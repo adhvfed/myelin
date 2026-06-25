@@ -54,6 +54,17 @@ sla_mins = 5
 # under the full 30× agent-skewed surge. The agent-mention shed budget below is no longer just a
 # named floor — it is asserted green at the surge multiplier here.
 #
+# MEASURED + PROVEN GREEN at 30× by AG-D6 (AG-P22 / P-478, 2026-06-25): the agent-FABRIC's own slice —
+# the agent-DISPATCH surge gate (myelin_agent_service::AgentDispatchSurgeGate) wires the substrate
+# shed::ShedLane over AgentMention (the concurrency front) in front of the storage AgentRunGate reserve/
+# settle gate (the wallet front). A 30× agent-dispatch storm (P-S02 generator, agent-skewed mix) on ONE
+# tenant: the protected human lane HELD (0 human shed, surging tenant's own + a quiet co-tenant's human
+# admitted), the agent lane SHED with 429 + Retry-After (the runtime HONOURED it — 0 immediate retries,
+# no retry storm), reserve/settle REFUSED the over-budget runs (reserve_refusals > 0) WITHOUT
+# interrupting in-flight (0 interrupts), and cross-tenant impact was 0. This MOVES the AgentMention cap
+# below from the M2 placeholder floor to the MEASURED default-to-beat (the agent-fabric's slice of the
+# F6 surge family; sibling to BUS-D7 / SUB-D3 / FLOW-D8).
+#
 # MEASURED + PROVEN GREEN at 30× by SUB-D3 (P-S32 / P-433, 2026-06-24): the substrate's own
 # principal-aware shed lane (shed::ShedLane) was driven by the P-S02 load generator at the full 30×
 # agent/CI-skewed mix on ONE tenant against the substrate's public surfaces (HttpIntake + CiDispatch).
@@ -416,7 +427,19 @@ retry_after_secs = 3
 
 [[shed_budgets]]
 surface = "AgentMention"      # humans never queue behind agent runs (a reserved human fraction).
-per_tenant_in_flight_cap = 96  # MEASURED: BUS-D7 (P-420) + SUB-D3 held the human lane under the 30× agent-mention storm.
+# AGENT-LANE SHED BUDGET — the M2 PLACEHOLDER → the MEASURED cap (AG-P22 / P-478, AG-D6, 2026-06-25).
+# BEFORE (M2 v1 floor, agent-fabric.md §8 C10): the bound EXISTED (Surface::AgentMention in the substrate
+# shed table) but the NUMBER was a round, conservative placeholder (96/24). AFTER (MEASURED): the agent-
+# fabric's own 30× agent-DISPATCH surge (AG-D6, P-478) drove the P-S02 generator at 30× agent-mention
+# load on ONE tenant through BOTH fronts — the substrate shed::ShedLane (concurrency front) AND the
+# storage AgentRunGate reserve/settle gate (wallet front). The protected human lane HELD (0 human shed,
+# the surging tenant's own + a quiet co-tenant's human dispatch admitted), the agent lane SHED with
+# 429 + Retry-After (the agent runtime HONOURED it — 0 immediate retries, no retry storm), reserve/settle
+# REFUSED the over-budget runs (reserve_refusals > 0) WITHOUT interrupting in-flight (0 interrupts), and
+# cross-tenant impact was 0. The 96/24 cap is the SAME number the Bus's BUS-D7 (P-420) slice measured —
+# AG-D6 confirms it sufficient on the agent-dispatch path, so the row is the MEASURED default-to-beat, no
+# longer a named floor (never a number chosen to make the drill pass).
+per_tenant_in_flight_cap = 96  # MEASURED: BUS-D7 (P-420) + SUB-D3 + AG-D6 (P-478) held the human lane under the 30× agent-dispatch storm.
 human_lane_reservation = 24    # 25% of cap — above the 20% measured human-lane floor.
 retry_after_secs = 10
 

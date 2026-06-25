@@ -83,6 +83,7 @@ pub mod ci_tools;
 pub mod cost_gate;
 pub mod defaults;
 pub mod dispatch;
+pub mod dispatch_surge;
 pub mod dry_run;
 pub mod effect_api;
 pub mod escape_gate;
@@ -315,6 +316,20 @@ pub use ci_tools::{
 // auto-dispatch on a casual mention remains [OPEN → LEGAL] (L-3, counsel-gated — GDPR Art. 22 / EU
 // AI-Act human-oversight); the auto-spawn path is NOT wired until counsel ratifies the basis.
 pub use dispatch::{classify, DispatchCounter, DispatchDecision, DispatchTrigger};
+
+// The 30× agent-dispatch surge family (AG-P22 → P-478, M5, AG-D6 / contract 1.11/1.9/11.7): the
+// protected-human-lane shed gate at the agent-DISPATCH front door. WIRES the substrate's
+// shed::ShedLane over Surface::AgentMention (budget read from the thresholds file) in front of the
+// storage AgentRunGate reserve gate — the two structural defences (concurrency front + wallet front)
+// compose. The agent lane sheds with 429 + Retry-After (the runtime HONOURS it — no retry storm), the
+// human lane is protected (humans never queue behind agent runs), reserve refuses the over-budget runs
+// without interrupting in-flight, and cross-tenant impact is 0. The agent-lane shed budget moves from
+// the M2 placeholder floor to the MEASURED cap (thresholds.toml AgentMention 96/24, AG-D6 2026-06-25).
+pub use dispatch_surge::{
+    run_agent_dispatch_surge, AgentDispatchShed, AgentDispatchSurgeGate, AgentDispatchSurgeReport,
+    DispatchFrontError, RetryAfterHonouringRuntime, RuntimeReaction,
+    AGENT_DISPATCH_SURGE_MULTIPLIER, AGENT_LANE_SHED_BUDGET_IS_MEASURED,
+};
 
 // The agent-trace HOLDER seam (AG-P19 → P-268, M3, AG-7 / contract 8.8): the execution trace is a
 // CONTENT-ADDRESSED Knowledge document reusing the frozen myelin-content 13.1 block model;
