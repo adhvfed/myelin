@@ -325,6 +325,26 @@ impl OutboxStore {
             .collect()
     }
 
+    /// **Restore seam: insert a committed outbox row directly (bypassing a transaction) — the PITR-target
+    /// re-hydration the durable-workflow restore-verify (FLOW-D10 / P-FLOW-25,
+    /// `myelin_flow::restore_verify`) populates the RESTORED outbox from.** Models `pg_restore` re-loading
+    /// the retained `outbox` rows (all `seq <= T`) into a clean target: the row is re-inserted at its
+    /// original `(event_id, aggregate, seq)`, preserving the commit order so the cross-seam offset
+    /// reconcile reads the SAME committed sequence the live store held. Idempotent on `event_id` (the
+    /// UNIQUE key) — a re-load of an already-present row is a no-op. NOT a production write path: the ONE
+    /// production write path is [`OutboxTransaction::commit`].
+    #[doc(hidden)]
+    pub fn restore_committed_row_for_test(&self, row: OutboxRow) {
+        let mut inner = self.lock();
+        if inner.rows.contains_key(&row.event_id) {
+            return;
+        }
+        let next = inner.next_seq.entry(row.aggregate.clone()).or_insert(0);
+        *next = (*next).max(row.seq + 1);
+        inner.order.push(row.event_id.clone());
+        inner.rows.insert(row.event_id.clone(), row);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }

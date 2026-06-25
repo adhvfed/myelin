@@ -322,6 +322,15 @@ impl WfJournal {
             .collect()
     }
 
+    /// **All `wf_history` rows across every tenant/run, in commit (append) order — the whole-journal scan
+    /// the restore-verify (FLOW-D10 / P-FLOW-25, [`crate::restore_verify`]) takes the consistent-point cut
+    /// over (§3.2).** Restore truncates the journal at the event-log offset by retaining the rows with
+    /// `seq <= T` from THIS scan; the gate then asserts no retained row points at a vanished result. The
+    /// rows are in the append order the journal committed them (the `seq` ordering the cut respects).
+    pub fn all_history_in_seq_order(&self) -> Vec<WfHistoryRow> {
+        self.lock().history.clone()
+    }
+
     /// **Test/holder seam: append a `wf_history` row directly** (bypassing the [`WfCtx`] co-commit),
     /// so a unit/CDC test of a journal CONSUMER (the P-FLOW-03 holder's `locate`/`erase` over a
     /// populated journal — [`crate::holder`]) can seed the journal with a known set of refs-stored
