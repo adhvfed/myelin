@@ -358,6 +358,29 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "ga_p511_dogfood_self_served_dsr_drill",
             ],
         },
+        // (8) the REFERENCE GRAPH dogfood band (P-513 / REF-P28 → REF-M6): the reference graph runs over
+        //     Myelin's OWN work — the PR context pane on the Myelin monorepo's PRs (commits ↔ issues ↔ CI
+        //     ↔ KN docs ↔ chat), the spec-to-ship lineage on Myelin's roadmap/scorecard as Myelin issues
+        //     + a Knowledge space, and the structural-erasure holder fan-out over a team member's own data
+        //     — all green, 0 leak; the Refs truth-up pass confirms 0 red earlier-band Refs gates; the
+        //     every-incident-adds-a-drill loop is self-hosted. WIRES the existing Refs surface + drills
+        //     (EI-01 §7 — never re-implemented here). The switch-test browser drive is the named floor →
+        //     REF-P29.
+        SelfHostJob {
+            id: "REF-P28-dogfood",
+            title: "the reference graph on Myelin's own work — the PR context pane + the spec-to-ship \
+                    lineage + the holder fan-out (all green, 0 leak) + the Refs truth-up pass (0 red \
+                    earlier-band Refs gate) + the self-hosted every-incident-adds-a-drill loop",
+            kind: JobKind::Drill,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-refs-service",
+                "--test",
+                "ref_p28_dogfood_drill",
+            ],
+        },
     ]
 }
 
