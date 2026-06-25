@@ -122,9 +122,24 @@ myelin-refs = { path = "../myelin-refs" }
 sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 
+# SRCH-P30 (P-463, M5): the object-store index backstop swap (the fs-backed BlobStore ->
+# object-store swap, contract 11.2) gets PROVEN against the LIVE dev-stack object store (RustFS /
+# Scaleway via `myelin_storage::s3blob::S3BlobStore`) in
+# tests/integration_srch_p30_object_store_backstop.rs. The OPTIONAL `myelin-config` (the dev S3
+# endpoint/creds) + `myelin-storage/integration` (the real `s3blob` module is `#[cfg(feature =
+# "integration")]` in storage) are pulled ONLY by `--features integration` — the default
+# `cargo build --workspace` stays DB-free. No new modelled-DAG edge: `myelin-config` is leaf config
+# and Search already depends on `myelin-storage` (Search stays a terminal leaf consumer).
+myelin-config = { path = "../myelin-config", optional = true }
+
 [features]
 default = []
-integration = ["dep:sqlx", "dep:tokio"]
+integration = [
+    "dep:sqlx",
+    "dep:tokio",
+    "dep:myelin-config",
+    "myelin-storage/integration",
+]
 
 [dev-dependencies]
 myelin-lints = { path = "../myelin-lints" }

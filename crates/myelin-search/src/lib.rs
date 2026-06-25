@@ -130,6 +130,7 @@ pub mod indexer;
 pub mod issues_projection;
 pub mod kn_projection;
 pub mod layout;
+pub mod object_store_backstop;
 pub mod pipeline;
 pub mod projection_feeder;
 pub mod reindex;
@@ -221,6 +222,10 @@ pub use kn_projection::{
 pub use layout::{
     derived_state_invariant_holds, srch_p03_floors, LayoutError, PerTenantIndexLayout,
     SrchP03Floor, StatefulComponent,
+};
+pub use object_store_backstop::{
+    ObjectStoreBackstopArtifact, ObjectStoreBackstopFailure, ObjectStoreBackstopGate,
+    ObjectStoreBackstopVerdict, SegmentBackstop, StoredSegment, SwappedSegments,
 };
 pub use pipeline::{
     query, query_consistent, semantic, ListObjectsPort, Page, QueryError, QueryStats, RankedResult,

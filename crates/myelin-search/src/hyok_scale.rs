@@ -173,6 +173,46 @@ impl SealedBackupSegment {
     pub fn try_recover(&self, dek: &DekHandle) -> Option<Vec<u8>> {
         dek.open(&self.nonce, &self.ciphertext)
     }
+
+    /// **Serialise a sealed segment into the opaque at-rest bytes a [`BlobStore`] object holds**
+    /// (the object-store index backstop, SRCH-P30 / P-463). The serialised form is PII-free at
+    /// rest — the AEAD nonce + the per-tenant-DEK-encrypted ciphertext, never a readable body — so
+    /// the same per-tenant-DEK crypto-shred renders the OBJECT-STORE-RESIDENT segment unrecoverable
+    /// exactly as it does the in-memory segment (§4.8). The `doc_id` is intentionally NOT folded
+    /// into the object bytes: it is the object-store KEY (the content the caller addresses by), so
+    /// the bytes carry ONLY the sealed payload. The wire shape is `nonce_len (1 byte) || nonce ||
+    /// ciphertext` — self-describing so the swap-back round-trips byte-for-byte.
+    ///
+    /// [`BlobStore`]: myelin_storage::BlobStore
+    pub fn to_blob_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + self.nonce.len() + self.ciphertext.len());
+        // The nonce length is fixed (`NONCE_LEN`) but framed explicitly so a future nonce-width
+        // change is caught loudly on read rather than silently mis-parsing the ciphertext.
+        out.push(self.nonce.len() as u8);
+        out.extend_from_slice(&self.nonce);
+        out.extend_from_slice(&self.ciphertext);
+        out
+    }
+
+    /// **Reconstruct a sealed segment from its object-store at-rest bytes** + the `doc_id` it was
+    /// stored under (the object-store KEY). The inverse of [`SealedBackupSegment::to_blob_bytes`].
+    /// Returns `None` if the bytes are malformed (a truncated frame or a nonce width that no longer
+    /// matches [`NONCE_LEN`]) — a corrupt at-rest segment is surfaced, never silently opened.
+    pub fn from_blob_bytes(doc_id: &str, bytes: &[u8]) -> Option<SealedBackupSegment> {
+        let (&nonce_len, rest) = bytes.split_first()?;
+        let nonce_len = nonce_len as usize;
+        if nonce_len != NONCE_LEN || rest.len() < nonce_len {
+            return None;
+        }
+        let (nonce_slice, ciphertext) = rest.split_at(nonce_len);
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(nonce_slice);
+        Some(SealedBackupSegment {
+            doc_id: doc_id.to_string(),
+            nonce,
+            ciphertext: ciphertext.to_vec(),
+        })
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════

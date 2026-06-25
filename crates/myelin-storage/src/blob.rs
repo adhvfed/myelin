@@ -516,6 +516,26 @@ impl BlobStore for FsBlobStore {
     }
 }
 
+/// A shared-backing blanket impl: an `Arc<B>` IS a `BlobStore` (it forwards to the inner `B`). This
+/// lets multiple tenant-pinned consumers (e.g. the Search object-store index backstop, SRCH-P30)
+/// share ONE underlying backing without forking the trait or making every backing `Clone`. It is a
+/// pure forward — no new semantics — so the fs↔object swap and the per-tenant keyspace are
+/// unchanged.
+impl<B: BlobStore> BlobStore for std::sync::Arc<B> {
+    fn put(&self, tenant: &TenantId, bytes: &[u8]) -> Result<ContentHash> {
+        (**self).put(tenant, bytes)
+    }
+    fn get(&self, tenant: &TenantId, hash: &ContentHash) -> Result<Vec<u8>> {
+        (**self).get(tenant, hash)
+    }
+    fn head(&self, tenant: &TenantId, hash: &ContentHash) -> Result<BlobMeta> {
+        (**self).head(tenant, hash)
+    }
+    fn delete(&self, tenant: &TenantId, hash: &ContentHash) -> Result<()> {
+        (**self).delete(tenant, hash)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
