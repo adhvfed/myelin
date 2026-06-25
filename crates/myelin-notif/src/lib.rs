@@ -141,6 +141,17 @@ pub mod snooze_resurface;
 // damping, and mute/DND honoring. Storm-control suppresses DELIVERY and RANKING only — NEVER the
 // audit/history (Notif is a projection, EI-04 §5.3). The router runs it between classify and UPSERT.
 pub mod storm_control;
+// The 30×-agent-surge shed budget (the F6 surge family; human-last lane) + NOTIF-D5 (NOTIF-P25 /
+// P-467 — §5.2, contract 1.11/1.8 consumed). Notif is the ORIGIN of the substrate's `AgentMention`
+// storm surface ("humans never queue behind agent runs"); this WIRES the existing
+// `myelin_substrate::shed::ShedLane` over that surface (it does NOT re-author the shed order),
+// reading the budget from the FROZEN thresholds file. The agent-generated notification lane sheds
+// first with `429 + Retry-After` (ADR-16.3); a human's interactive inbox read is last-to-shed; one
+// tenant's storm never sheds another's humans (the per-tenant bulkhead); a per-provider
+// `ProviderBulkhead` (the substrate's one `BoundedQueue`) bounds the off-cell delivery-adapter load.
+// NOTIF-D5: human inbox-read holds, agent sheds, cross-tenant 0, bulkhead bounds provider load.
+// FLOORS: the real EU provider is NOTIF-P26; the erasure residual NOTIF-P27. See [`surge`].
+pub mod surge;
 // Write-fanout for the bounded high-signal set (NOTIF-P12 / P-190 — §3.5/§3.2.4): the router reads
 // the frozen `mention(Principal)` STRUCTURED node (contract 13.1) — NEVER free text (AG-6) — and
 // materialises one inbox_item per mentioned recipient, bounded by the hot-subject cap so a
@@ -224,6 +235,11 @@ pub use snooze_resurface::{
 pub use storm_control::{
     dedup_collapse_ratio_bps, is_self_notification, subject_root_of, Coalescer, RateConfig,
     StormContext, StormControl, StormDecision, StormPrefs, SuppressReason, TokenBucket,
+};
+pub use surge::{
+    run_notif_surge, NotifShedGate, NotifShedRejection, NotifSurgeReport, ProviderBulkhead,
+    ERASURE_RESIDUAL_FOLLOW_ON, EU_DELIVERY_PROVIDER_FOLLOW_ON, NOTIF_SURGE_MULTIPLIER,
+    NOTIF_SURGE_SURFACE,
 };
 pub use watch::{
     cold_rebuild, cold_rebuild_item_ids, inbox_scope, inbox_stream, publish_inbox_frame,
