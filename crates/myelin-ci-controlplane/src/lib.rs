@@ -58,6 +58,7 @@ pub mod deployment;
 pub mod events;
 pub mod fairness;
 pub mod fleet;
+pub mod floor_followons;
 pub mod holder;
 pub mod live_tail;
 pub mod log_pipeline;
@@ -303,6 +304,11 @@ pub use migrations::{
 pub use permanent_gates::{
     ci_restore_verify_stores, m4_boundary_permanent_gates, run_ci_restore_verify_or_fail,
     PermanentGate, PermanentGateKind,
+};
+
+pub use floor_followons::{
+    all_floor_followons, FloorFollowOn, TriggerStatus, DEFERRED_BY_REFERENCE_FLOORS,
+    MEASURED_TRIGGER_FLOORS,
 };
 
 /// The deployable service name (the `AppSpec::name` + the telemetry/trace service identifier). The
