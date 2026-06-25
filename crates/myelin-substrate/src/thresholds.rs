@@ -183,6 +183,19 @@ pub struct Thresholds {
     /// seeds. Mirrors `myelin_search::filtered_ann::FilteredAnnStrategy` seed constants.
     #[serde(default)]
     pub filtered_ann: FilteredAnn,
+    /// The Search-side measured projection-feeder promotion threshold (SRCH-P27 / P-462, M5;
+    /// search-and-indexing §4.6.1 / contract 6.3 / OQ-C). The fraction of a collection's view
+    /// executions a facet must be filtered in (over a rolling window) for Search to promote it from
+    /// its cold GIN-indexed JSONB scan to a generated/columnar fast-field index. The OWNER of the
+    /// per-facet filter-frequency signal is Issues/Knowledge (`myelin_knowledge::FacetTelemetry`,
+    /// `myelin_knowledge::FACET_PROMOTION_THRESHOLD`); SRCH-P27 is the Search-side CONSUMER that reads
+    /// the signal and decides promotion for ITS OWN index — promotion changes COST, never correctness
+    /// (a promoted facet's results are byte-identical). A Search-owned tunable, NOT a contract constant
+    /// (§4.6.1), measured never predicted (EI-01 §3). `#[serde(default)]` so an older thresholds file
+    /// (pre-P-462) still parses against the §4.6.1 seed. Mirrors
+    /// `myelin_search::projection_feeder::ProjectionFeeder` seed constants.
+    #[serde(default)]
+    pub projection_feeder: ProjectionFeeder,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -726,6 +739,73 @@ impl Default for FilteredAnn {
             recall_at_k_bps: Self::RECALL_AT_K_BPS_SEED,
             brute_force_fallback_visible_bps: Self::BRUTE_FORCE_FALLBACK_VISIBLE_BPS_SEED,
             ivf_pq_promotion_live_vectors: Self::IVF_PQ_PROMOTION_LIVE_VECTORS_SEED,
+        }
+    }
+}
+
+/// **The Search-side measured projection-feeder promotion threshold (SRCH-P27 / P-462, M5).** The
+/// fraction of a collection's view executions a facet must be filtered in (over a rolling window)
+/// for Search to promote it from a cold GIN-indexed JSONB scan to a generated/columnar fast-field
+/// index (search-and-indexing §4.6.1 / contract 6.3 / OQ-C). The owner of the per-facet
+/// filter-frequency signal is Issues/Knowledge (`myelin_knowledge::FacetTelemetry`); Search consumes
+/// it and decides promotion for its own index. The trigger is STRICTLY greater-than (a facet at
+/// EXACTLY the ratio does NOT promote — the frozen §4.6.1 wording). Promotion changes COST, never
+/// correctness. A Search-owned tunable, not a contract constant, measured never predicted (EI-01 §3).
+/// `#[serde(default)]` so an older thresholds file parses (the seed). Mirrors
+/// `myelin_search::projection_feeder::ProjectionFeeder` seed constants.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ProjectionFeeder {
+    /// The promotion ratio — a facet filtered in MORE than this fraction of a collection's view
+    /// executions over the rolling window promotes from the GIN scan to a generated index. Expressed
+    /// as a ratio (`0.05` == 5 %). MUST be in `(0, 1)` (a 0 ratio promotes everything — the GIN scan
+    /// would never serve; a ratio ≥ 1 promotes nothing — a vacuous bar). The trigger is STRICTLY
+    /// greater-than (§4.6.1).
+    pub promotion_ratio: f64,
+    /// The minimum number of recorded view executions before a facet is eligible for promotion (the
+    /// rolling-window floor). Below it the measured frequency is too noisy to act on — a single early
+    /// execution must not promote a facet on a 100 % sample of size 1. MUST be `> 0`.
+    pub min_executions: u64,
+}
+
+impl ProjectionFeeder {
+    /// The promotion-ratio seed: **0.05 == > 5 %** — the frozen §4.6.1 / contract 6.3 / OQ-C trigger.
+    /// Equal to `myelin_knowledge::FACET_PROMOTION_THRESHOLD` (the SAME OQ-C number; Search consumes
+    /// the Issues/KN-owned signal). A Search-owned tunable; the world-scale run re-confirms it.
+    pub const PROMOTION_RATIO_SEED: f64 = 0.05;
+    /// The rolling-window execution floor seed: **20 executions** before a facet is promotion-eligible.
+    /// A facet's frequency over fewer executions is too noisy to promote on (1/1 == 100 % is not a hot
+    /// facet). Measured-not-predicted; the cell-class window finalises it at world scale.
+    pub const MIN_EXECUTIONS_SEED: u64 = 20;
+
+    /// Whether a facet filtered in `uses` of `total` view executions has crossed the promotion
+    /// threshold: `total ≥ min_executions` AND `uses/total > promotion_ratio` (STRICTLY greater —
+    /// §4.6.1). Integer-exact comparison (no float rounding of the ratio): `uses > ratio * total`.
+    /// A facet below the execution floor is never promoted (too noisy). `total == 0` never promotes.
+    pub fn should_promote(&self, uses: u64, total: u64) -> bool {
+        if total == 0 || total < self.min_executions {
+            return false;
+        }
+        // uses/total > ratio  ⇔  uses > ratio*total. Float on the RHS only (the ratio is a config
+        // fraction); the LHS stays an exact integer so an at-threshold facet never promotes by round.
+        (uses as f64) > self.promotion_ratio * (total as f64)
+    }
+
+    /// Whether the threshold numbers are well-formed: the ratio is in `(0, 1)` and the execution floor
+    /// is positive. A 0 ratio (promote everything) / a ratio ≥ 1 (promote nothing) / a 0 floor are
+    /// mis-specified — a green can never be manufactured by a vacuous bar (EI-01 §3).
+    pub fn is_well_formed(&self) -> bool {
+        self.promotion_ratio > 0.0 && self.promotion_ratio < 1.0 && self.min_executions > 0
+    }
+}
+
+impl Default for ProjectionFeeder {
+    /// The §4.6.1 / OQ-C seed default-to-beat: the frozen `> 5 %` ratio + a 20-execution rolling-window
+    /// floor. SRCH-P27 (P-462) measures the promotion against this and dates it. An older thresholds
+    /// file (pre-P-462) falls back here.
+    fn default() -> Self {
+        ProjectionFeeder {
+            promotion_ratio: Self::PROMOTION_RATIO_SEED,
+            min_executions: Self::MIN_EXECUTIONS_SEED,
         }
     }
 }
@@ -1316,6 +1396,41 @@ mod tests {
         // The promotion point binds at/above 1 000 000 live vectors, not below.
         assert!(f.should_promote_to_ivf_pq(1_000_000));
         assert!(!f.should_promote_to_ivf_pq(999_999));
+    }
+
+    /// The canonical file carries the Search-side projection-feeder promotion threshold (SRCH-P27 /
+    /// P-462): the frozen `> 5 %` ratio (the OQ-C number Search consumes from Issues/KN) + the
+    /// rolling-window execution floor — well-formed (no vacuous bar), strictly greater-than.
+    #[test]
+    fn canonical_file_holds_the_projection_feeder_threshold() {
+        let t = Thresholds::load_canonical().expect("load");
+        let p = &t.projection_feeder;
+        assert_eq!(
+            p.promotion_ratio,
+            ProjectionFeeder::PROMOTION_RATIO_SEED,
+            "the §4.6.1 / OQ-C frozen > 5 % promotion ratio (Search consumes the Issues/KN signal)"
+        );
+        assert_eq!(
+            p.min_executions,
+            ProjectionFeeder::MIN_EXECUTIONS_SEED,
+            "the rolling-window execution floor (too-few executions is too noisy to promote on)"
+        );
+        assert!(
+            p.is_well_formed(),
+            "the threshold must be well-formed (a 0 / ≥ 1 ratio or 0 floor is rejected)"
+        );
+        // A facet filtered in 6 of 100 executions (6 % > 5 %) promotes; 5 of 100 (exactly 5 %) does
+        // NOT (the trigger is STRICTLY greater-than, the frozen §4.6.1 wording).
+        assert!(p.should_promote(6, 100), "6 % > 5 % promotes");
+        assert!(
+            !p.should_promote(5, 100),
+            "exactly 5 % does NOT promote (strict >)"
+        );
+        // Below the execution floor a facet is never promoted (1/1 == 100 % is too noisy).
+        assert!(
+            !p.should_promote(1, 1),
+            "below the execution floor never promotes"
+        );
     }
 
     /// The canonical file carries every Q32 default-to-beat at its documented value.

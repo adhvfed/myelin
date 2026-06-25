@@ -131,6 +131,7 @@ pub mod issues_projection;
 pub mod kn_projection;
 pub mod layout;
 pub mod pipeline;
+pub mod projection_feeder;
 pub mod reindex;
 pub mod residency;
 pub mod restore_verify;
@@ -225,6 +226,10 @@ pub use pipeline::{
     query, query_consistent, semantic, ListObjectsPort, Page, QueryError, QueryStats, RankedResult,
     RankedResults, RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, ScopedEngine,
     VectorQuery, READ_PERMISSION,
+};
+pub use projection_feeder::{
+    FacetCollection, FacetDoc, FacetServingPath, ProjectionFeederArtifact, ProjectionFeederFailure,
+    ProjectionFeederGate, ProjectionFeederVerdict, ViewExecutionTelemetry,
 };
 pub use reindex::{
     ReindexCursorStore, ReindexError, ReindexJob, ReindexProgress, SearchReindexer,
