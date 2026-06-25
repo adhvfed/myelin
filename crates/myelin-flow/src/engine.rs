@@ -222,6 +222,19 @@ impl RunStore {
             .cloned()
     }
 
+    /// **Every `workflow_run` row, in a stable order (by `(tenant, run_id)`) — the whole-store scan the
+    /// restore-verify (FLOW-D10 / P-FLOW-25, [`crate::restore_verify`]) takes the consistent-point cut
+    /// over.** Restore re-builds the run store from THIS scan, clamping each run's cursor to its restored
+    /// journal depth + clearing its lease (every in-flight run is re-leasable on restore, §4.7). The stable
+    /// order makes the post-restore re-drive deterministic.
+    pub fn all_runs(&self) -> Vec<RunRow> {
+        let mut runs: Vec<RunRow> = self.lock().values().cloned().collect();
+        runs.sort_by(|a, b| {
+            (a.tenant.0.as_str(), a.run_id.as_str()).cmp(&(b.tenant.0.as_str(), b.run_id.as_str()))
+        });
+        runs
+    }
+
     /// **Run a mutation `f` over the `(tenant, run_id)` run row under the store lock — the seam the
     /// timer/signal WAKE (`waiting → running`) updates through (§4.2/§4.3).** Returns `f`'s result, or
     /// `None` (without calling `f`) if the run is absent. The lock is held for the duration of `f` so
@@ -620,6 +633,25 @@ struct TelemetryInner {
     /// DEKs the crypto-shred cascade destroyed (one per erased subject who had inline-PII rows).
     /// Monotonic `+=`. Each `+=` is one subject's inline-PII history/signal rows made unrecoverable.
     crypto_shreds_count: u64,
+    /// **the restore-verify CONSISTENT-POINT offset (the FLOW-D10 green artifact, §1.8 / contract 1.8 —
+    /// restore to a consistent point, P-FLOW-25).** The event-log offset `T` the most recent
+    /// restore-verify ([`crate::restore_verify`]) landed myelin-flow at: every retained `wf_history` row +
+    /// outbox row sits at `seq <= T`, in-flight runs resumed, no run points at a vanished result. Set on a
+    /// GREEN restore-verify; the dated SCHED signal the FLOW-D10 drill reads.
+    restore_verify_consistent_offset: i64,
+    /// **the restore-verify RESUMED-RUN counter (the FLOW-D10 green artifact, §1.8 — P-FLOW-25).** Total
+    /// in-flight runs the most recent restore-verify RESUMED on the post-restore re-drive (replayed their
+    /// restored journal with 0 re-executed side effect). The "consistent resume" half of F-10.
+    restore_verify_runs_resumed: u64,
+    /// **the restore-verify GREEN counter (the FLOW-D10 audit leg, §1.8 — P-FLOW-25).** Total restore-verify
+    /// runs that landed at one consistent point (in-flight runs resumed, no vanished result, offsets
+    /// reconciled). Monotonic `+=` — each `+=` is one dated consistent-point green artifact.
+    restore_verify_green_count: u64,
+    /// **the restore-verify RED counter (the FLOW-D10 health signal, §1.8 — P-FLOW-25).** Total restore-verify
+    /// runs that found an inconsistent restore (a vanished result, an un-resumed in-flight run, a re-executed
+    /// side effect, or an unreconciled offset). Monotonic `+=`. MUST stay 0 on a healthy restore; a non-zero
+    /// is the "a restore did not land at one consistent point" health signal (the F-10 red drill).
+    restore_verify_red_count: u64,
 }
 
 impl FlowTelemetry {
@@ -837,6 +869,50 @@ impl FlowTelemetry {
     /// history/signal rows made unrecoverable including in backups.
     pub fn crypto_shreds_count(&self) -> u64 {
         self.lock().crypto_shreds_count
+    }
+
+    /// **Record a GREEN restore-verify (the FLOW-D10 dated artifact, §1.8 / contract 1.8 — P-FLOW-25).**
+    /// Called by [`crate::restore_verify::WfRestoreVerify::run`] when a restore lands at one consistent point
+    /// `consistent_offset` (the event-log offset) with `runs_resumed` in-flight runs resumed, no vanished
+    /// result, offsets reconciled. Sets the consistent-point gauge + the resumed-run gauge and bumps the
+    /// green counter.
+    pub fn record_restore_verify_green(&self, consistent_offset: i64, runs_resumed: u64) {
+        let mut t = self.lock();
+        t.restore_verify_consistent_offset = consistent_offset;
+        t.restore_verify_runs_resumed = runs_resumed;
+        t.restore_verify_green_count += 1;
+    }
+
+    /// **Record a RED restore-verify (the FLOW-D10 health signal, §1.8 — P-FLOW-25).** Called when a restore
+    /// did NOT land at one consistent point (a vanished result, an un-resumed run, a re-executed side effect,
+    /// or an unreconciled offset). Monotonic `+=`; MUST stay 0 on a healthy restore.
+    pub fn record_restore_verify_red(&self) {
+        self.lock().restore_verify_red_count += 1;
+    }
+
+    /// The restore-verify consistent-point offset (the FLOW-D10 green artifact, §1.8) — the event-log offset
+    /// `T` the most recent restore-verify landed myelin-flow at. 0 until the first restore-verify runs.
+    pub fn restore_verify_consistent_offset(&self) -> i64 {
+        self.lock().restore_verify_consistent_offset
+    }
+
+    /// The restore-verify resumed-run counter (the FLOW-D10 green artifact, §1.8) — in-flight runs the most
+    /// recent restore-verify resumed on the post-restore re-drive (the "consistent resume" half of F-10).
+    pub fn restore_verify_runs_resumed(&self) -> u64 {
+        self.lock().restore_verify_runs_resumed
+    }
+
+    /// The restore-verify green counter (the FLOW-D10 audit leg, §1.8) — total restore-verify runs that
+    /// landed at one consistent point. Each `+=` is one dated consistent-point green artifact.
+    pub fn restore_verify_green_count(&self) -> u64 {
+        self.lock().restore_verify_green_count
+    }
+
+    /// The restore-verify red counter (the FLOW-D10 health signal, §1.8) — total restore-verify runs that
+    /// found an inconsistent restore. MUST stay 0 on a healthy restore; a non-zero is the "a restore did not
+    /// land at one consistent point" health signal.
+    pub fn restore_verify_red_count(&self) -> u64 {
+        self.lock().restore_verify_red_count
     }
 
     /// **The reserve/settle REJECT RATE in basis points (`0..=10000` — the §5.4 telemetry the

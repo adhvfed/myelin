@@ -43,8 +43,14 @@
 //!   history/signal rows are unrecoverable incl. backups, WITHOUT rewriting the journal — structure
 //!   preserved (replay still works, the PII is a tombstone) + the crypto-shred-lag telemetry, contract
 //!   1.8; wired into [`holder::WfHistoryHolder::with_crypto_shred`]; the FLOW-D9 drill is
-//!   `tests/drills_flow_d9_crypto_shred.rs`. **NAMED FLOOR:** restore-verify to a consistent point is
-//!   **P-FLOW-25** (FLOW-D10, M5)).
+//!   `tests/drills_flow_d9_crypto_shred.rs`. **Restore-verify to a consistent point is now LANDED at
+//!   P-FLOW-25** (FLOW-D10, M5), see [`restore_verify`] ([`WfRestoreVerify`]: restore the myelin-flow
+//!   run-store/journal/outbox to a consistent point `T` (the event-log offset, contract 11.5) → assert
+//!   in-flight runs RESUME via the P-FLOW-05 replay short-circuit with 0 re-executed side effect, NO run
+//!   points at a vanished result (every retained `wf_history` result ref is in the restored set), and
+//!   store↔outbox offsets RECONCILE at one `T`; the dated consistent-point green artifact +
+//!   restore-verify telemetry, contract 1.8; the FLOW-D10 drill is
+//!   `tests/drills_flow_d10_restore_verify.rs`)).
 //! - **The algorithms**: WfCtx + journal/outbox co-commit (**P-FLOW-04**, FLOW-D5) — **LANDED**,
 //!   see [`wfctx`] ([`WfCtx`]: `activity`/`now`/`rand`/`emit` + the single-txn co-commit; the
 //!   FLOW-D5 drill is `tests/drills_flow_d5_cocommit.rs`); deterministic
@@ -216,6 +222,7 @@ pub mod maintenance;
 pub mod merge_queue;
 pub mod migrations;
 pub mod remint;
+pub mod restore_verify;
 pub mod schema;
 pub mod signal_consumer;
 pub mod timer;
@@ -273,6 +280,10 @@ pub use merge_queue::{
 };
 pub use myelin_storage::reserve_settle::{MeteredUnit, MinorUnits};
 pub use remint::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenLease, RunTokenMinter};
+pub use restore_verify::{
+    ConsistentOffset, ConsistentPointArtifact, RestoreVerifyFailure, RestoreVerifyOutcome,
+    RestoredFlow, WfRestore, WfRestoreVerify,
+};
 pub use signal_consumer::{FlowSignalConsumer, SIGNAL_EVENT_TYPE};
 pub use timer::sla::{sla_timer_id, trigger_stale_timer_id, SlaTimerCall};
 pub use timer::{
