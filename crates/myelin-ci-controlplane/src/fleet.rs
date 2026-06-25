@@ -366,6 +366,27 @@ impl AutoscalePolicy {
         }
     }
 
+    /// **The MEASURED pre-warm sizing (CI-P30 / P-490 — replacing CI-P4's fixed warm-buffer floor, arch
+    /// §5.4 / open question 07#2).** Sizes the warm buffer from the MEASURED recent per-`(region,
+    /// label-class)` arrival rate via the tuned [`myelin_substrate::thresholds::CiSurge`] sizing function
+    /// (a fraction of the arrival rate, clamped at the per-VM-memory ceiling), rather than a fixed
+    /// constant. A busy pool keeps more warm (faster "time to first log line"); an idle pool keeps the
+    /// `min_warm` floor; the buffer is bounded so it never pre-warms past the residency-zone's headroom.
+    /// This is the "warm-pool size vs arrival rate vs the per-VM memory floor" function the prompt names —
+    /// the autoscaler now sizes the pre-warm buffer from a MEASURED rate, not a guess (EI-01 §3).
+    pub fn from_measured_arrival_rate(
+        ci_surge: &myelin_substrate::thresholds::CiSurge,
+        arrival_rate: u32,
+        min_warm: u32,
+        max: u32,
+    ) -> AutoscalePolicy {
+        AutoscalePolicy {
+            warm_buffer: ci_surge.prewarm_buffer_for(arrival_rate),
+            min_warm,
+            max,
+        }
+    }
+
     /// **The desired pool size for a load (arch §5.4).** `queue_depth` is the scheduler's claimable
     /// backlog ([`crate::scheduler::SchedulerState::queue_depth`]); `in_flight` is the count already
     /// leased/running off this pool. The target is `queue_depth + in_flight + warm_buffer`, floored at
@@ -961,6 +982,47 @@ mod tests {
         // A min_warm floor keeps a hot pool even at idle.
         let warm = AutoscalePolicy::new(1, /*min_warm*/ 2, 20);
         assert_eq!(warm.target(0, 0), 2, "idle but min_warm=2 keeps 2 hot");
+    }
+
+    /// **The MEASURED pre-warm sizing (CI-P30 / P-490, arch §5.4 / open question 07#2): the warm buffer
+    /// is SIZED to the measured arrival rate, not a fixed floor.** The policy reads the tuned `[ci_surge]`
+    /// row (the SAME source of truth the surge module reads) so a busy pool keeps a larger warm buffer
+    /// (faster "time to first log line") while an idle pool keeps min_warm, and the buffer is bounded by
+    /// the per-VM-memory ceiling (never past the zone's headroom). This replaces CI-P4's fixed warm-buffer
+    /// constant with a measured, arrival-rate-proportional function.
+    #[test]
+    fn prewarm_buffer_is_sized_from_the_measured_arrival_rate() {
+        let ci_surge = myelin_substrate::thresholds::CiSurge::default(); // 10% of arrival, capped at 16.
+
+        // A busy pool (arrival rate 100/window) keeps a 10-VM warm buffer; an idle pool keeps 0.
+        let busy =
+            AutoscalePolicy::from_measured_arrival_rate(&ci_surge, /*arrival*/ 100, 0, 200);
+        assert_eq!(
+            busy.warm_buffer, 10,
+            "10% of a 100-arrival rate = a 10-VM warm buffer"
+        );
+        // The warm buffer is ahead of demand: 5 queued + the measured warm buffer.
+        assert_eq!(
+            busy.target(5, 0),
+            15,
+            "5 queued + 10 warm (sized to the arrival rate)"
+        );
+
+        let idle =
+            AutoscalePolicy::from_measured_arrival_rate(&ci_surge, /*arrival*/ 0, 0, 200);
+        assert_eq!(
+            idle.warm_buffer, 0,
+            "an idle pool pre-warms nothing (scale-to-zero ready)"
+        );
+
+        // A burst arrival rate is CLAMPED at the per-VM-memory ceiling (never unbounded pre-warm).
+        let burst = AutoscalePolicy::from_measured_arrival_rate(
+            &ci_surge, /*arrival*/ 100_000, 0, 200,
+        );
+        assert_eq!(
+            burst.warm_buffer, 16,
+            "the warm buffer is clamped at the per-VM-memory ceiling"
+        );
     }
 
     /// **The autoscaler reconcile: the plan scales the pool UP when queue depth rises, DOWN to zero

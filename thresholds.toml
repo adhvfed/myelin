@@ -80,6 +80,39 @@ multiplier = 30
 human_lane_p99_budget_us = 10000  # SUB-D3: the substrate's protected-human-lane p99 ceiling under 30× (P-S33 re-confirms).
 
 # ---------------------------------------------------------------------------------------------
+# [ci_surge] — the MEASURED CI-surge controls: the tuned DRR / shed-budget / pre-warm numbers + the
+# per-fair_key starvation-histogram trigger (CI-P30 / P-490, M5; CI-D2, the F6 surge family;
+# continuous-integration §2.2/§2.4/§5.4, contract 1.11/1.8 / open question 07#1, 07#2, 07#5).
+#
+# MEASURED + PROVEN GREEN at 30× by CI-D2 (CI-P30 / P-490, 2026-06-25): the CI Control Plane's surge
+# controls were driven by the P-S02 LoadGenerator at the full 30× CI/agent-skewed mix on ONE tenant
+# against the CiDispatch surface + the DRR fair-share scheduler. The protected INTERACTIVE lane HELD
+# (0 interactive shed — a PR-check is admitted, never queued behind a batch matrix), the BATCH/CI lane
+# SHED with 429 + Retry-After (shed-count > 0, every shed carrying CiDispatch's 5 s Retry-After honoured
+# by `myelin ci`), a SECOND tenant was UNAFFECTED (cross-tenant shed 0 — the per-tenant bounded
+# run-queue held), reserve/settle REFUSED over-budget runs, and a KILLED runner's leased jobs
+# RE-QUEUED within the lease TTL with 0 orphans. Under the same surge the per-fair_key wait-time p99 was
+# MEASURED WITHIN the starvation trigger (flat DRR fairly interleaves the surging tenant — no
+# starvation), so `hierarchical_scheduler_promotion_owed = false`: the hierarchical scheduler (CI-P29)
+# stays a NAMED FLOOR (measured-not-predicted, open question 07#1; EI-04 §5).
+#
+# These NUMBERS mirror `myelin_ci_controlplane::surge::CiSurgeControls` + `fairness::{BASE_QUANTUM,
+# DEFICIT_CEILING,DEFAULT_TENANT_IN_FLIGHT_CAP}` (kept in lock-step by the CI-D2 drill); this file is the
+# source of truth. The starvation p99 + the pre-warm sizing are MEASUREMENT-GATE numbers (compared
+# against, never tuned toward); a regression past the starvation trigger is the hierarchical-scheduler
+# promotion signal, never a lowered bar (EI-01 §3). `per_tenant_in_flight_cap` EQUALS the CiDispatch
+# shed-budget cap below (one number, not two).
+# ---------------------------------------------------------------------------------------------
+[ci_surge]
+per_tenant_in_flight_cap = 64               # MEASURED: == shed_budgets.CiDispatch cap; the 30× CI surge shed the batch lane here, cross-tenant 0.
+drr_base_quantum = 1                        # the DRR deficit decrement on one claim (fairness::BASE_QUANTUM).
+drr_deficit_ceiling = 64                    # the DRR burst-credit cap — a long-idle fair_key cannot hoard priority (fairness::DEFICIT_CEILING).
+starvation_wait_p99_max_ticks = 32          # MEASUREMENT-GATE (07#1): wait p99 over this owes the hierarchical scheduler (CI-P29). MEASURED within budget at 30×.
+hierarchical_scheduler_promotion_owed = false # CI-D2 measured the wait p99 within budget → flat DRR holds; the hierarchy stays a named floor.
+prewarm_buffer_per_arrival_rate_bps = 1000  # MEASURED (07#2 / §5.4): 10% of the recent arrival rate kept warm (replaces CI-P4's fixed floor).
+prewarm_max_buffer = 16                     # the warm-buffer ceiling — bin-packing under the per-VM memory floor (never past the zone's headroom).
+
+# ---------------------------------------------------------------------------------------------
 # [authz_surge] — the ID-D9 (F6) protected-human-lane authz-decision p99 budget under the 30× authz
 # hot-path surge (identity §10/§13: authz is the highest-QPS shared system; contract 1.8
 # `auth_decision_latency` / 4.11 the shed order on the authz surface).

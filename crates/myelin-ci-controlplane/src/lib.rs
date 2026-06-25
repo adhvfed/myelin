@@ -74,6 +74,7 @@ pub mod supply_chain;
 pub mod surfacing;
 pub mod surfacing_index;
 pub mod surfacing_tools;
+pub mod surge;
 
 // CI-P15 (P-358): the `ci.pipeline` DURABLE WORKFLOW BODY + the X-1 producer side. The deterministic
 // Rust body registered under `CI_PIPELINE_WF_TYPE` at serve (guarded by the flow-determinism lint):
@@ -309,6 +310,16 @@ pub use permanent_gates::{
 pub use floor_followons::{
     all_floor_followons, FloorFollowOn, TriggerStatus, DEFERRED_BY_REFERENCE_FLOORS,
     MEASURED_TRIGGER_FLOORS,
+};
+
+// CI-P30 (P-490): the 30× CI surge family (CI-D2) — the interactive lane holds, the batch/CI lane sheds,
+// the tuned DRR/shed-budget numbers + the pre-warm buffer sizing + the measured per-`fair_key`
+// starvation signal (CI-P29's hierarchical-scheduler promotion gate). WIRES the existing shed lane
+// (Surface::CiDispatch) + the DRR fair-share (fairness) + the dead-runner reaper (scheduler) — no
+// parallel second implementation (EI-01 §7).
+pub use surge::{
+    drive_ci_d2_surge, CiDispatchShed, CiSurgeControls, CiSurgeGate, CiSurgeReport,
+    StarvationHistogram, CI_SURGE_MULTIPLIER,
 };
 
 /// The deployable service name (the `AppSpec::name` + the telemetry/trace service identifier). The
