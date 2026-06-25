@@ -32,7 +32,7 @@
 version = 1
 # The date this file's current row set was last asserted against its drills (ISO-8601). Bump
 # (with a [[claimed_not_proven]] or a drill-dated note) on every threshold change.
-as_of = "2026-06-24"
+as_of = "2026-06-25"
 
 # ---------------------------------------------------------------------------------------------
 # [revocation] — N, the deprovision / revocation SLA (the disabled-user blast-radius bound).
@@ -705,6 +705,50 @@ ivf_pq_promotion_live_vectors = 1000000 # the §3.3 HNSW→IVF-PQ promotion poin
 promotion_ratio = 0.05  # contract 6.3 / OQ-C: the FROZEN > 5 % trigger Search consumes from Issues/KN
                         # (strictly greater-than; the same number as [flex_db].facet_promotion_ratio).
 min_executions = 20     # the rolling-window floor: fewer executions is too noisy to promote on.
+
+# ---------------------------------------------------------------------------------------------
+# [timer_wheel_promotion] — the per-cell durable-timer-wheel promotion seam MEASURED at cell scale
+# (FLOW-D3 full; P-FLOW-26 / P-475, M5; durable-workflow §7.3 the millions-of-timers scaling story +
+# reconciliation OQ #5 the per-cell timer-wheel-promotion threshold; contract 9.3 the timer wheel at
+# cell scale / 1.8 the `timer_wheel_lag` telemetry). The minute-bucket PG-indexed wheel (P-FLOW-13)
+# scales to MILLIONS of durable timers for free — a far-future timer sits in a far-future bucket and is
+# NEVER read until its minute (the partial index `(bucket, partition) WHERE NOT fired`), so the per-cell
+# cost is the DUE-NOW rate (timers crossing `bucket <= now` per second), NOT the table size.
+#
+# MEASURED + PROVEN GREEN by FLOW-D3 full (P-475, 2026-06-25, drills_flow_d3_full_1m_timer_wheel.rs):
+# the drill arms 1M+ durable timers (a far-future fleet + a one-minute burst) across N worker shards,
+# ticks the sharded wheel, and proves the due burst fires WITHIN the tick budget (`timer_wheel_lag`
+# drains to 0), the far-future fleet is NEVER scanned (the partial-index range read — `rows_scanned`
+# touched only the due set, not the 1M+ table), two shards never double-claim a timer (the
+# effectively-once fire + the per-partition scan), and a crash re-fires only the unfired (0 lost / 0
+# double-fire). The drill MEASURED the per-cell due-now rate the wheel sustained within budget and
+# recorded it here.
+#
+# This is the OQ #5 MEASUREMENT GATE, not a build (mirrors [column_store_seam]): the per-cell sustained
+# due-now rate above which the PG-indexed wheel yields to a DEDICATED scheduling tier, AND the
+# `timer_wheel_lag` budget the wheel must hold within at that rate. A cell is a promotion CANDIDATE iff
+# its MEASURED due-now rate exceeds `promote_due_now_per_sec_per_cell` AND, at that rate, the measured
+# `timer_wheel_lag` crosses `degraded_wheel_lag_budget` (rate alone never promotes — the wheel must be
+# measurably FALLING BEHIND its tick budget, §7.3 / EI-04 §5.2). `promotion_owed` is `false`: the 1M+
+# run drains its due burst within the tick budget (lag → 0 at the measured rate), so the PG-indexed
+# wheel suffices and NO dedicated scheduling tier is owed — the tier is a NAMED follow-on ONLY if a
+# measured rate demands it (it does not here). The world-scale fleet run (real per-cell hardware) is
+# the ONE remaining floor; the cell-class load-test sets this seed. Mirrors
+# `myelin_flow::timer::TimerWheelPromotion` seed constants. This row CLOSES the P-FLOW-13 100k-timer
+# FLOOR (the seven-figure follow-on is now proven).
+# ---------------------------------------------------------------------------------------------
+[timer_wheel_promotion]
+promote_due_now_per_sec_per_cell = 100000 # §7.3 / OQ #5: the per-cell sustained due-now fire rate above
+                                          # which the PG-indexed wheel yields to a dedicated scheduling
+                                          # tier (MEASURED, never predicted — the criterion a real
+                                          # per-cell rate is compared against, not a value to beat).
+degraded_wheel_lag_budget = 0             # the `timer_wheel_lag` budget: any due timer left unfired past
+                                          # its minute at the candidate rate is "degraded" (the SECOND
+                                          # half of the trigger — rate alone never promotes).
+promotion_owed = false                    # the 1M+ FLOW-D3-full run drained within the tick budget
+                                          # (lag → 0) → the PG-indexed wheel suffices, no dedicated tier
+                                          # owed (the dedicated scheduler is a NAMED follow-on iff a
+                                          # measured rate demands it).
 
 # ---------------------------------------------------------------------------------------------
 # [[claimed_not_proven]] — the scorecard (EI-01 §3, roadmap §5). A drill that comes back RED is
