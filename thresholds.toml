@@ -674,6 +674,39 @@ ivf_pq_promotion_live_vectors = 1000000 # the §3.3 HNSW→IVF-PQ promotion poin
                                       # the real per-cell number is the world-scale fleet floor.
 
 # ---------------------------------------------------------------------------------------------
+# [projection_feeder] — the Search-side MEASURED projection-feeder promotion threshold (SRCH-D /
+# SCHED; SRCH-P27 / P-462, M5; search-and-indexing §4.6.1 the projection-feeder promotion, contract
+# 6.3 / OQ-C; reconciliation 00 OQ-C the promotion threshold). The fraction of a collection's view
+# executions a facet must be filtered in (over a rolling window) for Search to promote it from its
+# cold GIN-indexed JSONB scan to a generated/columnar fast-field index.
+#
+# OWNERSHIP (§4.6.1): the OWNER of the per-facet filter-frequency signal is Issues/Knowledge
+# (`myelin_knowledge::FacetTelemetry` / `FACET_PROMOTION_THRESHOLD`); SRCH-P27 is the Search-side
+# CONSUMER that reads the signal and decides promotion for ITS OWN index. This `promotion_ratio` is
+# the SAME OQ-C number (0.05 == > 5 %) the KN-side `[flex_db].facet_promotion_ratio` carries — a
+# Search-owned tunable, NOT a contract constant (§4.6.1), measured never predicted (EI-01 §3).
+#
+# MEASURED + PROVEN GREEN by the SCHED promotion gate (P-462, 2026-06-25,
+# projection_feeder.rs::tests): the gate records view executions against a facet, crosses the
+# measured > 5 % threshold, promotes the facet from the GIN scan to the generated index, and proves
+# the promoted facet's results are BYTE-IDENTICAL across the promotion (promotion changes COST, never
+# correctness — the GIN scan serves correctly meanwhile). A promotion that changed ANY result is a
+# typed RED, never softened. Recorded honestly: the threshold is carried as the OQ-C default-to-beat
+# (the same > 5 % the KN owner measures the frequency against); the PROMOTION MECHANISM + the
+# byte-identical-correctness invariant are MEASURED here.
+#
+# `promotion_ratio` is the > 5 % trigger (STRICTLY greater-than — a facet at EXACTLY 5 % does NOT
+# promote, the frozen §4.6.1 wording). `min_executions` is the rolling-window floor below which the
+# measured frequency is too noisy to act on (1/1 == 100 % is not a hot facet). The world-scale fleet
+# run re-confirms both at a real per-cell collection — the cell-class window sets the seed. Mirrors
+# `myelin_search::projection_feeder::ProjectionFeeder` seed constants.
+# ---------------------------------------------------------------------------------------------
+[projection_feeder]
+promotion_ratio = 0.05  # contract 6.3 / OQ-C: the FROZEN > 5 % trigger Search consumes from Issues/KN
+                        # (strictly greater-than; the same number as [flex_db].facet_promotion_ratio).
+min_executions = 20     # the rolling-window floor: fewer executions is too noisy to promote on.
+
+# ---------------------------------------------------------------------------------------------
 # [[claimed_not_proven]] — the scorecard (EI-01 §3, roadmap §5). A drill that comes back RED is
 # recorded HERE as a dated row with an owner and the follow-on, and is NEVER edited green: the
 # threshold it gates stays unchanged; the row stays until the deliverable is genuinely repaired
