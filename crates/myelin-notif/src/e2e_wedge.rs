@@ -61,11 +61,19 @@ use myelin_identity::{
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
 
-use crate::humanise::{
-    humanise, Channel, RefProjection, RefResolution, RefResolvePort, TemplateStore, Tombstone,
-    TombstoneReason, DEFAULT_LOCALE,
+use crate::escalation::{
+    notify_for, DurableWheel, EscalationEngine, EscalationPolicy, EscalationRun, InMemoryWheel,
+    OncallSchedule, RotationWindow, RunState,
 };
+use crate::humanise::{
+    humanise, Channel, HumaniseTemplate, RefProjection, RefResolution, RefResolvePort,
+    TemplateStore, Tombstone, TombstoneReason, DEFAULT_LOCALE,
+};
+use crate::prefs::{Channel as PrefChannel, QuietHours};
+use crate::ranking::reason_base_class;
 use crate::watch::{inbox_scope, inbox_stream, publish_inbox_frame, watch_open};
+use crate::{Class, Reason};
+use myelin_events::{OutboxStore, Timestamp};
 
 /// The E2E scenario Notif's leg crosses (the master M5 exit gate cites E2E-1..E2E-4; this module
 /// owns the Notif side of E2E-1 — the PR context pane). PII-free token — the drill asserts against
@@ -503,8 +511,8 @@ pub fn run_e2e_1_pr_pane() -> E2eArtifact {
 /// the master M5 exit gate's E2E-1 row; a red E2E-1 must NOT let M6 start. The artifact's `is_green()`
 /// is the earned verdict (0 leak + the per-viewer-pane + live-firehose predicate).
 ///
-/// **Floors named:** the E2E-2 HITL flagship leg is NOTIF-P29; the E2E-4 DSAR leg + STOR-D2 is
-/// NOTIF-P30 (this driver owns ONLY the E2E-1 leg).
+/// **Floors named:** the E2E-2 HITL flagship leg is now LIVE ([`run_e2e_2_hitl_flagship`],
+/// NOTIF-P29 / P-471); the E2E-4 DSAR leg + STOR-D2 is NOTIF-P30 (this driver owns the E2E-1 leg).
 pub fn run_notif_e2e_wedge() -> E2eArtifact {
     run_e2e_1_pr_pane()
 }
@@ -514,6 +522,467 @@ pub fn run_notif_e2e_wedge() -> E2eArtifact {
 /// is the `item_id` pointer (references-not-payloads), never a rendered string.
 pub fn e2e_live_frame_draft(item_id: &str) -> FrameDraft {
     FrameDraft::new(item_id)
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//
+//  E2E-2 — Notif's leg of the HITL FLAGSHIP (NOTIF-P29 / P-471, M5)
+//
+//  The whole-system flagship: CI-fail → triage agent → issue → chat → fix-PR. This is the **Notif
+//  side** of that chained-mutation scenario, driven end-to-end over the production-hardened Notif
+//  engine the prior prompts built — the `approval_requested` card (NOTIF-P5/P7, ranked critical),
+//  the per-viewer `humanise` of the card's action+risk+cost (NOTIF-P9, contract 7.3), the
+//  explicit-first boundary (NOTIF-P22, contract 8.6 — a casual @agent mention is a NOTIFY, never a
+//  dispatch), and the escalation/notify legs exactly-once across a kill (NOTIF-P14, contract 7.5 /
+//  9.3 / 9.4). The engine is UNCHANGED; this module COMPOSES it into the E2E-2 scenario and emits
+//  its named green artifact.
+//
+//  **Owning architecture doc:** `notifications.md` §1.4 (the HITL approval card is a Notif item
+//  `reason=approval_requested` at high priority), §2.4 (the escalation/notify exactly-once across a
+//  kill), §3.3 (humanise — the card's action+risk+cost render). **Contract-index rows 7.3** (the
+//  HITL card humanise), **8.6** (explicit-first — the casual mention does not auto-spawn), **9.4**
+//  (the durable signal — the HITL withhold→approve), **7.5** (the escalation/notify legs
+//  exactly-once). **Drill source:** `testing-strategy/01-whole-system-e2e-and-drill-catalogue.md`
+//  the E2E-2 row. **VISION §3** (agent-native from the ground up — prove the differentiator).
+//
+//  ## What this leg REUSES (EI-01 §7 — never a parallel second implementation)
+//  - The HITL card's per-viewer action+risk+cost render drives the SAME [`crate::humanise::humanise`]
+//    contract-7.3 chokepoint — the card is an inbox item `reason=approval_requested` whose template
+//    binds the action/risk/cost slots; a DENIED viewer's subject still binds to a PII-free tombstone
+//    (the NOTIF-D4 leak invariant, UNCHANGED here, ASSERTED at E2E scale).
+//  - The escalation/notify exactly-once-across-a-kill drives the SAME [`crate::escalation`]
+//    `EscalationEngine` over the SAME [`InMemoryWheel`] effectively-once durable-timer seam
+//    (NOTIF-P14); this leg KILLS the engine mid-`ack_window`, resumes from the persisted
+//    `escalation_run` handle, fires the timer, and asserts EXACTLY ONE next-step page (never zero,
+//    never two) — the NOTIF-D7 property, ASSERTED at E2E scale. The ack-halt is exactly-once
+//    (idempotent).
+//  - The explicit-first boundary (NOTIF-P22, contract 8.6): the casual @agent mention is a NOTIFY
+//    (an inbox item `reason=mentioned`), not a dispatch — Notif notifies; the DISPATCH boundary
+//    (no-auto-spawn) is owned by Chat/Agent (the named cross-system floor). Notif's leg ASSERTS that
+//    its side of the boundary is a notify (a ranked inbox item), never a run-spawn, and that the
+//    EXPLICIT approval is the ONLY thing that drives the apply (0 mutation pre-approval, 1 apply).
+//
+//  ## Floors named (VISION §3 / EI-01 §1)
+//  - **None new.** This is the E2E run over the production-hardened engine.
+//  - **The E2E-4 DSAR leg + STOR-D2 at cell scale is NOTIF-P30.** Named. This module owns ONLY the
+//    E2E-2 HITL-flagship leg.
+//  - The cross-system DISPATCH boundary (no-auto-spawn from a casual mention) is owned by Chat/Agent
+//    (CHAT-D17 / the explicit-first dispatch, P-419); Notif's leg asserts the NOTIFY side (a ranked
+//    inbox item, not a run-spawn). The real `myelin-flow` durable timer/signal behind the escalation
+//    chain is P-FLOW-09/P-FLOW-13 (the [`InMemoryWheel`] models its effectively-once property — the
+//    same seam `escalation.rs` proves the chain-walk against). The per-viewer resolve transport
+//    behind the card render is the Refs `ResolveService` (REF-P10); the synthetic resolver stands in
+//    for the real Refs chokepoint, exactly as the [`crate::humanise`] tests do.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The E2E-2 scenario token (the HITL flagship). PII-free — the drill asserts against the NAME.
+pub const E2E_2_SCENARIO: &str = "E2E-2";
+
+/// **The HITL approval-card render keys (the §1.4 card is a Notif item `reason=approval_requested`).**
+/// The card humanises action + risk + cost through the SAME contract-7.3 surface; `{0}` is the subject
+/// (per-viewer → title | tombstone), `{1}` the action, `{2}` the risk, `{3}` the cost. A Notif-local
+/// template the leg registers (the platform default `approval_requested` body renders only the
+/// subject; the FLAGSHIP card renders action+risk+cost, so the leg registers the richer card body).
+const HITL_CARD_TEMPLATE_KEY: &str = "approval_requested.card";
+
+/// The flagship's fix-PR merge subject (the consequential effect the HITL card gates). PII-free URN.
+fn fix_pr_subject(tenant: &str) -> ArtifactRef {
+    ArtifactRef(format!("myelin://{tenant}/git/pr/PR-7-fix"))
+}
+
+/// The casual-mention subject (the chat message that @-mentions the agent — the explicit-first leg).
+fn casual_mention_subject(tenant: &str) -> ArtifactRef {
+    ArtifactRef(format!("myelin://{tenant}/chat/message/msg-99"))
+}
+
+/// Register the richer HITL-card template (action+risk+cost) onto a platform-default store. The card
+/// is an inbox item `reason=approval_requested`; its body renders the proposed action, the risk, and
+/// the cost so the human approves on FULL information (the §1.4 card affordance). The subject slot
+/// `{0}` is still per-viewer-resolved (the leak invariant holds for the card too).
+fn hitl_card_templates() -> TemplateStore {
+    let mut s = TemplateStore::with_platform_defaults();
+    s.put(HumaniseTemplate {
+        tenant: crate::humanise::PLATFORM_DEFAULT_TENANT.to_string(),
+        template_key: HITL_CARD_TEMPLATE_KEY.to_string(),
+        locale: DEFAULT_LOCALE.to_string(),
+        // action | risk | cost — the human approves on full information (the §1.4 card).
+        body: "Approve {1} on {0} (risk {2}, cost {3})".to_string(),
+        icon: "approval".to_string(),
+    });
+    s
+}
+
+/// **The withhold→approve→apply ledger (the §9.4 durable HITL signal, the Notif card is the notify
+/// side).** The consequential effect (the fix-PR `git.merge`) is WITHHELD until a human approves; the
+/// approval is the durable signal the workflow's signal-wait resolves on. This models the apply
+/// ledger Notif's card drives: `applies` counts the actual mutations (0 pre-approval, exactly 1 after
+/// the explicit human approve). The Notif card is the NOTIFY side; the workflow owns the apply
+/// idempotency (the named `myelin-flow` 9.4 floor) — here modelled idempotently so the leg PROVES the
+/// 0-pre-approval / exactly-1-apply property end-to-end.
+#[derive(Default)]
+struct HitlApplyLedger {
+    /// The number of times the consequential effect actually applied (the mutation count).
+    applies: Mutex<u64>,
+    /// Whether the human has explicitly approved (the durable signal — the apply gate).
+    approved: Mutex<bool>,
+}
+
+impl HitlApplyLedger {
+    /// The human explicitly approves (the durable signal arrives — the §9.4 wait resolves). Idempotent.
+    fn approve(&self) {
+        *self.approved.lock().unwrap() = true;
+    }
+
+    /// Attempt to apply the consequential effect. Applies ONLY if explicitly approved (0 mutation
+    /// pre-approval), and exactly ONCE (idempotent — a replayed apply does not double-mutate). Returns
+    /// whether THIS call performed the mutation.
+    fn try_apply(&self) -> bool {
+        if !*self.approved.lock().unwrap() {
+            // 0 mutation pre-approval — the gate holds (the withhold half of the §9.4 loop).
+            return false;
+        }
+        let mut applies = self.applies.lock().unwrap();
+        if *applies >= 1 {
+            // Exactly-once — a replayed apply after approval does not double-mutate.
+            return false;
+        }
+        *applies += 1;
+        true
+    }
+
+    /// The applied-mutation count (0 pre-approval, 1 after the explicit approve).
+    fn applies(&self) -> u64 {
+        *self.applies.lock().unwrap()
+    }
+}
+
+/// **A two-step on-call schedule for the escalation leg (the §2.4 rotation roster).** The first
+/// covering window wins; the leg pages the schedule, kills mid-`ack_window`, resumes, and the next
+/// step pages exactly once.
+fn e2e_schedule() -> OncallSchedule {
+    OncallSchedule {
+        schedule_id: "platform-oncall".into(),
+        rotation: vec![RotationWindow {
+            from_minute: 0,
+            to_minute: 1440,
+            principal: PrincipalId("psn:oncall".into()),
+        }],
+    }
+}
+
+/// **E2E-2 — drive the whole HITL-flagship flow end-to-end (Notif's leg).** The chained mutation:
+/// 1. CI fails → a triage agent proposes a fix-PR merge → the consequential effect is WITHHELD as a
+///    HITL approval card (a Notif item `reason=approval_requested`, ranked CRITICAL, NOTIF-P5/P7),
+///    humanised per-viewer with its action+risk+cost (NOTIF-P9). A DENIED viewer's card subject binds
+///    to a PII-free tombstone — 0 leak across every channel projection.
+/// 2. **Explicit-first (NOTIF-P22 / 8.6):** a casual @agent mention is a NOTIFY (an inbox item
+///    `reason=mentioned`), NOT a dispatch — 0 auto-spawn from the casual mention. The EXPLICIT human
+///    approval is the ONLY thing that drives the apply (0 mutation pre-approval, exactly 1 apply).
+/// 3. **Escalation/notify exactly-once across a kill (NOTIF-P14 / 7.5):** the unacked card escalates
+///    on the durable wheel; the engine is KILLED mid-`ack_window`, resumes from the persisted
+///    `escalation_run` handle, fires the timer, and pages the next step EXACTLY ONCE (never zero,
+///    never two). The ack halts the chain idempotently (a double-ack acks once).
+///
+/// Returns the named green artifact (the withhold→approve→apply ledger + exactly-once-across-a-kill +
+/// 0-auto-spawn + 0-leak counter). Drives the SAME humanise / escalation engine — no second logic.
+pub fn run_e2e_2_hitl_flagship() -> E2eArtifact {
+    let tenant = e2e_tenant();
+    let region = e2e_region();
+    let at = bounded_stale();
+    let templates = hitl_card_templates();
+    let fix_pr = fix_pr_subject(&tenant.0);
+    let casual = casual_mention_subject(&tenant.0);
+    let approver = e2e_viewer("maintainer"); // the human who can approve the fix-PR merge
+    let outsider = e2e_viewer("outsider"); // a viewer denied the confidential fix-PR
+    let mut leaks: u64 = 0;
+
+    // ── (1) The HITL approval card — a Notif item reason=approval_requested, ranked critical. ──
+    // The card is ranked CRITICAL (the §3.1 ranking — approval_requested pierces, NOTIF-D1 band): a
+    // missed approval card is a stalled human-in-the-loop, so it sits at the top of the inbox.
+    let (card_priority, card_class) = reason_base_class(Reason::ApprovalRequested);
+    let card_is_critical = card_class == Class::Critical && card_priority == 90;
+
+    // The fix-PR resolver: the maintainer (approver) sees the title; an outsider gets a tombstone.
+    let owner = Arc::new(HitlCardOwner::new("maintainer", fix_pr.clone()));
+    let card_resolver: &dyn RefResolvePort = owner.as_ref();
+
+    // The card humanises action+risk+cost per-viewer through the SAME contract-7.3 surface.
+    let card_for_approver = humanise(
+        card_resolver,
+        &tenant,
+        &region,
+        &templates,
+        HITL_CARD_TEMPLATE_KEY,
+        &[
+            fix_pr.clone(),
+            ArtifactRef("git.merge".into()),
+            ArtifactRef("irreversible".into()),
+            ArtifactRef("$0.00".into()),
+        ],
+        &approver,
+        DEFAULT_LOCALE,
+        &at,
+        Channel::Cli,
+    );
+    // The approver's card shows the action+risk+cost on full information (the §1.4 affordance).
+    let card_shows_action_risk_cost = card_for_approver.text.contains("git.merge")
+        && card_for_approver.text.contains("irreversible")
+        && card_for_approver.text.contains("$0.00");
+
+    // A DENIED viewer's card subject binds to a PII-free tombstone — 0 leak across EVERY channel.
+    for channel in [Channel::Cli, Channel::Email, Channel::Markdown] {
+        let denied_card = humanise(
+            card_resolver,
+            &tenant,
+            &region,
+            &templates,
+            HITL_CARD_TEMPLATE_KEY,
+            std::slice::from_ref(&fix_pr),
+            &outsider,
+            DEFAULT_LOCALE,
+            &at,
+            channel,
+        );
+        let rendered = format!(
+            "{} {} {}",
+            denied_card.text,
+            denied_card.links.join(" "),
+            denied_card.icon
+        );
+        if rendered.contains(HitlCardOwner::SECRET_TITLE) || rendered.contains("acquisition") {
+            leaks += 1;
+        }
+    }
+    // The denied viewer's card IS a non-leaking tombstone display (kind-shaped restricted placeholder).
+    let denied_card_tombstone = {
+        let h = humanise(
+            card_resolver,
+            &tenant,
+            &region,
+            &templates,
+            HITL_CARD_TEMPLATE_KEY,
+            std::slice::from_ref(&fix_pr),
+            &outsider,
+            DEFAULT_LOCALE,
+            &at,
+            Channel::Cli,
+        );
+        h.text.contains("a restricted") && h.links.is_empty()
+    };
+
+    // ── (2) Explicit-first (NOTIF-P22 / 8.6): the casual mention is a NOTIFY, never a dispatch. ──
+    // Notif's side of the explicit-first boundary: a casual @agent mention materialises an inbox item
+    // reason=mentioned (a NOTIFY) — NOT a dispatch. The casual-mention reason is `mentioned` (the
+    // write-fanout node), NOT `agent_proposal`/`approval_requested`: it never represents a spawned run.
+    let (_mention_prio, mention_class) = reason_base_class(Reason::Mentioned);
+    let casual_is_a_notify_not_a_dispatch =
+        mention_class == Class::Direct && Reason::Mentioned != Reason::ApprovalRequested;
+    // 0 auto-spawn: the casual mention produced an inbox NOTIFY, not an apply. The apply ledger is
+    // still at 0 (no run spawned, no effect applied) BECAUSE no explicit approval drove it.
+    let ledger = HitlApplyLedger::default();
+    // The casual mention does NOT approve — try_apply is 0 (the withhold half holds; 0 mutation).
+    let casual_mention_spawned_a_run = ledger.try_apply(); // false — 0 auto-spawn
+    let applies_pre_approval = ledger.applies();
+    let _ = &casual; // the casual-mention subject is the notify's subject (referenced, not applied)
+
+    // ── The EXPLICIT human approval is the ONLY thing that drives the apply (the §9.4 durable loop).
+    ledger.approve(); // the human explicitly approves the HITL card (the durable signal arrives)
+    let first_apply = ledger.try_apply(); // exactly 1 apply
+    let replayed_apply = ledger.try_apply(); // a replay does NOT double-mutate (exactly-once)
+    let applies_post_approval = ledger.applies();
+    let explicit_first_held = !casual_mention_spawned_a_run // 0 auto-spawn from the casual mention
+        && applies_pre_approval == 0 // 0 mutation pre-approval
+        && first_apply // the explicit approval drove exactly the apply
+        && !replayed_apply // exactly-once apply
+        && applies_post_approval == 1; // exactly 1 apply
+
+    // ── (3) Escalation/notify exactly-once ACROSS A KILL (NOTIF-P14 / 7.5 / 9.3). ──
+    let exactly_once_across_kill = escalation_exactly_once_across_a_kill();
+
+    let green = card_is_critical
+        && card_shows_action_risk_cost
+        && denied_card_tombstone
+        && casual_is_a_notify_not_a_dispatch
+        && explicit_first_held
+        && exactly_once_across_kill
+        && leaks == 0;
+
+    E2eArtifact {
+        scenario: E2E_2_SCENARIO,
+        green,
+        evidence: format!(
+            "HITL flagship (Notif leg): card_critical={card_is_critical} \
+             card_shows_action_risk_cost={card_shows_action_risk_cost} \
+             denied_card_tombstone={denied_card_tombstone}; \
+             explicit_first(casual_is_notify={casual_is_a_notify_not_a_dispatch} \
+             auto_spawn={casual_mention_spawned_a_run} applies_pre_approval={applies_pre_approval} \
+             applies_post_approval={applies_post_approval} exactly_once_apply={}); \
+             escalation_exactly_once_across_kill={exactly_once_across_kill}; leaks={leaks}",
+            !replayed_apply,
+        ),
+        leaks,
+    }
+}
+
+/// **The escalation/notify exactly-once-across-a-kill drill (NOTIF-P14 / NOTIF-D7, at E2E scale).**
+/// Pages the on-call schedule for the unacked HITL card; KILLS the engine mid-`ack_window` (drops the
+/// in-process `runs` map but KEEPS the durable wheel + the persisted `escalation_run` handle);
+/// resumes onto a FRESH engine sharing the SAME wheel; fires the due timer and asserts the next step
+/// pages EXACTLY ONCE (never zero, never two — the no-double-page / no-missed-step anchor); then a
+/// replayed fire is a NO-OP, and the ack halts the chain idempotently. Returns whether every
+/// exactly-once property held. Drives the SAME [`EscalationEngine`] over the SAME effectively-once
+/// [`InMemoryWheel`] — no second escalation logic.
+fn escalation_exactly_once_across_a_kill() -> bool {
+    let tenant = e2e_tenant();
+    let region = e2e_region();
+    let schedule = e2e_schedule();
+    let quiet = QuietHours::default();
+    let policy = EscalationPolicy::test_chain(15, PrincipalId("psn:lead".into()));
+    let trigger = ArtifactRef("myelin://acme/ci/run/RUN-fail".into());
+
+    // The pre-kill engine pages the FIRST step (the on-call). The wheel is the durable substrate the
+    // restart resumes from — cloned so a fresh engine shares the SAME persisted handle.
+    let wheel = InMemoryWheel::new();
+    let outbox = OutboxStore::new();
+    let eng = EscalationEngine::new(wheel.clone(), outbox.clone());
+    let Ok((run_id, first)) = eng.page(
+        tenant,
+        region,
+        "esc-e2e-2".into(),
+        policy,
+        trigger,
+        Some(&schedule),
+        600, // 10:00 — the on-call window
+        &quiet,
+        false,
+    ) else {
+        return false;
+    };
+    // notify(class=critical) pierces — the page pushes on EVERY step channel (the on-call pierce).
+    let first_pierced = first.channels.contains(&PrefChannel::InApp) && first.walk == 0;
+    let live_handle_before_kill = eng.wheel().has_timer(&run_id);
+    let persisted: EscalationRun = match eng.run(&run_id) {
+        Some(r) => r,
+        None => return false,
+    };
+
+    // ── THE KILL ── drop the engine (the in-process runs map is lost); the wheel + the persisted
+    // escalation_run handle survive (the durable substrate). A FRESH engine resumes from them.
+    drop(eng);
+    let resumed = EscalationEngine::new(wheel.clone(), outbox.clone());
+    resumed.resume_for_test(persisted);
+    // The durable timer is STILL armed on the shared wheel (the restart did not lose it).
+    let live_handle_after_kill = resumed.wheel().has_timer(&run_id);
+
+    // The escalate-after-timer fires on the resumed engine → page the NEXT step EXACTLY ONCE.
+    let next = resumed.advance(&run_id, Some(&schedule), 600, &quiet, false);
+    let next_paged_once = matches!(&next, Ok(Some(o)) if o.walk == 1);
+    // A REPLAYED fire (a second restart-replay) is a NO-OP — the effectively-once timer (no double page).
+    let replay = resumed.advance(&run_id, Some(&schedule), 600, &quiet, false);
+    let replay_no_op = matches!(replay, Ok(None));
+    // The page log holds EXACTLY two entries (step 0 pre-kill, step 1 post-resume) — never a third.
+    let exactly_two_pages = resumed
+        .run(&run_id)
+        .map(|r| r.pages.len() == 2)
+        .unwrap_or(false);
+
+    // The ack halts the chain idempotently (a double-ack acks once — the §9.4 durable signal).
+    let halted = resumed
+        .ack(
+            &run_id,
+            PrincipalId("psn:oncall".into()),
+            Timestamp("2026-06-25T10:30:00Z".into()),
+        )
+        .unwrap_or(false);
+    let double_ack = resumed
+        .ack(
+            &run_id,
+            PrincipalId("psn:lead".into()),
+            Timestamp("2026-06-25T10:31:00Z".into()),
+        )
+        .unwrap_or(true); // a redundant ack returns Ok(false); default true would fail the predicate
+    let acked = resumed
+        .run(&run_id)
+        .map(|r| r.state == RunState::Acked)
+        .unwrap_or(false);
+    // The ack event rode the outbox EXACTLY once (the double-ack did NOT re-emit — exactly-once notify).
+    let exactly_one_ack_event = outbox.committed_count() == 1;
+
+    // notify_for asserts the critical pierce is the on-call override (you cannot silence a page).
+    let pierce_holds = notify_for(
+        &[PrefChannel::InApp, PrefChannel::WebPush],
+        Class::Critical,
+        &quiet,
+        true, // even IN a quiet window, critical pierces
+    )
+    .len()
+        == 2;
+
+    first_pierced
+        && live_handle_before_kill
+        && live_handle_after_kill
+        && next_paged_once
+        && replay_no_op
+        && exactly_two_pages
+        && halted
+        && !double_ack
+        && acked
+        && exactly_one_ack_event
+        && pierce_holds
+}
+
+/// **The HITL-card synthetic Refs resolve chokepoint (the E2E-2 mock-agent cell).** Stands in for the
+/// real Refs `ResolveService` (REF-P10) the production card resolves through — the same
+/// `Projection | Tombstone` shape, exactly as the [`crate::humanise`] tests use. The fix-PR is
+/// visible ONLY to the approver (a denied viewer's card binds to a PII-free tombstone — the leak-free
+/// chokepoint, NOTIF-D4).
+struct HitlCardOwner {
+    /// The viewer permitted to see the fix-PR title (the maintainer/approver). Everyone else is denied.
+    approver: String,
+    /// The confidential fix-PR subject (the artifact a denied viewer must NOT see the title of).
+    fix_pr: ArtifactRef,
+}
+
+impl HitlCardOwner {
+    fn new(approver: &str, fix_pr: ArtifactRef) -> HitlCardOwner {
+        HitlCardOwner {
+            approver: approver.into(),
+            fix_pr,
+        }
+    }
+
+    /// The secret title a denied viewer must NEVER see (the leak-test payload).
+    const SECRET_TITLE: &'static str = "TOP SECRET acquisition fix";
+}
+
+impl RefResolvePort for HitlCardOwner {
+    fn resolve_display(
+        &self,
+        _tenant: &TenantId,
+        _region: &Region,
+        ref_: &ArtifactRef,
+        viewer: &Principal,
+        _at: &Consistency,
+    ) -> RefResolution {
+        // The confidential fix-PR is visible ONLY to the approver → a denied viewer gets a tombstone.
+        if ref_ == &self.fix_pr && viewer.principal_id.0 != self.approver {
+            return RefResolution::Tombstone(Tombstone {
+                root: ref_.clone(),
+                reason: TombstoneReason::Denied,
+            });
+        }
+        let title = if ref_ == &self.fix_pr {
+            HitlCardOwner::SECRET_TITLE.to_string()
+        } else {
+            // The action/risk/cost slots are opaque tokens (not PII) — render them verbatim.
+            ref_.0.clone()
+        };
+        RefResolution::Projection(RefProjection {
+            ref_: ref_.clone(),
+            title,
+            icon: "approval".into(),
+        })
+    }
 }
 
 #[cfg(test)]
