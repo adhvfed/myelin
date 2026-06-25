@@ -85,6 +85,10 @@ pub mod defaults;
 pub mod dispatch;
 pub mod dispatch_surge;
 pub mod dry_run;
+/// The Fabric's FULL `PersonalDataHolder` BODIES + the AG-D10 erasure fan-out (AG-P23 → P-479): the
+/// per-subject DEK crypto-shred, pseudonym attribution fallback, the erasure ledger + post-restore
+/// re-erasure. Fills the AG-P3 [`holder`] floor with real locate/export/erase.
+pub mod dsr;
 pub mod effect_api;
 pub mod escape_gate;
 pub mod exec;
@@ -111,6 +115,14 @@ pub mod trace_seam;
 pub use holder::{
     agent_store_classifier, register_agent_holders, AgentHolderRegistration, AgentOltpHolder,
     AgentTraceHolder, AGENT_OLTP_STORE, AGENT_TRACE_STORE,
+};
+
+// The Fabric's FULL DSR holder BODIES + the AG-D10 erasure fan-out (AG-P23 → P-479): the real
+// locate/export/erase over the per-subject DEK crypto-shred + pseudonym attribution fallback, the
+// erasure ledger + post-restore re-erasure.
+pub use dsr::{
+    subject_dek_ref, AgentFabricHolder, AgentFabricStore, FabricEraseReceipt, FabricErasureLedger,
+    FabricLocateReport, FabricReErasureReceipt, FreeTextRow, RunAttribution,
 };
 
 // The SKELETON runtime (AG-P4 → P-216): the gateway → identity → dispatch → reserve → trace path at
