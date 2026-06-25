@@ -251,6 +251,47 @@ mod tests {
         assert!(ledger.is_empty(), "revert removed the only pair");
     }
 
+    /// **`forget` returns whether a mark was actually removed (the reindex-after-wipe path).** The
+    /// boolean is load-bearing: a FULL reindex forgets the snapshot's mark for the scope so the cold
+    /// rebuild re-applies it. Forgetting a PRESENT mark returns `true` (and the pair is gone so a
+    /// redelivery re-runs the handler); forgetting an ABSENT mark returns `false` (nothing to do).
+    /// Pins the `true`/`false` return (a constant-`true` mutant would falsely claim a wipe happened
+    /// on an empty scope; a constant-`false` would hide a real forget). (P-507 mutation gate.)
+    #[test]
+    fn forget_returns_whether_a_mark_was_removed_and_re_runs_the_handler() {
+        let ledger = DedupLedger::new();
+        let c = consumer("indexer");
+        let id = EventId("01J-snapshot".into());
+
+        // forgetting an ABSENT mark is a no-op → false.
+        assert!(
+            !ledger.forget(&c, &id),
+            "forgetting a mark that was never present returns false"
+        );
+
+        // mark it handled, then forget it: a PRESENT mark → true, and the pair is gone.
+        assert!(ledger.mark_handled(&c, &id), "first delivery is fresh");
+        assert!(ledger.is_handled(&c, &id), "the pair is handled");
+        assert!(
+            ledger.forget(&c, &id),
+            "forgetting a present mark returns true"
+        );
+        assert!(
+            !ledger.is_handled(&c, &id),
+            "after forget the pair is unhandled — the cold rebuild re-applies the snapshot"
+        );
+        // forgetting again (now absent) is false.
+        assert!(
+            !ledger.forget(&c, &id),
+            "a second forget of the now-absent mark returns false"
+        );
+        // and a re-delivery after forget is FRESH again (the handler re-runs).
+        assert!(
+            ledger.mark_handled(&c, &id),
+            "redelivery after forget is fresh → the handler re-runs (reindex-after-wipe)"
+        );
+    }
+
     /// The 2.5 migration is the frozen shape: the `(consumer, event_id)` PK + the columns are
     /// present; forward-only (no destructive DROP).
     #[test]

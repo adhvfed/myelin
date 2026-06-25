@@ -466,11 +466,17 @@ impl<T: BusTransport> Relay<T> {
                 break;
             }
             let r = self.drain_once();
-            let made_progress = r.published > 0 || r.deduplicated > 0 || r.dead_lettered > 0;
+            // Progress = published OR deduplicated. The `dead_lettered` count is structurally ALWAYS
+            // 0 within THIS loop (a row only dead-letters on its MAX_PUBLISH_ATTEMPTS-th FAILED pass,
+            // but an all-failed pass makes NO progress so the loop breaks BEFORE any row reaches the
+            // dead-letter bound — dead-lettering happens via repeated `drain_once`, never inside
+            // `drain_to_empty`). So a `dead_lettered` progress term / accumulation would be dead code
+            // (always 0); it is deliberately OMITTED — the report still surfaces dead-letters via
+            // `drain_once`, and `dead_letter_count()` is the durable surfaced signal.
+            let made_progress = r.published > 0 || r.deduplicated > 0;
             total.published += r.published;
             total.deduplicated += r.deduplicated;
             total.failed += r.failed;
-            total.dead_lettered += r.dead_lettered;
             // No progress (broker down: every row failed, none dead-lettered yet) → stop so we
             // do not spin forever. The caller heals the broker and drains again.
             if !made_progress {
@@ -1006,6 +1012,52 @@ mod tests {
         );
     }
 
+    /// **`drain_to_empty` keeps looping while it makes progress via DEDUP across MULTIPLE passes.**
+    /// Pre-deliver 5 rows to the broker (the crash-before-mark state), then a transient outage fails
+    /// the first 2 puts of pass 1: pass 1 dedups 3 (depth 2 left, progress via dedup); pass 2 dedups
+    /// the 2 retried — total deduplicated 5, depth → 0. Pins the `r.deduplicated > 0` progress term
+    /// and the second `||` (a `>`→`<` or `||`→`&&` mutant would stop after pass 1, leaving depth 2).
+    /// (P-507 mutation gate.)
+    #[test]
+    fn drain_to_empty_loops_on_dedup_progress_across_passes() {
+        let store = OutboxStore::new();
+        let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+        let ids = commit_n(&store, minter, 5, "issue:PROJ-1");
+        let bus = InProcessBus::new();
+        // pre-deliver every row directly (crash-before-mark): each id is now in the broker's
+        // accepted set, so a relay re-claim will be Deduplicated (not published).
+        for id in &ids {
+            let row = store.row(id).unwrap();
+            bus.put(&row.subject, &row.envelope, &row.event_id).unwrap();
+        }
+        assert_eq!(store.outbox_depth(), 5, "delivered but not yet marked sent");
+        // a transient outage fails the first 2 re-claims of pass 1 (checked BEFORE dedup), so pass 1
+        // can only dedup 3 → depth 2 remains → the loop MUST continue (driven by dedup progress).
+        bus.fail_next(2);
+
+        let relay = Relay::new(store.clone(), bus.clone(), clock);
+        let total = relay.drain_to_empty();
+        assert_eq!(
+            total.deduplicated, 5,
+            "all 5 dedups accumulate ACROSS the two passes (the dedup progress term keeps looping)"
+        );
+        assert_eq!(
+            total.published, 0,
+            "nothing newly published (already delivered)"
+        );
+        assert_eq!(total.failed, 2, "the 2 transient failures are reported");
+        assert_eq!(
+            store.outbox_depth(),
+            0,
+            "the outbox fully drained over 2 passes via the dedup path (0 lost)"
+        );
+        assert_eq!(
+            bus.delivered_count(),
+            5,
+            "still exactly 5 delivered (no ghost)"
+        );
+    }
+
     /// The in-process broker's `purge` clears the delivered/dedup state, and `ack` records the
     /// consumer high-water (the frozen `put/consume/ack/purge` shape is fully exercised).
     #[test]
@@ -1204,6 +1256,86 @@ mod tests {
             store.outbox_depth(),
             4,
             "all four rows still parked + deliverable"
+        );
+    }
+
+    /// **EB-04 — GC reaps STRICTLY before the cutoff: a row published EXACTLY at the cutoff is
+    /// retained.** Pins the `published_at < cutoff` strict comparison (a `<=` mutant would reap a
+    /// row at the cutoff instant — but the retention window is `[cutoff, now]`, so a row at the
+    /// cutoff boundary is the youngest still-retained row, NOT reaped). (P-507 mutation gate.)
+    #[test]
+    fn eb04_gc_is_strict_before_cutoff_a_row_at_the_cutoff_is_retained() {
+        let store = OutboxStore::new();
+        let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+        let ids = commit_n(&store, minter, 2, "issue:PROJ-1");
+        let cutoff = Timestamp("2026-06-18T12:00:00Z".into());
+
+        // row 0 published one second BEFORE the cutoff → reaped; row 1 published EXACTLY at the
+        // cutoff → retained (strict `<`).
+        store.mark_published(&ids[0], Timestamp("2026-06-18T11:59:59Z".into()));
+        store.mark_published(&ids[1], cutoff.clone());
+
+        let relay = Relay::new(store.clone(), InProcessBus::new(), clock);
+        let reaped = relay.gc_published(&cutoff);
+        assert_eq!(
+            reaped, 1,
+            "only the row strictly BEFORE the cutoff is reaped"
+        );
+        assert!(
+            store.row(&ids[0]).is_none(),
+            "the row before the cutoff was reaped"
+        );
+        assert!(
+            store.row(&ids[1]).is_some(),
+            "the row AT the cutoff is retained (strict `<`, not `<=`)"
+        );
+    }
+
+    /// **EB-04 — the `Box<dyn BusTransport>` blanket forward is faithful for `ack` + `purge`.** The
+    /// harness holds a `Relay<Box<dyn BusTransport>>`, so the boxed forwarders (each `(**self)
+    /// .method(..)`) MUST reach the inner transport. Drives `ack`/`purge` THROUGH the boxed type
+    /// and asserts the effect lands on the inner bus (a no-op `()` mutant of either forwarder would
+    /// silently drop the ack/purge). (P-507 mutation gate.)
+    #[test]
+    fn boxed_bustransport_forwards_ack_and_purge_to_the_inner_bus() {
+        let store = OutboxStore::new();
+        let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+        let ids = commit_n(&store, minter, 2, "issue:PROJ-1");
+        let inner = InProcessBus::new();
+        // box the transport (the harness shape) and drain through it.
+        let boxed: Box<dyn BusTransport> = Box::new(inner.clone());
+        Relay::new(store.clone(), boxed, clock).drain_to_empty();
+        assert_eq!(
+            inner.delivered_count(),
+            2,
+            "drained through the boxed transport"
+        );
+
+        // consume THROUGH a boxed handle returns the relayed envelopes (a `vec![]` mutant of the
+        // boxed `consume` forward would return nothing — pin the forward).
+        let boxed_consumer: Box<dyn BusTransport> = Box::new(inner.clone());
+        let consumed = boxed_consumer.consume("myelin://acme/issues/issue/");
+        assert_eq!(
+            consumed.len(),
+            2,
+            "the boxed `consume` forward returns the inner bus's 2 envelopes (not vec![])"
+        );
+
+        // ack THROUGH a fresh boxed handle reaches the inner bus's high-water.
+        let boxed2: Box<dyn BusTransport> = Box::new(inner.clone());
+        boxed2.ack("indexer", &ids[1]);
+        assert_eq!(
+            inner.ack_of("indexer").as_ref(),
+            Some(&ids[1]),
+            "the boxed `ack` forward landed on the inner bus"
+        );
+
+        // purge THROUGH the boxed handle clears the inner delivered/dedup state.
+        boxed2.purge();
+        assert_eq!(
+            inner.delivered_count(),
+            0,
+            "the boxed `purge` forward cleared the inner bus"
         );
     }
 

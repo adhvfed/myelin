@@ -148,6 +148,21 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // exclusion, reddening the lint-gate; restored here as part of the P-506 truth-up pass, the
     // code-wins-over-docs re-sync, EI-01 §1: an earlier-band gate may not stay red under a later band.)
     "myelin-harness/src/bin/m5-scorecard.rs",
+    // The Myelin self-hosting CI graph runner (the DOGFOOD loop, P-507 / P-S37 → M6): same posture
+    // as the band-boundary scorecard runners above — its `Command::new(env!("CARGO"))` spawns
+    // `cargo run`/`cargo test`/`cargo mutants` per ratchet job (the twelve lints + the
+    // contract-coverage scanner + the mandatory-core mutation gate + the SUB-D3/D6/D10 drills) on
+    // Myelin's OWN commit, the one legitimate host-exec site for a CI/test-support orchestration
+    // binary. NAMED, LOUD exclusion of a single tool file; the lint stays fully live on every
+    // production crate.
+    "myelin-harness/src/bin/self-hosting-ci.rs",
+    // The self-hosting CI graph DEFINITION module (P-507 / P-S37): carries `Command::new(env!
+    // ("CARGO"))` (the proof-command runner, same legitimate host-exec posture as the runner bin
+    // above) PLUS the ratchet proof-command argv tokens as FROZEN SCANNER DATA (the `self_hosting_
+    // jobs` table). Exactly the lint-crate-carries-forbidden-tokens-as-data posture as `myelin-
+    // lints/` itself. NAMED, LOUD exclusion of this single CI-orchestration module; the lint stays
+    // fully live on every production crate.
+    "myelin-harness/src/self_hosting_ci.rs",
     // The Firecracker + gVisor sandbox BACKENDS (CI-P2 → P-237): the ONE legitimate VMM/runtime
     // spawn sites. The `no-host-exec` rule forbids platform code SHELLING OUT to the host kernel so
     // that all execution goes through the unified sandbox seam (`SandboxBackend::launch`). These two

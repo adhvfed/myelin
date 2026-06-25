@@ -512,8 +512,14 @@ impl Breaker {
             }
             BreakerState::Closed => {
                 self.window.push_back(success);
+                // Trim the rolling window to its configured size. Bounded by the actual pop (the
+                // loop stops the instant `pop_front` yields `None`) so a mis-mutated length
+                // comparison can never spin on an already-empty deque — the substrate's bounded-
+                // everything posture even on a maintenance loop (contract 1.11).
                 while self.window.len() > cfg.breaker_window as usize {
-                    self.window.pop_front();
+                    if self.window.pop_front().is_none() {
+                        break;
+                    }
                 }
                 let total = self.window.len() as u32;
                 if total >= cfg.breaker_min_requests {
@@ -675,10 +681,16 @@ impl ResilientClient {
         let mut last_err: Option<CallError> = None;
         // `attempts_done` counts completed downstream attempts; the loop runs once and then
         // re-enters only while there is budget for a retry. Encoding the retry budget as a
-        // single `attempts_done < max_attempts` guard (rather than a `for` bound plus a
-        // separate early break) keeps the retry-count logic single-sourced.
+        // single `attempts_done < max_attempts` guard keeps the retry-count logic single-sourced.
+        //
+        // The loop is bounded by `max_attempts` iterations as a STRUCTURAL runaway guard (the
+        // substrate's bounded-everything doctrine, contract 1.11): the retry budget is the hard
+        // iteration ceiling, so no inner arithmetic error on `attempts_done` (a stuck increment,
+        // a flipped budget comparison) can ever spin the call forever — it exhausts the bound and
+        // returns the last error. The normal exit is still the `attempts_done >= max_attempts`
+        // return inside; this `for` is the belt-and-braces ceiling on top of it.
         let mut attempts_done: u32 = 0;
-        loop {
+        for _iteration in 0..max_attempts {
             // Between attempts (i.e. before every retry) sleep a full-jitter backoff unless
             // it would overrun the deadline, in which case we stop with the last error.
             if attempts_done > 0 {
@@ -758,6 +770,10 @@ impl ResilientClient {
                 return Err(last_err.unwrap_or(CallError::Timeout));
             }
         }
+        // The `for` ceiling was reached without an inner return (only possible if the inner
+        // budget guard was bypassed) — return the last error rather than fall through. This is the
+        // structural runaway guard's terminal: bounded-everything, never an infinite call.
+        Err(last_err.unwrap_or(CallError::Timeout))
     }
 
     /// (4) Full-jitter backoff (Brooker 2015): a uniform value in `[0, base * 2^attempt]`,
@@ -1161,6 +1177,74 @@ mod tests {
             "a saturated bulkhead must fast-fail, not queue"
         );
         assert_eq!(client.bulkhead_rejections(), 1);
+    }
+
+    /// **The bulkhead permit IS released when a call completes (the `BulkheadGuard::drop`).** With
+    /// a cap of 1: a first call takes + releases the permit on completion; a SECOND sequential call
+    /// then succeeds (the permit was freed). A no-op `drop` mutant would leak the permit, so the
+    /// second call would fast-fail BulkheadFull — this test pins the release. (P-507 mutation gate.)
+    #[test]
+    fn bulkhead_guard_releases_the_permit_on_drop_so_a_later_call_fits() {
+        let cfg = ResilientConfig {
+            bulkhead_max_concurrency: 1,
+            max_attempts: 1,
+            breaker_min_requests: 100,
+            ..ResilientConfig::default()
+        };
+        let client = client_with(cfg, Box::new(ZeroJitter));
+        let target = Target("svc".into());
+
+        // First call completes — its BulkheadGuard drops, releasing the single permit.
+        let r1 = client.call_op(&target, Idempotency::NonIdempotent, || {
+            Ok::<(), CallError>(())
+        });
+        assert_eq!(r1, Ok(()), "first call succeeds");
+        // Second sequential call fits ONLY if the permit was released on drop.
+        let r2 = client.call_op(&target, Idempotency::NonIdempotent, || {
+            Ok::<i32, CallError>(7)
+        });
+        assert_eq!(
+            r2,
+            Ok(7),
+            "the second call fits — the permit was released on drop (no leak)"
+        );
+        assert_eq!(
+            client.bulkhead_rejections(),
+            0,
+            "no bulkhead rejection — the permit was freed between calls"
+        );
+    }
+
+    /// **`config()` returns the configured per-target value set (the M0 floor accessor).** Pins the
+    /// accessor returns the ACTUAL config, not a `Default` (a `Box::leak(Default::default())` mutant
+    /// would return default numbers, hiding a tuned value set). (P-507 mutation gate.)
+    #[test]
+    fn config_accessor_returns_the_configured_values_not_default() {
+        let cfg = ResilientConfig {
+            bulkhead_max_concurrency: 7,
+            max_attempts: 9,
+            backoff_base_ms: 123,
+            ..ResilientConfig::default()
+        };
+        let client = client_with(cfg, Box::new(ZeroJitter));
+        let read = client.config();
+        assert_eq!(
+            read.bulkhead_max_concurrency, 7,
+            "config() returns the set cap"
+        );
+        assert_eq!(
+            read.max_attempts, 9,
+            "config() returns the set max_attempts"
+        );
+        assert_eq!(
+            read.backoff_base_ms, 123,
+            "config() returns the set backoff base"
+        );
+        // Guard: these are NOT the defaults (so a Default-returning mutant is distinguishable).
+        assert_ne!(
+            read.bulkhead_max_concurrency,
+            ResilientConfig::default().bulkhead_max_concurrency
+        );
     }
 
     // ---- Primitive (1): full-jitter backoff stays within the configured base. ----

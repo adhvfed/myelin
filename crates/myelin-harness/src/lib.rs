@@ -134,6 +134,7 @@ pub mod drills;
 pub mod load_generator;
 pub mod restore;
 pub mod scorecard;
+pub mod self_hosting_ci;
 pub mod telemetry;
 
 pub use cross_language_shim::{
@@ -150,6 +151,10 @@ pub use restore::{
     RestoredSnapshot, RestoredSnapshotBuilder, RtoGrain,
 };
 pub use scorecard::{Band, GateRow, RowResult, RowVerdict, Scorecard};
+pub use self_hosting_ci::{
+    run_graph, run_job_via_cargo, self_hosting_jobs, JobKind, JobResult, JobRunner, JobTool,
+    SelfHostJob, SelfHostingRun,
+};
 pub use telemetry::{
     AssertedSignal, Assertion, Label, Predicate, RejectReason, SignalName, SignalSource,
 };

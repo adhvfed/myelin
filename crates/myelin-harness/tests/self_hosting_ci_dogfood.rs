@@ -1,0 +1,176 @@
+//! The self-hosting CI graph IS the test (P-507 / P-S37 → M6) — the dogfood loop.
+//!
+//! The prompt's TESTS field: "The self-hosting CI pipeline IS the test: a Myelin commit triggers
+//! the lints + scanner + mutation gate; a deliberately-violating commit is rejected (the ratchet
+//! rejects on Myelin's own work)." These tests drive the graph with an INJECTED runner (no shelling
+//! to cargo — fast + hermetic), proving:
+//!   1. the frozen graph carries the substrate ratchet (the twelve lints + the scanner + the
+//!      mandatory-core mutation gate) AND drives SUB-D3/D6/D10 (the harness drives the drills);
+//!   2. an all-green commit reads GREEN (the dogfood gate passes on a clean commit);
+//!   3. a DELIBERATELY-VIOLATING commit (any ratchet job red) is REJECTED — the gate reds and names
+//!      the red job (the ratchet rejects on Myelin's own work, EI-01 §5).
+//!
+//! The REAL end-to-end run (`cargo run -p myelin-harness --bin self-hosting-ci`) shells the actual
+//! lints/scanner/mutation-gate/drills on Myelin's own commit; the CI job IS that artifact. These
+//! unit tests prove the graph's COMPOSITION + REJECTION LOGIC without the multi-minute cargo run.
+
+use myelin_harness::self_hosting_ci::{
+    run_graph, self_hosting_jobs, JobKind, JobResult, JobTool, SelfHostJob,
+};
+
+/// A stub runner that PASSES every job (a clean Myelin commit).
+fn all_green(job: &SelfHostJob) -> JobResult {
+    JobResult::Pass {
+        id: job.id.to_string(),
+        proof: format!("stub PASS `{}`", job.id),
+    }
+}
+
+/// A stub runner that reds exactly the job whose id is `violating` (a deliberately-violating
+/// commit: that one ratchet job exits non-zero).
+fn reds_one(violating: &'static str) -> impl Fn(&SelfHostJob) -> JobResult {
+    move |job: &SelfHostJob| {
+        if job.id == violating {
+            JobResult::Red {
+                id: job.id.to_string(),
+                reason: format!("stub RED `{}` — the deliberately-violating commit", job.id),
+            }
+        } else {
+            all_green(job)
+        }
+    }
+}
+
+#[test]
+fn the_graph_carries_the_substrate_ratchet_and_drives_the_drills() {
+    let jobs = self_hosting_jobs();
+
+    // The twelve architecture lints (the lint-gate job + the fixture matrix).
+    assert!(
+        jobs.iter()
+            .any(|j| j.id == "lints" && j.kind == JobKind::Lints),
+        "the self-hosting graph MUST run the twelve architecture lints on Myelin's own commit"
+    );
+    assert!(
+        jobs.iter()
+            .any(|j| j.id == "lints-fixtures" && j.kind == JobKind::Lints),
+        "the self-hosting graph MUST run the lint fixture matrix (the red-fixture rejects)"
+    );
+
+    // The contract-coverage scanner (the meta-gate + its self-test).
+    assert!(
+        jobs.iter()
+            .any(|j| j.id == "contract-coverage" && j.kind == JobKind::ContractCoverage),
+        "the self-hosting graph MUST run the contract-coverage scanner on Myelin's own commit"
+    );
+
+    // The mandatory-core cargo-mutants mutation gate — and it MUST run under `cargo mutants`.
+    let mutation = jobs
+        .iter()
+        .find(|j| j.id == "mutation-gate")
+        .expect("the self-hosting graph MUST run the mandatory-core cargo-mutants mutation gate");
+    assert_eq!(
+        mutation.kind,
+        JobKind::MutationGate,
+        "the mutation gate job must be a MutationGate"
+    );
+    assert_eq!(
+        mutation.tool,
+        JobTool::CargoMutants,
+        "the mutation gate MUST run under `cargo mutants` (reads .cargo/mutants.toml)"
+    );
+
+    // The harness drives the substrate's surge/restore/migration drills (SUB-D3/D6/D10).
+    for drill in ["SUB-D3", "SUB-D6", "SUB-D10"] {
+        assert!(
+            jobs.iter()
+                .any(|j| j.id == drill && j.kind == JobKind::Drill),
+            "the harness MUST drive {drill} as part of the self-hosting CI graph"
+        );
+    }
+}
+
+#[test]
+fn a_clean_commit_reads_green() {
+    let jobs = self_hosting_jobs();
+    let run = run_graph(&jobs, &all_green);
+
+    assert!(
+        run.is_green(),
+        "an all-green commit must read GREEN (the dogfood gate passes on a clean commit)"
+    );
+    assert!(run.red_jobs().is_empty(), "a green run names no red jobs");
+    assert_eq!(
+        run.results.len(),
+        jobs.len(),
+        "every job in the frozen graph is run (no fail-fast — the artifact is complete in one pass)"
+    );
+    // The rendered artifact reads GREEN and is dated.
+    let md = run.render_markdown();
+    assert!(
+        md.contains("GATE: GREEN"),
+        "a green run renders GATE: GREEN"
+    );
+    assert!(md.contains(&run.date), "the artifact carries the run date");
+}
+
+#[test]
+fn a_deliberately_violating_lint_commit_is_rejected() {
+    // The canonical rejection: a lint violation on Myelin's own commit reds the graph.
+    let jobs = self_hosting_jobs();
+    let run = run_graph(&jobs, &reds_one("lints"));
+
+    assert!(
+        !run.is_green(),
+        "a deliberately-violating commit (a lint red) MUST be rejected — the ratchet rejects on \
+         Myelin's own work (EI-01 §5)"
+    );
+    assert_eq!(
+        run.red_jobs(),
+        vec!["lints"],
+        "the gate names exactly the red ratchet job (loud, never swallowed)"
+    );
+    let md = run.render_markdown();
+    assert!(md.contains("GATE: RED"), "a red run renders GATE: RED");
+    assert!(
+        md.contains("lints"),
+        "the artifact names the red job so the rejection is auditable"
+    );
+}
+
+#[test]
+fn a_surviving_mutant_rejects_the_commit() {
+    // The mutation gate reds (a surviving mutant = a test gap on a mandatory-core module).
+    let jobs = self_hosting_jobs();
+    let run = run_graph(&jobs, &reds_one("mutation-gate"));
+    assert!(
+        !run.is_green(),
+        "a surviving mutant on a mandatory-core module MUST reject the commit"
+    );
+    assert_eq!(run.red_jobs(), vec!["mutation-gate"]);
+}
+
+#[test]
+fn a_red_substrate_drill_rejects_the_commit() {
+    // The harness-driven drills are part of the gate: a red SUB-D6 restore-verify reds the graph.
+    let jobs = self_hosting_jobs();
+    let run = run_graph(&jobs, &reds_one("SUB-D6"));
+    assert!(
+        !run.is_green(),
+        "a red substrate drill (SUB-D6) MUST reject the commit — the harness-driven drills are \
+         part of the self-hosting CI gate"
+    );
+    assert_eq!(run.red_jobs(), vec!["SUB-D6"]);
+}
+
+#[test]
+fn an_empty_run_is_not_green() {
+    // Guard: a run with no jobs is RED, not vacuously GREEN (dropping the whole graph cannot game
+    // the gate green — the same un-gameable discipline as the band scorecards).
+    let run = run_graph(&[], &all_green);
+    assert!(
+        !run.is_green(),
+        "an empty self-hosting run is RED, never vacuously GREEN — the gate cannot be gamed by \
+         dropping every job"
+    );
+}

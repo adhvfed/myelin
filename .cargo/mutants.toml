@@ -1,0 +1,66 @@
+# The MANDATORY-CORE cargo-mutants MUTATION GATE config (P-507 / P-S37, M6 — the dogfood loop).
+#
+# This is the COMMITTED config the substrate ratchet's mutation-gate job reads (an uncommitted
+# gate is no gate, EI-01 §5). cargo-mutants reads `.cargo/mutants.toml` by default, so wiring it
+# here makes the gate live on Myelin's OWN commits — the self-hosting CI graph runs
+# `cargo mutants` over exactly the mandatory-core surface below and FAILS LOUD if a mutant
+# survives (a surviving mutant = a test gap on a correctness-critical module).
+#
+# WHY THESE MODULES (the mandatory-core set the DEPENDS-ON names — P-S07/P-S08/P-S16/P-S18/
+# P-S19/P-S20, ledger-overview §6 "Mandatory-core modules carry a mutation-score floor"):
+#   - myelin-events/src/outbox.rs   — OutboxTx::emit causality + emit-iff-committed (P-S06/P-S07)
+#   - myelin-events/src/relay.rs    — the outbox relay drain (P-S07, SUB-D1/BUS-D4)
+#   - myelin-events/src/consumer.rs — the idempotent consumer template (P-S08, SUB-D2)
+#   - myelin-events/src/dedup.rs    — the consumer dedup ledger (P-S08)
+#   - myelin-client/src/lib.rs      — ResilientClient: timeout/breaker/bulkhead/retry (P-S16)
+#   - myelin-substrate/src/fail_static.rs — FailStatic<T> last-good cache (P-S18)
+#   - myelin-substrate/src/shed.rs        — the protected-human-lane shed order (P-S19/P-S20)
+#
+# Anything NOT in this examine set is OUT OF SCOPE for the gate (the surface is correctness-
+# critical glue, not every crate — a focused, fast, un-gameable gate, not a workspace-wide sweep).
+examine_globs = [
+    "crates/myelin-events/src/outbox.rs",
+    "crates/myelin-events/src/relay.rs",
+    "crates/myelin-events/src/consumer.rs",
+    "crates/myelin-events/src/dedup.rs",
+    "crates/myelin-client/src/lib.rs",
+    "crates/myelin-substrate/src/fail_static.rs",
+    "crates/myelin-substrate/src/shed.rs",
+]
+
+# cargo-mutants tests the PACKAGE CONTAINING each mutant by default (the mandatory-core surface
+# above spans myelin-events / myelin-client / myelin-substrate); that package's full test suite —
+# the in-crate `#[cfg(test)]` units AND the `tests/` drills (SUB-D1/D2/D5 etc.) — runs against
+# every mutant. A surviving mutant is a non-zero `cargo mutants` exit, which fails the self-hosting
+# CI graph's mutation job (LOUD, never swallowed).
+
+# EXCLUDE the genuinely-UN-UNIT-TESTABLE boundary lines from the gate (cargo-mutants' documented
+# scoping, NOT a weakening — these are observability/adapter/test-support boilerplate with no
+# behaviour a unit test can pin, exactly the trivial mutants the tool recommends skipping):
+#   - `fmt` (Display/Debug impls) — diagnostic string rendering, no logic;
+#   - `now_ms` / `sleep` (the REAL SystemTime clock adapter) — mocked by the `TimeSource` trait in
+#     every test BY DESIGN, so the real wall-clock impl is intentionally un-unit-tested (a unit
+#     test that asserts on the real clock would be flaky/non-deterministic);
+#   - `*_for_test` — test-support accessors (not production behaviour).
+# Every CORRECTNESS line (the breaker/bulkhead/retry math, the relay drain/GC, the dedup ledger,
+# the shed-lane graded thresholds) stays FULLY in the gate — see the targeted mutation-killing
+# tests added in P-507 (relay::drain_to_empty/gc, dedup::forget, shed::admit/validate_tuned).
+exclude_re = [
+    "::fmt ->",
+    "TimeSource for SystemTime",
+    "_for_test",
+    # An EQUIVALENT mutant (documented in lib.rs): `retry_through_tripped` is structurally ALWAYS
+    # 0 in correct code (the open-breaker guard makes a non-zero value unreachable), so a constant-
+    # `0` body is observably indistinguishable from the live atomic read. We keep the live read so a
+    # FUTURE regression that let a retry slip an open breaker reds the SUB-D5 `== 0` assertion — the
+    # equivalence is the PROPERTY, not a test gap.
+    "retry_through_tripped -> u64 with 0",
+]
+
+# A lower bound on the auto-set per-mutant test timeout. The baseline test suite is fast, so a
+# mutant that makes a test HANG (e.g. flipping a breaker/retry comparison into an infinite retry
+# loop in `ResilientClient::call_op` / `Breaker::record`) is DETECTED as a TIMEOUT — a caught
+# behavioural change. This floor keeps a legitimately-slow correctness test (the SUB-D drills)
+# from being mis-scored as a runaway. (The 3 known TIMEOUTs are caught behavioural changes, not
+# undetected mutants; cargo-mutants exits clean — a TIMEOUT is a detection, not a survivor.)
+minimum_test_timeout = 30
