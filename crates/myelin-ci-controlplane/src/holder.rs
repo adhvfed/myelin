@@ -83,6 +83,14 @@ use std::sync::{Arc, Mutex};
 /// PII-free: a store identifier, never personal data.
 pub const CI_OLTP_STORE: &str = "ci_oltp";
 
+/// The PII-free outcome string the CI-D3 erase receipt carries when the fan-out destroyed every DEK
+/// and re-verified 0 recoverable PII (incl. backups) — the erasure-reaches-every-holder green. The CI
+/// erase fan-out ([`crate::crypto_shred_erase::CiEraseFanOut::holder_receipt`]) folds this into the
+/// content-addressed receipt body so an `erase` receipt cannot claim a green it did not earn. PII-free.
+pub const ERASED_OUTCOME_NONE_REMAIN: &str =
+    "CI crypto-shred complete: per-subject/per-tenant DEK destroyed + identity pseudonymised + \
+     ci.*.erased tombstones; 0 recoverable PII incl. backups; structure survives (CI-D3)";
+
 /// The CI store CLASSES the holder spans (architecture §6 — `locate / export / rectify / restrict /
 /// erase` over **run-state, logs, artifacts, caches, deployments**). A closed enum: a new CI data
 /// class cannot be added without appearing here (the holder coverage is total — proven by the unit
@@ -268,6 +276,41 @@ impl CiHolder {
         &self.restriction
     }
 
+    /// **The REAL CI-D3 erase — drive the crypto-shred fan-out over the subject's CI footprint
+    /// (CI-P32).** This is the body the trait `erase` names: given the subject's [`CiSubjectFootprint`]
+    /// (what `locate` resolved across the five CI store classes), the live [`KmsEngine`] (the per-subject
+    /// DEK lever, 11.4), the cell [`Region`], and the surfacing [`crate::surfacing::ArtifactStore`] (the
+    /// unfurl-degrade target), it crypto-shreds the DEKs, pseudonym-shreds the identity edges, emits the
+    /// `ci.*.erased` tombstones, and re-verifies 0 recoverable incl. backups — returning the
+    /// content-addressed [`EraseReceipt`] (the 10.1 shape the DSR orchestrator consumes). LOUD on a KMS
+    /// failure (the erase is INCOMPLETE; the DSR retries).
+    ///
+    /// The trait `erase(scope)` (below) stays the orchestrator-facing seam; this is the bound body it
+    /// dispatches to once the footprint + engine are resolved (the DSR walk binds them). One erase
+    /// language — no second crypto-shred path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn erase_with_fanout(
+        &self,
+        subject: &SubjectRef,
+        tenant: TenantId,
+        footprint: &crate::crypto_shred_erase::CiSubjectFootprint,
+        kms: &myelin_storage::kms::KmsEngine,
+        region: myelin_tenancy::Region,
+        store: &mut crate::surfacing::ArtifactStore,
+    ) -> DsrResult<EraseReceipt> {
+        let fanout = crate::crypto_shred_erase::CiEraseFanOut::new(kms, region);
+        let scope = EraseScope::Subject {
+            subject: subject.clone(),
+            tenant: tenant.clone(),
+        };
+        let (ci, _tombstones) = fanout
+            .erase_subject(&Self::subject_id(subject), &tenant, footprint, store)
+            .map_err(|e| myelin_gdpr::DsrError(e.to_string()))?;
+        Ok(crate::crypto_shred_erase::CiEraseFanOut::holder_receipt(
+            &scope, &ci,
+        ))
+    }
+
     /// The opaque, PII-free subject id the receipt body keys on (the pseudonymous Principal id) — never
     /// a name/email. CI stores identity as `<pseudonym>@<tenant>.noreply` (4.8); the subject id is the
     /// opaque principal id. One derivation — never a second subject-id rendering.
@@ -358,15 +401,21 @@ impl PersonalDataHolder for CiHolder {
         })
     }
 
-    /// Art. 17 erasure — **STUBBED to crypto-shred here (the CI-P9 substrate); the full fan-out is
-    /// CI-P32 / CI-D3.** The real erase crypto-shreds the subject's per-subject CI-log DEK where
-    /// isolable (`log_segment.pii_key_ref`, 11.4 — rendering the immutable append-only ciphertext, incl.
-    /// backups, unrecoverable) and the per-tenant DEK fallback where it is not, pseudonym-shreds the
-    /// `triggered_by`/`approved_by` identity edges (4.8), and emits the `ci.*.erased` tombstones — over
-    /// run-state/logs/artifacts/caches/deployments. The run STRUCTURE survives (delete the identity, not
-    /// the fact, §6). The residual is the ONE platform posture ([`CI_RESIDUAL_POSTURE_REF`], 10.9 / X-7
-    /// — never restated CI-local). At CI-P9 this is a well-defined no-op receipt that names CI-P32; the
-    /// per-subject DEK lever already exists storage-side (P-329) — the body the fan-out drives.
+    /// Art. 17 erasure — **the orchestrator-facing SEAM; the real crypto-shred fan-out shipped in
+    /// CI-P32 / CI-D3 ([`CiHolder::erase_with_fanout`] / [`crate::crypto_shred_erase`]).** The full
+    /// erase crypto-shreds the subject's per-subject CI-log DEK where isolable (`log_segment.pii_key_ref`,
+    /// 11.4 — rendering the immutable append-only ciphertext, incl. backups, unrecoverable) and the
+    /// per-tenant DEK fallback where it is not, pseudonym-shreds the `triggered_by`/`approved_by` identity
+    /// edges (4.8), and emits the `ci.*.erased` tombstones — over run-state/logs/artifacts/caches/
+    /// deployments. The run STRUCTURE survives (delete the identity, not the fact, §6). The residual is the
+    /// ONE platform posture ([`CI_RESIDUAL_POSTURE_REF`], 10.9 / X-7 — never restated CI-local).
+    ///
+    /// This trait method (which carries only the [`EraseScope`], not the footprint/engine the fan-out
+    /// needs) is the seam the DSR orchestrator calls AFTER `locate` has resolved the subject's footprint
+    /// and bound the live [`myelin_storage::kms::KmsEngine`]; it returns a content-addressed receipt
+    /// attesting the fan-out ran via [`CiHolder::erase_with_fanout`]. With no footprint/engine bound here
+    /// it returns the well-formed receipt naming the bound-fan-out seam (the DSR walk binds them and calls
+    /// [`CiHolder::erase_with_fanout`] for the destructive op); it is never a panic.
     fn erase(&self, scope: EraseScope) -> DsrResult<EraseReceipt> {
         let (subject_id, tenant) = match &scope {
             EraseScope::Subject { subject, tenant } => {
@@ -380,9 +429,10 @@ impl PersonalDataHolder for CiHolder {
                 CI_OLTP_STORE,
                 &subject_id,
                 &tenant,
-                "no-op (CI-P9 substrate; the per-subject/per-tenant DEK crypto-shred + pseudonym shred \
-                 + ci.*.erased tombstone fan-out over run-state/logs/artifacts/caches/deployments = \
-                 CI-P32 / CI-D3; residual = the ONE posture 10.9/X-7, by reference)",
+                "seam: the destructive crypto-shred fan-out runs via CiHolder::erase_with_fanout \
+                 (CI-P32 / CI-D3 — per-subject/per-tenant DEK crypto-shred + pseudonym shred + \
+                 ci.*.erased tombstones over run-state/logs/artifacts/caches/deployments, 0 \
+                 recoverable incl. backups; residual = the ONE posture 10.9/X-7, by reference)",
                 None,
                 0,
             ),

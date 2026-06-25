@@ -54,6 +54,7 @@ pub mod artifact_cache;
 pub mod check_emitter;
 pub mod ci_pipeline;
 pub mod ci_result_signal;
+pub mod crypto_shred_erase;
 pub mod deployment;
 pub mod events;
 pub mod fairness;
@@ -185,7 +186,23 @@ pub use metering::{
 
 pub use holder::{
     ci_store_classifier, register_ci_holders, CiHolder, CiHolderRegistration, CiStoreClass,
-    RestrictionFlag, CI_OLTP_STORE, CI_RESIDUAL_POSTURE_REF,
+    RestrictionFlag, CI_OLTP_STORE, CI_RESIDUAL_POSTURE_REF, ERASED_OUTCOME_NONE_REMAIN,
+};
+
+// CI-P32 (P-492): the CI `PersonalDataHolder` ERASE crypto-shred fan-out — erasure-reaches-every-holder
+// (CI-D3). Fills CI-P9's `erase` stub: `erase(subject)` crypto-shreds the subject's PII across all five
+// CI store classes (run-state/logs/artifacts/caches/deployments) by destroying the per-subject DEK (where
+// isolable) + the per-tenant DEK fallback through Storage's frozen `KmsEngine` (11.4 — no second crypto),
+// pseudonym-shreds the `triggered_by`/`approved_by` identity edges (the row survives for audit), emits
+// `ci.*.erased` tombstones so every unfurl degrades (§OQ-D, 0 dangling leak), and re-verifies 0 recoverable
+// PII incl. backups (§7.5 — the backup snapshot excludes a shredded DEK). The residual third-party free-text
+// PII is the ONE platform posture, by reference (10.9 / X-7), never restated CI-local. FLOOR: the live-stack
+// CI-D3 fan-out over Postgres/RustFS/Valkey is the integration follow-on (`floor_followons`). NO cycle:
+// `myelin-storage`/`myelin-gdpr`/`myelin-events` have no edge back to `myelin-ci-controlplane`.
+pub use crypto_shred_erase::{
+    drive_ci_d3_erasure_reaches_every_holder, subject_dek_ref, tenant_dek_ref, CiD3Report,
+    CiEraseFanOut, CiEraseReceipt, CiErasedTombstone, CiSealedRow, CiShredError,
+    CiSubjectFootprint, CI_ERASED_VERB, ERASED_PSEUDONYM,
 };
 
 // CI-P20 (P-363): logs over the firehose + the sealed T3 (job, step, byte-range) log tier +

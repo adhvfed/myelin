@@ -1081,6 +1081,13 @@ impl ArtifactStore {
     pub fn mark_restricted(&mut self, canonical_ref: &ArtifactRef) {
         self.restricted.insert(canonical_ref.0.clone());
     }
+
+    /// Whether a canonical ref has been marked ERASED (a `ci.*.erased` tombstone, §OQ-D). The CI-P32
+    /// erase fan-out ([`crate::crypto_shred_erase`]) sets this so the unfurl degrades to a content-free
+    /// tombstone immediately (0 dangling leak); a drill reads it to assert the erased root degrades.
+    pub fn is_erased(&self, canonical_ref: &ArtifactRef) -> bool {
+        self.erased.contains(&canonical_ref.0)
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
