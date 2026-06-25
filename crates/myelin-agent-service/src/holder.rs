@@ -49,6 +49,17 @@
 //! Knowledge + its erasure) lands with Knowledge in M3 (**AG-P19 → P-268**, KN-D11/KN-D12). The
 //! point of registering NOW: the M5 DSAR fan-out cannot silently miss the Agent Fabric (10.1
 //! exhaustiveness).
+//!
+//! ## RECONCILED at AG-P23 (→ P-479): the holder BODIES now exist ([`crate::dsr`])
+//! The AG-P3 floor named here is FILLED: [`crate::dsr::AgentFabricHolder`] ships the REAL
+//! locate/export/erase bodies — `erase(subject)` crypto-shreds the per-subject DEK (the free-text
+//! `input_payload`/`risk_summary`/`trace_body` becomes unrecoverable live + in backups), tombstones
+//! the run rows, pseudonymises the attribution edges (attribution → opaque pseudonym, 4.8), and
+//! drives the post-restore re-erasure ([`crate::dsr::FabricErasureLedger`]). The agent long-term
+//! memory/RAG leg remains the named seam (v1 stateless except the trace — AG-P25). The
+//! [`AgentOltpHolder`] / [`AgentTraceHolder`] structs HERE stay the REGISTRATION seam (opening IS
+//! registering, contract 1.4) — their empty-but-correct receipts are the registration witness; the
+//! erasure WORK is in [`crate::dsr`] (one mechanism, no parallel second holder — EI-01 §7).
 
 use myelin_gdpr::{
     EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle, Receipt,
