@@ -2368,6 +2368,7 @@ dependencies = [
  "myelin-events",
  "myelin-flow",
  "myelin-gdpr",
+ "myelin-harness",
  "myelin-identity",
  "myelin-identity-service",
  "myelin-lints",

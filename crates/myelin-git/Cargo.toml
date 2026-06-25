@@ -158,6 +158,12 @@ myelin-identity-service = { path = "../myelin-identity-service" }
 # check_status projection; X-1 / EI-02 §3). A dev-only edge (the lint scanner is a test-time tool, not
 # a production-DAG node — architecture §2.9).
 myelin-lints = { path = "../myelin-lints" }
+# TEST-SUPPORT only: the failure-injection / 1×/10×/30× load generator (myelin-harness, P-S02..S04) the
+# GIT-D6 clone-storm surge drill (`tests/drill_git_d6_clone_surge.rs`, GIT-P34 / P-483) drives the
+# mixed-principal surge with — and the STOR-D2 cell-scale re-confirm uses for the world-scale load. A
+# dev-only edge (the harness is NOT a production-DAG node — architecture §2.9; the SAME posture as the
+# myelin-lints dev-dep above). Nothing in `src/` depends on it.
+myelin-harness = { path = "../myelin-harness" }
 # TEST-SUPPORT only: the GIT-D5 concurrent-merge linearizability drill
 # (`tests/drills_git_d5_concurrent_merge_linearizability.rs`, GIT-P33 / P-482) reads its
 # `concurrent_merge_attempts` + `lost_merge_max` bounds from the workspace-root `thresholds.toml`

@@ -376,6 +376,17 @@ pub mod shed_clone;
 /// movement bisects + rebases the survivors — linearizable on the protected `base_ref` (GIT-D5).
 pub mod speculative_queue;
 pub mod subs;
+/// **World-scale hardening: the GIT-D6 clone-storm surge + git's E2E slices** (GIT-P34 / P-483, M5).
+/// The M5 production-hardening face of the Git front door: the [`surge::run_git_clone_surge`] runner
+/// drives the LIVE [`shed_clone::GitFrontDoorShed`] at the 30× clone surge (human fetch HELD, agent + CI
+/// SHED, cross-tenant impact 0 — the F6 surge family's git row, GIT-D6), and [`surge::run_git_e2e_wedge`]
+/// composes git's slices of the three whole-system E2E scenarios (E2E-1 the PR-context reference
+/// producer; E2E-2 the agent-native flagship — the `git.merge` HITL gate + the X-1 CheckStatus gate +
+/// `git.pr.merged` closing the issue via the `Closes` trailer, exactly-once HITL + merge; E2E-3 the
+/// commit→PR→merge lineage, cold-reindex == live). Authors NO new mechanism — it is the world-scale
+/// composition + drill over the engine the M3/M5 prompts shipped (EI-01 §7). No new floor; the one
+/// remaining floor is the world-scale 30× run on real fleet hardware (the shared §4.1 fleet drill).
+pub mod surge;
 /// The **typed-edge mirror: PR-link / commit-trailer lifecycle edges into the Refs projection**
 /// (GIT-P19 / P-280, M3-G3 — the typed-edge-mirror half). As the PR lifecycle advances, a Git PR emits
 /// **lifecycle edges** (`closes`/`relates`, `rel_class='lifecycle'`) via the outbox — DISTINCT from the
