@@ -256,6 +256,35 @@ fn a_red_refs_dogfood_drill_rejects_the_commit() {
 }
 
 #[test]
+fn the_self_hosting_graph_runs_the_refs_switch_test_band() {
+    // REF-P29 / P-514 (M6): the reference-graph switch test is wired as a Myelin CI job — the
+    // four-keystroke cross-artifact jump driven over the real Refs surface (failing-test → line of code
+    // → issue → conversation, across the five subsystems) works without hitting a wall the four-tool
+    // anchor didn't have, measured against the latency budgets, 0 leak. The dogfood loop carries it.
+    let jobs = self_hosting_jobs();
+    assert!(
+        jobs.iter()
+            .any(|j| j.id == "REF-P29-switch-test" && j.kind == JobKind::Drill),
+        "the self-hosting graph MUST run the Refs switch-test band (the four-keystroke cross-artifact \
+         jump driven + measured) as part of the self-hosting CI graph"
+    );
+}
+
+#[test]
+fn a_red_refs_switch_test_rejects_the_commit() {
+    // A switch-test red (a wall the four-tool anchor didn't have / a blown latency budget / a leak in
+    // the four-keystroke jump) reds the graph — the moat thesis is held on Myelin's own work (EI-01 §5).
+    let jobs = self_hosting_jobs();
+    let run = run_graph(&jobs, &reds_one("REF-P29-switch-test"));
+    assert!(
+        !run.is_green(),
+        "a red Refs switch test (a wall / a blown budget / a leak in the four-keystroke jump) MUST \
+         reject the commit — the switch test is part of the self-hosting CI gate"
+    );
+    assert_eq!(run.red_jobs(), vec!["REF-P29-switch-test"]);
+}
+
+#[test]
 fn a_clean_commit_reads_green() {
     let jobs = self_hosting_jobs();
     let run = run_graph(&jobs, &all_green);

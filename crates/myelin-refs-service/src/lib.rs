@@ -389,6 +389,7 @@ pub mod resolve;
 pub mod restore_reerase;
 pub mod restrict;
 pub mod surge;
+pub mod switch_test;
 pub mod traverse;
 
 pub use backlinks::{
@@ -487,6 +488,11 @@ pub use restrict::RestrictSet;
 pub use surge::{
     run_refs_surge, RefsShedGate, RefsShedRejection, RefsSurgeReport, R4_REACH_INDEX_FOLLOW_ON,
     REFS_SURGE_MULTIPLIER, SHARD_SPLIT_IS_MEASURED_ONLY,
+};
+pub use switch_test::{
+    four_keystroke_jump_chain, switch_capability_matrix, switch_surface_drive_record,
+    BrowserDriveStatus, MeasuredLatencies, RefsSwitchTest, RefsSwitchVerdict, SwitchCapability,
+    SwitchSurfaceDrive,
 };
 pub use traverse::{
     apply_post_filter, depth_ceiling_from_thresholds, max_nodes_from_thresholds, Traverse,

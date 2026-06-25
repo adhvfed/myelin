@@ -381,6 +381,28 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "ref_p28_dogfood_drill",
             ],
         },
+        // (9) the REFERENCE GRAPH switch-test band (P-514 / REF-P29 → REF-M6): the switch test driven
+        //     over the real Refs surface — the four-keystroke cross-artifact jump (failing-test → line of
+        //     code → issue → conversation, across the five subsystems) works without hitting a wall the
+        //     four-tool anchor (GitHub/Jira/Linear/Notion/Slack) didn't have, MEASURED against the
+        //     latency budgets (backlink read / unfurl within the keyboard / no-spinner-flash), 0 leak.
+        //     WIRES the existing resolve chokepoint (EI-01 §7 — never re-implemented here). The
+        //     pixel-level browser drive over the rendered Refs web tier is the honest named floor.
+        SelfHostJob {
+            id: "REF-P29-switch-test",
+            title: "the reference-graph switch test driven over the real surface — the four-keystroke \
+                    cross-artifact jump works vs the four-tool anchor (0 walls), measured within the \
+                    latency budgets (backlink/unfurl/no-spinner-flash), 0 leak",
+            kind: JobKind::Drill,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-refs-service",
+                "--test",
+                "ref_p29_switch_test_drill",
+            ],
+        },
     ]
 }
 

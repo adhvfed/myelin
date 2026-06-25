@@ -228,6 +228,17 @@ pub struct Thresholds {
     /// `myelin_ci_controlplane::dogfood`'s switch-test budget.
     #[serde(default)]
     pub ci_switch_test: CiSwitchTestThreshold,
+    /// The Refs **switch-test** cross-artifact-jump latency budgets (REF-P29 / P-514, M6; the
+    /// reference-graph switch test; reference-graph §3 R-M6 the switch-test bullet + the latency budgets,
+    /// refined arch 05 §1 the moat thesis — the four-keystroke cross-artifact jump). The microsecond
+    /// ceilings the three driven surfaces (the backlink read, the per-viewer unfurl, the whole
+    /// four-keystroke jump within the no-spinner-flash budget) must stay WITHIN for a GitHub/Jira/Linear/
+    /// Notion user's cross-artifact navigation to work without hitting a wall the old tool didn't have.
+    /// MEASURED by the switch test (driven against the real Refs surface), never hardcoded in the test
+    /// (EI-01 §3/§4) and never weakened to pass. `#[serde(default)]` so an older thresholds file
+    /// (pre-P-514) still parses against the seeds. Mirrors `myelin_refs_service::switch_test`'s budgets.
+    #[serde(default)]
+    pub refs_switch_test: RefsSwitchTestThreshold,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -731,6 +742,81 @@ impl Default for CiSwitchTestThreshold {
     fn default() -> Self {
         CiSwitchTestThreshold {
             render_budget_us: Self::RENDER_BUDGET_US_SEED,
+        }
+    }
+}
+
+/// The Refs **switch-test** cross-artifact-jump latency budgets (REF-P29 / P-514, M6). The microsecond
+/// ceilings the three driven Refs surfaces must stay WITHIN for a GitHub/Jira/Linear/Notion user's
+/// cross-artifact navigation to work without hitting a wall the old tool didn't have (reference-graph §3
+/// R-M6 the switch-test bullet + the latency budgets; refined arch 05 §1 the moat thesis — the
+/// four-keystroke cross-artifact jump). The switch test MEASURES each driven surface against its budget
+/// (driven, EI-01 §4); the numbers are read here, never hardcoded in the test and never weakened to pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefsSwitchTestThreshold {
+    /// **The backlink-read latency budget, in MICROSECONDS** (`_us`; the §2.10 units anchor). The
+    /// per-viewer backlink read the switch test drives (the "referenced-by" list that opens the jump)
+    /// must complete within this p-latency; a backlink read slower than the anchor's interactive grade is
+    /// a UX wall.
+    #[serde(default = "RefsSwitchTestThreshold::default_backlink_read_budget_us")]
+    pub backlink_read_budget_us: u64,
+    /// **The per-viewer unfurl latency budget, in MICROSECONDS** — the "within the keyboard" budget: the
+    /// single cross-artifact unfurl (the hovered/opened reference resolving live to its title/status)
+    /// must render within this p-latency so it lands within a keystroke, no spinner. Slower is a wall.
+    #[serde(default = "RefsSwitchTestThreshold::default_unfurl_budget_us")]
+    pub unfurl_budget_us: u64,
+    /// **The whole four-keystroke-jump no-spinner-flash budget, in MICROSECONDS** — the full
+    /// failing-test → line-of-code → issue → conversation cross-artifact jump must complete within this
+    /// p-latency so no spinner ever flashes (the moat thesis). A jump slower than this flashes a spinner
+    /// — a wall the old four-tool dance also had, but the switch test asserts Myelin does NOT.
+    #[serde(default = "RefsSwitchTestThreshold::default_jump_no_spinner_budget_us")]
+    pub jump_no_spinner_budget_us: u64,
+}
+
+impl RefsSwitchTestThreshold {
+    /// The seed backlink-read budget: **20 000 µs (= 20 ms)** — an interactive "referenced-by" list
+    /// render grade (the backlink read that opens the jump). REF-P29 measures the real read against this;
+    /// the number is dated here, never a value to tune toward (measured-not-predicted, EI-01 §3).
+    pub const BACKLINK_READ_BUDGET_US_SEED: u64 = 20_000;
+    /// The seed per-viewer unfurl budget: **16 000 µs (= 16 ms)** — the "within the keyboard" grade: a
+    /// single unfurl resolving live within roughly one keystroke at 60 fps, no spinner.
+    pub const UNFURL_BUDGET_US_SEED: u64 = 16_000;
+    /// The seed whole-jump no-spinner-flash budget: **100 000 µs (= 100 ms)** — the human-perceptible
+    /// "instant" ceiling (Nielsen's 0.1 s): a four-keystroke jump completing within 100 ms never flashes
+    /// a spinner. The four-tool dance the user is leaving cannot meet this — the switch-test moat.
+    pub const JUMP_NO_SPINNER_BUDGET_US_SEED: u64 = 100_000;
+
+    /// The seed backlink-read budget (`_us`). Used when an older thresholds file omits the row.
+    pub fn default_backlink_read_budget_us() -> u64 {
+        Self::BACKLINK_READ_BUDGET_US_SEED
+    }
+
+    /// The seed unfurl budget (`_us`). Used when an older thresholds file omits the row.
+    pub fn default_unfurl_budget_us() -> u64 {
+        Self::UNFURL_BUDGET_US_SEED
+    }
+
+    /// The seed whole-jump no-spinner-flash budget (`_us`). Used when an older thresholds file omits it.
+    pub fn default_jump_no_spinner_budget_us() -> u64 {
+        Self::JUMP_NO_SPINNER_BUDGET_US_SEED
+    }
+
+    /// Whether the switch-test budgets are well-formed: every budget positive. A 0 budget ("any render is
+    /// a wall") is rejected so a green can never be manufactured by a vacuous bar (EI-01 §3).
+    pub fn is_well_formed(&self) -> bool {
+        self.backlink_read_budget_us > 0
+            && self.unfurl_budget_us > 0
+            && self.jump_no_spinner_budget_us > 0
+    }
+}
+
+impl Default for RefsSwitchTestThreshold {
+    /// The seed budgets (REF-P29 dates the measured surfaces against them).
+    fn default() -> Self {
+        RefsSwitchTestThreshold {
+            backlink_read_budget_us: Self::BACKLINK_READ_BUDGET_US_SEED,
+            unfurl_budget_us: Self::UNFURL_BUDGET_US_SEED,
+            jump_no_spinner_budget_us: Self::JUMP_NO_SPINNER_BUDGET_US_SEED,
         }
     }
 }

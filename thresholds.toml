@@ -124,6 +124,21 @@ prewarm_max_buffer = 16                     # the warm-buffer ceiling — bin-pa
 render_budget_us = 50000                    # MEASURED-GATE: the interactive run/log view render p-latency budget; a render slower than the GitHub Actions anchor's interactive grade is a UX wall.
 
 # ---------------------------------------------------------------------------------------------
+# [refs_switch_test] — the Refs SWITCH-TEST cross-artifact-jump latency budgets (REF-P29 / P-514,
+# M6; the reference-graph switch test; reference-graph §3 R-M6 the switch-test bullet + the latency
+# budgets; refined arch 05 §1 the moat thesis — the four-keystroke cross-artifact jump). The
+# microsecond ceilings the three driven Refs surfaces (the backlink read / the per-viewer unfurl
+# "within the keyboard" / the whole four-keystroke jump within the no-spinner-flash budget) must stay
+# WITHIN for a GitHub/Jira/Linear/Notion user's cross-artifact navigation to work without hitting a
+# wall the old tool didn't have. MEASURED by the switch test (driven against the real surface, EI-01
+# §4), never hardcoded in the test and never weakened to pass.
+# ---------------------------------------------------------------------------------------------
+[refs_switch_test]
+backlink_read_budget_us = 20000             # MEASURED-GATE: the per-viewer backlink "referenced-by" read that opens the jump; slower than the anchor's interactive grade is a UX wall.
+unfurl_budget_us = 16000                    # MEASURED-GATE: the "within the keyboard" single-unfurl render budget (~one keystroke at 60 fps, no spinner); slower is a wall.
+jump_no_spinner_budget_us = 100000          # MEASURED-GATE: the whole four-keystroke jump (failing-test→line→issue→conversation) within the human-perceptible "instant" ceiling so no spinner flashes.
+
+# ---------------------------------------------------------------------------------------------
 # [authz_surge] — the ID-D9 (F6) protected-human-lane authz-decision p99 budget under the 30× authz
 # hot-path surge (identity §10/§13: authz is the highest-QPS shared system; contract 1.8
 # `auth_decision_latency` / 4.11 the shed order on the authz surface).
