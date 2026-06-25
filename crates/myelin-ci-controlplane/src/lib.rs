@@ -66,6 +66,7 @@ pub mod metering;
 pub mod migrations;
 pub mod permanent_gates;
 pub mod rebac_fragment;
+pub mod residency_drill;
 pub mod schedule_and_run_job;
 pub mod scheduler;
 pub mod schema;
@@ -320,6 +321,16 @@ pub use floor_followons::{
 pub use surge::{
     drive_ci_d2_surge, CiDispatchShed, CiSurgeControls, CiSurgeGate, CiSurgeReport,
     StarvationHistogram, CI_SURGE_MULTIPLIER,
+};
+
+// CI-P31 (P-491): world-scale hardening at CELL scale — the CI-R3 residency-at-scale drill (in-region
+// runner only; logs/artifacts/caches never leave region; residency_verify attests; residency-pin lint
+// green) + the CI-D10 self-hosted-runner trust-boundary drill (a compromised self-hosted runner is
+// bounded by its scoped token to its own tenant's SelfHosted jobs; 0 cross-tenant job/secret reads;
+// attestation failure → cannot claim). The cell-scale DRILL layer over CI-P14/CI-P22/CI-P4 (no fork).
+pub use residency_drill::{
+    drive_ci_d10_self_hosted_boundary, drive_ci_r3_residency, CellJob, CiD10Report, CiR3Report,
+    CiStoreResidency,
 };
 
 /// The deployable service name (the `AppSpec::name` + the telemetry/trace service identifier). The
