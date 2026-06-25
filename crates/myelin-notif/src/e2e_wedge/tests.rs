@@ -361,3 +361,169 @@ fn e2e_2_explicit_first_zero_auto_spawn_and_exactly_one_apply() {
         artifact.evidence
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//  E2E-4 — the DSAR fan-out leg + STOR-D2 at cell scale (NOTIF-P30 / P-472 — the LAST Notif prompt).
+//
+//  Each test drives the CHAINED DSAR end-to-end (EI-01 §4) — NOT a single-handler test: holder locate
+//  → residual erase (NOTIF-P27) → 0 recoverable PII → [erased user] at read time → multi-cell
+//  member_cells iteration → STOR-D2 restore-verify of the system-of-record tables. The erase /
+//  tombstone / cross-cell mutation floors (NOTIF-P4/P27/P24, NOTIF-D6) are UNCHANGED and re-asserted at
+//  E2E scale.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// **The E2E-4 DSAR leg + STOR-D2 is GREEN end-to-end (the named green artifact's `is_green()`).** The
+/// whole DSAR fan-out — Notif located as a holder, the residual erased to 0 recoverable PII, the inbox
+/// showing `[erased user]`, every member cell erased — plus the STOR-D2 permanent gate, all hold.
+#[test]
+fn e2e_4_dsar_and_stor_d2_is_green_end_to_end() {
+    let artifact = run_e2e_4_dsar_and_stor_d2();
+    assert_eq!(artifact.scenario, "E2E-4");
+    assert!(
+        artifact.is_green(),
+        "the E2E-4 DSAR leg + STOR-D2 must be green end-to-end: {}",
+        artifact.evidence
+    );
+}
+
+/// **The DSAR threshold: 0 recoverable PII (NOTIF-D6 / E2E-4).** After the residual erase, the
+/// inline-PII delivery column is unrecoverable — the count of recoverable columns is EXACTLY 0. Never
+/// softened.
+#[test]
+fn e2e_4_post_erase_zero_recoverable_pii() {
+    let artifact = run_e2e_4_dsar_and_stor_d2();
+    assert_eq!(
+        artifact.recoverable_pii, 0,
+        "post-erase locate = 0 recoverable PII: {}",
+        artifact.evidence
+    );
+    assert!(
+        artifact.evidence.contains("recoverable_pii=0"),
+        "the artifact records 0 recoverable PII: {}",
+        artifact.evidence
+    );
+}
+
+/// **Inbox items show `[erased user]` (the tombstone-for-free, at E2E scale).** Notif is one of the
+/// H1–H18 holders; the erased subject's appearance humanises to `[erased user]` across every channel
+/// projection, with the opaque id NEVER leaked.
+#[test]
+fn e2e_4_inbox_items_show_erased_user() {
+    let artifact = run_e2e_4_dsar_and_stor_d2();
+    assert!(
+        artifact.evidence.contains("inbox_shows_[erased_user]=true"),
+        "every inbox appearance of the erased subject shows [erased user]: {}",
+        artifact.evidence
+    );
+}
+
+/// **The multi-cell DSAR leg: 0 holders missed across the union (10.4 / NOTIF-P24 / GA-D8).** The DSR
+/// orchestrator iterates `member_cells` over the cross-cell bridge; every member cell mints an erase
+/// receipt (`erased = true`).
+#[test]
+fn e2e_4_multi_cell_member_cells_all_erased() {
+    let artifact = run_e2e_4_dsar_and_stor_d2();
+    assert_eq!(
+        artifact.member_cells_erased, 2,
+        "every member cell erased its inbox pointers (0 holders missed): {}",
+        artifact.evidence
+    );
+    assert!(
+        artifact.evidence.contains("all_erased=true"),
+        "the member_cells iteration ran across the union: {}",
+        artifact.evidence
+    );
+}
+
+/// **STOR-D2 at cell scale is GREEN — the permanent gate (11.5 / §5.5).** The restore-verify of
+/// Notif's system-of-record tables holds: cold == live (0 loss), the erasure held across the restore,
+/// and the RPO/RTO are within the unweakened master §2 budgets.
+#[test]
+fn stor_d2_at_cell_scale_is_green() {
+    let verdict = run_stor_d2_at_cell_scale(&e2e_tenant());
+    assert!(
+        verdict.is_green(),
+        "STOR-D2 at cell scale must be green (the permanent gate): {}",
+        verdict.summary()
+    );
+    assert!(verdict.cold_equals_live, "cold == live (0 loss)");
+    assert!(
+        verdict.erasure_held,
+        "a pre-backup shred stayed dead across the restore"
+    );
+}
+
+/// **MANDATORY-CORE: the STOR-D2 thresholds are NEVER weakened (EI-01 §3).** A measured RPO over the
+/// 5-min budget — or an RTO over the 1h-tenant / 4h-cell budget — is RED. We assert the gate refuses a
+/// loss (cold != live) and an over-budget RPO/RTO; a mutant that softens any threshold or inverts a
+/// comparison is caught.
+#[test]
+fn stor_d2_thresholds_are_load_bearing() {
+    // The honest measured verdict is green and well within budget.
+    let green = run_stor_d2_at_cell_scale(&e2e_tenant());
+    assert!(green.is_green());
+
+    // A LOSS (cold != live) is RED — the restored copy is not whole.
+    let lost = StorD2Verdict {
+        cold_equals_live: false,
+        ..green.clone()
+    };
+    assert!(
+        !lost.is_green(),
+        "a cold != live restore (data loss) MUST be RED"
+    );
+
+    // A RESURRECTED subject (erasure NOT held) is RED — the gravest failure.
+    let resurrected = StorD2Verdict {
+        erasure_held: false,
+        ..green.clone()
+    };
+    assert!(
+        !resurrected.is_green(),
+        "an erased subject resurrected by the restore MUST be RED"
+    );
+
+    // An RPO over the 5-min (300s) budget is RED — never softened.
+    let stale = StorD2Verdict {
+        rpo_seconds: 301,
+        ..green.clone()
+    };
+    assert!(
+        !stale.is_green(),
+        "an RPO over the 5-min budget MUST be RED"
+    );
+
+    // An RTO over the per-tenant 1h budget is RED.
+    let slow_tenant = StorD2Verdict {
+        rto_tenant_seconds: 60 * 60 + 1,
+        ..green.clone()
+    };
+    assert!(
+        !slow_tenant.is_green(),
+        "an RTO over the 1h-per-tenant budget MUST be RED"
+    );
+
+    // An RTO over the per-cell 4h budget is RED.
+    let slow_cell = StorD2Verdict {
+        rto_cell_seconds: 4 * 60 * 60 + 1,
+        ..green
+    };
+    assert!(
+        !slow_cell.is_green(),
+        "an RTO over the 4h-per-cell budget MUST be RED"
+    );
+}
+
+/// **The E2E-4 driver returns the named green artifact (the master M5 → M6 GDPR exit row).** A red
+/// E2E-4 must NOT let M6 start; here it is green. THIS IS THE LAST NOTIF PROMPT.
+#[test]
+fn the_e2e_4_driver_returns_a_green_artifact() {
+    let artifact = run_notif_e2e_4_dsar();
+    assert_eq!(artifact.scenario, E2E_4_SCENARIO);
+    assert!(artifact.is_green(), "{}", artifact.evidence);
+    assert!(
+        artifact.stor_d2_green,
+        "the STOR-D2 permanent gate is folded into the E2E-4 artifact: {}",
+        artifact.evidence
+    );
+}
