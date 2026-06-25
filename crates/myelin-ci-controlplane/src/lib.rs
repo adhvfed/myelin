@@ -56,6 +56,14 @@ pub mod ci_pipeline;
 pub mod ci_result_signal;
 pub mod crypto_shred_erase;
 pub mod deployment;
+/// CI's slices of the whole-system E2E wedge (CI-P33 / P-493, M5): E2E-1 (the PR context pane —
+/// CI's check rows resolve per-viewer, 0 leak, `#step-<n>` anchor) + E2E-3 (spec-to-ship
+/// traceability — HITL-gated deploy ships, cold-reindex == live, audit tamper detected). Each leg
+/// drives the whole flow end-to-end (chaining mutations mid-flight, EI-01 §4) over the UNCHANGED
+/// production-hardened CI engine and emits its named green artifact ([`e2e_wedge::E2eArtifact`]).
+/// E2E-2 is CI-P34; E2E-4 (DSAR) is covered for CI by CI-P32's CI-D3. No new contract; no weakened
+/// gate.
+pub mod e2e_wedge;
 pub mod events;
 pub mod fairness;
 pub mod fleet;
@@ -264,6 +272,14 @@ pub use surfacing::{
     DeploymentMeta, LoweredFilter, PipelineMeta, ProjectError, Projected, Projection, Projector,
     RenderHint, RunMeta, SubAnchor, Tombstone, TombstoneReason, AUTHZ_VISIBLE_TABLE, CI_SUBSYSTEM,
     RUN_LIST_PERMISSION, VIEW,
+};
+
+// CI-P33 (P-493): CI's slices of the whole-system E2E wedge — the two named green artifacts the
+// master M5 exit gate cites (E2E-1 the PR context pane, E2E-3 spec-to-ship traceability). Each leg
+// runs the whole flow end-to-end over the UNCHANGED engine; both must be `is_green()`.
+pub use e2e_wedge::{
+    run_ci_e2e_slices, run_e2e1_pr_context_pane, run_e2e3_spec_to_ship_lineage, E2eArtifact,
+    E2E_SCENARIOS,
 };
 
 // CI-P26 (P-369): the cross-fabric surfacing INDEX + REPLAY half — `declare_indexable` (the `ci/run`
