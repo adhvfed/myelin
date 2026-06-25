@@ -46,8 +46,12 @@
 //!   rewrite (**CHAT-P26**).
 //! - **Mega-channel live delivery = firehose subject fan-out with per-view scope bounding.** The
 //!   channel-sharded home-node (the Phoenix/Discord guild model, Rust + consistent-hash) is the
-//!   named M5 escalation (**M5-C-S3 / CHAT-P29**), promoted on a measured subscriber count exceeding
-//!   the subject-fan-out budget. Until measured, the subject model is the design (ADR-10).
+//!   named M5 escalation (**M5-C-S3 / CHAT-P29 / P-503**), promoted on a measured subscriber count
+//!   exceeding the subject-fan-out budget. Until measured, the subject model is the design (ADR-10).
+//!   The floor's measurable trigger predicate ([`SubjectFanOutBudget::exceeded_by`]) + its dated
+//!   gap-report row ([`home_node_floor_gap_report`]) live in [`home_node`]; at this prompt's execution
+//!   the trigger has NOT fired (the surge family measured shed budgets, not subscriber fan-out), so
+//!   the home-node is a named floor, not built.
 //! - **The firehose-only LIVE delivery body + the protected-human-lane shed order is CHAT-P10**
 //!   (**P-404**) — this crate is the gateway SHELL + the resume-cursor live tier (subscribe / resume
 //!   / resync); the message/presence/typing/read-state/partials delivery surface + the per-surface
@@ -60,10 +64,15 @@
 #![forbid(unsafe_code)]
 
 pub mod delivery;
+pub mod home_node;
 pub mod shed;
 pub mod surge;
 
 pub use delivery::{DeliveryOutcome, LiveDelivery, LiveFrame};
+pub use home_node::{
+    home_node_floor_gap_report, MeasuredFanOut, SubjectFanOutBudget, BEAM_GATEWAY_SIBLING_FLOOR,
+    GATEWAY_MEASURED_TRIGGER_FLOORS, HOME_NODE_FLOOR,
+};
 pub use shed::{LiveSurface, ShedGovernor, ShedVerdict};
 pub use surge::{
     run_chat_surge, surge_governor_from_thresholds, ChatSurgeReport, CHAT_SHED_BUDGETS_TUNED,

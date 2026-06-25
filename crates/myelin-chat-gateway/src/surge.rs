@@ -91,7 +91,10 @@ pub const SCYLLA_HOT_TIER_FOLLOW_ON: &str = "CHAT-P28";
 
 /// **The channel-sharded home-node follow-on** (mega-channel live delivery; the Phoenix/Discord guild
 /// model) — a TRIGGERED chat M5 promotion, taken on a measured subscriber count exceeding the
-/// subject-fan-out budget: **CHAT-P29**.
+/// subject-fan-out budget: **CHAT-P29** (global P-503). The FULL named-floor record (the measurable
+/// subject-fan-out budget trigger predicate + the dated gap-report row + the BEAM-gateway sibling
+/// floor) lives in [`crate::home_node`] ([`crate::HOME_NODE_FLOOR`]); this string is the back-pointer
+/// to the landing prompt (EI-01 §7 — one floor record, this names where it lands).
 pub const HOME_NODE_FOLLOW_ON: &str = "CHAT-P29";
 
 /// **The cross-org delivery follow-on** — a TRIGGERED chat M5 promotion: **CHAT-P30**.
