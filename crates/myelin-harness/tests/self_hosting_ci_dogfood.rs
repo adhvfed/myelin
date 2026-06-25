@@ -142,6 +142,55 @@ fn a_red_tenancy_dogfood_drill_rejects_the_commit() {
 }
 
 #[test]
+fn the_graph_runs_the_ci_dogfood_band() {
+    // P-509 / CI-P35 → CI-M6 (the done-bar): the Myelin build/test/lint/mutation pipeline runs AS a
+    // Myelin `ci.pipeline` — the body's determinism (CI-D9) + crash-recovery (CI-D1) + the Git↔CI
+    // check seam (CI-D8) + CI's E2E flagship (E2E-2) run as Myelin CI jobs, and the CI-P35 dogfood
+    // drill (the switch test + the truth-up pass) is the done-bar gate. The dogfood loop carries CI.
+    let jobs = self_hosting_jobs();
+
+    for (id, why) in [
+        (
+            "ci-pipeline-determinism",
+            "the ci.pipeline body (the durable workflow hosting the Myelin build) runs as Myelin CI \
+             with bit-identical replay (CI-D9) + crash-recovery (CI-D1)",
+        ),
+        (
+            "ci-check-seam",
+            "the Git↔CI check seam (5.9 / CI-D8) runs on Myelin's own commits",
+        ),
+        (
+            "ci-e2e-flagship",
+            "CI's slice of the agent-native E2E flagship (E2E-2) is driven as a Myelin CI job",
+        ),
+        (
+            "CI-P35-dogfood",
+            "the CI switch test (driven, measured) + the CI truth-up pass run as the done-bar gate",
+        ),
+    ] {
+        assert!(
+            jobs.iter()
+                .any(|j| j.id == id && j.kind == JobKind::Drill),
+            "the self-hosting graph MUST run the CI dogfood band job `{id}` — {why}"
+        );
+    }
+}
+
+#[test]
+fn a_red_ci_dogfood_drill_rejects_the_commit() {
+    // The CI-P35 dogfood drill is part of the gate: a switch-test wall / an undated PROVEN CI row reds
+    // the graph — the ratchet rejects on Myelin's own work (the done-bar holds itself, EI-01 §5).
+    let jobs = self_hosting_jobs();
+    let run = run_graph(&jobs, &reds_one("CI-P35-dogfood"));
+    assert!(
+        !run.is_green(),
+        "a red CI dogfood drill (a switch-test wall / a claimed-not-proven CI row) MUST reject the \
+         commit — the switch test + truth-up pass are part of the self-hosting CI gate"
+    );
+    assert_eq!(run.red_jobs(), vec!["CI-P35-dogfood"]);
+}
+
+#[test]
 fn a_clean_commit_reads_green() {
     let jobs = self_hosting_jobs();
     let run = run_graph(&jobs, &all_green);

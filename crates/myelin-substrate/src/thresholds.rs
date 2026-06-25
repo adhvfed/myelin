@@ -218,6 +218,16 @@ pub struct Thresholds {
     /// `myelin_ci_controlplane::surge::CiSurgeControls` seed constants.
     #[serde(default)]
     pub ci_surge: CiSurge,
+    /// The CI **switch-test** interactive run/log render-latency budget (CI-P35 / P-509, M6; the Git
+    /// OQ-12 / CI switch test; continuous-integration §3 CI-M6, arch 04 §2 the run/log/deploy views the
+    /// switch test drives). The microsecond ceiling the representative `myelin ci` run/log view render
+    /// must stay WITHIN for a GitHub-Actions user to move without hitting a UX wall the old tool didn't
+    /// have. MEASURED by the switch test (driven against the real surface), never hardcoded in the test
+    /// (EI-01 §3/§4) and never weakened to pass. `#[serde(default)]` so an older thresholds file
+    /// (pre-P-509) still parses against the seed. Mirrors
+    /// `myelin_ci_controlplane::dogfood`'s switch-test budget.
+    #[serde(default)]
+    pub ci_switch_test: CiSwitchTestThreshold,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -675,6 +685,52 @@ impl Default for CiSurge {
             hierarchical_scheduler_promotion_owed: false,
             prewarm_buffer_per_arrival_rate_bps: Self::PREWARM_BUFFER_PER_ARRIVAL_RATE_BPS_SEED,
             prewarm_max_buffer: Self::PREWARM_MAX_BUFFER_SEED,
+        }
+    }
+}
+
+/// The CI **switch-test** interactive render-latency budget (CI-P35 / P-509, M6). The microsecond
+/// ceiling the representative `myelin ci` run/log view render must stay WITHIN for the switch test to
+/// pass — a GitHub-Actions user moving to Myelin must not hit a UX wall (a slower-than-the-anchor
+/// run/log view) the old tool didn't have (continuous-integration §3 CI-M6; arch 04 §2). The switch
+/// test MEASURES the real render against this budget (driven, EI-01 §4); the number is read here, never
+/// hardcoded in the test and never weakened to pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiSwitchTestThreshold {
+    /// **The interactive run/log render-latency budget, in MICROSECONDS** (`_us`; the §2.10 units
+    /// anchor). The representative `myelin ci watch` / run-view render path the switch test drives must
+    /// complete within this p-latency; a render slower than the GitHub Actions anchor's interactive
+    /// budget is a UX wall that reds the switch test (the migrating user hits a wall the old tool
+    /// didn't have).
+    #[serde(default = "CiSwitchTestThreshold::default_render_budget_us")]
+    pub render_budget_us: u64,
+}
+
+impl CiSwitchTestThreshold {
+    /// The seed interactive render-latency budget: **50 000 µs (= 50 ms)** — a generous-but-real
+    /// interactive ceiling for a run/log view render (GitHub Actions' Actions-tab run view is
+    /// interactive at this grade). A run/log render slower than 50 ms under no load IS a UX wall worth a
+    /// switch-test red. CI-P35 measures the real render against this; the number is dated here, never a
+    /// value to tune toward (measured-not-predicted, EI-01 §3).
+    pub const RENDER_BUDGET_US_SEED: u64 = 50_000;
+
+    /// The seed render-latency budget (`_us`). Used when an older thresholds file omits the row.
+    pub fn default_render_budget_us() -> u64 {
+        Self::RENDER_BUDGET_US_SEED
+    }
+
+    /// Whether the switch-test budget is well-formed: a positive render budget. A 0 budget ("any render
+    /// is a wall") is rejected so a green can never be manufactured by a vacuous bar (EI-01 §3).
+    pub fn is_well_formed(&self) -> bool {
+        self.render_budget_us > 0
+    }
+}
+
+impl Default for CiSwitchTestThreshold {
+    /// The seed: a 50 ms interactive render budget (CI-P35 dates the measured render against it).
+    fn default() -> Self {
+        CiSwitchTestThreshold {
+            render_budget_us: Self::RENDER_BUDGET_US_SEED,
         }
     }
 }
