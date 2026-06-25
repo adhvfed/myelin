@@ -118,6 +118,7 @@ pub mod compiler;
 pub mod consistency;
 pub mod cross_cell;
 pub mod dek;
+pub mod e2e_wedge;
 pub mod engine;
 pub mod erase;
 pub mod erasure_posture;
@@ -170,6 +171,10 @@ pub use consistency::{
     ConsistencyStats,
 };
 pub use dek::{hyok_skips_index, srch_p03_inherited_gates, InheritedGate, SearchDekPin};
+pub use e2e_wedge::{
+    run_e2e_1_pr_pane, run_e2e_3_spec_to_ship, run_e2e_4_dsar_fanout, run_search_e2e_wedge,
+    E2eArtifact, E2E_SCENARIOS,
+};
 pub use engine::{
     AclFilter, Hit, IndexBackend, IndexDocument, IndexError, SubjectMatcher, TantivyBackend,
     DEFAULT_SUBJECT_LOCATOR_FACETS, ORDER_KEY_FIELD,
