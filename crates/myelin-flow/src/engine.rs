@@ -1135,6 +1135,8 @@ pub fn drive_with_timers(
         timers,
         None,
         now_secs,
+        None,
+        None,
     )
 }
 
@@ -1163,6 +1165,8 @@ pub fn drive_full(
     timers: Option<crate::timer::TimerStore>,
     signals: Option<SignalStore>,
     now_secs: i64,
+    run_identity: Option<crate::remint::RunTokenLease>,
+    budget: Option<crate::budget::BudgetGate>,
 ) -> DriveOutcome {
     let tenant = run.tenant.clone();
     // Load the journal so far (the replay prefix the body short-circuits over §4.1).
@@ -1191,6 +1195,17 @@ pub fn drive_full(
     // (P-FLOW-09 delivery) + parks the run (`waiting`) when the named signal has not arrived (§4.3).
     if let Some(signals) = signals.clone() {
         ctx = ctx.with_signals(signals);
+    }
+    // Supply the per-run mint context so a resume across a multi-day wait re-mints a FRESH short-lived
+    // attenuated per-run token (contract 4.7, §6.2). The automatic resume hook in `wait_for_signal`
+    // fires on a TRUE resume; an un-privileged drive (no lease) skips it silently.
+    if let Some(lease) = run_identity {
+        ctx = ctx.with_run_identity(lease);
+    }
+    // Supply the reserve/settle bookend so every spend-bearing dispatch meters into the run's wallet
+    // (contract 9.5/11.7) — the same depleting wallet across the whole run.
+    if let Some(gate) = budget {
+        ctx = ctx.with_budget(gate);
     }
 
     // Run the body. It replays the journaled commands (short-circuit, 0 side effect) then runs the
@@ -1315,6 +1330,25 @@ pub struct FlowDispatcher {
     /// activity/timer surface (a body `wait_for_signal` errors loudly — never a silent no-op). Share
     /// the executor's store ([`FlowExecutor::signals`]) so the wait consumes what `signal` delivered.
     signals: Option<SignalStore>,
+    /// **The per-run mint context the dispatcher wires into each drive's `WfCtx` so a resume across a
+    /// multi-day wait re-mints a FRESH short-lived attenuated per-run token (contract 4.7, §6.2 —
+    /// P-FLOW-17).** `None` until [`Self::with_run_identity`] supplies it. When set, every drive's
+    /// `WfCtx` carries the lease ([`WfCtx::with_run_identity`]), so the automatic resume hook
+    /// ([`WfCtx::remint_if_resuming`]) fires on a TRUE resume (a prior `signal_waited`): the resumed
+    /// body runs under a fresh token whose life == ACTIVITY life, not the days-long workflow life (the
+    /// workflow holds no long-lived privileged token across the park). This is the production shape the
+    /// remint.rs doctrine describes — *the dispatcher mints from the run's agent identity on resume*.
+    /// The E2E-2 spine ([`tests/drills_flow_e2e2_spine.rs`]) reads the re-mint off this path.
+    run_identity: Option<crate::remint::RunTokenLease>,
+    /// **The reserve/settle bookend the dispatcher wires into each drive's `WfCtx` so every
+    /// spend-bearing dispatch the body makes reserves-at-dispatch + settles-on-completion against the
+    /// run's wallet (contract 9.5/11.7 — P-FLOW-16).** `None` until [`Self::with_budget`] supplies it.
+    /// When set, the body's `metered_activity` / `metered_schedule_and_run_job` / `run_merge_attempt`
+    /// meter into the SAME depleting wallet across the whole run — the production shape where the
+    /// dispatcher seeds the wallet from the run's budget ([`crate::RunBudget`]). A dispatcher WITHOUT a
+    /// gate drives the un-metered surface (the loop-cap is the runaway bound, AG-6), so the broad
+    /// existing tests are unaffected. The E2E-2 spine reads reserve/settle parity off this path.
+    budget: Option<crate::budget::BudgetGate>,
 }
 
 impl FlowDispatcher {
@@ -1347,7 +1381,34 @@ impl FlowDispatcher {
             running_versions: HashMap::new(),
             timers: None,
             signals: None,
+            run_identity: None,
+            budget: None,
         }
+    }
+
+    /// **Supply the reserve/settle bookend so every spend-bearing dispatch the body makes meters into
+    /// the run's wallet (contract 9.5/11.7 — P-FLOW-16).** Chainable on [`Self::new`]. When wired, every
+    /// drive's `WfCtx` carries the [`crate::budget::BudgetGate`] ([`WfCtx::with_budget`]), so a body's
+    /// `metered_activity` / `metered_schedule_and_run_job` / `run_merge_attempt` reserve-at-dispatch +
+    /// settle-on-completion against the SAME depleting wallet across the whole run — the production shape
+    /// where the dispatcher seeds the wallet from the run's budget. A dispatcher WITHOUT a gate drives
+    /// the un-metered surface (the broad existing tests wire no budget and are unaffected).
+    pub fn with_budget(mut self, gate: crate::budget::BudgetGate) -> Self {
+        self.budget = Some(gate);
+        self
+    }
+
+    /// **Supply the per-run mint context so a resume across a multi-day wait re-mints a FRESH
+    /// short-lived attenuated per-run token (contract 4.7, §6.2 — P-FLOW-17).** Chainable on
+    /// [`Self::new`]. When wired, every drive's `WfCtx` carries the [`crate::remint::RunTokenLease`]
+    /// ([`WfCtx::with_run_identity`]), so the automatic resume hook re-mints on a TRUE resume — the
+    /// resumed body runs under a token whose life == ACTIVITY life (not the days-long workflow life).
+    /// This is the production shape: the dispatcher mints from the run's agent identity on resume. A
+    /// dispatcher WITHOUT a lease drives the un-privileged surface (the resume hook is a silent no-op,
+    /// so the broad existing wait/long-park tests are unaffected — they wire no identity).
+    pub fn with_run_identity(mut self, lease: crate::remint::RunTokenLease) -> Self {
+        self.run_identity = Some(lease);
+        self
     }
 
     /// **Supply the durably-buffered `wf_signal` store so a body's `wait_for_signal` consumes + parks
@@ -1436,6 +1497,8 @@ impl FlowDispatcher {
             self.timers.clone(),
             self.signals.clone(),
             now,
+            self.run_identity.clone(),
+            self.budget.clone(),
         );
         Some(outcome)
     }

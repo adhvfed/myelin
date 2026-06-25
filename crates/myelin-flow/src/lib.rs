@@ -195,7 +195,32 @@
 //!   [`WfCtx::schedule_and_run_job`] (the long-park `job.done` resume, through the wait). The 4.7 CDC
 //!   pair vs Identity's `IdentityService::mint_run_token` provider is `tests/cdc_4_7_remint.rs`. **NAMED
 //!   FLOOR:** the `mint_run_token` BODY is Identity's (P-ID-18, M1); the E2E-2 spine re-mint assertion
-//!   lands at **P-FLOW-27**.
+//!   is now **LANDED at P-FLOW-28** (the global ledger P-477 — the §6.2 cross-ref to "P-FLOW-27"
+//!   pre-dated the E2E split; the E2E-2 spine that asserts the re-mint end-to-end across the whole
+//!   multi-day HITL + long-park flow is the P-FLOW-28 flagship, `tests/drills_flow_e2e2_spine.rs`).
+//! - **The E2E-2 durable-workflow + HITL SPINE** (the agent-native flagship — myelin-flow's role in the
+//!   whole-system E2E-2 wedge) → **LANDED at P-FLOW-28** (P-477, M5), see
+//!   `tests/drills_flow_e2e2_spine.rs`. The scenario chains the mutations CI-fail → triage agent
+//!   workflow → issue (no approval) → HITL `git.merge` gate (`request_approval_and_wait` parks,
+//!   `state=waiting` holding no runtime — **0 mutation before approval**, AG-8) → KILL the Agent +
+//!   Workflow worker mid-`ack_window` → DAYS-later double-click approve (`ON CONFLICT DO NOTHING` →
+//!   buffered=1, 1 wake) → RESUME (FLOW-D4) → RE-MINT the run token on resume (contract 4.7 — wired
+//!   through the new [`FlowDispatcher::with_run_identity`] so the dispatcher mints from the run's agent
+//!   identity, the production shape) → consume the approval EXACTLY ONCE → the merge applies EXACTLY
+//!   ONCE (FLOW-D1, merge-count == 1, 0 double-effect across the kill) → the fix-PR's CI goes green →
+//!   the merge-queue workflow wakes on `ci.result` IDEMPOTENTLY (X-1, via [`RealCiResultProducer`], a
+//!   doubly-delivered rollup → 1 wake → merge-count == 1) → reserve/settle BALANCED across the WHOLE
+//!   run (the new [`FlowDispatcher::with_budget`] meters every spend-bearing dispatch into the ONE
+//!   wallet — settle-count == completed-dispatch-count, 0 rejects, 0 in-flight interrupts, the wallet
+//!   conserved, contract 11.7/9.5). Contracts exercised: 9.1/9.4 (signal + wait), 4.7 (re-mint), 5.9
+//!   (the merge-queue wake), 9.5/11.7 (reserve/settle parity). The dated SCHED green artifact is the
+//!   run trace + the HITL withhold→approve→apply ledger + reserve/settle parity + merge-count == 1.
+//!   **CROSS-SUBSYSTEM FACES recorded as their owners':** the real agent plan loop (Agent Fabric's E2E
+//!   leg), the Issues row (Issues' leg), the Notif approval-card RENDER (P-471 Notif/Chat's leg — the
+//!   `agent.approval.requested` emit is real here; the card UX is theirs), Git's real merge (Git's leg),
+//!   the Identity `mint_run_token` BODY (P-ID-18 — a recording minter fixture here proves the engine
+//!   CALLS the surface). This prompt owns ONLY the durable-workflow + HITL spine. (M5 for myelin-flow is
+//!   now covered across P-FLOW-24..28.)
 //!
 //! There is **no mandatory-core algorithm module** here (it is the schema + frozen type shapes), so
 //! there is no mutation-score floor on this prompt — stated explicitly per the template's TESTS

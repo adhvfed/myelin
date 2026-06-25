@@ -788,6 +788,8 @@ mod tests {
             None,
             Some(ex.signals().clone()),
             1_000,
+            None,
+            None,
         );
         assert_eq!(
             o1,
@@ -836,6 +838,8 @@ mod tests {
             None,
             Some(ex.signals().clone()),
             200_000,
+            None,
+            None,
         );
         match o2 {
             DriveOutcome::Completed(refs) => assert_eq!(
@@ -893,6 +897,8 @@ mod tests {
             None,
             Some(ex.signals().clone()),
             1_000,
+            None,
+            None,
         );
         let emits_after_park = outbox.committed_count();
 
@@ -925,6 +931,8 @@ mod tests {
             None,
             Some(ex.signals().clone()),
             2_000,
+            None,
+            None,
         );
         assert_eq!(
             o2,
