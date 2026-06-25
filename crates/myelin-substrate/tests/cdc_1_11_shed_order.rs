@@ -166,8 +166,8 @@ fn cdc_1_11_v1_floor_table_is_bounded_with_a_reserved_human_lane() {
         seen += 1;
     }
     assert_eq!(
-        seen, 9,
-        "the v1 floor names the four §7.6 surfaces + the Git front door (GIT-P15) + the two Refs surfaces (REF-P22) + the Search query surface (SRCH-P25) + the generic HTTP intake"
+        seen, 10,
+        "the v1 floor names the four §7.6 surfaces + the Git front door (GIT-P15) + the two Refs surfaces (REF-P22) + the Search query surface (SRCH-P25) + the durable-workflow start surface (P-FLOW-27) + the generic HTTP intake"
     );
     // CI is the batch lane — no human reservation; the human-facing surfaces reserve a lane.
     assert_eq!(

@@ -449,6 +449,13 @@ human_lane_reservation = 40    # 25% of cap — above the 20% measured human-lan
 retry_after_secs = 3
 
 [[shed_budgets]]
+surface = "WorkflowAgentLane" # the durable-workflow START surface (P-FLOW-27, FLOW-D8): an agent-initiated-workflow
+                              # storm sheds before a human-initiated workflow (the F-8 protected lane, §7.6).
+per_tenant_in_flight_cap = 96  # MEASURED: FLOW-D8 30× agent-initiated-workflow surge shed the agent lane at this cap; the human-initiated workflow lane held within its reserved slots.
+human_lane_reservation = 24    # 25% of cap — above the 20% measured human-lane floor.
+retry_after_secs = 10          # generous — a workflow start is not latency-critical; an agent fan-out backs off and re-initiates.
+
+[[shed_budgets]]
 surface = "HttpIntake"        # the generic public surface (§7.1): every surface reserves a human fraction.
 per_tenant_in_flight_cap = 200 # MEASURED: SUB-D3 (P-S32) + ID-D9 (P-424) held the human lane at this generic-intake cap.
 human_lane_reservation = 50    # 25% of cap — above the 20% measured human-lane floor.
