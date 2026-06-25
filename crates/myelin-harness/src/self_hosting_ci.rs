@@ -235,6 +235,42 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "drill_sub_d10_migration_under_load",
             ],
         },
+        // (5) the TENANCY dogfood band (P-508 / P-CP-23 → CP-M6): Myelin self-hosts as exactly one
+        //     cell + the two Tenancy lints run as Myelin CI jobs on the platform's own commit. The
+        //     `residency-pin` + `control-plane-pii-free` lints are part of the twelve-lint `lints`
+        //     job above; these jobs prove the two Tenancy-OWNED lints still BITE on a fixture commit
+        //     (a PII column / an out-of-region write), and drive the team-tenant residency-verify +
+        //     the truth-up pass — the dogfood loop for Tenancy (no new gate, no new floor).
+        SelfHostJob {
+            id: "tenancy-lints",
+            title: "the two Tenancy lints (residency-pin + control-plane-pii-free) bite on a \
+                    fixture commit (PII column / out-of-region write) — the ratchet on Myelin's code",
+            kind: JobKind::Lints,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-lints",
+                "--test",
+                "tenancy_lints",
+                "--test",
+                "tenancy_control_plane_lints",
+            ],
+        },
+        SelfHostJob {
+            id: "CP-D23-dogfood",
+            title: "Myelin self-hosts as one cell + residency_verify GREEN on the team's own data \
+                    + the truth-up pass (no later-band CP gate red)",
+            kind: JobKind::Drill,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-control-plane",
+                "--test",
+                "cp_d23_dogfood_self_host_drill",
+            ],
+        },
     ]
 }
 
