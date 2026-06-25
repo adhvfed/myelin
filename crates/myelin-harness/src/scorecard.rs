@@ -156,6 +156,40 @@ pub enum Band {
     /// surge) needs real fleet hardware — is a named, dated M5 deferral in `render_markdown`, NOT a row
     /// here; gVisor as a second escape-drill backend (CI-P28) is a named run-when-available residual.
     M4Consumers,
+    /// The **M5 world-scale-hardening exit gate** (M5 → M6) — the consolidated go/no-go that
+    /// declares world-scale readiness. It WIRES (does not re-implement) the per-feature M5 drills
+    /// (each `proof_command` is the real `cargo test` target that already lives with its feature
+    /// prompt, P-420..P-444) across five families:
+    ///
+    /// - **The F6 30× surge family (all owners):** SUB-D3, ID-D9, BUS-D7, REF-D10, SRCH-D6,
+    ///   NOTIF-D5, AG-D6, FLOW-D8, GIT-D6, CI-D2, CHAT-D3/D4 — the human lane stays within budget,
+    ///   the agent lane sheds, cross-tenant impact is 0.
+    /// - **Git world-scale:** GIT-D4 (monorepo ceiling / object-backed packs, clone p99 held),
+    ///   GIT-D5 (concurrent-merge linearizability under failover — no split-brain, 0 lost merge).
+    /// - **Knowledge:** KN-D1-re-green (KN-D1 holds ACROSS the Yrs CRDT promotion boundary),
+    ///   KN-D8 (all-hands doc surge — thousands of concurrent editors, caps hold).
+    /// - **Multi-cell / DSR:** GA-D1 (full H1–H18 DSR fan-out at cell scale, 0 holders missed),
+    ///   GA-D8 (multi-cell DSR fan-out, per-cell receipt set complete), CP-D7 (cell→cell live
+    ///   migration, 0 loss), CP-D8 (cross-cell PII-free CrossCellPointer bridge).
+    /// - **The four whole-system E2E scenarios:** E2E-2 (the agent-native flagship:
+    ///   CI-fail→triage→issue→chat→fix-PR), E2E-4 (the DSAR fan-out flagship), E2E-3 (spec-to-ship
+    ///   reindex-parity storage half), E2E-1 (PR context pane — git slice) — each its named green
+    ///   artifact.
+    ///
+    /// Plus **STOR-D2 at cell scale** (the PERMANENT restore gate re-confirmed at cell scale under
+    /// world-scale load — RPO/RTO within bound; a backup never restored is not a backup, EI-01 §3)
+    /// and the **contract-coverage** scanner re-affirm. STOR-D2-cell is the only `permanent` row.
+    ///
+    /// A single RED row blocks M6 (the master band gate invariant, master-sequencing §2/§4,
+    /// EI-01 §2). The M5 surge family runs as a **single-box SCALED drill** (the shed-order /
+    /// lane-priority / cross-tenant-isolation LOGIC is exercised and green); the **true multi-node
+    /// FLEET proof** (30× fan-out across a real multi-box cluster, measured blast-radius/density at
+    /// fleet scale) remains the ONE genuine named floor — named, dated, NEVER faked green
+    /// (EI-01 §1), printed by [`Scorecard::render_markdown`], NOT a row that reds this gate. The
+    /// carried-forward AG-D4 production-exec floor (M7 P-544/P-545) and the measured-trigger-gated
+    /// floors (Chat ScyllaDB hot-tier M4-C1, mega-channel home-node M4-C2, comment-threading OQ-L)
+    /// are likewise named there, not rows that red this gate.
+    M5World,
 }
 
 impl fmt::Display for Band {
@@ -167,6 +201,7 @@ impl fmt::Display for Band {
             Band::M2Reactive => write!(f, "M2 (reactive shared layer)"),
             Band::M3Producers => write!(f, "M3 (producer subsystems)"),
             Band::M4Consumers => write!(f, "M4 (consumer subsystems)"),
+            Band::M5World => write!(f, "M5 (world-scale hardening)"),
         }
     }
 }
@@ -184,6 +219,7 @@ impl Band {
             Band::M2Reactive => m2_required_rows(),
             Band::M3Producers => m3_required_rows(),
             Band::M4Consumers => m4_required_rows(),
+            Band::M5World => m5_required_rows(),
         }
     }
 }
@@ -1452,6 +1488,191 @@ pub fn m4_required_rows() -> Vec<GateRow> {
     ]
 }
 
+/// The FROZEN required-row set for the **M5 world-scale-hardening exit gate** (M5 → M6). This is the
+/// build-layer realisation of the master band gate invariant (master-sequencing §2/§4, EI-01 §2): the
+/// platform is *world-scale ready* before M6 (dogfooding) is started. It WIRES the per-feature M5
+/// drills (it does not re-implement them — each `proof_command` is the real `cargo test` target that
+/// already lives with its feature prompt, P-420..P-444) across five families:
+///
+/// - **The F6 30× surge family (all owners):** SUB-D3, ID-D9, BUS-D7, REF-D10, SRCH-D6, NOTIF-D5,
+///   AG-D6, FLOW-D8, GIT-D6, CI-D2, CHAT-D3/D4 — the human lane stays within budget, the agent lane
+///   sheds, cross-tenant impact is 0.
+/// - **Git world-scale:** GIT-D4 (monorepo ceiling / object-backed packs), GIT-D5 (concurrent-merge
+///   linearizability under failover — no split-brain, 0 lost merge).
+/// - **Knowledge:** KN-D1-re-green (KN-D1 holds across the Yrs CRDT promotion boundary), KN-D8
+///   (all-hands doc surge — thousands of concurrent editors, caps hold).
+/// - **Multi-cell / DSR:** GA-D1 (full H1–H18 DSR fan-out at cell scale, 0 holders missed), GA-D8
+///   (multi-cell DSR fan-out), CP-D7 (cell→cell live migration, 0 loss), CP-D8 (cross-cell PII-free
+///   bridge).
+/// - **The four whole-system E2E scenarios:** E2E-2 (the agent-native flagship), E2E-4 (the DSAR
+///   fan-out flagship), E2E-3 (spec-to-ship reindex-parity storage half), E2E-1 (PR context pane —
+///   git slice) — each its named green artifact.
+///
+/// Plus **STOR-D2 at cell scale** (the PERMANENT restore gate re-confirmed at cell scale under
+/// world-scale load) and the **contract-coverage** scanner re-affirm. STOR-D2-cell is the only
+/// `permanent` row (the shared Storage-owned restore gate — a backup never restored is not a backup,
+/// EI-01 §3, re-run-forever). No M5 row needs `--features integration` (the cell-scale drill drives
+/// the harness gates with REAL generated load but no live backend).
+///
+/// The M5 surge family runs as a **single-box SCALED drill** — the true multi-node FLEET proof is the
+/// ONE genuine remaining floor, a named/dated deferral in [`Scorecard::render_markdown`], NOT a row
+/// here (it would red the gate; the drill proves the mechanism, the fleet residual is NAMED, EI-01 §1).
+pub fn m5_required_rows() -> Vec<GateRow> {
+    fn row(id: &'static str, title: &'static str, cmd: &'static [&'static str]) -> GateRow {
+        GateRow {
+            id,
+            title,
+            proof_command: cmd,
+            permanent: false,
+            floor: None,
+        }
+    }
+    vec![
+        // ---- The F6 30× surge family (all owners; SCHED: human lane within budget, agent sheds, cross-tenant 0) ----
+        row(
+            "SUB-D3",
+            "F6 surge → substrate 30× surge family: human lane within budget, agent lane sheds, cross-tenant impact 0",
+            &["test", "-p", "myelin-substrate", "--test", "drill_sub_d3_surge_family"],
+        ),
+        row(
+            "ID-D9",
+            "F6 surge → Identity authz 30× surge: check/list path holds under load, agent sheds, cross-tenant 0",
+            &["test", "-p", "myelin-identity-service", "--test", "drill_id_d9_authz_surge"],
+        ),
+        row(
+            "BUS-D7",
+            "F6 surge → Bus agent 30× surge: reactive dispatch holds, agent lane sheds, no cross-tenant amplification",
+            &["test", "-p", "myelin-substrate", "--test", "drills_bus_d7_agent_surge"],
+        ),
+        row(
+            "REF-D10",
+            "F6 surge → Reference Graph 30× surge: resolution holds within budget, agent sheds, cross-tenant 0",
+            &["test", "-p", "myelin-refs-service", "--test", "ref_d10_surge_drill"],
+        ),
+        row(
+            "SRCH-D6",
+            "F6 surge → Search 30× surge: query path within budget, agent sheds, 0 cross-tenant leak under load",
+            &["test", "-p", "myelin-search", "--test", "drill_srch_d6_surge"],
+        ),
+        row(
+            "NOTIF-D5",
+            "F6 surge → Notifications 30× surge: fan-out within budget, agent sheds, cross-tenant impact 0",
+            &["test", "-p", "myelin-notif", "--test", "drill_notif_d5"],
+        ),
+        row(
+            "AG-D6",
+            "F6 surge → Agent dispatch 30× surge: human lane within budget, agent dispatch sheds, cross-tenant 0",
+            &["test", "-p", "myelin-agent-service", "--test", "ag_d6_dispatch_surge_drill"],
+        ),
+        row(
+            "FLOW-D8",
+            "F6 surge → Durable Workflow 30× surge: human lane within budget, agent lane sheds, cross-tenant 0",
+            &["test", "-p", "myelin-flow", "--test", "drills_flow_d8_surge"],
+        ),
+        row(
+            "GIT-D6",
+            "F6 surge → Git clone 30× surge: clone p99 held within budget, agent sheds, cross-tenant 0",
+            &["test", "-p", "myelin-git", "--test", "drill_git_d6_clone_surge"],
+        ),
+        row(
+            "CI-D2",
+            "F6 surge → CI 30× surge: pipeline admission within budget, agent lane sheds, cross-tenant 0",
+            &["test", "-p", "myelin-ci-controlplane", "--test", "ci_d2_surge_drill"],
+        ),
+        row(
+            "CHAT-D3/D4",
+            "F6 surge → Chat agent 30× surge: human lane within budget, agent lane sheds, cross-tenant 0",
+            &["test", "-p", "myelin-chat-gateway", "--test", "drill_chat_d3_agent_surge"],
+        ),
+        // ---- Git world-scale ----
+        row(
+            "GIT-D4",
+            "monorepo ceiling → object-backed packs: large-monorepo ceiling documented + clone p99 held under object-backed packs",
+            &["test", "-p", "myelin-git", "--test", "drills_git_d4_object_backed_packs"],
+        ),
+        row(
+            "GIT-D5",
+            "concurrent-merge linearizability under failover → ref-CAS linearizable, no split-brain, 0 lost merge",
+            &["test", "-p", "myelin-git", "--test", "drills_git_d5_concurrent_merge_linearizability"],
+        ),
+        // ---- Knowledge ----
+        row(
+            "KN-D1-re-green",
+            "Yrs CRDT promotion re-green → KN-D1 resume-cursor collab holds ACROSS the CRDT boundary (no gap / no double-apply)",
+            &["test", "-p", "myelin-knowledge", "--test", "drill_kn_p29_yrs_promotion"],
+        ),
+        row(
+            "KN-D8",
+            "all-hands doc surge → thousands of concurrent editors on one doc → the per-doc caps hold (no runaway / no lost edit)",
+            &["test", "-p", "myelin-knowledge", "--test", "drill_kn_d8_allhands_surge"],
+        ),
+        // ---- Multi-cell / DSR ----
+        row(
+            "GA-D1",
+            "full H1–H18 DSR fan-out at cell scale → an erasure reaches every holder family, 0 holders missed, per-holder receipt",
+            &["test", "-p", "myelin-gdpr-service", "--test", "ga_d1_full_fanout_cell_scale"],
+        ),
+        row(
+            "GA-D8",
+            "multi-cell DSR fan-out → an erasure fans out across every member cell, per-cell receipt set complete, 0 cell missed",
+            &["test", "-p", "myelin-gdpr-service", "--test", "ga_d8_multi_cell_fanout"],
+        ),
+        row(
+            "CP-D7",
+            "cell→cell live migration → a tenant migrates between cells with 0 loss (no lost/ghost write across the cutover)",
+            &["test", "-p", "myelin-control-plane", "--test", "cp_d7_live_migration_drill"],
+        ),
+        row(
+            "CP-D8",
+            "cross-cell PII-free bridge → a cross-cell reference resolves via the PII-free CrossCellPointer bridge; 0 PII crosses",
+            &["test", "-p", "myelin-control-plane", "--test", "cp_d8_cross_cell_bridge_drill"],
+        ),
+        // ---- The four whole-system E2E scenarios (each its named green artifact) ----
+        row(
+            "E2E-2",
+            "agent-native flagship → CI-fail → triage agent → issue → chat → fix-PR drives end-to-end with its named green artifact",
+            &["test", "-p", "myelin-agent-service", "--test", "drills_ag_p24_e2e2_flagship"],
+        ),
+        row(
+            "E2E-4",
+            "DSAR fan-out flagship → 0 holders missed; 0 recoverable PII incl. vectors incl. backups; certificate sealed (named green artifact)",
+            &["test", "-p", "myelin-gdpr-service", "--test", "e2e_4_dsar_fanout_flagship"],
+        ),
+        row(
+            "E2E-3",
+            "spec-to-ship / reindex-parity (storage half) → a cold re-index pass equals the live projection; audit tamper detected (named artifact)",
+            &["test", "-p", "myelin-storage", "--test", "e2e3_reindex_parity_drill"],
+        ),
+        row(
+            "E2E-1",
+            "PR context pane (git slice) → the whole-system PR-context wedge drives end-to-end with its named green artifact",
+            &["test", "-p", "myelin-git", "--test", "e2e_wedge_git_p34"],
+        ),
+        // ---- STOR-D2 at cell scale: the PERMANENT restore gate (RPO/RTO under world-scale load) ----
+        GateRow {
+            id: "STOR-D2-cell",
+            title: "restore-verify at CELL SCALE under world-scale load → RPO/RTO within bound, 0 loss per cell (the permanent restore gate)",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-storage",
+                "--test",
+                "stor_d2_d8_cell_scale_under_world_scale_load_drill",
+            ],
+            permanent: true,
+            floor: None,
+        },
+        // ---- contract-coverage re-affirm ----
+        GateRow {
+            id: "contract-coverage",
+            title: "the contract-coverage scanner re-affirms the M5 CDC rows — no falsely-claimed/dropped row",
+            proof_command: &["run", "-p", "myelin-lints", "--bin", "contract-coverage"],
+            permanent: false,
+            floor: None,
+        },
+    ]
+}
+
 /// The verdict of one recorded scorecard row. A `Pass` is only constructible WITH a non-empty
 /// proof line (the dated green artifact the proof command emitted) — a green must be earned, it
 /// cannot be flipped from nothing (the ratchet's "no green without proof" half).
@@ -1609,6 +1830,12 @@ impl Scorecard {
                  STOR-D1/D2 (restore-verify on CI stores) + ISS-P06/D2/D3/D4/D5/D6/D7/D8/D9/D11/D13 + \
                  CHAT-D5/D6/D7/D18/D8/D9/D10/D11/D12/D15/D16/D17 + contract-coverage",
                 "M5",
+            ),
+            Band::M5World => (
+                "F6 surge family (SUB-D3/ID-D9/BUS-D7/REF-D10/SRCH-D6/NOTIF-D5/AG-D6/FLOW-D8/GIT-D6/CI-D2/CHAT-D3/D4) + \
+                 GIT-D4/D5 + KN-D1-re-green/KN-D8 + GA-D1/GA-D8/CP-D7/CP-D8 + E2E-1/E2E-2/E2E-3/E2E-4 + \
+                 STOR-D2 (cell scale, permanent restore gate) + contract-coverage",
+                "M6",
             ),
         };
         let mut out = String::new();
@@ -1823,6 +2050,34 @@ impl Scorecard {
                      under it needs an OCI bundle + root/userns privileges this host lacks; the \
                      AG-D4 attestation records it as a NAMED parametrized residual, never faked \
                      green. Firecracker (the production default) IS the exercised gate backend.\n",
+                );
+            }
+            Band::M5World => {
+                out.push_str(
+                    "**The world-scale 30× surge family is proven here as a SINGLE-BOX SCALED drill** \
+                     (the shed-order / lane-priority / cross-tenant-isolation LOGIC is exercised and \
+                     green). The **true multi-node FLEET proof** (30× fan-out across a real multi-box \
+                     cluster, measured blast-radius/density at fleet scale) remains the ONE genuine \
+                     named floor — it needs real fleet hardware this dev host does not have. The drill \
+                     proves the mechanism; the fleet-scale residual is NAMED, never faked green \
+                     (EI-01 §1).\n\n",
+                );
+                out.push_str(
+                    "**STOR-D2 at cell scale** is the permanent restore gate (a backup never restored \
+                     is not a backup, EI-01 §3) — re-run-forever.\n\n",
+                );
+                out.push_str(
+                    "**Carried-forward floor (M7):** the AG-D4 sandbox isolation boundary is \
+                     proven-on-real-hardware, but a real `JobSpec.command` does not yet flow through \
+                     the PRODUCTION `launch()` on either backend (Firecracker prod boots \
+                     `init=/bin/true`; gVisor prod runs only `runsc --version`) — production exec is \
+                     filled by M7 P-544/P-545, named here, not a row that reds this M5 gate.\n\n",
+                );
+                out.push_str(
+                    "**Measured-trigger-gated floors named in M5 (trigger not fired):** Chat ScyllaDB \
+                     hot-tier promotion (M4-C1), mega-channel channel-sharded home-node (M4-C2), \
+                     comment-threading consolidation (OQ-L) — each ships its seam + named follow-on, \
+                     promoted only on its measured trigger; not a row that reds this gate.\n",
                 );
             }
         }
@@ -2792,5 +3047,190 @@ mod tests {
         assert!(card
             .render_markdown("2026-06-24")
             .contains("RED — M5 is BLOCKED"));
+    }
+
+    // ---- M5 world-scale-hardening exit gate (M5 → M6) ----
+
+    /// The M5 required row set covers all five world-scale families: the F6 surge family (all
+    /// owners), Git world-scale (GIT-D4/D5), Knowledge (KN-D1-re-green/KN-D8), multi-cell/DSR
+    /// (GA-D1/GA-D8/CP-D7/CP-D8), and the four whole-system E2E scenarios (E2E-1..E2E-4), plus the
+    /// permanent STOR-D2 cell-scale restore gate and the contract-coverage re-affirm. The
+    /// frozen-row ratchet asserts a future edit cannot silently shrink the proof set, and the band
+    /// dispatch returns the same set.
+    #[test]
+    fn m5_required_rows_cover_the_world_scale_families() {
+        let ids: Vec<&str> = m5_required_rows().iter().map(|r| r.id).collect();
+        for must in [
+            // F6 surge family (all owners)
+            "SUB-D3",
+            "ID-D9",
+            "BUS-D7",
+            "REF-D10",
+            "SRCH-D6",
+            "NOTIF-D5",
+            "AG-D6",
+            "FLOW-D8",
+            "GIT-D6",
+            "CI-D2",
+            "CHAT-D3/D4",
+            // Git world-scale
+            "GIT-D4",
+            "GIT-D5",
+            // Knowledge
+            "KN-D1-re-green",
+            "KN-D8",
+            // Multi-cell / DSR
+            "GA-D1",
+            "GA-D8",
+            "CP-D7",
+            "CP-D8",
+            // The four whole-system E2E scenarios
+            "E2E-1",
+            "E2E-2",
+            "E2E-3",
+            "E2E-4",
+            // Permanent restore gate + coverage
+            "STOR-D2-cell",
+            "contract-coverage",
+        ] {
+            assert!(
+                ids.contains(&must),
+                "M5 gate is missing required row {must}"
+            );
+        }
+        // All five families present: a surge owner, a GIT-*, a KN-*, a GA-*/CP-*, and an E2E-*.
+        assert!(ids.contains(&"AG-D6"));
+        assert!(ids.iter().any(|id| id.starts_with("GIT-")));
+        assert!(ids.iter().any(|id| id.starts_with("KN-")));
+        assert!(ids
+            .iter()
+            .any(|id| id.starts_with("GA-") || id.starts_with("CP-")));
+        assert!(ids.iter().any(|id| id.starts_with("E2E-")));
+        // The band dispatch returns the same frozen set (the single dispatch point).
+        assert_eq!(
+            Band::M5World
+                .required_rows()
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+    }
+
+    /// EXACTLY one M5 row is permanent (re-run-forever): the STOR-D2 cell-scale restore gate. No M5
+    /// row needs `--features integration` (the cell-scale drill drives the harness gates under REAL
+    /// generated load with no live backend).
+    #[test]
+    fn m5_permanent_row_is_the_cell_scale_restore_gate() {
+        let perm: Vec<&str> = m5_required_rows()
+            .into_iter()
+            .filter(|r| r.permanent)
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            perm,
+            vec!["STOR-D2-cell"],
+            "the M5 permanent set is exactly the cell-scale restore gate"
+        );
+        assert!(
+            m5_required_rows()
+                .iter()
+                .all(|r| !r.proof_command.contains(&"--features")),
+            "no M5 row needs --features integration"
+        );
+    }
+
+    /// No M5 row carries a `floor` note — the ONE true remaining floor (the true multi-node FLEET
+    /// proof) is a named deferral in the rendered artifact, NOT a smoke-floor row that reds the gate.
+    #[test]
+    fn m5_has_no_floor_rows() {
+        assert!(m5_required_rows().iter().all(|r| r.floor.is_none()));
+    }
+
+    /// A fully-proven M5 scorecard reads GREEN, renders the M6-may-start verdict, the SINGLE-BOX
+    /// SCALED honesty framing + the named FLEET floor, the STOR-D2 permanent restore gate, and the
+    /// carried-forward M7 + measured-trigger floors as named, visible deferrals that do NOT red the
+    /// gate (EI-01 §1).
+    #[test]
+    fn m5_all_rows_proven_is_green_with_floor_named() {
+        let mut card = Scorecard::new(Band::M5World);
+        for r in m5_required_rows() {
+            card.record(RowResult::pass(
+                r.id,
+                format!("[2026-06-25] PASS {}", r.id),
+                "2026-06-25",
+            ));
+        }
+        assert!(card.is_green(), "every M5 row proven ⇒ green");
+        assert!(card.missing_required().is_empty());
+        let md = card.render_markdown("2026-06-25");
+        assert!(md.contains("GREEN — M6 may start"));
+        // The single-box-scaled honesty framing + the named fleet floor.
+        assert!(md.contains("SINGLE-BOX SCALED"));
+        assert!(md.contains("FLEET"));
+        // STOR-D2 permanent restore gate named.
+        assert!(
+            md.contains("permanent restore gate"),
+            "the STOR-D2 permanent restore gate must be named"
+        );
+        // Carried-forward M7 exec floor named.
+        assert!(
+            md.contains("P-544"),
+            "the M7 production-exec floor must be named"
+        );
+        // Measured-trigger-gated floors named.
+        assert!(
+            md.contains("M4-C1"),
+            "the ScyllaDB hot-tier trigger floor must be named"
+        );
+        assert!(
+            md.contains("OQ-L"),
+            "the comment-threading trigger floor must be named"
+        );
+    }
+
+    /// THE RATCHET on the M5 set: dropping ANY single row reds the M5→M6 gate (you cannot declare
+    /// world-scale readiness over a missing drill).
+    #[test]
+    fn m5_dropping_any_row_reds_the_gate() {
+        for dropped in m5_required_rows() {
+            let mut card = Scorecard::new(Band::M5World);
+            for r in m5_required_rows()
+                .into_iter()
+                .filter(|r| r.id != dropped.id)
+            {
+                card.record(RowResult::pass(r.id, "[2026-06-25] PASS", "2026-06-25"));
+            }
+            assert_eq!(card.missing_required(), vec![dropped.id]);
+            assert!(
+                !card.is_green(),
+                "dropping {} must RED the M5→M6 gate",
+                dropped.id
+            );
+        }
+    }
+
+    /// THE RATCHET on the M5 set: a claimed-not-proven row (e.g. the cell-scale restore gate that
+    /// did not meet RPO/RTO) keeps the gate RED — recorded honestly, never softened into a green
+    /// (EI-01 §3). The honest red blocks M6.
+    #[test]
+    fn m5_claimed_not_proven_row_reds_the_gate() {
+        let mut card = Scorecard::new(Band::M5World);
+        for r in m5_required_rows() {
+            if r.id == "STOR-D2-cell" {
+                card.record(RowResult::claimed_not_proven(
+                    r.id,
+                    "RPO/RTO exceeded the budget at cell scale under world-scale load — recorded RED",
+                    "2026-06-25",
+                ));
+            } else {
+                card.record(RowResult::pass(r.id, "[2026-06-25] PASS", "2026-06-25"));
+            }
+        }
+        assert!(!card.is_green(), "a claimed-not-proven M5 row blocks M6");
+        assert_eq!(card.not_proven().len(), 1);
+        assert!(card
+            .render_markdown("2026-06-25")
+            .contains("RED — M6 is BLOCKED"));
     }
 }
