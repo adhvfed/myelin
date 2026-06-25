@@ -272,6 +272,7 @@ pub mod cross_cell_rollup;
 pub mod declares;
 pub mod dek;
 pub mod e2e_flagship;
+pub mod e2e_lineage;
 pub mod e2e_wedge;
 pub mod events;
 pub mod floor_triggers;
@@ -698,6 +699,22 @@ pub use e2e_wedge::{
 // no new contract, no second governance/cost engine (EI-01 §7). Runs under the MOCK agent runtime
 // (real-LLM is the post-M5 swap, R-10). FLOOR named: none new (the world-scale 30x load is ISS-P33's).
 pub use e2e_flagship::{run_e2e_2_issues_flagship, CLOSE_CARD_ID, E2E_FLAGSHIP_SCENARIO};
+
+// ISS-P36 (P-499, M5-I9): the whole-system E2E-3 wedge — spec-to-ship traceability, the Issues side
+// (spec → issue → PR → CI lineage per-viewer). `run_e2e_3_lineage` drives the chained lineage scenario
+// end-to-end: the complete lineage resolves per-viewer (the insider walks the spec→initiative→issue→PR→
+// CI chain via the SAME bounded cycle-safe traverse 5.3; an outsider's confidential mid-chain hop
+// tombstones carrying the root, never the title — 0 leak, the lineage degrades gracefully), and the
+// cold-reindex byte-matches live (2.6 — the `*.snapshot` re-emit over the ONE IssueReindexSource::replay
+// path, 0 drift). EXERCISES the frozen contracts (5.6 project / 2.6 reindex-from-source / 10.4 DSR anchor)
+// end-to-end over the SAME `Projector`/`traverse`/`IssueReindexSource` — no new contract, no second
+// walker/resolver/rebuild path (EI-01 §7). The audit-tamper leg (GA-D3) rides the REAL GDPR hash-chain
+// in the cross-module test (a dev-dep edge — acyclic). Runs under the MOCK agent runtime (real-LLM is the
+// post-M5 swap, R-10). FLOOR named: none new (the world-scale 30x load is ISS-P33's named floor).
+pub use e2e_lineage::{
+    lineage_audit_anchor, run_e2e_3_lineage, run_issues_e2e_3, E2E_LINEAGE_SCENARIO,
+    LINEAGE_DEPTH_BOUND,
+};
 
 // ISS-P25 (P-392, M4-I6): the stateful Trigger flagship ("Remind me when unblocked") — exactly-once
 // across a restart, stale-once. `IssueTriggerEngine` is the Issues-side stateful Trigger over the
