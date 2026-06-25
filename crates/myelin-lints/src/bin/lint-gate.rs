@@ -139,6 +139,15 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // the one legitimate host-exec site for a CI/test-support orchestration binary. NAMED, LOUD
     // exclusion of a single tool file; the lint stays fully live on every production crate.
     "myelin-harness/src/bin/m4-scorecard.rs",
+    // The M5 world-scale-hardening exit-gate runner (M5 → M6): same posture as the runners above —
+    // its `Command::new(env!("CARGO"))` spawns `cargo test` per F6-surge / git-world-scale /
+    // Knowledge / multi-cell-DSR / E2E drill plus the STOR-D2-at-cell-scale permanent restore row,
+    // the one legitimate host-exec site for a CI/test-support orchestration binary. NAMED, LOUD
+    // exclusion of a single tool file; the lint stays fully live on every production crate. (This
+    // entry was missing when m5-scorecard.rs landed in a56c0b0 — the runner shipped without its
+    // exclusion, reddening the lint-gate; restored here as part of the P-506 truth-up pass, the
+    // code-wins-over-docs re-sync, EI-01 §1: an earlier-band gate may not stay red under a later band.)
+    "myelin-harness/src/bin/m5-scorecard.rs",
     // The Firecracker + gVisor sandbox BACKENDS (CI-P2 → P-237): the ONE legitimate VMM/runtime
     // spawn sites. The `no-host-exec` rule forbids platform code SHELLING OUT to the host kernel so
     // that all execution goes through the unified sandbox seam (`SandboxBackend::launch`). These two
