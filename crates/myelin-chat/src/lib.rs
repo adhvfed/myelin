@@ -174,6 +174,7 @@
 pub mod composer;
 pub mod content;
 pub mod conversation;
+pub mod cross_org;
 pub mod dek;
 pub mod dispatch;
 pub mod e2e_wedge;
@@ -210,6 +211,10 @@ pub use content::{
 pub use conversation::{
     Conversation, ConversationError, ConversationKind, ConversationStore, MemConversationStore,
     Membership, MembershipRole,
+};
+pub use cross_org::{
+    as_propagated, channel_ref, fanned_out_carried_fields, CellLocalChannelResolution,
+    ChannelProjection, CrossOrgChannel, CrossOrgPointer, FederatedMember,
 };
 pub use dek::{decrypt_body, encrypt_body, plaintext_at_rest, subject_dek_erasure, ChatFreeText};
 pub use dispatch::{
