@@ -36,10 +36,15 @@
 //! - **The `PersonalDataHolder` auto-registration** over `workflow_run` / `wf_history` / `wf_signal`
 //!   (the structural references-not-payloads half) → **LANDED at P-FLOW-03** (P-201), see [`holder`]
 //!   ([`WfHistoryHolder`]: `locate`/`export` real over the journal, `erase` structurally wired; the
-//!   flow store classifies to H8 — the §5.5 references-not-payloads reconcile; the per-subject-DEK
-//!   crypto-shred reach is the NAMED M5 follow-on **P-FLOW-24** — N.B. P-FLOW-23 is the X-1 seam
-//!   end-to-end, NOT the crypto-shred; the erasure follow-on is P-FLOW-24, the merge-queue floor's
-//!   crypto-shred sibling in the §6.5 cluster).
+//!   flow store classifies to H8 — the §5.5 references-not-payloads reconcile). **The per-subject-DEK
+//!   crypto-shred reach (the P-FLOW-03 named floor) is now CLOSED at P-FLOW-24 (FLOW-D9), see
+//!   [`crypto_shred`]** ([`WfCryptoShred`]: erasing a subject DESTROYS their per-subject DEK over the
+//!   ONE [`myelin_storage::kms::KmsEngine`] so the inline-PII `result_key_ref`/`payload_key_ref`
+//!   history/signal rows are unrecoverable incl. backups, WITHOUT rewriting the journal — structure
+//!   preserved (replay still works, the PII is a tombstone) + the crypto-shred-lag telemetry, contract
+//!   1.8; wired into [`holder::WfHistoryHolder::with_crypto_shred`]; the FLOW-D9 drill is
+//!   `tests/drills_flow_d9_crypto_shred.rs`. **NAMED FLOOR:** restore-verify to a consistent point is
+//!   **P-FLOW-25** (FLOW-D10, M5)).
 //! - **The algorithms**: WfCtx + journal/outbox co-commit (**P-FLOW-04**, FLOW-D5) — **LANDED**,
 //!   see [`wfctx`] ([`WfCtx`]: `activity`/`now`/`rand`/`emit` + the single-txn co-commit; the
 //!   FLOW-D5 drill is `tests/drills_flow_d5_cocommit.rs`); deterministic
@@ -201,6 +206,7 @@ pub mod app;
 pub mod approval;
 pub mod budget;
 pub mod ci_pipeline;
+pub mod crypto_shred;
 pub mod engine;
 pub mod executor;
 pub mod holder;
@@ -228,6 +234,11 @@ pub use budget::{BudgetError, BudgetGate, BudgetSettle, Wallet};
 pub use ci_pipeline::{
     read_stage_verdict, stage_verdict_marker, CiPipelineSpec, CiStage, PipelineOutcome,
     CI_PIPELINE_WF_TYPE,
+};
+pub use crypto_shred::{
+    aggregate_receipt as crypto_shred_receipt, history_row_has_inline_pii,
+    is_inline_pii_unrecoverable, open_inline_pii, seal_inline_pii, signal_row_has_inline_pii,
+    subject_dek_erasure, subject_dek_id, WfCryptoShred, WfShredReport,
 };
 // The reserve/settle cost type the public `CiStage` / `metered_schedule_and_run_job` surface takes
 // (contract 11.7) — re-exported so a consumer building a `CiStage` does not need a second
