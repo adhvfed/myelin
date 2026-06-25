@@ -640,6 +640,35 @@
 //! and the [`outbound_mirror_gate::OutboundMirrorGate::extra_eu_pii_transfers_blocked`] count; the
 //! `cargo mutants` score is in the commit body.
 
+//! ## P-GA-37 (→ P-511) — Dogfood: the GDPR/Audit machinery live on Myelin's own commits + a self-served DSR
+//! [`dogfood`] is the **dogfood operation** of contracts 10.1–10.9 on Myelin's OWN tenant (GA-M6) —
+//! NO new contract shape, only the machinery running FOR REAL on the platform's own data: (1) the
+//! audit consumer live on the Myelin self-hosting outbox
+//! ([`dogfood::run_audit_consumer_on_dogfood`] — every Myelin action, human AND agent, logged through
+//! the REAL outbox-only [`audit::AuditConsumer`]; the chain verifies, `audit_append_lag` reads green);
+//! (2) a self-served DSR over a Myelin team member's own data
+//! ([`dogfood::run_self_served_dsr_on_dogfood`] — `dsr_submit` → the WHOLE H1–H18 fan-out (GA-D1) over
+//! `member_cells ∪ home_cell` (GA-D8) → a certificate SEALED into the per-tenant audit Merkle tree via
+//! [`audit_proofs::AuditAuthority::seal_dsr_certificate`]); (3) the RoPA + data map living as a Myelin
+//! Knowledge space ([`dogfood::RopaKnowledgeSpace::for_myelin_team`] — the GENERATED data map +
+//! [`datamap::ropa`] projection rendered as the team's own space pages); (4) the
+//! every-incident-adds-a-drill loop ([`dogfood::GdprIncident`] — a PII-free issue draft + a
+//! reproducing-drill ticket); and (5) the truth-up pass ([`dogfood::TruthUpPass`] /
+//! [`dogfood::proven_gdpr_rows`] — every PROVEN §9.2 GDPR row (GA-D1..GA-D8 / GA-10 / GA-11 / E2E-3 /
+//! E2E-4) rests on a DATED green artifact; a claimed-not-proven row is a loud RED). It REUSES
+//! [`full_fanout`] + [`multi_cell`] + [`audit_proofs`] + [`datamap`] WHOLESALE (EI-01 §7 — no second
+//! fan-out, no second certificate path, no hand-written RoPA). **Floors named:** the FULL row-by-row
+//! truth-up enumeration across 10.1–10.9 (the closing honesty pass) → **P-GA-38 → P-512**
+//! ([`dogfood::TRUTH_UP_FULL_PASS_PROMPT`]); the live OLTP `audit_entry`/`dsr_request` tables + the
+//! real KMS signing key + a real RFC-3161 TSA witness + the live self-hosting JetStream subscription
+//! are the same DB/KMS/bus floor every M0/M1 store carries (P-007 / P-S12 — a config swap at boot, not
+//! a code change). **No new mutation floor** (the machinery's floors were set in P-GA-05..P-GA-36 — it
+//! runs for REAL here). **No `--features integration` leg owed:** the dogfood operation drives the
+//! already-shipped in-memory audit chain + fan-out + certificate over the platform's own PII-free
+//! carriers — touching NO new DB/object-store/cache/bus contract; the per-store live integration proofs
+//! are owned store-side, and the live self-hosting outbox subscription is the `serve(AppSpec)` boot
+//! follow-on (named).
+
 pub mod agent_trace_seam;
 pub mod audit;
 pub mod audit_proofs;
@@ -648,6 +677,7 @@ pub mod commit_prerequisite;
 pub mod datamap;
 pub mod derivative_erasure;
 pub mod diffgate;
+pub mod dogfood;
 pub mod dsr;
 pub mod dsr_timer;
 pub mod ediscovery;
@@ -703,6 +733,13 @@ pub use derivative_erasure::{
 pub use diffgate::{
     check_against_baseline, diff, CommittedBaseline, DataMapDiff, GateVerdict, Reclassification,
     COMMITTED_BASELINE_FINGERPRINT,
+};
+pub use dogfood::{
+    myelin_team_holder_schemas, proven_gdpr_rows, run_audit_consumer_on_dogfood,
+    run_self_served_dsr_on_dogfood, AuditDogfoodArtifact, DogfoodAction, DsrDogfoodArtifact,
+    GdprIncident, IncidentDrillTicket, IncidentIssueDraft, KnowledgeSpacePage, ProvenGdprRow,
+    RopaKnowledgeSpace, TruthUpPass, TruthUpRed, TruthUpVerdict, MYELIN_SELF_TENANT,
+    TRUTH_UP_FULL_PASS_PROMPT,
 };
 pub use dsr::{
     resolve_checklist_from_map, ChecklistItem, Dsr, DsrError, DsrId, DsrKind, DsrOrchestrator,

@@ -59,6 +59,14 @@ serde_json = { workspace = true }
 myelin-substrate = { path = "../myelin-substrate" }
 
 [dev-dependencies]
+# TEST-ONLY (P-GA-37 → P-511): the dogfood drill registers the every-incident repro into the harness
+# DrillRegistry (the T-3 `register_drill` hook) so it re-runs forever — the SAME posture every GDPR
+# drill + the storage dogfood drill (P-506) use. `myelin-harness` is the leaf test-support crate above
+# the substrate; this is a dev-dependency ONLY (nothing in the production DAG pulls it into the service
+# crate's runtime path). It supplies the DrillRegistry / DrillScenario / telemetry-assertion library
+# the dogfood integration drill drives the incident repro through. No cycle: the harness does not
+# depend on this leaf service crate.
+myelin-harness = { path = "../myelin-harness" }
 # TEST-ONLY (P-GA-28 → P-257): the GIT-D2 drill fires the P-GA-18 commit-identity architecture test
 # over Git's REAL commit codec (`myelin_git::commit::Commit` — pseudonymous-by-construction, GIT-P25).
 # This is a test-only edge: `myelin-git` depends on the `myelin-gdpr` CONTRACT crate (not this
