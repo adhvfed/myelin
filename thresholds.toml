@@ -209,6 +209,27 @@ clone_serve_p99_max_ms = 50  # GIT-D4: the object-backed packs' clone-serve p99 
                              # the read fan-out grows (the measured trigger for the object-backed swap).
 
 # ---------------------------------------------------------------------------------------------
+# [git_merge_queue] — the GIT-D5 concurrent-merge LINEARIZABILITY drill (P-482 / GIT-P33, with Git)
+# asserts against. Drill catalogue row GIT-D5: "concurrent merges + force-push to one protected
+# base_ref + DB-replica failover + node recovery mid-merge → LINEARIZABLE on the ref CAS; NO
+# split-brain; 0 LOST MERGE; update_seq monotonic + the fence honoured." (05-hard-problems.md HP-6
+# — the per-ref CAS is the linearisation point, update_seq is the fence, no bespoke per-repo
+# consensus group; HP-8 — the speculative/parallel merge queue, OQ-5.)
+#
+# The drill runs `concurrent_merge_attempts` PRs racing onto ONE protected base_ref through the
+# speculative queue, injects a force-push (base movement) + a DB-replica failover mid-merge, and
+# asserts: exactly the green-prefix landed as a strictly-monotonic update_seq CAS sequence (0 lost),
+# the force-pushed batch was invalidated (0 stale land), and update_seq is monotonic. The
+# `lost_merge_max` is the hard floor: a SINGLE lost merge fails the drill (a lost merge is the
+# failure mode the mutation-tested core defends). Keyed on HP-6/HP-8 + contract 5.9 (the merge-queue
+# ci.result wait). World-scale concurrent-merge under WORLD-SCALE surge is the M5 F6 family (GIT-D6,
+# GIT-P34).
+# ---------------------------------------------------------------------------------------------
+[git_merge_queue]
+concurrent_merge_attempts = 64  # GIT-D5: PRs racing onto one protected base_ref in the drill.
+lost_merge_max = 0              # the hard floor: 0 lost merge (a single lost merge fails the drill).
+
+# ---------------------------------------------------------------------------------------------
 # [depth_ceilings] — the causal-depth ceilings the agent-loop guard halts a loop at (SUB-D8).
 # Roadmap §2 item 5: "depth ceilings 12/16". The soft ceiling flags a deepening loop early; the
 # hard ceiling structurally halts it (reads EventEnvelope.depth). These ARE the seed constants in

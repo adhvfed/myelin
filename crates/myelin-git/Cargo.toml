@@ -158,6 +158,11 @@ myelin-identity-service = { path = "../myelin-identity-service" }
 # check_status projection; X-1 / EI-02 §3). A dev-only edge (the lint scanner is a test-time tool, not
 # a production-DAG node — architecture §2.9).
 myelin-lints = { path = "../myelin-lints" }
+# TEST-SUPPORT only: the GIT-D5 concurrent-merge linearizability drill
+# (`tests/drills_git_d5_concurrent_merge_linearizability.rs`, GIT-P33 / P-482) reads its
+# `concurrent_merge_attempts` + `lost_merge_max` bounds from the workspace-root `thresholds.toml`
+# (the versioned source of truth — EI-01 §3, never a magic number). No runtime edge.
+toml.workspace = true
 
 [features]
 # The DEV-REAL integration leg (GIT-P20 / P-281, M3) — the store-backed `check_status` projection
