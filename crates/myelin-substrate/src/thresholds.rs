@@ -196,6 +196,18 @@ pub struct Thresholds {
     /// `myelin_search::projection_feeder::ProjectionFeeder` seed constants.
     #[serde(default)]
     pub projection_feeder: ProjectionFeeder,
+    /// The per-cell durable-timer-wheel promotion seam MEASURED at cell scale (FLOW-D3 full; P-FLOW-26 /
+    /// P-475, M5; durable-workflow §7.3 the millions-of-timers scaling story + reconciliation OQ #5 the
+    /// per-cell timer-wheel-promotion threshold; contract 9.3 at cell scale / 1.8 `timer_wheel_lag`). The
+    /// per-cell sustained DUE-NOW rate (timers crossing `bucket <= now` and firing per second) above which
+    /// the PG-indexed minute-bucket wheel yields to a dedicated scheduling tier, plus the `timer_wheel_lag`
+    /// budget the wheel must hold within at that rate. The 1M+ FLOW-D3-full run measures the due-now rate
+    /// and proves the wheel drains its burst within the tick budget (lag → 0), so `promotion_owed` is
+    /// `false` — the dedicated tier is a named follow-on ONLY if a measured rate demands it (it does not
+    /// here). `#[serde(default)]` so an older thresholds file (pre-P-475) still parses against the §7.3
+    /// seed. Mirrors `myelin_flow::timer::TimerWheelPromotion` seed constants.
+    #[serde(default)]
+    pub timer_wheel_promotion: TimerWheelPromotion,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -430,6 +442,86 @@ impl ColumnStoreSeam {
     ) -> bool {
         measured_events_per_sec > self.promote_events_per_sec_per_stream
             && measured_publish_latency_p99_ms > self.degraded_publish_latency_p99_ms
+    }
+}
+
+/// The per-cell durable-timer-wheel promotion seam (FLOW-D3 full; P-FLOW-26 / P-475, M5; durable-workflow
+/// §7.3 the millions-of-timers scaling story + reconciliation OQ #5 the per-cell timer-wheel-promotion
+/// threshold; contract 9.3 the timer wheel at cell scale, 1.8 the `timer_wheel_lag` telemetry).
+///
+/// The minute-bucket PG-indexed wheel (P-FLOW-13) scales to MILLIONS of durable timers for free: a
+/// far-future timer sits in a far-future bucket and is NEVER read until its minute (the partial index
+/// `(bucket, partition) WHERE NOT fired`), so the per-cell cost is the DUE-NOW rate (timers crossing
+/// `bucket <= now` per minute), NOT the table size. P-FLOW-26 proves the algorithm at 1M+ outstanding
+/// timers (FLOW-D3 full) and MEASURES that due-now rate.
+///
+/// This struct records the **measurement gate** (OQ #5), not a build, mirroring [`ColumnStoreSeam`]: the
+/// per-cell sustained due-now rate (timers firing per second) above which the PG-indexed wheel is judged
+/// to need a DEDICATED scheduling tier (a hierarchical / hashed timing wheel in its own worker class),
+/// AND the `timer_wheel_lag` budget the wheel must hold within at that rate (volume alone never promotes —
+/// the wheel must be measurably FALLING BEHIND its tick budget at that volume, §7.3 / EI-04 §5.2). The
+/// SHAPE is frozen here (P-FLOW-26); the NUMBERS are the §7.3 promotion-criterion seeds.
+///
+/// `promotion_owed` records whether a measured per-cell due-now rate has been observed to cross BOTH
+/// criteria (rate AND lag-over-budget at that rate). It is `false` at this commit — the 1M+ FLOW-D3-full
+/// run fires its burst WITHIN the tick budget (`timer_wheel_lag` drains to 0), so the PG-indexed wheel
+/// suffices and **no dedicated scheduling tier is owed** (the honest state, EI-01 §3: the seam is a named
+/// follow-on ONLY if the measured rate demands it — here it does not, so the wheel stays the per-cell
+/// substrate). Mirrors `myelin_flow::timer::TimerWheelPromotion` seed constants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimerWheelPromotion {
+    /// The measured sustained per-cell DUE-NOW rate (durable timers crossing `bucket <= now` and firing
+    /// per SECOND) above which the PG-indexed minute-bucket wheel becomes a promotion CANDIDATE for a
+    /// dedicated scheduling tier. Below this, the bucketed partial-index wheel suffices (millions of
+    /// far-future timers are free; only the due-now set is scanned). MEASURED-not-predicted: the
+    /// criterion a real per-cell measurement is compared against, never a value the platform tunes toward.
+    pub promote_due_now_per_sec_per_cell: u64,
+    /// The `timer_wheel_lag` budget (due timers awaiting firing PAST their minute) above which the wheel
+    /// is judged DEGRADED at the candidate due-now rate — the SECOND half of the promotion trigger. A
+    /// candidate cell is promoted ONLY if, at its measured due-now rate, the wheel's measured lag crosses
+    /// this (rate alone is not enough — the wheel must be measurably falling behind, §7.3 / EI-04 §5.2).
+    pub degraded_wheel_lag_budget: u64,
+    /// Whether a measured per-cell due-now rate has been observed to cross BOTH criteria (rate AND
+    /// lag-over-budget) → a dedicated-scheduling-tier build is owed. `false` at this commit: the 1M+
+    /// FLOW-D3-full run fires within the tick budget (lag drains to 0), so the PG-indexed wheel suffices
+    /// and no follow-on prompt is owed until a measurement flips this.
+    pub promotion_owed: bool,
+}
+
+impl Default for TimerWheelPromotion {
+    /// The §7.3 promotion-criterion seeds. A per-cell wheel sustaining over 100 000 due-now timer fires
+    /// per second AND showing a `timer_wheel_lag` over 0 (any due timer left unfired past its minute) at
+    /// that rate is a promotion candidate (the dedicated scheduling tier is then owed). Neither number is
+    /// "beaten" — they are the thresholds a real per-cell measurement is compared against. `promotion_owed`
+    /// is `false`: the 1M+ FLOW-D3-full run drains its due burst within the tick budget (lag → 0), so the
+    /// PG-indexed wheel suffices and no dedicated tier is owed. An older thresholds file (pre-P-475) falls
+    /// back to this.
+    fn default() -> Self {
+        TimerWheelPromotion {
+            promote_due_now_per_sec_per_cell: 100_000,
+            degraded_wheel_lag_budget: 0,
+            promotion_owed: false,
+        }
+    }
+}
+
+impl TimerWheelPromotion {
+    /// **The per-cell promotion-gate decision (the measurement gate, not a build).** Given a cell's
+    /// MEASURED sustained due-now rate (timer fires/sec) and its MEASURED `timer_wheel_lag` (due timers
+    /// awaiting firing past their minute) at that rate, decide whether a dedicated scheduling tier is owed
+    /// for it. Promotion is owed **iff BOTH** criteria are crossed: the rate exceeds
+    /// [`Self::promote_due_now_per_sec_per_cell`] AND the lag exceeds [`Self::degraded_wheel_lag_budget`]
+    /// (rate alone never promotes — the wheel must be measurably FALLING BEHIND at that rate, §7.3 /
+    /// EI-04 §5.2). A cell below either stays on the PG-indexed wheel (named-not-built). This is the single
+    /// decision the seam exposes: it never builds the tier, it only reads a measurement and reports whether
+    /// a build is owed. (Identical in spirit to [`ColumnStoreSeam::promotion_owed_for`].)
+    pub fn promotion_owed_for(
+        &self,
+        measured_due_now_per_sec: u64,
+        measured_wheel_lag: u64,
+    ) -> bool {
+        measured_due_now_per_sec > self.promote_due_now_per_sec_per_cell
+            && measured_wheel_lag > self.degraded_wheel_lag_budget
     }
 }
 
@@ -1991,5 +2083,41 @@ mod tests {
         // Exactly at a criterion does NOT cross (strict `>` — the threshold is a floor to exceed).
         assert!(!seam.promotion_owed_for(50_000, 200));
         assert!(!seam.promotion_owed_for(80_000, 100));
+    }
+
+    /// **FLOW-D3 full / OQ #5 (P-475): the per-cell timer-wheel-promotion gate is RECORDED, not a build.**
+    /// The canonical file carries the OQ #5 promotion criteria, and at this commit the 1M+ FLOW-D3-full
+    /// run drains within the tick budget → `promotion_owed == false` (the PG-indexed wheel suffices at
+    /// cell scale; the dedicated scheduling tier is a NAMED follow-on iff a measured rate demands it).
+    #[test]
+    fn timer_wheel_promotion_is_named_not_built_at_this_commit() {
+        let t = Thresholds::load_canonical().expect("load");
+        assert!(
+            !t.timer_wheel_promotion.promotion_owed,
+            "FLOW-D3 full: the 1M+ run drains within budget → the PG-indexed wheel suffices (§7.3)"
+        );
+        assert!(
+            t.timer_wheel_promotion.promote_due_now_per_sec_per_cell > 0,
+            "OQ #5: the per-cell due-now-rate promotion criterion is recorded (compared against, not beaten)"
+        );
+    }
+
+    /// **FLOW-D3 full promotion gate is REAL, not vacuous (the OQ #5 measurement decision).** A cell
+    /// measured BELOW either criterion stays on the PG-indexed wheel; only a cell that crosses BOTH (a
+    /// due-now rate over the threshold AND a `timer_wheel_lag` over budget — the wheel measurably falling
+    /// behind) owes a dedicated scheduling tier (§7.3 / EI-04 §5.2 — rate alone never promotes).
+    #[test]
+    fn timer_wheel_promotion_owed_only_when_both_criteria_cross() {
+        let seam = TimerWheelPromotion::default(); // 100_000 due-now/s, lag budget 0.
+                                                   // Below the rate (whatever the lag) → the wheel suffices, no tier owed.
+        assert!(!seam.promotion_owed_for(10_000, 5_000));
+        // Above the rate but the wheel KEEPING UP (lag within budget 0) → no tier owed (it drains in budget).
+        assert!(!seam.promotion_owed_for(250_000, 0));
+        // Falling behind (lag over budget) but below the rate → not a candidate (volume too small).
+        assert!(!seam.promotion_owed_for(40_000, 5_000));
+        // BOTH crossed → a dedicated scheduling tier is owed (the wheel can't keep up at that rate).
+        assert!(seam.promotion_owed_for(250_000, 5_000));
+        // Exactly at the rate does NOT cross (strict `>` — the threshold is a floor to exceed).
+        assert!(!seam.promotion_owed_for(100_000, 5_000));
     }
 }

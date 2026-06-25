@@ -521,6 +521,25 @@ pub mod sla {
     }
 }
 
+/// **The per-cell timer-wheel-promotion seed constants (§7.3 / OQ #5 — the FLOW-D3-full measurement
+/// gate, P-FLOW-26).** The canonical, versioned numbers live in the thresholds file
+/// (`myelin_substrate::thresholds::TimerWheelPromotion`); these mirror its seeds so the flow crate that
+/// OWNS the wheel carries the same default-to-beat in code (the coherence anchor — one number, two
+/// readers). The per-cell promotion threshold is the sustained DUE-NOW rate (timers crossing
+/// `bucket <= now` and firing per second) above which the PG-indexed minute-bucket wheel yields to a
+/// dedicated scheduling tier; the wheel is "degraded" (the second half of the trigger) when the
+/// `timer_wheel_lag` exceeds its budget at that rate. The 1M+ FLOW-D3-full run measures the rate and
+/// proves the wheel drains within budget — so the dedicated tier is a NAMED follow-on, owed ONLY if a
+/// measured rate demands it (it does not at this commit).
+pub mod promotion {
+    /// The seed per-cell sustained due-now fire rate (timers/sec) above which the wheel is a promotion
+    /// CANDIDATE — mirrors `thresholds::TimerWheelPromotion::promote_due_now_per_sec_per_cell`.
+    pub const PROMOTE_DUE_NOW_PER_SEC_PER_CELL_SEED: u64 = 100_000;
+    /// The seed `timer_wheel_lag` budget above which the wheel is judged degraded at the candidate rate —
+    /// mirrors `thresholds::TimerWheelPromotion::degraded_wheel_lag_budget` (0: any past-minute timer).
+    pub const DEGRADED_WHEEL_LAG_BUDGET_SEED: u64 = 0;
+}
+
 /// The frozen `wf_history.kind` tokens the timer wheel writes (the §3.2 vocabulary the
 /// [`crate::migrations`] `CHECK` admits): `timer_set` when a `sleep` arms a timer, `timer_fired` when
 /// the wheel fires it.
@@ -603,6 +622,88 @@ impl TimerWheel {
     /// The telemetry handle the metrics-health port reads (the timer-wheel-lag signal).
     pub fn telemetry(&self) -> &FlowTelemetry {
         &self.telemetry
+    }
+}
+
+/// **The worker-shard partition for a run id — `partition = hash(run_id) % shards` (§7.2).** The
+/// SAME `partition = hash(run_id) % N` the engine's lease scan uses ([`crate::engine::RunRow::partition`]),
+/// so a timer is co-located with its run on ONE shard: the per-partition wheel scan
+/// ([`TimerStore::scan_due`] filters `partition = p`) means shard `p` reads ONLY its own timers, and no
+/// two shards ever scan the SAME timer (the structural half of "0 double-claim at cell scale", §7.3).
+/// Deterministic + stable (the FNV-1a hash) so a run's partition never drifts across restarts. `shards`
+/// must be ≥ 1 (a 0-shard fleet is a config error — floored to 1).
+pub fn partition_for(run_id: &str, shards: u16) -> i16 {
+    let n = shards.max(1) as u64;
+    // FNV-1a 64-bit — a stable, well-distributed hash (no std Hasher seed drift across processes).
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in run_id.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (h % n) as i16
+}
+
+/// **The per-cell worker-sharding wheel fleet — N per-partition [`TimerWheel`] workers over ONE shared
+/// store (§7.2/§7.3, the cell-scale FLOW-D3-full substrate).** The 1M+ cell-scale run shards the wheel
+/// by `partition = hash(run_id) % shards`: each [`TimerWheel`] owns ONE partition and scans ONLY its own
+/// timers (`scan_due` filters `partition = p`), so the seven-figure outstanding fleet is split across
+/// shards and **no two shards ever scan — let alone double-claim — the same timer** (the per-partition
+/// scan is the structural guard; the effectively-once [`TimerStore::fire`] is the belt-and-braces guard
+/// for the in-process double-claim model). The algorithm is UNCHANGED from P-FLOW-13 — this is the same
+/// bucketed wheel, sharded for the cell-scale worker fleet (the 1M+ proof is the SAME indexed range read
+/// as the 100k floor).
+pub struct WheelShardSet {
+    wheels: Vec<TimerWheel>,
+    timers: TimerStore,
+}
+
+impl WheelShardSet {
+    /// Build a `shards`-way wheel fleet over a shared `(timers, journal, runs, telemetry)` — one
+    /// [`TimerWheel`] per partition `0..shards`, each with the bounded per-tick fire `batch`. `shards`
+    /// must be ≥ 1 (floored to 1). Every shard shares the SAME store so a timer armed under
+    /// `partition_for(run_id, shards)` lands on exactly one shard's scan.
+    pub fn new(
+        timers: TimerStore,
+        journal: WfJournal,
+        runs: RunStore,
+        telemetry: FlowTelemetry,
+        shards: u16,
+        batch: usize,
+    ) -> Self {
+        let shards = shards.max(1);
+        let wheels = (0..shards)
+            .map(|p| {
+                TimerWheel::new(
+                    timers.clone(),
+                    journal.clone(),
+                    runs.clone(),
+                    telemetry.clone(),
+                    p as i16,
+                    batch,
+                )
+            })
+            .collect();
+        Self { wheels, timers }
+    }
+
+    /// The number of shards (worker partitions) in this fleet.
+    pub fn shards(&self) -> usize {
+        self.wheels.len()
+    }
+
+    /// **Tick EVERY shard once at `now_secs` — returns the total timers fired across all partitions.**
+    /// Each shard scans ONLY its own partition's due bucket (`scan_due` filters `partition = p`), so the
+    /// shards partition the work with no overlap: a timer is scanned by exactly the one shard
+    /// `partition_for(run_id, shards)` it was armed under. The per-shard fires sum to the total drained
+    /// this round; a burst spread across shards drains in parallel (each shard within its own batch).
+    pub fn tick_all(&self, now_secs: i64) -> usize {
+        self.wheels.iter().map(|w| w.tick(now_secs)).sum()
+    }
+
+    /// The shared timer store all shards scan (so a test/executor arms timers into it under
+    /// [`partition_for`]).
+    pub fn timers(&self) -> &TimerStore {
+        &self.timers
     }
 }
 
@@ -1279,6 +1380,131 @@ mod tests {
             ghost.re_arm(9_999),
             ReArmOutcome::Absent,
             "re-arm of an unarmed key is Absent (0 rows)"
+        );
+    }
+
+    /// **`partition_for` is deterministic, stable, and bounded to `0..shards` (§7.2).** The SAME run id
+    /// always hashes to the SAME partition (so a run's timers never drift across shards/restarts), every
+    /// partition is in range, and a 0-shard fleet floors to a single partition 0 (a config error, never a
+    /// panic / out-of-range partition).
+    #[test]
+    fn partition_for_is_deterministic_stable_and_in_range() {
+        assert_eq!(
+            partition_for("R-42", 8),
+            partition_for("R-42", 8),
+            "the same run → the same partition (stable)"
+        );
+        for i in 0..10_000 {
+            let p = partition_for(&format!("R-{i}"), 16);
+            assert!((0..16).contains(&p), "every partition is in 0..shards");
+        }
+        // a 0-shard fleet floors to one partition (no divide-by-zero, no out-of-range).
+        assert_eq!(partition_for("R-x", 0), 0, "0 shards floors to partition 0");
+    }
+
+    /// **The worker-sharding split does NOT double-claim a timer at scale (§7.2/§7.3 — the FLOW-D3-full
+    /// unit guard).** Arm a fleet of due timers, each under `partition_for(run_id, shards)`; run the
+    /// `WheelShardSet` (every shard scans ONLY its own partition). EVERY timer fires EXACTLY once across
+    /// the whole fleet (0 lost), and NO timer fires twice (0 double-claim) — the per-partition scan
+    /// partitions the work, and the effectively-once fire is the belt-and-braces guard.
+    #[test]
+    fn the_worker_sharding_split_does_not_double_claim_a_timer() {
+        let store = TimerStore::new();
+        let journal = WfJournal::new();
+        let runs = RunStore::new();
+        let tele = FlowTelemetry::new();
+        const SHARDS: u16 = 8;
+        const N: usize = 4_000;
+
+        for i in 0..N {
+            let run_id = format!("R-{i}");
+            let p = partition_for(&run_id, SHARDS);
+            let mut run = RunRow::new_runnable(tenant(), region(), run_id.clone(), "sla.run", p);
+            run.state = run_state::WAITING.into();
+            runs.put(run);
+            store.arm(timer(&format!("t/{i}"), &run_id, 0, p)); // all due now (bucket 0).
+        }
+        assert_eq!(store.armed_count(), N);
+
+        let fleet = WheelShardSet::new(
+            store.clone(),
+            journal.clone(),
+            runs.clone(),
+            tele.clone(),
+            SHARDS,
+            4_096,
+        );
+        assert_eq!(fleet.shards(), SHARDS as usize);
+
+        // tick every shard until the whole fleet drains (each shard scans only its own partition).
+        let mut total = 0usize;
+        let mut rounds = 0u32;
+        loop {
+            total += fleet.tick_all(30);
+            rounds += 1;
+            if store.unfired_count() == 0 {
+                break;
+            }
+            assert!(
+                rounds < 100,
+                "the fleet drains in a bounded number of rounds"
+            );
+        }
+        assert_eq!(
+            total, N,
+            "every timer fired EXACTLY once across the fleet (0 lost)"
+        );
+
+        // 0 double-claim: each run has EXACTLY one timer_fired row (no shard fired another's timer twice).
+        for i in 0..N {
+            let hist = journal.history_for(&tenant(), &format!("R-{i}"));
+            let fired = hist
+                .iter()
+                .filter(|r| r.kind == history_kind::TIMER_FIRED)
+                .count();
+            assert_eq!(fired, 1, "run R-{i} fired exactly once (0 double-claim)");
+        }
+    }
+
+    /// **The promotion-threshold measurement reads the due-now rate (OQ #5 — the FLOW-D3-full gate).** The
+    /// per-cell promotion decision is the SAME measurement-gate shape as the column-store seam: given a
+    /// MEASURED due-now rate and a MEASURED `timer_wheel_lag`, the gate says whether a dedicated scheduling
+    /// tier is owed. A wheel draining within budget (lag 0) at any rate is NOT owed a tier; a wheel falling
+    /// behind (lag over budget) AT a rate over the threshold IS. This mirrors
+    /// `thresholds::TimerWheelPromotion::promotion_owed_for`; the flow-side seeds match the thresholds file.
+    #[test]
+    fn the_promotion_threshold_measurement_reads_the_due_now_rate() {
+        use myelin_substrate::thresholds::TimerWheelPromotion;
+        let gate = TimerWheelPromotion::default();
+        // the flow crate's seed mirrors the thresholds file (one number, two readers — the coherence anchor).
+        assert_eq!(
+            gate.promote_due_now_per_sec_per_cell,
+            promotion::PROMOTE_DUE_NOW_PER_SEC_PER_CELL_SEED
+        );
+        assert_eq!(
+            gate.degraded_wheel_lag_budget,
+            promotion::DEGRADED_WHEEL_LAG_BUDGET_SEED
+        );
+
+        // the 1M+-run posture: a HIGH due-now rate but lag drained to 0 (within budget) → NOT owed a tier.
+        assert!(
+            !gate.promotion_owed_for(/*rate*/ 250_000, /*lag*/ 0),
+            "a wheel draining within budget is not owed a dedicated tier (rate alone never promotes)"
+        );
+        // a rate OVER the threshold AND a lag OVER budget (the wheel measurably falling behind) → owed.
+        assert!(
+            gate.promotion_owed_for(/*rate*/ 250_000, /*lag*/ 5_000),
+            "a wheel over rate AND falling behind is owed a dedicated scheduling tier"
+        );
+        // rate over but lag within budget → not owed (the second-half degraded criterion gates it).
+        assert!(
+            !gate.promotion_owed_for(150_000, 0),
+            "rate alone, with the wheel keeping up, never promotes"
+        );
+        // the committed posture: no production rate has crossed both → promotion not owed.
+        assert!(
+            !gate.promotion_owed,
+            "the committed seam stays NAMED — no dedicated tier owed (the wheel suffices at cell scale)"
         );
     }
 
