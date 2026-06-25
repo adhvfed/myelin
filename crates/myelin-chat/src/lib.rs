@@ -176,6 +176,7 @@ pub mod content;
 pub mod conversation;
 pub mod dek;
 pub mod dispatch;
+pub mod e2e_wedge;
 pub mod erase;
 pub mod events;
 pub mod fanout;
@@ -215,6 +216,7 @@ pub use dispatch::{
     no_auto_spawn_path_is_wired, reserve_gate, AgentProvenance, DispatchOutcome, Disposition,
     L3_AUTO_SPAWN_ABSENCE, PROVENANCE_AUDIT_LINK_KIND,
 };
+pub use e2e_wedge::{run_chat_e2e_wedge, ChatE2eArtifact};
 pub use erase::{
     aggregate_receipt, is_body_unrecoverable, ChatEraseReport, ChatErasureCascade, StoreReceipt,
     CHAT_ERASE_CASCADE_TOKEN,
