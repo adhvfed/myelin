@@ -54,12 +54,15 @@
 //!
 //! ## FLOORS named
 //!
-//! - **The concrete production EU email/push provider** (with its DPA / sub-processor posture) is
-//!   **N-M5.2 / NOTIF-P25** (a sovereignty/legal [OPEN — LEGAL] selection; the EU-sovereign
-//!   delivery-provider follow-on is also tracked as NOTIF-P26 in the run table). The trait +
-//!   EU-preferring posture + redaction discipline ship NOW; the real provider swaps into the SAME
-//!   [`DeliveryAdapter`](crate::DeliveryAdapter) trait via the strategy pattern (ADR-12.8 — the same
-//!   mock→real swap mandate the agent fabric uses). Named.
+//! - **The concrete production EU email/push provider** (with its DPA / sub-processor posture) — the
+//!   real [`DeliveryAdapter`](crate::DeliveryAdapter) SHIPPED in **NOTIF-P26**
+//!   ([`crate::eu_provider::EuSovereignAdapter`]): region-aware, EU-preferring (refuses non-EU egress),
+//!   at-least-once + idempotent on a stable `provider_ref`, RedactedMessage-only, with the
+//!   provider-side-erasure-request hook. It swaps into THIS trait via the strategy pattern (ADR-12.8 —
+//!   the same mock→real swap mandate the agent fabric uses). The residual [OPEN — LEGAL] is now ONLY
+//!   the NAMED vendor + the DPA selection ([`crate::eu_provider::OPEN_LEGAL_PROVIDER_DPA`], dated),
+//!   which counsel/DPO ratifies — the engineering posture ships. The deterministic [`MockAdapter`]
+//!   stays the dev/drill double.
 //! - **The durable `notif_delivery` Postgres store** is the [`DeliveryLedger`] seam's real backing
 //!   (the same in-memory-now / Postgres-later seam pattern as [`PrefStore`](crate::prefs::PrefStore)
 //!   and the escalation wheel). The DDL + the `UNIQUE(tenant_id, idem_key)` constraint already exist

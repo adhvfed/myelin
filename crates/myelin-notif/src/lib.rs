@@ -86,6 +86,13 @@ pub mod define_rule;
 // `delivery_success` telemetry signal. NOTIF-D9 (crash between provider-ack and ledger-write, retry →
 // EXACTLY ONE effective delivery per (item, channel)). FLOOR: the real EU provider is NOTIF-P25/P26.
 pub mod delivery;
+// The EU-sovereign delivery provider follow-on (NOTIF-P26 / P-468 — §3.6/§10 row 2, contract 7.8):
+// the REAL `DeliveryAdapter` (region-aware, EU-preferring — refuses non-EU egress; at-least-once +
+// idempotent on a stable `provider_ref`; RedactedMessage-only) the fabric swaps in over the frozen
+// trait (the mock→real swap, ADR-12.8), PLUS the provider-side-erasure-request hook (the named
+// sub-processor obligation NOTIF-P27 consumes). The concrete vendor + DPA is `[OPEN — LEGAL]`
+// (`OPEN_LEGAL_PROVIDER_DPA`, dated) — the engineering posture ships, counsel/DPO ratifies the vendor.
+pub mod eu_provider;
 // Escalation on the durable wheel (NOTIF-P14 / P-192 — §2.4/§3.7, contract 7.5): `page(target,
 // reason)` starts an escalation DURABLE WORKFLOW walking the FROZEN chain shape (page →
 // oncall_now → notify(class=critical, pierces quiet-hours) → escalate-after-timer(ack_window) →
@@ -188,6 +195,10 @@ pub use escalation::{
     notify_for, oncall_now, render_oncall, render_page, DurableWheel, EscalationEngine,
     EscalationError, EscalationPolicy, EscalationRun, EscalationStep, EscalationTarget,
     InMemoryWheel, OncallSchedule, PageOutcome, RotationWindow, RunState, ESCALATION_REASON,
+};
+pub use eu_provider::{
+    EuProviderError, EuSovereignAdapter, EuTransport, OpenLegalFlag, ProviderErasureOutcome,
+    RecordingEuTransport, TransportReceipt, OPEN_LEGAL_PROVIDER_DPA,
 };
 pub use holder::{
     notif_history_holder, notif_store_classifier, register_notif_holder, NotifBacking,
