@@ -223,6 +223,39 @@ fn a_red_gdpr_dogfood_drill_rejects_the_commit() {
 }
 
 #[test]
+fn the_graph_runs_the_refs_dogfood_band() {
+    // P-513 / REF-P28 → REF-M6: the reference graph runs over Myelin's OWN work — the PR context pane
+    // on the Myelin monorepo's PRs (commits ↔ issues ↔ CI ↔ KN ↔ chat), the spec-to-ship lineage on
+    // Myelin's roadmap/scorecard as Myelin issues + a Knowledge space, and the holder fan-out over a
+    // team member's own data (all green, 0 leak), plus the Refs truth-up pass (0 red earlier-band Refs
+    // gates) and the self-hosted every-incident-adds-a-drill loop. The dogfood loop carries Refs.
+    let jobs = self_hosting_jobs();
+
+    assert!(
+        jobs.iter()
+            .any(|j| j.id == "REF-P28-dogfood" && j.kind == JobKind::Drill),
+        "the self-hosting graph MUST run the Refs dogfood band (the reference graph on Myelin's own \
+         work + the Refs truth-up pass) as part of the self-hosting CI graph"
+    );
+}
+
+#[test]
+fn a_red_refs_dogfood_drill_rejects_the_commit() {
+    // The Refs dogfood drill is part of the gate: a leak in the PR pane on Myelin's own work / a
+    // spec-to-ship lineage that drops a node / an undated PROVEN Refs row reds the graph — the ratchet
+    // rejects on Myelin's own work (the moat thesis holds itself, EI-01 §5).
+    let jobs = self_hosting_jobs();
+    let run = run_graph(&jobs, &reds_one("REF-P28-dogfood"));
+    assert!(
+        !run.is_green(),
+        "a red Refs dogfood drill (a leak on Myelin's own work / a claimed-not-proven Refs row) MUST \
+         reject the commit — the reference graph on Myelin's own commits is part of the self-hosting \
+         CI gate"
+    );
+    assert_eq!(run.red_jobs(), vec!["REF-P28-dogfood"]);
+}
+
+#[test]
 fn a_clean_commit_reads_green() {
     let jobs = self_hosting_jobs();
     let run = run_graph(&jobs, &all_green);
