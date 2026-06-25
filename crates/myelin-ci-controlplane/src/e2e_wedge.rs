@@ -130,7 +130,7 @@ impl E2eArtifact {
     /// Build a sealed artifact from the earned verdict + the evidence summary. The seal is a pure
     /// function of the body, so the same verdict always yields the same address (a reproducible
     /// artifact the exit gate can cite by hash).
-    fn sealed(
+    pub(crate) fn sealed(
         scenario: &'static str,
         green: bool,
         leaks: u64,
