@@ -662,3 +662,253 @@ fn cold_segment_round_trips_body_verbatim() {
     assert_eq!(read[0].body_nodes, vec![1, 2, 3, 4, 5]);
     assert_eq!(read[0].author_kind, AuthorKind::Agent);
 }
+
+// ── the object-store BlobStore swap (contract 11.2; CHAT-P28 / P-502) ────────────────────────────
+
+/// Build a representative cold-segment batch of stored `Message` rows (already ULID-ordered) so the
+/// parity oracle seals a realistic segment (mixed author kinds + non-trivial body bytes).
+fn sample_cold_batch() -> Vec<Message> {
+    (0..8u128)
+        .map(|i| Message {
+            message_id: MessageId::from_u128(i),
+            conv: conv(),
+            thread_root_id: if i % 3 == 0 {
+                None
+            } else {
+                Some(MessageId::from_u128(0))
+            },
+            author: format!("subject-{i}"),
+            author_kind: match i % 3 {
+                0 => AuthorKind::Human,
+                1 => AuthorKind::Agent,
+                _ => AuthorKind::Service,
+            },
+            body_inline: format!("cold segment body {i} — the quick brown fox").into_bytes(),
+            body_nodes: vec![i as u8, 0xAB, 0xCD],
+            client_nonce: format!("nonce-{i}"),
+            edited_seq: (i % 2) as i32,
+            state: MessageState::Active,
+        })
+        .collect()
+}
+
+/// **The CI parity proof (fs↔fs) for the cold-segment object-store swap (contract 11.2 / CHAT-P28).**
+/// The `--features integration` test (`tests/integration_chat_p28_blob_swap.rs`) runs the SAME oracle
+/// fs↔S3 against the live dev-stack RustFS. Here both backings are the fs floor, so the proof is
+/// deterministic + DB-free: the content address + the decoded rows must be IDENTICAL — the swap is
+/// behaviour-preserving (a one-line backing change behind the `BlobStore` trait, not a code change).
+#[test]
+fn chat_cold_blob_store_swap_is_byte_identical_fs_to_fs() {
+    let fs_a = myelin_storage::FsBlobStore::new();
+    let fs_b = myelin_storage::FsBlobStore::new();
+    let tenant = TenantId("acme".into());
+    let batch = sample_cold_batch();
+
+    let verdict =
+        super::chat_cold_blob_store_parity(&fs_a, &fs_b, &tenant, &batch).expect("parity runs");
+    assert_eq!(
+        verdict.fs_address, verdict.object_address,
+        "BLAKE3-of-the-encoded-segment is backing-independent — the content address is identical"
+    );
+    assert!(
+        verdict.byte_identical,
+        "the cold-segment object-store swap is byte-identical to the fs floor (same address, same \
+         decoded rows back from both backings) — the swap is behaviour-preserving (11.2)"
+    );
+}
+
+/// **The cold tier is generic over the `BlobStore` backing — `with_blob_store` is the swap entry
+/// point (CHAT-P28 / P-502).** Sealing through a `ColdSegments` built over an EXPLICIT backing reads
+/// back IDENTICALLY to the default fs floor: the seal/read code is unchanged across the swap. (Both
+/// sides use an `FsBlobStore` here — the DB-free floor; the live object-store backing is the
+/// integration test. The point proven: `ColdSegments<B>` is backing-parametric, the prod object
+/// store drops in at construction time.)
+#[test]
+fn cold_segments_is_generic_over_the_blob_store_backing() {
+    // The default-backing cold tier (FsBlobStore) and an explicit-backing one (also FsBlobStore,
+    // standing in for S3BlobStore in prod) seal the SAME batch and read back the SAME rows.
+    let default_tier: ColdSegments = ColdSegments::new();
+    let explicit_tier: ColdSegments<myelin_storage::FsBlobStore> =
+        ColdSegments::with_blob_store(myelin_storage::FsBlobStore::new());
+
+    let batch = sample_cold_batch();
+    default_tier.seal(&conv(), batch.clone()).unwrap();
+    explicit_tier.seal(&conv(), batch.clone()).unwrap();
+
+    let from_default = default_tier.read(&conv()).unwrap();
+    let from_explicit = explicit_tier.read(&conv()).unwrap();
+    assert_eq!(
+        from_default, from_explicit,
+        "the cold tier reads identically regardless of the BlobStore backing — the swap is a \
+         construction-time backing change, not a code change"
+    );
+    assert_eq!(
+        from_default, batch,
+        "the cold read round-trips the rows verbatim"
+    );
+}
+
+/// A test-only [`BlobStore`] wrapper that injects ONE divergence so each `byte_identical` conjunct
+/// in [`super::chat_cold_blob_store_parity`] is proven LOAD-BEARING (a mutated `&&`→`||` is caught).
+/// `bad_address` returns a WRONG content address from `put` (flips `address_identical`);
+/// `bad_bytes` returns CORRUPT bytes from `get` (flips the round-trip conjunct).
+struct DivergentBlob {
+    inner: myelin_storage::FsBlobStore,
+    bad_address: bool,
+    bad_bytes: bool,
+    /// The last real address `put` stored under — so `get` can serve the bytes even when `put`
+    /// REPORTED a divergent address (the `bad_address` case isolates the address conjunct, not the
+    /// round-trip one).
+    last_real: std::sync::Mutex<Option<myelin_storage::ContentHash>>,
+}
+
+impl myelin_storage::BlobStore for DivergentBlob {
+    fn put(
+        &self,
+        tenant: &TenantId,
+        bytes: &[u8],
+    ) -> myelin_storage::blob::Result<myelin_storage::ContentHash> {
+        let real = self.inner.put(tenant, bytes)?;
+        *self.last_real.lock().unwrap() = Some(real.clone());
+        if self.bad_address {
+            // A deliberately WRONG address (not what these bytes hash to) — flips address_identical.
+            Ok(myelin_storage::ContentHash::blake3(
+                b"a different payload entirely",
+            ))
+        } else {
+            Ok(real)
+        }
+    }
+    fn get(
+        &self,
+        tenant: &TenantId,
+        hash: &myelin_storage::ContentHash,
+    ) -> myelin_storage::blob::Result<Vec<u8>> {
+        // Serve the REAL stored object (under the bad-address case the requested `hash` is the wrong
+        // one `put` reported, so look up the real address we recorded) — isolating each conjunct.
+        let lookup = if self.bad_address {
+            self.last_real
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(hash.clone())
+        } else {
+            hash.clone()
+        };
+        let real = self.inner.get(tenant, &lookup)?;
+        if self.bad_bytes {
+            // A VALID-but-DIFFERENT segment (decodes cleanly to a single, different row) so the
+            // round-trip conjunct (`object_rows == messages`) is what FAILS — not a decode error.
+            // (A truly corrupt read is refused loudly by decode; this isolates the parity conjunct.)
+            Ok(super::encode_segment(&[Message {
+                message_id: super::MessageId::from_u128(999),
+                conv: conv(),
+                thread_root_id: None,
+                author: "someone-else".into(),
+                author_kind: AuthorKind::Human,
+                body_inline: b"a different body".to_vec(),
+                body_nodes: Vec::new(),
+                client_nonce: "different".into(),
+                edited_seq: 0,
+                state: MessageState::Active,
+            }]))
+        } else {
+            Ok(real)
+        }
+    }
+    fn head(
+        &self,
+        tenant: &TenantId,
+        hash: &myelin_storage::ContentHash,
+    ) -> myelin_storage::blob::Result<myelin_storage::blob::BlobMeta> {
+        self.inner.head(tenant, hash)
+    }
+    fn delete(
+        &self,
+        tenant: &TenantId,
+        hash: &myelin_storage::ContentHash,
+    ) -> myelin_storage::blob::Result<()> {
+        self.inner.delete(tenant, hash)
+    }
+}
+
+/// **The parity verdict is NOT vacuously true — each conjunct is load-bearing (the mutation floor
+/// for `chat_cold_blob_store_parity`).** A backing that assigns a divergent ADDRESS makes the swap
+/// NOT byte-identical; a backing that returns CORRUPT bytes on read makes it NOT byte-identical.
+/// Both must yield `byte_identical == false` — so a mutated `&&`→`||` in the verdict is caught.
+#[test]
+fn cold_blob_parity_verdict_is_load_bearing_per_conjunct() {
+    let tenant = TenantId("acme".into());
+    let batch = sample_cold_batch();
+    let fs = myelin_storage::FsBlobStore::new();
+
+    // Honest backing → byte-identical.
+    let honest = DivergentBlob {
+        inner: myelin_storage::FsBlobStore::new(),
+        bad_address: false,
+        bad_bytes: false,
+        last_real: std::sync::Mutex::new(None),
+    };
+    assert!(
+        super::chat_cold_blob_store_parity(&fs, &honest, &tenant, &batch)
+            .unwrap()
+            .byte_identical,
+        "an honest backing is byte-identical"
+    );
+
+    // A divergent ADDRESS breaks the address_identical conjunct.
+    let bad_addr = DivergentBlob {
+        inner: myelin_storage::FsBlobStore::new(),
+        bad_address: true,
+        bad_bytes: false,
+        last_real: std::sync::Mutex::new(None),
+    };
+    assert!(
+        !super::chat_cold_blob_store_parity(&fs, &bad_addr, &tenant, &batch)
+            .unwrap()
+            .byte_identical,
+        "a divergent content address makes the swap NOT byte-identical (the conjunct is load-bearing)"
+    );
+
+    // CORRUPT read bytes break the object-roundtrip conjunct.
+    let bad_read = DivergentBlob {
+        inner: myelin_storage::FsBlobStore::new(),
+        bad_address: false,
+        bad_bytes: true,
+        last_real: std::sync::Mutex::new(None),
+    };
+    assert!(
+        !super::chat_cold_blob_store_parity(&fs, &bad_read, &tenant, &batch)
+            .unwrap()
+            .byte_identical,
+        "a corrupt read-back makes the swap NOT byte-identical (the conjunct is load-bearing)"
+    );
+}
+
+// ── the ScyllaDB hot-tier promotion is a NAMED FLOOR — the trigger has NOT fired (EI-04 §4) ──────
+
+/// **The ScyllaDB hot-tier promotion is honestly NAMED as a floor, not silently built (CHAT-P28 /
+/// P-502).** The promotion is triggered by measured per-cell write/partition volume crossing the
+/// hot-tier budget; no such signal has been measured (the surge family measured the gateway SHED
+/// budgets), so `SCYLLA_HOT_TIER_PROMOTED == false` and the v1 Postgres hot tier is retained. The
+/// trigger signal + landing prompt are recorded in code so the gap is VISIBLE, not implied.
+#[test]
+fn scylla_hot_tier_promotion_is_a_named_floor_with_its_trigger() {
+    // Read the published constant through a runtime binding (not a bare `assert!` on a const) so the
+    // check asserts the EXPORTED API value the rest of the platform reads, and equals the honest
+    // floor state: NOT promoted (the measured trigger has not fired — measure-before-shard, ADR-10).
+    let promoted = std::hint::black_box(super::SCYLLA_HOT_TIER_PROMOTED);
+    assert!(
+        !promoted,
+        "the Scylla hot-tier promotion is a NAMED FLOOR — its measured trigger has not fired; the \
+         v1 Postgres-partitioned hot tier is retained"
+    );
+    assert!(
+        super::SCYLLA_PROMOTION_TRIGGER.contains("write/partition volume"),
+        "the named floor records its MEASURED trigger signal (R-C6/R-5)"
+    );
+    assert!(
+        super::SCYLLA_PROMOTION_LANDING.contains("P-502"),
+        "the named floor points at its landing prompt (the gap is traceable)"
+    );
+}

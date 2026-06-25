@@ -191,6 +191,7 @@ pub mod rebac_fragment;
 pub mod replay;
 pub mod restriction;
 pub mod schema;
+pub mod scylla_followon;
 pub mod search;
 pub mod store;
 pub mod subs;
@@ -262,6 +263,10 @@ pub use restriction::{
     render_body_mentions, render_mention, MentionRender, MentionResolver, ReadPath,
     RestrictionGate, ERASED_USER, LEGAL_RESIDUAL_FLOOR,
 };
+pub use scylla_followon::{
+    scylla_floor_gap_report, FloorFollowOn, TriggerStatus, MEASURED_TRIGGER_FLOORS,
+    SCYLLA_HOT_TIER_FLOOR,
+};
 pub use search::{
     admit_message_indexing, may_index_messages, message_doc_ref, message_index_spec,
     message_index_specs, message_search_acl_anchor, message_search_projection, non_member_filter,
@@ -271,9 +276,11 @@ pub use search::{
     MESSAGE_ACL_OBJECT_TYPE, MESSAGE_READ_PERMISSION, MESSAGE_TYPE,
 };
 pub use store::{
-    emit_erased_tombstone, AuthorKind, ColdSegments, ConversationId, MemHotTier, Message,
-    MessageId, MessageState, MessageStore, MonotonicUlidSource, NewMessage, OutboxTx, RangeCursor,
-    StoreError, SystemUlidSource, TombstoneReason, UlidSource,
+    chat_cold_blob_store_parity, emit_erased_tombstone, AuthorKind, ColdBlobParityVerdict,
+    ColdSegments, ConversationId, MemHotTier, Message, MessageId, MessageState, MessageStore,
+    MonotonicUlidSource, NewMessage, OutboxTx, RangeCursor, StoreError, SystemUlidSource,
+    TombstoneReason, UlidSource, SCYLLA_HOT_TIER_PROMOTED, SCYLLA_PROMOTION_LANDING,
+    SCYLLA_PROMOTION_TRIGGER,
 };
 pub use unfurl::{
     filter_candidates_by_class, precompute_visibility_class, AuthzVisibleIndex, Card,
