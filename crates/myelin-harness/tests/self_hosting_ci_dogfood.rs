@@ -191,6 +191,38 @@ fn a_red_ci_dogfood_drill_rejects_the_commit() {
 }
 
 #[test]
+fn the_graph_runs_the_gdpr_dogfood_band() {
+    // P-511 / P-GA-37 → GA-M6: the GDPR/Audit machinery runs on Myelin's OWN commits — the audit
+    // consumer is live on the platform's own actions, a self-served DSR over a Myelin team member's
+    // own data fans out + seals a certificate, the RoPA/data-map lives as a Myelin Knowledge space,
+    // and the GDPR truth-up pass confirms 0 red earlier-band GDPR gates. The dogfood loop carries GDPR.
+    let jobs = self_hosting_jobs();
+
+    assert!(
+        jobs.iter()
+            .any(|j| j.id == "GA-P511-dogfood" && j.kind == JobKind::Drill),
+        "the self-hosting graph MUST run the GDPR dogfood band (the audit consumer on Myelin's own \
+         commits + a self-served DSR + the truth-up pass) as part of the self-hosting CI graph"
+    );
+}
+
+#[test]
+fn a_red_gdpr_dogfood_drill_rejects_the_commit() {
+    // The GDPR dogfood drill is part of the gate: a broken audit chain on Myelin's own actions / a
+    // self-served DSR that misses a holder / an undated PROVEN GDPR row reds the graph — the ratchet
+    // rejects on Myelin's own work (the GDPR-by-construction guarantee holds itself, EI-01 §5).
+    let jobs = self_hosting_jobs();
+    let run = run_graph(&jobs, &reds_one("GA-P511-dogfood"));
+    assert!(
+        !run.is_green(),
+        "a red GDPR dogfood drill (a broken own-commit audit chain / a missed DSR holder / a \
+         claimed-not-proven GDPR row) MUST reject the commit — the GDPR machinery on Myelin's own \
+         commits is part of the self-hosting CI gate"
+    );
+    assert_eq!(run.red_jobs(), vec!["GA-P511-dogfood"]);
+}
+
+#[test]
 fn a_clean_commit_reads_green() {
     let jobs = self_hosting_jobs();
     let run = run_graph(&jobs, &all_green);

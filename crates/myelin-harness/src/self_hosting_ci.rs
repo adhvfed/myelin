@@ -336,6 +336,28 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "ci_p35_dogfood_switch_test_drill",
             ],
         },
+        // (7) the GDPR/Audit dogfood band (P-511 / P-GA-37 → GA-M6): the GDPR/Audit machinery runs on
+        //     Myelin's OWN commits — the audit consumer is live on the platform's own actions (the
+        //     audit graph is green on Myelin's own commits), a self-served DSR over a Myelin team
+        //     member's own data fans out (GA-D1 + GA-D8) + seals a certificate, the RoPA/data-map lives
+        //     as a Myelin Knowledge space, the every-incident-adds-a-drill loop is self-hosted, and the
+        //     truth-up pass confirms 0 red earlier-band GDPR gates. WIRES the existing GDPR machinery
+        //     (EI-01 §7 — never re-implemented here).
+        SelfHostJob {
+            id: "GA-P511-dogfood",
+            title: "the GDPR/Audit machinery on Myelin's own commits — the audit consumer live on the \
+                    self-hosting outbox + a self-served DSR fans out + seals a certificate + the \
+                    RoPA/data-map Knowledge space + the GDPR truth-up pass (0 red earlier GDPR gate)",
+            kind: JobKind::Drill,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-gdpr-service",
+                "--test",
+                "ga_p511_dogfood_self_served_dsr_drill",
+            ],
+        },
     ]
 }
 
