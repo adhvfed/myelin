@@ -116,6 +116,7 @@ pub mod chat_projection;
 pub mod ci_log_projection;
 pub mod compiler;
 pub mod consistency;
+pub mod cross_cell;
 pub mod dek;
 pub mod engine;
 pub mod erase;
