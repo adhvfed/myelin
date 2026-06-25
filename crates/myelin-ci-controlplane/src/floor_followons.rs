@@ -20,21 +20,28 @@
 //!
 //! In the global ledger, **P-490 (CI-P30) runs AFTER this prompt (P-489 / CI-P29)** — the
 //! architecture index itself places CI-P29 "after CI-P30's measurements", but the run-table orders
-//! P-489 before P-490. At THIS prompt's execution (2026-06-25) CI-P30 has **not run**, so:
-//! - **no per-`fair_key` starvation histogram has been measured under the 30× surge** (the
-//!   scheduler today exposes the queue-depth signal, [`crate::scheduler`] 1.8, but the
-//!   surge-driven wait-time histogram + its threshold are CI-P30's measurement);
-//! - **no firehose log-volume measurement vs the OLTP index has been taken** (the log pipeline
-//!   today seals into the object-segment T3 tier + the `(job, step, byte-range)` OLTP index,
-//!   [`crate::log_pipeline`] 11.8; the volume-vs-DB measurement is CI-P30's).
+//! P-489 before P-490. **UPDATE (2026-06-25): CI-P30 (P-490) HAS NOW RUN.** It drove the 30× CI-D2
+//! surge ([`crate::surge`]) and MEASURED the per-`fair_key` wait-time/starvation histogram
+//! ([`crate::surge::StarvationHistogram`]) against the tuned threshold
+//! ([`myelin_substrate::thresholds::CiSurge::starvation_wait_p99_max_ticks`], contract 1.8 / open
+//! question 07#1). The result: **the measured wait p99 stayed WITHIN the threshold** — flat DRR
+//! fairly interleaves the surging tenant, **no starvation fired**
+//! (`ci_surge.hierarchical_scheduler_promotion_owed = false`). So the **hierarchical-scheduler
+//! trigger did NOT fire** and that promotion **remains a named floor** (measured-not-predicted: the
+//! measurement was TAKEN and came back UNDER the trigger). The **time-series-log-tier** trigger is a
+//! SEPARATE measurement (firehose log-volume vs the OLTP index) that CI-P30 did **not** take — the
+//! log pipeline today seals into the object-segment T3 tier + the `(job, step, byte-range)` OLTP
+//! index ([`crate::log_pipeline`] 11.8); that volume-vs-DB measurement is still owed, so its trigger
+//! stays `NotFired` for the original reason.
 //!
-//! Therefore BOTH triggers are **`NotFired` (red-until-proven)** and BOTH promotions **remain named
-//! floors**. Building either now would be exactly the "add it before the volume is measured"
-//! anti-pattern EI-04 §5 forbids and the "floor that masquerades as done" VISION §3 forbids. This
-//! module records that honestly; it does NOT build the promotions. When CI-P30 fires a trigger, the
-//! follow-on agent flips that row's [`TriggerStatus`] to `Fired` (with the dated measured evidence)
-//! and ships the promotion behind the SAME contract (11.8 for the log tier; the DRR claim path the
-//! hierarchical scheduler refines) — a config/algorithm swap behind a frozen seam, NOT a rewrite.
+//! Therefore BOTH triggers are **`NotFired` (the scheduler one MEASURED-and-under-threshold, the log
+//! one not-yet-measured)** and BOTH promotions **remain named floors**. Building either now would be
+//! exactly the "add it before the volume is measured" anti-pattern EI-04 §5 forbids and the "floor
+//! that masquerades as done" VISION §3 forbids. This module records that honestly; it does NOT build
+//! the promotions. When a trigger DOES fire, the follow-on agent flips that row's [`TriggerStatus`]
+//! to `Fired` (with the dated measured evidence) and ships the promotion behind the SAME contract
+//! (11.8 for the log tier; the DRR claim path the hierarchical scheduler refines) — a config/
+//! algorithm swap behind a frozen seam, NOT a rewrite.
 //!
 //! ## What is already BUILT (the seams the promotions swap behind — no rewrite)
 //! - **Log tier (11.8):** the firehose → sealed T2 content-addressed segment → `log_segment` +
@@ -194,9 +201,12 @@ pub const MEASURED_TRIGGER_FLOORS: &[FloorFollowOn] = &[
         trigger: "CI-P30 (P-490) MEASURES a per-fair_key starvation signal under the 30x surge — \
                   the wait-time histogram crossing its tuned threshold (open question 07#1)",
         status: TriggerStatus::NotFired {
-            as_of: "2026-06-25: CI-P30 (P-490) has not run — no per-fair_key starvation histogram \
-                    has been measured under the 30x surge; flat DRR holds no-starvation today. \
-                    Floor remains named.",
+            as_of: "2026-06-25: CI-P30 (P-490) HAS RUN — the 30x CI-D2 surge MEASURED the \
+                    per-fair_key wait-time histogram (surge::StarvationHistogram); the wait p99 \
+                    stayed WITHIN the tuned starvation trigger (ci_surge.starvation_wait_p99_max_ticks \
+                    = 32 ticks), so flat DRR fairly interleaves the surging tenant — NO starvation \
+                    fired. ci_surge.hierarchical_scheduler_promotion_owed = false. Floor remains \
+                    named (measured-not-predicted: the trigger did NOT fire).",
         },
         follow_on: "refine the flat DRR claim predicate into a per-tenant -> per-project -> \
                     per-pipeline hierarchical DRR behind the unchanged claim seam, only on the \

@@ -208,6 +208,16 @@ pub struct Thresholds {
     /// seed. Mirrors `myelin_flow::timer::TimerWheelPromotion` seed constants.
     #[serde(default)]
     pub timer_wheel_promotion: TimerWheelPromotion,
+    /// The MEASURED CI-surge controls — the tuned DRR / shed-budget / pre-warm numbers + the per-`fair_key`
+    /// starvation-histogram trigger (CI-P30 / P-490, M5; CI-D2, the F6 surge family;
+    /// continuous-integration §2.2/§2.4/§5.4, contract 1.11/1.8). The tuned per-tenant cap + DRR quantum/
+    /// ceiling MEASURED sufficient under the 30× CI surge, the pre-warm buffer SIZED to the measured
+    /// arrival rate (replacing CI-P4's fixed floor), and the per-`fair_key` starvation p99 trigger the
+    /// hierarchical-scheduler promotion (CI-P29) is gated on (un-crossed → it stays a named floor).
+    /// `#[serde(default)]` so an older thresholds file (pre-P-490) still parses against the seeds. Mirrors
+    /// `myelin_ci_controlplane::surge::CiSurgeControls` seed constants.
+    #[serde(default)]
+    pub ci_surge: CiSurge,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -522,6 +532,150 @@ impl TimerWheelPromotion {
     ) -> bool {
         measured_due_now_per_sec > self.promote_due_now_per_sec_per_cell
             && measured_wheel_lag > self.degraded_wheel_lag_budget
+    }
+}
+
+/// **The MEASURED CI-surge controls — the tuned DRR / shed-budget / pre-warm numbers + the per-`fair_key`
+/// starvation-histogram trigger (CI-P30 / P-490, M5; CI-D2, the F6 surge family).**
+///
+/// CI-P30 drives the 30× CI surge (CI-D2) on one tenant and MEASURES the surge controls the CI Control
+/// Plane already carries: the DRR fair-share (`myelin_ci_controlplane::fairness`), the per-tenant
+/// in-flight cap (the bounded run-queue), the per-`fair_key` wait-time/starvation histogram (contract
+/// 1.8), and the autoscaler pre-warm buffer (`myelin_ci_controlplane::fleet`). This row records the
+/// MEASURED, tuned numbers — the SHAPE was frozen by the M4 prompts (CI-P12/P-13/P-4); the NUMBERS are
+/// the default-to-beat the 30× CI-D2 surge drill measured.
+///
+/// Two of these numbers are **measurement-gate triggers** (the same posture as [`ColumnStoreSeam`] /
+/// [`TimerWheelPromotion`]), NOT values to "beat":
+/// - `starvation_wait_p99_max_ticks` — the per-`fair_key` wait-time-histogram p99 (in scheduler claim
+///   ticks: how long a contending tenant's job waits before it is claimed) above which flat DRR is
+///   judged to be STARVING a tenant, so the **hierarchical scheduler** promotion (CI-P29, the
+///   `myelin_ci_controlplane::floor_followons` `hierarchical-scheduler` floor) is OWED. The 30× CI-D2
+///   surge measures the real p99; if it stays at/under this, flat DRR holds no-starvation and the
+///   hierarchical scheduler stays a NAMED FLOOR (measured-not-predicted, EI-04 §5 / open question 07#1).
+/// - `hierarchical_scheduler_promotion_owed` — whether the measured starvation p99 crossed the trigger
+///   (so the promotion is owed). `false` at this commit: the 30× CI-D2 surge measured the per-`fair_key`
+///   wait p99 WITHIN the budget (flat DRR fairly interleaves the surging tenant — no starvation), so the
+///   hierarchical scheduler stays a named floor (the honest state, EI-01 §3).
+///
+/// The pre-warm numbers SIZE the autoscaler's warm buffer (CI-P4's fixed-buffer floor → CI-P30's measured
+/// function): `prewarm_buffer_per_arrival_rate_bps` is the fraction (basis points) of the recent arrival
+/// rate kept warm ahead of demand, and `prewarm_max_buffer` is the absolute ceiling on the warm buffer
+/// (bin-packing under the per-VM memory floor — the buffer never grows past the residency-zone's
+/// provisioned headroom, architecture §5.4). `#[serde(default)]` on the parent field + [`Default`] here
+/// so an older thresholds file (pre-P-490) still parses against the §2.2/§2.4/§5.4 seeds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiSurge {
+    /// The tuned per-tenant CI in-flight cap (the bounded run-queue, architecture §2.4 / OQ-K) MEASURED
+    /// sufficient under the 30× CI-D2 surge — MUST equal the `CiDispatch` shed-budget cap (one number,
+    /// not two: the scheduler-internal cap and the public-surface shed budget agree). The CI-D2 drill
+    /// asserts this equals `shed_budgets.CiDispatch.per_tenant_in_flight_cap`.
+    pub per_tenant_in_flight_cap: u32,
+    /// The tuned DRR base quantum (architecture §2.2): the deficit decrement on one claim + the unit the
+    /// plan-weighted replenish multiplies. Mirrors `myelin_ci_controlplane::fairness::BASE_QUANTUM`.
+    pub drr_base_quantum: i64,
+    /// The tuned DRR deficit ceiling (the burst-credit cap, architecture §2.2): a long-idle `fair_key`'s
+    /// deficit never exceeds this, so it cannot accumulate unbounded priority then monopolise the queue.
+    /// Mirrors `myelin_ci_controlplane::fairness::DEFICIT_CEILING`.
+    pub drr_deficit_ceiling: i64,
+    /// **The per-`fair_key` starvation-histogram p99 TRIGGER (contract 1.8 / open question 07#1).** The
+    /// wait-time p99 (in scheduler claim ticks — how many claims a contending tenant's job waits before
+    /// it is served) above which flat DRR is MEASURED to be starving a tenant, so the hierarchical
+    /// scheduler (CI-P29) is owed. STRICTLY greater-than (a p99 AT the budget is within budget). The 30×
+    /// CI-D2 surge measures the real p99 against this; MEASURED-not-predicted (never a value to tune
+    /// toward).
+    pub starvation_wait_p99_max_ticks: u64,
+    /// Whether the measured starvation p99 crossed [`Self::starvation_wait_p99_max_ticks`] under the 30×
+    /// CI-D2 surge → the hierarchical-scheduler promotion (CI-P29) is owed. `false` at this commit: the
+    /// surge measured the wait p99 WITHIN budget (flat DRR holds no-starvation), so the hierarchical
+    /// scheduler stays a NAMED FLOOR (the honest red-until-proven state, EI-01 §3 / EI-04 §5).
+    pub hierarchical_scheduler_promotion_owed: bool,
+    /// **The pre-warm buffer sizing fraction (architecture §5.4).** The fraction (basis points,
+    /// `0..=10000`) of the recent per-`(region, label-class)` arrival rate kept WARM ahead of demand
+    /// (the pre-warmed snapshot pool — "time to first log line" is warm-pool-fast). Replaces CI-P4's
+    /// fixed warm-buffer floor with a measured arrival-rate-proportional size.
+    pub prewarm_buffer_per_arrival_rate_bps: u32,
+    /// **The pre-warm buffer absolute ceiling (architecture §5.4).** The warm buffer never exceeds this
+    /// many VMs per pool, regardless of arrival rate — bin-packing under the per-VM memory floor (the
+    /// fleet never pre-warms past the residency-zone's provisioned headroom).
+    pub prewarm_max_buffer: u32,
+}
+
+impl CiSurge {
+    /// The tuned per-tenant CI in-flight cap seed: **64** — MEASURED sufficient under the 30× CI-D2 surge
+    /// and EQUAL to the `CiDispatch` shed-budget cap (`shed::ShedBudgetTable::v1_floor`). One number, not
+    /// two.
+    pub const PER_TENANT_IN_FLIGHT_CAP_SEED: u32 = 64;
+    /// The DRR base quantum seed: **1** (mirrors `fairness::BASE_QUANTUM`).
+    pub const DRR_BASE_QUANTUM_SEED: i64 = 1;
+    /// The DRR deficit ceiling seed: **64** (mirrors `fairness::DEFICIT_CEILING`).
+    pub const DRR_DEFICIT_CEILING_SEED: i64 = 64;
+    /// **The starvation-histogram p99 trigger seed: 32 claim ticks.** Under the 30× CI-D2 surge a
+    /// contending tenant's job, with flat DRR fairly interleaving the surging tenant, is claimed well
+    /// within this many claims; a measured wait p99 over 32 ticks would be the starvation signal that
+    /// owes the hierarchical scheduler. Generous-but-real: a contending tenant waiting more than 32
+    /// claims under a fair scheduler IS the starvation the hierarchy exists to fix.
+    pub const STARVATION_WAIT_P99_MAX_TICKS_SEED: u64 = 32;
+    /// The pre-warm buffer sizing fraction seed: **1000 bps = 10%** of the recent arrival rate kept warm.
+    pub const PREWARM_BUFFER_PER_ARRIVAL_RATE_BPS_SEED: u32 = 1000;
+    /// The pre-warm buffer absolute ceiling seed: **16** VMs per pool (bin-packing under the per-VM
+    /// memory floor — the buffer never pre-warms past the zone's provisioned headroom).
+    pub const PREWARM_MAX_BUFFER_SEED: u32 = 16;
+
+    /// **The hierarchical-scheduler promotion-gate decision (the measurement gate, not a build).** Given
+    /// the MEASURED per-`fair_key` wait-time p99 (claim ticks) under the 30× CI-D2 surge, decide whether
+    /// the hierarchical scheduler (CI-P29) is owed: owed **iff** the measured p99 STRICTLY exceeds
+    /// [`Self::starvation_wait_p99_max_ticks`] (flat DRR is measurably starving a tenant). A p99 at/under
+    /// the budget means flat DRR holds no-starvation → the hierarchical scheduler stays a named floor
+    /// (measured-not-predicted, open question 07#1). This is the single decision the seam exposes: it
+    /// never builds the hierarchy, it only reads a measurement and reports whether a build is owed.
+    /// (Identical in spirit to [`ColumnStoreSeam::promotion_owed_for`].)
+    pub fn hierarchical_promotion_owed_for(&self, measured_wait_p99_ticks: u64) -> bool {
+        measured_wait_p99_ticks > self.starvation_wait_p99_max_ticks
+    }
+
+    /// **The MEASURED pre-warm buffer size for a pool (architecture §5.4 — the sizing FUNCTION).** Given
+    /// the recent per-`(region, label-class)` arrival rate (VMs/window), the warm buffer is
+    /// `arrival_rate * prewarm_buffer_per_arrival_rate_bps / 10000`, clamped at
+    /// [`Self::prewarm_max_buffer`] (bin-packing under the per-VM memory floor). Proportional to demand
+    /// (a busy pool keeps more warm) but bounded (never past the zone's provisioned headroom). Replaces
+    /// CI-P4's fixed warm-buffer floor with this measured function. Total + deterministic (no clock/RNG).
+    pub fn prewarm_buffer_for(&self, arrival_rate: u32) -> u32 {
+        let want =
+            ((arrival_rate as u64) * (self.prewarm_buffer_per_arrival_rate_bps as u64)) / 10_000;
+        (want as u32).min(self.prewarm_max_buffer)
+    }
+
+    /// Whether the CI-surge numbers are well-formed: a positive cap, a positive DRR quantum strictly
+    /// under the ceiling, a positive starvation trigger, and a pre-warm fraction in `(0, 100%]`. A
+    /// mis-specified row (a 0 cap, a quantum ≥ ceiling, a 0 starvation trigger — "any wait starves") is
+    /// rejected so a green can never be manufactured by a vacuous bar (EI-01 §3).
+    pub fn is_well_formed(&self) -> bool {
+        self.per_tenant_in_flight_cap > 0
+            && self.drr_base_quantum > 0
+            && self.drr_base_quantum < self.drr_deficit_ceiling
+            && self.starvation_wait_p99_max_ticks > 0
+            && self.prewarm_buffer_per_arrival_rate_bps > 0
+            && self.prewarm_buffer_per_arrival_rate_bps <= 10_000
+    }
+}
+
+impl Default for CiSurge {
+    /// The §2.2/§2.4/§5.4 seed default-to-beat: a 64 per-tenant cap, a DRR base quantum of 1 with a
+    /// 64 deficit ceiling, a 32-tick starvation trigger (un-crossed → the hierarchical scheduler stays a
+    /// named floor), a 10%-of-arrival-rate pre-warm buffer capped at 16 VMs. CI-P30 (P-490) measures
+    /// these under the 30× CI-D2 surge and dates them. An older thresholds file (pre-P-490) falls back
+    /// here. `hierarchical_scheduler_promotion_owed` is `false` (the surge did not measure starvation).
+    fn default() -> Self {
+        CiSurge {
+            per_tenant_in_flight_cap: Self::PER_TENANT_IN_FLIGHT_CAP_SEED,
+            drr_base_quantum: Self::DRR_BASE_QUANTUM_SEED,
+            drr_deficit_ceiling: Self::DRR_DEFICIT_CEILING_SEED,
+            starvation_wait_p99_max_ticks: Self::STARVATION_WAIT_P99_MAX_TICKS_SEED,
+            hierarchical_scheduler_promotion_owed: false,
+            prewarm_buffer_per_arrival_rate_bps: Self::PREWARM_BUFFER_PER_ARRIVAL_RATE_BPS_SEED,
+            prewarm_max_buffer: Self::PREWARM_MAX_BUFFER_SEED,
+        }
     }
 }
 
@@ -2122,5 +2276,76 @@ mod tests {
         assert!(seam.promotion_owed_for(250_000, 5_000));
         // Exactly at the rate does NOT cross (strict `>` — the threshold is a floor to exceed).
         assert!(!seam.promotion_owed_for(100_000, 5_000));
+    }
+
+    /// **CI-D2 (P-490): the CI-surge controls are recorded in the canonical file + well-formed.** The
+    /// tuned per-tenant cap EQUALS the `CiDispatch` shed-budget cap (one number, not two), and at this
+    /// commit the 30× CI-D2 surge measured the per-`fair_key` wait p99 WITHIN budget →
+    /// `hierarchical_scheduler_promotion_owed == false` (flat DRR holds no-starvation; the hierarchical
+    /// scheduler stays a NAMED FLOOR — CI-P29, measured-not-predicted).
+    #[test]
+    fn ci_surge_controls_are_recorded_and_well_formed() {
+        let t = Thresholds::load_canonical().expect("load");
+        assert!(
+            t.ci_surge.is_well_formed(),
+            "the CI-surge numbers are well-formed (no vacuous bar)"
+        );
+        let ci_cap = t
+            .shed_budget(crate::shed::Surface::CiDispatch)
+            .expect("CiDispatch shed budget present")
+            .per_tenant_in_flight_cap;
+        assert_eq!(
+            t.ci_surge.per_tenant_in_flight_cap, ci_cap,
+            "the tuned CI in-flight cap MUST equal the CiDispatch shed-budget cap (one v1 floor)"
+        );
+        assert!(
+            !t.ci_surge.hierarchical_scheduler_promotion_owed,
+            "CI-D2: the 30× surge measured the wait p99 within budget → flat DRR holds; the \
+             hierarchical scheduler stays a named floor (CI-P29)"
+        );
+    }
+
+    /// **The CI-D2 starvation gate is REAL, not vacuous (open question 07#1).** A measured per-`fair_key`
+    /// wait p99 AT/UNDER the trigger keeps flat DRR (no hierarchical scheduler owed); only a p99 strictly
+    /// OVER the trigger (a tenant measurably starving) owes the hierarchical-scheduler promotion (CI-P29).
+    #[test]
+    fn ci_surge_hierarchical_promotion_owed_only_when_starvation_trigger_crossed() {
+        let ci = CiSurge::default(); // starvation trigger 32 ticks.
+        assert!(
+            !ci.hierarchical_promotion_owed_for(5),
+            "a short wait is fairly served — no promotion"
+        );
+        assert!(
+            !ci.hierarchical_promotion_owed_for(32),
+            "exactly at the trigger does NOT cross (strict `>` — within budget)"
+        );
+        assert!(
+            ci.hierarchical_promotion_owed_for(33),
+            "a wait p99 over the trigger is the starvation signal → the hierarchy is owed (CI-P29)"
+        );
+    }
+
+    /// **The pre-warm sizing FUNCTION is proportional-but-bounded (architecture §5.4).** The warm buffer
+    /// tracks the arrival rate (10% of it) but is clamped at the absolute ceiling (bin-packing under the
+    /// per-VM memory floor — never past the zone's provisioned headroom). Replaces CI-P4's fixed floor.
+    #[test]
+    fn ci_surge_prewarm_buffer_is_proportional_then_clamped() {
+        let ci = CiSurge::default(); // 10% of arrival rate, capped at 16.
+        assert_eq!(
+            ci.prewarm_buffer_for(0),
+            0,
+            "an idle pool pre-warms nothing"
+        );
+        assert_eq!(
+            ci.prewarm_buffer_for(50),
+            5,
+            "10% of 50 arrivals = 5 warm VMs"
+        );
+        assert_eq!(ci.prewarm_buffer_for(100), 10, "10% of 100 = 10 warm VMs");
+        assert_eq!(
+            ci.prewarm_buffer_for(100_000),
+            16,
+            "the warm buffer is CLAMPED at the per-VM-memory ceiling (never unbounded)"
+        );
     }
 }
