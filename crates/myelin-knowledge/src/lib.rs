@@ -104,6 +104,7 @@ pub mod rollup;
 pub mod search_feed;
 pub mod store;
 pub mod subs;
+pub mod surge;
 pub mod sync_block;
 pub mod transport;
 pub mod yrs_engine;
@@ -209,6 +210,10 @@ pub use search_feed::{
     KN_READ_PERMISSION, KN_SEARCH_OBJECT_TYPE,
 };
 pub use store::{knowledge_scope, knowledge_store_migrations, KnowledgeStore, KnowledgeTable};
+pub use surge::{
+    run_collab_surge, run_lexorank_storm, CollabShedReason, CollabShedRejection, CollabSurgeGate,
+    CollabSurgeReport, LexoStormReport, COLLAB_SURGE_MULTIPLIER, FLEET_HARDWARE_FLOOR,
+};
 pub use sync_block::{
     render_sync_block, AllowAll, DenyAll, ProjectionFreshness, SourceReadCheck,
     SyncBlockProjection, SyncBlockRender, SyncSource, Tombstone, TombstoneReason, Viewer,
