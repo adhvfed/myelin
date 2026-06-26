@@ -42,7 +42,10 @@ never reinvent it.
 ### The anti-duplication discipline (binding on every Phase-2 prompt)
 Step 1 of every prompt: grep `planning/07-prompts/` + the crates for an existing implementation of the thing about
 to be built, and **extend/reconcile it — never fork it.** The ledger is the authoritative surface map; read the
-relevant rows before writing a line.
+relevant rows before writing a line. **And cross-check the ledger's *claim* against the actual commit/files** —
+`git log --grep="^P-NNN " ` + `git show --stat` — because a prompt may have "shipped" X as a Rust model/harness,
+not as the runnable thing (exactly what happened with the UI surfaces). The claim tells you what to *reuse*; the
+files tell you what's actually *built*; the gap is what to build.
 
 ---
 
