@@ -261,6 +261,20 @@ pub struct Thresholds {
     /// the seeds. Mirrors `myelin_git::switch_test`'s budgets.
     #[serde(default)]
     pub git_switch_test: GitSwitchTestThreshold,
+    /// The Knowledge **switch-test** budgets (KN-P34 / P-519, M6; the Knowledge switch test;
+    /// knowledge-platform §3 KN-M6 the dogfood + switch-test done-bar — measured contrast + latency +
+    /// `render(parse(md)) === md` against the real anchor (the design sketches / the design-manual
+    /// `02-components/block-editor.md` §2 one-render-path law); VISION §3 the switch test driven in a
+    /// browser). The microsecond render-latency ceiling the driven Knowledge editor surface (a
+    /// representative page render — the view the switch test drives, knowledge arch 04) must stay WITHIN,
+    /// plus the contrast floor (WCAG 1.4.3 normal-text 4.5:1 — the design-manual §2 measured anchor) the
+    /// rendered reference-chip / tombstone overlays must MEET, for a Notion user to move to Myelin
+    /// Knowledge without hitting a wall the old tool didn't have. MEASURED by the switch test (driven
+    /// against the real surface, EI-01 §4), never hardcoded in the test and never weakened to pass.
+    /// `#[serde(default)]` so an older thresholds file (pre-P-519) still parses against the seeds.
+    /// Mirrors `myelin_knowledge::switch_test`'s budgets.
+    #[serde(default)]
+    pub knowledge_switch_test: KnowledgeSwitchTestThreshold,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -970,6 +984,67 @@ impl Default for GitSwitchTestThreshold {
     fn default() -> Self {
         GitSwitchTestThreshold {
             pr_overview_render_budget_us: Self::PR_OVERVIEW_RENDER_BUDGET_US_SEED,
+            overlay_contrast_floor_bp: Self::OVERLAY_CONTRAST_FLOOR_BP_SEED,
+        }
+    }
+}
+
+/// The Knowledge **switch-test** budgets (KN-P34 / P-519, M6). The render-latency ceiling the driven
+/// Knowledge editor surface (a representative page render — the editor view the switch test drives,
+/// knowledge arch 04 §2) must stay WITHIN, plus the contrast floor (in basis points of a contrast ratio
+/// — `× 100`, so 450 == the WCAG 1.4.3 normal-text 4.5:1 minimum, the design-manual §2 measured anchor)
+/// the rendered reference-chip / tombstone overlays must MEET, for a Notion user to move to Myelin
+/// Knowledge without hitting a wall the old tool didn't have. MEASURED by the switch test (driven against
+/// the real surface, EI-01 §4), never hardcoded in the test and never weakened to pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeSwitchTestThreshold {
+    /// **The page render latency budget, in MICROSECONDS** (`_us`; the §2.10 units anchor). The
+    /// representative Knowledge page render (the editor view the switch test drives — the ONE render path,
+    /// design-manual block-editor §2) must complete within this p-latency; a render slower than the Notion
+    /// page anchor's interactive grade is a UX wall (the §1.1 keyboard < ~100ms reading bar).
+    #[serde(default = "KnowledgeSwitchTestThreshold::default_page_render_budget_us")]
+    pub page_render_budget_us: u64,
+    /// **The reference-chip / tombstone overlay contrast floor, in BASIS POINTS of a contrast ratio**
+    /// (`× 100`; 450 == 4.5:1). Every rendered reference-chip / tombstone-chip text/background pair must
+    /// MEET this WCAG 1.4.3 normal-text floor (the design-manual §2 measured-contrast anchor); an overlay
+    /// below it is an accessibility wall the switch test reds. Basis points (an integer) so the threshold
+    /// is exact + serde-stable (no float).
+    #[serde(default = "KnowledgeSwitchTestThreshold::default_overlay_contrast_floor_bp")]
+    pub overlay_contrast_floor_bp: u32,
+}
+
+impl KnowledgeSwitchTestThreshold {
+    /// The seed page render budget: **50 000 µs (= 50 ms)** — an interactive Knowledge-page render grade
+    /// (a Notion page is interactive at this grade). KN-P34 measures the real render against this; the
+    /// number is dated here, never a value to tune toward (measured-not-predicted, EI-01 §3).
+    pub const PAGE_RENDER_BUDGET_US_SEED: u64 = 50_000;
+    /// The seed overlay contrast floor: **450 bp (= 4.5:1)** — the WCAG 1.4.3 normal-text minimum (the
+    /// design-manual §2 PROVEN floor). Every reference-chip / tombstone overlay must meet or beat it.
+    pub const OVERLAY_CONTRAST_FLOOR_BP_SEED: u32 = 450;
+
+    /// The seed page render budget (`_us`). Used when an older thresholds file omits the row.
+    pub fn default_page_render_budget_us() -> u64 {
+        Self::PAGE_RENDER_BUDGET_US_SEED
+    }
+
+    /// The seed overlay contrast floor (`_bp`). Used when an older thresholds file omits the row.
+    pub fn default_overlay_contrast_floor_bp() -> u32 {
+        Self::OVERLAY_CONTRAST_FLOOR_BP_SEED
+    }
+
+    /// Whether the switch-test budgets are well-formed: a positive render budget AND a contrast floor that
+    /// actually demands the WCAG minimum (≥ 450 bp). A 0 render budget ("any render is a wall") or a sub-AA
+    /// contrast floor would manufacture a green by a vacuous bar — rejected (EI-01 §3).
+    pub fn is_well_formed(&self) -> bool {
+        self.page_render_budget_us > 0 && self.overlay_contrast_floor_bp >= 450
+    }
+}
+
+impl Default for KnowledgeSwitchTestThreshold {
+    /// The seed budgets (KN-P34 dates the measured surfaces against them).
+    fn default() -> Self {
+        KnowledgeSwitchTestThreshold {
+            page_render_budget_us: Self::PAGE_RENDER_BUDGET_US_SEED,
             overlay_contrast_floor_bp: Self::OVERLAY_CONTRAST_FLOOR_BP_SEED,
         }
     }
