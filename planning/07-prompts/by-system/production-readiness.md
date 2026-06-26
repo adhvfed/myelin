@@ -27,6 +27,19 @@
 > AFTER M6 (the dogfood loop is the cheapest load generator and must be green first) and BEFORE any real
 > customer tenant data is admitted.
 >
+> **M7 system-review overlay.** The review pack under
+> [`../../system-reviews/2026-06-26/`](../../system-reviews/2026-06-26/) is part of the M7 planning surface:
+> [`00-m7-hardening-strategy.md`](../../system-reviews/2026-06-26/00-m7-hardening-strategy.md) fixes the
+> sequencing and proof posture, [`01-m7-vetting-gate-matrix.md`](../../system-reviews/2026-06-26/01-m7-vetting-gate-matrix.md)
+> maps each prompt to the gate that must fail on the old floor, and
+> [`02-blackbox-security-persistence-drills.md`](../../system-reviews/2026-06-26/02-blackbox-security-persistence-drills.md)
+> defines the adversarial security/persistence drills P-540/P-541/P-546 must read as release evidence, and
+> [`03-whole-system-end-to-end-vetting.md`](../../system-reviews/2026-06-26/03-whole-system-end-to-end-vetting.md)
+> composes the M0..M7 evidence into one end-to-end release-confidence model, and
+> [`04-m7-agent-handoff-chunks.md`](../../system-reviews/2026-06-26/04-m7-agent-handoff-chunks.md) gives the
+> resumed ledger agent a per-prompt sub-agent chunking map. These docs do not add new features; they make the M7
+> proof obligations concrete and executable.
+>
 > **The two doctrines that bind M7 hardest:** (1) EI-01 §3 prove-it-or-it-isn't-real — a model/mock/dogfood
 > NEVER proves a production mechanism, so every M7 mechanism prompt has a SEPARATE verification prompt, and the
 > final gate refuses to read a mechanism's own self-claim. (2) EI-01 §1 name-your-floors / code-wins-over-docs —
@@ -64,6 +77,13 @@ largely independent of the runtime work and can run in parallel after P-522 → 
 (P-540/541) reads everything → the external human-blocker reviews (P-542/543) are recorded → the real sandbox
 production exec path (P-544 impl) → the production-path sandbox exec + escape drill on both backends (P-545
 verify) → the final fail-closed release gate (P-546) is last and reads them all.
+
+**Vetting requirements from the system review.** Every M7 prompt must preserve the existing M0..M6 ratchets and
+add only evidence that would fail on the old floor. Static scanners require red fixtures. Live-stack tests must
+hard-fail when their required dependency is absent (`MYELIN_REQUIRE_DB`, `MYELIN_REQUIRE_KVM`, runsc/Firecracker,
+SoftHSM/HSM-class adapter). Blackbox drills are required for persistence, auth/token, tenant isolation, secret
+handling, sandbox exec, supply chain, scorecard tamper, and release-gate one-condition-red cases. A model, mock,
+dogfood run, source grep, or harness-only path is useful context but never sufficient production proof.
 
 **The floor→filling-prompt cross-reference (this band closes these named floors):**
 
@@ -531,6 +551,13 @@ verify) → the final fail-closed release gate (P-546) is last and reads them al
   - [`../../VISION.md`](../../VISION.md) §3/§4/§8 (the done-bar; one agent, proven gates).
   - [`../../external-insights/01-process-and-quality-doctrine.md`](../../external-insights/01-process-and-quality-doctrine.md) §1 (name-your-floors; nothing silently swallowed), §2 (order-by-non-negotiability), §3 (PROVEN not CLAIMED; never weaken to pass), §5 (the committed ratchet).
   - [`../../06-roadmaps/00-master-sequencing.md`](../../06-roadmaps/00-master-sequencing.md) §2 (the M7 band invariant + this gate); the M7 truth-up + external-review + pentest scorecards.
+  - [`../../system-reviews/2026-06-26/00-m7-hardening-strategy.md`](../../system-reviews/2026-06-26/00-m7-hardening-strategy.md),
+    [`../../system-reviews/2026-06-26/01-m7-vetting-gate-matrix.md`](../../system-reviews/2026-06-26/01-m7-vetting-gate-matrix.md),
+    [`../../system-reviews/2026-06-26/02-blackbox-security-persistence-drills.md`](../../system-reviews/2026-06-26/02-blackbox-security-persistence-drills.md),
+    [`../../system-reviews/2026-06-26/03-whole-system-end-to-end-vetting.md`](../../system-reviews/2026-06-26/03-whole-system-end-to-end-vetting.md),
+    and [`../../system-reviews/2026-06-26/04-m7-agent-handoff-chunks.md`](../../system-reviews/2026-06-26/04-m7-agent-handoff-chunks.md)
+    (the M7 review overlay: static gates, blackbox drills, whole-cell E2E campaign, evidence-integrity checks,
+    external-review records, and sub-agent handoff chunks).
 - **DELIVERABLE.** A single committed, FAIL-CLOSED production-release gate (a CI job + a `release-gate` binary + a `testing/scorecards/m7-release-gate.md` scorecard) that goes green if and ONLY IF every condition below holds — it defaults to RED and each condition must flip it, never the reverse:
   1. **No structural/mock impl in the production dependency graph** — the absence scanners (P-523 in-memory stores, P-528 structural verifiers/signers/attestation) are green; 0 `Structural*`/in-memory-durable constructors in any production path; the mock agent runtime is `--use-mock`-gated only.
   2. **Durable persistence proven** — P-522/P-523 green (crash/restart + multi-instance, real OLTP/cache).
@@ -546,9 +573,9 @@ verify) → the final fail-closed release gate (P-546) is last and reads them al
   12. **Gates mechanically enforced** — P-540 green (required jobs fail-not-skip; mandatory mutation; immutable attestations); P-541 truth-up has 0 red rows.
   13. **Independent reviews + pentest** — P-542/P-543: the independent crypto + sandbox reviews and the third-party pentest are COMPLETED with 0 critical/high findings open, OR each open item is explicitly recorded as an external human blocker with a named owner + rationale + sign-off (the gate names them; it does not silently pass over a critical/high).
 
-  The gate's verdict is computed mechanically from the named scorecards (it reads dated green artifacts, never a self-claim). Any single condition RED ⇒ the gate is RED ⇒ no production release. A threshold is never weakened to flip it; a red condition is a dated honest row + an escalation. **Floor named:** the gate explicitly enumerates any remaining external/human blocker (HSM physical keying ceremony, sub-processor DPA, counsel/DPO erasure-residual ratification, staffed security owners) as a NAMED release prerequisite — the gate cannot be green while any critical one is unrecorded.
+  The gate's verdict is computed mechanically from the named scorecards (it reads dated green artifacts, never a self-claim). It must also read the M7 system-review scorecard set proposed in `01-m7-vetting-gate-matrix.md`: durable persistence, KMS, auth, backup/restore, tenant isolation, secret handling, supply chain, runtime, gate integrity, production-readiness truth-up, external reviews, pentest, sandbox exec, and release-gate. Any single condition RED ⇒ the gate is RED ⇒ no production release. A threshold is never weakened to flip it; a red condition is a dated honest row + an escalation. **Floor named:** the gate explicitly enumerates any remaining external/human blocker (HSM physical keying ceremony, sub-processor DPA, counsel/DPO erasure-residual ratification, staffed security owners) as a NAMED release prerequisite — the gate cannot be green while any critical one is unrecorded.
 - **CONTRACTS TO IMPLEMENT.** The release-gate meta-contract (reads the contract-1.8 signals + the scorecards); implements no new system contract.
-- **GATE / DRILLS (quantified).** The release-gate binary returns non-zero (RED) unless all 13 conditions are green; it is proven to bite by a fixture that makes any one condition red (e.g. reintroduce a `StructuralVerifier` use, hardcode `oneshot=true`/`init=/bin/true` on a real-job sandbox launch, add an open critical pentest finding, leave an advisory open) → the gate goes RED. 0 conditions may be silently skipped. Dated green artifact = the only thing that authorizes a production release.
+- **GATE / DRILLS (quantified).** The release-gate binary returns non-zero (RED) unless all 13 conditions are green; it is proven to bite by a fixture that makes any one condition red (e.g. reintroduce a `StructuralVerifier` use, hardcode `oneshot=true`/`init=/bin/true` on a real-job sandbox launch, add an open critical pentest finding, leave an advisory open) → the gate goes RED. It must include the `02-blackbox-security-persistence-drills.md` one-condition-red fixtures for persistence loss, forged credential/token admission, pooled-tenant bleed, secret sentinel leakage, sandbox harness routing, scorecard tamper, and missing external review. 0 conditions may be silently skipped. Dated green artifact = the only thing that authorizes a production release.
 - **TESTS (required).** The release-gate self-test: a green full-stack fixture ⇒ zero exit; one-condition-red fixtures (one per condition, including a sandbox-launch reverted to `oneshot=true`/`init=/bin/true`) ⇒ non-zero exit (the gate bites on each). Mutation floor: the gate's AND-of-all-conditions logic is mandatory-core (a mutation that ORs, or that ignores a condition, MUST be caught — the gate must not be weakenable).
 - **DEFINITION OF DONE.** The fail-closed release-gate binary + CI job + scorecard exist; the gate is RED by default and green only when all 13 conditions emit dated green artifacts; it is proven to bite on each condition; every external/human blocker is enumerated by name; PROVEN, not claimed; committed. This is the last M7 prompt — the platform is production-releasable only when this gate is green.
 - **COMMIT.** Header `P-546 M7: the fail-closed production-release gate`. Body: the 13 conditions + their scorecard sources; the bite self-test per condition; the enumerated external/human blockers; the AND-logic mutation score. Co-Authored-By trailer.
@@ -577,4 +604,4 @@ verify) → the final fail-closed release gate (P-546) is last and reads them al
 **External/human-blocker-recording prompts:** P-542, P-543.
 **The final fail-closed release gate:** P-546.
 
-**Honesty.** No M7 prompt accepts a model, mock, or dogfood run as proof of a production mechanism: each mechanism's proof is a separate verification prompt running under `--features integration` with `MYELIN_REQUIRE_KVM`/`MYELIN_REQUIRE_DB` so a backend-free run HARD-FAILS. A drill on a special harness is NOT proof of a production exec path — the sandbox impl (P-544) and its production-path escape verification (P-545) are separate prompts. Every external/human prerequisite (real-HSM keying ceremony, independent crypto audit, independent sandbox audit, third-party pentest, sub-processor DPA, counsel/DPO erasure-residual ratification, staffed security owners) is NAMED and RECORDED, never silently swallowed, and is a hard blocker on the P-546 release gate.
+**Honesty.** No M7 prompt accepts a model, mock, or dogfood run as proof of a production mechanism: each mechanism's proof is a separate verification prompt running under `--features integration` with `MYELIN_REQUIRE_KVM`/`MYELIN_REQUIRE_DB` so a backend-free run HARD-FAILS. A drill on a special harness is NOT proof of a production exec path — the sandbox impl (P-544) and its production-path escape verification (P-545) are separate prompts. The system-review pack under `planning/system-reviews/2026-06-26/` is the concrete vetting overlay: static gates need red fixtures, blackbox drills must attack the release boundary, and P-546 must prove red-on-each-condition. Every external/human prerequisite (real-HSM keying ceremony, independent crypto audit, independent sandbox audit, third-party pentest, sub-processor DPA, counsel/DPO erasure-residual ratification, staffed security owners) is NAMED and RECORDED, never silently swallowed, and is a hard blocker on the P-546 release gate.
