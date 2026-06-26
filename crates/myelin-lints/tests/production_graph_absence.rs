@@ -65,7 +65,13 @@
 //! - `myelin-identity-service/src/pseudonym_erase.rs:268` — `PseudonymErasureLedger` in-mem via the
 //!     `type LedgerByPartition = BTreeMap<…>` ALIAS (alias false-negative closed; census 10.8; MR-007/009)
 //! - `myelin-events/src/outbox.rs:230`                    — `OutboxStore` in-mem (SI-007; events durable MR, P-522/523)
-//! - `myelin-events/src/dedup.rs:87`                      — `DedupLedger` in-mem (SI-023; events durable MR)
+//! - `myelin-events/src/dedup.rs:141`                     — `DedupLedger` (SI-023). MR-023 ADDED the
+//!   durable `DurableDedup` PG seam (`DedupLedger::durable`, backing
+//!   `myelin_storage::events_durable::DurableDedupBacking`, proven live:
+//!   `integration_mr023_events_serve`) but the `Memory(Arc<Mutex<HashSet>>)` backend variant is
+//!   still the always-compiled default — so the enum-following scanner STILL fires (supplemented,
+//!   not removed). Removed when production wires `durable` as the non-optional default (MR-009 /
+//!   route MRs), the same status as MR-007/008's principal/tuple/revocation entries.
 //! - `myelin-events/src/reerase.rs:102`                   — `BusErasureLedger` in-mem (SI-039; GDPR/events durable MR)
 //! - `myelin-control-plane/src/registry.rs:111`          — `Registry` placement in-mem (SI-011; cp durable MR)
 //! - `myelin-control-plane/src/cross_cell_bridge.rs:244` — `CellResolverRegistry` in-mem (SI-052; cp/multi-cell MR)
@@ -285,7 +291,7 @@ const BASELINE: &[(&str, &str, usize)] = &[
     (
         "no-in-memory-durable-store",
         "crates/myelin-events/src/dedup.rs",
-        87,
+        141,
     ),
     (
         "no-in-memory-durable-store",

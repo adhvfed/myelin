@@ -75,49 +75,141 @@ CREATE TABLE IF NOT EXISTS consumer_dedup (
     CONSTRAINT consumer_dedup_pk PRIMARY KEY (consumer, event_id)
 );";
 
-/// The per-consumer `consumer_dedup` ledger (contract 2.5, the in-memory model). `(consumer,
-/// event_id)` is the PK: [`DedupLedger::mark_handled`] records the pair and returns whether it was
-/// FRESH (newly inserted) or a DUPLICATE (already present — the idempotency no-op). A cloneable
-/// handle over shared state so a reconnected `Consumer` re-bound by the same name re-uses the SAME
-/// ledger (consumer-template rule 4) and the redelivery is absorbed.
+/// **The durable backing seam for the `consumer_dedup` ledger (SI-023, MR-023).** A real
+/// `(consumer, event_id)` PK table over the OLTP pool implements this so consumer idempotency
+/// **survives a process restart**: a redelivered event after a restart is still deduped because the
+/// mark lives in Postgres, not a per-process `HashSet`. The verbs mirror the in-memory ledger's
+/// (the `INSERT … ON CONFLICT DO NOTHING` primitive + the read/revert/forget verbs). The trait is
+/// SYNC to match the consumer runtime's sync `mark_handled` call site; a PG impl bridges to async
+/// internally (`block_in_place` + `block_on`), the same bridge [`crate::nats::NatsJetStreamBus`]
+/// uses (the production impl is `myelin_storage::events_durable::DurableDedupBacking`).
+///
+/// **The atomicity FLOOR (named, not silently skipped — MR-023b):** the in-the-SAME-transaction-
+/// as-the-handler's-state-write co-commit (so a rolled-back handler rolls back its dedup mark for
+/// free) requires the consumer runtime to thread a transaction INTO the handler — a runtime change
+/// beyond this seam. THIS seam delivers **durability-across-restart** (the mark persists); the
+/// same-tx atomicity stays the documented floor [`crate::consumer`] already names. Fail-direction:
+/// when a durable [`DurableDedup::mark_handled`] cannot reach the DB it MUST report FRESH (run the
+/// handler), never a silent "already handled" (which would be a skipped → lost event) — effectively-
+/// once degrades to at-least-once under a DB outage, never to data loss.
+pub trait DurableDedup: Send + Sync {
+    /// `INSERT (consumer, event_id) ON CONFLICT DO NOTHING` → `true` iff freshly inserted.
+    fn mark_handled(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool;
+    /// Read-only presence check.
+    fn is_handled(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool;
+    /// Remove the pair (a `Retry` reverts its speculative mark so a redelivery re-runs).
+    fn revert(&self, consumer: &ConsumerName, event_id: &crate::EventId);
+    /// Forget the pair (the reindex-after-wipe path); `true` iff a mark was removed.
+    fn forget(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool;
+}
+
+/// The dedup-ledger backend (MR-023, the MR-007/008 backend-enum pattern). `Memory` is the
+/// always-compiled in-memory **TEST-DOUBLE** (the model the unit suite + the in-process SUB-D1/D2
+/// drills run against); `Durable` is the production PG-backed seam the events `serve()` composition
+/// root (`myelin_storage::events_serve`) wires. `Memory` stays the default so the DB-free default
+/// build is unchanged; the `no-in-memory-durable-store` scanner FOLLOWS this enum and still fires
+/// on the `Memory` variant (still the default) — the baseline entry is supplemented, not removed,
+/// until production wires `Durable` as the non-optional default (the MR-007/008 status).
+#[derive(Clone)]
+enum DedupBackend {
+    /// The in-memory model / test-double: `(consumer, event_id)` set behind a shared lock.
+    Memory(Arc<Mutex<HashSet<(ConsumerName, crate::EventId)>>>),
+    /// The durable PG-backed seam (production): a `(consumer, event_id)` table that survives restart.
+    Durable(Arc<dyn DurableDedup>),
+}
+
+impl Default for DedupBackend {
+    fn default() -> Self {
+        DedupBackend::Memory(Arc::new(Mutex::new(HashSet::new())))
+    }
+}
+
+/// The per-consumer `consumer_dedup` ledger (contract 2.5). `(consumer, event_id)` is the PK:
+/// [`DedupLedger::mark_handled`] records the pair and returns whether it was FRESH (newly inserted)
+/// or a DUPLICATE (already present — the idempotency no-op). A cloneable handle so a reconnected
+/// `Consumer` re-bound by the same name re-uses the SAME ledger (consumer-template rule 4) and the
+/// redelivery is absorbed.
+///
+/// **Backend (MR-023):** [`DedupLedger::new`] is the in-memory test-double; [`DedupLedger::durable`]
+/// binds a PG-backed [`DurableDedup`] so idempotency survives a process restart (SI-023). The public
+/// API (`mark_handled`/`is_handled`/`revert`/`forget`) is identical on both backends — the consumer
+/// runtime calls the same methods regardless.
 ///
 /// This is **the effectively-once anchor**: every consumer's at-least-once delivery resolves to
 /// exactly-once-in-effect through this ledger (Bus §4.2).
 #[derive(Clone, Default)]
 pub struct DedupLedger {
-    inner: Arc<Mutex<HashSet<(ConsumerName, crate::EventId)>>>,
+    backend: DedupBackend,
 }
 
 impl DedupLedger {
-    /// A fresh, empty ledger.
+    /// A fresh, empty IN-MEMORY ledger (the test-double / in-process-drill default).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// **MR-023: bind the ledger to a DURABLE PG backing** so consumer idempotency survives a
+    /// process restart (a redelivered event after a restart is still deduped — SI-023). The events
+    /// `serve()` composition root (`myelin_storage::events_serve::EventsRuntime`) constructs this
+    /// with the PG-backed `consumer_dedup` table; [`DedupLedger::new`] stays the in-memory default.
+    pub fn durable(backing: Arc<dyn DurableDedup>) -> Self {
+        DedupLedger {
+            backend: DedupBackend::Durable(backing),
+        }
+    }
+
+    /// Lock the in-memory set (only valid on the `Memory` backend; the `Durable` backend routes
+    /// straight to its trait, never here).
+    fn mem(&self) -> Option<std::sync::MutexGuard<'_, HashSet<(ConsumerName, crate::EventId)>>> {
+        match &self.backend {
+            DedupBackend::Memory(inner) => Some(inner.lock().unwrap_or_else(|e| e.into_inner())),
+            DedupBackend::Durable(_) => None,
+        }
     }
 
     /// Record `(consumer, event_id)` and report whether it was FRESH. This is the `INSERT …
     /// ON CONFLICT DO NOTHING` model: a fresh pair returns `true` (the handler should run); a pair
     /// already present returns `false` (a redelivery — the handler is SKIPped, the message is
     /// acked, 0 dup). The PK is the pair, so the SAME event delivered to two DIFFERENT consumers is
-    /// fresh for each.
+    /// fresh for each. On the `Durable` backend a restart-surviving PG row is the dedup state.
     pub fn mark_handled(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool {
-        let mut set = self.lock();
-        set.insert((consumer.clone(), event_id.clone()))
+        match &self.backend {
+            DedupBackend::Memory(inner) => inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((consumer.clone(), event_id.clone())),
+            DedupBackend::Durable(d) => d.mark_handled(consumer, event_id),
+        }
     }
 
     /// Has `(consumer, event_id)` already been handled? (Read-only check; `mark_handled` is the
     /// transactional one.)
     pub fn is_handled(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool {
-        self.lock().contains(&(consumer.clone(), event_id.clone()))
+        match &self.backend {
+            DedupBackend::Memory(inner) => inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&(consumer.clone(), event_id.clone())),
+            DedupBackend::Durable(d) => d.is_handled(consumer, event_id),
+        }
     }
 
     /// Remove `(consumer, event_id)` from the ledger. A consumer-template `Retry` is NOT a
     /// completed handle, so the runtime reverts the mark a delivery speculatively took — a later
     /// redelivery must re-run the handler (else a transient failure would be permanently swallowed:
     /// silent data loss). The real `consumer_dedup` row is written in the SAME transaction as the
-    /// handler's state write (P-007/P-S12), so a rolled-back handler rolls back its dedup mark for
-    /// free — this models that atomicity. Crate-internal: only the runtime calls it.
+    /// handler's state write (P-007/P-S12; the same-tx atomicity floor — MR-023b), so a rolled-back
+    /// handler rolls back its dedup mark for free — this models that atomicity. Crate-internal.
     pub(crate) fn revert(&self, consumer: &ConsumerName, event_id: &crate::EventId) {
-        self.lock().remove(&(consumer.clone(), event_id.clone()));
+        match &self.backend {
+            DedupBackend::Memory(inner) => {
+                inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&(consumer.clone(), event_id.clone()));
+            }
+            DedupBackend::Durable(d) => d.revert(consumer, event_id),
+        }
     }
 
     /// **Forget `(consumer, event_id)` so a later delivery re-runs the handler (the reindex-after-wipe
@@ -133,21 +225,26 @@ impl DedupLedger {
     /// (forward-only; the snapshot id re-applies idempotently into the wiped store). Returns `true` iff
     /// a mark was present and removed.
     pub fn forget(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool {
-        self.lock().remove(&(consumer.clone(), event_id.clone()))
+        match &self.backend {
+            DedupBackend::Memory(inner) => inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(consumer.clone(), event_id.clone())),
+            DedupBackend::Durable(d) => d.forget(consumer, event_id),
+        }
     }
 
-    /// How many `(consumer, event_id)` pairs the ledger holds (for tests / a depth read).
+    /// How many `(consumer, event_id)` pairs the IN-MEMORY ledger holds (a depth read for tests /
+    /// the in-process model). On the `Durable` backend the count is a DB query not exposed through
+    /// this introspection helper — it returns the in-process view (`0`); production correctness
+    /// rests on `mark_handled`/`is_handled`, not on this helper.
     pub fn len(&self) -> usize {
-        self.lock().len()
+        self.mem().map(|s| s.len()).unwrap_or(0)
     }
 
-    /// Whether the ledger is empty.
+    /// Whether the IN-MEMORY ledger is empty (see [`DedupLedger::len`] for the durable caveat).
     pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<(ConsumerName, crate::EventId)>> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        self.mem().map(|s| s.is_empty()).unwrap_or(true)
     }
 }
 

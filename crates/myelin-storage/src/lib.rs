@@ -674,6 +674,16 @@ pub mod identity_durable;
 pub mod backend;
 #[cfg(feature = "integration")]
 pub mod pgrelay;
+// The durable PG backing for the consumer_dedup ledger (MR-023 / SI-023): the real
+// `(consumer, event_id)` table behind the `myelin_events::DurableDedup` seam so consumer
+// idempotency survives a process restart. Reuses the frozen `CONSUMER_DEDUP_MIGRATION`.
+#[cfg(feature = "integration")]
+pub mod events_durable;
+// The events serve() composition root (MR-023 / SI-008/009): wires the durable outbox (PgRelay) +
+// the REAL NATS JetStream broker + the relay drain + the idempotent consumer (durable dedup) into a
+// running event-delivery pipeline — the production default, not the in-process fake.
+#[cfg(feature = "integration")]
+pub mod events_serve;
 
 pub use agent_run_gate::{AgentRunGate, AgentRunGateSignal, DispatchError, InFlightRun, RunKind};
 pub use backup::{
@@ -818,3 +828,7 @@ pub use identity_durable::{
 };
 #[cfg(feature = "integration")]
 pub use tenant_tx::{connect_pool_with_reset, with_tenant_tx, TxScope};
+#[cfg(feature = "integration")]
+pub use events_durable::DurableDedupBacking;
+#[cfg(feature = "integration")]
+pub use events_serve::{EventsRuntime, EventsServeError, DEFAULT_DRAIN_BATCH};
