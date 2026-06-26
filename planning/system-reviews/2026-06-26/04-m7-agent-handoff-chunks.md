@@ -6,10 +6,15 @@ This document makes the M7 review overlay executable by a resumed ledger agent. 
 global prompt P-522..P-546: one main agent owns one prompt, assembles the final patch, runs the gate, writes the
 scorecard, and commits. Inside that prompt, the main agent may hand off bounded work packets to sub-agents.
 
-The target context model is the existing ledger model: each global prompt is self-contained and large enough to
-carry roughly 400k-700k tokens of relevant context when expanded by its CANON DOCS, code reads, test output,
-review overlay, and sub-agent results. Do not split a P-NNN into multiple ledger commits unless a blocker creates
-a new explicit follow-on prompt. Sub-agent packets are implementation aids, not new roadmap prompts.
+The unit of work is the chunk, not a token count. Each global prompt P-522..P-546 stays one ledger commit, but
+its work must be split into sub-agent packets each sized so a single agent can hold everything it needs — the
+prompt body, the canon sections, the code it reads, the change it writes, and the verification it runs — inside
+one coherent working window with room to spare. An agent works best well short of its context limit; a packet
+that fills the window is a packet that will force a shortcut, because an agent low on working room stubs the
+rest. Right-sizing the packets is therefore a quality control, not an ergonomic nicety — it is one of the
+mechanisms that stops a corner being cut for lack of room. Do not split a P-NNN into multiple ledger commits
+unless a blocker creates a new explicit follow-on prompt; sub-agent packets are implementation aids, not new
+roadmap prompts.
 
 ## Universal Handoff Rules
 
@@ -28,21 +33,23 @@ Every P-522..P-546 main agent must:
 6. Reject any sub-agent result that proves only a model, mock, dogfood path, or special harness where the prompt requires production proof.
 7. Merge only when the prompt's own GATE / DRILLS field is green.
 
-## Context Budget Pattern
+## Chunking Pattern
 
-Use this approximate split inside each 400k-700k prompt context:
+Split each prompt's work so no single packet has to hold all of it. A workable division of labour inside one
+P-NNN:
 
-| Context slice | Budget posture |
+| Work slice | How it is chunked |
 |---|---|
-| Prompt body + M7 overlay | Always loaded by main agent. |
-| Canon architecture/testing docs | Loaded by main agent; section-scoped where possible. |
-| Codebase read | Split among sub-agents by crate or boundary. |
-| Implementation | Main agent owns final patch; sub-agents can draft isolated changes or reports. |
-| Verification | Sub-agents can run narrow gates; main agent runs the prompt-level gate. |
-| Scorecard/evidence | Main agent writes final generated/dated artifact. |
+| Prompt body + M7 overlay | Held by the main agent; it owns the done-bar. |
+| Canon architecture/testing docs | Section-scoped; load only the parts a packet needs. |
+| Codebase read | One packet per crate or trust boundary, so no packet reads the whole tree. |
+| Implementation | Main agent owns the final patch; sub-agents draft isolated changes or reports. |
+| Verification | Sub-agents run narrow gates; the main agent runs the prompt-level gate. |
+| Scorecard/evidence | Main agent writes the final generated/dated artifact. |
 
-If context pressure rises, drop broad prose first and keep: prompt body, floor evidence, modified code, gate
-commands, and scorecard schema.
+When a packet approaches the edge of a comfortable working window, that is the signal to split it further — not
+to compress the work into less room. Keep the load-bearing material (prompt body, floor evidence, the code under
+change, the gate commands, the scorecard schema) and shed broad prose first.
 
 ## P-522/P-523: Durable Identity Persistence
 
