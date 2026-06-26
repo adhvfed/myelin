@@ -2439,10 +2439,12 @@ dependencies = [
 name = "myelin-harness"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "myelin-chat",
  "myelin-identity",
  "myelin-tenancy",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

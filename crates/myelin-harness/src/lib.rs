@@ -148,6 +148,7 @@ pub mod dependency_break;
 pub mod dogfood;
 pub mod drills;
 pub mod load_generator;
+pub mod make_it_real;
 pub mod restore;
 pub mod scorecard;
 pub mod self_hosting_ci;
