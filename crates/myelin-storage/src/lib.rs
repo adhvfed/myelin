@@ -684,6 +684,13 @@ pub mod events_durable;
 // running event-delivery pipeline — the production default, not the in-process fake.
 #[cfg(feature = "integration")]
 pub mod events_serve;
+// The durable PG backing for the control-plane placement registry (MR-024 / SI-011/SI-028): the
+// `cell` + `tenant_placement` tables (frozen contract-12.3 shape) + the HARD placement invariant as
+// a REAL DB TRIGGER + the durable `misroute_audit` sink. Control-plane ROUTING infra (cross-tenant by
+// design, PII-free) — connects to the pool directly, NOT through the per-request RLS/with_tenant_tx
+// convention (a NAMED tenant-predicate exclusion, like pgrelay.rs / events_durable.rs).
+#[cfg(feature = "integration")]
+pub mod placement_durable;
 
 pub use agent_run_gate::{AgentRunGate, AgentRunGateSignal, DispatchError, InFlightRun, RunKind};
 pub use backup::{
@@ -832,3 +839,8 @@ pub use tenant_tx::{connect_pool_with_reset, with_tenant_tx, TxScope};
 pub use events_durable::DurableDedupBacking;
 #[cfg(feature = "integration")]
 pub use events_serve::{EventsRuntime, EventsServeError, DEFAULT_DRAIN_BATCH};
+#[cfg(feature = "integration")]
+pub use placement_durable::{
+    placement_durable_migrations, DurableCellRow, DurableMisrouteAuditBacking, DurableMisrouteRecord,
+    DurablePlacementBacking, DurablePlacementRow, PlacementWriteError,
+};
