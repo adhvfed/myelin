@@ -23,6 +23,16 @@ The one rule that generalizes: **break the builder/verifier coupling.** Every de
 thing it inspects — a different agent, a different framing (outside-in/black-box), a real backend instead of a
 mock, an **external oracle** instead of our own assertion. Wherever those coincide, a shortcut can hide.
 
+**A second structural gap: the ledger has a conformance loop, not a learning loop.** Each prompt's gate asks "did
+this pass?" — never "now that this exists, was it the right thing to build?" A frozen contract plus an incentive
+to conform means an early-era shape gets *bolted onto* rather than reconsidered: the platform's multi-cell,
+object-store, real-crypto, and real-agent layers are all retrofits over an earlier core, and each swap leaves a
+seam that reads as "X, but actually X′ added later." Detailed planning did not prevent this — it *caused* it,
+because the plan specified components and a build order, not smoothed interactions. Coherence is emergent from
+interactions, so it needs a design-level feedback pass the ledger never ran. The bounds the plan imposed were not
+too tight — they were *unidirectional*: an agent could conform-and-defer, but nothing rewarded reconsidering the
+shape. Stage D supplies the missing direction.
+
 Two classes of shortcut, handled differently:
 - **Named floors** — carry a `Floor named:` comment; finite, enumerated (M7 audit + a grep). Tractable.
 - **Silent shortcuts** — no comment; invisible to a search for comments. *The real risk.* They need discovery,
@@ -78,11 +88,26 @@ to rediscover things a grep or a system test would have caught for a fraction of
      (§3), dependency-ordered, reworking the M7 prompts where a finding changes their scope.
 - **Output:** the inventory + the remediation ledger.
 
-### Stage D — Design / threat review of the security-critical subsystems  *(real ≠ well-conceived)*
-- Independent threat-model + architecture review of identity/authz (trust boundaries — is tenant derived from a
-  *verified* claim everywhere?), sandbox, KMS/crypto, tenancy/residency, GDPR erasure. A reviewer empowered to
-  say "this whole approach is wrong," informing remediation — not a final rubber stamp. Pairs with M7 P-542/P-543
-  but is positioned to *change what gets built*, not just sign it off.
+### Stage D — Design soundness **and shape-coherence** review of the load-bearing subsystems  *(real ≠ well-conceived; conformant ≠ coherent)*
+Two questions, one independent review per security-critical / phased subsystem, by a reviewer empowered to say
+"this whole approach is wrong" and to *change what gets built* — not a final rubber stamp:
+- **Is it well-conceived?** Threat-model + architecture review of identity/authz (is tenant derived from a
+  *verified* claim on every surface?), sandbox, KMS/crypto, tenancy/residency, GDPR erasure. Pairs with M7
+  P-542/P-543 but is positioned early enough to inform remediation, not sign it off.
+- **Is the frozen shape still right?** For every floor→follow-on seam — single-cell→multi-cell (`CrossCellPointer`
+  over a single-cell core), fs-backed→object-store `BlobStore`, structural→real crypto, **mock→real agent
+  runtime** — ask whether the evolved capability should be *native design* or is an adaptation layer bolted onto
+  an earlier-era shape, and whether the retrofit left a coherence seam to smooth. This is the agile correction to
+  the waterfall bound: re-open the contract question *once, after* the code exists to inform it — the
+  design-level feedback the conformance loop never ran. A finding here becomes a reshape prompt in the
+  remediation ledger, not just a note.
+- **The mock-agent-runtime boundary is its own line item.** The entire agent fabric (M2..M6 — dispatch, HITL,
+  plan-then-apply determinism, the surge drills, the E2E-2 "agent-native flagship") was validated against the
+  scripted-deterministic `--use-mock` runtime; the real `LlmAgentRuntime` was deferred post-M5 (P-481 is a seam
+  doc only). So every agent-governance property is proven against a *cooperative strawman*. The review must ask
+  which of those properties survive a real, nondeterministic, occasionally-adversarial runtime, and treat any
+  that do not as **unproven**. This is not on the M7 floor list and is arguably as load-bearing as the crypto
+  floors — it is the corner the plan painted hardest, and the one the audit does not see.
 
 ### Stage E — Evidence integrity + the fail-closed gate  *(make the proofs un-gameable)*
 - Production-graph absence scanners with **red fixtures** (a scanner with no red fixture is too easy to weaken),
@@ -160,7 +185,9 @@ The platform is "truly confident" when:
 - every load-bearing claim has a falsifier mapped to an **independent** gate (real backend / external oracle /
   adversarial drill / different-agent review), or a recorded human blocker where automation cannot prove it;
 - no structural/mock impl remains in any production dependency path (scanner-proven, with red fixtures);
-- the security-critical designs have passed an independent review empowered to reject the approach;
+- the security-critical designs have passed an independent review empowered to reject the approach, **and every
+  floor→follow-on seam — above all the mock→real agent runtime — has been re-examined for whether it should be
+  native design rather than a retrofit, with the agent-governance properties re-proven against a real runtime;**
 - the evidence itself is attested and un-gameable; and
 - the fail-closed release gate reads it all and is green only on fresh, dated, attested artifacts.
 
