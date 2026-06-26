@@ -31,7 +31,21 @@ security-critical prompt gets an independent verifier agent that never touched t
 | MR-003 | Census synthesis → shortcut-inventory.md | 66 deduped (17 CRIT) | orch verified SI-010 + SI-006 against source | n/a (read-only) | b00d536 |
 | MR-004 | Production-graph absence scanners | 3 scanners + 23-entry 2-way ratchet, 153 tests | INDEP verifier: ACCEPT-w/-followups → 4 false-negs found & closed; orch re-checked sites + gate | GREEN (cargo test -p myelin-lints; check workspace) | 0e5a289 |
 | MR-005 | Attested scorecards + red-by-default gate | blake3-attested manifest + make-it-real gate (exit 1, red-by-default), 8 tamper tests | INDEP verifier: ACCEPT-w/-followups → gate NOT gameable (no trust-manifest path; live re-run mandatory); found PRE-EXISTING vacuous-green rows | GREEN (cargo test -p myelin-harness; gate exits 1; check workspace) | 1bd35a8 |
-| MR-006 | Shape/design review | 4 seams SHAPE-OK, 2 RESHAPE (001 sandbox/off-spine, 002 tenant-tx-conn/on-spine→MR-022) | orch verified seam injectors + SandboxHandle + AgentRuntime against source | n/a (read-only) | (this) |
+| MR-006 | Shape/design review | 4 seams SHAPE-OK, 2 RESHAPE (001 sandbox/off-spine, 002 tenant-tx-conn/on-spine→MR-022) | orch verified seam injectors + SandboxHandle + AgentRuntime against source | n/a (read-only) | (committed w/ log) |
+| MR-022 | Persistence foundation (migrations + provider + tenant-tx convention, RESHAPE-002) | apply_validated + SubstrateProvider + with_tenant_tx, 3 live-PG integration tests | INDEP verifier (live PG, app role): ACCEPT — real force-RLS proven, reset-on-release load-bearing, no overclaim, pg.rs untouched | GREEN (3 integ + 842 default + ratchet + workspace) | (this) |
+
+## Test environment (verified live 2026-06-26 — every persistence/auth prompt uses this)
+
+Real backends run via `docker-compose.dev.yml` and are UP (confirmed `smoke_backends` integration test
+green: pg connect, s3 put/get, rebac tuples, outbox→bus relay, valkey cache):
+- **Postgres** `myelin-postgres` on **:5433** — app role `postgres://myelin_app:myelin_app_pw@localhost:5433/myelin`
+  (RLS-enforced), admin role `myelin_admin`/`myelin_dev_pw`.
+- **Valkey** `:6380` → `REDIS_URL=redis://localhost:6380`. **NATS** `:4222`. **rustfs/S3** `:9000`
+  (`S3_ENDPOINT=http://localhost:9000`, key `myelin_dev_access`/`myelin_dev_secret`, region `fr-par`).
+- Tests reach them only under `--features integration` (env vars above). Run example:
+  `DATABASE_URL=… REDIS_URL=… cargo test -p <crate> --features integration --test <file>`.
+- Real PG-backed impls already exist behind the `integration` feature; the in-memory versions are the
+  DEFAULT/production path today (the census's core finding). "Make it real" = make the real path the default.
 
 ## Shape-review outcomes (MR-006) — binding on later prompts
 
