@@ -190,6 +190,40 @@ pub enum Band {
     /// floors (Chat ScyllaDB hot-tier M4-C1, mega-channel home-node M4-C2, comment-threading OQ-L)
     /// are likewise named there, not rows that red this gate.
     M5World,
+    /// The **M6 dogfooding exit gate** (M6 → M7) — the FINAL band-boundary go/no-go, the platform
+    /// done-bar reached by DOGFOODING (master-sequencing §"Exit gate (the done-bar for the
+    /// platform)"). It WIRES (does not re-implement) the per-feature M6 dogfood / switch-test drills
+    /// (each `proof_command` is the real `cargo test`/`cargo run` target that already lives with its
+    /// feature prompt, P-445..P-521) across four families:
+    ///
+    /// - **The switch tests (browser-driven over the real surface; measured contrast + latency, NOT a
+    ///   feature-list read-off, EI-01 §4):** ISS-D14 (Issues), CHAT-D19 (Chat — a lib unit-test
+    ///   module, not a tests/ file), GIT-OQ-12 (Git), KN-switch (Knowledge), REF-switch (Refs),
+    ///   SRCH-switch (Search), CI-P35-switch (CI dogfood + switch test).
+    /// - **The self-hosting CI graph is green (the dogfood loop is live):** self-hosting-CI — the CI
+    ///   graph runs green on the platform's own commits; every-incident-adds-a-drill.
+    /// - **The dogfood drills (the platform runs on its own work):** FLOW-P29, AG-P26,
+    ///   CP-D23-selfhost, STOR-D37 (restore-verify on Myelin's own commits — the PERMANENT restore
+    ///   gate, the only `permanent` row), GA-P511 (self-served DSR), REF-P28, SRCH-P33, KN-P34,
+    ///   GIT-P35.
+    /// - **The truth-up pass (every PROVEN gate rests on a dated green artifact, never a doc claim,
+    ///   EI-01 §1):** GA-truth-up, contract-coverage.
+    ///
+    /// STOR-D37 is the only `permanent` row (the shared restore gate on Myelin's own commits — a
+    /// backup never restored is not a backup, EI-01 §3, re-run-forever). No M6 row needs `--features
+    /// integration` (the dogfood loop's LOGIC runs in-process over the platform's own work; the
+    /// switch tests drive the real surface directly).
+    ///
+    /// A single RED row blocks the first production release (the master band gate invariant,
+    /// master-sequencing §2/§4, EI-01 §2). M6 green is **dogfood-complete, NOT production-ready** —
+    /// M7 (P-522..P-546, production readiness & security hardening) is the next band and is NOT yet
+    /// implemented: M0..M6 deliberately shipped several production mechanisms as documented EI-01 §1
+    /// structural FLOORS (auth-token crypto, HSM-class KMS, durable Identity stores, real
+    /// backup/restore, sandbox PRODUCTION exec on both backends). M7 fills each floor with a real
+    /// implementation + a SEPARATE verification prompt, and gates the first production release
+    /// fail-closed (P-546). These floors are NAMED, dated deferrals in [`Scorecard::render_markdown`],
+    /// NOT rows that red this M6 gate.
+    M6Dogfood,
 }
 
 impl fmt::Display for Band {
@@ -202,6 +236,7 @@ impl fmt::Display for Band {
             Band::M3Producers => write!(f, "M3 (producer subsystems)"),
             Band::M4Consumers => write!(f, "M4 (consumer subsystems)"),
             Band::M5World => write!(f, "M5 (world-scale hardening)"),
+            Band::M6Dogfood => write!(f, "M6 (dogfooding)"),
         }
     }
 }
@@ -220,6 +255,7 @@ impl Band {
             Band::M3Producers => m3_required_rows(),
             Band::M4Consumers => m4_required_rows(),
             Band::M5World => m5_required_rows(),
+            Band::M6Dogfood => m6_required_rows(),
         }
     }
 }
@@ -1673,6 +1709,158 @@ pub fn m5_required_rows() -> Vec<GateRow> {
     ]
 }
 
+/// The FROZEN required-row set for the **M6 dogfooding exit gate** (M6 → M7) — the FINAL
+/// band-boundary go/no-go, the platform done-bar reached by DOGFOODING. This is the build-layer
+/// realisation of the master band gate invariant (master-sequencing §2/§4, EI-01 §2): the platform
+/// is *dogfood-complete* before M7 (production readiness & security hardening) is started. It WIRES
+/// the per-feature M6 drills (it does not re-implement them — each `proof_command` is the real
+/// `cargo test`/`cargo run` target that already lives with its feature prompt, P-445..P-521) across
+/// four families:
+///
+/// - **The switch tests (browser-driven over the real surface; measured contrast + latency, EI-01
+///   §4):** ISS-D14, CHAT-D19 (a lib unit-test module, not a tests/ file), GIT-OQ-12, KN-switch,
+///   REF-switch, SRCH-switch, CI-P35-switch.
+/// - **The self-hosting CI graph is green (the dogfood loop is live):** self-hosting-CI.
+/// - **The dogfood drills (the platform runs on its own work):** FLOW-P29, AG-P26, CP-D23-selfhost,
+///   STOR-D37 (the PERMANENT restore gate on Myelin's own commits), GA-P511, REF-P28, SRCH-P33,
+///   KN-P34, GIT-P35.
+/// - **The truth-up pass (every PROVEN gate rests on a dated green artifact, never a doc claim,
+///   EI-01 §1):** GA-truth-up, contract-coverage.
+///
+/// STOR-D37 is the only `permanent` row (the shared restore gate on Myelin's own commits — a backup
+/// never restored is not a backup, EI-01 §3, re-run-forever). No M6 row needs `--features
+/// integration` (the dogfood loop's LOGIC runs in-process over the platform's own work; the switch
+/// tests drive the real surface directly).
+///
+/// The carried-forward EI-01 §1 production FLOORS (auth-token crypto, HSM-class KMS, durable
+/// Identity stores, real backup/restore, sandbox PRODUCTION exec on both backends — filled by M7
+/// P-522..P-546) are named, dated deferrals in [`Scorecard::render_markdown`], NOT rows here (they
+/// would red the gate; M6 is *dogfood-complete*, M7 is *production-ready*).
+pub fn m6_required_rows() -> Vec<GateRow> {
+    fn row(id: &'static str, title: &'static str, cmd: &'static [&'static str]) -> GateRow {
+        GateRow {
+            id,
+            title,
+            proof_command: cmd,
+            permanent: false,
+            floor: None,
+        }
+    }
+    vec![
+        // ---- The switch tests (browser-driven over the real surface; measured contrast + latency) ----
+        row(
+            "ISS-D14",
+            "Issues switch test → driven over the real surface with measured contrast + latency (not a feature-list read-off)",
+            &["test", "-p", "myelin-issues", "--test", "iss_p37_switch_test_drill"],
+        ),
+        row(
+            "CHAT-D19",
+            "Chat switch test → driven over the real surface with measured contrast + latency (the lib switch_test module)",
+            &["test", "-p", "myelin-chat", "--lib", "switch_test"],
+        ),
+        row(
+            "GIT-OQ-12",
+            "Git switch test → driven over the real surface with measured contrast + latency (not a feature-list read-off)",
+            &["test", "-p", "myelin-git", "--test", "git_p35_switch_test_drill"],
+        ),
+        row(
+            "KN-switch",
+            "Knowledge switch test → driven over the real surface with measured contrast + latency (not a feature-list read-off)",
+            &["test", "-p", "myelin-knowledge", "--test", "drill_kn_p34_switch_test"],
+        ),
+        row(
+            "REF-switch",
+            "Refs switch test → driven over the real surface with measured contrast + latency (not a feature-list read-off)",
+            &["test", "-p", "myelin-refs-service", "--test", "ref_p29_switch_test_drill"],
+        ),
+        row(
+            "SRCH-switch",
+            "Search switch test → driven over the real surface with measured contrast + latency (not a feature-list read-off)",
+            &["test", "-p", "myelin-search", "--test", "srch_p33_switch_test_drill"],
+        ),
+        row(
+            "CI-P35-switch",
+            "CI dogfood + switch test → the CI surface driven over the real surface with measured contrast + latency",
+            &["test", "-p", "myelin-ci-controlplane", "--test", "ci_p35_dogfood_switch_test_drill"],
+        ),
+        // ---- The self-hosting CI graph is green (the dogfood loop is live) ----
+        row(
+            "self-hosting-CI",
+            "the self-hosting CI graph is green on the platform's own commits → the dogfood loop is live; every-incident-adds-a-drill",
+            &["test", "-p", "myelin-harness", "--test", "self_hosting_ci_dogfood"],
+        ),
+        // ---- The dogfood drills (the platform runs on its own work) ----
+        row(
+            "FLOW-P29",
+            "Flow dogfood → a flow incident files an issue and joins the permanent drill suite (the platform runs on its own work)",
+            &["test", "-p", "myelin-flow", "--test", "flow_p29_dogfood_drill"],
+        ),
+        row(
+            "AG-P26",
+            "Agent fabric dogfood → a fabric incident files an issue and joins the permanent drill suite (the platform runs on its own work)",
+            &["test", "-p", "myelin-agent-service", "--test", "ag_p26_dogfood_drill"],
+        ),
+        row(
+            "CP-D23-selfhost",
+            "Control-plane dogfood → Myelin self-hosts as one cell, residency-verify green, truth-up passes (the platform runs on its own work)",
+            &["test", "-p", "myelin-control-plane", "--test", "cp_d23_dogfood_self_host_drill"],
+        ),
+        // STOR-D37 — restore-verify on Myelin's own commits: the PERMANENT restore gate.
+        GateRow {
+            id: "STOR-D37",
+            title: "restore-verify on Myelin's own commits → a synthetic storage incident files an issue and joins the permanent drill suite (the permanent restore gate)",
+            proof_command: &[
+                "test",
+                "-p",
+                "myelin-storage",
+                "--test",
+                "stor_d37_dogfood_restore_verify_drill",
+            ],
+            permanent: true,
+            floor: None,
+        },
+        row(
+            "GA-P511",
+            "self-served DSR → the dogfood DSR loop runs end-to-end self-hosting (the platform serves its own data-subject requests)",
+            &["test", "-p", "myelin-gdpr-service", "--test", "ga_p511_dogfood_self_served_dsr_drill"],
+        ),
+        row(
+            "REF-P28",
+            "Refs dogfood → a refs incident files an issue and joins the permanent drill suite (the platform runs on its own work)",
+            &["test", "-p", "myelin-refs-service", "--test", "ref_p28_dogfood_drill"],
+        ),
+        row(
+            "SRCH-P33",
+            "Search dogfood → a search incident files an issue and joins the permanent drill suite (the platform runs on its own work)",
+            &["test", "-p", "myelin-search", "--test", "srch_p33_dogfood_drill"],
+        ),
+        row(
+            "KN-P34",
+            "Knowledge dogfood → the every-incident loop joins the permanent suite and re-runs green (the platform runs on its own work)",
+            &["test", "-p", "myelin-knowledge", "--test", "drill_kn_p34_dogfood"],
+        ),
+        row(
+            "GIT-P35",
+            "Git dogfood → the every-incident loop joins the permanent suite and re-runs green (the platform runs on its own work)",
+            &["test", "-p", "myelin-git", "--test", "git_p35_dogfood_drill"],
+        ),
+        // ---- The truth-up pass (every PROVEN gate rests on a dated green artifact, never a doc claim) ----
+        row(
+            "GA-truth-up",
+            "truth-up pass → every PROVEN gate rests on a dated green artifact, never a doc claim (code-wins-over-docs, EI-01 §1)",
+            &["test", "-p", "myelin-gdpr-service", "--test", "ga_p512_truth_up_pass"],
+        ),
+        // ---- contract-coverage re-affirm ----
+        GateRow {
+            id: "contract-coverage",
+            title: "the contract-coverage scanner re-affirms the M6 CDC rows — no falsely-claimed/dropped row",
+            proof_command: &["run", "-p", "myelin-lints", "--bin", "contract-coverage"],
+            permanent: false,
+            floor: None,
+        },
+    ]
+}
+
 /// The verdict of one recorded scorecard row. A `Pass` is only constructible WITH a non-empty
 /// proof line (the dated green artifact the proof command emitted) — a green must be earned, it
 /// cannot be flipped from nothing (the ratchet's "no green without proof" half).
@@ -1836,6 +2024,12 @@ impl Scorecard {
                  GIT-D4/D5 + KN-D1-re-green/KN-D8 + GA-D1/GA-D8/CP-D7/CP-D8 + E2E-1/E2E-2/E2E-3/E2E-4 + \
                  STOR-D2 (cell scale, permanent restore gate) + contract-coverage",
                 "M6",
+            ),
+            Band::M6Dogfood => (
+                "switch tests (ISS-D14/CHAT-D19/GIT-OQ-12/KN-switch/REF-switch/SRCH-switch/CI-P35-switch) + \
+                 self-hosting-CI + dogfood drills (FLOW-P29/AG-P26/CP-D23-selfhost/STOR-D37/GA-P511/REF-P28/SRCH-P33/KN-P34/GIT-P35) + \
+                 truth-up pass (GA-truth-up + contract-coverage)",
+                "M7",
             ),
         };
         let mut out = String::new();
@@ -2078,6 +2272,39 @@ impl Scorecard {
                      hot-tier promotion (M4-C1), mega-channel channel-sharded home-node (M4-C2), \
                      comment-threading consolidation (OQ-L) — each ships its seam + named follow-on, \
                      promoted only on its measured trigger; not a row that reds this gate.\n",
+                );
+            }
+            Band::M6Dogfood => {
+                out.push_str(
+                    "**M6 is the platform done-bar reached by DOGFOODING** — Myelin hosts its own \
+                     repos/CI/issues/docs/chat, and the switch tests are driven over the real surface \
+                     (measured contrast + latency), not read off a feature list (EI-01 §4).\n\n",
+                );
+                out.push_str(
+                    "**The self-hosting CI graph is green on the platform's own commits** — the \
+                     dogfood loop is live; every-incident-adds-a-drill.\n\n",
+                );
+                out.push_str(
+                    "**STOR-D37 dogfood restore-verify on Myelin's own commits** is permanent (a \
+                     backup never restored is not a backup, EI-01 §3).\n\n",
+                );
+                out.push_str(
+                    "**The truth-up pass holds:** every PROVEN row here rests on a dated green \
+                     artifact, never a doc claim (code-wins-over-docs, EI-01 §1).\n\n",
+                );
+                out.push_str(
+                    "**M7 (P-522..P-546) is the next band — production readiness & security hardening \
+                     — and is NOT yet implemented.** M0..M6 deliberately shipped several production \
+                     mechanisms as documented EI-01 §1 structural FLOORS (correct in shape, honestly \
+                     named, not production-real): auth-token crypto (StructuralTokenSigner/Verifier \
+                     still in prod constructors), HSM-class KMS, durable Identity stores (in-memory \
+                     maps), real backup/restore (modeled offsets), and **sandbox PRODUCTION exec on \
+                     both backends** (Firecracker prod boots `init=/bin/true`; gVisor prod runs only \
+                     `runsc --version` — the AG-D4 isolation boundary is proven on real hardware, but \
+                     a real `JobSpec.command` does not yet flow through prod `launch()`). M7 fills each \
+                     floor with a real implementation + a SEPARATE verification prompt, and gates the \
+                     first production release fail-closed (P-546). **This M6 green is dogfood-complete, \
+                     NOT production-ready** — do not read it as the latter.\n",
                 );
             }
         }
@@ -3232,5 +3459,187 @@ mod tests {
         assert!(card
             .render_markdown("2026-06-25")
             .contains("RED — M6 is BLOCKED"));
+    }
+
+    // ---- M6 dogfooding exit gate (M6 → M7) ----
+
+    /// The M6 required row set covers all four dogfood families: the switch tests (browser-driven
+    /// over the real surface), the self-hosting CI graph, the dogfood drills (the platform runs on
+    /// its own work), and the truth-up pass, plus the permanent STOR-D37 restore gate and the
+    /// contract-coverage re-affirm. The frozen-row ratchet asserts a future edit cannot silently
+    /// shrink the proof set, and the band dispatch returns the same set.
+    #[test]
+    fn m6_required_rows_cover_the_dogfood_families() {
+        let ids: Vec<&str> = m6_required_rows().iter().map(|r| r.id).collect();
+        for must in [
+            // The switch tests (browser-driven over the real surface)
+            "ISS-D14",
+            "CHAT-D19",
+            "GIT-OQ-12",
+            "KN-switch",
+            "REF-switch",
+            "SRCH-switch",
+            "CI-P35-switch",
+            // The self-hosting CI graph is green
+            "self-hosting-CI",
+            // The dogfood drills (the platform runs on its own work)
+            "FLOW-P29",
+            "AG-P26",
+            "CP-D23-selfhost",
+            "STOR-D37",
+            "GA-P511",
+            "REF-P28",
+            "SRCH-P33",
+            "KN-P34",
+            "GIT-P35",
+            // The truth-up pass
+            "GA-truth-up",
+            "contract-coverage",
+        ] {
+            assert!(
+                ids.contains(&must),
+                "M6 gate is missing required row {must}"
+            );
+        }
+        // All four families present: a switch test, the self-hosting CI graph, a dogfood drill, and
+        // the truth-up pass.
+        assert!(ids
+            .iter()
+            .any(|id| id.ends_with("-switch") || *id == "ISS-D14"));
+        assert!(ids.contains(&"self-hosting-CI"));
+        assert!(ids
+            .iter()
+            .any(|id| id.ends_with("-P29") || id.ends_with("-P26")));
+        assert!(ids.contains(&"GA-truth-up"));
+        // The band dispatch returns the same frozen set (the single dispatch point).
+        assert_eq!(
+            Band::M6Dogfood
+                .required_rows()
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+    }
+
+    /// EXACTLY one M6 row is permanent (re-run-forever): the STOR-D37 dogfood restore-verify on
+    /// Myelin's own commits (a backup never restored is not a backup, EI-01 §3). No M6 row needs
+    /// `--features integration` (the dogfood loop's LOGIC runs in-process over the platform's own
+    /// work; the switch tests drive the real surface directly).
+    #[test]
+    fn m6_permanent_row_is_the_dogfood_restore_gate() {
+        let perm: Vec<&str> = m6_required_rows()
+            .into_iter()
+            .filter(|r| r.permanent)
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            perm,
+            vec!["STOR-D37"],
+            "the M6 permanent set is exactly the dogfood restore gate"
+        );
+        assert!(
+            m6_required_rows()
+                .iter()
+                .all(|r| !r.proof_command.contains(&"--features")),
+            "no M6 row needs --features integration"
+        );
+    }
+
+    /// No M6 row carries a `floor` note — the carried-forward EI-01 §1 production FLOORS (filled by
+    /// M7) are named deferrals in the rendered artifact, NOT smoke-floor rows that red the gate.
+    #[test]
+    fn m6_has_no_floor_rows() {
+        assert!(m6_required_rows().iter().all(|r| r.floor.is_none()));
+    }
+
+    /// A fully-proven M6 scorecard reads GREEN, renders the M7-may-start verdict, the dogfooding
+    /// done-bar framing, the self-hosting CI graph, the STOR-D37 permanent restore gate, the truth-up
+    /// pass, and the carried-forward M7 production floors (incl. the sandbox prod-exec floor) as
+    /// named, visible deferrals that do NOT red the gate (EI-01 §1).
+    #[test]
+    fn m6_all_rows_proven_is_green() {
+        let mut card = Scorecard::new(Band::M6Dogfood);
+        for r in m6_required_rows() {
+            card.record(RowResult::pass(
+                r.id,
+                format!("[2026-06-26] PASS {}", r.id),
+                "2026-06-26",
+            ));
+        }
+        assert!(card.is_green(), "every M6 row proven ⇒ green");
+        assert!(card.missing_required().is_empty());
+        let md = card.render_markdown("2026-06-26");
+        assert!(md.contains("GREEN — M7 may start"));
+        // The dogfooding done-bar framing.
+        assert!(md.contains("DOGFOODING"));
+        assert!(
+            md.contains("self-hosting CI graph is green"),
+            "the live self-hosting CI graph must be named"
+        );
+        // STOR-D37 permanent restore gate named.
+        assert!(
+            md.contains("STOR-D37"),
+            "the STOR-D37 permanent restore gate must be named"
+        );
+        // The truth-up pass holds.
+        assert!(
+            md.contains("truth-up pass holds"),
+            "the truth-up pass must be named"
+        );
+        // The carried-forward M7 floors named (incl. the sandbox prod-exec floor + the fail-closed gate).
+        assert!(
+            md.contains("P-546"),
+            "the M7 fail-closed production-release gate must be named"
+        );
+        assert!(
+            md.contains("dogfood-complete") && md.contains("NOT production-ready"),
+            "the dogfood-complete-NOT-production-ready framing must be printed"
+        );
+    }
+
+    /// THE RATCHET on the M6 set: dropping ANY single row reds the M6→M7 gate (you cannot declare the
+    /// platform dogfood-complete over a missing drill).
+    #[test]
+    fn m6_dropping_any_row_reds_the_gate() {
+        for dropped in m6_required_rows() {
+            let mut card = Scorecard::new(Band::M6Dogfood);
+            for r in m6_required_rows()
+                .into_iter()
+                .filter(|r| r.id != dropped.id)
+            {
+                card.record(RowResult::pass(r.id, "[2026-06-26] PASS", "2026-06-26"));
+            }
+            assert_eq!(card.missing_required(), vec![dropped.id]);
+            assert!(
+                !card.is_green(),
+                "dropping {} must RED the M6→M7 gate",
+                dropped.id
+            );
+        }
+    }
+
+    /// THE RATCHET on the M6 set: a claimed-not-proven row (e.g. the dogfood restore-verify that did
+    /// not restore on Myelin's own commits) keeps the gate RED — recorded honestly, never softened
+    /// into a green (EI-01 §3). The honest red blocks M7.
+    #[test]
+    fn m6_claimed_not_proven_row_reds_the_gate() {
+        let mut card = Scorecard::new(Band::M6Dogfood);
+        for r in m6_required_rows() {
+            if r.id == "STOR-D37" {
+                card.record(RowResult::claimed_not_proven(
+                    r.id,
+                    "restore-verify on Myelin's own commits did not reach a consistent point — recorded RED",
+                    "2026-06-26",
+                ));
+            } else {
+                card.record(RowResult::pass(r.id, "[2026-06-26] PASS", "2026-06-26"));
+            }
+        }
+        assert!(!card.is_green(), "a claimed-not-proven M6 row blocks M7");
+        assert_eq!(card.not_proven().len(), 1);
+        assert!(card
+            .render_markdown("2026-06-26")
+            .contains("RED — M7 is BLOCKED"));
     }
 }
