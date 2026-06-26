@@ -52,6 +52,15 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // queries — the same posture as relay.rs. NAMED, LOUD exclusion (see the crate note in
     // pgrelay.rs), never a silent skip; the tenant-store code in pg.rs stays fully linted.
     "myelin-storage/src/pgrelay.rs",
+    // The DURABLE consumer_dedup BACKING (MR-023 / SI-023): the frozen `consumer_dedup` table is
+    // keyed `(consumer, event_id)` and carries NO tenant column (the event_id is a globally-unique
+    // ULID; dedup is per-consumer, cross-tenant by design — contract 2.5). Its INSERT/SELECT/DELETE
+    // are consumer-INTERNAL, not tenant-store queries, so the `tenant-predicate` fingerprint
+    // (`sqlx::query` without a `tenant_id`) flags them falsely — exactly the relay-INTERNAL
+    // posture pgrelay.rs's outbox queries take above. The tenant-store code in pg.rs /
+    // identity_durable.rs stays FULLY linted. NAMED, LOUD exclusion (see the module note in
+    // events_durable.rs), never a silent skip; the lint is NOT weakened.
+    "myelin-storage/src/events_durable.rs",
     // The race-safe LIVE MIGRATION DRIVER (Stage 2 / infra, the P-S12 floor): `PgMigrator::apply`
     // + `with_migration_lock` run SCHEMA/INFRA statements only — the Postgres session advisory lock
     // (`pg_advisory_lock`/`unlock`), the global schema-version table `myelin_applied_migration`

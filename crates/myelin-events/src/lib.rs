@@ -402,7 +402,7 @@ pub use crosscell_propagation::{
     pointer_for_propagation, propagated_carried_fields, CrossCellPropagator, CrossCellStream,
     PropagatedPointer,
 };
-pub use dedup::{DedupLedger, CONSUMER_DEDUP_MIGRATION};
+pub use dedup::{DedupLedger, DurableDedup, CONSUMER_DEDUP_MIGRATION};
 /// The firehose resume-cursor subscription protocol (contract 3.5, the Bus-owned zero-loss-replay
 /// half — EB-21 / P-141, built FIRST per EI-04 §2.2). `Firehose::publish`/`tail`/`subscribe`/`resume`
 /// implement the §5.5 surface: a per-`(stream, scope)` monotonic `seq`, `(last_seq, now]` backfill on

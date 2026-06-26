@@ -48,7 +48,8 @@ reason; always use `cargo test` for the gate.
 | MR-006 | Shape/design review | 4 seams SHAPE-OK, 2 RESHAPE (001 sandbox/off-spine, 002 tenant-tx-conn/on-spine→MR-022) | orch verified seam injectors + SandboxHandle + AgentRuntime against source | n/a (read-only) | (committed w/ log) |
 | MR-022 | Persistence foundation (migrations + provider + tenant-tx convention, RESHAPE-002) | apply_validated + SubstrateProvider + with_tenant_tx, 3 live-PG integration tests | INDEP verifier (live PG, app role): ACCEPT — real force-RLS proven, reset-on-release load-bearing, no overclaim, pg.rs untouched | GREEN (3 integ + 842 default + ratchet + workspace) | 87a9c8e (+fix 2fa0260) |
 | MR-007 | Durable principal + tuple stores (PG backing via MR-022 convention) | identity_durable.rs + pg conn-twins + new principal/credential_link RLS tables, 3 live-PG tests | INDEP verifier (live PG): ACCEPT-w/-followups → confirmed real force-RLS + durability + outbox co-commit; CAUGHT enum-indirection blinding the MR-004 ratchet → builder extended scanner to follow enums, baseline restored to honest 23 | GREEN (full lints + 3 integ + default + workspace) | 5952615 |
-| MR-008 | Durable revocation + expiry stores (RevocationStore→PG; run-token TTL) | new revocation/run_token_teardown RLS tables, expires_at persisted, fail-loud writes/fail-closed reads, 3 live-PG tests | INDEP verifier (live PG): ACCEPT-w/-followups → CAUGHT a REJECT-level expiry fail-open (lexical timestamp compare) → builder fixed to instant-compare (chrono) + fail-closed-on-parse, regression tests added; found+baselined the S7Denylist machine-token revocation gap (→MR-011) | GREEN (full lints + 3+3 integ + default + workspace) | (this) |
+| MR-008 | Durable revocation + expiry stores (RevocationStore→PG; run-token TTL) | new revocation/run_token_teardown RLS tables, expires_at persisted, fail-loud writes/fail-closed reads, 3 live-PG tests | INDEP verifier (live PG): ACCEPT-w/-followups → CAUGHT a REJECT-level expiry fail-open (lexical timestamp compare) → builder fixed to instant-compare (chrono) + fail-closed-on-parse, regression tests added; found+baselined the S7Denylist machine-token revocation gap (→MR-011) | GREEN (full lints + 3+3 integ + default + workspace) | cf8ed01 |
+| MR-023 | Events durable persistence + serve() (EventsRuntime: PgRelay outbox + NATS + durable dedup) | DurableDedup + EventsRuntime composition root, 3 live PG+NATS tests (0-lost/0-ghost/emit-iff-committed) | INDEP verifier (live PG+NATS): ACCEPT-w/-followups → 0-lost/0-ghost proven (mark-sent only after durable PubAck), dedup fail-direction safe, tenant-predicate exclusion legitimate; FOLLOW-UP: dedup mark not yet co-committed w/ handler state write (latent → MR-009/023b) | GREEN (full lints + 3 integ + default + no-regression + workspace) | (this) |
 
 ## Test environment (verified live 2026-06-26 — every persistence/auth prompt uses this)
 
@@ -65,6 +66,15 @@ green: pg connect, s3 put/get, rebac tuples, outbox→bus relay, valkey cache):
 
 ## Carried-forward obligations for later prompts
 
+- **MR-009 / MR-023b: the durable dedup mark MUST co-commit with the consumer handler's state write.**
+  MR-023's `DurableDedupBacking::mark_handled` commits in its OWN autocommit tx BEFORE the handler runs.
+  Latent today (no production durable consumer with state writes rides this path yet), but the moment MR-009
+  points a real consumer at the durable dedup ledger, a crash between mark-commit and handler-effect =
+  SILENT LOSS. Thread the handler's tx so the mark + the handler state write commit atomically (or use the
+  consume→handle→ack ordering with the mark inside the handler's tx). Documented in dedup.rs/events_durable.rs.
+- **Low-pri check (pre-existing, not MR-023):** snapshot/reindex events use a deterministic FNV-1a
+  `event_id` (not tenant-derived); confirm aggregate keys are globally unique so a cross-tenant consumer
+  replaying snapshots can't dedup-collide. Property of the frozen ledger, unchanged by MR-023.
 - **MR-011 (machine tokens) / MR-009 MUST route `CapabilityAuthenticator` through the durable
   `RevocationStore`.** MR-008 found `S7Denylist` (`machine_auth.rs:347`) is a tenant-less in-memory jti set
   rebuilt empty on construction — a machine-token jti revoked only there RE-VALIDATES after restart (a real
