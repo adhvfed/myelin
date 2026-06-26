@@ -32,11 +32,22 @@
 //! scanner green) is **MR-013 (P-531)**. MR-022 gets the convention right FIRST so the four durable
 //! store MRs (007/008/023/024) bind to it correct-by-construction and MR-013 hardens *policy* on a
 //! sound foundation rather than re-plumbing N stores.
+//!
+//! ## `residency-pin` lint — region pinned OUT-OF-BAND (`@residency-cell-pinned:file`)
+//! [`connect_pool_with_reset`] builds a bounded sqlx pool, which has no native `Region` type to pin
+//! on the construction statement. The region IS pinned: the [`crate::provider::SubstrateProvider`]
+//! that owns this pool carries the cell's `config.region` and threads it here, where it is tagged
+//! onto every connection's `application_name` (`myelin:<region>`) — the same per-session,
+//! out-of-band region-pin posture as [`crate::pg`] and [`crate::oltp`]. The file-level waiver marker
+//! `@residency-cell-pinned:file` records this LOUDLY (EI-01 §4 — named, never a silent skip); it is
+//! NOT a weakening (an unmarked region-less store-open in any caller/application file still fires).
+//! The end-to-end per-pool runtime region fail-fast lands with the rest of MR-013 (P-531).
 
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::{Executor, PgConnection};
 
 use crate::pg::PgError;
@@ -113,8 +124,17 @@ where
 /// (`max_connections`, never unbounded — storage §3.1).
 pub async fn connect_pool_with_reset(
     database_url: &str,
+    region: &str,
     max_connections: u32,
 ) -> Result<PgPool, PgError> {
+    // Pin the pool to its residency `Region` (ADR-11 / residency-pin): there is NO global,
+    // region-less pool. The region is tagged onto every connection's `application_name`
+    // (`myelin:<region>`) so the pool is observably bound to one residency boundary — data cannot
+    // silently leave it, and PG-side observability (pg_stat_activity) shows the residency of each
+    // connection. (Region fail-fast / mTLS hardening is MR-013; this is the construction-site pin.)
+    let opts = PgConnectOptions::from_str(database_url)
+        .map_err(|e| PgError::Connect(e.to_string()))?
+        .application_name(&format!("myelin:{region}"));
     PgPoolOptions::new()
         .max_connections(max_connections.max(1))
         .after_release(|conn, _meta| {
@@ -125,7 +145,7 @@ pub async fn connect_pool_with_reset(
                 Ok(true)
             })
         })
-        .connect(database_url)
+        .connect_with(opts)
         .await
         .map_err(|e| PgError::Connect(e.to_string()))
 }

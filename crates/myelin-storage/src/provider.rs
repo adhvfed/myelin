@@ -115,7 +115,9 @@ impl SubstrateProvider {
     /// [`Self::migrate_foundation`] (+ its own migrations) at startup.
     pub async fn from_env(mode: Mode) -> Result<SubstrateProvider, ProviderError> {
         let config = MyelinConfig::from_env(mode)?;
-        let pool = connect_pool_with_reset(&config.database_url, DEFAULT_MAX_CONNECTIONS).await?;
+        let pool =
+            connect_pool_with_reset(&config.database_url, &config.region, DEFAULT_MAX_CONNECTIONS)
+                .await?;
         Ok(SubstrateProvider { pool, config })
     }
 
@@ -126,7 +128,8 @@ impl SubstrateProvider {
         config: MyelinConfig,
         max_connections: u32,
     ) -> Result<SubstrateProvider, ProviderError> {
-        let pool = connect_pool_with_reset(&config.database_url, max_connections).await?;
+        let pool =
+            connect_pool_with_reset(&config.database_url, &config.region, max_connections).await?;
         Ok(SubstrateProvider { pool, config })
     }
 

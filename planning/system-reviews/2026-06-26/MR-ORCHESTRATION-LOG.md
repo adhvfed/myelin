@@ -7,6 +7,20 @@ and the commit. It is the orchestrator's running memory across the batch. The ca
 project — *the agent that wrote a floor cannot certify it* — is enforced here: every load-bearing or
 security-critical prompt gets an independent verifier agent that never touched the code.
 
+## PROCESS CORRECTION (after MR-007, 2026-06-26)
+
+The gate between prompts MUST include the **full** `cargo test -p myelin-lints` (its `workspace_clean` +
+`ci_gate` tests scan ALL `crates/*/src`), not just `--test production_graph_absence` or a per-crate test.
+MR-005 and MR-022 each introduced a real architecture-lint violation (`make-it-real-scorecard.rs`
+no-host-exec; `tenant_tx.rs` residency-pin) that the narrow tests I ran did not surface — caught only when
+MR-007's builder ran the full suite. Both fixed in commit (post-MR-022): added the scorecard runner to the
+no-host-exec exclusion (same CI-orchestration class as m3–m6, not a weakening) and gave `connect_pool_with_reset`
+a region pin (application_name `myelin:<region>`) + the `@residency-cell-pinned:file` waiver matching `pg.rs`/
+`oltp.rs`. **Gate from now on:** `cargo check --workspace --all-targets` + `cargo test -p myelin-lints` (full) +
+the touched crates' tests + the relevant `--features integration` proof. Also: `cargo check` (which I used for
+the initial baseline) does NOT run tests — the lints suite was already red on main before MR-004 for a different
+reason; always use `cargo test` for the gate.
+
 ## Quality bar (the gate between every prompt)
 
 1. **Anti-duplication first.** Each prompt opens with grep of `planning/07-prompts/` + crates + design

@@ -156,6 +156,14 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // exclusion, reddening the lint-gate; restored here, same code-wins-over-docs re-sync as the m5
     // entry above, EI-01 §1: an earlier-band gate may not stay red under a later band.)
     "myelin-harness/src/bin/m6-scorecard.rs",
+    // The make-it-real spine gate runner (MR-005): same posture as the band-boundary scorecard
+    // runners above — its `Command::new(env!("CARGO"))` (`run_and_capture`) spawns `cargo test` per
+    // spine proof row, the one legitimate host-exec site for this CI/test-support orchestration
+    // binary (it RE-RUNS each proof command live and attests the captured output — the gate's whole
+    // un-fakeable guarantee). NAMED, LOUD exclusion of a single tool file; the lint stays fully live
+    // on every production crate. (Was missing when make-it-real-scorecard.rs landed in MR-005,
+    // reddening the lint-gate; restored here, same re-sync as the m5/m6 entries above, EI-01 §1.)
+    "myelin-harness/src/bin/make-it-real-scorecard.rs",
     // The Myelin self-hosting CI graph runner (the DOGFOOD loop, P-507 / P-S37 → M6): same posture
     // as the band-boundary scorecard runners above — its `Command::new(env!("CARGO"))` spawns
     // `cargo run`/`cargo test`/`cargo mutants` per ratchet job (the twelve lints + the
