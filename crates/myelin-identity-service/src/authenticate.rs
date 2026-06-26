@@ -130,12 +130,44 @@ pub trait CredentialVerifier: Send + Sync {
     fn verify(&self, credential: &Credential) -> myelin_identity::Result<VerifiedAssertion>;
 }
 
-/// **The floor credential verifier (the EI-01 §1 documented deviation).** It parses the frozen
-/// verified-assertion envelope from the credential's opaque [`Credential::material`] — the
-/// structural model of "the IdP verified this credential and asserts these facts". The real
-/// cryptographic verification (signature/attestation) is the named P5/P6 floor; this verifier
-/// proves the AUTHORIZATION-relevant path (tenant-from-credential, subject-key extraction) without
-/// pretending to do crypto it does not.
+/// **The production refuse-not-mock fallback (MR-012).** A [`CredentialVerifier`] that resolves NO
+/// scheme — it REFUSES every credential loudly. It is the production default fallback for
+/// [`crate::oidc::SchemeDispatchVerifier`]: a scheme without a real, config-wired verifier
+/// (OIDC/SAML/WebAuthn/SSH pending their JWKS/trust-anchor/RP config; SCIM, which is a provisioning
+/// seam with no auth verifier at all) routes here and is REFUSED — it NEVER falls back to the mock
+/// [`StructuralVerifier`]. This is the EI-01 §1 honesty boundary made structural: an unwired scheme
+/// resolves no Principal rather than admit a forgeable plaintext envelope. (Census SI-004, MR-012.)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RefuseUnsupportedVerifier;
+
+impl RefuseUnsupportedVerifier {
+    /// A fresh refuse-not-mock fallback.
+    pub fn new() -> RefuseUnsupportedVerifier {
+        RefuseUnsupportedVerifier
+    }
+}
+
+impl CredentialVerifier for RefuseUnsupportedVerifier {
+    fn verify(&self, _credential: &Credential) -> myelin_identity::Result<VerifiedAssertion> {
+        // Refuse loudly — NEVER resolve a Principal through mock crypto. A scheme reaches this
+        // fallback only when no real, config-wired verifier is routed for it (the prod default until
+        // the per-scheme JWKS/trust-anchor/RP config is injected; SCIM has no auth verifier at all).
+        Err(AuthzError::NotYetImplemented(
+            "credential scheme has no production-wired cryptographic verifier yet (refuse-not-mock, \
+             MR-012) — a real verifier (OIDC JWKS / SAML XML-DSig / WebAuthn attestation / SSH \
+             challenge) must be config-wired via SchemeDispatchVerifier::route; SCIM is a \
+             provisioning seam, not an auth credential. The mock StructuralVerifier is a #[cfg(test)] \
+             double and is NEVER the production fallback.",
+        ))
+    }
+}
+
+/// **The floor credential verifier (the EI-01 §1 documented deviation) — a `#[cfg(test)]` TEST-DOUBLE
+/// (MR-012).** It parses the frozen verified-assertion envelope from the credential's opaque
+/// [`Credential::material`] — the structural model of "the IdP verified this credential and asserts
+/// these facts". It is a forgeable plaintext stand-in (no signature to defeat), so MR-012 demoted its
+/// CONSTRUCTION to the test build: the production fallback is [`RefuseUnsupportedVerifier`]
+/// (refuse-not-mock). The type stays available to the unit tests that exercise the resolution body.
 ///
 /// ## The frozen verified-assertion envelope (the floor wire shape)
 /// `material = "<tenant>|<region>|<subject_key>"` — three `|`-separated fields. This is NOT a
@@ -146,7 +178,7 @@ pub trait CredentialVerifier: Send + Sync {
 pub struct StructuralVerifier;
 
 impl StructuralVerifier {
-    /// A fresh floor verifier.
+    /// A fresh floor verifier (a `#[cfg(test)]` test-double — never constructed in production).
     pub fn new() -> StructuralVerifier {
         StructuralVerifier
     }
@@ -282,11 +314,32 @@ pub struct HumanSsoAuthenticator {
 }
 
 impl HumanSsoAuthenticator {
-    /// Build the authenticator over the S1 [`PrincipalStore`] with the floor [`StructuralVerifier`].
-    /// The real cryptographic verifier swaps in via [`Self::with_verifier`] without changing the
-    /// resolution body.
+    /// **TEST-DOUBLE constructor (`#[cfg(test)]`, MR-012).** Builds the authenticator over the S1
+    /// [`PrincipalStore`] with the mock floor [`StructuralVerifier`]. This forgeable-envelope default
+    /// is NOT in the production graph — production builds the real verifier via
+    /// [`Self::production`] / [`Self::with_verifier`] (the `no-structural-crypto-in-prod` scanner
+    /// admits this construction because it is `#[cfg(test)]`-gated).
+    #[cfg(test)]
     pub fn new(store: PrincipalStore) -> HumanSsoAuthenticator {
         HumanSsoAuthenticator::with_verifier(store, Arc::new(StructuralVerifier::new()))
+    }
+
+    /// **The production default (MR-012) — the refuse-not-mock real-verifier dispatch.** Wires the
+    /// real per-scheme [`crate::oidc::SchemeDispatchVerifier`] whose fallback is
+    /// [`RefuseUnsupportedVerifier`]: a scheme with a config-wired real verifier
+    /// (OIDC/SAML/WebAuthn/SSH) routes to it; every other scheme (including SCIM, a provisioning seam
+    /// with no auth verifier, and any scheme whose JWKS/trust-anchor config is not yet injected) is
+    /// REFUSED loudly — it NEVER reaches the mock [`StructuralVerifier`]. The real per-scheme verifiers
+    /// are `.route(...)`-injected from config at the composition boundary; until they are, the prod
+    /// default refuses every credential rather than admit a forgeable plaintext envelope.
+    pub fn production(store: PrincipalStore) -> HumanSsoAuthenticator {
+        use crate::oidc::SchemeDispatchVerifier;
+        HumanSsoAuthenticator::with_verifier(
+            store,
+            Arc::new(SchemeDispatchVerifier::new(Arc::new(
+                RefuseUnsupportedVerifier::new(),
+            ))),
+        )
     }
 
     /// Build the authenticator with an explicit [`CredentialVerifier`] (the seam the real
@@ -884,5 +937,43 @@ mod tests {
             None,
         );
         assert!(matches!(r, Err(AuthzError::FailClosed(_))));
+    }
+
+    /// **THE MR-012 PROD-DEFAULT PROOF: the production authenticator REFUSES a forged credential
+    /// (it is the real refuse-not-mock dispatch, never the mock `StructuralVerifier`).** The mock
+    /// floor would ACCEPT a plaintext `<tenant>|<region>|<subject_key>` envelope (no signature to
+    /// defeat) and resolve a Principal; the production default ([`HumanSsoAuthenticator::production`])
+    /// routes every not-yet-wired scheme — including SCIM — to [`RefuseUnsupportedVerifier`] and
+    /// REFUSES it loudly. A mutation that restored the Structural fallback in the prod default would
+    /// turn this refusal into a fabricated session (the exact mock-crypto shortcut MR-012 removes).
+    #[test]
+    fn production_default_refuses_forged_credential_never_mocks() {
+        let auth = HumanSsoAuthenticator::production(store());
+        // A perfectly well-formed Structural envelope — the mock verifier would HAPPILY parse it and
+        // resolve a Principal. The production default has no real verifier wired for these schemes
+        // yet, so the refuse-not-mock fallback refuses every one (never a forged session).
+        for s in scheme::HUMAN_SSO_SCHEMES {
+            let r = auth.authenticate(
+                &Credential {
+                    scheme: (*s).into(),
+                    material: material("acme", "eu-west", "subj-1"),
+                },
+                None,
+            );
+            assert!(
+                matches!(r, Err(AuthzError::NotYetImplemented(_))),
+                "the production default must REFUSE scheme `{s}` (refuse-not-mock), not resolve a \
+                 forged plaintext envelope through the mock StructuralVerifier"
+            );
+        }
+        // SCIM specifically (a provisioning seam, not an auth verifier) refuses, never mocks.
+        let scim = auth.authenticate(
+            &Credential {
+                scheme: scheme::SCIM.into(),
+                material: material("acme", "eu-west", "ext-7"),
+            },
+            None,
+        );
+        assert!(matches!(scim, Err(AuthzError::NotYetImplemented(_))));
     }
 }

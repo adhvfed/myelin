@@ -194,13 +194,18 @@ fn ci_d10_self_hosted_mint_cannot_mint_cross_tenant() {
             &Timestamp("2026-06-22T00:00:00Z".into()),
         )
         .expect("an own-tenant self-hosted run token mints (the scope bounds, it does not blind)");
+    // MR-012: the minted token is a REAL signed PASETO token; read its grants via the verify
+    // round-trip through the provider's cell trust anchor, not a plaintext substring.
+    let own_authority = svc
+        .introspect_run_token("per_job", &own)
+        .expect("an own-tenant self-hosted token verifies through the real cell trust anchor (MR-012)")
+        .authority;
     assert!(
-        own.token
-            .contains(&format!("{SELFHOSTED_GRANT_PREFIX}acme")),
+        own_authority.holds(&format!("{SELFHOSTED_GRANT_PREFIX}acme")),
         "the minted token carries ONLY the own-tenant SelfHosted grant"
     );
     assert!(
-        !own.token.contains("globex"),
+        !own_authority.grants().any(|g| g.contains("globex")),
         "the minted token never names another tenant's scope"
     );
 
