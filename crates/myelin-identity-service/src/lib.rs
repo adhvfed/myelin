@@ -66,6 +66,7 @@
 //! Identity's migrations so the booting instance is **not-ready until they apply**.
 
 pub mod authenticate;
+pub mod capability_crypto;
 pub mod chat_fragment;
 pub mod check_engine;
 pub mod ci_fragment;
@@ -145,9 +146,13 @@ pub use reverse_index::{
     ReverseIndex, ReverseIndexConsumer, ReverseRow, S8_CONSUMER, S8_HOLDER, S8_TABLE,
 };
 // `StoreBackedCheck` is defined below in this module; re-exported at the crate root for callers.
+pub use capability_crypto::{
+    attenuate, CapabilityMintSpec, CellAnchorSet, CellTokenAuthority, CellTrustAnchor, DpopBinding,
+    DpopClientKey, DpopReplayGuard, PasetoCapabilitySigner, PasetoCapabilityVerifier,
+};
 pub use machine_auth::{
-    Authority, CapabilityAuthenticator, CapabilityToken, MachineKind, S7Denylist,
-    StructuralTokenVerifier, TokenVerifier,
+    Authority, CapabilityAuthenticator, CapabilityToken, MachineKind, StructuralTokenVerifier,
+    TokenVerifier,
 };
 pub use mint::{
     expires_at_of, run_token_jti, MintError, RevocationProof, RunTokenMinter,

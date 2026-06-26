@@ -2504,6 +2504,7 @@ dependencies = [
  "base64",
  "chrono",
  "ciborium",
+ "hmac 0.12.1",
  "myelin-agent",
  "myelin-client",
  "myelin-config",

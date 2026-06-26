@@ -117,6 +117,16 @@ rsa = "0.9"
 sha2 = { workspace = true, features = ["oid"] }
 base64 = "0.22"
 # ------------------------------------------------------------------------------------------
+# MR-011 (SI-002/003, the machine/capability-token slice of P-527): REAL PASETO v4.public
+# capability-token signing/verification + macaroon-style HMAC caveat attenuation + DPoP (RFC 9449).
+# The macaroon caveat chain binds each offline-added narrowing under the PREVIOUS tag, seeded from a
+# cell-held secret (so a holder can EXTEND/attenuate but cannot REMOVE a caveat) → amplification-proof.
+# `hmac` is the vetted RustCrypto HMAC (constant-time `verify_slice`); it is ALREADY in Cargo.lock
+# (transitive); this edge only PROMOTES it to a direct dep — no new crate enters the tree. The
+# Ed25519 sign/verify reuses `ring` (the SAME primitive the OIDC EdDSA + SSH paths already pull);
+# base64url is `base64`; the claims body is `serde_json`. NO hand-rolled signature/MAC math.
+hmac = "0.12"
+# ------------------------------------------------------------------------------------------
 # MR-010b (SI-001/004, the SAML slice of P-526): REAL SAML 2.0 XML-DSig signature verification.
 # `xmlparser` is a NON-EXPANDING, non-validating XML TOKENIZER — it emits DTD/entity tokens rather
 # than expanding them, which is exactly the property the XXE / billion-laughs defence needs (the
