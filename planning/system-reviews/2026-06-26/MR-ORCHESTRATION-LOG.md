@@ -30,7 +30,27 @@ security-critical prompt gets an independent verifier agent that never touched t
 | MR-002 | Census: Git + sandbox seam | 10 findings (5 CRIT) | orch spot-check: firecracker/gvisor/RefStore verified | n/a (read-only) | 2e2b6b1 |
 | MR-003 | Census synthesis → shortcut-inventory.md | 66 deduped (17 CRIT) | orch verified SI-010 + SI-006 against source | n/a (read-only) | b00d536 |
 | MR-004 | Production-graph absence scanners | 3 scanners + 23-entry 2-way ratchet, 153 tests | INDEP verifier: ACCEPT-w/-followups → 4 false-negs found & closed; orch re-checked sites + gate | GREEN (cargo test -p myelin-lints; check workspace) | 0e5a289 |
-| MR-005 | Attested scorecards + red-by-default gate | blake3-attested manifest + make-it-real gate (exit 1, red-by-default), 8 tamper tests | INDEP verifier: ACCEPT-w/-followups → gate NOT gameable (no trust-manifest path; live re-run mandatory); found PRE-EXISTING vacuous-green rows | GREEN (cargo test -p myelin-harness; gate exits 1; check workspace) | (this) |
+| MR-005 | Attested scorecards + red-by-default gate | blake3-attested manifest + make-it-real gate (exit 1, red-by-default), 8 tamper tests | INDEP verifier: ACCEPT-w/-followups → gate NOT gameable (no trust-manifest path; live re-run mandatory); found PRE-EXISTING vacuous-green rows | GREEN (cargo test -p myelin-harness; gate exits 1; check workspace) | 1bd35a8 |
+| MR-006 | Shape/design review | 4 seams SHAPE-OK, 2 RESHAPE (001 sandbox/off-spine, 002 tenant-tx-conn/on-spine→MR-022) | orch verified seam injectors + SandboxHandle + AgentRuntime against source | n/a (read-only) | (this) |
+
+## Shape-review outcomes (MR-006) — binding on later prompts
+
+- **RESHAPE-002 (on the spine critical path) → folded into MR-022.** `SET LOCAL` RLS is a silent no-op on a
+  bare pooled connection with no transaction (standard PG semantics, confirmed). So MR-022 (persistence
+  foundation) must establish the **tenant-scoped-transaction connection convention** (acquire → BEGIN → set
+  tenant/region GUC via `SET LOCAL`/`set_config(...,true)` → use → COMMIT + reset-on-release) BEFORE the four
+  durable-store MRs (007/008/023/024) bind to the wrong pattern. MR-013 then enforces it. Baked into the MR-022
+  prompt + task.
+- **RESHAPE-001 (OFF the spine) → CI track.** `SandboxHandle{guest_id}` + `launch()->Result<SandboxHandle>`
+  cannot carry a command's exit/stdout/stderr/usage; the result/lifecycle seam must be redrawn before P-544
+  (sandbox prod exec). Tracked as a task for the deferred CI long-pole; not a spine blocker.
+- **Confirmed SHAPE-OK (harden behind existing seams, no redraw):** identity authz (`with_verifier`/`with_signer`
+  injectors exist → MR-010/011 drop in, MR-012 removes default), KMS envelope (MR-025 is additive), GDPR
+  tagging→shred→RoPA, and the agent mock→`LlmAgentRuntime` seam (`AgentRuntime::step` clean swap; `EffectApi::apply`
+  is the brain-agnostic governance chokepoint → **binding on MR-021: local Claude over MCP routes through
+  `mint_run_token → EffectApi`, NOT a bare human PAT**, so agent governance is real from day one).
+- **Single-cell dogfood path confirmed clean** through the multi-cell machinery (`DegenerateControlPlane`, shared
+  organs, no fork) — multi-cell stays dormant-but-present, not on the critical path.
 
 ## Decisions & deviations
 
