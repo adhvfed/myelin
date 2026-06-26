@@ -81,12 +81,16 @@ files tell you what's actually *built*; the gap is what to build.
   surface; removes the `Structural*` verifiers from the prod graph; fixes the `set_config(..., false)` bleed.
 - **E0.6 The product/edge API surface.** RECONCILE the existing `serve(AppSpec)` service shells into one coherent
   API the UI/CLI/MCP call. Expose existing contracts; do not invent a parallel API.
-- **E0.7 Frontend-architecture decision + component foundation.** RESOLVE the mismatch first: git's one real UI
-  is server-rendered Rust→HTML, but the design system specs a client-side React + React-Aria stack. Decide one —
-  extend server-rendered Rust→HTML, build a React SPA on the design system, or a hybrid (e.g. server-rendered +
-  islands) — weighing that an agent-operable, fast, simple-to-self-host UI may favour server-rendered, while rich
-  interactivity (editor, board, live chat) may favour React. This is a "frozen shape vs. reality" decision
-  (campaign Stage D) and it **gates every subsystem UI.** Then build the component foundation accordingly.
+- **E0.7 Frontend foundation — DECIDED (2026-06-26).** Client SPA in **SolidJS** + **Tauri 2** (desktop/mobile,
+  sharing a Rust core with Myelin) + **SolidStart** (optional SSR for web auth/first-paint); **React-Aria →
+  Kobalte**. The design manual (direction A "Instrument") is reused: only **Tier 0 was built** (tokens/icons/
+  styleguide/a11y gates — framework-agnostic) and Tiers 1–3 are specs, so adopting Solid discards **no built UI**
+  — it re-targets the unbuilt React stack. Git's server-rendered `web.rs` becomes a **view-model/data source**,
+  not the render path. **Full plan: `08-frontend-foundation.md`.** Deliverables: the Solid design-system package
+  + a "Solid patterns for agents" guide + frontend lint; Tier 1 overlay primitives on Kobalte; Tier 2 shared
+  components (reference-chip / views / block-editor are the hard ones); the SolidStart app shell + Tauri shell;
+  the real-browser (Playwright) test harness (which re-platforms the switch-test from a Rust harness to a real
+  browser test). **Gates every subsystem UI.**
 - **E0.8 The UI shell.** Runnable web-app skeleton (routing, auth, layout) on the component library.
 - **E0.9 The CLI + MCP substrate.** The `myelin` CLI core + MCP server skeleton + the auth/command/tool framework
   each subsystem plugs into — reusing the existing Rust command logic, not re-deriving it.
