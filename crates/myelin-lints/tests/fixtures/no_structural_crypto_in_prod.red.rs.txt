@@ -1,0 +1,10 @@
+//! A production composition root that wires the FLOOR mock-crypto verifier as the default graph.
+//! This is the SI-001..SI-004 shape: the `Structural*` verifier parses a plaintext pipe-delimited
+//! string, so any principal/token is forgeable — and it is constructed in the PRODUCTION graph.
+use std::sync::Arc;
+
+/// Build the human/SSO authenticator over the S1 principal store (the `*_app_spec` default).
+pub fn human_sso_app_spec(store: PrincipalStore) -> HumanSsoAuthenticator {
+    // RED: the `Structural*` mock-crypto verifier is CONSTRUCTED in the production graph.
+    HumanSsoAuthenticator::with_verifier(store, Arc::new(StructuralVerifier::new()))
+}
