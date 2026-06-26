@@ -77,6 +77,15 @@ pub mod collab;
 pub mod comments;
 pub mod compaction;
 pub mod database;
+/// Knowledge's M6 DOGFOOD + the truth-up pass (KN-P34 / P-519, M6): Myelin's OWN roadmap / gap-report /
+/// scorecard live as a Knowledge space ([`dogfood::myelin_knowledge_space`] — every block round-trips
+/// `render(parse(md)) === md` through the ONE render path), the production-hardened surface driven over
+/// Myelin's own work across the PR-context-pane + spec-to-ship faces (REUSING the [`e2e_wedge`] runners —
+/// [`dogfood::run_knowledge_over_myelins_own_work`]), the truth-up pass over the PROVEN KN-D1..KN-D13 + the
+/// E2E slices ([`dogfood::run_knowledge_truth_up_scorecard`] — every row rests on a dated green artifact
+/// whose proof source exists on disk, a vanished row surfaced CLAIMED-NOT-PROVEN), and the
+/// every-incident-adds-a-drill loop ([`dogfood::KnowledgeIncident`]). No new contract; no weakened gate.
+pub mod dogfood;
 /// Knowledge's legs of the whole-system E2E wedge (KN-P33 / P-488, M5): **E2E-1** (the PR context pane
 /// — a Knowledge design-doc embed resolves per-viewer through the SAME [`refs_glue::Projector`] ladder,
 /// 0 title leak to the unauthorized viewer, the tombstone carrying ONLY the root) and **E2E-3** (the
@@ -115,6 +124,15 @@ pub mod search_feed;
 pub mod store;
 pub mod subs;
 pub mod surge;
+/// The Knowledge M6 SWITCH TEST (KN-P34 / P-519, M6): the done-bar's "actually try it" gate (EI-01 §4) —
+/// the editor render leg + the `render(parse(md)) === md` round-trip leg + the reference-chip / tombstone
+/// overlay-contrast leg + the per-viewer tombstone, driven over the real Knowledge surface on the Myelin
+/// self-tenant against the Notion anchor ([`switch_test::KnowledgeSwitchTest::drive`]). 0 walls + 100%
+/// round-trip + every overlay ≥ the design-manual §2 WCAG floor + the render leg within the
+/// thresholds-file budget ⇒ a Notion user could move without hitting a wall the old tool didn't have. The
+/// per-surface browser-drive is recorded HONESTLY (the live `<BlockEditor>` shell + a Playwright drive are
+/// a named floor — the WASM-clean model is driven, see `editor-browser-drive.md`).
+pub mod switch_test;
 pub mod sync_block;
 pub mod transport;
 pub mod yrs_engine;
@@ -141,6 +159,13 @@ pub use database::{
     DbRow, FacetIndexHint, FacetPath, FacetTelemetry, FieldDef, FieldSchema, LoweredViewFilter,
     PageBound, PropertyBag, RelationEdgeEvent, RelationKind, RelationStore, SchemaError, ViewError,
     ViewQuery, FACET_PROMOTION_THRESHOLD,
+};
+pub use dogfood::{
+    myelin_knowledge_space, proven_knowledge_rows, run_knowledge_over_myelins_own_work,
+    run_knowledge_truth_up_scorecard, KnowledgeDogfoodArtifact, KnowledgeIncident,
+    KnowledgeIncidentDrillTicket, KnowledgeIncidentIssueDraft, KnowledgeRowStatus,
+    KnowledgeScorecardEntry, KnowledgeTruthUpPass, KnowledgeTruthUpRed, KnowledgeTruthUpScorecard,
+    KnowledgeTruthUpVerdict, MyelinDoc, ProvenKnowledgeRow, MYELIN_SELF_REGION, MYELIN_SELF_TENANT,
 };
 pub use e2e_wedge::{
     run_e2e1_pr_context_pane, run_e2e3_spec_to_ship_lineage, run_knowledge_e2e_legs, E2eArtifact,
@@ -185,6 +210,11 @@ pub use rebac_fragment::{
 pub use subs::{
     mint_block, mint_heading, register_knowledge_sub_kinds, KNOWLEDGE_OWNED_SUB_KINDS,
     KNOWLEDGE_SUBSYSTEM,
+};
+pub use switch_test::{
+    switch_capability_matrix as knowledge_switch_capability_matrix, switch_surface_drive_record,
+    BrowserDriveStatus, KnowledgeOverlay, KnowledgeSwitchTest, KnowledgeSwitchVerdict,
+    MeasuredLegs, SwitchCapability as KnowledgeSwitchCapability, SwitchSurfaceDrive,
 };
 // The Refs glue (KN-P19 / P-309): the inline-node `refs.edge.created` producer (5.4), the TE-7
 // typed-edge mirror (5.5), and the `project(ref, viewer)` 4-step tombstone ladder (5.6 / 5.7). The
