@@ -112,18 +112,26 @@ fn admin_url(cfg: &MyelinConfig) -> String {
         .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
 
+/// A raw admin/owner pool for test-only DDL + cleanup SQL. MR-013 removed `PgStore::pool()` (the
+/// bare tenant-bypassing hatch); the test harness builds its OWN admin pool from the admin URL for
+/// throwaway-row cleanup — this is test infrastructure, NOT the tenant store handing out its pool.
+async fn admin_pool(cfg: &MyelinConfig) -> sqlx::PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&admin_url(cfg))
+        .await
+        .expect("connect admin pool (is the stack up?)")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_oltp_connect_and_select() {
     let cfg = MyelinConfig::dev();
     let store = PgStore::connect(&admin_url(&cfg), &cfg.region, 2)
         .await
         .expect("connect Postgres (is the stack up?)");
-    // A trivial OLTP select through the pool proves reachability.
-    let one: i32 = sqlx::query_scalar("SELECT 1")
-        .fetch_one(store.pool())
-        .await
-        .expect("select 1");
-    assert_eq!(one, 1);
+    // The OLTP-reachability probe — through the scoped health helper that replaced the bare
+    // `pool()` hatch (MR-013). A successful `SELECT 1` proves the tier answers.
+    store.health_check().await.expect("OLTP health check");
 }
 
 // ---- PgStore: the ReBAC tuple store, RLS-scoped --------------------------------------------
@@ -161,10 +169,11 @@ async fn pg_rebac_tuple_store_reverse_index() {
         .expect("reverse index");
     assert_eq!(objs, vec!["doc1".to_string(), "doc2".to_string()]);
 
-    // Cleanup this run's rows (RLS-scoped delete via the same session GUCs the store sets).
+    // Cleanup this run's rows (best-effort, via the admin/owner pool).
+    let pool = admin_pool(&cfg).await;
     sqlx::query("DELETE FROM rebac_tuple WHERE tenant_id = $1")
         .bind(&tenant)
-        .execute(store.pool())
+        .execute(&pool)
         .await
         .ok();
 }
@@ -243,9 +252,10 @@ async fn pg_outbox_relay_drains_to_bus() {
     assert_eq!(n2, 0, "already-published rows are not re-claimed");
 
     // Cleanup this run's rows.
+    let pool = admin_pool(&cfg).await;
     sqlx::query("DELETE FROM outbox WHERE aggregate = $1")
         .bind(&agg)
-        .execute(store.pool())
+        .execute(&pool)
         .await
         .ok();
 }

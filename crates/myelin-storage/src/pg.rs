@@ -17,9 +17,11 @@
 //!   build never needs a live DB (no `query!` compile-time macro anywhere).
 //! - [`PgStore::put_tuple`] / [`PgStore::reverse_index`] — the ReBAC tuple store: write an
 //!   `object#relation@subject` edge in a `(tenant, region)` partition, and resolve the S8
-//!   reverse-index lookup ("objects where subject has relation"). The session GUCs
-//!   `myelin.tenant_id` / `myelin.region` are set per connection so the DB RLS policy isolates
-//!   tenants — a wrong-tenant session structurally cannot read another tenant's tuples.
+//!   reverse-index lookup ("objects where subject has relation"). The `(tenant, region)` GUCs
+//!   `myelin.tenant_id` / `myelin.region` are set TRANSACTION-scoped (`set_config(..., true)`, the
+//!   MR-022 [`crate::tenant_tx::with_tenant_tx`] convention) so the DB RLS policy isolates tenants —
+//!   a wrong-tenant transaction structurally cannot read another tenant's tuples, and the GUC is
+//!   discarded at COMMIT so NO tenant identity bleeds across a pooled checkout (the SI-005 fix).
 //! - [`PgStore::relay`] → [`crate::pgrelay::PgRelay`] — the outbox + relay: an outbox row is
 //!   inserted (the envelope as JSONB), and the relay CLAIMS unsent rows with
 //!   `SELECT … FOR UPDATE SKIP LOCKED` (no double-claim across replicas), publishes them to a
@@ -34,15 +36,18 @@
 //! pg-init `myelin_make_tenant_scoped` helper). So a cross-tenant read is refused by Postgres,
 //! not merely by app code — the IDOR floor lives in the database (storage.md §1.1).
 //!
-//! ## `residency-pin` lint — region pinned PER SESSION (`@residency-cell-pinned:file`)
-//! The same NAMED floor `oltp.rs` / `coloc.rs` record: [`PgStore`] carries its `Region` and
-//! sets `myelin.region` on EVERY session ([`PgStore::set_session_scope`]) so every tuple
-//! read/write is `(tenant, region)`-scoped — but the bounded sqlx pool itself
-//! ([`PgStore::connect`]) is opened region-AGNOSTIC (the region is a runtime value, not a
-//! per-pool pin). A per-POOL runtime region-pin is the end-to-end STOR-D5 gate
-//! (P-ST-15 / P-102). The file-level waiver marker `@residency-cell-pinned:file` records this
-//! floor LOUDLY (EI-01 §4 — named, never a silent skip), exactly as the OLTP floor does; the
-//! `(tenant, region)` predicate the RLS policy enforces is the real residency boundary here.
+//! ## `residency-pin` lint — region pinned PER TRANSACTION + fail-fast (`@residency-cell-pinned:file`)
+//! The same NAMED floor `oltp.rs` / `coloc.rs` record: [`PgStore`] carries its `Region` and sets
+//! `myelin.region` TRANSACTION-scoped on every tenant op (the `with_tenant_tx` convention) so every
+//! tuple read/write is `(tenant, region)`-scoped. MR-013 adds **region fail-fast**: [`PgStore::connect`]
+//! REFUSES a blank region (no region-less pool is ever opened) and every tenant-scoped entry point
+//! re-checks (belt-and-suspenders), and the pool is now built through
+//! [`crate::tenant_tx::connect_pool_with_reset`] so each connection is tagged
+//! `application_name = myelin:<region>` and scrubbed with `RESET ALL` on release. The mTLS half of
+//! the region pin (peer-cert ⇄ region binding) genuinely belongs to the runtime transport layer and
+//! is deferred there. The file-level waiver marker `@residency-cell-pinned:file` records this floor
+//! LOUDLY (EI-01 §4 — named, never a silent skip); the `(tenant, region)` predicate the RLS policy
+//! enforces is the real residency boundary here.
 //!
 //! ## `no-raw-publish` — the broker publish is isolated to [`crate::pgrelay`]
 //! This file carries NO `bus.put(...)`: the relay (the ONE legitimate broker-publish component,
@@ -50,7 +55,7 @@
 //! that one relay file (the same posture `myelin-events/src/relay.rs` has). `pg.rs` is the OLTP
 //! client + the tenant-store, fully subject to the `tenant-predicate` IDOR lint.
 
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::PgPool;
 use sqlx::Row;
 
 /// The relation-tuple table DDL — the frozen ⟨object#relation@subject⟩ shape, `(tenant, region)`
@@ -126,11 +131,28 @@ impl PgStore {
         region: &str,
         max_connections: u32,
     ) -> Result<PgStore, PgError> {
-        let pool = PgPoolOptions::new()
-            .max_connections(max_connections.max(1))
-            .connect(database_url)
-            .await
-            .map_err(|e| PgError::Connect(e.to_string()))?;
+        // **Region fail-fast (residency pin; P-531 / STOR-D5).** A blank region is never a valid
+        // residency boundary — refuse it LOUDLY at construction rather than open a region-less pool
+        // whose every tenant-scoped op would silently run with an empty `myelin.region` GUC (an op
+        // that matches nothing, or — worse, if the policy were ever relaxed — everything). The mTLS
+        // half of the region pin (peer-cert ⇄ region binding) genuinely belongs to the runtime
+        // transport layer and is deferred there; this is the cheap, real, in-process part.
+        if region.trim().is_empty() {
+            return Err(PgError::Connect(
+                "region pin is empty — refusing to open a region-less OLTP pool (residency \
+                 fail-fast, P-531 / STOR-D5)"
+                    .to_string(),
+            ));
+        }
+        // Build the bounded pool through the MR-022 reset-on-release helper
+        // ([`crate::tenant_tx::connect_pool_with_reset`]): every connection is tagged with its
+        // residency region (`application_name = myelin:<region>`) and scrubbed with `RESET ALL` on
+        // release (defence-in-depth against any session GUC residue). Combined with the
+        // TRANSACTION-scoped `(tenant, region)` GUC every tenant op now sets (the MR-022
+        // `with_tenant_tx` convention), no tenant identity can bleed across a pooled checkout — the
+        // structural SI-005 fix MR-013 lands.
+        let pool =
+            crate::tenant_tx::connect_pool_with_reset(database_url, region, max_connections).await?;
         Ok(PgStore {
             pool,
             region: region.to_string(),
@@ -146,9 +168,42 @@ impl PgStore {
         self.authz_queries.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// The underlying bounded pool (for the OLTP-reachability smoke check).
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
+    /// **OLTP-reachability health check (the SI-005 replacement for the former bare `pool()` hatch).**
+    /// Runs a trivial `SELECT 1` over the bounded pool and returns `Ok(())` iff the OLTP tier answers
+    /// — the reachability probe the smoke check needs WITHOUT handing out the raw `&PgPool`. The old
+    /// `pub fn pool(&self) -> &PgPool` let any caller `.acquire()` a connection that bypassed the
+    /// tenant-scoped RLS path (the bare-hatch leg of census SI-005); it is GONE. Every tenant op
+    /// routes through the `(tenant, region)` transaction-scoped convention
+    /// ([`crate::tenant_tx::with_tenant_tx`] / [`Self::scoped_conn`]); there is deliberately no
+    /// raw-pool accessor on this tenant store.
+    pub async fn health_check(&self) -> Result<(), PgError> {
+        use sqlx::Connection;
+        // A server round-trip liveness PING (not a query-builder call) — proves the OLTP tier
+        // answers WITHOUT issuing any tenant-store query, so the `tenant-predicate` IDOR floor stays
+        // fully live over pg.rs (a `SELECT 1` here would be a tenant-less query the floor rejects).
+        // The connection touches no tenant data and returns to the pool scrubbed (reset-on-release).
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        conn.ping()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Region fail-fast for a tenant-scoped op (residency pin; P-531 / STOR-D5). `connect` already
+    /// refuses a blank `self.region`, so this is belt-and-suspenders: an op never runs region-less.
+    fn ensure_region(&self) -> Result<(), PgError> {
+        if self.region.trim().is_empty() {
+            return Err(PgError::Query(
+                "region pin is empty — refusing a region-less tenant-scoped op (residency \
+                 fail-fast, P-531 / STOR-D5)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Run the forward-only migrations against PG: the RLS convention helper (re-asserted
@@ -205,25 +260,31 @@ impl PgStore {
         relation: &str,
         subject: &str,
     ) -> Result<(), PgError> {
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| PgError::Query(e.to_string()))?;
-        self.set_session_scope(&mut conn, tenant).await?;
-        sqlx::query(
-            "INSERT INTO rebac_tuple (tenant_id, region, object_id, relation, subject) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
-        )
-        .bind(tenant)
-        .bind(&self.region)
-        .bind(object_id)
-        .bind(relation)
-        .bind(subject)
-        .execute(&mut *conn)
+        self.ensure_region()?;
+        let region = self.region.clone();
+        let (tenant_owned, object_id, relation, subject) = (
+            tenant.to_string(),
+            object_id.to_string(),
+            relation.to_string(),
+            subject.to_string(),
+        );
+        // Route through the MR-022 convention: acquire → BEGIN → SET LOCAL `(tenant, region)` →
+        // INSERT → COMMIT. The GUC is transaction-scoped, so it is discarded on commit and no tenant
+        // identity bleeds onto the returned pooled connection (the SI-005 fix).
+        crate::tenant_tx::with_tenant_tx(&self.pool, tenant, &self.region, move |conn| {
+            Box::pin(async move {
+                Self::insert_tuple_on_conn(
+                    conn,
+                    &tenant_owned,
+                    &region,
+                    &object_id,
+                    &relation,
+                    &subject,
+                )
+                .await
+            })
+        })
         .await
-        .map_err(|e| PgError::Query(e.to_string()))?;
-        Ok(())
     }
 
     /// **The residency write-boundary probe (P-CP-12 / CP-D3 / STOR-D5 — layer 3 at the LIVE DB).**
@@ -248,28 +309,37 @@ impl PgStore {
         relation: &str,
         subject: &str,
     ) -> Result<(), PgError> {
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| PgError::Query(e.to_string()))?;
-        // The session (the cell) is pinned to self.region; the ROW carries row_region. When they
-        // differ, the RLS WITH CHECK predicate `region = current_setting('myelin.region')` fails
-        // and Postgres refuses the INSERT (a 42501 / row-violates-policy error).
-        self.set_session_scope(&mut conn, tenant).await?;
-        sqlx::query(
-            "INSERT INTO rebac_tuple (tenant_id, region, object_id, relation, subject) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
-        )
-        .bind(tenant)
-        .bind(row_region)
-        .bind(object_id)
-        .bind(relation)
-        .bind(subject)
-        .execute(&mut *conn)
+        self.ensure_region()?;
+        let (tenant_owned, row_region, object_id, relation, subject) = (
+            tenant.to_string(),
+            row_region.to_string(),
+            object_id.to_string(),
+            relation.to_string(),
+            subject.to_string(),
+        );
+        // The cell SESSION is pinned to self.region (the transaction-scoped GUC); the ROW carries
+        // row_region. When they differ, the RLS `WITH CHECK (region = current_setting('myelin.region',
+        // true))` predicate fails and Postgres refuses the INSERT (a 42501 / row-violates-policy
+        // error) — the op returns Err and the transaction rolls back. Now TRANSACTION-scoped: no
+        // session GUC bleed.
+        crate::tenant_tx::with_tenant_tx(&self.pool, tenant, &self.region, move |conn| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO rebac_tuple (tenant_id, region, object_id, relation, subject) \
+                     VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+                )
+                .bind(&tenant_owned)
+                .bind(&row_region)
+                .bind(&object_id)
+                .bind(&relation)
+                .bind(&subject)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| PgError::Query(e.to_string()))?;
+                Ok(())
+            })
+        })
         .await
-        .map_err(|e| PgError::Query(e.to_string()))?;
-        Ok(())
     }
 
     /// The S8 reverse-index lookup the authz path uses: the objects where `subject` has
@@ -281,32 +351,34 @@ impl PgStore {
         subject: &str,
         relation: &str,
     ) -> Result<Vec<String>, PgError> {
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| PgError::Query(e.to_string()))?;
-        self.set_session_scope(&mut conn, tenant).await?;
+        self.ensure_region()?;
         // Defence in depth: the DB RLS policy already isolates `(tenant_id, region)`, AND the
         // query threads an explicit `tenant_id` predicate (the tenant-predicate IDOR floor — a
         // tenant-store query must carry the tenant predicate in the query itself, not rely on
         // RLS alone). The tenant is the VERIFIED arg, never a URL path.
         self.authz_queries
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let rows = sqlx::query(
-            "SELECT object_id FROM rebac_tuple \
-             WHERE tenant_id = $1 AND subject = $2 AND relation = $3 ORDER BY object_id",
-        )
-        .bind(tenant)
-        .bind(subject)
-        .bind(relation)
-        .fetch_all(&mut *conn)
+        let (tenant_owned, subject, relation) =
+            (tenant.to_string(), subject.to_string(), relation.to_string());
+        crate::tenant_tx::with_tenant_tx(&self.pool, tenant, &self.region, move |conn| {
+            Box::pin(async move {
+                let rows = sqlx::query(
+                    "SELECT object_id FROM rebac_tuple \
+                     WHERE tenant_id = $1 AND subject = $2 AND relation = $3 ORDER BY object_id",
+                )
+                .bind(&tenant_owned)
+                .bind(&subject)
+                .bind(&relation)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(|e| PgError::Query(e.to_string()))?;
+                Ok(rows
+                    .iter()
+                    .map(|r| r.get::<String, _>("object_id"))
+                    .collect())
+            })
+        })
         .await
-        .map_err(|e| PgError::Query(e.to_string()))?;
-        Ok(rows
-            .iter()
-            .map(|r| r.get::<String, _>("object_id"))
-            .collect())
     }
 
     /// **check (contract 4.2) — the per-action fail-closed gate, one tuple existence query.**
@@ -321,26 +393,32 @@ impl PgStore {
         relation: &str,
         subject: &str,
     ) -> Result<bool, PgError> {
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| PgError::Query(e.to_string()))?;
-        self.set_session_scope(&mut conn, tenant).await?;
+        self.ensure_region()?;
         self.authz_queries
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM rebac_tuple \
-             WHERE tenant_id = $1 AND object_id = $2 AND relation = $3 AND subject = $4)",
-        )
-        .bind(tenant)
-        .bind(object_id)
-        .bind(relation)
-        .bind(subject)
-        .fetch_one(&mut *conn)
+        let (tenant_owned, object_id, relation, subject) = (
+            tenant.to_string(),
+            object_id.to_string(),
+            relation.to_string(),
+            subject.to_string(),
+        );
+        crate::tenant_tx::with_tenant_tx(&self.pool, tenant, &self.region, move |conn| {
+            Box::pin(async move {
+                let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM rebac_tuple \
+                     WHERE tenant_id = $1 AND object_id = $2 AND relation = $3 AND subject = $4)",
+                )
+                .bind(&tenant_owned)
+                .bind(&object_id)
+                .bind(&relation)
+                .bind(&subject)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| PgError::Query(e.to_string()))?;
+                Ok(exists)
+            })
+        })
         .await
-        .map_err(|e| PgError::Query(e.to_string()))?;
-        Ok(exists)
     }
 
     /// **list_objects (contract 4.3) — the leak-free pre-filter, ONE reverse-index query.**
@@ -364,78 +442,61 @@ impl PgStore {
         self.reverse_index(tenant, subject, relation).await
     }
 
-    /// **RLS-scoped connection (stage-3 (TENANT,REGION)-RLS-ISOLATION drill).** Acquire a pooled
-    /// connection and set its session `(tenant, region)` scope to `acting_tenant`, then hand it
-    /// back so the caller can run reads under THAT scope. The RLS-isolation drill uses this to run
-    /// a deliberately tenant-predicate-LESS `SELECT *` and prove the DB's FORCE-RLS policy — not
-    /// app code — filters out every other tenant's rows. The unscoped probe query itself lives in
-    /// the test (under `/tests/`, the home for deliberate red/probe samples) so `pg.rs` keeps every
-    /// tenant-store query tenant-bound (the `tenant-predicate` IDOR lint stays fully live here).
+    /// **RLS-scoped tenant TRANSACTION (stage-3 (TENANT,REGION)-RLS-ISOLATION drill).** Open a
+    /// transaction on a pooled connection and set its `(tenant, region)` GUC TRANSACTION-scoped
+    /// (`set_config(..., true)` — the MR-022 convention), then hand the transaction back so the
+    /// caller can run reads under THAT scope. The RLS-isolation drill uses this to run a deliberately
+    /// tenant-predicate-LESS `SELECT *` and prove the DB's FORCE-RLS policy — not app code — filters
+    /// out every other tenant's rows. Because the GUC is transaction-scoped it is discarded at
+    /// commit/rollback (when the returned tx is dropped) — NO residual tenant identity bleeds onto
+    /// the pooled connection (the SI-005 fix; the former session-scoped `scoped_conn` WAS the bleed).
+    /// The unscoped probe query itself lives in the test (under `/tests/`, the home for deliberate
+    /// red/probe samples) so `pg.rs` keeps every tenant-store query tenant-bound (the
+    /// `tenant-predicate` IDOR lint stays fully live here). A read transaction needs no commit (drop
+    /// = rollback); a caller that mutated must `tx.commit().await`.
     pub async fn scoped_conn(
         &self,
         acting_tenant: &str,
-    ) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>, PgError> {
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| PgError::Query(e.to_string()))?;
-        self.set_session_scope(&mut conn, acting_tenant).await?;
-        Ok(conn)
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, PgError> {
+        self.scoped_conn_in_region(acting_tenant, &self.region).await
     }
 
-    /// Set the per-session `(tenant, region)` GUCs the RLS policy keys on. The tenant is the
-    /// VERIFIED tenant (never a URL path) — the IDOR floor: a session for tenant A can only ever
-    /// read tenant A's rows because the policy compares `tenant_id = current_setting(...)`.
-    async fn set_session_scope(
-        &self,
-        conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
-        tenant: &str,
-    ) -> Result<(), PgError> {
-        self.set_session_scope_in_region(conn, tenant, &self.region)
-            .await
-    }
-
-    /// Set the `(tenant, region)` session GUCs to an EXPLICIT region (a test-support seam for the
-    /// P-CP-12 / STOR-D5 cross-region-egress drill). The production path
-    /// ([`Self::set_session_scope`]) always pins `self.region` — the cell's region the harness
-    /// injected — so a production session is structurally in-region. This decoupled variant lets the
-    /// drill scope a session to a DIFFERENT region than the tenant's rows and PROVE the DB's RLS
-    /// `(tenant, region)` policy returns ZERO of them (cross-region read is impossible).
-    async fn set_session_scope_in_region(
-        &self,
-        conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
-        tenant: &str,
-        region: &str,
-    ) -> Result<(), PgError> {
-        // Set BOTH the tenant_id and region GUCs in ONE statement (one round trip) so the RLS
-        // policy's `(tenant_id, region)` predicate is keyed before any tenant query runs.
-        sqlx::query("SELECT set_config('myelin.tenant_id', $1, false), set_config('myelin.region', $2, false)")
-            .bind(tenant)
-            .bind(region)
-            .execute(&mut **conn)
-            .await
-            .map_err(|e| PgError::Query(e.to_string()))?;
-        Ok(())
-    }
-
-    /// **A connection scoped to an EXPLICIT `(tenant, region)` (P-CP-12 / STOR-D5 drill seam).** Like
-    /// [`Self::scoped_conn`] but pins the session to `region` instead of the cell's `self.region`.
-    /// The drill uses this to read as a session in a region DIFFERENT from the tenant's rows and
-    /// prove the DB returns 0 of them (cross-region read impossible).
+    /// **A tenant TRANSACTION scoped to an EXPLICIT `(tenant, region)` (P-CP-12 / STOR-D5 drill seam).**
+    /// Like [`Self::scoped_conn`] but pins the transaction GUC to `region` instead of the cell's
+    /// `self.region`. The drill uses this to read as a session in a region DIFFERENT from the
+    /// tenant's rows and prove the DB returns 0 of them (cross-region read impossible). The
+    /// `(tenant, region)` GUC is set TRANSACTION-scoped (`set_config(..., true)`) so it is discarded
+    /// at commit/rollback — no session bleed. An empty `region` is refused LOUDLY (residency
+    /// fail-fast; P-531 / STOR-D5).
     pub async fn scoped_conn_in_region(
         &self,
         acting_tenant: &str,
         region: &str,
-    ) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>, PgError> {
-        let mut conn = self
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, PgError> {
+        if region.trim().is_empty() {
+            return Err(PgError::Query(
+                "region pin is empty — refusing a region-less tenant-scoped transaction \
+                 (residency fail-fast, P-531 / STOR-D5)"
+                    .to_string(),
+            ));
+        }
+        let mut tx = self
             .pool
-            .acquire()
+            .begin()
             .await
-            .map_err(|e| PgError::Query(e.to_string()))?;
-        self.set_session_scope_in_region(&mut conn, acting_tenant, region)
-            .await?;
-        Ok(conn)
+            .map_err(|e| PgError::Query(format!("begin tenant-scoped transaction: {e}")))?;
+        // Set BOTH GUCs in ONE round trip, TRANSACTION-scoped (is_local = true): they live only for
+        // this transaction and are discarded at COMMIT/ROLLBACK — the RLS policy's `(tenant, region)`
+        // predicate is keyed before any tenant query runs, with no residual scope on the pooled conn.
+        sqlx::query(
+            "SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)",
+        )
+        .bind(acting_tenant)
+        .bind(region)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| PgError::Query(format!("set transaction-scoped tenant GUC: {e}")))?;
+        Ok(tx)
     }
 
     /// **The reverse-index lookup under an EXPLICIT region session (P-CP-12 / STOR-D5 drill seam).**
@@ -449,32 +510,39 @@ impl PgStore {
         subject: &str,
         relation: &str,
     ) -> Result<Vec<String>, PgError> {
-        use sqlx::Row;
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| PgError::Query(e.to_string()))?;
-        self.set_session_scope_in_region(&mut conn, tenant, region)
-            .await?;
+        if region.trim().is_empty() {
+            return Err(PgError::Query(
+                "region pin is empty — refusing a region-less tenant-scoped read (residency \
+                 fail-fast, P-531 / STOR-D5)"
+                    .to_string(),
+            ));
+        }
         self.authz_queries
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // The query threads the tenant predicate (defence in depth); the REGION is enforced by the
-        // RLS policy keyed on current_setting('myelin.region') — which we set to `region` above.
-        let rows = sqlx::query(
-            "SELECT object_id FROM rebac_tuple \
-             WHERE tenant_id = $1 AND subject = $2 AND relation = $3 ORDER BY object_id",
-        )
-        .bind(tenant)
-        .bind(subject)
-        .bind(relation)
-        .fetch_all(&mut *conn)
+        // RLS policy keyed on current_setting('myelin.region', true) — set TRANSACTION-scoped to
+        // `region` by the convention. No session GUC bleed.
+        let (tenant_owned, subject, relation) =
+            (tenant.to_string(), subject.to_string(), relation.to_string());
+        crate::tenant_tx::with_tenant_tx(&self.pool, tenant, region, move |conn| {
+            Box::pin(async move {
+                let rows = sqlx::query(
+                    "SELECT object_id FROM rebac_tuple \
+                     WHERE tenant_id = $1 AND subject = $2 AND relation = $3 ORDER BY object_id",
+                )
+                .bind(&tenant_owned)
+                .bind(&subject)
+                .bind(&relation)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(|e| PgError::Query(e.to_string()))?;
+                Ok(rows
+                    .iter()
+                    .map(|r| r.get::<String, _>("object_id"))
+                    .collect())
+            })
+        })
         .await
-        .map_err(|e| PgError::Query(e.to_string()))?;
-        Ok(rows
-            .iter()
-            .map(|r| r.get::<String, _>("object_id"))
-            .collect())
     }
 
     // ---- Outbox + relay (the real FOR UPDATE SKIP LOCKED claim) -----------------------------

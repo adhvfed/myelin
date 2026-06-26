@@ -110,9 +110,18 @@
 //! A future "we made the bus / control-plane durable" claim is therefore only PARTIALLY gated until
 //! that MR extends the scanner — this note exists so that gap is not silently relied upon.
 //!
-//! ### `no-bare-tenant-pool` (2) — removed by MR-013 (P-531)
-//! - `myelin-storage/src/pg.rs:413` — session-scoped `set_config('myelin.tenant_id', $1, false)` (SI-005)
-//! - `myelin-storage/src/pg.rs:150` — bare raw-pool hatch `PgStore::pool() -> &PgPool` (SI-005)
+//! ### `no-bare-tenant-pool` (0) — MR-013 (P-531) flipped BOTH sites GREEN (census SI-005 closed)
+//! The two former entries are REMOVED (the ratchet tightened 19 → 17):
+//! - `myelin-storage/src/pg.rs:413` — session-scoped `set_config('myelin.tenant_id', $1, false)` —
+//!   GONE. The PgStore tenant path (`put_tuple`/`reverse_index`/`check_tuple`/`list_objects` +
+//!   `scoped_conn`/`*_in_region`) now sets the `(tenant, region)` GUC TRANSACTION-scoped
+//!   (`set_config(.., true)`) via the MR-022 `with_tenant_tx` convention, so the GUC is discarded at
+//!   COMMIT and NO tenant identity bleeds across a pooled checkout. `PgStore::connect` now builds the
+//!   pool through `connect_pool_with_reset` (reset-on-release + region `application_name`).
+//! - `myelin-storage/src/pg.rs:150` — bare raw-pool hatch `PgStore::pool() -> &PgPool` — GONE,
+//!   replaced by `PgStore::health_check()` (the OLTP-reachability `SELECT 1` probe that does NOT hand
+//!   out the raw pool). The integration tests build their OWN admin pool for throwaway-row cleanup
+//!   (test infrastructure, not the tenant store handing out its pool). No named exclusion was needed.
 
 use myelin_lints::production_graph::{
     no_bare_tenant_pool, no_in_memory_durable_store, no_structural_crypto_in_prod,
@@ -423,17 +432,13 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-control-plane/src/placement_of.rs",
         223,
     ),
-    // ---- no-bare-tenant-pool (2) — MR-013 (P-531) ----
-    (
-        "no-bare-tenant-pool",
-        "crates/myelin-storage/src/pg.rs",
-        150,
-    ),
-    (
-        "no-bare-tenant-pool",
-        "crates/myelin-storage/src/pg.rs",
-        413,
-    ),
+    // ---- no-bare-tenant-pool (0) — MR-013 (P-531) flipped BOTH sites GREEN ----
+    // The two former entries (pg.rs:150 bare `pool() -> &PgPool` hatch, pg.rs:413 session-scoped
+    // `set_config('myelin.tenant_id', $1, false)`) are GONE: MR-013 transaction-scoped the PgStore
+    // tenant path through the MR-022 `with_tenant_tx` convention (`set_config(.., true)` inside a tx,
+    // reset-on-release pool) and replaced the bare pool hatch with `PgStore::health_check()`. The
+    // `no-bare-tenant-pool` scanner is now GREEN over the production tree (census SI-005 closed). No
+    // named exclusion was needed — a real tenant store does not dodge the lint.
 ];
 
 fn workspace_root() -> PathBuf {
@@ -512,9 +517,10 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
     // un-wired gate). The counts pin the manifest shape.
     assert_eq!(
         BASELINE.len(),
-        19,
-        "the committed baseline has 19 entries (MR-012 flipped the 4 identity structural sites GREEN: \
-         23 → 19)"
+        17,
+        "the committed baseline has 17 entries (MR-013 flipped the 2 no-bare-tenant-pool sites GREEN: \
+         19 → 17 — pg.rs's session-scoped set_config(.., false) is now transaction-scoped and the \
+         bare pool() hatch is removed)"
     );
     let structural = BASELINE
         .iter()
@@ -545,7 +551,14 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          standalone tenant-less stub is deleted, not supplemented (17→16). The remaining present-not- \
          removed sites flip when MR-009 wires with_pg as the default."
     );
-    assert_eq!(bare_pool, 2, "2 bare-tenant-pool sites");
+    assert_eq!(
+        bare_pool, 0,
+        "0 bare-tenant-pool sites: MR-013 (P-531) closed both legs of census SI-005 — pg.rs's \
+         session-scoped `set_config(<tenant GUC>, .., false)` is now TRANSACTION-scoped via the \
+         MR-022 `with_tenant_tx` convention (no cross-checkout bleed), and the bare \
+         `PgStore::pool() -> &PgPool` hatch is REMOVED (replaced by `health_check()`). The scanner \
+         is GREEN over the production tree."
+    );
     // The census-named anchor sites are present (the prompt's hard requirements).
     let has = |s: &str, p: &str, l: usize| BASELINE.contains(&(s, p, l));
     // MR-012 flipped the former auth-spine anchor (authenticate.rs:289) GREEN; the surviving
@@ -568,8 +581,10 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
         "authenticate.rs:289 was flipped GREEN by MR-012 and must NOT remain in the baseline"
     );
     assert!(
-        has("no-bare-tenant-pool", "crates/myelin-storage/src/pg.rs", 413),
-        "anchor pg.rs:413 must be in the baseline"
+        !has("no-bare-tenant-pool", "crates/myelin-storage/src/pg.rs", 413)
+            && !has("no-bare-tenant-pool", "crates/myelin-storage/src/pg.rs", 150),
+        "the former anchors pg.rs:413 (session-scoped set_config) + pg.rs:150 (bare pool() hatch) \
+         were flipped GREEN by MR-013 and must NOT remain in the baseline (the ratchet tightened)"
     );
 }
 

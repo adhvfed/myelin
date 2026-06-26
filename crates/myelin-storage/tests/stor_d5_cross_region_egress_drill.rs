@@ -158,7 +158,8 @@ async fn stor_d5_cross_region_egress_impossible() {
         visible_from_fr.len()
     );
 
-    // cleanup (admin, scoped to fr-par so the RLS DELETE policy admits it).
+    // cleanup (admin, scoped to fr-par so the RLS DELETE policy admits it). `scoped_conn` now
+    // returns a tenant-scoped TRANSACTION (MR-013) — commit it so the DELETE actually lands.
     let mut conn = store
         .scoped_conn(&tenant)
         .await
@@ -168,4 +169,5 @@ async fn stor_d5_cross_region_egress_impossible() {
         .execute(&mut *conn)
         .await
         .ok();
+    conn.commit().await.ok();
 }

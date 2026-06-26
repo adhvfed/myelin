@@ -352,12 +352,23 @@ async fn c_tenant_tx_isolates_and_does_not_bleed() {
          a session-scoped set_config(.., false) would BLEED here"
     );
 
-    // cleanup (via the admin/owner pool — a bare app-role DELETE outside a tenant tx matches no
-    // rows under RLS, by design).
-    let _ = sqlx::query("DELETE FROM rebac_tuple WHERE object_id = $1")
-        .bind(&obj)
-        .execute(store.pool())
-        .await;
+    // cleanup: delete tenant A's seeded row THROUGH the convention (acquire → BEGIN → SET LOCAL
+    // (A, region) → DELETE → COMMIT) so the RLS policy admits the delete. (MR-013 removed the bare
+    // `PgStore::pool()` hatch; the durable path is the tenant-scoped transaction.)
+    let _ = with_tenant_tx(&pool, &tenant_a, &region, {
+        let o = obj.clone();
+        move |conn| {
+            Box::pin(async move {
+                sqlx::query("DELETE FROM rebac_tuple WHERE object_id = $1")
+                    .bind(&o)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| myelin_storage::pg::PgError::Query(e.to_string()))?;
+                Ok(())
+            })
+        }
+    })
+    .await;
     println!("OK [C]: tenant-scoped-tx isolates across tenants (RLS in tx) + no GUC bleed on reuse.");
 }
 
