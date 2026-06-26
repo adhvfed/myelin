@@ -476,6 +476,32 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "flow_p29_dogfood_drill",
             ],
         },
+        // (13) the AGENT-FABRIC dogfood band (P-517 / AG-P26 → AG-M6): the platform's own agents run on
+        //      its own commits/issues/chat — a real Myelin CI failure on a Myelin commit dispatches a
+        //      MOCK triage agent (explicit-first / Signal-driven; a casual mention only NOTIFIES) which
+        //      emits a BALANCED reserve/settle ledger (reserved == settled; the Mock bills 0 → the
+        //      reservation refunds) + a content-addressed trace per run (the dogfood green artifacts,
+        //      contract 1.8); the every-incident-adds-a-drill loop files a Myelin issue + a reproducing
+        //      drill; and the AG-P26 truth-up pass confirms every PROVEN Fabric row (AG-D1..AG-D11 +
+        //      the E2E-2 spine) rests on a dated green artifact (0 red later-band Fabric gate). WIRES the
+        //      existing Fabric surface + drills (EI-01 §7 — never re-implemented here). The MOCK-runtime
+        //      posture is the honest named floor → the real LlmAgentRuntime swap is AG-P25 (post-M5).
+        SelfHostJob {
+            id: "AG-P26-dogfood",
+            title: "the platform's own agents on Myelin's own work — a MOCK triage agent on a real \
+                    Myelin CI failure (explicit-first dispatch + balanced reserve/settle ledger + a \
+                    content-addressed trace per run) + the Fabric truth-up pass (0 red later-band \
+                    Fabric gate) + the self-hosted every-incident-adds-a-drill loop",
+            kind: JobKind::Drill,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-agent-service",
+                "--test",
+                "ag_p26_dogfood_drill",
+            ],
+        },
     ]
 }
 
