@@ -63,6 +63,26 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// **Compare two RFC3339 timestamps as INSTANTS (not lexically).** Returns `Some(now < expires_at)`
+/// — `true` iff `now` is STRICTLY BEFORE the expiry instant. A raw lexical string compare of the
+/// `Timestamp(pub String)` form is a FAIL-OPEN bug in security code: differing fractional precision
+/// (`…00.5Z` vs `…00Z`), a non-`Z` offset (`…+02:00` == an earlier UTC instant), or a boundary form
+/// (`.000Z` vs `Z`) all order WRONG lexically, so an expired token could read as live/not-revoked.
+/// Parsing both to a `DateTime<FixedOffset>` and comparing by instant (chrono compares the underlying
+/// UTC moment) closes that. Returns `None` if EITHER timestamp is unparseable — the caller decides the
+/// fail-closed direction for its context (deny: stay-revoked for `is_revoked`, `Expired` for
+/// `run_token_state`). We never read the wall clock here — `now` is always the caller-supplied instant.
+fn now_strictly_before(now: &str, expires_at: &str) -> Option<bool> {
+    match (
+        chrono::DateTime::parse_from_rfc3339(now),
+        chrono::DateTime::parse_from_rfc3339(expires_at),
+    ) {
+        (Ok(n), Ok(e)) => Some(n < e),
+        // A malformed `now` OR `expires_at` is a parse failure → the caller fails CLOSED (deny).
+        _ => None,
+    }
+}
+
 /// The S7 revocation mirror's tenant-owned table name (the durable PG-mirror layer). The denylist
 /// is `(tenant, region)`-partitioned; the table is the recovery source of truth the fast layer is
 /// rebuilt from. Mirrors the `0102_s7_revocation` migration in the service shell.
@@ -169,16 +189,74 @@ struct Inner {
 /// **No cross-tenant query path:** every accessor takes a verified [`TenantScope`] (the partition
 /// is keyed by its `(tenant, region)`), so a consult for one tenant structurally cannot reach
 /// another tenant's revocations.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RevocationStore {
-    inner: Arc<Mutex<Inner>>,
+    /// The durable backing — the REAL PG `revocation`/`run_token_teardown` tables (MR-008) on the
+    /// production path, or the in-memory two-layer (mirror+fast) test-double on the default DB-free
+    /// build. The system-of-record is the Pg backing; the in-memory model is an explicit test double.
+    backend: RevocationBackend,
     telemetry: Arc<RevocationTelemetry>,
 }
 
+/// The S7 store backing: the REAL durable PG tables (MR-008) or the in-memory two-layer test-double.
+/// Splitting the backing OUT of the role struct's direct fields lets the `no-in-memory-durable-store`
+/// ratchet (now enum-following, MR-007) record the shortcut's status: `RevocationStore` holds a
+/// backing that CAN be durable, but the `Memory(Arc<Mutex<Inner>>)` variant still holds the
+/// collection and is the always-compiled default — so the scanner still fires (honestly) until
+/// production wires `with_pg` as the non-optional default (MR-009).
+#[derive(Clone)]
+enum RevocationBackend {
+    /// The in-memory two-layer (mirror + fast) test-double. NOT the production system-of-record.
+    Memory(Arc<Mutex<Inner>>),
+    /// The REAL durable PG backing over the MR-022 provider pool + `with_tenant_tx` convention.
+    #[cfg(feature = "integration")]
+    Pg(PgRevocationBacking),
+}
+
+/// The PG-backed S7 backing (MR-008): the durable `revocation` mirror + `run_token_teardown` set +
+/// the sync→async bridge (`tokio::runtime::Handle` driving `block_in_place`+`block_on`). On this path
+/// the durable table IS the recovery source of truth — the "fast Redis/Valkey layer" collapses into
+/// the DB (reads hit the table directly; `recover_from_mirror` is a no-op, nothing to rebuild).
+#[cfg(feature = "integration")]
+#[derive(Clone)]
+struct PgRevocationBacking {
+    backing: Arc<myelin_storage::DurableRevocationBacking>,
+    rt: tokio::runtime::Handle,
+}
+
+impl Default for RevocationStore {
+    fn default() -> RevocationStore {
+        RevocationStore::new()
+    }
+}
+
 impl RevocationStore {
-    /// A fresh (empty) S7 denylist.
+    /// A fresh (empty) S7 denylist (the in-memory two-layer test-double).
     pub fn new() -> RevocationStore {
-        RevocationStore::default()
+        RevocationStore {
+            backend: RevocationBackend::Memory(Arc::new(Mutex::new(Inner::default()))),
+            telemetry: Arc::new(RevocationTelemetry::new()),
+        }
+    }
+
+    /// **Build the S7 store over the REAL durable PG backing (MR-008 / SI-020).** Revocation entries +
+    /// run-token TTLs + teardowns persist through the MR-022 [`myelin_storage::SubstrateProvider`]
+    /// pool + `with_tenant_tx` convention (RLS-scoped, no GUC bleed). `rt` is the tokio runtime handle
+    /// the sync API drives the async backing on. Preserves the API + telemetry + `(tenant, region)`
+    /// scoping; expiry (`expires_at`) is durable so a revoked/expired token reads correctly after a
+    /// fresh store instance over the same pool.
+    #[cfg(feature = "integration")]
+    pub fn with_pg(
+        backing: myelin_storage::DurableRevocationBacking,
+        rt: tokio::runtime::Handle,
+    ) -> RevocationStore {
+        RevocationStore {
+            backend: RevocationBackend::Pg(PgRevocationBacking {
+                backing: Arc::new(backing),
+                rt,
+            }),
+            telemetry: Arc::new(RevocationTelemetry::new()),
+        }
     }
 
     /// The `revocation_lag` telemetry sink (contract-index row 1.8) — for the ID-D1 drill
@@ -246,17 +324,25 @@ impl RevocationStore {
     /// path). Records one `revocation_lag` observation (the teardown is a revoke).
     pub fn tear_down_run_token(&self, scope: &TenantScope, jti: &str, now: Timestamp) {
         // Record the teardown in the durable, crash-safe teardown set (survives a fast-layer rebuild).
-        {
-            let mut guard = self.lock();
-            guard.run_teardowns.insert((
-                scope.tenant().0.clone(),
-                scope.region().0.clone(),
-                jti.to_string(),
-            ));
+        match &self.backend {
+            RevocationBackend::Memory(inner) => {
+                let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                guard.run_teardowns.insert((
+                    scope.tenant().0.clone(),
+                    scope.region().0.clone(),
+                    jti.to_string(),
+                ));
+            }
+            #[cfg(feature = "integration")]
+            RevocationBackend::Pg(pg) => {
+                // A teardown that cannot durably land must NOT silently succeed (a lost teardown would
+                // let a torn-down token validate) — fail LOUD.
+                pg.block(pg.backing.insert_teardown(&scope.tenant().0, jti))
+                    .expect("durable run-token teardown must persist (fail-closed: never a silent lost teardown)");
+            }
         }
-        // The teardown is a revoke of the jti — also write the denylist entry (the no-op idempotent
-        // path if the mint already wrote the TTL entry; the explicit deny is the teardown SET above).
-        // This keeps the `revocation_lag` telemetry firing on every teardown (observability).
+        // The teardown is a revoke of the jti — the explicit deny is the teardown record above. This
+        // keeps the `revocation_lag` telemetry firing on every teardown (observability).
         let _ = now; // the teardown instant; the deny is effective immediately (lag = 0).
         self.telemetry.observe();
     }
@@ -282,32 +368,61 @@ impl RevocationStore {
             RevokeTarget::Jti(jti) => jti.clone(),
             RevokeTarget::Principal(_) => return RunTokenState::Unknown,
         };
-        let guard = self.lock();
-        // Teardown takes precedence (the immediate deny — dead even before the TTL).
-        if guard.run_teardowns.contains(&(
-            scope.tenant().0.clone(),
-            scope.region().0.clone(),
-            jti.clone(),
-        )) {
-            return RunTokenState::TornDown;
-        }
-        let key = self.key(scope, RevokedKind::Jti, jti);
-        match guard.fast.get(&key) {
-            // No record → fail-closed (never minted in this cell, or a different jti).
-            None => RunTokenState::Unknown,
-            Some(entry) => match &entry.expires_at {
-                // A per-run token always carries a TTL (the mint registers `expires_at == run-life`).
-                // A no-TTL jti entry is not a per-run token (it is a plain `revoke(jti)`); we report
-                // it as TornDown (a no-expiry revoke is an explicit, permanent deny).
+        // The expiry decision over `(teardown?, expires_at?)` — shared by both backends so the
+        // TornDown-precedence + TTL semantics never drift between the in-memory model and PG.
+        let decide = |torn_down: bool, expires_at: Option<&str>| -> RunTokenState {
+            if torn_down {
+                return RunTokenState::TornDown; // immediate deny — dead even before the TTL.
+            }
+            match expires_at {
+                // A no-TTL jti entry is not a per-run token (it is a plain `revoke(jti)`); report it
+                // as TornDown (a no-expiry revoke is an explicit, permanent deny).
                 None => RunTokenState::TornDown,
+                // Compared as INSTANTS (not lexically). FAIL-CLOSED: an unparseable timestamp reads
+                // `Expired` (a deny state), never `LiveWithinRunLife`.
                 Some(exp) => {
-                    if now.0 < exp.0 {
+                    if now_strictly_before(now.0.as_str(), exp).unwrap_or(false) {
                         RunTokenState::LiveWithinRunLife
                     } else {
                         RunTokenState::Expired
                     }
                 }
-            },
+            }
+        };
+        match &self.backend {
+            RevocationBackend::Memory(inner) => {
+                let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                let torn_down = guard.run_teardowns.contains(&(
+                    scope.tenant().0.clone(),
+                    scope.region().0.clone(),
+                    jti.clone(),
+                ));
+                if torn_down {
+                    return RunTokenState::TornDown;
+                }
+                let key = self.key(scope, RevokedKind::Jti, jti);
+                match guard.fast.get(&key) {
+                    None => RunTokenState::Unknown, // no record → fail-closed.
+                    Some(entry) => decide(false, entry.expires_at.as_ref().map(|t| t.0.as_str())),
+                }
+            }
+            #[cfg(feature = "integration")]
+            RevocationBackend::Pg(pg) => {
+                // Read the durable teardown set + the revocation row. On a DB error, fail CLOSED:
+                // return `Unknown` (a non-Live state every caller denies on) — never report a token
+                // Live because the consult could not complete.
+                let torn_down = pg
+                    .block(pg.backing.is_teardown(&scope.tenant().0, &jti))
+                    .unwrap_or(true); // error → treat as torn-down (deny), never as live.
+                if torn_down {
+                    return RunTokenState::TornDown;
+                }
+                match pg.block(pg.backing.get_revocation(&scope.tenant().0, RevokedKind::Jti.as_str(), &jti)) {
+                    Err(_) => RunTokenState::Unknown, // fail-closed (deny), never Live on a read error.
+                    Ok(None) => RunTokenState::Unknown,
+                    Ok(Some(row)) => decide(false, row.expires_at.as_deref()),
+                }
+            }
         }
     }
 
@@ -320,19 +435,38 @@ impl RevocationStore {
             RevokeTarget::Jti(jti) => (RevokedKind::Jti, jti.clone()),
             RevokeTarget::Principal(pid) => (RevokedKind::Principal, pid.0.clone()),
         };
-        let key = self.key(scope, kind, handle);
-        let guard = self.lock();
-        match guard.fast.get(&key) {
-            None => false,
-            Some(entry) => match &entry.expires_at {
-                // No TTL: revoked until explicitly cleared (a suspended principal).
+        // The expiry decision over an entry's `expires_at` — shared so the semantics never drift.
+        // `None` TTL → revoked until cleared (a suspended principal). A TTL'd entry is a live
+        // revocation only WHILE `now < expires_at`, compared as INSTANTS via `now_strictly_before`
+        // (NOT a lexical string compare — that fails open under fractional/offset/boundary forms).
+        let revoked_if_present = |expires_at: Option<&str>| -> bool {
+            match expires_at {
                 None => true,
-                // A TTL'd entry is a live revocation only WHILE it has not yet expired. The
-                // timestamps are RFC3339 strings whose lexical order == chronological order (the
-                // same convention the tuple-store zookie + audit-chain use), so `now < expires_at`
-                // is a string compare.
-                Some(exp) => now.0 < exp.0,
-            },
+                // Compared as INSTANTS (not lexically): still revoked iff `now < expires_at`.
+                // FAIL-CLOSED: an unparseable timestamp stays REVOKED (deny), never reads not-revoked.
+                Some(exp) => now_strictly_before(now.0.as_str(), exp).unwrap_or(true),
+            }
+        };
+        match &self.backend {
+            RevocationBackend::Memory(inner) => {
+                let key = self.key(scope, kind, handle);
+                let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                match guard.fast.get(&key) {
+                    None => false,
+                    Some(entry) => revoked_if_present(entry.expires_at.as_ref().map(|t| t.0.as_str())),
+                }
+            }
+            #[cfg(feature = "integration")]
+            RevocationBackend::Pg(pg) => {
+                // Read the durable row. On a DB error, fail CLOSED: return `true` (deny) — never
+                // report a revoked handle as not-revoked because the consult could not complete (the
+                // exact "missed revocation lets a revoked token validate" failure).
+                match pg.block(pg.backing.get_revocation(&scope.tenant().0, kind.as_str(), &handle)) {
+                    Err(_) => true,
+                    Ok(None) => false,
+                    Ok(Some(row)) => revoked_if_present(row.expires_at.as_deref()),
+                }
+            }
         }
     }
 
@@ -342,20 +476,37 @@ impl RevocationStore {
     /// This is the no-op a double-revoke-across-a-crash collapses to (the mirror already has the
     /// entry; recovery re-derives the same fast layer). Idempotent (callable any number of times).
     pub fn recover_from_mirror(&self) {
-        let mut guard = self.lock();
-        guard.fast = guard.mirror.clone();
+        match &self.backend {
+            RevocationBackend::Memory(inner) => {
+                let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                guard.fast = guard.mirror.clone();
+            }
+            // On the Pg path the durable table IS the mirror — reads hit it directly, so there is no
+            // fast layer to lose + rebuild. Recovery is a no-op (the durability is the DB's).
+            #[cfg(feature = "integration")]
+            RevocationBackend::Pg(_) => {}
+        }
     }
 
     /// The count of distinct revocations in the verified `(tenant, region)` partition (for the drill
     /// + idempotency assertions — a double-revoke must NOT grow this).
     pub fn revocation_count(&self, scope: &TenantScope) -> usize {
-        let (t, r) = (scope.tenant().0.clone(), scope.region().0.clone());
-        let guard = self.lock();
-        guard
-            .mirror
-            .keys()
-            .filter(|(kt, kr, _, _)| *kt == t && *kr == r)
-            .count()
+        match &self.backend {
+            RevocationBackend::Memory(inner) => {
+                let (t, r) = (scope.tenant().0.clone(), scope.region().0.clone());
+                let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                guard
+                    .mirror
+                    .keys()
+                    .filter(|(kt, kr, _, _)| *kt == t && *kr == r)
+                    .count()
+            }
+            #[cfg(feature = "integration")]
+            RevocationBackend::Pg(pg) => pg
+                .block(pg.backing.count(&scope.tenant().0))
+                .map(|n| n as usize)
+                .unwrap_or(0),
+        }
     }
 
     /// The shared insert — the mirror-first, idempotent write both `revoke` and the TTL register
@@ -370,24 +521,40 @@ impl RevocationStore {
         now: Timestamp,
         expires_at: Option<Timestamp>,
     ) {
-        let key = self.key(scope, kind, handle.clone());
-        let entry = RevocationEntry {
-            kind,
-            handle,
-            revoked_at: now,
-            expires_at,
-        };
-        let mut guard = self.lock();
-        // (1) Durable mirror FIRST (crash-safe: a crash after this line recovers the revocation).
-        //     IDEMPOTENT: only insert if absent — an already-revoked handle keeps its FIRST
-        //     `revoked_at` (a re-revoke does not overwrite, duplicate, or clear it).
-        guard
-            .mirror
-            .entry(key.clone())
-            .or_insert_with(|| entry.clone());
-        // (2) Fast Redis/Valkey-class layer (mirror of the mirror — same idempotent semantics).
-        guard.fast.entry(key).or_insert(entry);
-        drop(guard);
+        match &self.backend {
+            RevocationBackend::Memory(inner) => {
+                let key = self.key(scope, kind, handle.clone());
+                let entry = RevocationEntry {
+                    kind,
+                    handle,
+                    revoked_at: now,
+                    expires_at,
+                };
+                let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                // (1) Durable mirror FIRST (crash-safe). IDEMPOTENT: only insert if absent — an
+                //     already-revoked handle keeps its FIRST `revoked_at`.
+                guard
+                    .mirror
+                    .entry(key.clone())
+                    .or_insert_with(|| entry.clone());
+                // (2) Fast Redis/Valkey-class layer (mirror of the mirror — same idempotent semantics).
+                guard.fast.entry(key).or_insert(entry);
+            }
+            #[cfg(feature = "integration")]
+            RevocationBackend::Pg(pg) => {
+                // The durable INSERT is idempotent (`ON CONFLICT DO NOTHING` preserves the FIRST
+                // `revoked_at`). A revoke that cannot durably land must NOT silently succeed (a lost
+                // revoke would let a revoked token validate — the F8 failure) → fail LOUD.
+                pg.block(pg.backing.insert_revocation(
+                    &scope.tenant().0,
+                    kind.as_str(),
+                    &handle,
+                    &now.0,
+                    expires_at.as_ref().map(|t| t.0.as_str()),
+                ))
+                .expect("durable revocation must persist (fail-closed: never a silent lost revoke)");
+            }
+        }
         // (3) The deny is effective immediately (a hot consult); record the revocation_lag sample.
         self.telemetry.observe();
     }
@@ -403,8 +570,26 @@ impl RevocationStore {
         )
     }
 
+    /// Lock the in-memory test-double backing (the Memory arm; the unit tests' direct mirror/fast
+    /// inspection uses it). Panics on the Pg backend (the durable table is the source of truth there,
+    /// no in-process map) — only the in-memory tests call this.
+    #[cfg(test)]
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        match &self.backend {
+            RevocationBackend::Memory(inner) => inner.lock().unwrap_or_else(|e| e.into_inner()),
+            #[cfg(feature = "integration")]
+            RevocationBackend::Pg(_) => {
+                panic!("lock() is the in-memory test-double accessor; the Pg backend has no map")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "integration")]
+impl PgRevocationBacking {
+    /// Drive an async backing call from the sync store API (the `block_in_place`+`block_on` bridge).
+    fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
+        tokio::task::block_in_place(|| self.rt.block_on(fut))
     }
 }
 
@@ -459,6 +644,87 @@ mod tests {
 
     fn ts(s: &str) -> Timestamp {
         Timestamp(s.into())
+    }
+
+    /// **Expiry is compared by INSTANT, not lexically — the fail-open the verifier found is CLOSED.**
+    /// Each adversarial pair would read LIVE/not-revoked under a raw `now.0 < exp` string compare, but
+    /// must read EXPIRED/denied because `now` is chronologically at-or-past `expires_at`. Plus the
+    /// fail-closed-on-malformed posture. Covers the Memory backend (same `now_strictly_before` path as
+    /// the Pg backend).
+    #[test]
+    fn expiry_is_instant_compared_not_lexical_and_fails_closed() {
+        let acme = scope("acme");
+        let run = RevokeTarget::Jti("run-jti".into());
+
+        // Each case: (expires_at, now) where `now` is chronologically >= expiry → token is EXPIRED,
+        // but a lexical string compare would (wrongly) say `now < exp` → LIVE.
+        let cases = [
+            // (1) differing fractional precision: 0.5s PAST expiry, but '.' < 'Z' lexically.
+            ("2026-06-19T00:05:00Z", "2026-06-19T00:05:00.5Z"),
+            // (2) non-`Z` offset: exp == 00:05:00Z; now == 00:06:00Z (1 min past). Lexically "00" < "02".
+            ("2026-06-19T02:05:00+02:00", "2026-06-19T00:06:00Z"),
+            // (3) the exact boundary instant (equal): strict `<` → not live → Expired. '.' < 'Z'.
+            ("2026-06-19T00:05:00Z", "2026-06-19T00:05:00.000Z"),
+        ];
+        for (exp, now) in cases {
+            let s7 = RevocationStore::new();
+            s7.register_run_token_ttl(&acme, "run-jti", ts("2026-06-19T00:00:00Z"), ts(exp));
+            assert!(
+                !s7.is_revoked(&acme, &run, &ts(now)),
+                "is_revoked: now={now} is at/past expires_at={exp} → token expired (not revoked); a \
+                 lexical compare would fail OPEN here"
+            );
+            assert_eq!(
+                s7.run_token_state(&acme, &run, &ts(now)),
+                RunTokenState::Expired,
+                "run_token_state: now={now} at/past expires_at={exp} → Expired, never Live"
+            );
+        }
+
+        // Sanity: a clearly-BEFORE instant with a tricky offset still reads LIVE (not over-denied).
+        // now == 00:04:00Z is before exp == 00:05:00Z (written as +02:00) → still revoked / Live.
+        let s7 = RevocationStore::new();
+        s7.register_run_token_ttl(
+            &acme,
+            "run-jti",
+            ts("2026-06-19T00:00:00Z"),
+            ts("2026-06-19T02:05:00+02:00"),
+        );
+        assert!(s7.is_revoked(&acme, &run, &ts("2026-06-19T00:04:00Z")));
+        assert_eq!(
+            s7.run_token_state(&acme, &run, &ts("2026-06-19T00:04:00Z")),
+            RunTokenState::LiveWithinRunLife
+        );
+
+        // FAIL-CLOSED on a malformed expires_at: is_revoked stays REVOKED (deny), state reads Expired.
+        let s7 = RevocationStore::new();
+        s7.register_run_token_ttl(
+            &acme,
+            "run-jti",
+            ts("2026-06-19T00:00:00Z"),
+            ts("not-a-timestamp"),
+        );
+        assert!(
+            s7.is_revoked(&acme, &run, &ts("2026-06-19T00:04:00Z")),
+            "a malformed expires_at fails CLOSED: the handle stays revoked (deny), never reads not-revoked"
+        );
+        assert_eq!(
+            s7.run_token_state(&acme, &run, &ts("2026-06-19T00:04:00Z")),
+            RunTokenState::Expired,
+            "a malformed expires_at fails CLOSED in run_token_state (Expired, never Live)"
+        );
+        // FAIL-CLOSED on a malformed `now` too (deny).
+        let s7 = RevocationStore::new();
+        s7.register_run_token_ttl(
+            &acme,
+            "run-jti",
+            ts("2026-06-19T00:00:00Z"),
+            ts("2026-06-19T00:05:00Z"),
+        );
+        assert!(
+            s7.is_revoked(&acme, &run, &ts("garbage-now")),
+            "a malformed `now` fails CLOSED (stays revoked)"
+        );
     }
 
     /// A revoked `jti` reads `is_revoked == true` (the deny-on-denylisted mandatory-core property).

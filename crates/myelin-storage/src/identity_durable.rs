@@ -74,6 +74,58 @@ CREATE POLICY myelin_tenant_isolation ON principal \
   WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
               AND region = current_setting('myelin.region', true));";
 
+/// The S7 `revocation` mirror table (MR-008, SI-020) — `(tenant, region)`-scoped, RLS-ready, the
+/// durable recovery source of truth the identity `RevocationStore` mirror models. Holds revoked
+/// `jti`s + suspended/disabled principals + per-run agent-token TTLs. `(kind, handle)` is the entry
+/// identity an idempotent re-revoke collapses onto (`ON CONFLICT DO NOTHING` preserves the FIRST
+/// `revoked_at`). `expires_at` is the per-run TTL (`expires_at == run-life`) that survives restart —
+/// the auto-expire (defence-in-depth for revoke-on-crash). Timestamps are RFC3339 text (lexical
+/// order == chronological, the same convention the tuple-store zookie + audit chain use).
+pub const REVOCATION_MIGRATION: &str = "\
+CREATE TABLE IF NOT EXISTS revocation (
+    tenant_id  text NOT NULL,
+    region     text NOT NULL,
+    kind       text NOT NULL,
+    handle     text NOT NULL,
+    revoked_at text NOT NULL,
+    expires_at text,
+    PRIMARY KEY (tenant_id, region, kind, handle)
+);";
+
+/// The `(tenant, region)` FORCE-RLS policy on `revocation` (same form as `principal`).
+pub const REVOCATION_RLS_POLICY: &str = "\
+ALTER TABLE revocation ENABLE ROW LEVEL SECURITY;
+ALTER TABLE revocation FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON revocation;
+CREATE POLICY myelin_tenant_isolation ON revocation \
+  USING (tenant_id = current_setting('myelin.tenant_id', true) \
+         AND region = current_setting('myelin.region', true)) \
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
+              AND region = current_setting('myelin.region', true));";
+
+/// The S7 `run_token_teardown` table (MR-008) — the per-run-token EXPLICIT-teardown set, kept
+/// distinct from the TTL `revocation` row so the two run-token deaths stay distinguishable:
+/// **torn-down** (an explicit teardown landed → the immediate deny) vs **expired** (the TTL passed
+/// with no teardown → the auto-expire). `(tenant, region)`-scoped + RLS. PII-free (an opaque `jti`).
+pub const RUN_TOKEN_TEARDOWN_MIGRATION: &str = "\
+CREATE TABLE IF NOT EXISTS run_token_teardown (
+    tenant_id text NOT NULL,
+    region    text NOT NULL,
+    jti       text NOT NULL,
+    PRIMARY KEY (tenant_id, region, jti)
+);";
+
+/// The `(tenant, region)` FORCE-RLS policy on `run_token_teardown` (same form).
+pub const RUN_TOKEN_TEARDOWN_RLS_POLICY: &str = "\
+ALTER TABLE run_token_teardown ENABLE ROW LEVEL SECURITY;
+ALTER TABLE run_token_teardown FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON run_token_teardown;
+CREATE POLICY myelin_tenant_isolation ON run_token_teardown \
+  USING (tenant_id = current_setting('myelin.tenant_id', true) \
+         AND region = current_setting('myelin.region', true)) \
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
+              AND region = current_setting('myelin.region', true));";
+
 /// The S1 `credential_link` table — the verified-credential `(scheme, subject_key)` → `principal_id`
 /// index `authenticate` keys on (identity §2 "SSO/SCIM links"). `(tenant, region)`-scoped + RLS so a
 /// credential verified for tenant A can never resolve a principal in tenant B. `link_key` is the
@@ -123,6 +175,10 @@ pub fn identity_durable_migrations() -> Migrations {
         Migration::plain("0013_principal_rls", PRINCIPAL_RLS_POLICY),
         Migration::plain("0014_credential_link", CREDENTIAL_LINK_MIGRATION),
         Migration::plain("0015_credential_link_rls", CREDENTIAL_LINK_RLS_POLICY),
+        Migration::plain("0016_revocation", REVOCATION_MIGRATION),
+        Migration::plain("0017_revocation_rls", REVOCATION_RLS_POLICY),
+        Migration::plain("0018_run_token_teardown", RUN_TOKEN_TEARDOWN_MIGRATION),
+        Migration::plain("0019_run_token_teardown_rls", RUN_TOKEN_TEARDOWN_RLS_POLICY),
     ])
 }
 
@@ -472,5 +528,182 @@ fn row_to_principal(r: &sqlx::postgres::PgRow) -> DurablePrincipalRow {
         data_role: r.get("data_role"),
         status: r.get("status"),
         profile,
+    }
+}
+
+// =================================================================================================
+// DurableRevocationBacking — the S7 revocation + run-token-TTL/teardown over with_tenant_tx (MR-008).
+// =================================================================================================
+
+/// A durable revocation entry as read back (the fields the consult needs). `expires_at` is the per-run
+/// TTL (`None` for a permanent revocation / suspended principal); the consult honours `now < expires_at`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableRevocationRow {
+    /// When it was FIRST revoked (preserved across an idempotent re-revoke).
+    pub revoked_at: String,
+    /// The per-run TTL (`expires_at == run-life`), or `None` for a permanent revocation.
+    pub expires_at: Option<String>,
+}
+
+/// The REAL durable S7 backing (MR-008): the `revocation` mirror + `run_token_teardown` set, accessed
+/// THROUGH the MR-022 `with_tenant_tx` convention (RLS-scoped, no GUC bleed). The durable table IS the
+/// recovery source of truth — on this path the "fast Redis/Valkey layer" collapses into the DB itself
+/// (reads hit the durable table directly; there is nothing to lose + rebuild). Cloneable.
+#[derive(Clone)]
+pub struct DurableRevocationBacking {
+    provider: SubstrateProvider,
+}
+
+impl DurableRevocationBacking {
+    /// Build the backing over the MR-022 provider (the app-role, reset-on-release pool).
+    pub fn new(provider: SubstrateProvider) -> DurableRevocationBacking {
+        DurableRevocationBacking { provider }
+    }
+
+    fn region(&self) -> String {
+        self.provider.config().region.clone()
+    }
+
+    /// Insert a revocation entry (idempotent — `ON CONFLICT DO NOTHING` preserves the FIRST
+    /// `revoked_at`, the crash-safe idempotency contract 4.7). `kind` is `"jti"`/`"principal"`.
+    pub async fn insert_revocation(
+        &self,
+        tenant: &str,
+        kind: &str,
+        handle: &str,
+        revoked_at: &str,
+        expires_at: Option<&str>,
+    ) -> Result<(), ProviderError> {
+        let tenant_owned = tenant.to_string();
+        let region = self.region();
+        let kind = kind.to_string();
+        let handle = handle.to_string();
+        let revoked_at = revoked_at.to_string();
+        let expires_at = expires_at.map(|s| s.to_string());
+        self.provider
+            .with_tenant_tx(tenant, move |conn| {
+                Box::pin(async move {
+                    sqlx::query(
+                        "INSERT INTO revocation \
+                           (tenant_id, region, kind, handle, revoked_at, expires_at) \
+                         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region)
+                    .bind(&kind)
+                    .bind(&handle)
+                    .bind(&revoked_at)
+                    .bind(expires_at)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                    Ok(())
+                })
+            })
+            .await
+    }
+
+    /// Record an explicit run-token teardown (idempotent).
+    pub async fn insert_teardown(&self, tenant: &str, jti: &str) -> Result<(), ProviderError> {
+        let tenant_owned = tenant.to_string();
+        let region = self.region();
+        let jti = jti.to_string();
+        self.provider
+            .with_tenant_tx(tenant, move |conn| {
+                Box::pin(async move {
+                    sqlx::query(
+                        "INSERT INTO run_token_teardown (tenant_id, region, jti) \
+                         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region)
+                    .bind(&jti)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                    Ok(())
+                })
+            })
+            .await
+    }
+
+    /// Read a single revocation entry (`None` if absent) in the `(tenant, region)` partition.
+    pub async fn get_revocation(
+        &self,
+        tenant: &str,
+        kind: &str,
+        handle: &str,
+    ) -> Result<Option<DurableRevocationRow>, ProviderError> {
+        let tenant_owned = tenant.to_string();
+        let region = self.region();
+        let kind = kind.to_string();
+        let handle = handle.to_string();
+        self.provider
+            .with_tenant_tx(tenant, move |conn| {
+                Box::pin(async move {
+                    let row = sqlx::query(
+                        "SELECT revoked_at, expires_at FROM revocation \
+                         WHERE tenant_id = $1 AND region = $2 AND kind = $3 AND handle = $4",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region)
+                    .bind(&kind)
+                    .bind(&handle)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                    Ok(row.map(|r| DurableRevocationRow {
+                        revoked_at: r.get("revoked_at"),
+                        expires_at: r.get("expires_at"),
+                    }))
+                })
+            })
+            .await
+    }
+
+    /// Whether an explicit teardown exists for `jti` in the `(tenant, region)` partition.
+    pub async fn is_teardown(&self, tenant: &str, jti: &str) -> Result<bool, ProviderError> {
+        let tenant_owned = tenant.to_string();
+        let region = self.region();
+        let jti = jti.to_string();
+        self.provider
+            .with_tenant_tx(tenant, move |conn| {
+                Box::pin(async move {
+                    let exists: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM run_token_teardown \
+                         WHERE tenant_id = $1 AND region = $2 AND jti = $3)",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region)
+                    .bind(&jti)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                    Ok(exists)
+                })
+            })
+            .await
+    }
+
+    /// The count of distinct revocations in the `(tenant, region)` partition (the idempotency/drill
+    /// assertion — a double-revoke must NOT grow this).
+    pub async fn count(&self, tenant: &str) -> Result<i64, ProviderError> {
+        let tenant_owned = tenant.to_string();
+        let region = self.region();
+        self.provider
+            .with_tenant_tx(tenant, move |conn| {
+                Box::pin(async move {
+                    let n: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM revocation WHERE tenant_id = $1 AND region = $2",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                    Ok(n)
+                })
+            })
+            .await
     }
 }

@@ -83,6 +83,12 @@ myelin-notif = { path = "../myelin-notif" }
 # The `myelin_refs::ArtifactRef` the Notif router `classify`s a curated KN Signal under (the subject
 # the inbox item is about). A pure value carrier; no production DAG edge depends back on this service.
 myelin-refs = { path = "../myelin-refs" }
+# MR-008 expiry comparison (revocation.rs): RFC3339 token-TTL timestamps must be compared as INSTANTS,
+# not lexically — a raw string compare fails OPEN under differing fractional precision / non-`Z`
+# offsets (an expired token could read as live/not-revoked). REUSE the chrono already in the workspace
+# lock (sqlx pulls it); parse-only (`default-features = false`, no `clock` — we never read the wall
+# clock here). NON-optional: the default-build (in-memory) revocation path uses the same comparison.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 # ------------------------------------------------------------------------------------------
 # MR-007 (SI-018/019): the durable PG backings for the S1 principal + S3 tuple stores live in
 # myelin-storage behind its `integration` feature (the real sqlx client). The identity-layer
