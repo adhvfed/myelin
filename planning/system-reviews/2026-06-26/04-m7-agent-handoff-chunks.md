@@ -6,15 +6,16 @@ This document makes the M7 review overlay executable by a resumed ledger agent. 
 global prompt P-522..P-546: one main agent owns one prompt, assembles the final patch, runs the gate, writes the
 scorecard, and commits. Inside that prompt, the main agent may hand off bounded work packets to sub-agents.
 
-The unit of work is the chunk, not a token count. Each global prompt P-522..P-546 stays one ledger commit, but
-its work must be split into sub-agent packets each sized so a single agent can hold everything it needs — the
-prompt body, the canon sections, the code it reads, the change it writes, and the verification it runs — inside
-one coherent working window with room to spare. An agent works best well short of its context limit; a packet
-that fills the window is a packet that will force a shortcut, because an agent low on working room stubs the
-rest. Right-sizing the packets is therefore a quality control, not an ergonomic nicety — it is one of the
-mechanisms that stops a corner being cut for lack of room. Do not split a P-NNN into multiple ledger commits
-unless a blocker creates a new explicit follow-on prompt; sub-agent packets are implementation aids, not new
-roadmap prompts.
+The unit of work is the chunk, and the chunk is sized by what it costs to execute. Each global prompt
+P-522..P-546 stays one ledger commit, but its work must be split so that running it end to end — the prompt body,
+the canon sections, the code it reads, the change it writes, and the verification it runs — lands at roughly
+**400k–700k tokens of working context, and never above 700k**. Below 400k is fine; a prompt creeping past 700k is
+the signal to split it into an explicit follow-on. The figure is a structuring tool, not a budget to spend up to:
+a unit of work that fills the whole window is one that will force a shortcut, because an agent low on working room
+stubs the rest and writes a passing test for the stub. Right-sizing is therefore a quality control, not an
+ergonomic nicety. Sub-agent packets inside a prompt split the same work further; they are implementation aids,
+not new roadmap prompts, and a P-NNN is not split into multiple ledger commits unless a blocker creates an
+explicit follow-on.
 
 ## Universal Handoff Rules
 
