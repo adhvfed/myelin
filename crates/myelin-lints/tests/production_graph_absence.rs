@@ -76,7 +76,10 @@
 //! - `myelin-control-plane/src/registry.rs:111`          — `Registry` placement in-mem (SI-011; cp durable MR)
 //! - `myelin-control-plane/src/cross_cell_bridge.rs:244` — `CellResolverRegistry` in-mem (SI-052; cp/multi-cell MR)
 //! - `myelin-control-plane/src/placement_of.rs:223`      — `MisrouteAudit` `Arc<Mutex<Vec<…>>>` audit sink (SI-028; cp durable MR)
-//! - `myelin-storage/src/kms.rs:470`                      — `KmsEngine` root/KEKs in-mem (SI-006; MR-009 / Tier-4 P-524)
+//! - `myelin-storage/src/kms.rs:622`                      — `KmsEngine` root/KEKs in-mem (SI-006). MR-025
+//!   ADDED the durable software-sealed root (`kms_durable::DurableKmsBacking` + `load_or_generate`,
+//!   proven live: `integration_mr025_kms_durable`); `KmsEngine::new()` still the always-compiled
+//!   in-memory default → named-holder scanner still fires (re-pinned 470→622). Removed at MR-009 wiring.
 //! - `myelin-storage/src/reserve_settle.rs:283`          — `CostLedger` reserve/settle in-mem (SI-021 cluster; MR-007/009)
 //! - `myelin-storage/src/restore_verify.rs:175`          — `ErasureLedger` restore-verify in-mem (SI-036 cluster; P-530)
 //! - `myelin-storage/src/reerase.rs:156`                  — `InMemoryPostPitLedger` `records: Vec<…>` (Vec false-negative closed; P-ST-14 / P-522/523)
@@ -360,10 +363,19 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-identity-service/src/machine_auth.rs",
         347,
     ),
+    // MR-025 (SI-006) ADDED the durable software-sealed root path (`kms_durable::DurableKmsBacking`
+    // + `load_or_generate` over `kms_sealed_root`/`kms_wrapped_kek`/`kms_wrapped_dek`, proven live:
+    // `integration_mr025_kms_durable` — decrypt-across-restart + wrong-seal-key-fails-closed +
+    // backup/restore). SUPPLEMENTED, not removed: `KmsEngine::new()` is still the always-compiled
+    // in-memory default (the durable backing is behind `#[cfg(feature="integration")]`) and nothing
+    // wires `load_or_generate` yet — so the in-memory KMS is STILL the production default, and the
+    // named-holder scanner STILL fires on the `KmsEngine` struct header (re-pinned 470→622 after the
+    // MR-025 seal/export/snapshot additions). Removed when MR-009 wires `load_or_generate` as the
+    // non-optional boot default (+ the kill-9 proof).
     (
         "no-in-memory-durable-store",
         "crates/myelin-storage/src/kms.rs",
-        470,
+        622,
     ),
     (
         "no-in-memory-durable-store",

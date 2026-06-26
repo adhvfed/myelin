@@ -289,6 +289,129 @@ impl CellRoot {
         bytes.copy_from_slice(&plain);
         Some(RawKey(bytes))
     }
+
+    /// **Seal (envelope-encrypt) this cell root UNDER THE OPERATOR-HELD SEAL KEY** — the software
+    /// analogue of an HSM unseal key (the MR-025 software-sealed floor). The result ([`SealedRoot`])
+    /// is the ONLY form the L0 root EVER rests in at rest: the root NEVER persists in plaintext. The
+    /// seal key is supplied at BOOT from the environment/config and never rests in the DB. Reuses the
+    /// same vetted AES-256-GCM AEAD — never a hand-rolled cipher.
+    pub fn seal(&self, seal_key: &SealKey) -> SealedRoot {
+        let nonce = Aes256Gcm::generate_nonce(OsRng);
+        let ct = seal_key
+            .cipher()
+            .encrypt(&nonce, self.root.0.as_slice())
+            .expect("AES-256-GCM seal cell root under the seal key");
+        let mut n = [0u8; NONCE_LEN];
+        n.copy_from_slice(nonce.as_slice());
+        SealedRoot {
+            nonce: n,
+            ciphertext: ct,
+        }
+    }
+
+    /// Unseal a [`SealedRoot`] back into a usable cell root under the seal key. Returns `None` if it
+    /// does not authenticate — a WRONG or absent seal key (or a tampered/corrupt sealed root). The
+    /// caller MUST then **fail closed + loud** and NEVER generate a fresh root (that would orphan
+    /// every existing ciphertext = unrecoverable data, the worst outcome, §7.5).
+    pub fn unseal(seal_key: &SealKey, sealed: &SealedRoot) -> Option<CellRoot> {
+        let plain = seal_key
+            .cipher()
+            .decrypt(
+                Nonce::from_slice(&sealed.nonce),
+                sealed.ciphertext.as_slice(),
+            )
+            .ok()?;
+        if plain.len() != KEY_LEN {
+            return None;
+        }
+        let mut bytes = [0u8; KEY_LEN];
+        bytes.copy_from_slice(&plain);
+        Some(CellRoot {
+            root: RawKey(bytes),
+        })
+    }
+}
+
+/// The operator-held **seal key** — the root-of-trust on this software floor (the software analogue
+/// of an HSM unseal key, the MR-025 software-sealed design). 256-bit AEAD key material supplied at
+/// BOOT from the environment/config ([`SealKey::from_encoded`] over e.g. `MYELIN_KMS_SEAL_KEY`); the
+/// [`CellRoot`] rests ONLY sealed under it ([`CellRoot::seal`]). It NEVER rests in the database (it
+/// is the env-supplied unseal key), is NEVER logged / `Debug`-printed (redacted below), and is NEVER
+/// serialized (no `serde` derive) — a seal key in a log or a row is a TOTAL key compromise.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SealKey(RawKey);
+
+impl SealKey {
+    /// Build a seal key from raw 256-bit material (the test seam / a config layer that already
+    /// decoded the bytes). The material is never exported back out of the key.
+    pub fn from_bytes(bytes: [u8; KEY_LEN]) -> SealKey {
+        SealKey(RawKey(bytes))
+    }
+
+    /// Decode a seal key from its HEX-encoded form (64 hex chars == 32 bytes) — the at-boot
+    /// env/config encoding (e.g. `MYELIN_KMS_SEAL_KEY`). A non-hex string or a wrong length is a LOUD
+    /// [`SealKeyError`] (fail-closed at boot — never a silently-truncated or all-zero key).
+    pub fn from_encoded(s: &str) -> Result<SealKey, SealKeyError> {
+        let decoded = hex::decode(s.trim()).map_err(|e| SealKeyError::Decode(e.to_string()))?;
+        if decoded.len() != KEY_LEN {
+            return Err(SealKeyError::WrongLength(decoded.len()));
+        }
+        let mut bytes = [0u8; KEY_LEN];
+        bytes.copy_from_slice(&decoded);
+        Ok(SealKey(RawKey(bytes)))
+    }
+
+    /// The AEAD cipher keyed by this seal key (the SAME vetted AES-256-GCM the rest of the engine
+    /// uses — EI-01 §7, never a hand-rolled cipher).
+    fn cipher(&self) -> Aes256Gcm {
+        self.0.cipher()
+    }
+}
+
+impl fmt::Debug for SealKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redacted — the seal key NEVER enters a log/Debug output (it is the unseal root-of-trust).
+        f.write_str("SealKey(<redacted seal key>)")
+    }
+}
+
+/// Why a [`SealKey`] could not be decoded from its env/config form (fail-closed at boot). Carries no
+/// key material (only the structural fault), so it is safe to log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SealKeyError {
+    /// The string was not valid hex (the underlying decode error — never includes key bytes).
+    Decode(String),
+    /// The decoded key was not exactly 32 bytes (256-bit).
+    WrongLength(usize),
+}
+
+impl fmt::Display for SealKeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SealKeyError::Decode(e) => write!(
+                f,
+                "KMS seal key is not valid hex (a 256-bit key as 64 hex chars is required): {e}"
+            ),
+            SealKeyError::WrongLength(n) => write!(
+                f,
+                "KMS seal key decoded to {n} bytes; a 256-bit (32-byte) key is required"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SealKeyError {}
+
+/// The at-rest form of the cell root: the L0 root AES-256-GCM-encrypted UNDER THE SEAL KEY
+/// ([`CellRoot::seal`]). This — NEVER the plaintext root — is what the durable KMS store persists.
+/// Both fields are CIPHERTEXT (safe to store / `Debug`); the root plaintext is recoverable ONLY by
+/// [`CellRoot::unseal`] with the correct seal key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedRoot {
+    /// The per-seal random AES-GCM nonce.
+    pub nonce: [u8; NONCE_LEN],
+    /// The AES-256-GCM ciphertext+tag of the 32-byte root plaintext, sealed under the seal key.
+    pub ciphertext: Vec<u8>,
 }
 
 /// A key sealed (wrapped) under its parent key — the at-rest form of a KEK (under the cell root).
@@ -458,6 +581,35 @@ struct StoredKek {
     epoch: u64,
 }
 
+/// A wrapped KEK exported for DURABLE persistence — the L0→L1 envelope at rest (the KEK sealed under
+/// the cell root) plus its epoch. The KEK plaintext is NOT here (it is recoverable only by unwrapping
+/// under the root); this is the ciphertext form the durable KMS store persists, mirroring
+/// [`WrappedDek`] one level up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportedKek {
+    /// The wrapping nonce (96-bit, per-wrap random).
+    pub nonce: [u8; NONCE_LEN],
+    /// The AES-256-GCM ciphertext+tag of the 32-byte KEK plaintext, sealed under the cell root.
+    pub wrapped: Vec<u8>,
+    /// The KEK's current epoch (a rotation bumps it).
+    pub epoch: u64,
+}
+
+/// A full DURABLE snapshot of a cell's KMS key material (MR-025): the SEALED cell root (under the
+/// seal key), the wrapped KEKs (under the root), and the wrapped DEKs (under their KEKs) — everything
+/// a clean target needs (WITH the same seal key) to recover EVERY encrypted column across a
+/// restart/restore. A crypto-shredded key is EXCLUDED (it is absent from the engine's maps, so it
+/// never enters here — it stays dead across a restore, §7.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KmsDurableSnapshot {
+    /// The cell root, sealed under the seal key (the only at-rest form of the root).
+    pub sealed_root: SealedRoot,
+    /// Every live KEK, wrapped under the root.
+    pub keks: Vec<(KekId, ExportedKek)>,
+    /// Every live DEK (of a still-live tenant), wrapped under its KEK, with its DEK epoch.
+    pub deks: Vec<(DekId, WrappedDek, u64)>,
+}
+
 /// The self-hostable software KMS engine (Vault-Transit-class) — the in-cell key store behind the
 /// [`KmsAdapter`] seam (§4). It holds the L0 cell root, the L1 per-(tenant,region) KEKs, and the
 /// L2 DEKs stored ENVELOPE-WRAPPED ([`WrappedDek`]) under their KEKs. Every public operation goes
@@ -478,13 +630,86 @@ pub struct KmsEngine {
 }
 
 impl KmsEngine {
-    /// Stand up a fresh engine over a generated cell root (one per cell).
+    /// Stand up a fresh engine over a generated cell root (one per cell). This is the in-memory
+    /// **test-double**: it mints a fresh root per process, so NOTHING it sealed survives a restart.
+    /// The PRODUCTION path is the durable `load_or_generate` ([`crate::kms_durable`], MR-025), which
+    /// recovers the sealed root + wrapped KEKs/DEKs from the store across a restart.
     pub fn new() -> KmsEngine {
         KmsEngine {
             root: CellRoot::generate(),
             keks: Mutex::new(BTreeMap::new()),
             deks: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Stand up an engine over an EXISTING cell root — the durable load path (MR-025): the root has
+    /// just been UNSEALED from the store under the seal key, or freshly generated on a genuine first
+    /// boot. The KEK/DEK maps start empty; the durable loader then
+    /// [`install_wrapped_kek`](Self::install_wrapped_kek) /
+    /// [`install_wrapped_dek`](Self::install_wrapped_dek) the persisted wrapped key material (all
+    /// wrapped under THIS same root, the durable invariant).
+    pub fn from_root(root: CellRoot) -> KmsEngine {
+        KmsEngine {
+            root,
+            keks: Mutex::new(BTreeMap::new()),
+            deks: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Install a KEK loaded from the durable store — its wrapped (under-the-root) form + epoch. The
+    /// wrapped bytes MUST have been wrapped under THIS engine's root (the durable invariant: the
+    /// persisted KEKs are wrapped under the persisted root that was just unsealed).
+    pub fn install_wrapped_kek(
+        &self,
+        id: KekId,
+        nonce: [u8; NONCE_LEN],
+        wrapped: Vec<u8>,
+        epoch: u64,
+    ) {
+        let mut keks = self.keks.lock().expect("KMS keks poisoned");
+        keks.insert(
+            id,
+            StoredKek {
+                wrapped: WrappedKey { nonce, wrapped },
+                epoch,
+            },
+        );
+    }
+
+    /// Install a DEK loaded from the durable store — its wrapped (under-the-KEK) form + DEK epoch.
+    pub fn install_wrapped_dek(&self, id: DekId, dek: WrappedDek, dek_epoch: u64) {
+        let mut deks = self.deks.lock().expect("KMS deks poisoned");
+        deks.insert(id, (dek, dek_epoch));
+    }
+
+    /// Export this engine's cell root in its SEALED at-rest form (under the seal key) — what the
+    /// durable store persists. The plaintext root never leaves the engine.
+    pub fn export_sealed_root(&self, seal_key: &SealKey) -> SealedRoot {
+        self.root.seal(seal_key)
+    }
+
+    /// Export one KEK's wrapped (under-the-root) form for persistence, or `None` if absent/destroyed.
+    pub fn export_kek(&self, id: &KekId) -> Option<ExportedKek> {
+        let keks = self.keks.lock().expect("KMS keks poisoned");
+        keks.get(id).map(|sk| ExportedKek {
+            nonce: sk.wrapped.nonce,
+            wrapped: sk.wrapped.wrapped.clone(),
+            epoch: sk.epoch,
+        })
+    }
+
+    /// Export one DEK's wrapped (under-the-KEK) form + its DEK epoch, or `None` if absent/shredded.
+    pub fn export_dek(&self, id: &DekId) -> Option<(WrappedDek, u64)> {
+        let deks = self.deks.lock().expect("KMS deks poisoned");
+        deks.get(id).map(|(w, e)| (w.clone(), *e))
+    }
+
+    /// Export EVERY live DEK's wrapped form + DEK epoch (for a full write-through / mirror).
+    pub fn export_deks(&self) -> Vec<(DekId, WrappedDek, u64)> {
+        let deks = self.deks.lock().expect("KMS deks poisoned");
+        deks.iter()
+            .map(|(id, (w, e))| (id.clone(), w.clone(), *e))
+            .collect()
     }
 
     /// Provision (or fetch) the L1 KEK for a `(tenant, region)`. Idempotent: a second call for the
@@ -695,6 +920,44 @@ impl KmsEngine {
             })
             .map(|(dek_id, (wrapped, _epoch))| (dek_id.clone(), wrapped.clone()))
             .collect()
+    }
+
+    /// **The extended backup snapshot (MR-025): the SEALED root + the wrapped KEKs + the wrapped
+    /// DEKs.** This EXTENDS [`backup_snapshot`](Self::backup_snapshot) (which carries the wrapped
+    /// DEKs ONLY) to ALSO carry the sealed cell root + the wrapped KEKs, so a restore to a clean
+    /// target (WITH the same seal key) recovers EVERY encrypted column — not just the DEK ciphertext
+    /// whose wrapping KEK + root would otherwise be gone (the very thing today's fresh-root-per-process
+    /// loses). A crypto-shredded key stays excluded: a DEK whose tenant has no live KEK is omitted
+    /// (the SAME §7.5 rule as `backup_snapshot`), and a destroyed KEK/DEK is already absent from the
+    /// maps — so it cannot be resurrected by a restore.
+    pub fn backup_snapshot_durable(&self, seal_key: &SealKey) -> KmsDurableSnapshot {
+        let keks = self.keks.lock().expect("KMS keks poisoned");
+        let deks = self.deks.lock().expect("KMS deks poisoned");
+        let kek_list: Vec<(KekId, ExportedKek)> = keks
+            .iter()
+            .map(|(id, sk)| {
+                (
+                    id.clone(),
+                    ExportedKek {
+                        nonce: sk.wrapped.nonce,
+                        wrapped: sk.wrapped.wrapped.clone(),
+                        epoch: sk.epoch,
+                    },
+                )
+            })
+            .collect();
+        let dek_list: Vec<(DekId, WrappedDek, u64)> = deks
+            .iter()
+            // Exclude a DEK whose tenant has NO live KEK (crypto-shredded → stays dead across
+            // restore, §7.5) — the SAME rule `backup_snapshot` applies.
+            .filter(|(dek_id, _)| keks.keys().any(|k| k.tenant == dek_id.tenant))
+            .map(|(dek_id, (wrapped, epoch))| (dek_id.clone(), wrapped.clone(), *epoch))
+            .collect();
+        KmsDurableSnapshot {
+            sealed_root: self.root.seal(seal_key),
+            keks: kek_list,
+            deks: dek_list,
+        }
     }
 
     /// Envelope-wrap raw DEK material under a tenant's KEK (the L1→L2 seal) — the primitive the
@@ -1102,6 +1365,137 @@ mod tests {
             dbg.contains("CellRoot"),
             "the CellRoot wrapper is named: {dbg}"
         );
+    }
+
+    // ───────────── MR-025: the software-sealed durable root-of-trust (DB-free crypto proofs) ─────
+
+    #[test]
+    fn seal_unseal_round_trips_the_root_and_never_rests_plaintext() {
+        let root = CellRoot::generate();
+        let seal = SealKey::from_bytes([3u8; KEY_LEN]);
+        let sealed = root.seal(&seal);
+        // The sealed bytes are CIPHERTEXT — the root NEVER rests in plaintext at rest.
+        assert_ne!(
+            sealed.ciphertext.as_slice(),
+            root.root.0.as_slice(),
+            "the sealed root is ciphertext, never the plaintext root"
+        );
+        // Unseal under the CORRECT key recovers the exact root (so every KEK it wrapped still unwraps).
+        let recovered = CellRoot::unseal(&seal, &sealed).expect("unseal under the correct seal key");
+        assert_eq!(
+            recovered.root.0, root.root.0,
+            "unseal recovers the exact 256-bit root"
+        );
+    }
+
+    #[test]
+    fn unseal_with_a_wrong_seal_key_fails_never_a_silent_root() {
+        // The crypto heart of the fail-closed posture: a sealed root does NOT unseal under a wrong
+        // seal key — None (AEAD auth failure), NEVER a fabricated/wrong root. The durable
+        // load_or_generate turns this None into a LOUD WrongSealKey + refuses to start (proven live).
+        let root = CellRoot::generate();
+        let sealed = root.seal(&SealKey::from_bytes([1u8; KEY_LEN]));
+        assert!(
+            CellRoot::unseal(&SealKey::from_bytes([2u8; KEY_LEN]), &sealed).is_none(),
+            "a wrong seal key must NOT unseal the root"
+        );
+    }
+
+    #[test]
+    fn a_kek_wrapped_under_the_root_survives_a_seal_unseal_cycle() {
+        // The durability invariant in miniature: a KEK wrapped under the root still unwraps under the
+        // root recovered from its sealed form — so persisted KEKs survive a restart (the very thing a
+        // fresh-root-per-process loses today).
+        let root = CellRoot::generate();
+        let kek_plain = RawKey::generate();
+        let wrapped = root.wrap_kek(&kek_plain);
+        let seal = SealKey::from_bytes([9u8; KEY_LEN]);
+        let recovered = CellRoot::unseal(&seal, &root.seal(&seal)).expect("unseal");
+        let unwrapped = recovered
+            .unwrap_kek(&wrapped)
+            .expect("the KEK unwraps under the recovered root");
+        assert_eq!(
+            unwrapped.0, kek_plain.0,
+            "the KEK plaintext survived the seal/unseal cycle"
+        );
+    }
+
+    #[test]
+    fn seal_key_from_encoded_decodes_hex_and_rejects_garbage() {
+        let hexkey = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let k = SealKey::from_encoded(hexkey).expect("valid 32-byte hex seal key");
+        // It works as a real AEAD key (seal+unseal a root under it).
+        let root = CellRoot::generate();
+        assert!(CellRoot::unseal(&k, &root.seal(&k)).is_some());
+        // Loud, fail-closed decode errors — never a silent zero/truncated key.
+        assert!(matches!(
+            SealKey::from_encoded("nothex!!"),
+            Err(SealKeyError::Decode(_))
+        ));
+        assert!(matches!(
+            SealKey::from_encoded("00112233"),
+            Err(SealKeyError::WrongLength(4))
+        ));
+    }
+
+    #[test]
+    fn seal_key_debug_is_redacted() {
+        // A seal key in a log is a TOTAL compromise — its Debug must never print the bytes.
+        let seal = SealKey::from_bytes([5u8; KEY_LEN]);
+        assert_eq!(format!("{seal:?}"), "SealKey(<redacted seal key>)");
+        assert!(!format!("{seal:?}").contains('5'));
+    }
+
+    #[test]
+    fn backup_snapshot_durable_carries_root_keks_deks_and_rebuilds_a_working_engine() {
+        // The full reconstruct path, DB-free: snapshot (sealed root + wrapped KEKs + wrapped DEKs) →
+        // unseal the root → install the keys → resolve a DEK and decrypt. This is the in-process twin
+        // of the live decrypt-across-restart proof.
+        let kms = KmsEngine::new();
+        let (live, region) = (t("live-co"), r("eu-west"));
+        let dead = t("offboarded-co");
+        kms.ensure_kek(&KekId::new(live.clone(), region.clone()));
+        kms.ensure_kek(&KekId::new(dead.clone(), region.clone()));
+        let kr = kms
+            .ensure_dek(&live, &region, KeyClass::Tenant)
+            .expect("live dek");
+        kms.ensure_dek(&dead, &region, KeyClass::Tenant)
+            .expect("dead dek");
+        // Seal a payload under the live DEK BEFORE snapshotting.
+        let (nonce, ct) = kms.resolve_dek(&kr, &region).expect("resolve").seal(b"col");
+
+        // Crypto-shred the offboarded tenant, then snapshot.
+        assert!(kms.destroy_kek(&KekId::new(dead.clone(), region.clone())));
+        let seal = SealKey::from_bytes([4u8; KEY_LEN]);
+        let snap = kms.backup_snapshot_durable(&seal);
+
+        assert!(snap.keks.iter().any(|(id, _)| id.tenant == live));
+        assert!(
+            !snap.keks.iter().any(|(id, _)| id.tenant == dead),
+            "a crypto-shredded KEK is EXCLUDED from the durable snapshot"
+        );
+        assert!(snap.deks.iter().any(|(id, ..)| id.tenant == live));
+        assert!(
+            !snap.deks.iter().any(|(id, ..)| id.tenant == dead),
+            "a crypto-shredded tenant's DEK is EXCLUDED (stays dead across restore)"
+        );
+
+        // Rebuild a FRESH engine from the snapshot (unseal root + install keys) and DECRYPT.
+        let engine2 = KmsEngine::from_root(
+            CellRoot::unseal(&seal, &snap.sealed_root).expect("unseal the snapshot root"),
+        );
+        for (id, k) in snap.keks {
+            engine2.install_wrapped_kek(id, k.nonce, k.wrapped, k.epoch);
+        }
+        for (id, w, e) in snap.deks {
+            engine2.install_wrapped_dek(id, w, e);
+        }
+        let pt = engine2
+            .resolve_dek(&kr, &region)
+            .expect("the live DEK resolves after a from-snapshot rebuild")
+            .open(&nonce, &ct)
+            .expect("and decrypts the pre-snapshot ciphertext");
+        assert_eq!(pt, b"col", "decrypt across a from-snapshot rebuild");
     }
 
     #[test]
