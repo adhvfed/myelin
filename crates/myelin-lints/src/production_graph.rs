@@ -628,10 +628,13 @@ pub fn no_in_memory_durable_store() -> Lint {
 ///      store's own `scoped_conn` helpers acquire-then-scope internally, which is the sanctioned
 ///      path — so removing the hatch closes the bare-acquire bypass.)
 ///
-/// **This documents, it does not fix.** The real fix (`SET LOCAL` / `set_config(…, true)` +
-/// reset-on-release + removing the bare `pool()` hatch + identifier validation + mTLS) is MR-013
-/// (P-531). MR-004 only ships the absence scanner + the committed baseline so MR-013's fix is
-/// provable. It MUST flag `crates/myelin-storage/src/pg.rs:413` (the `set_config(…, false)` line).
+/// **The fix landed (MR-013 / P-531).** The PgStore tenant path was transaction-scoped
+/// (`set_config(…, true)` via the MR-022 `with_tenant_tx` convention + reset-on-release pool) and the
+/// bare `pool() -> &PgPool` hatch was removed (replaced by `health_check()`), so this scanner is now
+/// GREEN over the production tree (the two former baseline anchors `pg.rs:413`/`pg.rs:150` were flipped
+/// — see `tests/production_graph_absence.rs`). The scanner stays armed: a regression to a
+/// session-scoped `set_config(<tenant GUC>, _, false)` or a new `fn pool(…) -> &PgPool` hatch fires
+/// LOUDLY. (The mTLS half of the region pin belongs to the runtime transport layer; deferred there.)
 pub const NO_BARE_TENANT_POOL: LintId = LintId("no-bare-tenant-pool");
 
 /// Tenant/region GUC names whose session-scoped `set_config` leaks across pooled connections.

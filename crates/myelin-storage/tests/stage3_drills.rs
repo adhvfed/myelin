@@ -52,6 +52,17 @@ fn admin_url(cfg: &MyelinConfig) -> String {
         .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
 
+/// A raw admin/owner pool for test-only DDL + cleanup SQL. MR-013 removed `PgStore::pool()` (the
+/// bare tenant-bypassing hatch); the drills build their OWN admin pool from the admin URL for the
+/// throwaway state tables + cleanup — test infrastructure, NOT the tenant store handing out its pool.
+async fn admin_pool(cfg: &MyelinConfig) -> sqlx::PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(6)
+        .connect(&admin_url(cfg))
+        .await
+        .expect("connect admin pool (is the stack up?)")
+}
+
 /// A process-unique, monotonic suffix so concurrent runs (and re-runs) never collide on
 /// event_ids / aggregates / stream names.
 fn uniq() -> String {
@@ -143,6 +154,7 @@ async fn drill1_outbox_no_loss_under_crash() {
         .migrate()
         .await
         .expect("run migrations (outbox + rebac_tuple + RLS)");
+    let pool = admin_pool(&cfg).await;
 
     let tag = uniq();
     // A real domain STATE table the outbox co-commits with (the emit-iff-committed seam).
@@ -150,7 +162,7 @@ async fn drill1_outbox_no_loss_under_crash() {
     sqlx::raw_sql(&format!(
         "CREATE TABLE IF NOT EXISTS {state_table} (id text PRIMARY KEY, event_id text NOT NULL)"
     ))
-    .execute(store.pool())
+    .execute(&pool)
     .await
     .expect("create drill state table");
 
@@ -274,7 +286,7 @@ async fn drill1_outbox_no_loss_under_crash() {
             "SELECT count(*) FROM {state_table} WHERE event_id = $1"
         ))
         .bind(&env.0)
-        .fetch_one(store.pool())
+        .fetch_one(&pool)
         .await
         .expect("state lookup");
         assert_eq!(
@@ -292,11 +304,11 @@ async fn drill1_outbox_no_loss_under_crash() {
     // cleanup
     sqlx::query("DELETE FROM outbox WHERE aggregate = $1")
         .bind(&agg)
-        .execute(store.pool())
+        .execute(&pool)
         .await
         .ok();
     sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {state_table}"))
-        .execute(store.pool())
+        .execute(&pool)
         .await
         .ok();
     tokio::task::block_in_place(|| bus.purge());
@@ -328,6 +340,7 @@ async fn drill2_restore_verify_cross_seam() {
         .await
         .expect("connect Postgres");
     store.migrate().await.expect("migrate");
+    let pool = admin_pool(&cfg).await;
 
     let blobs = S3BlobStore::connect(&cfg.s3, tokio::runtime::Handle::current());
     let tag = uniq();
@@ -340,7 +353,7 @@ async fn drill2_restore_verify_cross_seam() {
         "CREATE TABLE IF NOT EXISTS {docs} \
          (seq bigint PRIMARY KEY, blob_hash text NOT NULL, bus_event_id text NOT NULL)"
     ))
-    .execute(store.pool())
+    .execute(&pool)
     .await
     .expect("create docs table");
 
@@ -351,13 +364,13 @@ async fn drill2_restore_verify_cross_seam() {
     sqlx::raw_sql(&format!(
         "CREATE TABLE IF NOT EXISTS {offset} (k text PRIMARY KEY, bus_offset bigint NOT NULL)"
     ))
-    .execute(store.pool())
+    .execute(&pool)
     .await
     .expect("create offset table");
     sqlx::query(&format!(
         "INSERT INTO {offset} (k, bus_offset) VALUES ('bus', 0) ON CONFLICT (k) DO NOTHING"
     ))
-    .execute(store.pool())
+    .execute(&pool)
     .await
     .expect("seed offset");
 
@@ -375,7 +388,7 @@ async fn drill2_restore_verify_cross_seam() {
         .bind(seq)
         .bind(&hash.digest_hex)
         .bind(&bus_event_id)
-        .execute(store.pool())
+        .execute(&pool)
         .await
         .expect("insert doc row");
         // the bus delivered this event → advance the offset.
@@ -383,7 +396,7 @@ async fn drill2_restore_verify_cross_seam() {
             "UPDATE {offset} SET bus_offset = $1 WHERE k = 'bus'"
         ))
         .bind(seq)
-        .execute(store.pool())
+        .execute(&pool)
         .await
         .expect("advance bus offset");
     }
@@ -392,7 +405,7 @@ async fn drill2_restore_verify_cross_seam() {
     // the bus offset == T). This is the one cross-seam cursor restore lands every tier at.
     let captured_offset: i64 =
         sqlx::query_scalar(&format!("SELECT bus_offset FROM {offset} WHERE k='bus'"))
-            .fetch_one(store.pool())
+            .fetch_one(&pool)
             .await
             .expect("read offset at T");
     assert_eq!(captured_offset, T, "the captured bus offset is exactly T");
@@ -408,14 +421,14 @@ async fn drill2_restore_verify_cross_seam() {
     .bind(T + 1)
     .bind(&post_hash.digest_hex)
     .bind(format!("d2-evt-{tag}-{}", T + 1))
-    .execute(store.pool())
+    .execute(&pool)
     .await
     .expect("insert post-T row");
     sqlx::query(&format!(
         "UPDATE {offset} SET bus_offset = $1 WHERE k = 'bus'"
     ))
     .bind(T + 1)
-    .execute(store.pool())
+    .execute(&pool)
     .await
     .expect("advance bus offset past T");
 
@@ -423,14 +436,14 @@ async fn drill2_restore_verify_cross_seam() {
     //     and lands the bus offset back at T (the cursor cannot point past the restored rows).
     sqlx::query(&format!("DELETE FROM {docs} WHERE seq > $1"))
         .bind(T)
-        .execute(store.pool())
+        .execute(&pool)
         .await
         .expect("restore: drop rows past T");
     sqlx::query(&format!(
         "UPDATE {offset} SET bus_offset = $1 WHERE k = 'bus'"
     ))
     .bind(T)
-    .execute(store.pool())
+    .execute(&pool)
     .await
     .expect("restore: land bus offset at T");
 
@@ -439,7 +452,7 @@ async fn drill2_restore_verify_cross_seam() {
     let restored_rows: Vec<(i64, String)> = {
         let rows: Vec<(i64, String)> =
             sqlx::query_as(&format!("SELECT seq, blob_hash FROM {docs} ORDER BY seq"))
-                .fetch_all(store.pool())
+                .fetch_all(&pool)
                 .await
                 .expect("read restored rows");
         rows
@@ -470,12 +483,12 @@ async fn drill2_restore_verify_cross_seam() {
     //      offset past the restored rows (the post-T event is not referenced by any cursor).
     let max_restored_seq: i64 =
         sqlx::query_scalar(&format!("SELECT coalesce(max(seq),0) FROM {docs}"))
-            .fetch_one(store.pool())
+            .fetch_one(&pool)
             .await
             .expect("max restored seq");
     let restored_offset: i64 =
         sqlx::query_scalar(&format!("SELECT bus_offset FROM {offset} WHERE k='bus'"))
-            .fetch_one(store.pool())
+            .fetch_one(&pool)
             .await
             .expect("restored offset");
     assert_eq!(max_restored_seq, T, "the newest restored row is at T");
@@ -491,7 +504,7 @@ async fn drill2_restore_verify_cross_seam() {
     //      forbidden direction is a row -> missing blob, which 4a proved cannot happen.)
     let post_rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {docs} WHERE seq > $1"))
         .bind(T)
-        .fetch_one(store.pool())
+        .fetch_one(&pool)
         .await
         .expect("count post-T rows");
     assert_eq!(
@@ -513,7 +526,7 @@ async fn drill2_restore_verify_cross_seam() {
     sqlx::raw_sql(&format!(
         "DROP TABLE IF EXISTS {docs}; DROP TABLE IF EXISTS {offset};"
     ))
-    .execute(store.pool())
+    .execute(&pool)
     .await
     .ok();
 }
@@ -545,6 +558,7 @@ async fn drill3_tenant_region_rls_isolation() {
         .migrate()
         .await
         .expect("migrate (rebac_tuple + RLS policy)");
+    let pool = admin_pool(&cfg).await;
 
     let tag = uniq();
     let tenant_a = format!("tenant-A-{tag}");
@@ -629,12 +643,12 @@ async fn drill3_tenant_region_rls_isolation() {
     )
     .bind(&tenant_a)
     .bind(&cfg.region)
-    .execute(admin.pool())
+    .execute(&pool)
     .await
     .ok();
     sqlx::query("DELETE FROM rebac_tuple WHERE tenant_id = $1")
         .bind(&tenant_a)
-        .execute(admin.pool())
+        .execute(&pool)
         .await
         .ok();
     sqlx::query(
@@ -642,12 +656,12 @@ async fn drill3_tenant_region_rls_isolation() {
     )
     .bind(&tenant_b)
     .bind(&cfg.region)
-    .execute(admin.pool())
+    .execute(&pool)
     .await
     .ok();
     sqlx::query("DELETE FROM rebac_tuple WHERE tenant_id = $1")
         .bind(&tenant_b)
-        .execute(admin.pool())
+        .execute(&pool)
         .await
         .ok();
 }
@@ -676,6 +690,7 @@ async fn drill4_rebac_check_list_objects_no_leak_no_n_plus_1() {
         .await
         .expect("connect Postgres");
     store.migrate().await.expect("migrate (rebac_tuple + RLS)");
+    let pool = admin_pool(&cfg).await;
 
     let tag = uniq();
     let tenant = format!("acme-d4-{tag}");
@@ -802,12 +817,12 @@ async fn drill4_rebac_check_list_objects_no_leak_no_n_plus_1() {
     )
     .bind(&tenant)
     .bind(&cfg.region)
-    .execute(store.pool())
+    .execute(&pool)
     .await
     .ok();
     sqlx::query("DELETE FROM rebac_tuple WHERE tenant_id = $1")
         .bind(&tenant)
-        .execute(store.pool())
+        .execute(&pool)
         .await
         .ok();
 }

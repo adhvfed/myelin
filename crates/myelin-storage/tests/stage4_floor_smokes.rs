@@ -49,6 +49,16 @@ fn admin_url(cfg: &MyelinConfig) -> String {
         .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
 
+/// A raw admin/owner pool for test-only DDL + cleanup SQL (MR-013 removed `PgStore::pool()` — the
+/// bare tenant-bypassing hatch). Test infrastructure, NOT the tenant store handing out its pool.
+async fn admin_pool(cfg: &MyelinConfig) -> sqlx::PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&admin_url(cfg))
+        .await
+        .expect("connect admin pool (is the stack up?)")
+}
+
 fn principal() -> Principal {
     Principal::stub(
         PrincipalId("p".into()),
@@ -215,13 +225,14 @@ async fn load_10x_containerized_smoke() {
         .await
         .expect("connect Postgres (is the stack up?)");
     store.migrate().await.expect("run migrations");
+    let pool = admin_pool(&cfg).await;
 
     let tag = format!("{}-{}", std::process::id(), 0);
     let state_table = format!("load10x_state_{}", tag.replace('-', "_"));
     sqlx::raw_sql(&format!(
         "CREATE TABLE IF NOT EXISTS {state_table} (id text PRIMARY KEY, event_id text NOT NULL)"
     ))
-    .execute(store.pool())
+    .execute(&pool)
     .await
     .expect("create load state table");
 
@@ -350,11 +361,11 @@ async fn load_10x_containerized_smoke() {
     // cleanup
     sqlx::query("DELETE FROM outbox WHERE aggregate = $1")
         .bind(&agg)
-        .execute(store.pool())
+        .execute(&pool)
         .await
         .ok();
     sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {state_table}"))
-        .execute(store.pool())
+        .execute(&pool)
         .await
         .ok();
     tokio::task::block_in_place(|| bus.purge());
