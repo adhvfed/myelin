@@ -47,8 +47,8 @@ surface in the same style.
 | MR-013 | E0.5 | Tenant isolation: **`SET LOCAL` RLS + reset-on-release** (fixes `set_config(...,false)` bleed) + identifier allowlist + mTLS/region fail-fast | REUSE P-531 | MR-009 | ~mid |
 | MR-014 | E0.6 | Product/edge API: the **edge gateway design** + auth integration (E0.5 tokens) + the API conventions every subsystem follows | NET-NEW | MR-012, MR-013 | design+impl; ~mid–high |
 | MR-015 | E0.6 | Product/edge API: **wire the existing `serve(AppSpec)` shells through the edge**; the Git API contract first (reuse git `api.rs` grammar) | NET-NEW | MR-014 | ~mid |
-| MR-016 | E0.7 | Frontend: the **Solid design-system package** (Tier 0 tokens/icons/styleguide wired) + the **"Solid patterns for agents" guide** + the **frontend lint** (eslint-plugin-solid/jsx-a11y/axe) | NET-NEW | — | ~mid |
-| MR-017 | E0.7 | Frontend: **Kobalte validation** + the **Tier-1 overlay primitives** (Dialog/Confirm/Popover/Dropdown/Tooltip/Toast — focus/portal/z-index/ARIA once) | NET-NEW | MR-016 | ~mid–high |
+| MR-016 | E0.7 | Frontend: the **Solid design-system package** (Tier 0 tokens/icons/styleguide wired) + the **"Solid patterns for agents" guide** (seeded from `10-frontend-component-patterns.md`) + the **frontend lint** (eslint-plugin-solid/jsx-a11y/axe) | NET-NEW | — | ~mid |
+| MR-017 | E0.7 | Frontend: the **hand-built Tier-1 overlay primitives** (Dialog/Confirm/Popover/Dropdown/Tooltip/Toast — focus-trap/portal/scroll-lock/z-index/ARIA once, per doc 10 §1) gated by axe+keyboard | NET-NEW | MR-016 | ~mid–high |
 | MR-018 | E0.7 | Frontend: the **Tauri 2 shell skeleton** (desktop + mobile) sharing the Rust core (`myelin-content`/`myelin-client`); **validate the mobile target early** | NET-NEW | MR-016 | ~mid (mobile risk) |
 | MR-019 | E0.7/E0.8 | Frontend: the **SolidStart app shell** (nav/routing/auth-session/layout/⌘K trigger/inbox/identity menu/residency cue) + the **Playwright+axe** harness | NET-NEW | MR-015, MR-017 | ~mid–high; **may split shell / test-harness** |
 | MR-020 | E0.9 | **CLI:** the `myelin` CLI core (clap binary + auth + command framework) — reuse the git/notif command grammars | NET-NEW | MR-015 | ~mid |
@@ -85,6 +85,11 @@ prompts depending on what the shape review finds.
   identity chrome; the Playwright+axe harness that **re-platforms the switch-test onto a real browser**.
 - **MR-020/021 (CLI/MCP):** the `myelin` binary and the MCP server, both calling the product API under real
   auth+audit — the near-term "agents, but driven locally" path.
+
+> **Frontend note:** the hard components (overlays, command palette, block editor, real-time, data, app
+> shell) have a known-good behavioural approach in `10-frontend-component-patterns.md` — minimal deps,
+> hand-built primitives, per-block contenteditable, SolidStart-native data + a server cookie-auth gateway,
+> SSE. The subsystem UI prompts implement these fresh against the design tokens and harden the named edges.
 
 ## After the spine
 
