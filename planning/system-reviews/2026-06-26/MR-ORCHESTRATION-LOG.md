@@ -71,7 +71,9 @@ MR-010a wires nothing into the prod default (StructuralVerifier still the OIDC d
 
 **Codex review attempted (user suggestion):** codex CLI is non-functional in this environment — `codex exec`/`doctor`/`login status` all exit 144 with no output (only `--help`/`--version` work; likely an auth/runtime/network issue specific to the API-calling subcommands). Relied on the thorough Claude security audit. If codex is fixed (auth/runtime) it can be a second lens on later security-critical prompts.
 
-Auth-crypto so far: OIDC + SSH + SAML all real, all survived a security verifier trying to forge. WebAuthn (MR-010c) next (user: build all four, test in depth).
+| MR-010c | WebAuthn/FIDO2 passkey (assertion + registration; ES256-DER/RS256/EdDSA; CBOR via ciborium) | WebauthnVerifier behind the seam + 25-test corpus (forged sig, counter-clone, alg-confusion, origin look-alikes, CBOR fuzz) | INDEP SECURITY verifier: ACCEPT-w/-followups → 15 adversarial attacks, COULD NOT forge any assertion; counter floor holds (failed sig does NOT advance counter), origin exact-match (punycode rejected), CBOR fuzz no-panic; packed-full/tpm/apple honestly refused-loud | GREEN (25 webauthn + full lints + workspace; +4 pure-Rust crates) | (this) |
+
+**MR-010 (human/SSO real crypto) COMPLETE** — all four credential types (OIDC, SSH, SAML, WebAuthn) are real and each survived an independent security verifier trying to forge past it. Minor non-blocking follow-ups logged: WebAuthn RSA public-exponent explicit bound (redundant w/ the rsa crate); challenge burned on failed-sig assertion (availability note, not a bypass); MR-012 must flip the prod default (all four are test-wired today, Structural still the prod default until then).
 
 ## Test environment (verified live 2026-06-26 — every persistence/auth prompt uses this)
 

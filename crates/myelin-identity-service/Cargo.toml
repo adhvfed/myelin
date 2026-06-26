@@ -127,6 +127,17 @@ base64 = "0.22"
 # (no libxml2 / openssl) — the security-conscious choice for this minefield (see saml.rs STEP-1 note).
 xmlparser = "0.13"
 # ------------------------------------------------------------------------------------------
+# MR-010c (SI-001/004, the passkey slice of P-526): REAL WebAuthn/FIDO2 assertion + attestation
+# verification. WebAuthn needs CBOR (the attestationObject + the COSE-encoded credential public key)
+# and COSE key parsing; no CBOR/COSE crate was in Cargo.lock. `ciborium` is a small, well-maintained,
+# PURE-Rust CBOR codec (NO C deps; it pulls only pure-Rust crates — ciborium-io/ll, half, crunchy). Its
+# `from_reader` is TOTAL (a malformed/truncated/garbage blob is an `Err`, never a panic — the fuzz
+# requirement). The signature math is NOT hand-rolled: COSE ES256 (ASN.1-DER, `ring`), RS256 (`rsa` +
+# `sha2`), and EdDSA (`ring`) reuse the SAME vetted primitives the OIDC/SSH paths already pull. The
+# X.509 attestation-cert chain (packed FULL / tpm / apple / android) is DEFERRED (refused, not faked) —
+# no pure-Rust X.509 chain verifier is in the lock, and a half-built one would be a security regression.
+ciborium = "0.2"
+# ------------------------------------------------------------------------------------------
 # MR-007 (SI-018/019): the durable PG backings for the S1 principal + S3 tuple stores live in
 # myelin-storage behind its `integration` feature (the real sqlx client). The identity-layer
 # stores delegate to them through the MR-022 SubstrateProvider + with_tenant_tx convention. The
