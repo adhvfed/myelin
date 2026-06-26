@@ -275,6 +275,21 @@ pub struct Thresholds {
     /// Mirrors `myelin_knowledge::switch_test`'s budgets.
     #[serde(default)]
     pub knowledge_switch_test: KnowledgeSwitchTestThreshold,
+    /// The Issues **switch-test** budgets (ISS-P37 / P-520, M6; the Issues ISS-D14 switch test;
+    /// issue-tracker §6 M6-I10 the dogfood + switch-test done-bar — the create→triage→plan→board→done
+    /// loop without a manual, measured contrast + latency on the primary screens incl. the empty/
+    /// loading/error/permission/erased/agent-pending states; VISION §3 the switch test driven in a
+    /// browser). The microsecond render-latency ceiling the driven Issues surface (a representative
+    /// canonical-view render — the board/table/roadmap view the switch test drives, issue-tracker arch
+    /// 04 §S3/S4/S5) must stay WITHIN, plus the contrast floor (WCAG 1.4.3 normal-text 4.5:1 — the
+    /// design-manual §2 measured anchor) the rendered state-pill / priority-badge / agent-pending /
+    /// erased-tombstone overlays must MEET, for a Jira/Linear user to move to Myelin Issues without
+    /// hitting a wall the old tool didn't have. MEASURED by the switch test (driven against the real
+    /// surface, EI-01 §4), never hardcoded in the test and never weakened to pass. `#[serde(default)]`
+    /// so an older thresholds file (pre-P-520) still parses against the seeds. Mirrors
+    /// `myelin_issues::switch_test`'s budgets.
+    #[serde(default)]
+    pub issues_switch_test: IssuesSwitchTestThreshold,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -1045,6 +1060,70 @@ impl Default for KnowledgeSwitchTestThreshold {
     fn default() -> Self {
         KnowledgeSwitchTestThreshold {
             page_render_budget_us: Self::PAGE_RENDER_BUDGET_US_SEED,
+            overlay_contrast_floor_bp: Self::OVERLAY_CONTRAST_FLOOR_BP_SEED,
+        }
+    }
+}
+
+/// The Issues **switch-test** budgets (ISS-P37 / P-520, M6). The render-latency ceiling the driven
+/// Issues surface (a representative canonical-view render — the board/table/roadmap view the switch
+/// test drives, issue-tracker arch 04 §S3/S4/S5) must stay WITHIN, plus the contrast floor (in basis
+/// points of a contrast ratio — `× 100`, so 450 == the WCAG 1.4.3 normal-text 4.5:1 minimum, the
+/// design-manual §2 measured anchor) the rendered state-pill / priority-badge / agent-pending /
+/// erased-tombstone overlays must MEET, for a Jira/Linear user to move to Myelin Issues without hitting
+/// a wall the old tool didn't have. MEASURED by the switch test (driven against the real surface,
+/// EI-01 §4), never hardcoded in the test and never weakened to pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuesSwitchTestThreshold {
+    /// **The view render latency budget, in MICROSECONDS** (`_us`; the §2.10 units anchor). The
+    /// representative Issues canonical-view render (the board/table/roadmap view the switch test drives
+    /// — the `ViewSpec` projection over the one `issue` table, issue-tracker arch 04 §S3/S4/S5) must
+    /// complete within this p-latency; a render slower than the Jira/Linear board anchor's interactive
+    /// grade is a UX wall (the §1.1 keyboard < ~100ms reading bar).
+    #[serde(default = "IssuesSwitchTestThreshold::default_view_render_budget_us")]
+    pub view_render_budget_us: u64,
+    /// **The state-pill / priority-badge / agent-pending / erased-tombstone overlay contrast floor, in
+    /// BASIS POINTS of a contrast ratio** (`× 100`; 450 == 4.5:1). Every rendered primary-screen overlay
+    /// text/background pair must MEET this WCAG 1.4.3 normal-text floor (the design-manual §2
+    /// measured-contrast anchor); an overlay below it is an accessibility wall the switch test reds.
+    /// Basis points (an integer) so the threshold is exact + serde-stable (no float).
+    #[serde(default = "IssuesSwitchTestThreshold::default_overlay_contrast_floor_bp")]
+    pub overlay_contrast_floor_bp: u32,
+}
+
+impl IssuesSwitchTestThreshold {
+    /// The seed view render budget: **50 000 µs (= 50 ms)** — an interactive Issues-board render grade
+    /// (a Jira/Linear board is interactive at this grade). ISS-P37 measures the real render against
+    /// this; the number is dated here, never a value to tune toward (measured-not-predicted, EI-01 §3).
+    pub const VIEW_RENDER_BUDGET_US_SEED: u64 = 50_000;
+    /// The seed overlay contrast floor: **450 bp (= 4.5:1)** — the WCAG 1.4.3 normal-text minimum (the
+    /// design-manual §2 PROVEN floor). Every state-pill / priority-badge / agent-pending / erased
+    /// overlay must meet or beat it.
+    pub const OVERLAY_CONTRAST_FLOOR_BP_SEED: u32 = 450;
+
+    /// The seed view render budget (`_us`). Used when an older thresholds file omits the row.
+    pub fn default_view_render_budget_us() -> u64 {
+        Self::VIEW_RENDER_BUDGET_US_SEED
+    }
+
+    /// The seed overlay contrast floor (`_bp`). Used when an older thresholds file omits the row.
+    pub fn default_overlay_contrast_floor_bp() -> u32 {
+        Self::OVERLAY_CONTRAST_FLOOR_BP_SEED
+    }
+
+    /// Whether the switch-test budgets are well-formed: a positive render budget AND a contrast floor
+    /// that actually demands the WCAG minimum (≥ 450 bp). A 0 render budget ("any render is a wall") or
+    /// a sub-AA contrast floor would manufacture a green by a vacuous bar — rejected (EI-01 §3).
+    pub fn is_well_formed(&self) -> bool {
+        self.view_render_budget_us > 0 && self.overlay_contrast_floor_bp >= 450
+    }
+}
+
+impl Default for IssuesSwitchTestThreshold {
+    /// The seed budgets (ISS-P37 dates the measured surfaces against them).
+    fn default() -> Self {
+        IssuesSwitchTestThreshold {
+            view_render_budget_us: Self::VIEW_RENDER_BUDGET_US_SEED,
             overlay_contrast_floor_bp: Self::OVERLAY_CONTRAST_FLOOR_BP_SEED,
         }
     }

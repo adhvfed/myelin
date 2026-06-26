@@ -552,6 +552,58 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "git_p35_switch_test_drill",
             ],
         },
+        // (16) the ISSUES dogfood band (P-520 / ISS-P37 → M6-I10): THE DONE-BAR. Myelin tracks its OWN
+        //      issues — the team plans its own sprints on the platform's own board/roadmap. Myelin's own
+        //      roadmap/gap-report/scorecard live as Myelin issues whose bodies round-trip through the ONE
+        //      WASM render path (render(parse(md)) === md, ISS-D10); the PR context pane (a confidential
+        //      issue's title/count never leaks, 0 leak), the agent-native flagship (a governed close
+        //      HITL-gated + exactly-once across a crash), and the spec-to-ship lineage (cold-reindex ==
+        //      live byte-for-byte) — all green, 0 leak; the Issues truth-up pass confirms every PROVEN
+        //      Issues row (ISS-D1..D13 + the E2E slices) rests on a dated green artifact (0 red later-band
+        //      Issues gate); the every-incident-adds-a-drill loop is self-hosted. WIRES the existing Issues
+        //      surface + drills (EI-01 §7 — never re-implemented here). The switch test is the next band.
+        SelfHostJob {
+            id: "ISS-P37-dogfood",
+            title: "Myelin tracks its own issues — own work as Myelin issues (round-trip) + the PR \
+                    context pane + the agent-native flagship (exactly-once close) + the spec-to-ship \
+                    lineage (all green, 0 leak) + the Issues truth-up pass (0 red later-band Issues \
+                    gate) + the self-hosted every-incident-adds-a-drill loop",
+            kind: JobKind::Drill,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-issues",
+                "--test",
+                "iss_p37_dogfood_drill",
+            ],
+        },
+        // (17) the ISSUES switch-test band (P-520 / ISS-P37 → M6-I10): the ISS-D14 switch test driven over
+        //      the real surface — could a JIRA/LINEAR user complete create→triage→plan→board→done WITHOUT
+        //      a manual? The representative canonical view renders within the latency budget, the issue
+        //      bodies round-trip (render(parse(md)) === md at 100%, contract 13.1), every primary-screen
+        //      overlay (state-pill/priority-badge/agent-pending/erased) meets the WCAG 4.5:1 contrast floor
+        //      (the design-manual §2 measured anchor), and every primary-screen state (empty/loading/error/
+        //      permission/erased/agent-pending) is reached — 0 walls vs the Jira/Linear anchor. WIRES the
+        //      existing canonical ViewSpec views + the ONE WASM round-trip + the §2 overlays (EI-01 §7 —
+        //      never re-implemented here). The pixel-level browser drive over the live <Board>/<Views>
+        //      shell is the honest named floor.
+        SelfHostJob {
+            id: "ISS-P37-switch-test",
+            title: "the Issues ISS-D14 switch test driven over the real surface — the \
+                    create→triage→plan→board→done loop without a manual + the canonical view render \
+                    within budget + render(parse(md)) === md at 100% + every overlay at ≥ 4.5:1 contrast \
+                    + every primary-screen state reached (0 walls vs the Jira/Linear anchor)",
+            kind: JobKind::Drill,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-issues",
+                "--test",
+                "iss_p37_switch_test_drill",
+            ],
+        },
     ]
 }
 

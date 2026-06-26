@@ -180,6 +180,20 @@ page_render_budget_us = 50000               # MEASURED-GATE: the representative 
 overlay_contrast_floor_bp = 450             # MEASURED-GATE: the reference-chip / tombstone overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-manual §2 anchor); an overlay below it is an accessibility wall.
 
 # ---------------------------------------------------------------------------------------------
+# [issues_switch_test] — the Issues ISS-D14 SWITCH-TEST budgets (ISS-P37 / P-520, M6; the issue-tracker
+# done-bar; issue-tracker §6 M6-I10 the dogfood + switch-test bullet — the create→triage→plan→board→done
+# loop without a manual, measured contrast + latency on the primary screens incl. the empty/loading/error/
+# permission/erased/agent-pending states; VISION §3 the switch test driven in a browser). The render-latency
+# ceiling the driven Issues surface (a representative canonical-view render — the board/table/roadmap view)
+# must stay WITHIN, plus the contrast floor every rendered primary-screen overlay must MEET, for a
+# Jira/Linear user to move to Myelin Issues without hitting a wall the old tool didn't have. MEASURED by the
+# switch test (driven against the real surface, EI-01 §4), never hardcoded in the test and never weakened.
+# ---------------------------------------------------------------------------------------------
+[issues_switch_test]
+view_render_budget_us = 50000               # MEASURED-GATE: the representative Issues canonical-view render p-latency (the board/table/roadmap view the switch test drives, a ViewSpec projection over the one issue table); slower than the Jira/Linear board anchor's interactive grade is a UX wall.
+overlay_contrast_floor_bp = 450             # MEASURED-GATE: the state-pill / priority-badge / agent-pending / erased-tombstone overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-manual §2 anchor); an overlay below it is an accessibility wall.
+
+# ---------------------------------------------------------------------------------------------
 # [authz_surge] — the ID-D9 (F6) protected-human-lane authz-decision p99 budget under the 30× authz
 # hot-path surge (identity §10/§13: authz is the highest-QPS shared system; contract 1.8
 # `auth_decision_latency` / 4.11 the shed order on the authz surface).

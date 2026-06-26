@@ -271,6 +271,7 @@ pub mod cost_bounder;
 pub mod cross_cell_rollup;
 pub mod declares;
 pub mod dek;
+pub mod dogfood;
 pub mod e2e_flagship;
 pub mod e2e_lineage;
 pub mod e2e_wedge;
@@ -301,6 +302,7 @@ pub mod schemes;
 pub mod sla_calendar;
 pub mod sla_escalation;
 pub mod surge;
+pub mod switch_test;
 pub mod time_axis;
 pub mod trigger;
 pub mod views;
@@ -714,6 +716,30 @@ pub use e2e_flagship::{run_e2e_2_issues_flagship, CLOSE_CARD_ID, E2E_FLAGSHIP_SC
 pub use e2e_lineage::{
     lineage_audit_anchor, run_e2e_3_lineage, run_issues_e2e_3, E2E_LINEAGE_SCENARIO,
     LINEAGE_DEPTH_BOUND,
+};
+
+// ISS-P37 (P-520, M6-I10): the dogfood done-bar — Myelin tracks its OWN issues + the truth-up pass + the
+// switch test (driven over the real surface). `run_issues_over_myelins_own_work` drives the production
+// Issues surface across the four faces (Myelin's own work as Myelin issues, the PR context pane, the
+// agent-native flagship, the spec-to-ship lineage) on the Myelin self-tenant, REUSING the existing
+// E2E runners + the ONE WASM render path (`roundtrips_md`) — no new contract, no second engine (EI-01 §7).
+// `run_issues_truth_up_scorecard` enumerates every PROVEN Issues row (ISS-D1..ISS-D13 + E2E-1/E2E-2/E2E-3)
+// and asserts each rests on a DATED green artifact whose proof source exists on disk (code-wins-over-docs,
+// EI-01 §1). `IssuesIncident` is the every-incident-adds-a-drill loop (a PII-free Myelin issue draft + a
+// reproducing-drill ticket). `IssuesSwitchTest::drive` reaches the ISS-D14 switch-test verdict over the
+// real surface (the create→triage→plan→board→done loop without a manual, measured contrast/latency on the
+// primary screens incl. the empty/loading/error/permission/erased/agent-pending states). FLOOR named: none
+// new (the world-scale 30x load is ISS-P33's; the pixel-level browser drive is the UI follow-on's, recorded
+// honestly as a named floor).
+pub use dogfood::{
+    myelin_issue_backlog, proven_issues_rows, run_issues_over_myelins_own_work,
+    run_issues_truth_up_scorecard, IssuesDogfoodArtifact, IssuesIncident, IssuesRowStatus,
+    IssuesTruthUpPass, IssuesTruthUpRed, IssuesTruthUpScorecard, IssuesTruthUpVerdict, MyelinIssue,
+    ProvenIssuesRow, MYELIN_SELF_REGION, MYELIN_SELF_TENANT,
+};
+pub use switch_test::{
+    switch_capability_matrix, switch_surface_drive_record, IssuesOverlay, IssuesSwitchTest,
+    IssuesSwitchVerdict, PrimaryScreenState, SwitchCapability,
 };
 
 // ISS-P25 (P-392, M4-I6): the stateful Trigger flagship ("Remind me when unblocked") — exactly-once
