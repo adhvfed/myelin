@@ -194,6 +194,20 @@ view_render_budget_us = 50000               # MEASURED-GATE: the representative 
 overlay_contrast_floor_bp = 450             # MEASURED-GATE: the state-pill / priority-badge / agent-pending / erased-tombstone overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-manual §2 anchor); an overlay below it is an accessibility wall.
 
 # ---------------------------------------------------------------------------------------------
+# [chat_switch_test] — the Chat CHAT-D19 SWITCH-TEST budgets (CHAT-P32 / P-521, M6; the chat done-bar;
+# chat §4 M6 the switch-test done-bar — drive the real Chat UI (the 13 screens S1–S13 + the responsive
+# cases: hover-action / width-takeover / flip-popover) in a browser; measured contrast + latency budgets —
+# optimistic send < ~100ms perceived; flip-popovers correct against the real bottom-pinned composer anchor;
+# VISION §3 the switch test driven in a browser). The perceived optimistic-send latency ceiling the driven
+# Chat composer's optimistic echo must stay WITHIN, plus the contrast floor every rendered overlay must MEET,
+# for a Slack user to move to Myelin Chat without hitting a wall the old tool didn't have. MEASURED by the
+# switch test (driven against the real surface, EI-01 §4), never hardcoded in the test and never weakened.
+# ---------------------------------------------------------------------------------------------
+[chat_switch_test]
+perceived_send_budget_us = 100000           # MEASURED-GATE: the optimistic-send perceived p-latency (the S3 composer's optimistic echo into the timeline before the durable ack); the wireframes' "optimistic send < ~100ms perceived" target — slower than the Slack anchor's optimistic grade is a UX wall.
+overlay_contrast_floor_bp = 450             # MEASURED-GATE: the message-row / agent / unfurl / erased-tombstone overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-manual §2 anchor); an overlay below it is an accessibility wall.
+
+# ---------------------------------------------------------------------------------------------
 # [authz_surge] — the ID-D9 (F6) protected-human-lane authz-decision p99 budget under the 30× authz
 # hot-path surge (identity §10/§13: authz is the highest-QPS shared system; contract 1.8
 # `auth_decision_latency` / 4.11 the shed order on the authz surface).
