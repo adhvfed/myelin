@@ -178,6 +178,7 @@ pub mod conversation;
 pub mod cross_org;
 pub mod dek;
 pub mod dispatch;
+pub mod dogfood;
 pub mod e2e_wedge;
 pub mod erase;
 pub mod events;
@@ -197,6 +198,7 @@ pub mod scylla_followon;
 pub mod search;
 pub mod store;
 pub mod subs;
+pub mod switch_test;
 pub mod tools;
 pub mod unfurl;
 
@@ -226,6 +228,10 @@ pub use dispatch::{
     agent_provenance, dispatch_disposition_class, dispatch_explicit, mention_is_always_notify_only,
     no_auto_spawn_path_is_wired, reserve_gate, AgentProvenance, DispatchOutcome, Disposition,
     L3_AUTO_SPAWN_ABSENCE, PROVENANCE_AUDIT_LINK_KIND,
+};
+pub use dogfood::{
+    myelin_chat_channels, run_chat_over_myelins_own_work, ChatDogfoodArtifact, MyelinChannel,
+    MYELIN_SELF_REGION, MYELIN_SELF_TENANT,
 };
 pub use e2e_wedge::{run_chat_e2e_wedge, ChatE2eArtifact};
 pub use erase::{
@@ -291,6 +297,10 @@ pub use store::{
     MonotonicUlidSource, NewMessage, OutboxTx, RangeCursor, StoreError, SystemUlidSource,
     TombstoneReason, UlidSource, SCYLLA_HOT_TIER_PROMOTED, SCYLLA_PROMOTION_LANDING,
     SCYLLA_PROMOTION_TRIGGER,
+};
+pub use switch_test::{
+    chat_screen_catalogue, ChatOverlay, ChatSwitchTest, ChatSwitchVerdict, ComposerAnchor,
+    MeasuredLegs as ChatSwitchMeasuredLegs, ResponsiveCase, ScreenRecord, ScreenVerdict,
 };
 pub use unfurl::{
     filter_candidates_by_class, precompute_visibility_class, AuthzVisibleIndex, Card,

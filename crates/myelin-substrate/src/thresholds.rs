@@ -290,6 +290,20 @@ pub struct Thresholds {
     /// `myelin_issues::switch_test`'s budgets.
     #[serde(default)]
     pub issues_switch_test: IssuesSwitchTestThreshold,
+    /// The Chat **switch-test** budgets (CHAT-P32 / P-521, M6; the Chat CHAT-D19 switch test;
+    /// chat §4 M6 the dogfood + switch-test done-bar — drive the real Chat UI (the 13 screens S1–S13
+    /// plus the responsive cases) in a browser; measured contrast + latency budgets (optimistic send
+    /// under ~100ms perceived); flip-popovers correct against the real bottom-pinned composer; VISION
+    /// §3 the switch test driven in a browser). The microsecond perceived-send-latency ceiling the
+    /// driven Chat composer's optimistic send must stay WITHIN (a slow optimistic echo is a UX wall —
+    /// chat arch 04 §1 the composer S3), plus the contrast floor (WCAG 1.4.3 normal-text 4.5:1 — the
+    /// design-manual §2 measured anchor) the rendered message-row / agent / unfurl / erased-tombstone
+    /// overlays must MEET, for a Slack user to move to Myelin Chat without hitting a wall the old tool
+    /// didn't have. MEASURED by the switch test (driven against the real surface, EI-01 §4), never
+    /// hardcoded in the test and never weakened to pass. `#[serde(default)]` so an older thresholds
+    /// file (pre-P-521) still parses against the seeds. Mirrors `myelin_chat::switch_test`'s budgets.
+    #[serde(default)]
+    pub chat_switch_test: ChatSwitchTestThreshold,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -1124,6 +1138,71 @@ impl Default for IssuesSwitchTestThreshold {
     fn default() -> Self {
         IssuesSwitchTestThreshold {
             view_render_budget_us: Self::VIEW_RENDER_BUDGET_US_SEED,
+            overlay_contrast_floor_bp: Self::OVERLAY_CONTRAST_FLOOR_BP_SEED,
+        }
+    }
+}
+
+/// The Chat **switch-test** budgets (CHAT-P32 / P-521, M6). The perceived-send-latency ceiling the
+/// driven Chat composer's optimistic send (the S3 composer's optimistic echo — chat arch 04 §1) must
+/// stay WITHIN, plus the contrast floor (in basis points of a contrast ratio — `× 100`, so 450 == the
+/// WCAG 1.4.3 normal-text 4.5:1 minimum, the design-manual §2 measured anchor) the rendered
+/// message-row / agent / unfurl / erased-tombstone overlays must MEET, for a Slack user to move to
+/// Myelin Chat without hitting a wall the old tool didn't have. MEASURED by the switch test (driven
+/// against the real surface, EI-01 §4), never hardcoded in the test and never weakened to pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatSwitchTestThreshold {
+    /// **The perceived optimistic-send latency budget, in MICROSECONDS** (`_us`; the §2.10 units
+    /// anchor). The optimistic send the composer renders (the message echoes into the timeline
+    /// BEFORE the durable ack — chat arch 04 §1, design-language §8b.4) must complete within this
+    /// p-latency; the drill bar is **< ~100ms perceived** (the wireframes' "optimistic send" target),
+    /// so the seed is 100 000 µs. A send slower than the Slack anchor's optimistic grade is a UX wall.
+    #[serde(default = "ChatSwitchTestThreshold::default_perceived_send_budget_us")]
+    pub perceived_send_budget_us: u64,
+    /// **The message-row / agent / unfurl / erased-tombstone overlay contrast floor, in BASIS POINTS
+    /// of a contrast ratio** (`× 100`; 450 == 4.5:1). Every rendered Chat overlay text/background pair
+    /// must MEET this WCAG 1.4.3 normal-text floor (the design-manual §2 measured-contrast anchor); an
+    /// overlay below it is an accessibility wall the switch test reds. Basis points (an integer) so
+    /// the threshold is exact + serde-stable (no float).
+    #[serde(default = "ChatSwitchTestThreshold::default_overlay_contrast_floor_bp")]
+    pub overlay_contrast_floor_bp: u32,
+}
+
+impl ChatSwitchTestThreshold {
+    /// The seed perceived-send budget: **100 000 µs (= 100 ms)** — the wireframes' "optimistic send
+    /// < ~100ms perceived" target (a Slack message echoes instantly). CHAT-P32 measures the real
+    /// optimistic echo against this; the number is dated here, never a value to tune toward
+    /// (measured-not-predicted, EI-01 §3).
+    pub const PERCEIVED_SEND_BUDGET_US_SEED: u64 = 100_000;
+    /// The seed overlay contrast floor: **450 bp (= 4.5:1)** — the WCAG 1.4.3 normal-text minimum (the
+    /// design-manual §2 PROVEN floor). Every message-row / agent / unfurl / erased overlay must meet
+    /// or beat it.
+    pub const OVERLAY_CONTRAST_FLOOR_BP_SEED: u32 = 450;
+
+    /// The seed perceived-send budget (`_us`). Used when an older thresholds file omits the row.
+    pub fn default_perceived_send_budget_us() -> u64 {
+        Self::PERCEIVED_SEND_BUDGET_US_SEED
+    }
+
+    /// The seed overlay contrast floor (`_bp`). Used when an older thresholds file omits the row.
+    pub fn default_overlay_contrast_floor_bp() -> u32 {
+        Self::OVERLAY_CONTRAST_FLOOR_BP_SEED
+    }
+
+    /// Whether the switch-test budgets are well-formed: a positive perceived-send budget AND a
+    /// contrast floor that actually demands the WCAG minimum (≥ 450 bp). A 0 send budget ("any send is
+    /// a wall") or a sub-AA contrast floor would manufacture a green by a vacuous bar — rejected
+    /// (EI-01 §3).
+    pub fn is_well_formed(&self) -> bool {
+        self.perceived_send_budget_us > 0 && self.overlay_contrast_floor_bp >= 450
+    }
+}
+
+impl Default for ChatSwitchTestThreshold {
+    /// The seed budgets (CHAT-P32 dates the measured surfaces against them).
+    fn default() -> Self {
+        ChatSwitchTestThreshold {
+            perceived_send_budget_us: Self::PERCEIVED_SEND_BUDGET_US_SEED,
             overlay_contrast_floor_bp: Self::OVERLAY_CONTRAST_FLOOR_BP_SEED,
         }
     }
