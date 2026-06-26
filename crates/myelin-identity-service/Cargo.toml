@@ -101,6 +101,22 @@ myelin-refs = { path = "../myelin-refs" }
 # clock here). NON-optional: the default-build (in-memory) revocation path uses the same comparison.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 # ------------------------------------------------------------------------------------------
+# MR-010a (SI-001/004, the OIDC slice of P-526): REAL OIDC ID-token (JWT) signature verification.
+# The verifier replaces the forgeable `StructuralVerifier` for the OIDC scheme with VETTED crypto —
+# NO hand-rolled signature math. All four crates below are ALREADY in Cargo.lock as transitive deps
+# (ring/rsa/base64 via the sqlx/rustls/aws stacks); these edges only PROMOTE them to direct deps, so
+# no new crate enters the dependency tree.
+#   - `ring` — ES256 (ECDSA P-256/SHA-256, fixed r‖s) + EdDSA (Ed25519) signature verification.
+#   - `rsa` + `sha2` — RS256 (RSA PKCS#1 v1.5 / SHA-256), constructed straight from the JWKS n/e.
+#   - `base64` — base64url (no-pad) decoding of the JWS compact segments (RFC 7515).
+# JWKS is INJECTED (no network in the crypto path); a runtime jwks_uri fetch is a later thin layer.
+ring = "0.17"
+rsa = "0.9"
+# `oid` enables `AssociatedOid` for Sha256 — required for the prefixed PKCS#1 v1.5 (RS256) DigestInfo.
+# Features are additive across the workspace; this widens the shared `sha2` build, breaking nothing.
+sha2 = { workspace = true, features = ["oid"] }
+base64 = "0.22"
+# ------------------------------------------------------------------------------------------
 # MR-007 (SI-018/019): the durable PG backings for the S1 principal + S3 tuple stores live in
 # myelin-storage behind its `integration` feature (the real sqlx client). The identity-layer
 # stores delegate to them through the MR-022 SubstrateProvider + with_tenant_tx convention. The
@@ -114,6 +130,10 @@ myelin-config = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
+# MR-010a: the OIDC negative/positive corpus MINTS real RSA keys to sign genuine test tokens (the
+# verifier only ever sees the PUBLIC half via the injected JWKS). `rand` 0.8 (rand_core 0.6,
+# compatible with rsa 0.9's keygen) is already in Cargo.lock — DEV-only, never in the prod graph.
+rand = "0.8"
 # P-ID-10 (P-068) ID-D3 drill: the failure-injection harness's telemetry-assertion library
 # (the contract-1.8 survival-signal set, incl. CrossTenantCount) the cross-tenant drill emits its
 # dated green artifact through. DEV-only — myelin-harness never enters the service production DAG.

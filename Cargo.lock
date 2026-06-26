@@ -2463,6 +2463,7 @@ dependencies = [
 name = "myelin-identity-service"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "chrono",
  "myelin-agent",
  "myelin-client",
@@ -2477,7 +2478,11 @@ dependencies = [
  "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",
+ "rand",
+ "ring",
+ "rsa",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tokio",
 ]

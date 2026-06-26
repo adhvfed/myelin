@@ -59,6 +59,12 @@ reason; always use `cargo test` for the gate.
 
 **Master-plan Tier-0 done-bar MET: load-bearing state survives kill -9 + restart** (proven, not asserted). The production-default flip (un-gate durable layer + Memory→test-only → scanner green) is MR-009b — large blast radius (15 modules, 6 deps, all Memory variants), deferred not faked.
 
+### E0.5 auth crypto (MR-010 split per credential type — Revision 2)
+
+| MR-010a | OIDC JWKS real crypto (RS256/ES256/EdDSA, alg-confusion + alg:none defence, replay guard) | OidcVerifier behind the CredentialVerifier seam + 18-test negative corpus | INDEP SECURITY verifier: ACCEPT-w/-followups → ran 10 adversarial forgeries, COULD NOT forge a token past it (alg-confusion all key types, jwk/jku/x5u smuggling, ES256 DER malleability, tenant-injection all rejected); found a panic-DoS (alg byte-slice + i64 leeway overflow) on attacker bytes → builder fixed all 4 sites (saturating arith), verify now total over attacker input | GREEN (18 oidc + full lints + workspace; no new crates) | (this) |
+
+MR-010a wires nothing into the prod default (StructuralVerifier still the OIDC default until MR-012); it ADDS the real verifier + proves it. JWKS network fetch/rotation deferred (injected key set).
+
 ## Test environment (verified live 2026-06-26 — every persistence/auth prompt uses this)
 
 Real backends run via `docker-compose.dev.yml` and are UP (confirmed `smoke_backends` integration test
