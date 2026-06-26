@@ -550,6 +550,61 @@ impl PrOverviewPage {
     }
 }
 
+/// **A representative PR overview page for the GIT-P35 switch test** (the view-model the switch test
+/// renders + measures, [`crate::switch_test`]). Assembles a real visible [`PrOverviewPage`] — a visible
+/// projection (title + state pill + checks-green render hint) + a live checks panel + a ready
+/// merge-readiness affordance — so the switch test's render leg exercises the SAME GIT-P32 assembly +
+/// render path (EI-01 §7, never a second renderer). `tenant` frames the page for the self-tenant. The
+/// page is PII-free (opaque ids only).
+pub fn switch_test_representative_pr_page(tenant: &str) -> PrOverviewPage {
+    use crate::check_status::{CheckContext, CheckStatus, GitOid, HumanisedRef, Timestamp};
+    use myelin_tenancy::{ArtifactRef, TenantId};
+    let fact = CheckStatus {
+        tenant: TenantId(tenant.into()),
+        repo: ArtifactRef(format!("myelin://{tenant}/git/repo/myelin")),
+        commit_oid: GitOid("blake3:switchtesthead".into()),
+        context: CheckContext::ci("build"),
+        state: CheckState::Success,
+        required: true,
+        run: ArtifactRef(format!("myelin://{tenant}/ci/run/1")),
+        run_attempt: 1,
+        trust_tier: TrustTier::Trusted,
+        details_ref: ArtifactRef(format!("myelin://{tenant}/ci/run/1#step-1")),
+        summary: HumanisedRef {
+            template_key: "ci.check.updated".into(),
+            args: std::collections::BTreeMap::new(),
+        },
+        started_at: Timestamp("2026-06-26T00:00:00Z".into()),
+        completed_at: Some(Timestamp("2026-06-26T00:01:00Z".into())),
+        cost_settled: true,
+    };
+    let row = CheckStatusRow::from_fact(&fact);
+    PrOverviewPage {
+        projected: Projected::Visible(crate::project::Projection {
+            title: format!("[{tenant}] Restore-verify gate at cell scale"),
+            state: "open".into(),
+            icon: "pr".into(),
+            render_hint: Some(RenderHint {
+                checks: ChecksSummary::Green,
+                approvals: (2, 2),
+                is_draft: false,
+            }),
+            sub_anchor: None,
+        }),
+        pr_state: PrState::Open,
+        checks: ChecksPanel::Live {
+            rows: vec![CheckRowView::from_row(
+                &row,
+                "build passed",
+                true,
+                false,
+                false,
+            )],
+        },
+        merge: MergeReadiness::from_gate(&MergeGateOutcome::Admitted, (2, 2)),
+    }
+}
+
 fn render_pr_hint(hint: &RenderHint) -> String {
     let cue = match hint.checks {
         ChecksSummary::Green => StatusCue {

@@ -153,6 +153,19 @@ doc_by_content_budget_us = 40000           # MEASURED-GATE: the doc-by-content s
 issue_by_facet_budget_us = 20000           # MEASURED-GATE: the issue-by-facet structured find on the issue corpus (status/priority/assignee); slower than a Jira facet search's interactive grade is a wall.
 
 # ---------------------------------------------------------------------------------------------
+# [git_switch_test] — the Git OQ-12 SWITCH-TEST budgets (GIT-P35 / P-518, M6; the git-hosting done-bar;
+# git-hosting §3 M6-G10 the switch-test bullet — measured contrast + latency + render(parse(md)) === md
+# + overlays against the real anchor; VISION §3 the switch test driven in a browser). The render-latency
+# ceiling the driven git surface (a representative PR overview page render) must stay WITHIN, plus the
+# contrast floor every rendered status overlay must MEET, for a GitHub user to move to Myelin git hosting
+# without hitting a wall the old tool didn't have. MEASURED by the switch test (driven against the real
+# surface, EI-01 §4), never hardcoded in the test and never weakened to pass.
+# ---------------------------------------------------------------------------------------------
+[git_switch_test]
+pr_overview_render_budget_us = 50000        # MEASURED-GATE: the representative PR overview page render p-latency (the view the switch test drives); slower than the GitHub PR-page anchor's interactive grade is a UX wall.
+overlay_contrast_floor_bp = 450             # MEASURED-GATE: the status-overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-language §8b anchor); an overlay below it is an accessibility wall.
+
+# ---------------------------------------------------------------------------------------------
 # [authz_surge] — the ID-D9 (F6) protected-human-lane authz-decision p99 budget under the 30× authz
 # hot-path surge (identity §10/§13: authz is the highest-QPS shared system; contract 1.8
 # `auth_decision_latency` / 4.11 the shed order on the authz surface).

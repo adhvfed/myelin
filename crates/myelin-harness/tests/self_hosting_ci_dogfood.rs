@@ -482,6 +482,64 @@ fn a_red_agent_fabric_dogfood_drill_rejects_the_commit() {
 }
 
 #[test]
+fn the_self_hosting_graph_runs_the_git_hosting_dogfood_band() {
+    // P-518 / GIT-P35 (M6) — THE DONE-BAR: the git-hosting dogfood band is wired as a Myelin CI job — the
+    // Myelin monorepo is hosted on Myelin git hosting; the PR context pane + the agent-native fix-PR
+    // flagship (exactly-once merge) + the spec-to-ship lineage all green on the platform's own work, plus
+    // the git truth-up pass (GIT-D1..D11 + the E2E slices).
+    let jobs = self_hosting_jobs();
+    assert!(
+        jobs.iter()
+            .any(|j| j.id == "GIT-P35-dogfood" && j.kind == JobKind::Drill),
+        "the self-hosting graph MUST run the git-hosting dogfood band (git hosts Myelin's own \
+         repositories + the git truth-up pass) as part of the self-hosting CI graph"
+    );
+}
+
+#[test]
+fn a_red_git_hosting_dogfood_drill_rejects_the_commit() {
+    // The git dogfood drill is part of the gate: a leak / a missed-or-double merge / a broken lineage / an
+    // undated PROVEN git row reds the graph — the ratchet rejects on Myelin's own work (EI-01 §5).
+    let jobs = self_hosting_jobs();
+    let run = run_graph(&jobs, &reds_one("GIT-P35-dogfood"));
+    assert!(
+        !run.is_green(),
+        "a red git dogfood drill (a leak / a double-merge / a broken lineage / a claimed-not-proven git \
+         row) MUST reject the commit — git hosting Myelin's own repositories is part of the self-hosting \
+         CI gate"
+    );
+    assert_eq!(run.red_jobs(), vec!["GIT-P35-dogfood"]);
+}
+
+#[test]
+fn the_self_hosting_graph_runs_the_git_switch_test_band() {
+    // P-518 / GIT-P35 (M6): the Git OQ-12 switch test is wired as a Myelin CI job — the PR overview render
+    // within budget + render(parse(md)) === md at 100% + every status overlay at ≥ 4.5:1 contrast, 0 walls
+    // vs the GitHub anchor.
+    let jobs = self_hosting_jobs();
+    assert!(
+        jobs.iter()
+            .any(|j| j.id == "GIT-P35-switch-test" && j.kind == JobKind::Drill),
+        "the self-hosting graph MUST run the Git OQ-12 switch-test band (the PR overview render + the \
+         markdown round-trip + the status overlays, driven over the real surface) as a Myelin CI job"
+    );
+}
+
+#[test]
+fn a_red_git_switch_test_drill_rejects_the_commit() {
+    // The git switch test is part of the gate: a wall vs the GitHub anchor / a blown render budget / a
+    // broken round-trip / a sub-floor overlay reds the graph — the ratchet rejects on Myelin's own work.
+    let jobs = self_hosting_jobs();
+    let run = run_graph(&jobs, &reds_one("GIT-P35-switch-test"));
+    assert!(
+        !run.is_green(),
+        "a red git switch-test drill (a wall / a blown render budget / a broken round-trip / a sub-floor \
+         overlay) MUST reject the commit — the Git OQ-12 switch test is part of the self-hosting CI gate"
+    );
+    assert_eq!(run.red_jobs(), vec!["GIT-P35-switch-test"]);
+}
+
+#[test]
 fn an_empty_run_is_not_green() {
     // Guard: a run with no jobs is RED, not vacuously GREEN (dropping the whole graph cannot game
     // the gate green — the same un-gameable discipline as the band scorecards).
