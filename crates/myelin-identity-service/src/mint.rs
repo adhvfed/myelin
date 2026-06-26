@@ -243,28 +243,48 @@ pub struct RunTokenMinter {
 }
 
 impl RunTokenMinter {
-    /// Build a minter over a shared S7 [`RevocationStore`] (the one `check`/`authenticate`/`revoke`
-    /// consult), with the floor [`StructuralTokenSigner`] and NO tuple store (the pure-token mint).
-    /// The real crypto signer + a tuple store swap in via the `with_*` constructors.
-    pub fn new(revocations: RevocationStore) -> RunTokenMinter {
+    /// **The production minter constructor (MR-012) — REQUIRES an injected real [`TokenSigner`].**
+    /// No `Structural*` default is built here: the composition root injects the REAL
+    /// [`crate::capability_crypto::PasetoCapabilitySigner`] (PASETO v4 / Ed25519, from the cell token
+    /// authority). `tuples` is `Some` when the caller also writes the auto-expiring per-run grant
+    /// tuple (`expires_at == run life`, §6/§11). This is the constructor `StoreBackedCheck` wires —
+    /// the `no-structural-crypto-in-prod` scanner is GREEN here (no mock-crypto construction).
+    pub fn with_signer_and_tuples(
+        revocations: RevocationStore,
+        tuples: Option<TupleStore>,
+        signer: std::sync::Arc<dyn TokenSigner>,
+    ) -> RunTokenMinter {
         RunTokenMinter {
             algebra: DelegationAlgebra::new(),
             revocations,
-            signer: std::sync::Arc::new(StructuralTokenSigner::new()),
-            tuples: None,
+            signer,
+            tuples,
         }
     }
 
-    /// Build a minter that ALSO writes the auto-expiring per-run grant tuple (`expires_at == run
-    /// life`, §6/§11) through the shared [`TupleStore`] — the tuple-layer revoke-on-crash defence
-    /// the caller that owns the run's object graph wires alongside the token-layer S7 TTL.
-    pub fn with_tuple_store(revocations: RevocationStore, tuples: TupleStore) -> RunTokenMinter {
-        RunTokenMinter {
-            algebra: DelegationAlgebra::new(),
+    /// **TEST-DOUBLE constructor (`#[cfg(test)]`, MR-012).** Build a minter over a shared S7
+    /// [`RevocationStore`] with the mock floor [`StructuralTokenSigner`] and NO tuple store. The
+    /// forgeable-envelope signer is NOT in the production graph — production injects the real signer
+    /// via [`Self::with_signer_and_tuples`]; the scanner admits this `#[cfg(test)]`-gated construction.
+    #[cfg(test)]
+    pub fn new(revocations: RevocationStore) -> RunTokenMinter {
+        RunTokenMinter::with_signer_and_tuples(
             revocations,
-            signer: std::sync::Arc::new(StructuralTokenSigner::new()),
-            tuples: Some(tuples),
-        }
+            None,
+            std::sync::Arc::new(StructuralTokenSigner::new()),
+        )
+    }
+
+    /// **TEST-DOUBLE constructor (`#[cfg(test)]`, MR-012).** A minter that ALSO writes the
+    /// auto-expiring per-run grant tuple, with the mock floor [`StructuralTokenSigner`]. Production
+    /// uses [`Self::with_signer_and_tuples`] with the real signer.
+    #[cfg(test)]
+    pub fn with_tuple_store(revocations: RevocationStore, tuples: TupleStore) -> RunTokenMinter {
+        RunTokenMinter::with_signer_and_tuples(
+            revocations,
+            Some(tuples),
+            std::sync::Arc::new(StructuralTokenSigner::new()),
+        )
     }
 
     /// Swap in an explicit [`TokenSigner`] (the seam the real PASETO/biscuit crypto signer plugs

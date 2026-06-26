@@ -20,7 +20,7 @@
 use myelin_identity::{
     Credential, IdentityService, Principal, PrincipalId, PrincipalKind, PrincipalStatus,
 };
-use myelin_identity_service::{scheme, HumanSsoAuthenticator, PrincipalStore};
+use myelin_identity_service::{scheme, HumanSsoAuthenticator, PrincipalStore, StructuralVerifier};
 use myelin_storage::{KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
@@ -62,7 +62,11 @@ fn provider() -> HumanSsoAuthenticator {
             &PrincipalId("p:alice".into()),
         )
         .expect("link the OIDC credential");
-    HumanSsoAuthenticator::new(store)
+    // MR-012: the Structural-defaulting `new` is now a `#[cfg(test)]` test-double of the lib; this
+    // CDC test exercises the resolution body (tenant-from-credential / IDOR / fail-closed) over the
+    // mock floor verifier, injected explicitly via the production `with_verifier` seam (constructing a
+    // `Structural*` double in a `tests/` file is admitted — the prod-graph scanner excludes tests/).
+    HumanSsoAuthenticator::with_verifier(store, Arc::new(StructuralVerifier::new()))
 }
 
 /// The CONSUMER side: a gateway authenticates an inbound credential through the frozen

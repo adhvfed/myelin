@@ -393,10 +393,13 @@ pub struct CapabilityAuthenticator {
 }
 
 impl CapabilityAuthenticator {
-    /// Build the authenticator over the S1 [`PrincipalStore`] with the floor
-    /// [`StructuralTokenVerifier`] and a fresh in-memory [`RevocationStore`]. The REAL crypto verifier
-    /// ([`crate::capability_crypto::PasetoCapabilityVerifier`]) + the durable `with_pg` revocation
-    /// store swap in via [`Self::with_verifier`] without changing the resolution body.
+    /// **TEST-DOUBLE constructor (`#[cfg(test)]`, MR-012).** Builds the authenticator over the S1
+    /// [`PrincipalStore`] with the mock floor [`StructuralTokenVerifier`] and a fresh in-memory
+    /// [`RevocationStore`]. This forgeable-envelope default is NOT in the production graph — production
+    /// builds the REAL [`crate::capability_crypto::PasetoCapabilityVerifier`] (PASETO v4 / Ed25519,
+    /// from the cell trust anchor) via [`Self::with_verifier`]. The `no-structural-crypto-in-prod`
+    /// scanner admits this construction because it is `#[cfg(test)]`-gated.
+    #[cfg(test)]
     pub fn new(store: PrincipalStore) -> CapabilityAuthenticator {
         CapabilityAuthenticator::with_verifier(
             store,
@@ -1328,5 +1331,32 @@ mod tests {
                 "a {status:?} machine principal fails closed"
             );
         }
+    }
+
+    /// **THE MR-012 PROD-DEFAULT PROOF: the REAL PASETO verifier REFUSES a forged token (it is real
+    /// Ed25519 crypto, never the mock `StructuralTokenVerifier`).** The production capability
+    /// authenticator is built via [`CapabilityAuthenticator::with_verifier`] over the REAL
+    /// [`crate::capability_crypto::PasetoCapabilityVerifier`] (the cell trust anchor). A hand-rolled
+    /// plaintext `<tenant>|<region>|…` envelope — which the mock `StructuralTokenVerifier` would
+    /// parse and resolve — is NOT a valid PASETO v4.public token, so the real verifier REFUSES it.
+    /// This proves the prod default does real crypto: a forged token does not resolve a Principal.
+    #[test]
+    fn production_paseto_verifier_refuses_forged_token_never_mocks() {
+        use crate::capability_crypto::{CellTokenAuthority, PasetoCapabilityVerifier};
+        let cell = CellTokenAuthority::from_seed(&[7u8; 32], &[9u8; 32]).expect("cell authority");
+        let auth = CapabilityAuthenticator::with_verifier(
+            store(),
+            Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
+            RevocationStore::new(),
+        );
+        // The forgeable plaintext Structural envelope the MOCK verifier would accept — the real
+        // PASETO verifier rejects it (it is not a signed v4.public token).
+        let forged = material("acme", "eu-west", "run-1", "jti-forge", false, &["agent:run"]);
+        let r = auth.authenticate(&cred(scheme::AGENT, forged), None);
+        assert!(
+            matches!(r, Err(AuthzError::BadRequest(_)) | Err(AuthzError::FailClosed(_))),
+            "the production PASETO verifier must REFUSE a forged plaintext envelope (real crypto), \
+             never resolve it through the mock StructuralTokenVerifier"
+        );
     }
 }

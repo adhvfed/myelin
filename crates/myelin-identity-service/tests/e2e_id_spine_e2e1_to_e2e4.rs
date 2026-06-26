@@ -381,8 +381,14 @@ fn e2e2_triage_agent_runs_under_delegation_and_mint_exactly_once_merge() {
             &ts("2026-06-24T00:00:00Z"),
         )
         .expect("the per-run token mints");
+    // MR-012: the token is a REAL signed PASETO token; assert on the verified authority (read through
+    // the provider's cell trust anchor), not a plaintext substring of the now-opaque bytes.
+    let minted_authority = svc
+        .introspect_run_token("agent", &token)
+        .expect("the per-run token verifies through the real cell trust anchor (MR-012)")
+        .authority;
     assert!(
-        !token.token.contains("admin"),
+        !minted_authority.grants().any(|g| g.contains("admin")),
         "E2E-2: the mint dropped the #admin over-reach (the token never exceeds the ∩)"
     );
     assert!(

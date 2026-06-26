@@ -541,7 +541,23 @@ pub struct StoreBackedCheck {
     /// restore). Cloneable + shared so the erase path, the re-erasure pass, and the service read one
     /// ledger.
     erasure_ledger: pseudonym_erase::PseudonymErasureLedger,
+    /// **The cell token authority (MR-012) — the REAL Ed25519/PASETO keypair the per-run-token
+    /// [`mint::RunTokenMinter`] signs under.** Replaces the removed mock `StructuralTokenSigner` prod
+    /// default: minted run tokens are now genuine signed PASETO v4.public tokens (a forged token is
+    /// rejected). Held (Arc) so [`StoreBackedCheck::token_trust_anchor`] can hand out the PUBLIC half
+    /// for a consumer/drill to verify a minted token through a [`PasetoCapabilityVerifier`]. The
+    /// KMS-sealed cell-root LOAD of this key is the named provenance follow-on (P-527/MR-025).
+    cell_authority: std::sync::Arc<CellTokenAuthority>,
 }
+
+/// **The fixed PASETO `exp` ceiling (seconds) the production per-run-token signer stamps (MR-012).**
+/// The [`mint::TokenSigner`] seam does not receive the per-mint run-life TTL, so the production
+/// [`PasetoCapabilitySigner`] uses this generous fixed ceiling for the token's own `exp`. The
+/// AUTHORITATIVE per-run-life expiry is the `expires_at == run-life` TTL the mint registers in the
+/// durable S7 [`revocation::RevocationStore`] (the `is_live`/`is_revoked` consult every surface runs);
+/// the PASETO `exp` is a secondary fail-static ceiling. (Threading the per-mint TTL into the signer
+/// seam is a named follow-on; it does not affect the S7-authoritative run-life boundary.)
+pub const PROD_RUN_TOKEN_PASETO_TTL_SECS: i64 = 3600;
 
 impl StoreBackedCheck {
     /// Wire the real `check` engine over the S3 [`TupleStore`], with the **core org/team/project
@@ -559,14 +575,25 @@ impl StoreBackedCheck {
     /// projection. The core hierarchy is pre-loaded; subsystem fragments admit on top.
     pub fn with_index(tuples: TupleStore, index: ReverseIndex) -> StoreBackedCheck {
         let revocations = revocation::RevocationStore::new();
+        // MR-012: the per-run-token signer is the REAL PASETO v4.public (Ed25519) signer over a fresh
+        // cell token authority — NOT the removed mock `StructuralTokenSigner`. A minted run token is a
+        // genuinely-signed token (a forged token is rejected); the cell key's KMS-sealed provenance is
+        // the named follow-on (P-527/MR-025). The same authority's PUBLIC half verifies the token
+        // (`token_trust_anchor`), so the mint→verify round-trip is real crypto end-to-end.
+        let cell_authority = std::sync::Arc::new(CellTokenAuthority::generate());
+        let signer = std::sync::Arc::new(PasetoCapabilitySigner::new(
+            cell_authority.clone(),
+            PROD_RUN_TOKEN_PASETO_TTL_SECS,
+        ));
         // The minter shares THIS slot's S7 store + S3 tuple store (one revocation oracle, one write
         // primitive): a mint registers the per-run TTL into the SAME denylist `check`/`authenticate`
         // consult, and the auto-expiring per-run grant tuple goes through the SAME write_tuples path.
-        let minter = mint::RunTokenMinter::with_tuple_store(revocations.clone(), tuples.clone());
+        let minter =
+            mint::RunTokenMinter::with_signer_and_tuples(revocations.clone(), Some(tuples.clone()), signer);
         // The shared cell KMS (P-058) — the crypto-shred substrate. A fresh engine here; a live
         // service shares the cell engine S1/S2 seal under (so one per-subject-DEK shred erases both).
         let kms = std::sync::Arc::new(myelin_storage::KmsEngine::new());
-        StoreBackedCheck::with_kms(tuples, index, revocations, minter, kms)
+        StoreBackedCheck::with_kms(tuples, index, revocations, minter, kms, cell_authority)
     }
 
     /// Wire the slot over an EXPLICIT shared [`KmsEngine`] (so a live service can share the SAME cell
@@ -579,6 +606,7 @@ impl StoreBackedCheck {
         revocations: revocation::RevocationStore,
         minter: mint::RunTokenMinter,
         kms: std::sync::Arc<myelin_storage::KmsEngine>,
+        cell_authority: std::sync::Arc<CellTokenAuthority>,
     ) -> StoreBackedCheck {
         StoreBackedCheck {
             engine: CheckEngine::new(tuples.clone()),
@@ -593,7 +621,37 @@ impl StoreBackedCheck {
             pseudonyms: PseudonymStore::new(kms.clone()),
             erasure_ledger: pseudonym_erase::PseudonymErasureLedger::new(),
             kms,
+            cell_authority,
         }
+    }
+
+    /// **The cell token trust anchor (the PUBLIC half) the minted per-run tokens verify under
+    /// (MR-012).** Minted run tokens are now REAL signed PASETO v4.public tokens (not a plaintext
+    /// envelope), so a consumer / drill that needs to confirm a minted token's trust-rooted authority
+    /// builds a [`PasetoCapabilityVerifier`] from this anchor (or uses [`Self::introspect_run_token`]).
+    /// The anchor carries NO private signing key — it can verify but never mint.
+    pub fn token_trust_anchor(&self) -> CellTrustAnchor {
+        self.cell_authority.trust_anchor()
+    }
+
+    /// **Verify a per-run token THIS slot minted, returning its trust-rooted capability facts
+    /// (MR-012).** The minted material is a genuine signed PASETO token; this round-trips it through
+    /// the REAL [`PasetoCapabilityVerifier`] under the cell trust anchor — a FORGED token refuses
+    /// loudly (never resolves). `scheme` is the credential scheme the token was minted under
+    /// (`agent`/`ci`/`per_job`/…). Exposed so a drill/consumer can confirm a minted token's authority
+    /// without reaching into the (now opaque) token bytes.
+    pub fn introspect_run_token(
+        &self,
+        scheme: &str,
+        token: &myelin_identity::RunToken,
+    ) -> myelin_identity::Result<CapabilityToken> {
+        use machine_auth::TokenVerifier;
+        PasetoCapabilityVerifier::new(self.cell_authority.trust_anchor()).verify(
+            &myelin_identity::Credential {
+                scheme: scheme.to_string(),
+                material: token.token.clone(),
+            },
+        )
     }
 
     /// The shared S7 revocation list / token denylist (P-ID-14) this `check` slot consults — so a

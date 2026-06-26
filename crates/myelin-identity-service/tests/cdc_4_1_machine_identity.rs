@@ -24,7 +24,9 @@ use myelin_identity::{
     AuthzError, Credential, Principal, PrincipalId, PrincipalKind, PrincipalStatus,
 };
 use myelin_identity_service::machine_auth::scheme as machine_scheme;
-use myelin_identity_service::{CapabilityAuthenticator, PrincipalStore};
+use myelin_identity_service::{
+    CapabilityAuthenticator, PrincipalStore, RevocationStore, StructuralTokenVerifier,
+};
 use myelin_storage::{KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
@@ -78,7 +80,15 @@ fn provider() -> CapabilityAuthenticator {
             &PrincipalId("svc:runner".into()),
         )
         .expect("link the per-job token record");
-    CapabilityAuthenticator::new(store)
+    // MR-012: the Structural-defaulting `new` is now a `#[cfg(test)]` test-double of the lib; this
+    // CDC test exercises the resolution body (tenant-from-token / scope ceiling / revocation consult)
+    // over the mock floor verifier, injected explicitly via the production `with_verifier` seam
+    // (constructing a `Structural*` double in a `tests/` file is admitted — the scanner excludes tests/).
+    CapabilityAuthenticator::with_verifier(
+        store,
+        Arc::new(StructuralTokenVerifier::new()),
+        RevocationStore::new(),
+    )
 }
 
 /// The CONSUMER side: a CI-dispatch / gateway authenticates an inbound machine token and returns the

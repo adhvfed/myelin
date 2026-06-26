@@ -197,8 +197,14 @@ fn ci_dispatch_self_hosted_token_is_bounded_to_its_tenants_ci() {
     let acme = scope_of(&runner("acme", "svc:runner-acme"));
     let token = ci_dispatch_mints_self_hosted(&svc, &acme, "svc:runner-acme", "run-1", "acme")
         .expect("the CI-dispatch consumer mints an own-tenant self-hosted token");
+    // MR-012: the minted token is a REAL signed PASETO token; read its grants via the verify
+    // round-trip through the provider's cell trust anchor, not a plaintext substring.
+    let minted = svc
+        .introspect_run_token("per_job", &token)
+        .expect("a minted self-hosted token verifies through the real cell trust anchor (MR-012)")
+        .authority;
     assert!(
-        token.token.contains("selfhosted:acme") && !token.token.contains("globex"),
+        minted.holds("selfhosted:acme") && !minted.grants().any(|g| g.contains("globex")),
         "the minted token carries ONLY the own-tenant SelfHosted grant"
     );
 

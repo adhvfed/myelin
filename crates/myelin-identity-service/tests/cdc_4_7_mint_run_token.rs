@@ -68,6 +68,16 @@ fn auth(grants: &[&str]) -> Authority {
     Authority::of(grants.iter().copied())
 }
 
+/// **MR-012:** a minted per-run token is now a REAL signed PASETO v4.public token (not a plaintext
+/// envelope), so its grants are read by VERIFYING the token through the provider's cell trust anchor
+/// (the real crypto round-trip) — never by string-matching the now-opaque token bytes. (These tokens
+/// are minted under `MachineKind::Agent` → the `agent` scheme.)
+fn minted_authority(svc: &StoreBackedCheck, token: &RunToken) -> Authority {
+    svc.introspect_run_token("agent", token)
+        .expect("a minted per-run token verifies through the real cell trust anchor (MR-012)")
+        .authority
+}
+
 fn input(agent: &[&str], deleg: &[&str], tenant: &[&str], held: &[&str]) -> DelegationInput {
     DelegationInput {
         agent_policy: auth(agent),
@@ -132,8 +142,9 @@ fn cdc_4_7_minted_token_honoured_within_run_life() {
             &ts("2026-06-19T00:00:00Z"),
         )
         .expect("the provider mints a per-run token");
-    // The token carries exactly the effective grant (the mint applied the intersection).
-    assert!(token.token.contains("repo:acme/web#read"));
+    // The token carries exactly the effective grant (the mint applied the intersection) — read via
+    // the real PASETO verify round-trip (MR-012), not a plaintext substring.
+    assert!(minted_authority(&svc, &token).holds("repo:acme/web#read"));
     // The CONSUMER dispatches under the token and proceeds (it is live within run-life).
     assert!(
         dispatch_under_token_is_honoured(&svc, &s, &token, &ts("2026-06-19T00:02:00Z")),
@@ -168,11 +179,12 @@ fn cdc_4_7_mint_never_exceeds_effective_policy() {
             &ts("2026-06-19T00:00:00Z"),
         )
         .expect("mint");
+    let minted = minted_authority(&svc, &token);
     assert!(
-        !token.token.contains("admin"),
+        !minted.holds("repo:acme/web#admin"),
         "the mint never mints a grant the delegator never held (cannot delegate what you lack)"
     );
-    assert!(token.token.contains("repo:acme/web#read"));
+    assert!(minted.holds("repo:acme/web#read"));
 }
 
 /// **The 4.7 self-hosted-runner scope: a runner token cannot act cross-tenant.** The provider
@@ -281,9 +293,10 @@ fn cdc_4_7_re_mint_on_resume_yields_a_fresh_token() {
         resumed.jti, dispatch.jti,
         "the re-mint is a fresh token (distinct jti — its own life)"
     );
-    assert!(resumed.token.contains("g:read"));
+    let resumed_authority = minted_authority(&svc, &resumed);
+    assert!(resumed_authority.holds("g:read"));
     assert!(
-        !resumed.token.contains("g:write"),
+        !resumed_authority.holds("g:write"),
         "the re-minted token is narrower (the delegator lost g:write — recomputed as-of-resume)"
     );
 }

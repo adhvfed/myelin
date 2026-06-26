@@ -176,6 +176,24 @@ impl CellTokenAuthority {
         })
     }
 
+    /// **Generate a fresh per-cell token authority (the MR-012 production-boot floor).** Samples a
+    /// random 32-byte Ed25519 seed + 32-byte macaroon secret from the OS CSPRNG and builds a REAL
+    /// signing authority. This is genuine Ed25519/PASETO crypto — the production composition root signs
+    /// AND verifies per-run tokens under this keypair, so a FORGED token is rejected (no plaintext
+    /// envelope, no mock). The KMS-sealed cell-root LOAD of this material (so the key survives a cell
+    /// restart / is shared across the cell) is the named key-provenance follow-on (P-527 / MR-025) — a
+    /// key-management concern, NOT mock crypto. The private seed never leaves this process.
+    pub fn generate() -> CellTokenAuthority {
+        use ring::rand::SecureRandom;
+        let rng = ring::rand::SystemRandom::new();
+        let mut seed = [0u8; 32];
+        let mut mac = [0u8; 32];
+        rng.fill(&mut seed).expect("OS CSPRNG fills the Ed25519 seed");
+        rng.fill(&mut mac).expect("OS CSPRNG fills the macaroon secret");
+        CellTokenAuthority::from_seed(&seed, &mac)
+            .expect("a random 32-byte Ed25519 seed is always a valid cell authority")
+    }
+
     /// The verifier's trust anchor (the cell PUBLIC key + the shared macaroon secret). Injected into a
     /// [`PasetoCapabilityVerifier`]; it carries NO Ed25519 private key (a verifier can check but never
     /// mint a token).
