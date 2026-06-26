@@ -148,6 +148,14 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // exclusion, reddening the lint-gate; restored here as part of the P-506 truth-up pass, the
     // code-wins-over-docs re-sync, EI-01 §1: an earlier-band gate may not stay red under a later band.)
     "myelin-harness/src/bin/m5-scorecard.rs",
+    // The M6 production-readiness exit-gate runner (M6 → M7): same posture as the runners above —
+    // its `Command::new(env!("CARGO"))` (`run_proof`) spawns `cargo test`/`cargo run` per band-M6
+    // drill, the one legitimate host-exec site for a CI/test-support orchestration binary. NAMED,
+    // LOUD exclusion of a single tool file; the lint stays fully live on every production crate.
+    // (This entry was missing when m6-scorecard.rs landed — the runner shipped without its
+    // exclusion, reddening the lint-gate; restored here, same code-wins-over-docs re-sync as the m5
+    // entry above, EI-01 §1: an earlier-band gate may not stay red under a later band.)
+    "myelin-harness/src/bin/m6-scorecard.rs",
     // The Myelin self-hosting CI graph runner (the DOGFOOD loop, P-507 / P-S37 → M6): same posture
     // as the band-boundary scorecard runners above — its `Command::new(env!("CARGO"))` spawns
     // `cargo run`/`cargo test`/`cargo mutants` per ratchet job (the twelve lints + the

@@ -1,0 +1,16 @@
+//! The S1 principal store — the identity SYSTEM-OF-RECORD, durable by contract (SI-018). On this
+//! shape it is backed by an in-memory map with NO pool: it loses ALL state on restart.
+use std::sync::{Arc, Mutex};
+use std::collections::BTreeMap;
+
+/// The shared inner state behind the store handle (the in-memory backing).
+#[derive(Default)]
+struct Inner {
+    /// Committed principal rows, keyed by `(tenant, region)` partition then `principal_id`.
+    partitions: BTreeMap<(String, String), BTreeMap<String, PrincipalRow>>,
+}
+
+/// The S1 principal store (system-of-record). RED: in-memory, no pool/connection field.
+pub struct PrincipalStore {
+    inner: Arc<Mutex<Inner>>,
+}

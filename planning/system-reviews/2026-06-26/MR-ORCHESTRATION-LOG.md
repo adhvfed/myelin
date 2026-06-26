@@ -28,7 +28,8 @@ security-critical prompt gets an independent verifier agent that never touched t
 | baseline | `cargo check --workspace --all-targets` | — | — | GREEN | b4b7799 |
 | MR-001 | Census: substrate | 57 findings (~12 CRIT) | orch spot-check: symbols/lines verified | n/a (read-only) | (this) |
 | MR-002 | Census: Git + sandbox seam | 10 findings (5 CRIT) | orch spot-check: firecracker/gvisor/RefStore verified | n/a (read-only) | 2e2b6b1 |
-| MR-003 | Census synthesis → shortcut-inventory.md | 66 deduped (17 CRIT) | orch verified SI-010 + SI-006 against source | n/a (read-only) | (this) |
+| MR-003 | Census synthesis → shortcut-inventory.md | 66 deduped (17 CRIT) | orch verified SI-010 + SI-006 against source | n/a (read-only) | b00d536 |
+| MR-004 | Production-graph absence scanners | 3 scanners + 23-entry 2-way ratchet, 153 tests | INDEP verifier: ACCEPT-w/-followups → 4 false-negs found & closed; orch re-checked sites + gate | GREEN (cargo test -p myelin-lints; check workspace) | (this) |
 
 ## Decisions & deviations
 
@@ -44,4 +45,19 @@ security-critical prompt gets an independent verifier agent that never touched t
   (master plan already requires no-HashMap-for-load-bearing-state); this is the authoring-time split the ledger
   anticipated. Git ref-store/server/backup (SI-012/13/14/15) stay on the Git subsystem track, not the spine.
   Did NOT block the user on a question — autonomous batch, faithful to the master plan, fully reversible (planning).
+- **MR-004 verification loop (the cardinal rule in action).** Builder shipped 3 scanners + a two-way baseline
+  ratchet (148 tests). An INDEPENDENT verifier (never touched the code) ran it adversarially against the census
+  and found 3 real false negatives in `no-in-memory-durable-store` — type-alias collection fields
+  (`PseudonymErasureLedger`), `Vec`/`VecDeque`-backed ledgers (`InMemoryPostPitLedger`, SI-028 `MisrouteAudit`),
+  and a wrongly-excluded in-memory blob store (`FsBlobStore`, excluded on a FALSE "fs::write byte-durable"
+  premise — confirmed 0 `std::fs` calls in blob.rs). Sent back to builder; all 4 closed (baseline 19→23, +6
+  admit-tests proving no new false positives; SI-028 caught via a precise named-holder entry, not a blanket
+  suffix). This is exactly why builder≠verifier: the gate that everything downstream is certified against had
+  holes precisely in the persistence surface it must certify. **Known coverage boundary (documented in
+  `production_graph.rs`):** scanner #2 keys on role-suffix/named-holder, so non-suffix census sites (S7Denylist,
+  Consumer, Firehose, InMemoryShredder, OltpPool, PlacementService) are NOT yet gated — the events/control-plane
+  persistence MRs (MR-023/024) must extend `NAMED_DURABLE_HOLDERS`/`DURABLE_ROLE_SUFFIXES` when they land.
+- **Gate note:** `cargo test -p myelin-lints` was already RED on main before MR-004 (m6-scorecard.rs missing
+  from the no-host-exec exclusion list — same class as the excluded m3/m4/m5 runners). MR-004 restored it. The
+  baseline-green check must use `cargo test`, not just `cargo check`, going forward.
 - **Top systemic truths carried forward:** (1) the production auth graph is wired to `Structural*` mock crypto by default → total forgery; (2) tenant RLS bleeds across pooled connections; (3) no durable persistence anywhere load-bearing (identity stores, events outbox, KMS keys, git refs/pack-index all in-memory); (4) the sandbox never runs `spec.command` in prod and the escape gate certifies a path real jobs don't take; (5) git has no prod WireExecutor/server binary; (6) the E0.2 absence-scanners that should mechanically block these do not exist yet → **MR-004 is the true first build dependency.**

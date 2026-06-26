@@ -1,0 +1,17 @@
+//! The S1 principal store, durably backed by a real connection pool — state survives a restart.
+//! Plus: a legitimate in-memory CACHE/derived view is NOT a system-of-record and is admitted.
+
+/// The S1 principal store — durable-backed (a real pool), so it persists across a restart.
+pub struct PrincipalStore {
+    pool: PgPool,
+}
+
+/// A legitimate in-memory cache (rebuildable lookup) — NOT a durable system-of-record, admitted.
+pub struct PrincipalCache {
+    inner: std::sync::Mutex<std::collections::BTreeMap<String, Row>>,
+}
+
+/// A deliberate in-memory test/dev double (the `Mem*` prefix) — admitted by the precise scope.
+pub struct MemPrincipalStore {
+    inner: std::sync::Mutex<std::collections::BTreeMap<String, Row>>,
+}
