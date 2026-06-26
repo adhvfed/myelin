@@ -2324,6 +2324,7 @@ dependencies = [
  "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",
+ "tokio",
 ]
 
 [[package]]

@@ -8,6 +8,15 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+# MR-024: the durable PG binding for the placement registry (the `Pg` arm of the registry's backend
+# enum) compiles ONLY under `integration` — it pulls myelin-storage's real sqlx-backed durable
+# placement backing + a tokio runtime handle for the sync→async bridge. The DEFAULT build/test stays
+# DB-free (the in-memory Registry is the default test-double), exactly like identity-service's
+# `integration` feature gates its `with_pg` path. Production boot selecting the Pg arm is MR-009.
+[features]
+default = []
+integration = ["myelin-storage/integration", "dep:tokio"]
+
 # THE Tenancy control-plane SERVICE crate (P-CP-05 → global P-080): the three PII-free
 # control-plane registry tables (`cell` / `tenant_placement` / `cell_provisioning`) + the per-cell
 # `local_tenant` directory + the HARD placement invariant (multi-cell single-region by
@@ -77,6 +86,10 @@ hex = { workspace = true }
 # in-memory (the real engine's Postgres six-table model is the named myelin-flow floor); the control
 # plane consumes the engine-agnostic `DurableExecutor` TRAIT, never a concrete DB-bound engine.
 myelin-flow = { path = "../myelin-flow" }
+# MR-024: the sync→async bridge for the durable placement backing (block_in_place + block_on),
+# matching the sync Registry API to the async sqlx backing. Optional — pulled ONLY by `integration`
+# (the same posture identity-service / storage use for their live-PG code). DB-free by default.
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The GDPR/Audit SERVICE crate — DEV-only, for the contract-10.8 CDC pair + the STOR-D4/STOR-D3-GA-face

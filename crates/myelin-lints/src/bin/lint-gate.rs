@@ -74,6 +74,17 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // pg.rs stays FULLY linted. NAMED, LOUD exclusion (see the module note in pg_migrator.rs), never
     // a silent skip; the lint is NOT weakened.
     "myelin-storage/src/pg_migrator.rs",
+    // The durable CONTROL-PLANE PLACEMENT REGISTRY backing (MR-024 / SI-011/SI-028): the `cell` /
+    // `tenant_placement` / `misroute_audit` tables are control-plane ROUTING infra — the registry
+    // routes ALL tenants to cells, so every query is cross-tenant BY DESIGN (the gateway asks "which
+    // cell homes tenant X?" for any X). It is PII-free (opaque ids only — control-plane-pii-free) and
+    // is NOT a per-request tenant data store, so it does NOT use the with_tenant_tx/RLS convention and
+    // carries no per-row tenant predicate — exactly the relay-INTERNAL / non-tenant-store posture
+    // pgrelay.rs / events_durable.rs take above. The `tenant_id` column is the ROUTING KEY, not an RLS
+    // predicate; the HARD placement invariant is enforced as a REAL DB TRIGGER, not a tenant predicate.
+    // The tenant-store code in pg.rs / identity_durable.rs stays FULLY linted. NAMED, LOUD exclusion
+    // (see the module note in placement_durable.rs), never a silent skip; the lint is NOT weakened.
+    "myelin-storage/src/placement_durable.rs",
     // The FIREHOSE transport (EB-21 / P-141): `firehose::publish(stream, scope, frame)` is the
     // FROZEN contract-3.5 / §5.5 method name for the EPHEMERAL firehose transport — a DIFFERENT
     // seam from the durable bus the `no-raw-publish` lint guards. §4.3 is explicit: "the durable bus

@@ -283,6 +283,16 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-control-plane/src/cross_cell_bridge.rs",
         244,
     ),
+    // MR-024 (SI-011) ADDED the durable PG path for the placement registry: the `cell` +
+    // `tenant_placement` tables (frozen contract-12.3) + the HARD placement invariant as a REAL DB
+    // TRIGGER (`myelin_storage::placement_durable`) + the `Pg | Memory` backend enum binding
+    // (`myelin_control_plane::registry_durable::DurablePlacementRegistry::with_pg`), PROVEN durable +
+    // trigger-enforced against live PG (`integration_mr024_placement_durable`). Same status as the
+    // identity stores: the in-memory `Registry` (the `Memory` arm) is still the always-compiled
+    // DEFAULT and nothing wires the Pg arm in production yet (the Pg arm is behind
+    // `#[cfg(feature="integration")]`), so the in-memory store is still the production-graph default
+    // and this entry STILL fires here — honestly, SUPPLEMENTED not removed. Removed when production
+    // boot wires the durable Pg arm as the non-optional default (MR-009).
     (
         "no-in-memory-durable-store",
         "crates/myelin-control-plane/src/registry.rs",
@@ -392,6 +402,11 @@ const BASELINE: &[(&str, &str, usize)] = &[
     (
         // `MisrouteAudit` — `records: Arc<Mutex<Vec<MisrouteAuditRecord>>>`, an audit SINK whose
         // durable tamper-evident log is the named floor (census SI-028; control-plane durable MR).
+        // MR-024 ADDED the durable PG sink (`myelin_storage::DurableMisrouteAuditBacking` +
+        // `misroute_audit` table) + the binding (`DurablePlacementRegistry::record_misroute`), PROVEN
+        // durable against live PG (`integration_mr024_placement_durable`). SUPPLEMENTED not removed:
+        // the in-memory `MisrouteAudit` is still the default the gateway uses; the durable sink is
+        // behind `integration` and production wiring (the gateway writing the durable audit) is MR-009.
         "no-in-memory-durable-store",
         "crates/myelin-control-plane/src/placement_of.rs",
         223,

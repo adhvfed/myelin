@@ -241,6 +241,12 @@ pub mod placement_of;
 pub mod placement_of_repo;
 pub mod provision;
 pub mod registry;
+// MR-024 (SI-011/SI-028): the `Pg | Memory` backend enum that binds the placement registry to real
+// Postgres (durable cell/tenant_placement tables + the HARD-invariant DB TRIGGER + the durable
+// misroute audit sink in myelin_storage::placement_durable). Compiled ONLY under `integration` (the
+// in-memory Registry is the DB-free default); production boot selecting the Pg arm is MR-009.
+#[cfg(feature = "integration")]
+pub mod registry_durable;
 pub mod residency_verify;
 pub mod runner_claim_pin;
 pub mod schema;
