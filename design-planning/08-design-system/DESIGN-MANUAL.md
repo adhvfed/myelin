@@ -1,5 +1,14 @@
 # The Myelin Design Manual — direction A "Instrument"
 
+> ⚠️ **STACK SUPERSEDED (2026-06-26) — read before building any UI.** The visual system, tokens, icons, component
+> *specs*, principles, and the WCAG/APG accessibility bar in this manual **remain canonical**. But the
+> **implementation stack** named below (TypeScript + React + React Aria — §1.1/§1.2 of
+> `00-framework-and-buildout-plan.md`) is **superseded**: the build is **SolidJS + SolidStart + Tauri 2**, with
+> **hand-built overlay primitives** (not React Aria) and a **per-block `contenteditable`** editor. For ANY UI
+> surface, read **`planning/system-reviews/2026-06-26/08-frontend-foundation.md`** (the stack) and
+> **`…/10-frontend-component-patterns.md`** (the component behaviour) ALONGSIDE the relevant spec here. Wherever
+> this manual says "React" / "React Aria", read "Solid / hand-built" per docs 08 + 10.
+
 > **The single authoritative handbook for building a Myelin UI surface.** Open this first; it is the
 > through-line that ties the principles, tokens, components, patterns, and pipeline together and points
 > you at the detailed spec or the live styleguide for each. **Status date: 2026-06-21.**

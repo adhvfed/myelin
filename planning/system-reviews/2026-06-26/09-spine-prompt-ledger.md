@@ -18,6 +18,11 @@ surface in the same style.
 - **Sizing:** each prompt targets ~400k–700k execution tokens (canon/specs read + code read + impl + verify),
   **never above 700k.** The size note flags split/merge risk; flagged splits are confirmed at authoring time.
 - **Gate:** the batch runner runs these one at a time, cargo+frontend gate between each, halt on red.
+- **Frontend canon (binding on every UI prompt's CANON DOCS):** the stack is **SolidJS + SolidStart + Tauri 2**
+  with **hand-built primitives** — *not* React. Every UI/frontend prompt body MUST cite, and the agent MUST read
+  IN FULL FIRST: `08-frontend-foundation.md` (stack), `10-frontend-component-patterns.md` (component behaviour),
+  and the relevant `design-planning/08-design-system/` spec (tokens/icons/component-spec/a11y). The design
+  manual's named React+React-Aria stack is SUPERSEDED by docs 08+10 (a banner says so at both entry points).
 
 ## Dependency waves (the batch runs them linearly in this order; waves show what *could* parallelize)
 
