@@ -139,6 +139,20 @@ unfurl_budget_us = 16000                    # MEASURED-GATE: the "within the key
 jump_no_spinner_budget_us = 100000          # MEASURED-GATE: the whole four-keystroke jump (failing-test→line→issue→conversation) within the human-perceptible "instant" ceiling so no spinner flashes.
 
 # ---------------------------------------------------------------------------------------------
+# [search_switch_test] — the Search SWITCH-TEST interactive find-latency budgets (SRCH-P33 / P-515,
+# M6; the Search switch test; search-and-indexing §3 S-M6 the switch-test bullet — code-by-symbol /
+# doc-by-content / issue-by-facet found within the latency budget; VISION §3 the switch test). The
+# microsecond ceilings the three driven Search surfaces (the code-by-symbol FT find / the doc-by-content
+# semantic find / the issue-by-facet structured find) must stay WITHIN for a GitHub/Notion/Jira user to
+# FIND what they expect without hitting a wall the old tool didn't have. MEASURED by the switch test
+# (driven against the real Search surface, EI-01 §4), never hardcoded in the test and never weakened.
+# ---------------------------------------------------------------------------------------------
+[search_switch_test]
+code_by_symbol_budget_us = 30000            # MEASURED-GATE: the per-viewer code-by-symbol trigram FT find on the git-blob corpus; slower than the GitHub code-search anchor's interactive grade is a UX wall.
+doc_by_content_budget_us = 40000           # MEASURED-GATE: the doc-by-content semantic/hybrid find on the Knowledge corpus (the vector probe costs more than an FT find); slower than a Notion content search is a wall.
+issue_by_facet_budget_us = 20000           # MEASURED-GATE: the issue-by-facet structured find on the issue corpus (status/priority/assignee); slower than a Jira facet search's interactive grade is a wall.
+
+# ---------------------------------------------------------------------------------------------
 # [authz_surge] — the ID-D9 (F6) protected-human-lane authz-decision p99 budget under the 30× authz
 # hot-path surge (identity §10/§13: authz is the highest-QPS shared system; contract 1.8
 # `auth_decision_latency` / 4.11 the shed order on the authz surface).

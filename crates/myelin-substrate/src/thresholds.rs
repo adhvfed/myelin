@@ -239,6 +239,17 @@ pub struct Thresholds {
     /// (pre-P-514) still parses against the seeds. Mirrors `myelin_refs_service::switch_test`'s budgets.
     #[serde(default)]
     pub refs_switch_test: RefsSwitchTestThreshold,
+    /// The Search **switch-test** interactive find-latency budgets (SRCH-P33 / P-515, M6; the Search
+    /// switch test; search-and-indexing §3 S-M6 the switch-test bullet — code-by-symbol / doc-by-content
+    /// / issue-by-facet found within the latency budget; VISION §3 the switch test). The microsecond
+    /// ceilings the three driven Search surfaces (the code-by-symbol FT find, the doc-by-content semantic
+    /// find, the issue-by-facet structured find) must stay WITHIN for a GitHub/Notion/Jira user to FIND
+    /// what they expect without hitting a wall the old tool didn't have. MEASURED by the switch test
+    /// (driven against the real Search surface), never hardcoded in the test (EI-01 §3/§4) and never
+    /// weakened to pass. `#[serde(default)]` so an older thresholds file (pre-P-515) still parses against
+    /// the seeds. Mirrors `myelin_search::switch_test`'s budgets.
+    #[serde(default)]
+    pub search_switch_test: SearchSwitchTestThreshold,
     /// The scorecard: drills that came back red live here, never edited green (EI-01 §3).
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -817,6 +828,79 @@ impl Default for RefsSwitchTestThreshold {
             backlink_read_budget_us: Self::BACKLINK_READ_BUDGET_US_SEED,
             unfurl_budget_us: Self::UNFURL_BUDGET_US_SEED,
             jump_no_spinner_budget_us: Self::JUMP_NO_SPINNER_BUDGET_US_SEED,
+        }
+    }
+}
+
+/// The Search **switch-test** interactive find-latency budgets (SRCH-P33 / P-515, M6). The microsecond
+/// ceilings the three driven Search surfaces must stay WITHIN for a GitHub/Notion/Jira user to FIND what
+/// they expect — code by symbol, a doc by content, an issue by facet — without hitting a wall the old
+/// tool didn't have (search-and-indexing §3 S-M6 the switch-test bullet; VISION §3 the switch test). The
+/// switch test MEASURES each driven query against its budget (driven against the real Search surface,
+/// EI-01 §4); the numbers are read here, never hardcoded in the test and never weakened to pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchSwitchTestThreshold {
+    /// **The code-by-symbol search latency budget, in MICROSECONDS** (`_us`; the §2.10 units anchor). The
+    /// per-viewer code search (the trigram FT find on the git-blob corpus that lands on a symbol) must
+    /// complete within this p-latency; a code search slower than the GitHub code-search anchor's
+    /// interactive grade is a UX wall (the migrating user hits a wall the old tool didn't have).
+    #[serde(default = "SearchSwitchTestThreshold::default_code_by_symbol_budget_us")]
+    pub code_by_symbol_budget_us: u64,
+    /// **The doc-by-content (semantic) search latency budget, in MICROSECONDS** — the "within the
+    /// keyboard" budget for a Knowledge doc found by content (the hybrid/semantic find resolving live to
+    /// its hit). Slower than a Notion content search's interactive grade is a wall.
+    #[serde(default = "SearchSwitchTestThreshold::default_doc_by_content_budget_us")]
+    pub doc_by_content_budget_us: u64,
+    /// **The issue-by-facet (structured) search latency budget, in MICROSECONDS** — the structured facet
+    /// find on the issue corpus (status/priority/assignee) must render within this p-latency so it lands
+    /// within a keystroke, no spinner flash. Slower than a Jira facet search's interactive grade is a wall.
+    #[serde(default = "SearchSwitchTestThreshold::default_issue_by_facet_budget_us")]
+    pub issue_by_facet_budget_us: u64,
+}
+
+impl SearchSwitchTestThreshold {
+    /// The seed code-by-symbol budget: **30 000 µs (= 30 ms)** — an interactive code-search render grade
+    /// (a GitHub code-search result is interactive at this grade). SRCH-P33 measures the real find against
+    /// this; the number is dated here, never a value to tune toward (measured-not-predicted, EI-01 §3).
+    pub const CODE_BY_SYMBOL_BUDGET_US_SEED: u64 = 30_000;
+    /// The seed doc-by-content budget: **40 000 µs (= 40 ms)** — a semantic/hybrid find render grade (a
+    /// Notion content search is interactive at this grade; the vector probe costs more than an FT find).
+    pub const DOC_BY_CONTENT_BUDGET_US_SEED: u64 = 40_000;
+    /// The seed issue-by-facet budget: **20 000 µs (= 20 ms)** — a structured facet find render grade (a
+    /// Jira facet search is interactive at this grade; the structured branch is the cheapest find).
+    pub const ISSUE_BY_FACET_BUDGET_US_SEED: u64 = 20_000;
+
+    /// The seed code-by-symbol budget (`_us`). Used when an older thresholds file omits the row.
+    pub fn default_code_by_symbol_budget_us() -> u64 {
+        Self::CODE_BY_SYMBOL_BUDGET_US_SEED
+    }
+
+    /// The seed doc-by-content budget (`_us`). Used when an older thresholds file omits the row.
+    pub fn default_doc_by_content_budget_us() -> u64 {
+        Self::DOC_BY_CONTENT_BUDGET_US_SEED
+    }
+
+    /// The seed issue-by-facet budget (`_us`). Used when an older thresholds file omits the row.
+    pub fn default_issue_by_facet_budget_us() -> u64 {
+        Self::ISSUE_BY_FACET_BUDGET_US_SEED
+    }
+
+    /// Whether the switch-test budgets are well-formed: every budget positive. A 0 budget ("any find is a
+    /// wall") is rejected so a green can never be manufactured by a vacuous bar (EI-01 §3).
+    pub fn is_well_formed(&self) -> bool {
+        self.code_by_symbol_budget_us > 0
+            && self.doc_by_content_budget_us > 0
+            && self.issue_by_facet_budget_us > 0
+    }
+}
+
+impl Default for SearchSwitchTestThreshold {
+    /// The seed budgets (SRCH-P33 dates the measured surfaces against them).
+    fn default() -> Self {
+        SearchSwitchTestThreshold {
+            code_by_symbol_budget_us: Self::CODE_BY_SYMBOL_BUDGET_US_SEED,
+            doc_by_content_budget_us: Self::DOC_BY_CONTENT_BUDGET_US_SEED,
+            issue_by_facet_budget_us: Self::ISSUE_BY_FACET_BUDGET_US_SEED,
         }
     }
 }

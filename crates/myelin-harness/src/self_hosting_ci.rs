@@ -403,6 +403,52 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "ref_p29_switch_test_drill",
             ],
         },
+        // (10) the SEARCH dogfood band (P-515 / SRCH-P33 → S-M6): the production-hardened Search engine
+        //      runs over Myelin's OWN work — code + issue search on the Myelin monorepo (per-viewer
+        //      leak-free hits, the confidential issue tombstones, 0 leak), search over Myelin's own
+        //      Knowledge space (the roadmap/scorecard as a Knowledge space, reindex-from-source parity),
+        //      and the DSAR fan-out over a team member's own data (0 recoverable PII incl. embeddings
+        //      incl. backups, the holder-coverage receipt includes Search H7) — all green, 0 leak; the
+        //      Search truth-up pass confirms 0 red earlier-band Search gates (SRCH-D1..D10 + the E2E
+        //      legs); the every-incident-adds-a-drill loop is self-hosted. WIRES the existing Search
+        //      surface + drills (EI-01 §7 — never re-implemented here). The switch test is the next band.
+        SelfHostJob {
+            id: "SRCH-P33-dogfood",
+            title: "Search on Myelin's own work — code + issue search + the Knowledge-space \
+                    reindex-parity + the DSAR fan-out (all green, 0 leak) + the Search truth-up pass \
+                    (0 red earlier-band Search gate) + the self-hosted every-incident-adds-a-drill loop",
+            kind: JobKind::Drill,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-search",
+                "--test",
+                "srch_p33_dogfood_drill",
+            ],
+        },
+        // (11) the SEARCH switch-test band (P-515 / SRCH-P33 → S-M6): the Search switch test driven over
+        //      the real surface — a GitHub/Notion/Jira user can FIND what they expect (code-by-symbol /
+        //      doc-by-content / issue-by-facet) without hitting a wall the three-tool anchor didn't have,
+        //      MEASURED against the latency budgets, 0 leak (a denied doc never enters the candidate set).
+        //      WIRES the existing query/semantic pre-filter (EI-01 §7 — never re-implemented here). The
+        //      pixel-level browser drive over the rendered Search results web tier is the honest named
+        //      floor; the embedding-adapter posture (mock) is recorded honestly.
+        SelfHostJob {
+            id: "SRCH-P33-switch-test",
+            title: "the Search switch test driven over the real surface — code-by-symbol / \
+                    doc-by-content / issue-by-facet found vs the three-tool anchor (0 walls), measured \
+                    within the latency budgets, 0 leak",
+            kind: JobKind::Drill,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-search",
+                "--test",
+                "srch_p33_switch_test_drill",
+            ],
+        },
     ]
 }
 
