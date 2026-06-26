@@ -285,6 +285,67 @@ fn a_red_refs_switch_test_rejects_the_commit() {
 }
 
 #[test]
+fn the_graph_runs_the_search_dogfood_band() {
+    // P-515 / SRCH-P33 → S-M6: the production-hardened Search engine runs over Myelin's OWN work —
+    // code + issue search on the Myelin monorepo, search over Myelin's own Knowledge space
+    // (reindex-from-source parity), and the DSAR fan-out over a team member's own data (all green,
+    // 0 leak), plus the Search truth-up pass (0 red earlier-band Search gates: SRCH-D1..D10 + the
+    // E2E legs) and the self-hosted every-incident-adds-a-drill loop. The dogfood loop carries Search.
+    let jobs = self_hosting_jobs();
+
+    assert!(
+        jobs.iter()
+            .any(|j| j.id == "SRCH-P33-dogfood" && j.kind == JobKind::Drill),
+        "the self-hosting graph MUST run the Search dogfood band (Search on Myelin's own work + the \
+         Search truth-up pass) as part of the self-hosting CI graph"
+    );
+}
+
+#[test]
+fn a_red_search_dogfood_drill_rejects_the_commit() {
+    // The Search dogfood drill is part of the gate: a confidential doc that enters the candidate set
+    // on Myelin's own work / a reindex-parity break / an undated PROVEN Search row reds the graph —
+    // the ratchet rejects on Myelin's own work (the two cardinal invariants hold themselves, EI-01 §5).
+    let jobs = self_hosting_jobs();
+    let run = run_graph(&jobs, &reds_one("SRCH-P33-dogfood"));
+    assert!(
+        !run.is_green(),
+        "a red Search dogfood drill (a leak on Myelin's own work / a reindex-parity break / a \
+         claimed-not-proven Search row) MUST reject the commit — Search on Myelin's own commits is \
+         part of the self-hosting CI gate"
+    );
+    assert_eq!(run.red_jobs(), vec!["SRCH-P33-dogfood"]);
+}
+
+#[test]
+fn the_self_hosting_graph_runs_the_search_switch_test_band() {
+    // SRCH-P33 / P-515 (M6): the Search switch test is wired as a Myelin CI job — code-by-symbol /
+    // doc-by-content / issue-by-facet found over the real Search surface without hitting a wall the
+    // three-tool anchor (GitHub/Notion/Jira) didn't have, measured against the latency budgets, 0 leak.
+    let jobs = self_hosting_jobs();
+    assert!(
+        jobs.iter()
+            .any(|j| j.id == "SRCH-P33-switch-test" && j.kind == JobKind::Drill),
+        "the self-hosting graph MUST run the Search switch-test band (the three interactive finds \
+         driven + measured) as part of the self-hosting CI graph"
+    );
+}
+
+#[test]
+fn a_red_search_switch_test_rejects_the_commit() {
+    // A switch-test red (a wall the three-tool anchor didn't have / a blown find-latency budget / a
+    // leak in a find) reds the graph — the switch test is held on Myelin's own work (EI-01 §5).
+    let jobs = self_hosting_jobs();
+    let run = run_graph(&jobs, &reds_one("SRCH-P33-switch-test"));
+    assert!(
+        !run.is_green(),
+        "a red Search switch test (a wall / a blown budget / a leak in a find) MUST reject the \
+         commit — the switch test is part of the self-hosting CI gate"
+    );
+    assert_eq!(run.red_jobs(), vec!["SRCH-P33-switch-test"]);
+}
+
+#[test]
 fn a_clean_commit_reads_green() {
     let jobs = self_hosting_jobs();
     let run = run_graph(&jobs, &all_green);
