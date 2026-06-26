@@ -16,12 +16,18 @@ The cardinal rule (founder's): **duplicate surface area is the poison.** So ever
 and the interaction surface "exists" in the ledger as Rust shape/logic/harnesses, not as runnable software.**
 - Every subsystem backend + the shared substrate **EXIST** (31 crates), with the load-bearing organs **stubbed**
   (auth-token crypto, KMS, durable identity stores, sandbox production exec, durable persistence).
-- The UI "exists" as Rust **view-models, ViewSpec definitions, the `myelin-content` render path, and "switch
-  test" harnesses that *model* browser-driven behaviour** (e.g. chat's switch test is a Rust `#[test]`, not a
-  browser test). There is **no runnable frontend**: no `package.json`, no React/`.tsx` anywhere outside the design
-  *specs*; `myelin-git/src/web` is a test module.
-- "CLI" exists only as a few Rust command modules (notif list/show/read/prefs). There is **no installable
-  `myelin` CLI binary.**
+- The UI is **almost entirely absent as runnable software, with one partial exception** (this corrected a
+  filesystem-only survey, via cross-checking the ledger against the commits): **Git alone** has a server-rendered
+  web UI — `myelin-git/src/web.rs` (~822 lines, a Rust view-model → browseable HTML) + a CLI/API command grammar
+  (`src/api.rs`) — with a headless-chromium *rehearsal* test (`e2e_git_p32_web_browser.rs`) that renders the HTML
+  and checks the DOM. But that test is **gated on chromium being present and degrades to `partial`**, and it
+  drives *static rendered HTML*, not a live interactive app against a backend. **Every other subsystem** (issues,
+  chat, knowledge, CI, notif) has **only Rust ViewSpec models + switch-test harnesses — no rendered web surface,
+  no API surface.** There is **no React/SPA frontend** (the design system is React *specs*, unimplemented), and
+  that client-side React stack is **architecturally mismatched** with git's server-rendered Rust→HTML — an
+  unresolved frontend-architecture decision (see E0.7).
+- "CLI" exists only as command *grammar/logic* in Rust (git's `api.rs`; notif list/show/read/prefs). There is
+  **no installable `myelin` CLI binary** wired to argv, and **no MCP server** (named only, P-481).
 - There is **no MCP server** (only named as a future seam in P-481).
 - A coherent **product/edge API** for a UI/CLI/MCP to call is **partial**: services boot internal shells via the
   harness `serve(AppSpec)`, but there is no unified product API surface.
@@ -48,9 +54,10 @@ relevant rows before writing a line.
 | Subsystem backends (git, ci-controlplane/dispatch/sandbox, chat/chat-gateway, issues, knowledge) | Yes | organs stubbed | **HARDEN + RECONCILE** |
 | UI logic (ViewSpec, render paths, `myelin-content`, switch-test harnesses) | Yes (Rust) | models, not runnable | **REUSE** as the UI data/logic layer |
 | Design system | Yes (specs only) | `design-planning/08-design-system/` | **NET-NEW** component library from specs |
-| Product/edge API | Partial | internal `serve(AppSpec)` shells | **RECONCILE/EXPOSE** as one product API |
-| Web UI + app | No | — | **NET-NEW** (runnable) over existing logic |
-| CLI (`myelin`) | No (only command modules) | — | **NET-NEW** binary over existing logic |
+| Product/edge API | Partial | git `api.rs`; others `serve(AppSpec)` shells | **RECONCILE/EXPOSE** as one product API |
+| Web UI | Partial | **git** = server-rendered Rust→HTML (+ gated chromium rehearsal); others = none; React specs unimplemented & arch-mismatched | **DECISION (E0.7) + NET-NEW** per subsystem |
+| App (native/mobile) | No | — | **NET-NEW** (follows web per subsystem) |
+| CLI (`myelin`) | Partial | git command grammar; no installable binary | **NET-NEW** binary, reuse the grammar |
 | MCP server | No (named only) | — | **NET-NEW** |
 | Agent fabric | Yes | mock runtime | **DEFERRED** (cost) |
 
@@ -71,8 +78,12 @@ relevant rows before writing a line.
   surface; removes the `Structural*` verifiers from the prod graph; fixes the `set_config(..., false)` bleed.
 - **E0.6 The product/edge API surface.** RECONCILE the existing `serve(AppSpec)` service shells into one coherent
   API the UI/CLI/MCP call. Expose existing contracts; do not invent a parallel API.
-- **E0.7 Design system → real component library.** Implement the `design-planning/08-design-system/` specs as the
-  actual components (React + React-Aria + Style Dictionary). The UI foundation.
+- **E0.7 Frontend-architecture decision + component foundation.** RESOLVE the mismatch first: git's one real UI
+  is server-rendered Rust→HTML, but the design system specs a client-side React + React-Aria stack. Decide one —
+  extend server-rendered Rust→HTML, build a React SPA on the design system, or a hybrid (e.g. server-rendered +
+  islands) — weighing that an agent-operable, fast, simple-to-self-host UI may favour server-rendered, while rich
+  interactivity (editor, board, live chat) may favour React. This is a "frozen shape vs. reality" decision
+  (campaign Stage D) and it **gates every subsystem UI.** Then build the component foundation accordingly.
 - **E0.8 The UI shell.** Runnable web-app skeleton (routing, auth, layout) on the component library.
 - **E0.9 The CLI + MCP substrate.** The `myelin` CLI core + MCP server skeleton + the auth/command/tool framework
   each subsystem plugs into — reusing the existing Rust command logic, not re-deriving it.
