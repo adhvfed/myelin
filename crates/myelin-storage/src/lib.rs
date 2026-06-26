@@ -662,6 +662,11 @@ pub mod tenant_tx;
 // explicit test-doubles on this path.
 #[cfg(feature = "integration")]
 pub mod provider;
+// The durable PG backings for the identity S1 principal + S3 tuple stores (MR-007 / SI-018/019):
+// reuses the rebac_tuple table/ops + adds the principal/credential_link tables (same RLS form), all
+// driven through the MR-022 with_tenant_tx convention. The identity-layer stores delegate to these.
+#[cfg(feature = "integration")]
+pub mod identity_durable;
 // The OLTP-co-located outbox relay (the one legitimate broker-publish site, BUS-2) — kept in its
 // own module so the broker-publish call is isolated to a single named relay file (the same
 // posture as myelin-events/src/relay.rs).
@@ -806,5 +811,10 @@ pub use pg_migrator::{with_migration_lock, PgMigrator, MIGRATION_LOCK_KEY};
 // reconciliation (SI-010). Behind `integration` like the rest of the live-PG code.
 #[cfg(feature = "integration")]
 pub use provider::{foundation_migrations, ProviderError, SubstrateProvider, DEFAULT_MAX_CONNECTIONS};
+#[cfg(feature = "integration")]
+pub use identity_durable::{
+    identity_durable_migrations, DurablePrincipalBacking, DurablePrincipalRow, DurableProfileBlob,
+    DurableTupleBacking, TupleEdgeOp,
+};
 #[cfg(feature = "integration")]
 pub use tenant_tx::{connect_pool_with_reset, with_tenant_tx, TxScope};

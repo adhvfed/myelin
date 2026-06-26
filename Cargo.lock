@@ -2464,6 +2464,7 @@ version = "0.0.0"
 dependencies = [
  "myelin-agent",
  "myelin-client",
+ "myelin-config",
  "myelin-events",
  "myelin-gdpr",
  "myelin-harness",
@@ -2475,6 +2476,8 @@ dependencies = [
  "myelin-substrate",
  "myelin-tenancy",
  "serde_json",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]

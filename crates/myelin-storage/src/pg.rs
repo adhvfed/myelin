@@ -486,4 +486,96 @@ impl PgStore {
     pub fn relay(&self) -> crate::pgrelay::PgRelay {
         crate::pgrelay::PgRelay::new(self.pool.clone())
     }
+
+    // ---- Conn-bound rebac_tuple ops (the MR-022 with_tenant_tx-convention twins, MR-007) -------
+    //
+    // These are the TRANSACTION-scoped twins of [`put_tuple`] / [`reverse_index`]: they take an
+    // EXISTING `&mut PgConnection` (the one MR-022's [`crate::tenant_tx::with_tenant_tx`] has
+    // already opened + `SET LOCAL`-scoped to `(tenant, region)`), so the caller controls the GUC
+    // transaction-scoped and no session GUC bleeds. They write/read the SAME `rebac_tuple` table
+    // ([`REBAC_TUPLE_MIGRATION`]) under the SAME `myelin_tenant_isolation` FORCE-RLS policy — this
+    // is NOT a second tuple store, it is the convention-correct access path the identity-layer
+    // `TupleStore` durable binding (MR-007) drives. The legacy acquire-based [`put_tuple`] (which
+    // sets the GUC session-scoped) is the path MR-013 reconciles; these twins are already correct.
+
+    /// Insert an `object#relation@subject` edge on a tenant-scoped connection (idempotent;
+    /// `ON CONFLICT DO NOTHING`). The `(tenant, region)` GUC must already be SET LOCAL on `conn`
+    /// (the [`with_tenant_tx`](crate::tenant_tx::with_tenant_tx) convention); the explicit
+    /// `tenant_id`/`region` binds are the defence-in-depth tenant predicate (never a path).
+    pub async fn insert_tuple_on_conn(
+        conn: &mut sqlx::PgConnection,
+        tenant: &str,
+        region: &str,
+        object_id: &str,
+        relation: &str,
+        subject: &str,
+    ) -> Result<(), PgError> {
+        sqlx::query(
+            "INSERT INTO rebac_tuple (tenant_id, region, object_id, relation, subject) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(object_id)
+        .bind(relation)
+        .bind(subject)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete an `object#relation@subject` edge on a tenant-scoped connection (the `Remove` delta).
+    /// RLS + the explicit `(tenant_id, region)` predicate make a cross-tenant delete a no-op.
+    pub async fn delete_tuple_on_conn(
+        conn: &mut sqlx::PgConnection,
+        tenant: &str,
+        region: &str,
+        object_id: &str,
+        relation: &str,
+        subject: &str,
+    ) -> Result<(), PgError> {
+        sqlx::query(
+            "DELETE FROM rebac_tuple \
+             WHERE tenant_id = $1 AND region = $2 AND object_id = $3 AND relation = $4 \
+               AND subject = $5",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(object_id)
+        .bind(relation)
+        .bind(subject)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Read every `(object_id, relation, subject)` edge in the `(tenant, region)` partition on a
+    /// tenant-scoped connection (the reverse-index feed / `tuples_in`). Deterministically ordered.
+    pub async fn tuples_on_conn(
+        conn: &mut sqlx::PgConnection,
+        tenant: &str,
+        region: &str,
+    ) -> Result<Vec<(String, String, String)>, PgError> {
+        let rows = sqlx::query(
+            "SELECT object_id, relation, subject FROM rebac_tuple \
+             WHERE tenant_id = $1 AND region = $2 ORDER BY object_id, relation, subject",
+        )
+        .bind(tenant)
+        .bind(region)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("object_id"),
+                    r.get::<String, _>("relation"),
+                    r.get::<String, _>("subject"),
+                )
+            })
+            .collect())
+    }
 }

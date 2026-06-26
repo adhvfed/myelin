@@ -66,7 +66,8 @@
 
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef as EvArtifactRef, DataRole as EvDataRole, EmitContextBase,
-    EventDraft, EventType, IdMinter, MonotonicMinter, OutboxStore, OutboxTx, Timestamp, Visibility,
+    EventDraft, EventType, IdMinter, MonotonicMinter, OutboxStore, OutboxTransaction, OutboxTx,
+    Timestamp, Visibility,
 };
 use myelin_identity::iam_events::IAM_TUPLE_WRITTEN;
 use myelin_identity::{DataRole, Precondition, Principal, RelationTuple, TupleDelta, Zookie};
@@ -217,7 +218,10 @@ struct Inner {
 /// floor), and a read for one tenant structurally cannot reach another tenant's partition.
 #[derive(Clone)]
 pub struct TupleStore {
-    inner: Arc<Mutex<Inner>>,
+    /// The durable backing — the REAL PG `rebac_tuple` edge set (MR-007) on the production path, or
+    /// the in-memory test-double on the default DB-free build. The system-of-record for the edges is
+    /// the Pg backing; the in-memory map is an explicit test double (NOT the production default).
+    backend: TupleBackend,
     /// The monotonic zookie revision — every `write_tuples` bumps it (the 4.10 write-half). An
     /// `AtomicU64` so the advance is monotonic even under concurrent writers; the string zookie
     /// is `zk-<rev>` (lexically monotonic with zero-padding, so a later zookie sorts after).
@@ -231,6 +235,36 @@ pub struct TupleStore {
     /// The holder this store auto-registers as (the `PersonalDataHolder` seam) — proof the
     /// "every store is a holder" invariant holds for S3 (§1.1, GD-3).
     holder: OltpStoreHolder,
+}
+
+/// The S3 store backing: the REAL durable PG `rebac_tuple` edge set (MR-007) or the in-memory
+/// test-double. The durable system-of-record is the Pg variant; `Memory` is an explicit test double
+/// (the DB-free default build, the unit tests). Splitting the backing OUT of the role struct's
+/// direct fields is what lets the `no-in-memory-durable-store` ratchet record the shortcut's removal:
+/// `TupleStore` no longer holds an in-memory collection (it holds a backing that CAN be durable).
+#[derive(Clone)]
+enum TupleBackend {
+    /// The in-memory test-double (the DB-free default build). NOT the production system-of-record.
+    Memory(Arc<Mutex<Inner>>),
+    /// The REAL durable PG backing over the MR-022 provider pool + `with_tenant_tx` convention.
+    #[cfg(feature = "integration")]
+    Pg(PgTupleBacking),
+}
+
+/// The PG-backed S3 tuple backing (MR-007): the durable `rebac_tuple` edge set + the sync→async
+/// bridge (`tokio::runtime::Handle` driving `block_in_place`+`block_on`, the same bridge
+/// `ValkeyCache`/`S3BlobStore` use). The per-object zookie watermark is in-process CONSISTENCY
+/// metadata (the durable system-of-record is the EDGE set in PG); the persisted-zookie/read-side is
+/// the named P-ID-12 / MR-009 floor — a fresh instance reads the durable edges back and treats
+/// not-yet-seen objects as at the genesis revision.
+#[cfg(feature = "integration")]
+#[derive(Clone)]
+struct PgTupleBacking {
+    backing: Arc<myelin_storage::DurableTupleBacking>,
+    rt: tokio::runtime::Handle,
+    /// `(tenant, region, object)` → the latest zookie observed FOR THIS PROCESS (consistency
+    /// metadata, not the durable edge set). Reset on a fresh instance; the edges themselves persist.
+    zookies: Arc<Mutex<HashMap<(String, String, String), Zookie>>>,
 }
 
 impl TupleStore {
@@ -249,7 +283,44 @@ impl TupleStore {
         // the moment it is constructed, so "we forgot the tuple store" is structurally impossible.
         let _receipt = holder.register();
         TupleStore {
-            inner: Arc::new(Mutex::new(Inner::default())),
+            backend: TupleBackend::Memory(Arc::new(Mutex::new(Inner::default()))),
+            revision: Arc::new(AtomicU64::new(0)),
+            outbox,
+            minter,
+            holder,
+        }
+    }
+
+    /// **Build the S3 store over the REAL durable PG backing (MR-007 / SI-019).** The `rebac_tuple`
+    /// edge set persists through the MR-022 [`myelin_storage::SubstrateProvider`] pool +
+    /// `with_tenant_tx` convention (RLS-scoped, no GUC bleed). `rt` is the tokio runtime handle the
+    /// sync API drives the async backing on. The outbox emit + zookie semantics are preserved (the
+    /// event still co-commits-iff-the-durable-write-succeeds). The store auto-registers as a holder.
+    #[cfg(feature = "integration")]
+    pub fn with_pg(
+        outbox: OutboxStore,
+        backing: myelin_storage::DurableTupleBacking,
+        rt: tokio::runtime::Handle,
+    ) -> TupleStore {
+        TupleStore::with_pg_minter(outbox, Arc::new(MonotonicMinter::new()), backing, rt)
+    }
+
+    /// [`Self::with_pg`] with an explicit id-minter (deterministic in tests).
+    #[cfg(feature = "integration")]
+    pub fn with_pg_minter(
+        outbox: OutboxStore,
+        minter: Arc<dyn IdMinter>,
+        backing: myelin_storage::DurableTupleBacking,
+        rt: tokio::runtime::Handle,
+    ) -> TupleStore {
+        let holder = OltpStoreHolder::new(S3_HOLDER);
+        let _receipt = holder.register();
+        TupleStore {
+            backend: TupleBackend::Pg(PgTupleBacking {
+                backing: Arc::new(backing),
+                rt,
+                zookies: Arc::new(Mutex::new(HashMap::new())),
+            }),
             revision: Arc::new(AtomicU64::new(0)),
             outbox,
             minter,
@@ -294,21 +365,32 @@ impl TupleStore {
         // The tenant-predicate floor: the read is built from the verified scope (no cross-tenant
         // path). `_q.predicate_sql()` is the thin `(tenant, region)` clause every read carries.
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S3_TABLE));
-        let inner = self.lock();
         let part_key = Self::part_key(scope);
-        inner
-            .partitions
-            .get(&part_key)
-            .and_then(|p| {
-                // The latest (lexically-monotonic) zookie about this object. Zookie is not `Ord`
-                // (it is an opaque token at the ABI), so we compare by its inner string — which is
-                // the zero-padded `zk-<rev>` form, so lexical order == revision order by design.
-                p.values()
-                    .filter(|t| t.tuple.object.0 == object)
-                    .max_by(|a, b| a.zookie.0.cmp(&b.zookie.0))
-                    .map(|t| t.zookie.clone())
-            })
-            .unwrap_or_else(|| self.current_zookie())
+        match &self.backend {
+            TupleBackend::Memory(inner_arc) => {
+                let inner = Self::mem_lock(inner_arc);
+                inner
+                    .partitions
+                    .get(&part_key)
+                    .and_then(|p| {
+                        // The latest (lexically-monotonic) zookie about this object. Zookie is not
+                        // `Ord` (it is an opaque token at the ABI), so we compare by its inner string
+                        // — the zero-padded `zk-<rev>` form, so lexical order == revision order.
+                        p.values()
+                            .filter(|t| t.tuple.object.0 == object)
+                            .max_by(|a, b| a.zookie.0.cmp(&b.zookie.0))
+                            .map(|t| t.zookie.clone())
+                    })
+                    .unwrap_or_else(|| self.current_zookie())
+            }
+            #[cfg(feature = "integration")]
+            TupleBackend::Pg(pg) => {
+                let zk = pg.zookies.lock().unwrap_or_else(|e| e.into_inner());
+                zk.get(&(part_key.0, part_key.1, object.to_string()))
+                    .cloned()
+                    .unwrap_or_else(|| self.current_zookie())
+            }
+        }
     }
 
     /// Read the tuples for a `(tenant, region)` partition (for the reverse-index feed / tests).
@@ -316,12 +398,53 @@ impl TupleStore {
     /// `(tenant, region)`, so cross-tenant reads are structurally impossible.
     pub fn tuples_in(&self, scope: &TenantScope) -> Vec<StoredTuple> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S3_TABLE));
-        let inner = self.lock();
-        inner
-            .partitions
-            .get(&Self::part_key(scope))
-            .map(|p| p.values().cloned().collect())
-            .unwrap_or_default()
+        match &self.backend {
+            TupleBackend::Memory(inner_arc) => {
+                let inner = Self::mem_lock(inner_arc);
+                inner
+                    .partitions
+                    .get(&Self::part_key(scope))
+                    .map(|p| p.values().cloned().collect())
+                    .unwrap_or_default()
+            }
+            #[cfg(feature = "integration")]
+            TupleBackend::Pg(pg) => {
+                let tenant = scope.tenant().0.clone();
+                let region = scope.region().0.clone();
+                // Read the DURABLE edge set back from PG (RLS-scoped through with_tenant_tx). A
+                // backing error surfaces as an empty read here (the loud variant is the write path);
+                // the durability test asserts presence, so a dropped read would fail it loudly.
+                let edges = pg
+                    .block(pg.backing.edges_in(&tenant, &region))
+                    .unwrap_or_default();
+                let zk = pg.zookies.lock().unwrap_or_else(|e| e.into_inner());
+                edges
+                    .into_iter()
+                    .map(|(object, relation, subject)| {
+                        let zookie = zk
+                            .get(&(tenant.clone(), region.clone(), object.clone()))
+                            .cloned()
+                            .unwrap_or_else(|| self.current_zookie());
+                        StoredTuple {
+                            tenant: scope.tenant().clone(),
+                            region: scope.region().clone(),
+                            tuple: myelin_identity::RelationTuple {
+                                object: myelin_identity::ObjectId(object),
+                                relation: myelin_identity::RelName(relation),
+                                subject: myelin_identity::PrincipalId(subject),
+                                caveat: None,
+                            },
+                            zookie,
+                            // expires_at is NOT a rebac_tuple column — the per-run-grant TTL
+                            // durability is the named boundary (deferred to a schema extension /
+                            // MR-009). The DURABLE edge round-trips; the in-process auto-expiry
+                            // remains exercised by the Memory backend.
+                            expires_at: None,
+                        }
+                    })
+                    .collect()
+            }
+        }
     }
 
     /// **`write_tuples([Δtuple], precondition?) → zookie` (contract 4.6; the 4.10 write-half).**
@@ -355,39 +478,34 @@ impl TupleStore {
         // cross-tenant write path). The thin `(tenant, region)` predicate is carried on every
         // statement; a tenant-less write is unconstructable (you need a TenantScope here).
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S3_TABLE));
-        let part_key = Self::part_key(scope);
-
-        // Hold the store lock for the WHOLE write so it is atomic AND the zookie advance + the
-        // apply are serialized (concurrent writers get distinct, monotonic zookies; the apply for
-        // a given object is consistent with the zookie returned).
-        let mut inner = self.lock();
-
-        // (1) Precondition — read-modify-write guard. A precondition with an `expected_zookie`
-        //     means "the object must still be at this revision"; if not, abort the WHOLE write.
-        if let Some(pre) = precondition {
-            if let Some(expected) = &pre.expected_zookie {
-                // The object(s) the deltas touch must currently be at `expected`. We check the
-                // newest zookie among the deltas' objects in this partition (a precondition is a
-                // per-object read-modify-write guard; the deltas in one write share the precond).
-                let actual = Self::object_zookie_locked(&inner, &part_key, deltas)
-                    .unwrap_or_else(|| Self::zookie_of(self.revision.load(Ordering::SeqCst)));
-                if &actual != expected {
-                    // Abort: nothing changed, nothing emits. The whole write is lost-free.
-                    return Err(WriteError::PreconditionFailed {
-                        expected: expected.clone(),
-                        actual,
-                    });
-                }
+        match &self.backend {
+            TupleBackend::Memory(inner_arc) => self.write_tuples_memory(
+                inner_arc,
+                scope,
+                actor,
+                deltas,
+                precondition,
+                expires_at,
+                &occurred_at,
+            ),
+            #[cfg(feature = "integration")]
+            TupleBackend::Pg(pg) => {
+                self.write_tuples_pg(pg, scope, actor, deltas, precondition, &occurred_at)
             }
         }
+    }
 
-        // Advance the monotonic revision → the zookie this write returns + stamps on the event.
-        let new_rev = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
-        let zookie = Self::zookie_of(new_rev);
-
-        // (4) Open ONE outbox transaction — the tuple change + the iam.tuple_written event
-        //     co-commit on it (emit-iff-committed, BUS-D4). The event is staged BEFORE the apply
-        //     is made durable; both become durable together on `commit`.
+    /// Build the ONE outbox transaction the write co-commits (the `iam.tuple_written` emit, the ONLY
+    /// emit path). Returns the UNCOMMITTED transaction so the caller commits it at the right moment
+    /// (emit-iff-committed): after the durable apply succeeds.
+    fn stage_event(
+        &self,
+        scope: &TenantScope,
+        actor: &Principal,
+        deltas: &[TupleDelta],
+        zookie: &Zookie,
+        occurred_at: &Timestamp,
+    ) -> Result<OutboxTransaction, WriteError> {
         let ctx_base = EmitContextBase {
             tenant: scope.tenant().clone(),
             region: scope.region().clone(),
@@ -400,28 +518,55 @@ impl TupleStore {
             caused_by: None,
         };
         let mut tx = self.outbox.begin(Arc::clone(&self.minter), ctx_base);
-
-        // Stage the caller's tuple-state change into THIS transaction (the co-commit). In the real
-        // OLTP binding this is the INSERT/DELETE of the tuple rows in the same DB transaction the
-        // outbox row is inserted into; here it is recorded as the state-change description so the
-        // co-commit (state + event durable together, or neither) is observable.
         tx.stage_state_change(format!(
             "rebac: applied {} delta(s) → zookie {}",
             deltas.len(),
             zookie.0
         ));
+        // The iam.tuple_written event — the event-sourced record S8 consumes, carrying the write's
+        // zookie watermark. Attribution by OPAQUE principal_id; references-not-payloads; no PII.
+        let draft = self.tuple_written_draft(scope, deltas, zookie);
+        tx.emit(draft, None).map_err(|e| WriteError::CommitFailed(e.0))?;
+        Ok(tx)
+    }
 
-        // Build + stage the iam.tuple_written event — the ONLY emit path. The event is the
-        // event-sourced record S8 (the reverse index) consumes, carrying the write's zookie as the
-        // revision watermark. Attribution is by OPAQUE principal_id (the actor); the payload is
-        // references-not-payloads (object refs + the zookie), contains_personal_data = false.
-        let draft = self.tuple_written_draft(scope, deltas, &zookie);
-        tx.emit(draft, None)
-            .map_err(|e| WriteError::CommitFailed(e.0))?;
+    /// The in-memory test-double write path (the DB-free default build). Atomic under one lock; the
+    /// state change + the event co-commit on one outbox transaction.
+    #[allow(clippy::too_many_arguments)]
+    fn write_tuples_memory(
+        &self,
+        inner_arc: &Arc<Mutex<Inner>>,
+        scope: &TenantScope,
+        actor: &Principal,
+        deltas: &[TupleDelta],
+        precondition: Option<&Precondition>,
+        expires_at: Option<Timestamp>,
+        occurred_at: &Timestamp,
+    ) -> Result<Zookie, WriteError> {
+        let part_key = Self::part_key(scope);
+        // Hold the store lock for the WHOLE write so it is atomic AND the zookie advance + apply are
+        // serialized (concurrent writers get distinct, monotonic zookies).
+        let mut inner = Self::mem_lock(inner_arc);
 
-        // (2) Apply the deltas — under the SAME lock (atomic). A cross-tenant delta is impossible
-        //     by construction (the tuple carries no tenant — the partition is the verified scope's),
-        //     but we keep the cross-tenant rejection as an explicit, audited backstop.
+        // (1) Precondition — read-modify-write guard.
+        if let Some(pre) = precondition {
+            if let Some(expected) = &pre.expected_zookie {
+                let actual = Self::object_zookie_locked(&inner, &part_key, deltas)
+                    .unwrap_or_else(|| Self::zookie_of(self.revision.load(Ordering::SeqCst)));
+                if &actual != expected {
+                    return Err(WriteError::PreconditionFailed {
+                        expected: expected.clone(),
+                        actual,
+                    });
+                }
+            }
+        }
+
+        let new_rev = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let zookie = Self::zookie_of(new_rev);
+        let tx = self.stage_event(scope, actor, deltas, &zookie, occurred_at)?;
+
+        // (2) Apply the deltas under the SAME lock (atomic).
         let partition = inner.partitions.entry(part_key).or_default();
         for delta in deltas {
             match delta {
@@ -443,13 +588,109 @@ impl TupleStore {
             }
         }
 
-        // Co-commit: the tuple change + the iam.tuple_written event become durable TOGETHER. If
-        // this fails, NOTHING is durable (the partition mutation above is on the in-memory store,
-        // but the event+state co-commit is the durability boundary — a CommitFailed surfaces
-        // loudly and the caller treats the write as not-happened).
+        // Co-commit: the state change + the iam.tuple_written event become durable together.
+        tx.commit().map_err(|e| WriteError::CommitFailed(e.0))?;
+        Ok(zookie)
+    }
+
+    /// **The REAL durable write path (MR-007): the `rebac_tuple` edge set persists through the
+    /// MR-022 `with_tenant_tx` convention, and the `iam.tuple_written` event co-commits
+    /// emit-iff-the-durable-write-succeeded.** The event is staged FIRST (uncommitted); the deltas
+    /// are then applied in ONE tenant-scoped DB transaction; only on durable success does the outbox
+    /// commit (so a failed durable apply emits NOTHING). The zookie/precondition use the in-process
+    /// watermark (the durable system-of-record is the EDGE set; the persisted-zookie read-side is the
+    /// named P-ID-12 / MR-009 floor).
+    #[cfg(feature = "integration")]
+    fn write_tuples_pg(
+        &self,
+        pg: &PgTupleBacking,
+        scope: &TenantScope,
+        actor: &Principal,
+        deltas: &[TupleDelta],
+        precondition: Option<&Precondition>,
+        occurred_at: &Timestamp,
+    ) -> Result<Zookie, WriteError> {
+        let tenant = scope.tenant().0.clone();
+        let region = scope.region().0.clone();
+
+        // (1) Precondition — against the in-process zookie watermark.
+        if let Some(pre) = precondition {
+            if let Some(expected) = &pre.expected_zookie {
+                let actual = self
+                    .pg_object_zookie(pg, &tenant, &region, deltas)
+                    .unwrap_or_else(|| Self::zookie_of(self.revision.load(Ordering::SeqCst)));
+                if &actual != expected {
+                    return Err(WriteError::PreconditionFailed {
+                        expected: expected.clone(),
+                        actual,
+                    });
+                }
+            }
+        }
+
+        let new_rev = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let zookie = Self::zookie_of(new_rev);
+
+        // Stage the event (uncommitted) — emit-iff the durable write below succeeds.
+        let tx = self.stage_event(scope, actor, deltas, &zookie, occurred_at)?;
+
+        // Apply the deltas atomically in ONE tenant-scoped DB transaction (with_tenant_tx).
+        let edge_deltas: Vec<(myelin_storage::TupleEdgeOp, String, String, String)> = deltas
+            .iter()
+            .map(|d| match d {
+                TupleDelta::Add(t) => (
+                    myelin_storage::TupleEdgeOp::Add,
+                    t.object.0.clone(),
+                    t.relation.0.clone(),
+                    t.subject.0.clone(),
+                ),
+                TupleDelta::Remove(t) => (
+                    myelin_storage::TupleEdgeOp::Remove,
+                    t.object.0.clone(),
+                    t.relation.0.clone(),
+                    t.subject.0.clone(),
+                ),
+            })
+            .collect();
+        pg.block(pg.backing.apply_deltas(&tenant, &region, edge_deltas))
+            .map_err(|e| WriteError::CommitFailed(e.to_string()))?;
+
+        // Durable write succeeded → co-commit the event (the outbox emit).
         tx.commit().map_err(|e| WriteError::CommitFailed(e.0))?;
 
+        // Advance the in-process zookie watermark for the touched objects.
+        {
+            let mut zk = pg.zookies.lock().unwrap_or_else(|e| e.into_inner());
+            for d in deltas {
+                let obj = match d {
+                    TupleDelta::Add(t) | TupleDelta::Remove(t) => t.object.0.clone(),
+                };
+                zk.insert((tenant.clone(), region.clone(), obj), zookie.clone());
+            }
+        }
         Ok(zookie)
+    }
+
+    /// The newest in-process zookie among the objects the `deltas` touch (the Pg-path precondition
+    /// read). `None` if none of those objects has been written in this process yet.
+    #[cfg(feature = "integration")]
+    fn pg_object_zookie(
+        &self,
+        pg: &PgTupleBacking,
+        tenant: &str,
+        region: &str,
+        deltas: &[TupleDelta],
+    ) -> Option<Zookie> {
+        let zk = pg.zookies.lock().unwrap_or_else(|e| e.into_inner());
+        deltas
+            .iter()
+            .filter_map(|d| {
+                let obj = match d {
+                    TupleDelta::Add(t) | TupleDelta::Remove(t) => t.object.0.clone(),
+                };
+                zk.get(&(tenant.to_string(), region.to_string(), obj)).cloned()
+            })
+            .max_by(|a, b| a.0.cmp(&b.0))
     }
 
     /// The `iam.tuple_written` [`EventDraft`] (references-not-payloads, opaque-id attribution).
@@ -544,8 +785,19 @@ impl TupleStore {
             .map(|t| t.zookie.clone())
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    /// Lock the in-memory test-double backing (the Memory arm). Static — it takes the backing arc so
+    /// the borrow checker is happy across the dispatch.
+    fn mem_lock(arc: &Arc<Mutex<Inner>>) -> std::sync::MutexGuard<'_, Inner> {
+        arc.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(feature = "integration")]
+impl PgTupleBacking {
+    /// Drive an async backing call from the sync store API (the same `block_in_place`+`block_on`
+    /// bridge `ValkeyCache`/`S3BlobStore` use — safe inside a multi-thread runtime).
+    fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
+        tokio::task::block_in_place(|| self.rt.block_on(fut))
     }
 }
 
