@@ -20,6 +20,13 @@ publish = false
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
 serde.workspace = true
+# MR-005 (attested scorecards): blake3 is the workspace-standard content hash (the same
+# `blake3::hash(..).to_hex()` myelin-storage's ContentHash / pg_migrator use, P-047). The
+# make-it-real gate binds a green verdict to its captured proof output with this one hash —
+# never a hand-rolled digest (VISION §4 / EI-01 §7). serde_json serialises the attested
+# scorecard manifest (the machine-readable artifact the red-by-default gate re-validates).
+blake3.workspace = true
+serde_json.workspace = true
 
 # DEV-ONLY (P-S30 / P-319): the cross-language harness shim conformance suite records its 1.7
 # N/A against chat's REAL TE-21 connection-tier language pin (today: Rust → the shim is a NO-OP,

@@ -224,6 +224,23 @@ pub enum Band {
     /// fail-closed (P-546). These floors are NAMED, dated deferrals in [`Scorecard::render_markdown`],
     /// NOT rows that red this M6 gate.
     M6Dogfood,
+    /// The **make-it-real evidence gate** (MR-005, the internal P-540/541 evidence spine — the
+    /// E0.2 floor). Unlike every band gate above (each WIRES per-feature drills into a
+    /// band-boundary go/no-go), this gate is the *evidence-integrity skeleton itself*: it
+    /// aggregates the spine's required, **attested** evidence rows and is **RED BY DEFAULT** —
+    /// it reads GREEN only when EVERY required row carries a FRESH, hash-VALID, attested PASS
+    /// (a green that cannot prove it bites is not evidence, master-plan §"attested, not
+    /// hand-editable scorecards"). The rows map to the spine prompts that fill the production
+    /// floors: MR-004 (the production-graph absence ratchet at/under baseline), MR-009 (durable
+    /// persistence verify), MR-010/011 (auth-crypto negative corpus), MR-012 (Structural*
+    /// removed — the absence scanner green-on-prod), MR-013 (tenant isolation). Because the
+    /// spine work is not done, running this gate over the real tree is EXPECTED to be RED — that
+    /// correctness is the whole point (it fails closed; it is never faked green, EI-01 §1). Its
+    /// distinguishing layer over the base scorecard is the **attestation**
+    /// ([`crate::make_it_real`]): each PASS is cryptographically bound (blake3) to the captured
+    /// output of its real proof command, so a hand-edited verdict / changed output is detected
+    /// as a tamper and reds the gate.
+    MakeItReal,
 }
 
 impl fmt::Display for Band {
@@ -237,6 +254,7 @@ impl fmt::Display for Band {
             Band::M4Consumers => write!(f, "M4 (consumer subsystems)"),
             Band::M5World => write!(f, "M5 (world-scale hardening)"),
             Band::M6Dogfood => write!(f, "M6 (dogfooding)"),
+            Band::MakeItReal => write!(f, "make-it-real (evidence spine)"),
         }
     }
 }
@@ -256,6 +274,7 @@ impl Band {
             Band::M4Consumers => m4_required_rows(),
             Band::M5World => m5_required_rows(),
             Band::M6Dogfood => m6_required_rows(),
+            Band::MakeItReal => make_it_real_required_rows(),
         }
     }
 }
@@ -1861,6 +1880,116 @@ pub fn m6_required_rows() -> Vec<GateRow> {
     ]
 }
 
+/// The FROZEN required-row set for the **make-it-real evidence gate** (MR-005 — the internal
+/// P-540/541 evidence spine, the E0.2 floor). This is the un-gameable ratchet's data for the
+/// gate that makes the whole spine's evidence un-fakeable: the gate verdict is RED unless EVERY
+/// id here is present AND carries a FRESH, hash-VALID, attested PASS (the make-it-real gate's
+/// fail-closed property, [`crate::make_it_real`]). The rows map 1:1 to the spine prompts that
+/// fill the production floors the absence scanners (MR-004) document:
+///
+/// - **MR-004** — the production-graph ABSENCE ratchet at/under its committed baseline (the
+///   skeleton this gate is built on; the absence scanners' two-way fixture+baseline test).
+/// - **MR-009** — durable-persistence verify across all four store families (identity, events,
+///   control-plane, KMS root): kill-9/restart + 3-instance consistency + the no-in-memory
+///   scanner green.
+/// - **MR-010** — human/SSO auth real crypto + the forged/expired/replayed NEGATIVE corpus.
+/// - **MR-011** — machine/capability tokens + DPoP (signed, attenuated, revocable) + negative corpus.
+/// - **MR-012** — the `Structural*` verifiers/signers REMOVED from the production graph (the
+///   absence scanner goes green-on-prod, red-on-fixture).
+/// - **MR-013** — tenant isolation: `SET LOCAL` RLS + reset-on-release (the `set_config(..,false)`
+///   bleed fixed) + identifier allowlist + mTLS/region fail-fast.
+///
+/// **RED BY DEFAULT, by design.** Every proof command below is the `cargo test` target that the
+/// owning MR will make green; until that MR lands the command FAILS (the test does not yet exist
+/// or does not yet pass), so the row records claimed-not-proven and the gate reads RED. Running
+/// this gate over the incomplete spine SHOULD be red — that is correct, never faked green
+/// (EI-01 §1). MR-004's row is the one already-landed proof; the rest are forward references the
+/// gate enforces are filled before the spine can claim green.
+pub fn make_it_real_required_rows() -> Vec<GateRow> {
+    fn row(id: &'static str, title: &'static str, cmd: &'static [&'static str]) -> GateRow {
+        GateRow {
+            id,
+            title,
+            proof_command: cmd,
+            // Every make-it-real row is a PERMANENT floor gate: the production mechanisms it
+            // proves (durable stores, real crypto, tenant isolation) must stay real forever —
+            // a regression re-reds the gate (EI-01 §2/§3).
+            permanent: true,
+            floor: None,
+        }
+    }
+    vec![
+        row(
+            "MR-004",
+            "production-graph ABSENCE ratchet at/under the committed baseline (no new Structural* / in-memory-durable / bare-tenant-pool site; the skeleton this gate rests on)",
+            &["test", "-p", "myelin-lints", "--test", "production_graph_absence"],
+        ),
+        row(
+            "MR-009",
+            "durable-persistence verify across identity/events/control-plane/KMS-root: kill-9/restart + 3-instance consistency + no-in-memory scanner green",
+            &[
+                "test",
+                "-p",
+                "myelin-identity-service",
+                "--features",
+                "integration",
+                "--test",
+                "durable_persistence_verify",
+            ],
+        ),
+        row(
+            "MR-010",
+            "human/SSO auth real crypto (OIDC JWKS / SAML XML-DSig / WebAuthn / SSH) + the forged/expired/replayed NEGATIVE corpus rejects",
+            &[
+                "test",
+                "-p",
+                "myelin-identity-service",
+                "--test",
+                "auth_human_negative_corpus",
+            ],
+        ),
+        row(
+            "MR-011",
+            "machine/capability tokens + DPoP (signed, attenuated, sender-constrained, revocable) + the forged/expired/replayed NEGATIVE corpus rejects",
+            &[
+                "test",
+                "-p",
+                "myelin-identity-service",
+                "--test",
+                "auth_machine_negative_corpus",
+            ],
+        ),
+        row(
+            "MR-012",
+            "Structural* verifiers/signers REMOVED from the production graph — the no-structural-crypto absence scanner is green-on-prod, red-on-fixture",
+            // A DEDICATED test target (not a name filter on production_graph_absence): a name
+            // filter that matches zero tests makes `cargo test` exit 0 (a VACUOUS green the gate
+            // must never read as PASS). Pointing at a not-yet-existing --test target makes cargo
+            // ERROR (exit non-zero) until MR-012 lands the target — red by default, never vacuous.
+            &[
+                "test",
+                "-p",
+                "myelin-lints",
+                "--test",
+                "no_structural_crypto_in_prod",
+            ],
+        ),
+        row(
+            "MR-013",
+            "tenant isolation: SET LOCAL RLS + reset-on-release (set_config(..,false) bleed fixed) + identifier allowlist + mTLS/region fail-fast",
+            &[
+                "test",
+                "-p",
+                "myelin-storage",
+                "--features",
+                "integration",
+                "--test",
+                "tenant_isolation_set_local",
+            ],
+        ),
+    ]
+}
+
 /// The verdict of one recorded scorecard row. A `Pass` is only constructible WITH a non-empty
 /// proof line (the dated green artifact the proof command emitted) — a green must be earned, it
 /// cannot be flipped from nothing (the ratchet's "no green without proof" half).
@@ -1890,6 +2019,12 @@ pub struct RowResult {
     pub verdict: RowVerdict,
     /// The ISO-8601 date this row was asserted (the dated green-artifact date).
     pub date: String,
+    /// `Some(..)` iff this PASS is **attested** (MR-005): a content-hash binding the verdict to
+    /// the captured output of the real proof command. Band gates M0..M6 record un-attested
+    /// passes (`None`) — they predate this layer and keep working unchanged. The make-it-real
+    /// gate records attested passes via [`RowResult::pass_attested`]; its validator recomputes
+    /// the hash and reds the gate on any mismatch (a hand-edit can flip bytes, never the hash).
+    pub attestation: Option<crate::make_it_real::RowAttestation>,
 }
 
 impl RowResult {
@@ -1907,7 +2042,25 @@ impl RowResult {
             id: id.into(),
             verdict: RowVerdict::Pass { proof },
             date: date.into(),
+            attestation: None,
         }
+    }
+
+    /// Record an **attested** PASS row (MR-005). Identical to [`RowResult::pass`] — the proof
+    /// line is still required, no green without proof — but it additionally carries the
+    /// [`crate::make_it_real::RowAttestation`] that binds this green to the captured output of
+    /// the real proof command. The make-it-real gate records every PASS this way; its validator
+    /// recomputes the attestation hash and reds the gate on mismatch (the tamper-detection that
+    /// makes the green un-fakeable). Panics on an empty proof line, same as `pass`.
+    pub fn pass_attested(
+        id: impl Into<String>,
+        proof: impl Into<String>,
+        date: impl Into<String>,
+        attestation: crate::make_it_real::RowAttestation,
+    ) -> Self {
+        let mut row = RowResult::pass(id, proof, date);
+        row.attestation = Some(attestation);
+        row
     }
 
     /// Record a CLAIMED-NOT-PROVEN row (a red drill / non-zero exit). The gate reads RED; the
@@ -1923,6 +2076,7 @@ impl RowResult {
                 reason: reason.into(),
             },
             date: date.into(),
+            attestation: None,
         }
     }
 
@@ -2030,6 +2184,12 @@ impl Scorecard {
                  self-hosting-CI + dogfood drills (FLOW-P29/AG-P26/CP-D23-selfhost/STOR-D37/GA-P511/REF-P28/SRCH-P33/KN-P34/GIT-P35) + \
                  truth-up pass (GA-truth-up + contract-coverage)",
                 "M7",
+            ),
+            Band::MakeItReal => (
+                "MR-004 absence ratchet + MR-009 durable-persistence verify + MR-010/011 \
+                 auth-crypto negative corpus + MR-012 Structural*-removed + MR-013 tenant isolation \
+                 — each row ATTESTED (blake3-bound to its proof output)",
+                "the spine to claim production-real",
             ),
         };
         let mut out = String::new();
@@ -2305,6 +2465,35 @@ impl Scorecard {
                      floor with a real implementation + a SEPARATE verification prompt, and gates the \
                      first production release fail-closed (P-546). **This M6 green is dogfood-complete, \
                      NOT production-ready** — do not read it as the latter.\n",
+                );
+            }
+            Band::MakeItReal => {
+                out.push_str(
+                    "**RED BY DEFAULT — the evidence-integrity skeleton (MR-005).** This gate is \
+                     NOT a feature go/no-go; it is the spine's un-fakeable evidence floor. It reads \
+                     GREEN only when EVERY required row carries a FRESH, hash-VALID, attested PASS. \
+                     Missing row → RED. Stale row (older than the freshness window) → RED. \
+                     Tamper / hash-mismatch → RED. A green that cannot prove it bites is not \
+                     evidence (master-plan: \"attested, not hand-editable scorecards\"). Because the \
+                     spine work is not done, running this gate over the real tree is EXPECTED to be \
+                     RED — that is correct, and is never faked green (EI-01 §1).\n\n",
+                );
+                out.push_str(
+                    "**Attestation (the un-fakeable layer).** Each PASS is bound by a blake3 hash \
+                     over {row id, proof-command argv, ISO date, PASS flag, digest of the captured \
+                     proof-command output}. The make-it-real gate re-runs each proof command, \
+                     re-derives the output digest, and recomputes the hash; a hand-edited verdict \
+                     (RED flipped to PASS) or changed output bytes no longer matches the stored \
+                     hash, so the row reds the gate instead of passing silently. The machine-\
+                     readable attested manifest lives next to this file as `make-it-real.json` — \
+                     it is the artifact the gate re-validates (this `.md` is the human mirror).\n\n",
+                );
+                out.push_str(
+                    "**Required rows → owning MR (each red until its MR lands):** MR-004 (absence \
+                     ratchet, the only already-landed proof) · MR-009 (durable-persistence verify) · \
+                     MR-010 (human/SSO auth crypto + negative corpus) · MR-011 (machine/DPoP tokens \
+                     + negative corpus) · MR-012 (Structural* removed, scanner green-on-prod) · \
+                     MR-013 (tenant isolation, SET LOCAL RLS + reset-on-release).\n",
                 );
             }
         }

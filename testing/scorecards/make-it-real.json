@@ -1,0 +1,58 @@
+{
+  "band": "make-it-real (evidence spine)",
+  "generated_on": "2026-06-26",
+  "rows": [
+    {
+      "id": "MR-004",
+      "passed": true,
+      "date": "2026-06-26",
+      "detail": "[2026-06-26] PASS `cargo test -p myelin-lints --test production_graph_absence` (attested blake3:75efdb5045d8)",
+      "attestation": {
+        "argv": [
+          "test",
+          "-p",
+          "myelin-lints",
+          "--test",
+          "production_graph_absence"
+        ],
+        "output_digest": "c3e10e29812220ec8e3113932bcab614c82116cc0f6af6c29b0f289d57c717f8",
+        "hash": "75efdb5045d8749bda011bd655134357bdfc661b7af18698745ab2c54f38e56f"
+      }
+    },
+    {
+      "id": "MR-009",
+      "passed": false,
+      "date": "2026-06-26",
+      "detail": "`cargo test -p myelin-identity-service --features integration --test durable_persistence_verify` exited non-zero (101) — the drill read RED (this floor is not yet real)",
+      "attestation": null
+    },
+    {
+      "id": "MR-010",
+      "passed": false,
+      "date": "2026-06-26",
+      "detail": "`cargo test -p myelin-identity-service --test auth_human_negative_corpus` exited non-zero (101) — the drill read RED (this floor is not yet real)",
+      "attestation": null
+    },
+    {
+      "id": "MR-011",
+      "passed": false,
+      "date": "2026-06-26",
+      "detail": "`cargo test -p myelin-identity-service --test auth_machine_negative_corpus` exited non-zero (101) — the drill read RED (this floor is not yet real)",
+      "attestation": null
+    },
+    {
+      "id": "MR-012",
+      "passed": false,
+      "date": "2026-06-26",
+      "detail": "`cargo test -p myelin-lints --test no_structural_crypto_in_prod` exited non-zero (101) — the drill read RED (this floor is not yet real)",
+      "attestation": null
+    },
+    {
+      "id": "MR-013",
+      "passed": false,
+      "date": "2026-06-26",
+      "detail": "`cargo test -p myelin-storage --features integration --test tenant_isolation_set_local` exited non-zero (101) — the drill read RED (this floor is not yet real)",
+      "attestation": null
+    }
+  ]
+}
