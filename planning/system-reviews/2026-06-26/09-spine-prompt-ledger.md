@@ -78,6 +78,14 @@ surface in the same style.
 | MR-020 | E0.9 | **CLI:** the `myelin` CLI core (clap binary + auth + command framework) — reuse the git/notif command grammars | NET-NEW | MR-015 | ~mid |
 | MR-021 | E0.9 | **MCP server:** the skeleton + tool-registration framework so a local Claude drives Myelin under the same auth+audit as a human | NET-NEW | MR-015, MR-020 | ~mid |
 
+> **Revision 2 (2026-06-26, authoring-time split of MR-010).** As flagged, MR-010 (human/SSO real crypto)
+> splits per credential type — four distinct security-critical protocols, each with its own forged/expired/
+> replayed negative corpus, each independently verified: **MR-010a OIDC JWKS** (JWT sig verify, alg-confusion
+> defence), **MR-010b SAML 2.0 XML-DSig**, **MR-010c WebAuthn/FIDO2 attestation**, **MR-010d SSH pubkey
+> challenge-response**. All swap in behind the existing `CredentialVerifier` seam (`authenticate.rs`, MR-006
+> confirmed harden-as-is). MR-011 (machine/DPoP) also discharges the carried-forward `CapabilityAuthenticator`
+> →durable-`RevocationStore` wiring (the S7Denylist gap from MR-008).
+
 ~21 spine prompts. Flagged for likely split at authoring: **MR-010** (per credential type) and possibly **MR-007**
 (if principal+tuple alone exceeds the window) and **MR-019** (shell vs. test-harness). MR-006 may *emit* reshape
 prompts depending on what the shape review finds.

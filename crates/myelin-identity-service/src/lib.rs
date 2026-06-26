@@ -82,6 +82,7 @@ pub mod machine_auth;
 pub mod mint;
 pub mod multi_cell;
 pub mod namespace;
+pub mod oidc;
 pub mod principal_store;
 pub mod pseudonym_erase;
 pub mod pseudonym_store;
@@ -152,6 +153,9 @@ pub use mint::{
 pub use multi_cell::{
     CellPartition, CrossCellAudit, CrossCellGrant, CrossCellResolution, MigrationReceipt,
     MultiCellAuthority, MultiCellDsrReceiptSet,
+};
+pub use oidc::{
+    JwkKey, JwkSet, OidcConfig, OidcVerifier, ReplayGuard, SchemeDispatchVerifier,
 };
 pub use principal_store::{
     PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore, ProfileRef, S1_HOLDER, S1_TABLE,
