@@ -89,6 +89,7 @@ pub mod pseudonym_store;
 pub mod read_replica;
 pub mod reverse_index;
 pub mod revocation;
+pub mod ssh_auth;
 pub mod tuple_store;
 
 pub use authenticate::{
@@ -156,6 +157,10 @@ pub use multi_cell::{
 };
 pub use oidc::{
     JwkKey, JwkSet, OidcConfig, OidcVerifier, ReplayGuard, SchemeDispatchVerifier,
+};
+pub use ssh_auth::{
+    encode_ssh_credential_material, signed_payload, ssh_fingerprint, Challenge, ChallengeGuard,
+    KeyBindingIndex, RegisteredKey, SshVerifier,
 };
 pub use principal_store::{
     PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore, ProfileRef, S1_HOLDER, S1_TABLE,
