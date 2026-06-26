@@ -44,7 +44,7 @@
 //! data-plane code, fully subject to the same lints as [`crate::pg`]; it needs no no-host-exec
 //! exclusion.
 
-use crate::migration::{is_destructive, Migrations};
+use crate::migration::{is_blocking_alter, is_destructive, HotTables, Migrations};
 use crate::pg::PgError;
 use sqlx::postgres::PgPool;
 use sqlx::Executor;
@@ -129,6 +129,54 @@ impl PgMigrator {
             .await;
 
         result
+    }
+
+    /// **The reconciled boot entry (MR-022 / SI-010): VALIDATE then EXECUTE.** This is the one call
+    /// the production composition root ([`crate::provider::SubstrateProvider::migrate`]) makes so the
+    /// boot path *actually executes the DDL* — closing the SI-010 gap where the substrate boot-time
+    /// [`myelin_substrate::migrations::MigrationRunner::run`] validated the set (forward-only /
+    /// hot-table refusals) but executed NOTHING.
+    ///
+    /// It runs the SAME forward-only + hot-table checks that boot-time validator runs — using the
+    /// shared, single-authority predicates ([`is_destructive`] / [`is_blocking_alter`] /
+    /// [`HotTables`]) so the two never drift — and ONLY THEN hands the admitted set to the race-safe
+    /// driver [`apply`](Self::apply) (advisory lock + `myelin_applied_migration` version table +
+    /// idempotent skip). A rejected set runs NO DDL and takes NO lock (the validation is a pure
+    /// pre-flight before any connection is acquired). The result: validate → apply, in one call, so
+    /// after boot the substrate tables exist in the live DB and a re-boot is idempotent.
+    ///
+    /// (The narrower [`apply`](Self::apply) — which validates only forward-only inside the lock — is
+    /// retained for the concurrent-migrate regression test + the pre-existing `PgStore::migrate`
+    /// caller; `apply_validated` is the hot-table-AWARE boot reconciliation MR-022 adds.)
+    pub async fn apply_validated(
+        pool: &PgPool,
+        migrations: &Migrations,
+        hot_tables: &HotTables,
+    ) -> Result<(), PgError> {
+        // (1) VALIDATE — forward-only + hot-table, before any DDL runs or any lock is taken. This
+        //     mirrors `myelin_substrate::migrations::MigrationRunner::run` exactly (the substrate
+        //     boot-time validator), via the shared single-authority predicates.
+        for m in &migrations.0 {
+            if is_destructive(m.ddl) {
+                return Err(PgError::Migrate(format!(
+                    "migration {} is destructive (DROP) — forward-only migrations only; a rollback \
+                     is a NEW forward migration, never a down (§9.1)",
+                    m.id
+                )));
+            }
+            if let Some(table) = m.table {
+                if hot_tables.is_hot(table) && is_blocking_alter(m.ddl) {
+                    return Err(PgError::Migrate(format!(
+                        "migration {} takes a blocking ALTER on the declared-HOT table `{}` — a \
+                         hot-table change must be expand→backfill→contract, never one blocking \
+                         ALTER that locks writes at QPS (§9.4)",
+                        m.id, table
+                    )));
+                }
+            }
+        }
+        // (2) EXECUTE — the admitted set, race-safe + idempotent + version-recorded.
+        Self::apply(pool, migrations).await
     }
 
     /// The under-the-lock body: ensure the version table, then apply-or-skip each migration in

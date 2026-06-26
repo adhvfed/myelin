@@ -648,6 +648,20 @@ pub mod pg_migrator;
 pub mod s3blob;
 #[cfg(feature = "integration")]
 pub mod valkey;
+// The tenant-scoped-TRANSACTION connection convention (RESHAPE-002 / MR-022): acquire → BEGIN → set
+// the (tenant, region) GUC transaction-scoped (`set_config(..., true)`) → run the op → COMMIT, with
+// `after_release(RESET ALL)` reset-on-release. The mechanism every durable tenant-scoped store
+// acquires through so the SI-005 cross-tenant bleed is impossible by construction; MR-013 hardens
+// the RLS POLICY on this sound foundation.
+#[cfg(feature = "integration")]
+pub mod tenant_tx;
+// The production composition root / real-pool provider (MR-022 / SI-022): reads config from env
+// (the dev↔prod CONFIG SWAP), constructs the REAL bounded PgPool (reset-on-release wired), runs
+// migrations at startup (validate → execute, the SI-010 fix), and hands the pool + cache + blob to
+// the stores. The seam every durable store is constructed through — the in-memory impls become
+// explicit test-doubles on this path.
+#[cfg(feature = "integration")]
+pub mod provider;
 // The OLTP-co-located outbox relay (the one legitimate broker-publish site, BUS-2) — kept in its
 // own module so the broker-publish call is isolated to a single named relay file (the same
 // posture as myelin-events/src/relay.rs).
@@ -787,3 +801,10 @@ pub use storage_surge::{
 pub use pg::{PgError, PgStore};
 #[cfg(feature = "integration")]
 pub use pg_migrator::{with_migration_lock, PgMigrator, MIGRATION_LOCK_KEY};
+// The MR-022 persistence foundation: the tenant-scoped-transaction convention (RESHAPE-002) + the
+// production composition root / real-pool provider (SI-022) + the validate→execute migration boot
+// reconciliation (SI-010). Behind `integration` like the rest of the live-PG code.
+#[cfg(feature = "integration")]
+pub use provider::{foundation_migrations, ProviderError, SubstrateProvider, DEFAULT_MAX_CONNECTIONS};
+#[cfg(feature = "integration")]
+pub use tenant_tx::{connect_pool_with_reset, with_tenant_tx, TxScope};
