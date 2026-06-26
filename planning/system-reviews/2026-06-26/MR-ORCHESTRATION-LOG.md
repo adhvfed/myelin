@@ -47,7 +47,8 @@ reason; always use `cargo test` for the gate.
 | MR-005 | Attested scorecards + red-by-default gate | blake3-attested manifest + make-it-real gate (exit 1, red-by-default), 8 tamper tests | INDEP verifier: ACCEPT-w/-followups → gate NOT gameable (no trust-manifest path; live re-run mandatory); found PRE-EXISTING vacuous-green rows | GREEN (cargo test -p myelin-harness; gate exits 1; check workspace) | 1bd35a8 |
 | MR-006 | Shape/design review | 4 seams SHAPE-OK, 2 RESHAPE (001 sandbox/off-spine, 002 tenant-tx-conn/on-spine→MR-022) | orch verified seam injectors + SandboxHandle + AgentRuntime against source | n/a (read-only) | (committed w/ log) |
 | MR-022 | Persistence foundation (migrations + provider + tenant-tx convention, RESHAPE-002) | apply_validated + SubstrateProvider + with_tenant_tx, 3 live-PG integration tests | INDEP verifier (live PG, app role): ACCEPT — real force-RLS proven, reset-on-release load-bearing, no overclaim, pg.rs untouched | GREEN (3 integ + 842 default + ratchet + workspace) | 87a9c8e (+fix 2fa0260) |
-| MR-007 | Durable principal + tuple stores (PG backing via MR-022 convention) | identity_durable.rs + pg conn-twins + new principal/credential_link RLS tables, 3 live-PG tests | INDEP verifier (live PG): ACCEPT-w/-followups → confirmed real force-RLS + durability + outbox co-commit; CAUGHT enum-indirection blinding the MR-004 ratchet → builder extended scanner to follow enums, baseline restored to honest 23 | GREEN (full lints + 3 integ + default + workspace) | (this) |
+| MR-007 | Durable principal + tuple stores (PG backing via MR-022 convention) | identity_durable.rs + pg conn-twins + new principal/credential_link RLS tables, 3 live-PG tests | INDEP verifier (live PG): ACCEPT-w/-followups → confirmed real force-RLS + durability + outbox co-commit; CAUGHT enum-indirection blinding the MR-004 ratchet → builder extended scanner to follow enums, baseline restored to honest 23 | GREEN (full lints + 3 integ + default + workspace) | 5952615 |
+| MR-008 | Durable revocation + expiry stores (RevocationStore→PG; run-token TTL) | new revocation/run_token_teardown RLS tables, expires_at persisted, fail-loud writes/fail-closed reads, 3 live-PG tests | INDEP verifier (live PG): ACCEPT-w/-followups → CAUGHT a REJECT-level expiry fail-open (lexical timestamp compare) → builder fixed to instant-compare (chrono) + fail-closed-on-parse, regression tests added; found+baselined the S7Denylist machine-token revocation gap (→MR-011) | GREEN (full lints + 3+3 integ + default + workspace) | (this) |
 
 ## Test environment (verified live 2026-06-26 — every persistence/auth prompt uses this)
 
@@ -63,6 +64,18 @@ green: pg connect, s3 put/get, rebac tuples, outbox→bus relay, valkey cache):
   DEFAULT/production path today (the census's core finding). "Make it real" = make the real path the default.
 
 ## Carried-forward obligations for later prompts
+
+- **MR-011 (machine tokens) / MR-009 MUST route `CapabilityAuthenticator` through the durable
+  `RevocationStore`.** MR-008 found `S7Denylist` (`machine_auth.rs:347`) is a tenant-less in-memory jti set
+  rebuilt empty on construction — a machine-token jti revoked only there RE-VALIDATES after restart (a real
+  revocation gap). MR-008 surfaced + baselined it (24/17) but did NOT wire it (correct — that's auth-path
+  scope). Until `CapabilityAuthenticator::authenticate` consults the durable RevocationStore, the gap ships.
+- **Before any real run-token timestamp writer (P-ID-18) / in MR-011:** the run-token expiry guarantee must
+  stay structural. MR-008 fixed its OWN expiry comparison to parse instants (was a lexical string compare that
+  failed open on non-normalized timestamps), but the shared `Timestamp(String)` type (myelin-events) is still
+  unnormalized — any NEW expiry comparison must parse instants (or normalize at the Timestamp boundary, the
+  deferred typed-clock change), never lexical-compare raw RFC3339 strings.
+
 
 - **MR-009 (or the identity route-body MRs) must:** (a) wire the durable `with_pg` PrincipalStore/TupleStore
   into the production boot spec (`identity_app_spec`) as the non-optional default; (b) un-gate the storage

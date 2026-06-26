@@ -814,7 +814,7 @@ pub use provider::{foundation_migrations, ProviderError, SubstrateProvider, DEFA
 #[cfg(feature = "integration")]
 pub use identity_durable::{
     identity_durable_migrations, DurablePrincipalBacking, DurablePrincipalRow, DurableProfileBlob,
-    DurableTupleBacking, TupleEdgeOp,
+    DurableRevocationBacking, DurableRevocationRow, DurableTupleBacking, TupleEdgeOp,
 };
 #[cfg(feature = "integration")]
 pub use tenant_tx::{connect_pool_with_reset, with_tenant_tx, TxScope};

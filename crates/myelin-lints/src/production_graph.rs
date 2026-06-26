@@ -206,13 +206,14 @@ pub fn no_structural_crypto_in_prod() -> Lint {
 ///
 /// **KNOWN COVERAGE BOUNDARY — the role-suffix blind spot (LOUD, named; NOT a bug).** This scanner
 /// keys on the durable-role NAME suffix (`Store`/`Registry`/`Outbox`/`Ledger`) plus a small precise
-/// [`NAMED_DURABLE_HOLDERS`] list (`KmsEngine` SI-006, `MisrouteAudit` SI-028). A census persistence
-/// shortcut whose struct has NEITHER is INVISIBLE here — the baseline covers the role-suffix
-/// representative PER ORGAN, NOT the full census persistence set. Known-uncovered, each riding a
-/// not-yet-authored persistence MR that MUST extend this scanner (add the type to
-/// [`NAMED_DURABLE_HOLDERS`] or widen [`DURABLE_ROLE_SUFFIXES`]) when it lands: `S7Denylist` (SI-020),
+/// [`NAMED_DURABLE_HOLDERS`] list (`KmsEngine` SI-006, `MisrouteAudit` SI-028, `S7Denylist` SI-020).
+/// A census persistence shortcut whose struct has NEITHER is INVISIBLE here — the baseline covers the
+/// role-suffix representative PER ORGAN, NOT the full census persistence set. Known-uncovered, each
+/// riding a not-yet-authored persistence MR that MUST extend this scanner (add the type to
+/// [`NAMED_DURABLE_HOLDERS`] or widen [`DURABLE_ROLE_SUFFIXES`]) when it lands:
 /// `Consumer` (SI-024), `Firehose` (SI-037), `InMemoryShredder` (SI-038), `OltpPool` (SI-021),
-/// `PlacementService` stickiness (SI-026). A future "the bus / control-plane is durable now" claim is
+/// `PlacementService` stickiness (SI-026). (`S7Denylist` SI-020 was added to the named list by MR-008,
+/// the revocation MR.) A future "the bus / control-plane is durable now" claim is
 /// therefore only PARTIALLY gated until that MR extends the scanner — this note exists so that gap is
 /// never silently relied upon (the full list + per-organ mapping is in `tests/production_graph_absence.rs`).
 ///
@@ -256,7 +257,13 @@ const DURABLE_ROLE_SUFFIXES: &[&str] = &["Store", "Registry", "Outbox", "Ledger"
 ///     (census SI-028; `records: Arc<Mutex<Vec<…>>>`, in-memory today). Named here rather than via an
 ///     `Audit` suffix, which would wrongly flag report/value types like `CrossCellAudit` (no
 ///     collection) and `RestrictionLeakAudit` (a computed gate REPORT, not a system-of-record).
-const NAMED_DURABLE_HOLDERS: &[&str] = &["KmsEngine", "MisrouteAudit"];
+///   - `S7Denylist` — the machine-auth `authenticate` revocation consult (census SI-020), a
+///     STUB `Arc<Mutex<BTreeSet<String>>>` of revoked jtis with NO durable backing (it loses every
+///     revocation on restart → a revoked token would validate again). Named here (the `Denylist`
+///     suffix is not a generic role suffix) because MR-008 is the revocation MR the MR-004
+///     coverage-boundary note said must extend this scanner. Removed when `CapabilityAuthenticator`
+///     consults the now-durable `RevocationStore` instead of its own stub set (MR-009 / auth MRs).
+const NAMED_DURABLE_HOLDERS: &[&str] = &["KmsEngine", "MisrouteAudit", "S7Denylist"];
 /// Name fragments that mark an obvious NON-durable in-memory double/cache/derived view — excluded so
 /// a legitimate cache/index/derived-projection/code-registry is not flagged (the precise-scope
 /// discipline the rule names: only a durable SYSTEM-OF-RECORD is a shortcut, never a rebuildable
@@ -794,6 +801,17 @@ mod tests {
         // `MisrouteAudit` (SI-028) — no role suffix, caught precisely via the named-holder list.
         let red = "pub struct MisrouteAudit {\n    records: Arc<Mutex<Vec<MisrouteAuditRecord>>>,\n}";
         assert!(!no_in_memory_durable_store().run(red).is_empty());
+    }
+
+    #[test]
+    fn in_memory_store_catches_s7_denylist_named_holder() {
+        // `S7Denylist` (SI-020) — no role suffix (ends `Denylist`), caught via the named-holder list
+        // (added by MR-008, the revocation MR). A bare in-process set of revoked jtis with no pool.
+        let red = "pub struct S7Denylist {\n    revoked: Arc<Mutex<BTreeSet<String>>>,\n}";
+        assert!(
+            !no_in_memory_durable_store().run(red).is_empty(),
+            "the S7Denylist revocation stub must be caught (a lost revocation lets a revoked token validate)"
+        );
     }
 
     #[test]
