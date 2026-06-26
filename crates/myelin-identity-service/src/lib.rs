@@ -89,6 +89,7 @@ pub mod pseudonym_store;
 pub mod read_replica;
 pub mod reverse_index;
 pub mod revocation;
+pub mod saml;
 pub mod ssh_auth;
 pub mod tuple_store;
 

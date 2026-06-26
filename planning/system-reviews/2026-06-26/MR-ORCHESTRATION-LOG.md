@@ -67,7 +67,11 @@ MR-010a wires nothing into the prod default (StructuralVerifier still the OIDC d
 
 | MR-010d | SSH pubkey challenge-response (Ed25519/RSA-SHA2, single-use TTL challenge, alg pinning, RSA≥2048 floor) | SshVerifier behind the seam + 19-test corpus (real keypairs/sigs/forgeries) | INDEP SECURITY verifier: ACCEPT-w/-followups → own 12-test adversarial suite, COULD NOT forge/replay/panic past it (consume atomic under 16 threads, domain-sep confirmed, wire-fuzz total); renames legit (ephemeral guard + read-index over PG SoR, not MR-007 evasion); found no-RSA-min-keysize → builder added ≥2048 floor | GREEN (19 ssh + full lints + workspace; no new crates) | (this) |
 
-Auth-crypto so far: OIDC + SSH both real, both survived a security verifier trying to forge. SAML (MR-010b) + WebAuthn (MR-010c) next (user: build all four, test in depth).
+| MR-010b | SAML 2.0 XML-DSig (hand-built exc-c14n + structural XSW defence, no libxml/openssl) | SamlVerifier behind the seam + 26-test corpus (full XSW family, XXE/billion-laughs, c14n, non-anchored cert) | INDEP SECURITY verifier: ACCEPT-w/-followups → 22 adversarial attacks, COULD NOT authenticate any forgery (no XSW shape, no c14n collision — canonicalization injective, pointer-identity defence); found a deep-nesting stack-overflow DoS → builder added a parse-time depth bound (256) + regression test | GREEN (26 saml + full lints + workspace; no C/SAML crates) | (this) |
+
+**Codex review attempted (user suggestion):** codex CLI is non-functional in this environment — `codex exec`/`doctor`/`login status` all exit 144 with no output (only `--help`/`--version` work; likely an auth/runtime/network issue specific to the API-calling subcommands). Relied on the thorough Claude security audit. If codex is fixed (auth/runtime) it can be a second lens on later security-critical prompts.
+
+Auth-crypto so far: OIDC + SSH + SAML all real, all survived a security verifier trying to forge. WebAuthn (MR-010c) next (user: build all four, test in depth).
 
 ## Test environment (verified live 2026-06-26 — every persistence/auth prompt uses this)
 
