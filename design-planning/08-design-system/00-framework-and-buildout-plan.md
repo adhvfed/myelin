@@ -50,6 +50,12 @@ finalists (decision-brief §7.1), so this phase must **name the primitive librar
 dependency**, not a "we'll pick later." Each decision below is tagged and, where it makes a current-tooling
 claim, cited.
 
+> ⚠️ **§1.1 + §1.2 SUPERSEDED (2026-06-26).** The framework is **SolidJS + SolidStart** (not React) and the
+> overlay/a11y primitives are **hand-built in vanilla Solid** (not React Aria), wrapped by **Tauri 2** for
+> desktop/mobile. The reasoning + the full revised stack is `planning/system-reviews/2026-06-26/08-frontend-foundation.md`; the component behaviour is `…/10-frontend-component-patterns.md`. The
+> parameterization model, the catalogue, the sequence, and everything below §1.2 still hold — only the named
+> framework + primitive library changed.
+
 ### 1.1 UI framework — **TypeScript + React (function components + hooks)** — CONFIRM §8
 
 - **Decision:** TS + React as the default for all web surfaces, with one shared component library + token
