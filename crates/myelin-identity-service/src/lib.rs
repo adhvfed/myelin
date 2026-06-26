@@ -92,6 +92,7 @@ pub mod revocation;
 pub mod saml;
 pub mod ssh_auth;
 pub mod tuple_store;
+pub mod webauthn;
 
 pub use authenticate::{
     scheme, AuthTelemetry, CredentialVerifier, HumanSsoAuthenticator, IdorCounters,
@@ -162,6 +163,10 @@ pub use oidc::{
 pub use ssh_auth::{
     encode_ssh_credential_material, signed_payload, ssh_fingerprint, Challenge, ChallengeGuard,
     KeyBindingIndex, RegisteredKey, SshVerifier,
+};
+pub use webauthn::{
+    encode_assertion_material, encode_registration_material, ChallengeGuard as WebauthnChallengeGuard,
+    CoseKey, CredentialBindingIndex, WebauthnConfig, WebauthnVerifier,
 };
 pub use principal_store::{
     PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore, ProfileRef, S1_HOLDER, S1_TABLE,
