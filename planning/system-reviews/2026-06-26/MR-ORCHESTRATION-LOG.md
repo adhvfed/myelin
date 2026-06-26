@@ -1,0 +1,47 @@
+# MR-NNN Spine — Orchestration Log
+
+Orchestrator: Claude (Opus 4.8). Started 2026-06-26. Source ledger: `09-spine-prompt-ledger.md`.
+
+This log records, per prompt: builder verdict, the independent verification, the cargo gate result,
+and the commit. It is the orchestrator's running memory across the batch. The cardinal rule of this
+project — *the agent that wrote a floor cannot certify it* — is enforced here: every load-bearing or
+security-critical prompt gets an independent verifier agent that never touched the code.
+
+## Quality bar (the gate between every prompt)
+
+1. **Anti-duplication first.** Each prompt opens with grep of `planning/07-prompts/` + crates + design
+   specs, AND a ledger-vs-commits cross-check (`git log --grep`, `git show --stat`). Extend, never fork.
+2. **Cargo gate.** `cargo check --workspace --all-targets` green before and after; `cargo test` for the
+   touched crates green. Halt on red.
+3. **Independent verification.** For HARDEN / security / persistence prompts, a separate agent (which did
+   not write the code) re-derives the claim against the real artifact — runs the negative corpus, the
+   crash/restart, the scanner-on-red-fixture — and reports PASS/FAIL with evidence. Builder's green is
+   not accepted on its own word.
+4. **Evidence, not assertion.** "It works" must be backed by a command + its output. Red fixtures must be
+   shown to actually bite. No green-lying.
+5. **Commit per prompt** (`MR-NNN: <title>`), so the next prompt's ledger-vs-commits cross-check works.
+
+## Status
+
+| MR | Title | Builder | Verify | Gate | Commit |
+|----|-------|---------|--------|------|--------|
+| baseline | `cargo check --workspace --all-targets` | — | — | GREEN | b4b7799 |
+| MR-001 | Census: substrate | 57 findings (~12 CRIT) | orch spot-check: symbols/lines verified | n/a (read-only) | (this) |
+| MR-002 | Census: Git + sandbox seam | 10 findings (5 CRIT) | orch spot-check: firecracker/gvisor/RefStore verified | n/a (read-only) | 2e2b6b1 |
+| MR-003 | Census synthesis → shortcut-inventory.md | 66 deduped (17 CRIT) | orch verified SI-010 + SI-006 against source | n/a (read-only) | (this) |
+
+## Decisions & deviations
+
+- **Census ran MR-001 + MR-002 concurrently** (read-only, disjoint crates, separate output files, both in W1). Sequential build discipline still applies from MR-004 on.
+- **Orchestrator verification of census:** spot-checked the load-bearing CRITICAL claims against source rather than trusting verbatim. MR-001 auth-crypto (`StructuralVerifier` `identity-service/authenticate.rs:146`, `StructuralTokenSigner` `mint.rs:164`), RLS bleed (`storage/pg.rs:413` `set_config(...,false)`); MR-002 sandbox (`firecracker.rs:114` `init=/bin/true`, `gvisor.rs:230` `runsc --version` probe, `spec.command` unused at `gvisor.rs:67`), git `RefStore` in-memory (`receive_pack.rs:537`). All confirmed accurate. A path-prefix audit pass on MR-001 fixed 2 cross-crate refs; identity findings were already correctly prefixed `myelin-identity-service`.
+- **LEDGER REVISION 1 (orchestrator steering decision, post-MR-003).** The synthesis found the spine's
+  durable-persistence coverage (MR-007/008) was identity-crate only, leaving 5 CRITICAL load-bearing substrate
+  organs with no spine prompt. Verified two gap claims against source before acting: migration runner `run()`
+  (`substrate/migrations.rs:108`) executes no real DDL (doc admits "DDL execution lands with the driver");
+  KMS mints a fresh `RawKey::generate()` root per process (`storage/kms.rs:256`) with no durable backing →
+  MR-009's restart verify would be hollow. Inserted **MR-022..MR-025** (foundation, events, control-plane, KMS
+  root) into the W2 persistence band; expanded MR-009 verify to all four store families. Destination unchanged
+  (master plan already requires no-HashMap-for-load-bearing-state); this is the authoring-time split the ledger
+  anticipated. Git ref-store/server/backup (SI-012/13/14/15) stay on the Git subsystem track, not the spine.
+  Did NOT block the user on a question — autonomous batch, faithful to the master plan, fully reversible (planning).
+- **Top systemic truths carried forward:** (1) the production auth graph is wired to `Structural*` mock crypto by default → total forgery; (2) tenant RLS bleeds across pooled connections; (3) no durable persistence anywhere load-bearing (identity stores, events outbox, KMS keys, git refs/pack-index all in-memory); (4) the sandbox never runs `spec.command` in prod and the escape gate certifies a path real jobs don't take; (5) git has no prod WireExecutor/server binary; (6) the E0.2 absence-scanners that should mechanically block these do not exist yet → **MR-004 is the true first build dependency.**

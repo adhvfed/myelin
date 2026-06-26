@@ -27,11 +27,30 @@ surface in the same style.
 ## Dependency waves (the batch runs them linearly in this order; waves show what *could* parallelize)
 
 - **W1 (no deps):** MR-001/002 census · MR-004 absence scanners · MR-016 frontend package/guide/lint · (MR-006 shape review after census)
-- **W2:** MR-003 census synthesis · MR-005 evidence gate · MR-007/008 durable persistence · MR-017 overlays · MR-018 Tauri skeleton
+- **W2:** MR-003 census synthesis · MR-005 evidence gate · **MR-022 persistence foundation** · MR-007/008 durable persistence · **MR-023 events persistence · MR-024 control-plane persistence · MR-025 KMS durable root** · MR-017 overlays · MR-018 Tauri skeleton
 - **W3:** MR-009 persistence verify · MR-010/011 auth crypto
 - **W4:** MR-012 remove Structural + scanner · MR-013 tenant isolation
 - **W5:** MR-014/015 product API
 - **W6:** MR-019 app shell · MR-020 CLI core · MR-021 MCP server
+
+> **Revision 1 (2026-06-26, post-census).** The MR-003 synthesis (`shortcut-inventory.md`) found the spine's
+> durable-persistence coverage (MR-007/008) was **identity-crate only**, leaving five CRITICAL load-bearing
+> substrate organs with no spine prompt. The destination is unchanged (the master plan already requires "nothing
+> is real while load-bearing state lives in a `HashMap`"); this is the authoring-time split the ledger anticipated.
+> Inserted prompts **MR-022..MR-025** (IDs stable; run order is the wave list above + the per-prompt Deps, not the
+> ID sequence). The persistence band now runs **MR-022 (foundation) → MR-007 → MR-008 → MR-023 → MR-024 → MR-025
+> → MR-009 (verify, scope expanded to all four store families)**. Git ref-store durability, the git server binary,
+> and real backup/restore (SI-012/013/014/015) remain correctly routed to the **Git subsystem track** (decomposed
+> after the spine), not the spine — flagged in `shortcut-inventory.md` §B so they aren't lost.
+
+### Inserted persistence prompts (Revision 1)
+
+| ID | Epic | Title | Type | Deps | Size note |
+|---|---|---|---|---|---|
+| MR-022 | E0.3 | **Persistence foundation:** real migration-runner DDL execution against the live pool + the composition root that injects a real Postgres/Valkey pool into the substrate + **flip the real backings onto the DEFAULT test gate** (off `--features integration`, fixes SI-022) | NET-NEW | MR-003 | **prerequisite for all persistence**; ~mid–high. Fixes SI-010. |
+| MR-023 | E0.3 | **Events bus durable persistence:** outbox + dedup ledger + relay delivery on the live pool/bus + the events `serve()` composition root | REUSE P-522/523 + P-539 | MR-022 | ~mid–high. Fixes SI-007/008/009/023/024/025/037. May split outbox vs serve. |
+| MR-024 | E0.3 | **Control-plane placement registry durable persistence:** tenant→cell routing survives restart | REUSE P-522/523 | MR-022 | ~mid. Fixes SI-011/026/027/028. |
+| MR-025 | E0.3 | **KMS durable cell-root + KEK persistence slice** (software-sealed, *not* HSM — HSM stays Tier-4): the L0 root + L1 KEKs survive restart so encrypted columns are recoverable; `backup_snapshot` includes them | REUSE P-522 (KMS slice) | MR-022 | ~mid. Fixes SI-006; without it MR-009's restart verify is hollow. |
 
 ## The spine prompt set
 
@@ -45,7 +64,7 @@ surface in the same style.
 | MR-006 | E0.4 | Shape/design review: identity/authz, sandbox, KMS, tenancy, GDPR **+ the mock→`LlmAgentRuntime` seam** — "is the frozen shape still right" → reshape findings | NET-NEW | MR-003 | review; ~mid (may spawn reshape prompts) |
 | MR-007 | E0.3 | Durable persistence impl: bind the live OLTP/cache pool under the **principal + tuple** stores | REUSE P-522 | MR-003 | **split of P-522**; ~mid–high |
 | MR-008 | E0.3 | Durable persistence impl: the **revocation + expiry** stores on the live pool | REUSE P-522 | MR-007 | second half of P-522; ~mid |
-| MR-009 | E0.3 | Durable persistence **verify**: kill-9/restart + 3-instance consistency + the no-in-memory scanner green | REUSE P-523 | MR-007, MR-008, MR-004 | integration; ~mid |
+| MR-009 | E0.3 | Durable persistence **verify** (scope expanded, Rev 1): kill-9/restart + 3-instance consistency + the no-in-memory scanner green — across **all four store families** (identity, events, control-plane, KMS root) | REUSE P-523 | MR-007, MR-008, MR-023, MR-024, MR-025, MR-004 | integration; ~mid–high |
 | MR-010 | E0.5 | Auth: **human/SSO** real crypto (OIDC JWKS / SAML XML-DSig / WebAuthn / SSH) + the forged/expired/replayed negative corpus | REUSE P-526 | MR-009 | **likely splits per credential type**; ~high |
 | MR-011 | E0.5 | Auth: **machine/capability tokens + DPoP** (signed, attenuated, sender-constrained, revocable) + negative corpus | REUSE P-527 | MR-009 | ~mid–high |
 | MR-012 | E0.5 | **Remove the `Structural*` verifiers/signers** from the production graph; the absence scanner (MR-004) goes green-on-prod, red-on-fixture | REUSE P-528 | MR-010, MR-011, MR-004 | ~mid |
