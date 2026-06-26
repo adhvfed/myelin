@@ -691,6 +691,17 @@ pub mod events_serve;
 // convention (a NAMED tenant-predicate exclusion, like pgrelay.rs / events_durable.rs).
 #[cfg(feature = "integration")]
 pub mod placement_durable;
+// The durable PG backing for the KMS cell root + KEKs/DEKs (MR-025 / SI-006): the software-sealed
+// root-of-trust — the L0 cell root rests ONLY sealed under the operator-held seal key
+// (MYELIN_KMS_SEAL_KEY, never in the DB), with the KEKs wrapped under the root + the DEKs under their
+// KEKs. `load_or_generate` recovers the root + keys across a restart (fail-closed + LOUD on a
+// wrong/absent seal key — NEVER a new root that would orphan every existing ciphertext). Cell-INFRA
+// key material (PII-free, cross-tenant by design) — connects to the pool directly, NOT through the
+// per-request RLS/with_tenant_tx convention (a NAMED tenant-predicate exclusion, like
+// placement_durable.rs / events_durable.rs). The HSM/Shamir-split L0 backing stays Tier-4; the
+// production boot wiring + kill-9 proof is MR-009. EXTENDS kms.rs — there is ONE KmsEngine.
+#[cfg(feature = "integration")]
+pub mod kms_durable;
 
 pub use agent_run_gate::{AgentRunGate, AgentRunGateSignal, DispatchError, InFlightRun, RunKind};
 pub use backup::{
@@ -756,8 +767,9 @@ pub use key_origin::{
     KeyOriginError, KeyOriginKind, KeyOriginTelemetry, PlatformManaged,
 };
 pub use kms::{
-    CellRoot, DekHandle, DekId, KekId, KeyClass, KmsAdapter, KmsEngine, KmsError, PiiKeyRef,
-    WrappedDek, KEY_LEN, NONCE_LEN,
+    CellRoot, DekHandle, DekId, ExportedKek, KekId, KeyClass, KmsAdapter, KmsDurableSnapshot,
+    KmsEngine, KmsError, PiiKeyRef, SealKey, SealKeyError, SealedRoot, WrappedDek, KEY_LEN,
+    NONCE_LEN,
 };
 pub use kms_failstatic::{
     KmsFailStaticSignals, KmsReadError, KmsReadPath, KmsReadResult, KmsReadiness,
@@ -843,4 +855,11 @@ pub use events_serve::{EventsRuntime, EventsServeError, DEFAULT_DRAIN_BATCH};
 pub use placement_durable::{
     placement_durable_migrations, DurableCellRow, DurableMisrouteAuditBacking, DurableMisrouteRecord,
     DurablePlacementBacking, DurablePlacementRow, PlacementWriteError,
+};
+// The durable KMS backing (MR-025 / SI-006): the software-sealed cell root + wrapped KEKs/DEKs over
+// the OLTP pool, with `load_or_generate` (fail-closed on a wrong seal key) + the env seal-key supply.
+#[cfg(feature = "integration")]
+pub use kms_durable::{
+    kms_durable_migrations, seal_key_from_env, DurableKmsBacking, KmsDurableError,
+    KMS_SEALED_ROOT_MIGRATION, KMS_WRAPPED_DEK_MIGRATION, KMS_WRAPPED_KEK_MIGRATION, SEAL_KEY_ENV,
 };

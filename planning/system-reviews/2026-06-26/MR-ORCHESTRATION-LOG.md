@@ -50,7 +50,10 @@ reason; always use `cargo test` for the gate.
 | MR-007 | Durable principal + tuple stores (PG backing via MR-022 convention) | identity_durable.rs + pg conn-twins + new principal/credential_link RLS tables, 3 live-PG tests | INDEP verifier (live PG): ACCEPT-w/-followups → confirmed real force-RLS + durability + outbox co-commit; CAUGHT enum-indirection blinding the MR-004 ratchet → builder extended scanner to follow enums, baseline restored to honest 23 | GREEN (full lints + 3 integ + default + workspace) | 5952615 |
 | MR-008 | Durable revocation + expiry stores (RevocationStore→PG; run-token TTL) | new revocation/run_token_teardown RLS tables, expires_at persisted, fail-loud writes/fail-closed reads, 3 live-PG tests | INDEP verifier (live PG): ACCEPT-w/-followups → CAUGHT a REJECT-level expiry fail-open (lexical timestamp compare) → builder fixed to instant-compare (chrono) + fail-closed-on-parse, regression tests added; found+baselined the S7Denylist machine-token revocation gap (→MR-011) | GREEN (full lints + 3+3 integ + default + workspace) | cf8ed01 |
 | MR-023 | Events durable persistence + serve() (EventsRuntime: PgRelay outbox + NATS + durable dedup) | DurableDedup + EventsRuntime composition root, 3 live PG+NATS tests (0-lost/0-ghost/emit-iff-committed) | INDEP verifier (live PG+NATS): ACCEPT-w/-followups → 0-lost/0-ghost proven (mark-sent only after durable PubAck), dedup fail-direction safe, tenant-predicate exclusion legitimate; FOLLOW-UP: dedup mark not yet co-committed w/ handler state write (latent → MR-009/023b) | GREEN (full lints + 3 integ + default + no-regression + workspace) | 9c21d66 |
-| MR-024 | Control-plane placement registry durable persistence (tenant_placement/cell tables + invariant trigger) | placement_durable.rs + registry_durable.rs, 3 live-PG tests; placement invariant as a REAL DB trigger | orch focused INDEP verify (live PG): cross-region placement REJECTED by trg_placement_invariant via direct psql (bypassing Rust); durability proven; lint exclusion legitimate (pg.rs/identity_durable still linted) | GREEN (full lints + 3 integ + default + workspace) | (this) |
+| MR-024 | Control-plane placement registry durable persistence (tenant_placement/cell tables + invariant trigger) | placement_durable.rs + registry_durable.rs, 3 live-PG tests; placement invariant as a REAL DB trigger | orch focused INDEP verify (live PG): cross-region placement REJECTED by trg_placement_invariant via direct psql (bypassing Rust); durability proven; lint exclusion legitimate (pg.rs/identity_durable still linted) | d2a5f92 |
+| MR-025 | KMS durable cell-root + KEK/DEK persistence (software-sealed, SealKey from env) | kms_durable.rs + load_or_generate + backup_snapshot_durable, 3 live-PG tests | INDEP verifier (live PG + psql + own tamper probe): ACCEPT-w/-followups → wrong/missing/malformed/TAMPERED seal key fails closed + never mints a new root, root never plaintext at rest, seal key no-leak, crypto-shred survives restore | GREEN (full lints + 3 integ + 422 default + workspace) | (this) |
+
+**Persistence wave COMPLETE** (MR-022 foundation + MR-007/008 identity + MR-023 events + MR-024 control-plane + MR-025 KMS). Next: MR-009 (verify) wires the durable paths into production boot + the kill-9 proof + discharges the carried-forward obligations.
 
 ## Test environment (verified live 2026-06-26 — every persistence/auth prompt uses this)
 
@@ -73,6 +76,14 @@ green: pg connect, s3 put/get, rebac tuples, outbox→bus relay, valkey cache):
   points a real consumer at the durable dedup ledger, a crash between mark-commit and handler-effect =
   SILENT LOSS. Thread the handler's tx so the mark + the handler state write commit atomically (or use the
   consume→handle→ack ordering with the mark inside the handler's tx). Documented in dedup.rs/events_durable.rs.
+- **Lint-harness improvement (low-pri, affects all `*_durable.rs`):** the workspace `is_excluded` skips a
+  named file from ALL twelve lints, not just the one it false-positives on (tenant-predicate). Low risk today
+  (no other lint applies to the durable backings), but a future edit to events_durable/placement_durable/
+  kms_durable is unguarded by the other eleven. Add per-lint exclusion granularity when the lint harness
+  supports it (a `(path, lint_id)` exclusion instead of a whole-file path).
+- **KMS minor (MR-025, non-blocking):** `destroy_kek` leaves orphan wrapped-DEK rows (harmless — KekUnavailable
+  on resolve, excluded from snapshot); a sweep could reap them. `upsert_sealed_root` is a root-overwrite
+  primitive (safe for restore-into-clean; watch new callers).
 - **Low-pri check (pre-existing, not MR-023):** snapshot/reindex events use a deterministic FNV-1a
   `event_id` (not tenant-derived); confirm aggregate keys are globally unique so a cross-tenant consumer
   replaying snapshots can't dedup-collide. Property of the frozen ledger, unchanged by MR-023.

@@ -85,6 +85,17 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // The tenant-store code in pg.rs / identity_durable.rs stays FULLY linted. NAMED, LOUD exclusion
     // (see the module note in placement_durable.rs), never a silent skip; the lint is NOT weakened.
     "myelin-storage/src/placement_durable.rs",
+    // The durable KMS backing (MR-025 / SI-006): the software-sealed cell ROOT + wrapped KEKs/DEKs
+    // (`kms_sealed_root` / `kms_wrapped_kek` / `kms_wrapped_dek`). This is cell-INFRA key material —
+    // the KMS holds the keys for ALL tenants in the cell (one engine resolves every tenant's DEK), so
+    // it is cross-tenant BY DESIGN and PII-free (key ciphertext + opaque ids). The `kms_sealed_root`
+    // queries carry no tenant column at all (the root is per-CELL), and the KEK/DEK `tenant_id` column
+    // is the key-OWNER, not an RLS predicate. Like placement_durable.rs / events_durable.rs / pgrelay.rs
+    // this is infra, NOT a per-request tenant data store, so it does NOT use the with_tenant_tx/RLS
+    // convention and carries no per-row tenant predicate. The tenant-store code in pg.rs /
+    // identity_durable.rs stays FULLY linted. NAMED, LOUD exclusion (see the module note in
+    // kms_durable.rs), never a silent skip; the lint is NOT weakened.
+    "myelin-storage/src/kms_durable.rs",
     // The FIREHOSE transport (EB-21 / P-141): `firehose::publish(stream, scope, frame)` is the
     // FROZEN contract-3.5 / §5.5 method name for the EPHEMERAL firehose transport — a DIFFERENT
     // seam from the durable bus the `no-raw-publish` lint guards. §4.3 is explicit: "the durable bus
