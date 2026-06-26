@@ -244,7 +244,7 @@ async fn c_tenant_tx_isolates_and_does_not_bleed() {
     // NOBYPASSRLS — the admin/owner role is a superuser and would bypass every policy). DDL above
     // ran as admin; the convention below runs as the app role so RLS is genuinely enforced. The
     // app-role pool has reset-on-release wired (RESHAPE-002 defence-in-depth).
-    let pool = connect_pool_with_reset(&cfg.database_url, 4)
+    let pool = connect_pool_with_reset(&cfg.database_url, &cfg.region, 4)
         .await
         .expect("open the app-role reset-on-release pool");
 
@@ -297,7 +297,7 @@ async fn c_tenant_tx_isolates_and_does_not_bleed() {
 
     // (3) RESET-ON-RELEASE / no bleed. Use a single-connection pool so the next acquire reuses the
     //     SAME backend connection — the exact surface the old session-scoped GUC bled across.
-    let pool1 = connect_pool_with_reset(&cfg.database_url, 1)
+    let pool1 = connect_pool_with_reset(&cfg.database_url, &cfg.region, 1)
         .await
         .expect("single-connection app-role pool");
 
