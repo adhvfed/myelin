@@ -65,6 +65,10 @@ reason; always use `cargo test` for the gate.
 
 MR-010a wires nothing into the prod default (StructuralVerifier still the OIDC default until MR-012); it ADDS the real verifier + proves it. JWKS network fetch/rotation deferred (injected key set).
 
+| MR-010d | SSH pubkey challenge-response (Ed25519/RSA-SHA2, single-use TTL challenge, alg pinning, RSA≥2048 floor) | SshVerifier behind the seam + 19-test corpus (real keypairs/sigs/forgeries) | INDEP SECURITY verifier: ACCEPT-w/-followups → own 12-test adversarial suite, COULD NOT forge/replay/panic past it (consume atomic under 16 threads, domain-sep confirmed, wire-fuzz total); renames legit (ephemeral guard + read-index over PG SoR, not MR-007 evasion); found no-RSA-min-keysize → builder added ≥2048 floor | GREEN (19 ssh + full lints + workspace; no new crates) | (this) |
+
+Auth-crypto so far: OIDC + SSH both real, both survived a security verifier trying to forge. SAML (MR-010b) + WebAuthn (MR-010c) next (user: build all four, test in depth).
+
 ## Test environment (verified live 2026-06-26 — every persistence/auth prompt uses this)
 
 Real backends run via `docker-compose.dev.yml` and are UP (confirmed `smoke_backends` integration test
@@ -79,6 +83,10 @@ green: pg connect, s3 put/get, rebac tuples, outbox→bus relay, valkey cache):
   DEFAULT/production path today (the census's core finding). "Make it real" = make the real path the default.
 
 ## Carried-forward obligations for later prompts
+
+- **Git smart-transport MR:** populate `KeyBindingIndex` (SSH key→principal) from the durable PG `PrincipalStore`
+  on key registration, and issue the SSH auth challenge on the git-transport handshake (MR-010d ships these as
+  thin injected layers; the crypto is real + proven, the runtime wiring is deferred — honestly scoped).
 
 - **MR-009 / MR-023b: the durable dedup mark MUST co-commit with the consumer handler's state write.**
   MR-023's `DurableDedupBacking::mark_handled` commits in its OWN autocommit tx BEFORE the handler runs.
