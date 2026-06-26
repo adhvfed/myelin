@@ -117,6 +117,16 @@ rsa = "0.9"
 sha2 = { workspace = true, features = ["oid"] }
 base64 = "0.22"
 # ------------------------------------------------------------------------------------------
+# MR-010b (SI-001/004, the SAML slice of P-526): REAL SAML 2.0 XML-DSig signature verification.
+# `xmlparser` is a NON-EXPANDING, non-validating XML TOKENIZER — it emits DTD/entity tokens rather
+# than expanding them, which is exactly the property the XXE / billion-laughs defence needs (the
+# verifier refuses any DTD/entity token outright). It is ALREADY in Cargo.lock as a transitive dep
+# (via aws-smithy-xml); this edge only PROMOTES it to a direct dep, so no new crate enters the tree.
+# Exclusive c14n is hand-built (see saml.rs); the signature math reuses the SAME vetted primitives the
+# OIDC path already pulls (`rsa` + `sha2` for rsa-sha256, `ring` for ecdsa-p256-sha256). No C deps
+# (no libxml2 / openssl) — the security-conscious choice for this minefield (see saml.rs STEP-1 note).
+xmlparser = "0.13"
+# ------------------------------------------------------------------------------------------
 # MR-007 (SI-018/019): the durable PG backings for the S1 principal + S3 tuple stores live in
 # myelin-storage behind its `integration` feature (the real sqlx client). The identity-layer
 # stores delegate to them through the MR-022 SubstrateProvider + with_tenant_tx convention. The
