@@ -191,12 +191,18 @@ pub fn no_structural_crypto_in_prod() -> Lint {
 /// in `tests/production_graph_absence.rs`) — product-subsystem stores ride their own subsystem
 /// tracks (census §B2), not this spine scanner.
 ///
-/// **Detection completeness (false-negatives closed in the MR-004 verifier review).** The collection
-/// fingerprint matches maps AND sequences (`Vec<`/`VecDeque<`), and `type` aliases that expand to a
-/// collection are resolved ([`collection_alias_names`]) so an `Arc<Mutex<Alias>>` field is seen
-/// (e.g. `PseudonymErasureLedger`'s `type LedgerByPartition = BTreeMap<…>`). `FsBlobStore` is NOT
-/// exempt — it is `Mutex<HashMap<String, Vec<u8>>>` with no `fs::write`, an in-memory store whose
-/// byte backing belongs to the Git/backup track (P-ST-30), recorded in the baseline.
+/// **Detection completeness (false-negatives closed in the MR-004 verifier review + the MR-007
+/// enum-indirection review).** The collection fingerprint matches maps AND sequences
+/// (`Vec<`/`VecDeque<`), and `type` aliases that expand to a collection are resolved
+/// ([`collection_alias_names`]) so an `Arc<Mutex<Alias>>` field is seen (e.g.
+/// `PseudonymErasureLedger`'s `type LedgerByPartition = BTreeMap<…>`). It ALSO follows a durable
+/// store's `backend` ENUM into its variants ([`parse_enum_defs`] + `in_memory_backend_enums`): a
+/// role struct whose field references an enum with a `Memory(Arc<Mutex<Inner>>)`/`Memory(Mutex<Map>)`
+/// variant fires, closing the enum-indirection blind spot (the MR-007 relocation — moving the
+/// `HashMap` out of a struct field into a `Memory(..)` variant would otherwise make the struct-only
+/// scan permanently silent). A pool-only enum (all variants pool-backed, no collection) is admitted.
+/// `FsBlobStore` is NOT exempt — it is `Mutex<HashMap<String, Vec<u8>>>` with no `fs::write`, an
+/// in-memory store whose byte backing belongs to the Git/backup track (P-ST-30), in the baseline.
 ///
 /// **KNOWN COVERAGE BOUNDARY — the role-suffix blind spot (LOUD, named; NOT a bug).** This scanner
 /// keys on the durable-role NAME suffix (`Store`/`Registry`/`Outbox`/`Ledger`) plus a small precise
@@ -360,6 +366,73 @@ fn parse_struct_defs(src: &str) -> Vec<StructDef> {
     out
 }
 
+/// A parsed enum: name, the 1-based line of its `enum NAME {` header, the joined VARIANT-PAYLOAD
+/// text (every variant's `(…)`/`{…}` payload + attributes), and whether it is `#[cfg(test)]`-gated.
+/// Used to follow a durable store's `backend` ENUM into its variants — the relocation a struct-only
+/// scan misses (moving the `Arc<Mutex<HashMap>>` from a struct field into a `Memory(..)` variant).
+struct EnumDef {
+    name: String,
+    fields: String,
+    in_test: bool,
+}
+
+/// Parse the brace-delimited `enum NAME { … }` definitions out of `src` (the variant block is the
+/// scanned payload). Mirrors [`parse_struct_defs`]'s hermetic line/brace tracking so the same
+/// collection/alias/`Inner`-delegate detection applies to variant payloads.
+fn parse_enum_defs(src: &str) -> Vec<EnumDef> {
+    let lines = code_lines(src);
+    let test_flags = cfg_test_line_flags(src);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let (lineno, code) = &lines[i];
+        let trimmed = code.trim();
+        let is_enum_header = (trimmed.starts_with("enum ")
+            || trimmed.starts_with("pub enum ")
+            || trimmed.contains(" enum "))
+            && code.contains('{');
+        if !is_enum_header {
+            i += 1;
+            continue;
+        }
+        let after_kw = trimmed.split("enum ").nth(1).unwrap_or("").trim_start();
+        let name: String = after_kw
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let mut depth: i32 = 0;
+        let mut fields = String::new();
+        let mut j = i;
+        let mut started = false;
+        while j < lines.len() {
+            let (_, jcode) = &lines[j];
+            for ch in jcode.chars() {
+                if ch == '{' {
+                    depth += 1;
+                    started = true;
+                } else if ch == '}' {
+                    depth -= 1;
+                }
+            }
+            if j > i {
+                fields.push_str(jcode);
+                fields.push('\n');
+            }
+            if started && depth <= 0 {
+                break;
+            }
+            j += 1;
+        }
+        out.push(EnumDef {
+            name,
+            fields,
+            in_test: test_flags.get(*lineno).copied().unwrap_or(false),
+        });
+        i = j + 1;
+    }
+    out
+}
+
 /// The names of `type` aliases that EXPAND to an in-memory collection — e.g.
 /// `type LedgerByPartition = BTreeMap<…>;`. A field typed `Arc<Mutex<LedgerByPartition>>` is then just
 /// as in-memory as a literal `Arc<Mutex<BTreeMap<…>>>`, but the literal-token scan can't see it
@@ -422,6 +495,25 @@ fn scan_no_in_memory_durable_store(src: &str) -> Vec<Violation> {
         .map(|s| s.name.clone())
         .collect();
 
+    // Pass 1b: the set of in-memory BACKEND ENUM names — an enum (a store's `backend: SomeEnum`
+    // field) is in-memory-capable if ANY of its variant payloads holds an in-memory collection
+    // (literal/alias) OR delegates to an in-memory backing struct (the `Memory(Arc<Mutex<Inner>>)`
+    // relocation). This closes the enum-indirection blind spot: a `HashMap` moved out of a struct
+    // field into a `Memory(..)` variant is just as in-memory, and a future regression that ships the
+    // `Memory` variant as the system-of-record must still fire. A pool-only enum (all variants
+    // pool-backed, no collection) is NOT in-memory-capable → not added → the role struct is admitted.
+    let in_memory_backend_enums: std::collections::BTreeSet<String> = parse_enum_defs(src)
+        .iter()
+        .filter(|e| !e.in_test)
+        .filter(|e| {
+            has_collection(&e.fields)
+                || in_memory_backings
+                    .iter()
+                    .any(|b| field_references_type(&e.fields, b))
+        })
+        .map(|e| e.name.clone())
+        .collect();
+
     let mut out = Vec::new();
     for s in &structs {
         if s.in_test {
@@ -453,7 +545,13 @@ fn scan_no_in_memory_durable_store(src: &str) -> Vec<Violation> {
             .iter()
             .filter(|b| **b != s.name)
             .any(|b| field_references_type(&s.fields, b));
-        if direct_in_memory || delegated {
+        // Enum-backend delegation: a field whose type references an in-memory-capable backend ENUM
+        // (e.g. `backend: TupleBackend` where `TupleBackend` has a `Memory(Arc<Mutex<Inner>>)`
+        // variant). This catches the relocation a struct-only scan misses.
+        let enum_delegated = in_memory_backend_enums
+            .iter()
+            .any(|e| field_references_type(&s.fields, e));
+        if direct_in_memory || delegated || enum_delegated {
             out.push(Violation {
                 lint: NO_IN_MEMORY_DURABLE_STORE,
                 line: s.line,
@@ -696,6 +794,44 @@ mod tests {
         // `MisrouteAudit` (SI-028) — no role suffix, caught precisely via the named-holder list.
         let red = "pub struct MisrouteAudit {\n    records: Arc<Mutex<Vec<MisrouteAuditRecord>>>,\n}";
         assert!(!no_in_memory_durable_store().run(red).is_empty());
+    }
+
+    #[test]
+    fn in_memory_store_follows_backend_enum_memory_variant() {
+        // The MR-007 enum-indirection relocation: the in-memory map moved out of a struct field into
+        // a `Memory(..)` variant of a backend ENUM. The role struct must STILL fire (a struct-only
+        // scan would go permanently silent here). Two shapes: a direct collection in the variant, and
+        // the `Inner`-delegate variant the real TupleStore/PrincipalStore use.
+        let direct = "pub enum Backend {\n    Memory(std::sync::Mutex<std::collections::HashMap<K, V>>),\n    Pg(PgPool),\n}\npub struct TupleStore {\n    backend: Backend,\n}";
+        assert!(
+            !no_in_memory_durable_store().run(direct).is_empty(),
+            "a *Store whose backend enum has a Memory(Mutex<HashMap>) variant must fire"
+        );
+        let delegate = "struct Inner {\n    partitions: HashMap<K, V>,\n}\npub enum TupleBackend {\n    Memory(Arc<Mutex<Inner>>),\n    Pg(PgTupleBacking),\n}\npub struct TupleStore {\n    backend: TupleBackend,\n}";
+        assert!(
+            !no_in_memory_durable_store().run(delegate).is_empty(),
+            "a *Store whose backend enum delegates to an in-memory Inner via a Memory(..) variant must fire"
+        );
+    }
+
+    #[test]
+    fn in_memory_store_admits_pool_only_backend_enum() {
+        // The green counterpart: a backend ENUM whose variants are ALL pool-backed (no in-memory
+        // collection variant) is NOT a system-of-record-in-memory — the role struct is admitted.
+        let green = "pub enum Backend {\n    Primary(PgPool),\n    Replica(Pool<Postgres>),\n}\npub struct TupleStore {\n    backend: Backend,\n}";
+        assert!(
+            no_in_memory_durable_store().run(green).is_empty(),
+            "a *Store whose backend enum has only pool-backed variants must be admitted (no false positive)"
+        );
+    }
+
+    #[test]
+    fn in_memory_store_enum_following_no_false_positive_on_value_enums() {
+        // A legitimate non-backend enum (a value/status enum) referenced by a *Store must NOT fire as
+        // long as it carries no in-memory collection / Inner-delegate variant — the enum-following is
+        // scoped to in-memory-CAPABLE enums, not every enum a store mentions.
+        let ok = "pub enum Status {\n    Active,\n    Suspended,\n}\npub struct PrincipalStore {\n    status: Status,\n    pool: PgPool,\n}";
+        assert!(no_in_memory_durable_store().run(ok).is_empty());
     }
 
     #[test]

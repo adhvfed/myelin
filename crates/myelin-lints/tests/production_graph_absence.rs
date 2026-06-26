@@ -47,8 +47,13 @@
 //! - `myelin-ci-controlplane/src/residency_drill.rs:444`— `StructuralAttestationVerifier` (SI-001/attestation floor, P-527)
 //!
 //! ### `no-in-memory-durable-store` (16) — removed by the spine durable-persistence MRs (P-522/523)
-//! - `myelin-identity-service/src/principal_store.rs:280` — `PrincipalStore` in-mem (SI-018; MR-007/009)
-//! - `myelin-identity-service/src/tuple_store.rs:219`     — `TupleStore` in-mem (SI-019; MR-007/009)
+//! - `myelin-identity-service/src/principal_store.rs:289` — `PrincipalStore` (SI-018). MR-007 ADDED
+//!   the durable `with_pg` PG path (proven live: `integration_mr007_identity_durable`) but the
+//!   `Memory(Arc<Mutex<Inner>>)` variant is still the always-compiled default (the `Pg` variant is
+//!   `#[cfg(feature="integration")]`) and nothing wires it yet — so the in-memory store is STILL the
+//!   production default. The scanner now FOLLOWS the backend enum (MR-007 fix) and still fires.
+//!   Removed when production wires `with_pg` as the non-optional default (MR-009 / route MRs).
+//! - `myelin-identity-service/src/tuple_store.rs:220`     — `TupleStore` (SI-019), same MR-007 status.
 //! - `myelin-identity-service/src/revocation.rs:173`      — `RevocationStore` in-mem (SI-020; MR-008/009)
 //! - `myelin-identity-service/src/pseudonym_store.rs:191` — `PseudonymStore` (S2) in-mem (SI-018 cluster; MR-007/009)
 //! - `myelin-identity-service/src/pseudonym_erase.rs:268` — `PseudonymErasureLedger` in-mem via the
@@ -285,10 +290,24 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-events/src/reerase.rs",
         102,
     ),
+    // MR-007 (SI-018/019) ADDED the durable PG path (`with_pg` over
+    // `myelin_storage::Durable{Principal,Tuple}Backing` + the MR-022 `with_tenant_tx` convention) and
+    // PROVED it durable + tenant-isolated against live PG (`integration_mr007_identity_durable`). But
+    // the in-memory store is NOT yet removed — only SUPPLEMENTED: the `Memory(Arc<Mutex<Inner>>)`
+    // variant still holds the collection, it is the ALWAYS-compiled default (the `Pg` variant is
+    // behind `#[cfg(feature="integration")]`), and NO production code wires either store yet. So the
+    // in-memory store is still the production-graph DEFAULT. The scanner now FOLLOWS the backend enum
+    // (the MR-007 enum-following fix) and STILL fires here — honestly. These two are REMOVED when
+    // production wires the durable `with_pg` path as the non-optional default (MR-009 / route MRs).
     (
         "no-in-memory-durable-store",
         "crates/myelin-identity-service/src/principal_store.rs",
-        280,
+        289,
+    ),
+    (
+        "no-in-memory-durable-store",
+        "crates/myelin-identity-service/src/tuple_store.rs",
+        220,
     ),
     (
         "no-in-memory-durable-store",
@@ -299,11 +318,6 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "no-in-memory-durable-store",
         "crates/myelin-identity-service/src/revocation.rs",
         173,
-    ),
-    (
-        "no-in-memory-durable-store",
-        "crates/myelin-identity-service/src/tuple_store.rs",
-        219,
     ),
     (
         "no-in-memory-durable-store",
@@ -452,7 +466,12 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
         .filter(|(s, ..)| *s == "no-bare-tenant-pool")
         .count();
     assert_eq!(structural, 5, "5 structural-crypto sites");
-    assert_eq!(in_memory, 16, "16 in-memory durable-store sites");
+    assert_eq!(
+        in_memory, 16,
+        "16 in-memory durable-store sites (principal_store + tuple_store re-pinned: MR-007 added \
+         the durable path but the Memory variant is still the always-compiled production default; \
+         the scanner now follows the backend enum and STILL fires — removed at MR-009 wiring)"
+    );
     assert_eq!(bare_pool, 2, "2 bare-tenant-pool sites");
     // The census-named anchor sites are present (the prompt's hard requirements).
     let has = |s: &str, p: &str, l: usize| BASELINE.contains(&(s, p, l));

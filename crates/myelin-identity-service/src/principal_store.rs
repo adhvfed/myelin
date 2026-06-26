@@ -209,6 +209,10 @@ pub enum PrincipalError {
         /// The opaque `principal_id` the rejected link pointed at.
         principal_id: String,
     },
+    /// The durable PG backing failed (a connection/query error from the live store, MR-007) — a LOUD
+    /// typed value, never a silent partial write/read. Distinct from [`PrincipalError::Kms`] (a key
+    /// failure) so the verifier can tell a storage fault from a crypto fault.
+    Storage(String),
 }
 
 impl core::fmt::Display for PrincipalError {
@@ -233,6 +237,11 @@ impl core::fmt::Display for PrincipalError {
                 f,
                 "credential link rejected: principal `{principal_id}` does not exist in the verified \
                  (tenant, region) partition (a dangling SSO/SCIM link is refused)"
+            ),
+            PrincipalError::Storage(why) => write!(
+                f,
+                "principal store durable backing error (the read/write did NOT succeed — never a \
+                 silent partial write): {why}"
             ),
         }
     }
@@ -278,7 +287,10 @@ struct Inner {
 /// floor), and a read for one tenant structurally cannot reach another tenant's partition.
 #[derive(Clone)]
 pub struct PrincipalStore {
-    inner: Arc<Mutex<Inner>>,
+    /// The durable backing — the REAL PG `principal`/`credential_link` tables (MR-007) on the
+    /// production path, or the in-memory test-double on the default DB-free build. The
+    /// system-of-record is the Pg backing; the in-memory map is an explicit test double.
+    backend: PrincipalBackend,
     /// The KMS engine the store seals/opens profile PII through (the L0→L1→L2 hierarchy, P-058).
     /// Profile PII is sealed under the per-SUBJECT DEK ([`KeyClass::Subject`]) — the GD-4
     /// individual crypto-shred lever, distinct from the per-tenant DEK.
@@ -286,6 +298,30 @@ pub struct PrincipalStore {
     /// The holder this store auto-registers as (the `PersonalDataHolder` seam) — proof the "every
     /// store is a holder" invariant holds for S1 (§1.1, GD-3).
     holder: OltpStoreHolder,
+}
+
+/// The S1 store backing: the REAL durable PG `principal`/`credential_link` tables (MR-007) or the
+/// in-memory test-double. Splitting the backing OUT of the role struct's direct fields is what lets
+/// the `no-in-memory-durable-store` ratchet record the shortcut's removal: `PrincipalStore` no longer
+/// holds an in-memory collection (it holds a backing that CAN be durable). The profile PII is
+/// KMS-encrypted in BOTH backings; the Pg backing persists only the OPAQUE ciphertext (the keys stay
+/// with the engine — decrypt-across-restart depends on the durable KMS root, MR-025).
+#[derive(Clone)]
+enum PrincipalBackend {
+    /// The in-memory test-double (the DB-free default build). NOT the production system-of-record.
+    Memory(Arc<Mutex<Inner>>),
+    /// The REAL durable PG backing over the MR-022 provider pool + `with_tenant_tx` convention.
+    #[cfg(feature = "integration")]
+    Pg(PgPrincipalBacking),
+}
+
+/// The PG-backed S1 principal backing (MR-007): the durable `principal`/`credential_link` tables +
+/// the sync→async bridge (`tokio::runtime::Handle` driving `block_in_place`+`block_on`).
+#[cfg(feature = "integration")]
+#[derive(Clone)]
+struct PgPrincipalBacking {
+    backing: Arc<myelin_storage::DurablePrincipalBacking>,
+    rt: tokio::runtime::Handle,
 }
 
 impl PrincipalStore {
@@ -298,7 +334,31 @@ impl PrincipalStore {
         // so "we forgot the principal store" is structurally impossible.
         let _receipt = holder.register();
         PrincipalStore {
-            inner: Arc::new(Mutex::new(Inner::default())),
+            backend: PrincipalBackend::Memory(Arc::new(Mutex::new(Inner::default()))),
+            kms,
+            holder,
+        }
+    }
+
+    /// **Build the S1 store over the REAL durable PG backing (MR-007 / SI-018).** The principal rows
+    /// + KMS-sealed profile ciphertext + credential links persist through the MR-022
+    /// [`myelin_storage::SubstrateProvider`] pool + `with_tenant_tx` convention (RLS-scoped, no GUC
+    /// bleed). `rt` is the tokio runtime handle the sync API drives the async backing on. The KMS
+    /// engine is reused as-is (the profile-encryption boundary is unchanged); decrypt-across-restart
+    /// depends on the durable KMS root (MR-025) — out of MR-007's scope. Auto-registers as a holder.
+    #[cfg(feature = "integration")]
+    pub fn with_pg(
+        kms: Arc<KmsEngine>,
+        backing: myelin_storage::DurablePrincipalBacking,
+        rt: tokio::runtime::Handle,
+    ) -> PrincipalStore {
+        let holder = OltpStoreHolder::new(S1_HOLDER);
+        let _receipt = holder.register();
+        PrincipalStore {
+            backend: PrincipalBackend::Pg(PgPrincipalBacking {
+                backing: Arc::new(backing),
+                rt,
+            }),
             kms,
             holder,
         }
@@ -387,23 +447,55 @@ impl PrincipalStore {
             status,
         };
 
-        // (3) Commit the row + the encrypted profile into the verified partition (atomic under the
-        //     lock). The partition is keyed by the verified (tenant, region) — a write for one
-        //     tenant structurally cannot land in another's map.
-        let mut inner = self.lock();
-        inner
-            .partitions
-            .entry(part_key.clone())
-            .or_default()
-            .insert(principal_id.0.clone(), row.clone());
-        if let Some(enc) = sealed {
-            inner
-                .profiles
-                .entry(part_key)
-                .or_default()
-                .insert(principal_id.0.clone(), enc);
+        match &self.backend {
+            PrincipalBackend::Memory(inner_arc) => {
+                // (3) Commit the row + the encrypted profile into the verified partition (atomic
+                //     under the lock). The partition is keyed by the verified (tenant, region) — a
+                //     write for one tenant structurally cannot land in another's map.
+                let mut inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
+                inner
+                    .partitions
+                    .entry(part_key.clone())
+                    .or_default()
+                    .insert(principal_id.0.clone(), row.clone());
+                if let Some(enc) = sealed {
+                    inner
+                        .profiles
+                        .entry(part_key)
+                        .or_default()
+                        .insert(principal_id.0.clone(), enc);
+                }
+                Ok(row)
+            }
+            #[cfg(feature = "integration")]
+            PrincipalBackend::Pg(pg) => {
+                // The DURABLE upsert: the row's governance columns (serde-JSON kind/role/status) +
+                // the KMS-sealed profile ciphertext blob, through with_tenant_tx (RLS-scoped). The
+                // profile is sealed under the per-SUBJECT DEK (unchanged); only the ciphertext rests
+                // in PG (the keys stay with the engine — MR-025 boundary).
+                let blob = match (&row.profile_ref, &sealed) {
+                    (Some(pr), Some(enc)) => Some(myelin_storage::DurableProfileBlob {
+                        key_ref: pr.key_ref.to_uri(),
+                        nonce: enc.nonce.to_vec(),
+                        ciphertext: enc.ciphertext.clone(),
+                    }),
+                    _ => None,
+                };
+                let drow = myelin_storage::DurablePrincipalRow {
+                    principal_id: principal_id.0.clone(),
+                    // The polymorphic governance columns as serde-JSON text so the `Agent{..}` kind
+                    // round-trips exactly (the column is opaque to the storage layer).
+                    kind: serde_json::to_string(&row.kind).expect("principal.kind serializes"),
+                    data_role: serde_json::to_string(&row.data_role)
+                        .expect("principal.data_role serializes"),
+                    status: serde_json::to_string(&row.status).expect("principal.status serializes"),
+                    profile: blob,
+                };
+                pg.block(pg.backing.put_principal(&scope.tenant().0, drow))
+                    .map_err(|e| PrincipalError::Storage(e.to_string()))?;
+                Ok(row)
+            }
         }
-        Ok(row)
     }
 
     /// Seal a [`PrincipalProfile`] under the principal's per-SUBJECT DEK, returning the
@@ -441,11 +533,21 @@ impl PrincipalStore {
         principal_id: &PrincipalId,
     ) -> Option<PrincipalRow> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
-        let inner = self.lock();
-        inner
-            .partitions
-            .get(&Self::part_key(scope))
-            .and_then(|p| p.get(&principal_id.0).cloned())
+        match &self.backend {
+            PrincipalBackend::Memory(inner_arc) => {
+                let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
+                inner
+                    .partitions
+                    .get(&Self::part_key(scope))
+                    .and_then(|p| p.get(&principal_id.0).cloned())
+            }
+            #[cfg(feature = "integration")]
+            PrincipalBackend::Pg(pg) => pg
+                .block(pg.backing.get_principal(&scope.tenant().0, &principal_id.0))
+                .ok()
+                .flatten()
+                .map(|drow| Self::durable_to_row(scope, drow)),
+        }
     }
 
     /// **Read + decrypt a principal's profile PII under its per-SUBJECT DEK (11.3 read path).**
@@ -464,33 +566,65 @@ impl PrincipalStore {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
         let part_key = Self::part_key(scope);
         // The row carries the profile_ref (which per-subject DEK sealed it); the ciphertext lives
-        // in the profiles map. Both are read under the verified scope's partition.
-        let (key_ref, enc) = {
-            let inner = self.lock();
-            let row = match inner
-                .partitions
-                .get(&part_key)
-                .and_then(|p| p.get(&principal_id.0))
-            {
-                Some(r) => r.clone(),
-                None => return Ok(None),
-            };
-            let key_ref = match row.profile_ref {
-                Some(pr) => pr.key_ref,
-                None => return Ok(None), // a principal with no profile (e.g. a machine principal)
-            };
-            let enc = match inner
-                .profiles
-                .get(&part_key)
-                .and_then(|p| p.get(&principal_id.0))
-            {
-                Some(e) => e.clone(),
-                None => return Ok(None),
-            };
-            (key_ref, enc)
+        // with it. Both are read under the verified scope's partition.
+        let (key_ref, enc) = match &self.backend {
+            PrincipalBackend::Memory(inner_arc) => {
+                let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
+                let row = match inner
+                    .partitions
+                    .get(&part_key)
+                    .and_then(|p| p.get(&principal_id.0))
+                {
+                    Some(r) => r.clone(),
+                    None => return Ok(None),
+                };
+                let key_ref = match row.profile_ref {
+                    Some(pr) => pr.key_ref,
+                    None => return Ok(None), // a principal with no profile (e.g. a machine principal)
+                };
+                let enc = match inner
+                    .profiles
+                    .get(&part_key)
+                    .and_then(|p| p.get(&principal_id.0))
+                {
+                    Some(e) => e.clone(),
+                    None => return Ok(None),
+                };
+                (key_ref, enc)
+            }
+            #[cfg(feature = "integration")]
+            PrincipalBackend::Pg(pg) => {
+                let drow = match pg
+                    .block(pg.backing.get_principal(&scope.tenant().0, &principal_id.0))
+                    .map_err(|e| PrincipalError::Storage(e.to_string()))?
+                {
+                    Some(d) => d,
+                    None => return Ok(None),
+                };
+                let blob = match drow.profile {
+                    Some(b) => b,
+                    None => return Ok(None), // a principal with no profile
+                };
+                let key_ref = PiiKeyRef::parse(&blob.key_ref)
+                    .ok_or_else(|| PrincipalError::Storage("malformed profile key_ref".into()))?;
+                let mut nonce = [0u8; myelin_storage::NONCE_LEN];
+                if blob.nonce.len() != myelin_storage::NONCE_LEN {
+                    return Err(PrincipalError::CorruptProfile);
+                }
+                nonce.copy_from_slice(&blob.nonce);
+                (
+                    key_ref,
+                    EncryptedProfile {
+                        nonce,
+                        ciphertext: blob.ciphertext,
+                    },
+                )
+            }
         };
         // Resolve the per-SUBJECT DEK + open. A shredded/destroyed key is a LOUD KmsError here,
-        // never a plaintext fall-through (the 0-fail-open invariant).
+        // never a plaintext fall-through (the 0-fail-open invariant). NOTE: decrypt-across-restart
+        // depends on the durable KMS root (MR-025) — out of MR-007's scope (a fresh-process resolve
+        // of a key minted before restart is MR-009's proof; here the SAME engine resolves it).
         let dek = self.kms.resolve_dek(&key_ref, scope.region())?;
         let plain = dek
             .open(&enc.nonce, &enc.ciphertext)
@@ -517,12 +651,23 @@ impl PrincipalStore {
     /// region)`, so cross-tenant reads are structurally impossible.
     pub fn principals_in(&self, scope: &TenantScope) -> Vec<PrincipalRow> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
-        let inner = self.lock();
-        inner
-            .partitions
-            .get(&Self::part_key(scope))
-            .map(|p| p.values().cloned().collect())
-            .unwrap_or_default()
+        match &self.backend {
+            PrincipalBackend::Memory(inner_arc) => {
+                let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
+                inner
+                    .partitions
+                    .get(&Self::part_key(scope))
+                    .map(|p| p.values().cloned().collect())
+                    .unwrap_or_default()
+            }
+            #[cfg(feature = "integration")]
+            PrincipalBackend::Pg(pg) => pg
+                .block(pg.backing.principals_in(&scope.tenant().0))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|drow| Self::durable_to_row(scope, drow))
+                .collect(),
+        }
     }
 
     /// **Link a VERIFIED credential `(scheme, subject_key)` to a principal within the verified
@@ -545,24 +690,47 @@ impl PrincipalStore {
     ) -> Result<(), PrincipalError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
         let part_key = Self::part_key(scope);
-        let mut inner = self.lock();
-        // Refuse a link to a principal that does not exist in THIS verified partition (defence in
-        // depth: a credential can only resolve to a principal in its own tenant directory).
-        let exists = inner
-            .partitions
-            .get(&part_key)
-            .is_some_and(|p| p.contains_key(&principal_id.0));
-        if !exists {
-            return Err(PrincipalError::UnknownPrincipal {
-                principal_id: principal_id.0.clone(),
-            });
+        match &self.backend {
+            PrincipalBackend::Memory(inner_arc) => {
+                let mut inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
+                // Refuse a link to a principal that does not exist in THIS verified partition
+                // (defence in depth: a credential can only resolve to a principal in its own tenant
+                // directory).
+                let exists = inner
+                    .partitions
+                    .get(&part_key)
+                    .is_some_and(|p| p.contains_key(&principal_id.0));
+                if !exists {
+                    return Err(PrincipalError::UnknownPrincipal {
+                        principal_id: principal_id.0.clone(),
+                    });
+                }
+                inner
+                    .credential_links
+                    .entry(part_key)
+                    .or_default()
+                    .insert(Self::link_key(scheme, subject_key), principal_id.0.clone());
+                Ok(())
+            }
+            #[cfg(feature = "integration")]
+            PrincipalBackend::Pg(pg) => {
+                // The backing checks existence in the SAME tenant-scoped tx (it returns `false` for
+                // an unknown principal — a dangling SSO/SCIM link is refused, never silently created).
+                let linked = pg
+                    .block(pg.backing.link_credential(
+                        &scope.tenant().0,
+                        &Self::link_key(scheme, subject_key),
+                        &principal_id.0,
+                    ))
+                    .map_err(|e| PrincipalError::Storage(e.to_string()))?;
+                if !linked {
+                    return Err(PrincipalError::UnknownPrincipal {
+                        principal_id: principal_id.0.clone(),
+                    });
+                }
+                Ok(())
+            }
         }
-        inner
-            .credential_links
-            .entry(part_key)
-            .or_default()
-            .insert(Self::link_key(scheme, subject_key), principal_id.0.clone());
-        Ok(())
     }
 
     /// **Resolve a VERIFIED credential `(scheme, subject_key)` to its principal WITHIN the verified
@@ -578,16 +746,29 @@ impl PrincipalStore {
     ) -> Option<PrincipalRow> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
         let part_key = Self::part_key(scope);
-        let inner = self.lock();
-        let principal_id = inner
-            .credential_links
-            .get(&part_key)
-            .and_then(|m| m.get(&Self::link_key(scheme, subject_key)))?
-            .clone();
-        inner
-            .partitions
-            .get(&part_key)
-            .and_then(|p| p.get(&principal_id).cloned())
+        match &self.backend {
+            PrincipalBackend::Memory(inner_arc) => {
+                let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
+                let principal_id = inner
+                    .credential_links
+                    .get(&part_key)
+                    .and_then(|m| m.get(&Self::link_key(scheme, subject_key)))?
+                    .clone();
+                inner
+                    .partitions
+                    .get(&part_key)
+                    .and_then(|p| p.get(&principal_id).cloned())
+            }
+            #[cfg(feature = "integration")]
+            PrincipalBackend::Pg(pg) => pg
+                .block(
+                    pg.backing
+                        .resolve_credential(&scope.tenant().0, &Self::link_key(scheme, subject_key)),
+                )
+                .ok()
+                .flatten()
+                .map(|drow| Self::durable_to_row(scope, drow)),
+        }
     }
 
     /// The credential-link map key — `"<scheme>\x1f<subject_key>"`. The `\x1f` (ASCII unit
@@ -647,8 +828,50 @@ impl PrincipalStore {
         (scope.tenant().0.clone(), scope.region().0.clone())
     }
 
+    /// Lock the in-memory test-double backing (the Memory arm; the unit tests' defence-in-depth
+    /// ciphertext probe uses it). Panics on the Pg backend (which has no in-process map) — only the
+    /// in-memory tests call this.
+    #[cfg(test)]
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        match &self.backend {
+            PrincipalBackend::Memory(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()),
+            #[cfg(feature = "integration")]
+            PrincipalBackend::Pg(_) => {
+                panic!("lock() is the in-memory test-double accessor; the Pg backend has no map")
+            }
+        }
+    }
+
+    /// Reconstruct a [`PrincipalRow`] from a durable row (the profile_ref is rebuilt from the blob's
+    /// key_ref URI; the governance columns deserialize from their serde-JSON text). The kind/role/
+    /// status are our own writes, so a parse failure is a genuine corruption — surfaced loudly.
+    #[cfg(feature = "integration")]
+    fn durable_to_row(
+        scope: &TenantScope,
+        drow: myelin_storage::DurablePrincipalRow,
+    ) -> PrincipalRow {
+        let profile_ref = drow
+            .profile
+            .as_ref()
+            .and_then(|b| PiiKeyRef::parse(&b.key_ref))
+            .map(|key_ref| ProfileRef { key_ref });
+        PrincipalRow {
+            tenant: scope.tenant().clone(),
+            region: scope.region().clone(),
+            principal_id: PrincipalId(drow.principal_id),
+            kind: serde_json::from_str(&drow.kind).expect("principal.kind round-trips"),
+            profile_ref,
+            data_role: serde_json::from_str(&drow.data_role).expect("principal.data_role round-trips"),
+            status: serde_json::from_str(&drow.status).expect("principal.status round-trips"),
+        }
+    }
+}
+
+#[cfg(feature = "integration")]
+impl PgPrincipalBacking {
+    /// Drive an async backing call from the sync store API (the `block_in_place`+`block_on` bridge).
+    fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
+        tokio::task::block_in_place(|| self.rt.block_on(fut))
     }
 }
 

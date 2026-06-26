@@ -46,7 +46,8 @@ reason; always use `cargo test` for the gate.
 | MR-004 | Production-graph absence scanners | 3 scanners + 23-entry 2-way ratchet, 153 tests | INDEP verifier: ACCEPT-w/-followups → 4 false-negs found & closed; orch re-checked sites + gate | GREEN (cargo test -p myelin-lints; check workspace) | 0e5a289 |
 | MR-005 | Attested scorecards + red-by-default gate | blake3-attested manifest + make-it-real gate (exit 1, red-by-default), 8 tamper tests | INDEP verifier: ACCEPT-w/-followups → gate NOT gameable (no trust-manifest path; live re-run mandatory); found PRE-EXISTING vacuous-green rows | GREEN (cargo test -p myelin-harness; gate exits 1; check workspace) | 1bd35a8 |
 | MR-006 | Shape/design review | 4 seams SHAPE-OK, 2 RESHAPE (001 sandbox/off-spine, 002 tenant-tx-conn/on-spine→MR-022) | orch verified seam injectors + SandboxHandle + AgentRuntime against source | n/a (read-only) | (committed w/ log) |
-| MR-022 | Persistence foundation (migrations + provider + tenant-tx convention, RESHAPE-002) | apply_validated + SubstrateProvider + with_tenant_tx, 3 live-PG integration tests | INDEP verifier (live PG, app role): ACCEPT — real force-RLS proven, reset-on-release load-bearing, no overclaim, pg.rs untouched | GREEN (3 integ + 842 default + ratchet + workspace) | (this) |
+| MR-022 | Persistence foundation (migrations + provider + tenant-tx convention, RESHAPE-002) | apply_validated + SubstrateProvider + with_tenant_tx, 3 live-PG integration tests | INDEP verifier (live PG, app role): ACCEPT — real force-RLS proven, reset-on-release load-bearing, no overclaim, pg.rs untouched | GREEN (3 integ + 842 default + ratchet + workspace) | 87a9c8e (+fix 2fa0260) |
+| MR-007 | Durable principal + tuple stores (PG backing via MR-022 convention) | identity_durable.rs + pg conn-twins + new principal/credential_link RLS tables, 3 live-PG tests | INDEP verifier (live PG): ACCEPT-w/-followups → confirmed real force-RLS + durability + outbox co-commit; CAUGHT enum-indirection blinding the MR-004 ratchet → builder extended scanner to follow enums, baseline restored to honest 23 | GREEN (full lints + 3 integ + default + workspace) | (this) |
 
 ## Test environment (verified live 2026-06-26 — every persistence/auth prompt uses this)
 
@@ -60,6 +61,18 @@ green: pg connect, s3 put/get, rebac tuples, outbox→bus relay, valkey cache):
   `DATABASE_URL=… REDIS_URL=… cargo test -p <crate> --features integration --test <file>`.
 - Real PG-backed impls already exist behind the `integration` feature; the in-memory versions are the
   DEFAULT/production path today (the census's core finding). "Make it real" = make the real path the default.
+
+## Carried-forward obligations for later prompts
+
+- **MR-009 (or the identity route-body MRs) must:** (a) wire the durable `with_pg` PrincipalStore/TupleStore
+  into the production boot spec (`identity_app_spec`) as the non-optional default; (b) un-gate the storage
+  real-pool layer so the durable code compiles in the default/production build (the `integration` feature
+  should gate the live-backend TESTS, not the production durable CODE — this is SI-022, a storage feature-graph
+  decision, deliberately deferred from MR-007); (c) do the kill-9/restart proof + the profile-decrypt-across-
+  restart proof (needs MR-025 KMS durable root). When (a)+(b) land, the two principal/tuple baseline entries
+  flip from present→removed (the ratchet proving the in-memory default is finally gone, not just supplemented).
+- **MR-004 ratchet now follows enum variants** (closed the MR-007 enum-indirection blind spot): a durable
+  `*Store` whose backend is an in-memory-capable enum fires. Baseline honest at 23 (16 no-in-memory).
 
 ## Shape-review outcomes (MR-006) — binding on later prompts
 

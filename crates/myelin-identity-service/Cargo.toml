@@ -83,6 +83,18 @@ myelin-notif = { path = "../myelin-notif" }
 # The `myelin_refs::ArtifactRef` the Notif router `classify`s a curated KN Signal under (the subject
 # the inbox item is about). A pure value carrier; no production DAG edge depends back on this service.
 myelin-refs = { path = "../myelin-refs" }
+# ------------------------------------------------------------------------------------------
+# MR-007 (SI-018/019): the durable PG backings for the S1 principal + S3 tuple stores live in
+# myelin-storage behind its `integration` feature (the real sqlx client). The identity-layer
+# stores delegate to them through the MR-022 SubstrateProvider + with_tenant_tx convention. The
+# sync store API drives the async backing via a `tokio::runtime::Handle` (block_in_place +
+# block_on — the same bridge ValkeyCache/S3BlobStore use). OPTIONAL: the DEFAULT build compiles
+# none of this (stays DB-free, in-memory test-double backing); `--features integration` pulls it.
+tokio = { workspace = true, optional = true }
+myelin-config = { workspace = true, optional = true }
+# The MR-007 integration test reaches the live pool directly for migration setup + the GUC-bleed
+# probe + RLS-bypassing admin cleanup (the same posture as myelin-storage's integration tests).
+sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
 # P-ID-10 (P-068) ID-D3 drill: the failure-injection harness's telemetry-assertion library
@@ -103,3 +115,9 @@ myelin-client = { path = "../myelin-client" }
 # DEV-only: myelin-agent is a frozen contract carrier; nothing in the identity-service production DAG
 # depends on it (the live EffectApi body is AG-P6 → P-218; this drill proves Id's half is consumed).
 myelin-agent = { path = "../myelin-agent" }
+
+[features]
+default = []
+# Compile the durable PG store bindings + the live-PG integration tests (run against the
+# docker-compose dev stack). Turns on myelin-storage's integration feature (the backings + provider).
+integration = ["dep:tokio", "dep:myelin-config", "dep:sqlx", "myelin-storage/integration"]
