@@ -48,30 +48,34 @@ binding visual + UX authority and is **almost entirely preserved.** The key fact
 
 **RE-TARGET (an unbuilt decision, no code discarded):**
 - **React → SolidJS.**
-- **React-Aria → a Solid headless a11y-primitive library (the hard dependency).** Each spec's named "React Aria
-  Components primitive" maps to its Solid equivalent. Recommended: **Kobalte** (`@kobalte/core`, WAI-ARIA-APG
-  compliant — the Solid analog of Radix/React-Aria). Strong framework-agnostic alternative to evaluate: **Ark UI
-  / Zag.js** (state-machine primitives shared across frameworks — the a11y logic lives in framework-agnostic
-  machines). Fallback: **corvu**, or hand-built on WAI-ARIA APG for any missing primitive. **The a11y bar is
-  PROVEN/binding; primitive coverage is the load-bearing validation of §9.**
+- **React-Aria → hand-built Solid primitives** (`10-frontend-component-patterns.md` §1). Each spec's named "React
+  Aria Components primitive" becomes a hand-built Solid component meeting the *same* WAI-ARIA-APG behaviour
+  (focus-trap / portal / scroll-lock / roving / ARIA), gated by **axe + keyboard tests**. A headless library
+  (Kobalte) is a **per-component fallback** if a specific primitive proves hard. **The a11y bar is PROVEN/binding —
+  we meet it ourselves and gate it, rather than import it.**
 
 ---
 
 ## 3. The stack, layer by layer
 
+> The *behavioural* approach for each hard component is `10-frontend-component-patterns.md` (the hard parts,
+> solved). This section is the stack; that doc is the how. Both revise the earlier Kobalte/ProseMirror/TanStack
+> assumption toward **minimal dependencies + hand-built primitives**, which is the proven, lower-churn path.
+
 | Layer | Choice | Notes |
 |---|---|---|
 | UI framework | **SolidJS** | fine-grained reactivity, no VDOM |
 | Web meta-framework | **SolidStart** | file routing + server functions; SSR optional (auth/first-paint) |
-| Headless a11y primitives | **Kobalte** (eval Ark/Zag) | the React-Aria replacement; hard dependency |
+| Overlay/a11y primitives | **hand-built in vanilla Solid** (doc 10 §1) | proven viable with full focus-trap/portal/scroll-lock/ARIA; minimal deps; **axe + keyboard tests are the gate**. Kobalte only as a per-component fallback |
 | Tokens | **reuse** DTCG → Style Dictionary → `tokens.css` + generated TS types | the only tier components touch; parameterization preserved |
 | Icons | **reuse** the strok sprite + a Solid `<Icon>` wrapper | self-hosted, no CDN |
-| Server-state / data | **TanStack `@tanstack/solid-query`** | the founder's preferred data layer, Solid adapter |
+| Data | **SolidStart loaders/actions + `createResource`** + a **server-side cookie-auth gateway client** (doc 10 §5) | tokens stay server-side (the SSR auth win); no third-party query lib needed |
 | Client-state | **Solid signals + stores** | no Redux/Zustand needed |
 | Routing | **`@solidjs/router`** / SolidStart routing | |
-| Forms | **Kobalte form primitives** + a Solid form lib (`@tanstack/solid-form` or `modular-forms`) | |
+| Forms | **Solid-native** (signals + the hand-built controls) | per the design manual's forms-and-controls spec; minimal deps |
 | Styling | **CSS driven by `tokens.css` vars** | direction-A is hairlines/near-zero-radius/compact; token-only, framework-agnostic |
-| Editor | **ProseMirror core (framework-agnostic) + Solid view; `myelin-content` WASM for parse/serialize; Yjs/Yrs for CRDT** | the hardest piece — §9 |
+| Editor | **per-block `contenteditable`** (doc 10 §3) + `myelin-content` WASM parse/serialize | the per-block model is the key that makes it tractable; **ProseMirror-*per-block*** is the named fallback for the hard edges (§9) |
+| Real-time | **SSE (`EventSource`), server-proxied** (doc 10 §6) | simpler + proxy-friendly vs. a client WebSocket |
 | Desktop + mobile | **Tauri 2** | one web frontend wrapped; Rust core shares Myelin crates; validate mobile early |
 | Auth | **SolidStart server session (httpOnly cookie) for web; Tauri secure storage (Stronghold/keychain) for native** | tokens from the hardened identity service (E0.5) |
 
@@ -95,12 +99,13 @@ with docs + lints. Three deliverables:
 1. **"Solid patterns for agents" guide** (a frontend analog of the design manual + the doctrine docs the agents
    already read): the reactivity rules (never destructure `props`; read `props.x` at use-site; `createMemo`/
    `createEffect`/`createResource` correctly; `<Show>`/`<For>`/`<Switch>` not ternaries/`.map`; stores for
-   nested state), Kobalte usage patterns, the **spec → Solid-component mapping convention**, token/icon usage, and
-   the testing pattern. Every UI prompt reads it first.
+   nested state), the **hand-built-primitive + per-component patterns** (`10-frontend-component-patterns.md`), the
+   **spec → Solid-component mapping convention**, token/icon usage, and the testing pattern. Every UI prompt reads
+   it + doc 10 first.
 2. **A frontend lint gate** (the clippy-equivalent): ESLint + **`eslint-plugin-solid`** (catches the
    prop-destructuring / reactivity foot-guns) + `eslint-plugin-jsx-a11y` + project conventions; plus **axe-core**
    in the e2e. Red-on-violation, in CI.
-3. **The fixed spec→component convention:** each `02-components/*.md` spec → one Solid component on Kobalte, ALL
+3. **The fixed spec→component convention:** each `02-components/*.md` spec → one hand-built Solid component (doc 10), ALL
    states implemented, tokens-only, with its real-browser test. No subsystem ships its own primitive.
 
 ---
@@ -112,7 +117,7 @@ with docs + lints. Three deliverables:
 - **Tier 1 — overlay primitives FIRST** (the most expensive UX retrofit; built before any feature consumes them):
   **Dialog, ConfirmDialog (`alertdialog`, safe-action default focus — irreversible/GDPR/HITL), Popover,
   Dropdown/Menu, Tooltip, Toast.** Focus-trap + return-focus + scroll-lock + Escape/backdrop + portal-to-root +
-  one z-index token scale (`chrome < popover < modal < toast`) + correct ARIA, **once**, on Kobalte.
+  one z-index token scale (`chrome < popover < modal < toast`) + correct ARIA, **once**, hand-built (doc 10 §1).
 - **Tier 2 — shared components** (each consumes the overlays): **nav shell · command palette (⌘K combobox modal) ·
   reference chip + unfurl (the connective tissue — specify early; renders identically in board cell / editor
   mention / inbox subject / dialog; permission-aware, no title leak, tombstone) · agent/HITL card (plan-then-apply,
@@ -149,14 +154,14 @@ with docs + lints. Three deliverables:
 
 ## 9. Risks & validations (honest — validate these FIRST)
 
-- **Kobalte primitive coverage** vs. the specs (command-palette combobox, overlays, menus, forms). *Validate in
-  Tier 1/2 before depending on it.* Fallback: Ark/Zag (framework-agnostic), corvu, or hand-built on APG.
-- **The block editor is the single hardest component, and the one place React's ecosystem (TipTap/Lexical/Slate)
-  is genuinely richer.** Mitigation: **ProseMirror core is framework-agnostic** — wrap it in a Solid view; reuse
-  the **`myelin-content` WASM** for parse/serialize (the round-trip gate already exists) and **Yjs/Yrs** for CRDT
-  (already in the Knowledge backend). This is where to validate the Solid choice hardest. **Named fallback:** if
-  the Solid editor view proves intractable, isolate *only the editor* as a React micro-island (Tauri/web can host
-  one component in a different runtime) — a contained fallback, not a stack reversal.
+- **Hand-built primitive correctness** (focus-trap/portal/scroll-lock/roving/ARIA across the 6 overlays). The
+  approach is proven (doc 10 §1), but a11y is binding: gate every primitive with axe + keyboard tests in Tier 1.
+  If a specific primitive resists, Kobalte is the per-component fallback.
+- **The block editor is the single hardest component.** Mitigation: the **per-block `contenteditable`** model
+  (doc 10 §3) contains the minefield per block; `myelin-content` WASM owns parse/serialize (round-trip gate) and
+  Yrs owns CRDT (already in Knowledge). The named hard edges — **IME, rich/HTML paste, multi-block selection,
+  cross-block undo** — are explicit hardening tasks with real-input tests. **Named fallback:** wrap a ProseMirror
+  instance *per block* (still per-block, not a document rewrite) if those edges resist.
 - **Tauri-mobile maturity** — newer; validate early; Capacitor fallback.
 - **SolidStart SSR/auth maturity** — validate the session flow early.
 - **Agent fluency** — expect a short ramp; the §5 guide + lint are the mitigation; budget a first "teach the
