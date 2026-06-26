@@ -454,7 +454,14 @@ platform's first production release fail-closed.** It runs AFTER M6 and BEFORE a
 admitted. The full per-finding disposition is the audit
 [`../07-prompts/production-readiness-audit.md`](../07-prompts/production-readiness-audit.md); the prompt bodies
 are [`../07-prompts/by-system/production-readiness.md`](../07-prompts/by-system/production-readiness.md)
-(P-522..P-546).
+(P-522..P-546). The M7 vetting overlay is recorded in
+[`../system-reviews/2026-06-26/00-m7-hardening-strategy.md`](../system-reviews/2026-06-26/00-m7-hardening-strategy.md),
+[`../system-reviews/2026-06-26/01-m7-vetting-gate-matrix.md`](../system-reviews/2026-06-26/01-m7-vetting-gate-matrix.md),
+and
+[`../system-reviews/2026-06-26/02-blackbox-security-persistence-drills.md`](../system-reviews/2026-06-26/02-blackbox-security-persistence-drills.md);
+those review docs do not add product scope, but they make the proof obligations concrete: production-graph
+absence scanners, blackbox security/persistence drills, evidence-integrity checks, and external-review records
+are part of the M7 done-bar.
 
 **Work (the floors filled, each with its filling prompt):**
 - **Durable persistence** — bind the live OLTP/cache pool under Identity's in-memory principal/tuple/revocation
@@ -487,6 +494,13 @@ are [`../07-prompts/by-system/production-readiness.md`](../07-prompts/by-system/
   production exec path (not the special harness) → 0 escapes on a real kernel (P-545).
 
 **Entry dependency:** M6 green (the platform is dogfooded and the M0..M6 gate invariant holds end-to-end).
+
+**Vetting overlay:** M7 must be executed under the review matrix in
+`planning/system-reviews/2026-06-26/`: every implementation prompt has a paired verification artifact that
+would fail on the old floor; every security or persistence claim has a blackbox/adversarial drill; every static
+scanner has a red fixture proving it bites; every DB/KVM/runsc/KMS dependency is required, not skipped; every
+scorecard row is generated/attested or treated as non-evidence. These review docs are the tactical test plan
+for the M7 prompts, and P-546 reads their required scorecards as release evidence.
 
 **Exit gate (the production-release done-bar — P-546, FAIL-CLOSED, RED by default):** the single release gate
 goes green if and ONLY IF all hold, computed mechanically from dated green artifacts (never a self-claim):

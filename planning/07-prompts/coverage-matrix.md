@@ -295,6 +295,14 @@ Cross-cutting band (not a single Phase-6 roadmap system). Motivation + per-findi
 [`by-system/production-readiness.md`](by-system/production-readiness.md). Each prompt's "milestone" is the audit
 FINDING it fills (F1..F11), not a Phase-6 roadmap milestone — M7 is a post-M6 hardening band that closes the
 documented structural/durability/crypto/supply-chain/sandbox-exec floors the executed code (P-001..P-434) left open.
+The companion system-review pack
+[`../system-reviews/2026-06-26/00-m7-hardening-strategy.md`](../system-reviews/2026-06-26/00-m7-hardening-strategy.md),
+[`../system-reviews/2026-06-26/01-m7-vetting-gate-matrix.md`](../system-reviews/2026-06-26/01-m7-vetting-gate-matrix.md),
+and
+[`../system-reviews/2026-06-26/02-blackbox-security-persistence-drills.md`](../system-reviews/2026-06-26/02-blackbox-security-persistence-drills.md)
+is the vetting overlay for this band: it translates the prompt list into required static gates, integration
+gates, blackbox drills, evidence-integrity checks, and release scorecards. It is normative for P-540/P-541/P-546
+and advisory-but-expected for every implementation/verification pair.
 
 | Audit finding (the floor M7 fills) | Prompt(s) |
 |---|---|
