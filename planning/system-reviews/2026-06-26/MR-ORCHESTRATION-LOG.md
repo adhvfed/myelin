@@ -53,7 +53,11 @@ reason; always use `cargo test` for the gate.
 | MR-024 | Control-plane placement registry durable persistence (tenant_placement/cell tables + invariant trigger) | placement_durable.rs + registry_durable.rs, 3 live-PG tests; placement invariant as a REAL DB trigger | orch focused INDEP verify (live PG): cross-region placement REJECTED by trg_placement_invariant via direct psql (bypassing Rust); durability proven; lint exclusion legitimate (pg.rs/identity_durable still linted) | d2a5f92 |
 | MR-025 | KMS durable cell-root + KEK/DEK persistence (software-sealed, SealKey from env) | kms_durable.rs + load_or_generate + backup_snapshot_durable, 3 live-PG tests | INDEP verifier (live PG + psql + own tamper probe): ACCEPT-w/-followups → wrong/missing/malformed/TAMPERED seal key fails closed + never mints a new root, root never plaintext at rest, seal key no-leak, crypto-shred survives restore | GREEN (full lints + 3 integ + 422 default + workspace) | (this) |
 
-**Persistence wave COMPLETE** (MR-022 foundation + MR-007/008 identity + MR-023 events + MR-024 control-plane + MR-025 KMS). Next: MR-009 (verify) wires the durable paths into production boot + the kill-9 proof + discharges the carried-forward obligations.
+**Persistence wave COMPLETE** (MR-022 foundation + MR-007/008 identity + MR-023 events + MR-024 control-plane + MR-025 KMS).
+
+| MR-009 | Durable persistence VERIFY — kill-9/restart + 3-instance across all 5 families | real SIGKILL writer bin + 6-test harness (identity+profile-decrypt, revocation/TTL, events 0-lost, control-plane, KMS); deliverable-2 (prod-default flip) SPLIT → MR-009b | INDEP verifier: ACCEPT (clean) — genuine SIGKILL of a separate OS process (signal 9 asserted, writer blocks forever no-flush), reads from live backends proven via wrong-seal-key fail-closed probe, split honestly deferred (baseline unchanged 24) | GREEN (full lints + 6 integ + default + workspace) | (this) |
+
+**Master-plan Tier-0 done-bar MET: load-bearing state survives kill -9 + restart** (proven, not asserted). The production-default flip (un-gate durable layer + Memory→test-only → scanner green) is MR-009b — large blast radius (15 modules, 6 deps, all Memory variants), deferred not faked.
 
 ## Test environment (verified live 2026-06-26 — every persistence/auth prompt uses this)
 

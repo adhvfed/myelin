@@ -11,6 +11,17 @@ publish = false
 name = "identity"
 path = "src/main.rs"
 
+# MR-009 kill-9/restart durability child process (writer + reader). The harness spawns this as a
+# REAL OS process and SIGKILLs it, so the durability proof is a genuine process-death proof (not the
+# census's in-process "crash" = drop+recreate). `required-features = ["integration"]` means the
+# default `cargo build/check --workspace` NEVER compiles it (it stays DB-free); it is built only
+# under `--features integration`, where the integration test (which spawns it via CARGO_BIN_EXE_*)
+# runs against the docker-compose dev stack. See src/bin/mr009_kill9_writer.rs.
+[[bin]]
+name = "mr009_kill9_writer"
+path = "src/bin/mr009_kill9_writer.rs"
+required-features = ["integration"]
+
 [lib]
 path = "src/lib.rs"
 
