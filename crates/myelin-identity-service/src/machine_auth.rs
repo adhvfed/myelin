@@ -45,12 +45,13 @@
 //!   union (so attenuation grew authority) MUST be caught.
 //!
 //! ## Floors named (frozen shape now → bodies in a later prompt / parallel track)
-//! - **The S7 revocation denylist is a STUB here ([`S7Denylist`]); the full S7 store + idempotent
-//!   `revoke` + the SCIM-disable revocation wiring is P-ID-14 (P-072).** This body ships the
-//!   *consult* seam (an `authenticate` checks the denylist and fail-closes a revoked `jti`) + the
-//!   short-TTL expiry check, so the revocation SURFACE the per-job/PAT flow needs is real now; the
-//!   durable, replicated, idempotent denylist BODY is the named follow-on. Recorded here and in the
-//!   commit body.
+//! - **Revocation routes through the DURABLE [`crate::revocation::RevocationStore`] (MR-011 — the
+//!   carried-forward S7Denylist fix is DISCHARGED).** `authenticate` consults the same `(tenant,
+//!   region)`-partitioned, PG-backed (`with_pg`) store every surface shares: a revoked `jti` denies
+//!   AND the denial survives a restart (proven cross-restart under `--features integration`). The old
+//!   tenant-less in-memory `S7Denylist` (a bare `Mutex<BTreeSet>` rebuilt empty on construction — a
+//!   token revoked there re-validated after restart) is REMOVED; the durable store is the source of
+//!   truth. Fail-closed: a revocation-store read error denies.
 //! - **The per-job-token mid-resume RE-MINT is P-ID-17 (`mint_run_token`, P-076).** This body
 //!   resolves a per-job token and stamps its one-tenant `SelfHosted` ceiling; the mid-workflow
 //!   re-mint on resume (token life == activity life) is the named follow-on (`mint_run_token`).
@@ -66,11 +67,32 @@
 
 use crate::authenticate::{scheme as human_scheme, AuthTelemetry, IdorCounters};
 use crate::principal_store::PrincipalStore;
-use myelin_identity::{AuthzError, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
+use crate::revocation::RevocationStore;
+use myelin_events::Timestamp;
+use myelin_identity::{
+    AuthzError, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RevokeTarget,
+};
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+/// The default wall-clock "now" for the revocation consult, as an RFC-3339 instant. Injected via
+/// [`CapabilityAuthenticator::with_clock`] in tests/drills; the production default reads the system
+/// clock (chrono is the parse/format-only dep already in the workspace — no `clock` feature needed for
+/// the epoch→RFC-3339 conversion). The consult only needs `now` to honour a per-run-token TTL; a plain
+/// `revoke(jti)` (no TTL) denies regardless of `now`.
+fn system_now_ts() -> Timestamp {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let dt = chrono::DateTime::from_timestamp(secs, 0).unwrap_or_default();
+    Timestamp(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+/// The injected "now" source (RFC-3339) for the revocation consult.
+type NowFn = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
 /// The capability-token / machine-identity credential schemes this body resolves (architecture §3/§4).
 /// A scheme is a `&'static str` (matching the frozen [`myelin_identity::Credential::scheme`]
@@ -122,8 +144,10 @@ pub enum MachineKind {
 }
 
 impl MachineKind {
-    /// Parse the credential scheme to its machine kind (or `None` for a non-machine scheme).
-    fn from_scheme(s: &str) -> Option<MachineKind> {
+    /// Parse the credential scheme to its machine kind (or `None` for a non-machine scheme). Public so
+    /// the real [`crate::capability_crypto::PasetoCapabilityVerifier`] reads the kind from the scheme
+    /// the SAME way the structural floor does (the kind is not in the signed body — MR-011b hardening).
+    pub fn from_scheme(s: &str) -> Option<MachineKind> {
         match s {
             scheme::PAT => Some(MachineKind::Pat),
             scheme::CI => Some(MachineKind::Ci),
@@ -338,39 +362,6 @@ impl TokenVerifier for StructuralTokenVerifier {
     }
 }
 
-/// **The S7 revocation denylist — a STUB (the named floor → P-ID-14 / P-072).** Architecture §4:
-/// revocation is a **denylist (S7) + short TTL**. This is the *consult* seam an `authenticate`
-/// fail-closes against (a revoked `jti` never resolves to a live session); the durable, replicated,
-/// idempotent denylist STORE + the idempotent `revoke` + the SCIM-disable wiring is P-ID-14. Held as
-/// an in-process set so the revocation SURFACE the per-job/PAT flow needs is real now.
-#[derive(Clone, Default)]
-pub struct S7Denylist {
-    revoked: Arc<Mutex<BTreeSet<String>>>,
-}
-
-impl S7Denylist {
-    /// A fresh (empty) denylist.
-    pub fn new() -> S7Denylist {
-        S7Denylist::default()
-    }
-
-    /// Revoke a token by `jti` (the stub revoke — the full idempotent `revoke` is P-ID-14).
-    /// Idempotent: revoking an already-revoked `jti` is a no-op (the S7 floor honours the
-    /// idempotency the full body formalises).
-    pub fn revoke_jti(&self, jti: &str) {
-        self.lock().insert(jti.to_string());
-    }
-
-    /// Is `jti` revoked? (The `authenticate` consult — a revoked token fail-closes.)
-    pub fn is_revoked(&self, jti: &str) -> bool {
-        self.lock().contains(jti)
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
-        self.revoked.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
 /// The grant prefix a repo-scoped deploy key's authority is ceiling-bounded to (`"repo:"`). A deploy
 /// key's authority may name only grants UNDER its one repo (architecture §3, C6) — the repo-scope
 /// ceiling this body enforces.
@@ -385,43 +376,59 @@ const SELFHOSTED_GRANT_PREFIX: &str = "selfhosted:";
 /// identities to the one polymorphic [`Principal`] over the S1 store, with **tenant-from-token**
 /// (ID-3), **monotone caveat-chain attenuation**, the **deploy-key repo ceiling**, the
 /// **self-hosted-runner one-tenant scope** (C6), the **DPoP-binding requirement** for long-lived
-/// PATs, the **S7 denylist + TTL revocation consult**, and per-request `auth_decision_latency`
-/// telemetry. Extends the same 4.1 surface the human/SSO [`crate::authenticate::HumanSsoAuthenticator`]
-/// owns — the frozen signature is unchanged.
+/// PATs, the **durable S7 revocation consult** (the `(tenant, region)`-partitioned
+/// [`RevocationStore`], MR-008 — a revoked `jti` denies AND survives restart), and per-request
+/// `auth_decision_latency` telemetry. Extends the same 4.1 surface the human/SSO
+/// [`crate::authenticate::HumanSsoAuthenticator`] owns — the frozen signature is unchanged.
 pub struct CapabilityAuthenticator {
     store: PrincipalStore,
     verifier: Arc<dyn TokenVerifier>,
-    denylist: S7Denylist,
+    /// The DURABLE S7 revocation store (MR-008/MR-011) — the source of truth the consult denies on.
+    /// Shared (cloneable) with the mint/teardown side so a revoke from any surface denies here.
+    revocations: RevocationStore,
+    /// The injected "now" (RFC-3339) for the revocation TTL consult (default: system clock).
+    now: NowFn,
     telemetry: Arc<AuthTelemetry>,
     idor: Arc<IdorCounters>,
 }
 
 impl CapabilityAuthenticator {
     /// Build the authenticator over the S1 [`PrincipalStore`] with the floor
-    /// [`StructuralTokenVerifier`] and a fresh [`S7Denylist`]. The real crypto verifier swaps in via
-    /// [`Self::with_verifier`] without changing the resolution body.
+    /// [`StructuralTokenVerifier`] and a fresh in-memory [`RevocationStore`]. The REAL crypto verifier
+    /// ([`crate::capability_crypto::PasetoCapabilityVerifier`]) + the durable `with_pg` revocation
+    /// store swap in via [`Self::with_verifier`] without changing the resolution body.
     pub fn new(store: PrincipalStore) -> CapabilityAuthenticator {
         CapabilityAuthenticator::with_verifier(
             store,
             Arc::new(StructuralTokenVerifier::new()),
-            S7Denylist::new(),
+            RevocationStore::new(),
         )
     }
 
-    /// Build the authenticator with an explicit [`TokenVerifier`] + [`S7Denylist`] (the seams the
-    /// real PASETO/biscuit/DPoP verifier and the durable S7 store plug into — the named floors).
+    /// Build the authenticator with an explicit [`TokenVerifier`] + the durable [`RevocationStore`]
+    /// (the seams the real PASETO/macaroon/DPoP verifier and the PG-backed S7 store plug into). The
+    /// revocation store is the SAME one the mint/teardown side writes to, so a revoke is consulted
+    /// here — and, with `RevocationStore::with_pg`, the denial survives a restart.
     pub fn with_verifier(
         store: PrincipalStore,
         verifier: Arc<dyn TokenVerifier>,
-        denylist: S7Denylist,
+        revocations: RevocationStore,
     ) -> CapabilityAuthenticator {
         CapabilityAuthenticator {
             store,
             verifier,
-            denylist,
+            revocations,
+            now: Arc::new(system_now_ts),
             telemetry: Arc::new(AuthTelemetry::new()),
             idor: Arc::new(IdorCounters::new()),
         }
+    }
+
+    /// Inject a deterministic clock (RFC-3339 "now") for the revocation TTL consult — the test / drill
+    /// seam (the production default reads the system clock).
+    pub fn with_clock(mut self, now: impl Fn() -> Timestamp + Send + Sync + 'static) -> CapabilityAuthenticator {
+        self.now = Arc::new(now);
+        self
     }
 
     /// The per-request `auth_decision_latency` telemetry sink (row 1.8) — for the drill assertion.
@@ -434,9 +441,10 @@ impl CapabilityAuthenticator {
         &self.idor
     }
 
-    /// The S7 revocation denylist (the stub seam → P-ID-14) — for revoking a `jti` in a drill.
-    pub fn denylist(&self) -> &S7Denylist {
-        &self.denylist
+    /// The DURABLE S7 revocation store (MR-008/MR-011) — to revoke a `jti` (and prove the cross-restart
+    /// denial) in a drill, and the SAME store the mint/teardown side shares.
+    pub fn revocations(&self) -> &RevocationStore {
+        &self.revocations
     }
 
     /// **`authenticate(credential) → Principal` (contract 4.1, the token/machine half).** `path_tenant`
@@ -446,7 +454,9 @@ impl CapabilityAuthenticator {
     ///
     /// Resolution:
     /// 1. **verify** the credential → [`CapabilityToken`] (the trust-rooted tenant + authority + jti);
-    /// 2. **revocation consult** — a revoked `jti` (S7 denylist) fail-closes (never a live session);
+    /// 2. **durable revocation consult** — a revoked `jti` (the durable [`RevocationStore`]) fail-closes
+    ///    (never a live session); the consult is `(tenant, region)`-scoped from the VERIFIED token, and
+    ///    a revocation-store read error denies (fail-closed). With `with_pg`, the deny survives restart;
     /// 3. **DPoP requirement** — a long-lived PAT MUST be DPoP sender-constrained (§4);
     /// 4. **tenant-from-token** (never the path): build the [`TenantScope`] from the token's tenant,
     ///    run the ONE IDOR primitive [`TenantScope::resolve`] over `path_tenant` (the effective tenant
@@ -468,14 +478,23 @@ impl CapabilityAuthenticator {
         // (1) Verify the credential → the trust-rooted token. An unverifiable token is a LOUD error.
         let token = self.verifier.verify(credential)?;
 
-        // (2) Revocation consult (S7 denylist + short TTL, §4). A revoked jti never resolves to a
-        //     live session (fail-closed). The durable, idempotent denylist BODY is P-ID-14 (the
-        //     consult SEAM is real here).
-        if self.denylist.is_revoked(&token.jti) {
+        // Build the verified `(tenant, region)` scope from the token (tenant-from-token, ID-3) — used
+        // for BOTH the revocation consult (partitioned) and the S1 lookup. No path-derived scope.
+        let scope = self.scope_for(&token);
+
+        // (2) DURABLE revocation consult (the MR-008 `(tenant, region)`-partitioned S7 store; the
+        //     carried-forward S7Denylist fix). A revoked jti never resolves to a live session
+        //     (fail-closed). With `with_pg`, the deny survives a restart (the durable source of truth).
+        //     The store's read is itself fail-closed (a PG read error denies), so a consult that cannot
+        //     complete denies rather than admit a possibly-revoked token.
+        if self
+            .revocations
+            .is_revoked(&scope, &RevokeTarget::Jti(token.jti.clone()), &(self.now)())
+        {
             return Err(AuthzError::FailClosed(format!(
-                "token `{}` is revoked (S7 denylist) — fail-closed (the full S7 store + idempotent \
-                 revoke is P-ID-14)",
-                token.jti
+                "token `{}` is revoked (durable S7 revocation store) — fail-closed (the deny survives \
+                 restart; tenant `{}`)",
+                token.jti, token.tenant.0
             )));
         }
 
@@ -490,10 +509,9 @@ impl CapabilityAuthenticator {
             ));
         }
 
-        // (4) THE IDOR FLOOR (ID-3): the tenant is the VERIFIED TOKEN's, never the URL path. Build
-        //     the scope from the token's tenant, then run the ONE storage-tier IDOR primitive over
-        //     the path assertion — purely to COUNT a rejected mismatch.
-        let scope = self.scope_for(&token);
+        // (4) THE IDOR FLOOR (ID-3): the tenant is the VERIFIED TOKEN's, never the URL path. The scope
+        //     (built above from the token's tenant) feeds the ONE storage-tier IDOR primitive over the
+        //     path assertion — purely to COUNT a rejected mismatch.
         let resolved = scope.resolve(path_tenant);
         debug_assert_eq!(
             resolved.tenant, token.tenant,
@@ -1081,9 +1099,11 @@ mod tests {
         );
     }
 
-    /// **A revoked token (S7 denylist) fails closed (the revocation consult seam → P-ID-14).** A token
-    /// whose `jti` is on the denylist never resolves to a live session. The full S7 store + idempotent
-    /// `revoke` is the named floor; the consult is real now.
+    /// **A revoked token fails closed through the DURABLE revocation store (the MR-011 carried-forward
+    /// fix).** A token whose `jti` is revoked in the `(tenant, region)`-partitioned [`RevocationStore`]
+    /// never resolves to a live session. (Cross-RESTART durability is proven in the live-PG integration
+    /// test `integration_mr011_machine_token_revocation_durable` — here the in-memory model proves the
+    /// consult routes through the durable store, not the old tenant-less stub.)
     #[test]
     fn revoked_token_fails_closed() {
         let auth = seeded(
@@ -1104,8 +1124,13 @@ mod tests {
             None,
         )
         .unwrap();
-        // Revoke the jti (the stub revoke; full S7 → P-ID-14).
-        auth.denylist().revoke_jti("jti-live");
+        // Revoke the jti through the DURABLE store, in the token's `(tenant, region)` partition.
+        let sc = scope("acme", "eu-west");
+        auth.revocations().revoke(
+            &sc,
+            &RevokeTarget::Jti("jti-live".into()),
+            Timestamp("2026-06-26T00:00:00Z".into()),
+        );
         // After revocation: fail-closed.
         let r = auth.authenticate(
             &cred(
@@ -1116,11 +1141,15 @@ mod tests {
         );
         assert!(
             matches!(r, Err(AuthzError::FailClosed(_))),
-            "a revoked token (S7 denylist) fails closed (never a live session)"
+            "a revoked token (durable S7 store) fails closed (never a live session)"
         );
-        // The denylist revoke is idempotent (the S7 floor honours what the full body formalises).
-        auth.denylist().revoke_jti("jti-live");
-        assert!(auth.denylist().is_revoked("jti-live"));
+        // The revoke is idempotent + tenant-partitioned: a DIFFERENT tenant's identical jti is NOT
+        // revoked (no cross-tenant denylist path — the partition is the verified token's).
+        assert!(!auth.revocations().is_revoked(
+            &scope("globex", "eu-west"),
+            &RevokeTarget::Jti("jti-live".into()),
+            &Timestamp("2026-06-26T00:00:01Z".into()),
+        ));
     }
 
     /// **A human/SSO scheme is REFUSED by this body (it is P-ID-06's).** The capability authenticator

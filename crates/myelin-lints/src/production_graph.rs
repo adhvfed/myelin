@@ -206,14 +206,15 @@ pub fn no_structural_crypto_in_prod() -> Lint {
 ///
 /// **KNOWN COVERAGE BOUNDARY — the role-suffix blind spot (LOUD, named; NOT a bug).** This scanner
 /// keys on the durable-role NAME suffix (`Store`/`Registry`/`Outbox`/`Ledger`) plus a small precise
-/// [`NAMED_DURABLE_HOLDERS`] list (`KmsEngine` SI-006, `MisrouteAudit` SI-028, `S7Denylist` SI-020).
+/// [`NAMED_DURABLE_HOLDERS`] list (`KmsEngine` SI-006, `MisrouteAudit` SI-028).
 /// A census persistence shortcut whose struct has NEITHER is INVISIBLE here — the baseline covers the
 /// role-suffix representative PER ORGAN, NOT the full census persistence set. Known-uncovered, each
 /// riding a not-yet-authored persistence MR that MUST extend this scanner (add the type to
 /// [`NAMED_DURABLE_HOLDERS`] or widen [`DURABLE_ROLE_SUFFIXES`]) when it lands:
 /// `Consumer` (SI-024), `Firehose` (SI-037), `InMemoryShredder` (SI-038), `OltpPool` (SI-021),
-/// `PlacementService` stickiness (SI-026). (`S7Denylist` SI-020 was added to the named list by MR-008,
-/// the revocation MR.) A future "the bus / control-plane is durable now" claim is
+/// `PlacementService` stickiness (SI-026). (`S7Denylist` SI-020 was added to the named list by MR-008
+/// and then REMOVED by MR-011, which deleted the stub type and routed the consult through the durable
+/// `RevocationStore`.) A future "the bus / control-plane is durable now" claim is
 /// therefore only PARTIALLY gated until that MR extends the scanner — this note exists so that gap is
 /// never silently relied upon (the full list + per-organ mapping is in `tests/production_graph_absence.rs`).
 ///
@@ -257,13 +258,12 @@ const DURABLE_ROLE_SUFFIXES: &[&str] = &["Store", "Registry", "Outbox", "Ledger"
 ///     (census SI-028; `records: Arc<Mutex<Vec<…>>>`, in-memory today). Named here rather than via an
 ///     `Audit` suffix, which would wrongly flag report/value types like `CrossCellAudit` (no
 ///     collection) and `RestrictionLeakAudit` (a computed gate REPORT, not a system-of-record).
-///   - `S7Denylist` — the machine-auth `authenticate` revocation consult (census SI-020), a
-///     STUB `Arc<Mutex<BTreeSet<String>>>` of revoked jtis with NO durable backing (it loses every
-///     revocation on restart → a revoked token would validate again). Named here (the `Denylist`
-///     suffix is not a generic role suffix) because MR-008 is the revocation MR the MR-004
-///     coverage-boundary note said must extend this scanner. Removed when `CapabilityAuthenticator`
-///     consults the now-durable `RevocationStore` instead of its own stub set (MR-009 / auth MRs).
-const NAMED_DURABLE_HOLDERS: &[&str] = &["KmsEngine", "MisrouteAudit", "S7Denylist"];
+///   - (`S7Denylist` SI-020 was a third named holder, added by MR-008; MR-011 DELETED the type — the
+///     machine-auth `authenticate` revocation consult now routes through the durable `RevocationStore`
+///     (revocation.rs, the `Store`-suffixed durable-capable S7), so there is no stub set to name. The
+///     carried-forward machine-token revocation gap is discharged; the `Store` role-suffix rule covers
+///     the surviving durable-capable revocation store.)
+const NAMED_DURABLE_HOLDERS: &[&str] = &["KmsEngine", "MisrouteAudit"];
 /// Name fragments that mark an obvious NON-durable in-memory double/cache/derived view — excluded so
 /// a legitimate cache/index/derived-projection/code-registry is not flagged (the precise-scope
 /// discipline the rule names: only a durable SYSTEM-OF-RECORD is a shortcut, never a rebuildable
@@ -804,13 +804,24 @@ mod tests {
     }
 
     #[test]
-    fn in_memory_store_catches_s7_denylist_named_holder() {
-        // `S7Denylist` (SI-020) — no role suffix (ends `Denylist`), caught via the named-holder list
-        // (added by MR-008, the revocation MR). A bare in-process set of revoked jtis with no pool.
-        let red = "pub struct S7Denylist {\n    revoked: Arc<Mutex<BTreeSet<String>>>,\n}";
+    fn s7_denylist_named_holder_discharged_by_mr011() {
+        // MR-011 DELETED the `S7Denylist` stub and routed `CapabilityAuthenticator`'s revocation
+        // consult through the durable `RevocationStore`. The type no longer exists in the tree, and it
+        // is no longer a NAMED_DURABLE_HOLDER, so the scanner no longer flags a `S7Denylist {...}` shape
+        // (the `Denylist` suffix is not a generic role suffix). This pins the discharge: the surviving
+        // durable-capable revocation store is covered by the `Store` role-suffix rule (revocation.rs),
+        // so the carried-forward machine-token revocation gap is closed without a coverage hole.
+        let no_longer_named = "pub struct S7Denylist {\n    revoked: Arc<Mutex<BTreeSet<String>>>,\n}";
         assert!(
-            !no_in_memory_durable_store().run(red).is_empty(),
-            "the S7Denylist revocation stub must be caught (a lost revocation lets a revoked token validate)"
+            no_in_memory_durable_store().run(no_longer_named).is_empty(),
+            "S7Denylist is no longer a named durable holder (deleted by MR-011); the durable \
+             RevocationStore (Store suffix) is the covered revocation system-of-record"
+        );
+        // Belt-and-braces: the surviving durable-capable store still fires under the role-suffix rule.
+        let store = "struct Inner {\n    mirror: BTreeMap<MirrorKey, RevocationEntry>,\n}\npub enum RevocationBackend {\n    Memory(Arc<Mutex<Inner>>),\n    Pg(PgRevocationBacking),\n}\npub struct RevocationStore {\n    backend: RevocationBackend,\n}";
+        assert!(
+            !no_in_memory_durable_store().run(store).is_empty(),
+            "the durable-capable RevocationStore still fires (Memory default) under the Store suffix"
         );
     }
 

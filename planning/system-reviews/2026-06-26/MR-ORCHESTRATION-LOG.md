@@ -75,6 +75,14 @@ MR-010a wires nothing into the prod default (StructuralVerifier still the OIDC d
 
 **MR-010 (human/SSO real crypto) COMPLETE** — all four credential types (OIDC, SSH, SAML, WebAuthn) are real and each survived an independent security verifier trying to forge past it. Minor non-blocking follow-ups logged: WebAuthn RSA public-exponent explicit bound (redundant w/ the rsa crate); challenge burned on failed-sig assertion (availability note, not a bypass); MR-012 must flip the prod default (all four are test-wired today, Structural still the prod default until then).
 
+| MR-011 | Machine/capability tokens + DPoP + durable revocation (PASETO v4.public + macaroon HMAC chain + RFC 9449) | capability_crypto.rs real signer/verifier; S7Denylist DELETED → revocation via durable RevocationStore; 17 corpus + 1 live-PG cross-restart test | INDEP SECURITY verifier: ACCEPT-w/-followups → 18 adversarial attacks, COULD NOT forge/amplify/replay (PAE binding, macaroon law doubly-enforced, DPoP sound, footer-key rejected); added own live-PG tenant-PARTITION test (no A→B revocation bleed) + fail-closed-on-store-error confirmed; S7Denylist genuinely gone (baseline 24→23, first net REMOVAL) | GREEN (17 + 1 live-PG + full lints + 848 default + workspace; hmac promoted, no new crate) | (this) |
+
+**E0.5 auth crypto COMPLETE** — OIDC/SSH/SAML/WebAuthn (human/SSO) + machine/capability tokens+DPoP all real, all forge-audited. The carried-forward S7Denylist→durable-revocation gap is DISCHARGED (revoked machine tokens stay denied across restart). MR-011 follow-ups (non-blocking): kind/scheme not in the signed token body (deny-on-mismatch, not a bypass → MR-011b); DpopReplayGuard is per-instance in-memory (correct single-cell; multi-replica DPoP replay within the 60s window needs a shared/TTL'd store — fails closed; defer with multi-cell). NEXT: MR-012 (remove Structural* defaults — flip all the real verifiers to prod default; the no-structural-crypto scanner goes green) + MR-013 (RLS hardening).
+
+| MR-011 | Real machine/capability-token crypto (PASETO v4.public + macaroon attenuation + DPoP, P-527) + route revocation through the durable RevocationStore (discharge the carried-forward S7Denylist gap) | `capability_crypto.rs`: Ed25519/PASETO-v4.public on `ring`, HMAC-SHA256 macaroon caveat chain on `hmac`+`sha2` (K_mac-seeded → extend-only/amplification-proof), RFC-9449 DPoP (Ed25519 proof, jkt-bind, htm/htu, freshness, single-use); real `TokenSigner`/`TokenVerifier` behind the seams; `CapabilityAuthenticator` field S7Denylist→durable `RevocationStore`; 17-test corpus (real forgeries) + live-PG cross-restart revocation test | builder self-verify: 17/17 corpus GREEN (forge/tamper/amplify/removed-caveat/expired/DPoP-missing/wrong-key/replay/wrong-htm-htu/stale-iat/garbage/tenant-injection) + live-PG `integration_mr011_machine_token_revocation_durable` GREEN (revoked machine token stays denied across a FRESH store over the same pool). **INDEP SECURITY verify PENDING** | GREEN (full lints 57 + ratchet 23/16; 848 workspace default ok / 0 failed; check workspace + integration; 1 dep promoted `hmac`) | (this) |
+
+**Carried-forward S7Denylist machine-token revocation gap (MR-008→MR-011): DISCHARGED.** `CapabilityAuthenticator::authenticate` now consults the durable `(tenant, region)`-partitioned `RevocationStore` (the same `with_pg` store as every other revocation); the tenant-less in-memory `S7Denylist` stub is DELETED. Cross-restart denial proven against live PG. Baseline 24→23, no-in-memory 17→16 (S7Denylist removed, not supplemented). The `Structural*` machine-token verifier/signer DEFAULTS remain (MR-012 removes them); the REAL `PasetoCapability{Signer,Verifier}` are available behind `with_signer`/`with_verifier` and proven end-to-end. **MR-011b deferred (named, not faked):** binding `kind` into the signed body (kind is read from the credential scheme, as the structural floor did — a deny-on-mismatch hardening); PASETO footer key-id / key rotation (single anchor today); a full biscuit asymmetric block chain (the macaroon HMAC chain is the sound, simpler construction); the runtime gateway DPoP `htm`/`htu` binding wiring (injected seam today). **MR-012** still owes the prod-default flip (Structural→real verifier/signer as the non-optional default).
+
 ## Test environment (verified live 2026-06-26 — every persistence/auth prompt uses this)
 
 Real backends run via `docker-compose.dev.yml` and are UP (confirmed `smoke_backends` integration test
@@ -111,11 +119,12 @@ green: pg connect, s3 put/get, rebac tuples, outbox→bus relay, valkey cache):
 - **Low-pri check (pre-existing, not MR-023):** snapshot/reindex events use a deterministic FNV-1a
   `event_id` (not tenant-derived); confirm aggregate keys are globally unique so a cross-tenant consumer
   replaying snapshots can't dedup-collide. Property of the frozen ledger, unchanged by MR-023.
-- **MR-011 (machine tokens) / MR-009 MUST route `CapabilityAuthenticator` through the durable
-  `RevocationStore`.** MR-008 found `S7Denylist` (`machine_auth.rs:347`) is a tenant-less in-memory jti set
-  rebuilt empty on construction — a machine-token jti revoked only there RE-VALIDATES after restart (a real
-  revocation gap). MR-008 surfaced + baselined it (24/17) but did NOT wire it (correct — that's auth-path
-  scope). Until `CapabilityAuthenticator::authenticate` consults the durable RevocationStore, the gap ships.
+- **[DISCHARGED by MR-011] MUST route `CapabilityAuthenticator` through the durable `RevocationStore`.**
+  MR-008 found `S7Denylist` (`machine_auth.rs:347`) is a tenant-less in-memory jti set rebuilt empty on
+  construction — a machine-token jti revoked only there RE-VALIDATES after restart (a real revocation gap).
+  MR-011 routed `CapabilityAuthenticator::authenticate` through the durable `(tenant, region)`-partitioned
+  `RevocationStore` (fail-closed reads), DELETED the stub type, and proved the cross-restart denial against
+  live PG (`integration_mr011_machine_token_revocation_durable`). Baseline 24→23, no-in-memory 17→16.
 - **Before any real run-token timestamp writer (P-ID-18) / in MR-011:** the run-token expiry guarantee must
   stay structural. MR-008 fixed its OWN expiry comparison to parse instants (was a lexical string compare that
   failed open on non-normalized timestamps), but the shared `Timestamp(String)` type (myelin-events) is still

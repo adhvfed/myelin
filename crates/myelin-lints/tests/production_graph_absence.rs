@@ -41,12 +41,12 @@
 //!
 //! ### `no-structural-crypto-in-prod` (5) — removed by MR-010/011/012 (P-526/527/528)
 //! - `myelin-identity-service/src/authenticate.rs:289`  — `StructuralVerifier` default (SI-004)
-//! - `myelin-identity-service/src/machine_auth.rs:406`  — `StructuralTokenVerifier` default (SI-002)
+//! - `myelin-identity-service/src/machine_auth.rs:403`  — `StructuralTokenVerifier` default (SI-002)
 //! - `myelin-identity-service/src/mint.rs:253`          — `StructuralTokenSigner` default (SI-003)
 //! - `myelin-identity-service/src/mint.rs:265`          — `StructuralTokenSigner` w/tuples (SI-003)
 //! - `myelin-ci-controlplane/src/residency_drill.rs:444`— `StructuralAttestationVerifier` (SI-001/attestation floor, P-527)
 //!
-//! ### `no-in-memory-durable-store` (17) — removed by the spine durable-persistence MRs (P-522/523)
+//! ### `no-in-memory-durable-store` (16) — removed by the spine durable-persistence MRs (P-522/523)
 //! - `myelin-identity-service/src/principal_store.rs:289` — `PrincipalStore` (SI-018). MR-007 ADDED
 //!   the durable `with_pg` PG path (proven live: `integration_mr007_identity_durable`) but the
 //!   `Memory(Arc<Mutex<Inner>>)` variant is still the always-compiled default (the `Pg` variant is
@@ -58,9 +58,10 @@
 //!   ADDED the durable `with_pg` path (proven live incl. expiry-across-restart:
 //!   `integration_mr008_revocation_durable`); `Memory` variant still the default → enum-following
 //!   scanner still fires. Removed at MR-009 wiring.
-//! - `myelin-identity-service/src/machine_auth.rs:347`    — `S7Denylist` (SI-020), the auth revocation
-//!   CONSULT stub (no durable backing — loses revocations on restart). MR-008 added it to the named
-//!   holders; the fix is routing `CapabilityAuthenticator` to the durable `RevocationStore` (MR-009).
+//!   (`machine_auth.rs:347 S7Denylist` SI-020 was an entry here; MR-011 DELETED the stub type and
+//!   routed `CapabilityAuthenticator`'s revocation consult through the durable `RevocationStore` above
+//!   — 17→16. The machine-token revocation is now backed by the same durable-capable S7 store; the
+//!   cross-restart denial is proven in `integration_mr011_machine_token_revocation_durable`.)
 //! - `myelin-identity-service/src/pseudonym_store.rs:191` — `PseudonymStore` (S2) in-mem (SI-018 cluster; MR-007/009)
 //! - `myelin-identity-service/src/pseudonym_erase.rs:268` — `PseudonymErasureLedger` in-mem via the
 //!     `type LedgerByPartition = BTreeMap<…>` ALIAS (alias false-negative closed; census 10.8; MR-007/009)
@@ -92,7 +93,7 @@
 //! the full census persistence set. Known-uncovered (each rides a not-yet-authored persistence MR
 //! that MUST extend this scanner — add the type to `NAMED_DURABLE_HOLDERS` or widen the suffix set —
 //! when it lands; see the matching note in `production_graph.rs`):
-//!   - `S7Denylist` (SI-020, identity revocation hot-set) · `Consumer` (SI-024, events cursor/lag)
+//!   - `Consumer` (SI-024, events cursor/lag) · (S7Denylist SI-020 was here — DISCHARGED by MR-011)
 //!   - `Firehose` (SI-037, live transport) · `InMemoryShredder` (SI-038, GDPR shred) ·
 //!     `OltpPool` (SI-021, OLTP permit pool) · `PlacementService` stickiness (SI-026, control-plane)
 //! A future "we made the bus / control-plane durable" claim is therefore only PARTIALLY gated until
@@ -267,7 +268,7 @@ const BASELINE: &[(&str, &str, usize)] = &[
     (
         "no-structural-crypto-in-prod",
         "crates/myelin-identity-service/src/machine_auth.rs",
-        406,
+        403,
     ),
     (
         "no-structural-crypto-in-prod",
@@ -352,17 +353,15 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-identity-service/src/revocation.rs",
         193,
     ),
-    // `S7Denylist` (SI-020) — the machine-auth `authenticate` revocation CONSULT stub: a bare
-    // `Arc<Mutex<BTreeSet<String>>>` of revoked jtis with NO durable backing (loses every revocation
-    // on restart → a revoked token would validate again). MR-008 added it to the scanner's
-    // NAMED_DURABLE_HOLDERS (it has no role suffix). It is NOT bound to PG (that would fork a second
-    // revocation store); the fix is routing `CapabilityAuthenticator` through the now-durable
-    // `RevocationStore` — an auth-path wiring change for MR-009 / the auth MRs. Fires until then.
-    (
-        "no-in-memory-durable-store",
-        "crates/myelin-identity-service/src/machine_auth.rs",
-        347,
-    ),
+    // `S7Denylist` (SI-020) — REMOVED by MR-011 (the carried-forward fix is DISCHARGED). The
+    // machine-auth `authenticate` revocation CONSULT was a bare `Arc<Mutex<BTreeSet<String>>>` of
+    // revoked jtis with NO durable backing (lost every revocation on restart → a revoked token would
+    // validate again). MR-011 ROUTES `CapabilityAuthenticator` through the durable `RevocationStore`
+    // (the `(tenant, region)`-partitioned, `with_pg`-capable S7 store at revocation.rs:193, already in
+    // this baseline) and DELETES the `S7Denylist` type. The machine-token revocation is now backed by
+    // the SAME durable-capable store as every other revocation — the standalone tenant-less stub is
+    // gone (proven cross-restart in `integration_mr011_machine_token_revocation_durable`). So this
+    // entry is removed, not supplemented (the durable consult path is real now).
     // MR-025 (SI-006) ADDED the durable software-sealed root path (`kms_durable::DurableKmsBacking`
     // + `load_or_generate` over `kms_sealed_root`/`kms_wrapped_kek`/`kms_wrapped_dek`, proven live:
     // `integration_mr025_kms_durable` — decrypt-across-restart + wrong-seal-key-fails-closed +
@@ -510,7 +509,7 @@ fn live_violations(root: &Path) -> Vec<(String, String, usize)> {
 fn the_baseline_is_non_empty_and_internally_consistent() {
     // The baseline must be non-empty (a vacuous green would mean the scanners found nothing — an
     // un-wired gate). The counts pin the manifest shape.
-    assert_eq!(BASELINE.len(), 24, "the committed baseline has 24 entries");
+    assert_eq!(BASELINE.len(), 23, "the committed baseline has 23 entries (MR-011 removed S7Denylist)");
     let structural = BASELINE
         .iter()
         .filter(|(s, ..)| *s == "no-structural-crypto-in-prod")
@@ -525,11 +524,13 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
         .count();
     assert_eq!(structural, 5, "5 structural-crypto sites");
     assert_eq!(
-        in_memory, 17,
-        "17 in-memory durable-store sites: MR-007 re-pinned principal_store + tuple_store (durable \
+        in_memory, 16,
+        "16 in-memory durable-store sites: MR-007 re-pinned principal_store + tuple_store (durable \
          path added, Memory variant still the default → enum-following scanner still fires); MR-008 \
-         added S7Denylist (machine_auth.rs) to the named holders + kept revocation.rs:173 (same \
-         supplemented-not-removed status). All removed when MR-009 wires with_pg as the default."
+         kept revocation.rs:193 (supplemented-not-removed). MR-011 REMOVED S7Denylist (machine_auth.rs) \
+         — the machine-token revocation now routes through the durable RevocationStore, so the \
+         standalone tenant-less stub is deleted, not supplemented (17→16). The remaining present-not- \
+         removed sites flip when MR-009 wires with_pg as the default."
     );
     assert_eq!(bare_pool, 2, "2 bare-tenant-pool sites");
     // The census-named anchor sites are present (the prompt's hard requirements).
