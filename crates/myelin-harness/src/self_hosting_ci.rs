@@ -502,6 +502,56 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "ag_p26_dogfood_drill",
             ],
         },
+        // (14) the GIT-HOSTING dogfood band (P-518 / GIT-P35 → M6-G10): THE DONE-BAR. The Myelin monorepo
+        //      is hosted on Myelin git hosting — the platform's own repositories run on the self-hosting
+        //      platform. The PR context pane on the Myelin monorepo (git the reference producer; a denied
+        //      viewer's linked confidential issue tombstones, 0 leak), the agent-native fix-PR flagship
+        //      (CI-fail → fix-PR; the git.merge HITL + X-1 CheckStatus gate; exactly-once HITL + merge;
+        //      git.pr.merged closes the issue), and the spec-to-ship lineage (commit→PR→merge; cold-reindex
+        //      == live byte-for-byte) — all green, 0 leak, merge-count == 1; the git truth-up pass confirms
+        //      every PROVEN git row (GIT-D1..D11 + the E2E slices) rests on a dated green artifact (0 red
+        //      later-band git gate); the every-incident-adds-a-drill loop is self-hosted. WIRES the
+        //      existing git surface + drills (EI-01 §7 — never re-implemented here). The switch test is the
+        //      next band.
+        SelfHostJob {
+            id: "GIT-P35-dogfood",
+            title: "git hosts Myelin's own repositories — the PR context pane + the agent-native fix-PR \
+                    flagship (exactly-once merge) + the spec-to-ship lineage (all green, 0 leak) + the \
+                    git truth-up pass (0 red later-band git gate) + the self-hosted \
+                    every-incident-adds-a-drill loop",
+            kind: JobKind::Drill,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-git",
+                "--test",
+                "git_p35_dogfood_drill",
+            ],
+        },
+        // (15) the GIT-HOSTING switch-test band (P-518 / GIT-P35 → M6-G10): the Git OQ-12 switch test
+        //      driven over the real surface — could a GitHub user move to Myelin git hosting WITHOUT
+        //      hitting a wall the old tool didn't have? The PR overview renders within the latency budget,
+        //      the markdown round-trips (render(parse(md)) === md at 100%, contract 13.1), and every status
+        //      overlay meets the WCAG 4.5:1 contrast floor (the design-language §8b measured anchor), 0
+        //      walls vs the GitHub anchor. WIRES the existing PrOverviewPage render + the ONE Body
+        //      round-trip + the StatusCue overlays (EI-01 §7 — never re-implemented here). The pixel-level
+        //      browser drive over the live WASM editor + the <svg> icon binding is the honest named floor.
+        SelfHostJob {
+            id: "GIT-P35-switch-test",
+            title: "the Git OQ-12 switch test driven over the real surface — the PR overview render \
+                    within budget + render(parse(md)) === md at 100% + every status overlay at ≥ 4.5:1 \
+                    contrast (0 walls vs the GitHub anchor)",
+            kind: JobKind::Drill,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-git",
+                "--test",
+                "git_p35_switch_test_drill",
+            ],
+        },
     ]
 }
 

@@ -426,3 +426,29 @@ pub mod web;
 /// `Id.check` → state change + outbox emit in one transaction (BUS-2); every cross-subsystem read uses
 /// `project`/`resolve` (cell-local, never cross-DB).
 pub mod api;
+
+/// **Dogfood: git hosts Myelin's OWN repositories (GIT-P35 / P-518, M6 — THE DONE-BAR).** M6 promotes
+/// NOTHING and freezes NO new contract — the engine is fixed at M3 and hardened through M5. This module is
+/// the dogfood DRIVER over the already-shipped git surface on the Myelin self-tenant: the platform's own
+/// monorepo on Myelin git hosting, its build/test/lint/mutation pipeline as a Myelin CI graph. It REUSES
+/// the existing E2E-wedge runners ([`surge::run_e2e_1_pr_pane`] / [`surge::run_e2e_2_fix_pr`] /
+/// [`surge::run_e2e_3_spec_to_ship`], EI-01 §7 — never a second engine) for the three dogfood faces (the
+/// PR-context pane + the agent-native fix-PR flagship + the spec-to-ship lineage), plus the git TRUTH-UP
+/// pass ([`dogfood::run_git_truth_up_scorecard`] over [`dogfood::proven_git_rows`]) — every PROVEN git row
+/// (GIT-D1..GIT-D11 + the E2E slices) rests on a DATED green artifact whose proof source exists on disk; a
+/// vanished/undated row is surfaced CLAIMED-NOT-PROVEN, never trusted on faith — and the
+/// every-incident-adds-a-drill loop ([`dogfood::GitIncident`]). No new floor; the one remaining floor is
+/// the world-scale 30× fleet-hardware load drill (the shared §4.1 fleet drill). The switch test is the
+/// sibling [`switch_test`] module.
+pub mod dogfood;
+
+/// **The Git OQ-12 SWITCH TEST driven over the real surface (GIT-P35 / P-518, M6 — THE DONE-BAR).** The
+/// "actually try it" gate (EI-01 §4): could a GitHub user move to Myelin git hosting WITHOUT hitting a
+/// wall the old tool didn't have — MEASURED against the contrast + latency budgets + `render(parse(md)) ===
+/// md` + the status overlays (git-hosting §3 M6-G10; VISION §3)? The DRIVER renders the real
+/// [`web::PrOverviewPage`] (measured against the render-latency budget), round-trips the [`body::Body`]
+/// corpus (`render(parse(md)) === md` at 100%, contract 13.1), and resolves every [`web::StatusCue`]
+/// overlay's contrast against the design-language §8b measured floor — over the Myelin self-tenant. Reused,
+/// never re-implemented (EI-01 §7). The pixel-level browser drive over the live WASM editor + `<svg>` icon
+/// binding is the honest named floor — recorded per surface, never claimed.
+pub mod switch_test;
