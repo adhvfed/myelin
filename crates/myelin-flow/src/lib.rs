@@ -238,6 +238,7 @@ pub mod approval;
 pub mod budget;
 pub mod ci_pipeline;
 pub mod crypto_shred;
+pub mod dogfood;
 pub mod engine;
 pub mod executor;
 pub mod holder;
@@ -276,6 +277,15 @@ pub use crypto_shred::{
 // The reserve/settle cost type the public `CiStage` / `metered_schedule_and_run_job` surface takes
 // (contract 11.7) — re-exported so a consumer building a `CiStage` does not need a second
 // `myelin-storage` edge just to name the cost.
+// The M6 dogfood loop (P-FLOW-29 / P-516): Myelin's own pipelines / merge queue / SLA timers run as
+// myelin-flow workflows over the platform's own work + the FLOW truth-up pass over FLOW-D1..D10 + E2E-2.
+pub use dogfood::{
+    proven_flow_rows, run_flow_over_myelins_own_work, run_flow_truth_up_scorecard,
+    run_myelin_ci_pipeline, run_myelin_merge_queue, run_myelin_sla_timer, FlowDogfoodArtifact,
+    FlowIncident, FlowIncidentDrillTicket, FlowIncidentIssueDraft, FlowRowStatus,
+    FlowScorecardEntry, FlowTruthUpPass, FlowTruthUpRed, FlowTruthUpScorecard, FlowTruthUpVerdict,
+    MergeFace, PipelineFace, ProvenFlowRow, SlaFace, MYELIN_SELF_REGION, MYELIN_SELF_TENANT,
+};
 pub use engine::{
     drive, drive_full, drive_versioned, drive_with_timers, run_state, DriveOutcome, FlowDispatcher,
     FlowTelemetry, RunRow, RunStore, SignalRow, SignalStore, WorkflowBody,

@@ -449,6 +449,33 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "srch_p33_switch_test_drill",
             ],
         },
+        // (12) the DURABLE-WORKFLOW dogfood band (P-516 / P-FLOW-29 → FLOW-M6): Myelin's OWN pipelines /
+        //      merge queue / SLA timers run AS myelin-flow workflows on the self-hosting platform — the
+        //      dogfood loop exercises every engine path (replay, the long-park, signals, the merge-queue
+        //      wake, the durable timer) on the platform's own commits. Myelin's own build/test/lint
+        //      pipeline runs as a `ci.pipeline` workflow end-to-end; Myelin's own merge queue merges a
+        //      real Myelin PR EXACTLY ONCE (merge-count == 1, 0 double-merge, one git.pr.merged); a real
+        //      Myelin SLA timer FIRES on a real Myelin issue (arm → cheap re-arm → fire); the FLOW
+        //      truth-up pass confirms every PROVEN FLOW row (FLOW-D1..D10 + the E2E-2 spine) rests on a
+        //      dated green artifact (0 red earlier-band FLOW gate); the every-incident-adds-a-drill loop
+        //      is self-hosted. WIRES the existing myelin-flow surface + drills (EI-01 §7 — never
+        //      re-implemented here).
+        SelfHostJob {
+            id: "FLOW-P29-dogfood",
+            title: "Myelin's own pipelines/merge-queue/SLA-timers as myelin-flow workflows — the \
+                    ci.pipeline workflow + the merge queue merging a real Myelin PR exactly once + a \
+                    real Myelin SLA timer firing on a real Myelin issue (all green) + the FLOW truth-up \
+                    pass (0 red earlier-band FLOW gate) + the self-hosted every-incident-adds-a-drill loop",
+            kind: JobKind::Drill,
+            tool: JobTool::Cargo,
+            argv: &[
+                "test",
+                "-p",
+                "myelin-flow",
+                "--test",
+                "flow_p29_dogfood_drill",
+            ],
+        },
     ]
 }
 

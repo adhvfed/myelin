@@ -419,6 +419,37 @@ fn a_red_substrate_drill_rejects_the_commit() {
 }
 
 #[test]
+fn the_self_hosting_graph_runs_the_durable_workflow_dogfood_band() {
+    // P-FLOW-29 / P-516 (M6): the durable-workflow dogfood band is wired as a Myelin CI job — Myelin's
+    // own pipelines / merge queue / SLA timers run as myelin-flow workflows on the platform's own
+    // commits, plus the FLOW truth-up pass (FLOW-D1..D10 + the E2E-2 spine).
+    let jobs = self_hosting_jobs();
+    assert!(
+        jobs.iter()
+            .any(|j| j.id == "FLOW-P29-dogfood" && j.kind == JobKind::Drill),
+        "the self-hosting graph MUST run the durable-workflow dogfood band (Myelin's pipelines/\
+         merge-queue/SLA-timers as myelin-flow workflows + the FLOW truth-up pass) as part of the \
+         self-hosting CI graph"
+    );
+}
+
+#[test]
+fn a_red_flow_dogfood_drill_rejects_the_commit() {
+    // The FLOW dogfood drill is part of the gate: a re-dispatch / a double-merge on Myelin's own PR /
+    // an SLA timer that fails to fire / an undated PROVEN FLOW row reds the graph — the ratchet rejects
+    // on Myelin's own work (the exactly-once + truth-up invariants hold themselves, EI-01 §5).
+    let jobs = self_hosting_jobs();
+    let run = run_graph(&jobs, &reds_one("FLOW-P29-dogfood"));
+    assert!(
+        !run.is_green(),
+        "a red FLOW dogfood drill (a re-dispatch / a double-merge on Myelin's own PR / an SLA \
+         timer that didn't fire / a claimed-not-proven FLOW row) MUST reject the commit — Myelin's \
+         own workflows on Myelin's own commits are part of the self-hosting CI gate"
+    );
+    assert_eq!(run.red_jobs(), vec!["FLOW-P29-dogfood"]);
+}
+
+#[test]
 fn an_empty_run_is_not_green() {
     // Guard: a run with no jobs is RED, not vacuously GREEN (dropping the whole graph cannot game
     // the gate green — the same un-gameable discipline as the band scorecards).
