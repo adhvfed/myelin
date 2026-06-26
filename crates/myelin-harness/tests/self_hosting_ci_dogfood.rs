@@ -450,6 +450,38 @@ fn a_red_flow_dogfood_drill_rejects_the_commit() {
 }
 
 #[test]
+fn the_self_hosting_graph_runs_the_agent_fabric_dogfood_band() {
+    // P-AG-P26 / P-517 (M6): the agent-fabric dogfood band is wired as a Myelin CI job — the platform's
+    // own triage agent runs on a real Myelin CI failure (explicit-first dispatch + a balanced reserve/
+    // settle ledger + a content-addressed trace per run), plus the Fabric truth-up pass (AG-D1..AG-D11
+    // + the E2E-2 spine).
+    let jobs = self_hosting_jobs();
+    assert!(
+        jobs.iter()
+            .any(|j| j.id == "AG-P26-dogfood" && j.kind == JobKind::Drill),
+        "the self-hosting graph MUST run the agent-fabric dogfood band (the platform's own agents on \
+         Myelin's own work + the Fabric truth-up pass) as part of the self-hosting CI graph"
+    );
+}
+
+#[test]
+fn a_red_agent_fabric_dogfood_drill_rejects_the_commit() {
+    // The Fabric dogfood drill is part of the gate: an unbalanced reserve/settle ledger / an in-flight
+    // interrupt / a casual mention auto-spawning a run / an undated PROVEN Fabric row reds the graph —
+    // the ratchet rejects on Myelin's own work (the balanced-ledger + truth-up invariants hold
+    // themselves, EI-01 §5).
+    let jobs = self_hosting_jobs();
+    let run = run_graph(&jobs, &reds_one("AG-P26-dogfood"));
+    assert!(
+        !run.is_green(),
+        "a red Fabric dogfood drill (an unbalanced ledger / an interrupted in-flight run / a \
+         claimed-not-proven Fabric row) MUST reject the commit — the platform's own agents on \
+         Myelin's own commits are part of the self-hosting CI gate"
+    );
+    assert_eq!(run.red_jobs(), vec!["AG-P26-dogfood"]);
+}
+
+#[test]
 fn an_empty_run_is_not_green() {
     // Guard: a run with no jobs is RED, not vacuously GREEN (dropping the whole graph cannot game
     // the gate green — the same un-gameable discipline as the band scorecards).

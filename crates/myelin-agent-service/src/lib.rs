@@ -84,6 +84,12 @@ pub mod cost_gate;
 pub mod defaults;
 pub mod dispatch;
 pub mod dispatch_surge;
+/// The platform's own agents run on its own commits/issues/chat (AG-P26 → P-517, M6): the dogfood
+/// loop — Myelin's own triage agent runs on the self-hosting CI graph with a BALANCED reserve/settle
+/// ledger + a content-addressed trace per run (contract 1.8), the truth-up pass over every PROVEN
+/// Fabric row (AG-D1..AG-D11 + E2E-2), and the every-incident-adds-a-drill loop. The MOCK-runtime
+/// floor (the real LlmAgentRuntime swap is AG-P25) is named in [`dogfood::DOGFOOD_RUNTIME_FLOOR`].
+pub mod dogfood;
 pub mod dry_run;
 /// The Fabric's FULL `PersonalDataHolder` BODIES + the AG-D10 erasure fan-out (AG-P23 → P-479): the
 /// per-subject DEK crypto-shred, pseudonym attribution fallback, the erasure ledger + post-restore
@@ -131,6 +137,21 @@ pub use dsr::{
 pub use skeleton::{
     ChildEnv, RunOutcomeKind, RunSubstrate, RunTokenRevoker, SkeletonAgent, SkeletonAgentRuntime,
     SkeletonError, SkeletonTelemetry, AGENT_RUN_TRACED_EVENT, SKELETON_STEP_UNIT,
+};
+
+// The M6 dogfood loop (AG-P26 → P-517): the platform's own triage agent runs on the self-hosting CI
+// graph (a real Myelin CI failure → explicit-first dispatch → a costed triage run) with a BALANCED
+// reserve/settle ledger + a content-addressed trace per run (contract 1.8), the Fabric truth-up pass
+// over every PROVEN row (AG-D1..AG-D11 + E2E-2), and the every-incident-adds-a-drill loop. NO new
+// engine — drives the already-shipped Fabric surface over the Myelin self-tenant (EI-01 §7). FLOOR:
+// the dogfood agents run on the MOCK runtime (DOGFOOD_RUNTIME_FLOOR); the real LlmAgentRuntime swap is
+// the named post-M5 follow-on AG-P25.
+pub use dogfood::{
+    proven_fabric_rows, run_fabric_over_myelins_own_work, run_fabric_truth_up_scorecard,
+    run_myelin_triage_on_ci_failure, FabricDogfoodArtifact, FabricIncident,
+    FabricIncidentDrillTicket, FabricIncidentIssueDraft, FabricRowStatus, FabricScorecardEntry,
+    FabricTruthUpPass, FabricTruthUpRed, FabricTruthUpScorecard, FabricTruthUpVerdict,
+    ProvenFabricRow, TriageFace, DOGFOOD_RUNTIME_FLOOR, MYELIN_SELF_REGION, MYELIN_SELF_TENANT,
 };
 
 // The reserve/settle cost gate as the runaway self-limiter (AG-P14 → P-227, M2-B, AG-D11): the
