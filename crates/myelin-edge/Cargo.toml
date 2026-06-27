@@ -37,6 +37,14 @@ myelin-substrate = { path = "../myelin-substrate" }
 myelin-storage = { path = "../myelin-storage" }
 # TenantId / Region value types (the path-tenant the IDOR guard rejects; the residency dimension).
 myelin-tenancy = { path = "../myelin-tenancy" }
+# The Git SUBSYSTEM (MR-015): its endpoint grammar (`api::http_catalogue` — the route table the edge
+# re-roots under `/v1/git/...`) + its `web` ViewModels (the JSON data contract the edge serves). The
+# edge is the ONE composition/wiring point: it DEPENDS ON the subsystems it exposes (like a `main`),
+# and NOTHING in the production DAG depends back on `myelin-edge` — so `myelin-edge → myelin-git` is an
+# acyclic edge between two leaf consumers (neither is a node in the eleven-crate library DAG modelled
+# by `crate_graph.rs`; `substrate_is_root()`/`identity_is_sink()` are unaffected). The subsystem never
+# depends on its transport — the edge knows about Git, Git does not know about the edge.
+myelin-git = { path = "../myelin-git" }
 # The {error:{message,code?}} envelope + the JSON view-model/data contract are serde_json::Value (the
 # one workspace-pinned shape). No derive needed — the edge builds/parses Value directly.
 serde_json = { workspace = true }

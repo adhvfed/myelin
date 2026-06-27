@@ -12,7 +12,9 @@
 //! drain wiring lands with the rest of the transport. The bind address is `MYELIN_EDGE_ADDR` (default
 //! `127.0.0.1:8080`).
 
-use myelin_edge::{serve_edge, AllowAll, Gateway, Method, WhoamiHandler};
+use myelin_edge::{
+    register_git, serve_edge, AllowAll, Gateway, GitEdgeState, Method, WhoamiHandler,
+};
 use myelin_identity_service::{
     CapabilityAuthenticator, CellTokenAuthority, HumanSsoAuthenticator, PasetoCapabilityVerifier,
     PrincipalStore, RevocationStore,
@@ -36,18 +38,23 @@ async fn main() {
         KmsEngine::new(),
     ))));
 
-    let gateway = Arc::new(
-        Gateway::builder(authn, human_login, Arc::new(AllowAll))
-            .route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler))
-            .route(
-                Method::Get,
-                "/v1/t/{tenant}/whoami",
-                "edge.whoami",
-                Arc::new(WhoamiHandler),
-            )
-            .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge")
-            .build(),
-    );
+    // The Git subsystem wired through the edge (MR-015): its `/v1/git/...` routes serve Git's real
+    // ViewModels as JSON. The bootable shell seeds a representative demo tenant from Git's OWN
+    // ViewModels; the durable repo/ref backing is the Git track (E1.1). The production composition root
+    // (a real per-tenant git backend behind `GitEdgeState`) is the Git-track follow-on.
+    let git_state = Arc::new(GitEdgeState::new().seed_demo("acme"));
+
+    let mut builder = Gateway::builder(authn, human_login, Arc::new(AllowAll))
+        .route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler))
+        .route(
+            Method::Get,
+            "/v1/t/{tenant}/whoami",
+            "edge.whoami",
+            Arc::new(WhoamiHandler),
+        )
+        .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge");
+    builder = register_git(builder, git_state);
+    let gateway = Arc::new(builder.build());
 
     let addr = std::env::var("MYELIN_EDGE_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let listener = match tokio::net::TcpListener::bind(&addr).await {
