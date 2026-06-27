@@ -42,6 +42,7 @@ use crate::check_status::{CheckState, CheckStatusRow, TrustTier};
 use crate::lifecycle::PrState;
 use crate::merge_gate::{MergeGateOutcome, UnmetContext, UnmetReason};
 use crate::project::{ChecksSummary, Projected, RenderHint};
+use serde_json::{json, Value};
 
 /// Minimal HTML-escape for text interpolated into the rendered view-model. The view-model never
 /// renders attacker-controlled bytes raw (no XSS surface), and a tombstone NEVER reaches this function
@@ -92,6 +93,20 @@ impl StatusToken {
             StatusToken::Info => "st-info",
             StatusToken::Muted => "st-muted",
             StatusToken::Agent => "st-agent",
+        }
+    }
+
+    /// The semantic-token NAME (the DATA channel the JSON projection carries — `success`/`danger`/…).
+    /// The HTML render binds the CSS class ([`StatusToken::css_class`]); the edge JSON contract
+    /// ([`StatusCue::to_json`]) carries this bare semantic name so a client renders its own treatment.
+    pub fn name(self) -> &'static str {
+        match self {
+            StatusToken::Success => "success",
+            StatusToken::Danger => "danger",
+            StatusToken::Warning => "warning",
+            StatusToken::Info => "info",
+            StatusToken::Muted => "muted",
+            StatusToken::Agent => "agent",
         }
     }
 }
@@ -917,6 +932,186 @@ pub fn page(title: &str, body: &str) -> String {
         STYLE,
         body,
     )
+}
+
+// ---------------------------------------------------------------------------
+// The JSON projection — the edge DATA contract (MR-015, E0.6)
+// ---------------------------------------------------------------------------
+//
+// The product edge (`myelin-edge`, MR-014) serves the ViewModel DATA as JSON — the UI renders, the
+// edge provides the projection (catalogue.rs: "the JSON view-model/data contract"). Each `to_json`
+// MIRRORS the ViewModel's own fields — the SAME vocabulary the `render()` HTML projection consumes
+// (design pass §0: never a parallel vocabulary). One ViewModel, two projections (HTML + JSON), fed by
+// the same already-built backend logic — Git OWNS the data vocabulary, the edge is a thin re-rooter.
+
+impl StatusCue {
+    /// The status cue as JSON `{ token, glyph, label }` — the three-channel status signal (semantic
+    /// token NAME + role glyph + text label), never colour alone (the same data `render()` shows).
+    pub fn to_json(&self) -> Value {
+        json!({ "token": self.token.name(), "glyph": self.glyph, "label": self.label })
+    }
+}
+
+impl ForkTrustBadge {
+    /// The fork-trust badge as JSON. The `[ Trust this run ]` affordance is permission-gated: the
+    /// `viewer_may_endorse` flag mirrors `render()` (a viewer without `approve_untrusted_ci` gets the
+    /// honest badge but no action — no leaked affordance).
+    pub fn to_json(&self) -> Value {
+        json!({ "viewer_may_endorse": self.viewer_may_endorse })
+    }
+}
+
+impl CheckRowView {
+    /// One checks-panel row as JSON `{ context, cue, required, summary, fork_badge }` — the X-1
+    /// consumer surface's data (design pass §4.2). `fork_badge` is present ONLY for an un-endorsed
+    /// `untrusted_fork` row (the load-bearing X-1 affordance, design pass §4.1).
+    pub fn to_json(&self) -> Value {
+        json!({
+            "context": self.context,
+            "cue": self.cue.to_json(),
+            "required": self.required,
+            "summary": self.summary,
+            "fork_badge": self.fork_badge.as_ref().map(ForkTrustBadge::to_json),
+        })
+    }
+}
+
+impl ChecksPanel {
+    /// The checks panel as JSON, carrying ITS state (`live` rows / `empty` / `loading` skeleton /
+    /// `error`) — the panel fails static for its own surface only (design pass §4.2).
+    pub fn to_json(&self) -> Value {
+        match self {
+            ChecksPanel::Live { rows } => json!({
+                "state": "live",
+                "rows": rows.iter().map(CheckRowView::to_json).collect::<Vec<_>>(),
+            }),
+            ChecksPanel::Empty => json!({ "state": "empty" }),
+            ChecksPanel::Loading { skeleton_rows } => {
+                json!({ "state": "loading", "skeleton_rows": skeleton_rows })
+            }
+            ChecksPanel::Error => json!({ "state": "error" }),
+        }
+    }
+}
+
+impl MergeReadiness {
+    /// The merge-readiness affordance as JSON (design pass §4.3) — names WHICH context is unmet
+    /// (humanised, never a bare "blocked"), the queue position, or the multi-day HITL hold.
+    pub fn to_json(&self) -> Value {
+        match self {
+            MergeReadiness::Ready { approvals } => json!({
+                "state": "ready",
+                "approvals": { "current": approvals.0, "required": approvals.1 },
+            }),
+            MergeReadiness::Blocked { unmet } => json!({
+                "state": "blocked",
+                "unmet": unmet
+                    .iter()
+                    .map(|u| json!({ "context": u.context.name, "reason": humanise_unmet(u) }))
+                    .collect::<Vec<_>>(),
+            }),
+            MergeReadiness::Queued { position } => json!({ "state": "queued", "position": position }),
+            MergeReadiness::HitlHold { awaiting } => {
+                json!({ "state": "hitl_hold", "awaiting": awaiting })
+            }
+        }
+    }
+}
+
+impl PrOverviewPage {
+    /// The PR overview page as JSON (the centrepiece, view doc §2.2). A tombstone short-circuits to the
+    /// content-free restricted state — the title/state NEVER reach the JSON (the 0-leak invariant, the
+    /// SAME boundary `render()` enforces: no-access is indistinguishable from erased).
+    pub fn to_json(&self) -> Value {
+        match &self.projected {
+            Projected::Tombstoned(_t) => json!({
+                "visible": false,
+                "restricted": true,
+                // No title, no state, no reason — the viewer learns only "not available" (0 leak).
+            }),
+            Projected::Visible(p) => json!({
+                "visible": true,
+                "title": p.title,
+                "state": p.state,
+                "icon": p.icon,
+                "pr_state": pr_state_label(self.pr_state),
+                "render_hint": p.render_hint.as_ref().map(render_hint_json),
+                "sub_anchor": p.sub_anchor.as_ref().map(|s| json!({
+                    "kind": s.kind, "excerpt": s.excerpt,
+                })),
+                "checks": self.checks.to_json(),
+                "merge": self.merge.to_json(),
+            }),
+        }
+    }
+}
+
+/// The PR render-hint as JSON (the coarse checks/approvals/draft summary, project §3). The checks
+/// summary is the Git-OWNED gate state (green/red/neutral), never a raw CI string.
+fn render_hint_json(h: &RenderHint) -> Value {
+    let checks = match h.checks {
+        ChecksSummary::Green => "green",
+        ChecksSummary::Red => "red",
+        ChecksSummary::Neutral => "neutral",
+    };
+    json!({
+        "checks": checks,
+        "approvals": { "current": h.approvals.0, "required": h.approvals.1 },
+        "is_draft": h.is_draft,
+    })
+}
+
+impl RepoHome {
+    /// The repo-home view-model as JSON (view doc §2.1) — populated (slug + README excerpt + tree +
+    /// clone URL) / empty (onboarding-forward) / restricted (the 0-leak tombstone, no leaked slug).
+    pub fn to_json(&self) -> Value {
+        match self {
+            RepoHome::Populated { slug, readme_excerpt, entries, clone_url } => json!({
+                "state": "populated",
+                "slug": slug,
+                "readme_excerpt": readme_excerpt,
+                "clone_url": clone_url,
+                "entries": entries
+                    .iter()
+                    .map(|(path, is_dir)| json!({ "path": path, "is_dir": is_dir }))
+                    .collect::<Vec<_>>(),
+            }),
+            RepoHome::Empty { slug, clone_url } => {
+                json!({ "state": "empty", "slug": slug, "clone_url": clone_url })
+            }
+            RepoHome::Restricted => json!({ "state": "restricted" }),
+        }
+    }
+}
+
+impl WebEditForm {
+    /// The single-file web-edit/file-view form as JSON (GF-6). A read-only viewer (`viewer_may_edit =
+    /// false`) still gets the file contents — the COMPOSER is absent, not the content (the same posture
+    /// `render()` takes: the composer is absent, not greyed).
+    pub fn to_json(&self) -> Value {
+        json!({
+            "path": self.path,
+            "contents": self.contents,
+            "base_oid": self.base_oid,
+            "viewer_may_edit": self.viewer_may_edit,
+        })
+    }
+}
+
+impl WebEditOutcome {
+    /// The web-edit commit outcome as JSON (GF-6) — `committed` (the ref WOULD advance) / `stale_base`
+    /// (refused honestly, no 3-way editor) / `denied` (no write permission).
+    pub fn to_json(&self) -> Value {
+        match self {
+            WebEditOutcome::Committed { new_oid } => {
+                json!({ "outcome": "committed", "new_oid": new_oid })
+            }
+            WebEditOutcome::StaleBase { current_oid } => {
+                json!({ "outcome": "stale_base", "current_oid": current_oid })
+            }
+            WebEditOutcome::Denied => json!({ "outcome": "denied" }),
+        }
+    }
 }
 
 #[cfg(test)]
