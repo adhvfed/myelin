@@ -1,0 +1,74 @@
+[package]
+name = "myelin-edge"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The product/edge API GATEWAY (MR-014 / E0.6, P-S14 transport): the ONE HTTP edge the UI/CLI/MCP
+# call. A LEAF CONSUMER above the glue crates + substrate (it depends on -identity / -identity-service
+# / -substrate / -storage / -tenancy) and NOT a node in the eleven-crate library DAG modelled by
+# crate_graph.rs — nothing in the production DAG depends back on it (substrate_is_root() preserved).
+[lib]
+path = "src/lib.rs"
+
+# The deployable edge binary the harness/launcher runs (a thin shim over `serve_edge`). Like the
+# other service mains it does nothing but bind the listener and hand requests to the gateway.
+[[bin]]
+name = "edge"
+path = "src/main.rs"
+
+[dependencies]
+# The frozen identity contract surface: Principal / Credential / AuthzError. The verified principal's
+# tenant/region is the request scope (ID-3, the cardinal IDOR rule).
+myelin-identity = { path = "../myelin-identity" }
+# The REAL Bearer-token verifier + the human-login refuse-not-mock path (MR-011/MR-012): the
+# CapabilityAuthenticator (PasetoCapabilityVerifier + DPoP + durable revocation + S1 lookup) and
+# HumanSsoAuthenticator::production. The edge AUTHENTICATES through these — it never re-implements auth
+# or admits mock crypto.
+myelin-identity-service = { path = "../myelin-identity-service" }
+# The PublicSurface request-lifecycle SHAPE this transport realises: topology::PublicSurface
+# (tenant-from-token + IDOR reject/audit), InjectedIdentity, the re-authorize-every-call Authorizer
+# seam. The edge EXTENDS this; it does not fork a parallel API.
+myelin-substrate = { path = "../myelin-substrate" }
+# TenantScope (the verified `(tenant, region)` scope) + with_tenant_tx (the MR-013/MR-022 tenant scope
+# the edge sets before dispatch — behind `integration`, the live-PG transaction). KmsEngine seeds the
+# S1 principal store in the proofs.
+myelin-storage = { path = "../myelin-storage" }
+# TenantId / Region value types (the path-tenant the IDOR guard rejects; the residency dimension).
+myelin-tenancy = { path = "../myelin-tenancy" }
+# The {error:{message,code?}} envelope + the JSON view-model/data contract are serde_json::Value (the
+# one workspace-pinned shape). No derive needed — the edge builds/parses Value directly.
+serde_json = { workspace = true }
+
+# ----------------------------------------------------------------------------------------------
+# THE HTTP TRANSPORT — hyper 1.x DIRECTLY (no axum). Every crate below is ALREADY in Cargo.lock as a
+# transitive dep (via the aws-smithy / rustls / sqlx stacks), so promoting them to direct deps adds
+# ZERO new crates to the tree (the same "promote transitive, no new crate" discipline the identity
+# crate used for ring/hmac). axum is NOT in the lock and would pull a new subtree (axum / axum-core /
+# matchit / …) — rejected. The tiny router is hand-built (frontend canon §0: minimal deps).
+# ----------------------------------------------------------------------------------------------
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time"] }
+# BroadcastStream — adapts the SSE hub's tokio broadcast channel into the streaming response body.
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# ----------------------------------------------------------------------------------------------
+# Live-PG path (the tenant scope set via with_tenant_tx). OPTIONAL: the default build/test compiles
+# none of it (stays DB-free; the auth/tenant/dispatch/SSE proofs run over the real hyper listener with
+# the in-memory PublicSurface scope). `--features integration` pulls the storage durable backings +
+# sqlx so the edge can prove the tenant scope is set in a real transaction.
+# ----------------------------------------------------------------------------------------------
+sqlx = { workspace = true, optional = true }
+
+[dev-dependencies]
+# `myelin_events::Timestamp` — to revoke a token's jti in the durable S7 store (the revoked→401
+# proof). The revocation API takes an RFC-3339 `Timestamp`; the events crate owns that value type.
+myelin-events = { path = "../myelin-events" }
+
+[features]
+default = []
+integration = ["myelin-storage/integration", "dep:sqlx"]

@@ -205,6 +205,25 @@ members = [
     # preserved. See the crate-level note in crates/myelin-control-plane/src/lib.rs.
     "crates/myelin-control-plane",
     "crates/myelin-substrate",
+    # The product/edge API GATEWAY crate (MR-014 / E0.6, P-S14 transport): the ONE HTTP edge the
+    # UI/CLI/MCP call. It implements the PublicSurface request lifecycle as a REAL hyper listener —
+    # request → authenticate (Bearer capability token | session cookie) → resolve principal
+    # (tenant/region) → set tenant scope → authorize → dispatch → respond — plus the API
+    # conventions every subsystem follows (the {error:{message}} envelope, /v1 versioning, cursor
+    # pagination, the SSE real-time convention, the per-subsystem plug-in catalogue). Like the other
+    # service/subsystem crates it is a LEAF CONSUMER above the glue crates + substrate (it depends on
+    # -identity/-identity-service/-substrate/-storage/-tenancy) and is NOT a node in the eleven-crate
+    # library DAG modelled by crate_graph.rs — nothing in the production DAG depends back on it;
+    # substrate_is_root()/identity_is_sink() are preserved (the edge is the graph's terminal
+    # consumer, the one HTTP front door). It REUSES (never forks) substrate::topology::PublicSurface
+    # (tenant-from-token + IDOR reject/audit), the real PasetoCapabilityVerifier /
+    # CapabilityAuthenticator (Bearer auth), HumanSsoAuthenticator::production (refuse-not-mock human
+    # login), and storage::with_tenant_tx (the tenant scope). The per-subsystem handlers are MR-015+
+    # (this crate ships the gateway + conventions + ONE trivial whoami proof handler). It uses
+    # hyper/hyper-util/http-body-util/tokio DIRECTLY (all already in Cargo.lock as transitive deps —
+    # zero new crates enter the tree; axum is NOT in the lock and would add a new subtree), hand-
+    # building the tiny router (frontend canon §0 minimal-deps). See crates/myelin-edge/src/lib.rs.
+    "crates/myelin-edge",
     # Test-support failure-injection harness (P-S02..P-S04). NOT a node in the production
     # crate DAG (architecture §2.9) — it sits above myelin-substrate as a leaf consumer and
     # nothing depends on it. See crates/myelin-harness/Cargo.toml.
