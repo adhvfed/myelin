@@ -236,6 +236,16 @@ pub mod gix_backend;
 /// companion to the read backend [`gix_backend::GixCore`] — REUSES the same resolver + `git2`,
 /// never reimplements git. The smart-transport WIRE sits on this (GT-006, sandbox-gated).
 pub mod durable;
+/// **GT-002 (E1.1) — REAL git-repo backup + DESTRUCTIVE restore.** [`backup::GitRepoBackup`] captures
+/// a GT-001 on-disk bare repo's complete object graph + refs into a single self-contained artifact (a
+/// ref snapshot + a non-thin libgit2 packfile — the canonical `git bundle`-style mechanism, NOT a
+/// modeled WAL offset), from which [`backup::restore_repo`] reconstructs the repo onto a CLEAN target
+/// alone — proven IDENTICAL on read-back + `git fsck --full --strict` clean (the external oracle).
+/// Fixes census SI-014/015 for the git slice; the DB-PITR offset tier stays the deferred
+/// [`myelin_storage::backup`]/[`myelin_storage::restore`] floor. Reconciles as the content-addressed
+/// T2 object tier ([`backup::GitRepoBackup::store_tier`]) — composes with the storage framework, does
+/// not fork it. Reuses the GT-001 durable store + the validated path resolver (no traversal bypass).
+pub mod backup;
 /// The **git `PersonalDataHolder` H1 BODY: the DSR fan-out + history-rewrite erasure semantics**
 /// (GIT-P29 / P-290, M3-G7 — GIT-D2 complete). [`holder::GitPersonalDataHolder`] is the real
 /// `locate/export/rectify/restrict/erase` over git + metadata (contract 10.1/10.4), completing the H1

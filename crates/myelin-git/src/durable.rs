@@ -117,6 +117,7 @@ pub struct DurableReflogEntry {
 /// path; every op opens the repo via `git2` (the same per-call open the read backend [`GixCore`] uses
 /// — libgit2 caches the odb/refdb, and this keeps the handle `Send`-cheap with no long-lived FFI
 /// borrow). Refs, reflog, and objects all live ON DISK and survive a process restart.
+#[derive(Debug)]
 pub struct DurableGitRepo {
     /// the bare repo's on-disk path (`…/<repo>.git`).
     path: PathBuf,
