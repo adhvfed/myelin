@@ -336,3 +336,16 @@ green: pg connect, s3 put/get, rebac tuples, outbox→bus relay, valkey cache):
   before mount (symlink_metadata/canonicalize; gated by a prior host-fs breach); (2) **the writable quarantine
   is EINVAL under rootless runsc — the receive-pack/push intake path is a real CT-006b problem** (CT-006a proved
   only the read/upload-pack path). Needs a git-bearing rootfs (MYELIN_GVISOR_GIT_ROOTFS).
+
+- **CT-006b — production WireExecutor + GitCore wiring — COMMITTED 2ce5742.** myelin-edge::GitWireExecutor impls
+  myelin_git WireExecutor (maps WireInvocation→GitWireSpec→launch_git_wire; non-zero exit/timeout→GitCoreError);
+  DurableGitBackend::wire_serving() builds RoutedGitCore<GitWireExecutor,GixCore>; edge→ci-sandbox dep added
+  (acyclic). CLONE/FETCH PROVEN end-to-end through the production GitCore seam (real runsc): advertise_refs +
+  serve(UploadPack)→a packfile git index-pack/verify-pack accept. Folded the two CT-006a follow-ups:
+  assert_repo_under_root (symlinked-repo-path refused pre-mount) + a committed validator-drift-pin test (replica
+  vs myelin_git original, both-arms corpus). Independent verifier: PASS-with-FOLLOWUP — large-pack truncation at
+  the 256 KiB cap is LOUD (git index-pack → fatal: early EOF; no silent corruption). **But the wire is unusable
+  for real-size repos until the cap is lifted → CT-006c must stream/raise the wire stdout bound + propagate the
+  truncated flag→GitCoreError (fail loud at the seam).** Remaining git-wire work SPLIT: CT-006c (read side —
+  stdout streaming + HTTP upload-pack server + external-oracle clone/fetch) · CT-006d (write side — rootless
+  writable quarantine + receive-pack policy + one-tx ref-CAS/outbox + external-oracle push; + FU-2 symlink/TOCTOU).
