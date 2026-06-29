@@ -349,3 +349,17 @@ green: pg connect, s3 put/get, rebac tuples, outbox→bus relay, valkey cache):
   truncated flag→GitCoreError (fail loud at the seam).** Remaining git-wire work SPLIT: CT-006c (read side —
   stdout streaming + HTTP upload-pack server + external-oracle clone/fetch) · CT-006d (write side — rootless
   writable quarantine + receive-pack policy + one-tx ref-CAS/outbox + external-oracle push; + FU-2 symlink/TOCTOU).
+
+- **CT-006c — git smart-HTTP server (upload-pack) + wire stdout streaming — COMMITTED 1fe630d. REAL `git clone`
+    WORKS.** Fixed the CT-006b 256 KiB-cap blocker: the git-wire path streams stdout to a host temp file
+  (RAM bounded to one 64 KiB chunk) under a disk_bytes-derived 512 MiB cap; over-cap → GitCoreError (fail loud,
+  no silent short pack); CI/agent logs keep the 256 KiB bound. HTTP endpoints (info/refs?upload-pack + POST
+  git-upload-pack) over the edge gateway; receive-pack → 403 (CT-006d). External-oracle: a stock host `git`
+  clones a >256 KiB-pack repo over smart-HTTP through the sandbox, fsck clean, HEAD==origin; fetch picks up a
+  new commit; no-token + cross-tenant clones refused. Independent security verifier: PASS — cross-tenant/IDOR
+  no-oracle (byte-identical 403s), region-from-token (GIT-D8), real PASETO auth, large-pack COMPLETENESS
+  (rev-list set-identical, not just fsck), over-cap loud, URL-encoded slug traversal refused, receive-pack 403,
+  escapes 0. **FOLLOW-UP (platform-wide, task #60, NOT a wire regression): per-repo object-level authz is
+  structurally absent — the Authorizer seam is (principal,action) only, repo-blind, so intra-tenant any token
+  reads any repo (same as the durable read handlers; Identity-M1 ReBAC deferral). Cross-tenant isolation IS
+  enforced.** Final git-wire prompt = CT-006d (the push path).
