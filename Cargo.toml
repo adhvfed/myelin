@@ -250,6 +250,15 @@ members = [
     # myelin-edge it is NOT a node in the eleven-crate library DAG modelled by crate_graph.rs
     # (substrate_is_root()/identity_is_sink() unaffected). See crates/myelin-cli/src/lib.rs.
     "crates/myelin-cli",
+    # The myelin-mcp MCP server (E0.9 / MR-021): the JSON-RPC-2.0-over-stdio surface a LOCAL Claude
+    # drives Myelin through as native MCP tools, under the SAME governance a human is. The MR-006
+    # binding: every tools/call routes through mint_run_token -> EffectApi::apply (the platform-owned
+    # governance chokepoint), never a bare PAT or a direct mutation. A LEAF BINARY like myelin-cli /
+    # myelin-edge: it REUSES git's agent_tools() catalogue + the EffectApi governance contract + the
+    # RunTokenMinter, and NOTHING in the production DAG depends back on it (NOT a node in the
+    # eleven-crate library DAG modelled by crate_graph.rs; substrate_is_root()/identity_is_sink()
+    # unaffected). See crates/myelin-mcp/src/lib.rs.
+    "crates/myelin-mcp",
 ]
 
 # Workspace-wide dependency versions. Pinned once here so every glue crate shares

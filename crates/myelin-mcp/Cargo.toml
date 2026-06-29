@@ -1,0 +1,63 @@
+[package]
+name = "myelin-mcp"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The `myelin-mcp` MCP server (E0.9 / MR-021): the JSON-RPC-2.0-over-stdio surface a LOCAL Claude
+# (Claude Code on the operator's machine) drives Myelin through as native MCP tools — under the SAME
+# governance a human is. It is the near-term answer to "agents, but not hosted yet": agent
+# GOVERNANCE (who/what did what, with what authority) is real from day one, even though agent
+# HOSTING (the real LlmAgentRuntime) stays deferred. The MR-006 binding: every `tools/call` routes
+# through `mint_run_token → EffectApi::apply` (the platform-owned governance chokepoint), NOT a bare
+# human PAT and NOT a direct mutation.
+#
+# A LEAF BINARY (like myelin-cli / myelin-edge): it depends on the subsystem tool catalogue
+# (myelin-git `api::agent_tools`), the agent-fabric governance contract (myelin-agent `EffectApi` /
+# `RunCtx` / `ProposedEffect`), and the per-run token minter (myelin-identity-service
+# `RunTokenMinter::mint_run_token`). NOTHING in the production crate DAG depends back on it; it is NOT
+# a node in the eleven-crate library DAG modelled by myelin-substrate::crate_graph
+# (substrate_is_root()/identity_is_sink() unaffected — an MCP server is a terminal consumer).
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "myelin-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# REUSE git's frozen agent-tool catalogue (`api::agent_tools` / `AgentToolDef` — the MCP tool shape:
+# name + frozen `requires_approval` + the already-built handler). A NEW git tool added to
+# `agent_tools()` flows to the MCP server with NO re-declaration here (the tool-registration
+# convention). The MCP surface is a thin projection of this catalogue.
+myelin-git = { path = "../myelin-git" }
+
+# REUSE the agent-fabric governance contract surface (the BRAIN-AGNOSTIC chokepoint): `EffectApi`
+# (PLAN-THEN-APPLY, §8.2) + `RunCtx` / `ProposedEffect` / `EffectResult`. The MCP server routes every
+# tool's effect through `EffectApi::apply` under a per-run `RunCtx` — it never re-implements the
+# pipeline and never mutates directly. The concrete `EffectApi` body (the eight-step PlanThenApply)
+# is injected by the composition root (myelin-agent-service); here we route through the trait.
+myelin-agent = { path = "../myelin-agent" }
+
+# REUSE the per-run attenuated token minter (`RunTokenMinter::mint_run_token`, MR-011-real): a
+# `tools/call` mints a per-run capability token and acts under it (consulting durable revocation
+# before apply). The MCP server never re-implements token minting.
+myelin-identity-service = { path = "../myelin-identity-service" }
+
+# The frozen identity value types the mint + the RunCtx attribution key on: PrincipalId / Principal /
+# RunId / RunToken / FailStaticBound / DelegationCaveats.
+myelin-identity = { path = "../myelin-identity" }
+# TenantId / Region — the verified `(tenant, region)` scope the run token is minted under.
+myelin-tenancy = { path = "../myelin-tenancy" }
+# TenantScope (the verified scope the mint registers the per-run TTL in).
+myelin-storage = { path = "../myelin-storage" }
+# Timestamp — the RFC-3339 mint instant + revocation-consult `now`.
+myelin-events = { path = "../myelin-events" }
+
+# The JSON-RPC 2.0 envelopes + the MCP message bodies are serde_json::Value (the ONE workspace-pinned
+# JSON shape — the same convention myelin-edge / myelin-cli use). MCP is JSON-RPC 2.0 over stdio;
+# there is NO MCP/rmcp SDK in Cargo.lock, so the protocol is HAND-BUILT on serde_json (minimal-deps
+# ethos — do not pull an unvetted MCP SDK).
+serde_json = { workspace = true }

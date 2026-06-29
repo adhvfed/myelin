@@ -2739,6 +2739,20 @@ name = "myelin-lints"
 version = "0.0.0"
 
 [[package]]
+name = "myelin-mcp"
+version = "0.0.0"
+dependencies = [
+ "myelin-agent",
+ "myelin-events",
+ "myelin-git",
+ "myelin-identity",
+ "myelin-identity-service",
+ "myelin-storage",
+ "myelin-tenancy",
+ "serde_json",
+]
+
+[[package]]
 name = "myelin-notif"
 version = "0.0.0"
 dependencies = [
