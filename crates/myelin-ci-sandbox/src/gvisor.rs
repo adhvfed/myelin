@@ -39,7 +39,7 @@ use crate::{
     ResourceLimits, ResourceUsage, RunTokenRef, RunnerHooks, SandboxBackend, SandboxHandle,
     SandboxLaunch, SandboxResult, TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
 };
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -613,6 +613,7 @@ fn run_production_container(spec: &JobSpec, cfg: &OciConfig) -> Result<Container
         timeout,
         spec.limits.mem_bytes,
         None, // CI/agent jobs receive no stdin (the git-wire path supplies the request body).
+        StdoutMode::CappedHead, // CI/agent logs: the byte-unchanged 256 KiB head capture.
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -705,9 +706,16 @@ struct RunscOutcome {
     exit: Option<i32>,
     /// True iff the wall-clock `timeout_secs` ceiling fired and the whole container was killed.
     timed_out: bool,
-    /// The container's REAL piped stdout (the runtime's fd, not in-container framing).
+    /// The container's REAL piped stdout (the runtime's fd, not in-container framing). Bounded by the
+    /// stream's [`StdoutMode`] (the 256 KiB head bound for CI/agent logs; the GENEROUS git-wire cap,
+    /// disk-streamed, for the wire path).
     stdout: Vec<u8>,
-    /// The container's REAL piped stderr.
+    /// True iff the stdout stream exceeded its [`StdoutMode`] bound (head-truncated). For the CI/agent
+    /// path this is benign (logs are head-captured by design); for the git-wire path it is FATAL — a
+    /// truncated packfile fails the client's `index-pack` with "early EOF", so the wire seam REFUSES it
+    /// loudly (never returns a silently-truncated pack). See [`run_git_wire_container`].
+    stdout_truncated: bool,
+    /// The container's REAL piped stderr (always 256 KiB head-bounded — it is error text, not payload).
     stderr: Vec<u8>,
     /// Wall-clock duration the container ran.
     wall: Duration,
@@ -729,6 +737,7 @@ fn run_and_capture(
     timeout: Duration,
     mem_bytes: u64,
     stdin: Option<Vec<u8>>,
+    stdout_mode: StdoutMode,
 ) -> Result<RunscOutcome, String> {
     // CT-003b (SI-017): establish the OUT-OF-BAND memory cgroup BEFORE spawning runsc and FAIL
     // CLOSED if it cannot be established (rootless runsc would otherwise run the workload's anonymous
@@ -774,10 +783,19 @@ fn run_and_capture(
     // Drain both pipes on threads so a chatty container cannot fill a pipe buffer and deadlock.
     let mut out = child.stdout.take().expect("piped stdout");
     let mut err = child.stderr.take().expect("piped stderr");
-    // CT-002c: cap each stream at SANDBOX_CAPTURE_BOUND (head capture) and DISCARD the rest to EOF —
-    // bounds host memory under a runaway container while still draining the pipe so the container
-    // never blocks on a full pipe (no deadlock that would defeat the timeout).
-    let th_out = std::thread::spawn(move || drain_capped(&mut out, SANDBOX_CAPTURE_BOUND).0);
+    // stdout draining depends on the stream's mode (CT-006c):
+    //   - `CappedHead` (CI/agent logs): cap at SANDBOX_CAPTURE_BOUND (256 KiB head capture) + DISCARD the
+    //     rest to EOF — bounds host memory under a runaway container, byte-unchanged from CT-002c.
+    //   - `StreamToFile` (the git wire): stream straight to a host TEMP FILE under a GENEROUS cap so a
+    //     real-size packfile (megabytes, not 256 KiB) comes through WHOLE while host RAM stays one chunk
+    //     (the bytes land on disk, not in a growing Vec). Over the generous cap ⇒ `truncated` (the wire
+    //     seam then REFUSES loudly — never a silently-truncated pack). Both keep reading past the bound
+    //     so the container never blocks on a full pipe (no deadlock that would defeat the timeout).
+    let th_out = std::thread::spawn(move || match stdout_mode {
+        StdoutMode::CappedHead => drain_capped(&mut out, SANDBOX_CAPTURE_BOUND),
+        StdoutMode::StreamToFile { bound } => drain_to_temp_file(&mut out, bound),
+    });
+    // stderr is ALWAYS the 256 KiB head bound — it is error text folded into a message, never payload.
     let th_err = std::thread::spawn(move || drain_capped(&mut err, SANDBOX_CAPTURE_BOUND).0);
 
     let mut timed_out = false;
@@ -808,7 +826,7 @@ fn run_and_capture(
     let wall = start.elapsed();
 
     // The child has exited/been-killed ⇒ the pipes hit EOF ⇒ the drain threads finish.
-    let stdout = th_out.join().unwrap_or_default();
+    let (stdout, stdout_truncated) = th_out.join().unwrap_or_default();
     let stderr = th_err.join().unwrap_or_default();
     // The writer thread has finished (the child read its request body, or it exited and the write
     // EPIPE'd — either way `write_all` returned). Join so no thread outlives the run.
@@ -824,10 +842,92 @@ fn run_and_capture(
         exit,
         timed_out,
         stdout,
+        stdout_truncated,
         stderr,
         wall,
         cpu_seconds: last_cpu,
     })
+}
+
+/// How the container's stdout is drained (CT-006c). The non-wire (CI/agent) path keeps the byte-unchanged
+/// 256 KiB head capture; the git-wire path streams to a host temp file under a generous cap so a
+/// real-size packfile survives whole while host RAM stays bounded to one chunk.
+enum StdoutMode {
+    /// CI/agent logs: head-capture the first [`SANDBOX_CAPTURE_BOUND`] bytes in RAM, discard the rest.
+    CappedHead,
+    /// The git wire: stream straight to a host temp file under `bound` bytes (host RAM stays one 64 KiB
+    /// chunk regardless of pack size), then materialize back. Over `bound` ⇒ the returned `truncated`
+    /// flag is set and the wire seam refuses loudly.
+    StreamToFile { bound: usize },
+}
+
+/// **Drain a child stream straight to a host TEMP FILE under a generous byte cap (the git-wire path,
+/// CT-006c).** Host MEMORY stays bounded to ONE 64 KiB chunk regardless of how large the packfile is —
+/// the bytes are written to disk as they arrive, NOT buffered in a growing Vec. Keeps reading past the
+/// cap (draining + discarding) so the container never blocks on a full pipe (no deadlock that would
+/// defeat the timeout). Returns the materialized head (≤ `cap` bytes, read back from the temp file) and
+/// whether the cap was exceeded (`truncated`). The temp file is removed before returning (no leak).
+///
+/// NOTE (future, documented): materializing back into a `Vec` still costs `min(pack, cap)` host RAM at
+/// the end — true end-to-end streaming would need a `WireOutput`/`SandboxResult` streaming-body API
+/// change. For CT-006c, disk-staging the drain (so RAM is bounded DURING the run) + a generous cap is
+/// sufficient: real-size clones come through whole, and an over-cap response fails loud rather than
+/// returning a truncated pack.
+fn drain_to_temp_file<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
+    let path = std::env::temp_dir().join(format!(
+        "myelin-gitwire-stdout-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let mut file = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        // If we cannot stage to disk, fall back to the in-RAM capped drain under the SAME generous cap
+        // (still bounded, still reports truncation) rather than losing the deadlock-free pipe drain.
+        Err(_) => return drain_capped(&mut r, cap),
+    };
+    let mut written: usize = 0;
+    let mut truncated = false;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => break, // EOF: the guest pipe closed (child exited / whole-container-killed).
+            Ok(n) => {
+                if written < cap {
+                    let take = (cap - written).min(n);
+                    if file.write_all(&chunk[..take]).is_err() {
+                        // A disk write error ⇒ stop staging but KEEP draining to EOF (no pipe-fill
+                        // deadlock); treat as truncated so the wire seam refuses rather than serving a
+                        // short pack.
+                        truncated = true;
+                        written = cap;
+                    } else {
+                        written += take;
+                        if take < n {
+                            truncated = true; // overflowed the cap this read
+                        }
+                    }
+                } else {
+                    truncated = true; // already at the cap: drain + discard the remainder
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break, // pipe error ⇒ end-of-stream; the wait/kill loop owns lifecycle.
+        }
+    }
+    let _ = file.flush();
+    drop(file);
+    // Read the staged bytes back (≤ cap). A read-back failure is treated as truncated (fail-closed:
+    // the wire seam refuses rather than serving a short/empty pack).
+    let head = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            truncated = true;
+            Vec::new()
+        }
+    };
+    let _ = std::fs::remove_file(&path);
+    (head, truncated)
 }
 
 /// Build the [`SandboxResult`] from the runtime outcome. The exit code is the `runsc` child's REAL
@@ -838,10 +938,12 @@ fn run_and_capture(
 /// CPU-seconds of the `runsc` process (or a wall-clock ceiling fallback so a real run never
 /// under-meters to 0) + mem-byte-seconds from the job's mem ceiling × wall-seconds.
 fn build_result(spec: &JobSpec, o: &RunscOutcome) -> SandboxResult {
-    let mut stdout = o.stdout.clone();
-    if stdout.len() > SANDBOX_CAPTURE_BOUND {
-        stdout.truncate(SANDBOX_CAPTURE_BOUND); // HEAD capture (documented; full stream → firehose)
-    }
+    // The drain threads ALREADY applied the correct per-stream bound ([`run_and_capture`]): stdout is
+    // bounded by its [`StdoutMode`] (256 KiB head for CI/agent; the generous git-wire cap, disk-staged),
+    // stderr by [`SANDBOX_CAPTURE_BOUND`]. Re-truncating stdout to 256 KiB HERE would corrupt a real-size
+    // wire packfile (CT-006c FU-1 — the original silent-truncation defect), so the already-bounded bytes
+    // pass through unchanged. stderr is belt-and-braces clamped (it is already ≤ the bound).
+    let stdout = o.stdout.clone();
     let mut stderr = o.stderr.clone();
     if stderr.len() > SANDBOX_CAPTURE_BOUND {
         stderr.truncate(SANDBOX_CAPTURE_BOUND);
@@ -1077,6 +1179,17 @@ pub const WIRE_QUARANTINE_MOUNT: &str = "/quarantine";
 /// host to buffer an unbounded request). CT-006b may revisit this for very large pushes (chunked
 /// intake); for CT-006a it bounds the negotiation/advertise request bodies with margin to spare.
 pub const WIRE_STDIN_BOUND: usize = 64 * 1024 * 1024;
+/// The DEFAULT generous cap on the git-wire RESPONSE (the upload-pack packfile / advertisement) the
+/// container streams to stdout — 512 MiB, matching the serving tier's default `disk_bytes` scratch
+/// quota. UNLIKE the 256 KiB [`SANDBOX_CAPTURE_BOUND`] used for CI/agent logs, the wire response is a
+/// real packfile (megabytes for a real repo), so it gets this large bound — STREAMED to a host temp
+/// file ([`drain_to_temp_file`]) so host RAM stays bounded to one chunk during the run. The LIVE cap is
+/// derived per-launch from `spec.limits.disk_bytes` (so it is configurable via [`ResourceLimits`]); this
+/// const documents the default. A response that exceeds the live cap is REFUSED loudly at the wire seam
+/// ([`WireError::OutputTooLarge`]) — never a silently-truncated pack (which would fail the client's
+/// `index-pack` with "early EOF"). True end-to-end streaming (no materialization) is a future
+/// `WireOutput` streaming-body API change.
+pub const WIRE_STDOUT_BOUND: usize = 512 * 1024 * 1024;
 /// Env var naming a staged rootfs that CONTAINS `git` (busybox-class rootfs + `git` + its `git-core`
 /// helpers + the shared-lib closure). Defaults to `~/.local/share/gvisor-assets/git-rootfs`. The git
 /// wire REQUIRES a real `git` in the guest — see the staging recipe in `tests/git_wire_prod_exec_test.rs`.
@@ -1111,6 +1224,13 @@ pub enum WireError {
         /// The cap it breached.
         cap: usize,
     },
+    /// The wire RESPONSE (upload-pack packfile / advertisement) exceeded the generous wire cap (derived
+    /// from `disk_bytes`, default [`WIRE_STDOUT_BOUND`]) — REFUSED fail-LOUD rather than returning a
+    /// silently-truncated pack (a truncated pack fails the client's `index-pack` with "early EOF").
+    OutputTooLarge {
+        /// The cap it breached (bytes).
+        cap: usize,
+    },
     /// The mandatory hardening profile could not be asserted in force (fail-closed).
     Hardening(String),
     /// A four-guarantee hook failed (cost-exhausted / token-rejected / isolation-floor-not-met).
@@ -1126,6 +1246,11 @@ impl std::fmt::Display for WireError {
             WireError::StdinTooLarge { len, cap } => write!(
                 f,
                 "git-wire: request body {len} bytes exceeds the {cap}-byte cap (refused fail-closed)"
+            ),
+            WireError::OutputTooLarge { cap } => write!(
+                f,
+                "git-wire: upload-pack response exceeded the {cap}-byte wire cap — refusing a TRUNCATED \
+                 pack (a short packfile fails the client's `index-pack` with 'early EOF'); fail-loud"
             ),
             WireError::Hardening(s) => write!(f, "git-wire: hardening not enforced: {s}"),
             WireError::Hook(e) => write!(f, "git-wire: guarantee hook failed: {e}"),
@@ -1411,12 +1536,26 @@ impl GvisorBackend {
             .with_extra_mounts(mounts)
             .with_root_path(root_abs);
 
-        let ContainerRun {
-            child,
-            bundle_dir,
-            result,
-        } = run_git_wire_container(&job, &cfg, spec.stdin.clone(), &rootfs)
+        let (
+            ContainerRun {
+                child,
+                bundle_dir,
+                result,
+            },
+            stdout_truncated,
+        ) = run_git_wire_container(&job, &cfg, spec.stdin.clone(), &rootfs)
             .map_err(WireError::Runtime)?;
+
+        // FAIL LOUD at the seam (CT-006c FU-1): if the response overflowed the generous wire cap, the
+        // captured pack is TRUNCATED — refuse rather than hand back a short pack the client's
+        // `index-pack` would reject with "early EOF". Tear down the just-run container's bundle (the
+        // container itself is already deleted by `run_git_wire_container`).
+        if stdout_truncated {
+            let _ = std::fs::remove_dir_all(&bundle_dir);
+            return Err(WireError::OutputTooLarge {
+                cap: job.limits.disk_bytes as usize,
+            });
+        }
 
         let guest_id = format!("runsc-gitwire-{}", job.idem_token.0);
         self.live
@@ -1443,7 +1582,7 @@ fn run_git_wire_container(
     cfg: &OciConfig,
     stdin: Vec<u8>,
     rootfs: &Path,
-) -> Result<ContainerRun, String> {
+) -> Result<(ContainerRun, bool), String> {
     let bin = runsc_bin();
     if !rootfs.exists() {
         return Err(format!(
@@ -1460,6 +1599,12 @@ fn run_git_wire_container(
     let container_id = format!("myelin-gitwire-{}-{}", std::process::id(), unique_suffix());
 
     let timeout = Duration::from_secs(job.limits.timeout_secs as u64);
+    // The git-wire response (the packfile / advertisement) is STREAMED to a host temp file under a
+    // GENEROUS cap derived from the job's `disk_bytes` scratch quota (configurable; default
+    // [`WIRE_STDOUT_BOUND`] = 512 MiB) — NOT the 256 KiB CI/agent log bound — so a real-size pack comes
+    // through whole while host RAM stays bounded to one chunk. Over the cap ⇒ `outcome.stdout_truncated`,
+    // which the caller turns into a LOUD [`WireError::OutputTooLarge`] (never a silently-short pack).
+    let wire_cap = job.limits.disk_bytes as usize;
     let outcome = match run_and_capture(
         &bin,
         &bundle_dir,
@@ -1467,6 +1612,7 @@ fn run_git_wire_container(
         timeout,
         job.limits.mem_bytes,
         Some(stdin),
+        StdoutMode::StreamToFile { bound: wire_cap },
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -1477,12 +1623,16 @@ fn run_git_wire_container(
     };
     delete_container(&bin, &container_id);
 
+    let stdout_truncated = outcome.stdout_truncated;
     let result = build_result(job, &outcome);
-    Ok(ContainerRun {
-        child: Box::new(SpawnedRunsc { bin, container_id }),
-        bundle_dir,
-        result,
-    })
+    Ok((
+        ContainerRun {
+            child: Box::new(SpawnedRunsc { bin, container_id }),
+            bundle_dir,
+            result,
+        },
+        stdout_truncated,
+    ))
 }
 
 /// Stage a CONFIG-ONLY OCI bundle (just `config.json`) for the git wire — the rootfs is referenced by
@@ -1562,6 +1712,25 @@ mod tests {
                 mem_byte_seconds: 1,
             }),
         }
+    }
+
+    /// CT-006c (the streaming fix): the git-wire stdout drain stages straight to a host temp file under
+    /// a generous cap with host memory bounded to one chunk. A response WITHIN the cap comes through
+    /// WHOLE (no 256 KiB truncation); a response OVER the cap is head-bounded AND flagged `truncated`
+    /// (which the wire seam turns into a LOUD `WireError::OutputTooLarge` — never a silent short pack).
+    #[test]
+    fn drain_to_temp_file_streams_whole_under_cap_and_flags_over_cap() {
+        // A 1 MiB stream (FAR past the 256 KiB SANDBOX_CAPTURE_BOUND) under a 4 MiB cap → WHOLE, untruncated.
+        let big = vec![0xABu8; 1024 * 1024];
+        let (out, truncated) = drain_to_temp_file(&big[..], 4 * 1024 * 1024);
+        assert_eq!(out.len(), big.len(), "a real-size pack under the cap comes through WHOLE");
+        assert_eq!(out, big, "the bytes are byte-identical (no corruption via the temp file)");
+        assert!(!truncated, "within the cap ⇒ not truncated");
+
+        // The SAME stream under a 64 KiB cap → head-bounded to the cap AND flagged truncated (fail-loud).
+        let (head, over) = drain_to_temp_file(&big[..], 64 * 1024);
+        assert_eq!(head.len(), 64 * 1024, "over the cap ⇒ exactly the cap bytes are kept");
+        assert!(over, "over the cap ⇒ truncated flag set (the wire seam then refuses loudly)");
     }
 
     #[test]
