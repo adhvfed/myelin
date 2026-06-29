@@ -146,7 +146,7 @@ impl DurableGitBackend {
 
     /// Create a bare repo on disk under the verified `(tenant, region)`. Returns `true` iff newly created
     /// (an existing repo is a conflict the handler surfaces as `409`). Traversal-safe via the resolver.
-    fn create_repo(&self, tenant: &str, region: &str, slug: &str) -> Result<bool, DurableError> {
+    pub fn create_repo(&self, tenant: &str, region: &str, slug: &str) -> Result<bool, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         if self.store.repo_exists(&loc) {
             return Ok(false);
@@ -371,6 +371,18 @@ impl DurableGitBackend {
 
     // ── PR lifecycle (durable) ──
 
+    /// Read a durable PR record back (the fresh-read proof a write persisted). `None` if absent under
+    /// the verified `(tenant, region)`. Tenant-scoped via the validated resolver.
+    pub fn get_pr(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        number: u64,
+    ) -> Result<Option<PrRecord>, DurableError> {
+        self.prs.get(&Self::loc(tenant, region, slug), number)
+    }
+
     fn next_pr_number(&self, loc: &RepoLoc) -> u64 {
         self.prs
             .list(loc)
@@ -378,7 +390,7 @@ impl DurableGitBackend {
             .unwrap_or(1)
     }
 
-    fn open_pr(
+    pub fn open_pr(
         &self,
         tenant: &str,
         region: &str,
@@ -425,7 +437,7 @@ impl DurableGitBackend {
     /// enforces live HERE, never in author input. The edge gates this behind the distinct
     /// `git.repo.branch_protection.set` authorize action (the production authorizer resolves
     /// `Id.check(repo_admin)`); the durable config is path-isolated via the validated resolver.
-    fn set_branch_protection(
+    pub fn set_branch_protection(
         &self,
         tenant: &str,
         region: &str,
@@ -479,7 +491,7 @@ impl DurableGitBackend {
     /// facts on a PR for its head (the real CI producer is M4; the PR AUTHOR cannot call this — the edge
     /// gates the distinct `git.checks.report` action). The facts the merge gate reads come from HERE,
     /// never from the PR-open body.
-    fn report_checks(
+    pub fn report_checks(
         &self,
         tenant: &str,
         region: &str,
@@ -509,7 +521,7 @@ impl DurableGitBackend {
         Ok(rec)
     }
 
-    fn submit_review(
+    pub fn submit_review(
         &self,
         tenant: &str,
         region: &str,
@@ -538,7 +550,7 @@ impl DurableGitBackend {
         Ok(rec)
     }
 
-    fn endorse_fork_ci(
+    pub fn endorse_fork_ci(
         &self,
         tenant: &str,
         region: &str,
@@ -567,7 +579,7 @@ impl DurableGitBackend {
         Ok(rec)
     }
 
-    fn merge(
+    pub fn merge(
         &self,
         tenant: &str,
         region: &str,

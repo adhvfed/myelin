@@ -61,3 +61,11 @@ myelin-events = { path = "../myelin-events" }
 # there is NO MCP/rmcp SDK in Cargo.lock, so the protocol is HAND-BUILT on serde_json (minimal-deps
 # ethos — do not pull an unvetted MCP SDK).
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# GT-005 integration: bind the concrete git `EffectApi` body (`myelin_edge::GitEffectApi`) to the
+# DURABLE GT-003 backend (`DurableGitBackend`) and inject it into the GovernedRouter — proving a
+# governed `tools/call` (mint_run_token → EffectApi::apply) lands the real durable git effect and
+# reflects the server-side merge gate. A dev-dependency only (the protocol shell never depends on the
+# edge in production; the composition root injects the body).
+myelin-edge = { path = "../myelin-edge" }

@@ -45,6 +45,12 @@ myelin-tenancy = { path = "../myelin-tenancy" }
 # by `crate_graph.rs`; `substrate_is_root()`/`identity_is_sink()` are unaffected). The subsystem never
 # depends on its transport — the edge knows about Git, Git does not know about the edge.
 myelin-git = { path = "../myelin-git" }
+# GT-005: the BRAIN-AGNOSTIC PLAN-THEN-APPLY chokepoint (`EffectApi` / `RunCtx` / `ProposedEffect` /
+# `EffectResult`, §8.2). The edge is the composition point that binds a concrete `EffectApi` body to the
+# durable git backend, so a governed MCP `tools/call` (mint_run_token → EffectApi::apply, MR-021) lands
+# the real GT-003 git effect under the run's verified scope + the server-side merge gate. Value types
+# only — no agent runtime / no LLM (the `no-llm-in-platform` ratchet is unaffected).
+myelin-agent = { path = "../myelin-agent" }
 # GT-003: the durable git write path co-commits its `git.ref.updated` through the frozen
 # `myelin_events::OutboxStore` (the same emit-iff-committed substrate the receive-pack path uses) — the
 # edge composes `RefStore::open_durable` + the outbox + the id minter to make API writes persist.

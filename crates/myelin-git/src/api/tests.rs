@@ -91,30 +91,57 @@ fn cli_parses_the_arch_section_3_2_verbs() {
         }
     );
     assert_eq!(
-        parse_cli(&["pr", "view", "42"]).unwrap(),
-        CliCommand::PrView { number: 42 }
+        parse_cli(&["repo", "create", "alpha"]).unwrap(),
+        CliCommand::RepoCreate {
+            slug: "alpha".into()
+        }
     );
     assert_eq!(
-        parse_cli(&["pr", "checks", "42"]).unwrap(),
-        CliCommand::PrChecks { number: 42 }
+        parse_cli(&["pr", "open", "core", "--head-oid", "abc", "--draft"]).unwrap(),
+        CliCommand::PrOpen {
+            repo: "core".into(),
+            base_ref: None,
+            head_ref: None,
+            head_oid: Some("abc".into()),
+            draft: true,
+        }
     );
     assert_eq!(
-        parse_cli(&["pr", "review", "42", "--approve"]).unwrap(),
+        parse_cli(&["pr", "view", "core", "42"]).unwrap(),
+        CliCommand::PrView {
+            repo: "core".into(),
+            number: 42
+        }
+    );
+    assert_eq!(
+        parse_cli(&["pr", "checks", "core", "42"]).unwrap(),
+        CliCommand::PrChecks {
+            repo: "core".into(),
+            number: 42
+        }
+    );
+    assert_eq!(
+        parse_cli(&["pr", "review", "core", "42", "--approve"]).unwrap(),
         CliCommand::PrReview {
+            repo: "core".into(),
             number: 42,
             verdict: "approve".into()
         }
     );
     assert_eq!(
-        parse_cli(&["pr", "merge", "42", "--auto"]).unwrap(),
+        parse_cli(&["pr", "merge", "core", "42", "--auto"]).unwrap(),
         CliCommand::PrMerge {
+            repo: "core".into(),
             number: 42,
             auto: true
         }
     );
     assert_eq!(
-        parse_cli(&["pr", "endorse-fork-ci", "42"]).unwrap(),
-        CliCommand::PrEndorseForkCi { number: 42 }
+        parse_cli(&["pr", "endorse-fork-ci", "core", "42"]).unwrap(),
+        CliCommand::PrEndorseForkCi {
+            repo: "core".into(),
+            number: 42
+        }
     );
     assert_eq!(
         parse_cli(&["search", "code", "needle", "--repo", "core"]).unwrap(),
@@ -130,11 +157,16 @@ fn cli_each_verb_lowers_to_an_existing_handler() {
     // No new handler — every CLI verb maps to an already-built module.
     assert_eq!(CliCommand::RepoList.handler(), Handler::ListFilter);
     assert_eq!(
-        CliCommand::PrChecks { number: 1 }.handler(),
+        CliCommand::PrChecks {
+            repo: "r".into(),
+            number: 1
+        }
+        .handler(),
         Handler::CheckStatus
     );
     assert_eq!(
         CliCommand::PrMerge {
+            repo: "r".into(),
             number: 1,
             auto: false
         }
@@ -142,7 +174,11 @@ fn cli_each_verb_lowers_to_an_existing_handler() {
         Handler::MergeGate
     );
     assert_eq!(
-        CliCommand::PrEndorseForkCi { number: 1 }.handler(),
+        CliCommand::PrEndorseForkCi {
+            repo: "r".into(),
+            number: 1
+        }
+        .handler(),
         Handler::ForkEndorse
     );
     assert_eq!(
@@ -158,19 +194,38 @@ fn cli_each_verb_lowers_to_an_existing_handler() {
 #[test]
 fn cli_write_commands_are_classified_for_the_bus2_gate() {
     assert!(CliCommand::PrMerge {
+        repo: "r".into(),
         number: 1,
         auto: false
     }
     .is_write());
     assert!(CliCommand::PrReview {
+        repo: "r".into(),
         number: 1,
         verdict: "approve".into()
     }
     .is_write());
-    assert!(CliCommand::PrEndorseForkCi { number: 1 }.is_write());
+    assert!(CliCommand::PrEndorseForkCi {
+        repo: "r".into(),
+        number: 1
+    }
+    .is_write());
+    assert!(CliCommand::RepoCreate { slug: "r".into() }.is_write());
+    assert!(CliCommand::PrOpen {
+        repo: "r".into(),
+        base_ref: None,
+        head_ref: None,
+        head_oid: None,
+        draft: false
+    }
+    .is_write());
     // Reads are not writes.
     assert!(!CliCommand::RepoList.is_write());
-    assert!(!CliCommand::PrChecks { number: 1 }.is_write());
+    assert!(!CliCommand::PrChecks {
+        repo: "r".into(),
+        number: 1
+    }
+    .is_write());
 }
 
 #[test]
@@ -189,11 +244,17 @@ fn cli_is_loud_on_unknown_and_missing() {
         Err(CliParseError::MissingArg { .. })
     ));
     assert!(matches!(
-        parse_cli(&["pr", "view", "notanum"]),
+        parse_cli(&["pr", "view", "core", "notanum"]),
         Err(CliParseError::BadArg { .. })
     ));
+    // `pr view <repo>` with no number is a missing-arg (the number positional is required).
     assert!(matches!(
-        parse_cli(&["pr", "review", "1"]),
+        parse_cli(&["pr", "view", "core"]),
+        Err(CliParseError::MissingArg { .. })
+    ));
+    // `pr review <repo> <n>` with no verdict flag is a missing-arg.
+    assert!(matches!(
+        parse_cli(&["pr", "review", "core", "1"]),
         Err(CliParseError::MissingArg { .. })
     ));
 }

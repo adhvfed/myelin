@@ -65,7 +65,9 @@
 //! the `StructuralVerifier` prod default entirely is MR-012.
 
 use crate::authenticate::{scheme, CredentialVerifier, VerifiedAssertion};
-use myelin_identity::{AuthzError, Credential};
+use crate::principal_store::{PrincipalError, PrincipalStore};
+use myelin_identity::{AuthzError, Credential, PrincipalId};
+use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -434,6 +436,102 @@ impl KeyBindingIndex {
     }
 }
 
+/// **The SSH key→principal binding source the verifier consults (MR-010d).** The verifier looks a
+/// presented key's fingerprint up here AFTER parsing it (an unregistered key is refused). Abstracted so
+/// the binding can be either the in-memory [`KeyBindingIndex`] (tests / a static config) OR the DURABLE
+/// PG [`PrincipalStore`] ([`PrincipalStoreKeyBindings`]) — so a registered key authenticates against the
+/// durable binding that SURVIVES RESTART, not an injected stub. The resolution is tenant-scoped: a
+/// durable resolver is bound to ONE verified `(tenant, region)` and never reaches another tenant's keys.
+pub trait KeyBindingResolver: Send + Sync {
+    /// The trust-rooted binding a registered fingerprint maps to, or `None` if the key is unregistered.
+    /// `tenant`/`region`/`subject_key` come ONLY from here — never from the credential wrapper (ID-3).
+    fn resolve(&self, fingerprint: &str) -> Option<RegisteredKey>;
+}
+
+/// The in-memory index is itself a binding source (tests / a static deployment config).
+impl KeyBindingResolver for KeyBindingIndex {
+    fn resolve(&self, fingerprint: &str) -> Option<RegisteredKey> {
+        self.get(fingerprint).cloned()
+    }
+}
+
+/// **The DURABLE SSH-key→principal binding, resolved from the S1 [`PrincipalStore`] (the MR-010d
+/// follow-up).** Replaces the injected in-memory stub: a registered SSH key resolves to its principal
+/// via [`PrincipalStore::resolve_credential`] keyed by the OpenSSH fingerprint under the `ssh` scheme,
+/// so the binding SURVIVES RESTART (it lives in the durable PG store, MR-007) instead of an in-process
+/// map. Bound to ONE verified `(tenant, region)` scope (the candidate tenant the Git smart-transport
+/// establishes — GT-006): a key registered under tenant A is invisible to a resolver scoped to tenant B
+/// (no cross-tenant key resolution).
+///
+/// **Registration** is the same durable link: [`Self::register_key`] computes the fingerprint and calls
+/// [`PrincipalStore::link_credential`] (on SSH-key add) — the SINGLE link both this resolver and
+/// `authenticate`'s downstream principal lookup key on.
+///
+/// **Boundary note (GT-006).** This is the durable key→principal BINDING + resolution. Issuing the SSH
+/// challenge ON the Git transport handshake (the live challenge-response over the wire) is the
+/// smart-transport prompt (GT-006); the cryptographic verification + freshness/replay defence in
+/// [`SshVerifier`] are unchanged.
+#[derive(Clone)]
+pub struct PrincipalStoreKeyBindings {
+    store: PrincipalStore,
+    scope: TenantScope,
+}
+
+impl PrincipalStoreKeyBindings {
+    /// Bind the resolver to the durable store + the verified `(tenant, region)` scope the keys resolve
+    /// within. The scope is the trust-rooted candidate tenant (never a path/arg).
+    pub fn new(store: PrincipalStore, scope: TenantScope) -> PrincipalStoreKeyBindings {
+        PrincipalStoreKeyBindings { store, scope }
+    }
+
+    /// **The registration path (SSH-key add).** Compute the OpenSSH fingerprint of a public-key blob and
+    /// durably link it to `principal_id` under the `ssh` scheme (the S1 SSO-link). The principal must
+    /// already exist in the scope (a dangling link is refused). Returns the fingerprint it registered.
+    pub fn register_key(
+        &self,
+        public_key_blob: &[u8],
+        principal_id: &PrincipalId,
+    ) -> Result<String, PrincipalError> {
+        let fingerprint = ssh_fingerprint(public_key_blob);
+        self.store
+            .link_credential(&self.scope, scheme::SSH, &fingerprint, principal_id)?;
+        Ok(fingerprint)
+    }
+
+    /// Register a pre-computed fingerprint → principal link (when the fingerprint is already known).
+    pub fn register_fingerprint(
+        &self,
+        fingerprint: &str,
+        principal_id: &PrincipalId,
+    ) -> Result<(), PrincipalError> {
+        self.store
+            .link_credential(&self.scope, scheme::SSH, fingerprint, principal_id)
+    }
+
+    /// The verified scope this resolver is bound to (so a caller can inspect the tenant/region floor).
+    pub fn scope(&self) -> &TenantScope {
+        &self.scope
+    }
+}
+
+impl KeyBindingResolver for PrincipalStoreKeyBindings {
+    fn resolve(&self, fingerprint: &str) -> Option<RegisteredKey> {
+        // The durable lookup: a credential link `(ssh, fingerprint) → principal` within the verified
+        // partition. The tenant/region come from the DURABLE row (the trust root), never the wrapper;
+        // a fingerprint registered under another tenant is not in this scope's partition (no
+        // cross-tenant resolution). subject_key = the fingerprint (the conventional S1 SSO-link key the
+        // downstream `authenticate` principal lookup re-resolves on).
+        let row = self
+            .store
+            .resolve_credential(&self.scope, scheme::SSH, fingerprint)?;
+        Some(RegisteredKey {
+            tenant: row.tenant,
+            region: row.region,
+            subject_key: fingerprint.to_string(),
+        })
+    }
+}
+
 // ================================================================================================
 // The challenge store — single-use, time-bounded freshness (replay defence).
 // ================================================================================================
@@ -645,15 +743,29 @@ impl SshEnvelope {
 /// seam; the [`crate::authenticate`] resolution + telemetry body does not change.
 #[derive(Clone)]
 pub struct SshVerifier {
-    registry: KeyBindingIndex,
+    registry: Arc<dyn KeyBindingResolver>,
     challenges: ChallengeGuard,
 }
 
 impl SshVerifier {
-    /// Build the verifier over an injected key registry (the S1 SSO-link binding) + challenge store
+    /// Build the verifier over an in-memory key registry (tests / a static config) + challenge store
     /// (the replay/freshness defence). Wire it as the `ssh`-scheme verifier via
     /// `SchemeDispatchVerifier::route(scheme::SSH, …)`.
     pub fn new(registry: KeyBindingIndex, challenges: ChallengeGuard) -> SshVerifier {
+        SshVerifier {
+            registry: Arc::new(registry),
+            challenges,
+        }
+    }
+
+    /// **Build the verifier over a DURABLE binding source (MR-010d).** The canonical production
+    /// constructor: pass a [`PrincipalStoreKeyBindings`] (or any [`KeyBindingResolver`]) so a registered
+    /// SSH key resolves against the durable PG store — surviving restart, tenant-scoped — not an
+    /// injected stub.
+    pub fn with_resolver(
+        registry: Arc<dyn KeyBindingResolver>,
+        challenges: ChallengeGuard,
+    ) -> SshVerifier {
         SshVerifier {
             registry,
             challenges,
@@ -666,9 +778,9 @@ impl SshVerifier {
         &self.challenges
     }
 
-    /// The injected key registry (so a caller can inspect / pre-seed bindings).
-    pub fn registry(&self) -> &KeyBindingIndex {
-        &self.registry
+    /// The injected key-binding source (so a caller can inspect which resolver is wired).
+    pub fn bindings(&self) -> &dyn KeyBindingResolver {
+        self.registry.as_ref()
     }
 }
 
@@ -703,7 +815,7 @@ impl CredentialVerifier for SshVerifier {
         //     subject) is read from THIS binding — never the credential wrapper (ID-3). Looked up
         //     BEFORE consuming the challenge so an unregistered probe cannot burn a valid challenge.
         let fingerprint = ssh_fingerprint(&public_key_blob);
-        let binding = self.registry.get(&fingerprint).ok_or_else(|| {
+        let binding = self.registry.resolve(&fingerprint).ok_or_else(|| {
             refuse(format!(
                 "unregistered SSH key fingerprint `{fingerprint}` (no S1 binding — fail-closed, \
                  never a fabricated principal)"
@@ -1315,5 +1427,154 @@ mod tests {
         assert_eq!(p.tenant, TenantId(TENANT.into()), "tenant from the registered key binding");
         assert_eq!(p.region, Region(REGION.into()));
         assert_eq!(p.kind, PrincipalKind::Service);
+    }
+
+    // ── MR-010d: the DURABLE SSH-key→principal binding (PrincipalStoreKeyBindings) ────────────────
+
+    use crate::principal_store::PrincipalStore;
+    use myelin_identity::{DataRole, Principal, PrincipalKind, PrincipalStatus};
+    use myelin_storage::{KmsEngine, TenantScope};
+
+    fn admin_scope(store_tenant: &str, region: &str) -> TenantScope {
+        TenantScope::from_verified_token(
+            &Principal::stub(
+                PrincipalId("admin".into()),
+                PrincipalKind::Human,
+                TenantId(store_tenant.into()),
+            ),
+            Region(region.into()),
+        )
+    }
+
+    /// Seed a service principal in `(tenant, region)` (the principal the SSH key will bind to).
+    fn seed_service(store: &PrincipalStore, scope: &TenantScope, pid: &str) {
+        store
+            .put_principal(
+                scope,
+                PrincipalId(pid.into()),
+                PrincipalKind::Service,
+                DataRole::Processor,
+                PrincipalStatus::Active,
+                None,
+            )
+            .expect("seed principal");
+    }
+
+    /// **The MR-010d follow-up: a registered SSH key resolves to its principal via the DURABLE
+    /// PrincipalStore (not an injected stub), and the binding SURVIVES a fresh verifier instance** (it
+    /// lives in the durable store, which a fresh verifier re-reads — the PG backing is the same store
+    /// across a real restart, MR-007). The registration path is `PrincipalStoreKeyBindings::register_key`
+    /// (→ `link_credential` on SSH-key add).
+    #[test]
+    fn durable_binding_resolves_and_survives_a_fresh_verifier() {
+        let key = EdKey::generate();
+        let blob = key.pubkey_blob();
+        let fp = ssh_fingerprint(&blob);
+
+        // The durable S1 store + the verified acme/eu-west scope.
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        let scope = admin_scope(TENANT, REGION);
+        seed_service(&store, &scope, "svc:deploy");
+
+        // REGISTRATION (SSH-key add): durably link the key fingerprint → principal.
+        let bindings = PrincipalStoreKeyBindings::new(store.clone(), scope.clone());
+        let registered_fp = bindings.register_key(&blob, &PrincipalId("svc:deploy".into())).unwrap();
+        assert_eq!(registered_fp, fp);
+
+        // The verifier resolves the durable binding (NOT an in-memory KeyBindingIndex).
+        let v = SshVerifier::with_resolver(Arc::new(bindings), ChallengeGuard::new(300));
+        let c = signed_cred(&v, &blob, |m| key.sig_blob(m));
+        let a = v.verify(&c).expect("a correctly-signed challenge resolves the durable binding");
+        assert_eq!(a.tenant, TenantId(TENANT.into()), "tenant from the DURABLE binding");
+        assert_eq!(a.region, Region(REGION.into()));
+        assert_eq!(a.subject_key, fp);
+
+        // SURVIVES a fresh verifier: a brand-new resolver + verifier over the SAME durable store (the
+        // model of a restart — the binding is not in the verifier, it is in the store) still resolves.
+        let fresh = SshVerifier::with_resolver(
+            Arc::new(PrincipalStoreKeyBindings::new(store.clone(), scope.clone())),
+            ChallengeGuard::new(300),
+        );
+        let c2 = signed_cred(&fresh, &blob, |m| key.sig_blob(m));
+        let a2 = fresh.verify(&c2).expect("the durable binding survives a fresh verifier instance");
+        assert_eq!(a2.subject_key, fp);
+    }
+
+    /// An UNREGISTERED key is refused by the durable resolver (no fabricated principal) — a valid
+    /// self-signature, but no durable link in the store.
+    #[test]
+    fn durable_binding_refuses_an_unregistered_key() {
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        let scope = admin_scope(TENANT, REGION);
+        // Nothing registered.
+        let stranger = EdKey::generate();
+        let blob = stranger.pubkey_blob();
+        let v = SshVerifier::with_resolver(
+            Arc::new(PrincipalStoreKeyBindings::new(store, scope)),
+            ChallengeGuard::new(300),
+        );
+        let c = signed_cred(&v, &blob, |m| stranger.sig_blob(m));
+        let err = v.verify(&c).unwrap_err();
+        assert!(
+            matches!(&err, AuthzError::FailClosed(m) if m.contains("unregistered SSH key")),
+            "an unregistered key must be refused by the durable resolver, got {err:?}"
+        );
+    }
+
+    /// **Tenant-scoped: no cross-tenant key resolution.** A key registered under tenant `acme` does NOT
+    /// resolve through a durable resolver scoped to tenant `globex` (the credential link lives in
+    /// acme's partition; resolve_credential never crosses partitions).
+    #[test]
+    fn durable_binding_is_tenant_scoped_no_cross_tenant_resolution() {
+        let key = EdKey::generate();
+        let blob = key.pubkey_blob();
+
+        // ONE shared durable store; register the key under acme only.
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        let acme = admin_scope("acme", REGION);
+        seed_service(&store, &acme, "svc:deploy");
+        PrincipalStoreKeyBindings::new(store.clone(), acme)
+            .register_key(&blob, &PrincipalId("svc:deploy".into()))
+            .unwrap();
+
+        // A verifier scoped to GLOBEX cannot resolve acme's key (cross-tenant resolution is impossible).
+        let globex = admin_scope("globex", REGION);
+        let v = SshVerifier::with_resolver(
+            Arc::new(PrincipalStoreKeyBindings::new(store, globex)),
+            ChallengeGuard::new(300),
+        );
+        let c = signed_cred(&v, &blob, |m| key.sig_blob(m));
+        let err = v.verify(&c).unwrap_err();
+        assert!(
+            matches!(&err, AuthzError::FailClosed(m) if m.contains("unregistered SSH key")),
+            "acme's key must NOT resolve under globex's scope (tenant-scoped), got {err:?}"
+        );
+    }
+
+    /// END-TO-END through the authenticator over the DURABLE resolver: a single `link_credential` serves
+    /// BOTH the verifier's binding lookup AND `authenticate`'s downstream principal resolution.
+    #[test]
+    fn durable_binding_end_to_end_through_authenticator() {
+        use crate::authenticate::HumanSsoAuthenticator;
+
+        let key = EdKey::generate();
+        let blob = key.pubkey_blob();
+
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        let scope = admin_scope(TENANT, REGION);
+        seed_service(&store, &scope, "svc:deploy");
+        PrincipalStoreKeyBindings::new(store.clone(), scope.clone())
+            .register_key(&blob, &PrincipalId("svc:deploy".into()))
+            .unwrap();
+
+        let v = SshVerifier::with_resolver(
+            Arc::new(PrincipalStoreKeyBindings::new(store.clone(), scope)),
+            ChallengeGuard::new(300),
+        );
+        let c = signed_cred(&v, &blob, |m| key.sig_blob(m));
+        let auth = HumanSsoAuthenticator::with_verifier(store, Arc::new(v));
+        let p = auth.authenticate(&c, None).expect("durable ssh binding resolves the principal");
+        assert_eq!(p.principal_id, PrincipalId("svc:deploy".into()));
+        assert_eq!(p.tenant, TenantId(TENANT.into()));
     }
 }
