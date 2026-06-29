@@ -36,8 +36,8 @@ use myelin_ci_sandbox::escape_corpus::{BEGIN_MARKER, END_MARKER};
 use myelin_ci_sandbox::{
     parse_console, Backend, BackendRun, EgressPolicy, EnvVar, EscapeAttestation, HookError,
     IdemToken, ImageRef, JobKind, JobSpec, MeterTarget, ReserveHandle, ResourceLimits,
-    ResourceUsage, RunTokenRef, RunnerHooks, SandboxBackend, SandboxHandle, SecretRef, TrustTier,
-    CORPUS, CORPUS_VERSION,
+    ResourceUsage, RunTokenRef, RunnerHooks, SandboxBackend, SandboxHandle, SandboxLaunch,
+    SandboxResult, SecretRef, TrustTier, CORPUS, CORPUS_VERSION,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -82,7 +82,7 @@ struct RunnerSeam {
 
 impl SandboxBackend for RunnerSeam {
     type Error = HookError;
-    fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxHandle, Self::Error> {
+    fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
         (hooks.isolation_floor)(spec)?;
         self.order.lock().unwrap().push("isolation_floor");
         (hooks.attribute)(&spec.run_token)?;
@@ -96,17 +96,18 @@ impl SandboxBackend for RunnerSeam {
         };
         let res = (hooks.reserve)(&target)?;
         self.order.lock().unwrap().push("reserve");
-        // ... the hardened guest runs the (compute) command here ...
-        (hooks.settle)(
-            &res,
-            ResourceUsage {
-                cpu_seconds: 2,
-                mem_byte_seconds: 4,
-            },
-        )?;
+        // ... the hardened guest runs the (compute) command here; the seam carries the result back ...
+        let result = SandboxResult::stub_ok(ResourceUsage {
+            cpu_seconds: 2,
+            mem_byte_seconds: 4,
+        });
+        (hooks.settle)(&res, result.usage)?;
         self.order.lock().unwrap().push("settle");
-        Ok(SandboxHandle {
-            guest_id: "fabric-guest".into(),
+        Ok(SandboxLaunch {
+            handle: SandboxHandle {
+                guest_id: "fabric-guest".into(),
+            },
+            result,
         })
     }
     fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {

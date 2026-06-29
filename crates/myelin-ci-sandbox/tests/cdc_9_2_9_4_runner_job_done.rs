@@ -23,15 +23,14 @@
 use myelin_ci_sandbox::{
     CountingFirehose, EgressPolicy, EngineTerminalReporter, IdemToken, ImageRef, JobKind,
     JobLeaseStore, JobSpec, MeterTarget, QueuedJob, ReserveHandle, ResourceLimits, ResourceUsage,
-    RunnerAgent, RunnerHooks, SandboxBackend, SandboxHandle, TerminalReport, TerminalReporter,
-    TrustTier, WorkspaceSpec,
+    RunnerAgent, RunnerHooks, SandboxBackend, SandboxHandle, SandboxLaunch, SandboxResult,
+    TerminalReport, TerminalReporter, TrustTier, WorkspaceSpec,
 };
 use myelin_events::MonotonicMinter;
 use myelin_flow::{
     job_idem_token, DurableExecutor, FlowExecutor, RunId, SignalOutcome, SignalSpec, StartSpec,
     JOB_DONE_SIGNAL,
 };
-use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
 
@@ -86,19 +85,20 @@ fn hooks() -> RunnerHooks {
 struct NoopBackend;
 impl SandboxBackend for NoopBackend {
     type Error = myelin_ci_sandbox::HookError;
-    fn launch(&self, spec: &JobSpec, h: &RunnerHooks) -> Result<SandboxHandle, Self::Error> {
+    fn launch(&self, spec: &JobSpec, h: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
         (h.isolation_floor)(spec)?;
         (h.attribute)(&spec.run_token)?;
         let r = (h.reserve)(&spec.meter_to)?;
-        (h.settle)(
-            &r,
-            ResourceUsage {
-                cpu_seconds: 1,
-                mem_byte_seconds: 1,
+        let result = SandboxResult::stub_ok(ResourceUsage {
+            cpu_seconds: 1,
+            mem_byte_seconds: 1,
+        });
+        (h.settle)(&r, result.usage)?;
+        Ok(SandboxLaunch {
+            handle: SandboxHandle {
+                guest_id: "g".into(),
             },
-        )?;
-        Ok(SandboxHandle {
-            guest_id: "g".into(),
+            result,
         })
     }
     fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
@@ -155,13 +155,8 @@ fn runner_echoes_idem_token_engine_wakes_exactly_once() {
         hooks(),
     );
 
-    let report = TerminalReport {
-        passed: true,
-        result_refs: vec![ArtifactRef("myelin://acme/ci/run/run/log".into())],
-    };
-    let out = agent
-        .run_one(1000, 2, report.clone())
-        .expect("the runner runs + reports");
+    // the runner DERIVES the report from the backend's clean result (no longer an input).
+    let out = agent.run_one(1000).expect("the runner runs + reports");
     assert_eq!(
         out.signal_outcome,
         SignalOutcome::Buffered,
@@ -169,8 +164,9 @@ fn runner_echoes_idem_token_engine_wakes_exactly_once() {
     );
 
     // the runner RE-delivers (at-least-once) — the engine's ON CONFLICT DO NOTHING makes it a no-op.
+    // The re-delivery passes the derived report directly (the job row is already settled).
     let again = agent
-        .report_done_again(&run.0, &idem, &report)
+        .report_done_again(&run.0, &idem, &out.report)
         .expect("re-delivery is the idempotency working");
     assert_eq!(
         again,

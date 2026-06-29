@@ -383,7 +383,10 @@ fn long_job_target(job: &SandboxJob) -> String {
 mod tests {
     use super::*;
     use myelin_agent::{EffectKind, ToolName};
-    use myelin_ci_sandbox::{JobSpec as SandboxJobSpec, SandboxHandle, SpecError};
+    use myelin_ci_sandbox::{
+        JobSpec as SandboxJobSpec, ResourceUsage, SandboxHandle, SandboxLaunch, SandboxResult,
+        SpecError,
+    };
     use myelin_events::{
         Actor, CausedBy, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp,
     };
@@ -420,9 +423,15 @@ mod tests {
             &self,
             _spec: &SandboxJobSpec,
             _hooks: &myelin_ci_sandbox::RunnerHooks,
-        ) -> Result<SandboxHandle, Self::Error> {
-            Ok(SandboxHandle {
-                guest_id: "unused-inline".into(),
+        ) -> Result<SandboxLaunch, Self::Error> {
+            Ok(SandboxLaunch {
+                handle: SandboxHandle {
+                    guest_id: "unused-inline".into(),
+                },
+                result: SandboxResult::stub_ok(ResourceUsage {
+                    cpu_seconds: 0,
+                    mem_byte_seconds: 0,
+                }),
             })
         }
         fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {

@@ -22,7 +22,8 @@ use myelin_agent_service::{dispatch_long_compute, LongComputeProfile};
 use myelin_ci_sandbox::escape_corpus::{BEGIN_MARKER, END_MARKER};
 use myelin_ci_sandbox::{
     parse_console, Backend, BackendRun, EgressPolicy, EscapeAttestation, IdemToken, ImageRef,
-    MeterTarget, ResourceLimits, RunTokenRef, SandboxBackend, SandboxHandle, SpecError, TrustTier,
+    MeterTarget, ResourceLimits, ResourceUsage, RunTokenRef, SandboxBackend, SandboxHandle,
+    SandboxLaunch, SandboxResult, SpecError, TrustTier,
     CORPUS, CORPUS_VERSION,
 };
 use myelin_ci_sandbox::{JobSpec as SandboxJobSpec, RunnerHooks};
@@ -55,10 +56,16 @@ impl SandboxBackend for UnifiedRunnerProducer {
         &self,
         _spec: &SandboxJobSpec,
         _hooks: &RunnerHooks,
-    ) -> Result<SandboxHandle, Self::Error> {
+    ) -> Result<SandboxLaunch, Self::Error> {
         // the in-line launch is unused on the long-park path.
-        Ok(SandboxHandle {
-            guest_id: "unused".into(),
+        Ok(SandboxLaunch {
+            handle: SandboxHandle {
+                guest_id: "unused".into(),
+            },
+            result: SandboxResult::stub_ok(ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            }),
         })
     }
     fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
