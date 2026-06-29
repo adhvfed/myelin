@@ -34,6 +34,7 @@
 #![cfg(feature = "integration")]
 
 use myelin_ci_sandbox::escape_corpus::{parse_console, Backend, BackendRun, EscapeAttestation};
+use myelin_ci_sandbox::gvisor::MemoryCgroup;
 use myelin_ci_sandbox::{
     build_gvisor_corpus_script, gvisor_drill_config_json, resolved_gvisor_rootfs, EgressPolicy,
     IdemToken, ImageRef, JobKind, JobSpec, MeterTarget, ResourceLimits, RunTokenRef, TrustTier,
@@ -165,15 +166,28 @@ fn ag_d4_ci_t1_escape_gate_re_runs_green_on_the_gvisor_backend() {
     // 2) Run the corpus INSIDE a REAL runsc (gVisor) sandbox. --network=none ⇒ only loopback exists
     //    (egress closed); --rootless runs without sudo. The corpus prints per-attack markers to
     //    stdout, which we capture for the SAME host-side parser the Firecracker drill uses.
-    let out = std::process::Command::new(&bin)
-        .arg("--rootless")
+    //
+    //    CT-003b (SI-017): the corpus now carries the anon-memory hog (Mx_memhog). rootless runsc
+    //    does NOT enforce the OCI memory.limit, so — exactly as the production launch() does — we
+    //    place the runsc process tree into an OUT-OF-BAND host memory cgroup (the SAME
+    //    `MemoryCgroup` helper the production path uses; no forked enforcer). Without it the hog
+    //    would HELD an oversized anonymous allocation ⇒ ESCAPED ⇒ the drill would (correctly) go RED.
+    let cgroup = MemoryCgroup::create(spec.limits.mem_bytes).expect(
+        "[AG-D4 gVisor] the memory cgroup MUST be establishable to contain the anon-memory hog \
+         (cgroup v2 + a delegated `memory` controller) — fail-closed otherwise (SI-017)",
+    );
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("--rootless")
         .arg("--network=none")
         .arg("run")
         .arg("-bundle")
         .arg(&bundle)
-        .arg(&container_id)
-        .output()
-        .expect("run the corpus inside a real runsc sandbox");
+        .arg(&container_id);
+    cgroup
+        .place_child(&mut cmd)
+        .expect("bind the runsc process tree into the memory cgroup");
+    let out = cmd.output().expect("run the corpus inside a real runsc sandbox");
+    cgroup.cleanup();
     // Best-effort teardown (idempotent; the container has exited).
     let _ = std::process::Command::new(&bin)
         .arg("--rootless")

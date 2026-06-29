@@ -38,6 +38,8 @@ use crate::{
     drain_capped, JobSpec, ResourceUsage, RunnerHooks, SandboxBackend, SandboxHandle,
     SandboxLaunch, SandboxResult, SANDBOX_CAPTURE_BOUND,
 };
+use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -74,6 +76,17 @@ pub struct OciConfig {
     seccomp: bool,
     has_network: bool,
     pids_max: u32,
+    /// The memory ceiling (bytes) — emitted as `linux.resources.memory.limit`. IMPORTANT (CT-003b /
+    /// SI-017): `runsc --rootless` does NOT enforce this OCI field (rootless runsc cannot manage a
+    /// host cgroup), so this value is ADVISORY here (it would be honored by a non-rootless `runsc`).
+    /// The REAL host-RAM bound for the gVisor workload is the OUT-OF-BAND [`MemoryCgroup`] the
+    /// production run path places the `runsc` process tree into — that is what OOM-kills a memory hog
+    /// within the limit and keeps it from consuming host RAM beyond `mem_bytes`.
+    mem_bytes: u64,
+    /// The scratch-disk quota (bytes) — the size of the bounded writable `/tmp` tmpfs (CT-003a). gVisor
+    /// would otherwise auto-mount an UNBOUNDED host-RAM-backed tmpfs at `/tmp`; sizing it caps a disk
+    /// fill at ENOSPC (the SI-017 host-DoS escape D2 surfaced through the production `launch()`).
+    disk_bytes: u64,
 }
 
 impl OciConfig {
@@ -88,6 +101,9 @@ impl OciConfig {
             seccomp: profile.seccomp,
             has_network: profile.network_device,
             pids_max: profile.pids_max,
+            mem_bytes: spec.limits.mem_bytes,
+            // The hardening profile's scratch-disk quota (= `spec.limits.disk_bytes`).
+            disk_bytes: profile.scratch_quota_bytes,
         }
     }
 
@@ -114,7 +130,10 @@ impl OciConfig {
              \"noNewPrivileges\": {nnp},\n    \
              \"capabilities\": {{ \"bounding\": [], \"effective\": [], \"permitted\": [] }}\n  }},\n  \
              \"root\": {{ \"path\": \"rootfs\", \"readonly\": {ro} }},\n  \
-             \"linux\": {{\n    \"resources\": {{ \"pids\": {{ \"limit\": {pids} }} }},\n    \
+             \"mounts\": [ {{ \"destination\": \"/tmp\", \"type\": \"tmpfs\", \"source\": \"tmpfs\", \
+             \"options\": [\"nosuid\", \"nodev\", \"mode=1777\", \"size={disk}\"] }} ],\n  \
+             \"linux\": {{\n    \"resources\": {{ \"memory\": {{ \"limit\": {mem} }}, \
+             \"pids\": {{ \"limit\": {pids} }} }},\n    \
              \"seccomp\": {{ \"defaultAction\": \"SCMP_ACT_ERRNO\" }},\n    \
              \"namespaces\": [ {net_ns} ]\n  }}\n}}",
             uid = UNTRUSTED_UID,
@@ -122,6 +141,8 @@ impl OciConfig {
             args = args,
             nnp = self.no_new_privileges,
             ro = self.root_readonly,
+            disk = self.disk_bytes,
+            mem = self.mem_bytes,
             pids = self.pids_max,
             net_ns = net_ns,
         )
@@ -163,6 +184,158 @@ impl std::error::Error for GvisorError {}
 impl From<crate::HookError> for GvisorError {
     fn from(e: crate::HookError) -> Self {
         GvisorError::Hook(e)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// CT-003b (SI-017) — the OUT-OF-BAND memory enforcer for the gVisor workload.
+//
+// THE DEFECT: `runsc --rootless` does NOT enforce the OCI `linux.resources.memory.limit` (rootless
+// runsc cannot create/manage a host cgroup), so an untrusted gVisor job's ANONYMOUS memory was
+// UNBOUNDED — it could drive the HOST to OOM (a supply-chain availability compromise). The `/tmp`
+// disk quota and Firecracker's hard guest-RAM cap were fine; this was gVisor-anonymous-memory-only.
+//
+// THE FIX: bound the workload's memory with a REAL cgroup v2 the host (not rootless runsc) controls.
+// gVisor runs the ENTIRE guest inside the `runsc-sandbox` (sentry) process, and the guest's anonymous
+// memory is backed by the sentry's host RSS — so placing the `runsc` child PROCESS TREE (frontend +
+// the sentry/gofer it forks) into a memory cgroup BOUNDS the workload's anonymous memory at the host
+// level. A `memory.max` breach OOM-kills the sentry within the limit; host RAM is never consumed
+// beyond `mem_bytes` (proven: a 1 GiB anon hog under a 256 MiB cap is OOM-killed, host MemAvailable
+// unmoved). We place the child via `pre_exec` (writing its pid to `cgroup.procs` BEFORE `exec`), so
+// every process `runsc` forks is born inside the cgroup — no race where the sentry escapes it.
+//
+// FAIL-CLOSED: if a memory cgroup CANNOT be established (no cgroup v2, or the `memory` controller is
+// not delegated to us), [`MemoryCgroup::create`] returns `Err` and the gVisor `launch()` REFUSES —
+// it NEVER runs the workload unbounded. (Firecracker is unaffected: its microVM hard-caps guest RAM.)
+// ---------------------------------------------------------------------------------------------
+
+/// A child cgroup v2 (sibling of this process's own delegated cgroup) that HARD-BOUNDS the gVisor
+/// `runsc` process tree's memory at `mem_bytes` (+ no swap escape hatch). Cleaned up on drop
+/// (`cgroup.kill` every member, then `rmdir`) so no cgroup leaks on any teardown path.
+pub struct MemoryCgroup {
+    /// The created cgroup directory under `/sys/fs/cgroup`.
+    dir: PathBuf,
+}
+
+impl MemoryCgroup {
+    /// Establish a memory cgroup capped at `mem_bytes` (swap disabled). FAIL-CLOSED: returns `Err`
+    /// when cgroup v2 is absent or the `memory` controller is not delegated to this process — the
+    /// caller MUST then refuse to run the workload (never unbounded). The sandbox cgroup is created
+    /// as a SIBLING of this process's own cgroup (whose parent already delegates the `memory`
+    /// controller into its `subtree_control`, since our own cgroup carries it as a controller); this
+    /// respects cgroup v2's no-internal-process rule without relocating this supervisor process.
+    pub fn create(mem_bytes: u64) -> Result<MemoryCgroup, String> {
+        const ROOT: &str = "/sys/fs/cgroup";
+        // cgroup v2 unified hierarchy ⇒ /proc/self/cgroup has exactly one `0::<path>` line.
+        let content = std::fs::read_to_string("/proc/self/cgroup")
+            .map_err(|e| format!("read /proc/self/cgroup: {e}"))?;
+        let rel = content
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .map(str::trim)
+            .ok_or_else(|| {
+                "no cgroup v2 unified hierarchy (`0::` line absent) — cannot establish a memory \
+                 cgroup; refusing to run the gVisor workload unbounded (SI-017 fail-closed)"
+                    .to_string()
+            })?;
+        let our_dir = PathBuf::from(ROOT).join(rel.trim_start_matches('/'));
+        // The `memory` controller must be delegated to our own cgroup (⇒ available to siblings).
+        let controllers =
+            std::fs::read_to_string(our_dir.join("cgroup.controllers")).unwrap_or_default();
+        if !controllers.split_whitespace().any(|c| c == "memory") {
+            return Err(format!(
+                "the `memory` cgroup controller is NOT delegated to {our_dir:?} (controllers: \
+                 {controllers:?}) — cannot bound gVisor memory; refusing to run the workload \
+                 unbounded (SI-017 fail-closed)"
+            ));
+        }
+        let parent = our_dir.parent().ok_or_else(|| {
+            "this process's cgroup has no parent — cannot create a sibling memory cgroup".to_string()
+        })?;
+        let dir = parent.join(format!(
+            "myelin-mem-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let _ = std::fs::remove_dir(&dir);
+        std::fs::create_dir(&dir).map_err(|e| format!("create memory cgroup {dir:?}: {e}"))?;
+        // The sibling must actually have the `memory` controller (the parent delegated it). If not,
+        // tear down and fail closed rather than run a workload an empty cgroup would not bound.
+        let cg_controllers =
+            std::fs::read_to_string(dir.join("cgroup.controllers")).unwrap_or_default();
+        if !cg_controllers.split_whitespace().any(|c| c == "memory") {
+            let _ = std::fs::remove_dir(&dir);
+            return Err(format!(
+                "the created cgroup {dir:?} has no `memory` controller (parent did not delegate it) \
+                 — refusing to run the gVisor workload unbounded (SI-017 fail-closed)"
+            ));
+        }
+        // The HARD host-RAM bound + close the swap escape hatch (so a hog OOMs rather than swaps).
+        if let Err(e) = std::fs::write(dir.join("memory.max"), mem_bytes.to_string()) {
+            let _ = std::fs::remove_dir(&dir);
+            return Err(format!("write memory.max={mem_bytes} to {dir:?}: {e}"));
+        }
+        // Best-effort: a host without a swap controller has nothing to cap (swap.max absent ⇒ no
+        // swap to escape into). Where present, 0 forces an OOM-kill instead of swapping the hog out.
+        let _ = std::fs::write(dir.join("memory.swap.max"), b"0");
+        Ok(MemoryCgroup { dir })
+    }
+
+    /// Arrange for `cmd`'s spawned child (and every process it forks — for `runsc` that is the
+    /// sentry/gofer tree) to run INSIDE this memory cgroup, by writing the child's own pid to
+    /// `cgroup.procs` in a `pre_exec` hook BEFORE `exec`. The `cgroup.procs` file is opened HERE (in
+    /// the parent) and the descriptor inherited across `fork`; the hook does only async-signal-safe
+    /// work (a `getpid` + a `write` of a stack-formatted decimal pid — no allocation, no locks).
+    pub fn place_child(&self, cmd: &mut Command) -> std::io::Result<()> {
+        let procs = std::fs::OpenOptions::new()
+            .write(true)
+            .open(self.dir.join("cgroup.procs"))?;
+        // SAFETY: the closure runs in the forked child between `fork` and `exec`; it performs only
+        // async-signal-safe operations (no heap allocation, no lock acquisition): a `getpid`, a
+        // manual stack-buffer decimal format, and a `write` to a pre-opened descriptor.
+        unsafe {
+            cmd.pre_exec(move || {
+                let mut pid = std::process::id();
+                // Format the decimal pid + '\n' into a stack buffer (u32 ⇒ ≤ 10 digits).
+                let mut buf = [0u8; 11];
+                let mut i = buf.len();
+                i -= 1;
+                buf[i] = b'\n';
+                if pid == 0 {
+                    i -= 1;
+                    buf[i] = b'0';
+                } else {
+                    while pid > 0 {
+                        i -= 1;
+                        buf[i] = b'0' + (pid % 10) as u8;
+                        pid /= 10;
+                    }
+                }
+                (&procs).write_all(&buf[i..])
+            });
+        }
+        Ok(())
+    }
+
+    /// Tear the cgroup down on EVERY path (success / timeout-kill / error): `cgroup.kill` every
+    /// remaining member (cgroup v2), wait briefly for the kernel to reap them, then `rmdir`. No
+    /// leaked cgroups. Idempotent — safe to call more than once (Drop also calls it).
+    pub fn cleanup(&self) {
+        let _ = std::fs::write(self.dir.join("cgroup.kill"), b"1");
+        for _ in 0..200 {
+            match std::fs::read_to_string(self.dir.join("cgroup.procs")) {
+                Ok(s) if s.split_whitespace().next().is_none() => break,
+                Ok(_) => std::thread::sleep(Duration::from_millis(5)),
+                Err(_) => break, // already gone
+            }
+        }
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+impl Drop for MemoryCgroup {
+    fn drop(&mut self) {
+        self.cleanup();
     }
 }
 
@@ -314,7 +487,14 @@ impl SandboxBackend for GvisorBackend {
 /// Mechanism (REUSING the proven bundle pattern from `escape_drill_gvisor_test::stage_bundle`):
 /// 1. Stage a temp bundle dir: a `rootfs` symlink → [`resolved_gvisor_rootfs`] + a `config.json` =
 ///    [`OciConfig::to_json`] (read-only root, caps dropped, no-new-privs, seccomp, no netns when
-///    egress is default-deny, pids ceiling, NON-ROOT user).
+///    egress is default-deny, pids ceiling, NON-ROOT user, an advisory `memory.limit`, and a
+///    size-bounded writable `/tmp` tmpfs from `spec.limits.disk_bytes` — CT-003a: a disk fill hits
+///    ENOSPC at the quota, never an unbounded host-RAM-backed tmpfs).
+/// 1b. CT-003b (SI-017): establish an OUT-OF-BAND [`MemoryCgroup`] capped at `spec.limits.mem_bytes`
+///    and place the `runsc` process tree (frontend + the sentry/gofer it forks) into it. This is the
+///    REAL memory bound — rootless runsc ignores the OCI `memory.limit`, so without this an untrusted
+///    job's anonymous memory was UNBOUNDED (a host-DoS escape). FAIL-CLOSED: if the cgroup cannot be
+///    established the run REFUSES (never runs the workload unbounded).
 /// 2. Run `runsc --rootless --network=none run -bundle <dir> <cid>` with stdout/stderr piped, waiting
 ///    at most `spec.limits.timeout_secs`; on expiry the WHOLE CONTAINER is killed (`runsc kill <cid>
 ///    KILL` + the child) ⇒ `timed_out=true`, `exit_code=None`.
@@ -334,7 +514,13 @@ fn run_production_container(spec: &JobSpec, cfg: &OciConfig) -> Result<Container
     let container_id = format!("myelin-prod-{}-{}", std::process::id(), unique_suffix());
 
     let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
-    let outcome = match run_and_capture(&bin, &bundle_dir, &container_id, timeout) {
+    let outcome = match run_and_capture(
+        &bin,
+        &bundle_dir,
+        &container_id,
+        timeout,
+        spec.limits.mem_bytes,
+    ) {
         Ok(o) => o,
         Err(e) => {
             // Spawning/waiting failed before a trustworthy result — clean up + surface honestly.
@@ -439,9 +625,15 @@ fn run_and_capture(
     bundle: &Path,
     container_id: &str,
     timeout: Duration,
+    mem_bytes: u64,
 ) -> Result<RunscOutcome, String> {
-    let mut child = Command::new(bin)
-        .arg("--rootless")
+    // CT-003b (SI-017): establish the OUT-OF-BAND memory cgroup BEFORE spawning runsc and FAIL
+    // CLOSED if it cannot be established (rootless runsc would otherwise run the workload's anonymous
+    // memory UNBOUNDED — a host-DoS escape). The cgroup is torn down on every path (its `Drop`).
+    let cgroup = MemoryCgroup::create(mem_bytes)?;
+
+    let mut cmd = Command::new(bin);
+    cmd.arg("--rootless")
         .arg("--network=none")
         .arg("run")
         .arg("-bundle")
@@ -449,9 +641,12 @@ fn run_and_capture(
         .arg(container_id)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn runsc: {e}"))?;
+        .stderr(Stdio::piped());
+    // Place the runsc child (and the sentry/gofer tree it forks) into the memory cgroup at birth.
+    cgroup
+        .place_child(&mut cmd)
+        .map_err(|e| format!("bind runsc into the memory cgroup: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("spawn runsc: {e}"))?;
 
     let pid = child.id();
     let start = Instant::now();
@@ -495,6 +690,10 @@ fn run_and_capture(
     // The child has exited/been-killed ⇒ the pipes hit EOF ⇒ the drain threads finish.
     let stdout = th_out.join().unwrap_or_default();
     let stderr = th_err.join().unwrap_or_default();
+
+    // The container + its sentry/gofer tree are gone; reap the cgroup (kill any straggler, rmdir).
+    // `Drop` is the backstop, but tear it down deterministically here on the success/timeout path.
+    cgroup.cleanup();
 
     Ok(RunscOutcome {
         exit,
@@ -648,12 +847,25 @@ if echo x 2>/dev/null > /root_write_probe; then echo "D1_root_readonly ESCAPED";
 mkdir -p /tmp/scratch 2>/dev/null
 if dd if=/dev/zero of=/tmp/scratch/fill bs=1M count=512 2>/dev/null; then echo "D2_diskfill ESCAPED"; else echo "D2_diskfill CONTAINED"; fi
 
+# ---- anonymous-memory hog (Mx_memhog) — bounded by the OUT-OF-BAND host memory cgroup the
+#      production run path places the runsc process tree into (rootless runsc does NOT enforce the
+#      OCI memory.limit, so the cgroup is the real enforcer). An oversized anon alloc breaches
+#      memory.max and the kernel OOM-kills the sentry within the limit ⇒ the WHOLE container dies
+#      mid-alloc. So containment is STRUCTURAL: the ATTEMPT sentinel + the END marker are printed
+#      (and flushed) BEFORE the alloc; the ESCAPED line prints ONLY if the oversized alloc HELD (the
+#      bound failed / the cgroup was dropped). The host-side parser reads ATTEMPT-present-and-ESCAPED-
+#      absent as CONTAINED. A regression dropping the cgroup => the hog HELDs => ESCAPED => RED. ----
+echo "{memhog_id} ATTEMPT bytes={hog}"
 echo "{end}"
+( S=aaaaaaaaaaaaaaaa; n=0; while [ $n -lt 26 ]; do S="$S$S"; n=$((n+1)); done; echo "{memhog_id} ESCAPED held=${{#S}}" ) 2>/dev/null
+echo "{memhog_id} CONTAINED via_cgroup"
 "#,
         cv = CORPUS_VERSION,
         begin = BEGIN_MARKER,
         end = END_MARKER,
         pids_max = pids_max,
+        memhog_id = crate::escape_corpus::MEMHOG_ID,
+        hog = crate::escape_corpus::MEMHOG_BYTES,
     )
 }
 
@@ -797,6 +1009,24 @@ mod tests {
             json.contains("\"cwd\": \"/\""),
             "process.cwd must be set or the OCI runtime rejects the spec"
         );
+        // CT-003a/CT-003b (SI-017): the OCI emits an (advisory — rootless runsc ignores it) memory
+        // ceiling from spec.limits.mem_bytes; the REAL host-RAM bound is the out-of-band MemoryCgroup
+        // the production run path places the runsc tree into (see MemoryCgroup). It also mounts a
+        // SIZE-BOUNDED writable `/tmp` tmpfs (sized from the scratch quota) so a disk fill hits
+        // ENOSPC instead of an unbounded host-RAM-backed tmpfs. spec()'s limits are mem=256 MiB,
+        // disk=1 GiB.
+        assert!(
+            json.contains(&format!("\"limit\": {}", 256u64 << 20)),
+            "the OCI config must carry the memory ceiling (linux.resources.memory.limit) from spec.limits.mem_bytes"
+        );
+        assert!(
+            json.contains("\"destination\": \"/tmp\"") && json.contains("\"type\": \"tmpfs\""),
+            "a size-bounded writable /tmp tmpfs must be mounted (no unbounded host-RAM-backed scratch)"
+        );
+        assert!(
+            json.contains(&format!("size={}", 1u64 << 30)) && json.contains("mode=1777"),
+            "the /tmp tmpfs must be sized from spec.limits.disk_bytes and writable by the non-root payload"
+        );
     }
 
     #[test]
@@ -834,6 +1064,51 @@ mod tests {
         assert!(script.contains("mknod /dev/port"));
         // The fork-bomb ceiling is carried from the arg.
         assert!(script.contains("ceiling=64"));
+        // CT-003b: the anon-memory hog's ATTEMPT sentinel + the END marker precede the oversized
+        // alloc, so the corpus COMPLETES even when the contained hog OOM-kills the whole sentry
+        // mid-alloc (the host cgroup bounds host RAM). The ESCAPED line follows only if it HELD.
+        let attempt = script
+            .find(&format!("{} ATTEMPT", crate::escape_corpus::MEMHOG_ID))
+            .expect("memhog ATTEMPT sentinel in the gVisor corpus");
+        let end = script.find(crate::escape_corpus::END_MARKER).unwrap();
+        assert!(attempt < end, "the memhog ATTEMPT sentinel must precede the END marker");
+        // Pure-shell doubling allocator (holds the anon memory in the sh process itself; ~1 GiB) —
+        // the host cgroup OOM-kills the sentry when it breaches memory.max, never a false held=0.
+        assert!(script.contains(r#"S="$S$S""#) && script.contains("while [ $n -lt 26 ]"));
+    }
+
+    #[test]
+    fn memory_cgroup_round_trips_or_fails_closed() {
+        // On a host with cgroup v2 + a delegated `memory` controller, create() establishes a real
+        // child cgroup with memory.max set, places nothing (we only assert the knobs), and cleans up
+        // (no leaked cgroup dir). On a host WITHOUT it, create() MUST fail closed (Err) — never a
+        // silently-unbounded cgroup. Either branch is a valid host posture; both are asserted honest.
+        match MemoryCgroup::create(64 << 20) {
+            Ok(cg) => {
+                let dir = cg.dir.clone();
+                let max = std::fs::read_to_string(dir.join("memory.max")).unwrap_or_default();
+                assert_eq!(
+                    max.trim(),
+                    (64u64 << 20).to_string(),
+                    "memory.max must be written to the cap (the REAL out-of-band bound)"
+                );
+                assert!(
+                    std::fs::read_to_string(dir.join("cgroup.controllers"))
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .any(|c| c == "memory"),
+                    "the created cgroup must actually carry the memory controller"
+                );
+                cg.cleanup();
+                assert!(!dir.exists(), "cleanup must rmdir the cgroup (no leaks)");
+            }
+            Err(e) => {
+                assert!(
+                    e.contains("fail-closed"),
+                    "an unestablishable memory cgroup must fail CLOSED with a clear reason, got: {e}"
+                );
+            }
+        }
     }
 
     #[test]

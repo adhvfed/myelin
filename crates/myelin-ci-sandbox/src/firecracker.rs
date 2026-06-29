@@ -501,6 +501,14 @@ fn sh_squote(s: &str) -> String {
 /// prints the captured streams base64-framed + the real exit code, each marker nonce-suffixed.
 /// The non-root boundary is the PRIMARY (structural) forge guarantee; base64 + nonce + reap are
 /// defence in depth (see the marker consts above).
+///
+/// CT-003a (SI-017) adds two in-guest resource-limit enforcements derived from `spec.limits`: (1) a
+/// `ulimit -u spec.limits.pids_max` (RLIMIT_NPROC) applied in the runner subshell BEFORE `setpriv`,
+/// inherited by the non-root payload + all descendants, so a fork bomb is refused at the ceiling and
+/// the guest survives (rather than OOM-dying); (2) a size-bounded `/run/scratch` tmpfs sized from
+/// `spec.limits.disk_bytes` (the profile's scratch quota), separate from the `/run` capture area, so a
+/// workload disk fill hits ENOSPC at the quota. (The whole-guest RAM bounds everything else — the
+/// microVM keeps the HOST safe regardless.)
 fn build_command_runner_script(spec: &JobSpec, nonce: &str) -> String {
     let mut exports = String::new();
     for ev in &spec.env {
@@ -523,6 +531,14 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sys /sys 2>/dev/null
 mount -t tmpfs tmpfs /run 2>/dev/null
+# CT-003a (SI-017): a SIZE-BOUNDED writable scratch tmpfs (sized from spec.limits.disk_bytes, the
+# profile's scratch quota) at /run/scratch — a SEPARATE mount from /run (which holds the trusted
+# capture files /run/myelin.{{out,err}}), so a workload disk fill hits ENOSPC at the quota WITHOUT
+# starving the capture or the trusted markers. mode=1777 so the NON-ROOT payload can write it. (The
+# whole-guest RAM bounds everything else — the microVM keeps the HOST safe regardless; this makes the
+# in-guest disk quota the enforcer for the workload's scratch.)
+mkdir -p /run/scratch 2>/dev/null
+mount -t tmpfs -o size={disk_bytes},mode=1777 tmpfs /run/scratch 2>/dev/null
 N='{nonce}'
 # STRUCTURAL forge boundary: init (this script) is PID1/root and is the ONLY writer of the
 # nonce-framed markers below. The untrusted argv runs NON-ROOT (--reuid/--regid 65534 =
@@ -531,7 +547,14 @@ N='{nonce}'
 # cannot inject ANY console line (forged or otherwise) even knowing the nonce. The redirect of the
 # payload's stdout/stderr to /run is performed HERE, by root, in the subshell BEFORE setpriv drops
 # privileges, so the non-root argv inherits those already-open fds and capture still works.
+# CT-003a (SI-017): apply RLIMIT_NPROC = spec.limits.pids_max IN-GUEST via `ulimit -u` in the runner
+# subshell BEFORE setpriv drops to the non-root uid — rlimits inherit across setpriv/exec, so the
+# untrusted payload (uid 65534) and ALL its descendants are capped at the pids ceiling. A fork bomb is
+# REFUSED at the ceiling (fork() → EAGAIN) instead of growing until the guest OOM-dies, so the guest
+# SURVIVES and the rest of the run (e.g. the disk-fill probe) still executes. The ceiling counts
+# per-real-uid; root init/runner processes (uid 0) are unaffected.
 {exports}( exec </dev/null >/run/myelin.out 2>/run/myelin.err
+ulimit -u {pids_max} 2>/dev/null
 setpriv --reuid 65534 --regid 65534 --clear-groups \
         --no-new-privs --bounding-set -all --inh-caps -all --ambient-caps -all {argv} )
 CODE=$?
@@ -553,6 +576,8 @@ reboot -f
         nonce = nonce,
         exports = exports,
         argv = argv,
+        disk_bytes = spec.limits.disk_bytes,
+        pids_max = spec.limits.pids_max,
         so_b = MARK_STDOUT_BEGIN,
         so_e = MARK_STDOUT_END,
         se_b = MARK_STDERR_BEGIN,
