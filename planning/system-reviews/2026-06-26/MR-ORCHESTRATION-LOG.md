@@ -271,3 +271,20 @@ green: pg connect, s3 put/get, rebac tuples, outbox→bus relay, valkey cache):
   AGENT command still returns Ok — CT-002 must wire the result into the agent trace; (2) Firecracker `launch_with`
   hardcodes `stub_ok` instead of calling the already-present `VmmChild::wait` (gVisor already threads its wait) —
   converge both backends on calling `wait` at CT-002.
+
+- **CT-002a (P-544) — Firecracker PRODUCTION exec — COMMITTED 7da35f1.** Builder made `launch()` boot a REAL
+  microVM running `spec.command` (reusing the escape-drill 2nd-drive recipe + a shared `spawn_and_capture`),
+  with timeout→whole-guest-kill, /proc+wall usage, base64-framed head-bounded streams. **The orchestrator ran
+  the independent security probe directly** (the prior verifier's process died in a host reboot but left its
+  attack on disk): PHASE1 proved the untrusted payload ran as **root**, could read the per-boot nonce in
+  plaintext off `/dev/vdb`, AND write the root-only `/dev/console` — so the code's stated "nonce secrecy is the
+  primary guarantee" was VOID and the only real defense was a `kill -KILL -1` + last-line TIMING RACE (held
+  20/20 vs a fork-bomb console-spammer, but a race, not a boundary). **REJECTED pre-commit** and dispatched a
+  structural fix: run the untrusted argv NON-ROOT (`setpriv --reuid/--regid 65534`), so it physically cannot
+  open `/dev/console` → forge impossible by construction. Re-proved on the real kernel myself: payload
+  `uid=65534`, console-write DENIED, `/dev/vdb` unreadable, fork-bomb 0/20 wins, happy-path exit-7/timeout
+  captured, AG-D4 still 0 escapes; committed regression test locks it. Lesson reaffirmed: **a security floor's
+  "primary guarantee" must be checked against the actual adversary capability (root-in-guest can't be denied a
+  secret) — the fix must be structural, not a race.** Residual: a future root-in-guest CI tier needs a
+  host-read-only exit channel (not built; documented). NOTE: dev backends were down post-reboot (one PG-backed
+  test PoolTimedOut) — brought `docker-compose.dev.yml` up; gate then fully green.
