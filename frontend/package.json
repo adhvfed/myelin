@@ -1,0 +1,29 @@
+{
+  "name": "@myelin/frontend",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Myelin frontend monorepo — SolidJS design-system foundation (E0.7 / MR-016). The later UI prompts (overlays MR-017, Tauri MR-018, app shell MR-019) build inside this workspace.",
+  "type": "module",
+  "packageManager": "pnpm@10.5.2",
+  "engines": {
+    "node": ">=22",
+    "pnpm": ">=10"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint",
+    "lint:prove": "pnpm -r --no-bail lint:prove",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.18.0",
+    "eslint": "^9.18.0",
+    "eslint-plugin-jsx-a11y": "^6.10.2",
+    "eslint-plugin-solid": "^0.14.5",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.21.0"
+  }
+}
