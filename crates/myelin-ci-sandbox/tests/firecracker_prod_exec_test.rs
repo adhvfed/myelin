@@ -33,10 +33,10 @@ use myelin_ci_sandbox::firecracker::{
 };
 use myelin_ci_sandbox::{
     EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget, ReserveHandle, ResourceLimits,
-    RunTokenRef, RunnerHooks, SandboxBackend, TrustTier, WorkspaceSpec,
+    RunTokenRef, RunnerHooks, SandboxBackend, TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
 };
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// KVM + firecracker + staged-asset availability (the same preconditions the hardened-boot self-test
 /// gates on). Returns `false` ⇒ graceful skip (unless `MYELIN_REQUIRE_KVM=1`, which makes it a panic).
@@ -168,6 +168,86 @@ fn real_microvm_runs_command_and_captures_exit_stdout_stderr() {
 
     backend.kill(&launch.handle).expect("teardown whole-guest-kill is idempotent");
     backend.kill(&launch.handle).expect("kill is idempotent on an already-gone guest");
+}
+
+/// CT-002c host-side memory-DoS regression (REAL kernel). An untrusted workload emits 2 MiB of stdout
+/// which the in-init `base64` dump frames onto the serial console as ~2.8 MiB — exceeding BOTH the
+/// 2 MiB host `CONSOLE_CAPTURE_BOUND` and the ~64 KiB OS pipe buffer. The fix proves two properties:
+///   (a) BOUNDED HOST MEMORY — `result.stdout.len() <= SANDBOX_CAPTURE_BOUND`: the host drain thread
+///       head-captures at most the cap and DISCARDS the rest, so it never buffers the whole stream
+///       (the old `read_to_end`-then-truncate would have buffered the ENTIRE ~2.8 MiB — and for a
+///       guest writing GBs to its tmpfs, GBs — before truncating).
+///   (b) NO PIPE DEADLOCK / NO HANG — the guest's `base64` dump is far larger than the console pipe
+///       buffer; because the host KEEPS READING past the cap (drain-and-discard) the dump never
+///       blocks, so init reaches `reboot -f` and the VM exits ON ITS OWN — `timed_out == false` and
+///       `elapsed` is far below the timeout ceiling. A buggy "stop reading at the cap" would instead
+///       block `base64` at ~2 MiB written, hang the guest, and force `timed_out == true` at the
+///       ceiling. NOTE: `exit_code` is `None` here — the trusted exit marker is emitted by init AFTER
+///       the two stream blobs, so a >cap runaway stream pushes it beyond the host console cap (it is
+///       discarded with the overflow). That is the correct fail-closed outcome (a job spamming past
+///       the console cap is not a clean pass); the OLD code parsed it only by also buffering the whole
+///       unbounded console — exactly the DoS this closes. Legitimate runs (console <= 2 MiB, incl.
+///       both streams at their full 256 KiB head bound) keep their exit marker — see the exit-7 test.
+#[test]
+fn real_microvm_runaway_stdout_is_capped_without_deadlock() {
+    if skip_or_panic("fc-prod-exec runaway-stdout-cap") {
+        return;
+    }
+    let backend = FirecrackerBackend::new();
+    // Emit 2 MiB of 'x' to stdout (→ ~2.8 MiB base64 console, over the 2 MiB cap), then exit. dd,
+    // /dev/zero and tr are all present in the staged rootfs (used by the escape drill / forge test).
+    // timeout_secs=120 gives a >5x margin over the observed ~20s self-completion, so a `timed_out`
+    // here can ONLY mean a genuine drain-stopped pipe deadlock, never slow-but-progressing UART.
+    let timeout_secs = 120u32;
+    let spec = spec_running(
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "dd if=/dev/zero bs=4096 count=512 2>/dev/null | tr '\\0' 'x'".into(),
+        ],
+        timeout_secs,
+    );
+
+    let start = Instant::now();
+    let launch = backend
+        .launch(&spec, &ok_hooks())
+        .expect("the production launch must boot and run the runaway-output command");
+    let elapsed = start.elapsed();
+    let result = &launch.result;
+
+    println!("=== CT-002c REAL Firecracker runaway-stdout host-memory-DoS cap ===");
+    println!(
+        "exit_code = {:?}  timed_out = {}  elapsed = {:?}",
+        result.exit_code, result.timed_out, elapsed
+    );
+    println!(
+        "captured stdout.len() = {}  (bound = {})",
+        result.stdout.len(),
+        SANDBOX_CAPTURE_BOUND
+    );
+
+    // (a) host memory stayed bounded: the captured head is <= the per-stream bound.
+    assert!(
+        result.stdout.len() <= SANDBOX_CAPTURE_BOUND,
+        "captured stdout MUST be head-bounded to <= {SANDBOX_CAPTURE_BOUND}; got {} (a runaway guest \
+         must not be able to force the host to buffer the whole stream)",
+        result.stdout.len()
+    );
+    // (b) NO deadlock/hang: the guest base64-dumped a >cap console and rebooted ON ITS OWN — the host
+    // kept draining past the cap so the dump never blocked. A drain that stopped at the cap would
+    // have hung the guest and forced the timeout-kill.
+    assert!(
+        !result.timed_out,
+        "a 2 MiB completing flood must NOT time out — the host must keep draining the >cap console so \
+         the guest's base64 dump never blocks (a timeout here = the host stopped draining and the \
+         guest deadlocked on a full console pipe)"
+    );
+    assert!(
+        elapsed < Duration::from_secs(u64::from(timeout_secs) - 30),
+        "the guest must complete + reboot WELL under the {timeout_secs}s ceiling (no hang); elapsed {elapsed:?}"
+    );
+
+    backend.kill(&launch.handle).expect("teardown whole-guest-kill is idempotent");
 }
 
 #[test]

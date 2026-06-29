@@ -35,10 +35,9 @@
 
 use crate::hardening::HardeningProfile;
 use crate::{
-    JobSpec, ResourceUsage, RunnerHooks, SandboxBackend, SandboxHandle, SandboxLaunch,
-    SandboxResult, SANDBOX_CAPTURE_BOUND,
+    drain_capped, JobSpec, ResourceUsage, RunnerHooks, SandboxBackend, SandboxHandle,
+    SandboxLaunch, SandboxResult, SANDBOX_CAPTURE_BOUND,
 };
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -460,16 +459,11 @@ fn run_and_capture(
     // Drain both pipes on threads so a chatty container cannot fill a pipe buffer and deadlock.
     let mut out = child.stdout.take().expect("piped stdout");
     let mut err = child.stderr.take().expect("piped stderr");
-    let th_out = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = out.read_to_end(&mut b);
-        b
-    });
-    let th_err = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = err.read_to_end(&mut b);
-        b
-    });
+    // CT-002c: cap each stream at SANDBOX_CAPTURE_BOUND (head capture) and DISCARD the rest to EOF —
+    // bounds host memory under a runaway container while still draining the pipe so the container
+    // never blocks on a full pipe (no deadlock that would defeat the timeout).
+    let th_out = std::thread::spawn(move || drain_capped(&mut out, SANDBOX_CAPTURE_BOUND).0);
+    let th_err = std::thread::spawn(move || drain_capped(&mut err, SANDBOX_CAPTURE_BOUND).0);
 
     let mut timed_out = false;
     let mut last_cpu: Option<u64> = None;
