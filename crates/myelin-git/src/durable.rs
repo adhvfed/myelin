@@ -111,6 +111,65 @@ pub struct DurableReflogEntry {
     pub message: String,
 }
 
+// ───────────────────────────── commit log / diff raw read shapes (GT-004) ────────────────────────
+
+/// Raw metadata for one commit read from the on-disk graph (libgit2). PII-free — `author_*` is the
+/// GIT-1 tenant pseudonym the commit was authored with (never a raw identity).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitMeta {
+    /// The full commit oid.
+    pub oid: String,
+    /// The commit summary (first line of the message).
+    pub summary: String,
+    /// The author name (the tenant pseudonym).
+    pub author_name: String,
+    /// The author email (the tenant pseudonym's `…@<tenant>.noreply`).
+    pub author_email: String,
+    /// Commit time, unix seconds.
+    pub time: i64,
+    /// The parent oids (0 = root; >1 = a merge commit).
+    pub parents: Vec<String>,
+}
+
+/// Raw per-file delta in a commit diff (libgit2 `diff_tree_to_tree`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileDelta {
+    /// The (new) file path.
+    pub path: String,
+    /// The rename/copy source path (`None` otherwise).
+    pub old_path: Option<String>,
+    /// `A`/`M`/`D`/`R`/`C`.
+    pub status: char,
+    /// The unified-diff lines: `(origin, content)` where origin is `+`/`-`/` `.
+    pub lines: Vec<(char, String)>,
+}
+
+/// Raw full detail of one commit: metadata + full message + per-file diff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitDetail {
+    /// The commit metadata.
+    pub meta: CommitMeta,
+    /// The full commit message.
+    pub message: String,
+    /// The changed files.
+    pub files: Vec<FileDelta>,
+}
+
+/// Project a libgit2 commit into the PII-free [`CommitMeta`] read shape.
+fn commit_meta(c: &git2::Commit<'_>) -> CommitMeta {
+    let author = c.author();
+    // `Commit::summary` takes `&mut self`; derive the first message line (a `&self` accessor) instead.
+    let message = c.message().unwrap_or("");
+    CommitMeta {
+        oid: c.id().to_string(),
+        summary: message.lines().next().unwrap_or("").to_string(),
+        author_name: author.name().unwrap_or("").to_string(),
+        author_email: author.email().unwrap_or("").to_string(),
+        time: c.time().seconds(),
+        parents: c.parent_ids().map(|p| p.to_string()).collect(),
+    }
+}
+
 // ───────────────────────────── the per-repo durable handle ───────────────────────────────────────
 
 /// **A real on-disk bare git repository.** Wraps the resolved `<root>/<tenant>/<region>/<repo>.git`
@@ -436,6 +495,129 @@ impl DurableGitRepo {
         Ok(out)
     }
 
+    // ── commit log + commit diff (the browse surface — GT-004; libgit2 revwalk + tree diff) ──
+
+    /// Walk the commit log from a ref tip (newest-first), returning a page of [`CommitMeta`] plus a
+    /// `has_more` flag (the cursor the edge advances). Reuses libgit2's `revwalk` over the REAL on-disk
+    /// commit graph — never a reimplemented walk. An absent ref yields an empty page (not an error).
+    pub fn commit_log(
+        &self,
+        ref_name: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<CommitMeta>, bool), DurableError> {
+        let repo = self.open_git()?;
+        let Some(tip) = self.tip_commit(&repo, ref_name)? else {
+            return Ok((Vec::new(), false));
+        };
+        let mut walk = repo.revwalk().map_err(|e| git_err("revwalk", e))?;
+        walk.set_sorting(git2::Sort::TIME).map_err(|e| git_err("revwalk sort", e))?;
+        walk.push(tip).map_err(|e| git_err("revwalk push", e))?;
+        let mut seen = 0usize;
+        let mut out = Vec::new();
+        let mut has_more = false;
+        for oid_res in walk {
+            let oid = oid_res.map_err(|e| git_err("revwalk next", e))?;
+            if seen < offset {
+                seen += 1;
+                continue;
+            }
+            if out.len() == limit {
+                has_more = true;
+                break;
+            }
+            let c = repo.find_commit(oid).map_err(|e| git_err("find_commit", e))?;
+            out.push(commit_meta(&c));
+            seen += 1;
+        }
+        Ok((out, has_more))
+    }
+
+    /// The full detail of one commit (`None` if the oid is malformed or absent): its metadata, full
+    /// message, and the per-file unified diff against the FIRST parent (the root commit diffs against
+    /// the empty tree). Reuses libgit2's `diff_tree_to_tree` over the REAL on-disk trees.
+    pub fn commit_detail(&self, oid_str: &str) -> Result<Option<CommitDetail>, DurableError> {
+        let repo = self.open_git()?;
+        let goid = match git2::Oid::from_str(oid_str) {
+            Ok(o) => o,
+            Err(_) => return Ok(None),
+        };
+        let commit = match repo.find_commit(goid) {
+            Ok(c) => c,
+            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+            Err(e) => return Err(git_err("find_commit", e)),
+        };
+        let tree = commit.tree().map_err(|e| git_err("commit tree", e))?;
+        let parent_tree = if commit.parent_count() > 0 {
+            Some(
+                commit
+                    .parent(0)
+                    .map_err(|e| git_err("parent", e))?
+                    .tree()
+                    .map_err(|e| git_err("parent tree", e))?,
+            )
+        } else {
+            None
+        };
+        let mut opts = git2::DiffOptions::new();
+        let diff = repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))
+            .map_err(|e| git_err("diff_tree_to_tree", e))?;
+
+        // Two cooperating callbacks share one accumulator via RefCell: file_cb opens a new file delta,
+        // line_cb appends lines to the current (last) one. libgit2 calls file_cb before its lines.
+        let files: std::cell::RefCell<Vec<FileDelta>> = std::cell::RefCell::new(Vec::new());
+        let mut file_cb = |delta: git2::DiffDelta<'_>, _progress: f32| {
+            let path = delta
+                .new_file()
+                .path()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let old_path = delta
+                .old_file()
+                .path()
+                .map(|p| p.to_string_lossy().to_string());
+            let status = match delta.status() {
+                git2::Delta::Added => 'A',
+                git2::Delta::Deleted => 'D',
+                git2::Delta::Renamed => 'R',
+                git2::Delta::Copied => 'C',
+                _ => 'M',
+            };
+            // A rename only carries old_path when it actually differs from path.
+            let old_path = old_path.filter(|o| o != &path);
+            files.borrow_mut().push(FileDelta {
+                path,
+                old_path,
+                status,
+                lines: Vec::new(),
+            });
+            true
+        };
+        let mut line_cb = |_delta: git2::DiffDelta<'_>,
+                           _hunk: Option<git2::DiffHunk<'_>>,
+                           line: git2::DiffLine<'_>| {
+            let origin = line.origin();
+            if matches!(origin, '+' | '-' | ' ') {
+                let content = String::from_utf8_lossy(line.content())
+                    .trim_end_matches('\n')
+                    .to_string();
+                if let Some(f) = files.borrow_mut().last_mut() {
+                    f.lines.push((origin, content));
+                }
+            }
+            true
+        };
+        diff.foreach(&mut file_cb, None, None, Some(&mut line_cb))
+            .map_err(|e| git_err("diff foreach", e))?;
+
+        Ok(Some(CommitDetail {
+            meta: commit_meta(&commit),
+            message: commit.message().unwrap_or("").to_string(),
+            files: files.into_inner(),
+        }))
+    }
+
     /// **Build a single-file web-edit commit (GT-003).** Write `contents` as a blob, rebuild the ref's
     /// top-level tree with `path` set to that blob (seeded from the current tree so OTHER entries are
     /// preserved; empty for a first commit), and write a commit whose parent is the ref's current tip.
@@ -731,6 +913,66 @@ mod tests {
             repo2.list_refs().expect("list"),
             vec![("refs/heads/main".to_string(), commit)]
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **GT-004 browse: the commit log + commit diff read the REAL on-disk graph** (libgit2 revwalk +
+    /// tree diff), newest-first, paginated, with the root commit diffing against the empty tree.
+    #[test]
+    fn commit_log_and_diff_read_the_real_graph() {
+        let root = temp_root("log");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+
+        let b1 = repo.write_blob(b"line one\n").unwrap();
+        let t1 = repo.write_tree(&[("file.txt", &b1)]).unwrap();
+        let c1 = repo
+            .write_commit(&t1, &[], "feat: first", "psn@acme.noreply", "psn@acme.noreply")
+            .unwrap();
+        repo.update_ref_cas("refs/heads/main", None, Some(&c1), "create", "psn@acme.noreply")
+            .unwrap();
+
+        let b2 = repo.write_blob(b"line one\nline two\n").unwrap();
+        let t2 = repo.write_tree(&[("file.txt", &b2)]).unwrap();
+        let c2 = repo
+            .write_commit(&t2, &[&c1], "feat: second", "psn@acme.noreply", "psn@acme.noreply")
+            .unwrap();
+        repo.update_ref_cas("refs/heads/main", Some(&c1), Some(&c2), "ff", "psn@acme.noreply")
+            .unwrap();
+
+        // Newest-first, both commits, no more within a generous page.
+        let (rows, more) = repo.commit_log("refs/heads/main", 0, 10).expect("log");
+        assert!(!more);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].oid, c2.0);
+        assert_eq!(rows[0].summary, "feat: second");
+        assert_eq!(rows[0].parents, vec![c1.0.clone()]);
+        assert_eq!(rows[1].oid, c1.0);
+
+        // Pagination: page-of-1 reports has_more; offset 1 returns the older commit.
+        let (p0, more0) = repo.commit_log("refs/heads/main", 0, 1).unwrap();
+        assert!(more0 && p0.len() == 1 && p0[0].oid == c2.0);
+        let (p1, more1) = repo.commit_log("refs/heads/main", 1, 1).unwrap();
+        assert!(!more1 && p1.len() == 1 && p1[0].oid == c1.0);
+
+        // Diff of c2 vs its parent: file.txt MODIFIED with an added "line two".
+        let detail = repo.commit_detail(&c2.0).expect("detail").expect("present");
+        assert_eq!(detail.meta.oid, c2.0);
+        assert_eq!(detail.files.len(), 1);
+        assert_eq!(detail.files[0].path, "file.txt");
+        assert_eq!(detail.files[0].status, 'M');
+        assert!(detail.files[0]
+            .lines
+            .iter()
+            .any(|(o, c)| *o == '+' && c == "line two"));
+
+        // The ROOT commit diffs against the empty tree → file.txt ADDED.
+        let root_detail = repo.commit_detail(&c1.0).unwrap().unwrap();
+        assert_eq!(root_detail.files[0].status, 'A');
+
+        // A malformed/absent oid → None (a clean 404 upstream; never a panic).
+        assert!(repo.commit_detail("not-a-real-oid").unwrap().is_none());
 
         std::fs::remove_dir_all(&root).ok();
     }

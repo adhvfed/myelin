@@ -32,8 +32,17 @@ export interface SessionRecord {
   tenant: string;
 }
 
-/** The in-memory session store (the model; durable backing is the named floor). */
-const store = new Map<string, SessionRecord>();
+/** The in-memory session store (the model; durable backing is the named floor).
+ *
+ * Backed on `globalThis` so the SSR bundle and the server-functions bundle — which vinxi/Nitro loads
+ * as SEPARATE module graphs in the SAME process — share ONE Map. Without this, a session written by a
+ * server action (server-fns bundle) is invisible to the SSR `requireViewer` on a full-reload/deep-link
+ * navigation, so every app route would bounce to `/login` on refresh. (A durable backing — Valkey/PG —
+ * is the named follow-on; this keeps the in-memory model honest while making deep-links/refresh work.) */
+const globalStore = globalThis as unknown as {
+  __myelinSessionStore?: Map<string, SessionRecord>;
+};
+const store: Map<string, SessionRecord> = (globalStore.__myelinSessionStore ??= new Map());
 
 /** Generate an opaque, unguessable session id (CSPRNG — the production-grade id the Rust model flagged). */
 function freshId(): string {
@@ -61,7 +70,11 @@ export function issueSession(rec: SessionRecord): string {
   store.set(id, rec);
   setCookie(SESSION_COOKIE, id, {
     httpOnly: true,
-    sameSite: "strict",
+    // `lax` (not `strict`): the session cookie MUST ride a top-level deep-link/full-reload navigation
+    // (e.g. opening `/git/repos/{repo}/prs/{n}` directly), which `strict` suppresses — while `lax`
+    // still withholds it from cross-site sub-requests, so the CSRF posture holds. (httpOnly keeps the
+    // opaque id out of client JS regardless.)
+    sameSite: "lax",
     path: "/",
     // Secure in production; relaxed for the http dev/test harness so the cookie is actually set.
     secure: process.env.NODE_ENV === "production",

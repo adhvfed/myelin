@@ -1114,5 +1114,124 @@ impl WebEditOutcome {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Commit log + commit diff (the browse surface — GT-004) — JSON-contract ViewModels
+// ---------------------------------------------------------------------------
+//
+// These browse ViewModels carry ONLY a `to_json` projection (no legacy HTML `render()`): the
+// load-bearing render path for the browse surface is the Solid Git web UI (GT-004), which renders
+// this JSON. Git still OWNS the data vocabulary — the edge reads the real on-disk commit objects
+// (via libgit2, the same backend `GixCore` wraps) and projects them through these ViewModels; the UI
+// never invents a parallel shape. PII-free: the author is the GIT-1 tenant pseudonym, never a raw
+// identity; `committed_at` is unix seconds (the client formats it for the viewer's locale).
+
+/// The first 12 chars of an oid — the short form the log/diff headers render (full oid is the link).
+pub fn short_oid(oid: &str) -> String {
+    oid.chars().take(12).collect()
+}
+
+/// One **commit-log row** (the browse log surface). The summary is the commit's first line; the
+/// author is the tenant pseudonym; `committed_at` is unix seconds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitRow {
+    /// The full commit oid (the diff link target).
+    pub oid: String,
+    /// The commit summary (first line of the message).
+    pub summary: String,
+    /// The author — the GIT-1 tenant pseudonym (never a raw identity).
+    pub author: String,
+    /// Commit time, unix seconds (the client formats per the viewer's locale).
+    pub committed_at: i64,
+    /// The parent oids (≥1 = a merge commit has >1; 0 = the root commit).
+    pub parents: Vec<String>,
+}
+
+impl CommitRow {
+    /// One log row as JSON `{ oid, short_oid, summary, author, committed_at, parents }`.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "oid": self.oid,
+            "short_oid": short_oid(&self.oid),
+            "summary": self.summary,
+            "author": self.author,
+            "committed_at": self.committed_at,
+            "parents": self.parents,
+        })
+    }
+}
+
+/// One **diff line** in a file delta — `origin` is `'+'` (added) / `'-'` (removed) / `' '` (context),
+/// the same three-channel signal the diff render binds (never colour alone — the `+`/`-` glyph + the
+/// line position carry the meaning for a monochrome viewer).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffLineView {
+    /// `+` add / `-` remove / ` ` context.
+    pub origin: char,
+    /// The line content (newline-trimmed).
+    pub content: String,
+}
+
+impl DiffLineView {
+    /// One diff line as JSON `{ origin, content }`.
+    pub fn to_json(&self) -> Value {
+        json!({ "origin": self.origin.to_string(), "content": self.content })
+    }
+}
+
+/// One **changed file** in a commit diff — its path, the rename source (if any), the change status
+/// (`A`/`M`/`D`/`R`/`C`), and the unified-diff lines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffFile {
+    /// The (new) file path.
+    pub path: String,
+    /// The old path for a rename/copy (`None` otherwise).
+    pub old_path: Option<String>,
+    /// The change status glyph — `A` added / `M` modified / `D` deleted / `R` renamed / `C` copied.
+    pub status: char,
+    /// The unified-diff lines (added/removed/context).
+    pub lines: Vec<DiffLineView>,
+}
+
+impl DiffFile {
+    /// One changed file as JSON `{ path, old_path, status, lines }`.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "path": self.path,
+            "old_path": self.old_path,
+            "status": self.status.to_string(),
+            "lines": self.lines.iter().map(DiffLineView::to_json).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// The **commit diff page** (the browse diff surface) — the commit header (oid/summary/full message/
+/// author/time) + the per-file unified diff against the first parent (the root commit diffs against
+/// the empty tree). Built from the real on-disk commit object (libgit2 `diff_tree_to_tree`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitDiff {
+    /// The commit header row (oid/summary/author/time/parents).
+    pub commit: CommitRow,
+    /// The full commit message (body + summary).
+    pub message: String,
+    /// The changed files (each with its unified-diff lines).
+    pub files: Vec<DiffFile>,
+}
+
+impl CommitDiff {
+    /// The commit diff page as JSON — the commit header (flattened) + `message` + `files`.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "oid": self.commit.oid,
+            "short_oid": short_oid(&self.commit.oid),
+            "summary": self.commit.summary,
+            "message": self.message,
+            "author": self.commit.author,
+            "committed_at": self.commit.committed_at,
+            "parents": self.commit.parents,
+            "files": self.files.iter().map(DiffFile::to_json).collect::<Vec<_>>(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests;

@@ -16,7 +16,14 @@ import {
   DEV_REFRESH_TOKEN,
   whoamiJson,
   reposEnvelope,
+  repoHomeJson,
+  blobJson,
+  commitsEnvelope,
+  commitDiffJson,
+  prJson,
+  prChecksJson,
   unauthorizedEnvelope,
+  notFoundEnvelope,
 } from "./dev-contract.mjs";
 
 const PORT = Number(process.env.DEV_EDGE_PORT ?? 8787);
@@ -61,6 +68,39 @@ const server = createServer((req, res) => {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
     const limit = Number(url.searchParams.get("limit") ?? 50);
     return send(res, 200, reposEnvelope(limit));
+  }
+
+  // GT-004 browse + PR routes (every one Bearer-gated; a missing seed is the uniform 404 envelope).
+  if (method === "GET") {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    const limit = Number(url.searchParams.get("limit") ?? 50);
+    const seg = (s) => decodeURIComponent(s);
+    let m;
+    // Order: more-specific (/prs/{n}/checks) before /prs/{n}.
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/checks$/))) {
+      const v = prChecksJson(seg(m[1]), Number(m[2]));
+      return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("pull request"));
+    }
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)$/))) {
+      const v = prJson(seg(m[1]), Number(m[2]));
+      return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("pull request"));
+    }
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/blob\/([^/]+)\/([^/]+)$/))) {
+      const v = blobJson(seg(m[1]), seg(m[2]), seg(m[3]));
+      return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("file"));
+    }
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/commits\/([^/]+)$/))) {
+      const v = commitsEnvelope(seg(m[1]), limit);
+      return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("repository"));
+    }
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/commit\/([^/]+)$/))) {
+      const v = commitDiffJson(seg(m[1]), seg(m[2]));
+      return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("commit"));
+    }
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)$/))) {
+      const v = repoHomeJson(seg(m[1]));
+      return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("repository"));
+    }
   }
 
   return send(res, 404, { error: { message: `no route for ${method} ${path}`, code: "not_found" } });

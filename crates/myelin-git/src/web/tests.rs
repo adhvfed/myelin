@@ -395,3 +395,43 @@ fn page_shell_is_well_formed_and_uses_semantic_tokens() {
 fn escape_neutralises_html_metacharacters() {
     assert_eq!(escape("<script>&\"'"), "&lt;script&gt;&amp;&quot;&#39;");
 }
+
+#[test]
+fn commit_row_and_diff_json_carry_the_browse_contract() {
+    // GT-004 browse ViewModels: the JSON the Solid Git web UI renders (short_oid + the +/- diff
+    // origins as the three-channel signal; PII-free pseudonymous author; unix `committed_at`).
+    let row = CommitRow {
+        oid: "0123456789abcdef0123".into(),
+        summary: "feat: land the browse surface".into(),
+        author: "u_dev@acme.noreply".into(),
+        committed_at: 1_700_000_000,
+        parents: vec!["aaaa".into()],
+    };
+    let j = row.to_json();
+    assert_eq!(j["oid"], "0123456789abcdef0123");
+    assert_eq!(j["short_oid"], "0123456789ab"); // first 12 chars
+    assert_eq!(j["author"], "u_dev@acme.noreply");
+    assert_eq!(j["committed_at"], 1_700_000_000i64);
+    assert_eq!(j["parents"][0], "aaaa");
+
+    let diff = CommitDiff {
+        commit: row,
+        message: "feat: land the browse surface\n\nbody".into(),
+        files: vec![DiffFile {
+            path: "README.md".into(),
+            old_path: None,
+            status: 'M',
+            lines: vec![
+                DiffLineView { origin: ' ', content: "context".into() },
+                DiffLineView { origin: '+', content: "added".into() },
+                DiffLineView { origin: '-', content: "removed".into() },
+            ],
+        }],
+    };
+    let dj = diff.to_json();
+    assert_eq!(dj["short_oid"], "0123456789ab");
+    assert_eq!(dj["files"][0]["path"], "README.md");
+    assert_eq!(dj["files"][0]["status"], "M");
+    assert_eq!(dj["files"][0]["lines"][1]["origin"], "+");
+    assert_eq!(dj["files"][0]["lines"][1]["content"], "added");
+}

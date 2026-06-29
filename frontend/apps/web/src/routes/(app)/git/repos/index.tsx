@@ -1,13 +1,13 @@
-// THE ONE REAL EDGE-BACKED SCREEN (MR-019): the Git repos list, rendered from the edge's RepoHome
-// ViewModel JSON. This proves the full path: shell → server-side gateway client (Bearer from the
-// httpOnly-cookie session) → edge `/v1/git/repos` → the `{items,page}` envelope of RepoHome ViewModels
-// → this Solid render. Unglamorous states are first-class (loading / error / empty-list / per-repo
-// empty). Semantic tokens only.
+// The Git repos list (GT-004), rendered from the edge's RepoHome ViewModel JSON. Proves the full path:
+// shell → server-side gateway client → edge `/v1/git/repos` → the `{items,page}` envelope of RepoHome
+// ViewModels → this Solid render. Each repo links to its home screen. Unglamorous states are
+// first-class (loading / error / empty-list / per-repo empty). Semantic tokens only.
 import { ErrorBoundary, For, Show, Suspense } from "solid-js";
 import { Title } from "@solidjs/meta";
-import { createAsync } from "@solidjs/router";
+import { A, createAsync } from "@solidjs/router";
 import { Icon } from "@myelin/design-system";
-import { getRepos, type RepoHomeVM } from "../../../lib/api";
+import { getRepos, type RepoHomeVM } from "~/lib/api";
+import { bareRepo } from "~/lib/format";
 
 export default function ReposScreen() {
   const repos = createAsync(() => getRepos());
@@ -27,10 +27,7 @@ export default function ReposScreen() {
         )}
       >
         <Suspense fallback={<p style={{ color: "var(--text-muted)" }}>Loading repositories…</p>}>
-          <Show
-            when={repos()}
-            keyed
-          >
+          <Show when={repos()} keyed>
             {(page) => (
               <Show
                 when={page.items.length > 0}
@@ -75,18 +72,24 @@ function RepoRow(props: { repo: RepoHomeVM }) {
             when={props.repo.state === "empty"}
             fallback={<span style={{ color: "var(--text-subtle)" }}>Restricted repository</span>}
           >
-            <span style={{ display: "flex", "align-items": "center", gap: "var(--space-2)" }}>
+            <A
+              href={`/git/repos/${bareRepo(props.repo.slug)}`}
+              style={{ display: "flex", "align-items": "center", gap: "var(--space-2)", color: "var(--text-primary)" }}
+            >
               <Icon name="repo" />
               <strong>{props.repo.slug}</strong>
               <span style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>empty · push to get started</span>
-            </span>
+            </A>
           </Show>
         }
       >
-        <span style={{ display: "flex", "align-items": "center", gap: "var(--space-2)" }}>
+        <A
+          href={`/git/repos/${bareRepo(props.repo.slug)}`}
+          style={{ display: "flex", "align-items": "center", gap: "var(--space-2)", color: "var(--text-primary)" }}
+        >
           <Icon name="repo" />
           <strong>{props.repo.slug}</strong>
-        </span>
+        </A>
         <Show when={props.repo.readme_excerpt}>
           {(excerpt) => (
             <span style={{ color: "var(--text-muted)", "font-size": "var(--fs-body-sm)" }}>{excerpt()}</span>
