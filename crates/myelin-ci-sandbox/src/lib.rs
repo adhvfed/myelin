@@ -430,6 +430,51 @@ pub struct SandboxHandle {
 /// boundary). The bound is enforced when CT-002 wires real capture; the SHAPE carries it now.
 pub const SANDBOX_CAPTURE_BOUND: usize = 256 * 1024;
 
+/// Drain a child stream (a guest pipe / serial console) into an owned buffer that is HARD-bounded to
+/// `limit` bytes of **HEAD** capture (the first `limit` bytes — matching the existing head-bound
+/// semantics), then KEEP READING the remainder into a small fixed throwaway buffer and DISCARD it to
+/// EOF.
+///
+/// This is the CT-002c host-side memory-DoS fix shared by BOTH production-exec backends
+/// (Firecracker serial console + gVisor `runsc` stdout/stderr). The previous code did
+/// `read_to_end`-then-`truncate`, so an untrusted workload emitting at high rate until `timeout_secs`
+/// could force this HOST drain thread to buffer multi-GB BEFORE the bound was applied (the guest's
+/// cgroup mem limit does not bound a HOST allocation). Here host memory is bounded to
+/// `limit` + the 64 KiB throwaway chunk REGARDLESS of how much the workload emits.
+///
+/// Crucially it keeps READING (and discarding) past the bound rather than stopping: if we stopped
+/// reading, a chatty guest would fill the OS pipe buffer and BLOCK on write, hanging until the
+/// timeout-kill — defeating prompt termination and risking a cross-stream deadlock. Draining-and-
+/// discarding applies no backpressure, so the guest runs to its real exit / the timeout fires cleanly.
+///
+/// Returns the captured head bytes and whether any bytes beyond the bound were seen (`truncated`).
+pub(crate) fn drain_capped<R: std::io::Read>(mut r: R, limit: usize) -> (Vec<u8>, bool) {
+    let mut head = Vec::new();
+    let mut truncated = false;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => break, // EOF: the guest pipe closed (child exited or was whole-guest-killed).
+            Ok(n) => {
+                if head.len() < limit {
+                    let take = (limit - head.len()).min(n);
+                    head.extend_from_slice(&chunk[..take]);
+                    if take < n {
+                        truncated = true; // overflowed the head bound this read
+                    }
+                } else {
+                    // Already at the bound: read into `chunk` and DISCARD — bounded host memory, but
+                    // the pipe keeps draining so the guest never blocks on a full pipe.
+                    truncated = true;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break, // pipe error ⇒ treat as end-of-stream; the wait/kill loop owns lifecycle.
+        }
+    }
+    (head, truncated)
+}
+
 /// **The result of running a job's command inside the sandbox (RESHAPE-001 / CT-001).** This is the
 /// in-line compute outcome the runner DERIVES its [`TerminalReport`](crate::runner::TerminalReport)
 /// from — `passed = exit_code == Some(0) && !timed_out`. Before this reshape the seam could carry

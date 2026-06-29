@@ -31,7 +31,7 @@ use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
     ReserveHandle, ResourceLimits, RunTokenRef, RunnerHooks, SandboxBackend, TrustTier,
-    WorkspaceSpec,
+    WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
 };
 use std::path::Path;
 use std::time::Instant;
@@ -222,6 +222,76 @@ fn real_runsc_runs_untrusted_command_non_root() {
     );
 
     backend.kill(&launch.handle).expect("teardown");
+}
+
+/// CT-002c host-side memory-DoS regression (REAL `runsc`). An untrusted workload emits FAR more than
+/// `SANDBOX_CAPTURE_BOUND` (here ~8 MiB) straight onto the container's stdout pipe — vastly exceeding
+/// the 256 KiB host capture cap AND the ~64 KiB OS pipe buffer. The fix proves BOTH properties:
+///   (a) BOUNDED HOST MEMORY — `result.stdout.len() <= SANDBOX_CAPTURE_BOUND`: the host drain thread
+///       head-captures at most the cap and DISCARDS the rest, so it never buffers the whole stream
+///       (the old `read_to_end`-then-truncate would have buffered all ~8 MiB before truncating).
+///   (b) NO PIPE DEADLOCK — the run TERMINATES with the REAL exit (`Some(0)`), NOT a timeout. The
+///       flood is far larger than the pipe buffer; because the host KEEPS READING past the cap
+///       (drain-and-discard) the container's writer never blocks, so it reaches its real exit. A
+///       buggy "stop reading at the cap" would block the writer, hang the container, force a timeout.
+#[test]
+fn real_runsc_runaway_stdout_is_capped_without_deadlock() {
+    let Some(_bin) = require_or_skip("gvisor-prod-exec runaway-stdout-cap") else {
+        return;
+    };
+    let backend = GvisorBackend::new();
+    // Emit ~8 MiB of 'x' to stdout, then exit 0 (the pipeline's last command, `tr`, exits 0). dd,
+    // /dev/zero and tr are all present in the staged rootfs (used by the escape drill).
+    let spec = spec_running(
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "dd if=/dev/zero bs=4096 count=2048 2>/dev/null | tr '\\0' 'x'".into(),
+        ],
+        60,
+    );
+
+    let start = Instant::now();
+    let launch = backend
+        .launch(&spec, &ok_hooks())
+        .expect("the production launch must run the runaway-output container");
+    let elapsed = start.elapsed();
+    let result = &launch.result;
+
+    println!("=== CT-002c REAL gVisor runaway-stdout host-memory-DoS cap ===");
+    println!(
+        "exit_code = {:?}  timed_out = {}  elapsed = {:?}",
+        result.exit_code, result.timed_out, elapsed
+    );
+    println!(
+        "captured stdout.len() = {}  (bound = {})",
+        result.stdout.len(),
+        SANDBOX_CAPTURE_BOUND
+    );
+
+    // (a) host memory stayed bounded: the captured head is <= the per-stream bound.
+    assert!(
+        result.stdout.len() <= SANDBOX_CAPTURE_BOUND,
+        "captured stdout MUST be head-bounded to <= {SANDBOX_CAPTURE_BOUND}; got {} (a runaway \
+         container must not be able to force the host to buffer the whole stream)",
+        result.stdout.len()
+    );
+    // (b) the run TERMINATED with the real exit — no pipe deadlock that defeats the timeout.
+    assert_eq!(
+        result.exit_code,
+        Some(0),
+        "the run must terminate with the REAL exit (drain-and-discard keeps the pipe moving so the \
+         container's writer never blocks); got exit {:?} timed_out={}",
+        result.exit_code,
+        result.timed_out
+    );
+    assert!(
+        !result.timed_out,
+        "an ~8 MiB completing flood must NOT time out — a timeout here would mean the host stopped \
+         draining and the container deadlocked on a full stdout pipe"
+    );
+
+    backend.kill(&launch.handle).expect("teardown is idempotent");
 }
 
 #[test]

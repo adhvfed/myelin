@@ -37,8 +37,8 @@
 
 use crate::hardening::HardeningProfile;
 use crate::{
-    JobSpec, ResourceUsage, RunnerHooks, SandboxBackend, SandboxHandle, SandboxLaunch,
-    SandboxResult, SANDBOX_CAPTURE_BOUND,
+    drain_capped, JobSpec, ResourceUsage, RunnerHooks, SandboxBackend, SandboxHandle,
+    SandboxLaunch, SandboxResult, SANDBOX_CAPTURE_BOUND,
 };
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -98,6 +98,16 @@ const MARK_STDOUT_END: &str = "__MYELIN_STDOUT_B64_END__";
 const MARK_STDERR_BEGIN: &str = "__MYELIN_STDERR_B64_BEGIN__";
 const MARK_STDERR_END: &str = "__MYELIN_STDERR_B64_END__";
 const MARK_EXIT: &str = "__MYELIN_EXIT__";
+
+/// Host-side cap on the buffered serial console (CT-002c). Unlike gVisor's two separate pipes, the
+/// Firecracker console is ONE stream interleaving the kernel boot log with the nonce-framed base64 of
+/// BOTH streams; the per-stream `SANDBOX_CAPTURE_BOUND` head bound is applied AFTER base64-decoding in
+/// [`capture_stream`]. base64 inflates 4/3 and coreutils wraps at 76 cols, so two streams each at the
+/// 256 KiB bound need ~2×(256 KiB × 4/3 × 1.013) ≈ 710 KiB plus the boot log + markers. 8× the bound
+/// (2 MiB) comfortably holds a full LEGITIMATE capture (head-bound semantics preserved — both streams
+/// can still reach 256 KiB decoded, and the trailing exit line survives) while HARD-bounding the host
+/// drain thread to 2 MiB + the throwaway chunk regardless of how much an untrusted guest emits.
+const CONSOLE_CAPTURE_BOUND: usize = 8 * SANDBOX_CAPTURE_BOUND;
 
 fn default_kernel() -> PathBuf {
     if let Ok(p) = std::env::var(ENV_FC_KERNEL) {
@@ -681,16 +691,11 @@ fn spawn_and_capture(
     // Drain both pipes on threads so a chatty guest console cannot fill a pipe buffer and deadlock.
     let mut out = child.stdout.take().expect("piped stdout");
     let mut err = child.stderr.take().expect("piped stderr");
-    let th_out = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = out.read_to_end(&mut b);
-        b
-    });
-    let th_err = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = err.read_to_end(&mut b);
-        b
-    });
+    // CT-002c: cap each drained stream at CONSOLE_CAPTURE_BOUND (head capture) and DISCARD the rest to
+    // EOF — bounds host memory under a runaway guest while still draining the pipe so the guest never
+    // blocks on a full pipe (no deadlock that would defeat the timeout).
+    let th_out = std::thread::spawn(move || drain_capped(&mut out, CONSOLE_CAPTURE_BOUND).0);
+    let th_err = std::thread::spawn(move || drain_capped(&mut err, CONSOLE_CAPTURE_BOUND).0);
 
     let mut timed_out = false;
     let mut last_cpu: Option<u64> = None;
