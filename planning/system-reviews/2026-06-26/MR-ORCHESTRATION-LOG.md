@@ -322,3 +322,17 @@ green: pg connect, s3 put/get, rebac tuples, outbox→bus relay, valkey cache):
   harness drill). **The sandbox production-exec floor (P-544/545) is now genuinely proven — this unblocks CT-006
   (the git wire / GT-006) and CT-007 (the GitHub-Actions cutover).** User enabled `loginctl enable-linger` so the
   rootless memory cgroup enforcement holds headlessly.
+
+- **CT-006a — sandbox git-wire capability — COMMITTED 15b01a3.** First prompt of the git wire (GT-006). gVisor
+  `launch_git_wire(GitWireSpec)` runs canonical `git upload-pack/receive-pack --stateless-rpc` against a bare
+  repo bind-mounted RO at /repo (+ optional writable /quarantine, bounded stdin, captured stdout) under the full
+  CT-002/003 hardening. JobSpec left byte-frozen (focused wire path). Path resolved via a byte-for-byte REPLICA
+  of GT-001's validator (myelin-git is dev-dep-only — a prod CI→Git edge would break X-1 acyclic). Real-runsc
+  proof: upload-pack advertise-refs + v2 ls-refs return the real HEAD oid; RO enforced (in-guest write → EROFS,
+  host repo byte-identical); cross-tenant/.. refused pre-mount. Independent security verifier: PASS — RO holds
+  vs all write syscalls, symlink reads confined to the guest ns, no parent/sibling exposure, stdin-bound +
+  egress-deny intact, and **the replica validator has ZERO drift vs the GT-001 original over a hostile corpus**
+  (the deferred drift check, done). Two CT-006b follow-ups: (1) defense-in-depth reject a symlinked repo PATH
+  before mount (symlink_metadata/canonicalize; gated by a prior host-fs breach); (2) **the writable quarantine
+  is EINVAL under rootless runsc — the receive-pack/push intake path is a real CT-006b problem** (CT-006a proved
+  only the read/upload-pack path). Needs a git-bearing rootfs (MYELIN_GVISOR_GIT_ROOTFS).
