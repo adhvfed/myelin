@@ -236,6 +236,20 @@ pub mod gix_backend;
 /// companion to the read backend [`gix_backend::GixCore`] — REUSES the same resolver + `git2`,
 /// never reimplements git. The smart-transport WIRE sits on this (GT-006, sandbox-gated).
 pub mod durable;
+/// **GT-003 (E1.2) — the cross-system recovery reconciler.** [`reconcile::reconcile_refs`] replays the
+/// committed `git.ref.updated` outbox rows against the durable on-disk repo, re-applying any whose
+/// on-disk `update_seq` is behind the durable reflog (the apply-after-outbox-commit crash window —
+/// [`receive_pack::CrashPoint::AfterCommitBeforeApply`]). At-least-once + idempotent on `update_seq`
+/// (arch §4.2); the GT-001 prerequisite for the durable store reaching the live front door. Reuses the
+/// durable per-ref CAS + the on-disk reflog as the generation — no parallel ref store, no parallel seq.
+pub mod reconcile;
+/// **GT-003 (E1.2) — the DURABLE PR/review store + the gated, durable merge.** [`pr_store::DurablePrStore`]
+/// persists the [`lifecycle`] PR/review entities as on-disk repo metadata (tenant/region path-isolated via
+/// the SAME validated resolver the durable git store uses); [`pr_store::merge_pr`] evaluates the reused
+/// [`merge_gate`] (required-set + fork-trust) + [`lifecycle::evaluate_ruleset`] (approvals/CODEOWNERS/
+/// conversations) and advances the target ref via the durable per-ref CAS ONLY on a fully-admitted gate —
+/// never a policy bypass. The PG home for these rows (MR-022 provider) is the named GT-003b follow-on.
+pub mod pr_store;
 /// **GT-002 (E1.1) — REAL git-repo backup + DESTRUCTIVE restore.** [`backup::GitRepoBackup`] captures
 /// a GT-001 on-disk bare repo's complete object graph + refs into a single self-contained artifact (a
 /// ref snapshot + a non-thin libgit2 packfile — the canonical `git bundle`-style mechanism, NOT a

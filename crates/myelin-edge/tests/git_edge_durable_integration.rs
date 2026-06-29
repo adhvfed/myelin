@@ -1,0 +1,428 @@
+//! # GT-003 — Git durable front door: real HTTP integration proofs (builder ≠ verifier oracle).
+//!
+//! Binds an ephemeral TCP port, serves the edge with Git's routes registered over the DURABLE on-disk
+//! backend ([`myelin_edge::register_git_durable`]), and drives REAL HTTP round-trips with real minted
+//! capability tokens. Proves:
+//!  - (A) **writes PERSIST** — create-repo + a web-edit commit through the edge are read back from disk;
+//!        a FRESH backend instance over the SAME root (a simulated restart) still serves them.
+//!  - (B) **merge-gate ENFORCED + durable ref-advance** — a merge with unmet required checks is REFUSED
+//!        (no ref advance); with checks green + an approval the merge advances the base ref durably.
+//!  - (C) **tenant isolation + traversal-safety** — an acme repo is invisible to globex; a `../`-laden
+//!        repo slug is refused (the validated resolver), never escaping the tenant root.
+
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::Response;
+use hyper::Request;
+use hyper_util::rt::TokioIo;
+use myelin_edge::{
+    register_git_durable, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
+};
+use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
+use myelin_identity_service::{
+    CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
+    PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
+};
+use myelin_storage::{KmsEngine, TenantScope};
+use myelin_tenancy::{Region, TenantId};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::net::{TcpListener, TcpStream};
+
+const REGION: &str = "eu-west";
+const SCHEME: &str = "agent";
+
+fn now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
+fn temp_root(tag: &str) -> PathBuf {
+    let mut p = std::env::temp_dir();
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    p.push(format!("myelin-edge-gt003-{tag}-{nanos}"));
+    p
+}
+
+fn admin_scope(tenant: &str) -> TenantScope {
+    TenantScope::from_verified_token(
+        &Principal::stub(
+            PrincipalId("admin".into()),
+            PrincipalKind::Human,
+            TenantId(tenant.into()),
+        ),
+        Region(REGION.into()),
+    )
+}
+
+fn seed_principal(store: &PrincipalStore, tenant: &str, pid: &str, subject_key: &str) {
+    let scope = admin_scope(tenant);
+    store
+        .put_principal(
+            &scope,
+            PrincipalId(pid.into()),
+            PrincipalKind::Service,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+            None,
+        )
+        .expect("seed principal");
+    store
+        .link_credential(&scope, SCHEME, subject_key, &PrincipalId(pid.into()))
+        .expect("link credential");
+}
+
+fn seed_tenant(store: &PrincipalStore, tenant: &str) {
+    // Two principals per tenant: an author (subj-1) and a distinct reviewer (subj-2) — so a NON-author
+    // approval can be genuinely submitted (a self-approval must not count toward the threshold).
+    seed_principal(store, tenant, "svc:agent", "subj-1");
+    seed_principal(store, tenant, "svc:reviewer", "subj-2");
+}
+
+/// A test authorizer that DENIES one action (proving the gateway re-authorizes per action). All else is
+/// allowed. Used to prove the repo-admin branch-protection op is authorization-gated.
+struct DenyAction(&'static str);
+impl myelin_substrate::Authorizer for DenyAction {
+    fn authorize(&self, _principal: &Principal, action: &str) -> bool {
+        action != self.0
+    }
+}
+
+/// Build a gateway with Git registered over a DURABLE backend rooted at `root` + a chosen authorizer.
+fn build_with(
+    root: &std::path::Path,
+    authorizer: Arc<dyn myelin_substrate::Authorizer>,
+) -> (Arc<Gateway>, CellTokenAuthority) {
+    let cell = CellTokenAuthority::from_seed(&[7u8; 32], &[9u8; 32]).expect("cell authority");
+    let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+    seed_tenant(&store, "acme");
+    seed_tenant(&store, "globex");
+
+    let authn = Arc::new(CapabilityAuthenticator::with_verifier(
+        store,
+        Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
+        RevocationStore::new(),
+    ));
+    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(
+        KmsEngine::new(),
+    ))));
+
+    let backend = Arc::new(DurableGitBackend::rooted(root.to_path_buf()));
+    let mut builder = Gateway::builder(authn, human_login, authorizer).route(
+        Method::Get,
+        "/v1/whoami",
+        "edge.whoami",
+        Arc::new(WhoamiHandler),
+    );
+    builder = register_git_durable(builder, backend);
+    (Arc::new(builder.build()), cell)
+}
+
+fn build(root: &std::path::Path) -> (Arc<Gateway>, CellTokenAuthority) {
+    build_with(root, Arc::new(AllowAll))
+}
+
+fn mint(cell: &CellTokenAuthority, tenant: &str, jti: &str) -> String {
+    mint_as(cell, tenant, "subj-1", jti)
+}
+
+fn mint_as(cell: &CellTokenAuthority, tenant: &str, subject_key: &str, jti: &str) -> String {
+    cell.mint(&CapabilityMintSpec {
+        tenant: tenant.into(),
+        region: REGION.into(),
+        subject_key: subject_key.into(),
+        jti: jti.into(),
+        exp_unix: now() + 3600,
+        authority: vec!["agent:run".into()],
+        dpop_jkt: None,
+    })
+}
+
+async fn spawn(gateway: Arc<Gateway>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_edge(listener, gateway).await;
+    });
+    addr
+}
+
+async fn open(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+) -> Response<Incoming> {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let mut builder = Request::builder().method(method).uri(path).header("host", "edge.test");
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let req = builder.body(Full::new(Bytes::from(body))).unwrap();
+    sender.send_request(req).await.unwrap()
+}
+
+async fn http(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+) -> (u16, serde_json::Value) {
+    let resp = open(addr, method, path, headers, body).await;
+    let status = resp.status().as_u16();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, v)
+}
+
+fn bearer(token: &str) -> [(&'static str, String); 2] {
+    [
+        ("authorization", format!("Bearer {token}")),
+        ("x-myelin-token-scheme", SCHEME.to_string()),
+    ]
+}
+fn hdr<'a>(b: &'a [(&'static str, String); 2]) -> Vec<(&'a str, &'a str)> {
+    b.iter().map(|(k, v)| (*k, v.as_str())).collect()
+}
+
+/// (A) Writes PERSIST: create-repo + a web-edit commit are durable, reads reflect them, and a FRESH
+/// backend over the SAME on-disk root (a simulated restart) still serves them.
+#[tokio::test]
+async fn writes_persist_across_a_fresh_backend_restart() {
+    let root = temp_root("persist");
+    let (gw, cell) = build(&root);
+    let addr = spawn(gw).await;
+    let h = bearer(&mint(&cell, "acme", "jti-a1"));
+
+    // create-repo → durable:true.
+    let (st, cv) = http(addr, "POST", "/v1/git/repos", &hdr(&h), br#"{"slug":"alpha"}"#.to_vec()).await;
+    assert_eq!(st, 201, "create-repo: {cv}");
+    assert_eq!(cv["durable"], true);
+
+    // a fresh repo lists as Empty (no commits) — the durable read, not a seed.
+    let (_, lv) = http(addr, "GET", "/v1/git/repos", &hdr(&h), vec![]).await;
+    assert_eq!(lv["items"].as_array().unwrap().len(), 1, "alpha listed: {lv}");
+    assert_eq!(lv["items"][0]["state"], "empty");
+
+    // web-edit commit on main creates README.md durably.
+    let (wc, wv) = http(
+        addr,
+        "POST",
+        "/v1/git/repos/alpha/blob/main/README.md",
+        &hdr(&h),
+        br##"{"base_oid":"","contents":"# acme/alpha durable\n","message":"init"}"##.to_vec(),
+    )
+    .await;
+    assert_eq!(wc, 200, "web-edit: {wv}");
+    assert_eq!(wv["durable"], true, "the web-edit commit PERSISTS (durable:true)");
+    assert_eq!(wv["applied"]["outcome"], "committed");
+
+    // the blob view now reflects the durable write.
+    let (bc, bv) = http(addr, "GET", "/v1/git/repos/alpha/blob/main/README.md", &hdr(&h), vec![]).await;
+    assert_eq!(bc, 200, "blob: {bv}");
+    assert_eq!(bv["contents"], "# acme/alpha durable\n");
+    let base_oid = bv["base_oid"].as_str().unwrap().to_string();
+    assert!(!base_oid.is_empty(), "the durable blob carries a real content-address");
+
+    // repo now lists as Populated with the README in the tree.
+    let (_, lv2) = http(addr, "GET", "/v1/git/repos", &hdr(&h), vec![]).await;
+    assert_eq!(lv2["items"][0]["state"], "populated");
+
+    // A stale base is the honest 409 (GF-6) — no silent overwrite.
+    let (sc, _sv) = http(
+        addr,
+        "POST",
+        "/v1/git/repos/alpha/blob/main/README.md",
+        &hdr(&h),
+        br##"{"base_oid":"blake3:STALE","contents":"# clobber\n","message":"x"}"##.to_vec(),
+    )
+    .await;
+    assert_eq!(sc, 409, "a stale base is refused");
+
+    // === RESTART: a FRESH backend + gateway over the SAME root. ===
+    let (gw2, cell2) = build(&root);
+    let addr2 = spawn(gw2).await;
+    let h2 = bearer(&mint(&cell2, "acme", "jti-a2"));
+    let (rc, rv) = http(addr2, "GET", "/v1/git/repos", &hdr(&h2), vec![]).await;
+    assert_eq!(rc, 200);
+    assert_eq!(rv["items"].as_array().unwrap().len(), 1, "alpha survived the restart");
+    assert_eq!(rv["items"][0]["state"], "populated");
+    let (bc2, bv2) = http(addr2, "GET", "/v1/git/repos/alpha/blob/main/README.md", &hdr(&h2), vec![]).await;
+    assert_eq!(bc2, 200);
+    assert_eq!(bv2["contents"], "# acme/alpha durable\n", "the web-edit survived the restart");
+    assert_eq!(bv2["base_oid"], base_oid, "same durable content-address after restart");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// (B) **Merge bypass CLOSED + gated, durable ref-advance.** Branch-protection policy is REPO-OWNED, not
+/// author-supplied: a PR author cannot weaken the gate by passing loose policy / self-claimed greens at
+/// open (those fields are ignored) or by self-approving. A protected ref defaults CLOSED. The merge
+/// advances the base ref durably ONLY with the repo-required checks genuinely green (CI-reported) + a
+/// genuine NON-author approval; an arbitrary head_oid is refused.
+#[tokio::test]
+async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
+    let root = temp_root("merge");
+    let (gw, cell) = build(&root);
+    let addr = spawn(gw).await;
+    let author = bearer(&mint(&cell, "acme", "jti-author")); // subj-1 → svc:agent (the PR author)
+    let reviewer = bearer(&mint_as(&cell, "acme", "subj-2", "jti-rev")); // svc:reviewer (non-author)
+
+    http(addr, "POST", "/v1/git/repos", &hdr(&author), br#"{"slug":"svc"}"#.to_vec()).await;
+    // The author creates a feature head commit via a web-edit; capture its commit oid.
+    let (_, wv) = http(
+        addr,
+        "POST",
+        "/v1/git/repos/svc/blob/feature/app.txt",
+        &hdr(&author),
+        br#"{"base_oid":"","contents":"v1\n","message":"feat"}"#.to_vec(),
+    )
+    .await;
+    let head_oid = wv["applied"]["new_oid"].as_str().unwrap().to_string();
+
+    // ===== ATTACK (A+B): the author opens a PR to PROTECTED main supplying loose policy + greens in the
+    // body (all IGNORED), then SELF-approves, then tries to merge. Must be BLOCKED. =====
+    let attack_body = format!(
+        r#"{{"base_ref":"refs/heads/main","head_ref":"refs/heads/feature","head_oid":"{head_oid}","required_contexts":[],"required_approvals":0,"green_contexts":["ci/build"]}}"#
+    );
+    let (oc1, _o1) = http(addr, "POST", "/v1/git/repos/svc/prs", &hdr(&author), attack_body.into_bytes()).await;
+    assert_eq!(oc1, 201);
+    // self-approval by the author.
+    http(addr, "POST", "/v1/git/repos/svc/prs/1/reviews", &hdr(&author), br#"{"verdict":"approve"}"#.to_vec()).await;
+    let (mc1, mv1) = http(addr, "POST", "/v1/git/repos/svc/prs/1/merge", &hdr(&author), vec![]).await;
+    assert_eq!(mc1, 409, "the bypass is closed: loose policy + self-approval cannot merge protected main: {mv1}");
+    let (gb, _gv) = http(addr, "GET", "/v1/git/repos/svc/blob/main/app.txt", &hdr(&author), vec![]).await;
+    assert_eq!(gb, 404, "no ref advance on the blocked bypass attempt");
+
+    // ===== LEGIT: repo-admin configures protection (repo-owned); CI reports greens; a NON-author
+    // reviewer approves; then the merge is admitted and advances the ref durably. =====
+    let (sp, _sv) = http(
+        addr,
+        "POST",
+        "/v1/git/repos/svc/branch-protection",
+        &hdr(&author), // AllowAll here; the AUTHZ gate is proven in the dedicated test below
+        br#"{"rulesets":[{"ref_pattern":"refs/heads/main","required_contexts":["ci/build"],"required_approvals":1}]}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(sp, 200, "repo-admin sets branch protection");
+
+    // open a fresh PR #2 (the proposal only — no policy/greens accepted).
+    let body2 = format!(
+        r#"{{"base_ref":"refs/heads/main","head_ref":"refs/heads/feature","head_oid":"{head_oid}"}}"#
+    );
+    http(addr, "POST", "/v1/git/repos/svc/prs", &hdr(&author), body2.into_bytes()).await;
+
+    // no greens, no approval → blocked.
+    let (m2a, _) = http(addr, "POST", "/v1/git/repos/svc/prs/2/merge", &hdr(&author), vec![]).await;
+    assert_eq!(m2a, 409, "repo-required ci/build not green → blocked");
+
+    // CI reports the required check green (the authorized producer path — NOT the author at open).
+    let (cr, _crv) = http(
+        addr,
+        "POST",
+        "/v1/git/repos/svc/prs/2/checks",
+        &hdr(&author), // AllowAll; production gates git.checks.report to CI
+        br#"{"green_contexts":["ci/build"]}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(cr, 200);
+    // green but still no NON-author approval → blocked.
+    let (m2b, _) = http(addr, "POST", "/v1/git/repos/svc/prs/2/merge", &hdr(&author), vec![]).await;
+    assert_eq!(m2b, 409, "green but no non-author approval → blocked");
+
+    // a genuine NON-author approval (the reviewer principal).
+    http(addr, "POST", "/v1/git/repos/svc/prs/2/reviews", &hdr(&reviewer), br#"{"verdict":"approve"}"#.to_vec()).await;
+    let (m2c, mv2c) = http(addr, "POST", "/v1/git/repos/svc/prs/2/merge", &hdr(&author), vec![]).await;
+    assert_eq!(m2c, 200, "genuine greens + non-author approval → admitted: {mv2c}");
+    assert_eq!(mv2c["applied"]["new_oid"], head_oid, "base ref advanced to the head");
+
+    // The merged ref is durable across a fresh-backend restart.
+    let (gw2, cell2) = build(&root);
+    let addr2 = spawn(gw2).await;
+    let h2 = bearer(&mint(&cell2, "acme", "jti-m2"));
+    let (gb3, gv3) = http(addr2, "GET", "/v1/git/repos/svc/blob/main/app.txt", &hdr(&h2), vec![]).await;
+    assert_eq!(gb3, 200, "the merged ref survived the restart");
+    assert_eq!(gv3["contents"], "v1\n");
+
+    // ===== INVALID HEAD: a PR naming a bogus head_oid is refused (no advance to an arbitrary oid). =====
+    let bogus = "0".repeat(40);
+    let body3 = format!(
+        r#"{{"base_ref":"refs/heads/feat2","head_ref":"refs/heads/x","head_oid":"{bogus}"}}"#
+    );
+    http(addr, "POST", "/v1/git/repos/svc/prs", &hdr(&author), body3.into_bytes()).await;
+    let (m3, _m3v) = http(addr, "POST", "/v1/git/repos/svc/prs/3/merge", &hdr(&author), vec![]).await;
+    assert_eq!(m3, 400, "a non-existent head_oid is refused");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// (D) The repo-admin branch-protection op is AUTHORIZATION-gated: a gateway whose authorizer denies
+/// `git.repo.branch_protection.set` rejects the call (403) — a non-admin cannot set/weaken protection.
+#[tokio::test]
+async fn branch_protection_set_is_authorization_gated() {
+    let root = temp_root("authz");
+    let (gw, cell) = build_with(&root, Arc::new(DenyAction("git.repo.branch_protection.set")));
+    let addr = spawn(gw).await;
+    let h = bearer(&mint(&cell, "acme", "jti-d"));
+    http(addr, "POST", "/v1/git/repos", &hdr(&h), br#"{"slug":"svc"}"#.to_vec()).await;
+    let (sc, sv) = http(
+        addr,
+        "POST",
+        "/v1/git/repos/svc/branch-protection",
+        &hdr(&h),
+        br#"{"rulesets":[{"ref_pattern":"refs/heads/main","required_approvals":0}]}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(sc, 403, "a non-admin cannot set/weaken branch protection: {sv}");
+    // A non-denied git action still works (the deny is per-action, not blanket).
+    let (lc, _lv) = http(addr, "GET", "/v1/git/repos", &hdr(&h), vec![]).await;
+    assert_eq!(lc, 200, "other git actions are unaffected");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// (C) Tenant isolation + traversal-safety: an acme repo is invisible to globex; a `../`-laden slug is
+/// refused by the validated resolver (never escaping the tenant root).
+#[tokio::test]
+async fn tenant_isolation_and_traversal_safety() {
+    let root = temp_root("iso");
+    let (gw, cell) = build(&root);
+    let addr = spawn(gw).await;
+    let acme = bearer(&mint(&cell, "acme", "jti-acme"));
+    let globex = bearer(&mint(&cell, "globex", "jti-globex"));
+
+    // acme creates a repo.
+    let (c, _) = http(addr, "POST", "/v1/git/repos", &hdr(&acme), br#"{"slug":"secret"}"#.to_vec()).await;
+    assert_eq!(c, 201);
+
+    // acme sees it; globex sees NOTHING (tenant-partitioned by the verified token).
+    let (_, av) = http(addr, "GET", "/v1/git/repos", &hdr(&acme), vec![]).await;
+    assert_eq!(av["items"].as_array().unwrap().len(), 1);
+    let (_, gv) = http(addr, "GET", "/v1/git/repos", &hdr(&globex), vec![]).await;
+    assert_eq!(gv["items"].as_array().unwrap().len(), 0, "globex cannot see acme's repo: {gv}");
+
+    // globex cannot read acme's repo blob (it does not exist under globex's tenant path).
+    let (gb, _) = http(addr, "GET", "/v1/git/repos/secret/blob/main/README.md", &hdr(&globex), vec![]).await;
+    assert_eq!(gb, 404);
+
+    // A traversal-laden repo slug is refused by the validated resolver → 400 (never escapes the root).
+    let (tc, _tv) = http(
+        addr,
+        "POST",
+        "/v1/git/repos",
+        &hdr(&acme),
+        br#"{"slug":"../../globex/eu-west/secret"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(tc, 400, "a traversal slug is refused");
+
+    std::fs::remove_dir_all(&root).ok();
+}

@@ -13,7 +13,7 @@
 //! `127.0.0.1:8080`).
 
 use myelin_edge::{
-    register_git, serve_edge, AllowAll, Gateway, GitEdgeState, Method, WhoamiHandler,
+    register_git_durable, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
 };
 use myelin_identity_service::{
     CapabilityAuthenticator, CellTokenAuthority, HumanSsoAuthenticator, PasetoCapabilityVerifier,
@@ -38,11 +38,16 @@ async fn main() {
         KmsEngine::new(),
     ))));
 
-    // The Git subsystem wired through the edge (MR-015): its `/v1/git/...` routes serve Git's real
-    // ViewModels as JSON. The bootable shell seeds a representative demo tenant from Git's OWN
-    // ViewModels; the durable repo/ref backing is the Git track (E1.1). The production composition root
-    // (a real per-tenant git backend behind `GitEdgeState`) is the Git-track follow-on.
-    let git_state = Arc::new(GitEdgeState::new().seed_demo("acme"));
+    // The Git subsystem wired through the edge over the DURABLE on-disk backend (GT-003): its
+    // `/v1/git/...` write handlers PERSIST on real on-disk bare repos (GT-001) under the verified tenant
+    // scope + the merge-gate/fork-trust policy, and its reads reflect the durable state. The on-disk root
+    // is `MYELIN_GIT_ROOT` (default a per-host data dir) — the same `<tenant>/<region>/<repo>.git` layout
+    // the read backend resolves against. The reconciler (`myelin_git::reconcile`) heals the
+    // apply-after-outbox-commit window before the store serves; the cross-restart recovery runs in the
+    // production composition root (here the shell boots a fresh-or-existing durable backend).
+    let git_root = std::env::var("MYELIN_GIT_ROOT")
+        .unwrap_or_else(|_| std::env::temp_dir().join("myelin-git-data").to_string_lossy().into());
+    let git_backend = Arc::new(DurableGitBackend::rooted(git_root));
 
     let mut builder = Gateway::builder(authn, human_login, Arc::new(AllowAll))
         .route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler))
@@ -53,7 +58,7 @@ async fn main() {
             Arc::new(WhoamiHandler),
         )
         .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge");
-    builder = register_git(builder, git_state);
+    builder = register_git_durable(builder, git_backend);
     let gateway = Arc::new(builder.build());
 
     let addr = std::env::var("MYELIN_EDGE_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());

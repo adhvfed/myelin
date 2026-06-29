@@ -45,6 +45,11 @@ myelin-tenancy = { path = "../myelin-tenancy" }
 # by `crate_graph.rs`; `substrate_is_root()`/`identity_is_sink()` are unaffected). The subsystem never
 # depends on its transport — the edge knows about Git, Git does not know about the edge.
 myelin-git = { path = "../myelin-git" }
+# GT-003: the durable git write path co-commits its `git.ref.updated` through the frozen
+# `myelin_events::OutboxStore` (the same emit-iff-committed substrate the receive-pack path uses) — the
+# edge composes `RefStore::open_durable` + the outbox + the id minter to make API writes persist.
+# Already in the tree (myelin-git depends on it) — promoting it adds ZERO new crate.
+myelin-events = { path = "../myelin-events" }
 # The {error:{message,code?}} envelope + the JSON view-model/data contract are serde_json::Value (the
 # one workspace-pinned shape). No derive needed — the edge builds/parses Value directly.
 serde_json = { workspace = true }
@@ -71,11 +76,6 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # sqlx so the edge can prove the tenant scope is set in a real transaction.
 # ----------------------------------------------------------------------------------------------
 sqlx = { workspace = true, optional = true }
-
-[dev-dependencies]
-# `myelin_events::Timestamp` — to revoke a token's jti in the durable S7 store (the revoked→401
-# proof). The revocation API takes an RFC-3339 `Timestamp`; the events crate owns that value type.
-myelin-events = { path = "../myelin-events" }
 
 [features]
 default = []

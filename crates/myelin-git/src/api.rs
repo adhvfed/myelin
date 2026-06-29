@@ -165,6 +165,25 @@ pub fn http_catalogue() -> Vec<Endpoint> {
             true,
         )
         .unwrap(),
+        // The repo-owned BRANCH-PROTECTION policy set (GT-003) — an authorized repo-ADMIN write
+        // (`Id.check(repo_admin)`); the merge gate's required set + thresholds come from HERE, never
+        // from author input. Id.check-gated.
+        Endpoint::new(
+            Method::Post,
+            "/api/git/repos/{repo}/branch-protection",
+            Handler::Settings,
+            true,
+        )
+        .unwrap(),
+        // The CI check-report (GT-003) — the authorized producer that stamps green/fork facts on a PR
+        // (the real CI producer is M4; the PR AUTHOR cannot set facts). A WRITE, Id.check-gated.
+        Endpoint::new(
+            Method::Post,
+            "/api/git/repos/{repo}/prs/{n}/checks",
+            Handler::CheckStatus,
+            true,
+        )
+        .unwrap(),
         Endpoint::new(
             Method::Get,
             "/api/git/repos/{repo}/blob/{ref}/{path}",
