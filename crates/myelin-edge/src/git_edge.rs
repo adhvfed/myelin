@@ -171,12 +171,12 @@ impl GitEdgeState {
 }
 
 /// The verified tenant of the request (the ONLY tenant a handler may touch — the IDOR floor).
-fn tenant_of<'a>(ctx: &'a HandlerCtx<'_>) -> &'a str {
+pub(crate) fn tenant_of<'a>(ctx: &'a HandlerCtx<'_>) -> &'a str {
     ctx.scope.tenant().0.as_str()
 }
 
 /// A required path param, or a clean `400` (never a panic).
-fn param<'a>(ctx: &'a HandlerCtx<'_>, name: &str) -> Result<&'a str, EdgeError> {
+pub(crate) fn param<'a>(ctx: &'a HandlerCtx<'_>, name: &str) -> Result<&'a str, EdgeError> {
     ctx.params
         .get(name)
         .map(String::as_str)
@@ -184,7 +184,7 @@ fn param<'a>(ctx: &'a HandlerCtx<'_>, name: &str) -> Result<&'a str, EdgeError> 
 }
 
 /// A required numeric path param (e.g. a PR number), or a clean `400`.
-fn num_param(ctx: &HandlerCtx<'_>, name: &str) -> Result<u64, EdgeError> {
+pub(crate) fn num_param(ctx: &HandlerCtx<'_>, name: &str) -> Result<u64, EdgeError> {
     let raw = param(ctx, name)?;
     raw.parse::<u64>()
         .map_err(|_| EdgeError::BadRequest(format!("path param `{name}` is not a number: `{raw}`")))
@@ -427,13 +427,13 @@ fn content_fingerprint(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 /// Re-root a Git catalogue path (`/api/git/...`) under the edge's versioned prefix (`/v1/git/...`).
-fn reroot(path: &str) -> String {
+pub(crate) fn reroot(path: &str) -> String {
     let tail = path.strip_prefix("/api/git").unwrap_or(path);
     format!("/{API_VERSION}/git{tail}")
 }
 
 /// Map a Git API method to the edge method (Git's surface is Get/Post; the edge supports the full set).
-fn map_method(m: GitMethod) -> Method {
+pub(crate) fn map_method(m: GitMethod) -> Method {
     match m {
         GitMethod::Get => Method::Get,
         GitMethod::Post => Method::Post,
@@ -535,7 +535,7 @@ mod tests {
         // Build succeeds and registered one route per catalogue entry.
         let gw = b.build();
         let _ = gw; // routes are private; the build not panicking + reroot test cover the mapping.
-        assert_eq!(http_catalogue().len(), 11, "the git catalogue surface is stable");
+        assert_eq!(http_catalogue().len(), 13, "the git catalogue surface is stable");
     }
 
     fn test_authn() -> Arc<myelin_identity_service::CapabilityAuthenticator> {

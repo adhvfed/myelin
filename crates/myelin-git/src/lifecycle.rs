@@ -78,7 +78,7 @@ use crate::body::Body;
 ///   merge gate evaluates against.
 /// - `Merged` — TERMINAL: the PR's head landed on the base via the merge gate (`git.pr.merged`).
 /// - `Closed` — the PR was closed without merging (`git.pr.closed`); may be `Reopen`ed back to `Open`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum PrState {
     /// A draft PR (work-in-progress, not review-ready). `git.pr.opened` with `is_draft`.
     Draft,
@@ -280,7 +280,7 @@ impl PullRequest {
 
 /// A review verdict (`git.review.submitted` carries this + `is_agent`). The closed set: a submitted
 /// review is exactly one of approve / request-changes / comment-only.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ReviewVerdict {
     /// The reviewer approves — counts toward the ruleset's `required_approvals` AND satisfies a
     /// CODEOWNERS requirement if the reviewer is an owner ([`BranchProtectionRuleset`]).
@@ -292,7 +292,7 @@ pub enum ReviewVerdict {
 }
 
 /// The review lifecycle state (00-overview §1.1). `Requested → Submitted(verdict) → Dismissed`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ReviewState {
     /// A review was REQUESTED (`git.review.requested`) — pending the reviewer's verdict.
     Requested,
@@ -487,7 +487,7 @@ impl Thread {
 /// This is the ENTITY (the ruleset row); the per-ref persistence + the live `git.branch.protection_changed`
 /// emit ride GIT-P20/GIT-P22. The pure ENTITY-LAYER evaluation ([`evaluate_ruleset`]) is the gate the
 /// 0-unprotected-merges drill exercises.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BranchProtectionRuleset {
     /// The ref-pattern this ruleset protects (e.g. `refs/heads/main`, `refs/heads/release/*`). A PR's
     /// `base_ref` matches via [`BranchProtectionRuleset::matches`] (glob, last-segment `*`/`**`).

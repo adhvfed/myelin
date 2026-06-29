@@ -381,6 +381,155 @@ impl DurableGitRepo {
         Ok(out)
     }
 
+    // ── working-tree reads + the single-file commit build (GT-003 web-edit) ──
+
+    /// Resolve a ref to its tip commit (`None` if the ref does not exist).
+    fn tip_commit(&self, repo: &git2::Repository, ref_name: &str) -> Result<Option<git2::Oid>, DurableError> {
+        match repo.find_reference(ref_name) {
+            Ok(r) => Ok(r.target()),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+            Err(e) => Err(git_err(&format!("find_reference {ref_name}"), e)),
+        }
+    }
+
+    /// Read a single TOP-LEVEL file at a ref (`Some((bytes, blob_oid))`, or `None` if the ref/file is
+    /// absent). The blob oid is the GF-6 content-address base the web-edit CAS keys on. (The edge router
+    /// matches a single path segment — nested paths are the URL-codec follow-on; this reads the top tree.)
+    pub fn read_file_at_ref(
+        &self,
+        ref_name: &str,
+        path: &str,
+    ) -> Result<Option<(Vec<u8>, Oid)>, DurableError> {
+        let repo = self.open_git()?;
+        let Some(tip) = self.tip_commit(&repo, ref_name)? else {
+            return Ok(None);
+        };
+        let commit = repo.find_commit(tip).map_err(|e| git_err("find commit", e))?;
+        let tree = commit.tree().map_err(|e| git_err("commit tree", e))?;
+        let entry = match tree.get_name(path) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        let obj = entry.to_object(&repo).map_err(|e| git_err("entry object", e))?;
+        let blob = match obj.as_blob() {
+            Some(b) => b,
+            None => return Ok(None), // a dir at that name — not a file
+        };
+        Ok(Some((blob.content().to_vec(), Oid::new(entry.id().to_string()))))
+    }
+
+    /// List a ref's TOP-LEVEL tree entries `(name, is_dir)` (empty if the ref does not exist). The repo
+    /// home ViewModel's file tree (durable — read from the real on-disk tree, never a seeded list).
+    pub fn tree_entries_at_ref(&self, ref_name: &str) -> Result<Vec<(String, bool)>, DurableError> {
+        let repo = self.open_git()?;
+        let Some(tip) = self.tip_commit(&repo, ref_name)? else {
+            return Ok(Vec::new());
+        };
+        let commit = repo.find_commit(tip).map_err(|e| git_err("find commit", e))?;
+        let tree = commit.tree().map_err(|e| git_err("commit tree", e))?;
+        let mut out = Vec::new();
+        for entry in tree.iter() {
+            let is_dir = matches!(entry.kind(), Some(git2::ObjectType::Tree));
+            out.push((entry.name().unwrap_or_default().to_string(), is_dir));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// **Build a single-file web-edit commit (GT-003).** Write `contents` as a blob, rebuild the ref's
+    /// top-level tree with `path` set to that blob (seeded from the current tree so OTHER entries are
+    /// preserved; empty for a first commit), and write a commit whose parent is the ref's current tip.
+    /// Returns `(new_commit_oid, new_blob_oid, parent_commit_oid)`. Does NOT move the ref — the durable
+    /// per-ref CAS ([`crate::receive_pack::RefStore`]) is the explicit next step (one write path, GF-6).
+    pub fn build_file_commit(
+        &self,
+        ref_name: &str,
+        path: &str,
+        contents: &[u8],
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<(Oid, Oid, Option<Oid>), DurableError> {
+        let repo = self.open_git()?;
+        let parent_oid = self.tip_commit(&repo, ref_name)?;
+
+        let blob_oid = repo.blob(contents).map_err(|e| git_err("write blob", e))?;
+
+        // Seed the tree builder from the parent's tree so other files survive the single-file edit.
+        let base_tree = match parent_oid {
+            Some(p) => {
+                let c = repo.find_commit(p).map_err(|e| git_err("find parent", e))?;
+                Some(c.tree().map_err(|e| git_err("parent tree", e))?)
+            }
+            None => None,
+        };
+        let mut builder = repo
+            .treebuilder(base_tree.as_ref())
+            .map_err(|e| git_err("treebuilder", e))?;
+        builder
+            .insert(path, blob_oid, 0o100644)
+            .map_err(|e| git_err(&format!("tree insert {path}"), e))?;
+        let tree_oid = builder.write().map_err(|e| git_err("write tree", e))?;
+        let tree_obj = repo.find_tree(tree_oid).map_err(|e| git_err("find tree", e))?;
+
+        let sig = git2::Signature::now(author_name, author_email)
+            .map_err(|e| git_err("signature", e))?;
+        let parent_commits: Vec<git2::Commit<'_>> = match parent_oid {
+            Some(p) => vec![repo.find_commit(p).map_err(|e| git_err("find parent", e))?],
+            None => Vec::new(),
+        };
+        let parent_refs: Vec<&git2::Commit<'_>> = parent_commits.iter().collect();
+        let commit_oid = repo
+            .commit(None, &sig, &sig, message, &tree_obj, &parent_refs)
+            .map_err(|e| git_err("write commit", e))?;
+
+        Ok((
+            Oid::new(commit_oid.to_string()),
+            Oid::new(blob_oid.to_string()),
+            parent_oid.map(|p| Oid::new(p.to_string())),
+        ))
+    }
+
+    // ── merge-target validation (GT-003 — never advance a protected ref to an arbitrary oid) ──
+
+    /// Whether `oid` exists in the odb AND is a commit (a ref must point at a real commit). Used to
+    /// reject a merge that names a non-existent / non-commit `head_oid`.
+    pub fn object_is_commit(&self, oid: &Oid) -> bool {
+        let Ok(repo) = self.open_git() else { return false };
+        let Ok(goid) = git2::Oid::from_str(oid.as_str()) else {
+            return false;
+        };
+        let is_commit = repo.find_commit(goid).is_ok();
+        is_commit
+    }
+
+    /// Is advancing a ref from `base_tip` to `head` a fast-forward (the only durable merge advance v1
+    /// admits — never advance a protected ref to an unrelated/arbitrary oid)? `head` must be a real
+    /// commit; `base_tip = None` (creating the ref) is allowed; otherwise `head` must equal OR be a
+    /// descendant of `base_tip` (the connectivity/ancestry check the empty-quarantine path lacked).
+    pub fn is_fast_forward(
+        &self,
+        base_tip: Option<&Oid>,
+        head: &Oid,
+    ) -> Result<bool, DurableError> {
+        let repo = self.open_git()?;
+        let head_g = Self::parse_oid(head)?;
+        if repo.find_commit(head_g).is_err() {
+            return Ok(false); // head is not a real commit on disk
+        }
+        match base_tip {
+            None => Ok(true), // creating the ref — any real commit is a valid initial tip
+            Some(base) => {
+                let base_g = Self::parse_oid(base)?;
+                if base_g == head_g {
+                    return Ok(true);
+                }
+                repo.graph_descendant_of(head_g, base_g)
+                    .map_err(|e| git_err("graph_descendant_of", e))
+            }
+        }
+    }
+
     // ── integrity (the external-oracle discipline, in-process slice) ──
 
     /// **In-process integrity check** — the `git fsck`-equivalent slice runnable in `src` (no host

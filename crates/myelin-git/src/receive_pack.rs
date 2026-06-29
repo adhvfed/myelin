@@ -456,6 +456,14 @@ pub enum CrashPoint {
     /// BEFORE any post-commit work — the ref move + the event SURVIVE (0 lost; the relay publishes
     /// the durable row, the recovery fence reconciles to the committed `update_seq`).
     AfterCommit,
+    /// **The GT-003 reconciler window.** Crash AFTER the outbox transaction committed (the
+    /// `git.ref.updated` row is durable) but BEFORE the on-disk ref CAS applied
+    /// ([`RefStore::apply_one`]). This is the precise apply-after-outbox-commit window the cross-system
+    /// reconciler ([`crate::reconcile`]) recovers: the event is the durable witness, the on-disk ref is
+    /// momentarily BEHIND its committed `update_seq`. The apply loop is skipped so the same recovery
+    /// replay is exercised on either backing. NOT silent loss — the committed event drives an
+    /// idempotent re-apply on restart.
+    AfterCommitBeforeApply,
 }
 
 /// A crash injected at [`CrashPoint`] — the recoverable failure the GIT-D9 drill forces. The push
@@ -767,13 +775,13 @@ impl RefStore {
                     Some(crate::core::Oid::new(new_oid.0.clone()))
                 };
                 let msg = format!("receive-pack: {} -> {}", self.repo, ref_name.0);
-                // TODO(GT-003): wire the cross-system recovery reconciler before this durable store
-                // reaches a live front door. The apply-after-outbox-commit window (outbox row durable,
-                // on-disk ref move pending) is BOUNDED + RECOVERABLE — on restart, replay committed
-                // `git.ref.updated` rows whose on-disk ref tip / `update_seq` is behind the durable
-                // reflog and re-apply the CAS (idempotent on `update_seq`, arch §4.2). It is NOT
-                // silent-loss (the on-disk reflog is the durable witness), so it is acceptable for
-                // GT-001; GT-003 (durable API writes at the edge) must land the reconciler.
+                // GT-003: the cross-system recovery reconciler is LANDED ([`crate::reconcile`]). The
+                // apply-after-outbox-commit window (outbox row durable, on-disk ref move pending —
+                // modeled by [`CrashPoint::AfterCommitBeforeApply`]) is BOUNDED + RECOVERABLE: on
+                // restart [`crate::reconcile::reconcile_refs`] replays committed `git.ref.updated` rows
+                // whose on-disk `update_seq` is behind the durable reflog and re-applies the CAS
+                // (idempotent on `update_seq`, arch §4.2). It is NOT silent-loss (the committed event is
+                // the durable witness), so the durable store may now reach the live front door (GT-003).
                 repo.update_ref_cas(&ref_name.0, old_core.as_ref(), new_core.as_ref(), &msg, pseudonym)
                     // Post-commit apply failure is a should-not-happen invariant breach (the CAS was
                     // pre-checked under the held lock + the objects were migrated before commit). It
@@ -945,6 +953,14 @@ impl RefStore {
         // the ref-row mutations + the reflog — keeping the in-memory model's "ref move iff event
         // committed" identical to the real "UPDATE git_ref … + INSERT outbox … in one tx".
         tx.commit()?;
+
+        // The GT-003 reconciler window: the outbox row is now DURABLE but the on-disk ref CAS has not
+        // run. A crash here leaves the on-disk ref BEHIND its committed `update_seq` — recoverable by
+        // replaying the committed `git.ref.updated` row ([`crate::reconcile`]), idempotent on
+        // `update_seq`. We return WITHOUT applying so the recovery replay is exercised on restart.
+        if crash == CrashPoint::AfterCommitBeforeApply {
+            return Ok(PushOutcome::Crashed(InjectedCrash { at: crash }));
+        }
 
         // The ref CAS + reflog are the COMMITTED state-change half (applied to the durable backing
         // under the SAME per-ref locks the CAS-staleness check read, still held here — so no
