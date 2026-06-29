@@ -251,3 +251,23 @@ green: pg connect, s3 put/get, rebac tuples, outbox→bus relay, valkey cache):
   from the no-host-exec exclusion list — same class as the excluded m3/m4/m5 runners). MR-004 restored it. The
   baseline-green check must use `cargo test`, not just `cargo check`, going forward.
 - **Top systemic truths carried forward:** (1) the production auth graph is wired to `Structural*` mock crypto by default → total forgery; (2) tenant RLS bleeds across pooled connections; (3) no durable persistence anywhere load-bearing (identity stores, events outbox, KMS keys, git refs/pack-index all in-memory); (4) the sandbox never runs `spec.command` in prod and the escape gate certifies a path real jobs don't take; (5) git has no prod WireExecutor/server binary; (6) the E0.2 absence-scanners that should mechanically block these do not exist yet → **MR-004 is the true first build dependency.**
+
+---
+
+## Phase 4 — Actions/CI track (the long pole). Ledger: `12-ci-track-ledger.md` (CT-001..007).
+
+- **CT-001 (RESHAPE-001) — sandbox launch/result/lifecycle seam redraw — COMMITTED 77aa544.** The real
+  defect (confirmed in source before dispatch): `RunnerAgent::run_one` took the terminal `report` as an INPUT
+  parameter and `SandboxBackend::launch` returned only `SandboxHandle{guest_id}` — the seam could not carry a
+  guest command's exit/stdout/usage, so pass/fail was caller-supplied, not derived from the guest. Builder
+  redrew shape (A): `launch -> SandboxLaunch{handle, result}` with `SandboxResult{exit_code, timed_out, usage,
+  stdout, stderr}`; `run_one(now)` now DERIVES `passed = exit_code==Some(0) && !timed_out`, ships captured
+  streams to the firehose as redacted frames, keeps the `job.done` signal payload refs-only. Sandbox-INDEPENDENT
+  (backends still return STUB results; real boots are CT-002). Full gate green (ci-sandbox 86 / agent-service
+  267 / lints 57 / workspace check). Independent verifier (non-builder): **PASS** — derivation genuine (4 cases
+  proven end-to-end through RunnerAgent, no always-pass default), references-not-payloads asserted NEGATIVELY,
+  whole-guest-kill-before-report + lease-settle + one-signal-path + digest-pin invariants all intact, gate
+  reproduced to exit 0. Two CT-002 follow-ups recorded: (1) `exec.rs:405` discards `launch.result` so a failed
+  AGENT command still returns Ok — CT-002 must wire the result into the agent trace; (2) Firecracker `launch_with`
+  hardcodes `stub_ok` instead of calling the already-present `VmmChild::wait` (gVisor already threads its wait) —
+  converge both backends on calling `wait` at CT-002.
