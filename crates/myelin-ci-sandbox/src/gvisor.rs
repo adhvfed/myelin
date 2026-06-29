@@ -35,8 +35,9 @@
 
 use crate::hardening::HardeningProfile;
 use crate::{
-    drain_capped, JobSpec, ResourceUsage, RunnerHooks, SandboxBackend, SandboxHandle,
-    SandboxLaunch, SandboxResult, SANDBOX_CAPTURE_BOUND,
+    drain_capped, EgressPolicy, HookError, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
+    ResourceLimits, ResourceUsage, RunTokenRef, RunnerHooks, SandboxBackend, SandboxHandle,
+    SandboxLaunch, SandboxResult, TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
 };
 use std::io::Write;
 use std::os::unix::process::CommandExt;
@@ -87,6 +88,39 @@ pub struct OciConfig {
     /// would otherwise auto-mount an UNBOUNDED host-RAM-backed tmpfs at `/tmp`; sizing it caps a disk
     /// fill at ENOSPC (the SI-017 host-DoS escape D2 surfaced through the production `launch()`).
     disk_bytes: u64,
+    /// CT-006a (the git wire): EXTRA bind mounts injected into the bundle (host→guest, with a
+    /// `readonly` flag). EMPTY for every CI/agent job (so the prod-exec posture is byte-unchanged);
+    /// the git-wire launch path populates it with the **read-only bare-repo mount** at
+    /// [`WIRE_REPO_MOUNT`] and an optional **writable quarantine mount** at [`WIRE_QUARANTINE_MOUNT`].
+    /// Rendered into the SAME OCI `mounts` array the `/tmp` tmpfs uses (reusing the proven machinery).
+    extra_mounts: Vec<WireMount>,
+    /// CT-006a: EXTRA `process.env` entries (`"KEY=VALUE"`) appended after the base `PATH`. EMPTY for
+    /// every CI/agent job; the git-wire path sets `GIT_PROTOCOL=version=2` / `GIT_EXEC_PATH` so the
+    /// sandboxed canonical `git` speaks protocol-v2 and finds its `git-core` helpers.
+    extra_env: Vec<String>,
+    /// CT-006a: an ABSOLUTE OCI `root.path` override. `None` ⇒ `"rootfs"` (relative to the bundle — the
+    /// prod-exec path symlinks `rootfs` into the bundle, byte-unchanged). The git-wire path sets the
+    /// absolute staged-rootfs path here so the bundle needs NO `rootfs` symlink — a symlinked root.path
+    /// COMBINED with a host bind mount makes the rootless `runsc` gofer fail to bring up the sandbox
+    /// ("cannot read client sync file"), whereas an absolute root.path + a bind mount works.
+    root_path: Option<PathBuf>,
+}
+
+/// CT-006a (the git wire): a single host→guest bind mount injected into the hardened OCI bundle, with
+/// an explicit `readonly` flag. The **bare repo** is mounted `readonly: true` (a serve can NEVER
+/// mutate it — `upload-pack` is read-only by construction; the RO is enforced by runsc, not advisory);
+/// the **quarantine** (push object intake) is mounted writable so the sandboxed `receive-pack` writes
+/// objects THERE, never into the real repo (the in-process ref-CAS policy inspects the quarantine on
+/// the host AFTER the run — CT-006b). The host source is ALWAYS a resolver-validated path (see
+/// [`resolve_bare_repo_path`]); a raw attacker-influenced path NEVER reaches a mount.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WireMount {
+    /// The host path to bind into the guest (a validated bare-repo / quarantine dir — never raw).
+    pub host_source: PathBuf,
+    /// The fixed guest mount point (e.g. `/repo`, `/quarantine`).
+    pub guest_dest: String,
+    /// `true` ⇒ the bind is `ro` (runsc-enforced read-only); `false` ⇒ writable (`rw`).
+    pub readonly: bool,
 }
 
 impl OciConfig {
@@ -104,7 +138,32 @@ impl OciConfig {
             mem_bytes: spec.limits.mem_bytes,
             // The hardening profile's scratch-disk quota (= `spec.limits.disk_bytes`).
             disk_bytes: profile.scratch_quota_bytes,
+            // No extra bind mounts / env by default — a CI/agent job's posture is byte-unchanged.
+            extra_mounts: Vec::new(),
+            extra_env: Vec::new(),
+            root_path: None,
         }
+    }
+
+    /// CT-006a: override the OCI `root.path` with an ABSOLUTE staged-rootfs path (so the bundle needs no
+    /// `rootfs` symlink — required when a host bind mount is present). Consuming builder.
+    pub fn with_root_path(mut self, path: PathBuf) -> OciConfig {
+        self.root_path = Some(path);
+        self
+    }
+
+    /// CT-006a: attach the git-wire bind mounts (RO repo + optional writable quarantine) to this
+    /// config — they render into the SAME OCI `mounts` array the `/tmp` tmpfs uses. Consuming builder.
+    pub fn with_extra_mounts(mut self, mounts: Vec<WireMount>) -> OciConfig {
+        self.extra_mounts = mounts;
+        self
+    }
+
+    /// CT-006a: append extra `process.env` entries (`"KEY=VALUE"`) after the base `PATH`. Consuming
+    /// builder; used to set `GIT_PROTOCOL=version=2` / `GIT_EXEC_PATH` for the sandboxed `git`.
+    pub fn with_extra_env(mut self, env: Vec<String>) -> OciConfig {
+        self.extra_env = env;
+        self
     }
 
     /// Serialize to a minimal OCI `config.json` (`runsc run --bundle <dir>` consumes it). The
@@ -122,16 +181,48 @@ impl OciConfig {
             // No network namespace interface — egress closed at the namespace level.
             "{ \"type\": \"network\", \"path\": \"\" }"
         };
+        // `process.env`: the base PATH first, then any extra entries (e.g. GIT_PROTOCOL) — JSON-quoted.
+        let mut envs = vec![format!(
+            "{:?}",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        )];
+        for e in &self.extra_env {
+            envs.push(format!("{e:?}"));
+        }
+        let env_json = envs.join(", ");
+        // `mounts`: the size-bounded writable `/tmp` tmpfs first (byte-unchanged), then any extra bind
+        // mounts (CT-006a: the RO repo + optional writable quarantine). Source/dest are JSON-escaped via
+        // `{:?}` so a path can carry no JSON-injection. A RO bind carries `ro`; a writable one `rw`.
+        let mut mounts = vec![format!(
+            "{{ \"destination\": \"/tmp\", \"type\": \"tmpfs\", \"source\": \"tmpfs\", \
+             \"options\": [\"nosuid\", \"nodev\", \"mode=1777\", \"size={}\"] }}",
+            self.disk_bytes
+        )];
+        for m in &self.extra_mounts {
+            let src = m.host_source.to_string_lossy();
+            let mode = if m.readonly { "ro" } else { "rw" };
+            mounts.push(format!(
+                "{{ \"destination\": {dest:?}, \"type\": \"bind\", \"source\": {src:?}, \
+                 \"options\": [\"bind\", \"{mode}\", \"nosuid\", \"nodev\"] }}",
+                dest = m.guest_dest,
+            ));
+        }
+        let mounts_json = mounts.join(", ");
+        // `root.path`: the absolute staged rootfs for the git wire, else the bundle-relative `rootfs`.
+        let root_path = self
+            .root_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "rootfs".to_string());
         format!(
             "{{\n  \"ociVersion\": \"1.0.0\",\n  \"process\": {{\n    \
              \"user\": {{ \"uid\": {uid}, \"gid\": {gid} }},\n    \
              \"args\": [{args}],\n    \"cwd\": \"/\",\n    \
-             \"env\": [\"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"],\n    \
+             \"env\": [{env_json}],\n    \
              \"noNewPrivileges\": {nnp},\n    \
              \"capabilities\": {{ \"bounding\": [], \"effective\": [], \"permitted\": [] }}\n  }},\n  \
-             \"root\": {{ \"path\": \"rootfs\", \"readonly\": {ro} }},\n  \
-             \"mounts\": [ {{ \"destination\": \"/tmp\", \"type\": \"tmpfs\", \"source\": \"tmpfs\", \
-             \"options\": [\"nosuid\", \"nodev\", \"mode=1777\", \"size={disk}\"] }} ],\n  \
+             \"root\": {{ \"path\": {root_path:?}, \"readonly\": {ro} }},\n  \
+             \"mounts\": [ {mounts_json} ],\n  \
              \"linux\": {{\n    \"resources\": {{ \"memory\": {{ \"limit\": {mem} }}, \
              \"pids\": {{ \"limit\": {pids} }} }},\n    \
              \"seccomp\": {{ \"defaultAction\": \"SCMP_ACT_ERRNO\" }},\n    \
@@ -139,9 +230,10 @@ impl OciConfig {
             uid = UNTRUSTED_UID,
             gid = UNTRUSTED_GID,
             args = args,
+            env_json = env_json,
             nnp = self.no_new_privileges,
             ro = self.root_readonly,
-            disk = self.disk_bytes,
+            mounts_json = mounts_json,
             mem = self.mem_bytes,
             pids = self.pids_max,
             net_ns = net_ns,
@@ -520,6 +612,7 @@ fn run_production_container(spec: &JobSpec, cfg: &OciConfig) -> Result<Container
         &container_id,
         timeout,
         spec.limits.mem_bytes,
+        None, // CI/agent jobs receive no stdin (the git-wire path supplies the request body).
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -541,12 +634,21 @@ fn run_production_container(spec: &JobSpec, cfg: &OciConfig) -> Result<Container
     })
 }
 
-/// A cheap monotonic-ish suffix to avoid bundle/container-id collisions within a process.
+/// A unique suffix for bundle dirs / container ids. The wall-clock nanos alone are NOT unique: two
+/// launches on different threads can read the SAME nanosecond (the clock resolution is coarser than a
+/// launch), colliding on the bundle path (`symlink rootfs: File exists`). Mixing in a per-process
+/// monotonically-incrementing counter makes the suffix collision-proof WITHIN the process; the nanos
+/// keep it unique ACROSS processes.
 fn unique_suffix() -> u128 {
-    std::time::SystemTime::now()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+    // Shift the nanos up and OR in the sequence so both contribute to a unique value.
+    (nanos << 24) | (seq & 0xff_ffff)
 }
 
 /// Stage a self-contained OCI bundle in a temp dir — the SAME pattern as
@@ -626,6 +728,7 @@ fn run_and_capture(
     container_id: &str,
     timeout: Duration,
     mem_bytes: u64,
+    stdin: Option<Vec<u8>>,
 ) -> Result<RunscOutcome, String> {
     // CT-003b (SI-017): establish the OUT-OF-BAND memory cgroup BEFORE spawning runsc and FAIL
     // CLOSED if it cannot be established (rootless runsc would otherwise run the workload's anonymous
@@ -639,7 +742,13 @@ fn run_and_capture(
         .arg("-bundle")
         .arg(bundle)
         .arg(container_id)
-        .stdin(Stdio::null())
+        // CT-006a: the git-wire path pipes the stateless-rpc request body in; CI/agent jobs get no
+        // stdin (`null`). The bytes are already bounded by [`WIRE_STDIN_BOUND`] before we get here.
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Place the runsc child (and the sentry/gofer tree it forks) into the memory cgroup at birth.
@@ -647,6 +756,17 @@ fn run_and_capture(
         .place_child(&mut cmd)
         .map_err(|e| format!("bind runsc into the memory cgroup: {e}"))?;
     let mut child = cmd.spawn().map_err(|e| format!("spawn runsc: {e}"))?;
+
+    // CT-006a: feed the bounded request body to the container's stdin on a DEDICATED thread (so a
+    // large body + a slow in-guest reader cannot deadlock against our stdout/stderr drains), then drop
+    // the handle to deliver EOF (the stateless-rpc request terminator). None ⇒ stdin was `null`.
+    let stdin_th = stdin.map(|bytes| {
+        let mut si = child.stdin.take().expect("piped stdin");
+        std::thread::spawn(move || {
+            let _ = si.write_all(&bytes);
+            // `si` drops here ⇒ the write end closes ⇒ the guest `git` sees EOF on its request body.
+        })
+    });
 
     let pid = child.id();
     let start = Instant::now();
@@ -690,6 +810,11 @@ fn run_and_capture(
     // The child has exited/been-killed ⇒ the pipes hit EOF ⇒ the drain threads finish.
     let stdout = th_out.join().unwrap_or_default();
     let stderr = th_err.join().unwrap_or_default();
+    // The writer thread has finished (the child read its request body, or it exited and the write
+    // EPIPE'd — either way `write_all` returned). Join so no thread outlives the run.
+    if let Some(t) = stdin_th {
+        let _ = t.join();
+    }
 
     // The container + its sentry/gofer tree are gone; reap the cgroup (kill any straggler, rmdir).
     // `Drop` is the backstop, but tear it down deterministically here on the success/timeout path.
@@ -917,13 +1042,408 @@ pub fn gvisor_drill_config_json(spec: &JobSpec, script_name: &str) -> Result<Str
     Ok(json)
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// CT-006a (GT-006 / SI-013) — the SANDBOXED GIT-WIRE capability.
+//
+// The git smart-transport wire (`upload-pack` = clone/fetch, `receive-pack` = push) is canonical
+// `git` processing UNTRUSTED client pack/negotiation bytes, so it MUST run under the SAME proven
+// hardening this backend already enforces for CI/agent jobs (ro-root, all-caps-dropped, no-new-privs,
+// seccomp, no-netns egress-deny, non-root uid, bounded mem/pids/disk, whole-container kill + cleanup,
+// bounded capture). On top of that floor the git wire needs THREE things this section adds, all by
+// REUSING the machinery above:
+//   1. the bare repo BIND-MOUNTED READ-ONLY at `/repo` (a serve can never mutate it) — a [`WireMount`]
+//      rendered into the SAME OCI `mounts` array as the `/tmp` tmpfs;
+//   2. a WRITABLE QUARANTINE bind-mount at `/quarantine` for `receive-pack` object intake — the
+//      sandboxed receive-pack writes objects THERE, the host-side ref-CAS policy (CT-006b) inspects it
+//      AFTER the run; it NEVER touches the real repo;
+//   3. BOUNDED stdin delivery (the stateless-rpc request body, capped at [`WIRE_STDIN_BOUND`]) piped to
+//      the runsc child + captured stdout (the response) via the existing [`drain_capped`] bound.
+//
+// SECURITY — path confinement (the GT-001 isolation boundary, replicated): the (tenant, region, repo)
+// locator is URL/client-influenced, so a raw `PathBuf::join` is a cross-tenant path-traversal breakout.
+// [`resolve_bare_repo_path`] VALIDATES every segment against the allowlist `[A-Za-z0-9._-]` (no empty /
+// `.` / `..` / separator / NUL / absolute) and REFUSES before any path is built — the byte-for-byte
+// guarantee of `myelin_git::gix_backend::validate_path_segment` (the GT-001 fix). It is REPLICATED here
+// (not imported) because `myelin-git` is a dev-dep only — the CI sandbox must carry NO production edge
+// to the git crate (X-1 acyclic: CI emits, Git reads); a drift test in CT-006b pins the two in sync.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The fixed guest mount point for the READ-ONLY bare repo (the git argv ends with this path).
+pub const WIRE_REPO_MOUNT: &str = "/repo";
+/// The fixed guest mount point for the WRITABLE push-object quarantine (`receive-pack` intake).
+pub const WIRE_QUARANTINE_MOUNT: &str = "/quarantine";
+/// The documented cap on the stateless-rpc REQUEST BODY (stdin) the wire delivers into the guest —
+/// 64 MiB. A larger body is REFUSED fail-closed before any container spawns (a client cannot force the
+/// host to buffer an unbounded request). CT-006b may revisit this for very large pushes (chunked
+/// intake); for CT-006a it bounds the negotiation/advertise request bodies with margin to spare.
+pub const WIRE_STDIN_BOUND: usize = 64 * 1024 * 1024;
+/// Env var naming a staged rootfs that CONTAINS `git` (busybox-class rootfs + `git` + its `git-core`
+/// helpers + the shared-lib closure). Defaults to `~/.local/share/gvisor-assets/git-rootfs`. The git
+/// wire REQUIRES a real `git` in the guest — see the staging recipe in `tests/git_wire_prod_exec_test.rs`.
+pub const ENV_GVISOR_GIT_ROOTFS: &str = "MYELIN_GVISOR_GIT_ROOTFS";
+
+/// The resolved rootfs the git-wire container runs in (env override → the staged git-rootfs asset).
+/// SEPARATE from [`resolved_gvisor_rootfs`] because the escape-drill rootfs is busybox-only (no `git`);
+/// the git wire needs a `git`-bearing rootfs. The launch fails closed (honest `Runtime` error) if it
+/// is absent — it never fabricates a result.
+pub fn resolved_gvisor_git_rootfs() -> PathBuf {
+    if let Ok(p) = std::env::var(ENV_GVISOR_GIT_ROOTFS) {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("gvisor-assets")
+        .join("git-rootfs")
+}
+
+/// A git-wire backend error.
+#[derive(Debug)]
+pub enum WireError {
+    /// The (tenant, region, repo) locator failed path-confinement validation — REFUSED before any
+    /// mount (cross-tenant / `..` / separator / absolute / non-allowlisted segment).
+    Path(String),
+    /// The request body exceeded [`WIRE_STDIN_BOUND`] — refused fail-closed before spawning.
+    StdinTooLarge {
+        /// The offending body length.
+        len: usize,
+        /// The cap it breached.
+        cap: usize,
+    },
+    /// The mandatory hardening profile could not be asserted in force (fail-closed).
+    Hardening(String),
+    /// A four-guarantee hook failed (cost-exhausted / token-rejected / isolation-floor-not-met).
+    Hook(HookError),
+    /// The `runsc` runtime / bundle staging errored (absent git rootfs, spawn failure, …).
+    Runtime(String),
+}
+
+impl std::fmt::Display for WireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WireError::Path(s) => write!(f, "git-wire: path confinement refused: {s}"),
+            WireError::StdinTooLarge { len, cap } => write!(
+                f,
+                "git-wire: request body {len} bytes exceeds the {cap}-byte cap (refused fail-closed)"
+            ),
+            WireError::Hardening(s) => write!(f, "git-wire: hardening not enforced: {s}"),
+            WireError::Hook(e) => write!(f, "git-wire: guarantee hook failed: {e}"),
+            WireError::Runtime(s) => write!(f, "git-wire: runsc/bundle error: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for WireError {}
+
+impl From<HookError> for WireError {
+    fn from(e: HookError) -> Self {
+        WireError::Hook(e)
+    }
+}
+
+/// Reject a single `(tenant|region|repo)` path segment that could escape the per-tenant/region root.
+/// REPLICATES `myelin_git::gix_backend::validate_path_segment` byte-for-byte: empty, `.`, `..`, and any
+/// char outside `[A-Za-z0-9._-]` (so separators `/`/`\`, NUL, control chars, and absolute components
+/// are all refused). Fail-closed — refuses before any path is built.
+pub fn validate_wire_segment(kind: &str, seg: &str) -> Result<(), WireError> {
+    if seg.is_empty() {
+        return Err(WireError::Path(format!(
+            "invalid {kind} path segment: empty (fail-closed — refusing to resolve a path)"
+        )));
+    }
+    if seg == "." || seg == ".." {
+        return Err(WireError::Path(format!(
+            "invalid {kind} path segment {seg:?}: path-traversal component refused (fail-closed)"
+        )));
+    }
+    for c in seg.chars() {
+        let ok = c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+        if !ok {
+            return Err(WireError::Path(format!(
+                "invalid {kind} path segment {seg:?}: character {c:?} not in the allowlist \
+                 [A-Za-z0-9._-] — separators/NUL/control chars are refused (path-traversal / \
+                 absolute-component guard, fail-closed)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a (possibly namespaced `team/app`) repo slug into its individually-validated `/`-pieces.
+/// REPLICATES `myelin_git::gix_backend::validate_repo_slug`: a backslash/NUL slug is refused outright,
+/// then each `/`-piece is held to [`validate_wire_segment`] (so `../../x`, `/etc/passwd`, `a//b`, a
+/// trailing `/` all yield a `.`/`..`/empty piece and are REFUSED). Never returns an empty piece list.
+pub fn validate_wire_repo_slug(repo: &str) -> Result<Vec<String>, WireError> {
+    if repo.contains('\\') || repo.contains('\0') {
+        return Err(WireError::Path(format!(
+            "invalid repo slug {repo:?}: contains a backslash/NUL (path-traversal guard, fail-closed)"
+        )));
+    }
+    let pieces: Vec<String> = repo.split('/').map(|s| s.to_string()).collect();
+    for piece in &pieces {
+        validate_wire_segment("repo", piece)?;
+    }
+    Ok(pieces)
+}
+
+/// Resolve the on-disk bare-repo path `<root>/<tenant>/<region>/<repo>.git`, FAIL-CLOSED on any
+/// traversing/absolute/separator/non-allowlisted segment (the GT-001 cross-tenant isolation boundary).
+/// This is the ONLY way a host path reaches a [`WireMount`] — a raw attacker-influenced path can never
+/// be mounted. Mirrors `myelin_git::gix_backend::RootedResolver::repo_path`.
+pub fn resolve_bare_repo_path(
+    root: &Path,
+    tenant: &str,
+    region: &str,
+    repo: &str,
+) -> Result<PathBuf, WireError> {
+    validate_wire_segment("tenant", tenant)?;
+    validate_wire_segment("region", region)?;
+    let pieces = validate_wire_repo_slug(repo)?;
+    let mut path = root.to_path_buf();
+    path.push(tenant);
+    path.push(region);
+    for piece in &pieces {
+        path.push(piece);
+    }
+    let last = pieces
+        .last()
+        .expect("validate_wire_repo_slug returns ≥1 piece or errors");
+    path.set_file_name(format!("{last}.git"));
+    Ok(path)
+}
+
+/// **A sandboxed git-wire invocation** — the git-shaped analogue of a [`JobSpec`]. It carries a
+/// RESOLVER-VALIDATED bare-repo host path (RO-mounted at [`WIRE_REPO_MOUNT`]), the canonical `git` argv
+/// (WITHOUT the repo path — the launch appends `/repo`), the bounded stdin request body, optional extra
+/// env, an optional WRITABLE quarantine host dir (bound at [`WIRE_QUARANTINE_MOUNT`]), and the limits +
+/// four-guarantee tokens. Build it with [`GitWireSpec::for_repo`], which performs the path confinement.
+#[derive(Clone, Debug)]
+pub struct GitWireSpec {
+    repo_host_path: PathBuf,
+    git_argv: Vec<String>,
+    stdin: Vec<u8>,
+    env: Vec<String>,
+    quarantine_host_path: Option<PathBuf>,
+    limits: ResourceLimits,
+    run_token: RunTokenRef,
+    meter_to: MeterTarget,
+    idem_token: IdemToken,
+}
+
+impl GitWireSpec {
+    /// Build a git-wire spec for `(root, tenant, region, repo)`, RESOLVING + VALIDATING the bare-repo
+    /// path through [`resolve_bare_repo_path`] (fail-closed on any cross-tenant/`..`/absolute segment —
+    /// the locator NEVER reaches a mount raw). `git_argv` is the canonical subcommand + flags WITHOUT
+    /// the repo path (e.g. `["upload-pack", "--stateless-rpc", "--advertise-refs"]`); the launch appends
+    /// `/repo`. `quarantine_host_path` (if set) is bound WRITABLE at `/quarantine` for receive-pack.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_repo(
+        root: &Path,
+        tenant: &str,
+        region: &str,
+        repo: &str,
+        git_argv: Vec<String>,
+        stdin: Vec<u8>,
+        env: Vec<String>,
+        quarantine_host_path: Option<PathBuf>,
+        limits: ResourceLimits,
+        run_token: RunTokenRef,
+        meter_to: MeterTarget,
+        idem_token: IdemToken,
+    ) -> Result<GitWireSpec, WireError> {
+        let repo_host_path = resolve_bare_repo_path(root, tenant, region, repo)?;
+        Ok(GitWireSpec {
+            repo_host_path,
+            git_argv,
+            stdin,
+            env,
+            quarantine_host_path,
+            limits,
+            run_token,
+            meter_to,
+            idem_token,
+        })
+    }
+
+    /// The resolver-validated bare-repo host path that will be RO-mounted at `/repo`.
+    pub fn repo_host_path(&self) -> &Path {
+        &self.repo_host_path
+    }
+}
+
+impl GvisorBackend {
+    /// **Run a canonical-`git` wire op in the hardened gVisor sandbox (CT-006a).** Drives the SAME
+    /// four-guarantee seam as [`launch`](SandboxBackend::launch) (isolation floor → hardening assert →
+    /// attribution → reserve → run → settle), with the git-wire additions: the bare repo is bound
+    /// READ-ONLY at `/repo`, an optional writable quarantine at `/quarantine`, the bounded request body
+    /// is piped to stdin, and the response is captured (bounded). The command is `git <argv> /repo`,
+    /// run under the full hardening (ro-root, caps dropped, no-new-privs, seccomp, no-netns, non-root
+    /// uid, mem/pids/disk bounded, whole-container kill + cleanup). Fail-closed: an oversize body, an
+    /// unmet floor / exhausted wallet, or an absent git rootfs all REFUSE before/instead of a result.
+    pub fn launch_git_wire(
+        &self,
+        spec: &GitWireSpec,
+        hooks: &RunnerHooks,
+    ) -> Result<SandboxLaunch, WireError> {
+        // Bound the request body BEFORE anything spawns (a client cannot force unbounded host buffering).
+        if spec.stdin.len() > WIRE_STDIN_BOUND {
+            return Err(WireError::StdinTooLarge {
+                len: spec.stdin.len(),
+                cap: WIRE_STDIN_BOUND,
+            });
+        }
+        // The guest command: `git <argv> /repo` (the RO repo mount is the final argument).
+        let mut command = Vec::with_capacity(spec.git_argv.len() + 2);
+        command.push("git".to_string());
+        command.extend(spec.git_argv.iter().cloned());
+        command.push(WIRE_REPO_MOUNT.to_string());
+        // Build the internal hardened JobSpec so the git wire inherits the SAME profile + guarantees as
+        // every CI/agent job (the image is a placeholder — gVisor runs the staged rootfs, not an image).
+        let image = ImageRef::pinned(
+            "sandbox/git-wire@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .map_err(|e| WireError::Runtime(e.to_string()))?;
+        let job = JobSpec::new(
+            JobKind::Ci,
+            image,
+            command,
+            vec![],
+            vec![],
+            EgressPolicy::deny_all(), // a serve needs no egress (egress-deny / no-netns).
+            spec.limits,
+            WorkspaceSpec::default(),
+            TrustTier::Trusted,
+            spec.run_token.clone(),
+            spec.meter_to.clone(),
+            spec.idem_token.clone(),
+        )
+        .map_err(|e| WireError::Runtime(e.to_string()))?;
+
+        // The four-guarantee seam, in the mandated order (identical to `launch_with`).
+        (hooks.isolation_floor)(&job)?;
+        let profile = HardeningProfile::derive(&job);
+        profile.assert_enforced().map_err(WireError::Hardening)?;
+        (hooks.attribute)(&job.run_token)?;
+        let reserve = (hooks.reserve)(&job.meter_to)?;
+
+        // The git-wire mounts: the RO bare repo, then (if requested) the writable quarantine.
+        let mut mounts = vec![WireMount {
+            host_source: spec.repo_host_path.clone(),
+            guest_dest: WIRE_REPO_MOUNT.to_string(),
+            readonly: true,
+        }];
+        if let Some(q) = &spec.quarantine_host_path {
+            mounts.push(WireMount {
+                host_source: q.clone(),
+                guest_dest: WIRE_QUARANTINE_MOUNT.to_string(),
+                readonly: false,
+            });
+        }
+        // The staged rootfs is referenced by an ABSOLUTE `root.path` (no symlink — required alongside
+        // the host bind mounts). Canonicalize so the path is absolute; an absent rootfs is caught
+        // (fail-closed) in `run_git_wire_container`.
+        let rootfs = resolved_gvisor_git_rootfs();
+        let root_abs = std::fs::canonicalize(&rootfs).unwrap_or_else(|_| rootfs.clone());
+        let cfg = OciConfig::from_spec(&job, &profile)
+            .with_extra_env(spec.env.clone())
+            .with_extra_mounts(mounts)
+            .with_root_path(root_abs);
+
+        let ContainerRun {
+            child,
+            bundle_dir,
+            result,
+        } = run_git_wire_container(&job, &cfg, spec.stdin.clone(), &rootfs)
+            .map_err(WireError::Runtime)?;
+
+        let guest_id = format!("runsc-gitwire-{}", job.idem_token.0);
+        self.live
+            .lock()
+            .unwrap()
+            .insert(guest_id.clone(), RunscProc { child, bundle_dir });
+
+        // Settle against the REAL measured usage (never interrupt in-flight).
+        (hooks.settle)(&reserve, result.usage)?;
+
+        Ok(SandboxLaunch {
+            handle: SandboxHandle { guest_id },
+            result,
+        })
+    }
+}
+
+/// The git-wire production run path — mirrors [`run_production_container`] but stages the GIT-bearing
+/// rootfs ([`resolved_gvisor_git_rootfs`]) and pipes the bounded request body to the container's stdin.
+/// The bind mounts (RO repo + optional writable quarantine) are already in `cfg`'s `mounts` array. The
+/// container + bundle are cleaned up on EVERY path (no leaks); an absent git rootfs fails closed.
+fn run_git_wire_container(
+    job: &JobSpec,
+    cfg: &OciConfig,
+    stdin: Vec<u8>,
+    rootfs: &Path,
+) -> Result<ContainerRun, String> {
+    let bin = runsc_bin();
+    if !rootfs.exists() {
+        return Err(format!(
+            "staged gVisor git rootfs absent: {} (the git wire REQUIRES a real `git` in the guest — \
+             stage a git-bearing rootfs and point {ENV_GVISOR_GIT_ROOTFS} at it; see \
+             tests/git_wire_prod_exec_test.rs)",
+            rootfs.display()
+        ));
+    }
+    // Stage a config-only bundle: `cfg`'s `root.path` is the ABSOLUTE staged rootfs (set by
+    // `launch_git_wire`), so no `rootfs` symlink is staged (a symlinked root.path + a host bind mount
+    // makes the rootless gofer fail to start the sandbox; an absolute root.path + bind mount works).
+    let bundle_dir = stage_git_wire_bundle(cfg)?;
+    let container_id = format!("myelin-gitwire-{}-{}", std::process::id(), unique_suffix());
+
+    let timeout = Duration::from_secs(job.limits.timeout_secs as u64);
+    let outcome = match run_and_capture(
+        &bin,
+        &bundle_dir,
+        &container_id,
+        timeout,
+        job.limits.mem_bytes,
+        Some(stdin),
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            delete_container(&bin, &container_id);
+            let _ = std::fs::remove_dir_all(&bundle_dir);
+            return Err(e);
+        }
+    };
+    delete_container(&bin, &container_id);
+
+    let result = build_result(job, &outcome);
+    Ok(ContainerRun {
+        child: Box::new(SpawnedRunsc { bin, container_id }),
+        bundle_dir,
+        result,
+    })
+}
+
+/// Stage a CONFIG-ONLY OCI bundle (just `config.json`) for the git wire — the rootfs is referenced by
+/// the config's ABSOLUTE `root.path`, so no `rootfs` symlink is staged. Returns the bundle dir (removed
+/// on teardown).
+fn stage_git_wire_bundle(cfg: &OciConfig) -> Result<PathBuf, String> {
+    let bundle = std::env::temp_dir().join(format!(
+        "myelin-gitwire-bundle-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let _ = std::fs::remove_dir_all(&bundle);
+    std::fs::create_dir_all(&bundle).map_err(|e| format!("create bundle dir {bundle:?}: {e}"))?;
+    std::fs::write(bundle.join("config.json"), cfg.to_json())
+        .map_err(|e| format!("write config.json: {e}"))?;
+    Ok(bundle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        EgressPolicy, IdemToken, ImageRef, JobKind, MeterTarget, ReserveHandle, ResourceLimits,
-        ResourceUsage, RunTokenRef, TrustTier, WorkspaceSpec,
-    };
+    use crate::ReserveHandle;
 
     fn spec(allow: Vec<String>) -> JobSpec {
         JobSpec::new(
