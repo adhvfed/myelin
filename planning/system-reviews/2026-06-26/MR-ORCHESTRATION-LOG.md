@@ -302,3 +302,23 @@ green: pg connect, s3 put/get, rebac tuples, outbox→bus relay, valkey cache):
   buffers the full stream, so host memory isn't bounded during capture (a high-rate emitter could buffer GBs) —
   identical in BOTH backends; a capped drain-and-discard reader is the fix, landing before CT-003 (it's a
   host-DoS on the untrusted-exec boundary, so harden it before building escape verification + cutover on top).
+
+- **CT-003 + CT-003a + CT-003b (P-545) — production-path escape verification — COMMITTED 12e1e87. SI-017 CLOSED.**
+  Routed the AG-D4 corpus through the PRODUCTION launch() (not the drill harness) on both backends; 0 escapes;
+  routing guard (guest_euid=65534 vs harness root=0) fails RED on a reroute. **This is the SI-017 mechanism in
+  action: routing through the REAL path surfaced THREE declared-but-unenforced resource limits the harness
+  hid** — (a) gVisor /tmp unbounded host-RAM tmpfs → D2 escaped (fixed: size=disk_bytes tmpfs); (b) FC pids_max
+  never applied in-guest → fork bomb OOM-killed the guest (fixed: ulimit -u in the init before setpriv);
+  (c) **REJECT caught pre-commit** — the gVisor OCI memory.limit is INERT under runsc --rootless (verifier
+  proved 2 GiB held under a 256 MiB limit, host RAM consumed). Fixed by enforcing mem_bytes OUT-OF-BAND via a
+  real cgroup v2 memory.max on the runsc child tree (sentry+gofer placed via pre_exec), FAIL-CLOSED if the
+  controller can't be established; added an Mx_memhog corpus family (CORPUS_VERSION=2) so the memory gate is
+  non-vacuous. The SAME verifier that REJECTED re-tested → PASS: anon hog now cgroup-OOM-killed (exit 137, host
+  RAM bounded), gofer/sentry in-cgroup, tmpfs counts against the cap, cgroup-escape denied, fail-closed real,
+  dropping the enforcer flips the gate RED. **Lesson (reinforced twice): a control that EMITS a config field is
+  not a control that ENFORCES it — verify enforcement at runtime against the real adversary (rootless runsc
+  silently ignores OCI memory.limit; the harness's bounded tmpfs masked the prod gap).** Green prod-path escape
+  attestation minted for gVisor; FC's withheld (non-root report not green — its root-adversary proof stays the
+  harness drill). **The sandbox production-exec floor (P-544/545) is now genuinely proven — this unblocks CT-006
+  (the git wire / GT-006) and CT-007 (the GitHub-Actions cutover).** User enabled `loginctl enable-linger` so the
+  rootless memory cgroup enforcement holds headlessly.
