@@ -34,8 +34,15 @@
 //! exclusion of this one file (registered in `lint-gate` + `tests/workspace_clean.rs`).
 
 use crate::hardening::HardeningProfile;
-use crate::{JobSpec, RunnerHooks, SandboxBackend, SandboxHandle, SandboxLaunch, SandboxResult};
+use crate::{
+    JobSpec, ResourceUsage, RunnerHooks, SandboxBackend, SandboxHandle, SandboxLaunch,
+    SandboxResult, SANDBOX_CAPTURE_BOUND,
+};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Env var naming the `runsc` binary; defaults to `runsc` on `PATH`.
 pub const ENV_RUNSC_BIN: &str = "MYELIN_RUNSC_BIN";
@@ -44,10 +51,21 @@ fn runsc_bin() -> String {
     std::env::var(ENV_RUNSC_BIN).unwrap_or_else(|_| "runsc".to_string())
 }
 
+/// The unprivileged uid/gid the untrusted `spec.command` runs as INSIDE the gVisor sandbox. Untrusted
+/// code must NEVER be uid 0 even within the userspace-kernel boundary (defense in depth + hygiene);
+/// 65534 = nobody/nogroup (numeric ⇒ no `/etc/passwd` lookup). Unlike Firecracker, gVisor's exit
+/// capture needs no forge defense — `runsc run` returns the container process's REAL exit code
+/// directly to THIS host process (there is no shared serial console to spoof) — but the workload is
+/// still dropped to this non-root uid/gid in the OCI config so it never runs as root in the sandbox.
+const UNTRUSTED_UID: u32 = 65534;
+const UNTRUSTED_GID: u32 = 65534;
+
 /// The OCI runtime config (`config.json`) the gVisor `runsc` path consumes, built from a [`JobSpec`]
 /// and the mandatory [`HardeningProfile`]. Every hardening field maps to a real OCI posture: the
 /// root is `readonly: true`, all capabilities are dropped, `no_new_privileges: true`, a seccomp
-/// profile is attached, and the network namespace carries no interface when egress is default-deny.
+/// profile is attached, the network namespace carries no interface when egress is default-deny, and
+/// the untrusted process runs as a NON-ROOT uid/gid ([`UNTRUSTED_UID`]/[`UNTRUSTED_GID`]). This is a
+/// RUNNABLE OCI config (`process.cwd` + `process.env` are set) — `runsc run --bundle` executes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OciConfig {
     args: Vec<String>,
@@ -91,12 +109,17 @@ impl OciConfig {
         };
         format!(
             "{{\n  \"ociVersion\": \"1.0.0\",\n  \"process\": {{\n    \
-             \"args\": [{args}],\n    \"noNewPrivileges\": {nnp},\n    \
+             \"user\": {{ \"uid\": {uid}, \"gid\": {gid} }},\n    \
+             \"args\": [{args}],\n    \"cwd\": \"/\",\n    \
+             \"env\": [\"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"],\n    \
+             \"noNewPrivileges\": {nnp},\n    \
              \"capabilities\": {{ \"bounding\": [], \"effective\": [], \"permitted\": [] }}\n  }},\n  \
              \"root\": {{ \"path\": \"rootfs\", \"readonly\": {ro} }},\n  \
              \"linux\": {{\n    \"resources\": {{ \"pids\": {{ \"limit\": {pids} }} }},\n    \
              \"seccomp\": {{ \"defaultAction\": \"SCMP_ACT_ERRNO\" }},\n    \
              \"namespaces\": [ {net_ns} ]\n  }}\n}}",
+            uid = UNTRUSTED_UID,
+            gid = UNTRUSTED_GID,
             args = args,
             nnp = self.no_new_privileges,
             ro = self.root_readonly,
@@ -146,9 +169,10 @@ impl From<crate::HookError> for GvisorError {
 
 /// A live gVisor container handle (the OCI/`runsc` container id, killable on teardown). Its
 /// lifecycle is RECONCILED with the Firecracker [`VmmChild`](crate::firecracker::VmmChild): both
-/// expose `kill` (whole-guest teardown) AND `wait` (block until the command exits, returning the
-/// exit code). CT-002 calls `wait` to populate [`SandboxResult::exit_code`] from a real `runsc run`.
-trait RunscChild {
+/// expose `kill` (whole-guest teardown) AND `wait` (block until the command exits). For gVisor the
+/// REAL exit is captured directly from the `runsc` child's exit status during the run (no separate
+/// wait), so [`wait`](RunscChild::wait) is retained only for lifecycle-shape parity with `VmmChild`.
+pub trait RunscChild {
     fn kill(&mut self) -> Result<(), String>;
     /// Wait for the container's process to exit; returns its exit code (0 == clean). Reconciles with
     /// `VmmChild::wait` so both backends share the same launch→run→wait→result lifecycle shape.
@@ -158,7 +182,32 @@ trait RunscChild {
 /// The gVisor (`runsc`) second backend — same trait, same hardening, OCI/`runsc` path.
 #[derive(Default)]
 pub struct GvisorBackend {
-    live: Mutex<std::collections::HashMap<String, Box<dyn RunscChild + Send>>>,
+    /// guest_id → the live container's teardown state (its `runsc` child + bundle temp dir). Ephemeral;
+    /// one job per container, never reused.
+    live: Mutex<std::collections::HashMap<String, RunscProc>>,
+}
+
+/// A live container's teardown state: the (already-exited/killed) `runsc` child + the bundle temp dir
+/// to remove on teardown. Mirrors the Firecracker `GuestProc` (one job per sandbox).
+struct RunscProc {
+    child: Box<dyn RunscChild + Send>,
+    bundle_dir: PathBuf,
+}
+
+/// What a launch's run-closure hands back to [`GvisorBackend::launch_with`]: the spawned `runsc` child
+/// (already exited/killed by the time this is returned; carried for idempotent teardown), the bundle
+/// temp dir (removed on teardown), and the **already-captured** [`SandboxResult`]. Mirrors the
+/// Firecracker `GuestRun` — the CT-001 seam now carries a REAL result, no longer a stub. The real
+/// production closure ([`run_production_container`]) runs `runsc run --bundle` and fills this from the
+/// container's REAL runtime result; unit tests inject a fake child + a canned result so the
+/// four-guarantee control flow is testable without a runtime (the injectable-spawn seam — preserved).
+pub struct ContainerRun {
+    /// The spawned (and, by the time this is returned, already-exited/killed) `runsc` child.
+    pub child: Box<dyn RunscChild + Send>,
+    /// The bundle temp dir to remove on teardown.
+    pub bundle_dir: PathBuf,
+    /// The captured command result (exit / timeout / usage / bounded streams).
+    pub result: SandboxResult,
 }
 
 impl GvisorBackend {
@@ -175,8 +224,17 @@ impl GvisorBackend {
         Ok(OciConfig::from_spec(spec, &profile))
     }
 
-    /// Shared launch flow (testable without a runtime): drive the four guarantees in the mandated
-    /// order, assert the mandatory hardening profile, build the OCI config, and `run` the container.
+    /// Drive the four-guarantee seam in the mandated order — **isolation floor → hardening assert →
+    /// attribution → reserve → run → settle** — fail-closed at every step, then hand the captured
+    /// [`SandboxResult`] back behind the redrawn CT-001 seam. The `run` closure does the actual run:
+    /// it stages an OCI bundle from the built [`OciConfig`], runs `runsc run --bundle` (the untrusted
+    /// `spec.command`), captures the real exit/streams/usage and enforces `spec.limits.timeout_secs`,
+    /// and returns a [`ContainerRun`]. The trait `launch` passes [`run_production_container`] (a REAL
+    /// `runsc` container); unit tests pass a closure returning a fake child + a canned result so the
+    /// control flow is testable without a runtime (the injectable-spawn seam — preserved). `run` is
+    /// only invoked AFTER reserve succeeds, so an exhausted wallet / unmet isolation floor
+    /// refuses-to-start and `runsc` never spawns (CT-002b: the result is CONSUMED from the run, never
+    /// hardcoded — reconciles with the Firecracker `launch_with`).
     fn launch_with<F>(
         &self,
         spec: &JobSpec,
@@ -184,7 +242,7 @@ impl GvisorBackend {
         run: F,
     ) -> Result<SandboxLaunch, GvisorError>
     where
-        F: FnOnce(&OciConfig) -> Result<Box<dyn RunscChild + Send>, String>,
+        F: FnOnce(&JobSpec, &OciConfig) -> Result<ContainerRun, String>,
     {
         (hooks.isolation_floor)(spec)?;
         let profile = HardeningProfile::derive(spec);
@@ -193,30 +251,22 @@ impl GvisorBackend {
         let reserve = (hooks.reserve)(&spec.meter_to)?;
 
         let cfg = OciConfig::from_spec(spec, &profile);
-        let mut child = run(&cfg).map_err(GvisorError::Runtime)?;
-
-        // RESHAPE-001 / CT-001: the reconciled launch→run→WAIT→result lifecycle. `wait` blocks for
-        // the in-line compute job and returns the exit code (mirroring the Firecracker `VmmChild`).
-        // At CT-001 the child is the `runsc --version` probe whose `wait` is a documented no-op
-        // `Ok(0)` (no real container ran); CT-002 swaps in a real `runsc run --bundle` whose `wait`
-        // returns the real `spec.command` exit code, captures stdout/stderr, and enforces the
-        // timeout (setting `timed_out`). The usage FIELD flows into the settle hook now.
-        let exit_code = child.wait().map_err(GvisorError::Runtime)?;
+        // Run the container + capture the REAL result (the ONE legitimate `runsc`-spawn site — the
+        // sandbox seam's mechanism; the `no-host-exec` named exclusion). `run` cleans up its own
+        // bundle/container on error.
+        let ContainerRun {
+            child,
+            bundle_dir,
+            result,
+        } = run(spec, &cfg).map_err(GvisorError::Runtime)?;
 
         let guest_id = format!("runsc-{}", spec.idem_token.0);
-        self.live.lock().unwrap().insert(guest_id.clone(), child);
+        self.live
+            .lock()
+            .unwrap()
+            .insert(guest_id.clone(), RunscProc { child, bundle_dir });
 
-        let result = SandboxResult {
-            exit_code: Some(exit_code),
-            timed_out: false,
-            usage: crate::ResourceUsage {
-                cpu_seconds: 1,
-                mem_byte_seconds: 1,
-            },
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        };
-
+        // Settle against the result's REAL measured usage (CT-002b) — never interrupt in-flight.
         (hooks.settle)(&reserve, result.usage)?;
 
         Ok(SandboxLaunch {
@@ -229,43 +279,289 @@ impl GvisorBackend {
 impl SandboxBackend for GvisorBackend {
     type Error = GvisorError;
 
+    /// Run a digest-pinned [`JobSpec`] inside a REAL `runsc` (gVisor) sandbox. Blocks until the
+    /// container has run and the four guarantees have fired. The REAL `runsc` container is spawned
+    /// here — the one legitimate runtime-spawn site (the `no-host-exec` named exclusion; this seam IS
+    /// the unified sandbox, not a bypass of it).
     fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
-        self.launch_with(spec, hooks, spawn_real_runsc)
+        self.launch_with(spec, hooks, run_production_container)
     }
 
+    /// Whole-container kill on teardown: best-effort destroy the container + remove its bundle temp
+    /// dir. The container is ephemeral, never reused. Idempotent — the run path has already deleted
+    /// the container + bundle on completion, so killing an already-gone container is a no-op success.
     fn kill(&self, h: &SandboxHandle) -> Result<(), Self::Error> {
-        let child = self.live.lock().unwrap().remove(&h.guest_id);
-        if let Some(mut child) = child {
-            child.kill().map_err(GvisorError::Runtime)?;
+        let proc = self.live.lock().unwrap().remove(&h.guest_id);
+        if let Some(mut proc) = proc {
+            let r = proc.child.kill();
+            let _ = std::fs::remove_dir_all(&proc.bundle_dir);
+            r.map_err(GvisorError::Runtime)?;
         }
         Ok(())
     }
 }
 
-/// Spawn a real `runsc` container (the gVisor OCI path). The ONE legitimate runtime-spawn site for
-/// this backend (the `no-host-exec` named exclusion — the seam's mechanism, not a bypass). At P-237
-/// this verifies the `runsc` runtime is reachable (`runsc --version`); the full OCI-bundle run path
-/// is a CI-P28 follow-on, but the backend is wired onto the SAME trait NOW.
-fn spawn_real_runsc(_cfg: &OciConfig) -> Result<Box<dyn RunscChild + Send>, String> {
-    // Verify the runtime is present and gVisor-capable (a real precondition for a runsc launch).
-    let out = std::process::Command::new(runsc_bin())
-        .arg("--version")
-        .output()
-        .map_err(|e| format!("runsc not reachable: {e}"))?;
-    if !out.status.success() {
-        return Err("runsc --version failed".into());
+/// The REAL production run path (CT-002b → P-544): build a hardened OCI bundle from the spec and RUN
+/// the untrusted `spec.command` inside a REAL `runsc` (gVisor) sandbox, capturing its REAL result.
+///
+/// **Why gVisor needs no forge defense (unlike Firecracker):** `runsc run` returns the container
+/// process's REAL exit status directly to THIS host process — there is NO shared serial console the
+/// workload could write — so the exit code is taken from the `runsc` child's real `ExitStatus`, never
+/// from any in-container output. stdout/stderr are the runtime's OWN piped fds (two separate streams),
+/// not a channel the host trusts the payload to frame; there is no nonce/base64 framing because there
+/// is nothing for the payload to forge. The workload STILL runs NON-ROOT (`process.user` =
+/// 65534/65534 in the OCI config) — defense in depth; untrusted code is never uid 0 in the sandbox.
+///
+/// Mechanism (REUSING the proven bundle pattern from `escape_drill_gvisor_test::stage_bundle`):
+/// 1. Stage a temp bundle dir: a `rootfs` symlink → [`resolved_gvisor_rootfs`] + a `config.json` =
+///    [`OciConfig::to_json`] (read-only root, caps dropped, no-new-privs, seccomp, no netns when
+///    egress is default-deny, pids ceiling, NON-ROOT user).
+/// 2. Run `runsc --rootless --network=none run -bundle <dir> <cid>` with stdout/stderr piped, waiting
+///    at most `spec.limits.timeout_secs`; on expiry the WHOLE CONTAINER is killed (`runsc kill <cid>
+///    KILL` + the child) ⇒ `timed_out=true`, `exit_code=None`.
+/// 3. Best-effort `runsc delete -force <cid>` + remove the bundle dir on EVERY path (no leaks).
+fn run_production_container(spec: &JobSpec, cfg: &OciConfig) -> Result<ContainerRun, String> {
+    let bin = runsc_bin();
+    let rootfs = resolved_gvisor_rootfs();
+    // Honest fail-closed: a runtime/start precondition failure surfaces as an error (never a
+    // fabricated exit). An absent rootfs cannot produce a valid bundle.
+    if !rootfs.exists() {
+        return Err(format!(
+            "staged gVisor rootfs absent: {} (cannot build a valid OCI bundle)",
+            rootfs.display()
+        ));
     }
-    Ok(Box::new(SpawnedRunsc))
+    let bundle_dir = stage_production_bundle(cfg, &rootfs)?;
+    let container_id = format!("myelin-prod-{}-{}", std::process::id(), unique_suffix());
+
+    let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
+    let outcome = match run_and_capture(&bin, &bundle_dir, &container_id, timeout) {
+        Ok(o) => o,
+        Err(e) => {
+            // Spawning/waiting failed before a trustworthy result — clean up + surface honestly.
+            delete_container(&bin, &container_id);
+            let _ = std::fs::remove_dir_all(&bundle_dir);
+            return Err(e);
+        }
+    };
+    // The container has exited (or been timeout-killed) — best-effort delete (idempotent; `runsc run`
+    // usually self-deletes on a clean exit, but the timeout path leaves it for us to reap).
+    delete_container(&bin, &container_id);
+
+    let result = build_result(spec, &outcome);
+    Ok(ContainerRun {
+        child: Box::new(SpawnedRunsc { bin, container_id }),
+        bundle_dir,
+        result,
+    })
 }
 
-struct SpawnedRunsc;
+/// A cheap monotonic-ish suffix to avoid bundle/container-id collisions within a process.
+fn unique_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// Stage a self-contained OCI bundle in a temp dir — the SAME pattern as
+/// `escape_drill_gvisor_test::stage_bundle` (no forked recipe): a `rootfs` symlink → the staged
+/// minimal rootfs (`runsc` reads `root.path = "rootfs"` relative to the bundle) + the production
+/// `config.json` from [`OciConfig::to_json`]. Returns the bundle dir.
+fn stage_production_bundle(cfg: &OciConfig, rootfs: &Path) -> Result<PathBuf, String> {
+    let bundle = std::env::temp_dir().join(format!(
+        "myelin-gvisor-prod-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let _ = std::fs::remove_dir_all(&bundle);
+    std::fs::create_dir_all(&bundle).map_err(|e| format!("create bundle dir {bundle:?}: {e}"))?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(rootfs, bundle.join("rootfs"))
+        .map_err(|e| format!("symlink rootfs into bundle: {e}"))?;
+    std::fs::write(bundle.join("config.json"), cfg.to_json())
+        .map_err(|e| format!("write config.json: {e}"))?;
+    Ok(bundle)
+}
+
+/// Best-effort idempotent container delete (`runsc --rootless delete -force <cid>`). Deleting an
+/// already-gone container is a harmless no-op — called on EVERY teardown path so no container leaks.
+fn delete_container(bin: &str, container_id: &str) {
+    let _ = Command::new(bin)
+        .arg("--rootless")
+        .arg("delete")
+        .arg("-force")
+        .arg(container_id)
+        .output();
+}
+
+/// Read the `runsc` process's cumulative CPU time (utime+stime) from `/proc/<pid>/stat`, in whole
+/// seconds (USER_HZ = 100 on Linux). Mirrors the Firecracker backend's measurement (a small,
+/// backend-specific `/proc` read of the spawned runtime's pid). `None` if `/proc` is unavailable or
+/// unparseable (then the caller falls back to a wall-clock figure — a real run never under-meters to 0).
+fn read_proc_cpu_seconds(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The comm field (field 2) is parenthesised and may contain spaces/`)`; skip past the LAST ')'.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // After comm: state(3) ppid(4) ... utime(14) stime(15) ... ⇒ rest indices 11/12.
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some((utime + stime) / 100)
+}
+
+/// The raw outcome of running `runsc run` to completion (or to a timeout-kill) — consumed by
+/// [`build_result`] into a [`SandboxResult`].
+struct RunscOutcome {
+    /// The `runsc` child's REAL exit status = the container process's actual exit code. `None` if the
+    /// container was timeout-killed (no trustworthy code — never fabricated).
+    exit: Option<i32>,
+    /// True iff the wall-clock `timeout_secs` ceiling fired and the whole container was killed.
+    timed_out: bool,
+    /// The container's REAL piped stdout (the runtime's fd, not in-container framing).
+    stdout: Vec<u8>,
+    /// The container's REAL piped stderr.
+    stderr: Vec<u8>,
+    /// Wall-clock duration the container ran.
+    wall: Duration,
+    /// Host-side CPU-seconds of the `runsc` process (utime+stime from `/proc`), if readable.
+    cpu_seconds: Option<u64>,
+}
+
+/// Spawn the REAL `runsc` container (`runsc --rootless --network=none run -bundle <dir> <cid>`) — THE
+/// one legitimate runtime-spawn site (the `no-host-exec` named exclusion; the mechanism that CREATES
+/// the userspace-kernel boundary, not a bypass) — drain its stdout/stderr on dedicated threads (so a
+/// chatty container cannot fill a pipe buffer and deadlock), and wait at most `timeout`. On expiry the
+/// WHOLE CONTAINER is killed (`runsc kill <cid> KILL` then the child) and `timed_out` is set. The exit
+/// code is the `runsc` child's REAL `ExitStatus.code()` — the container process's actual exit, never
+/// parsed from container output (the structural reason gVisor needs no forge defense).
+fn run_and_capture(
+    bin: &str,
+    bundle: &Path,
+    container_id: &str,
+    timeout: Duration,
+) -> Result<RunscOutcome, String> {
+    let mut child = Command::new(bin)
+        .arg("--rootless")
+        .arg("--network=none")
+        .arg("run")
+        .arg("-bundle")
+        .arg(bundle)
+        .arg(container_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn runsc: {e}"))?;
+
+    let pid = child.id();
+    let start = Instant::now();
+
+    // Drain both pipes on threads so a chatty container cannot fill a pipe buffer and deadlock.
+    let mut out = child.stdout.take().expect("piped stdout");
+    let mut err = child.stderr.take().expect("piped stderr");
+    let th_out = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = out.read_to_end(&mut b);
+        b
+    });
+    let th_err = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = err.read_to_end(&mut b);
+        b
+    });
+
+    let mut timed_out = false;
+    let mut last_cpu: Option<u64> = None;
+    let exit = loop {
+        if let Some(status) = child.try_wait().map_err(|e| format!("wait runsc: {e}"))? {
+            break status.code();
+        }
+        if let Some(c) = read_proc_cpu_seconds(pid) {
+            last_cpu = Some(c);
+        }
+        if start.elapsed() >= timeout {
+            // Wall-clock ceiling hit: whole-CONTAINER kill (SIGKILL the container's PID1 via the
+            // runtime), then reap the `runsc` child process so the pipes hit EOF.
+            let _ = Command::new(bin)
+                .arg("--rootless")
+                .arg("kill")
+                .arg(container_id)
+                .arg("KILL")
+                .output();
+            let _ = child.kill();
+            let _ = child.wait();
+            timed_out = true;
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let wall = start.elapsed();
+
+    // The child has exited/been-killed ⇒ the pipes hit EOF ⇒ the drain threads finish.
+    let stdout = th_out.join().unwrap_or_default();
+    let stderr = th_err.join().unwrap_or_default();
+
+    Ok(RunscOutcome {
+        exit,
+        timed_out,
+        stdout,
+        stderr,
+        wall,
+        cpu_seconds: last_cpu,
+    })
+}
+
+/// Build the [`SandboxResult`] from the runtime outcome. The exit code is the `runsc` child's REAL
+/// exit status (gVisor returns the container process's exit directly — no forge surface); a timed-out
+/// (killed) container has no trustworthy exit (`None`, never fabricated as 0). stdout/stderr are the
+/// container's REAL piped streams, HEAD-bounded to [`SANDBOX_CAPTURE_BOUND`] (256 KiB) EACH — the same
+/// bound the Firecracker backend uses (shared `lib.rs` const). Usage is the REAL measured figure: host
+/// CPU-seconds of the `runsc` process (or a wall-clock ceiling fallback so a real run never
+/// under-meters to 0) + mem-byte-seconds from the job's mem ceiling × wall-seconds.
+fn build_result(spec: &JobSpec, o: &RunscOutcome) -> SandboxResult {
+    let mut stdout = o.stdout.clone();
+    if stdout.len() > SANDBOX_CAPTURE_BOUND {
+        stdout.truncate(SANDBOX_CAPTURE_BOUND); // HEAD capture (documented; full stream → firehose)
+    }
+    let mut stderr = o.stderr.clone();
+    if stderr.len() > SANDBOX_CAPTURE_BOUND {
+        stderr.truncate(SANDBOX_CAPTURE_BOUND);
+    }
+    // A timed-out container was killed mid-flight ⇒ no trustworthy exit code (do NOT fabricate one).
+    let exit_code = if o.timed_out { None } else { o.exit };
+
+    let wall_secs_ceil = o.wall.as_secs() + u64::from(o.wall.subsec_nanos() > 0);
+    let cpu_seconds = o.cpu_seconds.filter(|c| *c > 0).unwrap_or(wall_secs_ceil);
+    let mem_byte_seconds = spec.limits.mem_bytes.saturating_mul(wall_secs_ceil);
+
+    SandboxResult {
+        exit_code,
+        timed_out: o.timed_out,
+        usage: ResourceUsage {
+            cpu_seconds,
+            mem_byte_seconds,
+        },
+        stdout,
+        stderr,
+    }
+}
+
+/// The post-run container teardown handle (the container has already exited/been-killed + been
+/// deleted by the run path). [`kill`](RunscChild::kill) is an idempotent best-effort `runsc delete
+/// -force` (no-op if already gone). [`wait`](RunscChild::wait) is a no-op for trait parity with the
+/// Firecracker `VmmChild` — the REAL exit was already captured from the `runsc` child's exit status.
+struct SpawnedRunsc {
+    bin: String,
+    container_id: String,
+}
 impl RunscChild for SpawnedRunsc {
     fn kill(&mut self) -> Result<(), String> {
+        delete_container(&self.bin, &self.container_id);
         Ok(())
     }
     fn wait(&mut self) -> Result<i32, String> {
-        // CT-001: no real container ran (the launch only probed `runsc --version`); a clean exit.
-        // CT-002 waits on the real `runsc run` and returns its actual exit code.
+        // The real exit was already captured from the `runsc` child's exit status (no real wait left).
         Ok(0)
     }
 }
@@ -420,7 +716,7 @@ mod tests {
     use super::*;
     use crate::{
         EgressPolicy, IdemToken, ImageRef, JobKind, MeterTarget, ReserveHandle, ResourceLimits,
-        RunTokenRef, TrustTier, WorkspaceSpec,
+        ResourceUsage, RunTokenRef, TrustTier, WorkspaceSpec,
     };
 
     fn spec(allow: Vec<String>) -> JobSpec {
@@ -468,6 +764,19 @@ mod tests {
         }
     }
 
+    /// A canned [`ContainerRun`] for the fake path (no real `runsc`): a clean exit-0 result + a fake
+    /// child + a non-existent bundle dir (its removal on teardown is a harmless no-op).
+    fn fake_run() -> ContainerRun {
+        ContainerRun {
+            child: Box::new(FakeRunsc),
+            bundle_dir: std::env::temp_dir().join("myelin-gvisor-fake-bundle-does-not-exist"),
+            result: SandboxResult::stub_ok(ResourceUsage {
+                cpu_seconds: 1,
+                mem_byte_seconds: 1,
+            }),
+        }
+    }
+
     #[test]
     fn oci_config_enforces_the_backend_independent_hardening() {
         let cfg = GvisorBackend::oci_config(&spec(vec![])).unwrap();
@@ -484,6 +793,16 @@ mod tests {
             json.contains("\"bounding\": []"),
             "all capabilities dropped"
         );
+        // CT-002b: the untrusted process runs NON-ROOT (defense in depth — never uid 0 in the
+        // sandbox) and the config is RUNNABLE (`cwd` set, else `runsc run` rejects the spec).
+        assert!(
+            json.contains("\"uid\": 65534") && json.contains("\"gid\": 65534"),
+            "the untrusted process must run as a non-root uid/gid (65534)"
+        );
+        assert!(
+            json.contains("\"cwd\": \"/\""),
+            "process.cwd must be set or the OCI runtime rejects the spec"
+        );
     }
 
     #[test]
@@ -491,7 +810,7 @@ mod tests {
         // The SAME SandboxBackend trait + the SAME hardening — the named-second backend.
         let backend = GvisorBackend::new();
         let launch = backend
-            .launch_with(&spec(vec![]), &ok_hooks(), |_cfg| Ok(Box::new(FakeRunsc)))
+            .launch_with(&spec(vec![]), &ok_hooks(), |_spec, _cfg| Ok(fake_run()))
             .unwrap();
         assert_eq!(launch.handle.guest_id, "runsc-idem-runsc-1");
         // The reshaped seam carries the command result back (CT-001 stub).
@@ -555,7 +874,7 @@ mod tests {
             attribute: Box::new(|_t| Ok(())),
             isolation_floor: Box::new(|_s| Ok(())),
         };
-        let r = backend.launch_with(&spec(vec![]), &hooks, |_cfg| Ok(Box::new(FakeRunsc)));
+        let r = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg| Ok(fake_run()));
         assert!(matches!(r, Err(GvisorError::Hook(_))));
     }
 }
