@@ -221,6 +221,12 @@ pub fn http_catalogue() -> Vec<Endpoint> {
 pub enum CliCommand {
     /// `myelin repo list` — the leak-free repo list (the `SetExpr` push-down).
     RepoList,
+    /// `myelin repo create <slug>` — create a durable bare repo (the GT-003 `create_repo` write). The
+    /// tenant is the token's; the body carries only the `slug`.
+    RepoCreate {
+        /// The repo slug to create (under the verified tenant).
+        slug: String,
+    },
     /// `myelin repo view <repo>` — the per-viewer repo projection.
     RepoView {
         /// The repo slug/ref.
@@ -231,32 +237,57 @@ pub enum CliCommand {
         /// Optional repo filter.
         repo: Option<String>,
     },
-    /// `myelin pr view <pr>` — the PR overview projection (the context pane).
+    /// `myelin pr open <repo> [--base <ref>] [--head <ref>] [--head-oid <oid>] [--draft]` — open a PR
+    /// (the GT-003 durable `open_pr`). The body carries ONLY the proposal (never branch-protection
+    /// policy or check facts — those are repo-owned / producer-set, the GT-003 bypass fix).
+    PrOpen {
+        /// The repo slug the PR is opened against.
+        repo: String,
+        /// The base ref (default `refs/heads/main`).
+        base_ref: Option<String>,
+        /// The head ref (default `refs/heads/feature`).
+        head_ref: Option<String>,
+        /// The head commit oid the PR proposes (validated against the repo at merge).
+        head_oid: Option<String>,
+        /// Whether the PR opens as a draft.
+        draft: bool,
+    },
+    /// `myelin pr view <repo> <pr>` — the PR overview projection (the context pane).
     PrView {
+        /// The repo slug the PR lives in.
+        repo: String,
         /// The PR number.
         number: u64,
     },
-    /// `myelin pr checks <pr>` — the `check_status` projection (per-context state/required/summary).
+    /// `myelin pr checks <repo> <pr>` — the `check_status` projection (per-context state/required/summary).
     PrChecks {
+        /// The repo slug the PR lives in.
+        repo: String,
         /// The PR number.
         number: u64,
     },
-    /// `myelin pr review <pr> --approve|--request-changes|--comment` — submit a review.
+    /// `myelin pr review <repo> <pr> --approve|--request-changes|--comment` — submit a review.
     PrReview {
+        /// The repo slug the PR lives in.
+        repo: String,
         /// The PR number.
         number: u64,
         /// The verdict (`approve` / `request-changes` / `comment`).
         verdict: String,
     },
-    /// `myelin pr merge <pr> [--squash|--rebase|--merge] [--auto]` — the merge gate + queue.
+    /// `myelin pr merge <repo> <pr> [--squash|--rebase|--merge] [--auto]` — the merge gate + queue.
     PrMerge {
+        /// The repo slug the PR lives in.
+        repo: String,
         /// The PR number.
         number: u64,
         /// `--auto` = merge-when-green (the durable `ci.result` wait).
         auto: bool,
     },
-    /// `myelin pr endorse-fork-ci <pr>` — the maintainer `approve_untrusted_ci` endorsement (X-1).
+    /// `myelin pr endorse-fork-ci <repo> <pr>` — the maintainer `approve_untrusted_ci` endorsement (X-1).
     PrEndorseForkCi {
+        /// The repo slug the PR lives in.
+        repo: String,
         /// The PR number.
         number: u64,
     },
@@ -274,9 +305,11 @@ impl CliCommand {
     pub fn handler(&self) -> Handler {
         match self {
             CliCommand::RepoList | CliCommand::PrList { .. } => Handler::ListFilter,
+            CliCommand::RepoCreate { .. } | CliCommand::PrOpen { .. } | CliCommand::PrReview { .. } => {
+                Handler::Lifecycle
+            }
             CliCommand::RepoView { .. } | CliCommand::PrView { .. } => Handler::Project,
             CliCommand::PrChecks { .. } => Handler::CheckStatus,
-            CliCommand::PrReview { .. } => Handler::Lifecycle,
             CliCommand::PrMerge { .. } => Handler::MergeGate,
             CliCommand::PrEndorseForkCi { .. } => Handler::ForkEndorse,
             CliCommand::SearchCode { .. } => Handler::CodeSearch,
@@ -287,7 +320,9 @@ impl CliCommand {
     pub fn is_write(&self) -> bool {
         matches!(
             self,
-            CliCommand::PrReview { .. }
+            CliCommand::RepoCreate { .. }
+                | CliCommand::PrOpen { .. }
+                | CliCommand::PrReview { .. }
                 | CliCommand::PrMerge { .. }
                 | CliCommand::PrEndorseForkCi { .. }
         )
@@ -338,10 +373,14 @@ fn parse_repo(rest: &[&str]) -> Result<CliCommand, CliParseError> {
         .ok_or(CliParseError::MissingArg { what: "repo verb" })?;
     match *verb {
         "list" => Ok(CliCommand::RepoList),
+        "create" => {
+            let slug = positional(args, 0).ok_or(CliParseError::MissingArg { what: "slug" })?;
+            Ok(CliCommand::RepoCreate {
+                slug: slug.to_string(),
+            })
+        }
         "view" => {
-            let repo = args
-                .first()
-                .ok_or(CliParseError::MissingArg { what: "repo" })?;
+            let repo = positional(args, 0).ok_or(CliParseError::MissingArg { what: "repo" })?;
             Ok(CliCommand::RepoView {
                 repo: repo.to_string(),
             })
@@ -357,18 +396,35 @@ fn parse_pr(rest: &[&str]) -> Result<CliCommand, CliParseError> {
         .split_first()
         .ok_or(CliParseError::MissingArg { what: "pr verb" })?;
     match *verb {
+        // `pr list` keeps its repo as an OPTIONAL `--repo` filter (no per-PR target).
         "list" => {
             let repo = flag_value(args, "--repo");
             Ok(CliCommand::PrList { repo })
         }
-        "view" => Ok(CliCommand::PrView {
-            number: parse_number(args)?,
-        }),
-        "checks" => Ok(CliCommand::PrChecks {
-            number: parse_number(args)?,
-        }),
+        // `pr open <repo> [--base …] [--head …] [--head-oid …] [--draft]` — the repo is the first
+        // positional; the rest is the proposal (never policy/facts — the GT-003 bypass fix).
+        "open" => {
+            let repo = positional(args, 0).ok_or(CliParseError::MissingArg { what: "repo" })?;
+            Ok(CliCommand::PrOpen {
+                repo: repo.to_string(),
+                base_ref: flag_value(args, "--base"),
+                head_ref: flag_value(args, "--head"),
+                head_oid: flag_value(args, "--head-oid"),
+                draft: args.contains(&"--draft"),
+            })
+        }
+        // The per-PR verbs all take `<repo> <number>` (the edge path is /repos/<repo>/prs/<n> — the
+        // repo is threaded so the CLI can build the durable route; GT-005).
+        "view" => {
+            let (repo, number) = repo_and_number(args)?;
+            Ok(CliCommand::PrView { repo, number })
+        }
+        "checks" => {
+            let (repo, number) = repo_and_number(args)?;
+            Ok(CliCommand::PrChecks { repo, number })
+        }
         "review" => {
-            let number = parse_number(args)?;
+            let (repo, number) = repo_and_number(args)?;
             let verdict = if args.contains(&"--approve") {
                 "approve"
             } else if args.contains(&"--request-changes") {
@@ -381,22 +437,40 @@ fn parse_pr(rest: &[&str]) -> Result<CliCommand, CliParseError> {
                 });
             };
             Ok(CliCommand::PrReview {
+                repo,
                 number,
                 verdict: verdict.to_string(),
             })
         }
         "merge" => {
-            let number = parse_number(args)?;
+            let (repo, number) = repo_and_number(args)?;
             let auto = args.contains(&"--auto");
-            Ok(CliCommand::PrMerge { number, auto })
+            Ok(CliCommand::PrMerge { repo, number, auto })
         }
-        "endorse-fork-ci" => Ok(CliCommand::PrEndorseForkCi {
-            number: parse_number(args)?,
-        }),
+        "endorse-fork-ci" => {
+            let (repo, number) = repo_and_number(args)?;
+            Ok(CliCommand::PrEndorseForkCi { repo, number })
+        }
         other => Err(CliParseError::Unknown {
             token: other.to_string(),
         }),
     }
+}
+
+/// The `n`th non-flag positional argument (0-indexed), if present.
+fn positional<'a>(args: &'a [&str], n: usize) -> Option<&'a str> {
+    args.iter().filter(|a| !a.starts_with("--")).nth(n).copied()
+}
+
+/// Parse a per-PR target `<repo> <number>` from the positionals: the FIRST positional is the repo
+/// slug, the SECOND is the PR number (loud on a missing repo / missing or non-numeric number).
+fn repo_and_number(args: &[&str]) -> Result<(String, u64), CliParseError> {
+    let repo = positional(args, 0).ok_or(CliParseError::MissingArg { what: "repo" })?;
+    let raw = positional(args, 1).ok_or(CliParseError::MissingArg { what: "number" })?;
+    let number = raw.parse::<u64>().map_err(|_| CliParseError::BadArg {
+        value: raw.to_string(),
+    })?;
+    Ok((repo.to_string(), number))
 }
 
 fn parse_search(rest: &[&str]) -> Result<CliCommand, CliParseError> {
@@ -419,17 +493,6 @@ fn parse_search(rest: &[&str]) -> Result<CliCommand, CliParseError> {
             token: other.to_string(),
         }),
     }
-}
-
-/// The first non-flag positional argument parsed as a PR number (loud on a non-numeric value).
-fn parse_number(args: &[&str]) -> Result<u64, CliParseError> {
-    let raw = args
-        .iter()
-        .find(|a| !a.starts_with("--"))
-        .ok_or(CliParseError::MissingArg { what: "number" })?;
-    raw.parse::<u64>().map_err(|_| CliParseError::BadArg {
-        value: raw.to_string(),
-    })
 }
 
 /// The value following a `--flag` (e.g. `--repo core`), or `None` if absent.

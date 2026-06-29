@@ -21,6 +21,7 @@
 
 use crate::error::CliError;
 use myelin_git::api::{parse_cli, CliCommand, CliParseError};
+use serde_json::json;
 
 /// The HTTP method an [`EdgeCall`] uses (the CLI only issues reads + simple writes today).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +61,17 @@ impl EdgeCall {
     fn get(path: impl Into<String>) -> EdgeCall {
         EdgeCall { method: HttpMethod::Get, path: path.into(), query: None, payload: None }
     }
+
+    /// A `POST` with a JSON body (the body bytes are the serialized payload). The tenant is NEVER in
+    /// the body — it is the verified token's (the IDOR floor); the body carries only the proposal.
+    fn post_json(path: impl Into<String>, payload: serde_json::Value) -> EdgeCall {
+        EdgeCall {
+            method: HttpMethod::Post,
+            path: path.into(),
+            query: None,
+            payload: Some(payload.to_string().into_bytes()),
+        }
+    }
 }
 
 /// Map a parse error from a subsystem grammar to a clean [`CliError::Usage`] (exit 2) — a bad verb /
@@ -83,19 +95,28 @@ pub fn git_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     git_command_to_call(&command)
 }
 
-/// Map a git [`CliCommand`] to its edge [`EdgeCall`]. The implemented (REAL, end-to-end) reads are
-/// the repo list + code search — the edge GET routes that line up with the grammar's args (the tenant
-/// is from the token; neither carries a path-tenant). The remaining commands are honestly deferred:
-/// the edge git surface (MR-015) is repos-list / single-PR / checks / blob / code-search, and several
-/// grammar verbs (`repo view`, `pr list`, `pr view`) either have no edge endpoint yet or carry no
-/// `<repo>` the edge PR/blob path requires — named, not faked.
+/// Map a git [`CliCommand`] to its edge [`EdgeCall`]. As of GT-005 the operator surface is wired to
+/// the DURABLE GT-003 edge: repo create/list/view, PR open/view/checks/review/merge/endorse, blob, and
+/// code-search all hit a real `/v1/git/...` route under the Bearer capability token (the tenant is the
+/// token's — no path-tenant). A server-side gate (the merge gate) surfaces as a clean edge error
+/// through the client, never a CLI bypass. `pr list` stays an honest deferral (the edge exposes a
+/// single-PR view, not a list).
 pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
     match command {
-        // REAL end-to-end: GET /v1/git/repos → the leak-free repo list ViewModel (the {items,page}
-        // envelope). The tenant is the verified token's; the path carries none.
+        // ── Reads ──
+        // GET /v1/git/repos → the leak-free repo list ViewModel (the {items,page} envelope).
         CliCommand::RepoList => Ok(EdgeCall::get("/v1/git/repos")),
-
-        // REAL end-to-end: GET /v1/git/search/code?q=… → the ACL-pre-filtered code-search hits.
+        // GET /v1/git/repos/<repo> → the per-repo home projection (durable on-disk state).
+        CliCommand::RepoView { repo } => Ok(EdgeCall::get(format!("/v1/git/repos/{repo}"))),
+        // GET /v1/git/repos/<repo>/prs/<n> → the durable PR overview.
+        CliCommand::PrView { repo, number } => {
+            Ok(EdgeCall::get(format!("/v1/git/repos/{repo}/prs/{number}")))
+        }
+        // GET /v1/git/repos/<repo>/prs/<n>/checks → the X-1 checks projection (the repo-owned ruleset).
+        CliCommand::PrChecks { repo, number } => {
+            Ok(EdgeCall::get(format!("/v1/git/repos/{repo}/prs/{number}/checks")))
+        }
+        // GET /v1/git/search/code?q=… → the ACL-pre-filtered code-search hits.
         CliCommand::SearchCode { query, .. } => {
             if query.split_whitespace().count() != 1 {
                 // The edge query parser does not percent-decode yet (a named follow-on); a
@@ -113,26 +134,49 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
             })
         }
 
-        // Honest deferrals — the grammar accepts these, but the edge does not expose a matching route
-        // (or the grammar carries no `<repo>` the edge path needs). Named, never faked.
-        CliCommand::RepoView { .. } => Err(CliError::Unsupported(
-            "`git repo view` is not yet on the edge (the MR-015 git surface is repos-list / single-PR \
-             / checks / blob / code-search) — deferred".into(),
+        // ── Writes (durable GT-003; the tenant is the token's, never the body) ──
+        // POST /v1/git/repos {slug} → create a durable bare repo.
+        CliCommand::RepoCreate { slug } => {
+            Ok(EdgeCall::post_json("/v1/git/repos", json!({ "slug": slug })))
+        }
+        // POST /v1/git/repos/<repo>/prs {base_ref, head_ref, head_oid, draft} → open a PR. The body
+        // carries ONLY the proposal (never branch-protection policy or check facts — the GT-003 fix).
+        CliCommand::PrOpen { repo, base_ref, head_ref, head_oid, draft } => {
+            let mut body = json!({ "draft": draft });
+            if let Some(b) = base_ref {
+                body["base_ref"] = json!(b);
+            }
+            if let Some(h) = head_ref {
+                body["head_ref"] = json!(h);
+            }
+            if let Some(o) = head_oid {
+                body["head_oid"] = json!(o);
+            }
+            Ok(EdgeCall::post_json(format!("/v1/git/repos/{repo}/prs"), body))
+        }
+        // POST /v1/git/repos/<repo>/prs/<n>/reviews {verdict} → submit a review.
+        CliCommand::PrReview { repo, number, verdict } => Ok(EdgeCall::post_json(
+            format!("/v1/git/repos/{repo}/prs/{number}/reviews"),
+            json!({ "verdict": verdict }),
         )),
+        // POST /v1/git/repos/<repo>/prs/<n>/merge → the merge gate (server-enforced). A blocked gate is
+        // a clean edge error the CLI surfaces (the reason), never a bypass. `--auto` (merge-when-green)
+        // is a named durable follow-on; the immediate gate evaluation runs server-side either way.
+        CliCommand::PrMerge { repo, number, .. } => Ok(EdgeCall::post_json(
+            format!("/v1/git/repos/{repo}/prs/{number}/merge"),
+            json!({}),
+        )),
+        // POST /v1/git/repos/<repo>/prs/<n>/endorse-fork-ci → the maintainer fork-CI endorsement.
+        CliCommand::PrEndorseForkCi { repo, number } => Ok(EdgeCall::post_json(
+            format!("/v1/git/repos/{repo}/prs/{number}/endorse-fork-ci"),
+            json!({}),
+        )),
+
+        // Honest deferral — the edge exposes a single-PR view, not a list endpoint.
         CliCommand::PrList { .. } => Err(CliError::Unsupported(
             "`git pr list` has no edge endpoint yet (the edge exposes a single PR view at \
              /v1/git/repos/<repo>/prs/<n>, not a list) — deferred".into(),
         )),
-        CliCommand::PrView { .. } | CliCommand::PrChecks { .. } => Err(CliError::Unsupported(
-            "the edge PR path is /v1/git/repos/<repo>/prs/<n>, but the `pr` grammar carries no \
-             <repo> to build it — deferred until the grammar threads a repo".into(),
-        )),
-        CliCommand::PrReview { .. } | CliCommand::PrMerge { .. } | CliCommand::PrEndorseForkCi { .. } => {
-            Err(CliError::Unsupported(
-                "git write commands are wired at the edge but their durable effect is deferred to the \
-                 Git track (E1.1), and the grammar carries no <repo> for the path — deferred".into(),
-            ))
-        }
     }
 }
 
@@ -213,10 +257,35 @@ mod tests {
     }
 
     /// A parsed-but-unmapped git command is an HONEST Unsupported (exit 4), not a faked success.
+    /// `pr list` parses via git's grammar but the edge exposes no list route — deferred, not faked.
     #[test]
     fn git_unmapped_command_is_honest_unsupported() {
-        let err = git_dispatch(&["repo", "view", "core"]).unwrap_err();
+        let err = git_dispatch(&["pr", "list"]).unwrap_err();
         assert_eq!(err.code(), 4);
+    }
+
+    /// GT-005: the durable write commands now map to a real `/v1/git/...` route (POST with a JSON
+    /// body) — the tenant is the token's, never the body (the IDOR floor).
+    #[test]
+    fn git_durable_writes_map_to_real_routes() {
+        let create = git_dispatch(&["repo", "create", "alpha"]).unwrap();
+        assert_eq!(create.method, HttpMethod::Post);
+        assert_eq!(create.path, "/v1/git/repos");
+        let body = String::from_utf8(create.payload.clone().unwrap()).unwrap();
+        assert!(body.contains("\"slug\":\"alpha\""));
+        assert!(!body.contains("tenant"), "the tenant is never in the body (IDOR floor)");
+
+        let view = git_dispatch(&["pr", "view", "alpha", "7"]).unwrap();
+        assert_eq!(view.method, HttpMethod::Get);
+        assert_eq!(view.path, "/v1/git/repos/alpha/prs/7");
+
+        let merge = git_dispatch(&["pr", "merge", "alpha", "7"]).unwrap();
+        assert_eq!(merge.method, HttpMethod::Post);
+        assert_eq!(merge.path, "/v1/git/repos/alpha/prs/7/merge");
+
+        let review = git_dispatch(&["pr", "review", "alpha", "7", "--approve"]).unwrap();
+        assert_eq!(review.path, "/v1/git/repos/alpha/prs/7/reviews");
+        assert!(String::from_utf8(review.payload.unwrap()).unwrap().contains("approve"));
     }
 
     /// notif REUSES its own grammar (CliView): a valid `--view` parses, an unknown view is rejected

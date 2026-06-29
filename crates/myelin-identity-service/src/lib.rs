@@ -167,7 +167,7 @@ pub use oidc::{
 };
 pub use ssh_auth::{
     encode_ssh_credential_material, signed_payload, ssh_fingerprint, Challenge, ChallengeGuard,
-    KeyBindingIndex, RegisteredKey, SshVerifier,
+    KeyBindingIndex, KeyBindingResolver, PrincipalStoreKeyBindings, RegisteredKey, SshVerifier,
 };
 pub use webauthn::{
     encode_assertion_material, encode_registration_material, ChallengeGuard as WebauthnChallengeGuard,

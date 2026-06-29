@@ -322,19 +322,19 @@ fn git_p32_cli_and_api_surface_the_existing_handlers() {
     // `myelin …` git CLI + the HTTP catalogue, asserting each maps to an already-built handler and
     // every write is Id.check-gated (BUS-2).
     assert_eq!(
-        parse_cli(&["pr", "merge", "1421", "--auto"])
+        parse_cli(&["pr", "merge", "core", "1421", "--auto"])
             .unwrap()
             .handler(),
         Handler::MergeGate
     );
     assert_eq!(
-        parse_cli(&["pr", "endorse-fork-ci", "1421"])
+        parse_cli(&["pr", "endorse-fork-ci", "core", "1421"])
             .unwrap()
             .handler(),
         Handler::ForkEndorse
     );
     assert_eq!(
-        parse_cli(&["pr", "checks", "1421"]).unwrap().handler(),
+        parse_cli(&["pr", "checks", "core", "1421"]).unwrap().handler(),
         Handler::CheckStatus
     );
     assert_eq!(

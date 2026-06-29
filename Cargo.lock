@@ -2502,6 +2502,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "myelin-agent",
  "myelin-events",
  "myelin-git",
  "myelin-identity",
@@ -2743,6 +2744,7 @@ name = "myelin-mcp"
 version = "0.0.0"
 dependencies = [
  "myelin-agent",
+ "myelin-edge",
  "myelin-events",
  "myelin-git",
  "myelin-identity",

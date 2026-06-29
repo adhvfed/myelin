@@ -71,6 +71,7 @@ pub mod error;
 pub mod gateway;
 pub mod git_durable;
 pub mod git_edge;
+pub mod git_effect;
 pub mod request;
 pub mod server;
 pub mod session;
@@ -79,6 +80,7 @@ pub mod sse;
 pub use authz::AllowAll;
 pub use git_durable::{register_git_durable, DurableGitBackend};
 pub use git_edge::{register_git, GitEdgeState};
+pub use git_effect::GitEffectApi;
 pub use catalogue::{
     page_envelope, Handler, HandlerCtx, Method, Page, API_VERSION, DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
