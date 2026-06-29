@@ -242,6 +242,14 @@ members = [
     # keeps `cargo build --workspace` DB-free; the real backend clients live behind the
     # `integration` feature in the crates that own the trait impls.
     "crates/myelin-config",
+    # The `myelin` CLI (E0.9 / MR-020): the ONE local command surface a human or an agent drives the
+    # product through — an edge CLIENT that presents a REAL capability token as `Authorization: Bearer`
+    # and calls the MR-014 gateway's `/v1/...` endpoints (the same auth + audit a browser session is).
+    # A LEAF BINARY: it depends on the subsystem command grammars (myelin-git `api`, myelin-notif `cli`)
+    # + a tiny hyper HTTP client, and nothing in the production DAG depends back on it. Like
+    # myelin-edge it is NOT a node in the eleven-crate library DAG modelled by crate_graph.rs
+    # (substrate_is_root()/identity_is_sink() unaffected). See crates/myelin-cli/src/lib.rs.
+    "crates/myelin-cli",
 ]
 
 # Workspace-wide dependency versions. Pinned once here so every glue crate shares
