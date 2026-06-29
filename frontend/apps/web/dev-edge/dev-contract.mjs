@@ -58,6 +58,178 @@ export function reposEnvelope(limit = 50) {
   return { items: SEED_REPOS, page: { next_cursor: null, limit } };
 }
 
+// The bare repo name (the edge route param) for a tenant-qualified slug (`acme/myelin` → `myelin`).
+function bareName(slug) {
+  const parts = slug.split("/");
+  return parts.length > 1 ? parts.slice(1).join("/") : slug;
+}
+
+// ── GT-004 browse surface: the single repo home, blob, commit log + diff, PR overview ──
+//
+// These mirror the REAL durable-edge JSON shapes exactly (crates/myelin-git/src/web.rs `to_json` +
+// crates/myelin-edge/src/git_durable.rs) so the Solid screens render the genuine contract. The data is
+// the SAME seed the repos list serves (acme/myelin populated, acme/sandbox empty), extended with a
+// real commit pair, a file, and two PRs (one blocked-with-a-fork-trust-badge, one ready).
+
+/** GET /v1/git/repos/{repo} → the RepoHome ViewModel (null = 404). */
+export function repoHomeJson(repo) {
+  return SEED_REPOS.find((r) => bareName(r.slug) === repo) ?? null;
+}
+
+// One file in acme/myelin@main (WebEditForm::to_json).
+const SEED_BLOBS = {
+  "myelin/main/README.md": {
+    path: "README.md",
+    contents: "# acme/myelin\n\nThe make-it-real spine.\n",
+    base_oid: "blake3:readmecontentaddress0001",
+    viewer_may_edit: true,
+  },
+};
+
+/** GET /v1/git/repos/{repo}/blob/{ref}/{path} → the WebEditForm ViewModel (null = 404). */
+export function blobJson(repo, ref, path) {
+  return SEED_BLOBS[`${repo}/${ref}/${path}`] ?? null;
+}
+
+// A real two-commit history for acme/myelin (CommitRow::to_json).
+const C1 = "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334";
+const C2 = "b2c3d4e5f60718293a4b5c6d7e8f900112233445";
+const SEED_COMMITS = {
+  myelin: [
+    {
+      oid: C2,
+      short_oid: C2.slice(0, 12),
+      summary: "docs: expand the README",
+      author: "u_dev_operator@acme.noreply",
+      committed_at: 1719446400,
+      parents: [C1],
+    },
+    {
+      oid: C1,
+      short_oid: C1.slice(0, 12),
+      summary: "feat: land the make-it-real spine",
+      author: "u_dev_operator@acme.noreply",
+      committed_at: 1719360000,
+      parents: [],
+    },
+  ],
+};
+
+/** GET /v1/git/repos/{repo}/commits/{ref} → the `{items,page}` commit-log envelope (null = 404). */
+export function commitsEnvelope(repo, limit = 50) {
+  const items = SEED_COMMITS[repo];
+  if (!items) return null;
+  return { items, page: { next_cursor: null, limit } };
+}
+
+// The per-commit diff (CommitDiff::to_json).
+const SEED_DIFFS = {
+  [C2]: {
+    oid: C2,
+    short_oid: C2.slice(0, 12),
+    summary: "docs: expand the README",
+    message: "docs: expand the README\n\nAdd the spine tagline.",
+    author: "u_dev_operator@acme.noreply",
+    committed_at: 1719446400,
+    parents: [C1],
+    files: [
+      {
+        path: "README.md",
+        old_path: null,
+        status: "M",
+        lines: [
+          { origin: " ", content: "# acme/myelin" },
+          { origin: " ", content: "" },
+          { origin: "+", content: "The make-it-real spine." },
+        ],
+      },
+    ],
+  },
+  [C1]: {
+    oid: C1,
+    short_oid: C1.slice(0, 12),
+    summary: "feat: land the make-it-real spine",
+    message: "feat: land the make-it-real spine",
+    author: "u_dev_operator@acme.noreply",
+    committed_at: 1719360000,
+    parents: [],
+    files: [
+      {
+        path: "README.md",
+        old_path: null,
+        status: "A",
+        lines: [{ origin: "+", content: "# acme/myelin" }],
+      },
+    ],
+  },
+};
+
+/** GET /v1/git/repos/{repo}/commit/{oid} → the CommitDiff ViewModel (null = 404). */
+export function commitDiffJson(repo, oid) {
+  return SEED_DIFFS[oid] ?? null;
+}
+
+// Two PRs: #1 blocked (a required check not green + an untrusted-fork run), #2 ready.
+const SEED_PRS = {
+  1: {
+    pr: {
+      number: 1,
+      pr_state: "open",
+      base_ref: "refs/heads/main",
+      head_ref: "refs/heads/feature",
+      head_oid: C2,
+      author: "u_dev_operator@acme.noreply",
+      reviews: 0,
+      durable: true,
+    },
+    checks: {
+      required_contexts: ["ci/build", "ci/test"],
+      required_approvals: 1,
+      green_contexts: ["ci/build"],
+      endorsed_contexts: [],
+      fork_unendorsed_contexts: ["ci/test"],
+      gate_admitted: false,
+      durable: true,
+    },
+  },
+  2: {
+    pr: {
+      number: 2,
+      pr_state: "open",
+      base_ref: "refs/heads/main",
+      head_ref: "refs/heads/hotfix",
+      head_oid: C1,
+      author: "u_dev_operator@acme.noreply",
+      reviews: 1,
+      durable: true,
+    },
+    checks: {
+      required_contexts: ["ci/build"],
+      required_approvals: 0,
+      green_contexts: ["ci/build"],
+      endorsed_contexts: [],
+      fork_unendorsed_contexts: [],
+      gate_admitted: true,
+      durable: true,
+    },
+  },
+};
+
+/** GET /v1/git/repos/{repo}/prs/{n} → the durable PR record (null = 404). */
+export function prJson(repo, n) {
+  return repo === "myelin" && SEED_PRS[n] ? SEED_PRS[n].pr : null;
+}
+
+/** GET /v1/git/repos/{repo}/prs/{n}/checks → the checks + merge-gate projection (null = 404). */
+export function prChecksJson(repo, n) {
+  return repo === "myelin" && SEED_PRS[n] ? SEED_PRS[n].checks : null;
+}
+
+/** The edge's `{error:{message, code}}` envelope (error.rs) — a uniform 404. */
+export function notFoundEnvelope(what) {
+  return { error: { message: `${what} not found`, code: "not_found" } };
+}
+
 // The edge's `{error:{message, code}}` envelope (error.rs) — uniform, oracle-free 401.
 export function unauthorizedEnvelope() {
   return { error: { message: "authentication required", code: "unauthorized" } };

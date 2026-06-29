@@ -1,7 +1,7 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "types": ["vinxi/types/client", "vite/client"],
+    "types": ["vinxi/types/client", "vite/client", "node"],
     "noEmit": true,
     "allowJs": true,
     "paths": {

@@ -20,6 +20,7 @@
     "build:assets": "node scripts/copy-assets.mjs",
     "build:verify": "node scripts/verify-tokens.mjs",
     "build": "pnpm build:tokens && pnpm build:assets && pnpm build:verify && tsc --noEmit",
+    "typecheck": "tsc --noEmit",
     "lint": "eslint src styleguide build-tokens.mjs scripts",
     "lint:prove": "eslint fixtures/red",
     "test": "vitest run"

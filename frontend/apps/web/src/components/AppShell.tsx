@@ -50,7 +50,7 @@ export function AppShell(props: AppShellProps) {
     const current = (el.dataset.theme as (typeof THEMES)[number]) ?? "dark";
     const next = THEMES[(THEMES.indexOf(current) + 1) % THEMES.length] ?? "dark";
     el.dataset.theme = next;
-    toast.show({ message: `Theme: ${next}`, variant: "info" });
+    toast.show({ title: `Theme: ${next}`, variant: "info" });
   };
 
   // Global ⌘K (and Ctrl+K) — open the palette from anywhere in the shell.
@@ -80,7 +80,7 @@ export function AppShell(props: AppShellProps) {
   ];
 
   const identityItems: MenuItemSpec[] = [
-    { label: "Profile", icon: "human", onSelect: () => toast.show({ message: "Profile is a later surface", variant: "info" }) },
+    { label: "Profile", icon: "human", onSelect: () => toast.show({ title: "Profile is a later surface", variant: "info" }) },
     { label: "Toggle theme", icon: "settings", onSelect: cycleTheme },
     { label: "Sign out", icon: "close", onSelect: () => void doLogout() },
   ];

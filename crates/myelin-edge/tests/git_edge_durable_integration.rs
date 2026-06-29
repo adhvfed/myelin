@@ -426,3 +426,73 @@ async fn tenant_isolation_and_traversal_safety() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// (D) **GT-004 browse READ endpoints over the durable graph, tenant-scoped.** The repo home, the
+/// commit log (libgit2 revwalk), and the commit diff (libgit2 tree diff) serve the REAL on-disk state
+/// the web-edit commit produced — and a cross-tenant viewer gets a 0-leak 404 (the repo is not found
+/// under its tenant path), never another tenant's bytes.
+#[tokio::test]
+async fn browse_endpoints_serve_the_durable_graph_tenant_scoped() {
+    let root = temp_root("browse");
+    let (gw, cell) = build(&root);
+    let addr = spawn(gw).await;
+    let h = bearer(&mint(&cell, "acme", "jti-br1"));
+
+    let (st, _) = http(addr, "POST", "/v1/git/repos", &hdr(&h), br#"{"slug":"browse"}"#.to_vec()).await;
+    assert_eq!(st, 201);
+    let (wc, _) = http(
+        addr,
+        "POST",
+        "/v1/git/repos/browse/blob/main/README.md",
+        &hdr(&h),
+        br##"{"base_oid":"","contents":"# hello browse\n","message":"init"}"##.to_vec(),
+    )
+    .await;
+    assert_eq!(wc, 200);
+
+    // GET /v1/git/repos/{repo} → the single RepoHome, populated, slug tenant-qualified.
+    let (rc, rv) = http(addr, "GET", "/v1/git/repos/browse", &hdr(&h), vec![]).await;
+    assert_eq!(rc, 200, "repo home: {rv}");
+    assert_eq!(rv["state"], "populated");
+    assert_eq!(rv["slug"], "acme/browse");
+    assert!(rv["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["path"] == "README.md"));
+
+    // GET /commits/main → the log (one commit, newest-first), PII-free pseudonymous author.
+    let (cc, cv) = http(addr, "GET", "/v1/git/repos/browse/commits/main", &hdr(&h), vec![]).await;
+    assert_eq!(cc, 200, "commit log: {cv}");
+    let items = cv["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    let oid = items[0]["oid"].as_str().unwrap().to_string();
+    assert_eq!(items[0]["short_oid"], oid[..12].to_string());
+    assert!(items[0]["author"].as_str().unwrap().ends_with("@acme.noreply"));
+
+    // GET /commit/{oid} → the diff (README.md ADDED, with a + line).
+    let (dc, dv) = http(addr, "GET", &format!("/v1/git/repos/browse/commit/{oid}"), &hdr(&h), vec![]).await;
+    assert_eq!(dc, 200, "commit diff: {dv}");
+    assert_eq!(dv["oid"], oid);
+    let files = dv["files"].as_array().unwrap();
+    assert_eq!(files[0]["path"], "README.md");
+    assert_eq!(files[0]["status"], "A");
+    assert!(files[0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|l| l["origin"] == "+"));
+
+    // A bogus commit oid → a clean 404 (never a panic).
+    let (nc, _) = http(addr, "GET", "/v1/git/repos/browse/commit/deadbeef", &hdr(&h), vec![]).await;
+    assert_eq!(nc, 404);
+
+    // Tenant isolation: globex sees a 0-leak 404 for acme's repo home + log.
+    let g = bearer(&mint(&cell, "globex", "jti-br2"));
+    let (gc, _) = http(addr, "GET", "/v1/git/repos/browse", &hdr(&g), vec![]).await;
+    assert_eq!(gc, 404, "cross-tenant repo home is not found (0-leak)");
+    let (glc, _) = http(addr, "GET", "/v1/git/repos/browse/commits/main", &hdr(&g), vec![]).await;
+    assert_eq!(glc, 404, "cross-tenant commit log is not found");
+
+    std::fs::remove_dir_all(&root).ok();
+}

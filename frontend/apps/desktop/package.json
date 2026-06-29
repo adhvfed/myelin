@@ -6,6 +6,7 @@
   "description": "Myelin desktop+mobile shell (E0.7 / MR-018): one Solid app wrapped by Tauri 2. The Tauri Rust side (src-tauri) exposes commands that REUSE the Myelin crates (myelin-content render path, myelin-client config) — the 'one Rust core, three shells' proof. The full app shell slots in at MR-019.",
   "scripts": {
     "dev": "vite",
+    "typecheck": "tsc --noEmit",
     "build": "vite build && tsc --noEmit",
     "preview": "vite preview",
     "tauri": "tauri",

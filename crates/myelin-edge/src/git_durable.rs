@@ -45,7 +45,8 @@ use myelin_git::receive_pack::{
     CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome, PushSession,
     Pusher, RefName, RefStore,
 };
-use myelin_git::web::{RepoHome, WebEditForm, WebEditOutcome};
+use myelin_git::durable::{CommitDetail, CommitMeta};
+use myelin_git::web::{CommitDiff, CommitRow, DiffFile, DiffLineView, RepoHome, WebEditForm, WebEditOutcome};
 use myelin_identity::Principal;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -213,6 +214,49 @@ impl DurableGitBackend {
                 clone_url,
             }
         }
+    }
+
+    /// One repo's home ViewModel (`GET /v1/git/repos/{repo}`) — the durable per-repo home the browse
+    /// UI lands on. `NotFound` (404) if the repo is absent under the verified tenant (the 0-leak posture:
+    /// a cross-tenant repo simply is not found under this tenant's path).
+    fn repo_home_one(&self, tenant: &str, region: &str, slug: &str) -> Result<RepoHome, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        let repo = self.store.open_repo(&loc)?;
+        Ok(self.repo_home(tenant, slug, &repo))
+    }
+
+    // ── commit log + commit diff (durable read; reuses the durable repo's libgit2 walk/diff) ──
+
+    /// A page of the commit log for a ref (newest-first) as [`CommitRow`] ViewModels + the `has_more`
+    /// cursor flag. A bare ref name is qualified to `refs/heads/<ref>` (a fully-qualified `refs/…` is
+    /// used as-is). Tenant-scoped via the validated resolver.
+    fn commit_log(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        gitref: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<CommitRow>, bool), DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        let repo = self.store.open_repo(&loc)?;
+        let full = qualify_ref(gitref);
+        let (metas, has_more) = repo.commit_log(&full, offset, limit)?;
+        Ok((metas.into_iter().map(commit_row).collect(), has_more))
+    }
+
+    /// One commit's diff page as a [`CommitDiff`] ViewModel (`None` if the oid is malformed/absent).
+    fn commit_diff(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        oid: &str,
+    ) -> Result<Option<CommitDiff>, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        let repo = self.store.open_repo(&loc)?;
+        Ok(repo.commit_detail(oid)?.map(commit_diff_vm))
     }
 
     // ── blob view (durable read) ──
@@ -574,6 +618,48 @@ fn region_of<'a>(ctx: &'a HandlerCtx<'_>) -> &'a str {
     ctx.scope.region().0.as_str()
 }
 
+/// Qualify a bare ref (`main`) to `refs/heads/main`; a fully-qualified `refs/…` passes through.
+fn qualify_ref(gitref: &str) -> String {
+    if gitref.starts_with("refs/") {
+        gitref.to_string()
+    } else {
+        format!("refs/heads/{gitref}")
+    }
+}
+
+/// Map the durable raw [`CommitMeta`] to the [`CommitRow`] ViewModel (the author is the GIT-1 pseudonym).
+fn commit_row(m: CommitMeta) -> CommitRow {
+    CommitRow {
+        oid: m.oid,
+        summary: m.summary,
+        author: m.author_name,
+        committed_at: m.time,
+        parents: m.parents,
+    }
+}
+
+/// Map the durable raw [`CommitDetail`] to the [`CommitDiff`] ViewModel.
+fn commit_diff_vm(d: CommitDetail) -> CommitDiff {
+    CommitDiff {
+        commit: commit_row(d.meta),
+        message: d.message,
+        files: d
+            .files
+            .into_iter()
+            .map(|f| DiffFile {
+                path: f.path,
+                old_path: f.old_path,
+                status: f.status,
+                lines: f
+                    .lines
+                    .into_iter()
+                    .map(|(origin, content)| DiffLineView { origin, content })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
 fn map_durable_err(e: DurableError) -> EdgeError {
     match e {
         DurableError::NotFound(m) => EdgeError::NotFound(m),
@@ -635,6 +721,71 @@ impl Handler for DRepoCreate {
             201,
             &json!({ "applied": { "action": "git.repo.create", "slug": slug }, "durable": true }),
         ))
+    }
+}
+
+struct DRepoHome {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DRepoHome {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let home = self
+            .be
+            .repo_home_one(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?)
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(200, &home.to_json()))
+    }
+}
+
+struct DCommitLog {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DCommitLog {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let offset = ctx
+            .page
+            .cursor
+            .as_deref()
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(0);
+        let limit = ctx.page.limit;
+        let (rows, has_more) = self
+            .be
+            .commit_log(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+                param(ctx, "ref")?,
+                offset,
+                limit,
+            )
+            .map_err(map_durable_err)?;
+        let items: Vec<Value> = rows.iter().map(CommitRow::to_json).collect();
+        let next = if has_more {
+            Some((offset + limit).to_string())
+        } else {
+            None
+        };
+        Ok(EdgeResponse::json(200, &page_envelope(json!(items), next, limit)))
+    }
+}
+
+struct DCommitDiff {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DCommitDiff {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let diff = self
+            .be
+            .commit_diff(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+                param(ctx, "oid")?,
+            )
+            .map_err(map_durable_err)?
+            .ok_or_else(|| EdgeError::NotFound("no such commit".into()))?;
+        Ok(EdgeResponse::json(200, &diff.to_json()))
     }
 }
 
@@ -763,6 +914,9 @@ impl Handler for DPrChecks {
                 "required_approvals": ruleset.required_approvals,
                 "green_contexts": rec.green_contexts,
                 "endorsed_contexts": rec.endorsed_contexts,
+                // The X-1 fork-trust surface: contexts that passed on an UNTRUSTED FORK run and are
+                // recorded-but-neutral until a maintainer endorses them (the badge the UI renders).
+                "fork_unendorsed_contexts": rec.fork_unendorsed_contexts,
                 "gate_admitted": eval.admitted(),
                 "durable": true,
             }),
@@ -983,5 +1137,27 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         };
         b = b.route(method, &pattern, action, handler);
     }
+    // The GT-004 browse READ endpoints Git's catalogue doesn't expose yet — added here (reusing the
+    // durable repo's libgit2 reads, never a git reimplementation), tenant-scoped exactly like the
+    // catalogue routes (the gateway owns auth/scope/IDOR/error/pagination per route). All GET (reads).
+    let get = map_method(GitMethod::Get);
+    b = b.route(
+        get,
+        &reroot("/api/git/repos/{repo}"),
+        "git.repo.view",
+        Arc::new(DRepoHome { be: be.clone() }),
+    );
+    b = b.route(
+        get,
+        &reroot("/api/git/repos/{repo}/commits/{ref}"),
+        "git.commits.log",
+        Arc::new(DCommitLog { be: be.clone() }),
+    );
+    b = b.route(
+        get,
+        &reroot("/api/git/repos/{repo}/commit/{oid}"),
+        "git.commit.diff",
+        Arc::new(DCommitDiff { be: be.clone() }),
+    );
     b
 }
