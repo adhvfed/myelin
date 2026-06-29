@@ -288,3 +288,17 @@ green: pg connect, s3 put/get, rebac tuples, outbox→bus relay, valkey cache):
   secret) — the fix must be structural, not a race.** Residual: a future root-in-guest CI tier needs a
   host-read-only exit channel (not built; documented). NOTE: dev backends were down post-reboot (one PG-backed
   test PoolTimedOut) — brought `docker-compose.dev.yml` up; gate then fully green.
+
+- **CT-002b (P-544) — gVisor PRODUCTION exec — COMMITTED 7900f51.** Builder made `GvisorBackend::launch` run
+  `spec.command` in a real `runsc` container (reusing the drill's bundle pattern + `OciConfig`), exit from the
+  runtime's child status, timeout→whole-container-kill + cleanup on every path, non-root (uid 65534) workload.
+  **Structurally safer than Firecracker:** gVisor has NO forge surface (exit = runtime status, streams = runtime
+  fds; the workload can't fabricate them) — so no nonce/console defense needed; non-root + caps-dropped + ro-root
+  + no-netns are defense-in-depth. Orchestrator ran the real `runsc` proofs + leak check directly. Independent
+  security verifier: **PASS** — forged `__MYELIN_EXIT__` lines in container stdout ignored (real exit 3 returned),
+  non-root un-escalatable, timeout leak-free incl. the error path (0 leaked containers/bundles/orphans), egress
+  loopback-only (metadata IP blocked), four-guarantee order fail-closed, drill still 0 escapes. **CT-002 (both
+  backends) is DONE.** Non-blocking FOLLOW-UP → **CT-002c**: the capture bound truncates AFTER `read_to_end`
+  buffers the full stream, so host memory isn't bounded during capture (a high-rate emitter could buffer GBs) —
+  identical in BOTH backends; a capped drain-and-discard reader is the fix, landing before CT-003 (it's a
+  host-DoS on the untrusted-exec boundary, so harden it before building escape verification + cutover on top).
