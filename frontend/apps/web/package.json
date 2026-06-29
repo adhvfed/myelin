@@ -1,0 +1,30 @@
+{
+  "name": "@myelin/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Myelin SolidStart app shell (E0.7 / MR-019): the running web app the whole UI hangs in — nav/routing, the ⌘K command palette, inbox, identity menu, residency cue — built on the MR-016 design-system + MR-017 overlays, fed by a REAL server-side cookie-auth gateway client that calls the MR-014/015 edge contract. The dev/test login is a clearly-marked seam the deferred OIDC login replaces. Wrapped by the MR-018 Tauri shell eventually (one Solid app, three shells).",
+  "scripts": {
+    "dev": "vinxi dev",
+    "build": "vinxi build",
+    "start": "vinxi start",
+    "dev:edge": "node dev-edge/server.mjs",
+    "lint": "eslint src dev-edge tests",
+    "test": "vitest run",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@myelin/design-system": "workspace:*",
+    "@solidjs/meta": "^0.29.4",
+    "@solidjs/router": "^0.15.3",
+    "@solidjs/start": "^1.3.2",
+    "solid-js": "^1.9.4",
+    "vinxi": "^0.5.3"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
+    "@playwright/test": "^1.61.1",
+    "vite": "^6.4.1",
+    "vitest": "^3.0.0"
+  }
+}
