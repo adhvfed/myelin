@@ -71,7 +71,21 @@ use serde::{Deserialize, Serialize};
 /// The corpus version stamped into every attestation (arch 02 §5.5: the corpus version is part of
 /// the green artifact, so a re-run after a corpus change is a NEW attestation). Bump on any change
 /// to the attack set / [`build_corpus_script`].
-pub const CORPUS_VERSION: u32 = 1;
+///
+/// v2 (CT-003b / SI-017): added the anonymous-memory-hog family ([`MEMHOG_ID`]) so the memory
+/// enforcer (Firecracker guest-RAM cap / the gVisor out-of-band cgroup) is GATED, not vacuous.
+pub const CORPUS_VERSION: u32 = 2;
+
+/// The marker id of the anonymous-memory-hog attack (CT-003b). Its containment is proven
+/// STRUCTURALLY (see [`parse_console`]): a contained hog OOM-kills the prober (on gVisor the WHOLE
+/// sentry) before it can print a `CONTAINED` line, so the corpus prints an `ATTEMPT` sentinel BEFORE
+/// the oversized allocation and an `ESCAPED` line ONLY if the allocation HELD.
+pub const MEMHOG_ID: &str = "Mx_memhog";
+
+/// How much ANONYMOUS memory the [`MEMHOG_ID`] probe tries to hold — chosen WELL OVER every job
+/// spec's `mem_bytes` (all current specs cap at 256 MiB), so the allocation must be prevented/killed
+/// by the memory bound. A host with a larger `mem_bytes` ceiling would need this sized up (residual).
+pub const MEMHOG_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The marker grep prefix the host-side parser keys on. Each attack prints `<id> CONTAINED` or
 /// `<id> ESCAPED`; the corpus brackets its output with [`BEGIN_MARKER`] / [`END_MARKER`] so a
@@ -101,6 +115,11 @@ pub enum AttackFamily {
     ForkBomb,
     /// Disk fill past the scratch quota — must hit ENOSPC; root stays read-only.
     DiskFill,
+    /// Anonymous-memory hog past the memory ceiling (CT-003b / SI-017) — must be OOM-killed within
+    /// the limit, never consuming host RAM beyond it. Firecracker bounds it with the guest-RAM hard
+    /// cap; gVisor bounds it with an out-of-band host cgroup (rootless `runsc` does NOT enforce the
+    /// OCI `memory.limit`, so the cgroup is the real enforcer). Containment is proven STRUCTURALLY.
+    MemHog,
 }
 
 impl AttackFamily {
@@ -114,10 +133,11 @@ impl AttackFamily {
             AttackFamily::SecretExfil => "secret_exfil",
             AttackFamily::ForkBomb => "fork_bomb",
             AttackFamily::DiskFill => "disk_fill",
+            AttackFamily::MemHog => "mem_hog",
         }
     }
 
-    /// All seven families, in corpus order.
+    /// All eight families, in corpus order.
     pub fn all() -> &'static [AttackFamily] {
         &[
             AttackFamily::KernelExploit,
@@ -127,6 +147,7 @@ impl AttackFamily {
             AttackFamily::SecretExfil,
             AttackFamily::ForkBomb,
             AttackFamily::DiskFill,
+            AttackFamily::MemHog,
         ]
     }
 }
@@ -190,6 +211,10 @@ pub const CORPUS: &[AttackMarker] = &[
     AttackMarker {
         id: "D2_diskfill",
         family: AttackFamily::DiskFill,
+    },
+    AttackMarker {
+        id: MEMHOG_ID,
+        family: AttackFamily::MemHog,
     },
 ];
 
@@ -257,7 +282,17 @@ mount -t tmpfs -o size=4m tmpfs /run/scratch 2>/dev/null || mkdir -p /run/scratc
 dd if=/dev/zero of=/run/scratch/fill bs=1M count=64 2>/dev/null; rc=$?
 if [ $rc -ne 0 ]; then echo "D2_diskfill CONTAINED enospc_rc=$rc"; else echo "D2_diskfill ESCAPED"; fi
 
+# ---- anonymous-memory hog (Mx_memhog) — the microVM HARD-CAPS guest RAM, so an oversized anon
+#      allocation is OOM-killed in-guest (the hog subshell dies; PID1 survives). Containment is
+#      STRUCTURAL: the ATTEMPT sentinel + the END marker are printed BEFORE the alloc, and the
+#      ESCAPED line prints ONLY if the oversized alloc HELD (the memory bound failed). The trailing
+#      CONTAINED line is printed by the surviving parent (FC) for an authoritative marker; on a
+#      backend where the whole guest is killed (gVisor) the host-side parser infers CONTAINED from
+#      ATTEMPT-present-and-ESCAPED-absent. A regression dropping the memory bound => ESCAPED => RED. ---
+echo "{memhog_id} ATTEMPT bytes={hog}"
 echo "{end}"
+( S=aaaaaaaaaaaaaaaa; n=0; while [ $n -lt 26 ]; do S="$S$S"; n=$((n+1)); done; echo "{memhog_id} ESCAPED held=${{#S}}" ) 2>/dev/null
+echo "{memhog_id} CONTAINED in_guest_oom"
 sync
 reboot -f
 "#,
@@ -265,6 +300,8 @@ reboot -f
         begin = BEGIN_MARKER,
         end = END_MARKER,
         pids_max = pids_max,
+        memhog_id = MEMHOG_ID,
+        hog = MEMHOG_BYTES,
     )
 }
 
@@ -372,6 +409,17 @@ pub fn parse_console(console: &str) -> DrillReport {
                     Some("ESCAPED") => {
                         outcome = AttackOutcome::Escaped;
                         break;
+                    }
+                    // STRUCTURAL containment for the anon-memory hog (CT-003b), and ONLY for it: a
+                    // contained hog is OOM-killed (on gVisor the WHOLE sentry) BEFORE it can print a
+                    // `CONTAINED` line, so the corpus prints `<id> ATTEMPT` just before the oversized
+                    // alloc and `<id> ESCAPED` ONLY if the alloc HELD. For THIS id, an ATTEMPT with no
+                    // later ESCAPED ⇒ Contained (proven structurally). We do NOT `break` so a real
+                    // ESCAPED line (the alloc held ⇒ the bound failed) still overrides to Escaped.
+                    // This does NOT relax the strict rule for any other attack: their absence of an
+                    // explicit ESCAPED stays DidNotRun (a property not drilled is never inferred green).
+                    Some("ATTEMPT") if atk.id == MEMHOG_ID => {
+                        outcome = AttackOutcome::Contained;
                     }
                     _ => {}
                 }
@@ -588,10 +636,21 @@ mod tests {
         assert!(script.contains("echo 64 >") || script.contains("echo 64>"));
         // The hardening posture is enforced on the kernel-primitive family.
         assert!(script.contains("setpriv --no-new-privs"));
+        // CT-003b: the anon-memory hog prints its ATTEMPT sentinel BEFORE the END marker (so the
+        // corpus completes even when the contained hog kills the prober mid-alloc) and the oversized
+        // allocation step comes AFTER it.
+        let attempt = script.find(&format!("{MEMHOG_ID} ATTEMPT")).expect("memhog ATTEMPT sentinel");
+        let end = script.find(END_MARKER).expect("END marker");
+        assert!(attempt < end, "the memhog ATTEMPT sentinel must precede the END marker");
+        // The hog is a pure-shell doubling allocator that HOLDS the anon memory in the shell process
+        // itself (16·2^26 ≈ 1 GiB) — no command-substitution child whose death could falsely report
+        // an empty "held=0" escape. It exceeds every current spec's mem_bytes (256 MiB).
+        assert!(script.contains(r#"S="$S$S""#) && script.contains("while [ $n -lt 26 ]"));
+        assert_eq!(MEMHOG_BYTES, 16 * (1u64 << 26), "the ATTEMPT byte count matches the allocator");
     }
 
     #[test]
-    fn all_seven_families_are_represented_in_the_corpus() {
+    fn all_eight_families_are_represented_in_the_corpus() {
         for fam in AttackFamily::all() {
             assert!(
                 CORPUS.iter().any(|a| a.family == *fam),
@@ -701,6 +760,71 @@ mod tests {
             .find(|(id, _, _)| *id == "K2_devmem")
             .unwrap();
         assert_eq!(*k2, AttackOutcome::Contained);
+    }
+
+    #[test]
+    fn memhog_attempt_without_escaped_is_contained_structurally() {
+        // CT-003b: on gVisor a contained hog OOM-kills the WHOLE sentry mid-alloc, so the corpus can
+        // print only the `ATTEMPT` sentinel (+ the END marker, emitted BEFORE the alloc), never a
+        // `CONTAINED` line. The parser must STRUCTURALLY read {ATTEMPT present, ESCAPED absent} as
+        // Contained — for this id ONLY. We build a console with every OTHER attack CONTAINED and the
+        // memhog reported only as ATTEMPT.
+        let mut s = format!("{BEGIN_MARKER} corpus_version={CORPUS_VERSION} guest_euid=65534\n");
+        for atk in CORPUS {
+            if atk.id == MEMHOG_ID {
+                continue;
+            }
+            s.push_str(&format!("{} CONTAINED\n", atk.id));
+        }
+        s.push_str(&format!("{MEMHOG_ID} ATTEMPT bytes=1073741824\n"));
+        s.push_str(&format!("{END_MARKER}\n"));
+        // (the sentry was killed during the alloc — no `Mx_memhog CONTAINED`/`ESCAPED` line follows)
+        let report = parse_console(&s);
+        assert_eq!(*outcome_for(&report, MEMHOG_ID), AttackOutcome::Contained);
+        assert_eq!(report.escapes(), 0);
+        assert_eq!(report.did_not_run(), 0);
+        assert!(report.corpus_completed);
+        assert!(
+            report.is_green(),
+            "an ATTEMPT-only memhog (no ESCAPED) is structurally Contained ⇒ green"
+        );
+    }
+
+    #[test]
+    fn memhog_escaped_after_attempt_is_escaped() {
+        // The bound FAILED: the oversized alloc HELD, so the corpus printed `Mx_memhog ESCAPED` AFTER
+        // the `ATTEMPT` sentinel. The later ESCAPED MUST override the provisional Contained ⇒ RED.
+        // A mutant that `break`s on ATTEMPT (never seeing the ESCAPED) is killed here.
+        let mut s = green_console();
+        s = s.replace(
+            &format!("{MEMHOG_ID} CONTAINED extra=stuff\n"),
+            &format!("{MEMHOG_ID} ATTEMPT bytes=1073741824\n{MEMHOG_ID} ESCAPED held=1073741824\n"),
+        );
+        let report = parse_console(&s);
+        assert_eq!(*outcome_for(&report, MEMHOG_ID), AttackOutcome::Escaped);
+        assert_eq!(report.escapes(), 1);
+        assert!(!report.is_green(), "a held anon-hog (the memory bound failed) ⇒ RED");
+    }
+
+    #[test]
+    fn memhog_with_no_marker_at_all_is_did_not_run() {
+        // No ATTEMPT, no ESCAPED, no CONTAINED for the memhog ⇒ the attack did not run ⇒ RED (the
+        // structural ATTEMPT exception NEVER invents a green from a totally-absent marker).
+        let s = green_console().replace(&format!("{MEMHOG_ID} CONTAINED extra=stuff\n"), "");
+        let report = parse_console(&s);
+        assert_eq!(*outcome_for(&report, MEMHOG_ID), AttackOutcome::DidNotRun);
+        assert_eq!(report.did_not_run(), 1);
+        assert!(!report.is_green());
+    }
+
+    /// Test helper: the outcome of one catalogued attack in a parsed report.
+    fn outcome_for<'a>(report: &'a DrillReport, id: &str) -> &'a AttackOutcome {
+        &report
+            .outcomes
+            .iter()
+            .find(|(i, _, _)| *i == id)
+            .expect("attack id in the parsed catalogue")
+            .2
     }
 
     #[test]
