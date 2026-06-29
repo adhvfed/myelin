@@ -93,8 +93,12 @@ export function ToastProvider(props: { children?: JSX.Element }): JSX.Element {
       region?.querySelector<HTMLElement>("button")?.focus();
     }
   };
-  onMount(() => document.addEventListener("keydown", onKey));
-  onCleanup(() => document.removeEventListener("keydown", onKey));
+  // Register the listener AND its teardown inside onMount: onMount never runs on the server, so SSR
+  // disposal won't touch `document` (which is undefined there). Client behaviour is unchanged.
+  onMount(() => {
+    document.addEventListener("keydown", onKey);
+    onCleanup(() => document.removeEventListener("keydown", onKey));
+  });
 
   return (
     <ToastContext.Provider value={{ show, dismiss }}>

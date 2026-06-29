@@ -1,0 +1,90 @@
+import { test, expect, type Page } from "@playwright/test";
+import AxeBuilder from "@axe-core/playwright";
+
+// A real-browser axe assertion on the live DOM (the thing jsdom couldn't do for the overlays). We scan
+// the rendered page against WCAG 2.0/2.1 A+AA tags; a violation fails the gate loudly.
+async function expectNoAxeViolations(page: Page, context?: string) {
+  const results = await new AxeBuilder({ page })
+    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+    .analyze();
+  expect(results.violations, `axe violations${context ? ` on ${context}` : ""}: ${JSON.stringify(results.violations, null, 2)}`).toEqual([]);
+}
+
+async function devLogin(page: Page) {
+  await page.goto("/login");
+  await page.getByTestId("dev-login").click();
+  await page.waitForURL("**/git/repos");
+}
+
+test.describe("MR-019 app shell — real browser", () => {
+  test("unauthenticated /git/repos redirects to /login (the 401→/login floor)", async ({ page }) => {
+    await page.goto("/git/repos");
+    await page.waitForURL("**/login");
+    await expect(page.getByTestId("dev-login")).toBeVisible();
+    await expectNoAxeViolations(page, "/login");
+  });
+
+  test("dev login → the repos screen renders the edge ViewModel JSON (shell→gateway→edge→ViewModel)", async ({ page }) => {
+    await devLogin(page);
+
+    // The repos list is the real edge RepoHome ViewModel projection.
+    await expect(page.getByTestId("repos-list")).toBeVisible();
+    await expect(page.getByText("acme/myelin", { exact: true })).toBeVisible();
+    await expect(page.getByText("The make-it-real spine.")).toBeVisible(); // the README excerpt field
+    await expect(page.getByText("ssh://git@myelin/acme/myelin.git")).toBeVisible();
+    // The empty-state repo (an unglamorous state served by the same envelope).
+    await expect(page.getByText("acme/sandbox", { exact: true })).toBeVisible();
+    await expect(page.getByText("empty · push to get started")).toBeVisible();
+
+    // The chrome is present: residency cue (data region from whoami/session), identity, inbox.
+    await expect(page.getByText("Data region:")).toBeVisible();
+    await expect(page.getByText("eu-west")).toBeVisible();
+    await expect(page.getByRole("button", { name: /Inbox/ })).toBeVisible();
+
+    await expectNoAxeViolations(page, "the authenticated shell + repos screen");
+  });
+
+  test("⌘K opens the command palette (focus in the search), Escape closes it", async ({ page }) => {
+    await devLogin(page);
+
+    await page.keyboard.press("Meta+k");
+    const dialog = page.getByRole("dialog", { name: "Command palette" });
+    await expect(dialog).toBeVisible();
+
+    // Focus moved into the palette's search input (the combobox), per the Dialog focus-trap.
+    const search = page.getByRole("combobox", { name: /Search or run a command/ });
+    await expect(search).toBeFocused();
+
+    // axe on the OPEN overlay — the real-browser check the overlays could not get under jsdom (MR-017).
+    await expectNoAxeViolations(page, "the command palette (open)");
+
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+  });
+
+  test("the ⌘K trigger is keyboard-operable and Escape returns focus to it", async ({ page }) => {
+    await devLogin(page);
+
+    const trigger = page.getByRole("button", { name: /Search or run a command/ });
+    await trigger.focus();
+    await expect(trigger).toBeFocused();
+    await page.keyboard.press("Enter"); // activate the trigger from the keyboard
+
+    const dialog = page.getByRole("dialog", { name: "Command palette" });
+    await expect(dialog).toBeVisible();
+
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+    // Return-focus to the trigger (the Dialog primitive's return-focus mechanic).
+    await expect(trigger).toBeFocused();
+  });
+
+  test("a command runs in-place: type 'inbox' + Enter opens the inbox overlay", async ({ page }) => {
+    await devLogin(page);
+    await page.keyboard.press("Meta+k");
+    const search = page.getByRole("combobox", { name: /Search or run a command/ });
+    await search.fill("inbox");
+    await page.keyboard.press("Enter");
+    await expect(page.getByRole("dialog", { name: "Inbox" })).toBeVisible();
+  });
+});

@@ -1,0 +1,59 @@
+/* The app's global skin — SEMANTIC tokens only (doc 10 §4). The design-system tokens.css owns the
+   actual values + the three-theme re-skin + the single :focus-visible rule; this file only applies
+   the semantic surface to the document root. Never a hex, never a primitive var here. */
+@import "@myelin/design-system/tokens.css";
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--surface);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  height: 100%;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* Direction-A "Instrument": hairline borders, near-zero radius, compact. The base button gets a
+   token-driven treatment so the chrome's buttons are consistent without per-component CSS. */
+button {
+  font: inherit;
+  color: inherit;
+}
+
+/* The skip link (WCAG 2.4.1 bypass blocks) — visible only on focus. */
+.skip-link {
+  position: absolute;
+  left: var(--space-2);
+  top: var(--space-2);
+  z-index: var(--z-toast);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-overlay);
+  color: var(--text-primary);
+  border: var(--hairline) solid var(--border-strong);
+  border-radius: var(--radius-1);
+  transform: translateY(-200%);
+}
+.skip-link:focus {
+  transform: translateY(0);
+}
