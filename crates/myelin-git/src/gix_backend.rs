@@ -45,12 +45,81 @@ impl RootedResolver {
 
 impl RepoPathResolver for RootedResolver {
     fn repo_path(&self, repo: &RepoLoc) -> Result<PathBuf, GitCoreError> {
-        Ok(self
-            .root
-            .join(&repo.tenant)
-            .join(&repo.region)
-            .join(format!("{}.git", repo.repo)))
+        // SECURITY (the GT-001 isolation boundary): the locator components are user/URL-controlled
+        // (the repo slug + the tenant/region from the request), so a raw `PathBuf::join` of
+        // UNVALIDATED segments is a cross-tenant path-traversal breakout — e.g. a repo slug
+        // `../../tenant-a/fr-par/secret` collapses onto another tenant's repo, and an absolute
+        // `tenant = /abs` discards the root entirely (write-anywhere). We FAIL-CLOSED: every segment
+        // is validated and a traversing/absolute/separator/NUL segment is REFUSED before any path is
+        // built. The tenant/region are single segments; the repo MAY be namespaced (`team/app`) so it
+        // is validated per `/`-separated piece (each piece still cannot be `.`/`..`/empty/absolute).
+        // Both the READ backend ([`GixCore`]) and the WRITE/lifecycle store
+        // ([`crate::durable::DurableGitStore`]) resolve through THIS one method, so this single check
+        // closes both paths.
+        validate_path_segment("tenant", &repo.tenant)?;
+        validate_path_segment("region", &repo.region)?;
+        let repo_dir = validate_repo_slug(&repo.repo)?;
+        let mut path = self.root.clone();
+        path.push(&repo.tenant);
+        path.push(&repo.region);
+        for piece in &repo_dir {
+            path.push(piece);
+        }
+        // The final on-disk dir is the last repo piece with the `.git` suffix.
+        let last = repo_dir
+            .last()
+            .expect("validate_repo_slug returns ≥1 piece or errors");
+        path.set_file_name(format!("{last}.git"));
+        Ok(path)
     }
+}
+
+/// Reject a single path segment that could escape the per-tenant/region root. The security-critical
+/// rejects: empty, `.`, `..` (traversal), an absolute/rooted segment, and any segment containing a
+/// path separator (`/`, `\`), a NUL, or a non-allowlisted char. The allowlist is `[A-Za-z0-9._-]`
+/// (git owner/repo names — and ULID-style tenant ids — are already so constrained; uppercase is
+/// permitted because it is not a path-traversal vector and ULID tenant ids are upper-base32).
+pub fn validate_path_segment(kind: &str, seg: &str) -> Result<(), GitCoreError> {
+    if seg.is_empty() {
+        return Err(GitCoreError::Read(format!(
+            "invalid {kind} path segment: empty (fail-closed — refusing to resolve a path)"
+        )));
+    }
+    if seg == "." || seg == ".." {
+        return Err(GitCoreError::Read(format!(
+            "invalid {kind} path segment {seg:?}: path-traversal component refused (fail-closed)"
+        )));
+    }
+    for c in seg.chars() {
+        let ok = c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+        if !ok {
+            return Err(GitCoreError::Read(format!(
+                "invalid {kind} path segment {seg:?}: character {c:?} not in the allowlist \
+                 [A-Za-z0-9._-] — separators/NUL/control chars are refused (path-traversal / \
+                 absolute-component guard, fail-closed)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a (possibly namespaced) repo slug and return its `/`-separated, individually-validated
+/// pieces. A namespaced slug (`team/app`) is admitted, but each piece is held to
+/// [`validate_path_segment`] — so `../../x`, `/etc/passwd`, `a//b`, and a trailing `/` are all
+/// REFUSED (each yields a `.`/`..`/empty piece). Never returns an empty piece list.
+pub fn validate_repo_slug(repo: &str) -> Result<Vec<String>, GitCoreError> {
+    // A backslash never separates here, but it IS a Windows separator + a traversal vector — reject
+    // it outright (validate_path_segment also rejects it per-piece, but a slug-level guard is loud).
+    if repo.contains('\\') || repo.contains('\0') {
+        return Err(GitCoreError::Read(format!(
+            "invalid repo slug {repo:?}: contains a backslash/NUL (path-traversal guard, fail-closed)"
+        )));
+    }
+    let pieces: Vec<String> = repo.split('/').map(|s| s.to_string()).collect();
+    for piece in &pieces {
+        validate_path_segment("repo", piece)?;
+    }
+    Ok(pieces)
 }
 
 /// The in-process read backend over `git2` (libgit2 — the architecture-named fallback; gix-preferred
@@ -143,5 +212,89 @@ impl<P: RepoPathResolver> ReadBackend for GixCore<P> {
             });
         }
         Ok(hunks)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root() -> RootedResolver {
+        RootedResolver::new("/srv/git-root")
+    }
+
+    /// A benign locator resolves to exactly `<root>/<tenant>/<region>/<repo>.git`.
+    #[test]
+    fn benign_locator_resolves_under_the_root() {
+        let p = root()
+            .repo_path(&RepoLoc::new("acme", "fr-par", "core"))
+            .expect("benign locator resolves");
+        assert_eq!(
+            p,
+            std::path::Path::new("/srv/git-root/acme/fr-par/core.git")
+        );
+    }
+
+    /// A namespaced (sub-grouped) repo slug `team/app` is admitted — and resolves WITHIN the root.
+    #[test]
+    fn namespaced_repo_slug_is_admitted_within_root() {
+        let p = root()
+            .repo_path(&RepoLoc::new("acme", "fr-par", "team/app"))
+            .expect("namespaced slug resolves");
+        assert_eq!(
+            p,
+            std::path::Path::new("/srv/git-root/acme/fr-par/team/app.git")
+        );
+        assert!(p.starts_with("/srv/git-root/acme/fr-par"));
+    }
+
+    /// **SECURITY: the cross-tenant breakout via a `..` repo slug is REFUSED (the damning vector).**
+    /// `repo = ../../tenant-a/fr-par/secret` would collapse onto tenant A's repo — it must fail-closed.
+    #[test]
+    fn cross_tenant_dotdot_repo_slug_is_refused() {
+        let r = root().repo_path(&RepoLoc::new(
+            "tenant-b",
+            "fr-par",
+            "../../tenant-a/fr-par/secret",
+        ));
+        assert!(
+            matches!(r, Err(GitCoreError::Read(_))),
+            "a `..` traversal repo slug must be refused, got {r:?}"
+        );
+    }
+
+    /// **SECURITY: an absolute / rooted tenant segment is REFUSED (write-anywhere vector).**
+    #[test]
+    fn absolute_component_is_refused() {
+        // A `/`-bearing tenant (absolute escape) is rejected (tenant must be one safe segment).
+        assert!(matches!(
+            root().repo_path(&RepoLoc::new("/abs/path", "fr-par", "core")),
+            Err(GitCoreError::Read(_))
+        ));
+        // A repo slug that starts at root is rejected (empty first piece).
+        assert!(matches!(
+            root().repo_path(&RepoLoc::new("acme", "fr-par", "/etc/passwd")),
+            Err(GitCoreError::Read(_))
+        ));
+    }
+
+    /// **SECURITY: NUL, backslash, and bare `.`/`..` segments are all REFUSED.**
+    #[test]
+    fn nul_backslash_and_dot_segments_are_refused() {
+        for bad in [
+            RepoLoc::new("acme", "fr-par", "a\\b"),       // backslash (Windows sep / traversal)
+            RepoLoc::new("acme", "fr-par", "a\0b"),       // NUL
+            RepoLoc::new("acme", "fr-par", ".."),          // bare parent
+            RepoLoc::new("acme", "fr-par", "."),           // bare current
+            RepoLoc::new("acme", "fr-par", ""),            // empty
+            RepoLoc::new("acme", "..", "core"),            // `..` region
+            RepoLoc::new("..", "fr-par", "core"),          // `..` tenant
+            RepoLoc::new("acme", "fr-par", "a/../../b"),   // mid-slug traversal
+        ] {
+            assert!(
+                matches!(root().repo_path(&bad), Err(GitCoreError::Read(_))),
+                "expected refusal for {bad:?}"
+            );
+        }
     }
 }

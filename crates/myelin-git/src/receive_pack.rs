@@ -517,15 +517,40 @@ pub struct ReflogEntry {
     pub pusher_pseudonym: String,
 }
 
-/// One per-ref lock cell — the in-memory model of the **single `git_ref` row** the CAS locks
-/// `FOR UPDATE` (arch §3 / GIT-P10). The cell holds `Some(row)` once the ref exists, `None` while it
-/// does not (a create transitions `None → Some`; a delete transitions `Some → None`). The `Mutex`
-/// IS the per-ref linearisation point: a rapid burst of pushes to ONE hot ref serialises on THIS
-/// lock, while pushes to OTHER refs lock OTHER cells and proceed in PARALLEL — the per-ref-order /
-/// refs-fan-out-parallel property GIT-P10 (GIT-D1) hardens. (The previous GIT-P9 store held one
-/// global lock over the whole repo, which serialised EVERY ref — arch §3 requires per-row locks so
-/// different refs advance in parallel. This is the reconciliation.)
-type RefCell = std::sync::Mutex<Option<RefRow>>;
+/// One per-ref **linearisation lock** (arch §3 / GIT-P10). Held across the whole CAS → commit →
+/// apply window so a rapid burst of pushes to ONE hot ref serialises on THIS lock, while pushes to
+/// OTHER refs lock OTHER cells and proceed in PARALLEL (the per-ref-order / refs-fan-out-parallel
+/// property GIT-P10 (GIT-D1) hardens). The lock carries NO state — the durable ref state lives in the
+/// [`RefBacking`] (the on-disk git repo in production, an in-memory map in the test double). This is
+/// the reconciliation: GT-001 moved the ref STATE onto durable on-disk git (SI-012), keeping the
+/// in-process per-ref lock as the linearisation point the burst drill (GIT-D1) relies on.
+type RefLock = std::sync::Mutex<()>;
+
+/// **The ref-state backing** — where the durable ref rows + reflog actually live. The
+/// reconciliation GT-001 lands (prompt §4: "the in-memory `RefStore`/index become a real
+/// on-disk-git-backed store … keep the in-memory form as an explicit test-double"):
+/// - [`RefBacking::Disk`] is the **PRODUCTION** path — refs / reflog / objects on the real on-disk
+///   bare repo ([`crate::durable::DurableGitRepo`], via `git2`), so a ref written then read after a
+///   FRESH `RefStore` over the same on-disk root is still there (SI-012 fixed: `open` loads from
+///   disk, the object/oid lookup is the real on-disk odb — F-git-2).
+/// - [`RefBacking::Memory`] is the **TEST DOUBLE** — the former in-memory `git_ref` row model + the
+///   append-only reflog. It keeps the rich receive-pack CAS / emit-iff-committed / crash-injection
+///   unit tests + the GIT-D1 burst drill running in isolation (no temp fs), byte-for-byte identical
+///   to the prior behaviour. NOT a durable system-of-record.
+enum RefBacking {
+    /// The in-memory test double: `git_ref` rows + the append-only reflog (the prior model).
+    Memory {
+        /// the modeled `git_ref` rows (the durable state, in memory for the double).
+        rows: std::sync::Mutex<BTreeMap<RefName, RefRow>>,
+        /// the append-only reflog (the modeled `git_reflog` table).
+        reflog: std::sync::Mutex<Vec<ReflogEntry>>,
+    },
+    /// The production durable path: refs / reflog / objects on the real on-disk bare repo.
+    Disk {
+        /// the on-disk bare repo handle (`git2`); refs + reflog + odb all live here, survive restart.
+        repo: Arc<crate::durable::DurableGitRepo>,
+    },
+}
 
 /// **The reftable-on-OLTP ref store + the receive-pack write path** (arch §2 / §3). The per-ref CAS
 /// is the linearisation point; the ref-update + the reflog insert + the `git.ref.updated` outbox emit
@@ -543,20 +568,29 @@ pub struct RefStore {
     outbox: OutboxStore,
     /// the id minter (the stable ULID source — injected, the frozen seam).
     minter: Arc<dyn IdMinter>,
-    /// the registry of per-ref lock cells (the modeled `git_ref` rows, each behind its OWN lock —
-    /// the per-ref linearisation point) + the reflog. The registry lock guards only lookup/vivify;
-    /// the per-ref CAS holds the individual cells, so different refs fan out parallel (arch §3).
-    registry: std::sync::Mutex<BTreeMap<RefName, Arc<RefCell>>>,
-    /// the append-only reflog (the modeled `git_reflog` table), behind its own short-lived lock.
-    reflog: std::sync::Mutex<Vec<ReflogEntry>>,
+    /// the durable ref-state backing — the real on-disk bare repo in production
+    /// ([`RefBacking::Disk`]) or the in-memory test double ([`RefBacking::Memory`]). This is where
+    /// the `git_ref` rows + reflog actually live; `open`/`tip` load from here (SI-012 fixed).
+    backing: RefBacking,
+    /// the registry of per-ref **linearisation locks** (each ref serialises on its OWN lock — the
+    /// per-ref linearisation point, arch §3 / GIT-P10). The registry lock guards only lookup/vivify;
+    /// the per-ref CAS holds the individual lock across the window, so different refs fan out
+    /// parallel. The lock carries no state — the state is in [`Self::backing`].
+    locks: std::sync::Mutex<BTreeMap<RefName, Arc<RefLock>>>,
     /// the H1 holder-registration receipt (proof the store registered when it opened).
     holder: crate::holder_intent::HolderRegistration,
 }
 
 impl RefStore {
-    /// **Open the ref store for a repo** — and AUTO-REGISTER it as `PersonalDataHolder` H1 (contract
-    /// 10.1 / 1.4). The registration receipt is produced here (the store cannot escape the holder
-    /// registry — "we forgot a store" is structurally impossible); the DSR bodies are GIT-P29.
+    /// **Open the ref store for a repo over the in-memory TEST DOUBLE** — and AUTO-REGISTER it as
+    /// `PersonalDataHolder` H1 (contract 10.1 / 1.4). The registration receipt is produced here (the
+    /// store cannot escape the holder registry — "we forgot a store" is structurally impossible); the
+    /// DSR bodies are GIT-P29.
+    ///
+    /// **GT-001:** this constructs the [`RefBacking::Memory`] test double (the prior in-memory `git_ref`
+    /// row model) — it keeps the rich receive-pack CAS / emit-iff-committed / crash-injection unit
+    /// tests + the GIT-D1 burst drill running in isolation (no temp fs), behaviour-identical to before.
+    /// The **PRODUCTION** durable-on-disk path is [`RefStore::open_durable`] (refs survive restart).
     pub fn open(
         repo: impl Into<String>,
         ctx_base: EmitContextBase,
@@ -568,8 +602,42 @@ impl RefStore {
             ctx_base,
             outbox,
             minter,
-            registry: std::sync::Mutex::new(BTreeMap::new()),
-            reflog: std::sync::Mutex::new(Vec::new()),
+            backing: RefBacking::Memory {
+                rows: std::sync::Mutex::new(BTreeMap::new()),
+                reflog: std::sync::Mutex::new(Vec::new()),
+            },
+            locks: std::sync::Mutex::new(BTreeMap::new()),
+            holder: crate::holder_intent::HolderRegistration::auto_register(),
+        }
+    }
+
+    /// **Open the ref store over the REAL on-disk bare repo (the GT-001 production path).** Ref
+    /// reads / writes / CAS + the reflog go to the durable on-disk repo
+    /// ([`crate::durable::DurableGitRepo`], `git2`), and [`Self::tip`] / [`Self::reflog`] LOAD FROM
+    /// DISK — so a ref written then read after a FRESH `RefStore` over the same on-disk root is still
+    /// there (SI-012 fixed). The object/oid lookup is the real on-disk odb (F-git-2). Opening still
+    /// auto-registers the store as `PersonalDataHolder` H1 (the holder cannot be forgotten).
+    ///
+    /// The caller resolves the [`crate::durable::DurableGitRepo`] from its
+    /// [`crate::durable::DurableGitStore`] (`create_repo` / `open_repo` at the tenant/region path) —
+    /// the tenant/region pathing IS the isolation boundary. The receive-pack policy + the
+    /// one-transaction outbox co-commit are UNCHANGED; only the ref STATE is now durable on disk.
+    pub fn open_durable(
+        durable_repo: Arc<crate::durable::DurableGitRepo>,
+        repo: impl Into<String>,
+        ctx_base: EmitContextBase,
+        outbox: OutboxStore,
+        minter: Arc<dyn IdMinter>,
+    ) -> Self {
+        Self {
+            repo: repo.into(),
+            ctx_base,
+            outbox,
+            minter,
+            backing: RefBacking::Disk {
+                repo: durable_repo,
+            },
+            locks: std::sync::Mutex::new(BTreeMap::new()),
             holder: crate::holder_intent::HolderRegistration::auto_register(),
         }
     }
@@ -586,19 +654,134 @@ impl RefStore {
 
     /// The current tip of a ref (for the CAS expected-old + a read-your-writes check). `None` if the
     /// ref does not exist. Reads under the ref's OWN lock (a snapshot read, not the registry lock —
-    /// so a tip read of ref A never blocks a CAS on ref B).
+    /// so a tip read of ref A never blocks a CAS on ref B). On the durable path this LOADS FROM DISK
+    /// — a FRESH `RefStore` over the same on-disk root reads the persisted tip (SI-012 fixed).
     pub fn tip(&self, ref_name: &RefName) -> Option<Oid> {
-        let cell = self.cell(ref_name);
-        let g = cell.lock().unwrap_or_else(|e| e.into_inner());
-        g.as_ref().map(|r| r.target_oid.clone())
+        let lock = self.ref_lock(ref_name);
+        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.tip_of(ref_name)
     }
 
-    /// The reflog (append-only; the per-ref history — used by the holder + the audit walk).
+    /// The reflog (append-only; the per-ref history — used by the holder + the audit walk). On the
+    /// durable path this reads the real on-disk git reflog of every ref (loaded from disk).
     pub fn reflog(&self) -> Vec<ReflogEntry> {
-        self.reflog
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        match &self.backing {
+            RefBacking::Memory { reflog, .. } => {
+                reflog.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            }
+            RefBacking::Disk { repo } => {
+                // Assemble the per-ref durable reflogs into the RefStore view, oldest-first per ref,
+                // with the monotonic `update_seq` = the entry's 1-based position in that ref's reflog.
+                let mut out = Vec::new();
+                if let Ok(refs) = repo.list_refs() {
+                    for (name, _tip) in refs {
+                        let entries = repo.reflog_entries(&name).unwrap_or_default();
+                        for (i, e) in entries.into_iter().enumerate() {
+                            out.push(ReflogEntry {
+                                ref_name: RefName::new(name.clone()),
+                                old_oid: e.old_oid.map(|o| Oid::new(o.0)),
+                                new_oid: Oid::new(e.new_oid.0),
+                                update_seq: (i as u64) + 1,
+                                pusher_pseudonym: e.committer,
+                            });
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// Read a ref's current tip from the backing (NO lock taken here — callers hold the per-ref lock).
+    /// Memory: the modeled `git_ref` row; Disk: the real on-disk ref.
+    fn tip_of(&self, ref_name: &RefName) -> Option<Oid> {
+        match &self.backing {
+            RefBacking::Memory { rows, .. } => rows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(ref_name)
+                .map(|r| r.target_oid.clone()),
+            RefBacking::Disk { repo } => {
+                repo.read_ref(&ref_name.0).ok().flatten().map(|o| Oid::new(o.0))
+            }
+        }
+    }
+
+    /// The current per-ref generation (`update_seq`; 0 if the ref does not exist). Memory: the row's
+    /// `update_seq`; Disk: the on-disk reflog length (durable — survives restart).
+    fn seq_of(&self, ref_name: &RefName) -> u64 {
+        match &self.backing {
+            RefBacking::Memory { rows, .. } => rows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(ref_name)
+                .map(|r| r.update_seq)
+                .unwrap_or(0),
+            RefBacking::Disk { repo } => repo.reflog_len(&ref_name.0) as u64,
+        }
+    }
+
+    /// Apply one committed ref move to the backing (called AFTER the outbox transaction committed —
+    /// the committed state-change half, under the ref's held linearisation lock). Memory: mutate the
+    /// row + push the reflog; Disk: the durable on-disk ref CAS + reflog. `old` is the pre-move tip
+    /// (the CAS expected-old, already verified under the held lock); a zero `new_oid` is a DELETE.
+    fn apply_one(
+        &self,
+        ref_name: &RefName,
+        new_oid: &Oid,
+        new_seq: u64,
+        old: Option<Oid>,
+        pseudonym: &str,
+    ) -> Result<(), OutboxError> {
+        match &self.backing {
+            RefBacking::Memory { rows, reflog } => {
+                let mut rows = rows.lock().unwrap_or_else(|e| e.into_inner());
+                if new_oid.is_zero() {
+                    rows.remove(ref_name);
+                } else {
+                    rows.insert(
+                        ref_name.clone(),
+                        RefRow {
+                            target_oid: new_oid.clone(),
+                            update_seq: new_seq,
+                        },
+                    );
+                }
+                drop(rows);
+                reflog.lock().unwrap_or_else(|e| e.into_inner()).push(ReflogEntry {
+                    ref_name: ref_name.clone(),
+                    old_oid: old,
+                    new_oid: new_oid.clone(),
+                    update_seq: new_seq,
+                    pusher_pseudonym: pseudonym.to_string(),
+                });
+                Ok(())
+            }
+            RefBacking::Disk { repo } => {
+                // Convert the receive-pack `Oid` (this module's type) to the durable backend's
+                // `core::Oid` at the boundary (both wrap the hex string).
+                let old_core = old.as_ref().map(|o| crate::core::Oid::new(o.0.clone()));
+                let new_core = if new_oid.is_zero() {
+                    None
+                } else {
+                    Some(crate::core::Oid::new(new_oid.0.clone()))
+                };
+                let msg = format!("receive-pack: {} -> {}", self.repo, ref_name.0);
+                // TODO(GT-003): wire the cross-system recovery reconciler before this durable store
+                // reaches a live front door. The apply-after-outbox-commit window (outbox row durable,
+                // on-disk ref move pending) is BOUNDED + RECOVERABLE — on restart, replay committed
+                // `git.ref.updated` rows whose on-disk ref tip / `update_seq` is behind the durable
+                // reflog and re-apply the CAS (idempotent on `update_seq`, arch §4.2). It is NOT
+                // silent-loss (the on-disk reflog is the durable witness), so it is acceptable for
+                // GT-001; GT-003 (durable API writes at the edge) must land the reconciler.
+                repo.update_ref_cas(&ref_name.0, old_core.as_ref(), new_core.as_ref(), &msg, pseudonym)
+                    // Post-commit apply failure is a should-not-happen invariant breach (the CAS was
+                    // pre-checked under the held lock + the objects were migrated before commit). It
+                    // surfaces LOUD, never silently — the event is committed; the GT-003 reconciler
+                    // (above) re-applies from the durable reflog.
+                    .map_err(|e| OutboxError(format!("durable ref apply failed (post-commit): {e}")))
+            }
+        }
     }
 
     /// The per-ref aggregate key for the outbox (arch §2.2 / §3): `<repo>:<ref_name>`. The `:`
@@ -681,24 +864,21 @@ impl RefStore {
         let mut targets: Vec<RefName> = push.updates.iter().map(|u| u.ref_name.clone()).collect();
         targets.sort();
         targets.dedup();
-        let cells: Vec<Arc<RefCell>> = targets.iter().map(|r| self.cell(r)).collect();
-        // Lock each cell in the sorted order (the deadlock-free discipline). The guards are held for
-        // the whole CAS→commit→apply window — the per-ref linearisation point spans check + apply.
-        let mut guards: BTreeMap<RefName, std::sync::MutexGuard<'_, Option<RefRow>>> =
-            BTreeMap::new();
-        for (name, cell) in targets.iter().zip(cells.iter()) {
-            guards.insert(name.clone(), cell.lock().unwrap_or_else(|e| e.into_inner()));
-        }
+        let locks: Vec<Arc<RefLock>> = targets.iter().map(|r| self.ref_lock(r)).collect();
+        // Lock each ref's linearisation lock in the sorted order (the deadlock-free discipline). The
+        // guards are held for the whole CAS→commit→apply window — the per-ref linearisation point
+        // spans check + apply. The lock carries no state; the ref STATE is read/written from the
+        // durable backing (on-disk git in production) under this held lock.
+        let _guards: Vec<std::sync::MutexGuard<'_, ()>> = locks
+            .iter()
+            .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect();
 
         // First pass: CAS-staleness check over EVERY ref (the per-ref linearisation assertion). A
-        // single stale ref aborts the WHOLE atomic push (no partial write). Reading the locked cell
-        // is the `SELECT … FOR UPDATE` row read.
+        // single stale ref aborts the WHOLE atomic push (no partial write). Reading the backing under
+        // the held lock is the `SELECT … FOR UPDATE` row read.
         for u in &push.updates {
-            let actual = guards
-                .get(&u.ref_name)
-                .and_then(|g| g.as_ref())
-                .map(|r| r.target_oid.clone())
-                .unwrap_or_else(Oid::zero);
+            let actual = self.tip_of(&u.ref_name).unwrap_or_else(Oid::zero);
             if actual != u.expected_old {
                 // Reject BEFORE moving any ref — drop the locks (transaction never opened) → 0 ghost.
                 return Ok(PushOutcome::Rejected(RejectReason::NonFastForward {
@@ -718,9 +898,8 @@ impl RefStore {
         // Stage each ref-CAS as the transaction's state change + emit its git.ref.updated together.
         let mut planned: Vec<(RefName, Oid, u64, Option<Oid>, myelin_events::EventId)> = Vec::new();
         for u in &push.updates {
-            let cur = guards.get(&u.ref_name).and_then(|g| g.as_ref());
-            let old = cur.map(|r| r.target_oid.clone());
-            let prev_seq = cur.map(|r| r.update_seq).unwrap_or(0);
+            let old = self.tip_of(&u.ref_name);
+            let prev_seq = self.seq_of(&u.ref_name);
             let new_seq = prev_seq + 1;
 
             // The state change (the ref CAS + reflog) — staged into THIS transaction (co-commit).
@@ -767,42 +946,21 @@ impl RefStore {
         // committed" identical to the real "UPDATE git_ref … + INSERT outbox … in one tx".
         tx.commit()?;
 
-        // The ref CAS + reflog are the COMMITTED state-change half (applied under the SAME per-ref
-        // locks the CAS-staleness check read, still held here — so no interleaving moved the ref
-        // between the check and the apply; the per-ref linearisation point holds). A push to the new
-        // zero-oid is a DELETE (the cell transitions to `None`); otherwise the cell becomes `Some`.
+        // The ref CAS + reflog are the COMMITTED state-change half (applied to the durable backing
+        // under the SAME per-ref locks the CAS-staleness check read, still held here — so no
+        // interleaving moved the ref between the check and the apply; the per-ref linearisation point
+        // holds). A push to the zero-oid is a DELETE; otherwise the ref is created/updated. On the
+        // durable path this is the real on-disk git ref CAS + reflog (survives restart).
         let mut moved = Vec::new();
         let mut emitted = Vec::new();
-        {
-            let mut reflog = self.reflog.lock().unwrap_or_else(|e| e.into_inner());
-            for (ref_name, new_oid, new_seq, old, id) in planned {
-                let guard = guards
-                    .get_mut(&ref_name)
-                    .expect("the ref's cell was locked for the CAS");
-                if new_oid.is_zero() {
-                    // A delete: the ref row is removed (the cell goes empty); the next create starts
-                    // a fresh generation (matching the `git_ref` row being deleted).
-                    **guard = None;
-                } else {
-                    **guard = Some(RefRow {
-                        target_oid: new_oid.clone(),
-                        update_seq: new_seq,
-                    });
-                }
-                reflog.push(ReflogEntry {
-                    ref_name: ref_name.clone(),
-                    old_oid: old,
-                    new_oid: new_oid.clone(),
-                    update_seq: new_seq,
-                    pusher_pseudonym: push.pusher.pseudonym.clone(),
-                });
-                moved.push((ref_name, new_oid, new_seq));
-                emitted.push(id);
-            }
+        for (ref_name, new_oid, new_seq, old, id) in planned {
+            self.apply_one(&ref_name, &new_oid, new_seq, old, &push.pusher.pseudonym)?;
+            moved.push((ref_name, new_oid, new_seq));
+            emitted.push(id);
         }
         // The per-ref guards drop HERE — the linearisation window (check → commit → apply) closes,
         // releasing each ref for the next push in the burst.
-        drop(guards);
+        drop(_guards);
 
         // The crash-after-commit point: the transaction committed (the event rows are durable +
         // unsent; the ref moved). A crash HERE loses nothing — the relay publishes the durable rows
@@ -815,12 +973,13 @@ impl RefStore {
         Ok(PushOutcome::Accepted { moved, emitted })
     }
 
-    /// Look up — vivifying if absent — the per-ref lock cell for a ref. The registry lock is held
-    /// ONLY for this lookup/insert, never across the per-ref CAS (so different refs never contend on
-    /// the registry). Returns an `Arc` clone so the caller holds the cell's lock independently — the
-    /// per-ref `FOR UPDATE` serialisation lives in the cell, not the registry (arch §3 / GIT-P10).
-    fn cell(&self, ref_name: &RefName) -> Arc<RefCell> {
-        let mut g = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+    /// Look up — vivifying if absent — the per-ref **linearisation lock** for a ref. The registry
+    /// lock is held ONLY for this lookup/insert, never across the per-ref CAS (so different refs never
+    /// contend on the registry). Returns an `Arc` clone so the caller holds the lock independently —
+    /// the per-ref `FOR UPDATE` serialisation lives in this lock; the ref STATE lives in the durable
+    /// backing (arch §3 / GIT-P10).
+    fn ref_lock(&self, ref_name: &RefName) -> Arc<RefLock> {
+        let mut g = self.locks.lock().unwrap_or_else(|e| e.into_inner());
         Arc::clone(g.entry(ref_name.clone()).or_default())
     }
 }

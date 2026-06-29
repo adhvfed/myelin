@@ -228,6 +228,14 @@ pub mod git_resolve;
 /// architecture-named fallback; gix-preferred is the OQ-1 floor, GIT-P33). Read/diff/blame with no
 /// `git` fork (no-host-exec by construction).
 pub mod gix_backend;
+/// **Durable on-disk git STORAGE (GT-001 / E1.1).** Real on-disk bare repos at
+/// `<root>/<tenant>/<region>/<repo>.git` via `git2` ([`durable::DurableGitStore`] /
+/// [`durable::DurableGitRepo`]) — repo lifecycle (`init_bare`), durable refs + reflog + CAS
+/// (fixes SI-012: `open` loads refs from disk), and the on-disk odb as the object tier (fixes
+/// F-git-2: the oid→object lookup is the real odb, no in-memory index). The WRITE/lifecycle
+/// companion to the read backend [`gix_backend::GixCore`] — REUSES the same resolver + `git2`,
+/// never reimplements git. The smart-transport WIRE sits on this (GT-006, sandbox-gated).
+pub mod durable;
 /// The **git `PersonalDataHolder` H1 BODY: the DSR fan-out + history-rewrite erasure semantics**
 /// (GIT-P29 / P-290, M3-G7 — GIT-D2 complete). [`holder::GitPersonalDataHolder`] is the real
 /// `locate/export/rectify/restrict/erase` over git + metadata (contract 10.1/10.4), completing the H1
