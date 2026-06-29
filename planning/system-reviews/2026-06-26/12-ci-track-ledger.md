@@ -32,7 +32,8 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
 | ID | Epic | Title | Deps | Size |
 |---|---|---|---|---|
 | CT-001 | (RESHAPE-001) | **Redraw the sandbox launch/result/lifecycle seam:** `launch → run(spec.command) → wait → SandboxResult{exit, stdout, stderr, usage, timed_out}` (+ settle-once); the seam both Firecracker + gVisor backends and the runner implement. Sandbox-INDEPENDENT (a Rust type/API redraw; no exec yet). | — | mid |
-| CT-002 | E2.1 (P-544) | **Sandbox PRODUCTION exec:** a real `spec.command` runs through the hardened production `launch()` on **both** Firecracker (a real microVM boots — NOT `init=/bin/true`) and gVisor (real `runsc run` of the OCI bundle — NOT a `--version` probe); capture exit/stdout/stderr/usage; the timeout kills the whole guest; settle once after completion. Real boots (`MYELIN_REQUIRE_KVM=1`). | CT-001 | high |
+| CT-002a | E2.1 (P-544) | **Firecracker PRODUCTION exec** (the DEFAULT backend; CI-P2 = the one through the escape drill FIRST): a real `spec.command` runs in a real microVM (NOT `init=/bin/true`) — reuse the proven `drill_config_json` recipe (2nd read-only virtio drive + `init=/bin/bash /dev/vdb`) with a command-runner init script; capture exit/stdout/stderr (bounded by `SANDBOX_CAPTURE_BOUND`) + usage from the serial console + `VmmChild::wait`; `spec.limits.timeout_secs` kills the whole guest (`timed_out=true`); settle once. Real boots (`MYELIN_REQUIRE_KVM=1`). | CT-001 | high |
+| CT-002b | E2.1 (P-544) | **gVisor PRODUCTION exec** (the NAMED SECOND backend, CI-P28): real `runsc run --bundle` of the OCI bundle built from the spec (`OciConfig::from_spec` + a rootfs) — NOT a `--version` probe; same `SandboxResult` capture convention + timeout→whole-guest-kill as CT-002a. Real `runsc run`. | CT-002a | high |
 | CT-003 | E2.2 (P-545) | **Production-path escape verification:** re-run the **AG-D4 escape corpus through the PRODUCTION `launch()`** on both backends — **0 escapes** — with a guard that fails RED if a case is routed to the harness shortcut instead of the prod path. The supply-chain-safety proof. | CT-002 | high |
 | CT-004 | E2.3 | **CI backend HARDEN + RECONCILE** (ci-controlplane / dispatch / sandbox): durable pipeline/run/step state, the scheduler/lease/metering, the log pipeline — on the durable substrate (MR-022). | CT-002 | high |
 | CT-005 | E2.4 | **CI API + UI + CLI/MCP:** pipelines / runs / live log-tail (SSE) through the edge (MR-014/015) + the web UI (MR-019) + the CLI/MCP (MR-020/021); reuse the CI ViewSpec. | CT-004 | high; may split (API/UI vs CLI/MCP) |
@@ -41,7 +42,7 @@ escape). Commit per prompt. **No green without a real microVM boot** (`MYELIN_RE
 
 ## Waves
 - **W1:** CT-001 (seam redraw — sandbox-independent)
-- **W2:** CT-002 (production exec — real boots)
+- **W2:** CT-002a (Firecracker prod exec — real boots) → CT-002b (gVisor prod exec — real `runsc run`)
 - **W3:** CT-003 (escape verification, 0 escapes through prod) · CT-004 (CI backend harden) · CT-006 (the git wire, unblocked)
 - **W4:** CT-005 (CI API+UI+CLI/MCP)
 - **W5:** CT-007 (cut over — only after the sandbox is genuinely hardened)
