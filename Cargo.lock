@@ -2503,6 +2503,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "myelin-agent",
+ "myelin-ci-sandbox",
  "myelin-events",
  "myelin-git",
  "myelin-identity",

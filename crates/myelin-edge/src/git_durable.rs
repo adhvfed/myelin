@@ -63,6 +63,9 @@ pub struct DurableGitBackend {
     minter: Arc<dyn IdMinter>,
     /// The `ssh://` clone host rendered into the repo-home ViewModel.
     clone_host: String,
+    /// The on-disk root holding `<tenant>/<region>/<repo>.git` bare repos — retained so the wire-serving
+    /// tier (CT-006b) composes its sandboxed `GitCore` over the SAME root the durable store reads/writes.
+    root: PathBuf,
 }
 
 impl DurableGitBackend {
@@ -72,11 +75,27 @@ impl DurableGitBackend {
         let root = root.into();
         DurableGitBackend {
             store: DurableGitStore::rooted(root.clone()),
-            prs: DurablePrStore::rooted(root),
+            prs: DurablePrStore::rooted(root.clone()),
             outbox: OutboxStore::new(),
             minter: Arc::new(MonotonicMinter::new()),
             clone_host: "ssh://git@myelin".into(),
+            root,
         }
+    }
+
+    /// **The wire-serving `GitCore` over the SAME on-disk root (CT-006b / GT-006).** Composes the
+    /// production sandboxed [`crate::git_wire_exec::GitWireExecutor`] (wire ops → canonical `git` in the
+    /// hardened gVisor sandbox, no-host-exec) with the in-process [`myelin_git::gix_backend::GixCore`]
+    /// read backend. `advertise_refs(repo, UploadPack)` / `serve(repo, UploadPack, request)` flow
+    /// through here against the real on-disk bare repos. The HTTP smart-transport listener that drives
+    /// this over the wire (+ the receive-pack/PUSH path) is CT-006c.
+    pub fn wire_serving(
+        &self,
+    ) -> myelin_git::core::RoutedGitCore<
+        crate::git_wire_exec::GitWireExecutor,
+        myelin_git::gix_backend::GixCore<myelin_git::gix_backend::RootedResolver>,
+    > {
+        crate::git_wire_exec::production_git_core_default(self.root.clone())
     }
 
     /// The shared outbox (so the reconciler / a relay can read the committed `git.ref.updated` rows).

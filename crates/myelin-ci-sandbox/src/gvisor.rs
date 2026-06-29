@@ -1213,6 +1213,58 @@ pub fn resolve_bare_repo_path(
     Ok(path)
 }
 
+/// **Symlink-path defence-in-depth (CT-006b 4a).** [`resolve_bare_repo_path`] closes the textual
+/// path-traversal vector (`..` / separators / absolute / non-allowlist), but a textually-clean path
+/// can STILL escape the tenant tree at the FILESYSTEM layer: a `<repo>.git` that is a SYMLINK (or any
+/// resolved component that is) would make the RO bind-mount follow OUT of `<root>/<tenant>/<region>`
+/// into, e.g., another tenant's tree or `/etc`. This asserts, AFTER resolution and BEFORE any mount,
+/// that the resolved repo path is a REAL directory whose canonicalized location stays UNDER the
+/// canonicalized `root`. Fail-closed: a symlinked final component, a non-directory, an unstat-able
+/// path, or a canonical path that leaves the root is REFUSED (`WireError::Path`).
+///
+/// Two complementary checks (defence in depth):
+///   - `symlink_metadata` (does NOT follow the FINAL component) ⇒ a `<repo>.git` symlink is caught
+///     even when it points back INSIDE the root;
+///   - `canonicalize` + `starts_with(canonical_root)` ⇒ a symlinked INTERMEDIATE component (or a
+///     final symlink pointing OUTSIDE) that escapes the tree is caught.
+pub fn assert_repo_under_root(root: &Path, repo_host_path: &Path) -> Result<(), WireError> {
+    let meta = std::fs::symlink_metadata(repo_host_path).map_err(|e| {
+        WireError::Path(format!(
+            "repo path {repo_host_path:?} is not present/stat-able ({e}) — refused before mount \
+             (fail-closed)"
+        ))
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(WireError::Path(format!(
+            "repo path {repo_host_path:?} is a SYMLINK — refused before mount (a symlinked \
+             `<repo>.git` could make the bind-mount follow OUT of the tenant tree; defence in depth)"
+        )));
+    }
+    if !meta.is_dir() {
+        return Err(WireError::Path(format!(
+            "repo path {repo_host_path:?} is not a directory — refused before mount (fail-closed)"
+        )));
+    }
+    let canon_root = std::fs::canonicalize(root).map_err(|e| {
+        WireError::Path(format!(
+            "git root {root:?} could not be canonicalized ({e}) — refused before mount (fail-closed)"
+        ))
+    })?;
+    let canon_repo = std::fs::canonicalize(repo_host_path).map_err(|e| {
+        WireError::Path(format!(
+            "repo path {repo_host_path:?} could not be canonicalized ({e}) — refused before mount \
+             (fail-closed)"
+        ))
+    })?;
+    if !canon_repo.starts_with(&canon_root) {
+        return Err(WireError::Path(format!(
+            "resolved repo path {canon_repo:?} escapes the canonical git root {canon_root:?} (a \
+             symlinked component would leave the tenant tree) — refused before mount (fail-closed)"
+        )));
+    }
+    Ok(())
+}
+
 /// **A sandboxed git-wire invocation** — the git-shaped analogue of a [`JobSpec`]. It carries a
 /// RESOLVER-VALIDATED bare-repo host path (RO-mounted at [`WIRE_REPO_MOUNT`]), the canonical `git` argv
 /// (WITHOUT the repo path — the launch appends `/repo`), the bounded stdin request body, optional extra
@@ -1221,6 +1273,10 @@ pub fn resolve_bare_repo_path(
 #[derive(Clone, Debug)]
 pub struct GitWireSpec {
     repo_host_path: PathBuf,
+    /// The on-disk root the locator resolved UNDER — retained so the launch can assert (defence in
+    /// depth, CT-006b) that the resolved repo path stays a REAL directory beneath the canonicalized
+    /// root before it is bind-mounted (a symlinked `<repo>.git` / component cannot escape the tree).
+    root: PathBuf,
     git_argv: Vec<String>,
     stdin: Vec<u8>,
     env: Vec<String>,
@@ -1255,6 +1311,7 @@ impl GitWireSpec {
         let repo_host_path = resolve_bare_repo_path(root, tenant, region, repo)?;
         Ok(GitWireSpec {
             repo_host_path,
+            root: root.to_path_buf(),
             git_argv,
             stdin,
             env,
@@ -1293,6 +1350,10 @@ impl GvisorBackend {
                 cap: WIRE_STDIN_BOUND,
             });
         }
+        // Symlink-path defence in depth (CT-006b 4a): the resolved repo MUST be a real directory under
+        // the canonicalized root before it is bind-mounted (a symlinked `<repo>.git`/component cannot
+        // make the RO mount follow out of the tenant tree). REFUSED here, before any container spawns.
+        assert_repo_under_root(&spec.root, &spec.repo_host_path)?;
         // The guest command: `git <argv> /repo` (the RO repo mount is the final argument).
         let mut command = Vec::with_capacity(spec.git_argv.len() + 2);
         command.push("git".to_string());
@@ -1665,5 +1726,65 @@ mod tests {
         };
         let r = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg| Ok(fake_run()));
         assert!(matches!(r, Err(GvisorError::Hook(_))));
+    }
+
+    /// **CT-006b 4a — symlink-path defence in depth (no runsc needed).** A textually-clean repo
+    /// locator whose resolved `<repo>.git` is a SYMLINK out of the tenant tree is REFUSED by
+    /// [`assert_repo_under_root`] BEFORE any mount, while a REAL directory under the root is admitted.
+    #[test]
+    fn symlinked_repo_path_is_refused_before_mount() {
+        let tmp = std::env::temp_dir().join(format!(
+            "myelin-gitwire-symlink-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let root = tmp.join("git-root");
+        let outside = tmp.join("outside-the-tree");
+        std::fs::create_dir_all(root.join("acme").join("fr-par")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // (1) A REAL bare-repo directory under the root is admitted.
+        let real = resolve_bare_repo_path(&root, "acme", "fr-par", "widgets").unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        assert!(
+            assert_repo_under_root(&root, &real).is_ok(),
+            "a real directory under the root must be admitted"
+        );
+
+        // (2) A SYMLINKED `<repo>.git` pointing OUT of the tenant tree is refused (final-symlink check
+        //     AND the canonical-escape check would both catch it).
+        let evil = resolve_bare_repo_path(&root, "acme", "fr-par", "evil").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &evil).unwrap();
+        let r = assert_repo_under_root(&root, &evil);
+        assert!(
+            matches!(r, Err(WireError::Path(_))),
+            "a symlinked repo path escaping the tree must be refused, got {r:?}"
+        );
+
+        // (3) A symlinked INTERMEDIATE component (the tenant dir → /tmp) is caught by the canonical
+        //     starts_with check even though the final `<repo>.git` is a real dir under the symlink.
+        let root2 = tmp.join("git-root-2");
+        std::fs::create_dir_all(&root2).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root2.join("acme")).unwrap();
+        let leak_parent = outside.join("fr-par");
+        std::fs::create_dir_all(leak_parent.join("widgets.git")).unwrap();
+        let via_symlinked_component =
+            resolve_bare_repo_path(&root2, "acme", "fr-par", "widgets").unwrap();
+        let r2 = assert_repo_under_root(&root2, &via_symlinked_component);
+        assert!(
+            matches!(r2, Err(WireError::Path(_))),
+            "a symlinked intermediate component leaving the root must be refused, got {r2:?}"
+        );
+
+        // (4) An absent repo path fails closed (never a silent admit).
+        let absent = resolve_bare_repo_path(&root, "acme", "fr-par", "ghost").unwrap();
+        assert!(matches!(
+            assert_repo_under_root(&root, &absent),
+            Err(WireError::Path(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

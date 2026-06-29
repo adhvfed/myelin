@@ -72,6 +72,7 @@ pub mod gateway;
 pub mod git_durable;
 pub mod git_edge;
 pub mod git_effect;
+pub mod git_wire_exec;
 pub mod request;
 pub mod server;
 pub mod session;
@@ -81,6 +82,7 @@ pub use authz::AllowAll;
 pub use git_durable::{register_git_durable, DurableGitBackend};
 pub use git_edge::{register_git, GitEdgeState};
 pub use git_effect::GitEffectApi;
+pub use git_wire_exec::{production_git_core, production_git_core_default, GitWireExecutor};
 pub use catalogue::{
     page_envelope, Handler, HandlerCtx, Method, Page, API_VERSION, DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,

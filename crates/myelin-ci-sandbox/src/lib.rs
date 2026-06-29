@@ -109,9 +109,9 @@ pub use gvisor::{
 // (tenant, region, repo) locator is resolver-validated (the GT-001 cross-tenant boundary, replicated)
 // before any mount. Exercised by tests/git_wire_prod_exec_test.rs against a real `runsc` sandbox.
 pub use gvisor::{
-    resolve_bare_repo_path, resolved_gvisor_git_rootfs, validate_wire_repo_slug,
-    validate_wire_segment, GitWireSpec, WireError, WireMount, ENV_GVISOR_GIT_ROOTFS,
-    WIRE_QUARANTINE_MOUNT, WIRE_REPO_MOUNT, WIRE_STDIN_BOUND,
+    assert_repo_under_root, resolve_bare_repo_path, resolved_gvisor_git_rootfs,
+    validate_wire_repo_slug, validate_wire_segment, GitWireSpec, WireError, WireMount,
+    ENV_GVISOR_GIT_ROOTFS, WIRE_QUARANTINE_MOUNT, WIRE_REPO_MOUNT, WIRE_STDIN_BOUND,
 };
 
 pub use runner::{

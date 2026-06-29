@@ -56,6 +56,17 @@ myelin-agent = { path = "../myelin-agent" }
 # edge composes `RefStore::open_durable` + the outbox + the id minter to make API writes persist.
 # Already in the tree (myelin-git depends on it) — promoting it adds ZERO new crate.
 myelin-events = { path = "../myelin-events" }
+# CT-006b (GT-006): the SANDBOXED git-wire capability the production `WireExecutor` calls into —
+# `GvisorBackend::launch_git_wire(&GitWireSpec, &hooks)` runs canonical `git upload-pack`/`receive-pack`
+# in the hardened gVisor sandbox (egress-deny, ro-root, caps dropped, non-root, bounded). The edge owns
+# the PRODUCTION `myelin_git::core::WireExecutor` impl (`GitWireExecutor`) so the git crate carries NO
+# host-exec fingerprint (the executor owns the sandboxed launch). The edge executor NEVER shells out
+# itself — it delegates to `launch_git_wire`. ACYCLIC: `myelin-ci-sandbox` is a leaf consumer (depends
+# only on the shared glue crates) and NOTHING in the production DAG depends back on `myelin-edge`, so
+# `myelin-edge → myelin-ci-sandbox` is a forward edge between two leaf consumers (neither a node in the
+# eleven-crate library DAG; ci-sandbox does NOT depend on edge). `myelin-git` is ci-sandbox's DEV-dep
+# only (the validator replica is drift-pinned by a committed test), so no production edge ci→git either.
+myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
 # The {error:{message,code?}} envelope + the JSON view-model/data contract are serde_json::Value (the
 # one workspace-pinned shape). No derive needed — the edge builds/parses Value directly.
 serde_json = { workspace = true }
