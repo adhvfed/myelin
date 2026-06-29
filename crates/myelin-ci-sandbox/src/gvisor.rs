@@ -34,7 +34,7 @@
 //! exclusion of this one file (registered in `lint-gate` + `tests/workspace_clean.rs`).
 
 use crate::hardening::HardeningProfile;
-use crate::{JobSpec, RunnerHooks, SandboxBackend, SandboxHandle};
+use crate::{JobSpec, RunnerHooks, SandboxBackend, SandboxHandle, SandboxLaunch, SandboxResult};
 use std::sync::Mutex;
 
 /// Env var naming the `runsc` binary; defaults to `runsc` on `PATH`.
@@ -144,9 +144,15 @@ impl From<crate::HookError> for GvisorError {
     }
 }
 
-/// A live gVisor container handle (the OCI/`runsc` container id, killable on teardown).
+/// A live gVisor container handle (the OCI/`runsc` container id, killable on teardown). Its
+/// lifecycle is RECONCILED with the Firecracker [`VmmChild`](crate::firecracker::VmmChild): both
+/// expose `kill` (whole-guest teardown) AND `wait` (block until the command exits, returning the
+/// exit code). CT-002 calls `wait` to populate [`SandboxResult::exit_code`] from a real `runsc run`.
 trait RunscChild {
     fn kill(&mut self) -> Result<(), String>;
+    /// Wait for the container's process to exit; returns its exit code (0 == clean). Reconciles with
+    /// `VmmChild::wait` so both backends share the same launch→run→wait→result lifecycle shape.
+    fn wait(&mut self) -> Result<i32, String>;
 }
 
 /// The gVisor (`runsc`) second backend — same trait, same hardening, OCI/`runsc` path.
@@ -176,7 +182,7 @@ impl GvisorBackend {
         spec: &JobSpec,
         hooks: &RunnerHooks,
         run: F,
-    ) -> Result<SandboxHandle, GvisorError>
+    ) -> Result<SandboxLaunch, GvisorError>
     where
         F: FnOnce(&OciConfig) -> Result<Box<dyn RunscChild + Send>, String>,
     {
@@ -187,27 +193,43 @@ impl GvisorBackend {
         let reserve = (hooks.reserve)(&spec.meter_to)?;
 
         let cfg = OciConfig::from_spec(spec, &profile);
-        let child = run(&cfg).map_err(GvisorError::Runtime)?;
+        let mut child = run(&cfg).map_err(GvisorError::Runtime)?;
+
+        // RESHAPE-001 / CT-001: the reconciled launch→run→WAIT→result lifecycle. `wait` blocks for
+        // the in-line compute job and returns the exit code (mirroring the Firecracker `VmmChild`).
+        // At CT-001 the child is the `runsc --version` probe whose `wait` is a documented no-op
+        // `Ok(0)` (no real container ran); CT-002 swaps in a real `runsc run --bundle` whose `wait`
+        // returns the real `spec.command` exit code, captures stdout/stderr, and enforces the
+        // timeout (setting `timed_out`). The usage FIELD flows into the settle hook now.
+        let exit_code = child.wait().map_err(GvisorError::Runtime)?;
 
         let guest_id = format!("runsc-{}", spec.idem_token.0);
         self.live.lock().unwrap().insert(guest_id.clone(), child);
 
-        (hooks.settle)(
-            &reserve,
-            crate::ResourceUsage {
+        let result = SandboxResult {
+            exit_code: Some(exit_code),
+            timed_out: false,
+            usage: crate::ResourceUsage {
                 cpu_seconds: 1,
                 mem_byte_seconds: 1,
             },
-        )?;
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
 
-        Ok(SandboxHandle { guest_id })
+        (hooks.settle)(&reserve, result.usage)?;
+
+        Ok(SandboxLaunch {
+            handle: SandboxHandle { guest_id },
+            result,
+        })
     }
 }
 
 impl SandboxBackend for GvisorBackend {
     type Error = GvisorError;
 
-    fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxHandle, Self::Error> {
+    fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
         self.launch_with(spec, hooks, spawn_real_runsc)
     }
 
@@ -240,6 +262,11 @@ struct SpawnedRunsc;
 impl RunscChild for SpawnedRunsc {
     fn kill(&mut self) -> Result<(), String> {
         Ok(())
+    }
+    fn wait(&mut self) -> Result<i32, String> {
+        // CT-001: no real container ran (the launch only probed `runsc --version`); a clean exit.
+        // CT-002 waits on the real `runsc run` and returns its actual exit code.
+        Ok(0)
     }
 }
 
@@ -436,6 +463,9 @@ mod tests {
         fn kill(&mut self) -> Result<(), String> {
             Ok(())
         }
+        fn wait(&mut self) -> Result<i32, String> {
+            Ok(0)
+        }
     }
 
     #[test]
@@ -460,11 +490,14 @@ mod tests {
     fn gvisor_launch_drives_four_guarantees_on_the_same_trait() {
         // The SAME SandboxBackend trait + the SAME hardening — the named-second backend.
         let backend = GvisorBackend::new();
-        let handle = backend
+        let launch = backend
             .launch_with(&spec(vec![]), &ok_hooks(), |_cfg| Ok(Box::new(FakeRunsc)))
             .unwrap();
-        assert_eq!(handle.guest_id, "runsc-idem-runsc-1");
-        backend.kill(&handle).unwrap();
+        assert_eq!(launch.handle.guest_id, "runsc-idem-runsc-1");
+        // The reshaped seam carries the command result back (CT-001 stub).
+        assert_eq!(launch.result.exit_code, Some(0));
+        assert!(launch.result.passed());
+        backend.kill(&launch.handle).unwrap();
     }
 
     #[test]

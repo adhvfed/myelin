@@ -36,7 +36,7 @@
 //! The fleet impl is CI-P14; pre-warmed snapshot pools are CI-P4.
 
 use crate::hardening::HardeningProfile;
-use crate::{JobSpec, RunnerHooks, SandboxBackend, SandboxHandle};
+use crate::{JobSpec, RunnerHooks, SandboxBackend, SandboxHandle, SandboxLaunch, SandboxResult};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -253,7 +253,7 @@ impl FirecrackerBackend {
         hooks: &RunnerHooks,
         oneshot: bool,
         spawn: F,
-    ) -> Result<SandboxHandle, FcError>
+    ) -> Result<SandboxLaunch, FcError>
     where
         F: FnOnce(&FcMachineConfig, &PathBuf) -> Result<Box<dyn VmmChild + Send>, String>,
     {
@@ -286,17 +286,24 @@ impl FirecrackerBackend {
             },
         );
 
-        // #1b settle — release the unused reserve on completion (never interrupt in-flight). For an
-        // in-line compute job the guest has booted; the metering unit is resource-seconds (§8).
-        (hooks.settle)(
-            &reserve,
-            crate::ResourceUsage {
-                cpu_seconds: cfg.vcpu_count as u64,
-                mem_byte_seconds: (cfg.mem_size_mib as u64) * 1024 * 1024,
-            },
-        )?;
+        // CT-001 (RESHAPE-001): the seam now carries the command's result. CT-002 boots the guest,
+        // runs `spec.command`, enforces `spec.limits.timeout_secs`, and reads the exit/usage via the
+        // already-present `VmmChild::wait` (no new wait mechanism); here we return a STUB OK result
+        // behind the redrawn seam (no real microVM boot at CT-001). The metering unit is
+        // resource-seconds (§8); the FIELD shape exists and FLOWS into the settle hook now.
+        let result = SandboxResult::stub_ok(crate::ResourceUsage {
+            cpu_seconds: cfg.vcpu_count as u64,
+            mem_byte_seconds: (cfg.mem_size_mib as u64) * 1024 * 1024,
+        });
 
-        Ok(SandboxHandle { guest_id })
+        // #1b settle — release the unused reserve on completion (never interrupt in-flight), now
+        // settling against the result's measured (stub at CT-001) usage.
+        (hooks.settle)(&reserve, result.usage)?;
+
+        Ok(SandboxLaunch {
+            handle: SandboxHandle { guest_id },
+            result,
+        })
     }
 }
 
@@ -324,7 +331,7 @@ impl SandboxBackend for FirecrackerBackend {
     /// up and the four guarantees have fired (the in-line compute contract). The REAL VMM is spawned
     /// here — the one legitimate host-exec site (the `no-host-exec` named exclusion; this seam IS
     /// the unified sandbox, not a bypass of it).
-    fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxHandle, Self::Error> {
+    fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
         self.launch_with(spec, hooks, /* oneshot = */ true, spawn_real_vmm)
     }
 
@@ -552,12 +559,17 @@ mod tests {
         let backend = FirecrackerBackend::new();
         let killed = Arc::new(AtomicBool::new(false));
         let killed2 = killed.clone();
-        let handle = backend
+        let launch = backend
             .launch_with(&spec(vec![]), &ok_hooks(), true, move |_cfg, _p| {
                 Ok(Box::new(FakeVmm { killed: killed2 }))
             })
             .unwrap();
-        assert_eq!(handle.guest_id, "fc-idem-fc-1");
+        assert_eq!(launch.handle.guest_id, "fc-idem-fc-1");
+        // The reshaped seam carries the command result (CT-001 stub): clean exit, usage flows.
+        assert_eq!(launch.result.exit_code, Some(0));
+        assert!(launch.result.passed());
+        assert_eq!(launch.result.usage.cpu_seconds, 2); // 2000 millis ⇒ 2 vcpu
+        let handle = launch.handle;
         backend.kill(&handle).unwrap();
         assert!(
             killed.load(Ordering::SeqCst),

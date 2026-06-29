@@ -33,7 +33,7 @@
 use myelin_ci_sandbox::{
     agent_job, EgressPolicy, HookError, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
     ReserveHandle, ResourceLimits, ResourceUsage, RunTokenRef, RunnerHooks, SandboxBackend,
-    SandboxHandle, SpecError, TrustTier, WorkspaceSpec,
+    SandboxHandle, SandboxLaunch, SandboxResult, SpecError, TrustTier, WorkspaceSpec,
 };
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -67,7 +67,7 @@ struct RunnerSeam {
 impl SandboxBackend for RunnerSeam {
     type Error = HookError;
 
-    fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxHandle, Self::Error> {
+    fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error> {
         // #4 isolation floor FIRST — the hardening profile must hold before any code runs.
         (hooks.isolation_floor)(spec)?;
         self.order.lock().unwrap().push("isolation_floor");
@@ -83,18 +83,20 @@ impl SandboxBackend for RunnerSeam {
             (hooks.reserve)(&spec.meter_to)
         }?;
         self.order.lock().unwrap().push("reserve");
-        // ... the hardened guest would run the (compute/external) command here ...
+        // ... the hardened guest would run the (compute/external) command here; the seam carries
+        // the result back (RESHAPE-001 / CT-001 stub) ...
+        let result = SandboxResult::stub_ok(ResourceUsage {
+            cpu_seconds: 2,
+            mem_byte_seconds: 4,
+        });
         // #1b settle — release the unused reserve on completion (never interrupt in-flight).
-        (hooks.settle)(
-            &reserve,
-            ResourceUsage {
-                cpu_seconds: 2,
-                mem_byte_seconds: 4,
-            },
-        )?;
+        (hooks.settle)(&reserve, result.usage)?;
         self.order.lock().unwrap().push("settle");
-        Ok(SandboxHandle {
-            guest_id: "guest-1".into(),
+        Ok(SandboxLaunch {
+            handle: SandboxHandle {
+                guest_id: "guest-1".into(),
+            },
+            result,
         })
     }
 
@@ -167,9 +169,10 @@ fn provider_launches_consumer_ci_spec_driving_four_guarantees_in_order() {
         exhausted: false,
     };
     let spec = consumer_builds_ci_spec();
-    let handle = provider.launch(&spec, &working_hooks()).unwrap();
-    assert_eq!(handle.guest_id, "guest-1");
-    provider.kill(&handle).unwrap();
+    let launch = provider.launch(&spec, &working_hooks()).unwrap();
+    assert_eq!(launch.handle.guest_id, "guest-1");
+    assert_eq!(launch.result.exit_code, Some(0), "the seam carries the result");
+    provider.kill(&launch.handle).unwrap();
     assert_eq!(
         *order.lock().unwrap(),
         vec!["isolation_floor", "attribute", "reserve", "settle"],

@@ -85,7 +85,7 @@
 //! report run against LIVE Postgres ONLY in `tests/integration_runner_lease.rs` (the `integration`
 //! feature). `cargo build --workspace` + the default `cargo test` stay DB-free AND VM-free.
 
-use crate::{JobSpec, RunnerHooks, SandboxBackend, SandboxHandle};
+use crate::{JobSpec, RunnerHooks, SandboxBackend, SandboxLaunch};
 use myelin_flow::{
     DurableExecutor, ExecutorError, RunId, SignalOutcome, SignalSpec, JOB_DONE_SIGNAL,
 };
@@ -555,24 +555,24 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter> RunnerAgent<'a
     /// 2. **Heartbeat** to confirm the lease is still held BEFORE launching (a runner that stalled
     ///    between claim and launch must not run a job another worker reclaimed). A refused heartbeat
     ///    is `Err(LeaseLost)` — the reaper (CI-P12) re-queued it.
-    /// 3. **Launch** the sandbox via [`SandboxBackend::launch`] (CI-P1/CI-P2), driving the
-    ///    four-guarantee hooks; stream `frames` firehose frames (CI-P20 stub); **kill** the guest on
+    /// 3. **Launch → run → collect** the sandbox via [`SandboxBackend::launch`] (CI-P1/CI-P2),
+    ///    driving the four-guarantee hooks. `launch` BLOCKS for the in-line compute job and returns a
+    ///    [`SandboxLaunch`] carrying the command's [`SandboxResult`](crate::SandboxResult)
+    ///    (exit/timeout/usage/captured-streams). The runner ships the captured `stdout`/`stderr`
+    ///    through the firehose as redacted frames (CI-P20 stub sink), then **kills** the guest on
     ///    teardown (one-job-per-sandbox, ephemeral). A launch failure is `Err(LaunchFailed)`
     ///    fail-closed (no terminal report — the dispatch activity retries the job, §OQ-F).
-    /// 4. **Report terminal** `job.done` ECHOING the spec's `idem_token` through the engine signal
-    ///    path (the exactly-once wake), then **settle** the lease. The [`RunOutcome`] carries the
-    ///    delivery's idempotency outcome.
+    /// 4. **DERIVE + report terminal.** The runner DERIVES the [`TerminalReport`] from the result
+    ///    (`passed = result.exit_code == Some(0) && !result.timed_out`; `result_refs` carry the
+    ///    `ci.log.available` pointer the firehose pipeline publishes — references-not-payloads, NEVER
+    ///    the captured bytes) and delivers `job.done` ECHOING the spec's `idem_token` through the
+    ///    engine signal path (the exactly-once wake), then **settles** the lease. The [`RunOutcome`]
+    ///    carries the derived report + the delivery's idempotency outcome.
     ///
-    /// `now` is the runner's clock (epoch seconds); `frames` is how many firehose frames the job
-    /// produced (the CI-P20 stub's observable — a real job streams as it runs). `report` is the
-    /// job's terminal outcome the runner assembles from the guest's exit (a real runner derives
-    /// pass/fail + the `ci.log.available` pointer; the test supplies it).
-    pub fn run_one(
-        &self,
-        now: i64,
-        frames: u64,
-        report: TerminalReport,
-    ) -> Result<RunOutcome, RunnerError> {
+    /// `now` is the runner's clock (epoch seconds). The terminal report is no longer an input
+    /// (RESHAPE-001 / CT-001): the runner derives it from the [`SandboxResult`](crate::SandboxResult)
+    /// the seam now carries back.
+    pub fn run_one(&self, now: i64) -> Result<RunOutcome, RunnerError> {
         // ── Step 1: CLAIM (the FOR UPDATE SKIP LOCKED handshake). Region + label + trust eligible,
         // lease-free (unleased or expired). A live lease another runner holds is skipped.
         let job = self
@@ -603,25 +603,29 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter> RunnerAgent<'a
             });
         }
 
-        // ── Step 3: LAUNCH the sandbox via the unified backend (CI-P1/CI-P2). The four-guarantee
+        // ── Step 3: LAUNCH → RUN → COLLECT via the unified backend (CI-P1/CI-P2). The four-guarantee
         // hooks fire inside launch (reserve/attribute/isolation-floor → settle); a refusal fails the
         // launch CLOSED — no terminal report, the dispatch activity retries (§OQ-F). The runner does
-        // NOT reimplement the sandbox; it drives the seam.
-        let handle: SandboxHandle = self
+        // NOT reimplement the sandbox; it drives the seam. `launch` BLOCKS for the in-line compute job
+        // and returns the command's result (RESHAPE-001 / CT-001).
+        let SandboxLaunch { handle, result } = self
             .backend
             .launch(&job.spec, &self.hooks)
             .map_err(|e| RunnerError::LaunchFailed(e.to_string()))?;
 
-        // Stream firehose frames (CI-P20 STUB): a real job streams each redacted log line as it runs;
-        // here we ship `frames` frames so the runner's stream → `ci.log.available` pointer path is
-        // exercised. Re-heartbeat once mid-stream (a long job renews its lease so it does not lapse).
-        for _ in 0..frames {
-            self.firehose.ship_frame(
-                &job.run_id,
-                &job.job_id,
-                b"<redacted log frame (CI-P20 stub)>",
-            );
+        // Stream the captured guest stdout/stderr through the firehose as redacted frames (CI-P20
+        // STUB sink). references-not-payloads at the SIGNAL boundary: the raw bytes go to the firehose
+        // (→ the `ci.log.available` pointer), NEVER into the `job.done` engine signal payload. We ship
+        // a frame per non-empty stream; the full pipeline (byte-range index, resume cursor) is CI-P20.
+        if !result.stdout.is_empty() {
+            self.firehose
+                .ship_frame(&job.run_id, &job.job_id, &result.stdout);
         }
+        if !result.stderr.is_empty() {
+            self.firehose
+                .ship_frame(&job.run_id, &job.job_id, &result.stderr);
+        }
+        // Re-heartbeat (a long job renews its lease so it does not lapse mid-run).
         self.leases.heartbeat(
             &self.worker_id,
             &job.tenant,
@@ -635,9 +639,21 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter> RunnerAgent<'a
             .kill(&handle)
             .map_err(|e| RunnerError::LaunchFailed(e.to_string()))?;
 
-        // ── Step 4: REPORT TERMINAL `job.done` ECHOING the spec's idem_token through the ENGINE
-        // signal path (the exactly-once wake). The runner can deliver this twice (at-least-once); the
-        // engine buffers once; the workflow wakes once. NO second signal path.
+        // ── Step 4: DERIVE the terminal report from the command result, then REPORT TERMINAL.
+        // `passed` is derived (NOT an input): a clean exit that did not time out. The result_refs
+        // carry the `ci.log.available` pointer (references-not-payloads) the firehose pipeline
+        // publishes for the captured streams — never the bytes themselves.
+        let report = TerminalReport {
+            passed: result.passed(),
+            result_refs: vec![ArtifactRef(format!(
+                "myelin://{}/ci/run/{}/job/{}/log.available",
+                job.tenant.0, job.run_id, job.job_id
+            ))],
+        };
+
+        // `job.done` ECHOING the spec's idem_token through the ENGINE signal path (the exactly-once
+        // wake). The runner can deliver this twice (at-least-once); the engine buffers once; the
+        // workflow wakes once. NO second signal path.
         let run = RunId(job.run_id.clone());
         let outcome = self
             .reporter
@@ -679,7 +695,8 @@ mod tests {
     use super::*;
     use crate::{
         EgressPolicy, HookError, IdemToken, ImageRef, JobKind, MeterTarget, ReserveHandle,
-        ResourceLimits, ResourceUsage, RunTokenRef, TrustTier, WorkspaceSpec,
+        ResourceLimits, ResourceUsage, RunTokenRef, SandboxHandle, SandboxLaunch, SandboxResult,
+        TrustTier, WorkspaceSpec,
     };
     use myelin_events::MonotonicMinter;
     use myelin_flow::{job_idem_token, FlowExecutor, StartSpec};
@@ -741,11 +758,32 @@ mod tests {
     /// launches/kills, and runs the four-guarantee hooks exactly as a real backend must. NO host-exec
     /// path (no `process::Command`) — the launch trait is the only execution seam (the no-host-exec
     /// lint admits this, 1.6).
-    #[derive(Default)]
     struct RecordingBackend {
         launches: AtomicUsize,
         kills: AtomicUsize,
         fail_launch: bool,
+        /// The command result the seam carries back — the runner DERIVES the terminal report from
+        /// it (RESHAPE-001 / CT-001). Defaults to a clean pass with a stub stdout frame.
+        result: SandboxResult,
+    }
+    impl Default for RecordingBackend {
+        fn default() -> Self {
+            Self {
+                launches: AtomicUsize::new(0),
+                kills: AtomicUsize::new(0),
+                fail_launch: false,
+                result: SandboxResult {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    usage: ResourceUsage {
+                        cpu_seconds: 1,
+                        mem_byte_seconds: 1,
+                    },
+                    stdout: b"<stub guest stdout>".to_vec(),
+                    stderr: Vec::new(),
+                },
+            }
+        }
     }
     impl SandboxBackend for RecordingBackend {
         type Error = HookError;
@@ -753,7 +791,7 @@ mod tests {
             &self,
             spec: &JobSpec,
             hooks: &RunnerHooks,
-        ) -> Result<SandboxHandle, Self::Error> {
+        ) -> Result<SandboxLaunch, Self::Error> {
             if self.fail_launch {
                 return Err(HookError("backend refused".into()));
             }
@@ -761,16 +799,13 @@ mod tests {
             (hooks.isolation_floor)(spec)?;
             (hooks.attribute)(&spec.run_token)?;
             let res = (hooks.reserve)(&spec.meter_to)?;
-            (hooks.settle)(
-                &res,
-                ResourceUsage {
-                    cpu_seconds: 1,
-                    mem_byte_seconds: 1,
-                },
-            )?;
+            (hooks.settle)(&res, self.result.usage)?;
             self.launches.fetch_add(1, Ordering::SeqCst);
-            Ok(SandboxHandle {
-                guest_id: format!("guest-{}", spec.idem_token.0),
+            Ok(SandboxLaunch {
+                handle: SandboxHandle {
+                    guest_id: format!("guest-{}", spec.idem_token.0),
+                },
+                result: self.result.clone(),
             })
         }
         fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
@@ -954,17 +989,25 @@ mod tests {
             test_hooks(),
         );
 
-        let report = TerminalReport {
-            passed: true,
-            result_refs: vec![ArtifactRef("myelin://acme/ci/run/run-1/log".into())],
-        };
         let outcome = agent
-            .run_one(1000, 5, report.clone())
+            .run_one(1000)
             .expect("the runner runs the job and reports terminal");
 
         assert_eq!(outcome.job_id, "job-1");
         assert_eq!(outcome.run_id, run.0);
-        assert_eq!(outcome.report, report);
+        // the runner DERIVED the report from the backend's clean (exit 0) result.
+        assert!(
+            outcome.report.passed,
+            "a clean exit (0, not timed out) derives passed=true"
+        );
+        // result_refs carry the derived `ci.log.available` pointer (references-not-payloads).
+        assert_eq!(
+            outcome.report.result_refs,
+            vec![ArtifactRef(format!(
+                "myelin://acme/ci/run/{}/job/job-1/log.available",
+                run.0
+            ))]
+        );
         assert_eq!(
             outcome.signal_outcome,
             SignalOutcome::Buffered,
@@ -973,8 +1016,8 @@ mod tests {
         // exactly one launch + one whole-guest kill (one-job-per-sandbox, ephemeral).
         assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
         assert_eq!(backend.kills.load(Ordering::SeqCst), 1);
-        // the firehose streamed 5 frames (the CI-P20 stub observable).
-        assert_eq!(firehose.frames_shipped(), 5);
+        // the firehose streamed the captured stdout as one redacted frame (stderr was empty).
+        assert_eq!(firehose.frames_shipped(), 1);
         // the lease was settled (the claimed row removed).
         assert!(
             q.get(&tenant(), "job-1").is_none(),
@@ -1019,17 +1062,15 @@ mod tests {
             test_hooks(),
         );
 
-        let report = TerminalReport {
-            passed: true,
-            result_refs: vec![ArtifactRef("myelin://acme/ci/run/run-1/log".into())],
-        };
-        // first cycle: the FIRST job.done is Buffered (the workflow wakes).
-        let first = agent.run_one(1000, 3, report.clone()).expect("first cycle");
+        // first cycle: the FIRST job.done is Buffered (the workflow wakes). The runner DERIVES the
+        // report from the backend result (no longer an input).
+        let first = agent.run_one(1000).expect("first cycle");
         assert_eq!(first.signal_outcome, SignalOutcome::Buffered);
 
-        // the runner RE-delivers the SAME job.done (at-least-once) — keyed on the SAME idem_token.
+        // the runner RE-delivers the SAME job.done (at-least-once) — keyed on the SAME idem_token,
+        // passing the derived report directly (the job row is already settled after run_one).
         let again = agent
-            .report_done_again(&run.0, &idem, &report)
+            .report_done_again(&run.0, &idem, &first.report)
             .expect("re-delivery is the idempotency working, not an error");
         assert_eq!(
             again,
@@ -1083,14 +1124,7 @@ mod tests {
         );
 
         let err = agent
-            .run_one(
-                1000,
-                1,
-                TerminalReport {
-                    passed: true,
-                    result_refs: vec![],
-                },
-            )
+            .run_one(1000)
             .expect_err("a launch refusal fails closed");
         assert!(matches!(err, RunnerError::LaunchFailed(_)));
         // NO job.done was reported — the parked workflow is not falsely woken (§OQ-F retry).
@@ -1123,14 +1157,7 @@ mod tests {
             test_hooks(),
         );
         let err = agent
-            .run_one(
-                1000,
-                0,
-                TerminalReport {
-                    passed: true,
-                    result_refs: vec![],
-                },
-            )
+            .run_one(1000)
             .expect_err("an empty queue surfaces NoWork");
         assert!(matches!(err, RunnerError::NoWork));
         assert_eq!(
@@ -1194,7 +1221,21 @@ mod tests {
             vec!["linux".into()],
             ci_spec(&idem),
         ));
-        let backend = RecordingBackend::default();
+        // a backend whose result is a NON-zero exit + captured stderr — the runner DERIVES
+        // passed=false and ships the stderr to the firehose (NOT the signal payload).
+        let backend = RecordingBackend {
+            result: SandboxResult {
+                exit_code: Some(2),
+                timed_out: false,
+                usage: ResourceUsage {
+                    cpu_seconds: 1,
+                    mem_byte_seconds: 1,
+                },
+                stdout: Vec::new(),
+                stderr: b"compile error: E0001".to_vec(),
+            },
+            ..Default::default()
+        };
         let firehose = CountingFirehose::new();
         let reporter = EngineTerminalReporter::new(ex.clone());
         let agent = RunnerAgent::new(
@@ -1209,31 +1250,116 @@ mod tests {
             &reporter,
             test_hooks(),
         );
-        agent
-            .run_one(
-                1000,
-                1,
-                TerminalReport {
-                    passed: false,
-                    result_refs: vec![ArtifactRef("myelin://acme/ci/run/run-1#step-2".into())],
-                },
-            )
-            .expect("run");
+        agent.run_one(1000).expect("run");
+
+        // the captured stderr rode the FIREHOSE (one frame), never the signal payload.
+        assert_eq!(firehose.frames_shipped(), 1);
 
         // the buffered job.done is keyed on the idem_token the runner echoed.
         let row = ex
             .signals()
             .get(&tenant(), &run.0, JOB_DONE_SIGNAL, &idem)
             .expect("the job.done buffered under the echoed idem_token");
-        // references-not-payloads: the marker + the result ref, no log bytes / PII body.
+        // references-not-payloads: the DERIVED passed marker + the `ci.log.available` ref, never the
+        // captured stderr bytes (those went to the firehose).
         assert_eq!(
             row.payload[0],
             ArtifactRef("myelin://job-done/passed-false".into())
         );
         assert_eq!(
             row.payload[1],
-            ArtifactRef("myelin://acme/ci/run/run-1#step-2".into())
+            ArtifactRef(format!(
+                "myelin://acme/ci/run/{}/job/job-1/log.available",
+                run.0
+            ))
         );
         assert_eq!(row.payload_key_ref, None, "no inline PII payload");
+        // the raw stderr bytes never appear in the signal payload (references-not-payloads).
+        for r in &row.payload {
+            assert!(
+                !r.0.contains("compile error"),
+                "captured stream bytes must NEVER enter the engine signal payload"
+            );
+        }
+    }
+
+    /// **GATE — the runner DERIVES the terminal report from the SandboxResult (RESHAPE-001 / CT-001),
+    /// it is no longer an input.** A clean exit (0, not timed out) ⇒ passed=true; a non-zero exit ⇒
+    /// passed=false; a timeout ⇒ passed=false (regardless of exit code). This is the seam carrying a
+    /// command's outcome back, the defect RESHAPE-001 fixes.
+    #[test]
+    fn runner_derives_terminal_report_from_the_sandbox_result() {
+        fn run_with(result: SandboxResult) -> bool {
+            let (ex, run) = started_run();
+            let idem = job_idem_token(&run.0, "ci.pipeline:0");
+            let q = JobLeaseStore::new();
+            q.enqueue(QueuedJob::new(
+                tenant(),
+                region(),
+                &run.0,
+                "job-1",
+                vec!["linux".into()],
+                ci_spec(&idem),
+            ));
+            let backend = RecordingBackend {
+                result,
+                ..Default::default()
+            };
+            let firehose = CountingFirehose::new();
+            let reporter = EngineTerminalReporter::new(ex.clone());
+            let agent = RunnerAgent::new(
+                "worker-1",
+                vec!["linux".into()],
+                vec![TrustTier::Trusted],
+                region(),
+                30,
+                q,
+                &backend,
+                &firehose,
+                &reporter,
+                test_hooks(),
+            );
+            agent.run_one(1000).expect("run").report.passed
+        }
+
+        fn usage() -> ResourceUsage {
+            ResourceUsage {
+                cpu_seconds: 1,
+                mem_byte_seconds: 1,
+            }
+        }
+
+        // exit 0, not timed out ⇒ PASS.
+        assert!(run_with(SandboxResult {
+            exit_code: Some(0),
+            timed_out: false,
+            usage: usage(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }));
+        // exit 1 ⇒ FAIL.
+        assert!(!run_with(SandboxResult {
+            exit_code: Some(1),
+            timed_out: false,
+            usage: usage(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }));
+        // timed out ⇒ FAIL even though no exit code (killed by the timeout).
+        assert!(!run_with(SandboxResult {
+            exit_code: None,
+            timed_out: true,
+            usage: usage(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }));
+        // timed out with a stale 0 exit ⇒ still FAIL (timeout dominates).
+        assert!(!run_with(SandboxResult {
+            exit_code: Some(0),
+            timed_out: true,
+            usage: usage(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }));
     }
 }

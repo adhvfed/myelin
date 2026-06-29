@@ -396,15 +396,16 @@ impl<'a, B: SandboxBackend> SandboxToolHands<'a, B> {
         // The whole of execution goes through `launch` — there is no host-exec bypass (1.6). `launch`
         // fires: #4 isolation floor → #2 attribution → #1a reserve (refuse-on-exhaustion) → (guest
         // runs the compute) → #1b settle, in the mandated order (the backend owns the order).
-        let handle = self
+        let launch = self
             .backend
             .launch(job.spec(), &self.hooks)
             .map_err(ExecError::Launch)?;
         // Guarantee #4: whole-guest kill on teardown — the guest is destroyed, never reused.
-        self.backend.kill(&handle).map_err(ExecError::Kill)?;
-        // The result the hardened guest produced (the real backend captures stdout/exit; a shape
-        // stub returns its marker). references-not-payloads is the caller's concern (the trace).
-        Ok(ToolResult(format!("sandbox:{}", handle.guest_id)))
+        self.backend.kill(&launch.handle).map_err(ExecError::Kill)?;
+        // RESHAPE-001 / CT-001: the seam now returns `launch.result` (exit_code/stdout/stderr/usage/
+        // timed_out). Surfacing the compute result (exit/streams) into the agent trace is its own
+        // follow-on; here the X-6 routing equivalence is unchanged — we keep the guest-id marker.
+        Ok(ToolResult(format!("sandbox:{}", launch.handle.guest_id)))
     }
 
     /// Build the hardened `kind=agent` [`SandboxJob`] for a `compute` `def` + `cmd`, scoped to this
@@ -505,7 +506,7 @@ mod tests {
     use myelin_ci_sandbox::escape_corpus::{BEGIN_MARKER, END_MARKER};
     use myelin_ci_sandbox::{
         parse_console, Backend, BackendRun, EscapeAttestation, HookError, ReserveHandle,
-        ResourceUsage, SandboxHandle, CORPUS, CORPUS_VERSION,
+        ResourceUsage, SandboxHandle, SandboxLaunch, SandboxResult, CORPUS, CORPUS_VERSION,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
@@ -852,24 +853,25 @@ mod tests {
             &self,
             spec: &JobSpec,
             hooks: &RunnerHooks,
-        ) -> Result<SandboxHandle, Self::Error> {
+        ) -> Result<SandboxLaunch, Self::Error> {
             (hooks.isolation_floor)(spec)?;
             self.order.lock().unwrap().push("isolation_floor");
             (hooks.attribute)(&spec.run_token)?;
             self.order.lock().unwrap().push("attribute");
             let res = (hooks.reserve)(&spec.meter_to)?;
             self.order.lock().unwrap().push("reserve");
-            // ... the hardened guest runs the compute here ...
-            (hooks.settle)(
-                &res,
-                ResourceUsage {
-                    cpu_seconds: 1,
-                    mem_byte_seconds: 1,
-                },
-            )?;
+            // ... the hardened guest runs the compute here; the seam carries the result back ...
+            let result = SandboxResult::stub_ok(ResourceUsage {
+                cpu_seconds: 1,
+                mem_byte_seconds: 1,
+            });
+            (hooks.settle)(&res, result.usage)?;
             self.order.lock().unwrap().push("settle");
-            Ok(SandboxHandle {
-                guest_id: "agent-guest".into(),
+            Ok(SandboxLaunch {
+                handle: SandboxHandle {
+                    guest_id: "agent-guest".into(),
+                },
+                result,
             })
         }
         fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {

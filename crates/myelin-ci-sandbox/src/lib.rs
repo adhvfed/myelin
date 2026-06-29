@@ -423,6 +423,84 @@ pub struct SandboxHandle {
     pub guest_id: String,
 }
 
+/// The **per-stream capture bound** for [`SandboxResult`] (RESHAPE-001 / CT-001). Captured guest
+/// `stdout`/`stderr` are bounded to this many bytes EACH at the seam — a HEAD capture, so a runaway
+/// guest cannot OOM the runner. The *full* stream rides the firehose → the `ci.log.available`
+/// pointer (CI-P20), never the engine signal payload (references-not-payloads at the signal
+/// boundary). The bound is enforced when CT-002 wires real capture; the SHAPE carries it now.
+pub const SANDBOX_CAPTURE_BOUND: usize = 256 * 1024;
+
+/// **The result of running a job's command inside the sandbox (RESHAPE-001 / CT-001).** This is the
+/// in-line compute outcome the runner DERIVES its [`TerminalReport`](crate::runner::TerminalReport)
+/// from — `passed = exit_code == Some(0) && !timed_out`. Before this reshape the seam could carry
+/// NOTHING about the command's outcome (the handle was `{ guest_id }` only and the runner took the
+/// terminal report as an INPUT parameter); now the outcome flows back through the seam.
+///
+/// **References-not-payloads at the SIGNAL boundary:** `stdout`/`stderr` are BOUNDED capture (see
+/// [`SANDBOX_CAPTURE_BOUND`]) for the runner to ship through the firehose as redacted frames; they
+/// are NEVER placed in the `job.done` engine signal payload (that stays `ArtifactRef`s only — the
+/// `ci.log.available` pointer the firehose pipeline publishes).
+///
+/// At CT-001 a backend returns a STUB value (exit 0, empty streams, stub usage) — the FIELD shape
+/// must exist and FLOW. CT-002 fills in the real Firecracker boot + gVisor `runsc run` that runs
+/// `spec.command`, captures the streams, enforces `spec.limits.timeout_secs` (setting `timed_out`),
+/// and reports the measured [`ResourceUsage`] (it reuses the inner backend `wait` already present).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SandboxResult {
+    /// The guest command's exit code — `None` if the guest was killed by signal/timeout (no code).
+    pub exit_code: Option<i32>,
+    /// Whether the wall-clock `timeout_secs` ceiling fired (the whole guest was killed). A timed-out
+    /// job is NOT a pass regardless of any partial exit code.
+    pub timed_out: bool,
+    /// The measured resource usage (the resource-seconds metering unit, arch §8) — handed to the
+    /// guarantee-#1 settle hook so metering settles against what the job actually consumed. Stub at
+    /// CT-001; measured at CT-002.
+    pub usage: ResourceUsage,
+    /// Bounded ([`SANDBOX_CAPTURE_BOUND`]) captured guest stdout — for the firehose/log pipeline, NOT
+    /// the signal payload.
+    pub stdout: Vec<u8>,
+    /// Bounded ([`SANDBOX_CAPTURE_BOUND`]) captured guest stderr — for the firehose/log pipeline, NOT
+    /// the signal payload.
+    pub stderr: Vec<u8>,
+}
+
+impl SandboxResult {
+    /// Whether the job PASSED — `exit_code == Some(0)` AND it did not time out. This is the single
+    /// derivation point the runner uses to build `TerminalReport.passed` (no longer a parameter).
+    pub fn passed(&self) -> bool {
+        self.exit_code == Some(0) && !self.timed_out
+    }
+
+    /// A CT-001 STUB clean result (exit 0, no timeout, empty streams, the given `usage`). CT-002
+    /// replaces this with the real captured outcome. Centralised so backends do not hand-roll the
+    /// stub shape (anti-duplication).
+    pub fn stub_ok(usage: ResourceUsage) -> SandboxResult {
+        SandboxResult {
+            exit_code: Some(0),
+            timed_out: false,
+            usage,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+}
+
+/// **What [`SandboxBackend::launch`] returns (RESHAPE-001 / CT-001, shape A).** The teardown
+/// [`SandboxHandle`] PLUS the command [`SandboxResult`]. `launch` BLOCKS for the in-line compute job
+/// (matching the trait's documented semantics: it returns when the guest is up and, for an in-line
+/// job, has run) and returns both — `kill(handle)` still tears the guest down (idempotent if the
+/// guest already exited). This is preferred over a separate `wait()` method: the in-line compute
+/// path is a single blocking call, so one return value (handle + result) keeps every call site's
+/// control flow linear; the long-park path keeps using [`SandboxBackend::accept_async`] +
+/// `job.done`, which is a different lifecycle entirely.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SandboxLaunch {
+    /// The teardown handle the caller MUST eventually [`kill`](SandboxBackend::kill).
+    pub handle: SandboxHandle,
+    /// The command's result — the runner DERIVES the terminal report from it.
+    pub result: SandboxResult,
+}
+
 /// The sandbox backend (arch 01 §2): Firecracker (default) | Gvisor (named 2nd) | SelfHosted
 /// (delegated). The **trait SHAPE only** at P-129 — the Firecracker impl is CI-P2 (→ P-237), the
 /// gVisor impl is CI-P28, the self-hosted impl is CI-P4. `launch` carries the [`RunnerHooks`]
@@ -436,9 +514,13 @@ pub trait SandboxBackend {
     type Error: std::error::Error;
 
     /// Launch a job in a fresh, ephemeral, one-job-per-sandbox guest, applying the mandatory
-    /// hardening profile (arch 02 §5.3) and wiring the four-guarantee `hooks` (arch 02 §5.2).
-    /// Returns a [`SandboxHandle`] the caller MUST eventually [`kill`](SandboxBackend::kill).
-    fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxHandle, Self::Error>;
+    /// hardening profile (arch 02 §5.3) and wiring the four-guarantee `hooks` (arch 02 §5.2). For an
+    /// in-line compute job `launch` BLOCKS for the duration and returns a [`SandboxLaunch`] carrying
+    /// BOTH the teardown [`SandboxHandle`] (the caller MUST eventually [`kill`](SandboxBackend::kill)
+    /// it — idempotent if the guest already exited) AND the command's [`SandboxResult`]
+    /// (exit/timeout/usage/captured-streams). The runner DERIVES its terminal report from the
+    /// result; it is no longer supplied as an input (RESHAPE-001 / CT-001).
+    fn launch(&self, spec: &JobSpec, hooks: &RunnerHooks) -> Result<SandboxLaunch, Self::Error>;
 
     /// Whole-guest kill on teardown (arch 01 §2): the guest is destroyed, never reused across
     /// tenants/jobs. Idempotent (killing an already-dead guest is a no-op success).
@@ -878,21 +960,24 @@ mod tests {
             &self,
             spec: &JobSpec,
             hooks: &RunnerHooks,
-        ) -> Result<SandboxHandle, Self::Error> {
+        ) -> Result<SandboxLaunch, Self::Error> {
             // Drive the four-guarantee seam exactly as a real backend must:
             (hooks.isolation_floor)(spec)?; // #4 isolation floor
             (hooks.attribute)(&spec.run_token)?; // #2 attribution
             let res = (hooks.reserve)(&spec.meter_to)?; // #1a cost gate (reserve)
                                                         // ... the guest would run here (a real backend launches the hardened VM) ...
-            (hooks.settle)(
-                &res,
-                ResourceUsage {
-                    cpu_seconds: 1,
-                    mem_byte_seconds: 1,
+            // CT-001: the seam now carries the command result; the metering settle (guarantee #1)
+            // settles against `result.usage`.
+            let result = SandboxResult::stub_ok(ResourceUsage {
+                cpu_seconds: 1,
+                mem_byte_seconds: 1,
+            });
+            (hooks.settle)(&res, result.usage)?; // #1b settle (against the result's usage)
+            Ok(SandboxLaunch {
+                handle: SandboxHandle {
+                    guest_id: "noop-guest".into(),
                 },
-            )?; // #1b settle
-            Ok(SandboxHandle {
-                guest_id: "noop-guest".into(),
+                result,
             })
         }
         fn kill(&self, _h: &SandboxHandle) -> Result<(), Self::Error> {
@@ -913,9 +998,13 @@ mod tests {
     fn sandbox_backend_launch_drives_the_four_guarantee_hooks() {
         let backend = NoopBackend;
         let hooks = test_hooks();
-        let handle = backend.launch(&ci_spec(), &hooks).unwrap();
-        assert_eq!(handle.guest_id, "noop-guest");
-        backend.kill(&handle).unwrap();
+        let launch = backend.launch(&ci_spec(), &hooks).unwrap();
+        assert_eq!(launch.handle.guest_id, "noop-guest");
+        // The seam now carries the command result back (CT-001 stub): a clean exit, not timed out.
+        assert_eq!(launch.result.exit_code, Some(0));
+        assert!(!launch.result.timed_out);
+        assert!(launch.result.passed());
+        backend.kill(&launch.handle).unwrap();
     }
 
     #[test]
