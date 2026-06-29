@@ -1,0 +1,62 @@
+[package]
+name = "myelin-cli"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The `myelin` CLI (E0.9 / MR-020): the ONE local command surface a HUMAN or an AGENT drives the
+# product through. It is an edge CLIENT — it presents a REAL capability token as `Authorization:
+# Bearer <paseto>` and calls the MR-014 gateway's `/v1/...` endpoints, under the SAME auth + audit a
+# browser session is (agent governance from day one). A LEAF BINARY: it depends on the subsystem
+# command grammars (myelin-git `api::parse_cli`, myelin-notif `cli`) + a tiny HTTP client, and NOTHING
+# in the production crate DAG depends back on it. Like myelin-edge it is NOT a node in the eleven-crate
+# library DAG modelled by myelin-substrate::crate_graph (substrate_is_root()/identity_is_sink()
+# unaffected). See src/lib.rs.
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "myelin"
+path = "src/main.rs"
+
+[dependencies]
+# clap — the arg-parsing framework the ledger names ("clap binary"). It owns ONLY the top-level shell
+# (`myelin <subsystem> ...` + the global flags + `login`/`whoami`); the per-subsystem command SET is
+# REUSED from the subsystem crates (anti-duplication), so a new git command in api.rs flows to the CLI
+# without re-declaring it here.
+clap = { version = "4", features = ["derive"] }
+
+# REUSE the git CLI command grammar (api::parse_cli / CliCommand) — the CLI does NOT re-derive git's
+# commands; it parses with git's own total parser and maps the parsed command to the edge route.
+myelin-git = { path = "../myelin-git" }
+# REUSE the notif CLI grammar (cli::CliView — the named scoped views + verb set).
+myelin-notif = { path = "../myelin-notif" }
+
+# The {items,page} + {error:{message,code}} envelopes + the rendered view-models are serde_json::Value
+# (the one workspace-pinned JSON shape) — the CLI parses/renders them directly.
+serde_json = { workspace = true }
+
+# ----------------------------------------------------------------------------------------------
+# THE HTTP CLIENT — hyper 1.x DIRECTLY (no reqwest). Every crate below is ALREADY in Cargo.lock (the
+# myelin-edge transport promoted exactly these), so the CLI's edge client adds ZERO new crates to the
+# tree. reqwest is NOT in the lock and would pull a large subtree (reqwest / h2 / tower / ...) —
+# rejected, same minimal-deps discipline the edge used to reject axum (frontend canon §0).
+# ----------------------------------------------------------------------------------------------
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["rt", "net", "macros", "io-util"] }
+
+[dev-dependencies]
+# The integration proof spins up the REAL edge in-process (a known cell seed so a token can be minted
+# — the deployable `edge` binary generates a random cell with no mint API yet) over a real TCP socket,
+# then runs the `myelin` binary as a subprocess against it. These build the gateway + mint a REAL
+# PASETO capability token (genuine Ed25519 crypto).
+myelin-edge = { path = "../myelin-edge" }
+myelin-identity = { path = "../myelin-identity" }
+myelin-identity-service = { path = "../myelin-identity-service" }
+myelin-storage = { path = "../myelin-storage" }
+myelin-tenancy = { path = "../myelin-tenancy" }
