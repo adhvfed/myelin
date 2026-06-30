@@ -363,3 +363,20 @@ green: pg connect, s3 put/get, rebac tuples, outbox→bus relay, valkey cache):
   structurally absent — the Authorizer seam is (principal,action) only, repo-blind, so intra-tenant any token
   reads any repo (same as the durable read handlers; Identity-M1 ReBAC deferral). Cross-tenant isolation IS
   enforced.** Final git-wire prompt = CT-006d (the push path).
+
+- **CT-006d — git PUSH path — COMMITTED fd0eb19. THE GIT SMART-TRANSPORT WIRE IS COMPLETE (clone/fetch/push
+    all real through the sandbox).** Solved the rootless writable-quarantine by NOT running server-side
+  `git receive-pack`: the sandbox only INGESTS (index-pack validates the untrusted pack against the RO repo via
+  alternates, cat-file streams resolved objects out); the durable ref move is trusted in-process host code
+  (stage in a throwaway quarantine → fsck/connectivity/ff → in-process PushPolicy secret/size/pseudonymity
+  BEFORE migration → write_raw_object re-hashes (forged oid impossible) → one-tx ref-CAS + outbox, reusing the
+  kill-9-proven receive_pack.rs). HTTP git-receive-pack endpoints write-gated (git.wire.receive_pack) + cross-
+  tenant/IDOR refused. External-oracle: real `git push` lands durably (fresh DurableGitStore re-open sees the
+  ref), fsck clean, outbox emit-iff-committed; secret/unauth/cross-tenant rejected with the ref unmoved + the
+  secret blob ABSENT from the real odb. Independent security verifier: PASS — write-authz before migration,
+  forged-oid impossible, policy-before-migration proven, 0-ghost/0-lost via the same one-tx path, /repo RO during
+  ingest, honest report-status, escapes 0. FOLLOW-UP (task #61, bounded, NOT a breach): non-ff reject migrates
+  objects before the CAS check → GC'able dangling objects (same-tenant authenticated crafted-client; fsck-clean;
+  ref never moves). **GIT DAILY DRIVER COMPLETE: GT-001..005 (durable backend/backup/API/UI/CLI/MCP) + CT-006a-d
+  (the wire). Next CI-track: CT-004 (backend harden) → CT-005 (API/UI/CLI/MCP) → CT-007 (cut over from GitHub
+  Actions, the reward, gated on CT-003 which is green).**
