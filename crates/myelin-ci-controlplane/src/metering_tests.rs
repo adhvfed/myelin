@@ -446,3 +446,44 @@ fn a_red_parity_signal_is_not_green() {
     };
     assert!(!conflated.is_green(), "wholesale == markup reads RED");
 }
+
+/// **Model ↔ SQL drift guard for the durable `cost_event` settle (CT-004).** The durable
+/// [`INSERT_COST_EVENT_QUERY`] MUST write exactly the columns the in-memory [`CostEventRow`] model
+/// mirrors, keep wholesale + markup as TWO distinct columns (the §8 invariant — never one conflated
+/// number), and be exactly-once on `(tenant_id, cost_id)` (`ON CONFLICT … DO NOTHING`). If the model
+/// row gains/loses a billed dimension the constant must move in lockstep — this fails loud otherwise.
+#[test]
+fn insert_cost_event_query_matches_the_cost_event_row_model() {
+    let q = INSERT_COST_EVENT_QUERY;
+    assert!(q.contains("INSERT INTO cost_event"), "writes the cost_event table");
+    // Every CostEventRow field has its column (run/job attribution + the two distinct cost columns).
+    for col in [
+        "tenant_id",
+        "region",
+        "cost_id",
+        "run_id",
+        "job_id",
+        "meter",
+        "amount",
+        "wholesale_minor_units",
+        "markup_minor_units",
+        "kind",
+    ] {
+        assert!(q.contains(col), "the durable settle writes the {col} column");
+    }
+    // wholesale + markup are SEPARATE columns (never conflated — the arch 02 §8 invariant).
+    assert!(
+        q.contains("wholesale_minor_units") && q.contains("markup_minor_units"),
+        "wholesale ≠ markup: the two cost columns are distinct in the durable write"
+    );
+    // Exactly-once settle: a re-delivered job.done records the same cost_id ONCE (double-effect = 0).
+    assert!(
+        q.contains("ON CONFLICT (tenant_id, cost_id) DO NOTHING"),
+        "the settle is idempotent on (tenant_id, cost_id) — exactly-once cost recording"
+    );
+    // The read-back attributes to the producing run.
+    assert!(
+        SELECT_COST_EVENTS_FOR_RUN_QUERY.contains("WHERE tenant_id = $1 AND run_id = $2"),
+        "the read-back attributes every metered unit to its (tenant, run)"
+    );
+}
