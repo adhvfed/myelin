@@ -43,7 +43,7 @@ const UPLOAD_PACK_ADV: &str = "application/x-git-upload-pack-advertisement";
 const UPLOAD_PACK_RESULT: &str = "application/x-git-upload-pack-result";
 
 /// pkt-line a payload: a 4-hex length prefix counting itself + the payload bytes (`001e# service…\n`).
-fn pkt_line(payload: &str) -> Vec<u8> {
+pub(crate) fn pkt_line(payload: &str) -> Vec<u8> {
     let mut v = format!("{:04x}", payload.len() + 4).into_bytes();
     v.extend_from_slice(payload.as_bytes());
     v
@@ -51,7 +51,7 @@ fn pkt_line(payload: &str) -> Vec<u8> {
 
 /// A raw (non-JSON) byte response with an explicit content-type — the git wire bytes are NOT a JSON
 /// view-model, so the smart-HTTP body is emitted verbatim.
-fn raw(status: u16, content_type: &str, body: Vec<u8>) -> EdgeResponse {
+pub(crate) fn raw(status: u16, content_type: &str, body: Vec<u8>) -> EdgeResponse {
     EdgeResponse::Bytes {
         status,
         content_type: content_type.to_string(),
@@ -66,7 +66,7 @@ fn raw(status: u16, content_type: &str, body: Vec<u8>) -> EdgeResponse {
 /// Resolve the `(tenant, region, repo)` for the lookup from the VERIFIED token scope (never the URL —
 /// GIT-D8) + the URL's `{repo}` segment with its `.git` suffix stripped (the resolver re-appends `.git`,
 /// so a raw `widgets.git` would otherwise resolve to `widgets.git.git`).
-fn repo_loc(ctx: &HandlerCtx<'_>) -> Result<RepoLoc, EdgeError> {
+pub(crate) fn repo_loc(ctx: &HandlerCtx<'_>) -> Result<RepoLoc, EdgeError> {
     let repo_seg = param(ctx, "repo")?;
     let slug = repo_seg.strip_suffix(".git").unwrap_or(repo_seg);
     if slug.is_empty() {
@@ -100,6 +100,20 @@ fn map_wire_err(e: &GitCoreError) -> EdgeError {
     }
 }
 
+/// Map a durable-backend error from a push path to an edge status. A repo absent under the verified
+/// tenant is the 0-leak 404 (a cross-tenant/non-existent repo "is not found"); a traversal-rejected
+/// slug is a 400; anything else is a 500 — never a silent empty/200.
+fn map_durable_to_wire(e: myelin_git::durable::DurableError) -> EdgeError {
+    use myelin_git::durable::DurableError;
+    match e {
+        DurableError::NotFound(_) => EdgeError::NotFound("repository not found".into()),
+        DurableError::Git(m) if m.contains("traversal") || m.contains("segment") || m.contains("slug") => {
+            EdgeError::BadRequest(m)
+        }
+        other => EdgeError::Internal(format!("git push error: {other}")),
+    }
+}
+
 /// `GET /<tenant>/<region>/<repo>.git/info/refs?service=git-upload-pack` — the smart-HTTP ref
 /// advertisement (the first half of a clone/fetch handshake).
 struct WireInfoRefs {
@@ -108,11 +122,20 @@ struct WireInfoRefs {
 impl Handler for WireInfoRefs {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let service = ctx.request.query_param("service").unwrap_or_default();
-        // Only the read service (clone/fetch) is served here; receive-pack (push) is CT-006d.
+        // The push (receive-pack) ref advertisement (CT-006d): built IN-PROCESS from the durable repo's
+        // refs with a restricted capability set (no side-band / report-status-v2 / atomic). A pure read
+        // of our own tenant-scoped repo — no sandbox needed.
         if service == "git-receive-pack" {
-            return Err(EdgeError::Forbidden(
-                "push (git-receive-pack) is not yet served over the wire — CT-006d".into(),
-            ));
+            let loc = repo_loc(ctx)?;
+            let refs = self
+                .be
+                .receive_pack_refs(loc.tenant.as_str(), loc.region.as_str(), loc.repo.as_str())
+                .map_err(map_durable_to_wire)?;
+            // Smart-HTTP framing: pkt-line("# service=git-receive-pack\n") + flush + the advertisement.
+            let mut body = pkt_line("# service=git-receive-pack\n");
+            body.extend_from_slice(b"0000");
+            body.extend_from_slice(&crate::git_receive_pack::build_receive_pack_refs(&refs));
+            return Ok(raw(200, crate::git_receive_pack::RECEIVE_PACK_ADV, body));
         }
         if service != "git-upload-pack" {
             // A dumb-HTTP client (no `?service=`) is unsupported — Myelin serves smart-HTTP only.
@@ -165,17 +188,29 @@ impl Handler for WireUploadPack {
     }
 }
 
-/// `POST /<tenant>/<region>/<repo>.git/git-receive-pack` — push is NOT yet served over the wire. The
-/// durable quarantine-intake + one-tx ref-CAS + outbox push path is **CT-006d**. A LOUD 403 (never a
-/// silent accept) so a client's `git push` fails honestly.
-struct WireReceivePack;
+/// `POST /<tenant>/<region>/<repo>.git/git-receive-pack` — the PUSH (CT-006d). Drives
+/// [`DurableGitBackend::receive_pack`]: parse the ref-update commands + packfile, ingest the untrusted
+/// pack in the hardened sandbox, run the in-process policy + the one-tx ref-CAS + `git.ref.updated`
+/// outbox emit, and return the `report-status`. The gateway has already authenticated + authorized the
+/// WRITE action (`git.wire.receive_pack`) + rejected any cross-tenant IDOR; the operating `(tenant,
+/// region)` is the VERIFIED token's (never the URL).
+struct WireReceivePack {
+    be: Arc<DurableGitBackend>,
+}
 impl Handler for WireReceivePack {
-    fn handle(&self, _ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        Err(EdgeError::Forbidden(
-            "push (git-receive-pack) is not yet served over the wire — CT-006d (the durable \
-             quarantine-intake + one-tx ref-CAS push path)"
-                .into(),
-        ))
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let loc = repo_loc(ctx)?;
+        let body = self
+            .be
+            .receive_pack(
+                loc.tenant.as_str(),
+                loc.region.as_str(),
+                loc.repo.as_str(),
+                ctx.principal,
+                &ctx.request.body,
+            )
+            .map_err(map_durable_to_wire)?;
+        Ok(raw(200, crate::git_receive_pack::RECEIVE_PACK_RESULT, body))
     }
 }
 
@@ -203,7 +238,7 @@ pub fn register_git_wire(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -> G
         Method::Post,
         "/{tenant}/{region}/{repo}/git-receive-pack",
         "git.wire.receive_pack",
-        Arc::new(WireReceivePack),
+        Arc::new(WireReceivePack { be: be.clone() }),
     );
     b
 }

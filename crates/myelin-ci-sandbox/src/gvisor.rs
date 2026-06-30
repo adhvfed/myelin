@@ -1174,6 +1174,53 @@ pub fn gvisor_drill_config_json(spec: &JobSpec, script_name: &str) -> Result<Str
 pub const WIRE_REPO_MOUNT: &str = "/repo";
 /// The fixed guest mount point for the WRITABLE push-object quarantine (`receive-pack` intake).
 pub const WIRE_QUARANTINE_MOUNT: &str = "/quarantine";
+
+/// **The receive-pack PACK-INGEST script (CT-006d) — the in-sandbox writable-quarantine solution.**
+///
+/// The push write path's hardest constraint: a host bind-mounted `/quarantine` is NOT writable by the
+/// in-guest non-root uid 65534 under rootless `runsc` (a write fails EINVAL on the gofer). So the
+/// quarantine lives entirely in the guest's OWN writable `/tmp` tmpfs (writable by 65534 — the SAME
+/// tmpfs `git upload-pack` already uses for `HOME`), and the ingested objects are streamed OUT to the
+/// host on stdout (captured by the existing wire stdout streaming), NEVER through a host bind.
+///
+/// Step by step (busybox `sh`; the canonical `git` does ALL pack parsing — the UNTRUSTED client pack is
+/// parsed only HERE, inside the hardened sandbox, never on the host):
+///   1. `git init --bare /tmp/q` — a throwaway quarantine repo on the writable tmpfs.
+///   2. `objects/info/alternates → /repo/objects` — so a THIN pack's delta bases (objects already in the
+///      RO real repo) resolve. `/repo` stays READ-ONLY (alternates only READ it).
+///   3. `git index-pack --stdin --fix-thin` — ingest the pushed pack from stdin into the quarantine's
+///      `objects/pack/`, VALIDATING every object's sha + the pack checksum and resolving deltas against
+///      the alternates. A corrupt/forged/incomplete pack (a base neither sent nor present) makes
+///      `index-pack` exit non-zero → the launch reports the failure and the host rejects the push (no
+///      objects migrate, no ref moves). Its progress/stats go to stderr (`1>&2`) so they never corrupt
+///      the object stream on stdout.
+///   4. `verify-pack -v … | awk` — list the oids the push INTRODUCED (exactly the objects in the received
+///      pack); `git cat-file --batch` then streams each as a FULLY-RESOLVED raw object
+///      (`<oid> SP <type> SP <size>\n<payload>\n`) on stdout — deltas already applied. The host parses
+///      this trivial framing (NO pack indexer runs on the host over untrusted bytes), re-hashes each
+///      object (a forged oid is impossible — git2's `odb.write` recomputes the sha), runs the in-process
+///      policy + connectivity check, and ONLY THEN migrates the objects into the real repo under the
+///      one-tx ref-CAS + outbox. `git receive-pack` is deliberately NEVER run server-side (it would
+///      update the RO real repo's refs) — the in-sandbox git ONLY ingests bytes; the ref move is the
+///      trusted in-process host code's job alone.
+///
+/// NO untrusted data is interpolated into this script — the pushed pack arrives only on stdin, never as
+/// an argv/shell token; the ref-update commands are parsed by the host BEFORE the sandbox is invoked.
+pub const RECEIVE_PACK_INGEST_SCRIPT: &str = "set -e
+export HOME=/tmp
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_EXEC_PATH=/usr/lib/git-core
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=safe.directory
+export GIT_CONFIG_VALUE_0=*
+export GIT_DIR=/tmp/q
+rm -rf /tmp/q
+git init --bare -q /tmp/q
+printf '%s\\n' /repo/objects > /tmp/q/objects/info/alternates
+git index-pack --stdin --fix-thin 1>&2
+git verify-pack -v /tmp/q/objects/pack/pack-*.idx | awk '$2 ~ /^(commit|tree|blob|tag)$/ {print $1}' > /tmp/oids
+git cat-file --batch < /tmp/oids
+";
 /// The documented cap on the stateless-rpc REQUEST BODY (stdin) the wire delivers into the guest —
 /// 64 MiB. A larger body is REFUSED fail-closed before any container spawns (a client cannot force the
 /// host to buffer an unbounded request). CT-006b may revisit this for very large pushes (chunked
@@ -1347,11 +1394,26 @@ pub fn resolve_bare_repo_path(
 /// canonicalized `root`. Fail-closed: a symlinked final component, a non-directory, an unstat-able
 /// path, or a canonical path that leaves the root is REFUSED (`WireError::Path`).
 ///
-/// Two complementary checks (defence in depth):
+/// THREE complementary checks (defence in depth):
 ///   - `symlink_metadata` (does NOT follow the FINAL component) ⇒ a `<repo>.git` symlink is caught
 ///     even when it points back INSIDE the root;
-///   - `canonicalize` + `starts_with(canonical_root)` ⇒ a symlinked INTERMEDIATE component (or a
-///     final symlink pointing OUTSIDE) that escapes the tree is caught.
+///   - **per-component lstat of every attacker-influenced segment** (CT-006b FU-2) ⇒ a symlinked
+///     INTERMEDIATE component (`<tenant>` or `<region>` planted as a symlink) is REFUSED *even when it
+///     resolves UNDER the root* — a `canonicalize`+`starts_with` check alone would "launder" such an
+///     intermediate symlink (it resolves under root, so `starts_with` passes), yet the bind mount binds
+///     the NON-canonical path and would FOLLOW that symlink. lstat-ing each segment closes that gap;
+///   - `canonicalize` + `starts_with(canonical_root)` ⇒ a final symlink pointing OUTSIDE (belt-and-
+///     braces with the first check) is caught.
+///
+/// **The check→mount TOCTOU.** These checks run on the host immediately before the OCI bundle is
+/// staged + `runsc` is spawned; a sufficiently-privileged local attacker could in principle swap a
+/// path component between the check and the gofer's `open` (a classic TOCTOU). It is closed AS FAR AS
+/// PRACTICAL here by (a) refusing ANY symlink in the path (so the only swap that helps is creating a
+/// brand-new symlink in a window of microseconds — and the path segments are allowlist-validated single
+/// names a tenant cannot point cross-tenant), and (b) the repo is bound READ-ONLY (a follow cannot
+/// WRITE the victim). A fully race-free guarantee needs `openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH)` +
+/// passing the resolved fd to the runtime, which the OCI/runsc bundle API does not yet expose — noted
+/// as the residual; the bind stays RO and non-root so a successful race still cannot mutate the tree.
 pub fn assert_repo_under_root(root: &Path, repo_host_path: &Path) -> Result<(), WireError> {
     let meta = std::fs::symlink_metadata(repo_host_path).map_err(|e| {
         WireError::Path(format!(
@@ -1375,6 +1437,30 @@ pub fn assert_repo_under_root(root: &Path, repo_host_path: &Path) -> Result<(), 
             "git root {root:?} could not be canonicalized ({e}) — refused before mount (fail-closed)"
         ))
     })?;
+    // FU-2: lstat EVERY attacker-influenced segment below the root (`<tenant>/<region>/<repo>.git`).
+    // A symlink at ANY of them is refused — even one that resolves UNDER the root — because the bind
+    // mount follows the non-canonical path. The segments are the suffix of `repo_host_path` past `root`.
+    let rel = repo_host_path.strip_prefix(root).map_err(|_| {
+        WireError::Path(format!(
+            "repo path {repo_host_path:?} is not under the configured git root {root:?} — refused \
+             before mount (fail-closed)"
+        ))
+    })?;
+    let mut cur = canon_root.clone();
+    for comp in rel.components() {
+        cur = cur.join(comp.as_os_str());
+        let m = std::fs::symlink_metadata(&cur).map_err(|e| {
+            WireError::Path(format!(
+                "repo path component {cur:?} is not present/stat-able ({e}) — refused before mount"
+            ))
+        })?;
+        if m.file_type().is_symlink() {
+            return Err(WireError::Path(format!(
+                "repo path component {cur:?} is a SYMLINK — refused before mount (an intermediate \
+                 symlink, even one resolving UNDER the root, is a bind-mount-follow vector; FU-2)"
+            )));
+        }
+    }
     let canon_repo = std::fs::canonicalize(repo_host_path).map_err(|e| {
         WireError::Path(format!(
             "repo path {repo_host_path:?} could not be canonicalized ({e}) — refused before mount \
@@ -1468,6 +1554,48 @@ impl GvisorBackend {
         spec: &GitWireSpec,
         hooks: &RunnerHooks,
     ) -> Result<SandboxLaunch, WireError> {
+        // The guest command: `git <argv> /repo` (the RO repo mount is the final argument).
+        let mut command = Vec::with_capacity(spec.git_argv.len() + 2);
+        command.push("git".to_string());
+        command.extend(spec.git_argv.iter().cloned());
+        command.push(WIRE_REPO_MOUNT.to_string());
+        self.launch_git_command(spec, hooks, command)
+    }
+
+    /// **Ingest a pushed packfile in the hardened sandbox (CT-006d — the push write path's untrusted-pack
+    /// intake).** The pushed pack is piped to stdin; the guest runs [`RECEIVE_PACK_INGEST_SCRIPT`]
+    /// (`git index-pack --fix-thin` into a writable `/tmp` tmpfs quarantine, NEVER the RO `/repo`) and
+    /// streams the VALIDATED, self-contained quarantine pack back on stdout. The host then stages that
+    /// pack in a throwaway odb, runs the in-process policy + fsck, and migrates it under the one-tx
+    /// ref-CAS — the in-sandbox `git` ONLY ingests bytes, it never moves a ref or touches the real repo.
+    /// Same four-guarantee seam + hardening floor + RO `/repo` mount as [`Self::launch_git_wire`].
+    pub fn launch_git_receive_pack(
+        &self,
+        spec: &GitWireSpec,
+        hooks: &RunnerHooks,
+    ) -> Result<SandboxLaunch, WireError> {
+        // The guest entrypoint is busybox `sh` running the FIXED ingest script — no `/repo` is appended
+        // (the script references the RO `/repo` mount itself, for the thin-pack alternates), and no
+        // untrusted data is interpolated (the pack arrives only on stdin).
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            RECEIVE_PACK_INGEST_SCRIPT.to_string(),
+        ];
+        self.launch_git_command(spec, hooks, command)
+    }
+
+    /// The shared git-wire launch body (CT-006a/d): bound stdin, symlink-confine the repo, build the
+    /// hardened internal `JobSpec`, drive the four-guarantee seam, mount the RO repo (+ optional writable
+    /// quarantine bind), run the container streaming the bounded request body to stdin + capturing the
+    /// bounded response from stdout. `command` is the fully-built guest argv (`git <argv> /repo` for the
+    /// wire serve, or the `sh -c <ingest>` for receive-pack) — the ONLY thing that differs between callers.
+    fn launch_git_command(
+        &self,
+        spec: &GitWireSpec,
+        hooks: &RunnerHooks,
+        command: Vec<String>,
+    ) -> Result<SandboxLaunch, WireError> {
         // Bound the request body BEFORE anything spawns (a client cannot force unbounded host buffering).
         if spec.stdin.len() > WIRE_STDIN_BOUND {
             return Err(WireError::StdinTooLarge {
@@ -1479,11 +1607,6 @@ impl GvisorBackend {
         // the canonicalized root before it is bind-mounted (a symlinked `<repo>.git`/component cannot
         // make the RO mount follow out of the tenant tree). REFUSED here, before any container spawns.
         assert_repo_under_root(&spec.root, &spec.repo_host_path)?;
-        // The guest command: `git <argv> /repo` (the RO repo mount is the final argument).
-        let mut command = Vec::with_capacity(spec.git_argv.len() + 2);
-        command.push("git".to_string());
-        command.extend(spec.git_argv.iter().cloned());
-        command.push(WIRE_REPO_MOUNT.to_string());
         // Build the internal hardened JobSpec so the git wire inherits the SAME profile + guarantees as
         // every CI/agent job (the image is a placeholder — gVisor runs the staged rootfs, not an image).
         let image = ImageRef::pinned(

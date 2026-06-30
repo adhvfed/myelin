@@ -135,6 +135,58 @@ impl GitWireExecutor {
     }
 }
 
+impl GitWireExecutor {
+    /// **Ingest a pushed packfile in the hardened sandbox (CT-006d).** Drives
+    /// [`GvisorBackend::launch_git_receive_pack`]: the UNTRUSTED client pack is piped to the sandbox,
+    /// `git index-pack --fix-thin` validates + resolves it against the RO `/repo` alternates inside the
+    /// writable `/tmp` tmpfs quarantine (never the real repo), and the FULLY-RESOLVED objects are streamed
+    /// back as a `git cat-file --batch` stream (`<oid> <type> <size>\n<payload>\n` repeated). A non-zero
+    /// `index-pack` exit (corrupt/forged/incomplete pack) or a timeout is a HARD error — never a silent
+    /// empty result. The repo stays READ-ONLY to the sandbox; the host parses + policies + migrates.
+    pub fn ingest_pack(
+        &self,
+        repo: &myelin_git::core::RepoLoc,
+        pack: Vec<u8>,
+    ) -> Result<Vec<u8>, GitCoreError> {
+        let (rt, mt, it) = self.next_tokens();
+        let spec = GitWireSpec::for_repo(
+            &self.root,
+            &repo.tenant,
+            &repo.region,
+            &repo.repo,
+            Vec::new(), // ignored for receive-pack ingest (the fixed `sh -c` ingest script runs)
+            pack,
+            Self::wire_env(),
+            None, // no host-bind quarantine — the quarantine is the in-guest /tmp tmpfs (rootless-safe)
+            self.limits,
+            rt,
+            mt,
+            it,
+        )
+        .map_err(|e| GitCoreError::Wire(e.to_string()))?;
+
+        let SandboxLaunch { handle, result } = self
+            .backend
+            .launch_git_receive_pack(&spec, &self.hooks)
+            .map_err(|e| GitCoreError::Wire(e.to_string()))?;
+        let _ = self.backend.kill(&handle);
+
+        if result.timed_out {
+            return Err(GitCoreError::Wire(format!(
+                "sandboxed receive-pack ingest timed out ({}s ceiling)",
+                self.limits.timeout_secs
+            )));
+        }
+        match result.exit_code {
+            Some(0) => Ok(result.stdout),
+            other => Err(GitCoreError::Wire(format!(
+                "sandboxed receive-pack ingest (git index-pack) exited {other:?}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            ))),
+        }
+    }
+}
+
 impl WireExecutor for GitWireExecutor {
     fn run(&self, inv: &WireInvocation) -> Result<WireOutput, GitCoreError> {
         let (rt, mt, it) = self.next_tokens();
