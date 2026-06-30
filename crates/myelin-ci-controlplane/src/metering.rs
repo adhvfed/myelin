@@ -231,6 +231,35 @@ impl CostEventRow {
     }
 }
 
+/// **The durable `cost_event` settle INSERT (CI-P17 / CT-004 — the bind-param SQL the live stack
+/// records each metered unit through; the table DDL is [`crate::migrations::CREATE_COST_EVENT_DDL`]).**
+/// This is the durable counterpart of the in-memory [`CostEventRow`] / [`meter_resource_seconds`] model
+/// — the SAME row shape, written to real Postgres. ONE row per metered unit (the
+/// `cost_events_per_unit == 1` invariant, arch 02 §8), attributed to its producing `(run_id, job_id)`,
+/// with the **wholesale** and **markup** carried as the TWO distinct integer-minor-units columns
+/// (NEVER conflated — the §8 invariant). `ON CONFLICT (tenant_id, cost_id) DO NOTHING` makes a
+/// re-delivered settle **exactly-once** (a doubly-delivered `job.done` records the same `cost_id`
+/// ONCE — double-effect = 0), the SAME idempotency the `wf_signal` terminal buffer + the dispatch
+/// `consumer_dedup` ledger mirror. The settle co-commits with the run-state transition in ONE tx so a
+/// crash between "stamp run terminal" and "record cost" cannot half-bill (the spine's one-tx rule).
+/// Bind: `$1 tenant_id`, `$2 region`, `$3 cost_id`, `$4 run_id`, `$5 job_id`, `$6 meter`, `$7 amount`,
+/// `$8 wholesale_minor_units`, `$9 markup_minor_units`, `$10 kind`.
+pub const INSERT_COST_EVENT_QUERY: &str = "\
+INSERT INTO cost_event
+  (tenant_id, region, cost_id, run_id, job_id, meter, amount, wholesale_minor_units, markup_minor_units, kind)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT (tenant_id, cost_id) DO NOTHING";
+
+/// The `cost_event` read-back — every metered unit attributed to a run (arch 01 §3.7), in the canonical
+/// `(job_id, meter)` order so a replay reads byte-identically. The durability/attribution verify-side of
+/// [`INSERT_COST_EVENT_QUERY`]: it reads back the wholesale + markup split a settle persisted, keyed on
+/// `(tenant_id, run_id)`. Bind: `$1 tenant_id`, `$2 run_id`.
+pub const SELECT_COST_EVENTS_FOR_RUN_QUERY: &str = "\
+SELECT job_id, meter, amount, wholesale_minor_units, markup_minor_units, kind
+FROM cost_event
+WHERE tenant_id = $1 AND run_id = $2
+ORDER BY job_id, meter";
+
 /// **The resource-second → markup SEAM (the arch 06 R-2 named follow-on, owned by Commercial).** A
 /// pure function from a sampled `(meter, amount, wholesale)` to the markup minor-units recorded in the
 /// distinct `markup_minor_units` column. CI carries the SEAM (so the meter is testable end-to-end

@@ -214,6 +214,7 @@ pub use schedule_and_run_job::{complete_job, JobScheduleTerms, SchedulerJobRunne
 pub use metering::{
     meter_resource_seconds, metered_units_for, reserve_settle_parity_drill, CiMeter, CostEventRow,
     CostKind, FlatBpsMarkup, MarkupPolicy, Meter, MeteredResource, ReserveSettleParitySignal,
+    INSERT_COST_EVENT_QUERY, SELECT_COST_EVENTS_FOR_RUN_QUERY,
 };
 
 pub use holder::{
