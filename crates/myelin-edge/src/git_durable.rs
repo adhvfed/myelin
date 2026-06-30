@@ -32,7 +32,7 @@ use myelin_events::{
     Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Region, TenantId, Timestamp,
 };
 use myelin_git::api::{http_catalogue, Method as GitMethod};
-use myelin_git::core::RepoLoc;
+use myelin_git::core::{Oid as CoreOid, RepoLoc};
 use myelin_git::durable::{DurableError, DurableGitRepo, DurableGitStore};
 use myelin_git::lifecycle::{
     BranchProtectionRuleset, PrState, PullRequest, ReviewState, ReviewVerdict,
@@ -43,7 +43,7 @@ use myelin_git::pr_store::{
 };
 use myelin_git::receive_pack::{
     CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome, PushSession,
-    Pusher, RefName, RefStore,
+    Pusher, QuarantineMigration, QuarantineObject, RefName, RefStore,
 };
 use myelin_git::durable::{CommitDetail, CommitMeta};
 use myelin_git::web::{CommitDiff, CommitRow, DiffFile, DiffLineView, RepoHome, WebEditForm, WebEditOutcome};
@@ -622,6 +622,166 @@ impl DurableGitBackend {
         )
     }
 
+    // ── git smart-HTTP PUSH (receive-pack) over the wire — CT-006d ──
+
+    /// The receive-pack ref advertisement source: every `(ref_name, oid)` on the durable repo, sorted.
+    /// A pure read of OUR tenant-scoped repo (no sandbox needed); the wire handler frames it + the
+    /// service header + the restricted capability list. `NotFound` (404) if the repo is absent.
+    pub fn receive_pack_refs(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+    ) -> Result<Vec<(String, String)>, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        let repo = self.store.open_repo(&loc)?;
+        let mut refs: Vec<(String, String)> =
+            repo.list_refs()?.into_iter().map(|(n, o)| (n, o.0)).collect();
+        refs.sort();
+        Ok(refs)
+    }
+
+    /// **The receive-pack PUSH write path (CT-006d).** Parses the ref-update commands + packfile, ingests
+    /// the UNTRUSTED pack in the hardened sandbox (`index-pack` into a writable `/tmp` quarantine — the
+    /// real repo stays RO), stages the fully-resolved objects in a HOST quarantine (connectivity + non-ff
+    /// computed there, never touching the real repo), then runs the in-process policy + the ONE-tx
+    /// ref-CAS + `git.ref.updated` outbox emit ([`RefStore::receive`]) — migration writes the accepted
+    /// objects into the real repo BETWEEN policy-pass and the CAS (reject-before-ref-moves; abort discards
+    /// the quarantine). Returns the `report-status` body the client renders. A push to a non-existent repo
+    /// is `NotFound` (404); every per-push refusal (corrupt pack / policy / non-ff / connectivity) is a
+    /// clean `report-status` with `ng` per ref (HTTP 200) so `git push` shows the honest rejection.
+    pub fn receive_pack(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        principal: &Principal,
+        body: &[u8],
+    ) -> Result<Vec<u8>, DurableError> {
+        use crate::git_receive_pack::{
+            all_ng, parse_cat_file_batch, parse_push_request, report_status,
+        };
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let loc = Self::loc(tenant, region, slug);
+        let repo = Arc::new(self.store.open_repo(&loc)?); // NotFound → 404 (no cross-tenant leak)
+
+        let (cmds, pack) = match parse_push_request(body) {
+            Ok(v) => v,
+            Err(e) => return Ok(report_status(&format!("parse-error: {e}"), &[])),
+        };
+        if cmds.is_empty() {
+            return Ok(report_status("no-commands", &[]));
+        }
+
+        // 1. Ingest the untrusted pack in the SANDBOX → fully-resolved objects (empty for delete-only).
+        let objects: Vec<(String, String, Vec<u8>)> = if pack.is_empty() {
+            Vec::new()
+        } else {
+            let exec = crate::git_wire_exec::GitWireExecutor::serving_default(self.root.clone());
+            match exec.ingest_pack(&loc, pack) {
+                Ok(stream) => match parse_cat_file_batch(&stream) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return Ok(report_status(
+                            &format!("ingest-parse: {e}"),
+                            &all_ng(&cmds, "object ingest failed"),
+                        ))
+                    }
+                },
+                // A corrupt/forged/incomplete pack fails `index-pack` in the sandbox → honest reject.
+                Err(e) => {
+                    return Ok(report_status(
+                        &format!("index-pack-failed: {e}"),
+                        &all_ng(&cmds, "object ingest rejected"),
+                    ))
+                }
+            }
+        };
+
+        // 2. Stage the objects in a HOST quarantine repo (alternates → the real repo so existing history
+        //    + thin bases resolve) so connectivity + non-ff are computed WITHOUT touching the real repo.
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let qdir = std::env::temp_dir().join(format!("myelin-ct006d-q-{}-{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&qdir);
+        let q = DurableGitRepo::init_quarantine(&qdir, &repo.path().join("objects"))?;
+        let mut quarantine = Vec::new();
+        for (oid, ty, bytes) in &objects {
+            let written = q.write_raw_object(ty, bytes)?;
+            if &written.0 != oid {
+                let _ = std::fs::remove_dir_all(&qdir);
+                return Ok(report_status(
+                    &format!("oid-mismatch: claimed {oid}, computed {}", written.0),
+                    &all_ng(&cmds, "object integrity"),
+                ));
+            }
+            quarantine.push(QuarantineObject {
+                oid: PushOid::new(oid.clone()),
+                bytes: bytes.clone(),
+            });
+        }
+
+        // 3. Build the proposed updates: `forced` = an existing ref advancing to a NON-descendant; a
+        //    non-delete tip whose object set is INCOMPLETE (missing tree/blob) rejects the whole push.
+        let mut updates = Vec::new();
+        let mut per_ref_status: Vec<(String, Option<String>)> = Vec::new();
+        for c in &cmds {
+            let new_zero = c.new.chars().all(|ch| ch == '0');
+            let old_zero = c.old.chars().all(|ch| ch == '0');
+            if !new_zero && !q.commit_tree_complete(&CoreOid::new(c.new.clone())).unwrap_or(false) {
+                let _ = std::fs::remove_dir_all(&qdir);
+                return Ok(report_status(
+                    "ok",
+                    &all_ng(&cmds, "rejected: incomplete object set (missing tree/blob) for a ref"),
+                ));
+            }
+            let forced = if !old_zero && !new_zero {
+                !q.is_fast_forward(
+                    Some(&CoreOid::new(c.old.clone())),
+                    &CoreOid::new(c.new.clone()),
+                )
+                .unwrap_or(false)
+            } else {
+                false
+            };
+            updates.push(ProposedRefUpdate {
+                ref_name: RefName::new(c.ref_name.clone()),
+                expected_old: if old_zero { PushOid::zero() } else { PushOid::new(c.old.clone()) },
+                new_oid: if new_zero { PushOid::zero() } else { PushOid::new(c.new.clone()) },
+                forced,
+                commit_oids: if new_zero { vec![] } else { vec![PushOid::new(c.new.clone())] },
+            });
+            per_ref_status.push((c.ref_name.clone(), None));
+        }
+
+        // 4. The ONE-transaction ref-CAS + outbox via the durable RefStore. policy (secret-scan / size /
+        //    pseudonymity) runs INSIDE `receive` BEFORE the migration; `ObjectPromotion::migrate` writes
+        //    the accepted objects into the REAL repo (re-hashing each — a forged oid is impossible)
+        //    between policy-pass and the CAS; the CAS + `git.ref.updated` commit together (BUS-2).
+        let ref_store = self.open_durable_refstore(repo.clone(), slug, tenant, region, principal);
+        let push = PushSession {
+            updates,
+            quarantine,
+            pusher: Pusher {
+                pseudonym: Self::pseudonym(tenant, principal),
+                is_agent: false,
+            },
+        };
+        let migration = ObjectPromotion { repo: &repo, objects: &objects };
+        let outcome = ref_store.receive(&push, &migration, CrashPoint::None);
+        let _ = std::fs::remove_dir_all(&qdir); // the host quarantine is discarded either way
+
+        match outcome.map_err(|e| DurableError::Git(format!("ref-CAS: {e:?}")))? {
+            PushOutcome::Accepted { .. } => Ok(report_status("ok", &per_ref_status)),
+            // A policy/non-ff refusal moved NO ref and discarded the quarantine — LOUD `ng` per ref.
+            PushOutcome::Rejected(reason) => Ok(report_status(
+                "ok",
+                &all_ng(&cmds, &format!("rejected: {reason:?}")),
+            )),
+            PushOutcome::Crashed(_) => Err(DurableError::Git("receive-pack crashed".into())),
+        }
+    }
+
     fn pr_json(rec: &PrRecord) -> Value {
         json!({
             "number": rec.number,
@@ -644,6 +804,32 @@ impl DurableGitBackend {
 // ---------------------------------------------------------------------------
 // Handlers (durable; ViewModel/record-backed)
 // ---------------------------------------------------------------------------
+
+/// The [`QuarantineMigration`] that promotes a sandbox-validated, policy-passed push into the REAL repo
+/// (CT-006d). `RefStore::receive` calls `migrate` ONLY after the in-process policy admits the push and
+/// BEFORE the ref CAS — so a secret/oversized/non-pseudonymous object NEVER reaches the real odb, and a
+/// crash/abort after migrate leaves only orphan (unreferenced, GC'able) objects, never a moved ref. Each
+/// object is written via `write_raw_object`, which RE-HASHES the content (a forged oid is impossible).
+struct ObjectPromotion<'a> {
+    repo: &'a DurableGitRepo,
+    /// (claimed-oid, type, raw-payload) for every object the sandbox returned.
+    objects: &'a [(String, String, Vec<u8>)],
+}
+
+impl QuarantineMigration for ObjectPromotion<'_> {
+    fn migrate(&self, _quarantine: &[QuarantineObject]) -> Result<(), String> {
+        for (claimed_oid, ty, bytes) in self.objects {
+            let written = self.repo.write_raw_object(ty, bytes).map_err(|e| e.to_string())?;
+            if &written.0 != claimed_oid {
+                return Err(format!(
+                    "refusing migration: object oid mismatch (claimed {claimed_oid}, git computed {})",
+                    written.0
+                ));
+            }
+        }
+        Ok(())
+    }
+}
 
 fn region_of<'a>(ctx: &'a HandlerCtx<'_>) -> &'a str {
     ctx.scope.region().0.as_str()

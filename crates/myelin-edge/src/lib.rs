@@ -72,6 +72,7 @@ pub mod gateway;
 pub mod git_durable;
 pub mod git_edge;
 pub mod git_effect;
+pub mod git_receive_pack;
 pub mod git_wire_exec;
 pub mod git_wire_http;
 pub mod request;

@@ -193,6 +193,30 @@ impl DurableGitRepo {
             .map_err(|e| git_err(&format!("open bare repo {}", self.path.display()), e))
     }
 
+    /// **Open a THROWAWAY host-side quarantine bare repo (CT-006d push staging).** `init_bare` at `dir`
+    /// with its odb alternating to `alternate_objects` (the REAL repo's `objects/` dir, READ-only) — the
+    /// staging area where the sandbox-validated pushed objects are written + inspected (policy +
+    /// connectivity) BEFORE any of them migrate into the real repo. The alternate lets a thin delta's
+    /// base + existing-history connectivity resolve against the real repo without writing to it. The
+    /// caller removes `dir` after the push resolves (accept OR reject — the quarantine is never kept).
+    pub fn init_quarantine(
+        dir: &Path,
+        alternate_objects: &Path,
+    ) -> Result<DurableGitRepo, DurableError> {
+        git2::Repository::init_bare(dir).map_err(|e| git_err("init quarantine repo", e))?;
+        let info = dir.join("objects").join("info");
+        std::fs::create_dir_all(&info)
+            .map_err(|e| DurableError::Io(format!("mkdir {}: {e}", info.display())))?;
+        std::fs::write(
+            info.join("alternates"),
+            format!("{}\n", alternate_objects.display()),
+        )
+        .map_err(|e| DurableError::Io(format!("write quarantine alternates: {e}")))?;
+        Ok(DurableGitRepo {
+            path: dir.to_path_buf(),
+        })
+    }
+
     fn parse_oid(oid: &Oid) -> Result<git2::Oid, DurableError> {
         git2::Oid::from_str(oid.as_str())
             .map_err(|e| DurableError::Git(format!("bad oid {}: {e}", oid.as_str())))
@@ -743,6 +767,68 @@ impl DurableGitRepo {
             }
         }
         Ok(())
+    }
+
+    // ── push intake: migrate a sandbox-validated quarantine object into the durable odb (CT-006d) ──
+
+    /// **Write a raw `(type, payload)` git object into this repo's on-disk odb (CT-006d push migration).**
+    /// `kind` is `commit`/`tree`/`blob`/`tag`; `payload` is the object body WITHOUT the `"<type> <len>\0"`
+    /// header (exactly what `git cat-file --batch` emits and what `read_object` returns). git2 RE-HASHES
+    /// the content and returns the computed oid — a forged/mismatched oid is structurally impossible, and
+    /// a content-addressed re-write of an object that already exists is an idempotent no-op. This is the
+    /// TRUSTED in-process migration: the sandboxed `index-pack` already validated the untrusted pack; the
+    /// host only promotes the resulting fully-resolved objects, AFTER the in-process policy admits them.
+    pub fn write_raw_object(&self, kind: &str, payload: &[u8]) -> Result<Oid, DurableError> {
+        let obj_type = match kind {
+            "commit" => git2::ObjectType::Commit,
+            "tree" => git2::ObjectType::Tree,
+            "blob" => git2::ObjectType::Blob,
+            "tag" => git2::ObjectType::Tag,
+            other => {
+                return Err(DurableError::Git(format!(
+                    "refusing to migrate an object of unknown type `{other}` into the durable repo"
+                )))
+            }
+        };
+        let repo = self.open_git()?;
+        let odb = repo.odb().map_err(|e| git_err("odb", e))?;
+        let oid = odb
+            .write(obj_type, payload)
+            .map_err(|e| git_err(&format!("write {kind} object"), e))?;
+        Ok(Oid::new(oid.to_string()))
+    }
+
+    /// Whether `tip` is a real commit whose full tree is present + readable in the odb (a connectivity
+    /// slice for the push-accept gate: a ref must never advance to a commit with a missing tree/blob).
+    /// Walks the commit's root tree recursively; a missing object surfaces as `Err`. (Full historical
+    /// reachability is the external `git fsck --full` oracle the push test additionally runs.)
+    pub fn commit_tree_complete(&self, tip: &Oid) -> Result<bool, DurableError> {
+        let repo = self.open_git()?;
+        let goid = Self::parse_oid(tip)?;
+        let commit = match repo.find_commit(goid) {
+            Ok(c) => c,
+            Err(_) => return Ok(false),
+        };
+        let tree = match commit.tree() {
+            Ok(t) => t,
+            Err(_) => return Ok(false),
+        };
+        let odb = repo.odb().map_err(|e| git_err("odb", e))?;
+        let mut complete = true;
+        tree.walk(git2::TreeWalkMode::PreOrder, |_root, entry| {
+            match entry.kind() {
+                Some(git2::ObjectType::Tree) | Some(git2::ObjectType::Blob) => {
+                    if !odb.exists(entry.id()) {
+                        complete = false;
+                        return git2::TreeWalkResult::Abort;
+                    }
+                }
+                _ => {}
+            }
+            git2::TreeWalkResult::Ok
+        })
+        .map_err(|e| git_err("tree walk", e))?;
+        Ok(complete)
     }
 }
 
