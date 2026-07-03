@@ -189,3 +189,13 @@ default = []
 # Compile the durable PG store bindings + the live-PG integration tests (run against the
 # docker-compose dev stack). Turns on myelin-storage's integration feature (the backings + provider).
 integration = ["dep:tokio", "dep:myelin-config", "dep:sqlx", "myelin-storage/integration"]
+
+# MR-009b Wave 0 — the `test-support` cargo feature (alias `memory`). It gates the identity spine's
+# in-memory durable-store DOUBLES (PrincipalStore/TupleStore/RevocationStore/PseudonymStore Inner +
+# `Memory(..)` backend arms) so DOWNSTREAM crates enable them as a DEV-dependency (the in-memory
+# doubles are consumed cross-crate in non-test lib code; `#[cfg(test)]` is crate-local and can't
+# reach them). EMPTY in Wave 0 — established so later waves (W2) gate the doubles behind it + the
+# `no-in-memory-durable-store` scanner treats `feature = "test-support"` as a test-double gate. No
+# code moves behind it yet. `memory` is a documented alias.
+test-support = []
+memory = ["test-support"]

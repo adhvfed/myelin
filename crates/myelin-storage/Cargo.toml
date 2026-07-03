@@ -85,6 +85,17 @@ integration = [
     "myelin-events/integration",
 ]
 
+# MR-009b Wave 0 — the `test-support` cargo feature (alias `memory`). It exists to gate the
+# in-memory durable-store DOUBLES (KMS engine, cost/erasure/post-pit ledgers, blob store, …) so
+# DOWNSTREAM crates can enable them as a DEV-dependency: the doubles are consumed CROSS-CRATE in
+# non-test lib code (e.g. `KmsEngine::new()` at ~90 sites), which `#[cfg(test)]` (crate-local) can
+# NOT reach. It is EMPTY here in Wave 0 — the feature is established so later waves (2-7) gate the
+# doubles behind `#[cfg(any(test, feature = "test-support"))]` and downstream dev-deps can turn it
+# on; NO code moves behind it yet. The `no-in-memory-durable-store` scanner treats
+# `feature = "test-support"` as a test-double gate (Wave 0). `memory` is a documented alias.
+test-support = []
+memory = ["test-support"]
+
 # The failure-injection harness is TEST-SUPPORT only (the same posture as a service's
 # main.rs / the harness's own dev usage). The IDOR + pool-saturation DRILLS read the
 # contract-1.8 survival signal set (CrossTenantCount == 0, PoolSaturation) off the
