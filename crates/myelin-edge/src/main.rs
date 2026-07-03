@@ -12,6 +12,7 @@
 //! drain wiring lands with the rest of the transport. The bind address is `MYELIN_EDGE_ADDR` (default
 //! `127.0.0.1:8080`).
 
+use myelin_config::{Mode, MyelinConfig};
 use myelin_edge::{
     register_git_durable, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
 };
@@ -19,24 +20,54 @@ use myelin_identity_service::{
     CapabilityAuthenticator, CellTokenAuthority, HumanSsoAuthenticator, PasetoCapabilityVerifier,
     PrincipalStore, RevocationStore,
 };
-use myelin_storage::KmsEngine;
+use myelin_storage::{
+    DurablePrincipalBacking, DurableRevocationBacking, KmsEngine, SubstrateProvider,
+};
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
+    // MR-009b Wave 2 — the DURABLE-BY-DEFAULT composition root: the identity S1 principal + S7
+    // revocation stores are wired via `with_pg` over the MR-022 SubstrateProvider pool (the in-memory
+    // doubles moved behind `test-support`, so the production edge binary never constructs them). The
+    // provider connects to the dev docker stack by default (`MyelinConfig::from_env`); a boot that
+    // cannot reach the durable pool FAILS LOUD (exit non-zero) — never a silent in-memory fallback.
+    let config = MyelinConfig::from_env(Mode::DevDefaults).unwrap_or_else(|e| {
+        eprintln!("edge: invalid config: {e}");
+        std::process::exit(1);
+    });
+    let provider = match SubstrateProvider::connect(config, 8).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("edge: cannot reach the durable OLTP pool (durable-by-default requires PG): {e}");
+            std::process::exit(1);
+        }
+    };
+    let handle = tokio::runtime::Handle::current();
+    // The shared cell KMS (the crypto-shred substrate). The durable software-sealed KMS root LOAD is
+    // the named W5 follow-on (MR-025); here a fresh in-memory engine seeds the profile-encryption seam.
+    let kms = Arc::new(KmsEngine::new());
+
     // The REAL PASETO Bearer verifier over a freshly-generated cell authority (genuine Ed25519 crypto
     // — a forged token is rejected). The production cell-root LOAD + the seeded S1 directory is the
     // MR-015+ composition root; here a generated cell makes the bootable shell do real crypto.
     let cell = CellTokenAuthority::generate();
     let authn = Arc::new(CapabilityAuthenticator::with_verifier(
-        PrincipalStore::new(Arc::new(KmsEngine::new())),
+        PrincipalStore::with_pg(
+            kms.clone(),
+            DurablePrincipalBacking::new(provider.clone()),
+            handle.clone(),
+        ),
         Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
-        RevocationStore::new(),
+        RevocationStore::with_pg(DurableRevocationBacking::new(provider.clone()), handle.clone()),
     ));
-    // The refuse-not-mock production human verifier (login refuses until JWKS/trust-anchors land).
-    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(
-        KmsEngine::new(),
-    ))));
+    // The refuse-not-mock production human verifier (login refuses until JWKS/trust-anchors land),
+    // over the durable S1 principal directory.
+    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::with_pg(
+        kms.clone(),
+        DurablePrincipalBacking::new(provider),
+        handle,
+    )));
 
     // The Git subsystem wired through the edge over the DURABLE on-disk backend (GT-003): its
     // `/v1/git/...` write handlers PERSIST on real on-disk bare repos (GT-001) under the verified tenant

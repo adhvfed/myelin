@@ -57,22 +57,19 @@
 //!   from the auth spine); its removal belongs to the CI/attestation track, NOT this auth prompt. Left
 //!   honestly in the baseline (the scanner stays at 1 remaining structural entry).
 //!
-//! ### `no-in-memory-durable-store` (16) — removed by the spine durable-persistence MRs (P-522/523)
-//! - `myelin-identity-service/src/principal_store.rs:289` — `PrincipalStore` (SI-018). MR-007 ADDED
-//!   the durable `with_pg` PG path (proven live: `integration_mr007_identity_durable`) but the
-//!   `Memory(Arc<Mutex<Inner>>)` variant is still the always-compiled default (the `Pg` variant is
-//!   `#[cfg(feature="integration")]`) and nothing wires it yet — so the in-memory store is STILL the
-//!   production default. The scanner now FOLLOWS the backend enum (MR-007 fix) and still fires.
-//!   Removed when production wires `with_pg` as the non-optional default (MR-009 / route MRs).
-//! - `myelin-identity-service/src/tuple_store.rs:220`     — `TupleStore` (SI-019), same MR-007 status.
-//! - `myelin-identity-service/src/revocation.rs:193`      — `RevocationStore` (SI-019/SI-020). MR-008
-//!   ADDED the durable `with_pg` path (proven live incl. expiry-across-restart:
-//!   `integration_mr008_revocation_durable`); `Memory` variant still the default → enum-following
-//!   scanner still fires. Removed at MR-009 wiring.
+//! ### `no-in-memory-durable-store` (13) — the spine durable-persistence waves (P-522/523)
+//! - **MR-009b Wave 2 FLIPPED the 3 identity spine stores GREEN (17→14):**
+//!   `principal_store.rs` `PrincipalStore` (SI-018), `tuple_store.rs` `TupleStore` (SI-019), and
+//!   `revocation.rs` `RevocationStore` (SI-020) are now durable-by-default. Their in-memory
+//!   `Memory(Arc<Mutex<Inner>>)` backend variant + `Inner` + the in-memory `::new()` constructors are
+//!   `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLES; the durable `Pg(..)`/`with_pg` path
+//!   is the always-compiled PRODUCTION default (tokio/sqlx/myelin-config non-optional; `integration`
+//!   is now a test-selector). The scanner strips the `test-support`-gated `Memory` variant, so the
+//!   production backend enum presents POOL-ONLY → the three entries are REMOVED. Durable-by-default is
+//!   proven live on PG (`integration_mr007/008/009/011`); DB-free unit tests use the doubles via the
+//!   `myelin-identity-service/test-support` dev-dependency.
 //!   (`machine_auth.rs:347 S7Denylist` SI-020 was an entry here; MR-011 DELETED the stub type and
-//!   routed `CapabilityAuthenticator`'s revocation consult through the durable `RevocationStore` above
-//!   — 17→16. The machine-token revocation is now backed by the same durable-capable S7 store; the
-//!   cross-restart denial is proven in `integration_mr011_machine_token_revocation_durable`.)
+//!   routed `CapabilityAuthenticator`'s revocation consult through the durable `RevocationStore`.)
 //! - `myelin-identity-service/src/pseudonym_store.rs:191` — `PseudonymStore` (S2) in-mem (SI-018 cluster; MR-007/009)
 //! - `myelin-identity-service/src/pseudonym_erase.rs:268` — `PseudonymErasureLedger` in-mem via the
 //!     `type LedgerByPartition = BTreeMap<…>` ALIAS (alias false-negative closed; census 10.8; MR-007/009)
@@ -329,8 +326,9 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-ci-controlplane/src/residency_drill.rs",
         444,
     ),
-    // ---- no-in-memory-durable-store (13 here + 4 closed-false-negatives below = 17) ----
-    //      spine durable-persistence MRs (P-522/523); MR-008 added machine_auth.rs:347 (S7Denylist).
+    // ---- no-in-memory-durable-store (9 here + 4 closed-false-negatives below = 13) ----
+    //      spine durable-persistence waves (P-522/523); MR-009b Wave 2 flipped the 3 identity spine
+    //      stores (principal/tuple/revocation) durable-by-default → removed from this manifest (17→14).
     (
         "no-in-memory-durable-store",
         "crates/myelin-control-plane/src/cross_cell_bridge.rs",
@@ -366,41 +364,21 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-events/src/reerase.rs",
         102,
     ),
-    // MR-007 (SI-018/019) ADDED the durable PG path (`with_pg` over
-    // `myelin_storage::Durable{Principal,Tuple}Backing` + the MR-022 `with_tenant_tx` convention) and
-    // PROVED it durable + tenant-isolated against live PG (`integration_mr007_identity_durable`). But
-    // the in-memory store is NOT yet removed — only SUPPLEMENTED: the `Memory(Arc<Mutex<Inner>>)`
-    // variant still holds the collection, it is the ALWAYS-compiled default (the `Pg` variant is
-    // behind `#[cfg(feature="integration")]`), and NO production code wires either store yet. So the
-    // in-memory store is still the production-graph DEFAULT. The scanner now FOLLOWS the backend enum
-    // (the MR-007 enum-following fix) and STILL fires here — honestly. These two are REMOVED when
-    // production wires the durable `with_pg` path as the non-optional default (MR-009 / route MRs).
-    (
-        "no-in-memory-durable-store",
-        "crates/myelin-identity-service/src/principal_store.rs",
-        289,
-    ),
-    (
-        "no-in-memory-durable-store",
-        "crates/myelin-identity-service/src/tuple_store.rs",
-        220,
-    ),
+    // MR-009b Wave 2 (SI-018/019/020) FLIPPED the S1 principal + S3 tuple + S7 revocation stores
+    // GREEN: their in-memory `Memory(Arc<Mutex<Inner>>)` backend variant + `Inner` + the in-memory
+    // `::new()` constructors are now `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLES, and
+    // the durable `Pg(..)`/`with_pg` path is the always-compiled PRODUCTION default (tokio/sqlx/
+    // myelin-config non-optional; `integration` is now a test-selector). The PRODUCTION-compiled
+    // backend enum presents POOL-ONLY (the scanner strips the `test-support`-gated `Memory` variant),
+    // so `PrincipalStore`/`TupleStore`/`RevocationStore` no longer hold an in-memory collection in the
+    // production graph — the three former entries (principal_store.rs:289, tuple_store.rs:220,
+    // revocation.rs:193) are REMOVED (17→14). Durable-by-default is proven live on PG (mr007/008/009/
+    // 011); the DB-free unit tests use the doubles via `test-support`. The S2 pseudonym store below
+    // STAYS in-memory (its durable backing is the named W6 follow-on — a SEPARATE baseline entry).
     (
         "no-in-memory-durable-store",
         "crates/myelin-identity-service/src/pseudonym_store.rs",
         191,
-    ),
-    // MR-008 (SI-019/SI-020) ADDED the durable PG path for `RevocationStore` (`with_pg` over
-    // `myelin_storage::DurableRevocationBacking` + the MR-022 `with_tenant_tx` convention) and PROVED
-    // it durable (incl. expiry-across-restart) + tenant-isolated against live PG
-    // (`integration_mr008_revocation_durable`). Same status as principal/tuple: the `Memory` enum
-    // variant is still the always-compiled default and nothing wires `with_pg` yet → the
-    // enum-following scanner STILL fires here (the struct header is at :193 after the MR-008-followup
-    // instant-compare helper was added above it). Removed when production wires `with_pg` (MR-009).
-    (
-        "no-in-memory-durable-store",
-        "crates/myelin-identity-service/src/revocation.rs",
-        193,
     ),
     // `S7Denylist` (SI-020) — REMOVED by MR-011 (the carried-forward fix is DISCHARGED). The
     // machine-auth `authenticate` revocation CONSULT was a bare `Arc<Mutex<BTreeSet<String>>>` of
@@ -556,10 +534,11 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
     // un-wired gate). The counts pin the manifest shape.
     assert_eq!(
         BASELINE.len(),
-        17,
-        "the committed baseline has 17 entries (MR-013 flipped the 2 no-bare-tenant-pool sites GREEN: \
-         19 → 17 — pg.rs's session-scoped set_config(.., false) is now transaction-scoped and the \
-         bare pool() hatch is removed)"
+        14,
+        "the committed baseline has 14 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
+         GREEN: 17 → 14 — PrincipalStore (SI-018) / TupleStore (SI-019) / RevocationStore (SI-020) are \
+         durable-by-default now, their in-memory doubles are `test-support`-gated, so the production \
+         type presents pool-only)"
     );
     let structural = BASELINE
         .iter()
@@ -582,13 +561,13 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          to the CI track."
     );
     assert_eq!(
-        in_memory, 16,
-        "16 in-memory durable-store sites: MR-007 re-pinned principal_store + tuple_store (durable \
-         path added, Memory variant still the default → enum-following scanner still fires); MR-008 \
-         kept revocation.rs:193 (supplemented-not-removed). MR-011 REMOVED S7Denylist (machine_auth.rs) \
-         — the machine-token revocation now routes through the durable RevocationStore, so the \
-         standalone tenant-less stub is deleted, not supplemented (17→16). The remaining present-not- \
-         removed sites flip when MR-009 wires with_pg as the default."
+        in_memory, 13,
+        "13 in-memory durable-store sites: MR-009b Wave 2 FLIPPED the 3 identity spine stores \
+         (PrincipalStore/TupleStore/RevocationStore) — their in-memory backends are now \
+         `test-support`-gated test doubles and the durable `with_pg` path is the always-compiled \
+         production default, so the scanner sees pool-only production types (16→13). The remaining 13 \
+         (S2 pseudonym + erasure ledger; events dedup/outbox/reerase; control-plane registry/bridge/ \
+         misroute; storage kms/reserve/restore/reerase/blob) flip in the later waves W3–W7."
     );
     assert_eq!(
         bare_pool, 0,

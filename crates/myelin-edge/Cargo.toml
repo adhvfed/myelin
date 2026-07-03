@@ -35,6 +35,11 @@ myelin-substrate = { path = "../myelin-substrate" }
 # the edge sets before dispatch — behind `integration`, the live-PG transaction). KmsEngine seeds the
 # S1 principal store in the proofs.
 myelin-storage = { path = "../myelin-storage" }
+# MR-009b Wave 2: the edge composition root now wires the DURABLE S1/S7 identity stores (`with_pg`)
+# over the MR-022 SubstrateProvider pool — the identity in-memory doubles moved behind `test-support`,
+# so the production edge binary boots durable-by-default. `myelin-config` is the env-first
+# `MyelinConfig` the provider connects from (the dev docker stack by default).
+myelin-config = { workspace = true }
 # TenantId / Region value types (the path-tenant the IDOR guard rejects; the residency dimension).
 myelin-tenancy = { path = "../myelin-tenancy" }
 # The Git SUBSYSTEM (MR-015): its endpoint grammar (`api::http_catalogue` — the route table the edge
@@ -93,6 +98,15 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # sqlx so the edge can prove the tenant scope is set in a real transaction.
 # ----------------------------------------------------------------------------------------------
 sqlx = { workspace = true, optional = true }
+
+[dev-dependencies]
+# MR-009b Wave 2: the edge's OWN tests (the gateway/git-edge `#[cfg(test)]` modules + tests/*) build
+# the identity in-memory doubles (PrincipalStore/RevocationStore `::new`), which moved behind
+# `#[cfg(any(test, feature = "test-support"))]`. Enable `test-support` for the TEST build only — the
+# production edge binary (src/main.rs) wires the DURABLE `with_pg` stores, so `cargo build` keeps the
+# in-memory doubles OUT of the edge runtime (durable-by-default preserved; resolver v2 does not leak a
+# dev-dependency feature into the normal build).
+myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
 
 [features]
 default = []

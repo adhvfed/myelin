@@ -148,7 +148,10 @@ integration = [
 # to PROVE the frozen names-only carrier is admissible. A DEV-only edge (the runtime fragment chat
 # ships is the names-only carrier `myelin_identity::NamespaceFragment`; the rich form is exercised
 # only by the CDC test), so the production DAG stays acyclic.
-myelin-identity-service = { path = "../myelin-identity-service" }
+# MR-009b Wave 2: enable `test-support` so this crate's DEV tests reach the identity in-memory
+# doubles (PrincipalStore/TupleStore/RevocationStore/StoreBackedCheck `::new`) which moved behind
+# `#[cfg(any(test, feature = "test-support"))]`. DEV-only — never in the production DAG.
+myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
 # CHAT-P18 (P-413, M4-C6): the durable-workflow ENGINE — the CDC for contracts 9.1/9.4 posts chat's
 # HITL approval-card decision onto the REAL `myelin_flow::FlowExecutor::signal` (the per-effect
 # `idem_key` dedup — a double-click is ONE approval, a partial approval is well-defined) and ASSERTS

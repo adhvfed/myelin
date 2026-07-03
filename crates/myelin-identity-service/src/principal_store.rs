@@ -70,8 +70,13 @@ use myelin_storage::{
     TenantScope, TenantTable,
 };
 use myelin_tenancy::{Region, TenantId};
+// `HashMap`/`Mutex` back the in-memory test-double [`Inner`] only (MR-009b Wave 2 — `test-support`-
+// gated); the durable production path uses the PG backing, so they are absent from the default build.
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Mutex;
 
 /// The S1 store's tenant-owned table name (the `(tenant, region)`-first RLS table). Every store
 /// access is built through [`TenantQuery::for_table`] over THIS table, so a principal read/write
@@ -257,6 +262,13 @@ impl From<KmsError> for PrincipalError {
 
 /// The shared inner state of a [`PrincipalStore`] (behind `Arc<Mutex<…>>` so the store is a
 /// cloneable handle and a write is atomic under one lock).
+///
+/// **MR-009b Wave 2 — TEST DOUBLE (compiled ONLY under `#[cfg(any(test, feature = "test-support"))]`).**
+/// The PRODUCTION default is the durable PG backing ([`PgPrincipalBacking`], via
+/// [`PrincipalStore::with_pg`]); this in-memory `Inner` is the DB-free unit-test double downstream
+/// crates reach via the `test-support` dev-dependency. The `no-in-memory-durable-store` scanner
+/// treats a `test-support`-gated backing as a test double, so S1 leaves the baseline (SI-018).
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 struct Inner {
     /// The committed principal rows, keyed by `(tenant, region)` partition then `principal_id`. The
@@ -300,24 +312,28 @@ pub struct PrincipalStore {
     holder: OltpStoreHolder,
 }
 
-/// The S1 store backing: the REAL durable PG `principal`/`credential_link` tables (MR-007) or the
-/// in-memory test-double. Splitting the backing OUT of the role struct's direct fields is what lets
-/// the `no-in-memory-durable-store` ratchet record the shortcut's removal: `PrincipalStore` no longer
-/// holds an in-memory collection (it holds a backing that CAN be durable). The profile PII is
-/// KMS-encrypted in BOTH backings; the Pg backing persists only the OPAQUE ciphertext (the keys stay
-/// with the engine — decrypt-across-restart depends on the durable KMS root, MR-025).
+/// The S1 store backing: the REAL durable PG `principal`/`credential_link` tables (MR-007) — the
+/// PRODUCTION default (MR-009b Wave 2) — or the in-memory test-double. Splitting the backing OUT of
+/// the role struct's direct fields is what lets the `no-in-memory-durable-store` ratchet record the
+/// shortcut's removal: the PRODUCTION-compiled enum presents ONLY the pool-backed `Pg` variant (the
+/// `Memory` variant is `test-support`-gated, which the scanner strips as a test double), so
+/// `PrincipalStore` no longer holds an in-memory collection in the production graph. The profile PII
+/// is KMS-encrypted in BOTH backings; the Pg backing persists only the OPAQUE ciphertext (the keys
+/// stay with the engine — decrypt-across-restart depends on the durable KMS root, MR-025).
 #[derive(Clone)]
 enum PrincipalBackend {
-    /// The in-memory test-double (the DB-free default build). NOT the production system-of-record.
+    /// The in-memory test-double — MR-009b Wave 2: compiled ONLY under
+    /// `#[cfg(any(test, feature = "test-support"))]`. NOT the production system-of-record.
+    #[cfg(any(test, feature = "test-support"))]
     Memory(Arc<Mutex<Inner>>),
-    /// The REAL durable PG backing over the MR-022 provider pool + `with_tenant_tx` convention.
-    #[cfg(feature = "integration")]
+    /// The REAL durable PG backing over the MR-022 provider pool + `with_tenant_tx` convention — the
+    /// PRODUCTION DEFAULT (always compiled as of MR-009b Wave 2).
     Pg(PgPrincipalBacking),
 }
 
 /// The PG-backed S1 principal backing (MR-007): the durable `principal`/`credential_link` tables +
-/// the sync→async bridge (`tokio::runtime::Handle` driving `block_in_place`+`block_on`).
-#[cfg(feature = "integration")]
+/// the sync→async bridge (`tokio::runtime::Handle` driving `block_in_place`+`block_on`). The
+/// production default (always compiled as of MR-009b Wave 2).
 #[derive(Clone)]
 struct PgPrincipalBacking {
     backing: Arc<myelin_storage::DurablePrincipalBacking>,
@@ -325,9 +341,12 @@ struct PgPrincipalBacking {
 }
 
 impl PrincipalStore {
-    /// Build the S1 store over a service-owned [`KmsEngine`] (the same engine the cell's stores
-    /// share, P-058). The store auto-registers as a `PersonalDataHolder` on construction (opening
-    /// IS registering, §3.4) so the registration is structural, never an afterthought.
+    /// Build the S1 store over the in-memory TEST-DOUBLE backing (MR-009b Wave 2: compiled ONLY
+    /// under `#[cfg(any(test, feature = "test-support"))]`). The PRODUCTION constructor is
+    /// [`PrincipalStore::with_pg`] (the durable PG default); this `::new` is the DB-free unit-test
+    /// entry point downstream crates reach via the `test-support` dev-dependency. The store
+    /// auto-registers as a `PersonalDataHolder` on construction (opening IS registering, §3.4).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(kms: Arc<KmsEngine>) -> PrincipalStore {
         let holder = OltpStoreHolder::new(S1_HOLDER);
         // Opening IS registering (§3.4, GD-3): the S1 store auto-registers the moment it is built,
@@ -346,7 +365,7 @@ impl PrincipalStore {
     /// bleed). `rt` is the tokio runtime handle the sync API drives the async backing on. The KMS
     /// engine is reused as-is (the profile-encryption boundary is unchanged); decrypt-across-restart
     /// depends on the durable KMS root (MR-025) — out of MR-007's scope. Auto-registers as a holder.
-    #[cfg(feature = "integration")]
+    /// **The PRODUCTION default (MR-009b Wave 2) — always compiled.**
     pub fn with_pg(
         kms: Arc<KmsEngine>,
         backing: myelin_storage::DurablePrincipalBacking,
@@ -424,6 +443,7 @@ impl PrincipalStore {
         // cross-tenant write path). The thin `(tenant, region)` predicate is carried on every
         // statement; a tenant-less write is unconstructable (you need a TenantScope here).
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
+        #[cfg(any(test, feature = "test-support"))]
         let part_key = Self::part_key(scope);
 
         // (2) Seal the profile PII under the PER-SUBJECT DEK (GD-4) — distinct from the per-tenant
@@ -448,6 +468,7 @@ impl PrincipalStore {
         };
 
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             PrincipalBackend::Memory(inner_arc) => {
                 // (3) Commit the row + the encrypted profile into the verified partition (atomic
                 //     under the lock). The partition is keyed by the verified (tenant, region) — a
@@ -467,7 +488,6 @@ impl PrincipalStore {
                 }
                 Ok(row)
             }
-            #[cfg(feature = "integration")]
             PrincipalBackend::Pg(pg) => {
                 // The DURABLE upsert: the row's governance columns (serde-JSON kind/role/status) +
                 // the KMS-sealed profile ciphertext blob, through with_tenant_tx (RLS-scoped). The
@@ -534,6 +554,7 @@ impl PrincipalStore {
     ) -> Option<PrincipalRow> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             PrincipalBackend::Memory(inner_arc) => {
                 let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
                 inner
@@ -541,7 +562,6 @@ impl PrincipalStore {
                     .get(&Self::part_key(scope))
                     .and_then(|p| p.get(&principal_id.0).cloned())
             }
-            #[cfg(feature = "integration")]
             PrincipalBackend::Pg(pg) => pg
                 .block(pg.backing.get_principal(&scope.tenant().0, &principal_id.0))
                 .ok()
@@ -564,10 +584,12 @@ impl PrincipalStore {
         principal_id: &PrincipalId,
     ) -> Result<Option<PrincipalProfile>, PrincipalError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
+        #[cfg(any(test, feature = "test-support"))]
         let part_key = Self::part_key(scope);
         // The row carries the profile_ref (which per-subject DEK sealed it); the ciphertext lives
         // with it. Both are read under the verified scope's partition.
         let (key_ref, enc) = match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             PrincipalBackend::Memory(inner_arc) => {
                 let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
                 let row = match inner
@@ -592,7 +614,6 @@ impl PrincipalStore {
                 };
                 (key_ref, enc)
             }
-            #[cfg(feature = "integration")]
             PrincipalBackend::Pg(pg) => {
                 let drow = match pg
                     .block(pg.backing.get_principal(&scope.tenant().0, &principal_id.0))
@@ -652,6 +673,7 @@ impl PrincipalStore {
     pub fn principals_in(&self, scope: &TenantScope) -> Vec<PrincipalRow> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             PrincipalBackend::Memory(inner_arc) => {
                 let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
                 inner
@@ -660,7 +682,6 @@ impl PrincipalStore {
                     .map(|p| p.values().cloned().collect())
                     .unwrap_or_default()
             }
-            #[cfg(feature = "integration")]
             PrincipalBackend::Pg(pg) => pg
                 .block(pg.backing.principals_in(&scope.tenant().0))
                 .unwrap_or_default()
@@ -689,8 +710,10 @@ impl PrincipalStore {
         principal_id: &PrincipalId,
     ) -> Result<(), PrincipalError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
+        #[cfg(any(test, feature = "test-support"))]
         let part_key = Self::part_key(scope);
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             PrincipalBackend::Memory(inner_arc) => {
                 let mut inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
                 // Refuse a link to a principal that does not exist in THIS verified partition
@@ -712,7 +735,6 @@ impl PrincipalStore {
                     .insert(Self::link_key(scheme, subject_key), principal_id.0.clone());
                 Ok(())
             }
-            #[cfg(feature = "integration")]
             PrincipalBackend::Pg(pg) => {
                 // The backing checks existence in the SAME tenant-scoped tx (it returns `false` for
                 // an unknown principal — a dangling SSO/SCIM link is refused, never silently created).
@@ -745,8 +767,10 @@ impl PrincipalStore {
         subject_key: &str,
     ) -> Option<PrincipalRow> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
+        #[cfg(any(test, feature = "test-support"))]
         let part_key = Self::part_key(scope);
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             PrincipalBackend::Memory(inner_arc) => {
                 let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
                 let principal_id = inner
@@ -759,7 +783,6 @@ impl PrincipalStore {
                     .get(&part_key)
                     .and_then(|p| p.get(&principal_id).cloned())
             }
-            #[cfg(feature = "integration")]
             PrincipalBackend::Pg(pg) => pg
                 .block(
                     pg.backing
@@ -823,7 +846,9 @@ impl PrincipalStore {
 
     /// The `(tenant, region)` partition key for a verified scope (the OUTER partition; 12.1). A
     /// `(String, String)` so the partition map is keyed by the residency-pinned tenant+region — a
-    /// read for one never reaches another's bucket.
+    /// read for one never reaches another's bucket. In-memory test-double helper (MR-009b Wave 2 —
+    /// `test-support`-gated; the durable path scopes via `with_tenant_tx`).
+    #[cfg(any(test, feature = "test-support"))]
     fn part_key(scope: &TenantScope) -> (String, String) {
         (scope.tenant().0.clone(), scope.region().0.clone())
     }
@@ -835,7 +860,6 @@ impl PrincipalStore {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         match &self.backend {
             PrincipalBackend::Memory(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()),
-            #[cfg(feature = "integration")]
             PrincipalBackend::Pg(_) => {
                 panic!("lock() is the in-memory test-double accessor; the Pg backend has no map")
             }
@@ -845,7 +869,6 @@ impl PrincipalStore {
     /// Reconstruct a [`PrincipalRow`] from a durable row (the profile_ref is rebuilt from the blob's
     /// key_ref URI; the governance columns deserialize from their serde-JSON text). The kind/role/
     /// status are our own writes, so a parse failure is a genuine corruption — surfaced loudly.
-    #[cfg(feature = "integration")]
     fn durable_to_row(
         scope: &TenantScope,
         drow: myelin_storage::DurablePrincipalRow,
@@ -867,7 +890,6 @@ impl PrincipalStore {
     }
 }
 
-#[cfg(feature = "integration")]
 impl PgPrincipalBacking {
     /// Drive an async backing call from the sync store API (the `block_in_place`+`block_on` bridge).
     fn block<F: std::future::Future>(&self, fut: F) -> F::Output {

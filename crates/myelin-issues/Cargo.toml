@@ -143,7 +143,10 @@ tokio = { workspace = true, optional = true }
 # engine is a dev-dependency (test scaffolding only — no runtime edge). EI-01 §7: prove against the
 # frozen engine, never re-define it.
 [dev-dependencies]
-myelin-identity-service = { path = "../myelin-identity-service" }
+# MR-009b Wave 2: enable `test-support` so this crate's DEV tests reach the identity in-memory
+# doubles (PrincipalStore/TupleStore/RevocationStore/StoreBackedCheck `::new`) which moved behind
+# `#[cfg(any(test, feature = "test-support"))]`. DEV-only — never in the production DAG.
+myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
 # ISS-P35 (P-498, M5): the E2E-2 agent-native flagship (Issues' slice) drives the
 # exactly-once-approval-ACROSS-A-KILL leg against the REAL `myelin-flow` durable HITL substrate —
 # `SignalStore` (the `wf_signal` ON-CONFLICT-DO-NOTHING dedup, 9.4) + `approval::{ApprovalCard,

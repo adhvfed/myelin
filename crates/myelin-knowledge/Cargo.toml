@@ -192,7 +192,10 @@ myelin-lints = { path = "../myelin-lints" }
 # SAME shape both sides agree on, never a stub of the producer (the cdc_4_3_git_list_pushdown.rs
 # precedent). DEV-dependency ONLY — `myelin-identity-service` does NOT enter the Knowledge production
 # DAG (the production crate depends only on the frozen `myelin-identity` ABI; the DAG stays acyclic).
-myelin-identity-service = { path = "../myelin-identity-service" }
+# MR-009b Wave 2: enable `test-support` so this crate's DEV tests reach the identity in-memory
+# doubles (PrincipalStore/TupleStore/RevocationStore/StoreBackedCheck `::new`) which moved behind
+# `#[cfg(any(test, feature = "test-support"))]`. DEV-only — never in the production DAG.
+myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
 # DEV-only (KN-P27 / P-317): the Fabric's Knowledge ToolDef REGISTRATION
 # (`myelin_agent_service::knowledge_tools`, AG-P19 → P-268) — the contract-8.1 CDC pairs the KN-domain
 # SOURCE OF TRUTH (`myelin_knowledge::agent` — the tool identity + the `required_caps` from the frozen
