@@ -115,6 +115,11 @@ sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
+# MR-009b Wave 3: enable `test-support` so this crate's DEV tests reach the events in-memory
+# `DedupLedger::new()` double (the durable `DedupLedger::durable` is the production default; the
+# in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
+# — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
+myelin-events = { path = "../myelin-events", features = ["test-support"] }
 # The migration test re-uses the storage online runner; serde_json round-trips the trace ArtifactRef.
 serde_json.workspace = true
 # AG-P12 (→ P-224, AG-D7) — the M0 failure-injection harness: the tenant-scoped DependencyBreaker

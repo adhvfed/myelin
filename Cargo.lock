@@ -2525,6 +2525,7 @@ dependencies = [
  "async-nats",
  "futures",
  "myelin-config",
+ "myelin-events",
  "myelin-harness",
  "myelin-identity",
  "myelin-tenancy",

@@ -87,6 +87,12 @@ default = []
 # this feature — the live-backend tests still gate on it.
 integration = [
     "myelin-events/integration",
+    # MR-009b Wave 3: `integration` is a TEST-SELECTOR, so it also turns on the events in-memory
+    # `test-support` doubles the live-PG integration/drill tests build against (e.g. the
+    # `DedupLedger::new()` / `OutboxStore::new()` in-process-floor comparisons in
+    # `integration_mr023_events_serve` + the reindex-parity drills). Never in a production build
+    # (`cargo build` / `--workspace` do not enable `integration`) → no runtime double leak.
+    "myelin-events/test-support",
 ]
 
 # MR-009b Wave 0 — the `test-support` cargo feature (alias `memory`). It exists to gate the

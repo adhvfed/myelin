@@ -522,12 +522,16 @@ pub fn notif_app_spec(config: Config) -> AppSpec {
 pub fn notif_app_spec_with_router(
     config: Config,
     tenants: &[TenantId],
+    dedup: DedupLedger,
 ) -> (AppSpec, router::InboxProjection) {
     let inbox = router::InboxProjection::new();
     // The ONE outbox the routers emit into AND the relay drains (BUS-2): supply it to the
     // OutboxSpec so the emit → relay → bus path is the sanctioned one (no second store).
     let outbox = OutboxStore::new();
-    let dedup = DedupLedger::new();
+    // MR-009b Wave 3: the dedup ledger is INJECTED (durable-by-default composition root). The
+    // in-memory `DedupLedger::new()` is a `test-support` double the caller supplies on the
+    // in-process floor; a durable deployment injects `DedupLedger::durable` (events `serve()`).
+    // One shared ledger across the tenant routers (the `(consumer, event_id)` PK isolates them).
     let mut consumers: Vec<ConsumerReg> = Vec::with_capacity(tenants.len());
     for tenant in tenants {
         // `build_router` binds the `sig.<tenant>.` whitelist through the sanctioned `consume`
@@ -667,7 +671,8 @@ mod tests {
     #[test]
     fn notif_app_spec_with_router_registers_the_router_consumer() {
         let tenants = [TenantId("acme".into()), TenantId("globex".into())];
-        let (spec, _inbox) = notif_app_spec_with_router(Config::default(), &tenants);
+        let (spec, _inbox) =
+            notif_app_spec_with_router(Config::default(), &tenants, DedupLedger::new());
         assert_eq!(
             spec.consumers.len(),
             2,
@@ -698,7 +703,8 @@ mod tests {
     #[test]
     fn notif_app_spec_with_router_skips_overbroad_tenant_but_boots() {
         let tenants = [TenantId("acme".into()), TenantId("".into())]; // the empty tenant is invalid.
-        let (spec, _inbox) = notif_app_spec_with_router(Config::default(), &tenants);
+        let (spec, _inbox) =
+            notif_app_spec_with_router(Config::default(), &tenants, DedupLedger::new());
         assert_eq!(
             spec.consumers.len(),
             1,

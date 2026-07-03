@@ -152,7 +152,8 @@ fn invalidator_subjects_are_a_wildcard_free_whitelist() {
         assert!(!s.is_empty());
     }
     let cache = UnfurlCache::new();
-    let consumer = UnfurlInvalidator::new(cache).into_consumer("chat.unfurl.invalidation");
+    let consumer =
+        UnfurlInvalidator::new(cache).into_consumer("chat.unfurl.invalidation", DedupLedger::new());
     assert_eq!(consumer.name().0, "chat.unfurl.invalidation");
 }
 

@@ -596,10 +596,16 @@ pub const LIVING_DOC_CONSUMER: &str = "knowledge-living-doc";
 /// trigger); the concrete embedded-view / mention-preview projection is KN-P19/P20/P21, the
 /// Search/Notif/GDPR consumers KN-P25/P27. This prompt ships the WIRING (the relay + the `*`-free
 /// consumer template + the dedup discipline), not the reaction bodies.
-pub fn knowledge_app_spec_with_consumers(config: Config, subjects: &[&str]) -> AppSpec {
+pub fn knowledge_app_spec_with_consumers(
+    config: Config,
+    subjects: &[&str],
+    dedup: DedupLedger,
+) -> AppSpec {
     // The ONE outbox the emit seam buffers into AND the relay drains (BUS-2 — no second store).
     let outbox = OutboxStore::new();
-    let dedup = DedupLedger::new();
+    // MR-009b Wave 3: the dedup ledger is INJECTED (durable-by-default composition root). The
+    // in-memory `DedupLedger::new()` is a `test-support` double the caller supplies on the
+    // in-process floor; a durable deployment injects `DedupLedger::durable` (events `serve()`).
     let mut spec = knowledge_app_spec(config);
 
     // Register the living-doc consumer through the sanctioned `consume` (rule 3 rejects `*`/empty;
@@ -886,6 +892,7 @@ mod tests {
         let spec = knowledge_app_spec_with_consumers(
             Config::default(),
             &["myelin://acme/issues/", "myelin://acme/ci/"],
+            DedupLedger::new(),
         );
         assert_eq!(
             spec.consumers.len(),
@@ -906,7 +913,7 @@ mod tests {
     /// wired (the shell still boots) — never a silently-narrowed over-broad subscription.
     #[test]
     fn wired_appspec_rejects_a_wildcard_consumer_subject() {
-        let spec = knowledge_app_spec_with_consumers(Config::default(), &["*"]);
+        let spec = knowledge_app_spec_with_consumers(Config::default(), &["*"], DedupLedger::new());
         assert!(
             spec.consumers.is_empty(),
             "a `*` subject is rejected at registration → no consumer wired (never silently widened)"

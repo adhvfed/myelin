@@ -57,7 +57,7 @@
 //!   from the auth spine); its removal belongs to the CI/attestation track, NOT this auth prompt. Left
 //!   honestly in the baseline (the scanner stays at 1 remaining structural entry).
 //!
-//! ### `no-in-memory-durable-store` (13) — the spine durable-persistence waves (P-522/523)
+//! ### `no-in-memory-durable-store` (12) — the spine durable-persistence waves (P-522/523)
 //! - **MR-009b Wave 2 FLIPPED the 3 identity spine stores GREEN (17→14):**
 //!   `principal_store.rs` `PrincipalStore` (SI-018), `tuple_store.rs` `TupleStore` (SI-019), and
 //!   `revocation.rs` `RevocationStore` (SI-020) are now durable-by-default. Their in-memory
@@ -74,13 +74,19 @@
 //! - `myelin-identity-service/src/pseudonym_erase.rs:268` — `PseudonymErasureLedger` in-mem via the
 //!     `type LedgerByPartition = BTreeMap<…>` ALIAS (alias false-negative closed; census 10.8; MR-007/009)
 //! - `myelin-events/src/outbox.rs:230`                    — `OutboxStore` in-mem (SI-007; events durable MR, P-522/523)
-//! - `myelin-events/src/dedup.rs:141`                     — `DedupLedger` (SI-023). MR-023 ADDED the
-//!   durable `DurableDedup` PG seam (`DedupLedger::durable`, backing
-//!   `myelin_storage::events_durable::DurableDedupBacking`, proven live:
-//!   `integration_mr023_events_serve`) but the `Memory(Arc<Mutex<HashSet>>)` backend variant is
-//!   still the always-compiled default — so the enum-following scanner STILL fires (supplemented,
-//!   not removed). Removed when production wires `durable` as the non-optional default (MR-009 /
-//!   route MRs), the same status as MR-007/008's principal/tuple/revocation entries.
+//! - **MR-009b Wave 3 FLIPPED the `DedupLedger` (SI-023) GREEN:** `dedup.rs` `DedupLedger` is now
+//!   durable-by-default. The `Memory(Arc<Mutex<HashSet>>)` backend variant + its `Default` + the
+//!   in-memory `::new()` constructor are `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLES;
+//!   the durable `Durable(Arc<dyn DurableDedup>)` arm is the always-compiled PRODUCTION default the
+//!   events `serve()` composition root wires (`myelin_storage::events_serve::EventsRuntime::dedup_ledger`
+//!   → `DedupLedger::durable`, backing `events_durable::DurableDedupBacking`). The scanner strips the
+//!   `test-support`-gated `Memory` variant, so the production backend enum presents non-in-memory →
+//!   the `dedup.rs:141` entry is REMOVED (13→12). Durable-by-default proven live on PG
+//!   (`integration_mr023_events_serve`); the DB-free unit tests use the double via the
+//!   `myelin-events/test-support` dev-dependency (the 3 in-process-floor consumer builders —
+//!   chat `into_consumer`, `knowledge_app_spec_with_consumers`, `notif_app_spec_with_router` — now
+//!   INJECT the ledger). NOTE — the SIBLING `outbox.rs:230` `OutboxStore` (SI-007) is NOT flipped in
+//!   Wave 3: see the residual note in the module docs below (the outbox re-point is a separate wave).
 //! - `myelin-events/src/reerase.rs:102`                   — `BusErasureLedger` in-mem (SI-039; GDPR/events durable MR)
 //! - `myelin-control-plane/src/registry.rs:111`          — `Registry` placement in-mem (SI-011; cp durable MR)
 //! - `myelin-control-plane/src/cross_cell_bridge.rs:244` — `CellResolverRegistry` in-mem (SI-052; cp/multi-cell MR)
@@ -93,6 +99,24 @@
 //! - `myelin-storage/src/restore_verify.rs:175`          — `ErasureLedger` restore-verify in-mem (SI-036 cluster; P-530)
 //! - `myelin-storage/src/reerase.rs:156`                  — `InMemoryPostPitLedger` `records: Vec<…>` (Vec false-negative closed; P-ST-14 / P-522/523)
 //! - `myelin-storage/src/blob.rs:362`                     — `FsBlobStore` `Mutex<HashMap<…, Vec<u8>>>` IN-MEMORY (no `fs::write`); byte backing is the Git/backup track (P-ST-30; SI-014/015/029)
+//!
+//! ### RESIDUAL — `outbox.rs:230` `OutboxStore` (SI-007) is a SEPARATE, higher-coupling wave (NOT Wave 3)
+//! MR-009b Wave 3 flipped the sibling `DedupLedger` (SI-023) but DELIBERATELY LEFT `OutboxStore` in
+//! this baseline. Unlike `DedupLedger` (a role struct with a `backend` ENUM whose in-memory `Memory`
+//! arm is gated behind `test-support` while the always-compiled `Durable` arm keeps the struct — and
+//! every downstream `dedup: DedupLedger` field — compiling), the in-memory-ness of `OutboxStore` IS
+//! the struct itself (`inner: Arc<Mutex<Inner>>`, no backend enum). To leave the baseline the whole
+//! `OutboxStore`/`Inner`/`OutboxTransaction` must be `test-support`-gated — which removes the type
+//! from the DEFAULT build and breaks EVERY production `outbox: OutboxStore` field/param across the
+//! in-process event floor (`myelin-events` `relay.rs`/`reindex.rs`/`telemetry.rs`/`holder.rs`/
+//! `reerase.rs` + `issues`/`git`/`flow`/`storage`/`substrate`/identity `tuple_store::write_tuples_pg`
+//! …), none of which are dev-dep-fixable (they are production code) and none re-pointable to
+//! `PgRelay::co_commit_in_tx` without threading a PG transaction through each emit site. The durable
+//! outbox (`PgRelay`, already wired in `events_serve`) uses a co-commit-in-the-caller's-tx API that
+//! CANNOT back `OutboxStore::begin/buffer/commit` without breaking the BUS-2 emit-iff-committed
+//! guarantee, so the enum-variant trick that flipped `DedupLedger` does NOT transfer. Retiring the
+//! in-process floor from production + the per-subsystem durable emit re-point is the MR-009 scope the
+//! `events_serve.rs` module docs already name — tracked as its own wave, NOT folded into Wave 3.
 //!
 //! ### Role-suffix BLIND SPOT (documented coverage boundary — NOT yet gated; verifier MR-004 review)
 //! Scanner #2 keys on the durable-role NAME suffix (`Store`/`Registry`/`Outbox`/`Ledger`) + a small
@@ -326,9 +350,13 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-ci-controlplane/src/residency_drill.rs",
         444,
     ),
-    // ---- no-in-memory-durable-store (9 here + 4 closed-false-negatives below = 13) ----
+    // ---- no-in-memory-durable-store (8 here + 4 closed-false-negatives below = 12) ----
     //      spine durable-persistence waves (P-522/523); MR-009b Wave 2 flipped the 3 identity spine
-    //      stores (principal/tuple/revocation) durable-by-default → removed from this manifest (17→14).
+    //      stores (principal/tuple/revocation) durable-by-default → removed (17→14); MR-009b Wave 3
+    //      flipped the events `DedupLedger` (SI-023) durable-by-default → `dedup.rs:141` removed
+    //      (in-memory count 13→12; total baseline 14→13).
+    //      (The sibling `outbox.rs:230` `OutboxStore`/SI-007 STAYS — its durable re-point to
+    //      `PgRelay::co_commit_in_tx` is a separate, higher-coupling wave; see the module-doc residual.)
     (
         "no-in-memory-durable-store",
         "crates/myelin-control-plane/src/cross_cell_bridge.rs",
@@ -349,11 +377,11 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-control-plane/src/registry.rs",
         111,
     ),
-    (
-        "no-in-memory-durable-store",
-        "crates/myelin-events/src/dedup.rs",
-        141,
-    ),
+    // `myelin-events/src/dedup.rs:141` `DedupLedger` (SI-023) — REMOVED by MR-009b Wave 3 (the
+    // `Memory` variant + `::new()` + `Default` are now `#[cfg(any(test, feature = "test-support"))]`
+    // test doubles; the always-compiled backend is the pool-backed `Durable(Arc<dyn DurableDedup>)`
+    // arm the events `serve()` root wires). The production enum presents non-in-memory → the scanner
+    // no longer fires. See the flipped-GREEN note in the module docs above.
     (
         "no-in-memory-durable-store",
         "crates/myelin-events/src/outbox.rs",
@@ -534,11 +562,11 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
     // un-wired gate). The counts pin the manifest shape.
     assert_eq!(
         BASELINE.len(),
-        14,
-        "the committed baseline has 14 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
-         GREEN: 17 → 14 — PrincipalStore (SI-018) / TupleStore (SI-019) / RevocationStore (SI-020) are \
-         durable-by-default now, their in-memory doubles are `test-support`-gated, so the production \
-         type presents pool-only)"
+        13,
+        "the committed baseline has 13 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
+         GREEN: 17 → 14 — PrincipalStore/TupleStore/RevocationStore are durable-by-default, their \
+         in-memory doubles `test-support`-gated; MR-009b Wave 3 then flipped the events `DedupLedger` \
+         (SI-023) durable-by-default — `dedup.rs:141` removed → 14 → 13)"
     );
     let structural = BASELINE
         .iter()
@@ -561,13 +589,15 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          to the CI track."
     );
     assert_eq!(
-        in_memory, 13,
-        "13 in-memory durable-store sites: MR-009b Wave 2 FLIPPED the 3 identity spine stores \
-         (PrincipalStore/TupleStore/RevocationStore) — their in-memory backends are now \
-         `test-support`-gated test doubles and the durable `with_pg` path is the always-compiled \
-         production default, so the scanner sees pool-only production types (16→13). The remaining 13 \
-         (S2 pseudonym + erasure ledger; events dedup/outbox/reerase; control-plane registry/bridge/ \
-         misroute; storage kms/reserve/restore/reerase/blob) flip in the later waves W3–W7."
+        in_memory, 12,
+        "12 in-memory durable-store sites: MR-009b Wave 2 FLIPPED the 3 identity spine stores \
+         (PrincipalStore/TupleStore/RevocationStore) durable-by-default (16→13), and MR-009b Wave 3 \
+         FLIPPED the events `DedupLedger` (SI-023) durable-by-default — its `Memory` arm + `::new()` + \
+         `Default` are now `test-support`-gated test doubles and the pool-backed `Durable` arm is the \
+         always-compiled production default the events `serve()` root wires (13→12). The remaining 12 \
+         (S2 pseudonym + erasure ledger; events OUTBOX (SI-007, a separate higher-coupling wave) + \
+         reerase; control-plane registry/bridge/misroute; storage kms/reserve/restore/reerase/blob) \
+         flip in the later waves."
     );
     assert_eq!(
         bare_pool, 0,
