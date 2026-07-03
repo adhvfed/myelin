@@ -565,6 +565,13 @@ impl StoreBackedCheck {
     /// on top via [`StoreBackedCheck::admit_fragment`] / [`NamespaceEngine::admit`]). A fresh S8
     /// reverse index is created; for a live service the index fed off the bus is shared via
     /// [`StoreBackedCheck::with_index`].
+    ///
+    /// **MR-009b Wave 2 — the IN-MEMORY test-double entry point (compiled ONLY under
+    /// `#[cfg(any(test, feature = "test-support"))]`).** It takes an in-memory [`TupleStore`] and
+    /// builds an in-memory [`revocation::RevocationStore`]; the PRODUCTION default is
+    /// [`StoreBackedCheck::with_pg`] (durable S3 + S7 over a live pool). Downstream crates reach this
+    /// via the `myelin-identity-service/test-support` dev-dependency.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(tuples: TupleStore) -> StoreBackedCheck {
         StoreBackedCheck::with_index(tuples, ReverseIndex::new())
     }
@@ -573,6 +580,10 @@ impl StoreBackedCheck {
     /// [`ReverseIndex`] (the one fed off the bus by [`reverse_index::ReverseIndexConsumer`]), so the
     /// `list_objects` slot materialises the `Ids` path / targets the `Filter` push-down over the live
     /// projection. The core hierarchy is pre-loaded; subsystem fragments admit on top.
+    ///
+    /// **MR-009b Wave 2 — the IN-MEMORY test-double entry point (`test-support`-gated).** It builds an
+    /// in-memory [`revocation::RevocationStore`]; the PRODUCTION default is [`StoreBackedCheck::with_pg`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_index(tuples: TupleStore, index: ReverseIndex) -> StoreBackedCheck {
         let revocations = revocation::RevocationStore::new();
         // MR-012: the per-run-token signer is the REAL PASETO v4.public (Ed25519) signer over a fresh
@@ -623,6 +634,59 @@ impl StoreBackedCheck {
             kms,
             cell_authority,
         }
+    }
+
+    /// **The PRODUCTION `check` slot over the DURABLE S3 + S7 stores (MR-009b Wave 2 — the
+    /// durable-by-default composition root).** Wires the real depth-bounded engine over a
+    /// [`TupleStore::with_pg`] (the live `rebac_tuple` edge set) + a [`RevocationStore::with_pg`] (the
+    /// live `revocation` denylist), both driven through the MR-022 [`myelin_storage::SubstrateProvider`]
+    /// pool + `with_tenant_tx` convention (the sync API bridges to the async backing via the supplied
+    /// `handle`). This is the DEFAULT production wiring the service boot uses (mirrors the
+    /// `myelin_storage::events_serve` durable composition root); the in-memory
+    /// [`StoreBackedCheck::new`]/[`StoreBackedCheck::with_index`] are the `test-support`-gated unit-test
+    /// entry points.
+    ///
+    /// `outbox` is the S3 store's emit path (the durable [`myelin_storage::pgrelay`] co-commit is the
+    /// W3 follow-on; here the caller supplies the outbox the relay drains). `kms` is the shared cell
+    /// engine S1/S2 seal under. The S2 pseudonym map + PII-free erasure ledger remain in-memory (the
+    /// named W6 durable follow-on — they are separate baseline entries, not flipped in Wave 2).
+    pub fn with_pg(
+        provider: myelin_storage::SubstrateProvider,
+        outbox: myelin_events::OutboxStore,
+        kms: std::sync::Arc<myelin_storage::KmsEngine>,
+        cell_authority: std::sync::Arc<CellTokenAuthority>,
+        handle: tokio::runtime::Handle,
+    ) -> StoreBackedCheck {
+        // The durable S3 tuple store (the live `rebac_tuple` edge set) — the production default.
+        let tuples = TupleStore::with_pg(
+            outbox,
+            myelin_storage::DurableTupleBacking::new(provider.clone()),
+            handle.clone(),
+        );
+        // The durable S7 revocation denylist (the live `revocation` mirror) — the production default.
+        let revocations = RevocationStore::with_pg(
+            myelin_storage::DurableRevocationBacking::new(provider),
+            handle,
+        );
+        // The REAL PASETO v4.public (Ed25519) run-token signer over the cell authority (one signer,
+        // one revocation oracle): the minter registers per-run TTLs into the SAME durable S7 store.
+        let signer = std::sync::Arc::new(PasetoCapabilitySigner::new(
+            cell_authority.clone(),
+            PROD_RUN_TOKEN_PASETO_TTL_SECS,
+        ));
+        let minter = mint::RunTokenMinter::with_signer_and_tuples(
+            revocations.clone(),
+            Some(tuples.clone()),
+            signer,
+        );
+        StoreBackedCheck::with_kms(
+            tuples,
+            ReverseIndex::new(),
+            revocations,
+            minter,
+            kms,
+            cell_authority,
+        )
     }
 
     /// **The cell token trust anchor (the PUBLIC half) the minted per-run tokens verify under

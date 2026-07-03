@@ -148,17 +148,20 @@ xmlparser = "0.13"
 # no pure-Rust X.509 chain verifier is in the lock, and a half-built one would be a security regression.
 ciborium = "0.2"
 # ------------------------------------------------------------------------------------------
-# MR-007 (SI-018/019): the durable PG backings for the S1 principal + S3 tuple stores live in
-# myelin-storage behind its `integration` feature (the real sqlx client). The identity-layer
-# stores delegate to them through the MR-022 SubstrateProvider + with_tenant_tx convention. The
-# sync store API drives the async backing via a `tokio::runtime::Handle` (block_in_place +
-# block_on — the same bridge ValkeyCache/S3BlobStore use). OPTIONAL: the DEFAULT build compiles
-# none of this (stays DB-free, in-memory test-double backing); `--features integration` pulls it.
-tokio = { workspace = true, optional = true }
-myelin-config = { workspace = true, optional = true }
-# The MR-007 integration test reaches the live pool directly for migration setup + the GUC-bleed
+# MR-009b Wave 2 (SI-018/019/020): the durable PG backings for the S1 principal + S3 tuple + S7
+# revocation stores live in myelin-storage and are NOW compiled unconditionally (W1 made the storage
+# durable deps non-optional). The identity-layer stores delegate to them through the MR-022
+# SubstrateProvider + with_tenant_tx convention as the PRODUCTION DEFAULT; the sync store API drives
+# the async backing via a `tokio::runtime::Handle` (block_in_place + block_on — the same bridge
+# ValkeyCache/S3BlobStore use). These deps are NON-OPTIONAL (mirror W1): the durable `with_pg` path
+# is the always-compiled default, so `tokio`/`myelin-config` must be present in the DEFAULT build. The
+# in-memory doubles move behind `test-support` (below). `integration` is now a TEST-SELECTOR only.
+tokio = { workspace = true }
+myelin-config = { workspace = true }
+# The MR-007/008 integration tests reach the live pool directly for migration setup + the GUC-bleed
 # probe + RLS-bypassing admin cleanup (the same posture as myelin-storage's integration tests).
-sqlx = { workspace = true, optional = true }
+# NON-OPTIONAL (mirror W1) — used by the live-PG tests gated by `required-features = ["integration"]`.
+sqlx = { workspace = true }
 
 [dev-dependencies]
 # MR-010a: the OIDC negative/positive corpus MINTS real RSA keys to sign genuine test tokens (the
@@ -183,12 +186,25 @@ myelin-client = { path = "../myelin-client" }
 # DEV-only: myelin-agent is a frozen contract carrier; nothing in the identity-service production DAG
 # depends on it (the live EffectApi body is AG-P6 → P-218; this drill proves Id's half is consumed).
 myelin-agent = { path = "../myelin-agent" }
+# MR-009b Wave 2 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN
+# `tests/*.rs` integration-test files (a separate compilation unit that links the NORMAL lib, where
+# `#[cfg(test)]` is NOT active). The in-memory doubles (`PrincipalStore::new`/`TupleStore::new`/
+# `RevocationStore::new`/`StoreBackedCheck::new`) are now `#[cfg(any(test, feature = "test-support"))]`,
+# so the crate's own CDC/drill/e2e tests reach them ONLY when `test-support` is on. Listing the crate
+# as a DEV-dependency of itself with the feature is the sanctioned Cargo idiom (dev-dep cycles are
+# allowed; it does NOT affect the normal `cargo build`, which stays durable-by-default). This keeps
+# `cargo test -p myelin-identity-service` (DB-free) green without polluting the production build.
+myelin-identity-service = { path = ".", features = ["test-support"] }
 
 [features]
 default = []
-# Compile the durable PG store bindings + the live-PG integration tests (run against the
-# docker-compose dev stack). Turns on myelin-storage's integration feature (the backings + provider).
-integration = ["dep:tokio", "dep:myelin-config", "dep:sqlx", "myelin-storage/integration"]
+# MR-009b Wave 2: `integration` is now a TEST-SELECTOR only. The durable deps (tokio/myelin-config/
+# sqlx) are non-optional [dependencies] above, so the durable `with_pg` store path compiles in the
+# DEFAULT build (durable-by-default); `integration` no longer carries any `dep:` activation. It stays
+# the `required-features` marker on the live-PG tests (`tests/integration_*.rs`, the mr007/008/009/011
+# drills) + the `mr009_kill9_writer` bin, and turns on myelin-storage's integration feature (the live
+# broker surface for the durable tests). Do NOT delete it — the live-backend tests gate on it.
+integration = ["myelin-storage/integration"]
 
 # MR-009b Wave 0 — the `test-support` cargo feature (alias `memory`). It gates the identity spine's
 # in-memory durable-store DOUBLES (PrincipalStore/TupleStore/RevocationStore/PseudonymStore Inner +

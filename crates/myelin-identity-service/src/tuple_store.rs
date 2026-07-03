@@ -181,6 +181,9 @@ impl StoredTuple {
 /// The key a stored tuple is uniquely identified by within its `(tenant, region)` partition —
 /// the `object#relation@subject` edge identity (a re-add of the same edge is idempotent; a
 /// remove targets exactly this key).
+// The edge-identity key of the in-memory test-double [`Inner`] partition map (MR-009b Wave 2 —
+// `test-support`-gated; the durable PG path keys on the `rebac_tuple` primary key in SQL).
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TupleKey {
     object: String,
@@ -188,6 +191,7 @@ struct TupleKey {
     subject: String,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl TupleKey {
     fn of(t: &RelationTuple) -> TupleKey {
         TupleKey {
@@ -200,6 +204,11 @@ impl TupleKey {
 
 /// The shared inner state of a [`TupleStore`] (behind `Arc<Mutex<…>>` so the store is a cloneable
 /// handle and `write_tuples` is atomic under one lock).
+///
+/// **MR-009b Wave 2 — TEST DOUBLE (compiled ONLY under `#[cfg(any(test, feature = "test-support"))]`).**
+/// The PRODUCTION default is the durable PG backing ([`PgTupleBacking`], via [`TupleStore::with_pg`]);
+/// this in-memory `Inner` is the DB-free unit-test double (SI-019 leaves the baseline).
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 struct Inner {
     /// The committed tuples, keyed by `(tenant, region)` partition then edge identity. The OUTER
@@ -237,17 +246,20 @@ pub struct TupleStore {
     holder: OltpStoreHolder,
 }
 
-/// The S3 store backing: the REAL durable PG `rebac_tuple` edge set (MR-007) or the in-memory
-/// test-double. The durable system-of-record is the Pg variant; `Memory` is an explicit test double
-/// (the DB-free default build, the unit tests). Splitting the backing OUT of the role struct's
-/// direct fields is what lets the `no-in-memory-durable-store` ratchet record the shortcut's removal:
-/// `TupleStore` no longer holds an in-memory collection (it holds a backing that CAN be durable).
+/// The S3 store backing: the REAL durable PG `rebac_tuple` edge set (MR-007) — the PRODUCTION
+/// default (MR-009b Wave 2) — or the in-memory test-double. Splitting the backing OUT of the role
+/// struct's direct fields is what lets the `no-in-memory-durable-store` ratchet record the shortcut's
+/// removal: the PRODUCTION-compiled enum presents ONLY the pool-backed `Pg` variant (the `Memory`
+/// variant is `test-support`-gated, which the scanner strips as a test double), so `TupleStore` no
+/// longer holds an in-memory collection in the production graph (SI-019 leaves the baseline).
 #[derive(Clone)]
 enum TupleBackend {
-    /// The in-memory test-double (the DB-free default build). NOT the production system-of-record.
+    /// The in-memory test-double — MR-009b Wave 2: compiled ONLY under
+    /// `#[cfg(any(test, feature = "test-support"))]`. NOT the production system-of-record.
+    #[cfg(any(test, feature = "test-support"))]
     Memory(Arc<Mutex<Inner>>),
-    /// The REAL durable PG backing over the MR-022 provider pool + `with_tenant_tx` convention.
-    #[cfg(feature = "integration")]
+    /// The REAL durable PG backing over the MR-022 provider pool + `with_tenant_tx` convention — the
+    /// PRODUCTION DEFAULT (always compiled as of MR-009b Wave 2).
     Pg(PgTupleBacking),
 }
 
@@ -256,27 +268,52 @@ enum TupleBackend {
 /// `ValkeyCache`/`S3BlobStore` use). The per-object zookie watermark is in-process CONSISTENCY
 /// metadata (the durable system-of-record is the EDGE set in PG); the persisted-zookie/read-side is
 /// the named P-ID-12 / MR-009 floor — a fresh instance reads the durable edges back and treats
-/// not-yet-seen objects as at the genesis revision.
-#[cfg(feature = "integration")]
+/// not-yet-seen objects as at the genesis revision. The production default (always compiled, W2).
 #[derive(Clone)]
 struct PgTupleBacking {
     backing: Arc<myelin_storage::DurableTupleBacking>,
     rt: tokio::runtime::Handle,
-    /// `(tenant, region, object)` → the latest zookie observed FOR THIS PROCESS (consistency
-    /// metadata, not the durable edge set). Reset on a fresh instance; the edges themselves persist.
-    zookies: Arc<Mutex<HashMap<(String, String, String), Zookie>>>,
+    /// The in-process zookie WATERMARK — REBUILDABLE consistency metadata, NOT the durable
+    /// system-of-record (the edge set lives in PG; a fresh instance re-derives it, treating
+    /// not-yet-seen objects as the genesis revision — the named P-ID-12 / MR-009 read-side floor).
+    /// Held as a distinct in-memory index type ([`PgZookieWatermark`]) so the durable backing does
+    /// NOT present a bare in-memory collection to the `no-in-memory-durable-store` scanner (a durable
+    /// PG backing carrying a rebuildable consistency cache is pool-backed, not an in-memory store).
+    watermark: PgZookieWatermark,
+}
+
+/// The in-process zookie watermark for the Pg tuple path: `(tenant, region, object)` → the latest
+/// zookie observed FOR THIS PROCESS. **REBUILDABLE consistency metadata, NOT a system-of-record** —
+/// the durable edge set is in PG; this map is reset on a fresh instance (the persisted-zookie
+/// read-side is the named P-ID-12 / MR-009 floor). A pure in-memory index/cache the durable backing
+/// consults for precondition/watermark reads, not the tuple store's data of record.
+#[derive(Clone, Default)]
+struct PgZookieWatermark {
+    inner: Arc<Mutex<HashMap<(String, String, String), Zookie>>>,
+}
+
+impl PgZookieWatermark {
+    /// Lock the watermark index (poison-tolerant — a poisoned lock is a same-process panic-during-hold,
+    /// which the consistency cache recovers from; the durable edges are unaffected).
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String, String), Zookie>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 impl TupleStore {
-    /// Build the S3 store over a service-owned [`OutboxStore`] (the SAME store the `serve` relay
-    /// drains — so the emitted `iam.tuple_written` is published by the lifecycle). The store
-    /// auto-registers as a `PersonalDataHolder` on construction (opening IS registering, §3.4).
+    /// Build the S3 store over the in-memory TEST-DOUBLE backing (MR-009b Wave 2: compiled ONLY under
+    /// `#[cfg(any(test, feature = "test-support"))]`). The PRODUCTION constructor is
+    /// [`TupleStore::with_pg`]; this `::new` is the DB-free unit-test entry point downstream crates
+    /// reach via the `test-support` dev-dependency. Auto-registers as a `PersonalDataHolder` (§3.4).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(outbox: OutboxStore) -> TupleStore {
         TupleStore::with_minter(outbox, Arc::new(MonotonicMinter::new()))
     }
 
     /// Build the S3 store with an explicit id-minter (so a test can inject a deterministic one;
-    /// the real wall-clock+random ULID source implements the same [`IdMinter`] trait, P-S12).
+    /// the real wall-clock+random ULID source implements the same [`IdMinter`] trait, P-S12). The
+    /// in-memory TEST-DOUBLE constructor (MR-009b Wave 2 — `test-support`-gated).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_minter(outbox: OutboxStore, minter: Arc<dyn IdMinter>) -> TupleStore {
         let holder = OltpStoreHolder::new(S3_HOLDER);
         // Opening IS registering (§3.4, GD-3): the S3 store auto-registers as a PersonalDataHolder
@@ -296,7 +333,7 @@ impl TupleStore {
     /// `with_tenant_tx` convention (RLS-scoped, no GUC bleed). `rt` is the tokio runtime handle the
     /// sync API drives the async backing on. The outbox emit + zookie semantics are preserved (the
     /// event still co-commits-iff-the-durable-write-succeeds). The store auto-registers as a holder.
-    #[cfg(feature = "integration")]
+    /// **The PRODUCTION default (MR-009b Wave 2) — always compiled.**
     pub fn with_pg(
         outbox: OutboxStore,
         backing: myelin_storage::DurableTupleBacking,
@@ -305,8 +342,7 @@ impl TupleStore {
         TupleStore::with_pg_minter(outbox, Arc::new(MonotonicMinter::new()), backing, rt)
     }
 
-    /// [`Self::with_pg`] with an explicit id-minter (deterministic in tests).
-    #[cfg(feature = "integration")]
+    /// [`Self::with_pg`] with an explicit id-minter (deterministic in tests). Always compiled (W2).
     pub fn with_pg_minter(
         outbox: OutboxStore,
         minter: Arc<dyn IdMinter>,
@@ -319,7 +355,7 @@ impl TupleStore {
             backend: TupleBackend::Pg(PgTupleBacking {
                 backing: Arc::new(backing),
                 rt,
-                zookies: Arc::new(Mutex::new(HashMap::new())),
+                watermark: PgZookieWatermark::default(),
             }),
             revision: Arc::new(AtomicU64::new(0)),
             outbox,
@@ -367,6 +403,7 @@ impl TupleStore {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S3_TABLE));
         let part_key = Self::part_key(scope);
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             TupleBackend::Memory(inner_arc) => {
                 let inner = Self::mem_lock(inner_arc);
                 inner
@@ -383,9 +420,8 @@ impl TupleStore {
                     })
                     .unwrap_or_else(|| self.current_zookie())
             }
-            #[cfg(feature = "integration")]
             TupleBackend::Pg(pg) => {
-                let zk = pg.zookies.lock().unwrap_or_else(|e| e.into_inner());
+                let zk = pg.watermark.lock();
                 zk.get(&(part_key.0, part_key.1, object.to_string()))
                     .cloned()
                     .unwrap_or_else(|| self.current_zookie())
@@ -399,6 +435,7 @@ impl TupleStore {
     pub fn tuples_in(&self, scope: &TenantScope) -> Vec<StoredTuple> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S3_TABLE));
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             TupleBackend::Memory(inner_arc) => {
                 let inner = Self::mem_lock(inner_arc);
                 inner
@@ -407,7 +444,6 @@ impl TupleStore {
                     .map(|p| p.values().cloned().collect())
                     .unwrap_or_default()
             }
-            #[cfg(feature = "integration")]
             TupleBackend::Pg(pg) => {
                 let tenant = scope.tenant().0.clone();
                 let region = scope.region().0.clone();
@@ -417,7 +453,7 @@ impl TupleStore {
                 let edges = pg
                     .block(pg.backing.edges_in(&tenant, &region))
                     .unwrap_or_default();
-                let zk = pg.zookies.lock().unwrap_or_else(|e| e.into_inner());
+                let zk = pg.watermark.lock();
                 edges
                     .into_iter()
                     .map(|(object, relation, subject)| {
@@ -465,6 +501,13 @@ impl TupleStore {
     ///
     /// Returns the advanced [`Zookie`] to stamp on the object, or a [`WriteError`] (in which case
     /// NOTHING changed and NOTHING emitted — emit-iff-committed).
+    // `expires_at` (the auto-expiring per-run grant TTL) is consumed only by the in-memory test-double
+    // write path; the durable `rebac_tuple` has no `expires_at` column (the named MR-009 boundary), so
+    // in the durable-only default build it is unused — allowed rather than gated (it is public API).
+    #[cfg_attr(
+        not(any(test, feature = "test-support")),
+        allow(unused_variables)
+    )]
     pub fn write_tuples(
         &self,
         scope: &TenantScope,
@@ -479,6 +522,7 @@ impl TupleStore {
         // statement; a tenant-less write is unconstructable (you need a TenantScope here).
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S3_TABLE));
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             TupleBackend::Memory(inner_arc) => self.write_tuples_memory(
                 inner_arc,
                 scope,
@@ -488,7 +532,6 @@ impl TupleStore {
                 expires_at,
                 &occurred_at,
             ),
-            #[cfg(feature = "integration")]
             TupleBackend::Pg(pg) => {
                 self.write_tuples_pg(pg, scope, actor, deltas, precondition, &occurred_at)
             }
@@ -530,8 +573,10 @@ impl TupleStore {
         Ok(tx)
     }
 
-    /// The in-memory test-double write path (the DB-free default build). Atomic under one lock; the
-    /// state change + the event co-commit on one outbox transaction.
+    /// The in-memory test-double write path (MR-009b Wave 2: compiled ONLY under
+    /// `#[cfg(any(test, feature = "test-support"))]`). Atomic under one lock; the state change + the
+    /// event co-commit on one outbox transaction. The PRODUCTION path is [`Self::write_tuples_pg`].
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(clippy::too_many_arguments)]
     fn write_tuples_memory(
         &self,
@@ -600,7 +645,6 @@ impl TupleStore {
     /// commit (so a failed durable apply emits NOTHING). The zookie/precondition use the in-process
     /// watermark (the durable system-of-record is the EDGE set; the persisted-zookie read-side is the
     /// named P-ID-12 / MR-009 floor).
-    #[cfg(feature = "integration")]
     fn write_tuples_pg(
         &self,
         pg: &PgTupleBacking,
@@ -660,7 +704,7 @@ impl TupleStore {
 
         // Advance the in-process zookie watermark for the touched objects.
         {
-            let mut zk = pg.zookies.lock().unwrap_or_else(|e| e.into_inner());
+            let mut zk = pg.watermark.lock();
             for d in deltas {
                 let obj = match d {
                     TupleDelta::Add(t) | TupleDelta::Remove(t) => t.object.0.clone(),
@@ -673,7 +717,6 @@ impl TupleStore {
 
     /// The newest in-process zookie among the objects the `deltas` touch (the Pg-path precondition
     /// read). `None` if none of those objects has been written in this process yet.
-    #[cfg(feature = "integration")]
     fn pg_object_zookie(
         &self,
         pg: &PgTupleBacking,
@@ -681,7 +724,7 @@ impl TupleStore {
         region: &str,
         deltas: &[TupleDelta],
     ) -> Option<Zookie> {
-        let zk = pg.zookies.lock().unwrap_or_else(|e| e.into_inner());
+        let zk = pg.watermark.lock();
         deltas
             .iter()
             .filter_map(|d| {
@@ -765,7 +808,9 @@ impl TupleStore {
     }
 
     /// The newest zookie among the objects the `deltas` touch, within a locked partition (the
-    /// precondition read). `None` if none of those objects has a tuple yet.
+    /// precondition read). `None` if none of those objects has a tuple yet. Memory-path helper
+    /// (MR-009b Wave 2 — `test-support`-gated, it takes the test-double [`Inner`]).
+    #[cfg(any(test, feature = "test-support"))]
     fn object_zookie_locked(
         inner: &Inner,
         part_key: &(String, String),
@@ -786,13 +831,14 @@ impl TupleStore {
     }
 
     /// Lock the in-memory test-double backing (the Memory arm). Static — it takes the backing arc so
-    /// the borrow checker is happy across the dispatch.
+    /// the borrow checker is happy across the dispatch. Memory-path helper (MR-009b Wave 2 —
+    /// `test-support`-gated).
+    #[cfg(any(test, feature = "test-support"))]
     fn mem_lock(arc: &Arc<Mutex<Inner>>) -> std::sync::MutexGuard<'_, Inner> {
         arc.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
-#[cfg(feature = "integration")]
 impl PgTupleBacking {
     /// Drive an async backing call from the sync store API (the same `block_in_place`+`block_on`
     /// bridge `ValkeyCache`/`S3BlobStore` use — safe inside a multi-thread runtime).

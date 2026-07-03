@@ -57,6 +57,9 @@ tokio = { version = "1", features = ["rt", "net", "macros", "io-util"] }
 # PASETO capability token (genuine Ed25519 crypto).
 myelin-edge = { path = "../myelin-edge" }
 myelin-identity = { path = "../myelin-identity" }
-myelin-identity-service = { path = "../myelin-identity-service" }
+# MR-009b Wave 2: enable `test-support` so this crate's DEV tests reach the identity in-memory
+# doubles (PrincipalStore/TupleStore/RevocationStore/StoreBackedCheck `::new`) which moved behind
+# `#[cfg(any(test, feature = "test-support"))]`. DEV-only — never in the production DAG.
+myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
 myelin-storage = { path = "../myelin-storage" }
 myelin-tenancy = { path = "../myelin-tenancy" }

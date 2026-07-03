@@ -59,9 +59,14 @@
 use myelin_events::Timestamp;
 use myelin_identity::{PrincipalId, RevokeTarget};
 use myelin_storage::TenantScope;
+// `BTreeMap`/`Mutex` back the in-memory two-layer test-double [`Inner`] only (MR-009b Wave 2 —
+// `test-support`-gated); the durable production path uses the PG backing.
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Mutex;
 
 /// **Compare two RFC3339 timestamps as INSTANTS (not lexically).** Returns `Some(now < expires_at)`
 /// — `true` iff `now` is STRICTLY BEFORE the expiry instant. A raw lexical string compare of the
@@ -154,13 +159,21 @@ pub struct RevocationEntry {
 /// The `(tenant, region, kind, handle)` mirror key — the durable PG-mirror primary key. The
 /// `(tenant, region)` prefix is the partition (no cross-tenant query path: a consult is built from
 /// a verified [`TenantScope`], never a path); the `(kind, handle)` suffix is the entry identity an
-/// idempotent re-revoke collapses onto.
+/// idempotent re-revoke collapses onto. Keys the in-memory test-double mirror/fast maps (MR-009b
+/// Wave 2 — `test-support`-gated; the durable PG mirror keys on the same tuple in SQL).
+#[cfg(any(test, feature = "test-support"))]
 type MirrorKey = (String, String, RevokedKind, String);
 
 /// The shared inner state of a [`RevocationStore`] (behind `Arc<Mutex<…>>` so the store is a
 /// cloneable handle every surface shares). The architecture's **two layers** are both modelled
 /// here: `mirror` is the durable PG-mirror (the recovery source of truth), `fast` is the
 /// Redis/Valkey-class hot denylist rebuilt from it.
+///
+/// **MR-009b Wave 2 — TEST DOUBLE (compiled ONLY under `#[cfg(any(test, feature = "test-support"))]`).**
+/// The PRODUCTION default is the durable PG backing ([`PgRevocationBacking`], via
+/// [`RevocationStore::with_pg`]); this in-memory two-layer model is the DB-free unit-test double
+/// (SI-020 leaves the baseline).
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 struct Inner {
     /// The durable PG MIRROR — the source of truth a crash recovers from. Keyed
@@ -198,32 +211,38 @@ pub struct RevocationStore {
     telemetry: Arc<RevocationTelemetry>,
 }
 
-/// The S7 store backing: the REAL durable PG tables (MR-008) or the in-memory two-layer test-double.
-/// Splitting the backing OUT of the role struct's direct fields lets the `no-in-memory-durable-store`
-/// ratchet (now enum-following, MR-007) record the shortcut's status: `RevocationStore` holds a
-/// backing that CAN be durable, but the `Memory(Arc<Mutex<Inner>>)` variant still holds the
-/// collection and is the always-compiled default — so the scanner still fires (honestly) until
-/// production wires `with_pg` as the non-optional default (MR-009).
+/// The S7 store backing: the REAL durable PG tables (MR-008) — the PRODUCTION default (MR-009b Wave
+/// 2) — or the in-memory two-layer test-double. Splitting the backing OUT of the role struct's direct
+/// fields lets the `no-in-memory-durable-store` ratchet (enum-following, MR-007) record the shortcut's
+/// removal: the PRODUCTION-compiled enum presents ONLY the pool-backed `Pg` variant (the `Memory`
+/// variant is `test-support`-gated, which the scanner strips as a test double), so `RevocationStore`
+/// no longer holds an in-memory collection in the production graph (SI-020 leaves the baseline).
 #[derive(Clone)]
 enum RevocationBackend {
-    /// The in-memory two-layer (mirror + fast) test-double. NOT the production system-of-record.
+    /// The in-memory two-layer (mirror + fast) test-double — MR-009b Wave 2: compiled ONLY under
+    /// `#[cfg(any(test, feature = "test-support"))]`. NOT the production system-of-record.
+    #[cfg(any(test, feature = "test-support"))]
     Memory(Arc<Mutex<Inner>>),
-    /// The REAL durable PG backing over the MR-022 provider pool + `with_tenant_tx` convention.
-    #[cfg(feature = "integration")]
+    /// The REAL durable PG backing over the MR-022 provider pool + `with_tenant_tx` convention — the
+    /// PRODUCTION DEFAULT (always compiled as of MR-009b Wave 2).
     Pg(PgRevocationBacking),
 }
 
 /// The PG-backed S7 backing (MR-008): the durable `revocation` mirror + `run_token_teardown` set +
 /// the sync→async bridge (`tokio::runtime::Handle` driving `block_in_place`+`block_on`). On this path
 /// the durable table IS the recovery source of truth — the "fast Redis/Valkey layer" collapses into
-/// the DB (reads hit the table directly; `recover_from_mirror` is a no-op, nothing to rebuild).
-#[cfg(feature = "integration")]
+/// the DB (reads hit the table directly; `recover_from_mirror` is a no-op, nothing to rebuild). The
+/// production default (always compiled as of MR-009b Wave 2).
 #[derive(Clone)]
 struct PgRevocationBacking {
     backing: Arc<myelin_storage::DurableRevocationBacking>,
     rt: tokio::runtime::Handle,
 }
 
+/// The in-memory test-double `Default` (MR-009b Wave 2 — `test-support`-gated, it calls the
+/// in-memory [`RevocationStore::new`]). The production store is built durably via
+/// [`RevocationStore::with_pg`], which has no `Default`.
+#[cfg(any(test, feature = "test-support"))]
 impl Default for RevocationStore {
     fn default() -> RevocationStore {
         RevocationStore::new()
@@ -231,7 +250,11 @@ impl Default for RevocationStore {
 }
 
 impl RevocationStore {
-    /// A fresh (empty) S7 denylist (the in-memory two-layer test-double).
+    /// A fresh (empty) S7 denylist over the in-memory TEST-DOUBLE backing (MR-009b Wave 2: compiled
+    /// ONLY under `#[cfg(any(test, feature = "test-support"))]`). The PRODUCTION constructor is
+    /// [`RevocationStore::with_pg`]; this `::new` is the DB-free unit-test entry point downstream
+    /// crates reach via the `test-support` dev-dependency.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new() -> RevocationStore {
         RevocationStore {
             backend: RevocationBackend::Memory(Arc::new(Mutex::new(Inner::default()))),
@@ -244,8 +267,8 @@ impl RevocationStore {
     /// pool + `with_tenant_tx` convention (RLS-scoped, no GUC bleed). `rt` is the tokio runtime handle
     /// the sync API drives the async backing on. Preserves the API + telemetry + `(tenant, region)`
     /// scoping; expiry (`expires_at`) is durable so a revoked/expired token reads correctly after a
-    /// fresh store instance over the same pool.
-    #[cfg(feature = "integration")]
+    /// fresh store instance over the same pool. **The PRODUCTION default (MR-009b Wave 2) — always
+    /// compiled.**
     pub fn with_pg(
         backing: myelin_storage::DurableRevocationBacking,
         rt: tokio::runtime::Handle,
@@ -325,6 +348,7 @@ impl RevocationStore {
     pub fn tear_down_run_token(&self, scope: &TenantScope, jti: &str, now: Timestamp) {
         // Record the teardown in the durable, crash-safe teardown set (survives a fast-layer rebuild).
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             RevocationBackend::Memory(inner) => {
                 let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                 guard.run_teardowns.insert((
@@ -333,7 +357,6 @@ impl RevocationStore {
                     jti.to_string(),
                 ));
             }
-            #[cfg(feature = "integration")]
             RevocationBackend::Pg(pg) => {
                 // A teardown that cannot durably land must NOT silently succeed (a lost teardown would
                 // let a torn-down token validate) — fail LOUD.
@@ -390,6 +413,7 @@ impl RevocationStore {
             }
         };
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             RevocationBackend::Memory(inner) => {
                 let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                 let torn_down = guard.run_teardowns.contains(&(
@@ -406,7 +430,6 @@ impl RevocationStore {
                     Some(entry) => decide(false, entry.expires_at.as_ref().map(|t| t.0.as_str())),
                 }
             }
-            #[cfg(feature = "integration")]
             RevocationBackend::Pg(pg) => {
                 // Read the durable teardown set + the revocation row. On a DB error, fail CLOSED:
                 // return `Unknown` (a non-Live state every caller denies on) — never report a token
@@ -448,6 +471,7 @@ impl RevocationStore {
             }
         };
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             RevocationBackend::Memory(inner) => {
                 let key = self.key(scope, kind, handle);
                 let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -456,7 +480,6 @@ impl RevocationStore {
                     Some(entry) => revoked_if_present(entry.expires_at.as_ref().map(|t| t.0.as_str())),
                 }
             }
-            #[cfg(feature = "integration")]
             RevocationBackend::Pg(pg) => {
                 // Read the durable row. On a DB error, fail CLOSED: return `true` (deny) — never
                 // report a revoked handle as not-revoked because the consult could not complete (the
@@ -477,13 +500,13 @@ impl RevocationStore {
     /// entry; recovery re-derives the same fast layer). Idempotent (callable any number of times).
     pub fn recover_from_mirror(&self) {
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             RevocationBackend::Memory(inner) => {
                 let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                 guard.fast = guard.mirror.clone();
             }
             // On the Pg path the durable table IS the mirror — reads hit it directly, so there is no
             // fast layer to lose + rebuild. Recovery is a no-op (the durability is the DB's).
-            #[cfg(feature = "integration")]
             RevocationBackend::Pg(_) => {}
         }
     }
@@ -492,6 +515,7 @@ impl RevocationStore {
     /// + idempotency assertions — a double-revoke must NOT grow this).
     pub fn revocation_count(&self, scope: &TenantScope) -> usize {
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             RevocationBackend::Memory(inner) => {
                 let (t, r) = (scope.tenant().0.clone(), scope.region().0.clone());
                 let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -501,7 +525,6 @@ impl RevocationStore {
                     .filter(|(kt, kr, _, _)| *kt == t && *kr == r)
                     .count()
             }
-            #[cfg(feature = "integration")]
             RevocationBackend::Pg(pg) => pg
                 .block(pg.backing.count(&scope.tenant().0))
                 .map(|n| n as usize)
@@ -522,6 +545,7 @@ impl RevocationStore {
         expires_at: Option<Timestamp>,
     ) {
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             RevocationBackend::Memory(inner) => {
                 let key = self.key(scope, kind, handle.clone());
                 let entry = RevocationEntry {
@@ -540,7 +564,6 @@ impl RevocationStore {
                 // (2) Fast Redis/Valkey-class layer (mirror of the mirror — same idempotent semantics).
                 guard.fast.entry(key).or_insert(entry);
             }
-            #[cfg(feature = "integration")]
             RevocationBackend::Pg(pg) => {
                 // The durable INSERT is idempotent (`ON CONFLICT DO NOTHING` preserves the FIRST
                 // `revoked_at`). A revoke that cannot durably land must NOT silently succeed (a lost
@@ -560,7 +583,9 @@ impl RevocationStore {
     }
 
     /// Build the `(tenant, region, kind, handle)` mirror key from the verified scope (the partition
-    /// prefix is the scope's `(tenant, region)`, never a path — the tenant-predicate floor).
+    /// prefix is the scope's `(tenant, region)`, never a path — the tenant-predicate floor). Used by
+    /// the in-memory test-double arms only (MR-009b Wave 2 — `test-support`-gated).
+    #[cfg(any(test, feature = "test-support"))]
     fn key(&self, scope: &TenantScope, kind: RevokedKind, handle: String) -> MirrorKey {
         (
             scope.tenant().0.clone(),
@@ -577,7 +602,6 @@ impl RevocationStore {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         match &self.backend {
             RevocationBackend::Memory(inner) => inner.lock().unwrap_or_else(|e| e.into_inner()),
-            #[cfg(feature = "integration")]
             RevocationBackend::Pg(_) => {
                 panic!("lock() is the in-memory test-double accessor; the Pg backend has no map")
             }
@@ -585,7 +609,6 @@ impl RevocationStore {
     }
 }
 
-#[cfg(feature = "integration")]
 impl PgRevocationBacking {
     /// Drive an async backing call from the sync store API (the `block_in_place`+`block_on` bridge).
     fn block<F: std::future::Future>(&self, fut: F) -> F::Output {

@@ -69,3 +69,8 @@ serde_json = { workspace = true }
 # reflects the server-side merge gate. A dev-dependency only (the protocol shell never depends on the
 # edge in production; the composition root injects the body).
 myelin-edge = { path = "../myelin-edge" }
+# MR-009b Wave 2: the MCP tests build the identity in-memory doubles (StoreBackedCheck `::new`), which
+# moved behind `#[cfg(any(test, feature = "test-support"))]`. Enable `test-support` for the TEST build
+# only — MCP's production shell depends on identity-service without it (durable-by-default preserved;
+# resolver v2 does not leak a dev-dependency feature into the normal build).
+myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }

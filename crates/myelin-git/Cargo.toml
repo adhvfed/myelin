@@ -152,7 +152,10 @@ myelin-client = { path = "../myelin-client" }
 # dev-dependency (test scaffolding only — no runtime edge). EI-01 §7: extend/prove against the frozen
 # engine, never re-define it.
 [dev-dependencies]
-myelin-identity-service = { path = "../myelin-identity-service" }
+# MR-009b Wave 2: enable `test-support` so this crate's DEV tests reach the identity in-memory
+# doubles (PrincipalStore/TupleStore/RevocationStore/StoreBackedCheck `::new`) which moved behind
+# `#[cfg(any(test, feature = "test-support"))]`. DEV-only — never in the production DAG.
+myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
 # The architecture-lint engine — the merge-queue e2e (GIT-P23 / P-285) runs the `no-cross-sync-cycle`
 # lint over `src/merge_queue.rs` to PROVE Git makes 0 synchronous calls to CI (it reads its own
 # check_status projection; X-1 / EI-02 §3). A dev-only edge (the lint scanner is a test-time tool, not
