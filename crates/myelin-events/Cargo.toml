@@ -33,6 +33,15 @@ futures = { workspace = true, optional = true }
 default = []
 integration = ["dep:async-nats", "dep:tokio", "dep:myelin-config", "dep:futures"]
 
+# MR-009b Wave 0 — the `test-support` cargo feature (alias `memory`). It gates the events pipeline's
+# in-memory durable-store DOUBLES (OutboxStore, DedupLedger `Memory` arm, BusErasureLedger) so
+# DOWNSTREAM crates enable them as a DEV-dependency (the doubles are consumed cross-crate in non-test
+# lib code; `#[cfg(test)]` is crate-local and can't reach them). EMPTY in Wave 0 — established so
+# later waves (W3) gate the doubles behind it + the `no-in-memory-durable-store` scanner treats
+# `feature = "test-support"` as a test-double gate. No code moves behind it yet. `memory` is an alias.
+test-support = []
+memory = ["test-support"]
+
 # TEST-SUPPORT ONLY (dev-dependency, P-S07). The SUB-D1 / BUS-D4 drill scenarios ride the
 # P-S03 scoped-reversible dependency-break injector (Dependency::Broker) + the P-S04
 # telemetry-assertion library (outbox_depth / dead_letter_count signals), exactly as the

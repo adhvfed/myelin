@@ -237,6 +237,45 @@ fn each_red_fixture_trips_exactly_its_own_scanner() {
 }
 
 // ================================================================================================
+// MR-009b Wave 0 — the `test-support` cargo-feature gate is a TEST-DOUBLE gate (admit + bite).
+//
+// The in-memory durable-store DOUBLES are consumed CROSS-CRATE in non-test lib code, so they can't
+// move to `#[cfg(test)]` (crate-local); they live behind a `test-support` cargo feature downstream
+// crates enable as a DEV-dependency. Wave 0 teaches `no-in-memory-durable-store` that a
+// `test-support`-gated in-memory store/backing is a test double (ADMITTED) — WITHOUT admitting any
+// real production store (the un-gated twin still BITES). These two fixtures pin exactly that: the
+// enhancement admits ONLY the test-support gate, never a real prod in-memory store. (Kept OUT of the
+// 3-row `matrix()` above so the "exactly the three scanners" invariant is undisturbed.)
+// ================================================================================================
+
+#[test]
+fn test_support_gate_admits_the_double_but_the_ungated_twin_still_bites() {
+    // ADMIT: a `#[cfg(feature = "test-support")]` / `#[cfg(any(test, feature = "test-support"))]`
+    // gated in-memory *Store (and its `Memory(Inner)` backend arm) is a test double — 0 violations.
+    let green = read_fixture("no_in_memory_durable_store.test_support.green.rs.txt");
+    let admitted = no_in_memory_durable_store().run(&green);
+    assert!(
+        admitted.is_empty(),
+        "a `test-support`-gated in-memory store/backing is a TEST DOUBLE and must be ADMITTED, \
+         but found: {admitted:?}"
+    );
+
+    // BITE (the over-broadening guard): the SAME shape with the gate REMOVED must STILL fire — if
+    // this ever goes green, Wave 0 over-broadened and let a REAL production in-memory store through.
+    let red = read_fixture("no_in_memory_durable_store.ungated.red.rs.txt");
+    let bites = no_in_memory_durable_store().run(&red);
+    assert!(
+        !bites.is_empty(),
+        "the UN-gated twin of the test-support fixture MUST still fire — Wave 0 must admit ONLY the \
+         `test-support` gate, never a real prod in-memory store"
+    );
+    assert!(
+        bites.iter().all(|v| v.lint == LintId("no-in-memory-durable-store")),
+        "the un-gated fixture must fire ONLY the in-memory-durable-store scanner"
+    );
+}
+
+// ================================================================================================
 // The baseline ratchet (the live half — the scanners over the real tree vs the committed baseline).
 // ================================================================================================
 

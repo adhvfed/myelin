@@ -37,29 +37,50 @@ use crate::engine::{blank_string_literals, code_lines, Lint, LintId, Violation};
 // (it is code, not a comment), so we can track which lines sit inside a `#[cfg(test)]`-gated item.
 // ================================================================================================
 
-/// For each 1-based line of `src`, whether it sits inside a `#[cfg(test)]`-gated block (a test
-/// module or a test fn). A `#[cfg(test)]` attribute arms the NEXT block it opens; the region ends
-/// when that block's braces close. Conservative + hermetic (pure fn of source text).
-fn cfg_test_line_flags(src: &str) -> Vec<bool> {
+/// For each 1-based line of `src`, whether it sits inside a gated block whose OPENING attribute
+/// `is_gate` matched. A gate attribute arms the NEXT block it opens; the region ends when that
+/// block's braces close. Conservative + hermetic (pure fn of source text). The `is_gate` predicate
+/// is applied to the CODE-only line text (comments already stripped, string literals intact) so a
+/// gate substring inside a `#[cfg(...)]` attribute (e.g. `feature = "test-support"`) is seen.
+fn cfg_line_flags(src: &str, is_gate: impl Fn(&str) -> bool) -> Vec<bool> {
     let lines = code_lines(src);
     let max_line = lines.iter().map(|(n, _)| *n).max().unwrap_or(0);
     let mut flags = vec![false; max_line + 1];
     let mut depth: i32 = 0;
-    // The brace depths at which an ACTIVE `#[cfg(test)]` block opened (a stack so nested test items
-    // are handled). While the stack is non-empty we are inside test-gated code.
+    // The brace depths at which an ACTIVE gated block opened (a stack so nested gated items are
+    // handled). While the stack is non-empty we are inside gated code.
     let mut stack: Vec<i32> = Vec::new();
-    let mut pending = false; // a `#[cfg(test)]` attribute seen, awaiting its opening brace.
+    let mut pending = false; // a gate attribute seen, awaiting the item it attributes.
+    let mut pending_depth: i32 = 0; // the brace depth at which the pending gate attribute sits.
+    // `()`/`[]` nesting, used ONLY to find the TOP-LEVEL `;` that terminates a BRACELESS gated item
+    // (a `use`/`const`/`type`), so a gate attribute cannot leak onto a later unrelated `{`.
+    let mut nest: i32 = 0;
     for (lineno, code) in &lines {
-        // `#[cfg(test)]` (and `#[cfg(all(test, ...))]`) arm the next opening block.
-        if code.contains("cfg(test)") {
+        // The gate attribute arms the item it attributes — but ONLY if it is in ATTRIBUTE position
+        // (the line starts with `#[`). A `cfg(test)` / `test-support` substring sitting inside a
+        // string or a `const`/`type` RHS (e.g. `const D: &str = "cfg(test)";`) must NOT arm the gate
+        // (Wave-0 probe B2). Matched on the RAW line so the `test-support` gate's OWN string literal
+        // (`feature = "test-support"`) is still seen (blanking it would defeat the gate).
+        if code.trim_start().starts_with("#[") && is_gate(code) {
+            if !pending {
+                pending_depth = depth;
+            }
             pending = true;
         }
-        // The line's test status is decided BEFORE this line's own braces take effect.
+        // The line's gate status is decided BEFORE this line's own braces take effect.
         if *lineno < flags.len() {
             flags[*lineno] = !stack.is_empty();
         }
-        for ch in code.chars() {
+        // Blank string literals for the DELIMITER scan so a brace/semicolon inside a string cannot
+        // miscount `depth`/`nest` or falsely terminate a pending item.
+        for ch in blank_string_literals(code).chars() {
             match ch {
+                '(' | '[' => nest += 1,
+                ')' | ']' => {
+                    if nest > 0 {
+                        nest -= 1;
+                    }
+                }
                 '{' => {
                     depth += 1;
                     if pending {
@@ -72,12 +93,183 @@ fn cfg_test_line_flags(src: &str) -> Vec<bool> {
                         stack.pop();
                     }
                     depth -= 1;
+                    // A gate that never opened a block before its ENCLOSING scope closed attributed a
+                    // BRACELESS item (e.g. a unit enum variant `#[cfg(test)] Fake,`) — drop the
+                    // dangling gate so it cannot arm a later unrelated block (Wave-0 probe K).
+                    if pending && depth < pending_depth {
+                        pending = false;
+                    }
+                }
+                ';' if pending && nest == 0 => {
+                    // A BRACELESS statement item (`use`/`const`/`type`) ended: it opened no block, so
+                    // the gate attributed only itself. Drop the dangling gate so it does NOT arm the
+                    // next unrelated struct's `{` (Wave-0 probes I/G/J — the `pending`-leak root fix).
+                    pending = false;
                 }
                 _ => {}
             }
         }
     }
     flags
+}
+
+/// The EXACT `test-support` cargo-feature gate substring the in-memory durable-store scanner (only)
+/// treats as a test-double gate (MR-009b Wave 0). Matched EXACTLY (`feature = "test-support"`) — a
+/// `#[cfg(feature = "test-support")]` / `#[cfg(any(test, feature = "test-support"))]` block is a
+/// test-double gate (the in-memory doubles that downstream crates enable as a DEV-dependency), NOT a
+/// production store. This is deliberately NOT broadened to arbitrary features (that would admit a
+/// real prod store hidden behind some other feature); the platform convention is that ONLY
+/// `test-support` gates the durable-store doubles.
+const TEST_SUPPORT_GATE: &str = "feature = \"test-support\"";
+
+/// For each 1-based line of `src`, whether it sits inside a `#[cfg(test)]`-gated block (a test
+/// module or a test fn). A `#[cfg(test)]` attribute arms the NEXT block it opens; the region ends
+/// when that block's braces close. Conservative + hermetic (pure fn of source text). Used by the
+/// `no-structural-crypto-in-prod` scanner (and anywhere the LITERAL `cfg(test)` gate is meant) —
+/// deliberately NOT test-support-aware, so that scanner is unaffected by Wave 0.
+fn cfg_test_line_flags(src: &str) -> Vec<bool> {
+    cfg_line_flags(src, |code| code.contains("cfg(test)"))
+}
+
+/// Like [`cfg_test_line_flags`], but ALSO treats the `test-support` cargo-feature gate
+/// ([`TEST_SUPPORT_GATE`]) as a test-double gate — so a `#[cfg(feature = "test-support")]` /
+/// `#[cfg(any(test, feature = "test-support"))]` struct/enum is recognized as a test double. Used
+/// ONLY by the `no-in-memory-durable-store` scanner (via [`parse_struct_defs`]/[`parse_enum_defs`]),
+/// so the other two scanners' `cfg(test)` handling is untouched (MR-009b Wave 0).
+fn cfg_double_line_flags(src: &str) -> Vec<bool> {
+    cfg_line_flags(src, |code| {
+        code.contains("cfg(test)") || code.contains(TEST_SUPPORT_GATE)
+    })
+}
+
+/// Whether `text` carries a double-gate token (`cfg(test)` or the exact `test-support` feature gate).
+/// Matched on the raw text (the gate's `feature = "test-support"` lives in a string literal, so it
+/// must NOT be blanked). Callers restrict WHERE this is consulted to real attribute positions.
+fn text_has_double_gate(text: &str) -> bool {
+    text.contains("cfg(test)") || text.contains(TEST_SUPPORT_GATE)
+}
+
+/// Peel a line's LEADING `#[..]` attributes and report `(any_leading_attr_is_a_double_gate,
+/// remaining_code_after_the_attributes)`. This is how a gate is scoped to the item it ACTUALLY
+/// attributes: a PURE attribute line (remainder empty) attributes the item on the NEXT line; an
+/// attribute WITH code after it (e.g. `#[cfg(test)] Fake,` or `#[cfg(test)] use x as M;`) attributes
+/// its OWN co-located item and must NOT be mistaken for the gate of a later struct/enum.
+fn leading_attr_gate(line: &str) -> (bool, String) {
+    let mut s = line.trim_start();
+    let mut gated = false;
+    while s.starts_with("#[") {
+        // Find the matching `]` of this `#[..]` (bracket-balanced, so `#[cfg(any(..))]` is one attr).
+        let mut d: i32 = 0;
+        let mut end = None;
+        for (idx, ch) in s.char_indices() {
+            match ch {
+                '[' => d += 1,
+                ']' => {
+                    d -= 1;
+                    if d == 0 {
+                        end = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(e) = end else { break };
+        if text_has_double_gate(&s[..=e]) {
+            gated = true;
+        }
+        s = s[e + 1..].trim_start();
+    }
+    (gated, s.to_string())
+}
+
+/// Whether the struct/enum whose header is `lines[header_idx]` is DIRECTLY attributed with a
+/// double-gate — the gate on the header line's OWN leading attribute (`#[cfg(test)] struct Foo {`)
+/// or on a contiguous PURE-attribute line immediately above it. This scopes the test-double gate to
+/// the item ACTUALLY attributed instead of reading a poisonable header..=end SPAN (Wave-0 fix #2/#3):
+/// a braceless-gate leak, a co-located gated variant, or a `cfg(test)` string in a preceding const
+/// can no longer mark an un-gated store `in_test`, because only the ATTRIBUTE(s) bound to THIS item
+/// are consulted. A line that is an attribute PLUS a co-located item (`#[cfg(test)] Fake,`) is a real
+/// code line whose gate belongs to its own item — it ends the walk and is not honored here.
+fn directly_double_gated(lines: &[(usize, String)], header_idx: usize) -> bool {
+    // Same-line attribute on the header itself: `#[cfg(test)] pub struct Foo {`.
+    let (gated, rest) = leading_attr_gate(&lines[header_idx].1);
+    if gated && !rest.is_empty() {
+        return true;
+    }
+    // Walk up the contiguous attribute block (skipping blank/comment-only lines), honoring a PURE
+    // attribute line's gate and stopping at the first real code line.
+    let mut k = header_idx;
+    while k > 0 {
+        k -= 1;
+        let t = lines[k].1.trim_start();
+        if t.is_empty() {
+            continue; // blank or comment-only line — attributes may still sit above it
+        }
+        if t.starts_with("#[") {
+            let (g, remainder) = leading_attr_gate(&lines[k].1);
+            if remainder.is_empty() {
+                // A PURE attribute line: it attributes the item below, so honor its gate.
+                if g {
+                    return true;
+                }
+                continue; // a stacked non-gate attribute (e.g. `#[derive(..)]`) — keep looking up
+            }
+            // An attribute WITH a co-located item — its gate binds THAT item, not our header. Stop.
+            break;
+        }
+        break; // a real code line ends the attribute block
+    }
+    false
+}
+
+/// Strip the double-gated VARIANTS out of an enum body, returning the joined payload text of the
+/// SURVIVING (un-gated) variants. Variants are split at TOP-LEVEL commas (outside every `()`/`[]`/
+/// `{}` payload), so a same-line `#[cfg(test)] Fake, Memory(Arc<Mutex<Inner>>)` strips ONLY the
+/// attributed `Fake` and preserves the co-located un-gated `Memory(..)` arm (Wave-0 fix #4); a
+/// multi-line or braced gated variant (`#[cfg(test)] Fake { x: u32 }`) is likewise stripped as a
+/// single unit without marking the rest of the enum (fix #3). A non-gate leading attribute (e.g.
+/// `#[default]`) is preserved with its variant.
+fn stripped_enum_payload(body: &str) -> String {
+    let mut out = String::new();
+    let mut seg = String::new();
+    let mut depth: i32 = 0;
+    let flush = |seg: &str, out: &mut String| {
+        if !seg.trim().is_empty() && !leading_attr_gate(seg).0 {
+            out.push_str(seg);
+            out.push('\n');
+        }
+    };
+    // Track `()[]{}` depth and detect TOP-LEVEL commas over the STRING-BLANKED body — mirroring the
+    // brace-balance scan in [`parse_enum_defs`] (which counts `{}` over `blank_string_literals`). A
+    // delimiter INSIDE a string literal (e.g. `#[doc = "("]` or `#[deprecated = "use Pg( instead"]`)
+    // must NOT shift depth; otherwise an unbalanced-open string delimiter keeps depth > 0 for the
+    // rest of the body, no top-level comma ever splits, and the whole enum collapses into ONE
+    // gate-led segment that `flush` drops — carrying the real un-gated `Memory(..)` arm with it, so
+    // the delegating `*Store` is falsely ADMITTED. The SEGMENT TEXT is emitted from the RAW `body`
+    // (variant contents preserved verbatim for the gate/attr check); only depth/comma boundaries are
+    // computed on the blanked form. `blank_string_literals` is char-for-char length-preserving, so
+    // the raw and blanked chars zip 1:1.
+    let blanked = blank_string_literals(body);
+    for (raw, scan) in body.chars().zip(blanked.chars()) {
+        match scan {
+            '(' | '[' | '{' => {
+                depth += 1;
+                seg.push(raw);
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                seg.push(raw);
+            }
+            ',' if depth == 0 => {
+                flush(&seg, &mut out);
+                seg.clear();
+            }
+            _ => seg.push(raw),
+        }
+    }
+    flush(&seg, &mut out); // the trailing variant (no trailing comma)
+    out
 }
 
 // ================================================================================================
@@ -314,7 +506,9 @@ struct StructDef {
 /// no `{ … }` field block and are skipped). Hermetic line/brace tracking in the `code_lines` idiom.
 fn parse_struct_defs(src: &str) -> Vec<StructDef> {
     let lines = code_lines(src);
-    let test_flags = cfg_test_line_flags(src);
+    // Test-support-aware gating: a `#[cfg(feature = "test-support")]` struct is a test double, just
+    // like a `#[cfg(test)]` one (MR-009b Wave 0). Used ONLY by the in-memory durable-store scanner.
+    let test_flags = cfg_double_line_flags(src);
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -362,11 +556,22 @@ fn parse_struct_defs(src: &str) -> Vec<StructDef> {
             }
             j += 1;
         }
+        // Gate the struct WITHOUT reading a poisonable header..=close SPAN (Wave-0 fix #2). Two
+        // honest sources: (a) the HEADER line's own flag — true iff the struct sits inside an
+        // enclosing `#[cfg(test)] mod { .. }` (whose opening brace already armed the region); or
+        // (b) a gate attribute DIRECTLY on this struct (`#[cfg(test)] struct Foo {` or a pure
+        // attribute line just above). A directly-attributed struct arms the gate on its OWN opening
+        // brace, so its header flag is false — [`directly_double_gated`] recognizes that case by
+        // consulting ONLY the attribute(s) bound to THIS struct. Because we never read the body span,
+        // a braceless-gate leak / a co-located gated variant / a `cfg(test)` string in a preceding
+        // const can no longer mark an un-gated store `in_test`.
+        let header_flag = test_flags.get(*lineno).copied().unwrap_or(false);
+        let in_test = header_flag || directly_double_gated(&lines, i);
         out.push(StructDef {
             name,
             line: *lineno,
             fields,
-            in_test: test_flags.get(*lineno).copied().unwrap_or(false),
+            in_test,
         });
         i = j + 1;
     }
@@ -388,7 +593,10 @@ struct EnumDef {
 /// collection/alias/`Inner`-delegate detection applies to variant payloads.
 fn parse_enum_defs(src: &str) -> Vec<EnumDef> {
     let lines = code_lines(src);
-    let test_flags = cfg_test_line_flags(src);
+    // Test-support-aware gating (MR-009b Wave 0), matching [`parse_struct_defs`]: a whole enum gated
+    // behind `test-support` is a test double, and — crucially — an individual test/feature-gated
+    // VARIANT is stripped from the scanned payload below.
+    let test_flags = cfg_double_line_flags(src);
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -407,13 +615,17 @@ fn parse_enum_defs(src: &str) -> Vec<EnumDef> {
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect();
+        // Collect the enum's raw text from the header until its braces balance, then extract the
+        // body between the enum's opening `{` and its matching `}`.
         let mut depth: i32 = 0;
-        let mut fields = String::new();
-        let mut j = i;
         let mut started = false;
+        let mut whole = String::new();
+        let mut j = i;
         while j < lines.len() {
             let (_, jcode) = &lines[j];
-            for ch in jcode.chars() {
+            whole.push_str(jcode);
+            whole.push('\n');
+            for ch in blank_string_literals(jcode).chars() {
                 if ch == '{' {
                     depth += 1;
                     started = true;
@@ -421,19 +633,30 @@ fn parse_enum_defs(src: &str) -> Vec<EnumDef> {
                     depth -= 1;
                 }
             }
-            if j > i {
-                fields.push_str(jcode);
-                fields.push('\n');
-            }
             if started && depth <= 0 {
                 break;
             }
             j += 1;
         }
+        let body = match (whole.find('{'), whole.rfind('}')) {
+            (Some(a), Some(b)) if b > a => &whole[a + 1..b],
+            _ => "",
+        };
+        // Variant-level gate stripping (MR-009b Wave 0, Wave-0 fixes #3/#4): strip ONLY the
+        // double-gated variants (splitting at TOP-LEVEL commas so a same-line co-located un-gated
+        // arm survives, and a braced gated variant is stripped as a single unit without marking the
+        // rest of the enum). The un-gated `Memory(..)` arm of a partly-gated enum is thus still seen.
+        let fields = stripped_enum_payload(body);
+        // Gate the WHOLE enum WITHOUT reading a poisonable span (Wave-0 fix #2/#3): the header flag
+        // (enclosing `#[cfg(test)] mod`) OR a gate attribute DIRECTLY on the enum. A single gated
+        // VARIANT never marks the whole enum `in_test` — that is the enum-level-span false-admit
+        // (probe E): the un-gated `Memory(..)` arm must still be counted.
+        let header_flag = test_flags.get(*lineno).copied().unwrap_or(false);
+        let in_test = header_flag || directly_double_gated(&lines, i);
         out.push(EnumDef {
             name,
             fields,
-            in_test: test_flags.get(*lineno).copied().unwrap_or(false),
+            in_test,
         });
         i = j + 1;
     }
@@ -492,12 +715,14 @@ fn scan_no_in_memory_durable_store(src: &str) -> Vec<Violation> {
     };
     // Pass 1: the set of in-memory BACKING struct names (any struct whose field block holds a
     // collection — literal or alias — and no pool) — captures the `Inner`-style helpers the role
-    // structs delegate to.
+    // structs delegate to. A test/test-support-gated backing (`s.in_test`) is a TEST DOUBLE and must
+    // NOT be counted (MR-009b Wave 0): otherwise a durable enum referencing a test-gated
+    // `Memory(Inner)` would still (wrongly) fire even though the double is compiled out of production.
     let in_memory_backings: std::collections::BTreeSet<String> = structs
         .iter()
         .filter(|s| {
             let has_pool = POOL_TOKENS.iter().any(|t| s.fields.contains(t));
-            has_collection(&s.fields) && !has_pool
+            !s.in_test && has_collection(&s.fields) && !has_pool
         })
         .map(|s| s.name.clone())
         .collect();
@@ -885,6 +1110,255 @@ mod tests {
         // `FsBlobStore` is in-memory (HashMap of bytes, no fs::write) — NOT exempt.
         let red = "pub struct FsBlobStore {\n    objects: Mutex<HashMap<String, Vec<u8>>>,\n}";
         assert!(!no_in_memory_durable_store().run(red).is_empty());
+    }
+
+    // ---- MR-009b Wave 0: the `test-support` cargo-feature gate is a test-double gate ----------
+
+    #[test]
+    fn test_support_gate_admits_direct_in_memory_store() {
+        // A `#[cfg(feature = "test-support")]`-gated in-memory *Store is a TEST DOUBLE (downstream
+        // crates enable `test-support` as a DEV-dependency) — admitted, exactly like `#[cfg(test)]`.
+        let gated = "#[cfg(feature = \"test-support\")]\npub struct PrincipalStore {\n    inner: std::sync::Mutex<std::collections::BTreeMap<String, Row>>,\n}";
+        assert!(
+            no_in_memory_durable_store().run(gated).is_empty(),
+            "a #[cfg(feature=\"test-support\")]-gated in-memory *Store is a test double — admitted"
+        );
+    }
+
+    #[test]
+    fn test_support_any_gate_admits_direct_in_memory_store() {
+        // The `#[cfg(any(test, feature = "test-support"))]` form (the double compiles in unit tests
+        // AND when a downstream crate turns on `test-support`) is likewise a test-double gate.
+        let gated = "#[cfg(any(test, feature = \"test-support\"))]\npub struct TupleStore {\n    inner: std::sync::Mutex<std::collections::HashMap<String, Row>>,\n}";
+        assert!(
+            no_in_memory_durable_store().run(gated).is_empty(),
+            "a #[cfg(any(test, feature=\"test-support\"))]-gated in-memory *Store is a test double — admitted"
+        );
+    }
+
+    #[test]
+    fn ungated_in_memory_store_still_bites_the_over_broadening_guard() {
+        // The GUARD that Wave 0 did NOT over-broaden: an IDENTICAL in-memory *Store with NO gate
+        // still FIRES (red). If this ever goes green, the enhancement admitted a real prod store.
+        let ungated = "pub struct PrincipalStore {\n    inner: std::sync::Mutex<std::collections::BTreeMap<String, Row>>,\n}";
+        assert!(
+            !no_in_memory_durable_store().run(ungated).is_empty(),
+            "an UN-gated in-memory *Store must STILL fire — Wave 0 must not over-broaden"
+        );
+    }
+
+    #[test]
+    fn non_test_support_feature_gate_still_bites() {
+        // The gate is matched EXACTLY (`feature = "test-support"`): a store hidden behind some OTHER
+        // feature (e.g. `feature = "postgres"`) is NOT admitted — that would be a real prod store
+        // behind a feature flag, which the scanner must still catch (no broadening to any feature).
+        let other = "#[cfg(feature = \"postgres\")]\npub struct PrincipalStore {\n    inner: std::sync::Mutex<std::collections::BTreeMap<String, Row>>,\n}";
+        assert!(
+            !no_in_memory_durable_store().run(other).is_empty(),
+            "a store behind a NON-test-support feature must still fire (the gate is matched exactly)"
+        );
+    }
+
+    #[test]
+    fn test_support_gated_backend_variant_and_inner_are_admitted() {
+        // The Wave 2+ shape: the role struct's backend enum has a `Memory(..)` variant AND its
+        // in-memory `Inner` backing BOTH gated behind test-support, with the `Pg` (pool) variant the
+        // always-compiled production default. The gated variant is stripped and the gated `Inner` is
+        // not counted as a backing → the *Store is ADMITTED (durable-by-default in production).
+        let admitted = "#[cfg(any(test, feature = \"test-support\"))]\nstruct Inner {\n    partitions: std::collections::HashMap<String, Row>,\n}\npub enum TupleBackend {\n    #[cfg(any(test, feature = \"test-support\"))]\n    Memory(std::sync::Arc<std::sync::Mutex<Inner>>),\n    Pg(PgTupleBacking),\n}\npub struct TupleStore {\n    backend: TupleBackend,\n}";
+        assert!(
+            no_in_memory_durable_store().run(admitted).is_empty(),
+            "a *Store whose ONLY in-memory arm (the Memory variant + Inner) is test-support-gated, \
+             with a Pg default, is durable-by-default in production — admitted"
+        );
+        // The over-broadening guard: the SAME shape with the variant UN-gated still fires.
+        let bites = "struct Inner {\n    partitions: std::collections::HashMap<String, Row>,\n}\npub enum TupleBackend {\n    Memory(std::sync::Arc<std::sync::Mutex<Inner>>),\n    Pg(PgTupleBacking),\n}\npub struct TupleStore {\n    backend: TupleBackend,\n}";
+        assert!(
+            !no_in_memory_durable_store().run(bites).is_empty(),
+            "the same backend enum with an UN-gated Memory(Inner) variant must STILL fire"
+        );
+    }
+
+    // ---- MR-009b Wave 0 — the ADVERSARIAL BATTERY (probes A/B2/E/G/I/J/K) ---------------------
+    //
+    // An independent verifier proved the Wave-0 enhancement could be TRICKED into silently ADMITTING
+    // a real, un-gated production in-memory durable store via a `pending`-leak / poisonable-span
+    // defect. Each probe below reproduces one confirmed false-admit; every one MUST now BITE (the
+    // real un-gated store still fires). These lock the fix — if any goes green, a real prod store
+    // slipped through. The un-gated store shape is `PrincipalStore { inner: Mutex<BTreeMap<..>> }`
+    // (a durable role-suffix store on an in-memory map, no pool) — the same shape the green
+    // `test-support` fixtures ADMIT only when it is actually gated.
+
+    // The un-gated, must-BITE store body reused across the leak probes.
+    const UNGATED_STORE: &str = "pub struct PrincipalStore {\n    inner: std::sync::Mutex<std::collections::BTreeMap<String, Row>>,\n}";
+
+    #[test]
+    fn probe_i_braceless_use_gate_on_own_line_does_not_leak() {
+        // Probe I: a braceless `#[cfg(test)]` `use` on its OWN line preceding the un-gated store. The
+        // `pending` gate must NOT leak onto the store's opening brace and mark it `in_test`.
+        let src = format!(
+            "#[cfg(test)]\nuse std::collections::HashMap as TestMap;\n{UNGATED_STORE}"
+        );
+        assert!(
+            !no_in_memory_durable_store().run(&src).is_empty(),
+            "a braceless `#[cfg(test)] use` must gate only itself — the un-gated store must BITE"
+        );
+    }
+
+    #[test]
+    fn probe_g_same_line_braceless_use_gate_does_not_leak() {
+        // Probe G: the gate attribute and the braceless `use` on the SAME line before the store.
+        let src = format!(
+            "#[cfg(test)] use std::collections::HashMap as TestMap;\n{UNGATED_STORE}"
+        );
+        assert!(
+            !no_in_memory_durable_store().run(&src).is_empty(),
+            "a same-line `#[cfg(test)] use ...;` must gate only itself — the store must BITE"
+        );
+    }
+
+    #[test]
+    fn probe_j_braceless_const_and_type_gate_do_not_leak() {
+        // Probe J: a braceless gated `const` (and a gated `type`) preceding the store — both `;`-
+        // terminated braceless items must not leak the gate onto the store.
+        let via_const = format!("#[cfg(test)]\nconst FAKE_MODE: bool = true;\n{UNGATED_STORE}");
+        let via_type = format!("#[cfg(test)]\ntype FakeMap = std::collections::HashMap<String, Row>;\n{UNGATED_STORE}");
+        assert!(
+            !no_in_memory_durable_store().run(&via_const).is_empty(),
+            "a braceless gated `const` must not leak — the store must BITE"
+        );
+        assert!(
+            !no_in_memory_durable_store().run(&via_type).is_empty(),
+            "a braceless gated `type` must not leak — the store must BITE"
+        );
+    }
+
+    #[test]
+    fn probe_k_unit_variant_gate_does_not_leak_past_enum() {
+        // Probe K: a `#[cfg(test)]` UNIT enum variant (no payload, no `;`) immediately preceding the
+        // un-gated store. The dangling gate must be dropped when the enum's brace closes, not leak
+        // onto the store.
+        let src = format!(
+            "pub enum Role {{\n    #[cfg(test)]\n    Fake,\n    Real,\n}}\n{UNGATED_STORE}"
+        );
+        assert!(
+            !no_in_memory_durable_store().run(&src).is_empty(),
+            "a gated unit enum variant must not leak past the enum — the store must BITE"
+        );
+        // Same-line unit-variant form: `#[cfg(test)] Fake,` on one line.
+        let same_line = format!(
+            "pub enum Role {{\n    #[cfg(test)] Fake,\n    Real,\n}}\n{UNGATED_STORE}"
+        );
+        assert!(
+            !no_in_memory_durable_store().run(&same_line).is_empty(),
+            "a same-line gated unit variant must not leak — the store must BITE"
+        );
+    }
+
+    #[test]
+    fn probe_b2_string_literal_cfg_test_does_not_poison_the_store() {
+        // Probe B2: a `const DOC: &str = "cfg(test)";` before the store. The `cfg(test)` substring is
+        // string DATA, not an attribute — it must NOT arm the gate or mark the store `in_test`.
+        let src = format!("const DOC: &str = \"cfg(test)\";\n{UNGATED_STORE}");
+        assert!(
+            !no_in_memory_durable_store().run(&src).is_empty(),
+            "a `cfg(test)` string literal must not poison the store — it must BITE"
+        );
+        // The `test-support` string form is likewise inert as DATA.
+        let src2 = format!("const DOC: &str = \"feature = \\\"test-support\\\"\";\n{UNGATED_STORE}");
+        assert!(
+            !no_in_memory_durable_store().run(&src2).is_empty(),
+            "a `test-support` string literal must not poison the store — it must BITE"
+        );
+    }
+
+    #[test]
+    fn probe_a_same_line_gated_variant_preserves_co_located_memory_arm() {
+        // Probe A: `#[cfg(test)] Fake, Memory(Arc<Mutex<Inner>>),` on ONE line. Stripping the gated
+        // `Fake` must NOT drop the co-located UN-gated `Memory(..)` arm — the store must still BITE.
+        let src = "struct Inner {\n    rows: std::collections::HashMap<String, Row>,\n}\npub enum Backend {\n    #[cfg(test)] Fake, Memory(std::sync::Arc<std::sync::Mutex<Inner>>),\n    Pg(PgBacking),\n}\npub struct TupleStore {\n    backend: Backend,\n}";
+        assert!(
+            !no_in_memory_durable_store().run(src).is_empty(),
+            "the un-gated Memory(Inner) arm co-located after a gated Fake must still fire"
+        );
+    }
+
+    #[test]
+    fn probe_e_gated_braced_variant_does_not_drop_the_whole_enum() {
+        // Probe E: a gated BRACED struct-variant `#[cfg(test)] Fake { note: String }` alongside an
+        // un-gated `Memory(Arc<Mutex<Inner>>)`. The braced gated variant must not mark the WHOLE enum
+        // `in_test` (which would drop it and hide the live Memory arm) — the store must still BITE.
+        let src = "struct Inner {\n    rows: std::collections::HashMap<String, Row>,\n}\npub enum Backend {\n    #[cfg(test)]\n    Fake { note: String },\n    Memory(std::sync::Arc<std::sync::Mutex<Inner>>),\n}\npub struct TupleStore {\n    backend: Backend,\n}";
+        assert!(
+            !no_in_memory_durable_store().run(src).is_empty(),
+            "a gated braced variant must strip only itself; the un-gated Memory arm must still fire"
+        );
+        // The over-broadening guard for probe E: the SAME enum with Fake also un-gated obviously
+        // fires, and (the neutrality half) gating the Memory arm too admits it.
+        let all_gated = "struct Inner {\n    rows: std::collections::HashMap<String, Row>,\n}\npub enum Backend {\n    #[cfg(test)]\n    Fake { note: String },\n    #[cfg(test)]\n    Memory(std::sync::Arc<std::sync::Mutex<Inner>>),\n    Pg(PgBacking),\n}\npub struct TupleStore {\n    backend: Backend,\n}";
+        // `Inner` is un-gated here, so it is still an in-memory backing, but the enum's only arm that
+        // references it (`Memory`) is gated → the enum presents no in-memory arm → admitted only if
+        // Inner is also not referenced by a live arm. Assert the intended shape: with BOTH in-memory
+        // arms gated and a `Pg` default, the store is admitted.
+        let admitted = "#[cfg(test)]\nstruct Inner {\n    rows: std::collections::HashMap<String, Row>,\n}\npub enum Backend {\n    #[cfg(test)]\n    Memory(std::sync::Arc<std::sync::Mutex<Inner>>),\n    Pg(PgBacking),\n}\npub struct TupleStore {\n    backend: Backend,\n}";
+        let _ = all_gated;
+        assert!(
+            no_in_memory_durable_store().run(admitted).is_empty(),
+            "when the ONLY in-memory arm (Memory + its Inner) is gated with a Pg default, admit it"
+        );
+    }
+
+    #[test]
+    fn probe_unbalanced_string_delimiter_in_attr_does_not_drop_the_enum() {
+        // Regression (MR-009b Wave 0, verifier false-admit): an UNBALANCED OPEN delimiter INSIDE a
+        // string literal on a gated variant's attribute (`#[doc = "("]`). Before the fix,
+        // `stripped_enum_payload` counted `()[]{}` depth over the RAW body, so the `(` inside the doc
+        // string pushed depth to 1 for the rest of the body — no top-level comma ever split, the whole
+        // enum collapsed into ONE gate-led segment that `flush` dropped, taking the un-gated
+        // `Memory(..)` arm with it. The enum then looked non-in-memory and the `*Store` was ADMITTED.
+        // The fix tracks depth/top-level commas over `blank_string_literals(body)` (mirroring the
+        // brace scan in `parse_enum_defs`), so a string-literal delimiter can't shift depth.
+        let doc_open = "pub enum Backend {\n    #[cfg(test)]\n    #[doc = \"(\"]\n    Fake,\n    Memory(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Row>>>),\n}\npub struct TupleStore {\n    backend: Backend,\n}";
+        assert!(
+            !no_in_memory_durable_store().run(doc_open).is_empty(),
+            "an unbalanced `(` inside a gated variant's doc string must not drop the un-gated Memory arm — the store must BITE"
+        );
+        // The `#[deprecated = "use Pg( instead"]` form — same unbalanced open, different attribute.
+        let deprecated_open = "pub enum Backend {\n    #[cfg(test)]\n    #[deprecated = \"use Pg( instead\"]\n    Fake,\n    Memory(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Row>>>),\n}\npub struct TupleStore {\n    backend: Backend,\n}";
+        assert!(
+            !no_in_memory_durable_store().run(deprecated_open).is_empty(),
+            "an unbalanced `(` inside a gated variant's `#[deprecated = ...]` string must not drop the Memory arm — the store must BITE"
+        );
+        // The delegate-to-Inner shape: `Memory(Arc<Mutex<Inner>>)` to a separate un-gated `Inner`,
+        // with the same unbalanced-open doc string on the gated variant.
+        let delegate_open = "struct Inner {\n    rows: std::collections::HashMap<String, Row>,\n}\npub enum Backend {\n    #[cfg(test)]\n    #[doc = \"(\"]\n    Fake,\n    Memory(std::sync::Arc<std::sync::Mutex<Inner>>),\n}\npub struct TupleStore {\n    backend: Backend,\n}";
+        assert!(
+            !no_in_memory_durable_store().run(delegate_open).is_empty(),
+            "an unbalanced `(` in a doc string must not drop a Memory(Inner) delegate arm — the store must BITE"
+        );
+        // Causation control: the SAME enum with a BALANCED doc paren (`#[doc = \"(x)\"]`) already bit
+        // before the fix and must STILL bite — proving the defect was the UNBALANCED open specifically.
+        let balanced = "pub enum Backend {\n    #[cfg(test)]\n    #[doc = \"(x)\"]\n    Fake,\n    Memory(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Row>>>),\n}\npub struct TupleStore {\n    backend: Backend,\n}";
+        assert!(
+            !no_in_memory_durable_store().run(balanced).is_empty(),
+            "a balanced doc paren must still bite (the control) — the un-gated Memory arm fires"
+        );
+    }
+
+    #[test]
+    fn probe_neutrality_directly_gated_store_and_mod_still_admitted() {
+        // Neutrality: the legitimate test-double shapes the fix must KEEP admitting — a directly
+        // `#[cfg(test)]`-attributed store, and a store inside a `#[cfg(test)] mod { .. }`.
+        let direct = format!("#[cfg(test)]\n{UNGATED_STORE}");
+        assert!(
+            no_in_memory_durable_store().run(&direct).is_empty(),
+            "a directly `#[cfg(test)]`-attributed in-memory store is a test double — admitted"
+        );
+        let in_mod = "#[cfg(test)]\nmod tests {\n    pub struct PrincipalStore {\n        inner: std::sync::Mutex<std::collections::BTreeMap<String, Row>>,\n    }\n}";
+        assert!(
+            no_in_memory_durable_store().run(in_mod).is_empty(),
+            "an in-memory store inside a `#[cfg(test)] mod` is a test double — admitted"
+        );
     }
 
     #[test]
