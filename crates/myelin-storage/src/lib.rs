@@ -628,60 +628,57 @@ pub mod rls;
 pub mod storage_surge;
 
 // ---- Stage 2 / infra: the REAL backends behind the existing traits (config-selected) ----
-// These modules are compiled ONLY under `--features integration` (they pull the real sqlx /
-// aws-sdk-s3 / fred clients). The default `cargo build --workspace` compiles NONE of them, so
-// it stays DB-free. Each implements an EXISTING trait — it does not fork one:
+// MR-009b Wave 1: these durable modules are now compiled UNCONDITIONALLY (the durable deps —
+// sqlx / aws-sdk-s3 / fred / tokio / myelin-config — are non-optional, so the durable CODE is the
+// DAG-root compile foundation every dependent builds on). The default `cargo build --workspace`
+// stays DB-free at BUILD time (zero compile-time `sqlx::query!` macros; all durable code is runtime
+// `sqlx::query(&str)`). This wave un-gates the CODE only — it does NOT flip any composition root to
+// durable-by-default (that is Waves 2-5); the in-memory models remain the default WIRING. Each
+// module implements an EXISTING trait — it does not fork one:
 //   - s3blob::S3BlobStore  implements blob::BlobStore  (object store, RustFS/Scaleway)
 //   - valkey::ValkeyCache  implements cache::Cache     (Valkey/Redis)
 //   - pg::PgStore          backs the OLTP + outbox/relay + ReBAC tuple store on real Postgres
 // The `backend` module is the config-selection seam (real-vs-in-memory from MyelinConfig).
-#[cfg(feature = "integration")]
 pub mod pg;
 // The race-safe LIVE migration DRIVER (the P-S12 floor): a forward-only, idempotent, SERIALIZED
 // (Postgres session advisory lock on a fixed app-wide key), version-recorded migrator. It fixes the
 // concurrent-`CREATE TABLE` `pg_type_typname_nsp_index` race that the bare
-// `raw_sql(ddl).execute(&pool)` sites (PgStore::migrate, git check_status) had. Behind `integration`
-// like the rest of the live-PG code.
-#[cfg(feature = "integration")]
+// `raw_sql(ddl).execute(&pool)` sites (PgStore::migrate, git check_status) had.
 pub mod pg_migrator;
-#[cfg(feature = "integration")]
 pub mod s3blob;
-#[cfg(feature = "integration")]
 pub mod valkey;
 // The tenant-scoped-TRANSACTION connection convention (RESHAPE-002 / MR-022): acquire → BEGIN → set
 // the (tenant, region) GUC transaction-scoped (`set_config(..., true)`) → run the op → COMMIT, with
 // `after_release(RESET ALL)` reset-on-release. The mechanism every durable tenant-scoped store
 // acquires through so the SI-005 cross-tenant bleed is impossible by construction; MR-013 hardens
 // the RLS POLICY on this sound foundation.
-#[cfg(feature = "integration")]
 pub mod tenant_tx;
 // The production composition root / real-pool provider (MR-022 / SI-022): reads config from env
 // (the dev↔prod CONFIG SWAP), constructs the REAL bounded PgPool (reset-on-release wired), runs
 // migrations at startup (validate → execute, the SI-010 fix), and hands the pool + cache + blob to
 // the stores. The seam every durable store is constructed through — the in-memory impls become
 // explicit test-doubles on this path.
-#[cfg(feature = "integration")]
 pub mod provider;
 // The durable PG backings for the identity S1 principal + S3 tuple stores (MR-007 / SI-018/019):
 // reuses the rebac_tuple table/ops + adds the principal/credential_link tables (same RLS form), all
 // driven through the MR-022 with_tenant_tx convention. The identity-layer stores delegate to these.
-#[cfg(feature = "integration")]
 pub mod identity_durable;
 // The OLTP-co-located outbox relay (the one legitimate broker-publish site, BUS-2) — kept in its
 // own module so the broker-publish call is isolated to a single named relay file (the same
 // posture as myelin-events/src/relay.rs).
-#[cfg(feature = "integration")]
 pub mod backend;
-#[cfg(feature = "integration")]
 pub mod pgrelay;
 // The durable PG backing for the consumer_dedup ledger (MR-023 / SI-023): the real
 // `(consumer, event_id)` table behind the `myelin_events::DurableDedup` seam so consumer
 // idempotency survives a process restart. Reuses the frozen `CONSUMER_DEDUP_MIGRATION`.
-#[cfg(feature = "integration")]
 pub mod events_durable;
 // The events serve() composition root (MR-023 / SI-008/009): wires the durable outbox (PgRelay) +
 // the REAL NATS JetStream broker + the relay drain + the idempotent consumer (durable dedup) into a
-// running event-delivery pipeline — the production default, not the in-process fake.
+// running event-delivery pipeline — the production default, not the in-process fake. STAYS behind
+// `integration` (MR-009b Wave 1): it consumes the real NATS broker `myelin_events::nats`, which
+// lives behind `myelin-events/integration` (async-nats is still optional in myelin-events until a
+// later wave), so this composition root is NOT yet "always available" — it compiles only when the
+// integration feature turns the events live-bus surface on.
 #[cfg(feature = "integration")]
 pub mod events_serve;
 // The durable PG backing for the control-plane placement registry (MR-024 / SI-011/SI-028): the
@@ -689,7 +686,6 @@ pub mod events_serve;
 // a REAL DB TRIGGER + the durable `misroute_audit` sink. Control-plane ROUTING infra (cross-tenant by
 // design, PII-free) — connects to the pool directly, NOT through the per-request RLS/with_tenant_tx
 // convention (a NAMED tenant-predicate exclusion, like pgrelay.rs / events_durable.rs).
-#[cfg(feature = "integration")]
 pub mod placement_durable;
 // The durable PG backing for the KMS cell root + KEKs/DEKs (MR-025 / SI-006): the software-sealed
 // root-of-trust — the L0 cell root rests ONLY sealed under the operator-held seal key
@@ -700,7 +696,6 @@ pub mod placement_durable;
 // per-request RLS/with_tenant_tx convention (a NAMED tenant-predicate exclusion, like
 // placement_durable.rs / events_durable.rs). The HSM/Shamir-split L0 backing stays Tier-4; the
 // production boot wiring + kill-9 proof is MR-009. EXTENDS kms.rs — there is ONE KmsEngine.
-#[cfg(feature = "integration")]
 pub mod kms_durable;
 
 pub use agent_run_gate::{AgentRunGate, AgentRunGateSignal, DispatchError, InFlightRun, RunKind};
@@ -829,36 +824,30 @@ pub use storage_surge::{
     StorageSurgeReport, STORAGE_SURGE_MULTIPLIER,
 };
 
-// The race-safe live migration driver (the P-S12 floor) — re-exported behind `integration`, along
-// with the live `PgStore` + its typed `PgError` the driver returns.
-#[cfg(feature = "integration")]
+// The race-safe live migration driver (the P-S12 floor) — re-exported unconditionally (MR-009b
+// Wave 1), along with the live `PgStore` + its typed `PgError` the driver returns.
 pub use pg::{PgError, PgStore};
-#[cfg(feature = "integration")]
 pub use pg_migrator::{with_migration_lock, PgMigrator, MIGRATION_LOCK_KEY};
 // The MR-022 persistence foundation: the tenant-scoped-transaction convention (RESHAPE-002) + the
 // production composition root / real-pool provider (SI-022) + the validate→execute migration boot
-// reconciliation (SI-010). Behind `integration` like the rest of the live-PG code.
-#[cfg(feature = "integration")]
+// reconciliation (SI-010). Compiled unconditionally as of MR-009b Wave 1.
 pub use provider::{foundation_migrations, ProviderError, SubstrateProvider, DEFAULT_MAX_CONNECTIONS};
-#[cfg(feature = "integration")]
 pub use identity_durable::{
     identity_durable_migrations, DurablePrincipalBacking, DurablePrincipalRow, DurableProfileBlob,
     DurableRevocationBacking, DurableRevocationRow, DurableTupleBacking, TupleEdgeOp,
 };
-#[cfg(feature = "integration")]
 pub use tenant_tx::{connect_pool_with_reset, with_tenant_tx, TxScope};
-#[cfg(feature = "integration")]
 pub use events_durable::DurableDedupBacking;
+// `events_serve` STAYS behind `integration` (it consumes the real NATS broker `myelin_events::nats`,
+// gated by `myelin-events/integration`) — see the module declaration above.
 #[cfg(feature = "integration")]
 pub use events_serve::{EventsRuntime, EventsServeError, DEFAULT_DRAIN_BATCH};
-#[cfg(feature = "integration")]
 pub use placement_durable::{
     placement_durable_migrations, DurableCellRow, DurableMisrouteAuditBacking, DurableMisrouteRecord,
     DurablePlacementBacking, DurablePlacementRow, PlacementWriteError,
 };
 // The durable KMS backing (MR-025 / SI-006): the software-sealed cell root + wrapped KEKs/DEKs over
 // the OLTP pool, with `load_or_generate` (fail-closed on a wrong seal key) + the env seal-key supply.
-#[cfg(feature = "integration")]
 pub use kms_durable::{
     kms_durable_migrations, seal_key_from_env, DurableKmsBacking, KmsDurableError,
     KMS_SEALED_ROOT_MIGRATION, KMS_WRAPPED_DEK_MIGRATION, KMS_WRAPPED_KEK_MIGRATION, SEAL_KEY_ENV,
