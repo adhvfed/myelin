@@ -176,6 +176,11 @@ integration = [
 ]
 
 [dev-dependencies]
+# MR-009b Wave 3: enable `test-support` so this crate's DEV tests reach the events in-memory
+# `DedupLedger::new()` double (the durable `DedupLedger::durable` is the production default; the
+# in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
+# — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
+myelin-events = { path = "../myelin-events", features = ["test-support"] }
 # The shell's boot self-test asserts against the same three-port / liveness≠readiness surface the
 # later drills read from. DEV-only — the harness never enters the knowledge production DAG.
 myelin-harness = { path = "../myelin-harness" }

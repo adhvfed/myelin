@@ -27,8 +27,8 @@ use myelin_chat::unfurl::invalidation::{invalidates_card, UnfurlInvalidator};
 use myelin_chat::unfurl::{Projection, UnfurlCache};
 use myelin_events::taxonomy::new_tokens::CI_CHECK_UPDATED;
 use myelin_events::{
-    Actor, AggregateKey, CausedBy, CorrelationId, DataRole, EventEnvelope, EventHandler, EventId,
-    EventType, HandleOutcome, Timestamp, Visibility,
+    Actor, AggregateKey, CausedBy, CorrelationId, DataRole, DedupLedger, EventEnvelope,
+    EventHandler, EventId, EventType, HandleOutcome, Timestamp, Visibility,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef as RefsRef;
@@ -159,6 +159,6 @@ fn cdc_5_9_2_7_consumer_subjects_are_bounded() {
         assert!(!s.0.contains('*') && !s.0.is_empty());
     }
     // and it binds into the ONE frozen consumer runtime (the `*`-rejection passes by construction).
-    let consumer = invalidator.into_consumer("chat.unfurl.invalidation");
+    let consumer = invalidator.into_consumer("chat.unfurl.invalidation", DedupLedger::new());
     assert_eq!(consumer.name().0, "chat.unfurl.invalidation");
 }

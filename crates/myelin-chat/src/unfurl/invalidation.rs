@@ -230,14 +230,17 @@ impl UnfurlInvalidator {
     /// `consumer_dedup`). Builds the [`Subscription`] over the whitelisted subjects (the `*`-rejection
     /// is structural) + a fresh [`DedupLedger`] (contract 2.5 — idempotent redelivery). The durable
     /// `name` is stable so a reconnect re-binds the SAME cursor + ledger.
-    pub fn into_consumer(self, name: &str) -> Consumer<UnfurlInvalidator> {
+    pub fn into_consumer(self, name: &str, dedup: DedupLedger) -> Consumer<UnfurlInvalidator> {
         let subscription = Subscription::bind(
             ConsumerName(name.into()),
             UNFURL_INVALIDATION_SUBJECTS,
             PrefetchBound::DEFAULT,
         )
         .expect("the unfurl-invalidation subjects are a `*`-free whitelist (never over-broad)");
-        Consumer::new(self, subscription, DedupLedger::new())
+        // MR-009b Wave 3: the dedup ledger is INJECTED (durable-by-default composition). The
+        // in-memory `DedupLedger::new()` is a `test-support` double the callers supply on the
+        // in-process floor; a durable deployment injects `DedupLedger::durable` (events `serve()`).
+        Consumer::new(self, subscription, dedup)
     }
 }
 

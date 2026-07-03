@@ -53,6 +53,14 @@ memory = ["test-support"]
 # continues to model the production crates only.
 [dev-dependencies]
 myelin-harness = { path = "../myelin-harness" }
+# MR-009b Wave 3 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN test
+# crates (`tests/*.rs`): the in-memory `DedupLedger::new()` double is now
+# `#[cfg(any(test, feature = "test-support"))]` (the durable `DedupLedger::durable` is the production
+# default), so the crate's own external CDC/drill tests (drills_bus_d2/d8, drills_sub_d2,
+# cdc_2_5/2_8, …) reach it ONLY when `test-support` is on. Listing the crate as a DEV-dependency of
+# itself with the feature is the sanctioned Cargo idiom (dev-dep cycles are allowed) — it keeps
+# `cargo test -p myelin-events` (DB-free) green WITHOUT polluting the production build.
+myelin-events = { path = ".", features = ["test-support"] }
 # CDC: the firehose-retention CDC test (EB-30 / P-439) parses the workspace `thresholds.toml`
 # `[firehose_retention]` rows and asserts they are byte-for-byte the `retention::StreamClass::tuning()`
 # measured numbers (the file is the versioned source of truth, kept in lock-step with the code).

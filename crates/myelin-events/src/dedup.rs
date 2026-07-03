@@ -52,8 +52,13 @@
 //! `(consumer, event_id)` key, the `mark_handled` primitive) does NOT change.
 
 use crate::ConsumerName;
+// `HashSet` stays ungated: it appears in `mem()`'s always-compiled return type. `Mutex` is used
+// ONLY by the `test-support`-gated in-memory `Memory` arm + its `Default`, so it is gated too
+// (MR-009b Wave 3 — the production ledger is the pool-backed `Durable` arm).
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Mutex;
 
 /// The frozen forward-only DDL for the `consumer_dedup` ledger (contract 2.5). This is the shape
 /// the migration runner (P-S15) applies when the OLTP tier client (P-007) is wired; the in-memory
@@ -113,11 +118,22 @@ pub trait DurableDedup: Send + Sync {
 #[derive(Clone)]
 enum DedupBackend {
     /// The in-memory model / test-double: `(consumer, event_id)` set behind a shared lock.
+    /// **MR-009b Wave 3 — TEST DOUBLE (compiled ONLY under `#[cfg(any(test, feature = "test-support"))]`).**
+    /// NOT the production system-of-record: the production-compiled enum presents ONLY the pool-backed
+    /// `Durable` variant (the `no-in-memory-durable-store` scanner strips this `test-support`-gated
+    /// `Memory` arm as a test double), so `DedupLedger` no longer holds an in-memory collection in the
+    /// production graph (SI-023 leaves the baseline).
+    #[cfg(any(test, feature = "test-support"))]
     Memory(Arc<Mutex<HashSet<(ConsumerName, crate::EventId)>>>),
     /// The durable PG-backed seam (production): a `(consumer, event_id)` table that survives restart.
+    /// **The PRODUCTION DEFAULT (MR-009b Wave 3) — always compiled.**
     Durable(Arc<dyn DurableDedup>),
 }
 
+/// The default backend is the in-memory TEST DOUBLE — compiled ONLY under
+/// `#[cfg(any(test, feature = "test-support"))]` (MR-009b Wave 3). Production constructs the
+/// `Durable` backing through [`DedupLedger::durable`] (the events `serve()` composition root).
+#[cfg(any(test, feature = "test-support"))]
 impl Default for DedupBackend {
     fn default() -> Self {
         DedupBackend::Memory(Arc::new(Mutex::new(HashSet::new())))
@@ -137,13 +153,29 @@ impl Default for DedupBackend {
 ///
 /// This is **the effectively-once anchor**: every consumer's at-least-once delivery resolves to
 /// exactly-once-in-effect through this ledger (Bus §4.2).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct DedupLedger {
     backend: DedupBackend,
 }
 
+/// The `Default` ledger is the in-memory TEST DOUBLE — `#[cfg(any(test, feature = "test-support"))]`
+/// only (MR-009b Wave 3). Production builds the durable ledger through [`DedupLedger::durable`].
+#[cfg(any(test, feature = "test-support"))]
+impl Default for DedupLedger {
+    fn default() -> Self {
+        DedupLedger {
+            backend: DedupBackend::default(),
+        }
+    }
+}
+
 impl DedupLedger {
     /// A fresh, empty IN-MEMORY ledger (the test-double / in-process-drill default).
+    /// **MR-009b Wave 3 — TEST DOUBLE (compiled ONLY under `#[cfg(any(test, feature = "test-support"))]`).**
+    /// The PRODUCTION constructor is [`DedupLedger::durable`] (the events `serve()` composition root
+    /// wires the PG-backed `consumer_dedup` table); this `::new` is the DB-free unit-test entry point
+    /// downstream crates reach via the `myelin-events/test-support` dev-dependency.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new() -> Self {
         Self::default()
     }
@@ -162,6 +194,7 @@ impl DedupLedger {
     /// straight to its trait, never here).
     fn mem(&self) -> Option<std::sync::MutexGuard<'_, HashSet<(ConsumerName, crate::EventId)>>> {
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             DedupBackend::Memory(inner) => Some(inner.lock().unwrap_or_else(|e| e.into_inner())),
             DedupBackend::Durable(_) => None,
         }
@@ -174,6 +207,7 @@ impl DedupLedger {
     /// fresh for each. On the `Durable` backend a restart-surviving PG row is the dedup state.
     pub fn mark_handled(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool {
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             DedupBackend::Memory(inner) => inner
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -186,6 +220,7 @@ impl DedupLedger {
     /// transactional one.)
     pub fn is_handled(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool {
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             DedupBackend::Memory(inner) => inner
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -202,6 +237,7 @@ impl DedupLedger {
     /// handler rolls back its dedup mark for free — this models that atomicity. Crate-internal.
     pub(crate) fn revert(&self, consumer: &ConsumerName, event_id: &crate::EventId) {
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             DedupBackend::Memory(inner) => {
                 inner
                     .lock()
@@ -226,6 +262,7 @@ impl DedupLedger {
     /// a mark was present and removed.
     pub fn forget(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool {
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             DedupBackend::Memory(inner) => inner
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

@@ -143,6 +143,11 @@ integration = [
 ]
 
 [dev-dependencies]
+# MR-009b Wave 3: enable `test-support` so this crate's DEV tests reach the events in-memory
+# `DedupLedger::new()` double (the durable `DedupLedger::durable` is the production default; the
+# in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
+# — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
+myelin-events = { path = "../myelin-events", features = ["test-support"] }
 # The Identity namespace ENGINE — the CDC for contract 4.9 admits chat's RICH fragment (the
 # `+ parent_project->read` TTU, the `& parent_project->admin` intersection) into the real cell schema
 # to PROVE the frozen names-only carrier is admissible. A DEV-only edge (the runtime fragment chat

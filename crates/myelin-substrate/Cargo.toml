@@ -31,6 +31,11 @@ serde.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+# MR-009b Wave 3: enable `test-support` so this crate's DEV tests reach the events in-memory
+# `DedupLedger::new()` double (the durable `DedupLedger::durable` is the production default; the
+# in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
+# — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
+myelin-events = { path = "../myelin-events", features = ["test-support"] }
 # Test-support ONLY: the hello-world serve test reads the contract-1.8 producer signals
 # serve exports back through the harness's telemetry-assertion library (the SAME SignalName
 # set). A dev-dependency so myelin-harness stays OUT of the production crate DAG
