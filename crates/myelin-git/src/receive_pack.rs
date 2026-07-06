@@ -716,7 +716,15 @@ impl RefStore {
     }
 
     /// The current per-ref generation (`update_seq`; 0 if the ref does not exist). Memory: the row's
-    /// `update_seq`; Disk: the on-disk reflog length (durable — survives restart).
+    /// `update_seq`; Disk: the durable per-ref generation counter (R0.4 / git #1 HIGH —
+    /// [`DurableGitRepo::ref_generation`], the config-backed counter that survives restart AND is
+    /// monotonic across a ref's delete+recreate, unlike the reflog length it replaces).
+    ///
+    /// **Write-path ↔ reconcile coherence.** The write path stamps `new_seq = seq_of(ref) + 1` into the
+    /// emitted `git.ref.updated` event; `apply_one`'s CAS then bumps the SAME durable counter to
+    /// `previous + 1` internally (under the ref's held linearisation lock, so no interleaving move sits
+    /// between the read here and the bump). Hence after the apply `ref_generation(ref) == new_seq`, so
+    /// the reconciler's `rec.update_seq <= ref_generation` skip is EXACT for an already-applied move.
     fn seq_of(&self, ref_name: &RefName) -> u64 {
         match &self.backing {
             RefBacking::Memory { rows, .. } => rows
@@ -725,7 +733,7 @@ impl RefStore {
                 .get(ref_name)
                 .map(|r| r.update_seq)
                 .unwrap_or(0),
-            RefBacking::Disk { repo } => repo.reflog_len(&ref_name.0) as u64,
+            RefBacking::Disk { repo } => repo.ref_generation(&ref_name.0),
         }
     }
 
