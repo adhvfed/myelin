@@ -23,9 +23,18 @@ fix and passes after — the proof column in the plan doc is the acceptance cont
 | R0.4 | Git crash reconciler: durable monotonic generation replaces reflog-length `update_seq` | git #1 HIGH | DONE | `c221b2e` | git-config `myelin.refgen.<hex>` counter, survives delete+recreate; write-path+reconcile switched; independent verifier CONFIRMED-SOUND; 432 tests |
 | R0.5 | Wire HTTP body bounded at front door (stream+cap, 413) | DELTA N3 | DONE | `38d77cf` | `collect_bounded` frame-by-frame cap 100 MiB + Content-Length fast-reject + canonical 413; 7 tests; self-reviewed |
 | R0.6 | Dev-login env guard (explicit flag AND non-prod build; loud audit) | fe-web auth bypass | DONE | `2209203` | `devLoginAllowed` requires `NODE_ENV!=production` AND `MYELIN_DEV_LOGIN=1`; refuses loud + fail-closed; unit-tested both directions; vitest+tsc+eslint green |
-| R0.7 | Hygiene batch: shallow-push connectivity (N4), `digest_pinned` length, config Debug redaction, CLI token chmod | DELTA N4 + lows | PENDING | — | — |
+| R0.7 | Hygiene batch: shallow-push connectivity (N4), `digest_pinned` length, config Debug redaction, CLI token chmod | DELTA N4 + lows | DONE | `e5355d0` (A/B/C), `5f47dd8` (D) | A: CLI token atomic 0600-before-write. B: `digest_pinned` per-algo length (+4 downstream fixture crates padded). C: `S3Config`/`MyelinConfig` `Debug` redacts secrets. D: `history_connectivity_complete` full-ancestry walk, wired into the accept gate. |
 
 R0 exit: all seven rows DONE with adversarial proofs; verifier sign-off recorded per security row.
+
+**R0 COMPLETE (2026-07-06).** All 7 items landed across commits `21b5848` (R0.1), `f0df43e` (R0.2/R0.3),
+`c221b2e` (R0.4), `38d77cf` (R0.5), `2209203` (R0.6), `e5355d0` (R0.7-A/B/C), `5f47dd8` (R0.7-D). Every
+security item passed builder → independent adversarial verifier → commit; the one defect the process
+caught (R0.2 fail-open on a corrupt branch-protection config) was fixed + regression-tested before commit.
+Carried forward to R2 as **R2.1a**: wire R0.2/R0.3 live (inject a real `RepoAuthorizer`, `register_git_wire`
+in production `main.rs`) — the gates are correct but latent until then. Workspace build clean; per-crate
+gates green; the `drills_git_d9`/`DedupLedger::new` failure is a pre-existing MR-009b (W3) integration-gated
+item, addressed in R1, not R0.
 
 ## R1 — MR-009b completion (executes in ledger 13; fold-ins tracked here)
 
@@ -69,3 +78,8 @@ Tracked here at phase granularity once entered; R3 rows will be added when its d
 ## Decision log
 
 - 2026-07-06: Ledger opened; R0 execution begins at HEAD `2f38fce`.
+- 2026-07-06: **R0 complete** (7/7, HEAD `5f47dd8`). Builder/verifier/commit process throughout; R2.1a
+  carried forward (wire the R0.2/R0.3 gates live). **Next: R1** — MR-009b W3b–W7 (ledger 13) with the
+  review HIGHs folded into their waves (see the R1 fold-in table above). R1 exit = scanner
+  `no-in-memory-durable-store` baseline 0; the pre-existing `DedupLedger::new` integration breakage is an
+  R1 item. R3 (Git/PR UX) can run in parallel with R1/R2 when opened.
