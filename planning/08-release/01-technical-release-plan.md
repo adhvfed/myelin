@@ -62,7 +62,7 @@ makes object-level authz real and then removes the AllowAll authorizer — in th
 
 | # | Item | Source |
 |---|---|---|
-| R2.1 | **Object-level (relationship) authorization at the edge**: extend the R0.3 seam platform-wide — edge re-authorization takes (action, object) and consults the tuple store; `git_edge` template corrected first so every subsystem copies the fixed shape. | xc-tenancy HIGH |
+| R2.1 | **Object-level (relationship) authorization at the edge**: extend the R0.3 seam platform-wide — edge re-authorization takes (action, object) and consults the tuple store; `git_edge` template corrected first so every subsystem copies the fixed shape. **Includes wiring R0.2/R0.3 LIVE** (R0 verifier finding): production `main.rs` must inject a real grant-backed `RepoAuthorizer` (not the `AllowAllRepos` default) and `register_git_wire` in the production gateway — until then the R0.2 branch-protection gate and R0.3 per-repo authz are correct but latent. | xc-tenancy HIGH, R0 verifier |
 | R2.2 | Identity `check()` authorizes on fully-qualified object, not bare trailing id; query `EventMatcher` and SSE scope get the same object-qualification treatment. | identity #a, themes |
 | R2.3 | **Fail-static authz cache: full-key comparison** (no 64-bit-hash aliasing). | substrate HIGH |
 | R2.4 | **MCP HITL**: approval is a server-side verdict looked up by the gate, never a caller-supplied boolean; batch partial-approval applies effects by approval-id, not tool name. | mcp/agent HIGHs |
