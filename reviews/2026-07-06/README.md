@@ -5,6 +5,7 @@ Multi-agent review of the Myelin platform: **24 units** reviewed and adversarial
 **Totals:** 85 kept findings (76 confirmed)  ·  🔴 3 critical  ·  🟠 11 high  ·  🟡 30 medium  ·  🔵 37 low  ·  ⚪ 4 nit
 
 - [Executive summary](00-executive-summary.md)
+- [**Delta: impact of the 26 post-review commits (CT track + MR-009b)**](DELTA-post-CT-and-MR009b.md) — no finding fixed; several escalated to live; 4 new findings (3 HIGH) on the CI prod-exec + git-wire surfaces
 
 ## Codebase
 
