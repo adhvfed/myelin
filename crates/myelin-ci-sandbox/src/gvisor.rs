@@ -1782,7 +1782,7 @@ mod tests {
     fn spec(allow: Vec<String>) -> JobSpec {
         JobSpec::new(
             JobKind::Agent,
-            ImageRef::pinned("r/img@sha256:abc123def4567890").unwrap(),
+            ImageRef::pinned("r/img@sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890").unwrap(),
             vec!["python3".into(), "-c".into(), "print(1)".into()],
             vec![],
             vec![],

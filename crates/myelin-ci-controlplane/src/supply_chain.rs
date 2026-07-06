@@ -663,8 +663,8 @@ fn component_digest(reference: &str) -> String {
 mod tests {
     use super::*;
 
-    const PINNED: &str = "registry.example/build@sha256:abc123def456";
-    const PINNED2: &str = "registry.example/test@sha256:ffeeddccbbaa";
+    const PINNED: &str = "registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000";
+    const PINNED2: &str = "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000";
 
     fn identity() -> BuildIdentity {
         BuildIdentity::new("run-0001", "ci-runner@acme")
@@ -915,8 +915,8 @@ mod tests {
         assert_eq!(
             prov.input_digests,
             vec![
-                "sha256:abc123def456".to_string(),
-                "sha256:ffeeddccbbaa".to_string()
+                "sha256:abc123def4560000000000000000000000000000000000000000000000000000".to_string(),
+                "sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000".to_string()
             ],
             "input digests are sorted (deterministic provenance)"
         );

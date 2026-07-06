@@ -169,7 +169,7 @@ fn ok_hooks() -> RunnerHooks {
 fn corpus_spec(command: Vec<String>, tag: &str) -> JobSpec {
     JobSpec::new(
         JobKind::Ci,
-        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef0123456789abcdef").unwrap(),
+        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap(),
         command,
         vec![],
         vec![],

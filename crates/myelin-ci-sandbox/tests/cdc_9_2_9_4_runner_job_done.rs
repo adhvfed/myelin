@@ -41,7 +41,7 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 fn pinned() -> ImageRef {
-    ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef").unwrap()
+    ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap()
 }
 fn limits() -> ResourceLimits {
     ResourceLimits {

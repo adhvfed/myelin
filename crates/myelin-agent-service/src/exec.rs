@@ -512,7 +512,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn pinned() -> ImageRef {
-        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef").unwrap()
+        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef000000000000000000000000000000000000000000000000").unwrap()
     }
 
     /// A real GREEN AG-D4 gate for the test production backend (minted from the corpus parser, never

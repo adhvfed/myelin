@@ -22,8 +22,8 @@ use myelin_ci_controlplane::supply_chain::{
 use myelin_ci_sandbox::events::CI_SUPPLY_CHAIN_VERIFICATION_FAILED;
 use myelin_events::ArtifactRef;
 
-const PINNED_BUILD: &str = "registry.example/build@sha256:abc123def456";
-const PINNED_TEST: &str = "registry.example/test@sha256:ffeeddccbbaa";
+const PINNED_BUILD: &str = "registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000";
+const PINNED_TEST: &str = "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000";
 const RUN_ID: &str = "run-d4-0001";
 
 fn identity() -> BuildIdentity {

@@ -24,8 +24,8 @@ use myelin_storage::s3blob::S3BlobStore;
 use myelin_storage::{BlobStore, ContentHash};
 use myelin_tenancy::TenantId;
 
-const PINNED_BUILD: &str = "registry.example/build@sha256:abc123def456";
-const PINNED_TEST: &str = "registry.example/test@sha256:ffeeddccbbaa";
+const PINNED_BUILD: &str = "registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000";
+const PINNED_TEST: &str = "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000";
 
 /// **The CAS definition snapshot round-trips through the REAL object store + a floating tag is
 /// refused before any byte lands.**

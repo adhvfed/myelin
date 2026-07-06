@@ -483,7 +483,7 @@ mod tests {
     fn spec_with_egress(allow: Vec<String>) -> JobSpec {
         JobSpec::new(
             JobKind::Ci,
-            ImageRef::pinned("r/img@sha256:abc123def4567890").unwrap(),
+            ImageRef::pinned("r/img@sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890").unwrap(),
             vec!["echo".into(), "hi".into()],
             vec![],
             vec![],

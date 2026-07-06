@@ -84,7 +84,13 @@ pub enum Mode {
 }
 
 /// The validated, env-first runtime config — the dev<->prod swap target.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// R0.7-C: `Debug` is hand-written (NOT derived) because [`MyelinConfig::database_url`] and
+/// [`MyelinConfig::redis_url`] are connection DSNs that embed a password in their userinfo
+/// (`postgres://user:PASSWORD@host/db`); a derived `{:?}` in a log line, a panic, or an error
+/// context would print that password in clear. The redacting impl below prints `<redacted>` for
+/// those two fields (and defers the S3 credential redaction to [`S3Config`]'s own impl).
+#[derive(Clone, PartialEq, Eq)]
 pub struct MyelinConfig {
     /// Postgres OLTP connection string (OLTP + outbox + ReBAC tuple store + audit).
     pub database_url: String,
@@ -100,7 +106,12 @@ pub struct MyelinConfig {
 
 /// The S3-compatible object-store config (the [`MyelinConfig::s3`] slice). Consumed by the
 /// `aws-sdk-s3` BlobStore object impl behind the `integration` feature.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// R0.7-C: `Debug` is hand-written (NOT derived) because [`S3Config::access_key`] and
+/// [`S3Config::secret_key`] are plaintext credentials; a derived `{:?}` (in a log line, a panic,
+/// or an error context) would print the S3 secret in clear. The redacting impl below prints
+/// `<redacted>` for both credential fields; the non-secret fields print normally.
+#[derive(Clone, PartialEq, Eq)]
 pub struct S3Config {
     /// Custom endpoint URL (RustFS/Scaleway) — NOT the AWS default endpoint.
     pub endpoint: String,
@@ -115,6 +126,35 @@ pub struct S3Config {
     /// Use path-style addressing (`true` for RustFS/MinIO-class + Scaleway). The
     /// `aws-sdk-s3` `force_path_style` knob.
     pub force_path_style: bool,
+}
+
+impl core::fmt::Debug for S3Config {
+    /// R0.7-C: redact the credential fields so a `{:?}` never prints the S3 secret/access key.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("access_key", &"<redacted>")
+            .field("secret_key", &"<redacted>")
+            .field("bucket", &self.bucket)
+            .field("force_path_style", &self.force_path_style)
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for MyelinConfig {
+    /// R0.7-C: redact the credential-bearing DSN fields (`database_url`, `redis_url`) so a `{:?}`
+    /// never prints the password embedded in their userinfo. `s3` defers to [`S3Config`]'s own
+    /// redacting impl; `nats_url`/`region` carry no credential and print normally.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MyelinConfig")
+            .field("database_url", &"<redacted>")
+            .field("s3", &self.s3)
+            .field("redis_url", &"<redacted>")
+            .field("nats_url", &self.nats_url)
+            .field("region", &self.region)
+            .finish()
+    }
 }
 
 impl MyelinConfig {
@@ -261,6 +301,38 @@ mod tests {
         env::set_var("MYELIN_REGION", "fr-par");
         let cfg = MyelinConfig::from_env(Mode::DevDefaults).unwrap();
         assert_eq!(cfg.database_url, "postgres://custom/x");
+        clear();
+    }
+
+    /// R0.7-C: a `{:?}` of the config must NOT contain the S3 secret / access key nor the DB
+    /// password embedded in the DSN — it must print the `<redacted>` marker instead.
+    #[test]
+    fn debug_redacts_secrets() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear();
+        env::set_var("DATABASE_URL", "postgres://dbuser:SUPER_SECRET_DB_PW@host:5432/myelin");
+        env::set_var("S3_ENDPOINT", "https://s3.fr-par.scw.cloud");
+        env::set_var("S3_REGION", "fr-par");
+        env::set_var("S3_ACCESS_KEY", "AKIA_SECRET_ACCESS_ID");
+        env::set_var("S3_SECRET_KEY", "TOP_SECRET_S3_KEY_MATERIAL");
+        env::set_var("S3_BUCKET", "myelin-prod");
+        env::set_var("REDIS_URL", "rediss://redisuser:REDIS_SECRET_PW@prod:6379");
+        env::set_var("NATS_URL", "nats://prod:4222");
+        let cfg = MyelinConfig::from_env(Mode::RequireEnv).unwrap();
+
+        // S3Config on its own redacts both credential fields.
+        let s3_dbg = format!("{:?}", cfg.s3);
+        assert!(!s3_dbg.contains("AKIA_SECRET_ACCESS_ID"), "access_key leaked: {s3_dbg}");
+        assert!(!s3_dbg.contains("TOP_SECRET_S3_KEY_MATERIAL"), "secret_key leaked: {s3_dbg}");
+        assert!(s3_dbg.contains("<redacted>"), "expected a redaction marker: {s3_dbg}");
+        assert!(s3_dbg.contains("myelin-prod"), "non-secret bucket should still print: {s3_dbg}");
+
+        // The whole config's Debug redacts the S3 secret AND the DSN passwords.
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("TOP_SECRET_S3_KEY_MATERIAL"), "s3 secret leaked via MyelinConfig: {dbg}");
+        assert!(!dbg.contains("SUPER_SECRET_DB_PW"), "db password leaked: {dbg}");
+        assert!(!dbg.contains("REDIS_SECRET_PW"), "redis password leaked: {dbg}");
+        assert!(dbg.contains("<redacted>"), "expected a redaction marker: {dbg}");
         clear();
     }
 

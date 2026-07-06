@@ -74,7 +74,7 @@ fn preconditions() -> Option<String> {
 fn drill_spec() -> JobSpec {
     JobSpec::new(
         JobKind::Agent,
-        ImageRef::pinned("r/agd4@sha256:abc123def4567890").unwrap(),
+        ImageRef::pinned("r/agd4@sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890").unwrap(),
         vec!["/bin/sh".into(), format!("/{GVISOR_CORPUS_SCRIPT}")],
         vec![],
         vec![],
