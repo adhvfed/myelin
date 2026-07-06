@@ -776,14 +776,36 @@ impl DurableGitBackend {
         //    non-delete tip whose object set is INCOMPLETE (missing tree/blob) rejects the whole push.
         let mut updates = Vec::new();
         let mut per_ref_status: Vec<(String, Option<String>)> = Vec::new();
+        // R0.7-D / DELTA N4: the durable repo's CURRENT ref tips (pre-push state), computed once for the
+        // full-history connectivity walk below. The walk hides these so a thin push only pays for the
+        // newly-introduced commits; an unreadable ref list fails safe to `[]` (a wider walk = stricter).
+        let existing_tips: Vec<CoreOid> = repo
+            .list_refs()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, oid)| oid)
+            .collect();
         for c in &cmds {
             let new_zero = c.new.chars().all(|ch| ch == '0');
             let old_zero = c.old.chars().all(|ch| ch == '0');
-            if !new_zero && !q.commit_tree_complete(&CoreOid::new(c.new.clone())).unwrap_or(false) {
+            // R0.7-D / DELTA N4: FULL-history connectivity, not just the tip tree. `index-pack --fix-thin`
+            // resolves delta bases but NOT missing PARENT commits, and the old tip-only check
+            // (`commit_tree_complete`) verified only the tip commit's own tree — so a push whose tip has a
+            // missing ancestor was accepted and later wedged clone/fetch. Walk from the new tip hiding the
+            // existing tips; reject if any reachable commit/tree/blob/parent is absent. Fail-closed:
+            // `.unwrap_or(false)` rejects on any infra error too.
+            if !new_zero
+                && !q
+                    .history_connectivity_complete(&CoreOid::new(c.new.clone()), &existing_tips)
+                    .unwrap_or(false)
+            {
                 let _ = std::fs::remove_dir_all(&qdir);
                 return Ok(report_status(
                     "ok",
-                    &all_ng(&cmds, "rejected: incomplete object set (missing tree/blob) for a ref"),
+                    &all_ng(
+                        &cmds,
+                        "rejected: incomplete history (missing ancestor/tree/blob) for a ref",
+                    ),
                 ));
             }
             let forced = if !old_zero && !new_zero {

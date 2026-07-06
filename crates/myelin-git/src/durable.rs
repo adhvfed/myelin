@@ -870,10 +870,18 @@ impl DurableGitRepo {
         Ok(Oid::new(oid.to_string()))
     }
 
-    /// Whether `tip` is a real commit whose full tree is present + readable in the odb (a connectivity
-    /// slice for the push-accept gate: a ref must never advance to a commit with a missing tree/blob).
-    /// Walks the commit's root tree recursively; a missing object surfaces as `Err`. (Full historical
-    /// reachability is the external `git fsck --full` oracle the push test additionally runs.)
+    /// Whether `tip` is a real commit whose OWN root tree is present + readable in the odb — the
+    /// **tip-only** slice (trees + blobs reachable from THIS commit's tree exist). It walks exactly one
+    /// commit's tree and says NOTHING about the commit's ancestry.
+    ///
+    /// **R0.7-D / DELTA N4 — why this is NOT the full connectivity check.** A push whose tip tree is
+    /// complete can still reference a MISSING ANCESTOR commit (`index-pack --fix-thin` resolves delta
+    /// bases, never missing parent COMMITS). Accepting on the tip-tree alone lets one crafted push wedge
+    /// a branch's clonability: the accept gate says "ok", but a later `clone`/`fetch` fails client-side
+    /// walking into the absent parent — a durable-integrity DoS. The push-accept gate MUST instead use
+    /// [`Self::history_connectivity_complete`], which verifies EVERY new commit's tree AND that every
+    /// parent oid is present. This method is retained only as the single-commit tree slice (reused by
+    /// the full walk via the shared [`Self::tree_objects_present`] helper).
     pub fn commit_tree_complete(&self, tip: &Oid) -> Result<bool, DurableError> {
         let repo = self.open_git()?;
         let goid = Self::parse_oid(tip)?;
@@ -886,21 +894,124 @@ impl DurableGitRepo {
             Err(_) => return Ok(false),
         };
         let odb = repo.odb().map_err(|e| git_err("odb", e))?;
+        Self::tree_objects_present(&odb, &tree)
+    }
+
+    /// The shared tree-walk: whether EVERY tree/blob reachable from `tree` is present in `odb`. Factored
+    /// out of [`Self::commit_tree_complete`] so the full connectivity walk
+    /// ([`Self::history_connectivity_complete`]) checks each commit's tree with the SAME logic (no
+    /// duplicated object walking — the anti-duplication discipline). A missing tree/blob → `Ok(false)`
+    /// (a walk that aborts early); only a libgit2 walk failure surfaces as `Err`.
+    fn tree_objects_present(odb: &git2::Odb, tree: &git2::Tree) -> Result<bool, DurableError> {
         let mut complete = true;
         tree.walk(git2::TreeWalkMode::PreOrder, |_root, entry| {
             match entry.kind() {
-                Some(git2::ObjectType::Tree) | Some(git2::ObjectType::Blob) => {
-                    if !odb.exists(entry.id()) {
-                        complete = false;
-                        return git2::TreeWalkResult::Abort;
-                    }
+                Some(git2::ObjectType::Tree) | Some(git2::ObjectType::Blob)
+                    if !odb.exists(entry.id()) =>
+                {
+                    complete = false;
+                    git2::TreeWalkResult::Abort
                 }
-                _ => {}
+                _ => git2::TreeWalkResult::Ok,
             }
-            git2::TreeWalkResult::Ok
         })
         .map_err(|e| git_err("tree walk", e))?;
         Ok(complete)
+    }
+
+    /// **R0.7-D / DELTA N4 (MEDIUM) — full push-connectivity check: is EVERY object reachable from
+    /// `new_tip` and NOT already reachable from `existing_tips` present + connected in the odb?**
+    ///
+    /// The push-accept gate MUST call this INSTEAD of the tip-only [`Self::commit_tree_complete`]. The
+    /// tip-only check verifies just the tip commit's own tree, so a crafted push whose tip references a
+    /// MISSING ANCESTOR commit is accepted (the tip's tree is complete) yet leaves the branch
+    /// un-clonable — a later `clone`/`fetch` fails walking into the absent parent. That is a durable-
+    /// integrity DoS one push can inflict; this walk closes it by proving the WHOLE newly-introduced
+    /// history is self-contained before the ref moves.
+    ///
+    /// **The walk (thin-push cheap).** A libgit2 revwalk pushes `new_tip` and HIDES each `existing_tips`
+    /// entry, so only the commits this push actually INTRODUCES are visited — a thin push pays for its
+    /// delta, not the whole history each time. `existing_tips` empty (a repo/branch CREATE) is correct:
+    /// the walk then covers the full new history, which a fresh branch must be entirely self-contained
+    /// to satisfy. Hiding a non-existent / unparseable existing tip is done gracefully (skipped): it
+    /// contributes nothing to reachability, so failing to hide it only WIDENS the walk — the fail-closed
+    /// direction (we verify more, never less).
+    ///
+    /// For EACH new commit the walk yields we assert three things, reusing existing helpers:
+    /// - the commit object exists (`find_commit`),
+    /// - its root tree is complete ([`Self::tree_objects_present`] — the shared tree walk), and
+    /// - EVERY parent oid is present in the odb (`odb.exists`) — a missing ancestor commit.
+    ///
+    /// **Fail-closed mapping (deliberate).** A genuinely-missing ancestor manifests two ways, and BOTH
+    /// map to `Ok(false)` (REJECT the push), never `Err`:
+    /// 1. `odb.exists(parent)` is `false` for a walked commit's parent — the deterministic catch;
+    /// 2. the revwalk step itself ERRORS because libgit2 tried to load a missing parent to continue the
+    ///    traversal — mapped to `Ok(false)`.
+    ///
+    /// Returning `Err` for a missing object would be dangerous: a caller might treat an `Err` as a
+    /// transient/infra failure and retry-then-accept, re-opening the hole. So a missing object is a
+    /// hard, first-class REJECT (`Ok(false)`), distinct from the genuine infrastructure errors that DO
+    /// surface as `Err` (`open_git` / `odb` acquisition / a `new_tip` that is not a parseable oid). On
+    /// any doubt within the walk we fail CLOSED — reject, never accept.
+    pub fn history_connectivity_complete(
+        &self,
+        new_tip: &Oid,
+        existing_tips: &[Oid],
+    ) -> Result<bool, DurableError> {
+        let repo = self.open_git()?;
+        let odb = repo.odb().map_err(|e| git_err("odb", e))?;
+        let tip_g = Self::parse_oid(new_tip)?;
+        // The new tip itself must be a present commit — a ref never advances to a missing/non-commit
+        // tip (mirrors the tip-only check's first guard).
+        if repo.find_commit(tip_g).is_err() {
+            return Ok(false);
+        }
+
+        let mut walk = repo.revwalk().map_err(|e| git_err("revwalk", e))?;
+        walk.push(tip_g)
+            .map_err(|e| git_err("revwalk push new_tip", e))?;
+        // Hide each already-reachable existing tip → only the NEW commits are walked (thin-push cheap).
+        // A tip we cannot parse or that is absent from the odb is skipped gracefully (see doc): failing
+        // to hide only widens the walk, which is the fail-closed direction.
+        for t in existing_tips {
+            if let Ok(g) = Self::parse_oid(t) {
+                if odb.exists(g) {
+                    // A hide of a genuinely-present commit; ignore a benign libgit2 hide error (still
+                    // fail-closed — an un-hidden tip only means we verify more objects).
+                    let _ = walk.hide(g);
+                }
+            }
+        }
+
+        for step in walk {
+            // A revwalk step that ERRORS is libgit2 failing to load a commit it must traverse (a
+            // missing ancestor) → REJECT (fail closed), never a swallowed-into-accept `Err`.
+            let commit_oid = match step {
+                Ok(o) => o,
+                Err(_) => return Ok(false),
+            };
+            let commit = match repo.find_commit(commit_oid) {
+                Ok(c) => c,
+                Err(_) => return Ok(false),
+            };
+            // (a) this commit's own tree must be complete (the shared tree-walk helper).
+            let tree = match commit.tree() {
+                Ok(t) => t,
+                Err(_) => return Ok(false),
+            };
+            if !Self::tree_objects_present(&odb, &tree)? {
+                return Ok(false);
+            }
+            // (b) every PARENT commit oid must be present in the odb — the missing-ancestor catch the
+            // tip-only check lacked. A boundary commit whose parent is the absent ancestor is itself
+            // NEW (reachable, not hidden), so this deterministically rejects the wedge push.
+            for parent_oid in commit.parent_ids() {
+                if !odb.exists(parent_oid) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -1278,5 +1389,170 @@ mod tests {
             "the durable generation survives a process restart (config is on disk)"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── R0.7-D / DELTA N4: full push-connectivity (missing-ancestor rejection) ──
+
+    /// Copy one object's raw bytes from `src`'s odb into `dst`'s odb, preserving its oid (git2
+    /// re-hashes on write, so we assert the oid is identical — a forged copy is impossible). Used to
+    /// stage a `dst` odb that is MISSING a chosen ancestor commit while its tip tree is complete.
+    fn copy_object(src: &DurableGitRepo, dst: &DurableGitRepo, oid: &Oid, kind: &str) {
+        let bytes = src.read_object(oid).expect("read src object");
+        let written = dst.write_raw_object(kind, &bytes).expect("write dst object");
+        assert_eq!(written.0, oid.0, "the re-hashed copy keeps the same oid");
+    }
+
+    /// Build a linear `c1 <- c2 <- c3` history in a fresh source repo and return
+    /// `(root, repo, [(blob,tree,commit); 3])` so a target odb can be assembled with a chosen subset.
+    #[allow(clippy::type_complexity)]
+    fn seed_three_commit_history() -> (PathBuf, DurableGitRepo, Vec<(Oid, Oid, Oid)>) {
+        let root = temp_root("conn-src");
+        let repo = DurableGitStore::rooted(&root).create_repo(&loc()).expect("create src");
+        let mut chain: Vec<(Oid, Oid, Oid)> = Vec::new();
+        let mut parent: Option<Oid> = None;
+        for i in 0..3u8 {
+            let blob = repo.write_blob(format!("line {i}\n").as_bytes()).unwrap();
+            let tree = repo.write_tree(&[("file.txt", &blob)]).unwrap();
+            let parents: Vec<&Oid> = parent.iter().collect();
+            let commit = repo
+                .write_commit(&tree, &parents, &format!("c{i}"), "psn@acme.noreply", "psn@acme.noreply")
+                .unwrap();
+            parent = Some(commit.clone());
+            chain.push((blob, tree, commit));
+        }
+        (root, repo, chain)
+    }
+
+    /// **THE R0.7-D REGRESSION (DELTA N4).** A push whose TIP commit's tree is COMPLETE but whose
+    /// PARENT (ancestor) commit is MISSING from the odb must be REJECTED by the full-connectivity check
+    /// — this is exactly the state the tip-only [`DurableGitRepo::commit_tree_complete`] ACCEPTS today
+    /// (proven here) and that would wedge the branch's clonability. `existing_tips` is empty (a branch
+    /// create): a fresh branch must be fully self-contained.
+    #[test]
+    fn history_connectivity_rejects_a_missing_ancestor_commit() {
+        let (src_root, src, chain) = seed_three_commit_history();
+        let (b1, t1, c1) = chain[0].clone();
+        let (b2, t2, c2) = chain[1].clone();
+        let (b3, t3, c3) = chain[2].clone();
+
+        // Target odb: everything EXCEPT the ANCESTOR commit c1 (its tree/blob copied so nothing else
+        // is missing — the ONLY hole is the parent COMMIT c1).
+        let dst_root = temp_root("conn-dst-missing");
+        let dst = DurableGitStore::rooted(&dst_root).create_repo(&loc()).expect("create dst");
+        copy_object(&src, &dst, &b1, "blob");
+        copy_object(&src, &dst, &t1, "tree");
+        copy_object(&src, &dst, &b2, "blob");
+        copy_object(&src, &dst, &t2, "tree");
+        copy_object(&src, &dst, &b3, "blob");
+        copy_object(&src, &dst, &t3, "tree");
+        copy_object(&src, &dst, &c2, "commit");
+        copy_object(&src, &dst, &c3, "commit");
+        // c1 (the ancestor commit) is deliberately NOT copied.
+        assert!(!dst.has_object(&c1), "the ancestor commit is absent from the target odb");
+
+        // What passes today: the tip's OWN tree is complete (the tip-only slice says "ok").
+        assert!(
+            dst.commit_tree_complete(&c3).unwrap(),
+            "the tip-only check ACCEPTS — the tip's tree is complete (this is the hole)"
+        );
+        // The FIX: full connectivity REJECTS (missing ancestor → a branch a clone cannot walk).
+        assert_eq!(
+            dst.history_connectivity_complete(&c3, &[]).unwrap(),
+            false,
+            "R0.7-D: a missing ANCESTOR commit rejects the push (fail-closed) — the ref must not move"
+        );
+
+        std::fs::remove_dir_all(&src_root).ok();
+        std::fs::remove_dir_all(&dst_root).ok();
+    }
+
+    /// A normal push whose FULL history is present is ACCEPTED (the full-connectivity walk finds every
+    /// commit + tree + parent). Both the branch-create (`existing_tips == []`) form and the tip-only
+    /// slice agree here — the fix is never MORE permissive on a well-formed push.
+    #[test]
+    fn history_connectivity_accepts_full_history() {
+        let (src_root, src, chain) = seed_three_commit_history();
+        let dst_root = temp_root("conn-dst-full");
+        let dst = DurableGitStore::rooted(&dst_root).create_repo(&loc()).expect("create dst");
+        for (b, t, c) in &chain {
+            copy_object(&src, &dst, b, "blob");
+            copy_object(&src, &dst, t, "tree");
+            copy_object(&src, &dst, c, "commit");
+        }
+        let c3 = &chain[2].2;
+        assert!(
+            dst.history_connectivity_complete(c3, &[]).unwrap(),
+            "a fully self-contained new history is ACCEPTED (branch create)"
+        );
+        std::fs::remove_dir_all(&src_root).ok();
+        std::fs::remove_dir_all(&dst_root).ok();
+    }
+
+    /// **Thin-push cheapness + correctness.** With `existing_tips = [c2]` the walk HIDES the existing
+    /// history and visits ONLY the newly-introduced commit c3 — so a push whose delta base c2 is present
+    /// is accepted WITHOUT re-verifying the whole chain, AND a non-existent existing tip is hidden
+    /// gracefully (skipped, only widening the walk — fail-closed).
+    #[test]
+    fn history_connectivity_thin_push_hides_existing_tips() {
+        let (src_root, src, chain) = seed_three_commit_history();
+        let dst_root = temp_root("conn-dst-thin");
+        let dst = DurableGitStore::rooted(&dst_root).create_repo(&loc()).expect("create dst");
+        for (b, t, c) in &chain {
+            copy_object(&src, &dst, b, "blob");
+            copy_object(&src, &dst, t, "tree");
+            copy_object(&src, &dst, c, "commit");
+        }
+        let c2 = chain[1].2.clone();
+        let c3 = chain[2].2.clone();
+
+        assert!(
+            dst.history_connectivity_complete(&c3, &[c2.clone()]).unwrap(),
+            "a thin push onto a present base tip is accepted (only the delta is walked)"
+        );
+        // A bogus / non-existent existing tip is hidden gracefully — the push is still correctly judged.
+        let bogus = Oid::new("0".repeat(39) + "1");
+        assert!(
+            dst.history_connectivity_complete(&c3, &[c2, bogus]).unwrap(),
+            "hiding a non-existent existing tip is graceful (skipped, never an error)"
+        );
+        std::fs::remove_dir_all(&src_root).ok();
+        std::fs::remove_dir_all(&dst_root).ok();
+    }
+
+    /// A thin push whose DELTA BASE is present but whose deeper ancestor is missing is still ACCEPTED
+    /// when that ancestor is already reachable from `existing_tips` (it is present, just hidden); but a
+    /// push introducing a commit whose parent is genuinely absent is REJECTED even with a non-empty
+    /// `existing_tips`. This pins the boundary: the check verifies parents of every NEW commit.
+    #[test]
+    fn history_connectivity_rejects_missing_parent_of_a_new_commit_even_with_existing_tips() {
+        let (src_root, src, chain) = seed_three_commit_history();
+        let (b2, t2, c2) = chain[1].clone();
+        let (b3, t3, c3) = chain[2].clone();
+
+        // Target odb has c3 + its tree/blob and c2's tree/blob, but NOT c2 (the parent of the new tip).
+        let dst_root = temp_root("conn-dst-thin-missing");
+        let dst = DurableGitStore::rooted(&dst_root).create_repo(&loc()).expect("create dst");
+        copy_object(&src, &dst, &b2, "blob");
+        copy_object(&src, &dst, &t2, "tree");
+        copy_object(&src, &dst, &b3, "blob");
+        copy_object(&src, &dst, &t3, "tree");
+        copy_object(&src, &dst, &c3, "commit");
+        assert!(!dst.has_object(&c2), "the new tip's parent commit is absent");
+
+        // existing_tips names c2, but c2 is NOT in the odb → hidden gracefully (skipped), so the walk
+        // still visits c3 and finds its parent c2 missing → REJECT (fail-closed).
+        assert_eq!(
+            dst.history_connectivity_complete(&c3, &[c2]).unwrap(),
+            false,
+            "a new commit whose parent is genuinely absent is rejected regardless of existing_tips"
+        );
+        // A missing NEW tip is itself a reject (never a swallowed error).
+        assert_eq!(
+            dst.history_connectivity_complete(&Oid::new("0".repeat(39) + "1"), &[]).unwrap(),
+            false,
+            "a new_tip that is not a present commit is rejected (fail-closed)"
+        );
+        std::fs::remove_dir_all(&src_root).ok();
+        std::fs::remove_dir_all(&dst_root).ok();
     }
 }
