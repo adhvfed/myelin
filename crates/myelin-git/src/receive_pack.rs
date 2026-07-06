@@ -69,6 +69,19 @@ use myelin_events::{
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+// R0.2 / DELTA N1 — the direct-push-to-a-protected-ref gate REUSES the PR merge gate. The
+// required-set logic lives in [`crate::merge_gate`] (never re-implemented here); this module only
+// wires it onto the wire push path (a direct `git push` to a protected ref must clear the SAME gate a
+// PR merge would). No cycle: `merge_gate`/`lifecycle`/`check_status` do not depend on `receive_pack`.
+use crate::check_status::{
+    CheckContext, CheckState, CheckStatus, CheckStatusProjection, GitOid, HumanisedRef,
+    Timestamp as CheckTimestamp, TrustTier,
+};
+use crate::lifecycle::BranchProtectionRuleset;
+use crate::merge_gate::{
+    evaluate_merge_gate, parse_required_context, MergeGateOutcome, MergeGatePolicy, UnmetContext,
+};
+
 // ───────────────────────────── the frozen ref-store DDL (arch §3 / §4.2) ─────────────────────────
 
 /// The frozen forward-only DDL for the `git_ref` reftable-on-OLTP store (arch `01 §4.2`, `02 §3`).
@@ -264,6 +277,29 @@ pub enum RejectReason {
         /// the ref's actual current tip.
         actual: Oid,
     },
+    /// **R0.2 / DELTA N1 (HIGH) — a DIRECT push to a protected ref whose branch-protection merge gate
+    /// is NOT green for the pushed head.** A `git push` straight to a protected branch is refused
+    /// unless every `required_contexts` in the repo's [`BranchProtectionRuleset`] has a
+    /// current-and-acceptable success for the pushed commit — EXACTLY the gate a PR merge into that ref
+    /// would clear ([`crate::merge_gate::evaluate_merge_gate`], reused). This closes the
+    /// under-gated-protected-push hole: a principal holding `git.wire.receive_pack` can no longer land
+    /// un-CI'd code on a protected branch by pushing to it directly. Carries the SPECIFIC unmet
+    /// contexts (loud — never a silent under-gate).
+    ProtectedCheckNotGreen {
+        /// the protected ref the push targeted.
+        ref_name: RefName,
+        /// the specific required contexts that were missing / not-green / un-endorsed-fork.
+        unmet: Vec<UnmetContext>,
+    },
+    /// **R0.2 / DELTA N1 — a repo ruleset named an UNPARSEABLE required context.** Fail-closed: an
+    /// unparseable required context is NEVER treated as "not required" (that would be an under-gated
+    /// protected push). Carries the protected ref + the loud parse detail.
+    ProtectedGateInput {
+        /// the protected ref the push targeted.
+        ref_name: RefName,
+        /// the loud, humanisable parse detail (never silently dropped).
+        detail: String,
+    },
 }
 
 /// The push policy configuration the in-process engine evaluates (arch §2 step 2). The minimal-but-
@@ -375,6 +411,110 @@ impl PushPolicy {
             }
         }
         Ok(())
+    }
+}
+
+// ───────────────────────────── R0.2 / DELTA N1: the protected-ref direct-push gate ───────────────
+
+/// Build a synthetic [`CheckStatus`] fact for the pushed head from a recorded check-context name — the
+/// bridge between Git's OWN recorded check facts (context strings) and the typed
+/// [`CheckStatusProjection`] the merge gate reads. Mirrors the PR merge path's fact synthesis
+/// ([`crate::pr_store`]): a recorded green becomes a `Trusted` success, a recorded fork-unendorsed
+/// green becomes an `UntrustedFork` success (neutral-for-gating until endorsed, Δ3). ACYCLIC — this
+/// reads facts Git already recorded; it NEVER synchronously calls CI (EI-02 §3).
+fn synthetic_check_fact(head: &GitOid, ctx: CheckContext, trust: TrustTier) -> CheckStatus {
+    CheckStatus {
+        tenant: myelin_events::TenantId("_wirepush".into()),
+        repo: ArtifactRef("myelin://_wirepush/git/repo/_".into()),
+        commit_oid: head.clone(),
+        context: ctx,
+        state: CheckState::Success,
+        required: true,
+        run: ArtifactRef("myelin://_wirepush/ci/run/_".into()),
+        run_attempt: 1,
+        trust_tier: trust,
+        details_ref: ArtifactRef("myelin://_wirepush/ci/run/_#s".into()),
+        summary: HumanisedRef {
+            template_key: "ci.check.updated".into(),
+            args: Default::default(),
+        },
+        started_at: CheckTimestamp("2026-06-29T00:00:00Z".into()),
+        completed_at: Some(CheckTimestamp("2026-06-29T00:01:00Z".into())),
+        cost_settled: true,
+    }
+}
+
+/// **R0.2 / DELTA N1 (HIGH) — the branch-protection posture a DIRECT push to a PROTECTED ref must
+/// clear over the wire.** The security invariant: a `git push` straight to a protected branch is held
+/// to the SAME gate a PR merge into that branch would be — no under-gated protected push. Given the
+/// repo-owned [`BranchProtectionRuleset`] for the target ref (loaded by the caller from the repo's
+/// durable config — never a hardcoded literal, never author input) + Git's OWN recorded check facts
+/// for the pushed head, this refuses:
+/// - a DELETE of a protected ref ([`RejectReason::DeleteProtected`]);
+/// - a FORCE-push (non-fast-forward) of a protected ref unless the ruleset sets `allow_force_push`
+///   ([`RejectReason::ForcePushOnProtected`]);
+/// - a push whose head does NOT clear the required-context merge gate
+///   ([`RejectReason::ProtectedCheckNotGreen`]) — evaluated by [`evaluate_merge_gate`] (REUSED, never
+///   duplicated) against the projection synthesised from the recorded facts.
+///
+/// A protected ref with an EMPTY required set clears the checks half on a plain fast-forward (the
+/// force/delete bans still apply) — so this is never MORE permissive than the pre-R0.2 hardcoded
+/// force/delete floor, only stricter (it now also enforces the repo's configured required contexts).
+/// Returns `Ok(())` iff the push may proceed to the ref-CAS. Reads facts Git already holds — ACYCLIC,
+/// it never calls CI (EI-02 §3).
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_protected_ref_push(
+    ref_name: &RefName,
+    is_delete: bool,
+    is_forced: bool,
+    ruleset: &BranchProtectionRuleset,
+    head_oid: &GitOid,
+    green_contexts: &[String],
+    fork_unendorsed_contexts: &[String],
+    endorsed_contexts: &[String],
+) -> Result<(), RejectReason> {
+    // A protected ref is never DELETED over the wire (the ruleset deletion ban).
+    if is_delete {
+        return Err(RejectReason::DeleteProtected {
+            ref_name: ref_name.clone(),
+        });
+    }
+    // A protected ref is never FORCE-pushed unless the repo ruleset opts in (`allow_force_push`).
+    if is_forced && !ruleset.allow_force_push {
+        return Err(RejectReason::ForcePushOnProtected {
+            ref_name: ref_name.clone(),
+        });
+    }
+    // The required-set merge gate — REUSED from `merge_gate` (0 duplicate protected-branch notion).
+    let gate_input = |detail: String| RejectReason::ProtectedGateInput {
+        ref_name: ref_name.clone(),
+        detail,
+    };
+    let policy = MergeGatePolicy::from_required_contexts(&ruleset.required_contexts)
+        .map_err(|e| gate_input(e.to_string()))?;
+
+    // Synthesise the projection for the pushed head from Git's OWN recorded facts (acyclic — no CI
+    // call). A malformed recorded context name is fail-closed (never treated as "not required").
+    let mut proj = CheckStatusProjection::new();
+    for c in green_contexts {
+        let ctx = parse_required_context(c).map_err(|e| gate_input(e.to_string()))?;
+        proj.apply(&synthetic_check_fact(head_oid, ctx, TrustTier::Trusted));
+    }
+    for c in fork_unendorsed_contexts {
+        let ctx = parse_required_context(c).map_err(|e| gate_input(e.to_string()))?;
+        proj.apply(&synthetic_check_fact(head_oid, ctx, TrustTier::UntrustedFork));
+    }
+    let endorsed: Vec<CheckContext> = endorsed_contexts
+        .iter()
+        .map(|c| parse_required_context(c).map_err(|e| gate_input(e.to_string())))
+        .collect::<Result<_, _>>()?;
+
+    match evaluate_merge_gate(&policy, &proj, head_oid, &endorsed) {
+        MergeGateOutcome::Admitted => Ok(()),
+        MergeGateOutcome::Blocked { unmet } => Err(RejectReason::ProtectedCheckNotGreen {
+            ref_name: ref_name.clone(),
+            unmet,
+        }),
     }
 }
 
@@ -1055,6 +1195,199 @@ mod tests {
                 is_agent: false,
             },
         }
+    }
+
+    // ════════ R0.2 / DELTA N1 — the protected-ref DIRECT-push gate (reuses merge_gate) ════════
+
+    fn protected_ruleset(required: &[&str], allow_force_push: bool) -> BranchProtectionRuleset {
+        BranchProtectionRuleset {
+            ref_pattern: "refs/heads/main".into(),
+            required_contexts: required.iter().map(|s| s.to_string()).collect(),
+            required_approvals: 0,
+            require_codeowner_review: false,
+            require_conversation_resolution: false,
+            allow_force_push,
+        }
+    }
+
+    #[test]
+    fn protected_direct_push_rejects_delete() {
+        // A protected ref is never deleted over the wire.
+        let rs = protected_ruleset(&[], false);
+        let head = GitOid("0".repeat(40));
+        assert_eq!(
+            evaluate_protected_ref_push(
+                &RefName::new("refs/heads/main"),
+                /*is_delete*/ true,
+                /*is_forced*/ false,
+                &rs,
+                &head,
+                &[],
+                &[],
+                &[],
+            ),
+            Err(RejectReason::DeleteProtected {
+                ref_name: RefName::new("refs/heads/main")
+            })
+        );
+    }
+
+    #[test]
+    fn protected_direct_push_rejects_force_unless_ruleset_allows() {
+        let head = GitOid("abc".into());
+        // Force-push refused when the ruleset does NOT allow it.
+        assert_eq!(
+            evaluate_protected_ref_push(
+                &RefName::new("refs/heads/main"),
+                false,
+                /*is_forced*/ true,
+                &protected_ruleset(&[], false),
+                &head,
+                &[],
+                &[],
+                &[],
+            ),
+            Err(RejectReason::ForcePushOnProtected {
+                ref_name: RefName::new("refs/heads/main")
+            })
+        );
+        // The SAME force-push admits when the ruleset opts into `allow_force_push` (no required set).
+        assert_eq!(
+            evaluate_protected_ref_push(
+                &RefName::new("refs/heads/main"),
+                false,
+                true,
+                &protected_ruleset(&[], /*allow_force_push*/ true),
+                &head,
+                &[],
+                &[],
+                &[],
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn protected_direct_push_requires_the_required_contexts_green_for_the_head() {
+        let head = GitOid("deadbeef".into());
+        let rs = protected_ruleset(&["ci/build", "ci/test"], false);
+        // No recorded greens for the head → BLOCKED (CI red/missing), naming the unmet contexts.
+        match evaluate_protected_ref_push(
+            &RefName::new("refs/heads/main"),
+            false,
+            false,
+            &rs,
+            &head,
+            &[],
+            &[],
+            &[],
+        ) {
+            Err(RejectReason::ProtectedCheckNotGreen { unmet, .. }) => {
+                assert_eq!(unmet.len(), 2, "both required contexts are unmet");
+            }
+            other => panic!("expected ProtectedCheckNotGreen, got {other:?}"),
+        }
+        // A partial green (only ci/build) is still BLOCKED (ci/test missing).
+        assert!(matches!(
+            evaluate_protected_ref_push(
+                &RefName::new("refs/heads/main"),
+                false,
+                false,
+                &rs,
+                &head,
+                &["ci/build".into()],
+                &[],
+                &[],
+            ),
+            Err(RejectReason::ProtectedCheckNotGreen { .. })
+        ));
+        // Both required contexts green-and-current for the head → ADMITTED (the ff push may proceed).
+        assert_eq!(
+            evaluate_protected_ref_push(
+                &RefName::new("refs/heads/main"),
+                false,
+                false,
+                &rs,
+                &head,
+                &["ci/build".into(), "ci/test".into()],
+                &[],
+                &[],
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn protected_direct_push_fork_success_is_neutral_until_endorsed() {
+        // A fork-run (untrusted) success is neutral-for-gating (Δ3) — BLOCKED until a maintainer
+        // endorses it; endorsement admits. A fork cannot self-green its own protected push.
+        let head = GitOid("f00".into());
+        let rs = protected_ruleset(&["ci/build"], false);
+        assert!(matches!(
+            evaluate_protected_ref_push(
+                &RefName::new("refs/heads/main"),
+                false,
+                false,
+                &rs,
+                &head,
+                &[],
+                &["ci/build".into()],
+                &[],
+            ),
+            Err(RejectReason::ProtectedCheckNotGreen { .. })
+        ));
+        assert_eq!(
+            evaluate_protected_ref_push(
+                &RefName::new("refs/heads/main"),
+                false,
+                false,
+                &rs,
+                &head,
+                &[],
+                &["ci/build".into()],
+                &["ci/build".into()],
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn protected_direct_push_empty_required_set_admits_a_plain_fast_forward() {
+        // No required contexts → the checks half admits a plain ff (force/delete bans still apply).
+        let head = GitOid("cafe".into());
+        assert_eq!(
+            evaluate_protected_ref_push(
+                &RefName::new("refs/heads/main"),
+                false,
+                false,
+                &protected_ruleset(&[], false),
+                &head,
+                &[],
+                &[],
+                &[],
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn protected_direct_push_unparseable_required_context_is_fail_closed() {
+        // A malformed recorded green name is never treated as "not required" — fail-closed loud.
+        let head = GitOid("beef".into());
+        let rs = protected_ruleset(&["ci/build"], false);
+        assert!(matches!(
+            evaluate_protected_ref_push(
+                &RefName::new("refs/heads/main"),
+                false,
+                false,
+                &rs,
+                &head,
+                &["ci/".into()], // an empty-named context — malformed
+                &[],
+                &[],
+            ),
+            Err(RejectReason::ProtectedGateInput { .. })
+        ));
     }
 
     /// **The happy path: receive-pack → one-tx ref-CAS + outbox.** A push to a non-protected ref is

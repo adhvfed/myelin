@@ -676,6 +676,57 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// **A CORRUPT protection file is `Err`, NOT `Ok(None)` (the R0.2 fail-closed precondition).** The
+    /// wire push gate (`git_durable.rs` step 3b) relies on this distinction: a MISSING file means "no
+    /// protection configured" (`Ok(None)`, proceed), but an UNREADABLE/garbage `branch-protection.json`
+    /// must surface as `Err` so the push path can fail CLOSED (reject) rather than silently disable the
+    /// branch-protection gate. If this ever regressed to `Ok(None)` on corruption, a corrupt policy would
+    /// re-open force-push/delete/un-CI'd-push on every protected ref.
+    #[test]
+    fn a_corrupt_protection_file_is_an_error_not_a_silent_none() {
+        let root = temp_root("prot-corrupt");
+        let gitstore = DurableGitStore::rooted(&root);
+        gitstore.create_repo(&loc()).unwrap();
+        let store = DurablePrStore::rooted(&root);
+        // Write a valid config so the file exists at the canonical path, then overwrite it with garbage
+        // (the path helper is private, so locate the file by name under the store root).
+        store
+            .put_protection(&loc(), &BranchProtectionConfig::default())
+            .unwrap();
+        let mut path = None;
+        for entry in walkdir(&root) {
+            if entry.file_name().and_then(|s| s.to_str()) == Some("branch-protection.json") {
+                path = Some(entry);
+                break;
+            }
+        }
+        let path = path.expect("branch-protection.json was written by put_protection");
+        std::fs::write(&path, b"{ this is not valid json").unwrap();
+
+        let result = store.get_protection(&loc());
+        assert!(
+            result.is_err(),
+            "a corrupt branch-protection.json must be Err (fail-closed), got {result:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Minimal recursive file walk (test-only) — returns every file path under `dir`.
+    fn walkdir(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    out.extend(walkdir(&p));
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
     /// (a) **The bypass is CLOSED.** A protected ref defaults CLOSED: a PR carrying NO policy (the author
     /// cannot set any) is blocked — the repo-owned default requires a non-author approval.
     #[test]

@@ -33,6 +33,7 @@ use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::git_durable::DurableGitBackend;
 use crate::git_edge::{param, tenant_of};
+use crate::repo_authz::RepoAccess;
 use crate::request::EdgeResponse;
 use myelin_git::core::{GitCore, GitCoreError, RepoLoc, Service};
 use std::sync::Arc;
@@ -122,11 +123,23 @@ struct WireInfoRefs {
 impl Handler for WireInfoRefs {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let service = ctx.request.query_param("service").unwrap_or_default();
+        let loc = repo_loc(ctx)?;
         // The push (receive-pack) ref advertisement (CT-006d): built IN-PROCESS from the durable repo's
         // refs with a restricted capability set (no side-band / report-status-v2 / atomic). A pure read
         // of our own tenant-scoped repo — no sandbox needed.
         if service == "git-receive-pack" {
-            let loc = repo_loc(ctx)?;
+            // R0.3 / DELTA N2: the receive-pack advert is a WRITE-intent surface — gate on the WRITE
+            // per-repo grant. A denial is a fail-closed 403 (an in-tenant principal without a write
+            // grant learns nothing beyond "forbidden"; cross-tenant was already IDOR-rejected upstream).
+            if !self
+                .be
+                .repo_authorizer()
+                .authorize_repo(ctx.principal, &loc, RepoAccess::Write)
+            {
+                return Err(EdgeError::Forbidden(
+                    "no write grant for this repository".into(),
+                ));
+            }
             let refs = self
                 .be
                 .receive_pack_refs(loc.tenant.as_str(), loc.region.as_str(), loc.repo.as_str())
@@ -143,7 +156,16 @@ impl Handler for WireInfoRefs {
                 "only the smart git protocol is supported (expected ?service=git-upload-pack)".into(),
             ));
         }
-        let loc = repo_loc(ctx)?;
+        // R0.3 / DELTA N2: the upload-pack advert is a READ — gate on the READ per-repo grant. A denial
+        // is a 0-leak 404 (repo existence is NOT leaked to an un-granted in-tenant principal — the same
+        // posture `map_wire_err` returns for an absent repo).
+        if !self
+            .be
+            .repo_authorizer()
+            .authorize_repo(ctx.principal, &loc, RepoAccess::Read)
+        {
+            return Err(EdgeError::NotFound("repository not found".into()));
+        }
         let adv = self
             .be
             .wire_serving()
@@ -172,6 +194,15 @@ struct WireUploadPack {
 impl Handler for WireUploadPack {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let loc = repo_loc(ctx)?;
+        // R0.3 / DELTA N2: the packfile serve is a READ — gate on the READ per-repo grant BEFORE any
+        // bytes are served. A denial is a 0-leak 404 (no ref/pack byte reaches an un-granted principal).
+        if !self
+            .be
+            .repo_authorizer()
+            .authorize_repo(ctx.principal, &loc, RepoAccess::Read)
+        {
+            return Err(EdgeError::NotFound("repository not found".into()));
+        }
         let body = ctx.request.body.clone();
         let served = self
             .be
@@ -200,6 +231,18 @@ struct WireReceivePack {
 impl Handler for WireReceivePack {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let loc = repo_loc(ctx)?;
+        // R0.3 / DELTA N2: the push is a WRITE — gate on the WRITE per-repo grant BEFORE the pack is
+        // parsed/ingested. A denial is a fail-closed 403 (an in-tenant principal without a write grant
+        // cannot push; cross-tenant was already IDOR-rejected upstream). No object is ingested on deny.
+        if !self
+            .be
+            .repo_authorizer()
+            .authorize_repo(ctx.principal, &loc, RepoAccess::Write)
+        {
+            return Err(EdgeError::Forbidden(
+                "no write grant for this repository".into(),
+            ));
+        }
         let body = self
             .be
             .receive_pack(
@@ -241,4 +284,136 @@ pub fn register_git_wire(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -> G
         Arc::new(WireReceivePack { be: be.clone() }),
     );
     b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalogue::Page;
+    use crate::repo_authz::{DenyAllRepos, GrantBackedRepos};
+    use crate::request::EdgeRequest;
+    use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+    use myelin_storage::TenantScope;
+    use myelin_tenancy::TenantId;
+    use std::collections::BTreeMap;
+
+    fn principal() -> Principal {
+        Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Service,
+            TenantId("acme".into()),
+        )
+    }
+
+    fn backend(authz: Arc<dyn crate::repo_authz::RepoAuthorizer>) -> Arc<DurableGitBackend> {
+        let root = std::env::temp_dir().join(format!(
+            "myelin-r03-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        Arc::new(DurableGitBackend::rooted(root).with_repo_authorizer(authz))
+    }
+
+    /// Build a `HandlerCtx` for `repo` with the given query string (`service=…`). The scope is the
+    /// verified token's (tenant `acme`); `{repo}` is the only path param `repo_loc` consumes.
+    fn run(
+        handler: &dyn Handler,
+        be_principal: &Principal,
+        scope: &TenantScope,
+        repo: &str,
+        query: &str,
+    ) -> Result<EdgeResponse, EdgeError> {
+        let mut params = BTreeMap::new();
+        params.insert("repo".to_string(), repo.to_string());
+        let req = EdgeRequest::new("GET", "/acme/acme-home/widgets/info/refs", query, vec![], vec![]);
+        let page = Page::from_request(&req);
+        let ctx = HandlerCtx {
+            principal: be_principal,
+            scope,
+            params: &params,
+            page: &page,
+            request: &req,
+        };
+        handler.handle(&ctx)
+    }
+
+    /// The status of a denied handler call (panics if the handler unexpectedly succeeded — `EdgeResponse`
+    /// is not `Debug`, so we match rather than `unwrap_err`).
+    fn deny_status(r: Result<EdgeResponse, EdgeError>) -> u16 {
+        match r {
+            Ok(_) => panic!("expected a denial, got a served response"),
+            Err(e) => e.status(),
+        }
+    }
+
+    /// **R0.3 / DELTA N2 — an un-granted READ is a 0-leak 404.** An in-tenant principal WITHOUT a grant
+    /// on the repo is refused at the upload-pack advert with a 404 (repo existence is NOT leaked), BEFORE
+    /// any bytes/refs are served.
+    #[test]
+    fn upload_pack_advert_denied_is_zero_leak_404() {
+        let p = principal();
+        let scope = TenantScope::from_verified_token(&p, p.region.clone());
+        let be = backend(Arc::new(DenyAllRepos));
+        let h = WireInfoRefs { be };
+        let st = deny_status(run(&h, &p, &scope, "widgets.git", "service=git-upload-pack"));
+        assert_eq!(st, 404, "an un-granted READ leaks nothing (0-leak 404)");
+    }
+
+    /// **R0.3 — an un-granted receive-pack advert (WRITE intent) is a 403.**
+    #[test]
+    fn receive_pack_advert_denied_is_403() {
+        let p = principal();
+        let scope = TenantScope::from_verified_token(&p, p.region.clone());
+        let be = backend(Arc::new(DenyAllRepos));
+        let h = WireInfoRefs { be };
+        let st = deny_status(run(&h, &p, &scope, "widgets.git", "service=git-receive-pack"));
+        assert_eq!(st, 403, "an un-granted WRITE is a fail-closed 403");
+    }
+
+    /// **R0.3 — an un-granted PUSH (receive-pack POST) is a 403 with NO object ingested.** The seam is
+    /// consulted before the pack is parsed/ingested.
+    #[test]
+    fn receive_pack_push_denied_is_403() {
+        let p = principal();
+        let scope = TenantScope::from_verified_token(&p, p.region.clone());
+        let be = backend(Arc::new(DenyAllRepos));
+        let h = WireReceivePack { be };
+        let st = deny_status(run(&h, &p, &scope, "widgets.git", ""));
+        assert_eq!(st, 403);
+    }
+
+    /// **R0.3 — an un-granted packfile serve (upload-pack POST) is a 0-leak 404.**
+    #[test]
+    fn upload_pack_serve_denied_is_zero_leak_404() {
+        let p = principal();
+        let scope = TenantScope::from_verified_token(&p, p.region.clone());
+        let be = backend(Arc::new(DenyAllRepos));
+        let h = WireUploadPack { be };
+        let st = deny_status(run(&h, &p, &scope, "widgets.git", ""));
+        assert_eq!(st, 404);
+    }
+
+    /// **R0.3 — a WRITE grant admits the receive-pack advert past the seam** (it then proceeds to the
+    /// durable lookup, which is a 0-leak 404 for the absent test repo — proving the seam ADMITTED and did
+    /// not itself deny; a denied grant would 403 here). This is the positive half: the grant is
+    /// load-bearing, not vacuous.
+    #[test]
+    fn write_grant_admits_receive_pack_advert_past_the_seam() {
+        let p = principal();
+        let scope = TenantScope::from_verified_token(&p, p.region.clone());
+        let be = backend(Arc::new(
+            GrantBackedRepos::new().grant_write("p", "acme", "widgets"),
+        ));
+        let h = WireInfoRefs { be };
+        let st = deny_status(run(&h, &p, &scope, "widgets.git", "service=git-receive-pack"));
+        // Past the seam (else it would be 403): the absent test repo is a 0-leak 404, NOT a 403 deny.
+        assert_eq!(
+            st,
+            404,
+            "a WRITE grant admits the seam; the absent repo is then a 404 (not a 403 deny)"
+        );
+    }
 }
