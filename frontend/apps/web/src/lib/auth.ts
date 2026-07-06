@@ -13,6 +13,7 @@ import {
   DEV_REFRESH_TOKEN,
   DEV_SCHEME,
 } from "../../dev-edge/dev-contract.mjs";
+import { devLoginAllowed } from "./dev-login-guard";
 
 /** The PII-free viewer facts the chrome renders (identity menu + residency cue). Null = no session. */
 export interface Viewer {
@@ -50,13 +51,39 @@ export const requireViewer = query(async (): Promise<Viewer> => {
 }, "require-viewer");
 
 /**
+ * R0.6 fail-closed guard on the dev-login seam (review fe-web #1 — "dev-login mints a full session
+ * with no environment guard", a full app-shell auth bypass if this bundle is ever deployed). The
+ * seam may mint a session ONLY when BOTH conditions hold — two INDEPENDENT gates so no single
+ * misconfiguration re-opens it:
+ *   1. the build is NOT production (`NODE_ENV !== "production"`), AND
+ *   2. dev-login is EXPLICITLY opted in (`MYELIN_DEV_LOGIN === "1"`).
+ * A production build refuses outright; a non-production build that forgot the flag also refuses.
+ * Refusal is LOUD (server-side warn) and fail-closed (redirect to /login, no session minted). When
+ * the real OIDC login lands (R2.5) this whole seam is deleted; until then this guard is what keeps a
+ * forgotten dev seam from authenticating anyone at exposure time.
+ */
+function assertDevLoginAllowed(): void {
+  if (!devLoginAllowed(process.env)) {
+    // Loud, server-side audit line — a refusal here means the seam was reachable in a posture it
+    // must never mint sessions in (production build, or non-prod without the explicit opt-in).
+    console.warn(
+      `[R0.6] dev-login REFUSED: NODE_ENV=${process.env.NODE_ENV ?? "<unset>"} ` +
+        `MYELIN_DEV_LOGIN=${process.env.MYELIN_DEV_LOGIN ?? "<unset>"} — no session minted.`,
+    );
+    throw redirect("/login");
+  }
+}
+
+/**
  * THE DEV-LOGIN SEAM (clearly marked — NOT production auth). Mints a session carrying the well-known
  * dev token the dev edge accepts, then redirects into the app. The real OIDC/human login (MR-012
  * deferred — the edge's `POST /v1/auth/login` REFUSES, refuse-not-mock) replaces THIS function; the
  * session store, the httpOnly cookie, and the gateway client it feeds are all real and unchanged.
+ * Guarded by {@link assertDevLoginAllowed} (R0.6) so it cannot mint a session once deployed.
  */
 export const loginDev = action(async () => {
   "use server";
+  assertDevLoginAllowed();
   issueSession({
     token: DEV_ACCESS_TOKEN,
     refreshToken: DEV_REFRESH_TOKEN,
