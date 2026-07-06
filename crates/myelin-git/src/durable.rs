@@ -93,6 +93,41 @@ fn git_err(ctx: &str, e: git2::Error) -> DurableError {
     DurableError::Git(format!("{ctx}: {e}"))
 }
 
+// ───────────────────────────── durable per-ref generation counter (R0.4 / git #1 HIGH) ───────────
+
+/// The git-config key holding the durable, monotonic generation of one ref (R0.4 / git #1 HIGH).
+///
+/// **Why this exists (the bug it replaces).** The crash reconciler + write path used to treat the
+/// on-disk **reflog LENGTH** ([`DurableGitRepo::reflog_len`]) as the durable per-ref `update_seq`
+/// generation. Reflog length is an OPERATION COUNT, not a monotonic generation: when a ref is
+/// **deleted**, libgit2 removes that ref's reflog, so on a delete+recreate the count RESETS to 1 —
+/// while the committed `update_seq` (the recovery fence) is monotonic and keeps climbing. After a
+/// delete+recreate followed by a crash in the apply-after-outbox-commit window, the reconciler then
+/// mis-compares (the restarted reflog is smaller than the committed seq of an already-applied move)
+/// and can replay a stale move (CAS-mismatch) or leave a ref wrongly deleted. See git #1 HIGH.
+///
+/// **Why the config counter is correct.** This counter is keyed by the ref NAME and stored in the
+/// repo's git-**config** (`[myelin "refgen"] <encoded-ref> = N`), which is a wholly separate on-disk
+/// file from the ref's reflog. So it:
+///  - **survives the ref's own deletion** — deleting a ref removes its reflog but never touches the
+///    `myelin.refgen.*` config, so the generation does NOT reset on delete+recreate;
+///  - **survives restart** — config is on disk; a fresh [`Self::open_git`] reopen reads it back;
+///  - **is monotonic (max-wins, never decreases)** — every advancing CAS writes `current + 1`.
+///
+/// The ref name is **hex-encoded** (with a leading letter) so the config variable is always a valid
+/// git identifier (`[a-zA-Z][a-zA-Z0-9-]*`) regardless of the ref's slashes/dots, and the encoding is
+/// 1:1 — two distinct refs never collide onto one counter.
+fn refgen_key(ref_name: &str) -> String {
+    use std::fmt::Write as _;
+    // Leading 'r' guarantees an alphabetic first char (a bare hex digit is a rejected config key).
+    let mut var = String::with_capacity(ref_name.len() * 2 + 1);
+    var.push('r');
+    for b in ref_name.as_bytes() {
+        let _ = write!(var, "{b:02x}");
+    }
+    format!("myelin.refgen.{var}")
+}
+
 // ───────────────────────────── one on-disk reflog entry ──────────────────────────────────────────
 
 /// One durable reflog entry read back from the on-disk git reflog. The reflog is durable (it is the
@@ -412,12 +447,49 @@ impl DurableGitRepo {
             // A no-op (delete a non-existent ref): nothing to do, already absent.
             (None, None) => {}
         }
+
+        // R0.4 / git #1 HIGH: bump the durable per-ref generation on every successful, non-noop CAS —
+        // create, update, AND delete alike (a delete is a generation-advancing event too). The bump is
+        // `previous + 1`, keyed by ref NAME in git-config, so it is monotonic ACROSS the ref's own
+        // deletion (the reflog dies with the ref; this counter does not) and across restart. This
+        // replaces reflog-LENGTH-as-generation, which reset on delete+recreate and broke the reconciler
+        // fence. See [`refgen_key`]. The `(None, None)` no-op above is deliberately excluded.
+        if !matches!((expected, new), (None, None)) {
+            self.bump_generation(&repo, name)?;
+        }
         Ok(())
     }
 
-    /// The number of entries in a ref's on-disk reflog (0 if the ref / reflog does not exist). Used
-    /// to derive the monotonic `update_seq` generation durably (it survives restart — the reflog is
-    /// on disk), matching the in-memory model's per-ref generation.
+    /// Advance the durable per-ref generation to `current + 1` (R0.4). Reads the current value from the
+    /// repo's git-config (0 if never written), writes `+1` back at the repo-local config level (the same
+    /// config handle pattern `update_ref_cas` uses for `user.name`/`user.email`). Monotonic — a bump
+    /// never decreases the stored value.
+    fn bump_generation(&self, repo: &git2::Repository, name: &str) -> Result<(), DurableError> {
+        let key = refgen_key(name);
+        let mut cfg = repo.config().map_err(|e| git_err("config (refgen)", e))?;
+        let current = cfg.get_i64(&key).unwrap_or(0).max(0);
+        cfg.set_i64(&key, current + 1)
+            .map_err(|e| git_err(&format!("set refgen for {name}"), e))?;
+        Ok(())
+    }
+
+    /// **The durable, monotonic per-ref generation** (R0.4 / git #1 HIGH — the recovery fence the
+    /// reconciler compares `update_seq` against). Reads the `myelin.refgen.<encoded-ref>` config counter
+    /// (0 if the ref was never written). Unlike [`Self::reflog_len`], this does NOT reset when a ref is
+    /// deleted and recreated (it is keyed by name in config, not tied to the ref's reflog), and it
+    /// survives a process restart (config is on disk). This is the source of truth both the write path
+    /// ([`crate::receive_pack`]) and the reconciler ([`crate::reconcile`]) use for `update_seq`.
+    pub fn ref_generation(&self, name: &str) -> u64 {
+        let Ok(repo) = self.open_git() else { return 0 };
+        let Ok(cfg) = repo.config() else { return 0 };
+        cfg.get_i64(&refgen_key(name)).unwrap_or(0).max(0) as u64
+    }
+
+    /// The number of entries in a ref's on-disk reflog (0 if the ref / reflog does not exist). This is
+    /// the reflog ENTRY COUNT — used only for the reflog listing view / entry-count assertions. It is
+    /// **NOT** the durable generation (R0.4 / git #1 HIGH): the reflog is destroyed when a ref is
+    /// deleted, so this count RESETS on a delete+recreate while the true generation must keep climbing.
+    /// Use [`Self::ref_generation`] for the monotonic per-ref generation / recovery fence.
     pub fn reflog_len(&self, name: &str) -> usize {
         let Ok(repo) = self.open_git() else { return 0 };
         match repo.reflog(name) {
@@ -1155,10 +1227,14 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A delete CAS removes the ref durably; a create-then-delete-then-recreate restarts the
-    /// generation (matching git's reflog-deleted-with-ref behaviour).
+    /// **R0.4 / git #1 HIGH — a delete+recreate does NOT reset the durable generation.** A delete CAS
+    /// removes the ref durably; the ref's on-disk REFLOG restarts (that is libgit2 behaviour — the
+    /// reflog dies with the ref), but the durable per-ref GENERATION counter is keyed by name in config
+    /// and is monotonic ACROSS the delete: create→delete→recreate advances it 1→2→3, never resetting.
+    /// This is exactly the invariant reflog-length-as-generation violated (git #1 HIGH): reflog_len
+    /// resets to 1 on recreate while `ref_generation` correctly reaches 3.
     #[test]
-    fn delete_cas_removes_ref_and_recreate_restarts_generation() {
+    fn delete_cas_removes_ref_but_does_not_reset_durable_generation() {
         let root = temp_root("delete");
         let store = DurableGitStore::rooted(&root);
         let repo = store.create_repo(&loc()).expect("create");
@@ -1166,17 +1242,40 @@ mod tests {
         repo.update_ref_cas("refs/heads/tmp", None, Some(&c1), "create", "psn@acme.noreply")
             .unwrap();
         assert_eq!(repo.read_ref("refs/heads/tmp").unwrap(), Some(c1.clone()));
+        assert_eq!(repo.ref_generation("refs/heads/tmp"), 1, "create is generation 1");
 
         repo.update_ref_cas("refs/heads/tmp", Some(&c1), None, "delete", "psn@acme.noreply")
             .expect("delete");
         assert_eq!(repo.read_ref("refs/heads/tmp").unwrap(), None, "ref deleted");
+        assert_eq!(
+            repo.ref_generation("refs/heads/tmp"),
+            2,
+            "the delete ADVANCES the durable generation (a delete is a generation-advancing event)"
+        );
 
         repo.update_ref_cas("refs/heads/tmp", None, Some(&c1), "recreate", "psn@acme.noreply")
             .expect("recreate");
+        // libgit2 restarts the ref's reflog on recreate — that is the OLD (wrong) generation source.
         assert_eq!(
             repo.reflog_len("refs/heads/tmp"),
             1,
-            "the recreated ref starts a fresh reflog generation"
+            "the recreated ref's reflog restarts (libgit2 behaviour — why reflog_len was wrong)"
+        );
+        // The DURABLE generation does NOT reset — it keeps climbing across the delete (the fix).
+        assert_eq!(
+            repo.ref_generation("refs/heads/tmp"),
+            3,
+            "the durable per-ref generation is monotonic across delete+recreate (R0.4 fix)"
+        );
+
+        // And it survives a restart: a FRESH store + handle over the same root reads the same value.
+        drop(repo);
+        let store2 = DurableGitStore::rooted(&root);
+        let repo2 = store2.open_repo(&loc()).expect("reopen");
+        assert_eq!(
+            repo2.ref_generation("refs/heads/tmp"),
+            3,
+            "the durable generation survives a process restart (config is on disk)"
         );
         std::fs::remove_dir_all(&root).ok();
     }

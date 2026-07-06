@@ -12,14 +12,16 @@
 //! This is **NOT silent data loss** — the committed `git.ref.updated` row is the durable witness, so the
 //! correct on-disk state is fully recoverable. This module is that recovery: on restart (before the
 //! durable store serves the live front door), replay the committed `git.ref.updated` rows and re-apply
-//! any whose on-disk `update_seq` is behind the durable reflog. The replay is **at-least-once + idempotent
+//! any whose on-disk `update_seq` is behind the durable per-ref generation. The replay is **at-least-once + idempotent
 //! on `update_seq`** (arch §4.2 — the recovery fence): re-running it over an already-current repo is a
 //! no-op, and a partially-applied burst is driven forward to exactly the committed sequence.
 //!
 //! ## Anti-duplication
 //! The reconciler REUSES the durable store's own per-ref CAS ([`DurableGitRepo::update_ref_cas`]) and the
-//! on-disk reflog length ([`DurableGitRepo::reflog_len`]) as the durable `update_seq` — it does NOT
-//! reimplement ref storage or a parallel seq counter. The committed events come from the already-frozen
+//! durable per-ref generation ([`DurableGitRepo::ref_generation`]) as the on-disk `update_seq` — it does
+//! NOT reimplement ref storage or a parallel seq counter. (R0.4 / git #1 HIGH: this was the reflog LENGTH,
+//! which RESET on a ref's delete+recreate and broke the fence — the generation is now a monotonic
+//! config-backed counter keyed by ref name.) The committed events come from the already-frozen
 //! [`myelin_events::OutboxStore`] (in production the durable `outbox` table); [`refs_from_outbox`]
 //! extracts the `git.ref.updated` rows for one repo from that store.
 
@@ -29,8 +31,8 @@ use crate::events::GIT_REF_UPDATED;
 use myelin_events::OutboxStore;
 
 /// One committed `git.ref.updated` record — the durable witness of a ref move (the payload
-/// [`crate::receive_pack::RefStore::receive`] emits). The reconciler replays these; the on-disk reflog
-/// length is the durable `update_seq` it compares against.
+/// [`crate::receive_pack::RefStore::receive`] emits). The reconciler replays these; the durable per-ref
+/// generation ([`DurableGitRepo::ref_generation`]) is the on-disk `update_seq` it compares against.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitRefUpdatedRecord {
     /// The repo the move targeted (the `<repo>` half of the `<repo>:<ref>` aggregate).
@@ -116,9 +118,9 @@ impl ReconcileReport {
 }
 
 /// **The recovery reconciler (GT-003).** Replay the committed `git.ref.updated` records against the
-/// durable on-disk repo, re-applying any whose `update_seq` is AHEAD of the on-disk reflog length (the
-/// durable per-ref generation). Idempotent on `update_seq`: a record whose `update_seq <= reflog_len(ref)`
-/// is already applied and skipped; a record whose `update_seq > reflog_len(ref)` is the un-applied tail
+/// durable on-disk repo, re-applying any whose `update_seq` is AHEAD of the durable per-ref generation
+/// ([`DurableGitRepo::ref_generation`]). Idempotent on `update_seq`: a record whose `update_seq <= ref_generation(ref)`
+/// is already applied and skipped; a record whose `update_seq > ref_generation(ref)` is the un-applied tail
 /// of the crash window and is re-applied via the durable per-ref CAS, advancing the on-disk ref to the
 /// committed tip.
 ///
@@ -141,8 +143,11 @@ pub fn reconcile_refs(
     ordered.sort_by_key(|r| r.update_seq);
 
     for rec in ordered {
-        // The durable per-ref generation = the on-disk reflog length (survives restart).
-        let on_disk_seq = repo.reflog_len(&rec.ref_name) as u64;
+        // The durable per-ref generation (R0.4 / git #1 HIGH — the config-backed counter, NOT the
+        // reflog length). It survives restart AND is monotonic across a ref's delete+recreate, so the
+        // idempotent `<=` comparison below is exact even after a branch was deleted and recreated
+        // (reflog length would have RESET on the recreate and mis-compared here).
+        let on_disk_seq = repo.ref_generation(&rec.ref_name);
         if rec.update_seq <= on_disk_seq {
             // Already applied — the idempotent skip (the no-crash case + the re-run case).
             report.already_current += 1;
@@ -300,6 +305,137 @@ mod tests {
         assert_eq!(report.already_current, 1, "seq 1 already current");
         assert_eq!(repo.read_ref("refs/heads/main").unwrap(), Some(c2));
         assert_eq!(repo.reflog_len("refs/heads/main"), 2);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **R0.4 / git #1 HIGH — THE CORE REGRESSION: reconcile is a clean no-op after a delete+recreate.**
+    ///
+    /// The whole committed history of a ref that was created, updated, DELETED, then RECREATED is on
+    /// disk and fully applied (the ref points at the recreated tip). The recreated ref's REFLOG has
+    /// restarted at length 1 (libgit2 destroys a ref's reflog on delete), but the durable generation is
+    /// monotonic at 4. Reconciling all four committed records must be a clean no-op: the ref stays at the
+    /// recreated tip, nothing is re-applied, and NO CAS-mismatch is raised.
+    ///
+    /// This is the test that FAILS on `reflog_len`-as-generation: with the restarted reflog reading 1,
+    /// the reconciler would see seq 2 (2 > 1) as un-applied and try to replay a STALE move
+    /// (old_oid = c1 vs the on-disk recreated tip) → a spurious `CasMismatch`. With the durable counter
+    /// (4) every record is `<= 4` → skipped, and the ref is left correct (never reverted / deleted).
+    #[test]
+    fn reconcile_is_a_noop_after_delete_recreate_with_monotonic_generation() {
+        let root = temp_root("delrecreate");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let c1 = seed_commit(&repo, b"v1\n");
+        let blob2 = repo.write_blob(b"v2\n").unwrap();
+        let tree2 = repo.write_tree(&[("file.txt", &blob2)]).unwrap();
+        let c2 = repo
+            .write_commit(&tree2, &[&c1], "v2", "psn@acme.noreply", "psn@acme.noreply")
+            .unwrap();
+        let c3 = seed_commit(&repo, b"reborn\n");
+
+        // The full applied history on disk: create → update → delete → recreate.
+        repo.update_ref_cas("refs/heads/main", None, Some(&c1), "create", "psn@acme.noreply").unwrap();
+        repo.update_ref_cas("refs/heads/main", Some(&c1), Some(&c2), "ff", "psn@acme.noreply").unwrap();
+        repo.update_ref_cas("refs/heads/main", Some(&c2), None, "delete", "psn@acme.noreply").unwrap();
+        repo.update_ref_cas("refs/heads/main", None, Some(&c3), "recreate", "psn@acme.noreply").unwrap();
+
+        // The reflog RESTARTED (the old, wrong generation source) but the durable generation is 4.
+        assert_eq!(repo.reflog_len("refs/heads/main"), 1, "recreated ref's reflog restarted");
+        assert_eq!(
+            repo.ref_generation("refs/heads/main"),
+            4,
+            "durable generation monotonic across the delete — did NOT reset"
+        );
+
+        let zero = "0".repeat(40);
+        let recs = vec![
+            GitRefUpdatedRecord {
+                repo: "core".into(), ref_name: "refs/heads/main".into(),
+                old_oid: zero.clone(), new_oid: c1.0.clone(), update_seq: 1,
+                pusher_pseudonym: "psn@acme.noreply".into(),
+            },
+            GitRefUpdatedRecord {
+                repo: "core".into(), ref_name: "refs/heads/main".into(),
+                old_oid: c1.0.clone(), new_oid: c2.0.clone(), update_seq: 2,
+                pusher_pseudonym: "psn@acme.noreply".into(),
+            },
+            GitRefUpdatedRecord {
+                repo: "core".into(), ref_name: "refs/heads/main".into(),
+                old_oid: c2.0.clone(), new_oid: zero.clone(), update_seq: 3,
+                pusher_pseudonym: "psn@acme.noreply".into(),
+            },
+            GitRefUpdatedRecord {
+                repo: "core".into(), ref_name: "refs/heads/main".into(),
+                old_oid: zero.clone(), new_oid: c3.0.clone(), update_seq: 4,
+                pusher_pseudonym: "psn@acme.noreply".into(),
+            },
+        ];
+
+        // Clean no-op: every record is already current at generation 4; NO stale replay, NO mismatch.
+        let report = reconcile_refs(&repo, &recs).expect("reconcile must not raise CasMismatch");
+        assert!(!report.recovered_any(), "nothing to recover — the ref is already at the committed tip");
+        assert_eq!(report.already_current, 4, "all four records idempotently skipped");
+        assert_eq!(
+            repo.read_ref("refs/heads/main").unwrap(),
+            Some(c3),
+            "the ref is at the recreated tip — NOT left deleted, NOT reverted to a stale move"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **R0.4 — a partial burst that SPANS a delete+recreate is driven forward.** Only the create (seq 1)
+    /// was applied on disk before the crash; the committed records carry the delete (seq 2) and the
+    /// recreate (seq 3) that were never applied. The reconciler replays the un-applied tail in order —
+    /// delete then recreate — converging the ref to the recreated tip, with the durable generation
+    /// advancing monotonically 1→2→3 across the delete.
+    #[test]
+    fn reconcile_drives_a_burst_across_delete_recreate_forward() {
+        let root = temp_root("burstdel");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let c1 = seed_commit(&repo, b"v1\n");
+        let c3 = seed_commit(&repo, b"reborn\n");
+
+        // Only seq 1 (create) applied on disk; the crash left seq 2 (delete) + seq 3 (recreate) pending.
+        repo.update_ref_cas("refs/heads/main", None, Some(&c1), "create", "psn@acme.noreply").unwrap();
+        assert_eq!(repo.ref_generation("refs/heads/main"), 1);
+
+        let zero = "0".repeat(40);
+        let recs = vec![
+            GitRefUpdatedRecord {
+                repo: "core".into(), ref_name: "refs/heads/main".into(),
+                old_oid: zero.clone(), new_oid: c1.0.clone(), update_seq: 1,
+                pusher_pseudonym: "psn@acme.noreply".into(),
+            },
+            GitRefUpdatedRecord {
+                repo: "core".into(), ref_name: "refs/heads/main".into(),
+                old_oid: c1.0.clone(), new_oid: zero.clone(), update_seq: 2,
+                pusher_pseudonym: "psn@acme.noreply".into(),
+            },
+            GitRefUpdatedRecord {
+                repo: "core".into(), ref_name: "refs/heads/main".into(),
+                old_oid: zero.clone(), new_oid: c3.0.clone(), update_seq: 3,
+                pusher_pseudonym: "psn@acme.noreply".into(),
+            },
+        ];
+
+        let report = reconcile_refs(&repo, &recs).expect("reconcile");
+        assert_eq!(
+            report.reapplied,
+            vec![("refs/heads/main".to_string(), 2), ("refs/heads/main".to_string(), 3)],
+            "the delete AND the recreate were replayed forward in order"
+        );
+        assert_eq!(report.already_current, 1, "seq 1 (create) already applied");
+        assert_eq!(
+            repo.read_ref("refs/heads/main").unwrap(),
+            Some(c3),
+            "the ref converged to the recreated tip across the delete"
+        );
+        assert_eq!(
+            repo.ref_generation("refs/heads/main"),
+            3,
+            "the durable generation advanced monotonically across the replayed delete"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }
