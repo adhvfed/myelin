@@ -22,7 +22,7 @@ fix and passes after — the proof column in the plan doc is the acceptance cont
 | R0.3 | Per-repo object authz on wire routes (read+write) — seeds the R2 platform seam | DELTA N2 HIGH | PENDING | — | — |
 | R0.4 | Git crash reconciler: durable monotonic generation replaces reflog-length `update_seq` | git #1 HIGH | PENDING | — | — |
 | R0.5 | Wire HTTP body bounded at front door (stream+cap, 413) | DELTA N3 | PENDING | — | — |
-| R0.6 | Dev-login env guard (explicit flag AND non-prod build; loud audit) | fe-web auth bypass | PENDING | — | — |
+| R0.6 | Dev-login env guard (explicit flag AND non-prod build; loud audit) | fe-web auth bypass | DONE | `2209203` | `devLoginAllowed` requires `NODE_ENV!=production` AND `MYELIN_DEV_LOGIN=1`; refuses loud + fail-closed; unit-tested both directions; vitest+tsc+eslint green |
 | R0.7 | Hygiene batch: shallow-push connectivity (N4), `digest_pinned` length, config Debug redaction, CLI token chmod | DELTA N4 + lows | PENDING | — | — |
 
 R0 exit: all seven rows DONE with adversarial proofs; verifier sign-off recorded per security row.
