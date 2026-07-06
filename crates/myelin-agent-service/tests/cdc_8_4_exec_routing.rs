@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 fn pinned() -> ImageRef {
-    ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef").unwrap()
+    ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef000000000000000000000000000000000000000000000000").unwrap()
 }
 
 fn limits() -> ResourceLimits {

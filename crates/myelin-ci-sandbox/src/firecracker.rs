@@ -1119,7 +1119,7 @@ mod tests {
     fn spec(allow: Vec<String>) -> JobSpec {
         JobSpec::new(
             JobKind::Ci,
-            ImageRef::pinned("r/img@sha256:abc123def4567890").unwrap(),
+            ImageRef::pinned("r/img@sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890").unwrap(),
             vec!["true".into()],
             vec![],
             vec![],

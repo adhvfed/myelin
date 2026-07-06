@@ -33,8 +33,8 @@ use myelin_flow::{DurableExecutor, FlowExecutor, StartSpec};
 use myelin_storage::{BlobStore, ContentHash, FsBlobStore};
 use myelin_tenancy::{Region, TenantId};
 
-const PINNED_BUILD: &str = "registry.example/build@sha256:abc123def456";
-const PINNED_TEST: &str = "registry.example/test@sha256:ffeeddccbbaa";
+const PINNED_BUILD: &str = "registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000";
+const PINNED_TEST: &str = "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000";
 
 fn tenant() -> TenantId {
     TenantId("acme".into())

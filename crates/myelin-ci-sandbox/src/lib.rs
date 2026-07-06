@@ -228,8 +228,10 @@ impl ImageRef {
 
     /// True iff the reference is pinned by a content digest (`...@<algo>:<hexdigest>`), the only
     /// admitted form. A bare `:tag` (or no tag) is NOT pinned. The check is deliberately strict:
-    /// a digest is `@<algo>:<hex>` where the hex part is non-empty and all-hex (so `@sha256:`
-    /// with an empty digest, or a non-hex digest, is rejected).
+    /// a digest is `@<algo>:<hex>` where the hex part is non-empty, all-hex, AND its length matches
+    /// the named algorithm (R0.7-B): `sha256` → 64 hex, `sha384` → 96, `sha512` → 128. An unknown
+    /// algorithm is rejected fail-closed — an unrecognized digest algorithm is not a trustworthy pin
+    /// (a short/truncated digest like `@sha256:ab` is no longer accepted as "pinned").
     pub fn digest_pinned(&self) -> bool {
         let Some((_, after_at)) = self.reference.rsplit_once('@') else {
             return false;
@@ -237,7 +239,25 @@ impl ImageRef {
         let Some((algo, digest)) = after_at.split_once(':') else {
             return false;
         };
-        !algo.is_empty() && !digest.is_empty() && digest.chars().all(|c| c.is_ascii_hexdigit())
+        // The digest must be non-empty, all-hex, AND the exact hex length for the named algorithm.
+        // An unknown algorithm has no known length → reject fail-closed.
+        let Some(expected_hex_len) = Self::digest_hex_len(algo) else {
+            return false;
+        };
+        !digest.is_empty()
+            && digest.len() == expected_hex_len
+            && digest.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    /// The exact hex-string length for a known digest algorithm (R0.7-B). `None` for an unknown
+    /// algorithm — which [`ImageRef::digest_pinned`] treats as not-pinned (fail-closed).
+    fn digest_hex_len(algo: &str) -> Option<usize> {
+        match algo {
+            "sha256" => Some(64),
+            "sha384" => Some(96),
+            "sha512" => Some(128),
+            _ => None,
+        }
     }
 }
 
@@ -796,7 +816,7 @@ mod tests {
     use super::*;
 
     fn digest() -> ImageRef {
-        ImageRef::pinned("registry.example/img@sha256:abc123def4567890").unwrap()
+        ImageRef::pinned("registry.example/img@sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890").unwrap()
     }
 
     fn limits() -> ResourceLimits {
@@ -841,8 +861,10 @@ mod tests {
 
     #[test]
     fn digest_pinned_accepts_a_sha_digest_and_rejects_a_bare_tag() {
+        // A correct 64-hex sha256 digest IS pinned.
+        let sha256_64 = "a".repeat(64);
         assert!(ImageRef {
-            reference: "img@sha256:deadbeef".into()
+            reference: format!("img@sha256:{sha256_64}")
         }
         .digest_pinned());
         assert!(!ImageRef {
@@ -860,7 +882,28 @@ mod tests {
         .digest_pinned());
         // a non-hex digest is NOT pinned.
         assert!(!ImageRef {
-            reference: "img@sha256:nothex!!".into()
+            reference: format!("img@sha256:{}", "z".repeat(64))
+        }
+        .digest_pinned());
+        // R0.7-B: a too-SHORT sha256 digest (all-hex but only 8 chars) is NOT pinned — the length
+        // must match the algorithm; a truncated digest is not a trustworthy pin.
+        assert!(!ImageRef {
+            reference: "img@sha256:deadbeef".into()
+        }
+        .digest_pinned());
+        // R0.7-B: a too-LONG sha256 digest (65 hex) is NOT pinned.
+        assert!(!ImageRef {
+            reference: format!("img@sha256:{}", "a".repeat(65))
+        }
+        .digest_pinned());
+        // R0.7-B: an UNKNOWN algorithm is NOT pinned (fail-closed), even with an all-hex 64-char body.
+        assert!(!ImageRef {
+            reference: format!("img@md5:{}", "a".repeat(64))
+        }
+        .digest_pinned());
+        // A correct 128-hex sha512 digest IS pinned.
+        assert!(ImageRef {
+            reference: format!("img@sha512:{}", "b".repeat(128))
         }
         .digest_pinned());
     }
@@ -869,7 +912,9 @@ mod tests {
     fn image_ref_pinned_rejects_undigested_fail_closed() {
         let err = ImageRef::pinned("registry/img:latest").unwrap_err();
         assert!(matches!(err, SpecError::UndigestedImage { .. }));
-        assert!(ImageRef::pinned("registry/img@sha256:abc123").is_ok());
+        // R0.7-B: a full 64-hex sha256 digest is accepted; a short one is rejected.
+        assert!(ImageRef::pinned(format!("registry/img@sha256:{}", "c".repeat(64))).is_ok());
+        assert!(ImageRef::pinned("registry/img@sha256:abc123").is_err());
     }
 
     #[test]

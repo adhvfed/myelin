@@ -34,7 +34,7 @@ use myelin_ci_controlplane::supply_chain::{
 use myelin_ci_sandbox::events::CI_SUPPLY_CHAIN_VERIFICATION_FAILED;
 use myelin_events::{validate_event_type, DataRole, Visibility};
 
-const PINNED: &str = "registry.example/build@sha256:abc123def456";
+const PINNED: &str = "registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000";
 
 fn identity() -> BuildIdentity {
     BuildIdentity::new("run-0001", "ci-runner@acme")

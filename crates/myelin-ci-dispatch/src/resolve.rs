@@ -691,8 +691,8 @@ mod tests {
     use crate::dispatch::{stamp_trust, RunProvenance};
     use myelin_storage::FsBlobStore;
 
-    const PINNED: &str = "registry.example/build@sha256:abc123def456";
-    const PINNED2: &str = "registry.example/test@sha256:ffeeddccbbaa";
+    const PINNED: &str = "registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000";
+    const PINNED2: &str = "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000";
 
     fn tenant() -> TenantId {
         TenantId("acme".into())

@@ -23,7 +23,7 @@ use myelin_tenancy::{Region, TenantId};
 fn ci_spec(idem: &str) -> JobSpec {
     JobSpec::new(
         JobKind::Ci,
-        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef").unwrap(),
+        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef000000000000000000000000000000000000000000000000").unwrap(),
         vec!["cargo".into(), "test".into()],
         vec![],
         vec![],

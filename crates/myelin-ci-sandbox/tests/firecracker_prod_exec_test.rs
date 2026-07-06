@@ -87,7 +87,7 @@ fn skip_or_panic(test: &str) -> bool {
 fn spec_running(command: Vec<String>, timeout_secs: u32) -> JobSpec {
     JobSpec::new(
         JobKind::Ci,
-        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef0123456789abcdef").unwrap(),
+        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap(),
         command,
         vec![],
         vec![],

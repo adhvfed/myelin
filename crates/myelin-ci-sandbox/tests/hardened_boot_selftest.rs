@@ -36,7 +36,7 @@ use std::path::PathBuf;
 fn trivial_hardened_spec() -> JobSpec {
     JobSpec::new(
         JobKind::Ci,
-        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef0123456789abcdef")
+        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
             .unwrap(),
         // The one-shot boot uses init=/bin/true (set by the backend); the command is the
         // logical in-guest workload the spec describes.

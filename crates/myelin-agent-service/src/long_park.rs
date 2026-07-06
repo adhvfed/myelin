@@ -490,7 +490,7 @@ mod tests {
     }
 
     fn pinned() -> ImageRef {
-        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef").unwrap()
+        ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef000000000000000000000000000000000000000000000000").unwrap()
     }
     fn limits() -> ResourceLimits {
         ResourceLimits {

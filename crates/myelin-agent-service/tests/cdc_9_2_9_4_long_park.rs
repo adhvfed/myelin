@@ -167,7 +167,7 @@ fn green_gate() -> AgentExecGate {
 
 fn profile() -> LongComputeProfile {
     LongComputeProfile {
-        image: ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef").unwrap(),
+        image: ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef000000000000000000000000000000000000000000000000").unwrap(),
         command: vec!["cargo".into(), "test".into(), "--release".into()],
         secret_refs: vec![],
         egress: EgressPolicy::deny_all(),

@@ -125,10 +125,40 @@ pub fn store_token(token: &str, getenv: &dyn Fn(&str) -> Option<String>) -> Resu
     std::fs::create_dir_all(&dir)
         .map_err(|e| CliError::Config(format!("cannot create config dir {}: {e}", dir.display())))?;
     let path = dir.join("token");
-    std::fs::write(&path, token.as_bytes())
-        .map_err(|e| CliError::Config(format!("cannot write token file {}: {e}", path.display())))?;
+    // R0.7-A (TOCTOU fix): create the file with mode 0600 ATOMICALLY *before* any bytes land, so the
+    // capability token never exists on disk world-readable. The prior `fs::write` created the file
+    // with the default umask (typically 0644) and only chmod'd 0600 afterwards — a window in which the
+    // secret was world-readable. The atomic create closes that window; `set_owner_only` below is
+    // belt-and-braces (it also tightens a pre-existing file whose perms were wrong).
+    write_owner_only(&path, token.as_bytes())?;
     set_owner_only(&path)?;
     Ok(path)
+}
+
+/// Write `bytes` to `path`, creating the file with mode `0600` ATOMICALLY (the file never exists with
+/// broader perms). R0.7-A: closes the TOCTOU window a plain `fs::write` + post-chmod leaves open.
+#[cfg(unix)]
+fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<(), CliError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| CliError::Config(format!("cannot create token file {}: {e}", path.display())))?;
+    f.write_all(bytes)
+        .map_err(|e| CliError::Config(format!("cannot write token file {}: {e}", path.display())))
+}
+
+/// On a non-unix host there is no mode bit to set atomically; write normally (the file lands under the
+/// user's profile dir and the cross-platform ACL hardening is a deployment concern — mirrors
+/// [`set_owner_only`]).
+#[cfg(not(unix))]
+fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<(), CliError> {
+    std::fs::write(path, bytes)
+        .map_err(|e| CliError::Config(format!("cannot write token file {}: {e}", path.display())))
 }
 
 /// Set `0600` on the token file (owner read/write only) so a stored credential is not world-readable.
@@ -222,11 +252,36 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            // R0.7-A: the file is 0600 immediately after `store_token`. Because the file is created
+            // ATOMICALLY with mode 0600 (via `write_owner_only`'s `OpenOptions::mode(0o600)`) BEFORE
+            // any bytes land, it was never created world-readable — the assertion on the final mode is
+            // the observable proof; the atomic create closes the TOCTOU window a post-chmod would leave.
             assert_eq!(mode, 0o600, "the token file is owner-only");
         }
         let read = |p: &std::path::Path| std::fs::read_to_string(p).ok();
         assert_eq!(resolve_token(None, &getenv, &read).unwrap(), "ROUNDTRIP_TOKEN");
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = path; // silence unused on non-unix
+    }
+
+    /// R0.7-A belt-and-braces: even if a token file already exists world-readable (0644), a subsequent
+    /// `store_token` truncate-opens it and re-tightens to 0600 — the stored credential ends owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn store_token_tightens_a_preexisting_world_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("myelin-cli-test-preexist-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("token");
+        // Pre-seed a world-readable file (simulating a token stored by an older, unpatched CLI).
+        std::fs::write(&path, b"OLD").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let dir = tmp.to_string_lossy().to_string();
+        let getenv = env_from(&[("MYELIN_CONFIG_DIR", &dir)]);
+        let path = store_token("NEW_TOKEN", &getenv).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a pre-existing 0644 token file is re-tightened to 0600");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "NEW_TOKEN");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

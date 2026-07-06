@@ -49,7 +49,7 @@ fn limits() -> ResourceLimits {
 }
 
 fn pinned() -> ImageRef {
-    ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef").unwrap()
+    ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap()
 }
 
 /// **PROVIDER side of 8.4 (CI runner seam).** A backend that records the ORDER it drives the four
