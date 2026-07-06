@@ -50,6 +50,9 @@ export default defineConfig({
       env: {
         PORT: String(PORT),
         MYELIN_EDGE_URL: `http://127.0.0.1:${EDGE_PORT}`,
+        // R0.6: the e2e harness drives the real dev-login seam, so it must explicitly opt in
+        // (the seam refuses without this flag). vinxi dev keeps NODE_ENV !== "production".
+        MYELIN_DEV_LOGIN: "1",
       },
     },
   ],
