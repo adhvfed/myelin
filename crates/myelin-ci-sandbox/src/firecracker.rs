@@ -35,7 +35,9 @@
 //! is satisfied EARLY here so the AG-D4 drill (CI-P5 → P-239) can parametrize per available backend.
 //! The fleet impl is CI-P14; pre-warmed snapshot pools are CI-P4.
 
-use crate::hardening::HardeningProfile;
+use crate::hardening::{
+    enforce_egress, EgressEnforceError, EgressEnforcer, EnforcedEgress, HardeningProfile,
+};
 use crate::{
     drain_capped, JobSpec, ResourceUsage, RunnerHooks, SandboxBackend, SandboxHandle,
     SandboxLaunch, SandboxResult, SANDBOX_CAPTURE_BOUND,
@@ -149,8 +151,11 @@ pub struct FcMachineConfig {
     root_is_read_only: bool,
     vcpu_count: u32,
     mem_size_mib: u32,
-    /// Whether a NIC is attached — `false` (no network device) iff egress is fully default-deny.
-    has_network_device: bool,
+    /// The recorded proof that the per-tap egress firewall was emitted+applied (R0.1). The NIC is
+    /// emitted into the JSON **iff this is `Some`** — the machine config cannot conjure a NIC from a
+    /// bare bool; it must carry the applied-ruleset attestation. `None` (no NIC) is the fully
+    /// default-deny common case.
+    enforced_egress: Option<EnforcedEgress>,
     pids_max: u32,
 }
 
@@ -176,9 +181,14 @@ impl FcMachineConfig {
             root_is_read_only: profile.read_only_root,
             vcpu_count: vcpu,
             mem_size_mib: mem_mib,
-            // NO network device unless the egress allowlist is non-empty (the strongest
-            // default-deny: egress closed at the device level).
-            has_network_device: profile.network_device,
+            // R0.1: the NIC is gated on the profile's RECORDED enforced-egress ruleset, NOT on the
+            // `network_device` requirement bool. A profile that requests a NIC but carries no
+            // `enforced_egress` record (enforcement not applied) yields NO NIC here — the machine
+            // config and the applied firewall are one indivisible thing. The launch path sets
+            // `enforced_egress` only after `enforce_egress` succeeds; `assert_enforced` (run before
+            // this) additionally refuses a `network_device` profile with no record, so a NIC-bearing
+            // config cannot be built without an applied ruleset.
+            enforced_egress: profile.enforced_egress.clone(),
             pids_max: profile.pids_max,
         }
     }
@@ -187,8 +197,9 @@ impl FcMachineConfig {
     /// the drive `is_read_only` flag and the presence/absence of `network-interfaces` reflect the
     /// real enforced posture, so a test asserting over this JSON asserts over the enforced state.
     pub fn to_json(&self) -> String {
-        let net = if self.has_network_device {
-            // A filtered NIC (the host wires the egress allowlist via the tap device's firewall).
+        let net = if self.enforced_egress.is_some() {
+            // A filtered NIC — emitted ONLY because an enforced-egress ruleset is recorded (R0.1); the
+            // host wired the egress allowlist onto this tap device via the applied nftables firewall.
             ",\n  \"network-interfaces\": [\n    {\n      \"iface_id\": \"eth0\",\n      \
              \"host_dev_name\": \"tap-myelin\"\n    }\n  ]"
         } else {
@@ -227,7 +238,8 @@ impl FcMachineConfig {
             &self.rootfs_path,
             self.root_is_read_only,
             script_drive_path,
-            self.has_network_device,
+            // R0.1: NIC iff an enforced-egress ruleset is recorded (not a bare bool).
+            self.enforced_egress.is_some(),
             self.vcpu_count,
             self.mem_size_mib,
         )
@@ -238,9 +250,16 @@ impl FcMachineConfig {
         self.root_is_read_only
     }
 
-    /// True iff a network device is attached. `false` == egress closed at the device level.
+    /// True iff a network device is attached — which is true iff an enforced-egress ruleset is
+    /// recorded (R0.1). `false` == egress closed at the device level. There is no path to a NIC that
+    /// does not carry the applied-firewall attestation.
     pub fn has_network_device(&self) -> bool {
-        self.has_network_device
+        self.enforced_egress.is_some()
+    }
+
+    /// The recorded enforced-egress attestation (the applied ruleset), if a NIC is attached (R0.1).
+    pub fn enforced_egress(&self) -> Option<&EnforcedEgress> {
+        self.enforced_egress.as_ref()
     }
 
     /// The `pids.max` ceiling carried into the cgroup the VMM runs under.
@@ -256,6 +275,9 @@ pub enum FcError {
     Hook(crate::HookError),
     /// The mandatory hardening profile could not be asserted in force (fail-closed before boot).
     Hardening(String),
+    /// R0.1: the per-tap egress firewall could not be emitted+applied (a hostname allowlist entry is
+    /// unenforceable, or `nft -f` failed) — the job is REFUSED fail-closed; no NIC is attached.
+    Egress(EgressEnforceError),
     /// Spawning / waiting on the VMM failed.
     Vmm(String),
 }
@@ -265,6 +287,7 @@ impl std::fmt::Display for FcError {
         match self {
             FcError::Hook(e) => write!(f, "firecracker backend: guarantee hook failed: {e}"),
             FcError::Hardening(s) => write!(f, "firecracker backend: hardening not enforced: {s}"),
+            FcError::Egress(e) => write!(f, "firecracker backend: egress not enforced: {e}"),
             FcError::Vmm(s) => write!(f, "firecracker backend: VMM error: {s}"),
         }
     }
@@ -278,12 +301,76 @@ impl From<crate::HookError> for FcError {
     }
 }
 
-/// The Firecracker default backend (microVM = KVM + minimal VMM). Tracks live guest VMM processes so
-/// [`kill`](FirecrackerBackend::kill) can whole-guest-kill on teardown.
+impl From<EgressEnforceError> for FcError {
+    fn from(e: EgressEnforceError) -> Self {
+        FcError::Egress(e)
+    }
+}
+
+/// The R0.1 real egress enforcer: install the emitted ruleset on the host via `nft -f -` (reading the
+/// ruleset from stdin). This is a legitimate host-config action — it CREATES the egress boundary for
+/// the guest's tap device, exactly as spawning the VMM creates the isolation boundary — and it lives
+/// in THIS file, which is the `no-host-exec` named-exclusion site (registered in
+/// `myelin-lints/src/bin/lint-gate.rs` + `tests/workspace_clean.rs`; see the module note above). The
+/// `Command::new("nft")` fingerprint would trip the `no-host-exec` lint on any other production file,
+/// so the apply site is deliberately colocated here rather than in a fresh (linted) module — and it is
+/// injectable ([`EgressEnforcer`]) so production wires this real impl at boot while tests drive the
+/// fail-closed control flow with a double. FAIL-CLOSED: a non-zero `nft` exit (or a missing/incapable
+/// `nft`) returns [`EgressEnforceError::ApplyFailed`] and the caller attaches NO NIC.
 #[derive(Default)]
+pub struct NftEgressEnforcer;
+
+impl EgressEnforcer for NftEgressEnforcer {
+    fn apply(&self, ruleset: &str) -> Result<EnforcedEgress, EgressEnforceError> {
+        use std::io::Write;
+        let mut child = Command::new("nft")
+            .arg("-f")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| EgressEnforceError::ApplyFailed(format!("spawn nft: {e}")))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| EgressEnforceError::ApplyFailed("nft stdin unavailable".into()))?
+            .write_all(ruleset.as_bytes())
+            .map_err(|e| EgressEnforceError::ApplyFailed(format!("write ruleset to nft: {e}")))?;
+        let out = child
+            .wait_with_output()
+            .map_err(|e| EgressEnforceError::ApplyFailed(format!("wait nft: {e}")))?;
+        if !out.status.success() {
+            return Err(EgressEnforceError::ApplyFailed(format!(
+                "nft -f exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        // The ruleset is now IN FORCE on the tap device — record the exact text as the attestation.
+        Ok(EnforcedEgress::new(ruleset.to_string()))
+    }
+}
+
+/// The Firecracker default backend (microVM = KVM + minimal VMM). Tracks live guest VMM processes so
+/// [`kill`](FirecrackerBackend::kill) can whole-guest-kill on teardown. Carries the injectable R0.1
+/// [`EgressEnforcer`] (production: [`NftEgressEnforcer`]) used to apply the per-tap egress firewall
+/// before any egress-capable NIC is attached.
 pub struct FirecrackerBackend {
     /// guest_id → the live VMM child (so teardown whole-guest-kills it). Ephemeral; one job per VMM.
     live: Mutex<std::collections::HashMap<String, GuestProc>>,
+    /// The egress-firewall apply seam (R0.1). Injectable so unit tests drive the fail-closed flow
+    /// without root / `nft`; production wires [`NftEgressEnforcer`].
+    egress_enforcer: Box<dyn EgressEnforcer + Send + Sync>,
+}
+
+impl Default for FirecrackerBackend {
+    fn default() -> FirecrackerBackend {
+        FirecrackerBackend {
+            live: Mutex::default(),
+            egress_enforcer: Box::new(NftEgressEnforcer),
+        }
+    }
 }
 
 /// A live guest VMM process (the child + its config-file temp path for cleanup).
@@ -318,14 +405,30 @@ pub trait VmmChild {
 }
 
 impl FirecrackerBackend {
-    /// A new backend with no live guests.
+    /// A new backend with no live guests (production [`NftEgressEnforcer`] wired).
     pub fn new() -> FirecrackerBackend {
         FirecrackerBackend::default()
+    }
+
+    /// A backend with an injected [`EgressEnforcer`] (R0.1) — used by unit tests to drive the
+    /// fail-closed egress control flow without root / `nft`.
+    pub fn with_enforcer(enforcer: Box<dyn EgressEnforcer + Send + Sync>) -> FirecrackerBackend {
+        FirecrackerBackend {
+            live: Mutex::default(),
+            egress_enforcer: enforcer,
+        }
     }
 
     /// Build the machine config a launch WOULD use for `spec` (the hardened profile derived + the
     /// JSON assembled), without booting. Used by the boot self-test to assert posture and by unit
     /// tests to assert the config reflects the real enforced state.
+    ///
+    /// R0.1: this helper does NOT apply the egress firewall (it has no enforcer seam), so it is
+    /// meaningful only for the no-egress common case. An egress-REQUESTING spec (non-empty allowlist)
+    /// is refused fail-closed here — `assert_enforced` rejects the derived profile because it claims a
+    /// network device without a recorded enforced-egress ruleset. A NIC-bearing config is producible
+    /// only through the real launch path ([`launch`](FirecrackerBackend::launch)), which applies+records
+    /// the firewall first.
     pub fn machine_config(spec: &JobSpec, oneshot: bool) -> Result<FcMachineConfig, FcError> {
         let profile = HardeningProfile::derive(spec);
         profile.assert_enforced().map_err(FcError::Hardening)?;
@@ -353,8 +456,17 @@ impl FirecrackerBackend {
     {
         // #4 isolation floor FIRST — the hardening profile must hold before any code runs.
         (hooks.isolation_floor)(spec)?;
-        // The mandatory backend-independent hardening profile (arch 02 §5.3), asserted in force.
-        let profile = HardeningProfile::derive(spec);
+        // The mandatory backend-independent hardening profile (arch 02 §5.3).
+        let mut profile = HardeningProfile::derive(spec);
+        // R0.1 (DELTA now-live HIGH): if the job requests egress (non-empty allowlist), EMIT+APPLY+
+        // RECORD the per-tap egress firewall BEFORE we assert or attach anything — fail-closed. A
+        // hostname allowlist entry (unenforceable) or an `nft -f` failure returns Err here and the
+        // run closure is NEVER invoked, so no NIC-bearing config is ever produced. Only on success
+        // does the profile carry the `enforced_egress` record that authorises the NIC. The empty-
+        // allowlist common case is a no-op (`Ok(None)`) — no NIC, unchanged.
+        profile.enforced_egress = enforce_egress(&profile, self.egress_enforcer.as_ref())?;
+        // The mandatory profile is now asserted in force — including R0.1's honesty check that a
+        // network-device profile carries the enforced-egress record just recorded above.
         profile.assert_enforced().map_err(FcError::Hardening)?;
         // #2 attribution — the per-run attenuated token (4.7).
         (hooks.attribute)(&spec.run_token)?;
@@ -969,13 +1081,40 @@ pub fn resolved_rootfs_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hardening::HardeningProfile;
+    use crate::hardening::{emit_egress_ruleset, HardeningProfile};
     use crate::{
         EgressPolicy, IdemToken, ImageRef, JobKind, MeterTarget, ReserveHandle, ResourceLimits,
         RunTokenRef, TrustTier, WorkspaceSpec,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    /// Derive a profile for `allow` and RECORD the applied egress ruleset (R0.1) so a NIC-bearing
+    /// config can be built in-test without a real `nft` — mirrors what the launch path does after
+    /// `enforce_egress` succeeds. Requires the allowlist to be enforceable (IP literals).
+    fn enforced_profile(allow: Vec<String>) -> HardeningProfile {
+        let mut p = HardeningProfile::derive(&spec(allow));
+        if p.network_device {
+            p.enforced_egress = Some(EnforcedEgress::new(emit_egress_ruleset(&p).unwrap()));
+        }
+        p
+    }
+
+    /// A recording test enforcer that captures the applied ruleset; `fail` forces a fail-closed apply.
+    struct RecordingEnforcer {
+        fail: bool,
+        seen: Arc<StdMutex<Option<String>>>,
+    }
+    impl EgressEnforcer for RecordingEnforcer {
+        fn apply(&self, ruleset: &str) -> Result<EnforcedEgress, EgressEnforceError> {
+            *self.seen.lock().unwrap() = Some(ruleset.to_string());
+            if self.fail {
+                Err(EgressEnforceError::ApplyFailed("injected nft failure".into()))
+            } else {
+                Ok(EnforcedEgress::new(ruleset.to_string()))
+            }
+        }
+    }
 
     fn spec(allow: Vec<String>) -> JobSpec {
         JobSpec::new(
@@ -1054,12 +1193,18 @@ mod tests {
     }
 
     #[test]
-    fn nonempty_allowlist_attaches_a_filtered_nic() {
-        let s = spec(vec!["registry.example.com".into()]);
-        let profile = HardeningProfile::derive(&s);
+    fn nonempty_allowlist_attaches_a_filtered_nic_only_with_a_recorded_ruleset() {
+        let s = spec(vec!["93.184.216.34".into()]);
+        // R0.1: a bare derived profile (no recorded ruleset) yields NO NIC — the config cannot conjure
+        // a NIC from the `network_device` bool alone.
+        let bare = HardeningProfile::derive(&s);
+        assert!(!FcMachineConfig::from_spec(&s, &bare, false).has_network_device());
+        // With the applied-ruleset record present, the NIC is attached.
+        let profile = enforced_profile(vec!["93.184.216.34".into()]);
         let cfg = FcMachineConfig::from_spec(&s, &profile, false);
         assert!(cfg.has_network_device());
         assert!(cfg.to_json().contains("network-interfaces"));
+        assert!(cfg.enforced_egress().unwrap().ruleset().contains("policy drop;"));
     }
 
     #[test]
@@ -1150,6 +1295,84 @@ mod tests {
         );
     }
 
+    // ---- R0.1: fail-closed egress NIC — the NIC is indivisible from an applied+recorded ruleset ----
+
+    #[test]
+    fn launch_applies_the_ruleset_and_records_it_on_the_profile_for_an_ip_allowlist() {
+        // Driven through the production launch control flow with a recording test enforcer: an egress
+        // request to a PUBLIC IP produces a ruleset that default-drops and does NOT permit any
+        // always-blocked class, and the profile handed to the run closure carries the record → a
+        // NIC-bearing config is now producible.
+        let seen = Arc::new(StdMutex::new(None));
+        let backend = FirecrackerBackend::with_enforcer(Box::new(RecordingEnforcer {
+            fail: false,
+            seen: seen.clone(),
+        }));
+        let got_profile: Arc<StdMutex<Option<HardeningProfile>>> = Arc::new(StdMutex::new(None));
+        let gp2 = got_profile.clone();
+        let killed = Arc::new(AtomicBool::new(false));
+        let launch = backend
+            .launch_with(&spec(vec!["93.184.216.34".into()]), &ok_hooks(), move |_s, profile| {
+                *gp2.lock().unwrap() = Some(profile.clone());
+                Ok(fake_run(killed.clone()))
+            })
+            .expect("an IP-literal egress allowlist is enforceable");
+        assert_eq!(launch.result.exit_code, Some(0));
+        // The enforcer was handed a default-dropping ruleset that never permits a blocked class.
+        let ruleset = seen.lock().unwrap().clone().expect("a ruleset was applied");
+        assert!(ruleset.contains("policy drop;"));
+        assert!(ruleset.contains("ip daddr 93.184.216.34 accept"));
+        for blocked in ["169.254.169.254", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "0.0.0.0/8"] {
+            assert!(!ruleset.contains(&format!("ip daddr {blocked} accept")));
+        }
+        // The run closure saw a profile carrying the enforced record → a NIC-bearing config is built.
+        let profile = got_profile.lock().unwrap().clone().unwrap();
+        assert!(profile.enforced_egress.is_some());
+        let s = spec(vec!["93.184.216.34".into()]);
+        assert!(FcMachineConfig::from_spec(&s, &profile, false).has_network_device());
+    }
+
+    #[test]
+    fn launch_fails_closed_when_the_egress_enforcer_apply_fails() {
+        // Injected apply failure: launch returns an error and the run closure is NEVER invoked, so no
+        // NIC-bearing config is ever produced.
+        let backend = FirecrackerBackend::with_enforcer(Box::new(RecordingEnforcer {
+            fail: true,
+            seen: Arc::new(StdMutex::new(None)),
+        }));
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = ran.clone();
+        let r = backend.launch_with(&spec(vec!["93.184.216.34".into()]), &ok_hooks(), move |_s, _p| {
+            ran2.store(true, Ordering::SeqCst);
+            Ok(fake_run(Arc::new(AtomicBool::new(false))))
+        });
+        assert!(matches!(r, Err(FcError::Egress(EgressEnforceError::ApplyFailed(_)))));
+        assert!(!ran.load(Ordering::SeqCst), "no guest runs when the egress firewall cannot be applied");
+    }
+
+    #[test]
+    fn launch_refuses_a_hostname_allowlist_with_the_typed_error() {
+        // A hostname allowlist entry is unenforceable (DNS rebinding) → refused fail-closed; the
+        // enforcer is never even reached and the run closure never runs.
+        let seen = Arc::new(StdMutex::new(None));
+        let backend = FirecrackerBackend::with_enforcer(Box::new(RecordingEnforcer {
+            fail: false,
+            seen: seen.clone(),
+        }));
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = ran.clone();
+        let r = backend.launch_with(&spec(vec!["registry.example.com".into()]), &ok_hooks(), move |_s, _p| {
+            ran2.store(true, Ordering::SeqCst);
+            Ok(fake_run(Arc::new(AtomicBool::new(false))))
+        });
+        assert!(matches!(
+            r,
+            Err(FcError::Egress(EgressEnforceError::UnenforceableHostname(_)))
+        ));
+        assert!(!ran.load(Ordering::SeqCst), "no guest runs for an unenforceable hostname allowlist");
+        assert!(seen.lock().unwrap().is_none(), "a hostname never reaches the apply step");
+    }
+
     // ---- CT-002a: the command-runner config + the forge-resistant capture (pure-fn, VM-free) ----
 
     #[test]
@@ -1169,11 +1392,16 @@ mod tests {
     }
 
     #[test]
-    fn command_runner_json_attaches_a_nic_only_when_egress_allowlisted() {
-        let s = spec(vec!["registry.example.com".into()]);
-        let profile = HardeningProfile::derive(&s);
+    fn command_runner_json_attaches_a_nic_only_when_egress_enforced() {
+        let s = spec(vec!["93.184.216.34".into()]);
+        let profile = enforced_profile(vec!["93.184.216.34".into()]);
         let cfg = FcMachineConfig::from_spec(&s, &profile, false);
         assert!(cfg
+            .command_runner_json(Path::new("/tmp/r.sh"))
+            .contains("network-interfaces"));
+        // Without the recorded ruleset (bare derive), the runner config carries NO NIC.
+        let bare = HardeningProfile::derive(&s);
+        assert!(!FcMachineConfig::from_spec(&s, &bare, false)
             .command_runner_json(Path::new("/tmp/r.sh"))
             .contains("network-interfaces"));
     }
