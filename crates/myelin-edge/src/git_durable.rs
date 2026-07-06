@@ -27,6 +27,7 @@ use crate::catalogue::{page_envelope, Handler, HandlerCtx};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::git_edge::{map_method, num_param, param, reroot, tenant_of};
+use crate::repo_authz::{AllowAllRepos, RepoAuthorizer};
 use crate::request::EdgeResponse;
 use myelin_events::{
     Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Region, TenantId, Timestamp,
@@ -37,13 +38,14 @@ use myelin_git::durable::{DurableError, DurableGitRepo, DurableGitStore};
 use myelin_git::lifecycle::{
     BranchProtectionRuleset, PrState, PullRequest, ReviewState, ReviewVerdict,
 };
+use myelin_git::check_status::GitOid;
 use myelin_git::pr_store::{
-    evaluate_merge, merge_pr, BranchProtectionConfig, DurablePrStore, MergeAttempt, PrRecord,
-    ReviewRecord,
+    effective_ruleset, evaluate_merge, merge_pr, BranchProtectionConfig, DurablePrStore,
+    MergeAttempt, PrRecord, ReviewRecord,
 };
 use myelin_git::receive_pack::{
-    CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome, PushSession,
-    Pusher, QuarantineMigration, QuarantineObject, RefName, RefStore,
+    evaluate_protected_ref_push, CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate,
+    PushOutcome, PushSession, Pusher, QuarantineMigration, QuarantineObject, RefName, RefStore,
 };
 use myelin_git::durable::{CommitDetail, CommitMeta};
 use myelin_git::web::{CommitDiff, CommitRow, DiffFile, DiffLineView, RepoHome, WebEditForm, WebEditOutcome};
@@ -66,11 +68,20 @@ pub struct DurableGitBackend {
     /// The on-disk root holding `<tenant>/<region>/<repo>.git` bare repos — retained so the wire-serving
     /// tier (CT-006b) composes its sandboxed `GitCore` over the SAME root the durable store reads/writes.
     root: PathBuf,
+    /// **R0.3 / DELTA N2 — the per-repo object-authorization seam for the git wire.** The wire handlers
+    /// consult this AFTER `repo_loc` resolves the repo and BEFORE serving any bytes, so an in-tenant
+    /// principal with no grant on a repo cannot clone/fetch/push it (the un-granted-repo-reach hole,
+    /// closed). Defaults to the [`AllowAllRepos`] fixture (the happy-path wire proofs dispatch);
+    /// production boot injects a grant-backed authorizer via [`DurableGitBackend::with_repo_authorizer`]
+    /// — the R2 platform-wide object-authz seam backs this with the real tuple store / Identity `check`.
+    repo_authz: Arc<dyn RepoAuthorizer>,
 }
 
 impl DurableGitBackend {
     /// Root the durable backend at an on-disk directory holding `<tenant>/<region>/<repo>.git` repos —
-    /// the same root the durable git store + read backend resolve against.
+    /// the same root the durable git store + read backend resolve against. The wire object-authz seam
+    /// (R0.3) defaults to [`AllowAllRepos`]; production injects a grant-backed authorizer via
+    /// [`DurableGitBackend::with_repo_authorizer`].
     pub fn rooted(root: impl Into<PathBuf>) -> DurableGitBackend {
         let root = root.into();
         DurableGitBackend {
@@ -80,7 +91,22 @@ impl DurableGitBackend {
             minter: Arc::new(MonotonicMinter::new()),
             clone_host: "ssh://git@myelin".into(),
             root,
+            repo_authz: Arc::new(AllowAllRepos),
         }
+    }
+
+    /// **Inject the R0.3 per-repo object authorizer** (the wire object-authz seam) — the analogue of
+    /// injecting the Identity-M1 [`Authorizer`](myelin_substrate::Authorizer) into the gateway. Boot
+    /// wires the real grant-backed authorizer here; tests default to the [`AllowAllRepos`] fixture.
+    /// **TODO(R2):** back this with the platform-wide object-authz tuple store / Identity `check()`.
+    pub fn with_repo_authorizer(mut self, repo_authz: Arc<dyn RepoAuthorizer>) -> DurableGitBackend {
+        self.repo_authz = repo_authz;
+        self
+    }
+
+    /// The injected R0.3 per-repo object authorizer (the wire handlers consult this before serving).
+    pub fn repo_authorizer(&self) -> &Arc<dyn RepoAuthorizer> {
+        &self.repo_authz
     }
 
     /// **The wire-serving `GitCore` over the SAME on-disk root (CT-006b / GT-006).** Composes the
@@ -624,6 +650,31 @@ impl DurableGitBackend {
 
     // ── git smart-HTTP PUSH (receive-pack) over the wire — CT-006d ──
 
+    /// **R0.2 / DELTA N1 — Git's OWN recorded check facts for a pushed head commit.** Scans the repo's
+    /// durable PR records for any whose `head_oid` equals the pushed oid and gathers the recorded green
+    /// / fork-unendorsed / endorsed context names (the facts authorized producers stamped — the CI
+    /// check-report op, the maintainer endorsement op). Returns `(green, fork_unendorsed, endorsed)` for
+    /// the merge gate. ACYCLIC: it reads facts Git already holds; the wire push NEVER synchronously
+    /// calls CI (EI-02 §3). The store-backed per-commit `check_status` projection is the GIT-P20
+    /// follow-on; until then a commit's recorded facts live on its PR record(s).
+    fn check_facts_for_head(
+        &self,
+        loc: &RepoLoc,
+        head_oid: &str,
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let mut green = Vec::new();
+        let mut fork_unendorsed = Vec::new();
+        let mut endorsed = Vec::new();
+        if let Ok(prs) = self.prs.list(loc) {
+            for rec in prs.into_iter().filter(|r| r.head_oid == head_oid) {
+                green.extend(rec.green_contexts);
+                fork_unendorsed.extend(rec.fork_unendorsed_contexts);
+                endorsed.extend(rec.endorsed_contexts);
+            }
+        }
+        (green, fork_unendorsed, endorsed)
+    }
+
     /// The receive-pack ref advertisement source: every `(ref_name, oid)` on the durable repo, sorted.
     /// A pure read of OUR tenant-scoped repo (no sandbox needed); the wire handler frames it + the
     /// service header + the restricted capability list. `NotFound` (404) if the repo is absent.
@@ -752,6 +803,65 @@ impl DurableGitBackend {
                 commit_oids: if new_zero { vec![] } else { vec![PushOid::new(c.new.clone())] },
             });
             per_ref_status.push((c.ref_name.clone(), None));
+        }
+
+        // 3b. **R0.2 / DELTA N1 — the branch-protection gate on a DIRECT push to a PROTECTED ref.** A
+        //     `git push` straight to a protected branch must clear the SAME gate a PR merge into that
+        //     branch would: reject force-push (non-ff) + delete, and REQUIRE the repo's configured
+        //     `required_contexts` to be green-and-current for the pushed head. Protected-ness comes from
+        //     the repo-owned [`BranchProtectionConfig`] (never a hardcoded literal) — a configured
+        //     ruleset (any ref pattern) protects its refs; the built-in `main`/`release/*` literal is at
+        //     most a fallback for an unconfigured protected-looking ref (never MORE permissive than the
+        //     pre-R0.2 force/delete floor). Reject-before-the-ref-moves: any protected violation aborts
+        //     the whole atomic push with a loud per-ref `ng` (0 under-gated protected push). The check
+        //     facts are read from Git's OWN durable records (acyclic — this never calls CI, EI-02 §3).
+        // FAIL-CLOSED on a config-load error (verifier finding): a MISSING protection file is `Ok(None)`
+        // (no protection configured — proceed), but a CORRUPT/unreadable `branch-protection.json` is an
+        // `Err`. Swallowing that Err into `None` (`.ok().flatten()`) would SILENTLY DISABLE protection —
+        // a non-standard protected ref (e.g. `refs/heads/prod`) would skip the gate entirely, and
+        // `main`/`release/*` would lose required-CI enforcement. That is a self-disabling security gate.
+        // If we cannot read the policy we cannot safely accept ANY push, so reject the whole push loudly
+        // (matching the PR-merge path, which fail-closes via `?` on the same load error).
+        let protection = match self.prs.get_protection(&loc) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&qdir); // discard the host quarantine (no ref moves).
+                return Ok(report_status(
+                    "ok",
+                    &all_ng(
+                        &cmds,
+                        &format!("rejected (branch-protection policy unreadable — fail-closed): {e}"),
+                    ),
+                ));
+            }
+        };
+        for u in &updates {
+            let ref_str = u.ref_name.0.as_str();
+            let configured = protection.as_ref().and_then(|c| c.resolve(ref_str)).is_some();
+            let is_protected = configured || u.ref_name.is_protected();
+            if !is_protected {
+                continue; // a non-protected ref keeps the existing PushPolicy checks (unchanged).
+            }
+            let ruleset = effective_ruleset(protection.as_ref(), ref_str);
+            let is_delete = u.new_oid.is_zero();
+            let (green, fork_unendorsed, endorsed) = self.check_facts_for_head(&loc, u.new_oid.0.as_str());
+            let head = GitOid(u.new_oid.0.clone());
+            if let Err(reason) = evaluate_protected_ref_push(
+                &u.ref_name,
+                is_delete,
+                u.forced,
+                &ruleset,
+                &head,
+                &green,
+                &fork_unendorsed,
+                &endorsed,
+            ) {
+                let _ = std::fs::remove_dir_all(&qdir); // discard the host quarantine (no ref moves).
+                return Ok(report_status(
+                    "ok",
+                    &all_ng(&cmds, &format!("rejected (branch protection): {reason:?}")),
+                ));
+            }
         }
 
         // 4. The ONE-transaction ref-CAS + outbox via the durable RefStore. policy (secret-scan / size /
