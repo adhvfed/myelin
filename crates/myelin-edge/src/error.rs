@@ -31,6 +31,10 @@ pub enum EdgeError {
     Conflict(String),
     /// 422 — a well-formed but semantically invalid request. Detail is client-safe.
     Unprocessable(String),
+    /// 413 — the request body exceeded the front-door size ceiling (R0.5 / DELTA N3). Rejected at the
+    /// edge BEFORE the whole body is buffered, so a single oversize POST cannot exhaust host RAM.
+    /// Detail is client-safe (it names the byte ceiling, not an internal secret).
+    PayloadTooLarge(String),
     /// 503 — a dependency is unavailable, OR an auth mode is configured-deferred and refuses LOUDLY
     /// (refuse-not-mock — e.g. human login until JWKS/trust-anchors land). Detail is client-safe.
     Unavailable(String),
@@ -49,6 +53,7 @@ impl EdgeError {
             EdgeError::NotFound(_) => 404,
             EdgeError::Conflict(_) => 409,
             EdgeError::Unprocessable(_) => 422,
+            EdgeError::PayloadTooLarge(_) => 413,
             EdgeError::Unavailable(_) => 503,
             EdgeError::Internal(_) => 500,
         }
@@ -63,6 +68,7 @@ impl EdgeError {
             EdgeError::NotFound(_) => "not_found",
             EdgeError::Conflict(_) => "conflict",
             EdgeError::Unprocessable(_) => "unprocessable",
+            EdgeError::PayloadTooLarge(_) => "payload_too_large",
             EdgeError::Unavailable(_) => "unavailable",
             EdgeError::Internal(_) => "internal",
         }
@@ -81,6 +87,7 @@ impl EdgeError {
             | EdgeError::NotFound(m)
             | EdgeError::Conflict(m)
             | EdgeError::Unprocessable(m)
+            | EdgeError::PayloadTooLarge(m)
             | EdgeError::Unavailable(m) => m.clone(),
         }
     }
@@ -94,6 +101,7 @@ impl EdgeError {
             | EdgeError::NotFound(m)
             | EdgeError::Conflict(m)
             | EdgeError::Unprocessable(m)
+            | EdgeError::PayloadTooLarge(m)
             | EdgeError::Unavailable(m)
             | EdgeError::Internal(m) => m,
         }
@@ -143,6 +151,8 @@ mod tests {
         assert_eq!(EdgeError::NotFound("x".into()).status(), 404);
         assert_eq!(EdgeError::Conflict("x".into()).status(), 409);
         assert_eq!(EdgeError::Unprocessable("x".into()).status(), 422);
+        assert_eq!(EdgeError::PayloadTooLarge("x".into()).status(), 413);
+        assert_eq!(EdgeError::PayloadTooLarge("x".into()).code(), "payload_too_large");
         assert_eq!(EdgeError::Unavailable("x".into()).status(), 503);
         assert_eq!(EdgeError::Internal("x".into()).status(), 500);
         assert_eq!(EdgeError::Unauthorized("x".into()).code(), "unauthorized");

@@ -9,11 +9,12 @@
 //! authorization, error envelope, versioning, pagination, SSE scoping) lives in [`Gateway`], so the
 //! security properties hold identically whether driven over this socket or in-process.
 
+use crate::error::EdgeError;
 use crate::gateway::Gateway;
 use crate::request::{EdgeRequest, EdgeResponse};
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
-use hyper::body::{Frame, Incoming};
+use hyper::body::{Body, Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
@@ -26,6 +27,61 @@ use tokio_stream::StreamExt;
 /// The response body type the adapter emits — a boxed body of [`Bytes`] frames (finished or
 /// streamed), with an `io::Error` error channel.
 type EdgeBody = BoxBody<Bytes, std::io::Error>;
+
+/// **The front-door request-body size ceiling (R0.5 / DELTA N3).**
+///
+/// `body.collect().await` on a hyper `Incoming` buffers the ENTIRE body into host RAM with no size
+/// limit — the comment that it was "bounded by hyper's defaults" was false, so a single large POST
+/// (e.g. to the `git-receive-pack` wire route, or ANY route) is a trivial memory-exhaustion DoS. The
+/// sandbox's 64 MiB stdin bound in `myelin-ci-sandbox` only applies AFTER this collection, so it
+/// never protects the edge process. We therefore bound the body AS IT STREAMS and reject oversize
+/// with a `413 Payload Too Large` without buffering past the cap.
+///
+/// **Tradeoff / choice of 100 MiB:** git pushes ship packfiles that can be large, so the ceiling must
+/// be generous enough for a legitimate `git-receive-pack` — but finite, so the front door has a hard
+/// DoS ceiling. 100 MiB is that compromise: comfortably above ordinary pushes, far below "exhaust the
+/// host". FOLLOW-UP (not built here): a per-route cap could differentiate the small JSON routes (a few
+/// KiB is plenty) from the large git wire routes, tightening the ceiling on everything that is not a
+/// packfile push. Until then this single front-door ceiling is the floor.
+const MAX_REQUEST_BODY_BYTES: usize = 100 * 1024 * 1024;
+
+/// Why a bounded collect stopped short of returning the full body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundedCollectError {
+    /// The accumulated data frames exceeded [`MAX_REQUEST_BODY_BYTES`]; reading stopped at the cap
+    /// (the oversize buffer is never allocated) — maps to a `413` at the edge.
+    TooLarge,
+    /// The transport yielded a read error mid-body — the caller falls back to an empty body (the
+    /// gateway then produces a clean `400` if a body was required), preserving prior behavior.
+    Read,
+}
+
+/// **Collect a request body frame-by-frame, bounded by `cap` (R0.5 / DELTA N3).**
+///
+/// Iterates the body one [`Frame`] at a time via [`BodyExt::frame`], accumulating ONLY data frames
+/// (trailers do not count toward the body) into a `Vec`. The moment the running total would exceed
+/// `cap`, it STOPS reading and returns [`BoundedCollectError::TooLarge`] — it does NOT keep buffering,
+/// so an oversize body never grows host memory past ~`cap`. A transport read error returns
+/// [`BoundedCollectError::Read`]. Generic over any `Body<Data = Bytes>` so it is unit-testable with an
+/// in-memory body (no socket needed).
+async fn collect_bounded<B>(mut body: B, cap: usize) -> Result<Vec<u8>, BoundedCollectError>
+where
+    B: Body<Data = Bytes> + Unpin,
+{
+    let mut acc: Vec<u8> = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| BoundedCollectError::Read)?;
+        // Only DATA frames count toward the body; a trailers frame is skipped.
+        if let Ok(data) = frame.into_data() {
+            // Reject BEFORE extending past the cap — never allocate the full oversize buffer.
+            if acc.len() + data.len() > cap {
+                return Err(BoundedCollectError::TooLarge);
+            }
+            acc.extend_from_slice(&data);
+        }
+    }
+    Ok(acc)
+}
 
 /// **Serve the edge over a bound TCP listener.** Accepts connections forever, serving each over
 /// HTTP/1.1 with the gateway. Returns only on an accept error.
@@ -58,14 +114,42 @@ async fn handle_connection(gw: Arc<Gateway>, req: Request<Incoming>) -> Response
         .iter()
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
-    // Collect the body (bounded by hyper's defaults). A read error → empty body (the gateway then
-    // produces a clean 400 if a body was required) — never a panic.
-    let bytes = match body.collect().await {
-        Ok(c) => c.to_bytes().to_vec(),
-        Err(_) => Vec::new(),
+    // Front-door body bound (R0.5 / DELTA N3): fast-path reject on a Content-Length header that
+    // already declares more than the cap — refuse before reading a single body byte.
+    if content_length_over_cap(&parts.headers, MAX_REQUEST_BODY_BYTES) {
+        return payload_too_large();
+    }
+    // Collect the body bounded by MAX_REQUEST_BODY_BYTES, streaming frame-by-frame. Oversize → a 413
+    // WITHOUT buffering past the cap; a read error → empty body (the gateway then produces a clean 400
+    // if a body was required) — never a panic.
+    let bytes = match collect_bounded(body, MAX_REQUEST_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(BoundedCollectError::TooLarge) => return payload_too_large(),
+        Err(BoundedCollectError::Read) => Vec::new(),
     };
     let edge_req = EdgeRequest::new(method, path, query, headers, bytes);
     to_hyper(gw.handle(edge_req))
+}
+
+/// True iff a `Content-Length` header is present, parseable, and DECLARES more than `cap` bytes — the
+/// front-door fast-reject signal (R0.5 / DELTA N3). An absent/unparseable header is NOT over-cap here
+/// (the streaming bound in [`collect_bounded`] is the real enforcement; this is only the cheap
+/// pre-read shortcut for a client that honestly declares an oversize body).
+fn content_length_over_cap(headers: &hyper::HeaderMap, cap: usize) -> bool {
+    headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .is_some_and(|declared| declared > cap as u64)
+}
+
+/// Render the `413 Payload Too Large` response through the existing error-envelope path, so its
+/// `{error:{message,code}}` shape matches every other edge error (R0.5 / DELTA N3).
+fn payload_too_large() -> Response<EdgeBody> {
+    let err = EdgeError::PayloadTooLarge(format!(
+        "request body exceeds the {MAX_REQUEST_BODY_BYTES}-byte front-door limit"
+    ));
+    to_hyper(EdgeResponse::error(&err))
 }
 
 /// Render an [`EdgeResponse`] as a hyper response (finished body or streamed SSE).
@@ -115,4 +199,118 @@ fn sse_body(rx: tokio::sync::broadcast::Receiver<crate::sse::SseEvent>) -> EdgeB
         Err(_) => None,
     });
     StreamBody::new(stream).boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    //! R0.5 / DELTA N3 — the front-door body bound. These prove: (a) an under-cap body collects fully
+    //! and correctly; (b) an over-cap body returns `TooLarge` and stops accumulating NEAR the cap (the
+    //! full oversize buffer is never allocated); (c) a Content-Length header over the cap fast-rejects.
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// (a) A body under the cap collects fully and byte-for-byte.
+    #[tokio::test]
+    async fn under_cap_collects_full_body() {
+        let payload = b"the quick brown fox jumps over the lazy dog".to_vec();
+        let body = Full::new(Bytes::from(payload.clone()));
+        let out = collect_bounded(body, MAX_REQUEST_BODY_BYTES).await.expect("under cap");
+        assert_eq!(out, payload, "an under-cap body is returned exactly");
+    }
+
+    /// A body exactly AT the cap is accepted (the boundary is inclusive).
+    #[tokio::test]
+    async fn exactly_at_cap_is_accepted() {
+        let cap = 4096;
+        let body = Full::new(Bytes::from(vec![7u8; cap]));
+        let out = collect_bounded(body, cap).await.expect("at cap is accepted");
+        assert_eq!(out.len(), cap);
+    }
+
+    /// (b) A body over the cap returns `TooLarge` AND stops reading near the cap — it does NOT pull the
+    /// whole oversize input. We count bytes actually pulled from the stream; only consumed frames
+    /// increment it, so the counter proves accumulation halted a frame past the cap, not at input end.
+    #[tokio::test]
+    async fn over_cap_rejects_without_buffering_full_input() {
+        let cap = 4096usize;
+        let chunk = 1024usize;
+        let total_chunks = 4096usize; // 4 MiB of input — 1000x the cap.
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = pulled.clone();
+        let chunks: Vec<Bytes> = (0..total_chunks).map(|_| Bytes::from(vec![0u8; chunk])).collect();
+        let stream = tokio_stream::iter(chunks).map(move |b| {
+            counter.fetch_add(b.len(), Ordering::SeqCst);
+            Ok::<Frame<Bytes>, std::io::Error>(Frame::data(b))
+        });
+        let body = StreamBody::new(stream);
+
+        let res = collect_bounded(body, cap).await;
+        assert_eq!(res, Err(BoundedCollectError::TooLarge), "over-cap body is rejected");
+
+        let consumed = pulled.load(Ordering::SeqCst);
+        assert!(
+            consumed <= cap + chunk,
+            "reading stopped near the cap (consumed {consumed}), not the full {} input bytes",
+            total_chunks * chunk
+        );
+    }
+
+    /// Trailers frames do not count toward the body: a data frame under the cap followed by trailers
+    /// still collects successfully and yields only the data bytes.
+    #[tokio::test]
+    async fn trailers_frame_is_not_counted_as_body() {
+        let mut trailers = hyper::HeaderMap::new();
+        trailers.insert("x-checksum", hyper::header::HeaderValue::from_static("abc"));
+        let frames: Vec<Result<Frame<Bytes>, std::io::Error>> = vec![
+            Ok(Frame::data(Bytes::from_static(b"hello"))),
+            Ok(Frame::trailers(trailers)),
+        ];
+        let body = StreamBody::new(tokio_stream::iter(frames));
+        let out = collect_bounded(body, 1024).await.expect("data under cap");
+        assert_eq!(out, b"hello", "only the data frame contributes to the body");
+    }
+
+    /// A transport read error surfaces as `Read` (the caller falls back to an empty body → clean 400).
+    #[tokio::test]
+    async fn read_error_surfaces_as_read_not_too_large() {
+        let frames: Vec<Result<Frame<Bytes>, std::io::Error>> = vec![
+            Ok(Frame::data(Bytes::from_static(b"partial"))),
+            Err(std::io::Error::other("connection reset")),
+        ];
+        let body = StreamBody::new(tokio_stream::iter(frames));
+        let res = collect_bounded(body, 1024).await;
+        assert_eq!(res, Err(BoundedCollectError::Read), "a mid-body read error is Read, not TooLarge");
+    }
+
+    /// (c) A Content-Length header declaring more than the cap fast-rejects; at/under the cap, or
+    /// absent/unparseable, does not.
+    #[test]
+    fn content_length_over_cap_fast_rejects() {
+        let cap = 4096usize;
+        let mk = |val: &str| {
+            let mut h = hyper::HeaderMap::new();
+            h.insert(hyper::header::CONTENT_LENGTH, hyper::header::HeaderValue::from_str(val).unwrap());
+            h
+        };
+        assert!(content_length_over_cap(&mk("4097"), cap), "declared > cap rejects");
+        assert!(!content_length_over_cap(&mk("4096"), cap), "declared == cap does not reject");
+        assert!(!content_length_over_cap(&mk("10"), cap), "declared < cap does not reject");
+        assert!(!content_length_over_cap(&mk("not-a-number"), cap), "unparseable does not fast-reject");
+        assert!(
+            !content_length_over_cap(&hyper::HeaderMap::new(), cap),
+            "absent Content-Length does not fast-reject (streaming bound enforces)"
+        );
+    }
+
+    /// The 413 response carries the canonical `{error:{message,code}}` envelope with code
+    /// `payload_too_large` and HTTP status 413.
+    #[test]
+    fn payload_too_large_uses_the_canonical_413_envelope() {
+        let resp = payload_too_large();
+        assert_eq!(resp.status(), 413);
+        let err = EdgeError::PayloadTooLarge("x".into());
+        assert_eq!(err.status(), 413);
+        assert_eq!(err.code(), "payload_too_large");
+    }
 }
