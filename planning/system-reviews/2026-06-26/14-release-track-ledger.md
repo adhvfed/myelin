@@ -38,6 +38,28 @@ item, addressed in R1, not R0.
 
 ## R1 — MR-009b completion (executes in ledger 13; fold-ins tracked here)
 
+**R1 grounding (2026-07-07).** Warm-up done: `DedupLedger` test-support dev-dep fixed (`5340c47`).
+**Current scanner baseline (authoritative, via `cargo test -p myelin-lints production_graph_absence`):
+`no-in-memory-durable-store` = 12** (+ 1 `no-structural-crypto-in-prod` residency_drill survivor, out of
+scope). The 12: `OutboxStore` (W3b), `KmsEngine` (W5), and the W6/W7 cluster — `BusErasureLedger`,
+`Registry` (W6d), `CellResolverRegistry`, `MisrouteAudit`, `PseudonymStore`, `PseudonymErasureLedger`,
+`CostLedger`, `ErasureLedger`, `InMemoryPostPitLedger`, `FsBlobStore` (W7).
+
+**W3b SCOPE CORRECTION — bigger than ledger-13's "13→12" line.** `OutboxStore` (`myelin-events/outbox.rs:230`)
+is the in-memory event-emit seam, and unlike `DedupLedger` it has NO backend enum (the in-memory-ness IS the
+struct). The scanner fires on the struct definition, so flipping it green requires gating the whole type
+behind `test-support` — which requires that **no production code references it**. But `OutboxStore` is used
+in PRODUCTION lib code across ~15 crates (flow `WfCtx`/engine/dogfood, git `RefStore`/code_projection, issues
+write_path/reorder/import, notif escalation/router/reindex, storage coloc/olap_feed, substrate serve, knowledge,
+search, refs-service, edge, chat[already re-pointed]). So W3b is a **platform-wide event-emit re-point**, not a
+small wave. Architectural blocker: `myelin-identity-service` and `myelin-events` are DAG sinks that cannot depend
+on `myelin-storage` (where `PgRelay::co_commit_in_tx` lives) → they cannot call the durable relay directly; the
+durable co-commit primitive must be reachable from a low crate, or their emit must route through a caller that
+owns both the state tx and the relay. Also unresolved: the in-process serving floor (`InProcessBus` + in-mem
+`OutboxStore`, used by substrate `default_inproc`, flow `app`, notif `lib`, knowledge `lib`) — under MR-009b
+doctrine (durable-by-default, in-memory test-only) this becomes a test/dev-only path. **W3b needs a design pass
+before execution; sequencing under review (see R1 decision log).**
+
 | Fold-in | Into wave | Status |
 |---|---|---|
 | Erasure ledger records COMPLETION time + restore-inside-window resurrection test | W6b | PENDING |
