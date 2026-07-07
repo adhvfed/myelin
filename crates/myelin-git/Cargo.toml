@@ -156,6 +156,12 @@ myelin-client = { path = "../myelin-client" }
 # doubles (PrincipalStore/TupleStore/RevocationStore/StoreBackedCheck `::new`) which moved behind
 # `#[cfg(any(test, feature = "test-support"))]`. DEV-only — never in the production DAG.
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
+# MR-009b Wave 3 (R1): enable `test-support` so this crate's DEV tests reach the events in-memory
+# `DedupLedger::new` test-double, which moved behind `#[cfg(any(test, feature = "test-support"))]`
+# (the durable `DedupLedger::durable` is production). Without this, `drills_git_d9_check_seam_consumer_leg`
+# only compiled via workspace feature-unification and broke under isolated `cargo clippy -p myelin-git
+# --all-targets`. DEV-only — a test-support dev-dep back-edge, never in the production DAG (§2.9).
+myelin-events = { path = "../myelin-events", features = ["test-support"] }
 # The architecture-lint engine — the merge-queue e2e (GIT-P23 / P-285) runs the `no-cross-sync-cycle`
 # lint over `src/merge_queue.rs` to PROVE Git makes 0 synchronous calls to CI (it reads its own
 # check_status projection; X-1 / EI-02 §3). A dev-only edge (the lint scanner is a test-time tool, not
