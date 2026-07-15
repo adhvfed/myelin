@@ -47,9 +47,18 @@
 //! REF-P10/CHAT-P15) is the inherited seam E2E-1 drives through; here the in-memory resolver models its
 //! EXACT `Projection | Tombstone` contract so the no-leak PROPERTY is proven structurally.
 
+// MR-009b Wave 5: the E2E runners that construct the in-memory KMS test double are
+// `test-support`-gated, which leaves their imports + private helpers unused on the default
+// (production) build. File-scoped allow ONLY for that cfg (the test/test-support build still
+// checks imports).
+#![cfg_attr(not(any(test, feature = "test-support")), allow(unused_imports, dead_code))]
+
 use crate::erase::ChatEraseReport;
 use crate::hitl::CardOutcome;
 
+// MR-009b Wave 5: the E2E-4 DSAR leg constructs the in-memory `KmsEngine` test double, so the leg
+// (and the whole-wedge aggregator below) is `test-support`-gated with it.
+#[cfg(any(test, feature = "test-support"))]
 pub mod e2e_dsar;
 pub mod e2e_flagship;
 pub mod e2e_pane;
@@ -87,6 +96,10 @@ impl ChatE2eArtifact {
 /// earned verdict (the scenario predicate + 0 leak).
 ///
 /// [`is_green`]: ChatE2eArtifact::is_green
+/// **MR-009b Wave 5 — `test-support`-gated:** this in-process drill constructs the in-memory
+/// `KmsEngine` test double (the production engine is the durable `kms_durable::load_or_generate`);
+/// its consumers (the tests-dir wedge/dogfood drills) reach it via the `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
 pub fn run_chat_e2e_wedge() -> Vec<ChatE2eArtifact> {
     vec![
         e2e_pane::run_e2e_1_unfurl_pane(),
@@ -112,6 +125,7 @@ pub(crate) fn hitl_approved_once(outcome: &CardOutcome, apply_count: usize) -> b
 /// recorded (the crypto-shred ran) + the cascade rode the bus (no backdoor). The whole-system
 /// certificate cites chat's leg green iff this holds (chat appears with 0 holders missed). Returns
 /// `true` iff chat's H5 holder erased completely.
+#[cfg(any(test, feature = "test-support"))] // consumed only by the gated E2E-4 DSAR leg (Wave 5)
 pub(crate) fn dsar_holder_green(report: &ChatEraseReport) -> bool {
     report.receipts_complete() && report.destroyed_key_epoch.is_some() && report.cascade_published
 }

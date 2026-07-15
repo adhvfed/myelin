@@ -42,11 +42,15 @@
 //! doctrine.md` §1 (code-wins-over-docs — the truth-up pass), §3/§4 (prove it / drive the whole thing),
 //! §5 (the ratchet runs on the builders' own work). **VISION §5** (dogfooding).
 
+#[cfg(any(test, feature = "test-support"))] // consumed only by the gated dogfood runner (Wave 5)
 use myelin_events::{Actor, EmitContextBase, Timestamp};
+#[cfg(any(test, feature = "test-support"))] // consumed only by the gated dogfood runner (Wave 5)
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+#[cfg(any(test, feature = "test-support"))] // consumed only by the gated dogfood runner (Wave 5)
 use myelin_tenancy::{Region, TenantId};
 
 use crate::e2e_wedge::E2eArtifact;
+#[cfg(any(test, feature = "test-support"))]
 use crate::{run_e2e_1_pr_pane, run_e2e_3_spec_to_ship, run_e2e_4_dsar_fanout};
 
 /// The Myelin self-tenant id (the platform self-hosts as exactly one cell — P-508 / CP-M6). Opaque,
@@ -58,6 +62,7 @@ pub const MYELIN_SELF_TENANT: &str = "myelin";
 pub const MYELIN_SELF_REGION: &str = "fr-par";
 
 /// The Myelin self-tenant region (fr-par).
+#[cfg(any(test, feature = "test-support"))] // consumed only by the gated dogfood runner (Wave 5)
 fn myelin_self_region() -> Region {
     Region(MYELIN_SELF_REGION.into())
 }
@@ -72,6 +77,7 @@ fn myelin_self_region() -> Region {
 /// fork a second corpus. The "over Myelin's own work" framing of REF-P28 is carried by the artifact
 /// SHAPES the production runners already model (commits ↔ issues ↔ CI checks ↔ KN docs ↔ chat threads)
 /// + the self-tenant summary; the engine driven is the SAME production reindex-parity engine.
+#[cfg(any(test, feature = "test-support"))] // consumed only by the gated dogfood runner (Wave 5)
 fn myelin_ctx_base() -> EmitContextBase {
     // The canonical E2E fixture tenant the spec-to-ship runner builds its reindex-parity corpus under
     // (mirrors the production runner's internal `e2e_tenant()`; aligning here keeps the parity green).
@@ -151,6 +157,10 @@ impl DogfoodArtifact {
 /// across the three faces (the PR pane, the spec-to-ship lineage, the holder fan-out) on the Myelin
 /// self-tenant, REUSING the existing E2E-wedge runners (the SAME resolve chokepoint / traverse /
 /// reindex / holder engine — EI-01 §7, never a second implementation). `date` is the run stamp.
+/// **MR-009b Wave 5 — `test-support`-gated:** this in-process drill constructs the in-memory
+/// `KmsEngine` test double (the production engine is the durable `kms_durable::load_or_generate`);
+/// its consumers (the tests-dir wedge/dogfood drills) reach it via the `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
 pub fn run_refs_over_myelins_own_work(date: &str) -> DogfoodArtifact {
     DogfoodArtifact {
         date: date.to_string(),

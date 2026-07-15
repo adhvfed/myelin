@@ -723,10 +723,14 @@ pub use ci_log_index::{
 };
 pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
 pub use dogfood::{
-    proven_storage_rows, run_restore_verify_on_dogfood, DogfoodCorpus, DogfoodGreenArtifact,
-    DogfoodRecord, DogfoodStore, IncidentDrillTicket, IncidentIssueDraft, ProvenRow,
-    StorageIncident, TruthUpPass, TruthUpRed, TruthUpVerdict,
+    proven_storage_rows, DogfoodCorpus, DogfoodGreenArtifact, DogfoodRecord, DogfoodStore,
+    IncidentDrillTicket, IncidentIssueDraft, ProvenRow, StorageIncident, TruthUpPass, TruthUpRed,
+    TruthUpVerdict,
 };
+// The in-process dogfood restore-verify drill constructs the in-memory KMS test double — MR-009b
+// Wave 5: `test-support`-gated (the tests-dir drills reach it via the self dev-dependency).
+#[cfg(any(test, feature = "test-support"))]
+pub use dogfood::run_restore_verify_on_dogfood;
 pub use e2e3_reindex_parity::{
     run_e2e3_storage_half, DerivedReindexSource, DerivedStoreClass, DerivedStoreParity,
     E2e3StorageArtifact,

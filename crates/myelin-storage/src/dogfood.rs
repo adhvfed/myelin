@@ -60,13 +60,21 @@ use std::collections::BTreeMap;
 
 use myelin_tenancy::TenantId;
 
-use crate::backup::{ContinuousArchiver, WalOffset, WalSegment};
+use crate::backup::WalOffset;
+// The in-memory KMS double + the corpus→gate-input machinery are consumed ONLY by the
+// `test-support`-gated in-process drill surface (`DogfoodCorpus::kms`/`archiver`/`wal_rows`/… +
+// `run_restore_verify_on_dogfood`) — MR-009b Wave 5.
+#[cfg(any(test, feature = "test-support"))]
+use crate::backup::{ContinuousArchiver, WalSegment};
+#[cfg(any(test, feature = "test-support"))]
 use crate::blob::ContentHash;
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::{KekId, KeyClass, KmsEngine};
+#[cfg(any(test, feature = "test-support"))]
 use crate::restore::{SourceLog, WalRow};
-use crate::restore_verify::{
-    ErasureLedger, GateInputs, GreenArtifact, RestoreVerifyGate, RestoredObject,
-};
+#[cfg(any(test, feature = "test-support"))]
+use crate::restore_verify::{ErasureLedger, GateInputs, RestoreVerifyGate, RestoredObject};
+use crate::restore_verify::GreenArtifact;
 use myelin_tenancy::Region;
 
 // ───────────────────────────── the dogfood corpus (Myelin's own stores as real tenant data) ─────────────────────────────
@@ -224,6 +232,7 @@ impl DogfoodCorpus {
     /// The restored objects (the platform's own bytes, content-addressed) — the object tier a backup
     /// of the corpus brings back. Each is `integral` (its address IS the BLAKE3 hash of its bytes), so
     /// a whole restore checksum-parity-verifies.
+    #[cfg(any(test, feature = "test-support"))]
     fn restored_objects(&self) -> Vec<RestoredObject> {
         self.records
             .iter()
@@ -232,6 +241,7 @@ impl DogfoodCorpus {
     }
 
     /// The OLTP rows (each platform record references its content-addressed object).
+    #[cfg(any(test, feature = "test-support"))]
     fn wal_rows(&self) -> Vec<WalRow> {
         self.records
             .iter()
@@ -244,6 +254,7 @@ impl DogfoodCorpus {
     }
 
     /// The durable source log the derived stores reindex FROM (each record's row id at its offset).
+    #[cfg(any(test, feature = "test-support"))]
     fn source_log(&self) -> SourceLog {
         let mut source = SourceLog::new();
         for r in &self.records {
@@ -254,6 +265,8 @@ impl DogfoodCorpus {
 
     /// An archiver whose base + WAL tail makes the corpus's whole offset range reachable (a PITR
     /// reachable to [`Self::latest_offset`] — the dogfood backup's reach).
+    /// (`test-support`-gated with the drill surface it feeds — MR-009b Wave 5.)
+    #[cfg(any(test, feature = "test-support"))]
     fn archiver(&self) -> ContinuousArchiver {
         let mut arch = ContinuousArchiver::new();
         // base at 0 …
@@ -274,6 +287,13 @@ impl DogfoodCorpus {
 
     /// A KMS engine holding the self-host tenant's KEK + DEK (so a restore brings back the key the
     /// platform's own envelope-encrypted data is wrapped under — a live, non-erased dogfood tenant).
+    ///
+    /// **MR-009b Wave 5 — `test-support`-gated:** this in-process dogfood corpus builds the
+    /// IN-MEMORY `KmsEngine` test double (the production engine is the durable
+    /// `kms_durable::load_or_generate`), so the whole in-process dogfood drill surface
+    /// ([`run_restore_verify_on_dogfood`]) rides the test/`test-support` build only — exactly the
+    /// tests-dir drills that consume it (`stor_d37_dogfood_restore_verify_drill`).
+    #[cfg(any(test, feature = "test-support"))]
     fn kms(&self) -> KmsEngine {
         let kms = KmsEngine::new();
         kms.ensure_kek(&KekId::new(self.tenant.clone(), self.region.clone()));
@@ -297,6 +317,11 @@ impl DogfoodCorpus {
 /// `now_iso` is the caller-supplied date (the harness `today_iso()` at the run) so the artifact is
 /// DATED at the dogfood run — a claim that outlives its verification misleads the next agent
 /// (EI-01 §1).
+///
+/// **MR-009b Wave 5 — `test-support`-gated:** this in-process drill constructs the in-memory
+/// `KmsEngine` test double (via [`DogfoodCorpus::kms`]); its consumers are the tests-dir drills,
+/// which reach it through the `myelin-storage/test-support` self-dev-dependency.
+#[cfg(any(test, feature = "test-support"))]
 pub fn run_restore_verify_on_dogfood(
     corpus: &DogfoodCorpus,
     now_iso: &str,

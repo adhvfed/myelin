@@ -143,6 +143,18 @@ tokio = { workspace = true, optional = true }
 # engine is a dev-dependency (test scaffolding only — no runtime edge). EI-01 §7: prove against the
 # frozen engine, never re-define it.
 [dev-dependencies]
+# MR-009b Wave 3 follow-up (found by the Wave-5 per-crate isolation check, the 5340c47 bug class):
+# this crate's OWN tests (drill_iss_p06_emit_iff_committed / drill_iss_d5_reorder_zero_clobber)
+# construct the events in-memory `DedupLedger::new()` double, which is
+# `#[cfg(any(test, feature = "test-support"))]` as of Wave 3 — the workspace build masked the
+# missing feature via unification; the isolated `cargo clippy -p myelin-issues --all-targets`
+# catches it. DEV-only.
+myelin-events = { path = "../myelin-events", features = ["test-support"] }
+# MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
+# `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests (the same
+# posture as the Wave-2/3 identity/events test-support dev-dependencies). DEV-only — never in the
+# production DAG (cargo tree -e no-dev shows no test-support edge).
+myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 # MR-009b Wave 2: enable `test-support` so this crate's DEV tests reach the identity in-memory
 # doubles (PrincipalStore/TupleStore/RevocationStore/StoreBackedCheck `::new`) which moved behind
 # `#[cfg(any(test, feature = "test-support"))]`. DEV-only — never in the production DAG.

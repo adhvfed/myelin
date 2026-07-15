@@ -33,7 +33,9 @@
 //! `external-insights/01-process-and-quality-doctrine.md` §4 (the switch test — drive the real
 //! surface), §1 (record honestly — no claimed-but-unearned green). **VISION §5** (Myelin hosts itself).
 
-use crate::e2e_wedge::{run_chat_e2e_wedge, ChatE2eArtifact};
+use crate::e2e_wedge::ChatE2eArtifact;
+#[cfg(any(test, feature = "test-support"))]
+use crate::e2e_wedge::run_chat_e2e_wedge;
 
 /// The Myelin self-tenant id (the dogfood drives the Chat surface over the platform's OWN work).
 pub const MYELIN_SELF_TENANT: &str = "myelin";
@@ -167,6 +169,10 @@ impl ChatDogfoodArtifact {
 /// (every channel round-trips AND every face green AND 0 leak). Reused, never re-implemented (EI-01 §7).
 ///
 /// [`is_green`]: ChatDogfoodArtifact::is_green
+/// **MR-009b Wave 5 — `test-support`-gated:** this in-process drill constructs the in-memory
+/// `KmsEngine` test double (the production engine is the durable `kms_durable::load_or_generate`);
+/// its consumers (the tests-dir wedge/dogfood drills) reach it via the `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
 pub fn run_chat_over_myelins_own_work(date: &str) -> ChatDogfoodArtifact {
     let channels = myelin_chat_channels();
     let channels_total = channels.len();

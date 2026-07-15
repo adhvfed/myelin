@@ -57,7 +57,7 @@
 //!   from the auth spine); its removal belongs to the CI/attestation track, NOT this auth prompt. Left
 //!   honestly in the baseline (the scanner stays at 1 remaining structural entry).
 //!
-//! ### `no-in-memory-durable-store` (12) — the spine durable-persistence waves (P-522/523)
+//! ### `no-in-memory-durable-store` (11) — the spine durable-persistence waves (P-522/523)
 //! - **MR-009b Wave 2 FLIPPED the 3 identity spine stores GREEN (17→14):**
 //!   `principal_store.rs` `PrincipalStore` (SI-018), `tuple_store.rs` `TupleStore` (SI-019), and
 //!   `revocation.rs` `RevocationStore` (SI-020) are now durable-by-default. Their in-memory
@@ -91,10 +91,21 @@
 //! - `myelin-control-plane/src/registry.rs:111`          — `Registry` placement in-mem (SI-011; cp durable MR)
 //! - `myelin-control-plane/src/cross_cell_bridge.rs:244` — `CellResolverRegistry` in-mem (SI-052; cp/multi-cell MR)
 //! - `myelin-control-plane/src/placement_of.rs:223`      — `MisrouteAudit` `Arc<Mutex<Vec<…>>>` audit sink (SI-028; cp durable MR)
-//! - `myelin-storage/src/kms.rs:622`                      — `KmsEngine` root/KEKs in-mem (SI-006). MR-025
-//!   ADDED the durable software-sealed root (`kms_durable::DurableKmsBacking` + `load_or_generate`,
-//!   proven live: `integration_mr025_kms_durable`); `KmsEngine::new()` still the always-compiled
-//!   in-memory default → named-holder scanner still fires (re-pinned 470→622). Removed at MR-009 wiring.
+//! - **MR-009b Wave 5 FLIPPED the `KmsEngine` (SI-006) GREEN (12→11):** `kms.rs` `KmsEngine` is now
+//!   durable-by-default — a role struct over a `KmsBackend` enum (the Wave-2/DedupLedger pattern).
+//!   The in-memory `Memory(KmsCore)` arm + `KmsEngine::new()`/`Default`/`from_root` are
+//!   `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLES; the always-compiled PRODUCTION
+//!   backend is `Durable(kms_durable::DurableKms)` — the MR-025 software-sealed store hydrated at
+//!   boot by `DurableKmsBacking::load_or_generate` (fail-closed + LOUD on a wrong/absent
+//!   `MYELIN_KMS_SEAL_KEY` — never a fresh root that would orphan existing ciphertext), with EVERY
+//!   mutation (`ensure_kek`/`ensure_dek`/`rotate_kek`/`destroy_kek`/`destroy_dek`) written through
+//!   to `kms_wrapped_kek`/`kms_wrapped_dek`, so keys minted at runtime survive kill-9 too. The
+//!   production boot root (edge `main.rs`) wires `load_or_generate` and exits non-zero on missing
+//!   durable config — no silent in-memory fallback. The scanner strips the `test-support`-gated
+//!   `Memory` arm, so the production-compiled named holder presents no in-memory backing — the
+//!   `kms.rs:622` entry is REMOVED. Proven live: `integration_mr025_kms_durable`
+//!   (decrypt-across-restart, wrong-seal-key-fails-closed, + the Wave-5 sync-API write-through
+//!   restart proof). DB-free unit tests reach the double via `myelin-storage/test-support`.
 //! - `myelin-storage/src/reserve_settle.rs:283`          — `CostLedger` reserve/settle in-mem (SI-021 cluster; MR-007/009)
 //! - `myelin-storage/src/restore_verify.rs:175`          — `ErasureLedger` restore-verify in-mem (SI-036 cluster; P-530)
 //! - `myelin-storage/src/reerase.rs:156`                  — `InMemoryPostPitLedger` `records: Vec<…>` (Vec false-negative closed; P-ST-14 / P-522/523)
@@ -350,11 +361,12 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-ci-controlplane/src/residency_drill.rs",
         444,
     ),
-    // ---- no-in-memory-durable-store (8 here + 4 closed-false-negatives below = 12) ----
+    // ---- no-in-memory-durable-store (7 here + 4 closed-false-negatives below = 11) ----
     //      spine durable-persistence waves (P-522/523); MR-009b Wave 2 flipped the 3 identity spine
     //      stores (principal/tuple/revocation) durable-by-default → removed (17→14); MR-009b Wave 3
     //      flipped the events `DedupLedger` (SI-023) durable-by-default → `dedup.rs:141` removed
-    //      (in-memory count 13→12; total baseline 14→13).
+    //      (in-memory count 13→12; total baseline 14→13); MR-009b Wave 5 flipped the `KmsEngine`
+    //      (SI-006) durable-by-default → `kms.rs:622` removed (in-memory count 12→11; total 13→12).
     //      (The sibling `outbox.rs:230` `OutboxStore`/SI-007 STAYS — its durable re-point to
     //      `PgRelay::co_commit_in_tx` is a separate, higher-coupling wave; see the module-doc residual.)
     (
@@ -417,20 +429,22 @@ const BASELINE: &[(&str, &str, usize)] = &[
     // the SAME durable-capable store as every other revocation — the standalone tenant-less stub is
     // gone (proven cross-restart in `integration_mr011_machine_token_revocation_durable`). So this
     // entry is removed, not supplemented (the durable consult path is real now).
-    // MR-025 (SI-006) ADDED the durable software-sealed root path (`kms_durable::DurableKmsBacking`
-    // + `load_or_generate` over `kms_sealed_root`/`kms_wrapped_kek`/`kms_wrapped_dek`, proven live:
-    // `integration_mr025_kms_durable` — decrypt-across-restart + wrong-seal-key-fails-closed +
-    // backup/restore). SUPPLEMENTED, not removed: `KmsEngine::new()` is still the always-compiled
-    // in-memory default (the durable backing is behind `#[cfg(feature="integration")]`) and nothing
-    // wires `load_or_generate` yet — so the in-memory KMS is STILL the production default, and the
-    // named-holder scanner STILL fires on the `KmsEngine` struct header (re-pinned 470→622 after the
-    // MR-025 seal/export/snapshot additions). Removed when MR-009 wires `load_or_generate` as the
-    // non-optional boot default (+ the kill-9 proof).
-    (
-        "no-in-memory-durable-store",
-        "crates/myelin-storage/src/kms.rs",
-        622,
-    ),
+    // `myelin-storage/src/kms.rs` `KmsEngine` (SI-006) — REMOVED by MR-009b Wave 5 (the ratchet
+    // tightened 12 → 11). The engine is now a role struct over a backend enum (`KmsBackend`,
+    // the Wave-2/DedupLedger pattern): the in-memory `Memory(KmsCore)` arm + `KmsEngine::new()`/
+    // `Default`/`from_root` are `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLES, and the
+    // always-compiled PRODUCTION backend is `Durable(DurableKms)` — the MR-025 software-sealed
+    // store (`kms_durable::DurableKmsBacking::load_or_generate` over `kms_sealed_root`/
+    // `kms_wrapped_kek`/`kms_wrapped_dek`, fail-closed + LOUD on a wrong/absent seal key) hydrating
+    // the working set at boot, with EVERY mutation (`ensure_kek`/`ensure_dek`/`rotate_kek`/
+    // `destroy_*`) writing through, so keys minted at runtime survive a kill-9 restart. The
+    // production boot root (edge `main.rs`) wires `load_or_generate` and FAILS LOUD (exit non-zero)
+    // on missing seal key / unreachable store — never a silent in-memory fallback. The scanner
+    // strips the `test-support`-gated `Memory` arm, so the production-compiled named holder
+    // presents no in-memory collection/backing. Durable-by-default proven live on PG
+    // (`integration_mr025_kms_durable` — decrypt-across-restart + wrong-seal-key-fails-closed +
+    // the Wave-5 write-through kill-9-equivalent proof); DB-free unit tests use the double via the
+    // `myelin-storage/test-support` dev-dependency.
     (
         "no-in-memory-durable-store",
         "crates/myelin-storage/src/reserve_settle.rs",
@@ -562,11 +576,12 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
     // un-wired gate). The counts pin the manifest shape.
     assert_eq!(
         BASELINE.len(),
-        13,
-        "the committed baseline has 13 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
+        12,
+        "the committed baseline has 12 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
          GREEN: 17 → 14 — PrincipalStore/TupleStore/RevocationStore are durable-by-default, their \
-         in-memory doubles `test-support`-gated; MR-009b Wave 3 then flipped the events `DedupLedger` \
-         (SI-023) durable-by-default — `dedup.rs:141` removed → 14 → 13)"
+         in-memory doubles `test-support`-gated; MR-009b Wave 3 flipped the events `DedupLedger` \
+         (SI-023) — `dedup.rs:141` removed → 14 → 13; MR-009b Wave 5 flipped the `KmsEngine` \
+         (SI-006) durable-by-default — `kms.rs:622` removed → 13 → 12)"
     );
     let structural = BASELINE
         .iter()
@@ -589,15 +604,17 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          to the CI track."
     );
     assert_eq!(
-        in_memory, 12,
-        "12 in-memory durable-store sites: MR-009b Wave 2 FLIPPED the 3 identity spine stores \
-         (PrincipalStore/TupleStore/RevocationStore) durable-by-default (16→13), and MR-009b Wave 3 \
-         FLIPPED the events `DedupLedger` (SI-023) durable-by-default — its `Memory` arm + `::new()` + \
-         `Default` are now `test-support`-gated test doubles and the pool-backed `Durable` arm is the \
-         always-compiled production default the events `serve()` root wires (13→12). The remaining 12 \
-         (S2 pseudonym + erasure ledger; events OUTBOX (SI-007, a separate higher-coupling wave) + \
-         reerase; control-plane registry/bridge/misroute; storage kms/reserve/restore/reerase/blob) \
-         flip in the later waves."
+        in_memory, 11,
+        "11 in-memory durable-store sites: MR-009b Wave 2 FLIPPED the 3 identity spine stores \
+         (PrincipalStore/TupleStore/RevocationStore) durable-by-default (16→13), MR-009b Wave 3 \
+         FLIPPED the events `DedupLedger` (SI-023) durable-by-default (13→12), and MR-009b Wave 5 \
+         FLIPPED the `KmsEngine` (SI-006) durable-by-default — its `Memory(KmsCore)` arm + \
+         `::new()`/`Default`/`from_root` are now `test-support`-gated test doubles and the \
+         always-compiled production backend is the MR-025 software-sealed durable store \
+         (`load_or_generate` + write-through on every mutation) the edge boot root wires (12→11). \
+         The remaining 11 (S2 pseudonym + erasure ledger; events OUTBOX (SI-007, a separate \
+         higher-coupling wave) + reerase; control-plane registry/bridge/misroute; storage \
+         reserve/restore/reerase/blob) flip in the later waves."
     );
     assert_eq!(
         bare_pool, 0,

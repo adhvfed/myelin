@@ -134,6 +134,13 @@ myelin-config = { path = "../myelin-config", optional = true }
 
 [features]
 default = []
+# MR-009b Wave 5 — the `test-support` cargo feature (alias `memory`). Gates this crate's in-process
+# E2E-wedge/dogfood drill runners (`run_e2e_3_spec_to_ship` / `run_e2e_4_dsar_fanout` /
+# `run_search_e2e_wedge` / `run_search_over_myelins_own_work`), which construct the in-memory
+# `KmsEngine` test double — so it forwards to `myelin-storage/test-support` (where the double
+# lives). DEV/TEST only — never enabled by a production dependency edge.
+test-support = ["myelin-storage/test-support"]
+memory = ["test-support"]
 integration = [
     "dep:sqlx",
     "dep:tokio",
@@ -147,6 +154,13 @@ integration = [
 # in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
 # — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
+# MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
+# `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests. DEV-only.
+myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
+# MR-009b Wave 5 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN
+# tests-dir targets (the e2e-wedge/dogfood drills call the now-gated in-process runners). The same
+# posture as the myelin-identity-service self dev-dependency (Wave 2).
+myelin-search = { path = ".", features = ["test-support"] }
 myelin-lints = { path = "../myelin-lints" }
 serde_json = { workspace = true }
 

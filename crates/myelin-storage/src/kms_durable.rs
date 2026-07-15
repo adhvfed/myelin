@@ -47,12 +47,15 @@
 //! - **The HSM / Shamir-split-recovery L0 backing stays Tier-4 (P-524).** This is the software floor:
 //!   the seal key is env-held, not in an HSM. The hierarchy SHAPE (root wraps KEKs, never exported)
 //!   is unchanged when the HSM lands — only the seal-key custodian changes.
-//! - **Production boot wiring + the kill-9/restart proof is MR-009.** This module ships the durable
-//!   mechanism + proves decrypt-across-restart against live PG; wiring `load_or_generate` into the
-//!   production boot spec as the non-optional default (so the in-memory `KmsEngine::new()` stops being
-//!   the default) is MR-009 — at which point the `kms.rs` baseline entry flips present→removed.
+//! - **Production boot wiring + the kill-9/restart proof — DONE (MR-009b Wave 5).**
+//!   [`DurableKmsBacking::load_or_generate`] is now the PRODUCTION [`KmsEngine`] constructor: the
+//!   returned engine rides the always-compiled DURABLE backend ([`DurableKms`] — hydrated working
+//!   set + write-through on every mutation), the in-memory `KmsEngine::new()` moved behind
+//!   `#[cfg(any(test, feature = "test-support"))]` as the test double, and the `kms.rs`
+//!   `no-in-memory-durable-store` baseline entry is REMOVED (the ratchet tightened 12 → 11).
 //!
-//! Feature-gated `integration` (it pulls the real sqlx client), like the rest of the live-PG code.
+//! Always-compiled (MR-009b Wave 1: sqlx is a plain dependency — runtime queries only, no live DB
+//! at build time); the `integration` feature remains a live-PG TEST-selector only.
 
 use sqlx::postgres::PgPool;
 use sqlx::Row;
@@ -60,8 +63,8 @@ use sqlx::Row;
 use myelin_tenancy::{Region, TenantId};
 
 use crate::kms::{
-    CellRoot, DekId, ExportedKek, KekId, KeyClass, KmsDurableSnapshot, KmsEngine, KmsError,
-    PiiKeyRef, SealKey, SealKeyError, SealedRoot, WrappedDek, NONCE_LEN,
+    CellRoot, DekId, ExportedKek, KekId, KeyClass, KmsCore, KmsDurableSnapshot, KmsEngine,
+    KmsError, PiiKeyRef, SealKey, SealKeyError, SealedRoot, WrappedDek, KEY_LEN, NONCE_LEN,
 };
 use crate::pg::PgError;
 
@@ -217,12 +220,20 @@ impl DurableKmsBacking {
         &self.cell_id
     }
 
-    /// **`load_or_generate` — the durable root-origin constructor (MR-025).** Recover a working
-    /// [`KmsEngine`] for this cell from the store under `seal_key`, or — on a genuine empty first boot
-    /// — generate + persist a fresh root. See the module docs for the fail-closed-on-wrong-key logic:
-    /// a sealed root that exists but does NOT unseal is a LOUD [`KmsDurableError::WrongSealKey`] and
-    /// the engine refuses to start (NEVER a new root). On success the wrapped KEKs + DEKs are loaded
-    /// from the store into the engine, so a DEK provisioned before a restart resolves + decrypts after.
+    /// **`load_or_generate` — the durable root-origin constructor (MR-025) and, as of MR-009b
+    /// Wave 5, the PRODUCTION [`KmsEngine`] constructor.** Recover a working engine for this cell
+    /// from the store under `seal_key`, or — on a genuine empty first boot — generate + persist a
+    /// fresh root. See the module docs for the fail-closed-on-wrong-key logic: a sealed root that
+    /// exists but does NOT unseal is a LOUD [`KmsDurableError::WrongSealKey`] and the engine
+    /// refuses to start (NEVER a new root). On success the wrapped KEKs + DEKs are hydrated from
+    /// the store into the working set, so a DEK provisioned before a restart resolves + decrypts
+    /// after — and the returned engine is on the DURABLE backend: every subsequent mutation
+    /// (`ensure_kek`/`ensure_dek`/`rotate_kek`/`destroy_*`) WRITES THROUGH to this store, so keys
+    /// minted after boot survive a kill-9 restart too (SI-006 closed at the default).
+    ///
+    /// Must be called INSIDE a tokio runtime (it captures the runtime handle the sync engine API
+    /// bridges its write-throughs on — the same `block_in_place`+`block_on` bridge the Wave-2
+    /// identity stores use, which requires the MULTI-THREADED runtime).
     pub async fn load_or_generate(&self, seal_key: &SealKey) -> Result<KmsEngine, KmsDurableError> {
         let root = match self.read_sealed_root().await? {
             Some(sealed) => {
@@ -248,10 +259,14 @@ impl DurableKmsBacking {
                 })?
             }
         };
-        let engine = KmsEngine::from_root(root);
-        self.load_keks(&engine).await?;
-        self.load_deks(&engine).await?;
-        Ok(engine)
+        let core = KmsCore::from_root(root);
+        self.load_keks(&core).await?;
+        self.load_deks(&core).await?;
+        Ok(KmsEngine::durable(DurableKms {
+            core,
+            backing: self.clone(),
+            rt: tokio::runtime::Handle::current(),
+        }))
     }
 
     // ---- sealed root ----
@@ -302,7 +317,7 @@ impl DurableKmsBacking {
 
     // ---- KEKs ----
 
-    async fn load_keks(&self, engine: &KmsEngine) -> Result<(), PgError> {
+    async fn load_keks(&self, core: &KmsCore) -> Result<(), PgError> {
         let rows = sqlx::query(
             "SELECT tenant_id, region, nonce, wrapped, epoch FROM kms_wrapped_kek WHERE cell_id = $1",
         )
@@ -316,7 +331,7 @@ impl DurableKmsBacking {
             let nonce: Vec<u8> = r.get("nonce");
             let wrapped: Vec<u8> = r.get("wrapped");
             let epoch: i64 = r.get("epoch");
-            engine.install_wrapped_kek(
+            core.install_wrapped_kek(
                 KekId::new(TenantId(tenant), Region(region)),
                 nonce_from(&nonce),
                 wrapped,
@@ -327,6 +342,15 @@ impl DurableKmsBacking {
     }
 
     async fn upsert_kek_row(&self, id: &KekId, k: &ExportedKek) -> Result<(), PgError> {
+        self.upsert_kek_row_on(&self.pool, id, k).await
+    }
+
+    async fn upsert_kek_row_on<'e, E: sqlx::PgExecutor<'e>>(
+        &self,
+        ex: E,
+        id: &KekId,
+        k: &ExportedKek,
+    ) -> Result<(), PgError> {
         sqlx::query(
             "INSERT INTO kms_wrapped_kek (cell_id, tenant_id, region, nonce, wrapped, epoch) \
              VALUES ($1, $2, $3, $4, $5, $6) \
@@ -339,7 +363,7 @@ impl DurableKmsBacking {
         .bind(k.nonce.as_slice())
         .bind(&k.wrapped)
         .bind(k.epoch as i64)
-        .execute(&self.pool)
+        .execute(ex)
         .await
         .map_err(|e| PgError::Query(e.to_string()))?;
         Ok(())
@@ -371,7 +395,7 @@ impl DurableKmsBacking {
 
     // ---- DEKs ----
 
-    async fn load_deks(&self, engine: &KmsEngine) -> Result<(), PgError> {
+    async fn load_deks(&self, core: &KmsCore) -> Result<(), PgError> {
         let rows = sqlx::query(
             "SELECT tenant_id, class, nonce, wrapped, kek_epoch, dek_epoch FROM kms_wrapped_dek \
              WHERE cell_id = $1",
@@ -390,7 +414,7 @@ impl DurableKmsBacking {
             let wrapped: Vec<u8> = r.get("wrapped");
             let kek_epoch: i64 = r.get("kek_epoch");
             let dek_epoch: i64 = r.get("dek_epoch");
-            engine.install_wrapped_dek(
+            core.install_wrapped_dek(
                 DekId::new(TenantId(tenant), class),
                 WrappedDek {
                     nonce: nonce_from(&nonce),
@@ -405,6 +429,16 @@ impl DurableKmsBacking {
 
     async fn upsert_dek_row(
         &self,
+        id: &DekId,
+        w: &WrappedDek,
+        dek_epoch: u64,
+    ) -> Result<(), PgError> {
+        self.upsert_dek_row_on(&self.pool, id, w, dek_epoch).await
+    }
+
+    async fn upsert_dek_row_on<'e, E: sqlx::PgExecutor<'e>>(
+        &self,
+        ex: E,
         id: &DekId,
         w: &WrappedDek,
         dek_epoch: u64,
@@ -424,9 +458,33 @@ impl DurableKmsBacking {
         .bind(&w.wrapped)
         .bind(w.kek_epoch as i64)
         .bind(dek_epoch as i64)
-        .execute(&self.pool)
+        .execute(ex)
         .await
         .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Persist a rotation's full row set — the new wrapped KEK + every re-wrapped DEK — in ONE
+    /// PG transaction. Rotation re-wraps every DEK under the new KEK, so a partial persist (new
+    /// KEK row + old DEK rows) is UNRECOVERABLE after a restart: the old KEK plaintext exists
+    /// nowhere to unwrap the old envelopes. Atomicity means a failure at ANY point leaves the
+    /// store wholly at the previous wrapping generation, which still decrypts everything.
+    async fn persist_rotation(
+        &self,
+        id: &KekId,
+        kek: &ExportedKek,
+        deks: &[(DekId, WrappedDek, u64)],
+    ) -> Result<(), PgError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        self.upsert_kek_row_on(&mut *tx, id, kek).await?;
+        for (dek_id, w, dek_epoch) in deks {
+            self.upsert_dek_row_on(&mut *tx, dek_id, w, *dek_epoch).await?;
+        }
+        tx.commit().await.map_err(|e| PgError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -480,17 +538,24 @@ impl DurableKmsBacking {
     }
 
     /// `rotate_kek` + re-persist the KEK AND every re-wrapped DEK for that tenant (rotation re-wraps
-    /// the DEKs under the new KEK — the wrapped forms changed, so the durable rows must too).
+    /// the DEKs under the new KEK — the wrapped forms changed, so the durable rows must too), in ONE
+    /// PG transaction (a partial persist would strand the old DEK envelopes unrecoverably — the old
+    /// KEK plaintext exists nowhere after the in-memory rotation).
     pub async fn rotate_kek(&self, engine: &KmsEngine, id: &KekId) -> Result<u64, KmsDurableError> {
         let epoch = engine.rotate_kek(id).map_err(KmsDurableError::Kms)?;
-        self.persist_kek(engine, id).await?;
-        for (dek_id, w, dek_epoch) in engine
+        let kek = engine.export_kek(id).ok_or_else(|| {
+            KmsDurableError::Db(PgError::Query(format!(
+                "no KEK to persist after rotation for tenant={} region={}",
+                id.tenant.as_str(),
+                id.region.as_str()
+            )))
+        })?;
+        let deks: Vec<_> = engine
             .export_deks()
             .into_iter()
             .filter(|(d, _, _)| d.tenant == id.tenant)
-        {
-            self.upsert_dek_row(&dek_id, &w, dek_epoch).await?;
-        }
+            .collect();
+        self.persist_rotation(id, &kek, &deks).await?;
         Ok(epoch)
     }
 
@@ -536,6 +601,207 @@ impl DurableKmsBacking {
         seal_key: &SealKey,
     ) -> Result<(), KmsDurableError> {
         self.restore(&engine.backup_snapshot_durable(seal_key)).await
+    }
+}
+
+// =================================================================================================
+// DurableKms — the PRODUCTION KmsEngine backend (MR-009b Wave 5): hydrated core + write-through.
+// =================================================================================================
+
+/// **The durable [`KmsEngine`] backend (MR-009b Wave 5 / SI-006).** Pairs the in-process working
+/// set ([`KmsCore`], hydrated from the store by [`DurableKmsBacking::load_or_generate`]) with the
+/// PG backing and a sync→async bridge, so the engine's SYNC mutation API writes through to the
+/// `kms_wrapped_kek`/`kms_wrapped_dek` tables at the moment a key is minted / rotated / shredded —
+/// a key handed out by the production engine ALWAYS survives a restart.
+///
+/// **Fail direction (fail-static — storage.md §4.5):**
+///   - a FRESH mint whose write-through fails is ROLLED BACK and refused — [`KmsError::Durability`]
+///     where the signature has an error channel (`ensure_dek`/`rotate_kek`), a LOUD panic where it
+///     does not (`ensure_kek`; the infallible signature predates the durable default and is called
+///     from ~130 sites). Never a silently-non-durable key.
+///   - a crypto-shred DELETES the durable row FIRST; a delete failure refuses the shred with a LOUD
+///     panic — reporting a shred that did not reach the store would let a restart resurrect the key
+///     (§7.5, a silent GDPR erasure failure).
+///
+/// NOTE on the panics: under the default UNWINDING panic profile a panic downs the CALLING TASK
+/// (the operation is refused and the failure is loud in logs/telemetry), not necessarily the whole
+/// process — operators must treat any `KMS DURABILITY FAILURE` panic as fatal and page on it.
+/// Converting the infallible signatures to `Result` (a ~50+180 call-site ripple) is a named
+/// hardening follow-up (ledger 14, W5 residuals).
+///
+/// The bridge is the SAME `block_in_place` + `block_on` convention as the Wave-2 identity stores
+/// (`PgPrincipalBacking::block`) — it requires the MULTI-THREADED tokio runtime (the production
+/// `#[tokio::main]` default; integration tests use `flavor = "multi_thread"`).
+pub(crate) struct DurableKms {
+    /// The in-process working set (hydrated at boot; the read path).
+    pub(crate) core: KmsCore,
+    /// The durable PG backing (pool + cell scope) every mutation writes through to.
+    pub(crate) backing: DurableKmsBacking,
+    /// The runtime handle the sync engine API drives the async write-throughs on.
+    pub(crate) rt: tokio::runtime::Handle,
+}
+
+impl DurableKms {
+    /// The hydrated working set (the shared read path).
+    pub(crate) fn core(&self) -> &KmsCore {
+        &self.core
+    }
+
+    /// Drive an async write-through from the sync engine API (the `block_in_place`+`block_on`
+    /// bridge — the Wave-2 identity-store convention).
+    fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
+        tokio::task::block_in_place(|| self.rt.block_on(fut))
+    }
+
+    /// Persist one KEK's current wrapped form out of the core (upsert; idempotent).
+    async fn persist_kek_row(&self, id: &KekId) -> Result<(), KmsDurableError> {
+        let k = self.core.export_kek(id).ok_or_else(|| {
+            KmsDurableError::Db(PgError::Query(format!(
+                "no KEK to persist for tenant={} region={}",
+                id.tenant.as_str(),
+                id.region.as_str()
+            )))
+        })?;
+        self.backing.upsert_kek_row(id, &k).await?;
+        Ok(())
+    }
+
+    /// Persist one DEK's current wrapped form out of the core (upsert; idempotent).
+    async fn persist_dek_row(&self, id: &DekId) -> Result<(), KmsDurableError> {
+        let (w, dek_epoch) = self.core.export_dek(id).ok_or_else(|| {
+            KmsDurableError::Db(PgError::Query(format!(
+                "no DEK to persist for tenant={} class={}",
+                id.tenant.as_str(),
+                id.class.as_token()
+            )))
+        })?;
+        self.backing.upsert_dek_row(id, &w, dek_epoch).await?;
+        Ok(())
+    }
+
+    /// `ensure_kek` with write-through: a FRESH mint persists before the epoch is handed out. A
+    /// persist failure rolls the mint back and panics LOUDLY (fail-static hard-down — the
+    /// infallible signature has no error channel, and a non-durable KEK must never be handed out).
+    pub(crate) fn ensure_kek(&self, id: &KekId) -> u64 {
+        let (epoch, fresh) = self.core.ensure_kek_tracked(id);
+        if fresh {
+            if let Err(e) = self.block(self.persist_kek_row(id)) {
+                self.core.destroy_kek(id); // roll the non-durable mint back — never hand it out.
+                panic!(
+                    "KMS DURABILITY FAILURE (fail-static hard-down): freshly minted KEK for \
+                     tenant={} region={} could not be persisted to the durable store — the \
+                     in-memory mint was rolled back and the operation REFUSED (a KEK that does not \
+                     survive a restart is silent key loss, SI-006): {e}",
+                    id.tenant.as_str(),
+                    id.region.as_str()
+                );
+            }
+        }
+        epoch
+    }
+
+    /// `ensure_dek` with write-through: a FRESH mint persists its wrapping-KEK row (idempotent
+    /// upsert — heals a missing row so the DEK is restart-resolvable) + its own row before the ref
+    /// is handed out. A persist failure rolls the mint back and returns the loud
+    /// [`KmsError::Durability`].
+    pub(crate) fn ensure_dek(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        class: KeyClass,
+    ) -> Result<PiiKeyRef, KmsError> {
+        let (key_ref, fresh) = self.core.ensure_dek_tracked(tenant, region, class)?;
+        if fresh {
+            let kek_id = KekId::new(tenant.clone(), region.clone());
+            let dek_id = DekId::new(tenant.clone(), key_ref.class.clone());
+            let res = self.block(async {
+                // The KEK row FIRST (a persisted DEK row is unrecoverable across restart without
+                // the wrapping KEK row), then the DEK row.
+                self.persist_kek_row(&kek_id).await?;
+                self.persist_dek_row(&dek_id).await
+            });
+            if let Err(e) = res {
+                self.core.destroy_dek(&dek_id); // roll the non-durable mint back.
+                return Err(KmsError::Durability(e.to_string()));
+            }
+        }
+        Ok(key_ref)
+    }
+
+    /// `rotate_kek` with write-through: the new wrapped KEK + every re-wrapped DEK row persists in
+    /// ONE PG transaction. On a persist failure the loud [`KmsError::Durability`] is returned and
+    /// the store atomically holds the PREVIOUS wrapping generation, which is SAFE (the DEK material
+    /// never changes across a rotation, so every ciphertext still decrypts after a restart — only
+    /// the epoch bump is lost; re-run the rotation). The transaction is load-bearing: a PARTIAL
+    /// persist (new KEK row + old DEK rows) would be unrecoverable after a restart, because the old
+    /// KEK plaintext exists nowhere to unwrap the old envelopes.
+    pub(crate) fn rotate_kek(&self, id: &KekId) -> Result<u64, KmsError> {
+        let epoch = self.core.rotate_kek(id)?;
+        let res = self.block(async {
+            let kek = self.core.export_kek(id).ok_or_else(|| {
+                KmsDurableError::Db(PgError::Query(format!(
+                    "no KEK to persist after rotation for tenant={} region={}",
+                    id.tenant.as_str(),
+                    id.region.as_str()
+                )))
+            })?;
+            let deks: Vec<_> = self
+                .core
+                .export_deks()
+                .into_iter()
+                .filter(|(d, _, _)| d.tenant == id.tenant)
+                .collect();
+            self.backing.persist_rotation(id, &kek, &deks).await?;
+            Ok::<(), KmsDurableError>(())
+        });
+        res.map_err(|e| KmsError::Durability(e.to_string()))?;
+        Ok(epoch)
+    }
+
+    /// `destroy_kek` (crypto-shred L1) with the durable DELETE FIRST: the shred reaches the store
+    /// or it does not happen at all (a delete failure panics LOUDLY — hard-down — because the
+    /// infallible signature cannot report it, and a shred that does not reach the store would
+    /// resurrect the offboarded tenant's key on restart, §7.5).
+    pub(crate) fn destroy_kek(&self, id: &KekId) -> bool {
+        if let Err(e) = self.block(self.backing.delete_kek_row(id)) {
+            panic!(
+                "KMS DURABILITY FAILURE (fail-static hard-down): crypto-shred of KEK tenant={} \
+                 region={} could NOT delete the durable row — the shred was REFUSED (a shred that \
+                 does not reach the store silently resurrects the key on restart, §7.5): {e}",
+                id.tenant.as_str(),
+                id.region.as_str()
+            );
+        }
+        self.core.destroy_kek(id)
+    }
+
+    /// `destroy_dek` (crypto-shred L2 / GD-4 individual erasure) with the durable DELETE FIRST —
+    /// the same fail-closed posture as [`Self::destroy_kek`].
+    pub(crate) fn destroy_dek(&self, id: &DekId) -> bool {
+        if let Err(e) = self.block(self.backing.delete_dek_row(id)) {
+            panic!(
+                "KMS DURABILITY FAILURE (fail-static hard-down): crypto-shred of DEK tenant={} \
+                 class={} could NOT delete the durable row — the shred was REFUSED (a shred that \
+                 does not reach the store silently resurrects the key on restart, §7.5): {e}",
+                id.tenant.as_str(),
+                id.class.as_token()
+            );
+        }
+        self.core.destroy_dek(id)
+    }
+
+    /// `wrap_dek_material` with write-through: the (possibly freshly ensured) tenant KEK persists
+    /// through [`Self::ensure_kek`]'s fail-static path; the returned [`WrappedDek`] is the CALLER's
+    /// to persist (the `KeyOrigin` holders store it — it is not a `kms_wrapped_dek` row).
+    pub(crate) fn wrap_dek_material(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        material: &[u8; KEY_LEN],
+    ) -> Result<WrappedDek, KmsError> {
+        let kek_id = KekId::new(tenant.clone(), region.clone());
+        self.ensure_kek(&kek_id); // durable ensure (write-through / fail-static).
+        self.core.wrap_dek_material(tenant, region, material)
     }
 }
 

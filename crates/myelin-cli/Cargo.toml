@@ -61,5 +61,7 @@ myelin-identity = { path = "../myelin-identity" }
 # doubles (PrincipalStore/TupleStore/RevocationStore/StoreBackedCheck `::new`) which moved behind
 # `#[cfg(any(test, feature = "test-support"))]`. DEV-only — never in the production DAG.
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
-myelin-storage = { path = "../myelin-storage" }
+# MR-009b Wave 5: + `test-support` — the storage in-memory KMS double (`KmsEngine::new()`) is now
+# `#[cfg(any(test, feature = "test-support"))]`; this crate's DEV tests construct it. DEV-only.
+myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 myelin-tenancy = { path = "../myelin-tenancy" }

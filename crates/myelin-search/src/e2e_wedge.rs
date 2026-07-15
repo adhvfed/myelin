@@ -77,6 +77,13 @@
 //! [SRCH-P28]: crate::restore_verify::SearchRestoreVerifyGate
 //! [SRCH-P29]: crate::hyok_scale::BackupScaleEraseGate
 
+
+// MR-009b Wave 5: the E2E runners that construct the in-memory KMS test double are
+// `test-support`-gated, which leaves their imports + private helpers unused on the default
+// (production) build.
+// File-scoped allow ONLY for that cfg (the test/test-support build still checks imports).
+#![cfg_attr(not(any(test, feature = "test-support")), allow(unused_imports, dead_code))]
+
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -678,6 +685,10 @@ fn lineage_parity_hash(ix: &IncrementalIndexer, tenant: &TenantId, region: &Regi
 ///
 /// Returns the named green artifact (the lineage diff live-vs-cold at 0 drift + the parity hash). Drives
 /// the SAME [`SearchReindexer::reindex`] engine + the SAME restore-verify gate.
+/// **MR-009b Wave 5 — `test-support`-gated:** this in-process drill constructs the in-memory
+/// `KmsEngine` test double (the production engine is the durable `kms_durable::load_or_generate`);
+/// its consumers (the tests-dir wedge/dogfood drills) reach it via the `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
 pub fn run_e2e_3_spec_to_ship() -> E2eArtifact {
     let tenant = e2e_tenant();
     let region = e2e_region();
@@ -779,6 +790,10 @@ pub fn run_e2e_3_spec_to_ship() -> E2eArtifact {
 /// Returns the named green artifact (Search's H7 holder-coverage row + post-erase 0 recoverable incl.
 /// backups). Drives the SAME [`BackupScaleEraseGate`] over the SAME [`SearchEraseHolder`] — no second
 /// erasure path.
+/// **MR-009b Wave 5 — `test-support`-gated:** this in-process drill constructs the in-memory
+/// `KmsEngine` test double (the production engine is the durable `kms_durable::load_or_generate`);
+/// its consumers (the tests-dir wedge/dogfood drills) reach it via the `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
 pub fn run_e2e_4_dsar_fanout() -> E2eArtifact {
     let tenant = e2e_tenant();
     let region = e2e_region();
@@ -893,6 +908,10 @@ pub fn run_e2e_4_dsar_fanout() -> E2eArtifact {
 /// This COMPLETES the master M5→M6 boundary's Search rows — the master M5 exit gate cites E2E-1..E2E-4
 /// green; a red E2E-1 must NOT let M6 start. Each artifact's `is_green()` is the per-scenario earned
 /// verdict (0 leak/recoverable + the scenario's predicate).
+/// **MR-009b Wave 5 — `test-support`-gated:** this in-process drill constructs the in-memory
+/// `KmsEngine` test double (the production engine is the durable `kms_durable::load_or_generate`);
+/// its consumers (the tests-dir wedge/dogfood drills) reach it via the `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
 pub fn run_search_e2e_wedge() -> Vec<E2eArtifact> {
     vec![
         run_e2e_1_pr_pane(),

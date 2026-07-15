@@ -129,9 +129,28 @@ tokio = { workspace = true, optional = true }
 # so this dev-dep is acyclic; it is a TEST-only dep (the default build stays DB-free + harness-free).
 [dev-dependencies]
 myelin-harness = { path = "../myelin-harness" }
+# MR-009b Wave 3 follow-up (found by the Wave-5 per-crate isolation check, the 5340c47 bug class):
+# this crate's OWN tests (cdc_5_4_edge_builder / cdc_ref_p7_invalidator / ...) construct the events
+# in-memory `DedupLedger::new()` double, which is `#[cfg(any(test, feature = "test-support"))]` as
+# of Wave 3 — the workspace build masked the missing feature via unification; the isolated
+# `cargo clippy -p myelin-refs-service --all-targets` catches it. DEV-only.
+myelin-events = { path = "../myelin-events", features = ["test-support"] }
+# MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
+# `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests. DEV-only.
+myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
+# MR-009b Wave 5 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN
+# tests-dir targets (the e2e-wedge/dogfood drills call the now-gated in-process runners). The same
+# posture as the myelin-identity-service self dev-dependency (Wave 2).
+myelin-refs-service = { path = ".", features = ["test-support"] }
 
 [features]
 default = []
+# MR-009b Wave 5 — the `test-support` cargo feature (alias `memory`). Gates this crate's in-process
+# E2E-wedge/dogfood drill runners (`run_e2e_4_dsar_fanout` / `run_refs_e2e_wedge` /
+# `run_refs_over_myelins_own_work`), which construct the in-memory `KmsEngine` test double — so it
+# forwards to `myelin-storage/test-support`. DEV/TEST only.
+test-support = ["myelin-storage/test-support"]
+memory = ["test-support"]
 # REF-P12 / P-161: the R2 cache integration test (tests/integration_ref_p12_r2_cache.rs) drives the
 # REAL `myelin_storage::ValkeyCache` against the live dev-stack Valkey, so it turns on storage's
 # `integration` feature (which pulls fred + tokio + compiles `ValkeyCache`). The default

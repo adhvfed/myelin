@@ -100,6 +100,11 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
+# MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
+# `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests (the same
+# posture as the Wave-2/3 identity/events test-support dev-dependencies). DEV-only — never in the
+# production DAG (cargo tree -e no-dev shows no test-support edge).
+myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 # MR-009b Wave 2: the edge's OWN tests (the gateway/git-edge `#[cfg(test)]` modules + tests/*) build
 # the identity in-memory doubles (PrincipalStore/RevocationStore `::new`), which moved behind
 # `#[cfg(any(test, feature = "test-support"))]`. Enable `test-support` for the TEST build only — the
