@@ -368,7 +368,6 @@ impl<E: DurableExecutor> LiveMigration<E> {
         let placement =
             registry
                 .placement(tenant)
-                .cloned()
                 .ok_or_else(|| MigrationError::TenantNotPlaced {
                     tenant: tenant.clone(),
                 })?;

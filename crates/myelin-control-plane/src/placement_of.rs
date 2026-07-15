@@ -61,6 +61,10 @@
 //! in `myelin_substrate::topology::PublicSurface::misroute_count`; the `cp_d2_gate_is_not_vacuous`
 //! drill proves a non-zero value WOULD read RED. Excluding the documented equivalent mutant the score
 //! is **13/13 = 100%** of the load-bearing mutants.
+//! **W6d scope note:** the floor covers the route/reject logic + the Memory-arm audit sink the unit
+//! tests drive (unchanged by W6d). The `MisrouteAuditBackend::Pg` dispatch arms are NOT unit-mutable
+//! (live PG); their proof is `integration_mr009b_w6d_registry_durable` (a gateway-rejected misroute
+//! lands in the durable sink and survives a fresh pool) + `integration_mr024_placement_durable`.
 //!
 //! ## Floor named (deferred body → filling prompt) — VISION §3 name-your-floors
 //! - **`member_cells` is single-element / resolution always same-cell in v1.** `placement_of` returns
@@ -77,8 +81,11 @@
 //!   durable chain is the named follow-on (mirrors `myelin_substrate::topology::AuditSink`).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Mutex;
 
+use myelin_storage::placement_durable::DurableMisrouteAuditBacking;
 use myelin_tenancy::{CellId, Region, TenantId};
 
 use crate::registry::Registry;
@@ -213,29 +220,106 @@ pub struct MisrouteAuditRecord {
     pub home_cell: Option<CellId>,
 }
 
-/// The audit sink a [`CellGateway`] records a rejected misroute into (architecture §5.3 layer 4). On
-/// this floor it is a typed, in-process collector with the PII-free [`MisrouteAuditRecord`] shape; the
-/// durable tamper-evident audit log is GDPR `P-GA-19`/`P-062` (the consumer reads the same shape).
-/// Named floor (EI-01 §4): the SINK is real and recorded; the durable chain is that prompt — the
-/// security property (every misroute audited, never swallowed) is complete now. Mirrors
-/// `myelin_substrate::topology::AuditSink`.
-#[derive(Clone, Default)]
+/// The Pg arm of the audit sink (MR-009b W6d): the durable `misroute_audit` backing (SI-028,
+/// migration 0034) + the runtime handle the sync gateway API drives the async sqlx backing on.
+#[derive(Clone)]
+struct PgMisrouteAudit {
+    backing: DurableMisrouteAuditBacking,
+    rt: tokio::runtime::Handle,
+}
+
+impl PgMisrouteAudit {
+    fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
+        tokio::task::block_in_place(|| self.rt.block_on(fut))
+    }
+}
+
+/// The audit-sink backend (MR-009b W6d): the `test-support`-gated in-memory DOUBLE or the
+/// ALWAYS-COMPILED durable PG sink. The production-compiled enum presents no in-memory collection.
+#[derive(Clone)]
+enum MisrouteAuditBackend {
+    /// The in-memory test double (DB-free). Compiled ONLY under
+    /// `#[cfg(any(test, feature = "test-support"))]` — NOT the production sink.
+    #[cfg(any(test, feature = "test-support"))]
+    Memory(Arc<Mutex<Vec<MisrouteAuditRecord>>>),
+    /// The REAL durable PG sink — the audit trail survives a process restart (SI-028).
+    Pg(PgMisrouteAudit),
+}
+
+/// The audit sink a [`CellGateway`] records a rejected misroute into (architecture §5.3 layer 4).
+/// As of MR-009b W6d this is a role struct over a backend enum: the ALWAYS-COMPILED production sink
+/// is the durable `misroute_audit` table ([`MisrouteAudit::with_pg`] — the trail survives restart,
+/// SI-028 closed); the in-process collector is the `test-support`-gated test double
+/// ([`MisrouteAudit::new`]). Both carry the SAME PII-free [`MisrouteAuditRecord`] shape the GDPR
+/// audit consumer (P-GA-19/P-062) reads. A durable write fault fails static LOUD (panic) — an
+/// unrecorded misroute would be silently-lost evidence (the W6a ledger-write lesson).
+#[derive(Clone)]
 pub struct MisrouteAudit {
-    records: Arc<Mutex<Vec<MisrouteAuditRecord>>>,
+    backend: MisrouteAuditBackend,
+}
+
+impl core::fmt::Debug for MisrouteAudit {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // PII-free Debug: the backend arm only — never a record (tenant ids stay off the log).
+        let arm = match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            MisrouteAuditBackend::Memory(_) => "Memory(test-double)",
+            MisrouteAuditBackend::Pg(_) => "Pg(durable)",
+        };
+        f.debug_struct("MisrouteAudit").field("backend", &arm).finish()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Default for MisrouteAudit {
+    fn default() -> MisrouteAudit {
+        MisrouteAudit::new()
+    }
 }
 
 impl MisrouteAudit {
-    /// A fresh, empty sink.
+    /// A fresh, empty IN-MEMORY sink — **TEST DOUBLE** (MR-009b W6d: compiled only under
+    /// `#[cfg(any(test, feature = "test-support"))]`). The production constructor is
+    /// [`MisrouteAudit::with_pg`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new() -> MisrouteAudit {
-        MisrouteAudit::default()
+        MisrouteAudit {
+            backend: MisrouteAuditBackend::Memory(Arc::new(Mutex::new(Vec::new()))),
+        }
     }
 
-    /// Record a rejected misroute (loud, never swallowed — the attempt IS evidence).
+    /// **The PRODUCTION audit sink — bound to the REAL durable `misroute_audit` backing (MR-009b
+    /// W6d / SI-028).** Every recorded misroute survives a process restart. The caller must have
+    /// applied [`myelin_storage::placement_durable_migrations`]. `rt` is the tokio runtime handle
+    /// the sync gateway drives the async backing on.
+    pub fn with_pg(backing: DurableMisrouteAuditBacking, rt: tokio::runtime::Handle) -> MisrouteAudit {
+        MisrouteAudit {
+            backend: MisrouteAuditBackend::Pg(PgMisrouteAudit { backing, rt }),
+        }
+    }
+
+    /// Record a rejected misroute (loud, never swallowed — the attempt IS evidence). On the Pg arm
+    /// a durable write fault fails static LOUD (panic): an audit sink that silently drops a record
+    /// is evidence loss, the exact resurrection-path shape the W6a verifier closed.
     fn record(&self, rec: MisrouteAuditRecord) {
-        self.records
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(rec);
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            MisrouteAuditBackend::Memory(records) => {
+                records.lock().unwrap_or_else(|e| e.into_inner()).push(rec);
+            }
+            MisrouteAuditBackend::Pg(pg) => pg
+                .block(pg.backing.record(
+                    rec.tenant_id.as_str(),
+                    rec.received_by_cell.as_str(),
+                    rec.home_cell.as_ref().map(|c| c.as_str()),
+                ))
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "misroute audit: durable record FAILED (fail-static loud — an unrecorded \
+                         misroute is silently-lost layer-4 evidence; the write did NOT land): {e}"
+                    )
+                }),
+        }
     }
 
     /// **Record a rejected misroute from the repo-grain path** ([`crate::placement_of_repo`]) — the
@@ -245,17 +329,43 @@ impl MisrouteAudit {
         self.record(rec);
     }
 
-    /// Every audited misroute so far (so a drill/test can assert the rejection was audited).
+    /// Every audited misroute so far (so a drill/test can assert the rejection was audited). On the
+    /// Pg arm this reads the durable trail (which is shared, append-ordered infrastructure — a test
+    /// filters by its own opaque ids).
     pub fn records(&self) -> Vec<MisrouteAuditRecord> {
-        self.records
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            MisrouteAuditBackend::Memory(records) => {
+                records.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            }
+            MisrouteAuditBackend::Pg(pg) => pg
+                .block(pg.backing.records())
+                .unwrap_or_else(|e| {
+                    panic!("misroute audit: durable read FAILED (fail-static loud): {e}")
+                })
+                .iter()
+                .map(|r| MisrouteAuditRecord {
+                    tenant_id: TenantId::from_token(&r.tenant_id),
+                    received_by_cell: CellId::from_token(&r.received_by_cell),
+                    home_cell: r.home_cell.as_deref().map(CellId::from_token),
+                })
+                .collect(),
+        }
     }
 
     /// How many misroutes have been audited.
     pub fn count(&self) -> usize {
-        self.records.lock().unwrap_or_else(|e| e.into_inner()).len()
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            MisrouteAuditBackend::Memory(records) => {
+                records.lock().unwrap_or_else(|e| e.into_inner()).len()
+            }
+            MisrouteAuditBackend::Pg(pg) => pg
+                .block(pg.backing.count())
+                .unwrap_or_else(|e| {
+                    panic!("misroute audit: durable count FAILED (fail-static loud): {e}")
+                }) as usize,
+        }
     }
 }
 
@@ -289,7 +399,11 @@ pub struct CellGateway {
 }
 
 impl CellGateway {
-    /// Build a cell gateway for `cell_id` over a fresh audit sink.
+    /// Build a cell gateway for `cell_id` over a fresh IN-MEMORY audit sink — **TEST DOUBLE**
+    /// (MR-009b W6d: compiled only under `#[cfg(any(test, feature = "test-support"))]`, because it
+    /// constructs the in-memory [`MisrouteAudit::new`] double). Production wires
+    /// [`CellGateway::with_audit`] over the durable [`MisrouteAudit::with_pg`] sink.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(cell_id: CellId) -> CellGateway {
         CellGateway::with_audit(cell_id, MisrouteAudit::new())
     }

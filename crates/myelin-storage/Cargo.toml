@@ -146,7 +146,10 @@ toml.workspace = true
 # DAG edge); a dev-dependency back is the CDC consumer reaching DOWN to its provider's test — a
 # dev-only edge Cargo permits (it never enters the storage crate's production/runtime DAG, so no
 # build cycle). This is the SAME posture as the myelin-lints / myelin-harness dev-deps above.
-myelin-control-plane = { path = "../myelin-control-plane" }
+# MR-009b W6d: `test-support` turned on DEV-only — the cdc_10_5_mirror_crossing_flag CDC builds the
+# control-plane in-memory `Registry::new()` double (now `test-support`-gated). Never in the
+# production DAG (cargo tree -e no-dev shows no test-support edge).
+myelin-control-plane = { path = "../myelin-control-plane", features = ["test-support"] }
 # myelin-gdpr-service is a DEV-dependency ONLY: the E2E-4 holder-coverage CDC pair
 # (tests/cdc_e2e4_holder_coverage.rs, P-ST-35) pins that storage's H1–H18 `HolderClass::ALL`
 # catalogue (the PROVIDER of the storage-side crypto-shred reach) covers the orchestrator's

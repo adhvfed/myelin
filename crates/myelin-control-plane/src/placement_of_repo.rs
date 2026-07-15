@@ -129,9 +129,9 @@ pub struct RepoPlacement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RepoPlacementRow {
     /// The cell the repo lives on (a stored fact — relocatable within-region, never node-hashed).
-    cell_id: CellId,
+    pub(crate) cell_id: CellId,
     /// The repo-storage group within the cell.
-    group: StorageGroup,
+    pub(crate) group: StorageGroup,
 }
 
 /// **The reason a repo placement / relocation is rejected.** Either the repo's tenant is not placed
@@ -249,8 +249,9 @@ impl Registry {
         // register this is the tenant's own home cell, which the tenant placement invariant already
         // verified; we re-assert it so register + relocate share one residency check.)
         self.assert_cell_in_region(&home_cell, &region, repo)?;
-        self.repo_placements.insert(
-            repo.0.clone(),
+        self.upsert_repo_placement_row(
+            &repo.0,
+            &tenant,
             RepoPlacementRow {
                 cell_id: home_cell,
                 group,
@@ -291,8 +292,9 @@ impl Registry {
         // target is refused — a repo cannot leave its region (§5.2). This is a STORED-FACT update; no
         // node hash is consulted or recomputed.
         self.assert_cell_in_region(&target_cell, &region, repo)?;
-        self.repo_placements.insert(
-            repo.0.clone(),
+        self.upsert_repo_placement_row(
+            &repo.0,
+            &tenant,
             RepoPlacementRow {
                 cell_id: target_cell,
                 group: target_group,
@@ -313,7 +315,7 @@ impl Registry {
     /// misroute-reject ([`CellGateway::route_repo`]) structural.
     pub fn placement_of_repo(&self, repo: &ArtifactRef) -> Option<RepoPlacement> {
         let (tenant, _id) = parse_repo_ref(repo)?;
-        let row = self.repo_placements.get(&repo.0)?;
+        let row = self.repo_placement_row(&repo.0)?;
         // The residency pin: the region + status come from the TENANT placement, never stored at repo
         // grain — so a repo NEVER reports a region different from its tenant's.
         let tenant_placement = self.placement(&tenant)?;

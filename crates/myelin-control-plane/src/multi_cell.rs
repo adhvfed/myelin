@@ -378,7 +378,7 @@ impl Registry {
         // Read the current placement (an unknown tenant is a fail-closed UnknownCell — there is no
         // placement to extend). Clone so the invariant is checked against the PROPOSED set before any
         // mutation (the trigger admits-or-rejects the whole proposed row, never a partial write).
-        let Some(current) = self.placement(tenant_id).cloned() else {
+        let Some(current) = self.placement(tenant_id) else {
             return Err(PlacementError::UnknownCell {
                 tenant: tenant_id.clone(),
                 cell: new_member,
@@ -412,7 +412,7 @@ impl Registry {
         from_cell: &CellId,
         to_cell: CellId,
     ) -> Result<RebalanceReceipt, PlacementError> {
-        let Some(current) = self.placement(tenant_id).cloned() else {
+        let Some(current) = self.placement(tenant_id) else {
             return Err(PlacementError::UnknownCell {
                 tenant: tenant_id.clone(),
                 cell: to_cell,

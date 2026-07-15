@@ -355,8 +355,8 @@ impl Registry {
         &self,
         region: &Region,
         requested_tier: IsolationKind,
-    ) -> Vec<&crate::schema::Cell> {
-        let mut eligible: Vec<&crate::schema::Cell> = self
+    ) -> Vec<crate::schema::Cell> {
+        let mut eligible: Vec<crate::schema::Cell> = self
             .cells_iter()
             // 1. region-first.
             .filter(|c| &c.region == region)
@@ -564,10 +564,10 @@ mod tests {
         );
 
         // The full deterministic order excludes the cross-region + wrong-tier cells entirely.
-        let order: Vec<&str> = reg
+        let order: Vec<String> = reg
             .cells_in_assignment_order(&Region::new("eu-west"), IsolationKind::Pool)
             .iter()
-            .map(|c| c.cell_id.as_str())
+            .map(|c| c.cell_id.as_str().to_string())
             .collect();
         assert_eq!(order, vec!["cell-w-lo", "cell-w-tie", "cell-w-hi"]);
     }

@@ -54,11 +54,12 @@
 //! blast-radius legs are re-confirmed in the dogfood band (P-CP-23, [`crate`] M6); here CP-D3 (the
 //! residency write-boundary) is proven green on the degenerate cell.
 
+use myelin_storage::placement_durable::{DurableMisrouteAuditBacking, DurablePlacementBacking};
 use myelin_tenancy::{CellId, Region, TenantId};
 
 use crate::four_layer::{CrossRegionPathError, FourLayerEnforcement, ResidencyWriteRejected};
 use crate::place::{CounterMinter, PlaceError, PlacementAnswer, PlacementService};
-use crate::placement_of::{CellGateway, GatewayReject, PlacementOf};
+use crate::placement_of::{CellGateway, GatewayReject, MisrouteAudit, PlacementOf};
 use crate::registry::Registry;
 use crate::residency_verify::{
     residency_verify, ResidencyMismatch, ResidencySigningKey, ResidencyStoreClass,
@@ -87,11 +88,17 @@ pub struct DegenerateControlPlane {
     /// The install's region (the customer's region — the same region every store pins to). Immutable
     /// (region immutability, §5.3 layer 1 — there is no setter).
     region: Region,
+    /// The install's ONE misroute-audit sink (MR-009b W6d): [`Self::gateway`] hands every gateway
+    /// this shared sink, so the layer-4 evidence lands in ONE trail (durable on the Pg arm) instead
+    /// of a fresh per-call collector.
+    audit: MisrouteAudit,
 }
 
 impl DegenerateControlPlane {
     /// **Stand up a degenerate one-cell control plane** for a self-hosted install in `region`, with
-    /// the one cell `cell_id`. The cell is `Active` (a self-host install's single cell is the one it
+    /// the one cell `cell_id` — over the IN-MEMORY registry: **TEST DOUBLE** (MR-009b W6d: compiled
+    /// only under `#[cfg(any(test, feature = "test-support"))]`; the production boot is
+    /// [`Self::with_pg`]). The cell is `Active` (a self-host install's single cell is the one it
     /// serves from) and at the Pool isolation tier (the v1 self-host tier — Bridge/Dedicated are
     /// managed-fleet on-demand, N/A for self-host). This is the SAME [`Registry::insert_cell`] a fleet
     /// uses — there is no degenerate-only insert path.
@@ -99,19 +106,94 @@ impl DegenerateControlPlane {
     /// The cell `endpoint` is the install's own host (`cell.<region>.<cell_id>.local` by default — a
     /// PII-free routing host, never personal data); a self-host operator overrides it via
     /// [`Self::with_endpoint`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn bootstrap(cell_id: CellId, region: Region) -> DegenerateControlPlane {
         let endpoint = format!("cell.{}.{}.local", region.as_str(), cell_id.as_str());
         Self::with_endpoint(cell_id, region, endpoint)
     }
 
     /// As [`Self::bootstrap`], but with an explicit self-host `endpoint` (the install's own routing
-    /// host). PII-free routing host — never personal data.
+    /// host). PII-free routing host — never personal data. **TEST DOUBLE** (gated as
+    /// [`Self::bootstrap`]; the production boot is [`Self::with_pg`]).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_endpoint(
         cell_id: CellId,
         region: Region,
         endpoint: String,
     ) -> DegenerateControlPlane {
-        let mut registry = Registry::new();
+        Self::over(
+            Registry::new(),
+            MisrouteAudit::new(),
+            cell_id,
+            region,
+            endpoint,
+        )
+    }
+
+    /// **The PRODUCTION self-host boot (MR-009b W6d): the degenerate control plane over the REAL
+    /// durable registry + audit sink.** The one-row `cell` inventory, every placed tenant, the repo
+    /// placements, the provisioning log, the local-tenant directory AND the misroute-audit trail
+    /// all live in Postgres (migrations 0030–0039 — the caller must have applied
+    /// [`myelin_storage::placement_durable_migrations`], the same fail-loud boot posture as the
+    /// W3b.4 durable-outbox composition roots) and survive a kill-9 restart: re-booting `with_pg`
+    /// over the same database re-registers the one cell (an idempotent upsert — `region` is
+    /// immutable on the conflict path) and every previously placed tenant still routes.
+    ///
+    /// Fails LOUD (panic — exit non-zero at a boot root), never a silent in-memory fallback: a
+    /// durable fault in the one-cell registration, or a boot that somehow yields an EMPTY registry
+    /// (the resolver-projection non-empty assertion, the W6c-cp residual applied to this boot
+    /// root), refuses to construct the control plane.
+    pub fn with_pg(
+        cell_id: CellId,
+        region: Region,
+        endpoint: String,
+        placement: DurablePlacementBacking,
+        audit: DurableMisrouteAuditBacking,
+        rt: tokio::runtime::Handle,
+    ) -> DegenerateControlPlane {
+        let cp = Self::over(
+            Registry::with_pg(placement, rt.clone()),
+            MisrouteAudit::with_pg(audit, rt),
+            cell_id,
+            region,
+            endpoint,
+        );
+        // The boot-root non-empty assertion (the W6c-cp residual, applied here): a self-host boot
+        // that cannot see its own cell row has NO routing authority — refuse loudly, never serve
+        // from a silently-empty registry.
+        assert!(
+            cp.registry.cell_count() >= 1,
+            "self-host boot: the durable registry is EMPTY after registering the install's own \
+             cell — refusing to boot a control plane with no routing authority (fail loud)"
+        );
+        // Region-claim read-back (W6d verifier finding, probe-proven): `insert_cell` is idempotent
+        // with region IMMUTABLE on conflict — a re-boot claiming a DIFFERENT region than the
+        // durable row silently kept the durable region while `self.region` carried the new claim
+        // (and the endpoint was overwritten under the wrong-region config), so the operator
+        // misconfig only surfaced at the first `place()`. Refuse it AT BOOT instead: the claimed
+        // region must equal the durable row's region.
+        let durable = cp.cell();
+        assert!(
+            durable.region == cp.region,
+            "self-host boot: this install claims region '{}' but the durable cell row for '{}' is \
+             pinned to region '{}' (region is immutable) — refusing to boot on a mismatched region \
+             claim; fix the boot config (fail loud, never a silent divergence)",
+            cp.region.0,
+            cp.cell_id.0,
+            durable.region.0
+        );
+        cp
+    }
+
+    /// The shared assembly: register the one cell through the SAME [`Registry::insert_cell`] a
+    /// fleet uses (no self-host fork; idempotent on a re-boot — `region` is immutable).
+    fn over(
+        mut registry: Registry,
+        audit: MisrouteAudit,
+        cell_id: CellId,
+        region: Region,
+        endpoint: String,
+    ) -> DegenerateControlPlane {
         // The ONE row of the degenerate registry — the install's own cell, Active, Pool tier, pinned
         // to the install's region. Inserted via the SAME shared `insert_cell` (no self-host fork).
         registry.insert_cell(Cell {
@@ -132,6 +214,7 @@ impl DegenerateControlPlane {
             registry,
             cell_id,
             region,
+            audit,
         }
     }
 
@@ -147,8 +230,9 @@ impl DegenerateControlPlane {
 
     /// **The one cell row (architecture §10 — the registry is a one-row local table).** Borrowed from
     /// the SHARED [`Registry`] — the same `cell` inventory type a fleet holds, here with exactly one
-    /// row. (Returns the shared [`Cell`], not a degenerate-only type — the parity proof.)
-    pub fn cell(&self) -> &Cell {
+    /// row. (Returns the shared [`Cell`], not a degenerate-only type — the parity proof. Owned as
+    /// of W6d: on the Pg arm the row is read off the durable table.)
+    pub fn cell(&self) -> Cell {
         self.registry
             .cell(&self.cell_id)
             .expect("the degenerate control plane always has its one cell")
@@ -215,9 +299,10 @@ impl DegenerateControlPlane {
     /// for the degenerate cell ACCEPTS every tenant it homes (which, on a one-cell install, is every
     /// placed tenant) and would REJECT a misroute exactly as a fleet gateway does (there is no misroute
     /// on a one-cell install, but the SAME reject logic is present — N/A by configuration, not by a
-    /// forked code path).
+    /// forked code path). The gateway shares the install's ONE audit sink (durable on the Pg arm —
+    /// MR-009b W6d), so every rejected misroute lands in one surviving trail.
     pub fn gateway(&self) -> CellGateway {
-        CellGateway::new(self.cell_id.clone())
+        CellGateway::with_audit(self.cell_id.clone(), self.audit.clone())
     }
 
     /// **`route(tenant_id)` through the one cell's gateway — the SAME [`CellGateway::route`].** On the

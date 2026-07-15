@@ -249,11 +249,11 @@ pub mod placement_of;
 pub mod placement_of_repo;
 pub mod provision;
 pub mod registry;
-// MR-024 (SI-011/SI-028): the `Pg | Memory` backend enum that binds the placement registry to real
-// Postgres (durable cell/tenant_placement tables + the HARD-invariant DB TRIGGER + the durable
-// misroute audit sink in myelin_storage::placement_durable). Compiled ONLY under `integration` (the
-// in-memory Registry is the DB-free default); production boot selecting the Pg arm is MR-009.
-#[cfg(feature = "integration")]
+// MR-024 (SI-011/SI-028) → MR-009b W6d: the `Pg | Memory` backend enum that binds the placement
+// registry to real Postgres (durable cell/tenant_placement tables + the HARD-invariant DB TRIGGER +
+// the durable misroute audit sink in myelin_storage::placement_durable). Compiled UNCONDITIONALLY
+// as of W6d (the canonical `Registry` itself is now durable-by-default; this MR-024 binding's
+// `Memory(Registry)` arm is the `test-support`-gated double).
 pub mod registry_durable;
 pub mod residency_verify;
 pub mod runner_claim_pin;
@@ -651,7 +651,7 @@ mod tests {
         let row = registry
             .placement(&tenant)
             .expect("the placement is stored");
-        let answer = PlacementOfAnswer::from_row(row);
+        let answer = PlacementOfAnswer::from_row(&row);
         assert_eq!(answer.region.as_str(), "eu-west");
         assert_eq!(answer.home_cell.as_str(), "cell-w-1");
         assert_eq!(answer.member_cells.len(), 1); // v1 single-element floor.

@@ -144,6 +144,103 @@ CREATE OR REPLACE TRIGGER trg_placement_invariant \
     BEFORE INSERT OR UPDATE ON tenant_placement \
     FOR EACH ROW EXECUTE FUNCTION myelin_placement_invariant();";
 
+/// **The `repo_placement` table (architecture §5.2, C-1; MR-009b W6d).** The repo-grain placement
+/// facts: the repo's opaque `ArtifactRef` string (PK), the tenant extracted from that ref (the
+/// residency anchor the invariant trigger joins on), the cell the repo lives on (a STORED fact —
+/// relocatable within-region, never a node hash) and its storage group. **Deliberately NO `region`
+/// column:** a repo's region derives from its TENANT's `tenant_placement.region` at read time
+/// (`Registry::placement_of_repo`), so there is no repo-grain region field to drift — the residency
+/// pin is structural. The cross-region guard is the [`REPO_PLACEMENT_INVARIANT_FN`] trigger below
+/// (the DB-level mirror of the app-level `assert_cell_in_region`). PII-free; forward-only.
+///
+/// **The `tenant_id` FK is load-bearing for the residency pin (W6d verifier finding,
+/// probe-proven):** repo region DERIVES from `tenant_placement` at read, and the
+/// region-immutability trigger guards only UPDATE — a raw-SQL DELETE + re-INSERT of the tenant's
+/// placement with a NEW region silently flipped every placed repo's derived region (while the
+/// stored cell physically stayed in the old region). `ON DELETE RESTRICT` refuses the delete
+/// while repos are placed, closing the two-statement re-place drift vector even for direct-SQL
+/// admin access.
+pub const REPO_PLACEMENT_MIGRATION: &str = "\
+CREATE TABLE IF NOT EXISTS repo_placement (
+    repo_ref      text PRIMARY KEY,
+    tenant_id     text NOT NULL
+                  REFERENCES tenant_placement(tenant_id) ON DELETE RESTRICT,
+    cell_id       text NOT NULL,
+    storage_group text NOT NULL
+);";
+
+/// The `cell_provisioning` orchestration log (architecture §5.1; MR-009b W6d). APPEND-ONLY: an
+/// auto-increment `id` keeps registration order; the backing exposes ONLY an INSERT verb (no
+/// UPDATE/DELETE method exists on [`DurablePlacementBacking`]), mirroring the in-memory log's
+/// `push`-only surface. PII-free — an opaque cell id + a step label + an outcome. Forward-only.
+pub const CELL_PROVISIONING_MIGRATION: &str = "\
+CREATE TABLE IF NOT EXISTS cell_provisioning (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    cell_id     text NOT NULL,
+    step        text NOT NULL,
+    outcome     text NOT NULL,
+    recorded_at timestamptz NOT NULL DEFAULT now()
+);";
+
+/// The per-cell `local_tenant` directory (architecture §5.1 / Phase-3 §4.2; MR-009b W6d). The
+/// cell-local mirror of the global placement record — which tenants a cell homes. PII-free: opaque
+/// ids + a tier + a flag. Keyed `(cell_id, tenant_id)`; forward-only.
+pub const LOCAL_TENANT_MIGRATION: &str = "\
+CREATE TABLE IF NOT EXISTS local_tenant (
+    cell_id        text NOT NULL,
+    tenant_id      text NOT NULL,
+    isolation_tier text NOT NULL,
+    active         boolean NOT NULL,
+    PRIMARY KEY (cell_id, tenant_id)
+);";
+
+/// **The repo-grain residency pin, as a REAL Postgres trigger function (architecture §5.2; MR-009b
+/// W6d).** Mirrors — at the DATABASE — the app-level `Registry::assert_cell_in_region` check, at the
+/// SAME bar as the tenant_placement invariant trigger ([`PLACEMENT_INVARIANT_FN`]):
+///   1. **Unplaced tenant → REJECT (fail-closed).** A repo cannot be homed onto a region of record
+///      that does not exist (`tenant_placement` has no row for `NEW.tenant_id`).
+///   2. **Unknown cell → REJECT (fail-closed).** The cell's region pin cannot be verified.
+///   3. **Cross-region cell → REJECT (the residency pin).** The repo's stored `cell_id` must be in
+///      its TENANT's region — a repo never leaves its tenant's region, even via a direct SQL write
+///      that bypasses all Rust app logic.
+///
+/// Each rejection RAISEs with SQLSTATE `check_violation` (23514) + a loud, named reason. Because the
+/// table stores NO region column, there is additionally nothing to drift: the region is derived from
+/// the tenant placement at read time, and THIS trigger pins the stored cell to that derivation.
+/// `CREATE OR REPLACE FUNCTION` is idempotent + forward-only-legal.
+pub const REPO_PLACEMENT_INVARIANT_FN: &str = "\
+CREATE OR REPLACE FUNCTION myelin_repo_placement_invariant() RETURNS trigger AS $myelin$
+DECLARE
+    tenant_region text;
+    cell_region   text;
+BEGIN
+    SELECT region INTO tenant_region FROM tenant_placement WHERE tenant_id = NEW.tenant_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'repo placement REJECTED: repo % — its tenant % is not placed; a repo cannot be homed onto a region of record that does not exist (fail-closed, §5.2)', NEW.repo_ref, NEW.tenant_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    SELECT region INTO cell_region FROM cell WHERE cell_id = NEW.cell_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'repo placement REJECTED: repo % — cell % is not registered; a placement whose region pin cannot be verified is refused (fail-closed, §5.3)', NEW.repo_ref, NEW.cell_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF cell_region <> tenant_region THEN
+        RAISE EXCEPTION 'repo placement REJECTED: repo % — cell % is in region % but the repo tenant % is pinned to region % (the residency pin holds at repo grain, §5.2; a repo never leaves its tenant region)', NEW.repo_ref, NEW.cell_id, cell_region, NEW.tenant_id, tenant_region
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$myelin$ LANGUAGE plpgsql;";
+
+/// **The repo-placement residency trigger** (BEFORE INSERT OR UPDATE on `repo_placement`) — fires
+/// [`REPO_PLACEMENT_INVARIANT_FN`] for every row write, so a cross-region / unknown-cell /
+/// unplaced-tenant repo placement is rejected by the DATABASE before the row lands (even on a direct
+/// SQL write bypassing all app logic). `CREATE OR REPLACE TRIGGER` (PG14+) is idempotent.
+pub const REPO_PLACEMENT_INVARIANT_TRIGGER: &str = "\
+CREATE OR REPLACE TRIGGER trg_repo_placement_invariant \
+    BEFORE INSERT OR UPDATE ON repo_placement \
+    FOR EACH ROW EXECUTE FUNCTION myelin_repo_placement_invariant();";
+
 /// The `misroute_audit` sink (architecture §5.3 layer 4 — SI-028). PII-free: opaque tenant id, the
 /// cell that received+rejected the request, and the home cell (NULL for an unknown tenant). An
 /// auto-increment `id` keeps the append order; `recorded_at` is a server timestamp. Forward-only.
@@ -171,6 +268,19 @@ pub fn placement_durable_migrations() -> crate::migration::Migrations {
         Migration::plain("0032_placement_invariant_fn", PLACEMENT_INVARIANT_FN),
         Migration::plain("0033_placement_invariant_trigger", PLACEMENT_INVARIANT_TRIGGER),
         Migration::plain("0034_misroute_audit", MISROUTE_AUDIT_MIGRATION),
+        // MR-009b W6d — the WHOLE-SURFACE placement extension (0035–0039 is the reserved
+        // placement-extension range): the repo_placement stored facts (NOT rebuildable — the
+        // load-bearing gap), the append-only cell_provisioning log, the per-cell local_tenant
+        // directory, and the repo-grain residency-pin trigger (the DB-level mirror of the
+        // app-level `assert_cell_in_region`, at the same bar as the tenant_placement trigger).
+        Migration::plain("0035_repo_placement", REPO_PLACEMENT_MIGRATION),
+        Migration::plain("0036_cell_provisioning", CELL_PROVISIONING_MIGRATION),
+        Migration::plain("0037_local_tenant", LOCAL_TENANT_MIGRATION),
+        Migration::plain("0038_repo_placement_invariant_fn", REPO_PLACEMENT_INVARIANT_FN),
+        Migration::plain(
+            "0039_repo_placement_invariant_trigger",
+            REPO_PLACEMENT_INVARIANT_TRIGGER,
+        ),
     ])
 }
 
@@ -222,6 +332,45 @@ pub struct DurablePlacementRow {
     pub status: String,
     /// The multi-cell fan-out set (single-element in v1).
     pub member_cells: Vec<String>,
+}
+
+/// A durable `repo_placement` row (opaque columns; MR-009b W6d). NO region column — the repo's
+/// region derives from its tenant's `tenant_placement.region` at read time (the residency pin is
+/// structural; the trigger pins the stored cell to that derivation).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableRepoPlacementRow {
+    /// The repo's opaque `ArtifactRef` string (PK).
+    pub repo_ref: String,
+    /// The repo's tenant (extracted from the ref — the residency anchor the trigger joins on).
+    pub tenant_id: String,
+    /// The cell the repo lives on (a stored, relocatable fact — never a node hash).
+    pub cell_id: String,
+    /// The repo-storage group within the cell.
+    pub storage_group: String,
+}
+
+/// A durable `cell_provisioning` log entry (opaque columns; append-only — MR-009b W6d).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableCellProvisioningRow {
+    /// The cell being provisioned.
+    pub cell_id: String,
+    /// The provisioning step label.
+    pub step: String,
+    /// The step outcome (opaque text — the control-plane owns the enum).
+    pub outcome: String,
+}
+
+/// A durable per-cell `local_tenant` directory entry (opaque columns; MR-009b W6d).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableLocalTenantRow {
+    /// The cell whose directory this entry belongs to.
+    pub cell_id: String,
+    /// The opaque tenant id this cell homes.
+    pub tenant_id: String,
+    /// The served isolation tier (opaque text).
+    pub isolation_tier: String,
+    /// Whether the tenant is active in this cell.
+    pub active: bool,
 }
 
 /// One durable misroute audit record (PII-free — opaque ids only).
@@ -453,6 +602,240 @@ impl DurablePlacementBacking {
             .fetch_one(&self.pool)
             .await
             .map_err(|e| PgError::Query(e.to_string()))
+    }
+
+    /// Every `tenant_placement` row, in stable tenant-id order (the provisioning gate scans this to
+    /// assert the CP-D6 zero — 0 tenants on an unverified cell). MR-009b W6d.
+    pub async fn all_placements(&self) -> Result<Vec<DurablePlacementRow>, PgError> {
+        let rows = sqlx::query(
+            "SELECT tenant_id, region, home_cell, isolation_tier, slug, status, member_cells \
+             FROM tenant_placement ORDER BY tenant_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(rows.iter().map(placement_from_row).collect())
+    }
+
+    /// Read a `tenant_placement` row by its non-personal routing slug (the `discover(slug)` path),
+    /// or `None`. Deterministic on duplicates (lowest tenant id — the live schema treats slugs as
+    /// unique per registry). MR-009b W6d.
+    pub async fn get_placement_by_slug(
+        &self,
+        slug: &str,
+    ) -> Result<Option<DurablePlacementRow>, PgError> {
+        let row = sqlx::query(
+            "SELECT tenant_id, region, home_cell, isolation_tier, slug, status, member_cells \
+             FROM tenant_placement WHERE slug = $1 ORDER BY tenant_id LIMIT 1",
+        )
+        .bind(slug)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(row.as_ref().map(placement_from_row))
+    }
+
+    /// Flip a cell's lifecycle `status` (the ONLY mutable-lifecycle write; `region` is untouched —
+    /// immutable, §5.3 layer 1). Returns `true` iff the cell exists and was updated. MR-009b W6d.
+    pub async fn set_cell_status(&self, cell_id: &str, status: &str) -> Result<bool, PgError> {
+        let res = sqlx::query("UPDATE cell SET status = $2 WHERE cell_id = $1")
+            .bind(cell_id)
+            .bind(status)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Set a placement's lifecycle `status` (e.g. `Active → Offboarding`). `region`/`tenant_id` are
+    /// NOT reachable through this (the invariant trigger additionally rejects any region change).
+    /// Returns `true` iff the placement exists and was updated. MR-009b W6d.
+    pub async fn set_placement_status(
+        &self,
+        tenant_id: &str,
+        status: &str,
+    ) -> Result<bool, PgError> {
+        let res = sqlx::query("UPDATE tenant_placement SET status = $2 WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .bind(status)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    // ── the repo_placement stored facts (MR-009b W6d — the load-bearing, NOT-rebuildable gap) ──
+
+    /// Upsert a repo's stored placement fact `{tenant, cell, group}` keyed by its opaque ref. The
+    /// repo-grain residency pin is enforced by the DB TRIGGER ([`REPO_PLACEMENT_INVARIANT_FN`]): a
+    /// cross-region / unknown cell / unplaced tenant is REJECTED
+    /// ([`PlacementWriteError::InvariantRejected`]) and nothing lands. NO region is stored — it
+    /// derives from the tenant placement at read time (the pin cannot drift).
+    pub async fn upsert_repo_placement(
+        &self,
+        r: &DurableRepoPlacementRow,
+    ) -> Result<(), PlacementWriteError> {
+        let res = sqlx::query(
+            "INSERT INTO repo_placement (repo_ref, tenant_id, cell_id, storage_group) \
+             VALUES ($1,$2,$3,$4) \
+             ON CONFLICT (repo_ref) DO UPDATE SET \
+               tenant_id = EXCLUDED.tenant_id, cell_id = EXCLUDED.cell_id, \
+               storage_group = EXCLUDED.storage_group",
+        )
+        .bind(&r.repo_ref)
+        .bind(&r.tenant_id)
+        .bind(&r.cell_id)
+        .bind(&r.storage_group)
+        .execute(&self.pool)
+        .await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let is_invariant = e
+                    .as_database_error()
+                    .and_then(|d| d.code())
+                    .map(|c| c == "23514")
+                    .unwrap_or(false);
+                if is_invariant {
+                    Err(PlacementWriteError::InvariantRejected(e.to_string()))
+                } else {
+                    Err(PlacementWriteError::Db(e.to_string()))
+                }
+            }
+        }
+    }
+
+    /// Read a repo's stored placement fact by its opaque ref, or `None` (an unregistered repo).
+    pub async fn get_repo_placement(
+        &self,
+        repo_ref: &str,
+    ) -> Result<Option<DurableRepoPlacementRow>, PgError> {
+        let row = sqlx::query(
+            "SELECT repo_ref, tenant_id, cell_id, storage_group \
+             FROM repo_placement WHERE repo_ref = $1",
+        )
+        .bind(repo_ref)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(row.map(|r| DurableRepoPlacementRow {
+            repo_ref: r.get("repo_ref"),
+            tenant_id: r.get("tenant_id"),
+            cell_id: r.get("cell_id"),
+            storage_group: r.get("storage_group"),
+        }))
+    }
+
+    // ── the cell_provisioning orchestration log (MR-009b W6d — append-only) ──
+
+    /// Append a `cell_provisioning` orchestration-log entry. APPEND-ONLY: this is the only write
+    /// verb over the table (no UPDATE/DELETE method exists — the in-memory log's `push`-only
+    /// surface, mirrored).
+    pub async fn log_provisioning(&self, e: &DurableCellProvisioningRow) -> Result<(), PgError> {
+        sqlx::query("INSERT INTO cell_provisioning (cell_id, step, outcome) VALUES ($1,$2,$3)")
+            .bind(&e.cell_id)
+            .bind(&e.step)
+            .bind(&e.outcome)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    /// The full provisioning log, in append (id) order.
+    pub async fn provisioning_log(&self) -> Result<Vec<DurableCellProvisioningRow>, PgError> {
+        let rows = sqlx::query("SELECT cell_id, step, outcome FROM cell_provisioning ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(rows
+            .iter()
+            .map(|r| DurableCellProvisioningRow {
+                cell_id: r.get("cell_id"),
+                step: r.get("step"),
+                outcome: r.get("outcome"),
+            })
+            .collect())
+    }
+
+    // ── the per-cell local_tenant directory (MR-009b W6d) ──
+
+    /// Upsert a `local_tenant` directory entry in a cell's directory. Returns the PRIOR entry if
+    /// any (read-then-upsert — the same return contract as the in-memory directory).
+    pub async fn upsert_local_tenant(
+        &self,
+        e: &DurableLocalTenantRow,
+    ) -> Result<Option<DurableLocalTenantRow>, PgError> {
+        let prior = self.get_local_tenant(&e.cell_id, &e.tenant_id).await?;
+        sqlx::query(
+            "INSERT INTO local_tenant (cell_id, tenant_id, isolation_tier, active) \
+             VALUES ($1,$2,$3,$4) \
+             ON CONFLICT (cell_id, tenant_id) DO UPDATE SET \
+               isolation_tier = EXCLUDED.isolation_tier, active = EXCLUDED.active",
+        )
+        .bind(&e.cell_id)
+        .bind(&e.tenant_id)
+        .bind(&e.isolation_tier)
+        .bind(e.active)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(prior)
+    }
+
+    /// One `local_tenant` directory entry, or `None`.
+    pub async fn get_local_tenant(
+        &self,
+        cell_id: &str,
+        tenant_id: &str,
+    ) -> Result<Option<DurableLocalTenantRow>, PgError> {
+        let row = sqlx::query(
+            "SELECT cell_id, tenant_id, isolation_tier, active \
+             FROM local_tenant WHERE cell_id = $1 AND tenant_id = $2",
+        )
+        .bind(cell_id)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(row.map(|r| local_tenant_from_row(&r)))
+    }
+
+    /// The `local_tenant` directory of a given cell (the tenants that cell homes), in stable
+    /// tenant-id order.
+    pub async fn local_tenants(&self, cell_id: &str) -> Result<Vec<DurableLocalTenantRow>, PgError> {
+        let rows = sqlx::query(
+            "SELECT cell_id, tenant_id, isolation_tier, active \
+             FROM local_tenant WHERE cell_id = $1 ORDER BY tenant_id",
+        )
+        .bind(cell_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(rows.iter().map(local_tenant_from_row).collect())
+    }
+}
+
+/// Map a `tenant_placement` sqlx row to its durable row shape (shared by the point + scan reads).
+fn placement_from_row(r: &sqlx::postgres::PgRow) -> DurablePlacementRow {
+    DurablePlacementRow {
+        tenant_id: r.get("tenant_id"),
+        region: r.get("region"),
+        home_cell: r.get("home_cell"),
+        isolation_tier: r.get("isolation_tier"),
+        slug: r.get("slug"),
+        status: r.get("status"),
+        member_cells: r.get("member_cells"),
+    }
+}
+
+/// Map a `local_tenant` sqlx row to its durable row shape.
+fn local_tenant_from_row(r: &sqlx::postgres::PgRow) -> DurableLocalTenantRow {
+    DurableLocalTenantRow {
+        cell_id: r.get("cell_id"),
+        tenant_id: r.get("tenant_id"),
+        isolation_tier: r.get("isolation_tier"),
+        active: r.get("active"),
     }
 }
 
