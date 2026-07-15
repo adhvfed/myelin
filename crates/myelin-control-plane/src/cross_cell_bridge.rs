@@ -234,33 +234,122 @@ pub trait CellLocalResolver: Send + Sync {
     ) -> BridgeResolution;
 }
 
+/// **The durable-cell-table PROJECTION seam (MR-009b W6c-cp).** The production
+/// [`CellResolverRegistry`] is a boot-time PROJECTION of the durable `cell` table: its authority is
+/// the durable, PII-free per-cell routing `endpoint` (`myelin_storage::placement_durable`'s `cell`
+/// row), NOT any in-memory system-of-record. A `ResolverProjection` answers `resolver_for(home_cell)`
+/// off the live handles it built at boot (endpoint string → [`CellLocalResolver`], via a resolver
+/// factory) — the map of handles it holds is a process-local CONNECTION CACHE (live transport
+/// clients), rebuilt from the durable cell rows on every boot, never durable state itself.
+///
+/// The seam keeps the `CellResolverRegistry` type DB-free (a trait object, no `PgPool`): the
+/// concrete pool-backed projection ([`crate::cross_cell_bridge_durable`], compiled UNCONDITIONALLY —
+/// durable-by-default) is built from `DurablePlacementBacking`, exactly as the `Durable(Arc<dyn
+/// …>)` events/dedup seams keep `myelin-events` DB-free. `Send + Sync` so the bridge holds it behind
+/// an [`Arc`] across serving threads.
+pub trait ResolverProjection: Send + Sync {
+    /// The cell-local resolver for `cell` (the projected live handle), or `None` if the cell is not in
+    /// the durable projection — the bridge degrades to a tombstone (never fabricates content, never
+    /// reaches into a cell it cannot see).
+    fn resolver_for(&self, cell: &CellId) -> Option<Arc<dyn CellLocalResolver>>;
+}
+
 /// **A registry of the cell-local resolvers reachable over the bridge (the home cells).** Maps a
 /// [`CellId`] to its [`CellLocalResolver`] — the bridge looks up the pointer's `home_cell` here and
-/// dispatches the resolve THERE. In production each member cell exposes its resolver endpoint and the
-/// bridge reaches it over the resilient client; on this floor the registry holds the in-process
-/// resolver handles (the SAME seam, the wire is the named transport floor — mirrors how the misroute
-/// audit's durable chain is the named GDPR follow-on while the in-process sink is real now).
-#[derive(Clone, Default)]
+/// dispatches the resolve THERE.
+///
+/// **The registry's authority is the durable `cell` table (MR-009b W6c-cp).** In PRODUCTION it is a
+/// boot-time PROJECTION of the durable, PII-free per-cell routing `endpoint` (the
+/// [`CellResolverBackend::Projected`] arm over a [`ResolverProjection`]): the map of live handles is a
+/// connection cache rebuilt at boot from the durable cell rows by a resolver factory, never an
+/// in-memory system-of-record. The raw hand-`register`ed [`CellResolverBackend::Memory`] map is the
+/// TEST-SUPPORT double (gated `#[cfg(any(test, feature = "test-support"))]`) the CP-D8 drills use — it
+/// is compiled out of the production graph, so the `no-in-memory-durable-store` scanner strips it and
+/// the production registry presents no in-memory backing.
+#[derive(Clone)]
 pub struct CellResolverRegistry {
-    resolvers: std::collections::HashMap<CellId, Arc<dyn CellLocalResolver>>,
+    backend: CellResolverBackend,
+}
+
+/// The registry backend: the TEST-SUPPORT in-memory double (a raw hand-registered handle map) or the
+/// PRODUCTION durable-cell-table projection (a [`ResolverProjection`] trait object). Splitting the
+/// backend out of the role struct is what lets the scanner strip the `test-support`-gated `Memory` arm
+/// and see the production registry as a pool-authority projection, not an in-memory store.
+#[derive(Clone)]
+enum CellResolverBackend {
+    /// The in-memory test-double (the DB-free CP-D8 default) — a raw hand-`register`ed handle map. NOT
+    /// the production system-of-record; gated so it is compiled out of the production graph.
+    #[cfg(any(test, feature = "test-support"))]
+    Memory(std::collections::HashMap<CellId, Arc<dyn CellLocalResolver>>),
+    /// The PRODUCTION projection of the durable `cell` table (its authority is the durable cell
+    /// endpoints) — a [`ResolverProjection`] built at boot from the durable cell rows.
+    Projected(Arc<dyn ResolverProjection>),
 }
 
 impl CellResolverRegistry {
-    /// A fresh, empty registry.
+    /// **The PRODUCTION registry over a durable-cell-table projection.** The `projection` is a boot-time
+    /// [`ResolverProjection`] built from the durable `cell` endpoints (see
+    /// [`crate::cross_cell_bridge_durable`]); the bridge dispatches `home_cell` resolves through it. The
+    /// composition root (W6d / W3b.4 boot wiring — NOT wired here) builds the projection at boot and
+    /// hands it to [`CrossCellBridge::new`]; on a missing/unresolvable cell endpoint the projection
+    /// construction fails LOUD (never a silent empty registry).
+    pub fn projected(projection: Arc<dyn ResolverProjection>) -> CellResolverRegistry {
+        CellResolverRegistry {
+            backend: CellResolverBackend::Projected(projection),
+        }
+    }
+
+    /// A fresh, empty in-memory registry (the TEST-SUPPORT double — the CP-D8 drills' `register` +
+    /// resolve path). Compiled out of the production graph. No `Default` on purpose: the PRODUCTION
+    /// constructor is [`Self::projected`] (a durable-cell-table projection), never an empty default.
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(clippy::new_without_default)]
     pub fn new() -> CellResolverRegistry {
-        CellResolverRegistry::default()
+        CellResolverRegistry {
+            backend: CellResolverBackend::Memory(std::collections::HashMap::new()),
+        }
     }
 
-    /// Register the cell-local resolver for `cell` (the home cell's resolver the bridge dispatches to).
+    /// Register the cell-local resolver for `cell` (the home cell's resolver the bridge dispatches to)
+    /// — the TEST-SUPPORT double's hand-registration. In production the registry is a durable-cell-table
+    /// projection ([`Self::projected`]); this is compiled out of the production graph.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn register(&mut self, cell: CellId, resolver: Arc<dyn CellLocalResolver>) {
-        self.resolvers.insert(cell, resolver);
+        match &mut self.backend {
+            CellResolverBackend::Memory(map) => {
+                map.insert(cell, resolver);
+            }
+            CellResolverBackend::Projected(_) => {
+                panic!("register() is the test-support double; a projected registry is durable-authoritative")
+            }
+        }
     }
 
-    /// The cell-local resolver for `cell`, if registered (the home cell the bridge dispatches a resolve
+    /// The cell-local resolver for `cell`, if reachable (the home cell the bridge dispatches a resolve
     /// to). `None` means the home cell is unknown to this bridge — the bridge degrades to a tombstone
-    /// (never fabricates content, never reaches into a cell it cannot see).
-    fn resolver_for(&self, cell: &CellId) -> Option<&Arc<dyn CellLocalResolver>> {
-        self.resolvers.get(cell)
+    /// (never fabricates content, never reaches into a cell it cannot see). On the production arm this
+    /// reads the boot-projected handle for the durable cell row; on the test-support arm the raw map.
+    fn resolver_for(&self, cell: &CellId) -> Option<Arc<dyn CellLocalResolver>> {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            CellResolverBackend::Memory(map) => map.get(cell).cloned(),
+            CellResolverBackend::Projected(projection) => projection.resolver_for(cell),
+        }
+    }
+}
+
+impl core::fmt::Debug for CellResolverRegistry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // PII-free Debug: the backend kind only — never a cell id, endpoint, or resolver handle (the
+        // same PII-free-log discipline as [`CrossCellBridge`]).
+        let backend = match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            CellResolverBackend::Memory(_) => "memory(test-support)",
+            CellResolverBackend::Projected(_) => "projected(durable-cell-table)",
+        };
+        f.debug_struct("CellResolverRegistry")
+            .field("backend", &backend)
+            .finish()
     }
 }
 
@@ -807,5 +896,52 @@ mod tests {
         let v = ViewerId::from_token("01J0PRINCIPAL");
         assert_eq!(v.as_str(), "01J0PRINCIPAL");
         // There is intentionally no `From<String> for ViewerId` — a personal string can't coerce in.
+    }
+
+    /// A stand-in [`ResolverProjection`] — the shape the durable-cell-table boot projection produces:
+    /// a map of `CellId → Arc<dyn CellLocalResolver>` built from durable cell rows (here hand-built for
+    /// a DB-free proof). This is the PRODUCTION registry arm (no `CellResolverRegistry::new`/`register`).
+    struct ProjectedFromCells {
+        resolvers: HashMap<CellId, Arc<dyn CellLocalResolver>>,
+    }
+    impl ResolverProjection for ProjectedFromCells {
+        fn resolver_for(&self, cell: &CellId) -> Option<Arc<dyn CellLocalResolver>> {
+            self.resolvers.get(cell).cloned()
+        }
+    }
+
+    /// **The CP-D8 "0 PII across the bridge" property holds on the PRODUCTION projected arm too
+    /// (DB-free).** Building the registry via [`CellResolverRegistry::projected`] (the durable-cell-table
+    /// projection seam, no in-memory hand-registration) resolves an authorised viewer to a projection,
+    /// an unauthorised one to a `Denied` tombstone, and an unknown home cell to a `Gone` tombstone — with
+    /// `cross_cell_raw_rows == 0` throughout. This exercises the same CP-D8 zero the memory arm proves,
+    /// against the production arm (the live-PG projection is proven in the W6c-cp integration test).
+    #[test]
+    fn cp_d8_zero_holds_on_the_projected_production_arm() {
+        let mut b = HomeCellResolver::new();
+        b.permit("myelin://01J0BETA/issues/issue/7", "viewer-1");
+        b.render("myelin://01J0BETA/issues/issue/7", "Ship M5", "open", "issue");
+
+        // The PRODUCTION arm: a durable-cell-table projection (a `ResolverProjection`), NOT `register`.
+        let mut resolvers: HashMap<CellId, Arc<dyn CellLocalResolver>> = HashMap::new();
+        resolvers.insert(CellId::from_token("cell-b"), Arc::new(b));
+        let reg = CellResolverRegistry::projected(Arc::new(ProjectedFromCells { resolvers }));
+        let bridge = CrossCellBridge::new(CellId::from_token("cell-a"), reg);
+
+        // Authorised → projection, resolved IN the home cell; 0 raw rows.
+        let p = pointer("myelin://01J0BETA/issues/issue/7", ArtifactType::Issue, "cell-b");
+        let ok = bridge.resolve(&p, &ViewerId::from_token("viewer-1"), BridgeMode::Live);
+        assert!(ok.is_projection(), "authorised viewer gets the projection on the projected arm");
+        assert_eq!(bridge.cross_cell_raw_rows(), 0);
+
+        // Unauthorised → Denied tombstone (no leak).
+        let denied = bridge.resolve(&p, &ViewerId::from_token("viewer-2"), BridgeMode::Live);
+        assert_eq!(denied.tombstone_reason(), Some(BridgeTombstoneReason::Denied));
+
+        // Unknown home cell (not in the durable projection) → Gone tombstone, 0 raw rows.
+        let ghost = pointer("myelin://01J0GHOST/issues/issue/1", ArtifactType::Issue, "cell-unknown");
+        let gone = bridge.resolve(&ghost, &ViewerId::from_token("viewer-1"), BridgeMode::Live);
+        assert_eq!(gone.tombstone_reason(), Some(BridgeTombstoneReason::Gone));
+        assert_eq!(bridge.cross_cell_raw_rows(), 0);
     }
 }

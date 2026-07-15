@@ -102,6 +102,23 @@ myelin-flow = { path = "../myelin-flow" }
 tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
+# MR-009b W6c-cp — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN test
+# targets. The `CellResolverRegistry` in-memory double (`new`/`register` + the `Memory` backend arm) is
+# now `#[cfg(any(test, feature = "test-support"))]` (the production arm is the durable-cell-table
+# `Projected` projection), so the crate's own integration drills (cp_d8 / cdc_12_6 / cdc_10_4 /
+# ga_d8_cross_cell_dsr) — separate test binaries that link the lib WITHOUT `cfg(test)` — reach the
+# double ONLY when `test-support` is on. Listing the crate as a DEV-dependency of itself with the
+# feature is the sanctioned Cargo idiom (dev-dep cycles are allowed), matching the Wave-2/3
+# identity/events self dev-dependencies; it keeps `cargo test -p myelin-control-plane` (DB-free) green
+# WITHOUT polluting the production build (cargo tree -e no-dev shows no test-support edge).
+myelin-control-plane = { path = ".", features = ["test-support"] }
+# MR-009b W6c-cp — DEV-only: the dev config (`MyelinConfig::dev()`) the live-PG W6c-cp projection
+# integration test connects the pool with. DEV-only — never in the production DAG.
+myelin-config = { path = "../myelin-config" }
+# MR-009b W6c-cp — DEV-only: the live-PG W6c-cp projection integration test cleans up its own throwaway
+# `cell` rows (the control-plane `cell` table is cross-tenant routing infra with no RLS/suffix scope, so
+# `all_cells()` is unscoped) through a direct DELETE. DEV-only — never in the production DAG.
+sqlx = { workspace = true }
 # MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
 # `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests (the same
 # posture as the Wave-2/3 identity/events test-support dev-dependencies). DEV-only — never in the

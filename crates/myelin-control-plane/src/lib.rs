@@ -228,6 +228,14 @@
 pub mod bulkhead;
 pub mod cp_outage;
 pub mod cross_cell_bridge;
+// MR-009b W6c-cp: the PRODUCTION arm of `CellResolverRegistry` — a boot-time PROJECTION of the durable
+// `cell` table (each cell's PII-free routing `endpoint`) into the live cell-local resolver handles the
+// cross-cell bridge dispatches to. Compiled UNCONDITIONALLY (W6c-cp verifier finding: sqlx is
+// non-optional in myelin-storage post-W1 and this module needs no tokio bridge, so an `integration`
+// gate here would make the only durable projection builder UNREACHABLE in production builds — the
+// exact correct-but-latent shape MR-009b kills). The `cross_cell_bridge` seam stays DB-free behind
+// the `ResolverProjection` trait object. Boot wiring is W6d / W3b.4.
+pub mod cross_cell_bridge_durable;
 pub mod discover;
 pub mod dogfood;
 pub mod four_layer;
@@ -259,8 +267,11 @@ pub use cp_outage::{
 };
 pub use cross_cell_bridge::{
     bridge_carried_fields, BridgeMode, BridgeProjection, BridgeResolution, BridgeTombstone,
-    BridgeTombstoneReason, CellLocalResolver, CellResolverRegistry, CrossCellBridge, ViewerId,
+    BridgeTombstoneReason, CellLocalResolver, CellResolverRegistry, CrossCellBridge,
+    ResolverProjection, ViewerId,
 };
+// MR-009b W6c-cp: the durable-cell-table projection constructor + factory/error (production arm).
+pub use cross_cell_bridge_durable::{ProjectionError, ResolverFactory};
 pub use discover::{DiscoverKey, DiscoveryCache, DiscoverySignals, RouteTuple};
 pub use dogfood::{
     proven_tenancy_rows, MyelinSelfHost, ProvenTenancyRow, TenancyTruthUpPass, TenancyTruthUpRed,

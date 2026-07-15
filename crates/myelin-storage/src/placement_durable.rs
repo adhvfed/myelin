@@ -342,6 +342,37 @@ impl DurablePlacementBacking {
         }))
     }
 
+    /// **Every `cell` inventory row, in stable id order.** The durable authority the control-plane
+    /// [`myelin_control_plane`] `CellResolverRegistry` PROJECTS at boot (MR-009b W6c-cp): the
+    /// cross-cell bridge rebuilds its live resolver handles from each cell's durable, PII-free routing
+    /// `endpoint`, so the registry is a boot-time projection of this table, not an in-memory
+    /// system-of-record. Ordered by `cell_id` so the projection is deterministic across reboots.
+    pub async fn all_cells(&self) -> Result<Vec<DurableCellRow>, PgError> {
+        let rows = sqlx::query(
+            "SELECT cell_id, region, status, isolation_kind, tenants_max, write_qps_max, \
+                    storage_bytes_max, utilisation, version, endpoint \
+             FROM cell ORDER BY cell_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(rows
+            .iter()
+            .map(|r| DurableCellRow {
+                cell_id: r.get("cell_id"),
+                region: r.get("region"),
+                status: r.get("status"),
+                isolation_kind: r.get("isolation_kind"),
+                tenants_max: r.get("tenants_max"),
+                write_qps_max: r.get("write_qps_max"),
+                storage_bytes_max: r.get("storage_bytes_max"),
+                utilisation: r.get("utilisation"),
+                version: r.get("version"),
+                endpoint: r.get("endpoint"),
+            })
+            .collect())
+    }
+
     /// The number of cells in the inventory.
     pub async fn cell_count(&self) -> Result<i64, PgError> {
         sqlx::query_scalar("SELECT COUNT(*) FROM cell")

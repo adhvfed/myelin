@@ -2483,6 +2483,8 @@ dependencies = [
  "blake3",
  "hex",
  "myelin-ci-sandbox",
+ "myelin-config",
+ "myelin-control-plane",
  "myelin-events",
  "myelin-flow",
  "myelin-gdpr",
@@ -2492,6 +2494,7 @@ dependencies = [
  "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",
+ "sqlx",
  "tokio",
 ]
 
