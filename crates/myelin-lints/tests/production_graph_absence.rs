@@ -119,7 +119,22 @@
 //!   dev-dependency (the events crate's own `reerase`/`cdc_10_8`/`drills_bus_d8` tests + storage's
 //!   `drills_bus_d8_backups`).
 //! - `myelin-control-plane/src/registry.rs:111`          — `Registry` placement in-mem (SI-011; cp durable MR)
-//! - `myelin-control-plane/src/cross_cell_bridge.rs:244` — `CellResolverRegistry` in-mem (SI-052; cp/multi-cell MR)
+//! - **MR-009b W6c-cp FLIPPED the `CellResolverRegistry` (SI-052) GREEN (6→5):**
+//!   `cross_cell_bridge.rs:244` is REMOVED. The registry is now a role struct over a `CellResolverBackend`
+//!   enum whose in-memory `Memory(HashMap<CellId, Arc<dyn CellLocalResolver>>)` arm + `::new()`/`register()`
+//!   are `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLES; the always-compiled PRODUCTION arm is
+//!   `Projected(Arc<dyn ResolverProjection>)` — a boot-time PROJECTION of the durable `cell` table (each
+//!   cell's PII-free routing `endpoint`), NOT an in-memory system-of-record. The durable authority already
+//!   exists (`myelin_storage::placement_durable`'s `cell.endpoint`, the same column `discover` routes on);
+//!   the registry's live handle map is a process-local CONNECTION CACHE rebuilt at boot by a resolver
+//!   factory (`cross_cell_bridge_durable::project_from_durable_cells`, compiled UNCONDITIONALLY —
+//!   the verifier killed an `integration` gate that would have left the only durable projection
+//!   builder production-unreachable), fail-loud on a missing/unresolvable endpoint (never a silent
+//!   empty registry).
+//!   The scanner strips the `test-support`-gated `Memory` arm, so the production backend enum presents
+//!   non-in-memory → the entry is REMOVED. Proven live (`integration_mr009b_w6c_cp_resolver_projection`);
+//!   DB-free unit tests use the double via the `myelin-control-plane/test-support` self dev-dependency, and
+//!   the projected production arm is exercised DB-free in `cp_d8_zero_holds_on_the_projected_production_arm`.
 //! - `myelin-control-plane/src/placement_of.rs:223`      — `MisrouteAudit` `Arc<Mutex<Vec<…>>>` audit sink (SI-028; cp durable MR)
 //! - **MR-009b Wave 5 FLIPPED the `KmsEngine` (SI-006) GREEN (12→11):** `kms.rs` `KmsEngine` is now
 //!   durable-by-default — a role struct over a `KmsBackend` enum (the Wave-2/DedupLedger pattern).
@@ -405,7 +420,16 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-ci-controlplane/src/residency_drill.rs",
         444,
     ),
-    // ---- no-in-memory-durable-store (4 here + 2 closed-false-negatives below = 6) ----
+    // ---- no-in-memory-durable-store (3 here + 2 closed-false-negatives below = 5) ----
+    //      MR-009b W6c-cp FLIPPED the control-plane `CellResolverRegistry` (SI-052) durable-by-default
+    //      (6→5): `cross_cell_bridge.rs:244` is REMOVED from the "here" group. The registry is now a role
+    //      struct over a `CellResolverBackend` enum whose in-memory `Memory(HashMap<…>)` arm + `::new()`/
+    //      `register()` are `#[cfg(any(test, feature = "test-support"))]` test doubles; the always-compiled
+    //      PRODUCTION arm is `Projected(Arc<dyn ResolverProjection>)` — a boot-time PROJECTION of the
+    //      durable `cell` table's PII-free routing `endpoint` (reuse of the existing system-of-record, NOT
+    //      a net-new table). The live handle map is a process-local connection cache the resolver factory
+    //      rebuilds at boot (`cross_cell_bridge_durable::project_from_durable_cells`), fail-loud on a
+    //      missing/unresolvable endpoint. Proven live (`integration_mr009b_w6c_cp_resolver_projection`).
     //      MR-009b W6c-events FLIPPED the events `BusErasureLedger` (SI-039) durable-by-default (7→6):
     //      `reerase.rs:102` is REMOVED from the "here" group. `myelin-events` is a §2.9 DAG SINK, so
     //      it uses the DedupLedger trait-seam pattern — the `DurableBusErasure` trait is defined IN
@@ -434,11 +458,11 @@ const BASELINE: &[(&str, &str, usize)] = &[
     //      (SI-006) durable-by-default → `kms.rs:622` removed (in-memory count 12→11; total 13→12).
     //      (The sibling `outbox.rs:231` `OutboxStore`/SI-007 STAYS — its durable re-point to
     //      `PgRelay::co_commit_in_tx` is a separate, higher-coupling wave; see the module-doc residual.)
-    (
-        "no-in-memory-durable-store",
-        "crates/myelin-control-plane/src/cross_cell_bridge.rs",
-        244,
-    ),
+    // (`cross_cell_bridge.rs:244` `CellResolverRegistry` (SI-052) — REMOVED by MR-009b W6c-cp: its
+    //  in-memory `Memory(HashMap<…>)` backend arm + `::new()`/`register()` are now `test-support`-gated
+    //  test doubles, and the always-compiled production arm is `Projected(Arc<dyn ResolverProjection>)` — a
+    //  boot-time projection of the durable `cell.endpoint`. The production enum presents non-in-memory →
+    //  the scanner no longer fires. See the flipped-GREEN note in the module docs above.)
     // MR-024 (SI-011) ADDED the durable PG path for the placement registry: the `cell` +
     // `tenant_placement` tables (frozen contract-12.3) + the HARD placement invariant as a REAL DB
     // TRIGGER (`myelin_storage::placement_durable`) + the `Pg | Memory` backend enum binding
@@ -656,8 +680,8 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
     // un-wired gate). The counts pin the manifest shape.
     assert_eq!(
         BASELINE.len(),
-        7,
-        "the committed baseline has 7 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
+        6,
+        "the committed baseline has 6 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
          GREEN: 17 → 14; Wave 3 flipped the events `DedupLedger` (SI-023) → 14 → 13; Wave 5 flipped \
          the `KmsEngine` (SI-006) → 13 → 12; Wave 6a flipped the 2 identity S2 pseudonym holders → \
          12 → 10; Wave 6b flipped the 2 in-crate storage ERASURE ledgers — `restore_verify.rs:175` \
@@ -665,7 +689,8 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          (the sibling `reserve_settle.rs:283` `CostLedger` is SUPPLEMENTED not removed: its durable \
          backing exists but the flip awaits the flow/ci budget-gate durable redesign); W6c-events \
          flipped the events `BusErasureLedger` (SI-039) durable-by-default via the DedupLedger \
-         trait-seam pattern → 8 → 7)"
+         trait-seam pattern → 8 → 7; W6c-cp flipped the control-plane `CellResolverRegistry` (SI-052) \
+         durable-by-default via a boot-time projection of the durable `cell.endpoint` → 7 → 6)"
     );
     let structural = BASELINE
         .iter()
@@ -688,21 +713,25 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          to the CI track."
     );
     assert_eq!(
-        in_memory, 6,
-        "6 in-memory durable-store sites: Waves 2/3/5/6a flipped the identity spine + events \
+        in_memory, 5,
+        "5 in-memory durable-store sites: Waves 2/3/5/6a flipped the identity spine + events \
          DedupLedger + KmsEngine + the 2 S2 pseudonym holders durable-by-default (16→9); \
          MR-009b Wave 6b FLIPPED the 2 in-crate storage ERASURE ledgers durable-by-default (9→7): \
          `restore_verify.rs:175` `ErasureLedger` (now a backend enum over the non-shred-erasable \
          `restore_erasure_ledger` table, migration 0051, carrying the R1 §7.6 completion-offset \
          fold-in) + `reerase.rs:156` `InMemoryPostPitLedger` (now the `test-support`-gated double \
-         behind `DurablePostPitLedger` over `post_pit_erasure_ledger`, 0052); and W6c-events FLIPPED \
+         behind `DurablePostPitLedger` over `post_pit_erasure_ledger`, 0052); W6c-events FLIPPED \
          the events `BusErasureLedger` (SI-039) durable-by-default (7→6) via the DedupLedger \
          trait-seam pattern (`DurableBusErasure` trait in events; `DurableBusErasureBacking` over the \
          non-shred-erasable, NO-RLS `bus_erasure_ledger` table, migration 0053, in storage; wired at \
-         `events_serve::EventsRuntime`). The remaining 6 (events OUTBOX (SI-007); control-plane \
-         registry/bridge/misroute; storage `reserve_settle.rs:283` `CostLedger` (SUPPLEMENTED — \
-         durable backing exists, flip awaits the flow/ci budget-gate durable redesign) + \
-         `blob.rs:362`) flip in the later waves."
+         `events_serve::EventsRuntime`); and W6c-cp FLIPPED the control-plane `CellResolverRegistry` \
+         (SI-052) durable-by-default (7→6) via a boot-time PROJECTION of the durable `cell.endpoint` \
+         (the `Projected(Arc<dyn ResolverProjection>)` production arm; the `Memory(HashMap<…>)` arm + \
+         `::new()`/`register()` are `test-support`-gated doubles; projection in \
+         `cross_cell_bridge_durable`, fail-loud on a missing/unresolvable endpoint). The remaining 5 \
+         (events OUTBOX (SI-007); control-plane registry/misroute; storage `reserve_settle.rs:283` \
+         `CostLedger` (SUPPLEMENTED — durable backing exists, flip awaits the flow/ci budget-gate \
+         durable redesign) + `blob.rs:362`) flip in the later waves."
     );
     assert_eq!(
         bare_pool, 0,
