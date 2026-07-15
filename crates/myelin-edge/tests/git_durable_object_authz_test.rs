@@ -540,3 +540,132 @@ fn report_checks_requires_the_repo_write_grant() {
     );
     assert_eq!(st, 200, "a granted producer stamps greens: {v}");
 }
+
+// ═══════════════ R2-EXIT BLOCKER — the writer→protected-branch escalation, flipped to DENIED ═══════
+//
+// Two independent red-team adversaries proved a plain in-tenant WRITER (a `push` grant, NO
+// `admin`/`protected_push`) could land arbitrary code on the PROTECTED branch `refs/heads/main` over
+// the git wire — defeating required status checks, required reviews, CODEOWNERS, AND the admin
+// requirement. Three compounding defects; the tests below pin Defect 1 at the durable backend
+// (`report_checks` is a CI-PRODUCER capability — the SERVICE-kind floor), IN ADDITION to the R2.1
+// object-guard leg proven above (`report_checks_requires_the_repo_write_grant`):
+//
+// - **Defect 1 (self-certifiable CI).** `report_checks` fail-closed refuses any non-SERVICE principal:
+//   a HUMAN (or AGENT) writer attempting to stamp its own PR's checks green is REFUSED (403), while a
+//   SERVICE principal (a CI run token — the legitimate producer) is admitted.
+// - **Defect 2 (direct push needs `protected_push`).** R2.1's `RepoPermission::ProtectedPush` rung is
+//   admin-only (proven in `repo_authz` / `repo_authz_live`); the wire receive-pack path resolves it via
+//   `authorize_repo_permission` and holds a writer's direct push to a protected ref to the FULL ruleset.
+// - **Defect 3 (full ruleset, not just contexts).** Proven in `myelin-git`'s
+//   `evaluate_protected_ref_push` gate tests (approvals/CODEOWNERS make a direct push unsatisfiable).
+//
+// The end-to-end REAL-`git`-push leg (a writer's direct push to protected `main` refused over the
+// wire) lives in `git_wire_http_push_oracle_test.rs` (gated on `MYELIN_REQUIRE_RUNSC=1`).
+
+use myelin_identity::RuntimeRef;
+use serde_json::json;
+
+/// A bare principal of an arbitrary KIND (the producer floor gates on the kind, not on any grant).
+fn principal_of_kind(id: &str, kind: PrincipalKind) -> Principal {
+    Principal::stub(PrincipalId(id.into()), kind, TenantId(TENANT.into()))
+}
+
+/// Stand up a durable backend, create the repo, and open one PR (head = an arbitrary oid — the
+/// producer floor gates on the reporting PRINCIPAL, not the commit).
+fn backend_with_open_pr(tag: &str) -> (DurableGitBackend, PathBuf) {
+    let root = temp_root(tag);
+    let be = DurableGitBackend::rooted_inmem_for_test(&root);
+    be.create_repo(TENANT, REGION, "widgets").expect("create repo");
+    let author = principal_of_kind("author", PrincipalKind::Human);
+    be.open_pr(
+        TENANT,
+        REGION,
+        "widgets",
+        &json!({
+            "base_ref": "refs/heads/main",
+            "head_ref": "refs/heads/feature",
+            "head_oid": "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff",
+        }),
+        &author,
+    )
+    .expect("open PR #1");
+    (be, root)
+}
+
+/// **THE EXPLOIT (Defect 1), FLIPPED TO DENIED — the rewrite of the mis-codified expectation.** A
+/// plain writer that is a HUMAN principal cannot attest CI check facts on its own PR. `report_checks`
+/// is a CI-producer capability; a human writer stamping greens is REFUSED (fail-closed), so it can
+/// never self-certify the required checks the merge gate / the protected-push gate read.
+#[test]
+fn human_writer_cannot_report_checks_on_its_own_pr() {
+    let (be, root) = backend_with_open_pr("human-deny");
+    let human_writer = principal_of_kind("author", PrincipalKind::Human);
+
+    let err = be
+        .report_checks(
+            TENANT,
+            REGION,
+            "widgets",
+            1,
+            &human_writer,
+            &json!({ "green_contexts": ["ci/build"] }),
+        )
+        .expect_err("a human writer must NOT be able to attest CI check facts");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("forbidden") && msg.contains("CI-producer"),
+        "the refusal names the CI-producer capability floor: {msg}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// An AGENT writer is likewise refused (only a SERVICE CI run token produces check facts).
+#[test]
+fn agent_writer_cannot_report_checks() {
+    let (be, root) = backend_with_open_pr("agent-deny");
+    let agent = principal_of_kind(
+        "agent",
+        PrincipalKind::Agent {
+            runtime_ref: RuntimeRef("rt-1".into()),
+            on_behalf_of: None,
+        },
+    );
+    assert!(
+        be.report_checks(
+            TENANT,
+            REGION,
+            "widgets",
+            1,
+            &agent,
+            &json!({ "green_contexts": ["ci/build"] })
+        )
+        .is_err(),
+        "an agent is not a CI service producer"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **LEGIT (Defect 1): a SERVICE principal (a CI run token — the authorized producer) CAN report
+/// checks.** The floor denies human/agent writers, never the legitimate CI producer path.
+#[test]
+fn ci_service_producer_can_report_checks() {
+    let (be, root) = backend_with_open_pr("service-ok");
+    let ci_producer = principal_of_kind("ci:runner", PrincipalKind::Service);
+
+    let rec = be
+        .report_checks(
+            TENANT,
+            REGION,
+            "widgets",
+            1,
+            &ci_producer,
+            &json!({ "green_contexts": ["ci/build"] }),
+        )
+        .expect("a CI service producer reports checks");
+    assert_eq!(
+        rec.green_contexts,
+        vec!["ci/build".to_string()],
+        "the producer's attested greens are recorded (the facts the merge gate reads)"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
