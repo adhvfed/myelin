@@ -57,7 +57,7 @@ use myelin_git::receive_pack::{
 use myelin_git::web::{
     CommitDiff, CommitRow, DiffFile, DiffLineView, RepoHome, WebEditForm, WebEditOutcome,
 };
-use myelin_identity::Principal;
+use myelin_identity::{Principal, PrincipalKind};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -690,18 +690,40 @@ impl DurableGitBackend {
         Ok(n)
     }
 
-    /// **CI check-report (GT-003).** The authorized producer stamps the green / fork-unendorsed check
-    /// facts on a PR for its head (the real CI producer is M4; the PR AUTHOR cannot call this — the edge
-    /// gates the distinct `git.checks.report` action). The facts the merge gate reads come from HERE,
-    /// never from the PR-open body.
+    /// **CI check-report — a CI-PRODUCER capability (GT-003 / R2-exit Defect 1).** The authorized
+    /// producer stamps the green / fork-unendorsed check facts on a PR for its head; the facts the merge
+    /// gate reads come from HERE, never from the PR-open body.
+    ///
+    /// **The producer floor (why a plain writer cannot self-certify its own PR).** Reporting CI check
+    /// facts is NOT an ordinary writer capability — if it were, a PR author (a writer) could stamp its
+    /// own required checks green and defeat the merge gate / the protected-push gate. So this is gated
+    /// as a CI-producer capability two ways: (1) the edge routes `DReportChecks` through the R2.1
+    /// [`RepoObjectGuard`] (`RepoPermission::Push` — the object-level repo grant stays required); and
+    /// (2) HERE, fail-closed, the reporting principal MUST be a SERVICE principal — the kind a CI
+    /// runner's self-hosted-runner run token mints as (`mint`, P-ID-18). A `Human` (or `Agent`)
+    /// principal is REFUSED regardless of any writer grant. How CI legitimately reports today: a CI run
+    /// executes under a service principal (the run token), and that service principal — never the human
+    /// developer who opened the PR — posts the check facts. The full producer-RELATION
+    /// (`repo.report_checks` / a `ci_producer` edge in the frozen fragment) is the R2+ follow-on; this
+    /// SERVICE-kind floor is the deny-a-human-writer guarantee in the meantime.
     pub fn report_checks(
         &self,
         tenant: &str,
         region: &str,
         slug: &str,
         number: u64,
+        principal: &Principal,
         body: &Value,
     ) -> Result<PrRecord, DurableError> {
+        // The producer floor: only a SERVICE principal (a CI run token) may attest CI check facts. A
+        // human writer / an agent is refused (fail-closed) — it cannot self-certify its own PR.
+        if !matches!(principal.kind, PrincipalKind::Service) {
+            return Err(DurableError::Forbidden(format!(
+                "git.checks.report is a CI-producer capability: principal `{}` (kind {:?}) is not a CI \
+                 service producer — a human/agent writer cannot attest CI check facts on a PR",
+                principal.principal_id.0, principal.kind
+            )));
+        }
         let loc = Self::loc(tenant, region, slug);
         let mut rec = self
             .prs
@@ -1057,6 +1079,18 @@ impl DurableGitBackend {
                 ));
             }
         };
+        // R2-exit Defect 2 — the pusher's PROTECTED-PUSH (admin/bypass) standing, resolved ONCE through
+        // the R2.1 per-repo object authorizer (`repo.protected_push = admin`, contract 4.9). A DIRECT
+        // push to a protected ref is admitted only if the pusher holds this admin-only rung OR the push
+        // clears the FULL branch-protection ruleset (Defect 3) — a plain writer holds neither, so it can
+        // no longer land arbitrary code on `refs/heads/main` over the wire. Computed here (not per-ref) —
+        // the standing is a repo-level grant, and a push whose refs include ANY protected one is held to
+        // the stronger check.
+        let pusher_has_protected_push = self.repo_authz.authorize_repo_permission(
+            principal,
+            &loc,
+            RepoPermission::ProtectedPush,
+        );
         for u in &updates {
             let ref_str = u.ref_name.0.as_str();
             let configured = protection
@@ -1076,6 +1110,7 @@ impl DurableGitBackend {
                 &u.ref_name,
                 is_delete,
                 u.forced,
+                pusher_has_protected_push,
                 &ruleset,
                 &head,
                 &green,
@@ -1229,6 +1264,8 @@ fn map_durable_err(e: DurableError) -> EdgeError {
             EdgeError::BadRequest(m)
         }
         DurableError::CasMismatch { .. } => EdgeError::Conflict(e.to_string()),
+        // A capability-scoped refusal (e.g. a non-CI-producer reporting checks) is a fail-closed 403.
+        DurableError::Forbidden(m) => EdgeError::Forbidden(m),
         other => EdgeError::Internal(other.to_string()),
     }
 }
@@ -1646,6 +1683,7 @@ impl Handler for DReportChecks {
                 region_of(ctx),
                 param(ctx, "repo")?,
                 num_param(ctx, "n")?,
+                ctx.principal,
                 &body,
             )
             .map_err(map_durable_err)?;

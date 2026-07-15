@@ -77,7 +77,9 @@ use crate::check_status::{
     CheckContext, CheckState, CheckStatus, CheckStatusProjection, GitOid, HumanisedRef,
     Timestamp as CheckTimestamp, TrustTier,
 };
-use crate::lifecycle::BranchProtectionRuleset;
+use crate::lifecycle::{
+    evaluate_ruleset, BlockReason, BranchProtectionRuleset, MergeContext, RulesetOutcome,
+};
 use crate::merge_gate::{
     evaluate_merge_gate, parse_required_context, MergeGateOutcome, MergeGatePolicy, UnmetContext,
 };
@@ -300,6 +302,21 @@ pub enum RejectReason {
         /// the loud, humanisable parse detail (never silently dropped).
         detail: String,
     },
+    /// **R2-exit blocker (HIGH) — a DIRECT push to a PROTECTED ref by a NON-bypass pusher failed the
+    /// FULL branch-protection ruleset** (approvals / CODEOWNERS / conversation-resolution — the same
+    /// [`crate::lifecycle::evaluate_ruleset`] a PR merge clears). A direct `git push` carries NO PR
+    /// review context (0 approvals, no CODEOWNERS approval, no resolved conversations), so a ruleset
+    /// that requires ANY of them is UNSATISFIABLE for a direct push — it accepts a direct push ONLY
+    /// from a `protected_push`/bypass (admin) pusher. This closes the writer→protected-branch
+    /// escalation: a plain writer can no longer land on a protected ref by pushing to it directly, even
+    /// with (producer-attested) green checks, because the approvals/CODEOWNERS half is not satisfiable
+    /// without a PR + genuine reviews. Carries the SPECIFIC unmet ruleset reasons (loud, typed).
+    ProtectedRulesetNotSatisfied {
+        /// the protected ref the push targeted.
+        ref_name: RefName,
+        /// the specific ruleset conditions the direct push did not satisfy (≥ 1).
+        reasons: Vec<BlockReason>,
+    },
 }
 
 /// The push policy configuration the in-process engine evaluates (arch §2 step 2). The minimal-but-
@@ -462,29 +479,53 @@ fn synthetic_check_fact(head: &GitOid, ctx: CheckContext, trust: TrustTier) -> C
 /// force/delete floor, only stricter (it now also enforces the repo's configured required contexts).
 /// Returns `Ok(())` iff the push may proceed to the ref-CAS. Reads facts Git already holds — ACYCLIC,
 /// it never calls CI (EI-02 §3).
+///
+/// **R2-exit blocker fix — the pusher's `protected_push` standing + the FULL ruleset.** Two defects
+/// this composition closes (the writer→protected-branch escalation two red-team adversaries proved):
+/// - **`pusher_has_protected_push`** — the pusher's bypass standing (the repo's admin-only
+///   `protected_push` relation, resolved by the caller through the per-repo authorizer). Force/delete
+///   bans apply to EVERYONE (R0.2, kept); but the required-checks + approvals/CODEOWNERS gate below is
+///   BYPASSED only for a `protected_push`/admin pusher — a plain writer never bypasses it.
+/// - **the FULL branch-protection ruleset, not just `required_contexts`.** A direct push is held to the
+///   SAME [`crate::lifecycle::evaluate_ruleset`] a PR merge clears — required approvals, CODEOWNERS
+///   review, conversation resolution — REUSED (one ruleset evaluation, no divergent second gate). A
+///   direct push carries NO PR review context, so a ruleset requiring approvals/CODEOWNERS is
+///   UNSATISFIABLE for it: the ref then admits a direct push ONLY from a bypass/admin pusher (gated
+///   above) — the correct protected-branch semantics.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_protected_ref_push(
     ref_name: &RefName,
     is_delete: bool,
     is_forced: bool,
+    pusher_has_protected_push: bool,
     ruleset: &BranchProtectionRuleset,
     head_oid: &GitOid,
     green_contexts: &[String],
     fork_unendorsed_contexts: &[String],
     endorsed_contexts: &[String],
 ) -> Result<(), RejectReason> {
-    // A protected ref is never DELETED over the wire (the ruleset deletion ban).
+    // A protected ref is never DELETED over the wire (the ruleset deletion ban) — applies to EVERYONE,
+    // bypass/admin included (keep the R0.2 floor green).
     if is_delete {
         return Err(RejectReason::DeleteProtected {
             ref_name: ref_name.clone(),
         });
     }
-    // A protected ref is never FORCE-pushed unless the repo ruleset opts in (`allow_force_push`).
+    // A protected ref is never FORCE-pushed unless the repo ruleset opts in (`allow_force_push`) —
+    // applies to EVERYONE (bypass/admin does not license a non-ff on a protected ref; R0.2 floor).
     if is_forced && !ruleset.allow_force_push {
         return Err(RejectReason::ForcePushOnProtected {
             ref_name: ref_name.clone(),
         });
     }
+    // **The bypass leg (Defect 2).** A pusher holding the repo's admin-only `protected_push` relation
+    // may direct-push a protected ref (a legitimate hotfix/admin path) — it CLEARS the required-checks +
+    // approvals/CODEOWNERS gate below. A plain writer holds no such standing, so it never reaches here.
+    if pusher_has_protected_push {
+        return Ok(());
+    }
+
+    // ── The NON-bypass path: the SAME gate a PR merge into this ref would clear (Defect 3). ──
     // The required-set merge gate — REUSED from `merge_gate` (0 duplicate protected-branch notion).
     let gate_input = |detail: String| RejectReason::ProtectedGateInput {
         ref_name: ref_name.clone(),
@@ -509,11 +550,38 @@ pub fn evaluate_protected_ref_push(
         .map(|c| parse_required_context(c).map_err(|e| gate_input(e.to_string())))
         .collect::<Result<_, _>>()?;
 
-    match evaluate_merge_gate(&policy, &proj, head_oid, &endorsed) {
-        MergeGateOutcome::Admitted => Ok(()),
-        MergeGateOutcome::Blocked { unmet } => Err(RejectReason::ProtectedCheckNotGreen {
+    // Half A — the required-CONTEXTS gate (green-and-current with an acceptable trust posture).
+    if let MergeGateOutcome::Blocked { unmet } =
+        evaluate_merge_gate(&policy, &proj, head_oid, &endorsed)
+    {
+        return Err(RejectReason::ProtectedCheckNotGreen {
             ref_name: ref_name.clone(),
             unmet,
+        });
+    }
+
+    // Half B — the FULL ruleset (approvals / CODEOWNERS / conversation-resolution), REUSED verbatim
+    // from the merge path ([`crate::lifecycle::evaluate_ruleset`] — the same function `merge_pr` runs).
+    // A DIRECT push carries NO PR review context: 0 approvals, no CODEOWNERS approval, no conversation
+    // threads. So a ruleset requiring approvals/CODEOWNERS is UNSATISFIABLE for a direct push by a
+    // non-bypass pusher (the `required_contexts` half is owned above — emptied here to avoid a
+    // double-evaluation / drift, exactly as `pr_store::evaluate_merge` splits the two halves).
+    let direct_push_ctx = MergeContext {
+        green_contexts: Vec::new(),
+        current_approvals: 0,
+        codeowner_review_satisfied: false,
+        has_blocking_review: false,
+        outstanding_conversations: 0,
+    };
+    let ruleset_no_contexts = BranchProtectionRuleset {
+        required_contexts: Vec::new(),
+        ..ruleset.clone()
+    };
+    match evaluate_ruleset(&ruleset_no_contexts, &direct_push_ctx) {
+        RulesetOutcome::Satisfied => Ok(()),
+        RulesetOutcome::Blocked { reasons } => Err(RejectReason::ProtectedRulesetNotSatisfied {
+            ref_name: ref_name.clone(),
+            reasons,
         }),
     }
 }
@@ -1197,7 +1265,14 @@ mod tests {
         }
     }
 
-    // ════════ R0.2 / DELTA N1 — the protected-ref DIRECT-push gate (reuses merge_gate) ════════
+    // ════════ R0.2 / DELTA N1 + R2-exit — the protected-ref DIRECT-push gate (reuses merge_gate +
+    // the FULL lifecycle ruleset; the pusher's `protected_push` standing is the bypass leg) ════════
+
+    /// `pusher_has_protected_push = false` for every R0.2 case (a plain writer, not a bypass/admin —
+    /// so the required-checks + full-ruleset gate is enforced). The R2-exit cases below exercise the
+    /// `true` bypass leg + the new approvals/CODEOWNERS half explicitly.
+    const WRITER: bool = false;
+    const ADMIN: bool = true;
 
     fn protected_ruleset(required: &[&str], allow_force_push: bool) -> BranchProtectionRuleset {
         BranchProtectionRuleset {
@@ -1212,51 +1287,58 @@ mod tests {
 
     #[test]
     fn protected_direct_push_rejects_delete() {
-        // A protected ref is never deleted over the wire.
+        // A protected ref is never deleted over the wire — even by a bypass/admin pusher.
         let rs = protected_ruleset(&[], false);
         let head = GitOid("0".repeat(40));
-        assert_eq!(
-            evaluate_protected_ref_push(
-                &RefName::new("refs/heads/main"),
-                /*is_delete*/ true,
-                /*is_forced*/ false,
-                &rs,
-                &head,
-                &[],
-                &[],
-                &[],
-            ),
-            Err(RejectReason::DeleteProtected {
-                ref_name: RefName::new("refs/heads/main")
-            })
-        );
+        for bypass in [WRITER, ADMIN] {
+            assert_eq!(
+                evaluate_protected_ref_push(
+                    &RefName::new("refs/heads/main"),
+                    /*is_delete*/ true,
+                    /*is_forced*/ false,
+                    bypass,
+                    &rs,
+                    &head,
+                    &[],
+                    &[],
+                    &[],
+                ),
+                Err(RejectReason::DeleteProtected {
+                    ref_name: RefName::new("refs/heads/main")
+                })
+            );
+        }
     }
 
     #[test]
     fn protected_direct_push_rejects_force_unless_ruleset_allows() {
         let head = GitOid("abc".into());
-        // Force-push refused when the ruleset does NOT allow it.
-        assert_eq!(
-            evaluate_protected_ref_push(
-                &RefName::new("refs/heads/main"),
-                false,
-                /*is_forced*/ true,
-                &protected_ruleset(&[], false),
-                &head,
-                &[],
-                &[],
-                &[],
-            ),
-            Err(RejectReason::ForcePushOnProtected {
-                ref_name: RefName::new("refs/heads/main")
-            })
-        );
+        // Force-push refused when the ruleset does NOT allow it — even for a bypass/admin pusher.
+        for bypass in [WRITER, ADMIN] {
+            assert_eq!(
+                evaluate_protected_ref_push(
+                    &RefName::new("refs/heads/main"),
+                    false,
+                    /*is_forced*/ true,
+                    bypass,
+                    &protected_ruleset(&[], false),
+                    &head,
+                    &[],
+                    &[],
+                    &[],
+                ),
+                Err(RejectReason::ForcePushOnProtected {
+                    ref_name: RefName::new("refs/heads/main")
+                })
+            );
+        }
         // The SAME force-push admits when the ruleset opts into `allow_force_push` (no required set).
         assert_eq!(
             evaluate_protected_ref_push(
                 &RefName::new("refs/heads/main"),
                 false,
                 true,
+                WRITER,
                 &protected_ruleset(&[], /*allow_force_push*/ true),
                 &head,
                 &[],
@@ -1276,6 +1358,7 @@ mod tests {
             &RefName::new("refs/heads/main"),
             false,
             false,
+            WRITER,
             &rs,
             &head,
             &[],
@@ -1293,6 +1376,7 @@ mod tests {
                 &RefName::new("refs/heads/main"),
                 false,
                 false,
+                WRITER,
                 &rs,
                 &head,
                 &["ci/build".into()],
@@ -1301,12 +1385,14 @@ mod tests {
             ),
             Err(RejectReason::ProtectedCheckNotGreen { .. })
         ));
-        // Both required contexts green-and-current for the head → ADMITTED (the ff push may proceed).
+        // Both required contexts green-and-current for the head → ADMITTED (the ff push may proceed;
+        // this ruleset requires 0 approvals / no CODEOWNERS, so the full ruleset half is satisfied).
         assert_eq!(
             evaluate_protected_ref_push(
                 &RefName::new("refs/heads/main"),
                 false,
                 false,
+                WRITER,
                 &rs,
                 &head,
                 &["ci/build".into(), "ci/test".into()],
@@ -1328,6 +1414,7 @@ mod tests {
                 &RefName::new("refs/heads/main"),
                 false,
                 false,
+                WRITER,
                 &rs,
                 &head,
                 &[],
@@ -1341,6 +1428,7 @@ mod tests {
                 &RefName::new("refs/heads/main"),
                 false,
                 false,
+                WRITER,
                 &rs,
                 &head,
                 &[],
@@ -1353,13 +1441,17 @@ mod tests {
 
     #[test]
     fn protected_direct_push_empty_required_set_admits_a_plain_fast_forward() {
-        // No required contexts → the checks half admits a plain ff (force/delete bans still apply).
+        // No required contexts + 0 approvals / no CODEOWNERS → the full gate admits a plain ff (the
+        // force/delete bans still apply). A repo that configures NO protection requirements permits a
+        // writer's fast-forward — GitHub-parity; the escalation the R2-exit cases below close is a
+        // repo that DOES configure required reviews/CODEOWNERS.
         let head = GitOid("cafe".into());
         assert_eq!(
             evaluate_protected_ref_push(
                 &RefName::new("refs/heads/main"),
                 false,
                 false,
+                WRITER,
                 &protected_ruleset(&[], false),
                 &head,
                 &[],
@@ -1380,6 +1472,7 @@ mod tests {
                 &RefName::new("refs/heads/main"),
                 false,
                 false,
+                WRITER,
                 &rs,
                 &head,
                 &["ci/".into()], // an empty-named context — malformed
@@ -1387,6 +1480,128 @@ mod tests {
                 &[],
             ),
             Err(RejectReason::ProtectedGateInput { .. })
+        ));
+    }
+
+    // ──── R2-EXIT BLOCKER: the writer→protected-branch escalation is closed ────
+
+    /// A ruleset that models the red-team's target: a protected `main` requiring a CI context AND a
+    /// human approval AND CODEOWNERS review — the shape a real repo protects `main` with.
+    fn strict_protected_ruleset() -> BranchProtectionRuleset {
+        BranchProtectionRuleset {
+            ref_pattern: "refs/heads/main".into(),
+            required_contexts: vec!["ci/build".into()],
+            required_approvals: 1,
+            require_codeowner_review: true,
+            require_conversation_resolution: false,
+            allow_force_push: false,
+        }
+    }
+
+    /// **THE EXPLOIT, FLIPPED TO DENIED (Defect 3).** A plain WRITER direct-pushes to a strict-protected
+    /// `main` carrying (even genuinely-green, producer-attested) required checks — but a direct push has
+    /// NO PR review context, so the required-approval + CODEOWNERS half is UNSATISFIABLE. DENIED, naming
+    /// the specific unmet ruleset reasons. The writer cannot land on protected main by pushing directly.
+    #[test]
+    fn writer_direct_push_to_strict_protected_ref_is_denied_by_the_full_ruleset() {
+        let head = GitOid("c0ffee".into());
+        let rs = strict_protected_ruleset();
+        // Even with the required context GREEN, the approvals + CODEOWNERS half blocks a direct push.
+        match evaluate_protected_ref_push(
+            &RefName::new("refs/heads/main"),
+            /*is_delete*/ false,
+            /*is_forced*/ false,
+            WRITER,
+            &rs,
+            &head,
+            &["ci/build".into()], // genuine (or forged) greens do NOT help — approvals/CODEOWNERS block
+            &[],
+            &[],
+        ) {
+            Err(RejectReason::ProtectedRulesetNotSatisfied { reasons, .. }) => {
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|r| matches!(r, BlockReason::InsufficientApprovals { need: 1, .. })),
+                    "a direct push carries 0 approvals — the 1 required is unmet: {reasons:?}"
+                );
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|r| matches!(r, BlockReason::CodeownerReviewMissing)),
+                    "a direct push has no CODEOWNERS approval: {reasons:?}"
+                );
+            }
+            other => panic!("expected ProtectedRulesetNotSatisfied, got {other:?}"),
+        }
+    }
+
+    /// A writer with NO greens on a strict-protected ref is denied at the CONTEXTS half first (still
+    /// DENIED — the escalation is closed regardless of which half fires first).
+    #[test]
+    fn writer_direct_push_without_greens_is_denied_at_the_contexts_half() {
+        let head = GitOid("d00d".into());
+        assert!(matches!(
+            evaluate_protected_ref_push(
+                &RefName::new("refs/heads/main"),
+                false,
+                false,
+                WRITER,
+                &strict_protected_ruleset(),
+                &head,
+                &[],
+                &[],
+                &[],
+            ),
+            Err(RejectReason::ProtectedCheckNotGreen { .. })
+        ));
+    }
+
+    /// **The LEGIT bypass (Defect 2): an admin / `protected_push` pusher CAN direct-push a protected
+    /// ref** (a fast-forward) even against a strict ruleset it cannot otherwise satisfy — the required
+    /// hotfix/admin path. Force/delete bans still apply to admin (proven above).
+    #[test]
+    fn admin_bypass_may_direct_push_a_strict_protected_ref() {
+        let head = GitOid("ba5e".into());
+        assert_eq!(
+            evaluate_protected_ref_push(
+                &RefName::new("refs/heads/main"),
+                /*is_delete*/ false,
+                /*is_forced*/ false,
+                ADMIN,
+                &strict_protected_ruleset(),
+                &head,
+                &[], // no greens, no approvals — the bypass clears the checks/ruleset gate
+                &[],
+                &[],
+            ),
+            Ok(())
+        );
+    }
+
+    /// A ruleset requiring a human approval (but NO CODEOWNERS) still blocks a writer's direct push —
+    /// the `required_approvals` half alone is unsatisfiable for a direct push.
+    #[test]
+    fn writer_direct_push_blocked_by_required_approvals_alone() {
+        let head = GitOid("feed".into());
+        let rs = BranchProtectionRuleset {
+            required_approvals: 2,
+            require_codeowner_review: false,
+            ..protected_ruleset(&[], false)
+        };
+        assert!(matches!(
+            evaluate_protected_ref_push(
+                &RefName::new("refs/heads/main"),
+                false,
+                false,
+                WRITER,
+                &rs,
+                &head,
+                &[],
+                &[],
+                &[],
+            ),
+            Err(RejectReason::ProtectedRulesetNotSatisfied { .. })
         ));
     }
 

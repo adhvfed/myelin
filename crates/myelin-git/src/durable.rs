@@ -66,6 +66,11 @@ pub enum DurableError {
     },
     /// An object / ref / repo asked for was not present on disk.
     NotFound(String),
+    /// **A capability-scoped refusal (R2-exit).** The operation is well-formed and the object exists,
+    /// but the principal is NOT authorized to perform it — e.g. a non-CI-producer principal attempting
+    /// to report CI check facts (`git.checks.report` is a CI-PRODUCER capability, never an ordinary
+    /// writer one). Maps to a fail-closed 403 at the edge. Loud + specific (a refusal is diagnosable).
+    Forbidden(String),
 }
 
 impl std::fmt::Display for DurableError {
@@ -83,6 +88,7 @@ impl std::fmt::Display for DurableError {
                  {actual:?} — the ref did NOT move (non-fast-forward / lost-update)"
             ),
             DurableError::NotFound(m) => write!(f, "durable git not found: {m}"),
+            DurableError::Forbidden(m) => write!(f, "durable git forbidden: {m}"),
         }
     }
 }
