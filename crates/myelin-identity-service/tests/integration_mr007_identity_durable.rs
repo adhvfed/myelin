@@ -28,10 +28,11 @@
 use std::sync::Arc;
 
 use myelin_config::MyelinConfig;
-use myelin_events::{OutboxStore, Timestamp};
+use myelin_events::{EventEnvelope, Timestamp};
+use myelin_identity::iam_events::IAM_TUPLE_WRITTEN;
 use myelin_identity::{
-    DataRole, ObjectId, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RelName,
-    RelationTuple, TupleDelta,
+    DataRole, ObjectId, Precondition, Principal, PrincipalId, PrincipalKind, PrincipalStatus,
+    RelName, RelationTuple, TupleDelta, Zookie,
 };
 use myelin_identity_service::principal_store::{PrincipalProfile, PrincipalStore};
 use myelin_identity_service::tuple_store::TupleStore;
@@ -78,6 +79,35 @@ fn actor() -> Principal {
         PrincipalKind::Human,
         TenantId("acme".into()),
     )
+}
+
+/// A per-store-UNIQUE, lexically-monotonic id minter for the durable tuple stores. The default
+/// `MonotonicMinter` resets to `0` per store, so every store's first co-committed `iam.tuple_written`
+/// mints the SAME `event_id` — which the global `outbox` `UNIQUE(event_id)` collapses via
+/// `ON CONFLICT DO NOTHING` when suites share the live DB (masking the co-commit). The production
+/// wall-clock+random ULID source (P-S12) is globally unique; this test double reproduces that
+/// property via a per-store `base` so the BUS-2-exact co-commit is observable in isolation.
+struct UniqueMinter {
+    base: String,
+    n: std::sync::atomic::AtomicU64,
+}
+
+impl UniqueMinter {
+    fn new(base: impl Into<String>) -> Self {
+        UniqueMinter {
+            base: base.into(),
+            n: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl myelin_events::IdMinter for UniqueMinter {
+    fn mint(&self) -> myelin_events::Ulid {
+        // `01J` prefix + the per-store base + a zero-padded counter: lexically-monotonic WITHIN the
+        // store (per-aggregate ordering) and globally unique ACROSS stores (the base).
+        let n = self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        myelin_events::Ulid(format!("01J{}{n:012}", self.base))
+    }
 }
 
 fn tuple(object: &str, relation: &str, subject: &str) -> RelationTuple {
@@ -157,8 +187,8 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
         DurablePrincipalBacking::new(app.clone()),
         handle.clone(),
     );
-    let tstore1 = TupleStore::with_pg(
-        OutboxStore::new(),
+    let tstore1 = TupleStore::with_pg_minter(
+        Arc::new(UniqueMinter::new(format!("{suffix}w1"))),
         DurableTupleBacking::new(app.clone()),
         handle.clone(),
     );
@@ -207,11 +237,7 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
         DurablePrincipalBacking::new(app.clone()),
         handle.clone(),
     );
-    let tstore2 = TupleStore::with_pg(
-        OutboxStore::new(),
-        DurableTupleBacking::new(app.clone()),
-        handle.clone(),
-    );
+    let tstore2 = TupleStore::with_pg(DurableTupleBacking::new(app.clone()), handle.clone());
 
     // Principal ROW durability (the MR-007 claim): kind/role/status/profile_ref present + correct.
     let read = pstore2
@@ -260,6 +286,11 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
     ] {
         let _ = sqlx::query(sql).bind(&tenant).execute(admin.db_pool()).await;
     }
+    // The co-committed iam.tuple_written rows for this tenant (BUS-2 exact now emits into the outbox).
+    let _ = sqlx::query("DELETE FROM outbox WHERE aggregate LIKE $1")
+        .bind(format!("iam:tuple:{tenant}:%"))
+        .execute(admin.db_pool())
+        .await;
     println!("OK [1]: principal row + profile ciphertext + tuple edges durable across a fresh instance.");
 }
 
@@ -295,8 +326,11 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
 
     let pstore =
         PrincipalStore::with_pg(kms.clone(), DurablePrincipalBacking::new(app.clone()), handle.clone());
-    let tstore =
-        TupleStore::with_pg(OutboxStore::new(), DurableTupleBacking::new(app.clone()), handle.clone());
+    let tstore = TupleStore::with_pg_minter(
+        Arc::new(UniqueMinter::new(format!("{suffix}w2"))),
+        DurableTupleBacking::new(app.clone()),
+        handle.clone(),
+    );
 
     // Tenant A writes a principal + a tuple.
     let alice = PrincipalId("p:alice".into());
@@ -369,6 +403,8 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
         "DELETE FROM rebac_tuple WHERE tenant_id = $1 OR tenant_id = $2",
         "DELETE FROM principal WHERE tenant_id = $1 OR tenant_id = $2",
         "DELETE FROM credential_link WHERE tenant_id = $1 OR tenant_id = $2",
+        "DELETE FROM outbox WHERE aggregate LIKE 'iam:tuple:' || $1 || ':%' \
+         OR aggregate LIKE 'iam:tuple:' || $2 || ':%'",
     ] {
         let _ = sqlx::query(sql)
             .bind(&tenant_a)
@@ -380,7 +416,10 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
 }
 
 // =================================================================================================
-// 3 — Outbox co-commit on the durable tuple write (emit-iff-the-durable-write-succeeded).
+// 3 — Outbox co-commit on the durable tuple write, into the SAME-DB outbox table (BUS-2 exact —
+//     MR-009b W3b.3). A committed write lands EXACTLY one iam.tuple_written row in the co-located
+//     `outbox` table (not a separate in-memory store); an aborted write (failed precondition)
+//     lands NONE — commit/abort together (0 ghost / 0 lost).
 // =================================================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -396,6 +435,11 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
         .expect("identity durable migrations");
+    // The co-located `outbox` table (the frozen 2.3 shape) the tuple write co-commits into.
+    admin
+        .migrate_foundation()
+        .await
+        .expect("foundation (outbox) migration");
     let Some(app) = app_provider().await else {
         return;
     };
@@ -405,11 +449,38 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
     let tenant = format!("mr007-ob-{suffix}");
     let s = scope(&tenant, &region);
 
-    let outbox = OutboxStore::new();
-    let tstore = TupleStore::with_pg(outbox.clone(), DurableTupleBacking::new(app.clone()), handle);
+    // The per-object aggregate key the iam.tuple_written draft stamps: `iam:tuple:<tenant>:<object>`.
+    let aggregate = format!("iam:tuple:{tenant}:repo:core");
 
-    let depth_before = outbox.outbox_depth();
-    tstore
+    // Count the co-located outbox rows for THIS write's aggregate (RLS-free infra table; read it
+    // straight via the admin pool — the outbox carries no tenant column, contract 2.3).
+    async fn outbox_count(pool: &sqlx::PgPool, aggregate: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM outbox WHERE aggregate = $1")
+            .bind(aggregate)
+            .fetch_one(pool)
+            .await
+            .expect("count outbox rows")
+    }
+
+    let tstore = TupleStore::with_pg_minter(
+        Arc::new(UniqueMinter::new(suffix.clone())),
+        DurableTupleBacking::new(app.clone()),
+        handle,
+    );
+
+    // Pre-clean any stale row for this aggregate left by an aborted prior run (idempotent).
+    let _ = sqlx::query("DELETE FROM outbox WHERE aggregate = $1")
+        .bind(&aggregate)
+        .execute(admin.db_pool())
+        .await;
+    assert_eq!(
+        outbox_count(admin.db_pool(), &aggregate).await,
+        0,
+        "no outbox row for this aggregate before the write"
+    );
+
+    // (a) A COMMITTED write → EXACTLY one iam.tuple_written row in the SAME-DB outbox table.
+    let z = tstore
         .write_tuples(
             &s,
             &actor(),
@@ -420,13 +491,63 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
         )
         .expect("durable tuple write");
     assert_eq!(
-        outbox.outbox_depth(),
-        depth_before + 1,
-        "a committed durable write emitted exactly one iam.tuple_written event (co-commit)"
+        outbox_count(admin.db_pool(), &aggregate).await,
+        1,
+        "a committed durable write co-committed EXACTLY one iam.tuple_written row (BUS-2 exact)"
     );
 
-    for sql in ["DELETE FROM rebac_tuple WHERE tenant_id = $1"] {
-        let _ = sqlx::query(sql).bind(&tenant).execute(admin.db_pool()).await;
+    // The row's SHAPE is preserved (consumers cannot tell the durable path apart): same type, the
+    // write's zookie in the payload, no inline PII.
+    let env_json: serde_json::Value =
+        sqlx::query_scalar("SELECT envelope FROM outbox WHERE aggregate = $1")
+            .bind(&aggregate)
+            .fetch_one(admin.db_pool())
+            .await
+            .expect("read the co-committed outbox envelope");
+    let env: EventEnvelope =
+        serde_json::from_value(env_json).expect("the outbox row is a canonical EventEnvelope");
+    assert_eq!(env.type_.0, IAM_TUPLE_WRITTEN, "the co-committed event is iam.tuple.written");
+    assert_eq!(env.payload["zookie"], serde_json::json!(z.0), "it carries the write's zookie");
+    assert!(!env.contains_personal_data, "the iam.* event carries no inline PII");
+    assert_eq!(
+        env.actor.0.principal_id.0, "p:writer",
+        "attribution by opaque principal_id only"
+    );
+
+    // (b) An ABORTED write (stale precondition) co-commits NOTHING — the outbox count is UNCHANGED
+    // (0 ghost: no event without its committed tuple write).
+    let stale = Zookie("zk-00000000000000000000".into());
+    let err = tstore
+        .write_tuples(
+            &s,
+            &actor(),
+            &[TupleDelta::Add(tuple("repo:core", "writer", "p:bob"))],
+            Some(&Precondition {
+                expected_zookie: Some(stale),
+            }),
+            None,
+            Timestamp("2026-06-26T00:00:01Z".into()),
+        )
+        .expect_err("a stale precondition aborts the write");
+    assert!(
+        matches!(err, myelin_identity_service::tuple_store::WriteError::PreconditionFailed { .. }),
+        "the aborted write is a precondition failure"
+    );
+    assert_eq!(
+        outbox_count(admin.db_pool(), &aggregate).await,
+        1,
+        "the aborted write co-committed NO outbox row (0 ghost — commit/abort together)"
+    );
+
+    for sql in [
+        "DELETE FROM rebac_tuple WHERE tenant_id = $1",
+        "DELETE FROM outbox WHERE aggregate = $1",
+    ] {
+        let bind = if sql.contains("outbox") { &aggregate } else { &tenant };
+        let _ = sqlx::query(sql).bind(bind).execute(admin.db_pool()).await;
     }
-    println!("OK [3]: a committed durable tuple write co-commits exactly one outbox event.");
+    println!(
+        "OK [3]: a committed durable tuple write co-commits EXACTLY one iam.tuple_written row into \
+         the SAME-DB outbox; an aborted write co-commits none (0 ghost)."
+    );
 }
