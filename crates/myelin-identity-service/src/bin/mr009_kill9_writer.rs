@@ -31,7 +31,7 @@ use std::time::Duration;
 use myelin_config::MyelinConfig;
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, EventEnvelope, EventId, EventType,
-    OutboxStore, Timestamp, Visibility,
+    IdMinter, Timestamp, Ulid, Visibility,
 };
 use myelin_identity::{
     DataRole, ObjectId, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RelName,
@@ -72,6 +72,33 @@ fn admin_config() -> MyelinConfig {
 fn seal_key() -> SealKey {
     let hex = std::env::var("MYELIN_KMS_SEAL_KEY").unwrap_or_else(|_| DEFAULT_SEAL_HEX.to_string());
     SealKey::from_encoded(&hex).expect("MYELIN_KMS_SEAL_KEY must be 64 hex chars")
+}
+
+/// A per-run-UNIQUE, lexically-monotonic id minter for the durable tuple store's co-committed
+/// `iam.tuple_written` event (MR-009b W3b.3). The default `MonotonicMinter` resets to `0` per store,
+/// so every run mints the SAME `event_id` — which the global `outbox` `UNIQUE(event_id)` collapses
+/// via `ON CONFLICT DO NOTHING`, masking the co-commit when suites share the live DB. The production
+/// wall-clock+random ULID source (P-S12) is globally unique; this seeds uniqueness from the run-id so
+/// each kill-9 run's event survives independently (the id stays lexically-monotonic within the store).
+struct RunSeededMinter {
+    base: String,
+    n: std::sync::atomic::AtomicU64,
+}
+
+impl RunSeededMinter {
+    fn new(base: impl Into<String>) -> RunSeededMinter {
+        RunSeededMinter {
+            base: base.into(),
+            n: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl IdMinter for RunSeededMinter {
+    fn mint(&self) -> Ulid {
+        let n = self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ulid(format!("01J{}{n:012}", self.base))
+    }
 }
 
 fn scope(tenant: &str, region: &str) -> myelin_storage::TenantScope {
@@ -257,8 +284,11 @@ async fn identity_family(
         DurablePrincipalBacking::new(app.clone()),
         handle.clone(),
     );
-    let tstore = TupleStore::with_pg(
-        OutboxStore::new(),
+    // The durable S3 tuple store — its iam.tuple_written emit co-commits into the SAME rebac_tuple
+    // tx as the write (MR-009b W3b.3), so no separate OutboxStore is threaded here. A run-seeded
+    // minter keeps the co-committed event_id unique across runs sharing the live outbox.
+    let tstore = TupleStore::with_pg_minter(
+        Arc::new(RunSeededMinter::new(id_tenant(run))),
         DurableTupleBacking::new(app.clone()),
         handle.clone(),
     );
