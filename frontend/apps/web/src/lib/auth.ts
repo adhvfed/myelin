@@ -83,6 +83,16 @@ function assertDevLoginAllowed(): void {
  */
 export const loginDev = action(async () => {
   "use server";
+  // R2.5 — BUILD-TIME kill switch (defense-in-depth ON TOP of the R0.6 runtime guard below). In a
+  // production BUILD Vite replaces `import.meta.env.PROD` with the literal `true`, so everything
+  // after this `throw` is statically UNREACHABLE — the bundler dead-code-eliminates the dev-token
+  // issuance and tree-shakes the now-unused `dev-contract` import (the well-known `DEV_ACCESS_TOKEN`)
+  // OUT of the production bundle. The seam is thus structurally absent in prod, not merely refused at
+  // runtime. In a dev/test build `import.meta.env.PROD` is `false`, so the seam is retained and the
+  // runtime R0.6 guard (`assertDevLoginAllowed`) still gates it on `MYELIN_DEV_LOGIN`.
+  if (import.meta.env.PROD) {
+    throw redirect("/login");
+  }
   assertDevLoginAllowed();
   issueSession({
     token: DEV_ACCESS_TOKEN,
