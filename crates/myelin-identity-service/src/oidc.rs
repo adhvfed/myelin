@@ -1173,6 +1173,169 @@ mod tests {
         assert_eq!(a.scheme, scheme::SAML);
     }
 
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+    // R2.5 — the WIRED-PRODUCTION-AUTHENTICATOR corpus. These drive the real OIDC verifier THROUGH
+    // `HumanSsoAuthenticator::production_with_oidc` (the constructor the edge main wires) over a
+    // seeded S1 directory — proving a VALID OIDC token authenticates end-to-end to the right
+    // Principal (tenant/region from the VERIFIED claims, never a path), and forgeries are refused.
+    // The verifier built inside `production_with_oidc` uses the SYSTEM clock, so these tokens carry
+    // REAL wall-clock timestamps (not the pinned `NOW`).
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+
+    fn real_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// Seed an active OIDC-linked principal `p:alice` in tenant `acme` / region `eu-west` and build
+    /// the wired production authenticator over an RSA JWKS — returning `(auth, rsa_key)` so the test
+    /// can mint genuinely-signed tokens against the published key.
+    fn wired_auth() -> (crate::authenticate::HumanSsoAuthenticator, RsaKey) {
+        use crate::authenticate::HumanSsoAuthenticator;
+        use crate::principal_store::PrincipalStore;
+        use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
+        use myelin_storage::{KmsEngine, TenantScope};
+
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        let admin = Principal::stub(
+            PrincipalId("admin".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        );
+        let sc = TenantScope::from_verified_token(&admin, Region("eu-west".into()));
+        store
+            .put_principal(
+                &sc,
+                PrincipalId("p:alice".into()),
+                PrincipalKind::Human,
+                DataRole::Processor,
+                PrincipalStatus::Active,
+                None,
+            )
+            .unwrap();
+        store
+            .link_credential(&sc, scheme::OIDC, "oidc-sub-1", &PrincipalId("p:alice".into()))
+            .unwrap();
+
+        let key = RsaKey::generate();
+        let jwks = JwkSet::new().with_key("rsa-1", key.jwk());
+        let cfg = OidcConfig::new("https://idp.example.com", "myelin-rp");
+        let auth = HumanSsoAuthenticator::production_with_oidc(store, Some((cfg, jwks)));
+        (auth, key)
+    }
+
+    /// Claims valid RIGHT NOW (real wall clock), with a caller-chosen `jti` so the replay guard does
+    /// not collide across cases in one authenticator.
+    fn live_claims(jti: &str) -> serde_json::Value {
+        let now = real_now();
+        serde_json::json!({
+            "iss": "https://idp.example.com",
+            "aud": "myelin-rp",
+            "sub": "oidc-sub-1",
+            "exp": now + 3600,
+            "nbf": now - 60,
+            "iat": now - 60,
+            "jti": jti,
+            "tenant": "acme",
+            "region": "eu-west",
+        })
+    }
+
+    /// **THE R2.5 END-TO-END PROOF — a VALID OIDC token authenticates through the wired production
+    /// authenticator to the right Principal, with tenant/region from the VERIFIED claims (never the
+    /// URL path).** The path asserts `globex`; the resolved Principal is `acme`'s (the IDOR floor).
+    #[test]
+    fn wired_production_authenticates_valid_oidc_token_to_principal() {
+        use myelin_identity::{PrincipalId, PrincipalKind};
+        let (auth, key) = wired_auth();
+        let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
+        let cl = live_claims("wired-valid-1");
+        let token = jwt(&header, &cl, &key.sign(signing_input(&header, &cl).as_bytes()));
+
+        // The URL path LIES (globex); the credential is IdP-verified for acme.
+        let p = auth
+            .authenticate(&cred(token), Some(&TenantId("globex".into())))
+            .expect("a valid OIDC token must authenticate through the wired production authenticator");
+        assert_eq!(p.principal_id, PrincipalId("p:alice".into()));
+        assert_eq!(
+            p.tenant,
+            TenantId("acme".into()),
+            "tenant is the VERIFIED claim (acme), never the path (globex)"
+        );
+        assert_eq!(p.region, Region("eu-west".into()));
+        assert_eq!(p.kind, PrincipalKind::Human);
+    }
+
+    /// **The wired production authenticator REFUSES forgeries** — `alg:none`, wrong `iss`, wrong
+    /// `aud`, and an expired token each fail closed (they never resolve a Principal). Same
+    /// authenticator instance: none of these consume the `jti` (each is refused at/before the
+    /// pre-replay checks), so the corpus is independent.
+    #[test]
+    fn wired_production_rejects_forged_oidc_tokens() {
+        use myelin_identity::AuthzError;
+        let (auth, key) = wired_auth();
+        let sign = |header: &serde_json::Value, cl: &serde_json::Value| {
+            jwt(header, cl, &key.sign(signing_input(header, cl).as_bytes()))
+        };
+
+        // (a) alg:none — unsigned bypass.
+        let none = jwt(
+            &serde_json::json!({"alg": "none", "kid": "rsa-1"}),
+            &live_claims("wired-none"),
+            b"",
+        );
+        // (b) wrong issuer.
+        let mut cl_iss = live_claims("wired-iss");
+        cl_iss["iss"] = serde_json::json!("https://evil-idp.example.com");
+        let wrong_iss = sign(&serde_json::json!({"alg": "RS256", "kid": "rsa-1"}), &cl_iss);
+        // (c) wrong audience.
+        let mut cl_aud = live_claims("wired-aud");
+        cl_aud["aud"] = serde_json::json!("some-other-rp");
+        let wrong_aud = sign(&serde_json::json!({"alg": "RS256", "kid": "rsa-1"}), &cl_aud);
+        // (d) expired.
+        let mut cl_exp = live_claims("wired-exp");
+        cl_exp["exp"] = serde_json::json!(real_now() - 10_000);
+        let expired = sign(&serde_json::json!({"alg": "RS256", "kid": "rsa-1"}), &cl_exp);
+
+        for (label, token) in [
+            ("alg:none", none),
+            ("wrong-iss", wrong_iss),
+            ("wrong-aud", wrong_aud),
+            ("expired", expired),
+        ] {
+            let r = auth.authenticate(&cred(token), None);
+            assert!(
+                matches!(r, Err(AuthzError::FailClosed(_))),
+                "forged OIDC token ({label}) must fail closed through the wired authenticator, got {r:?}"
+            );
+        }
+    }
+
+    /// **`production_with_oidc(store, None)` keeps refuse-not-mock for OIDC** — with no IdP
+    /// configured, even a structurally-valid OIDC token is refused (`NotYetImplemented` from the
+    /// refuse-unsupported fallback), never resolved. This is the opt-in / boot-succeeds semantics.
+    #[test]
+    fn wired_production_without_oidc_refuses_oidc_scheme() {
+        use crate::authenticate::HumanSsoAuthenticator;
+        use crate::principal_store::PrincipalStore;
+        use myelin_identity::AuthzError;
+        use myelin_storage::KmsEngine;
+
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        let auth = HumanSsoAuthenticator::production_with_oidc(store, None);
+        let key = RsaKey::generate();
+        let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
+        let cl = live_claims("no-oidc-configured");
+        let token = jwt(&header, &cl, &key.sign(signing_input(&header, &cl).as_bytes()));
+        let r = auth.authenticate(&cred(token), None);
+        assert!(
+            matches!(r, Err(AuthzError::NotYetImplemented(_))),
+            "with no OIDC configured, an OIDC token must be refused (refuse-not-mock), got {r:?}"
+        );
+    }
+
     // ── A tiny, self-contained HMAC-SHA256 for the alg-confusion forgery ONLY (test code). ───────
     // This is NOT used by the verifier (which never accepts a symmetric alg); it exists only to MINT
     // the attacker's forged HS256 token so we can prove the verifier refuses it.
