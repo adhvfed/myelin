@@ -71,6 +71,12 @@ pub mod dogfood;
 /// `ci.result` merge wake EXACTLY ONCE (9.4 → merge-count == 1), and the balanced reserve/settle
 /// (11.7) — over the UNCHANGED producer seams, emitting its named green ([`e2e_wedge::E2eArtifact`]).
 /// The Agent-Fabric leg is AG-P24/P-480; the durable park/resume spine is `myelin-flow`'s P-477.
+///
+/// **MR-009b W6b2 — `#[cfg(any(test, feature = "test-support"))]`:** this whole in-process E2E-2 slice
+/// module constructs the now-`test-support`-gated in-memory `CostLedger::new`; nothing in the production
+/// graph references it, and its only caller (the `drill_ci_p34_*` test) reaches it via the
+/// `myelin-ci-controlplane/test-support` self dev-dependency.
+#[cfg(any(test, feature = "test-support"))]
 pub mod e2e_flagship;
 /// CI's slices of the whole-system E2E wedge (CI-P33 / P-493, M5): E2E-1 (the PR context pane —
 /// CI's check rows resolve per-viewer, 0 leak, `#step-<n>` anchor) + E2E-3 (spec-to-ship
@@ -212,10 +218,15 @@ pub use schedule_and_run_job::{complete_job, JobScheduleTerms, SchedulerJobRunne
 // on `job.done`. FLOOR named: the resource-second → credit/price MARKUP mapping is Commercial's (arch
 // 06 R-2 — the `MarkupPolicy` seam carries it; CI owns only the meter + the wholesale column).
 pub use metering::{
-    meter_resource_seconds, metered_units_for, reserve_settle_parity_drill, CiMeter, CostEventRow,
-    CostKind, FlatBpsMarkup, MarkupPolicy, Meter, MeteredResource, ReserveSettleParitySignal,
-    INSERT_COST_EVENT_QUERY, SELECT_COST_EVENTS_FOR_RUN_QUERY,
+    meter_resource_seconds, metered_units_for, CiMeter, CostEventRow, CostKind, FlatBpsMarkup,
+    MarkupPolicy, Meter, MeteredResource, ReserveSettleParitySignal, INSERT_COST_EVENT_QUERY,
+    SELECT_COST_EVENTS_FOR_RUN_QUERY,
 };
+// MR-009b W6b2 — the CI-D5 parity DRILL is `test-support`-gated (it builds the in-memory
+// `BudgetGate::new`); its re-export follows the same gate so the default build does not name a
+// non-existent item.
+#[cfg(any(test, feature = "test-support"))]
+pub use metering::reserve_settle_parity_drill;
 
 pub use holder::{
     ci_store_classifier, register_ci_holders, CiHolder, CiHolderRegistration, CiStoreClass,

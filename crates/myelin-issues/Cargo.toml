@@ -149,6 +149,11 @@ myelin-config = { path = "../myelin-config" }
 # engine is a dev-dependency (test scaffolding only — no runtime edge). EI-01 §7: prove against the
 # frozen engine, never re-define it.
 [dev-dependencies]
+# MR-009b W6b2 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN test
+# targets (the `src/e2e_flagship/tests.rs` + `src/dogfood.rs` unit tests + `tests/e2e_flagship_iss_p35.rs`
+# + `tests/iss_p37_dogfood_drill.rs`) that call the now-gated dogfood/agent-flagship drills. The
+# sanctioned Cargo idiom; it does NOT affect the normal `cargo build`.
+myelin-issues = { path = ".", features = ["test-support"] }
 # MR-009b Wave 3 follow-up (found by the Wave-5 per-crate isolation check, the 5340c47 bug class):
 # this crate's OWN tests (drill_iss_p06_emit_iff_committed / drill_iss_d5_reorder_zero_clobber)
 # construct the events in-memory `DedupLedger::new()` double, which is
@@ -210,6 +215,11 @@ myelin-lints = { path = "../myelin-lints" }
 
 [features]
 default = []
+# MR-009b W6b2 — the `test-support` cargo feature. The dogfood + agent-flagship in-process drills
+# (`run_e2e_2_issues_flagship`, `run_issues_over_myelins_own_work` → `run_issues_truth_up_scorecard`)
+# construct the now-`test-support`-gated in-memory `CostLedger::new()`, so they are gated behind
+# `#[cfg(any(test, feature = "test-support"))]`. Forwards to `myelin-storage/test-support`. DEV/TEST only.
+test-support = ["myelin-storage/test-support"]
 # ISS-P05 (P-371): the live-stack schema-apply proof (the issue-spine migration against real
 # Postgres). ISS-P06 (P-372) ADDS the live-stack emit-iff-committed proof for the write path (the
 # issue state row + its issue.* event co-commit in ONE Postgres tx; a rolled-back tx writes 0 of

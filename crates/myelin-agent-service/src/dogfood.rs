@@ -146,6 +146,12 @@ fn text(s: &str) -> Inline {
 /// against the Myelin wallet, the Mock brain runs (billing 0 metered units), the run settles (reserved
 /// == settled — the BALANCED ledger), and a content-addressed 13.1 trace is written for the run.
 /// `commit_oid` is the Myelin commit CI failed on (opaque, PII-free).
+///
+/// **MR-009b W6b2 — `#[cfg(any(test, feature = "test-support"))]`:** the reserve-at-dispatch leg
+/// constructs the now-`test-support`-gated in-memory `CostLedger::new`; its callers (the dogfood
+/// scorecard + `tests/ag_p26_dogfood_drill.rs`) reach it via the `myelin-agent-service/test-support`
+/// self dev-dependency.
+#[cfg(any(test, feature = "test-support"))]
 pub fn run_myelin_triage_on_ci_failure(commit_oid: &str, run_id: u128) -> TriageFace {
     // ── explicit-first dispatch (§3.4 / CHAT-1): the CI-fail Signal DISPATCHES; a mention NOTIFIES. ──
     let signal = classify(&DispatchTrigger::ExplicitRun(format!(
@@ -250,6 +256,10 @@ impl FabricDogfoodArtifact {
 /// **Run Myelin's OWN triage agent on the self-hosting CI graph (P-517).** The dogfood loop: drives the
 /// production Agent-Fabric surface over the Myelin self-tenant, REUSING the already-shipped surface
 /// (EI-01 §7, never a second engine). `date` is the run stamp.
+///
+/// **MR-009b W6b2 — `#[cfg(any(test, feature = "test-support"))]`:** it calls the now-gated
+/// `run_myelin_triage_on_ci_failure` (which builds the in-memory `CostLedger`); gated with it.
+#[cfg(any(test, feature = "test-support"))]
 pub fn run_fabric_over_myelins_own_work(date: &str) -> FabricDogfoodArtifact {
     FabricDogfoodArtifact {
         date: date.to_string(),

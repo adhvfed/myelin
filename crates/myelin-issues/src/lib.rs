@@ -272,6 +272,11 @@ pub mod cross_cell_rollup;
 pub mod declares;
 pub mod dek;
 pub mod dogfood;
+// MR-009b W6b2 — the E2E-2 flagship slice constructs the now-`test-support`-gated in-memory
+// `CostLedger::new`; the whole in-process drill module (+ its re-exports below) is gated with it.
+// Nothing in the production graph references it; its callers (the dogfood scorecard + the
+// `e2e_flagship_iss_p35` / `e2e_flagship/tests.rs` drills) reach it via `myelin-issues/test-support`.
+#[cfg(any(test, feature = "test-support"))]
 pub mod e2e_flagship;
 pub mod e2e_lineage;
 pub mod e2e_wedge;
@@ -700,6 +705,10 @@ pub use e2e_wedge::{
 // the SAME `plan_agent_ci_gated_transition`/`LinkedPrCheck`/`spend_bearing_run`/`per_effect_idem_key` —
 // no new contract, no second governance/cost engine (EI-01 §7). Runs under the MOCK agent runtime
 // (real-LLM is the post-M5 swap, R-10). FLOOR named: none new (the world-scale 30x load is ISS-P33's).
+// MR-009b W6b2 — the whole `e2e_flagship` in-process drill module is `test-support`-gated (it builds
+// the in-memory `CostLedger::new`); its re-exports (the runner + the two scenario/card-id consts)
+// follow the same gate.
+#[cfg(any(test, feature = "test-support"))]
 pub use e2e_flagship::{run_e2e_2_issues_flagship, CLOSE_CARD_ID, E2E_FLAGSHIP_SCENARIO};
 
 // ISS-P36 (P-499, M5-I9): the whole-system E2E-3 wedge — spec-to-ship traceability, the Issues side
@@ -732,11 +741,14 @@ pub use e2e_lineage::{
 // new (the world-scale 30x load is ISS-P33's; the pixel-level browser drive is the UI follow-on's, recorded
 // honestly as a named floor).
 pub use dogfood::{
-    myelin_issue_backlog, proven_issues_rows, run_issues_over_myelins_own_work,
-    run_issues_truth_up_scorecard, IssuesDogfoodArtifact, IssuesIncident, IssuesRowStatus,
-    IssuesTruthUpPass, IssuesTruthUpRed, IssuesTruthUpScorecard, IssuesTruthUpVerdict, MyelinIssue,
-    ProvenIssuesRow, MYELIN_SELF_REGION, MYELIN_SELF_TENANT,
+    myelin_issue_backlog, proven_issues_rows, run_issues_truth_up_scorecard, IssuesDogfoodArtifact,
+    IssuesIncident, IssuesRowStatus, IssuesTruthUpPass, IssuesTruthUpRed, IssuesTruthUpScorecard,
+    IssuesTruthUpVerdict, MyelinIssue, ProvenIssuesRow, MYELIN_SELF_REGION, MYELIN_SELF_TENANT,
 };
+// MR-009b W6b2 — the dogfood DRIVER (`run_issues_over_myelins_own_work`) is `test-support`-gated (it
+// calls the gated E2E-2 flagship runner); its re-export follows the same gate.
+#[cfg(any(test, feature = "test-support"))]
+pub use dogfood::run_issues_over_myelins_own_work;
 pub use switch_test::{
     switch_capability_matrix, switch_surface_drive_record, IssuesOverlay, IssuesSwitchTest,
     IssuesSwitchVerdict, PrimaryScreenState, SwitchCapability,

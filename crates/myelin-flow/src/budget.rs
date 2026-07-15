@@ -217,16 +217,31 @@ struct GateInner {
 }
 
 impl BudgetGate {
-    /// Build a bookend over a `wallet`. The Storage ledger is created fresh; telemetry is absent
-    /// (reject-rate not recorded) — use [`BudgetGate::with_telemetry`] to attach it.
+    /// Build a bookend over a `wallet` backed by a fresh **in-memory** Storage ledger. **MR-009b W6b2:
+    /// `#[cfg(any(test, feature = "test-support"))]` — this constructs the now-`test-support`-gated
+    /// in-memory [`CostLedger::new`] TEST DOUBLE.** The PRODUCTION constructors are
+    /// [`BudgetGate::with_pg`] (durable ledger from a provider) / [`BudgetGate::new_durable`] (a
+    /// caller-supplied ledger). Telemetry is absent — use [`BudgetGate::with_telemetry`] to attach it.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(wallet: Wallet) -> BudgetGate {
+        BudgetGate::new_durable(wallet, CostLedger::new())
+    }
+
+    /// Build a bookend over a `wallet` + a caller-supplied Storage [`CostLedger`] (always-compiled —
+    /// the injection seam the durable production wiring uses). Telemetry is absent (chainable on
+    /// [`BudgetGate::with_telemetry`]).
+    pub fn new_durable(wallet: Wallet, ledger: CostLedger) -> BudgetGate {
         BudgetGate {
-            inner: Arc::new(Mutex::new(GateInner {
-                wallet,
-                ledger: CostLedger::new(),
-            })),
+            inner: Arc::new(Mutex::new(GateInner { wallet, ledger })),
             telemetry: None,
         }
+    }
+
+    /// Build a bookend over a `wallet` backed by the **durable** production [`CostLedger`] over the
+    /// MR-022 provider (always-compiled — the `cost_reservation`/`cost_event` FORCE-RLS tables). **Must
+    /// be called inside a tokio runtime** (the durable ledger captures `Handle::current()`).
+    pub fn with_pg(wallet: Wallet, provider: myelin_storage::SubstrateProvider) -> BudgetGate {
+        BudgetGate::new_durable(wallet, CostLedger::with_pg(provider))
     }
 
     /// Attach a [`FlowTelemetry`] so each reserve attempt/reject + each settle is recorded into the

@@ -205,6 +205,12 @@ impl HitlApplyLedger {
 /// 2. 0 effect outside the `∩` (an UNDECLARED edge is BLOCKED — the FSM is Issues' slice of the `∩`);
 /// 3. the governed transition applies EXACTLY ONCE across the kill + the duplicate approval;
 /// 4. reserve/settle is balanced (reserved == billed + refunded, one cost event per unit, 0 interrupt).
+///
+/// **MR-009b W6b2 — `#[cfg(any(test, feature = "test-support"))]`:** this in-process flagship slice
+/// constructs the now-`test-support`-gated in-memory `CostLedger::new`; its callers (the
+/// dogfood scorecard + the `e2e_flagship_iss_p35` / `e2e_flagship/tests.rs` drills) reach it via the
+/// `myelin-issues/test-support` self dev-dependency.
+#[cfg(any(test, feature = "test-support"))]
 pub fn run_e2e_2_issues_flagship() -> IssuesE2eArtifact {
     let mut leaks: u64 = 0;
     let tenant = tenant();

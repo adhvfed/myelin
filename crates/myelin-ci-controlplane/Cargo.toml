@@ -116,6 +116,11 @@ myelin-config = { path = "../myelin-config", optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
 
 [dev-dependencies]
+# MR-009b W6b2 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN test
+# targets (the `src/metering_tests.rs` unit tests + `tests/drills_ci_p17_*` + `tests/drill_ci_p34_*`
+# that call the now-gated `reserve_settle_parity_drill` / `run_e2e2_ci_flagship_slice`). The sanctioned
+# Cargo idiom; it does NOT affect the normal `cargo build`, which stays durable-by-default.
+myelin-ci-controlplane = { path = ".", features = ["test-support"] }
 # MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
 # `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests (the same
 # posture as the Wave-2/3 identity/events test-support dev-dependencies). DEV-only — never in the
@@ -152,6 +157,13 @@ toml.workspace = true
 
 [features]
 default = []
+# MR-009b W6b2 — the `test-support` cargo feature. Gates the two ledger-constructing DRILL pub-fns
+# (`metering::reserve_settle_parity_drill` builds `myelin_flow::BudgetGate::new`; `e2e_flagship::
+# run_e2e2_ci_flagship_slice` builds the in-memory `CostLedger::new`) behind
+# `#[cfg(any(test, feature = "test-support"))]`, so the default build stays durable-by-default. Forwards
+# to `myelin-flow/test-support` + `myelin-storage/test-support` (the two in-memory doubles the drills
+# reach). DEV/TEST only — never in the production DAG.
+test-support = ["myelin-flow/test-support", "myelin-storage/test-support"]
 # `myelin-storage/integration` exposes the s3blob module (the real S3BlobStore over RustFS/Scaleway)
 # the CI-P20 log-pipeline seal flushes its sealed segments to.
 integration = [

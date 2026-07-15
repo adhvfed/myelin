@@ -205,6 +205,12 @@ impl IssuesDogfoodArtifact {
 /// spec-to-ship lineage) on the Myelin self-tenant, REUSING the existing E2E runners (the SAME ACL
 /// chokepoint / governance FSM / reindex engine — EI-01 §7, never a second implementation). `date` is
 /// the run stamp.
+///
+/// **MR-009b W6b2 — `#[cfg(any(test, feature = "test-support"))]`:** it calls the now-gated
+/// `run_e2e_2_issues_flagship` (which builds the in-memory `CostLedger`); gated with it. Its callers
+/// (this crate's dogfood unit tests + `tests/iss_p37_dogfood_drill.rs`) reach it via the
+/// `myelin-issues/test-support` self dev-dependency.
+#[cfg(any(test, feature = "test-support"))]
 pub fn run_issues_over_myelins_own_work(date: &str) -> IssuesDogfoodArtifact {
     let backlog = myelin_issue_backlog();
     let issues_total = backlog.len();
