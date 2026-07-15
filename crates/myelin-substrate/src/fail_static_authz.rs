@@ -51,6 +51,37 @@ use crate::fail_static::{Answer, Clock, FailStatic, FailStaticSignals, SystemClo
 use crate::thresholds::FailStaticThreshold;
 use crate::{FailStaticError, Seconds, ServeError, StalenessBound};
 
+/// **Encode `(tenant, region, subject, permission, object, …)` segments into an INJECTIVE authz
+/// cache key (R2.3b).** The fail-static cache compares the FULL key by `Eq` (R2.3), which kills the
+/// 64-bit-hash aliasing — but only if two DISTINCT logical questions never serialize to the SAME
+/// key string. A naive `format!("{t}|{r}|{s}|{p}@{o}")` does NOT guarantee that: the segments are
+/// unconstrained user-controlled `String`s (an OIDC `sub` / SCIM id / an object ref carry no charset
+/// rule), so a subject id like `alice|view@repo:secret` can forge the delimiter structure and make a
+/// `(different-subject, different-object)` question produce a byte-identical key — a cross-principal
+/// cached-ALLOW replay the `Eq` comparison cannot catch (the strings really are equal).
+///
+/// This frames each segment **length-prefixed** as `{byte_len}:{segment}` and concatenates them.
+/// Decoding is unambiguous (read decimal digits up to the first `:`, then consume EXACTLY that many
+/// bytes — the segment bytes are counted, never scanned), so no segment's content can shift a frame
+/// boundary. The map `segments → key` is therefore injective: distinct segment sequences always
+/// yield distinct keys. The encoding stays roughly human-readable (`5:alice2:eu…`).
+///
+/// Both authz key builders (`myelin-git` `live_check::cache_key` and `myelin-refs-service`
+/// `resolve`) route through this ONE helper so the injective framing is defined once.
+pub fn encode_authz_key(segments: &[&str]) -> String {
+    // Pre-size: each frame is the segment bytes + its decimal length + one ':' — a small over-count
+    // (the length digits) that avoids reallocations on the hot path.
+    let mut out = String::with_capacity(segments.iter().map(|s| s.len() + 3).sum());
+    for seg in segments {
+        // `str::len()` is the BYTE length — the count the decoder consumes; framing on bytes (not
+        // chars) keeps it injective over arbitrary UTF-8 segment content.
+        out.push_str(&seg.len().to_string());
+        out.push(':');
+        out.push_str(seg);
+    }
+    out
+}
+
 /// The freshness window seed (seconds) of the authz fail-static ladder: within it a cached coarse
 /// answer is served fresh even on a hiccup (no degradation). A v1 seed well under `static_max`;
 /// the measured value is tuned at scale. `static_max` (W) is read from the thresholds file
