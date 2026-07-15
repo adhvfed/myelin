@@ -892,7 +892,8 @@ pub use identity_durable::{
     DurableRevocationBacking, DurableRevocationRow, DurableTupleBacking, TupleEdgeOp,
 };
 pub use provider::{
-    foundation_migrations, ProviderError, SubstrateProvider, DEFAULT_MAX_CONNECTIONS,
+    all_durable_migrations, durable_migration_groups, foundation_migrations, ProviderError,
+    SubstrateProvider, DEFAULT_MAX_CONNECTIONS,
 };
 pub use pseudonym_durable::{
     pseudonym_durable_migrations, DurableErasureLedgerBacking, DurableErasureLedgerRow,

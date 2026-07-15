@@ -25,7 +25,7 @@
 use myelin_config::{Mode, MyelinConfig};
 use myelin_events::OutboxStore;
 use myelin_knowledge::knowledge_app_spec;
-use myelin_storage::{PgOutboxBacking, SubstrateProvider};
+use myelin_storage::{all_durable_migrations, HotTables, PgOutboxBacking, SubstrateProvider};
 use myelin_substrate::{serve, Config};
 use std::sync::Arc;
 
@@ -64,6 +64,19 @@ async fn main() {
         eprintln!(
             "knowledge: cannot apply the substrate foundation migrations (outbox/consumer_dedup): {e}"
         );
+        std::process::exit(1);
+    }
+    // W7.2 (doc-18 Part 5) — THE BOOT-MIGRATIONS FIX: apply the FULL durable migration aggregate
+    // (identity 0010–0019, pseudonym 0020–0022, placement 0030–0039, kms 0040–0042, cost/erasure
+    // 0050–0053) after the foundation, so EVERY durable store bound at this main's boot has its
+    // tables on a fresh DB (doc-18: a main that migrated only a piecemeal subset left the stores it
+    // constructs writing to un-migrated tables). Idempotent + advisory-locked (safe on re-boot);
+    // FAIL LOUD, never a silent fallback.
+    if let Err(e) = provider
+        .migrate(&all_durable_migrations(), &HotTables::none())
+        .await
+    {
+        eprintln!("knowledge: cannot apply the durable migration aggregate (identity/pseudonym/placement/kms/cost/erasure): {e}");
         std::process::exit(1);
     }
     // The DURABLE outbox (SI-007): committed events live in Postgres, not a per-process mutex.

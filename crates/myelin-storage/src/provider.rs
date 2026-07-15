@@ -99,6 +99,62 @@ pub fn foundation_migrations() -> Migrations {
     ])
 }
 
+/// The ORDERED list of every durable migration GROUP the platform owns, each returned by its own
+/// `*_durable_migrations()` constructor, in strictly-ascending id-range order (W7.2 / doc-18 Part 5).
+/// This is the SINGLE authority the aggregate [`all_durable_migrations`] is built FROM: the aggregate
+/// is nothing but the flattened concatenation of these groups, so a group **cannot** be in the boot
+/// sequence unless it is listed here, and the aggregate can never contain a migration that is not in
+/// one of these groups. Adding a new durable subsystem = add its constructor to THIS list (and the
+/// `boot_migration_ids_*` unit tests, which iterate the SAME list, keep the aggregate honest).
+///
+/// | group                              | id range      |
+/// |------------------------------------|---------------|
+/// | `identity_durable_migrations`      | `0010`–`0019` |
+/// | `pseudonym_durable_migrations`     | `0020`–`0022` |
+/// | `placement_durable_migrations`     | `0030`–`0039` |
+/// | `kms_durable_migrations`           | `0040`–`0042` |
+/// | `reserve_settle_durable_migrations`| `0050`        |
+/// | `restore_verify_durable_migrations`| `0051`        |
+/// | `post_pit_durable_migrations`      | `0052`        |
+/// | `bus_erasure_durable_migrations`   | `0053`        |
+///
+/// The substrate FOUNDATION (`0000`–`0001`, outbox + consumer_dedup) is deliberately NOT in this list:
+/// it stays the separate [`foundation_migrations`] / [`SubstrateProvider::migrate_foundation`] call
+/// (the substrate boot owns it). The full boot sequence at a service main is therefore
+/// `migrate_foundation()` THEN `migrate(&all_durable_migrations(), …)` — foundation + everything else,
+/// each exactly once.
+pub fn durable_migration_groups() -> Vec<Migrations> {
+    vec![
+        crate::identity_durable::identity_durable_migrations(),
+        crate::pseudonym_durable::pseudonym_durable_migrations(),
+        crate::placement_durable::placement_durable_migrations(),
+        crate::kms_durable::kms_durable_migrations(),
+        crate::reserve_settle_durable::reserve_settle_durable_migrations(),
+        crate::restore_verify_durable::restore_verify_durable_migrations(),
+        crate::reerase_durable::post_pit_durable_migrations(),
+        crate::events_durable::bus_erasure_durable_migrations(),
+    ]
+}
+
+/// **The provider-level DURABLE MIGRATION AGGREGATE (W7.2 / doc-18 Part 5 — the boot-migrations fix).**
+/// Composes EVERY durable migration group ([`durable_migration_groups`]) into one ordered
+/// [`Migrations`] in strictly-ascending id order (`0010`–`0053`), so a single boot call migrates the
+/// complete durable schema every service's stores bind to — closing the doc-18 LIVE DEFECT where a
+/// service main constructed durable stores (e.g. `PrincipalStore::with_pg`, needing identity
+/// `0010`–`0019`) but never migrated their tables, so the first write failed at runtime on a fresh DB.
+///
+/// Built FROM the group constructors (not a re-listed copy of the ids) so it **cannot drift**: it is
+/// exactly the flattened concatenation of [`durable_migration_groups`]. Excludes the substrate
+/// FOUNDATION (`0000`–`0001`) — that stays the separate [`SubstrateProvider::migrate_foundation`]
+/// call. Apply order at a main: `migrate_foundation()` then `migrate(&all_durable_migrations(), …)`.
+///
+/// The [`PgMigrator`] is idempotent + advisory-locked + version-recorded, so this is safe to apply at
+/// every boot and safe alongside any pre-existing per-group `migrate` call (the aggregate REPLACES the
+/// piecemeal calls; a residual one would just no-op).
+pub fn all_durable_migrations() -> Migrations {
+    Migrations::of(durable_migration_groups().into_iter().flat_map(|g| g.0))
+}
+
 /// **The production composition root.** Holds the REAL bounded [`PgPool`] (with reset-on-release
 /// wired) + the env-driven [`MyelinConfig`] every durable store is constructed through.
 #[derive(Clone)]
@@ -197,5 +253,75 @@ impl SubstrateProvider {
         rt: tokio::runtime::Handle,
     ) -> Box<dyn BlobStore + Send + Sync> {
         backend::blob_store(Backend::Real, &self.config, rt)
+    }
+}
+
+// =================================================================================================
+// W7.2 — the boot-migrations aggregate is well-formed (DB-FREE unit tests, doc-18 Part 5). These run
+// on the DEFAULT `cargo test -p myelin-storage` (no `integration` feature, no DB): they inspect only
+// the migration ids the constructors return.
+// =================================================================================================
+#[cfg(test)]
+mod boot_migrations_tests {
+    use super::*;
+
+    fn ids(m: &Migrations) -> Vec<&'static str> {
+        m.0.iter().map(|mg| mg.id).collect()
+    }
+
+    /// The aggregate's ids are STRICTLY ASCENDING (so the boot sequence applies FK/trigger deps in
+    /// the numerically-ordered order the groups were authored in) and DUPLICATE-FREE (no id is
+    /// applied twice — no two groups collide on an id).
+    #[test]
+    fn aggregate_ids_are_strictly_ascending_and_duplicate_free() {
+        let ids = ids(&all_durable_migrations());
+        assert!(!ids.is_empty(), "the aggregate is non-empty");
+        for w in ids.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "migration ids must be strictly ascending + duplicate-free, but {:?} !< {:?}",
+                w[0],
+                w[1]
+            );
+        }
+        // Non-vacuity: the full set is present (identity 0010 … bus-erasure 0053).
+        assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
+        assert_eq!(*ids.last().unwrap(), "0053_bus_erasure_ledger");
+    }
+
+    /// STRUCTURAL anti-drift: the aggregate is EXACTLY the flattened concatenation of every group in
+    /// [`durable_migration_groups`], so it is a superset of each group AND contains nothing else. A
+    /// newly-authored group that is added to `durable_migration_groups` is folded in automatically;
+    /// one that is NOT listed there is neither migrated nor counted here — the two cannot diverge.
+    #[test]
+    fn aggregate_is_exactly_the_concatenation_of_every_group() {
+        let groups = durable_migration_groups();
+        // (a) Each group is a contiguous, in-order SUBSET of the aggregate (nothing dropped/reordered).
+        let agg = ids(&all_durable_migrations());
+        let mut rebuilt: Vec<&'static str> = Vec::new();
+        for g in &groups {
+            let g_ids = ids(g);
+            assert!(!g_ids.is_empty(), "no group is empty");
+            for id in &g_ids {
+                assert!(agg.contains(id), "group id {id:?} must appear in the aggregate");
+            }
+            rebuilt.extend(g_ids);
+        }
+        // (b) The aggregate contains NOTHING beyond the groups (exact equality of the flattened list).
+        assert_eq!(
+            agg, rebuilt,
+            "the aggregate must be exactly the ordered concatenation of the groups — no drift"
+        );
+    }
+
+    /// The aggregate is DISJOINT from the substrate FOUNDATION (`0000`/`0001`): the boot sequence
+    /// `migrate_foundation()` + `migrate(&all_durable_migrations())` covers each id exactly once, so
+    /// keeping foundation a separate call never double-applies.
+    #[test]
+    fn aggregate_is_disjoint_from_the_foundation() {
+        let agg = ids(&all_durable_migrations());
+        for f in ids(&foundation_migrations()) {
+            assert!(!agg.contains(&f), "foundation id {f:?} must NOT be in the durable aggregate");
+        }
     }
 }
