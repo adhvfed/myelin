@@ -501,6 +501,12 @@ pub mod erase;
 // merge a complete per-cell receipt set with 0 cells missed (idempotent). The storage leg behind the
 // control plane's generic `CrossCellDsrFanOut` (global P-430). The full cross-HOLDER reach (E2E-4) is
 // the named follow-on P-ST-35 (P-446).
+// MR-009b W7.3 — `FirehoseArchiver` seals segments into the `test-support`-gated fs `FsBlobStore`
+// floor (`store: FsBlobStore`) and NO service wires the archiver yet; it is a floor exercised only
+// by this crate's own drills. Gated WITH the floor (its durable object backing is injected when the
+// archiver lands in a composition root). Storage's tests-dir drills reach it via the self
+// dev-dependency (`myelin-storage` with `test-support`).
+#[cfg(any(test, feature = "test-support"))]
 pub mod firehose_archive;
 // The full DSAR / crypto-shred fan-out across ALL H1–H18 holders — the E2E-4 STORAGE SPINE (P-ST-35 /
 // P-446): every holder now exists, so the crypto-shred reach is COMPLETE (incl. vectors incl.
@@ -524,6 +530,10 @@ pub mod multi_cell_erase;
 // variant). FLOORS NAMED: the per-SUBJECT CI-log DEK (C1) is the sibling P-ST-27 (a key-class swap
 // on the same DekContentWrap seam); the real OLTP `ci_log_index` table (UNIQUE(job,step,seq)) is
 // the P-S12/P-S15 backing swap (the in-process map is the index SHAPE).
+// MR-009b W7.3 — `CiLogTier` embeds `FirehoseArchiver` (the `test-support`-gated fs floor above)
+// and is likewise unwired to any service; gated WITH the floor. Storage's own drills reach it via
+// the self dev-dependency.
+#[cfg(any(test, feature = "test-support"))]
 pub mod ci_log_index;
 pub mod gd4;
 // The minimal cache seam (Stage 1 / infra — NEW). No cache trait existed before; this is the
@@ -725,9 +735,14 @@ pub use backup::{
     ObjectTierBackup, ObjectVersion, StoreTier, WalOffset, WalSegment,
 };
 pub use blob::{
-    BlobError, BlobMeta, BlobStore, BlobTelemetry, ContentHash, ContentWrap, FsBlobStore, HashAlgo,
-    IdentityWrap,
+    BlobError, BlobMeta, BlobStore, BlobTelemetry, ContentHash, ContentWrap, HashAlgo, IdentityWrap,
 };
+// MR-009b W7.3 — the fs `FsBlobStore` floor is a `test-support`-gated TEST DOUBLE (its
+// `Mutex<HashMap<…>>` is not byte-durable). The DURABLE production backing is the always-compiled
+// `s3blob::S3BlobStore`, config-selected via `SubstrateProvider::blob_store`. Downstream crates
+// reach the double via the `myelin-storage/test-support` dev-dependency.
+#[cfg(any(test, feature = "test-support"))]
+pub use blob::FsBlobStore;
 pub use bus_shred::KmsBusShredder;
 pub use cache::{Cache, CacheError, InMemoryCache};
 pub use cdn::{CdnCloneClass, CdnEdgePop, CdnEdgeSet};
@@ -738,6 +753,9 @@ pub use cell_migration::{
 pub use ci_cache_scope::{
     CacheScope, CacheScopeError, CacheScopeTelemetry, CiCacheNamespace, TrustTier,
 };
+// MR-009b W7.3 — gated WITH the `ci_log_index` floor module (embeds the `test-support`-gated fs
+// `FsBlobStore` floor via `FirehoseArchiver`).
+#[cfg(any(test, feature = "test-support"))]
 pub use ci_log_index::{
     CiLogError, CiLogFrame, CiLogIndex, CiLogTier, SegmentKeying, StepAnchor, StepSpan,
     CI_LOG_STREAM,
@@ -763,6 +781,9 @@ pub use erase::{
     BlobShredReach, BusErase, CryptoShredErase, EpochMillis, EraseError, EraseHolders,
     ErasureLedgerSink, ErasureReceipt, PseudonymShred, RefsTombstone, SearchPurge,
 };
+// MR-009b W7.3 — gated WITH the `firehose_archive` floor module (`store: FsBlobStore`, the
+// `test-support`-gated fs floor).
+#[cfg(any(test, feature = "test-support"))]
 pub use firehose_archive::{
     segment_pointer_draft, ArchiveError, ArchiveTelemetry, FirehoseArchiver, SealedSegment,
     SegmentBytes,

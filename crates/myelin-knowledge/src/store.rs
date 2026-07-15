@@ -61,8 +61,10 @@
 //! load-bearing shape — `(tenant, region)` partition, the stable `block_id`, `order_key`,
 //! `page_id` index — is byte-faithful to §2.3. Recorded here, not hidden.
 
+use std::sync::Arc;
+
 use myelin_identity::Principal;
-use myelin_storage::blob::{BlobStore, FsBlobStore};
+use myelin_storage::blob::BlobStore;
 use myelin_storage::oltp::{OltpConfig, OltpError, OltpPool};
 use myelin_storage::rls::{ResolvedTenant, TenantQuery, TenantScope, TenantTable};
 use myelin_tenancy::{Region, TenantId};
@@ -148,7 +150,13 @@ impl KnowledgeTable {
 /// permit-accounting layer (the `@residency-cell-pinned` waiver below).
 pub struct KnowledgeStore {
     pool: OltpPool,
-    blobs: FsBlobStore,
+    /// The content-addressed media + CRDT-snapshot [`BlobStore`] (11.2). **MR-009b W7.3 —
+    /// INJECTED** (the composition root owns durability): the durable production backing is the
+    /// object-store [`myelin_storage::s3blob::S3BlobStore`], config-selected via
+    /// `SubstrateProvider::blob_store()`; a test/drill injects the `test-support`-gated fs floor
+    /// (`Arc::new(FsBlobStore::new())`). The store constructs NO backing of its own — the fs
+    /// floor is no longer hardcoded in the production constructor (the SI-014/015/029 flip).
+    blobs: Arc<dyn BlobStore + Send + Sync>,
 }
 
 impl KnowledgeStore {
@@ -161,14 +169,23 @@ impl KnowledgeStore {
     /// `(tenant, region)` `TenantScope` carries the region out-of-band, and the per-pool runtime
     /// region-pin lands in the storage `RegionPinnedStore` (P-ST-15 / STOR-D5). NOT a weakening —
     /// the `residency-pin` lint stays live on every UNMARKED store open.
-    pub fn open(config: OltpConfig) -> Result<KnowledgeStore, OltpError> {
+    ///
+    /// **MR-009b W7.3 — the BlobStore is INJECTED (durable-by-default).** The store no longer
+    /// hardcodes the in-memory `FsBlobStore` floor: the caller supplies the config-selected backing.
+    /// The production composition root passes `provider.blob_store()` (the durable
+    /// `S3BlobStore` over RustFS/Scaleway); a test/drill passes `Arc::new(FsBlobStore::new())` (the
+    /// `test-support`-gated fs floor). **BOOT WIRING (named seam):** `knowledge_app_spec` builds NO
+    /// `KnowledgeStore` today (the shell has no store manifest); when KN wiring lands the store in the
+    /// composition root (the `SubstrateProvider` `main.rs` already constructs a provider), it threads
+    /// `provider.blob_store(rt)` here — the same W3b.4 injection precedent the durable outbox uses.
+    pub fn open(
+        config: OltpConfig,
+        blobs: Arc<dyn BlobStore + Send + Sync>,
+    ) -> Result<KnowledgeStore, OltpError> {
         // @residency-cell-pinned: the M0 region-less pool MODEL (the TenantScope pins the region
         // per-query; the per-pool RegionPinnedStore seam is P-ST-15). Named, reviewed, not hidden.
         let pool = OltpPool::open(config)?;
-        Ok(KnowledgeStore {
-            pool,
-            blobs: FsBlobStore::new(),
-        })
+        Ok(KnowledgeStore { pool, blobs })
     }
 
     /// The bounded OLTP pool (11.1) — handlers acquire a per-tenant permit against it.
@@ -176,10 +193,12 @@ impl KnowledgeStore {
         &self.pool
     }
 
-    /// The fs-backed media + CRDT-snapshot BlobStore (11.2, the M1 floor; K6 of §6). Per-tenant
-    /// keyed, content-addressed (BLAKE3), re-hash-on-read. The object-store swap is KN-P31 (M5).
-    pub fn blobs(&self) -> &impl BlobStore {
-        &self.blobs
+    /// The injected media + CRDT-snapshot BlobStore (11.2; K6 of §6). Per-tenant keyed,
+    /// content-addressed (BLAKE3), re-hash-on-read — properties of the [`BlobStore`] trait, held by
+    /// whichever backing the composition root injected (durable `S3BlobStore` in production, the fs
+    /// floor in a drill). MR-009b W7.3: returns the trait object, not the concrete fs floor.
+    pub fn blobs(&self) -> &(dyn BlobStore + Send + Sync) {
+        self.blobs.as_ref()
     }
 
     /// **The tenant-scoped query helper (the RLS half of 11.1 / 12.1 — the `tenant-predicate`
@@ -382,7 +401,8 @@ mod tests {
     /// The store opens over a validated bounded pool (11.1) and wires the fs BlobStore (11.2).
     #[test]
     fn store_opens_with_pool_and_blobs() {
-        let store = KnowledgeStore::open(cfg()).expect("the knowledge store opens");
+        let store = KnowledgeStore::open(cfg(), Arc::new(myelin_storage::blob::FsBlobStore::new()))
+            .expect("the knowledge store opens");
         assert_eq!(store.pool().config(), cfg());
         // The fs BlobStore is wired + usable (media + CRDT snapshots, K6).
         let acme = TenantId("acme".into());
@@ -402,7 +422,8 @@ mod tests {
     /// `WHERE tenant = $.. AND region = $..` clause; the tenant + region are the verified token's.
     #[test]
     fn every_knowledge_query_carries_the_tenant_region_predicate() {
-        let store = KnowledgeStore::open(cfg()).expect("open");
+        let store = KnowledgeStore::open(cfg(), Arc::new(myelin_storage::blob::FsBlobStore::new()))
+            .expect("open");
         let scope = knowledge_scope(&principal("acme"), Region::new("fr-par"));
         for table in KnowledgeTable::ALL {
             let q = store.query(scope.clone(), table);

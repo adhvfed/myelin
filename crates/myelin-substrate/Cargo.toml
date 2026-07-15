@@ -41,6 +41,11 @@ myelin-events = { path = "../myelin-events", features = ["test-support"] }
 # set). A dev-dependency so myelin-harness stays OUT of the production crate DAG
 # (architecture §2.9 — the harness is a leaf consumer; nothing in the DAG depends on it).
 myelin-harness = { path = "../myelin-harness" }
+# MR-009b W7.3 — the fs `FsBlobStore` floor is now a `test-support`-gated test double in
+# myelin-storage; the `drill_sub_d6_restore_verify*` cell-scale drills drive it via the `BlobStore`
+# trait, so enable `test-support` DEV-only. Never in the production DAG (cargo tree -e no-dev shows no
+# test-support edge) — the SAME idiom as the events test-support dev-dep above.
+myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 serde_json.workspace = true
 
 [features]

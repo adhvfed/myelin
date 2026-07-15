@@ -299,11 +299,15 @@ pub use search::{
 };
 pub use store::{
     chat_cold_blob_store_parity, emit_erased_tombstone, AuthorKind, ColdBlobParityVerdict,
-    ColdSegments, ConversationId, MemHotTier, Message, MessageId, MessageState, MessageStore,
+    ColdSegments, ConversationId, Message, MessageId, MessageState, MessageStore,
     MonotonicUlidSource, NewMessage, OutboxTx, RangeCursor, StoreError, SystemUlidSource,
     TombstoneReason, UlidSource, SCYLLA_HOT_TIER_PROMOTED, SCYLLA_PROMOTION_LANDING,
     SCYLLA_PROMOTION_TRIGGER,
 };
+// MR-009b W7.3 — `MemHotTier` is the `test-support`-gated in-memory `MessageStore` double (it embeds
+// the fs `FsBlobStore` cold floor). The durable production store is `pg::PgMessageStore`.
+#[cfg(any(test, feature = "test-support"))]
+pub use store::MemHotTier;
 pub use switch_test::{
     chat_screen_catalogue, ChatOverlay, ChatSwitchTest, ChatSwitchVerdict, ComposerAnchor,
     MeasuredLegs as ChatSwitchMeasuredLegs, ResponsiveCase, ScreenRecord, ScreenVerdict,
