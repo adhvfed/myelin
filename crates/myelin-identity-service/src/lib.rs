@@ -1926,9 +1926,11 @@ mod tests {
         );
         let scope = TenantScope::from_verified_token(&alice, alice.region.clone());
 
-        // Seed a grant: `issues.read#@p:alice` on the action-object the authorizer builds. The
-        // CheckAuthorizer builds object `myelin://acme/identity/action/issues.read` → object id
-        // `issues.read`; grant alice the `issues.read` relation on that object.
+        // Seed a grant on the action-object the authorizer builds. The CheckAuthorizer builds
+        // object `myelin://acme/identity/action/issues.read`, which keys onto the canonical
+        // type-qualified tuple key `action:issues.read` (R2.2 — the one `myelin_refs::object_key`
+        // grammar; the pre-R2.2 bare trailing id `issues.read` was the type-blind spelling);
+        // grant alice the `issues.read` relation on that object key.
         let store = TupleStore::new(OutboxStore::new());
         let admin = Principal::stub(
             PrincipalId("p-admin".into()),
@@ -1940,7 +1942,7 @@ mod tests {
                 &scope,
                 &admin,
                 &[TupleDelta::Add(RelationTuple {
-                    object: ObjectId("issues.read".into()),
+                    object: ObjectId("action:issues.read".into()),
                     relation: RelName("issues.read".into()),
                     subject: PrincipalId("p:alice".into()),
                     caveat: None,

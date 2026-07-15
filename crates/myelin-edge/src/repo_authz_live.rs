@@ -30,8 +30,11 @@
 //! and shared by the check side and the tuple-write side. Why this exact grammar:
 //! - the engine derives the object TYPE via `namespace::type_of_object_ref` — `repo:<slug>` →
 //!   `repo`, so the compiled `repo` fragment's `pull`/`push` rewrites resolve;
-//! - the engine derives the tuple KEY via `check_engine::object_id_of` (the last `/`-segment) —
-//!   `repo:<slug>` has no `/`, so the tuple ObjectId IS `repo:<slug>` verbatim;
+//! - the engine derives the tuple KEY via `check_engine::object_id_of`, which (R2.2) routes
+//!   through the ONE canonical `myelin_refs::object_key` — a bare `repo:<slug>` is a FIXED POINT
+//!   of that canonicalisation (the tuple ObjectId IS `repo:<slug>` verbatim, including a
+//!   NAMESPACED `repo:team/app`, which pre-R2.2 wrongly collapsed to `app`), and the URN spelling
+//!   `myelin://<t>/git/repo/<slug>` reaches the SAME key;
 //! - it matches the grammar the live-fragment tests and `git_fragment::compile_codeowners`
 //!   (`ref:<repo-id>::<glob>` where `<repo-id>` is `repo:<slug>`) already pin.
 //!
@@ -343,6 +346,37 @@ mod tests {
             authz.authorize_repo(&creator, &repo, RepoAccess::Write),
             "admin ⊆ push: the creator pushes to its fresh repo"
         );
+    }
+
+    /// **R2.1a carry-forward #2 (fixed by R2.2): a NAMESPACED slug keys correctly end-to-end.**
+    /// The bootstrap writes `repo:team/app`; before R2.2 the check side collapsed the object to
+    /// the last `/`-segment (`app`), so the repo's own bootstrap grant never matched its own
+    /// check — the fresh repo was unreachable BY ITS CREATOR (availability break). Now the
+    /// canonical object key keeps the slug whole, and the single-segment grammar is untouched.
+    #[test]
+    fn namespaced_slug_bootstrap_grant_admits_creator() {
+        let sbc = check_with_git_fragment();
+        let bootstrap = TupleRepoBootstrap::new(sbc.tuples().clone());
+        let authz = authorizer(sbc);
+        let creator = principal("svc:creator", "acme");
+        let repo = RepoLoc::new("acme", "eu-west", "team/app");
+
+        assert!(
+            !authz.authorize_repo(&creator, &repo, RepoAccess::Read),
+            "pre-grant: denied (the admit below is the grant's doing)"
+        );
+        bootstrap.grant_creator(&creator, &repo).expect("bootstrap grant on team/app");
+        assert!(
+            authz.authorize_repo(&creator, &repo, RepoAccess::Read),
+            "the namespaced-slug bootstrap grant admits its creator (pull)"
+        );
+        assert!(
+            authz.authorize_repo(&creator, &repo, RepoAccess::Write),
+            "the namespaced-slug bootstrap grant admits its creator (push)"
+        );
+        // No aliasing onto the collapse target: a repo literally named `app` stays unreachable.
+        let alias = RepoLoc::new("acme", "eu-west", "app");
+        assert!(!authz.authorize_repo(&creator, &alias, RepoAccess::Read));
     }
 
     /// **Cross-repo isolation:** the creator's grant on `widgets` does NOT admit `secrets` (per-

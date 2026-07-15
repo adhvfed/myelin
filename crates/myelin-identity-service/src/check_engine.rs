@@ -239,8 +239,18 @@ impl CheckEngine {
             if !at_least.0.is_empty() && st.zookie.0 > at_least.0 {
                 continue;
             }
+            // R2.2 — read==write keying: index the stored tuple under the SAME canonical
+            // type-qualified key `object_id_of` derives for the check side. For every bare-form
+            // stored key (`repo:core`, `issue:PROJ-1`, `org:acme` — the form ALL writers store)
+            // this is byte-identical (a fixed point of the canonicalisation, so every existing
+            // grant keeps its key); a URN-spelled stored key normalises onto the same `type:id`
+            // key its bare spelling has. A stored key the canonicaliser cannot parse is kept
+            // verbatim (it can then only ever match itself — never an aliased object).
+            let stored_key = myelin_refs::object_key(&ArtifactRef(st.tuple.object.0.clone()))
+                .map(|k| k.tuple_key())
+                .unwrap_or_else(|| st.tuple.object.0.clone());
             by_object
-                .entry(st.tuple.object.0.clone())
+                .entry(stored_key)
                 .or_default()
                 .push(SnapTuple {
                     relation: st.tuple.relation.0.clone(),
@@ -351,28 +361,20 @@ pub(crate) fn parse_userset(subject: &str) -> Option<(&str, &str)> {
     Some((obj, rel))
 }
 
-/// Extract the object id a `check` targets from its `ArtifactRef`. The tuples key on the **last
-/// path segment** of the ref's URN (the object id the owning subsystem minted) — e.g.
-/// `myelin://acme/issues/issue/PROJ-1` → `PROJ-1`, and a bare object id (no scheme) is itself the
-/// id. Returns `None` for an empty/whitespace ref (genuine uncertainty → the caller fails closed).
+/// Extract the **canonical type-qualified tuple key** a `check` targets from its `ArtifactRef`
+/// (R2.2). The tuples key on the `type:id` spelling the owning subsystem writes (`repo:core`,
+/// `issue:PROJ-1`); a full URN (`myelin://acme/git/repo/core`) maps onto the SAME key, a `#sub`
+/// anchor keys at the root object, and a namespaced bare id (`repo:team/app`) is kept whole.
+/// Returns `None` for an empty/whitespace/malformed ref (genuine uncertainty → the caller fails
+/// closed).
 ///
-/// The S3 tuples store the object id the subsystem minted (architecture §6: Id never invents object
-/// ids); this maps the contract-boundary `ArtifactRef` onto that id. The full ref grammar
-/// (scheme/tenant/type/id with `#sub` anchors) is `myelin-refs`; the engine needs only the object
-/// id, taken from the final segment so both a full URN and a bare id resolve.
+/// This routes through the ONE canonical [`myelin_refs::object_key`] — the same function the
+/// `EventMatcher` reads and [`CheckEngine::snapshot_view`] normalises stored keys with — so a URN
+/// ref and a bare ref of the same logical object always agree, and two different types with the
+/// same trailing id never do (the pre-R2.2 trailing-`/`-segment reduction was the cross-type
+/// confusion defect: a grant on `issue:PROJ-1` authorized `repo/PROJ-1`).
 fn object_id_of(object: &ArtifactRef) -> Option<String> {
-    let raw = object.0.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    // Strip a trailing `#sub` anchor (the sub-artifact addresses the same root object for the
-    // object-level check); the root object id is the last `/`-segment of the remaining ref.
-    let root = raw.split('#').next().unwrap_or(raw);
-    let id = root.rsplit('/').next().unwrap_or(root);
-    if id.is_empty() {
-        return None;
-    }
-    Some(id.to_string())
+    myelin_refs::object_key(object).map(|k| k.tuple_key())
 }
 
 /// **Evaluate a field/transition caveat predicate through the ONE `QueryAst` predicate core**
@@ -1162,25 +1164,165 @@ mod tests {
         );
     }
 
-    /// **The object id is extracted from a full URN ArtifactRef** (`myelin://t/issues/issue/PROJ-1`
-    /// → `PROJ-1`) and a `#sub` anchor addresses the same root object.
+    /// **The object key is TYPE-QUALIFIED and spelling-independent (R2.2).** A full URN keys as
+    /// `type:id` — the SAME key its bare spelling yields — a `#sub` anchor addresses the root
+    /// object, a namespaced bare id is kept whole, and an empty ref is fail-closed `None`.
+    /// (Rewritten from the pre-R2.2 test that asserted the type-BLIND trailing-segment reduction —
+    /// `myelin://acme/issues/issue/PROJ-1` → bare `PROJ-1` — as correct; that reduction was the
+    /// cross-type-confusion defect.)
     #[test]
     fn object_id_extracted_from_urn_and_sub_anchor() {
         assert_eq!(
             object_id_of(&ArtifactRef("myelin://acme/issues/issue/PROJ-1".into())),
-            Some("PROJ-1".into())
+            Some("issue:PROJ-1".into()),
+            "a URN keys type-qualified, never as the bare trailing id"
         );
         assert_eq!(
             object_id_of(&ArtifactRef("repo:core".into())),
             Some("repo:core".into())
         );
         assert_eq!(
+            object_id_of(&ArtifactRef("myelin://acme/git/repo/core".into())),
+            object_id_of(&ArtifactRef("repo:core".into())),
+            "URN and bare spellings of ONE object agree on ONE key"
+        );
+        assert_eq!(
             object_id_of(&ArtifactRef(
                 "myelin://acme/issues/issue/PROJ-1#comment-7".into()
             )),
-            Some("PROJ-1".into())
+            Some("issue:PROJ-1".into()),
+            "a #sub anchor authorizes at the root object"
+        );
+        assert_eq!(
+            object_id_of(&ArtifactRef("repo:team/app".into())),
+            Some("repo:team/app".into()),
+            "a namespaced slug (the R2.1a git grammar) is kept whole, never collapsed to `app`"
         );
         assert_eq!(object_id_of(&ArtifactRef("  ".into())), None);
+    }
+
+    /// **R2.2 Defect A — no cross-TYPE check within a tenant.** A grant on `issue:PROJ-1` must NOT
+    /// authorize `repo/PROJ-1` (same trailing id, different type): before R2.2, `object_id_of`
+    /// collapsed both spellings to the bare `PROJ-1`, so the issue grant leaked onto the repo.
+    #[test]
+    fn no_cross_type_check() {
+        let s = scope("acme");
+        // The grant is on the ISSUE (both the bare spelling and the URN spelling are seeded, so
+        // the deny below cannot be an artifact of a spelling mismatch).
+        let eng = engine_with(
+            &s,
+            &[
+                add("issue:PROJ-1", "reader", "p:alice"),
+                add("PROJ-1", "reader", "p:alice"), // even a legacy type-less grant on the id
+            ],
+        );
+        // The check is on the REPO with the same trailing id — must DENY (cross-type).
+        for repo_spelling in ["myelin://acme/git/repo/PROJ-1", "repo:PROJ-1"] {
+            assert_eq!(
+                eng.check(
+                    &s,
+                    &subject("p:alice"),
+                    &RelName("reader".into()),
+                    &ArtifactRef(repo_spelling.into()),
+                    &latest(),
+                    None
+                ),
+                Decision::Deny,
+                "a grant on issue:PROJ-1 must not authorize `{repo_spelling}` (cross-type confusion)"
+            );
+        }
+        // Sanity: the grant DOES authorize the issue itself, in BOTH spellings.
+        for issue_spelling in ["issue:PROJ-1", "myelin://acme/issues/issue/PROJ-1"] {
+            assert_eq!(
+                eng.check(
+                    &s,
+                    &subject("p:alice"),
+                    &RelName("reader".into()),
+                    &ArtifactRef(issue_spelling.into()),
+                    &latest(),
+                    None
+                ),
+                Decision::Allow,
+                "the issue grant authorizes the issue (spelling `{issue_spelling}`)"
+            );
+        }
+    }
+
+    /// **R2.2 Defect A (consistency direction) — a grant written in one spelling matches a check
+    /// in the other.** `repo:core` (bare, how the R2.1a writers store) ⟷
+    /// `myelin://acme/git/repo/core` (URN, the contract-boundary form): before R2.2 the URN check
+    /// collapsed to bare `core` and silently never matched the stored `repo:core` (fail-closed
+    /// over-denial — an availability break, and the write/check grammar drift the R2.1a module doc
+    /// warns about).
+    #[test]
+    fn grant_and_check_spellings_agree_across_forms() {
+        let s = scope("acme");
+        let eng = engine_with(&s, &[add("repo:core", "reader", "p:alice")]);
+        assert_eq!(
+            eng.check(
+                &s,
+                &subject("p:alice"),
+                &RelName("reader".into()),
+                &ArtifactRef("myelin://acme/git/repo/core".into()),
+                &latest(),
+                None
+            ),
+            Decision::Allow,
+            "a bare-spelled grant matches a URN-spelled check of the SAME object"
+        );
+        // And the reverse: a tuple stored URN-spelled matches a bare-spelled check (the snapshot
+        // view canonicalises the stored key through the same one function).
+        let eng2 = engine_with(
+            &s,
+            &[add("myelin://acme/git/repo/core", "reader", "p:bob")],
+        );
+        assert_eq!(
+            eng2.check(
+                &s,
+                &subject("p:bob"),
+                &RelName("reader".into()),
+                &ArtifactRef("repo:core".into()),
+                &latest(),
+                None
+            ),
+            Decision::Allow,
+            "a URN-spelled stored grant matches a bare-spelled check of the SAME object"
+        );
+    }
+
+    /// **R2.1a carry-forward #2 — a NAMESPACED slug keys correctly end-to-end.** A grant written
+    /// as `repo:team/app` (the R2.1a bootstrap grammar for a namespaced repo slug) must authorize
+    /// a check on `repo:team/app`: before R2.2, the check side collapsed the object to the last
+    /// `/`-segment `app`, so the repo's own bootstrap grant never matched (availability break).
+    #[test]
+    fn namespaced_slug_grant_matches_its_own_check() {
+        let s = scope("acme");
+        let eng = engine_with(&s, &[add("repo:team/app", "reader", "p:alice")]);
+        assert_eq!(
+            eng.check(
+                &s,
+                &subject("p:alice"),
+                &RelName("reader".into()),
+                &ArtifactRef("repo:team/app".into()),
+                &latest(),
+                None
+            ),
+            Decision::Allow,
+            "the namespaced-slug grant matches its own check (never collapsed to `app`)"
+        );
+        // And the collapse target `repo:app` is NOT reachable off that grant (no aliasing).
+        assert_eq!(
+            eng.check(
+                &s,
+                &subject("p:alice"),
+                &RelName("reader".into()),
+                &ArtifactRef("repo:app".into()),
+                &latest(),
+                None
+            ),
+            Decision::Deny,
+            "the grant on team/app does not alias onto a repo literally named `app`"
+        );
     }
 
     /// **No cross-tenant check path.** A grant under `acme` does not allow the same `check` under

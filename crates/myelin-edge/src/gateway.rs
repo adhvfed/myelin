@@ -39,9 +39,36 @@ use std::sync::Arc;
 const DEFAULT_TOKEN_SCHEME: &str = "pat";
 
 /// The bounded SSE scope for a verified tenant — `tenant:<t>` (never a client-supplied `*` selector;
-/// the §7.7 "never `*`" stream-IDOR floor). A subsystem publishes to this same key.
+/// the §7.7 "never `*`" stream-IDOR floor). A subsystem publishes to this same key. This scope is
+/// legal ONLY for a genuinely tenant-wide stream: an OBJECT-ADDRESSED stream must scope through
+/// [`sse_scope_for_resource`] (R2.2 — [`GatewayBuilder::sse_route`] refuses, at registration time,
+/// a tenant-coarse route whose pattern addresses an object).
 pub fn sse_scope_for_tenant(tenant: &str) -> String {
     format!("tenant:{tenant}")
+}
+
+/// The bounded SSE scope for ONE object within a verified tenant —
+/// `tenant:<t>/<param>:<id>` (R2.2). `param` is the route's path-parameter NAME (e.g. `repo`) and
+/// `id` the matched, [`bounded`](is_bounded_resource_id) value — so a per-resource subscription can
+/// never receive another object's frames, and a publisher addressing one object can never fan out
+/// tenant-wide. The tenant ALWAYS prefixes the scope (a resource id can never cross tenants), and
+/// the `/` separator cannot appear in either side (a path segment never contains `/`; the id is
+/// bounded-validated), so the scope grammar is injective.
+pub fn sse_scope_for_resource(tenant: &str, param: &str, id: &str) -> String {
+    format!("tenant:{tenant}/{param}:{id}")
+}
+
+/// Is a client-supplied resource id BOUNDED enough to become part of an SSE scope? (The §7.7
+/// "verified tenant + optional bounded resource id" contract.) Non-empty, ≤ 128 bytes, and free of
+/// wildcard/whitespace/control/`/` bytes — so a path value can neither smuggle a selector (`*`)
+/// nor forge the scope grammar's separator. Fail-closed: an unbounded id is a 400, never a
+/// subscription.
+fn is_bounded_resource_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && !id.contains('*')
+        && !id.contains('/')
+        && !id.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// One route segment — a literal or a `{name}` path parameter.
@@ -54,8 +81,15 @@ enum Seg {
 enum RouteKind {
     /// A normal handler (a JSON view-model response).
     Normal(Arc<dyn Handler>),
-    /// An SSE stream by name (the real-time convention).
-    Sse(String),
+    /// An SSE stream by name (the real-time convention). `resource_param` is `None` for a
+    /// tenant-wide stream (scope = [`sse_scope_for_tenant`]) or `Some(param)` for an
+    /// object-addressed stream (scope = [`sse_scope_for_resource`] over the named path param) —
+    /// the R2.2 contract: which one a route is, is fixed at REGISTRATION time, so a subsystem
+    /// cannot register an object-addressed stream behind a tenant-coarse scope.
+    Sse {
+        stream: String,
+        resource_param: Option<String>,
+    },
 }
 
 /// A registered route: `(method, pattern)` → a handler/stream, gated by an authorize action.
@@ -110,19 +144,90 @@ impl GatewayBuilder {
         self
     }
 
-    /// Register an SSE route (`GET pattern`) gated by `action`, streaming the `stream` channel scoped
-    /// to the verified tenant.
+    /// Register a TENANT-WIDE SSE route (`GET pattern`) gated by `action`, streaming the `stream`
+    /// channel scoped to the verified tenant ([`sse_scope_for_tenant`]).
+    ///
+    /// **R2.2 registration-time contract:** the pattern may carry NO path parameter other than the
+    /// IDOR-check `{tenant}`. A pattern that addresses an object (`…/repos/{repo}/events`) names a
+    /// per-object stream, and binding it to the tenant-coarse scope would let every in-tenant
+    /// subscriber receive every object's frames regardless of the id in their URL — the stream
+    /// analogue of the bare-trailing-id check defect. Such a route MUST register through
+    /// [`GatewayBuilder::sse_route_scoped`]; this method PANICS at composition time (a
+    /// mis-registered stream is a boot-time bug, never a live one).
     pub fn sse_route(
         mut self,
         pattern: &str,
         action: impl Into<String>,
         stream: impl Into<String>,
     ) -> GatewayBuilder {
+        let segs = parse_pattern(pattern);
+        let object_params: Vec<&str> = segs
+            .iter()
+            .filter_map(|s| match s {
+                Seg::Param(name) if name != "tenant" => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            object_params.is_empty(),
+            "sse_route(`{pattern}`): the pattern addresses object(s) {object_params:?} but binds \
+             the TENANT-COARSE scope — every in-tenant subscriber would receive every object's \
+             frames (stream IDOR, R2.2). Register an object-addressed stream with \
+             sse_route_scoped(pattern, action, stream, resource_param) so the subscription scope \
+             is bound to the verified tenant + the bounded resource id."
+        );
         self.routes.push(Route {
             method: Method::Get,
-            segs: parse_pattern(pattern),
+            segs,
             action: action.into(),
-            kind: RouteKind::Sse(stream.into()),
+            kind: RouteKind::Sse {
+                stream: stream.into(),
+                resource_param: None,
+            },
+        });
+        self
+    }
+
+    /// Register an OBJECT-ADDRESSED SSE route (`GET pattern`) gated by `action`, streaming the
+    /// `stream` channel scoped to the verified tenant + the bounded resource id taken from the
+    /// `{resource_param}` path parameter ([`sse_scope_for_resource`]) — the R2.2 per-object scope
+    /// contract. The pattern MUST contain `{resource_param}` (panics at composition time
+    /// otherwise); at dispatch, an unbounded id (empty / >128 bytes / wildcard / separator bytes)
+    /// is a 400, never a subscription.
+    ///
+    /// NOTE: the action-level `authorize(principal, action)` gate still runs on every subscribe;
+    /// if the streamed frames are more sensitive than the action grant implies, the registering
+    /// subsystem must ALSO thread the object-level `IdentityService::check` at its publish/route
+    /// seam (the same check the JSON routes use) — the scope binding here guarantees isolation
+    /// between objects, not object-level grant semantics.
+    pub fn sse_route_scoped(
+        mut self,
+        pattern: &str,
+        action: impl Into<String>,
+        stream: impl Into<String>,
+        resource_param: &str,
+    ) -> GatewayBuilder {
+        let segs = parse_pattern(pattern);
+        assert!(
+            resource_param != "tenant",
+            "sse_route_scoped(`{pattern}`): `tenant` is the IDOR-check parameter, not a resource \
+             id — the tenant already prefixes every SSE scope"
+        );
+        assert!(
+            segs.iter()
+                .any(|s| matches!(s, Seg::Param(name) if name == resource_param)),
+            "sse_route_scoped(`{pattern}`): the pattern does not carry the `{{{resource_param}}}` \
+             path parameter the subscription scope is bound to (R2.2 — an object-addressed stream \
+             must derive its scope from the matched object id)"
+        );
+        self.routes.push(Route {
+            method: Method::Get,
+            segs,
+            action: action.into(),
+            kind: RouteKind::Sse {
+                stream: stream.into(),
+                resource_param: Some(resource_param.to_string()),
+            },
         });
         self
     }
@@ -251,9 +356,35 @@ impl Gateway {
                 };
                 handler.handle(&ctx)
             }
-            RouteKind::Sse(stream) => {
-                // The subscription scope is the VERIFIED tenant (bounded; never a client selector).
-                let sub = self.sse.subscribe(stream, &sse_scope_for_tenant(&scope.tenant().0));
+            RouteKind::Sse {
+                stream,
+                resource_param,
+            } => {
+                // The subscription scope is ALWAYS derived, never a client selector: the VERIFIED
+                // tenant, plus — for an object-addressed route (R2.2) — the bounded resource id
+                // from the matched path. The registration-time contract (sse_route vs
+                // sse_route_scoped) fixed WHICH of the two this route is.
+                let sse_scope = match resource_param {
+                    None => sse_scope_for_tenant(&scope.tenant().0),
+                    Some(param) => {
+                        // The param is present by construction (registration asserted it is in
+                        // the pattern; the route only matched with every segment bound) — but
+                        // fail CLOSED, never coarse, if that invariant is ever violated.
+                        let id = params.get(param).ok_or_else(|| {
+                            EdgeError::BadRequest(format!(
+                                "SSE route is scoped by `{{{param}}}` but the match bound no \
+                                 such parameter"
+                            ))
+                        })?;
+                        if !is_bounded_resource_id(id) {
+                            return Err(EdgeError::BadRequest(format!(
+                                "SSE resource id for `{{{param}}}` is not a bounded id"
+                            )));
+                        }
+                        sse_scope_for_resource(&scope.tenant().0, param, id)
+                    }
+                };
+                let sub = self.sse.subscribe(stream, &sse_scope);
                 Ok(EdgeResponse::sse(sub))
             }
         }
@@ -520,5 +651,88 @@ mod tests {
     fn malformed_login_body_is_400_no_panic() {
         let resp = gw().handle(EdgeRequest::new("POST", "/v1/auth/login", "", vec![], b"{garbage".to_vec()));
         assert_eq!(resp.status(), 400);
+    }
+
+    // ── R2.2: the SSE scope registration-time contract ──────────────────────────────────────────
+
+    /// **R2.2 Defect C — a resource-addressed SSE route CANNOT collapse to tenant-only scope.**
+    /// Registering a pattern that addresses an object (`{repo}`) through the tenant-coarse
+    /// `sse_route` is refused at COMPOSITION time (the boot panics; the stream-IDOR route never
+    /// exists). The object-addressed registration path is `sse_route_scoped`.
+    #[test]
+    #[should_panic(expected = "sse_route_scoped")]
+    fn object_addressed_pattern_cannot_register_tenant_coarse() {
+        let _ = Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll)).sse_route(
+            "/v1/t/{tenant}/repos/{repo}/events",
+            "git.repo.events.subscribe",
+            "git",
+        );
+    }
+
+    /// The scoped registration demands the pattern actually carry the parameter the scope binds
+    /// to — a typo'd/absent `{resource_param}` is a composition-time panic, not a silently
+    /// tenant-coarse stream.
+    #[test]
+    #[should_panic(expected = "does not carry")]
+    fn scoped_route_requires_the_resource_param_in_the_pattern() {
+        let _ = Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll)).sse_route_scoped(
+            "/v1/t/{tenant}/events",
+            "git.repo.events.subscribe",
+            "git",
+            "repo",
+        );
+    }
+
+    /// `tenant` is the IDOR-check parameter, never a resource id — binding the scope to it is
+    /// refused (the tenant already prefixes every scope).
+    #[test]
+    #[should_panic(expected = "not a resource id")]
+    fn scoped_route_refuses_tenant_as_the_resource_param() {
+        let _ = Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll)).sse_route_scoped(
+            "/v1/t/{tenant}/events",
+            "edge.events.subscribe",
+            "edge",
+            "tenant",
+        );
+    }
+
+    /// The legitimate registrations still compose: the tenant-wide `{tenant}`-only pattern through
+    /// `sse_route` (today's `/v1/t/{tenant}/events`), and an object-addressed pattern through
+    /// `sse_route_scoped`.
+    #[test]
+    fn legitimate_sse_registrations_compose() {
+        let _ = Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll))
+            .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge")
+            .sse_route_scoped(
+                "/v1/t/{tenant}/repos/{repo}/events",
+                "git.repo.events.subscribe",
+                "git",
+                "repo",
+            )
+            .build();
+    }
+
+    /// The per-object scope grammar is tenant-prefixed and distinct from the tenant-coarse scope
+    /// (a per-object publish can never fan out tenant-wide, and vice versa), and the bounded-id
+    /// validator refuses selector/separator smuggling.
+    #[test]
+    fn resource_scope_grammar_is_bounded_and_tenant_prefixed() {
+        assert_eq!(sse_scope_for_tenant("acme"), "tenant:acme");
+        assert_eq!(
+            sse_scope_for_resource("acme", "repo", "widgets"),
+            "tenant:acme/repo:widgets"
+        );
+        assert_ne!(
+            sse_scope_for_resource("acme", "repo", "widgets"),
+            sse_scope_for_tenant("acme")
+        );
+        // Bounded ids: a wildcard, a scope-separator, whitespace, empty, oversized — all refused.
+        assert!(is_bounded_resource_id("widgets"));
+        assert!(is_bounded_resource_id("repo-7_x.y"));
+        assert!(!is_bounded_resource_id("*"));
+        assert!(!is_bounded_resource_id("a/b"));
+        assert!(!is_bounded_resource_id("a b"));
+        assert!(!is_bounded_resource_id(""));
+        assert!(!is_bounded_resource_id(&"x".repeat(129)));
     }
 }
