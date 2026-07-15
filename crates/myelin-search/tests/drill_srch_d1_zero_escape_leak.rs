@@ -190,8 +190,25 @@ fn adversarial_corpus() -> TantivyBackend {
         vec![1.0, 0.0, 0.0],
     ))
     .unwrap();
+    // R2.7 — a confidential SUB-ARTIFACT doc whose `doc_id` is `#sub`-precise while its `acl_object`
+    // pins on the `#sub`-stripped parent (doc_id ≠ acl_object). It carries an embedding AT the query
+    // direction (the nearest neighbour), so a vector path that only checked `doc_id` would let a deny
+    // expressed on the PARENT `acl_object` leak this hit. The ACL parity fix denies it on either arm.
+    be.upsert(
+        &doc(
+            SUB_DOC_ID,
+            "deadlock in the confidential merger sub-block",
+            vec![1.0, 0.0, 0.0],
+        )
+        .with_acl_object(SUB_DOC_PARENT),
+    )
+    .unwrap();
     be
 }
+
+/// The R2.7 sub-artifact fixture: a `#sub`-precise `doc_id` whose ACL pins on the parent `acl_object`.
+const SUB_DOC_ID: &str = "acme/issue/SECRET-SUB#b1";
+const SUB_DOC_PARENT: &str = "acme/issue/SECRET-SUB";
 
 /// The ONLY visible doc the reverse-index JOIN resolves for the unauthorized viewer.
 const VISIBLE: [&str; 1] = ["acme/issue/PUB-1"];
@@ -317,6 +334,53 @@ fn srch_d1_zero_escape_leak_rag_vector_half() {
         ids,
         ["acme/issue/PUB-1"],
         "only the visible neighbour; the nearest hidden one never surfaces"
+    );
+}
+
+/// **SRCH-D1 / R2.7 — the vector-path deny-set leak test, BOTH directions, over a `doc_id ≠
+/// acl_object` sub-artifact fixture.** The confidential sub-doc (`doc_id` = `…SECRET-SUB#b1`,
+/// `acl_object` = the parent `…SECRET-SUB`) carries an embedding AT the query direction — it is the
+/// nearest neighbour, the strongest leak vector. The vector filter-during-traversal predicate matches
+/// `doc_id` OR `acl_object` exactly like the lexical clause, so:
+///  - a GRANT on the parent `acl_object` ADMITS the sub-doc's vector (the acl_object arm);
+///  - a DENY on the parent `acl_object` EXCLUDES the sub-doc's vector hit — **the leak direction**
+///    that fails RED on pre-fix code (`NotIds::admits` only compared the sub-precise `doc_id`, so a
+///    deny expressed on the parent never matched and the DENIED sub-doc leaked into semantic/RAG);
+///  - a DENY on the sub-precise `doc_id` ALSO excludes it (the `doc_id` arm stays enforced).
+#[test]
+fn srch_d1_vector_deny_set_both_directions_doc_id_or_acl_object() {
+    let be = adversarial_corpus();
+    let q = Embedding::new(vec![1.0, 0.0, 0.0]); // AT the sub-doc's embedding direction.
+
+    // ALLOW via the parent acl_object arm: a grant on the parent admits the sub-doc's vector.
+    let admit = be
+        .semantic(&AclFilter::ids([SUB_DOC_PARENT]), &q, 10)
+        .expect("semantic grant on parent");
+    assert!(
+        admit.iter().any(|h| h.doc_id == SUB_DOC_ID),
+        "a grant on the parent acl_object admits the sub-doc's vector (acl_object arm)"
+    );
+
+    // LEAK DIRECTION: a deny on the parent acl_object must EXCLUDE the sub-doc's vector hit.
+    let deny_parent = be
+        .semantic(&AclFilter::not_ids([SUB_DOC_PARENT]), &q, 20)
+        .expect("semantic deny on parent");
+    assert!(
+        !deny_parent.iter().any(|h| h.doc_id == SUB_DOC_ID),
+        "R2.7 leak direction: a deny on the parent acl_object excludes the sub-doc's vector hit"
+    );
+    assert!(
+        !deny_parent.is_empty(),
+        "the deny is selective (other docs still surface) — not a blanket empty result"
+    );
+
+    // DOC_ID DIRECTION: a deny on the sub-precise doc_id also excludes it (the doc_id arm intact).
+    let deny_docid = be
+        .semantic(&AclFilter::not_ids([SUB_DOC_ID]), &q, 20)
+        .expect("semantic deny on doc_id");
+    assert!(
+        !deny_docid.iter().any(|h| h.doc_id == SUB_DOC_ID),
+        "a deny on the sub-precise doc_id excludes the sub-doc's vector hit (doc_id arm)"
     );
 }
 

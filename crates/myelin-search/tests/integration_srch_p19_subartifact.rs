@@ -46,9 +46,9 @@ use myelin_tenancy::{ArtifactRef, Region, TenantId};
 use myelin_content::{parse_inline, Block, HeadingLevel};
 use myelin_search::{
     block_subdoc_projection, db_field_subdoc_projection, db_row_subdoc_projection,
-    line_range_subdoc_projection, AclFilter, AnchorState, ContentAnchoredSpan, IncrementalIndexer,
-    IndexSpec, MockEmbeddingAdapter, ProjectFetchError, ProjectFetcher, SearchProjection,
-    SearchReindexer, SubGrain, FACET_ANCHOR_STATE, FACET_LINE_START,
+    line_range_subdoc_projection, AclFilter, AnchorState, ContentAnchoredSpan, EmbeddingAdapter,
+    IncrementalIndexer, IndexSpec, MockEmbeddingAdapter, ProjectFetchError, ProjectFetcher,
+    SearchProjection, SearchReindexer, SubGrain, FACET_ANCHOR_STATE, FACET_LINE_START,
 };
 
 // ----------------------------------------------------------------------------------------------
@@ -681,5 +681,107 @@ fn e2e1_confidential_sub_doc_is_a_tombstone_zero_leak() {
     assert_eq!(
         ok[0].doc_id, block_ref,
         "the sub-precise doc_id resolves once reachable"
+    );
+}
+
+/// **R2.7 — the SEMANTIC-path counterpart of `e2e1_confidential_sub_doc_is_a_tombstone_zero_leak`:
+/// the vector path ADMITS/DENIES a confidential sub-doc by `doc_id` OR `acl_object` exactly like the
+/// lexical path.** The confidential block sub-doc carries an embedding (the KN page spec is
+/// semantically indexed). Its `doc_id` is `#sub`-precise (`…/secret#b1`) while the ACL pins on the
+/// `#sub`-stripped parent (`…/secret`). The semantic k-NN must:
+///  - DENY with no grant (`AclFilter::None` short-circuits — 0 vector/RAG leak); and
+///  - ADMIT once a grant on the PARENT `acl_object` reaches it (the acl_object arm — pre-fix this
+///    wrongly DENIED the sub-doc's vector, an availability divergence from the lexical path).
+#[test]
+fn e2e1_confidential_sub_doc_semantic_path_admits_via_parent_acl_object() {
+    let (ix, fetcher) = indexer();
+    let block_ref = "myelin://acme/knowledge/page/secret#b1";
+    let parent = "myelin://acme/knowledge/page/secret";
+    let text = "the confidential merger terms";
+    let block = Block::Paragraph {
+        inline: parse_inline(text, &[]),
+    };
+    fetcher.put(block_ref, block_subdoc_projection(&block, Some("en")));
+    ix.index(&created_event("knowledge.page.updated", block_ref))
+        .expect("index secret block (embedded)");
+
+    // The query vector is the sub-doc's own text (the deterministic mock embed makes it the nearest
+    // neighbour). The adapter is a fresh instance with the SAME dim → the SAME vector the indexer used.
+    let query = MockEmbeddingAdapter::new(8).embed(text).expect("embed query");
+
+    // No grant ⇒ the confidential sub-doc's vector NEVER surfaces (0 RAG/vector leak).
+    let denied = ix
+        .search_semantic(&tenant(), &region(), &AclFilter::None, &query, 10)
+        .expect("semantic denied");
+    assert!(
+        denied.is_empty(),
+        "0 vector leak: the confidential sub-doc's embedding never surfaces without a grant"
+    );
+
+    // A grant on the PARENT acl_object ⇒ the sub-doc's vector is admitted via the acl_object arm.
+    let granted = AclFilter::ids([parent]);
+    let ok = ix
+        .search_semantic(&tenant(), &region(), &granted, &query, 10)
+        .expect("semantic granted");
+    assert_eq!(
+        ok.len(),
+        1,
+        "a grant on the parent acl_object makes the sub-doc's vector reachable (acl_object arm)"
+    );
+    assert_eq!(
+        ok[0].doc_id, block_ref,
+        "the sub-precise doc_id resolves on the vector path once reachable"
+    );
+}
+
+/// **R2.7 — the DENY-SET leak test BOTH directions on the SEMANTIC path.** With the confidential
+/// sub-doc embedded (`doc_id` = `…/secret#b1`, `acl_object` = the parent `…/secret`):
+///  - a deny on the PARENT `acl_object` EXCLUDES the sub-doc's vector hit — the leak direction that
+///    fails RED on pre-fix code (where `NotIds::admits` only checked `doc_id`, so a deny expressed on
+///    the parent wrongly ADMITTED the sub-doc's semantic hit — a denied document leaking into RAG);
+///  - a deny on the sub-precise `doc_id` ALSO excludes it — the `doc_id` arm stays enforced.
+#[test]
+fn e2e1_confidential_sub_doc_semantic_deny_set_both_directions() {
+    let (ix, fetcher) = indexer();
+    let block_ref = "myelin://acme/knowledge/page/secret#b1";
+    let parent = "myelin://acme/knowledge/page/secret";
+    let text = "the confidential merger terms";
+    let block = Block::Paragraph {
+        inline: parse_inline(text, &[]),
+    };
+    fetcher.put(block_ref, block_subdoc_projection(&block, Some("en")));
+    ix.index(&created_event("knowledge.page.updated", block_ref))
+        .expect("index secret block (embedded)");
+
+    let query = MockEmbeddingAdapter::new(8).embed(text).expect("embed query");
+
+    // Sanity: a deny that names NEITHER identifier admits the sub-doc (so the exclusions below are
+    // the deny firing, not a blanket empty result).
+    let unrelated_deny = AclFilter::not_ids(["myelin://acme/knowledge/page/other"]);
+    let admitted = ix
+        .search_semantic(&tenant(), &region(), &unrelated_deny, &query, 10)
+        .expect("semantic unrelated deny");
+    assert_eq!(
+        admitted.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(),
+        vec![block_ref],
+        "a deny naming neither identifier admits the sub-doc (control)"
+    );
+
+    // LEAK DIRECTION: deny on the PARENT acl_object ⇒ the sub-doc's vector hit is EXCLUDED.
+    let deny_parent = AclFilter::not_ids([parent]);
+    assert!(
+        ix.search_semantic(&tenant(), &region(), &deny_parent, &query, 10)
+            .expect("semantic deny parent")
+            .is_empty(),
+        "R2.7: a deny on the parent acl_object excludes the sub-doc's vector hit (no semantic leak)"
+    );
+
+    // DOC_ID DIRECTION: deny on the sub-precise doc_id ⇒ also excluded (the doc_id arm intact).
+    let deny_docid = AclFilter::not_ids([block_ref]);
+    assert!(
+        ix.search_semantic(&tenant(), &region(), &deny_docid, &query, 10)
+            .expect("semantic deny doc_id")
+            .is_empty(),
+        "a deny on the sub-precise doc_id excludes the sub-doc's vector hit (doc_id arm enforced)"
     );
 }
