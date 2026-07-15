@@ -307,12 +307,30 @@ Grounding surveys done for all of R2.1a, R2.2, R2.3, R2.4, R2.7 before dispatch.
 builder → orchestrator gate → independent adversarial verifier (Fable) → merge, every verifier
 CONFIRMED-SOUND.
 
-**R2 EXIT — red-team campaign IN PROGRESS.** 5 adversaries (edge JSON API, git wire, MCP, SSE, search) each
-hunting an intra-tenant object reach-around; the edge+wire adversaries tasked to prove/refute #13
-(report_checks CI-forgery → protected-branch bypass) end-to-end. On return: fix all confirmed reach-arounds,
-re-verify, then R2 exits (all-denied + AllowAll gone — already true). **Tracked/deferred:** R2.4-fu (#12,
-MCP GovernedRouter prod wiring — product-surface, MCP execution not live); #13 report_checks CI-producer
-relation (likely fixed as part of the exit).
+**R2 EXIT — red-team campaign RAN (5 adversaries, Fable×3 + Opus×2).** Results:
+- **MCP — PASS** (no approval bypass; self-approval/caller-boolean/gate-forgery/per-effect-collision/store-fail-open
+  all DENIED). MCP execution confirmed LATENT (GOVERNANCE_NOT_WIRED). Latent findings → #12: F1 (approved gate
+  not single-use — re-applies the exact approved effect N times; add per-effect idem ledger before wiring), run_id
+  consult conjunct, durable-panic-not-caught-by-stdio-handler.
+- **SSE — PASS** (no cross/intra-tenant leak on the live surface; scope token-derived, registration-panic fires
+  at build time, bounded-id validated). Latent → #14: tenant-id charset injectivity; per-frame filter deferred.
+- **Search — PASS** (no prod-reachable leak, both directions, every serving path). Latent → #14: legacy 3-field
+  sealed-segment deny-arm fail-open (not reachable — no serving path opens sealed segments today).
+- **Edge + Wire — ONE HIGH RELEASE-BLOCKER, converged (task #13):** a plain in-tenant **writer** lands arbitrary
+  code on protected `main` over the wire, defeating required checks + reviews + codeowners + the admin
+  requirement. Three compounding defects: (1) self-certifiable CI (`git.checks.report` is an ordinary writer
+  capability, `report_checks` copies greens verbatim); (2) `evaluate_protected_ref_push` honors only
+  required_contexts, not the full ruleset (approvals/codeowners/conversations); (3) the direct-push wire path
+  gates only `Write`, never `ProtectedPush`. Proven with 2 runnable exploits. Force/delete-on-protected floor
+  (R0.2) HOLDS. **Everything else on edge+wire DENIED** (no-grant clone/push, cross-tenant, list leak, 0-leak
+  404, object-grammar reach-around, create abuse — all secure).
+
+**R2 EXIT STATUS: BLOCKED on #13.** Fix IN PROGRESS (Fable, worktree): (a) `git.checks.report` → a CI-producer
+capability (not `writer`); (b) direct push to a protected ref requires `ProtectedPush`; (c) full-ruleset
+evaluation on the direct-push gate. Acceptance = both red-team exploits flip to DENIED + legit flows
+(admin/bypass push, CI-producer report, PR merge) still work. On merge: re-run a focused edge+wire red-team to
+confirm the cluster is closed → **then R2 exits** (all-denied + AllowAll gone). Non-blocking latent residuals
+tracked in #14; MCP wiring + its latent findings in #12.
 
 **Sequencing decisions:** R2.2 (object-qualification of `check`/EventMatcher/SSE) must land AFTER R2.1a —
 it changes tuple-store object keying while R2.1a writes the first production grant tuples; git's
