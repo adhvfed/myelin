@@ -176,6 +176,21 @@ impl RepoAuthorizer for CheckBackedRepoAuthorizer {
 pub trait RepoBootstrapGrants: Send + Sync {
     /// Grant the creator its bootstrap relation(s) on the repo about to be created.
     fn grant_creator(&self, creator: &Principal, repo: &RepoLoc) -> Result<(), String>;
+
+    /// **The COMPENSATING removal (R2.1a-followup, defect #7).** Remove the EXACT bootstrap
+    /// relation(s) [`grant_creator`] added — called by
+    /// [`crate::git_durable::DurableGitBackend::create_repo_as`] in its error arm when the on-disk
+    /// `git init` FAILS after the grant already committed, so no orphan `repo:<slug>#admin@<creator>`
+    /// tuple survives on a repo that does not exist (the cross-user hole: an orphan grant + slug
+    /// reuse by a DIFFERENT principal = the original principal silently holds admin on the new repo).
+    ///
+    /// Must be the exact inverse of [`grant_creator`]: same object grammar, same relation, same
+    /// subject, scoped to the creator's verified `(tenant, region)`, through the ordinary
+    /// [`TupleStore::write_tuples`] path (contract 4.6 — NEVER raw SQL). A [`TupleDelta::Remove`] of a
+    /// tuple that was never durably committed is a no-op (safe), so this is always sound to call in
+    /// the error arm. An `Err` here means the compensation ITSELF failed — the caller surfaces that
+    /// LOUDLY (a KNOWN, logged orphan grant beats a silent one).
+    fn revoke_creator(&self, creator: &Principal, repo: &RepoLoc) -> Result<(), String>;
 }
 
 /// The no-op bootstrap (the `test-support`/fixture default, paired with the `AllowAllRepos`
@@ -186,6 +201,9 @@ pub struct NoRepoBootstrap;
 
 impl RepoBootstrapGrants for NoRepoBootstrap {
     fn grant_creator(&self, _creator: &Principal, _repo: &RepoLoc) -> Result<(), String> {
+        Ok(())
+    }
+    fn revoke_creator(&self, _creator: &Principal, _repo: &RepoLoc) -> Result<(), String> {
         Ok(())
     }
 }
@@ -205,24 +223,51 @@ impl TupleRepoBootstrap {
     pub fn new(tuples: TupleStore) -> TupleRepoBootstrap {
         TupleRepoBootstrap { tuples }
     }
-}
 
-impl RepoBootstrapGrants for TupleRepoBootstrap {
-    fn grant_creator(&self, creator: &Principal, repo: &RepoLoc) -> Result<(), String> {
-        // Defence-in-depth: the same tenant pin the authorizer applies — a drifted RepoLoc must not
-        // write a grant into the creator's partition for another tenant's repo name.
+    /// The ONE bootstrap tuple both the grant [`TupleDelta::Add`] and the compensating
+    /// [`TupleDelta::Remove`] key on — `repo:<slug>#admin@<creator>` in the shared `repo:<slug>`
+    /// grammar. Spelled once so the compensating remove targets the EXACT tuple the grant added
+    /// (defect #7 — a drifted spelling would remove nothing and leave the orphan).
+    fn admin_tuple(creator: &Principal, repo: &RepoLoc) -> RelationTuple {
+        RelationTuple {
+            object: ObjectId(repo_object_id(&repo.repo)),
+            relation: RelName(REPO_ADMIN_RELATION.to_string()),
+            subject: creator.principal_id.clone(),
+            caveat: None,
+        }
+    }
+
+    /// The defence-in-depth tenant pin both halves apply (a drifted RepoLoc must not touch the
+    /// creator's partition for another tenant's repo name).
+    fn tenant_pin(creator: &Principal, repo: &RepoLoc) -> Result<(), String> {
         if creator.tenant.0 != repo.tenant {
             return Err(format!(
                 "bootstrap grant refused: repo tenant `{}` is not the creator's verified tenant",
                 repo.tenant
             ));
         }
-        let delta = TupleDelta::Add(RelationTuple {
-            object: ObjectId(repo_object_id(&repo.repo)),
-            relation: RelName(REPO_ADMIN_RELATION.to_string()),
-            subject: creator.principal_id.clone(),
-            caveat: None,
-        });
+        Ok(())
+    }
+}
+
+impl RepoBootstrapGrants for TupleRepoBootstrap {
+    fn grant_creator(&self, creator: &Principal, repo: &RepoLoc) -> Result<(), String> {
+        Self::tenant_pin(creator, repo)?;
+        let delta = TupleDelta::Add(Self::admin_tuple(creator, repo));
+        let scope = TenantScope::from_verified_token(creator, creator.region.clone());
+        self.tuples
+            .write_tuples(&scope, creator, &[delta], None, None, now_rfc3339())
+            .map(|_zookie| ())
+            .map_err(|e| e.to_string())
+    }
+
+    fn revoke_creator(&self, creator: &Principal, repo: &RepoLoc) -> Result<(), String> {
+        // The exact inverse of grant_creator: same tenant pin, same tuple, a Remove through the
+        // ordinary 4.6 write path (never raw SQL), scoped to the creator's verified (tenant, region).
+        // Removing a tuple that never durably committed is a no-op (the store's Remove is idempotent),
+        // so this is safe to call in the create error arm even if the grant itself had failed.
+        Self::tenant_pin(creator, repo)?;
+        let delta = TupleDelta::Remove(Self::admin_tuple(creator, repo));
         let scope = TenantScope::from_verified_token(creator, creator.region.clone());
         self.tuples
             .write_tuples(&scope, creator, &[delta], None, None, now_rfc3339())
@@ -343,6 +388,55 @@ mod tests {
             authz.authorize_repo(&creator, &repo, RepoAccess::Write),
             "admin ⊆ push: the creator pushes to its fresh repo"
         );
+    }
+
+    /// **Defect #7 — the compensating remove is the exact inverse of the grant:** after a grant
+    /// then a `revoke_creator`, the authorizer DENIES again (the orphan tuple is gone through the
+    /// real 4.6 write path — the checker resolves the removal, not just an in-memory forget).
+    #[test]
+    fn revoke_creator_removes_the_grant_the_checker_resolves() {
+        let sbc = check_with_git_fragment();
+        let bootstrap = TupleRepoBootstrap::new(sbc.tuples().clone());
+        let authz = authorizer(sbc);
+        let creator = principal("svc:creator", "acme");
+        let repo = RepoLoc::new("acme", "eu-west", "widgets");
+
+        bootstrap.grant_creator(&creator, &repo).expect("grant");
+        assert!(authz.authorize_repo(&creator, &repo, RepoAccess::Read));
+
+        bootstrap
+            .revoke_creator(&creator, &repo)
+            .expect("the compensating remove writes");
+        assert!(
+            !authz.authorize_repo(&creator, &repo, RepoAccess::Read),
+            "the removed grant no longer admits"
+        );
+        assert!(!authz.authorize_repo(&creator, &repo, RepoAccess::Write));
+    }
+
+    /// **A compensating remove of a tuple that was never committed is a safe no-op** (the store's
+    /// Remove is idempotent) — so the create error arm can always call it without a spurious failure.
+    #[test]
+    fn revoke_creator_on_never_granted_is_a_noop_ok() {
+        let sbc = check_with_git_fragment();
+        let bootstrap = TupleRepoBootstrap::new(sbc.tuples().clone());
+        let creator = principal("svc:creator", "acme");
+        let repo = RepoLoc::new("acme", "eu-west", "widgets");
+        // No grant was ever written; the remove still succeeds (no-op).
+        bootstrap
+            .revoke_creator(&creator, &repo)
+            .expect("remove of an absent tuple is a no-op Ok");
+    }
+
+    /// **The compensating remove keeps the same defence-in-depth tenant pin:** a foreign-tenant
+    /// RepoLoc is refused (never a write into another partition).
+    #[test]
+    fn revoke_creator_refuses_a_foreign_tenant() {
+        let sbc = check_with_git_fragment();
+        let bootstrap = TupleRepoBootstrap::new(sbc.tuples().clone());
+        let creator = principal("svc:creator", "acme");
+        let foreign = RepoLoc::new("globex", "eu-west", "widgets");
+        assert!(bootstrap.revoke_creator(&creator, &foreign).is_err());
     }
 
     /// **Cross-repo isolation:** the creator's grant on `widgets` does NOT admit `secrets` (per-
