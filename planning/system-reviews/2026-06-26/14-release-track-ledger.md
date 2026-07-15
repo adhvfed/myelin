@@ -115,6 +115,13 @@ normalized in Rust pre-bind + adversarial regression input. Residuals: **boot-wi
 apply migrations 0051–0053** (dedup's table IS boot-applied, these are not — asymmetry flagged);
 key refs embed subject discriminators in a non-erasable table (opaque-id grammar concern, W6a).
 
+**W6c-cp DONE (2026-07-15, `5dd13c1`): scanner 6→5.** CellResolverRegistry = boot-time projection
+of the existing `cell.endpoint` authority (no net-new table); Memory arm test-support-gated.
+Verifier HOLD→fixed→sound: the projection module shipped `integration`-gated with a provably false
+justification — the correct-but-latent shape this track kills — now compiled unconditionally.
+Residuals: W6d boot root must assert non-empty projection in multi-cell mode; real transport
+factory = named transport floor; boot wiring lands with W6d/W3b.4.
+
 **P-S12 minter floor — blast radius note (W3b.3 discovery):** the default `MonotonicMinter` resets
 per store ⇒ two durable TupleStores mint colliding `event_id`s and `co_commit_in_tx`'s
 `ON CONFLICT (event_id) DO NOTHING` silently DROPS the later event. Pre-existing named floor (the
