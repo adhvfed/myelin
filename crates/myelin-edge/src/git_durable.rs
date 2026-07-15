@@ -27,7 +27,7 @@ use crate::catalogue::{page_envelope, Handler, HandlerCtx};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::git_edge::{map_method, num_param, param, reroot, tenant_of};
-use crate::repo_authz::{AllowAllRepos, RepoAuthorizer};
+use crate::repo_authz::{AllowAllRepos, RepoAuthorizer, RepoPermission};
 use crate::repo_authz_live::{NoRepoBootstrap, RepoBootstrapGrants};
 use crate::request::EdgeResponse;
 use myelin_events::{Actor, EmitContextBase, IdMinter, OutboxStore, Region, TenantId, Timestamp};
@@ -321,23 +321,22 @@ impl DurableGitBackend {
 
     // ── repo list (durable read) ──
 
-    /// List the verified tenant's repos from disk, building the [`RepoHome`] ViewModel from the REAL
-    /// on-disk state (Populated with the default-branch tree, or Empty if no commits) — never a seed.
-    fn list_repos(&self, tenant: &str, region: &str) -> Vec<RepoHome> {
-        let mut out = Vec::new();
-        // The tenant/region dir holds `<repo>.git` bare repos. Resolve via a representative locator's
-        // parent so the scan stays inside the validated tenant/region path (no traversal).
+    /// The verified tenant's on-disk repo SLUGS (sorted). The tenant/region dir holds `<repo>.git`
+    /// bare repos; resolve via a representative locator's parent so the scan stays inside the
+    /// validated tenant/region path (no traversal). This is the CANDIDATE set the R2.1 list
+    /// prefilter intersects with the principal's `pull`-visible set — never served raw.
+    fn scan_repo_slugs(&self, tenant: &str, region: &str) -> Vec<String> {
+        let mut slugs: Vec<String> = Vec::new();
         let probe = Self::loc(tenant, region, "_probe");
         let Ok(probe_path) = self.store.repo_path(&probe) else {
-            return out;
+            return slugs;
         };
         let Some(dir) = probe_path.parent() else {
-            return out;
+            return slugs;
         };
         let Ok(rd) = std::fs::read_dir(dir) else {
-            return out;
+            return slugs;
         };
-        let mut slugs: Vec<String> = Vec::new();
         for entry in rd.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if let Some(slug) = name.strip_suffix(".git") {
@@ -345,7 +344,27 @@ impl DurableGitBackend {
             }
         }
         slugs.sort();
-        for slug in slugs {
+        slugs
+    }
+
+    /// **List the repos `principal` may `pull` (R2.1 — the leak-free list).** The on-disk listing is
+    /// the CANDIDATE set; the injected [`RepoAuthorizer::visible_repos`] prefilter (backed by the
+    /// Identity `list_objects` Ids-materialise in production, per-candidate checks otherwise)
+    /// resolves the visible subset BEFORE any ViewModel is built — an un-granted repo's slug/readme/
+    /// tree never reach the response (0-leak: pre-filter by construction, never a post-filter).
+    /// ViewModels are built from the REAL on-disk state (Populated/Empty) — never a seed.
+    fn list_repos_visible(
+        &self,
+        tenant: &str,
+        region: &str,
+        principal: &Principal,
+    ) -> Vec<RepoHome> {
+        let candidates = self.scan_repo_slugs(tenant, region);
+        let visible = self
+            .repo_authz
+            .visible_repos(principal, tenant, region, &candidates);
+        let mut out = Vec::new();
+        for slug in visible {
             let loc = Self::loc(tenant, region, &slug);
             let Ok(repo) = self.store.open_repo(&loc) else {
                 continue;
@@ -1205,7 +1224,11 @@ struct DRepoList {
 }
 impl Handler for DRepoList {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let all = self.be.list_repos(tenant_of(ctx), region_of(ctx));
+        // R2.1: the LIST endpoint is prefiltered to the principal's `pull`-visible set (the
+        // `list_objects` seam) BEFORE pagination — an un-granted repo's existence is never leaked.
+        let all = self
+            .be
+            .list_repos_visible(tenant_of(ctx), region_of(ctx), ctx.principal);
         let offset = ctx
             .page
             .cursor
@@ -1631,58 +1654,174 @@ impl Handler for DCodeSearch {
     }
 }
 
+/// **The R2.1 OBJECT-AUTHZ chokepoint for every object-addressed git JSON route — the registration-
+/// declared object check (the platform forward pattern).** The gateway's action gate authorizes the
+/// ACTION only; this guard is the OBJECT leg: it wraps the route's handler at REGISTRATION time with
+/// the ONE frozen-fragment [`RepoPermission`] the route needs, and consults the injected
+/// [`RepoAuthorizer`] on the `(principal, repo:<slug>, permission)` triple BEFORE the inner handler
+/// parses a byte of the request body. Deny postures mirror the wire oracle convention exactly:
+///
+/// - a **`Pull`** denial is the 0-leak **404** (`repository not found` — repo existence is never
+///   leaked to an un-granted in-tenant principal; identical to the absent-repo response);
+/// - every other denial is a fail-closed **403** naming the missing grant class.
+///
+/// The repo is resolved from the validated `{repo}` path segment + the VERIFIED `ctx.scope`
+/// (tenant-from-token, GIT-D8) — never a body/header field. A route with no `{repo}` param cannot
+/// pass this guard (fail-closed 400), so a mis-registered object route is loud, never silently
+/// action-only.
+///
+/// **Why this lives at the subsystem's registration and not a `GatewayBuilder::route_scoped`:** the
+/// gateway holds no object-authorizer handle (main.rs injects the object seam into the git BACKEND),
+/// the per-route permission varies across FOUR rungs (pull/push/protected_push/approve_untrusted_ci
+/// — not a binary object spec), and the deny posture varies with it (0-leak 404 vs 403). Mirroring
+/// R2.2's `sse_route`/`sse_route_scoped` registration-time contract, the enforced-by-construction
+/// property lands HERE: [`register_git_durable`] wraps every object-addressed route through
+/// [`guarded`], so a new git route either declares its object permission or visibly ships without
+/// one at the single registration site. The next subsystem mounting object-addressed routes copies
+/// this guard shape over its own object grammar (or generalises it into the gateway once two
+/// subsystems share an object-authorizer seam there).
+struct RepoObjectGuard {
+    be: Arc<DurableGitBackend>,
+    permission: RepoPermission,
+    inner: Arc<dyn Handler>,
+}
+
+impl Handler for RepoObjectGuard {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let slug = param(ctx, "repo")?;
+        let loc = RepoLoc::new(tenant_of(ctx), region_of(ctx), slug);
+        if !self
+            .be
+            .repo_authorizer()
+            .authorize_repo_permission(ctx.principal, &loc, self.permission)
+        {
+            return Err(match self.permission {
+                // The 0-leak read posture (the wire's `map_wire_err` convention): an un-granted
+                // reader learns nothing an absent repo would not also say.
+                RepoPermission::Pull => EdgeError::NotFound("repository not found".into()),
+                RepoPermission::Push => {
+                    EdgeError::Forbidden("no write grant for this repository".into())
+                }
+                RepoPermission::ProtectedPush => EdgeError::Forbidden(
+                    "no admin (protected_push) grant for this repository".into(),
+                ),
+                RepoPermission::ApproveUntrustedCi => EdgeError::Forbidden(
+                    "no fork-CI endorsement grant (approve_untrusted_ci) for this repository"
+                        .into(),
+                ),
+            });
+        }
+        self.inner.handle(ctx)
+    }
+}
+
+/// Wrap `inner` in the [`RepoObjectGuard`] for `permission` — the one-line registration-time
+/// declaration every object-addressed git route goes through.
+fn guarded(
+    be: &Arc<DurableGitBackend>,
+    permission: RepoPermission,
+    inner: Arc<dyn Handler>,
+) -> Arc<dyn Handler> {
+    Arc::new(RepoObjectGuard {
+        be: be.clone(),
+        permission,
+        inner,
+    })
+}
+
 /// **Register Git through the product edge over the DURABLE backend (GT-003).** Iterates Git's OWN
 /// catalogue (anti-duplication — the route set is Git's, re-rooted under `/v1/git/...`) and binds the
 /// durable handlers. The gateway owns auth/scope/IDOR/error/pagination; every write persists on the real
 /// on-disk backend under `ctx.scope` (the verified tenant + region), the merge passes the gate, and the
 /// resolver is traversal-safe.
+///
+/// **R2.1 — every object-addressed route is registered through the [`RepoObjectGuard`]** with the
+/// frozen-fragment permission it needs (the object leg the action-only gateway gate cannot do). The
+/// per-handler mapping (each reduces to a `repo:<slug>` check; PR routes reduce via the fragment's
+/// ttu arms, the parent repo being the validated `{repo}` segment):
+///
+/// | route | permission | deny |
+/// |---|---|---|
+/// | repo home / commit log / commit diff / blob view / PR overview / PR checks | `Pull` | 0-leak 404 |
+/// | web-edit commit / open-PR / PR review / CI check-report | `Push` | 403 |
+/// | endorse fork CI | `ApproveUntrustedCi` | 403 |
+/// | merge (`pull_request.merge = parent_repo->protected_push`) | `ProtectedPush` | 403 |
+/// | set branch protection | `ProtectedPush` | 403 |
+///
+/// NOT object-guarded (deliberate): `GET /repos` (the LIST — prefiltered leak-free inside
+/// [`DRepoList`] via the `list_objects` seam, which is stronger than a single object check);
+/// `POST /repos` (create — there is no repo OBJECT yet; the gateway's `git.repo.create` ACTION gate
+/// authorizes it and the R2.1a creator→admin bootstrap grant makes the fresh repo owned — a
+/// tenant-level "may create repos" object check needs a tenant/project object the frozen fragment
+/// does not define, named for the fragment's next revision); `GET /search/code` (serves the empty
+/// envelope; the ACL-prefiltered index is the Search track).
 pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -> GatewayBuilder {
+    use RepoPermission::{ApproveUntrustedCi, ProtectedPush, Pull, Push};
     for ep in http_catalogue() {
         let pattern = reroot(ep.path);
         let method = map_method(ep.method);
         let (handler, action): (Arc<dyn Handler>, &'static str) = match (ep.method, ep.path) {
             (GitMethod::Get, "/api/git/repos") => {
+                // The LIST: prefiltered inside the handler (list_objects seam) — see above.
                 (Arc::new(DRepoList { be: be.clone() }), "git.repos.list")
             }
             (GitMethod::Post, "/api/git/repos") => {
+                // Create: action-gated + bootstrap-granted — no repo object exists yet (see above).
                 (Arc::new(DRepoCreate { be: be.clone() }), "git.repo.create")
             }
-            (GitMethod::Get, "/api/git/repos/{repo}/prs/{n}") => {
-                (Arc::new(DPrOverview { be: be.clone() }), "git.pr.view")
-            }
-            (GitMethod::Get, "/api/git/repos/{repo}/prs/{n}/checks") => {
-                (Arc::new(DPrChecks { be: be.clone() }), "git.pr.checks")
-            }
-            (GitMethod::Get, "/api/git/repos/{repo}/blob/{ref}/{path}") => {
-                (Arc::new(DBlobView { be: be.clone() }), "git.blob.view")
-            }
+            (GitMethod::Get, "/api/git/repos/{repo}/prs/{n}") => (
+                guarded(&be, Pull, Arc::new(DPrOverview { be: be.clone() })),
+                "git.pr.view",
+            ),
+            (GitMethod::Get, "/api/git/repos/{repo}/prs/{n}/checks") => (
+                guarded(&be, Pull, Arc::new(DPrChecks { be: be.clone() })),
+                "git.pr.checks",
+            ),
+            (GitMethod::Get, "/api/git/repos/{repo}/blob/{ref}/{path}") => (
+                guarded(&be, Pull, Arc::new(DBlobView { be: be.clone() })),
+                "git.blob.view",
+            ),
             (GitMethod::Post, "/api/git/repos/{repo}/blob/{ref}/{path}") => (
-                Arc::new(DWebEditCommit { be: be.clone() }),
+                guarded(&be, Push, Arc::new(DWebEditCommit { be: be.clone() })),
                 "git.blob.commit",
             ),
-            (GitMethod::Post, "/api/git/repos/{repo}/prs") => {
-                (Arc::new(DOpenPr { be: be.clone() }), "git.pr.open")
-            }
-            (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/reviews") => {
-                (Arc::new(DPrReview { be: be.clone() }), "git.pr.review")
-            }
+            (GitMethod::Post, "/api/git/repos/{repo}/prs") => (
+                guarded(&be, Push, Arc::new(DOpenPr { be: be.clone() })),
+                "git.pr.open",
+            ),
+            (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/reviews") => (
+                guarded(&be, Push, Arc::new(DPrReview { be: be.clone() })),
+                "git.pr.review",
+            ),
+            // The X-1 endorsement: the DISTINCT approve_untrusted_ci relation (never collapsed to
+            // write — endorsing an untrusted fork run is its own trust decision).
             (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/endorse-fork-ci") => (
-                Arc::new(DEndorse { be: be.clone() }),
+                guarded(&be, ApproveUntrustedCi, Arc::new(DEndorse { be: be.clone() })),
                 "git.pr.endorse_fork_ci",
             ),
-            (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/merge") => {
-                (Arc::new(DMerge { be: be.clone() }), "git.pr.merge")
-            }
-            // Repo-admin: set branch-protection policy — a DISTINCT authorize action (the production
-            // authorizer resolves `Id.check(repo_admin)`; a non-admin is rejected by the gateway).
+            // Merge: `pull_request.merge = parent_repo->protected_push` (§5-frozen) — the guard
+            // checks the reduction on the parent repo (the validated `{repo}` segment). A push-only
+            // writer does NOT clear this.
+            (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/merge") => (
+                guarded(&be, ProtectedPush, Arc::new(DMerge { be: be.clone() })),
+                "git.pr.merge",
+            ),
+            // Repo-admin: set branch-protection policy — a DISTINCT authorize action AND the
+            // admin-only protected_push OBJECT check (a non-admin writer is rejected here even if
+            // action-granted).
             (GitMethod::Post, "/api/git/repos/{repo}/branch-protection") => (
-                Arc::new(DSetBranchProtection { be: be.clone() }),
+                guarded(
+                    &be,
+                    ProtectedPush,
+                    Arc::new(DSetBranchProtection { be: be.clone() }),
+                ),
                 "git.repo.branch_protection.set",
             ),
             // CI check-report — a DISTINCT authorize action (the producer is CI/M4; a PR author is not
-            // granted it). The PR author cannot stamp greens.
+            // granted it) + the per-repo write grant (an in-tenant CI producer stamps greens only on
+            // repos it is granted on).
             (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/checks") => (
-                Arc::new(DReportChecks { be: be.clone() }),
+                guarded(&be, Push, Arc::new(DReportChecks { be: be.clone() })),
                 "git.checks.report",
             ),
             (GitMethod::Get, "/api/git/search/code") => (Arc::new(DCodeSearch), "git.search.code"),
@@ -1695,25 +1834,26 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
     }
     // The GT-004 browse READ endpoints Git's catalogue doesn't expose yet — added here (reusing the
     // durable repo's libgit2 reads, never a git reimplementation), tenant-scoped exactly like the
-    // catalogue routes (the gateway owns auth/scope/IDOR/error/pagination per route). All GET (reads).
+    // catalogue routes (the gateway owns auth/scope/IDOR/error/pagination per route). All GET (reads),
+    // all object-guarded on `Pull` (R2.1).
     let get = map_method(GitMethod::Get);
     b = b.route(
         get,
         &reroot("/api/git/repos/{repo}"),
         "git.repo.view",
-        Arc::new(DRepoHome { be: be.clone() }),
+        guarded(&be, Pull, Arc::new(DRepoHome { be: be.clone() })),
     );
     b = b.route(
         get,
         &reroot("/api/git/repos/{repo}/commits/{ref}"),
         "git.commits.log",
-        Arc::new(DCommitLog { be: be.clone() }),
+        guarded(&be, Pull, Arc::new(DCommitLog { be: be.clone() })),
     );
     b = b.route(
         get,
         &reroot("/api/git/repos/{repo}/commit/{oid}"),
         "git.commit.diff",
-        Arc::new(DCommitDiff { be: be.clone() }),
+        guarded(&be, Pull, Arc::new(DCommitDiff { be: be.clone() })),
     );
     b
 }

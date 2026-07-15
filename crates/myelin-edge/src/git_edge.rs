@@ -36,6 +36,17 @@
 //! - **Web-edit commit** additionally runs the REAL pure [`myelin_git::web::WebEditOutcome::evaluate`]
 //!   CAS (GF-6): a stale base is an honest `409` refuse (no silent overwrite, no 3-way editor); a clean
 //!   base reports the modeled `committed` outcome with `durable: false` (the ref advance is E1.1).
+//!
+//! ## NOT MOUNTED IN PRODUCTION (R2.1 grounding — do not parallel-patch)
+//! The production edge binary (`main.rs`) mounts [`crate::register_git_durable`] (GT-003, the durable
+//! front door) + [`crate::register_git_wire`] — **NOT** [`register_git`]. This module's in-memory
+//! predecessor handlers serve only the legacy integration proofs
+//! (`tests/git_edge_integration.rs`, `myelin-cli/tests/cli_edge_integration.rs`) over seeded
+//! [`GitEdgeState`] fixtures; no production route reaches them, so the R2.1 per-repo OBJECT
+//! authorization (the [`crate::repo_authz::RepoAuthorizer`] guard every object-addressed durable
+//! route now passes through) is deliberately NOT duplicated here. If these handlers are ever
+//! re-mounted on a serving binary they MUST first be wrapped in the same object guard
+//! (`git_durable.rs::RepoObjectGuard`) — grep for `RepoObjectGuard` and mirror the registration.
 
 use crate::catalogue::{page_envelope, Handler, HandlerCtx, Method, API_VERSION};
 use crate::error::EdgeError;
