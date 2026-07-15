@@ -278,7 +278,7 @@ pub use fail_static::{
     TestClock,
 };
 pub use fail_static_authz::{
-    AuthzDecision, AuthzServed, CoarseAuthz, FailStaticAuthz, AUTHZ_FRESH_TTL_SECS,
+    encode_authz_key, AuthzDecision, AuthzServed, CoarseAuthz, FailStaticAuthz, AUTHZ_FRESH_TTL_SECS,
 };
 pub use firehose::{
     FirehoseScope, FirehoseSignals, Frame, FrameBuffer, FrameClass, FrameLagSample, PushOutcome,
@@ -396,7 +396,7 @@ mod tests {
             revocation_sla_secs: 300,
             agent_token_ttl_secs: 60,
         };
-        let fs: FailStatic<u8> = FailStatic::try_new(30, 300, bound).expect("valid bound");
+        let fs: FailStatic<&str, u8> = FailStatic::try_new(30, 300, bound).expect("valid bound");
         assert_eq!(fs.fresh_ttl(), 30u64);
         assert_eq!(fs.static_max(), 300u64);
         assert!(fs.static_max() >= fs.fresh_ttl());

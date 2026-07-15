@@ -45,11 +45,11 @@ fn cdc_1_10_constructor_enforces_the_threshold_file_bound() {
     let (bound, seed) = bound_from_file();
 
     // the seed value (300s == revocation SLA) is exactly the upper boundary → admitted (≤).
-    FailStatic::<u8>::try_new(30, seed, bound)
+    FailStatic::<&str, u8>::try_new(30, seed, bound)
         .expect("the seed static_max == revocation SLA admits");
 
     // one second over the revocation SLA → REJECTED (a revoked actor would outlive N).
-    let err = FailStatic::<u8>::try_new(30, bound.revocation_sla_secs + 1, bound)
+    let err = FailStatic::<&str, u8>::try_new(30, bound.revocation_sla_secs + 1, bound)
         .expect_err("over the revocation SLA must be rejected");
     assert!(
         matches!(err, FailStaticError::ExceedsRevocationSla { .. }),
@@ -57,7 +57,7 @@ fn cdc_1_10_constructor_enforces_the_threshold_file_bound() {
     );
 
     // one second under the agent-token TTL → REJECTED (the window must contain the token).
-    let err = FailStatic::<u8>::try_new(10, bound.agent_token_ttl_secs - 1, bound)
+    let err = FailStatic::<&str, u8>::try_new(10, bound.agent_token_ttl_secs - 1, bound)
         .expect_err("under the agent-token TTL must be rejected");
     assert!(
         matches!(err, FailStaticError::BelowAgentTokenTtl { .. }),
@@ -78,7 +78,7 @@ fn cdc_1_10_value_w_is_open_legal_but_the_mechanism_ships() {
     );
     // but the constraint + the mechanism ship: a FailStatic constructs against the seed.
     let (bound, seed) = bound_from_file();
-    FailStatic::<u8>::try_new(30, seed, bound).expect("the mechanism ships regardless of W");
+    FailStatic::<&str, u8>::try_new(30, seed, bound).expect("the mechanism ships regardless of W");
 }
 
 /// **CDC 1.10 — the sequence property (EI-01 §4): authenticated → hiccup → serve-stale →
@@ -90,7 +90,7 @@ fn cdc_1_10_sequence_authenticated_hiccup_stale_then_denied_at_window_close() {
     let (bound, seed) = bound_from_file(); // seed == 300s; agent-token TTL == 60s
     let clock = TestClock::at(10_000);
     // fresh_ttl 30s, static_max == the seed (the largest the constraint admits).
-    let fs: FailStatic<&'static str, _> =
+    let fs: FailStatic<&'static str, &'static str, _> =
         FailStatic::try_new_with_clock(30, seed, bound, clock).expect("valid bound from the file");
 
     // model an upstream that is UP, then hiccups (the transient Identity hiccup of P-S25). We flip a
@@ -159,7 +159,7 @@ fn cdc_1_10_sequence_authenticated_hiccup_stale_then_denied_at_window_close() {
 #[test]
 fn cdc_1_10_cold_hiccup_never_fails_open() {
     let (bound, seed) = bound_from_file();
-    let fs: FailStatic<u8> = FailStatic::try_new(30, seed, bound).expect("valid");
+    let fs: FailStatic<&str, u8> = FailStatic::try_new(30, seed, bound).expect("valid");
     let denied = fs.get("never-seen", || Err(ServeError("hiccup".into())));
     assert_eq!(
         denied,
@@ -172,6 +172,6 @@ fn cdc_1_10_cold_hiccup_never_fails_open() {
 /// Advance the test-clock inside a `FailStatic<T, TestClock>` from this integration test (the clock
 /// is owned by the cache; `FailStatic::clock()` hands back a borrow we advance to step across the
 /// `fresh_ttl` / `static_max` boundaries deterministically).
-fn advance<T: Clone>(fs: &FailStatic<T, TestClock>, secs: u64) {
+fn advance<K: std::hash::Hash + Eq, T: Clone>(fs: &FailStatic<K, T, TestClock>, secs: u64) {
     fs.clock().advance(secs);
 }

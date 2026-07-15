@@ -503,16 +503,24 @@ impl ResolveService {
         // The cache key is the verified (tenant, region, subject, view@root) discriminator — distinct
         // authz questions never share one cached grant; the partition prefix comes from the verified
         // viewer + the OWNER-supplied ref, never a path.
-        let key = format!(
-            "{}|{}|{}|{}@{}",
-            tenant.0, region.0, viewer.principal_id.0, VIEW_PERMISSION, root.0
-        );
+        //
+        // R2.3b: the segments are unconstrained user-controlled strings, so they are framed
+        // length-prefixed (INJECTIVE) via `encode_authz_key` — a `format!("{}|{}|…")` join would let a
+        // subject id / object ref like `alice|view@repo:secret` forge the delimiter structure and
+        // collide with a different (subject, object) question (a cross-principal cached-ALLOW replay).
+        let key = myelin_substrate::encode_authz_key(&[
+            &tenant.0,
+            &region.0,
+            &viewer.principal_id.0,
+            VIEW_PERMISSION,
+            &root.0,
+        ]);
         let perm = Permission(VIEW_PERMISSION.to_string());
         // The owner of the authoritative check is Identity; here it is the synthetic owner's
         // permission verdict (the production wire is the named ResilientClient floor). On a transient
         // Id hiccup the closure returns Err(ServeError) → the fail-static cache decides (degrade /
         // closed). We capture the owner's authoritative decision through the closure.
-        let decision: AuthzDecision = self.authz.serve(&key, at, subject_revoked, || {
+        let decision: AuthzDecision = self.authz.serve(key, at, subject_revoked, || {
             self.owner
                 .check_view(tenant, region, root, viewer, &perm)
                 .map_err(|e| ServeError(format!("identity check hiccup: {e:?}")))

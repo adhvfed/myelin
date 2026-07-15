@@ -152,7 +152,7 @@ fn cdc_consumer_1_10_fail_static_degrade_not_cascade() {
         revocation_sla_secs: 300,
         agent_token_ttl_secs: 60,
     };
-    let fs = FailStatic::<u8>::try_new(30, 300, bound).expect("a valid fail-static window");
+    let fs = FailStatic::<&str, u8>::try_new(30, 300, bound).expect("a valid fail-static window");
     // A fresh read caches the coarse grant.
     assert_eq!(fs.get("acl:alice", || Ok(1u8)), Answer::Fresh(1));
     // A subsequent Id hiccup INSIDE the window degrades (serves stale), it does NOT cascade closed.
