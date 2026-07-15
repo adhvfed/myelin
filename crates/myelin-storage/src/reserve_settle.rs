@@ -67,6 +67,9 @@
 //! 34/34 = 100%.
 
 use myelin_tenancy::TenantId;
+// `HashMap` backs only the `test-support`-gated `MemoryCostLedger` (the durable production arm keeps
+// its state in PG), so the import is gated to the same cfg — otherwise it is unused in the default build.
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 
 /// An integer **minor-units** amount (e.g. cents) — the frozen cost/budget unit (storage.md
@@ -150,8 +153,11 @@ pub struct CostEvent {
     /// The run that produced this metered unit.
     pub run: RunId,
     /// A stable label for the metered unit (e.g. `"llm.tokens"`, `"ci.minute"`) — the
-    /// dimension the one-event-per-unit rule counts.
-    pub unit: &'static str,
+    /// dimension the one-event-per-unit rule counts. An OWNED `String` (not `&'static str`):
+    /// the durable arm rebuilds this label from a `cost_event.unit` DB column, so it cannot lend
+    /// a `'static` reference (this is what killed the `Box::leak` in `reserve_settle_durable`).
+    /// The reporting-side [`MeteredUnit::unit`] STAYS `&'static str` (a compile-time constant).
+    pub unit: String,
     /// The **wholesale** (provider) cost in minor-units — what the upstream charged.
     pub wholesale: MinorUnits,
     /// The **markup** (platform margin) in minor-units — recorded DISTINCTLY from wholesale.
@@ -274,13 +280,142 @@ pub struct SettleOutcome {
     pub refunded: MinorUnits,
 }
 
-/// **The durable per-tenant reserve/settle ledger (mandatory-core).** A backend-agnostic
-/// model of the OLTP-tier ledger: reservations keyed by `(tenant, run)`, the recorded cost
-/// events, and the in-flight-interrupt counter the drill reads (`0` by construction). Real
-/// durability lands with the OLTP driver (P-S12); the arithmetic + invariants are complete
-/// now.
-#[derive(Debug, Default)]
+/// **The durable per-tenant reserve/settle ledger (mandatory-core) — MR-009b W6b2: a role struct
+/// over a [`CostBackend`].** The in-memory `HashMap`/`Vec`/counter core (with ALL the reserve/settle
+/// arithmetic, the settle cap, the idempotent double-settle, and the never-interrupt invariant) now
+/// lives in the `test-support`-gated [`MemoryCostLedger`] TEST DOUBLE; the always-compiled PRODUCTION
+/// backend is the pool-backed [`crate::reserve_settle_durable::DurableCostLedger`] over the FORCE-RLS
+/// `cost_reservation`/`cost_event` tables (migration 0050). The `no-in-memory-durable-store` scanner
+/// strips the `test-support`-gated `Memory` arm, so the production graph presents no in-memory ledger.
+///
+/// The method surface is UNCHANGED (`&mut self` on the mutating ops, `&self` on the readers) — every
+/// call dispatches per-method to the live backend. The durable arm's ops are `&self` (state in PG);
+/// a `&mut self` wrapper calls them fine (Clone, interior state in the DB).
 pub struct CostLedger {
+    backend: CostBackend,
+}
+
+/// The backend of a [`CostLedger`] — the in-memory core (test double, `test-support`-gated) or the
+/// durable `cost_reservation`/`cost_event` tables (production default).
+enum CostBackend {
+    /// The in-memory reserve/settle core. **MR-009b W6b2 — TEST DOUBLE
+    /// (`#[cfg(any(test, feature = "test-support"))]` only).**
+    #[cfg(any(test, feature = "test-support"))]
+    Memory(MemoryCostLedger),
+    /// The durable production backing over the `cost_reservation`/`cost_event` tables.
+    Durable(crate::reserve_settle_durable::DurableCostLedger),
+}
+
+impl CostLedger {
+    /// A fresh, empty IN-MEMORY ledger — the **test double** (MR-009b W6b2: `#[cfg(any(test, feature =
+    /// "test-support"))]` only). The PRODUCTION ledger is [`Self::with_pg`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new() -> CostLedger {
+        CostLedger {
+            backend: CostBackend::Memory(MemoryCostLedger::default()),
+        }
+    }
+
+    /// Wrap the durable PG backing as the production ledger (the always-compiled default over the
+    /// `cost_reservation`/`cost_event` tables). **Must be called inside a tokio runtime** (the durable
+    /// backing captures `Handle::current()` for its sync→async bridge).
+    pub fn with_pg(provider: crate::provider::SubstrateProvider) -> CostLedger {
+        CostLedger {
+            backend: CostBackend::Durable(crate::reserve_settle_durable::DurableCostLedger::new(
+                provider,
+            )),
+        }
+    }
+
+    /// **Reserve-at-dispatch.** Dispatches to the live backend.
+    pub fn reserve(
+        &mut self,
+        tenant: TenantId,
+        run: RunId,
+        amount: MinorUnits,
+        available: MinorUnits,
+    ) -> Result<Reservation, ReserveError> {
+        match &mut self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            CostBackend::Memory(m) => m.reserve(tenant, run, amount, available),
+            CostBackend::Durable(d) => d.reserve(tenant, run, amount, available),
+        }
+    }
+
+    /// **Mark a reserved run in-flight.** Dispatches to the live backend.
+    pub fn begin(&mut self, tenant: &TenantId, run: &RunId) -> Result<(), SettleError> {
+        match &mut self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            CostBackend::Memory(m) => m.begin(tenant, run),
+            CostBackend::Durable(d) => d.begin(tenant, run),
+        }
+    }
+
+    /// **Settle-on-completion.** Dispatches to the live backend.
+    pub fn settle(
+        &mut self,
+        tenant: &TenantId,
+        run: &RunId,
+        units: &[MeteredUnit],
+    ) -> Result<SettleOutcome, SettleError> {
+        match &mut self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            CostBackend::Memory(m) => m.settle(tenant, run, units),
+            CostBackend::Durable(d) => d.settle(tenant, run, units),
+        }
+    }
+
+    /// **Refund an unstarted run** (the only teardown; never touches an in-flight run). Dispatches.
+    pub fn cancel_unstarted(
+        &mut self,
+        tenant: &TenantId,
+        run: &RunId,
+    ) -> Result<MinorUnits, SettleError> {
+        match &mut self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            CostBackend::Memory(m) => m.cancel_unstarted(tenant, run),
+            CostBackend::Durable(d) => d.cancel_unstarted(tenant, run),
+        }
+    }
+
+    /// The current state of a reservation (for the drill / consumer to observe). Dispatches.
+    pub fn state_of(&self, tenant: &TenantId, run: &RunId) -> Option<ReservationState> {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            CostBackend::Memory(m) => m.state_of(tenant, run),
+            CostBackend::Durable(d) => d.state_of(tenant, run),
+        }
+    }
+
+    /// Every cost event recorded for a `(tenant, run)` (the durable audit) — OWNED rows (unified
+    /// across the arms: the durable arm cannot lend a reference into the DB). Dispatches.
+    pub fn cost_events_for(&self, tenant: &TenantId, run: &RunId) -> Vec<CostEvent> {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            CostBackend::Memory(m) => m.cost_events_for(tenant, run),
+            CostBackend::Durable(d) => d.cost_events_for(tenant, run),
+        }
+    }
+
+    /// **The in-flight-interrupt counter the drill reads.** `0` by construction on BOTH arms.
+    pub fn inflight_interrupt_count(&self) -> u64 {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            CostBackend::Memory(m) => m.inflight_interrupt_count(),
+            CostBackend::Durable(d) => d.inflight_interrupt_count(),
+        }
+    }
+}
+
+/// **The in-memory reserve/settle core — the `test-support`-gated TEST DOUBLE (MR-009b W6b2).** A
+/// backend-agnostic model of the OLTP-tier ledger: reservations keyed by `(tenant, run)`, the recorded
+/// cost events, and the in-flight-interrupt counter (`0` by construction). ALL the reserve/settle
+/// arithmetic, the settle cap, and the idempotent double-settle logic (the 34/34 mutation floor) live
+/// here, UNCHANGED from the pre-W6b2 `CostLedger`. The always-compiled production ledger is the
+/// pool-backed [`crate::reserve_settle_durable::DurableCostLedger`].
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+pub struct MemoryCostLedger {
     /// The live reservations, keyed by `(tenant, run)`.
     reservations: HashMap<(TenantId, RunId), Reservation>,
     /// Every cost event ever recorded (the durable audit of metered units).
@@ -291,10 +426,11 @@ pub struct CostLedger {
     inflight_interrupt_count: u64,
 }
 
-impl CostLedger {
-    /// A fresh, empty ledger.
-    pub fn new() -> CostLedger {
-        CostLedger::default()
+#[cfg(any(test, feature = "test-support"))]
+impl MemoryCostLedger {
+    /// A fresh, empty in-memory ledger.
+    pub fn new() -> MemoryCostLedger {
+        MemoryCostLedger::default()
     }
 
     /// **Reserve-at-dispatch.** Debit `amount` (integer minor-units) against the supplied
@@ -393,7 +529,7 @@ impl CostLedger {
             let event = CostEvent {
                 tenant: tenant.clone(),
                 run: run.clone(),
-                unit: u.unit,
+                unit: u.unit.to_string(),
                 wholesale: u.wholesale,
                 markup: u.markup,
             };
@@ -498,11 +634,13 @@ impl CostLedger {
     }
 
     /// Every cost event recorded for a `(tenant, run)` (the durable audit; the drill counts
-    /// these against the metered units to assert `cost_events_per_unit == 1`).
-    pub fn cost_events_for(&self, tenant: &TenantId, run: &RunId) -> Vec<&CostEvent> {
+    /// these against the metered units to assert `cost_events_per_unit == 1`). Returns OWNED rows
+    /// (unified with the durable arm, which cannot lend a reference into the DB).
+    pub fn cost_events_for(&self, tenant: &TenantId, run: &RunId) -> Vec<CostEvent> {
         self.cost_events
             .iter()
             .filter(|e| &e.tenant == tenant && &e.run == run)
+            .cloned()
             .collect()
     }
 

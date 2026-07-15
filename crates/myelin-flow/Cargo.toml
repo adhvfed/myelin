@@ -86,6 +86,11 @@ tokio = { workspace = true }
 sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
+# MR-009b W6b2 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN test
+# targets (the `src/budget.rs` unit tests + `tests/drills_flow_*` + `tests/*` that call the now-gated
+# `BudgetGate::new`). The sanctioned Cargo idiom (same as the storage/chat self dev-deps); it does NOT
+# affect the normal `cargo build`, which stays durable-by-default (`CostLedger` production = `with_pg`).
+myelin-flow = { path = ".", features = ["test-support"] }
 # MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
 # `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests (the same
 # posture as the Wave-2/3 identity/events test-support dev-dependencies). DEV-only — never in the
@@ -132,3 +137,9 @@ myelin-agent = { path = "../myelin-agent" }
 # (tokio + myelin-config are regular deps since W3b.4 — the durable main.rs needs them; the
 # feature now only pulls the raw-sqlx test harness.)
 integration = ["dep:sqlx"]
+# MR-009b W6b2 — the `test-support` cargo feature. It gates `BudgetGate::new(wallet)` (which
+# constructs the now-`test-support`-gated in-memory `CostLedger::new()`) + the ci_pipeline test
+# helpers behind `#[cfg(any(test, feature = "test-support"))]`, so downstream crates (ci-controlplane)
+# can enable them as a DEV-dependency. Forwards to `myelin-storage/test-support` (the in-memory
+# `CostLedger` double lives there). DEV/TEST only — never in the production DAG.
+test-support = ["myelin-storage/test-support"]

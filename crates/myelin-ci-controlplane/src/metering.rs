@@ -486,6 +486,12 @@ impl ReserveSettleParitySignal {
 /// - `samples` — the runner's raw resource-second samples each completed run settles (≥ 2 dimensions
 ///   so the wholesale ≠ markup split is exercised across meters).
 /// - `markup_before` / `markup_after` — the pricing policy before/after the pricing change (R-2 seam).
+///
+/// **MR-009b W6b2 — `#[cfg(any(test, feature = "test-support"))]`:** this drill constructs
+/// `myelin_flow::BudgetGate::new`, which is now the `test-support`-gated in-memory [`CostLedger`] path
+/// (production is `BudgetGate::with_pg`). Its callers (this crate's `metering_tests` + the
+/// `drills_ci_p17_*` tests) reach it via the `myelin-ci-controlplane/test-support` self dev-dependency.
+#[cfg(any(test, feature = "test-support"))]
 pub fn reserve_settle_parity_drill(
     tenant: &TenantId,
     per_run_estimate: MinorUnits,
@@ -608,6 +614,9 @@ pub fn reserve_settle_parity_drill(
 /// 0): a `kind` that did NOT refuse-start is one over-exhaustion start. `0` is the green artifact (both
 /// kinds refused — the parity). A pure function so the RED (one kind started) case is unit-testable
 /// even though the live gate refuses both.
+// MR-009b W6b2 — a helper of the `test-support`-gated `reserve_settle_parity_drill`; gated to match so
+// it is not an unused item in the default (durable-by-default) build.
+#[cfg(any(test, feature = "test-support"))]
 fn count_over_exhaustion_starts(ci_refused: bool, agent_refused: bool) -> u64 {
     u64::from(!ci_refused) + u64::from(!agent_refused)
 }
@@ -615,6 +624,7 @@ fn count_over_exhaustion_starts(ci_refused: bool, agent_refused: bool) -> u64 {
 /// The drill's run-kind for iteration `i` — alternates `Ci` / `Agent` so BOTH kinds meter into the
 /// SAME wallet across the affordable runs (the unified-meter property, X-6 — not two budgets). Even
 /// `i` is a CI run, odd is an agent run.
+#[cfg(any(test, feature = "test-support"))]
 fn run_kind(i: u64) -> CostKind {
     if i.is_multiple_of(2) {
         CostKind::Ci
@@ -625,8 +635,10 @@ fn run_kind(i: u64) -> CostKind {
 
 /// A `MarkupPolicy` adapter that forwards to a borrowed `&dyn MarkupPolicy` so a [`CiMeter`] (which
 /// owns its markup policy by value) can be built over a borrowed trait object inside the drill.
+#[cfg(any(test, feature = "test-support"))]
 struct FwdMarkup<'a>(&'a dyn MarkupPolicy);
 
+#[cfg(any(test, feature = "test-support"))]
 impl MarkupPolicy for FwdMarkup<'_> {
     fn markup_for(&self, meter: Meter, amount: u64, wholesale: MinorUnits) -> MinorUnits {
         self.0.markup_for(meter, amount, wholesale)
