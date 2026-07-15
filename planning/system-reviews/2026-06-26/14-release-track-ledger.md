@@ -121,6 +121,14 @@ per store ⇒ two durable TupleStores mint colliding `event_id`s and `co_commit_
 production ULID source), but the W3b track makes the shared PG outbox the real emit path — the
 ULID/unique-minter fix should land before or with W3b.4 (composition roots).
 
+**W3b.3 DONE (2026-07-15, merge `50387a5`): BUS-2 exact for identity.** Tuple deltas +
+`co_commit_in_tx` in ONE `with_tenant_tx` (both-or-neither, probe-proven under a forced post-delta
+unique violation + kill-9 0-ghost/0-lost); event shape byte-identical; durable ctors drop the
+OutboxStore param. **NAMED CONDITION → W3b.4: composition roots MUST wire a unique/ULID minter,
+never the default `MonotonicMinter`** (collision → `ON CONFLICT DO NOTHING` silently drops events;
+newly reachable via the shared PG outbox, probe-proven). Principal/revocation backings emit no
+events — no analogous re-point exists.
+
 **W3b.2 DONE (2026-07-15, merge `20fe480`): scanner-neutral.** `PgOutboxBacking` over the frozen
 outbox table; commit_staged_atomic (dup-event_id rejects whole commit = memory parity; one seq
 discipline with co_commit_in_tx); drain_once_dead_letter (claim locks held across publishes; per-row
