@@ -51,6 +51,37 @@ use crate::fail_static::{Answer, Clock, FailStatic, FailStaticSignals, SystemClo
 use crate::thresholds::FailStaticThreshold;
 use crate::{FailStaticError, Seconds, ServeError, StalenessBound};
 
+/// **Encode `(tenant, region, subject, permission, object, …)` segments into an INJECTIVE authz
+/// cache key (R2.3b).** The fail-static cache compares the FULL key by `Eq` (R2.3), which kills the
+/// 64-bit-hash aliasing — but only if two DISTINCT logical questions never serialize to the SAME
+/// key string. A naive `format!("{t}|{r}|{s}|{p}@{o}")` does NOT guarantee that: the segments are
+/// unconstrained user-controlled `String`s (an OIDC `sub` / SCIM id / an object ref carry no charset
+/// rule), so a subject id like `alice|view@repo:secret` can forge the delimiter structure and make a
+/// `(different-subject, different-object)` question produce a byte-identical key — a cross-principal
+/// cached-ALLOW replay the `Eq` comparison cannot catch (the strings really are equal).
+///
+/// This frames each segment **length-prefixed** as `{byte_len}:{segment}` and concatenates them.
+/// Decoding is unambiguous (read decimal digits up to the first `:`, then consume EXACTLY that many
+/// bytes — the segment bytes are counted, never scanned), so no segment's content can shift a frame
+/// boundary. The map `segments → key` is therefore injective: distinct segment sequences always
+/// yield distinct keys. The encoding stays roughly human-readable (`5:alice2:eu…`).
+///
+/// Both authz key builders (`myelin-git` `live_check::cache_key` and `myelin-refs-service`
+/// `resolve`) route through this ONE helper so the injective framing is defined once.
+pub fn encode_authz_key(segments: &[&str]) -> String {
+    // Pre-size: each frame is the segment bytes + its decimal length + one ':' — a small over-count
+    // (the length digits) that avoids reallocations on the hot path.
+    let mut out = String::with_capacity(segments.iter().map(|s| s.len() + 3).sum());
+    for seg in segments {
+        // `str::len()` is the BYTE length — the count the decoder consumes; framing on bytes (not
+        // chars) keeps it injective over arbitrary UTF-8 segment content.
+        out.push_str(&seg.len().to_string());
+        out.push(':');
+        out.push_str(seg);
+    }
+    out
+}
+
 /// The freshness window seed (seconds) of the authz fail-static ladder: within it a cached coarse
 /// answer is served fresh even on a hiccup (no degradation). A v1 seed well under `static_max`;
 /// the measured value is tuned at scale. `static_max` (W) is read from the thresholds file
@@ -142,8 +173,11 @@ impl AuthzDecision {
 pub struct FailStaticAuthz<C: Clock = SystemClock> {
     /// The substrate bounded-staleness mechanism (P-S18). The `static_max` (W) it was constructed
     /// with is the thresholds-file bound; the constructor enforced
-    /// `agent_token_ttl ≤ static_max ≤ revocation_sla` structurally.
-    inner: FailStatic<CoarseAuthz, C>,
+    /// `agent_token_ttl ≤ static_max ≤ revocation_sla` structurally. Keyed by the OWNED `String`
+    /// authz discriminator (the verified `(tenant, region, subject, permission@object)` the caller
+    /// builds) — the cache compares the FULL key, so two distinct questions that collide in a hash
+    /// can never share one cached grant (R2.3; no 64-bit-hash aliasing).
+    inner: FailStatic<String, CoarseAuthz, C>,
 }
 
 impl<C: Clock> std::fmt::Debug for FailStaticAuthz<C> {
@@ -212,7 +246,9 @@ impl<C: Clock> FailStaticAuthz<C> {
     ///
     /// - `key` is the cache key (the verified `(tenant, region, subject, permission@object)`
     ///   discriminator built by the caller — distinct authz questions never share one cached
-    ///   grant; the partition prefix comes from a verified token, never a path).
+    ///   grant; the partition prefix comes from a verified token, never a path). Accepted as
+    ///   anything that owns into a `String`; the cache compares the FULL key by value (never a
+    ///   64-bit digest), so a hash collision between two distinct questions cannot alias grants (R2.3).
     /// - `at` is the read consistency: `Strong` (zookie-stamped) BYPASSES the cache (4.10);
     ///   `BoundedStale` consults it.
     /// - `subject_revoked` is the caller's revocation consult (the S7 denylist): a subject revoked
@@ -223,9 +259,9 @@ impl<C: Clock> FailStaticAuthz<C> {
     ///   hiccup it returns `Err` (the cache serves the bounded-staleness fallback, or fails
     ///   closed). A drill drives the hiccup by making `source` return `Err` (the harness routes
     ///   the **P-S03 `DependencyBreaker`** consult into this).
-    pub fn serve<K: std::hash::Hash>(
+    pub fn serve(
         &self,
-        key: K,
+        key: impl Into<String>,
         at: &Consistency,
         subject_revoked: bool,
         source: impl Fn() -> Result<Decision, ServeError>,
@@ -262,7 +298,7 @@ impl<C: Clock> FailStaticAuthz<C> {
                 // `FailStatic::get` runs the source; on success it caches the coarse answer + serves
                 // it Fresh; on a hiccup it serves the last coarse grant Static (within W) or Closed
                 // (past W / no fallback). Only a real authoritative answer is ever cached.
-                let answer = self.inner.get(key, || source().map(CoarseAuthz::of));
+                let answer = self.inner.get(key.into(), || source().map(CoarseAuthz::of));
                 serve_answer(answer)
             }
         }
@@ -509,14 +545,24 @@ mod tests {
         );
     }
 
-    /// **Distinct keys do not share a cache bucket — no cross-actor/cross-question leak.** A grant
-    /// cached for one key does not serve a different key's hiccup.
+    /// **Distinct keys do not share a cache bucket — no cross-actor/cross-question leak (R2.3).** A
+    /// grant cached for one full key does not serve a DIFFERENT full key's hiccup. The cache compares
+    /// the whole `(tenant, region, subject, permission@object)` string by value (never a 64-bit
+    /// digest), so a different subject or a different question can never replay another's cached
+    /// ALLOW — even while that ALLOW is live-and-stale in the cache (the cross-actor authz leak the
+    /// full-key comparison shuts).
     #[test]
     fn distinct_keys_do_not_share_a_cache_bucket() {
         let fs = authz_at(1_000);
         let _ = fs.serve("acme|eu|alice|read@doc:1", &bounded_stale(), false, allow);
         fs.clock().advance(31);
-        // a different subject / question / tenant has no cached grant → a hiccup fails closed.
+        // Alice's OWN grant is live-and-stale right now (proving the cache is NOT simply empty) …
+        let alice = fs.serve("acme|eu|alice|read@doc:1", &bounded_stale(), false, hiccup);
+        assert!(
+            alice.is_allow() && alice.is_degraded(),
+            "alice's stale ALLOW is live in the cache"
+        );
+        // … yet a different subject / question / tenant has no cached grant → a hiccup fails closed.
         let other = fs.serve("acme|eu|bob|read@doc:1", &bounded_stale(), false, hiccup);
         assert!(other.is_deny(), "bob must not borrow alice's cached grant");
         let other_q = fs.serve("acme|eu|alice|write@doc:1", &bounded_stale(), false, hiccup);
