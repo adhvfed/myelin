@@ -128,6 +128,17 @@ pub struct GatewayBuilder {
 impl GatewayBuilder {
     /// Register a normal route (`method` + `pattern` like `/v1/git/repos/{repo}/prs/{n}`), gated by
     /// the re-authorized `action`, dispatching to `handler`.
+    ///
+    /// **The action gate is NOT an object gate (R2.1).** The authorizer here authorizes the ACTION
+    /// (`git.pr.view`) only — it never sees WHICH object the route addresses. An object-addressed
+    /// route (`{repo}`, `{channel}`, …) MUST additionally enforce the object-level check at its
+    /// registration: wrap the handler in a subsystem object guard that consults the subsystem's
+    /// injected object authorizer with the route's declared permission BEFORE the handler runs (the
+    /// git precedent: `git_durable.rs::RepoObjectGuard`, declared per-route in
+    /// `register_git_durable` — the analogue of the R2.2 `sse_route`/`sse_route_scoped`
+    /// registration-time contract). A LIST route must instead prefilter through the Identity
+    /// `list_objects` seam (never post-filter). Registering an object-addressed route bare repeats
+    /// the R2.1 action-only bypass.
     pub fn route(
         mut self,
         method: Method,

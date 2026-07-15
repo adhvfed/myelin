@@ -10,9 +10,15 @@
 //! ## The check path (one primitive, the platform doctrine)
 //!
 //! [`CheckBackedRepoAuthorizer`] adapts the seam onto the frozen Git ReBAC fragment (contract 4.9):
-//! - [`RepoAccess::Read`]  → `check(principal, "pull", repo:<slug>)` (`pull = reader ∪ writer ∪
-//!   admin ∪ parent_project->view`);
-//! - [`RepoAccess::Write`] → `check(principal, "push", repo:<slug>)` (`push = writer ∪ admin ∪ …`).
+//! - [`RepoPermission::Pull`]  → `check(principal, "pull", repo:<slug>)` (`pull = reader ∪ writer ∪
+//!   admin ∪ parent_project->view`) — the wire's `RepoAccess::Read` maps here;
+//! - [`RepoPermission::Push`] → `check(principal, "push", repo:<slug>)` (`push = writer ∪ admin ∪
+//!   …`) — the wire's `RepoAccess::Write` maps here;
+//! - [`RepoPermission::ProtectedPush`] → `check(principal, "protected_push", repo:<slug>)`
+//!   (**admin-only** — the R2.1 merge / branch-protection gate; `pull_request.merge =
+//!   parent_repo->protected_push` reduces to exactly this check on the parent repo);
+//! - [`RepoPermission::ApproveUntrustedCi`] → `check(principal, "approve_untrusted_ci",
+//!   repo:<slug>)` (the X-1 fork-CI endorsement relation).
 //!
 //! The check rides [`myelin_git::live_check::GitCheckGate`] — the SAME `FailStaticAuthz` bounded-
 //! staleness cache the platform Identity dependency root rides (GIT-P14 doctrine: the git hot path
@@ -67,17 +73,19 @@
 //! leave the WRONG residue: a repo that exists but is reachable by no one. A failed grant write
 //! aborts the create loudly (fail-closed, no repo without an owner).
 
-use crate::repo_authz::{RepoAccess, RepoAuthorizer};
+use crate::repo_authz::{RepoAuthorizer, RepoPermission};
 use myelin_events::Timestamp;
 use myelin_git::core::RepoLoc;
-use myelin_git::live_check::{is_allow, perm, GitCheckGate};
+use myelin_git::live_check::{bounded_stale_at, is_allow, perm, strong_at, GitCheckGate};
 use myelin_identity::{
-    ObjectId, Permission, Principal, RelName, RelationTuple, RevokeTarget, TupleDelta, Zookie,
+    IdentityService, ListObjectsResult, ObjectId, ObjectType, Permission, Principal, RelName,
+    RelationTuple, RevokeTarget, TupleDelta, Zookie,
 };
 use myelin_identity_service::{StoreBackedCheck, TupleStore};
 use myelin_storage::TenantScope;
 use myelin_substrate::{FailStaticError, FailStaticThreshold, Seconds, SystemClock};
 use myelin_tenancy::ArtifactRef;
+use std::collections::BTreeSet;
 
 /// The frozen `repo` relation the bootstrap grant writes (`repo.admin` — the strongest repo
 /// relation in the 4.9 fragment: `pull`/`push`/`administer`/`protected_push` all admit it). Spelled
@@ -126,8 +134,44 @@ impl CheckBackedRepoAuthorizer {
     }
 }
 
+impl CheckBackedRepoAuthorizer {
+    /// The S7 revocation consult, supplied to the gate so a just-revoked principal is denied
+    /// even when the fail-static cache would otherwise serve a stale coarse ALLOW (the engine's
+    /// own internal consult only runs on a FRESH evaluation). A `Principal` denylist entry
+    /// carries no TTL, so the zero instant never gates it (mirrors `StoreBackedCheck::check`).
+    fn subject_revoked(&self, principal: &Principal) -> bool {
+        let scope = TenantScope::from_verified_token(principal, principal.region.clone());
+        self.gate.id_ref().revocations().is_revoked(
+            &scope,
+            &RevokeTarget::Principal(principal.principal_id.clone()),
+            &Timestamp(String::new()),
+        )
+    }
+}
+
 impl RepoAuthorizer for CheckBackedRepoAuthorizer {
-    fn authorize_repo(&self, principal: &Principal, repo: &RepoLoc, access: RepoAccess) -> bool {
+    /// **R2.1 — the permission-aware object decision, each variant on the RIGHT gate rung:**
+    ///
+    /// - `Pull` / `Push` → [`GitCheckGate::front_door_check`] (`repo.pull` / `repo.push`,
+    ///   **BoundedStale** — the read/write hot path DEGRADES on a transient Id hiccup, GIT-P14);
+    /// - `ProtectedPush` → `repo.protected_push` on a **Strong** read
+    ///   ([`myelin_git::live_check::strong_at`]) — the merge / branch-protection transitions are
+    ///   security-sensitive: a just-granted admin counts (read-your-writes) and an Id hiccup fails
+    ///   CLOSED, never serves a stale coarse grant (the same posture as
+    ///   [`GitCheckGate::merge_check`], whose `pull_request.merge` REDUCES to exactly this
+    ///   `parent_repo->protected_push` — the edge checks the reduction on the parent repo because
+    ///   the PR object carries no tuple of its own yet; the parent repo is the validated `{repo}`
+    ///   path segment, so the two are the same decision);
+    /// - `ApproveUntrustedCi` → [`GitCheckGate::fork_endorsement_check`] (**Strong** — a
+    ///   just-granted endorsement relation counts immediately, X-1).
+    ///
+    /// Fail-closed everywhere: only an explicit Allow admits (Deny / Conditional / Closed refuse).
+    fn authorize_repo_permission(
+        &self,
+        principal: &Principal,
+        repo: &RepoLoc,
+        permission: RepoPermission,
+    ) -> bool {
         // Defence-in-depth tenant pin: the gateway's IDOR reject + the GIT-D8 tenant-from-token rule
         // already guarantee `repo.tenant` is the VERIFIED token tenant, but a drifted call site must
         // fail CLOSED here, never leak into another tenant's partition (the check below scopes reads
@@ -136,37 +180,94 @@ impl RepoAuthorizer for CheckBackedRepoAuthorizer {
         if principal.tenant.0 != repo.tenant {
             return false;
         }
-        // Read → repo.pull, Write → repo.push (the frozen 4.9 permission names — live_check::perm).
-        let permission = Permission(
-            match access {
-                RepoAccess::Read => perm::PULL,
-                RepoAccess::Write => perm::PUSH,
-            }
-            .to_string(),
-        );
         let object = repo_object_ref(&repo.repo);
-        // The S7 revocation consult, supplied to the gate so a just-revoked principal is denied
-        // even when the fail-static cache would otherwise serve a stale coarse ALLOW (the engine's
-        // own internal consult only runs on a FRESH evaluation). A `Principal` denylist entry
-        // carries no TTL, so the zero instant never gates it (mirrors `StoreBackedCheck::check`).
-        let scope = TenantScope::from_verified_token(principal, principal.region.clone());
-        let revoked = self.gate.id_ref().revocations().is_revoked(
-            &scope,
-            &RevokeTarget::Principal(principal.principal_id.clone()),
-            &Timestamp(String::new()),
-        );
-        // The wire hot path is a BoundedStale read (the GIT-P14 availability posture: clone/fetch/
-        // push traffic survives a transient Id hiccup on the last coarse grant, within
-        // static_max ≤ revocation SLA). An empty zookie = "latest" (no snapshot pin).
-        let decision = self.gate.front_door_check(
-            principal,
-            &permission,
-            &object,
-            Zookie(String::new()),
-            revoked,
-        );
-        // Fail-closed: only an explicit Allow admits (Deny / Conditional / Closed all refuse).
+        let revoked = self.subject_revoked(principal);
+        // An empty zookie = "latest" (no snapshot pin) on every rung.
+        let decision = match permission {
+            RepoPermission::Pull | RepoPermission::Push => {
+                let name = match permission {
+                    RepoPermission::Pull => perm::PULL,
+                    _ => perm::PUSH,
+                };
+                self.gate.front_door_check(
+                    principal,
+                    &Permission(name.to_string()),
+                    &object,
+                    Zookie(String::new()),
+                    revoked,
+                )
+            }
+            RepoPermission::ProtectedPush => self.gate.check_failstatic(
+                principal,
+                &Permission(perm::PROTECTED_PUSH.to_string()),
+                &object,
+                &strong_at(Zookie(String::new())),
+                revoked,
+            ),
+            RepoPermission::ApproveUntrustedCi => self.gate.fork_endorsement_check(
+                principal,
+                &object,
+                Zookie(String::new()),
+                revoked,
+            ),
+        };
         is_allow(&decision)
+    }
+
+    /// **R2.1 — the leak-free LIST prefilter over Identity `list_objects` (contract 4.3).** Ask the
+    /// engine for the subject's `pull`-reachable `repo` set; an id in the returned `Ids` materialise
+    /// is granted BY CONSTRUCTION (the S4 path is permission-aware, never a post-filter), so those
+    /// candidates are admitted with ZERO per-repo checks — the no-N-check fast path. Every remaining
+    /// candidate is settled by the ordinary per-repo `Pull` check through the fail-static gate.
+    ///
+    /// Why the union (and not `Ids` alone): the S8 reverse index the `Ids` path materialises from is
+    /// fed OFF THE BUS ([`myelin_identity_service::ReverseIndexConsumer`]), and the edge composition
+    /// root does not yet run that consumer — so at the edge the index can be legitimately COLD (an
+    /// absent id means "not indexed", NOT "denied"). Treating `Ids` as the sole oracle would deny
+    /// every granted repo (an availability break); treating it as an ACCELERATOR keeps the answer
+    /// authoritative (each admit is a real engine grant, via either path) and becomes the dominant
+    /// no-N-check path the moment the composition root wires the consumer. The `Filter` arm (above
+    /// the cardinality cap) and any Id error likewise fall back to the per-candidate checks — the
+    /// on-disk candidate list bounds the work, and the gate's fail-static cache dedups repeats.
+    fn visible_repos(
+        &self,
+        principal: &Principal,
+        tenant: &str,
+        region: &str,
+        candidates: &[String],
+    ) -> Vec<String> {
+        // The same defence-in-depth tenant pin as the per-repo check (fail closed, never another
+        // tenant's partition).
+        if principal.tenant.0 != tenant {
+            return Vec::new();
+        }
+        // (1) The Ids-materialise fast path: the engine's leak-free reachable set for
+        // `(subject, pull, repo)` — BoundedStale (the list is a read hot path; the per-candidate
+        // fallback below still settles anything the index cannot answer).
+        let ids: BTreeSet<String> = match self.gate.id_ref().list_objects(
+            principal,
+            &Permission(perm::PULL.to_string()),
+            &ObjectType("repo".to_string()),
+            &bounded_stale_at(Zookie(String::new())),
+        ) {
+            Ok(ListObjectsResult::Ids { ids, .. }) => ids.into_iter().map(|o| o.0).collect(),
+            // Filter (above the cap) / any error → no fast path; the per-candidate checks decide.
+            _ => BTreeSet::new(),
+        };
+        // (2) Intersect with the on-disk candidates (the ADR-07 conjoin analogue), settling every
+        // candidate the fast path did not admit through the ordinary per-repo check.
+        candidates
+            .iter()
+            .filter(|slug| {
+                ids.contains(&repo_object_id(slug))
+                    || self.authorize_repo_permission(
+                        principal,
+                        &RepoLoc::new(tenant, region, slug.as_str()),
+                        RepoPermission::Pull,
+                    )
+            })
+            .cloned()
+            .collect()
     }
 }
 
@@ -308,6 +409,7 @@ fn now_rfc3339() -> Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo_authz::RepoAccess;
     use myelin_events::OutboxStore;
     use myelin_identity::{DataRole, FragmentAdmit, PrincipalId, PrincipalKind, PrincipalStatus};
     use myelin_substrate::FailStaticThreshold;
@@ -557,6 +659,143 @@ mod tests {
         let authz = authorizer(sbc);
         assert!(!authz.authorize_repo(&creator, &repo, RepoAccess::Read));
         assert!(!authz.authorize_repo(&creator, &repo, RepoAccess::Write));
+    }
+
+    // ── R2.1 — the permission-aware seam over the real engine ───────────────────────────────────
+
+    /// A raw `writer` tuple on the repo (the ordinary collaborator grant).
+    fn write_relation(sbc: &StoreBackedCheck, p: &Principal, relation: &str, slug: &str) {
+        let scope = TenantScope::from_verified_token(p, p.region.clone());
+        sbc.tuples()
+            .write_tuples(
+                &scope,
+                p,
+                &[TupleDelta::Add(RelationTuple {
+                    object: ObjectId(repo_object_id(slug)),
+                    relation: RelName(relation.into()),
+                    subject: p.principal_id.clone(),
+                    caveat: None,
+                })],
+                None,
+                None,
+                now_rfc3339(),
+            )
+            .expect("write relation tuple");
+    }
+
+    /// **R2.1 — a `writer` admits Push but NOT ProtectedPush and NOT ApproveUntrustedCi through the
+    /// REAL engine** (the frozen fragment's `protected_push = admin`; the endorsement is its own
+    /// relation). The stronger-permission split the JSON API's merge/branch-protection/endorse
+    /// handlers now stand on.
+    #[test]
+    fn writer_admits_push_but_not_protected_push_or_endorse() {
+        let sbc = check_with_git_fragment();
+        let dev = principal("svc:dev", "acme");
+        write_relation(&sbc, &dev, "writer", "widgets");
+        let authz = authorizer(sbc);
+        let repo = RepoLoc::new("acme", "eu-west", "widgets");
+        assert!(authz.authorize_repo_permission(&dev, &repo, RepoPermission::Pull));
+        assert!(authz.authorize_repo_permission(&dev, &repo, RepoPermission::Push));
+        assert!(
+            !authz.authorize_repo_permission(&dev, &repo, RepoPermission::ProtectedPush),
+            "a push-only writer must NOT clear the merge / branch-protection gate"
+        );
+        assert!(
+            !authz.authorize_repo_permission(&dev, &repo, RepoPermission::ApproveUntrustedCi),
+            "a push-only writer must NOT endorse untrusted fork CI"
+        );
+    }
+
+    /// **R2.1 — `admin` (the bootstrap grant's relation) admits `protected_push`** (merge + set
+    /// branch protection) **but NOT `approve_untrusted_ci`** (a distinct relation in the frozen
+    /// fragment), and the endorsement relation admits ONLY the endorsement.
+    #[test]
+    fn admin_admits_protected_push_endorser_admits_only_endorse() {
+        let sbc = check_with_git_fragment();
+        let boss = principal("svc:boss", "acme");
+        let bot = principal("svc:bot", "acme");
+        write_relation(&sbc, &boss, REPO_ADMIN_RELATION, "widgets");
+        write_relation(&sbc, &bot, "approve_untrusted_ci", "widgets");
+        let authz = authorizer(sbc);
+        let repo = RepoLoc::new("acme", "eu-west", "widgets");
+        assert!(authz.authorize_repo_permission(&boss, &repo, RepoPermission::ProtectedPush));
+        assert!(
+            !authz.authorize_repo_permission(&boss, &repo, RepoPermission::ApproveUntrustedCi),
+            "admin does not imply the endorsement relation (frozen fragment)"
+        );
+        assert!(authz.authorize_repo_permission(&bot, &repo, RepoPermission::ApproveUntrustedCi));
+        assert!(
+            !authz.authorize_repo_permission(&bot, &repo, RepoPermission::Pull),
+            "the endorsement relation alone confers no read"
+        );
+        assert!(!authz.authorize_repo_permission(&bot, &repo, RepoPermission::ProtectedPush));
+    }
+
+    /// **R2.1 — `visible_repos` over the real engine is leak-free deny-by-default:** an un-granted
+    /// principal sees the EMPTY set; a granted principal sees exactly its granted candidates (the
+    /// per-candidate fallback path — the S8 index is cold here, exactly the edge's current posture).
+    #[test]
+    fn visible_repos_filters_to_the_granted_set() {
+        let sbc = check_with_git_fragment();
+        let bootstrap = TupleRepoBootstrap::new(sbc.tuples().clone());
+        let creator = principal("svc:creator", "acme");
+        bootstrap
+            .grant_creator(&creator, &RepoLoc::new("acme", "eu-west", "alpha"))
+            .expect("grant on alpha");
+        let authz = authorizer(sbc);
+        let candidates = vec!["alpha".to_string(), "beta".to_string()];
+        assert_eq!(
+            authz.visible_repos(&creator, "acme", "eu-west", &candidates),
+            vec!["alpha".to_string()],
+            "only the granted repo is visible; `beta`'s existence is not leaked"
+        );
+        let mallory = principal("svc:mallory", "acme");
+        assert!(
+            authz
+                .visible_repos(&mallory, "acme", "eu-west", &candidates)
+                .is_empty(),
+            "an un-granted principal lists NOTHING"
+        );
+        // The defence-in-depth tenant pin: a foreign-tenant listing is the empty set.
+        assert!(authz
+            .visible_repos(&creator, "globex", "eu-west", &candidates)
+            .is_empty());
+    }
+
+    /// **R2.1 — the `list_objects` Ids fast path admits without a per-candidate check** when the S8
+    /// reverse index IS fed (the bus-fed posture the edge grows into): feed the index off the
+    /// outbox exactly as the production `ReverseIndexConsumer` does, then assert the granted repo
+    /// is visible. (Same observable answer as the fallback — this pins the fast path COMPOSES; the
+    /// leak-free split is pinned above.)
+    #[test]
+    fn visible_repos_ids_fast_path_over_a_fed_index() {
+        use myelin_events::{BusTransport, EventHandler as _, InProcessBus, Relay};
+        let outbox = OutboxStore::new();
+        let tuples = TupleStore::new(outbox.clone());
+        let index = myelin_identity_service::ReverseIndex::new();
+        let consumer = myelin_identity_service::ReverseIndexConsumer::new(index.clone());
+        let sbc = StoreBackedCheck::with_index(tuples, index);
+        for admit in sbc.admit_git_fragment() {
+            assert!(matches!(admit, FragmentAdmit::Admitted { .. }));
+        }
+        let creator = principal("svc:creator", "acme");
+        TupleRepoBootstrap::new(sbc.tuples().clone())
+            .grant_creator(&creator, &RepoLoc::new("acme", "eu-west", "alpha"))
+            .expect("grant on alpha");
+        // Feed the S8 index off the bus (the production ReverseIndexConsumer path).
+        let bus = InProcessBus::new();
+        let relay = Relay::new(outbox, bus.clone(), || Timestamp("t".into()));
+        relay.drain_to_empty();
+        for env in bus.consume("") {
+            let _ = consumer.handle(&env);
+        }
+        let authz = authorizer(sbc);
+        let candidates = vec!["alpha".to_string(), "beta".to_string()];
+        assert_eq!(
+            authz.visible_repos(&creator, "acme", "eu-west", &candidates),
+            vec!["alpha".to_string()],
+            "the fed-index Ids path admits the granted repo and still hides `beta`"
+        );
     }
 
     /// The one-grammar helpers stay in lock-step (kills a drifted-format mutant): the ref form wraps
