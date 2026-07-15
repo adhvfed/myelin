@@ -119,6 +119,12 @@ memory = ["test-support"]
 # The sanctioned Cargo idiom (same as the myelin-identity-service Wave-2 self dev-dependency); it does
 # NOT affect the normal `cargo build`, which stays durable-by-default.
 myelin-storage = { path = ".", features = ["test-support"] }
+# MR-009b W6c-events — the events `test-support` doubles as a DEV-dependency (the in-memory
+# `BusErasureLedger::new()` used by the DB-free `tests/drills_bus_d8_backups.rs` in-process drill,
+# now that the ledger is durable-by-default and its in-memory arm is `test-support`-gated). DEV-only:
+# `cargo build`/`--workspace` do not pull it, so production stays durable-by-default and
+# `cargo tree -e no-dev` shows NO test-support edge (the same idiom as the self dev-dep above).
+myelin-events = { path = "../myelin-events", features = ["test-support"] }
 myelin-harness = { path = "../myelin-harness" }
 # myelin-lints is TEST-SUPPORT only: the P-ST-08 encryption GATE drill
 # (tests/encryption_gate_drill.rs) exercises the `no-untagged-personal-data` lint over an inline

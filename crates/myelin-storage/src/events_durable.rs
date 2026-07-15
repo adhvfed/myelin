@@ -42,7 +42,12 @@
 
 use sqlx::postgres::PgPool;
 
-use myelin_events::{ConsumerName, DurableDedup, EventId};
+use myelin_events::{
+    ConsumerName, DurableBusErasure, DurableDedup, ErasedSubject, EventId, PiiKeyRef, Region,
+    TenantId, Timestamp,
+};
+
+use crate::migration::{Migration, Migrations};
 
 /// The REAL durable `consumer_dedup` backing over the OLTP `PgPool`. Cloneable (the pool is an
 /// `Arc`-backed handle). Constructed by the events `serve()` composition root over the SAME pool
@@ -132,6 +137,182 @@ impl DurableDedup for DurableDedupBacking {
                 Ok(res) => res.rows_affected() > 0,
                 Err(_) => false,
             }
+        })
+    }
+}
+
+// =================================================================================================
+// Durable PG backing for the Bus's PII-free erasure ledger (contract 10.8, MR-009b W6c-events)
+//
+// `myelin-events` is a §2.9 DAG SINK (it cannot name a `PgPool`), so — exactly like the
+// `consumer_dedup` seam above — the [`myelin_events::DurableBusErasure`] trait is defined IN events
+// and this module ships the REAL PG impl + the `bus_erasure_ledger` table. Wired at the
+// `EventsRuntime` composition root ([`crate::events_serve`]) via `BusErasureLedger::durable`.
+// =================================================================================================
+
+/// The `bus_erasure_ledger` table (contract 10.8, W6c-events) — `(tenant, region, subject)`-keyed.
+/// Holds ONLY the OPAQUE subject discriminator + the opaque `pii_key_ref` NAMES (never key material,
+/// never a payload) + the audit `erased_at` — PII-free by construction. **NON-shred-erasable + NO RLS
+/// by construction** (mirrors the W6a `identity_pseudonym_erasure_ledger` / W6b
+/// `post_pit_erasure_ledger`): it MUST survive the crypto-shred it records AND a restore, so
+/// `BusHolder::re_erase_after_restore` can replay it against a resurrected pre-erase backup — a
+/// crypto-shred/RLS lever on THIS table would defeat that. Partition isolation is the explicit
+/// `(tenant, region)` predicate on every statement (a NAMED tenant-predicate exclusion, like
+/// `DurableDedupBacking` / `pgrelay` / `reerase_durable`). Forward-only (`IF NOT EXISTS`); the
+/// idempotent `key_refs` merge is an `ON CONFLICT … DO UPDATE` array-merge (union + dedup + sort).
+pub const BUS_ERASURE_LEDGER_MIGRATION: &str = "\
+CREATE TABLE IF NOT EXISTS bus_erasure_ledger (
+    tenant    text   NOT NULL,
+    region    text   NOT NULL,
+    subject   text   NOT NULL,
+    key_refs  text[] NOT NULL DEFAULT '{}',
+    erased_at text   NOT NULL,
+    PRIMARY KEY (tenant, region, subject)
+);";
+
+/// The forward-only migration set the durable Bus erasure ledger binds to (id `0053`, next in the free
+/// `0053+` range after the W6b `0052_post_pit_erasure_ledger`). Applied via the MR-022
+/// [`crate::provider::SubstrateProvider::migrate`] at boot; idempotent on re-boot (`CREATE TABLE IF
+/// NOT EXISTS`).
+pub fn bus_erasure_durable_migrations() -> Migrations {
+    Migrations::of([Migration::plain(
+        "0053_bus_erasure_ledger",
+        BUS_ERASURE_LEDGER_MIGRATION,
+    )])
+}
+
+/// The REAL durable `bus_erasure_ledger` backing over the OLTP `PgPool` (MR-009b W6c-events). Cloneable
+/// (the pool is an `Arc`-backed handle). Constructed by the events `serve()` composition root over the
+/// SAME pool the relay/stores use, and injected into [`myelin_events::BusErasureLedger::durable`].
+///
+/// **NON-shred-erasable + NO RLS** (see [`BUS_ERASURE_LEDGER_MIGRATION`]): every statement carries the
+/// explicit `(tenant, region)` predicate — a NAMED tenant-predicate exclusion, exactly like the sibling
+/// [`DurableDedupBacking`]. The sync [`DurableBusErasure`] seam bridges onto the tokio runtime handle
+/// (`block_in_place` + `block_on`, the same bridge [`DurableDedupBacking`] uses).
+#[derive(Clone)]
+pub struct DurableBusErasureBacking {
+    pool: PgPool,
+    rt: tokio::runtime::Handle,
+}
+
+impl DurableBusErasureBacking {
+    /// Wrap a pool as the durable Bus erasure-ledger backing. `rt` is the runtime handle the sync trait
+    /// methods drive the async sqlx client on. The caller must have applied
+    /// [`BUS_ERASURE_LEDGER_MIGRATION`] (via [`bus_erasure_durable_migrations`]).
+    pub fn new(pool: PgPool, rt: tokio::runtime::Handle) -> DurableBusErasureBacking {
+        DurableBusErasureBacking { pool, rt }
+    }
+
+    fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
+        tokio::task::block_in_place(|| self.rt.block_on(fut))
+    }
+}
+
+impl DurableBusErasure for DurableBusErasureBacking {
+    fn record(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        subject: &str,
+        key_refs: &[PiiKeyRef],
+        erased_at: &Timestamp,
+    ) -> Result<(), String> {
+        // The idempotent merge (10.8) as ONE honest upsert: on conflict the stored `key_refs` are
+        // UNIONed with the incoming refs, then de-duplicated + sorted (`DISTINCT … ORDER BY` — matching
+        // the in-memory ledger's distinct, `PiiKeyRef.0`-sorted refs), and the FIRST `erased_at` is
+        // KEPT (`erased_at` is NOT in the DO UPDATE SET) — a later erase that locates more keys merges
+        // them without moving the recorded time. Deterministic array order so the replay artifact is
+        // reproducible.
+        //
+        // The incoming refs are normalized (sorted + deduped) in RUST before binding (W6c verifier
+        // finding, probe-proven): the no-conflict INSERT arm stores the bound array VERBATIM — only
+        // the DO UPDATE arm runs the DISTINCT/ORDER BY — so an unnormalized first insert would
+        // diverge from the memory arm (which normalizes on every record) and a duplicated ref would
+        // double-count `keys_resurrected_by_restore` in the re-erasure receipt. Rust-side sort uses
+        // byte order, matching the memory arm exactly (immune to DB collation, unlike ORDER BY).
+        let mut refs: Vec<String> = key_refs.iter().map(|k| k.0.clone()).collect();
+        refs.sort();
+        refs.dedup();
+        self.block(async {
+            sqlx::query(
+                "INSERT INTO bus_erasure_ledger (tenant, region, subject, key_refs, erased_at) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (tenant, region, subject) DO UPDATE SET \
+                   key_refs = ( \
+                     SELECT array( \
+                       SELECT DISTINCT r \
+                       FROM unnest(bus_erasure_ledger.key_refs || EXCLUDED.key_refs) AS r \
+                       ORDER BY r) \
+                   )",
+            )
+            .bind(&tenant.0)
+            .bind(&region.0)
+            .bind(subject)
+            .bind(&refs)
+            .bind(&erased_at.0)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            // Fail-direction: return Err so the ledger's infallible `record` panics fail-static (an
+            // unrecorded erasure is a silent resurrection path across a restore — never swallowed).
+            .map_err(|e| e.to_string())
+        })
+    }
+
+    fn is_erased(&self, tenant: &TenantId, region: &Region, subject: &str) -> bool {
+        self.block(async {
+            // `EXISTS(..)` decodes as bool. FAIL-STATIC on a store fault: a read failure must NOT be
+            // swallowed to a false "not erased" — that would let a resurrected subject read as
+            // never-erased (a silent resurrection path).
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM bus_erasure_ledger \
+                 WHERE tenant = $1 AND region = $2 AND subject = $3)",
+            )
+            .bind(&tenant.0)
+            .bind(&region.0)
+            .bind(subject)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "BUS ERASURE-LEDGER DURABILITY FAILURE (fail-static): is_erased read failed for \
+                     subject={subject} tenant={} — an incomplete read is a silent resurrection path \
+                     (EB-16/BUS-D8): {e}",
+                    tenant.0
+                )
+            });
+            exists
+        })
+    }
+
+    fn entries(&self, tenant: &TenantId, region: &Region) -> Vec<ErasedSubject> {
+        self.block(async {
+            // The `(tenant, region)`-scoped, subject-sorted replay set. FAIL-STATIC on a store fault:
+            // an incomplete replay set would let a resurrected subject escape the post-restore
+            // re-erasure pass (BUS-D8 would report green while a real identity resolves).
+            let rows: Vec<(String, Vec<String>, String)> = sqlx::query_as(
+                "SELECT subject, key_refs, erased_at FROM bus_erasure_ledger \
+                 WHERE tenant = $1 AND region = $2 ORDER BY subject",
+            )
+            .bind(&tenant.0)
+            .bind(&region.0)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "BUS ERASURE-LEDGER DURABILITY FAILURE (fail-static): entries read failed for \
+                     tenant={} — an incomplete replay set would let a resurrected subject escape the \
+                     post-restore re-erasure pass (EB-16/BUS-D8): {e}",
+                    tenant.0
+                )
+            });
+            rows.into_iter()
+                .map(|(subject, key_refs, erased_at)| ErasedSubject {
+                    subject,
+                    key_refs: key_refs.into_iter().map(PiiKeyRef).collect(),
+                    erased_at: Timestamp(erased_at),
+                })
+                .collect()
         })
     }
 }

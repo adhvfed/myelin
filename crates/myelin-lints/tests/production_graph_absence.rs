@@ -101,7 +101,23 @@
 //!   chat `into_consumer`, `knowledge_app_spec_with_consumers`, `notif_app_spec_with_router` — now
 //!   INJECT the ledger). NOTE — the SIBLING `outbox.rs:231` `OutboxStore` (SI-007) is NOT flipped in
 //!   Wave 3: see the residual note in the module docs below (the outbox re-point is a separate wave).
-//! - `myelin-events/src/reerase.rs:102`                   — `BusErasureLedger` in-mem (SI-039; GDPR/events durable MR)
+//! - **MR-009b W6c-events FLIPPED the `BusErasureLedger` (SI-039) GREEN (7→6):** `reerase.rs`
+//!   `BusErasureLedger` is now durable-by-default via the **DedupLedger trait-seam pattern**
+//!   (`myelin-events` is a §2.9 DAG SINK — it cannot name a `PgPool`). The `DurableBusErasure` trait
+//!   is defined IN events; the `Memory(Arc<Mutex<BTreeMap<String, ErasedSubject>>>)` arm + the
+//!   in-memory `::new()` are `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLES; the durable
+//!   `Durable(Arc<dyn DurableBusErasure>)` arm is the always-compiled PRODUCTION default the events
+//!   `serve()` composition root wires (`myelin_storage::events_serve::EventsRuntime::bus_erasure_ledger`
+//!   → `BusErasureLedger::durable`, backing `events_durable::DurableBusErasureBacking` over the
+//!   NON-shred-erasable, NO-RLS `bus_erasure_ledger` table, migration 0053 — it survives the
+//!   crypto-shred it records + a restore so `BusHolder::re_erase_after_restore` (BUS-D8) can replay it).
+//!   The scanner strips the `test-support`-gated `Memory` variant, so the production backend enum
+//!   presents non-in-memory → the `reerase.rs:102` entry is REMOVED (in-memory count 7→6; total 8→7).
+//!   Durable-by-default proven live on PG (`integration_mr009b_w6c_events_erasure`: records survive a
+//!   fresh pool; idempotent `key_refs` merge; partition isolation; `re_erase_after_restore` drives off
+//!   the durable ledger); DB-free unit tests use the double via the `myelin-events/test-support`
+//!   dev-dependency (the events crate's own `reerase`/`cdc_10_8`/`drills_bus_d8` tests + storage's
+//!   `drills_bus_d8_backups`).
 //! - `myelin-control-plane/src/registry.rs:111`          — `Registry` placement in-mem (SI-011; cp durable MR)
 //! - `myelin-control-plane/src/cross_cell_bridge.rs:244` — `CellResolverRegistry` in-mem (SI-052; cp/multi-cell MR)
 //! - `myelin-control-plane/src/placement_of.rs:223`      — `MisrouteAudit` `Arc<Mutex<Vec<…>>>` audit sink (SI-028; cp durable MR)
@@ -389,7 +405,15 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-ci-controlplane/src/residency_drill.rs",
         444,
     ),
-    // ---- no-in-memory-durable-store (5 here + 2 closed-false-negatives below = 7) ----
+    // ---- no-in-memory-durable-store (4 here + 2 closed-false-negatives below = 6) ----
+    //      MR-009b W6c-events FLIPPED the events `BusErasureLedger` (SI-039) durable-by-default (7→6):
+    //      `reerase.rs:102` is REMOVED from the "here" group. `myelin-events` is a §2.9 DAG SINK, so
+    //      it uses the DedupLedger trait-seam pattern — the `DurableBusErasure` trait is defined IN
+    //      events, the PG impl (`events_durable::DurableBusErasureBacking`) + the NON-shred-erasable,
+    //      NO-RLS `bus_erasure_ledger` table (migration 0053) live in storage, wired at
+    //      `events_serve::EventsRuntime::bus_erasure_ledger`. The in-memory `Memory` arm + `::new()`
+    //      are now `test-support`-gated test doubles; the always-compiled `Durable(Arc<dyn ...>)` arm
+    //      is production. Proven live (`integration_mr009b_w6c_events_erasure`).
     //      MR-009b Wave 6b FLIPPED the 2 in-crate storage ERASURE ledgers durable-by-default (9→7):
     //      `restore_verify.rs:175` `ErasureLedger` (SI-036) — removed from the "here" group — and
     //      `reerase.rs:156` `InMemoryPostPitLedger` (P-ST-14) — removed from the closed-false-negatives
@@ -446,11 +470,16 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-events/src/outbox.rs",
         231,
     ),
-    (
-        "no-in-memory-durable-store",
-        "crates/myelin-events/src/reerase.rs",
-        102,
-    ),
+    // `myelin-events/src/reerase.rs:102` `BusErasureLedger` (SI-039) — REMOVED by MR-009b W6c-events
+    // (the DedupLedger trait-seam pattern: `myelin-events` is a §2.9 DAG SINK, so it cannot name a
+    // `PgPool`). The `Memory(Arc<Mutex<BTreeMap<String, ErasedSubject>>>)` arm + the in-memory
+    // `::new()` constructor are now `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLES; the
+    // always-compiled PRODUCTION backend is the pool-backed `Durable(Arc<dyn DurableBusErasure>)` arm
+    // the events `serve()` root wires (`events_serve::EventsRuntime::bus_erasure_ledger` →
+    // `BusErasureLedger::durable`, backing `events_durable::DurableBusErasureBacking` over the
+    // NON-shred-erasable, NO-RLS `bus_erasure_ledger` table, migration 0053 — it survives the
+    // crypto-shred it records + a restore so BUS-D8 re-erasure can replay it). The production enum
+    // presents non-in-memory → the scanner no longer fires. See the flipped-GREEN note above.
     // MR-009b Wave 2 (SI-018/019/020) FLIPPED the S1 principal + S3 tuple + S7 revocation stores
     // GREEN: their in-memory `Memory(Arc<Mutex<Inner>>)` backend variant + `Inner` + the in-memory
     // `::new()` constructors are now `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLES, and
@@ -627,14 +656,16 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
     // un-wired gate). The counts pin the manifest shape.
     assert_eq!(
         BASELINE.len(),
-        8,
-        "the committed baseline has 8 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
+        7,
+        "the committed baseline has 7 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
          GREEN: 17 → 14; Wave 3 flipped the events `DedupLedger` (SI-023) → 14 → 13; Wave 5 flipped \
          the `KmsEngine` (SI-006) → 13 → 12; Wave 6a flipped the 2 identity S2 pseudonym holders → \
          12 → 10; Wave 6b flipped the 2 in-crate storage ERASURE ledgers — `restore_verify.rs:175` \
          `ErasureLedger` + `reerase.rs:156` `InMemoryPostPitLedger` — durable-by-default → 10 → 8 \
          (the sibling `reserve_settle.rs:283` `CostLedger` is SUPPLEMENTED not removed: its durable \
-         backing exists but the flip awaits the flow/ci budget-gate durable redesign))"
+         backing exists but the flip awaits the flow/ci budget-gate durable redesign); W6c-events \
+         flipped the events `BusErasureLedger` (SI-039) durable-by-default via the DedupLedger \
+         trait-seam pattern → 8 → 7)"
     );
     let structural = BASELINE
         .iter()
@@ -657,17 +688,21 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          to the CI track."
     );
     assert_eq!(
-        in_memory, 7,
-        "7 in-memory durable-store sites: Waves 2/3/5/6a flipped the identity spine + events \
-         DedupLedger + KmsEngine + the 2 S2 pseudonym holders durable-by-default (16→9), and \
+        in_memory, 6,
+        "6 in-memory durable-store sites: Waves 2/3/5/6a flipped the identity spine + events \
+         DedupLedger + KmsEngine + the 2 S2 pseudonym holders durable-by-default (16→9); \
          MR-009b Wave 6b FLIPPED the 2 in-crate storage ERASURE ledgers durable-by-default (9→7): \
          `restore_verify.rs:175` `ErasureLedger` (now a backend enum over the non-shred-erasable \
          `restore_erasure_ledger` table, migration 0051, carrying the R1 §7.6 completion-offset \
          fold-in) + `reerase.rs:156` `InMemoryPostPitLedger` (now the `test-support`-gated double \
-         behind `DurablePostPitLedger` over `post_pit_erasure_ledger`, 0052). The remaining 7 \
-         (events OUTBOX (SI-007) + reerase; control-plane registry/bridge/misroute; storage \
-         `reserve_settle.rs:283` `CostLedger` (SUPPLEMENTED — durable backing exists, flip awaits \
-         the flow/ci budget-gate durable redesign) + `blob.rs:362`) flip in the later waves."
+         behind `DurablePostPitLedger` over `post_pit_erasure_ledger`, 0052); and W6c-events FLIPPED \
+         the events `BusErasureLedger` (SI-039) durable-by-default (7→6) via the DedupLedger \
+         trait-seam pattern (`DurableBusErasure` trait in events; `DurableBusErasureBacking` over the \
+         non-shred-erasable, NO-RLS `bus_erasure_ledger` table, migration 0053, in storage; wired at \
+         `events_serve::EventsRuntime`). The remaining 6 (events OUTBOX (SI-007); control-plane \
+         registry/bridge/misroute; storage `reserve_settle.rs:283` `CostLedger` (SUPPLEMENTED — \
+         durable backing exists, flip awaits the flow/ci budget-gate durable redesign) + \
+         `blob.rs:362`) flip in the later waves."
     );
     assert_eq!(
         bare_pool, 0,
