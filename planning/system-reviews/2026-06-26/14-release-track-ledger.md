@@ -211,7 +211,7 @@ stack; kill-9 drills green.
 | R2.4-fu | Wire GovernedRouter + durable HitlVerdictStore into MCP prod main (currently GOVERNANCE_NOT_WIRED) | PENDING (tracked; MCP-serve composition root) | — |
 | R2.1 | Object-level authz at the edge, platform-wide (extends R0.3 seam; git_edge template first) | **DONE** | `083831d` (merge; `fc06f54`) |
 | R2.5 | Real OIDC login at edge; dev-login structurally dead in prod | **DONE** | `fb7fd1e` (merge; `a9e4e57`) |
-| R2.6 | AllowAll removed from main.rs + lint | IN BUILD | — |
+| R2.6 | AllowAll removed from main.rs + lint | **DONE** | `3b1fda0` (merge; `e149dee`) + `75223a0` (followup: object-seam default fail-closed → scanner TRUE ZERO) |
 | R2.7 | Search vector-path ACL parity | **DONE** | `f31e310` (merge; `6c56c42`) |
 
 R2 exit: red-team campaign (subagent per subsystem: edge/wire/MCP/SSE/search reach-around) all-denied; AllowAll gone.
@@ -293,11 +293,26 @@ Grounding surveys done for all of R2.1a, R2.2, R2.3, R2.4, R2.7 before dispatch.
   regression): report_checks is Push-gated → a writer can forge CI greens that feed the wire protected-ref
   push gate → bypass branch protection. Fix = a CI-producer relation. Prime R2-exit red-team target.**
 
-**R2 REMAINING:** R2.6 (remove action-level AllowAll + scanner — IN BUILD). Then the **R2 exit red-team
-campaign** (per-subsystem reach-around all-denied + AllowAll gone) — the acceptance gate, which will
-independently confirm task #13 (report_checks) and any other reach-around; fix all confirmed findings, then
-R2 exits. Deferred/tracked: R2.4-fu (#12, MCP GovernedRouter prod wiring — product-surface); #13
-report_checks CI-producer relation.
+- **R2.6 DONE (`3b1fda0` + followup `75223a0`)** — the action-level `AllowAll` is GONE from prod:
+  `main.rs` wires `AuthenticatedActionPolicy` (deny-by-default over a 20-verb `MOUNTED_EDGE_ACTIONS`
+  allowlist; denies unknown actions + empty principals; anti-drift test iterates `http_catalogue()`).
+  `AllowAll` gated `#[cfg(test/test-support)]` (zero test-file edits — features already set). New
+  `no-permissive-authorizer-in-prod` scanner (construction-shaped, edge-scoped, red-drill-confirmed).
+  **Followup fail-closed the object-seam:** `DurableGitBackend::rooted` now defaults `DenyAllRepos`
+  (was `AllowAllRepos`, always overridden by main.rs); the sole `AllowAllRepos` construction moved into
+  the test-support `rooted_inmem_for_test` → the scanner is a **TRUE ZERO** (baseline 2→1, only the CI
+  runner-attestation structural floor remains). Self-reviewed; workspace + lints ratchet green.
+
+**ALL 10 R2 ITEMS MERGED** (R2.1, R2.1a, R2.1a-fu, R2.2, R2.3+b, R2.4+b, R2.5, R2.6+fu, R2.7, W7.2) — each
+builder → orchestrator gate → independent adversarial verifier (Fable) → merge, every verifier
+CONFIRMED-SOUND.
+
+**R2 EXIT — red-team campaign IN PROGRESS.** 5 adversaries (edge JSON API, git wire, MCP, SSE, search) each
+hunting an intra-tenant object reach-around; the edge+wire adversaries tasked to prove/refute #13
+(report_checks CI-forgery → protected-branch bypass) end-to-end. On return: fix all confirmed reach-arounds,
+re-verify, then R2 exits (all-denied + AllowAll gone — already true). **Tracked/deferred:** R2.4-fu (#12,
+MCP GovernedRouter prod wiring — product-surface, MCP execution not live); #13 report_checks CI-producer
+relation (likely fixed as part of the exit).
 
 **Sequencing decisions:** R2.2 (object-qualification of `check`/EventMatcher/SSE) must land AFTER R2.1a —
 it changes tuple-store object keying while R2.1a writes the first production grant tuples; git's
