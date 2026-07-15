@@ -209,7 +209,7 @@ stack; kill-9 drills green.
 | R2.3 | Fail-static authz cache full-key comparison | **DONE** | `2154e38` (merge; `d3ebd3b`+`ff334e8`) |
 | R2.4 | MCP HITL server-side verdict; batch partial-approval by approval-id | **DONE** | `d248644` (merge; `d6b9d1e`+`5f60037`) |
 | R2.4-fu | Wire GovernedRouter + durable HitlVerdictStore into MCP prod main (currently GOVERNANCE_NOT_WIRED) | PENDING (tracked; MCP-serve composition root) | — |
-| R2.1 | Object-level authz at the edge, platform-wide (extends R0.3 seam; git_edge template first) | IN VERIFY | `fc06f54` (worktree, pre-merge) |
+| R2.1 | Object-level authz at the edge, platform-wide (extends R0.3 seam; git_edge template first) | **DONE** | `083831d` (merge; `fc06f54`) |
 | R2.5 | Real OIDC login at edge; dev-login structurally dead in prod | **DONE** | `fb7fd1e` (merge; `a9e4e57`) |
 | R2.6 | AllowAll removed from main.rs + lint | IN BUILD | — |
 | R2.7 | Search vector-path ACL parity | **DONE** | `f31e310` (merge; `6c56c42`) |
@@ -278,10 +278,26 @@ Grounding surveys done for all of R2.1a, R2.2, R2.3, R2.4, R2.7 before dispatch.
   `GOVERNANCE_NOT_WIRED`), so MCP tool EXECUTION is not live (fail-closed, not a vuln); whoever wires the
   composition root MUST inject `HitlVerdictStore::with_pg`. Release must not claim MCP execution live.
 
-**R2 REMAINING:** R2.1 (platform-wide object authz — now unblocked by R2.2's `object_key`), R2.5 (OIDC login
-at edge), R2.6 (remove the action-level AllowAll + scanner lint) — all three touch the edge composition root,
-so grounded together and executed as a coordinated edge-main.rs wave to avoid thrashing. Then R2.4-fu +
-the R2 exit red-team campaign.
+- **R2.5 DONE (`fb7fd1e`)** — real OidcVerifier (already tested in oidc.rs) routed via `production_with_oidc`;
+  `MyelinConfig` gains `Option<OidcSettings>` (issuer/audience + static JWKS, no jwks_uri fetch — tracked);
+  opt-in (absent→refuse-not-mock/boot-ok, partial→fail-loud); NO fail-open. Part B: frontend `loginDev`
+  build-time dead in prod (verified the dev token is ABSENT from the `.output` deployable). Self-reviewed
+  (fail-open surface clean; crypto pre-audited). Residual: jwks_uri fetch/rotation; SAML/SCIM/passkey/SSH
+  stay refuse-not-mock.
+- **R2.1 DONE (`083831d`)** — verifier CONFIRMED-SOUND. Closed the LIVE JSON-API object-authz bypass: the
+  `repo_authz` field git_durable.rs carried was never called, so a git action-grant reached ANY repo's
+  PR/blob/branch-protection. `RepoAuthorizer` extended to `RepoPermission {Pull,Push,ProtectedPush,
+  ApproveUntrustedCi}`; `RepoObjectGuard` wraps all 16 object routes with the correct rung (merge/branch-
+  protection = ProtectedPush/admin — a push grant is denied); `DRepoList` = leak-free `list_objects`
+  prefilter. git_edge.rs confirmed dead. **Verifier surfaced a pre-existing residual (task #13, NOT an R2.1
+  regression): report_checks is Push-gated → a writer can forge CI greens that feed the wire protected-ref
+  push gate → bypass branch protection. Fix = a CI-producer relation. Prime R2-exit red-team target.**
+
+**R2 REMAINING:** R2.6 (remove action-level AllowAll + scanner — IN BUILD). Then the **R2 exit red-team
+campaign** (per-subsystem reach-around all-denied + AllowAll gone) — the acceptance gate, which will
+independently confirm task #13 (report_checks) and any other reach-around; fix all confirmed findings, then
+R2 exits. Deferred/tracked: R2.4-fu (#12, MCP GovernedRouter prod wiring — product-surface); #13
+report_checks CI-producer relation.
 
 **Sequencing decisions:** R2.2 (object-qualification of `check`/EventMatcher/SSE) must land AFTER R2.1a —
 it changes tuple-store object keying while R2.1a writes the first production grant tuples; git's
