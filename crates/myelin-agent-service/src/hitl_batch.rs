@@ -63,19 +63,21 @@
 //! reverse edge `flow → agent` already exists); the parity is asserted in the consumer CDC
 //! (`tests/cdc_9_1_per_effect.rs`) against the real `myelin-flow` key rule, not by importing it.
 //!
-//! ## Design note (documented deviation, EI-01 §1) — the per-effect ledger is the apply authority
+//! ## Design note (R2.4 — the step-6 gate is now per-effect, STRUCTURAL not advisory)
 //!
-//! The single-effect loop (AG-P9) threads an approved gate's TOOL NAME into the run's `approved` set
-//! ([`crate::hitl::ApprovedTools`]), which `EffectApi::apply`'s step 6 reads. That is correct for a
-//! single-effect card, but it is **too coarse for a batch** where sibling effects share a tool (three
-//! `git.merge` effects on three PRs): approving effect 0 admits `git.merge`, which would let effect 1
-//! through step 6 even though effect 1 was DECLINED. The **per-effect [`ApplyLedger`]** is therefore
-//! the exactly-once AUTHORITY at batch granularity — it records each approved effect's per-effect
-//! `idem_key`, and the re-run applies **exactly the effects the ledger approved** (a declined effect's
-//! key is never recorded → it is never re-submitted → 0 mutation, AG-8). The tool-name `approved` set
-//! remains the step-6 gate; the per-effect ledger is the finer per-effect binding the batch needs. The
-//! two compose: a declined effect is never re-run, so the coarse tool-name gate is never consulted for
-//! it.
+//! Pre-R2.4, the loop threaded an approved gate's bare TOOL NAME into the run's `approved` set,
+//! which `EffectApi::apply`'s step 6 read — **too coarse for a batch** where sibling effects share a
+//! tool (three `git.merge` effects on three PRs): approving effect 0 admitted `git.merge` run-wide,
+//! so a DECLINED effect 1, if re-driven through `apply_planned`, fell through step 6 and applied
+//! (the 2026-07-06 HIGH finding). The per-effect [`ApplyLedger`] was only ADVISORY (populated here,
+//! never consulted by the enforcement gate). **R2.4 closed this structurally**: the `approved` set
+//! now carries PER-EFFECT gate keys ([`crate::effect_api::effect_gate_key`], `gate:{tool}:{object}`
+//! — the SAME key step 6 mints its `GateId` from), so the step-6 ENFORCEMENT gate itself is
+//! per-effect — a declined sibling's key is never admitted, and an adversarial re-drive of it gates
+//! again (0 mutation, AG-8; the negative leg in `tests/cdc_8_2_hitl_batch.rs` proves it). The
+//! [`ApplyLedger`] keeps its exactly-once role (the apply-counter == the approved-effect count; a
+//! double-click adds 0 applies) — it and the approved set are now keyed at the SAME per-effect
+//! granularity.
 //!
 //! ## FLOORS named
 //! - **None.** The per-effect idempotency completes the M2-B HITL machinery (the AG-D5 exactly-once
@@ -262,8 +264,9 @@ pub trait BatchHitlWait {
 /// INDEPENDENTLY — a partial approval mixes `Approved` and `Halted` across the card's effects.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EffectOutcome {
-    /// the effect was APPROVED — its tool is in `approved`; it applied EXACTLY once (the per-effect
-    /// `idem_key` deduped the apply). Carries the per-effect `idem_key` (the ledger key).
+    /// the effect was APPROVED — its per-(tool, object) gate key is in `approved` (R2.4 — never
+    /// the bare tool name); it applied EXACTLY once (the per-effect `idem_key` deduped the apply).
+    /// Carries the per-effect `idem_key` (the ledger key).
     Applied { idem_key: String, tool: String },
     /// the effect was HALTED (declined or expired) — it was WITHHELD: `EffectApi::apply` was NEVER
     /// reached, 0 mutation (AG-8). Carries the halt settlement (the reason in the trace + audit).
@@ -295,7 +298,8 @@ impl EffectOutcome {
 pub struct BatchOutcome {
     /// the per-effect outcomes, in card order (effect `idx` → outcome).
     pub effects: Vec<EffectOutcome>,
-    /// the run's `approved` set after the batch resume — the approved tools the re-run applies.
+    /// the run's `approved` set after the batch resume — the approved effects' per-(tool, object)
+    /// gate keys the re-run applies (R2.4: a declined sibling's key is never in it).
     pub approved: ApprovedTools,
     /// the exactly-once apply ledger — `applies() == approved-effect count` (the AG-D5 GATE).
     pub ledger: ApplyLedger,
@@ -362,9 +366,11 @@ pub fn run_batch_hitl_loop<W: BatchHitlWait>(
         let outcome = match decision {
             WaitDecision::Approve => {
                 gate.approve().expect("a freshly-opened gate is Waiting");
-                approved.admit(&gate); // thread the tool into `approved` (idempotent).
-                                       // record the apply under the per-effect key — EXACTLY ONCE (a double-click re-sends
-                                       // the same key → `record` returns false → no second apply; AG-D5 exactly-once).
+                // thread THIS effect's per-(tool, object) gate key into `approved` (idempotent;
+                // R2.4 — never the bare tool name, so a declined sibling is never admitted).
+                approved.admit(&gate);
+                // record the apply under the per-effect key — EXACTLY ONCE (a double-click re-sends
+                // the same key → `record` returns false → no second apply; AG-D5 exactly-once).
                 ledger.record(&idem_key);
                 EffectOutcome::Applied {
                     idem_key,

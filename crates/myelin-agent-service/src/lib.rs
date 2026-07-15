@@ -198,9 +198,10 @@ pub use mock::{
 // consumer seams (4.2 check / 4.5 delegation / tenant / 11.7 budget / subsystem public-endpoint
 // apply) + the AG-D2 denial signals (0 privileged fallback by construction).
 pub use effect_api::{
-    decode_proposed, encode_proposed, validate_schema, ApplyError, CapabilityCheck,
-    DelegationLookup, EffectApiBridge, EffectBudget, EffectCost, PipelineSignals, PipelineStep,
-    PlanThenApply, PlanVerdict, PlannedEffect, SubsystemApply, TenantGuard,
+    decode_proposed, effect_gate_key, effect_gate_key_str, encode_proposed, validate_schema,
+    ApplyError, CapabilityCheck, DelegationLookup, EffectApiBridge, EffectBudget, EffectCost,
+    PipelineSignals, PipelineStep, PlanThenApply, PlanVerdict, PlannedEffect, SubsystemApply,
+    TenantGuard,
 };
 
 // ToolHands::exec on the unified sandbox (AG-P15 → P-226, M2-C, contract 8.4 — the Fabric half): the
@@ -401,9 +402,9 @@ pub use dry_run::{
 // guarantee is structural (the loop opens the gate but never applies). Floors: per-effect resume
 // idempotency AG-P10 (→ P-222); humanise card text AG-P11 (→ P-223); auto-dispatch L-3 AG-P20.
 pub use hitl::{
-    derive_approver_set, gate_id_of, live_cost_estimate, run_hitl_loop, surface_card,
-    ApprovedTools, ApproverSet, Halted, HitlCard, HitlGate, HitlGateState, HitlOutcome, HitlWait,
-    InvalidTransition, RiskSummary, WaitDecision,
+    derive_approver_set, gate_id_of, live_cost_estimate, persist_gate_decision, persist_gate_open,
+    run_hitl_loop, surface_card, ApprovedTools, ApproverSet, Halted, HitlCard, HitlGate,
+    HitlGateState, HitlOutcome, HitlWait, InvalidTransition, RiskSummary, WaitDecision,
 };
 
 // The AG-P11 (→ P-223) card-text path (C9/OQ-L): the HITL card text + every agent-authored message

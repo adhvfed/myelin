@@ -386,10 +386,10 @@ fn chained_withhold_then_reject_halts_with_reason_zero_mutation() {
         HitlOutcome::Halted(Halted::Rejected("merge not safe — failing checks".into())),
         "rejection settles Halted::Rejected with the reason"
     );
-    // the tool was NEVER threaded into `approved` → a re-run GATES again (never applies).
+    // the effect was NEVER threaded into `approved` → a re-run GATES again (never applies).
     assert!(
-        !approved.contains("git.merge"),
-        "a rejected gate never approves the tool (AG-8)"
+        !approved.contains_effect("git.merge", "myelin://acme/git/pr/42"),
+        "a rejected gate never approves the effect (AG-8)"
     );
     let (result2, muts) = apply_once(&cat, &endpoint, approved.as_set());
     assert!(
@@ -437,9 +437,9 @@ fn cdc_9_4_consumer_drives_all_three_wait_decisions() {
             "every decision parked on the durable wait first"
         );
         assert_eq!(
-            approved.contains("git.merge"),
+            approved.contains_effect("git.merge", "myelin://acme/git/pr/42"),
             expect_approved,
-            "only Approve threads the tool"
+            "only Approve threads the effect's per-(tool, object) key (R2.4)"
         );
         match (expect_halt, outcome) {
             (None, HitlOutcome::Approved(_)) => {}

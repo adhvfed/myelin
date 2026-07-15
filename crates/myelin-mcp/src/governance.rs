@@ -10,7 +10,12 @@
 //! 2. **consults durable revocation** ([`RunTokenMinter::is_live`]) before acting — a revoked /
 //!    expired run token is **Denied**, never routed (MR-011 durable revocation);
 //! 3. **HITL-gates** a `requires_approval` tool (the FROZEN flag from git's `agent_tools()`) BEFORE
-//!    apply — a gated tool with no approval is **withheld** and **does NOT mutate** (the AG-8 leg);
+//!    apply — a gated tool with no approval is **withheld** and **does NOT mutate** (the AG-8 leg).
+//!    **R2.4:** the approval is a SERVER-SIDE VERDICT — the withhold opens a `waiting` row in the
+//!    durable verdict store (`agent_hitl_gate`, migration 0054) under an OPAQUE server-issued gate
+//!    id; the re-drive PRESENTS that id and the gate clears ONLY if the store says it is Approved
+//!    for that exact effect by a DISTINCT human principal. The caller-supplied `approval.granted`
+//!    boolean of the 2026-07-06 finding is dead — it is not even parsed;
 //! 4. **routes the effect through `EffectApi::apply`** (the platform-owned PLAN-THEN-APPLY chokepoint,
 //!    §8.2) under a [`RunCtx`] that carries the run-token `jti` + the principal — NOT a direct
 //!    mutation. `EffectApi` is **brain-agnostic** (identical for the mock runtime, a future hosted
@@ -38,6 +43,7 @@ use myelin_identity::{
 use myelin_identity_service::delegation::DelegationInput;
 use myelin_identity_service::machine_auth::MachineKind;
 use myelin_identity_service::mint::RunTokenMinter;
+use myelin_storage::hitl_gate_durable::{GateDecideError, GateRecord, GateState, HitlVerdictStore};
 use myelin_storage::TenantScope;
 
 use crate::registry::RegisteredTool;
@@ -123,18 +129,40 @@ pub struct GovernedRouter {
     principal: RunPrincipal,
     effect_api: Box<dyn EffectApi>,
     state: RefCell<RunState>,
+    /// **The server-side HITL verdict authority (R2.4).** A gated call INSERTs a `waiting` row here
+    /// under an OPAQUE server-issued gate id; a re-drive is admitted ONLY if the presented gate id
+    /// is `approved` in THIS store for THIS effect by a DISTINCT principal. The caller's
+    /// `approval.granted` boolean is never an enforcement input. Durable in production
+    /// ([`HitlVerdictStore::with_pg`] over `agent_hitl_gate`, migration 0054); the in-memory arm is
+    /// the test double.
+    verdicts: RefCell<HitlVerdictStore>,
+    /// The principals eligible to approve this run's gates (the `approver_filter` — in production
+    /// `list_subjects(object, approve_perm)`, supplied by the composition root). The run's own
+    /// agent principal is structurally EXCLUDED at gate-open time, so a self-approval is
+    /// unrepresentable even if the composition lists it here.
+    approvers: Vec<PrincipalId>,
 }
 
 impl GovernedRouter {
-    /// Build a router over the injected per-run minter, the run identity, and the `EffectApi` body
+    /// Build a router over the injected per-run minter, the run identity, the `EffectApi` body
     /// (the platform-owned governance chokepoint — `myelin_agent_service::PlanThenApply` in
-    /// production, [`SkeletonEffectApi`] for the routing proof).
+    /// production, [`SkeletonEffectApi`] for the routing proof), the server-side HITL verdict
+    /// store (R2.4 — durable in production), and the approver set for this run's gates.
     pub fn new(
         minter: RunTokenMinter,
         principal: RunPrincipal,
         effect_api: Box<dyn EffectApi>,
+        verdicts: HitlVerdictStore,
+        approvers: Vec<PrincipalId>,
     ) -> GovernedRouter {
-        GovernedRouter { minter, principal, effect_api, state: RefCell::new(RunState::default()) }
+        GovernedRouter {
+            minter,
+            principal,
+            effect_api,
+            state: RefCell::new(RunState::default()),
+            verdicts: RefCell::new(verdicts),
+            approvers,
+        }
     }
 
     /// The per-run minter (so a caller/test can revoke the run token + read the revocation telemetry).
@@ -186,15 +214,21 @@ impl GovernedRouter {
     }
 
     /// **Route one governed `tools/call`** (the MR-006 binding, in order, fail-closed):
-    /// mint → revocation consult → HITL gate → `EffectApi::apply` → audit. `approval_granted` is the
-    /// HITL signal (a withheld `requires_approval` tool is re-driven with this true after the human
-    /// approves the card; absent it, a gated tool does NOT mutate).
+    /// mint → revocation consult → HITL gate → `EffectApi::apply` → audit.
+    ///
+    /// **R2.4 — the HITL signal is a server-side verdict, never a caller boolean.** A withheld
+    /// `requires_approval` tool returns an OPAQUE server-issued gate id (a `waiting` row in the
+    /// verdict store); the re-drive PRESENTS that gate id (`presented_gate_id`), and the gate is
+    /// cleared ONLY if the store says that specific gate is `approved` — for THIS exact effect
+    /// (tool + args), by a DISTINCT human principal (approver ≠ the requesting agent). A made-up /
+    /// foreign gate id, a still-waiting gate presented for a different effect, or a self-approved
+    /// gate is refused. The old `approval.granted` boolean is NOT an input to this function at all.
     pub fn call(
         &self,
         tool: &RegisteredTool,
         args: &serde_json::Value,
         now: &Timestamp,
-        approval_granted: bool,
+        presented_gate_id: Option<&str>,
     ) -> CallOutcome {
         // (1) MINT the per-run attenuated token (NOT a bare PAT). A refusal is a loud Denied.
         let token = match self.ensure_run_token(now) {
@@ -218,12 +252,55 @@ impl GovernedRouter {
             );
         }
 
-        // (3) HITL GATE (BEFORE apply) — a frozen `requires_approval` tool with no approval is
-        //     withheld and does NOT mutate (the AG-8 leg). The flag is git's frozen `agent_tools()`
-        //     default (git.merge = yes), REUSED — not re-decided here.
-        if tool.requires_approval() && !approval_granted {
-            let gate_id = format!("hitl:{jti}:{}", tool.name());
-            return self.record(tool.name(), CallOutcome::Gated { gate_id, jti });
+        // (3) HITL GATE (BEFORE apply) — a frozen `requires_approval` tool is withheld unless the
+        //     SERVER-SIDE verdict store holds an `approved` gate for THIS exact effect, decided by
+        //     a DISTINCT principal (R2.4). The flag is git's frozen `agent_tools()` default
+        //     (git.merge = yes), REUSED — not re-decided here.
+        if tool.requires_approval() {
+            let effect_key = mcp_effect_key(tool.name(), args);
+            match presented_gate_id {
+                // No gate presented → withhold: open (or resurface) the pending gate row and
+                // return its OPAQUE server-issued id. 0 mutation.
+                None => {
+                    let gate_id = self.open_or_resurface_gate(&effect_key);
+                    return self.record(tool.name(), CallOutcome::Gated { gate_id, jti });
+                }
+                // A gate id presented → LOOK IT UP in the verdict store. Never trust the caller.
+                Some(gid) => {
+                    let verdict = self.verdicts.borrow().fetch(&self.principal.scope, gid);
+                    match verdict {
+                        // Approved, for THIS effect, by a distinct principal → the gate clears;
+                        // fall through to EffectApi::apply.
+                        Some(rec) if rec.authorizes(&effect_key, &self.principal.agent_id.0) => {}
+                        // The gate is real and pending for this effect → still withheld.
+                        Some(rec)
+                            if rec.state == GateState::Waiting && rec.effect_id == effect_key =>
+                        {
+                            return self.record(
+                                tool.name(),
+                                CallOutcome::Gated { gate_id: gid.to_string(), jti },
+                            );
+                        }
+                        // Everything else — unknown/forged id, rejected/expired gate, an approval
+                        // bound to a DIFFERENT effect, or a self-decided gate — is a loud deny.
+                        _ => {
+                            return self.record(
+                                tool.name(),
+                                CallOutcome::Denied {
+                                    reason: format!(
+                                        "HITL approval not granted server-side for gate `{gid}` \
+                                         on `{}` — the gate must be Approved in the verdict store \
+                                         for this exact effect by a distinct human principal; a \
+                                         caller-supplied approval is never trusted (R2.4)",
+                                        tool.name()
+                                    ),
+                                    jti,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // (4) ROUTE THE EFFECT THROUGH THE `EffectApi` CHOKEPOINT under a RunCtx that carries the
@@ -239,6 +316,62 @@ impl GovernedRouter {
         self.record(tool.name(), outcome)
     }
 
+    /// **Open (or resurface) the pending gate row for `effect_key` (R2.4 withhold).** If a
+    /// `waiting` gate for this `(run, effect)` already exists, its id is returned again (a retried
+    /// call re-surfaces the SAME pending gate — no duplicate spawn); otherwise a fresh row is
+    /// INSERTed under an OPAQUE random gate id. The run's own agent principal is structurally
+    /// excluded from the persisted approver filter.
+    fn open_or_resurface_gate(&self, effect_key: &str) -> String {
+        let mut verdicts = self.verdicts.borrow_mut();
+        if let Some(existing) =
+            verdicts.find_waiting(&self.principal.scope, &self.principal.run_id.0, effect_key)
+        {
+            return existing.gate_id;
+        }
+        let requested_by = self.principal.agent_id.0.clone();
+        let gate_id = opaque_gate_id();
+        let record = GateRecord {
+            gate_id: gate_id.clone(),
+            run_id: self.principal.run_id.0.clone(),
+            effect_id: effect_key.to_string(),
+            risk_summary: Vec::new(),
+            cost_estimate: 0,
+            approver_filter: self
+                .approvers
+                .iter()
+                .map(|p| p.0.clone())
+                .filter(|p| *p != requested_by)
+                .collect(),
+            state: GateState::Waiting,
+            card_ref: None,
+            requested_by,
+            decided_by: None,
+        };
+        verdicts
+            .open(&self.principal.scope, record)
+            .expect("a freshly minted opaque gate id never collides");
+        gate_id
+    }
+
+    /// **The server-side APPROVAL surface (R2.4).** The human decision path (the approval card /
+    /// operator surface) calls this — never the MCP client. The store enforces eligibility
+    /// (approver ∈ the gate's `approver_filter`) and the distinct-approver rule (approver ≠ the
+    /// gate's requester) SERVER-SIDE; a refusal leaves the gate `waiting`.
+    pub fn approve_gate(&self, approver: &PrincipalId, gate_id: &str) -> Result<(), GateDecideError> {
+        self.verdicts.borrow_mut().approve(&self.principal.scope, gate_id, &approver.0)
+    }
+
+    /// **The server-side REJECT surface (R2.4).** Settles the gate `rejected` — the effect is
+    /// withheld forever (0 mutation, AG-8); a later re-drive presenting this gate id is denied.
+    pub fn reject_gate(&self, decider: &PrincipalId, gate_id: &str) -> Result<(), GateDecideError> {
+        self.verdicts.borrow_mut().reject(&self.principal.scope, gate_id, &decider.0)
+    }
+
+    /// Read a gate's current verdict row (the operator/test observability read).
+    pub fn gate_verdict(&self, gate_id: &str) -> Option<GateRecord> {
+        self.verdicts.borrow().fetch(&self.principal.scope, gate_id)
+    }
+
     /// Append the outcome to the run's audit trail, attributed to the jti + the principal + the tool.
     fn record(&self, tool: &str, outcome: CallOutcome) -> CallOutcome {
         let entry = AuditEntry {
@@ -250,6 +383,25 @@ impl GovernedRouter {
         self.state.borrow_mut().audit.push(entry);
         outcome
     }
+}
+
+/// **The PER-EFFECT key an MCP approval is bound to (R2.4).** `mcp:{tool}:{args}` over the
+/// canonical `serde_json` serialisation (object keys are sorted — `serde_json`'s default `Map` is
+/// a `BTreeMap`), so an approval granted for `git.merge {number: 7}` NEVER clears a re-drive of
+/// `git.merge {number: 8}` — the approval is bound to the exact effect, not the tool name.
+pub fn mcp_effect_key(tool: &str, args: &serde_json::Value) -> String {
+    format!("mcp:{tool}:{args}")
+}
+
+/// **Mint an OPAQUE, unguessable gate id (R2.4).** 128 bits drawn from two independently
+/// OS-entropy-seeded `RandomState` hashers — never the old deterministic `hitl:{jti}:{tool}`
+/// display string a caller could predict. The id is the verdict-store PK; enforcement is the
+/// stored verdict (the opacity is defence in depth on top of it).
+fn opaque_gate_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let a = std::collections::hash_map::RandomState::new().build_hasher().finish();
+    let b = std::collections::hash_map::RandomState::new().build_hasher().finish();
+    format!("gate:{a:016x}{b:016x}")
 }
 
 /// Build the [`RunCtx`] an effect is applied under — it carries the run-token `jti` + the principal +

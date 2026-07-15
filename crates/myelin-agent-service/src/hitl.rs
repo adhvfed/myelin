@@ -35,9 +35,11 @@
 //! 3. **DECIDE.** A human clicks Approve/Reject minutes-or-days later. The run is PARKED
 //!    (`state=waiting`) holding no runtime; the worker is free. The decide step is observational here
 //!    — the durable wait (9.4) does the multi-day park.
-//! 4. **RESUME.** [`HitlGate::approve`] transitions `Waiting → Approved` and adds the tool name to the
-//!    run's `approved` set ([`ApprovedTools`]); a re-run of [`crate::effect_api::PlanThenApply::apply_planned`]
-//!    now passes step 6 and applies. [`HitlGate::reject`] transitions `Waiting → Rejected` and
+//! 4. **RESUME.** [`HitlGate::approve`] transitions `Waiting → Approved` and adds the effect's
+//!    per-(tool, object) gate key ([`crate::effect_api::effect_gate_key`], R2.4 — never the bare
+//!    tool name) to the run's `approved` set ([`ApprovedTools`]); a re-run of
+//!    [`crate::effect_api::PlanThenApply::apply_planned`]
+//!    now passes step 6 for THAT effect and applies. [`HitlGate::reject`] transitions `Waiting → Rejected` and
 //!    settles [`Halted::Rejected`] with the reason in the trace + audit — the effect is never applied
 //!    (0 mutation).
 //!
@@ -417,11 +419,19 @@ pub enum WaitDecision {
 
 // ───────────────────────── the run's approved-tool set (the resume threading) ────────────────────
 
-/// **The run's `approved` tool set — the slot the resume threads a decided gate into (§5.3 resume).**
-/// `EffectApi::apply`'s step 6 reads exactly this set: a `requires_approval` tool in the set passes
-/// the gate and applies. A fresh run's set is empty (every gated tool withholds); the HITL resume
-/// adds an APPROVED gate's tool name so the re-run applies it. This is the bridge between the
+/// **The run's `approved` PER-EFFECT gate-key set — the slot the resume threads a decided gate into
+/// (§5.3 resume).** `EffectApi::apply`'s step 6 reads exactly this set, keyed by
+/// [`crate::effect_api::effect_gate_key`] (`gate:{tool}:{object}` — the SAME key the step-6 `GateId`
+/// is minted from): a `requires_approval` effect whose OWN key is in the set passes the gate and
+/// applies. A fresh run's set is empty (every gated effect withholds); the HITL resume adds an
+/// APPROVED gate's per-effect key so the re-run applies THAT effect. This is the bridge between the
 /// `hitl_gate` machine (this module) and [`crate::effect_api::PlanThenApply::approved`].
+///
+/// **R2.4 (Defect B fix):** this set held bare TOOL NAMES — approving one `git.merge` admitted every
+/// sibling `git.merge` in a batch, including a DECLINED one re-driven through `apply_planned`. The
+/// set now carries per-(tool, object) keys, so a declined sibling's key is never present and it
+/// gates again (0 mutation, AG-8). The type keeps its name (it is the run's approved set everywhere)
+/// but a bare tool name is no longer an approval key anywhere.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ApprovedTools(pub std::collections::BTreeSet<String>);
 
@@ -431,22 +441,34 @@ impl ApprovedTools {
         ApprovedTools::default()
     }
 
-    /// **RESUME: add an APPROVED gate's tool to the set (§5.3 resume).** After this, a re-run of the
-    /// pipeline passes step 6 for that tool. Refused (a no-op, returns `false`) if the gate is NOT
-    /// approved (a Rejected/Expired/Waiting gate NEVER threads its tool into `approved` — the effect
-    /// is never applied, AG-8). Idempotent: adding an already-approved tool is a no-op (a double-click
-    /// is one approval — the set is the truth, not the click count).
+    /// **RESUME: add an APPROVED gate's PER-EFFECT key to the set (§5.3 resume).** After this, a
+    /// re-run of the pipeline passes step 6 for exactly that `(tool, object)` effect — never for a
+    /// sibling sharing the tool name. Refused (a no-op, returns `false`) if the gate is NOT approved
+    /// (a Rejected/Expired/Waiting gate NEVER threads its key into `approved` — the effect is never
+    /// applied, AG-8). Idempotent: re-admitting an approved gate is a no-op (a double-click is one
+    /// approval — the set is the truth, not the click count).
     pub fn admit(&mut self, gate: &HitlGate) -> bool {
         if !gate.is_approved() {
             return false;
         }
-        self.0.insert(gate.tool_name.clone());
+        self.0.insert(crate::effect_api::effect_gate_key_str(
+            &gate.tool_name,
+            &gate.object.0,
+        ));
         true
     }
 
-    /// Whether `tool` is approved for this run (the step-6 read).
-    pub fn contains(&self, tool: &str) -> bool {
-        self.0.contains(tool)
+    /// Whether the per-effect `key` ([`crate::effect_api::effect_gate_key`]) is approved for this
+    /// run (the step-6 read).
+    pub fn contains(&self, key: &str) -> bool {
+        self.0.contains(key)
+    }
+
+    /// Whether the `(tool, object)` effect is approved for this run (the key-derived convenience
+    /// read — same derivation as the step-6 consult).
+    pub fn contains_effect(&self, tool: &str, object: &str) -> bool {
+        self.0
+            .contains(&crate::effect_api::effect_gate_key_str(tool, object))
     }
 
     /// The set as the [`crate::effect_api::PlanThenApply::approved`] field expects it (a `BTreeSet`).
@@ -534,6 +556,101 @@ pub fn run_hitl_loop<W: HitlWait>(
             let halted = gate.expire().expect("a freshly-opened gate is Waiting");
             HitlOutcome::Halted(halted)
         }
+    }
+}
+
+// ───────────────────────── R2.4: HitlGate persistence over agent_hitl_gate ───────────────────────
+
+use myelin_storage::hitl_gate_durable::{
+    GateDecideError, GateOpenError, GateRecord, GateState as DurableGateState, HitlVerdictStore,
+};
+use myelin_storage::TenantScope;
+
+impl HitlGate {
+    /// **Project this gate onto the durable `agent_hitl_gate` row shape (R2.4).** The `effect_id`
+    /// is the PER-EFFECT key ([`crate::effect_api::effect_gate_key_str`]) — the same key the step-6
+    /// consult and [`ApprovedTools::admit`] use, so the durable verdict and the in-run approval are
+    /// keyed identically by construction. `requested_by` is the agent principal whose effect
+    /// tripped the gate (the distinct-approver anchor); it is structurally EXCLUDED from the
+    /// persisted `approver_filter` so the requester is never an eligible approver of its own gate.
+    pub fn to_gate_record(&self, requested_by: &str) -> GateRecord {
+        GateRecord {
+            gate_id: self.gate_id.0.clone(),
+            run_id: self.run_id.clone(),
+            effect_id: crate::effect_api::effect_gate_key_str(&self.tool_name, &self.object.0),
+            // The humanised SLOT serialized as bytes (references-not-payloads: template key +
+            // ArtifactRef args, never inline PII; the DEK envelope is the storage layer's, 11.4).
+            risk_summary: serde_json::to_vec(&serde_json::json!({
+                "template_key": self.risk_summary.template_key,
+                "args": self
+                    .risk_summary
+                    .args
+                    .iter()
+                    .map(|(n, r)| serde_json::json!([n, r.0]))
+                    .collect::<Vec<_>>(),
+            }))
+            .unwrap_or_default(),
+            cost_estimate: self.cost_estimate,
+            approver_filter: self
+                .approver_filter
+                .iter()
+                .map(|p| p.0.clone())
+                .filter(|p| p != requested_by)
+                .collect(),
+            state: match self.state {
+                HitlGateState::Waiting => DurableGateState::Waiting,
+                HitlGateState::Approved => DurableGateState::Approved,
+                HitlGateState::Rejected => DurableGateState::Rejected,
+                HitlGateState::Expired => DurableGateState::Expired,
+            },
+            card_ref: Some(self.card_ref.clone()),
+            requested_by: requested_by.to_string(),
+            decided_by: None,
+        }
+    }
+}
+
+/// **WITHHOLD → PERSIST: INSERT the pending gate row (R2.4 — the durable server-side gate).** A
+/// freshly opened `Waiting` [`HitlGate`] becomes an `agent_hitl_gate` row lookup-able by its
+/// `gate_id` across requests/processes; the later decision UPDATEs it via
+/// [`persist_gate_decision`] (or directly through the store's approve/reject/expire, which enforce
+/// the distinct-approver rule server-side).
+pub fn persist_gate_open(
+    store: &mut HitlVerdictStore,
+    scope: &TenantScope,
+    gate: &HitlGate,
+    requested_by: &str,
+) -> Result<(), GateOpenError> {
+    store.open(scope, gate.to_gate_record(requested_by))
+}
+
+/// **RESUME → PERSIST: UPDATE the durable row to this gate's decided state (R2.4).** Dispatches on
+/// the in-process state machine's terminal state: `Approved` records `decided_by` (the store
+/// re-enforces eligibility + the distinct-approver rule — a self-approval refuses even here),
+/// `Rejected` records the decider, `Expired` records none. A still-`Waiting` gate has no decision
+/// to persist — refused typed (`NotFound`: there is no decided verdict to write), with a
+/// debug-assert naming the caller bug loudly in dev.
+pub fn persist_gate_decision(
+    store: &mut HitlVerdictStore,
+    scope: &TenantScope,
+    gate: &HitlGate,
+    decided_by: Option<&str>,
+) -> Result<(), GateDecideError> {
+    debug_assert!(
+        gate.state.is_terminal(),
+        "persist_gate_decision is for a DECIDED gate (caller bug: still Waiting)"
+    );
+    match gate.state {
+        HitlGateState::Approved => {
+            let approver = decided_by.ok_or(GateDecideError::NotEligible)?;
+            store.approve(scope, &gate.gate_id.0, approver)
+        }
+        HitlGateState::Rejected => {
+            let decider = decided_by.ok_or(GateDecideError::NotEligible)?;
+            store.reject(scope, &gate.gate_id.0, decider)
+        }
+        HitlGateState::Expired => store.expire(scope, &gate.gate_id.0),
+        HitlGateState::Waiting => Err(GateDecideError::NotFound),
     }
 }
 
@@ -777,26 +894,38 @@ mod tests {
 
     // ───────── the approved-tool set (the resume threading into EffectApi step 6) ─────────
 
-    /// **RESUME threads an APPROVED gate's tool into `approved`; a Rejected/Expired gate NEVER does
-    /// (0 mutation, AG-8); admit is idempotent (a double-click is one approval).**
+    /// **RESUME threads an APPROVED gate's PER-EFFECT key into `approved`; a Rejected/Expired gate
+    /// NEVER does (0 mutation, AG-8); admit is idempotent (a double-click is one approval); and —
+    /// R2.4 — the key is per-(tool, object), never a bare tool name.**
     #[test]
     fn approved_set_admits_only_approved_gates_idempotently() {
+        const PR42: &str = "myelin://acme/git/pr/42";
         let mut approved = ApprovedTools::new();
-        assert!(!approved.contains("git.merge"));
+        assert!(!approved.contains_effect("git.merge", PR42));
 
         // a Waiting gate is NOT admitted (no decision yet).
         let waiting = open_waiting();
         assert!(!approved.admit(&waiting), "a Waiting gate threads nothing");
-        assert!(!approved.contains("git.merge"));
+        assert!(!approved.contains_effect("git.merge", PR42));
 
-        // an Approved gate IS admitted → the re-run applies the effect.
+        // an Approved gate IS admitted → the re-run applies THAT effect.
         let mut g = open_waiting();
         g.approve().unwrap();
         assert!(
             approved.admit(&g),
-            "an Approved gate threads its tool into approved"
+            "an Approved gate threads its per-effect key into approved"
         );
-        assert!(approved.contains("git.merge"));
+        assert!(approved.contains_effect("git.merge", PR42));
+        // R2.4: the key is per-(tool, object) — the bare tool name is NOT an approval key, and a
+        // sibling object is NOT admitted.
+        assert!(
+            !approved.contains("git.merge"),
+            "a bare tool name is never an approval key (Defect B)"
+        );
+        assert!(
+            !approved.contains_effect("git.merge", "myelin://acme/git/pr/41"),
+            "an approval never transfers to a sibling object sharing the tool name"
+        );
         // idempotent: a double-click (re-admit) is a no-op.
         assert!(approved.admit(&g));
         assert_eq!(
@@ -805,15 +934,15 @@ mod tests {
             "a double-click is one approval (one entry)"
         );
 
-        // a Rejected gate NEVER threads its tool (0 mutation, AG-8).
+        // a Rejected gate NEVER threads its key (0 mutation, AG-8).
         let mut r = open_waiting();
         r.tool_name = "git.force_push".into();
         r.reject("no").unwrap();
         assert!(
             !approved.admit(&r),
-            "a Rejected gate NEVER approves the tool (AG-8)"
+            "a Rejected gate NEVER approves the effect (AG-8)"
         );
-        assert!(!approved.contains("git.force_push"));
+        assert!(!approved.contains_effect("git.force_push", PR42));
     }
 
     // ───────── the end-to-end withhold → surface → resume loop driver ─────────
@@ -852,10 +981,11 @@ mod tests {
             }
             other => panic!("expected Approved, got {other:?}"),
         }
-        // the resume threaded the tool into `approved` → a re-run of apply_planned now passes step 6.
+        // the resume threaded THIS effect's key into `approved` → a re-run of apply_planned now
+        // passes step 6 for exactly this (tool, object).
         assert!(
-            approved.contains("git.merge"),
-            "the approved tool is now in the run's approved set"
+            approved.contains_effect("git.merge", "myelin://acme/git/pr/42"),
+            "the approved effect's key is now in the run's approved set"
         );
     }
 
@@ -878,11 +1008,97 @@ mod tests {
             outcome,
             HitlOutcome::Halted(Halted::Rejected("not safe".into()))
         );
-        // the rejected gate NEVER threaded the tool → the re-run gates again / the loop withholds.
+        // the rejected gate NEVER threaded its key → the re-run gates again / the loop withholds.
         assert!(
-            !approved.contains("git.merge"),
-            "a rejected gate makes 0 mutation (the tool stays unapproved, AG-8)"
+            !approved.contains_effect("git.merge", "myelin://acme/git/pr/42"),
+            "a rejected gate makes 0 mutation (the effect stays unapproved, AG-8)"
         );
+    }
+
+    // ───────── R2.4: HitlGate persistence over the agent_hitl_gate verdict store ─────────
+
+    fn scope() -> TenantScope {
+        let p = myelin_identity::Principal::stub(
+            PrincipalId("psn:human-x".into()),
+            myelin_identity::PrincipalKind::Human,
+            myelin_tenancy::TenantId("acme".into()),
+        );
+        TenantScope::from_verified_token(&p, myelin_tenancy::Region("eu-west".into()))
+    }
+
+    /// **A withheld gate PERSISTS as a `waiting` `agent_hitl_gate` row, lookup-able by its gate_id
+    /// (R2.4).** The persisted `effect_id` is the SAME per-effect key `ApprovedTools`/step-6 use,
+    /// and the requesting agent is structurally excluded from the persisted approver filter.
+    #[test]
+    fn a_withheld_gate_persists_waiting_and_is_lookup_able_by_gate_id() {
+        let mut store = HitlVerdictStore::new();
+        let gate = open_waiting();
+        persist_gate_open(&mut store, &scope(), &gate, "agent:claude").expect("persists");
+
+        let rec = store
+            .fetch(&scope(), &gate.gate_id.0)
+            .expect("the gate row is lookup-able by gate_id");
+        assert_eq!(rec.state, DurableGateState::Waiting);
+        assert_eq!(
+            rec.effect_id,
+            crate::effect_api::effect_gate_key_str("git.merge", "myelin://acme/git/pr/42"),
+            "the durable verdict is keyed by the SAME per-effect key step 6 consults"
+        );
+        assert_eq!(rec.cost_estimate, 50, "the LIVE cost estimate rides the row");
+        assert_eq!(rec.requested_by, "agent:claude");
+        assert!(
+            !rec.approver_filter.contains(&"agent:claude".to_string()),
+            "the requester is never an eligible approver of its own gate"
+        );
+    }
+
+    /// **The decision UPDATEs the durable state — approve (distinct approver, recorded), reject,
+    /// expire — and the store refuses a self-approval even at persist time (R2.4).**
+    #[test]
+    fn a_decision_updates_the_durable_verdict_with_distinct_approver() {
+        let mut store = HitlVerdictStore::new();
+
+        // APPROVE by a distinct eligible principal → durable `approved` + decided_by recorded.
+        let mut g = open_waiting();
+        persist_gate_open(&mut store, &scope(), &g, "agent:claude").unwrap();
+        g.approve().unwrap();
+        persist_gate_decision(&mut store, &scope(), &g, Some("psn:lead")).expect("approves");
+        let rec = store.fetch(&scope(), &g.gate_id.0).unwrap();
+        assert_eq!(rec.state, DurableGateState::Approved);
+        assert_eq!(rec.decided_by.as_deref(), Some("psn:lead"));
+        assert!(rec.authorizes(&rec.effect_id.clone(), "agent:claude"));
+
+        // A SELF-approval is refused server-side at persist time (the distinct-approver rule).
+        let mut s2 = HitlVerdictStore::new();
+        let mut g2 = open_waiting();
+        persist_gate_open(&mut s2, &scope(), &g2, "agent:claude").unwrap();
+        g2.approve().unwrap();
+        assert!(
+            persist_gate_decision(&mut s2, &scope(), &g2, Some("agent:claude")).is_err(),
+            "the requesting agent cannot approve its own gate — even through the persist path"
+        );
+        assert_eq!(
+            s2.fetch(&scope(), &g2.gate_id.0).unwrap().state,
+            DurableGateState::Waiting,
+            "the refused self-approval left the durable row undecided"
+        );
+
+        // REJECT + EXPIRE settle their durable states (0 mutation either way, AG-8).
+        let mut s3 = HitlVerdictStore::new();
+        let mut g3 = open_waiting();
+        persist_gate_open(&mut s3, &scope(), &g3, "agent:claude").unwrap();
+        g3.reject("no").unwrap();
+        persist_gate_decision(&mut s3, &scope(), &g3, Some("psn:lead")).unwrap();
+        assert_eq!(s3.fetch(&scope(), &g3.gate_id.0).unwrap().state, DurableGateState::Rejected);
+
+        let mut s4 = HitlVerdictStore::new();
+        let mut g4 = open_waiting();
+        persist_gate_open(&mut s4, &scope(), &g4, "agent:claude").unwrap();
+        g4.expire().unwrap();
+        persist_gate_decision(&mut s4, &scope(), &g4, None).unwrap();
+        let rec = s4.fetch(&scope(), &g4.gate_id.0).unwrap();
+        assert_eq!(rec.state, DurableGateState::Expired);
+        assert_eq!(rec.decided_by, None);
     }
 
     // ───────── the Gated-result entry guard ─────────
