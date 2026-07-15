@@ -45,7 +45,7 @@
 //!   an unviewable object.
 
 use crate::{EvalContext, EvalError, Predicate, QueryAst};
-use myelin_events::{ArtifactRef, EventEnvelope, Visibility};
+use myelin_events::{EventEnvelope, Visibility};
 use myelin_identity::{Literal, ObjectId, ObjectType, SetExpr};
 use serde::{Deserialize, Serialize};
 
@@ -151,11 +151,22 @@ impl EventMatcher {
     /// (`InRelation` / `TupleSet`) for the candidate object id (the consumer's authz
     /// reverse-index lookup; for the in-process / unit path it is an explicit closure).
     ///
-    /// The order is the load-bearing invariant: **we test visibility FIRST**. If the
-    /// envelope's subject object id is NOT in the viewer's visible set, we return
-    /// `Ok(false)` **without ever consulting the predicate** — a matcher can never select an
-    /// artifact the subject cannot see, no matter what the predicate says. Only for a
-    /// visible object do we project the envelope and run the bounded interpreter.
+    /// The order is the load-bearing invariant: **we test the OBJECT QUALIFICATION, then
+    /// visibility, FIRST** (R2.2). The subject is keyed through the ONE canonical
+    /// [`myelin_refs::object_key`] grammar (the same function the identity check engine keys
+    /// tuples with):
+    /// 1. a subject that does not qualify (malformed ref) never matches — fail-closed;
+    /// 2. a subject whose TYPE is not this matcher's `object_type` never matches (a shared
+    ///    trailing id on another type is structurally unmatched — the pre-R2.2 bare-trailing-id
+    ///    reduction delegated this entirely to the caller's list_objects scoping);
+    /// 3. a subject URN naming a tenant other than the envelope's own never matches;
+    /// 4. only then is the visible set consulted (against either spelling of the typed object:
+    ///    the consumer id-column `PROJ-1` or the tuple key `issue:PROJ-1`).
+    ///
+    /// If the subject is NOT in the viewer's visible set, we return `Ok(false)` **without ever
+    /// consulting the predicate** — a matcher can never select an artifact the subject cannot
+    /// see, no matter what the predicate says. Only for a visible object do we project the
+    /// envelope and run the bounded interpreter.
     ///
     /// Returns:
     /// - `Ok(true)` — visible AND the predicate holds.
@@ -170,12 +181,40 @@ impl EventMatcher {
         visible: &SetExpr,
         member_oracle: &dyn Fn(&RelMembership) -> bool,
     ) -> Result<bool, EvalError> {
-        // Permission compose FIRST (the 0-leak invariant). The candidate object is the
-        // envelope's subject; its id is the last path segment of the ArtifactRef.
-        let object_id = subject_object_id(&envelope.subject);
+        // Object qualification FIRST (R2.2): key the subject through the ONE canonical
+        // type-qualified grammar. A subject that does not qualify never matches (fail-closed —
+        // the matcher never guesses an object out of a ref it cannot parse).
+        let Some(key) = myelin_refs::object_key(&envelope.subject) else {
+            return Ok(false);
+        };
+        // The TYPE gate is structural: this matcher selects exactly `self.object_type`; a subject
+        // of any other type (or of no inferable type) is unmatched no matter the visible set —
+        // a shared trailing id on another type can never leak through (Defect B).
+        if key.object_type.as_deref() != Some(self.object_type.0.as_str()) {
+            return Ok(false);
+        }
+        // The TENANT gate: a URN subject naming a tenant other than the envelope's own verified
+        // tenant is malformed/adversarial → unmatched. (A bare `type:id` subject carries no
+        // tenant; the envelope's tenant stamp + the caller's tenant-scoped list_objects govern.)
+        if let Some(subject_tenant) = &key.tenant {
+            if subject_tenant != &envelope.tenant.0 {
+                return Ok(false);
+            }
+        }
+        // Permission compose (the 0-leak invariant). The candidate is tested against the viewer's
+        // visible set under EITHER spelling of the SAME typed object: the consumer id-column form
+        // (`PROJ-1` — what a subsystem's own list ranges over) or the canonical tuple-key form
+        // (`issue:PROJ-1` — what identity's list_objects/S8 range over). One shared walk budget
+        // bounds both membership tests.
         let mut budget = 0usize;
-        let visible_here = setexpr_contains(visible, &object_id, member_oracle, &mut budget, 0)
+        let bare = ObjectId(key.id.clone());
+        let qualified = ObjectId(key.tuple_key());
+        let mut visible_here = setexpr_contains(visible, &bare, member_oracle, &mut budget, 0)
             .ok_or(EvalError::CostExceeded)?;
+        if !visible_here && qualified != bare {
+            visible_here = setexpr_contains(visible, &qualified, member_oracle, &mut budget, 0)
+                .ok_or(EvalError::CostExceeded)?;
+        }
         if !visible_here {
             // Not in the viewer's read set → zero matches, predicate NEVER consulted.
             return Ok(false);
@@ -200,16 +239,6 @@ pub enum RelMembership {
     },
     /// `SetExpr::TupleSet { index }` — is the object in the server-materialised tuple set?
     InTupleSet { index: String, object_id: ObjectId },
-}
-
-/// Extract the object id (the last `/`-segment, sans any `#sub` anchor) from an
-/// `myelin://<tenant>/<subsystem>/<type>/<id>[#sub]` [`ArtifactRef`]. This is the id space
-/// `list_objects` ranges over (the consumer's own id column, 4.3).
-fn subject_object_id(subject: &ArtifactRef) -> ObjectId {
-    let s = &subject.0;
-    let no_anchor = s.split('#').next().unwrap_or(s);
-    let id = no_anchor.rsplit('/').next().unwrap_or(no_anchor);
-    ObjectId(id.to_string())
 }
 
 /// **Bounded membership over the frozen [`SetExpr`] algebra** (contract 4.3) — does the
@@ -379,7 +408,7 @@ mod tests {
     use super::*;
     use crate::{CmpOp, Expr};
     use myelin_events::{
-        Actor, AggregateKey, CorrelationId, DataRole, EventId, EventType, Timestamp,
+        Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventId, EventType, Timestamp,
     };
     use myelin_identity::{Principal, PrincipalId, PrincipalKind, RelName};
     use myelin_tenancy::{Region, TenantId};
@@ -471,6 +500,106 @@ mod tests {
             Ok(true),
             "visible + predicate holds → match"
         );
+    }
+
+    /// **R2.2 Defect B — a same-trailing-id, DIFFERENT-TYPE envelope is NOT matched, even when
+    /// `visible` contains the bare id.** Before R2.2 the matcher reduced the subject to its bare
+    /// trailing segment and never consulted its own `object_type`, so an `issue` matcher whose
+    /// viewer could see issue `X-1` also matched a `repo` envelope with trailing id `X-1` —
+    /// 0-leak was delegated entirely to the caller's list_objects scoping + global id uniqueness.
+    /// Now the type gate is structural in the matcher.
+    #[test]
+    fn same_trailing_id_different_type_is_not_matched() {
+        let m = EventMatcher::compile(ObjectType("issue".into()), Predicate::True).unwrap();
+        let visible = SetExpr::Ids(vec![ObjectId("X-1".into())]);
+        // A GIT REPO envelope whose subject shares the trailing id `X-1`.
+        let mut repo_env = envelope(
+            "git.ref.updated",
+            "X-1",
+            Visibility::Internal,
+            serde_json::json!({}),
+        );
+        repo_env.subject = ArtifactRef("myelin://t1/git/repo/X-1".into());
+        assert_eq!(
+            m.matches(&repo_env, &visible, &no_rel),
+            Ok(false),
+            "an `issue` matcher never matches a `repo` subject, even on a shared trailing id"
+        );
+        // Even SetExpr::All (the widest visible set) does not cross the type gate.
+        assert_eq!(
+            m.matches(&repo_env, &SetExpr::All, &no_rel),
+            Ok(false),
+            "the type gate is structural — not a property of the visible set"
+        );
+        // Sanity: the SAME id as an ISSUE subject matches.
+        let issue_env = envelope(
+            "issues.issue.updated",
+            "X-1",
+            Visibility::Internal,
+            serde_json::json!({}),
+        );
+        assert_eq!(m.matches(&issue_env, &visible, &no_rel), Ok(true));
+    }
+
+    /// **R2.2 Defect B (tenant leg) — a CROSS-TENANT subject is NOT matched.** An envelope whose
+    /// subject URN names a different tenant than the envelope's own verified tenant is malformed /
+    /// adversarial and never matches, no matter the visible set or predicate.
+    #[test]
+    fn cross_tenant_subject_is_not_matched() {
+        let m = EventMatcher::compile(ObjectType("issue".into()), Predicate::True).unwrap();
+        let mut env = envelope(
+            "issues.issue.updated",
+            "issue-1",
+            Visibility::Internal,
+            serde_json::json!({}),
+        );
+        // The envelope is stamped tenant t1, but the subject URN claims tenant t2.
+        env.subject = ArtifactRef("myelin://t2/issues/issue/issue-1".into());
+        assert_eq!(
+            m.matches(&env, &SetExpr::All, &no_rel),
+            Ok(false),
+            "a subject URN naming a foreign tenant never matches (structural 0-leak)"
+        );
+    }
+
+    /// **R2.2 — a structurally malformed subject fails closed to no-match** (the matcher never
+    /// guesses an object key out of a ref it cannot qualify).
+    #[test]
+    fn malformed_subject_is_not_matched() {
+        let m = EventMatcher::compile(ObjectType("issue".into()), Predicate::True).unwrap();
+        let mut env = envelope(
+            "issues.issue.updated",
+            "issue-1",
+            Visibility::Internal,
+            serde_json::json!({}),
+        );
+        env.subject = ArtifactRef("myelin://t1/issues/issue".into()); // 3 segments — malformed
+        assert_eq!(m.matches(&env, &SetExpr::All, &no_rel), Ok(false));
+    }
+
+    /// **R2.2 — the type-qualified spelling of the visible id also matches.** `list_objects` over
+    /// the identity tuple space returns type-qualified ids (`issue:PROJ-1` — the stored tuple
+    /// key); a consumer id-column returns the bare id (`PROJ-1`). The SAME subject matches
+    /// against either spelling of its OWN type — never against another type's.
+    #[test]
+    fn visible_set_matches_either_spelling_of_the_same_typed_object() {
+        let m = EventMatcher::compile(ObjectType("issue".into()), Predicate::True).unwrap();
+        let mut env = envelope(
+            "issues.issue.updated",
+            "PROJ-1",
+            Visibility::Internal,
+            serde_json::json!({}),
+        );
+        env.subject = ArtifactRef("myelin://t1/issues/issue/PROJ-1".into());
+        // The tuple-key spelling…
+        let qualified = SetExpr::Ids(vec![ObjectId("issue:PROJ-1".into())]);
+        assert_eq!(m.matches(&env, &qualified, &no_rel), Ok(true));
+        // …and the consumer id-column spelling both admit.
+        let bare = SetExpr::Ids(vec![ObjectId("PROJ-1".into())]);
+        assert_eq!(m.matches(&env, &bare, &no_rel), Ok(true));
+        // But another type's qualified id with the same trailing id does NOT.
+        let wrong_type = SetExpr::Ids(vec![ObjectId("repo:PROJ-1".into())]);
+        assert_eq!(m.matches(&env, &wrong_type, &no_rel), Ok(false));
     }
 
     /// **0-leak with an explicit allow-set: only the visible id matches.**

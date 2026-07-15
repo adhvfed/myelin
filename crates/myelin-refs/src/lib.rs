@@ -38,6 +38,7 @@
 //!
 //! So this crate at M0 is the contract value type only — not the engine, not the lints.
 
+mod object_key;
 mod parse;
 
 use myelin_identity::Principal;
@@ -51,6 +52,13 @@ pub use myelin_events::ArtifactRef;
 /// taxonomy. These are the value-type behaviours every service consumes (REF-3 — never
 /// re-implemented per service).
 pub use parse::{format, mint, parse, strip_sub, sub_kind, ParseError, Sub, SubKind, SCHEME};
+
+/// The ONE canonical **type-qualified authz object key** (R2.2): maps either spelling of a check/
+/// match object (`repo:core` or `myelin://acme/git/repo/core`, `#sub`-anchored or not) onto the one
+/// `type:id` tuple key writers store and the check engine / event matcher read. Both authz readers
+/// (`check_engine::object_id_of` and the `EventMatcher` subject keying) route through this — never
+/// a local trailing-segment reduction (the cross-type-confusion defect this module's doc names).
+pub use object_key::{object_key, ObjectKey};
 
 /// A subsystem's declaration to Refs that it OWNS (mints) a set of `#sub` kinds (contract 5.7 /
 /// §3.5). Refs owns the grammar + the resolution ladder; each subsystem owns the **stable mint** of

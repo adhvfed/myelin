@@ -88,7 +88,9 @@ pub use catalogue::{
     MAX_PAGE_LIMIT,
 };
 pub use error::{map_authz_error, EdgeError};
-pub use gateway::{sse_scope_for_tenant, Gateway, GatewayBuilder, WhoamiHandler};
+pub use gateway::{
+    sse_scope_for_resource, sse_scope_for_tenant, Gateway, GatewayBuilder, WhoamiHandler,
+};
 pub use git_durable::{register_git_durable, DurableGitBackend};
 pub use git_edge::{register_git, GitEdgeState};
 pub use git_effect::GitEffectApi;
