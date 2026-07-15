@@ -22,7 +22,7 @@ use myelin_identity_service::{
     PrincipalStore, RevocationStore,
 };
 use myelin_storage::{
-    kms_durable_migrations, seal_key_from_env, DurableKmsBacking, DurablePrincipalBacking,
+    all_durable_migrations, seal_key_from_env, DurableKmsBacking, DurablePrincipalBacking,
     DurableRevocationBacking, HotTables, PgOutboxBacking, SubstrateProvider,
 };
 use std::sync::Arc;
@@ -58,6 +58,20 @@ async fn main() {
         );
         std::process::exit(1);
     }
+    // W7.2 (doc-18 Part 5) — THE BOOT-MIGRATIONS FIX: apply the FULL durable migration aggregate
+    // (identity 0010–0019, pseudonym 0020–0022, placement 0030–0039, kms 0040–0042, cost/erasure
+    // 0050–0053) right after the foundation, so every durable store this main constructs has its
+    // tables. Previously this main migrated ONLY foundation + KMS, so the identity tables the
+    // `PrincipalStore::with_pg`/`RevocationStore::with_pg` stores below bind to (`principal`,
+    // `revocation`, …) were NEVER migrated — the first principal write failed at runtime on a fresh
+    // DB. The aggregate is idempotent + advisory-locked (safe on re-boot). FAIL LOUD, no fallback.
+    if let Err(e) = provider
+        .migrate(&all_durable_migrations(), &HotTables::none())
+        .await
+    {
+        eprintln!("edge: cannot apply the durable migration aggregate (identity/pseudonym/placement/kms/cost/erasure): {e}");
+        std::process::exit(1);
+    }
     let git_outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
         provider.db_pool().clone(),
         handle.clone(),
@@ -81,14 +95,8 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    // The KMS tables are forward-only + idempotent — apply them at boot via the MR-022 migrator.
-    if let Err(e) = provider
-        .migrate(&kms_durable_migrations(), &HotTables::none())
-        .await
-    {
-        eprintln!("edge: cannot apply the durable KMS migrations: {e}");
-        std::process::exit(1);
-    }
+    // The KMS tables (0040–0042) are migrated by the W7.2 durable aggregate applied above — no
+    // separate per-group KMS migrate call here anymore (the aggregate folds it in exactly once).
     // The cell whose sealed root this edge serves (a namespace, not a secret — dev default).
     let cell_id = std::env::var("MYELIN_CELL_ID").unwrap_or_else(|_| "cell-dev".to_string());
     let kms_backing = DurableKmsBacking::new(provider.db_pool().clone(), cell_id);
