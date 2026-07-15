@@ -73,14 +73,17 @@ serde_json = { workspace = true }
 # NOT pull a DB into `cargo build --workspace`.
 myelin-storage = { path = "../myelin-storage" }
 
-# REAL Postgres backend behind the `integration` feature (Stage 1 / infra). OPTIONAL deps pulled
-# ONLY by `--features integration`, which compiles the live-PG schema-apply + RLS denial +
-# idempotency-constraint test (tests/integration_flow_schema.rs) run against the docker-compose
-# dev stack. The default `cargo build --workspace` stays DB-free (the binding-policy floor — no
-# DB at build).
-myelin-config = { path = "../myelin-config", optional = true }
+# MR-009b W3b.4 — the DURABLE composition root in `src/main.rs` (SubstrateProvider from env →
+# foundation migrations → `OutboxStore::durable(PgOutboxBacking)`) is the ALWAYS-COMPILED default
+# (the Wave-2 identity-service posture), so `tokio` (the multi-thread runtime the sync→async
+# bridge requires) + `myelin-config` (the env-first durable config, fail-loud) are now regular
+# deps. Build stays DB-free: connecting happens at RUNTIME, never at build.
+myelin-config = { path = "../myelin-config" }
+tokio = { workspace = true }
+# REAL Postgres raw-sqlx test harness behind the `integration` feature (Stage 1 / infra): pulled
+# ONLY by `--features integration` (tests/integration_flow_schema.rs against the docker dev
+# stack). The default `cargo build --workspace` stays DB-free (the binding-policy floor).
 sqlx = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 # MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
@@ -126,4 +129,6 @@ myelin-agent = { path = "../myelin-agent" }
 
 [features]
 # The live-PG integration test (tests/integration_flow_schema.rs). DB-free by default.
-integration = ["dep:myelin-config", "dep:sqlx", "dep:tokio"]
+# (tokio + myelin-config are regular deps since W3b.4 — the durable main.rs needs them; the
+# feature now only pulls the raw-sqlx test harness.)
+integration = ["dep:sqlx"]

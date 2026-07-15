@@ -120,7 +120,11 @@ myelin-refs = { path = "../myelin-refs" }
 # test reads DATABASE_URL inline (no myelin-config edge — same posture as refs-service/identity).
 # ------------------------------------------------------------------------------------------
 sqlx = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
+# MR-009b W3b.4 — the DURABLE composition root in `src/main.rs` (SubstrateProvider from env →
+# foundation migrations → `OutboxStore::durable(PgOutboxBacking)`) is the ALWAYS-COMPILED default
+# (the Wave-2 identity-service posture), so `tokio` (the multi-thread runtime the sync→async
+# bridge requires) is now a regular dep. Build stays DB-free: connecting happens at RUNTIME.
+tokio = { workspace = true }
 
 # SRCH-P30 (P-463, M5): the object-store index backstop swap (the fs-backed BlobStore ->
 # object-store swap, contract 11.2) gets PROVEN against the LIVE dev-stack object store (RustFS /
@@ -130,7 +134,8 @@ tokio = { workspace = true, optional = true }
 # "integration")]` in storage) are pulled ONLY by `--features integration` — the default
 # `cargo build --workspace` stays DB-free. No new modelled-DAG edge: `myelin-config` is leaf config
 # and Search already depends on `myelin-storage` (Search stays a terminal leaf consumer).
-myelin-config = { path = "../myelin-config", optional = true }
+# (regular since W3b.4 — the durable main.rs reads the env-first durable config, fail-loud.)
+myelin-config = { path = "../myelin-config" }
 
 [features]
 default = []
@@ -141,10 +146,10 @@ default = []
 # lives). DEV/TEST only — never enabled by a production dependency edge.
 test-support = ["myelin-storage/test-support"]
 memory = ["test-support"]
+# (tokio + myelin-config are regular deps since W3b.4 — the durable main.rs needs them; the
+# feature now pulls the raw-sqlx test harness + the live storage backends.)
 integration = [
     "dep:sqlx",
-    "dep:tokio",
-    "dep:myelin-config",
     "myelin-storage/integration",
 ]
 

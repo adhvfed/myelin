@@ -346,11 +346,17 @@ impl TupleStore {
     /// there is no separate `OutboxStore` on this path — a crash mid-write leaves either the tuple +
     /// its event or neither. The store auto-registers as a holder.
     /// **The PRODUCTION default (MR-009b Wave 2) — always compiled.**
+    ///
+    /// Mints event ids with [`myelin_events::UlidMinter`] (W3b.4 verifier finding): the previous
+    /// `MonotonicMinter` default resets per store, so two production stores mint COLLIDING
+    /// `event_id`s and `co_commit_in_tx`'s `ON CONFLICT (event_id) DO NOTHING` silently DROPS the
+    /// later event — the exact W3b.3 named condition. Deterministic tests inject a seeded minter
+    /// via [`Self::with_pg_minter`].
     pub fn with_pg(
         backing: myelin_storage::DurableTupleBacking,
         rt: tokio::runtime::Handle,
     ) -> TupleStore {
-        TupleStore::with_pg_minter(Arc::new(MonotonicMinter::new()), backing, rt)
+        TupleStore::with_pg_minter(Arc::new(myelin_events::UlidMinter::new()), backing, rt)
     }
 
     /// [`Self::with_pg`] with an explicit id-minter (deterministic in tests). Always compiled (W2).
@@ -518,10 +524,7 @@ impl TupleStore {
     // `expires_at` (the auto-expiring per-run grant TTL) is consumed only by the in-memory test-double
     // write path; the durable `rebac_tuple` has no `expires_at` column (the named MR-009 boundary), so
     // in the durable-only default build it is unused — allowed rather than gated (it is public API).
-    #[cfg_attr(
-        not(any(test, feature = "test-support")),
-        allow(unused_variables)
-    )]
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(unused_variables))]
     pub fn write_tuples(
         &self,
         scope: &TenantScope,
@@ -624,7 +627,8 @@ impl TupleStore {
         // The iam.tuple_written event — the event-sourced record S8 consumes, carrying the write's
         // zookie watermark. Attribution by OPAQUE principal_id; references-not-payloads; no PII.
         let draft = self.tuple_written_draft(scope, deltas, zookie);
-        tx.emit(draft, None).map_err(|e| WriteError::CommitFailed(e.0))?;
+        tx.emit(draft, None)
+            .map_err(|e| WriteError::CommitFailed(e.0))?;
         Ok(tx)
     }
 
@@ -796,7 +800,8 @@ impl TupleStore {
                 let obj = match d {
                     TupleDelta::Add(t) | TupleDelta::Remove(t) => t.object.0.clone(),
                 };
-                zk.get(&(tenant.to_string(), region.to_string(), obj)).cloned()
+                zk.get(&(tenant.to_string(), region.to_string(), obj))
+                    .cloned()
             })
             .max_by(|a, b| a.0.cmp(&b.0))
     }

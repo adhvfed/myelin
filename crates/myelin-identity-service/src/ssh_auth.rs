@@ -341,8 +341,8 @@ fn verify_rsa_sha256(n: &[u8], e: &[u8], msg: &[u8], sig: &[u8]) -> Result<(), A
     use rsa::signature::Verifier;
     use sha2::Sha256;
     let vk = VerifyingKey::<Sha256>::new(rsa_public_key(n, e)?);
-    let signature =
-        Signature::try_from(sig).map_err(|_| refuse("malformed rsa-sha2-256 signature encoding"))?;
+    let signature = Signature::try_from(sig)
+        .map_err(|_| refuse("malformed rsa-sha2-256 signature encoding"))?;
     vk.verify(msg, &signature)
         .map_err(|_| refuse("rsa-sha2-256 signature verification failed"))
 }
@@ -354,8 +354,8 @@ fn verify_rsa_sha512(n: &[u8], e: &[u8], msg: &[u8], sig: &[u8]) -> Result<(), A
     use rsa::signature::Verifier;
     use sha2::Sha512;
     let vk = VerifyingKey::<Sha512>::new(rsa_public_key(n, e)?);
-    let signature =
-        Signature::try_from(sig).map_err(|_| refuse("malformed rsa-sha2-512 signature encoding"))?;
+    let signature = Signature::try_from(sig)
+        .map_err(|_| refuse("malformed rsa-sha2-512 signature encoding"))?;
     vk.verify(msg, &signature)
         .map_err(|_| refuse("rsa-sha2-512 signature verification failed"))
 }
@@ -650,13 +650,15 @@ impl ChallengeGuard {
     pub fn consume(&self, id: &str) -> Result<Vec<u8>, AuthzError> {
         let now = self.now();
         let mut map = self.lock();
-        let entry = map
-            .get_mut(id)
-            .ok_or_else(|| refuse("unknown SSH challenge (not server-issued, or already expired)"))?;
+        let entry = map.get_mut(id).ok_or_else(|| {
+            refuse("unknown SSH challenge (not server-issued, or already expired)")
+        })?;
         if now > entry.expires_at {
             // Stale — drop it and refuse.
             map.remove(id);
-            return Err(refuse("expired SSH challenge (stale — re-issue a fresh challenge)"));
+            return Err(refuse(
+                "expired SSH challenge (stale — re-issue a fresh challenge)",
+            ));
         }
         if entry.consumed {
             return Err(refuse(
@@ -1028,11 +1030,16 @@ mod tests {
         let blob = key.pubkey_blob();
         let c = signed_cred(&v, &blob, |m| key.sig_blob(m));
 
-        let a = v.verify(&c).expect("a correctly-signed ed25519 challenge must verify");
+        let a = v
+            .verify(&c)
+            .expect("a correctly-signed ed25519 challenge must verify");
         assert_eq!(a.tenant, TenantId(TENANT.into()));
         assert_eq!(a.region, Region(REGION.into()));
         assert_eq!(a.scheme, scheme::SSH);
-        assert_eq!(a.subject_key, fp, "subject = the registered key fingerprint");
+        assert_eq!(
+            a.subject_key, fp,
+            "subject = the registered key fingerprint"
+        );
     }
 
     #[test]
@@ -1043,7 +1050,9 @@ mod tests {
         let v = SshVerifier::new(registry, ChallengeGuard::new(300));
         let c = signed_cred(&v, &blob, |m| key.sig_blob_sha256(m));
 
-        let a = v.verify(&c).expect("a correctly-signed rsa-sha2-256 challenge must verify");
+        let a = v
+            .verify(&c)
+            .expect("a correctly-signed rsa-sha2-256 challenge must verify");
         assert_eq!(a.tenant, TenantId(TENANT.into()));
         assert_eq!(a.subject_key, ssh_fingerprint(&blob));
     }
@@ -1056,7 +1065,9 @@ mod tests {
         let v = SshVerifier::new(registry, ChallengeGuard::new(300));
         let c = signed_cred(&v, &blob, |m| key.sig_blob_sha512(m));
 
-        let a = v.verify(&c).expect("a correctly-signed rsa-sha2-512 challenge must verify");
+        let a = v
+            .verify(&c)
+            .expect("a correctly-signed rsa-sha2-512 challenge must verify");
         assert_eq!(a.tenant, TenantId(TENANT.into()));
     }
 
@@ -1220,7 +1231,8 @@ mod tests {
             "not json".into(),
             "{}".into(),
             // valid JSON shape but bad base64 in the fields
-            serde_json::json!({"public_key":"!!!","signature":"!!!","challenge_id":"x"}).to_string(),
+            serde_json::json!({"public_key":"!!!","signature":"!!!","challenge_id":"x"})
+                .to_string(),
         ];
 
         // A challenge that exists, paired with structurally-broken wire blobs (so we reach the wire
@@ -1246,11 +1258,18 @@ mod tests {
         ));
         // Garbage bytes for both blobs.
         let ch3 = v.challenges().issue().unwrap();
-        cases.push(encode_ssh_credential_material(b"\x00\x01\x02", b"\xff\xfe", &ch3.id));
+        cases.push(encode_ssh_credential_material(
+            b"\x00\x01\x02",
+            b"\xff\xfe",
+            &ch3.id,
+        ));
 
         for (i, material) in cases.iter().enumerate() {
             let r = v.verify(&cred(material.clone()));
-            assert!(r.is_err(), "malformed case {i} must be refused (and must not panic)");
+            assert!(
+                r.is_err(),
+                "malformed case {i} must be refused (and must not panic)"
+            );
         }
     }
 
@@ -1273,13 +1292,19 @@ mod tests {
             "region": "us-east",
         })
         .to_string();
-        let a = v.verify(&cred(material)).expect("verifies on the real signature");
+        let a = v
+            .verify(&cred(material))
+            .expect("verifies on the real signature");
         assert_eq!(
             a.tenant,
             TenantId(TENANT.into()),
             "tenant is the REGISTERED binding's (acme), never the injected wrapper value (globex)"
         );
-        assert_eq!(a.region, Region(REGION.into()), "region is the binding's too");
+        assert_eq!(
+            a.region,
+            Region(REGION.into()),
+            "region is the binding's too"
+        );
     }
 
     /// (j) UNKNOWN CHALLENGE — a valid signature, but the credential names a challenge id the server
@@ -1291,7 +1316,11 @@ mod tests {
         let blob = key.pubkey_blob();
         // Sign SOME nonce, but reference a challenge id that was never issued.
         let sig_blob = key.sig_blob(&signed_payload(b"whatever"));
-        let c = cred(encode_ssh_credential_material(&blob, &sig_blob, "never-issued-id"));
+        let c = cred(encode_ssh_credential_material(
+            &blob,
+            &sig_blob,
+            "never-issued-id",
+        ));
         let err = v.verify(&c).unwrap_err();
         assert!(
             matches!(&err, AuthzError::FailClosed(m) if m.contains("unknown SSH challenge")),
@@ -1378,7 +1407,9 @@ mod tests {
             scheme: scheme::SAML.into(),
             material: "acme|eu-west|nameid-1".into(),
         };
-        let a = dispatch.verify(&saml).expect("SAML routes to the floor fallback");
+        let a = dispatch
+            .verify(&saml)
+            .expect("SAML routes to the floor fallback");
         assert_eq!(a.tenant, TenantId("acme".into()));
         assert_eq!(a.scheme, scheme::SAML);
     }
@@ -1399,7 +1430,11 @@ mod tests {
         // Seed S1: a principal in acme/eu-west, with the SSH fingerprint linked as its credential.
         let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
         let scope = TenantScope::from_verified_token(
-            &Principal::stub(PrincipalId("admin".into()), PrincipalKind::Human, TenantId(TENANT.into())),
+            &Principal::stub(
+                PrincipalId("admin".into()),
+                PrincipalKind::Human,
+                TenantId(TENANT.into()),
+            ),
             Region(REGION.into()),
         );
         store
@@ -1422,9 +1457,15 @@ mod tests {
         let c = signed_cred(&ssh_v, &blob, |m| key.sig_blob(m));
         let auth = HumanSsoAuthenticator::with_verifier(store, Arc::new(ssh_v));
 
-        let p = auth.authenticate(&c, None).expect("ssh challenge resolves the principal");
+        let p = auth
+            .authenticate(&c, None)
+            .expect("ssh challenge resolves the principal");
         assert_eq!(p.principal_id, PrincipalId("svc:deploy".into()));
-        assert_eq!(p.tenant, TenantId(TENANT.into()), "tenant from the registered key binding");
+        assert_eq!(
+            p.tenant,
+            TenantId(TENANT.into()),
+            "tenant from the registered key binding"
+        );
         assert_eq!(p.region, Region(REGION.into()));
         assert_eq!(p.kind, PrincipalKind::Service);
     }
@@ -1478,14 +1519,22 @@ mod tests {
 
         // REGISTRATION (SSH-key add): durably link the key fingerprint → principal.
         let bindings = PrincipalStoreKeyBindings::new(store.clone(), scope.clone());
-        let registered_fp = bindings.register_key(&blob, &PrincipalId("svc:deploy".into())).unwrap();
+        let registered_fp = bindings
+            .register_key(&blob, &PrincipalId("svc:deploy".into()))
+            .unwrap();
         assert_eq!(registered_fp, fp);
 
         // The verifier resolves the durable binding (NOT an in-memory KeyBindingIndex).
         let v = SshVerifier::with_resolver(Arc::new(bindings), ChallengeGuard::new(300));
         let c = signed_cred(&v, &blob, |m| key.sig_blob(m));
-        let a = v.verify(&c).expect("a correctly-signed challenge resolves the durable binding");
-        assert_eq!(a.tenant, TenantId(TENANT.into()), "tenant from the DURABLE binding");
+        let a = v
+            .verify(&c)
+            .expect("a correctly-signed challenge resolves the durable binding");
+        assert_eq!(
+            a.tenant,
+            TenantId(TENANT.into()),
+            "tenant from the DURABLE binding"
+        );
         assert_eq!(a.region, Region(REGION.into()));
         assert_eq!(a.subject_key, fp);
 
@@ -1496,7 +1545,9 @@ mod tests {
             ChallengeGuard::new(300),
         );
         let c2 = signed_cred(&fresh, &blob, |m| key.sig_blob(m));
-        let a2 = fresh.verify(&c2).expect("the durable binding survives a fresh verifier instance");
+        let a2 = fresh
+            .verify(&c2)
+            .expect("the durable binding survives a fresh verifier instance");
         assert_eq!(a2.subject_key, fp);
     }
 
@@ -1573,7 +1624,9 @@ mod tests {
         );
         let c = signed_cred(&v, &blob, |m| key.sig_blob(m));
         let auth = HumanSsoAuthenticator::with_verifier(store, Arc::new(v));
-        let p = auth.authenticate(&c, None).expect("durable ssh binding resolves the principal");
+        let p = auth
+            .authenticate(&c, None)
+            .expect("durable ssh binding resolves the principal");
         assert_eq!(p.principal_id, PrincipalId("svc:deploy".into()));
         assert_eq!(p.tenant, TenantId(TENANT.into()));
     }

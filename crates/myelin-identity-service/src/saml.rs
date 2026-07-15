@@ -323,7 +323,9 @@ fn parse_xml(xml: &str) -> Result<Element, AuthzError> {
             },
             Token::Text { text } => {
                 if let Some(parent) = stack.last_mut() {
-                    parent.children.push(Node::Text(unescape_xml(text.as_str())?));
+                    parent
+                        .children
+                        .push(Node::Text(unescape_xml(text.as_str())?));
                 }
                 // Text outside the root element is whitespace-only in practice; ignore it.
             }
@@ -559,7 +561,8 @@ fn canonicalize(
         match child {
             Node::Text(t) => push_text(out, t),
             Node::Element(c) => {
-                if skip_signature && c.local == "Signature" && child_ns_matches(c, &scope) == DS_NS {
+                if skip_signature && c.local == "Signature" && child_ns_matches(c, &scope) == DS_NS
+                {
                     continue; // the enveloped-signature transform removes the Signature subtree.
                 }
                 canonicalize(c, &scope, &child_rendered, skip_signature, out);
@@ -615,7 +618,12 @@ fn collect_by_id<'a>(el: &'a Element, id: &str, out: &mut Vec<&'a Element>) {
 
 /// Direct child elements (namespace-aware match), with the scope resolved at the parent so the caller
 /// can resolve the children's own names.
-fn child_named<'a>(parent: &'a Element, scope: &NsScope, ns: &str, local: &str) -> Option<&'a Element> {
+fn child_named<'a>(
+    parent: &'a Element,
+    scope: &NsScope,
+    ns: &str,
+    local: &str,
+) -> Option<&'a Element> {
     let mut s = scope.clone();
     for (p, u) in &parent.ns_decls {
         s.insert(p.clone(), u.clone());
@@ -729,7 +737,11 @@ impl SamlConfig {
     }
 
     /// Override the tenant/region attribute names (builder form).
-    pub fn with_attrs(mut self, tenant_attr: impl Into<String>, region_attr: impl Into<String>) -> SamlConfig {
+    pub fn with_attrs(
+        mut self,
+        tenant_attr: impl Into<String>,
+        region_attr: impl Into<String>,
+    ) -> SamlConfig {
         self.tenant_attr = tenant_attr.into();
         self.region_attr = region_attr.into();
         self
@@ -782,7 +794,9 @@ fn verify_xmldsig(
         (JwkKey::EcP256 { x, y }, SigMethod::EcdsaSha256) => {
             use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
             if x.len() != 32 || y.len() != 32 {
-                return Err(refuse("invalid P-256 trust-anchor coordinates (expected 32 bytes each)"));
+                return Err(refuse(
+                    "invalid P-256 trust-anchor coordinates (expected 32 bytes each)",
+                ));
             }
             // XML-DSig ECDSA SignatureValue is the IEEE-P1363 fixed `r‖s` (RFC 4051) — exactly what
             // ring's *_FIXED verifier expects. The SEC1 uncompressed point is `0x04 ‖ x ‖ y`.
@@ -914,9 +928,8 @@ impl CredentialVerifier for SamlVerifier {
         let (signature, sig_inherited) = signatures.remove(0);
         // The signature must be a DIRECT child of the one assertion (enveloped position).
         let sig_is_enveloped_child =
-            child_named(assertion, &assertion_inherited, DS_NS, "Signature").is_some_and(|c| {
-                std::ptr::eq(c as *const Element, signature as *const Element)
-            });
+            child_named(assertion, &assertion_inherited, DS_NS, "Signature")
+                .is_some_and(|c| std::ptr::eq(c as *const Element, signature as *const Element));
         if !sig_is_enveloped_child {
             return Err(refuse(
                 "XSW defence: the <ds:Signature> is not the enveloped direct child of the signed \
@@ -936,9 +949,14 @@ impl CredentialVerifier for SamlVerifier {
             s
         };
 
-        let c14n_method = child_named(signed_info, &signed_info_scope, DS_NS, "CanonicalizationMethod")
-            .and_then(algorithm)
-            .ok_or_else(|| refuse("SignedInfo has no CanonicalizationMethod"))?;
+        let c14n_method = child_named(
+            signed_info,
+            &signed_info_scope,
+            DS_NS,
+            "CanonicalizationMethod",
+        )
+        .and_then(algorithm)
+        .ok_or_else(|| refuse("SignedInfo has no CanonicalizationMethod"))?;
         match c14n_method {
             EXC_C14N => {}
             EXC_C14N_COMMENTS => {
@@ -959,12 +977,10 @@ impl CredentialVerifier for SamlVerifier {
         let method = match sig_alg {
             RSA_SHA256 => SigMethod::RsaSha256,
             ECDSA_SHA256 => SigMethod::EcdsaSha256,
-            other => {
-                return Err(refuse(format!(
-                    "unsupported/weak SignatureMethod `{other}` (only rsa-sha256 / ecdsa-sha256 are \
+            other => return Err(refuse(format!(
+                "unsupported/weak SignatureMethod `{other}` (only rsa-sha256 / ecdsa-sha256 are \
                      accepted — SHA-1 is rejected)"
-                )))
-            }
+            ))),
         };
 
         let references = children_named(signed_info, &signed_info_scope, DS_NS, "Reference");
@@ -1145,7 +1161,9 @@ impl CredentialVerifier for SamlVerifier {
         //      must list this SP. (Schema position: Conditions is a direct child of the assertion.)
         let now = self.now();
         let leeway = self.config.leeway_secs;
-        if let Some(conditions) = child_named(assertion, &assertion_inherited, SAML_NS, "Conditions") {
+        if let Some(conditions) =
+            child_named(assertion, &assertion_inherited, SAML_NS, "Conditions")
+        {
             let cond_scope = {
                 let mut s = assertion_inherited.clone();
                 for (p, u) in &assertion.ns_decls {
@@ -1374,8 +1392,8 @@ mod tests {
             use ring::rand::SystemRandom;
             use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
             let rng = SystemRandom::new();
-            let pkcs8 =
-                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).expect("ec keygen");
+            let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+                .expect("ec keygen");
             let pair =
                 EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
                     .expect("ec from pkcs8");
@@ -1390,7 +1408,11 @@ mod tests {
             }
         }
         fn sign(&self, msg: &[u8]) -> Vec<u8> {
-            self.pair.sign(&self.rng, msg).expect("ec sign").as_ref().to_vec()
+            self.pair
+                .sign(&self.rng, msg)
+                .expect("ec sign")
+                .as_ref()
+                .to_vec()
         }
     }
 
@@ -1541,7 +1563,9 @@ mod tests {
     #[test]
     fn positive_rsa_sha256_verifies_and_yields_trust_rooted_assertion() {
         let (v, doc) = rsa_signed("_assertion_1");
-        let a = v.verify(&cred(doc)).expect("a correctly-signed RSA-SHA256 assertion must verify");
+        let a = v
+            .verify(&cred(doc))
+            .expect("a correctly-signed RSA-SHA256 assertion must verify");
         assert_eq!(a.tenant, TenantId("acme".into()));
         assert_eq!(a.region, Region("eu-west".into()));
         assert_eq!(a.scheme, scheme::SAML);
@@ -1553,10 +1577,20 @@ mod tests {
         let signer = EcSigner::generate();
         let v = verifier(vec![signer.jwk()]);
         let doc = build_doc(
-            "_ec_1", ISSUER, "bob@acme.example", "acme", "eu-west", NB, NA, SP, ECDSA_SHA256,
+            "_ec_1",
+            ISSUER,
+            "bob@acme.example",
+            "acme",
+            "eu-west",
+            NB,
+            NA,
+            SP,
+            ECDSA_SHA256,
             &|m| signer.sign(m),
         );
-        let a = v.verify(&cred(doc)).expect("a correctly-signed ECDSA-SHA256 assertion must verify");
+        let a = v
+            .verify(&cred(doc))
+            .expect("a correctly-signed ECDSA-SHA256 assertion must verify");
         assert_eq!(a.tenant, TenantId("acme".into()));
         assert_eq!(a.subject_key, "bob@acme.example");
     }
@@ -1591,8 +1625,14 @@ mod tests {
              </saml:AttributeStatement></saml:Assertion></samlp:Response>",
         );
         let doc = finalize(raw, &|m| signer.sign(m));
-        let a = v.verify(&cred(doc)).expect("region-less assertion verifies with the fallback region");
-        assert_eq!(a.region, Region("ap-south".into()), "region from the configured IdP binding");
+        let a = v
+            .verify(&cred(doc))
+            .expect("region-less assertion verifies with the fallback region");
+        assert_eq!(
+            a.region,
+            Region("ap-south".into()),
+            "region from the configured IdP binding"
+        );
         assert_eq!(a.tenant, TenantId("acme".into()));
     }
 
@@ -1766,7 +1806,15 @@ mod tests {
         // Anchor = the victim IdP key; document signed by the attacker.
         let v = verifier(vec![victim.jwk()]);
         let doc = build_doc(
-            "_assertion_1", ISSUER, "attacker@globex.evil", "globex", "eu-west", NB, NA, SP, RSA_SHA256,
+            "_assertion_1",
+            ISSUER,
+            "attacker@globex.evil",
+            "globex",
+            "eu-west",
+            NB,
+            NA,
+            SP,
+            RSA_SHA256,
             &|m| attacker.sign(m),
         );
         let err = v.verify(&cred(doc)).unwrap_err();
@@ -1783,7 +1831,14 @@ mod tests {
         let signer = RsaSigner::generate();
         let v = verifier(vec![signer.jwk()]);
         let doc = build_doc(
-            "_assertion_1", ISSUER, "alice@acme.example", "acme", "eu-west", NB, NA, SP,
+            "_assertion_1",
+            ISSUER,
+            "alice@acme.example",
+            "acme",
+            "eu-west",
+            NB,
+            NA,
+            SP,
             "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
             &|m| signer.sign(m),
         );
@@ -1817,8 +1872,15 @@ mod tests {
         let signer = RsaSigner::generate();
         let v = verifier(vec![signer.jwk()]);
         let doc = build_doc(
-            "_assertion_1", ISSUER, "alice@acme.example", "acme", "eu-west",
-            "2000-01-01T00:00:00Z", "2000-01-02T00:00:00Z", SP, RSA_SHA256,
+            "_assertion_1",
+            ISSUER,
+            "alice@acme.example",
+            "acme",
+            "eu-west",
+            "2000-01-01T00:00:00Z",
+            "2000-01-02T00:00:00Z",
+            SP,
+            RSA_SHA256,
             &|m| signer.sign(m),
         );
         let err = v.verify(&cred(doc)).unwrap_err();
@@ -1834,8 +1896,15 @@ mod tests {
         let signer = RsaSigner::generate();
         let v = verifier(vec![signer.jwk()]);
         let doc = build_doc(
-            "_assertion_1", ISSUER, "alice@acme.example", "acme", "eu-west",
-            "2099-01-01T00:00:00Z", "2099-01-02T00:00:00Z", SP, RSA_SHA256,
+            "_assertion_1",
+            ISSUER,
+            "alice@acme.example",
+            "acme",
+            "eu-west",
+            "2099-01-01T00:00:00Z",
+            "2099-01-02T00:00:00Z",
+            SP,
+            RSA_SHA256,
             &|m| signer.sign(m),
         );
         let err = v.verify(&cred(doc)).unwrap_err();
@@ -1851,8 +1920,15 @@ mod tests {
         let signer = RsaSigner::generate();
         let v = verifier(vec![signer.jwk()]);
         let doc = build_doc(
-            "_assertion_1", ISSUER, "alice@acme.example", "acme", "eu-west", NB, NA,
-            "https://some-other-sp.example.com", RSA_SHA256,
+            "_assertion_1",
+            ISSUER,
+            "alice@acme.example",
+            "acme",
+            "eu-west",
+            NB,
+            NA,
+            "https://some-other-sp.example.com",
+            RSA_SHA256,
             &|m| signer.sign(m),
         );
         let err = v.verify(&cred(doc)).unwrap_err();
@@ -1868,8 +1944,15 @@ mod tests {
         let signer = RsaSigner::generate();
         let v = verifier(vec![signer.jwk()]);
         let doc = build_doc(
-            "_assertion_1", "https://evil-idp.example.com", "alice@acme.example", "acme", "eu-west",
-            NB, NA, SP, RSA_SHA256,
+            "_assertion_1",
+            "https://evil-idp.example.com",
+            "alice@acme.example",
+            "acme",
+            "eu-west",
+            NB,
+            NA,
+            SP,
+            RSA_SHA256,
             &|m| signer.sign(m),
         );
         let err = v.verify(&cred(doc)).unwrap_err();
@@ -1883,7 +1966,8 @@ mod tests {
     #[test]
     fn replayed_assertion_is_rejected() {
         let (v, doc) = rsa_signed("_assertion_replay");
-        v.verify(&cred(doc.clone())).expect("first presentation verifies");
+        v.verify(&cred(doc.clone()))
+            .expect("first presentation verifies");
         let err = v.verify(&cred(doc)).unwrap_err();
         assert!(
             matches!(&err, AuthzError::FailClosed(m) if m.contains("replay")),
@@ -1968,7 +2052,10 @@ mod tests {
         ];
         for (i, bad) in cases.iter().enumerate() {
             let r = v.verify(&cred(bad.clone()));
-            assert!(r.is_err(), "garbage case {i} must be refused (and must not panic): {bad:?}");
+            assert!(
+                r.is_err(),
+                "garbage case {i} must be refused (and must not panic): {bad:?}"
+            );
         }
     }
 
@@ -1996,7 +2083,10 @@ mod tests {
         );
         // And a normal shallow assertion still verifies (the bound never bites a real assertion).
         let (v2, ok) = rsa_signed("_assertion_depth_ok");
-        assert!(v2.verify(&cred(ok)).is_ok(), "a shallow assertion must still verify");
+        assert!(
+            v2.verify(&cred(ok)).is_ok(),
+            "a shallow assertion must still verify"
+        );
     }
 
     /// EMPTY / MISSING tenant — a verified assertion that carries no tenant attribute is refused (we never
@@ -2045,7 +2135,9 @@ mod tests {
             .route(scheme::SAML, Arc::new(v));
 
         // A correctly-signed SAML credential verifies through the real crypto verifier.
-        let a = dispatch.verify(&cred(doc)).expect("real SAML verifies via the dispatcher");
+        let a = dispatch
+            .verify(&cred(doc))
+            .expect("real SAML verifies via the dispatcher");
         assert_eq!(a.tenant, TenantId("acme".into()));
         assert_eq!(a.scheme, scheme::SAML);
 
@@ -2076,15 +2168,23 @@ mod tests {
             .with_clock(|| NOW)
             .with_replay_guard(guard);
         let doc = build_doc(
-            "_assertion_shared", ISSUER, "alice@acme.example", "acme", "eu-west", NB, NA, SP, RSA_SHA256,
+            "_assertion_shared",
+            ISSUER,
+            "alice@acme.example",
+            "acme",
+            "eu-west",
+            NB,
+            NA,
+            SP,
+            RSA_SHA256,
             &|m| signer.sign(m),
         );
-        v1.verify(&cred(doc.clone())).expect("first handle verifies");
+        v1.verify(&cred(doc.clone()))
+            .expect("first handle verifies");
         let err = v2.verify(&cred(doc)).unwrap_err();
         assert!(
             matches!(&err, AuthzError::FailClosed(m) if m.contains("replay")),
             "the shared guard must block a cross-handle replay, got {err:?}"
         );
     }
-
 }

@@ -337,8 +337,8 @@ fn verify_cose_signature(key: &CoseKey, msg: &[u8], sig: &[u8]) -> Result<(), Au
             let pubkey = RsaPublicKey::new(n_int, BigUint::from_bytes_be(e))
                 .map_err(|err| refuse(format!("invalid RSA COSE key: {err}")))?;
             let vk = VerifyingKey::<Sha256>::new(pubkey);
-            let signature =
-                Signature::try_from(sig).map_err(|_| refuse("malformed RS256 signature encoding"))?;
+            let signature = Signature::try_from(sig)
+                .map_err(|_| refuse("malformed RS256 signature encoding"))?;
             vk.verify(msg, &signature)
                 .map_err(|_| refuse("RS256 signature verification failed"))
         }
@@ -826,8 +826,11 @@ fn env_b64(v: &serde_json::Value, name: &str) -> Result<Vec<u8>, AuthzError> {
         .get(name)
         .and_then(|x| x.as_str())
         .ok_or_else(|| malformed(format!("WebAuthn envelope missing `{name}`")))?;
-    B64.decode(s.as_bytes())
-        .map_err(|e| malformed(format!("WebAuthn envelope `{name}` is not valid base64: {e}")))
+    B64.decode(s.as_bytes()).map_err(|e| {
+        malformed(format!(
+            "WebAuthn envelope `{name}` is not valid base64: {e}"
+        ))
+    })
 }
 
 // ================================================================================================
@@ -887,15 +890,20 @@ impl WebauthnVerifier {
         tenant: &TenantId,
         region: &Region,
     ) -> myelin_identity::Result<Vec<u8>> {
-        let env: serde_json::Value = serde_json::from_str(material.trim())
-            .map_err(|e| malformed(format!("malformed WebAuthn registration envelope JSON: {e}")))?;
+        let env: serde_json::Value = serde_json::from_str(material.trim()).map_err(|e| {
+            malformed(format!(
+                "malformed WebAuthn registration envelope JSON: {e}"
+            ))
+        })?;
         let raw_client_data = env_b64(&env, "client_data_json")?;
         let attestation_object = env_b64(&env, "attestation_object")?;
 
         // (1) clientDataJSON — type == webauthn.create, origin allowlisted, challenge consumed.
-        let _cd =
-            self.config
-                .validate_client_data(&raw_client_data, "webauthn.create", &self.challenges)?;
+        let _cd = self.config.validate_client_data(
+            &raw_client_data,
+            "webauthn.create",
+            &self.challenges,
+        )?;
         let client_data_hash = Sha256::digest(&raw_client_data);
 
         // (2) attestationObject CBOR → { fmt, authData, attStmt }. Total parse (malformed → refusal).
@@ -982,9 +990,8 @@ impl WebauthnVerifier {
                 let mut signed = Vec::with_capacity(auth_data_bytes.len() + client_data_hash.len());
                 signed.extend_from_slice(&auth_data_bytes);
                 signed.extend_from_slice(&client_data_hash);
-                verify_cose_signature(&cose_key, &signed, &sig).map_err(|_| {
-                    refuse("packed self-attestation signature verification failed")
-                })?;
+                verify_cose_signature(&cose_key, &signed, &sig)
+                    .map_err(|_| refuse("packed self-attestation signature verification failed"))?;
             }
             other => {
                 return Err(refuse(format!(
@@ -1201,7 +1208,11 @@ mod tests {
             ]))
         }
         fn sign(&self, msg: &[u8]) -> Vec<u8> {
-            self.pair.sign(&self.rng, msg).expect("ec sign").as_ref().to_vec()
+            self.pair
+                .sign(&self.rng, msg)
+                .expect("ec sign")
+                .as_ref()
+                .to_vec()
         }
     }
 
@@ -1346,7 +1357,11 @@ mod tests {
     }
 
     fn fresh_verifier() -> WebauthnVerifier {
-        WebauthnVerifier::new(config(), CredentialBindingIndex::new(), ChallengeGuard::new(300))
+        WebauthnVerifier::new(
+            config(),
+            CredentialBindingIndex::new(),
+            ChallengeGuard::new(300),
+        )
     }
 
     fn cred(material: String) -> Credential {
@@ -1397,7 +1412,9 @@ mod tests {
         let cred_id = b"cred-positive-001";
         let v = registered_none(&key, cred_id, 0);
         let c = signed_assertion(&v, &key, cred_id, FLAG_UP, 1);
-        let a = v.verify(&c).expect("a correctly-signed assertion must verify");
+        let a = v
+            .verify(&c)
+            .expect("a correctly-signed assertion must verify");
         assert_eq!(a.tenant, TenantId(TENANT.into()));
         assert_eq!(a.region, Region(REGION.into()));
         assert_eq!(a.scheme, scheme::PASSKEY);
@@ -1437,7 +1454,9 @@ mod tests {
         assert_eq!(v.registry().len(), 1);
         // A subsequent correct assertion verifies.
         let c = signed_assertion(&v, &key, cred_id, FLAG_UP, 1);
-        let a = v.verify(&c).expect("assertion after packed-self registration must verify");
+        let a = v
+            .verify(&c)
+            .expect("assertion after packed-self registration must verify");
         assert_eq!(a.subject_key, URL_SAFE_NO_PAD.encode(cred_id));
         assert_eq!(a.tenant, TenantId(TENANT.into()));
     }
@@ -1682,19 +1701,35 @@ mod tests {
         // (j1) Non-JSON / empty / missing-field envelopes.
         for bad in ["", "not json", "{}", r#"{"credential_id":"!!!"}"#] {
             let r = v.verify(&cred(bad.to_string()));
-            assert!(r.is_err(), "malformed envelope `{bad}` must be refused (not panic)");
+            assert!(
+                r.is_err(),
+                "malformed envelope `{bad}` must be refused (not panic)"
+            );
         }
 
         // (j2) A valid envelope whose authenticatorData is truncated (< 37 bytes).
         let challenge = v.challenges().issue().unwrap();
         let cd = client_data("webauthn.get", &challenge, ORIGIN);
-        let c = cred(encode_assertion_material(cred_id, &cd, b"\x00\x01\x02", b"sig"));
+        let c = cred(encode_assertion_material(
+            cred_id,
+            &cd,
+            b"\x00\x01\x02",
+            b"sig",
+        ));
         assert!(v.verify(&c).is_err(), "truncated authData must be refused");
 
         // (j3) A valid envelope whose clientDataJSON is garbage (not JSON).
         let ad = assertion_auth_data(RP_ID, FLAG_UP, 1);
-        let c = cred(encode_assertion_material(cred_id, b"\xff\xff not json", &ad, b"sig"));
-        assert!(v.verify(&c).is_err(), "garbage clientDataJSON must be refused");
+        let c = cred(encode_assertion_material(
+            cred_id,
+            b"\xff\xff not json",
+            &ad,
+            b"sig",
+        ));
+        assert!(
+            v.verify(&c).is_err(),
+            "garbage clientDataJSON must be refused"
+        );
 
         // (j4) A registration whose authData claims a HUGE credIdLen (length-prefix overrun) — the
         //      bounds-checked reader refuses it, never an out-of-bounds panic.
@@ -1751,7 +1786,9 @@ mod tests {
             "region": "us-east",
         })
         .to_string();
-        let a = v.verify(&cred(material)).expect("the assertion itself is valid");
+        let a = v
+            .verify(&cred(material))
+            .expect("the assertion itself is valid");
         assert_eq!(
             a.tenant,
             TenantId(TENANT.into()),
@@ -1792,13 +1829,21 @@ mod tests {
         let ad = registration_auth_data(RP_ID, FLAG_UP, 0, cred_id, &key.cose_key_cbor());
         // attStmt sig is by the ATTACKER, not the credential's own key — self-attestation must fail.
         let att = attestation_object_packed_self(&ad, &Sha256::digest(&cd), &attacker);
-        let r = v.register(&att_material(&cd, &att), &TenantId(TENANT.into()), &Region(REGION.into()));
+        let r = v.register(
+            &att_material(&cd, &att),
+            &TenantId(TENANT.into()),
+            &Region(REGION.into()),
+        );
         let err = r.unwrap_err();
         assert!(
             matches!(&err, AuthzError::FailClosed(m) if m.contains("self-attestation")),
             "an invalid packed self-attestation must be refused, got {err:?}"
         );
-        assert_eq!(v.registry().len(), 0, "no binding stored on a failed attestation");
+        assert_eq!(
+            v.registry().len(),
+            0,
+            "no binding stored on a failed attestation"
+        );
     }
 
     /// PACKED FULL (x5c present) — the X.509 attestation-cert chain path is DEFERRED; it must be REFUSED
@@ -1831,7 +1876,11 @@ mod tests {
             ),
             (Cbor::Text("authData".into()), cbytes(&ad)),
         ]));
-        let r = v.register(&att_material(&cd, &att), &TenantId(TENANT.into()), &Region(REGION.into()));
+        let r = v.register(
+            &att_material(&cd, &att),
+            &TenantId(TENANT.into()),
+            &Region(REGION.into()),
+        );
         let err = r.unwrap_err();
         assert!(
             matches!(&err, AuthzError::FailClosed(m) if m.contains("FULL attestation")),
@@ -1853,7 +1902,11 @@ mod tests {
             (Cbor::Text("attStmt".into()), Cbor::Map(vec![])),
             (Cbor::Text("authData".into()), cbytes(&ad)),
         ]));
-        let r = v.register(&att_material(&cd, &att), &TenantId(TENANT.into()), &Region(REGION.into()));
+        let r = v.register(
+            &att_material(&cd, &att),
+            &TenantId(TENANT.into()),
+            &Region(REGION.into()),
+        );
         let err = r.unwrap_err();
         assert!(
             matches!(&err, AuthzError::FailClosed(m) if m.contains("not supported")),
@@ -1947,7 +2000,9 @@ mod tests {
             scheme: scheme::SAML.into(),
             material: "acme|eu-west|nameid-1".into(),
         };
-        let a = dispatch.verify(&saml).expect("SAML routes to the floor fallback");
+        let a = dispatch
+            .verify(&saml)
+            .expect("SAML routes to the floor fallback");
         assert_eq!(a.tenant, TenantId("acme".into()));
         assert_eq!(a.scheme, scheme::SAML);
     }

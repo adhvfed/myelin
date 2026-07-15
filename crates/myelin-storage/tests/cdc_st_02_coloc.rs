@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, DataRole, EmitContextBase, EventDraft, EventType,
-    IdMinter, MonotonicMinter, Region, Relay, TenantId, Timestamp, Visibility,
+    IdMinter, MonotonicMinter, OutboxStore, Region, Relay, TenantId, Timestamp, Visibility,
 };
 use myelin_events::{BusTransport, InProcessBus};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -38,7 +38,8 @@ impl IssuesService {
             per_tenant_in_flight_cap: 4,
         };
         let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
-        let db = ColocatedOltp::open(config, minter).expect("co-located OLTP store opens");
+        let db = ColocatedOltp::open(config, OutboxStore::new(), minter)
+            .expect("co-located OLTP store opens");
         // The service's migration set co-locates the outbox table in the same DB (proven below).
         let migrations = ColocatedOltp::migrations(&["CREATE TABLE issue (id TEXT PRIMARY KEY);"]);
         assert!(
