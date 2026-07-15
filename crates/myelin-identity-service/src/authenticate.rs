@@ -333,13 +333,32 @@ impl HumanSsoAuthenticator {
     /// are `.route(...)`-injected from config at the composition boundary; until they are, the prod
     /// default refuses every credential rather than admit a forgeable plaintext envelope.
     pub fn production(store: PrincipalStore) -> HumanSsoAuthenticator {
-        use crate::oidc::SchemeDispatchVerifier;
-        HumanSsoAuthenticator::with_verifier(
-            store,
-            Arc::new(SchemeDispatchVerifier::new(Arc::new(
-                RefuseUnsupportedVerifier::new(),
-            ))),
-        )
+        HumanSsoAuthenticator::production_with_oidc(store, None)
+    }
+
+    /// **The production authenticator with REAL OIDC login wired (R2.5).** Builds the same
+    /// refuse-not-mock [`crate::oidc::SchemeDispatchVerifier`] as [`Self::production`], but when
+    /// `oidc` is `Some((config, jwks))` it ROUTES the OIDC scheme to the real
+    /// [`crate::oidc::OidcVerifier`] over the injected static JWKS — so a genuinely IdP-signed OIDC
+    /// ID token authenticates (tenant/region from the VERIFIED claims, never a path), while every
+    /// OTHER scheme (SAML/SCIM/passkey/SSH) still falls through to [`RefuseUnsupportedVerifier`]
+    /// (refuse-not-mock — no forgeable envelope, no mock crypto). When `oidc` is `None` the behaviour
+    /// is IDENTICAL to [`Self::production`]: every scheme, including OIDC, is refused (the IdP is not
+    /// configured — boot still succeeds; OIDC login is opt-in).
+    pub fn production_with_oidc(
+        store: PrincipalStore,
+        oidc: Option<(crate::oidc::OidcConfig, crate::oidc::JwkSet)>,
+    ) -> HumanSsoAuthenticator {
+        use crate::oidc::{OidcVerifier, SchemeDispatchVerifier};
+        let mut dispatch =
+            SchemeDispatchVerifier::new(Arc::new(RefuseUnsupportedVerifier::new()));
+        if let Some((config, jwks)) = oidc {
+            // The REAL OIDC verifier (RS256/ES256/EdDSA, alg-confusion + iss/aud/exp + replay
+            // defences) plugs into the SAME CredentialVerifier seam — the resolution/telemetry body
+            // is unchanged. SAML/SCIM/passkey/SSH keep the refuse-not-mock fallback.
+            dispatch = dispatch.route(scheme::OIDC, Arc::new(OidcVerifier::new(config, jwks)));
+        }
+        HumanSsoAuthenticator::with_verifier(store, Arc::new(dispatch))
     }
 
     /// Build the authenticator with an explicit [`CredentialVerifier`] (the seam the real
