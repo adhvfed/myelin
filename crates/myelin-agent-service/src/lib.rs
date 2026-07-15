@@ -89,6 +89,13 @@ pub mod dispatch_surge;
 /// ledger + a content-addressed trace per run (contract 1.8), the truth-up pass over every PROVEN
 /// Fabric row (AG-D1..AG-D11 + E2E-2), and the every-incident-adds-a-drill loop. The MOCK-runtime
 /// floor (the real LlmAgentRuntime swap is AG-P25) is named in [`dogfood::DOGFOOD_RUNTIME_FLOOR`].
+///
+/// **MR-009b W6b2 — `#[cfg(any(test, feature = "test-support"))]`:** this whole in-process dogfood
+/// drill module (the AG-P26 done-bar) constructs the now-`test-support`-gated in-memory
+/// `CostLedger::new` in its triage/fabric runners; nothing in the production graph references it, and
+/// its callers (`tests/ag_p26_dogfood_drill.rs`) reach it via the `myelin-agent-service/test-support`
+/// self dev-dependency.
+#[cfg(any(test, feature = "test-support"))]
 pub mod dogfood;
 pub mod dry_run;
 /// The Fabric's FULL `PersonalDataHolder` BODIES + the AG-D10 erasure fan-out (AG-P23 → P-479): the
@@ -146,6 +153,9 @@ pub use skeleton::{
 // engine — drives the already-shipped Fabric surface over the Myelin self-tenant (EI-01 §7). FLOOR:
 // the dogfood agents run on the MOCK runtime (DOGFOOD_RUNTIME_FLOOR); the real LlmAgentRuntime swap is
 // the named post-M5 follow-on AG-P25.
+// MR-009b W6b2 — the whole `dogfood` in-process drill module is `test-support`-gated (its runners build
+// the in-memory `CostLedger::new`); the entire re-export follows the same gate.
+#[cfg(any(test, feature = "test-support"))]
 pub use dogfood::{
     proven_fabric_rows, run_fabric_over_myelins_own_work, run_fabric_truth_up_scorecard,
     run_myelin_triage_on_ci_failure, FabricDogfoodArtifact, FabricIncident,

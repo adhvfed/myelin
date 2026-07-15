@@ -60,6 +60,10 @@ use crate::hitl::CardOutcome;
 // (and the whole-wedge aggregator below) is `test-support`-gated with it.
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_dsar;
+// MR-009b W6b2 — the E2E-2 flagship slice constructs the now-`test-support`-gated in-memory
+// `CostLedger::new`; the whole module is gated with it (its only caller, `run_chat_e2e_wedge` below,
+// is already `test-support`-gated; nothing in the production graph references it).
+#[cfg(any(test, feature = "test-support"))]
 pub mod e2e_flagship;
 pub mod e2e_pane;
 

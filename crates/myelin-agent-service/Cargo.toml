@@ -115,6 +115,10 @@ sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
+# MR-009b W6b2 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN test
+# targets (the `src/dogfood.rs` unit tests + `tests/ag_p26_dogfood_drill.rs`) that call the now-gated
+# dogfood/triage drills. The sanctioned Cargo idiom; it does NOT affect the normal `cargo build`.
+myelin-agent-service = { path = ".", features = ["test-support"] }
 # MR-009b Wave 3: enable `test-support` so this crate's DEV tests reach the events in-memory
 # `DedupLedger::new()` double (the durable `DedupLedger::durable` is the production default; the
 # in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
@@ -141,3 +145,9 @@ myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
 default = []
 # Pull the real Postgres client + compile the live-PG (tenant, region) RLS cross-tenant denial test.
 integration = ["dep:myelin-config", "dep:sqlx", "dep:tokio"]
+# MR-009b W6b2 — the `test-support` cargo feature. The dogfood/triage in-process drills
+# (`run_myelin_triage_on_ci_failure` → `run_fabric_over_myelins_own_work` →
+# `run_fabric_truth_up_scorecard`) construct the now-`test-support`-gated in-memory `CostLedger::new()`,
+# so they are gated behind `#[cfg(any(test, feature = "test-support"))]`. Forwards to
+# `myelin-storage/test-support` (the in-memory `CostLedger` double). DEV/TEST only.
+test-support = ["myelin-storage/test-support"]
