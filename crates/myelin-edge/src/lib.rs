@@ -82,7 +82,11 @@ pub mod server;
 pub mod session;
 pub mod sse;
 
+// R2.6: `AllowAll` is a TEST DOUBLE (gated like the in-memory store doubles) — the production
+// action authorizer is `AuthenticatedActionPolicy` over the `MOUNTED_EDGE_ACTIONS` allowlist.
+#[cfg(any(test, feature = "test-support"))]
 pub use authz::AllowAll;
+pub use authz::{AuthenticatedActionPolicy, MOUNTED_EDGE_ACTIONS};
 pub use catalogue::{
     page_envelope, Handler, HandlerCtx, Method, Page, API_VERSION, DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,

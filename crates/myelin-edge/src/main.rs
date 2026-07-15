@@ -7,15 +7,17 @@
 //! **Floors named (EI-01 §4):** the production composition root that injects the cell trust anchor +
 //! the seeded S1 principal store + the Identity-M1 authorizer (so real tokens authenticate against a
 //! real directory) is the MR-015+ wiring; here the binary boots a structurally-complete gateway over
-//! a freshly-generated cell authority + the refuse-not-mock human verifier + the `AllowAll` seam
-//! authorizer, with the `whoami` proof handler + an SSE stream registered. The OS-signal → graceful
+//! a freshly-generated cell authority + the refuse-not-mock human verifier + the R2.6
+//! `AuthenticatedActionPolicy` action gate (the explicit mounted-action allowlist — the `AllowAll`
+//! fixture is test-only now), with the `whoami` proof handler + an SSE stream registered. The OS-signal → graceful
 //! drain wiring lands with the rest of the transport. The bind address is `MYELIN_EDGE_ADDR` (default
 //! `127.0.0.1:8080`).
 
 use myelin_config::{Mode, MyelinConfig};
 use myelin_edge::{
-    register_git_durable, register_git_wire, serve_edge, AllowAll, CheckBackedRepoAuthorizer,
-    DurableGitBackend, Gateway, Method, TupleRepoBootstrap, WhoamiHandler,
+    register_git_durable, register_git_wire, serve_edge, AuthenticatedActionPolicy,
+    CheckBackedRepoAuthorizer, DurableGitBackend, Gateway, Method, TupleRepoBootstrap,
+    WhoamiHandler,
 };
 use myelin_events::OutboxStore;
 use myelin_identity::FragmentAdmit;
@@ -237,7 +239,13 @@ async fn main() {
             .with_repo_bootstrap(repo_bootstrap),
     );
 
-    let mut builder = Gateway::builder(authn, human_login, Arc::new(AllowAll))
+    // R2.6 — the action-level gate is a REAL policy, not the AllowAll fixture: an explicit
+    // allowlist of exactly the mounted edge action verbs (deny-by-default for any other action
+    // string; authn + tenant scope are enforced upstream by the gateway lifecycle, and per-OBJECT
+    // authz is the R2.1/R2.1a repo-authz layer wired above). `AllowAll` itself is now a
+    // test-support-gated double the production binary cannot construct, and the
+    // `no-permissive-authorizer-in-prod` scanner keeps it out of this composition root.
+    let mut builder = Gateway::builder(authn, human_login, Arc::new(AuthenticatedActionPolicy::mounted()))
         .route(
             Method::Get,
             "/v1/whoami",

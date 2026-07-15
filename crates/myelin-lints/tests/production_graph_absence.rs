@@ -33,6 +33,27 @@
 //!     subsystem stores this MR does not own (scope discipline).
 //!   - `no-bare-tenant-pool` → `myelin-storage` (the crate that owns the tenant RLS / pool
 //!     primitive; census SI-005 = `pg.rs`). MR-013 (P-531) hardens THIS live pool.
+//!   - `no-permissive-authorizer-in-prod` (R2.6) → `myelin-edge` ONLY. The `AllowAll` (action seam)
+//!     / `AllowAllRepos` (object seam) permissive fixtures are EDGE types; other crates carry
+//!     UNRELATED same-named fixtures for different traits, so the gate is crate-scoped and the
+//!     scanner is construction-shaped (`Arc::new(AllowAll…)` exactly — definitions/doc mentions/
+//!     `DenyAll*` never fire).
+//!
+//! ### `no-permissive-authorizer-in-prod` (1) — R2.6 flipped the ACTION-level `AllowAll` GREEN
+//! `main.rs:210`'s `Gateway::builder(authn, human_login, Arc::new(AllowAll))` is GONE: the
+//! production composition root wires `AuthenticatedActionPolicy::mounted()` — the explicit
+//! allowlist of the mounted edge action verbs (`MOUNTED_EDGE_ACTIONS`), deny-by-default for any
+//! unknown action + a degenerate principal shape — and `AllowAll` is now a
+//! `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLE the edge binary cannot construct
+//! (proven over real HTTP in `edge_action_policy_integration.rs`: every mounted route admitted,
+//! an unmounted action verb 403s, no token still 401s). The ONE surviving entry is the OBJECT-seam
+//! sibling: `git_durable.rs:117` — `DurableGitBackend::rooted`'s `repo_authz:
+//! Arc::new(AllowAllRepos)` field DEFAULT. Production `main.rs` ALWAYS overrides it
+//! (`.with_repo_authorizer(CheckBackedRepoAuthorizer)`, R2.1a), so it is LATENT, not live — but it
+//! is still a permissive construction a forgetful composition root could inherit, and its removal
+//! (injection-first / test-support-gating, the W3b.4 precedent) belongs to the PARALLEL R2.1
+//! object-authz item that owns `git_durable.rs`. That item deletes the entry when it lands (the
+//! ratchet tightens to a true zero).
 //!
 //! ## THE COMMITTED BASELINE MANIFEST (the current known-shortcut sites + their fixing MR/SI)
 //! Each entry: `crate/path/file.rs:line — <scanner> — removed by MR-0XX (SI-0YY / P-NNN)`.
@@ -290,8 +311,9 @@
 //!   (test infrastructure, not the tenant store handing out its pool). No named exclusion was needed.
 
 use myelin_lints::production_graph::{
-    no_bare_tenant_pool, no_in_memory_durable_store, no_structural_crypto_in_prod,
-    production_graph_absence_scanners, PRODUCTION_GRAPH_ABSENCE_SCANNERS,
+    no_bare_tenant_pool, no_in_memory_durable_store, no_permissive_authorizer_in_prod,
+    no_structural_crypto_in_prod, production_graph_absence_scanners,
+    PRODUCTION_GRAPH_ABSENCE_SCANNERS,
 };
 use myelin_lints::{Lint, LintId};
 use std::path::{Path, PathBuf};
@@ -334,16 +356,23 @@ fn matrix() -> Vec<Row> {
             red: "no_bare_tenant_pool.red.rs.txt",
             green: "no_bare_tenant_pool.green.rs.txt",
         },
+        Row {
+            lint: no_permissive_authorizer_in_prod,
+            id: LintId("no-permissive-authorizer-in-prod"),
+            red: "no_permissive_authorizer_in_prod.red.rs.txt",
+            green: "no_permissive_authorizer_in_prod.green.rs.txt",
+        },
     ]
 }
 
 #[test]
-fn the_matrix_covers_exactly_the_three_scanners() {
+fn the_matrix_covers_exactly_the_four_scanners() {
     let rows = matrix();
     assert_eq!(
         rows.len(),
-        3,
-        "the matrix must cover all three absence scanners"
+        4,
+        "the matrix must cover all four absence scanners (the R2.6 permissive-authorizer \
+         scanner appended to the original three)"
     );
     let ids: Vec<LintId> = rows.iter().map(|r| r.id).collect();
     assert_eq!(ids, PRODUCTION_GRAPH_ABSENCE_SCANNERS.to_vec());
@@ -478,6 +507,14 @@ fn gates() -> Vec<Gate> {
         Gate {
             lint: no_bare_tenant_pool,
             scope: &["crates/myelin-storage/"], // the tenant-pool primitive owner (SI-005; MR-013).
+        },
+        Gate {
+            // R2.6: the permissive-authorizer scanner is scoped to the EDGE crate (the only crate
+            // whose `AllowAll`/`AllowAllRepos` are the gateway/wire authorizer fixtures). Other
+            // crates' same-named types are UNRELATED fixtures for different traits — the crate
+            // scope + the exact `Arc::new(AllowAll…)` construction shape keep them out.
+            lint: no_permissive_authorizer_in_prod,
+            scope: &["crates/myelin-edge/"],
         },
     ]
 }
@@ -719,6 +756,27 @@ const BASELINE: &[(&str, &str, usize)] = &[
     // reset-on-release pool) and replaced the bare pool hatch with `PgStore::health_check()`. The
     // `no-bare-tenant-pool` scanner is now GREEN over the production tree (census SI-005 closed). No
     // named exclusion was needed — a real tenant store does not dodge the lint.
+    // ---- no-permissive-authorizer-in-prod (1) — R2.6 removed the ACTION-level AllowAll ----
+    // R2.6 flipped the edge ACTION gate GREEN: `main.rs`'s `Gateway::builder(.., Arc::new(AllowAll))`
+    // is GONE — the production composition root wires the explicit `AuthenticatedActionPolicy`
+    // mounted-action allowlist (deny-by-default outside `MOUNTED_EDGE_ACTIONS`), and `AllowAll`
+    // itself is a `#[cfg(any(test, feature = "test-support"))]` test double the binary cannot
+    // construct. The R2.6 deliverable — the action-level permissive-authorizer set — is at ZERO.
+    // The single SURVIVING entry is the OBJECT-seam sibling:
+    (
+        // `DurableGitBackend::rooted`'s field DEFAULT `repo_authz: Arc::new(AllowAllRepos)` — a
+        // LATENT permissive object authorizer (production `main.rs` ALWAYS overrides it via
+        // `.with_repo_authorizer(CheckBackedRepoAuthorizer)` since R2.1a, but a composition root
+        // that forgot the override would silently serve an allow-everything git wire). Its removal
+        // (injection-first constructor / test-support-gating the default, the W3b.4 precedent)
+        // belongs to the PARALLEL R2.1 object-authz item that owns `git_durable.rs` — R2.6 does not
+        // touch that file. When R2.1 lands its flip, this entry is DELETED (the ratchet tightens to
+        // a true zero) — and until then any NEW `Arc::new(AllowAll…)` construction anywhere in the
+        // edge production graph still fails this gate loudly.
+        "no-permissive-authorizer-in-prod",
+        "crates/myelin-edge/src/git_durable.rs",
+        117,
+    ),
 ];
 
 fn workspace_root() -> PathBuf {
@@ -805,8 +863,10 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
     // un-wired gate). The counts pin the manifest shape.
     assert_eq!(
         BASELINE.len(),
-        1,
-        "the committed baseline has 1 entry — the CI runner-attestation structural floor ONLY: \
+        2,
+        "the committed baseline has 2 entries — the CI runner-attestation structural floor + the \
+         R2.1-owned `AllowAllRepos` object-seam builder default (git_durable.rs; the R2.6 \
+         ACTION-level permissive set is ZERO — main.rs wires `AuthenticatedActionPolicy`): \
          the `no-in-memory-durable-store` set is EMPTY (R1 EXIT). (MR-009b Wave 2 flipped the 3 identity spine stores \
          GREEN: 17 → 14; Wave 3 flipped the events `DedupLedger` (SI-023) → 14 → 13; Wave 5 flipped \
          the `KmsEngine` (SI-006) → 13 → 12; Wave 6a flipped the 2 identity S2 pseudonym holders → \
@@ -837,6 +897,10 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
     let bare_pool = BASELINE
         .iter()
         .filter(|(s, ..)| *s == "no-bare-tenant-pool")
+        .count();
+    let permissive = BASELINE
+        .iter()
+        .filter(|(s, ..)| *s == "no-permissive-authorizer-in-prod")
         .count();
     assert_eq!(
         structural, 1,
@@ -894,6 +958,17 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          `PgStore::pool() -> &PgPool` hatch is REMOVED (replaced by `health_check()`). The scanner \
          is GREEN over the production tree."
     );
+    assert_eq!(
+        permissive, 1,
+        "1 permissive-authorizer site remains, and it is the OBJECT-seam sibling only: R2.6 \
+         removed the ACTION-level `Arc::new(AllowAll)` from the edge composition root (main.rs \
+         wires the explicit `AuthenticatedActionPolicy` mounted-action allowlist; `AllowAll` is a \
+         test-support-gated double). The surviving entry is `DurableGitBackend::rooted`'s \
+         `repo_authz: Arc::new(AllowAllRepos)` field DEFAULT — always overridden by main.rs since \
+         R2.1a but still a latent permissive construction — owned by the parallel R2.1 \
+         object-authz item (git_durable.rs is its file); its flip deletes the entry and takes \
+         this scanner to a true zero."
+    );
     // The census-named anchor sites are present (the prompt's hard requirements).
     let has = |s: &str, p: &str, l: usize| BASELINE.contains(&(s, p, l));
     // MR-012 flipped the former auth-spine anchor (authenticate.rs:289) GREEN; the surviving
@@ -927,6 +1002,24 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
         ),
         "the former anchors pg.rs:413 (session-scoped set_config) + pg.rs:150 (bare pool() hatch) \
          were flipped GREEN by MR-013 and must NOT remain in the baseline (the ratchet tightened)"
+    );
+    // R2.6 anchors: the surviving permissive entry is EXACTLY the R2.1-owned object-seam default,
+    // and the flipped action-level main.rs site must NOT be (re)normalized into the manifest.
+    assert!(
+        has(
+            "no-permissive-authorizer-in-prod",
+            "crates/myelin-edge/src/git_durable.rs",
+            117
+        ),
+        "anchor git_durable.rs:117 (the `AllowAllRepos` builder default, owned by the parallel \
+         R2.1 object-authz item) must be in the baseline until that item flips it"
+    );
+    assert!(
+        !BASELINE.iter().any(|(s, p, _)| *s == "no-permissive-authorizer-in-prod"
+            && *p == "crates/myelin-edge/src/main.rs"),
+        "main.rs was flipped GREEN by R2.6 (AuthenticatedActionPolicy replaced AllowAll) and must \
+         NOT appear in the baseline — a re-added Arc::new(AllowAll) there fails the ratchet, not \
+         the manifest"
     );
 }
 

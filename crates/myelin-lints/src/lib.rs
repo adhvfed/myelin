@@ -129,9 +129,10 @@ pub use coverage::{
 
 pub use engine::{Lint, LintId, Violation};
 pub use production_graph::{
-    no_bare_tenant_pool, no_in_memory_durable_store, no_structural_crypto_in_prod,
-    production_graph_absence_scanners, NO_BARE_TENANT_POOL, NO_IN_MEMORY_DURABLE_STORE,
-    NO_STRUCTURAL_CRYPTO_IN_PROD, PRODUCTION_GRAPH_ABSENCE_SCANNERS,
+    no_bare_tenant_pool, no_in_memory_durable_store, no_permissive_authorizer_in_prod,
+    no_structural_crypto_in_prod, production_graph_absence_scanners, NO_BARE_TENANT_POOL,
+    NO_IN_MEMORY_DURABLE_STORE, NO_PERMISSIVE_AUTHORIZER_IN_PROD, NO_STRUCTURAL_CRYPTO_IN_PROD,
+    PRODUCTION_GRAPH_ABSENCE_SCANNERS,
 };
 pub use lints::{
     all_twelve, control_plane_pii_free, flow_determinism, forward_only_migration,

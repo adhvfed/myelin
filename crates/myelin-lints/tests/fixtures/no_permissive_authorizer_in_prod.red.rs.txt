@@ -1,0 +1,18 @@
+// RED fixture — `no-permissive-authorizer-in-prod` (R2.6).
+// A production composition root constructing the permissive allow-everything authorizer fixtures
+// OUTSIDE any test gate: the action-level `AllowAll` handed to the gateway builder, and the
+// per-repo `AllowAllRepos` wired as a backend default. Both must fire.
+
+fn boot_edge() {
+    let gateway = Gateway::builder(authn, human_login, Arc::new(AllowAll))
+        .route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler))
+        .build();
+    serve(gateway);
+}
+
+fn rooted_backend() -> DurableGitBackend {
+    DurableGitBackend {
+        repo_authz: Arc::new(AllowAllRepos),
+        bootstrap: Arc::new(NoRepoBootstrap),
+    }
+}
