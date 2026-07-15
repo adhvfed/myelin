@@ -13,6 +13,12 @@ publish = false
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
 myelin-events = { path = "../myelin-events" }
+# R2.2: the EventMatcher keys the envelope subject through the ONE canonical type-qualified
+# object-key grammar (`myelin_refs::object_key`) — the same function the identity check engine
+# keys tuples with — so a same-trailing-id, different-type/tenant subject is structurally
+# unmatched. refs sits beside query in the mid-tier (it depends only on identity + events and
+# does NOT depend on query), so this edge is acyclic.
+myelin-refs = { path = "../myelin-refs" }
 serde.workspace = true
 # The EventMatcher (matcher.rs, P-137) projects the EventEnvelope's `payload`
 # (`serde_json::Value`) into the bounded interpreter's variable namespace, so serde_json is a
