@@ -225,22 +225,31 @@ impl AclFilter {
         AclFilter::NotIds(ids.into_iter().map(Into::into).collect())
     }
 
-    /// **Does this filter ADMIT `doc_id`?** The predicate the vector path evaluates DURING traversal
-    /// (filter-during-traversal, §4.2.2) so the top-k are k VISIBLE neighbours, never k-then-filtered.
-    /// It is the exact set semantics the posting-list-level [`TantivyBackend::acl_query`] lowers — the
-    /// SAME predicate fed into the HNSW traversal as into the FT/structured pre-filter (one ACL
-    /// meaning, no drift). `All` admits all; `None` admits nothing; `Ids` is membership; `NotIds` is
-    /// the complement; `And`/`Or`/`Not` compose recursively.
-    pub fn admits(&self, doc_id: &str) -> bool {
+    /// **Does this filter ADMIT a doc identified by (`doc_id`, `acl_object`)?** The predicate the
+    /// vector path evaluates DURING traversal (filter-during-traversal, §4.2.2) so the top-k are k
+    /// VISIBLE neighbours, never k-then-filtered. It is the exact set semantics the posting-list-level
+    /// [`TantivyBackend::acl_query`] lowers — the SAME predicate fed into the HNSW traversal as into
+    /// the FT/structured pre-filter (one ACL meaning, no drift).
+    ///
+    /// **`Ids`/`NotIds` match `doc_id` OR `acl_object`** — a doc is in the (allow/deny) set if EITHER
+    /// identifier is a member, mirroring [`TantivyBackend::acl_clause`]'s two-field term set exactly.
+    /// This is load-bearing for sub-artifact docs, whose `doc_id` is `#sub`-precise while the ACL pins
+    /// on the `#sub`-stripped parent `acl_object`: a grant on the parent admits the sub-doc's vector,
+    /// and a deny on the parent excludes it — identically on the vector path and the lexical path (no
+    /// cross-path ACL drift; the R2.7 fix). `All` admits all; `None` admits nothing; `Ids` is
+    /// membership; `NotIds` is the complement; `And`/`Or`/`Not` compose recursively.
+    pub fn admits(&self, doc_id: &str, acl_object: &str) -> bool {
         match self {
             AclFilter::All => true,
             AclFilter::None => false,
-            AclFilter::Ids(ids) => ids.iter().any(|i| i == doc_id),
-            AclFilter::NotIds(ids) => !ids.iter().any(|i| i == doc_id),
-            AclFilter::And(subs) => subs.iter().all(|s| s.admits(doc_id)),
+            AclFilter::Ids(ids) => ids.iter().any(|i| i == doc_id || i == acl_object),
+            AclFilter::NotIds(ids) => !ids.iter().any(|i| i == doc_id || i == acl_object),
+            AclFilter::And(subs) => subs.iter().all(|s| s.admits(doc_id, acl_object)),
             // An empty `Or` (no sub-clause) admits nothing (the union identity — ∅).
-            AclFilter::Or(subs) => !subs.is_empty() && subs.iter().any(|s| s.admits(doc_id)),
-            AclFilter::Not(inner) => !inner.admits(doc_id),
+            AclFilter::Or(subs) => {
+                !subs.is_empty() && subs.iter().any(|s| s.admits(doc_id, acl_object))
+            }
+            AclFilter::Not(inner) => !inner.admits(doc_id, acl_object),
         }
     }
 }
@@ -709,6 +718,10 @@ impl TantivyBackend {
             (Some(embedding), Some(model_ref)) => {
                 self.vectors.upsert(crate::vector::VectorRecord {
                     doc_id: doc.doc_id.clone(),
+                    // Thread the ACL pre-filter key onto the vector so filter-during-traversal can
+                    // match `doc_id` OR `acl_object` exactly like the lexical posting-list clause
+                    // (R2.7 — no cross-path ACL drift for a sub-artifact doc).
+                    acl_object: doc.acl_object.clone(),
                     embedding: embedding.clone(),
                     model_ref: model_ref.clone(),
                 })?;
@@ -1015,16 +1028,19 @@ impl IndexBackend for TantivyBackend {
             // Admin: every live vector is visible — k-NN over the whole HNSW shape.
             AclFilter::All => self.vectors.knn(query, k),
             // FILTER-DURING-TRAVERSAL (§4.2.2 / SRCH-P11 building block): a candidate enters the
-            // result set ONLY if the ACL filter ADMITS its doc_id, so the top-k are k VISIBLE
-            // neighbours, never k-then-filtered. The predicate is keyed by `doc_id` (the
-            // one-doc-id-space key) and is the SAME set semantics the FT/structured posting-list
-            // pre-filter lowers — including the SRCH-P09 relational `Ids` (the resolved reverse-index
-            // visible-id set) and the `And`/`Or`/`Not` boolean composition. The hidden nearest
-            // neighbour (under ANY branch of the boolean tree) never enters the candidate set (no
-            // count/rank leak through the vector/RAG path — the SRCH-D1 vector half).
+            // result set ONLY if the ACL filter ADMITS it, so the top-k are k VISIBLE neighbours,
+            // never k-then-filtered. The predicate matches `doc_id` OR `acl_object` (the two-field
+            // membership the FT/structured posting-list pre-filter lowers — R2.7: a sub-artifact doc
+            // whose ACL pins on its parent is admitted/denied identically on the vector path) —
+            // including the SRCH-P09 relational `Ids` (the resolved reverse-index visible-id set) and
+            // the `And`/`Or`/`Not` boolean composition. The hidden nearest neighbour (under ANY
+            // branch of the boolean tree) never enters the candidate set (no count/rank leak through
+            // the vector/RAG path — the SRCH-D1 vector half).
             _ => self
                 .vectors
-                .knn_filtered(query, k, |doc_id| acl_filter.admits(doc_id)),
+                .knn_filtered(query, k, |doc_id, acl_object| {
+                    acl_filter.admits(doc_id, acl_object)
+                }),
         };
         Ok(hits)
     }
@@ -1718,27 +1734,59 @@ mod tests {
     /// traversal as into the FT pre-filter (no drift).**
     #[test]
     fn acl_filter_admits_matches_set_semantics() {
-        assert!(AclFilter::All.admits("x"));
-        assert!(!AclFilter::None.admits("x"));
-        assert!(AclFilter::ids(["x"]).admits("x") && !AclFilter::ids(["y"]).admits("x"));
-        assert!(!AclFilter::not_ids(["x"]).admits("x") && AclFilter::not_ids(["y"]).admits("x"));
-        // And: every sub admits; Or: at least one; Not: the complement.
-        assert!(AclFilter::And(vec![AclFilter::All, AclFilter::ids(["x"])]).admits("x"));
-        assert!(!AclFilter::And(vec![AclFilter::None, AclFilter::All]).admits("x"));
-        assert!(AclFilter::Or(vec![AclFilter::None, AclFilter::ids(["x"])]).admits("x"));
+        // The common case: doc_id == acl_object (a root doc). Both identifiers agree.
+        assert!(AclFilter::All.admits("x", "x"));
+        assert!(!AclFilter::None.admits("x", "x"));
+        assert!(AclFilter::ids(["x"]).admits("x", "x") && !AclFilter::ids(["y"]).admits("x", "x"));
         assert!(
-            !AclFilter::Or(vec![]).admits("x"),
+            !AclFilter::not_ids(["x"]).admits("x", "x")
+                && AclFilter::not_ids(["y"]).admits("x", "x")
+        );
+        // And: every sub admits; Or: at least one; Not: the complement.
+        assert!(AclFilter::And(vec![AclFilter::All, AclFilter::ids(["x"])]).admits("x", "x"));
+        assert!(!AclFilter::And(vec![AclFilter::None, AclFilter::All]).admits("x", "x"));
+        assert!(AclFilter::Or(vec![AclFilter::None, AclFilter::ids(["x"])]).admits("x", "x"));
+        assert!(
+            !AclFilter::Or(vec![]).admits("x", "x"),
             "empty Or admits nothing"
         );
         // A NON-EMPTY Or whose every sub-clause REJECTS the doc admits nothing (kills the `&&`→`||`
         // mutant: `!is_empty() || any` would wrongly admit here, `!is_empty() && any` correctly does
         // not).
         assert!(
-            !AclFilter::Or(vec![AclFilter::ids(["y"]), AclFilter::None]).admits("x"),
+            !AclFilter::Or(vec![AclFilter::ids(["y"]), AclFilter::None]).admits("x", "x"),
             "a non-empty Or whose subs all reject the doc admits nothing"
         );
-        assert!(AclFilter::Not(Box::new(AclFilter::ids(["y"]))).admits("x"));
-        assert!(!AclFilter::Not(Box::new(AclFilter::All)).admits("x"));
+        assert!(AclFilter::Not(Box::new(AclFilter::ids(["y"]))).admits("x", "x"));
+        assert!(!AclFilter::Not(Box::new(AclFilter::All)).admits("x", "x"));
+
+        // R2.7 — doc_id ≠ acl_object (a sub-artifact doc: doc_id `sub`, acl_object `parent`). The
+        // membership matches EITHER identifier, mirroring the lexical clause's two-field term set.
+        // Allow-set via the acl_object (parent) arm — the doc_id itself is NOT in the set.
+        assert!(
+            AclFilter::ids(["parent"]).admits("sub", "parent"),
+            "a grant on the parent acl_object admits the sub-doc (acl_object arm)"
+        );
+        // Allow-set via the doc_id (sub-precise) arm — the acl_object is NOT in the set.
+        assert!(
+            AclFilter::ids(["sub"]).admits("sub", "parent"),
+            "a grant on the sub-precise doc_id admits it (doc_id arm)"
+        );
+        // Neither identifier in the set ⇒ not admitted.
+        assert!(!AclFilter::ids(["other"]).admits("sub", "parent"));
+        // Deny-set BOTH directions: a deny on the parent acl_object excludes the sub-doc (the leak
+        // direction — fails red pre-fix, where NotIds only checked doc_id); a deny on the doc_id
+        // also excludes it (the doc_id arm stays enforced).
+        assert!(
+            !AclFilter::not_ids(["parent"]).admits("sub", "parent"),
+            "a deny on the parent acl_object excludes the sub-doc (no leak — R2.7)"
+        );
+        assert!(
+            !AclFilter::not_ids(["sub"]).admits("sub", "parent"),
+            "a deny on the sub-precise doc_id excludes it (doc_id arm)"
+        );
+        // A deny that names NEITHER identifier does not exclude.
+        assert!(AclFilter::not_ids(["other"]).admits("sub", "parent"));
     }
 
     /// **The `IndexError` Display message is non-empty and names the engine error (the loud, never

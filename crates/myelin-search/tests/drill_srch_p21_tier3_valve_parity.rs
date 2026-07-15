@@ -445,7 +445,7 @@ fn valve_carries_the_boards_own_filter_not_a_recomputation() {
     let canonical = AclFilter::ids([VISIBLE_A, VISIBLE_B]);
     for row in board_candidate_rows() {
         assert_eq!(
-            canonical.admits(&row),
+            canonical.admits(&row, &row),
             valve.contains(&row),
             "the valve admits exactly the rows the board's own filter admits ({row})"
         );

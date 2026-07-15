@@ -190,8 +190,12 @@ pub fn measure_recall_at_k(
         let truth: Vec<&str> = scored.iter().take(k).map(|(_, id)| *id).collect();
         expected_hits += truth.len() as u64;
 
-        // The filtered-ANN result over the LIVE index (the production code path).
-        let hits = index.knn_filtered(q, k, &visible);
+        // The filtered-ANN result over the LIVE index (the production code path). The recall harness
+        // is keyed on `doc_id` (the corpus is `(doc_id, embedding)` — no acl_object), so it adapts to
+        // the two-field predicate by matching on the `doc_id` arm (the acl_object is ignored here; the
+        // acl_object membership is exercised by the engine/vector ACL-parity tests, not the recall
+        // measurement).
+        let hits = index.knn_filtered(q, k, |doc_id, _acl_object| visible(doc_id));
         for h in &hits {
             // Any returned doc that is NOT visible is an ESCAPE (a leak) — contract 1.8 zero-escape.
             if !visible(&h.doc_id) {
@@ -523,6 +527,7 @@ mod tests {
             corpus.push((format!("d{i}"), e.clone()));
             idx.upsert(VectorRecord {
                 doc_id: format!("d{i}"),
+                acl_object: format!("d{i}"),
                 embedding: e,
                 model_ref: ModelRef("m@1".into()),
             })

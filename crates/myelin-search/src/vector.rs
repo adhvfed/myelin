@@ -155,6 +155,13 @@ pub struct VectorRecord {
     /// The primary key — the SAME `doc_id` the FT/structured shapes key on (§3.2). A vector hit and
     /// a keyword hit with this `doc_id` are the SAME document.
     pub doc_id: String,
+    /// The **ACL pre-filter key** — the `acl_object` the ACL filter pins on (§3.1), the SAME field
+    /// the FT/structured posting-list clause ([`crate::engine::TantivyBackend::acl_clause`]) matches
+    /// as its second term alongside `doc_id`. Usually equal to `doc_id`; for a sub-artifact doc it is
+    /// the `#sub`-stripped parent, so the vector path's [`crate::engine::AclFilter::admits`] matches
+    /// `doc_id` OR `acl_object` exactly like the lexical clause (no cross-path ACL drift). Carried on
+    /// the vector so the filter-during-traversal predicate has the second identifier available.
+    pub acl_object: String,
     /// The dense embedding.
     pub embedding: Embedding,
     /// The model that produced the embedding — a model swap is a re-embed reindex (§3.3).
@@ -464,7 +471,7 @@ impl HnswVectorIndex {
     /// ACL-/predicate-filtered form ([`knn_filtered`](Self::knn_filtered)) is the building block
     /// SRCH-P11 lowers the ACL set into (filter-during-traversal — named floor).
     pub fn knn(&self, query: &Embedding, k: usize) -> Vec<VectorHit> {
-        self.knn_filtered(query, k, |_| true)
+        self.knn_filtered(query, k, |_, _| true)
     }
 
     /// **Filter-during-traversal k-NN** (§4.5 / §4.2.2 / SRCH-P11): the greedy graph descent with the
@@ -484,11 +491,17 @@ impl HnswVectorIndex {
     /// HNSW↔IVF-PQ promotion point is the M5 strategy (SRCH-P26 / drill D8 — named floor). The fall
     /// back is correctness, not speed: a wrong (graph-missed) recall under a selective ACL filter
     /// would silently DROP a visible nearest neighbour, never leak a hidden one.
+    /// **The visibility predicate is `visible(doc_id, acl_object)`** — BOTH identifiers, so the ACL
+    /// filter admits a candidate if EITHER its `doc_id` OR its `acl_object` is in the allow-set (and
+    /// the negation for a deny-set), exactly mirroring the lexical/structured posting-list clause's
+    /// two-field term set ([`crate::engine::TantivyBackend::acl_clause`]). A sub-artifact doc whose
+    /// ACL pins on its `#sub`-stripped parent is therefore admitted/denied identically on the vector
+    /// path and the FT path (no cross-path ACL drift).
     pub fn knn_filtered(
         &self,
         query: &Embedding,
         k: usize,
-        visible: impl Fn(&str) -> bool,
+        visible: impl Fn(&str, &str) -> bool,
     ) -> Vec<VectorHit> {
         let entry = match self.entry {
             None => return Vec::new(),
@@ -513,8 +526,8 @@ impl HnswVectorIndex {
             if node.tombstoned {
                 continue; // soft-deleted ⇒ never surfaces (defence in depth; search_layer also skips)
             }
-            if !visible(&node.record.doc_id) {
-                continue; // ACL / predicate filter during traversal
+            if !visible(&node.record.doc_id, &node.record.acl_object) {
+                continue; // ACL / predicate filter during traversal (doc_id OR acl_object)
             }
             hits.push(VectorHit {
                 doc_id: node.record.doc_id.clone(),
@@ -541,10 +554,10 @@ impl HnswVectorIndex {
     /// Count the **live, visible** vectors (tombstoned excluded, `visible(doc_id)` held). The
     /// fallback trigger reads this: if the graph walk returned fewer than this AND fewer than `k`,
     /// a visible neighbour was missed and the brute-force pass recovers the true k-nearest.
-    fn visible_live_count(&self, visible: &impl Fn(&str) -> bool) -> usize {
+    fn visible_live_count(&self, visible: &impl Fn(&str, &str) -> bool) -> usize {
         self.nodes
             .iter()
-            .filter(|n| !n.tombstoned && visible(&n.record.doc_id))
+            .filter(|n| !n.tombstoned && visible(&n.record.doc_id, &n.record.acl_object))
             .count()
     }
 
@@ -557,12 +570,12 @@ impl HnswVectorIndex {
         &self,
         query: &Embedding,
         k: usize,
-        visible: &impl Fn(&str) -> bool,
+        visible: &impl Fn(&str, &str) -> bool,
     ) -> Vec<VectorHit> {
         let mut scored: Vec<(f32, &Node)> = self
             .nodes
             .iter()
-            .filter(|n| !n.tombstoned && visible(&n.record.doc_id))
+            .filter(|n| !n.tombstoned && visible(&n.record.doc_id, &n.record.acl_object))
             .map(|n| (n.record.embedding.cosine_distance(query), n))
             .collect();
         scored.sort_by(|a, b| {
@@ -660,8 +673,11 @@ impl HnswVectorIndex {
     }
 
     /// Serialize the LIVE vectors to a stable byte form: one record per line,
-    /// `doc_id\tmodel_ref\tf0,f1,...`. PII note: an embedding IS personal data, which is exactly why
-    /// it is sealed under the per-tenant DEK before it touches rest (the caller seals this).
+    /// `doc_id\tmodel_ref\tf0,f1,...\tacl_object`. The `acl_object` is the LAST field so a **legacy
+    /// 3-field segment** (sealed before the ACL-parity fix) still parses — [`deserialize`] falls the
+    /// missing field back to `doc_id` (fail-closed: doc_id-only matching, the pre-fix behaviour, never
+    /// a widen). PII note: an embedding IS personal data, which is exactly why it is sealed under the
+    /// per-tenant DEK before it touches rest (the caller seals this).
     fn serialize_live(&self) -> Vec<u8> {
         let mut out = String::new();
         for node in self.nodes.iter().filter(|n| !n.tombstoned) {
@@ -678,6 +694,8 @@ impl HnswVectorIndex {
             out.push_str(node.record.model_ref.as_str());
             out.push('\t');
             out.push_str(&dims);
+            out.push('\t');
+            out.push_str(&node.record.acl_object);
             out.push('\n');
         }
         out.into_bytes()
@@ -702,10 +720,15 @@ impl HnswVectorIndex {
             let dims = parts
                 .next()
                 .ok_or_else(|| IndexError::Engine("vector segment line has no dims".into()))?;
+            // The `acl_object` is the trailing field. A LEGACY 3-field segment (pre-ACL-parity) has
+            // none — fall back to `doc_id` (fail-closed: doc_id-only matching, exactly the pre-fix
+            // behaviour, so the reopened record never WIDENS access on either the allow or deny arm).
+            let acl_object = parts.next().unwrap_or(doc_id).to_string();
             let v: Result<Vec<f32>, _> = dims.split(',').map(|s| s.parse::<f32>()).collect();
             let v = v.map_err(|e| IndexError::Engine(format!("vector dim parse: {e}")))?;
             out.push(VectorRecord {
                 doc_id: doc_id.to_string(),
+                acl_object,
                 embedding: Embedding(v),
                 model_ref: ModelRef(model_ref.to_string()),
             });
@@ -764,6 +787,18 @@ mod tests {
     fn rec(doc: &str, v: Vec<f32>, model: &str) -> VectorRecord {
         VectorRecord {
             doc_id: doc.into(),
+            acl_object: doc.into(), // the common case: acl_object == doc_id
+            embedding: Embedding(v),
+            model_ref: ModelRef(model.into()),
+        }
+    }
+
+    /// A record whose `acl_object` DIFFERS from its `doc_id` (a sub-artifact doc: the ACL pins on the
+    /// `#sub`-stripped parent). Used to prove the vector filter matches `doc_id` OR `acl_object`.
+    fn rec_acl(doc: &str, acl_object: &str, v: Vec<f32>, model: &str) -> VectorRecord {
+        VectorRecord {
+            doc_id: doc.into(),
+            acl_object: acl_object.into(),
             embedding: Embedding(v),
             model_ref: ModelRef(model.into()),
         }
@@ -917,7 +952,7 @@ mod tests {
         idx.upsert(rec("v2", vec![0.9, 0.1, 0.0], "m@1")).unwrap();
         idx.upsert(rec("v3", vec![0.85, 0.15, 0.0], "m@1")).unwrap();
 
-        let visible = |doc: &str| doc != "secret";
+        let visible = |doc: &str, _acl: &str| doc != "secret";
         let hits = idx.knn_filtered(&Embedding(vec![1.0, 0.0, 0.0]), 2, visible);
         assert_eq!(
             hits.len(),
@@ -927,6 +962,49 @@ mod tests {
         assert!(
             !hits.iter().any(|h| h.doc_id == "secret"),
             "the hidden vector never surfaces (no post-filter leak/under-fill)"
+        );
+    }
+
+    /// **The filter-during-traversal predicate matches `doc_id` OR `acl_object` (the ACL-parity
+    /// property, R2.7).** A sub-artifact vector whose `doc_id` is sub-precise but whose `acl_object`
+    /// pins on the parent is ADMITTED by a predicate that only recognises the PARENT (the acl_object
+    /// arm) and DENIED by a predicate that recognises the parent as a deny (both directions), exactly
+    /// like the lexical posting-list clause. Pre-fix (doc_id-only) code fails this red.
+    #[test]
+    fn knn_filtered_matches_doc_id_or_acl_object() {
+        let mut idx = HnswVectorIndex::open();
+        // A sub-doc: doc_id is sub-precise, acl_object is the #sub-stripped parent.
+        idx.upsert(rec_acl(
+            "page/secret#b1",
+            "page/secret",
+            vec![1.0, 0.0, 0.0],
+            "m@1",
+        ))
+        .unwrap();
+
+        // Admit via the acl_object (parent) arm — the doc_id itself is NOT in the allow-set.
+        let by_parent = |_doc: &str, acl: &str| acl == "page/secret";
+        let hits = idx.knn_filtered(&Embedding(vec![1.0, 0.0, 0.0]), 5, by_parent);
+        assert_eq!(
+            hits.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(),
+            vec!["page/secret#b1"],
+            "a grant on the parent acl_object admits the sub-doc's vector (acl_object arm)"
+        );
+
+        // Deny via the acl_object (parent) arm — the sub-doc must be EXCLUDED (the leak direction).
+        let deny_parent = |_doc: &str, acl: &str| acl != "page/secret";
+        assert!(
+            idx.knn_filtered(&Embedding(vec![1.0, 0.0, 0.0]), 5, deny_parent)
+                .is_empty(),
+            "a deny on the parent acl_object excludes the sub-doc's vector (no semantic leak)"
+        );
+
+        // The doc_id arm still enforces: a deny on the sub-precise doc_id also excludes it.
+        let deny_docid = |doc: &str, _acl: &str| doc != "page/secret#b1";
+        assert!(
+            idx.knn_filtered(&Embedding(vec![1.0, 0.0, 0.0]), 5, deny_docid)
+                .is_empty(),
+            "a deny on the sub-precise doc_id excludes the sub-doc's vector (doc_id arm intact)"
         );
     }
 
@@ -958,7 +1036,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let visible = |doc: &str| visible_ids.iter().any(|v| v == doc);
+        let visible = |doc: &str, _acl: &str| visible_ids.iter().any(|v| v == doc);
 
         // The query: near `d255` (a visible doc) — but the graph neighbourhood around it is full of
         // INVISIBLE vectors, so a pure graph walk would under-fill / miss visible neighbours.
@@ -968,7 +1046,7 @@ mod tests {
         // Brute-force ground truth over the VISIBLE set only.
         let mut truth: Vec<(f32, String)> = corpus
             .iter()
-            .filter(|(id, _)| visible(id))
+            .filter(|(id, _)| visible(id, id))
             .map(|(id, v)| (Embedding(v.clone()).cosine_distance(&q), id.clone()))
             .collect();
         truth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then_with(|| a.1.cmp(&b.1)));
@@ -986,7 +1064,7 @@ mod tests {
         );
         // No invisible doc leaked.
         assert!(
-            hits.iter().all(|h| visible(&h.doc_id)),
+            hits.iter().all(|h| visible(&h.doc_id, &h.doc_id)),
             "no hidden vector surfaced"
         );
         // The nearest is `d255` itself (distance ~0).
@@ -1034,7 +1112,7 @@ mod tests {
         assert!(idx.soft_delete("near_tombstoned"));
 
         // The selective filter: only the two `*_visible` docs are visible (very selective ⇒ fallback).
-        let visible = |doc: &str| doc == "near_visible" || doc == "far_visible";
+        let visible = |doc: &str, _acl: &str| doc == "near_visible" || doc == "far_visible";
         let q = Embedding(vec![1.0, 0.0, 0.0, 0.0, 0.0]);
         let hits = idx.knn_filtered(&q, 5, visible);
 
@@ -1078,7 +1156,7 @@ mod tests {
             idx.upsert(rec(&format!("d{i}"), v, "m@1")).unwrap();
         }
         // Everything visible: the graph walk fills k without needing the fallback.
-        let visible = |_: &str| true;
+        let visible = |_: &str, _: &str| true;
         let q = Embedding(vec![1.0, 0.0]);
         let hits = idx.knn_filtered(&q, 3, visible);
         assert_eq!(
@@ -1110,7 +1188,7 @@ mod tests {
             let v = vec![(i as f32).sin(), (i as f32).cos(), (i as f32 * 0.3).sin()];
             idx.upsert(rec(&format!("d{i}"), v, "m@1")).unwrap();
         }
-        let visible = |doc: &str| doc == "d10" || doc == "d50";
+        let visible = |doc: &str, _acl: &str| doc == "d10" || doc == "d50";
         let q = Embedding(vec![0.0, 1.0, 0.0]);
         let hits = idx.knn_filtered(&q, 5, visible);
         assert_eq!(
