@@ -148,7 +148,7 @@ fn ci_gate_caller_fails_ci_on_a_resurrected_erased_subject() {
     let objects: Vec<RestoredObject> = vec![];
     let source = SourceLog::new();
     let rows: Vec<WalRow> = vec![];
-    let mut ledger = ErasureLedger::new();
+    let ledger = ErasureLedger::new();
     ledger.record_erased(resurrected.clone());
     let inputs = GateInputs {
         archiver: &arch,

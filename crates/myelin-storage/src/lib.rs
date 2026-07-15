@@ -668,6 +668,15 @@ pub mod identity_durable;
 // the NON-shred-erasable, NO-RLS `identity_pseudonym_erasure_ledger` (10.8 — must survive the
 // crypto-shred it records + restore). The identity-layer S2 store + erasure ledger delegate to these.
 pub mod pseudonym_durable;
+// The durable PG backings for the three in-crate storage ledgers (MR-009b W6b / SI-021/036 +
+// P-ST-14): the FORCE-RLS `cost_reservation`/`cost_event` tables (0050) behind `reserve_settle::
+// CostLedger`; the non-shred-erasable `restore_erasure_ledger` (0051) behind `restore_verify::
+// ErasureLedger` (carrying the R1 §7.6 completion-offset fold-in); the non-shred-erasable
+// `post_pit_erasure_ledger` (0052) behind `reerase::PostRestoreErasureLedger`. Durable-by-default:
+// the in-memory cores are now `test-support`-gated test doubles.
+pub mod reserve_settle_durable;
+pub mod restore_verify_durable;
+pub mod reerase_durable;
 // The OLTP-co-located outbox relay (the one legitimate broker-publish site, BUS-2) — kept in its
 // own module so the broker-publish call is isolated to a single named relay file (the same
 // posture as myelin-events/src/relay.rs).
@@ -807,9 +816,13 @@ pub use olap_restrict::{
 };
 pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
 pub use reerase::{
-    CellKillRestore, CellKillRtoReport, ErasureRecord, InMemoryPostPitLedger,
-    PostRestoreErasureLedger, ReErasePass, ReEraseReport, ReErasedSubject, RtoGrain,
+    CellKillRestore, CellKillRtoReport, ErasureRecord, PostRestoreErasureLedger, ReErasePass,
+    ReEraseReport, ReErasedSubject, RtoGrain,
 };
+// The in-memory post-PIT ledger is the MR-009b W6b `test-support`-gated TEST DOUBLE (the durable
+// `DurablePostPitLedger` is the always-compiled production ledger).
+#[cfg(any(test, feature = "test-support"))]
+pub use reerase::InMemoryPostPitLedger;
 pub use replicated_blob::{ReplicaTelemetry, ReplicatedBlobStore};
 pub use reserve_settle::{
     CostEvent, CostLedger, MeteredUnit, MinorUnits, Reservation, ReservationState, ReserveError,
@@ -848,6 +861,16 @@ pub use identity_durable::{
 pub use pseudonym_durable::{
     pseudonym_durable_migrations, DurableErasureLedgerBacking, DurableErasureLedgerRow,
     DurablePseudonymBacking, DurablePseudonymRow,
+};
+// The MR-009b W6b durable storage-ledger backings + their migration sets (0050/0051/0052).
+pub use reerase_durable::{
+    post_pit_durable_migrations, DurablePostPitLedger, POST_PIT_ERASURE_LEDGER_MIGRATION,
+};
+pub use reserve_settle_durable::{
+    reserve_settle_durable_migrations, DurableCostLedger, COST_LEDGER_MIGRATION,
+};
+pub use restore_verify_durable::{
+    restore_verify_durable_migrations, DurableRestoreErasureLedger, RESTORE_ERASURE_LEDGER_MIGRATION,
 };
 pub use tenant_tx::{connect_pool_with_reset, with_tenant_tx, TxScope};
 pub use events_durable::DurableDedupBacking;

@@ -407,14 +407,16 @@ mod tests {
         for table in KnowledgeTable::ALL {
             let q = store.query(scope.clone(), table);
             let sql = q.predicate_sql();
+            // Parameterized ($1/$2) — the token's (tenant, region) travel as binds, not literals.
             assert!(
-                sql.contains("tenant = 'acme'"),
-                "{} query must pin the token tenant: {sql}",
+                sql.contains("tenant = $1 AND region = $2"),
+                "{} query must pin the (tenant, region) via bind placeholders: {sql}",
                 table.name()
             );
-            assert!(
-                sql.contains("region = 'fr-par'"),
-                "{} query must pin the region (12.1): {sql}",
+            assert_eq!(
+                q.predicate_binds(),
+                vec!["acme".to_string(), "fr-par".to_string()],
+                "{} query binds carry the verified token's (tenant, region)",
                 table.name()
             );
             assert!(

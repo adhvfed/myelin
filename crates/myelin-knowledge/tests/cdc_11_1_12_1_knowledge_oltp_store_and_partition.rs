@@ -85,8 +85,13 @@ fn consumer_every_knowledge_query_is_tenant_region_scoped() {
     ] {
         let q = store.query(scope.clone(), table);
         let sql = q.predicate_sql();
-        assert!(sql.contains("tenant = 'acme'"), "{}: {sql}", table.name());
-        assert!(sql.contains("region = 'fr-par'"), "{}: {sql}", table.name());
+        assert!(sql.contains("tenant = $1 AND region = $2"), "{}: {sql}", table.name());
+        assert_eq!(
+            q.predicate_binds(),
+            vec!["acme".to_string(), "fr-par".to_string()],
+            "{}",
+            table.name()
+        );
         assert_eq!(q.validate(), Ok(()));
     }
 }
@@ -141,7 +146,9 @@ fn drill_kn_d13_cross_tenant_path_spoof_is_rejected_zero_cross_tenant() {
     let store = KnowledgeStore::open(cfg()).expect("open");
     let q = store.query(scope, KnowledgeTable::Page);
     assert!(
-        q.predicate_sql().contains("tenant = 'acme'") && !q.predicate_sql().contains("evil-corp"),
+        q.predicate_sql().contains("tenant = $1 AND region = $2")
+            && q.predicate_binds() == vec!["acme".to_string(), "fr-par".to_string()]
+            && !q.predicate_binds().iter().any(|b| b.contains("evil-corp")),
         "KN-D13: the resolved page query is pinned to the token tenant, never the spoofed path"
     );
 }

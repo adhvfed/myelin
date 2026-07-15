@@ -239,3 +239,52 @@ fn the_gate_run_with_reerase_greens_a_re_erased_restore() {
         "the gate artifact records 0 resurrected after the re-erasure pass"
     );
 }
+
+/// ADVERSARIAL (W6b verifier finding, probe-confirmed pre-fix): a §7.6 window-case erasure recorded
+/// in the RESTORE erasure ledger (completion offset > PIT) whose tenant has NO post-PIT-ledger
+/// coverage must make `run_with_reerase` RED — the base gate admitted the window record past its
+/// refusal on the promise the re-erasure pass re-kills it, and the pass ranges only over the
+/// post-PIT ledger; with no coverage nothing re-kills it. Pre-fix this returned GREEN (a silent
+/// resurrection); the structural cross-ledger coverage assert must refuse it.
+#[test]
+fn a_window_erasure_with_no_post_pit_coverage_is_refused_not_trusted_green() {
+    use myelin_storage::{ErasureLedger, GateInputs, RestoreVerifyGate};
+
+    let t = tenant("acme");
+    let kms = KmsEngine::new();
+    kms.ensure_kek(&KekId::new(t.clone(), region()));
+
+    // The window record: erasure completed at 140, restore PIT = 100 — the backup physically holds
+    // the pre-erasure key. The post-PIT ledger is EMPTY: nothing will re-kill it.
+    let ledger = ErasureLedger::new();
+    ledger.record_erased_at(t.clone(), 140);
+    let post_pit = InMemoryPostPitLedger::new();
+
+    let seams = Seams::default();
+    let holders = EraseHolders {
+        pseudonym: &seams,
+        search: &seams,
+        refs: &seams,
+        bus: &seams,
+        ledger: &seams,
+        git_reach: None,
+    };
+    let arch = reachable_archiver(300);
+    let inputs = GateInputs {
+        archiver: &arch,
+        target: 100,
+        rows: &[],
+        objects: &[],
+        source: &SourceLog::new(),
+        kms: &kms,
+        erasure_ledger: &ledger,
+    };
+
+    let verdict =
+        RestoreVerifyGate::new().run_with_reerase(&inputs, &post_pit, &holders, region(), 1_000);
+    assert!(
+        !verdict.is_green(),
+        "a window erasure with no post-PIT coverage must be REFUSED (structural cross-ledger \
+         assert), never a trusted green"
+    );
+}

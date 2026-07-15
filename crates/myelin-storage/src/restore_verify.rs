@@ -168,32 +168,104 @@ pub struct RestoreTarget {
 /// before-the-backup invariant). The full GDPR erasure ledger + the per-subject re-erasure pass for
 /// erasures completed AFTER the backup's PIT (re-destroy the per-subject DEK, re-purge Search,
 /// re-tombstone Refs, re-emit `*.erased`) is the sibling **P-ST-14 (global P-100)** — it drives THIS
-/// seam. Modeled here as the set of erased tenants the gate checks the restore did not resurrect
-/// (reusing the KMS crypto-shred backup-exclusion, §7.5: a shredded KEK is excluded from the restored
-/// set, so its tenant is structurally still erased).
-#[derive(Clone, Debug, Default)]
+/// seam. Each recorded erasure carries its **completion offset** (the §7.3 cross-seam cursor the
+/// restore PIT is compared against) so the gate can catch the §7.6 backup-window residual (an erasure
+/// completed AFTER the restore's PIT — the backup predates the completion and physically holds the
+/// pre-erasure key).
+///
+/// **MR-009b W6b — durable-by-default:** this is a role struct over an [`ErasureLedgerBackend`]
+/// backend enum. The in-memory `Memory` arm (a `(tenant → completion offset)` map) + [`Self::new`] are
+/// `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLES; the always-compiled PRODUCTION backend
+/// is the pool-backed [`crate::restore_verify_durable::DurableRestoreErasureLedger`] over the
+/// non-shred-erasable `restore_erasure_ledger` table (migration `0051`). The `no-in-memory-durable-store`
+/// scanner strips the `test-support`-gated `Memory` arm, so the production graph presents no in-memory
+/// collection.
+#[derive(Clone)]
 pub struct ErasureLedger {
-    /// The tenants whose key was crypto-shredded before the backup's PIT — each MUST stay erased
-    /// across the restore (no restored KEK). PII-free: an opaque [`TenantId`], never a payload.
-    erased_tenants: BTreeSet<TenantId>,
+    backend: ErasureLedgerBackend,
+}
+
+/// The backend of an [`ErasureLedger`] — the in-memory `(tenant → completion offset)` map (test
+/// double, `test-support`-gated) or the durable `restore_erasure_ledger` table (production default).
+#[derive(Clone)]
+enum ErasureLedgerBackend {
+    /// The in-memory test double: tenant → the erasure's completion offset. **MR-009b W6b — TEST
+    /// DOUBLE (`#[cfg(any(test, feature = "test-support"))]` only).**
+    #[cfg(any(test, feature = "test-support"))]
+    Memory(std::sync::Arc<std::sync::Mutex<BTreeMap<TenantId, WalOffset>>>),
+    /// The durable production backing over the `restore_erasure_ledger` table.
+    Pg(crate::restore_verify_durable::DurableRestoreErasureLedger),
 }
 
 impl ErasureLedger {
-    /// An empty ledger (no erasures recorded).
+    /// An empty in-memory ledger — the **test double** (MR-009b W6b: `#[cfg(any(test, feature =
+    /// "test-support"))]` only). The PRODUCTION ledger is [`Self::with_pg`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new() -> ErasureLedger {
-        ErasureLedger::default()
+        ErasureLedger {
+            backend: ErasureLedgerBackend::Memory(std::sync::Arc::new(std::sync::Mutex::new(
+                BTreeMap::new(),
+            ))),
+        }
     }
 
-    /// Record that `tenant` was erased (crypto-shredded) before the backup — it MUST NOT be
-    /// resurrected by a restore.
-    pub fn record_erased(&mut self, tenant: TenantId) -> &mut Self {
-        self.erased_tenants.insert(tenant);
+    /// Wrap the durable backing as the production ledger (the always-compiled default over the
+    /// `restore_erasure_ledger` table).
+    pub fn with_pg(backing: crate::restore_verify_durable::DurableRestoreErasureLedger) -> ErasureLedger {
+        ErasureLedger {
+            backend: ErasureLedgerBackend::Pg(backing),
+        }
+    }
+
+    /// Record that `tenant` was erased (crypto-shredded) **before the backup** (completion offset `0`,
+    /// which is `<=` any restore PIT — the classic before-the-backup exclude-from-backup case). It
+    /// MUST NOT be resurrected by a restore. Takes `&self` (interior mutability / durable write-through).
+    ///
+    /// **TEST DOUBLE ONLY (W6b verifier finding — fail-open default):** an offset-`0` record
+    /// silently OPTS OUT of the §7.6 backup-window comparison (`0 <= PIT` always), so a production
+    /// writer that used this for an erasure that actually completed inside the window would make
+    /// the gate wave the resurrection through. Production write paths MUST call
+    /// [`Self::record_erased_at`] with the erasure's REAL completion offset (the §7.3 cursor).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_erased(&self, tenant: TenantId) -> &Self {
+        self.record_erased_at(tenant, 0)
+    }
+
+    /// **Record an erasure that completed at `completed_at_offset` (the §7.3 cross-seam cursor).** An
+    /// erasure whose completion offset is `> ` the restore's PIT is the §7.6 backup-window residual the
+    /// gate catches (the backup predates the erasure completion, so it physically holds the pre-erasure
+    /// key). Idempotent per tenant.
+    pub fn record_erased_at(&self, tenant: TenantId, completed_at_offset: WalOffset) -> &Self {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            ErasureLedgerBackend::Memory(m) => {
+                m.lock()
+                    .expect("erasure ledger poisoned")
+                    .insert(tenant, completed_at_offset);
+            }
+            ErasureLedgerBackend::Pg(backing) => backing.record_erased_at(&tenant, completed_at_offset),
+        }
         self
     }
 
-    /// The erased tenants the gate asserts the restore did not resurrect.
-    pub fn erased_tenants(&self) -> &BTreeSet<TenantId> {
-        &self.erased_tenants
+    /// Every recorded erasure as `(tenant, completion offset)` — the set the gate's erasure-held leg
+    /// verifies the restore did not resurrect (comparing each completion offset against the restore PIT).
+    pub fn records(&self) -> Vec<(TenantId, WalOffset)> {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            ErasureLedgerBackend::Memory(m) => m
+                .lock()
+                .expect("erasure ledger poisoned")
+                .iter()
+                .map(|(t, o)| (t.clone(), *o))
+                .collect(),
+            ErasureLedgerBackend::Pg(backing) => backing.records(),
+        }
+    }
+
+    /// The erased tenants the gate asserts the restore did not resurrect (the keys of [`Self::records`]).
+    pub fn erased_tenants(&self) -> BTreeSet<TenantId> {
+        self.records().into_iter().map(|(t, _)| t).collect()
     }
 }
 
@@ -438,6 +510,17 @@ impl RestoreVerifyGate {
     /// 4. **Erasure held** — no tenant the [`ErasureLedger`] marks erased-before-the-backup has a
     ///    restored KEK ([`GateFailure::ErasureResurrected`] if one does).
     pub fn run(&self, inputs: &GateInputs<'_>) -> GateVerdict {
+        // The bare gate: NO post-restore re-erasure will run, so a §7.6 backup-window erasure (an
+        // erasure completed AFTER the restore PIT) has nothing to re-kill it — the gate REFUSES it.
+        self.run_inner(inputs, false)
+    }
+
+    /// The gate body, parameterized by whether a post-restore re-erasure pass WILL run after it
+    /// ([`Self::run_with_reerase`] passes `true`). It only changes the §7.6 backup-window leg: when a
+    /// re-erasure pass will follow, a post-PIT erasure is allowed past the base gate (the pass
+    /// re-applies it + asserts 0 resurrected); when none will (the bare [`Self::run`]), a post-PIT
+    /// erasure is REFUSED (there is nothing to re-kill the resurrected key).
+    fn run_inner(&self, inputs: &GateInputs<'_>, reerase_will_run: bool) -> GateVerdict {
         // (1) Spin the clean target + drive the restore. The restore's hard FAIL (missing hash /
         // unreachable PITR) is the no-loss floor — surfaced LOUD, never swallowed.
         let presence = build_presence(inputs.objects);
@@ -499,13 +582,24 @@ impl RestoreVerifyGate {
             });
         }
 
-        // (4) Erasure held — a subject erased before the backup stays erased across the restore. A
-        // restored KEK for a ledger-erased tenant is the gravest failure (it un-erases a person).
-        for tenant in inputs.erasure_ledger.erased_tenants() {
-            if report.restored_key_for_tenant(tenant) {
-                return GateVerdict::Red(GateFailure::ErasureResurrected {
-                    tenant: tenant.clone(),
-                });
+        // (4) Erasure held — a subject erased stays erased across the restore. The R1 fold-in uses
+        // each erasure's COMPLETION offset (the §7.3 cursor) vs the restore PIT:
+        //   - completed_at_offset <= PIT  → captured in/before the backup: the KEK exclusion (§7.5,
+        //     P-061) must hold — a restored key is the exclude-from-backup regression (gravest fail).
+        //   - completed_at_offset  > PIT  → the §7.6 backup-window residual: the backup predates the
+        //     erasure completion and physically holds the pre-erasure key, so a restore of PIT
+        //     resurrects the subject. The bare gate cannot re-kill it (that is the post-restore
+        //     re-erasure pass); if no re-erasure will run, the gate REFUSES (never a silent green).
+        for (tenant, completed_at_offset) in inputs.erasure_ledger.records() {
+            if completed_at_offset > report.restored_to_offset {
+                if reerase_will_run {
+                    // run_with_reerase re-applies this post-PIT erasure + asserts 0 resurrected.
+                    continue;
+                }
+                return GateVerdict::Red(GateFailure::ErasureResurrected { tenant });
+            }
+            if report.restored_key_for_tenant(&tenant) {
+                return GateVerdict::Red(GateFailure::ErasureResurrected { tenant });
             }
         }
 
@@ -553,8 +647,10 @@ impl RestoreVerifyGate {
         now: crate::erase::EpochMillis,
     ) -> GateVerdict {
         // (1) The three §7.4 assertions (no-loss / cross-seam / before-the-backup erasure-held). A red
-        // here short-circuits — never run re-erasure over a broken restore.
-        let base = self.run(inputs);
+        // here short-circuits — never run re-erasure over a broken restore. `reerase_will_run = true`:
+        // a §7.6 backup-window erasure is allowed past the base gate here — the re-erasure pass below
+        // re-applies it and asserts 0 resurrected (the bare `run` would REFUSE it instead).
+        let base = self.run_inner(inputs, true);
         let mut artifact = match base {
             GateVerdict::Green(a) => a,
             red @ GateVerdict::Red(_) => return red,
@@ -575,6 +671,27 @@ impl RestoreVerifyGate {
             Ok(report) => report,
             Err(e) => return GateVerdict::Red(GateFailure::RestoreFailed(e)),
         };
+
+        // (2b) STRUCTURAL cross-ledger coverage assert (W6b verifier finding). Step (1) admitted
+        // every §7.6 window-case erasure (completion offset > PIT) past the base gate's refusal ON
+        // THE PROMISE that the re-erasure pass below re-kills it. That promise is only real if the
+        // post-PIT ledger actually COVERS the window tenant: the two ledgers are DIFFERENT tables
+        // (the tenant-grained `restore_erasure_ledger` vs the subject-grained post-PIT ledger) and
+        // nothing else ties them together — a window record with no post-PIT coverage would sail
+        // through GREEN un-re-erased (probe-confirmed pre-fix). So the coverage is asserted
+        // structurally: every window tenant MUST appear in the post-PIT set, else RED — never a
+        // trusted green.
+        let post_pit_tenants: std::collections::BTreeSet<TenantId> = post_pit_ledger
+            .erasures_completed_after(report.restored_to_offset)
+            .into_iter()
+            .map(|r| r.tenant)
+            .collect();
+        for (tenant, completed_at_offset) in inputs.erasure_ledger.records() {
+            if completed_at_offset > report.restored_to_offset && !post_pit_tenants.contains(&tenant)
+            {
+                return GateVerdict::Red(GateFailure::ErasureResurrected { tenant });
+            }
+        }
 
         // (3) The mandatory post-restore re-erasure pass (§7.5): re-apply every post-PIT erasure +
         // assert 0 resurrected. A re-applied step failing is a loud restore-failed (an incomplete
@@ -987,7 +1104,7 @@ mod tests {
         let objects: Vec<RestoredObject> = vec![];
         let source = SourceLog::new();
         let rows: Vec<WalRow> = vec![];
-        let mut ledger = ErasureLedger::new();
+        let ledger = ErasureLedger::new();
         ledger.record_erased(shredded.clone());
         let inputs = GateInputs {
             archiver: &arch,
@@ -1022,7 +1139,7 @@ mod tests {
         let objects: Vec<RestoredObject> = vec![];
         let source = SourceLog::new();
         let rows: Vec<WalRow> = vec![];
-        let mut ledger = ErasureLedger::new();
+        let ledger = ErasureLedger::new();
         ledger.record_erased(resurrected.clone());
         let inputs = GateInputs {
             archiver: &arch,
@@ -1051,6 +1168,85 @@ mod tests {
         assert!(
             err.to_string().contains("ERASURE RESURRECTED"),
             "loud + specific: {err}"
+        );
+    }
+
+    // ───────── the R1 fold-in: the §7.6 backup-window residual (restore-inside-window) ─────────
+
+    /// **MANDATORY-CORE (R1 fold-in): an erasure completed INSIDE the backup window is CAUGHT by the
+    /// bare gate.** A backup taken at PIT T=100, but the erasure completed at offset 140 (AFTER T — the
+    /// backup predates the erasure completion, so it physically holds the pre-erasure key). A restore of
+    /// T would resurrect the subject. The bare gate has no re-erasure pass to re-kill it, so it must
+    /// REFUSE — comparing the restore PIT against the erasure's COMPLETION offset (the §7.6 residual).
+    /// This is the honest catch the timeless "shred reaches backups" model does not structurally cover.
+    #[test]
+    fn an_erasure_completed_inside_the_backup_window_is_refused_by_the_bare_gate() {
+        let windowed = tenant("erased-after-the-backup");
+        // The tenant's key is NOT in the KMS now (the erasure completed) — so `restored_key_for_tenant`
+        // is false; the model would green it. The COMPLETION-offset comparison is what catches it.
+        let kms = KmsEngine::new();
+        let arch = reachable_archiver(300);
+        let objects: Vec<RestoredObject> = vec![];
+        let source = SourceLog::new();
+        let rows: Vec<WalRow> = vec![];
+        let ledger = ErasureLedger::new();
+        // Erasure completed at offset 140 — AFTER the restore PIT T=100 (inside the backup window).
+        ledger.record_erased_at(windowed.clone(), 140);
+        let inputs = GateInputs {
+            archiver: &arch,
+            target: 100,
+            rows: &rows,
+            objects: &objects,
+            source: &source,
+            kms: &kms,
+            erasure_ledger: &ledger,
+        };
+
+        let verdict = RestoreVerifyGate::new().run(&inputs);
+        assert!(
+            !verdict.is_green(),
+            "an erasure completed inside the backup window MUST be caught (the §7.6 residual)"
+        );
+        assert_eq!(
+            verdict.failure(),
+            Some(&GateFailure::ErasureResurrected {
+                tenant: windowed.clone()
+            }),
+            "the gate refuses the restore-inside-window resurrection"
+        );
+    }
+
+    /// **The counterpart: an erasure completed BEFORE-or-AT the PIT is NOT the window residual** — it is
+    /// the classic exclude-from-backup case and greens (no restored key). Kills a mutant that flips the
+    /// `>` window comparison to `>=`/`<` (offset 100 == PIT 100 must NOT be treated as the window case).
+    #[test]
+    fn an_erasure_completed_at_or_before_the_pit_is_the_before_backup_case() {
+        let shredded = tenant("erased-before-the-backup");
+        let kms = KmsEngine::new();
+        kms.ensure_kek(&KekId::new(shredded.clone(), region()));
+        kms.ensure_dek(&shredded, &region(), KeyClass::Tenant).unwrap();
+        assert!(kms.destroy_kek(&KekId::new(shredded.clone(), region())));
+        let arch = reachable_archiver(300);
+        let objects: Vec<RestoredObject> = vec![];
+        let source = SourceLog::new();
+        let rows: Vec<WalRow> = vec![];
+        let ledger = ErasureLedger::new();
+        // Completed exactly AT the PIT (offset 100 == T) — captured at/before the backup, not the window.
+        ledger.record_erased_at(shredded.clone(), 100);
+        let inputs = GateInputs {
+            archiver: &arch,
+            target: 100,
+            rows: &rows,
+            objects: &objects,
+            source: &source,
+            kms: &kms,
+            erasure_ledger: &ledger,
+        };
+        let verdict = RestoreVerifyGate::new().run(&inputs);
+        assert!(
+            verdict.is_green(),
+            "an erasure completed at-or-before the PIT is the before-backup case → green, got {:?}",
+            verdict.failure()
         );
     }
 
