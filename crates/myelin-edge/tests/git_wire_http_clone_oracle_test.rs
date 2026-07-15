@@ -261,7 +261,7 @@ fn build(root: &Path) -> (Arc<Gateway>, CellTokenAuthority) {
     ));
     let human_login =
         Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(KmsEngine::new()))));
-    let backend = Arc::new(DurableGitBackend::rooted(root.to_path_buf()));
+    let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(root.to_path_buf()));
     let builder = Gateway::builder(authn, human_login, Arc::new(AllowAll))
         .default_token_scheme(SCHEME)
         .route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler));

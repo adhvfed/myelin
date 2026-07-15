@@ -58,7 +58,10 @@ pub(crate) fn raw(status: u16, content_type: &str, body: Vec<u8>) -> EdgeRespons
         content_type: content_type.to_string(),
         headers: vec![
             // Smart-HTTP responses must not be cached by intermediaries (the refs/pack are live).
-            ("cache-control".to_string(), "no-cache, max-age=0, must-revalidate".to_string()),
+            (
+                "cache-control".to_string(),
+                "no-cache, max-age=0, must-revalidate".to_string(),
+            ),
         ],
         body,
     }
@@ -108,7 +111,9 @@ fn map_durable_to_wire(e: myelin_git::durable::DurableError) -> EdgeError {
     use myelin_git::durable::DurableError;
     match e {
         DurableError::NotFound(_) => EdgeError::NotFound("repository not found".into()),
-        DurableError::Git(m) if m.contains("traversal") || m.contains("segment") || m.contains("slug") => {
+        DurableError::Git(m)
+            if m.contains("traversal") || m.contains("segment") || m.contains("slug") =>
+        {
             EdgeError::BadRequest(m)
         }
         other => EdgeError::Internal(format!("git push error: {other}")),
@@ -153,7 +158,8 @@ impl Handler for WireInfoRefs {
         if service != "git-upload-pack" {
             // A dumb-HTTP client (no `?service=`) is unsupported — Myelin serves smart-HTTP only.
             return Err(EdgeError::BadRequest(
-                "only the smart git protocol is supported (expected ?service=git-upload-pack)".into(),
+                "only the smart git protocol is supported (expected ?service=git-upload-pack)"
+                    .into(),
             ));
         }
         // R0.3 / DELTA N2: the upload-pack advert is a READ — gate on the READ per-repo grant. A denial
@@ -314,7 +320,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        Arc::new(DurableGitBackend::rooted(root).with_repo_authorizer(authz))
+        Arc::new(DurableGitBackend::rooted_inmem_for_test(root).with_repo_authorizer(authz))
     }
 
     /// Build a `HandlerCtx` for `repo` with the given query string (`service=…`). The scope is the
@@ -328,7 +334,13 @@ mod tests {
     ) -> Result<EdgeResponse, EdgeError> {
         let mut params = BTreeMap::new();
         params.insert("repo".to_string(), repo.to_string());
-        let req = EdgeRequest::new("GET", "/acme/acme-home/widgets/info/refs", query, vec![], vec![]);
+        let req = EdgeRequest::new(
+            "GET",
+            "/acme/acme-home/widgets/info/refs",
+            query,
+            vec![],
+            vec![],
+        );
         let page = Page::from_request(&req);
         let ctx = HandlerCtx {
             principal: be_principal,
@@ -358,7 +370,13 @@ mod tests {
         let scope = TenantScope::from_verified_token(&p, p.region.clone());
         let be = backend(Arc::new(DenyAllRepos));
         let h = WireInfoRefs { be };
-        let st = deny_status(run(&h, &p, &scope, "widgets.git", "service=git-upload-pack"));
+        let st = deny_status(run(
+            &h,
+            &p,
+            &scope,
+            "widgets.git",
+            "service=git-upload-pack",
+        ));
         assert_eq!(st, 404, "an un-granted READ leaks nothing (0-leak 404)");
     }
 
@@ -369,7 +387,13 @@ mod tests {
         let scope = TenantScope::from_verified_token(&p, p.region.clone());
         let be = backend(Arc::new(DenyAllRepos));
         let h = WireInfoRefs { be };
-        let st = deny_status(run(&h, &p, &scope, "widgets.git", "service=git-receive-pack"));
+        let st = deny_status(run(
+            &h,
+            &p,
+            &scope,
+            "widgets.git",
+            "service=git-receive-pack",
+        ));
         assert_eq!(st, 403, "an un-granted WRITE is a fail-closed 403");
     }
 
@@ -408,11 +432,16 @@ mod tests {
             GrantBackedRepos::new().grant_write("p", "acme", "widgets"),
         ));
         let h = WireInfoRefs { be };
-        let st = deny_status(run(&h, &p, &scope, "widgets.git", "service=git-receive-pack"));
+        let st = deny_status(run(
+            &h,
+            &p,
+            &scope,
+            "widgets.git",
+            "service=git-receive-pack",
+        ));
         // Past the seam (else it would be 403): the absent test repo is a 0-leak 404, NOT a 403 deny.
         assert_eq!(
-            st,
-            404,
+            st, 404,
             "a WRITE grant admits the seam; the absent repo is then a 404 (not a 403 deny)"
         );
     }

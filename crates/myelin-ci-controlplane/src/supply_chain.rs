@@ -915,8 +915,10 @@ mod tests {
         assert_eq!(
             prov.input_digests,
             vec![
-                "sha256:abc123def4560000000000000000000000000000000000000000000000000000".to_string(),
-                "sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000".to_string()
+                "sha256:abc123def4560000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+                "sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000"
+                    .to_string()
             ],
             "input digests are sorted (deterministic provenance)"
         );

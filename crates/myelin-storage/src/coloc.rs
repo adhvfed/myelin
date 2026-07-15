@@ -142,19 +142,24 @@ pub struct ColocatedOltp {
 }
 
 impl ColocatedOltp {
-    /// Open the co-located OLTP store: a bounded pool (validated config) + the outbox that
-    /// lives in the same DB. `minter` supplies the stable ULID for emitted events (the injected
-    /// id seam; the real wall-clock+random ULID source lands at P-S12 — see [`crate::oltp`]).
+    /// Open the co-located OLTP store: a bounded pool (validated config) + the INJECTED outbox
+    /// that lives in the same DB (MR-009b W3b.4 — the composition root owns durability: production
+    /// passes `OutboxStore::durable(PgOutboxBacking)`; a test passes the in-memory
+    /// `OutboxStore::new()` double). `minter` supplies the stable ULID for emitted events — a
+    /// production root wires the UNIQUE `myelin_events::UlidMinter` (the P-S12 stand-in), NEVER
+    /// the per-instance-resetting default `MonotonicMinter` (the W3b.3 named condition: colliding
+    /// `event_id`s are silently dropped by the durable `ON CONFLICT (event_id) DO NOTHING`).
     ///
     /// Fast-fails on a bad pool config (never starts with an unbounded pool — the §3.1 bound).
     pub fn open(
         config: OltpConfig,
+        outbox: OutboxStore,
         minter: Arc<dyn IdMinter>,
     ) -> Result<ColocatedOltp, ColocError> {
         let pool = OltpPool::open(config)?;
         Ok(ColocatedOltp {
             pool,
-            outbox: OutboxStore::new(),
+            outbox,
             minter,
         })
     }
@@ -340,8 +345,12 @@ mod tests {
     }
 
     fn store() -> ColocatedOltp {
-        ColocatedOltp::open(cfg(), Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>)
-            .expect("a valid config opens the co-located OLTP store")
+        ColocatedOltp::open(
+            cfg(),
+            OutboxStore::new(),
+            Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>,
+        )
+        .expect("a valid config opens the co-located OLTP store")
     }
 
     fn ctx_base(tenant: &str) -> EmitContextBase {
@@ -551,8 +560,12 @@ mod tests {
             statement_timeout_ms: 1_000,
             per_tenant_in_flight_cap: 1,
         };
-        let db = ColocatedOltp::open(cfg, Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>)
-            .unwrap();
+        let db = ColocatedOltp::open(
+            cfg,
+            OutboxStore::new(),
+            Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>,
+        )
+        .unwrap();
         let _held = db.begin(ctx_base("acme")).unwrap(); // holds the only permit
         let rejected = db.begin(ctx_base("acme"));
         assert!(
@@ -571,8 +584,12 @@ mod tests {
             statement_timeout_ms: 1_000,
             per_tenant_in_flight_cap: 1,
         };
-        let db = ColocatedOltp::open(cfg, Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>)
-            .unwrap();
+        let db = ColocatedOltp::open(
+            cfg,
+            OutboxStore::new(),
+            Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>,
+        )
+        .unwrap();
         {
             let mut tx = db.begin(ctx_base("acme")).unwrap();
             tx.emit(draft("issues.issue.created", "issue:A"), None)

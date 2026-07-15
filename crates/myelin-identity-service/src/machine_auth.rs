@@ -429,7 +429,10 @@ impl CapabilityAuthenticator {
 
     /// Inject a deterministic clock (RFC-3339 "now") for the revocation TTL consult — the test / drill
     /// seam (the production default reads the system clock).
-    pub fn with_clock(mut self, now: impl Fn() -> Timestamp + Send + Sync + 'static) -> CapabilityAuthenticator {
+    pub fn with_clock(
+        mut self,
+        now: impl Fn() -> Timestamp + Send + Sync + 'static,
+    ) -> CapabilityAuthenticator {
         self.now = Arc::new(now);
         self
     }
@@ -1351,7 +1354,14 @@ mod tests {
         );
         // The forgeable plaintext Structural envelope the MOCK verifier would accept — the real
         // PASETO verifier rejects it (it is not a signed v4.public token).
-        let forged = material("acme", "eu-west", "run-1", "jti-forge", false, &["agent:run"]);
+        let forged = material(
+            "acme",
+            "eu-west",
+            "run-1",
+            "jti-forge",
+            false,
+            &["agent:run"],
+        );
         let r = auth.authenticate(&cred(scheme::AGENT, forged), None);
         assert!(
             matches!(r, Err(AuthzError::BadRequest(_)) | Err(AuthzError::FailClosed(_))),

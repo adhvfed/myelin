@@ -52,7 +52,7 @@ use myelin_identity::{AuthzError, Credential};
 use myelin_tenancy::{Region, TenantId};
 use ring::signature::{Ed25519KeyPair, UnparsedPublicKey, ED25519};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, BTreeMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -118,7 +118,10 @@ fn paseto_v4_public_sign(key: &Ed25519KeyPair, claims: &[u8]) -> String {
 /// Verify a PASETO v4.public token against the cell's 32-byte Ed25519 PUBLIC key (the injected trust
 /// anchor). Returns `(claims_bytes, signature_bytes)` on success; a forged/tampered token is a LOUD
 /// refusal. TOTAL over attacker bytes — every decode is checked, no slice can panic.
-fn paseto_v4_public_verify(public_key: &[u8], token: &str) -> Result<(Vec<u8>, Vec<u8>), AuthzError> {
+fn paseto_v4_public_verify(
+    public_key: &[u8],
+    token: &str,
+) -> Result<(Vec<u8>, Vec<u8>), AuthzError> {
     let rest = token.strip_prefix(V4_PUBLIC_HEADER).ok_or_else(|| {
         AuthzError::BadRequest("not a v4.public token (bad header/version)".into())
     })?;
@@ -138,7 +141,9 @@ fn paseto_v4_public_verify(public_key: &[u8], token: &str) -> Result<(Vec<u8>, V
     let m2 = pae(&[V4_PUBLIC_HEADER.as_bytes(), claims, b"", b""]);
     UnparsedPublicKey::new(&ED25519, public_key)
         .verify(&m2, sig)
-        .map_err(|_| refuse("capability-token signature verification failed (forged or tampered)"))?;
+        .map_err(|_| {
+            refuse("capability-token signature verification failed (forged or tampered)")
+        })?;
     Ok((claims.to_vec(), sig.to_vec()))
 }
 
@@ -159,14 +164,19 @@ pub struct CellTokenAuthority {
 impl CellTokenAuthority {
     /// Build from an explicit 32-byte Ed25519 seed + 32-byte macaroon secret (the injected cell
     /// material). A malformed seed is a loud error (never a fabricated key).
-    pub fn from_seed(ed25519_seed: &[u8; 32], mac_key: &[u8; 32]) -> Result<CellTokenAuthority, AuthzError> {
+    pub fn from_seed(
+        ed25519_seed: &[u8; 32],
+        mac_key: &[u8; 32],
+    ) -> Result<CellTokenAuthority, AuthzError> {
         let signing_key = Ed25519KeyPair::from_seed_unchecked(ed25519_seed)
             .map_err(|e| AuthzError::BadRequest(format!("invalid Ed25519 cell seed: {e}")))?;
         use ring::signature::KeyPair;
         let mut public_key = [0u8; 32];
         let pk = signing_key.public_key().as_ref();
         if pk.len() != 32 {
-            return Err(AuthzError::BadRequest("unexpected Ed25519 public-key length".into()));
+            return Err(AuthzError::BadRequest(
+                "unexpected Ed25519 public-key length".into(),
+            ));
         }
         public_key.copy_from_slice(pk);
         Ok(CellTokenAuthority {
@@ -188,8 +198,10 @@ impl CellTokenAuthority {
         let rng = ring::rand::SystemRandom::new();
         let mut seed = [0u8; 32];
         let mut mac = [0u8; 32];
-        rng.fill(&mut seed).expect("OS CSPRNG fills the Ed25519 seed");
-        rng.fill(&mut mac).expect("OS CSPRNG fills the macaroon secret");
+        rng.fill(&mut seed)
+            .expect("OS CSPRNG fills the Ed25519 seed");
+        rng.fill(&mut mac)
+            .expect("OS CSPRNG fills the macaroon secret");
         CellTokenAuthority::from_seed(&seed, &mac)
             .expect("a random 32-byte Ed25519 seed is always a valid cell authority")
     }
@@ -227,8 +239,8 @@ impl CellTokenAuthority {
             cnf.insert("jkt".into(), jkt.clone().into());
             claims.insert("cnf".into(), cnf.into());
         }
-        let claims_bytes = serde_json::to_vec(&serde_json::Value::Object(claims))
-            .expect("claims serialize");
+        let claims_bytes =
+            serde_json::to_vec(&serde_json::Value::Object(claims)).expect("claims serialize");
         let paseto = paseto_v4_public_sign(&self.signing_key, &claims_bytes);
         // The macaroon root tag binds the (empty) caveat chain to THIS token's unique signature under
         // the cell secret K_mac — the holder cannot recompute it (no K_mac), so caveats are extend-only.
@@ -274,12 +286,23 @@ pub struct CapabilityMintSpec {
 /// Encode the credential `material`. PASETO v4.public + base64url use no `|`, so `|` is an unambiguous
 /// outer delimiter. `caveats` is the (possibly empty) offline-added narrowing chain; `tail` is the
 /// macaroon tag; `dpop` is the optional per-request proof.
-fn encode_material(paseto: &str, caveats: &[BTreeSet<String>], tail: &[u8], dpop: Option<&str>) -> String {
-    let caveats_json: Vec<Vec<String>> = caveats.iter().map(|c| c.iter().cloned().collect()).collect();
+fn encode_material(
+    paseto: &str,
+    caveats: &[BTreeSet<String>],
+    tail: &[u8],
+    dpop: Option<&str>,
+) -> String {
+    let caveats_json: Vec<Vec<String>> = caveats
+        .iter()
+        .map(|c| c.iter().cloned().collect())
+        .collect();
     let caveats_b64 = b64url_encode(&serde_json::to_vec(&caveats_json).expect("caveats serialize"));
     let tail_b64 = b64url_encode(tail);
     match dpop {
-        Some(d) => format!("{paseto}|{caveats_b64}|{tail_b64}|{}", b64url_encode(d.as_bytes())),
+        Some(d) => format!(
+            "{paseto}|{caveats_b64}|{tail_b64}|{}",
+            b64url_encode(d.as_bytes())
+        ),
         None => format!("{paseto}|{caveats_b64}|{tail_b64}"),
     }
 }
@@ -291,7 +314,9 @@ fn paseto_root_signature(paseto: &str) -> Result<Vec<u8>, AuthzError> {
         .ok_or_else(|| AuthzError::BadRequest("not a v4.public token".into()))?;
     let body = b64url_decode(rest.split('.').next().unwrap_or(""))?;
     if body.len() < 64 {
-        return Err(AuthzError::BadRequest("token body too short for a signature".into()));
+        return Err(AuthzError::BadRequest(
+            "token body too short for a signature".into(),
+        ));
     }
     Ok(body[body.len() - 64..].to_vec())
 }
@@ -356,12 +381,15 @@ impl ParsedMaterial {
         let parts: Vec<&str> = material.split('|').collect();
         if parts.len() < 3 || parts.len() > 4 {
             return Err(AuthzError::BadRequest(
-                "malformed capability credential (expected `<paseto>|<caveats>|<tail>[|<dpop>]`)".into(),
+                "malformed capability credential (expected `<paseto>|<caveats>|<tail>[|<dpop>]`)"
+                    .into(),
             ));
         }
         let paseto = parts[0].to_string();
         if !paseto.starts_with(V4_PUBLIC_HEADER) {
-            return Err(AuthzError::BadRequest("credential token is not a v4.public PASETO".into()));
+            return Err(AuthzError::BadRequest(
+                "credential token is not a v4.public PASETO".into(),
+            ));
         }
         let caveats_raw: serde_json::Value = serde_json::from_slice(&b64url_decode(parts[1])?)
             .map_err(|e| AuthzError::BadRequest(format!("malformed caveat chain: {e}")))?;
@@ -384,7 +412,11 @@ impl ParsedMaterial {
                 }
                 out
             }
-            _ => return Err(AuthzError::BadRequest("the caveat chain must be a JSON array".into())),
+            _ => {
+                return Err(AuthzError::BadRequest(
+                    "the caveat chain must be a JSON array".into(),
+                ))
+            }
         };
         let tail = b64url_decode(parts[2])?;
         let dpop = match parts.get(3) {
@@ -516,7 +548,9 @@ fn verify_dpop_proof(
         .next()
         .ok_or_else(|| AuthzError::BadRequest("DPoP proof missing signature segment".into()))?;
     if segs.next().is_some() {
-        return Err(AuthzError::BadRequest("DPoP proof has trailing segments".into()));
+        return Err(AuthzError::BadRequest(
+            "DPoP proof has trailing segments".into(),
+        ));
     }
     let payload_bytes = b64url_decode(payload_b64)?;
     let sig = b64url_decode(sig_b64)?;
@@ -643,7 +677,10 @@ impl PasetoCapabilityVerifier {
     }
 
     /// Inject a deterministic clock (Unix seconds) — the test / drill seam.
-    pub fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> PasetoCapabilityVerifier {
+    pub fn with_clock(
+        mut self,
+        now: impl Fn() -> i64 + Send + Sync + 'static,
+    ) -> PasetoCapabilityVerifier {
         self.now = Arc::new(now);
         self
     }
@@ -686,11 +723,16 @@ impl PasetoCapabilityVerifier {
             .and_then(|v| v.as_i64())
             .ok_or_else(|| refuse("verified token missing integer `exp`"))?;
         let root_grants: BTreeSet<String> = match claims.get("auth") {
-            Some(serde_json::Value::Array(arr)) => {
-                arr.iter().filter_map(|g| g.as_str().map(str::to_string)).collect()
-            }
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|g| g.as_str().map(str::to_string))
+                .collect(),
             None => BTreeSet::new(),
-            _ => return Err(AuthzError::BadRequest("`auth` claim must be an array".into())),
+            _ => {
+                return Err(AuthzError::BadRequest(
+                    "`auth` claim must be an array".into(),
+                ))
+            }
         };
         let bound_jkt = claims
             .get("cnf")
@@ -765,7 +807,7 @@ impl PasetoCapabilityVerifier {
                 // (it signals confusion / a downgrade attempt).
                 return Err(refuse(
                     "a DPoP proof was presented for a token that carries no `cnf.jkt` binding — refused",
-                ))
+                ));
             }
             (None, None) => false,
         };
@@ -850,14 +892,24 @@ impl PasetoCapabilitySigner {
     }
 
     /// Inject a deterministic clock (Unix seconds) — the test / drill seam.
-    pub fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> PasetoCapabilitySigner {
+    pub fn with_clock(
+        mut self,
+        now: impl Fn() -> i64 + Send + Sync + 'static,
+    ) -> PasetoCapabilitySigner {
         self.now = Arc::new(now);
         self
     }
 }
 
 impl crate::mint::TokenSigner for PasetoCapabilitySigner {
-    fn sign(&self, tenant: &str, region: &str, subject_key: &str, jti: &str, grants: &[&str]) -> String {
+    fn sign(
+        &self,
+        tenant: &str,
+        region: &str,
+        subject_key: &str,
+        jti: &str,
+        grants: &[&str],
+    ) -> String {
         let exp = (self.now)().saturating_add(self.ttl_secs);
         self.authority.mint(&CapabilityMintSpec {
             tenant: tenant.to_string(),
@@ -887,7 +939,11 @@ impl CellAnchorSet {
         }
     }
     /// Register `anchor` under `cell_id` (builder form).
-    pub fn with_anchor(mut self, cell_id: impl Into<String>, anchor: CellTrustAnchor) -> CellAnchorSet {
+    pub fn with_anchor(
+        mut self,
+        cell_id: impl Into<String>,
+        anchor: CellTrustAnchor,
+    ) -> CellAnchorSet {
         self.by_cell.insert(cell_id.into(), anchor);
         self
     }

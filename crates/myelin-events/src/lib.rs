@@ -430,7 +430,7 @@ pub use harness::{
 };
 pub use outbox::{
     DurableOutboxBacking, EmitContextBase, IdMinter, MonotonicMinter, OutboxRow, OutboxStore,
-    OutboxTransaction, Ulid, OUTBOX_MIGRATION,
+    OutboxTransaction, Ulid, UlidMinter, OUTBOX_MIGRATION,
 };
 pub use partition::{stream_name_for, PartitionKey, StreamSubject, SubjectError, SUBJECT_ROOT};
 pub use relay::{

@@ -475,7 +475,13 @@ fn notif_migrations() -> Migrations {
 /// **Floors wired as empty seams:** the `consumers` slot is empty (the Signal-consumer router is
 /// NOTIF-P3); the migration set is empty (the data model is NOTIF-P2); holders auto-register but
 /// the references-not-payloads store-holder lands with the data model (NOTIF-P4).
-pub fn notif_app_spec(config: Config) -> AppSpec {
+///
+/// **The outbox is INJECTED (MR-009b W3b.4 — the composition root owns durability):** the
+/// production `main.rs` constructs `OutboxStore::durable(PgOutboxBacking)` over the MR-022
+/// `SubstrateProvider` pool (foundation migrations applied, fail-loud on missing durable config);
+/// a test/drill passes the in-memory `OutboxStore::new()` double. This builder constructs NO
+/// store of its own — the W3 dedup-injection precedent applied to the outbox.
+pub fn notif_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
         config,
@@ -495,7 +501,9 @@ pub fn notif_app_spec(config: Config) -> AppSpec {
         // payloads structural erase tombstones an erased person's appearance for free.
         holders: AppSpec::auto(),
         stores: StoreManifest::new(),
-        outbox: myelin_substrate::OutboxSpec::default(),
+        // The relay drains the INJECTED store (W3b.4). The in-process broker fake stays the
+        // default TRANSPORT (durability lives in the store); EB-04's adapter is a config swap.
+        outbox: OutboxSpec::new(outbox, InProcessBus::new()),
         // Notif declares no further critical downstream at the shell (its consumer call-sites —
         // Identity check, the bus — land with the router, NOTIF-P3); the OLTP store is implicit.
         critical: CriticalDependencies::default(),
@@ -521,17 +529,18 @@ pub fn notif_app_spec(config: Config) -> AppSpec {
 /// shell-boot property; this is the wired path.
 pub fn notif_app_spec_with_router(
     config: Config,
+    outbox: OutboxStore,
     tenants: &[TenantId],
     dedup: DedupLedger,
 ) -> (AppSpec, router::InboxProjection) {
     let inbox = router::InboxProjection::new();
-    // The ONE outbox the routers emit into AND the relay drains (BUS-2): supply it to the
-    // OutboxSpec so the emit → relay → bus path is the sanctioned one (no second store).
-    let outbox = OutboxStore::new();
-    // MR-009b Wave 3: the dedup ledger is INJECTED (durable-by-default composition root). The
-    // in-memory `DedupLedger::new()` is a `test-support` double the caller supplies on the
-    // in-process floor; a durable deployment injects `DedupLedger::durable` (events `serve()`).
-    // One shared ledger across the tenant routers (the `(consumer, event_id)` PK isolates them).
+    // The ONE outbox the routers emit into AND the relay drains (BUS-2) is INJECTED (MR-009b
+    // W3b.4, like the dedup ledger in Wave 3): the production root passes a durable-backed store
+    // (and pairs emits with a UNIQUE id source — never the per-store-resetting default
+    // `MonotonicMinter`; `myelin_events::UlidMinter` is the production source); a test passes the
+    // in-memory double. One store, one truth — no second store.
+    // One shared dedup ledger across the tenant routers (the `(consumer, event_id)` PK isolates
+    // them).
     let mut consumers: Vec<ConsumerReg> = Vec::with_capacity(tenants.len());
     for tenant in tenants {
         // `build_router` binds the `sig.<tenant>.` whitelist through the sanctioned `consume`
@@ -543,10 +552,9 @@ pub fn notif_app_spec_with_router(
             consumers.push(ConsumerReg::new(router));
         }
     }
-    let mut spec = notif_app_spec(config);
+    // The routers emit into `outbox`; the relay drains the SAME injected store (one truth).
+    let mut spec = notif_app_spec(config, outbox);
     spec.consumers = consumers;
-    // The routers emit into `outbox`; the relay must drain THAT store (not a fresh default one).
-    spec.outbox = OutboxSpec::new(outbox, InProcessBus::new());
     (spec, inbox)
 }
 
@@ -556,15 +564,15 @@ pub fn notif_app_spec_with_router(
 /// inspect the three ports + the liveness≠readiness state, and drive the drain deterministically.
 ///
 /// Returns `Err` (the non-zero exit) on a failed boot (§3.1).
-pub fn boot_notif(config: Config) -> Result<ServeHandle, ServeError> {
-    boot(notif_app_spec(config))
+pub fn boot_notif(config: Config, outbox: OutboxStore) -> Result<ServeHandle, ServeError> {
+    boot(notif_app_spec(config, outbox))
 }
 
 /// Run the Notif service to completion under the harness (boot → migrate → relay → consumers →
 /// three ports → graceful drain). The `notif` binary calls this; a failed boot / incomplete
 /// drain returns `Err` (the non-zero process exit, §3.1).
-pub fn run_notif(config: Config) -> Result<(), ServeError> {
-    serve(notif_app_spec(config))
+pub fn run_notif(config: Config, outbox: OutboxStore) -> Result<(), ServeError> {
+    serve(notif_app_spec(config, outbox))
 }
 
 #[cfg(test)]
@@ -577,7 +585,8 @@ mod tests {
     /// metrics-health surfaces are all opened (3/3 ports up); no hand-rolled main.
     #[test]
     fn notif_shell_boots_and_three_ports_bind() {
-        let handle = boot_notif(Config::default()).expect("the notif shell boots");
+        let handle =
+            boot_notif(Config::default(), OutboxStore::new()).expect("the notif shell boots");
         assert_eq!(handle.name(), "notif");
         assert_eq!(
             handle.surfaces(),
@@ -626,7 +635,7 @@ mod tests {
     /// set (the data model is NOTIF-P2), so the bootable-shell property is exercised now.
     #[test]
     fn booted_instance_is_ready_after_migrate_complete() {
-        let handle = boot_notif(Config::default()).expect("boot");
+        let handle = boot_notif(Config::default(), OutboxStore::new()).expect("boot");
         assert_eq!(
             handle.metrics_health().startup(),
             Startup::Complete,
@@ -646,7 +655,7 @@ mod tests {
     /// working until NOTIF-P3 UPSERTs items), but the SCHEMA exists.
     #[test]
     fn shell_carries_empty_consumer_seam_and_the_nine_table_data_model() {
-        let spec = notif_app_spec(Config::default());
+        let spec = notif_app_spec(Config::default(), OutboxStore::new());
         assert!(
             spec.consumers.is_empty(),
             "the Signal-consumer router is the NOTIF-P3 floor"
@@ -671,8 +680,12 @@ mod tests {
     #[test]
     fn notif_app_spec_with_router_registers_the_router_consumer() {
         let tenants = [TenantId("acme".into()), TenantId("globex".into())];
-        let (spec, _inbox) =
-            notif_app_spec_with_router(Config::default(), &tenants, DedupLedger::new());
+        let (spec, _inbox) = notif_app_spec_with_router(
+            Config::default(),
+            OutboxStore::new(),
+            &tenants,
+            DedupLedger::new(),
+        );
         assert_eq!(
             spec.consumers.len(),
             2,
@@ -703,8 +716,12 @@ mod tests {
     #[test]
     fn notif_app_spec_with_router_skips_overbroad_tenant_but_boots() {
         let tenants = [TenantId("acme".into()), TenantId("".into())]; // the empty tenant is invalid.
-        let (spec, _inbox) =
-            notif_app_spec_with_router(Config::default(), &tenants, DedupLedger::new());
+        let (spec, _inbox) = notif_app_spec_with_router(
+            Config::default(),
+            OutboxStore::new(),
+            &tenants,
+            DedupLedger::new(),
+        );
         assert_eq!(
             spec.consumers.len(),
             1,

@@ -132,7 +132,14 @@ pub fn dispatch_app_spec(config: Config) -> AppSpec {
         // Trigger & Dispatch owns only its OLTP store (the dedup ledger lives in it); the harness
         // adds the implicit OLTP store + auto-registers it as a holder.
         stores: StoreManifest::new(),
-        outbox: OutboxSpec::default(),
+        // **W3b.6 debt (named, MR-009b W3b.4):** the EXPLICIT in-memory floor — the gated
+        // `OutboxSpec::default_inproc` is no longer reachable from production; this construction is
+        // the grep-able remainder the W3b.6 `OutboxStore::new` gate breaks LOUDLY, forcing this root
+        // onto `OutboxSpec::durable` (the ci-dispatch durable rewiring is not in the W3b.4 set).
+        outbox: OutboxSpec::new(
+            myelin_events::OutboxStore::new(),
+            myelin_events::InProcessBus::new(),
+        ),
         critical: dispatch_critical(),
     }
 }

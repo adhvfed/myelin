@@ -292,6 +292,17 @@ impl PgRelay {
     ///
     /// Returns a [`DrainReport`] counting this pass's published / deduplicated / failed /
     /// dead-lettered rows.
+    ///
+    /// # SHARED-TABLE HAZARD (W3b.4 verifier finding — probe-proven; BLOCKS the first production consumer)
+    /// The claim predicate has **no service/subject scoping** — a drain claims EVERY unsent row in
+    /// the shared `outbox` table, including rows other services committed. With multiple W3b.4
+    /// service mains on one database, service B's relay can claim service A's event, publish it to
+    /// B's process-LOCAL `InProcessBus` (where A's consumers are not), and permanently stamp
+    /// `published_at` — the event is then invisible to A's consumers forever. TODAY this loses
+    /// nothing (no production main registers a consumer; the git reconciler reads published rows
+    /// too), but this MUST be fixed — subject/ownership scoping on the claim, or a shared
+    /// distributed transport (NATS/EventsRuntime) — BEFORE the first production consumer or
+    /// cross-service transport is wired. Tracked in the release ledger (14, W3b.4 residuals).
     pub async fn drain_once_dead_letter<B: BusTransport + ?Sized>(
         &self,
         bus: &B,

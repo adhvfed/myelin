@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, DataRole, EmitContextBase, EventDraft, EventType,
-    IdMinter, InProcessBus, MonotonicMinter, Region, Relay, TenantId, Timestamp, Visibility,
+    IdMinter, InProcessBus, MonotonicMinter, OutboxStore, Region, Relay, TenantId, Timestamp,
+    Visibility,
 };
 use myelin_harness::telemetry::{Predicate, SignalName, SignalSource};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -37,6 +38,7 @@ fn db() -> ColocatedOltp {
     };
     ColocatedOltp::open(
         config,
+        OutboxStore::new(),
         Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>,
     )
     .expect("co-located OLTP store opens")

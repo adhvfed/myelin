@@ -45,6 +45,7 @@
 //! indexes) is `tests/integration_iss_p05_spine_schema.rs` behind the `integration` cargo feature.
 
 use crate::migrations::{issues_hot_tables, issues_migrations};
+use myelin_events::{InProcessBus, OutboxStore};
 use myelin_substrate::{
     boot, serve, AppSpec, Config, CriticalDependencies, InternalRpc, OutboxSpec, PublicRoutes,
     ServeError, ServeHandle, StoreManifest,
@@ -74,7 +75,12 @@ fn issues_critical() -> CriticalDependencies {
 /// tables are declared; `identity` is declared critical; the Issues OLTP store auto-registers as the
 /// H3 holder. No consumers are registered here (the rollup/SLA/trigger/feeder consumers are the
 /// per-band follow-ons; the write path is ISS-P06).
-pub fn issues_app_spec(config: Config) -> AppSpec {
+/// **The outbox is INJECTED (MR-009b W3b.4 — the composition root owns durability):** the
+/// production `main.rs` constructs `OutboxStore::durable(PgOutboxBacking)` over the MR-022
+/// `SubstrateProvider` pool (foundation migrations applied, fail-loud on missing durable config);
+/// a test/drill passes the in-memory `OutboxStore::new()` double. This builder constructs NO
+/// store of its own — the W3 dedup-injection precedent applied to the outbox.
+pub fn issues_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
         config,
@@ -90,7 +96,9 @@ pub fn issues_app_spec(config: Config) -> AppSpec {
         // the shell — every spine table lives in the one Postgres; it auto-registers as H3 (the only
         // store the shell owns; the blob attachments tier is declared by ISS-P19's behaviour band).
         stores: StoreManifest::new(),
-        outbox: OutboxSpec::default(),
+        // The relay drains the INJECTED store (W3b.4). The in-process broker fake stays the
+        // default TRANSPORT (durability lives in the store); EB-04's adapter is a config swap.
+        outbox: OutboxSpec::new(outbox, InProcessBus::new()),
         critical: issues_critical(),
     }
 }
@@ -99,15 +107,15 @@ pub fn issues_app_spec(config: Config) -> AppSpec {
 /// [`issues_app_spec`]). Separated from [`run_issues`] so a test/drill can boot, assert the three
 /// ports opened + the migrations ran + the holder registered, drive ticks, and drive the drain
 /// deterministically.
-pub fn boot_issues(config: Config) -> Result<ServeHandle, ServeError> {
-    boot(issues_app_spec(config))
+pub fn boot_issues(config: Config, outbox: OutboxStore) -> Result<ServeHandle, ServeError> {
+    boot(issues_app_spec(config, outbox))
 }
 
 /// **The Issue Tracker service entry — the one `serve(AppSpec)` call (contract 1.1).** The `issues`
 /// binary (`src/main.rs`) does nothing but hand [`issues_app_spec`] to this. A failed boot /
 /// incomplete drain returns non-zero (§3.1) — loud, never a silent success.
-pub fn run_issues(config: Config) -> Result<(), ServeError> {
-    serve(issues_app_spec(config))
+pub fn run_issues(config: Config, outbox: OutboxStore) -> Result<(), ServeError> {
+    serve(issues_app_spec(config, outbox))
 }
 
 #[cfg(test)]
@@ -123,7 +131,7 @@ mod tests {
     /// spine table.
     #[test]
     fn issues_boots_from_serve_appspec_with_three_ports() {
-        let handle = boot_issues(Config::default())
+        let handle = boot_issues(Config::default(), OutboxStore::new())
             .expect("the Issue Tracker shell boots from serve(AppSpec)");
         assert_eq!(handle.name(), SERVICE_NAME, "the deployable service name");
 
@@ -151,7 +159,7 @@ mod tests {
     /// live (no restart storm).
     #[test]
     fn dead_identity_flips_readiness_not_liveness() {
-        let handle = boot_issues(Config::default()).expect("boot");
+        let handle = boot_issues(Config::default(), OutboxStore::new()).expect("boot");
         let mh = handle.metrics_health();
         assert!(mh.readiness().is_ready(), "ready while identity is healthy");
 
@@ -174,7 +182,7 @@ mod tests {
     #[test]
     fn run_issues_runs_lifecycle_and_returns_ok() {
         assert_eq!(
-            run_issues(Config::default()),
+            run_issues(Config::default(), OutboxStore::new()),
             Ok(()),
             "the Issue Tracker shell boots → … → drains cleanly"
         );
@@ -184,7 +192,7 @@ mod tests {
     /// boot loudly — the shell never starts half-booted.
     #[test]
     fn failed_boot_returns_non_zero() {
-        let r = run_issues(Config("BAD_POOL".into()));
+        let r = run_issues(Config("BAD_POOL".into()), OutboxStore::new());
         assert!(r.is_err(), "a failed boot must return non-zero (Err)");
         assert!(
             r.unwrap_err().0.contains("fail-fast"),
@@ -198,7 +206,7 @@ mod tests {
     /// is loud.
     #[test]
     fn the_shell_carries_the_complete_spine_and_no_consumers() {
-        let spec = issues_app_spec(Config::default());
+        let spec = issues_app_spec(Config::default(), OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
             11,

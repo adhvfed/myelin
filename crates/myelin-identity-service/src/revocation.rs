@@ -440,7 +440,11 @@ impl RevocationStore {
                 if torn_down {
                     return RunTokenState::TornDown;
                 }
-                match pg.block(pg.backing.get_revocation(&scope.tenant().0, RevokedKind::Jti.as_str(), &jti)) {
+                match pg.block(pg.backing.get_revocation(
+                    &scope.tenant().0,
+                    RevokedKind::Jti.as_str(),
+                    &jti,
+                )) {
                     Err(_) => RunTokenState::Unknown, // fail-closed (deny), never Live on a read error.
                     Ok(None) => RunTokenState::Unknown,
                     Ok(Some(row)) => decide(false, row.expires_at.as_deref()),
@@ -477,14 +481,19 @@ impl RevocationStore {
                 let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                 match guard.fast.get(&key) {
                     None => false,
-                    Some(entry) => revoked_if_present(entry.expires_at.as_ref().map(|t| t.0.as_str())),
+                    Some(entry) => {
+                        revoked_if_present(entry.expires_at.as_ref().map(|t| t.0.as_str()))
+                    }
                 }
             }
             RevocationBackend::Pg(pg) => {
                 // Read the durable row. On a DB error, fail CLOSED: return `true` (deny) — never
                 // report a revoked handle as not-revoked because the consult could not complete (the
                 // exact "missed revocation lets a revoked token validate" failure).
-                match pg.block(pg.backing.get_revocation(&scope.tenant().0, kind.as_str(), &handle)) {
+                match pg.block(
+                    pg.backing
+                        .get_revocation(&scope.tenant().0, kind.as_str(), &handle),
+                ) {
                     Err(_) => true,
                     Ok(None) => false,
                     Ok(Some(row)) => revoked_if_present(row.expires_at.as_deref()),
@@ -575,7 +584,9 @@ impl RevocationStore {
                     &now.0,
                     expires_at.as_ref().map(|t| t.0.as_str()),
                 ))
-                .expect("durable revocation must persist (fail-closed: never a silent lost revoke)");
+                .expect(
+                    "durable revocation must persist (fail-closed: never a silent lost revoke)",
+                );
             }
         }
         // (3) The deny is effective immediately (a hot consult); record the revocation_lag sample.
