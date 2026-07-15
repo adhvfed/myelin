@@ -17,7 +17,7 @@
 //! entry is fixed but not removed from the manifest. That is the mechanism by which MR-009/012/013
 //! prove they actually removed the shortcut (EI-01 §5 — an uncommitted gate is no gate).
 //!
-//! The three scanners:
+//! The scanners (the original three + the R2.6 fourth):
 //! 1. [`no_structural_crypto_in_prod`] — a `Structural*` mock-crypto verifier/signer CONSTRUCTED in
 //!    the production graph (outside `#[cfg(test)]`). Census SI-001..SI-004 (P-526/527/528, MR-012).
 //! 2. [`no_in_memory_durable_store`] — a durable-by-contract store/registry/outbox/ledger backed by
@@ -25,6 +25,9 @@
 //!    MR-009).
 //! 3. [`no_bare_tenant_pool`] — session-scoped `set_config(..., false)` RLS (leaks across pooled
 //!    connections) + the bare raw-pool hatch. Census SI-005 (P-531, MR-013).
+//! 4. [`no_permissive_authorizer_in_prod`] — the permissive `AllowAll`/`AllowAllRepos` authorizer
+//!    fixtures CONSTRUCTED in the edge production graph (outside `#[cfg(test)]`/`test-support`).
+//!    R2.6 (action seam) / R2.1a-R2.1 (object seam).
 
 use crate::engine::{blank_string_literals, code_lines, Lint, LintId, Violation};
 
@@ -922,26 +925,127 @@ pub fn no_bare_tenant_pool() -> Lint {
 }
 
 // ================================================================================================
-// The three scanners as a set (for the baseline-ratchet gate). NOT part of `all_twelve()`.
+// Scanner 4 — `no-permissive-authorizer-in-prod` (R2.6 — the edge action gate is a real policy).
 // ================================================================================================
 
-/// The three production-graph ABSENCE scanners, in census order. These are NOT wired into
-/// `all_twelve()` / `workspace_clean` (the real tree violates all three by design); the
-/// baseline-ratchet test (`tests/production_graph_absence.rs`) runs this set against a committed
-/// baseline manifest.
+/// `no-permissive-authorizer-in-prod` — the permissive authorizer fixtures (`AllowAll` — the
+/// action-level allow-everything seam fixture — and `AllowAllRepos` — the per-repo object-authz
+/// allow-everything fixture) must not be CONSTRUCTED in the edge production graph.
+///
+/// **Rule.** R2.6 replaced the edge's action-level `Arc::new(AllowAll)` with the explicit
+/// `AuthenticatedActionPolicy` mounted-action allowlist and gated `AllowAll` behind
+/// `#[cfg(any(test, feature = "test-support"))]`; R2.1a replaced the wire's `AllowAllRepos` in the
+/// production composition root with the live `CheckBackedRepoAuthorizer`. A permissive fixture may
+/// EXIST as a test double, but a CONSTRUCTION site — `Arc::new(AllowAll)` / `Arc::new(AllowAllRepos)`
+/// (any path-qualified form, e.g. `Arc::new(crate::AllowAll)`) — outside a `#[cfg(test)]` /
+/// `test-support` gate re-opens the every-principal-may-do-everything hole. The scanner is
+/// CONSTRUCTION-shaped (the `no_structural_crypto_in_prod` template, NOT the struct-def template):
+/// the type definitions, `impl` blocks, doc mentions, and `DenyAll*` fixtures do not trip it.
+///
+/// **Scope (precise).** The baseline-ratchet gate scopes this scanner to `crates/myelin-edge/`
+/// (`tests/production_graph_absence.rs`): the exact-identifier construction match plus the crate
+/// scope keeps other crates' UNRELATED same-named fixtures (for different traits) out — a bare
+/// `AllowAll` string scan would false-positive there.
+pub const NO_PERMISSIVE_AUTHORIZER_IN_PROD: LintId = LintId("no-permissive-authorizer-in-prod");
+
+/// The permissive authorizer fixture type names whose construction is a production violation.
+/// EXACT identifier match (never a substring): `DenyAllRepos`, `AllowAllReposX`, etc. do not match.
+const PERMISSIVE_AUTHORIZERS: &[&str] = &["AllowAll", "AllowAllRepos"];
+
+/// If `code` constructs a permissive authorizer fixture — `Arc::new(AllowAll)` /
+/// `Arc::new(AllowAllRepos)`, with an optional module path (`Arc::new(crate::AllowAll)`) — return
+/// the constructed type name. Both are UNIT structs, so the construction shape is the bare
+/// identifier immediately closed by `)`; a call like `Arc::new(AllowAllRepos::something())` or a
+/// different type sharing the prefix does not match.
+fn permissive_authorizer_construction(code: &str) -> Option<String> {
+    for (i, _) in code.match_indices("Arc::new(") {
+        let mut rest = code[i + "Arc::new(".len()..].trim_start();
+        // Peel leading path segments (`crate::`, `myelin_edge::`, `authz::`, …) to the terminal one.
+        loop {
+            let ident: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if ident.is_empty() {
+                break;
+            }
+            let after = &rest[ident.len()..];
+            if let Some(next) = after.strip_prefix("::") {
+                rest = next;
+                continue;
+            }
+            // Terminal path segment: the unit-struct construction closes IMMEDIATELY with `)`.
+            if PERMISSIVE_AUTHORIZERS.contains(&ident.as_str())
+                && after.trim_start().starts_with(')')
+            {
+                return Some(ident);
+            }
+            break;
+        }
+    }
+    None
+}
+
+fn scan_no_permissive_authorizer_in_prod(src: &str) -> Vec<Violation> {
+    // Test-support-aware gating (like the in-memory durable-store scanner): the fixtures are
+    // legitimate under `#[cfg(test)]` AND under `#[cfg(any(test, feature = "test-support"))]`
+    // (the gate `AllowAll` itself now lives behind).
+    let test_flags = cfg_double_line_flags(src);
+    let mut out = Vec::new();
+    for (line, code) in code_lines(src) {
+        if test_flags.get(line).copied().unwrap_or(false) {
+            continue; // a gated construction is a TEST harness fixture — admitted.
+        }
+        if let Some(ty) = permissive_authorizer_construction(&code) {
+            out.push(Violation {
+                lint: NO_PERMISSIVE_AUTHORIZER_IN_PROD,
+                line,
+                reason: format!(
+                    "`{ty}` (a permissive allow-everything authorizer fixture) is CONSTRUCTED in \
+                     the edge production graph — every authenticated principal would be authorized \
+                     for every action/repo. The fixture may exist ONLY behind `#[cfg(test)]` / \
+                     `test-support`; production wires the explicit `AuthenticatedActionPolicy` \
+                     mounted-action allowlist (action seam, R2.6) / the live \
+                     `CheckBackedRepoAuthorizer` (object seam, R2.1a)."
+                ),
+            });
+        }
+    }
+    out
+}
+
+/// The [`Lint`] value for [`NO_PERMISSIVE_AUTHORIZER_IN_PROD`].
+pub fn no_permissive_authorizer_in_prod() -> Lint {
+    Lint {
+        id: NO_PERMISSIVE_AUTHORIZER_IN_PROD,
+        rule: "no permissive AllowAll/AllowAllRepos authorizer constructed in the edge production graph",
+        scan: scan_no_permissive_authorizer_in_prod,
+    }
+}
+
+// ================================================================================================
+// The four scanners as a set (for the baseline-ratchet gate). NOT part of `all_twelve()`.
+// ================================================================================================
+
+/// The four production-graph ABSENCE scanners, in census order (the R2.6 permissive-authorizer
+/// scanner appended). These are NOT wired into `all_twelve()` / `workspace_clean` (the ratchet
+/// idiom); the baseline-ratchet test (`tests/production_graph_absence.rs`) runs this set against a
+/// committed baseline manifest.
 pub fn production_graph_absence_scanners() -> Vec<Lint> {
     vec![
         no_structural_crypto_in_prod(),
         no_in_memory_durable_store(),
         no_bare_tenant_pool(),
+        no_permissive_authorizer_in_prod(),
     ]
 }
 
-/// The stable ids of the three production-graph absence scanners, in census order.
-pub const PRODUCTION_GRAPH_ABSENCE_SCANNERS: [LintId; 3] = [
+/// The stable ids of the four production-graph absence scanners, in census order.
+pub const PRODUCTION_GRAPH_ABSENCE_SCANNERS: [LintId; 4] = [
     NO_STRUCTURAL_CRYPTO_IN_PROD,
     NO_IN_MEMORY_DURABLE_STORE,
     NO_BARE_TENANT_POOL,
+    NO_PERMISSIVE_AUTHORIZER_IN_PROD,
 ];
 
 #[cfg(test)]
@@ -1377,8 +1481,54 @@ mod tests {
         assert!(!no_bare_tenant_pool().run(red).is_empty());
     }
 
+    // ---- R2.6: `no-permissive-authorizer-in-prod` (construction-shaped, edge-scoped) ----------
+
     #[test]
-    fn the_three_scanners_have_distinct_ids() {
+    fn permissive_authorizer_rejects_prod_construction_of_both_fixtures() {
+        let red_action = "fn boot() {\n    let gw = Gateway::builder(authn, human_login, Arc::new(AllowAll));\n}";
+        let red_repo = "fn rooted() -> Backend {\n    Backend { repo_authz: Arc::new(AllowAllRepos) }\n}";
+        let red_qualified = "fn boot() {\n    let a = Arc::new(crate::AllowAll);\n}";
+        for (tag, red) in [("AllowAll", red_action), ("AllowAllRepos", red_repo), ("crate::AllowAll", red_qualified)] {
+            let v = no_permissive_authorizer_in_prod().run(red);
+            assert!(
+                !v.is_empty(),
+                "an un-gated `Arc::new({tag})` construction must fire"
+            );
+        }
+    }
+
+    #[test]
+    fn permissive_authorizer_admits_test_gated_constructions() {
+        // `#[cfg(test)] mod` — the harness-fixture shape used across the edge tests.
+        let cfg_test = "#[cfg(test)]\nmod tests {\n    fn t() { let g = Gateway::builder(a(), h(), Arc::new(AllowAll)); }\n}";
+        // `test-support`-gated (the gate `AllowAll` itself lives behind post-R2.6).
+        let ts = "#[cfg(any(test, feature = \"test-support\"))]\nmod harness {\n    fn t() { let g = Gateway::builder(a(), h(), Arc::new(AllowAllRepos)); }\n}";
+        assert!(no_permissive_authorizer_in_prod().run(cfg_test).is_empty());
+        assert!(no_permissive_authorizer_in_prod().run(ts).is_empty());
+    }
+
+    #[test]
+    fn permissive_authorizer_admits_the_real_policy_and_non_permissive_fixtures() {
+        // The R2.6 production shape — the explicit mounted-action allowlist policy.
+        let real = "fn boot() {\n    let gw = Gateway::builder(authn, human_login, Arc::new(AuthenticatedActionPolicy::mounted()));\n}";
+        // The fail-closed fixtures are NOT permissive — never flagged.
+        let deny = "fn t() {\n    let d = Arc::new(DenyAllRepos);\n    let d2 = Arc::new(DenyAll);\n}";
+        // The type DEFINITION / a doc mention / an impl is not a construction.
+        let def = "/// like `Arc::new(AllowAll)` in tests\npub struct AllowAll;\nimpl Authorizer for AllowAll {\n    fn authorize(&self) -> bool { true }\n}";
+        // A method call on the type is not the unit-struct construction shape.
+        let call = "fn t() {\n    let x = Arc::new(AllowAllRepos::with_flags(f));\n}";
+        assert!(no_permissive_authorizer_in_prod().run(real).is_empty());
+        assert!(no_permissive_authorizer_in_prod().run(deny).is_empty());
+        assert!(
+            no_permissive_authorizer_in_prod().run(def).is_empty(),
+            "definitions/impl/doc mentions must not be flagged — construction only \
+             (the doc-comment `Arc::new(AllowAll)` is stripped by code_lines)"
+        );
+        assert!(no_permissive_authorizer_in_prod().run(call).is_empty());
+    }
+
+    #[test]
+    fn the_four_scanners_have_distinct_ids() {
         let ids: Vec<LintId> = production_graph_absence_scanners()
             .iter()
             .map(|l| l.id)
@@ -1387,6 +1537,6 @@ mod tests {
         let mut s: Vec<&str> = ids.iter().map(|i| i.0).collect();
         s.sort_unstable();
         s.dedup();
-        assert_eq!(s.len(), 3);
+        assert_eq!(s.len(), 4);
     }
 }
