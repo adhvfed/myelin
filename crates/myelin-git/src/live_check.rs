@@ -359,17 +359,24 @@ pub fn add_tuple(
 
 /// The fail-static cache key for a `(subject, permission, object)` authz question. The partition
 /// prefix is the VERIFIED principal's `(tenant, region, id)` (never a path); distinct questions never
-/// collide, two callers asking the same question share the bucket. Returns a `String` the
-/// `FailStaticAuthz` hashes (the cache stores only the coarse answer, not the key).
+/// collide, two callers asking the same question share the bucket. Returns the `String` the
+/// `FailStaticAuthz` cache stores AND compares by value (R2.3: the cache keys on the real key with
+/// `Eq`, not a 64-bit digest — so the key string, not just the coarse answer, is what discriminates
+/// one question from another).
+///
+/// R2.3b: the segments are UNCONSTRAINED user-controlled strings (an OIDC `sub`, a SCIM id, an
+/// object ref carry no charset rule), so we frame them with `encode_authz_key` (length-prefixed,
+/// injective) rather than a `format!` delimiter join — a principal id like `alice::pull@repo:secret`
+/// must NOT be able to forge the key structure and collide with a different (subject, object)
+/// question (a cross-principal cached-ALLOW replay the full-key `Eq` comparison could not catch).
 fn cache_key(subject: &Principal, permission: &Permission, object: &ArtifactRef) -> String {
-    format!(
-        "{}/{}/{}::{}@{}",
+    myelin_substrate::encode_authz_key(&[
         subject.tenant.as_str(),
         subject.region.as_str(),
-        subject.principal_id.0,
-        permission.0,
-        object.0,
-    )
+        &subject.principal_id.0,
+        &permission.0,
+        &object.0,
+    ])
 }
 
 /// `true` exactly when an [`AuthzDecision`] is an `Allow` — the "authenticated traffic survives"
@@ -955,6 +962,40 @@ mod tests {
             k(&alice, &pull, &core),
             k(&alice, &pull, &core),
             "same question, same bucket"
+        );
+    }
+
+    // ── 11b. R2.3b: the cache_key is INJECTIVE — a delimiter-embedding principal id cannot forge the
+    //    key structure and collide with a different (subject, object) question (the cross-principal
+    //    cached-ALLOW replay the length-prefixed encoding closes). This assertion is RED on the old
+    //    `format!("{t}/{r}/{pid}::{perm}@{obj}")` builder (the two keys were byte-identical) and GREEN
+    //    on `encode_authz_key`. ──
+    #[test]
+    fn cache_key_is_injective_against_delimiter_injection() {
+        let pull = Permission(perm::PULL.into());
+
+        // Question A: a principal whose id embeds the git key delimiters, on object `repo:pub`.
+        let alice_evil = subject("alice::pull@repo:secret");
+        let obj_pub = ArtifactRef("repo:pub".into());
+
+        // Question B: a plain `alice` on a crafted object that mirrors A's flattened tail — a DIFFERENT
+        // (subject, object) pair that the naive `format!` join serialized to the SAME string.
+        let alice_plain = subject("alice");
+        let obj_crafted = ArtifactRef("repo:secret::pull@repo:pub".into());
+
+        // The must-have: the two DISTINCT questions map to DISTINCT keys (fails on the old format!).
+        assert_ne!(
+            cache_key(&alice_evil, &pull, &obj_pub),
+            cache_key(&alice_plain, &pull, &obj_crafted),
+            "a delimiter-embedding principal id must NOT collide with a different (subject, object) \
+             question — the R2.3b injective encoding keeps them distinct"
+        );
+
+        // Sanity: the injective key still round-trips to itself (stable, deterministic).
+        assert_eq!(
+            cache_key(&alice_evil, &pull, &obj_pub),
+            cache_key(&alice_evil, &pull, &obj_pub),
+            "the same question is still a stable single key"
         );
     }
 
