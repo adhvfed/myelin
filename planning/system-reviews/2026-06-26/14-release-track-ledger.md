@@ -174,6 +174,31 @@ Residuals: no durable GC verb; NATS-bridge nested block_in_place unproven until 
 
 R1 exit: scanner `no-in-memory-durable-store` baseline **0**; unit tests DB-free; integration green; kill-9 drills.
 
+**R1 EXIT REACHED (2026-07-15, merge `d2b8740`).** `no-in-memory-durable-store` = **0** (12→0 in one
+session); the sole baseline survivor is the out-of-scope attestation structural floor. Closing waves:
+**W3b.5+.6** (`2beaa92`) — THE OUTBOX FLIP (SI-007 closed; ci-controlplane + ci-dispatch binaries went
+durable; kill-9 emit drill 0-lost/0-ghost; verifier probe proved the ratchet fires on un-gating) and
+**W7.3** (`58f2def`, merge `d2b8740`) — FsBlobStore → S3 byte backing (knowledge/chat production
+defaults re-pointed to injection; unwired fs floors gated with it; Backend::Real fail-loud). All 13
+waves this session passed builder → orchestrator gate → independent adversarial verifier → commit;
+~12 real defects fixed pre-commit. Unit tests DB-free (889 suites); integration green on the live
+stack; kill-9 drills green.
+
+**Carried out of R1 (the named follow-ups, in priority order):**
+1. **Shared-outbox drain scoping** (W3b.4 MUST-FIX, in-code at `PgRelay::drain_once_dead_letter`) —
+   BLOCKS the first production consumer / NATS wiring.
+2. **Boot-migrations aggregate (W7.2)** — provider `all_durable_migrations()` at every main;
+   includes the KNOWN EDGE DEFECT (identity tables never migrated at edge boot, doc 18 Part 5) +
+   migrate-as-owner/serve-as-app role split.
+3. **Region-scope sweep (W7.1)** — `provider.with_tenant_tx` hardcodes config.region (residency-bug
+   shape, doc 18 Part 4).
+4. **Result-conversion waves** — KMS/Registry/MisrouteAudit/cost infra-fault panics (routing-path
+   reads must convert BEFORE any serving binary wires route()).
+5. **W7.4 scanner blind-spot widening + W7.5 CT-004b CI slice** (doc 18 Parts 2–3) — the widened
+   coverage obligations; the no-in-memory gate scope is still SPINE-only.
+6. D2 KMS mint-visibility race; durable outbox GC verb; UlidMinter at remaining emit roots as they
+   appear; PrincipalId opaque-id grammar; dedup-vs-0051-0053 boot-apply asymmetry (folds into #2).
+
 ## R2 — authz completion
 
 | # | Item | Status | Commit(s) |
