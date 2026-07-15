@@ -205,12 +205,13 @@ stack; kill-9 drills green.
 |---|---|---|---|
 | R2.1 | Object-level authz at the edge, platform-wide (extends R0.3 seam; git_edge template first) | PENDING | — |
 | R2.1a | **Wire R0.2/R0.3 LIVE** (carried from R0 verifier): production `main.rs` must (a) inject a real grant-backed `RepoAuthorizer` (not the `AllowAllRepos` default) and (b) `register_git_wire` in the production gateway. Until both, the R0.2 branch-protection gate and R0.3 per-repo authz are correct-but-latent. | **DONE** | `239547c` (merge; v2 `453d6af`, superseded reverted v1 `2138fd2`) |
-| R2.2 | Identity `check()` fully-qualified object; EventMatcher + SSE scope likewise | IN BUILD | — |
+| R2.2 | Identity `check()` fully-qualified object; EventMatcher + SSE scope likewise | **DONE** | `25bb2b7` (merge; `59b078c`) |
 | R2.3 | Fail-static authz cache full-key comparison | **DONE** | `2154e38` (merge; `d3ebd3b`+`ff334e8`) |
-| R2.4 | MCP HITL server-side verdict; batch partial-approval by approval-id | IN BUILD | — |
+| R2.4 | MCP HITL server-side verdict; batch partial-approval by approval-id | **DONE** | `d248644` (merge; `d6b9d1e`+`5f60037`) |
+| R2.4-fu | Wire GovernedRouter + durable HitlVerdictStore into MCP prod main (currently GOVERNANCE_NOT_WIRED) | PENDING (tracked; MCP-serve composition root) | — |
 | R2.5 | Real OIDC login at edge; dev-login structurally dead in prod | PENDING | — |
 | R2.6 | AllowAll removed from main.rs + lint | PENDING | — |
-| R2.7 | Search vector-path ACL parity | IN VERIFY | `6c56c42` (worktree, pre-merge) |
+| R2.7 | Search vector-path ACL parity | **DONE** | `f31e310` (merge; `6c56c42`) |
 
 R2 exit: red-team campaign (subagent per subsystem: edge/wire/MCP/SSE/search reach-around) all-denied; AllowAll gone.
 
@@ -252,8 +253,34 @@ Grounding surveys done for all of R2.1a, R2.2, R2.3, R2.4, R2.7 before dispatch.
   **Verifier LOW carry-forwards → R2.1a-followup ledger row:** (#7) grant-first has no compensation on
   create-fail → orphan admin + slug-reuse = cross-user (narrow); (#1) durable-PG create-then-clone
   regression leg; (#2) `object_id_of` collapses namespaced slugs → **routed to R2.2** (not wire-reachable).
-- **R2.2 IN BUILD** — object-qualification of `check()`/`EventMatcher`/SSE (absorbs R2.1a verifier #2).
-- **R2.1a-followup IN BUILD** — #7 compensating grant + #1 durable-PG regression test.
+- **R2.1a-followup DONE (`90ad104`)** — #7 create_repo_as now compensates (exact-inverse `Remove` on
+  create-fail so no orphan admin grant survives for slug-reuse cross-user; double-fail surfaces the orphan
+  loudly; residual = crash between grant-commit and compensation needs a reconciler); #1 durable-PG
+  create-then-clone regression test (two separate durable stores over one `rebac_tuple` table, grant visible
+  to the wire check) passes live. Self-reviewed (LOW hardening); merged.
+- **R2.2 DONE (`25bb2b7`)** — verifier CONFIRMED-SOUND. `myelin_refs::object_key` = the ONE canonical
+  type-qualified key (`type:id`; bare refs are fixed points, URNs normalize, `#sub` roots, malformed→None
+  fail-closed). `check_engine::object_id_of` delegates; `snapshot_view` canonicalizes stored keys on read
+  (writers store verbatim → zero migration). Killed the cross-type leak (`no_cross_type_check` was ALLOW);
+  fixed the R2.1a #2 namespaced-slug carry-forward; EventMatcher now gates type+tenant; SSE `sse_route_scoped`
+  + registration-time panic for object-addressed routes. Live-PG proof. Residual (verifier obs, not a defect):
+  bare-ref `#` stripping is a latent aliasing surface only if a future subsystem admits `#` in an id reaching
+  both write+check — defended today by slug/id allowlists.
+- **R2.4 DONE (`d248644`, +R2.4b `5f60037`)** — verifier CONFIRMED-SOUND. Caller-boolean dead; opaque
+  OsRng gate-id + durable `waiting` verdict row; re-drive presents gateId, GovernedRouter admits only on a
+  stored Approved verdict for the exact (tool+args) effect by a distinct **HUMAN** principal (R2.4b typed
+  `MachineApproverRefused`, kind threaded — closes the two-machine-collusion MEDIUM). Step-6 + batch key
+  per-effect, never bare tool name. New durable `hitl_gate_durable` store; **found+fixed a real boot-migration
+  gap** — `agent_hitl_gate` was declared but never migrated (outside W7.2's 0010–0053 span) → now migration
+  `0054` in the aggregate with a model-vs-boot DDL parity test. Fail-closed on store errors. **KNOWN LATENT
+  (R2.4-fu, tracked):** the full GovernedRouter is not wired into the MCP prod main (`new_catalogue_only` →
+  `GOVERNANCE_NOT_WIRED`), so MCP tool EXECUTION is not live (fail-closed, not a vuln); whoever wires the
+  composition root MUST inject `HitlVerdictStore::with_pg`. Release must not claim MCP execution live.
+
+**R2 REMAINING:** R2.1 (platform-wide object authz — now unblocked by R2.2's `object_key`), R2.5 (OIDC login
+at edge), R2.6 (remove the action-level AllowAll + scanner lint) — all three touch the edge composition root,
+so grounded together and executed as a coordinated edge-main.rs wave to avoid thrashing. Then R2.4-fu +
+the R2 exit red-team campaign.
 
 **Sequencing decisions:** R2.2 (object-qualification of `check`/EventMatcher/SSE) must land AFTER R2.1a —
 it changes tuple-store object keying while R2.1a writes the first production grant tuples; git's
