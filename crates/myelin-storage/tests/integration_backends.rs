@@ -709,3 +709,87 @@ async fn c4_trust_scoped_cache_namespaces_over_real_object_store() {
     .await
     .expect("blocking C4 cache task");
 }
+
+/// **MR-009b W7.3 — the `FsBlobStore`→S3 byte-durability flip, PROVEN on the LIVE object store.**
+/// (Census SI-014/015/029; P-ST-30.) The two production `BlobStore` holders (knowledge
+/// `KnowledgeStore` + chat `ColdSegments`) were re-pointed OFF the in-memory `FsBlobStore` floor onto
+/// the config-selected DURABLE backing `SubstrateProvider::blob_store()` returns — i.e.
+/// `backend::blob_store(Backend::Real, …)` = [`myelin_storage::s3blob::S3BlobStore`]. This proves the
+/// property the fs floor LACKED and the flip delivers: a blob PUT through that seam SURVIVES a fresh
+/// store reconstruction (a kill-9 equivalent — the `Mutex<HashMap>` floor would have lost it with the
+/// process), and the re-hash-on-read address verify still holds after reconstruction.
+///
+/// The integrity-REFUSAL-on-corruption half of STOR-D7 on the S3 arm is proven by
+/// [`git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption`] (above): a direct
+/// out-of-band S3 overwrite → `BlobError::IntegrityFail` on read. This test covers the DURABILITY
+/// half (survives reconstruction) through the exact selection seam the re-points now use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn w7_3_blob_flip_survives_a_fresh_s3_store_reconstruction() {
+    use myelin_storage::backend::{blob_store, Backend};
+    use myelin_storage::blob::ContentHash;
+    use myelin_tenancy::TenantId;
+
+    let handle = tokio::runtime::Handle::current();
+    let tenant = TenantId(format!("itest-w73-{}", std::process::id()));
+    let payload = b"a re-pointed knowledge/chat blob that MUST survive a process restart".to_vec();
+    let endpoint = MyelinConfig::dev().s3.endpoint.clone();
+
+    // (1) PUT through the SAME durable selection seam the re-points select (`provider.blob_store()` →
+    //     `backend::blob_store(Backend::Real, …)` = `S3BlobStore`). Then DROP the store — the
+    //     "process" that wrote the bytes is gone (the kill-9 equivalent).
+    let hash = {
+        let tenant = tenant.clone();
+        let payload = payload.clone();
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = blob_store(Backend::Real, &MyelinConfig::dev(), handle);
+            store
+                .put(&tenant, &payload)
+                .expect("put through the durable Backend::Real seam")
+        })
+        .await
+        .expect("blocking put task")
+    };
+
+    // (2) A brand-NEW store (a fresh `S3BlobStore` over the same bucket — the restarted process) reads
+    //     the bytes back: they SURVIVED the reconstruction, and re-hash-on-read verifies the address.
+    let got = {
+        let tenant = tenant.clone();
+        let hash = hash.clone();
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let fresh = blob_store(Backend::Real, &MyelinConfig::dev(), handle);
+            fresh
+                .get(&tenant, &hash)
+                .expect("the bytes survived a FRESH store reconstruction (byte-durable, kill-9)")
+        })
+        .await
+        .expect("blocking get task")
+    };
+
+    assert_eq!(
+        got, payload,
+        "W7.3: bytes PUT through the durable Backend::Real seam SURVIVE a fresh store reconstruction \
+         (kill-9) — the property the in-memory FsBlobStore floor could NOT provide"
+    );
+    // Belt-and-braces: the surviving bytes re-hash to the SAME content address (address-verified serve).
+    assert_eq!(
+        ContentHash::blake3(&got),
+        hash,
+        "the reconstructed durable backing serves address-verified bytes (re-hash-on-read holds)"
+    );
+
+    // Cleanup the probe object via one more fresh store (S3 delete is idempotent).
+    let _ = tokio::task::spawn_blocking(move || {
+        let s = blob_store(Backend::Real, &MyelinConfig::dev(), handle);
+        let _ = s.delete(&tenant, &hash);
+    })
+    .await;
+
+    println!(
+        "[W7.3 INTEGRATION GREEN] FsBlobStore→S3 flip: a blob PUT through Backend::Real (the seam \
+         provider.blob_store() + the knowledge/chat re-points select) SURVIVES a FRESH S3BlobStore \
+         reconstruction on the live dev stack ({endpoint}) — byte-durable, unlike the in-memory fs \
+         floor. Integrity-refusal on the S3 arm: git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption."
+    );
+}

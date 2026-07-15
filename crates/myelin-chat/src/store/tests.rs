@@ -727,7 +727,7 @@ fn chat_cold_blob_store_swap_is_byte_identical_fs_to_fs() {
 fn cold_segments_is_generic_over_the_blob_store_backing() {
     // The default-backing cold tier (FsBlobStore) and an explicit-backing one (also FsBlobStore,
     // standing in for S3BlobStore in prod) seal the SAME batch and read back the SAME rows.
-    let default_tier: ColdSegments = ColdSegments::new();
+    let default_tier: ColdSegments<myelin_storage::FsBlobStore> = ColdSegments::new();
     let explicit_tier: ColdSegments<myelin_storage::FsBlobStore> =
         ColdSegments::with_blob_store(myelin_storage::FsBlobStore::new());
 
