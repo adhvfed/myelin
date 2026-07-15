@@ -170,7 +170,11 @@ impl Registry {
 /// The cache key is the [`DiscoverKey`]; the value is the [`RouteTuple`]. The `discovery_cache_hit`
 /// signal increments on every served route (fresh-from-cache or stale-fail-static).
 pub struct DiscoveryCache<C: Clock = SystemClock> {
-    inner: FailStatic<RouteTuple, C>,
+    // Keyed by the REAL [`DiscoverKey`] (compared by `Eq`, never a 64-bit digest) — two distinct
+    // keys that collide in a hash land in distinct entries, so a route cached for one tenant/slug
+    // can never be served for another (R2.3; the same full-key-comparison invariant the authz path
+    // relies on, here for routing).
+    inner: FailStatic<DiscoverKey, RouteTuple, C>,
     discovery_cache_hit: AtomicU64,
     misroute_count: AtomicU64,
 }
@@ -259,7 +263,7 @@ impl<C: Clock> DiscoveryCache<C> {
         // We track whether the upstream was actually reached this call, so a cache serve (the
         // fail-static path) increments `discovery_cache_hit` while a fresh upstream read does not.
         let reached_upstream = std::cell::Cell::new(false);
-        let answer = self.inner.get(key, || match discover_cp(key) {
+        let answer = self.inner.get(key.clone(), || match discover_cp(key) {
             // The CP answered with a route → fresh upstream read (cache it).
             Ok(Some(route)) => {
                 reached_upstream.set(true);

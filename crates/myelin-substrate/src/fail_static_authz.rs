@@ -142,8 +142,11 @@ impl AuthzDecision {
 pub struct FailStaticAuthz<C: Clock = SystemClock> {
     /// The substrate bounded-staleness mechanism (P-S18). The `static_max` (W) it was constructed
     /// with is the thresholds-file bound; the constructor enforced
-    /// `agent_token_ttl ≤ static_max ≤ revocation_sla` structurally.
-    inner: FailStatic<CoarseAuthz, C>,
+    /// `agent_token_ttl ≤ static_max ≤ revocation_sla` structurally. Keyed by the OWNED `String`
+    /// authz discriminator (the verified `(tenant, region, subject, permission@object)` the caller
+    /// builds) — the cache compares the FULL key, so two distinct questions that collide in a hash
+    /// can never share one cached grant (R2.3; no 64-bit-hash aliasing).
+    inner: FailStatic<String, CoarseAuthz, C>,
 }
 
 impl<C: Clock> std::fmt::Debug for FailStaticAuthz<C> {
@@ -212,7 +215,9 @@ impl<C: Clock> FailStaticAuthz<C> {
     ///
     /// - `key` is the cache key (the verified `(tenant, region, subject, permission@object)`
     ///   discriminator built by the caller — distinct authz questions never share one cached
-    ///   grant; the partition prefix comes from a verified token, never a path).
+    ///   grant; the partition prefix comes from a verified token, never a path). Accepted as
+    ///   anything that owns into a `String`; the cache compares the FULL key by value (never a
+    ///   64-bit digest), so a hash collision between two distinct questions cannot alias grants (R2.3).
     /// - `at` is the read consistency: `Strong` (zookie-stamped) BYPASSES the cache (4.10);
     ///   `BoundedStale` consults it.
     /// - `subject_revoked` is the caller's revocation consult (the S7 denylist): a subject revoked
@@ -223,9 +228,9 @@ impl<C: Clock> FailStaticAuthz<C> {
     ///   hiccup it returns `Err` (the cache serves the bounded-staleness fallback, or fails
     ///   closed). A drill drives the hiccup by making `source` return `Err` (the harness routes
     ///   the **P-S03 `DependencyBreaker`** consult into this).
-    pub fn serve<K: std::hash::Hash>(
+    pub fn serve(
         &self,
-        key: K,
+        key: impl Into<String>,
         at: &Consistency,
         subject_revoked: bool,
         source: impl Fn() -> Result<Decision, ServeError>,
@@ -262,7 +267,7 @@ impl<C: Clock> FailStaticAuthz<C> {
                 // `FailStatic::get` runs the source; on success it caches the coarse answer + serves
                 // it Fresh; on a hiccup it serves the last coarse grant Static (within W) or Closed
                 // (past W / no fallback). Only a real authoritative answer is ever cached.
-                let answer = self.inner.get(key, || source().map(CoarseAuthz::of));
+                let answer = self.inner.get(key.into(), || source().map(CoarseAuthz::of));
                 serve_answer(answer)
             }
         }
@@ -509,14 +514,24 @@ mod tests {
         );
     }
 
-    /// **Distinct keys do not share a cache bucket — no cross-actor/cross-question leak.** A grant
-    /// cached for one key does not serve a different key's hiccup.
+    /// **Distinct keys do not share a cache bucket — no cross-actor/cross-question leak (R2.3).** A
+    /// grant cached for one full key does not serve a DIFFERENT full key's hiccup. The cache compares
+    /// the whole `(tenant, region, subject, permission@object)` string by value (never a 64-bit
+    /// digest), so a different subject or a different question can never replay another's cached
+    /// ALLOW — even while that ALLOW is live-and-stale in the cache (the cross-actor authz leak the
+    /// full-key comparison shuts).
     #[test]
     fn distinct_keys_do_not_share_a_cache_bucket() {
         let fs = authz_at(1_000);
         let _ = fs.serve("acme|eu|alice|read@doc:1", &bounded_stale(), false, allow);
         fs.clock().advance(31);
-        // a different subject / question / tenant has no cached grant → a hiccup fails closed.
+        // Alice's OWN grant is live-and-stale right now (proving the cache is NOT simply empty) …
+        let alice = fs.serve("acme|eu|alice|read@doc:1", &bounded_stale(), false, hiccup);
+        assert!(
+            alice.is_allow() && alice.is_degraded(),
+            "alice's stale ALLOW is live in the cache"
+        );
+        // … yet a different subject / question / tenant has no cached grant → a hiccup fails closed.
         let other = fs.serve("acme|eu|bob|read@doc:1", &bounded_stale(), false, hiccup);
         assert!(other.is_deny(), "bob must not borrow alice's cached grant");
         let other_q = fs.serve("acme|eu|alice|write@doc:1", &bounded_stale(), false, hiccup);

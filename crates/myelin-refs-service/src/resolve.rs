@@ -512,7 +512,7 @@ impl ResolveService {
         // permission verdict (the production wire is the named ResilientClient floor). On a transient
         // Id hiccup the closure returns Err(ServeError) → the fail-static cache decides (degrade /
         // closed). We capture the owner's authoritative decision through the closure.
-        let decision: AuthzDecision = self.authz.serve(&key, at, subject_revoked, || {
+        let decision: AuthzDecision = self.authz.serve(key, at, subject_revoked, || {
             self.owner
                 .check_view(tenant, region, root, viewer, &perm)
                 .map_err(|e| ServeError(format!("identity check hiccup: {e:?}")))
