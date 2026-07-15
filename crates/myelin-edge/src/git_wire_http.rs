@@ -116,6 +116,7 @@ fn map_durable_to_wire(e: myelin_git::durable::DurableError) -> EdgeError {
         {
             EdgeError::BadRequest(m)
         }
+        DurableError::Forbidden(m) => EdgeError::Forbidden(m),
         other => EdgeError::Internal(format!("git push error: {other}")),
     }
 }
