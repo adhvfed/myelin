@@ -190,6 +190,19 @@ fn seed_principal(store: &PrincipalStore, tenant: &str, pid: &str, subject_key: 
 }
 
 fn build(root: &Path) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBackend>) {
+    build_with_authz(
+        root,
+        Arc::new(DurableGitBackend::rooted_inmem_for_test(root.to_path_buf())),
+    )
+}
+
+/// Same as [`build`] but with a caller-supplied backend (so a test can inject a restrictive per-repo
+/// authorizer — e.g. a write-only-but-NOT-protected_push grant to prove the R2-exit wire denial).
+fn build_with_authz(
+    root: &Path,
+    backend: Arc<DurableGitBackend>,
+) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBackend>) {
+    let _ = root;
     let cell = CellTokenAuthority::from_seed(&[7u8; 32], &[9u8; 32]).expect("cell");
     let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
     seed_principal(&store, "acme", "svc:agent", "subj-1");
@@ -202,7 +215,6 @@ fn build(root: &Path) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBacken
     let human = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
         Arc::new(KmsEngine::new()),
     )));
-    let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(root.to_path_buf()));
     let builder = Gateway::builder(authn, human, Arc::new(AllowAll))
         .default_token_scheme(SCHEME)
         .route(
@@ -624,5 +636,83 @@ async fn r0_2_branch_protection_rejects_force_push_through_the_live_wire() {
     );
 
     println!("=== R2.1a/R0.2 ORACLE PROVEN: branch protection fires through the LIVE wire (force-push rejected, ref unmoved) ===");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ═══════════════ R2-EXIT BLOCKER — a plain WRITER's direct push to a protected ref is DENIED ═══════
+//
+// The red-team exploit, over the REAL wire: a principal holding only a `write` grant (NO
+// `admin`/`protected_push`) pushes DIRECTLY to a protected `main` whose repo-owned ruleset requires a
+// human approval. Defect 2 (the wire consults R2.1's admin-only `RepoPermission::ProtectedPush` rung —
+// a writer lacks it) + Defect 3 (the full ruleset, not just contexts — a direct push carries 0
+// approvals) compose so the push is REJECTED at the wire (`ng`), the ref never moves, and NO event is
+// emitted.
+
+/// **THE EXPLOIT, FLIPPED TO DENIED (end-to-end).** A write-only principal's direct `git push` to a
+/// protected `main` that requires an approval is refused over the wire; the ref is never created/moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writer_direct_push_to_protected_ref_is_refused_over_the_wire() {
+    if !require_or_skip("r2-exit writer→protected-push oracle") {
+        return;
+    }
+    let Some(_rootfs) = git_rootfs() else { return };
+
+    let root = temp_root("r2exit-writer");
+    // A backend whose per-repo authorizer grants the pushing principal (svc:agent) WRITE only — NOT
+    // protected_push (`writer` in the frozen lattice; `protected_push = admin`). So the wire Write gate
+    // ADMITS the push, but the protected-ref gate does not find the admin bypass, and holds the direct
+    // push to the full ruleset.
+    let backend = Arc::new(
+        DurableGitBackend::rooted_inmem_for_test(root.to_path_buf()).with_repo_authorizer(Arc::new(
+            myelin_edge::GrantBackedRepos::new().grant_write("svc:agent", "acme", "widgets"),
+        )),
+    );
+    backend
+        .create_repo("acme", REGION, "widgets")
+        .expect("create server repo");
+    // Repo-owned protection: `main` requires ONE approval — unsatisfiable by a DIRECT push (no PR).
+    backend
+        .set_branch_protection(
+            "acme",
+            REGION,
+            "widgets",
+            &serde_json::json!({
+                "rulesets": [{
+                    "ref_pattern": "refs/heads/main",
+                    "required_approvals": 1
+                }]
+            }),
+        )
+        .expect("set branch protection");
+
+    let (gw, cell, backend) = build_with_authz(&root, backend);
+    let addr = spawn(gw).await;
+    let token = mint(&cell, "acme", "jti-writer");
+
+    let depth_before = backend.outbox().outbox_depth();
+    let work = make_work(&root);
+
+    let (ok, so, se) = git_push(addr, Some(&token), "/acme/eu-west/widgets.git", &work);
+    println!("=== writer direct push to PROTECTED main — must be refused ===\nsuccess={ok}\nstdout=\n{so}\nstderr=\n{se}");
+    assert!(
+        !ok,
+        "a plain writer's direct push to a protected ref MUST be refused (needs protected_push OR a satisfied full ruleset)"
+    );
+    assert!(
+        se.contains("remote rejected") || so.contains("remote rejected"),
+        "the rejection is the server's per-ref `ng` (remote rejected): {se}"
+    );
+    assert_eq!(
+        durable_tip(&root, "acme", "widgets", "refs/heads/main"),
+        None,
+        "the protected ref MUST NOT be created by the refused writer push (0 ghost)"
+    );
+    assert_eq!(
+        backend.outbox().outbox_depth(),
+        depth_before,
+        "a refused push emits NO git.ref.updated event"
+    );
+
+    println!("=== R2-EXIT ORACLE PROVEN: writer→protected-branch direct push DENIED over the live wire ===");
     let _ = std::fs::remove_dir_all(&root);
 }
