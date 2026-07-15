@@ -57,7 +57,7 @@
 //!   from the auth spine); its removal belongs to the CI/attestation track, NOT this auth prompt. Left
 //!   honestly in the baseline (the scanner stays at 1 remaining structural entry).
 //!
-//! ### `no-in-memory-durable-store` (11) — the spine durable-persistence waves (P-522/523)
+//! ### `no-in-memory-durable-store` (9) — the spine durable-persistence waves (P-522/523)
 //! - **MR-009b Wave 2 FLIPPED the 3 identity spine stores GREEN (17→14):**
 //!   `principal_store.rs` `PrincipalStore` (SI-018), `tuple_store.rs` `TupleStore` (SI-019), and
 //!   `revocation.rs` `RevocationStore` (SI-020) are now durable-by-default. Their in-memory
@@ -70,9 +70,23 @@
 //!   `myelin-identity-service/test-support` dev-dependency.
 //!   (`machine_auth.rs:347 S7Denylist` SI-020 was an entry here; MR-011 DELETED the stub type and
 //!   routed `CapabilityAuthenticator`'s revocation consult through the durable `RevocationStore`.)
-//! - `myelin-identity-service/src/pseudonym_store.rs:191` — `PseudonymStore` (S2) in-mem (SI-018 cluster; MR-007/009)
-//! - `myelin-identity-service/src/pseudonym_erase.rs:268` — `PseudonymErasureLedger` in-mem via the
-//!     `type LedgerByPartition = BTreeMap<…>` ALIAS (alias false-negative closed; census 10.8; MR-007/009)
+//! - **MR-009b Wave 6a FLIPPED the 2 identity S2 pseudonym holders GREEN (11→9):**
+//!   `pseudonym_store.rs` `PseudonymStore` (S2, SI-018 cluster) and `pseudonym_erase.rs`
+//!   `PseudonymErasureLedger` (census 10.8) are now durable-by-default. Their in-memory backing
+//!   (`Memory(Arc<Mutex<Inner>>)` for S2; `Memory(Arc<Mutex<LedgerByPartition>>)` for the ledger) +
+//!   the `Inner` struct + the `LedgerByPartition` alias + the in-memory `::new()` constructors are
+//!   `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLES; the always-compiled PRODUCTION
+//!   backend is the pool-backed `Pg(..)`/`with_pg` path over the MR-022 provider. S2 persists to the
+//!   tightest-RLS `pseudonym_map` table (KMS-sealed real-identity link, ciphertext-only — the
+//!   per-subject DEK stays in the KMS); the erasure ledger persists to the NON-shred-erasable, NO-RLS
+//!   `identity_pseudonym_erasure_ledger` (10.8 — it must survive the crypto-shred it records + a
+//!   restore so ID-D8 re-erasure can replay it). Backings + migrations (`0020`/`0021`/`0022`) live in
+//!   `myelin_storage::pseudonym_durable`; the production `StoreBackedCheck::with_pg` composition root
+//!   wires the durable pair (the in-memory pair is the `test-support`-gated double `with_index`
+//!   wires). The scanner strips the `test-support`-gated `Memory` arms, so both production backend
+//!   enums present POOL-ONLY → the two entries are REMOVED. Durable-by-default proven live on PG
+//!   (`integration_mr009b_w6a_pseudonym_durable`); DB-free unit tests use the doubles via the
+//!   `myelin-identity-service/test-support` dev-dependency.
 //! - `myelin-events/src/outbox.rs:230`                    — `OutboxStore` in-mem (SI-007; events durable MR, P-522/523)
 //! - **MR-009b Wave 3 FLIPPED the `DedupLedger` (SI-023) GREEN:** `dedup.rs` `DedupLedger` is now
 //!   durable-by-default. The `Memory(Arc<Mutex<HashSet>>)` backend variant + its `Default` + the
@@ -389,6 +403,12 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-control-plane/src/registry.rs",
         111,
     ),
+    // `myelin-identity-service/src/pseudonym_store.rs:191` `PseudonymStore` (S2, SI-018 cluster) —
+    // REMOVED by MR-009b Wave 6a (the `Memory(Arc<Mutex<Inner>>)` variant + `Inner` + `::new()` are
+    // now `#[cfg(any(test, feature = "test-support"))]` test doubles; the always-compiled backend is
+    // the pool-backed `Pg(PgPseudonymBacking)`/`with_pg` over the durable `pseudonym_map` table). The
+    // production backend enum presents non-in-memory → the scanner no longer fires. See the
+    // flipped-GREEN note in the module docs above.
     // `myelin-events/src/dedup.rs:141` `DedupLedger` (SI-023) — REMOVED by MR-009b Wave 3 (the
     // `Memory` variant + `::new()` + `Default` are now `#[cfg(any(test, feature = "test-support"))]`
     // test doubles; the always-compiled backend is the pool-backed `Durable(Arc<dyn DurableDedup>)`
@@ -413,13 +433,9 @@ const BASELINE: &[(&str, &str, usize)] = &[
     // so `PrincipalStore`/`TupleStore`/`RevocationStore` no longer hold an in-memory collection in the
     // production graph — the three former entries (principal_store.rs:289, tuple_store.rs:220,
     // revocation.rs:193) are REMOVED (17→14). Durable-by-default is proven live on PG (mr007/008/009/
-    // 011); the DB-free unit tests use the doubles via `test-support`. The S2 pseudonym store below
-    // STAYS in-memory (its durable backing is the named W6 follow-on — a SEPARATE baseline entry).
-    (
-        "no-in-memory-durable-store",
-        "crates/myelin-identity-service/src/pseudonym_store.rs",
-        191,
-    ),
+    // 011); the DB-free unit tests use the doubles via `test-support`. The S2 pseudonym store +
+    // erasure ledger were flipped GREEN by MR-009b Wave 6a (their durable backings are now the
+    // always-compiled default — see the flipped-GREEN notes above/below).
     // `S7Denylist` (SI-020) — REMOVED by MR-011 (the carried-forward fix is DISCHARGED). The
     // machine-auth `authenticate` revocation CONSULT was a bare `Arc<Mutex<BTreeSet<String>>>` of
     // revoked jtis with NO durable backing (lost every revocation on restart → a revoked token would
@@ -455,15 +471,13 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-storage/src/restore_verify.rs",
         175,
     ),
-    // -- closed false-negatives (verifier MR-004 review): alias / Vec / FsBlobStore / audit sink --
-    (
-        // `PseudonymErasureLedger` — field `inner: Arc<Mutex<LedgerByPartition>>` where the alias
-        // `type LedgerByPartition = BTreeMap<…>` hid the collection from a literal-token scan
-        // (census 10.8; must survive restore). → MR-007/009 (P-522/523).
-        "no-in-memory-durable-store",
-        "crates/myelin-identity-service/src/pseudonym_erase.rs",
-        268,
-    ),
+    // -- closed false-negatives (verifier MR-004 review): Vec / FsBlobStore / audit sink --
+    // (`PseudonymErasureLedger`, pseudonym_erase.rs:268 — the `type LedgerByPartition = BTreeMap<…>`
+    //  ALIAS false-negative — was here; MR-009b Wave 6a FLIPPED it GREEN: the `Memory` arm + the
+    //  `LedgerByPartition` alias + `::new()` are now `test-support`-gated test doubles, and the
+    //  always-compiled backend is the pool-backed `Pg(PgErasureLedgerBacking)`/`with_pg` over the
+    //  NON-shred-erasable, NO-RLS `identity_pseudonym_erasure_ledger` table (10.8 — it survives the
+    //  crypto-shred it records + a restore). The production enum presents non-in-memory → removed.)
     (
         // `InMemoryPostPitLedger` — field `records: Vec<ErasureRecord>` (hidden until `Vec<` was
         // added to the collection tokens). Post-restore re-erasure ledger. → P-ST-14 / P-522/523.
@@ -576,12 +590,14 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
     // un-wired gate). The counts pin the manifest shape.
     assert_eq!(
         BASELINE.len(),
-        12,
-        "the committed baseline has 12 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
+        10,
+        "the committed baseline has 10 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
          GREEN: 17 → 14 — PrincipalStore/TupleStore/RevocationStore are durable-by-default, their \
          in-memory doubles `test-support`-gated; MR-009b Wave 3 flipped the events `DedupLedger` \
          (SI-023) — `dedup.rs:141` removed → 14 → 13; MR-009b Wave 5 flipped the `KmsEngine` \
-         (SI-006) durable-by-default — `kms.rs:622` removed → 13 → 12)"
+         (SI-006) durable-by-default — `kms.rs:622` removed → 13 → 12; MR-009b Wave 6a flipped the 2 \
+         identity S2 pseudonym holders (PseudonymStore + PseudonymErasureLedger) durable-by-default — \
+         pseudonym_store.rs:191 + pseudonym_erase.rs:268 removed → 12 → 10)"
     );
     let structural = BASELINE
         .iter()
@@ -604,17 +620,19 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          to the CI track."
     );
     assert_eq!(
-        in_memory, 11,
-        "11 in-memory durable-store sites: MR-009b Wave 2 FLIPPED the 3 identity spine stores \
+        in_memory, 9,
+        "9 in-memory durable-store sites: MR-009b Wave 2 FLIPPED the 3 identity spine stores \
          (PrincipalStore/TupleStore/RevocationStore) durable-by-default (16→13), MR-009b Wave 3 \
-         FLIPPED the events `DedupLedger` (SI-023) durable-by-default (13→12), and MR-009b Wave 5 \
-         FLIPPED the `KmsEngine` (SI-006) durable-by-default — its `Memory(KmsCore)` arm + \
-         `::new()`/`Default`/`from_root` are now `test-support`-gated test doubles and the \
-         always-compiled production backend is the MR-025 software-sealed durable store \
-         (`load_or_generate` + write-through on every mutation) the edge boot root wires (12→11). \
-         The remaining 11 (S2 pseudonym + erasure ledger; events OUTBOX (SI-007, a separate \
-         higher-coupling wave) + reerase; control-plane registry/bridge/misroute; storage \
-         reserve/restore/reerase/blob) flip in the later waves."
+         FLIPPED the events `DedupLedger` (SI-023) durable-by-default (13→12), MR-009b Wave 5 \
+         FLIPPED the `KmsEngine` (SI-006) durable-by-default (12→11), and MR-009b Wave 6a FLIPPED \
+         the 2 identity S2 pseudonym holders — `PseudonymStore` (pseudonym_store.rs:191) + \
+         `PseudonymErasureLedger` (pseudonym_erase.rs:268): their `Memory` arms + `Inner`/ \
+         `LedgerByPartition` + `::new()` are now `test-support`-gated test doubles and the \
+         always-compiled production backend is the pool-backed `Pg`/`with_pg` over the durable \
+         `pseudonym_map` + non-shred-erasable `identity_pseudonym_erasure_ledger` tables the \
+         production `StoreBackedCheck::with_pg` composition root wires (11→9). The remaining 9 \
+         (events OUTBOX (SI-007, a separate higher-coupling wave) + reerase; control-plane \
+         registry/bridge/misroute; storage reserve/restore/reerase/blob) flip in the later waves."
     );
     assert_eq!(
         bare_pool, 0,

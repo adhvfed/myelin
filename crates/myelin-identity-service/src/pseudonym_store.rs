@@ -64,8 +64,13 @@ use myelin_storage::{
     TenantScope, TenantTable,
 };
 use myelin_tenancy::{Region, TenantId};
+// `HashMap`/`Mutex` back the in-memory test-double [`Inner`] only (MR-009b Wave 6a — `test-support`-
+// gated); the durable production path is the PG backing, so they are absent from the default build.
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Mutex;
 
 /// The S2 store's tenant-owned table name (the `(tenant, region)`-first, tightest-RLS table). Every
 /// access is built through [`TenantQuery::for_table`] over THIS table, so a pseudonym read/write
@@ -95,6 +100,10 @@ pub enum PseudonymError {
         /// The offending rendering (for the audit log) — PII-free (it is a pseudonym handle).
         handle: String,
     },
+    /// The durable PG backing failed (a connection/query error from the live store, MR-009b W6a) — a
+    /// LOUD typed value, never a silent partial write/read. Distinct from [`PseudonymError::Kms`] (a
+    /// key failure) so the verifier can tell a storage fault from a crypto fault.
+    Storage(String),
 }
 
 impl core::fmt::Display for PseudonymError {
@@ -114,6 +123,11 @@ impl core::fmt::Display for PseudonymError {
                 f,
                 "pseudonym handle `{handle}` does not match the frozen \
                  `<pseudonym>@<tenant>.noreply` grammar for the verified tenant (refused)"
+            ),
+            PseudonymError::Storage(why) => write!(
+                f,
+                "pseudonym-map durable backing error (the read/write did NOT succeed — never a \
+                 silent partial write): {why}"
             ),
         }
     }
@@ -162,6 +176,13 @@ pub struct PseudonymRow {
 
 /// The shared inner state of a [`PseudonymStore`] (behind `Arc<Mutex<…>>` so the store is a
 /// cloneable handle and a write is atomic under one lock).
+///
+/// **MR-009b Wave 6a — TEST DOUBLE (compiled ONLY under `#[cfg(any(test, feature = "test-support"))]`).**
+/// The PRODUCTION default is the durable PG backing ([`PgPseudonymBacking`], via
+/// [`PseudonymStore::with_pg`]); this in-memory `Inner` is the DB-free unit-test double downstream
+/// crates reach via the `test-support` dev-dependency. The `no-in-memory-durable-store` scanner treats
+/// a `test-support`-gated backing as a test double, so S2 leaves the baseline (SI-018 cluster).
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 struct Inner {
     /// The committed mapping rows, keyed by `(tenant, region)` partition then the opaque subject
@@ -189,7 +210,10 @@ struct Inner {
 /// reach another tenant's partition.
 #[derive(Clone)]
 pub struct PseudonymStore {
-    inner: Arc<Mutex<Inner>>,
+    /// The durable backing — the REAL PG `pseudonym_map` table (MR-009b W6a) on the production path,
+    /// or the in-memory test-double on the default DB-free build. The system-of-record is the Pg
+    /// backing; the in-memory map is an explicit test double.
+    backend: PseudonymBackend,
     /// The KMS engine the store seals/opens the real-identity link through (the L0→L1→L2 hierarchy,
     /// P-058). The link is sealed under the per-SUBJECT DEK ([`KeyClass::Subject`]) — the GD-4
     /// individual crypto-shred lever, distinct from the per-tenant DEK.
@@ -199,17 +223,80 @@ pub struct PseudonymStore {
     holder: OltpStoreHolder,
 }
 
+/// The S2 store backing: the REAL durable PG `pseudonym_map` table (MR-009b W6a) — the PRODUCTION
+/// default — or the in-memory test-double. Splitting the backing OUT of the role struct's direct
+/// fields is what lets the `no-in-memory-durable-store` ratchet record the shortcut's removal: the
+/// PRODUCTION-compiled enum presents ONLY the pool-backed `Pg` variant (the `Memory` variant is
+/// `test-support`-gated, which the scanner strips as a test double), so `PseudonymStore` no longer
+/// holds an in-memory collection in the production graph. The real-identity link is KMS-sealed in BOTH
+/// backings; the Pg backing persists only the OPAQUE ciphertext (the per-subject DEK stays with the
+/// KMS engine — MR-025 boundary).
+#[derive(Clone)]
+enum PseudonymBackend {
+    /// The in-memory test-double — MR-009b Wave 6a: compiled ONLY under
+    /// `#[cfg(any(test, feature = "test-support"))]`. NOT the production system-of-record.
+    #[cfg(any(test, feature = "test-support"))]
+    Memory(Arc<Mutex<Inner>>),
+    /// The REAL durable PG backing over the MR-022 provider pool + `with_tenant_tx` convention — the
+    /// PRODUCTION DEFAULT (always compiled).
+    Pg(PgPseudonymBacking),
+}
+
+/// The PG-backed S2 pseudonym backing (MR-009b W6a): the durable `pseudonym_map` table + the
+/// sync→async bridge (`tokio::runtime::Handle` driving `block_in_place`+`block_on`). The production
+/// default (always compiled).
+#[derive(Clone)]
+struct PgPseudonymBacking {
+    backing: Arc<myelin_storage::DurablePseudonymBacking>,
+    rt: tokio::runtime::Handle,
+}
+
+impl PgPseudonymBacking {
+    /// Drive an async backing call from the sync store API (the `block_in_place`+`block_on` bridge).
+    fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
+        tokio::task::block_in_place(|| self.rt.block_on(fut))
+    }
+}
+
 impl PseudonymStore {
-    /// Build the S2 store over a service-owned [`KmsEngine`] (the same engine the cell's stores
-    /// share, P-058). The store auto-registers as a `PersonalDataHolder` on construction (opening IS
-    /// registering, §3.4) so the registration is structural, never an afterthought.
+    /// Build the S2 store over the in-memory TEST-DOUBLE backing (MR-009b Wave 6a: compiled ONLY under
+    /// `#[cfg(any(test, feature = "test-support"))]`). The PRODUCTION constructor is
+    /// [`PseudonymStore::with_pg`] (the durable PG default); this `::new` is the DB-free unit-test
+    /// entry point downstream crates reach via the `test-support` dev-dependency. The store
+    /// auto-registers as a `PersonalDataHolder` on construction (opening IS registering, §3.4) so the
+    /// registration is structural, never an afterthought.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(kms: Arc<KmsEngine>) -> PseudonymStore {
         let holder = OltpStoreHolder::new(S2_HOLDER);
         // Opening IS registering (§3.4, GD-3): the S2 store auto-registers the moment it is built,
         // so "we forgot the pseudonym map" is structurally impossible.
         let _receipt = holder.register();
         PseudonymStore {
-            inner: Arc::new(Mutex::new(Inner::default())),
+            backend: PseudonymBackend::Memory(Arc::new(Mutex::new(Inner::default()))),
+            kms,
+            holder,
+        }
+    }
+
+    /// **Build the S2 store over the REAL durable PG backing (MR-009b W6a / SI-018 cluster).** The
+    /// mapping rows + the KMS-sealed real-identity-link ciphertext persist through the MR-022
+    /// [`myelin_storage::SubstrateProvider`] pool + `with_tenant_tx` convention (tightest-RLS-scoped,
+    /// no GUC bleed). `rt` is the tokio runtime handle the sync API drives the async backing on. The
+    /// KMS engine is reused as-is (the per-subject-DEK seal boundary is unchanged); decrypt-across-
+    /// restart depends on the durable KMS root (MR-025). Auto-registers as a holder. **The PRODUCTION
+    /// default (MR-009b Wave 6a) — always compiled.**
+    pub fn with_pg(
+        kms: Arc<KmsEngine>,
+        backing: myelin_storage::DurablePseudonymBacking,
+        rt: tokio::runtime::Handle,
+    ) -> PseudonymStore {
+        let holder = OltpStoreHolder::new(S2_HOLDER);
+        let _receipt = holder.register();
+        PseudonymStore {
+            backend: PseudonymBackend::Pg(PgPseudonymBacking {
+                backing: Arc::new(backing),
+                rt,
+            }),
             kms,
             holder,
         }
@@ -271,7 +358,6 @@ impl PseudonymStore {
         // (1) The tenant-predicate floor: the whole write is built from the verified scope (no
         //     cross-tenant write path). A tenant-less write is unconstructable.
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S2_TABLE));
-        let part_key = Self::part_key(scope);
 
         // (2) The handle is bound to the verified tenant — refuse a handle whose tenant label is not
         //     the verified scope's tenant (a forged/cross-tenant handle never lands).
@@ -292,26 +378,86 @@ impl PseudonymStore {
             real_id_key_ref: key_ref,
         };
 
-        // (4) Commit the row + the sealed link + the reverse index entry into the verified partition
-        //     (atomic under the lock). The partition is keyed by the verified (tenant, region) — a
-        //     write for one tenant structurally cannot land in another's map.
-        let mut inner = self.lock();
-        inner
-            .by_subject
-            .entry(part_key.clone())
-            .or_default()
-            .insert(subject.0.clone(), row.clone());
-        inner
-            .by_pseudonym
-            .entry(part_key.clone())
-            .or_default()
-            .insert(pseudonym.render(), subject.0.clone());
-        inner
-            .sealed
-            .entry(part_key)
-            .or_default()
-            .insert(subject.0.clone(), sealed);
+        // (4) Commit the row + the sealed link + the reverse index entry into the verified partition.
+        //     A write for one tenant structurally cannot land in another's partition (the Memory map
+        //     is keyed by the verified (tenant, region); the Pg path writes RLS-scoped).
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            PseudonymBackend::Memory(inner_arc) => {
+                let part_key = Self::part_key(scope);
+                let mut inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
+                inner
+                    .by_subject
+                    .entry(part_key.clone())
+                    .or_default()
+                    .insert(subject.0.clone(), row.clone());
+                inner
+                    .by_pseudonym
+                    .entry(part_key.clone())
+                    .or_default()
+                    .insert(pseudonym.render(), subject.0.clone());
+                inner
+                    .sealed
+                    .entry(part_key)
+                    .or_default()
+                    .insert(subject.0.clone(), sealed);
+            }
+            PseudonymBackend::Pg(pg) => {
+                // The DURABLE upsert: the public pseudonym rendering + the erasable key ref + the
+                // KMS-sealed real-identity ciphertext blob, through with_tenant_tx (tightest-RLS). Only
+                // the ciphertext rests in PG (the per-subject DEK stays with the engine — MR-025).
+                let drow = myelin_storage::DurablePseudonymRow {
+                    principal_id: subject.0.clone(),
+                    pseudonym_render: pseudonym.render(),
+                    real_id_key_ref: row.real_id_key_ref.to_uri(),
+                    nonce: sealed.nonce.to_vec(),
+                    ciphertext: sealed.ciphertext.clone(),
+                };
+                pg.block(pg.backing.put_mapping(&scope.tenant().0, drow))
+                    .map_err(|e| PseudonymError::Storage(e.to_string()))?;
+            }
+        }
         Ok(row)
+    }
+
+    /// Reconstruct a [`PseudonymRow`] from a durable row (the public pseudonym + the erasable key ref
+    /// rebuilt from the stored rendering/URI). These are our own writes, so a parse failure is a
+    /// genuine corruption — surfaced loudly (the `Storage` typed value, never a silently-coerced row).
+    fn durable_to_row(
+        scope: &TenantScope,
+        drow: &myelin_storage::DurablePseudonymRow,
+    ) -> Result<PseudonymRow, PseudonymError> {
+        let pseudonym = PseudonymHandle::parse(&drow.pseudonym_render).ok_or_else(|| {
+            PseudonymError::Storage(format!(
+                "malformed stored pseudonym rendering `{}`",
+                drow.pseudonym_render
+            ))
+        })?;
+        let real_id_key_ref = PiiKeyRef::parse(&drow.real_id_key_ref).ok_or_else(|| {
+            PseudonymError::Storage(format!("malformed stored key_ref `{}`", drow.real_id_key_ref))
+        })?;
+        Ok(PseudonymRow {
+            tenant: scope.tenant().clone(),
+            region: scope.region().clone(),
+            pseudonym,
+            real_id_key_ref,
+        })
+    }
+
+    /// Reconstruct the sealed real-identity link (`nonce` + `ciphertext`) from a durable row. A
+    /// wrong-length nonce is a corrupt blob (refused loudly, never a wrong-key read silently coerced).
+    fn durable_to_sealed(
+        drow: &myelin_storage::DurablePseudonymRow,
+    ) -> Result<SealedRealIdentity, PseudonymError> {
+        if drow.nonce.len() != myelin_storage::NONCE_LEN {
+            return Err(PseudonymError::CorruptMapping);
+        }
+        let mut nonce = [0u8; myelin_storage::NONCE_LEN];
+        nonce.copy_from_slice(&drow.nonce);
+        Ok(SealedRealIdentity {
+            nonce,
+            ciphertext: drow.ciphertext.clone(),
+        })
     }
 
     /// Seal a subject's real-identity link under its per-SUBJECT DEK, returning the
@@ -345,11 +491,21 @@ impl PseudonymStore {
     /// erased), so this read keeps working post-erasure.
     pub fn mapping_of(&self, scope: &TenantScope, subject: &PrincipalId) -> Option<PseudonymRow> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S2_TABLE));
-        let inner = self.lock();
-        inner
-            .by_subject
-            .get(&Self::part_key(scope))
-            .and_then(|p| p.get(&subject.0).cloned())
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            PseudonymBackend::Memory(inner_arc) => {
+                let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
+                inner
+                    .by_subject
+                    .get(&Self::part_key(scope))
+                    .and_then(|p| p.get(&subject.0).cloned())
+            }
+            PseudonymBackend::Pg(pg) => pg
+                .block(pg.backing.get_by_principal(&scope.tenant().0, &subject.0))
+                .ok()
+                .flatten()
+                .and_then(|drow| Self::durable_to_row(scope, &drow).ok()),
+        }
     }
 
     /// **Resolve a per-tenant pseudonym handle back to its subject's opaque `principal_id` (the
@@ -369,32 +525,49 @@ impl PseudonymStore {
         pseudonym: &PseudonymHandle,
     ) -> Result<Option<PrincipalId>, PseudonymError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S2_TABLE));
-        let part_key = Self::part_key(scope);
         // The reverse index names the subject; the sealed link + key_ref open it. All read under the
         // verified scope's partition.
-        let (key_ref, sealed) = {
-            let inner = self.lock();
-            let subject_id = match inner
-                .by_pseudonym
-                .get(&part_key)
-                .and_then(|m| m.get(&pseudonym.render()))
-            {
-                Some(s) => s.clone(),
-                None => return Ok(None),
-            };
-            let row = match inner
-                .by_subject
-                .get(&part_key)
-                .and_then(|p| p.get(&subject_id))
-            {
-                Some(r) => r.clone(),
-                None => return Ok(None),
-            };
-            let sealed = match inner.sealed.get(&part_key).and_then(|p| p.get(&subject_id)) {
-                Some(s) => s.clone(),
-                None => return Ok(None),
-            };
-            (row.real_id_key_ref, sealed)
+        let (key_ref, sealed) = match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            PseudonymBackend::Memory(inner_arc) => {
+                let part_key = Self::part_key(scope);
+                let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
+                let subject_id = match inner
+                    .by_pseudonym
+                    .get(&part_key)
+                    .and_then(|m| m.get(&pseudonym.render()))
+                {
+                    Some(s) => s.clone(),
+                    None => return Ok(None),
+                };
+                let row = match inner
+                    .by_subject
+                    .get(&part_key)
+                    .and_then(|p| p.get(&subject_id))
+                {
+                    Some(r) => r.clone(),
+                    None => return Ok(None),
+                };
+                let sealed = match inner.sealed.get(&part_key).and_then(|p| p.get(&subject_id)) {
+                    Some(s) => s.clone(),
+                    None => return Ok(None),
+                };
+                (row.real_id_key_ref, sealed)
+            }
+            PseudonymBackend::Pg(pg) => {
+                // The reverse-lookup index resolves the pseudonym rendering to its row (subject +
+                // key_ref + sealed link) in ONE tenant-scoped read.
+                let drow = match pg
+                    .block(pg.backing.get_by_pseudonym(&scope.tenant().0, &pseudonym.render()))
+                    .map_err(|e| PseudonymError::Storage(e.to_string()))?
+                {
+                    Some(d) => d,
+                    None => return Ok(None),
+                };
+                let row = Self::durable_to_row(scope, &drow)?;
+                let sealed = Self::durable_to_sealed(&drow)?;
+                (row.real_id_key_ref, sealed)
+            }
         };
         // Resolve the per-SUBJECT DEK + open. A shredded/destroyed key is a LOUD KmsError here, never
         // a plaintext fall-through (the 0-fail-open invariant).
@@ -420,18 +593,30 @@ impl PseudonymStore {
         subject: &PrincipalId,
     ) -> Option<PrincipalId> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S2_TABLE));
-        let part_key = Self::part_key(scope);
-        let (key_ref, sealed) = {
-            let inner = self.lock();
-            let row = inner
-                .by_subject
-                .get(&part_key)
-                .and_then(|p| p.get(&subject.0))?;
-            let sealed = inner
-                .sealed
-                .get(&part_key)
-                .and_then(|p| p.get(&subject.0))?;
-            (row.real_id_key_ref.clone(), sealed.clone())
+        let (key_ref, sealed) = match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            PseudonymBackend::Memory(inner_arc) => {
+                let part_key = Self::part_key(scope);
+                let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
+                let row = inner
+                    .by_subject
+                    .get(&part_key)
+                    .and_then(|p| p.get(&subject.0))?;
+                let sealed = inner
+                    .sealed
+                    .get(&part_key)
+                    .and_then(|p| p.get(&subject.0))?;
+                (row.real_id_key_ref.clone(), sealed.clone())
+            }
+            PseudonymBackend::Pg(pg) => {
+                let drow = pg
+                    .block(pg.backing.get_by_principal(&scope.tenant().0, &subject.0))
+                    .ok()
+                    .flatten()?;
+                let row = Self::durable_to_row(scope, &drow).ok()?;
+                let sealed = Self::durable_to_sealed(&drow).ok()?;
+                (row.real_id_key_ref, sealed)
+            }
         };
         // Open under the per-subject DEK. A destroyed DEK (crypto-shred) ⇒ Err ⇒ None (erased): never
         // a plaintext-without-key fall-through (the 0-fail-open invariant).
@@ -461,33 +646,45 @@ impl PseudonymStore {
     /// erase engine pairs with this — together they are the complete DSR-step-1 crypto-shred.
     pub fn shred_row(&self, scope: &TenantScope, subject: &PrincipalId) -> bool {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S2_TABLE));
-        let part_key = Self::part_key(scope);
-        let mut inner = self.lock();
-        // Find the public pseudonym rendering first (to remove its reverse-index entry) — read it out
-        // before the forward row is gone.
-        let pseudonym_rendering = inner
-            .by_subject
-            .get(&part_key)
-            .and_then(|p| p.get(&subject.0))
-            .map(|r| r.pseudonym.render());
-        let removed = inner
-            .by_subject
-            .get_mut(&part_key)
-            .and_then(|p| p.remove(&subject.0))
-            .is_some();
-        // Remove the sealed real-identity link (defence in depth: even if the DEK were somehow
-        // recoverable, the ciphertext is gone) and the reverse-index entry.
-        inner
-            .sealed
-            .get_mut(&part_key)
-            .and_then(|p| p.remove(&subject.0));
-        if let Some(rendering) = pseudonym_rendering {
-            inner
-                .by_pseudonym
-                .get_mut(&part_key)
-                .and_then(|m| m.remove(&rendering));
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            PseudonymBackend::Memory(inner_arc) => {
+                let part_key = Self::part_key(scope);
+                let mut inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
+                // Find the public pseudonym rendering first (to remove its reverse-index entry) — read
+                // it out before the forward row is gone.
+                let pseudonym_rendering = inner
+                    .by_subject
+                    .get(&part_key)
+                    .and_then(|p| p.get(&subject.0))
+                    .map(|r| r.pseudonym.render());
+                let removed = inner
+                    .by_subject
+                    .get_mut(&part_key)
+                    .and_then(|p| p.remove(&subject.0))
+                    .is_some();
+                // Remove the sealed real-identity link (defence in depth: even if the DEK were somehow
+                // recoverable, the ciphertext is gone) and the reverse-index entry.
+                inner
+                    .sealed
+                    .get_mut(&part_key)
+                    .and_then(|p| p.remove(&subject.0));
+                if let Some(rendering) = pseudonym_rendering {
+                    inner
+                        .by_pseudonym
+                        .get_mut(&part_key)
+                        .and_then(|m| m.remove(&rendering));
+                }
+                removed
+            }
+            PseudonymBackend::Pg(pg) => {
+                // The DURABLE crypto-shred: DELETE the row (row + sealed link + reverse-lookup path) in
+                // one tenant-scoped tx. A storage fault is swallowed to `false` (the shred did NOT
+                // land) — the erase engine's LOUD signal is the KMS destroy_dek half it pairs with.
+                pg.block(pg.backing.shred(&scope.tenant().0, &subject.0))
+                    .unwrap_or(false)
+            }
         }
-        removed
     }
 
     /// List the mapping rows in a `(tenant, region)` partition (for the directory / tests). There is
@@ -495,23 +692,45 @@ impl PseudonymStore {
     /// region)`, so cross-tenant reads are structurally impossible.
     pub fn mappings_in(&self, scope: &TenantScope) -> Vec<PseudonymRow> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S2_TABLE));
-        let inner = self.lock();
-        inner
-            .by_subject
-            .get(&Self::part_key(scope))
-            .map(|p| p.values().cloned().collect())
-            .unwrap_or_default()
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            PseudonymBackend::Memory(inner_arc) => {
+                let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
+                inner
+                    .by_subject
+                    .get(&Self::part_key(scope))
+                    .map(|p| p.values().cloned().collect())
+                    .unwrap_or_default()
+            }
+            PseudonymBackend::Pg(pg) => pg
+                .block(pg.backing.mappings_in(&scope.tenant().0))
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|drow| Self::durable_to_row(scope, drow).ok())
+                .collect(),
+        }
     }
 
     /// The `(tenant, region)` partition key for a verified scope (the OUTER partition; 12.1). A
     /// `(String, String)` so the partition map is keyed by the residency-pinned tenant+region — a
-    /// read for one never reaches another's bucket.
+    /// read for one never reaches another's bucket. In-memory test-double helper (MR-009b Wave 6a —
+    /// `test-support`-gated; the durable path scopes via `with_tenant_tx`).
+    #[cfg(any(test, feature = "test-support"))]
     fn part_key(scope: &TenantScope) -> (String, String) {
         (scope.tenant().0.clone(), scope.region().0.clone())
     }
 
+    /// Lock the in-memory test-double backing (the Memory arm; the unit tests' defence-in-depth
+    /// ciphertext probe uses it). Panics on the Pg backend (which has no in-process map) — only the
+    /// in-memory tests call this.
+    #[cfg(test)]
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        match &self.backend {
+            PseudonymBackend::Memory(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()),
+            PseudonymBackend::Pg(_) => {
+                panic!("lock() is the in-memory test-double accessor; the Pg backend has no map")
+            }
+        }
     }
 }
 

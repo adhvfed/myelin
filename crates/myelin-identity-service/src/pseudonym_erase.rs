@@ -64,8 +64,14 @@
 
 use myelin_storage::{ContentHash, DekId, KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
+// `BTreeMap`/`Mutex` back the in-memory test-double partition map only (MR-009b Wave 6a —
+// `test-support`-gated); the durable production path is the PG backing, so they are absent from the
+// default build.
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Mutex;
 
 use crate::pseudonym_store::PseudonymStore;
 use myelin_identity::PrincipalId;
@@ -240,7 +246,10 @@ impl ReErasureReceipt {
 }
 
 /// The ledger's partitioned inner map: `(tenant, region)` → (opaque subject id → entry). Named so
-/// the `MutexGuard` over it is not a "very complex type" at every accessor.
+/// the `MutexGuard` over it is not a "very complex type" at every accessor. **MR-009b Wave 6a — the
+/// in-memory test-double partition map (compiled ONLY under `#[cfg(any(test, feature = "test-support"))]`);
+/// the production default is the durable PG backing ([`PgErasureLedgerBacking`]).**
+#[cfg(any(test, feature = "test-support"))]
 type LedgerByPartition = BTreeMap<(String, String), BTreeMap<String, ErasureLedgerEntry>>;
 
 /// One PII-free ledger entry (10.8). Holds ONLY the opaque principal id + the partition + the date —
@@ -264,23 +273,82 @@ pub struct ErasureLedgerEntry {
 ///
 /// A cloneable handle over shared state (so the erase path + the re-erasure pass + the live service
 /// read the SAME ledger).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PseudonymErasureLedger {
-    /// `(tenant, region)` partition → (opaque subject id → entry). The OUTER map is the partition (no
-    /// cross-tenant read path). Keyed by the opaque subject so a re-erase is idempotent (the same
-    /// subject records once; a re-erase updates the date, never duplicates).
-    inner: Arc<Mutex<LedgerByPartition>>,
+    /// The durable backing — the REAL PG `identity_pseudonym_erasure_ledger` table (MR-009b W6a) on
+    /// the production path, or the in-memory test-double on the default DB-free build. The
+    /// system-of-record is the Pg backing; the in-memory map is an explicit test double.
+    backend: ErasureLedgerBackend,
+}
+
+/// The erasure-ledger backing: the REAL durable PG `identity_pseudonym_erasure_ledger` table (MR-009b
+/// W6a) — the PRODUCTION default — or the in-memory test-double. Splitting the backing OUT of the role
+/// struct's direct field lets the `no-in-memory-durable-store` ratchet record the shortcut's removal:
+/// the PRODUCTION-compiled enum presents ONLY the pool-backed `Pg` variant (the `Memory` variant is
+/// `test-support`-gated, which the scanner strips as a test double), so `PseudonymErasureLedger` no
+/// longer holds an in-memory collection in the production graph. **The ledger is PII-free +
+/// NON-shred-erasable in BOTH backings** — the durable table carries NO RLS/crypto-shred lever (it
+/// must survive the key destruction it records + a restore, so ID-D8 re-erasure can replay it).
+#[derive(Clone)]
+enum ErasureLedgerBackend {
+    /// The in-memory test-double — MR-009b Wave 6a: compiled ONLY under
+    /// `#[cfg(any(test, feature = "test-support"))]`. NOT the production system-of-record.
+    #[cfg(any(test, feature = "test-support"))]
+    Memory(Arc<Mutex<LedgerByPartition>>),
+    /// The REAL durable PG backing over the MR-022 provider pool — the PRODUCTION DEFAULT (always
+    /// compiled).
+    Pg(PgErasureLedgerBacking),
+}
+
+/// The PG-backed PII-free erasure-ledger backing (MR-009b W6a): the durable
+/// `identity_pseudonym_erasure_ledger` table + the sync→async bridge (`tokio::runtime::Handle`
+/// driving `block_in_place`+`block_on`). The production default (always compiled).
+#[derive(Clone)]
+struct PgErasureLedgerBacking {
+    backing: Arc<myelin_storage::DurableErasureLedgerBacking>,
+    rt: tokio::runtime::Handle,
+}
+
+impl PgErasureLedgerBacking {
+    /// Drive an async backing call from the sync ledger API (the `block_in_place`+`block_on` bridge).
+    fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
+        tokio::task::block_in_place(|| self.rt.block_on(fut))
+    }
 }
 
 impl PseudonymErasureLedger {
-    /// A fresh, empty ledger.
+    /// A fresh, empty in-memory ledger (MR-009b Wave 6a: compiled ONLY under
+    /// `#[cfg(any(test, feature = "test-support"))]`). The PRODUCTION constructor is
+    /// [`PseudonymErasureLedger::with_pg`] (the durable PG default); this `::new` is the DB-free
+    /// unit-test entry point downstream crates reach via the `test-support` dev-dependency.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new() -> PseudonymErasureLedger {
-        PseudonymErasureLedger::default()
+        PseudonymErasureLedger {
+            backend: ErasureLedgerBackend::Memory(Arc::new(Mutex::new(LedgerByPartition::new()))),
+        }
+    }
+
+    /// **Build the PII-free erasure ledger over the REAL durable PG backing (MR-009b W6a).** Every
+    /// erasure persists to the `identity_pseudonym_erasure_ledger` table (NON-shred-erasable, NO RLS —
+    /// it must survive the crypto-shred it records + a restore so ID-D8 re-erasure can replay it). `rt`
+    /// is the tokio runtime handle the sync API drives the async backing on. **The PRODUCTION default
+    /// (MR-009b Wave 6a) — always compiled.**
+    pub fn with_pg(
+        backing: myelin_storage::DurableErasureLedgerBacking,
+        rt: tokio::runtime::Handle,
+    ) -> PseudonymErasureLedger {
+        PseudonymErasureLedger {
+            backend: ErasureLedgerBackend::Pg(PgErasureLedgerBacking {
+                backing: Arc::new(backing),
+                rt,
+            }),
+        }
     }
 
     /// Record an erasure (10.8) — PII-free, idempotent. Built from a verified [`TenantScope`] so the
     /// record carries its `(tenant, region)` predicate (the tenant-predicate floor). Recording the
-    /// same subject again updates the timestamp, never duplicates (idempotent-by-construction).
+    /// same subject again updates the timestamp, never duplicates (idempotent-by-construction, the
+    /// durable path via `ON CONFLICT (tenant, region, subject) DO UPDATE SET erased_at`).
     pub fn record(
         &self,
         scope: &TenantScope,
@@ -288,42 +356,112 @@ impl PseudonymErasureLedger {
         dek_class: myelin_storage::KeyClass,
         erased_at: myelin_events::Timestamp,
     ) {
-        let part = Self::part_key(scope);
-        let entry = ErasureLedgerEntry {
-            subject: subject.clone(),
-            dek_class,
-            erased_at,
-        };
-        self.lock()
-            .entry(part)
-            .or_default()
-            .insert(subject.0.clone(), entry);
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            ErasureLedgerBackend::Memory(inner_arc) => {
+                let part = Self::part_key(scope);
+                let entry = ErasureLedgerEntry {
+                    subject: subject.clone(),
+                    dek_class,
+                    erased_at,
+                };
+                inner_arc
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(part)
+                    .or_default()
+                    .insert(subject.0.clone(), entry);
+            }
+            ErasureLedgerBackend::Pg(pg) => {
+                // The DURABLE idempotent upsert — FAIL-STATIC, mirroring the durable KMS
+                // `destroy_dek` posture this write pairs with (W6a verifier finding): a ledger
+                // entry that does not reach the store is a SILENT resurrection path — a
+                // pre-erasure PIT restore re-hydrates the DEK + map row, and the P-ID-20
+                // re-erasure replay (`entries_in`) would MISS the subject, reporting the ID-D8
+                // drill green while a real identity resolves. The infallible signature has no
+                // error channel (~ the erase engine's `record` sites), so a durable write
+                // failure panics LOUDLY rather than returning as if recorded.
+                if let Err(e) = pg.block(pg.backing.record(
+                    &scope.tenant().0,
+                    &subject.0,
+                    &dek_class.as_token(),
+                    &erased_at.0,
+                )) {
+                    panic!(
+                        "ERASURE-LEDGER DURABILITY FAILURE (fail-static): the erasure record for \
+                         subject={} tenant={} could NOT be persisted — an unrecorded erasure is a \
+                         silent resurrection path across PIT restore (P-ID-20/ID-D8); refusing to \
+                         report the erasure as recorded: {e}",
+                        subject.0,
+                        scope.tenant().0
+                    );
+                }
+            }
+        }
     }
 
     /// Every erasure entry in a `(tenant, region)` partition (the re-erasure pass replays THIS). No
     /// cross-partition accessor exists — a read is scoped to one verified `(tenant, region)`.
     pub fn entries_in(&self, scope: &TenantScope) -> Vec<ErasureLedgerEntry> {
-        self.lock()
-            .get(&Self::part_key(scope))
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default()
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            ErasureLedgerBackend::Memory(inner_arc) => inner_arc
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&Self::part_key(scope))
+                .map(|m| m.values().cloned().collect())
+                .unwrap_or_default(),
+            ErasureLedgerBackend::Pg(pg) => pg
+                .block(pg.backing.entries_in(&scope.tenant().0))
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|drow| {
+                    // Reconstruct the entry; a malformed dek_class token is a genuine corruption of our
+                    // own write — skipped rather than re-erased under a wrong key.
+                    myelin_storage::KeyClass::parse_token(&drow.dek_class).map(|dek_class| {
+                        ErasureLedgerEntry {
+                            subject: PrincipalId(drow.subject),
+                            dek_class,
+                            erased_at: myelin_events::Timestamp(drow.erased_at),
+                        }
+                    })
+                })
+                .collect(),
+        }
     }
 
     /// `true` iff the subject is recorded erased in the verified scope (the ledger remembers an
     /// erasure even after the map row + DEK are gone — the load-bearing 10.8 property).
     pub fn is_erased(&self, scope: &TenantScope, subject: &PrincipalId) -> bool {
-        self.lock()
-            .get(&Self::part_key(scope))
-            .map(|m| m.contains_key(&subject.0))
-            .unwrap_or(false)
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            ErasureLedgerBackend::Memory(inner_arc) => inner_arc
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&Self::part_key(scope))
+                .map(|m| m.contains_key(&subject.0))
+                .unwrap_or(false),
+            ErasureLedgerBackend::Pg(pg) => pg
+                .block(pg.backing.is_erased(&scope.tenant().0, &subject.0))
+                .unwrap_or(false),
+        }
     }
 
+    /// The `(tenant, region)` partition key for a verified scope. In-memory test-double helper (MR-009b
+    /// Wave 6a — `test-support`-gated; the durable path scopes via `(tenant_id, region)` predicates).
+    #[cfg(any(test, feature = "test-support"))]
     fn part_key(scope: &TenantScope) -> (String, String) {
         (scope.tenant().0.clone(), scope.region().0.clone())
     }
+}
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, LedgerByPartition> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+// The `Default` = the in-memory test double (MR-009b Wave 6a — `test-support`-gated, mirroring
+// `new`); the production ledger is built via `with_pg`. Keeps the argument-less `new` idiomatic
+// (clippy::new_without_default) without exposing an in-memory default in the production build.
+#[cfg(any(test, feature = "test-support"))]
+impl Default for PseudonymErasureLedger {
+    fn default() -> PseudonymErasureLedger {
+        PseudonymErasureLedger::new()
     }
 }
 
