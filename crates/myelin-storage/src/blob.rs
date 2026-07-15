@@ -73,8 +73,12 @@
 //! → 29 caught, 6 unviable, 0 missed). Every mutation of the integrity comparison, the address
 //! computation, and the per-tenant key path is killed by an assertion.
 
+// MR-009b W7.3 — `HashMap` backs only the `test-support`-gated `FsBlobStore` floor.
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+// MR-009b W7.3 — `Mutex` backs only the `test-support`-gated `FsBlobStore` floor.
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
 
 use myelin_tenancy::TenantId;
@@ -187,6 +191,9 @@ impl HashAlgo {
     ///   member) is re-hashed under SHA-256 and refused on a content-address mismatch — closing
     ///   the floor blob.rs named ("SHA-256 verification rides in with the git object import —
     ///   P-ST-22"). Uses the vetted RustCrypto `sha2` (FIPS-180-4), never a hand-rolled hash.
+    // MR-009b W7.3 — the re-hash-on-read helper is driven by the `test-support`-gated `FsBlobStore`
+    // floor's `get` (the always-compiled `S3BlobStore::get` inlines its own algo match).
+    #[cfg(any(test, feature = "test-support"))]
     fn rehash(self, bytes: &[u8]) -> std::result::Result<ContentHash, BlobError> {
         match self {
             HashAlgo::Blake3 => Ok(ContentHash::blake3(bytes)),
@@ -344,6 +351,9 @@ impl BlobTelemetry {
         self.blob_integrity_fail.load(Ordering::SeqCst)
     }
 
+    // MR-009b W7.3 — only the `test-support`-gated `FsBlobStore::get` records integrity fails on
+    // this counter (the `blob_integrity_fail()` getter above stays always-compiled).
+    #[cfg(any(test, feature = "test-support"))]
     fn record_integrity_fail(&self) {
         self.blob_integrity_fail.fetch_add(1, Ordering::SeqCst);
     }
@@ -359,6 +369,18 @@ impl BlobTelemetry {
 /// The store deliberately keeps the **key-path string** (not a flat `(tenant, hash)` tuple)
 /// as its map key so the per-tenant fan-out is exactly what an on-disk / object-store backing
 /// would use — the floor models the real layout, not a shortcut.
+///
+/// **MR-009b W7.3 — `test-support`-gated TEST DOUBLE.** This `Mutex<HashMap<String, Vec<u8>>>`
+/// floor is NOT byte-durable (its bytes die with the process); it survives from the first commit
+/// as the DB-free unit/drill backing. The DURABLE production backing is
+/// [`crate::s3blob::S3BlobStore`] (always-compiled, real `aws-sdk-s3`), config-selected via
+/// [`crate::provider::SubstrateProvider::blob_store`] → [`crate::backend::blob_store`]. So this
+/// type is gated behind `#[cfg(any(test, feature = "test-support"))]`: it is the test double
+/// every drill/replica test drives via the [`BlobStore`] trait; downstream crates reach it via
+/// the `myelin-storage/test-support` dev-dependency. Flipped GREEN out of the production graph
+/// (SI-014/015/029 — the false "already byte-durable" premise corrected; P-ST-30 is the object
+/// backing).
+#[cfg(any(test, feature = "test-support"))]
 pub struct FsBlobStore {
     /// The modelled object filesystem: key path → stored (wrapped) bytes.
     objects: Mutex<HashMap<String, Vec<u8>>>,
@@ -368,12 +390,14 @@ pub struct FsBlobStore {
     telemetry: BlobTelemetry,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for FsBlobStore {
     fn default() -> Self {
         FsBlobStore::new()
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl FsBlobStore {
     /// A fresh fs-backed store with the M0 identity wrap (plaintext-at-rest floor).
     pub fn new() -> FsBlobStore {
@@ -434,6 +458,7 @@ impl FsBlobStore {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl BlobStore for FsBlobStore {
     fn put(&self, tenant: &TenantId, bytes: &[u8]) -> Result<ContentHash> {
         // (a) BLAKE3 hash-on-write — the address is computed from the PLAINTEXT.

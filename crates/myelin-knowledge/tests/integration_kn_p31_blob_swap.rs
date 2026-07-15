@@ -79,3 +79,94 @@ async fn kn_p31_object_store_swap_is_byte_identical_to_the_fs_floor() {
         verdicts.len()
     );
 }
+
+/// **MR-009b W7.3 — the RE-POINTED `KnowledgeStore` blob path, PROVEN durable on the LIVE object
+/// store.** `KnowledgeStore::open` no longer hardcodes the in-memory `FsBlobStore` floor: it takes an
+/// INJECTED `Arc<dyn BlobStore + Send + Sync>`. The production composition root injects
+/// `provider.blob_store()` (the durable `S3BlobStore`); this drives that exact path against the live
+/// dev stack and proves the property the fs floor LACKED: a media/snapshot blob PUT through
+/// `store.blobs()` SURVIVES a fresh `KnowledgeStore` (+ fresh `S3BlobStore`) reconstruction — a
+/// kill-9 equivalent the `Mutex<HashMap>` floor could not have survived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kn_p31_repointed_knowledge_store_blob_path_is_durable_across_reconstruction() {
+    use std::sync::Arc;
+
+    use myelin_knowledge::KnowledgeStore;
+    use myelin_storage::OltpConfig;
+
+    let cfg = MyelinConfig::dev();
+    let endpoint = cfg.s3.endpoint.clone();
+    let handle = tokio::runtime::Handle::current();
+    let tenant = TenantId(format!("itest-knp31-durable-{}", std::process::id()));
+    let blob = b"a Knowledge CRDT snapshot written through the INJECTED durable BlobStore".to_vec();
+
+    fn oltp() -> OltpConfig {
+        OltpConfig {
+            max_pool_size: 8,
+            statement_timeout_ms: 5_000,
+            per_tenant_in_flight_cap: 4,
+        }
+    }
+
+    // (1) Open a KnowledgeStore with the DURABLE S3 backing INJECTED (the re-pointed production
+    //     shape), PUT a blob through `store.blobs()`, then DROP the whole store (kill-9 equivalent).
+    let hash = {
+        let s3cfg = cfg.s3.clone();
+        let handle = handle.clone();
+        let tenant = tenant.clone();
+        let blob = blob.clone();
+        tokio::task::spawn_blocking(move || {
+            let object = S3BlobStore::connect(&s3cfg, handle);
+            let store = KnowledgeStore::open(oltp(), Arc::new(object))
+                .expect("KnowledgeStore opens with the injected durable BlobStore");
+            store
+                .blobs()
+                .put(&tenant, &blob)
+                .expect("put a Knowledge blob through the re-pointed injected S3 backing")
+        })
+        .await
+        .expect("blocking open+put task")
+    };
+
+    // (2) A FRESH KnowledgeStore over a FRESH S3BlobStore (the restarted process) reads it back — the
+    //     bytes SURVIVED, proving the injected backing is genuinely byte-durable.
+    let got = {
+        let s3cfg = cfg.s3.clone();
+        let handle = handle.clone();
+        let tenant = tenant.clone();
+        let hash = hash.clone();
+        tokio::task::spawn_blocking(move || {
+            let object = S3BlobStore::connect(&s3cfg, handle);
+            let store = KnowledgeStore::open(oltp(), Arc::new(object))
+                .expect("a FRESH KnowledgeStore opens over a fresh durable backing");
+            store
+                .blobs()
+                .get(&tenant, &hash)
+                .expect("the Knowledge blob SURVIVED the store reconstruction (byte-durable)")
+        })
+        .await
+        .expect("blocking reopen+get task")
+    };
+
+    assert_eq!(
+        got, blob,
+        "W7.3: a Knowledge blob PUT through the injected durable BlobStore survives a fresh \
+         KnowledgeStore reconstruction — the fs floor (Mutex<HashMap>) could not have"
+    );
+
+    // cleanup
+    let _ = tokio::task::spawn_blocking(move || {
+        let object = S3BlobStore::connect(&cfg.s3, handle);
+        let store =
+            KnowledgeStore::open(oltp(), Arc::new(object)).expect("cleanup store opens");
+        let _ = store.blobs().delete(&tenant, &hash);
+    })
+    .await;
+
+    println!(
+        "[W7.3 KN-P31 INTEGRATION GREEN] the RE-POINTED KnowledgeStore blob path (open(cfg, \
+         Arc<dyn BlobStore> = S3BlobStore); store.blobs().put/get) is byte-DURABLE across a fresh \
+         store reconstruction on the live dev stack ({endpoint}) — the fs floor is flipped out of the \
+         production graph."
+    );
+}

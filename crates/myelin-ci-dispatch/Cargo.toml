@@ -104,6 +104,12 @@ aws-sdk-s3 = { workspace = true, optional = true }
 # in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
 # — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
+# MR-009b W7.3 — the fs `FsBlobStore` floor is now a `test-support`-gated test double in
+# myelin-storage; this crate's `resolve.rs` unit tests + `cdc_ci_p11_resolve_dispatch` drill drive it
+# via the `BlobStore` trait, so enable `test-support` DEV-only. Never in the production DAG
+# (`cargo tree -e no-dev` shows no test-support edge) — the SAME idiom as the other subsystem crates'
+# storage test-support dev-deps (git/search/issues/knowledge/chat).
+myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 
 [features]
 default = []
