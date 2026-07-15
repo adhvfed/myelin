@@ -83,6 +83,19 @@ on the shared baseline file. **W3b design DONE (`6ce6702`, doc 16):** DedupLedge
 6 steps W3b.1–.6; identity is NOT a DAG sink (only myelin-events is); one real BUS-2 gap (identity
 durable-tuple emit) fixed at W3b.3.
 
+**W6a DONE (2026-07-15, `a621a07`): scanner 11→9.** Pseudonym stores durable-by-default
+(pseudonym_map FORCE-RLS + NON-erasable erasure ledger, migrations 0020–0022). Verifier HOLD→fixed→
+sound: the ledger's only write silently swallowed durable failure = a real resurrection path
+(unrecorded erasure + pre-erasure PIT restore + replay miss); now fail-static panic mirroring
+destroy_dek. Residuals: PrincipalId unconstrained-string PII grammar (platform-wide);
+composition root must apply `pseudonym_durable_migrations()` (only integration tests do today);
+region persisted from provider pin (W7 sweep owns).
+
+**W3b.1 DONE (2026-07-15, merge `3583f59`): scanner-neutral.** OutboxStore role-struct +
+`DurableOutboxBacking` trait (commit_staged + reads + composite drain_once); ~300 reference sites
+unchanged; memory arm verifier-probed byte-equivalent. Staged debt for W3b.2 (in-line admissions):
+surface the durable drain error; durable GC verb; duplicate-event_id commit-semantics CDC parity.
+
 R1 exit: scanner `no-in-memory-durable-store` baseline **0**; unit tests DB-free; integration green; kill-9 drills.
 
 ## R2 — authz completion
