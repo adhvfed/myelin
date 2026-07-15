@@ -27,7 +27,11 @@ use crate::catalogue::{page_envelope, Handler, HandlerCtx};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::git_edge::{map_method, num_param, param, reroot, tenant_of};
-use crate::repo_authz::{AllowAllRepos, RepoAuthorizer, RepoPermission};
+use crate::repo_authz::{DenyAllRepos, RepoAuthorizer, RepoPermission};
+// `AllowAllRepos` is now constructed ONLY by the test-support `rooted_inmem_for_test` helper (R2.6:
+// the prod default is fail-closed `DenyAllRepos`), so its import is test-support-gated too.
+#[cfg(any(test, feature = "test-support"))]
+use crate::repo_authz::AllowAllRepos;
 use crate::repo_authz_live::{NoRepoBootstrap, RepoBootstrapGrants};
 use crate::request::EdgeResponse;
 use myelin_events::{Actor, EmitContextBase, IdMinter, OutboxStore, Region, TenantId, Timestamp};
@@ -114,7 +118,11 @@ impl DurableGitBackend {
             minter,
             clone_host: "ssh://git@myelin".into(),
             root,
-            repo_authz: Arc::new(AllowAllRepos),
+            // R2.6: the prod constructor default is FAIL-CLOSED (`DenyAllRepos`) — a composition root
+            // that forgets `with_repo_authorizer` denies every repo rather than serving all of them.
+            // Production `main.rs` ALWAYS injects the real `CheckBackedRepoAuthorizer`; the permissive
+            // `AllowAllRepos` fixture now lives ONLY in the test-support `rooted_inmem_for_test` below.
+            repo_authz: Arc::new(DenyAllRepos),
             bootstrap: Arc::new(NoRepoBootstrap),
         }
     }
@@ -128,7 +136,13 @@ impl DurableGitBackend {
     /// W3b.4 note promised.
     #[cfg(any(test, feature = "test-support"))]
     pub fn rooted_inmem_for_test(root: impl Into<PathBuf>) -> DurableGitBackend {
+        // The test/drill floor defaults to the permissive `AllowAllRepos` fixture so the many
+        // non-authz test call sites stay one-line (each authz test overrides via
+        // `with_repo_authorizer`). This is the ONLY `AllowAllRepos` construction left, and it is
+        // inside this `test-support`-gated helper — never a production path (R2.6: prod `rooted`
+        // fails closed with `DenyAllRepos`).
         DurableGitBackend::rooted(root, OutboxStore::new(), Arc::new(MonotonicMinter::new()))
+            .with_repo_authorizer(Arc::new(AllowAllRepos))
     }
 
     /// **Inject the R0.3 per-repo object authorizer** (the wire object-authz seam) — the analogue of
