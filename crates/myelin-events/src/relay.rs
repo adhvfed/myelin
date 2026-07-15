@@ -350,6 +350,17 @@ pub struct DrainReport {
     pub failed: usize,
     /// How many rows were dead-lettered this pass (exhausted the retry bound).
     pub dead_lettered: usize,
+    /// **How many durable `drain_once` calls ERRORED this pass — the durable-arm error surface
+    /// (W3b.2, resolving the W3b.1 staged debt).** On the `Durable` backend a `drain_once` that
+    /// returns `Err` (the DB claim / the drain transaction itself failed — DISTINCT from a
+    /// per-row publish `failed`, which is a reachable-broker-rejects-one-row event) is surfaced
+    /// HERE and logged LOUDLY, instead of silently collapsing to an all-zero "outbox empty"
+    /// report. It is `0` on every healthy pass AND on the in-memory arm (whose claim cannot
+    /// fail), so an all-zero report still unambiguously means "nothing to do", while
+    /// `drain_errors > 0` means "the drain itself failed — investigate" (the contract-1.8
+    /// `outbox_depth`/`oldest_unsent_recorded_at` survival signals stay the durable second line
+    /// of defence: a stalled drain keeps them climbing).
+    pub drain_errors: usize,
 }
 
 /// The outbox relay (contract 2.3 relay half) — stateless, horizontally-replicable. Holds the
@@ -420,15 +431,28 @@ impl<T: BusTransport> Relay<T> {
         // Durable dispatch: the whole claim → publish → mark-sent / dead-letter pass is ONE
         // composite verb on the backing (it owns the `FOR UPDATE SKIP LOCKED` claim atomicity).
         if let Some(backing) = self.store.durable_backing() {
-            // STAGED DEBT (W3b.1 verifier finding): a backing `Err` collapses to an all-zero
-            // `DrainReport` — indistinguishable from "outbox empty". Unreachable today (no
-            // production Durable store is constructed until W3b.4), and a stalled drain stays
-            // visible via `outbox_depth`/`oldest_unsent_recorded_at` (contract-1.8 survival
-            // signals) — but W3b.2 MUST surface this error (report it / log it LOUDLY) when it
-            // defines the backing's error semantics. Do NOT let this swallow ship past W3b.2.
-            return backing
-                .drain_once(&self.transport, DEFAULT_DRAIN_BATCH)
-                .unwrap_or_default();
+            // W3b.2 (resolves the W3b.1 staged debt): a backing `Err` is SURFACED, never swallowed
+            // into an all-zero "outbox empty" report. It is logged LOUDLY (an operator-visible
+            // stderr line) AND reported via `DrainReport::drain_errors` (distinct from a per-row
+            // publish `failed`), so a stalled/failed drain is unambiguously distinguishable from a
+            // drained outbox — the count is non-zero and the `outbox_depth`/`oldest_unsent`
+            // survival signals stay the durable second line of defence (they keep climbing while
+            // the drain cannot make progress). No committed row is lost: a failed drain transaction
+            // rolls back and every unsent row stays claimable for the next pass.
+            return match backing.drain_once(&self.transport, DEFAULT_DRAIN_BATCH) {
+                Ok(report) => report,
+                Err(e) => {
+                    eprintln!(
+                        "[outbox-relay] LOUD: durable drain_once FAILED — rows stay claimable \
+                         (0 lost), depth/age signals remain the alarm: {}",
+                        e.0
+                    );
+                    DrainReport {
+                        drain_errors: 1,
+                        ..DrainReport::default()
+                    }
+                }
+            };
         }
         let mut report = DrainReport::default();
         let claimed = self.store.claim_unsent();
@@ -497,6 +521,9 @@ impl<T: BusTransport> Relay<T> {
             total.published += r.published;
             total.deduplicated += r.deduplicated;
             total.failed += r.failed;
+            // Surface a durable-arm drain error across the loop too (a failed drain makes no
+            // progress → the loop breaks below, but the error is not silently dropped).
+            total.drain_errors += r.drain_errors;
             // No progress (broker down: every row failed, none dead-lettered yet) → stop so we
             // do not spin forever. The caller heals the broker and drains again.
             if !made_progress {

@@ -20,12 +20,69 @@
 //! `pg.rs` record); the per-POOL runtime region-pin is the STOR-D5 gate (P-ST-15 / P-102). The
 //! file-level waiver marker `@residency-cell-pinned:file` records this floor LOUDLY (EI-01 §4).
 
-use myelin_events::relay::{BusTransport, Delivery};
-use myelin_events::EventEnvelope;
+use myelin_events::relay::{BusTransport, Delivery, DrainReport, MAX_PUBLISH_ATTEMPTS};
+use myelin_events::{AggregateKey, ArtifactRef, EventEnvelope, EventId, OutboxRow, Timestamp};
 use sqlx::postgres::PgPool;
 use sqlx::Row;
 
 use crate::pg::PgError;
+
+/// How many times a racing (`aggregate`, `seq`) collision retries in [`PgRelay::commit_staged_atomic`]
+/// before giving up. A concurrent committer that lost the `MAX(seq)+1` race retries with the next
+/// contiguous seq; the bound only needs to exceed the realistic concurrency on one hot aggregate.
+const SEQ_CONTENTION_RETRIES: u32 = 128;
+
+/// The `SELECT` projection for reconstructing an [`OutboxRow`]: every outbox column plus the
+/// `published_at` cast to an RFC-3339 UTC string (`published_at_str`).
+const ROW_PROJECTION: &str = "event_id, aggregate, seq, subject, envelope, attempts, \
+     to_char(published_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS published_at_str";
+
+/// A typed outcome of one `commit_staged_atomic` transaction attempt, so the retry loop can
+/// distinguish a benign seq-contention collision (retry) from a genuine duplicate `event_id`
+/// (reject — parity with the in-memory arm) or any other DB error (propagate).
+enum CommitAttempt {
+    Committed,
+    SeqContention,
+    DuplicateEventId(String),
+    Db(PgError),
+}
+
+/// Reconstruct an [`OutboxRow`] from a selected outbox table row (the `ROW_PROJECTION` columns).
+fn row_from_pg(row: &sqlx::postgres::PgRow) -> Result<OutboxRow, PgError> {
+    let event_id: String = row.get("event_id");
+    let aggregate: String = row.get("aggregate");
+    let seq: i64 = row.get("seq");
+    let subject: String = row.get("subject");
+    let payload: serde_json::Value = row.get("envelope");
+    let published_at: Option<String> = row.get("published_at_str");
+    let attempts: i32 = row.get("attempts");
+    let envelope: EventEnvelope = serde_json::from_value(payload)
+        .map_err(|e| PgError::Query(format!("deserialize envelope: {e}")))?;
+    Ok(OutboxRow {
+        event_id: EventId(event_id),
+        aggregate: AggregateKey(aggregate),
+        seq: seq.max(0) as u64,
+        subject: ArtifactRef(subject),
+        envelope,
+        published_at: published_at.map(Timestamp),
+        attempts: attempts.max(0) as u32,
+    })
+}
+
+/// Classify a sqlx error from an outbox INSERT/commit: `outbox_aggregate_seq_unique` → benign
+/// seq-contention (retry); `outbox_event_id_unique` → a genuine duplicate (reject); else propagate.
+fn classify_insert_error(e: sqlx::Error, event_id: &str) -> CommitAttempt {
+    if let Some(db) = e.as_database_error() {
+        match db.constraint() {
+            Some("outbox_aggregate_seq_unique") => return CommitAttempt::SeqContention,
+            Some("outbox_event_id_unique") => {
+                return CommitAttempt::DuplicateEventId(event_id.to_string())
+            }
+            _ => {}
+        }
+    }
+    CommitAttempt::Db(PgError::Query(e.to_string()))
+}
 
 /// The OLTP-co-located outbox + relay over a bounded sqlx `PgPool`. Cloneable (the pool is an
 /// `Arc`-backed handle). Shares the SAME pool as the [`crate::pg::PgStore`] in a real service
@@ -213,6 +270,122 @@ impl PgRelay {
         Ok(published)
     }
 
+    /// **Bounded-retry drain pass with per-row dead-lettering (MR-009b W3b.2 — the durable-arm
+    /// PARITY with `myelin_events::relay::Relay::drain_once` over an in-memory store).** Like
+    /// [`relay_once`](Self::relay_once) — ONE transaction, claim up to `batch` unsent rows with
+    /// `FOR UPDATE SKIP LOCKED`, publish each in `(aggregate, seq)` order — but with the memory
+    /// relay's exact retry/dead-letter discipline (the one genuine gap the W3b design names):
+    ///
+    /// - A publish **failure does NOT abort the whole pass** (unlike `relay_once`, which returns
+    ///   `Err` on the first transport error and rolls the tx back). Instead the row's `attempts`
+    ///   is incremented in the SAME tx; the row stays unsent (claimable next pass) — 0 lost. The
+    ///   other rows of the pass still publish + mark sent.
+    /// - When a row's incremented `attempts` reaches `max_attempts` it is **dead-lettered**: the
+    ///   claim predicate is `attempts < max_attempts`, so a dead row is never re-claimed — it
+    ///   leaves the `outbox_depth` unsent set and enters the dead-letter set (`published_at IS NULL
+    ///   AND attempts >= max_attempts`), SURFACED not silently dropped (a LOUD stderr line carries
+    ///   the `dlq.<tenant>.<subsystem>` routing key + the `event_id`, mirroring the in-memory
+    ///   relay's `DeadLetterAlert`). Dead rows are NOT deleted — parity with the in-memory
+    ///   `dead_letters()` snapshot, which retains them.
+    /// - Every per-row mark (`published_at = now()` on success, `attempts + 1` on failure) commits
+    ///   together at the end of the pass; a claim released only on commit (no double-claim).
+    ///
+    /// Returns a [`DrainReport`] counting this pass's published / deduplicated / failed /
+    /// dead-lettered rows.
+    pub async fn drain_once_dead_letter<B: BusTransport + ?Sized>(
+        &self,
+        bus: &B,
+        batch: i64,
+        max_attempts: u32,
+    ) -> Result<DrainReport, PgError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+
+        // Claim: unsent AND not-yet-dead-lettered rows, in (aggregate, seq) order, SKIP LOCKED.
+        let rows = sqlx::query(
+            "SELECT event_id, subject, envelope FROM outbox \
+             WHERE published_at IS NULL AND attempts < $2 \
+             ORDER BY aggregate, seq \
+             FOR UPDATE SKIP LOCKED LIMIT $1",
+        )
+        .bind(batch)
+        .bind(max_attempts as i32)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+
+        let mut report = DrainReport::default();
+        for row in &rows {
+            let event_id: String = row.get("event_id");
+            let payload: serde_json::Value = row.get("envelope");
+            let envelope: EventEnvelope = serde_json::from_value(payload)
+                .map_err(|e| PgError::Query(format!("deserialize envelope: {e}")))?;
+
+            // The relay's sanctioned broker publish (BUS-2): stable event_id = broker dedup id.
+            match bus.put(&envelope.subject, &envelope, &envelope.event_id) {
+                Ok(Delivery::Accepted) => {
+                    sqlx::query("UPDATE outbox SET published_at = now() WHERE event_id = $1")
+                        .bind(&event_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| PgError::Query(e.to_string()))?;
+                    report.published += 1;
+                }
+                Ok(Delivery::Deduplicated) => {
+                    // A re-claim after a crash mid-publish: the broker already had this id → the
+                    // event WAS delivered → mark sent (no ghost, no re-delivery).
+                    sqlx::query("UPDATE outbox SET published_at = now() WHERE event_id = $1")
+                        .bind(&event_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| PgError::Query(e.to_string()))?;
+                    report.deduplicated += 1;
+                }
+                Err(_transport_err) => {
+                    // Bounded retry — bump attempts, do NOT abort the pass (0 lost: the row stays
+                    // unsent + claimable). RETURNING gives the new count so we dead-letter at the
+                    // bound in the SAME pass (parity with the in-memory `fail_attempt` + bound).
+                    let new_attempts: i32 = sqlx::query_scalar(
+                        "UPDATE outbox SET attempts = attempts + 1 WHERE event_id = $1 \
+                         RETURNING attempts",
+                    )
+                    .bind(&event_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| PgError::Query(e.to_string()))?;
+                    if new_attempts as u32 >= max_attempts {
+                        // Dead-lettered: SURFACED, never silent (the in-memory relay raises a
+                        // DeadLetterAlert here; the durable arm quarantines the row in-place and
+                        // logs the same routing detail loudly). The claim predicate now skips it.
+                        let subsystem = envelope
+                            .type_
+                            .0
+                            .split('.')
+                            .next()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("unknown");
+                        eprintln!(
+                            "[pg-outbox-relay] LOUD dead-letter: event_id={} \
+                             dlq=dlq.{}.{} attempts={} — quarantined after the retry bound, not lost",
+                            event_id, envelope.tenant.0, subsystem, new_attempts
+                        );
+                        report.dead_lettered += 1;
+                    } else {
+                        report.failed += 1;
+                    }
+                }
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(report)
+    }
+
     /// **Crash-injection drain (stage-3 OUTBOX-NO-LOSS-UNDER-CRASH drill).** Claims the unsent
     /// rows and PUBLISHES each to `bus` — exactly as [`relay_once`](Self::relay_once) — but
     /// SIMULATES A CRASH after publishing `crash_after` rows: the per-row `published_at` UPDATEs
@@ -290,5 +463,173 @@ impl PgRelay {
             .await
             .map_err(|e| PgError::Query(e.to_string()))?;
         Ok(n)
+    }
+
+    // --- The durable `OutboxStore` backing verbs (MR-009b W3b.2). ALL outbox SQL for the durable
+    // `myelin_events::DurableOutboxBacking` impl (`crate::outbox_durable::PgOutboxBacking`) lives
+    // HERE — the ONE sanctioned, lint-excluded, relay-INTERNAL outbox-query site (the same posture
+    // as `co_commit_in_tx` / `relay_once`). The dead-letter partition is `published_at IS NULL AND
+    // attempts >= MAX_PUBLISH_ATTEMPTS` (no parallel table, no schema change; `attempts` already
+    // exists in the frozen shape). ---
+
+    /// **The durable arm of `OutboxTransaction::commit`: commit every staged row in ONE atomic tx**
+    /// (all-or-nothing — a partial commit would be silent data loss). Allocates the per-aggregate
+    /// `seq` INSIDE the tx as `COALESCE(MAX(seq)+1, 0)` (the [`co_commit_in_tx`](Self::co_commit_in_tx)
+    /// discipline; sequential inserts in the same tx each see the prior seq → contiguous). A PLAIN
+    /// `INSERT` (NO `ON CONFLICT`) so a duplicate `event_id` ABORTS the tx and the call returns an
+    /// error (reject parity with the in-memory arm — NOT `ON CONFLICT DO NOTHING`). A racing
+    /// (`aggregate`, `seq`) collision under concurrency is retried (bounded) so the loser gets the
+    /// next contiguous seq → gap-free, true-commit-order seqs (EB-03, durably).
+    pub async fn commit_staged_atomic(&self, rows: &[OutboxRow]) -> Result<(), PgError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for _ in 0..SEQ_CONTENTION_RETRIES {
+            match self.try_commit_staged(rows).await {
+                CommitAttempt::Committed => return Ok(()),
+                CommitAttempt::SeqContention => continue, // racing committer — retry for the next seq.
+                CommitAttempt::DuplicateEventId(id) => {
+                    return Err(PgError::Query(format!(
+                        "outbox UNIQUE(event_id) violation on EventId(\"{id}\") — duplicate emit"
+                    )))
+                }
+                CommitAttempt::Db(e) => return Err(e),
+            }
+        }
+        Err(PgError::Query(
+            "outbox commit_staged exhausted seq-contention retries (hot-aggregate livelock?)".into(),
+        ))
+    }
+
+    async fn try_commit_staged(&self, rows: &[OutboxRow]) -> CommitAttempt {
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => return CommitAttempt::Db(PgError::Query(e.to_string())),
+        };
+        for row in rows {
+            let payload = match serde_json::to_value(&row.envelope) {
+                Ok(v) => v,
+                Err(e) => {
+                    return CommitAttempt::Db(PgError::Query(format!("serialize envelope: {e}")))
+                }
+            };
+            // Plain INSERT (NO `ON CONFLICT`): a duplicate event_id MUST abort (reject parity), a
+            // racing (aggregate, seq) collision surfaces for a retry. The seq is allocated in-tx.
+            let res = sqlx::query(
+                "INSERT INTO outbox (event_id, aggregate, seq, subject, envelope) \
+                 VALUES ($1, $2, \
+                 COALESCE((SELECT MAX(seq) + 1 FROM outbox WHERE aggregate = $2), 0), $3, $4)",
+            )
+            .bind(&row.event_id.0)
+            .bind(&row.aggregate.0)
+            .bind(&row.subject.0)
+            .bind(payload)
+            .execute(&mut *tx)
+            .await;
+            if let Err(e) = res {
+                return classify_insert_error(e, &row.event_id.0);
+            }
+        }
+        match tx.commit().await {
+            Ok(()) => CommitAttempt::Committed,
+            // The UNIQUE(aggregate, seq) collision can also surface at COMMIT under concurrency.
+            Err(e) => classify_insert_error(e, ""),
+        }
+    }
+
+    /// `outbox_depth` survival signal for the durable backing: unsent AND not-yet-dead rows
+    /// (`published_at IS NULL AND attempts < MAX_PUBLISH_ATTEMPTS`).
+    pub async fn unsent_depth(&self) -> Result<i64, PgError> {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM outbox WHERE published_at IS NULL AND attempts < $1",
+        )
+        .bind(MAX_PUBLISH_ATTEMPTS as i32)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))
+    }
+
+    /// The dead-letter count: unsent rows that exhausted the retry bound
+    /// (`published_at IS NULL AND attempts >= MAX_PUBLISH_ATTEMPTS`).
+    pub async fn dead_count(&self) -> Result<i64, PgError> {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM outbox WHERE published_at IS NULL AND attempts >= $1",
+        )
+        .bind(MAX_PUBLISH_ATTEMPTS as i32)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))
+    }
+
+    /// The `recorded_at` of the oldest still-unsent (not-yet-dead) row — the outbox-age anchor.
+    pub async fn oldest_unsent_recorded_at(&self) -> Result<Option<String>, PgError> {
+        sqlx::query_scalar(
+            "SELECT envelope ->> 'recorded_at' FROM outbox \
+             WHERE published_at IS NULL AND attempts < $1 \
+             ORDER BY envelope ->> 'recorded_at' ASC, aggregate ASC, seq ASC LIMIT 1",
+        )
+        .bind(MAX_PUBLISH_ATTEMPTS as i32)
+        .fetch_optional(&self.pool)
+        .await
+        .map(Option::flatten)
+        .map_err(|e| PgError::Query(e.to_string()))
+    }
+
+    /// The committed-and-live count (sent + unsent-retrying; NOT dead-lettered) — mirrors the
+    /// in-memory `order.len()`, which drops a row on dead-letter.
+    pub async fn committed_live_count(&self) -> Result<i64, PgError> {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM outbox WHERE NOT (published_at IS NULL AND attempts >= $1)",
+        )
+        .bind(MAX_PUBLISH_ATTEMPTS as i32)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))
+    }
+
+    /// Read a committed-and-live row by `event_id` (a dead-lettered row reads as absent — parity
+    /// with the in-memory `row()`, which reads the live map a dead row was removed from).
+    pub async fn committed_row(&self, id: &EventId) -> Result<Option<OutboxRow>, PgError> {
+        let row = sqlx::query(&format!(
+            "SELECT {ROW_PROJECTION} FROM outbox \
+             WHERE event_id = $1 AND NOT (published_at IS NULL AND attempts >= $2)"
+        ))
+        .bind(&id.0)
+        .bind(MAX_PUBLISH_ATTEMPTS as i32)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        row.as_ref().map(row_from_pg).transpose()
+    }
+
+    /// Snapshot the committed-and-live rows in per-aggregate COMMIT order (`(aggregate, seq)` —
+    /// the order the trait contract promises). NOTE (W3b.2 verifier finding): `event_id` mint
+    /// order does NOT track commit order — a tx minted earlier can commit later — so ordering by
+    /// event_id would violate the `committed_rows` contract; `seq` is allocated inside the commit
+    /// tx and is the true per-aggregate commit sequence.
+    pub async fn committed_live_rows(&self) -> Result<Vec<OutboxRow>, PgError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {ROW_PROJECTION} FROM outbox \
+             WHERE NOT (published_at IS NULL AND attempts >= $1) ORDER BY aggregate ASC, seq ASC"
+        ))
+        .bind(MAX_PUBLISH_ATTEMPTS as i32)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        rows.iter().map(row_from_pg).collect()
+    }
+
+    /// Snapshot the dead-lettered rows (retained, not deleted — parity with the in-memory
+    /// `dead_letters()` snapshot).
+    pub async fn dead_rows(&self) -> Result<Vec<OutboxRow>, PgError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {ROW_PROJECTION} FROM outbox \
+             WHERE published_at IS NULL AND attempts >= $1 ORDER BY aggregate ASC, seq ASC"
+        ))
+        .bind(MAX_PUBLISH_ATTEMPTS as i32)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        rows.iter().map(row_from_pg).collect()
     }
 }

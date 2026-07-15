@@ -686,6 +686,13 @@ pub mod pgrelay;
 // `(consumer, event_id)` table behind the `myelin_events::DurableDedup` seam so consumer
 // idempotency survives a process restart. Reuses the frozen `CONSUMER_DEDUP_MIGRATION`.
 pub mod events_durable;
+// The durable PG backing for the transactional `outbox` + relay (MR-009b W3b.2 / SI-007): the REAL
+// `outbox` table (the frozen `myelin_events::OUTBOX_MIGRATION`, the SAME one PgRelay owns) behind
+// the `myelin_events::DurableOutboxBacking` seam (added W3b.1), so the co-commit + the unsent-row
+// ledger + the relay drain survive a process restart. REUSES PgRelay (co_commit seq discipline +
+// the new bounded-retry/dead-letter drain) — no parallel outbox table. Holds a PgPool (scanner
+// ADMITs it); the in-memory OutboxStore holder stays the baseline entry (flipped in W3b.6).
+pub mod outbox_durable;
 // The events serve() composition root (MR-023 / SI-008/009): wires the durable outbox (PgRelay) +
 // the REAL NATS JetStream broker + the relay drain + the idempotent consumer (durable dedup) into a
 // running event-delivery pipeline — the production default, not the in-process fake. STAYS behind
@@ -874,6 +881,7 @@ pub use restore_verify_durable::{
 };
 pub use tenant_tx::{connect_pool_with_reset, with_tenant_tx, TxScope};
 pub use events_durable::DurableDedupBacking;
+pub use outbox_durable::PgOutboxBacking;
 // `events_serve` STAYS behind `integration` (it consumes the real NATS broker `myelin_events::nats`,
 // gated by `myelin-events/integration`) — see the module declaration above.
 #[cfg(feature = "integration")]
