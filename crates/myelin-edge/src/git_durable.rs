@@ -28,6 +28,7 @@ use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::git_edge::{map_method, num_param, param, reroot, tenant_of};
 use crate::repo_authz::{AllowAllRepos, RepoAuthorizer};
+use crate::repo_authz_live::{NoRepoBootstrap, RepoBootstrapGrants};
 use crate::request::EdgeResponse;
 use myelin_events::{Actor, EmitContextBase, IdMinter, OutboxStore, Region, TenantId, Timestamp};
 // Used only by the `test-support`-gated `rooted_inmem_for_test` helper (MR-009b W3b.6).
@@ -78,6 +79,14 @@ pub struct DurableGitBackend {
     /// production boot injects a grant-backed authorizer via [`DurableGitBackend::with_repo_authorizer`]
     /// — the R2 platform-wide object-authz seam backs this with the real tuple store / Identity `check`.
     repo_authz: Arc<dyn RepoAuthorizer>,
+    /// **R2.1a — the repo-create bootstrap-grant seam.** Consulted by
+    /// [`DurableGitBackend::create_repo_as`] BEFORE the bare repo lands on disk: production injects
+    /// [`crate::repo_authz_live::TupleRepoBootstrap`] (the creator→admin tuple through
+    /// `write_tuples`, 4.6) so a fresh repo is immediately reachable by its creator under the
+    /// deny-by-default [`crate::repo_authz_live::CheckBackedRepoAuthorizer`]. Defaults to the no-op
+    /// (paired with the `AllowAllRepos` fixture, where no grant is needed). A grant failure ABORTS
+    /// the create (fail-closed — never a repo no one can reach).
+    bootstrap: Arc<dyn RepoBootstrapGrants>,
 }
 
 impl DurableGitBackend {
@@ -106,6 +115,7 @@ impl DurableGitBackend {
             clone_host: "ssh://git@myelin".into(),
             root,
             repo_authz: Arc::new(AllowAllRepos),
+            bootstrap: Arc::new(NoRepoBootstrap),
         }
     }
 
@@ -136,6 +146,19 @@ impl DurableGitBackend {
     /// The injected R0.3 per-repo object authorizer (the wire handlers consult this before serving).
     pub fn repo_authorizer(&self) -> &Arc<dyn RepoAuthorizer> {
         &self.repo_authz
+    }
+
+    /// **Inject the R2.1a repo-create bootstrap-grant writer** (the pair of
+    /// [`DurableGitBackend::with_repo_authorizer`]: deny-by-default is only livable if a fresh
+    /// repo's creator is granted on create). Production wires
+    /// [`crate::repo_authz_live::TupleRepoBootstrap`] over the SAME tuple store the injected
+    /// authorizer's engine reads.
+    pub fn with_repo_bootstrap(
+        mut self,
+        bootstrap: Arc<dyn RepoBootstrapGrants>,
+    ) -> DurableGitBackend {
+        self.bootstrap = bootstrap;
+        self
     }
 
     /// **The wire-serving `GitCore` over the SAME on-disk root (CT-006b / GT-006).** Composes the
@@ -220,6 +243,11 @@ impl DurableGitBackend {
 
     /// Create a bare repo on disk under the verified `(tenant, region)`. Returns `true` iff newly created
     /// (an existing repo is a conflict the handler surfaces as `409`). Traversal-safe via the resolver.
+    ///
+    /// **The DIRECT (no-bootstrap-grant) path** — test fixtures / pre-authz callers that stage repos
+    /// out-of-band. The edge's create HANDLER goes through [`DurableGitBackend::create_repo_as`]
+    /// (R2.1a) so the creator→admin bootstrap grant is written; under the production deny-by-default
+    /// authorizer a repo created HERE is reachable by no one until a tuple is granted separately.
     pub fn create_repo(
         &self,
         tenant: &str,
@@ -230,6 +258,37 @@ impl DurableGitBackend {
         if self.store.repo_exists(&loc) {
             return Ok(false);
         }
+        self.store.create_repo(&loc)?;
+        Ok(true)
+    }
+
+    /// **Create a bare repo AS a verified principal (R2.1a — the edge create path).** Same as
+    /// [`DurableGitBackend::create_repo`] plus the creator→admin bootstrap grant through the
+    /// injected [`RepoBootstrapGrants`] seam, written BEFORE the directory lands:
+    ///
+    /// - **grant-first ordering:** the tuple write and the on-disk `git init` are two stores with no
+    ///   shared transaction. A crash between them leaves a dangling grant on a non-existent repo —
+    ///   harmless (every wire path 404s on the absent dir; a retried create proceeds and the
+    ///   duplicate `Add` is idempotent in the edge set). The REVERSE order could leave a repo that
+    ///   exists but is reachable by NO ONE — the residue we refuse.
+    /// - **fail-closed:** a grant-write failure ABORTS the create loudly (`DurableError::Git` → the
+    ///   handler's 500); the repo is NOT created without its owner grant.
+    pub fn create_repo_as(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        creator: &Principal,
+    ) -> Result<bool, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        if self.store.repo_exists(&loc) {
+            return Ok(false);
+        }
+        self.bootstrap.grant_creator(creator, &loc).map_err(|e| {
+            DurableError::Git(format!(
+                "creator bootstrap grant refused (repo NOT created — fail-closed): {e}"
+            ))
+        })?;
         self.store.create_repo(&loc)?;
         Ok(true)
     }
@@ -1161,9 +1220,12 @@ impl Handler for DRepoCreate {
             .or_else(|| body.get("name"))
             .and_then(Value::as_str)
             .ok_or_else(|| EdgeError::BadRequest("create-repo body missing `slug`".into()))?;
+        // R2.1a: the CREATE-through-the-edge path writes the creator→admin bootstrap grant (via the
+        // injected RepoBootstrapGrants seam) before the bare repo lands — under the deny-by-default
+        // CheckBackedRepoAuthorizer the creator can immediately clone/push its fresh repo.
         let created = self
             .be
-            .create_repo(tenant_of(ctx), region_of(ctx), slug)
+            .create_repo_as(tenant_of(ctx), region_of(ctx), slug, ctx.principal)
             .map_err(map_durable_err)?;
         if !created {
             return Err(EdgeError::Conflict(format!("repo `{slug}` already exists")));

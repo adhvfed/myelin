@@ -14,17 +14,17 @@
 //! one-tx ref-CAS + outbox. Gated like CT-006c: `MYELIN_REQUIRE_RUNSC=1` ⇒ an absent capability is a
 //! HARD failure. Run: `MYELIN_REQUIRE_RUNSC=1 cargo test -p myelin-edge --test git_wire_http_push_oracle_test -- --nocapture`.
 
+use myelin_ci_sandbox::{resolved_gvisor_rootfs, ENV_GVISOR_GIT_ROOTFS};
 use myelin_edge::{
     register_git_wire, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
 };
+use myelin_git::core::RepoLoc;
+use myelin_git::durable::DurableGitStore;
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
     CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
     PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
 };
-use myelin_ci_sandbox::{resolved_gvisor_rootfs, ENV_GVISOR_GIT_ROOTFS};
-use myelin_git::core::RepoLoc;
-use myelin_git::durable::DurableGitStore;
 use myelin_storage::{KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 use std::net::SocketAddr;
@@ -53,7 +53,11 @@ fn runsc_bin() -> Option<String> {
 }
 
 fn host_git() -> bool {
-    Command::new("git").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn require_or_skip(test: &str) -> bool {
@@ -87,9 +91,15 @@ fn stage_lib(rootfs: &Path, soname: &str, host_path: &str) {
 }
 
 fn stage_git_rootfs(base: &Path) -> PathBuf {
-    let staged = std::env::temp_dir().join(format!("myelin-ct006d-push-rootfs-{}", std::process::id()));
+    let staged =
+        std::env::temp_dir().join(format!("myelin-ct006d-push-rootfs-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
-    let st = Command::new("cp").arg("-a").arg(format!("{}/.", base.display())).arg(&staged).status().expect("cp -a");
+    let st = Command::new("cp")
+        .arg("-a")
+        .arg(format!("{}/.", base.display()))
+        .arg(&staged)
+        .status()
+        .expect("cp -a");
     assert!(st.success(), "cp -a base rootfs failed");
     copy_file(Path::new("/usr/bin/git"), &staged.join("usr/bin/git"));
     stage_lib(&staged, "libpcre2-8.so.0", "/usr/lib/libpcre2-8.so.0");
@@ -121,12 +131,21 @@ fn git_rootfs() -> Option<PathBuf> {
 }
 
 fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 fn temp_root(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let d = std::env::temp_dir().join(format!("myelin-ct006d-{tag}-{}-{nanos}", std::process::id()));
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let d = std::env::temp_dir().join(format!(
+        "myelin-ct006d-{tag}-{}-{nanos}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).expect("mkdir root");
     d
@@ -139,16 +158,35 @@ fn run_git(args: &[&str], cwd: Option<&Path>) {
         c.current_dir(d);
     }
     let out = c.output().expect("run host git");
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn seed_principal(store: &PrincipalStore, tenant: &str, pid: &str, subject_key: &str) {
     let scope = TenantScope::from_verified_token(
-        &Principal::stub(PrincipalId("admin".into()), PrincipalKind::Human, TenantId(tenant.into())),
+        &Principal::stub(
+            PrincipalId("admin".into()),
+            PrincipalKind::Human,
+            TenantId(tenant.into()),
+        ),
         Region(REGION.into()),
     );
-    store.put_principal(&scope, PrincipalId(pid.into()), PrincipalKind::Service, DataRole::Controller, PrincipalStatus::Active, None).expect("seed");
-    store.link_credential(&scope, SCHEME, subject_key, &PrincipalId(pid.into())).expect("link");
+    store
+        .put_principal(
+            &scope,
+            PrincipalId(pid.into()),
+            PrincipalKind::Service,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+            None,
+        )
+        .expect("seed");
+    store
+        .link_credential(&scope, SCHEME, subject_key, &PrincipalId(pid.into()))
+        .expect("link");
 }
 
 fn build(root: &Path) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBackend>) {
@@ -161,11 +199,18 @@ fn build(root: &Path) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBacken
         Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
         RevocationStore::new(),
     ));
-    let human = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(KmsEngine::new()))));
+    let human = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
+        Arc::new(KmsEngine::new()),
+    )));
     let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(root.to_path_buf()));
     let builder = Gateway::builder(authn, human, Arc::new(AllowAll))
         .default_token_scheme(SCHEME)
-        .route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler));
+        .route(
+            Method::Get,
+            "/v1/whoami",
+            "edge.whoami",
+            Arc::new(WhoamiHandler),
+        );
     let builder = register_git_wire(builder, backend.clone());
     (Arc::new(builder.build()), cell, backend)
 }
@@ -199,25 +244,48 @@ fn make_work(root: &Path) -> PathBuf {
     // The push pseudonymity gate (GIT-1) requires every pushed commit's author/committer identity to be
     // a `<pseudonym>@<tenant>.noreply` handle for the pushing tenant (acme) — a raw name/email is refused
     // BEFORE the ref moves. A real client does this one-time `git config`; the oracle does the same.
-    run_git(&["config", "user.email", "anon-7@acme.noreply"], Some(&work));
+    run_git(
+        &["config", "user.email", "anon-7@acme.noreply"],
+        Some(&work),
+    );
     run_git(&["config", "user.name", "anon-7@acme.noreply"], Some(&work));
     std::fs::write(work.join("README.md"), b"# ct006d push oracle\n").unwrap();
     run_git(&["add", "-A"], Some(&work));
-    run_git(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "initial"], Some(&work));
+    run_git(
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "initial",
+        ],
+        Some(&work),
+    );
     work
 }
 
 /// Run `git push <url> main` with an optional Bearer token. Returns (success, stdout, stderr).
-fn git_push(addr: SocketAddr, token: Option<&str>, repo_url_path: &str, work: &Path) -> (bool, String, String) {
+fn git_push(
+    addr: SocketAddr,
+    token: Option<&str>,
+    repo_url_path: &str,
+    work: &Path,
+) -> (bool, String, String) {
     let url = format!("http://{addr}{repo_url_path}");
     let mut c = Command::new("git");
     c.current_dir(work).env("GIT_TERMINAL_PROMPT", "0");
     if let Some(t) = token {
-        c.arg("-c").arg(format!("http.extraHeader=Authorization: Bearer {t}"));
+        c.arg("-c")
+            .arg(format!("http.extraHeader=Authorization: Bearer {t}"));
     }
     c.args(["push", &url, "main"]);
     let out = c.output().expect("spawn git push");
-    (out.status.success(), String::from_utf8_lossy(&out.stdout).to_string(), String::from_utf8_lossy(&out.stderr).to_string())
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
 }
 
 /// Re-open the durable repo in a FRESH store (a new process would do the same) and read a ref's tip.
@@ -237,7 +305,9 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
     let root = temp_root("push");
     // The server repo must exist (push to a non-existent repo is a 404). Create it durably.
     let backend_for_create = DurableGitBackend::rooted_inmem_for_test(root.clone());
-    backend_for_create.create_repo("acme", REGION, "widgets").expect("create server repo");
+    backend_for_create
+        .create_repo("acme", REGION, "widgets")
+        .expect("create server repo");
 
     let (gw, cell, backend) = build(&root);
     let addr = spawn(gw).await;
@@ -245,7 +315,10 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
 
     let work = make_work(&root);
     let pushed_oid = {
-        let o = Command::new("git").args(["-C", &work.to_string_lossy(), "rev-parse", "HEAD"]).output().unwrap();
+        let o = Command::new("git")
+            .args(["-C", &work.to_string_lossy(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
         String::from_utf8_lossy(&o.stdout).trim().to_string()
     };
 
@@ -259,34 +332,75 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
     // The ref + objects landed DURABLY: a FRESH store (≈ a restarted process) sees the new tip.
     let tip = durable_tip(&root, "acme", "widgets", "refs/heads/main");
     println!("durable re-open: refs/heads/main = {tip:?} (pushed {pushed_oid})");
-    assert_eq!(tip.as_deref(), Some(pushed_oid.as_str()), "the pushed ref must survive a fresh re-open");
+    assert_eq!(
+        tip.as_deref(),
+        Some(pushed_oid.as_str()),
+        "the pushed ref must survive a fresh re-open"
+    );
 
     // `git fsck --full` on the SERVER bare repo is clean (the migrated objects are intact + connected).
     let bare = root.join("acme/eu-west/widgets.git");
-    let fsck = Command::new("git").args(["--git-dir", &bare.to_string_lossy(), "fsck", "--full"]).output().unwrap();
-    println!("=== git fsck --full (server repo) ===\nstatus={:?}\nstderr=\n{}", fsck.status.code(), String::from_utf8_lossy(&fsck.stderr));
-    assert!(fsck.status.success(), "git fsck on the server repo must be clean");
+    let fsck = Command::new("git")
+        .args(["--git-dir", &bare.to_string_lossy(), "fsck", "--full"])
+        .output()
+        .unwrap();
+    println!(
+        "=== git fsck --full (server repo) ===\nstatus={:?}\nstderr=\n{}",
+        fsck.status.code(),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+    assert!(
+        fsck.status.success(),
+        "git fsck on the server repo must be clean"
+    );
 
     // emit-iff-committed: exactly ONE git.ref.updated row became durable for the accepted ref move.
     let depth_after = backend.outbox().outbox_depth();
     println!("outbox depth: before={depth_before} after={depth_after} (expect +1)");
-    assert_eq!(depth_after, depth_before + 1, "the accepted push emits exactly one git.ref.updated (0 ghost / 0 lost)");
+    assert_eq!(
+        depth_after,
+        depth_before + 1,
+        "the accepted push emits exactly one git.ref.updated (0 ghost / 0 lost)"
+    );
 
     // ── 2. a REJECTED push (a planted AWS-key secret) does NOT move the ref + emits NO event ──
     let tip_before_reject = durable_tip(&root, "acme", "widgets", "refs/heads/main");
     let depth_before_reject = backend.outbox().outbox_depth();
     std::fs::write(work.join("creds.txt"), b"aws_key = AKIAIOSFODNN7EXAMPLE\n").unwrap();
     run_git(&["add", "-A"], Some(&work));
-    run_git(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "oops a secret"], Some(&work));
+    run_git(
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "oops a secret",
+        ],
+        Some(&work),
+    );
     let (ok_s, so_s, se_s) = git_push(addr, Some(&token), "/acme/eu-west/widgets.git", &work);
     println!("=== git push (PLANTED SECRET) — must be rejected ===\nsuccess={ok_s}\nstdout=\n{so_s}\nstderr=\n{se_s}");
     assert!(!ok_s, "a push carrying a secret MUST be rejected");
     let tip_after_reject = durable_tip(&root, "acme", "widgets", "refs/heads/main");
-    assert_eq!(tip_after_reject, tip_before_reject, "a rejected push MUST NOT move the ref (0 ghost)");
-    assert_eq!(backend.outbox().outbox_depth(), depth_before_reject, "a rejected push emits NO event");
+    assert_eq!(
+        tip_after_reject, tip_before_reject,
+        "a rejected push MUST NOT move the ref (0 ghost)"
+    );
+    assert_eq!(
+        backend.outbox().outbox_depth(),
+        depth_before_reject,
+        "a rejected push emits NO event"
+    );
     // The server repo is still fsck-clean (no half-migrated corruption from the rejected push).
-    let fsck2 = Command::new("git").args(["--git-dir", &bare.to_string_lossy(), "fsck", "--full"]).output().unwrap();
-    assert!(fsck2.status.success(), "the server repo stays fsck-clean after a rejected push");
+    let fsck2 = Command::new("git")
+        .args(["--git-dir", &bare.to_string_lossy(), "fsck", "--full"])
+        .output()
+        .unwrap();
+    assert!(
+        fsck2.status.success(),
+        "the server repo stays fsck-clean after a rejected push"
+    );
     // Undo the local secret commit so the cross-tenant leg pushes a clean history.
     run_git(&["reset", "-q", "--hard", "HEAD~1"], Some(&work));
 
@@ -300,7 +414,10 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
     let tip_before_x = durable_tip(&root, "acme", "widgets", "refs/heads/main");
     std::fs::write(work.join("x.txt"), b"cross tenant attempt\n").unwrap();
     run_git(&["add", "-A"], Some(&work));
-    run_git(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "x"], Some(&work));
+    run_git(
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "x"],
+        Some(&work),
+    );
     let (ok_x, _so_x, se_x) = git_push(addr, Some(&globex), "/acme/eu-west/widgets.git", &work);
     println!("=== git push (CROSS-TENANT globex→acme) — must be refused ===\nsuccess={ok_x}\nstderr=\n{se_x}");
     assert!(!ok_x, "a cross-tenant push MUST be refused");
@@ -311,5 +428,201 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
     );
 
     println!("=== CT-006d EXTERNAL ORACLE PROVEN: real git push lands durably + secret-reject (0 ghost) + auth/cross-tenant refusal ===");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ═══════════════ R2.1a — R0.2 LIVE: branch protection fires on the production-shaped wire ═══════════════
+//
+// R0.2 (`evaluate_protected_ref_push`) was proven at the handler tier; what was missing was the wire
+// itself in the production composition (main.rs never called `register_git_wire`). This oracle runs
+// the R2.1a composition — the live CheckEngine repo-authorizer + the creator→admin bootstrap grant +
+// the mounted wire — and proves the protected-ref gate rejects a REAL `git push --force` to
+// `refs/heads/main` (the default-protected ref) with the ref tip UNMOVED, while ordinary
+// fast-forward pushes by the granted creator continue to land.
+
+use myelin_edge::{
+    register_git_durable, register_git_wire as register_wire_r21a, CheckBackedRepoAuthorizer,
+    TupleRepoBootstrap,
+};
+use myelin_events::OutboxStore;
+use myelin_identity::FragmentAdmit;
+use myelin_identity_service::{StoreBackedCheck, TupleStore};
+use myelin_substrate::FailStaticThreshold;
+
+fn r21a_threshold() -> FailStaticThreshold {
+    FailStaticThreshold {
+        status: "OPEN — LEGAL".into(),
+        owner: "DPO / Legal".into(),
+        static_max_secs: None,
+        static_max_default_secs: 300,
+        agent_token_ttl_secs: 60,
+        constraint: "static_max <= revocation-SLA AND static_max >= agent-token-TTL".into(),
+    }
+}
+
+/// The R2.1a production-shaped gateway (mirrors main.rs): live CheckEngine repo authz + bootstrap
+/// grants + the durable routes (create-repo) + the wire.
+fn build_r21a(root: &Path) -> (Arc<Gateway>, CellTokenAuthority) {
+    let cell = CellTokenAuthority::from_seed(&[21u8; 32], &[23u8; 32]).expect("cell");
+    let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+    seed_principal(&store, "acme", "svc:creator", "subj-c");
+    let authn = Arc::new(CapabilityAuthenticator::with_verifier(
+        store,
+        Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
+        RevocationStore::new(),
+    ));
+    let human = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
+        Arc::new(KmsEngine::new()),
+    )));
+
+    let check = StoreBackedCheck::new(TupleStore::new(OutboxStore::new()));
+    for admit in check.admit_git_fragment() {
+        assert!(matches!(admit, FragmentAdmit::Admitted { .. }), "{admit:?}");
+    }
+    let repo_authz = Arc::new(
+        CheckBackedRepoAuthorizer::try_new(check.clone(), 300, &r21a_threshold())
+            .expect("valid staleness bound"),
+    );
+    let repo_bootstrap = Arc::new(TupleRepoBootstrap::new(check.tuples().clone()));
+    let backend = Arc::new(
+        DurableGitBackend::rooted_inmem_for_test(root.to_path_buf())
+            .with_repo_authorizer(repo_authz)
+            .with_repo_bootstrap(repo_bootstrap),
+    );
+    let builder = Gateway::builder(authn, human, Arc::new(AllowAll))
+        .default_token_scheme(SCHEME)
+        .route(
+            Method::Get,
+            "/v1/whoami",
+            "edge.whoami",
+            Arc::new(WhoamiHandler),
+        );
+    let builder = register_git_durable(builder, backend.clone());
+    let builder = register_wire_r21a(builder, backend);
+    (Arc::new(builder.build()), cell)
+}
+
+fn mint_for(cell: &CellTokenAuthority, jti: &str, subject_key: &str) -> String {
+    cell.mint(&CapabilityMintSpec {
+        tenant: "acme".into(),
+        region: REGION.into(),
+        subject_key: subject_key.into(),
+        jti: jti.into(),
+        exp_unix: now() + 3600,
+        authority: vec!["agent:run".into()],
+        dpop_jkt: None,
+    })
+}
+
+/// A minimal HTTP/1.1 POST over a raw TcpStream (no client dep): returns the full response text.
+fn http_post(addr: SocketAddr, path: &str, token: &str, body: &str) -> String {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(addr).expect("connect edge");
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).expect("write request");
+    let mut out = String::new();
+    s.read_to_string(&mut out).expect("read response");
+    out
+}
+
+/// `git push [--force] <url> main`; returns (success, stdout, stderr).
+fn push_main(addr: SocketAddr, token: &str, work: &Path, force: bool) -> (bool, String, String) {
+    let url = format!("http://{addr}/acme/eu-west/widgets.git");
+    let mut c = Command::new("git");
+    c.current_dir(work).env("GIT_TERMINAL_PROMPT", "0");
+    c.arg("-c")
+        .arg(format!("http.extraHeader=Authorization: Bearer {token}"));
+    c.arg("push");
+    if force {
+        c.arg("--force");
+    }
+    c.args([url.as_str(), "main"]);
+    let out = c.output().expect("spawn git push");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r0_2_branch_protection_rejects_force_push_through_the_live_wire() {
+    if !require_or_skip("r2.1a R0.2 protected-ref oracle") {
+        return;
+    }
+    let Some(_rootfs) = git_rootfs() else { return };
+
+    let root = temp_root("r21a-r02");
+    let (gw, cell) = build_r21a(&root);
+    let addr = spawn(gw).await;
+    let token = mint_for(&cell, "jti-r02", "subj-c");
+
+    // The creator creates the repo THROUGH the edge (bootstrap grant written) and pushes twice —
+    // ordinary fast-forwards land through the live-authz wire.
+    let resp = http_post(addr, "/v1/git/repos", &token, r#"{"slug":"widgets"}"#);
+    assert!(
+        resp.starts_with("HTTP/1.1 201"),
+        "create-repo must 201: {resp}"
+    );
+
+    let work = make_work(&root);
+    let (ok1, _o1, e1) = push_main(addr, &token, &work, false);
+    println!("=== push A (ff) ===\nsuccess={ok1}\nstderr=\n{e1}");
+    assert!(
+        ok1,
+        "the creator's first push lands (bootstrap grant → push)"
+    );
+
+    std::fs::write(work.join("b.txt"), b"second\n").unwrap();
+    run_git(&["add", "-A"], Some(&work));
+    run_git(
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "B"],
+        Some(&work),
+    );
+    let (ok2, _o2, e2) = push_main(addr, &token, &work, false);
+    println!("=== push B (ff) ===\nsuccess={ok2}\nstderr=\n{e2}");
+    assert!(
+        ok2,
+        "a fast-forward push to main lands (the gate is not a blanket refusal)"
+    );
+    let tip_b = durable_tip(&root, "acme", "widgets", "refs/heads/main").expect("tip B");
+
+    // Rewrite history (divergent C from A) and FORCE-push → R0.2: `refs/heads/main` is protected
+    // by default; a force push is rejected AT THE WIRE (per-ref `ng` — the whole atomic push
+    // aborts) and the durable tip does not move.
+    run_git(&["reset", "-q", "--hard", "HEAD~1"], Some(&work));
+    std::fs::write(work.join("c.txt"), b"divergent\n").unwrap();
+    run_git(&["add", "-A"], Some(&work));
+    run_git(
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "C (divergent)",
+        ],
+        Some(&work),
+    );
+    let (ok_f, so_f, se_f) = push_main(addr, &token, &work, true);
+    println!("=== FORCE push (divergent) — must be rejected by R0.2 ===\nsuccess={ok_f}\nstdout=\n{so_f}\nstderr=\n{se_f}");
+    assert!(
+        !ok_f,
+        "a force push to the protected `main` MUST be rejected through the wire (R0.2 live)"
+    );
+    assert!(
+        se_f.contains("remote rejected") || so_f.contains("remote rejected"),
+        "the rejection is the server's per-ref `ng` (remote rejected), not a client-side refusal: {se_f}"
+    );
+    assert_eq!(
+        durable_tip(&root, "acme", "widgets", "refs/heads/main").as_deref(),
+        Some(tip_b.as_str()),
+        "the protected ref tip MUST NOT move on the rejected force push"
+    );
+
+    println!("=== R2.1a/R0.2 ORACLE PROVEN: branch protection fires through the LIVE wire (force-push rejected, ref unmoved) ===");
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -771,6 +771,15 @@ impl StoreBackedCheck {
         &self.revocations
     }
 
+    /// **The S3 tuple store this slot's `check` engine reads (the ONE ReBAC edge set).** Exposed so
+    /// a composition root can drive the scoped [`TupleStore::write_tuples`] path (contract 4.6 —
+    /// e.g. the R2.1a repo-create creator→admin bootstrap grant) against the SAME store the engine
+    /// resolves, never a second parallel handle. Every clone of this `StoreBackedCheck` shares the
+    /// same underlying store.
+    pub fn tuples(&self) -> &TupleStore {
+        &self.tuples
+    }
+
     /// **`revoke(jti | principal_id)` (contract 4.7) — the LIVE, scoped, idempotent, crash-safe
     /// revoke (P-ID-14).** Carries the verified `(tenant, region)` scope the ABI trait method cannot
     /// (it has no caller scope). Writes the S7 denylist (mirror-first, idempotent) so every surface
