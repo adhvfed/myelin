@@ -209,8 +209,9 @@ stack; kill-9 drills green.
 | R2.3 | Fail-static authz cache full-key comparison | **DONE** | `2154e38` (merge; `d3ebd3b`+`ff334e8`) |
 | R2.4 | MCP HITL server-side verdict; batch partial-approval by approval-id | **DONE** | `d248644` (merge; `d6b9d1e`+`5f60037`) |
 | R2.4-fu | Wire GovernedRouter + durable HitlVerdictStore into MCP prod main (currently GOVERNANCE_NOT_WIRED) | PENDING (tracked; MCP-serve composition root) | — |
-| R2.5 | Real OIDC login at edge; dev-login structurally dead in prod | PENDING | — |
-| R2.6 | AllowAll removed from main.rs + lint | PENDING | — |
+| R2.1 | Object-level authz at the edge, platform-wide (extends R0.3 seam; git_edge template first) | IN VERIFY | `fc06f54` (worktree, pre-merge) |
+| R2.5 | Real OIDC login at edge; dev-login structurally dead in prod | **DONE** | `fb7fd1e` (merge; `a9e4e57`) |
+| R2.6 | AllowAll removed from main.rs + lint | IN BUILD | — |
 | R2.7 | Search vector-path ACL parity | **DONE** | `f31e310` (merge; `6c56c42`) |
 
 R2 exit: red-team campaign (subagent per subsystem: edge/wire/MCP/SSE/search reach-around) all-denied; AllowAll gone.
