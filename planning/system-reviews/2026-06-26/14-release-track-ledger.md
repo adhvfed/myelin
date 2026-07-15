@@ -136,6 +136,21 @@ never the default `MonotonicMinter`** (collision → `ON CONFLICT DO NOTHING` si
 newly reachable via the shared PG outbox, probe-proven). Principal/revocation backings emit no
 events — no analogous re-point exists.
 
+**W3b.4 DONE (2026-07-15, merge `8745a50`): composition roots durable; in-proc floor test-only.**
+Six service mains require DATABASE_URL (exit-1 pre-config — DevDefaults would silently supply the
+dev DSN otherwise), migrate foundation, inject `OutboxStore::durable`; edge injects the new
+`UlidMinter` (P-S12 stand-in — satisfies the W3b.3 condition; `TupleStore::with_pg` default also
+re-pointed off the forbidden MonotonicMinter, verifier latent-gap). Verifier CONFIRMED-SOUND.
+**MUST-FIX BEFORE the first production consumer / NATS wiring (probe-proven, documented in-code at
+`PgRelay::drain_once_dead_letter`): the shared-table drain claim is unscoped** — one service's
+relay can claim another's rows, publish to its process-local bus, and permanently stamp
+published_at (loses nothing today: zero production consumers; git reconciler reads published rows).
+Honest STOP: AppSpec::minimal + agent-service/ci spec builders construct the memory floor
+EXPLICITLY (grep "W3b.6 debt"); ci-controlplane + ci-dispatch binaries boot it today (byte-identical
+to pre-change). Residuals: migrate-as-owner/serve-as-app role split unaddressed platform-wide (the
+app role cannot run the migrator — smokes/integration need the admin DSN); shared-backlog drain
+coupling in dev; edge reconcile reads the full table (per-aggregate verb = future work).
+
 **W3b.2 DONE (2026-07-15, merge `20fe480`): scanner-neutral.** `PgOutboxBacking` over the frozen
 outbox table; commit_staged_atomic (dup-event_id rejects whole commit = memory parity; one seq
 discipline with co_commit_in_tx); drain_once_dead_letter (claim locks held across publishes; per-row
