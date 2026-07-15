@@ -53,6 +53,14 @@ fn human_principal(id: &str, tenant: &str) -> Principal {
     p
 }
 
+/// A non-human machine principal (R2.4b — used to prove the distinct-HUMAN approver rule refuses a
+/// machine/service approver even when it is distinct from the requester).
+fn service_principal(id: &str, tenant: &str) -> Principal {
+    let mut p = Principal::stub(PrincipalId(id.into()), PrincipalKind::Service, TenantId(tenant.into()));
+    p.region = Region("eu-west".into());
+    p
+}
+
 /// Build a server with a governed router over a REAL minter (shared S7 store returned so a test can
 /// revoke the run token).
 fn governed_server() -> McpServer {
@@ -247,13 +255,13 @@ fn a_gated_tool_returns_an_opaque_unguessable_gate_id() {
     );
 }
 
-/// **R2.4 — the full server-side approval loop:** gated → the gate row is `waiting` in the store →
-/// the agent CANNOT approve its own gate (distinct-approver, enforced server-side even though the
-/// agent was listed in the approver set) → re-driving with the gate id while it is still waiting
-/// does NOT apply → a DISTINCT human approves in the store → the re-drive presenting that gate id
-/// applies through EffectApi.
+/// **R2.4 / R2.4b — the full server-side approval loop:** gated → the gate row is `waiting` in the
+/// store → the agent CANNOT approve its own gate (distinct-approver) AND a NON-HUMAN (machine)
+/// principal cannot approve at all (distinct-HUMAN, R2.4b) → re-driving with the gate id while it is
+/// still waiting does NOT apply → a DISTINCT HUMAN approves in the store → the re-drive presenting
+/// that gate id applies through EffectApi.
 #[test]
-fn approval_is_a_server_side_verdict_by_a_distinct_principal() {
+fn approval_is_a_server_side_verdict_by_a_distinct_human_principal() {
     let server = governed_server();
     let call =
         r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7}}}"#;
@@ -275,10 +283,22 @@ fn approval_is_a_server_side_verdict_by_a_distinct_principal() {
     //     its own gate, whatever it sends).
     assert!(
         matches!(
-            router.approve_gate(&PrincipalId("agent:claude".into()), &gate_id),
+            router.approve_gate(&agent_principal("agent:claude", "acme"), &gate_id),
             Err(GateDecideError::SelfApproval) | Err(GateDecideError::NotEligible)
         ),
         "the agent principal cannot approve its own gate"
+    );
+    // (2b) R2.4b — a DISTINCT NON-HUMAN principal (a service/agent) cannot approve either: the
+    //      HITL gate structurally requires a HUMAN approver (closes the machine-collusion gap).
+    assert_eq!(
+        router.approve_gate(&service_principal("svc:ci-robot", "acme"), &gate_id),
+        Err(GateDecideError::MachineApproverRefused),
+        "a distinct MACHINE principal is refused — the gate requires a HUMAN approver"
+    );
+    assert_eq!(
+        router.gate_verdict(&gate_id).unwrap().state,
+        GateState::Waiting,
+        "the machine-refused approval left the gate undecided"
     );
 
     // (3) Re-driving WITH the gate id while the gate is still waiting → still withheld, 0 apply.
@@ -295,7 +315,7 @@ fn approval_is_a_server_side_verdict_by_a_distinct_principal() {
 
     // (4) A DISTINCT human principal approves — SERVER-SIDE.
     router
-        .approve_gate(&PrincipalId("human:operator".into()), &gate_id)
+        .approve_gate(&human_principal("human:operator", "acme"), &gate_id)
         .expect("a distinct eligible human approves");
     let rec = router.gate_verdict(&gate_id).unwrap();
     assert_eq!(rec.state, GateState::Approved);
@@ -334,7 +354,7 @@ fn an_approval_never_transfers_to_a_sibling_effect_and_a_reject_is_final() {
     let gated = drive(&server, &[call7]);
     let gate7 = gated[0]["result"]["_meta"]["gateId"].as_str().unwrap().to_string();
     let router = server.router().unwrap();
-    router.approve_gate(&PrincipalId("human:operator".into()), &gate7).unwrap();
+    router.approve_gate(&human_principal("human:operator", "acme"), &gate7).unwrap();
 
     // The approved gate for PR 7 does NOT clear a re-drive of PR 8 (same tool, different effect).
     let cross = format!(
@@ -351,7 +371,7 @@ fn an_approval_never_transfers_to_a_sibling_effect_and_a_reject_is_final() {
     let gate9 = gated9[0]["result"]["_meta"]["gateId"].as_str().unwrap().to_string();
     router.reject_gate(&PrincipalId("human:operator".into()), &gate9).unwrap();
     assert!(
-        router.approve_gate(&PrincipalId("human:operator".into()), &gate9).is_err(),
+        router.approve_gate(&human_principal("human:operator", "acme"), &gate9).is_err(),
         "a rejected gate never re-transitions"
     );
     let redrive9 = format!(

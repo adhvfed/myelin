@@ -21,7 +21,7 @@
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
-use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
 use myelin_storage::hitl_gate_durable::{
     hitl_gate_durable_migrations, GateDecideError, GateRecord, GateState, HitlVerdictStore,
 };
@@ -118,21 +118,32 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
     assert_eq!(rec.requested_by, "agent:claude");
     assert!(!rec.authorizes(effect, "agent:claude"), "a waiting gate authorizes nothing");
 
-    // (2) The distinct-approver rule holds in the DURABLE arm: self-approval + out-of-filter are
-    //     refused and the row STAYS waiting.
+    // (2) The distinct-HUMAN-approver rule holds in the DURABLE arm: self-approval, a distinct
+    //     MACHINE (R2.4b), and an out-of-filter principal are all refused and the row STAYS waiting.
     assert_eq!(
-        store2.approve(&scope, &gate_id, "agent:claude"),
+        store2.approve(&scope, &gate_id, "agent:claude", PrincipalKind::Human),
         Err(GateDecideError::SelfApproval)
     );
+    // R2.4b — a distinct principal that IS eligible but is a MACHINE is refused on LIVE PG.
     assert_eq!(
-        store2.approve(&scope, &gate_id, "psn:stranger"),
+        store2.approve(
+            &scope,
+            &gate_id,
+            "psn:lead",
+            PrincipalKind::Agent { runtime_ref: RuntimeRef("rt".into()), on_behalf_of: None }
+        ),
+        Err(GateDecideError::MachineApproverRefused),
+        "a distinct, in-filter MACHINE approver is refused durably (distinct-HUMAN, R2.4b)"
+    );
+    assert_eq!(
+        store2.approve(&scope, &gate_id, "psn:stranger", PrincipalKind::Human),
         Err(GateDecideError::NotEligible)
     );
     assert_eq!(store1.fetch(&scope, &gate_id).unwrap().state, GateState::Waiting);
 
-    // A distinct eligible human approves through instance TWO ...
+    // A distinct eligible HUMAN approves through instance TWO ...
     store2
-        .approve(&scope, &gate_id, "psn:lead")
+        .approve(&scope, &gate_id, "psn:lead", PrincipalKind::Human)
         .expect("a distinct eligible human approves");
     // ... and instance ONE reads the durable verdict back: approved, by psn:lead, authorizing
     // exactly the bound effect for the requesting agent — and nothing else.
@@ -146,7 +157,7 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
     );
     // Terminal: a re-decide refuses durably.
     assert_eq!(
-        store1.approve(&scope, &gate_id, "psn:maintainer"),
+        store1.approve(&scope, &gate_id, "psn:maintainer", PrincipalKind::Human),
         Err(GateDecideError::AlreadyDecided(GateState::Approved))
     );
 
