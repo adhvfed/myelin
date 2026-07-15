@@ -216,7 +216,34 @@ stack; kill-9 drills green.
 
 R2 exit: red-team campaign (subagent per subsystem: edge/wire/MCP/SSE/search reach-around) all-denied; AllowAll gone.
 
-### R2 execution log (2026-07-15, session 2)
+## **R2 COMPLETE — EXITED (2026-07-16, merge `e698b2d`).**
+
+All 10 items merged, each builder → orchestrator gate → independent adversarial verifier (Fable) → merge,
+every verifier CONFIRMED-SOUND. **Exit red-team ran (5 adversaries):** MCP / SSE / search PASS (latent-only);
+edge + wire converged on ONE HIGH cross-subsystem blocker — the git protected-branch DIRECT-PUSH path was not
+a real control (a plain writer landed code on protected `main` via self-certifiable CI + a gate honoring only
+required_contexts + a wire path never checking ProtectedPush). **Blocker FIXED + verified + merged** (`e698b2d`):
+report_checks refuses non-Service principals; the wire requires `RepoPermission::ProtectedPush` (admin) for a
+protected-ref direct push; `evaluate_protected_ref_push` runs the FULL ruleset (approvals/CODEOWNERS/
+conversations); multi-ref pushes abort atomically. Both red-team exploits are now DENIED as regression tests on
+main (incl. a real `git push` refused under runsc); force/delete floor (R0.2) intact; legit flows work.
+**Exit criteria met: every reach-around all-denied; AllowAll gone (no-permissive-authorizer-in-prod scanner at
+TRUE ZERO).**
+
+**Carried out of R2 (tracked, non-blocking):**
+1. **#12 — MCP GovernedRouter not wired in prod** (`new_catalogue_only` → GOVERNANCE_NOT_WIRED; MCP tool
+   EXECUTION is not live — fail-closed, not a vuln). Before wiring: inject `HitlVerdictStore::with_pg`; fix the
+   latent gate findings (F1 approved-gate-not-single-use → per-effect idem ledger; run_id consult conjunct;
+   durable-panic-not-caught-by-stdio-handler). Product-surface piece (R3-ish).
+2. **#13-residual — CI-producer relation:** the report_checks Service-kind floor is coarse (any in-tenant
+   Service principal, not the specific ci_producer for that repo/run). Full `repo.report_checks`/`ci_producer`
+   fragment relation is the R2+ follow-on; the realistic Human-developer vector is fully closed.
+3. **#14 — latent residuals (non-prod-reachable):** SSE tenant-id charset injectivity (defense-in-depth before
+   any per-resource stream on a shared stream name) + per-frame object filter (lands with the first per-resource
+   publisher); search legacy 3-field sealed-segment deny-arm fail-open (close when at-rest seal-every-segment
+   wiring SRCH-P06/P15 lands).
+
+### R2 execution log (2026-07-15/16, session 2)
 
 Same process as R0/R1: builder → orchestrator gate → independent adversarial verifier → commit/merge.
 Grounding surveys done for all of R2.1a, R2.2, R2.3, R2.4, R2.7 before dispatch.
