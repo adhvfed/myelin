@@ -330,6 +330,69 @@ fn chained_partial_approval_applies_exactly_the_approved_effects() {
     );
 }
 
+// ───────────────────────── R2.4 Defect B: the declined-sibling NEGATIVE leg ───────────────────────
+
+/// **R2.4 Defect B (the tool-name-keyed bypass, closed):** approve effect 0 (`git.merge` on PR 40),
+/// DECLINE effect 1 (`git.merge` on PR 41 — the SAME tool name), then adversarially re-drive the
+/// DECLINED effect 1 through `apply_planned` using exactly the `approved` set the batch produced.
+/// The step-6 enforcement gate must consult the PER-EFFECT verdict — a declined sibling's key must
+/// never be satisfied by an approved sibling sharing a tool name. (Fails RED on the pre-R2.4 code,
+/// where `approved` held bare tool names and step 6 read `approved.contains(&plan.tool.0)`.)
+#[test]
+fn a_declined_sibling_sharing_a_tool_name_does_not_apply_on_re_drive() {
+    let cat = Catalogue {
+        defs: vec![merge_tool()],
+    };
+    let endpoint = Endpoint {
+        applied: RefCell::new(vec![]),
+    };
+    let card = withhold_three(&cat, &endpoint);
+
+    // Partial approval: approve 0 (pr 40), DECLINE 1 (pr 41), approve 2 (pr 42).
+    let mut script = DecisionScript::new();
+    script
+        .decide(card.idem_key_for(0), WaitDecision::Approve)
+        .decide(
+            card.idem_key_for(1),
+            WaitDecision::Reject("pr 41 fails checks".into()),
+        )
+        .decide(card.idem_key_for(2), WaitDecision::Approve);
+
+    let mut approved = ApprovedTools::new();
+    let mut ledger = ApplyLedger::new();
+    let outcome = run_batch_hitl_loop(&card, &script, &mut approved, &mut ledger);
+    assert!(
+        matches!(outcome.effects[1], EffectOutcome::Withheld { .. }),
+        "effect 1 was DECLINED"
+    );
+
+    // THE ADVERSARIAL RE-DRIVE: the DECLINED effect 1, re-submitted through the REAL pipeline with
+    // the batch's OWN approved set (whatever the batch produced). It must NOT apply.
+    let result = apply_once(&cat, &endpoint, &card.effects[1].plan, approved.as_set());
+    assert!(
+        !matches!(result, EffectResult::Applied(_)),
+        "the DECLINED effect 1 (git.merge on pr 41) must NOT apply just because an approved sibling \
+         shares its tool name — the step-6 gate must be per-effect, not tool-name-keyed: {result:?}"
+    );
+    assert!(
+        !endpoint
+            .applied
+            .borrow()
+            .iter()
+            .any(|o| o.contains("pr/41")),
+        "pr 41 made 0 mutation (AG-8) — the declined effect never reached apply"
+    );
+
+    // The approved siblings still apply on THEIR re-drive (the fix must not over-close).
+    for idx in [0usize, 2] {
+        let r = apply_once(&cat, &endpoint, &card.effects[idx].plan, approved.as_set());
+        assert!(
+            matches!(r, EffectResult::Applied(_)),
+            "the APPROVED effect {idx} still applies on the re-drive: {r:?}"
+        );
+    }
+}
+
 // ───────────────────────── CHAINED-E2E: the double-click variant (0 extra apply) ─────────────────
 
 /// **CHAINED-E2E (AG-D5 exactly-once leg — DOUBLE-CLICK): a double-click on "approve all" applies each

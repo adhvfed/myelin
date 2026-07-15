@@ -144,15 +144,17 @@ impl McpServer {
             )
         })?;
 
-        // HITL: the call may carry an explicit approval (a re-drive after the human approved the
-        // card). Absent it, a `requires_approval` tool is withheld (Gated) and does NOT mutate.
-        let approval_granted = params
+        // HITL (R2.4): a re-drive after a human approved the card PRESENTS the server-issued
+        // opaque gate id (`approval.gateId`); the router looks it up in the SERVER-SIDE verdict
+        // store and proceeds only if THAT gate is Approved there by a distinct HUMAN principal. The
+        // legacy caller-supplied `approval.granted` boolean is deliberately NOT read — it is inert
+        // on the wire and never an enforcement input (the 2026-07-06 HIGH finding).
+        let presented_gate_id = params
             .get("approval")
-            .and_then(|a| a.get("granted"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+            .and_then(|a| a.get("gateId"))
+            .and_then(Value::as_str);
 
-        let outcome = router.call(&tool, &args, &self.now, approval_granted);
+        let outcome = router.call(&tool, &args, &self.now, presented_gate_id);
         Ok(call_result_json(name, &outcome))
     }
 }

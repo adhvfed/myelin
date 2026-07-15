@@ -96,13 +96,23 @@ CREATE TABLE agent_proposed_effect (\
 /// per-subject-DEK-encrypted humanised card text (11.4); `approver_filter text[]` is the
 /// `list_subjects`-derived opaque-pseudonym set (4.4/4.8). `cost_estimate bigint` is integer
 /// minor-units. `(tenant, region)`-first.
+///
+/// **R2.4 reconciliation:** the id columns (`gate_id`, `run_id`, `effect_id`) are `text` — the
+/// code-side carriers are opaque STRINGS (`GateId(String)`, the run id, the per-effect key
+/// `gate:{tool}:{object}`), and the gate id is deliberately an unguessable opaque token (never a
+/// numeric sequence). The EXECUTED boot declaration of this table is
+/// `myelin_storage::hitl_gate_durable::AGENT_HITL_GATE_MIGRATION` (migration `0054`, in
+/// `all_durable_migrations()` — the boot gap this table sat in is closed); the parity test below
+/// pins THIS model DDL's columns to that boot DDL so the two declarations cannot drift. (This DDL
+/// was never boot-applied anywhere pre-R2.4 — that gap is exactly why the column-type
+/// reconciliation is safe in place.)
 pub const HITL_GATE_DDL: &str = "\
 CREATE TABLE agent_hitl_gate (\
   tenant_id text NOT NULL, \
   region text NOT NULL, \
-  gate_id numeric NOT NULL, \
-  run_id numeric NOT NULL, \
-  effect_id numeric NOT NULL, \
+  gate_id text NOT NULL, \
+  run_id text NOT NULL, \
+  effect_id text NOT NULL, \
   risk_summary bytea, \
   cost_estimate bigint NOT NULL, \
   approver_filter text[] NOT NULL, \
@@ -256,6 +266,46 @@ mod tests {
             );
         }
         assert_eq!(TABLES.len(), 5, "the five-table data model");
+    }
+
+    /// **R2.4 anti-drift parity: the §4.4 model DDL ⊆ the EXECUTED boot DDL.** `agent_hitl_gate`
+    /// is boot-applied by `myelin_storage::hitl_gate_durable` (migration `0054`, folded into
+    /// `all_durable_migrations()` — closing the gap where this crate DECLARED the table but no
+    /// service main ever migrated it). Storage cannot depend on this crate, so the boot DDL is a
+    /// second declaration — THIS test pins them together: every `(column, type)` pair of the §4.4
+    /// model DDL appears in the boot DDL (which additionally carries the R2.4 enforcement columns
+    /// `requested_by`/`decided_by`), and both share the `(tenant_id, region, gate_id)` PK.
+    #[test]
+    fn hitl_gate_model_ddl_is_a_subset_of_the_executed_boot_ddl() {
+        let boot = myelin_storage::hitl_gate_durable::AGENT_HITL_GATE_MIGRATION;
+        // Normalize whitespace so column definitions compare shape, not formatting.
+        let boot_norm = boot.split_whitespace().collect::<Vec<_>>().join(" ");
+        let model_cols = HITL_GATE_DDL
+            .split('(')
+            .nth(1)
+            .expect("a column list")
+            .rsplit_once(')')
+            .map(|(cols, _)| cols)
+            .unwrap_or_default();
+        for col in model_cols.split(", ") {
+            let col = col.trim();
+            if col.starts_with("PRIMARY KEY") {
+                continue;
+            }
+            // `name type` (strip NOT NULL — nullability is asserted by shape below for the PK).
+            let name_type = col.replace(" NOT NULL", "");
+            assert!(
+                boot_norm.contains(&name_type),
+                "boot DDL (0054) must carry the §4.4 column `{name_type}` — model/boot drift"
+            );
+        }
+        assert!(
+            boot_norm.contains("PRIMARY KEY (tenant_id, region, gate_id)"),
+            "both declarations share the (tenant, region, gate_id) PK"
+        );
+        // The boot DDL's R2.4 enforcement extensions are present (distinct-approver audit anchors).
+        assert!(boot_norm.contains("requested_by text NOT NULL"));
+        assert!(boot_norm.contains("decided_by text"));
     }
 
     /// The runner REFUSES a destructive (`DROP`) Fabric migration — forward-only is structural; a

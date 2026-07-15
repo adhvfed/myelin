@@ -338,8 +338,12 @@ fn ag_d5_governed_transition_withheld_then_applies_once() {
         "AG-D5: 0 mutation before approval (the green counter)"
     );
 
-    // (2) APPROVE → re-run with the tool in `approved` → APPLIES exactly once.
-    let approved: BTreeSet<String> = ["transition".to_string()].into_iter().collect();
+    // (2) APPROVE → re-run with THIS effect's per-(tool, object) key in `approved` (R2.4 — never
+    //     the bare tool name) → APPLIES exactly once.
+    let approved: BTreeSet<String> =
+        [myelin_agent_service::effect_gate_key(&plan.tool, &plan.object)]
+            .into_iter()
+            .collect();
     let (applied, muts1) = apply_once(&cat, &endpoint, &check, caps, approved, &plan);
     assert!(
         matches!(applied, EffectResult::Applied(_)),
@@ -379,8 +383,12 @@ fn ag_d5_governed_transition_without_approver_context_is_denied() {
             markup: 5,
         },
     };
-    // even "approved", the ABAC Conditional denies — fail-closed, never applies.
-    let approved: BTreeSet<String> = ["transition".to_string()].into_iter().collect();
+    // even "approved" (the per-effect key, R2.4), the ABAC Conditional denies — fail-closed,
+    // never applies.
+    let approved: BTreeSet<String> =
+        [myelin_agent_service::effect_gate_key(&plan.tool, &plan.object)]
+            .into_iter()
+            .collect();
     let (out, muts) = apply_once(&cat, &endpoint, &check, caps, approved, &plan);
     assert!(
         matches!(out, EffectResult::Denied(_)),
