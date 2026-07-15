@@ -455,7 +455,10 @@ fn a_red_parity_signal_is_not_green() {
 #[test]
 fn insert_cost_event_query_matches_the_cost_event_row_model() {
     let q = INSERT_COST_EVENT_QUERY;
-    assert!(q.contains("INSERT INTO cost_event"), "writes the cost_event table");
+    assert!(
+        q.contains("INSERT INTO cost_event"),
+        "writes the cost_event table"
+    );
     // Every CostEventRow field has its column (run/job attribution + the two distinct cost columns).
     for col in [
         "tenant_id",
@@ -469,7 +472,10 @@ fn insert_cost_event_query_matches_the_cost_event_row_model() {
         "markup_minor_units",
         "kind",
     ] {
-        assert!(q.contains(col), "the durable settle writes the {col} column");
+        assert!(
+            q.contains(col),
+            "the durable settle writes the {col} column"
+        );
     }
     // wholesale + markup are SEPARATE columns (never conflated — the arch 02 §8 invariant).
     assert!(

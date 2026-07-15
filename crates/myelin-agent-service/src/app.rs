@@ -173,7 +173,14 @@ pub fn agent_app_spec(config: Config) -> AppSpec {
         // The transactional outbox relay (BUS-2 — the ONLY emit path; the SKELETON's trace emit rides
         // this). The in-process broker fake is the M0 floor; the JetStream-class adapter is a config
         // swap (dev<->prod), never a code change.
-        outbox: OutboxSpec::default(),
+        // **W3b.6 debt (named, MR-009b W3b.4):** the EXPLICIT in-memory floor — the gated
+        // `OutboxSpec::default_inproc` is no longer reachable from production; this construction is
+        // the grep-able remainder the W3b.6 `OutboxStore::new` gate breaks LOUDLY, forcing this root
+        // onto `OutboxSpec::durable` (the agent-service durable rewiring is not in the W3b.4 set).
+        outbox: OutboxSpec::new(
+            myelin_events::OutboxStore::new(),
+            myelin_events::InProcessBus::new(),
+        ),
         // The agent OLTP store is implicitly critical; no further critical downstream at the shell.
         critical: CriticalDependencies::default(),
     }

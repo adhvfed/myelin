@@ -2691,6 +2691,7 @@ dependencies = [
 name = "myelin-issues"
 version = "0.0.0"
 dependencies = [
+ "myelin-config",
  "myelin-content",
  "myelin-events",
  "myelin-flow",
@@ -2776,6 +2777,7 @@ dependencies = [
  "myelin-lints",
  "myelin-query",
  "myelin-refs",
+ "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",
  "serde",

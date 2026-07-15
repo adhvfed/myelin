@@ -33,12 +33,13 @@ use myelin_events::{
     Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Region, TenantId, Timestamp,
 };
 use myelin_git::api::{http_catalogue, Method as GitMethod};
+use myelin_git::check_status::GitOid;
 use myelin_git::core::{Oid as CoreOid, RepoLoc};
+use myelin_git::durable::{CommitDetail, CommitMeta};
 use myelin_git::durable::{DurableError, DurableGitRepo, DurableGitStore};
 use myelin_git::lifecycle::{
     BranchProtectionRuleset, PrState, PullRequest, ReviewState, ReviewVerdict,
 };
-use myelin_git::check_status::GitOid;
 use myelin_git::pr_store::{
     effective_ruleset, evaluate_merge, merge_pr, BranchProtectionConfig, DurablePrStore,
     MergeAttempt, PrRecord, ReviewRecord,
@@ -47,8 +48,9 @@ use myelin_git::receive_pack::{
     evaluate_protected_ref_push, CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate,
     PushOutcome, PushSession, Pusher, QuarantineMigration, QuarantineObject, RefName, RefStore,
 };
-use myelin_git::durable::{CommitDetail, CommitMeta};
-use myelin_git::web::{CommitDiff, CommitRow, DiffFile, DiffLineView, RepoHome, WebEditForm, WebEditOutcome};
+use myelin_git::web::{
+    CommitDiff, CommitRow, DiffFile, DiffLineView, RepoHome, WebEditForm, WebEditOutcome,
+};
 use myelin_identity::Principal;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -82,24 +84,48 @@ impl DurableGitBackend {
     /// the same root the durable git store + read backend resolve against. The wire object-authz seam
     /// (R0.3) defaults to [`AllowAllRepos`]; production injects a grant-backed authorizer via
     /// [`DurableGitBackend::with_repo_authorizer`].
-    pub fn rooted(root: impl Into<PathBuf>) -> DurableGitBackend {
+    ///
+    /// **The outbox + id minter are INJECTED (MR-009b W3b.4 — the composition root owns
+    /// durability):** the production `main.rs` passes `OutboxStore::durable(PgOutboxBacking)` over
+    /// the MR-022 provider pool AND a UNIQUE id source (`myelin_events::UlidMinter` — NEVER the
+    /// per-instance-resetting default `MonotonicMinter`, whose colliding `event_id`s the durable
+    /// path's `ON CONFLICT (event_id) DO NOTHING` silently drops; the W3b.3 named condition). A
+    /// test passes the in-memory `OutboxStore::new()` double + a seeded deterministic minter.
+    pub fn rooted(
+        root: impl Into<PathBuf>,
+        outbox: OutboxStore,
+        minter: Arc<dyn IdMinter>,
+    ) -> DurableGitBackend {
         let root = root.into();
         DurableGitBackend {
             store: DurableGitStore::rooted(root.clone()),
             prs: DurablePrStore::rooted(root.clone()),
-            outbox: OutboxStore::new(),
-            minter: Arc::new(MonotonicMinter::new()),
+            outbox,
+            minter,
             clone_host: "ssh://git@myelin".into(),
             root,
             repo_authz: Arc::new(AllowAllRepos),
         }
     }
 
+    /// The in-memory-floor constructor for tests/drills: `rooted` over the in-memory outbox double
+    /// plus the seeded deterministic `MonotonicMinter` (the pre-W3b.4 shape). Production roots use
+    /// [`DurableGitBackend::rooted`] with a durable store + `UlidMinter` — this helper exists so
+    /// the many test call sites stay one-line and the production signature stays injection-first.
+    /// NOT a production path: the memory store loses events on restart (SI-007; the W3b.6 flip
+    /// gates `OutboxStore::new`, which will force this helper behind `test-support`).
+    pub fn rooted_inmem_for_test(root: impl Into<PathBuf>) -> DurableGitBackend {
+        DurableGitBackend::rooted(root, OutboxStore::new(), Arc::new(MonotonicMinter::new()))
+    }
+
     /// **Inject the R0.3 per-repo object authorizer** (the wire object-authz seam) — the analogue of
     /// injecting the Identity-M1 [`Authorizer`](myelin_substrate::Authorizer) into the gateway. Boot
     /// wires the real grant-backed authorizer here; tests default to the [`AllowAllRepos`] fixture.
     /// **TODO(R2):** back this with the platform-wide object-authz tuple store / Identity `check()`.
-    pub fn with_repo_authorizer(mut self, repo_authz: Arc<dyn RepoAuthorizer>) -> DurableGitBackend {
+    pub fn with_repo_authorizer(
+        mut self,
+        repo_authz: Arc<dyn RepoAuthorizer>,
+    ) -> DurableGitBackend {
         self.repo_authz = repo_authz;
         self
     }
@@ -191,7 +217,12 @@ impl DurableGitBackend {
 
     /// Create a bare repo on disk under the verified `(tenant, region)`. Returns `true` iff newly created
     /// (an existing repo is a conflict the handler surfaces as `409`). Traversal-safe via the resolver.
-    pub fn create_repo(&self, tenant: &str, region: &str, slug: &str) -> Result<bool, DurableError> {
+    pub fn create_repo(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+    ) -> Result<bool, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         if self.store.repo_exists(&loc) {
             return Ok(false);
@@ -239,7 +270,9 @@ impl DurableGitBackend {
     fn repo_home(&self, tenant: &str, slug: &str, repo: &DurableGitRepo) -> RepoHome {
         let full_slug = format!("{tenant}/{slug}");
         let clone_url = format!("{}/{tenant}/{slug}.git", self.clone_host);
-        let entries = repo.tree_entries_at_ref("refs/heads/main").unwrap_or_default();
+        let entries = repo
+            .tree_entries_at_ref("refs/heads/main")
+            .unwrap_or_default();
         if entries.is_empty() {
             RepoHome::Empty {
                 slug: full_slug,
@@ -264,7 +297,12 @@ impl DurableGitBackend {
     /// One repo's home ViewModel (`GET /v1/git/repos/{repo}`) — the durable per-repo home the browse
     /// UI lands on. `NotFound` (404) if the repo is absent under the verified tenant (the 0-leak posture:
     /// a cross-tenant repo simply is not found under this tenant's path).
-    fn repo_home_one(&self, tenant: &str, region: &str, slug: &str) -> Result<RepoHome, DurableError> {
+    fn repo_home_one(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+    ) -> Result<RepoHome, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc)?;
         Ok(self.repo_home(tenant, slug, &repo))
@@ -371,14 +409,8 @@ impl DurableGitBackend {
 
         // Build the real commit (blob → tree → commit) authored to the tenant pseudonym (GIT-1).
         let psn = Self::pseudonym(tenant, principal);
-        let (new_commit, _new_blob, parent) = repo.build_file_commit(
-            &full,
-            path,
-            contents.as_bytes(),
-            "web edit",
-            &psn,
-            &psn,
-        )?;
+        let (new_commit, _new_blob, parent) =
+            repo.build_file_commit(&full, path, contents.as_bytes(), "web edit", &psn, &psn)?;
 
         // Advance the ref via the durable per-ref CAS (the SAME one-tx ref-CAS + outbox the push uses).
         let ref_store = self.open_durable_refstore(repo, slug, tenant, region, principal);
@@ -445,11 +477,11 @@ impl DurableGitBackend {
     ) -> Result<PrRecord, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         self.store.open_repo(&loc)?; // 404 if the repo is absent
-        // The PR-open body carries ONLY the proposal (base/head/head_oid/draft) — NEVER branch-protection
-        // POLICY (required set / approval threshold) or check FACTS (greens). Policy is repo-owned (set
-        // via the repo-admin branch-protection op); facts are set by authorized producers (the CI
-        // check-report op, the review op, the endorse op). This is the GT-003 bypass fix: a PR author
-        // cannot weaken the gate by supplying loose policy or self-claimed greens at open.
+                                     // The PR-open body carries ONLY the proposal (base/head/head_oid/draft) — NEVER branch-protection
+                                     // POLICY (required set / approval threshold) or check FACTS (greens). Policy is repo-owned (set
+                                     // via the repo-admin branch-protection op); facts are set by authorized producers (the CI
+                                     // check-report op, the review op, the endorse op). This is the GT-003 bypass fix: a PR author
+                                     // cannot weaken the gate by supplying loose policy or self-claimed greens at open.
         let base_ref = body
             .get("base_ref")
             .and_then(Value::as_str)
@@ -505,7 +537,11 @@ impl DurableGitBackend {
                         required_contexts: r
                             .get("required_contexts")
                             .and_then(Value::as_array)
-                            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default(),
                         required_approvals: r
                             .get("required_approvals")
@@ -528,7 +564,8 @@ impl DurableGitBackend {
             })
             .unwrap_or_default();
         let n = rulesets.len();
-        self.prs.put_protection(&loc, &BranchProtectionConfig { rulesets })?;
+        self.prs
+            .put_protection(&loc, &BranchProtectionConfig { rulesets })?;
         Ok(n)
     }
 
@@ -550,16 +587,30 @@ impl DurableGitBackend {
             .get(&loc, number)?
             .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
         if let Some(g) = body.get("green_contexts").and_then(Value::as_array) {
-            rec.green_contexts = g.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            rec.green_contexts = g
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
         }
-        if let Some(g) = body.get("fork_unendorsed_contexts").and_then(Value::as_array) {
-            rec.fork_unendorsed_contexts =
-                g.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+        if let Some(g) = body
+            .get("fork_unendorsed_contexts")
+            .and_then(Value::as_array)
+        {
+            rec.fork_unendorsed_contexts = g
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
         }
-        if let Some(b) = body.get("codeowner_review_satisfied").and_then(Value::as_bool) {
+        if let Some(b) = body
+            .get("codeowner_review_satisfied")
+            .and_then(Value::as_bool)
+        {
             rec.codeowner_review_satisfied = b;
         }
-        if let Some(n) = body.get("outstanding_conversations").and_then(Value::as_u64) {
+        if let Some(n) = body
+            .get("outstanding_conversations")
+            .and_then(Value::as_u64)
+        {
             rec.outstanding_conversations = n as u32;
         }
         self.prs.put(&loc, &rec)?;
@@ -584,7 +635,11 @@ impl DurableGitBackend {
             "approve" => ReviewVerdict::Approve,
             "request-changes" | "request_changes" => ReviewVerdict::RequestChanges,
             "comment" => ReviewVerdict::Comment,
-            other => return Err(DurableError::Git(format!("unknown review verdict `{other}`"))),
+            other => {
+                return Err(DurableError::Git(format!(
+                    "unknown review verdict `{other}`"
+                )))
+            }
         };
         rec.reviews.push(ReviewRecord {
             reviewer_pseudonym: Self::pseudonym(tenant, principal),
@@ -612,7 +667,10 @@ impl DurableGitBackend {
         // `approve_untrusted_ci` capability is the gateway's authz gate; the durable record records the
         // resolved endorsement ([`myelin_git::fork_gate`] is the live resolver in the CLI/agent path).
         let to_endorse: Vec<String> = match body.get("contexts").and_then(Value::as_array) {
-            Some(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+            Some(a) => a
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
             None => rec.fork_unendorsed_contexts.clone(),
         };
         for c in to_endorse {
@@ -686,8 +744,11 @@ impl DurableGitBackend {
     ) -> Result<Vec<(String, String)>, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc)?;
-        let mut refs: Vec<(String, String)> =
-            repo.list_refs()?.into_iter().map(|(n, o)| (n, o.0)).collect();
+        let mut refs: Vec<(String, String)> = repo
+            .list_refs()?
+            .into_iter()
+            .map(|(n, o)| (n, o.0))
+            .collect();
         refs.sort();
         Ok(refs)
     }
@@ -752,8 +813,12 @@ impl DurableGitBackend {
 
         // 2. Stage the objects in a HOST quarantine repo (alternates → the real repo so existing history
         //    + thin bases resolve) so connectivity + non-ff are computed WITHOUT touching the real repo.
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let qdir = std::env::temp_dir().join(format!("myelin-ct006d-q-{}-{nanos}", std::process::id()));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let qdir =
+            std::env::temp_dir().join(format!("myelin-ct006d-q-{}-{nanos}", std::process::id()));
         let _ = std::fs::remove_dir_all(&qdir);
         let q = DurableGitRepo::init_quarantine(&qdir, &repo.path().join("objects"))?;
         let mut quarantine = Vec::new();
@@ -819,10 +884,22 @@ impl DurableGitBackend {
             };
             updates.push(ProposedRefUpdate {
                 ref_name: RefName::new(c.ref_name.clone()),
-                expected_old: if old_zero { PushOid::zero() } else { PushOid::new(c.old.clone()) },
-                new_oid: if new_zero { PushOid::zero() } else { PushOid::new(c.new.clone()) },
+                expected_old: if old_zero {
+                    PushOid::zero()
+                } else {
+                    PushOid::new(c.old.clone())
+                },
+                new_oid: if new_zero {
+                    PushOid::zero()
+                } else {
+                    PushOid::new(c.new.clone())
+                },
                 forced,
-                commit_oids: if new_zero { vec![] } else { vec![PushOid::new(c.new.clone())] },
+                commit_oids: if new_zero {
+                    vec![]
+                } else {
+                    vec![PushOid::new(c.new.clone())]
+                },
             });
             per_ref_status.push((c.ref_name.clone(), None));
         }
@@ -852,21 +929,27 @@ impl DurableGitBackend {
                     "ok",
                     &all_ng(
                         &cmds,
-                        &format!("rejected (branch-protection policy unreadable — fail-closed): {e}"),
+                        &format!(
+                            "rejected (branch-protection policy unreadable — fail-closed): {e}"
+                        ),
                     ),
                 ));
             }
         };
         for u in &updates {
             let ref_str = u.ref_name.0.as_str();
-            let configured = protection.as_ref().and_then(|c| c.resolve(ref_str)).is_some();
+            let configured = protection
+                .as_ref()
+                .and_then(|c| c.resolve(ref_str))
+                .is_some();
             let is_protected = configured || u.ref_name.is_protected();
             if !is_protected {
                 continue; // a non-protected ref keeps the existing PushPolicy checks (unchanged).
             }
             let ruleset = effective_ruleset(protection.as_ref(), ref_str);
             let is_delete = u.new_oid.is_zero();
-            let (green, fork_unendorsed, endorsed) = self.check_facts_for_head(&loc, u.new_oid.0.as_str());
+            let (green, fork_unendorsed, endorsed) =
+                self.check_facts_for_head(&loc, u.new_oid.0.as_str());
             let head = GitOid(u.new_oid.0.clone());
             if let Err(reason) = evaluate_protected_ref_push(
                 &u.ref_name,
@@ -899,7 +982,10 @@ impl DurableGitBackend {
                 is_agent: false,
             },
         };
-        let migration = ObjectPromotion { repo: &repo, objects: &objects };
+        let migration = ObjectPromotion {
+            repo: &repo,
+            objects: &objects,
+        };
         let outcome = ref_store.receive(&push, &migration, CrashPoint::None);
         let _ = std::fs::remove_dir_all(&qdir); // the host quarantine is discarded either way
 
@@ -951,7 +1037,10 @@ struct ObjectPromotion<'a> {
 impl QuarantineMigration for ObjectPromotion<'_> {
     fn migrate(&self, _quarantine: &[QuarantineObject]) -> Result<(), String> {
         for (claimed_oid, ty, bytes) in self.objects {
-            let written = self.repo.write_raw_object(ty, bytes).map_err(|e| e.to_string())?;
+            let written = self
+                .repo
+                .write_raw_object(ty, bytes)
+                .map_err(|e| e.to_string())?;
             if &written.0 != claimed_oid {
                 return Err(format!(
                     "refusing migration: object oid mismatch (claimed {claimed_oid}, git computed {})",
@@ -1013,7 +1102,9 @@ fn map_durable_err(e: DurableError) -> EdgeError {
     match e {
         DurableError::NotFound(m) => EdgeError::NotFound(m),
         // A traversal-rejected slug / bad input surfaces as a clean 400 (never a silent wrong path).
-        DurableError::Git(m) if m.contains("traversal") || m.contains("segment") || m.contains("slug") => {
+        DurableError::Git(m)
+            if m.contains("traversal") || m.contains("segment") || m.contains("slug") =>
+        {
             EdgeError::BadRequest(m)
         }
         DurableError::CasMismatch { .. } => EdgeError::Conflict(e.to_string()),
@@ -1034,13 +1125,21 @@ impl Handler for DRepoList {
             .and_then(|c| c.parse::<usize>().ok())
             .unwrap_or(0);
         let limit = ctx.page.limit;
-        let items: Vec<Value> = all.iter().skip(offset).take(limit).map(|r| r.to_json()).collect();
+        let items: Vec<Value> = all
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|r| r.to_json())
+            .collect();
         let next = if offset + limit < all.len() {
             Some((offset + limit).to_string())
         } else {
             None
         };
-        Ok(EdgeResponse::json(200, &page_envelope(json!(items), next, limit)))
+        Ok(EdgeResponse::json(
+            200,
+            &page_envelope(json!(items), next, limit),
+        ))
     }
 }
 
@@ -1115,7 +1214,10 @@ impl Handler for DCommitLog {
         } else {
             None
         };
-        Ok(EdgeResponse::json(200, &page_envelope(json!(items), next, limit)))
+        Ok(EdgeResponse::json(
+            200,
+            &page_envelope(json!(items), next, limit),
+        ))
     }
 }
 
@@ -1212,7 +1314,13 @@ impl Handler for DOpenPr {
         };
         let rec = self
             .be
-            .open_pr(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?, &body, ctx.principal)
+            .open_pr(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+                &body,
+                ctx.principal,
+            )
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(
             201,
@@ -1255,7 +1363,8 @@ impl Handler for DPrChecks {
             .prs
             .effective_ruleset_for(&loc, &rec.base_ref)
             .map_err(map_durable_err)?;
-        let eval = evaluate_merge(&ruleset, &rec).map_err(|e| EdgeError::Internal(e.to_string()))?;
+        let eval =
+            evaluate_merge(&ruleset, &rec).map_err(|e| EdgeError::Internal(e.to_string()))?;
         Ok(EdgeResponse::json(
             200,
             &json!({
@@ -1344,7 +1453,11 @@ impl Handler for DMerge {
             )
             .map_err(map_durable_err)?;
         match attempt {
-            MergeAttempt::Merged { base_ref, new_oid, update_seq } => Ok(EdgeResponse::json(
+            MergeAttempt::Merged {
+                base_ref,
+                new_oid,
+                update_seq,
+            } => Ok(EdgeResponse::json(
                 200,
                 &json!({
                     "applied": { "action": "git.pr.merge", "merged": true, "base_ref": base_ref,
@@ -1364,9 +1477,9 @@ impl Handler for DMerge {
             ))),
             // An arbitrary / non-existent / non-descendant head — refused, no ref advance (never advance
             // a protected ref to an arbitrary oid). 422: the merge target is unprocessable.
-            MergeAttempt::InvalidHead(why) => Err(EdgeError::BadRequest(format!(
-                "invalid merge head: {why}"
-            ))),
+            MergeAttempt::InvalidHead(why) => {
+                Err(EdgeError::BadRequest(format!("invalid merge head: {why}")))
+            }
         }
     }
 }
@@ -1452,18 +1565,20 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
             (GitMethod::Get, "/api/git/repos/{repo}/blob/{ref}/{path}") => {
                 (Arc::new(DBlobView { be: be.clone() }), "git.blob.view")
             }
-            (GitMethod::Post, "/api/git/repos/{repo}/blob/{ref}/{path}") => {
-                (Arc::new(DWebEditCommit { be: be.clone() }), "git.blob.commit")
-            }
+            (GitMethod::Post, "/api/git/repos/{repo}/blob/{ref}/{path}") => (
+                Arc::new(DWebEditCommit { be: be.clone() }),
+                "git.blob.commit",
+            ),
             (GitMethod::Post, "/api/git/repos/{repo}/prs") => {
                 (Arc::new(DOpenPr { be: be.clone() }), "git.pr.open")
             }
             (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/reviews") => {
                 (Arc::new(DPrReview { be: be.clone() }), "git.pr.review")
             }
-            (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/endorse-fork-ci") => {
-                (Arc::new(DEndorse { be: be.clone() }), "git.pr.endorse_fork_ci")
-            }
+            (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/endorse-fork-ci") => (
+                Arc::new(DEndorse { be: be.clone() }),
+                "git.pr.endorse_fork_ci",
+            ),
             (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/merge") => {
                 (Arc::new(DMerge { be: be.clone() }), "git.pr.merge")
             }
@@ -1475,9 +1590,10 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
             ),
             // CI check-report — a DISTINCT authorize action (the producer is CI/M4; a PR author is not
             // granted it). The PR author cannot stamp greens.
-            (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/checks") => {
-                (Arc::new(DReportChecks { be: be.clone() }), "git.checks.report")
-            }
+            (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/checks") => (
+                Arc::new(DReportChecks { be: be.clone() }),
+                "git.checks.report",
+            ),
             (GitMethod::Get, "/api/git/search/code") => (Arc::new(DCodeSearch), "git.search.code"),
             (_, other) => (
                 Arc::new(DCodeSearch),

@@ -16,13 +16,14 @@ use myelin_config::{Mode, MyelinConfig};
 use myelin_edge::{
     register_git_durable, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
 };
+use myelin_events::OutboxStore;
 use myelin_identity_service::{
     CapabilityAuthenticator, CellTokenAuthority, HumanSsoAuthenticator, PasetoCapabilityVerifier,
     PrincipalStore, RevocationStore,
 };
 use myelin_storage::{
     kms_durable_migrations, seal_key_from_env, DurableKmsBacking, DurablePrincipalBacking,
-    DurableRevocationBacking, HotTables, SubstrateProvider,
+    DurableRevocationBacking, HotTables, PgOutboxBacking, SubstrateProvider,
 };
 use std::sync::Arc;
 
@@ -40,11 +41,32 @@ async fn main() {
     let provider = match SubstrateProvider::connect(config, 8).await {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("edge: cannot reach the durable OLTP pool (durable-by-default requires PG): {e}");
+            eprintln!(
+                "edge: cannot reach the durable OLTP pool (durable-by-default requires PG): {e}"
+            );
             std::process::exit(1);
         }
     };
     let handle = tokio::runtime::Handle::current();
+    // MR-009b W3b.4 — the DURABLE transactional outbox (SI-007): the git backend's ref-CAS
+    // co-commits its `git.ref.updated` into the PG-backed `outbox` table (survives restart), never
+    // a per-process in-memory buffer. The substrate foundation tables (the frozen `outbox` +
+    // `consumer_dedup` DDL) are applied first through the MR-022 migrator — FAIL LOUD, no fallback.
+    if let Err(e) = provider.migrate_foundation().await {
+        eprintln!(
+            "edge: cannot apply the substrate foundation migrations (outbox/consumer_dedup): {e}"
+        );
+        std::process::exit(1);
+    }
+    let git_outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
+        provider.db_pool().clone(),
+        handle.clone(),
+    )));
+    // THE W3b.3 NAMED CONDITION: the composition root wires the UNIQUE production id source
+    // (`UlidMinter`, the P-S12 stand-in) — NEVER the default `MonotonicMinter`, which resets per
+    // instance so two roots mint colliding `event_id`s that the durable co-commit path's
+    // `ON CONFLICT (event_id) DO NOTHING` silently DROPS (probe-proven in W3b.3).
+    let git_minter: Arc<dyn myelin_events::IdMinter> = Arc::new(myelin_events::UlidMinter::new());
     // The shared cell KMS (the crypto-shred substrate) — DURABLE-BY-DEFAULT (MR-009b Wave 5 /
     // SI-006): the software-sealed root + wrapped KEKs/DEKs load from the `kms_sealed_root`/
     // `kms_wrapped_kek`/`kms_wrapped_dek` tables via `load_or_generate` (MR-025), and every key
@@ -73,7 +95,9 @@ async fn main() {
     let kms = match kms_backing.load_or_generate(&seal_key).await {
         Ok(engine) => Arc::new(engine),
         Err(e) => {
-            eprintln!("edge: KMS refused to start (fail-closed, never a silent in-memory engine): {e}");
+            eprintln!(
+                "edge: KMS refused to start (fail-closed, never a silent in-memory engine): {e}"
+            );
             std::process::exit(1);
         }
     };
@@ -89,7 +113,10 @@ async fn main() {
             handle.clone(),
         ),
         Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
-        RevocationStore::with_pg(DurableRevocationBacking::new(provider.clone()), handle.clone()),
+        RevocationStore::with_pg(
+            DurableRevocationBacking::new(provider.clone()),
+            handle.clone(),
+        ),
     ));
     // The refuse-not-mock production human verifier (login refuses until JWKS/trust-anchors land),
     // over the durable S1 principal directory.
@@ -106,12 +133,21 @@ async fn main() {
     // the read backend resolves against. The reconciler (`myelin_git::reconcile`) heals the
     // apply-after-outbox-commit window before the store serves; the cross-restart recovery runs in the
     // production composition root (here the shell boots a fresh-or-existing durable backend).
-    let git_root = std::env::var("MYELIN_GIT_ROOT")
-        .unwrap_or_else(|_| std::env::temp_dir().join("myelin-git-data").to_string_lossy().into());
-    let git_backend = Arc::new(DurableGitBackend::rooted(git_root));
+    let git_root = std::env::var("MYELIN_GIT_ROOT").unwrap_or_else(|_| {
+        std::env::temp_dir()
+            .join("myelin-git-data")
+            .to_string_lossy()
+            .into()
+    });
+    let git_backend = Arc::new(DurableGitBackend::rooted(git_root, git_outbox, git_minter));
 
     let mut builder = Gateway::builder(authn, human_login, Arc::new(AllowAll))
-        .route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler))
+        .route(
+            Method::Get,
+            "/v1/whoami",
+            "edge.whoami",
+            Arc::new(WhoamiHandler),
+        )
         .route(
             Method::Get,
             "/v1/t/{tenant}/whoami",

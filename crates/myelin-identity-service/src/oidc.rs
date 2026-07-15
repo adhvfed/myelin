@@ -387,7 +387,9 @@ fn verify_signature(key: &JwkKey, msg: &[u8], sig: &[u8]) -> Result<(), AuthzErr
         JwkKey::EcP256 { x, y } => {
             use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
             if x.len() != 32 || y.len() != 32 {
-                return Err(refuse("invalid P-256 JWKS coordinates (expected 32 bytes each)"));
+                return Err(refuse(
+                    "invalid P-256 JWKS coordinates (expected 32 bytes each)",
+                ));
             }
             // The SEC1 uncompressed point `0x04 ‖ x ‖ y` ring's ECDSA verifier expects.
             let mut point = Vec::with_capacity(65);
@@ -750,12 +752,9 @@ mod tests {
             let rng = SystemRandom::new();
             let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
                 .expect("ec keygen");
-            let pair = EcdsaKeyPair::from_pkcs8(
-                &ECDSA_P256_SHA256_FIXED_SIGNING,
-                pkcs8.as_ref(),
-                &rng,
-            )
-            .expect("ec from pkcs8");
+            let pair =
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+                    .expect("ec from pkcs8");
             EcKey { pair, rng }
         }
         fn jwk(&self) -> JwkKey {
@@ -769,7 +768,11 @@ mod tests {
             }
         }
         fn sign(&self, msg: &[u8]) -> Vec<u8> {
-            self.pair.sign(&self.rng, msg).expect("ec sign").as_ref().to_vec()
+            self.pair
+                .sign(&self.rng, msg)
+                .expect("ec sign")
+                .as_ref()
+                .to_vec()
         }
     }
 
@@ -811,7 +814,9 @@ mod tests {
         let sig = key.sign(signing_input(&header, &cl).as_bytes());
         let token = jwt(&header, &cl, &sig);
 
-        let a = verifier(jwks).verify(&cred(token)).expect("RS256 must verify");
+        let a = verifier(jwks)
+            .verify(&cred(token))
+            .expect("RS256 must verify");
         assert_eq!(a.tenant, TenantId("acme".into()));
         assert_eq!(a.region, Region("eu-west".into()));
         assert_eq!(a.scheme, scheme::OIDC);
@@ -827,7 +832,9 @@ mod tests {
         let sig = key.sign(signing_input(&header, &cl).as_bytes());
         let token = jwt(&header, &cl, &sig);
 
-        let a = verifier(jwks).verify(&cred(token)).expect("ES256 must verify");
+        let a = verifier(jwks)
+            .verify(&cred(token))
+            .expect("ES256 must verify");
         assert_eq!(a.tenant, TenantId("acme".into()));
         assert_eq!(a.subject_key, "oidc-sub-1");
     }
@@ -841,7 +848,9 @@ mod tests {
         let sig = key.sign(signing_input(&header, &cl).as_bytes());
         let token = jwt(&header, &cl, &sig);
 
-        let a = verifier(jwks).verify(&cred(token)).expect("EdDSA must verify");
+        let a = verifier(jwks)
+            .verify(&cred(token))
+            .expect("EdDSA must verify");
         assert_eq!(a.tenant, TenantId("acme".into()));
         assert_eq!(a.subject_key, "oidc-sub-1");
     }
@@ -865,7 +874,9 @@ mod tests {
         let header = serde_json::json!({"alg": "RS256", "kid": "rsa-json"});
         let cl = claims("jti-rs-json");
         let sig = key.sign(signing_input(&header, &cl).as_bytes());
-        let a = verifier(jwks).verify(&cred(jwt(&header, &cl, &sig))).unwrap();
+        let a = verifier(jwks)
+            .verify(&cred(jwt(&header, &cl, &sig)))
+            .unwrap();
         assert_eq!(a.tenant, TenantId("acme".into()));
     }
 
@@ -929,7 +940,9 @@ mod tests {
         let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
         let cl = claims("jti-wrongkey");
         let sig = attacker.sign(signing_input(&header, &cl).as_bytes());
-        let err = verifier(jwks).verify(&cred(jwt(&header, &cl, &sig))).unwrap_err();
+        let err = verifier(jwks)
+            .verify(&cred(jwt(&header, &cl, &sig)))
+            .unwrap_err();
         assert!(
             matches!(&err, AuthzError::FailClosed(m) if m.contains("RS256 signature verification failed")),
             "a signature by an unknown key must be refused, got {err:?}"
@@ -944,7 +957,9 @@ mod tests {
         let header = serde_json::json!({"alg": "RS256", "kid": "rsa-OTHER"});
         let cl = claims("jti-unknownkid");
         let sig = key.sign(signing_input(&header, &cl).as_bytes());
-        let err = verifier(jwks).verify(&cred(jwt(&header, &cl, &sig))).unwrap_err();
+        let err = verifier(jwks)
+            .verify(&cred(jwt(&header, &cl, &sig)))
+            .unwrap_err();
         assert!(
             matches!(&err, AuthzError::FailClosed(m) if m.contains("unknown `kid`")),
             "an unknown kid must be refused, got {err:?}"
@@ -960,7 +975,9 @@ mod tests {
         let mut cl = claims("jti-expired");
         cl["exp"] = serde_json::json!(NOW - 1000); // well beyond the 60s leeway
         let sig = key.sign(signing_input(&header, &cl).as_bytes());
-        let err = verifier(jwks).verify(&cred(jwt(&header, &cl, &sig))).unwrap_err();
+        let err = verifier(jwks)
+            .verify(&cred(jwt(&header, &cl, &sig)))
+            .unwrap_err();
         assert!(
             matches!(&err, AuthzError::FailClosed(m) if m.contains("expired")),
             "an expired token must be refused, got {err:?}"
@@ -975,7 +992,11 @@ mod tests {
         let v = verifier(jwks);
         let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
         let cl = claims("jti-replay-unique");
-        let token = jwt(&header, &cl, &key.sign(signing_input(&header, &cl).as_bytes()));
+        let token = jwt(
+            &header,
+            &cl,
+            &key.sign(signing_input(&header, &cl).as_bytes()),
+        );
         v.verify(&cred(token.clone())).expect("first use verifies");
         let err = v.verify(&cred(token)).unwrap_err();
         assert!(
@@ -993,7 +1014,9 @@ mod tests {
         let mut cl = claims("jti-wrongaud");
         cl["aud"] = serde_json::json!("some-other-rp");
         let sig = key.sign(signing_input(&header, &cl).as_bytes());
-        let err = verifier(jwks).verify(&cred(jwt(&header, &cl, &sig))).unwrap_err();
+        let err = verifier(jwks)
+            .verify(&cred(jwt(&header, &cl, &sig)))
+            .unwrap_err();
         assert!(
             matches!(&err, AuthzError::FailClosed(m) if m.contains("audience")),
             "a wrong-aud token must be refused, got {err:?}"
@@ -1009,7 +1032,9 @@ mod tests {
         let mut cl = claims("jti-wrongiss");
         cl["iss"] = serde_json::json!("https://evil-idp.example.com");
         let sig = key.sign(signing_input(&header, &cl).as_bytes());
-        let err = verifier(jwks).verify(&cred(jwt(&header, &cl, &sig))).unwrap_err();
+        let err = verifier(jwks)
+            .verify(&cred(jwt(&header, &cl, &sig)))
+            .unwrap_err();
         assert!(
             matches!(&err, AuthzError::FailClosed(m) if m.contains("issuer")),
             "a wrong-iss token must be refused, got {err:?}"
@@ -1168,7 +1193,9 @@ mod tests {
             scheme: scheme::SAML.into(),
             material: "acme|eu-west|nameid-1".into(),
         };
-        let a = dispatch.verify(&saml).expect("SAML routes to the floor fallback");
+        let a = dispatch
+            .verify(&saml)
+            .expect("SAML routes to the floor fallback");
         assert_eq!(a.tenant, TenantId("acme".into()));
         assert_eq!(a.scheme, scheme::SAML);
     }

@@ -437,7 +437,14 @@ pub fn controlplane_app_spec(config: Config) -> AppSpec {
         // the shell — every control-plane table lives in the one Postgres; the blob/cache/log-tier
         // stores are declared by their behaviour bands (CI-P20/CI-P22). Auto-registered as holders.
         stores: myelin_substrate::StoreManifest::new(),
-        outbox: OutboxSpec::default(),
+        // **W3b.6 debt (named, MR-009b W3b.4):** the EXPLICIT in-memory floor — the gated
+        // `OutboxSpec::default_inproc` is no longer reachable from production; this construction is
+        // the grep-able remainder the W3b.6 `OutboxStore::new` gate breaks LOUDLY, forcing this root
+        // onto `OutboxSpec::durable` (the ci-controlplane durable rewiring is not in the W3b.4 set).
+        outbox: OutboxSpec::new(
+            myelin_events::OutboxStore::new(),
+            myelin_events::InProcessBus::new(),
+        ),
         critical: controlplane_critical(),
     }
 }

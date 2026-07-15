@@ -109,7 +109,7 @@ fn build_with(
         KmsEngine::new(),
     ))));
 
-    let backend = Arc::new(DurableGitBackend::rooted(root.to_path_buf()));
+    let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(root.to_path_buf()));
     let mut builder = Gateway::builder(authn, human_login, authorizer).route(
         Method::Get,
         "/v1/whoami",

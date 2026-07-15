@@ -21,6 +21,7 @@
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
+use myelin_events::OutboxStore;
 use myelin_flow::{flow_app_spec, SERVICE_NAME};
 use myelin_substrate::Config;
 
@@ -43,7 +44,7 @@ async fn flow_shell_migration_set_applies_against_live_postgres() {
         .expect("connect as admin (is the dev stack up?)");
 
     // The EXACT migration set the shell's AppSpec wires (no second schema — same `migrations()`).
-    let spec = flow_app_spec(Config::default());
+    let spec = flow_app_spec(Config::default(), OutboxStore::new());
     assert_eq!(spec.name, SERVICE_NAME);
     assert_eq!(
         spec.migrations.0.len(),

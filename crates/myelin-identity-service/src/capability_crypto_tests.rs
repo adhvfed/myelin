@@ -69,7 +69,11 @@ fn with_dpop(material: &str, proof: &str) -> String {
 #[test]
 fn positive_signed_token_verifies() {
     let c = cell();
-    let material = c.mint(&spec("acme", &["repo:acme/web#read", "repo:acme/web#write"], None));
+    let material = c.mint(&spec(
+        "acme",
+        &["repo:acme/web#read", "repo:acme/web#write"],
+        None,
+    ));
     let token = verifier(c.trust_anchor())
         .verify_material(&material, MachineKind::Agent)
         .expect("a correctly-signed token verifies");
@@ -87,14 +91,28 @@ fn positive_signed_token_verifies() {
 #[test]
 fn positive_attenuated_child_verifies_narrowed() {
     let c = cell();
-    let root = c.mint(&spec("acme", &["repo:acme/web#read", "repo:acme/web#write"], None));
+    let root = c.mint(&spec(
+        "acme",
+        &["repo:acme/web#read", "repo:acme/web#write"],
+        None,
+    ));
     let child = attenuate(&root, ["repo:acme/web#read"]).expect("offline attenuation");
     let token = verifier(c.trust_anchor())
         .verify_material(&child, MachineKind::Agent)
         .expect("the attenuated child verifies");
-    assert!(token.authority.holds("repo:acme/web#read"), "the kept grant survives");
-    assert!(!token.authority.holds("repo:acme/web#write"), "the dropped grant is gone (narrowed)");
-    assert_eq!(token.authority.len(), 1, "effective authority is a strict subset");
+    assert!(
+        token.authority.holds("repo:acme/web#read"),
+        "the kept grant survives"
+    );
+    assert!(
+        !token.authority.holds("repo:acme/web#write"),
+        "the dropped grant is gone (narrowed)"
+    );
+    assert_eq!(
+        token.authority.len(),
+        1,
+        "effective authority is a strict subset"
+    );
 }
 
 /// **A valid DPoP-bound PAT + a valid proof verifies (sender-constraint satisfied).**
@@ -147,7 +165,9 @@ fn negative_tampered_token_is_refused() {
     // (b1) tenant acme → globex.
     let t1 = tamper_claims(&material, |v| v["tenant"] = serde_json::json!("globex"));
     // (b2) authority widened to admin.
-    let t2 = tamper_claims(&material, |v| v["auth"] = serde_json::json!(["repo:acme/web#admin"]));
+    let t2 = tamper_claims(&material, |v| {
+        v["auth"] = serde_json::json!(["repo:acme/web#admin"])
+    });
     // (b3) jti swapped (to dodge a revocation).
     let t3 = tamper_claims(&material, |v| v["jti"] = serde_json::json!("jti-evil"));
     for (name, forged) in [("tenant", t1), ("authority", t2), ("jti", t3)] {
@@ -290,13 +310,25 @@ fn negative_dpop_wrong_htm_htu_is_refused() {
         htu: "https://api.myelin/x".into(),
     });
     // wrong method
-    let p_method = with_dpop(&material, &client.prove("GET", "https://api.myelin/x", NOW, "h1"));
+    let p_method = with_dpop(
+        &material,
+        &client.prove("GET", "https://api.myelin/x", NOW, "h1"),
+    );
     let e1 = v.verify_material(&p_method, MachineKind::Pat).unwrap_err();
-    assert!(matches!(&e1, AuthzError::FailClosed(m) if m.contains("htm")), "wrong htm refused: {e1:?}");
+    assert!(
+        matches!(&e1, AuthzError::FailClosed(m) if m.contains("htm")),
+        "wrong htm refused: {e1:?}"
+    );
     // wrong URL
-    let p_url = with_dpop(&material, &client.prove("POST", "https://evil/x", NOW, "h2"));
+    let p_url = with_dpop(
+        &material,
+        &client.prove("POST", "https://evil/x", NOW, "h2"),
+    );
     let e2 = v.verify_material(&p_url, MachineKind::Pat).unwrap_err();
-    assert!(matches!(&e2, AuthzError::FailClosed(m) if m.contains("htu")), "wrong htu refused: {e2:?}");
+    assert!(
+        matches!(&e2, AuthzError::FailClosed(m) if m.contains("htu")),
+        "wrong htu refused: {e2:?}"
+    );
 }
 
 /// **(f) DPoP: a stale `iat` (outside the freshness window) is refused.**
@@ -329,14 +361,18 @@ fn negative_garbage_is_refused_not_panicking() {
         htm: "POST".into(),
         htu: "https://api.myelin/x".into(),
     });
-    let good = c.mint(&spec("acme", &["a"], Some(DpopClientKey::from_seed(&[3u8; 32]).unwrap().jkt())));
+    let good = c.mint(&spec(
+        "acme",
+        &["a"],
+        Some(DpopClientKey::from_seed(&[3u8; 32]).unwrap().jkt()),
+    ));
     let garbage = [
         "".to_string(),
         "not-a-token".to_string(),
-        "v4.public.@@@|bm90|dGFpbA".to_string(),  // bad base64 in the PASETO body
-        "v4.public.AAAA|!!!|dGFpbA".to_string(),  // bad base64 caveats
-        "onlyone|two".to_string(),                 // 2 fields
-        "a|b|c|d|e".to_string(),                   // 5 fields
+        "v4.public.@@@|bm90|dGFpbA".to_string(), // bad base64 in the PASETO body
+        "v4.public.AAAA|!!!|dGFpbA".to_string(), // bad base64 caveats
+        "onlyone|two".to_string(),               // 2 fields
+        "a|b|c|d|e".to_string(),                 // 5 fields
         format!("{}|{}|{}|{}", "v4.public.AAAA", "W10", "dA", "Z2FyYmFnZQ"), // garbage dpop on garbage token
         with_dpop(&good, "totally-not-a-dpop-proof"), // garbage proof on a real bound token
         with_dpop(&good, "dpop.v1.@@@.###"),          // bad base64 proof segments
@@ -344,7 +380,10 @@ fn negative_garbage_is_refused_not_panicking() {
     for g in garbage {
         // Must return (an Err), never panic. Either BadRequest (structural) or FailClosed (crypto).
         let r = v.verify_material(&g, MachineKind::Pat);
-        assert!(r.is_err(), "garbage `{g}` must be refused (and must not panic)");
+        assert!(
+            r.is_err(),
+            "garbage `{g}` must be refused (and must not panic)"
+        );
     }
     // attenuate over garbage is also total.
     assert!(attenuate("garbage", ["x"]).is_err());
@@ -402,9 +441,14 @@ fn signer_verifier_seam_round_trip() {
         scheme: "agent".into(),
         material,
     };
-    let token = v.verify(&cred).expect("the signed per-run token verifies through the seam");
+    let token = v
+        .verify(&cred)
+        .expect("the signed per-run token verifies through the seam");
     assert_eq!(token.tenant.0, "acme");
     assert_eq!(token.subject_key, "svc:agent");
     assert!(token.authority.holds("agent:run"));
-    assert!(!token.dpop_bound, "a per-run token is TTL-constrained, not DPoP-bound");
+    assert!(
+        !token.dpop_bound,
+        "a per-run token is TTL-constrained, not DPoP-bound"
+    );
 }

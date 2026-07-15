@@ -434,7 +434,10 @@ impl PseudonymStore {
             ))
         })?;
         let real_id_key_ref = PiiKeyRef::parse(&drow.real_id_key_ref).ok_or_else(|| {
-            PseudonymError::Storage(format!("malformed stored key_ref `{}`", drow.real_id_key_ref))
+            PseudonymError::Storage(format!(
+                "malformed stored key_ref `{}`",
+                drow.real_id_key_ref
+            ))
         })?;
         Ok(PseudonymRow {
             tenant: scope.tenant().clone(),
@@ -558,7 +561,10 @@ impl PseudonymStore {
                 // The reverse-lookup index resolves the pseudonym rendering to its row (subject +
                 // key_ref + sealed link) in ONE tenant-scoped read.
                 let drow = match pg
-                    .block(pg.backing.get_by_pseudonym(&scope.tenant().0, &pseudonym.render()))
+                    .block(
+                        pg.backing
+                            .get_by_pseudonym(&scope.tenant().0, &pseudonym.render()),
+                    )
                     .map_err(|e| PseudonymError::Storage(e.to_string()))?
                 {
                     Some(d) => d,

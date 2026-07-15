@@ -162,7 +162,7 @@ fn build(root: &Path) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBacken
         RevocationStore::new(),
     ));
     let human = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(KmsEngine::new()))));
-    let backend = Arc::new(DurableGitBackend::rooted(root.to_path_buf()));
+    let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(root.to_path_buf()));
     let builder = Gateway::builder(authn, human, Arc::new(AllowAll))
         .default_token_scheme(SCHEME)
         .route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler));
@@ -236,7 +236,7 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
 
     let root = temp_root("push");
     // The server repo must exist (push to a non-existent repo is a 404). Create it durably.
-    let backend_for_create = DurableGitBackend::rooted(root.clone());
+    let backend_for_create = DurableGitBackend::rooted_inmem_for_test(root.clone());
     backend_for_create.create_repo("acme", REGION, "widgets").expect("create server repo");
 
     let (gw, cell, backend) = build(&root);
