@@ -204,16 +204,28 @@ impl TenantQuery {
     }
 
     /// Render the thin, visible-SQL `(tenant, region)` predicate this query always carries
-    /// (storage §3.1 — "thin, visible SQL over a heavy ORM"). The tenant/region bind values
-    /// come from the verified scope; this is the predicate the `tenant-predicate` lint
-    /// requires on every statement against a tenant table.
+    /// (storage §3.1 — "thin, visible SQL over a heavy ORM"). The tenant/region are rendered
+    /// as **bind placeholders** (`$1`/`$2`), NOT interpolated string literals — the values
+    /// travel out-of-band via [`TenantQuery::predicate_binds`] and are bound by the prepared
+    /// statement. This is the SQL-interpolation fold-in (MR-009b W6b): a tenant/region value is
+    /// NEVER spliced into the SQL text (a literal-interpolation shape is a classic injection
+    /// vector even for a "trusted" verified scope — the honest rendering is parameterized). This
+    /// is the predicate the `tenant-predicate` lint requires on every statement against a tenant
+    /// table.
+    ///
+    /// The placeholder ordinals are stable: `$1` = tenant, `$2` = region — the SAME order
+    /// [`predicate_binds`](Self::predicate_binds) returns, so `query(&q.predicate_sql())` bound
+    /// with `predicate_binds()` in order is a well-formed, injection-safe prepared statement.
     pub fn predicate_sql(&self) -> String {
-        format!(
-            "{} WHERE tenant = '{}' AND region = '{}'",
-            self.table.name(),
-            self.scope.tenant().0,
-            self.scope.region().0,
-        )
+        format!("{} WHERE tenant = $1 AND region = $2", self.table.name())
+    }
+
+    /// The ordered bind values for [`predicate_sql`](Self::predicate_sql)'s placeholders —
+    /// `[tenant, region]`, both sourced from the VERIFIED scope (never a path/string). The
+    /// caller binds these positionally (`$1` = `[0]` = tenant, `$2` = `[1]` = region) so the
+    /// values travel as parameters, never as interpolated SQL text (the injection-safe path).
+    pub fn predicate_binds(&self) -> Vec<String> {
+        vec![self.scope.tenant().0.clone(), self.scope.region().0.clone()]
     }
 
     /// Defence-in-depth backstop: a query is well-formed only if it carries a non-empty
@@ -303,17 +315,25 @@ mod tests {
         let scope = TenantScope::from_verified_token(&principal("acme"), Region("eu-west".into()));
         let q = TenantQuery::for_table(scope, TenantTable::new("issue"));
         let sql = q.predicate_sql();
+        // The predicate is PARAMETERIZED — placeholders, never interpolated literals (the
+        // SQL-interpolation fold-in). The tenant/region values travel via `predicate_binds`.
         assert!(
-            sql.contains("tenant = 'acme'"),
-            "predicate must pin the token tenant: {sql}"
+            sql.contains("tenant = $1 AND region = $2"),
+            "predicate must render bind placeholders, not literals: {sql}"
         );
         assert!(
-            sql.contains("region = 'eu-west'"),
-            "predicate must pin the region: {sql}"
+            !sql.contains('\''),
+            "no value may be interpolated as a string literal (injection-safe): {sql}"
         );
         assert!(
             sql.starts_with("issue WHERE"),
             "predicate must target the declared table: {sql}"
+        );
+        // The bind values are the verified token's, in `$1`=tenant, `$2`=region order.
+        assert_eq!(
+            q.predicate_binds(),
+            vec!["acme".to_string(), "eu-west".to_string()],
+            "binds carry the verified (tenant, region) out-of-band"
         );
     }
 

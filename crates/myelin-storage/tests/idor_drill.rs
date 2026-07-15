@@ -61,9 +61,11 @@ fn idor_drill_zero_path_derived_tenants() {
         if resolved.tenant != token.tenant {
             cross_tenant_reads += 1;
         }
-        // And the actual query carries the (tenant, region) predicate pinned to the token.
+        // And the actual query carries the (tenant, region) predicate pinned to the token —
+        // parameterized ($1/$2 placeholders), with the token tenant carried out-of-band as a bind.
         let q = TenantQuery::for_table(scope.clone(), TenantTable::new("issue"));
-        assert!(q.predicate_sql().contains("tenant = 'acme'"));
+        assert!(q.predicate_sql().contains("tenant = $1 AND region = $2"));
+        assert_eq!(q.predicate_binds().first().map(String::as_str), Some("acme"));
     }
 
     // Record the survival signals (the producer side exports these on the metrics-health

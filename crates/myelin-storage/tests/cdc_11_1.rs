@@ -52,7 +52,9 @@ impl IssuesService {
             .expect("a permit is available under the consumer's load");
         let scope = TenantScope::from_verified_token(token, region);
         let q = TenantQuery::for_table(scope, TenantTable::new("issue"));
-        q.predicate_sql()
+        // Return the parameterized statement + its out-of-band binds (rendered for the CDC's
+        // assertions) — the values travel as parameters, never interpolated into the SQL text.
+        format!("{} -- binds={:?}", q.predicate_sql(), q.predicate_binds())
     }
 }
 
@@ -70,14 +72,15 @@ fn cdc_11_1_consumer_opens_oltp_client_through_the_harness() {
     );
     let sql = issues.read_issue(&token, Region("eu-west".into()));
 
-    // The provider produced a tenant-scoped statement pinned to the verified token.
+    // The provider produced a tenant-scoped statement pinned to the verified token — the
+    // (tenant, region) predicate is PARAMETERIZED ($1/$2) and the token's values travel as binds.
     assert!(
-        sql.contains("tenant = 'acme'"),
-        "11.1 must scope to the verified tenant: {sql}"
+        sql.contains("tenant = $1 AND region = $2"),
+        "11.1 must scope to the verified (tenant, region) via bind placeholders: {sql}"
     );
     assert!(
-        sql.contains("region = 'eu-west'"),
-        "11.1 must scope to the region: {sql}"
+        sql.contains("binds=[\"acme\", \"eu-west\"]"),
+        "11.1 must carry the verified token's (tenant, region) as out-of-band binds: {sql}"
     );
     assert!(
         sql.starts_with("issue WHERE"),

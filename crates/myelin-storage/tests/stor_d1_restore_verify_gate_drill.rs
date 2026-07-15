@@ -128,7 +128,7 @@ fn stor_d1_restore_verify_gate_greens_a_whole_restore() {
             blob_ref: None,
         }, // > T → dropped
     ];
-    let mut ledger = ErasureLedger::new();
+    let ledger = ErasureLedger::new();
     ledger.record_erased(erased.clone());
 
     let target = 100;
@@ -316,7 +316,7 @@ fn stor_d1_gate_fails_ci_on_a_resurrected_erased_subject() {
     let objects: Vec<RestoredObject> = vec![];
     let source = SourceLog::new();
     let rows: Vec<WalRow> = vec![];
-    let mut ledger = ErasureLedger::new();
+    let ledger = ErasureLedger::new();
     ledger.record_erased(resurrected.clone());
     let inputs = GateInputs {
         archiver: &arch,

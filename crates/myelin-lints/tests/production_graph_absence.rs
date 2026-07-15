@@ -57,7 +57,7 @@
 //!   from the auth spine); its removal belongs to the CI/attestation track, NOT this auth prompt. Left
 //!   honestly in the baseline (the scanner stays at 1 remaining structural entry).
 //!
-//! ### `no-in-memory-durable-store` (9) — the spine durable-persistence waves (P-522/523)
+//! ### `no-in-memory-durable-store` (7) — the spine durable-persistence waves (P-522/523)
 //! - **MR-009b Wave 2 FLIPPED the 3 identity spine stores GREEN (17→14):**
 //!   `principal_store.rs` `PrincipalStore` (SI-018), `tuple_store.rs` `TupleStore` (SI-019), and
 //!   `revocation.rs` `RevocationStore` (SI-020) are now durable-by-default. Their in-memory
@@ -120,9 +120,23 @@
 //!   `kms.rs:622` entry is REMOVED. Proven live: `integration_mr025_kms_durable`
 //!   (decrypt-across-restart, wrong-seal-key-fails-closed, + the Wave-5 sync-API write-through
 //!   restart proof). DB-free unit tests reach the double via `myelin-storage/test-support`.
-//! - `myelin-storage/src/reserve_settle.rs:283`          — `CostLedger` reserve/settle in-mem (SI-021 cluster; MR-007/009)
-//! - `myelin-storage/src/restore_verify.rs:175`          — `ErasureLedger` restore-verify in-mem (SI-036 cluster; P-530)
-//! - `myelin-storage/src/reerase.rs:156`                  — `InMemoryPostPitLedger` `records: Vec<…>` (Vec false-negative closed; P-ST-14 / P-522/523)
+//! - `myelin-storage/src/reserve_settle.rs:283`          — `CostLedger` reserve/settle in-mem (SI-021 cluster; MR-007/009).
+//!   **MR-009b Wave 6b SUPPLEMENTED (not removed):** the durable FORCE-RLS `cost_reservation`/`cost_event`
+//!   tables + `DurableCostLedger` (migration 0050) exist + are proven live, but flipping durable-by-default
+//!   gates `CostLedger::new()`, which breaks the PRODUCTION `myelin-flow::BudgetGate::new` in-memory
+//!   construction (a product-subsystem budget-gate redesign — semantic decision outside W6b scope).
+//! - **MR-009b Wave 6b FLIPPED the 2 in-crate storage ERASURE ledgers GREEN (9→7):**
+//!   `restore_verify.rs:175` `ErasureLedger` (SI-036) and `reerase.rs:156` `InMemoryPostPitLedger`
+//!   (P-ST-14) are now durable-by-default. Their in-memory backings (`ErasureLedger`'s `Memory(Arc<Mutex<
+//!   BTreeMap<TenantId, WalOffset>>>)` arm + `::new()`; the whole `InMemoryPostPitLedger` type) are
+//!   `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLES; the always-compiled production backends are
+//!   the pool-backed `restore_verify_durable::DurableRestoreErasureLedger` (non-shred-erasable, NO-RLS
+//!   `restore_erasure_ledger` table, migration 0051 — carrying the R1 §7.6 completion-offset fold-in so
+//!   the gate catches a restore-inside-window resurrection) + `reerase_durable::DurablePostPitLedger`
+//!   (non-shred-erasable `post_pit_erasure_ledger`, 0052 — drops into `ReErasePass::run`'s `&dyn` seam
+//!   with zero caller change). Both production types present non-in-memory → the two entries are REMOVED.
+//!   Durable-by-default proven live (`integration_mr009b_w6b_storage_ledgers`); DB-free unit tests use
+//!   the doubles via the `myelin-storage/test-support` (self) dev-dependency.
 //! - `myelin-storage/src/blob.rs:362`                     — `FsBlobStore` `Mutex<HashMap<…, Vec<u8>>>` IN-MEMORY (no `fs::write`); byte backing is the Git/backup track (P-ST-30; SI-014/015/029)
 //!
 //! ### RESIDUAL — `outbox.rs:231` `OutboxStore` (SI-007) is a SEPARATE, higher-coupling wave (NOT Wave 3)
@@ -375,7 +389,20 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-ci-controlplane/src/residency_drill.rs",
         444,
     ),
-    // ---- no-in-memory-durable-store (6 here + 3 closed-false-negatives below = 9) ----
+    // ---- no-in-memory-durable-store (5 here + 2 closed-false-negatives below = 7) ----
+    //      MR-009b Wave 6b FLIPPED the 2 in-crate storage ERASURE ledgers durable-by-default (9→7):
+    //      `restore_verify.rs:175` `ErasureLedger` (SI-036) — removed from the "here" group — and
+    //      `reerase.rs:156` `InMemoryPostPitLedger` (P-ST-14) — removed from the closed-false-negatives
+    //      group. Their in-memory backings are now `test-support`-gated test doubles and the
+    //      always-compiled production ledgers are the pool-backed `restore_verify_durable::
+    //      DurableRestoreErasureLedger` (non-shred-erasable `restore_erasure_ledger`, migration 0051,
+    //      carrying the R1 §7.6 completion-offset fold-in) + `reerase_durable::DurablePostPitLedger`
+    //      (non-shred-erasable `post_pit_erasure_ledger`, 0052). The sibling `reserve_settle.rs:283`
+    //      `CostLedger` STAYS (SUPPLEMENTED not removed): its durable backing + FORCE-RLS tables exist
+    //      (`reserve_settle_durable`, 0050) and are proven live, but flipping it durable-by-default
+    //      requires gating `CostLedger::new()`, which breaks the PRODUCTION `myelin-flow::BudgetGate::new`
+    //      → `ci-controlplane::metering` in-memory construction (a product-subsystem budget-gate durable
+    //      redesign — a semantic decision outside W6b's in-crate scope; see the residual note below).
     //      spine durable-persistence waves (P-522/523); MR-009b Wave 2 flipped the 3 identity spine
     //      stores (principal/tuple/revocation) durable-by-default → removed (17→14); MR-009b Wave 3
     //      flipped the events `DedupLedger` (SI-023) durable-by-default → `dedup.rs:141` removed
@@ -461,30 +488,40 @@ const BASELINE: &[(&str, &str, usize)] = &[
     // (`integration_mr025_kms_durable` — decrypt-across-restart + wrong-seal-key-fails-closed +
     // the Wave-5 write-through kill-9-equivalent proof); DB-free unit tests use the double via the
     // `myelin-storage/test-support` dev-dependency.
+    // `myelin-storage/src/restore_verify.rs:175` `ErasureLedger` (SI-036) — REMOVED by MR-009b
+    // Wave 6b: it is now a role struct over a backend enum (`ErasureLedgerBackend`) whose in-memory
+    // `Memory(Arc<Mutex<BTreeMap<TenantId, WalOffset>>>)` arm + `::new()` are `test-support`-gated test
+    // doubles, and the always-compiled production backend is `Pg(DurableRestoreErasureLedger)` over the
+    // non-shred-erasable `restore_erasure_ledger` table (migration 0051). The R1 fold-in enriched each
+    // record with the erasure COMPLETION offset (§7.6 backup-window residual): the gate now catches a
+    // restore-inside-window resurrection by comparing the restore PIT vs the completion offset. The
+    // production enum presents non-in-memory → the scanner no longer fires. Proven live
+    // (`integration_mr009b_w6b_storage_ledgers`).
+    // `CostLedger` (reserve_settle.rs:283, SI-021) — SUPPLEMENTED not removed by MR-009b Wave 6b: the
+    // durable FORCE-RLS `cost_reservation`/`cost_event` tables + `DurableCostLedger` backing (migration
+    // 0050) exist and are proven live (idempotent double-settle + settle-capped on Pg), BUT the
+    // in-memory `CostLedger` is STILL the default. Flipping it durable-by-default gates `CostLedger::new()`,
+    // which breaks the PRODUCTION in-memory construction in `myelin-flow::BudgetGate::new` (called by
+    // `ci-controlplane::metering`) — a product-subsystem budget-gate durable redesign, a semantic
+    // decision outside W6b's in-crate storage scope. Removed when flow's budget gate is wired durable.
     (
         "no-in-memory-durable-store",
         "crates/myelin-storage/src/reserve_settle.rs",
         283,
     ),
-    (
-        "no-in-memory-durable-store",
-        "crates/myelin-storage/src/restore_verify.rs",
-        175,
-    ),
-    // -- closed false-negatives (verifier MR-004 review): Vec / FsBlobStore / audit sink --
+    // -- closed false-negatives (verifier MR-004 review): FsBlobStore / audit sink --
+    // (`InMemoryPostPitLedger`, reerase.rs:156 — the `records: Vec<ErasureRecord>` false-negative —
+    //  was here; MR-009b Wave 6b FLIPPED it GREEN: the struct + its impls + `::new()` are now
+    //  `test-support`-gated test doubles, and the always-compiled production `PostRestoreErasureLedger`
+    //  is `reerase_durable::DurablePostPitLedger` over the non-shred-erasable `post_pit_erasure_ledger`
+    //  table (0052) — the durable impl drops into `ReErasePass::run`'s `&dyn` seam with zero caller
+    //  change. The production graph presents non-in-memory → removed.)
     // (`PseudonymErasureLedger`, pseudonym_erase.rs:268 — the `type LedgerByPartition = BTreeMap<…>`
     //  ALIAS false-negative — was here; MR-009b Wave 6a FLIPPED it GREEN: the `Memory` arm + the
     //  `LedgerByPartition` alias + `::new()` are now `test-support`-gated test doubles, and the
     //  always-compiled backend is the pool-backed `Pg(PgErasureLedgerBacking)`/`with_pg` over the
     //  NON-shred-erasable, NO-RLS `identity_pseudonym_erasure_ledger` table (10.8 — it survives the
     //  crypto-shred it records + a restore). The production enum presents non-in-memory → removed.)
-    (
-        // `InMemoryPostPitLedger` — field `records: Vec<ErasureRecord>` (hidden until `Vec<` was
-        // added to the collection tokens). Post-restore re-erasure ledger. → P-ST-14 / P-522/523.
-        "no-in-memory-durable-store",
-        "crates/myelin-storage/src/reerase.rs",
-        156,
-    ),
     (
         // `FsBlobStore` — `objects: Mutex<HashMap<String, Vec<u8>>>`, `put()` just inserts (NO
         // `fs::write`). An in-memory store; its real byte backing is the Git/backup-durability track
@@ -590,14 +627,14 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
     // un-wired gate). The counts pin the manifest shape.
     assert_eq!(
         BASELINE.len(),
-        10,
-        "the committed baseline has 10 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
-         GREEN: 17 → 14 — PrincipalStore/TupleStore/RevocationStore are durable-by-default, their \
-         in-memory doubles `test-support`-gated; MR-009b Wave 3 flipped the events `DedupLedger` \
-         (SI-023) — `dedup.rs:141` removed → 14 → 13; MR-009b Wave 5 flipped the `KmsEngine` \
-         (SI-006) durable-by-default — `kms.rs:622` removed → 13 → 12; MR-009b Wave 6a flipped the 2 \
-         identity S2 pseudonym holders (PseudonymStore + PseudonymErasureLedger) durable-by-default — \
-         pseudonym_store.rs:191 + pseudonym_erase.rs:268 removed → 12 → 10)"
+        8,
+        "the committed baseline has 8 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
+         GREEN: 17 → 14; Wave 3 flipped the events `DedupLedger` (SI-023) → 14 → 13; Wave 5 flipped \
+         the `KmsEngine` (SI-006) → 13 → 12; Wave 6a flipped the 2 identity S2 pseudonym holders → \
+         12 → 10; Wave 6b flipped the 2 in-crate storage ERASURE ledgers — `restore_verify.rs:175` \
+         `ErasureLedger` + `reerase.rs:156` `InMemoryPostPitLedger` — durable-by-default → 10 → 8 \
+         (the sibling `reserve_settle.rs:283` `CostLedger` is SUPPLEMENTED not removed: its durable \
+         backing exists but the flip awaits the flow/ci budget-gate durable redesign))"
     );
     let structural = BASELINE
         .iter()
@@ -620,19 +657,17 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          to the CI track."
     );
     assert_eq!(
-        in_memory, 9,
-        "9 in-memory durable-store sites: MR-009b Wave 2 FLIPPED the 3 identity spine stores \
-         (PrincipalStore/TupleStore/RevocationStore) durable-by-default (16→13), MR-009b Wave 3 \
-         FLIPPED the events `DedupLedger` (SI-023) durable-by-default (13→12), MR-009b Wave 5 \
-         FLIPPED the `KmsEngine` (SI-006) durable-by-default (12→11), and MR-009b Wave 6a FLIPPED \
-         the 2 identity S2 pseudonym holders — `PseudonymStore` (pseudonym_store.rs:191) + \
-         `PseudonymErasureLedger` (pseudonym_erase.rs:268): their `Memory` arms + `Inner`/ \
-         `LedgerByPartition` + `::new()` are now `test-support`-gated test doubles and the \
-         always-compiled production backend is the pool-backed `Pg`/`with_pg` over the durable \
-         `pseudonym_map` + non-shred-erasable `identity_pseudonym_erasure_ledger` tables the \
-         production `StoreBackedCheck::with_pg` composition root wires (11→9). The remaining 9 \
-         (events OUTBOX (SI-007, a separate higher-coupling wave) + reerase; control-plane \
-         registry/bridge/misroute; storage reserve/restore/reerase/blob) flip in the later waves."
+        in_memory, 7,
+        "7 in-memory durable-store sites: Waves 2/3/5/6a flipped the identity spine + events \
+         DedupLedger + KmsEngine + the 2 S2 pseudonym holders durable-by-default (16→9), and \
+         MR-009b Wave 6b FLIPPED the 2 in-crate storage ERASURE ledgers durable-by-default (9→7): \
+         `restore_verify.rs:175` `ErasureLedger` (now a backend enum over the non-shred-erasable \
+         `restore_erasure_ledger` table, migration 0051, carrying the R1 §7.6 completion-offset \
+         fold-in) + `reerase.rs:156` `InMemoryPostPitLedger` (now the `test-support`-gated double \
+         behind `DurablePostPitLedger` over `post_pit_erasure_ledger`, 0052). The remaining 7 \
+         (events OUTBOX (SI-007) + reerase; control-plane registry/bridge/misroute; storage \
+         `reserve_settle.rs:283` `CostLedger` (SUPPLEMENTED — durable backing exists, flip awaits \
+         the flow/ci budget-gate durable redesign) + `blob.rs:362`) flip in the later waves."
     );
     assert_eq!(
         bare_pool, 0,

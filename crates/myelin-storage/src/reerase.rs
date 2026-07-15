@@ -152,11 +152,20 @@ pub trait PostRestoreErasureLedger {
 /// An in-memory [`PostRestoreErasureLedger`] (the floor the pass + drill drive; the real GDPR ledger
 /// is the seam binding, P-GA-15 / P-115). Holds the PII-free [`ErasureRecord`]s; selection is the
 /// exact `completed_at_offset > pit` comparison the §7.5 pass needs.
+///
+/// **MR-009b W6b — TEST DOUBLE (compiled ONLY under `#[cfg(any(test, feature = "test-support"))]`).**
+/// The always-compiled PRODUCTION [`PostRestoreErasureLedger`] is the durable
+/// [`crate::reerase_durable::DurablePostPitLedger`] over the non-shred-erasable `post_pit_erasure_ledger`
+/// table (migration `0052`) — a durable impl drops into `ReErasePass::run`'s `&dyn` seam with zero
+/// caller change. The `no-in-memory-durable-store` scanner strips this `test-support`-gated
+/// `records: Vec<…>` holder, so the production graph presents only the durable ledger.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryPostPitLedger {
     records: Vec<ErasureRecord>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl InMemoryPostPitLedger {
     /// An empty ledger.
     pub fn new() -> InMemoryPostPitLedger {
@@ -180,6 +189,7 @@ impl InMemoryPostPitLedger {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PostRestoreErasureLedger for InMemoryPostPitLedger {
     fn erasures_completed_after(&self, pit: WalOffset) -> Vec<ErasureRecord> {
         // ONLY the erasures completed strictly AFTER the PIT — a pre-or-at-T erasure is already dead
