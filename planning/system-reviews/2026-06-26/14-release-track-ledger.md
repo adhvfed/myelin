@@ -204,15 +204,64 @@ stack; kill-9 drills green.
 | # | Item | Status | Commit(s) |
 |---|---|---|---|
 | R2.1 | Object-level authz at the edge, platform-wide (extends R0.3 seam; git_edge template first) | PENDING | — |
-| R2.1a | **Wire R0.2/R0.3 LIVE** (carried from R0 verifier): production `main.rs` must (a) inject a real grant-backed `RepoAuthorizer` (not the `AllowAllRepos` default) and (b) `register_git_wire` in the production gateway. Until both, the R0.2 branch-protection gate and R0.3 per-repo authz are correct-but-latent. | PENDING | — |
-| R2.2 | Identity `check()` fully-qualified object; EventMatcher + SSE scope likewise | PENDING | — |
-| R2.3 | Fail-static authz cache full-key comparison | PENDING | — |
-| R2.4 | MCP HITL server-side verdict; batch partial-approval by approval-id | PENDING | — |
+| R2.1a | **Wire R0.2/R0.3 LIVE** (carried from R0 verifier): production `main.rs` must (a) inject a real grant-backed `RepoAuthorizer` (not the `AllowAllRepos` default) and (b) `register_git_wire` in the production gateway. Until both, the R0.2 branch-protection gate and R0.3 per-repo authz are correct-but-latent. | **DONE** | `239547c` (merge; v2 `453d6af`, superseded reverted v1 `2138fd2`) |
+| R2.2 | Identity `check()` fully-qualified object; EventMatcher + SSE scope likewise | IN BUILD | — |
+| R2.3 | Fail-static authz cache full-key comparison | **DONE** | `2154e38` (merge; `d3ebd3b`+`ff334e8`) |
+| R2.4 | MCP HITL server-side verdict; batch partial-approval by approval-id | IN BUILD | — |
 | R2.5 | Real OIDC login at edge; dev-login structurally dead in prod | PENDING | — |
 | R2.6 | AllowAll removed from main.rs + lint | PENDING | — |
-| R2.7 | Search vector-path ACL parity | PENDING | — |
+| R2.7 | Search vector-path ACL parity | IN VERIFY | `6c56c42` (worktree, pre-merge) |
 
 R2 exit: red-team campaign (subagent per subsystem: edge/wire/MCP/SSE/search reach-around) all-denied; AllowAll gone.
+
+### R2 execution log (2026-07-15, session 2)
+
+Same process as R0/R1: builder → orchestrator gate → independent adversarial verifier → commit/merge.
+Grounding surveys done for all of R2.1a, R2.2, R2.3, R2.4, R2.7 before dispatch.
+
+- **W7.2 boot-migrations aggregate DONE (`ef7400a`)** — pulled forward from the R1 carry list
+  (#2) as a hard PREREQ for R2.1a: identity tuple/principal tables must exist at edge boot. Adds
+  `all_durable_migrations()` in myelin-storage (built structurally FROM `durable_migration_groups()`,
+  anti-drift), applied at all 9 durable service mains after `migrate_foundation()`. Closes the doc-18
+  Part 5 LIVE DEFECT (identity 0010–0019 never migrated at edge — first principal write failed on a
+  fresh DB) + the W6c dedup-vs-0051–0053 asymmetry. Fresh-schema red→green proof + `PrincipalStore::with_pg`
+  first-write proof on live PG. Pre-existing `mr023_serve` outbox-pollution integration flake noted, out of scope.
+- **R2.3 + R2.3b DONE (`2154e38`)** — core: FailStatic cache keyed by the real key, not a 64-bit
+  DefaultHasher digest (kills cross-principal cached-ALLOW replay on hash collision). **TWO independent
+  adversarial verifiers → CONFIRMED-SOUND**, aliasing test proven non-vacuous (fails on old code); both
+  flagged the same residual → **R2.3b**: the two string-key builders (git live_check, refs resolve)
+  flattened unconstrained OIDC-`sub`/SCIM-sourced segments with a `format!` delimiter join → distinct
+  authz questions could serialize byte-identical. New `encode_authz_key()` length-prefixes each segment
+  (`{len}:{seg}`) → injective; regression coverage incl. the background-refresh path; doc-rot fixed.
+  Workspace 8080 passed.
+- **R2.7 IN VERIFY (`6c56c42`, worktree)** — `AclFilter::admits(doc_id, acl_object)` mirrors the lexical
+  `acl_clause` two-field match; `VectorRecord`/`knn_filtered`/`upsert_stamped` thread `acl_object`;
+  persistence appends it with a legacy-missing-field fail-closed fallback; bonus: `projection_feeder` was
+  silently `acl_object`-only, fixed. Red→green on the deny-set-both-directions leak tests. Adversarial
+  verifier running (focus: NotIds deny arm + HNSW recall path).
+- **R2.1a DONE (`239547c`)** — THE FLIP: git smart-HTTP clone/fetch/push now exists in prod, gated by the
+  real Identity check. `CheckBackedRepoAuthorizer` over `StoreBackedCheck` via the doctrinal `GitCheckGate`
+  (Read→pull, Write→push, fail-closed, revocation-consult byte-identical to `StoreBackedCheck::check`);
+  `register_git_wire` mounted; `TupleRepoBootstrap` writes the creator→admin grant into the SAME store the
+  checker reads (deny-by-default would otherwise strand every fresh repo). **Two parallel builds happened**
+  (dedup): the shared-store **v2** (`453d6af`) superseded a two-store **v1** (`2138fd2`, reverted at
+  `0a2b16d`) — v2 also adds a tenant-pin defence-in-depth + an R0.2 force-push-through-wire test. **Both
+  independently adversarial-verified CONFIRMED-SOUND** (no false-ALLOW cross-user wire read/write; per-repo
+  authz runs before any byte in all 3 handlers; cross-tenant blocked upstream by resolve_scope IDOR; R0.2
+  fires through the wire; cross-store reads live-PG per check). Real-git gVisor oracle legs executed.
+  **Verifier LOW carry-forwards → R2.1a-followup ledger row:** (#7) grant-first has no compensation on
+  create-fail → orphan admin + slug-reuse = cross-user (narrow); (#1) durable-PG create-then-clone
+  regression leg; (#2) `object_id_of` collapses namespaced slugs → **routed to R2.2** (not wire-reachable).
+- **R2.2 IN BUILD** — object-qualification of `check()`/`EventMatcher`/SSE (absorbs R2.1a verifier #2).
+- **R2.1a-followup IN BUILD** — #7 compensating grant + #1 durable-PG regression test.
+
+**Sequencing decisions:** R2.2 (object-qualification of `check`/EventMatcher/SSE) must land AFTER R2.1a —
+it changes tuple-store object keying while R2.1a writes the first production grant tuples; git's
+type-prefixed refs (`repo:core`) survive today's reduction, so R2.1a builds on the current grammar and
+R2.2 canonicalizes against the then-live wire tests. R2.4 (MCP HITL) deferred until after R2.1a lands to
+avoid myelin-agent-service overlap; fix shape settled (persist HitlGate in the already-declared
+`agent_hitl_gate` table, MCP re-drive presents a server-issued gate-id looked up server-side, step-6
+gate + batch approval key per-effect not by bare tool name).
 
 ## R3–R6
 
