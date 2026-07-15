@@ -12,7 +12,12 @@
 
 use myelin_config::MyelinConfig;
 
-use crate::blob::{BlobStore, FsBlobStore};
+use crate::blob::BlobStore;
+// MR-009b W7.3 — the fs `FsBlobStore` floor is `test-support`-gated; the `Backend::InMemory` blob
+// arm below (a test/dev convenience — production uses `Backend::Real` → `S3BlobStore`) is gated with
+// it. There are zero production callers of `blob_store(Backend::InMemory, …)`.
+#[cfg(any(test, feature = "test-support"))]
+use crate::blob::FsBlobStore;
 use crate::cache::{Cache, CacheError, InMemoryCache};
 use crate::s3blob::S3BlobStore;
 use crate::valkey::ValkeyCache;
@@ -36,7 +41,17 @@ pub fn blob_store(
     rt: tokio::runtime::Handle,
 ) -> Box<dyn BlobStore + Send + Sync> {
     match backend {
+        // MR-009b W7.3 — the fs floor is a `test-support`-gated test double. In a production build
+        // (no `test-support`) this arm is unreachable — production wires `Backend::Real` only
+        // (`SubstrateProvider::blob_store` hardcodes `Backend::Real`) — so it fails LOUD rather than
+        // silently returning an in-memory store as a system of record.
+        #[cfg(any(test, feature = "test-support"))]
         Backend::InMemory => Box::new(FsBlobStore::new()),
+        #[cfg(not(any(test, feature = "test-support")))]
+        Backend::InMemory => panic!(
+            "backend::blob_store(Backend::InMemory) requires the `test-support` feature — the fs \
+             FsBlobStore floor is a test double; production uses Backend::Real (S3BlobStore)"
+        ),
         Backend::Real => Box::new(S3BlobStore::connect(&cfg.s3, rt)),
     }
 }

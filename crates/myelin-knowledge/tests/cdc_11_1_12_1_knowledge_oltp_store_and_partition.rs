@@ -27,10 +27,14 @@
 //! on a deliberately tenant-less query fixture and GREEN on the Knowledge store query path. No
 //! threshold weakened.
 
+use std::sync::Arc;
+
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_knowledge::{knowledge_scope, KnowledgeStore, KnowledgeTable};
 use myelin_lints::lints::tenant_predicate;
-use myelin_storage::{OltpConfig, TenantScope};
+// MR-009b W7.3 — the Knowledge store's BlobStore is now INJECTED; a drill passes the
+// `test-support`-gated fs floor (available here via the `myelin-storage/test-support` dev-dep).
+use myelin_storage::{FsBlobStore, OltpConfig, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 
 fn principal(tenant: &str) -> Principal {
@@ -55,7 +59,7 @@ fn cfg() -> OltpConfig {
 /// another subsystem's tables). The bounded-pool semantics (fast-fail on saturation) carry through.
 #[test]
 fn consumer_knowledge_store_opens_its_own_bounded_oltp_pool() {
-    let store = KnowledgeStore::open(cfg()).expect("the Knowledge store opens its OLTP pool");
+    let store = KnowledgeStore::open(cfg(), Arc::new(FsBlobStore::new())).expect("the Knowledge store opens its OLTP pool");
     assert_eq!(store.pool().config(), cfg());
     // The bounded pool is real: a per-tenant permit accounts against it (11.1 / storage §3.1).
     let acme = TenantId("acme".into());
@@ -75,7 +79,7 @@ fn consumer_knowledge_store_opens_its_own_bounded_oltp_pool() {
 /// token's — never a path-derived value (12.1, the partition key from the token).
 #[test]
 fn consumer_every_knowledge_query_is_tenant_region_scoped() {
-    let store = KnowledgeStore::open(cfg()).expect("open");
+    let store = KnowledgeStore::open(cfg(), Arc::new(FsBlobStore::new())).expect("open");
     let scope = knowledge_scope(&principal("acme"), Region::new("fr-par"));
     // Exercise the highest-write table (block) + a structured one (db_row) + the op-log (doc_op).
     for table in [
@@ -143,7 +147,7 @@ fn drill_kn_d13_cross_tenant_path_spoof_is_rejected_zero_cross_tenant() {
 
     // (4) And the query the resolved tenant builds is pinned to `acme` — so even the SQL it would
     // run carries `WHERE tenant = 'acme'`, never `evil-corp` (the predicate is the token's).
-    let store = KnowledgeStore::open(cfg()).expect("open");
+    let store = KnowledgeStore::open(cfg(), Arc::new(FsBlobStore::new())).expect("open");
     let q = store.query(scope, KnowledgeTable::Page);
     assert!(
         q.predicate_sql().contains("tenant = $1 AND region = $2")

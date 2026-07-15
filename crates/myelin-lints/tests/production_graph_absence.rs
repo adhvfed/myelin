@@ -57,7 +57,8 @@
 //!   from the auth spine); its removal belongs to the CI/attestation track, NOT this auth prompt. Left
 //!   honestly in the baseline (the scanner stays at 1 remaining structural entry).
 //!
-//! ### `no-in-memory-durable-store` (1) — the spine durable-persistence waves (P-522/523)
+//! ### `no-in-memory-durable-store` (0 — R1 EXIT: the ratchet is FULLY GREEN) — the spine
+//!     durable-persistence waves (P-522/523)
 //! - **MR-009b Wave 2 FLIPPED the 3 identity spine stores GREEN (17→14):**
 //!   `principal_store.rs` `PrincipalStore` (SI-018), `tuple_store.rs` `TupleStore` (SI-019), and
 //!   `revocation.rs` `RevocationStore` (SI-020) are now durable-by-default. Their in-memory
@@ -229,7 +230,24 @@
 //!   with zero caller change). Both production types present non-in-memory → the two entries are REMOVED.
 //!   Durable-by-default proven live (`integration_mr009b_w6b_storage_ledgers`); DB-free unit tests use
 //!   the doubles via the `myelin-storage/test-support` (self) dev-dependency.
-//! - `myelin-storage/src/blob.rs:362`                     — `FsBlobStore` `Mutex<HashMap<…, Vec<u8>>>` IN-MEMORY (no `fs::write`); byte backing is the Git/backup track (P-ST-30; SI-014/015/029)
+//! - **MR-009b W7.3 FLIPPED storage `blob.rs:362` `FsBlobStore` (SI-014/015/029) GREEN:** the
+//!   `objects: Mutex<HashMap<String, Vec<u8>>>` floor (`put()` inserts, NO `fs::write`) is now the
+//!   `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLE; the DURABLE production backing is the
+//!   always-compiled `s3blob::S3BlobStore` (real `aws-sdk-s3`, RustFS/Scaleway — P-ST-30), which was
+//!   ALREADY the selection seam's `Backend::Real` arm (`SubstrateProvider::blob_store` →
+//!   `backend::blob_store(Backend::Real, …)`). The TWO production defaults that hardcoded the fs floor
+//!   are re-pointed to INJECTION (the W3b.4 precedent): knowledge `KnowledgeStore::open` takes an
+//!   injected `Arc<dyn BlobStore + Send + Sync>` (production threads `provider.blob_store()`), and
+//!   chat `ColdSegments<FsBlobStore>::new`/`Default` + the `MemHotTier` in-memory tier that embeds
+//!   them are `test-support`-gated (chat production seals cold segments to the injected `S3BlobStore`
+//!   via `ColdSegments::with_blob_store`; the generic `ColdSegments<B>` seam stays always-compiled).
+//!   The other fs-floor consumers — `backend::blob_store`'s `Backend::InMemory` arm (zero production
+//!   callers; production hardcodes `Backend::Real`), `FirehoseArchiver`/`CiLogTier` (unwired floors),
+//!   the `ReplicatedBlobStore<FsBlobStore>` drill impl — are gated with it. Re-hash-on-read integrity
+//!   refusal (STOR-D7, 0 silent serve) is a trait-level property held by BOTH backings and proven
+//!   live on the S3 arm. The scanner strips the `test-support`-gated struct → the production graph
+//!   presents no in-memory blob store → the entry is REMOVED (in-memory count −1 in this tree; the
+//!   sibling `outbox.rs:231` OUTBOX/SI-007 flips in the parallel W3b.6 wave — reconcile at merge).
 //!
 //! ### (DISCHARGED) RESIDUAL — `outbox.rs:231` `OutboxStore` (SI-007): the separate wave LANDED (W3b)
 //! MR-009b Wave 3 flipped the sibling `DedupLedger` (SI-023) but DELIBERATELY LEFT `OutboxStore`
@@ -483,7 +501,10 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-ci-controlplane/src/residency_drill.rs",
         444,
     ),
-    // ---- no-in-memory-durable-store (0 here + 1 closed-false-negative below = 1) ----
+    // ---- no-in-memory-durable-store (0 here + 0 closed-false-negatives = 0 — R1 EXIT:
+    //      W3b.6 removed the last "here" entry (events `outbox.rs:231` OutboxStore) and W7.3
+    //      removed the last closed-false-negative (storage `blob.rs:362` FsBlobStore); every
+    //      census-named spine durable-store shortcut is retired from the production graph) ----
     //      MR-009b W6d FLIPPED the control-plane `Registry` (SI-011) + `MisrouteAudit` (SI-028)
     //      durable-by-default (5→3): `registry.rs:111` is REMOVED from the "here" group and
     //      `placement_of.rs:223` from the closed-false-negatives group below. The canonical
@@ -655,7 +676,7 @@ const BASELINE: &[(&str, &str, usize)] = &[
     // is REMOVED. Durable-by-default proven live (`integration_mr009b_w6b_storage_ledgers`, W6b2 leg —
     // idempotent double-settle + settle-capped + fresh-pool survival on Pg); DB-free unit tests use the double
     // via `myelin-storage/test-support`.
-    // -- closed false-negatives (verifier MR-004 review): FsBlobStore / audit sink --
+    // -- closed false-negatives (verifier MR-004 review): FsBlobStore (FLIPPED GREEN by W7.3) / audit sink --
     // (`InMemoryPostPitLedger`, reerase.rs:156 — the `records: Vec<ErasureRecord>` false-negative —
     //  was here; MR-009b Wave 6b FLIPPED it GREEN: the struct + its impls + `::new()` are now
     //  `test-support`-gated test doubles, and the always-compiled production `PostRestoreErasureLedger`
@@ -668,14 +689,22 @@ const BASELINE: &[(&str, &str, usize)] = &[
     //  always-compiled backend is the pool-backed `Pg(PgErasureLedgerBacking)`/`with_pg` over the
     //  NON-shred-erasable, NO-RLS `identity_pseudonym_erasure_ledger` table (10.8 — it survives the
     //  crypto-shred it records + a restore). The production enum presents non-in-memory → removed.)
-    (
-        // `FsBlobStore` — `objects: Mutex<HashMap<String, Vec<u8>>>`, `put()` just inserts (NO
-        // `fs::write`). An in-memory store; its real byte backing is the Git/backup-durability track
-        // (P-ST-30; census SI-014/015/029) — NOT the false "already byte-durable" premise.
-        "no-in-memory-durable-store",
-        "crates/myelin-storage/src/blob.rs",
-        362,
-    ),
+    // `myelin-storage/src/blob.rs:362` `FsBlobStore` (SI-014/015/029) — REMOVED by MR-009b W7.3.
+    // The `objects: Mutex<HashMap<String, Vec<u8>>>` floor (`put()` just inserts, NO `fs::write`) is
+    // now the `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLE; the DURABLE production
+    // backing is the always-compiled `s3blob::S3BlobStore` (real `aws-sdk-s3`, RustFS/Scaleway —
+    // P-ST-30), config-selected via `SubstrateProvider::blob_store` → `backend::blob_store(
+    // Backend::Real, …)`. The TWO production defaults that hardcoded the fs floor are re-pointed to
+    // injection: knowledge `KnowledgeStore::open` now takes an `Arc<dyn BlobStore + Send + Sync>`,
+    // and chat `ColdSegments<FsBlobStore>::new`/`Default` (+ the `MemHotTier` in-memory tier that
+    // embeds it) are `test-support`-gated (chat production seals cold segments to the injected
+    // `S3BlobStore` via `ColdSegments::with_blob_store`). The remaining fs-floor consumers
+    // (`backend::blob_store`'s `InMemory` arm, `FirehoseArchiver`/`CiLogTier`, the
+    // `ReplicatedBlobStore<FsBlobStore>` drill impl) are unwired floors gated with it. The scanner
+    // strips the `test-support`-gated struct, so the production graph presents no in-memory blob
+    // store → the entry is REMOVED. The re-hash-on-read integrity refusal (STOR-D7) is a trait-level
+    // property held by BOTH backings; proven live on the S3 arm (P-ST-30). See the flipped-GREEN note
+    // in the module docs above.
     // (`MisrouteAudit`, placement_of.rs:223 — the `records: Arc<Mutex<Vec<…>>>` audit-sink
     //  closed-false-negative — was here; MR-009b W6d FLIPPED it GREEN: the `Memory` arm +
     //  `MisrouteAudit::new()`/`Default` + `CellGateway::new()` are now `test-support`-gated test
@@ -776,8 +805,9 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
     // un-wired gate). The counts pin the manifest shape.
     assert_eq!(
         BASELINE.len(),
-        2,
-        "the committed baseline has 2 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
+        1,
+        "the committed baseline has 1 entry — the CI runner-attestation structural floor ONLY: \
+         the `no-in-memory-durable-store` set is EMPTY (R1 EXIT). (MR-009b Wave 2 flipped the 3 identity spine stores \
          GREEN: 17 → 14; Wave 3 flipped the events `DedupLedger` (SI-023) → 14 → 13; Wave 5 flipped \
          the `KmsEngine` (SI-006) → 13 → 12; Wave 6a flipped the 2 identity S2 pseudonym holders → \
          12 → 10; Wave 6b flipped the 2 in-crate storage ERASURE ledgers — `restore_verify.rs:175` \
@@ -817,8 +847,9 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          to the CI track."
     );
     assert_eq!(
-        in_memory, 1,
-        "1 in-memory durable-store site: Waves 2/3/5/6a flipped the identity spine + events \
+        in_memory, 0,
+        "0 in-memory durable-store sites — R1 EXIT, the ratchet is fully green over the spine. \
+         (History: Waves 2/3/5/6a flipped the identity spine + events \
          DedupLedger + KmsEngine + the 2 S2 pseudonym holders durable-by-default (16→9); \
          MR-009b Wave 6b FLIPPED the 2 in-crate storage ERASURE ledgers durable-by-default (9→7): \
          `restore_verify.rs:175` `ErasureLedger` (now a backend enum over the non-shred-erasable \
@@ -844,14 +875,16 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          `CostLedger::new()` are `test-support`-gated; the always-compiled `Durable(DurableCostLedger)` \
          arm over the FORCE-RLS `cost_reservation`/`cost_event` tables, 0050, is production) + the \
          `myelin-flow::BudgetGate::with_pg`/`new_durable` injection that closed the W6b honest-STOP; \
-         and W3b.6 FLIPPED the events `outbox.rs:231` `OutboxStore` (SI-007) durable-by-default \
-         (2→1) — THE FLIP closing the W3b.1–.6 chain: the `Memory(Arc<Mutex<Inner>>)` arm + `Inner` \
+         W3b.6 FLIPPED the events `outbox.rs:231` `OutboxStore` (SI-007) durable-by-default \
+         — THE FLIP closing the W3b.1–.6 chain: the `Memory(Arc<Mutex<Inner>>)` arm + `Inner` \
          + `::new()`/`Default` + the memory-arm relay mechanics + `restore_committed_row_for_test` \
          are `test-support`-gated TEST DOUBLES, and the always-compiled PRODUCTION backend is \
          `Durable(Arc<dyn DurableOutboxBacking>)` over `PgOutboxBacking` (proven live: \
          `integration_mr009b_outbox_durable` + `integration_w3b4_durable_spec_boot` + the kill-9 \
-         emit drill, 0 lost / 0 ghost). \
-         The remaining 1 (storage `blob.rs:362` `FsBlobStore` (W7.3)) flips in the last wave."
+         emit drill, 0 lost / 0 ghost); and W7.3 FLIPPED storage `blob.rs:362` `FsBlobStore` \
+         (SI-014/015/029) — the fs floor is a `test-support`-gated test double, the durable backing \
+         is the always-compiled `s3blob::S3BlobStore`, the knowledge + chat production defaults \
+         re-pointed to injection — completing the ledger-13 2→0.)"
     );
     assert_eq!(
         bare_pool, 0,

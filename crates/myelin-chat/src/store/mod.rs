@@ -70,10 +70,19 @@ use myelin_events::{
     AggregateKey, DataRole, EventDraft, EventType, OutboxTransaction, OutboxTx as OutboxTxTrait,
     Visibility,
 };
-use myelin_storage::{BlobStore, ContentHash, FsBlobStore};
+use myelin_storage::{BlobStore, ContentHash};
+// MR-009b W7.3 — the fs `FsBlobStore` floor is `test-support`-gated in storage; chat's in-memory
+// `MemHotTier` + the `ColdSegments::new()`/`Default` floor constructors that use it are gated with
+// it (production seals cold segments to the injected `S3BlobStore` via `with_blob_store`).
+#[cfg(any(test, feature = "test-support"))]
+use myelin_storage::FsBlobStore;
 use myelin_tenancy::TenantId;
 
-use crate::events::{CHAT_MESSAGE_CREATED, CHAT_MESSAGE_EDITED, CHAT_MESSAGE_ERASED};
+use crate::events::CHAT_MESSAGE_ERASED;
+// MR-009b W7.3 — these two subjects are emitted only by the `test-support`-gated `MemHotTier`
+// MessageStore impl; gated with it.
+#[cfg(any(test, feature = "test-support"))]
+use crate::events::{CHAT_MESSAGE_CREATED, CHAT_MESSAGE_EDITED};
 
 pub use ulid::{MessageId, MonotonicUlidSource, SystemUlidSource, UlidSource};
 
@@ -412,15 +421,22 @@ pub trait MessageStore {
 /// The store is residency-pinned STRUCTURALLY: the partition key includes `region`, so a write for
 /// `(tenant, region)` lands ONLY in that region's partition — a read for a different region sees 0
 /// rows (the partition/residency-pin GATE; the PG tier enforces the same at the DB via RLS).
+///
+/// **MR-009b W7.3 — `test-support`-gated TEST DOUBLE.** This in-memory tier (its `partitions`
+/// `Mutex<BTreeMap>` and its fs-floor `ColdSegments<FsBlobStore>`) is the DB-free unit/drill store;
+/// the DURABLE production `MessageStore` is [`pg::PgMessageStore`]. Gated with the fs blob floor it
+/// embeds (SI-014/015/029 flip); chat's own tests reach it via the `test-support`/self dev-dep.
+#[cfg(any(test, feature = "test-support"))]
 pub struct MemHotTier {
     /// The minter for k-sortable message ids (the ordering source — monotone).
     minter: Box<dyn UlidSource>,
     /// The partitioned log: `(tenant, region, conversation)` → ordered `message_id` → row.
     partitions: Mutex<BTreeMap<ConversationId, BTreeMap<MessageId, Message>>>,
     /// The fs-backed cold-segment tier (the 11.2 fs floor); sealed archived ranges live here.
-    cold: ColdSegments,
+    cold: ColdSegments<FsBlobStore>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl MemHotTier {
     /// A fresh hot tier with the deterministic monotone ULID source (the test/floor source) and a
     /// fresh fs-backed cold tier.
@@ -439,7 +455,7 @@ impl MemHotTier {
     }
 
     /// The cold-segment tier (for the seal/restore lifecycle the detach job drives, arch §2.1).
-    pub fn cold(&self) -> &ColdSegments {
+    pub fn cold(&self) -> &ColdSegments<FsBlobStore> {
         &self.cold
     }
 
@@ -494,12 +510,14 @@ impl MemHotTier {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for MemHotTier {
     fn default() -> Self {
         MemHotTier::new()
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl MessageStore for MemHotTier {
     fn append(&self, tx: &mut OutboxTx, msg: NewMessage) -> Result<MessageId> {
         let mut parts = self.lock();
@@ -707,13 +725,24 @@ impl MessageStore for MemHotTier {
 /// pin holds because the BlobStore is per-tenant-keyed (`<tenant>/…`); the crypto-shred-for-erasure
 /// is the per-tenant/per-subject DEK destroy (the GDPR holder's job, CHAT-P6), which operates at the
 /// key layer and is therefore preserved across the backing swap.
-pub struct ColdSegments<B: BlobStore = FsBlobStore> {
+// MR-009b W7.3 — the `= FsBlobStore` default type parameter was REMOVED: the fs floor is now
+// `test-support`-gated, so an always-compiled default naming it would not resolve in a production
+// build. `ColdSegments<B>` stays the always-compiled GENERIC injection seam (production will seal to
+// the injected `S3BlobStore` via `with_blob_store` when the chat cold-detach job is wired); the
+// `ColdSegments<FsBlobStore>` `new`/`Default` floor constructors below are gated with the fs floor.
+// Its only current caller is the `test-support`-gated `MemHotTier` + the p28 parity proof, so the
+// private seal/read wire + backing field are `allow(dead_code)` in a production build (the seam
+// exists ahead of its production wire — the same posture as an un-wired durable backing).
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub struct ColdSegments<B: BlobStore> {
     blob: B,
     /// `conversation` → the content addresses of its sealed segments, oldest-first (the
     /// `(conversation, range → segment)` index, arch §2.1).
     index: Mutex<BTreeMap<ConversationId, Vec<ContentHash>>>,
 }
 
+// MR-009b W7.3 — the fs-floor convenience constructor is `test-support`-gated with `FsBlobStore`.
+#[cfg(any(test, feature = "test-support"))]
 impl ColdSegments<FsBlobStore> {
     /// A fresh cold tier over a new fs-backed `BlobStore` (the DB-free floor backing).
     pub fn new() -> ColdSegments<FsBlobStore> {
@@ -721,6 +750,10 @@ impl ColdSegments<FsBlobStore> {
     }
 }
 
+// MR-009b W7.3 — `seal`/`read` are the cold-tier wire; their only caller is the `test-support`-gated
+// `MemHotTier`, so they are `allow(dead_code)` in a production build (the injection seam awaiting its
+// durable wire). `with_blob_store` is `pub` (the swap entry point) and never dead.
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 impl<B: BlobStore> ColdSegments<B> {
     /// A fresh cold tier over an EXPLICIT [`BlobStore`] backing — the object-store swap entry point
     /// (contract 11.2, CHAT-P28 / P-502). Pass [`myelin_storage::s3blob::S3BlobStore`] to seal cold
@@ -777,6 +810,7 @@ impl<B: BlobStore> ColdSegments<B> {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for ColdSegments<FsBlobStore> {
     fn default() -> Self {
         ColdSegments::new()

@@ -127,6 +127,10 @@ impl<B: BlobStore> ReplicatedBlobStore<B> {
     }
 }
 
+// MR-009b W7.3 — these drill-only helpers are specialised on the `test-support`-gated fs
+// `FsBlobStore` floor, so the impl block is gated with it (the generic `ReplicatedBlobStore<B>`
+// surface above stays always-compiled). Reached only by drills over the fs floor.
+#[cfg(any(test, feature = "test-support"))]
 impl ReplicatedBlobStore<crate::blob::FsBlobStore> {
     /// **Drill-only: corrupt ONLY the PRIMARY object node's copy at `hash`** (object-tier bit-rot on
     /// the primary), leaving the replica copies intact — so the STOR-D7-on-object-backed-packs drill
