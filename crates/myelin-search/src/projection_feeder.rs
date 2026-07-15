@@ -279,7 +279,10 @@ impl FacetCollection {
         self.docs
             .iter()
             .filter(|d| d.facets.get(facet).map(value_key).as_deref() == Some(key.as_str()))
-            .filter(|d| acl.admits(&d.acl_object))
+            // Match `doc_id` OR `acl_object` — the SAME two-field membership the posting-list clause
+            // applies (a sub-artifact doc pins its ACL on the parent acl_object; the doc_id arm still
+            // enforces a doc-id-precise grant/deny).
+            .filter(|d| acl.admits(&d.doc_id, &d.acl_object))
             .map(|d| d.doc_id.clone())
             .collect()
     }
@@ -309,7 +312,7 @@ impl FacetCollection {
                         self.docs
                             .iter()
                             .find(|d| &d.doc_id == *id)
-                            .map(|d| acl.admits(&d.acl_object))
+                            .map(|d| acl.admits(&d.doc_id, &d.acl_object))
                             .unwrap_or(false)
                     })
                     .cloned()

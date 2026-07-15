@@ -246,7 +246,7 @@ fn oltp_reference_shares_the_one_lowering() {
     let acl = board_acl_filter(&set_expr, &viewer(), &Zookie("z@0".into()), None).unwrap();
     for row in &rows {
         assert_eq!(
-            acl.admits(row),
+            acl.admits(row, row),
             oltp.contains(row),
             "the valve's lowered filter admits exactly the OLTP board's visible rows ({row})"
         );
@@ -272,5 +272,5 @@ fn over_budget_decision() {
 #[test]
 fn control_canonical_filter_matches_valve() {
     let canonical = AclFilter::ids([A, B]);
-    assert!(canonical.admits(A) && canonical.admits(B) && !canonical.admits(SECRET));
+    assert!(canonical.admits(A, A) && canonical.admits(B, B) && !canonical.admits(SECRET, SECRET));
 }

@@ -336,7 +336,10 @@ pub fn oltp_board_admits(
     let acl = board_acl_filter(set_expr, subject, zookie, reverse_resolver)?;
     Ok(candidate_rows
         .iter()
-        .filter(|row| acl.admits(row))
+        // A candidate row is a single id (the OLTP board scans by one key); pass it as BOTH doc_id
+        // and acl_object so the two-field membership reduces to the row's membership — byte-identical
+        // to the valve for the SAME set_expr (the parity property).
+        .filter(|row| acl.admits(row, row))
         .cloned()
         .collect())
 }
@@ -477,7 +480,7 @@ mod tests {
         // The SAME lowering produces the SAME AclFilter the valve conjoins (no second interpreter).
         let acl = board_acl_filter(&allow, &subject(), &zk("z@0"), None).unwrap();
         assert_eq!(acl, AclFilter::Ids(vec!["A".into(), "C".into()]));
-        assert!(acl.admits("A") && !acl.admits("B") && acl.admits("C"));
+        assert!(acl.admits("A", "A") && !acl.admits("B", "B") && acl.admits("C", "C"));
     }
 
     /// **A `Difference` board ACL (visible-under-left MINUS reachable-under-right) lowers to the SAME
@@ -497,7 +500,7 @@ mod tests {
             "the confidential B is excluded by the set-difference (the `- confidential` shape)"
         );
         let acl = board_acl_filter(&set_expr, &subject(), &zk("z@0"), None).unwrap();
-        assert!(acl.admits("A") && !acl.admits("B") && acl.admits("C"));
+        assert!(acl.admits("A", "A") && !acl.admits("B", "B") && acl.admits("C", "C"));
     }
 
     /// **A relational board ACL with NO reverse resolver is a loud error (deny-when-unsure, never a

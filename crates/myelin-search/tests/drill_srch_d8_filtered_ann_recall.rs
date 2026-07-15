@@ -72,6 +72,7 @@ fn corpus_and_index(
         corpus.push((format!("d{i}"), e.clone()));
         idx.upsert(VectorRecord {
             doc_id: format!("d{i}"),
+            acl_object: format!("d{i}"),
             embedding: e,
             model_ref: ModelRef("m@1".into()),
         })
