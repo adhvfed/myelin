@@ -756,27 +756,18 @@ const BASELINE: &[(&str, &str, usize)] = &[
     // reset-on-release pool) and replaced the bare pool hatch with `PgStore::health_check()`. The
     // `no-bare-tenant-pool` scanner is now GREEN over the production tree (census SI-005 closed). No
     // named exclusion was needed — a real tenant store does not dodge the lint.
-    // ---- no-permissive-authorizer-in-prod (1) — R2.6 removed the ACTION-level AllowAll ----
+    // ---- no-permissive-authorizer-in-prod (0) — R2.6 removed the ACTION-level AllowAll; the
+    // R2.6-followup fail-closed the OBJECT-seam default → the whole gate is a TRUE ZERO ----
     // R2.6 flipped the edge ACTION gate GREEN: `main.rs`'s `Gateway::builder(.., Arc::new(AllowAll))`
     // is GONE — the production composition root wires the explicit `AuthenticatedActionPolicy`
     // mounted-action allowlist (deny-by-default outside `MOUNTED_EDGE_ACTIONS`), and `AllowAll`
     // itself is a `#[cfg(any(test, feature = "test-support"))]` test double the binary cannot
-    // construct. The R2.6 deliverable — the action-level permissive-authorizer set — is at ZERO.
-    // The single SURVIVING entry is the OBJECT-seam sibling:
-    (
-        // `DurableGitBackend::rooted`'s field DEFAULT `repo_authz: Arc::new(AllowAllRepos)` — a
-        // LATENT permissive object authorizer (production `main.rs` ALWAYS overrides it via
-        // `.with_repo_authorizer(CheckBackedRepoAuthorizer)` since R2.1a, but a composition root
-        // that forgot the override would silently serve an allow-everything git wire). Its removal
-        // (injection-first constructor / test-support-gating the default, the W3b.4 precedent)
-        // belongs to the PARALLEL R2.1 object-authz item that owns `git_durable.rs` — R2.6 does not
-        // touch that file. When R2.1 lands its flip, this entry is DELETED (the ratchet tightens to
-        // a true zero) — and until then any NEW `Arc::new(AllowAll…)` construction anywhere in the
-        // edge production graph still fails this gate loudly.
-        "no-permissive-authorizer-in-prod",
-        "crates/myelin-edge/src/git_durable.rs",
-        117,
-    ),
+    // construct. The former OBJECT-seam survivor — `DurableGitBackend::rooted`'s field DEFAULT
+    // `repo_authz: Arc::new(AllowAllRepos)` — is GONE too: the prod `rooted` constructor now defaults
+    // FAIL-CLOSED (`Arc::new(DenyAllRepos)`), and the only surviving `Arc::new(AllowAllRepos)` moved
+    // into the `#[cfg(any(test, feature = "test-support"))]` `rooted_inmem_for_test` helper (admitted
+    // by the scanner's cfg-region detection). No permissive authorizer is constructed anywhere in the
+    // edge PRODUCTION graph — any NEW `Arc::new(AllowAll…)` in a src/ file fails this gate loudly.
 ];
 
 fn workspace_root() -> PathBuf {
@@ -863,11 +854,13 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
     // un-wired gate). The counts pin the manifest shape.
     assert_eq!(
         BASELINE.len(),
-        2,
-        "the committed baseline has 2 entries — the CI runner-attestation structural floor + the \
-         R2.1-owned `AllowAllRepos` object-seam builder default (git_durable.rs; the R2.6 \
-         ACTION-level permissive set is ZERO — main.rs wires `AuthenticatedActionPolicy`): \
-         the `no-in-memory-durable-store` set is EMPTY (R1 EXIT). (MR-009b Wave 2 flipped the 3 identity spine stores \
+        1,
+        "the committed baseline has 1 entry — the CI runner-attestation structural floor only. \
+         The R2.6(+followup) permissive-authorizer set is a TRUE ZERO: the ACTION-level `AllowAll` \
+         is gone from main.rs (wires `AuthenticatedActionPolicy`) AND the OBJECT-seam \
+         `DurableGitBackend::rooted` default now fail-closes with `DenyAllRepos` (the only \
+         `AllowAllRepos` construction moved into the test-support `rooted_inmem_for_test`). \
+         The `no-in-memory-durable-store` set is EMPTY (R1 EXIT). (MR-009b Wave 2 flipped the 3 identity spine stores \
          GREEN: 17 → 14; Wave 3 flipped the events `DedupLedger` (SI-023) → 14 → 13; Wave 5 flipped \
          the `KmsEngine` (SI-006) → 13 → 12; Wave 6a flipped the 2 identity S2 pseudonym holders → \
          12 → 10; Wave 6b flipped the 2 in-crate storage ERASURE ledgers — `restore_verify.rs:175` \
@@ -959,15 +952,15 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          is GREEN over the production tree."
     );
     assert_eq!(
-        permissive, 1,
-        "1 permissive-authorizer site remains, and it is the OBJECT-seam sibling only: R2.6 \
-         removed the ACTION-level `Arc::new(AllowAll)` from the edge composition root (main.rs \
+        permissive, 0,
+        "0 permissive-authorizer sites — the scanner is a TRUE ZERO over the edge production graph. \
+         R2.6 removed the ACTION-level `Arc::new(AllowAll)` from the edge composition root (main.rs \
          wires the explicit `AuthenticatedActionPolicy` mounted-action allowlist; `AllowAll` is a \
-         test-support-gated double). The surviving entry is `DurableGitBackend::rooted`'s \
-         `repo_authz: Arc::new(AllowAllRepos)` field DEFAULT — always overridden by main.rs since \
-         R2.1a but still a latent permissive construction — owned by the parallel R2.1 \
-         object-authz item (git_durable.rs is its file); its flip deletes the entry and takes \
-         this scanner to a true zero."
+         test-support-gated double), and the R2.6-followup fail-closed the OBJECT-seam \
+         `DurableGitBackend::rooted` default (`Arc::new(DenyAllRepos)`); the only surviving \
+         `Arc::new(AllowAllRepos)` moved into the `#[cfg(any(test, feature = \"test-support\"))]` \
+         `rooted_inmem_for_test` helper (admitted by cfg-region detection). A NEW `Arc::new(AllowAll…)` \
+         in any edge src/ file fails this gate loudly."
     );
     // The census-named anchor sites are present (the prompt's hard requirements).
     let has = |s: &str, p: &str, l: usize| BASELINE.contains(&(s, p, l));
@@ -1006,13 +999,12 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
     // R2.6 anchors: the surviving permissive entry is EXACTLY the R2.1-owned object-seam default,
     // and the flipped action-level main.rs site must NOT be (re)normalized into the manifest.
     assert!(
-        has(
-            "no-permissive-authorizer-in-prod",
-            "crates/myelin-edge/src/git_durable.rs",
-            117
-        ),
-        "anchor git_durable.rs:117 (the `AllowAllRepos` builder default, owned by the parallel \
-         R2.1 object-authz item) must be in the baseline until that item flips it"
+        !BASELINE.iter().any(|(s, p, _)| *s == "no-permissive-authorizer-in-prod"
+            && *p == "crates/myelin-edge/src/git_durable.rs"),
+        "git_durable.rs's `AllowAllRepos` builder default was fail-closed to `DenyAllRepos` \
+         (R2.6-followup) — it must NOT be in the baseline; the permissive-authorizer scanner is a \
+         true zero. A re-added Arc::new(AllowAllRepos) in a src/ file fails the ratchet, not the \
+         manifest."
     );
     assert!(
         !BASELINE.iter().any(|(s, p, _)| *s == "no-permissive-authorizer-in-prod"
