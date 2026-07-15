@@ -267,12 +267,23 @@ impl DurableGitBackend {
     /// injected [`RepoBootstrapGrants`] seam, written BEFORE the directory lands:
     ///
     /// - **grant-first ordering:** the tuple write and the on-disk `git init` are two stores with no
-    ///   shared transaction. A crash between them leaves a dangling grant on a non-existent repo —
-    ///   harmless (every wire path 404s on the absent dir; a retried create proceeds and the
-    ///   duplicate `Add` is idempotent in the edge set). The REVERSE order could leave a repo that
-    ///   exists but is reachable by NO ONE — the residue we refuse.
+    ///   shared transaction. Grant-first (not create-first) avoids the residue we refuse most — a
+    ///   repo that exists but is reachable by NO ONE.
     /// - **fail-closed:** a grant-write failure ABORTS the create loudly (`DurableError::Git` → the
     ///   handler's 500); the repo is NOT created without its owner grant.
+    /// - **compensation on create-failure (R2.1a-followup, defect #7):** if the grant committed but
+    ///   the on-disk `git init` then FAILS, the error arm issues a COMPENSATING
+    ///   [`RepoBootstrapGrants::revoke_creator`] (an exact-tuple `Remove` through the 4.6 write path)
+    ///   so NO orphan `repo:<slug>#admin@<creator>` grant survives on a repo that does not exist. The
+    ///   orphan is the real hole: a DIFFERENT principal could later create the same slug and the
+    ///   original (failed-create) principal would silently still hold admin on it (cross-user
+    ///   access). If the compensation ITSELF fails we surface BOTH errors loudly — a known, logged
+    ///   orphan grant beats a silent one; a reconciler is the durable sweep for that narrow window.
+    /// - **residual window (documented, out of scope):** a process crash BETWEEN the grant-commit and
+    ///   the compensating remove still orphans the grant (no shared transaction across PG + the
+    ///   filesystem, and no in-process compensation can run through a crash). Healing that requires an
+    ///   out-of-band reconciler (grant with no on-disk repo → revoke) — named, not built here. The
+    ///   common failure path (an on-disk create error the process observes) IS cleaned up.
     pub fn create_repo_as(
         &self,
         tenant: &str,
@@ -289,8 +300,23 @@ impl DurableGitBackend {
                 "creator bootstrap grant refused (repo NOT created — fail-closed): {e}"
             ))
         })?;
-        self.store.create_repo(&loc)?;
-        Ok(true)
+        // The grant is now durably committed. If the on-disk create fails, we MUST NOT leave the
+        // grant as an orphan (defect #7 — cross-user access via slug reuse), so compensate before
+        // returning the error.
+        match self.store.create_repo(&loc) {
+            Ok(_repo) => Ok(true),
+            Err(create_err) => match self.bootstrap.revoke_creator(creator, &loc) {
+                // Compensation succeeded: no orphan grant survives — surface the original create error.
+                Ok(()) => Err(create_err),
+                // Compensation FAILED: fail loud with BOTH — a KNOWN orphan grant (logged here) beats
+                // a silent one, and a reconciler is the durable sweep for it.
+                Err(revoke_err) => Err(DurableError::Git(format!(
+                    "repo create FAILED and the compensating bootstrap-grant removal ALSO failed — \
+                     an admin grant on `{slug}` is ORPHANED (reachable by slug reuse; a reconciler \
+                     must revoke it): create error: {create_err}; compensation error: {revoke_err}"
+                ))),
+            },
+        }
     }
 
     // ── repo list (durable read) ──
@@ -1690,4 +1716,180 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         Arc::new(DCommitDiff { be: be.clone() }),
     );
     b
+}
+
+#[cfg(test)]
+mod create_compensation_tests {
+    //! **R2.1a-followup, defect #7 — the create-fail compensation path.** `create_repo_as` writes
+    //! the creator→admin grant BEFORE the on-disk `git init`; if the on-disk create then fails, the
+    //! error arm MUST issue a compensating [`RepoBootstrapGrants::revoke_creator`] so no orphan admin
+    //! grant survives on a repo that does not exist (the cross-user hole: orphan grant + slug reuse
+    //! by another principal). These tests pin the ordering and the compensation with a recording
+    //! bootstrap double, forcing the on-disk create to fail deterministically.
+
+    use super::*;
+    use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
+    use myelin_tenancy::{Region as IdRegion, TenantId};
+    use std::sync::Mutex;
+
+    fn principal(id: &str, tenant: &str) -> Principal {
+        Principal::new(
+            TenantId(tenant.into()),
+            IdRegion("fr-par".into()),
+            PrincipalId(id.into()),
+            PrincipalKind::Service,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        )
+    }
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("myelin-compensation-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    /// A recording bootstrap double: counts grant/revoke calls and records the (creator, slug) each
+    /// was invoked with, so a test asserts the compensating remove fired with the EXACT tuple key.
+    #[derive(Default)]
+    struct RecordingBootstrap {
+        grants: Mutex<Vec<(String, String)>>,
+        revokes: Mutex<Vec<(String, String)>>,
+        /// When set, `revoke_creator` returns Err (the compensation-ALSO-fails path).
+        revoke_fails: bool,
+    }
+
+    impl RepoBootstrapGrants for RecordingBootstrap {
+        fn grant_creator(&self, creator: &Principal, repo: &RepoLoc) -> Result<(), String> {
+            self.grants
+                .lock()
+                .unwrap()
+                .push((creator.principal_id.0.clone(), repo.repo.clone()));
+            Ok(())
+        }
+        fn revoke_creator(&self, creator: &Principal, repo: &RepoLoc) -> Result<(), String> {
+            self.revokes
+                .lock()
+                .unwrap()
+                .push((creator.principal_id.0.clone(), repo.repo.clone()));
+            if self.revoke_fails {
+                Err("simulated compensation transport failure".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Make the on-disk create fail deterministically: plant a regular FILE where the
+    /// `<tenant>/<region>` directory would go, so `create_dir_all(parent)` inside
+    /// `DurableGitStore::create_repo` errors — the grant has already committed at that point.
+    fn block_on_disk_create(root: &std::path::Path, tenant: &str, region: &str) {
+        let tenant_dir = root.join(tenant);
+        std::fs::create_dir_all(&tenant_dir).unwrap();
+        std::fs::write(tenant_dir.join(region), b"not-a-directory").unwrap();
+    }
+
+    /// **The happy path still grants and never compensates** (a successful create leaves the grant).
+    #[test]
+    fn successful_create_grants_and_does_not_revoke() {
+        let root = temp_root("ok");
+        let boot = Arc::new(RecordingBootstrap::default());
+        let be = DurableGitBackend::rooted_inmem_for_test(&root)
+            .with_repo_bootstrap(boot.clone());
+        let creator = principal("svc:creator", "acme");
+
+        let created = be
+            .create_repo_as("acme", "fr-par", "widgets", &creator)
+            .expect("create succeeds");
+        assert!(created);
+        assert_eq!(boot.grants.lock().unwrap().len(), 1, "granted once");
+        assert!(
+            boot.revokes.lock().unwrap().is_empty(),
+            "no compensation on the happy path"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **Defect #7 — an on-disk create failure AFTER the grant committed issues the compensating
+    /// remove** with the EXACT (creator, slug) the grant used, and surfaces the create error.
+    #[test]
+    fn create_failure_after_grant_compensates_the_orphan() {
+        let root = temp_root("fail");
+        block_on_disk_create(&root, "acme", "fr-par");
+        let boot = Arc::new(RecordingBootstrap::default());
+        let be = DurableGitBackend::rooted_inmem_for_test(&root)
+            .with_repo_bootstrap(boot.clone());
+        let creator = principal("svc:creator", "acme");
+
+        let err = be
+            .create_repo_as("acme", "fr-par", "widgets", &creator)
+            .expect_err("the on-disk create must fail");
+        // The grant fired, then the compensating remove fired with the SAME tuple key.
+        assert_eq!(
+            *boot.grants.lock().unwrap(),
+            vec![("svc:creator".to_string(), "widgets".to_string())]
+        );
+        assert_eq!(
+            *boot.revokes.lock().unwrap(),
+            vec![("svc:creator".to_string(), "widgets".to_string())],
+            "the compensating remove fired with the exact grant tuple"
+        );
+        // The surfaced error is the underlying create error (compensation succeeded → not the
+        // orphan-known message).
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("ORPHANED"),
+            "compensation succeeded, so no orphan-known error: {msg}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **When the compensation ITSELF fails, the error names the ORPHANED grant loudly** (a known,
+    /// logged orphan beats a silent one — the reconciler's cue).
+    #[test]
+    fn compensation_failure_surfaces_the_known_orphan_loudly() {
+        let root = temp_root("double-fail");
+        block_on_disk_create(&root, "acme", "fr-par");
+        let boot = Arc::new(RecordingBootstrap {
+            revoke_fails: true,
+            ..Default::default()
+        });
+        let be = DurableGitBackend::rooted_inmem_for_test(&root)
+            .with_repo_bootstrap(boot.clone());
+        let creator = principal("svc:creator", "acme");
+
+        let err = be
+            .create_repo_as("acme", "fr-par", "widgets", &creator)
+            .expect_err("create fails");
+        assert_eq!(boot.revokes.lock().unwrap().len(), 1, "compensation was attempted");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ORPHANED") && msg.contains("compensation error"),
+            "the doubly-failed path names the orphan loudly: {msg}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **An existing repo short-circuits: neither grant nor revoke fires** (the conflict path, not a
+    /// create — no bootstrap tuple churn on a `409`).
+    #[test]
+    fn existing_repo_neither_grants_nor_revokes() {
+        let root = temp_root("exists");
+        let boot = Arc::new(RecordingBootstrap::default());
+        let be = DurableGitBackend::rooted_inmem_for_test(&root)
+            .with_repo_bootstrap(boot.clone());
+        let creator = principal("svc:creator", "acme");
+        assert!(be
+            .create_repo_as("acme", "fr-par", "widgets", &creator)
+            .unwrap());
+        // A second create of the same slug is a conflict (Ok(false)) — no second grant, no revoke.
+        assert!(!be
+            .create_repo_as("acme", "fr-par", "widgets", &creator)
+            .unwrap());
+        assert_eq!(boot.grants.lock().unwrap().len(), 1, "granted only on the first create");
+        assert!(boot.revokes.lock().unwrap().is_empty(), "no compensation");
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
