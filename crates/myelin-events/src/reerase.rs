@@ -64,8 +64,14 @@
 use crate::holder::{BusEventLog, BusHolder, EraseReceipt, InlinePiiShredder, ShredError};
 use crate::outbox::{IdMinter, OutboxStore};
 use crate::{PiiKeyRef, Region, TenantId, Timestamp};
+use std::sync::Arc;
+// `BTreeMap`/`Mutex` are used ONLY by the `test-support`-gated in-memory `Memory` arm (MR-009b
+// W6c-events — the production ledger is the pool-backed `Durable` arm), so both are gated too.
+// `Arc` stays ungated: it wraps the always-compiled `Durable(Arc<dyn DurableBusErasure>)` variant.
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Mutex;
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
 // The PII-free, non-shred-erasable erasure ledger (contract 10.8, CONSUMED)
@@ -88,6 +94,49 @@ pub struct ErasedSubject {
     pub erased_at: Timestamp,
 }
 
+/// **The durable backing seam for the Bus's PII-free erasure ledger (contract 10.8, MR-009b
+/// W6c-events).** A real `bus_erasure_ledger` table over the OLTP pool implements this so the record
+/// that a subject was erased **survives a process restart AND a backup restore** — the whole point of
+/// the non-shred-erasable ledger: an in-memory `BTreeMap` rebuilt EMPTY on every restart would forget
+/// every erasure, so [`BusHolder::re_erase_after_restore`] would replay NOTHING and a restored
+/// pre-erase backup could silently resurrect an erased subject's inline-PII key.
+///
+/// `myelin-events` is a §2.9 DAG **sink** (it cannot name a `PgPool`), so — exactly like
+/// [`crate::DurableDedup`] — the trait is defined HERE (low in the events crate) and the PG impl
+/// (`myelin_storage::events_durable::DurableBusErasureBacking`) lives DOWNSTREAM in storage, wired at
+/// the `EventsRuntime` composition root via [`BusErasureLedger::durable`]. The trait is SYNC (it
+/// matches the ledger's sync `record`/`is_erased`/`entries` call sites); the PG impl bridges to the
+/// async sqlx client internally (`block_in_place` + `block_on`), the same bridge [`crate::DurableDedup`]
+/// uses. Every method carries the explicit `(tenant, region)` partition predicate the ledger is scoped
+/// to (the Bus never crosses a cell — residency-pin, EB-13).
+///
+/// **Fail-direction (the W6a/W6b enforced standard):** a [`DurableBusErasure::record`] write failure is
+/// LOUD — it returns `Err` so [`BusErasureLedger::record`] (whose public signature is infallible) can
+/// PANIC fail-static. An unrecorded erasure is a silent resurrection path (a pre-erase PIT restore
+/// re-hydrates the DEK + log rows and the re-erasure pass would MISS the subject), so it must never be
+/// swallowed as if recorded. The reads ([`DurableBusErasure::is_erased`]/[`DurableBusErasure::entries`])
+/// likewise fail-static LOUD on a store fault: an incomplete read would let a resurrected subject escape
+/// the re-erasure pass (BUS-D8 would report green while a real identity resolves).
+pub trait DurableBusErasure: Send + Sync {
+    /// Idempotent merge-record (10.8): insert `(tenant, region, subject)` with `key_refs`, or — on a
+    /// subject already present — MERGE the distinct key refs and KEEP the first `erased_at`. Returns
+    /// `Err` on a store fault (the caller panics fail-static — an unrecorded erasure is a resurrection
+    /// path across a restore).
+    fn record(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        subject: &str,
+        key_refs: &[PiiKeyRef],
+        erased_at: &Timestamp,
+    ) -> Result<(), String>;
+    /// Whether `(tenant, region, subject)` is recorded erased (fail-static LOUD on a store fault).
+    fn is_erased(&self, tenant: &TenantId, region: &Region, subject: &str) -> bool;
+    /// Every recorded erasure in `(tenant, region)`, subject-sorted — what the re-erasure pass replays
+    /// (fail-static LOUD on a store fault).
+    fn entries(&self, tenant: &TenantId, region: &Region) -> Vec<ErasedSubject>;
+}
+
 /// The Bus's slice of the PII-free erasure ledger (contract 10.8, **CONSUMED**). It durably records
 /// which subjects the Bus erased + which key refs it shredded, so [`BusHolder::re_erase_after_restore`]
 /// can replay them after a restore. PII-free + non-shred-erasable (it must outlive the keys it records
@@ -96,24 +145,66 @@ pub struct ErasedSubject {
 ///
 /// In the real binding the Bus's `record` writes into the GDPR-owned global ledger (10.8) through the
 /// downstream adapter (P-GA-06, the floor); here it is an in-cell `(tenant, region)`-scoped record
-/// (the Bus never crosses a cell — residency-pin, EB-13). The map is keyed by subject so a re-erase of
+/// (the Bus never crosses a cell — residency-pin, EB-13). Records are keyed by subject so a re-erase of
 /// an already-recorded subject MERGES key refs (idempotent record).
+///
+/// **Backend (MR-009b W6c-events, the DedupLedger trait-seam pattern):** [`BusErasureLedger::new`] is
+/// the in-memory test double; [`BusErasureLedger::durable`] binds a PG-backed [`DurableBusErasure`] so
+/// the erasure record survives a process restart AND a backup restore (the non-shred-erasable 10.8
+/// property). The public API is identical on both backends.
 #[derive(Clone)]
 pub struct BusErasureLedger {
     tenant: TenantId,
     region: Region,
-    /// subject discriminator → (the distinct key refs shredded, the first erased-at). A `BTreeMap` so
-    /// the replay order is deterministic (sorted by subject) — the drill artifact is reproducible.
-    entries: Arc<Mutex<BTreeMap<String, ErasedSubject>>>,
+    /// The backing — the always-compiled durable PG `bus_erasure_ledger` table (production) or the
+    /// `test-support`-gated in-memory test double.
+    backend: BusErasureBackend,
+}
+
+/// The Bus erasure-ledger backing (MR-009b W6c-events, the [`crate::DedupLedger`] trait-seam pattern).
+/// `Memory` is the `test-support`-gated in-memory test double (subject → entry behind a shared lock);
+/// `Durable` is the production PG-backed seam the events `serve()` composition root wires. The
+/// `no-in-memory-durable-store` scanner strips the `test-support`-gated `Memory` arm, so the
+/// PRODUCTION-compiled enum presents ONLY the pool-backed `Durable` variant — [`BusErasureLedger`] no
+/// longer holds an in-memory collection in the production graph (the baseline entry is REMOVED).
+#[derive(Clone)]
+enum BusErasureBackend {
+    /// The in-memory test double — MR-009b W6c-events: compiled ONLY under
+    /// `#[cfg(any(test, feature = "test-support"))]`. NOT the production system-of-record. Keyed by
+    /// subject in a `BTreeMap` so the replay order is deterministic (sorted by subject).
+    #[cfg(any(test, feature = "test-support"))]
+    Memory(Arc<Mutex<BTreeMap<String, ErasedSubject>>>),
+    /// The durable PG-backed seam (production, always compiled): a `(tenant, region, subject)` table
+    /// whose erasure records survive a process restart AND a backup restore.
+    Durable(Arc<dyn DurableBusErasure>),
 }
 
 impl BusErasureLedger {
-    /// A fresh ledger for one `(tenant, region)` cell.
+    /// A fresh IN-MEMORY ledger for one `(tenant, region)` cell.
+    /// **MR-009b W6c-events — TEST DOUBLE** (compiled ONLY under
+    /// `#[cfg(any(test, feature = "test-support"))]`). The PRODUCTION constructor is
+    /// [`BusErasureLedger::durable`] (the events `serve()` composition root wires the PG-backed
+    /// `bus_erasure_ledger` table); this `::new` is the DB-free unit-test entry point downstream
+    /// crates reach via the `myelin-events/test-support` dev-dependency.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(tenant: TenantId, region: Region) -> Self {
         BusErasureLedger {
             tenant,
             region,
-            entries: Arc::new(Mutex::new(BTreeMap::new())),
+            backend: BusErasureBackend::Memory(Arc::new(Mutex::new(BTreeMap::new()))),
+        }
+    }
+
+    /// **Bind the ledger to a DURABLE PG backing (MR-009b W6c-events)** so an erasure record survives a
+    /// process restart AND a backup restore (the non-shred-erasable 10.8 property the post-restore
+    /// re-erasure pass replays). The events `serve()` composition root
+    /// (`myelin_storage::events_serve::EventsRuntime`) constructs this with the PG-backed
+    /// `bus_erasure_ledger` table; [`BusErasureLedger::new`] stays the in-memory double.
+    pub fn durable(tenant: TenantId, region: Region, backing: Arc<dyn DurableBusErasure>) -> Self {
+        BusErasureLedger {
+            tenant,
+            region,
+            backend: BusErasureBackend::Durable(backing),
         }
     }
 
@@ -129,52 +220,83 @@ impl BusErasureLedger {
     /// Record that `subject` was erased, shredding `key_refs` (contract 10.8). Idempotent: recording a
     /// subject already present MERGES the key refs (a later erase may have located more keys) and
     /// keeps the FIRST `erased_at`. Called by the DSR orchestrator after a successful
-    /// [`BusHolder::erase`] (or by [`BusHolder::erase_and_record`], which does both atomically).
+    /// [`BusHolder::erase`] (or by [`BusHolder::erase_and_record`], which does both atomically). On the
+    /// `Durable` backend the record is a restart-and-restore-surviving PG row.
     pub fn record(&self, subject: &str, key_refs: &[PiiKeyRef], erased_at: Timestamp) {
-        let mut g = self.entries.lock().expect("erasure ledger poisoned");
-        let entry = g
-            .entry(subject.to_string())
-            .or_insert_with(|| ErasedSubject {
-                subject: subject.to_string(),
-                key_refs: Vec::new(),
-                erased_at: erased_at.clone(),
-            });
-        for k in key_refs {
-            if !entry.key_refs.contains(k) {
-                entry.key_refs.push(k.clone());
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            BusErasureBackend::Memory(entries) => {
+                let mut g = entries.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = g
+                    .entry(subject.to_string())
+                    .or_insert_with(|| ErasedSubject {
+                        subject: subject.to_string(),
+                        key_refs: Vec::new(),
+                        erased_at: erased_at.clone(),
+                    });
+                for k in key_refs {
+                    if !entry.key_refs.contains(k) {
+                        entry.key_refs.push(k.clone());
+                    }
+                }
+                entry.key_refs.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+            BusErasureBackend::Durable(d) => {
+                // FAIL-STATIC (the W6a/W6b enforced standard): the public `record` signature is
+                // infallible, so a durable write failure PANICS LOUDLY rather than returning as if
+                // recorded — an unrecorded erasure is a silent resurrection path across a backup
+                // restore (the re-erasure pass would MISS the subject and report BUS-D8 green while a
+                // real identity resolves).
+                if let Err(e) = d.record(&self.tenant, &self.region, subject, key_refs, &erased_at) {
+                    panic!(
+                        "BUS ERASURE-LEDGER DURABILITY FAILURE (fail-static): the erasure record for \
+                         subject={subject} tenant={} could NOT be persisted — an unrecorded erasure is \
+                         a silent resurrection path across a backup restore (EB-16/BUS-D8); refusing \
+                         to report the erasure as recorded: {e}",
+                        self.tenant.0
+                    );
+                }
             }
         }
-        entry.key_refs.sort_by(|a, b| a.0.cmp(&b.0));
     }
 
     /// Whether the ledger remembers erasing `subject` (the fail-closed read EB-15's `resolve` uses —
     /// "erased" vs "never seen"). True once `record`ed; a restore CANNOT clear it (non-shred-erasable).
     pub fn is_erased(&self, subject: &str) -> bool {
-        self.entries
-            .lock()
-            .expect("erasure ledger poisoned")
-            .contains_key(subject)
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            BusErasureBackend::Memory(entries) => entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(subject),
+            BusErasureBackend::Durable(d) => d.is_erased(&self.tenant, &self.region, subject),
+        }
     }
 
     /// Every recorded erasure, in deterministic (subject-sorted) order — what the re-erasure pass
-    /// replays. PII-free.
+    /// replays. PII-free. On the `Durable` backend this is a `(tenant, region)`-scoped read of the
+    /// `bus_erasure_ledger` table (the records survived the restart/restore).
     pub fn entries(&self) -> Vec<ErasedSubject> {
-        self.entries
-            .lock()
-            .expect("erasure ledger poisoned")
-            .values()
-            .cloned()
-            .collect()
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            BusErasureBackend::Memory(entries) => entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .cloned()
+                .collect(),
+            BusErasureBackend::Durable(d) => d.entries(&self.tenant, &self.region),
+        }
     }
 
     /// How many subjects the ledger has recorded as erased.
     pub fn len(&self) -> usize {
-        self.entries.lock().expect("erasure ledger poisoned").len()
+        self.entries().len()
     }
 
     /// Whether the ledger is empty.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.entries().is_empty()
     }
 }
 

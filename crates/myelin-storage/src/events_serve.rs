@@ -50,9 +50,11 @@ use sqlx::postgres::PgPool;
 use myelin_events::consumer::{Consumer, ConsumerSpec, Delivered, Message, SubscribeError};
 use myelin_events::nats::NatsJetStreamBus;
 use myelin_events::relay::{BusTransport, TransportError};
-use myelin_events::{DedupLedger, DurableDedup, EventHandler};
+use myelin_events::{
+    BusErasureLedger, DedupLedger, DurableBusErasure, DurableDedup, EventHandler, Region, TenantId,
+};
 
-use crate::events_durable::DurableDedupBacking;
+use crate::events_durable::{DurableBusErasureBacking, DurableDedupBacking};
 use crate::pg::PgError;
 use crate::pgrelay::PgRelay;
 use crate::provider::SubstrateProvider;
@@ -105,6 +107,7 @@ pub struct EventsRuntime {
     relay: PgRelay,
     bus: NatsJetStreamBus,
     dedup_backing: DurableDedupBacking,
+    bus_erasure_backing: DurableBusErasureBacking,
 }
 
 impl EventsRuntime {
@@ -152,7 +155,8 @@ impl EventsRuntime {
             rt.clone(),
         )?;
         let relay = PgRelay::new(pool.clone());
-        let dedup_backing = DurableDedupBacking::new(pool.clone(), rt);
+        let dedup_backing = DurableDedupBacking::new(pool.clone(), rt.clone());
+        let bus_erasure_backing = DurableBusErasureBacking::new(pool.clone(), rt);
         Ok(EventsRuntime {
             pool,
             region: region.to_string(),
@@ -161,6 +165,7 @@ impl EventsRuntime {
             relay,
             bus,
             dedup_backing,
+            bus_erasure_backing,
         })
     }
 
@@ -180,6 +185,21 @@ impl EventsRuntime {
     /// a restart) share the dedup state (it is in PG, not a per-process `HashSet`).
     pub fn dedup_ledger(&self) -> DedupLedger {
         DedupLedger::durable(Arc::new(self.dedup_backing.clone()) as Arc<dyn DurableDedup>)
+    }
+
+    /// **The DURABLE Bus erasure ledger (contract 10.8, W6c-events)** — bound to the PG
+    /// `bus_erasure_ledger` table so an erasure record survives a process restart AND a backup restore
+    /// (the non-shred-erasable property `BusHolder::re_erase_after_restore` replays). Scoped to the
+    /// VERIFIED `tenant` + the runtime's region pin (the Bus never crosses a cell — residency-pin).
+    /// Two `EventsRuntime`s over the same pool (e.g. across a restart) share the ledger state (it is in
+    /// PG, not a per-process `BTreeMap`), so a restored pre-erase backup cannot silently resurrect a
+    /// subject the ledger remembers erasing.
+    pub fn bus_erasure_ledger(&self, tenant: TenantId) -> BusErasureLedger {
+        BusErasureLedger::durable(
+            tenant,
+            Region(self.region.clone()),
+            Arc::new(self.bus_erasure_backing.clone()) as Arc<dyn DurableBusErasure>,
+        )
     }
 
     /// Build an idempotent [`Consumer`] through the sanctioned [`myelin_events::consume`] entry-point

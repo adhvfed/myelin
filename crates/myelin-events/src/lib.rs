@@ -470,7 +470,7 @@ pub use holder::{
 /// cross-seam). [`reerase::BusErasureLedger`] is the Bus's PII-free, non-shred-erasable slice of the
 /// erasure ledger; [`holder::BusHolder::re_erase_after_restore`] replays it after a restore so the
 /// key STAYS destroyed across a restore ([`reerase::ReErasureReceipt`] proves 0 resurrected).
-pub use reerase::{BusErasureLedger, ErasedSubject, ReErasureReceipt};
+pub use reerase::{BusErasureLedger, DurableBusErasure, ErasedSubject, ReErasureReceipt};
 
 /// The reindex-from-source seam + the `*.snapshot` event schema (contract 2.6 OWNED, EB-22 / P-142).
 /// [`reindex::reindex`] is the §5.6 `events::reindex(scope)` surface: ask the OWNER of a
