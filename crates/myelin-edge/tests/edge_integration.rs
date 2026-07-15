@@ -22,7 +22,7 @@ use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use myelin_edge::{
-    serve_edge, sse_scope_for_tenant, AllowAll, Gateway, Method, SseEvent, WhoamiHandler,
+    serve_edge, sse_scope_for_resource, sse_scope_for_tenant, AllowAll, Gateway, Method, SseEvent, WhoamiHandler,
 };
 use myelin_events::Timestamp;
 use myelin_identity::{
@@ -95,6 +95,14 @@ fn build_gateway() -> (Arc<Gateway>, CellTokenAuthority, RevocationStore) {
                 Arc::new(WhoamiHandler),
             )
             .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge")
+            // R2.2: an OBJECT-ADDRESSED stream registers through the scoped path (the tenant-coarse
+            // sse_route refuses an object-addressing pattern at composition time).
+            .sse_route_scoped(
+                "/v1/t/{tenant}/repos/{repo}/events",
+                "git.repo.events.subscribe",
+                "git",
+                "repo",
+            )
             .build(),
     );
     (gateway, cell, revocations)
@@ -336,4 +344,60 @@ async fn sse_endpoint_streams_a_frame() {
     let frame = got.expect("an SSE frame should stream to the client");
     assert!(frame.contains("event: ping"), "the SSE frame carries the event type: {frame}");
     assert!(frame.contains("data: {\"hello\":true}"), "the SSE frame carries the data: {frame}");
+}
+
+/// (g) R2.2: an OBJECT-ADDRESSED SSE route subscribes at the tenant+resource scope — NOT the
+/// tenant-coarse one. A frame published tenant-coarse (or to a DIFFERENT object) never reaches the
+/// per-object subscriber; the frame published to the derived `(tenant, repo)` scope does. This is
+/// the live proof of the registration contract: the subscription key is the object's, so a
+/// per-object stream cannot leak other objects' frames.
+#[tokio::test]
+async fn scoped_sse_route_isolates_per_object() {
+    let (gw, cell, _rev) = build_gateway();
+    let token = mint(&cell, TENANT, "jti-sse-scoped", now() + 3600);
+    let h = bearer(&token);
+    let addr = spawn(gw.clone()).await;
+
+    // Open the per-object stream for repo `widgets`.
+    let resp = open(
+        addr,
+        "GET",
+        &format!("/v1/t/{TENANT}/repos/widgets/events"),
+        &hdr(&h),
+        vec![],
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let mut body = resp.into_body();
+
+    let coarse = sse_scope_for_tenant(TENANT);
+    let other = sse_scope_for_resource(TENANT, "repo", "secrets");
+    let widgets = sse_scope_for_resource(TENANT, "repo", "widgets");
+    let mut got = None;
+    for _ in 0..20 {
+        // Frames the widgets subscriber must NEVER receive: the tenant-coarse scope and another
+        // object's scope (different (stream, scope) channels entirely).
+        gw.sse_hub().broadcast("git", &coarse, SseEvent::typed("leak", "{\"coarse\":true}"));
+        gw.sse_hub().broadcast("git", &other, SseEvent::typed("leak", "{\"other\":true}"));
+        // The frame it MUST receive: its own derived (tenant, repo) scope.
+        gw.sse_hub().broadcast("git", &widgets, SseEvent::typed("push", "{\"repo\":\"widgets\"}"));
+        match tokio::time::timeout(Duration::from_millis(100), body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    got = Some(String::from_utf8_lossy(data).to_string());
+                    break;
+                }
+            }
+            _ => continue,
+        }
+    }
+    let frame = got.expect("the per-object SSE frame should stream to the client");
+    assert!(
+        frame.contains("data: {\"repo\":\"widgets\"}"),
+        "the subscriber receives ITS object's frame: {frame}"
+    );
+    assert!(
+        !frame.contains("coarse") && !frame.contains("other"),
+        "no tenant-coarse / foreign-object frame leaked into the per-object stream: {frame}"
+    );
 }
