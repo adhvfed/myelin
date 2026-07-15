@@ -107,6 +107,20 @@ BudgetGate durable redesign (queued as its own wave, "W6b2"). `reserve_settle.rs
 SUPPLEMENTED. Residuals: Box::leak unit-label rebuild (bounded, unwired); cost-op infra faults
 panic (no error variant); region from provider pin (W7).
 
+**W6c-events DONE (2026-07-15, `ac4e923`): scanner 7→6.** BusErasureLedger durable via the
+DAG-sink trait seam (`DurableBusErasure` in events, `DurableBusErasureBacking` + `bus_erasure_ledger`
+0053 in storage, wired at EventsRuntime). Verifier HOLD→fixed→sound: the no-conflict INSERT arm
+stored key_refs verbatim (unsorted+dup ⇒ memory-arm divergence + receipt double-count) — now
+normalized in Rust pre-bind + adversarial regression input. Residuals: **boot-wiring wave must
+apply migrations 0051–0053** (dedup's table IS boot-applied, these are not — asymmetry flagged);
+key refs embed subject discriminators in a non-erasable table (opaque-id grammar concern, W6a).
+
+**P-S12 minter floor — blast radius note (W3b.3 discovery):** the default `MonotonicMinter` resets
+per store ⇒ two durable TupleStores mint colliding `event_id`s and `co_commit_in_tx`'s
+`ON CONFLICT (event_id) DO NOTHING` silently DROPS the later event. Pre-existing named floor (the
+production ULID source), but the W3b track makes the shared PG outbox the real emit path — the
+ULID/unique-minter fix should land before or with W3b.4 (composition roots).
+
 **W3b.2 DONE (2026-07-15, merge `20fe480`): scanner-neutral.** `PgOutboxBacking` over the frozen
 outbox table; commit_staged_atomic (dup-event_id rejects whole commit = memory parity; one seq
 discipline with co_commit_in_tx); drain_once_dead_letter (claim locks held across publishes; per-row
