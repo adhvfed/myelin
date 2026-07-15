@@ -643,6 +643,127 @@ impl OutboxTx for OutboxTransaction {
     }
 }
 
+/// Crockford's base32 alphabet (excludes I, L, O, U) — the canonical ULID rendering alphabet.
+/// Rendering a `u128` as 26 fixed-width Crockford digits preserves order: a numerically greater
+/// value renders to a lexically greater string (the `IdMinter` monotonicity property).
+const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// **The production ULID source — the P-S12 stand-in (MR-009b W3b.4).** A real ULID: a 48-bit
+/// wall-clock millisecond timestamp + 80 bits of per-process randomness, rendered as 26
+/// Crockford-base32 characters, with a **monotonic guard** within the process (two mints in the
+/// same millisecond never violate lexical order — the second bumps the previous value instead of
+/// re-rolling). Implements the SAME [`IdMinter`] trait the store was built against, exactly as the
+/// module-level "FLOOR — the ULID source" note promised: the store/relay do not change.
+///
+/// **Why composition roots MUST wire this (the W3b.3 named condition, P-S12 minter floor):** the
+/// deterministic [`MonotonicMinter`] resets its counter to `0` per instance, so two production
+/// roots (two stores, two processes, or one process across a restart) mint COLLIDING `event_id`s —
+/// and the durable co-commit path's `ON CONFLICT (event_id) DO NOTHING`
+/// (`PgRelay::co_commit_in_tx`) then SILENTLY DROPS the later event (probe-proven in W3b.3).
+/// This source seeds its 80 random bits from OS entropy (`RandomState`) + the process id + the
+/// nanosecond clock, so ids are unique across stores, processes, and restarts — the collision
+/// path is closed. [`MonotonicMinter`] remains the deterministic TEST source (seeded, no
+/// wall-clock flakiness); this is the source every PRODUCTION root injects.
+///
+/// **Stand-in honesty:** this is the P-S12 stand-in, not a distributed-uniqueness proof — the
+/// 80-bit randomness gives the standard ULID collision bound (~2^40 mints per ms for a 50%
+/// birthday collision), which is the accepted production posture for `Nats-Msg-Id`-class dedup
+/// keys. A shared-entropy/coordinated scheme is deliberately NOT built (no measured need).
+pub struct UlidMinter {
+    /// The last minted 128-bit value — the monotonic-within-process guard (lexical order ==
+    /// mint order even under a same-ms burst or a clock step backwards).
+    last: Mutex<u128>,
+    /// The per-process random seed: OS entropy (`RandomState`'s per-instance random keys) mixed
+    /// with the process id, so two processes started in the same nanosecond still diverge.
+    seed: u64,
+    /// A per-mint disambiguator mixed into the random bits (concurrent mints diverge pre-guard).
+    bump: AtomicU64,
+}
+
+impl Default for UlidMinter {
+    fn default() -> Self {
+        UlidMinter::new()
+    }
+}
+
+impl UlidMinter {
+    /// A fresh production ULID source seeded from OS entropy + the process id + the clock.
+    pub fn new() -> UlidMinter {
+        use std::hash::{BuildHasher, Hasher};
+        // `RandomState` carries genuinely random per-instance keys from the OS — the workspace's
+        // no-new-dependency entropy source (no `rand` crate edge added to the events sink).
+        let os_entropy = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        UlidMinter {
+            last: Mutex::new(0),
+            seed: os_entropy ^ (u64::from(std::process::id()).rotate_left(32)) ^ nanos,
+            bump: AtomicU64::new(0),
+        }
+    }
+
+    fn now_ms() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    }
+
+    /// 80 pseudo-random bits for the ULID tail: a splitmix64-style avalanche over the per-process
+    /// seed, the per-mint counter, and the nanosecond clock. Randomness only has to make ids
+    /// unlikely-to-collide ACROSS processes within a millisecond; ORDER comes from the timestamp
+    /// + the monotonic guard, never from these bits.
+    fn rand80(&self) -> u128 {
+        fn splitmix64(mut z: u64) -> u64 {
+            z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        let n = self.bump.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let hi = splitmix64(self.seed ^ n ^ nanos);
+        let lo = splitmix64(hi ^ self.seed.rotate_left(17));
+        (u128::from(hi) << 64 | u128::from(lo)) & ((1u128 << 80) - 1)
+    }
+
+    /// Render a 128-bit ULID value as its canonical 26-char Crockford-base32 string (fixed width,
+    /// most-significant first — lexical order == numeric order).
+    fn render(value: u128) -> String {
+        let mut buf = [0u8; 26];
+        let mut v = value;
+        for slot in buf.iter_mut().rev() {
+            *slot = CROCKFORD[(v & 0x1f) as usize];
+            v >>= 5;
+        }
+        String::from_utf8(buf.to_vec()).expect("crockford bytes are ASCII")
+    }
+}
+
+impl IdMinter for UlidMinter {
+    fn mint(&self) -> Ulid {
+        let candidate = (Self::now_ms() << 80) | self.rand80();
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        // The monotonic guard: never return a value <= the last one (same-ms burst or a clock
+        // that stepped backwards bumps the previous value by 1 — order preserved, id still unique
+        // within this process; cross-process uniqueness rides the random tail).
+        let value = if candidate > *last {
+            candidate
+        } else {
+            last.wrapping_add(1)
+        };
+        *last = value;
+        Ulid(Self::render(value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,6 +1043,53 @@ mod tests {
         );
     }
 
+    /// **The production `UlidMinter` (P-S12 stand-in) satisfies the W3b.3 named condition:**
+    /// two independent minters (modeling two composition roots / two processes / a restart) mint
+    /// DISJOINT ids — unlike two `MonotonicMinter`s, which both start at `01J…0` and collide
+    /// (the collision the durable `ON CONFLICT (event_id) DO NOTHING` silently drops).
+    #[test]
+    fn ulid_minter_two_instances_mint_disjoint_ids() {
+        // First, pin the hazard this closes: two default MonotonicMinters DO collide.
+        assert_eq!(
+            MonotonicMinter::new().mint(),
+            MonotonicMinter::new().mint(),
+            "the deterministic test minter resets per instance (the named hazard)"
+        );
+        let a = UlidMinter::new();
+        let b = UlidMinter::new();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1_000 {
+            assert!(seen.insert(a.mint()), "minter A repeated an id");
+            assert!(
+                seen.insert(b.mint()),
+                "minter B collided with A or repeated"
+            );
+        }
+    }
+
+    /// The production `UlidMinter` is monotonic within the process (lexical order == mint order,
+    /// the `IdMinter` contract) even under a same-millisecond burst, and renders the canonical
+    /// 26-char Crockford-base32 ULID form.
+    #[test]
+    fn ulid_minter_is_monotonic_and_canonical_within_process() {
+        let m = UlidMinter::new();
+        let mut prev = m.mint();
+        assert_eq!(prev.0.len(), 26, "canonical 26-char ULID rendering");
+        for _ in 0..1_000 {
+            let next = m.mint();
+            assert_eq!(next.0.len(), 26);
+            assert!(
+                next.0.bytes().all(|b| CROCKFORD.contains(&b)),
+                "canonical Crockford alphabet only"
+            );
+            assert!(
+                prev < next,
+                "same-ms burst must stay monotonic: {prev:?} < {next:?}"
+            );
+            prev = next;
+        }
+    }
+
     /// The minted id is a stable ULID stamped onto the envelope (the broker-side dedup key).
     /// Monotonic minting → lexical order == mint order (ULID time-ordering).
     #[test]
@@ -981,7 +1149,10 @@ mod tests {
                 .map(|r| r.envelope.recorded_at.clone())
         }
         fn committed_count(&self) -> usize {
-            self.committed.lock().unwrap_or_else(|e| e.into_inner()).len()
+            self.committed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
         }
         fn row(&self, id: &EventId) -> Option<OutboxRow> {
             self.committed
@@ -1000,11 +1171,7 @@ mod tests {
         fn dead_letters(&self) -> Vec<OutboxRow> {
             Vec::new()
         }
-        fn drain_once(
-            &self,
-            _transport: &dyn BusTransport,
-            batch: usize,
-        ) -> Result<DrainReport> {
+        fn drain_once(&self, _transport: &dyn BusTransport, batch: usize) -> Result<DrainReport> {
             self.drain_calls
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1042,7 +1209,11 @@ mod tests {
             .unwrap();
         assert_eq!(tx.staged_len(), 2, "two rows buffered");
         // emit-iff-committed: nothing reaches the backing before commit.
-        assert_eq!(backing.committed_count(), 0, "an open tx wrote nothing durable");
+        assert_eq!(
+            backing.committed_count(),
+            0,
+            "an open tx wrote nothing durable"
+        );
 
         tx.commit().unwrap();
         // the staged rows routed through `commit_staged` (one atomic call, both rows).
@@ -1112,7 +1283,11 @@ mod tests {
         });
         let report = relay.drain_once();
         assert_eq!(report.published, 2, "drain routed to backing.drain_once");
-        assert_eq!(store.outbox_depth(), 0, "the backing marked the rows published");
+        assert_eq!(
+            store.outbox_depth(),
+            0,
+            "the backing marked the rows published"
+        );
         assert_eq!(
             backing
                 .drain_calls

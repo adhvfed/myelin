@@ -508,7 +508,8 @@ impl PrincipalStore {
                     kind: serde_json::to_string(&row.kind).expect("principal.kind serializes"),
                     data_role: serde_json::to_string(&row.data_role)
                         .expect("principal.data_role serializes"),
-                    status: serde_json::to_string(&row.status).expect("principal.status serializes"),
+                    status: serde_json::to_string(&row.status)
+                        .expect("principal.status serializes"),
                     profile: blob,
                 };
                 pg.block(pg.backing.put_principal(&scope.tenant().0, drow))
@@ -785,8 +786,10 @@ impl PrincipalStore {
             }
             PrincipalBackend::Pg(pg) => pg
                 .block(
-                    pg.backing
-                        .resolve_credential(&scope.tenant().0, &Self::link_key(scheme, subject_key)),
+                    pg.backing.resolve_credential(
+                        &scope.tenant().0,
+                        &Self::link_key(scheme, subject_key),
+                    ),
                 )
                 .ok()
                 .flatten()
@@ -884,7 +887,8 @@ impl PrincipalStore {
             principal_id: PrincipalId(drow.principal_id),
             kind: serde_json::from_str(&drow.kind).expect("principal.kind round-trips"),
             profile_ref,
-            data_role: serde_json::from_str(&drow.data_role).expect("principal.data_role round-trips"),
+            data_role: serde_json::from_str(&drow.data_role)
+                .expect("principal.data_role round-trips"),
             status: serde_json::from_str(&drow.status).expect("principal.status round-trips"),
         }
     }

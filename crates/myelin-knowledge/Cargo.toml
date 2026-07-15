@@ -123,17 +123,17 @@ serde_json = { workspace = true }
 # DB-free build — NOT an `integration`-gated network backend.
 yrs = { workspace = true }
 # KN-P06: the REAL Postgres outbox co-commit proof behind the `integration` feature
-# (tests/integration_kn_d7_outbox.rs). The OPTIONAL sqlx + tokio deps are pulled ONLY by
+# (tests/integration_kn_d7_outbox.rs). The OPTIONAL sqlx dep is pulled ONLY by
 # `--features integration`; the default `cargo build --workspace` / `cargo test --workspace` stay
 # DB-free. EXTERNAL crates only — no new myelin edge; the test reads DATABASE_URL inline.
 sqlx = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
-# KN-P31: the REAL object-store BlobStore swap parity proof behind the `integration` feature
-# (tests/integration_kn_p31_blob_swap.rs). The OPTIONAL myelin-config (the dev<->prod config swap
-# seam supplying the S3 endpoint) is pulled ONLY by `--features integration`; the default DB-free
-# build never sees it. The live `S3BlobStore` itself comes from `myelin-storage/integration` (the
-# feature below turns it on transitively), so no new aws-sdk edge is added to this crate.
-myelin-config = { path = "../myelin-config", optional = true }
+# MR-009b W3b.4 — the DURABLE composition root in `src/main.rs` (SubstrateProvider from env →
+# foundation migrations → `OutboxStore::durable(PgOutboxBacking)`) is the ALWAYS-COMPILED default
+# (the Wave-2 identity-service posture), so `tokio` (the multi-thread runtime the sync→async
+# bridge requires) + `myelin-config` (the env-first durable config, fail-loud) are now regular
+# deps. Build stays DB-free: connecting happens at RUNTIME, never at build.
+tokio = { workspace = true }
+myelin-config = { path = "../myelin-config" }
 
 [features]
 default = []
@@ -168,10 +168,10 @@ default = []
 # backing change behind the `BlobStore` trait (the compactor is already generic over `B: BlobStore`).
 # tests/integration_kn_p31_blob_swap.rs. Registered red-until-proven; flips green only with the real
 # artifact. Turns on `myelin-storage/integration` so the live `s3blob` module compiles.
+# (tokio + myelin-config are regular deps since W3b.4 — the durable main.rs needs them; the
+# feature now pulls the raw-sqlx test harness + the live storage backends.)
 integration = [
     "dep:sqlx",
-    "dep:tokio",
-    "dep:myelin-config",
     "myelin-storage/integration",
 ]
 

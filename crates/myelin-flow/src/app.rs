@@ -38,6 +38,7 @@
 //! preserved — a subsystem service is the graph's terminal consumer).
 
 use crate::migrations::migrations as flow_migrations;
+use myelin_events::{InProcessBus, OutboxStore};
 use myelin_substrate::{
     boot, serve, AppSpec, Config, CriticalDependencies, HotTables, InternalRpc, Migrations,
     OutboxSpec, PublicRoutes, ServeError, ServeHandle, StoreManifest,
@@ -74,7 +75,13 @@ fn flow_service_migrations() -> Migrations {
 /// - holder auto-registration: every opened store auto-registers as a `PersonalDataHolder` (§3.4,
 ///   GD-3) through the harness's one door; the references-not-payloads flow store-holder over
 ///   `workflow_run`/`wf_history`/`wf_signal` lands at P-FLOW-03 (P-201).
-pub fn flow_app_spec(config: Config) -> AppSpec {
+///
+/// **The outbox is INJECTED (MR-009b W3b.4 — the composition root owns durability):** the
+/// production `main.rs` constructs `OutboxStore::durable(PgOutboxBacking)` over the MR-022
+/// `SubstrateProvider` pool (foundation migrations applied, fail-loud on missing durable config);
+/// a test/drill passes the in-memory `OutboxStore::new()` double. This builder constructs NO
+/// store of its own — the W3 dedup-injection precedent applied to the outbox.
+pub fn flow_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
         config,
@@ -97,10 +104,10 @@ pub fn flow_app_spec(config: Config) -> AppSpec {
         // workflow_run/wf_history/wf_signal lands at P-FLOW-03 (P-201).
         holders: AppSpec::auto(),
         stores: StoreManifest::new(),
-        // The transactional outbox relay (BUS-2 — the ONLY emit path; §10 no second publish path).
-        // The in-process broker fake is the M0 floor; EB-04's JetStream-class adapter is the real
-        // transport (a config swap, dev<->prod, never a code change).
-        outbox: OutboxSpec::default(),
+        // The transactional outbox relay (BUS-2 — the ONLY emit path; §10 no second publish path)
+        // over the INJECTED store (W3b.4). The in-process broker fake stays the default TRANSPORT
+        // (durability lives in the store); EB-04's JetStream-class adapter is a config swap.
+        outbox: OutboxSpec::new(outbox, InProcessBus::new()),
         // The engine declares no further critical downstream at the shell; the OLTP store is implicit.
         critical: CriticalDependencies::default(),
     }
@@ -113,15 +120,15 @@ pub fn flow_app_spec(config: Config) -> AppSpec {
 /// drain deterministically.
 ///
 /// Returns `Err` (the non-zero exit) on a failed boot (§3.1) — loud, never a silent success.
-pub fn boot_flow(config: Config) -> Result<ServeHandle, ServeError> {
-    boot(flow_app_spec(config))
+pub fn boot_flow(config: Config, outbox: OutboxStore) -> Result<ServeHandle, ServeError> {
+    boot(flow_app_spec(config, outbox))
 }
 
 /// **Run the myelin-flow service to completion under the harness** (boot → migrate → relay →
 /// consumers → three ports → graceful drain). The `myelin-flow` binary calls this; a failed boot /
 /// incomplete drain returns `Err` (the non-zero process exit, §3.1).
-pub fn run_flow(config: Config) -> Result<(), ServeError> {
-    serve(flow_app_spec(config))
+pub fn run_flow(config: Config, outbox: OutboxStore) -> Result<(), ServeError> {
+    serve(flow_app_spec(config, outbox))
 }
 
 /// **Build the myelin-flow AppSpec WITH the replay/lease engine wired into the consumer seam
@@ -143,6 +150,7 @@ pub fn run_flow(config: Config) -> Result<(), ServeError> {
 /// registry (§3.6, populated by `DurableExecutor`) lands at **P-FLOW-06**.
 pub fn flow_app_spec_with_engine(
     config: Config,
+    outbox: OutboxStore,
     minter: std::sync::Arc<dyn myelin_events::IdMinter>,
     ctx_base: myelin_events::EmitContextBase,
     partition: i16,
@@ -153,10 +161,11 @@ pub fn flow_app_spec_with_engine(
     crate::engine::FlowDispatcher,
     crate::timer::TimerWheel,
 ) {
-    use myelin_events::{InProcessBus, OutboxStore};
-    // The ONE outbox the engine drives co-commit into AND the relay drains (BUS-2): supply it to the
-    // OutboxSpec so the drive → relay → bus path is the sanctioned one (no second store).
-    let outbox = OutboxStore::new();
+    // The ONE outbox the engine drives co-commit into AND the relay drains (BUS-2) is INJECTED
+    // (MR-009b W3b.4): the production root passes a durable-backed store (and a UNIQUE id source —
+    // never the per-store-resetting default `MonotonicMinter`, whose colliding event_ids the durable
+    // `ON CONFLICT (event_id) DO NOTHING` silently drops; `myelin_events::UlidMinter` is the
+    // production source); a test passes the in-memory double + a seeded deterministic minter.
     let runs = crate::engine::RunStore::new();
     let journal = crate::wfctx::WfJournal::new();
     let telemetry = crate::engine::FlowTelemetry::new();
@@ -184,10 +193,9 @@ pub fn flow_app_spec_with_engine(
     let wheel = crate::timer::TimerWheel::new(
         timers, journal, runs, telemetry, partition, /* batch */ 4_096,
     );
-    let mut spec = flow_app_spec(config);
-    // The engine drives co-commit into `outbox`; the relay must drain THAT store (the sanctioned
-    // emit → relay → bus path), not a fresh default one.
-    spec.outbox = OutboxSpec::new(outbox, InProcessBus::new());
+    // The engine drives co-commit into `outbox`; the relay drains the SAME injected store (the
+    // sanctioned emit → relay → bus path — one store, one truth).
+    let spec = flow_app_spec(config, outbox);
     (spec, dispatcher, wheel)
 }
 
@@ -241,7 +249,8 @@ mod tests {
     /// metrics-health surfaces are all opened (3/3 ports up); no hand-rolled main.
     #[test]
     fn flow_shell_boots_and_three_ports_bind() {
-        let handle = boot_flow(Config::default()).expect("the myelin-flow shell boots");
+        let handle =
+            boot_flow(Config::default(), OutboxStore::new()).expect("the myelin-flow shell boots");
         assert_eq!(handle.name(), SERVICE_NAME);
         assert_eq!(
             handle.surfaces(),
@@ -291,7 +300,7 @@ mod tests {
     /// metrics-health port reports ready only once migrate + relay are live.
     #[test]
     fn booted_instance_is_ready_after_migrate_complete() {
-        let handle = boot_flow(Config::default()).expect("boot");
+        let handle = boot_flow(Config::default(), OutboxStore::new()).expect("boot");
         assert_eq!(
             handle.metrics_health().startup(),
             Startup::Complete,
@@ -309,7 +318,7 @@ mod tests {
     /// the signal/timer consumers are the P-FLOW-04..05/09/13 floor — this shell has NO executor).
     #[test]
     fn shell_wires_the_six_table_migration_set_and_empty_consumer_seam() {
-        let spec = flow_app_spec(Config::default());
+        let spec = flow_app_spec(Config::default(), OutboxStore::new());
         assert_eq!(spec.name, SERVICE_NAME);
         assert!(
             spec.consumers.is_empty(),
@@ -343,7 +352,7 @@ mod tests {
             .expect("the sig.acme. whitelist binds through the sanctioned consume (never `*`)");
 
         // wire it into the slot — the P-FLOW-02 empty seam is now filled for the signal leg.
-        let mut spec = flow_app_spec(Config::default());
+        let mut spec = flow_app_spec(Config::default(), OutboxStore::new());
         spec.consumers = vec![reg];
         assert_eq!(
             spec.consumers.len(),
@@ -358,7 +367,7 @@ mod tests {
     #[test]
     fn flow_oltp_store_auto_registers_as_a_holder_at_boot() {
         use myelin_substrate::StoreKind;
-        let handle = boot_flow(Config::default()).expect("boot");
+        let handle = boot_flow(Config::default(), OutboxStore::new()).expect("boot");
         assert!(
             handle
                 .holder_registry()
@@ -380,7 +389,7 @@ mod tests {
     fn boot_registered_flow_store_classifies_and_completeness_is_green() {
         use crate::holder::{flow_history_holder, flow_store_classifier};
         use myelin_substrate::{assert_holder_completeness, Holder};
-        let handle = boot_flow(Config::default()).expect("boot");
+        let handle = boot_flow(Config::default(), OutboxStore::new()).expect("boot");
         // the auto-registered boot store classifies to H8 (no orphan).
         assert_eq!(flow_history_holder(), Some(Holder::H8EventBus));
         // the holder-completeness assertion is green over the boot registry + the flow classifier.
@@ -400,7 +409,7 @@ mod tests {
     #[test]
     fn run_flow_boots_serves_and_drains_cleanly() {
         assert_eq!(
-            run_flow(Config::default()),
+            run_flow(Config::default(), OutboxStore::new()),
             Ok(()),
             "the flow shell boots → migrates → relays → drains cleanly (depth 0)"
         );
@@ -411,7 +420,7 @@ mod tests {
     /// fail-fast property the bootable shell must exhibit.
     #[test]
     fn failed_boot_returns_non_zero() {
-        let r = run_flow(Config("BAD_POOL".into()));
+        let r = run_flow(Config("BAD_POOL".into()), OutboxStore::new());
         assert!(r.is_err(), "a failed boot must return non-zero (Err)");
         assert!(
             r.unwrap_err().0.contains("fail-fast"),
@@ -451,6 +460,7 @@ mod tests {
         };
         let (spec, mut dispatcher, _wheel) = flow_app_spec_with_engine(
             Config::default(),
+            OutboxStore::new(),
             Arc::new(MonotonicMinter::new()),
             ctx_base,
             0,
@@ -531,6 +541,7 @@ mod tests {
         };
         let (_spec, mut dispatcher, wheel) = flow_app_spec_with_engine(
             Config::default(),
+            OutboxStore::new(),
             Arc::new(MonotonicMinter::new()),
             ctx_base,
             0,
@@ -626,7 +637,7 @@ mod tests {
     /// committed is left unprocessed.
     #[test]
     fn graceful_drain_leaves_outbox_depth_zero() {
-        let handle = boot_flow(Config::default()).expect("boot");
+        let handle = boot_flow(Config::default(), OutboxStore::new()).expect("boot");
         handle.signal_drain();
         assert!(handle.is_draining(), "intake is stopped");
         // one tick finishes in-flight; the telemetry snapshot reports depth 0.

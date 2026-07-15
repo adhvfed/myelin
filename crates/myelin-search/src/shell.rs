@@ -33,6 +33,7 @@
 //! indexer, no query path** here. `engine.search` stays private by construction (the SRCH-P01 lint
 //! holds — there is no public search path in this crate to add a bypass to).
 
+use myelin_events::{InProcessBus, OutboxStore};
 use myelin_substrate::{
     boot, serve, AppSpec, Config, CriticalDependencies, DeclaredStore, HotTables, InternalRpc,
     Migration, Migrations, OutboxSpec, PublicRoutes, ServeError, ServeHandle, StoreKind,
@@ -110,7 +111,13 @@ fn search_critical() -> CriticalDependencies {
 /// as the H7 holder); `identity` is declared critical. No consumers are registered here — the
 /// indexer (the `evt.*` consumer) is SRCH-P06 (named floor); the shell carries no query path
 /// (engine.search stays private, the SRCH-P01 lint holds).
-pub fn search_app_spec(config: Config) -> AppSpec {
+///
+/// **The outbox is INJECTED (MR-009b W3b.4 — the composition root owns durability):** the
+/// production `main.rs` constructs `OutboxStore::durable(PgOutboxBacking)` over the MR-022
+/// `SubstrateProvider` pool (foundation migrations applied, fail-loud on missing durable config);
+/// a test/drill passes the in-memory `OutboxStore::new()` double. This builder constructs NO
+/// store of its own — the W3 dedup-injection precedent applied to the outbox.
+pub fn search_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
         config,
@@ -125,7 +132,9 @@ pub fn search_app_spec(config: Config) -> AppSpec {
         consumers: Vec::new(),
         holders: AppSpec::auto(),
         stores: search_stores(),
-        outbox: OutboxSpec::default(),
+        // The relay drains the INJECTED store (W3b.4). The in-process broker fake stays the
+        // default TRANSPORT (durability lives in the store); EB-04's adapter is a config swap.
+        outbox: OutboxSpec::new(outbox, InProcessBus::new()),
         critical: search_critical(),
     }
 }
@@ -134,15 +143,15 @@ pub fn search_app_spec(config: Config) -> AppSpec {
 /// [`boot`](myelin_substrate::boot) of [`search_app_spec`]). Separated from [`run_search`] so a
 /// test/drill can boot, assert the three ports opened + the migration ran + the index store
 /// registered, drive ticks, and drive the drain deterministically.
-pub fn boot_search(config: Config) -> Result<ServeHandle, ServeError> {
-    boot(search_app_spec(config))
+pub fn boot_search(config: Config, outbox: OutboxStore) -> Result<ServeHandle, ServeError> {
+    boot(search_app_spec(config, outbox))
 }
 
 /// **The Search service entry — the one `serve(AppSpec)` call (contract 1.1).** The `search` binary
 /// (`src/main.rs`) does nothing but hand [`search_app_spec`] to this. A failed boot / incomplete
 /// drain returns non-zero (§3.1) — loud, never a silent success.
-pub fn run_search(config: Config) -> Result<(), ServeError> {
-    serve(search_app_spec(config))
+pub fn run_search(config: Config, outbox: OutboxStore) -> Result<(), ServeError> {
+    serve(search_app_spec(config, outbox))
 }
 
 #[cfg(test)]
@@ -157,8 +166,8 @@ mod tests {
     /// liveness ≠ readiness, and a forward-only migration creates a per-tenant index directory.
     #[test]
     fn search_boots_from_serve_appspec_with_three_ports() {
-        let handle =
-            boot_search(Config::default()).expect("the Search shell boots from serve(AppSpec)");
+        let handle = boot_search(Config::default(), OutboxStore::new())
+            .expect("the Search shell boots from serve(AppSpec)");
         assert_eq!(handle.name(), SERVICE_NAME, "the deployable service name");
 
         // (1.2) the three ports opened in the lifecycle (public / internal / metrics-health).
@@ -210,7 +219,7 @@ mod tests {
     /// live (no restart storm). This proves the two signals are distinct, not aliased.
     #[test]
     fn dead_identity_flips_readiness_not_liveness() {
-        let handle = boot_search(Config::default()).expect("boot");
+        let handle = boot_search(Config::default(), OutboxStore::new()).expect("boot");
         let mh = handle.metrics_health();
         assert!(mh.readiness().is_ready(), "ready while identity is healthy");
 
@@ -235,7 +244,7 @@ mod tests {
     #[test]
     fn run_search_runs_lifecycle_and_returns_ok() {
         assert_eq!(
-            run_search(Config::default()),
+            run_search(Config::default(), OutboxStore::new()),
             Ok(()),
             "the Search shell boots → … → drains cleanly"
         );
@@ -245,7 +254,7 @@ mod tests {
     /// boot loudly — the shell never starts half-booted.
     #[test]
     fn failed_boot_returns_non_zero() {
-        let r = run_search(Config("BAD_POOL".into()));
+        let r = run_search(Config("BAD_POOL".into()), OutboxStore::new());
         assert!(r.is_err(), "a failed boot must return non-zero (Err)");
         assert!(
             r.unwrap_err().0.contains("fail-fast"),
@@ -268,7 +277,7 @@ mod tests {
             "the migration creates the per-tenant index directory catalog"
         );
         // And boot actually applies it (it is in the spec's migration set).
-        let spec = search_app_spec(Config::default());
+        let spec = search_app_spec(Config::default(), OutboxStore::new());
         assert!(
             spec.migrations
                 .0
@@ -284,7 +293,7 @@ mod tests {
     /// declaration, is loud.
     #[test]
     fn the_shell_declares_the_index_store_and_no_engine() {
-        let spec = search_app_spec(Config::default());
+        let spec = search_app_spec(Config::default(), OutboxStore::new());
         assert!(
             spec.stores
                 .stores()

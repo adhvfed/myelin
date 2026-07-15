@@ -27,6 +27,7 @@
 //! after migrate-complete, drain clean. The `forward-only-migration` lint is green over the
 //! Knowledge migrations (0 backward/destructive). No threshold weakened.
 
+use myelin_events::OutboxStore;
 use myelin_knowledge::{boot_knowledge, knowledge_app_spec, HOT_TABLES, SERVICE_NAME};
 use myelin_substrate::{
     is_destructive, serve, Config, HotTables, Migration, MigrationPhase, MigrationRunner,
@@ -38,7 +39,8 @@ use myelin_substrate::{
 /// readiness on migrate-complete. The consumer re-implements nothing.
 #[test]
 fn consumer_knowledge_appspec_boots_three_ports_over_harness_provider() {
-    let handle = boot_knowledge(Config::default()).expect("the knowledge shell boots");
+    let handle =
+        boot_knowledge(Config::default(), OutboxStore::new()).expect("the knowledge shell boots");
     assert_eq!(handle.name(), SERVICE_NAME);
     // PROVIDER opened all three surfaces around the CONSUMER's spec.
     assert_eq!(
@@ -68,7 +70,7 @@ fn consumer_knowledge_appspec_boots_three_ports_over_harness_provider() {
 #[test]
 fn consumer_knowledge_service_serves_and_drains_cleanly() {
     assert_eq!(
-        serve(knowledge_app_spec(Config::default())),
+        serve(knowledge_app_spec(Config::default(), OutboxStore::new())),
         Ok(()),
         "the knowledge service boots → … → drains cleanly over the harness PROVIDER"
     );
@@ -79,7 +81,7 @@ fn consumer_knowledge_service_serves_and_drains_cleanly() {
 /// migration runner) + the `forward-only-migration` lint both read.
 #[test]
 fn consumer_knowledge_appspec_declares_the_three_hot_tables() {
-    let spec = knowledge_app_spec(Config::default());
+    let spec = knowledge_app_spec(Config::default(), OutboxStore::new());
     for table in HOT_TABLES {
         assert!(
             spec.hot_tables.is_hot(table),
@@ -121,7 +123,10 @@ fn provider_migration_runner_refuses_blocking_alter_on_hot_table() {
 #[test]
 fn provider_migration_runner_refuses_destructive_migration() {
     // The CONSUMER's own skeleton is forward-only.
-    for m in &knowledge_app_spec(Config::default()).migrations.0 {
+    for m in &knowledge_app_spec(Config::default(), OutboxStore::new())
+        .migrations
+        .0
+    {
         assert!(
             !is_destructive(m.ddl),
             "the Knowledge migration `{}` is forward-only",

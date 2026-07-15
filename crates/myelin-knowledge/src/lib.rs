@@ -539,9 +539,14 @@ impl<S: IdentityService + Send + Sync> Authorizer for KnowledgeEntrypointAuthori
 /// `config` is the validated, env-first config (§3.2). The OLTP store is implicitly critical (the
 /// harness adds it); Knowledge declares no further critical downstream here on the shell floor
 /// (the Identity / Search / Refs critical-dependency set is wired when those clients land —
-/// KN-P14/P16/P21). The outbox relay hook is the default in-process spec; the Knowledge-owned emit
-/// bodies + the consumer set land in KN-P06.
-pub fn knowledge_app_spec(config: Config) -> AppSpec {
+/// KN-P14/P16/P21). The Knowledge-owned emit bodies + the consumer set land in KN-P06.
+///
+/// **The outbox is INJECTED (MR-009b W3b.4 — the composition root owns durability):** the
+/// production `main.rs` constructs `OutboxStore::durable(PgOutboxBacking)` over the MR-022
+/// `SubstrateProvider` pool (foundation migrations applied, fail-loud on missing durable config);
+/// a test/drill passes the in-memory `OutboxStore::new()` double. This builder constructs NO
+/// store of its own — the W3 dedup-injection precedent applied to the outbox.
+pub fn knowledge_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
         config,
@@ -564,9 +569,9 @@ pub fn knowledge_app_spec(config: Config) -> AppSpec {
         holders: AppSpec::auto(),
         stores: StoreManifest::new(),
         // The outbox relay hook (architecture 03 §4 — emit-via-outbox-only, the no-raw-publish
-        // discipline). The default in-process spec; the Knowledge-owned emit bodies wire their own
-        // store + EB-04's adapter in KN-P06.
-        outbox: myelin_substrate::OutboxSpec::default(),
+        // discipline) over the INJECTED store (W3b.4). The in-process broker fake stays the
+        // default TRANSPORT (durability lives in the store); EB-04's adapter is a config swap.
+        outbox: OutboxSpec::new(outbox, InProcessBus::new()),
         // No further critical downstream declared on the shell floor (the Id/Search/Refs client
         // dependencies wire their critical set as those clients land — KN-P14/P16/P21).
         critical: CriticalDependencies::default(),
@@ -598,15 +603,16 @@ pub const LIVING_DOC_CONSUMER: &str = "knowledge-living-doc";
 /// consumer template + the dedup discipline), not the reaction bodies.
 pub fn knowledge_app_spec_with_consumers(
     config: Config,
+    outbox: OutboxStore,
     subjects: &[&str],
     dedup: DedupLedger,
 ) -> AppSpec {
-    // The ONE outbox the emit seam buffers into AND the relay drains (BUS-2 — no second store).
-    let outbox = OutboxStore::new();
-    // MR-009b Wave 3: the dedup ledger is INJECTED (durable-by-default composition root). The
-    // in-memory `DedupLedger::new()` is a `test-support` double the caller supplies on the
-    // in-process floor; a durable deployment injects `DedupLedger::durable` (events `serve()`).
-    let mut spec = knowledge_app_spec(config);
+    // The ONE outbox the emit seam buffers into AND the relay drains (BUS-2 — no second store) is
+    // INJECTED (MR-009b W3b.4, like the dedup ledger in Wave 3): the production root passes a
+    // durable-backed store (and pairs emits with a UNIQUE id source — never the per-store-
+    // resetting default `MonotonicMinter`; `myelin_events::UlidMinter` is the production source);
+    // a test passes the in-memory double.
+    let mut spec = knowledge_app_spec(config, outbox);
 
     // Register the living-doc consumer through the sanctioned `consume` (rule 3 rejects `*`/empty;
     // rule 4 binds the durable name). A malformed/over-broad subject is a LOUD registration error —
@@ -618,8 +624,6 @@ pub fn knowledge_app_spec_with_consumers(
     ) {
         spec.consumers = vec![ConsumerReg::new(consumer)];
     }
-    // The emit seam buffers into `outbox`; the relay must drain THAT store (not a fresh default).
-    spec.outbox = OutboxSpec::new(outbox, InProcessBus::new());
     spec
 }
 
@@ -638,8 +642,8 @@ pub fn entrypoint_authorizer() -> KnowledgeEntrypointAuthorizer<FailClosedEntryp
 /// inspect the three ports + the liveness ≠ readiness state, and drive the drain deterministically.
 ///
 /// Returns `Err` (the non-zero exit) on a failed boot (§3.1).
-pub fn boot_knowledge(config: Config) -> Result<ServeHandle, ServeError> {
-    boot(knowledge_app_spec(config))
+pub fn boot_knowledge(config: Config, outbox: OutboxStore) -> Result<ServeHandle, ServeError> {
+    boot(knowledge_app_spec(config, outbox))
 }
 
 #[cfg(test)]
@@ -662,7 +666,8 @@ mod tests {
     /// metrics-health surfaces are all opened (3/3 ports up).
     #[test]
     fn knowledge_shell_boots_and_three_ports_bind() {
-        let handle = boot_knowledge(Config::default()).expect("the knowledge shell boots");
+        let handle = boot_knowledge(Config::default(), OutboxStore::new())
+            .expect("the knowledge shell boots");
         assert_eq!(handle.name(), "knowledge");
         assert_eq!(
             handle.surfaces(),
@@ -712,7 +717,7 @@ mod tests {
     /// startup gate to Complete at the end of a successful boot — the post-migrate readiness).
     #[test]
     fn booted_instance_is_ready_after_migrate_complete() {
-        let handle = boot_knowledge(Config::default()).expect("boot");
+        let handle = boot_knowledge(Config::default(), OutboxStore::new()).expect("boot");
         assert_eq!(
             handle.metrics_health().startup(),
             Startup::Complete,
@@ -730,7 +735,7 @@ mod tests {
     /// high-write tables KN-P05 creates. This is the OWNED half of 1.5 the shell ships.
     #[test]
     fn hot_table_flags_are_declared() {
-        let spec = knowledge_app_spec(Config::default());
+        let spec = knowledge_app_spec(Config::default(), OutboxStore::new());
         for table in HOT_TABLES {
             assert!(
                 spec.hot_tables.is_hot(table),
@@ -861,7 +866,7 @@ mod tests {
     /// block/db_row/doc_op store holders land with those stores (KN-P05); the OLTP store now.
     #[test]
     fn knowledge_store_auto_registers_as_holder() {
-        let handle = boot_knowledge(Config::default()).expect("boot");
+        let handle = boot_knowledge(Config::default(), OutboxStore::new()).expect("boot");
         assert!(
             handle
                 .holder_registry()
@@ -876,7 +881,7 @@ mod tests {
     #[test]
     fn knowledge_service_serves_and_drains_cleanly() {
         assert_eq!(
-            serve(knowledge_app_spec(Config::default())),
+            serve(knowledge_app_spec(Config::default(), OutboxStore::new())),
             Ok(()),
             "the knowledge service boots → … → drains cleanly"
         );
@@ -891,6 +896,7 @@ mod tests {
     fn wired_appspec_registers_the_living_doc_consumer_and_drains() {
         let spec = knowledge_app_spec_with_consumers(
             Config::default(),
+            OutboxStore::new(),
             &["myelin://acme/issues/", "myelin://acme/ci/"],
             DedupLedger::new(),
         );
@@ -905,7 +911,9 @@ mod tests {
             "the wired knowledge service boots → migrates → relay → consumer → drains cleanly"
         );
         // the bare shell stays consumer-free (the empty seam is preserved).
-        assert!(knowledge_app_spec(Config::default()).consumers.is_empty());
+        assert!(knowledge_app_spec(Config::default(), OutboxStore::new())
+            .consumers
+            .is_empty());
     }
 
     /// **An over-broad consumer subject does NOT silently widen the wiring (rule 3).** A `*` subject
@@ -913,7 +921,12 @@ mod tests {
     /// wired (the shell still boots) — never a silently-narrowed over-broad subscription.
     #[test]
     fn wired_appspec_rejects_a_wildcard_consumer_subject() {
-        let spec = knowledge_app_spec_with_consumers(Config::default(), &["*"], DedupLedger::new());
+        let spec = knowledge_app_spec_with_consumers(
+            Config::default(),
+            OutboxStore::new(),
+            &["*"],
+            DedupLedger::new(),
+        );
         assert!(
             spec.consumers.is_empty(),
             "a `*` subject is rejected at registration → no consumer wired (never silently widened)"
@@ -929,7 +942,7 @@ mod tests {
     /// the Knowledge service boot with a loud error — never a silent success.
     #[test]
     fn knowledge_failed_boot_returns_non_zero() {
-        let r = boot_knowledge(Config("BAD_POOL".into()));
+        let r = boot_knowledge(Config("BAD_POOL".into()), OutboxStore::new());
         assert!(r.is_err(), "a failed knowledge boot returns non-zero (Err)");
     }
 }

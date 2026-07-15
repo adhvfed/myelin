@@ -132,7 +132,13 @@ yrs = { workspace = true }
 # test reads DATABASE_URL inline (no myelin-config edge — same posture as ci-controlplane/refs).
 # ------------------------------------------------------------------------------------------
 sqlx = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
+# MR-009b W3b.4 — the DURABLE composition root in `src/main.rs` (SubstrateProvider from env →
+# foundation migrations → `OutboxStore::durable(PgOutboxBacking)`) is the ALWAYS-COMPILED default
+# (the Wave-2 identity-service posture), so `tokio` (the multi-thread runtime the sync→async
+# bridge requires) + `myelin-config` (the env-first durable config, fail-loud) are now regular
+# deps. Build stays DB-free: connecting happens at RUNTIME, never at build.
+tokio = { workspace = true }
+myelin-config = { path = "../myelin-config" }
 
 # DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the
 # Identity SERVICE crate. The runtime Issues fragment is the names-only `myelin_identity::Namespace-
@@ -213,4 +219,6 @@ default = []
 # into a real Postgres column and read back to assert 0 plaintext-at-rest + a successful decrypt while
 # the key lives (tests/integration_iss_p07_subject_dek.rs). The ColumnCryptor seal/open is DB-free
 # (in-memory KmsEngine), so the integration test only adds the real at-rest round-trip.
-integration = ["dep:sqlx", "dep:tokio"]
+# (tokio is a regular dep since W3b.4 — the durable main.rs needs it; the feature now only
+# pulls the raw-sqlx test harness.)
+integration = ["dep:sqlx"]

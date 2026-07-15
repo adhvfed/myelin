@@ -87,7 +87,7 @@ fn build(root: &PathBuf) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBac
         KmsEngine::new(),
     ))));
 
-    let backend = Arc::new(DurableGitBackend::rooted(root.clone()));
+    let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(root.clone()));
     let mut builder = Gateway::builder(authn, human_login, Arc::new(AllowAll)).route(
         Method::Get,
         "/v1/whoami",

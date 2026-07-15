@@ -42,3 +42,11 @@ myelin-events = { path = "../myelin-events", features = ["test-support"] }
 # (architecture §2.9 — the harness is a leaf consumer; nothing in the DAG depends on it).
 myelin-harness = { path = "../myelin-harness" }
 serde_json.workspace = true
+
+[features]
+# MR-009b W3b.4: gates the in-process outbox FLOOR (`OutboxSpec::default_inproc` + the `Default`
+# impl) so no production composition root silently picks up the per-process in-memory outbox
+# (SI-007). Production constructs `OutboxSpec::durable(store, transport)` over a durable-backed
+# `OutboxStore`; a downstream crate's DEV tests that still boot the in-proc floor enable this as a
+# dev-dependency feature (never in the runtime DAG — audited via `cargo tree -e no-dev`).
+test-support = []

@@ -162,17 +162,7 @@ pub use multi_cell::{
     CellPartition, CrossCellAudit, CrossCellGrant, CrossCellResolution, MigrationReceipt,
     MultiCellAuthority, MultiCellDsrReceiptSet,
 };
-pub use oidc::{
-    JwkKey, JwkSet, OidcConfig, OidcVerifier, ReplayGuard, SchemeDispatchVerifier,
-};
-pub use ssh_auth::{
-    encode_ssh_credential_material, signed_payload, ssh_fingerprint, Challenge, ChallengeGuard,
-    KeyBindingIndex, KeyBindingResolver, PrincipalStoreKeyBindings, RegisteredKey, SshVerifier,
-};
-pub use webauthn::{
-    encode_assertion_material, encode_registration_material, ChallengeGuard as WebauthnChallengeGuard,
-    CoseKey, CredentialBindingIndex, WebauthnConfig, WebauthnVerifier,
-};
+pub use oidc::{JwkKey, JwkSet, OidcConfig, OidcVerifier, ReplayGuard, SchemeDispatchVerifier};
 pub use principal_store::{
     PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore, ProfileRef, S1_HOLDER, S1_TABLE,
 };
@@ -185,8 +175,18 @@ pub use revocation::{
     RevocationEntry, RevocationStore, RevocationTelemetry, RevokedKind, RunTokenState,
     REVOCATION_SLA_SECS, S7_TABLE,
 };
+pub use ssh_auth::{
+    encode_ssh_credential_material, signed_payload, ssh_fingerprint, Challenge, ChallengeGuard,
+    KeyBindingIndex, KeyBindingResolver, PrincipalStoreKeyBindings, RegisteredKey, SshVerifier,
+};
 pub use tuple_store::{run_grant_expiry, StoredTuple, TupleStore, WriteError, S3_HOLDER, S3_TABLE};
+pub use webauthn::{
+    encode_assertion_material, encode_registration_material,
+    ChallengeGuard as WebauthnChallengeGuard, CoseKey, CredentialBindingIndex, WebauthnConfig,
+    WebauthnVerifier,
+};
 
+use myelin_events::{InProcessBus, OutboxStore};
 use myelin_identity::{
     AuthzError, CaveatContext, Consistency, Decision, IdentityService, ListObjectsResult,
     ObjectType, Permission, Principal, Zookie,
@@ -599,8 +599,11 @@ impl StoreBackedCheck {
         // The minter shares THIS slot's S7 store + S3 tuple store (one revocation oracle, one write
         // primitive): a mint registers the per-run TTL into the SAME denylist `check`/`authenticate`
         // consult, and the auto-expiring per-run grant tuple goes through the SAME write_tuples path.
-        let minter =
-            mint::RunTokenMinter::with_signer_and_tuples(revocations.clone(), Some(tuples.clone()), signer);
+        let minter = mint::RunTokenMinter::with_signer_and_tuples(
+            revocations.clone(),
+            Some(tuples.clone()),
+            signer,
+        );
         // The shared cell KMS (P-058) — the crypto-shred substrate. A fresh engine here; a live
         // service shares the cell engine S1/S2 seal under (so one per-subject-DEK shred erases both).
         let kms = std::sync::Arc::new(myelin_storage::KmsEngine::new());
@@ -1715,7 +1718,13 @@ impl IdentityService for StoreBackedCheck {
 /// `config` is the validated, env-first config (§3.2). The OLTP store is implicitly critical (the
 /// harness adds it); Identity declares no further critical downstream here (it is the dependency
 /// ROOT — it depends on nothing else, §1), so a healthy boot is ready once migrations apply.
-pub fn identity_app_spec(config: Config) -> AppSpec {
+///
+/// **The outbox is INJECTED (MR-009b W3b.4 — the composition root owns durability):** the
+/// production `main.rs` constructs `OutboxStore::durable(PgOutboxBacking)` over the MR-022
+/// `SubstrateProvider` pool (foundation migrations applied, fail-loud on missing durable config);
+/// a test/drill passes the in-memory `OutboxStore::new()` double. This builder constructs NO
+/// store of its own — the W3 dedup-injection precedent applied to the outbox.
+pub fn identity_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
         config,
@@ -1734,7 +1743,9 @@ pub fn identity_app_spec(config: Config) -> AppSpec {
         // holders land with those stores (P-ID-05/P-ID-08); the OLTP store registers at boot.
         holders: AppSpec::auto(),
         stores: StoreManifest::new(),
-        outbox: myelin_substrate::OutboxSpec::default(),
+        // The relay drains the INJECTED store (W3b.4). The in-process broker fake stays the
+        // default TRANSPORT (durability lives in the store); EB-04's adapter is a config swap.
+        outbox: myelin_substrate::OutboxSpec::new(outbox, InProcessBus::new()),
         // Identity is the dependency root — it declares no critical downstream of its own (§1).
         critical: CriticalDependencies::default(),
     }
@@ -1754,8 +1765,8 @@ pub fn internal_authorizer() -> CheckAuthorizer<FailClosedCheck> {
 /// the three ports + the liveness ≠ readiness state, and drive the drain deterministically.
 ///
 /// Returns `Err` (the non-zero exit) on a failed boot (§3.1).
-pub fn boot_identity(config: Config) -> Result<ServeHandle, ServeError> {
-    boot(identity_app_spec(config))
+pub fn boot_identity(config: Config, outbox: OutboxStore) -> Result<ServeHandle, ServeError> {
+    boot(identity_app_spec(config, outbox))
 }
 
 #[cfg(test)]
@@ -1778,7 +1789,8 @@ mod tests {
     /// metrics-health surfaces are all opened (3/3 ports up).
     #[test]
     fn identity_shell_boots_and_three_ports_bind() {
-        let handle = boot_identity(Config::default()).expect("the identity shell boots");
+        let handle =
+            boot_identity(Config::default(), OutboxStore::new()).expect("the identity shell boots");
         assert_eq!(handle.name(), "identity");
         assert_eq!(
             handle.surfaces(),
@@ -1832,7 +1844,7 @@ mod tests {
     /// startup gate to Complete at the end of a successful boot — the post-migrate readiness).
     #[test]
     fn booted_instance_is_ready_after_migrate_complete() {
-        let handle = boot_identity(Config::default()).expect("boot");
+        let handle = boot_identity(Config::default(), OutboxStore::new()).expect("boot");
         assert_eq!(
             handle.metrics_health().startup(),
             Startup::Complete,
@@ -2036,7 +2048,7 @@ mod tests {
     /// S1/S3 store holders land with those stores (P-ID-05/P-ID-08); the OLTP store registers now.
     #[test]
     fn identity_store_auto_registers_as_holder() {
-        let handle = boot_identity(Config::default()).expect("boot");
+        let handle = boot_identity(Config::default(), OutboxStore::new()).expect("boot");
         assert!(
             handle
                 .holder_registry()
@@ -2051,7 +2063,7 @@ mod tests {
     #[test]
     fn identity_service_serves_and_drains_cleanly() {
         assert_eq!(
-            serve(identity_app_spec(Config::default())),
+            serve(identity_app_spec(Config::default(), OutboxStore::new())),
             Ok(()),
             "the identity service boots → … → drains cleanly"
         );
@@ -2061,7 +2073,7 @@ mod tests {
     /// the Identity service boot with a loud error — never a silent success.
     #[test]
     fn identity_failed_boot_returns_non_zero() {
-        let r = boot_identity(Config("BAD_POOL".into()));
+        let r = boot_identity(Config("BAD_POOL".into()), OutboxStore::new());
         assert!(r.is_err(), "a failed identity boot returns non-zero (Err)");
     }
 }

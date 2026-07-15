@@ -89,9 +89,13 @@ pub struct OutboxSpec {
 }
 
 impl OutboxSpec {
-    /// The default spec: a fresh empty store + the in-process broker fake (the M0 floor). A
-    /// real service supplies its own store (the same one its handlers emit into) and EB-04's
-    /// adapter via [`OutboxSpec::new`].
+    /// **The in-process floor: a fresh empty MEMORY store + the in-process broker fake — TEST /
+    /// DEV ONLY (MR-009b W3b.4).** Gated behind `test-support` so no production composition root
+    /// can silently pick up the per-process in-memory outbox (SI-007: events lost on restart).
+    /// Production supplies a DURABLE-backed store via [`OutboxSpec::durable`]; a service that
+    /// still constructs the memory floor does so EXPLICITLY via [`OutboxSpec::new`] over
+    /// `OutboxStore::new()` (a grep-able, named W3b.6 debt site), never through a default.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn default_inproc() -> OutboxSpec {
         OutboxSpec {
             store: OutboxStore::new(),
@@ -107,12 +111,30 @@ impl OutboxSpec {
         }
     }
 
+    /// **The production spec (MR-009b W3b.4): a DURABLE-backed store + the chosen transport.**
+    /// The caller constructs the store durable-first —
+    /// `OutboxStore::durable(Arc::new(PgOutboxBacking::new(pool, handle)))` over the MR-022
+    /// `SubstrateProvider` pool (with the provider's `migrate_foundation` applied so the frozen
+    /// `outbox` table exists) — and the relay the lifecycle starts then drains PG-committed rows
+    /// through `PgRelay`'s claim/mark/dead-letter discipline to `transport`. Events survive a
+    /// process restart; the in-process memory floor ([`OutboxSpec::default_inproc`]) is the
+    /// test/dev double. `InProcessBus` remains a legitimate default TRANSPORT (the broker hop is
+    /// in-process; durability lives in the store) — the NATS-by-default transport is the
+    /// EventsRuntime/integration track, out of this wave's scope by design.
+    pub fn durable(store: OutboxStore, transport: Box<dyn BusTransport>) -> OutboxSpec {
+        OutboxSpec { store, transport }
+    }
+
     /// The store the relay drains (so a test/handler can emit into it).
     pub fn store(&self) -> &OutboxStore {
         &self.store
     }
 }
 
+/// The default spec is the in-process floor — TEST / DEV ONLY (gated with
+/// [`OutboxSpec::default_inproc`], MR-009b W3b.4): production roots must choose
+/// [`OutboxSpec::durable`] explicitly; there is no silent in-memory default to fall into.
+#[cfg(any(test, feature = "test-support"))]
 impl Default for OutboxSpec {
     fn default() -> Self {
         OutboxSpec::default_inproc()
@@ -411,6 +433,14 @@ impl AppSpec {
 
     /// A minimal spec for a service `name` with a validated `config` (the hello-world shape):
     /// no migrations, no consumers, the in-process outbox. Builders add migrations/consumers.
+    ///
+    /// **W3b.6 debt (named, MR-009b W3b.4):** the outbox here is still the EXPLICIT in-memory
+    /// floor (`OutboxStore::new()` — un-gated until the W3b.6 flip) because `minimal` is a
+    /// production convenience `control-plane` still builds on. The gated
+    /// [`OutboxSpec::default_inproc`] can no longer be reached silently; this construction is the
+    /// grep-able remainder the W3b.6 `OutboxStore::new` gate breaks LOUDLY, forcing the remaining
+    /// roots (control-plane / agent-service / ci-controlplane / ci-dispatch) onto
+    /// [`OutboxSpec::durable`].
     pub fn minimal(name: &'static str, config: Config) -> AppSpec {
         AppSpec {
             name,
@@ -422,7 +452,7 @@ impl AppSpec {
             consumers: Vec::new(),
             holders: HoldersSpec::Auto,
             stores: StoreManifest::new(),
-            outbox: OutboxSpec::default(),
+            outbox: OutboxSpec::new(OutboxStore::new(), InProcessBus::new()),
             critical: CriticalDependencies::default(),
         }
     }
