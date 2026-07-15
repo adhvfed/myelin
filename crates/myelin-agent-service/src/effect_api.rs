@@ -163,6 +163,21 @@ pub fn encode_proposed(plan: &PlannedEffect) -> ProposedEffect {
     ))
 }
 
+/// **The PER-EFFECT gate key (R2.4 — the step-6 approval granularity).** One approval authorizes
+/// exactly one `(tool, object)` effect: this is both the `GateId` step 6 mints on a withhold AND
+/// the key the step-6 consult reads back from the run's `approved` set (one derivation — the mint
+/// and the consult cannot diverge). An [`crate::hitl::ApprovedTools::admit`] threads exactly this
+/// key; a bare tool name is never an approval key anywhere.
+pub fn effect_gate_key(tool: &ToolName, object: &ArtifactRef) -> String {
+    effect_gate_key_str(&tool.0, &object.0)
+}
+
+/// The string-typed derivation behind [`effect_gate_key`] (for callers holding the raw
+/// `hitl_gate.tool_name` / object strings, e.g. the HITL resume threading).
+pub fn effect_gate_key_str(tool: &str, object: &str) -> String {
+    format!("gate:{tool}:{object}")
+}
+
 // ───────────────────────── the consumer seams (CONSUMED: 4.2, 4.5, tenant, apply) ───────────────
 
 /// **The contract-4.2 `check` surface, as the engine consumes it (CONSUMED, §5.2 step 2).** A seam
@@ -392,8 +407,15 @@ where
     pub trigger_actor: Principal,
     /// The consistency the `check` reads at (the run's zookie watermark — read-your-writes).
     pub zookie: Zookie,
-    /// The set of tool names already APPROVED for this run (step 6 reads this — a gated tool that
-    /// has been approved passes). Empty for a fresh run; the HITL resume (AG-P9) adds to it.
+    /// The set of PER-EFFECT gate keys ([`effect_gate_key`] — `gate:{tool}:{object}`) already
+    /// APPROVED for this run (step 6 reads this — a gated effect whose OWN key was approved
+    /// passes). Empty for a fresh run; the HITL resume (AG-P9/P10) adds an approved gate's key.
+    ///
+    /// **R2.4 (Defect B fix):** this set held bare TOOL NAMES, so approving `git.merge` on PR 40
+    /// admitted `git.merge` run-wide — a DECLINED sibling on PR 41 re-driven through
+    /// `apply_planned` fell through step 6 and applied. The set now carries the SAME
+    /// per-(tool, object) key the step-6 `GateId` is minted from: a declined sibling's key is
+    /// never present, so it gates again (0 mutation, AG-8).
     pub approved: std::collections::BTreeSet<String>,
     /// The contract-1.8 signal set the pipeline records into (mutably borrowed).
     pub signals: &'a mut PipelineSignals,
@@ -560,13 +582,16 @@ where
             );
         }
 
-        // (6) HITL GATE — if the tool requires_approval AND is not yet approved for this run →
-        //     WITHHELD: the tool does NOT mutate (AG-8). The HITL machinery (open the card, surface,
-        //     resume) is AG-P9 — HERE we only signal the gate. The COLUMN read here is the FROZEN
-        //     §6.3 default (seeded at registration, [`crate::defaults`]).
-        if def.requires_approval && !self.approved.contains(&plan.tool.0) {
-            let gate_id = GateId(format!("gate:{}:{}", plan.tool.0, plan.object.0));
-            return PlanVerdict::WouldGate(gate_id);
+        // (6) HITL GATE — if the tool requires_approval AND this EFFECT's per-(tool, object) gate
+        //     key is not yet approved for this run → WITHHELD: the tool does NOT mutate (AG-8).
+        //     The HITL machinery (open the card, surface, resume) is AG-P9 — HERE we only signal
+        //     the gate. The COLUMN read here is the FROZEN §6.3 default (seeded at registration,
+        //     [`crate::defaults`]). R2.4: the consult is keyed by [`effect_gate_key`] — the SAME
+        //     key the `GateId` below is minted from — never by the bare tool name, so an approved
+        //     sibling sharing a tool name can NEVER admit a declined effect.
+        let gate_key = effect_gate_key(&plan.tool, &plan.object);
+        if def.requires_approval && !self.approved.contains(&gate_key) {
+            return PlanVerdict::WouldGate(GateId(gate_key));
         }
 
         PlanVerdict::WouldApply
@@ -1455,14 +1480,17 @@ mod tests {
         );
         assert_eq!(signals.gated(), 1);
 
-        // approved (the HITL resume, AG-P9, adds the tool name to `approved`) → Applies.
+        // approved (the HITL resume, AG-P9, adds THIS effect's per-(tool, object) gate key to
+        // `approved` — R2.4: never the bare tool name) → Applies.
         let mut budget2 = Budget {
             remaining: 100,
             billed: 0,
             settles: 0,
         };
         let mut signals2 = PipelineSignals::new();
-        let approved: BTreeSet<String> = ["git.merge".to_string()].into_iter().collect();
+        let the_plan = plan("git.merge", r#"{"title":"x"}"#);
+        let approved: BTreeSet<String> =
+            [effect_gate_key(&the_plan.tool, &the_plan.object)].into_iter().collect();
         let mut p2 = pipeline(
             &cat,
             &check,
@@ -1473,7 +1501,7 @@ mod tests {
             approved,
             &mut signals2,
         );
-        let out = p2.apply_planned(&plan("git.merge", r#"{"title":"x"}"#));
+        let out = p2.apply_planned(&the_plan);
         assert!(
             matches!(out, EffectResult::Applied(_)),
             "an approved gated effect Applies: {out:?}"
@@ -1482,6 +1510,67 @@ mod tests {
             endpoint.applied.borrow().len(),
             1,
             "the approved effect mutated once"
+        );
+    }
+
+    /// **Step 6 is PER-EFFECT keyed (R2.4 Defect B):** an approval for `git.merge` on object A
+    /// admits ONLY that effect — the same tool on object B still gates, and (regression pin) a
+    /// bare TOOL NAME in the `approved` set admits NOTHING.
+    #[test]
+    fn step6_approval_is_per_effect_never_per_tool_name() {
+        let cat = Catalogue {
+            defs: vec![tool_def(
+                "git.merge",
+                &["git.merge"],
+                true,
+                EffectKind::Mutate,
+            )],
+        };
+        let check = allow_caps(&["git.merge"]);
+        let del = Delegator {
+            policy: vec!["git.merge".into()],
+        };
+        let tenant = Tenant {
+            forbid: BTreeSet::new(),
+        };
+        let endpoint = Endpoint {
+            fail: false,
+            applied: RefCell::new(vec![]),
+        };
+
+        let mut plan_a = plan("git.merge", r#"{"title":"a"}"#);
+        plan_a.object = ArtifactRef("myelin://acme/git/pr/40".into());
+        let mut plan_b = plan("git.merge", r#"{"title":"b"}"#);
+        plan_b.object = ArtifactRef("myelin://acme/git/pr/41".into());
+
+        // approved: exactly effect A's key (pr 40). Effect B (pr 41, SAME tool) must still gate.
+        let approved: BTreeSet<String> =
+            [effect_gate_key(&plan_a.tool, &plan_a.object)].into_iter().collect();
+        let mut budget = Budget { remaining: 100, billed: 0, settles: 0 };
+        let mut signals = PipelineSignals::new();
+        let mut p = pipeline(
+            &cat, &check, &del, &tenant, &endpoint, &mut budget, approved, &mut signals,
+        );
+        assert!(
+            matches!(p.apply_planned(&plan_a), EffectResult::Applied(_)),
+            "the approved effect (pr 40) applies"
+        );
+        assert!(
+            matches!(p.apply_planned(&plan_b), EffectResult::Gated(_)),
+            "the sibling (pr 41) sharing the tool name still GATES — approval never transfers"
+        );
+        assert_eq!(endpoint.applied.borrow().len(), 1, "exactly the approved effect mutated");
+
+        // Regression pin: a bare tool name in `approved` is NOT an approval key — it admits nothing.
+        let by_name: BTreeSet<String> = ["git.merge".to_string()].into_iter().collect();
+        let mut budget2 = Budget { remaining: 100, billed: 0, settles: 0 };
+        let mut signals2 = PipelineSignals::new();
+        let mut p2 = pipeline(
+            &cat, &check, &del, &tenant, &endpoint, &mut budget2, by_name, &mut signals2,
+        );
+        assert!(
+            matches!(p2.apply_planned(&plan_b), EffectResult::Gated(_)),
+            "a bare tool name in the approved set clears NO gate (the old bypass shape)"
         );
     }
 

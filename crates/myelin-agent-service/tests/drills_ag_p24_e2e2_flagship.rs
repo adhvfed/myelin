@@ -699,8 +699,8 @@ fn ag_p24_e2e2_flagship_green_end_to_end() {
         "the first approval click resolves Approved (the tool admitted): {outcome_1:?}"
     );
     assert!(
-        approved.contains("git.merge"),
-        "the merge tool is in the approved set after the first click"
+        approved.contains_effect("git.merge", &merge_plan.object.0),
+        "the merge effect's per-(tool, object) key is in the approved set after the first click"
     );
     // SECOND click (the double-click): admitting the same gate again is idempotent — STILL one tool.
     if let HitlOutcome::Approved(gate) = &outcome_1 {
@@ -909,9 +909,9 @@ fn ag_p24_e2e2_decline_leg_withholds_forever() {
         matches!(outcome, HitlOutcome::Halted(_)),
         "a rejected approval HALTS — the merge is withheld forever: {outcome:?}"
     );
-    // the merge tool is NEVER in the approved set (0 mutation on the decline path, AG-8).
+    // the merge effect is NEVER in the approved set (0 mutation on the decline path, AG-8).
     assert!(
-        !approved.contains("git.merge"),
+        !approved.contains_effect("git.merge", &merge_plan.object.0),
         "a rejected merge is NEVER admitted to approved (0 mutation, AG-8)"
     );
 

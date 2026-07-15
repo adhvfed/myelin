@@ -691,6 +691,12 @@ pub mod pseudonym_durable;
 pub mod reerase_durable;
 pub mod reserve_settle_durable;
 pub mod restore_verify_durable;
+// The durable PG backing for the agent-fabric HITL gate VERDICT store (R2.4): the §4.4
+// `agent_hitl_gate` table (migration 0054, FORCE RLS) behind the `HitlVerdictStore` role struct —
+// the server-side approval authority the MCP gate looks a presented gate_id up in (never a
+// caller-supplied boolean), with the distinct-approver rule enforced at decide time. The in-memory
+// arm is the `test-support`-gated test double (scanner-stripped).
+pub mod hitl_gate_durable;
 // The OLTP-co-located outbox relay (the one legitimate broker-publish site, BUS-2) — kept in its
 // own module so the broker-publish call is isolated to a single named relay file (the same
 // posture as myelin-events/src/relay.rs).
