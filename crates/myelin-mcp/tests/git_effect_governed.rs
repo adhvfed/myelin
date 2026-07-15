@@ -124,7 +124,7 @@ fn call_approved(name: &str, args: serde_json::Value) -> String {
 fn open_pr_routes_through_effect_api_and_persists_durably() {
     let root = temp_root("openpr");
     let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(&root));
-    backend.create_repo(TENANT, REGION, "alpha", &agent_principal("agent:claude")).expect("create repo");
+    backend.create_repo(TENANT, REGION, "alpha").expect("create repo");
 
     let server = governed_git_server(backend.clone());
 
@@ -172,7 +172,7 @@ fn open_pr_routes_through_effect_api_and_persists_durably() {
 fn merge_is_hitl_gated_then_reflects_the_server_gate_block() {
     let root = temp_root("merge");
     let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(&root));
-    backend.create_repo(TENANT, REGION, "alpha", &agent_principal("agent:claude")).expect("create repo");
+    backend.create_repo(TENANT, REGION, "alpha").expect("create repo");
     // Repo-owned branch protection: require a CI context that is never green → the merge gate must block.
     backend
         .set_branch_protection(

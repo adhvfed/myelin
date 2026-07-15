@@ -20,21 +20,13 @@
 //! `MYELIN_REQUIRE_RUNSC=1 cargo test -p myelin-edge --test git_wire_http_clone_oracle_test -- --nocapture`.
 
 use myelin_edge::{
-    register_git_wire, serve_edge, AllowAll, DurableGitBackend, GitCheckRepoAuthorizer, Gateway,
-    Method, RepoGrantWriter, TupleStoreGrantWriter, WhoamiHandler,
+    register_git_wire, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
 };
-use myelin_events::{OutboxStore, Timestamp};
-use myelin_git::core::RepoLoc;
-use myelin_git::live_check::GitCheckGate;
-use myelin_identity::{
-    DataRole, ObjectId, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RelName,
-    RelationTuple, TupleDelta,
-};
+use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
     CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
-    PasetoCapabilityVerifier, PrincipalStore, RevocationStore, StoreBackedCheck, TupleStore,
+    PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
 };
-use myelin_substrate::FailStaticThreshold;
 use myelin_ci_sandbox::{resolved_gvisor_rootfs, ENV_GVISOR_GIT_ROOTFS};
 use myelin_storage::{KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
@@ -277,92 +269,6 @@ fn build(root: &Path) -> (Arc<Gateway>, CellTokenAuthority) {
     (Arc::new(builder.build()), cell)
 }
 
-// ───────── the R2.1a LIVE-authorizer build: the wire gated by the real Identity `check` ─────────
-
-/// The FailStatic staleness bound the wire check gate is constructed with (the `[fail_static]` seed;
-/// `static_max ≤ revocation SLA`).
-fn threshold() -> FailStaticThreshold {
-    FailStaticThreshold {
-        status: "OPEN — LEGAL".into(),
-        owner: "DPO / Legal".into(),
-        static_max_secs: None,
-        static_max_default_secs: 300,
-        agent_token_ttl_secs: 60,
-        constraint: "static_max <= revocation-SLA AND static_max >= agent-token-TTL".into(),
-    }
-}
-
-/// The VERIFIED wire principal the minted `subj-1` token resolves to (the seeded `svc:agent` service
-/// principal in `tenant`, region `eu-west`) — the subject the grants below target + the check scopes on.
-fn wire_principal(tenant: &str) -> Principal {
-    let mut p = Principal::stub(
-        PrincipalId("svc:agent".into()),
-        PrincipalKind::Service,
-        TenantId(tenant.into()),
-    );
-    p.region = Region(REGION.into());
-    p
-}
-
-/// Write a `repo:<slug>#<relation>@svc:agent` grant into the SHARED tuple store the live check reads
-/// (the `reader` read-only leg; the admin bootstrap grant uses the [`TupleStoreGrantWriter`] seam).
-fn grant(store: &TupleStore, tenant: &str, slug: &str, relation: &str) {
-    let p = wire_principal(tenant);
-    let scope = TenantScope::from_verified_token(&p, p.region.clone());
-    let delta = TupleDelta::Add(RelationTuple {
-        object: ObjectId(format!("repo:{slug}")),
-        relation: RelName(relation.into()),
-        subject: PrincipalId("svc:agent".into()),
-        caveat: None,
-    });
-    store
-        .write_tuples(&scope, &p, &[delta], None, None, Timestamp("2026-07-15T00:00:00Z".into()))
-        .expect("write grant");
-}
-
-/// Build a gateway whose git wire is gated by the R2.1a LIVE per-repo authorizer (the real Identity
-/// `check` over an in-memory `StoreBackedCheck` with the Git fragment admitted) + the bootstrap-grant
-/// seam. Returns the gateway, the cell, and the SHARED tuple store (so a test can write grants that the
-/// wire check then honours) + the backend (so a test can drive the create-repo grant seam).
-fn build_live(root: &Path) -> (Arc<Gateway>, CellTokenAuthority, TupleStore, Arc<DurableGitBackend>) {
-    let cell = CellTokenAuthority::from_seed(&[7u8; 32], &[9u8; 32]).expect("cell authority");
-    let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
-    seed_principal(&store, "acme", "svc:agent", "subj-1");
-    seed_principal(&store, "globex", "svc:agent", "subj-1");
-    let authn = Arc::new(CapabilityAuthenticator::with_verifier(
-        store,
-        Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
-        RevocationStore::new(),
-    ));
-    let human_login =
-        Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(KmsEngine::new()))));
-
-    // The live wire authz slot: one in-memory tuple store shared by the check, the grant-writer seam,
-    // and the test (so grants written by any path are seen by the wire check).
-    let tuples = TupleStore::new(OutboxStore::new());
-    let check = StoreBackedCheck::new(tuples.clone());
-    for admit in check.admit_git_fragment() {
-        assert!(
-            matches!(admit, myelin_identity::FragmentAdmit::Admitted { .. }),
-            "the Git fragment admits: {admit:?}"
-        );
-    }
-    let gate = GitCheckGate::try_new(check, 300, &threshold()).expect("valid staleness bound");
-    let authorizer = Arc::new(GitCheckRepoAuthorizer::new(gate, RevocationStore::new()));
-    let grant_writer = Arc::new(TupleStoreGrantWriter::new(tuples.clone()));
-
-    let backend = Arc::new(
-        DurableGitBackend::rooted_inmem_for_test(root.to_path_buf())
-            .with_repo_authorizer(authorizer)
-            .with_grant_writer(grant_writer),
-    );
-    let builder = Gateway::builder(authn, human_login, Arc::new(AllowAll))
-        .default_token_scheme(SCHEME)
-        .route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler));
-    let builder = register_git_wire(builder, backend.clone());
-    (Arc::new(builder.build()), cell, tuples, backend)
-}
-
 fn mint(cell: &CellTokenAuthority, tenant: &str, jti: &str) -> String {
     cell.mint(&CapabilityMintSpec {
         tenant: tenant.into(),
@@ -549,81 +455,5 @@ async fn over_cap_upload_pack_response_errors_cleanly() {
         "an over-the-wire-cap upload-pack response MUST error cleanly (never a silently-truncated Ok pack)"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-// ═══════════ R2.1a: the R0 acceptance contract — un-granted repo reach is DENIED (0-leak) ═══════════
-
-/// **R2.1a — the LIVE per-repo authorizer over a real `git clone` (the R0 done-bar).** Drives the host's
-/// REAL `git` through the FULL gateway lifecycle (auth → IDOR → action-authorize → repo-authorize) with
-/// the wire gated by the real Identity `check`:
-///   (a) an in-tenant, authenticated principal with **NO grant** on the repo → `git clone` FAILS and the
-///       HTTP surface is a **0-leak 404** (no repo-existence signal);
-///   (b) after the **bootstrap admin grant** (written through the SAME create-repo seam) → the SAME
-///       `git clone` SUCCEEDS end-to-end (fsck-clean, HEAD matches) — the grant makes the repo usable;
-///   (c) a **read-only (`reader`) grant** on a second repo → `git clone` SUCCEEDS (pull is conferred).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn live_authorizer_denies_ungranted_clone_admits_granted() {
-    if !require_or_skip("r2.1a live-authorizer clone oracle") {
-        return;
-    }
-    let Some(_rootfs) = git_rootfs() else { return };
-
-    let root = temp_root("live-clone");
-    // Two real content-bearing repos on disk (the authorizer gates reach; the bytes are real).
-    let (widgets_head, _w1) = make_big_repo(&root, "acme", "eu-west", "widgets", 512 * 1024);
-    let (docs_head, _w2) = make_big_repo(&root, "acme", "eu-west", "docs", 512 * 1024);
-
-    let (gw, cell, tuples, _backend) = build_live(&root);
-    let addr = spawn(gw).await;
-    let token = mint(&cell, "acme", "jti-live-clone");
-
-    // ── (a) NO grant → real clone denied, 0-leak (no repo bytes, no existence signal) ──
-    let dst_denied = root.join("clone-denied");
-    let (ok_d, _so_d, se_d) =
-        git_clone(addr, Some(&token), "/acme/eu-west/widgets.git", &dst_denied);
-    println!("=== git clone (in-tenant, NO grant) — must be denied ===\nsuccess={ok_d}\nstderr=\n{se_d}");
-    assert!(
-        !ok_d,
-        "an in-tenant principal with NO grant on the repo MUST be denied the clone (un-granted-reach hole closed)"
-    );
-
-    // ── (b) bootstrap ADMIN grant via the SAME create-repo seam → clone succeeds end-to-end ──
-    // Write the creator→admin grant through the production grant-writer shape (the bootstrap seam).
-    TupleStoreGrantWriter::new(tuples.clone())
-        .grant_repo_admin(&wire_principal("acme"), &RepoLoc::new("acme", "eu-west", "widgets"))
-        .expect("bootstrap admin grant");
-    let dst_admin = root.join("clone-admin");
-    let (ok_a, _so_a, se_a) = git_clone(addr, Some(&token), "/acme/eu-west/widgets.git", &dst_admin);
-    println!("=== git clone (ADMIN grant) — must succeed ===\nsuccess={ok_a}\nstderr=\n{se_a}");
-    assert!(ok_a, "an admin-granted principal clones end-to-end through the live authorizer");
-    let fsck = Command::new("git")
-        .args(["-C", &dst_admin.to_string_lossy(), "fsck", "--full"])
-        .output()
-        .unwrap();
-    assert!(fsck.status.success(), "the granted clone is fsck-clean");
-    let head = Command::new("git")
-        .args(["-C", &dst_admin.to_string_lossy(), "rev-parse", "HEAD"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&head.stdout).trim(),
-        widgets_head,
-        "the granted clone's HEAD matches the origin"
-    );
-
-    // ── (c) read-only (reader) grant on `docs` → clone succeeds (pull is conferred) ──
-    grant(&tuples, "acme", "docs", "reader");
-    let dst_reader = root.join("clone-reader");
-    let (ok_r, _so_r, se_r) = git_clone(addr, Some(&token), "/acme/eu-west/docs.git", &dst_reader);
-    println!("=== git clone (READER grant) — must succeed ===\nsuccess={ok_r}\nstderr=\n{se_r}");
-    assert!(ok_r, "a read-only grant admits the clone (Read→pull)");
-    let rhead = Command::new("git")
-        .args(["-C", &dst_reader.to_string_lossy(), "rev-parse", "HEAD"])
-        .output()
-        .unwrap();
-    assert_eq!(String::from_utf8_lossy(&rhead.stdout).trim(), docs_head);
-
-    println!("=== R2.1a PROVEN (clone): un-granted repo reach DENIED (0-leak 404); admin+reader grants admit ===");
     let _ = std::fs::remove_dir_all(&root);
 }
