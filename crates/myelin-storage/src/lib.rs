@@ -890,8 +890,9 @@ pub use outbox_durable::PgOutboxBacking;
 #[cfg(feature = "integration")]
 pub use events_serve::{EventsRuntime, EventsServeError, DEFAULT_DRAIN_BATCH};
 pub use placement_durable::{
-    placement_durable_migrations, DurableCellRow, DurableMisrouteAuditBacking, DurableMisrouteRecord,
-    DurablePlacementBacking, DurablePlacementRow, PlacementWriteError,
+    placement_durable_migrations, DurableCellProvisioningRow, DurableCellRow,
+    DurableLocalTenantRow, DurableMisrouteAuditBacking, DurableMisrouteRecord,
+    DurablePlacementBacking, DurablePlacementRow, DurableRepoPlacementRow, PlacementWriteError,
 };
 // The durable KMS backing (MR-025 / SI-006): the software-sealed cell root + wrapped KEKs/DEKs over
 // the OLTP pool, with `load_or_generate` (fail-closed on a wrong seal key) + the env seal-key supply.

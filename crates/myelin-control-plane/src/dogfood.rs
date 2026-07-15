@@ -72,12 +72,27 @@ impl MyelinSelfHost {
     /// team as a real tenant (`slug` is the team's PII-free routing slug). With one `Active` cell the
     /// placement trivially resolves to "this cell" — the degeneracy, not a fork. Returns a loud
     /// [`PlaceError`] if (impossibly) the one cell were ineligible.
+    /// **TEST DOUBLE as of MR-009b W6d** (compiled only under
+    /// `#[cfg(any(test, feature = "test-support"))]` — it boots the in-memory
+    /// [`DegenerateControlPlane::bootstrap`]). A production dogfood install boots the durable
+    /// [`DegenerateControlPlane::with_pg`] and places the team via [`Self::bootstrap_team_on`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn bootstrap_team(
         cell_id: CellId,
         region: Region,
         slug: &str,
     ) -> Result<MyelinSelfHost, PlaceError> {
-        let mut control_plane = DegenerateControlPlane::bootstrap(cell_id, region);
+        Self::bootstrap_team_on(DegenerateControlPlane::bootstrap(cell_id, region), slug)
+    }
+
+    /// **Place the Myelin team on an ALREADY-BOOTED degenerate control plane (MR-009b W6d).** The
+    /// durable dogfood path: boot [`DegenerateControlPlane::with_pg`] (the Pg arm — the team's
+    /// placement survives a restart) and hand it here; the SAME [`PlacementService::place`] a fleet
+    /// cell calls places the team as just another tenant.
+    pub fn bootstrap_team_on(
+        mut control_plane: DegenerateControlPlane,
+        slug: &str,
+    ) -> Result<MyelinSelfHost, PlaceError> {
         let service = PlacementService::new(CounterMinter::new());
         // The SAME PlacementService::place a fleet cell calls — the team is just another placed tenant.
         let placement = control_plane.place(&service, IsolationKind::Pool, slug)?;

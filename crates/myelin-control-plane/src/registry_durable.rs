@@ -25,137 +25,24 @@
 //! to the OLTP pool directly — see the NAMED `tenant-predicate` exclusion in
 //! `myelin-storage/src/placement_durable.rs` / `tests/workspace_clean.rs`.
 //!
-//! ## Honesty (not overclaiming)
-//! Feature-gated `integration` (the default build stays DB-free; the in-memory [`Registry`] is the
-//! default). PRODUCTION BOOT selecting the Pg arm (wiring `with_pg` into the cell-orchestration boot
-//! spec) + the kill-9/restart proof is **MR-009**, exactly as identity left `PrincipalStore::with_pg`
-//! unwired. What MR-024 delivers + proves: the durable tables, the REAL invariant TRIGGER, the
-//! durable audit sink, and THIS binding (proven durable against live PG in the storage integration
-//! tests).
+//! ## Status as of MR-009b W6d (the durable-by-default flip)
+//! Compiled UNCONDITIONALLY (the `integration` feature is a test-selector only). The canonical
+//! [`Registry`] is itself now a role struct whose ALWAYS-COMPILED production backend is the durable
+//! PG whole surface (`Registry::with_pg` — cell + tenant_placement + repo_placement +
+//! cell_provisioning + local_tenant, migrations 0030–0039), so THIS binding's `Memory(Registry)`
+//! arm is the `test-support`-gated double and its `with_pg` arm remains the narrow MR-024 surface
+//! (cell + tenant_placement + misroute_audit) the MR-024 live proofs exercise.
 
-use myelin_storage::{
-    DurableCellRow, DurableMisrouteAuditBacking, DurablePlacementBacking, DurablePlacementRow,
-    PlacementWriteError,
-};
-use myelin_tenancy::{CellId, Region, TenantId};
+use myelin_storage::{DurableMisrouteAuditBacking, DurablePlacementBacking, PlacementWriteError};
+use myelin_tenancy::{CellId, TenantId};
 
 use crate::placement_of::{MisrouteAuditRecord, PlacementOf};
+// One converter set for the whole crate (W6d): the opaque-text <-> typed-enum mappers live in
+// `crate::registry` (the role-struct's own Pg arm uses them) and are reused here.
+use crate::registry::{cell_to_durable, durable_to_cell, durable_to_placement, placement_to_durable};
+#[cfg(any(test, feature = "test-support"))]
 use crate::registry::Registry;
-use crate::schema::{
-    Capacity, Cell, CellStatus, IsolationKind, PlacementStatus, TenantPlacement,
-};
-
-// =================================================================================================
-// Opaque-text <-> typed-enum converters (the storage layer holds opaque text; the control-plane owns
-// the closed enums). Total + round-tripping; an unknown variant fails CLOSED (never silently coerced).
-// =================================================================================================
-
-fn cell_status_text(s: CellStatus) -> &'static str {
-    match s {
-        CellStatus::Provisioning => "Provisioning",
-        CellStatus::Active => "Active",
-        CellStatus::Draining => "Draining",
-    }
-}
-
-fn cell_status_from(s: &str) -> Option<CellStatus> {
-    match s {
-        "Provisioning" => Some(CellStatus::Provisioning),
-        "Active" => Some(CellStatus::Active),
-        "Draining" => Some(CellStatus::Draining),
-        _ => None,
-    }
-}
-
-fn isolation_text(k: IsolationKind) -> &'static str {
-    match k {
-        IsolationKind::Pool => "Pool",
-        IsolationKind::Bridge => "Bridge",
-        IsolationKind::Dedicated => "Dedicated",
-    }
-}
-
-fn isolation_from(s: &str) -> Option<IsolationKind> {
-    match s {
-        "Pool" => Some(IsolationKind::Pool),
-        "Bridge" => Some(IsolationKind::Bridge),
-        "Dedicated" => Some(IsolationKind::Dedicated),
-        _ => None,
-    }
-}
-
-fn placement_status_text(s: PlacementStatus) -> &'static str {
-    match s {
-        PlacementStatus::Pending => "Pending",
-        PlacementStatus::Active => "Active",
-        PlacementStatus::Offboarding => "Offboarding",
-    }
-}
-
-fn placement_status_from(s: &str) -> Option<PlacementStatus> {
-    match s {
-        "Pending" => Some(PlacementStatus::Pending),
-        "Active" => Some(PlacementStatus::Active),
-        "Offboarding" => Some(PlacementStatus::Offboarding),
-        _ => None,
-    }
-}
-
-fn cell_to_durable(c: &Cell) -> DurableCellRow {
-    DurableCellRow {
-        cell_id: c.cell_id.as_str().to_string(),
-        region: c.region.as_str().to_string(),
-        status: cell_status_text(c.status).to_string(),
-        isolation_kind: isolation_text(c.isolation_kind).to_string(),
-        tenants_max: c.capacity.tenants_max as i64,
-        write_qps_max: c.capacity.write_qps_max as i64,
-        storage_bytes_max: c.capacity.storage_bytes_max as i64,
-        utilisation: c.utilisation as i16,
-        version: c.version as i64,
-        endpoint: c.endpoint.clone(),
-    }
-}
-
-fn durable_to_cell(r: &DurableCellRow) -> Option<Cell> {
-    Some(Cell {
-        cell_id: CellId::from_token(&r.cell_id),
-        region: Region::new(&r.region),
-        status: cell_status_from(&r.status)?,
-        isolation_kind: isolation_from(&r.isolation_kind)?,
-        capacity: Capacity {
-            tenants_max: r.tenants_max as u32,
-            write_qps_max: r.write_qps_max as u32,
-            storage_bytes_max: r.storage_bytes_max as u64,
-        },
-        utilisation: r.utilisation as u8,
-        version: r.version as u32,
-        endpoint: r.endpoint.clone(),
-    })
-}
-
-fn placement_to_durable(p: &TenantPlacement) -> DurablePlacementRow {
-    DurablePlacementRow {
-        tenant_id: p.tenant_id.as_str().to_string(),
-        region: p.region.as_str().to_string(),
-        home_cell: p.home_cell.as_str().to_string(),
-        isolation_tier: isolation_text(p.isolation_tier).to_string(),
-        slug: p.slug.clone(),
-        status: placement_status_text(p.status).to_string(),
-        member_cells: p.member_cells.iter().map(|c| c.as_str().to_string()).collect(),
-    }
-}
-
-fn durable_to_placement(r: &DurablePlacementRow) -> Option<TenantPlacement> {
-    Some(TenantPlacement {
-        tenant_id: TenantId::from_token(&r.tenant_id),
-        region: Region::new(&r.region),
-        home_cell: CellId::from_token(&r.home_cell),
-        isolation_tier: isolation_from(&r.isolation_tier)?,
-        slug: r.slug.clone(),
-        status: placement_status_from(&r.status)?,
-        member_cells: r.member_cells.iter().map(|c| CellId::from_token(c)).collect(),
-    })
-}
+use crate::schema::{Cell, TenantPlacement};
 
 // =================================================================================================
 // The Pg backing handle + the sync→async bridge.
@@ -181,8 +68,10 @@ impl PgPlacement {
 /// PG backing. Splitting the backing out of the role struct is what makes the Pg arm a clean swap.
 #[derive(Clone)]
 enum PlacementBackend {
-    /// The in-memory test-double (the DB-free default) — the canonical [`Registry`]. NOT the
-    /// production system-of-record.
+    /// The in-memory test-double — the canonical [`Registry`] on ITS OWN `test-support`-gated
+    /// Memory arm (MR-009b W6d: compiled only under `#[cfg(any(test, feature = "test-support"))]`;
+    /// NOT the production system-of-record).
+    #[cfg(any(test, feature = "test-support"))]
     Memory(Registry),
     /// The REAL durable PG backing (MR-024) — the system-of-record (durable tables + the invariant
     /// TRIGGER + the durable audit sink).
@@ -200,14 +89,18 @@ pub struct DurablePlacementRegistry {
 }
 
 impl DurablePlacementRegistry {
-    /// The in-memory test-double over a fresh canonical [`Registry`] (the DB-free default).
+    /// The in-memory test-double over a fresh canonical [`Registry`] — **TEST DOUBLE** (MR-009b
+    /// W6d: compiled only under `#[cfg(any(test, feature = "test-support"))]`).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn in_memory() -> DurablePlacementRegistry {
         DurablePlacementRegistry {
             backend: PlacementBackend::Memory(Registry::new()),
         }
     }
 
-    /// Wrap an existing canonical [`Registry`] as the Memory arm (so existing in-memory state binds).
+    /// Wrap an existing canonical [`Registry`] as the Memory arm — **TEST DOUBLE** (gated as
+    /// [`Self::in_memory`]).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_registry(reg: Registry) -> DurablePlacementRegistry {
         DurablePlacementRegistry {
             backend: PlacementBackend::Memory(reg),
@@ -237,6 +130,7 @@ impl DurablePlacementRegistry {
     /// path never overwrites it; the Memory arm has no `update_cell_region`).
     pub fn insert_cell(&mut self, cell: Cell) -> Result<(), PlacementWriteError> {
         match &mut self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             PlacementBackend::Memory(reg) => {
                 reg.insert_cell(cell);
                 Ok(())
@@ -250,7 +144,8 @@ impl DurablePlacementRegistry {
     /// Look up a `cell` by opaque id.
     pub fn cell(&self, cell_id: &CellId) -> Option<Cell> {
         match &self.backend {
-            PlacementBackend::Memory(reg) => reg.cell(cell_id).cloned(),
+            #[cfg(any(test, feature = "test-support"))]
+            PlacementBackend::Memory(reg) => reg.cell(cell_id),
             PlacementBackend::Pg(pg) => pg
                 .block(pg.placement.get_cell(cell_id.as_str()))
                 .ok()
@@ -267,6 +162,7 @@ impl DurablePlacementRegistry {
         placement: TenantPlacement,
     ) -> Result<(), PlacementWriteError> {
         match &mut self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             PlacementBackend::Memory(reg) => match reg.place_tenant(placement) {
                 Ok(_) => Ok(()),
                 // Surface the in-code invariant rejection in the SAME shape the Pg trigger does.
@@ -281,7 +177,8 @@ impl DurablePlacementRegistry {
     /// Look up a `tenant_placement` row by opaque tenant id.
     pub fn placement(&self, tenant_id: &TenantId) -> Option<TenantPlacement> {
         match &self.backend {
-            PlacementBackend::Memory(reg) => reg.placement(tenant_id).cloned(),
+            #[cfg(any(test, feature = "test-support"))]
+            PlacementBackend::Memory(reg) => reg.placement(tenant_id),
             PlacementBackend::Pg(pg) => pg
                 .block(pg.placement.get_placement(tenant_id.as_str()))
                 .ok()
@@ -295,6 +192,7 @@ impl DurablePlacementRegistry {
     /// `None` for an unplaced tenant. The same frozen tuple [`Registry::placement_of`] returns.
     pub fn placement_of(&self, tenant_id: &TenantId) -> Option<PlacementOf> {
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             PlacementBackend::Memory(reg) => reg.placement_of(tenant_id),
             PlacementBackend::Pg(_) => self.placement(tenant_id).map(|p| PlacementOf {
                 region: p.region,
@@ -312,6 +210,7 @@ impl DurablePlacementRegistry {
     /// a no-op so the binding is uniform; the durable trail is the Pg arm's job.
     pub fn record_misroute(&self, rec: &MisrouteAuditRecord) -> Result<(), PlacementWriteError> {
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             PlacementBackend::Memory(_) => Ok(()),
             PlacementBackend::Pg(pg) => pg
                 .block(pg.audit.record(
@@ -327,6 +226,7 @@ impl DurablePlacementRegistry {
     /// [`Self::record_misroute`]).
     pub fn audited_misroute_count(&self) -> i64 {
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             PlacementBackend::Memory(_) => 0,
             PlacementBackend::Pg(pg) => pg.block(pg.audit.count()).unwrap_or(0),
         }
@@ -336,6 +236,8 @@ impl DurablePlacementRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{Capacity, CellStatus, IsolationKind, PlacementStatus};
+    use myelin_tenancy::Region;
 
     fn cell(id: &str, region: &str) -> Cell {
         Cell {

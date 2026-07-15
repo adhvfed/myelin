@@ -8,14 +8,18 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
-# MR-024: the durable PG binding for the placement registry (the `Pg` arm of the registry's backend
-# enum) compiles ONLY under `integration` — it pulls myelin-storage's real sqlx-backed durable
-# placement backing + a tokio runtime handle for the sync→async bridge. The DEFAULT build/test stays
-# DB-free (the in-memory Registry is the default test-double), exactly like identity-service's
-# `integration` feature gates its `with_pg` path. Production boot selecting the Pg arm is MR-009.
+# MR-024 → MR-009b W6d: the durable PG binding for the placement registry (the `Pg` arm of the
+# registry's backend enum) now compiles UNCONDITIONALLY and is the production default — the
+# in-memory `Registry`/`MisrouteAudit` doubles are `test-support`-gated. The DEFAULT build/test
+# stays DB-free (all durable code is runtime `sqlx::query(&str)`; no live DB at build time).
 [features]
 default = []
-integration = ["myelin-storage/integration", "dep:tokio"]
+# MR-009b W6d: `integration` is now a TEST-SELECTOR only (the live-PG proof tests gate on it) — the
+# durable Pg arm of the placement `Registry` / `MisrouteAudit` / `DurablePlacementRegistry` compiles
+# UNCONDITIONALLY (tokio is a plain dependency below; sqlx is non-optional in myelin-storage post-W1),
+# exactly like the identity-service Wave-2 flip. It still enables the storage/events live-bus test
+# surface transitively.
+integration = ["myelin-storage/integration"]
 
 # MR-009b Wave 0 — the `test-support` cargo feature (alias `memory`). It gates the control-plane's
 # in-memory durable-store DOUBLES (the placement `Registry` `Memory` arm, `CellResolverRegistry`,
@@ -96,10 +100,13 @@ hex = { workspace = true }
 # in-memory (the real engine's Postgres six-table model is the named myelin-flow floor); the control
 # plane consumes the engine-agnostic `DurableExecutor` TRAIT, never a concrete DB-bound engine.
 myelin-flow = { path = "../myelin-flow" }
-# MR-024: the sync→async bridge for the durable placement backing (block_in_place + block_on),
-# matching the sync Registry API to the async sqlx backing. Optional — pulled ONLY by `integration`
-# (the same posture identity-service / storage use for their live-PG code). DB-free by default.
-tokio = { workspace = true, optional = true }
+# MR-024 → MR-009b W6d: the sync→async bridge for the durable placement backing (block_in_place +
+# block_on), matching the sync Registry API to the async sqlx backing. NON-OPTIONAL as of W6d — the
+# placement `Registry` / `MisrouteAudit` Pg arms are the ALWAYS-COMPILED production backends (the
+# in-memory arms are `test-support`-gated doubles), so the bridge must compile in the default build.
+# tokio is already a non-optional dependency of myelin-storage (W1), so this adds no new production
+# DAG edge. `cargo build --workspace` stays DB-free: all queries are runtime `sqlx::query(&str)`.
+tokio = { workspace = true }
 
 [dev-dependencies]
 # MR-009b W6c-cp — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN test

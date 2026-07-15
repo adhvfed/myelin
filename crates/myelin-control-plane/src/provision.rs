@@ -556,10 +556,10 @@ mod tests {
         assert_eq!(signals.cells_activated, 1);
         assert_eq!(signals.cells_held_provisioning, 0);
         // Every gating step + the activation are recorded in the cell_provisioning log.
-        let steps: Vec<&str> = reg
+        let steps: Vec<String> = reg
             .provisioning_log()
             .iter()
-            .map(|e| e.step.as_str())
+            .map(|e| e.step.clone())
             .collect();
         assert_eq!(
             steps,
