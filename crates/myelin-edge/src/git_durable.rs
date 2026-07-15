@@ -28,6 +28,7 @@ use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::git_edge::{map_method, num_param, param, reroot, tenant_of};
 use crate::repo_authz::{AllowAllRepos, RepoAuthorizer};
+use crate::repo_authz_live::RepoGrantWriter;
 use crate::request::EdgeResponse;
 use myelin_events::{Actor, EmitContextBase, IdMinter, OutboxStore, Region, TenantId, Timestamp};
 // Used only by the `test-support`-gated `rooted_inmem_for_test` helper (MR-009b W3b.6).
@@ -78,6 +79,13 @@ pub struct DurableGitBackend {
     /// production boot injects a grant-backed authorizer via [`DurableGitBackend::with_repo_authorizer`]
     /// — the R2 platform-wide object-authz seam backs this with the real tuple store / Identity `check`.
     repo_authz: Arc<dyn RepoAuthorizer>,
+    /// **R2.1a — the create-repo bootstrap-grant seam.** Repo creation writes NO ReBAC tuples on its
+    /// own, so under a deny-by-default authorizer a fresh repo is born unreachable. When present (the
+    /// production boot injects it via [`DurableGitBackend::with_grant_writer`], wired to the SAME
+    /// tuple store the [`DurableGitBackend::repo_authorizer`] checks against), the create path writes
+    /// the creator→admin grant BEFORE the repo lands on disk — grant-first + fail-loud, so a repo is
+    /// never born on disk without its grant. Absent (the default, and every DB-free test) = no write.
+    grant_writer: Option<Arc<dyn RepoGrantWriter>>,
 }
 
 impl DurableGitBackend {
@@ -106,6 +114,7 @@ impl DurableGitBackend {
             clone_host: "ssh://git@myelin".into(),
             root,
             repo_authz: Arc::new(AllowAllRepos),
+            grant_writer: None,
         }
     }
 
@@ -136,6 +145,15 @@ impl DurableGitBackend {
     /// The injected R0.3 per-repo object authorizer (the wire handlers consult this before serving).
     pub fn repo_authorizer(&self) -> &Arc<dyn RepoAuthorizer> {
         &self.repo_authz
+    }
+
+    /// **Inject the R2.1a create-repo bootstrap-grant seam** — the writer that stamps the creator→admin
+    /// tuple so a freshly-created repo is reachable under the deny-by-default wire authorizer. Boot
+    /// wires the [`crate::repo_authz_live::TupleStoreGrantWriter`] over the SAME tuple store the injected
+    /// [`RepoAuthorizer`] checks against; absent = no grant is written (DB-free tests unchanged).
+    pub fn with_grant_writer(mut self, grant_writer: Arc<dyn RepoGrantWriter>) -> DurableGitBackend {
+        self.grant_writer = Some(grant_writer);
+        self
     }
 
     /// **The wire-serving `GitCore` over the SAME on-disk root (CT-006b / GT-006).** Composes the
@@ -220,15 +238,29 @@ impl DurableGitBackend {
 
     /// Create a bare repo on disk under the verified `(tenant, region)`. Returns `true` iff newly created
     /// (an existing repo is a conflict the handler surfaces as `409`). Traversal-safe via the resolver.
+    ///
+    /// **R2.1a — the bootstrap grant is GRANT-FIRST + fail-loud.** When a [`RepoGrantWriter`] seam is
+    /// injected, the creator→admin ReBAC tuple is written BEFORE the on-disk create: so a repo never
+    /// lands on disk without the grant that makes it reachable under the deny-by-default wire authorizer
+    /// (no orphaned unreachable repo). A grant-write failure aborts the create (returns `Err`, nothing
+    /// on disk). Absent seam = no grant write (the DB-free tests / the in-memory backend are unchanged).
+    /// `principal` is the verified creator the grant is written to.
     pub fn create_repo(
         &self,
         tenant: &str,
         region: &str,
         slug: &str,
+        principal: &Principal,
     ) -> Result<bool, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         if self.store.repo_exists(&loc) {
             return Ok(false);
+        }
+        // Grant-first: write the creator→admin bootstrap grant, then create on disk. A grant failure is
+        // FAIL-LOUD (the repo is never created) — the create can't leave an unreachable repo behind.
+        if let Some(gw) = &self.grant_writer {
+            gw.grant_repo_admin(principal, &loc)
+                .map_err(DurableError::Git)?;
         }
         self.store.create_repo(&loc)?;
         Ok(true)
@@ -1163,7 +1195,7 @@ impl Handler for DRepoCreate {
             .ok_or_else(|| EdgeError::BadRequest("create-repo body missing `slug`".into()))?;
         let created = self
             .be
-            .create_repo(tenant_of(ctx), region_of(ctx), slug)
+            .create_repo(tenant_of(ctx), region_of(ctx), slug, ctx.principal)
             .map_err(map_durable_err)?;
         if !created {
             return Err(EdgeError::Conflict(format!("repo `{slug}` already exists")));

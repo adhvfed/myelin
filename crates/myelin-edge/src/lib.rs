@@ -76,6 +76,7 @@ pub mod git_receive_pack;
 pub mod git_wire_exec;
 pub mod git_wire_http;
 pub mod repo_authz;
+pub mod repo_authz_live;
 pub mod request;
 pub mod server;
 pub mod session;
@@ -88,6 +89,9 @@ pub use git_effect::GitEffectApi;
 pub use git_wire_exec::{production_git_core, production_git_core_default, GitWireExecutor};
 pub use git_wire_http::register_git_wire;
 pub use repo_authz::{AllowAllRepos, DenyAllRepos, GrantBackedRepos, RepoAccess, RepoAuthorizer};
+pub use repo_authz_live::{
+    repo_object_ref, GitCheckRepoAuthorizer, RepoGrantWriter, TupleStoreGrantWriter,
+};
 pub use catalogue::{
     page_envelope, Handler, HandlerCtx, Method, Page, API_VERSION, DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,

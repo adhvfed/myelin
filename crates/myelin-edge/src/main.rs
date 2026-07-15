@@ -14,17 +14,21 @@
 
 use myelin_config::{Mode, MyelinConfig};
 use myelin_edge::{
-    register_git_durable, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
+    register_git_durable, register_git_wire, serve_edge, AllowAll, DurableGitBackend,
+    GitCheckRepoAuthorizer, Gateway, Method, TupleStoreGrantWriter, WhoamiHandler,
 };
 use myelin_events::OutboxStore;
+use myelin_git::live_check::GitCheckGate;
+use myelin_identity::FragmentAdmit;
 use myelin_identity_service::{
     CapabilityAuthenticator, CellTokenAuthority, HumanSsoAuthenticator, PasetoCapabilityVerifier,
-    PrincipalStore, RevocationStore,
+    PrincipalStore, RevocationStore, StoreBackedCheck, TupleStore,
 };
 use myelin_storage::{
     all_durable_migrations, seal_key_from_env, DurableKmsBacking, DurablePrincipalBacking,
-    DurableRevocationBacking, HotTables, PgOutboxBacking, SubstrateProvider,
+    DurableRevocationBacking, DurableTupleBacking, HotTables, PgOutboxBacking, SubstrateProvider,
 };
+use myelin_substrate::Thresholds;
 use std::sync::Arc;
 
 #[tokio::main]
@@ -112,8 +116,10 @@ async fn main() {
 
     // The REAL PASETO Bearer verifier over a freshly-generated cell authority (genuine Ed25519 crypto
     // — a forged token is rejected). The production cell-root LOAD + the seeded S1 directory is the
-    // MR-015+ composition root; here a generated cell makes the bootable shell do real crypto.
-    let cell = CellTokenAuthority::generate();
+    // MR-015+ composition root; here a generated cell makes the bootable shell do real crypto. Held in
+    // an `Arc` so the SAME cell authority roots both the token verifier AND the git-wire check slot's
+    // run-token signer (R2.1a — one cell trust anchor, one signing key).
+    let cell = Arc::new(CellTokenAuthority::generate());
     let authn = Arc::new(CapabilityAuthenticator::with_verifier(
         PrincipalStore::with_pg(
             kms.clone(),
@@ -127,11 +133,12 @@ async fn main() {
         ),
     ));
     // The refuse-not-mock production human verifier (login refuses until JWKS/trust-anchors land),
-    // over the durable S1 principal directory.
+    // over the durable S1 principal directory. `provider`/`handle` are CLONED (not moved) so the
+    // R2.1a git-wire authz slot below wires its durable S3 tuple store + S7 denylist over the same pool.
     let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::with_pg(
         kms.clone(),
-        DurablePrincipalBacking::new(provider),
-        handle,
+        DurablePrincipalBacking::new(provider.clone()),
+        handle.clone(),
     )));
 
     // The Git subsystem wired through the edge over the DURABLE on-disk backend (GT-003): its
@@ -147,7 +154,51 @@ async fn main() {
             .to_string_lossy()
             .into()
     });
-    let git_backend = Arc::new(DurableGitBackend::rooted(git_root, git_outbox, git_minter));
+    // ── R2.1a — THE FLIP: wire the R0.2/R0.3 git-wire security gates LIVE in production. ──
+    // The per-repo object-authz seam ([`RepoAuthorizer`]) is now backed by the REAL Identity `check`
+    // over the durable ReBAC tuple store — the doctrinal `GitCheckGate` (one engine, one fail-static
+    // cache, one check path). An in-tenant principal with NO grant on repo X can no longer clone/fetch
+    // (0-leak 404) or push (403) X; the creator gets a bootstrap admin grant so their repo is usable.
+    //
+    // The durable S3 tuple store + S7 denylist ride the same MR-022 provider pool as the identity
+    // stores. The frozen Git ReBAC fragment (repo/ref/pull_request/pr_comment) is admitted at boot so
+    // `pull`/`push` resolve their rich rewrites — FAIL LOUD if admission rejects (never a silent
+    // vacuous authorizer). The FailStatic bound (`static_max ≤ revocation SLA`) is sourced from the
+    // canonical thresholds file; a bound violation does NOT construct (fail loud).
+    let git_check =
+        StoreBackedCheck::with_pg(provider.clone(), kms.clone(), cell.clone(), handle.clone());
+    for admit in git_check.admit_git_fragment() {
+        if let FragmentAdmit::Rejected { reason } = admit {
+            eprintln!("edge: the Git ReBAC fragment failed to admit (the wire authz would be vacuous): {reason}");
+            std::process::exit(1);
+        }
+    }
+    // The wire authorizer consults the SAME S7 denylist the check slot does (one revocation oracle).
+    let git_revocations = git_check.revocations().clone();
+    let thresholds = Thresholds::load_canonical().unwrap_or_else(|e| {
+        eprintln!("edge: cannot load the canonical thresholds file (the fail-static bound source): {e}");
+        std::process::exit(1);
+    });
+    // N (the revocation SLA) in seconds — the upper bound on the fail-static staleness window.
+    let revocation_sla_secs = thresholds.revocation.sla_mins * 60;
+    let git_gate = GitCheckGate::try_new(git_check, revocation_sla_secs, &thresholds.fail_static)
+        .unwrap_or_else(|e| {
+            eprintln!("edge: the git→Id check gate rejected the fail-static bound (static_max ≤ revocation SLA): {e:?}");
+            std::process::exit(1);
+        });
+    let repo_authorizer = Arc::new(GitCheckRepoAuthorizer::new(git_gate, git_revocations));
+    // The create-repo bootstrap-grant writer over the durable `rebac_tuple` store (the SAME backing the
+    // check reads) — a fresh repo's creator→admin grant is co-committed through the outbox (contract 4.6).
+    let grant_writer = Arc::new(TupleStoreGrantWriter::new(TupleStore::with_pg(
+        DurableTupleBacking::new(provider.clone()),
+        handle.clone(),
+    )));
+
+    let git_backend = Arc::new(
+        DurableGitBackend::rooted(git_root, git_outbox, git_minter)
+            .with_repo_authorizer(repo_authorizer)
+            .with_grant_writer(grant_writer),
+    );
 
     let mut builder = Gateway::builder(authn, human_login, Arc::new(AllowAll))
         .route(
@@ -163,7 +214,11 @@ async fn main() {
             Arc::new(WhoamiHandler),
         )
         .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge");
-    builder = register_git_durable(builder, git_backend);
+    // The durable `/v1/git/...` product routes AND the git smart-HTTP wire routes share the SAME
+    // backend Arc (one authorizer, one grant-writer, one on-disk root). register_git_wire is THE FLIP:
+    // the clone/fetch/push wire now exists in production, gated by the live per-repo authorizer above.
+    builder = register_git_durable(builder, git_backend.clone());
+    builder = register_git_wire(builder, git_backend);
     let gateway = Arc::new(builder.build());
 
     let addr = std::env::var("MYELIN_EDGE_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
