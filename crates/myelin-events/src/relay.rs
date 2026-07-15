@@ -291,6 +291,13 @@ impl BusTransport for Box<dyn BusTransport> {
 /// retry — never an unbounded retry-storm). EB-04 may tune this; the floor default is 5.
 pub const MAX_PUBLISH_ATTEMPTS: u32 = 5;
 
+/// The default batch size a single durable [`Relay::drain_once`] pass claims + publishes (the
+/// `FOR UPDATE SKIP LOCKED` claim bound). The in-memory arm claims every unsent row in one pass;
+/// the durable arm bounds each pass so a hot outbox drains over several passes (a later wave may
+/// tune this). Only observed on the `Durable` backend (passed to
+/// [`DurableOutboxBacking::drain_once`]).
+pub const DEFAULT_DRAIN_BATCH: usize = 256;
+
 /// The dead-letter alert the relay raises when a row exhausts [`MAX_PUBLISH_ATTEMPTS`] (EB-04,
 /// arch §4.1: "dead-letter to `dlq.<tenant>.<subsystem>` after N attempts with a Signal alert").
 /// A dead-letter is **never silent**: it is surfaced both as the `dead_letter_count` survival
@@ -410,6 +417,19 @@ impl<T: BusTransport> Relay<T> {
     /// [`DrainReport`]. Idempotent: re-running after a crash mid-publish re-claims the unsent
     /// rows and the broker dedup suppresses any double-delivery (0 ghost).
     pub fn drain_once(&self) -> DrainReport {
+        // Durable dispatch: the whole claim → publish → mark-sent / dead-letter pass is ONE
+        // composite verb on the backing (it owns the `FOR UPDATE SKIP LOCKED` claim atomicity).
+        if let Some(backing) = self.store.durable_backing() {
+            // STAGED DEBT (W3b.1 verifier finding): a backing `Err` collapses to an all-zero
+            // `DrainReport` — indistinguishable from "outbox empty". Unreachable today (no
+            // production Durable store is constructed until W3b.4), and a stalled drain stays
+            // visible via `outbox_depth`/`oldest_unsent_recorded_at` (contract-1.8 survival
+            // signals) — but W3b.2 MUST surface this error (report it / log it LOUDLY) when it
+            // defines the backing's error semantics. Do NOT let this swallow ship past W3b.2.
+            return backing
+                .drain_once(&self.transport, DEFAULT_DRAIN_BATCH)
+                .unwrap_or_default();
+        }
         let mut report = DrainReport::default();
         let claimed = self.store.claim_unsent();
         for row in claimed {
@@ -496,7 +516,11 @@ impl OutboxStore {
     /// `(aggregate, seq)`. A claimed row is marked so a SECOND relay worker's claim SKIPs it (no
     /// double-claim across replicas). Returns the claimed rows for the relay to publish.
     pub(crate) fn claim_unsent(&self) -> Vec<OutboxRow> {
-        let mut inner = self.lock_inner();
+        // Memory-arm mechanic: the durable arm claims inside its own `drain_once` composite verb,
+        // never here (so a `Durable` store yields no in-memory claim).
+        let Some(mut inner) = self.mem() else {
+            return Vec::new();
+        };
         // Collect unsent + unclaimed ids in insertion order, then sort by (aggregate, seq) so a
         // given aggregate drains in order (per-aggregate ordering, D-9).
         let mut to_claim: Vec<OutboxRow> = inner
@@ -514,7 +538,9 @@ impl OutboxStore {
 
     /// Mark a row published (the relay published it / the broker deduped it). Releases the claim.
     pub(crate) fn mark_published(&self, id: &EventId, at: Timestamp) {
-        let mut inner = self.lock_inner();
+        let Some(mut inner) = self.mem() else {
+            return;
+        };
         if let Some(row) = inner.rows.get_mut(id) {
             row.published_at = Some(at);
         }
@@ -524,7 +550,9 @@ impl OutboxStore {
     /// Record a failed publish attempt (broker unreachable): bump `attempts`, release the claim
     /// so the row is re-claimable next pass. Returns the new attempt count.
     pub(crate) fn fail_attempt(&self, id: &EventId) -> u32 {
-        let mut inner = self.lock_inner();
+        let Some(mut inner) = self.mem() else {
+            return 0;
+        };
         let attempts = if let Some(row) = inner.rows.get_mut(id) {
             row.attempts += 1;
             row.attempts
@@ -540,7 +568,9 @@ impl OutboxStore {
     /// the relay ([`Relay::drain_once`], EB-04). It is no longer in `outbox_depth` (it is not
     /// lost — it is quarantined, visibly, in `dead_letter_count`).
     pub(crate) fn dead_letter(&self, id: &EventId) {
-        let mut inner = self.lock_inner();
+        let Some(mut inner) = self.mem() else {
+            return;
+        };
         if let Some(row) = inner.rows.remove(id) {
             inner.order.retain(|x| x != id);
             inner.dead_letters.push(row);
@@ -556,7 +586,10 @@ impl OutboxStore {
     /// **unsent** row (`published_at IS NULL`, the rows `outbox_depth` counts) is NEVER reaped —
     /// GC can only ever free already-delivered rows from the dedup/audit retention window.
     pub(crate) fn gc_published_before(&self, cutoff: &Timestamp) -> usize {
-        let mut inner = self.lock_inner();
+        // Memory-arm GC mechanic; the durable arm reaps in the DB (a later wave), never here.
+        let Some(mut inner) = self.mem() else {
+            return 0;
+        };
         let reap: Vec<EventId> = inner
             .rows
             .values()

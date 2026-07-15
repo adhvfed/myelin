@@ -86,6 +86,7 @@
 //! flakiness); the real wall-clock+random ULID source is wired at P-S12 and implements the
 //! SAME [`IdMinter`] trait — the relay/store do not change.
 
+use crate::relay::{BusTransport, DrainReport};
 use crate::{
     derive_envelope, AggregateKey, EmitContext, EventDraft, EventEnvelope, EventId, OutboxError,
     OutboxTx, Result,
@@ -228,13 +229,122 @@ pub(crate) struct Inner {
 /// its event. This is the silent-data-loss floor, correct-by-construction.
 #[derive(Clone, Default)]
 pub struct OutboxStore {
-    inner: Arc<Mutex<Inner>>,
+    backend: OutboxBackend,
+}
+
+/// **The durable backing seam for the `outbox` table + relay (SI-007, MR-009b W3b).** A real
+/// `outbox` table over the OLTP pool implements this so the transactional co-commit + the
+/// unsent-row ledger + the relay drain **survive a process restart** (a committed-but-unsent row
+/// after a restart is still relayed because it lives in Postgres, not a per-process
+/// `Arc<Mutex<Inner>>`). The verbs mirror the in-memory store's: the durable arm of
+/// [`OutboxTransaction::commit`] ([`commit_staged`](DurableOutboxBacking::commit_staged) — all
+/// staged rows in ONE atomic commit) + the contract-1.8 read signals + the SINGLE composite relay
+/// verb [`drain_once`](DurableOutboxBacking::drain_once). The trait is SYNC to match the emit /
+/// relay call sites; a PG impl bridges to async internally (`block_in_place` + `block_on`), the
+/// same bridge [`crate::nats::NatsJetStreamBus`] uses.
+///
+/// **The co-commit FLOOR (named, not silently skipped):** the real emit-iff-committed guarantee
+/// (BUS-D4) is the outbox row inserted in the SAME transaction as the caller's state write. This
+/// seam's [`commit_staged`](DurableOutboxBacking::commit_staged) takes the staged rows and commits
+/// them atomically; threading the caller's OWN state-write transaction INTO the same commit is the
+/// per-subsystem emit re-point (W3b.2+ / `PgRelay::co_commit_in_tx`) beyond this role-struct step.
+/// THIS seam delivers the durable ledger + restart-surviving relay; the in-caller's-tx co-commit
+/// stays the documented floor. `drain_once` is a SINGLE composite verb (claim →
+/// publish → mark-sent / dead-letter in one call) — deliberately NOT decomposed into
+/// claim/mark-sent primitives, so the durable impl owns the `FOR UPDATE SKIP LOCKED` atomicity.
+pub trait DurableOutboxBacking: Send + Sync {
+    /// The durable arm of [`OutboxTransaction::commit`]: durably + atomically commit every staged
+    /// row (all-or-nothing — a partial commit would be silent data loss). Assigns the per-aggregate
+    /// commit-order `seq` the same way the in-memory store does (gap-free, true commit order).
+    fn commit_staged(&self, rows: Vec<OutboxRow>) -> Result<()>;
+
+    /// The `outbox_depth` survival signal (contract 1.8): the number of unsent rows.
+    fn outbox_depth(&self) -> usize;
+    /// The dead-letter count survival signal (contract 1.8).
+    fn dead_letter_count(&self) -> usize;
+    /// The `recorded_at` of the oldest still-unsent row (the outbox-age anchor), or `None` when
+    /// fully drained.
+    fn oldest_unsent_recorded_at(&self) -> Option<crate::Timestamp>;
+    /// The total committed-row count (sent + unsent) — the no-ghost assertion input.
+    fn committed_count(&self) -> usize;
+    /// Read a committed row by id (the relay's envelope re-hydration / a test read).
+    fn row(&self, id: &EventId) -> Option<OutboxRow>;
+    /// Snapshot the committed rows in per-aggregate commit order.
+    fn committed_rows(&self) -> Vec<OutboxRow>;
+    /// Snapshot the dead-lettered rows (the operator alert / a test).
+    fn dead_letters(&self) -> Vec<OutboxRow>;
+
+    /// **The SINGLE composite relay verb** — one drain pass: claim up to `batch` unsent rows with
+    /// the `FOR UPDATE SKIP LOCKED` discipline, publish each via
+    /// `transport.put(subject, envelope, dedup_id = event_id)`, mark sent on `Accepted`/
+    /// `Deduplicated`, and dead-letter a row that exhausts the retry bound — returning a
+    /// [`DrainReport`]. Composite BY DESIGN (not decomposed into claim/mark primitives) so the
+    /// durable impl owns the claim atomicity in one transaction.
+    fn drain_once(&self, transport: &dyn BusTransport, batch: usize) -> Result<DrainReport>;
+}
+
+/// The outbox-store backend (the MR-007/008/023 backend-enum pattern; mirrors [`crate::dedup`]'s
+/// `DedupBackend`). `Memory` is the in-memory transactional model (the SUB-D1/BUS-D4 drill state +
+/// the in-process event floor); `Durable` is the production PG-backed seam a later wave wires.
+///
+/// **MR-009b W3b.1 — the `Memory` arm is DELIBERATELY UN-gated in this step** (no `cfg`): this is
+/// the scanner-neutral role-struct reshape. The `no-in-memory-durable-store` scanner FOLLOWS this
+/// enum into its `Memory(Arc<Mutex<Inner>>)` variant (which references the un-gated in-memory
+/// [`Inner`]) and still fires on the [`OutboxStore`] holder — the baseline entry is byte-identical
+/// to before the reshape. Gating this arm behind `test-support` (which flips the scanner GREEN) is
+/// the separate W3b.6 step, AFTER the durable impl + the per-subsystem emit re-point land.
+#[derive(Clone)]
+enum OutboxBackend {
+    /// The in-memory transactional model: all state behind a shared lock. **UN-gated in W3b.1**
+    /// (the scanner-neutral step); gated behind `test-support` in W3b.6.
+    Memory(Arc<Mutex<Inner>>),
+    /// The durable PG-backed seam (production): an `outbox` table that survives restart.
+    Durable(Arc<dyn DurableOutboxBacking>),
+}
+
+/// The default backend is the in-memory model (an empty transactional store). Production constructs
+/// the `Durable` backing through [`OutboxStore::durable`] (a later wave's composition root).
+impl Default for OutboxBackend {
+    fn default() -> Self {
+        OutboxBackend::Memory(Arc::new(Mutex::new(Inner::default())))
+    }
 }
 
 impl OutboxStore {
-    /// A fresh, empty store (depth 0, no dead-letters).
+    /// A fresh, empty IN-MEMORY store (depth 0, no dead-letters) — the SUB-D1/BUS-D4 drill +
+    /// in-process-floor default. The production constructor is [`OutboxStore::durable`].
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// **Bind the store to a DURABLE backing** (SI-007) so the transactional co-commit + the
+    /// unsent-row ledger + the relay drain survive a process restart. A later wave's composition
+    /// root constructs this with the PG-backed `outbox` table; [`OutboxStore::new`] stays the
+    /// in-memory default. Every public read/commit/drain method dispatches to the backing.
+    pub fn durable(backing: Arc<dyn DurableOutboxBacking>) -> Self {
+        OutboxStore {
+            backend: OutboxBackend::Durable(backing),
+        }
+    }
+
+    /// Crate-internal memory-arm accessor: the in-memory [`Inner`] guard on the `Memory` backend;
+    /// `None` on the `Durable` backend (whose reads + relay mechanics route straight to the trait,
+    /// never here). The relay's claim/mark-sent/dead-letter/GC mechanics ([`crate::relay`]) and the
+    /// memory-arm reads/commit obtain their guard through this.
+    pub(crate) fn mem(&self) -> Option<std::sync::MutexGuard<'_, Inner>> {
+        match &self.backend {
+            OutboxBackend::Memory(inner) => Some(inner.lock().unwrap_or_else(|e| e.into_inner())),
+            OutboxBackend::Durable(_) => None,
+        }
+    }
+
+    /// Crate-internal durable-backing accessor: `Some(backing)` on the `Durable` backend (so the
+    /// commit dispatch + the relay drain route to it), `None` on the `Memory` backend.
+    pub(crate) fn durable_backing(&self) -> Option<Arc<dyn DurableOutboxBacking>> {
+        match &self.backend {
+            OutboxBackend::Durable(b) => Some(Arc::clone(b)),
+            OutboxBackend::Memory(_) => None,
+        }
     }
 
     /// Begin a transaction. Everything emitted on the returned [`OutboxTransaction`] — together
@@ -256,7 +366,10 @@ impl OutboxStore {
     /// The `outbox_depth` survival signal (contract 1.8): the number of **unsent** rows
     /// (`published_at IS NULL`). The SUB-D1 drill asserts this `→ 0` once the relay drains.
     pub fn outbox_depth(&self) -> usize {
-        let inner = self.lock();
+        if let OutboxBackend::Durable(b) = &self.backend {
+            return b.outbox_depth();
+        }
+        let inner = self.mem().expect("memory backend");
         inner
             .order
             .iter()
@@ -272,7 +385,10 @@ impl OutboxStore {
     /// The dead-letter count survival signal (contract 1.8): rows the relay gave up on after
     /// bounded retries. The no-loss path asserts this `== 0`.
     pub fn dead_letter_count(&self) -> usize {
-        self.lock().dead_letters.len()
+        if let OutboxBackend::Durable(b) = &self.backend {
+            return b.dead_letter_count();
+        }
+        self.mem().expect("memory backend").dead_letters.len()
     }
 
     /// The **`recorded_at` of the oldest still-unsent row** — the input to the contract-1.8
@@ -286,7 +402,10 @@ impl OutboxStore {
     /// the age anchor. The age-in-seconds is computed against a caller-supplied `now` in
     /// [`crate::telemetry`] (M0 has no shared wall-clock until `serve`, P-S12 — named floor).
     pub fn oldest_unsent_recorded_at(&self) -> Option<crate::Timestamp> {
-        let inner = self.lock();
+        if let OutboxBackend::Durable(b) = &self.backend {
+            return b.oldest_unsent_recorded_at();
+        }
+        let inner = self.mem().expect("memory backend");
         inner.order.iter().find_map(|id| {
             inner
                 .rows
@@ -299,17 +418,26 @@ impl OutboxStore {
     /// The total committed-row count (sent + unsent), for the no-ghost assertion (every
     /// committed event is delivered exactly once; an aborted transaction adds nothing here).
     pub fn committed_count(&self) -> usize {
-        self.lock().order.len()
+        if let OutboxBackend::Durable(b) = &self.backend {
+            return b.committed_count();
+        }
+        self.mem().expect("memory backend").order.len()
     }
 
     /// Read a row by id (for tests / the relay's re-hydration of the envelope to publish).
     pub fn row(&self, id: &EventId) -> Option<OutboxRow> {
-        self.lock().rows.get(id).cloned()
+        if let OutboxBackend::Durable(b) = &self.backend {
+            return b.row(id);
+        }
+        self.mem().expect("memory backend").rows.get(id).cloned()
     }
 
     /// Snapshot the dead-lettered rows (for the operator alert / a test).
     pub fn dead_letters(&self) -> Vec<OutboxRow> {
-        self.lock().dead_letters.clone()
+        if let OutboxBackend::Durable(b) = &self.backend {
+            return b.dead_letters();
+        }
+        self.mem().expect("memory backend").dead_letters.clone()
     }
 
     /// Snapshot the committed rows in per-aggregate commit order (for a producer test / a consumer
@@ -317,7 +445,10 @@ impl OutboxStore {
     /// a producer drill to assert WHICH events a workflow body emitted (e.g. the CI-P15 `ci.pipeline`
     /// body's terminal `ci.check.updated` / `ci.run.*` / `ci.result` facts).
     pub fn committed_rows(&self) -> Vec<OutboxRow> {
-        let inner = self.lock();
+        if let OutboxBackend::Durable(b) = &self.backend {
+            return b.committed_rows();
+        }
+        let inner = self.mem().expect("memory backend");
         inner
             .order
             .iter()
@@ -335,7 +466,8 @@ impl OutboxStore {
     /// production write path is [`OutboxTransaction::commit`].
     #[doc(hidden)]
     pub fn restore_committed_row_for_test(&self, row: OutboxRow) {
-        let mut inner = self.lock();
+        // Memory-arm test/restore seam; the durable arm re-hydrates via `pg_restore`, not here.
+        let Some(mut inner) = self.mem() else { return };
         if inner.rows.contains_key(&row.event_id) {
             return;
         }
@@ -343,16 +475,6 @@ impl OutboxStore {
         *next = (*next).max(row.seq + 1);
         inner.order.push(row.event_id.clone());
         inner.rows.insert(row.event_id.clone(), row);
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Crate-internal lock accessor so the relay mechanics ([`crate::relay`]) can drive the
-    /// claim/mark-sent/dead-letter row updates against the shared state.
-    pub(crate) fn lock_inner(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -427,7 +549,13 @@ impl OutboxTransaction {
     /// the `UNIQUE(aggregate, seq)` constraint (a racing commit retries) — same observable
     /// property. The in-memory store models exactly that under the store lock.
     pub fn commit(mut self) -> Result<()> {
-        let mut inner = self.store.lock();
+        // Durable dispatch: the whole staged buffer commits atomically through the backing (the
+        // durable arm of the co-commit). The backing assigns the per-aggregate seq the same way.
+        if let Some(backing) = self.store.durable_backing() {
+            let rows: Vec<OutboxRow> = self.staged_rows.drain(..).collect();
+            return backing.commit_staged(rows);
+        }
+        let mut inner = self.store.mem().expect("memory backend");
         // First pass: every staged row's event_id must be unique (the UNIQUE(event_id)
         // constraint) — reject the WHOLE commit loudly before mutating anything (atomicity: a
         // partial commit would be silent data loss). The minter is monotonic so this cannot
@@ -806,5 +934,193 @@ mod tests {
         // From<Ulid> for EventId carries the id unchanged.
         let id: EventId = a.clone().into();
         assert_eq!(id.0, a.0);
+    }
+
+    // ============================================================================================
+    // MR-009b W3b.1 — the `DurableOutboxBacking` role-struct dispatch (scanner-neutral reshape).
+    // A test-local mock backing proves the `Durable` arm routes commit + reads + the composite
+    // drain verb to the trait, while the always-compiled `Memory` arm's behavior is unchanged
+    // (every memory-arm test above keeps passing byte-for-byte).
+    // ============================================================================================
+
+    /// A test-local mock [`DurableOutboxBacking`]: records the rows handed to `commit_staged` and
+    /// answers every read from that recorded set, so a `Durable` store's dispatch is observable.
+    /// Its `drain_once` is the SINGLE composite verb — it marks the unsent rows published and
+    /// reports them (recording the batch bound it was called with).
+    #[derive(Default)]
+    struct MockBacking {
+        committed: Mutex<Vec<OutboxRow>>,
+        drain_calls: Mutex<Vec<usize>>,
+    }
+
+    impl DurableOutboxBacking for MockBacking {
+        fn commit_staged(&self, rows: Vec<OutboxRow>) -> Result<()> {
+            self.committed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(rows);
+            Ok(())
+        }
+        fn outbox_depth(&self) -> usize {
+            self.committed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|r| r.published_at.is_none())
+                .count()
+        }
+        fn dead_letter_count(&self) -> usize {
+            0
+        }
+        fn oldest_unsent_recorded_at(&self) -> Option<Timestamp> {
+            self.committed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|r| r.published_at.is_none())
+                .map(|r| r.envelope.recorded_at.clone())
+        }
+        fn committed_count(&self) -> usize {
+            self.committed.lock().unwrap_or_else(|e| e.into_inner()).len()
+        }
+        fn row(&self, id: &EventId) -> Option<OutboxRow> {
+            self.committed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|r| &r.event_id == id)
+                .cloned()
+        }
+        fn committed_rows(&self) -> Vec<OutboxRow> {
+            self.committed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+        fn dead_letters(&self) -> Vec<OutboxRow> {
+            Vec::new()
+        }
+        fn drain_once(
+            &self,
+            _transport: &dyn BusTransport,
+            batch: usize,
+        ) -> Result<DrainReport> {
+            self.drain_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(batch);
+            let mut rows = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+            let mut published = 0;
+            for r in rows.iter_mut().filter(|r| r.published_at.is_none()) {
+                r.published_at = Some(Timestamp("2026-06-19T00:00:09Z".into()));
+                published += 1;
+            }
+            Ok(DrainReport {
+                published,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// **Commit dispatch routes the whole staged buffer to `commit_staged` (the durable arm of the
+    /// co-commit).** A `Durable` store's transaction stages rows, and `commit()` hands them — in
+    /// ONE atomic call — to the backing (nothing reaches it before commit; emit-iff-committed
+    /// holds on the durable arm too). The store's reads then route to the backing.
+    #[test]
+    fn commit_dispatches_staged_rows_to_the_durable_backing() {
+        let backing = Arc::new(MockBacking::default());
+        let store = OutboxStore::durable(backing.clone());
+        let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+
+        let mut tx = store.begin(minter, ctx_base());
+        tx.stage_state_change("state");
+        let a = tx
+            .emit(draft("issues.issue.created", "issue:A"), None)
+            .unwrap();
+        let b = tx
+            .emit(draft("issues.issue.updated", "issue:A"), None)
+            .unwrap();
+        assert_eq!(tx.staged_len(), 2, "two rows buffered");
+        // emit-iff-committed: nothing reaches the backing before commit.
+        assert_eq!(backing.committed_count(), 0, "an open tx wrote nothing durable");
+
+        tx.commit().unwrap();
+        // the staged rows routed through `commit_staged` (one atomic call, both rows).
+        let committed = backing.committed_rows();
+        assert_eq!(committed.len(), 2, "both staged rows handed to the backing");
+        assert_eq!(committed[0].event_id, a);
+        assert_eq!(committed[1].event_id, b);
+        // and the durable store's reads route to the backing.
+        assert_eq!(store.committed_count(), 2);
+        assert_eq!(store.outbox_depth(), 2);
+        assert_eq!(store.row(&a).unwrap().event_id, a);
+    }
+
+    /// **A Durable-only store's reads route to the backing.** A `Durable` store has NO in-memory
+    /// `Inner` (`mem()` is `None`), so if a read did not dispatch it would panic on the missing
+    /// memory arm; every read returning the backing's view proves the dispatch.
+    #[test]
+    fn durable_store_reads_route_to_the_backing() {
+        // Build realistic rows via a MEMORY store, then hand them to the backing directly.
+        let (mem, minter) = store_and_minter();
+        let mut tx = mem.begin(minter, ctx_base());
+        let a = tx
+            .emit(draft("issues.issue.created", "issue:A"), None)
+            .unwrap();
+        tx.emit(draft("issues.issue.updated", "issue:B"), None)
+            .unwrap();
+        tx.commit().unwrap();
+        let rows = mem.committed_rows();
+
+        let backing = Arc::new(MockBacking::default());
+        backing.commit_staged(rows.clone()).unwrap();
+        let store = OutboxStore::durable(backing.clone());
+
+        assert_eq!(store.committed_count(), 2);
+        assert_eq!(store.outbox_depth(), 2, "both rows unsent in the backing");
+        assert_eq!(store.committed_rows().len(), 2);
+        assert_eq!(store.row(&a).unwrap().event_id, a);
+        assert!(store.dead_letters().is_empty());
+        assert_eq!(store.dead_letter_count(), 0);
+        assert_eq!(
+            store.oldest_unsent_recorded_at(),
+            Some(rows[0].envelope.recorded_at.clone()),
+            "oldest-unsent age anchor read off the backing"
+        );
+    }
+
+    /// **The relay's drain dispatches to the backing's SINGLE composite verb.** `Relay::drain_once`
+    /// over a `Durable` store calls `backing.drain_once(transport, batch)` (never the in-memory
+    /// claim/mark mechanics), passing the default batch bound; the report + the resulting depth
+    /// reflect the backing.
+    #[test]
+    fn relay_drain_routes_to_the_durable_backing_composite_verb() {
+        use crate::relay::{InProcessBus, Relay, DEFAULT_DRAIN_BATCH};
+        let backing = Arc::new(MockBacking::default());
+        let store = OutboxStore::durable(backing.clone());
+        let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+        let mut tx = store.begin(minter, ctx_base());
+        tx.emit(draft("issues.issue.created", "issue:A"), None)
+            .unwrap();
+        tx.emit(draft("issues.issue.updated", "issue:A"), None)
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(store.outbox_depth(), 2);
+
+        let relay = Relay::new(store.clone(), InProcessBus::new(), || {
+            Timestamp("2026-06-19T00:00:09Z".into())
+        });
+        let report = relay.drain_once();
+        assert_eq!(report.published, 2, "drain routed to backing.drain_once");
+        assert_eq!(store.outbox_depth(), 0, "the backing marked the rows published");
+        assert_eq!(
+            backing
+                .drain_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &[DEFAULT_DRAIN_BATCH],
+            "the composite verb was called once with the default batch bound"
+        );
     }
 }

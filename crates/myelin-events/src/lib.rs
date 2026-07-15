@@ -429,8 +429,8 @@ pub use harness::{
     HarnessError, PayloadShape, RegisteredToken, SubsystemTokenList, TokenListHarness,
 };
 pub use outbox::{
-    EmitContextBase, IdMinter, MonotonicMinter, OutboxRow, OutboxStore, OutboxTransaction, Ulid,
-    OUTBOX_MIGRATION,
+    DurableOutboxBacking, EmitContextBase, IdMinter, MonotonicMinter, OutboxRow, OutboxStore,
+    OutboxTransaction, Ulid, OUTBOX_MIGRATION,
 };
 pub use partition::{stream_name_for, PartitionKey, StreamSubject, SubjectError, SUBJECT_ROOT};
 pub use relay::{
