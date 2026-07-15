@@ -96,9 +96,16 @@ fn governed_git_server(backend: Arc<DurableGitBackend>) -> McpServer {
     };
 
     // THE GT-005 INJECTION: the concrete git EffectApi body over the durable backend, bound to the
-    // run's verified (tenant, region) + acting principal.
+    // run's verified (tenant, region) + acting principal. R2.4: + the server-side HITL verdict
+    // store (the in-memory double of the durable agent_hitl_gate arm) and the approver set.
     let effect = GitEffectApi::new(backend, TENANT, REGION, agent);
-    let router = GovernedRouter::new(minter, principal, Box::new(effect));
+    let router = GovernedRouter::new(
+        minter,
+        principal,
+        Box::new(effect),
+        myelin_storage::hitl_gate_durable::HitlVerdictStore::new(),
+        vec![PrincipalId("human:operator".into())],
+    );
     McpServer::with_router(ToolRegistry::with_git(), router, now())
 }
 
@@ -110,10 +117,12 @@ fn call(name: &str, args: serde_json::Value) -> String {
     .to_string()
 }
 
-fn call_approved(name: &str, args: serde_json::Value) -> String {
+/// R2.4: a re-drive PRESENTS the server-issued opaque gate id — the router looks it up in the
+/// server-side verdict store (a caller-supplied `granted` boolean is inert and never sent here).
+fn call_with_gate(name: &str, args: serde_json::Value, gate_id: &str) -> String {
     serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": { "name": name, "arguments": args, "approval": { "granted": true } }
+        "params": { "name": name, "arguments": args, "approval": { "gateId": gate_id } }
     })
     .to_string()
 }
@@ -201,18 +210,29 @@ fn merge_is_hitl_gated_then_reflects_the_server_gate_block() {
 
     let server = governed_git_server(backend.clone());
 
-    // (1) WITHOUT approval → HITL-gated (withheld, NOT applied). No EffectApi::apply ran.
+    // (1) WITHOUT approval → HITL-gated (withheld, NOT applied). No EffectApi::apply ran. The
+    //     gate id is the R2.4 opaque server-issued token backing a `waiting` verdict row.
     let gated = server
         .handle_line(&call("git.merge", serde_json::json!({ "repo": "alpha", "number": 1 })))
         .unwrap();
     let g: serde_json::Value = serde_json::from_str(&gated).unwrap();
-    assert!(g["result"]["_meta"]["gateId"].is_string(), "git.merge is HITL-gated: {g}");
+    let gate_id = g["result"]["_meta"]["gateId"].as_str().expect("git.merge is HITL-gated").to_string();
     assert!(g["result"]["_meta"]["eventId"].is_null(), "a gated merge did NOT apply");
 
-    // (2) WITH approval → routes through EffectApi::apply → the server merge gate BLOCKS. Denied,
-    //     carrying the gate reason (the tool REFLECTS the gate, never bypasses).
+    // (2) A DISTINCT human approves SERVER-SIDE (R2.4 — never a caller boolean), then the re-drive
+    //     presenting the gate id routes through EffectApi::apply → the server merge gate BLOCKS.
+    //     Denied, carrying the gate reason (the tool REFLECTS the gate, never bypasses).
+    server
+        .router()
+        .unwrap()
+        .approve_gate(&human_principal("human:operator"), &gate_id)
+        .expect("the human operator approves the merge card");
     let denied = server
-        .handle_line(&call_approved("git.merge", serde_json::json!({ "repo": "alpha", "number": 1 })))
+        .handle_line(&call_with_gate(
+            "git.merge",
+            serde_json::json!({ "repo": "alpha", "number": 1 }),
+            &gate_id,
+        ))
         .unwrap();
     let d: serde_json::Value = serde_json::from_str(&denied).unwrap();
     assert_eq!(d["result"]["isError"], true, "the gate-blocked merge is denied: {d}");

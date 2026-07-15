@@ -28,6 +28,7 @@ use myelin_tenancy::{Region, TenantId};
 
 use myelin_mcp::governance::SkeletonEffectApi;
 use myelin_mcp::{CallOutcome, GovernedRouter, McpServer, RunPrincipal, ToolRegistry};
+use myelin_storage::hitl_gate_durable::{GateDecideError, GateState, HitlVerdictStore};
 
 fn now() -> Timestamp {
     Timestamp("2026-06-26T00:00:00Z".into())
@@ -48,6 +49,14 @@ fn agent_principal(id: &str, tenant: &str) -> Principal {
 
 fn human_principal(id: &str, tenant: &str) -> Principal {
     let mut p = Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId(tenant.into()));
+    p.region = Region("eu-west".into());
+    p
+}
+
+/// A non-human machine principal (R2.4b — used to prove the distinct-HUMAN approver rule refuses a
+/// machine/service approver even when it is distinct from the requester).
+fn service_principal(id: &str, tenant: &str) -> Principal {
+    let mut p = Principal::stub(PrincipalId(id.into()), PrincipalKind::Service, TenantId(tenant.into()));
     p.region = Region("eu-west".into());
     p
 }
@@ -87,7 +96,16 @@ fn governed_server() -> McpServer {
         ttl: FailStaticBound { static_max_secs: 300 },
     };
 
-    let router = GovernedRouter::new(minter, principal, Box::new(SkeletonEffectApi::new()));
+    // R2.4: the SERVER-SIDE verdict store (in-memory test double of the durable agent_hitl_gate
+    // arm) + the approver set. The agent principal is deliberately INCLUDED here to prove the
+    // router structurally excludes the requester from its own gate's eligible approvers.
+    let verdicts = HitlVerdictStore::new();
+    let approvers = vec![
+        PrincipalId("human:operator".into()),
+        PrincipalId("agent:claude".into()),
+    ];
+    let router =
+        GovernedRouter::new(minter, principal, Box::new(SkeletonEffectApi::new()), verdicts, approvers);
     McpServer::with_router(ToolRegistry::with_git(), router, now())
 }
 
@@ -170,18 +188,198 @@ fn requires_approval_tool_is_hitl_gated_before_apply() {
     assert!(matches!(server.router().unwrap().audit()[0].outcome, CallOutcome::Gated { .. }));
 }
 
+/// **R2.4 Defect A (the caller-boolean bypass, closed):** a bare `{"approval":{"granted":true}}`
+/// SUPPLIED BY THE CALLER — which for an autonomous agent IS the agent — must NOT clear the HITL
+/// gate. Approval is a SERVER-SIDE verdict looked up by the gate, never a caller-supplied boolean.
+/// (This test is the rewrite of the old `requires_approval_tool_applies_after_explicit_approval`,
+/// whose happy path literally demonstrated the bypass: it fails RED on the pre-R2.4 code.)
 #[test]
-fn requires_approval_tool_applies_after_explicit_approval() {
+fn a_caller_supplied_granted_boolean_never_applies() {
     let server = governed_server();
-    // The same git.merge, re-driven WITH an explicit HITL approval → routes through EffectApi::apply.
     let resps = drive(
         &server,
         &[r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7},"approval":{"granted":true}}}"#],
     );
     let r = &resps[0];
-    assert_eq!(r["result"]["isError"], false);
-    let event_id = r["result"]["_meta"]["eventId"].as_str().unwrap();
-    assert!(event_id.contains("tool:git.merge"), "the approved merge was applied through EffectApi");
+    assert!(
+        r["result"]["_meta"]["eventId"].is_null(),
+        "a caller-supplied `granted: true` must NOT apply a requires_approval tool (server-side \
+         verdict only): {r}"
+    );
+    assert!(
+        matches!(
+            server.router().unwrap().audit()[0].outcome,
+            CallOutcome::Gated { .. } | CallOutcome::Denied { .. }
+        ),
+        "the call is withheld or refused — never Applied off a caller boolean"
+    );
+}
+
+/// **R2.4: a gated tool returns an OPAQUE server-issued gate id** — not the old guessable
+/// deterministic `hitl:{jti}:{tool}` display string. Two independent servers gating the same call
+/// mint DIFFERENT ids (the id is unpredictable, so a caller cannot pre-compute it); a retried call
+/// on the SAME server re-surfaces the SAME pending gate (no duplicate spawn).
+#[test]
+fn a_gated_tool_returns_an_opaque_unguessable_gate_id() {
+    let call =
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7}}}"#;
+
+    let server = governed_server();
+    let resps = drive(&server, &[call]);
+    let gate_id = resps[0]["result"]["_meta"]["gateId"].as_str().unwrap().to_string();
+    let jti = resps[0]["result"]["_meta"]["runToken"].as_str().unwrap();
+
+    // NOT the guessable deterministic display string, and not derived from the visible jti.
+    assert_ne!(
+        gate_id,
+        format!("hitl:{jti}:git.merge"),
+        "the gate id must not be the old deterministic display string"
+    );
+    assert!(
+        !gate_id.contains(jti) && !gate_id.contains("git.merge"),
+        "the gate id must not embed the guessable call facts: {gate_id}"
+    );
+
+    // A second, independent server gating the IDENTICAL call mints a DIFFERENT id.
+    let other = governed_server();
+    let other_resps = drive(&other, &[call]);
+    let other_gate = other_resps[0]["result"]["_meta"]["gateId"].as_str().unwrap();
+    assert_ne!(gate_id, other_gate, "gate ids are unpredictable across servers/processes");
+
+    // A RETRY on the same server re-surfaces the SAME pending gate (one row, one card).
+    let retry = drive(&server, &[call]);
+    assert_eq!(
+        retry[0]["result"]["_meta"]["gateId"].as_str().unwrap(),
+        gate_id,
+        "a retried gated call re-surfaces the same pending gate"
+    );
+}
+
+/// **R2.4 / R2.4b — the full server-side approval loop:** gated → the gate row is `waiting` in the
+/// store → the agent CANNOT approve its own gate (distinct-approver) AND a NON-HUMAN (machine)
+/// principal cannot approve at all (distinct-HUMAN, R2.4b) → re-driving with the gate id while it is
+/// still waiting does NOT apply → a DISTINCT HUMAN approves in the store → the re-drive presenting
+/// that gate id applies through EffectApi.
+#[test]
+fn approval_is_a_server_side_verdict_by_a_distinct_human_principal() {
+    let server = governed_server();
+    let call =
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7}}}"#;
+
+    // (1) WITHHELD → an opaque gate id, a `waiting` row server-side, 0 mutation.
+    let gated = drive(&server, &[call]);
+    let gate_id = gated[0]["result"]["_meta"]["gateId"].as_str().unwrap().to_string();
+    assert!(gated[0]["result"]["_meta"]["eventId"].is_null());
+    let router = server.router().unwrap();
+    let rec = router.gate_verdict(&gate_id).expect("the gate is a server-side row");
+    assert_eq!(rec.state, GateState::Waiting);
+    assert_eq!(rec.requested_by, "agent:claude");
+    assert!(
+        !rec.approver_filter.contains(&"agent:claude".to_string()),
+        "the requesting agent is structurally excluded from its own gate's approver set"
+    );
+
+    // (2) SELF-APPROVAL refused server-side (the agent IS the MCP caller — it can never clear
+    //     its own gate, whatever it sends).
+    assert!(
+        matches!(
+            router.approve_gate(&agent_principal("agent:claude", "acme"), &gate_id),
+            Err(GateDecideError::SelfApproval) | Err(GateDecideError::NotEligible)
+        ),
+        "the agent principal cannot approve its own gate"
+    );
+    // (2b) R2.4b — a DISTINCT NON-HUMAN principal (a service/agent) cannot approve either: the
+    //      HITL gate structurally requires a HUMAN approver (closes the machine-collusion gap).
+    assert_eq!(
+        router.approve_gate(&service_principal("svc:ci-robot", "acme"), &gate_id),
+        Err(GateDecideError::MachineApproverRefused),
+        "a distinct MACHINE principal is refused — the gate requires a HUMAN approver"
+    );
+    assert_eq!(
+        router.gate_verdict(&gate_id).unwrap().state,
+        GateState::Waiting,
+        "the machine-refused approval left the gate undecided"
+    );
+
+    // (3) Re-driving WITH the gate id while the gate is still waiting → still withheld, 0 apply.
+    let redrive = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"git.merge","arguments":{{"repo":"acme/web","number":7}},"approval":{{"gateId":"{gate_id}"}}}}}}"#
+    );
+    let pending = drive(&server, &[redrive.as_str()]);
+    assert!(
+        pending[0]["result"]["_meta"]["eventId"].is_null(),
+        "a still-waiting gate does not apply: {}",
+        pending[0]
+    );
+    assert_eq!(pending[0]["result"]["_meta"]["gateId"].as_str().unwrap(), gate_id);
+
+    // (4) A DISTINCT human principal approves — SERVER-SIDE.
+    router
+        .approve_gate(&human_principal("human:operator", "acme"), &gate_id)
+        .expect("a distinct eligible human approves");
+    let rec = router.gate_verdict(&gate_id).unwrap();
+    assert_eq!(rec.state, GateState::Approved);
+    assert_eq!(rec.decided_by.as_deref(), Some("human:operator"));
+
+    // (5) The re-drive presenting the approved gate id now applies through EffectApi.
+    let applied = drive(&server, &[redrive.as_str()]);
+    let event_id = applied[0]["result"]["_meta"]["eventId"].as_str().expect("applied");
+    assert!(event_id.contains("tool:git.merge"), "the approved effect applied: {event_id}");
+}
+
+/// **R2.4: a made-up / forged gate id is DENIED** — the store has no such verdict; the caller
+/// cannot conjure an approval by presenting an id of its own invention.
+#[test]
+fn a_made_up_gate_id_is_denied() {
+    let server = governed_server();
+    let resps = drive(
+        &server,
+        &[r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7},"approval":{"gateId":"gate:0123456789abcdef0123456789abcdef"}}}"#],
+    );
+    let r = &resps[0];
+    assert_eq!(r["result"]["isError"], true, "a forged gate id is a loud deny: {r}");
+    assert!(r["result"]["_meta"]["eventId"].is_null(), "0 mutation");
+    let reason = r["result"]["_meta"]["reason"].as_str().unwrap();
+    assert!(reason.contains("not granted server-side"), "the deny names the rule: {reason}");
+}
+
+/// **R2.4: an approval is bound to the EXACT effect (tool + args), never the tool name** — an
+/// approved gate for PR 7 presented on a re-drive for PR 8 is denied; and a REJECTED gate stays
+/// denied forever (0 mutation, AG-8).
+#[test]
+fn an_approval_never_transfers_to_a_sibling_effect_and_a_reject_is_final() {
+    let server = governed_server();
+    let call7 =
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7}}}"#;
+    let gated = drive(&server, &[call7]);
+    let gate7 = gated[0]["result"]["_meta"]["gateId"].as_str().unwrap().to_string();
+    let router = server.router().unwrap();
+    router.approve_gate(&human_principal("human:operator", "acme"), &gate7).unwrap();
+
+    // The approved gate for PR 7 does NOT clear a re-drive of PR 8 (same tool, different effect).
+    let cross = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"git.merge","arguments":{{"repo":"acme/web","number":8}},"approval":{{"gateId":"{gate7}"}}}}}}"#
+    );
+    let denied = drive(&server, &[cross.as_str()]);
+    assert_eq!(denied[0]["result"]["isError"], true, "approval never transfers across effects");
+    assert!(denied[0]["result"]["_meta"]["eventId"].is_null());
+
+    // A REJECTED gate is final: re-driving with it is denied (never re-approvable).
+    let call9 =
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":9}}}"#;
+    let gated9 = drive(&server, &[call9]);
+    let gate9 = gated9[0]["result"]["_meta"]["gateId"].as_str().unwrap().to_string();
+    router.reject_gate(&PrincipalId("human:operator".into()), &gate9).unwrap();
+    assert!(
+        router.approve_gate(&human_principal("human:operator", "acme"), &gate9).is_err(),
+        "a rejected gate never re-transitions"
+    );
+    let redrive9 = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"git.merge","arguments":{{"repo":"acme/web","number":9}},"approval":{{"gateId":"{gate9}"}}}}}}"#
+    );
+    let d9 = drive(&server, &[redrive9.as_str()]);
+    assert_eq!(d9[0]["result"]["isError"], true, "a rejected effect is withheld forever (AG-8)");
+    assert!(d9[0]["result"]["_meta"]["eventId"].is_null(), "0 mutation");
 }
 
 #[test]

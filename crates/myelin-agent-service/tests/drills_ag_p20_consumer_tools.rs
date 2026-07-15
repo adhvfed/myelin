@@ -411,8 +411,12 @@ fn iss_d12_governed_transition_withheld_then_approved_applies_once() {
     );
     assert_eq!(muts0, 0, "ISS-D12: 0 mutation before approval (AG-8)");
 
-    // (2) APPROVE → re-run with the tool threaded into `approved` → APPLIES exactly once.
-    let approved: BTreeSet<String> = ["transition".to_string()].into_iter().collect();
+    // (2) APPROVE → re-run with THIS effect's per-(tool, object) key threaded into `approved`
+    //     (R2.4 — never the bare tool name) → APPLIES exactly once.
+    let approved: BTreeSet<String> =
+        [myelin_agent_service::effect_gate_key(&plan.tool, &plan.object)]
+            .into_iter()
+            .collect();
     let (applied, muts1) = apply_once(&cat, &endpoint, &check, caps, approved, &plan);
     assert!(
         matches!(applied, EffectResult::Applied(_)),
@@ -455,8 +459,12 @@ fn iss_d12_sla_bound_transition_without_approver_context_is_denied() {
             markup: 5,
         },
     };
-    // even with the tool "approved", the ABAC caveat (Conditional) denies — fail-closed, never applies.
-    let approved: BTreeSet<String> = ["transition".to_string()].into_iter().collect();
+    // even with the effect "approved", the ABAC caveat (Conditional) denies — fail-closed, never
+    // applies (the approval key is per-(tool, object), R2.4).
+    let approved: BTreeSet<String> =
+        [myelin_agent_service::effect_gate_key(&plan.tool, &plan.object)]
+            .into_iter()
+            .collect();
     let (out, muts) = apply_once(&cat, &endpoint, &check, caps, approved, &plan);
     assert!(
         matches!(out, EffectResult::Denied(_)),
