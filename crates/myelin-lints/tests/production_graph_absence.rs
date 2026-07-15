@@ -73,7 +73,7 @@
 //! - `myelin-identity-service/src/pseudonym_store.rs:191` — `PseudonymStore` (S2) in-mem (SI-018 cluster; MR-007/009)
 //! - `myelin-identity-service/src/pseudonym_erase.rs:268` — `PseudonymErasureLedger` in-mem via the
 //!     `type LedgerByPartition = BTreeMap<…>` ALIAS (alias false-negative closed; census 10.8; MR-007/009)
-//! - `myelin-events/src/outbox.rs:230`                    — `OutboxStore` in-mem (SI-007; events durable MR, P-522/523)
+//! - `myelin-events/src/outbox.rs:231`                    — `OutboxStore` in-mem (SI-007; events durable MR, P-522/523)
 //! - **MR-009b Wave 3 FLIPPED the `DedupLedger` (SI-023) GREEN:** `dedup.rs` `DedupLedger` is now
 //!   durable-by-default. The `Memory(Arc<Mutex<HashSet>>)` backend variant + its `Default` + the
 //!   in-memory `::new()` constructor are `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLES;
@@ -85,7 +85,7 @@
 //!   (`integration_mr023_events_serve`); the DB-free unit tests use the double via the
 //!   `myelin-events/test-support` dev-dependency (the 3 in-process-floor consumer builders —
 //!   chat `into_consumer`, `knowledge_app_spec_with_consumers`, `notif_app_spec_with_router` — now
-//!   INJECT the ledger). NOTE — the SIBLING `outbox.rs:230` `OutboxStore` (SI-007) is NOT flipped in
+//!   INJECT the ledger). NOTE — the SIBLING `outbox.rs:231` `OutboxStore` (SI-007) is NOT flipped in
 //!   Wave 3: see the residual note in the module docs below (the outbox re-point is a separate wave).
 //! - `myelin-events/src/reerase.rs:102`                   — `BusErasureLedger` in-mem (SI-039; GDPR/events durable MR)
 //! - `myelin-control-plane/src/registry.rs:111`          — `Registry` placement in-mem (SI-011; cp durable MR)
@@ -100,7 +100,7 @@
 //! - `myelin-storage/src/reerase.rs:156`                  — `InMemoryPostPitLedger` `records: Vec<…>` (Vec false-negative closed; P-ST-14 / P-522/523)
 //! - `myelin-storage/src/blob.rs:362`                     — `FsBlobStore` `Mutex<HashMap<…, Vec<u8>>>` IN-MEMORY (no `fs::write`); byte backing is the Git/backup track (P-ST-30; SI-014/015/029)
 //!
-//! ### RESIDUAL — `outbox.rs:230` `OutboxStore` (SI-007) is a SEPARATE, higher-coupling wave (NOT Wave 3)
+//! ### RESIDUAL — `outbox.rs:231` `OutboxStore` (SI-007) is a SEPARATE, higher-coupling wave (NOT Wave 3)
 //! MR-009b Wave 3 flipped the sibling `DedupLedger` (SI-023) but DELIBERATELY LEFT `OutboxStore` in
 //! this baseline. Unlike `DedupLedger` (a role struct with a `backend` ENUM whose in-memory `Memory`
 //! arm is gated behind `test-support` while the always-compiled `Durable` arm keeps the struct — and
@@ -355,7 +355,7 @@ const BASELINE: &[(&str, &str, usize)] = &[
     //      stores (principal/tuple/revocation) durable-by-default → removed (17→14); MR-009b Wave 3
     //      flipped the events `DedupLedger` (SI-023) durable-by-default → `dedup.rs:141` removed
     //      (in-memory count 13→12; total baseline 14→13).
-    //      (The sibling `outbox.rs:230` `OutboxStore`/SI-007 STAYS — its durable re-point to
+    //      (The sibling `outbox.rs:231` `OutboxStore`/SI-007 STAYS — its durable re-point to
     //      `PgRelay::co_commit_in_tx` is a separate, higher-coupling wave; see the module-doc residual.)
     (
         "no-in-memory-durable-store",
@@ -385,7 +385,7 @@ const BASELINE: &[(&str, &str, usize)] = &[
     (
         "no-in-memory-durable-store",
         "crates/myelin-events/src/outbox.rs",
-        230,
+        231,
     ),
     (
         "no-in-memory-durable-store",
