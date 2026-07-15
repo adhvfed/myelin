@@ -64,9 +64,24 @@ before execution; sequencing under review (see R1 decision log).**
 |---|---|---|
 | Erasure ledger records COMPLETION time + restore-inside-window resurrection test | W6b | PENDING |
 | git DSR receipts: real `holders_hit` reconciled against data-map | W6b/W6 | PENDING |
-| SQL-interpolation shapes killed while touching crates (rls predicate_sql, block_tree, TRUNCATE classifier) | W6 | PENDING |
-| KMS ~90-site classification by independent verifier; boot fails LOUD | W5 | PENDING |
+| SQL-interpolation shapes killed while touching crates (rls predicate_sql, block_tree, TRUNCATE classifier) | W6 | PENDING (block_tree/TRUNCATE are myelin-knowledge, out of spine scope per W6 grounding) |
+| KMS ~90-site classification by independent verifier; boot fails LOUD | W5 | **DONE** (`c271932`) — 121 src sites audited: 1 prod root (edge main.rs, fail-loud), 110 cfg(test), 7 drill fns gated, 0 injection re-points |
 | Region-scope sweep (identity PG `scope.region()`, fr-par partitions parameterized) | W7 | PENDING |
+
+**W5 DONE (2026-07-15, `c271932`): scanner 12→11.** Builder→orchestrator-gate→independent adversarial
+verifier (CONFIRMED-SOUND)→commit. Verifier defect **D1 fixed pre-commit** (rotate_kek KEK+DEK persist
+was non-transactional → one PG tx + regression test). **W5 residual hardening follow-ups:**
+(1) **D2** — concurrent first-mint of the same DekId can hand a ref out of the fast path while the
+first minter's persist is in flight; a DB failure/crash in that window loses the key LOUDLY
+(MEDIUM; fix = publish the in-memory entry only after persist commits). (2) `ensure_kek`/`destroy_*`
+panic-on-durability-failure is task-down, not process-down — converting the infallible signatures to
+`Result` is a ~50+180 call-site ripple wave. (3) `rotate_kek` fault-injection integration test.
+(4) `MYELIN_CELL_ID` default "cell-dev" — confirm against the multi-cell boot spec at W6d.
+
+**W6 grounding DONE (`180be21`, doc 15):** execution order W6a→W6b→W6c-events→W6c-cp→W6d, serialized
+on the shared baseline file. **W3b design DONE (`6ce6702`, doc 16):** DedupLedger trait-seam pattern,
+6 steps W3b.1–.6; identity is NOT a DAG sink (only myelin-events is); one real BUS-2 gap (identity
+durable-tuple emit) fixed at W3b.3.
 
 R1 exit: scanner `no-in-memory-durable-store` baseline **0**; unit tests DB-free; integration green; kill-9 drills.
 
