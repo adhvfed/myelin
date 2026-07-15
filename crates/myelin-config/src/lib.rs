@@ -102,6 +102,47 @@ pub struct MyelinConfig {
     pub nats_url: String,
     /// The data-residency region pin (`fr-par` in prod — the residency-pin lint's prod value).
     pub region: String,
+    /// **R2.5 — the OPTIONAL real-OIDC login surface.** `None` means no IdP is configured and the
+    /// edge keeps the refuse-not-mock human-login default (a boot with no OIDC configured still
+    /// succeeds — OIDC is opt-in, we do NOT force every prod deploy to configure an IdP before this
+    /// lands). `Some` carries the issuer/audience the token is validated against and the STATIC JWKS
+    /// JSON its signatures are checked with (no `jwks_uri` HTTP fetch/discovery — that is a tracked
+    /// follow-up; see [`OidcSettings`]). A PARTIALLY-set OIDC surface is a loud [`ConfigError`]
+    /// (misconfiguration is never coerced into a silent half-config).
+    pub oidc: Option<OidcSettings>,
+}
+
+/// **The env-driven OIDC login surface (R2.5).** The issuer + audience an OIDC ID token is validated
+/// against and the STATIC JWKS JSON document (RFC 7517) its signature is verified with. This is the
+/// CONFIG shape only — the edge converts it into the identity-service `OidcConfig` + `JwkSet` (via
+/// `JwkSet::from_jwks_json`) and wires the real `OidcVerifier`. There is intentionally NO `jwks_uri`
+/// HTTP fetch / OIDC discovery here (out of scope, MR-010a docs): the JWKS is injected as a literal
+/// document (an env var carrying the JSON, or a file path). A runtime `jwks_uri` fetch + key rotation
+/// is the tracked follow-up.
+///
+/// R0.7-C consistency: `Debug` is hand-written. The issuer/audience are NOT secrets (they identify
+/// the IdP + this RP), and a JWKS carries only PUBLIC keys — but the JWKS document can be large, so
+/// its `Debug` prints a byte-length summary rather than dumping the whole document, matching the
+/// crate's terse-Debug convention.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OidcSettings {
+    /// The exact `iss` an OIDC ID token must carry (the configured IdP issuer).
+    pub issuer: String,
+    /// The audience this relying-party IS — the token's `aud` must contain it.
+    pub audience: String,
+    /// The STATIC JWKS JSON document (RFC 7517) — the IdP's published public keys, injected as a
+    /// literal (never fetched over the network here). Parsed by `JwkSet::from_jwks_json` at the edge.
+    pub jwks_json: String,
+}
+
+impl core::fmt::Debug for OidcSettings {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OidcSettings")
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .field("jwks_json", &format_args!("<{} bytes>", self.jwks_json.len()))
+            .finish()
+    }
 }
 
 /// The S3-compatible object-store config (the [`MyelinConfig::s3`] slice). Consumed by the
@@ -153,6 +194,7 @@ impl core::fmt::Debug for MyelinConfig {
             .field("redis_url", &"<redacted>")
             .field("nats_url", &self.nats_url)
             .field("region", &self.region)
+            .field("oidc", &self.oidc)
             .finish()
     }
 }
@@ -189,12 +231,17 @@ impl MyelinConfig {
             None => DEFAULT_REGION.to_string(),
         };
 
+        // R2.5 — the OPTIONAL OIDC login surface. It is opt-in in BOTH modes (absent → None → the
+        // edge keeps refuse-not-mock login, boot succeeds); a PARTIAL config is a loud error.
+        let oidc = oidc_from_env(mode)?;
+
         Ok(MyelinConfig {
             database_url,
             s3,
             redis_url,
             nats_url,
             region,
+            oidc,
         })
     }
 
@@ -225,6 +272,56 @@ fn req(mode: Mode, var: &'static str, dev_default: &str) -> Result<String, Confi
     }
 }
 
+/// Resolve the OPTIONAL OIDC login surface (R2.5). OIDC is opt-in in BOTH modes:
+/// - **absent** (none of the OIDC vars set) → `Ok(None)` — the edge keeps refuse-not-mock human
+///   login and boot succeeds (we do NOT force every prod deploy to configure an IdP before this
+///   lands);
+/// - **fully set** (`MYELIN_OIDC_ISSUER`, `MYELIN_OIDC_AUDIENCE`, and exactly ONE of
+///   `MYELIN_OIDC_JWKS` = inline JSON / `MYELIN_OIDC_JWKS_FILE` = a path) → `Ok(Some(..))`;
+/// - **partially set** (any OIDC var present but the set is incomplete, or BOTH JWKS sources set) →
+///   a loud [`ConfigError`] — a half-configured IdP is a misconfiguration, never silently ignored.
+///
+/// The JWKS is a STATIC document: no `jwks_uri` HTTP fetch / discovery here (out of scope — the
+/// tracked follow-up). The `MYELIN_OIDC_JWKS_FILE` path is read at boot; an unreadable file is a
+/// loud [`ConfigError::Invalid`].
+fn oidc_from_env(mode: Mode) -> Result<Option<OidcSettings>, ConfigError> {
+    let issuer = read(mode, "MYELIN_OIDC_ISSUER");
+    let audience = read(mode, "MYELIN_OIDC_AUDIENCE");
+    let jwks_inline = read(mode, "MYELIN_OIDC_JWKS");
+    let jwks_file = read(mode, "MYELIN_OIDC_JWKS_FILE");
+
+    // OIDC is fully absent → not configured.
+    if issuer.is_none() && audience.is_none() && jwks_inline.is_none() && jwks_file.is_none() {
+        return Ok(None);
+    }
+
+    // Any OIDC var present ⇒ the full set is required (partial config fails loud).
+    let issuer = issuer.ok_or(ConfigError::Missing("MYELIN_OIDC_ISSUER"))?;
+    let audience = audience.ok_or(ConfigError::Missing("MYELIN_OIDC_AUDIENCE"))?;
+    let jwks_json = match (jwks_inline, jwks_file) {
+        (Some(_), Some(_)) => {
+            return Err(ConfigError::Invalid {
+                var: "MYELIN_OIDC_JWKS",
+                reason: "set only ONE JWKS source — MYELIN_OIDC_JWKS (inline JSON) OR \
+                         MYELIN_OIDC_JWKS_FILE (a path), not both"
+                    .into(),
+            })
+        }
+        (Some(json), None) => json,
+        (None, Some(path)) => std::fs::read_to_string(&path).map_err(|e| ConfigError::Invalid {
+            var: "MYELIN_OIDC_JWKS_FILE",
+            reason: format!("cannot read JWKS file `{path}`: {e}"),
+        })?,
+        (None, None) => return Err(ConfigError::Missing("MYELIN_OIDC_JWKS")),
+    };
+
+    Ok(Some(OidcSettings {
+        issuer,
+        audience,
+        jwks_json,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +343,10 @@ mod tests {
             "REDIS_URL",
             "NATS_URL",
             "MYELIN_REGION",
+            "MYELIN_OIDC_ISSUER",
+            "MYELIN_OIDC_AUDIENCE",
+            "MYELIN_OIDC_JWKS",
+            "MYELIN_OIDC_JWKS_FILE",
         ] {
             env::remove_var(v);
         }
@@ -333,6 +434,69 @@ mod tests {
         assert!(!dbg.contains("SUPER_SECRET_DB_PW"), "db password leaked: {dbg}");
         assert!(!dbg.contains("REDIS_SECRET_PW"), "redis password leaked: {dbg}");
         assert!(dbg.contains("<redacted>"), "expected a redaction marker: {dbg}");
+        clear();
+    }
+
+    /// R2.5: OIDC is opt-in. With no OIDC vars set, `oidc` is `None` in BOTH modes — the edge keeps
+    /// refuse-not-mock login and boot succeeds (dev AND a prod deploy that has not configured an IdP).
+    #[test]
+    fn oidc_absent_is_none_and_boots() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear();
+        assert!(MyelinConfig::from_env(Mode::DevDefaults).unwrap().oidc.is_none());
+        // A fully-configured prod env (no OIDC) still boots with oidc == None.
+        env::set_var("DATABASE_URL", "postgres://prod/db");
+        env::set_var("S3_ENDPOINT", "https://s3.fr-par.scw.cloud");
+        env::set_var("S3_REGION", "fr-par");
+        env::set_var("S3_ACCESS_KEY", "k");
+        env::set_var("S3_SECRET_KEY", "s");
+        env::set_var("S3_BUCKET", "myelin-prod");
+        env::set_var("REDIS_URL", "rediss://prod:6379");
+        env::set_var("NATS_URL", "nats://prod:4222");
+        assert!(MyelinConfig::from_env(Mode::RequireEnv).unwrap().oidc.is_none());
+        clear();
+    }
+
+    /// R2.5: a fully-set OIDC surface (issuer + audience + inline JWKS JSON) parses into `Some`.
+    #[test]
+    fn oidc_fully_set_is_wired() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear();
+        let jwks = r#"{"keys":[{"kty":"RSA","kid":"k1","n":"AQAB","e":"AQAB"}]}"#;
+        env::set_var("MYELIN_OIDC_ISSUER", "https://idp.example.com");
+        env::set_var("MYELIN_OIDC_AUDIENCE", "myelin-rp");
+        env::set_var("MYELIN_OIDC_JWKS", jwks);
+        let cfg = MyelinConfig::from_env(Mode::DevDefaults).unwrap();
+        let oidc = cfg.oidc.expect("oidc must be Some");
+        assert_eq!(oidc.issuer, "https://idp.example.com");
+        assert_eq!(oidc.audience, "myelin-rp");
+        assert_eq!(oidc.jwks_json, jwks);
+        // The JWKS document (public keys) is not dumped in Debug — a byte summary instead.
+        let dbg = format!("{oidc:?}");
+        assert!(dbg.contains("<"), "jwks_json should print a byte summary: {dbg}");
+        assert!(!dbg.contains("AQAB"), "jwks_json body should not be dumped: {dbg}");
+        clear();
+    }
+
+    /// R2.5: a PARTIAL OIDC surface (issuer set, JWKS + audience missing) fails LOUD — a
+    /// half-configured IdP is a misconfiguration, never silently ignored.
+    #[test]
+    fn oidc_partial_fails_loud() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear();
+        // Only the issuer → missing audience is the first loud error.
+        env::set_var("MYELIN_OIDC_ISSUER", "https://idp.example.com");
+        let err = MyelinConfig::from_env(Mode::DevDefaults).unwrap_err();
+        assert_eq!(err, ConfigError::Missing("MYELIN_OIDC_AUDIENCE"));
+        // Issuer + audience but NO JWKS source → missing JWKS.
+        env::set_var("MYELIN_OIDC_AUDIENCE", "myelin-rp");
+        let err = MyelinConfig::from_env(Mode::DevDefaults).unwrap_err();
+        assert_eq!(err, ConfigError::Missing("MYELIN_OIDC_JWKS"));
+        // BOTH JWKS sources set → ambiguous, loud.
+        env::set_var("MYELIN_OIDC_JWKS", "{}");
+        env::set_var("MYELIN_OIDC_JWKS_FILE", "/tmp/nope.json");
+        let err = MyelinConfig::from_env(Mode::DevDefaults).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { var: "MYELIN_OIDC_JWKS", .. }));
         clear();
     }
 

@@ -17,8 +17,8 @@ use myelin_edge::{
     register_git_durable, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
 };
 use myelin_identity_service::{
-    CapabilityAuthenticator, CellTokenAuthority, HumanSsoAuthenticator, PasetoCapabilityVerifier,
-    PrincipalStore, RevocationStore,
+    CapabilityAuthenticator, CellTokenAuthority, HumanSsoAuthenticator, JwkSet, OidcConfig,
+    PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
 };
 use myelin_storage::{
     kms_durable_migrations, seal_key_from_env, DurableKmsBacking, DurablePrincipalBacking,
@@ -91,13 +91,43 @@ async fn main() {
         Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
         RevocationStore::with_pg(DurableRevocationBacking::new(provider.clone()), handle.clone()),
     ));
-    // The refuse-not-mock production human verifier (login refuses until JWKS/trust-anchors land),
-    // over the durable S1 principal directory.
-    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::with_pg(
+    // R2.5 — the human/SSO login over the durable S1 principal directory. If an OIDC IdP is
+    // configured (`MYELIN_OIDC_ISSUER` + `MYELIN_OIDC_AUDIENCE` + a static JWKS via
+    // `MYELIN_OIDC_JWKS`/`MYELIN_OIDC_JWKS_FILE`), the REAL OidcVerifier is wired for the `oidc`
+    // scheme — a genuinely IdP-signed ID token authenticates (tenant/region from the VERIFIED
+    // claims, never a path). If OIDC is UNCONFIGURED, login stays refuse-not-mock (every scheme
+    // refuses) — boot still succeeds (OIDC login is opt-in). A configured-but-MALFORMED JWKS JSON is
+    // a FAIL-LOUD boot abort (never a silent no-OIDC fallback), matching the rest of this main.
+    let oidc_settings = provider.config().oidc.clone();
+    let human_store = PrincipalStore::with_pg(
         kms.clone(),
         DurablePrincipalBacking::new(provider),
         handle,
-    )));
+    );
+    let human_login = Arc::new(match oidc_settings {
+        Some(oidc) => {
+            let jwks = JwkSet::from_jwks_json(&oidc.jwks_json).unwrap_or_else(|e| {
+                eprintln!(
+                    "edge: OIDC is configured but the JWKS JSON \
+                     (MYELIN_OIDC_JWKS/MYELIN_OIDC_JWKS_FILE) is malformed: {e:?}"
+                );
+                std::process::exit(1);
+            });
+            eprintln!(
+                "edge: OIDC login wired (issuer={}, {} JWKS key(s))",
+                oidc.issuer,
+                jwks.len()
+            );
+            HumanSsoAuthenticator::production_with_oidc(
+                human_store,
+                Some((OidcConfig::new(oidc.issuer, oidc.audience), jwks)),
+            )
+        }
+        None => {
+            eprintln!("edge: OIDC not configured — human login refuses (refuse-not-mock)");
+            HumanSsoAuthenticator::production_with_oidc(human_store, None)
+        }
+    });
 
     // The Git subsystem wired through the edge over the DURABLE on-disk backend (GT-003): its
     // `/v1/git/...` write handlers PERSIST on real on-disk bare repos (GT-001) under the verified tenant
