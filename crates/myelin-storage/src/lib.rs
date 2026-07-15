@@ -591,6 +591,10 @@ pub mod olap_restrict;
 // restore code touched — the derived stores were never in the backup-able set). FLOOR NAMED: the
 // generated projection-feeder index measured-trigger (designed, not built until the volume warrants
 // it, EI-04 §5) is named in the honesty register.
+// MR-009b W3b.5: the E2E-3 drill half constructs the `test-support`-gated in-memory OutboxStore
+// double (`booted_bus()`), so the whole harness module is gated with it — it is a drill runner,
+// never production serving code (the tests-dir drill + CDC reach it via the self dev-dependency).
+#[cfg(any(test, feature = "test-support"))]
 pub mod e2e3_reindex_parity;
 pub mod oltp;
 pub mod reerase;
@@ -674,9 +678,9 @@ pub mod pseudonym_durable;
 // ErasureLedger` (carrying the R1 §7.6 completion-offset fold-in); the non-shred-erasable
 // `post_pit_erasure_ledger` (0052) behind `reerase::PostRestoreErasureLedger`. Durable-by-default:
 // the in-memory cores are now `test-support`-gated test doubles.
+pub mod reerase_durable;
 pub mod reserve_settle_durable;
 pub mod restore_verify_durable;
-pub mod reerase_durable;
 // The OLTP-co-located outbox relay (the one legitimate broker-publish site, BUS-2) — kept in its
 // own module so the broker-publish call is isolated to a single named relay file (the same
 // posture as myelin-events/src/relay.rs).
@@ -752,6 +756,8 @@ pub use dogfood::{
 // Wave 5: `test-support`-gated (the tests-dir drills reach it via the self dev-dependency).
 #[cfg(any(test, feature = "test-support"))]
 pub use dogfood::run_restore_verify_on_dogfood;
+// MR-009b W3b.5: gated with the harness module (its `booted_bus()` builds the in-memory outbox).
+#[cfg(any(test, feature = "test-support"))]
 pub use e2e3_reindex_parity::{
     run_e2e3_storage_half, DerivedReindexSource, DerivedStoreClass, DerivedStoreParity,
     E2e3StorageArtifact,
@@ -860,16 +866,23 @@ pub use pg_migrator::{with_migration_lock, PgMigrator, MIGRATION_LOCK_KEY};
 // The MR-022 persistence foundation: the tenant-scoped-transaction convention (RESHAPE-002) + the
 // production composition root / real-pool provider (SI-022) + the validate→execute migration boot
 // reconciliation (SI-010). Compiled unconditionally as of MR-009b Wave 1.
-pub use provider::{foundation_migrations, ProviderError, SubstrateProvider, DEFAULT_MAX_CONNECTIONS};
 pub use identity_durable::{
     identity_durable_migrations, DurablePrincipalBacking, DurablePrincipalRow, DurableProfileBlob,
     DurableRevocationBacking, DurableRevocationRow, DurableTupleBacking, TupleEdgeOp,
+};
+pub use provider::{
+    foundation_migrations, ProviderError, SubstrateProvider, DEFAULT_MAX_CONNECTIONS,
 };
 pub use pseudonym_durable::{
     pseudonym_durable_migrations, DurableErasureLedgerBacking, DurableErasureLedgerRow,
     DurablePseudonymBacking, DurablePseudonymRow,
 };
 // The MR-009b W6b durable storage-ledger backings + their migration sets (0050/0051/0052).
+pub use events_durable::{
+    bus_erasure_durable_migrations, DurableBusErasureBacking, DurableDedupBacking,
+    BUS_ERASURE_LEDGER_MIGRATION,
+};
+pub use outbox_durable::PgOutboxBacking;
 pub use reerase_durable::{
     post_pit_durable_migrations, DurablePostPitLedger, POST_PIT_ERASURE_LEDGER_MIGRATION,
 };
@@ -877,14 +890,10 @@ pub use reserve_settle_durable::{
     reserve_settle_durable_migrations, DurableCostLedger, COST_LEDGER_MIGRATION,
 };
 pub use restore_verify_durable::{
-    restore_verify_durable_migrations, DurableRestoreErasureLedger, RESTORE_ERASURE_LEDGER_MIGRATION,
+    restore_verify_durable_migrations, DurableRestoreErasureLedger,
+    RESTORE_ERASURE_LEDGER_MIGRATION,
 };
 pub use tenant_tx::{connect_pool_with_reset, with_tenant_tx, TxScope};
-pub use events_durable::{
-    bus_erasure_durable_migrations, DurableBusErasureBacking, DurableDedupBacking,
-    BUS_ERASURE_LEDGER_MIGRATION,
-};
-pub use outbox_durable::PgOutboxBacking;
 // `events_serve` STAYS behind `integration` (it consumes the real NATS broker `myelin_events::nats`,
 // gated by `myelin-events/integration`) — see the module declaration above.
 #[cfg(feature = "integration")]

@@ -68,7 +68,9 @@ serde_json = { workspace = true }
 # governed `tools/call` (mint_run_token → EffectApi::apply) lands the real durable git effect and
 # reflects the server-side merge gate. A dev-dependency only (the protocol shell never depends on the
 # edge in production; the composition root injects the body).
-myelin-edge = { path = "../myelin-edge" }
+# MR-009b W3b.6: + `test-support` — the tests build the edge in-memory git backend double
+# (`DurableGitBackend::rooted_inmem_for_test`), now gated with the events in-memory OutboxStore.
+myelin-edge = { path = "../myelin-edge", features = ["test-support"] }
 # MR-009b Wave 2: the MCP tests build the identity in-memory doubles (StoreBackedCheck `::new`), which
 # moved behind `#[cfg(any(test, feature = "test-support"))]`. Enable `test-support` for the TEST build
 # only — MCP's production shell depends on identity-service without it (durable-by-default preserved;

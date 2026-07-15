@@ -112,7 +112,19 @@ myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 # in-memory doubles OUT of the edge runtime (durable-by-default preserved; resolver v2 does not leak a
 # dev-dependency feature into the normal build).
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
+# MR-009b W3b.6: enable `test-support` so this crate's OWN `#[cfg(test)]` modules reach the events
+# in-memory `OutboxStore::new()` double (the durable `OutboxStore::durable` is the production
+# default the edge main wires). DEV-only — never in the production DAG.
+myelin-events = { path = "../myelin-events", features = ["test-support"] }
+# MR-009b W3b.6 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN
+# tests/*.rs files (they build `DurableGitBackend::rooted_inmem_for_test`, now gated).
+myelin-edge = { path = ".", features = ["test-support"] }
 
 [features]
 default = []
 integration = ["myelin-storage/integration", "dep:sqlx"]
+# MR-009b W3b.6 — gates `DurableGitBackend::rooted_inmem_for_test` (it constructs the now-gated
+# in-memory `OutboxStore::new()` double + the deterministic `MonotonicMinter`), forwarding to
+# `myelin-events/test-support`. DEV/TEST only — the downstream cli/mcp test suites enable it as a
+# dev-dependency feature; never in the production DAG.
+test-support = ["myelin-events/test-support"]

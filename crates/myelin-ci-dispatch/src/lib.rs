@@ -115,7 +115,13 @@ fn dispatch_critical() -> CriticalDependencies {
 /// the dispatch BEHAVIOUR (the [`dispatch`] module's `EventMatcher` + dedup + trust stamp) is
 /// CI-P10's pure core; the bus-subscription consumer that drives it on each triggering event is
 /// wired in with CI-P11's reserve/start. This shell carries the ledger SHAPE the idempotency rides.
-pub fn dispatch_app_spec(config: Config) -> AppSpec {
+///
+/// **The outbox is INJECTED (MR-009b W3b.6 — the W3b.4 debt discharged):** the production
+/// `main.rs` constructs `OutboxStore::durable(PgOutboxBacking)` over the MR-022
+/// `SubstrateProvider` pool (foundation migrations applied, FAIL LOUD on missing durable config);
+/// a test/drill passes the `test-support`-gated in-memory `OutboxStore::new()` double. This
+/// builder constructs NO store of its own — the issues/flow W3b.4 injection pattern.
+pub fn dispatch_app_spec(config: Config, outbox: myelin_events::OutboxStore) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
         config,
@@ -132,14 +138,10 @@ pub fn dispatch_app_spec(config: Config) -> AppSpec {
         // Trigger & Dispatch owns only its OLTP store (the dedup ledger lives in it); the harness
         // adds the implicit OLTP store + auto-registers it as a holder.
         stores: StoreManifest::new(),
-        // **W3b.6 debt (named, MR-009b W3b.4):** the EXPLICIT in-memory floor — the gated
-        // `OutboxSpec::default_inproc` is no longer reachable from production; this construction is
-        // the grep-able remainder the W3b.6 `OutboxStore::new` gate breaks LOUDLY, forcing this root
-        // onto `OutboxSpec::durable` (the ci-dispatch durable rewiring is not in the W3b.4 set).
-        outbox: OutboxSpec::new(
-            myelin_events::OutboxStore::new(),
-            myelin_events::InProcessBus::new(),
-        ),
+        // The relay drains the INJECTED store (MR-009b W3b.6 — the named W3b.4 debt discharged:
+        // this builder no longer constructs the memory floor). The in-process broker fake stays
+        // the default TRANSPORT (durability lives in the store); EB-04's adapter is a config swap.
+        outbox: OutboxSpec::new(outbox, myelin_events::InProcessBus::new()),
         critical: dispatch_critical(),
     }
 }
@@ -147,15 +149,18 @@ pub fn dispatch_app_spec(config: Config) -> AppSpec {
 /// **Boot the CI Trigger & Dispatch service to the pre-serve [`ServeHandle`]** (the harness's
 /// [`boot`] of [`dispatch_app_spec`]). Separated from [`run_dispatch`] so a test/drill can boot,
 /// assert the three ports opened + the migration ran, drive ticks, and drive the drain.
-pub fn boot_dispatch(config: Config) -> Result<ServeHandle, ServeError> {
-    boot(dispatch_app_spec(config))
+pub fn boot_dispatch(
+    config: Config,
+    outbox: myelin_events::OutboxStore,
+) -> Result<ServeHandle, ServeError> {
+    boot(dispatch_app_spec(config, outbox))
 }
 
 /// **The CI Trigger & Dispatch service entry — the one `serve(AppSpec)` call (contract 1.1).** The
 /// `ci-dispatch` binary (`src/main.rs`) does nothing but hand [`dispatch_app_spec`] to this. A
 /// failed boot / incomplete drain returns non-zero (§3.1) — loud, never a silent success.
-pub fn run_dispatch(config: Config) -> Result<(), ServeError> {
-    serve(dispatch_app_spec(config))
+pub fn run_dispatch(config: Config, outbox: myelin_events::OutboxStore) -> Result<(), ServeError> {
+    serve(dispatch_app_spec(config, outbox))
 }
 
 #[cfg(test)]
@@ -169,7 +174,7 @@ mod tests {
     /// three-surface split and liveness ≠ readiness, and a forward-only migration creates the ledger.
     #[test]
     fn dispatch_boots_from_serve_appspec_with_three_ports() {
-        let handle = boot_dispatch(Config::default())
+        let handle = boot_dispatch(Config::default(), myelin_events::OutboxStore::new())
             .expect("the Trigger & Dispatch shell boots from serve(AppSpec)");
         assert_eq!(handle.name(), SERVICE_NAME, "the deployable service name");
 
@@ -197,7 +202,8 @@ mod tests {
     /// — but stays live (no restart storm).
     #[test]
     fn dead_broker_flips_readiness_not_liveness() {
-        let handle = boot_dispatch(Config::default()).expect("boot");
+        let handle =
+            boot_dispatch(Config::default(), myelin_events::OutboxStore::new()).expect("boot");
         let mh = handle.metrics_health();
         assert!(
             mh.readiness().is_ready(),
@@ -223,7 +229,7 @@ mod tests {
     #[test]
     fn run_dispatch_runs_lifecycle_and_returns_ok() {
         assert_eq!(
-            run_dispatch(Config::default()),
+            run_dispatch(Config::default(), myelin_events::OutboxStore::new()),
             Ok(()),
             "the Trigger & Dispatch shell boots → … → drains cleanly"
         );
@@ -233,7 +239,7 @@ mod tests {
     /// boot loudly — the shell never starts half-booted.
     #[test]
     fn failed_boot_returns_non_zero() {
-        let r = run_dispatch(Config("BAD_POOL".into()));
+        let r = run_dispatch(Config("BAD_POOL".into()), myelin_events::OutboxStore::new());
         assert!(r.is_err(), "a failed boot must return non-zero (Err)");
         assert!(
             r.unwrap_err().0.contains("fail-fast"),
@@ -246,7 +252,7 @@ mod tests {
     /// consumer/handler without reconciliation, or drops the dedup ledger, is loud.
     #[test]
     fn the_shell_carries_the_dedup_ledger_and_no_consumers() {
-        let spec = dispatch_app_spec(Config::default());
+        let spec = dispatch_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
             1,

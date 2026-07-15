@@ -83,7 +83,11 @@ serde = { workspace = true }
 # inline (no myelin-config edge — same posture as refs-service/identity).
 # ------------------------------------------------------------------------------------------
 sqlx = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
+# MR-009b W3b.6: tokio + myelin-config are REGULAR deps now — the durable service main.rs
+# (provider-from-env → migrate_foundation → OutboxStore::durable, fail-loud) needs them. The
+# `integration` feature no longer carries their dep: activation; the build stays DB-free
+# (connecting happens at RUNTIME, never at build).
+tokio = { workspace = true }
 
 # CI-P11 (P-354, M4): the CAS-SNAPSHOT round-trip against the LIVE object store (RustFS). The binding
 # data-layer policy: a contract that touches the object store (11.2 BlobStore — the CAS definition
@@ -91,16 +95,21 @@ tokio = { workspace = true, optional = true }
 # writes the snapshot through `myelin_storage::s3blob::S3BlobStore` (the dev<->prod backing SWAP) and
 # reads the SAME bytes back at the SAME content address. These optional deps are pulled ONLY by
 # `--features integration`; the default build stays DB-free.
-myelin-config = { path = "../myelin-config", optional = true }
+myelin-config = { path = "../myelin-config" }
 aws-sdk-s3 = { workspace = true, optional = true }
+
+[dev-dependencies]
+# MR-009b W3b.6: enable `test-support` so this crate's DEV tests reach the events in-memory
+# `OutboxStore::new()` double (the durable `OutboxStore::durable` is the production default; the
+# in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
+# — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
+myelin-events = { path = "../myelin-events", features = ["test-support"] }
 
 [features]
 default = []
 # `myelin-storage/integration` exposes the s3blob module (the real S3BlobStore over RustFS/Scaleway).
 integration = [
     "dep:sqlx",
-    "dep:tokio",
-    "dep:myelin-config",
     "dep:aws-sdk-s3",
     "myelin-storage/integration",
 ]

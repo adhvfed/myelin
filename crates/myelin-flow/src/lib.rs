@@ -238,6 +238,10 @@ pub mod approval;
 pub mod budget;
 pub mod ci_pipeline;
 pub mod crypto_shred;
+// MR-009b W3b.5: the M6 dogfood drill runners build the in-process memory `Substrate`
+// (`OutboxStore::new()` + memory journal/timers) — a drill harness, never production serving
+// code. Gated with the events memory arm; the tests-dir drills reach it via the self dev-dep.
+#[cfg(any(test, feature = "test-support"))]
 pub mod dogfood;
 pub mod engine;
 pub mod executor;
@@ -248,6 +252,10 @@ pub mod maintenance;
 pub mod merge_queue;
 pub mod migrations;
 pub mod remint;
+// MR-009b W3b.5: the FLOW-D10 restore-verify drill re-hydrates a RESTORED in-memory outbox via
+// the `test-support`-gated `OutboxStore::new()` + `restore_committed_row_for_test` seam — a
+// PITR-model drill harness, never production serving code. Gated with the events memory arm.
+#[cfg(any(test, feature = "test-support"))]
 pub mod restore_verify;
 pub mod schema;
 pub mod signal_consumer;
@@ -279,6 +287,7 @@ pub use crypto_shred::{
 // `myelin-storage` edge just to name the cost.
 // The M6 dogfood loop (P-FLOW-29 / P-516): Myelin's own pipelines / merge queue / SLA timers run as
 // myelin-flow workflows over the platform's own work + the FLOW truth-up pass over FLOW-D1..D10 + E2E-2.
+#[cfg(any(test, feature = "test-support"))]
 pub use dogfood::{
     proven_flow_rows, run_flow_over_myelins_own_work, run_flow_truth_up_scorecard,
     run_myelin_ci_pipeline, run_myelin_merge_queue, run_myelin_sla_timer, FlowDogfoodArtifact,
@@ -316,6 +325,7 @@ pub use merge_queue::{
 };
 pub use myelin_storage::reserve_settle::{MeteredUnit, MinorUnits};
 pub use remint::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenLease, RunTokenMinter};
+#[cfg(any(test, feature = "test-support"))]
 pub use restore_verify::{
     ConsistentOffset, ConsistentPointArtifact, RestoreVerifyFailure, RestoreVerifyOutcome,
     RestoredFlow, WfRestore, WfRestoreVerify,

@@ -77,7 +77,10 @@
 //! The real GC sweep computes `cutoff = now() − 24h` from the `serve` clock; the algorithm + the
 //! "only-sent-rows-reaped" property do not change.
 
-use crate::outbox::{OutboxRow, OutboxStore};
+use crate::outbox::OutboxStore;
+// Used only by the `test-support`-gated memory-arm relay mechanics (MR-009b W3b.6).
+#[cfg(any(test, feature = "test-support"))]
+use crate::outbox::OutboxRow;
 use crate::{ArtifactRef, EventEnvelope, EventId, TenantId, Timestamp};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -327,6 +330,9 @@ pub fn dlq_subject(tenant: &TenantId, subsystem: &str) -> String {
 
 /// The owning subsystem token of an event (the first dotted segment of its `type`, §6.1). An
 /// empty / malformed type yields `"unknown"` so a dead-letter is still routable (never dropped).
+/// Called only by the `test-support`-gated memory drain arm (the durable arm derives the DLQ
+/// routing inside `PgRelay`'s dead-letter pass), so it is gated with it (MR-009b W3b.6).
+#[cfg(any(test, feature = "test-support"))]
 fn subsystem_of(envelope: &EventEnvelope) -> String {
     envelope
         .type_
@@ -370,7 +376,10 @@ pub struct Relay<T: BusTransport> {
     store: OutboxStore,
     transport: T,
     /// The `published_at` stamp source (a function so it is deterministic in tests; the real
-    /// clock is wired at `serve` P-S12).
+    /// clock is wired at `serve` P-S12). Read only by the `test-support`-gated memory drain arm
+    /// (the durable arm stamps `published_at` in SQL inside `PgRelay`); the field + the
+    /// constructor parameter stay so the `Relay::new` API is identical on both builds.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     clock: Box<dyn Fn() -> Timestamp + Send + Sync>,
     /// The dead-letter alerts raised this relay's lifetime (EB-04). Each exhausted-retry row
     /// pushes a [`DeadLetterAlert`] here (the `dlq.<tenant>.<subsystem>` Signal alert, arch §4.1)
@@ -417,7 +426,18 @@ impl<T: BusTransport> Relay<T> {
     /// ever removes rows that were already delivered (`published_at` is set) — it can never reap
     /// an unsent row, so it cannot lose a not-yet-delivered event.
     pub fn gc_published(&self, published_before: &Timestamp) -> usize {
-        self.store.gc_published_before(published_before)
+        // Memory-arm GC mechanic (MR-009b W3b.6: `test-support`-gated with the memory arm). The
+        // durable arm reaps in the DB — the durable GC verb is the NAMED W3b.2 residual floor
+        // (no rows are ever lost by its absence: only ALREADY-PUBLISHED rows are GC candidates).
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.store.gc_published_before(published_before)
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let _ = published_before;
+            0
+        }
     }
 
     /// **Drain pass: claim → publish → mark sent / dead-letter.** Claims every currently-unsent,
@@ -454,50 +474,60 @@ impl<T: BusTransport> Relay<T> {
                 }
             };
         }
-        let mut report = DrainReport::default();
-        let claimed = self.store.claim_unsent();
-        for row in claimed {
-            match self
-                .transport
-                .put(&row.subject, &row.envelope, &row.event_id)
-            {
-                Ok(Delivery::Accepted) => {
-                    self.store.mark_published(&row.event_id, (self.clock)());
-                    report.published += 1;
-                }
-                Ok(Delivery::Deduplicated) => {
-                    // The broker already had this id (a re-claim after a crash mid-publish): the
-                    // event WAS delivered, so mark the row sent — no ghost, no re-delivery.
-                    self.store.mark_published(&row.event_id, (self.clock)());
-                    report.deduplicated += 1;
-                }
-                Err(_) => {
-                    // Broker unreachable: release the claim + bump attempts. The row stays
-                    // unsent (claimable on the next pass) — 0 lost. After the bound, dead-letter.
-                    let attempts = self.store.fail_attempt(&row.event_id);
-                    if attempts >= MAX_PUBLISH_ATTEMPTS {
-                        self.store.dead_letter(&row.event_id);
-                        // EB-04: route the poison row to dlq.<tenant>.<subsystem> + raise the
-                        // operator Signal alert — a dead-letter is SURFACED, never silent.
-                        let subsystem = subsystem_of(&row.envelope);
-                        self.dead_letter_alerts
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(DeadLetterAlert {
-                                dlq_subject: dlq_subject(&row.envelope.tenant, &subsystem),
-                                event_id: row.event_id.clone(),
-                                tenant: row.envelope.tenant.clone(),
-                                subsystem,
-                                attempts,
-                            });
-                        report.dead_lettered += 1;
-                    } else {
-                        report.failed += 1;
+        // Memory-arm drain mechanics (MR-009b W3b.6: `test-support`-gated with the memory arm;
+        // in the production build `durable_backing()` is always `Some` — the enum presents only
+        // `Durable` — so this point is structurally unreachable there).
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let mut report = DrainReport::default();
+            let claimed = self.store.claim_unsent();
+            for row in claimed {
+                match self
+                    .transport
+                    .put(&row.subject, &row.envelope, &row.event_id)
+                {
+                    Ok(Delivery::Accepted) => {
+                        self.store.mark_published(&row.event_id, (self.clock)());
+                        report.published += 1;
+                    }
+                    Ok(Delivery::Deduplicated) => {
+                        // The broker already had this id (a re-claim after a crash mid-publish): the
+                        // event WAS delivered, so mark the row sent — no ghost, no re-delivery.
+                        self.store.mark_published(&row.event_id, (self.clock)());
+                        report.deduplicated += 1;
+                    }
+                    Err(_) => {
+                        // Broker unreachable: release the claim + bump attempts. The row stays
+                        // unsent (claimable on the next pass) — 0 lost. After the bound, dead-letter.
+                        let attempts = self.store.fail_attempt(&row.event_id);
+                        if attempts >= MAX_PUBLISH_ATTEMPTS {
+                            self.store.dead_letter(&row.event_id);
+                            // EB-04: route the poison row to dlq.<tenant>.<subsystem> + raise the
+                            // operator Signal alert — a dead-letter is SURFACED, never silent.
+                            let subsystem = subsystem_of(&row.envelope);
+                            self.dead_letter_alerts
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(DeadLetterAlert {
+                                    dlq_subject: dlq_subject(&row.envelope.tenant, &subsystem),
+                                    event_id: row.event_id.clone(),
+                                    tenant: row.envelope.tenant.clone(),
+                                    subsystem,
+                                    attempts,
+                                });
+                            report.dead_lettered += 1;
+                        } else {
+                            report.failed += 1;
+                        }
                     }
                 }
             }
+            report
         }
-        report
+        #[cfg(not(any(test, feature = "test-support")))]
+        unreachable!(
+            "a production OutboxStore is Durable-only (the Memory arm is test-support-gated)"
+        )
     }
 
     /// Drain repeatedly until the outbox depth reaches 0 or no progress is made (every remaining
@@ -536,8 +566,13 @@ impl<T: BusTransport> Relay<T> {
 
 // --- The claim / mark-sent / dead-letter operations the relay drives over the store. These
 // live on OutboxStore but are relay-internal mechanics (modeling the SQL row updates), so they
-// are defined here against the store's claim API. ---
+// are defined here against the store's claim API.
+//
+// **MR-009b W3b.6 — `test-support`-gated with the memory arm they operate on** (the durable arm
+// owns claim/mark/dead-letter/GC inside its single composite `drain_once` verb — `PgRelay`'s
+// `FOR UPDATE SKIP LOCKED` transaction — and never routes here). ---
 
+#[cfg(any(test, feature = "test-support"))]
 impl OutboxStore {
     /// Claim every currently-unsent, unclaimed row (the `FOR UPDATE SKIP LOCKED` batch), ordered
     /// `(aggregate, seq)`. A claimed row is marked so a SECOND relay worker's claim SKIPs it (no

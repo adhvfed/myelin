@@ -88,9 +88,13 @@
 
 use crate::relay::{BusTransport, DrainReport};
 use crate::{
-    derive_envelope, AggregateKey, EmitContext, EventDraft, EventEnvelope, EventId, OutboxError,
-    OutboxTx, Result,
+    derive_envelope, AggregateKey, EmitContext, EventDraft, EventEnvelope, EventId, OutboxTx,
+    Result,
 };
+// Used only by the `test-support`-gated memory arm (MR-009b W3b.6).
+#[cfg(any(test, feature = "test-support"))]
+use crate::OutboxError;
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -192,10 +196,17 @@ pub struct OutboxRow {
     pub attempts: u32,
 }
 
-/// The shared inner state of an [`OutboxStore`] (behind an `Arc<Mutex<…>>` so the store is a
-/// cloneable handle shared by the emitting transactions, the relay, and the depth reader).
-/// `pub(crate)` (with `pub(crate)` fields) because the relay's claim/mark-sent/dead-letter
-/// mechanics ([`crate::relay`]) operate on it directly (modeling the SQL row updates).
+/// The shared inner state of the **`test-support`-gated in-memory arm** of an [`OutboxStore`]
+/// (behind an `Arc<Mutex<…>>` so the store is a cloneable handle shared by the emitting
+/// transactions, the relay, and the depth reader). `pub(crate)` (with `pub(crate)` fields)
+/// because the relay's memory-arm claim/mark-sent/dead-letter mechanics ([`crate::relay`])
+/// operate on it directly (modeling the SQL row updates).
+///
+/// **MR-009b W3b.6 — TEST DOUBLE (compiled ONLY under `#[cfg(any(test, feature =
+/// "test-support"))]`).** The production store holds NO in-memory collection: the always-compiled
+/// backend is `Durable(Arc<dyn DurableOutboxBacking>)` over the real PG `outbox` table
+/// (`myelin_storage::PgOutboxBacking`), so committed events survive a process restart (SI-007).
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub(crate) struct Inner {
     /// All committed rows, keyed by `event_id` (the UNIQUE constraint). Insertion-ordered via
@@ -227,9 +238,22 @@ pub(crate) struct Inner {
 /// between buffering and commit) NOTHING is written — so there is no event without its state,
 /// and (because the caller's state mutation is in the same buffer) no committed state without
 /// its event. This is the silent-data-loss floor, correct-by-construction.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct OutboxStore {
     backend: OutboxBackend,
+}
+
+/// The `Default` store is the in-memory TEST DOUBLE — `#[cfg(any(test, feature =
+/// "test-support"))]` (MR-009b W3b.6). Production constructs the `Durable` backing through
+/// [`OutboxStore::durable`] (the W3b.4 composition roots: provider-from-env → foundation
+/// migrations → `PgOutboxBacking`, fail-loud on missing durable config).
+#[cfg(any(test, feature = "test-support"))]
+impl Default for OutboxStore {
+    fn default() -> Self {
+        OutboxStore {
+            backend: OutboxBackend::default(),
+        }
+    }
 }
 
 /// **The durable backing seam for the `outbox` table + relay (SI-007, MR-009b W3b).** A real
@@ -285,25 +309,31 @@ pub trait DurableOutboxBacking: Send + Sync {
 
 /// The outbox-store backend (the MR-007/008/023 backend-enum pattern; mirrors [`crate::dedup`]'s
 /// `DedupBackend`). `Memory` is the in-memory transactional model (the SUB-D1/BUS-D4 drill state +
-/// the in-process event floor); `Durable` is the production PG-backed seam a later wave wires.
+/// the test/dev in-process floor); `Durable` is the production PG-backed seam the W3b.4
+/// composition roots wire (`OutboxStore::durable(PgOutboxBacking)` over the MR-022 provider).
 ///
-/// **MR-009b W3b.1 — the `Memory` arm is DELIBERATELY UN-gated in this step** (no `cfg`): this is
-/// the scanner-neutral role-struct reshape. The `no-in-memory-durable-store` scanner FOLLOWS this
-/// enum into its `Memory(Arc<Mutex<Inner>>)` variant (which references the un-gated in-memory
-/// [`Inner`]) and still fires on the [`OutboxStore`] holder — the baseline entry is byte-identical
-/// to before the reshape. Gating this arm behind `test-support` (which flips the scanner GREEN) is
-/// the separate W3b.6 step, AFTER the durable impl + the per-subsystem emit re-point land.
+/// **MR-009b W3b.6 — THE FLIP: the `Memory` arm is a `test-support`-gated TEST DOUBLE.** The
+/// production-compiled enum presents ONLY `Durable(Arc<dyn DurableOutboxBacking>)`, so the
+/// `no-in-memory-durable-store` scanner (which strips `test-support`-gated variants as test
+/// doubles) no longer fires on the [`OutboxStore`] holder — the `outbox.rs` baseline entry is
+/// REMOVED. Chain: W3b.1 role-struct (scanner-neutral) → W3b.2 `PgOutboxBacking` + relay parity →
+/// W3b.3 identity co-commit (BUS-2 exact) → W3b.4 durable composition roots (fail-loud mains) →
+/// W3b.5 harness gating → THIS flip.
 #[derive(Clone)]
 enum OutboxBackend {
-    /// The in-memory transactional model: all state behind a shared lock. **UN-gated in W3b.1**
-    /// (the scanner-neutral step); gated behind `test-support` in W3b.6.
+    /// **MR-009b W3b.6 — TEST DOUBLE (compiled ONLY under `#[cfg(any(test, feature =
+    /// "test-support"))]`).** The in-memory transactional model: all state behind a shared lock.
+    /// DB-free unit tests/drills reach it via the `myelin-events/test-support` dev-dependency.
+    #[cfg(any(test, feature = "test-support"))]
     Memory(Arc<Mutex<Inner>>),
     /// The durable PG-backed seam (production): an `outbox` table that survives restart.
     Durable(Arc<dyn DurableOutboxBacking>),
 }
 
-/// The default backend is the in-memory model (an empty transactional store). Production constructs
-/// the `Durable` backing through [`OutboxStore::durable`] (a later wave's composition root).
+/// The default backend is the in-memory TEST DOUBLE — `#[cfg(any(test, feature =
+/// "test-support"))]` (MR-009b W3b.6). Production constructs the `Durable` backing through
+/// [`OutboxStore::durable`] (the W3b.4 composition roots).
+#[cfg(any(test, feature = "test-support"))]
 impl Default for OutboxBackend {
     fn default() -> Self {
         OutboxBackend::Memory(Arc::new(Mutex::new(Inner::default())))
@@ -311,8 +341,12 @@ impl Default for OutboxBackend {
 }
 
 impl OutboxStore {
-    /// A fresh, empty IN-MEMORY store (depth 0, no dead-letters) — the SUB-D1/BUS-D4 drill +
-    /// in-process-floor default. The production constructor is [`OutboxStore::durable`].
+    /// **MR-009b W3b.6 — TEST DOUBLE (compiled ONLY under `#[cfg(any(test, feature =
+    /// "test-support"))]`).** A fresh, empty IN-MEMORY store (depth 0, no dead-letters) — the
+    /// SUB-D1/BUS-D4 drill + in-process test floor. The production constructor is
+    /// [`OutboxStore::durable`] (the W3b.4 composition roots; a production root that reaches for
+    /// this breaks LOUDLY at compile time — never a silent in-memory fallback).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new() -> Self {
         Self::default()
     }
@@ -327,10 +361,12 @@ impl OutboxStore {
         }
     }
 
-    /// Crate-internal memory-arm accessor: the in-memory [`Inner`] guard on the `Memory` backend;
-    /// `None` on the `Durable` backend (whose reads + relay mechanics route straight to the trait,
-    /// never here). The relay's claim/mark-sent/dead-letter/GC mechanics ([`crate::relay`]) and the
-    /// memory-arm reads/commit obtain their guard through this.
+    /// Crate-internal memory-arm accessor (**`test-support`-gated with the [`Inner`] it
+    /// guards**, MR-009b W3b.6): the in-memory [`Inner`] guard on the `Memory` backend; `None`
+    /// on the `Durable` backend (whose reads + relay mechanics route straight to the trait,
+    /// never here). The relay's memory-arm claim/mark-sent/dead-letter/GC mechanics
+    /// ([`crate::relay`]) and the memory-arm reads/commit obtain their guard through this.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn mem(&self) -> Option<std::sync::MutexGuard<'_, Inner>> {
         match &self.backend {
             OutboxBackend::Memory(inner) => Some(inner.lock().unwrap_or_else(|e| e.into_inner())),
@@ -339,10 +375,13 @@ impl OutboxStore {
     }
 
     /// Crate-internal durable-backing accessor: `Some(backing)` on the `Durable` backend (so the
-    /// commit dispatch + the relay drain route to it), `None` on the `Memory` backend.
+    /// commit dispatch + the relay drain route to it), `None` on the (`test-support`-gated)
+    /// `Memory` backend. In the production build the enum presents ONLY `Durable`, so this is
+    /// always `Some` there (the `None` arm exists only under test/test-support).
     pub(crate) fn durable_backing(&self) -> Option<Arc<dyn DurableOutboxBacking>> {
         match &self.backend {
             OutboxBackend::Durable(b) => Some(Arc::clone(b)),
+            #[cfg(any(test, feature = "test-support"))]
             OutboxBackend::Memory(_) => None,
         }
     }
@@ -366,29 +405,33 @@ impl OutboxStore {
     /// The `outbox_depth` survival signal (contract 1.8): the number of **unsent** rows
     /// (`published_at IS NULL`). The SUB-D1 drill asserts this `→ 0` once the relay drains.
     pub fn outbox_depth(&self) -> usize {
-        if let OutboxBackend::Durable(b) = &self.backend {
-            return b.outbox_depth();
-        }
-        let inner = self.mem().expect("memory backend");
-        inner
-            .order
-            .iter()
-            .filter(|id| {
+        match &self.backend {
+            OutboxBackend::Durable(b) => b.outbox_depth(),
+            #[cfg(any(test, feature = "test-support"))]
+            OutboxBackend::Memory(_) => {
+                let inner = self.mem().expect("memory backend");
                 inner
-                    .rows
-                    .get(*id)
-                    .is_some_and(|r| r.published_at.is_none())
-            })
-            .count()
+                    .order
+                    .iter()
+                    .filter(|id| {
+                        inner
+                            .rows
+                            .get(*id)
+                            .is_some_and(|r| r.published_at.is_none())
+                    })
+                    .count()
+            }
+        }
     }
 
     /// The dead-letter count survival signal (contract 1.8): rows the relay gave up on after
     /// bounded retries. The no-loss path asserts this `== 0`.
     pub fn dead_letter_count(&self) -> usize {
-        if let OutboxBackend::Durable(b) = &self.backend {
-            return b.dead_letter_count();
+        match &self.backend {
+            OutboxBackend::Durable(b) => b.dead_letter_count(),
+            #[cfg(any(test, feature = "test-support"))]
+            OutboxBackend::Memory(_) => self.mem().expect("memory backend").dead_letters.len(),
         }
-        self.mem().expect("memory backend").dead_letters.len()
     }
 
     /// The **`recorded_at` of the oldest still-unsent row** — the input to the contract-1.8
@@ -402,42 +445,48 @@ impl OutboxStore {
     /// the age anchor. The age-in-seconds is computed against a caller-supplied `now` in
     /// [`crate::telemetry`] (M0 has no shared wall-clock until `serve`, P-S12 — named floor).
     pub fn oldest_unsent_recorded_at(&self) -> Option<crate::Timestamp> {
-        if let OutboxBackend::Durable(b) = &self.backend {
-            return b.oldest_unsent_recorded_at();
+        match &self.backend {
+            OutboxBackend::Durable(b) => b.oldest_unsent_recorded_at(),
+            #[cfg(any(test, feature = "test-support"))]
+            OutboxBackend::Memory(_) => {
+                let inner = self.mem().expect("memory backend");
+                inner.order.iter().find_map(|id| {
+                    inner
+                        .rows
+                        .get(id)
+                        .filter(|r| r.published_at.is_none())
+                        .map(|r| r.envelope.recorded_at.clone())
+                })
+            }
         }
-        let inner = self.mem().expect("memory backend");
-        inner.order.iter().find_map(|id| {
-            inner
-                .rows
-                .get(id)
-                .filter(|r| r.published_at.is_none())
-                .map(|r| r.envelope.recorded_at.clone())
-        })
     }
 
     /// The total committed-row count (sent + unsent), for the no-ghost assertion (every
     /// committed event is delivered exactly once; an aborted transaction adds nothing here).
     pub fn committed_count(&self) -> usize {
-        if let OutboxBackend::Durable(b) = &self.backend {
-            return b.committed_count();
+        match &self.backend {
+            OutboxBackend::Durable(b) => b.committed_count(),
+            #[cfg(any(test, feature = "test-support"))]
+            OutboxBackend::Memory(_) => self.mem().expect("memory backend").order.len(),
         }
-        self.mem().expect("memory backend").order.len()
     }
 
     /// Read a row by id (for tests / the relay's re-hydration of the envelope to publish).
     pub fn row(&self, id: &EventId) -> Option<OutboxRow> {
-        if let OutboxBackend::Durable(b) = &self.backend {
-            return b.row(id);
+        match &self.backend {
+            OutboxBackend::Durable(b) => b.row(id),
+            #[cfg(any(test, feature = "test-support"))]
+            OutboxBackend::Memory(_) => self.mem().expect("memory backend").rows.get(id).cloned(),
         }
-        self.mem().expect("memory backend").rows.get(id).cloned()
     }
 
     /// Snapshot the dead-lettered rows (for the operator alert / a test).
     pub fn dead_letters(&self) -> Vec<OutboxRow> {
-        if let OutboxBackend::Durable(b) = &self.backend {
-            return b.dead_letters();
+        match &self.backend {
+            OutboxBackend::Durable(b) => b.dead_letters(),
+            #[cfg(any(test, feature = "test-support"))]
+            OutboxBackend::Memory(_) => self.mem().expect("memory backend").dead_letters.clone(),
         }
-        self.mem().expect("memory backend").dead_letters.clone()
     }
 
     /// Snapshot the committed rows in per-aggregate commit order (for a producer test / a consumer
@@ -445,15 +494,18 @@ impl OutboxStore {
     /// a producer drill to assert WHICH events a workflow body emitted (e.g. the CI-P15 `ci.pipeline`
     /// body's terminal `ci.check.updated` / `ci.run.*` / `ci.result` facts).
     pub fn committed_rows(&self) -> Vec<OutboxRow> {
-        if let OutboxBackend::Durable(b) = &self.backend {
-            return b.committed_rows();
+        match &self.backend {
+            OutboxBackend::Durable(b) => b.committed_rows(),
+            #[cfg(any(test, feature = "test-support"))]
+            OutboxBackend::Memory(_) => {
+                let inner = self.mem().expect("memory backend");
+                inner
+                    .order
+                    .iter()
+                    .filter_map(|id| inner.rows.get(id).cloned())
+                    .collect()
+            }
         }
-        let inner = self.mem().expect("memory backend");
-        inner
-            .order
-            .iter()
-            .filter_map(|id| inner.rows.get(id).cloned())
-            .collect()
     }
 
     /// **Restore seam: insert a committed outbox row directly (bypassing a transaction) — the PITR-target
@@ -464,7 +516,11 @@ impl OutboxStore {
     /// reconcile reads the SAME committed sequence the live store held. Idempotent on `event_id` (the
     /// UNIQUE key) — a re-load of an already-present row is a no-op. NOT a production write path: the ONE
     /// production write path is [`OutboxTransaction::commit`].
+    ///
+    /// **MR-009b W3b.6 — `test-support`-gated with the memory arm it writes into** (the durable
+    /// arm re-hydrates via `pg_restore`, never through this seam).
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn restore_committed_row_for_test(&self, row: OutboxRow) {
         // Memory-arm test/restore seam; the durable arm re-hydrates via `pg_restore`, not here.
         let Some(mut inner) = self.mem() else { return };
@@ -555,30 +611,41 @@ impl OutboxTransaction {
             let rows: Vec<OutboxRow> = self.staged_rows.drain(..).collect();
             return backing.commit_staged(rows);
         }
-        let mut inner = self.store.mem().expect("memory backend");
-        // First pass: every staged row's event_id must be unique (the UNIQUE(event_id)
-        // constraint) — reject the WHOLE commit loudly before mutating anything (atomicity: a
-        // partial commit would be silent data loss). The minter is monotonic so this cannot
-        // happen on the happy path; a collision is a programming error.
-        for row in &self.staged_rows {
-            if inner.rows.contains_key(&row.event_id) {
-                return Err(OutboxError(format!(
-                    "outbox UNIQUE(event_id) violation on {:?} — duplicate emit",
-                    row.event_id
-                )));
+        // Memory arm (MR-009b W3b.6: the `test-support`-gated test double; in the production
+        // build `durable_backing()` is always `Some` — the enum presents only `Durable`).
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let mut inner = self.store.mem().expect("memory backend");
+            // First pass: every staged row's event_id must be unique (the UNIQUE(event_id)
+            // constraint) — reject the WHOLE commit loudly before mutating anything (atomicity: a
+            // partial commit would be silent data loss). The minter is monotonic so this cannot
+            // happen on the happy path; a collision is a programming error.
+            for row in &self.staged_rows {
+                if inner.rows.contains_key(&row.event_id) {
+                    return Err(OutboxError(format!(
+                        "outbox UNIQUE(event_id) violation on {:?} — duplicate emit",
+                        row.event_id
+                    )));
+                }
             }
+            // Second pass: assign the per-aggregate commit-order seq and durably insert. Staged
+            // rows keep the emit order, so within one transaction the seqs are assigned in emit
+            // order; across transactions they are assigned in commit order (this lock).
+            for mut row in self.staged_rows.drain(..) {
+                let slot = inner.next_seq.entry(row.aggregate.clone()).or_insert(0);
+                row.seq = *slot;
+                *slot += 1;
+                inner.order.push(row.event_id.clone());
+                inner.rows.insert(row.event_id.clone(), row);
+            }
+            Ok(())
         }
-        // Second pass: assign the per-aggregate commit-order seq and durably insert. Staged
-        // rows keep the emit order, so within one transaction the seqs are assigned in emit
-        // order; across transactions they are assigned in commit order (this lock).
-        for mut row in self.staged_rows.drain(..) {
-            let slot = inner.next_seq.entry(row.aggregate.clone()).or_insert(0);
-            row.seq = *slot;
-            *slot += 1;
-            inner.order.push(row.event_id.clone());
-            inner.rows.insert(row.event_id.clone(), row);
-        }
-        Ok(())
+        #[cfg(not(any(test, feature = "test-support")))]
+        // Structurally unreachable in the production build: `OutboxBackend` has only the
+        // `Durable` variant there, so `durable_backing()` returned `Some` above.
+        unreachable!(
+            "a production OutboxStore is Durable-only (the Memory arm is test-support-gated)"
+        )
     }
 
     /// Whether the caller staged a state change (for the co-commit assertion in tests).

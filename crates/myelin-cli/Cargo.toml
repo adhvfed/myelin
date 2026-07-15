@@ -55,7 +55,9 @@ tokio = { version = "1", features = ["rt", "net", "macros", "io-util"] }
 # — the deployable `edge` binary generates a random cell with no mint API yet) over a real TCP socket,
 # then runs the `myelin` binary as a subprocess against it. These build the gateway + mint a REAL
 # PASETO capability token (genuine Ed25519 crypto).
-myelin-edge = { path = "../myelin-edge" }
+# MR-009b W3b.6: + `test-support` — the tests build the edge in-memory git backend double
+# (`DurableGitBackend::rooted_inmem_for_test`), now gated with the events in-memory OutboxStore.
+myelin-edge = { path = "../myelin-edge", features = ["test-support"] }
 myelin-identity = { path = "../myelin-identity" }
 # MR-009b Wave 2: enable `test-support` so this crate's DEV tests reach the identity in-memory
 # doubles (PrincipalStore/TupleStore/RevocationStore/StoreBackedCheck `::new`) which moved behind

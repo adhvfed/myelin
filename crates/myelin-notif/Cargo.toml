@@ -113,3 +113,6 @@ myelin-lints = { path = "../myelin-lints" }
 # (tokio + myelin-config are regular deps since W3b.4 — the durable main.rs needs them; the
 # feature now only pulls the raw-sqlx test harness.)
 integration = ["dep:sqlx"]
+# MR-009b W3b.5 — gates the E2E wedge drill runners (they construct the now-gated in-memory
+# `OutboxStore::new()` double), forwarding to `myelin-events/test-support`. DEV/TEST only.
+test-support = ["myelin-events/test-support"]

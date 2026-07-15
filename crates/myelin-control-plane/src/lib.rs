@@ -322,7 +322,9 @@ pub use schema::{
 };
 pub use self_host::DegenerateControlPlane;
 
-use myelin_substrate::{AppSpec, Config, Migration, Migrations, StoreKind, StoreManifest};
+use myelin_substrate::{
+    AppSpec, Config, Migration, Migrations, OutboxSpec, StoreKind, StoreManifest,
+};
 
 /// The service name (the PII-free telemetry/trace identifier the harness keys on).
 pub const SERVICE_NAME: &str = "control-plane";
@@ -425,8 +427,15 @@ pub const CONTROL_PLANE_STORE_NAME: &str = "control_plane_registry";
 /// [`control_plane_store_manifest`] (so the registry store auto-registers as a holder). The routing
 /// surfaces (`discover`/`place`/`placement_of`) land in P-CP-06..P-CP-08; here the spec stands up
 /// the registry the service is built on.
-pub fn control_plane_app_spec(config: Config) -> AppSpec {
-    let mut spec = AppSpec::minimal(SERVICE_NAME, config);
+///
+/// **MR-009b W3b.6 (the W3b.4 debt discharged):** the outbox relay spec is INJECTED — this
+/// builder constructs NO store. A production boot root (there is no control-plane service binary
+/// yet — the self-host path drives `DegenerateControlPlane`) must pass
+/// [`OutboxSpec::durable`](myelin_substrate::OutboxSpec::durable) (the W3b.4 provider-from-env,
+/// fail-loud pattern); a test/drill passes the `test-support`-gated
+/// `OutboxSpec::default_inproc()` double.
+pub fn control_plane_app_spec(config: Config, outbox: OutboxSpec) -> AppSpec {
+    let mut spec = AppSpec::minimal(SERVICE_NAME, config, outbox);
     spec.migrations = control_plane_migrations();
     spec.stores = control_plane_store_manifest();
     spec
@@ -516,7 +525,7 @@ mod tests {
     /// admits the registry DDL (forward-only, no hot table) — the boot path is exercisable.
     #[test]
     fn app_spec_carries_registry_and_store_manifest() {
-        let spec = control_plane_app_spec(Config::default());
+        let spec = control_plane_app_spec(Config::default(), OutboxSpec::default_inproc());
         assert_eq!(spec.name, SERVICE_NAME);
         assert_eq!(spec.migrations.0.len(), 5);
         // The control-plane registry store is declared (so opening it = registering it).

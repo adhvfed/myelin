@@ -149,7 +149,9 @@ default = []
 # E2E-wedge/dogfood drill runners (`run_e2e_4_dsar_fanout` / `run_refs_e2e_wedge` /
 # `run_refs_over_myelins_own_work`), which construct the in-memory `KmsEngine` test double — so it
 # forwards to `myelin-storage/test-support`. DEV/TEST only.
-test-support = ["myelin-storage/test-support"]
+# MR-009b W3b.5/.6: also forwards to `myelin-events/test-support` — the gated dogfood/e2e_wedge/
+# reindex_at_scale drill runners construct the now-gated in-memory `OutboxStore::new()` double.
+test-support = ["myelin-storage/test-support", "myelin-events/test-support"]
 memory = ["test-support"]
 # REF-P12 / P-161: the R2 cache integration test (tests/integration_ref_p12_r2_cache.rs) drives the
 # REAL `myelin_storage::ValkeyCache` against the live dev-stack Valkey, so it turns on storage's

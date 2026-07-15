@@ -142,4 +142,6 @@ integration = ["dep:sqlx"]
 # helpers behind `#[cfg(any(test, feature = "test-support"))]`, so downstream crates (ci-controlplane)
 # can enable them as a DEV-dependency. Forwards to `myelin-storage/test-support` (the in-memory
 # `CostLedger` double lives there). DEV/TEST only — never in the production DAG.
-test-support = ["myelin-storage/test-support"]
+# MR-009b W3b.5/.6: also forwards to `myelin-events/test-support` — the gated dogfood /
+# restore_verify drill runners construct the now-gated in-memory `OutboxStore::new()` double.
+test-support = ["myelin-storage/test-support", "myelin-events/test-support"]

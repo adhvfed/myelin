@@ -99,6 +99,9 @@ pub mod eu_provider;
 // firehose live frame → shared per-ref cache bust → live pane re-humanise → per-viewer re-resolve;
 // 0 title leak to the unauthorized viewer). FLOORS named: the E2E-2 HITL flagship leg is NOTIF-P29;
 // the E2E-4 DSAR leg + STOR-D2 is NOTIF-P30. See [`e2e_wedge`].
+// MR-009b W3b.5: the E2E wedge drill runners construct the `test-support`-gated in-memory
+// OutboxStore double — a drill harness, never production serving code. Gated with it.
+#[cfg(any(test, feature = "test-support"))]
 pub mod e2e_wedge;
 // Escalation on the durable wheel (NOTIF-P14 / P-192 — §2.4/§3.7, contract 7.5): `page(target,
 // reason)` starts an escalation DURABLE WORKFLOW walking the FROZEN chain shape (page →
@@ -205,6 +208,8 @@ pub use delivery::{
     build_idem_key, channel_from_token, effective_delivery_count, is_eu_region, redact_for_offcell,
     DeliveryError, DeliveryFabric, DeliveryLedger, DeliveryOutcome, DeliveryRecord, MockAdapter,
 };
+// MR-009b W3b.5: gated with the harness module above.
+#[cfg(any(test, feature = "test-support"))]
 pub use e2e_wedge::{
     e2e_live_frame_draft, run_e2e_1_pr_pane, run_e2e_2_hitl_flagship, run_e2e_4_dsar_and_stor_d2,
     run_notif_e2e_4_dsar, run_notif_e2e_wedge, run_stor_d2_at_cell_scale, E2e4Artifact,

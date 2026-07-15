@@ -183,7 +183,9 @@ fn sigkill_and_assert_crash(family: &str, mut child: Child) {
         status.code().is_none(),
         "[{family}] a SIGKILLed process has NO clean exit code (it never ran a shutdown path)"
     );
-    println!("[MR-009] {family}: writer child SIGKILLed — confirmed died by signal 9 (no clean exit).");
+    println!(
+        "[MR-009] {family}: writer child SIGKILLed — confirmed died by signal 9 (no clean exit)."
+    );
 }
 
 /// Run a READ child (a FRESH OS process), returning its `MR009-READ` JSON. `None` to SKIP.
@@ -225,7 +227,10 @@ fn kill9_identity_principal_tuple_and_profile_decrypt_across_restart() {
     let Some(read) = read_back("identity", &run, "{}") else {
         return;
     };
-    assert_eq!(read["principal_kind"], "Human", "principal kind durable: {read}");
+    assert_eq!(
+        read["principal_kind"], "Human",
+        "principal kind durable: {read}"
+    );
     assert_eq!(read["status"], "Active", "principal status durable: {read}");
     assert_eq!(
         read["profile_email"],
@@ -233,7 +238,10 @@ fn kill9_identity_principal_tuple_and_profile_decrypt_across_restart() {
         "the KMS-sealed profile email DECRYPTED after a kill-9 restart (durable root+KEK+DEK): {read}"
     );
     assert_eq!(read["profile_name"], format!("Alice {run}"));
-    assert_eq!(read["tuple_present"], true, "the ReBAC tuple survived kill-9: {read}");
+    assert_eq!(
+        read["tuple_present"], true,
+        "the ReBAC tuple survived kill-9: {read}"
+    );
     // BUS-2 exact (MR-009b W3b.3): the iam.tuple_written event co-committed into the SAME
     // rebac_tuple transaction as the tuple write, so it SURVIVED the kill-9 alongside the tuple —
     // both the tuple AND its event are present (0 lost). Because they co-commit atomically, there
@@ -266,7 +274,10 @@ fn kill9_revocation_jti_and_run_token_ttl_survive() {
     let Some(read) = read_back("revocation", &run, "{}") else {
         return;
     };
-    assert_eq!(read["jti_revoked"], true, "the revoked jti reads revoked after kill-9: {read}");
+    assert_eq!(
+        read["jti_revoked"], true,
+        "the revoked jti reads revoked after kill-9: {read}"
+    );
     assert_eq!(
         read["run_state_before"], "LiveWithinRunLife",
         "the run-token TTL survived kill-9 (Live within run-life): {read}"
@@ -276,7 +287,9 @@ fn kill9_revocation_jti_and_run_token_ttl_survive() {
         "expiry honored across kill-9 (Expired past its TTL): {read}"
     );
     cleanup_revocation(&run);
-    println!("[MR-009] PASS  family=REVOCATION  revoked jti + run-token TTL/expiry survived kill-9.");
+    println!(
+        "[MR-009] PASS  family=REVOCATION  revoked jti + run-token TTL/expiry survived kill-9."
+    );
 }
 
 #[test]
@@ -285,9 +298,19 @@ fn kill9_events_outbox_rows_survive_and_restart_relay_drains_zero_lost() {
         return;
     }
     let run = run_id();
-    let Some((child, _ready)) = spawn_writer_until_ready("events", &run) else {
+    let Some((child, ready)) = spawn_writer_until_ready("events", &run) else {
         return;
     };
+    // The W3b.6 kill-9 EMIT drill shape: the writer emitted through the PRODUCTION path
+    // (`OutboxStore::durable(PgOutboxBacking)` + `OutboxTx::emit` → `commit`, UlidMinter ids) —
+    // 8 rows COMMITTED on the live aggregate, and 4 more STAGED on the ghost aggregate in a
+    // transaction that is deliberately NEVER committed (held open until the SIGKILL).
+    let ready: serde_json::Value = serde_json::from_str(&ready).expect("parse READY json");
+    assert_eq!(ready["committed"], 8, "writer committed 8 rows: {ready}");
+    assert_eq!(
+        ready["ghost_staged"], 4,
+        "writer staged 4 uncommitted ghost rows before blocking: {ready}"
+    );
     sigkill_and_assert_crash("events", child);
 
     // SURVIVED: the committed-but-unsent outbox rows are still there (the writer was SIGKILLed
@@ -298,6 +321,16 @@ fn kill9_events_outbox_rows_survive_and_restart_relay_drains_zero_lost() {
     assert_eq!(
         survived, 8,
         "all 8 committed-but-unsent outbox rows SURVIVED kill-9 (0 lost on the crash)"
+    );
+
+    // 0 GHOST (MR-009b W3b.6, emit-iff-committed on the DURABLE arm): the rows that were STAGED
+    // in the open, never-committed transaction at the moment of the SIGKILL must be ABSENT from
+    // PG — an emit becomes durable IFF its transaction committed; a crash between staging and
+    // commit writes NOTHING (BUS-D4, the structural half, now proven across a real process death).
+    let ghosts = count_rows_for_ghost_aggregate(&run);
+    assert_eq!(
+        ghosts, 0,
+        "rows staged-but-uncommitted at the kill must be ABSENT after the crash (0 ghost)"
     );
 
     // The RESTART relay (a FRESH process) re-claims + drains the survived rows to the real broker.
@@ -315,10 +348,17 @@ fn kill9_events_outbox_rows_survive_and_restart_relay_drains_zero_lost() {
         remaining, 0,
         "the restart relay drained every survived row (0 lost across the kill-9 + restart)"
     );
+    // Belt-and-braces: the drain cannot conjure the ghost rows either (still 0 post-restart).
+    assert_eq!(
+        count_rows_for_ghost_aggregate(&run),
+        0,
+        "the restart relay drained only COMMITTED rows — the ghost aggregate stays empty"
+    );
     cleanup_events(&run);
     println!(
-        "[MR-009] PASS  family=EVENTS  8 committed outbox rows survived kill-9; \
-         restart relay drained them → 0 lost."
+        "[MR-009] PASS  family=EVENTS  8 committed outbox rows (emitted through the production \
+         OutboxStore::durable path) survived kill-9; restart relay drained them → 0 lost; 4 \
+         staged-uncommitted rows absent → 0 ghost (MR-009b W3b.6 emit drill)."
     );
 }
 
@@ -518,14 +558,34 @@ fn count_unsent_for_aggregate(run: &str) -> i64 {
     })
 }
 
+/// Count ALL rows (sent or unsent) for the run's GHOST aggregate — the 0-ghost assertion input
+/// (rows staged in a never-committed transaction at the SIGKILL must not exist in PG at all).
+fn count_rows_for_ghost_aggregate(run: &str) -> i64 {
+    let aggregate = format!("issue:MR009GHOST-{run}");
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let admin = SubstrateProvider::connect(admin_config(), 2)
+            .await
+            .expect("admin pool");
+        sqlx::query_scalar("SELECT count(*) FROM outbox WHERE aggregate = $1")
+            .bind(&aggregate)
+            .fetch_one(admin.db_pool())
+            .await
+            .expect("count ghost outbox rows")
+    })
+}
+
 fn cleanup_events(run: &str) {
     let aggregate = format!("issue:MR009-{run}");
+    let ghost = format!("issue:MR009GHOST-{run}");
     with_admin_pool(|pool| {
         Box::pin(async move {
-            let _ = sqlx::query("DELETE FROM outbox WHERE aggregate = $1")
-                .bind(&aggregate)
-                .execute(pool)
-                .await;
+            for agg in [aggregate, ghost] {
+                let _ = sqlx::query("DELETE FROM outbox WHERE aggregate = $1")
+                    .bind(&agg)
+                    .execute(pool)
+                    .await;
+            }
         })
     });
 }

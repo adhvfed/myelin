@@ -85,6 +85,10 @@ pub mod e2e_flagship;
 /// production-hardened CI engine and emits its named green artifact ([`e2e_wedge::E2eArtifact`]).
 /// E2E-2 is CI-P34; E2E-4 (DSAR) is covered for CI by CI-P32's CI-D3. No new contract; no weakened
 /// gate.
+// MR-009b W3b.5: the E2E wedge drill runners construct the `test-support`-gated in-memory
+// OutboxStore double — a drill harness, never production serving code. Gated with it; the
+// `drill_ci_p33_*` test reaches it via the `myelin-ci-controlplane/test-support` self dev-dep.
+#[cfg(any(test, feature = "test-support"))]
 pub mod e2e_wedge;
 pub mod events;
 pub mod fairness;
@@ -313,6 +317,8 @@ pub use surfacing::{
 // CI-P33 (P-493): CI's slices of the whole-system E2E wedge — the two named green artifacts the
 // master M5 exit gate cites (E2E-1 the PR context pane, E2E-3 spec-to-ship traceability). Each leg
 // runs the whole flow end-to-end over the UNCHANGED engine; both must be `is_green()`.
+// MR-009b W3b.5: gated with the harness module above.
+#[cfg(any(test, feature = "test-support"))]
 pub use e2e_wedge::{
     run_ci_e2e_slices, run_e2e1_pr_context_pane, run_e2e3_spec_to_ship_lineage, E2eArtifact,
     E2E_SCENARIOS,
@@ -431,7 +437,13 @@ fn controlplane_critical() -> CriticalDependencies {
 /// hot tables are declared; `broker` / `authz` / `runner_pool` are declared critical. No consumers
 /// are registered here — the scheduler/check-emitter behaviour is the per-table follow-ons (named in
 /// [`migrations`]); the dedup consumer is the Trigger & Dispatch shell.
-pub fn controlplane_app_spec(config: Config) -> AppSpec {
+///
+/// **The outbox is INJECTED (MR-009b W3b.6 — the W3b.4 debt discharged):** the production
+/// `main.rs` constructs `OutboxStore::durable(PgOutboxBacking)` over the MR-022
+/// `SubstrateProvider` pool (foundation migrations applied, FAIL LOUD on missing durable config);
+/// a test/drill passes the `test-support`-gated in-memory `OutboxStore::new()` double. This
+/// builder constructs NO store of its own — the issues/flow W3b.4 injection pattern.
+pub fn controlplane_app_spec(config: Config, outbox: myelin_events::OutboxStore) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
         config,
@@ -448,14 +460,10 @@ pub fn controlplane_app_spec(config: Config) -> AppSpec {
         // the shell — every control-plane table lives in the one Postgres; the blob/cache/log-tier
         // stores are declared by their behaviour bands (CI-P20/CI-P22). Auto-registered as holders.
         stores: myelin_substrate::StoreManifest::new(),
-        // **W3b.6 debt (named, MR-009b W3b.4):** the EXPLICIT in-memory floor — the gated
-        // `OutboxSpec::default_inproc` is no longer reachable from production; this construction is
-        // the grep-able remainder the W3b.6 `OutboxStore::new` gate breaks LOUDLY, forcing this root
-        // onto `OutboxSpec::durable` (the ci-controlplane durable rewiring is not in the W3b.4 set).
-        outbox: OutboxSpec::new(
-            myelin_events::OutboxStore::new(),
-            myelin_events::InProcessBus::new(),
-        ),
+        // The relay drains the INJECTED store (MR-009b W3b.6 — the named W3b.4 debt discharged:
+        // this builder no longer constructs the memory floor). The in-process broker fake stays
+        // the default TRANSPORT (durability lives in the store); EB-04's adapter is a config swap.
+        outbox: OutboxSpec::new(outbox, myelin_events::InProcessBus::new()),
         critical: controlplane_critical(),
     }
 }
@@ -464,15 +472,21 @@ pub fn controlplane_app_spec(config: Config) -> AppSpec {
 /// [`controlplane_app_spec`]). Separated from [`run_controlplane`] so a test/drill can boot, assert
 /// the three ports opened + the migrations ran + the holders registered, drive ticks, and drive the
 /// drain deterministically.
-pub fn boot_controlplane(config: Config) -> Result<ServeHandle, ServeError> {
-    boot(controlplane_app_spec(config))
+pub fn boot_controlplane(
+    config: Config,
+    outbox: myelin_events::OutboxStore,
+) -> Result<ServeHandle, ServeError> {
+    boot(controlplane_app_spec(config, outbox))
 }
 
 /// **The CI Control Plane service entry — the one `serve(AppSpec)` call (contract 1.1).** The
 /// `ci-controlplane` binary (`src/main.rs`) does nothing but hand [`controlplane_app_spec`] to this.
 /// A failed boot / incomplete drain returns non-zero (§3.1) — loud, never a silent success.
-pub fn run_controlplane(config: Config) -> Result<(), ServeError> {
-    serve(controlplane_app_spec(config))
+pub fn run_controlplane(
+    config: Config,
+    outbox: myelin_events::OutboxStore,
+) -> Result<(), ServeError> {
+    serve(controlplane_app_spec(config, outbox))
 }
 
 #[cfg(test)]
@@ -486,7 +500,7 @@ mod tests {
     /// split and liveness ≠ readiness, and the forward-only migrations create every CI table.
     #[test]
     fn controlplane_boots_from_serve_appspec_with_three_ports() {
-        let handle = boot_controlplane(Config::default())
+        let handle = boot_controlplane(Config::default(), myelin_events::OutboxStore::new())
             .expect("the CI Control Plane shell boots from serve(AppSpec)");
         assert_eq!(handle.name(), SERVICE_NAME, "the deployable service name");
 
@@ -518,7 +532,8 @@ mod tests {
     /// 00 §4: readiness = DB + broker + authz + at-least-one-healthy-runner-pool).
     #[test]
     fn dead_runner_pool_flips_readiness_not_liveness() {
-        let handle = boot_controlplane(Config::default()).expect("boot");
+        let handle =
+            boot_controlplane(Config::default(), myelin_events::OutboxStore::new()).expect("boot");
         let mh = handle.metrics_health();
         assert!(
             mh.readiness().is_ready(),
@@ -539,7 +554,8 @@ mod tests {
         );
 
         // The other two declared critical deps (broker, authz) also gate readiness.
-        let handle2 = boot_controlplane(Config::default()).expect("boot");
+        let handle2 =
+            boot_controlplane(Config::default(), myelin_events::OutboxStore::new()).expect("boot");
         handle2.health_probe().mark_down("authz");
         assert!(
             !handle2.metrics_health().readiness().is_ready(),
@@ -553,7 +569,7 @@ mod tests {
     #[test]
     fn run_controlplane_runs_lifecycle_and_returns_ok() {
         assert_eq!(
-            run_controlplane(Config::default()),
+            run_controlplane(Config::default(), myelin_events::OutboxStore::new()),
             Ok(()),
             "the CI Control Plane shell boots → … → drains cleanly"
         );
@@ -563,7 +579,7 @@ mod tests {
     /// boot loudly — the shell never starts half-booted.
     #[test]
     fn failed_boot_returns_non_zero() {
-        let r = run_controlplane(Config("BAD_POOL".into()));
+        let r = run_controlplane(Config("BAD_POOL".into()), myelin_events::OutboxStore::new());
         assert!(r.is_err(), "a failed boot must return non-zero (Err)");
         assert!(
             r.unwrap_err().0.contains("fail-fast"),
@@ -576,7 +592,7 @@ mod tests {
     /// smuggles in a consumer without reconciliation, or drops a table / a hot-table flag, is loud.
     #[test]
     fn the_shell_carries_the_complete_data_model_and_no_consumers() {
-        let spec = controlplane_app_spec(Config::default());
+        let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
             14,

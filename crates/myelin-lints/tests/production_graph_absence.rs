@@ -57,7 +57,7 @@
 //!   from the auth spine); its removal belongs to the CI/attestation track, NOT this auth prompt. Left
 //!   honestly in the baseline (the scanner stays at 1 remaining structural entry).
 //!
-//! ### `no-in-memory-durable-store` (3) — the spine durable-persistence waves (P-522/523)
+//! ### `no-in-memory-durable-store` (1) — the spine durable-persistence waves (P-522/523)
 //! - **MR-009b Wave 2 FLIPPED the 3 identity spine stores GREEN (17→14):**
 //!   `principal_store.rs` `PrincipalStore` (SI-018), `tuple_store.rs` `TupleStore` (SI-019), and
 //!   `revocation.rs` `RevocationStore` (SI-020) are now durable-by-default. Their in-memory
@@ -87,7 +87,27 @@
 //!   enums present POOL-ONLY → the two entries are REMOVED. Durable-by-default proven live on PG
 //!   (`integration_mr009b_w6a_pseudonym_durable`); DB-free unit tests use the doubles via the
 //!   `myelin-identity-service/test-support` dev-dependency.
-//! - `myelin-events/src/outbox.rs:231`                    — `OutboxStore` in-mem (SI-007; events durable MR, P-522/523)
+//! - **MR-009b W3b.6 FLIPPED the `OutboxStore` (SI-007) GREEN (2→1): THE FLIP** — `outbox.rs:231`
+//!   is REMOVED, closing the W3b.1–.6 chain (W3b.1 role-struct reshape, scanner-neutral; W3b.2
+//!   `PgOutboxBacking` + PgRelay attempts/dead-letter parity; W3b.3 identity co-commit, BUS-2
+//!   exact; W3b.4 durable composition roots — six fail-loud service mains + `OutboxSpec::durable`;
+//!   W3b.5 harness-module gating; W3b.6 the memory-arm gate). The in-memory
+//!   `Memory(Arc<Mutex<Inner>>)` backend arm + `Inner` + `OutboxStore::new()`/`Default` + the
+//!   memory-arm relay mechanics (claim/mark-sent/fail-attempt/dead-letter/GC in `relay.rs`) +
+//!   `restore_committed_row_for_test` are `#[cfg(any(test, feature = "test-support"))]` TEST
+//!   DOUBLES; the always-compiled PRODUCTION backend is `Durable(Arc<dyn DurableOutboxBacking>)`
+//!   over the real PG `outbox` table (`myelin_storage::PgOutboxBacking`, delegating to `PgRelay`'s
+//!   `co_commit_in_tx`/`FOR UPDATE SKIP LOCKED` drain) — committed events SURVIVE restart. The last
+//!   two in-memory-booting binaries (ci-controlplane, ci-dispatch) were rewired onto the W3b.4
+//!   durable-main pattern (DATABASE_URL required, exit non-zero without it), and the named "W3b.6
+//!   debt" spec-builder floor constructions (`AppSpec::minimal`, control-plane, agent-service, the
+//!   two ci spec builders) were discharged by outbox INJECTION — no production code can construct
+//!   the memory floor at all. Proven live on PG (`integration_mr009b_outbox_durable` CDC parity +
+//!   `integration_w3b4_durable_spec_boot`) + the kill-9 EMIT drill
+//!   (`integration_mr009_kill9_durability` events family: rows committed through
+//!   `OutboxStore::durable` survive SIGKILL, 0 lost; rows STAGED but uncommitted at the kill are
+//!   ABSENT after restart, 0 ghost). DB-free unit tests use the double via the
+//!   `myelin-events/test-support` dev-dependency.
 //! - **MR-009b Wave 3 FLIPPED the `DedupLedger` (SI-023) GREEN:** `dedup.rs` `DedupLedger` is now
 //!   durable-by-default. The `Memory(Arc<Mutex<HashSet>>)` backend variant + its `Default` + the
 //!   in-memory `::new()` constructor are `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLES;
@@ -211,23 +231,19 @@
 //!   the doubles via the `myelin-storage/test-support` (self) dev-dependency.
 //! - `myelin-storage/src/blob.rs:362`                     — `FsBlobStore` `Mutex<HashMap<…, Vec<u8>>>` IN-MEMORY (no `fs::write`); byte backing is the Git/backup track (P-ST-30; SI-014/015/029)
 //!
-//! ### RESIDUAL — `outbox.rs:231` `OutboxStore` (SI-007) is a SEPARATE, higher-coupling wave (NOT Wave 3)
-//! MR-009b Wave 3 flipped the sibling `DedupLedger` (SI-023) but DELIBERATELY LEFT `OutboxStore` in
-//! this baseline. Unlike `DedupLedger` (a role struct with a `backend` ENUM whose in-memory `Memory`
-//! arm is gated behind `test-support` while the always-compiled `Durable` arm keeps the struct — and
-//! every downstream `dedup: DedupLedger` field — compiling), the in-memory-ness of `OutboxStore` IS
-//! the struct itself (`inner: Arc<Mutex<Inner>>`, no backend enum). To leave the baseline the whole
-//! `OutboxStore`/`Inner`/`OutboxTransaction` must be `test-support`-gated — which removes the type
-//! from the DEFAULT build and breaks EVERY production `outbox: OutboxStore` field/param across the
-//! in-process event floor (`myelin-events` `relay.rs`/`reindex.rs`/`telemetry.rs`/`holder.rs`/
-//! `reerase.rs` + `issues`/`git`/`flow`/`storage`/`substrate`/identity `tuple_store::write_tuples_pg`
-//! …), none of which are dev-dep-fixable (they are production code) and none re-pointable to
-//! `PgRelay::co_commit_in_tx` without threading a PG transaction through each emit site. The durable
-//! outbox (`PgRelay`, already wired in `events_serve`) uses a co-commit-in-the-caller's-tx API that
-//! CANNOT back `OutboxStore::begin/buffer/commit` without breaking the BUS-2 emit-iff-committed
-//! guarantee, so the enum-variant trick that flipped `DedupLedger` does NOT transfer. Retiring the
-//! in-process floor from production + the per-subsystem durable emit re-point is the MR-009 scope the
-//! `events_serve.rs` module docs already name — tracked as its own wave, NOT folded into Wave 3.
+//! ### (DISCHARGED) RESIDUAL — `outbox.rs:231` `OutboxStore` (SI-007): the separate wave LANDED (W3b)
+//! MR-009b Wave 3 flipped the sibling `DedupLedger` (SI-023) but DELIBERATELY LEFT `OutboxStore`
+//! in this baseline, because the in-memory-ness of the old `OutboxStore` WAS the struct itself
+//! (`inner: Arc<Mutex<Inner>>`, no backend enum) and the durable `PgRelay` co-commit API could not
+//! back `begin/buffer/commit` directly. The named separate wave is now DONE: W3b.1 rebuilt the
+//! store as a role struct over an `OutboxBackend` enum (so the DedupLedger enum-variant trick DID
+//! transfer once the `DurableOutboxBacking` trait — `commit_staged` all-staged-rows-in-one-tx +
+//! reads + the composite `drain_once` — was defined LOW in events, with the PG impl in storage
+//! delegating to the pre-existing `PgRelay`), W3b.2–.4 built + wired the durable backing at every
+//! composition root, W3b.5 gated the harness modules, and W3b.6 gated the memory arm — the flip
+//! recorded in the flipped-GREEN note above. Emit-iff-committed is preserved on the durable arm
+//! (staged rows commit in ONE PG tx; the identity tuple path co-commits in the CALLER's tx via
+//! `co_commit_in_tx`, W3b.3), proven by the kill-9 emit drill (0 lost / 0 ghost).
 //!
 //! ### Role-suffix BLIND SPOT (documented coverage boundary — NOT yet gated; verifier MR-004 review)
 //! Scanner #2 keys on the durable-role NAME suffix (`Store`/`Registry`/`Outbox`/`Ledger`) + a small
@@ -306,7 +322,11 @@ fn matrix() -> Vec<Row> {
 #[test]
 fn the_matrix_covers_exactly_the_three_scanners() {
     let rows = matrix();
-    assert_eq!(rows.len(), 3, "the matrix must cover all three absence scanners");
+    assert_eq!(
+        rows.len(),
+        3,
+        "the matrix must cover all three absence scanners"
+    );
     let ids: Vec<LintId> = rows.iter().map(|r| r.id).collect();
     assert_eq!(ids, PRODUCTION_GRAPH_ABSENCE_SCANNERS.to_vec());
 }
@@ -402,7 +422,9 @@ fn test_support_gate_admits_the_double_but_the_ungated_twin_still_bites() {
          `test-support` gate, never a real prod in-memory store"
     );
     assert!(
-        bites.iter().all(|v| v.lint == LintId("no-in-memory-durable-store")),
+        bites
+            .iter()
+            .all(|v| v.lint == LintId("no-in-memory-durable-store")),
         "the un-gated fixture must fire ONLY the in-memory-durable-store scanner"
     );
 }
@@ -461,7 +483,7 @@ const BASELINE: &[(&str, &str, usize)] = &[
         "crates/myelin-ci-controlplane/src/residency_drill.rs",
         444,
     ),
-    // ---- no-in-memory-durable-store (2 here + 1 closed-false-negative below = 3) ----
+    // ---- no-in-memory-durable-store (0 here + 1 closed-false-negative below = 1) ----
     //      MR-009b W6d FLIPPED the control-plane `Registry` (SI-011) + `MisrouteAudit` (SI-028)
     //      durable-by-default (5→3): `registry.rs:111` is REMOVED from the "here" group and
     //      `placement_of.rs:223` from the closed-false-negatives group below. The canonical
@@ -514,8 +536,9 @@ const BASELINE: &[(&str, &str, usize)] = &[
     //      flipped the events `DedupLedger` (SI-023) durable-by-default → `dedup.rs:141` removed
     //      (in-memory count 13→12; total baseline 14→13); MR-009b Wave 5 flipped the `KmsEngine`
     //      (SI-006) durable-by-default → `kms.rs:622` removed (in-memory count 12→11; total 13→12).
-    //      (The sibling `outbox.rs:231` `OutboxStore`/SI-007 STAYS — its durable re-point to
-    //      `PgRelay::co_commit_in_tx` is a separate, higher-coupling wave; see the module-doc residual.)
+    //      (The sibling `outbox.rs:231` `OutboxStore`/SI-007 — the separate, higher-coupling wave
+    //      those notes deferred to — was REMOVED by MR-009b W3b.6; see its flipped-GREEN entry below
+    //      and the discharged module-doc residual.)
     // (`cross_cell_bridge.rs:244` `CellResolverRegistry` (SI-052) — REMOVED by MR-009b W6c-cp: its
     //  in-memory `Memory(HashMap<…>)` backend arm + `::new()`/`register()` are now `test-support`-gated
     //  test doubles, and the always-compiled production arm is `Projected(Arc<dyn ResolverProjection>)` — a
@@ -541,11 +564,29 @@ const BASELINE: &[(&str, &str, usize)] = &[
     // test doubles; the always-compiled backend is the pool-backed `Durable(Arc<dyn DurableDedup>)`
     // arm the events `serve()` root wires). The production enum presents non-in-memory → the scanner
     // no longer fires. See the flipped-GREEN note in the module docs above.
-    (
-        "no-in-memory-durable-store",
-        "crates/myelin-events/src/outbox.rs",
-        231,
-    ),
+    // `myelin-events/src/outbox.rs:231` `OutboxStore` (SI-007) — REMOVED by MR-009b W3b.6 (THE
+    // FLIP, closing the W3b.1→.6 chain: W3b.1 role-struct reshape (scanner-neutral), W3b.2
+    // `PgOutboxBacking` + relay attempts/dead-letter parity, W3b.3 identity co-commit (BUS-2
+    // exact), W3b.4 durable composition roots (six fail-loud service mains + `OutboxSpec::durable`),
+    // W3b.5 harness-module gating, W3b.6 the memory-arm gate). The in-memory `Memory(Arc<Mutex<
+    // Inner>>)` backend arm + `Inner` + `OutboxStore::new()`/`Default` + the memory-arm relay
+    // mechanics (claim/mark-sent/fail-attempt/dead-letter/GC in relay.rs) +
+    // `restore_committed_row_for_test` are now `#[cfg(any(test, feature = "test-support"))]` TEST
+    // DOUBLES; the always-compiled PRODUCTION backend is `Durable(Arc<dyn DurableOutboxBacking>)`
+    // over the real PG `outbox` table (`myelin_storage::PgOutboxBacking` delegating to `PgRelay`),
+    // wired by the W3b.4 composition roots (`OutboxStore::durable` — provider-from-env →
+    // `migrate_foundation` → fail LOUD on missing DATABASE_URL; W3b.6 rewired the last two
+    // in-memory-booting binaries, ci-controlplane + ci-dispatch, onto the same durable main
+    // pattern and discharged the named "W3b.6 debt" spec-builder floor constructions via outbox
+    // INJECTION — `AppSpec::minimal`/control-plane/agent-service/ci spec builders construct NO
+    // store). The scanner strips the `test-support`-gated `Memory` arm, so the production enum
+    // presents non-in-memory → the entry is REMOVED. Proven live: `integration_mr009b_outbox_durable`
+    // (commit atomicity + EB-03 durable re-run + memory/durable CDC parity + crash-window
+    // re-publish), `integration_w3b4_durable_spec_boot` (spec-built app emit → PG row →
+    // lifecycle relay publish), and the kill-9 EMIT drill (`integration_mr009_kill9_durability`
+    // events family: committed-through-`OutboxStore::durable` rows survive SIGKILL — 0 lost —
+    // and rows STAGED but uncommitted at the kill are ABSENT after restart — 0 ghost). DB-free
+    // unit tests use the double via the `myelin-events/test-support` dev-dependency.
     // `myelin-events/src/reerase.rs:102` `BusErasureLedger` (SI-039) — REMOVED by MR-009b W6c-events
     // (the DedupLedger trait-seam pattern: `myelin-events` is a §2.9 DAG SINK, so it cannot name a
     // `PgPool`). The `Memory(Arc<Mutex<BTreeMap<String, ErasedSubject>>>)` arm + the in-memory
@@ -676,7 +717,10 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 fn all_src(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let crates = root.join("crates");
-    for c in std::fs::read_dir(&crates).expect("crates/ must exist").flatten() {
+    for c in std::fs::read_dir(&crates)
+        .expect("crates/ must exist")
+        .flatten()
+    {
         let src = c.path().join("src");
         if src.is_dir() {
             collect_rs(&src, &mut out);
@@ -700,7 +744,9 @@ fn live_violations(root: &Path) -> Vec<(String, String, usize)> {
                 .replace('\\', "/");
             // The lint crate's own scanners/fixtures carry the tokens as DATA; tests/fixtures hold
             // red samples. Excluded (named, like workspace_clean.rs).
-            if rel.contains("myelin-lints/") || rel.contains("/tests/") || rel.contains("/fixtures/")
+            if rel.contains("myelin-lints/")
+                || rel.contains("/tests/")
+                || rel.contains("/fixtures/")
             {
                 continue;
             }
@@ -715,7 +761,10 @@ fn live_violations(root: &Path) -> Vec<(String, String, usize)> {
         }
     }
     // Sanity: a 0-file scan would be a vacuous green (the un-wired-gate failure mode EI-01 §5).
-    assert!(scanned >= 8, "expected to scan the spine src tree, scanned {scanned}");
+    assert!(
+        scanned >= 8,
+        "expected to scan the spine src tree, scanned {scanned}"
+    );
     out.sort();
     out.dedup();
     out
@@ -727,8 +776,8 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
     // un-wired gate). The counts pin the manifest shape.
     assert_eq!(
         BASELINE.len(),
-        3,
-        "the committed baseline has 3 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
+        2,
+        "the committed baseline has 2 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
          GREEN: 17 → 14; Wave 3 flipped the events `DedupLedger` (SI-023) → 14 → 13; Wave 5 flipped \
          the `KmsEngine` (SI-006) → 13 → 12; Wave 6a flipped the 2 identity S2 pseudonym holders → \
          12 → 10; Wave 6b flipped the 2 in-crate storage ERASURE ledgers — `restore_verify.rs:175` \
@@ -739,9 +788,13 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          W6d flipped the control-plane `Registry` (SI-011) + `MisrouteAudit` (SI-028) \
          durable-by-default — the whole-surface backend enum over the extended placement backing \
          (repo_placement/cell_provisioning/local_tenant, 0035–0039) + the durable audit sink wired \
-         at the gateway → 6 → 4; and W6b2 flipped the sibling `reserve_settle.rs:283` `CostLedger` \
+         at the gateway → 6 → 4; W6b2 flipped the sibling `reserve_settle.rs:283` `CostLedger` \
          (SI-021) durable-by-default via the `CostBackend` role-struct + the \
-         `myelin-flow::BudgetGate::with_pg` injection — closing the W6b honest-STOP → 4 → 3)"
+         `myelin-flow::BudgetGate::with_pg` injection — closing the W6b honest-STOP → 4 → 3; and \
+         W3b.6 flipped the events `outbox.rs:231` `OutboxStore` (SI-007) durable-by-default — THE \
+         FLIP closing the W3b.1–.6 chain (`Memory` arm/`Inner`/`new`/`Default`/memory relay \
+         mechanics `test-support`-gated; the always-compiled arm is `Durable(Arc<dyn \
+         DurableOutboxBacking>)` over `PgOutboxBacking`) → 3 → 2)"
     );
     let structural = BASELINE
         .iter()
@@ -764,8 +817,8 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          to the CI track."
     );
     assert_eq!(
-        in_memory, 2,
-        "2 in-memory durable-store sites: Waves 2/3/5/6a flipped the identity spine + events \
+        in_memory, 1,
+        "1 in-memory durable-store site: Waves 2/3/5/6a flipped the identity spine + events \
          DedupLedger + KmsEngine + the 2 S2 pseudonym holders durable-by-default (16→9); \
          MR-009b Wave 6b FLIPPED the 2 in-crate storage ERASURE ledgers durable-by-default (9→7): \
          `restore_verify.rs:175` `ErasureLedger` (now a backend enum over the non-shred-erasable \
@@ -790,9 +843,15 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          durable-by-default via the `CostBackend` role struct (the `Memory(MemoryCostLedger)` arm + \
          `CostLedger::new()` are `test-support`-gated; the always-compiled `Durable(DurableCostLedger)` \
          arm over the FORCE-RLS `cost_reservation`/`cost_event` tables, 0050, is production) + the \
-         `myelin-flow::BudgetGate::with_pg`/`new_durable` injection that closed the W6b honest-STOP. \
-         The remaining 2 (events OUTBOX (SI-007, W3b.6) + storage `blob.rs:362` `FsBlobStore` (W7.3)) \
-         flip in the last waves."
+         `myelin-flow::BudgetGate::with_pg`/`new_durable` injection that closed the W6b honest-STOP; \
+         and W3b.6 FLIPPED the events `outbox.rs:231` `OutboxStore` (SI-007) durable-by-default \
+         (2→1) — THE FLIP closing the W3b.1–.6 chain: the `Memory(Arc<Mutex<Inner>>)` arm + `Inner` \
+         + `::new()`/`Default` + the memory-arm relay mechanics + `restore_committed_row_for_test` \
+         are `test-support`-gated TEST DOUBLES, and the always-compiled PRODUCTION backend is \
+         `Durable(Arc<dyn DurableOutboxBacking>)` over `PgOutboxBacking` (proven live: \
+         `integration_mr009b_outbox_durable` + `integration_w3b4_durable_spec_boot` + the kill-9 \
+         emit drill, 0 lost / 0 ghost). \
+         The remaining 1 (storage `blob.rs:362` `FsBlobStore` (W7.3)) flips in the last wave."
     );
     assert_eq!(
         bare_pool, 0,
@@ -824,8 +883,15 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
         "authenticate.rs:289 was flipped GREEN by MR-012 and must NOT remain in the baseline"
     );
     assert!(
-        !has("no-bare-tenant-pool", "crates/myelin-storage/src/pg.rs", 413)
-            && !has("no-bare-tenant-pool", "crates/myelin-storage/src/pg.rs", 150),
+        !has(
+            "no-bare-tenant-pool",
+            "crates/myelin-storage/src/pg.rs",
+            413
+        ) && !has(
+            "no-bare-tenant-pool",
+            "crates/myelin-storage/src/pg.rs",
+            150
+        ),
         "the former anchors pg.rs:413 (session-scoped set_config) + pg.rs:150 (bare pool() hatch) \
          were flipped GREEN by MR-013 and must NOT remain in the baseline (the ratchet tightened)"
     );

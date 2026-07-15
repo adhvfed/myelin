@@ -151,7 +151,13 @@ impl EventHandler for SkeletonDispatchConsumer {
 /// - the `consumers` slot is EMPTY in the bare spec — wire the dispatch consumer per-tenant via
 ///   [`agent_dispatch_consumer_reg`] (the explicit-first dispatch tier, §3.4);
 /// - holder auto-registration: every opened store auto-registers (the AG-P3 H11/H17 seam, §3.4).
-pub fn agent_app_spec(config: Config) -> AppSpec {
+///
+/// **The outbox is INJECTED (MR-009b W3b.6 — the W3b.4 debt discharged):** this builder
+/// constructs NO store. There is no agent-service binary yet; when its production root lands it
+/// must pass `OutboxStore::durable(PgOutboxBacking)` (the W3b.4 provider-from-env, fail-loud
+/// main.rs pattern the six service mains follow); a test/drill passes the `test-support`-gated
+/// in-memory `OutboxStore::new()` double.
+pub fn agent_app_spec(config: Config, outbox: myelin_events::OutboxStore) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
         config,
@@ -171,16 +177,11 @@ pub fn agent_app_spec(config: Config) -> AppSpec {
         holders: AppSpec::auto(),
         stores: StoreManifest::new(),
         // The transactional outbox relay (BUS-2 — the ONLY emit path; the SKELETON's trace emit rides
-        // this). The in-process broker fake is the M0 floor; the JetStream-class adapter is a config
-        // swap (dev<->prod), never a code change.
-        // **W3b.6 debt (named, MR-009b W3b.4):** the EXPLICIT in-memory floor — the gated
-        // `OutboxSpec::default_inproc` is no longer reachable from production; this construction is
-        // the grep-able remainder the W3b.6 `OutboxStore::new` gate breaks LOUDLY, forcing this root
-        // onto `OutboxSpec::durable` (the agent-service durable rewiring is not in the W3b.4 set).
-        outbox: OutboxSpec::new(
-            myelin_events::OutboxStore::new(),
-            myelin_events::InProcessBus::new(),
-        ),
+        // this). The relay drains the INJECTED store (MR-009b W3b.6 — the named W3b.4 debt
+        // discharged: this builder no longer constructs the memory floor). The in-process broker
+        // fake stays the default TRANSPORT (durability lives in the store); the JetStream-class
+        // adapter is a config swap (dev<->prod), never a code change.
+        outbox: OutboxSpec::new(outbox, myelin_events::InProcessBus::new()),
         // The agent OLTP store is implicitly critical; no further critical downstream at the shell.
         critical: CriticalDependencies::default(),
     }
@@ -228,15 +229,18 @@ pub fn agent_dispatch_consumer_reg(
 /// inspect the three ports + the liveness ≠ readiness state, and drive the graceful drain.
 ///
 /// Returns `Err` (the non-zero exit) on a failed boot (§3.1) — loud, never a silent success.
-pub fn boot_agent(config: Config) -> Result<ServeHandle, ServeError> {
-    boot(agent_app_spec(config))
+pub fn boot_agent(
+    config: Config,
+    outbox: myelin_events::OutboxStore,
+) -> Result<ServeHandle, ServeError> {
+    boot(agent_app_spec(config, outbox))
 }
 
 /// **Run the agent service to completion under the harness** (boot → migrate → relay → consumers →
 /// three ports → graceful drain). The `myelin-agent` binary calls this; a failed boot / incomplete
 /// drain returns `Err` (the non-zero process exit, §3.1).
-pub fn run_agent(config: Config) -> Result<(), ServeError> {
-    serve(agent_app_spec(config))
+pub fn run_agent(config: Config, outbox: myelin_events::OutboxStore) -> Result<(), ServeError> {
+    serve(agent_app_spec(config, outbox))
 }
 
 #[cfg(test)]
@@ -251,7 +255,8 @@ mod tests {
     /// metrics-health surfaces are all opened (3/3 ports up); no hand-rolled main.
     #[test]
     fn agent_shell_boots_and_three_ports_bind() {
-        let handle = boot_agent(Config::default()).expect("the myelin-agent shell boots");
+        let handle = boot_agent(Config::default(), myelin_events::OutboxStore::new())
+            .expect("the myelin-agent shell boots");
         assert_eq!(handle.name(), SERVICE_NAME);
         assert_eq!(
             handle.surfaces(),
@@ -292,7 +297,8 @@ mod tests {
     /// the startup gate to `Complete` at the end of a successful boot over the AG-P2 five-table set.
     #[test]
     fn booted_instance_is_ready_after_migrate_complete() {
-        let handle = boot_agent(Config::default()).expect("boot");
+        let handle =
+            boot_agent(Config::default(), myelin_events::OutboxStore::new()).expect("boot");
         assert_eq!(
             handle.metrics_health().startup(),
             Startup::Complete,
@@ -310,7 +316,7 @@ mod tests {
     /// per-tenant by `agent_dispatch_consumer_reg`).
     #[test]
     fn shell_wires_the_five_table_migration_set_and_empty_consumer_seam() {
-        let spec = agent_app_spec(Config::default());
+        let spec = agent_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(spec.name, SERVICE_NAME);
         assert!(
             spec.consumers.is_empty(),
@@ -348,7 +354,7 @@ mod tests {
         let reg = agent_dispatch_consumer_reg(&tenant, DedupLedger::new()).expect(
             "the agent.dispatch.acme. whitelist binds through the sanctioned consume (never `*`)",
         );
-        let mut spec = agent_app_spec(Config::default());
+        let mut spec = agent_app_spec(Config::default(), myelin_events::OutboxStore::new());
         spec.consumers = vec![reg];
         assert_eq!(
             spec.consumers.len(),
@@ -362,7 +368,8 @@ mod tests {
     #[test]
     fn agent_stores_auto_register_as_holders_at_boot() {
         use myelin_substrate::StoreKind;
-        let handle = boot_agent(Config::default()).expect("boot");
+        let handle =
+            boot_agent(Config::default(), myelin_events::OutboxStore::new()).expect("boot");
         assert!(
             handle
                 .holder_registry()
@@ -381,7 +388,7 @@ mod tests {
     #[test]
     fn run_agent_boots_serves_and_drains_cleanly() {
         assert_eq!(
-            run_agent(Config::default()),
+            run_agent(Config::default(), myelin_events::OutboxStore::new()),
             Ok(()),
             "the agent shell boots → migrates → relays → drains cleanly (depth 0)"
         );
@@ -391,7 +398,7 @@ mod tests {
     /// fails boot-time validation aborts boot with a loud error.
     #[test]
     fn failed_boot_returns_non_zero() {
-        let r = run_agent(Config("BAD_POOL".into()));
+        let r = run_agent(Config("BAD_POOL".into()), myelin_events::OutboxStore::new());
         assert!(r.is_err(), "a failed boot must return non-zero (Err)");
     }
 
