@@ -96,6 +96,26 @@ region persisted from provider pin (W7 sweep owns).
 unchanged; memory arm verifier-probed byte-equivalent. Staged debt for W3b.2 (in-line admissions):
 surface the durable drain error; durable GC verb; duplicate-event_id commit-semantics CDC parity.
 
+**W6b DONE (2026-07-15, `d7e418b`): scanner 9→7.** PostPit + restore ErasureLedgers durable
+(migrations 0051/0052); §7.6 completion-offset window gate (R1 fold-in) + predicate_sql
+parameterization fold-in. Verifier CONFIRMED-SOUND; two probe-confirmed latent gaps CLOSED
+pre-commit: offset-0 `record_erased` fail-open (now test-support-gated) + `run_with_reerase`
+trusted-not-structural post-PIT coverage (now a cross-ledger coverage assert + regression test).
+**CostLedger NOT flipped (honest STOP):** its durable backing (0050, FORCE-RLS) is built + proven
+live but unwired — flipping breaks production `myelin-flow::BudgetGate::new` → CI metering; needs a
+BudgetGate durable redesign (queued as its own wave, "W6b2"). `reserve_settle.rs:283` stays,
+SUPPLEMENTED. Residuals: Box::leak unit-label rebuild (bounded, unwired); cost-op infra faults
+panic (no error variant); region from provider pin (W7).
+
+**W3b.2 DONE (2026-07-15, merge `20fe480`): scanner-neutral.** `PgOutboxBacking` over the frozen
+outbox table; commit_staged_atomic (dup-event_id rejects whole commit = memory parity; one seq
+discipline with co_commit_in_tx); drain_once_dead_letter (claim locks held across publishes; per-row
+attempts/dead-letter; failed publish no longer aborts the pass); DrainReport.drain_errors surfaces
+backing failure (W3b.1 debt resolved). Verifier CONFIRMED-SOUND (concurrent-drain no-double-publish,
+crash-window 0-ghost/0-lost, EB-03 32-committer gap-free — all probed live); should-fix applied:
+committed_rows/dead_rows ORDER BY (aggregate,seq) — event_id mint order provably ≠ commit order.
+Residuals: no durable GC verb; NATS-bridge nested block_in_place unproven until W3b.4.
+
 R1 exit: scanner `no-in-memory-durable-store` baseline **0**; unit tests DB-free; integration green; kill-9 drills.
 
 ## R2 — authz completion
