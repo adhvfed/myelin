@@ -19,6 +19,11 @@
 //!   3. **backup_snapshot → restore recovers data:** a snapshot from engine #1 restored into a
 //!      cleared store lets a fresh engine (same seal key) decrypt the original ciphertext again; a
 //!      crypto-shredded DEK is absent from the snapshot and stays unrecoverable after restore.
+//!   4. **MR-009b Wave 5 — the DEFAULT path is durable:** keys minted through the engine's plain
+//!      SYNC API (`ensure_kek`/`ensure_dek` — the production call shape, no explicit persist)
+//!      survive engine re-construction from the same store over a fresh pool, and a sync-API
+//!      `destroy_dek` crypto-shred reaches the store (stays dead) — the kill-9-equivalent proof of
+//!      the durable-backend write-through.
 //!
 //! Skips gracefully if the DB is unreachable (like the sibling integration tests).
 #![cfg(feature = "integration")]
@@ -309,6 +314,171 @@ async fn backup_snapshot_restore_recovers_data_and_keeps_a_shredded_key_dead() {
     // cleanup.
     cleanup(provider.db_pool(), &cell).await;
     println!("OK [3]: snapshot→restore recovers the data; a crypto-shredded DEK stays dead after restore.");
+}
+
+// =================================================================================================
+// 4 — MR-009b Wave 5: the PRODUCTION DEFAULT construction is durable THROUGH THE ENGINE'S OWN SYNC
+//     API. `load_or_generate` returns the durable-backend engine; keys minted via the plain
+//     `ensure_kek`/`ensure_dek` calls (the ~130-call-site production API — NO explicit persist, NO
+//     backing wrapper) survive re-construction from the same store over a FRESH pool (the
+//     kill-9-equivalent proof), and a sync-API crypto-shred reaches the store (stays dead).
+// =================================================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keys_minted_through_the_default_sync_api_survive_engine_reconstruction() {
+    let Some(provider) = admin_provider().await else {
+        return;
+    };
+    let suffix = uniq();
+    let cell = format!("cell-{suffix}");
+    let tenant = TenantId(format!("01J0W5D{suffix}"));
+    let region = Region("eu-west".into());
+    let seal = seal_k();
+
+    // Engine #1 — THE PRODUCTION CONSTRUCTION (what edge main.rs wires): load_or_generate.
+    let backing1 = DurableKmsBacking::new(provider.db_pool().clone(), &cell);
+    let engine1 = backing1
+        .load_or_generate(&seal)
+        .await
+        .expect("production boot: load_or_generate");
+
+    // Mint keys through the ENGINE'S OWN SYNC API — the exact calls production lib code makes
+    // (PrincipalStore::seal_profile, the DEK pins, the erase paths). NO explicit persist call:
+    // the Wave-5 durable backend writes through internally.
+    engine1.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+    let live_ref = engine1
+        .ensure_dek(&tenant, &region, KeyClass::Tenant)
+        .expect("tenant DEK via the plain sync API");
+    let doomed_ref = engine1
+        .ensure_dek(&tenant, &region, KeyClass::Subject("u-doomed".into()))
+        .expect("subject DEK via the plain sync API");
+    let (nonce, ct) = engine1
+        .resolve_dek(&live_ref, &region)
+        .expect("resolve")
+        .seal(b"minted through the default path");
+
+    // A sync-API crypto-shred (the GD-4 lever as the erase paths call it) — must reach the store.
+    assert!(
+        engine1.destroy_dek(&myelin_storage::DekId::new(
+            tenant.clone(),
+            KeyClass::Subject("u-doomed".into()),
+        )),
+        "the subject DEK was present to destroy"
+    );
+
+    // KILL-9 EQUIVALENT: drop engine #1 entirely; re-construct from the SAME store over a FRESH
+    // pool (new connections — the state must live in Postgres, not process memory).
+    drop(engine1);
+    drop(backing1);
+    let engine2 = DurableKmsBacking::new(fresh_pool().await, &cell)
+        .load_or_generate(&seal)
+        .await
+        .expect("engine #2 re-constructs from the same pool/store");
+    let plain = engine2
+        .resolve_dek(&live_ref, &region)
+        .expect("the sync-API-minted DEK survives re-construction (the write-through is real)")
+        .open(&nonce, &ct)
+        .expect("and decrypts the pre-restart ciphertext");
+    assert_eq!(plain, b"minted through the default path");
+    // The sync-API shred reached the store: the subject DEK stays dead across the restart.
+    assert!(
+        engine2.resolve_dek(&doomed_ref, &region).is_err(),
+        "the sync-API crypto-shred deleted the durable row (stays dead across restart, §7.5)"
+    );
+
+    // cleanup.
+    cleanup(provider.db_pool(), &cell).await;
+    println!(
+        "OK [4]: keys minted via the DEFAULT sync engine API survive engine re-construction; a \
+         sync-API shred stays dead (Wave 5 write-through)."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotation_persists_kek_and_all_rewrapped_deks_atomically_and_survives_restart() {
+    let Some(provider) = admin_provider().await else {
+        return;
+    };
+    let suffix = uniq();
+    let cell = format!("cell-{suffix}");
+    let tenant = TenantId(format!("01J0W5R{suffix}"));
+    let region = Region("eu-west".into());
+    let seal = seal_k();
+
+    // Engine #1: mint a KEK + SEVERAL DEKs (the multi-row rotation persist is the point), seal
+    // data under one of them, then rotate through the plain sync API.
+    let backing1 = DurableKmsBacking::new(provider.db_pool().clone(), &cell);
+    let engine1 = backing1
+        .load_or_generate(&seal)
+        .await
+        .expect("production boot: load_or_generate");
+    let kek_id = KekId::new(tenant.clone(), region.clone());
+    let mint_epoch = engine1.ensure_kek(&kek_id);
+    let tenant_ref = engine1
+        .ensure_dek(&tenant, &region, KeyClass::Tenant)
+        .expect("tenant DEK");
+    let subj_a = engine1
+        .ensure_dek(&tenant, &region, KeyClass::Subject("u-a".into()))
+        .expect("subject DEK a");
+    let subj_b = engine1
+        .ensure_dek(&tenant, &region, KeyClass::Subject("u-b".into()))
+        .expect("subject DEK b");
+    let (nonce, ct) = engine1
+        .resolve_dek(&tenant_ref, &region)
+        .expect("resolve pre-rotation")
+        .seal(b"sealed before rotation");
+    let new_epoch = engine1.rotate_kek(&kek_id).expect("rotation (durable path)");
+    assert!(new_epoch > mint_epoch, "rotation bumped the KEK epoch");
+
+    // The rotation's row set persisted CONSISTENTLY: the KEK row and EVERY DEK row for the tenant
+    // carry the same (new) kek_epoch — a partial persist (D1, the pre-fix defect) would leave DEK
+    // rows behind at the old epoch, unrecoverable after restart.
+    let kek_epoch: i64 =
+        sqlx::query_scalar("SELECT epoch FROM kms_wrapped_kek WHERE cell_id = $1 AND tenant_id = $2")
+            .bind(&cell)
+            .bind(tenant.0.as_str())
+            .fetch_one(provider.db_pool())
+            .await
+            .expect("KEK row present");
+    let dek_epochs: Vec<i64> = sqlx::query_scalar(
+        "SELECT kek_epoch FROM kms_wrapped_dek WHERE cell_id = $1 AND tenant_id = $2",
+    )
+    .bind(&cell)
+    .bind(tenant.0.as_str())
+    .fetch_all(provider.db_pool())
+    .await
+    .expect("DEK rows present");
+    assert_eq!(dek_epochs.len(), 3, "all three DEK rows persisted");
+    assert!(
+        dek_epochs.iter().all(|e| *e == kek_epoch),
+        "every persisted DEK envelope is wrapped under the persisted KEK epoch \
+         (rotation rows are consistent — the one-transaction persist)"
+    );
+
+    // KILL-9 EQUIVALENT after rotation: everything still decrypts from a fresh engine.
+    drop(engine1);
+    drop(backing1);
+    let engine2 = DurableKmsBacking::new(fresh_pool().await, &cell)
+        .load_or_generate(&seal)
+        .await
+        .expect("engine #2 re-constructs post-rotation");
+    let plain = engine2
+        .resolve_dek(&tenant_ref, &region)
+        .expect("pre-rotation ref resolves post-rotation post-restart")
+        .open(&nonce, &ct)
+        .expect("pre-rotation ciphertext decrypts after rotation + restart");
+    assert_eq!(plain, b"sealed before rotation");
+    for r in [&subj_a, &subj_b] {
+        engine2
+            .resolve_dek(r, &region)
+            .expect("every re-wrapped subject DEK survives rotation + restart");
+    }
+
+    cleanup(provider.db_pool(), &cell).await;
+    println!(
+        "OK [5]: rotation persists the KEK + all re-wrapped DEK rows consistently (one PG tx) and \
+         everything decrypts after restart."
+    );
 }
 
 /// Remove every durable KMS row for a test cell (the sealed root + all wrapped KEKs/DEKs).

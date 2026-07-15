@@ -230,10 +230,16 @@ pub use dispatch::{
     L3_AUTO_SPAWN_ABSENCE, PROVENANCE_AUDIT_LINK_KIND,
 };
 pub use dogfood::{
-    myelin_chat_channels, run_chat_over_myelins_own_work, ChatDogfoodArtifact, MyelinChannel,
-    MYELIN_SELF_REGION, MYELIN_SELF_TENANT,
+    myelin_chat_channels, ChatDogfoodArtifact, MyelinChannel, MYELIN_SELF_REGION,
+    MYELIN_SELF_TENANT,
 };
-pub use e2e_wedge::{run_chat_e2e_wedge, ChatE2eArtifact};
+// The in-process dogfood/E2E drill runners construct the in-memory KMS test double — MR-009b
+// Wave 5: `test-support`-gated (the tests-dir drills reach them via the self dev-dependency).
+#[cfg(any(test, feature = "test-support"))]
+pub use dogfood::run_chat_over_myelins_own_work;
+pub use e2e_wedge::ChatE2eArtifact;
+#[cfg(any(test, feature = "test-support"))]
+pub use e2e_wedge::run_chat_e2e_wedge;
 pub use erase::{
     aggregate_receipt, is_body_unrecoverable, ChatEraseReport, ChatErasureCascade, StoreReceipt,
     CHAT_ERASE_CASCADE_TOKEN,

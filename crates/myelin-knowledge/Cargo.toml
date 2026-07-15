@@ -176,6 +176,11 @@ integration = [
 ]
 
 [dev-dependencies]
+# MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
+# `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests (the same
+# posture as the Wave-2/3 identity/events test-support dev-dependencies). DEV-only — never in the
+# production DAG (cargo tree -e no-dev shows no test-support edge).
+myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 # MR-009b Wave 3: enable `test-support` so this crate's DEV tests reach the events in-memory
 # `DedupLedger::new()` double (the durable `DedupLedger::durable` is the production default; the
 # in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only

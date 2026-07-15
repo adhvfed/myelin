@@ -213,5 +213,9 @@ integration = ["myelin-storage/integration"]
 # reach them). EMPTY in Wave 0 — established so later waves (W2) gate the doubles behind it + the
 # `no-in-memory-durable-store` scanner treats `feature = "test-support"` as a test-double gate. No
 # code moves behind it yet. `memory` is a documented alias.
-test-support = []
+# MR-009b Wave 5: forwards to `myelin-storage/test-support` — the identity `test-support` surface
+# (e.g. `StoreBackedCheck::with_index`) constructs the storage in-memory `KmsEngine::new()` double,
+# which is itself `#[cfg(any(test, feature = "test-support"))]` as of Wave 5. Enabling the identity
+# doubles therefore requires the storage double to exist.
+test-support = ["myelin-storage/test-support"]
 memory = ["test-support"]

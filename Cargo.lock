@@ -2328,6 +2328,7 @@ name = "myelin-chat"
 version = "0.0.0"
 dependencies = [
  "myelin-agent",
+ "myelin-chat",
  "myelin-ci-sandbox",
  "myelin-config",
  "myelin-content",
@@ -2817,6 +2818,7 @@ dependencies = [
  "myelin-identity",
  "myelin-issues",
  "myelin-refs",
+ "myelin-refs-service",
  "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",
@@ -2839,6 +2841,7 @@ dependencies = [
  "myelin-lints",
  "myelin-query",
  "myelin-refs",
+ "myelin-search",
  "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",
@@ -2870,6 +2873,7 @@ dependencies = [
  "myelin-lints",
  "myelin-refs-service",
  "myelin-search",
+ "myelin-storage",
  "myelin-tenancy",
  "serde",
  "serde_json",

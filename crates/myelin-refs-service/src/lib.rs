@@ -410,15 +410,18 @@ pub use cross_cell::{
 };
 pub use dek::{ref_p5_inherited_gates, InheritedGate, RefsDekPin};
 pub use dogfood::{
-    proven_refs_rows, run_refs_over_myelins_own_work, run_refs_truth_up_scorecard, DogfoodArtifact,
-    ProvenRefsRow, RefsIncident, RefsIncidentDrillTicket, RefsIncidentIssueDraft, RefsRowStatus,
-    RefsScorecardEntry, RefsTruthUpPass, RefsTruthUpRed, RefsTruthUpScorecard, RefsTruthUpVerdict,
-    MYELIN_SELF_REGION, MYELIN_SELF_TENANT,
+    proven_refs_rows, run_refs_truth_up_scorecard, DogfoodArtifact, ProvenRefsRow, RefsIncident,
+    RefsIncidentDrillTicket, RefsIncidentIssueDraft, RefsRowStatus, RefsScorecardEntry,
+    RefsTruthUpPass, RefsTruthUpRed, RefsTruthUpScorecard, RefsTruthUpVerdict, MYELIN_SELF_REGION,
+    MYELIN_SELF_TENANT,
 };
-pub use e2e_wedge::{
-    run_e2e_1_pr_pane, run_e2e_3_spec_to_ship, run_e2e_4_dsar_fanout, run_refs_e2e_wedge,
-    E2eArtifact, E2E_SCENARIOS,
-};
+// The in-process dogfood/E2E drill runners construct the in-memory KMS test double — MR-009b
+// Wave 5: `test-support`-gated (the tests-dir drills reach them via the self dev-dependency).
+#[cfg(any(test, feature = "test-support"))]
+pub use dogfood::run_refs_over_myelins_own_work;
+pub use e2e_wedge::{run_e2e_1_pr_pane, run_e2e_3_spec_to_ship, E2eArtifact, E2E_SCENARIOS};
+#[cfg(any(test, feature = "test-support"))]
+pub use e2e_wedge::{run_e2e_4_dsar_fanout, run_refs_e2e_wedge};
 pub use edge_builder::{
     edge_id, EdgeProjection, EdgeRow, ProjectError, RefsEdgeBuilder, RelClass,
     EDGE_BUILDER_CONSUMER, EDGE_BUILDER_SUBJECTS, EDGE_BUILDER_SUBJECT_PREFIXES,

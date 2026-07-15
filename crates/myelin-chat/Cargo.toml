@@ -130,6 +130,12 @@ myelin-config = { path = "../myelin-config", optional = true }
 
 [features]
 default = []
+# MR-009b Wave 5 — the `test-support` cargo feature (alias `memory`). Gates this crate's in-process
+# E2E-wedge/dogfood drill runners (the `e2e_dsar` leg / `run_chat_e2e_wedge` /
+# `run_chat_over_myelins_own_work`), which construct the in-memory `KmsEngine` test double — so it
+# forwards to `myelin-storage/test-support`. DEV/TEST only.
+test-support = ["myelin-storage/test-support"]
+memory = ["test-support"]
 # CHAT-P4 (P-398): pull the REAL Postgres hot tier (`store::pg::PgMessageStore`) + compile the
 # live-backend integration test. Turns on the storage crate's `integration` feature (the real
 # PgStore/BlobStore clients) and the sqlx/tokio clients the integration test drives. CHAT-P28
@@ -148,6 +154,12 @@ integration = [
 # in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
 # — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
+# MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
+# `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests. DEV-only.
+myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
+# MR-009b Wave 5 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN
+# tests-dir targets (e.g. tests/e2e_wedge_chat_p27.rs calls the now-gated `run_chat_e2e_wedge`).
+myelin-chat = { path = ".", features = ["test-support"] }
 # The Identity namespace ENGINE — the CDC for contract 4.9 admits chat's RICH fragment (the
 # `+ parent_project->read` TTU, the `& parent_project->admin` intersection) into the real cell schema
 # to PROVE the frozen names-only carrier is admissible. A DEV-only edge (the runtime fragment chat

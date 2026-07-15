@@ -77,6 +77,8 @@ use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
 
 use myelin_tenancy::{Region, TenantId};
 
+use crate::kms_durable::DurableKms;
+
 /// The size of an AES-256 key, in bytes (the L2 DEK + the L1 KEK + the L0 cell root are all
 /// 256-bit AEAD keys; §4 "AES-256-GCM").
 pub const KEY_LEN: usize = 32;
@@ -538,6 +540,12 @@ pub enum KmsError {
     /// The wrapped DEK did not authenticate under its KEK (tamper / wrong KEK / a re-wrap under a
     /// destroyed-then-recreated KEK). NEVER a silent wrong-key unwrap.
     UnwrapFailed(DekId),
+    /// **The durable write-through failed (MR-009b Wave 5 / SI-006).** A freshly minted key (or a
+    /// rotation's re-wrap) could NOT be persisted to the durable KMS store, so the in-memory
+    /// mutation was rolled back and the operation REFUSED — a key that does not survive a restart
+    /// is never handed out (that would be the silent-key-loss floor this wave closes). Carries only
+    /// the structural fault text (no key material) — safe to log.
+    Durability(String),
 }
 
 impl fmt::Display for KmsError {
@@ -564,6 +572,11 @@ impl fmt::Display for KmsError {
                  (tamper / wrong KEK) — refused, NEVER a silent wrong-key unwrap",
                 id.tenant.as_str(),
                 id.class.as_token()
+            ),
+            KmsError::Durability(e) => write!(
+                f,
+                "KMS: durable write-through FAILED — the key operation was rolled back and refused \
+                 (a key that does not survive a restart is never handed out; SI-006): {e}"
             ),
         }
     }
@@ -610,16 +623,21 @@ pub struct KmsDurableSnapshot {
     pub deks: Vec<(DekId, WrappedDek, u64)>,
 }
 
-/// The self-hostable software KMS engine (Vault-Transit-class) — the in-cell key store behind the
-/// [`KmsAdapter`] seam (§4). It holds the L0 cell root, the L1 per-(tenant,region) KEKs, and the
-/// L2 DEKs stored ENVELOPE-WRAPPED ([`WrappedDek`]) under their KEKs. Every public operation goes
-/// through the hierarchy: a DEK is never resolved without its KEK, a KEK never without the cell
-/// root.
+/// The in-process CRYPTO CORE of the KMS engine — the L0 cell root + the working set of L1 KEKs
+/// and L2 DEKs (stored ENVELOPE-WRAPPED, [`WrappedDek`], under their KEKs). Every operation walks
+/// the hierarchy: a DEK is never resolved without its KEK, a KEK never without the cell root.
+///
+/// **This is NOT the durable system-of-record (MR-009b Wave 5).** The public [`KmsEngine`] wraps
+/// this core behind a backend split ([`KmsBackend`]): on the PRODUCTION `Durable` backend the core
+/// is the working set HYDRATED from the PG store at boot (`kms_durable::load_or_generate`) and
+/// every mutation WRITES THROUGH to the `kms_sealed_root`/`kms_wrapped_kek`/`kms_wrapped_dek`
+/// tables; on the `test-support`-gated `Memory` backend it is the DB-free test double (fresh root
+/// per process — nothing survives a restart, which is exactly why it is a double).
 ///
 /// `destroy_kek` / `destroy_dek` are the crypto-shred levers; a destroyed key is removed from the
-/// store AND excluded from [`backup_snapshot`](Self::backup_snapshot) (it must stay dead across a
-/// restore, §7.5).
-pub struct KmsEngine {
+/// working set AND excluded from [`backup_snapshot`](Self::backup_snapshot) (it must stay dead
+/// across a restore, §7.5).
+pub(crate) struct KmsCore {
     root: CellRoot,
     /// L1: one KEK per `(tenant, region)`.
     keks: Mutex<BTreeMap<KekId, StoredKek>>,
@@ -629,27 +647,24 @@ pub struct KmsEngine {
     deks: Mutex<BTreeMap<DekId, (WrappedDek, u64 /* dek_epoch */)>>,
 }
 
-impl KmsEngine {
-    /// Stand up a fresh engine over a generated cell root (one per cell). This is the in-memory
-    /// **test-double**: it mints a fresh root per process, so NOTHING it sealed survives a restart.
-    /// The PRODUCTION path is the durable `load_or_generate` ([`crate::kms_durable`], MR-025), which
-    /// recovers the sealed root + wrapped KEKs/DEKs from the store across a restart.
-    pub fn new() -> KmsEngine {
-        KmsEngine {
-            root: CellRoot::generate(),
-            keks: Mutex::new(BTreeMap::new()),
-            deks: Mutex::new(BTreeMap::new()),
-        }
+impl KmsCore {
+    /// Stand up a fresh core over a generated cell root (one per cell). It mints a fresh root per
+    /// process, so NOTHING it sealed survives a restart — this is what makes the `Memory` backend a
+    /// TEST DOUBLE. The PRODUCTION path is the durable `load_or_generate` ([`crate::kms_durable`],
+    /// MR-025), which recovers the sealed root + wrapped KEKs/DEKs from the store across a restart.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fresh() -> KmsCore {
+        KmsCore::from_root(CellRoot::generate())
     }
 
-    /// Stand up an engine over an EXISTING cell root — the durable load path (MR-025): the root has
+    /// Stand up a core over an EXISTING cell root — the durable load path (MR-025): the root has
     /// just been UNSEALED from the store under the seal key, or freshly generated on a genuine first
     /// boot. The KEK/DEK maps start empty; the durable loader then
     /// [`install_wrapped_kek`](Self::install_wrapped_kek) /
     /// [`install_wrapped_dek`](Self::install_wrapped_dek) the persisted wrapped key material (all
     /// wrapped under THIS same root, the durable invariant).
-    pub fn from_root(root: CellRoot) -> KmsEngine {
-        KmsEngine {
+    pub fn from_root(root: CellRoot) -> KmsCore {
+        KmsCore {
             root,
             keks: Mutex::new(BTreeMap::new()),
             deks: Mutex::new(BTreeMap::new()),
@@ -717,15 +732,22 @@ impl KmsEngine {
     /// wrapped-by-the-root conceptually; on this floor it is held sealed in-process (never
     /// exported).
     pub fn ensure_kek(&self, id: &KekId) -> u64 {
+        self.ensure_kek_tracked(id).0
+    }
+
+    /// [`Self::ensure_kek`] + whether the KEK was FRESHLY minted (vs already present). The durable
+    /// backend keys its write-through on the freshness bit (a fresh mint MUST persist before it is
+    /// handed out; an existing KEK already has its durable row).
+    pub fn ensure_kek_tracked(&self, id: &KekId) -> (u64, bool) {
         let mut keks = self.keks.lock().expect("KMS keks poisoned");
         if let Some(existing) = keks.get(id) {
-            return existing.epoch;
+            return (existing.epoch, false);
         }
         // A fresh KEK is generated and immediately sealed under the cell root (the L0→L1 envelope);
         // only the wrapped form is stored — the bare KEK never rests in the map.
         let wrapped = self.root.wrap_kek(&RawKey::generate());
         keks.insert(id.clone(), StoredKek { wrapped, epoch: 0 });
-        0
+        (0, true)
     }
 
     /// Unwrap the KEK for `id` under the cell root into its transient plaintext. Loud failure if
@@ -745,19 +767,31 @@ impl KmsEngine {
     /// from the tenant class (GD-4). The DEK is generated, wrapped under the tenant KEK, and
     /// stored ONLY in wrapped form (envelope encryption — never a bare DEK at rest). Fails loudly
     /// if the KEK is unavailable (never fabricates a key).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn ensure_dek(
         &self,
         tenant: &TenantId,
         region: &Region,
         class: KeyClass,
     ) -> Result<PiiKeyRef, KmsError> {
+        self.ensure_dek_tracked(tenant, region, class).map(|(k, _)| k)
+    }
+
+    /// [`Self::ensure_dek`] + whether the DEK was FRESHLY minted. The durable backend keys its
+    /// write-through on the freshness bit (a fresh mint MUST persist before it is handed out).
+    pub fn ensure_dek_tracked(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        class: KeyClass,
+    ) -> Result<(PiiKeyRef, bool), KmsError> {
         let kek_id = KekId::new(tenant.clone(), region.clone());
         let dek_id = DekId::new(tenant.clone(), class.clone());
         {
             // Fast path: the DEK already exists → return its ref at its current epoch.
             let deks = self.deks.lock().expect("KMS deks poisoned");
             if let Some((_, dek_epoch)) = deks.get(&dek_id) {
-                return Ok(PiiKeyRef::new(tenant.clone(), *dek_epoch, class));
+                return Ok((PiiKeyRef::new(tenant.clone(), *dek_epoch, class), false));
             }
         }
         // Generate a fresh DEK, wrap it under the tenant KEK, store the wrapped form only.
@@ -766,11 +800,11 @@ impl KmsEngine {
         let mut deks = self.deks.lock().expect("KMS deks poisoned");
         // Re-check under the lock (another thread may have created it) — keep idempotent.
         if let Some((_, dek_epoch)) = deks.get(&dek_id) {
-            return Ok(PiiKeyRef::new(tenant.clone(), *dek_epoch, class));
+            return Ok((PiiKeyRef::new(tenant.clone(), *dek_epoch, class), false));
         }
         let dek_epoch = 0u64;
         deks.insert(dek_id, (wrapped, dek_epoch));
-        Ok(PiiKeyRef::new(tenant.clone(), dek_epoch, class))
+        Ok((PiiKeyRef::new(tenant.clone(), dek_epoch, class), true))
     }
 
     /// Wrap (envelope-encrypt) a DEK's plaintext under the named KEK — AES-256-GCM. Fails loudly
@@ -981,6 +1015,14 @@ impl KmsEngine {
     /// plaintext-without-key fall-through.
     ///
     /// [`KeyOrigin`]: crate::key_origin::KeyOrigin
+    /// The `(keks, deks)` working-set counts — the [`KmsEngine`] `Debug` depth read (counts only,
+    /// never key material).
+    pub fn counts(&self) -> (usize, usize) {
+        let keks = self.keks.lock().map(|k| k.len()).unwrap_or(0);
+        let deks = self.deks.lock().map(|d| d.len()).unwrap_or(0);
+        (keks, deks)
+    }
+
     pub fn unwrap_dek_material(
         &self,
         tenant: &TenantId,
@@ -1005,17 +1047,293 @@ impl KmsEngine {
     }
 }
 
+// ─────────────────────────── the backend split (MR-009b Wave 5 / SI-006) ───────────────────────
+
+/// The KMS engine backend (MR-009b Wave 5, the MR-007/008/Wave-2 backend-enum pattern). `Durable`
+/// is the always-compiled PRODUCTION default: the working-set [`KmsCore`] hydrated from the
+/// `kms_sealed_root`/`kms_wrapped_kek`/`kms_wrapped_dek` tables at boot
+/// (`kms_durable::DurableKmsBacking::load_or_generate`, fail-closed + LOUD on a wrong/absent seal
+/// key) with EVERY mutation written through to the store, so keys survive a restart (SI-006).
+/// `Memory` is the in-memory TEST DOUBLE — compiled ONLY under
+/// `#[cfg(any(test, feature = "test-support"))]`: a fresh root per process, nothing survives a
+/// restart. The `no-in-memory-durable-store` scanner strips the `test-support`-gated `Memory` arm,
+/// so the PRODUCTION-compiled engine presents only the durable backend.
+enum KmsBackend {
+    /// The in-memory test-double core. **MR-009b Wave 5 — TEST DOUBLE (compiled ONLY under
+    /// `#[cfg(any(test, feature = "test-support"))]`).** NOT the production system-of-record.
+    #[cfg(any(test, feature = "test-support"))]
+    Memory(KmsCore),
+    /// The durable software-sealed backend (production, always compiled): the hydrated core + the
+    /// PG backing + the sync→async write-through bridge ([`crate::kms_durable::DurableKms`]).
+    Durable(DurableKms),
+}
+
+/// The self-hostable software KMS engine (Vault-Transit-class) — the in-cell key store behind the
+/// [`KmsAdapter`] seam (§4). It holds the L0 cell root, the L1 per-(tenant,region) KEKs, and the
+/// L2 DEKs stored ENVELOPE-WRAPPED ([`WrappedDek`]) under their KEKs — via a backend split:
+///
+/// - **The PRODUCTION default is DURABLE (MR-009b Wave 5 / SI-006):** the engine is constructed by
+///   [`crate::kms_durable::DurableKmsBacking::load_or_generate`] (the software-sealed root-of-trust,
+///   MR-025 — fail-closed + LOUD on a wrong/absent `MYELIN_KMS_SEAL_KEY`), hydrating the working set
+///   from the `kms_sealed_root`/`kms_wrapped_kek`/`kms_wrapped_dek` tables, and EVERY mutation
+///   (`ensure_kek`/`ensure_dek`/`rotate_kek`/`destroy_kek`/`destroy_dek`/`wrap_dek_material`)
+///   WRITES THROUGH to the store — a key minted through this engine survives a kill-9 restart.
+/// - **The in-memory engine ([`KmsEngine::new`]) is a TEST DOUBLE**, compiled ONLY under
+///   `#[cfg(any(test, feature = "test-support"))]` (downstream crates reach it via the
+///   `myelin-storage/test-support` dev-dependency). It mints a fresh root per process, so nothing
+///   it sealed survives a restart — never the production system-of-record.
+///
+/// `destroy_kek` / `destroy_dek` are the crypto-shred levers; a destroyed key is removed from the
+/// store AND excluded from [`backup_snapshot`](Self::backup_snapshot) (it must stay dead across a
+/// restore, §7.5). On the durable backend the shred DELETES the durable row FIRST (fail-closed:
+/// a shred that cannot reach the store refuses — hard-down — rather than silently resurrecting the
+/// key on the next restart).
+pub struct KmsEngine {
+    backend: KmsBackend,
+}
+
+/// The `Default` engine is the in-memory TEST DOUBLE — `#[cfg(any(test, feature = "test-support"))]`
+/// only (MR-009b Wave 5). Production builds the durable engine through
+/// [`crate::kms_durable::DurableKmsBacking::load_or_generate`].
+#[cfg(any(test, feature = "test-support"))]
 impl Default for KmsEngine {
     fn default() -> Self {
         Self::new()
     }
 }
 
+impl KmsEngine {
+    /// Stand up a fresh IN-MEMORY engine over a generated cell root — the **test-double** (MR-009b
+    /// Wave 5: compiled ONLY under `#[cfg(any(test, feature = "test-support"))]`). It mints a fresh
+    /// root per process, so NOTHING it sealed survives a restart. The PRODUCTION constructor is the
+    /// durable [`crate::kms_durable::DurableKmsBacking::load_or_generate`] (MR-025), which recovers
+    /// the sealed root + wrapped KEKs/DEKs from the store across a restart; this `::new` is the
+    /// DB-free unit-test entry point downstream crates reach via the `myelin-storage/test-support`
+    /// dev-dependency.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new() -> KmsEngine {
+        KmsEngine {
+            backend: KmsBackend::Memory(KmsCore::fresh()),
+        }
+    }
+
+    /// Stand up an IN-MEMORY engine over an EXISTING cell root (the from-snapshot rebuild seam the
+    /// restore drills exercise). **A TEST-SUPPORT seam (MR-009b Wave 5)** — the production durable
+    /// load path hydrates through [`crate::kms_durable::DurableKmsBacking::load_or_generate`], not
+    /// through this constructor.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_root(root: CellRoot) -> KmsEngine {
+        KmsEngine {
+            backend: KmsBackend::Memory(KmsCore::from_root(root)),
+        }
+    }
+
+    /// Wrap the durable backend (the hydrated core + PG backing + bridge) as the public engine —
+    /// the PRODUCTION constructor, reached through
+    /// [`crate::kms_durable::DurableKmsBacking::load_or_generate`].
+    pub(crate) fn durable(backend: DurableKms) -> KmsEngine {
+        KmsEngine {
+            backend: KmsBackend::Durable(backend),
+        }
+    }
+
+    /// The crypto core (the working set) behind whichever backend is wired — the read path both
+    /// backends share.
+    pub(crate) fn core(&self) -> &KmsCore {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            KmsBackend::Memory(core) => core,
+            KmsBackend::Durable(d) => d.core(),
+        }
+    }
+
+    /// Install a KEK loaded from the durable store — its wrapped (under-the-root) form + epoch. The
+    /// wrapped bytes MUST have been wrapped under THIS engine's root (the durable invariant). This
+    /// is the HYDRATION seam (the durable loader / the from-snapshot rebuild) — it installs into the
+    /// in-process working set only and does NOT write through.
+    pub fn install_wrapped_kek(
+        &self,
+        id: KekId,
+        nonce: [u8; NONCE_LEN],
+        wrapped: Vec<u8>,
+        epoch: u64,
+    ) {
+        self.core().install_wrapped_kek(id, nonce, wrapped, epoch);
+    }
+
+    /// Install a DEK loaded from the durable store — its wrapped (under-the-KEK) form + DEK epoch
+    /// (the hydration seam; working-set only, no write-through).
+    pub fn install_wrapped_dek(&self, id: DekId, dek: WrappedDek, dek_epoch: u64) {
+        self.core().install_wrapped_dek(id, dek, dek_epoch);
+    }
+
+    /// Export this engine's cell root in its SEALED at-rest form (under the seal key) — what the
+    /// durable store persists. The plaintext root never leaves the engine.
+    pub fn export_sealed_root(&self, seal_key: &SealKey) -> SealedRoot {
+        self.core().export_sealed_root(seal_key)
+    }
+
+    /// Export one KEK's wrapped (under-the-root) form for persistence, or `None` if absent/destroyed.
+    pub fn export_kek(&self, id: &KekId) -> Option<ExportedKek> {
+        self.core().export_kek(id)
+    }
+
+    /// Export one DEK's wrapped (under-the-KEK) form + its DEK epoch, or `None` if absent/shredded.
+    pub fn export_dek(&self, id: &DekId) -> Option<(WrappedDek, u64)> {
+        self.core().export_dek(id)
+    }
+
+    /// Export EVERY live DEK's wrapped form + DEK epoch (for a full write-through / mirror).
+    pub fn export_deks(&self) -> Vec<(DekId, WrappedDek, u64)> {
+        self.core().export_deks()
+    }
+
+    /// Provision (or fetch) the L1 KEK for a `(tenant, region)`. Idempotent: a second call for the
+    /// same id returns the existing KEK's epoch (it does NOT silently rotate).
+    ///
+    /// **Durable backend (MR-009b Wave 5):** a FRESHLY minted KEK is written through to the
+    /// `kms_wrapped_kek` table before it is handed out. A write-through failure is FAIL-STATIC
+    /// HARD-DOWN (the in-memory mint is rolled back and the process panics LOUDLY): a KEK that does
+    /// not survive a restart must never be handed out (SI-006 — silent key loss), and this
+    /// infallible signature has no error channel. An existing KEK performs no DB write.
+    pub fn ensure_kek(&self, id: &KekId) -> u64 {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            KmsBackend::Memory(core) => core.ensure_kek(id),
+            KmsBackend::Durable(d) => d.ensure_kek(id),
+        }
+    }
+
+    /// Provision (or fetch) the L2 DEK for `(tenant, class)` in `region`, returning its
+    /// [`PiiKeyRef`]. Idempotent per `(tenant, class)`. A per-SUBJECT class yields a DISTINCT DEK
+    /// from the tenant class (GD-4). Fails loudly if the KEK is unavailable (never fabricates a key).
+    ///
+    /// **Durable backend (MR-009b Wave 5):** a FRESHLY minted DEK (and its wrapping KEK row) is
+    /// written through to the store before the ref is handed out; a write-through failure ROLLS BACK
+    /// the in-memory mint and returns the loud [`KmsError::Durability`] — a key that does not
+    /// survive a restart is never handed out.
+    pub fn ensure_dek(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        class: KeyClass,
+    ) -> Result<PiiKeyRef, KmsError> {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            KmsBackend::Memory(core) => core.ensure_dek(tenant, region, class),
+            KmsBackend::Durable(d) => d.ensure_dek(tenant, region, class),
+        }
+    }
+
+    /// Resolve (unwrap) the DEK named by a [`PiiKeyRef`] into a usable [`DekHandle`] — the read
+    /// path's key-resolution step (both backends resolve from the in-process working set; the
+    /// durable backend hydrated it from the store at boot). Every failure is LOUD ([`KmsError`]) —
+    /// **NEVER a plaintext-without-key fall-through** (the 0-fail-open invariant).
+    pub fn resolve_dek(&self, key_ref: &PiiKeyRef, region: &Region) -> Result<DekHandle, KmsError> {
+        self.core().resolve_dek(key_ref, region)
+    }
+
+    /// Rotate a tenant's KEK = **envelope re-wrap, not bulk re-encryption** (§4; `O(keys)`, not
+    /// `O(data)`). Returns the new KEK epoch.
+    ///
+    /// **Durable backend (MR-009b Wave 5):** the new wrapped KEK + every re-wrapped DEK row is
+    /// written through in ONE PG transaction (atomicity is load-bearing: a partial persist — new
+    /// KEK row + old DEK rows — would be unrecoverable after a restart, since the old KEK plaintext
+    /// exists nowhere to unwrap the old envelopes). On a write-through failure the loud
+    /// [`KmsError::Durability`] is returned and the store atomically holds the PREVIOUS
+    /// (pre-rotation) wrapping generation — every ciphertext remains decryptable after a restart
+    /// (the DEK material never changed), only the epoch bump is lost (re-run the rotation).
+    pub fn rotate_kek(&self, id: &KekId) -> Result<u64, KmsError> {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            KmsBackend::Memory(core) => core.rotate_kek(id),
+            KmsBackend::Durable(d) => d.rotate_kek(id),
+        }
+    }
+
+    /// **Crypto-shred at L1** (§5): destroy the tenant KEK — every DEK under it becomes
+    /// unrecoverable (the tenant-offboard lever). Returns `true` if a KEK was present to destroy.
+    ///
+    /// **Durable backend (MR-009b Wave 5):** the durable `kms_wrapped_kek` row is DELETED FIRST
+    /// (§7.5 — the shred must reach the store, or a restart resurrects the offboarded tenant's
+    /// key). A delete failure is FAIL-STATIC HARD-DOWN (loud panic, the in-memory key untouched):
+    /// this infallible signature has no error channel, and reporting a shred that did not reach the
+    /// store would be a silent GDPR erasure failure.
+    pub fn destroy_kek(&self, id: &KekId) -> bool {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            KmsBackend::Memory(core) => core.destroy_kek(id),
+            KmsBackend::Durable(d) => d.destroy_kek(id),
+        }
+    }
+
+    /// **Crypto-shred at L2** (§5): destroy a single per-subject (or per-tenant/blob) DEK — the
+    /// GD-4 individual-erasure lever. Returns `true` if a DEK was present to destroy.
+    ///
+    /// **Durable backend (MR-009b Wave 5):** the durable `kms_wrapped_dek` row is DELETED FIRST;
+    /// a delete failure is FAIL-STATIC HARD-DOWN (loud panic) — same posture as
+    /// [`Self::destroy_kek`].
+    pub fn destroy_dek(&self, id: &DekId) -> bool {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            KmsBackend::Memory(core) => core.destroy_dek(id),
+            KmsBackend::Durable(d) => d.destroy_dek(id),
+        }
+    }
+
+    /// A backup snapshot of the engine's key material — the wrapped DEKs ONLY (§7.5: a
+    /// crypto-shredded key is **excluded** — it must stay dead across a restore).
+    pub fn backup_snapshot(&self) -> Vec<(DekId, WrappedDek)> {
+        self.core().backup_snapshot()
+    }
+
+    /// **The extended backup snapshot (MR-025): the SEALED root + the wrapped KEKs + the wrapped
+    /// DEKs** — everything a clean target needs (WITH the same seal key) to recover every encrypted
+    /// column. A crypto-shredded key stays excluded (§7.5).
+    pub fn backup_snapshot_durable(&self, seal_key: &SealKey) -> KmsDurableSnapshot {
+        self.core().backup_snapshot_durable(seal_key)
+    }
+
+    /// Envelope-wrap raw DEK material under a tenant's KEK (the L1→L2 seal) — the primitive the
+    /// [`KeyOrigin`](crate::key_origin::KeyOrigin) platform/BYOK origins call. Ensures the tenant
+    /// KEK exists first; the material is wrapped, never stored bare.
+    ///
+    /// **Durable backend (MR-009b Wave 5):** a freshly ensured KEK is written through (same
+    /// fail-static posture as [`Self::ensure_kek`]). The returned [`WrappedDek`] itself is the
+    /// CALLER's to persist (the [`KeyOrigin`] holders store it) — it is not a `kms_wrapped_dek` row.
+    ///
+    /// [`KeyOrigin`]: crate::key_origin::KeyOrigin
+    pub fn wrap_dek_material(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        material: &[u8; KEY_LEN],
+    ) -> Result<WrappedDek, KmsError> {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            KmsBackend::Memory(core) => core.wrap_dek_material(tenant, region, material),
+            KmsBackend::Durable(d) => d.wrap_dek_material(tenant, region, material),
+        }
+    }
+
+    /// Unwrap a [`WrappedDek`] under a tenant's KEK into a usable [`DekHandle`] — the inverse of
+    /// [`Self::wrap_dek_material`] (read-only; both backends resolve from the working set). A
+    /// destroyed KEK / non-authenticating envelope fails LOUDLY ([`KmsError`]) — never a
+    /// plaintext-without-key fall-through.
+    pub fn unwrap_dek_material(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        w: &WrappedDek,
+    ) -> Result<DekHandle, KmsError> {
+        self.core().unwrap_dek_material(tenant, region, w)
+    }
+}
+
 impl fmt::Debug for KmsEngine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Counts only — NEVER any key material.
-        let keks = self.keks.lock().map(|k| k.len()).unwrap_or(0);
-        let deks = self.deks.lock().map(|d| d.len()).unwrap_or(0);
+        let (keks, deks) = self.core().counts();
         f.debug_struct("KmsEngine")
             .field("keks", &keks)
             .field("deks", &deks)

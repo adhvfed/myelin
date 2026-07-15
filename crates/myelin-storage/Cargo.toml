@@ -112,6 +112,13 @@ memory = ["test-support"]
 # telemetry-assertion library. It is a dev-dependency ONLY — nothing in the production
 # build path pulls myelin-harness into the storage crate's runtime DAG.
 [dev-dependencies]
+# MR-009b Wave 5 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN
+# `tests/*.rs` integration-test files (a separate compilation unit linking the NORMAL lib, where
+# `#[cfg(test)]` is NOT active). The in-memory `KmsEngine::new()` double + the in-process dogfood
+# drill surface (`run_restore_verify_on_dogfood`) are now `#[cfg(any(test, feature = "test-support"))]`.
+# The sanctioned Cargo idiom (same as the myelin-identity-service Wave-2 self dev-dependency); it does
+# NOT affect the normal `cargo build`, which stays durable-by-default.
+myelin-storage = { path = ".", features = ["test-support"] }
 myelin-harness = { path = "../myelin-harness" }
 # myelin-lints is TEST-SUPPORT only: the P-ST-08 encryption GATE drill
 # (tests/encryption_gate_drill.rs) exercises the `no-untagged-personal-data` lint over an inline

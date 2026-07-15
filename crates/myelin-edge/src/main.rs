@@ -21,7 +21,8 @@ use myelin_identity_service::{
     PrincipalStore, RevocationStore,
 };
 use myelin_storage::{
-    DurablePrincipalBacking, DurableRevocationBacking, KmsEngine, SubstrateProvider,
+    kms_durable_migrations, seal_key_from_env, DurableKmsBacking, DurablePrincipalBacking,
+    DurableRevocationBacking, HotTables, SubstrateProvider,
 };
 use std::sync::Arc;
 
@@ -44,9 +45,38 @@ async fn main() {
         }
     };
     let handle = tokio::runtime::Handle::current();
-    // The shared cell KMS (the crypto-shred substrate). The durable software-sealed KMS root LOAD is
-    // the named W5 follow-on (MR-025); here a fresh in-memory engine seeds the profile-encryption seam.
-    let kms = Arc::new(KmsEngine::new());
+    // The shared cell KMS (the crypto-shred substrate) — DURABLE-BY-DEFAULT (MR-009b Wave 5 /
+    // SI-006): the software-sealed root + wrapped KEKs/DEKs load from the `kms_sealed_root`/
+    // `kms_wrapped_kek`/`kms_wrapped_dek` tables via `load_or_generate` (MR-025), and every key
+    // minted at runtime writes through — keys survive a kill-9 restart. FAIL LOUD, never a silent
+    // in-memory fallback: a missing/malformed MYELIN_KMS_SEAL_KEY, an unreachable store, or a
+    // sealed root that does not unseal under the supplied key (WrongSealKey — fail-closed, NEVER a
+    // fresh root that would orphan every existing ciphertext) each exit non-zero.
+    let seal_key = match seal_key_from_env() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("edge: KMS refused to start (durable-by-default requires the seal key): {e}");
+            std::process::exit(1);
+        }
+    };
+    // The KMS tables are forward-only + idempotent — apply them at boot via the MR-022 migrator.
+    if let Err(e) = provider
+        .migrate(&kms_durable_migrations(), &HotTables::none())
+        .await
+    {
+        eprintln!("edge: cannot apply the durable KMS migrations: {e}");
+        std::process::exit(1);
+    }
+    // The cell whose sealed root this edge serves (a namespace, not a secret — dev default).
+    let cell_id = std::env::var("MYELIN_CELL_ID").unwrap_or_else(|_| "cell-dev".to_string());
+    let kms_backing = DurableKmsBacking::new(provider.db_pool().clone(), cell_id);
+    let kms = match kms_backing.load_or_generate(&seal_key).await {
+        Ok(engine) => Arc::new(engine),
+        Err(e) => {
+            eprintln!("edge: KMS refused to start (fail-closed, never a silent in-memory engine): {e}");
+            std::process::exit(1);
+        }
+    };
 
     // The REAL PASETO Bearer verifier over a freshly-generated cell authority (genuine Ed25519 crypto
     // — a forged token is rejected). The production cell-root LOAD + the seeded S1 directory is the

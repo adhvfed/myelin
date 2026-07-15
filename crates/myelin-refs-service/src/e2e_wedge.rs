@@ -63,6 +63,12 @@
 //!   producers are reached through the SAME frozen seams ([`crate::ProjectApi`], the synthetic owner
 //!   standing in for the real `project` — the production wire is the named `ResilientClient` floor).
 
+// MR-009b Wave 5: the E2E runners that construct the in-memory KMS test double are
+// `test-support`-gated, which leaves their imports + private helpers unused on the default
+// (production) build. File-scoped allow ONLY for that cfg (the test/test-support build still
+// checks imports).
+#![cfg_attr(not(any(test, feature = "test-support")), allow(unused_imports, dead_code))]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -597,6 +603,10 @@ pub fn run_e2e_3_spec_to_ship(ctx_base: EmitContextBase) -> E2eArtifact {
 ///
 /// Returns the named green artifact (Refs' part of the H1–H18 coverage receipt + post-erase locate = 0
 /// recoverable PII). Drives the SAME [`re_erase_at_backup_scale`] structural erasure engine.
+/// **MR-009b Wave 5 — `test-support`-gated:** this in-process drill constructs the in-memory
+/// `KmsEngine` test double (the production engine is the durable `kms_durable::load_or_generate`);
+/// its consumers (the tests-dir wedge/dogfood drills) reach it via the `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
 pub fn run_e2e_4_dsar_fanout() -> E2eArtifact {
     let tenant = e2e_tenant();
     let region = e2e_region();
@@ -663,6 +673,10 @@ pub fn run_e2e_4_dsar_fanout() -> E2eArtifact {
 /// end-to-end over the production-hardened engine and returns the three named green artifacts. This
 /// COMPLETES R-M5 — the master M5 exit gate cites E2E-1..E2E-4 green; a red E2E-1 must NOT let M6 start.
 /// Each artifact's `is_green()` is the per-scenario earned verdict (0 leak + the scenario's predicate).
+/// **MR-009b Wave 5 — `test-support`-gated:** this in-process drill constructs the in-memory
+/// `KmsEngine` test double (the production engine is the durable `kms_durable::load_or_generate`);
+/// its consumers (the tests-dir wedge/dogfood drills) reach it via the `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
 pub fn run_refs_e2e_wedge(ctx_base: EmitContextBase) -> Vec<E2eArtifact> {
     vec![
         run_e2e_1_pr_pane(),

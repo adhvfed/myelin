@@ -58,6 +58,7 @@
 //! work). **VISION §3** (the switch test) / **§5** (dogfooding).
 
 use crate::e2e_wedge::E2eArtifact;
+#[cfg(any(test, feature = "test-support"))]
 use crate::{run_e2e_1_pr_pane, run_e2e_3_spec_to_ship, run_e2e_4_dsar_fanout};
 
 /// The Myelin self-tenant id (the platform self-hosts as exactly one cell — P-508 / CP-M6). Opaque,
@@ -143,6 +144,10 @@ impl DogfoodArtifact {
 /// self-tenant, REUSING the existing E2E-wedge runners (the SAME permission-aware query pre-filter /
 /// reindex-from-source / structural-erase engine — EI-01 §7, never a second implementation). `date` is
 /// the run stamp.
+/// **MR-009b Wave 5 — `test-support`-gated:** this in-process drill constructs the in-memory
+/// `KmsEngine` test double (the production engine is the durable `kms_durable::load_or_generate`);
+/// its consumers (the tests-dir wedge/dogfood drills) reach it via the `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
 pub fn run_search_over_myelins_own_work(date: &str) -> DogfoodArtifact {
     DogfoodArtifact {
         date: date.to_string(),
