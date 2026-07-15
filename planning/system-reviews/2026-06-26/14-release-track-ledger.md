@@ -151,6 +151,18 @@ to pre-change). Residuals: migrate-as-owner/serve-as-app role split unaddressed 
 app role cannot run the migrator — smokes/integration need the admin DSN); shared-backlog drain
 coupling in dev; edge reconcile reads the full table (per-aggregate verb = future work).
 
+**W6d DONE (2026-07-15, `241cab1`): scanner → 3 in-mem.** Registry whole-surface + MisrouteAudit
+flipped; migrations 0035–0039 incl. the repo_placement residency trigger. Verifier findings CLOSED
+pre-commit: tenant-delete drift vector (FK ON DELETE RESTRICT, probe-proven refused) + wrong-region
+re-boot silent divergence (region-claim read-back assert at boot + adversarial test leg). Ledgered:
+routing-path infra-fault panics — the Result-conversion wave MUST land before any serving binary
+wires route(); placement_by_slug dup-slug (no UNIQUE); boot wiring must apply 0030–0039.
+
+**W6b2 DONE (2026-07-15, `364d5df` merge `a7f6ba9`): scanner → 2 in-mem.** CostLedger role-struct +
+BudgetGate injection; billing invariants proven on BOTH arms (verifier probe: 20 concurrent
+double-settle rounds → 0 double charges); Box::leak gone; wallet stays per-run (P-ST-19).
+**Remaining baseline: OutboxStore (W3b.5/.6) + FsBlobStore (W7.3).**
+
 **W3b.2 DONE (2026-07-15, merge `20fe480`): scanner-neutral.** `PgOutboxBacking` over the frozen
 outbox table; commit_staged_atomic (dup-event_id rejects whole commit = memory parity; one seq
 discipline with co_commit_in_tx); drain_once_dead_letter (claim locks held across publishes; per-row
