@@ -604,13 +604,34 @@ impl StoreBackedCheck {
         // The shared cell KMS (P-058) — the crypto-shred substrate. A fresh engine here; a live
         // service shares the cell engine S1/S2 seal under (so one per-subject-DEK shred erases both).
         let kms = std::sync::Arc::new(myelin_storage::KmsEngine::new());
-        StoreBackedCheck::with_kms(tuples, index, revocations, minter, kms, cell_authority)
+        // MR-009b Wave 6a — the in-memory S2 store + PII-free erasure ledger TEST DOUBLES (this
+        // entry point is itself `test-support`-gated); the production default is the durable pair
+        // `StoreBackedCheck::with_pg` wires.
+        let pseudonyms = PseudonymStore::new(kms.clone());
+        let erasure_ledger = pseudonym_erase::PseudonymErasureLedger::new();
+        StoreBackedCheck::with_kms(
+            tuples,
+            index,
+            revocations,
+            minter,
+            kms,
+            cell_authority,
+            pseudonyms,
+            erasure_ledger,
+        )
     }
 
-    /// Wire the slot over an EXPLICIT shared [`KmsEngine`] (so a live service can share the SAME cell
-    /// engine S1's profile encryption + S2's pseudonym-link seal use — one per-subject DEK, one
-    /// crypto-shred). The S2 pseudonym map ([`PseudonymStore`]) + the PII-free erasure ledger
-    /// ([`pseudonym_erase::PseudonymErasureLedger`]) are built over THIS engine.
+    /// Wire the slot over an EXPLICIT shared [`KmsEngine`] + the S2 pseudonym map
+    /// ([`PseudonymStore`]) + the PII-free erasure ledger ([`pseudonym_erase::PseudonymErasureLedger`])
+    /// the caller supplies (so a live service can share the SAME cell engine S1's profile encryption +
+    /// S2's pseudonym-link seal use — one per-subject DEK, one crypto-shred). **MR-009b Wave 6a — the
+    /// S2 store + ledger are passed IN (not built here) so the caller chooses the backend:** the
+    /// `test-support` [`StoreBackedCheck::with_index`] passes the in-memory doubles, while the
+    /// production [`StoreBackedCheck::with_pg`] passes the durable PG-backed pair.
+    // The 8 params are the slot's distinct collaborators (tuples/index/revocations/minter/kms/
+    // cell-authority + the S2 store + erasure ledger) — each a load-bearing shared handle, not a
+    // bag of scalars; grouping them into a config struct would only relocate the wiring.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_kms(
         tuples: TupleStore,
         index: ReverseIndex,
@@ -618,6 +639,8 @@ impl StoreBackedCheck {
         minter: mint::RunTokenMinter,
         kms: std::sync::Arc<myelin_storage::KmsEngine>,
         cell_authority: std::sync::Arc<CellTokenAuthority>,
+        pseudonyms: PseudonymStore,
+        erasure_ledger: pseudonym_erase::PseudonymErasureLedger,
     ) -> StoreBackedCheck {
         StoreBackedCheck {
             engine: CheckEngine::new(tuples.clone()),
@@ -629,8 +652,8 @@ impl StoreBackedCheck {
             revocations,
             read_replica: read_replica::AuthzReadReplica::new(),
             minter,
-            pseudonyms: PseudonymStore::new(kms.clone()),
-            erasure_ledger: pseudonym_erase::PseudonymErasureLedger::new(),
+            pseudonyms,
+            erasure_ledger,
             kms,
             cell_authority,
         }
@@ -648,8 +671,11 @@ impl StoreBackedCheck {
     ///
     /// `outbox` is the S3 store's emit path (the durable [`myelin_storage::pgrelay`] co-commit is the
     /// W3 follow-on; here the caller supplies the outbox the relay drains). `kms` is the shared cell
-    /// engine S1/S2 seal under. The S2 pseudonym map + PII-free erasure ledger remain in-memory (the
-    /// named W6 durable follow-on — they are separate baseline entries, not flipped in Wave 2).
+    /// engine S1/S2 seal under. **MR-009b Wave 6a — the S2 pseudonym map + PII-free erasure ledger are
+    /// now DURABLE-BY-DEFAULT too:** built via [`PseudonymStore::with_pg`] over the live `pseudonym_map`
+    /// table + [`pseudonym_erase::PseudonymErasureLedger::with_pg`] over the non-shred-erasable
+    /// `identity_pseudonym_erasure_ledger` (both through the SAME MR-022 provider pool). The in-memory
+    /// pair is now the `test-support`-gated double `with_index` wires.
     pub fn with_pg(
         provider: myelin_storage::SubstrateProvider,
         outbox: myelin_events::OutboxStore,
@@ -665,7 +691,20 @@ impl StoreBackedCheck {
         );
         // The durable S7 revocation denylist (the live `revocation` mirror) — the production default.
         let revocations = RevocationStore::with_pg(
-            myelin_storage::DurableRevocationBacking::new(provider),
+            myelin_storage::DurableRevocationBacking::new(provider.clone()),
+            handle.clone(),
+        );
+        // The durable S2 pseudonym map + the durable PII-free erasure ledger (MR-009b Wave 6a) — the
+        // production default. The S2 map seals the real-identity link under the SAME cell `kms`; the
+        // erasure ledger is NON-shred-erasable (it must survive the crypto-shred it records + a
+        // restore so the ID-D8 re-erasure pass can replay it).
+        let pseudonyms = PseudonymStore::with_pg(
+            kms.clone(),
+            myelin_storage::DurablePseudonymBacking::new(provider.clone()),
+            handle.clone(),
+        );
+        let erasure_ledger = pseudonym_erase::PseudonymErasureLedger::with_pg(
+            myelin_storage::DurableErasureLedgerBacking::new(provider),
             handle,
         );
         // The REAL PASETO v4.public (Ed25519) run-token signer over the cell authority (one signer,
@@ -686,6 +725,8 @@ impl StoreBackedCheck {
             minter,
             kms,
             cell_authority,
+            pseudonyms,
+            erasure_ledger,
         )
     }
 

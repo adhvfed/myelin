@@ -663,6 +663,11 @@ pub mod provider;
 // reuses the rebac_tuple table/ops + adds the principal/credential_link tables (same RLS form), all
 // driven through the MR-022 with_tenant_tx convention. The identity-layer stores delegate to these.
 pub mod identity_durable;
+// The durable PG backings for the identity S2 pseudonym map + the PII-free erasure ledger (MR-009b
+// W6a / SI-018 cluster): the `pseudonym_map` table (tightest-RLS, KMS-sealed real-identity link) +
+// the NON-shred-erasable, NO-RLS `identity_pseudonym_erasure_ledger` (10.8 — must survive the
+// crypto-shred it records + restore). The identity-layer S2 store + erasure ledger delegate to these.
+pub mod pseudonym_durable;
 // The OLTP-co-located outbox relay (the one legitimate broker-publish site, BUS-2) — kept in its
 // own module so the broker-publish call is isolated to a single named relay file (the same
 // posture as myelin-events/src/relay.rs).
@@ -839,6 +844,10 @@ pub use provider::{foundation_migrations, ProviderError, SubstrateProvider, DEFA
 pub use identity_durable::{
     identity_durable_migrations, DurablePrincipalBacking, DurablePrincipalRow, DurableProfileBlob,
     DurableRevocationBacking, DurableRevocationRow, DurableTupleBacking, TupleEdgeOp,
+};
+pub use pseudonym_durable::{
+    pseudonym_durable_migrations, DurableErasureLedgerBacking, DurableErasureLedgerRow,
+    DurablePseudonymBacking, DurablePseudonymRow,
 };
 pub use tenant_tx::{connect_pool_with_reset, with_tenant_tx, TxScope};
 pub use events_durable::DurableDedupBacking;
