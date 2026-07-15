@@ -15,16 +15,23 @@
 //! HARD failure. Run: `MYELIN_REQUIRE_RUNSC=1 cargo test -p myelin-edge --test git_wire_http_push_oracle_test -- --nocapture`.
 
 use myelin_edge::{
-    register_git_wire, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
+    register_git_wire, serve_edge, AllowAll, DurableGitBackend, GitCheckRepoAuthorizer, Gateway,
+    Method, RepoGrantWriter, TupleStoreGrantWriter, WhoamiHandler,
 };
-use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
+use myelin_events::{OutboxStore, Timestamp};
+use myelin_identity::{
+    DataRole, ObjectId, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RelName,
+    RelationTuple, TupleDelta,
+};
 use myelin_identity_service::{
     CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
-    PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
+    PasetoCapabilityVerifier, PrincipalStore, RevocationStore, StoreBackedCheck, TupleStore,
 };
 use myelin_ci_sandbox::{resolved_gvisor_rootfs, ENV_GVISOR_GIT_ROOTFS};
 use myelin_git::core::RepoLoc;
 use myelin_git::durable::DurableGitStore;
+use myelin_git::live_check::GitCheckGate;
+use myelin_substrate::FailStaticThreshold;
 use myelin_storage::{KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 use std::net::SocketAddr;
@@ -170,6 +177,85 @@ fn build(root: &Path) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBacken
     (Arc::new(builder.build()), cell, backend)
 }
 
+// ───────── the R2.1a LIVE-authorizer build: the push wire gated by the real Identity `check` ─────────
+
+fn threshold() -> FailStaticThreshold {
+    FailStaticThreshold {
+        status: "OPEN — LEGAL".into(),
+        owner: "DPO / Legal".into(),
+        static_max_secs: None,
+        static_max_default_secs: 300,
+        agent_token_ttl_secs: 60,
+        constraint: "static_max <= revocation-SLA AND static_max >= agent-token-TTL".into(),
+    }
+}
+
+/// The VERIFIED wire principal the minted `subj-1` token resolves to (the seeded `svc:agent` in
+/// `tenant`, region `eu-west`) — the subject the grants below target + the check scopes on.
+fn wire_principal(tenant: &str) -> Principal {
+    let mut p = Principal::stub(
+        PrincipalId("svc:agent".into()),
+        PrincipalKind::Service,
+        TenantId(tenant.into()),
+    );
+    p.region = Region(REGION.into());
+    p
+}
+
+/// Write a `repo:<slug>#<relation>@svc:agent` grant into the SHARED tuple store the live check reads.
+fn grant(store: &TupleStore, tenant: &str, slug: &str, relation: &str) {
+    let p = wire_principal(tenant);
+    let scope = TenantScope::from_verified_token(&p, p.region.clone());
+    let delta = TupleDelta::Add(RelationTuple {
+        object: ObjectId(format!("repo:{slug}")),
+        relation: RelName(relation.into()),
+        subject: PrincipalId("svc:agent".into()),
+        caveat: None,
+    });
+    store
+        .write_tuples(&scope, &p, &[delta], None, None, Timestamp("2026-07-15T00:00:00Z".into()))
+        .expect("write grant");
+}
+
+/// Build a gateway whose git wire is gated by the R2.1a LIVE per-repo authorizer + bootstrap-grant seam.
+/// Returns the gateway, cell, the SHARED tuple store (to write grants), and the backend.
+fn build_live(root: &Path) -> (Arc<Gateway>, CellTokenAuthority, TupleStore, Arc<DurableGitBackend>) {
+    let cell = CellTokenAuthority::from_seed(&[7u8; 32], &[9u8; 32]).expect("cell");
+    let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+    seed_principal(&store, "acme", "svc:agent", "subj-1");
+    seed_principal(&store, "globex", "svc:agent", "subj-1");
+    let authn = Arc::new(CapabilityAuthenticator::with_verifier(
+        store,
+        Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
+        RevocationStore::new(),
+    ));
+    let human =
+        Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(KmsEngine::new()))));
+
+    let tuples = TupleStore::new(OutboxStore::new());
+    let check = StoreBackedCheck::new(tuples.clone());
+    for admit in check.admit_git_fragment() {
+        assert!(
+            matches!(admit, myelin_identity::FragmentAdmit::Admitted { .. }),
+            "the Git fragment admits: {admit:?}"
+        );
+    }
+    let gate = GitCheckGate::try_new(check, 300, &threshold()).expect("valid staleness bound");
+    let authorizer = Arc::new(GitCheckRepoAuthorizer::new(gate, RevocationStore::new()));
+    let grant_writer = Arc::new(TupleStoreGrantWriter::new(tuples.clone()));
+
+    let backend = Arc::new(
+        DurableGitBackend::rooted_inmem_for_test(root.to_path_buf())
+            .with_repo_authorizer(authorizer)
+            .with_grant_writer(grant_writer),
+    );
+    let builder = Gateway::builder(authn, human, Arc::new(AllowAll))
+        .default_token_scheme(SCHEME)
+        .route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler));
+    let builder = register_git_wire(builder, backend.clone());
+    (Arc::new(builder.build()), cell, tuples, backend)
+}
+
 fn mint(cell: &CellTokenAuthority, tenant: &str, jti: &str) -> String {
     cell.mint(&CapabilityMintSpec {
         tenant: tenant.into(),
@@ -237,7 +323,9 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
     let root = temp_root("push");
     // The server repo must exist (push to a non-existent repo is a 404). Create it durably.
     let backend_for_create = DurableGitBackend::rooted_inmem_for_test(root.clone());
-    backend_for_create.create_repo("acme", REGION, "widgets").expect("create server repo");
+    backend_for_create
+        .create_repo("acme", REGION, "widgets", &wire_principal("acme"))
+        .expect("create server repo");
 
     let (gw, cell, backend) = build(&root);
     let addr = spawn(gw).await;
@@ -311,5 +399,89 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
     );
 
     println!("=== CT-006d EXTERNAL ORACLE PROVEN: real git push lands durably + secret-reject (0 ghost) + auth/cross-tenant refusal ===");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ═══════════ R2.1a: the R0 acceptance contract — un-granted repo push is DENIED (403, no ref move) ═══════════
+
+/// **R2.1a — the LIVE per-repo authorizer over a real `git push` (the R0 write-side done-bar).** Drives
+/// the host's REAL `git push` through the FULL gateway lifecycle with the wire gated by the real Identity
+/// `check`:
+///   (a) an in-tenant, authenticated principal with **NO grant** on the repo → `git push` gets **403** and
+///       the ref does NOT move (no object ingested);
+///   (b) after the **bootstrap admin grant** → the SAME push SUCCEEDS + lands DURABLY (a fresh re-open
+///       sees the ref; the outbox gained exactly one `git.ref.updated`);
+///   (c) a **read-only (`reader`) grant** → `git push` is still **403** (read confers pull, never push).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_authorizer_denies_ungranted_push_admits_admin_grant_reader_cannot_push() {
+    if !require_or_skip("r2.1a live-authorizer push oracle") {
+        return;
+    }
+    let Some(_rootfs) = git_rootfs() else { return };
+
+    let root = temp_root("live-push");
+    // Two server bare repos created WITHOUT the grant seam (a plain backend) → they exist on disk with
+    // NO grant for the pushing principal (the deny-by-default starting state).
+    let plain = DurableGitBackend::rooted_inmem_for_test(root.clone());
+    plain
+        .create_repo("acme", REGION, "widgets", &wire_principal("acme"))
+        .expect("create widgets (no grant)");
+    plain
+        .create_repo("acme", REGION, "docs", &wire_principal("acme"))
+        .expect("create docs (no grant)");
+
+    let (gw, cell, tuples, _backend) = build_live(&root);
+    let addr = spawn(gw).await;
+    let token = mint(&cell, "acme", "jti-live-push");
+    let work = make_work(&root);
+    let pushed_oid = {
+        let o = Command::new("git")
+            .args(["-C", &work.to_string_lossy(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+
+    // ── (a) NO grant → push refused (403), the ref does NOT move ──
+    let (ok_d, _so_d, se_d) = git_push(addr, Some(&token), "/acme/eu-west/widgets.git", &work);
+    println!("=== git push (in-tenant, NO grant) — must be refused ===\nsuccess={ok_d}\nstderr=\n{se_d}");
+    assert!(!ok_d, "an in-tenant principal with NO write grant MUST be refused the push");
+    assert_eq!(
+        durable_tip(&root, "acme", "widgets", "refs/heads/main"),
+        None,
+        "a denied push moves NO ref (no object ingested)"
+    );
+
+    // ── (b) bootstrap ADMIN grant → push succeeds + lands durably ──
+    TupleStoreGrantWriter::new(tuples.clone())
+        .grant_repo_admin(&wire_principal("acme"), &RepoLoc::new("acme", REGION, "widgets"))
+        .expect("bootstrap admin grant");
+    let depth_before = _backend.outbox().outbox_depth();
+    let (ok_a, _so_a, se_a) = git_push(addr, Some(&token), "/acme/eu-west/widgets.git", &work);
+    println!("=== git push (ADMIN grant) — must succeed ===\nsuccess={ok_a}\nstderr=\n{se_a}");
+    assert!(ok_a, "an admin-granted principal pushes end-to-end through the live authorizer");
+    assert_eq!(
+        durable_tip(&root, "acme", "widgets", "refs/heads/main").as_deref(),
+        Some(pushed_oid.as_str()),
+        "the granted push lands durably (a fresh re-open sees the new tip)"
+    );
+    assert_eq!(
+        _backend.outbox().outbox_depth(),
+        depth_before + 1,
+        "the accepted push emits exactly one git.ref.updated"
+    );
+
+    // ── (c) read-only (reader) grant → push still 403 (read ≠ write) ──
+    grant(&tuples, "acme", "docs", "reader");
+    let (ok_r, _so_r, se_r) = git_push(addr, Some(&token), "/acme/eu-west/docs.git", &work);
+    println!("=== git push (READER grant) — must be refused (read ≠ write) ===\nsuccess={ok_r}\nstderr=\n{se_r}");
+    assert!(!ok_r, "a read-only grant does NOT confer push (403)");
+    assert_eq!(
+        durable_tip(&root, "acme", "docs", "refs/heads/main"),
+        None,
+        "the reader-only push moved no ref"
+    );
+
+    println!("=== R2.1a PROVEN (push): un-granted push DENIED (403, 0 ref move); admin grant admits; reader cannot push ===");
     let _ = std::fs::remove_dir_all(&root);
 }
