@@ -186,11 +186,17 @@
 //!   `kms.rs:622` entry is REMOVED. Proven live: `integration_mr025_kms_durable`
 //!   (decrypt-across-restart, wrong-seal-key-fails-closed, + the Wave-5 sync-API write-through
 //!   restart proof). DB-free unit tests reach the double via `myelin-storage/test-support`.
-//! - `myelin-storage/src/reserve_settle.rs:283`          — `CostLedger` reserve/settle in-mem (SI-021 cluster; MR-007/009).
-//!   **MR-009b Wave 6b SUPPLEMENTED (not removed):** the durable FORCE-RLS `cost_reservation`/`cost_event`
-//!   tables + `DurableCostLedger` (migration 0050) exist + are proven live, but flipping durable-by-default
-//!   gates `CostLedger::new()`, which breaks the PRODUCTION `myelin-flow::BudgetGate::new` in-memory
-//!   construction (a product-subsystem budget-gate redesign — semantic decision outside W6b scope).
+//! - **MR-009b W6b2 FLIPPED the `CostLedger` (SI-021) GREEN (6→5):** `reserve_settle.rs:283` is REMOVED.
+//!   `CostLedger` is now a role struct over a `CostBackend` enum whose in-memory `Memory(MemoryCostLedger)`
+//!   arm (the `HashMap`/`Vec`/counter + ALL the reserve/settle arithmetic, the settle cap, the idempotent
+//!   double-settle) + `CostLedger::new()` are `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLES; the
+//!   always-compiled PRODUCTION backend is `Durable(DurableCostLedger)` over the FORCE-RLS
+//!   `cost_reservation`/`cost_event` tables (migration 0050). The W6b honest-STOP's named blocker — the
+//!   product-subsystem budget-gate redesign — is done: `myelin-flow::BudgetGate::new` is now `test-support`-
+//!   gated + `BudgetGate::with_pg`/`new_durable` are the always-compiled production constructors. The scanner
+//!   strips the `test-support`-gated `Memory` arm, so the production enum presents non-in-memory → REMOVED.
+//!   Proven live (`integration_mr009b_w6b_storage_ledgers`); DB-free unit tests use the double via
+//!   `myelin-storage/test-support`.
 //! - **MR-009b Wave 6b FLIPPED the 2 in-crate storage ERASURE ledgers GREEN (9→7):**
 //!   `restore_verify.rs:175` `ErasureLedger` (SI-036) and `reerase.rs:156` `InMemoryPostPitLedger`
 //!   (P-ST-14) are now durable-by-default. Their in-memory backings (`ErasureLedger`'s `Memory(Arc<Mutex<
@@ -496,12 +502,13 @@ const BASELINE: &[(&str, &str, usize)] = &[
     //      always-compiled production ledgers are the pool-backed `restore_verify_durable::
     //      DurableRestoreErasureLedger` (non-shred-erasable `restore_erasure_ledger`, migration 0051,
     //      carrying the R1 §7.6 completion-offset fold-in) + `reerase_durable::DurablePostPitLedger`
-    //      (non-shred-erasable `post_pit_erasure_ledger`, 0052). The sibling `reserve_settle.rs:283`
-    //      `CostLedger` STAYS (SUPPLEMENTED not removed): its durable backing + FORCE-RLS tables exist
-    //      (`reserve_settle_durable`, 0050) and are proven live, but flipping it durable-by-default
-    //      requires gating `CostLedger::new()`, which breaks the PRODUCTION `myelin-flow::BudgetGate::new`
-    //      → `ci-controlplane::metering` in-memory construction (a product-subsystem budget-gate durable
-    //      redesign — a semantic decision outside W6b's in-crate scope; see the residual note below).
+    //      (non-shred-erasable `post_pit_erasure_ledger`, 0052). MR-009b W6b2 then FLIPPED the sibling
+    //      `reserve_settle.rs:283` `CostLedger` (SI-021) durable-by-default (6→5) — REMOVED from this
+    //      group: it is now a `CostBackend` role struct (the `Memory(MemoryCostLedger)` arm + `CostLedger::
+    //      new()` are `test-support`-gated; the always-compiled `Durable(DurableCostLedger)` arm over the
+    //      FORCE-RLS `cost_reservation`/`cost_event` tables, 0050, is production), and the budget-gate
+    //      redesign the W6b honest-STOP named is done (`myelin-flow::BudgetGate::with_pg`/`new_durable` are
+    //      the always-compiled production constructors; `BudgetGate::new` is `test-support`-gated).
     //      spine durable-persistence waves (P-522/523); MR-009b Wave 2 flipped the 3 identity spine
     //      stores (principal/tuple/revocation) durable-by-default → removed (17→14); MR-009b Wave 3
     //      flipped the events `DedupLedger` (SI-023) durable-by-default → `dedup.rs:141` removed
@@ -595,18 +602,18 @@ const BASELINE: &[(&str, &str, usize)] = &[
     // restore-inside-window resurrection by comparing the restore PIT vs the completion offset. The
     // production enum presents non-in-memory → the scanner no longer fires. Proven live
     // (`integration_mr009b_w6b_storage_ledgers`).
-    // `CostLedger` (reserve_settle.rs:283, SI-021) — SUPPLEMENTED not removed by MR-009b Wave 6b: the
-    // durable FORCE-RLS `cost_reservation`/`cost_event` tables + `DurableCostLedger` backing (migration
-    // 0050) exist and are proven live (idempotent double-settle + settle-capped on Pg), BUT the
-    // in-memory `CostLedger` is STILL the default. Flipping it durable-by-default gates `CostLedger::new()`,
-    // which breaks the PRODUCTION in-memory construction in `myelin-flow::BudgetGate::new` (called by
-    // `ci-controlplane::metering`) — a product-subsystem budget-gate durable redesign, a semantic
-    // decision outside W6b's in-crate storage scope. Removed when flow's budget gate is wired durable.
-    (
-        "no-in-memory-durable-store",
-        "crates/myelin-storage/src/reserve_settle.rs",
-        283,
-    ),
+    // `CostLedger` (reserve_settle.rs:283, SI-021) — REMOVED by MR-009b W6b2: it is now a role struct
+    // over a `CostBackend` enum whose in-memory `Memory(MemoryCostLedger)` arm (the `HashMap`/`Vec`/counter
+    // + ALL the reserve/settle arithmetic + the settle cap + the idempotent double-settle) + `CostLedger::new()`
+    // are `#[cfg(any(test, feature = "test-support"))]` TEST DOUBLES; the always-compiled PRODUCTION backend
+    // is `Durable(DurableCostLedger)` over the FORCE-RLS `cost_reservation`/`cost_event` tables (migration
+    // 0050). The product-subsystem budget-gate redesign that the W6b honest-STOP named is done: `myelin-flow::
+    // BudgetGate::new` is now `test-support`-gated + `BudgetGate::with_pg`/`new_durable` are the always-compiled
+    // production constructors (`ci-controlplane::metering` borrows the gate, builds no ledger). The scanner
+    // strips the `test-support`-gated `Memory` arm, so the production enum presents non-in-memory → the entry
+    // is REMOVED. Durable-by-default proven live (`integration_mr009b_w6b_storage_ledgers`, W6b2 leg —
+    // idempotent double-settle + settle-capped + fresh-pool survival on Pg); DB-free unit tests use the double
+    // via `myelin-storage/test-support`.
     // -- closed false-negatives (verifier MR-004 review): FsBlobStore / audit sink --
     // (`InMemoryPostPitLedger`, reerase.rs:156 — the `records: Vec<ErasureRecord>` false-negative —
     //  was here; MR-009b Wave 6b FLIPPED it GREEN: the struct + its impls + `::new()` are now
@@ -720,21 +727,21 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
     // un-wired gate). The counts pin the manifest shape.
     assert_eq!(
         BASELINE.len(),
-        4,
-        "the committed baseline has 4 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
+        3,
+        "the committed baseline has 3 entries (MR-009b Wave 2 flipped the 3 identity spine stores \
          GREEN: 17 → 14; Wave 3 flipped the events `DedupLedger` (SI-023) → 14 → 13; Wave 5 flipped \
          the `KmsEngine` (SI-006) → 13 → 12; Wave 6a flipped the 2 identity S2 pseudonym holders → \
          12 → 10; Wave 6b flipped the 2 in-crate storage ERASURE ledgers — `restore_verify.rs:175` \
-         `ErasureLedger` + `reerase.rs:156` `InMemoryPostPitLedger` — durable-by-default → 10 → 8 \
-         (the sibling `reserve_settle.rs:283` `CostLedger` is SUPPLEMENTED not removed: its durable \
-         backing exists but the flip awaits the flow/ci budget-gate durable redesign); W6c-events \
-         flipped the events `BusErasureLedger` (SI-039) durable-by-default via the DedupLedger \
-         trait-seam pattern → 8 → 7; W6c-cp flipped the control-plane `CellResolverRegistry` (SI-052) \
-         durable-by-default via a boot-time projection of the durable `cell.endpoint` → 7 → 6; \
+         `ErasureLedger` + `reerase.rs:156` `InMemoryPostPitLedger` — durable-by-default → 10 → 8; \
+         W6c-events flipped the events `BusErasureLedger` (SI-039) durable-by-default via the \
+         DedupLedger trait-seam pattern → 8 → 7; W6c-cp flipped the control-plane `CellResolverRegistry` \
+         (SI-052) durable-by-default via a boot-time projection of the durable `cell.endpoint` → 7 → 6; \
          W6d flipped the control-plane `Registry` (SI-011) + `MisrouteAudit` (SI-028) \
          durable-by-default — the whole-surface backend enum over the extended placement backing \
          (repo_placement/cell_provisioning/local_tenant, 0035–0039) + the durable audit sink wired \
-         at the gateway → 6 → 4)"
+         at the gateway → 6 → 4; and W6b2 flipped the sibling `reserve_settle.rs:283` `CostLedger` \
+         (SI-021) durable-by-default via the `CostBackend` role-struct + the \
+         `myelin-flow::BudgetGate::with_pg` injection — closing the W6b honest-STOP → 4 → 3)"
     );
     let structural = BASELINE
         .iter()
@@ -757,8 +764,8 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          to the CI track."
     );
     assert_eq!(
-        in_memory, 3,
-        "3 in-memory durable-store sites: Waves 2/3/5/6a flipped the identity spine + events \
+        in_memory, 2,
+        "2 in-memory durable-store sites: Waves 2/3/5/6a flipped the identity spine + events \
          DedupLedger + KmsEngine + the 2 S2 pseudonym holders durable-by-default (16→9); \
          MR-009b Wave 6b FLIPPED the 2 in-crate storage ERASURE ledgers durable-by-default (9→7): \
          `restore_verify.rs:175` `ErasureLedger` (now a backend enum over the non-shred-erasable \
@@ -772,16 +779,20 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
          (SI-052) durable-by-default (7→6) via a boot-time PROJECTION of the durable `cell.endpoint` \
          (the `Projected(Arc<dyn ResolverProjection>)` production arm; the `Memory(HashMap<…>)` arm + \
          `::new()`/`register()` are `test-support`-gated doubles; projection in \
-         `cross_cell_bridge_durable`, fail-loud on a missing/unresolvable endpoint); and W6d FLIPPED \
-         the control-plane `Registry` (SI-011) + `MisrouteAudit` (SI-028) durable-by-default (5→3): \
+         `cross_cell_bridge_durable`, fail-loud on a missing/unresolvable endpoint); W6d FLIPPED \
+         the control-plane `Registry` (SI-011) + `MisrouteAudit` (SI-028) durable-by-default: \
          the whole-surface `RegistryBackend` enum over the EXTENDED placement backing (repo_placement \
-         + its residency-pin DB trigger, cell_provisioning, local_tenant — migrations 0035–0039) and \
-         the `MisrouteAuditBackend` enum over the MR-024 durable sink, both `test-support`-gating \
-         their Memory arms + in-memory ctors (`Registry::new`, `MisrouteAudit::new`, \
-         `CellGateway::new`), the self-host boot re-pointed via `with_pg`. The remaining 3 \
-         (events OUTBOX (SI-007); storage `reserve_settle.rs:283` `CostLedger` (SUPPLEMENTED — \
-         durable backing exists, flip awaits the flow/ci budget-gate durable redesign) + \
-         `blob.rs:362`) flip in the later waves."
+         + its residency-pin DB trigger + tenant-delete-RESTRICT FK, cell_provisioning, local_tenant \
+         — migrations 0035–0039) and the `MisrouteAuditBackend` enum over the MR-024 durable sink, \
+         both `test-support`-gating their Memory arms + in-memory ctors (`Registry::new`, \
+         `MisrouteAudit::new`, `CellGateway::new`), the self-host boot re-pointed via `with_pg`; and \
+         W6b2 FLIPPED the sibling storage `reserve_settle.rs:283` `CostLedger` (SI-021) \
+         durable-by-default via the `CostBackend` role struct (the `Memory(MemoryCostLedger)` arm + \
+         `CostLedger::new()` are `test-support`-gated; the always-compiled `Durable(DurableCostLedger)` \
+         arm over the FORCE-RLS `cost_reservation`/`cost_event` tables, 0050, is production) + the \
+         `myelin-flow::BudgetGate::with_pg`/`new_durable` injection that closed the W6b honest-STOP. \
+         The remaining 2 (events OUTBOX (SI-007, W3b.6) + storage `blob.rs:362` `FsBlobStore` (W7.3)) \
+         flip in the last waves."
     );
     assert_eq!(
         bare_pool, 0,

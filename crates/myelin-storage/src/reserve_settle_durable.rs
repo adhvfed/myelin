@@ -311,7 +311,7 @@ impl DurableCostLedger {
                     let event = CostEvent {
                         tenant: TenantId(tenant_s.clone()),
                         run: RunId(run_s.clone()),
-                        unit: u.unit,
+                        unit: u.unit.to_string(),
                         wholesale: u.wholesale,
                         markup: u.markup,
                     };
@@ -344,7 +344,7 @@ impl DurableCostLedger {
                     .bind(&region)
                     .bind(&run_s)
                     .bind(ord as i32)
-                    .bind(e.unit)
+                    .bind(e.unit.as_str())
                     .bind(e.wholesale.0 as i64)
                     .bind(e.markup.0 as i64)
                     .execute(&mut *conn)
@@ -527,10 +527,10 @@ fn rows_to_events(tenant_s: &str, run_s: &str, rows: &[sqlx::postgres::PgRow]) -
             CostEvent {
                 tenant: TenantId(tenant_s.to_string()),
                 run: RunId(run_s.to_string()),
-                // The unit label is a `&'static str` in the type; leak the durable string so the
-                // rebuilt event carries the same label (the labels are a small, bounded set — the
-                // metered-unit dimensions — so this is not an unbounded leak in practice).
-                unit: Box::leak(unit.into_boxed_str()),
+                // `CostEvent.unit` is an OWNED `String` (MR-009b W6b2), so the rebuilt event simply
+                // carries the durable label — no `Box::leak` (the pre-W6b2 `&'static str` workaround
+                // is gone).
+                unit,
                 wholesale: MinorUnits((r.get::<i64, _>("wholesale")) as u64),
                 markup: MinorUnits((r.get::<i64, _>("markup")) as u64),
             }
