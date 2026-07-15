@@ -6,7 +6,7 @@
 //! CALLER-SUPPLIED boolean on the MCP `tools/call` body, and the gate id was a deterministic display
 //! string never stored or looked up. **This module is the server-side verdict authority that closes
 //! it**: a gated tool/effect INSERTs a `waiting` row here; approve/reject/expire UPDATE the row's
-//! state (approve enforcing eligibility + distinct-principal SERVER-SIDE); and a re-drive is admitted
+//! state (approve enforcing distinct-HUMAN-approver + eligibility SERVER-SIDE); and a re-drive is admitted
 //! ONLY if the presented `gate_id` is `approved` in THIS store — lookup-able across requests AND
 //! processes (the durable arm). The caller's `approval.granted` boolean is no longer an enforcement
 //! input anywhere.
@@ -18,14 +18,17 @@
 //! (`Memory` — `#[cfg(any(test, feature = "test-support"))]`, stripped by the
 //! `no-in-memory-durable-store` scanner). Same shape as `reserve_settle::CostLedger` / the W3b outbox.
 //!
-//! ## The distinct-approver rule (enforced server-side, twice)
-//! 1. **At decide time** ([`HitlVerdictStore::approve`]): the approver must be a member of the gate's
-//!    `approver_filter` AND must differ from the gate's `requested_by` (the agent principal that
-//!    tripped the gate). A self-approval or an out-of-filter approval is a typed refusal — the row
-//!    stays `waiting`.
+//! ## The distinct-HUMAN-approver rule (enforced server-side, twice)
+//! 1. **At decide time** ([`HitlVerdictStore::approve`]): the approver must be a **`Human`
+//!    principal** (R2.4b — a machine/agent/service principal is refused even if it sits in the
+//!    filter, closing the machine-collusion gap), must be a member of the gate's `approver_filter`,
+//!    AND must differ from the gate's `requested_by` (the agent principal that tripped the gate). A
+//!    non-human, self-, or out-of-filter approval is a typed refusal — the row stays `waiting`.
 //! 2. **At consult time** ([`GateRecord::authorizes`]): the gate admits the re-drive ONLY if it is
 //!    `approved`, its `effect_id` matches the effect being re-driven (an approval is bound to ONE
-//!    effect, never a tool name), and the recorded `decided_by` differs from the requesting principal.
+//!    effect, never a tool name), and the recorded `decided_by` differs from the requesting
+//!    principal. (An `approved` row can only have been reached through the human-gated `approve`
+//!    above, so a machine approver can never have produced one.)
 //!
 //! ## The boot-migration gap this closes (R2.4 grounding)
 //! `myelin-agent-service::migrations` DECLAREs the §4.4 `agent_hitl_gate` shape (migration id
@@ -41,6 +44,7 @@
 
 use crate::migration::{Migration, Migrations};
 use crate::rls::TenantScope;
+use myelin_identity::PrincipalKind;
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 
@@ -85,6 +89,29 @@ CREATE POLICY myelin_tenant_isolation ON agent_hitl_gate \
 /// `all_durable_migrations()` at every service main (W7.2 sequence); idempotent on re-boot.
 pub fn hitl_gate_durable_migrations() -> Migrations {
     Migrations::of([Migration::plain("0054_agent_hitl_gate", AGENT_HITL_GATE_MIGRATION)])
+}
+
+/// **Mint an OPAQUE, unguessable gate id (R2.4 / R2.4b NIT).** 128 bits from the OS CSPRNG
+/// (`aes_gcm::aead::OsRng` — the SAME vetted entropy source `kms.rs` uses for key/nonce material),
+/// hex-encoded as `gate:<32 hex>`. The gate id is the verdict-store PK the MCP layer returns on a
+/// withhold; the caller PRESENTS it to re-drive.
+///
+/// **Defense-in-depth only:** enforcement is the STORED verdict — a re-drive clears the gate only if
+/// that specific row is `approved` for the exact effect by a distinct HUMAN principal (see
+/// [`HitlVerdictStore::approve`] / [`GateRecord::authorizes`]). Guessing an id yields nothing (an
+/// unknown id fetches `None` → fail-closed deny). The unpredictability is a second wall on top of
+/// the verdict check, never the check itself — so a CSPRNG (not a hash of nothing) is the correct
+/// source even though the security does not rest on it.
+pub fn opaque_gate_id() -> String {
+    use aes_gcm::aead::rand_core::RngCore;
+    use aes_gcm::aead::OsRng;
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    let mut s = String::from("gate:");
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 // =================================================================================================
@@ -214,6 +241,11 @@ pub enum GateDecideError {
     /// the approver IS the principal that requested the gated effect — a self-approval is refused
     /// SERVER-SIDE (the distinct-approver rule).
     SelfApproval,
+    /// the approver is NOT a `Human` principal (a machine/agent/service) — the safety-critical HITL
+    /// gate STRUCTURALLY requires a human approver (R2.4b — closes the machine-collusion gap where
+    /// two in-tenant machine principals could clear a gate). Refused even if the machine sits in the
+    /// `approver_filter` and differs from the requester.
+    MachineApproverRefused,
 }
 
 impl core::fmt::Display for GateDecideError {
@@ -229,6 +261,11 @@ impl core::fmt::Display for GateDecideError {
             GateDecideError::SelfApproval => write!(
                 f,
                 "the requesting principal cannot approve its own gate (distinct-approver rule)"
+            ),
+            GateDecideError::MachineApproverRefused => write!(
+                f,
+                "a non-human (machine/agent/service) principal cannot approve a HITL gate — the \
+                 gate structurally requires a distinct HUMAN approver"
             ),
         }
     }
@@ -292,19 +329,28 @@ impl HitlVerdictStore {
     }
 
     /// **APPROVE a waiting gate — the server-side verdict.** Enforced HERE, not at the caller:
-    /// the gate must exist and be `waiting`; `approver` must be in the gate's `approver_filter`;
-    /// and `approver` must DIFFER from the gate's `requested_by` (self-approval refused). On
-    /// success the row is `approved` with `decided_by = approver`.
+    /// the gate must exist and be `waiting`; the `approver` must be a **`Human` principal**
+    /// (`approver_kind` — R2.4b: a machine/agent/service is refused even if listed in the filter);
+    /// `approver` must be in the gate's `approver_filter`; and `approver` must DIFFER from the
+    /// gate's `requested_by` (self-approval refused). On success the row is `approved` with
+    /// `decided_by = approver`. The `approver_kind` is the AUTHENTICATED approver's kind (the same
+    /// principal `decided_by` records) — it is checked, never persisted.
     pub fn approve(
         &mut self,
         scope: &TenantScope,
         gate_id: &str,
         approver: &str,
+        approver_kind: PrincipalKind,
     ) -> Result<(), GateDecideError> {
+        let is_human = matches!(approver_kind, PrincipalKind::Human);
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            HitlVerdictBackend::Memory(m) => m.decide(scope, gate_id, GateState::Approved, Some(approver)),
-            HitlVerdictBackend::Durable(d) => d.decide(scope, gate_id, GateState::Approved, Some(approver)),
+            HitlVerdictBackend::Memory(m) => {
+                m.decide(scope, gate_id, GateState::Approved, Some(approver), is_human)
+            }
+            HitlVerdictBackend::Durable(d) => {
+                d.decide(scope, gate_id, GateState::Approved, Some(approver), is_human)
+            }
         }
     }
 
@@ -317,10 +363,16 @@ impl HitlVerdictStore {
         gate_id: &str,
         decider: &str,
     ) -> Result<(), GateDecideError> {
+        // The human/eligibility checks do NOT apply to a reject (declining grants nothing) — the
+        // `is_human` flag is inert for a non-Approved transition (see `decide_rules`).
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            HitlVerdictBackend::Memory(m) => m.decide(scope, gate_id, GateState::Rejected, Some(decider)),
-            HitlVerdictBackend::Durable(d) => d.decide(scope, gate_id, GateState::Rejected, Some(decider)),
+            HitlVerdictBackend::Memory(m) => {
+                m.decide(scope, gate_id, GateState::Rejected, Some(decider), false)
+            }
+            HitlVerdictBackend::Durable(d) => {
+                d.decide(scope, gate_id, GateState::Rejected, Some(decider), false)
+            }
         }
     }
 
@@ -328,8 +380,8 @@ impl HitlVerdictStore {
     pub fn expire(&mut self, scope: &TenantScope, gate_id: &str) -> Result<(), GateDecideError> {
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            HitlVerdictBackend::Memory(m) => m.decide(scope, gate_id, GateState::Expired, None),
-            HitlVerdictBackend::Durable(d) => d.decide(scope, gate_id, GateState::Expired, None),
+            HitlVerdictBackend::Memory(m) => m.decide(scope, gate_id, GateState::Expired, None, false),
+            HitlVerdictBackend::Durable(d) => d.decide(scope, gate_id, GateState::Expired, None, false),
         }
     }
 
@@ -394,10 +446,11 @@ impl MemoryHitlGates {
         gate_id: &str,
         to: GateState,
         decider: Option<&str>,
+        approver_is_human: bool,
     ) -> Result<(), GateDecideError> {
         let key = Self::key(scope, gate_id);
         let row = self.rows.get_mut(&key).ok_or(GateDecideError::NotFound)?;
-        decide_rules(row, to, decider)?;
+        decide_rules(row, to, decider, approver_is_human)?;
         row.state = to;
         row.decided_by = decider.map(str::to_string);
         Ok(())
@@ -419,10 +472,19 @@ impl MemoryHitlGates {
 }
 
 /// The SHARED decide-time rules (the memory arm applies them in Rust; the durable arm applies the
-/// SAME predicate in one guarded SQL UPDATE — this function is also its pre-read validation so the
-/// refusal is TYPED, not a bare rows-affected-0). Fail-closed: waiting-only; approve additionally
-/// requires eligibility + a distinct approver.
-fn decide_rules(row: &GateRecord, to: GateState, decider: Option<&str>) -> Result<(), GateDecideError> {
+/// SAME predicate as the pre-read validation of its guarded SQL UPDATE, so the refusal is TYPED,
+/// not a bare rows-affected-0). Fail-closed: waiting-only; **approve** additionally requires (in
+/// order) a distinct principal, a HUMAN principal (R2.4b), and membership in the approver filter.
+///
+/// The `approver_is_human` flag is the AUTHENTICATED approver's `PrincipalKind == Human` — it is
+/// only consulted for an `Approved` transition (a reject/expire grants nothing, so the human check
+/// does not apply and the flag is inert).
+fn decide_rules(
+    row: &GateRecord,
+    to: GateState,
+    decider: Option<&str>,
+    approver_is_human: bool,
+) -> Result<(), GateDecideError> {
     if row.state.is_terminal() {
         return Err(GateDecideError::AlreadyDecided(row.state));
     }
@@ -430,9 +492,17 @@ fn decide_rules(row: &GateRecord, to: GateState, decider: Option<&str>) -> Resul
         let Some(approver) = decider else {
             return Err(GateDecideError::NotEligible);
         };
+        // (1) distinct from the requester (self-approval refused first — the most specific fact).
         if approver == row.requested_by {
             return Err(GateDecideError::SelfApproval);
         }
+        // (2) HUMAN — the safety-critical HITL gate structurally requires a human approver, so a
+        //     machine/agent/service in the filter can NEVER clear a gate (the machine-collusion
+        //     gap, R2.4b).
+        if !approver_is_human {
+            return Err(GateDecideError::MachineApproverRefused);
+        }
+        // (3) eligible — in the gate's approver_filter.
         if !row.approver_filter.iter().any(|a| a == approver) {
             return Err(GateDecideError::NotEligible);
         }
@@ -528,6 +598,7 @@ impl DurableHitlGates {
         gate_id: &str,
         to: GateState,
         decider: Option<&str>,
+        approver_is_human: bool,
     ) -> Result<(), GateDecideError> {
         let region = self.region();
         let tenant = scope.tenant().0.clone();
@@ -553,7 +624,7 @@ impl DurableHitlGates {
                     return Ok(Err(GateDecideError::NotFound));
                 };
                 let record = row_to_record(&gate_id, &row);
-                if let Err(e) = decide_rules(&record, to, decider.as_deref()) {
+                if let Err(e) = decide_rules(&record, to, decider.as_deref(), approver_is_human) {
                     return Ok(Err(e));
                 }
                 sqlx::query(
@@ -709,7 +780,7 @@ mod tests {
         let mut s = HitlVerdictStore::new();
         assert!(s.fetch(&scope(), "gate:forged").is_none());
         assert_eq!(
-            s.approve(&scope(), "gate:forged", "psn:lead"),
+            s.approve(&scope(), "gate:forged", "psn:lead", PrincipalKind::Human),
             Err(GateDecideError::NotFound)
         );
     }
@@ -726,19 +797,57 @@ mod tests {
         s.open(&scope(), rec).unwrap();
 
         assert_eq!(
-            s.approve(&scope(), "gate:abc", "agent:claude"),
+            s.approve(&scope(), "gate:abc", "agent:claude", PrincipalKind::Human),
             Err(GateDecideError::SelfApproval),
             "the requester can NEVER approve its own gate"
         );
         assert_eq!(
-            s.approve(&scope(), "gate:abc", "psn:stranger"),
+            s.approve(&scope(), "gate:abc", "psn:stranger", PrincipalKind::Human),
             Err(GateDecideError::NotEligible),
             "an out-of-filter principal cannot approve"
         );
-        s.approve(&scope(), "gate:abc", "psn:lead").expect("an eligible distinct human approves");
+        s.approve(&scope(), "gate:abc", "psn:lead", PrincipalKind::Human)
+            .expect("an eligible distinct human approves");
         let rec = s.fetch(&scope(), "gate:abc").unwrap();
         assert_eq!(rec.state, GateState::Approved);
         assert_eq!(rec.decided_by.as_deref(), Some("psn:lead"));
+    }
+
+    /// **R2.4b — distinct-HUMAN, not just distinct-principal:** a machine/service/agent principal
+    /// that IS in the `approver_filter` and DIFFERS from the requester is STILL refused (the
+    /// machine-collusion gap); an eligible distinct HUMAN succeeds.
+    #[test]
+    fn approve_requires_a_human_principal_not_merely_a_distinct_one() {
+        let machine_kinds = [
+            PrincipalKind::Service,
+            PrincipalKind::Agent {
+                runtime_ref: myelin_identity::RuntimeRef("rt-2".into()),
+                on_behalf_of: None,
+            },
+        ];
+        for kind in machine_kinds {
+            let mut s = HitlVerdictStore::new();
+            // A SECOND machine principal, listed in the filter and distinct from the requester.
+            let mut rec = waiting("gate:m");
+            rec.approver_filter.push("machine:ci-bot".into());
+            s.open(&scope(), rec).unwrap();
+            assert_eq!(
+                s.approve(&scope(), "gate:m", "machine:ci-bot", kind),
+                Err(GateDecideError::MachineApproverRefused),
+                "a distinct, in-filter MACHINE approver is still refused (distinct-HUMAN rule)"
+            );
+            // the refused approval left the gate undecided.
+            assert_eq!(s.fetch(&scope(), "gate:m").unwrap().state, GateState::Waiting);
+        }
+
+        // A distinct eligible HUMAN clears the same gate.
+        let mut s = HitlVerdictStore::new();
+        let mut rec = waiting("gate:m2");
+        rec.approver_filter.push("machine:ci-bot".into());
+        s.open(&scope(), rec).unwrap();
+        s.approve(&scope(), "gate:m2", "psn:lead", PrincipalKind::Human)
+            .expect("a human approver clears the gate");
+        assert_eq!(s.fetch(&scope(), "gate:m2").unwrap().state, GateState::Approved);
     }
 
     /// A terminal gate never re-transitions (double-decide refused, both directions).
@@ -746,9 +855,9 @@ mod tests {
     fn a_terminal_gate_refuses_re_decision() {
         let mut s = HitlVerdictStore::new();
         s.open(&scope(), waiting("gate:a")).unwrap();
-        s.approve(&scope(), "gate:a", "psn:lead").unwrap();
+        s.approve(&scope(), "gate:a", "psn:lead", PrincipalKind::Human).unwrap();
         assert_eq!(
-            s.approve(&scope(), "gate:a", "psn:maintainer"),
+            s.approve(&scope(), "gate:a", "psn:maintainer", PrincipalKind::Human),
             Err(GateDecideError::AlreadyDecided(GateState::Approved))
         );
         assert_eq!(
@@ -760,7 +869,7 @@ mod tests {
         s2.open(&scope(), waiting("gate:b")).unwrap();
         s2.reject(&scope(), "gate:b", "psn:lead").unwrap();
         assert_eq!(
-            s2.approve(&scope(), "gate:b", "psn:lead"),
+            s2.approve(&scope(), "gate:b", "psn:lead", PrincipalKind::Human),
             Err(GateDecideError::AlreadyDecided(GateState::Rejected)),
             "a rejected gate can never be flipped to approved"
         );
@@ -778,7 +887,7 @@ mod tests {
         let rec = s.fetch(&scope(), "gate:a").unwrap();
         assert!(!rec.authorizes("gate:git.merge:myelin://acme/git/pr/40", "agent:claude"));
 
-        s.approve(&scope(), "gate:a", "psn:lead").unwrap();
+        s.approve(&scope(), "gate:a", "psn:lead", PrincipalKind::Human).unwrap();
         let rec = s.fetch(&scope(), "gate:a").unwrap();
         assert!(
             rec.authorizes("gate:git.merge:myelin://acme/git/pr/40", "agent:claude"),
@@ -822,7 +931,7 @@ mod tests {
             "a decided gate is no longer waiting"
         );
         assert_eq!(
-            s.approve(&scope(), "gate:a", "psn:lead"),
+            s.approve(&scope(), "gate:a", "psn:lead", PrincipalKind::Human),
             Err(GateDecideError::AlreadyDecided(GateState::Expired)),
             "an expired gate is terminal (auto-deny holds)"
         );

@@ -146,7 +146,7 @@ impl McpServer {
 
         // HITL (R2.4): a re-drive after a human approved the card PRESENTS the server-issued
         // opaque gate id (`approval.gateId`); the router looks it up in the SERVER-SIDE verdict
-        // store and proceeds only if THAT gate is Approved there by a distinct principal. The
+        // store and proceeds only if THAT gate is Approved there by a distinct HUMAN principal. The
         // legacy caller-supplied `approval.granted` boolean is deliberately NOT read — it is inert
         // on the wire and never an enforcement input (the 2026-07-06 HIGH finding).
         let presented_gate_id = params

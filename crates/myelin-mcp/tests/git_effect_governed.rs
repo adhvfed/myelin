@@ -225,7 +225,7 @@ fn merge_is_hitl_gated_then_reflects_the_server_gate_block() {
     server
         .router()
         .unwrap()
-        .approve_gate(&PrincipalId("human:operator".into()), &gate_id)
+        .approve_gate(&human_principal("human:operator"), &gate_id)
         .expect("the human operator approves the merge card");
     let denied = server
         .handle_line(&call_with_gate(

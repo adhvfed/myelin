@@ -43,7 +43,9 @@ use myelin_identity::{
 use myelin_identity_service::delegation::DelegationInput;
 use myelin_identity_service::machine_auth::MachineKind;
 use myelin_identity_service::mint::RunTokenMinter;
-use myelin_storage::hitl_gate_durable::{GateDecideError, GateRecord, GateState, HitlVerdictStore};
+use myelin_storage::hitl_gate_durable::{
+    opaque_gate_id, GateDecideError, GateRecord, GateState, HitlVerdictStore,
+};
 use myelin_storage::TenantScope;
 
 use crate::registry::RegisteredTool;
@@ -353,12 +355,19 @@ impl GovernedRouter {
         gate_id
     }
 
-    /// **The server-side APPROVAL surface (R2.4).** The human decision path (the approval card /
-    /// operator surface) calls this — never the MCP client. The store enforces eligibility
-    /// (approver ∈ the gate's `approver_filter`) and the distinct-approver rule (approver ≠ the
-    /// gate's requester) SERVER-SIDE; a refusal leaves the gate `waiting`.
-    pub fn approve_gate(&self, approver: &PrincipalId, gate_id: &str) -> Result<(), GateDecideError> {
-        self.verdicts.borrow_mut().approve(&self.principal.scope, gate_id, &approver.0)
+    /// **The server-side APPROVAL surface (R2.4 / R2.4b).** The human decision path (the approval
+    /// card / operator surface) calls this — never the MCP client. It takes the AUTHENTICATED
+    /// approver `Principal` (not a bare id) so the store can enforce, SERVER-SIDE: the approver is a
+    /// **`Human`** (R2.4b — a machine/agent/service is refused even if listed), is eligible
+    /// (∈ the gate's `approver_filter`), and is distinct from the gate's requester. A refusal
+    /// leaves the gate `waiting`.
+    pub fn approve_gate(&self, approver: &Principal, gate_id: &str) -> Result<(), GateDecideError> {
+        self.verdicts.borrow_mut().approve(
+            &self.principal.scope,
+            gate_id,
+            &approver.principal_id.0,
+            approver.kind.clone(),
+        )
     }
 
     /// **The server-side REJECT surface (R2.4).** Settles the gate `rejected` — the effect is
@@ -391,17 +400,6 @@ impl GovernedRouter {
 /// `git.merge {number: 8}` — the approval is bound to the exact effect, not the tool name.
 pub fn mcp_effect_key(tool: &str, args: &serde_json::Value) -> String {
     format!("mcp:{tool}:{args}")
-}
-
-/// **Mint an OPAQUE, unguessable gate id (R2.4).** 128 bits drawn from two independently
-/// OS-entropy-seeded `RandomState` hashers — never the old deterministic `hitl:{jti}:{tool}`
-/// display string a caller could predict. The id is the verdict-store PK; enforcement is the
-/// stored verdict (the opacity is defence in depth on top of it).
-fn opaque_gate_id() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    let a = std::collections::hash_map::RandomState::new().build_hasher().finish();
-    let b = std::collections::hash_map::RandomState::new().build_hasher().finish();
-    format!("gate:{a:016x}{b:016x}")
 }
 
 /// Build the [`RunCtx`] an effect is applied under — it carries the run-token `jti` + the principal +
