@@ -154,7 +154,7 @@ pub struct FailStaticCache<C: Clock = SystemClock> {
     /// The substrate bounded-staleness fail-static mechanism (P-S18). The `static_max` (W) it was
     /// constructed with is the thresholds-file bound; the constructor enforced
     /// `agent_token_ttl ≤ static_max ≤ revocation_sla` structurally.
-    inner: Arc<FailStatic<CoarseGrant, C>>,
+    inner: Arc<FailStatic<S6Key, CoarseGrant, C>>,
     /// The S7 revocation list / token denylist (P-ID-14) consulted on EVERY served answer — the
     /// just-revoked / SCIM-disabled subject is denied through a stale cache (the §4 authoritative
     /// deny path; the F7 / ID-D2 correctness floor). Shared so a `revoke` elsewhere is seen here.

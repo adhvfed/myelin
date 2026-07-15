@@ -268,22 +268,27 @@ impl FailStaticSignals {
 /// Units (frozen, §2.10): `fresh_ttl` / `static_max` are **seconds**. The constructor enforces
 /// `agent_token_ttl ≤ static_max ≤ revocation_sla` (architecture §8.2) — a violating value does not
 /// construct. The VALUE of `static_max` (W) is `[OPEN — LEGAL]`; the DPO ratifies it (L-1).
-pub struct FailStatic<T, C: Clock = SystemClock> {
+pub struct FailStatic<K, T, C: Clock = SystemClock> {
     /// serve fresh within this (seconds).
     fresh_ttl: Seconds,
     /// serve STALE (degraded marker) up to here on a hiccup (seconds); ≤ revocation SLA,
     /// ≥ agent-token TTL.
     static_max: Seconds,
     clock: C,
-    cache: Mutex<HashMap<u64, Entry<T>>>,
-    // Hash of the actual key → bucket; we key the cache by the key's hash so `K` need not be stored.
+    // The cache is keyed by the REAL key `K` (compared with `Eq`, hashed by `HashMap`'s own SipHash)
+    // — NOT by a 64-bit digest of it. Two distinct logical keys that happen to collide in a 64-bit
+    // hash therefore land in DISTINCT `HashMap` entries (the hash is a bucket index; equality is
+    // settled on the stored key), so one key can NEVER be served another key's cached answer. This
+    // is a security invariant on the authz read path (R2.3): a bare-hash discriminator would let one
+    // principal's cached ALLOW be replayed for a different (principal, permission, object) question.
+    cache: Mutex<HashMap<K, Entry<T>>>,
     fresh_count: AtomicU64,
     stale_count: AtomicU64,
     closed_count: AtomicU64,
     last_staleness_secs: AtomicU64,
 }
 
-impl<T, C: Clock> std::fmt::Debug for FailStatic<T, C> {
+impl<K, T, C: Clock> std::fmt::Debug for FailStatic<K, T, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Deliberately does NOT print the cached values (they are the coarse authz answers —
         // not for the log). Only the window bounds + the signal counters.
@@ -297,7 +302,7 @@ impl<T, C: Clock> std::fmt::Debug for FailStatic<T, C> {
     }
 }
 
-impl<T: Clone> FailStatic<T, SystemClock> {
+impl<K: Hash + Eq, T: Clone> FailStatic<K, T, SystemClock> {
     /// Construct against the wall clock, enforcing the §8.2 staleness bound. The `static_max` value
     /// is the DPO-ratified W (read from the thresholds file by the caller); a value violating
     /// `agent_token_ttl ≤ static_max ≤ revocation_sla` (or `fresh_ttl > static_max`) is REJECTED.
@@ -310,7 +315,7 @@ impl<T: Clone> FailStatic<T, SystemClock> {
     }
 }
 
-impl<T: Clone, C: Clock> FailStatic<T, C> {
+impl<K: Hash + Eq, T: Clone, C: Clock> FailStatic<K, T, C> {
     /// Construct against an injected clock (the boundary drills use a [`TestClock`]). Enforces the
     /// §8.2 staleness bound structurally — the only place `static_max` is validated, so a bad value
     /// cannot reach the hot path.
@@ -380,15 +385,14 @@ impl<T: Clone, C: Clock> FailStatic<T, C> {
     ///   - `age > static_max` → [`Answer::Closed`] (staleness budget spent; deny is correct).
     /// - upstream hiccups and NO cached value exists → [`Answer::Closed`] (we never fabricate an
     ///   answer; **never fail open**).
-    pub fn get<K: Hash>(&self, key: K, refresh: impl Fn() -> Result<T, ServeError>) -> Answer<T> {
-        let bucket = hash_key(&key);
+    pub fn get(&self, key: K, refresh: impl Fn() -> Result<T, ServeError>) -> Answer<T> {
         match refresh() {
             Ok(value) => {
                 let now = self.clock.now_secs();
                 {
                     let mut cache = self.cache.lock().expect("fail-static cache poisoned");
                     cache.insert(
-                        bucket,
+                        key,
                         Entry {
                             value: value.clone(),
                             cached_at_secs: now,
@@ -399,20 +403,23 @@ impl<T: Clone, C: Clock> FailStatic<T, C> {
                 self.last_staleness_secs.store(0, Ordering::SeqCst);
                 Answer::Fresh(value)
             }
-            Err(_hiccup) => self.serve_from_cache(bucket, &refresh),
+            Err(_hiccup) => self.serve_from_cache(key, &refresh),
         }
     }
 
     /// The hiccup path: fall back to the last known-good cached value within the bounded-staleness
     /// budget — NEVER fabricate or escalate. Factored out so the boundary logic is one testable unit.
+    ///
+    /// Lookup is by the REAL key (`cache.get(&key)`, `Eq`-compared) — never a bare 64-bit digest —
+    /// so a different logical key that collides in the hash cannot borrow this key's entry (R2.3).
     fn serve_from_cache(
         &self,
-        bucket: u64,
+        key: K,
         refresh: &impl Fn() -> Result<T, ServeError>,
     ) -> Answer<T> {
         let now = self.clock.now_secs();
         let cache = self.cache.lock().expect("fail-static cache poisoned");
-        let Some(entry) = cache.get(&bucket) else {
+        let Some(entry) = cache.get(&key) else {
             // No fallback to serve → fail CLOSED (never open).
             drop(cache);
             self.closed_count.fetch_add(1, Ordering::SeqCst);
@@ -436,7 +443,7 @@ impl<T: Clone, C: Clock> FailStatic<T, C> {
             // best-effort refresh, and a real ASYNC refresh task lands with the production runtime
             // (a `tokio` task pool) when the service shells carry one. We DO attempt it so a
             // recovered upstream re-freshes the cache.
-            self.try_background_refresh(bucket, refresh);
+            self.try_background_refresh(key, refresh);
             self.stale_count.fetch_add(1, Ordering::SeqCst);
             self.last_staleness_secs.store(age, Ordering::SeqCst);
             Answer::Static(value)
@@ -452,12 +459,12 @@ impl<T: Clone, C: Clock> FailStatic<T, C> {
     /// cache is refreshed so the NEXT read is fresh again; if it is still hiccupping, nothing
     /// changes (the staleness clock keeps running toward `static_max`). The caller's answer is NOT
     /// affected — they already hold the stale value.
-    fn try_background_refresh(&self, bucket: u64, refresh: &impl Fn() -> Result<T, ServeError>) {
+    fn try_background_refresh(&self, key: K, refresh: &impl Fn() -> Result<T, ServeError>) {
         if let Ok(value) = refresh() {
             let now = self.clock.now_secs();
             let mut cache = self.cache.lock().expect("fail-static cache poisoned");
             cache.insert(
-                bucket,
+                key,
                 Entry {
                     value,
                     cached_at_secs: now,
@@ -476,14 +483,6 @@ impl<T: Clone, C: Clock> FailStatic<T, C> {
             last_staleness_secs: self.last_staleness_secs.load(Ordering::SeqCst),
         }
     }
-}
-
-/// Hash a key into the cache bucket (so the cache need not store `K`, only `T`).
-fn hash_key<K: Hash>(key: &K) -> u64 {
-    use std::hash::Hasher;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut h);
-    h.finish()
 }
 
 #[cfg(test)]
@@ -510,7 +509,7 @@ mod tests {
     fn constructor_rejects_static_max_over_revocation_sla() {
         // static_max (301) > revocation SLA (300) → REJECTED (a revoked actor would outlive N).
         let err =
-            FailStatic::<u32>::try_new(30, 301, drill_bound()).expect_err("must reject > SLA");
+            FailStatic::<&str, u32>::try_new(30, 301, drill_bound()).expect_err("must reject > SLA");
         assert_eq!(
             err,
             FailStaticError::ExceedsRevocationSla {
@@ -524,7 +523,7 @@ mod tests {
     fn constructor_rejects_static_max_under_agent_token_ttl() {
         // static_max (59) < agent-token TTL (60) → REJECTED (the window must contain the token).
         let err =
-            FailStatic::<u32>::try_new(30, 59, drill_bound()).expect_err("must reject < token TTL");
+            FailStatic::<&str, u32>::try_new(30, 59, drill_bound()).expect_err("must reject < token TTL");
         assert_eq!(
             err,
             FailStaticError::BelowAgentTokenTtl {
@@ -537,7 +536,7 @@ mod tests {
     #[test]
     fn constructor_rejects_fresh_over_static() {
         // fresh_ttl (200) > static_max (120) → REJECTED (the ladder must be monotone).
-        let err = FailStatic::<u32>::try_new(200, 120, drill_bound())
+        let err = FailStatic::<&str, u32>::try_new(200, 120, drill_bound())
             .expect_err("must reject fresh>static");
         assert_eq!(
             err,
@@ -551,11 +550,11 @@ mod tests {
     #[test]
     fn constructor_admits_at_the_exact_boundaries() {
         // static_max == revocation SLA (300) AND == a value ≥ agent-token TTL: admitted (≤ / ≥).
-        FailStatic::<u32>::try_new(30, 300, drill_bound()).expect("== SLA is admitted (≤)");
+        FailStatic::<&str, u32>::try_new(30, 300, drill_bound()).expect("== SLA is admitted (≤)");
         // static_max == agent-token TTL (60): admitted (≥ is inclusive).
-        FailStatic::<u32>::try_new(30, 60, drill_bound()).expect("== token TTL is admitted (≥)");
+        FailStatic::<&str, u32>::try_new(30, 60, drill_bound()).expect("== token TTL is admitted (≥)");
         // fresh_ttl == static_max: admitted (≤ is inclusive).
-        FailStatic::<u32>::try_new(120, 120, drill_bound()).expect("fresh==static is admitted");
+        FailStatic::<&str, u32>::try_new(120, 120, drill_bound()).expect("fresh==static is admitted");
     }
 
     // ----- the get() boundaries: fresh / stale / closed (architecture §8) -----
@@ -563,7 +562,7 @@ mod tests {
     #[test]
     fn fresh_within_ttl_then_stale_then_closed_at_the_boundaries() {
         let clock = TestClock::at(1_000);
-        let fs = FailStatic::<u32, _>::try_new_with_clock(30, 300, drill_bound(), clock)
+        let fs = FailStatic::<&str, u32, _>::try_new_with_clock(30, 300, drill_bound(), clock)
             .expect("valid bound");
 
         // 1) a successful read caches + returns Fresh.
@@ -607,7 +606,7 @@ mod tests {
     #[test]
     fn never_fails_open_with_no_cached_value() {
         // a hiccup before ANY successful read → Closed (no fabricated answer; never open).
-        let fs = FailStatic::<u32>::try_new(30, 300, drill_bound()).expect("valid");
+        let fs = FailStatic::<&str, u32>::try_new(30, 300, drill_bound()).expect("valid");
         assert_eq!(fs.get("cold", fail_once()), Answer::Closed);
     }
 
@@ -616,7 +615,7 @@ mod tests {
         // the static (degraded) answer is the LAST CACHED value — never a fabricated/escalated one.
         let clock = TestClock::at(0);
         let fs =
-            FailStatic::<u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
+            FailStatic::<&str, u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
         assert_eq!(fs.get("k", || Ok(42u32)), Answer::Fresh(42));
         fs_clock(&fs).advance(50); // inside static_max, past fresh_ttl
         match fs.get("k", fail_once()) {
@@ -631,7 +630,7 @@ mod tests {
     fn stale_while_revalidate_refreshes_when_upstream_recovers() {
         let clock = TestClock::at(0);
         let fs =
-            FailStatic::<u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
+            FailStatic::<&str, u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
         assert_eq!(fs.get("k", || Ok(1u32)), Answer::Fresh(1));
         fs_clock(&fs).advance(50);
         // upstream has recovered: the read returns the NEW value Fresh, AND the background path is
@@ -651,7 +650,7 @@ mod tests {
     fn signals_count_fresh_stale_closed_and_staleness_age() {
         let clock = TestClock::at(0);
         let fs =
-            FailStatic::<u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
+            FailStatic::<&str, u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
         assert_eq!(fs.get("k", || Ok(5u32)), Answer::Fresh(5)); // fresh #1
         fs_clock(&fs).advance(50);
         assert_eq!(fs.get("k", fail_once()), Answer::Static(5)); // stale #1, age 50
@@ -735,7 +734,7 @@ mod tests {
     fn background_refresh_restamps_the_cache_on_recovery() {
         let clock = TestClock::at(0);
         let fs =
-            FailStatic::<u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
+            FailStatic::<&str, u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
         assert_eq!(fs.get("k", || Ok(1u32)), Answer::Fresh(1));
         fs_clock(&fs).advance(50); // inside static_max, past fresh_ttl → stale
 
@@ -770,13 +769,64 @@ mod tests {
     /// cross-actor authorization leak).
     #[test]
     fn distinct_keys_do_not_share_a_cache_bucket() {
-        let fs = FailStatic::<u32>::try_new(30, 300, drill_bound()).expect("valid");
+        let fs = FailStatic::<&str, u32>::try_new(30, 300, drill_bound()).expect("valid");
         assert_eq!(fs.get("actor:alice", || Ok(1u32)), Answer::Fresh(1));
         // a DIFFERENT key has no cached value → a hiccup must be Closed (never alice's value).
         assert_eq!(
             fs.get("actor:bob", fail_once()),
             Answer::Closed,
             "bob has no cache of his own — must NOT borrow alice's bucket"
+        );
+    }
+
+    /// **R2.3 — the ALIASING test: two DISTINCT keys that COLLIDE in the hash never share an entry.**
+    /// The old cache keyed by a bare 64-bit hash of the key, so any two logical keys whose 64-bit
+    /// digest collided served each other's cached answer — on the authz read path, one principal's
+    /// cached ALLOW replayed for a DIFFERENT (principal, permission, object) question. This test pins
+    /// that shut: a pathological key type whose `Hash` is a CONSTANT (every key hashes identically —
+    /// the worst-case collision) but whose `Eq` is honest. We cache under key A during a healthy read,
+    /// then look up key B (≠ A, same hash) during a simulated hiccup: B must get `Closed` (a genuine
+    /// miss — it has no cached entry of its own), NEVER A's `Fresh`/`Static` value. Full-key `Eq`
+    /// comparison, not the hash, decides — so the collision cannot leak A's answer to B.
+    #[test]
+    fn colliding_hash_distinct_keys_never_alias_each_others_cached_answer() {
+        // A key whose Hash ALWAYS collides (constant), but whose Eq is by the real id — the exact
+        // pathological shape a 64-bit-hash cache would confuse, and full-key comparison must not.
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct Collide(&'static str);
+        impl std::hash::Hash for Collide {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                // EVERY instance hashes to the same bucket — forces the collision the old cache aliased.
+                0u8.hash(state);
+            }
+        }
+
+        let fs = FailStatic::<Collide, u32>::try_new(30, 300, drill_bound()).expect("valid");
+        let alice = Collide("principal:alice|read@doc:1");
+        let bob = Collide("principal:bob|read@doc:1"); // ≠ alice by Eq, IDENTICAL hash bucket.
+        assert_ne!(alice, bob, "the two keys are DISTINCT by Eq");
+
+        // Alice's healthy read caches an ALLOW-shaped value under her real key.
+        assert_eq!(fs.get(alice.clone(), || Ok(1u32)), Answer::Fresh(1));
+
+        // Bob asks his question during a hiccup. Despite hashing to Alice's bucket, Bob has NO cached
+        // entry of his own → he MUST fail Closed. He must NEVER be served Alice's Fresh/Static value.
+        let bob_answer = fs.get(bob, fail_once());
+        assert_eq!(
+            bob_answer,
+            Answer::Closed,
+            "a hash-colliding distinct key must MISS (Closed) — never borrow the other key's entry"
+        );
+        assert!(
+            !matches!(bob_answer, Answer::Fresh(_) | Answer::Static(_)),
+            "a colliding key must NEVER observe another key's cached answer (the R2.3 leak)"
+        );
+
+        // And Alice's OWN entry is untouched — a hiccup still serves her cached value (Fresh at age 0).
+        assert_eq!(
+            fs.get(alice, fail_once()),
+            Answer::Fresh(1),
+            "the real key still resolves to its own entry after the colliding lookup"
         );
     }
 
@@ -828,7 +878,7 @@ mod tests {
     fn debug_shows_bounds_and_counters_not_cached_values() {
         let clock = TestClock::at(0);
         let fs =
-            FailStatic::<u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
+            FailStatic::<&str, u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
         // 57005 == 0xDEAD: a recognisable cached value we assert never appears in the debug output.
         assert_eq!(fs.get("k", || Ok(57005_u32)), Answer::Fresh(57005));
         let dbg = format!("{fs:?}");
@@ -867,8 +917,8 @@ mod tests {
         assert!(b >= a, "wall time does not run backwards across two reads");
     }
 
-    /// Helper: reach the test clock back out of a `FailStatic<T, TestClock>` to advance it.
-    fn fs_clock<T: Clone>(fs: &FailStatic<T, TestClock>) -> &TestClock {
+    /// Helper: reach the test clock back out of a `FailStatic<K, T, TestClock>` to advance it.
+    fn fs_clock<K, T: Clone>(fs: &FailStatic<K, T, TestClock>) -> &TestClock {
         &fs.clock
     }
 }
