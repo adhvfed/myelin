@@ -669,8 +669,10 @@ impl StoreBackedCheck {
     /// [`StoreBackedCheck::new`]/[`StoreBackedCheck::with_index`] are the `test-support`-gated unit-test
     /// entry points.
     ///
-    /// `outbox` is the S3 store's emit path (the durable [`myelin_storage::pgrelay`] co-commit is the
-    /// W3 follow-on; here the caller supplies the outbox the relay drains). `kms` is the shared cell
+    /// The S3 store's `iam.tuple_written` emit is now BUS-2 exact (MR-009b W3b.3): the durable
+    /// [`TupleStore::with_pg`] co-commits the event into the SAME `rebac_tuple` transaction as the
+    /// tuple write (`myelin_storage::pgrelay::PgRelay::co_commit_in_tx`), so this composition root no
+    /// longer threads a separate `OutboxStore` for tuple-write emission. `kms` is the shared cell
     /// engine S1/S2 seal under. **MR-009b Wave 6a — the S2 pseudonym map + PII-free erasure ledger are
     /// now DURABLE-BY-DEFAULT too:** built via [`PseudonymStore::with_pg`] over the live `pseudonym_map`
     /// table + [`pseudonym_erase::PseudonymErasureLedger::with_pg`] over the non-shred-erasable
@@ -678,14 +680,13 @@ impl StoreBackedCheck {
     /// pair is now the `test-support`-gated double `with_index` wires.
     pub fn with_pg(
         provider: myelin_storage::SubstrateProvider,
-        outbox: myelin_events::OutboxStore,
         kms: std::sync::Arc<myelin_storage::KmsEngine>,
         cell_authority: std::sync::Arc<CellTokenAuthority>,
         handle: tokio::runtime::Handle,
     ) -> StoreBackedCheck {
-        // The durable S3 tuple store (the live `rebac_tuple` edge set) — the production default.
+        // The durable S3 tuple store (the live `rebac_tuple` edge set) — the production default. Its
+        // iam.tuple_written emit co-commits into the tuple tx (no separate outbox param).
         let tuples = TupleStore::with_pg(
-            outbox,
             myelin_storage::DurableTupleBacking::new(provider.clone()),
             handle.clone(),
         );

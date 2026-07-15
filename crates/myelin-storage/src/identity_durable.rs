@@ -31,8 +31,11 @@
 
 use sqlx::Row;
 
+use myelin_events::EventEnvelope;
+
 use crate::migration::{Migration, Migrations};
 use crate::pg::PgStore;
+use crate::pgrelay::PgRelay;
 use crate::provider::{ProviderError, SubstrateProvider};
 
 // =================================================================================================
@@ -209,17 +212,34 @@ impl DurableTupleBacking {
         DurableTupleBacking { provider }
     }
 
-    /// Apply a batch of edge deltas ATOMICALLY in ONE tenant-scoped transaction (the `write_tuples`
-    /// durable apply). Either all deltas commit or none (the tx rolls back on any error). The
-    /// `(object, relation, subject)` are owned so the future is `Send`.
-    pub async fn apply_deltas(
+    /// **Apply a batch of edge deltas AND co-commit the `iam.tuple_written` outbox row in ONE
+    /// tenant-scoped transaction (BUS-2 emit-iff-committed, made EXACT for the durable S3 spine —
+    /// MR-009b W3b.3).** The tuple INSERT/DELETEs and the outbox-row insert
+    /// ([`PgRelay::co_commit_in_tx`], the one sanctioned outbox-write site) run in the SAME open
+    /// sqlx transaction the `with_tenant_tx` convention opens: either all deltas + the event commit,
+    /// or the whole tx rolls back. This REPLACES the former non-atomic pattern (durable tuple write
+    /// in this PG tx, then a SEPARATE — typically in-memory — `OutboxStore` emit), whose crash
+    /// window could lose the event or ghost it. A crash mid-sequence now leaves EITHER the tuple +
+    /// its event OR neither (0 ghost / 0 lost).
+    ///
+    /// The `envelope` (its causality + stable `event_id`) is DERIVED AT THE EMIT POINT in
+    /// `myelin-identity-service` (the `OutboxTransaction::emit` seam mints/derives it); this backing
+    /// only makes the already-derived row durable in the tuple tx — the chat `append_co_commit`
+    /// precedent (`myelin-chat/src/store/pg.rs`) applied at the S3 backing layer. `aggregate` is the
+    /// per-object ordering key the identity layer stamped on the draft; the `(object, relation,
+    /// subject)` are owned so the future is `Send`.
+    pub async fn apply_deltas_co_commit(
         &self,
         tenant: &str,
         region: &str,
         deltas: Vec<(TupleEdgeOp, String, String, String)>,
+        aggregate: &str,
+        envelope: &EventEnvelope,
     ) -> Result<(), ProviderError> {
         let tenant_owned = tenant.to_string();
         let region_owned = region.to_string();
+        let aggregate_owned = aggregate.to_string();
+        let envelope_owned = envelope.clone();
         self.provider
             .with_tenant_tx(tenant, move |conn| {
                 Box::pin(async move {
@@ -249,6 +269,11 @@ impl DurableTupleBacking {
                             }
                         }
                     }
+                    // The iam.tuple_written outbox row, in the SAME transaction as the tuple deltas
+                    // above — both commit or both roll back (emit-iff-committed). The relay owns the
+                    // outbox table, so the INSERT lives in PgRelay (the one lint-excluded outbox-write
+                    // site), never hand-rolled here.
+                    PgRelay::co_commit_in_tx(conn, &aggregate_owned, &envelope_owned).await?;
                     Ok(())
                 })
             })

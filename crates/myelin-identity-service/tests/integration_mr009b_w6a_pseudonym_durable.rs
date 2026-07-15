@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use myelin_config::MyelinConfig;
-use myelin_events::{OutboxStore, Timestamp};
+use myelin_events::Timestamp;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, PseudonymHandle};
 use myelin_identity_service::pseudonym_erase::PseudonymErasureLedger;
 use myelin_identity_service::pseudonym_store::{PseudonymError, PseudonymStore};
@@ -262,7 +262,6 @@ async fn full_erase_deletes_durably_and_the_ledger_drives_re_erasure_across_rest
     // ---- Engine #1 (production composition root over the live pool) ----
     let engine1 = StoreBackedCheck::with_pg(
         app1.clone(),
-        OutboxStore::new(),
         kms.clone(),
         cell.clone(),
         tokio::runtime::Handle::current(),
@@ -291,7 +290,6 @@ async fn full_erase_deletes_durably_and_the_ledger_drives_re_erasure_across_rest
     };
     let engine2 = StoreBackedCheck::with_pg(
         app2.clone(),
-        OutboxStore::new(),
         kms.clone(),
         cell.clone(),
         tokio::runtime::Handle::current(),

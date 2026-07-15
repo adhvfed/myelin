@@ -65,10 +65,15 @@
 //!   byte-for-byte the 4.6/§6 contract. The seam shape does not change when the binding lands.
 
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef as EvArtifactRef, DataRole as EvDataRole, EmitContextBase,
-    EventDraft, EventType, IdMinter, MonotonicMinter, OutboxStore, OutboxTransaction, OutboxTx,
+    derive_envelope, Actor, AggregateKey, ArtifactRef as EvArtifactRef, DataRole as EvDataRole,
+    EmitContext, EventDraft, EventEnvelope, EventId, EventType, IdMinter, MonotonicMinter,
     Timestamp, Visibility,
 };
+// The in-memory test-double emit path (MR-009b W3b.3): the `OutboxStore`/`OutboxTransaction`
+// co-commit is the DB-free double. The durable Pg path co-commits the derived envelope into the
+// SAME `rebac_tuple` tx via the backing (`PgRelay::co_commit_in_tx`) — it needs no `OutboxStore`.
+#[cfg(any(test, feature = "test-support"))]
+use myelin_events::{EmitContextBase, OutboxStore, OutboxTransaction, OutboxTx};
 use myelin_identity::iam_events::IAM_TUPLE_WRITTEN;
 use myelin_identity::{DataRole, Precondition, Principal, RelationTuple, TupleDelta, Zookie};
 use myelin_storage::{OltpStoreHolder, TenantQuery, TenantScope, TenantTable};
@@ -235,9 +240,13 @@ pub struct TupleStore {
     /// `AtomicU64` so the advance is monotonic even under concurrent writers; the string zookie
     /// is `zk-<rev>` (lexically monotonic with zero-padding, so a later zookie sorts after).
     revision: Arc<AtomicU64>,
-    /// The store's outbox — the ONLY emit path (`no-raw-publish`). `write_tuples` stages the
-    /// tuple change + the `iam.tuple_written` event into ONE transaction on this store and the
-    /// relay (auto-started by `serve`) drains it.
+    /// The in-memory test-double's outbox — the emit path for the `Memory` backing ONLY (MR-009b
+    /// W3b.3: `test-support`-gated). `write_tuples` (memory arm) stages the tuple change + the
+    /// `iam.tuple_written` event into ONE `OutboxTransaction` on this store. The DURABLE `Pg` backing
+    /// does NOT use it: it co-commits the `iam.tuple_written` row into the SAME `rebac_tuple` PG
+    /// transaction via the backing (`PgRelay::co_commit_in_tx`) — emit-iff-committed, BUS-2 exact — so
+    /// the production `TupleStore` carries no in-memory outbox at all.
+    #[cfg(any(test, feature = "test-support"))]
     outbox: OutboxStore,
     /// The stable id-minter for the emitted `iam.tuple_written` events (the broker-side dedup id).
     minter: Arc<dyn IdMinter>,
@@ -331,20 +340,21 @@ impl TupleStore {
     /// **Build the S3 store over the REAL durable PG backing (MR-007 / SI-019).** The `rebac_tuple`
     /// edge set persists through the MR-022 [`myelin_storage::SubstrateProvider`] pool +
     /// `with_tenant_tx` convention (RLS-scoped, no GUC bleed). `rt` is the tokio runtime handle the
-    /// sync API drives the async backing on. The outbox emit + zookie semantics are preserved (the
-    /// event still co-commits-iff-the-durable-write-succeeds). The store auto-registers as a holder.
+    /// sync API drives the async backing on. The `iam.tuple_written` emit + zookie semantics are
+    /// preserved, and made **BUS-2 exact** (MR-009b W3b.3): the event co-commits into the SAME
+    /// `rebac_tuple` transaction as the tuple write (`PgRelay::co_commit_in_tx` via the backing), so
+    /// there is no separate `OutboxStore` on this path — a crash mid-write leaves either the tuple +
+    /// its event or neither. The store auto-registers as a holder.
     /// **The PRODUCTION default (MR-009b Wave 2) — always compiled.**
     pub fn with_pg(
-        outbox: OutboxStore,
         backing: myelin_storage::DurableTupleBacking,
         rt: tokio::runtime::Handle,
     ) -> TupleStore {
-        TupleStore::with_pg_minter(outbox, Arc::new(MonotonicMinter::new()), backing, rt)
+        TupleStore::with_pg_minter(Arc::new(MonotonicMinter::new()), backing, rt)
     }
 
     /// [`Self::with_pg`] with an explicit id-minter (deterministic in tests). Always compiled (W2).
     pub fn with_pg_minter(
-        outbox: OutboxStore,
         minter: Arc<dyn IdMinter>,
         backing: myelin_storage::DurableTupleBacking,
         rt: tokio::runtime::Handle,
@@ -358,7 +368,11 @@ impl TupleStore {
                 watermark: PgZookieWatermark::default(),
             }),
             revision: Arc::new(AtomicU64::new(0)),
-            outbox,
+            // The durable Pg path co-commits its emit into the tuple tx (no separate OutboxStore);
+            // this field only exists for the `test-support`-gated `Memory` arm, so under a test build
+            // it is initialised to an unused empty store and under production it does not exist.
+            #[cfg(any(test, feature = "test-support"))]
+            outbox: OutboxStore::new(),
             minter,
             holder,
         }
@@ -538,9 +552,50 @@ impl TupleStore {
         }
     }
 
-    /// Build the ONE outbox transaction the write co-commits (the `iam.tuple_written` emit, the ONLY
-    /// emit path). Returns the UNCOMMITTED transaction so the caller commits it at the right moment
-    /// (emit-iff-committed): after the durable apply succeeds.
+    /// **Derive the `iam.tuple_written` [`EventEnvelope`] the durable Pg write co-commits (MR-009b
+    /// W3b.3).** Mints the stable `event_id` from the SAME `minter` and derives causality via the
+    /// pure [`derive_envelope`] — byte-for-byte what the memory arm's [`OutboxTransaction::emit`]
+    /// produces (same draft, same [`EmitContext`], root cause), so consumers cannot tell the two
+    /// paths apart. Returns `(aggregate, envelope)`; the durable backing co-commits the row into the
+    /// SAME `rebac_tuple` tx (`PgRelay::co_commit_in_tx`) — the derivation stays HERE (the emit
+    /// point), the durability is the backing's, mirroring chat's `append_co_commit`.
+    fn derive_tuple_event(
+        &self,
+        scope: &TenantScope,
+        actor: &Principal,
+        deltas: &[TupleDelta],
+        zookie: &Zookie,
+        occurred_at: &Timestamp,
+    ) -> (AggregateKey, EventEnvelope) {
+        let draft = self.tuple_written_draft(scope, deltas, zookie);
+        let aggregate = draft.aggregate.clone();
+        // The stable ULID event_id (the broker-side dedup id) — minted from the same source the
+        // memory arm's emit uses.
+        let event_id: EventId = self.minter.mint().into();
+        let ctx = EmitContext {
+            event_id,
+            tenant: scope.tenant().clone(),
+            region: scope.region().clone(),
+            actor: Actor(actor.clone()),
+            schema_ver: 1,
+            occurred_at: occurred_at.clone(),
+            // The outbox stamps `recorded_at` when the row is durably accepted; on this floor we
+            // pass the same instant (identical to the memory arm's EmitContextBase).
+            recorded_at: occurred_at.clone(),
+            caused_by: None,
+        };
+        // Root emit (cause = None) — the head of its own causal chain, exactly as the memory arm's
+        // `tx.emit(draft, None)`.
+        let envelope = derive_envelope(draft, ctx, None);
+        (aggregate, envelope)
+    }
+
+    /// Build the ONE outbox transaction the memory-arm write co-commits (the `iam.tuple_written`
+    /// emit, the ONLY emit path for the test double). Returns the UNCOMMITTED transaction so the
+    /// caller commits it at the right moment (emit-iff-committed): after the apply succeeds. The
+    /// durable Pg path uses [`Self::derive_tuple_event`] + the backing co-commit instead (MR-009b
+    /// W3b.3 — `test-support`-gated, it touches `self.outbox`).
+    #[cfg(any(test, feature = "test-support"))]
     fn stage_event(
         &self,
         scope: &TenantScope,
@@ -675,10 +730,17 @@ impl TupleStore {
         let new_rev = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
         let zookie = Self::zookie_of(new_rev);
 
-        // Stage the event (uncommitted) — emit-iff the durable write below succeeds.
-        let tx = self.stage_event(scope, actor, deltas, &zookie, occurred_at)?;
+        // Derive the iam.tuple_written envelope at the emit point (mint id + causality) — the SAME
+        // shape the memory arm's `OutboxTransaction::emit` produces, so no consumer can tell the
+        // durable path apart.
+        let (aggregate, envelope) =
+            self.derive_tuple_event(scope, actor, deltas, &zookie, occurred_at);
 
-        // Apply the deltas atomically in ONE tenant-scoped DB transaction (with_tenant_tx).
+        // Apply the deltas AND co-commit the iam.tuple_written outbox row in ONE tenant-scoped DB
+        // transaction (BUS-2 emit-iff-committed, EXACT — MR-009b W3b.3): the tuple write + the event
+        // become durable together, or neither does. This replaces the former non-atomic
+        // "durable apply, then commit into a SEPARATE in-memory OutboxStore" (whose crash window
+        // could lose the event or ghost it) — a crash mid-write now leaves 0 ghost / 0 lost.
         let edge_deltas: Vec<(myelin_storage::TupleEdgeOp, String, String, String)> = deltas
             .iter()
             .map(|d| match d {
@@ -696,11 +758,14 @@ impl TupleStore {
                 ),
             })
             .collect();
-        pg.block(pg.backing.apply_deltas(&tenant, &region, edge_deltas))
-            .map_err(|e| WriteError::CommitFailed(e.to_string()))?;
-
-        // Durable write succeeded → co-commit the event (the outbox emit).
-        tx.commit().map_err(|e| WriteError::CommitFailed(e.0))?;
+        pg.block(pg.backing.apply_deltas_co_commit(
+            &tenant,
+            &region,
+            edge_deltas,
+            &aggregate.0,
+            &envelope,
+        ))
+        .map_err(|e| WriteError::CommitFailed(e.to_string()))?;
 
         // Advance the in-process zookie watermark for the touched objects.
         {
