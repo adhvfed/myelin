@@ -66,9 +66,11 @@
 
 use myelin_events::{
     derive_envelope, Actor, AggregateKey, ArtifactRef as EvArtifactRef, DataRole as EvDataRole,
-    EmitContext, EventDraft, EventEnvelope, EventId, EventType, IdMinter, MonotonicMinter,
-    Timestamp, Visibility,
+    EmitContext, EventDraft, EventEnvelope, EventId, EventType, IdMinter, Timestamp, Visibility,
 };
+// Used only by the `test-support`-gated in-memory ctor (`TupleStore::new`) — MR-009b W3b.6.
+#[cfg(any(test, feature = "test-support"))]
+use myelin_events::MonotonicMinter;
 // The in-memory test-double emit path (MR-009b W3b.3): the `OutboxStore`/`OutboxTransaction`
 // co-commit is the DB-free double. The durable Pg path co-commits the derived envelope into the
 // SAME `rebac_tuple` tx via the backing (`PgRelay::co_commit_in_tx`) — it needs no `OutboxStore`.

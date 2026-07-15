@@ -29,9 +29,10 @@ use crate::gateway::GatewayBuilder;
 use crate::git_edge::{map_method, num_param, param, reroot, tenant_of};
 use crate::repo_authz::{AllowAllRepos, RepoAuthorizer};
 use crate::request::EdgeResponse;
-use myelin_events::{
-    Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Region, TenantId, Timestamp,
-};
+use myelin_events::{Actor, EmitContextBase, IdMinter, OutboxStore, Region, TenantId, Timestamp};
+// Used only by the `test-support`-gated `rooted_inmem_for_test` helper (MR-009b W3b.6).
+#[cfg(any(test, feature = "test-support"))]
+use myelin_events::MonotonicMinter;
 use myelin_git::api::{http_catalogue, Method as GitMethod};
 use myelin_git::check_status::GitOid;
 use myelin_git::core::{Oid as CoreOid, RepoLoc};
@@ -112,8 +113,10 @@ impl DurableGitBackend {
     /// plus the seeded deterministic `MonotonicMinter` (the pre-W3b.4 shape). Production roots use
     /// [`DurableGitBackend::rooted`] with a durable store + `UlidMinter` — this helper exists so
     /// the many test call sites stay one-line and the production signature stays injection-first.
-    /// NOT a production path: the memory store loses events on restart (SI-007; the W3b.6 flip
-    /// gates `OutboxStore::new`, which will force this helper behind `test-support`).
+    /// NOT a production path: the memory store loses events on restart (SI-007). MR-009b W3b.6
+    /// gated `OutboxStore::new` — so this helper is `test-support`-gated with it, exactly as the
+    /// W3b.4 note promised.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn rooted_inmem_for_test(root: impl Into<PathBuf>) -> DurableGitBackend {
         DurableGitBackend::rooted(root, OutboxStore::new(), Arc::new(MonotonicMinter::new()))
     }

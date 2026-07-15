@@ -367,7 +367,13 @@ pub mod chat_producer;
 pub mod ci_producer;
 pub mod cross_cell;
 pub mod dek;
+// MR-009b W3b.5: the dogfood / E2E-wedge / reindex-at-scale drill runners construct the
+// `test-support`-gated in-memory OutboxStore double (the at-scale parity corpus reindex) — drill
+// harnesses, never production serving code. Gated with it; the tests-dir drills reach them via
+// the `myelin-refs-service/test-support` self dev-dependency.
+#[cfg(any(test, feature = "test-support"))]
 pub mod dogfood;
+#[cfg(any(test, feature = "test-support"))]
 pub mod e2e_wedge;
 pub mod edge_builder;
 pub mod emit;
@@ -383,6 +389,8 @@ pub mod migration;
 pub mod mirror;
 pub mod reach_index;
 pub mod reindex;
+// MR-009b W3b.5: gated with the drill harnesses above (constructs `OutboxStore::new()`).
+#[cfg(any(test, feature = "test-support"))]
 pub mod reindex_at_scale;
 pub mod residency;
 pub mod resolve;
@@ -409,6 +417,7 @@ pub use cross_cell::{
     CROSS_CELL_RAW_ROWS_SIGNAL, CROSS_CELL_RESOLVES_SIGNAL,
 };
 pub use dek::{ref_p5_inherited_gates, InheritedGate, RefsDekPin};
+#[cfg(any(test, feature = "test-support"))]
 pub use dogfood::{
     proven_refs_rows, run_refs_truth_up_scorecard, DogfoodArtifact, ProvenRefsRow, RefsIncident,
     RefsIncidentDrillTicket, RefsIncidentIssueDraft, RefsRowStatus, RefsScorecardEntry,
@@ -419,6 +428,7 @@ pub use dogfood::{
 // Wave 5: `test-support`-gated (the tests-dir drills reach them via the self dev-dependency).
 #[cfg(any(test, feature = "test-support"))]
 pub use dogfood::run_refs_over_myelins_own_work;
+#[cfg(any(test, feature = "test-support"))]
 pub use e2e_wedge::{run_e2e_1_pr_pane, run_e2e_3_spec_to_ship, E2eArtifact, E2E_SCENARIOS};
 #[cfg(any(test, feature = "test-support"))]
 pub use e2e_wedge::{run_e2e_4_dsar_fanout, run_refs_e2e_wedge};
@@ -471,6 +481,7 @@ pub use reindex::{
     RefsReindexSource, RefsReindexer, ReindexError, ReindexReceipt, SourceEdge,
     REFS_EDGE_SNAPSHOT_TYPE, REFS_OWNER_TOKEN,
 };
+#[cfg(any(test, feature = "test-support"))]
 pub use reindex_at_scale::{
     build_full_scale_corpus, run_full_scale_reindex_parity, FiveProducerCorpus,
     FullScaleParityReport, FIVE_PRODUCERS, WORLD_SCALE_FLEET_LOAD_FLOOR,

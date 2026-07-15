@@ -30,8 +30,8 @@ use std::time::Duration;
 
 use myelin_config::MyelinConfig;
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, EventEnvelope, EventId, EventType,
-    IdMinter, Timestamp, Ulid, Visibility,
+    Actor, AggregateKey, ArtifactRef, CausedBy, EmitContextBase, EventDraft, EventType, IdMinter,
+    OutboxStore, OutboxTx, Timestamp, Ulid, UlidMinter, Visibility,
 };
 use myelin_identity::{
     DataRole, ObjectId, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RelName,
@@ -42,11 +42,10 @@ use myelin_identity_service::revocation::RevocationStore;
 use myelin_identity_service::tuple_store::TupleStore;
 use myelin_storage::events_serve::EventsRuntime;
 use myelin_storage::kms_durable::DurableKmsBacking;
-use myelin_storage::pg::PgError;
-use myelin_storage::pgrelay::PgRelay;
 use myelin_storage::placement_durable::{
     DurableCellRow, DurablePlacementBacking, DurablePlacementRow,
 };
+use myelin_storage::PgOutboxBacking;
 use myelin_storage::{
     DurablePrincipalBacking, DurableRevocationBacking, DurableTupleBacking, KekId, KeyClass,
     SealKey, SubstrateProvider, NONCE_LEN,
@@ -60,6 +59,11 @@ const DEFAULT_SEAL_HEX: &str = "00112233445566778899aabbccddeeff0011223344556677
 
 /// The number of committed-but-unsent outbox rows the events family writes.
 const EVENTS_N: usize = 8;
+
+/// The number of rows the events family STAGES on the ghost aggregate WITHOUT committing before it
+/// blocks for the SIGKILL (MR-009b W3b.6 kill-9 EMIT drill: emit-iff-committed on the durable arm —
+/// these must be ABSENT from PG after the crash, 0 ghost).
+const EVENTS_GHOST_N: usize = 4;
 
 fn admin_config() -> MyelinConfig {
     let mut c = MyelinConfig::dev();
@@ -135,6 +139,11 @@ fn place_tenant_id(run: &str) -> String {
 }
 fn events_aggregate(run: &str) -> String {
     format!("issue:MR009-{run}")
+}
+/// The aggregate the STAGED-BUT-NEVER-COMMITTED ghost rows are emitted on (the parent asserts PG
+/// holds ZERO rows for it after the SIGKILL — the 0-ghost half of the W3b.6 kill-9 emit drill).
+fn events_ghost_aggregate(run: &str) -> String {
+    format!("issue:MR009GHOST-{run}")
 }
 fn events_stream(run: &str) -> String {
     format!("MYELIN_MR009_{}", run.replace('-', "_"))
@@ -435,22 +444,52 @@ async fn events_family(
     };
 
     if writing {
-        // Co-commit N events through the MR-022 with_tenant_tx convention (PgRelay::co_commit_in_tx
-        // is the one sanctioned outbox-write site). All committed + UNSENT — we do NOT drain.
+        // **The MR-009b W3b.6 kill-9 EMIT drill (the flip's exit proof):** emit through the ONE
+        // production emit path — `OutboxStore::durable(PgOutboxBacking)` + the frozen
+        // `OutboxTx::emit` → `OutboxTransaction::commit` (which routes the whole staged buffer
+        // through `DurableOutboxBacking::commit_staged` in ONE PG tx) — with the PRODUCTION
+        // `UlidMinter` (the W3b.3 named condition: a per-run-unique id source, never the
+        // per-instance-resetting `MonotonicMinter`). This is the byte-identical composition-root
+        // shape the six rewired service mains boot; the old raw `PgRelay::co_commit_in_tx` loop
+        // was the pre-flip shape (that caller's-tx co-commit path stays proven by the IDENTITY
+        // family's tuple co-commit assert).
+        let store = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
+            admin.db_pool().clone(),
+            tokio::runtime::Handle::current(),
+        )));
+        let minter: Arc<dyn IdMinter> = Arc::new(UlidMinter::new());
+
+        // (a) COMMITTED rows: one durable co-commit transaction, EVENTS_N staged rows, committed.
+        //     All committed + UNSENT — we do NOT drain (the restart relay proves 0 lost).
+        let mut tx = store.begin(Arc::clone(&minter), events_ctx_base());
+        tx.stage_state_change(format!("mr009 events kill-9 emit drill {run}"));
         for i in 0..EVENTS_N {
-            let env = events_envelope(run, i, &aggregate);
-            let agg = aggregate.clone();
-            runtime
-                .with_tenant_tx("acme", move |conn| {
-                    Box::pin(async move {
-                        PgRelay::co_commit_in_tx(&mut *conn, &agg, &env).await?;
-                        Ok::<(), PgError>(())
-                    })
-                })
-                .await
-                .map_err(|e| format!("co-commit outbox row {i}: {e}"))?;
+            tx.emit(events_draft(run, i, &aggregate), None)
+                .map_err(|e| format!("emit committed row {i}: {}", e.0))?;
         }
-        return Ok(Outcome::Ready(serde_json::json!({ "committed": EVENTS_N })));
+        tx.commit()
+            .map_err(|e| format!("durable co-commit of the {EVENTS_N} rows: {}", e.0))?;
+
+        // (b) GHOST rows: a SECOND transaction stages EVENTS_GHOST_N rows on the ghost aggregate
+        //     and is deliberately NEVER committed — it is held OPEN (leaked, not dropped) while
+        //     this process blocks for the SIGKILL, so at the moment of the crash the rows are
+        //     staged-in-process-memory only. Emit-iff-committed (BUS-D4) on the DURABLE arm means
+        //     PG must hold ZERO rows for the ghost aggregate after the kill (the parent asserts).
+        let ghost_aggregate = events_ghost_aggregate(run);
+        let mut ghost_tx = store.begin(Arc::clone(&minter), events_ctx_base());
+        for i in 0..EVENTS_GHOST_N {
+            ghost_tx
+                .emit(events_draft(run, i, &ghost_aggregate), None)
+                .map_err(|e| format!("emit ghost row {i}: {}", e.0))?;
+        }
+        // Keep the un-committed transaction ALIVE until the SIGKILL (never dropped, never
+        // committed) — the genuine "staged at kill" crash shape.
+        std::mem::forget(ghost_tx);
+
+        return Ok(Outcome::Ready(serde_json::json!({
+            "committed": EVENTS_N,
+            "ghost_staged": EVENTS_GHOST_N,
+        })));
     }
 
     // read (the RESTART relay): a fresh process re-claims the survived outbox rows and drains them to
@@ -465,12 +504,11 @@ async fn events_family(
     Ok(Outcome::Read(serde_json::json!({ "published": published })))
 }
 
-fn events_envelope(run: &str, i: usize, aggregate: &str) -> EventEnvelope {
-    let id = format!("mr009-evt-{run}-{i}");
-    EventEnvelope {
-        event_id: EventId(id.clone()),
-        type_: EventType("issues.issue.created".into()),
-        schema_ver: 1,
+/// The ambient emit context for the W3b.6 kill-9 EMIT drill (the production emit path derives the
+/// envelope from this + the minted ULID through the frozen `derive_envelope` — no hand-built
+/// `EventEnvelope` in the drill: the drill drives the SAME emit surface production drives).
+fn events_ctx_base() -> EmitContextBase {
+    EmitContextBase {
         tenant: TenantId("acme".into()),
         region: Region("fr-par".into()),
         actor: Actor(Principal::stub(
@@ -478,19 +516,26 @@ fn events_envelope(run: &str, i: usize, aggregate: &str) -> EventEnvelope {
             PrincipalKind::Human,
             TenantId("acme".into()),
         )),
-        subject: ArtifactRef(format!("myelin://acme/issues/{i}")),
-        aggregate: AggregateKey(aggregate.into()),
-        causation_id: None,
-        correlation_id: CorrelationId(id),
-        caused_by: Some(CausedBy("session:mr009".into())),
-        depth: 0,
-        contains_personal_data: false,
-        data_role: myelin_events::DataRole::Controller,
-        visibility: Visibility::Internal,
-        pii_key_ref: None,
+        schema_ver: 1,
         occurred_at: Timestamp("2026-06-26T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-26T00:00:01Z".into()),
+        caused_by: Some(CausedBy("session:mr009".into())),
+    }
+}
+
+/// One emitted event draft for the kill-9 emit drill (the `event_id` is minted by the injected
+/// `UlidMinter` at emit; the per-aggregate `seq` is assigned by the durable backing at commit).
+fn events_draft(run: &str, i: usize, aggregate: &str) -> EventDraft {
+    let _ = run;
+    EventDraft {
+        type_: EventType("issues.issue.created".into()),
+        subject: ArtifactRef(format!("myelin://acme/issues/{i}")),
+        aggregate: AggregateKey(aggregate.into()),
         payload: serde_json::json!({ "ref": "mr009" }),
+        data_role: myelin_events::DataRole::Controller,
+        visibility: Visibility::Internal,
+        contains_personal_data: false,
+        pii_key_ref: None,
     }
 }
 

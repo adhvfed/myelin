@@ -85,6 +85,10 @@ pub mod database;
 /// E2E slices ([`dogfood::run_knowledge_truth_up_scorecard`] — every row rests on a dated green artifact
 /// whose proof source exists on disk, a vanished row surfaced CLAIMED-NOT-PROVEN), and the
 /// every-incident-adds-a-drill loop ([`dogfood::KnowledgeIncident`]). No new contract; no weakened gate.
+// MR-009b W3b.5: the dogfood loop REUSES the e2e_wedge drill runners (which construct the
+// `test-support`-gated in-memory OutboxStore double) — a drill harness, never production
+// serving code. Gated with it; the tests-dir drills reach it via the self dev-dependency.
+#[cfg(any(test, feature = "test-support"))]
 pub mod dogfood;
 /// Knowledge's legs of the whole-system E2E wedge (KN-P33 / P-488, M5): **E2E-1** (the PR context pane
 /// — a Knowledge design-doc embed resolves per-viewer through the SAME [`refs_glue::Projector`] ladder,
@@ -95,6 +99,9 @@ pub mod dogfood;
 /// [`myelin_storage::blob::ContentHash::blake3`] primitive). Each leg drives the whole flow end-to-end
 /// (chaining mutations mid-flight, EI-01 §4) over the UNCHANGED production-hardened engine and emits a
 /// named green artifact ([`e2e_wedge::E2eArtifact`]). No new contract; no weakened gate.
+// MR-009b W3b.5: the E2E wedge drill runners construct the `test-support`-gated in-memory
+// OutboxStore double — a drill harness, never production serving code. Gated with it.
+#[cfg(any(test, feature = "test-support"))]
 pub mod e2e_wedge;
 pub mod editor;
 pub mod emit;
@@ -132,6 +139,8 @@ pub mod surge;
 /// thresholds-file budget ⇒ a Notion user could move without hitting a wall the old tool didn't have. The
 /// per-surface browser-drive is recorded HONESTLY (the live `<BlockEditor>` shell + a Playwright drive are
 /// a named floor — the WASM-clean model is driven, see `editor-browser-drive.md`).
+// MR-009b W3b.5: gated with `dogfood` (the switch test drives the dogfood space builder).
+#[cfg(any(test, feature = "test-support"))]
 pub mod switch_test;
 pub mod sync_block;
 pub mod transport;
@@ -160,6 +169,8 @@ pub use database::{
     PageBound, PropertyBag, RelationEdgeEvent, RelationKind, RelationStore, SchemaError, ViewError,
     ViewQuery, FACET_PROMOTION_THRESHOLD,
 };
+// MR-009b W3b.5: gated with the harness modules above.
+#[cfg(any(test, feature = "test-support"))]
 pub use dogfood::{
     myelin_knowledge_space, proven_knowledge_rows, run_knowledge_over_myelins_own_work,
     run_knowledge_truth_up_scorecard, KnowledgeDogfoodArtifact, KnowledgeIncident,
@@ -167,6 +178,7 @@ pub use dogfood::{
     KnowledgeScorecardEntry, KnowledgeTruthUpPass, KnowledgeTruthUpRed, KnowledgeTruthUpScorecard,
     KnowledgeTruthUpVerdict, MyelinDoc, ProvenKnowledgeRow, MYELIN_SELF_REGION, MYELIN_SELF_TENANT,
 };
+#[cfg(any(test, feature = "test-support"))]
 pub use e2e_wedge::{
     run_e2e1_pr_context_pane, run_e2e3_spec_to_ship_lineage, run_knowledge_e2e_legs, E2eArtifact,
     E2E_SCENARIOS as KNOWLEDGE_E2E_SCENARIOS,
@@ -211,6 +223,7 @@ pub use subs::{
     mint_block, mint_heading, register_knowledge_sub_kinds, KNOWLEDGE_OWNED_SUB_KINDS,
     KNOWLEDGE_SUBSYSTEM,
 };
+#[cfg(any(test, feature = "test-support"))]
 pub use switch_test::{
     switch_capability_matrix as knowledge_switch_capability_matrix, switch_surface_drive_record,
     BrowserDriveStatus, KnowledgeOverlay, KnowledgeSwitchTest, KnowledgeSwitchVerdict,

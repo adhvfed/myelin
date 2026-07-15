@@ -70,7 +70,10 @@ use crate::metrics_health::{CriticalDependencies, HealthTable, MetricsHealthSurf
 use crate::migrations::{HotTables, Migration, MigrationRunner, Migrations};
 use crate::topology::PublicSurface;
 use crate::{Config, ServeError};
-use myelin_events::relay::{BusTransport, InProcessBus};
+use myelin_events::relay::BusTransport;
+// Used only by the `test-support`-gated in-process floor (`OutboxSpec::default_inproc`).
+#[cfg(any(test, feature = "test-support"))]
+use myelin_events::relay::InProcessBus;
 use myelin_events::{
     Consumer, ConsumerName, Delivered, EventHandler, Message, OutboxStore, Relay, Timestamp,
 };
@@ -92,9 +95,10 @@ impl OutboxSpec {
     /// **The in-process floor: a fresh empty MEMORY store + the in-process broker fake — TEST /
     /// DEV ONLY (MR-009b W3b.4).** Gated behind `test-support` so no production composition root
     /// can silently pick up the per-process in-memory outbox (SI-007: events lost on restart).
-    /// Production supplies a DURABLE-backed store via [`OutboxSpec::durable`]; a service that
-    /// still constructs the memory floor does so EXPLICITLY via [`OutboxSpec::new`] over
-    /// `OutboxStore::new()` (a grep-able, named W3b.6 debt site), never through a default.
+    /// Production supplies a DURABLE-backed store via [`OutboxSpec::durable`]. Since MR-009b
+    /// W3b.6 the memory floor cannot be constructed from production code AT ALL:
+    /// `OutboxStore::new()` itself is `test-support`-gated, so the former "explicit debt site"
+    /// escape hatch is closed at compile time (the W3b.4 debt is discharged).
     #[cfg(any(test, feature = "test-support"))]
     pub fn default_inproc() -> OutboxSpec {
         OutboxSpec {
@@ -432,16 +436,15 @@ impl AppSpec {
     }
 
     /// A minimal spec for a service `name` with a validated `config` (the hello-world shape):
-    /// no migrations, no consumers, the in-process outbox. Builders add migrations/consumers.
+    /// no migrations, no consumers, the CALLER-INJECTED outbox. Builders add migrations/consumers.
     ///
-    /// **W3b.6 debt (named, MR-009b W3b.4):** the outbox here is still the EXPLICIT in-memory
-    /// floor (`OutboxStore::new()` — un-gated until the W3b.6 flip) because `minimal` is a
-    /// production convenience `control-plane` still builds on. The gated
-    /// [`OutboxSpec::default_inproc`] can no longer be reached silently; this construction is the
-    /// grep-able remainder the W3b.6 `OutboxStore::new` gate breaks LOUDLY, forcing the remaining
-    /// roots (control-plane / agent-service / ci-controlplane / ci-dispatch) onto
-    /// [`OutboxSpec::durable`].
-    pub fn minimal(name: &'static str, config: Config) -> AppSpec {
+    /// **W3b.6 debt DISCHARGED (MR-009b W3b.6):** `minimal` no longer constructs the in-memory
+    /// floor — the [`OutboxSpec`] is INJECTED, so a production root that builds on `minimal`
+    /// (control-plane) chooses [`OutboxSpec::durable`] explicitly, and a test passes the
+    /// `test-support`-gated [`OutboxSpec::default_inproc`]. There is no silent in-memory default
+    /// left to fall into (the gated `OutboxStore::new` breaks a production reach LOUDLY at
+    /// compile time).
+    pub fn minimal(name: &'static str, config: Config, outbox: OutboxSpec) -> AppSpec {
         AppSpec {
             name,
             config,
@@ -452,7 +455,7 @@ impl AppSpec {
             consumers: Vec::new(),
             holders: HoldersSpec::Auto,
             stores: StoreManifest::new(),
-            outbox: OutboxSpec::new(OutboxStore::new(), InProcessBus::new()),
+            outbox,
             critical: CriticalDependencies::default(),
         }
     }
@@ -973,7 +976,7 @@ mod tests {
     /// consumer side of 1.1 — a hello-world `main` that just calls `serve`).
     #[test]
     fn serve_runs_lifecycle_and_returns_ok() {
-        let spec = AppSpec::minimal("svc", Config::default());
+        let spec = AppSpec::minimal("svc", Config::default(), OutboxSpec::default_inproc());
         assert_eq!(serve(spec), Ok(()), "serve boots → … → drains cleanly");
     }
 
@@ -981,7 +984,11 @@ mod tests {
     /// that fails boot-time validation (a bad/unbounded pool) aborts boot with a loud error.
     #[test]
     fn failed_boot_returns_non_zero() {
-        let spec = AppSpec::minimal("svc", Config("BAD_POOL".into()));
+        let spec = AppSpec::minimal(
+            "svc",
+            Config("BAD_POOL".into()),
+            OutboxSpec::default_inproc(),
+        );
         let r = serve(spec);
         assert!(r.is_err(), "a failed boot must return non-zero (Err)");
         assert!(
@@ -994,7 +1001,11 @@ mod tests {
     /// loud error before opening the pool / running migrations.
     #[test]
     fn config_validation_fails_fast_on_bad_env() {
-        let spec = AppSpec::minimal("svc", Config("BAD_POOL".into()));
+        let spec = AppSpec::minimal(
+            "svc",
+            Config("BAD_POOL".into()),
+            OutboxSpec::default_inproc(),
+        );
         let r = boot(spec);
         assert!(r.is_err(), "boot fails fast on a bad config");
     }

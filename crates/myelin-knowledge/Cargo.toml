@@ -137,6 +137,11 @@ myelin-config = { path = "../myelin-config" }
 
 [features]
 default = []
+# MR-009b W3b.5 — gates the e2e_wedge/dogfood drill runners (they construct the now-gated
+# in-memory `OutboxStore::new()` double), forwarding to `myelin-events/test-support`. The
+# tests-dir drills (drill_kn_p33/p34) reach the gated modules via the SELF dev-dependency.
+# DEV/TEST only — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
+test-support = ["myelin-events/test-support"]
 # KN-D7 (the silent-data-loss floor): the Knowledge outbox emit seam PROVEN against the live
 # dev-stack Postgres `outbox` table (the same-transaction co-commit; write → crash mid-relay →
 # recover → 0 ghost / 0 lost). Registered red-until-proven; flips green only with the real artifact.
@@ -186,6 +191,9 @@ myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 # in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
 # — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
+# MR-009b W3b.5 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN
+# tests/*.rs drill files (they drive the gated e2e_wedge/dogfood runners).
+myelin-knowledge = { path = ".", features = ["test-support"] }
 # The shell's boot self-test asserts against the same three-port / liveness≠readiness surface the
 # later drills read from. DEV-only — the harness never enters the knowledge production DAG.
 myelin-harness = { path = "../myelin-harness" }

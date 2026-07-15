@@ -103,7 +103,11 @@ serde_json = { workspace = true }
 # myelin-config edge — same posture as refs-service/identity).
 # ------------------------------------------------------------------------------------------
 sqlx = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
+# MR-009b W3b.6: tokio + myelin-config are REGULAR deps now — the durable service main.rs
+# (provider-from-env → migrate_foundation → OutboxStore::durable, fail-loud) needs them. The
+# `integration` feature no longer carries their dep: activation; the build stays DB-free
+# (connecting happens at RUNTIME, never at build).
+tokio = { workspace = true }
 # CI-P20 (P-363): the log-pipeline seal is PROVEN against the live dev stack — the sealed segment
 # flushes to the REAL RustFS object store (`S3BlobStore`, contract 11.2) AND the `(job, step,
 # byte-range)` index rows (`log_segment`/`log_anchor`, contract 11.8) apply + INSERT + read back
@@ -112,7 +116,7 @@ tokio = { workspace = true, optional = true }
 # verify) deps are pulled ONLY by `--features integration`; `myelin-storage/integration` exposes the
 # real `S3BlobStore` (RustFS in dev, Scaleway in prod — a config swap, never a code change). The
 # default build stays DB-free.
-myelin-config = { path = "../myelin-config", optional = true }
+myelin-config = { path = "../myelin-config" }
 aws-sdk-s3 = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -121,6 +125,11 @@ aws-sdk-s3 = { workspace = true, optional = true }
 # that call the now-gated `reserve_settle_parity_drill` / `run_e2e2_ci_flagship_slice`). The sanctioned
 # Cargo idiom; it does NOT affect the normal `cargo build`, which stays durable-by-default.
 myelin-ci-controlplane = { path = ".", features = ["test-support"] }
+# MR-009b W3b.6: enable `test-support` so this crate's DEV tests reach the events in-memory
+# `OutboxStore::new()` double (the durable `OutboxStore::durable` is the production default; the
+# in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
+# — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
+myelin-events = { path = "../myelin-events", features = ["test-support"] }
 # MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
 # `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests (the same
 # posture as the Wave-2/3 identity/events test-support dev-dependencies). DEV-only — never in the
@@ -163,13 +172,17 @@ default = []
 # `#[cfg(any(test, feature = "test-support"))]`, so the default build stays durable-by-default. Forwards
 # to `myelin-flow/test-support` + `myelin-storage/test-support` (the two in-memory doubles the drills
 # reach). DEV/TEST only — never in the production DAG.
-test-support = ["myelin-flow/test-support", "myelin-storage/test-support"]
+# MR-009b W3b.5/.6: also forwards to `myelin-events/test-support` — the gated e2e_wedge drill
+# runners + the DEV tests construct the now-gated in-memory `OutboxStore::new()` double.
+test-support = [
+    "myelin-flow/test-support",
+    "myelin-storage/test-support",
+    "myelin-events/test-support",
+]
 # `myelin-storage/integration` exposes the s3blob module (the real S3BlobStore over RustFS/Scaleway)
 # the CI-P20 log-pipeline seal flushes its sealed segments to.
 integration = [
     "dep:sqlx",
-    "dep:tokio",
-    "dep:myelin-config",
     "dep:aws-sdk-s3",
     "myelin-storage/integration",
 ]

@@ -103,7 +103,10 @@ integration = [
 # doubles behind `#[cfg(any(test, feature = "test-support"))]` and downstream dev-deps can turn it
 # on; NO code moves behind it yet. The `no-in-memory-durable-store` scanner treats
 # `feature = "test-support"` as a test-double gate (Wave 0). `memory` is a documented alias.
-test-support = []
+# MR-009b W3b.5/.6: forwards to `myelin-events/test-support` — this crate's `test-support`-gated
+# harness code (`e2e3_reindex_parity`'s `booted_bus()`) constructs the now-gated in-memory
+# `OutboxStore::new()` double, so enabling the doubles here must enable them in events too.
+test-support = ["myelin-events/test-support"]
 memory = ["test-support"]
 
 # The failure-injection harness is TEST-SUPPORT only (the same posture as a service's

@@ -119,6 +119,10 @@ tokio = { workspace = true }
 # identity/events self dev-dependencies; it keeps `cargo test -p myelin-control-plane` (DB-free) green
 # WITHOUT polluting the production build (cargo tree -e no-dev shows no test-support edge).
 myelin-control-plane = { path = ".", features = ["test-support"] }
+# MR-009b W3b.6: the control-plane spec-builder test boots the in-process outbox floor
+# (`OutboxSpec::default_inproc`), which is `test-support`-gated in the substrate (and constructs
+# the gated events in-memory OutboxStore). DEV-only — never in the production DAG.
+myelin-substrate = { path = "../myelin-substrate", features = ["test-support"] }
 # MR-009b W6c-cp — DEV-only: the dev config (`MyelinConfig::dev()`) the live-PG W6c-cp projection
 # integration test connects the pool with. DEV-only — never in the production DAG.
 myelin-config = { path = "../myelin-config" }

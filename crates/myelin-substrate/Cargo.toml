@@ -49,4 +49,6 @@ serde_json.workspace = true
 # (SI-007). Production constructs `OutboxSpec::durable(store, transport)` over a durable-backed
 # `OutboxStore`; a downstream crate's DEV tests that still boot the in-proc floor enable this as a
 # dev-dependency feature (never in the runtime DAG — audited via `cargo tree -e no-dev`).
-test-support = []
+# MR-009b W3b.5/.6: forwards to `myelin-events/test-support` — `default_inproc` constructs the
+# now-gated in-memory `OutboxStore::new()` double, so enabling the floor here enables it there.
+test-support = ["myelin-events/test-support"]
