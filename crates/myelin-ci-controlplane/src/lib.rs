@@ -122,6 +122,13 @@ pub mod job_queue_store;
 /// enqueue/cancel/complete/heartbeat queries in [`job_queue_store`] stay FULLY linted. Not part of
 /// the public surface — [`job_queue_store::CiJobQueueStore::claim`] / `reap` delegate to it.
 pub mod job_queue_region;
+/// CT-004c.2 — the runner exec binding: the durable `job_queue` store adapted to the sandbox
+/// [`myelin_ci_sandbox::LeaseStore`] port ([`runner_bind::DurableLeaseAdapter`]) + the bounded runner
+/// loop the service `main` spawns ([`runner_bind::CiRunnerLoop`]). Binds
+/// [`RunnerAgent`](myelin_ci_sandbox::RunnerAgent) to CT-004c.1's [`job_queue_store::CiJobQueueStore`]
+/// and executes the leased job in a real gVisor (`runsc`) guest — the tier/region claim predicate
+/// forwarded UNCHANGED (the adversarial-verifier surface).
+pub mod runner_bind;
 pub mod floor_followons;
 pub mod holder;
 pub mod live_tail;
@@ -392,6 +399,12 @@ pub use scheduler::{
 // predicate + the sandbox exec path).
 pub use job_queue_store::{
     CiJobQueueStore, DurableEnqueue, JobQueueReaper, JobQueueStoreError, LeasedJob,
+};
+
+// CT-004c.2: the runner exec binding — the durable-store lease adapter + the bounded runner loop the
+// service `main` spawns (WIRES `RunnerAgent` to `CiJobQueueStore` + a real gVisor backend).
+pub use runner_bind::{
+    spec_store_unavailable_resolver, CiRunnerLoop, DurableLeaseAdapter, JobSpecResolver,
 };
 
 // CI-P14 (P-357): the EU fleet autoscaler — the FleetProvider impl + autoscale-on-queue-depth +

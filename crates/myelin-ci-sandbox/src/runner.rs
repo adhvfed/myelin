@@ -304,6 +304,88 @@ impl JobLeaseStore {
 }
 
 // =================================================================================================
+// The lease/heartbeat PORT (CT-004c.2) — the seam [`RunnerAgent::run_one`] claims/heartbeats/settles
+// through, so the SAME agent drives BOTH the in-memory floor ([`JobLeaseStore`]) AND the DURABLE
+// `job_queue` store (`myelin_ci_controlplane::CiJobQueueStore`, adapted). Three moves, EXACTLY the
+// signatures `run_one` already calls — so binding the durable store is a NEW impl of this port, NOT a
+// change to the security-load-bearing claim→launch→report body.
+// =================================================================================================
+
+/// **The runner-side lease port (CT-004c.2) — claim / heartbeat / settle, the three moves
+/// [`RunnerAgent::run_one`] performs.** Modelled EXACTLY on the in-memory [`JobLeaseStore`]'s method
+/// shapes so the runner body is unchanged: the durable adapter
+/// (`myelin_ci_controlplane`'s `DurableLeaseAdapter`) implements THIS trait over the pool-backed
+/// `CiJobQueueStore`, passing the runner's `allowed_tiers` + `region` STRAIGHT THROUGH to the durable
+/// `FOR UPDATE SKIP LOCKED` claim UNCHANGED (an `untrusted_fork` job is never claimable by a
+/// trusted-only runner — the tier/region predicate is the durable store's, never re-derived here).
+///
+/// **The security contract of an impl:** [`claim_for_labels`](LeaseStore::claim_for_labels) MUST
+/// forward `allowed_tiers` and `region` to its claim WITHOUT widening, defaulting, or dropping either
+/// — the eligibility gate lives in the store the impl delegates to, never in the agent.
+pub trait LeaseStore {
+    /// Claim ONE eligible job for `worker`, in `region`, whose labels ⊆ `runner_labels` and whose
+    /// `trust_tier ∈ allowed_tiers`, taking a lease `= now + lease_ttl_secs`. `None` when nothing is
+    /// eligible (the long-poll found no work). The tier/region filter is forwarded UNCHANGED.
+    fn claim_for_labels(
+        &self,
+        worker: &str,
+        runner_labels: &[String],
+        allowed_tiers: &[crate::TrustTier],
+        region: &Region,
+        now: i64,
+        lease_ttl_secs: i64,
+    ) -> Option<QueuedJob>;
+
+    /// Renew the lease `worker` holds on `(tenant, job_id)`. `false` if the caller is NOT the owner
+    /// (the lost-lease detection [`RunnerAgent::run_one`] Step-2 stops on — fail-closed).
+    fn heartbeat(
+        &self,
+        worker: &str,
+        tenant: &TenantId,
+        job_id: &str,
+        now: i64,
+        lease_ttl_secs: i64,
+    ) -> bool;
+
+    /// Settle a claimed job on terminal (the engine signal idempotency — not this — is what makes the
+    /// wake exactly-once, so a settle after a redelivered report is a harmless no-op).
+    fn settle(&self, tenant: &TenantId, job_id: &str);
+}
+
+/// The in-memory floor IS a [`LeaseStore`] (the dev↔prod config swap). Each method delegates to the
+/// inherent method of the same name — method-call syntax resolves to the INHERENT method (inherent
+/// wins over a trait method), so this is a thin forward, never a recursion.
+impl LeaseStore for JobLeaseStore {
+    fn claim_for_labels(
+        &self,
+        worker: &str,
+        runner_labels: &[String],
+        allowed_tiers: &[crate::TrustTier],
+        region: &Region,
+        now: i64,
+        lease_ttl_secs: i64,
+    ) -> Option<QueuedJob> {
+        // Inherent `JobLeaseStore::claim_for_labels` (method-call → inherent, not this trait method).
+        self.claim_for_labels(worker, runner_labels, allowed_tiers, region, now, lease_ttl_secs)
+    }
+
+    fn heartbeat(
+        &self,
+        worker: &str,
+        tenant: &TenantId,
+        job_id: &str,
+        now: i64,
+        lease_ttl_secs: i64,
+    ) -> bool {
+        self.heartbeat(worker, tenant, job_id, now, lease_ttl_secs)
+    }
+
+    fn settle(&self, tenant: &TenantId, job_id: &str) {
+        self.settle(tenant, job_id)
+    }
+}
+
+// =================================================================================================
 // The firehose STUB seam — the full log pipeline is CI-P20 (named floor).
 // =================================================================================================
 
@@ -487,7 +569,8 @@ impl std::error::Error for RunnerError {}
 ///
 /// **Same binary hosted + self-hosted.** The self-hosted attestation gate + the tenant-scoped token
 /// mint is CI-P4 (→ P-240); here the runner CONSUMES the minted token off `JobSpec.run_token` (4.7).
-pub struct RunnerAgent<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter> {
+pub struct RunnerAgent<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore = JobLeaseStore>
+{
     /// the runner's worker id (the lease owner + the heartbeat principal).
     worker_id: String,
     /// the runner's labels — a job is claimable iff its labels ⊆ these (affinity).
@@ -499,8 +582,11 @@ pub struct RunnerAgent<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReport
     region: Region,
     /// the lease TTL seconds — `claim` sets `lease_expires = now + ttl`; `heartbeat` renews it.
     lease_ttl_secs: i64,
-    /// the job-queue lease store (the FOR UPDATE SKIP LOCKED + heartbeat primitive, arch 02 §2.1).
-    leases: JobLeaseStore,
+    /// the lease PORT (CT-004c.2): the in-memory floor ([`JobLeaseStore`]) OR the durable
+    /// `job_queue` store adapted to [`LeaseStore`] — the FOR UPDATE SKIP LOCKED claim + heartbeat
+    /// primitive (arch 02 §2.1). The claim's tier/region filter is the port impl's, forwarded
+    /// unchanged.
+    leases: L,
     /// the unified sandbox backend (CI-P1/CI-P2) — `launch`/`kill`; the runner does NOT reimplement
     /// the sandbox.
     backend: &'a B,
@@ -513,16 +599,19 @@ pub struct RunnerAgent<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReport
 }
 
 #[allow(clippy::too_many_arguments)]
-impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter> RunnerAgent<'a, B, F, T> {
+impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
+    RunnerAgent<'a, B, F, T, L>
+{
     /// Build a runner agent. `hooks` are the four-guarantee wiring seam (reserve/settle 11.7,
-    /// attribute 4.7, isolation-floor) every launch drives (X-6).
+    /// attribute 4.7, isolation-floor) every launch drives (X-6). `leases` is any [`LeaseStore`] —
+    /// the in-memory floor OR the durable adapter (CT-004c.2); the security body is identical.
     pub fn new(
         worker_id: impl Into<String>,
         labels: Vec<String>,
         allowed_tiers: Vec<crate::TrustTier>,
         region: Region,
         lease_ttl_secs: i64,
-        leases: JobLeaseStore,
+        leases: L,
         backend: &'a B,
         firehose: &'a F,
         reporter: &'a T,
