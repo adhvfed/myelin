@@ -248,7 +248,26 @@ pub enum ResolveError {
     /// The CAS blob write failed (the snapshot could not be content-addressed) — surfaced, never
     /// swallowed (the snapshot is the run's definition; no snapshot ⇒ no start).
     BlobWrite(String),
+    /// **The matrix cross-product exceeds [`MAX_TOTAL_MATRIX_INSTANCES`] (peer-review finding
+    /// 2026-07-16 #10 — resource-limit fail-closed).** `expand_matrix` materializes the full axis
+    /// cross-product; an unbounded config (e.g. ~8 axes × ~10 values) would OOM the dispatch consumer
+    /// on a SINGLE untrusted push. The instance count is computed with SATURATING arithmetic BEFORE any
+    /// expansion, so an astronomical product is refused without allocating it. Carries the offending
+    /// count + the cap for a self-describing error.
+    MatrixTooLarge {
+        /// The total (or running) resolved-instance count that tripped the cap (saturating).
+        count: usize,
+        /// The enforced ceiling ([`MAX_TOTAL_MATRIX_INSTANCES`]).
+        cap: usize,
+    },
 }
+
+/// **The hard ceiling on the total number of matrix-expanded job instances a single CI definition may
+/// resolve to (peer-review finding #10 — DoS floor).** A push whose config would fan out past this is
+/// refused fail-closed BEFORE the cross-product is materialized (the count is computed with saturating
+/// multiplication). 1024 is far above any legitimate pipeline (the workspace's largest real matrix is a
+/// few dozen instances) and far below anything that pressures the consumer's memory.
+pub const MAX_TOTAL_MATRIX_INSTANCES: usize = 1024;
 
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -273,6 +292,12 @@ impl std::fmt::Display for ResolveError {
             ResolveError::BlobWrite(e) => {
                 write!(f, "the CAS snapshot blob write failed: {e} (no snapshot ⇒ no start)")
             }
+            ResolveError::MatrixTooLarge { count, cap } => write!(
+                f,
+                "the matrix cross-product resolves to {count} job instances, over the {cap} ceiling — \
+                 rejected fail-closed (a push cannot fan out unbounded; raise the config's matrix or \
+                 split the pipeline)"
+            ),
         }
     }
 }
@@ -388,6 +413,26 @@ pub fn resolve_snapshot(
         }
     }
     validate_dag(&def.jobs)?;
+
+    // FINDING #10 — the matrix-expansion DoS floor: compute the TOTAL instance count with SATURATING
+    // multiplication BEFORE materializing anything, and refuse fail-closed past MAX_TOTAL_MATRIX_INSTANCES.
+    // Each job contributes the product of its axis value-counts (a non-matrix job = 1); an axis is
+    // non-empty by parse-validation. An untrusted push whose config would fan out to millions of
+    // instances is rejected without ever allocating the cross-product.
+    let mut total_instances: usize = 0;
+    for j in &def.jobs {
+        let job_instances = j
+            .matrix
+            .values()
+            .fold(1usize, |acc, vals| acc.saturating_mul(vals.len().max(1)));
+        total_instances = total_instances.saturating_add(job_instances);
+        if total_instances > MAX_TOTAL_MATRIX_INSTANCES {
+            return Err(ResolveError::MatrixTooLarge {
+                count: total_instances,
+                cap: MAX_TOTAL_MATRIX_INSTANCES,
+            });
+        }
+    }
 
     // Resolve + expand. Collect into a Vec, then sort by instance name for the deterministic order.
     let mut resolved: Vec<ResolvedJob> = Vec::new();
@@ -760,6 +805,39 @@ mod tests {
                 "the un-digested reference `{bad}` must be rejected fail-closed"
             );
         }
+    }
+
+    /// **Peer-review finding #10 — the matrix cross-product is capped (DoS floor).** A config with ~8
+    /// axes of 10 values fans out to 10^8 = 100M instances; the count is computed with SATURATING
+    /// arithmetic BEFORE expansion, so the push is refused fail-closed with `MatrixTooLarge` and NOTHING
+    /// is allocated. A legitimately-sized matrix (well under the ceiling) still resolves.
+    #[test]
+    fn an_unbounded_matrix_is_refused_before_it_is_materialized() {
+        // 8 axes × 10 values each = 10^8 instances — an OOM without the cap.
+        let mut job = JobDef::normal("build", PINNED);
+        for a in 0..8u32 {
+            job = job.with_matrix(
+                format!("axis{a}"),
+                (0..10u32).map(|v| v.to_string()).collect(),
+            );
+        }
+        let def = CiDefinition { on: OnTrigger::Push, jobs: vec![job] };
+        let err = resolve_snapshot(&def, &blobs(), &tenant())
+            .expect_err("an astronomical matrix must be refused");
+        assert!(
+            matches!(err, ResolveError::MatrixTooLarge { count, cap }
+                if count > cap && cap == MAX_TOTAL_MATRIX_INSTANCES),
+            "the over-cap matrix is refused fail-closed: {err:?}"
+        );
+
+        // A legitimate matrix (3 × 4 = 12 instances) still resolves + content-addresses.
+        let ok = JobDef::normal("test", PINNED2)
+            .with_matrix("os", vec!["linux".into(), "mac".into(), "win".into()])
+            .with_matrix("v", vec!["1".into(), "2".into(), "3".into(), "4".into()]);
+        let def_ok = CiDefinition { on: OnTrigger::Push, jobs: vec![ok] };
+        let (snap, _addr) = resolve_snapshot(&def_ok, &blobs(), &tenant())
+            .expect("a modestly-sized matrix resolves");
+        assert_eq!(snap.jobs.len(), 12, "3×4 expands to 12 instances");
     }
 
     /// **A digest-pinned definition resolves + content-addresses (the happy path).** Every image is
