@@ -38,6 +38,20 @@ use myelin_storage::{all_durable_migrations, HotTables, PgOutboxBacking, Substra
 use myelin_substrate::Config;
 use std::sync::Arc;
 
+/// The four-guarantee hooks the runner drives on every launch (X-6; arch 02 §5.2). The gVisor backend
+/// ALSO enforces the mandatory hardening profile internally (isolation floor) regardless of the hook,
+/// so these accept and let the launch reach the real `runsc` run. The REAL metering reserve/settle
+/// (against the cost store) + the per-run token attribution are the CT-004d bookend — wired here as the
+/// four-guarantee seam the sandbox drives (never bypassed).
+fn runner_hooks() -> myelin_ci_sandbox::RunnerHooks {
+    myelin_ci_sandbox::RunnerHooks {
+        reserve: Box::new(|m| Ok(myelin_ci_sandbox::ReserveHandle(m.reserve_id.clone()))),
+        settle: Box::new(|_h, _u| Ok(())),
+        attribute: Box::new(|_t| Ok(())),
+        isolation_floor: Box::new(|_s| Ok(())),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // FAIL LOUD on missing durable config (the W3b.4 pattern): the durable outbox requires the PG
@@ -134,6 +148,43 @@ async fn main() {
         std::time::Duration::from_secs(15),
     );
     tokio::spawn(reaper.run());
+    // CT-004c.2: OPT-IN spawn the bounded CI runner loop — it claims from the durable `job_queue` and
+    // EXECUTES the leased job in a REAL gVisor (`runsc`) guest (the AG-D4 gate). Gated behind
+    // `MYELIN_CI_RUNNER=1` (default OFF): a control-plane node runs untrusted code ONLY when explicitly
+    // enabled as a runner host — never implicitly on every boot. The loop runs on a DEDICATED thread
+    // (off the tokio runtime) so `RunnerAgent::run_one` (sync, blocking for the whole in-line job) does
+    // not starve a worker; the lease adapter bridges its async DB calls onto the runtime handle. The
+    // trust-tier/region claim predicate is CT-004c.1's durable store, forwarded UNCHANGED (an
+    // `untrusted_fork` job is never claimed by this trusted-only runner). The digest-pinned JobSpec
+    // store (the resolver's real backing) + the shared durable executor the `job.done` wakes are the
+    // CT-004d handoff — until then the resolver is a safe no-op (a leased-but-unresolved row is reaped),
+    // so enabling the runner before CT-004d never launches an unresolved job.
+    if std::env::var("MYELIN_CI_RUNNER").as_deref() == Ok("1") {
+        let region = provider.config().region.clone();
+        let runner_store = myelin_ci_controlplane::ci_job_queue_store(provider.db_pool().clone());
+        // The `job.done` target executor (CT-004d shares this with the parked `ci.pipeline` body). A
+        // hosted runner is cross-tenant; the per-run tenant scoping is the CT-004d executor's — this is
+        // the composition placeholder proving the one signal path (`EngineTerminalReporter`).
+        let executor = myelin_flow::FlowExecutor::new(
+            Arc::new(myelin_events::MonotonicMinter::new()),
+            myelin_tenancy::TenantId("ci-runner".into()),
+            myelin_tenancy::Region(region.clone()),
+        );
+        executor.register_definition(myelin_ci_controlplane::CI_PIPELINE_WF_TYPE);
+        let runner = myelin_ci_controlplane::CiRunnerLoop::new(
+            format!("ci-runner-{}", std::process::id()),
+            vec!["linux".to_string()],
+            vec![myelin_ci_sandbox::TrustTier::Trusted],
+            region,
+            30,
+            runner_store,
+            tokio::runtime::Handle::current(),
+            myelin_ci_controlplane::spec_store_unavailable_resolver(),
+            executor,
+            runner_hooks(),
+        );
+        runner.spawn();
+    }
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).
     match run_controlplane(Config::default(), outbox) {

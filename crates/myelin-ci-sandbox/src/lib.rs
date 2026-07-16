@@ -115,8 +115,8 @@ pub use gvisor::{
 };
 
 pub use runner::{
-    CountingFirehose, EngineTerminalReporter, FirehoseSink, JobLeaseStore, QueuedJob, RunOutcome,
-    RunnerAgent, RunnerError, TerminalReport, TerminalReporter,
+    CountingFirehose, EngineTerminalReporter, FirehoseSink, JobLeaseStore, LeaseStore, QueuedJob,
+    RunOutcome, RunnerAgent, RunnerError, TerminalReport, TerminalReporter,
 };
 
 use serde::{Deserialize, Serialize};
