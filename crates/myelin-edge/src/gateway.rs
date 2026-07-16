@@ -23,7 +23,7 @@ use crate::catalogue::{Handler, HandlerCtx, Method, Page};
 use crate::error::EdgeError;
 use crate::request::{EdgeRequest, EdgeResponse};
 use crate::session::{SessionStore, SESSION_COOKIE};
-use crate::sse::SseHub;
+use crate::sse::{SseEvent, SseHub};
 use myelin_identity::{AuthzError, Credential, Principal, PrincipalKind};
 use myelin_identity_service::{CapabilityAuthenticator, HumanSsoAuthenticator};
 use myelin_storage::TenantScope;
@@ -56,6 +56,75 @@ pub fn sse_scope_for_tenant(tenant: &str) -> String {
 /// bounded-validated), so the scope grammar is injective.
 pub fn sse_scope_for_resource(tenant: &str, param: &str, id: &str) -> String {
     format!("tenant:{tenant}/{param}:{id}")
+}
+
+/// **The UNAUTHENTICATED public auth surface (R3.5).** What the logged-out login page needs to render
+/// honestly BEFORE any session exists: whether SSO is wired (`sso_configured`), the provider label(s)
+/// to name on the primary button, and whether the dev-login seam may render (`dev_login_enabled`).
+/// Served by `GET /v1/auth/config` (in the pre-auth built-in route block, so it is reachable with no
+/// credential). It carries NOTHING sensitive — the presence of an IdP + a display label + a dev flag,
+/// nothing a logged-out attacker could not already infer from the login screen. The real OIDC
+/// verification config (issuer/audience/JWKS) is NEVER projected here.
+#[derive(Clone, Debug, Default)]
+pub struct AuthPublicConfig {
+    /// Whether a real OIDC IdP is wired at this edge (drives the primary button: enabled vs the
+    /// honest "SSO unavailable" reason).
+    pub sso_configured: bool,
+    /// The provider(s) to name on the login button (empty when `sso_configured` is false).
+    pub providers: Vec<AuthProvider>,
+    /// Whether the dev-login seam may render at all (belt-and-braces with the frontend build-time
+    /// PROD kill switch). Reflects the edge's `MYELIN_DEV_LOGIN` env at composition time.
+    pub dev_login_enabled: bool,
+}
+
+/// One login provider projected to the logged-out page — a stable `id` (the credential scheme, e.g.
+/// `oidc`) + a human `label` for the button. No secret, no endpoint.
+#[derive(Clone, Debug)]
+pub struct AuthProvider {
+    /// The credential scheme id (e.g. `oidc`).
+    pub id: String,
+    /// The human-facing button label (e.g. `Single sign-on`).
+    pub label: String,
+}
+
+/// Current wall-clock as unix millis (the `at` stamp on a lifecycle SSE frame). Dependency-free;
+/// a clock skew before the epoch collapses to 0 (the frame's meaning is carried by `type`+`slug`).
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// **The repo-lifecycle → firehose event mapping (R3.5, OQ-4 decision).** A successful (2xx) repo
+/// create / wire push becomes a TYPED firehose frame (`repo.created` / `repo.pushed`) so the
+/// first-run "waiting for your first push" affordance flips in place. Returns `None` for any other
+/// action or a non-2xx response (a failed create must NOT announce a repo). These are TRANSPORT
+/// events on the unified firehose, NOT inbox items (your own push is not a notification) — the
+/// content policy stays separate from the transport (the gate's OQ-4 "no second channel").
+fn repo_lifecycle_event(
+    action: &str,
+    params: &BTreeMap<String, String>,
+    resp: &EdgeResponse,
+) -> Option<(&'static str, String)> {
+    if !(200..300).contains(&resp.status()) {
+        return None;
+    }
+    match action {
+        // The create handler's response carries `applied.slug` — the authoritative created slug.
+        "git.repo.create" => resp
+            .json_body()
+            .and_then(|v| {
+                v.get("applied")
+                    .and_then(|a| a.get("slug"))
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string)
+            })
+            .map(|slug| ("repo.created", slug)),
+        // The wire receive-pack (push) route binds `{repo}` in its path — the pushed repo slug.
+        "git.wire.receive_pack" => params.get("repo").cloned().map(|slug| ("repo.pushed", slug)),
+        _ => None,
+    }
 }
 
 /// Is a client-supplied resource id BOUNDED enough to become part of an SSE scope? (The §7.7
@@ -130,6 +199,7 @@ pub struct GatewayBuilder {
     sse: SseHub,
     sessions: SessionStore,
     public_surface: PublicSurface,
+    auth_config: AuthPublicConfig,
 }
 
 impl GatewayBuilder {
@@ -256,6 +326,15 @@ impl GatewayBuilder {
         self
     }
 
+    /// Set the UNAUTHENTICATED public auth surface (`GET /v1/auth/config`) — the composition root
+    /// derives it from the OIDC config + the dev-login env (R3.5). Default = SSO not configured,
+    /// dev-login off (the fail-closed default: a login page over this default shows the honest
+    /// "SSO unavailable" reason and no dev seam).
+    pub fn with_auth_config(mut self, cfg: AuthPublicConfig) -> GatewayBuilder {
+        self.auth_config = cfg;
+        self
+    }
+
     /// Finish building the gateway.
     pub fn build(self) -> Gateway {
         Gateway {
@@ -267,6 +346,7 @@ impl GatewayBuilder {
             sse: self.sse,
             sessions: self.sessions,
             public_surface: self.public_surface,
+            auth_config: self.auth_config,
         }
     }
 }
@@ -282,6 +362,7 @@ pub struct Gateway {
     sse: SseHub,
     sessions: SessionStore,
     public_surface: PublicSurface,
+    auth_config: AuthPublicConfig,
 }
 
 impl Gateway {
@@ -300,6 +381,7 @@ impl Gateway {
             sse: SseHub::new(),
             sessions: SessionStore::new(),
             public_surface: PublicSurface::default(),
+            auth_config: AuthPublicConfig::default(),
         }
     }
 
@@ -333,7 +415,11 @@ impl Gateway {
             .ok_or_else(|| EdgeError::BadRequest(format!("unsupported method `{}`", req.method)))?;
 
         // Built-in auth routes (the cookie-session machinery; login refuses-not-mocks).
+        // `/v1/auth/config` is UNAUTHENTICATED by construction — it is matched here, BEFORE the
+        // authenticate step, exactly like login/logout/refresh, because the logged-out login page
+        // must read it with no session (R3.5 / OQ-3). It projects nothing sensitive.
         match (method, req.path.as_str()) {
+            (Method::Get, "/v1/auth/config") => return Ok(self.auth_config_response()),
             (Method::Post, "/v1/auth/login") => return self.login(req),
             (Method::Post, "/v1/auth/logout") => return Ok(self.logout(req)),
             (Method::Post, "/v1/auth/refresh") => return self.refresh(req),
@@ -372,7 +458,14 @@ impl Gateway {
                     page: &page,
                     request: req,
                 };
-                handler.handle(&ctx)
+                // Dispatch first; an error short-circuits (no lifecycle announce on a failed write).
+                let resp = handler.handle(&ctx)?;
+                // R3.5 (OQ-4): on a successful repo create / wire push, publish a TYPED frame onto
+                // the SAME tenant firehose (`edge` stream) the UI already subscribes to — no second
+                // channel. This is what makes the first-run "waiting for your first push" affordance
+                // flip in place.
+                self.broadcast_repo_lifecycle(&route.action, &params, &scope, &resp);
+                Ok(resp)
             }
             RouteKind::Sse {
                 stream,
@@ -462,6 +555,49 @@ impl Gateway {
                 .map_err(|reject| EdgeError::Forbidden(format!("cross-tenant IDOR rejected: {reject}")))?;
         }
         Ok(TenantScope::from_verified_token(principal, principal.region.clone()))
+    }
+
+    /// `GET /v1/auth/config` (UNAUTHENTICATED) — the logged-out login page's honest render source
+    /// (R3.5): `{ sso_configured, providers:[{id,label}], dev_login_enabled }`. Projects nothing
+    /// sensitive (see [`AuthPublicConfig`]).
+    fn auth_config_response(&self) -> EdgeResponse {
+        let providers: Vec<serde_json::Value> = self
+            .auth_config
+            .providers
+            .iter()
+            .map(|p| json!({ "id": p.id, "label": p.label }))
+            .collect();
+        EdgeResponse::json(
+            200,
+            &json!({
+                "sso_configured": self.auth_config.sso_configured,
+                "providers": providers,
+                "dev_login_enabled": self.auth_config.dev_login_enabled,
+            }),
+        )
+    }
+
+    /// Publish a repo-lifecycle frame ([`repo_lifecycle_event`]) to the tenant firehose after a
+    /// successful create/push — the R3.5 (OQ-4) unified-transport wiring. Scope is ALWAYS the
+    /// gateway-derived verified tenant (never a client selector); a frame with no live subscriber is
+    /// dropped (the ephemeral firehose posture — durability rides the resume-cursor seam).
+    fn broadcast_repo_lifecycle(
+        &self,
+        action: &str,
+        params: &BTreeMap<String, String>,
+        scope: &TenantScope,
+        resp: &EdgeResponse,
+    ) {
+        let Some((event_type, slug)) = repo_lifecycle_event(action, params, resp) else {
+            return;
+        };
+        let tenant = &scope.tenant().0;
+        let data = json!({ "type": event_type, "slug": slug, "at": now_millis() }).to_string();
+        self.sse.broadcast(
+            "edge",
+            &sse_scope_for_tenant(tenant),
+            SseEvent::typed(event_type, data),
+        );
     }
 
     /// `POST /v1/auth/login` — runs the REAL production human verifier (refuse-not-mock). The human
@@ -686,6 +822,119 @@ mod tests {
             vec![],
         ));
         assert_eq!(resp.status(), 401, "a forged token never resolves a principal");
+    }
+
+    // ── R3.5 — the unauthenticated public auth surface + the repo-lifecycle firehose wiring ──
+
+    /// `GET /v1/auth/config` is reachable with NO credential (it is matched in the pre-auth built-in
+    /// block) and projects the `{ sso_configured, providers, dev_login_enabled }` shape the
+    /// logged-out login page needs.
+    #[test]
+    fn auth_config_is_unauthenticated_and_reports_the_shape() {
+        let gw = Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll))
+            .with_auth_config(AuthPublicConfig {
+                sso_configured: true,
+                providers: vec![AuthProvider {
+                    id: "oidc".into(),
+                    label: "Single sign-on".into(),
+                }],
+                dev_login_enabled: false,
+            })
+            .build();
+        // No Authorization header, no session cookie — still 200 (unauthenticated by construction).
+        let resp = gw.handle(EdgeRequest::new("GET", "/v1/auth/config", "", vec![], vec![]));
+        assert_eq!(resp.status(), 200, "auth/config must be reachable logged-out");
+        let b = resp.json_body().unwrap();
+        assert_eq!(b["sso_configured"], true);
+        assert_eq!(b["dev_login_enabled"], false);
+        assert_eq!(b["providers"][0]["id"], "oidc");
+        assert_eq!(b["providers"][0]["label"], "Single sign-on");
+    }
+
+    /// `dev_login_enabled` faithfully reflects the composed config (env-driven at the composition
+    /// root) — here the two opposite values, proving the field is not hardcoded.
+    #[test]
+    fn auth_config_dev_login_flag_reflects_the_composed_value() {
+        for enabled in [true, false] {
+            let gw = Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll))
+                .with_auth_config(AuthPublicConfig {
+                    sso_configured: false,
+                    providers: vec![],
+                    dev_login_enabled: enabled,
+                })
+                .build();
+            let resp = gw.handle(EdgeRequest::new("GET", "/v1/auth/config", "", vec![], vec![]));
+            assert_eq!(resp.json_body().unwrap()["dev_login_enabled"], enabled);
+        }
+        // The default (no `.with_auth_config`) is fail-closed: SSO off, dev seam off.
+        let dflt = gw().handle(EdgeRequest::new("GET", "/v1/auth/config", "", vec![], vec![]));
+        let b = dflt.json_body().unwrap();
+        assert_eq!(b["sso_configured"], false);
+        assert_eq!(b["dev_login_enabled"], false);
+    }
+
+    /// The repo-lifecycle event mapping: a 2xx create → `repo.created` (slug from the response
+    /// `applied.slug`); a 2xx wire push → `repo.pushed` (slug from the `{repo}` path param); a
+    /// non-2xx or unrelated action → no frame (a failed create must NOT announce a repo).
+    #[test]
+    fn repo_lifecycle_event_maps_create_and_push_only_on_success() {
+        let created = EdgeResponse::json(
+            201,
+            &json!({ "applied": { "action": "git.repo.create", "slug": "widgets" }, "durable": true }),
+        );
+        let empty = BTreeMap::new();
+        assert_eq!(
+            repo_lifecycle_event("git.repo.create", &empty, &created),
+            Some(("repo.created", "widgets".to_string()))
+        );
+
+        let mut params = BTreeMap::new();
+        params.insert("repo".to_string(), "widgets".to_string());
+        let pushed = EdgeResponse::json(200, &json!({ "ok": true }));
+        assert_eq!(
+            repo_lifecycle_event("git.wire.receive_pack", &params, &pushed),
+            Some(("repo.pushed", "widgets".to_string()))
+        );
+
+        // A FAILED create (non-2xx) announces nothing.
+        let conflict = EdgeResponse::json(409, &json!({ "error": { "message": "exists" } }));
+        assert_eq!(repo_lifecycle_event("git.repo.create", &empty, &conflict), None);
+        // An unrelated action never announces.
+        assert_eq!(repo_lifecycle_event("git.pr.view", &empty, &created), None);
+    }
+
+    /// End-to-end wiring: a successful create dispatched through the gateway BROADCASTS a
+    /// `repo.created` typed frame onto the tenant firehose (`edge` stream, `tenant:<t>` scope) — the
+    /// exact channel the first-run "waiting for your first push" affordance subscribes to.
+    #[test]
+    fn create_broadcasts_repo_created_on_the_tenant_firehose() {
+        let gw = gw();
+        // A subscriber on the acme tenant firehose (the same key the SSE route derives).
+        let mut rx = gw
+            .sse_hub()
+            .subscribe("edge", &sse_scope_for_tenant("acme"))
+            .into_receiver();
+        // Drive the post-dispatch broadcast directly (the same call `handle_inner` makes after a
+        // successful Normal dispatch), with a real verified-token tenant scope.
+        let scope = TenantScope::from_verified_token(
+            &Principal::stub(
+                myelin_identity::PrincipalId("creator".into()),
+                PrincipalKind::Human,
+                TenantId("acme".into()),
+            ),
+            myelin_tenancy::Region("eu-west".into()),
+        );
+        let resp = EdgeResponse::json(
+            201,
+            &json!({ "applied": { "action": "git.repo.create", "slug": "widgets" } }),
+        );
+        gw.broadcast_repo_lifecycle("git.repo.create", &BTreeMap::new(), &scope, &resp);
+
+        let frame = rx.try_recv().expect("a repo.created frame reached the tenant subscriber");
+        assert_eq!(frame.event.as_deref(), Some("repo.created"));
+        let data: serde_json::Value = serde_json::from_str(&frame.data).unwrap();
+        assert_eq!(data["type"], "repo.created");
+        assert_eq!(data["slug"], "widgets");
     }
 
     #[test]

@@ -22,3 +22,21 @@ export function devLoginAllowed(env: DevLoginEnv): boolean {
   const explicitlyOptedIn = env.MYELIN_DEV_LOGIN === "1";
   return !isProduction && explicitlyOptedIn;
 }
+
+/**
+ * The dev-login SEAM RENDER gate (R3.5 / OQ-6). The login page paints the dev seam ONLY when THREE
+ * independent gates all hold — the most conservative posture so no single misconfiguration shows a
+ * dev seam on a real deployment:
+ *   1. the frontend build is NOT production (`isProdBuild === false`, the build-time PROD kill switch),
+ *   2. the frontend server opted the seam in (`devLoginAllowed(env)`), AND
+ *   3. the edge's public config agrees (`edgeDevLoginEnabled` from `GET /v1/auth/config`).
+ * Server truth (the frontend that owns the seam) wins; the edge flag is one more required gate. Pure +
+ * injectable, so it is unit-tested without touching any server module.
+ */
+export function devSeamAllowed(
+  edgeDevLoginEnabled: boolean,
+  env: DevLoginEnv,
+  isProdBuild: boolean,
+): boolean {
+  return !isProdBuild && devLoginAllowed(env) && edgeDevLoginEnabled;
+}
