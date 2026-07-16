@@ -94,9 +94,30 @@ async fn main() {
         provider.db_pool().clone(),
         tokio::runtime::Handle::current(),
     )));
+    // CT-004b — the LIVE `ci-dispatch.trigger` consumer construction site. It is built from the
+    // provider pool + the git read backend + the tenant CAS blob store + the durable reserve store
+    // via `myelin_ci_dispatch::build_trigger_consumer` and handed to `run_dispatch` as one
+    // `ConsumerReg` (replacing the shell's former `Vec::new()`). Three of the four backings are
+    // available here today:
+    //   - the durable reserve store: `OutboxReserveStore::new(outbox.clone(), minter)` co-commits
+    //     `ci.run.started` + the queued `ci.check.updated` through the DURABLE outbox above;
+    //   - the git read backend: `DurableGitConfigReader::new(DurableGitStore::with_root(<git root>))`;
+    //   - the exactly-once `DedupLedger` for the `Consumer` runtime.
+    // The FOURTH — the CAS `BlobStore` the resolver writes the definition snapshot to (contract
+    // 11.2, `S3BlobStore` over RustFS/Scaleway) — is INTEGRATION-GATED in this crate's Cargo.toml
+    // (`aws-sdk-s3` + `myelin-storage/integration`), so a DEFAULT-features binary has no CAS backing
+    // to construct here; that + the cross-service git-read hop + the `myelin-storage` durable
+    // `ci_run` backing (the `ci_run` table is owned by `myelin-ci-controlplane`, NOT applied by
+    // `all_durable_migrations()` here) are the NAMED wiring floors. The consumer LOGIC + the durable
+    // reserve/idempotency are proven end-to-end on live PG in
+    // `tests/integration_ci_ct004b_trigger_consumer.rs`. Until the CAS-blob backing is wired into
+    // this default build, the production binary boots the shell (no consumer registered) rather than
+    // half-wire a consumer that cannot content-address its snapshot.
+    let consumers = Vec::new();
+
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).
-    match run_dispatch(Config::default(), outbox) {
+    match run_dispatch(Config::default(), outbox, consumers) {
         Ok(()) => {}
         Err(e) => {
             // A failed boot / incomplete drain returns non-zero (§3.1) — loud, never swallowed.

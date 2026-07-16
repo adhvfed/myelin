@@ -67,11 +67,19 @@
 //! `tests/integration_ci_p6_dispatch_schema.rs` behind the `integration` cargo feature.
 
 pub mod config;
+pub mod consumer;
 pub mod dispatch;
 pub mod migrations;
 pub mod resolve;
 
 pub use config::{parse_ci_config, CiConfigError, ConfigFormat};
+
+pub use consumer::{
+    build_trigger_consumer, plan_dispatch, resolve_ci_config, ArmedRun, CiTriggerHandler,
+    DispatchOutcome, DurableGitConfigReader, GitConfigReader, GitReadError, OutboxReserveStore,
+    ReserveError, ReserveFacts, ReserveStore, SkipReason, CI_TRIGGER_SUBJECTS,
+    CI_TRIGGER_SUBJECT_STRS,
+};
 
 pub use dispatch::{
     classify_trust, compile_trigger, git_trust_of, stamp_trust, trigger_matches, DedupLedger,
@@ -85,8 +93,8 @@ pub use resolve::{
 };
 
 use myelin_substrate::{
-    boot, serve, AppSpec, Config, CriticalDependencies, InternalRpc, OutboxSpec, PublicRoutes,
-    ServeError, ServeHandle, StoreManifest,
+    boot, serve, AppSpec, Config, ConsumerReg, CriticalDependencies, InternalRpc, OutboxSpec,
+    PublicRoutes, ServeError, ServeHandle, StoreManifest,
 };
 
 pub use migrations::{dispatch_migrations, CONSUMER_DEDUP_TABLE, CREATE_CONSUMER_DEDUP_DDL};
@@ -124,7 +132,11 @@ fn dispatch_critical() -> CriticalDependencies {
 /// `SubstrateProvider` pool (foundation migrations applied, FAIL LOUD on missing durable config);
 /// a test/drill passes the `test-support`-gated in-memory `OutboxStore::new()` double. This
 /// builder constructs NO store of its own — the issues/flow W3b.4 injection pattern.
-pub fn dispatch_app_spec(config: Config, outbox: myelin_events::OutboxStore) -> AppSpec {
+pub fn dispatch_app_spec(
+    config: Config,
+    outbox: myelin_events::OutboxStore,
+    consumers: Vec<ConsumerReg>,
+) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
         config,
@@ -134,9 +146,13 @@ pub fn dispatch_app_spec(config: Config, outbox: myelin_events::OutboxStore) -> 
         hot_tables: myelin_substrate::HotTables::none(),
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
-        // No consumers at the shell — the dispatch behaviour is CI-P10's `dispatch` core; the
-        // bus-subscription that wires it in lands with CI-P11's reserve/start.
-        consumers: Vec::new(),
+        // **CT-004b: the LIVE bus consumer is INJECTED here** — `main.rs` builds the
+        // [`consumer::CiTriggerHandler`] from the provider pool + the git read backend + the tenant
+        // blob store + the durable reserve store, wraps it in `Consumer::new(handler, sub, dedup)`
+        // and hands it as one `ConsumerReg`. A shell-only boot (a drill / the DB-free port tests)
+        // passes `Vec::new()`. This is the seam that made dispatch FIRE: the shell's former
+        // `consumers: Vec::new()` is replaced by the injected trigger consumer.
+        consumers,
         holders: AppSpec::auto(),
         // Trigger & Dispatch owns only its OLTP store (the dedup ledger lives in it); the harness
         // adds the implicit OLTP store + auto-registers it as a holder.
@@ -155,15 +171,20 @@ pub fn dispatch_app_spec(config: Config, outbox: myelin_events::OutboxStore) -> 
 pub fn boot_dispatch(
     config: Config,
     outbox: myelin_events::OutboxStore,
+    consumers: Vec<ConsumerReg>,
 ) -> Result<ServeHandle, ServeError> {
-    boot(dispatch_app_spec(config, outbox))
+    boot(dispatch_app_spec(config, outbox, consumers))
 }
 
 /// **The CI Trigger & Dispatch service entry — the one `serve(AppSpec)` call (contract 1.1).** The
 /// `ci-dispatch` binary (`src/main.rs`) does nothing but hand [`dispatch_app_spec`] to this. A
 /// failed boot / incomplete drain returns non-zero (§3.1) — loud, never a silent success.
-pub fn run_dispatch(config: Config, outbox: myelin_events::OutboxStore) -> Result<(), ServeError> {
-    serve(dispatch_app_spec(config, outbox))
+pub fn run_dispatch(
+    config: Config,
+    outbox: myelin_events::OutboxStore,
+    consumers: Vec<ConsumerReg>,
+) -> Result<(), ServeError> {
+    serve(dispatch_app_spec(config, outbox, consumers))
 }
 
 #[cfg(test)]
@@ -177,7 +198,7 @@ mod tests {
     /// three-surface split and liveness ≠ readiness, and a forward-only migration creates the ledger.
     #[test]
     fn dispatch_boots_from_serve_appspec_with_three_ports() {
-        let handle = boot_dispatch(Config::default(), myelin_events::OutboxStore::new())
+        let handle = boot_dispatch(Config::default(), myelin_events::OutboxStore::new(), Vec::new())
             .expect("the Trigger & Dispatch shell boots from serve(AppSpec)");
         assert_eq!(handle.name(), SERVICE_NAME, "the deployable service name");
 
@@ -205,8 +226,8 @@ mod tests {
     /// — but stays live (no restart storm).
     #[test]
     fn dead_broker_flips_readiness_not_liveness() {
-        let handle =
-            boot_dispatch(Config::default(), myelin_events::OutboxStore::new()).expect("boot");
+        let handle = boot_dispatch(Config::default(), myelin_events::OutboxStore::new(), Vec::new())
+            .expect("boot");
         let mh = handle.metrics_health();
         assert!(
             mh.readiness().is_ready(),
@@ -232,7 +253,7 @@ mod tests {
     #[test]
     fn run_dispatch_runs_lifecycle_and_returns_ok() {
         assert_eq!(
-            run_dispatch(Config::default(), myelin_events::OutboxStore::new()),
+            run_dispatch(Config::default(), myelin_events::OutboxStore::new(), Vec::new()),
             Ok(()),
             "the Trigger & Dispatch shell boots → … → drains cleanly"
         );
@@ -242,7 +263,11 @@ mod tests {
     /// boot loudly — the shell never starts half-booted.
     #[test]
     fn failed_boot_returns_non_zero() {
-        let r = run_dispatch(Config("BAD_POOL".into()), myelin_events::OutboxStore::new());
+        let r = run_dispatch(
+            Config("BAD_POOL".into()),
+            myelin_events::OutboxStore::new(),
+            Vec::new(),
+        );
         assert!(r.is_err(), "a failed boot must return non-zero (Err)");
         assert!(
             r.unwrap_err().0.contains("fail-fast"),
@@ -250,12 +275,36 @@ mod tests {
         );
     }
 
-    /// **The shell carries the dedup-ledger migration + the critical deps, and NO consumers (the
-    /// dispatch-behaviour floor).** Pins the shell's surface so a later edit that smuggles in a
-    /// consumer/handler without reconciliation, or drops the dedup ledger, is loud.
+    /// **The shell carries the dedup-ledger migration + the critical deps, and REGISTERS the injected
+    /// trigger consumer (CT-004b: dispatch now FIRES).** Pins the shell's surface: the dedup ledger is
+    /// the one owned table, `broker`/`authz` are critical, and the injected `ci-dispatch.trigger`
+    /// consumer is carried through to the `AppSpec` (the former `consumers: Vec::new()` is gone).
     #[test]
-    fn the_shell_carries_the_dedup_ledger_and_no_consumers() {
-        let spec = dispatch_app_spec(Config::default(), myelin_events::OutboxStore::new());
+    fn the_shell_carries_the_dedup_ledger_and_the_injected_trigger_consumer() {
+        use std::sync::Arc;
+        // The DB-free trigger consumer (the CT-004b live handler) over the test doubles.
+        let handler = consumer::CiTriggerHandler::new(
+            Arc::new(consumer::MapGitConfigReader::new()),
+            Arc::new(myelin_storage::FsBlobStore::new()),
+            Arc::new(consumer::RecordingReserveStore::new()),
+        );
+        let sub = myelin_events::consumer::Subscription::bind(
+            myelin_events::ConsumerName(TRIGGER_CONSUMER.into()),
+            CI_TRIGGER_SUBJECT_STRS,
+            myelin_events::PrefetchBound::DEFAULT,
+        )
+        .expect("the CI trigger whitelist binds (never `*`)");
+        let reg = ConsumerReg::new(myelin_events::Consumer::new(
+            handler,
+            sub,
+            myelin_events::DedupLedger::new(),
+        ));
+
+        let spec = dispatch_app_spec(
+            Config::default(),
+            myelin_events::OutboxStore::new(),
+            vec![reg],
+        );
         assert_eq!(
             spec.migrations.0.len(),
             1,
@@ -266,10 +315,10 @@ mod tests {
             Some(CONSUMER_DEDUP_TABLE),
             "the migration creates the consumer_dedup ledger"
         );
-        assert!(
-            spec.consumers.is_empty(),
-            "no consumers at the shell yet (the dispatch BEHAVIOUR is CI-P10's `dispatch` module; \
-             the bus-subscription that wires it in lands with CI-P11's reserve/start)"
+        assert_eq!(
+            spec.consumers.len(),
+            1,
+            "the injected ci-dispatch.trigger consumer is registered (CT-004b — dispatch FIRES)"
         );
         let deps: Vec<&str> = spec.critical.deps().iter().map(|d| d.0.as_str()).collect();
         assert!(
@@ -279,6 +328,38 @@ mod tests {
         assert!(
             deps.contains(&"authz"),
             "authz is critical (the trust-tier ABAC edge)"
+        );
+
+        // A shell-only boot (no consumers) is still valid — the DB-free port tests use it.
+        let empty = dispatch_app_spec(Config::default(), myelin_events::OutboxStore::new(), Vec::new());
+        assert!(empty.consumers.is_empty(), "the shell boots with no consumers too");
+    }
+
+    /// **The injected trigger consumer boots + drains cleanly through the full lifecycle.** Proves the
+    /// live consumer registers into `serve(AppSpec)` and the harness drives it (boot → … → drain).
+    #[test]
+    fn the_injected_consumer_boots_and_drains() {
+        use std::sync::Arc;
+        let handler = consumer::CiTriggerHandler::new(
+            Arc::new(consumer::MapGitConfigReader::new()),
+            Arc::new(myelin_storage::FsBlobStore::new()),
+            Arc::new(consumer::RecordingReserveStore::new()),
+        );
+        let sub = myelin_events::consumer::Subscription::bind(
+            myelin_events::ConsumerName(TRIGGER_CONSUMER.into()),
+            CI_TRIGGER_SUBJECT_STRS,
+            myelin_events::PrefetchBound::DEFAULT,
+        )
+        .unwrap();
+        let reg = ConsumerReg::new(myelin_events::Consumer::new(
+            handler,
+            sub,
+            myelin_events::DedupLedger::new(),
+        ));
+        assert_eq!(
+            run_dispatch(Config::default(), myelin_events::OutboxStore::new(), vec![reg]),
+            Ok(()),
+            "the live trigger consumer boots → … → drains cleanly"
         );
     }
 }
