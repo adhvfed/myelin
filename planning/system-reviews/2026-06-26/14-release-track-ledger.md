@@ -455,7 +455,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
 | R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | CT-004 grounding scout running |
-| R4.3 | Backup/restore drill (repeating) on real dogfood data | AFTER R4.1 |
+| R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (needs minimal issues subsystem; until then findings land in this ledger) | QUEUED |
 
 R4 exit gate: 4 consecutive weeks where the founder never needed GitHub for daily work.
@@ -527,6 +527,16 @@ untested seam (real-edge response shapes → SSR gateway → rendered HTML) is c
 drift. **R4.1 is complete: the founder's push/pull/PR flow works on production infra via git CLI, the JSON API, AND
 the browser.** Remaining R4 phases: R4.2 (CT-004 CI reconcile — decomposed above), R4.3 (backup/restore drill on the
 now-real dogfood data), R4.4 (stand up Myelin's own issue tracker to host the burndown that lived here).
+
+**R4.3 DONE + PASSING (2026-07-16):** `scripts/backup-drill.sh run` captures the LIVE dogfood data (a `pg_dump -Fc`
+of the `myelin` DB + a tar of the on-disk git object tier under MYELIN_GIT_ROOT), RESTORES both into a CLEAN target
+(a fresh `myelin_restore_drill` DB + a clean git root), and VERIFIES byte-identity: PG row-count parity across
+principal/rebac_tuple/cell_token_root/outbox/kms_sealed_root/revocation (6/6 identical), and per-repo `git fsck` +
+ref→oid + HEAD-symref parity (the same destructive-restore property `myelin_git::backup` asserts, now proven on
+real data — dogfood2.git main+feat at the merged oid HEAD→main, myelin.git main+add-vision, all fsck-clean). Ran
+twice green (KEEP=1 then default), cleanup + idempotency proven (DROP DATABASE IF EXISTS). Schedulable via
+systemd-timer/cron (recipe in the script tail); full off-site DR (S3 bucket sync + 3-2-1 off-host) is the R5.3
+ops-runbook extension. Tier-0 "our backups actually restore" is now a repeatable drill, not an assumption.
 
 **CT-004 grounding (scouted 2026-07-16): RECONCILE + HARDEN, not green-field.** The census line "runs
 no CI work" is true only at the `serve(AppSpec)` layer: scheduler (CI-P12 claim/reap/DRR), pipeline
