@@ -641,6 +641,40 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         out.sort_by_key(|r| r.number);
         Ok(out)
     }
+
+    /// **The highest PR number present on disk, from the FILENAMES (`<n>.json`) — never the parsed
+    /// content (peer-review finding 2026-07-16 #3).** PR-number allocation MUST NOT derive from
+    /// [`list`](Self::list): `list` is a tolerant VIEW that skips an unreadable/unparseable record, so
+    /// deriving `next = max(parsed numbers) + 1` from it would REUSE a corrupt highest-numbered PR's
+    /// number and OVERWRITE its file (silent data loss). A PR's number is authoritative in its filename
+    /// (`pr_path` writes `<n>.json`), so this reads the directory entries and takes the max of the
+    /// numbers parsed from the `.json` stems — a corrupt record still counts, so its number is never
+    /// re-issued. Returns `None` on an empty/absent dir (the first PR is #1).
+    pub fn max_pr_number(&self, repo: &RepoLoc) -> Result<Option<u64>, DurableError> {
+        let dir = self.prs_dir(repo)?;
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(DurableError::Io(format!("read_dir {}: {e}", dir.display()))),
+        };
+        let mut max: Option<u64> = None;
+        for entry in rd {
+            let entry = entry.map_err(|e| DurableError::Io(format!("dir entry: {e}")))?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            // The number is the file STEM (`<n>.json`) — authoritative regardless of content validity.
+            if let Some(n) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                max = Some(max.map_or(n, |m| m.max(n)));
+            }
+        }
+        Ok(max)
+    }
 }
 
 // ───────────────────────────── the gated, durable merge ───────────────────────────────────────────
@@ -1076,6 +1110,32 @@ mod tests {
             other => panic!("expected Merged, got {other:?}"),
         }
         assert_eq!(rs.tip(&RefName::new("refs/heads/main")), Some(PushOid::new(c2.0)));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Peer-review finding 2026-07-16 #3: PR-number allocation is FILENAME-authoritative — a corrupt
+    /// highest-numbered record still bumps `max_pr_number`, so its number is never re-issued (which
+    /// would overwrite the live-but-corrupt PR). `list()` (the tolerant view) skips it; number
+    /// allocation must NOT.
+    #[test]
+    fn max_pr_number_counts_a_corrupt_record_so_its_number_is_never_reused() {
+        let root = temp_root("prnum");
+        let store = DurablePrStore::rooted(&root);
+        // Two valid PRs (#1, #2) + a corrupt #3.json (unparseable content).
+        store.open_pr(&loc(), &open_record(1, "refs/heads/main", &"a".repeat(40), "psn:a@acme")).unwrap();
+        store.open_pr(&loc(), &open_record(2, "refs/heads/main", &"b".repeat(40), "psn:a@acme")).unwrap();
+        let corrupt = store.pr_path(&loc(), 3).unwrap();
+        std::fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
+        std::fs::write(&corrupt, b"{ this is not valid PrRecord json").unwrap();
+
+        // `list()` (the tolerant view) skips the corrupt record → sees only #1, #2.
+        assert_eq!(store.list(&loc()).unwrap().len(), 2, "list() tolerantly skips the corrupt record");
+        // But number allocation counts it → next is #4, NOT #3 (no reuse / no overwrite).
+        assert_eq!(
+            store.max_pr_number(&loc()).unwrap(),
+            Some(3),
+            "the corrupt highest-numbered record still sets the max (filename-authoritative)"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
