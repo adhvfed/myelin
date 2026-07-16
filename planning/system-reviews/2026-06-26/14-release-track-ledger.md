@@ -548,8 +548,12 @@ gaps found: metering has NO durable PG impl (model-only); the `.myelin/ci.*` YAM
 JSON-Schema validation is missing (`resolve_snapshot` takes pre-parsed `CiDefinition`); runner rides
 an in-memory `JobLeaseStore` + `CountingFirehose`/`FsBlobStore` floors; check ingestion is bus-only
 (no HTTP report endpoint — "only CI may git.checks.report" is an authz token, not a mounted route).
-Decomposition (scout, deps in parens): **CT-004a** durable kill-9 harden + real PG metering (starts
-now) · **CT-004b** dispatch trigger consumer live (git.ref.updated→compile→dedup→stamp→resolve→
+Decomposition (scout, deps in parens): **CT-004a** durable kill-9 harden + real PG metering — **DONE `57f42b6`**
+(`CiCostEventStore` with_pg: settle_in_tx caller-tx co-commit + cost_events_for_run readback + deterministic
+cost_id idempotency; owns ONLY the CI reporting projection, money-truth stays in storage CostLedger; dormant,
+CT-004d attaches it. Kill-9 durability proven through the store 1/1 + p28 regression 4/4. **CT-004d PREREQ found:**
+Storage `cost_event` [0050] vs CI `cost_event` [ci_0014] table-name collision in the single-binary composition —
+harmless today, must reconcile [CI own DB / distinct name] before a live settle.) · **CT-004b** dispatch trigger consumer live (git.ref.updated→compile→dedup→stamp→resolve→
 reserve_and_start) + the real ci.* parser (a) · **CT-004c** scheduler/lease loop live on `job_queue`
 + reaper/autoscaler background loops (a) · **CT-004d** pipeline body + metering bookends live (b,c) ·
 **CT-004e** check/result producers live → closes the X-1 seam to the merge gate (d) · **CT-004f** log
