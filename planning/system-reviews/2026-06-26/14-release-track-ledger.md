@@ -556,10 +556,21 @@ Storage `cost_event` [0050] vs CI `cost_event` [ci_0014] table-name collision in
 harmless today, must reconcile [CI own DB / distinct name] before a live settle.) · **CT-004b** dispatch trigger consumer live (git.ref.updated→compile→dedup→stamp→resolve→
 reserve_and_start) + the real ci.* parser (a) — **PARSER DONE `3e14285`** (`parse_ci_config` TOML+JSON,
 deny_unknown_fields fail-closed, YAML deferred [serde_yaml archived]; structural-validation half, resolver
-keeps DAG/digest/matrix; 17 tests + compose proof). **CONSUMER IN PROGRESS** (live `ci-dispatch.trigger`
+keeps DAG/digest/matrix; 17 tests + compose proof). **CONSUMER DONE `381a0e4`** (live `ci-dispatch.trigger`
 EventHandler → read `.myelin/ci.*` at new_oid via myelin-git read backend → parse → resolve_snapshot →
-persist the atomic reserve/start bundle [ci_run + queued check + ci.run.started]; live pipeline EXECUTION =
-CT-004d) · **CT-004c** scheduler/lease loop live on `job_queue`
+persist the atomic reserve/start bundle; proven on live PG — envelope→durable ci_run + queued ci.check.updated
++ ci.run.started in one tx, idempotent [redelivery→0 dup]; trigger-match = type-family equality NOT
+EventMatcher [authz run-object gate — documented seam]; config/resolve errors = fail-closed surfaced skips;
+main.rs still boots the SHELL [no default-feature CAS BlobStore/git-read backing]; live pipeline EXECUTION =
+CT-004d). **★ CT-004m (NEXT — shared foundation blocker from BOTH a+b): CI durable-table migration/ownership
+reconcile.** The 14 CI tables (ci_run…cost_event) are owned by `ci_controlplane_migrations()` via the CI
+serve AppSpec; each service takes its own DATABASE_URL. (1) ci-DISPATCH writes ci_run but doesn't apply the
+CI migrations → prod-per-service-DB lacks it; the production durable ci_run writer belongs in a shared
+CI-schema owner (likely myelin-storage). (2) storage cost_event [0050] vs CI cost_event [ci_0014] collide in
+the single-binary composition. Reconcile: a clear CI migration owner + schema/DB boundary (own schema OR
+ci_-prefixed names) so dispatch+controlplane point at the same migrated CI tables in dev AND prod. Design-heavy
+— ground the DB-per-service boundary first. Unblocks LIVE serve-wiring of CT-004a settle + CT-004b consumer +
+CT-004c/d. · **CT-004c** scheduler/lease loop live on `job_queue`
 + reaper/autoscaler background loops (a) · **CT-004d** pipeline body + metering bookends live (b,c) ·
 **CT-004e** check/result producers live → closes the X-1 seam to the merge gate (d) · **CT-004f** log
 pipeline live substrate (a; SSE tail is CT-005) · **CT-004g** fleet/residency (c, optional split).
