@@ -7,37 +7,24 @@ import {
   getSessionRecord,
   issueSession,
 } from "../server/session";
-import { edgeGetPublic } from "../server/gateway";
+import { edgeGetPublic, edgeWhoamiWithToken } from "../server/gateway";
 import {
   DEV_ACCESS_TOKEN,
   DEV_PRINCIPAL,
   DEV_REFRESH_TOKEN,
   DEV_SCHEME,
 } from "../../dev-edge/dev-contract.mjs";
-import { devLoginAllowed, devSeamAllowed, type DevLoginEnv } from "./dev-login-guard";
+import { devLoginAllowed, type DevLoginEnv } from "./dev-login-guard";
+import { runTokenLogin } from "./token-login";
+import {
+  toAuthConfig,
+  type AuthConfig,
+  type AuthProvider,
+  type EdgeAuthConfig,
+} from "./auth-config";
 
-/** One SSO provider the login page names on its primary button (edge `GET /v1/auth/config`). */
-export interface AuthProvider {
-  id: string;
-  label: string;
-}
-
-/** The logged-out login page's honest render source — the edge's SSO posture (`sso_configured` +
- *  `providers`) plus whether the dev seam may render. Fetched UNAUTHENTICATED via
- *  `GET /v1/auth/config`. `dev_login_enabled` here is the FRONTEND-authoritative render gate (see
- *  {@link getAuthConfig}), belt-and-braces with the build-time PROD kill switch. */
-export interface AuthConfig {
-  sso_configured: boolean;
-  providers: AuthProvider[];
-  dev_login_enabled: boolean;
-}
-
-/** The edge's raw `/v1/auth/config` shape (its `dev_login_enabled` reflects the EDGE env). */
-interface EdgeAuthConfig {
-  sso_configured?: boolean;
-  providers?: AuthProvider[];
-  dev_login_enabled?: boolean;
-}
+// Re-exported from the pure mapping module so existing importers (`../lib/auth`) are unchanged.
+export type { AuthConfig, AuthProvider };
 
 /** The PII-free viewer facts the chrome renders (identity menu + residency cue). Null = no session. */
 export interface Viewer {
@@ -147,17 +134,35 @@ export const getAuthConfig = query(async (): Promise<AuthConfig> => {
     // Fail-closed render: no SSO, no dev seam. The login page still renders (honest "unavailable").
     edge = { sso_configured: false, providers: [], dev_login_enabled: false };
   }
-  return {
-    sso_configured: edge.sso_configured ?? false,
-    providers: edge.providers ?? [],
-    // The RENDER gate is the frontend-authoritative composition (build + frontend env + edge flag).
-    dev_login_enabled: devSeamAllowed(
-      edge.dev_login_enabled ?? false,
-      process.env as DevLoginEnv,
-      import.meta.env.PROD,
-    ),
-  };
+  // The mapping (dev-seam composition + the token-login edge flag) is the pure {@link toAuthConfig}.
+  return toAuthConfig(edge, process.env as DevLoginEnv, import.meta.env.PROD);
 }, "auth-config");
+
+/**
+ * **R4.0 — THE OPERATOR-TOKEN LOGIN (the real browser on-ramp for dogfood).** The founder pastes the
+ * capability token that `edge bootstrap` printed; this action VERIFIES it server-side against the real
+ * edge (`GET /v1/whoami` with the pasted token) and, on a 200, mints a session carrying the token +
+ * the whoami-returned principal/tenant/region — then lands in the app. Unlike the dev seam this is NOT
+ * a stand-in: it authenticates against the live edge. The token is a SECRET — it flows only as the
+ * submitted form value → this server function → the edge; it is never logged, never returned to the
+ * client, never placed in a URL. On any failure (invalid/expired token, edge unreachable) the founder
+ * is bounced to `/login?error=token_invalid` with NO session and NO leaked edge detail. The decision
+ * lives in the pure {@link runTokenLogin} core; this wires the real whoami-verify + session-issue deps.
+ */
+export const loginWithToken = action(async (formData: FormData) => {
+  "use server";
+  const token = String(formData.get("token") ?? "");
+  const schemeRaw = formData.get("scheme");
+  const result = await runTokenLogin(
+    token,
+    schemeRaw != null ? String(schemeRaw) : undefined,
+    {
+      verify: (t, s) => edgeWhoamiWithToken(t, s),
+      issue: (rec) => issueSession(rec),
+    },
+  );
+  throw redirect(result.redirectTo);
+}, "login-with-token");
 
 /**
  * **Begin SSO login (R3.5).** The primary button posts here when SSO is configured. VERIFIED FLOOR:

@@ -52,6 +52,41 @@ export async function edgeGetPublic<T = unknown>(path: string): Promise<T> {
   return JSON.parse(bodyText) as T;
 }
 
+/** The edge's `GET /v1/whoami` view-model (crates/myelin-edge gateway.rs). */
+export interface EdgeWhoami {
+  principal_id: string;
+  tenant: string;
+  region: string;
+  kind: string;
+}
+
+/**
+ * VERIFY a CALLER-SUPPLIED capability token (R4.0 operator-token login). Calls the edge's
+ * authenticated `GET /v1/whoami` with the PASTED token (NOT the session's) + the token scheme header,
+ * and returns the viewer facts on a 200. This is how the frontend proves a bootstrap token actually
+ * authenticates before minting a session. Server-only — the token never reaches client JS, and a
+ * non-200 throws a token-FREE `Unauthorized` (the raw edge body is NEVER attached, so it can't leak).
+ */
+export async function edgeWhoamiWithToken(token: string, scheme = "agent"): Promise<EdgeWhoami> {
+  const res = await fetch(`${edgeUrl()}/v1/whoami`, {
+    method: "GET",
+    headers: {
+      accept: "application/json",
+      authorization: `Bearer ${token}`,
+      "x-myelin-token-scheme": scheme,
+    },
+  });
+  if (res.status !== 200) {
+    // Do NOT attach the response body — it could echo the token or an internal error. Honest, opaque.
+    throw new Unauthorized(`token verification failed (HTTP ${res.status})`);
+  }
+  const who = (await res.json().catch(() => null)) as EdgeWhoami | null;
+  if (!who || typeof who.principal_id !== "string" || !who.principal_id) {
+    throw new Unauthorized("token verification returned an unexpected shape");
+  }
+  return who;
+}
+
 async function edgeRequest<T>(method: string, path: string, body?: unknown): Promise<T> {
   const scheme = getSessionRecord()?.scheme ?? "pat";
   return runGateway<T>({
