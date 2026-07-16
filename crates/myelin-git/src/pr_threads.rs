@@ -510,6 +510,14 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
                     "review {review_id} is already submitted — cannot append pending comments"
                 )))
             }
+            // A draft batch is PRIVATE to its author (the write-side of the `view_for` read filter):
+            // only the batch's own reviewer may append pending comments. Anything else is a 403 —
+            // never let one principal inject a comment into another's private draft (R3.3 verifier H).
+            Some(r) if r.reviewer.display != author.display => {
+                return Err(DurableError::Forbidden(format!(
+                    "review {review_id} belongs to another reviewer"
+                )))
+            }
             Some(_) => {}
         }
         let tid = doc.next_id("t");
@@ -544,15 +552,25 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         repo: &RepoLoc,
         object_key: &str,
         review_id: &str,
+        actor: &ThreadPrincipal,
         verdict: BatchVerdict,
         summary_md: Option<String>,
         now: i64,
     ) -> Result<Option<SubmittedBatch>, DurableError> {
         let mut doc = self.load(repo, object_key)?;
-        let already = match doc.review(review_id) {
+        let (owner_display, already) = match doc.review(review_id) {
             None => return Err(DurableError::NotFound(format!("review {review_id}"))),
-            Some(r) => !r.is_draft(),
+            Some(r) => (r.reviewer.display.clone(), !r.is_draft()),
         };
+        // Only the batch's OWN reviewer may submit it — else a Push holder could force-publish another
+        // reviewer's private draft under their identity/verdict (R3.3 verifier H-1: verdict forgery).
+        // The ownership check precedes the idempotency short-circuit so a stranger targeting an
+        // already-submitted batch still gets a 403, not a misleading idempotent success.
+        if owner_display != actor.display {
+            return Err(DurableError::Forbidden(format!(
+                "review {review_id} belongs to another reviewer"
+            )));
+        }
         if already {
             return Ok(None); // idempotent — one event per batch, never a double on retry.
         }
@@ -593,6 +611,7 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         repo: &RepoLoc,
         object_key: &str,
         review_id: &str,
+        actor: &ThreadPrincipal,
     ) -> Result<(), DurableError> {
         let mut doc = self.load(repo, object_key)?;
         match doc.review(review_id) {
@@ -600,6 +619,13 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             Some(r) if !r.is_draft() => {
                 return Err(DurableError::Forbidden(format!(
                     "review {review_id} is already submitted — its comments are public record"
+                )))
+            }
+            // Only the batch's OWN reviewer may discard it — else a Push holder could destroy another
+            // reviewer's private draft (R3.3 verifier H-2).
+            Some(r) if r.reviewer.display != actor.display => {
+                return Err(DurableError::Forbidden(format!(
+                    "review {review_id} belongs to another reviewer"
                 )))
             }
             Some(_) => {}
@@ -709,7 +735,15 @@ mod tests {
 
         // After submit, the comment is visible to everyone.
         store
-            .submit_review(&loc(), KEY, &batch.id, BatchVerdict::ChangesRequested, None, 300)
+            .submit_review(
+                &loc(),
+                KEY,
+                &batch.id,
+                &human("psn:reviewer@acme"),
+                BatchVerdict::ChangesRequested,
+                None,
+                300,
+            )
             .unwrap();
         let doc = store.load(&loc(), KEY).unwrap();
         let other = doc.view_for("psn:other@acme");
@@ -743,7 +777,15 @@ mod tests {
         }
         // First submit → ONE event carrying all three comments.
         let first = store
-            .submit_review(&loc(), KEY, &batch.id, BatchVerdict::Approved, Some("LGTM".into()), 400)
+            .submit_review(
+                &loc(),
+                KEY,
+                &batch.id,
+                &human("psn:reviewer@acme"),
+                BatchVerdict::Approved,
+                Some("LGTM".into()),
+                400,
+            )
             .unwrap();
         let ev = first.expect("first submit yields exactly one batch event");
         assert_eq!(ev.comment_ids.len(), 3, "the ONE event carries the whole batch");
@@ -751,7 +793,15 @@ mod tests {
         assert_eq!(ev.review.summary_md.as_deref(), Some("LGTM"));
         // Re-submit → idempotent None (no second event, no verdict change).
         let second = store
-            .submit_review(&loc(), KEY, &batch.id, BatchVerdict::Commented, None, 500)
+            .submit_review(
+                &loc(),
+                KEY,
+                &batch.id,
+                &human("psn:reviewer@acme"),
+                BatchVerdict::Commented,
+                None,
+                500,
+            )
             .unwrap();
         assert!(second.is_none(), "a re-submit must NOT emit a second event");
         std::fs::remove_dir_all(&root).ok();
@@ -782,7 +832,9 @@ mod tests {
         store
             .add_pending_comment(&loc(), KEY, &batch.id, None, human("psn:r@acme"), "draft", 1)
             .unwrap();
-        store.discard_review(&loc(), KEY, &batch.id).unwrap();
+        store
+            .discard_review(&loc(), KEY, &batch.id, &human("psn:r@acme"))
+            .unwrap();
         let doc = store.load(&loc(), KEY).unwrap();
         assert_eq!(doc.threads.len(), 0, "discard removes the draft's threads");
         assert_eq!(doc.reviews.len(), 0);
@@ -790,12 +842,61 @@ mod tests {
         // A submitted batch cannot be discarded.
         let b2 = store.start_review(&loc(), KEY, human("psn:r@acme")).unwrap();
         store
-            .submit_review(&loc(), KEY, &b2.id, BatchVerdict::Commented, None, 2)
+            .submit_review(
+                &loc(),
+                KEY,
+                &b2.id,
+                &human("psn:r@acme"),
+                BatchVerdict::Commented,
+                None,
+                2,
+            )
             .unwrap();
         assert!(matches!(
-            store.discard_review(&loc(), KEY, &b2.id),
+            store.discard_review(&loc(), KEY, &b2.id, &human("psn:r@acme")),
             Err(DurableError::Forbidden(_))
         ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **BINDING (R3.3 verifier H-1/H-2): a review batch is PRIVATE to its author on the WRITE side.**
+    /// Another principal (even one holding repo write) cannot submit, discard, or append to someone
+    /// else's draft batch — each is a `Forbidden`, and the draft is left intact and still private.
+    #[test]
+    fn a_batch_is_not_submittable_discardable_or_appendable_by_a_non_author() {
+        let root = temp_root("batch-owner");
+        let store = DurablePrThreadStore::rooted(&root);
+        let author = human("psn:author@acme");
+        let attacker = human("psn:attacker@acme");
+        let batch = store.start_review(&loc(), KEY, author.clone()).unwrap();
+        store
+            .add_pending_comment(&loc(), KEY, &batch.id, None, author.clone(), "secret draft", 1)
+            .unwrap();
+
+        // H-1: the attacker cannot force-submit the author's private draft.
+        assert!(matches!(
+            store.submit_review(&loc(), KEY, &batch.id, &attacker, BatchVerdict::Approved, Some("forged".into()), 2),
+            Err(DurableError::Forbidden(_))
+        ));
+        // H-2: nor discard it.
+        assert!(matches!(
+            store.discard_review(&loc(), KEY, &batch.id, &attacker),
+            Err(DurableError::Forbidden(_))
+        ));
+        // Nor inject a comment into it.
+        assert!(matches!(
+            store.add_pending_comment(&loc(), KEY, &batch.id, None, attacker.clone(), "injected", 3),
+            Err(DurableError::Forbidden(_))
+        ));
+
+        // The draft survived intact and is STILL private to its author, still submittable by them.
+        let doc = store.load(&loc(), KEY).unwrap();
+        assert_eq!(doc.view_for("psn:attacker@acme").reviews.len(), 0, "still hidden from the attacker");
+        assert_eq!(doc.view_for("psn:author@acme").reviews.len(), 1, "author still owns their draft");
+        let submitted = store
+            .submit_review(&loc(), KEY, &batch.id, &author, BatchVerdict::Approved, None, 4)
+            .unwrap();
+        assert!(submitted.is_some(), "the real author can still submit their own batch");
         std::fs::remove_dir_all(&root).ok();
     }
 
