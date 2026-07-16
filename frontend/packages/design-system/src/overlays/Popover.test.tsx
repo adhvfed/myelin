@@ -70,9 +70,36 @@ describe("Popover (hovercard)", () => {
     ));
     const trigger = screen.getByRole("button", { name: "@alice" });
     trigger.focus(); // real focus dispatches focusin → opens (hover AND focus)
-    expect(screen.getByRole("dialog", { name: "alice card" })).toBeTruthy();
+    expect(screen.getByRole("note", { name: "alice card" })).toBeTruthy();
     // Esc dismisses (dismissable).
     fireEvent.keyDown(trigger, { key: "Escape" });
+    expect(screen.queryByRole("note")).toBeNull();
+  });
+
+  it("does NOT advertise dialog semantics for the hovercard (finding 7)", () => {
+    render(() => (
+      <Popover variant="hover" triggerLabel="@alice" label="alice card">
+        Profile
+      </Popover>
+    ));
+    const trigger = screen.getByRole("button", { name: "@alice" });
+    // The hover trigger must not claim aria-haspopup=dialog (it's a non-modal informational surface).
+    expect(trigger.getAttribute("aria-haspopup")).toBeNull();
+    trigger.focus();
+    // The panel is a lighter role=note, not role=dialog.
     expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByRole("note", { name: "alice card" })).toBeTruthy();
+  });
+
+  it("the click variant still advertises dialog semantics", () => {
+    render(() => (
+      <Popover variant="click" triggerLabel="Filters" label="Filter builder">
+        <button>Apply</button>
+      </Popover>
+    ));
+    const trigger = screen.getByRole("button", { name: "Filters" });
+    expect(trigger.getAttribute("aria-haspopup")).toBe("dialog");
+    fireEvent.click(trigger);
+    expect(screen.getByRole("dialog", { name: "Filter builder" })).toBeTruthy();
   });
 });

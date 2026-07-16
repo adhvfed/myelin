@@ -7,6 +7,7 @@
 import { Show, createUniqueId, splitProps, mergeProps, type JSX } from "solid-js";
 import { OverlayPortal } from "./primitives/OverlayPortal";
 import { createOverlay } from "./primitives/createOverlay";
+import { getFocusable } from "./primitives/overlay-core";
 import { Icon } from "../Icon";
 
 export type DialogSize = "sm" | "md" | "lg";
@@ -56,6 +57,7 @@ export function Dialog(props: DialogProps): JSX.Element {
   ]);
 
   let panel: HTMLDivElement | undefined;
+  let body: HTMLDivElement | undefined;
   const titleId = createUniqueId();
   const descId = createUniqueId();
 
@@ -66,7 +68,11 @@ export function Dialog(props: DialogProps): JSX.Element {
     modal: true,
     closeOnEscape: () => local.dismissable,
     closeOnOutsidePointer: () => local.dismissable, // backdrop dismiss tracks the same flag
-    autoFocus: local.initialFocus ?? true,
+    // Default initial focus prefers the first meaningful control in the BODY (or the panel container
+    // itself), NOT the header Close (X) — otherwise an immediate Enter/Space closes the dialog (APG
+    // fix, fe-ds finding 5). An explicit initialFocus (e.g. ConfirmDialog's safe action, the palette
+    // input) always wins.
+    autoFocus: local.initialFocus ?? (() => (body ? (getFocusable(body)[0] ?? panel) : panel)),
   });
 
   return (
@@ -158,7 +164,7 @@ export function Dialog(props: DialogProps): JSX.Element {
               </Show>
             </header>
 
-            <div style={{ padding: "var(--space-4)", overflow: "auto", "min-block-size": "0" }}>
+            <div ref={body} style={{ padding: "var(--space-4)", overflow: "auto", "min-block-size": "0" }}>
               <Show when={local.description}>
                 <p id={descId} style={{ margin: "0 0 var(--space-3)", color: "var(--text-muted)" }}>
                   {local.description}

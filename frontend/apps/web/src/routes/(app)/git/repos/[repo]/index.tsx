@@ -5,7 +5,7 @@
 import { ErrorBoundary, For, Show, Suspense, Switch, Match } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, useParams } from "@solidjs/router";
-import { Icon, useToast } from "@myelin/design-system";
+import { Icon, useToast, Skeleton, SkeletonBlock } from "@myelin/design-system";
 import { getRepo } from "~/lib/api";
 import { NotAvailable } from "~/components/NotAvailable";
 
@@ -39,7 +39,15 @@ export default function RepoHomeScreen() {
           </p>
         )}
       >
-        <Suspense fallback={<p style={{ color: "var(--text-muted)" }}>Loading repository…</p>}>
+        <Suspense
+          fallback={
+            <Skeleton label="Loading repository…" data-testid="repo-loading">
+              <SkeletonBlock height="var(--fs-h1)" width="14rem" />
+              <SkeletonBlock height="2.5rem" width="20rem" style={{ "margin-block-start": "var(--space-3)" }} />
+              <SkeletonBlock height="10rem" style={{ "margin-block-start": "var(--space-3)" }} />
+            </Skeleton>
+          }
+        >
           <Show when={params.repo} fallback={<NotAvailable kind="repository" />}>
           <Show when={repo()} keyed>
             {(home) => (

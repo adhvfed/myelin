@@ -41,6 +41,55 @@ button {
   color: inherit;
 }
 
+/* Full-viewport shells: dvh so mobile browser chrome (the retractable address bar) doesn't clip the
+   fixed frame; the 100vh line before it is the fallback for engines without dvh (UX finding 7). */
+.app-shell {
+  height: 100vh;
+  height: 100dvh;
+}
+.login-main {
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+/* Interactive chrome colour lives in CSS classes, never inline styles — inline colour beats
+   :hover/:focus specificity, so an inline-coloured control can never receive hover feedback
+   (DESIGN-MANUAL §7 PROVEN don't). Only layout stays inline on these elements. */
+
+/* Primary nav rail item: resting muted; selected/active = --surface-hover fill + brighter text and
+   NO colored side-bar marker (R1 binding, §7). Hover gives the same non-colour surface feedback. */
+.nav-rail-item {
+  color: var(--text-muted);
+  background: transparent;
+}
+.nav-rail-item:hover {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+.nav-rail-item[aria-current="page"] {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+
+/* The ⌘K trigger — reads as a muted search field, brightens on hover. */
+.cmdk-trigger {
+  color: var(--text-muted);
+  background: var(--surface);
+}
+.cmdk-trigger:hover {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+
+/* The inbox affordance. */
+.inbox-button {
+  color: var(--text-primary);
+  background: var(--surface);
+}
+.inbox-button:hover {
+  background: var(--surface-hover);
+}
+
 /* The skip link (WCAG 2.4.1 bypass blocks) — visible only on focus. */
 .skip-link {
   position: absolute;

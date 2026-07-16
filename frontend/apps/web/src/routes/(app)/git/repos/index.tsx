@@ -5,7 +5,7 @@
 import { ErrorBoundary, For, Show, Suspense } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync } from "@solidjs/router";
-import { Icon } from "@myelin/design-system";
+import { Icon, Skeleton } from "@myelin/design-system";
 import { getRepos, type RepoHomeVM } from "~/lib/api";
 import { bareRepo } from "~/lib/format";
 
@@ -26,7 +26,7 @@ export default function ReposScreen() {
           </p>
         )}
       >
-        <Suspense fallback={<p style={{ color: "var(--text-muted)" }}>Loading repositories…</p>}>
+        <Suspense fallback={<Skeleton label="Loading repositories…" rows={4} rowHeight="4rem" data-testid="repos-loading" />}>
           <Show when={repos()} keyed>
             {(page) => (
               <Show

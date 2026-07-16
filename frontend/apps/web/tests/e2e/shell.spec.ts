@@ -79,6 +79,36 @@ test.describe("MR-019 app shell — real browser", () => {
     await expect(trigger).toBeFocused();
   });
 
+  test("the autofocused palette input keeps the shared focus ring (no inline outline:none)", async ({ page }) => {
+    await devLogin(page);
+    await page.keyboard.press("Meta+k");
+    const search = page.getByRole("combobox", { name: /Search or run a command/ });
+    await expect(search).toBeFocused();
+    // Manual must-ship #5: the palette input must NOT zero its outline inline — the shared
+    // zero-specificity :focus-visible ring must be able to paint on the flagship keyboard surface.
+    expect(await search.evaluate((el) => (el as HTMLElement).style.outline)).toBe("");
+    expect(await search.evaluate((el) => getComputedStyle(el).outlineWidth)).not.toBe("0px");
+  });
+
+  test("the active nav rail item is a --surface-hover fill, never an --accent fill (R1 binding)", async ({ page }) => {
+    await devLogin(page);
+    const active = page.locator('a.nav-rail-item[aria-current="page"]').first();
+    await expect(active).toBeVisible();
+    const { got, hover, accent } = await page.evaluate(() => {
+      const link = document.querySelector('a.nav-rail-item[aria-current="page"]') as HTMLElement;
+      const probe = document.createElement("div");
+      document.body.appendChild(probe);
+      probe.style.background = "var(--surface-hover)";
+      const hover = getComputedStyle(probe).backgroundColor;
+      probe.style.background = "var(--accent)";
+      const accent = getComputedStyle(probe).backgroundColor;
+      probe.remove();
+      return { got: getComputedStyle(link).backgroundColor, hover, accent };
+    });
+    expect(got).toBe(hover); // active fill = --surface-hover
+    expect(got).not.toBe(accent); // never the saturated accent tile
+  });
+
   test("a command runs in-place: type 'inbox' + Enter opens the inbox overlay", async ({ page }) => {
     await devLogin(page);
     await page.keyboard.press("Meta+k");

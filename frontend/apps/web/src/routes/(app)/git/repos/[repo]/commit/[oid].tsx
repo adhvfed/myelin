@@ -6,7 +6,7 @@
 import { ErrorBoundary, For, Show, Suspense } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, useParams } from "@solidjs/router";
-import { Icon } from "@myelin/design-system";
+import { Icon, Skeleton, SkeletonBlock } from "@myelin/design-system";
 import { getCommit, type DiffFileVM, type DiffLineVM } from "~/lib/api";
 import { fmtDate } from "~/lib/format";
 import { NotAvailable } from "~/components/NotAvailable";
@@ -41,7 +41,14 @@ export default function CommitDiffScreen() {
           </p>
         )}
       >
-        <Suspense fallback={<p style={{ color: "var(--text-muted)" }}>Loading commit…</p>}>
+        <Suspense
+          fallback={
+            <Skeleton label="Loading commit…" data-testid="commit-loading">
+              <SkeletonBlock height="5rem" />
+              <SkeletonBlock height="12rem" style={{ "margin-block-start": "var(--space-3)" }} />
+            </Skeleton>
+          }
+        >
           <Show when={ready()} fallback={<NotAvailable kind="commit" />}>
           <Show when={commit()} keyed>
             {(c) => (

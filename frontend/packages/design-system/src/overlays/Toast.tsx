@@ -110,6 +110,9 @@ export function ToastProvider(props: { children?: JSX.Element }): JSX.Element {
           ref={region}
           role="region"
           aria-label="Notifications"
+          // Marks this as a persistent live layer: a modal's hideOthers() skips it, so a toast raised
+          // while a Dialog is open stays announced (WCAG 4.1.3) and its Undo stays F6-reachable.
+          data-overlay-live=""
           style={{
             position: "fixed",
             "inset-block-end": "var(--space-4)",

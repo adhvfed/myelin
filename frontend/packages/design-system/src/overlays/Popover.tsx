@@ -38,7 +38,7 @@ export function Popover(props: PopoverProps): JSX.Element {
   const [local] = splitProps(merged, ["triggerLabel", "label", "variant", "placement", "children"]);
 
   const [open, setOpen] = createSignal(false);
-  const [pos, setPos] = createSignal({ left: 0, top: 0 });
+  const [pos, setPos] = createSignal({ left: 0, top: 0, maxBlockSize: 0 });
   let trigger: HTMLButtonElement | undefined;
   let panel: HTMLDivElement | undefined;
   let closeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -59,7 +59,7 @@ export function Popover(props: PopoverProps): JSX.Element {
   createEffect(() => {
     if (!open() || !trigger || !panel) return;
     const p = computePosition(trigger, panel, local.placement);
-    setPos({ left: p.left, top: p.top });
+    setPos({ left: p.left, top: p.top, maxBlockSize: p.maxBlockSize });
   });
 
   const cancelClose = () => {
@@ -90,7 +90,9 @@ export function Popover(props: PopoverProps): JSX.Element {
       <button
         ref={trigger}
         type="button"
-        aria-haspopup="dialog"
+        // Only the interactive click variant advertises a dialog popup. The hovercard is a non-modal
+        // informational surface, so it does NOT claim haspopup=dialog (fe-ds finding 7).
+        aria-haspopup={local.variant === "click" ? "dialog" : undefined}
         aria-expanded={open()}
         aria-controls={open() ? panelId : undefined}
         onClick={() => local.variant === "click" && setOpen((v) => !v)}
@@ -116,7 +118,9 @@ export function Popover(props: PopoverProps): JSX.Element {
           <div
             ref={panel}
             id={panelId}
-            role="dialog"
+            // click = an interactive dialog; hover = a non-modal hovercard (role=note, lighter
+            // semantics — never over-promise modal-dialog to AT) (fe-ds finding 7).
+            role={local.variant === "click" ? "dialog" : "note"}
             aria-label={local.label}
             // hoverable: keep the hovercard open while the pointer is on it (1.4.13).
             onPointerEnter={cancelClose}
@@ -127,6 +131,10 @@ export function Popover(props: PopoverProps): JSX.Element {
               top: `${pos().top}px`,
               "z-index": "var(--z-popover)",
               "max-inline-size": "20rem",
+              // Apply the positioner's viewport clamp so a tall popover scrolls, never overflows
+              // off-screen (fe-ds finding 2).
+              "max-block-size": pos().maxBlockSize > 0 ? `${pos().maxBlockSize}px` : undefined,
+              "overflow-y": "auto",
               background: "var(--surface-overlay)",
               color: "var(--text-primary)",
               border: "var(--hairline) solid var(--border)",

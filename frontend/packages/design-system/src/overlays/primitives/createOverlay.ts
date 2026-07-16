@@ -50,9 +50,12 @@ export function createOverlay(opts: CreateOverlayOptions): void {
 
     const id = pushOverlay();
     const modal = opts.modal ?? false;
-    const closeOnEscape = resolveBool(opts.closeOnEscape, true);
-    const closeOnOutsidePointer = resolveBool(opts.closeOnOutsidePointer, true);
     const restoreFocus = opts.restoreFocus ?? true;
+    // The reactive dismiss flags are read at EVENT time inside the handlers below — NOT snapshotted
+    // here. Snapshotting subscribed this effect to e.g. Dialog's `() => dismissable`, so toggling it
+    // mid-open (a real pattern: freeze dismiss during an in-flight confirm) tore down + re-ran the
+    // whole setup — churning scroll-lock/inert and yanking initial focus back. Reading at event time
+    // keeps the flag reactive without re-running the effect.
 
     // Record where focus came from BEFORE we move it, for the return-focus guarantee.
     const previouslyFocused = document.activeElement as HTMLElement | null;
@@ -80,7 +83,7 @@ export function createOverlay(opts: CreateOverlayOptions): void {
 
     const onKeydown = (e: KeyboardEvent) => {
       if (!isTopmost(id)) return; // nested: only the top-most overlay reacts (overlays.md §8)
-      if (e.key === "Escape" && closeOnEscape) {
+      if (e.key === "Escape" && resolveBool(opts.closeOnEscape, true)) {
         // stopPropagation so a modal opened from inside a panel doesn't also collapse that panel.
         e.stopPropagation();
         opts.onDismiss();
@@ -93,7 +96,7 @@ export function createOverlay(opts: CreateOverlayOptions): void {
     };
 
     const onPointerDown = (e: Event) => {
-      if (!isTopmost(id) || !closeOnOutsidePointer) return;
+      if (!isTopmost(id) || !resolveBool(opts.closeOnOutsidePointer, true)) return;
       const current = opts.contentRef();
       const trigger = opts.triggerRef?.();
       const target = e.target as Node | null;

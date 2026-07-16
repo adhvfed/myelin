@@ -5,7 +5,7 @@
 import { ErrorBoundary, For, Show, Suspense } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, useParams, useSearchParams } from "@solidjs/router";
-import { Icon } from "@myelin/design-system";
+import { Icon, Skeleton } from "@myelin/design-system";
 import { getCommits } from "~/lib/api";
 import { fmtDate } from "~/lib/format";
 import { NotAvailable } from "~/components/NotAvailable";
@@ -41,7 +41,7 @@ export default function CommitLogScreen() {
           </p>
         )}
       >
-        <Suspense fallback={<p style={{ color: "var(--text-muted)" }}>Loading commits…</p>}>
+        <Suspense fallback={<Skeleton label="Loading commits…" rows={6} rowHeight="3rem" data-testid="commits-loading" />}>
           <Show when={ready()} fallback={<NotAvailable kind="commit log" />}>
           <Show when={commits()} keyed>
             {(page) => (
@@ -54,7 +54,10 @@ export default function CommitLogScreen() {
                     {(c) => (
                       <li style={{ border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)", padding: "var(--space-3)", background: "var(--surface-raised)", display: "flex", "flex-direction": "column", gap: "var(--space-1)" }}>
                         <span style={{ display: "flex", "align-items": "center", gap: "var(--space-2)", "flex-wrap": "wrap" }}>
-                          <A href={`/git/repos/${params.repo}/commit/${c.oid}`} style={{ "font-family": "var(--font-mono)", color: "var(--accent)" }}>{c.short_oid}</A>
+                          {/* Short-oid link: --text-primary (AA-passing), never --accent-as-text.
+                              accent lands at the AA floor in light and fails 4.5:1 as small mono text
+                              on --surface-raised (DESIGN-MANUAL §3.1 carve-out). */}
+                          <A href={`/git/repos/${params.repo}/commit/${c.oid}`} style={{ "font-family": "var(--font-mono)", color: "var(--text-primary)", "text-decoration": "underline" }}>{c.short_oid}</A>
                           <strong>{c.summary}</strong>
                           <Show when={c.parents.length > 1}>
                             <span style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>
