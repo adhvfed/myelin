@@ -149,6 +149,53 @@ WHERE region = $1
   AND lease_expires < now()
 RETURNING tenant_id, job_id";
 
+/// **The idempotent enqueue (arch 02 §2.1 / §3.2) — insert ONE schedulable `job_queue` row.** The
+/// durable equivalent of [`SchedulerState::enqueue`]: a job the run's `SCHEDULE_AND_RUN_JOB`
+/// activity dispatches becomes a `queued` row. Idempotent on the `jq_idem` unique
+/// `(tenant_id, idem_token)` via `ON CONFLICT … DO NOTHING`, so a reaper re-queue + a redundant
+/// re-dispatch of the same `(tenant_id, idem_token)` is ONE row, never a duplicate (0 duplicate
+/// enqueues — the CI-D1 effectively-once floor). `enqueued_at` defaults to `now()` (the claim's
+/// oldest-first tie-break). Bind: `$1 tenant_id`, `$2 region`, `$3 job_id` (uuid), `$4 run_id`
+/// (uuid), `$5 lane`, `$6 labels text[]`, `$7 trust_tier`, `$8 concurrency_group` (nullable),
+/// `$9 fair_key`, `$10 idem_token`. `RETURNING job_id` is present iff the row was inserted (absent on
+/// the idempotent conflict) — so the store reads INSERTED vs DUPLICATE from the returned-row count.
+pub const INSERT_JOB_QUEUE_QUERY: &str = "\
+INSERT INTO job_queue
+  (tenant_id, region, job_id, run_id, lane, labels, trust_tier, concurrency_group, fair_key, idem_token, state)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued')
+ON CONFLICT (tenant_id, idem_token) DO NOTHING
+RETURNING job_id";
+
+/// **Complete a job — move it to `terminal` (the runner reported `job.done`, arch 02 §3.2).** The
+/// durable equivalent of [`SchedulerState::complete_job`]: a `leased`/`running`/`queued` job whose
+/// runner finished is moved to `terminal` (clearing the lease) so the reaper NEVER re-queues a
+/// completed job (re-queuing a done job would double-run it). Idempotent: a re-complete of an
+/// already-`terminal` row matches nothing (`state <> 'terminal'`) → 0 rows, the `job.done` side of
+/// the effectively-once invariant (a double-delivered `job.done` terminates the row ONCE). Bind:
+/// `$1 tenant_id`, `$2 job_id`. `RETURNING job_id` iff this call moved the row.
+pub const COMPLETE_JOB_QUERY: &str = "\
+UPDATE job_queue
+SET state = 'terminal', lease_owner = NULL, lease_expires = NULL
+WHERE tenant_id = $1
+  AND job_id = $2
+  AND state <> 'terminal'
+RETURNING job_id";
+
+/// **Heartbeat — a LIVE runner extends its lease (arch 02 §2.1).** The durable equivalent of
+/// [`SchedulerState::heartbeat`]: while a job is `leased` by this owner, push `lease_expires` forward
+/// so a heart-beating runner is NOT swept by the [`REAP_QUERY`] (only a DEAD runner's expired lease
+/// is reaped). Guarded to the lease OWNER (`lease_owner = $3`) so a stale/other runner cannot extend
+/// a lease it does not hold. Bind: `$1 tenant_id`, `$2 job_id`, `$3 lease_owner`,
+/// `$4 extend_seconds`. `RETURNING job_id` iff the lease was extended.
+pub const HEARTBEAT_QUERY: &str = "\
+UPDATE job_queue
+SET lease_expires = now() + ($4 || ' seconds')::interval
+WHERE tenant_id = $1
+  AND job_id = $2
+  AND state = 'leased'
+  AND lease_owner = $3
+RETURNING job_id";
+
 // =================================================================================================
 // 2. The deterministic in-memory model — the IDENTICAL claim/reaper semantics, DB-free, so the unit
 //    + drill tests are deterministic. The live SQL above carries the same algorithm against Postgres.
@@ -183,6 +230,18 @@ impl Lane {
             Lane::Interactive => "interactive",
             Lane::Batch => "batch",
             Lane::Deploy => "deploy",
+        }
+    }
+
+    /// Parse a `job_queue.lane` CHECK token back to a [`Lane`] (the read-back side of [`Lane::as_str`]).
+    /// `None` for a token outside the frozen three-lane set — a corrupt durable row the store surfaces
+    /// loudly (never silently coerced), the same posture as the metering store's meter/kind parse.
+    pub fn from_token(token: &str) -> Option<Lane> {
+        match token {
+            "interactive" => Some(Lane::Interactive),
+            "batch" => Some(Lane::Batch),
+            "deploy" => Some(Lane::Deploy),
+            _ => None,
         }
     }
 }

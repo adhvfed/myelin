@@ -1,0 +1,164 @@
+//! # `job_queue_region` — CT-004c.1: the REGION-scoped, CROSS-TENANT scheduler claim + reaper
+//!
+//! **This file is a NAMED, LOUD `tenant-predicate` exclusion (see `myelin-lints` `EXCLUDED_SUBSTRINGS`).**
+//! The scheduler pull-lease claim (arch 02 §2.1, [`crate::scheduler::CLAIM_QUERY`]) and the
+//! dead-runner reaper ([`crate::scheduler::REAP_QUERY`]) are CROSS-TENANT BY DESIGN: a hosted runner
+//! claims the next eligible job across ALL tenants in its region, and the DRR fairness
+//! (`fair_deficit.deficit DESC`) is explicitly cross-tenant ("prevents one tenant's matrix from
+//! starving every OTHER tenant", arch 02 §2.2). These queries filter by `region` only and carry NO
+//! `tenant_id` predicate — so the `tenant-predicate` IDOR fingerprint (`sqlx::query` without a
+//! `tenant_id`) flags them FALSELY, exactly the same control-plane-routing posture as
+//! `myelin-storage/src/placement_durable.rs` (the cell-placement registry: "which cell homes tenant
+//! X?" for any X). The `region` column is the ROUTING/RESIDENCY key here, not an RLS predicate.
+//!
+//! **The tenant-store queries stay FULLY linted.** Only the two cross-tenant SERVICE queries live in
+//! this excluded file; the PER-TENANT ops (`enqueue`/`cancel_superseded`/`complete`/`heartbeat`) stay
+//! in [`crate::job_queue_store`] (NOT excluded), each binding `tenant_id` through the MR-022
+//! `with_tenant_tx` convention — so the tenant-predicate lint reads the IDOR guard on every one. This
+//! is a SCOPED exclusion of the two genuinely-cross-tenant reads, never a whole-store waiver.
+//!
+//! **Residency + no bleed (in-band).** Both queries run under [`with_region_tx`]: acquire → BEGIN →
+//! set the `region` GUC transaction-scoped (residency pin, in-band — the same posture the
+//! `residency-pin` lint expects, recorded via `@residency-cell-pinned:file`) + clear the tenant GUC →
+//! op → COMMIT (the GUC discarded on commit, so the pooled connection carries no residual scope).
+//!
+//! **NAMED FLOOR (honest).** Under the `(tenant, region)` tenant-isolation FORCE-RLS policy a
+//! region-wide read returns nothing unless the scheduler connects under a role that reads the
+//! region's queue across tenants (a superuser / a dedicated region-scoped scheduler role). A
+//! region-scoped scheduler DB role / policy is the follow-on; the `region` GUC is set correctly here
+//! so a future policy keyed on `current_setting('myelin.region')` needs no code change. This is NOT a
+//! weakened tenant isolation — the per-tenant writes above enforce `(tenant, region)` RLS under the
+//! app role.
+//!
+//! @residency-cell-pinned:file — the region is pinned in-band on every op via the transaction-scoped
+//! `myelin.region` GUC (there is no region-less pool construction in this file; the pool is injected).
+
+use std::future::Future;
+use std::pin::Pin;
+
+use myelin_ci_sandbox::TrustTier;
+use myelin_storage::PgError;
+use sqlx::postgres::PgPool;
+use sqlx::types::Uuid;
+use sqlx::Row;
+
+use crate::job_queue_store::{trust_from_token, trust_token, JobQueueStoreError, LeasedJob};
+use crate::scheduler::{Lane, CLAIM_QUERY, REAP_QUERY};
+
+/// **The pull-lease claim raw execution (arch 02 §2.1; [`CLAIM_QUERY`]) — region-scoped, cross-tenant.**
+/// Runs [`CLAIM_QUERY`] under [`with_region_tx`] and rebuilds the leased row. See the module note: the
+/// `region` filter is the residency/routing key, NOT a tenant predicate (a hosted runner claims across
+/// all tenants in its region — the DRR fairness spans tenants).
+pub(crate) async fn claim_region_scoped(
+    pool: &PgPool,
+    region: &str,
+    runner_labels: &[String],
+    runner_allowed_tiers: &[TrustTier],
+    lease_owner: &str,
+    lease_secs: u64,
+) -> Result<Option<LeasedJob>, JobQueueStoreError> {
+    let labels: Vec<String> = runner_labels.to_vec();
+    let tiers: Vec<String> = runner_allowed_tiers
+        .iter()
+        .map(|t| trust_token(*t).to_string())
+        .collect();
+    let owner = lease_owner.to_string();
+    let ttl = lease_secs.to_string();
+    let region_owned = region.to_string();
+    let row = with_region_tx(pool, region, move |conn| {
+        Box::pin(async move {
+            sqlx::query(CLAIM_QUERY)
+                .bind(&region_owned) // $1 cell_region (RESIDENCY, not a tenant predicate)
+                .bind(&labels) // $2 runner_labels text[]
+                .bind(&tiers) // $3 runner_allowed_tiers text[]
+                .bind(&owner) // $4 lease_owner
+                .bind(&ttl) // $5 lease_ttl_seconds (text → interval)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| PgError::Query(e.to_string()))
+        })
+    })
+    .await?;
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(leased_from_row(&r)?)),
+    }
+}
+
+/// **The dead-runner reaper raw execution (arch 02 §2.1; [`REAP_QUERY`]) — region-scoped, cross-tenant.**
+/// Runs [`REAP_QUERY`] under [`with_region_tx`], re-queuing every expired lease in the region in place
+/// (no INSERT → 0 duplicate enqueues). Returns the count re-queued.
+pub(crate) async fn reap_region_scoped(
+    pool: &PgPool,
+    region: &str,
+) -> Result<u64, JobQueueStoreError> {
+    let region_owned = region.to_string();
+    let rows = with_region_tx(pool, region, move |conn| {
+        Box::pin(async move {
+            sqlx::query(REAP_QUERY)
+                .bind(&region_owned) // $1 region (RESIDENCY, not a tenant predicate)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(|e| PgError::Query(e.to_string()))
+        })
+    })
+    .await?;
+    Ok(rows.len() as u64)
+}
+
+/// **The REGION-scoped transaction seam (the cross-tenant claim/reap path).** Acquire → BEGIN → set
+/// the `region` GUC transaction-scoped (residency pin, in-band) + clear the tenant GUC → run `op` →
+/// COMMIT (the GUC discarded on commit — no bleed). Mirrors `myelin_storage::with_tenant_tx`'s
+/// mechanism but for a region-wide, cross-tenant SERVICE read.
+async fn with_region_tx<R, F>(pool: &PgPool, region: &str, op: F) -> Result<R, JobQueueStoreError>
+where
+    F: for<'c> FnOnce(
+            &'c mut sqlx::PgConnection,
+        ) -> Pin<Box<dyn Future<Output = Result<R, PgError>> + Send + 'c>>
+        + Send,
+    R: Send,
+{
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| JobQueueStoreError::Db(format!("begin region-scoped transaction: {e}")))?;
+    // Set the region GUC TRANSACTION-scoped and clear the tenant GUC (a region-wide claim is not a
+    // single tenant's op) — discarded at COMMIT, so the pooled connection carries no residue.
+    sqlx::query(
+        "SELECT set_config('myelin.region', $1, true), set_config('myelin.tenant_id', '', true)",
+    )
+    .bind(region)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| JobQueueStoreError::Db(format!("set region-scoped GUC: {e}")))?;
+    let out = op(&mut tx).await.map_err(JobQueueStoreError::from_pg)?;
+    tx.commit()
+        .await
+        .map_err(|e| JobQueueStoreError::Db(format!("commit region-scoped transaction: {e}")))?;
+    Ok(out)
+}
+
+/// Rebuild a [`LeasedJob`] from a claim `RETURNING` row (`tenant_id, job_id, run_id, lane,
+/// concurrency_group, fair_key, trust_tier`). A `lane`/`trust_tier` token outside the frozen set is a
+/// loud [`JobQueueStoreError::CorruptRow`].
+fn leased_from_row(r: &sqlx::postgres::PgRow) -> Result<LeasedJob, JobQueueStoreError> {
+    let tenant_id: String = r.get("tenant_id");
+    let job_id: Uuid = r.get("job_id");
+    let run_id: Uuid = r.get("run_id");
+    let lane_token: String = r.get("lane");
+    let concurrency_group: Option<String> = r.get("concurrency_group");
+    let fair_key: String = r.get("fair_key");
+    let trust_token_str: String = r.get("trust_tier");
+    let lane = Lane::from_token(&lane_token)
+        .ok_or_else(|| JobQueueStoreError::CorruptRow(format!("unknown lane token `{lane_token}`")))?;
+    let trust_tier = trust_from_token(&trust_token_str)?;
+    Ok(LeasedJob {
+        tenant_id,
+        job_id,
+        run_id,
+        lane,
+        concurrency_group,
+        fair_key,
+        trust_tier,
+    })
+}

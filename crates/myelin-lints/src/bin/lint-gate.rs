@@ -143,6 +143,21 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // honours the two-transport split. NAMED, LOUD exclusion (see the module note in
     // log_pipeline.rs), never a silent skip — the lint stays live on every durable-bus call site.
     "myelin-ci-controlplane/src/log_pipeline.rs",
+    // The REGION-scoped, CROSS-TENANT scheduler claim + reaper (CT-004c.1): `claim_region_scoped` /
+    // `reap_region_scoped` run `CLAIM_QUERY` / `REAP_QUERY` — the scheduler pull-lease claim (arch 02
+    // §2.1) and the dead-runner reaper. These are CROSS-TENANT BY DESIGN: a hosted runner claims the
+    // next eligible job across ALL tenants in its region, and the DRR fairness (`fair_deficit.deficit
+    // DESC`) explicitly spans tenants ("prevents one tenant's matrix from starving every OTHER
+    // tenant", arch 02 §2.2). They filter by `region` only (the residency/routing key, NOT an RLS
+    // predicate) and carry no `tenant_id` — so the `tenant-predicate` IDOR fingerprint flags them
+    // FALSELY, EXACTLY the control-plane-routing posture of `placement_durable.rs` (the cell-placement
+    // registry: "which cell homes tenant X?" for any X). The PER-TENANT job_queue ops
+    // (enqueue/cancel_superseded/complete/heartbeat) stay in `job_queue_store.rs` (NOT excluded), each
+    // binding `tenant_id` through the MR-022 `with_tenant_tx` convention — so the tenant-store code
+    // stays FULLY linted; only these two genuinely-cross-tenant SERVICE reads are excluded. NAMED,
+    // LOUD exclusion of a single file (see the module note in job_queue_region.rs), never a silent
+    // skip; the lint is NOT weakened.
+    "myelin-ci-controlplane/src/job_queue_region.rs",
     // The CHAT FIREHOSE-ONLY LIVE-DELIVERY surface (CHAT-P10 / P-404): `LiveDelivery::deliver` calls
     // `firehose.publish(stream=fan.<tenant>, scope=channel:<id>, frame)` — the EPHEMERAL live
     // message/presence/typing/read-state/partial frames the arch sites FIREHOSE-ONLY (02 §7 / 03 §1.2
