@@ -319,7 +319,8 @@ impl BudgetGate {
     /// metered `units`, recording exactly one cost event per unit (wholesale ≠ markup) and REFUNDING the
     /// over-reservation back into the wallet (the same wallet the reserve debited). Idempotent on
     /// `(tenant, run)`: a double-settle returns the same outcome and refunds NOTHING further (no
-    /// double-credit). Records the settle into the §5.4 telemetry.
+    /// double-credit) and records NO further §5.4 telemetry (only the FIRST, real settle is counted — an
+    /// idempotent re-settle on a replay is not a new settle event).
     pub fn settle(
         &self,
         tenant: &TenantId,
@@ -345,8 +346,15 @@ impl BudgetGate {
                 .ok_or(BudgetError::AmountOverflow)?;
         }
         drop(g);
-        if let Some(t) = &self.telemetry {
-            t.record_settle();
+        // Record ONLY a real settle into the §5.4 telemetry — an idempotent re-settle (an
+        // already-`Settled` run re-driven on replay) refunds nothing and is NOT a new settle event, so
+        // it must not inflate the settle count. This keeps the settle-count the true parity ledger of
+        // completed/failed metered dispatches even across a crash-recovery re-drive (the metered-activity
+        // bookend now settles unconditionally-but-idempotently on every drive).
+        if !already_settled {
+            if let Some(t) = &self.telemetry {
+                t.record_settle();
+            }
         }
         Ok(outcome)
     }
@@ -432,9 +440,11 @@ impl WfCtx {
         if let Some(gate) = self.budget().cloned() {
             // Reserve-at-dispatch. A refused reserve means the wallet is exhausted — the activity NEVER
             // runs (the dispatch never starts). On a re-drive the reserve hits the duplicate guard
-            // (already reserved on the first drive) — its begin/settle already ran, so we DO NOT
-            // re-progress the ledger (no double-debit, no begin-on-settled): the activity merely
-            // short-circuits its journaled result.
+            // (`fresh = false`, already reserved on the first drive): there is NO double-debit and we do
+            // NOT re-`begin` (a begin on a settled row is illegal — the progression is monotonic). The
+            // settle, by contrast, IS re-run on the re-drive — it is idempotent (no double-refund) and it
+            // RECONCILES a reservation the fresh drive may have left open by crashing before its settle
+            // committed. That reconciliation is why the settle below is NOT gated on `fresh`.
             let fresh = match gate.reserve(&tenant, &ledger_run, cost) {
                 Ok(()) => true,
                 Err(BudgetError::DuplicateReservation) => false,
@@ -463,20 +473,43 @@ impl WfCtx {
             }
 
             // Run the activity (journaled, retried — §4.4). It short-circuits its journaled result on a
-            // re-drive (0 re-execution). A successful completion settles; a retry-exhaustion surfaces
-            // the activity error (the reservation stays in-flight — the body compensates / dequeues;
-            // an in-flight reservation is never torn down, it settles when the body settles it).
-            let result = self.activity(policy, f)?;
+            // re-drive (0 re-execution). It returns `Ok` on a successful completion, or
+            // `Err(WfError::ActivityExhausted)` when the retries are exhausted (or any other `WfError`).
+            let outcome = self.activity(policy, f);
 
-            // Settle-on-completion: refund the over-reservation into the same wallet (§4.9 step 4) —
-            // ONLY on the fresh drive (a re-drive's settle already ran; re-settling is idempotent but
-            // we skip it to keep the replay a pure short-circuit).
-            if fresh {
-                gate.settle(&tenant, &ledger_run, &units).map_err(|e| {
-                    crate::WfError::CoCommit(format!("metered_activity settle failed: {e}"))
-                })?;
+            // **Settle-on-completion reconciles the reservation on BOTH outcomes (§4.9 step 4).** A
+            // completion — success OR retry-exhaustion — is NOT an in-flight interrupt (the activity ran
+            // to the END of its retries before this point), so it SETTLES: a SUCCESS bills the actual
+            // metered `units`; a FAILURE bills ZERO metered units — a failed activity produced no
+            // artifacts, so the WHOLE reservation is refunded — releasing the reservation the exhaustion
+            // path used to orphan permanently `InFlight` (the wallet was never refunded and the ledger
+            // key, private to this bookend, could never be settled by any caller).
+            //
+            // **Replay-safe (§4.9 replay), NOT gated on `fresh`:** the settle is idempotent on
+            // `(tenant, run)`. A normal re-drive whose fresh-drive settle already committed re-settles to
+            // the SAME outcome and refunds NOTHING further (no double-refund). A crash BETWEEN the
+            // activity finishing and this settle committing leaves the reservation open on the fresh
+            // drive; the re-drive (which replays `activity_failed`, or re-runs an un-journaled activity,
+            // to the same outcome) RECONCILES the still-open key here. An unconditional idempotent settle
+            // is therefore correct where the old `fresh`-only settle leaked on every exhaustion.
+            match outcome {
+                Ok(result) => {
+                    gate.settle(&tenant, &ledger_run, &units).map_err(|e| {
+                        crate::WfError::CoCommit(format!("metered_activity settle failed: {e}"))
+                    })?;
+                    Ok(result)
+                }
+                Err(activity_err) => {
+                    // Release/refund the reservation (bill ZERO units) BEFORE propagating. We surface the
+                    // ORIGINAL activity error — the outcome the body branches on (retry / compensate /
+                    // dequeue) — even if this settle itself errors: a durable-ledger settle failure recurs
+                    // and is reconciled by the unconditional settle on the next re-drive, so it must not
+                    // mask the activity's own failure. (For the in-memory ledger a zero-unit settle of a
+                    // live reservation is infallible.)
+                    let _ = gate.settle(&tenant, &ledger_run, &[]);
+                    Err(activity_err)
+                }
             }
-            Ok(result)
         } else {
             // Un-metered: no gate wired (the loop-cap depth is still the runaway bound, AG-6).
             self.activity(policy, f)
@@ -936,6 +969,120 @@ mod tests {
             gate.balance(),
             MinorUnits(940),
             "0 DOUBLE-DEBIT on replay (re-keyed identically)"
+        );
+    }
+
+    /// **R3.7b — a metered activity whose closure EXHAUSTS its retries SETTLES-on-exhaustion: the wallet
+    /// is FULLY restored, the reservation is `Settled` (not orphaned `InFlight`), and the settle is
+    /// recorded (§4.9).** This pins the budget-reservation-leak fix: reserve debits the wallet + `begin`
+    /// marks it in-flight, then the activity exhausts and surfaces `ActivityExhausted`. BEFORE the fix
+    /// the error propagated before the settle, so the reservation stayed `InFlight` forever — the wallet
+    /// was never refunded and no settle event was recorded. A failed activity produced no artifacts, so
+    /// it bills ZERO units → the whole reservation is refunded.
+    #[test]
+    fn exhausted_metered_activity_settles_refunds_full_and_is_not_left_in_flight() {
+        use myelin_storage::reserve_settle::ReservationState;
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let telemetry = FlowTelemetry::new();
+        let gate =
+            BudgetGate::new(Wallet::new(MinorUnits(1_000))).with_telemetry(telemetry.clone());
+
+        let mut ctx = begin_ctx(&outbox, journal, gate.clone());
+        let err = ctx
+            .metered_activity(
+                RetryPolicy { max_attempts: 2 },
+                MinorUnits(100),                  // reserve 100 (wallet 1000 → 900)
+                vec![unit("llm.tokens", 40, 20)], // the would-be billing — NOT charged on failure
+                |_idem, attempt| Err(crate::ActivityError(format!("hard failure {attempt}"))),
+            )
+            .expect_err("the activity exhausts its retries");
+        assert!(
+            matches!(err, crate::WfError::ActivityExhausted(_)),
+            "the activity error surfaces to the body (retry / compensate / dequeue), got {err:?}"
+        );
+
+        let lr = LedgerRunId::new("R1/merge.queue:0");
+        // The wallet is FULLY restored — the whole 100 reservation is refunded (a failed activity bills
+        // nothing). Before the fix this leaked at 900 (the reservation stayed InFlight, never refunded).
+        assert_eq!(
+            gate.balance(),
+            MinorUnits(1_000),
+            "the reservation is fully refunded on exhaustion (no leak)"
+        );
+        // The reservation is Settled — NOT orphaned InFlight.
+        assert_eq!(
+            gate.state_of(&tenant(), &lr),
+            Some(ReservationState::Settled),
+            "the reservation settled on exhaustion — never left InFlight"
+        );
+        // A settle event was recorded (the reconciliation is observable). A failed activity bills ZERO
+        // metered units, so no per-unit CostEvent row is written — the recorded event IS the settle.
+        assert_eq!(telemetry.settled(), 1, "the settle-on-exhaustion is recorded");
+        // A settle-on-exhaustion is a COMPLETION, not an interrupt — the headline zero still holds.
+        assert_eq!(gate.inflight_interrupt_count(), 0, "0 in-flight interrupts");
+    }
+
+    /// **R3.7b — a RE-DRIVE after an exhausted metered activity does NOT double-refund (idempotent
+    /// settle, §4.9 replay).** Drive 1 exhausts + settles (full refund, wallet restored, one
+    /// `activity_failed` journaled); drive 2 (resume) replays the journaled failure — the reserve hits
+    /// the duplicate guard and the settle re-runs IDEMPOTENTLY, refunding NOTHING further. The wallet is
+    /// restored EXACTLY once (the settle-on-exhaustion is not gated on `fresh`, so it reconciles a
+    /// crash-between-exhaust-and-settle re-drive, yet a normal re-drive never double-credits).
+    #[test]
+    fn re_drive_after_exhaustion_does_not_double_refund() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let gate = BudgetGate::new(Wallet::new(MinorUnits(1_000)));
+
+        // DRIVE 1: reserve 100 (wallet → 900), begin, activity exhausts → settle(zero units) refunds 100
+        // (wallet → 1000), then journal the activity_failed on commit.
+        let mut c1 = begin_ctx(&outbox, journal.clone(), gate.clone());
+        let err1 = c1
+            .metered_activity(
+                RetryPolicy { max_attempts: 1 },
+                MinorUnits(100),
+                vec![unit("u", 40, 20)],
+                |_i, _a| Err(crate::ActivityError("boom".into())),
+            )
+            .expect_err("drive 1 exhausts");
+        assert!(matches!(err1, crate::WfError::ActivityExhausted(_)));
+        c1.commit().expect("co-commit journals the activity_failed");
+        assert_eq!(
+            gate.balance(),
+            MinorUnits(1_000),
+            "drive 1 refunded the full reservation"
+        );
+        let history = journal.history_for(&tenant(), "R1");
+
+        // DRIVE 2 (re-drive): resume over the journal. The activity short-circuits its journaled
+        // activity_failed (0 re-execution — the closure must NOT run), the reserve hits the duplicate
+        // guard, and the settle re-runs idempotently (already Settled → no second refund).
+        let mut c2 = WfCtx::resume(
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "merge.queue",
+            "2026-06-21T00:00:00Z",
+            42,
+            history,
+        )
+        .with_budget(gate.clone());
+        let err2 = c2
+            .metered_activity(
+                RetryPolicy { max_attempts: 1 },
+                MinorUnits(100),
+                vec![unit("u", 40, 20)],
+                |_i, _a| panic!("the activity must NOT re-run on replay"),
+            )
+            .expect_err("the replay re-drives to the journaled failure");
+        assert!(matches!(err2, crate::WfError::ActivityExhausted(_)));
+        assert_eq!(
+            gate.balance(),
+            MinorUnits(1_000),
+            "0 DOUBLE-REFUND on replay (the settle is idempotent)"
         );
     }
 
