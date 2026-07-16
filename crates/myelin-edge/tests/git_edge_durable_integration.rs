@@ -496,3 +496,115 @@ async fn browse_endpoints_serve_the_durable_graph_tenant_scoped() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// **R3.4 repo-browsing completeness — the new read endpoints serve the durable graph.** refs (switcher
+/// source), tree-at-root, the enriched nested blob (binary/size/raw URLs), tree/blob kind-mismatch
+/// redirect hints, the commit-log prev_cursor/range round-trip, and the gateway-proxied raw/download
+/// byte-serving with `Content-Disposition`.
+#[tokio::test]
+async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
+    let root = temp_root("r34browse");
+    let (gw, cell) = build(&root);
+    let addr = spawn(gw).await;
+    let h = bearer(&mint(&cell, "acme", "jti-r34"));
+
+    let (st, _) = http(addr, "POST", "/v1/git/repos", &hdr(&h), br#"{"slug":"br"}"#.to_vec()).await;
+    assert_eq!(st, 201);
+    // Three commits on main via DISTINCT top-level files (each a real commit; avoids the GF-6
+    // stale-base refusal that re-editing one file at base_oid="" would trip) so the log pages.
+    for (i, path) in ["a.txt", "b.txt", "c.txt"].iter().enumerate() {
+        let (wc, wv) = http(
+            addr,
+            "POST",
+            &format!("/v1/git/repos/br/blob/main/{path}"),
+            &hdr(&h),
+            format!(r#"{{"base_oid":"","contents":"file {i}\n","message":"add {path}"}}"#).into_bytes(),
+        )
+        .await;
+        assert_eq!(wc, 200, "commit {path}: {wv}");
+    }
+
+    // refs → branches includes main (default), no tags.
+    let (rc, rv) = http(addr, "GET", "/v1/git/repos/br/refs", &hdr(&h), vec![]).await;
+    assert_eq!(rc, 200, "refs: {rv}");
+    assert_eq!(rv["default_branch"], "main");
+    assert!(rv["branches"].as_array().unwrap().iter().any(|b| b["name"] == "main"
+        && b["is_default"] == true));
+    assert_eq!(rv["tags"].as_array().unwrap().len(), 0);
+
+    // tree at root → the three files, each with a full `path` + a resolved latest_commit (bounded walk).
+    let (tc, tv) = http(addr, "GET", "/v1/git/repos/br/tree/main", &hdr(&h), vec![]).await;
+    assert_eq!(tc, 200, "tree: {tv}");
+    let entries = tv["entries"].as_array().unwrap();
+    assert!(entries.iter().any(|e| e["name"] == "a.txt" && e["path"] == "a.txt"));
+    assert!(
+        entries.iter().any(|e| e["latest_commit"]["summary"].is_string()),
+        "the bounded walk resolved at least one per-entry latest commit: {tv}"
+    );
+
+    // tree/{a file} → the kind-mismatch redirect hint (never a spurious 404).
+    let (kc, kv) = http(addr, "GET", "/v1/git/repos/br/tree/main/a.txt", &hdr(&h), vec![]).await;
+    assert_eq!(kc, 200, "tree-of-file: {kv}");
+    assert_eq!(kv["redirect_to_blob"], true);
+
+    // blob → enriched: not-binary, real size, gateway-proxied raw/download URLs, not truncated.
+    let (bc, bv) = http(addr, "GET", "/v1/git/repos/br/blob/main/a.txt", &hdr(&h), vec![]).await;
+    assert_eq!(bc, 200, "blob: {bv}");
+    assert_eq!(bv["is_binary"], false);
+    assert_eq!(bv["is_truncated"], false);
+    assert!(bv["size_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(bv["raw_url"], "/v1/git/repos/br/raw/main/a.txt");
+    assert_eq!(bv["download_url"], "/v1/git/repos/br/download/main/a.txt");
+    assert!(bv["contents"].as_str().unwrap().contains("file 0"));
+
+    // blob/{a dir} → the reverse kind-mismatch hint. (Seed a nested dir via a nested-path web edit is
+    // out of scope; the root itself is a dir, so blob at empty path is the reverse case — proven at the
+    // unit level. Here: an absent file is a clean 404.)
+    let (nc, _) = http(addr, "GET", "/v1/git/repos/br/blob/main/nope.txt", &hdr(&h), vec![]).await;
+    assert_eq!(nc, 404, "absent blob is a clean 404");
+
+    // commit-log paging: page 1 (limit=1) has a next_cursor and NO prev_cursor; range starts at 1.
+    let (p1c, p1) = http(addr, "GET", "/v1/git/repos/br/commits/main?limit=1", &hdr(&h), vec![]).await;
+    assert_eq!(p1c, 200, "page1: {p1}");
+    assert_eq!(p1["items"].as_array().unwrap().len(), 1);
+    assert!(p1["page"]["next_cursor"].is_string());
+    assert!(p1["page"]["prev_cursor"].is_null(), "first page has no Newer: {p1}");
+    assert_eq!(p1["page"]["range"]["from"], 1);
+    assert_eq!(p1["page"]["range"]["to"], 1);
+    // page 2 (cursor from page 1): prev_cursor is now present (the Newer link) and range advances.
+    let cursor = p1["page"]["next_cursor"].as_str().unwrap().to_string();
+    let (p2c, p2) = http(
+        addr,
+        "GET",
+        &format!("/v1/git/repos/br/commits/main?limit=1&cursor={cursor}"),
+        &hdr(&h),
+        vec![],
+    )
+    .await;
+    assert_eq!(p2c, 200, "page2: {p2}");
+    assert_eq!(p2["page"]["prev_cursor"], "0", "page 2 Newer points back to offset 0: {p2}");
+    assert_eq!(p2["page"]["range"]["from"], 2);
+
+    // raw = inline disposition; download = attachment disposition (Content-Disposition set server-side).
+    let raw = open(addr, "GET", "/v1/git/repos/br/raw/main/a.txt", &hdr(&h), vec![]).await;
+    assert_eq!(raw.status().as_u16(), 200);
+    let raw_cd = raw
+        .headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(raw_cd.starts_with("inline"), "raw is inline: {raw_cd}");
+    let dl = open(addr, "GET", "/v1/git/repos/br/download/main/a.txt", &hdr(&h), vec![]).await;
+    assert_eq!(dl.status().as_u16(), 200);
+    let dl_cd = dl
+        .headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(dl_cd.starts_with("attachment"), "download is an attachment: {dl_cd}");
+    assert!(dl_cd.contains("a.txt"), "the attachment carries the filename: {dl_cd}");
+
+    std::fs::remove_dir_all(&root).ok();
+}

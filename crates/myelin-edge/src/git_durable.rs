@@ -41,7 +41,7 @@ use myelin_events::MonotonicMinter;
 use myelin_git::api::{http_catalogue, Method as GitMethod};
 use myelin_git::check_status::GitOid;
 use myelin_git::core::{Oid as CoreOid, RepoLoc};
-use myelin_git::durable::{CommitDetail, CommitMeta};
+use myelin_git::durable::{BlobPathLookup, CommitDetail, CommitMeta, TreePathLookup};
 use myelin_git::durable::{DurableError, DurableGitRepo, DurableGitStore};
 use myelin_git::lifecycle::{
     BranchProtectionRuleset, PrState, PullRequest, ReviewState, ReviewVerdict,
@@ -55,7 +55,7 @@ use myelin_git::receive_pack::{
     PushOutcome, PushSession, Pusher, QuarantineMigration, QuarantineObject, RefName, RefStore,
 };
 use myelin_git::web::{
-    CommitDiff, CommitRow, DiffFile, DiffLineView, RepoHome, WebEditForm, WebEditOutcome,
+    CommitDiff, CommitRow, DiffFile, DiffLineView, RepoHome, WebEditOutcome,
 };
 use myelin_identity::{Principal, PrincipalKind};
 use serde_json::{json, Value};
@@ -432,20 +432,6 @@ impl DurableGitBackend {
         }
     }
 
-    /// One repo's home ViewModel (`GET /v1/git/repos/{repo}`) — the durable per-repo home the browse
-    /// UI lands on. `NotFound` (404) if the repo is absent under the verified tenant (the 0-leak posture:
-    /// a cross-tenant repo simply is not found under this tenant's path).
-    fn repo_home_one(
-        &self,
-        tenant: &str,
-        region: &str,
-        slug: &str,
-    ) -> Result<RepoHome, DurableError> {
-        let loc = Self::loc(tenant, region, slug);
-        let repo = self.store.open_repo(&loc)?;
-        Ok(self.repo_home(tenant, slug, &repo))
-    }
-
     // ── commit log + commit diff (durable read; reuses the durable repo's libgit2 walk/diff) ──
 
     /// A page of the commit log for a ref (newest-first) as [`CommitRow`] ViewModels + the `has_more`
@@ -480,34 +466,240 @@ impl DurableGitBackend {
         Ok(repo.commit_detail(oid)?.map(commit_diff_vm))
     }
 
-    // ── blob view (durable read) ──
+    // ── R3.4 repo-browsing completeness: refs · tree-at-path · nested blob · raw/download ──
 
-    /// The single-file view ViewModel built from the durable on-disk blob (`None` if the repo/file is
-    /// absent). `base_oid` is the REAL blob content-address (the GF-6 CAS base the next edit keys on).
-    fn blob_form(
+    /// The RefsVM for the switcher (`GET /repos/{repo}/refs`) — branches + tags + default_branch, all
+    /// permission-checked by the [`RepoObjectGuard`] (`Pull`) at the route. Reads the on-disk refdb.
+    fn refs_json(&self, tenant: &str, region: &str, slug: &str) -> Result<Value, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        let repo = self.store.open_repo(&loc)?;
+        let view = repo.refs_view()?;
+        let default_branch = view.default_branch.clone();
+        let branches: Vec<Value> = view
+            .branches
+            .iter()
+            .map(|(name, oid)| {
+                json!({ "name": name, "oid": oid.0, "is_default": *name == default_branch })
+            })
+            .collect();
+        let tags: Vec<Value> = view
+            .tags
+            .iter()
+            .map(|(name, oid)| json!({ "name": name, "oid": oid.0 }))
+            .collect();
+        Ok(json!({ "branches": branches, "tags": tags, "default_branch": default_branch }))
+    }
+
+    /// The enriched RepoHomeVM (`GET /repos/{repo}`) — default_branch, full README, latest_commit,
+    /// per-entry latest-commit (ONE bounded walk), branch/tag counts, name-carrying entries. Built from
+    /// the durable on-disk state; `NotFound` (404) if the repo is absent under the verified tenant.
+    fn repo_home_json(&self, tenant: &str, region: &str, slug: &str) -> Result<Value, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        let repo = self.store.open_repo(&loc)?; // NotFound → 404 (0-leak)
+        let full_slug = format!("{tenant}/{slug}");
+        let clone_url = format!("{}/{tenant}/{slug}.git", self.clone_host);
+        let refs = repo.refs_view()?;
+        let default_branch = refs.default_branch.clone();
+        let counts = json!({ "branches": refs.branches.len(), "tags": refs.tags.len() });
+        let branch_ref = format!("refs/heads/{default_branch}");
+        let entries = match repo.tree_at_path(&branch_ref, "")? {
+            TreePathLookup::Dir(e) => e,
+            _ => Vec::new(),
+        };
+        if entries.is_empty() {
+            return Ok(json!({
+                "state": "empty",
+                "slug": full_slug,
+                "clone_url": clone_url,
+                "default_branch": default_branch,
+                "counts": counts,
+            }));
+        }
+        let readme = repo
+            .read_file_at_ref(&branch_ref, "README.md")
+            .ok()
+            .flatten()
+            .map(|(b, _)| String::from_utf8_lossy(&b).to_string());
+        let latest = repo.commit_log(&branch_ref, 0, 1)?.0.into_iter().next();
+        let per_entry = repo
+            .latest_commits_in_dir(&branch_ref, "", LATEST_COMMIT_WALK_CAP)
+            .unwrap_or_default();
+        let entries_json = tree_entries_json(&entries, "", &per_entry);
+        Ok(json!({
+            "state": "populated",
+            "slug": full_slug,
+            "clone_url": clone_url,
+            "default_branch": default_branch,
+            // Full README (rendered via the editor read-path / sanitized markdown renderer on the client;
+            // never a raw-HTML dump). `readme_excerpt` retained for back-compat with the pre-R3.4 VM.
+            "readme": readme,
+            "readme_excerpt": readme.as_ref().map(|r| r.chars().take(400).collect::<String>()),
+            "latest_commit": latest.as_ref().map(commit_brief_json),
+            "counts": counts,
+            "entries": entries_json,
+        }))
+    }
+
+    /// The TreeVM (`GET /repos/{repo}/tree/{ref}/{...path}`, root = empty path). A file requested under
+    /// `tree/` returns `{ redirect_to_blob: true }` (the gate's kind-mismatch → client redirect); an
+    /// absent path is `NotFound` (404). Shares the entry projection with the repo home.
+    fn tree_json(
         &self,
         tenant: &str,
         region: &str,
         slug: &str,
         gitref: &str,
         path: &str,
-    ) -> Result<Option<WebEditForm>, DurableError> {
+    ) -> Result<Value, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        let repo = match self.store.open_repo(&loc) {
-            Ok(r) => r,
-            Err(DurableError::NotFound(_)) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let full = format!("refs/heads/{gitref}");
-        match repo.read_file_at_ref(&full, path)? {
-            Some((bytes, oid)) => Ok(Some(WebEditForm {
-                path: path.to_string(),
-                contents: String::from_utf8_lossy(&bytes).to_string(),
-                base_oid: oid.0,
-                viewer_may_edit: true,
-            })),
-            None => Ok(None),
+        let repo = self.store.open_repo(&loc)?;
+        match repo.tree_at_path(gitref, path)? {
+            TreePathLookup::IsFile => {
+                Ok(json!({ "redirect_to_blob": true, "ref": gitref, "path": path }))
+            }
+            TreePathLookup::Missing => Err(DurableError::NotFound(format!(
+                "no such path `{path}` at `{gitref}`"
+            ))),
+            TreePathLookup::Dir(entries) => {
+                let base = path.trim_matches('/');
+                let per_entry = repo
+                    .latest_commits_in_dir(gitref, base, LATEST_COMMIT_WALK_CAP)
+                    .unwrap_or_default();
+                let entries_json = tree_entries_json(&entries, base, &per_entry);
+                // A subtree README renders too (same read-path); binary/absent → no readme.
+                let readme_path = if base.is_empty() {
+                    "README.md".to_string()
+                } else {
+                    format!("{base}/README.md")
+                };
+                let readme = match repo.read_blob_at_path(gitref, &readme_path)? {
+                    BlobPathLookup::Found {
+                        bytes,
+                        is_binary: false,
+                        ..
+                    } => Some(String::from_utf8_lossy(&bytes).to_string()),
+                    _ => None,
+                };
+                Ok(json!({
+                    "ref": gitref,
+                    "path": base,
+                    "entries": entries_json,
+                    "readme": readme,
+                }))
+            }
         }
+    }
+
+    /// The enriched BlobVM (`GET /repos/{repo}/blob/{ref}/{...path}`, nested). Adds server-side binary
+    /// detection, byte size, truncation head, and the gateway-proxied raw/download URLs. A directory
+    /// requested under `blob/` returns `{ redirect_to_tree: true }` (kind mismatch → client redirect);
+    /// an absent path is `NotFound` (404).
+    fn blob_json(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        gitref: &str,
+        path: &str,
+    ) -> Result<Value, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        let repo = self.store.open_repo(&loc)?;
+        match repo.read_blob_at_path(gitref, path)? {
+            BlobPathLookup::IsDir => {
+                Ok(json!({ "redirect_to_tree": true, "ref": gitref, "path": path }))
+            }
+            BlobPathLookup::Missing => Err(DurableError::NotFound(format!(
+                "no such file `{path}` at `{gitref}`"
+            ))),
+            BlobPathLookup::Found {
+                bytes,
+                oid,
+                is_binary,
+                size,
+            } => {
+                let is_truncated = !is_binary && size as usize > BLOB_INLINE_CAP;
+                // The inline text: empty for binary (the download fallback renders instead), a head for a
+                // large file, the whole content otherwise. NEVER a `split('\n')` of binary bytes.
+                let contents = if is_binary {
+                    String::new()
+                } else if is_truncated {
+                    let head: Vec<u8> = bytes.iter().take(BLOB_INLINE_CAP).copied().collect();
+                    String::from_utf8_lossy(&head).to_string()
+                } else {
+                    String::from_utf8_lossy(&bytes).to_string()
+                };
+                let raw = format!(
+                    "/{}/git/repos/{slug}/raw/{gitref}/{path}",
+                    crate::catalogue::API_VERSION
+                );
+                let download = format!(
+                    "/{}/git/repos/{slug}/download/{gitref}/{path}",
+                    crate::catalogue::API_VERSION
+                );
+                Ok(json!({
+                    "path": path,
+                    "contents": contents,
+                    "base_oid": oid.0,
+                    "viewer_may_edit": true,
+                    "is_binary": is_binary,
+                    "size_bytes": size,
+                    "is_truncated": is_truncated,
+                    "raw_url": raw,
+                    "download_url": download,
+                }))
+            }
+        }
+    }
+
+    /// Serve raw file BYTES (`GET /repos/{repo}/raw|download/{ref}/{...path}`) — gateway-proxied,
+    /// in-region, never a public signed URL (the sovereignty rail, BINDING). `attachment` sets
+    /// `Content-Disposition: attachment` (the Download affordance); otherwise the bytes stream inline
+    /// with a conservative content-type (never `text/html` — a repo blob is never browser-executed).
+    /// Object-guarded on `Pull` at the route.
+    fn raw_response(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        gitref: &str,
+        path: &str,
+        attachment: bool,
+    ) -> Result<EdgeResponse, EdgeError> {
+        let loc = Self::loc(tenant, region, slug);
+        let repo = self.store.open_repo(&loc).map_err(map_durable_err)?;
+        let (bytes, is_binary) = match repo.read_blob_at_path(gitref, path).map_err(map_durable_err)? {
+            BlobPathLookup::Found { bytes, is_binary, .. } => (bytes, is_binary),
+            BlobPathLookup::IsDir => {
+                return Err(EdgeError::BadRequest("path is a directory, not a file".into()))
+            }
+            BlobPathLookup::Missing => {
+                return Err(EdgeError::NotFound("no such file at that ref".into()))
+            }
+        };
+        // A conservative content-type: text stays `text/plain; charset=utf-8` (never executed),
+        // binary is `application/octet-stream`. The filename is the basename of the requested path.
+        let content_type = if is_binary {
+            "application/octet-stream".to_string()
+        } else {
+            "text/plain; charset=utf-8".to_string()
+        };
+        let filename = path.rsplit('/').next().unwrap_or("download");
+        let mut headers = vec![(
+            "content-disposition".to_string(),
+            if attachment {
+                format!("attachment; filename=\"{}\"", sanitize_filename(filename))
+            } else {
+                format!("inline; filename=\"{}\"", sanitize_filename(filename))
+            },
+        )];
+        // Defense-in-depth: never let a browser sniff a repo blob into an executable type.
+        headers.push(("x-content-type-options".to_string(), "nosniff".to_string()));
+        Ok(EdgeResponse::Bytes {
+            status: 200,
+            content_type,
+            headers,
+            body: bytes,
+        })
     }
 
     // ── web-edit commit (durable ref-CAS) ──
@@ -1429,6 +1621,72 @@ fn qualify_ref(gitref: &str) -> String {
     }
 }
 
+/// The bounded per-entry latest-commit history walk cap (R3.4 gate decision): entries not resolved
+/// within this many commits render name-only (graceful degrade — never an N-walk-per-entry blow-up).
+const LATEST_COMMIT_WALK_CAP: usize = 500;
+
+/// The inline-text cap for a blob view (R3.4). A text blob larger than this renders a head + a
+/// "download full file" affordance; binary blobs never render inline at all (download fallback).
+const BLOB_INLINE_CAP: usize = 512 * 1024;
+
+/// The short oid (first 12 chars) — the browse log/tree short form.
+fn short_oid12(oid: &str) -> String {
+    oid.chars().take(12).collect()
+}
+
+/// A compact latest-commit projection for a tree row / the repo-home latest-commit bar (R3.4).
+fn commit_brief_json(m: &CommitMeta) -> Value {
+    json!({
+        "short_oid": short_oid12(&m.oid),
+        "oid": m.oid,
+        "summary": m.summary,
+        "author": m.author_name,
+        "committed_at": m.time,
+    })
+}
+
+/// Project tree entries to JSON (shared by the repo home + the tree route — the gate's "share the
+/// projection"). Each entry carries its basename `name`, its full `path` (for the link), `is_dir`, an
+/// optional blob `size`, and the bounded-walk `latest_commit` when resolved.
+fn tree_entries_json(
+    entries: &[myelin_git::durable::TreeEntryInfo],
+    base: &str,
+    per_entry: &std::collections::BTreeMap<String, CommitMeta>,
+) -> Vec<Value> {
+    entries
+        .iter()
+        .map(|e| {
+            let full = if base.is_empty() {
+                e.name.clone()
+            } else {
+                format!("{base}/{}", e.name)
+            };
+            let mut o = json!({ "name": e.name, "path": full, "is_dir": e.is_dir });
+            if let Some(sz) = e.size {
+                o["size"] = json!(sz);
+            }
+            if let Some(m) = per_entry.get(&e.name) {
+                o["latest_commit"] = commit_brief_json(m);
+            }
+            o
+        })
+        .collect()
+}
+
+/// Strip a filename to a safe `Content-Disposition` token: keep the basename's safe chars, drop quotes
+/// / control / path separators (defense against header injection + path leakage in the attachment name).
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"' && *c != '\\' && *c != '/')
+        .collect();
+    if cleaned.is_empty() {
+        "download".to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// Map the durable raw [`CommitMeta`] to the [`CommitRow`] ViewModel (the author is the GIT-1 pseudonym).
 fn commit_row(m: CommitMeta) -> CommitRow {
     CommitRow {
@@ -1554,11 +1812,13 @@ struct DRepoHome {
 }
 impl Handler for DRepoHome {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        // R3.4: the enriched repo-home VM (default_branch, full README, latest_commit, per-entry
+        // bounded-walk activity, branch/tag counts, name-carrying entries).
         let home = self
             .be
-            .repo_home_one(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?)
+            .repo_home_json(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?)
             .map_err(map_durable_err)?;
-        Ok(EdgeResponse::json(200, &home.to_json()))
+        Ok(EdgeResponse::json(200, &home))
     }
 }
 
@@ -1591,10 +1851,24 @@ impl Handler for DCommitLog {
         } else {
             None
         };
-        Ok(EdgeResponse::json(
-            200,
-            &page_envelope(json!(items), next, limit),
-        ))
+        // R3.4: bidirectional paging + honest position (range + page, NO fabricated total — the gate
+        // decision). `prev_cursor` is the "Newer" link (null on the first page); `range`/`offset` drive
+        // the "Commits 31–60 · Seite 2" readout without a costly total commit count.
+        let prev = if offset > 0 {
+            Some(offset.saturating_sub(limit).to_string())
+        } else {
+            None
+        };
+        let range_from = if items.is_empty() { 0 } else { offset + 1 };
+        let range_to = offset + items.len();
+        let page = json!({
+            "next_cursor": next,
+            "prev_cursor": prev,
+            "limit": limit,
+            "offset": offset,
+            "range": { "from": range_from, "to": range_to },
+        });
+        Ok(EdgeResponse::json(200, &json!({ "items": items, "page": page })))
     }
 }
 
@@ -1622,18 +1896,72 @@ struct DBlobView {
 }
 impl Handler for DBlobView {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let form = self
+        // R3.4: nested `{...path}` + binary/size/truncation + gateway-proxied raw/download URLs.
+        let vm = self
             .be
-            .blob_form(
+            .blob_json(
                 tenant_of(ctx),
                 region_of(ctx),
                 param(ctx, "repo")?,
                 param(ctx, "ref")?,
                 param(ctx, "path")?,
             )
-            .map_err(map_durable_err)?
-            .ok_or_else(|| EdgeError::NotFound("no such file at that ref".into()))?;
-        Ok(EdgeResponse::json(200, &form.to_json()))
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(200, &vm))
+    }
+}
+
+struct DRefs {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DRefs {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let vm = self
+            .be
+            .refs_json(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?)
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(200, &vm))
+    }
+}
+
+struct DTree {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DTree {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        // The catch-all `{...path}` binds the whole nested path (empty at the tree root).
+        let path = ctx.params.get("path").map(String::as_str).unwrap_or("");
+        let vm = self
+            .be
+            .tree_json(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+                param(ctx, "ref")?,
+                path,
+            )
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(200, &vm))
+    }
+}
+
+/// Raw/download byte-serving (R3.4). `attachment` is fixed at registration (raw = inline, download =
+/// attachment) so the disposition is not client-controlled.
+struct DRawFile {
+    be: Arc<DurableGitBackend>,
+    attachment: bool,
+}
+impl Handler for DRawFile {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let path = ctx.params.get("path").map(String::as_str).unwrap_or("");
+        self.be.raw_response(
+            tenant_of(ctx),
+            region_of(ctx),
+            param(ctx, "repo")?,
+            param(ctx, "ref")?,
+            path,
+            self.attachment,
+        )
     }
 }
 
@@ -2154,7 +2482,15 @@ fn guarded(
 pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -> GatewayBuilder {
     use RepoPermission::{ApproveUntrustedCi, ProtectedPush, Pull, Push};
     for ep in http_catalogue() {
-        let pattern = reroot(ep.path);
+        // R3.4: the blob READ route is widened to a nested `{...path}` catch-all (the core routing
+        // change vs the single-segment catalogue entry). The POST web-edit stays single-segment
+        // (nested web-edit is the GT-004b composer follow-on, not this surface).
+        let pattern = match (ep.method, ep.path) {
+            (GitMethod::Get, "/api/git/repos/{repo}/blob/{ref}/{path}") => {
+                reroot("/api/git/repos/{repo}/blob/{ref}/{...path}")
+            }
+            _ => reroot(ep.path),
+        };
         let method = map_method(ep.method);
         let (handler, action): (Arc<dyn Handler>, &'static str) = match (ep.method, ep.path) {
             (GitMethod::Get, "/api/git/repos") => {
@@ -2268,6 +2604,50 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         &reroot("/api/git/repos/{repo}/commit/{oid}"),
         "git.commit.diff",
         guarded(&be, Pull, Arc::new(DCommitDiff { be: be.clone() })),
+    );
+    // R3.4 repo-browsing completeness — the ref switcher + nested tree + raw/download read endpoints.
+    // All GET reads, all object-guarded on `Pull` (0-leak 404 on deny — the un-granted-repo posture),
+    // tenant-scoped via `ctx.scope` exactly like the catalogue routes.
+    b = b.route(
+        get,
+        &reroot("/api/git/repos/{repo}/refs"),
+        "git.refs.list",
+        guarded(&be, Pull, Arc::new(DRefs { be: be.clone() })),
+    );
+    // One catch-all handles BOTH the tree root (`/tree/{ref}`, empty `{...path}`) and nested paths.
+    b = b.route(
+        get,
+        &reroot("/api/git/repos/{repo}/tree/{ref}/{...path}"),
+        "git.tree.view",
+        guarded(&be, Pull, Arc::new(DTree { be: be.clone() })),
+    );
+    // Raw/download byte-serving — gateway-proxied, in-region, `Content-Disposition` set server-side
+    // (BINDING: no public signed URLs). `raw` = inline, `download` = attachment.
+    b = b.route(
+        get,
+        &reroot("/api/git/repos/{repo}/raw/{ref}/{...path}"),
+        "git.blob.raw",
+        guarded(
+            &be,
+            Pull,
+            Arc::new(DRawFile {
+                be: be.clone(),
+                attachment: false,
+            }),
+        ),
+    );
+    b = b.route(
+        get,
+        &reroot("/api/git/repos/{repo}/download/{ref}/{...path}"),
+        "git.blob.download",
+        guarded(
+            &be,
+            Pull,
+            Arc::new(DRawFile {
+                be: be.clone(),
+                attachment: true,
+            }),
+        ),
     );
     b
 }

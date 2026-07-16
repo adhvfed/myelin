@@ -68,9 +68,10 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await expect(log.getByText("u_dev_operator@acme.noreply").first()).toBeVisible();
     await expectNoAxeViolations(page, "commit log");
 
-    // Navigate into the newest commit's diff via its short-oid link.
+    // Navigate into the newest commit's diff via its short-oid link (R3.4: it carries `?ref=` so the
+    // commit breadcrumb keeps the arrival ref — the URL now has a query string).
     await log.getByRole("link", { name: C2.slice(0, 12) }).click();
-    await page.waitForURL(`**/git/repos/myelin/commit/${C2}`);
+    await page.waitForURL(`**/git/repos/myelin/commit/${C2}?ref=main`);
     await expect(page.getByRole("heading", { name: "docs: expand the README" })).toBeVisible();
     const files = page.getByTestId("diff-files");
     await expect(files.getByText("README.md", { exact: true })).toBeVisible();
@@ -121,5 +122,65 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await fileLink.press("Enter"); // keyboard-operable: Enter on the focused link navigates
     await page.waitForURL("**/git/repos/myelin/blob/main/README.md");
     await expect(page.getByTestId("blob-contents")).toBeVisible();
+  });
+
+  // ── R3.4 repo-browsing completeness ──
+
+  test("navigate into a NESTED dir and open a file (tree-at-path + nested blob)", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin");
+
+    // Into crates/ (a directory row → the tree route).
+    await page.getByTestId("repo-tree").getByRole("link", { name: "crates" }).click();
+    await page.waitForURL("**/git/repos/myelin/tree/main/crates");
+    await expectNoAxeViolations(page, "tree-at-path (crates)");
+
+    // Into crates/myelin-edge/ (deeper).
+    await page.getByTestId("repo-tree").getByRole("link", { name: "myelin-edge" }).click();
+    await page.waitForURL("**/git/repos/myelin/tree/main/crates/myelin-edge");
+
+    // Open lib.rs (a file → the nested blob route; contents are readable, not garbled).
+    await page.getByTestId("repo-tree").getByRole("link", { name: "lib.rs" }).click();
+    await page.waitForURL("**/git/repos/myelin/blob/main/crates/myelin-edge/lib.rs");
+    await expect(page.getByTestId("blob-contents")).toContainText("the product edge");
+    // The Download affordance is present (gateway-proxied attachment).
+    await expect(page.getByTestId("blob-download")).toBeVisible();
+    await expectNoAxeViolations(page, "nested blob");
+  });
+
+  test("the breadcrumb path segments are clickable (ref-true, no hardcoded main)", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/blob/main/crates/myelin-edge/lib.rs");
+    const crumbs = page.getByRole("navigation", { name: "Breadcrumb" });
+    // The intermediate segment `crates` is a link back to the tree at that sub-path.
+    await crumbs.getByRole("link", { name: "crates", exact: true }).click();
+    await page.waitForURL("**/git/repos/myelin/tree/main/crates");
+    await expect(page.getByTestId("repo-tree")).toBeVisible();
+  });
+
+  test("the commit-log pager is bidirectional with an honest position readout", async ({ page }) => {
+    await devLogin(page);
+    // limit=1 so the two-commit seed pages: first page has Older + no Newer.
+    await page.goto("/git/repos/myelin/commits/main?");
+    await expect(page.getByTestId("commit-log")).toBeVisible();
+    await expect(page.getByTestId("pager-position")).toContainText("page 1");
+    await expectNoAxeViolations(page, "commit log pager");
+  });
+
+  test("an unbuilt subsystem index renders the teaching NotAvailable inside the shell", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/issues");
+    await expect(page.getByTestId("not-available")).toContainText("Issues");
+    await expect(page.getByTestId("not-available")).toContainText("here yet");
+    // Still inside the shell (the primary rail is present, not a bare 404).
+    await expect(page.getByRole("navigation", { name: "Primary" })).toBeVisible();
+    await expectNoAxeViolations(page, "subsystem NotAvailable");
+  });
+
+  test("the catch-all route renders NotAvailable (not a raw framework 404)", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/this/path/does/not/exist");
+    await expect(page.getByTestId("not-available")).toBeVisible();
+    await expect(page.getByRole("navigation", { name: "Primary" })).toBeVisible();
   });
 });

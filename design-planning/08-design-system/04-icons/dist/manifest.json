@@ -1,10 +1,10 @@
 {
   "version": 1,
-  "count": 42,
+  "count": 43,
   "icons": [
     {
       "name": "agent",
-      "meaning": "Agent mark — plain geometric: rounded square + centered dot",
+      "meaning": "Agent mark \u2014 plain geometric: rounded square + centered dot",
       "tags": [
         "agent",
         "ai",
@@ -22,7 +22,7 @@
     },
     {
       "name": "approve",
-      "meaning": "Approve a proposed effect — bare check (HITL action)",
+      "meaning": "Approve a proposed effect \u2014 bare check (HITL action)",
       "tags": [
         "approve",
         "accept",
@@ -57,7 +57,7 @@
     },
     {
       "name": "channel",
-      "meaning": "Chat channel — the named glyph (#)",
+      "meaning": "Chat channel \u2014 the named glyph (#)",
       "tags": [
         "channel",
         "chat",
@@ -74,7 +74,7 @@
     },
     {
       "name": "check-fail",
-      "meaning": "Check failed — cross in status ring",
+      "meaning": "Check failed \u2014 cross in status ring",
       "tags": [
         "ci",
         "check",
@@ -93,7 +93,7 @@
     },
     {
       "name": "check-pass",
-      "meaning": "Check passed — check in status ring",
+      "meaning": "Check passed \u2014 check in status ring",
       "tags": [
         "ci",
         "check",
@@ -112,7 +112,7 @@
     },
     {
       "name": "check-pending",
-      "meaning": "Check pending / in-progress — clock in status ring",
+      "meaning": "Check pending / in-progress \u2014 clock in status ring",
       "tags": [
         "ci",
         "check",
@@ -131,7 +131,7 @@
     },
     {
       "name": "chevron",
-      "meaning": "Disclosure / next-prev — one glyph, rotated by CSS",
+      "meaning": "Disclosure / next-prev \u2014 one glyph, rotated by CSS",
       "tags": [
         "chevron",
         "disclosure",
@@ -150,7 +150,7 @@
     },
     {
       "name": "close",
-      "meaning": "Dismiss / remove — bare cross (chip/dialog corner)",
+      "meaning": "Dismiss / remove \u2014 bare cross (chip/dialog corner)",
       "tags": [
         "close",
         "dismiss",
@@ -220,12 +220,30 @@
     },
     {
       "name": "doc",
-      "meaning": "Doc / page — the named glyph",
+      "meaning": "Doc / page \u2014 the named glyph",
       "tags": [
         "doc",
         "page",
         "document",
         "article"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "download",
+      "meaning": "Download a file to disk (attachment) \u2014 arrow into a tray",
+      "tags": [
+        "download",
+        "save",
+        "file",
+        "attachment",
+        "blob"
       ],
       "canvas": {
         "w": 24,
@@ -411,7 +429,7 @@
     },
     {
       "name": "merge",
-      "meaning": "Merge — the named glyph (deep downward convergence)",
+      "meaning": "Merge \u2014 the named glyph (deep downward convergence)",
       "tags": [
         "git",
         "merge",
@@ -550,7 +568,7 @@
     },
     {
       "name": "pull-request",
-      "meaning": "PR — open-state combine mark",
+      "meaning": "PR \u2014 open-state combine mark",
       "tags": [
         "git",
         "pull-request",
@@ -568,7 +586,7 @@
     },
     {
       "name": "reject",
-      "meaning": "Reject a proposed effect — bare cross (HITL action)",
+      "meaning": "Reject a proposed effect \u2014 bare cross (HITL action)",
       "tags": [
         "reject",
         "decline",
