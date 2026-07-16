@@ -223,13 +223,27 @@ impl PrRecord {
         pr
     }
 
-    /// Current approvals that COUNT toward the threshold — EXCLUDES the author's own review (no
-    /// self-approval lets a PR meet its approval requirement).
+    /// Current approvals that COUNT toward the threshold — the number of DISTINCT, non-author, HUMAN
+    /// reviewers whose current review is an approval. Three exclusions, each a real gate bypass if
+    /// dropped (peer-review finding 2026-07-16 #1):
+    ///   - **de-dup by `reviewer_pseudonym`**: one reviewer approving N times (the single-shot review
+    ///     route appends a `ReviewRecord` per submission with no uniqueness check) must count ONCE —
+    ///     otherwise a lone reviewer could alone satisfy `required_approvals >= 2`.
+    ///   - **exclude agents** (`!is_agent`, ADR-08): an agent review is ALWAYS advisory — it never
+    ///     counts toward the merge gate (the batch path already gates on `!advisory`; this is the
+    ///     single-shot path's missing half).
+    ///   - **exclude the author** (no self-approval meets the requirement).
     fn counting_approvals(&self) -> u32 {
-        self.reviews
-            .iter()
-            .filter(|r| r.is_current_approval() && r.reviewer_pseudonym != self.author_pseudonym)
-            .count() as u32
+        let mut approvers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for r in &self.reviews {
+            if r.is_current_approval()
+                && !r.is_agent
+                && r.reviewer_pseudonym != self.author_pseudonym
+            {
+                approvers.insert(r.reviewer_pseudonym.as_str());
+            }
+        }
+        approvers.len() as u32
     }
 
     /// **The row-level review posture (R3.1 list VM).** `changes` if any current review requests
@@ -1063,6 +1077,38 @@ mod tests {
         }
         assert_eq!(rs.tip(&RefName::new("refs/heads/main")), Some(PushOid::new(c2.0)));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Peer-review finding 2026-07-16 #1: the approval count must be DISTINCT human non-author
+    /// reviewers — the single-shot review route appends a `ReviewRecord` per submission with no
+    /// uniqueness/agent check, so without de-dup + agent-exclusion a lone reviewer (or an agent)
+    /// could satisfy `required_approvals >= 2`.
+    #[test]
+    fn counting_approvals_dedups_reviewers_and_excludes_agents() {
+        let approve = |who: &str, agent: bool| ReviewRecord {
+            reviewer_pseudonym: who.into(),
+            state: ReviewState::Submitted(ReviewVerdict::Approve),
+            is_agent: agent,
+        };
+
+        // One HUMAN reviewer approving THREE times counts ONCE (not three).
+        let mut rec = open_record(1, "refs/heads/main", &"a".repeat(40), "psn:author@acme");
+        rec.reviews.push(approve("psn:rev1@acme", false));
+        rec.reviews.push(approve("psn:rev1@acme", false));
+        rec.reviews.push(approve("psn:rev1@acme", false));
+        assert_eq!(rec.counting_approvals(), 1, "N approvals by ONE reviewer count once");
+
+        // An AGENT approval never counts (ADR-08 advisory) — even alongside the human.
+        rec.reviews.push(approve("psn:agent@acme", true));
+        assert_eq!(rec.counting_approvals(), 1, "an agent approval must not count toward the gate");
+
+        // The AUTHOR's own approval never counts.
+        rec.reviews.push(approve("psn:author@acme", false));
+        assert_eq!(rec.counting_approvals(), 1, "self-approval must not count");
+
+        // A SECOND distinct human reviewer brings the count to 2 (a real required_approvals>=2 path).
+        rec.reviews.push(approve("psn:rev2@acme", false));
+        assert_eq!(rec.counting_approvals(), 2, "two DISTINCT human reviewers count as two");
     }
 
     /// (c) A non-existent or non-descendant head_oid is refused — the protected ref is never advanced to
