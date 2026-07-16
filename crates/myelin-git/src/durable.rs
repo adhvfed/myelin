@@ -629,7 +629,18 @@ impl DurableGitRepo {
         match repo.revparse_single(revspec) {
             Ok(obj) => match obj.peel_to_commit() {
                 Ok(c) => Ok(Some(c)),
-                Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+                // A revspec that resolves to a NON-commit object (e.g. a bare tree oid, `main^{tree}`)
+                // is a client input error, not a server fault: peel fails with InvalidSpec. Treat it
+                // like NotFound → an empty browse (404), never a 500 (R3.4 verifier finding 1; honours
+                // the module invariant "an absent ref/oid is an empty browse, not an error").
+                Err(e)
+                    if matches!(
+                        e.code(),
+                        git2::ErrorCode::NotFound | git2::ErrorCode::InvalidSpec
+                    ) =>
+                {
+                    Ok(None)
+                }
                 Err(e) => Err(git_err("peel_to_commit", e)),
             },
             Err(e)
@@ -959,6 +970,47 @@ impl DurableGitRepo {
             let c = repo.find_commit(oid).map_err(|e| git_err("find_commit", e))?;
             out.push(commit_meta(&c));
             seen += 1;
+        }
+        Ok((out, has_more))
+    }
+
+    /// **The commits IN a PR (R3.3 N2) — reachable from `head_oid` but NOT from `base_ref`'s tip.**
+    /// A libgit2 revwalk pushes the head and HIDES the base tip (the reviewer reviews the PR's OWN
+    /// commits, not the base's history). Newest-first, capped at `limit` (a `has_more` flag drives the
+    /// "full commits list" route; **floor:** the overview's `commits_count` is exact up to `limit` and
+    /// reads `limit+` beyond — dogfood-scale PRs are well under the cap). An absent head oid → empty.
+    pub fn commits_in_pr(
+        &self,
+        base_ref: &str,
+        head_oid: &str,
+        limit: usize,
+    ) -> Result<(Vec<CommitMeta>, bool), DurableError> {
+        let repo = self.open_git()?;
+        let head = match git2::Oid::from_str(head_oid) {
+            Ok(o) => o,
+            Err(_) => return Ok((Vec::new(), false)),
+        };
+        if repo.find_commit(head).is_err() {
+            return Ok((Vec::new(), false));
+        }
+        let mut walk = repo.revwalk().map_err(|e| git_err("revwalk", e))?;
+        walk.set_sorting(git2::Sort::TIME).map_err(|e| git_err("revwalk sort", e))?;
+        walk.push(head).map_err(|e| git_err("revwalk push head", e))?;
+        // Hide the base tip so only the PR's own commits remain. A missing base ref hides nothing
+        // (the walk then returns head's bounded history — honest, never an error).
+        if let Some(base_tip) = self.tip_commit(&repo, base_ref)? {
+            let _ = walk.hide(base_tip); // a non-existent/foreign base tip simply hides nothing.
+        }
+        let mut out = Vec::new();
+        let mut has_more = false;
+        for oid_res in walk {
+            let oid = oid_res.map_err(|e| git_err("revwalk next", e))?;
+            if out.len() == limit {
+                has_more = true;
+                break;
+            }
+            let c = repo.find_commit(oid).map_err(|e| git_err("find_commit", e))?;
+            out.push(commit_meta(&c));
         }
         Ok((out, has_more))
     }
@@ -1981,6 +2033,30 @@ mod tests {
         assert!(matches!(
             repo.tree_at_path("main", "crates/nope").unwrap(),
             TreePathLookup::Missing
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **A ref that resolves to a NON-commit object (a bare tree oid, `main^{tree}`) is a clean
+    /// empty browse, never a 500 (R3.4 verifier finding 1).** `revparse_single` succeeds but
+    /// `peel_to_commit` fails with InvalidSpec; `resolve_commit` maps that to `None`, so the browse
+    /// surfaces `Missing`/`None` rather than propagating a server error the edge would render as 500.
+    #[test]
+    fn ref_resolving_to_a_non_commit_object_is_a_clean_empty_browse_not_an_err() {
+        let root = temp_root("noncommit-ref");
+        let repo = seed_nested_repo(&root);
+        // `main^{tree}` peels the tip to its TREE object — a non-commit revspec a client can supply.
+        let tree_spec = "main^{tree}";
+        // tree-at-path: a non-resolving ref is an empty browse (empty root dir), returned cleanly —
+        // the load-bearing point is `.unwrap()` does NOT panic on an Err (no 500), not the variant.
+        assert!(
+            matches!(repo.tree_at_path(tree_spec, "").unwrap(), TreePathLookup::Dir(ref v) if v.is_empty()),
+            "a tree-oid ref browses as an empty dir, never a 500"
+        );
+        // blob-at-path: clean Missing, not Err.
+        assert!(matches!(
+            repo.read_blob_at_path(tree_spec, "README.md").unwrap(),
+            BlobPathLookup::Missing
         ));
         std::fs::remove_dir_all(&root).ok();
     }

@@ -50,6 +50,10 @@ use myelin_git::pr_store::{
     effective_ruleset, evaluate_merge, merge_pr, BranchProtectionConfig, ChecksSummary,
     DurablePrStore, MergeAttempt, PrRecord, ReviewRecord,
 };
+use myelin_git::pr_threads::{
+    AnchorState, BatchVerdict, CommentRecord, CommentState, DurablePrThreadStore, PrincipalRole,
+    ReviewBatch, ThreadAnchor, ThreadPrincipal, ThreadRecord, ViewedThreads,
+};
 use myelin_git::receive_pack::{
     evaluate_protected_ref_push, CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate,
     PushOutcome, PushSession, Pusher, QuarantineMigration, QuarantineObject, RefName, RefStore,
@@ -69,6 +73,9 @@ use std::sync::Arc;
 pub struct DurableGitBackend {
     store: DurableGitStore,
     prs: DurablePrStore,
+    /// **R3.3 / R3.2 — the durable PR review-thread / comment / review-batch store.** Keyed by the
+    /// canonical `object_key` (`pr:<slug>:<n>`); rooted at the SAME on-disk root as `store`/`prs`.
+    threads: DurablePrThreadStore,
     outbox: OutboxStore,
     minter: Arc<dyn IdMinter>,
     /// The `ssh://` clone host rendered into the repo-home ViewModel.
@@ -125,6 +132,7 @@ impl DurableGitBackend {
         DurableGitBackend {
             store: DurableGitStore::rooted(root.clone()),
             prs: DurablePrStore::rooted(root.clone()),
+            threads: DurablePrThreadStore::rooted(root.clone()),
             outbox,
             minter,
             clone_host: "ssh://git@myelin".into(),
@@ -861,7 +869,9 @@ impl DurableGitBackend {
         rec.title = title;
         rec.body_md = body_md;
         rec.author_is_agent = Self::is_agent(principal);
-        rec.updated_at = Some(now_unix());
+        let now = now_unix();
+        rec.created_at = Some(now); // R3.3 N1 — the header's "opened …" date, stamped once at open.
+        rec.updated_at = Some(now);
         self.prs.open_pr(&loc, &rec)?;
         Ok(rec)
     }
@@ -1226,6 +1236,268 @@ impl DurableGitBackend {
         )
     }
 
+    // ── R3.3 / R3.2 — the PR review-thread / comment / review-batch surface ───────────────────────
+    //
+    // The canonical model is THREADS (an optional content anchor; comments belong to threads); review
+    // batching layers on via `review_id` + the `ReviewBatch` lifecycle. Read = PR view (the `Pull`
+    // object guard at the route); write = a real write grant (the `Push` object guard) — never a
+    // permissive authorizer. Storage keys by the canonical `object_key` (`pr:<slug>:<n>`) so issues/
+    // docs mount the SAME store later. Every mutation verifies the PR exists first (a thread on a
+    // non-existent PR is a 404, mirroring the overview).
+
+    /// The canonical type-qualified object key for a PR (`pr:<slug>:<n>`). Bare `type:id` form is a
+    /// fixed point under [`myelin_refs::object_key`] (the tuple key IS this string), so issues/docs can
+    /// mount the same store by their own `issue:<id>` / `doc:<id>` keys with zero migration.
+    fn pr_object_key(slug: &str, number: u64) -> String {
+        format!("pr:{slug}:{number}")
+    }
+
+    /// The [`ThreadPrincipal`] snapshot for the acting principal (GIT-1 pseudonym as the display;
+    /// the four-channel agent badge rides `kind`). Never a raw identity.
+    fn thread_principal(tenant: &str, principal: &Principal) -> ThreadPrincipal {
+        let kind = match principal.kind {
+            PrincipalKind::Agent { .. } => PrincipalRole::Agent,
+            PrincipalKind::Service => PrincipalRole::Service,
+            _ => PrincipalRole::Human,
+        };
+        ThreadPrincipal::plain(kind, Self::pseudonym(tenant, principal))
+    }
+
+    /// Verify the PR exists (a thread op on an absent PR is a 404, exactly like the overview).
+    fn require_pr(&self, loc: &RepoLoc, number: u64) -> Result<PrRecord, DurableError> {
+        self.prs
+            .get(loc, number)?
+            .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))
+    }
+
+    /// **GET …/prs/{n}/threads — the viewer-scoped conversation.** Read = PR view (the `Pull` guard).
+    /// Pending review-batch comments authored by OTHERS never enter the projection (non-leak by
+    /// construction — `SubjectThreads::view_for`).
+    pub fn list_threads(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        number: u64,
+        principal: &Principal,
+    ) -> Result<Value, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        self.require_pr(&loc, number)?;
+        let key = Self::pr_object_key(slug, number);
+        let doc = self.threads.load(&loc, &key)?;
+        let viewer = Self::pseudonym(tenant, principal);
+        Ok(viewed_threads_json(&doc.view_for(&viewer)))
+    }
+
+    /// POST …/prs/{n}/threads — open a new thread with its first comment (`anchor` null = a discussion
+    /// thread; an anchor object = a diff-line thread). Write = `Push`.
+    pub fn create_thread(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        number: u64,
+        body: &Value,
+        principal: &Principal,
+    ) -> Result<Value, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        self.require_pr(&loc, number)?;
+        let key = Self::pr_object_key(slug, number);
+        let body_md = require_body_md(body)?;
+        let anchor = parse_anchor(body);
+        let author = Self::thread_principal(tenant, principal);
+        let thread = self
+            .threads
+            .create_thread(&loc, &key, anchor, author, body_md, now_unix())?;
+        self.bump_pr_updated(&loc, number);
+        Ok(thread_json(&thread))
+    }
+
+    /// POST …/prs/{n}/threads/{tid}/comments — reply to a thread. Write = `Push`.
+    pub fn add_thread_comment(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        number: u64,
+        thread_id: &str,
+        body: &Value,
+        principal: &Principal,
+    ) -> Result<Value, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        self.require_pr(&loc, number)?;
+        let key = Self::pr_object_key(slug, number);
+        let body_md = require_body_md(body)?;
+        let author = Self::thread_principal(tenant, principal);
+        let comment = self
+            .threads
+            .add_comment(&loc, &key, thread_id, author, body_md, now_unix())?;
+        self.bump_pr_updated(&loc, number);
+        Ok(comment_json(&comment))
+    }
+
+    /// POST …/prs/{n}/threads/{tid}/resolve — resolve/unresolve a thread. Write = `Push`.
+    pub fn resolve_thread(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        number: u64,
+        thread_id: &str,
+        body: &Value,
+    ) -> Result<Value, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        self.require_pr(&loc, number)?;
+        let key = Self::pr_object_key(slug, number);
+        let resolved = body.get("resolved").and_then(Value::as_bool).unwrap_or(true);
+        self.threads.resolve_thread(&loc, &key, thread_id, resolved)?;
+        Ok(json!({ "thread_id": thread_id, "resolved": resolved }))
+    }
+
+    /// POST …/prs/{n}/reviews/start — start a review batch (draft; verdict `in_progress`). Write =
+    /// `Push`. (`/start` distinguishes this from the existing single-shot `POST …/reviews` verdict op
+    /// that feeds the merge gate — a named deviation from N5's literal path, preserving R2's gate path.)
+    pub fn start_review_batch(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        number: u64,
+        principal: &Principal,
+    ) -> Result<Value, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        self.require_pr(&loc, number)?;
+        let key = Self::pr_object_key(slug, number);
+        let reviewer = Self::thread_principal(tenant, principal);
+        let batch = self.threads.start_review(&loc, &key, reviewer)?;
+        Ok(review_batch_json(&batch))
+    }
+
+    /// POST …/prs/{n}/reviews/{rid}/comments — add a PENDING comment to a draft batch (visible only to
+    /// its author until submit). Write = `Push`.
+    pub fn add_pending_comment(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        number: u64,
+        review_id: &str,
+        body: &Value,
+        principal: &Principal,
+    ) -> Result<Value, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        self.require_pr(&loc, number)?;
+        let key = Self::pr_object_key(slug, number);
+        let body_md = require_body_md(body)?;
+        let anchor = parse_anchor(body);
+        let author = Self::thread_principal(tenant, principal);
+        let comment = self.threads.add_pending_comment(
+            &loc,
+            &key,
+            review_id,
+            anchor,
+            author,
+            body_md,
+            now_unix(),
+        )?;
+        Ok(comment_json(&comment))
+    }
+
+    /// POST …/prs/{n}/reviews/{rid}/submit `{ verdict, summary_md }` — submit the batch. Emits ONE
+    /// batch event (R-BATCH-1; idempotent on retry). A NON-advisory (human) `approved` /
+    /// `changes_requested` verdict ALSO feeds the merge gate via the durable review record (an agent
+    /// batch stays advisory — it never gates). Write = `Push`.
+    pub fn submit_review_batch(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        number: u64,
+        review_id: &str,
+        body: &Value,
+        principal: &Principal,
+    ) -> Result<Value, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        self.require_pr(&loc, number)?;
+        let key = Self::pr_object_key(slug, number);
+        let verdict = match body.get("verdict").and_then(Value::as_str) {
+            Some("approved") | Some("approve") => BatchVerdict::Approved,
+            Some("changes_requested") | Some("request-changes") | Some("request_changes") => {
+                BatchVerdict::ChangesRequested
+            }
+            Some("commented") | Some("comment") | None => BatchVerdict::Commented,
+            Some(other) => {
+                return Err(DurableError::Git(format!("unknown review verdict `{other}`")))
+            }
+        };
+        let summary_md = body
+            .get("summary_md")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let submitted = self.threads.submit_review(
+            &loc,
+            &key,
+            review_id,
+            verdict,
+            summary_md,
+            now_unix(),
+        )?;
+        // Feed the merge gate: a NON-advisory approved/changes_requested verdict pushes a durable
+        // review record (the gate reads `counting_approvals` + `has_blocking_review`). An agent batch
+        // is advisory and a comment-only verdict adds no gate signal. Only the FIRST submit (Some)
+        // feeds the gate — a re-submit is idempotent (None), so no double-counted approval.
+        if let Some(ref batch) = submitted {
+            if !batch.review.advisory {
+                let gate_verdict = match verdict {
+                    BatchVerdict::Approved => Some("approve"),
+                    BatchVerdict::ChangesRequested => Some("request-changes"),
+                    _ => None,
+                };
+                if let Some(v) = gate_verdict {
+                    // Reuse the existing gate-feeding review op (self-approval is excluded there).
+                    let _ = self.submit_review(tenant, region, slug, number, v, principal);
+                }
+            }
+        }
+        self.bump_pr_updated(&loc, number);
+        Ok(json!({
+            // The ONE batch event's payload (server-side R-BATCH-1). `emitted` is true exactly once
+            // (the first submit); a re-submit is idempotent → `emitted: false`, no double event.
+            "emitted": submitted.is_some(),
+            "review": submitted.as_ref().map(|b| review_batch_json(&b.review)),
+            "comment_ids": submitted
+                .as_ref()
+                .map(|b| b.comment_ids.clone())
+                .unwrap_or_default(),
+        }))
+    }
+
+    /// DELETE …/prs/{n}/reviews/{rid} — discard a DRAFT batch (its private comments leave no trace).
+    /// A submitted batch is public record — `Forbidden`. Write = `Push`.
+    pub fn discard_review_batch(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        number: u64,
+        review_id: &str,
+    ) -> Result<Value, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        self.require_pr(&loc, number)?;
+        let key = Self::pr_object_key(slug, number);
+        self.threads.discard_review(&loc, &key, review_id)?;
+        Ok(json!({ "discarded": review_id }))
+    }
+
+    /// Bump the PR's `updated_at` after an authored conversation mutation (best-effort — a failure to
+    /// re-stamp the record never fails the comment that already persisted).
+    fn bump_pr_updated(&self, loc: &RepoLoc, number: u64) {
+        if let Ok(Some(mut rec)) = self.prs.get(loc, number) {
+            rec.updated_at = Some(now_unix());
+            let _ = self.prs.put(loc, &rec);
+        }
+    }
+
     // ── git smart-HTTP PUSH (receive-pack) over the wire — CT-006d ──
 
     /// **R0.2 / DELTA N1 — Git's OWN recorded check facts for a pushed head commit.** Scans the repo's
@@ -1548,8 +1820,61 @@ impl DurableGitBackend {
             "author_is_agent": rec.author_is_agent,
             "reviews": rec.reviews.len(),
             "updated_at": rec.updated_at,
+            // R3.3 N1 — the header's "opened …" date (Intl-formatted client-side); null on a legacy
+            // record (the header omits it rather than fabricating a date).
+            "created_at": rec.created_at,
             "durable": true,
         })
+    }
+
+    /// **The checks + merge-gate projection JSON (`PrChecksVM`).** `gate_admitted` is AUTHORITATIVE —
+    /// the UI reflects it, never recomputes. Reused by the checks endpoint AND the merge-409 re-render
+    /// (so a gate that flipped mid-dialog returns the fresh blocked card, never a stale one). `blocked`
+    /// carries the honest, VERIFIED gate inputs: `changes_requested` (a live request-changes blocks
+    /// unconditionally) and `approvals` (a real threshold; self-approval excluded) — both are what the
+    /// R2 ruleset actually ingests, so the copy never implies a gate input that isn't real.
+    fn pr_checks_json(&self, loc: &RepoLoc, rec: &PrRecord) -> Result<Value, DurableError> {
+        let ruleset = self.prs.effective_ruleset_for(loc, &rec.base_ref)?;
+        let eval = evaluate_merge(&ruleset, &rec).map_err(|e| DurableError::Git(e.to_string()))?;
+        let has_blocking_review = rec.reviews.iter().any(|r| {
+            matches!(
+                r.state,
+                ReviewState::Submitted(ReviewVerdict::RequestChanges)
+            )
+        });
+        let counting_approvals = rec
+            .reviews
+            .iter()
+            .filter(|r| {
+                matches!(r.state, ReviewState::Submitted(ReviewVerdict::Approve))
+                    && r.reviewer_pseudonym != rec.author_pseudonym
+            })
+            .count() as u32;
+        Ok(json!({
+            "required_contexts": ruleset.required_contexts,
+            "required_approvals": ruleset.required_approvals,
+            "green_contexts": rec.green_contexts,
+            "endorsed_contexts": rec.endorsed_contexts,
+            // The X-1 fork-trust surface: contexts that passed on an UNTRUSTED FORK run and are
+            // recorded-but-neutral until a maintainer endorses them (the badge the UI renders).
+            "fork_unendorsed_contexts": rec.fork_unendorsed_contexts,
+            "gate_admitted": eval.admitted(),
+            // The VERIFIED review-gate inputs (R2 `evaluate_ruleset`): the UI renders these as
+            // blocked-reason copy WITHOUT inventing a gate input that isn't real.
+            "changes_requested": has_blocking_review,
+            "current_approvals": counting_approvals,
+            "durable": true,
+        }))
+    }
+
+    /// The commits IN a PR count (R3.3 N1/N2 — the tab badge) via the bounded reachability walk. A cap
+    /// keeps it O(cap); the count is exact for dogfood-scale PRs (the named floor is `cap+`).
+    fn commits_in_pr_count(&self, loc: &RepoLoc, rec: &PrRecord) -> Option<(u64, bool)> {
+        let repo = self.store.open_repo(loc).ok()?;
+        let (rows, has_more) = repo
+            .commits_in_pr(&rec.base_ref, &rec.head_oid, 500)
+            .ok()?;
+        Some((rows.len() as u64, has_more))
     }
 }
 
@@ -1597,6 +1922,112 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// ── R3.3 / R3.2 thread-surface helpers (body parsing + VM serialization) ─────────────────────────
+
+/// Extract a non-empty `body_md` (or `body`) from a comment/thread POST body — a clean 400 if absent
+/// or blank (never a silent empty comment).
+fn require_body_md(body: &Value) -> Result<String, DurableError> {
+    body.get("body_md")
+        .or_else(|| body.get("body"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| DurableError::Git("comment body missing a non-empty `body_md`".into()))
+}
+
+/// Parse an optional diff-line content anchor from a POST body (`{ anchor: { path, line, side? } }`).
+/// A fresh anchor is authored `live`; the store's re-resolution (moved/outdated) is the diff pack's
+/// concern. `None` (absent anchor) = a PR-level discussion thread.
+fn parse_anchor(body: &Value) -> Option<ThreadAnchor> {
+    let a = body.get("anchor")?;
+    let path = a.get("path").and_then(Value::as_str)?.to_string();
+    let line = a.get("line").and_then(Value::as_u64);
+    Some(ThreadAnchor {
+        path,
+        line,
+        anchor_state: AnchorState::Live,
+    })
+}
+
+fn principal_role_token(role: PrincipalRole) -> &'static str {
+    match role {
+        PrincipalRole::Human => "human",
+        PrincipalRole::Agent => "agent",
+        PrincipalRole::Service => "service",
+    }
+}
+
+fn principal_json(p: &ThreadPrincipal) -> Value {
+    json!({
+        "kind": principal_role_token(p.kind),
+        "display": p.display,
+        "on_behalf_of": p.on_behalf_of,
+        "trigger": p.trigger,
+    })
+}
+
+fn anchor_state_token(s: AnchorState) -> &'static str {
+    match s {
+        AnchorState::Live => "live",
+        AnchorState::Moved => "moved",
+        AnchorState::Outdated => "outdated",
+    }
+}
+
+fn comment_json(c: &CommentRecord) -> Value {
+    json!({
+        "id": c.id,
+        "author": principal_json(&c.author),
+        // A removed comment withholds its body ("Comment removed", tree preserved) — never serialised.
+        "body_md": match c.state { CommentState::Removed => Value::Null, _ => json!(c.body_md) },
+        "created_at": c.created_at,
+        "edited_at": c.edited_at,
+        "state": match c.state { CommentState::Removed => "removed", _ => "visible" },
+        "review_id": c.review_id,
+        "pending": c.pending,
+    })
+}
+
+fn thread_json(t: &ThreadRecord) -> Value {
+    json!({
+        "id": t.id,
+        "anchor": t.anchor.as_ref().map(|a| json!({
+            "path": a.path,
+            "line": a.line,
+            "anchor_state": anchor_state_token(a.anchor_state),
+        })),
+        "resolved": t.resolved,
+        "comments": t.comments.iter().map(comment_json).collect::<Vec<_>>(),
+    })
+}
+
+fn review_batch_json(r: &ReviewBatch) -> Value {
+    json!({
+        "id": r.id,
+        "reviewer": principal_json(&r.reviewer),
+        "verdict": r.verdict.as_str(),
+        "advisory": r.advisory,
+        "submitted_at": r.submitted_at,
+        "summary_md": r.summary_md,
+    })
+}
+
+/// The `GET …/threads` envelope: the viewer-scoped threads split into discussion (anchor null) vs
+/// anchored, plus the visible review batches. The overview consumes `discussion` + `reviews`; the diff
+/// pack consumes `anchored`.
+fn viewed_threads_json(v: &ViewedThreads) -> Value {
+    let (anchored, discussion): (Vec<&ThreadRecord>, Vec<&ThreadRecord>) =
+        v.threads.iter().partition(|t| t.anchor.is_some());
+    json!({
+        "discussion": discussion.iter().map(|t| thread_json(t)).collect::<Vec<_>>(),
+        "anchored": anchored.iter().map(|t| thread_json(t)).collect::<Vec<_>>(),
+        "threads": v.threads.iter().map(thread_json).collect::<Vec<_>>(),
+        "reviews": v.reviews.iter().map(review_batch_json).collect::<Vec<_>>(),
+        "durable": true,
+    })
 }
 
 /// Parse the `?state=` tab filter to the set of PR-state tokens it selects. `open` (the default)
@@ -2046,7 +2477,255 @@ impl Handler for DPrOverview {
             .get(&loc, num_param(ctx, "n")?)
             .map_err(map_durable_err)?
             .ok_or_else(|| EdgeError::NotFound("no such pull request".into()))?;
-        Ok(EdgeResponse::json(200, &DurableGitBackend::pr_json(&rec)))
+        let mut vm = DurableGitBackend::pr_json(&rec);
+        // R3.3 N1 — the commits-in-PR count (the tab badge) enriches the base record. A read failure
+        // degrades to `null` (the badge simply omits the count — never a fabricated number).
+        if let Some(obj) = vm.as_object_mut() {
+            match self.be.commits_in_pr_count(&loc, &rec) {
+                Some((count, has_more)) => {
+                    obj.insert("commits_count".into(), json!(count));
+                    obj.insert("commits_count_capped".into(), json!(has_more));
+                }
+                None => {
+                    obj.insert("commits_count".into(), Value::Null);
+                }
+            }
+        }
+        Ok(EdgeResponse::json(200, &vm))
+    }
+}
+
+/// **GET …/prs/{n}/commits — the commits IN a PR (R3.3 N2).** Reachable from the head but not the base
+/// (three-dot semantics via the reachability walk), newest-first, MR-014 envelope. `Pull`-guarded.
+struct DPrCommits {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DPrCommits {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let loc = DurableGitBackend::loc(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?);
+        let rec = self
+            .be
+            .prs
+            .get(&loc, num_param(ctx, "n")?)
+            .map_err(map_durable_err)?
+            .ok_or_else(|| EdgeError::NotFound("no such pull request".into()))?;
+        let repo = self.be.store.open_repo(&loc).map_err(map_durable_err)?;
+        let (metas, has_more) = repo
+            .commits_in_pr(&rec.base_ref, &rec.head_oid, ctx.page.limit.min(500))
+            .map_err(map_durable_err)?;
+        let items: Vec<Value> = metas
+            .into_iter()
+            .map(|m| commit_row(m).to_json())
+            .collect();
+        let next = if has_more { Some("more".to_string()) } else { None };
+        Ok(EdgeResponse::json(
+            200,
+            &page_envelope(json!(items), next, ctx.page.limit),
+        ))
+    }
+}
+
+// ── R3.3 / R3.2 thread + review-batch handlers ──────────────────────────────────────────────────
+
+/// GET …/prs/{n}/threads — the viewer-scoped conversation. `Pull`-guarded (read = PR view).
+struct DPrThreads {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DPrThreads {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let vm = self
+            .be
+            .list_threads(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+                num_param(ctx, "n")?,
+                ctx.principal,
+            )
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(200, &vm))
+    }
+}
+
+/// POST …/prs/{n}/threads — open a new thread + first comment. `Push`-guarded.
+struct DPrThreadCreate {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DPrThreadCreate {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let body = ctx.request.json_body()?;
+        let vm = self
+            .be
+            .create_thread(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+                num_param(ctx, "n")?,
+                &body,
+                ctx.principal,
+            )
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(
+            201,
+            &json!({ "applied": { "action": "git.pr.thread.create", "thread": vm }, "durable": true }),
+        ))
+    }
+}
+
+/// POST …/prs/{n}/threads/{tid}/comments — reply to a thread. `Push`-guarded.
+struct DPrThreadComment {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DPrThreadComment {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let body = ctx.request.json_body()?;
+        let vm = self
+            .be
+            .add_thread_comment(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+                num_param(ctx, "n")?,
+                param(ctx, "tid")?,
+                &body,
+                ctx.principal,
+            )
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(
+            201,
+            &json!({ "applied": { "action": "git.pr.comment.create", "comment": vm }, "durable": true }),
+        ))
+    }
+}
+
+/// POST …/prs/{n}/threads/{tid}/resolve — resolve/unresolve a thread. `Push`-guarded.
+struct DPrThreadResolve {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DPrThreadResolve {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let body = if ctx.request.body.is_empty() {
+            Value::Null
+        } else {
+            ctx.request.json_body()?
+        };
+        let vm = self
+            .be
+            .resolve_thread(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+                num_param(ctx, "n")?,
+                param(ctx, "tid")?,
+                &body,
+            )
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(
+            200,
+            &json!({ "applied": { "action": "git.pr.thread.resolve", "result": vm }, "durable": true }),
+        ))
+    }
+}
+
+/// POST …/prs/{n}/reviews/start — start a review batch (draft). `Push`-guarded.
+struct DPrReviewStart {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DPrReviewStart {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let vm = self
+            .be
+            .start_review_batch(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+                num_param(ctx, "n")?,
+                ctx.principal,
+            )
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(
+            201,
+            &json!({ "applied": { "action": "git.pr.review.start", "review": vm }, "durable": true }),
+        ))
+    }
+}
+
+/// POST …/prs/{n}/reviews/{rid}/comments — add a pending comment to a draft batch. `Push`-guarded.
+struct DPrReviewComment {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DPrReviewComment {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let body = ctx.request.json_body()?;
+        let vm = self
+            .be
+            .add_pending_comment(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+                num_param(ctx, "n")?,
+                param(ctx, "rid")?,
+                &body,
+                ctx.principal,
+            )
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(
+            201,
+            &json!({ "applied": { "action": "git.pr.review.comment", "comment": vm }, "durable": true }),
+        ))
+    }
+}
+
+/// POST …/prs/{n}/reviews/{rid}/submit — submit the batch (ONE event, R-BATCH-1). `Push`-guarded.
+struct DPrReviewSubmit {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DPrReviewSubmit {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let body = if ctx.request.body.is_empty() {
+            Value::Null
+        } else {
+            ctx.request.json_body()?
+        };
+        let vm = self
+            .be
+            .submit_review_batch(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+                num_param(ctx, "n")?,
+                param(ctx, "rid")?,
+                &body,
+                ctx.principal,
+            )
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(
+            200,
+            &json!({ "applied": { "action": "git.pr.review.submit", "result": vm }, "durable": true }),
+        ))
+    }
+}
+
+/// DELETE …/prs/{n}/reviews/{rid} — discard a draft batch. `Push`-guarded.
+struct DPrReviewDiscard {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DPrReviewDiscard {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let vm = self
+            .be
+            .discard_review_batch(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+                num_param(ctx, "n")?,
+                param(ctx, "rid")?,
+            )
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(
+            200,
+            &json!({ "applied": { "action": "git.pr.review.discard", "result": vm }, "durable": true }),
+        ))
     }
 }
 
@@ -2062,28 +2741,8 @@ impl Handler for DPrChecks {
             .get(&loc, num_param(ctx, "n")?)
             .map_err(map_durable_err)?
             .ok_or_else(|| EdgeError::NotFound("no such pull request".into()))?;
-        // The required set comes from the REPO-OWNED ruleset for the base ref (never author input).
-        let ruleset = self
-            .be
-            .prs
-            .effective_ruleset_for(&loc, &rec.base_ref)
-            .map_err(map_durable_err)?;
-        let eval =
-            evaluate_merge(&ruleset, &rec).map_err(|e| EdgeError::Internal(e.to_string()))?;
-        Ok(EdgeResponse::json(
-            200,
-            &json!({
-                "required_contexts": ruleset.required_contexts,
-                "required_approvals": ruleset.required_approvals,
-                "green_contexts": rec.green_contexts,
-                "endorsed_contexts": rec.endorsed_contexts,
-                // The X-1 fork-trust surface: contexts that passed on an UNTRUSTED FORK run and are
-                // recorded-but-neutral until a maintainer endorses them (the badge the UI renders).
-                "fork_unendorsed_contexts": rec.fork_unendorsed_contexts,
-                "gate_admitted": eval.admitted(),
-                "durable": true,
-            }),
-        ))
+        let vm = self.be.pr_checks_json(&loc, &rec).map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(200, &vm))
     }
 }
 
@@ -2302,12 +2961,34 @@ impl Handler for DMerge {
                     "durable": true,
                 }),
             )),
-            // The merge gate BLOCKED — a loud, honest refusal (no ref advanced). 409: the PR is not in a
-            // mergeable state. The body names the gate outcome so the UI can humanise it.
-            MergeAttempt::Blocked(eval) => Err(EdgeError::Conflict(format!(
-                "merge blocked by policy (required-set admitted: {}, ruleset satisfied: {})",
-                eval.gate.is_admitted(),
-                eval.ruleset.is_satisfied()
+            // The merge gate BLOCKED — a loud, honest refusal (no ref advanced). N6: a 409 carrying the
+            // FRESH re-rendered `checks` (the gate may have flipped mid-dialog) so the UI re-renders the
+            // blocked card WITHOUT a second round-trip and NEVER merges on stale state. `gate_admitted`
+            // stays authoritative — the UI reflects it, never recomputes.
+            MergeAttempt::Blocked(_eval) => {
+                let loc =
+                    DurableGitBackend::loc(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?);
+                let checks = self
+                    .be
+                    .prs
+                    .get(&loc, num_param(ctx, "n")?)
+                    .ok()
+                    .flatten()
+                    .and_then(|rec| self.be.pr_checks_json(&loc, &rec).ok());
+                Ok(EdgeResponse::json(
+                    409,
+                    &json!({
+                        "error": {
+                            "code": "merge_blocked",
+                            "message": "merge blocked by branch protection",
+                        },
+                        "checks": checks,
+                        "durable": true,
+                    }),
+                ))
+            }
+            MergeAttempt::RefRefused(reason) => Err(EdgeError::Conflict(format!(
+                "merge ref advance refused: {reason:?}"
             ))),
             MergeAttempt::RefRefused(reason) => Err(EdgeError::Conflict(format!(
                 "merge ref advance refused: {reason:?}"
@@ -2569,6 +3250,7 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
     // catalogue routes (the gateway owns auth/scope/IDOR/error/pagination per route). All GET (reads),
     // all object-guarded on `Pull` (R2.1).
     let get = map_method(GitMethod::Get);
+    let post = map_method(GitMethod::Post);
     // R3.1 — the per-repo PR LIST. Object-guarded on `Pull`: the leak-free prefilter is the frozen
     // `pull_request.view = parent_repo->pull` reduction (a viewer who cannot pull gets the 0-leak 404
     // "no access" state; once past it every PR in the repo is view-able, so counts never leak).
@@ -2577,6 +3259,66 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         &reroot("/api/git/repos/{repo}/prs"),
         "git.prs.list",
         guarded(&be, Pull, Arc::new(DRepoPrList { be: be.clone() })),
+    );
+    // ── R3.3 N2 — commits IN a PR (the tab badge's full list). `Pull` (read = PR view). ──
+    b = b.route(
+        get,
+        &reroot("/api/git/repos/{repo}/prs/{n}/commits"),
+        "git.pr.commits",
+        guarded(&be, Pull, Arc::new(DPrCommits { be: be.clone() })),
+    );
+    // ── R3.3 / R3.2 — the thread + review-batch surface. READ = `Pull` (thread read = PR view);
+    //    WRITE = `Push` (comment/review write is a real write grant, never a permissive authorizer). ──
+    b = b.route(
+        get,
+        &reroot("/api/git/repos/{repo}/prs/{n}/threads"),
+        "git.pr.threads.list",
+        guarded(&be, Pull, Arc::new(DPrThreads { be: be.clone() })),
+    );
+    b = b.route(
+        post,
+        &reroot("/api/git/repos/{repo}/prs/{n}/threads"),
+        "git.pr.thread.create",
+        guarded(&be, Push, Arc::new(DPrThreadCreate { be: be.clone() })),
+    );
+    b = b.route(
+        post,
+        &reroot("/api/git/repos/{repo}/prs/{n}/threads/{tid}/comments"),
+        "git.pr.comment.create",
+        guarded(&be, Push, Arc::new(DPrThreadComment { be: be.clone() })),
+    );
+    b = b.route(
+        post,
+        &reroot("/api/git/repos/{repo}/prs/{n}/threads/{tid}/resolve"),
+        "git.pr.thread.resolve",
+        guarded(&be, Push, Arc::new(DPrThreadResolve { be: be.clone() })),
+    );
+    // The review-batch lifecycle (G-8). `/reviews/start` (not `POST /reviews`) preserves the existing
+    // single-shot `POST /reviews` verdict op that feeds the merge gate — a named deviation from N5's
+    // literal path. Discard is `POST …/discard` (the gateway git grammar is Get/Post only, no DELETE).
+    b = b.route(
+        post,
+        &reroot("/api/git/repos/{repo}/prs/{n}/reviews/start"),
+        "git.pr.review.start",
+        guarded(&be, Push, Arc::new(DPrReviewStart { be: be.clone() })),
+    );
+    b = b.route(
+        post,
+        &reroot("/api/git/repos/{repo}/prs/{n}/reviews/{rid}/comments"),
+        "git.pr.review.comment",
+        guarded(&be, Push, Arc::new(DPrReviewComment { be: be.clone() })),
+    );
+    b = b.route(
+        post,
+        &reroot("/api/git/repos/{repo}/prs/{n}/reviews/{rid}/submit"),
+        "git.pr.review.submit",
+        guarded(&be, Push, Arc::new(DPrReviewSubmit { be: be.clone() })),
+    );
+    b = b.route(
+        post,
+        &reroot("/api/git/repos/{repo}/prs/{n}/reviews/{rid}/discard"),
+        "git.pr.review.discard",
+        guarded(&be, Push, Arc::new(DPrReviewDiscard { be: be.clone() })),
     );
     // R3.1 — the CROSS-REPO PR front door (`/prs`). NOT object-guarded (no `{repo}`): the prefilter is
     // the `visible_repos` `list_objects` seam inside the handler (stronger than a single object check
@@ -3089,5 +3831,224 @@ mod pr_list_tests {
         assert_eq!(row["number"], 9);
         assert_eq!(row["checks_summary"]["verdict"], "unavailable", "fails static, still lists");
         assert_eq!(row["updated_at"], Value::Null);
+    }
+}
+
+#[cfg(test)]
+mod pr_thread_tests {
+    //! **R3.3 / R3.2 — the PR thread / comment / review-batch surface at the edge.** Drives the
+    //! handlers to prove: (a) thread READ = PR view (the `Pull` guard) but WRITE = a real write grant
+    //! (the `Push` guard — a read-only viewer is 403 on a comment, NOT AllowAll); (b) a pending review
+    //! comment is invisible to a second viewer until submit; (c) submit emits exactly ONE batch event
+    //! (idempotent on retry); (d) a submitted human `changes_requested` verdict flips the merge gate to
+    //! blocked; (e) a blocked merge returns a 409 carrying the FRESH re-rendered checks (N6).
+
+    use super::*;
+    use crate::catalogue::Page;
+    use crate::repo_authz::GrantBackedRepos;
+    use crate::request::EdgeRequest;
+    use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
+    use myelin_storage::TenantScope;
+    use myelin_tenancy::{Region as IdRegion, TenantId};
+    use std::collections::BTreeMap;
+
+    const TENANT: &str = "acme";
+    const REGION: &str = "eu-west";
+    const SLUG: &str = "core";
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("myelin-prthread-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    fn human(id: &str) -> Principal {
+        Principal::new(
+            TenantId(TENANT.into()),
+            IdRegion(REGION.into()),
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        )
+    }
+
+    /// Drive a handler (JSON body + path params), returning the `Result` so authz denials are testable.
+    fn serve(
+        handler: &dyn Handler,
+        method: &str,
+        viewer: &Principal,
+        params: &[(&str, &str)],
+        body: Value,
+    ) -> Result<Value, EdgeError> {
+        let scope = TenantScope::from_verified_token(viewer, viewer.region.clone());
+        let pmap: BTreeMap<String, String> = params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let bytes = if body.is_null() {
+            vec![]
+        } else {
+            serde_json::to_vec(&body).unwrap()
+        };
+        let req = EdgeRequest::new(method, "/v1/git/x", "", vec![], bytes);
+        let page = Page::from_request(&req);
+        let ctx = HandlerCtx {
+            principal: viewer,
+            scope: &scope,
+            params: &pmap,
+            page: &page,
+            request: &req,
+        };
+        handler.handle(&ctx).map(|r| r.json_body().expect("json"))
+    }
+
+    /// A backend with a writer + a read-only viewer, a repo, and one open PR at head `head_oid`.
+    fn setup(tag: &str, head_oid: &str) -> (Arc<DurableGitBackend>, Principal, Principal) {
+        let root = temp_root(tag);
+        let authz = GrantBackedRepos::new()
+            .grant_write("u:writer", TENANT, SLUG)
+            .grant_read("u:reader", TENANT, SLUG);
+        let writer = human("u:writer");
+        let reader = human("u:reader");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
+        be.create_repo_as(TENANT, REGION, SLUG, &writer).unwrap();
+        let body = json!({
+            "title": "R3.3 flagship", "base_ref": "refs/heads/main",
+            "head_ref": "refs/heads/feature", "head_oid": head_oid, "draft": false,
+        });
+        be.open_pr(TENANT, REGION, SLUG, &body, &writer).unwrap();
+        (Arc::new(be), writer, reader)
+    }
+
+    /// **Write = a REAL permission (Push), not AllowAll.** A read-only viewer may LIST threads (read =
+    /// PR view) but is 403 on creating a comment (the `Push` object guard denies).
+    #[test]
+    fn thread_read_is_pr_view_but_write_needs_a_real_write_grant() {
+        let (be, _writer, reader) = setup("authz", &"0".repeat(40));
+        // The reader may LIST (Pull-guarded read).
+        let list = guarded(&be, RepoPermission::Pull, Arc::new(DPrThreads { be: be.clone() }));
+        let v = serve(&*list, "GET", &reader, &[("repo", SLUG), ("n", "1")], Value::Null)
+            .expect("reader may read threads");
+        assert!(v["threads"].is_array());
+        // The reader may NOT create a comment (Push-guarded write) — 403, never a silent allow.
+        let create =
+            guarded(&be, RepoPermission::Push, Arc::new(DPrThreadCreate { be: be.clone() }));
+        let err = serve(
+            &*create,
+            "POST",
+            &reader,
+            &[("repo", SLUG), ("n", "1")],
+            json!({ "body_md": "hi" }),
+        )
+        .expect_err("a read-only viewer must be forbidden from commenting");
+        assert!(matches!(err, EdgeError::Forbidden(_)), "got {err:?}");
+    }
+
+    /// A pending review comment is invisible to a second viewer until submit; submit emits ONE event.
+    #[test]
+    fn pending_comment_is_private_and_submit_emits_one_event() {
+        let (be, writer, reader) = setup("pending", &"0".repeat(40));
+        let threads = Arc::new(DPrThreads { be: be.clone() });
+        let start = Arc::new(DPrReviewStart { be: be.clone() });
+        let pending = Arc::new(DPrReviewComment { be: be.clone() });
+        let submit = Arc::new(DPrReviewSubmit { be: be.clone() });
+
+        // The reader (a real reviewer with read) starts a batch + drafts a pending comment.
+        let batch = serve(&*start, "POST", &reader, &[("repo", SLUG), ("n", "1")], Value::Null).unwrap();
+        let rid = batch["applied"]["review"]["id"].as_str().unwrap().to_string();
+        serve(
+            &*pending,
+            "POST",
+            &reader,
+            &[("repo", SLUG), ("n", "1"), ("rid", &rid)],
+            json!({ "body_md": "draft note" }),
+        )
+        .unwrap();
+
+        // The WRITER (a different viewer) sees NO thread and NO draft batch.
+        let seen = serve(&*threads, "GET", &writer, &[("repo", SLUG), ("n", "1")], Value::Null).unwrap();
+        assert_eq!(seen["threads"].as_array().unwrap().len(), 0, "pending comment is private");
+        assert_eq!(seen["reviews"].as_array().unwrap().len(), 0, "draft batch is hidden");
+
+        // Submit → ONE event (emitted true); a re-submit is idempotent (emitted false).
+        let first = serve(
+            &*submit,
+            "POST",
+            &reader,
+            &[("repo", SLUG), ("n", "1"), ("rid", &rid)],
+            json!({ "verdict": "commented" }),
+        )
+        .unwrap();
+        assert_eq!(first["applied"]["result"]["emitted"], true);
+        let again = serve(
+            &*submit,
+            "POST",
+            &reader,
+            &[("repo", SLUG), ("n", "1"), ("rid", &rid)],
+            json!({ "verdict": "commented" }),
+        )
+        .unwrap();
+        assert_eq!(again["applied"]["result"]["emitted"], false, "no double event");
+
+        // Now the writer sees the (submitted) thread.
+        let seen = serve(&*threads, "GET", &writer, &[("repo", SLUG), ("n", "1")], Value::Null).unwrap();
+        assert_eq!(seen["threads"].as_array().unwrap().len(), 1, "submit makes it public");
+    }
+
+    /// A submitted human `changes_requested` batch flips the merge gate → the checks projection reads
+    /// `changes_requested: true` and `gate_admitted: false` (the VERIFIED R2 gate input).
+    #[test]
+    fn a_changes_requested_batch_blocks_the_gate() {
+        let (be, _writer, reader) = setup("blockgate", &"0".repeat(40));
+        let start = Arc::new(DPrReviewStart { be: be.clone() });
+        let submit = Arc::new(DPrReviewSubmit { be: be.clone() });
+        let checks = Arc::new(DPrChecks { be: be.clone() });
+
+        let batch = serve(&*start, "POST", &reader, &[("repo", SLUG), ("n", "1")], Value::Null).unwrap();
+        let rid = batch["applied"]["review"]["id"].as_str().unwrap().to_string();
+        serve(
+            &*submit,
+            "POST",
+            &reader,
+            &[("repo", SLUG), ("n", "1"), ("rid", &rid)],
+            json!({ "verdict": "changes_requested" }),
+        )
+        .unwrap();
+        let ck = serve(&*checks, "GET", &reader, &[("repo", SLUG), ("n", "1")], Value::Null).unwrap();
+        assert_eq!(ck["changes_requested"], true, "the gate ingests changes_requested");
+        assert_eq!(ck["gate_admitted"], false, "a live request-changes blocks the merge");
+    }
+
+    /// A blocked merge returns a 409 carrying the FRESH re-rendered checks (N6 — the UI re-renders the
+    /// blocked card without a second round-trip, never merges on stale state).
+    #[test]
+    fn a_blocked_merge_returns_409_with_rerendered_checks() {
+        // A protected base (`refs/heads/main`) defaults CLOSED (requires a non-author approval) → the
+        // merge is blocked by POLICY. Build the backend with an ADMIN grant for the writer so the
+        // OBJECT guard (ProtectedPush) admits and the POLICY gate is what blocks (the N6 case).
+        let root = temp_root("merge409");
+        let authz = GrantBackedRepos::new().grant_admin("u:writer", TENANT, SLUG);
+        let writer = human("u:writer");
+        let be = Arc::new(
+            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz)),
+        );
+        be.create_repo_as(TENANT, REGION, SLUG, &writer).unwrap();
+        be.open_pr(
+            TENANT,
+            REGION,
+            SLUG,
+            &json!({ "title": "N6", "base_ref": "refs/heads/main", "head_ref": "refs/heads/feature",
+                     "head_oid": "0".repeat(40), "draft": false }),
+            &writer,
+        )
+        .unwrap();
+        let merge = guarded(&be, RepoPermission::ProtectedPush, Arc::new(DMerge { be: be.clone() }));
+        let resp = serve(&*merge, "POST", &writer, &[("repo", SLUG), ("n", "1")], Value::Null)
+            .expect("merge handler returns a body (409 is an Ok EdgeResponse, not an Err)");
+        assert_eq!(resp["error"]["code"], "merge_blocked");
+        assert_eq!(resp["checks"]["gate_admitted"], false, "the 409 carries the fresh gate state");
     }
 }

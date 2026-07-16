@@ -5,11 +5,44 @@
 // fluid main slot (the `min-height:0` scroll container). Global ⌘K opens the palette from anywhere.
 // Built from the MR-016 design-system (<Icon>, semantic tokens) + the MR-017 overlays (Dialog/Menu/
 // Toast); semantic-tokens-only; a11y per the design manual (landmarks, skip link, aria-current).
-import { For, Show, createSignal, onCleanup, onMount, type JSX } from "solid-js";
+import {
+  For,
+  Show,
+  createContext,
+  createEffect,
+  createSignal,
+  onCleanup,
+  onMount,
+  useContext,
+  type JSX,
+} from "solid-js";
 import { A, useAction, useLocation, useNavigate } from "@solidjs/router";
 import { Icon, Menu, Dialog, useToast, type IconName, type MenuItemSpec } from "@myelin/design-system";
 import { logout, type Viewer } from "../lib/auth";
 import { CommandPalette, type Command } from "./CommandPalette";
+
+/** The shell context a nested route uses to fill the shell-owned context-pane region (§1b). A route
+ *  calls `setContextPane(() => <Pane/>)` in an effect (with `onCleanup(() => setContextPane(null))`);
+ *  the shell renders it as its 4th region / drawer. This keeps the frame/breakpoint/drawer/landmark in
+ *  the shell ONCE while letting any surface supply the content — without threading a prop through the
+ *  pathless layout. */
+interface ContextPaneApi {
+  /** Supply the pane as a render THUNK (called fresh per location) so the inline column and the narrow
+   *  drawer never share a DOM node. Pass `null` (in `onCleanup`) to drop the pane. */
+  setContextPane: (render: (() => JSX.Element) | null) => void;
+  setContextPaneLabel: (label: string) => void;
+}
+const ContextPaneContext = createContext<ContextPaneApi>();
+
+/** Consume the shell's context-pane slot from a nested route (no-op setters off the shell). */
+export function useContextPane(): ContextPaneApi {
+  return (
+    useContext(ContextPaneContext) ?? {
+      setContextPane: () => {},
+      setContextPaneLabel: () => {},
+    }
+  );
+}
 
 interface NavItem {
   href: string;
@@ -41,6 +74,28 @@ export interface AppShellProps {
   children?: JSX.Element;
 }
 
+/** The MOB-2 breakpoint: at ≤ 1280px the context-pane column drops and the pane becomes a drawer. */
+const PANE_DRAWER_MAX = 1280;
+
+/** The body grid columns: [secondaryNav?] main [contextPane?]. The pane column is added only when a
+ *  pane is present AND wide — otherwise it DROPS entirely (content never renders beside an empty
+ *  gutter, §1b). */
+/** True when a keystroke target is a text field / editable — bare-key shortcuts must not fire there. */
+function isTypingTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
+}
+
+function paneColumns(hasSecondary: boolean, hasPaneColumn: boolean): string {
+  const cols: string[] = [];
+  if (hasSecondary) cols.push("14rem");
+  cols.push("minmax(0, 1fr)");
+  if (hasPaneColumn) cols.push("332px");
+  return cols.join(" ");
+}
+
 export function AppShell(props: AppShellProps) {
   const location = useLocation();
   const navigate = useNavigate();
@@ -56,6 +111,33 @@ export function AppShell(props: AppShellProps) {
 
   const [paletteOpen, setPaletteOpen] = createSignal(false);
   const [inboxOpen, setInboxOpen] = createSignal(false);
+  // MOB-2: wide (> 1280px) renders the pane as a 4th column; narrow renders it in a drawer. Default
+  // wide so SSR renders the column; onMount installs the real matchMedia listener.
+  const [paneWide, setPaneWide] = createSignal(true);
+  const [paneDrawerOpen, setPaneDrawerOpen] = createSignal(false);
+  onMount(() => {
+    const mq = window.matchMedia(`(min-width: ${PANE_DRAWER_MAX + 1}px)`);
+    const sync = () => setPaneWide(mq.matches);
+    sync();
+    mq.addEventListener("change", sync);
+    onCleanup(() => mq.removeEventListener("change", sync));
+  });
+  // Route change auto-closes the drawer (NOTES §1b).
+  createEffect(() => {
+    location.pathname;
+    setPaneDrawerOpen(false);
+  });
+  // The pane content a nested route supplies via `useContextPane()` (or the direct prop). The prop
+  // wins when present; otherwise the context signal drives the region.
+  const [ctxPaneThunk, setCtxPaneThunk] = createSignal<(() => JSX.Element) | null>(null);
+  const [ctxPaneLabel, setCtxPaneLabel] = createSignal("Context");
+  const paneApi: ContextPaneApi = {
+    setContextPane: (render) => setCtxPaneThunk(() => render),
+    setContextPaneLabel: (label) => setCtxPaneLabel(label),
+  };
+  const paneThunk = (): (() => JSX.Element) | null => ctxPaneThunk();
+  const hasPane = () => paneThunk() != null;
+  const paneLabel = () => ctxPaneLabel();
 
   const cycleTheme = () => {
     const el = document.documentElement;
@@ -71,6 +153,21 @@ export function AppShell(props: AppShellProps) {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setPaletteOpen(true);
+        return;
+      }
+      // `x` toggles the context-pane drawer (NOTES §4) — only when narrow + a pane exists, and never
+      // while typing into a field or with a modifier held.
+      if (
+        e.key.toLowerCase() === "x" &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        hasPane() &&
+        !paneWide() &&
+        !isTypingTarget(e.target)
+      ) {
+        e.preventDefault();
+        setPaneDrawerOpen((v) => !v);
       }
     };
     document.addEventListener("keydown", onKey);
@@ -118,7 +215,9 @@ export function AppShell(props: AppShellProps) {
         style={{
           display: "grid",
           "grid-template-columns": "auto 1fr",
-          "grid-template-rows": "auto 1fr",
+          "grid-template-rows": "auto minmax(0, 1fr)",
+          // R3.3 §1b — the shell owns the viewport height (was 100vh; dvh survives mobile URL bars).
+          height: "100dvh",
           "min-height": "0",
         }}
       >
@@ -165,6 +264,32 @@ export function AppShell(props: AppShellProps) {
           <div style={{ flex: "1" }} />
 
           <ResidencyCue region={props.viewer.region} tenant={props.viewer.tenant} />
+
+          {/* MOB-2 — the "Context" drawer trigger. Only rendered when a surface supplies a pane AND
+              the viewport is narrow (≤ 1280px); at wider widths the pane is the 4th column. */}
+          <Show when={hasPane() && !paneWide()}>
+            <button
+              type="button"
+              class="context-trigger"
+              onClick={() => setPaneDrawerOpen(true)}
+              aria-haspopup="dialog"
+              aria-keyshortcuts="x"
+              style={{
+                display: "inline-flex",
+                "align-items": "center",
+                gap: "var(--space-1)",
+                padding: "var(--space-2)",
+                border: "var(--hairline) solid var(--border)",
+                "border-radius": "var(--radius-1)",
+                background: "var(--surface-raised)",
+                color: "var(--text-primary)",
+                cursor: "pointer",
+              }}
+            >
+              <Icon name="link" />
+              <span>{paneLabel()}</span>
+            </button>
+          </Show>
 
           {/* Inbox affordance — glyph + visible unread count (never color-only; WCAG 1.4.1). */}
           <button
@@ -264,12 +389,15 @@ export function AppShell(props: AppShellProps) {
           </For>
         </nav>
 
-        {/* Secondary-nav slot + the fluid main slot (the min-height:0 scroll container). */}
+        {/* Secondary-nav slot · the fluid main slot · the shell-owned context-pane column (R3.3 §1b).
+            The pane column is present only when a surface supplies `contextPane` AND the viewport is
+            wide (> 1280px) — otherwise it DROPS (content never renders beside an empty gutter) and the
+            pane moves to the header-triggered drawer below. */}
         <div
           style={{
             "grid-row": "2",
             display: "grid",
-            "grid-template-columns": props.secondaryNav ? "14rem 1fr" : "1fr",
+            "grid-template-columns": paneColumns(Boolean(props.secondaryNav), hasPane() && paneWide()),
             "min-height": "0",
             "min-width": "0",
           }}
@@ -291,10 +419,44 @@ export function AppShell(props: AppShellProps) {
             tabindex="-1"
             style={{ "min-height": "0", "min-width": "0", overflow: "auto", padding: "var(--space-5)" }}
           >
-            {props.children}
+            <ContextPaneContext.Provider value={paneApi}>
+              {props.children}
+            </ContextPaneContext.Provider>
           </main>
+          {/* The context pane — a `complementary` landmark that owns its own scroller (§1b). Rendered
+              inline only when wide; when narrow it lives in the drawer (below), never in both places. */}
+          <Show when={hasPane() && paneWide()}>
+            <aside
+              aria-label={paneLabel()}
+              data-testid="context-pane"
+              style={{
+                "border-inline-start": "var(--hairline) solid var(--border)",
+                padding: "var(--space-4)",
+                overflow: "auto",
+                "min-height": "0",
+                "overscroll-behavior": "contain",
+                background: "var(--surface-raised)",
+              }}
+            >
+              {paneThunk()?.()}
+            </aside>
+          </Show>
         </div>
       </div>
+
+      {/* MOB-2 — the narrow-viewport context drawer (portal + scrim + focus-trap + Esc via Dialog). */}
+      <Show when={hasPane() && !paneWide()}>
+        <Dialog
+          open={paneDrawerOpen()}
+          onClose={() => setPaneDrawerOpen(false)}
+          title={paneLabel()}
+          size="sm"
+        >
+          <div data-testid="context-pane-drawer" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-4)" }}>
+            {paneThunk()?.()}
+          </div>
+        </Dialog>
+      </Show>
 
       <CommandPalette open={paletteOpen()} onClose={() => setPaletteOpen(false)} commands={commands()} />
 

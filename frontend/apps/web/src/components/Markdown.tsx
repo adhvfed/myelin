@@ -174,6 +174,10 @@ function parseInline(text: string): (string | JSX.Element)[] {
 
 function safeHref(url: string): string | undefined {
   const u = url.trim();
+  // A protocol-relative URL (`//evil.com`) is an OFF-SITE link disguised as relative — an
+  // open-redirect/phishing vector in a rendered README (R3.4 verifier finding 2). Exclude it from
+  // the "relative" branch; a same-origin path is a single leading slash NOT followed by another.
+  if (u.startsWith("//")) return undefined;
   if (/^https?:\/\//i.test(u) || u.startsWith("/") || u.startsWith("#") || u.startsWith("./") || u.startsWith("../")) {
     return u;
   }

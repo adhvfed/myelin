@@ -2,8 +2,8 @@
 // `"use server"` directive keeps the gateway + token strictly server-side. On `Unauthorized` (a 401
 // that survived the single refresh + retry) the query throws a `/login` redirect — the canon's
 // 401→/login behaviour, applied centrally.
-import { query, redirect } from "@solidjs/router";
-import { edgeGet, GatewayError, Unauthorized } from "../server/gateway";
+import { action, query, redirect } from "@solidjs/router";
+import { edgeGet, edgePost, GatewayError, Unauthorized } from "../server/gateway";
 
 /** A brief commit projection for the latest-commit bar / per-entry activity (R3.4). */
 export interface CommitBriefVM {
@@ -135,15 +135,82 @@ export interface CommitDiffVM {
   files: DiffFileVM[];
 }
 
-/** The durable PR record (DurableGitBackend::pr_json). */
+/** The durable PR record (DurableGitBackend::pr_json). R3.3 adds the overview header fields:
+ *  `title`/`body_md` (the description via the ONE BlockEditor read path), `created_at` (the "opened …"
+ *  date, Intl-formatted client-side; null on a legacy record), `commits_count` (the tab badge; null
+ *  when the walk couldn't read; `commits_count_capped` = the count is `500+`). */
 export interface PrVM {
   number: number;
   pr_state: "draft" | "open" | "merged" | "closed";
+  title: string | null;
+  body_md: string | null;
   base_ref: string;
   head_ref: string;
   head_oid: string;
   author: string;
+  author_is_agent?: boolean;
   reviews: number;
+  created_at: number | null;
+  updated_at?: number | null;
+  commits_count?: number | null;
+  commits_count_capped?: boolean;
+  durable: boolean;
+}
+
+/** The identity/agent badge atom (PrincipalVM). `display` arrives pre-collapsed ("[erased user]" /
+ *  "Restricted"); `on_behalf_of`/`trigger` are the agent attribution channels. */
+export interface PrincipalVM {
+  kind: "human" | "agent" | "service";
+  display: string;
+  on_behalf_of: string | null;
+  trigger: string | null;
+}
+
+/** One diff-line content anchor on a thread/comment (null = a PR-level discussion thread). */
+export interface PrAnchorVM {
+  path: string;
+  line: number | null;
+  anchor_state: "live" | "moved" | "outdated";
+}
+
+/** One comment (PrCommentVM). `body_md` is null for a removed comment ("Comment removed", tree kept).
+ *  `pending` is true ONLY in the author's own view of an un-submitted review batch. */
+export interface PrCommentVM {
+  id: string;
+  author: PrincipalVM;
+  body_md: string | null;
+  created_at: number;
+  edited_at: number | null;
+  state: "visible" | "removed";
+  review_id: string | null;
+  pending: boolean;
+}
+
+/** One thread (PrThreadVM). `anchor` null = a PR-level discussion thread (the Overview renders those). */
+export interface PrThreadVM {
+  id: string;
+  anchor: PrAnchorVM | null;
+  resolved: boolean;
+  comments: PrCommentVM[];
+}
+
+/** One review batch (PrReviewVM). `advisory` = an agent review — it NEVER counts toward the gate. */
+export interface PrReviewVM {
+  id: string;
+  reviewer: PrincipalVM;
+  verdict: "in_progress" | "approved" | "changes_requested" | "commented";
+  advisory: boolean;
+  submitted_at: number | null;
+  summary_md: string | null;
+}
+
+/** The GET …/threads envelope (viewer-scoped): discussion (anchor null) vs anchored threads + the
+ *  visible review batches. The overview consumes `discussion` + `reviews`. */
+export interface PrThreadsVM {
+  discussion: PrThreadVM[];
+  anchored: PrThreadVM[];
+  threads: PrThreadVM[];
+  reviews: PrReviewVM[];
   durable: boolean;
 }
 
@@ -156,6 +223,10 @@ export interface PrChecksVM {
   endorsed_contexts: string[];
   fork_unendorsed_contexts: string[];
   gate_admitted: boolean;
+  /** The VERIFIED R2 gate inputs (never fabricated): a live request-changes blocks unconditionally;
+   *  `current_approvals` counts non-author approvals toward `required_approvals`. */
+  changes_requested?: boolean;
+  current_approvals?: number;
   durable: boolean;
 }
 
@@ -399,3 +470,110 @@ export const getPrChecks = query(
   },
   "git-pr-checks",
 );
+
+/** The PR discussion + review batches (GET /v1/git/repos/{repo}/prs/{n}/threads). Viewer-scoped: a
+ *  pending review comment authored by another reviewer never crosses the wire (non-leak). */
+export const getPrThreads = query(
+  async (input: { repo: string; n: number }): Promise<PrThreadsVM> => {
+    "use server";
+    return authed(() =>
+      edgeGet<PrThreadsVM>(`/v1/git/repos/${seg(input.repo)}/prs/${input.n}/threads`),
+    );
+  },
+  "git-pr-threads",
+);
+
+/** The commits IN a PR (GET /v1/git/repos/{repo}/prs/{n}/commits) — reachable from head but not base. */
+export const getPrCommits = query(
+  async (input: { repo: string; n: number; cursor?: string }): Promise<CommitsPage> => {
+    "use server";
+    const q = input.cursor ? `?cursor=${seg(input.cursor)}` : "";
+    return authed(() =>
+      edgeGet<CommitsPage>(`/v1/git/repos/${seg(input.repo)}/prs/${input.n}/commits${q}`),
+    );
+  },
+  "git-pr-commits",
+);
+
+// ── PR write paths (R3.3 G-8): threads, comments, review batches, merge. Server-only functions;
+//    the overview route calls them then revalidates the thread/checks queries. A 409 merge surfaces
+//    the fresh re-rendered checks so the UI re-renders the blocked card (N6), never merges on stale. ──
+
+/** The typed 409-blocked result of a merge attempt — carries the FRESH checks projection (N6). */
+export interface MergeBlocked {
+  blocked: true;
+  checks: PrChecksVM | null;
+}
+export interface MergeOk {
+  blocked: false;
+  base_ref: string;
+  new_oid: string;
+}
+export type MergeResult = MergeOk | MergeBlocked;
+
+/** The PR write ops (R3.3 G-8). ALL mutations route through ONE dispatching `action` — multiple
+ *  sibling `action(...)`s in this module collided onto one server-fn under the vinxi bundler (each
+ *  resolved to the first and returned null), so a single server function keyed by `op` is the robust
+ *  shape. The server-RPC (`action`) is the proven path with request/session context (a bare
+ *  `"use server"` function did not bind reliably here). */
+export type PrMutation =
+  | { op: "thread"; repo: string; n: number; body_md: string }
+  | { op: "comment"; repo: string; n: number; threadId: string; body_md: string }
+  | { op: "review-start"; repo: string; n: number }
+  | { op: "review-comment"; repo: string; n: number; reviewId: string; body_md: string }
+  | { op: "review-submit"; repo: string; n: number; reviewId: string; verdict: "approved" | "changes_requested" | "commented"; summary_md?: string }
+  | { op: "review-discard"; repo: string; n: number; reviewId: string }
+  | { op: "merge"; repo: string; n: number };
+
+/** The union of every mutation's result (the caller narrows by `op`). */
+export type PrMutationResult =
+  | { thread: PrThreadVM }
+  | { comment: PrCommentVM }
+  | { review: PrReviewVM }
+  | { ok: true }
+  | MergeResult;
+
+export const prMutate = action(async (m: PrMutation): Promise<PrMutationResult> => {
+  "use server";
+  const base = `/v1/git/repos/${seg(m.repo)}/prs/${m.n}`;
+  return authed(async () => {
+    switch (m.op) {
+      case "thread": {
+        const r = await edgePost<{ applied: { thread: PrThreadVM } }>(`${base}/threads`, { body_md: m.body_md });
+        return { thread: r.applied.thread };
+      }
+      case "comment": {
+        const r = await edgePost<{ applied: { comment: PrCommentVM } }>(`${base}/threads/${seg(m.threadId)}/comments`, { body_md: m.body_md });
+        return { comment: r.applied.comment };
+      }
+      case "review-start": {
+        const r = await edgePost<{ applied: { review: PrReviewVM } }>(`${base}/reviews/start`, {});
+        return { review: r.applied.review };
+      }
+      case "review-comment": {
+        const r = await edgePost<{ applied: { comment: PrCommentVM } }>(`${base}/reviews/${seg(m.reviewId)}/comments`, { body_md: m.body_md });
+        return { comment: r.applied.comment };
+      }
+      case "review-submit": {
+        await edgePost(`${base}/reviews/${seg(m.reviewId)}/submit`, { verdict: m.verdict, summary_md: m.summary_md });
+        return { ok: true };
+      }
+      case "review-discard": {
+        await edgePost(`${base}/reviews/${seg(m.reviewId)}/discard`, {});
+        return { ok: true };
+      }
+      case "merge": {
+        try {
+          const r = await edgePost<{ applied: { base_ref: string; new_oid: string } }>(`${base}/merge`, {});
+          return { blocked: false, base_ref: r.applied.base_ref, new_oid: r.applied.new_oid };
+        } catch (e) {
+          if (e instanceof GatewayError && e.status === 409) {
+            const checks = (e.body as { checks?: PrChecksVM } | undefined)?.checks ?? null;
+            return { blocked: true, checks };
+          }
+          throw e;
+        }
+      }
+    }
+  });
+}, "git-pr-mutate");

@@ -22,6 +22,9 @@ import {
   commitDiffJson,
   prJson,
   prChecksJson,
+  prThreadsJson,
+  prCommitsEnvelope,
+  devPost,
   repoPrsEnvelope,
   myPrsEnvelope,
   refsJson,
@@ -64,6 +67,29 @@ const server = createServer((req, res) => {
   // Every data route requires a valid Bearer (the auth floor). A missing/forged token → uniform 401.
   const authed = bearer(req) === DEV_ACCESS_TOKEN;
 
+  // R3.3 — PR write paths (threads / reviews / merge). Stateful in-memory; the e2e drives these.
+  let pm;
+  if (
+    method === "POST" &&
+    (pm = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/(.+)$/))
+  ) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => {
+      let body = {};
+      try {
+        body = raw ? JSON.parse(raw) : {};
+      } catch {
+        body = {};
+      }
+      const out = devPost(decodeURIComponent(pm[1]), Number(pm[2]), pm[3], body);
+      if (out.status === 404) return send(res, 404, notFoundEnvelope("pull request"));
+      return send(res, out.status, out.json ?? null);
+    });
+    return;
+  }
+
   if (method === "GET" && path === "/v1/whoami") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
     return send(res, 200, whoamiJson());
@@ -92,6 +118,16 @@ const server = createServer((req, res) => {
     // Order: more-specific (/prs/{n}/checks) before /prs/{n} before the /prs collection.
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/checks$/))) {
       const v = prChecksJson(seg(m[1]), Number(m[2]));
+      return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("pull request"));
+    }
+    // R3.3 — the PR discussion + review batches.
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/threads$/))) {
+      const v = prThreadsJson(seg(m[1]), Number(m[2]));
+      return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("pull request"));
+    }
+    // R3.3 — the commits IN a PR.
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/commits$/))) {
+      const v = prCommitsEnvelope(seg(m[1]), Number(m[2]), limit);
       return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("pull request"));
     }
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)$/))) {

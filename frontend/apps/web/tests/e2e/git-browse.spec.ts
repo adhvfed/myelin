@@ -83,8 +83,9 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await devLogin(page);
     await page.goto("/git/repos/myelin/prs/1");
 
-    await expect(page.getByRole("heading", { name: /Pull request #1/ })).toBeVisible();
-    await expect(page.getByTestId("pr-state")).toContainText("open");
+    // R3.3: the header is title-led (the fixture title) + the #number + the StatusPill (TEXT state).
+    await expect(page.getByRole("heading", { level: 1, name: /#1/ })).toBeVisible();
+    await expect(page.getByTitle("State: Open").first()).toBeVisible();
     // The checks panel (required contexts) + the fork-trust X-1 badge.
     await expect(page.getByTestId("pr-checks").getByText("ci/build", { exact: true })).toBeVisible();
     await expect(page.getByTestId("pr-checks").getByText("ci/test", { exact: true })).toBeVisible();
@@ -106,10 +107,11 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await expectNoAxeViolations(page, "PR overview (ready)");
   });
 
-  test("a missing PR renders the dignified not-available state (not a crash)", async ({ page }) => {
+  test("a missing PR renders the dignified not-found state (not a crash)", async ({ page }) => {
     await devLogin(page);
     await page.goto("/git/repos/myelin/prs/999");
-    await expect(page.getByTestId("pr-restricted")).toContainText("not available");
+    // R3.3: the route-level error trio (anti-oracle — a 404 PR is indistinguishable from no-access).
+    await expect(page.getByTestId("repo-error")).toBeVisible();
     await expectNoAxeViolations(page, "PR not-available");
   });
 

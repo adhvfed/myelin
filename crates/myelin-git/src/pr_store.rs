@@ -156,6 +156,11 @@ pub struct PrRecord {
     /// (the row omits the timestamp rather than fabricating one).
     #[serde(default)]
     pub updated_at: Option<i64>,
+    /// **When the PR was opened (unix seconds) — the overview header's "opened DD.MM.YYYY" (R3.3 N1).**
+    /// Set once at open through the edge; `None` for a legacy record (the header omits the date rather
+    /// than fabricating one). Additive `#[serde(default)]` — the JSON-store schema-evolution path.
+    #[serde(default)]
+    pub created_at: Option<i64>,
     /// The lifecycle state.
     pub state: PrState,
     /// The base ref the PR targets (the ref a merge advances; the policy keys on it).
@@ -191,6 +196,7 @@ impl PrRecord {
             body_md: None,
             author_is_agent: false,
             updated_at: None,
+            created_at: None,
             state: pr.state,
             base_ref: pr.base_ref.clone(),
             head_ref: pr.head_ref.clone(),
