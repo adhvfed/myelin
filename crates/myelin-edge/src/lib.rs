@@ -93,7 +93,8 @@ pub use catalogue::{
 };
 pub use error::{map_authz_error, EdgeError};
 pub use gateway::{
-    sse_scope_for_resource, sse_scope_for_tenant, Gateway, GatewayBuilder, WhoamiHandler,
+    sse_scope_for_resource, sse_scope_for_tenant, AuthProvider, AuthPublicConfig, Gateway,
+    GatewayBuilder, WhoamiHandler,
 };
 pub use git_durable::{register_git_durable, DurableGitBackend};
 pub use git_edge::{register_git, GitEdgeState};

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { devLoginAllowed } from "./dev-login-guard";
+import { devLoginAllowed, devSeamAllowed } from "./dev-login-guard";
 
 describe("dev-login guard (R0.6 — fe-web #1 auth-bypass fix)", () => {
   it("permits dev-login ONLY when non-production AND explicitly opted in", () => {
@@ -23,5 +23,26 @@ describe("dev-login guard (R0.6 — fe-web #1 auth-bypass fix)", () => {
   it("fail-closed on an empty / unknown environment", () => {
     expect(devLoginAllowed({})).toBe(false);
     expect(devLoginAllowed({ NODE_ENV: "staging" })).toBe(false);
+  });
+});
+
+describe("dev-seam RENDER gate (R3.5 / OQ-6 — the login page's dev-seam visibility)", () => {
+  const devEnv = { NODE_ENV: "development", MYELIN_DEV_LOGIN: "1" };
+
+  it("renders the dev seam ONLY when non-prod build AND frontend opt-in AND edge flag all hold", () => {
+    expect(devSeamAllowed(true, devEnv, false)).toBe(true);
+  });
+
+  it("a production BUILD hides the seam even if the edge flag + frontend opt-in are set (kill switch)", () => {
+    expect(devSeamAllowed(true, devEnv, true)).toBe(false);
+  });
+
+  it("the edge flag OFF hides the seam (server truth is one required gate)", () => {
+    expect(devSeamAllowed(false, devEnv, false)).toBe(false);
+  });
+
+  it("the frontend opt-in missing hides the seam regardless of the edge flag", () => {
+    expect(devSeamAllowed(true, { NODE_ENV: "development" }, false)).toBe(false);
+    expect(devSeamAllowed(true, {}, false)).toBe(false);
   });
 });
