@@ -90,16 +90,33 @@ async fn main() {
         eprintln!("ci-controlplane: cannot apply the durable migration aggregate (identity/pseudonym/placement/kms/cost/erasure): {e}");
         std::process::exit(1);
     }
+    // CT-004m — apply the SHARED CI durable writer subset (`ci_run` + `check_attempt` + `ci_cost_event`)
+    // at boot, BEFORE the cost store is constructed and independent of `serve(AppSpec)` order. This is
+    // the SAME forward-only set (same ids/DDL) `serve` applies as part of the full 14-table
+    // `ci_controlplane_migrations`, so the overlap no-ops (idempotent, advisory-locked). ci-dispatch
+    // applies the identical set at its boot, so the writer tables exist regardless of which CI service
+    // boots first (breaking the former boot-order coupling). FAIL LOUD.
+    if let Err(e) = provider
+        .migrate(
+            &myelin_ci_controlplane::ci_durable_migrations(),
+            &myelin_ci_controlplane::ci_durable_hot_tables(),
+        )
+        .await
+    {
+        eprintln!("ci-controlplane: cannot apply the shared CI durable migrations (ci_run/check_attempt/ci_cost_event): {e}");
+        std::process::exit(1);
+    }
     // The DURABLE outbox (SI-007): committed events live in Postgres, not a per-process mutex.
     let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
         provider.db_pool().clone(),
         tokio::runtime::Handle::current(),
     )));
-    // CT-004a: construct the REAL durable CI `cost_event` projection store from the provider pool —
+    // CT-004a: construct the REAL durable CI `ci_cost_event` projection store from the provider pool —
     // proving the metering path is a production-callable store (not model-only). DORMANT at the shell
     // (no consumer drives it yet); CT-004d attaches it to the `SCHEDULE_AND_RUN_JOB` dispatch settle
-    // bookend (and must first reconcile the `cost_event` table-name collision documented on
-    // `ci_cost_event_store`). Building it only wraps the pool — no query runs at boot.
+    // bookend. CT-004m resolved the former `cost_event` table-name collision (CI's table is now
+    // `ci_cost_event`, created by the shared `ci_durable_migrations` applied above). Building it only
+    // wraps the pool — no query runs at boot.
     let _ci_cost_events =
         myelin_ci_controlplane::ci_cost_event_store(provider.db_pool().clone());
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the

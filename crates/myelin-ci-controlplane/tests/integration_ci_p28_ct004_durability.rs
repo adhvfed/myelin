@@ -28,7 +28,7 @@
 
 use myelin_ci_controlplane::{
     BUMP_CHECK_ATTEMPT_SQL, CLAIM_QUERY, CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_JOB_DDL,
-    CREATE_CI_RUN_DDL, CREATE_COST_EVENT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_LOG_ANCHOR_DDL,
+    CREATE_CI_COST_EVENT_DDL, CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL, CREATE_LOG_ANCHOR_DDL,
     INSERT_COST_EVENT_QUERY, REAP_QUERY, SELECT_COST_EVENTS_FOR_RUN_QUERY, UPSERT_LOG_ANCHOR_QUERY,
 };
 use sqlx::types::Uuid;
@@ -262,7 +262,7 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
     let suffix = std::process::id();
     let run_tbl = format!("ci_run_ct004_{suffix}");
     let job_tbl = format!("ci_job_ct004_{suffix}");
-    let ce_tbl = format!("cost_event_ct004_{suffix}");
+    let ce_tbl = format!("ci_cost_event_ct004_{suffix}");
 
     let p1 = reopen().await;
     for t in [&ce_tbl, &job_tbl, &run_tbl] {
@@ -280,12 +280,15 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
     .execute(&p1)
     .await
     .expect("apply ci_job DDL (FK retargeted to the suffixed ci_run)");
-    sqlx::query(&CREATE_COST_EVENT_DDL.replace("EXISTS cost_event (", &format!("EXISTS {ce_tbl} (")))
-        .execute(&p1)
-        .await
-        .expect("apply cost_event DDL");
+    sqlx::query(
+        &CREATE_CI_COST_EVENT_DDL.replace("EXISTS ci_cost_event (", &format!("EXISTS {ce_tbl} (")),
+    )
+    .execute(&p1)
+    .await
+    .expect("apply ci_cost_event DDL");
 
-    let insert_cost = INSERT_COST_EVENT_QUERY.replace("INTO cost_event", &format!("INTO {ce_tbl}"));
+    let insert_cost =
+        INSERT_COST_EVENT_QUERY.replace("INTO ci_cost_event", &format!("INTO {ce_tbl}"));
 
     // Insert a run + its job, transition the run terminal, AND record its metered cost — all in ONE tx
     // (the run-state/metering co-commit: a crash here must not half-bill nor leave a ghost run).
@@ -397,7 +400,8 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
     );
 
     // The cost is durable + ATTRIBUTED to its (run_id, job_id), with wholesale ≠ markup (two columns).
-    let select = SELECT_COST_EVENTS_FOR_RUN_QUERY.replace("FROM cost_event", &format!("FROM {ce_tbl}"));
+    let select =
+        SELECT_COST_EVENTS_FOR_RUN_QUERY.replace("FROM ci_cost_event", &format!("FROM {ce_tbl}"));
     let costs = sqlx::query(&select)
         .bind("acme")
         .bind(uid("run-ok"))

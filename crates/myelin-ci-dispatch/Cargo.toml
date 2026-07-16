@@ -34,6 +34,15 @@ path = "src/lib.rs"
 # Dispatch is an AppSpec, not a hand-rolled main.
 myelin-substrate = { path = "../myelin-substrate" }
 
+# CT-004m: the SHARED CI durable-migration seam. ci-dispatch's reserve/start co-commit writes `ci_run`,
+# a table OWNED by myelin-ci-controlplane (its `CREATE_CI_RUN_DDL`). The dispatch main applies
+# `ci_durable_migrations()` (the `ci_run`/`check_attempt`/`ci_cost_event` writer subset) at boot so the
+# table is present regardless of which CI service boots first (the shared-`myelin`-DB reality — one PG
+# for every service). This is a PRODUCTION edge now (was dev-only): dispatch → controlplane is acyclic
+# (controlplane is a terminal leaf consumer; nothing in the modelled DAG depends back on dispatch, so
+# `substrate_is_root()` is preserved). The migration set is the ONE source of the `ci_run` DDL — no drift.
+myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
+
 # ------------------------------------------------------------------------------------------
 # CI-P10 (P-353, M4): the dispatch BEHAVIOUR's reused engines + frozen types. Trigger & Dispatch
 # is the graph's TERMINAL consumer (a subsystem crate OUTSIDE the modelled production DAG —
@@ -118,13 +127,10 @@ myelin-events = { path = "../myelin-events", features = ["test-support"] }
 # (`cargo tree -e no-dev` shows no test-support edge) — the SAME idiom as the other subsystem crates'
 # storage test-support dev-deps (git/search/issues/knowledge/chat).
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
-# CT-004b: the live-PG trigger-consumer durability test (`integration_ci_ct004b_trigger_consumer`)
-# stands up the `ci_run` table in an isolated schema to PROVE the atomic reserve co-commit on real
-# Postgres — the `ci_run` table is OWNED by myelin-ci-controlplane (its `CREATE_CI_RUN_DDL`), NOT by
-# ci-dispatch. This is a DEV-dependency (test-only; no production DAG edge — `cargo tree -e no-dev`
-# shows none) so the test uses the REAL frozen DDL constant (no drift), the SAME posture the CT-004a
-# / p28 durability drills use from inside the controlplane crate.
-myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
+# CT-004m: myelin-ci-controlplane is now a PRODUCTION dependency (see `[dependencies]` above) — the
+# dispatch main applies its `ci_durable_migrations()` at boot. The CT-004b live-PG trigger-consumer
+# durability test uses the SAME crate's real migration set (no drift). No separate dev-dependency
+# entry is needed (the production edge covers the test).
 
 [features]
 default = []

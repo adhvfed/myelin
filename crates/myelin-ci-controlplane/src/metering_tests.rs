@@ -456,8 +456,8 @@ fn a_red_parity_signal_is_not_green() {
 fn insert_cost_event_query_matches_the_cost_event_row_model() {
     let q = INSERT_COST_EVENT_QUERY;
     assert!(
-        q.contains("INSERT INTO cost_event"),
-        "writes the cost_event table"
+        q.contains("INSERT INTO ci_cost_event"),
+        "writes the ci_cost_event table (CT-004m: CI-namespaced, distinct from Storage's cost_event)"
     );
     // Every CostEventRow field has its column (run/job attribution + the two distinct cost columns).
     for col in [

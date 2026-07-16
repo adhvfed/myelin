@@ -90,7 +90,15 @@ pub const CACHE_ENTRY_TABLE: &str = "cache_entry";
 pub const ENVIRONMENT_TABLE: &str = "environment";
 pub const DEPLOYMENT_TABLE: &str = "deployment";
 pub const SECRET_BINDING_TABLE: &str = "secret_binding";
-pub const COST_EVENT_TABLE: &str = "cost_event";
+/// CI's metering-projection table. **CT-004m rename:** NAMED `ci_cost_event` (not `cost_event`) so it
+/// does NOT collide with Storage's money-ledger `cost_event` (myelin-storage migration `0050`,
+/// `reserve_settle_durable::COST_LEDGER_MIGRATION`) in the ONE shared `myelin` database every service
+/// migrates against. The two tables are DISTINCT: Storage's `cost_event` is the reserve-keyed money
+/// log (`run_id text, ord, unit, wholesale, markup`); CI's `ci_cost_event` is the run/job-attributed
+/// metering PROJECTION (`cost_id, run_id uuid, job_id, meter, amount, wholesale_minor_units,
+/// markup_minor_units, kind`). Before the rename `CREATE TABLE IF NOT EXISTS cost_event` would no-op
+/// against whichever applied first, silently leaving the other's INSERT to fail on missing columns.
+pub const CI_COST_EVENT_TABLE: &str = "ci_cost_event";
 
 /// The scheduler index names (arch 01 §3.3 — the hot-path claim surface). The behaviour (the
 /// `FOR UPDATE SKIP LOCKED` claim) is CI-P12; the SHAPES land here so the claim has its indexes.
@@ -346,10 +354,13 @@ CREATE TABLE IF NOT EXISTS secret_binding (
   PRIMARY KEY (tenant_id, project_id, name, scope)
 )";
 
-/// `cost_event` (arch 01 §3.7 — D8) — one row per metered unit; wholesale & markup separate columns,
-/// integer quantities (NEVER a float). HOT (per-metered-unit). The reserve/settle metering is CI-P17.
-pub const CREATE_COST_EVENT_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS cost_event (
+/// `ci_cost_event` (arch 01 §3.7 — D8) — one row per metered unit; wholesale & markup separate
+/// columns, integer quantities (NEVER a float). HOT (per-metered-unit). The reserve/settle metering is
+/// CI-P17. **CT-004m:** the physical table is `ci_cost_event` (see [`CI_COST_EVENT_TABLE`]) — a
+/// CI-namespaced name distinct from Storage's money-ledger `cost_event` (migration `0050`) in the
+/// shared `myelin` DB.
+pub const CREATE_CI_COST_EVENT_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS ci_cost_event (
   tenant_id             text NOT NULL,
   region                text NOT NULL,
   cost_id               uuid NOT NULL,
@@ -440,11 +451,40 @@ fn create_statements() -> Vec<(&'static str, &'static str, String)> {
             CREATE_SECRET_BINDING_DDL.to_string(),
         ),
         (
-            "ci_0014_cost_event",
-            COST_EVENT_TABLE,
-            CREATE_COST_EVENT_DDL.to_string(),
+            "ci_0014_ci_cost_event",
+            CI_COST_EVENT_TABLE,
+            CREATE_CI_COST_EVENT_DDL.to_string(),
         ),
     ]
+}
+
+/// The stable migration ids of the WRITER-CRITICAL CI durable tables both CI service mains must have
+/// present regardless of boot order (CT-004m): `ci_run` (ci-dispatch's reserve/start co-commit + the
+/// control-plane run state), `check_attempt` (the control-plane monotonic counter), and
+/// `ci_cost_event` (the control-plane metering projection [`crate::cost_store::CiCostEventStore`]
+/// writes). These are the tables the CT-004a + CT-004b production stores touch. The ids are a SUBSET
+/// of [`create_statements`] — the SAME ids + the SAME DDL the full [`ci_controlplane_migrations`] set
+/// carries, so applying both is idempotent (the shared ids no-op on the second apply).
+pub const CI_DURABLE_WRITER_IDS: &[&str] =
+    &["ci_0001_ci_run", "ci_0003_check_attempt", "ci_0014_ci_cost_event"];
+
+/// Assemble ONE forward-only [`Migration`] from a `(id, table, create-DDL)` triple: the CREATE (plus
+/// any indexes already appended to `create`) followed by the platform RLS scoping call. Single source
+/// of the per-table migration shape — both [`ci_controlplane_migrations`] and [`ci_durable_migrations`]
+/// build through it, so a table's DDL + id is authored EXACTLY ONCE (no divergence between the full
+/// control-plane set and the shared writer subset).
+fn assemble_ci_migration(id: &'static str, table: &'static str, create: String) -> Migration {
+    let mut ddl = create;
+    if !ddl.trim_end().ends_with(';') {
+        ddl.push(';');
+    }
+    ddl.push('\n');
+    ddl.push_str(&make_tenant_scoped_ddl(table));
+    ddl.push(';');
+    // The substrate `Migration` holds `&'static str`; the set is built once at boot/serve, so this is
+    // a one-time, bounded leak — the same shape the framework + refs-service expect.
+    let ddl: &'static str = Box::leak(ddl.into_boxed_str());
+    Migration::plain_on(id, ddl, table)
 }
 
 /// The RLS scoping DDL for a CI Control-Plane table — the platform-wide `myelin_make_tenant_scoped`
@@ -460,24 +500,46 @@ pub fn make_tenant_scoped_ddl(table: &str) -> String {
 /// CREATE-TABLE DDL + the platform RLS scoping (and, for `job_queue`, the three claim indexes). The
 /// runner applies them forward-only at boot; the `forward-only-migration` lint reads the same DDL.
 pub fn ci_controlplane_migrations() -> Migrations {
-    let mut migrations = Vec::new();
-    for (id, table, create) in create_statements() {
-        // Each migration: the CREATE (+ any indexes) followed by the platform RLS scoping call.
-        let mut ddl = create;
-        if !ddl.trim_end().ends_with(';') {
-            ddl.push(';');
-        }
-        ddl.push('\n');
-        ddl.push_str(&make_tenant_scoped_ddl(table));
-        ddl.push(';');
-        // The substrate `Migration` holds `&'static str`; the set is built once at boot/serve, so
-        // this is a one-time, bounded leak — the same shape the framework + refs-service expect.
-        let ddl: &'static str = Box::leak(ddl.into_boxed_str());
-        // `Migration::plain_on` carries the table so the runner can match it against the hot-table
-        // declaration (the hot tables refuse a blocking ALTER; the CREATE is admitted as Plain).
-        migrations.push(Migration::plain_on(id, ddl, table));
-    }
-    Migrations::of(migrations)
+    // Each migration is assembled through the ONE `assemble_ci_migration` seam (CREATE + any indexes +
+    // the platform RLS scoping). `Migration::plain_on` carries the table so the runner can match it
+    // against the hot-table declaration (the hot tables refuse a blocking ALTER; the CREATE is Plain).
+    Migrations::of(
+        create_statements()
+            .into_iter()
+            .map(|(id, table, create)| assemble_ci_migration(id, table, create))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// **The shared, writer-critical CI durable-migration subset (CT-004m).** The tables the CT-004a
+/// (`ci_cost_event`) + CT-004b (`ci_run`) production stores write, plus `check_attempt` — created
+/// forward-only, `(tenant, region)`-first + RLS-on, from the SAME DDL + ids as the full
+/// [`ci_controlplane_migrations`] set (via [`assemble_ci_migration`], filtered to
+/// [`CI_DURABLE_WRITER_IDS`]).
+///
+/// **Why it exists.** The platform runs ONE shared `myelin` Postgres for every service (docs/
+/// dev-stack.md). ci-controlplane applies the full 14-table CI schema through its `serve(AppSpec)`
+/// migrate; ci-dispatch's `serve(AppSpec)` applies ONLY `consumer_dedup` — so before CT-004m,
+/// ci-dispatch's reserve/start `ci_run` write depended on ci-controlplane having booted first (a
+/// boot-order coupling). BOTH CI service mains now apply THIS set at boot (idempotent, advisory-locked,
+/// forward-only), so the writer tables are present regardless of which service boots first. It shares
+/// migration ids with the full set, so a ci-controlplane boot that applies both no-ops the overlap.
+pub fn ci_durable_migrations() -> Migrations {
+    Migrations::of(
+        create_statements()
+            .into_iter()
+            .filter(|(id, _table, _create)| CI_DURABLE_WRITER_IDS.contains(id))
+            .map(|(id, table, create)| assemble_ci_migration(id, table, create))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The hot-table declaration for the [`ci_durable_migrations`] subset — the write-QPS tables in it
+/// (`ci_cost_event` the per-metered-unit log, `check_attempt` the per-`(commit_oid, context)`
+/// re-dispatch bump). `ci_run` is not hot. Consistent with [`ci_controlplane_hot_tables`] so the
+/// migration runner reads the SAME hot flags whichever set applies these tables.
+pub fn ci_durable_hot_tables() -> HotTables {
+    HotTables::declare([CI_COST_EVENT_TABLE, CHECK_ATTEMPT_TABLE])
 }
 
 /// **The CI Control-Plane hot-table declaration** (contract 1.5 / C-3; arch 01 §3 "Hot-table flags
@@ -490,7 +552,7 @@ pub fn ci_controlplane_hot_tables() -> HotTables {
     HotTables::declare([
         JOB_QUEUE_TABLE,
         LOG_SEGMENT_TABLE,
-        COST_EVENT_TABLE,
+        CI_COST_EVENT_TABLE,
         CHECK_ATTEMPT_TABLE,
     ])
 }
@@ -522,7 +584,7 @@ mod tests {
                 ENVIRONMENT_TABLE,
                 DEPLOYMENT_TABLE,
                 SECRET_BINDING_TABLE,
-                COST_EVENT_TABLE,
+                CI_COST_EVENT_TABLE,
             ],
             "all 14 control-plane tables, FK-dependency ordered (ci_run before ci_job)"
         );
@@ -629,7 +691,7 @@ mod tests {
     }
 
     /// **The four hot tables are declared (arch 01 §3 "Hot-table flags declared").** `job_queue` /
-    /// `log_segment` / `cost_event` / `check_attempt` — the write-QPS tables that refuse a blocking
+    /// `log_segment` / `ci_cost_event` / `check_attempt` — the write-QPS tables that refuse a blocking
     /// ALTER (the C-3 expand→backfill→contract discipline) at boot.
     #[test]
     fn the_four_hot_tables_are_declared() {
@@ -637,7 +699,7 @@ mod tests {
         for t in [
             JOB_QUEUE_TABLE,
             LOG_SEGMENT_TABLE,
-            COST_EVENT_TABLE,
+            CI_COST_EVENT_TABLE,
             CHECK_ATTEMPT_TABLE,
         ] {
             assert!(hot.is_hot(t), "`{t}` is declared hot (arch 01 §3)");
@@ -718,9 +780,84 @@ mod tests {
             "job_queue.lane is the frozen three-lane CHECK"
         );
         assert!(
-            squash(CREATE_COST_EVENT_DDL)
+            squash(CREATE_CI_COST_EVENT_DDL)
                 .contains("kind text NOT NULL CHECK (kind IN ('ci','agent'))"),
-            "cost_event.kind fronts both ci + agent (UNIFY / X-6)"
+            "ci_cost_event.kind fronts both ci + agent (UNIFY / X-6)"
         );
+    }
+
+    /// **CT-004m — the collision rename is real: CI's metering table is `ci_cost_event`, never
+    /// `cost_event`.** Storage owns the money-ledger `cost_event` (migration `0050`) in the shared
+    /// `myelin` DB; CI's projection must NOT create a differently-shaped table under the same name.
+    #[test]
+    fn ci_cost_event_is_ci_namespaced_not_the_storage_name() {
+        assert_eq!(CI_COST_EVENT_TABLE, "ci_cost_event");
+        assert!(
+            CREATE_CI_COST_EVENT_DDL.contains("CREATE TABLE IF NOT EXISTS ci_cost_event ("),
+            "the CI metering DDL creates `ci_cost_event`, not `cost_event`"
+        );
+        assert!(
+            !CREATE_CI_COST_EVENT_DDL.contains("EXISTS cost_event ("),
+            "the CI metering DDL never creates a bare `cost_event` (Storage's money-ledger name)"
+        );
+    }
+
+    /// **CT-004m — the shared writer subset is byte-identical to the full set (no DDL divergence).**
+    /// `ci_durable_migrations()` (the tables both CI mains apply at boot) carries EXACTLY the
+    /// `ci_run` / `check_attempt` / `ci_cost_event` migrations from the full `ci_controlplane_migrations()`
+    /// — same ids, same assembled DDL — so applying both at one boot is idempotent (shared ids no-op).
+    #[test]
+    fn ci_durable_subset_matches_the_full_set_for_the_writer_tables() {
+        let full = ci_controlplane_migrations();
+        let subset = ci_durable_migrations();
+        let subset_ids: Vec<&str> = subset.0.iter().map(|m| m.id).collect();
+        assert_eq!(
+            subset_ids, CI_DURABLE_WRITER_IDS,
+            "the subset is exactly the writer-critical ids, in create order"
+        );
+        for m in &subset.0 {
+            let full_m = full
+                .0
+                .iter()
+                .find(|f| f.id == m.id)
+                .expect("every subset id is in the full control-plane set");
+            assert_eq!(
+                full_m.ddl, m.ddl,
+                "the subset DDL is byte-identical to the full set's (one source of truth): {}",
+                m.id
+            );
+            assert_eq!(full_m.table, m.table, "same table binding: {}", m.id);
+        }
+        // The two hot tables in the subset agree with the full control-plane hot-table declaration.
+        let hot = ci_durable_hot_tables();
+        assert!(hot.is_hot(CI_COST_EVENT_TABLE) && hot.is_hot(CHECK_ATTEMPT_TABLE));
+        assert!(!hot.is_hot(CI_RUN_TABLE), "ci_run is not hot");
+    }
+
+    /// **CT-004m — the shared subset applies forward-only at boot (no DROP), FK-safe.** The runner
+    /// admits `ci_run` / `check_attempt` / `ci_cost_event` (the CREATEs are Plain on empty tables); a
+    /// re-run is idempotent. This is the boot-time half of the both-mains-apply gate.
+    #[test]
+    fn the_ci_durable_subset_applies_forward_only() {
+        use myelin_substrate::MigrationRunner;
+        let subset = ci_durable_migrations();
+        assert_eq!(subset.0.len(), 3, "three writer-critical CI tables");
+        for m in &subset.0 {
+            assert!(
+                !myelin_substrate::is_destructive(m.ddl),
+                "subset migration {} is forward-only",
+                m.id
+            );
+            assert!(
+                m.ddl.contains("myelin_make_tenant_scoped"),
+                "subset migration {} installs the platform RLS policy",
+                m.id
+            );
+        }
+        let mut runner = MigrationRunner::new();
+        runner
+            .run(&subset, &ci_durable_hot_tables())
+            .expect("the CI durable writer subset applies forward-only");
+        assert_eq!(runner.applied().len(), 3);
     }
 }

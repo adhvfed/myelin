@@ -28,8 +28,8 @@
 //!      money-truth. CI does **NOT** re-own it: [`crate::metering::CiMeter::settle_budget`] already
 //!      delegates every wallet movement to [`myelin_flow::BudgetGate`] (which wraps that ledger). The
 //!      money-parity invariant (reserve/settle bookends don't double-bill) is enforced THERE.
-//!   2. **The CI `cost_event` PROJECTION — this store** (CI's own `cost_event` table, migration
-//!      `ci_0014`, [`crate::migrations::CREATE_COST_EVENT_DDL`]): the run/job-attributed,
+//!   2. **The CI `ci_cost_event` PROJECTION — this store** (CI's own `ci_cost_event` table, migration
+//!      `ci_0014`, [`crate::migrations::CREATE_CI_COST_EVENT_DDL`]): the run/job-attributed,
 //!      meter-dimensioned REPORTING projection — `(tenant_id, cost_id)`-keyed rows carrying
 //!      `(run_id, job_id, meter, amount, wholesale, markup, kind)`. This is what a tenant's CI usage
 //!      view / the `ci.check.updated` `cost_settled` flag reads. CI OWNS this table; the controlplane
@@ -64,11 +64,16 @@
 //! ## FLOOR / follow-on NAMED (CT-004d)
 //! This store is a real, constructible PRODUCTION store, but it is **dormant** at the shell: no live
 //! consumer drives it yet. Attaching it to the `SCHEDULE_AND_RUN_JOB` dispatch settle path (so a real
-//! `job.done` co-commits its run-state transition + this projection write) is **CT-004d**. That chunk
-//! must ALSO reconcile the `cost_event` table-name collision recorded in [`crate::ci_cost_event_store`]
-//! (Storage's money-ledger `cost_event`, migration `0050`, and CI's projection `cost_event`,
-//! `ci_0014`, share a name in the single-binary composition) before this store executes against the
-//! live controlplane pool — see that fn's docs.
+//! `job.done` co-commits its run-state transition + this projection write) is **CT-004d**.
+//!
+//! **CT-004m RESOLVED the table-name collision** that CT-004a recorded here: Storage's money-ledger
+//! `cost_event` (migration `0050`) and CI's projection formerly shared the name `cost_event` in the
+//! ONE shared `myelin` DB. CI's table is now `ci_cost_event` ([`crate::migrations::CI_COST_EVENT_TABLE`]),
+//! created by [`crate::ci_durable_migrations`] (applied by BOTH CI mains at boot). So this store's
+//! [`INSERT_COST_EVENT_QUERY`] targets a table that reliably exists with the right shape. CT-004d's
+//! remaining job is to DRIVE a live settle through it via a tenant-scoped tx (the `ci_cost_event`
+//! table is FORCE-RLS, so a production write must set the `(tenant, region)` GUC — the durability
+//! test connects as the migration/owner role to exercise the store shape).
 
 use myelin_flow::MinorUnits;
 use myelin_tenancy::TenantId;
@@ -137,8 +142,9 @@ impl std::error::Error for CiCostStoreError {}
 /// executes the BYTE-IDENTICAL production constants [`INSERT_COST_EVENT_QUERY`] /
 /// [`SELECT_COST_EVENTS_FOR_RUN_QUERY`] against it. Cloneable (the pool is an `Arc`-backed handle).
 /// Named `…Store` + carries a `PgPool` so the `no-in-memory-durable-store` scanner reads it as a
-/// genuine durable store. The caller must have applied the CI control-plane migrations (via the shell's
-/// `serve(AppSpec)` migrate) so the `cost_event` table exists.
+/// genuine durable store. The caller must have applied the CI durable migrations (via the shell's
+/// `serve(AppSpec)` migrate, or [`crate::ci_durable_migrations`] at boot) so the `ci_cost_event`
+/// table exists.
 #[derive(Clone)]
 pub struct CiCostEventStore {
     pool: PgPool,

@@ -17,14 +17,16 @@
 //! logic end-to-end (envelope in → durable ci_run + queued check out). The real cross-service NATS
 //! delivery is the named deploy floor.
 //!
-//! ## The `ci_run` table is owned by myelin-ci-controlplane (named)
-//! `all_durable_migrations()` (what the ci-dispatch `main.rs` applies) does NOT create `ci_run`; the
-//! table is owned by `myelin-ci-controlplane` (`CREATE_CI_RUN_DDL`). This test stands it up in an
-//! ISOLATED per-pid schema (the CT-004a / p28 isolation posture) and drives a `PgReserveStore` that
-//! co-commits the `ci_run` row + the outbox events in ONE tx — proving the atomic bundle is real. The
-//! PRODUCTION durable `ci_run` writer belongs in `myelin-storage` (the `PgOutboxBacking` /
-//! `DurableTupleBacking` backing site); wiring it there + the cross-service migration ownership is the
-//! named follow-on.
+//! ## The `ci_run` table is created by the REAL shared CI migration path (CT-004m)
+//! The `ci_run` table is owned by `myelin-ci-controlplane`. CT-004m gives BOTH CI mains the shared
+//! [`myelin_ci_controlplane::ci_durable_migrations`] set (`ci_run` + `check_attempt` + `ci_cost_event`),
+//! applied at boot — so ci-dispatch no longer depends on ci-controlplane booting first to have `ci_run`.
+//! This test stands the tables up via that SAME real forward-only migration set (each `(tenant, region)`-
+//! first + FORCE-RLS) into an ISOLATED per-pid schema, and drives a `PgReserveStore` that co-commits the
+//! `ci_run` row + the outbox events in ONE tx — proving the atomic bundle against the tables as the real
+//! migration path produces them. The pool connects as the migration/owner role (`myelin_admin`,
+//! BYPASSRLS) so the reserve exercises the table shape under FORCE-RLS. The PRODUCTION durable reserve
+//! writer that wires this into the live dispatch consumer with a tenant-scoped tx is the named follow-on.
 //!
 //! Gated behind the `integration` cargo feature. Run against the docker-compose dev stack:
 //!
@@ -35,7 +37,7 @@
 
 use std::sync::Arc;
 
-use myelin_ci_controlplane::CREATE_CI_RUN_DDL;
+use myelin_ci_controlplane::ci_durable_migrations;
 use myelin_ci_dispatch::{
     plan_dispatch, ArmedRun, CiTriggerHandler, DispatchOutcome, GitConfigReader, GitReadError,
     ReserveError, ReserveStore,
@@ -73,7 +75,10 @@ async fn reopen() -> PgPool {
         .after_connect(move |conn, _meta| {
             let schema = schema.clone();
             Box::pin(async move {
-                conn.execute(format!("SET search_path TO {schema}").as_str())
+                // `public` follows the per-pid schema so the platform RLS helper
+                // `myelin_make_tenant_scoped` (in public, called by the real ci_durable_migrations)
+                // resolves, while unqualified table CREATEs land in the per-pid schema first.
+                conn.execute(format!("SET search_path TO {schema}, public").as_str())
                     .await?;
                 Ok(())
             })
@@ -282,10 +287,14 @@ async fn a_push_arms_a_durable_ci_run_and_queued_checks_idempotently() {
         .execute(&p1)
         .await
         .expect("create the per-pid schema");
-    sqlx::query(CREATE_CI_RUN_DDL)
-        .execute(&p1)
-        .await
-        .expect("apply the (controlplane-owned) ci_run DDL into the isolated schema");
+    // Apply the REAL shared CI durable migration set (ci_run + check_attempt + ci_cost_event, each
+    // FORCE-RLS) — the SAME set both CI mains apply at boot. Multi-statement DDL via the simple-query
+    // protocol lands in the search_path'd per-pid schema.
+    for m in ci_durable_migrations().0.iter() {
+        p1.execute(m.ddl)
+            .await
+            .unwrap_or_else(|e| panic!("apply CI durable migration {} into the schema: {e}", m.id));
+    }
     sqlx::query(CREATE_RESERVE_OUTBOX_DDL)
         .execute(&p1)
         .await

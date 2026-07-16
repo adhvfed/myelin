@@ -385,15 +385,16 @@ pub use fairness::{
 };
 
 pub use migrations::{
-    ci_controlplane_hot_tables, ci_controlplane_migrations, make_tenant_scoped_ddl, ARTIFACT_TABLE,
-    CACHE_ENTRY_TABLE, CHECK_ATTEMPT_TABLE, CI_JOB_TABLE, CI_RUN_TABLE, COST_EVENT_TABLE,
-    CREATE_ARTIFACT_DDL, CREATE_CACHE_ENTRY_DDL, CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_JOB_DDL,
-    CREATE_CI_RUN_DDL, CREATE_COST_EVENT_DDL, CREATE_DEPLOYMENT_DDL, CREATE_ENVIRONMENT_DDL,
-    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
-    CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL, CREATE_RUNNER_DDL, CREATE_SECRET_BINDING_DDL,
-    DEPLOYMENT_TABLE, ENVIRONMENT_TABLE, FAIR_DEFICIT_TABLE, JOB_QUEUE_TABLE, JQ_CLAIMABLE_INDEX,
-    JQ_IDEM_INDEX, JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE, RUNNER_TABLE,
-    SECRET_BINDING_TABLE,
+    ci_controlplane_hot_tables, ci_controlplane_migrations, ci_durable_hot_tables,
+    ci_durable_migrations, make_tenant_scoped_ddl, ARTIFACT_TABLE, CACHE_ENTRY_TABLE,
+    CHECK_ATTEMPT_TABLE, CI_COST_EVENT_TABLE, CI_DURABLE_WRITER_IDS, CI_JOB_TABLE, CI_RUN_TABLE,
+    CREATE_ARTIFACT_DDL, CREATE_CACHE_ENTRY_DDL, CREATE_CHECK_ATTEMPT_DDL,
+    CREATE_CI_COST_EVENT_DDL, CREATE_CI_JOB_DDL, CREATE_CI_RUN_DDL, CREATE_DEPLOYMENT_DDL,
+    CREATE_ENVIRONMENT_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
+    CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL, CREATE_RUNNER_DDL,
+    CREATE_SECRET_BINDING_DDL, DEPLOYMENT_TABLE, ENVIRONMENT_TABLE, FAIR_DEFICIT_TABLE,
+    JOB_QUEUE_TABLE, JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX, JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE,
+    LOG_SEGMENT_TABLE, RUNNER_TABLE, SECRET_BINDING_TABLE,
 };
 
 pub use permanent_gates::{
@@ -507,8 +508,8 @@ pub fn run_controlplane(
     serve(controlplane_app_spec(config, outbox))
 }
 
-/// **Construct the durable CI `cost_event` projection store at the composition root (CT-004a).** The
-/// service `main` builds this from the MR-022 `SubstrateProvider` pool (`provider.db_pool().clone()`)
+/// **Construct the durable CI `ci_cost_event` projection store at the composition root (CT-004a).**
+/// The service `main` builds this from the MR-022 `SubstrateProvider` pool (`provider.db_pool().clone()`)
 /// after the migrations have run, so the metering path has a real, production-callable
 /// [`CiCostEventStore`] — not the prior model-only SQL-constants-plus-in-memory-model. It is a thin,
 /// explicit composition seam (over [`CiCostEventStore::with_pg`]) so the wiring point is named + the
@@ -519,20 +520,18 @@ pub fn run_controlplane(
 /// live settle path is not attached. **CT-004d** attaches it to the `SCHEDULE_AND_RUN_JOB` dispatch
 /// settle bookend (a real `job.done` co-commits its run-state transition + `settle_in_tx` here).
 ///
-/// **⚠ CT-004d BLOCKER — the `cost_event` table-name collision (a discovered, pre-existing latent
-/// defect, recorded here so it is never silently relied upon).** The single-binary `main.rs` applies
-/// `myelin_storage::all_durable_migrations()` (which includes the reserve/settle MONEY ledger's
-/// `cost_event`, migration `0050` — Storage's `(tenant, region, run, ord, unit, wholesale, markup)`
-/// schema) AND, via `serve(AppSpec)`, CI's projection `cost_event` (`ci_0014` —
-/// `(tenant, region, cost_id, run_id, job_id, meter, amount, …, kind)`). Both are
-/// `CREATE TABLE IF NOT EXISTS cost_event`, so on one shared pool the FIRST-applied (Storage's) schema
-/// wins and CI's projection DDL silently no-ops — this store's INSERT would then fail at runtime on the
-/// missing CI columns. This is DORMANT today (nothing executes the CI `cost_event` yet). Per the arch
-/// "each service its own Postgres, no cross-DB", the two tables never coexist in production — the
-/// conflation is a dev single-binary artifact. CT-004d must reconcile it (CI on its own DB, or the CI
-/// main not applying Storage's `0050` cost tables, or a distinct CI projection table name) BEFORE
-/// driving a live settle through this store. CT-004a keeps its scope to the store + its kill-9 proof
-/// (proven against an ISOLATED `cost_event` in the durability test's own schema).
+/// **CT-004m — the `cost_event` table-name collision is RESOLVED.** The platform runs ONE shared
+/// `myelin` Postgres for every service (docs/dev-stack.md — NOT "each service its own DB"). Storage's
+/// money-ledger `cost_event` (migration `0050`; `(tenant, region, run_id text, ord, unit, wholesale,
+/// markup)`) and CI's metering projection formerly BOTH named `cost_event` → `CREATE TABLE IF NOT
+/// EXISTS cost_event` no-op'd whichever applied second, silently. CT-004m RENAMED CI's table to
+/// `ci_cost_event` ([`crate::migrations::CI_COST_EVENT_TABLE`] / [`crate::INSERT_COST_EVENT_QUERY`]),
+/// so the two DISTINCT-shaped tables coexist in the shared DB. The rename was safe in place: CI was
+/// fully dormant (no `ci_*` migration had ever been applied to any real DB). This store now targets
+/// `ci_cost_event`; the tables it needs are created by [`crate::ci_durable_migrations`] (applied by
+/// BOTH CI service mains at boot). **CT-004d** remains the follow-on that DRIVES a live settle through
+/// this store (attaching it to the dispatch settle bookend with a tenant-scoped tx for the FORCE-RLS
+/// `ci_cost_event` table) — the SCHEMA it writes to is now sound.
 pub fn ci_cost_event_store(pool: sqlx::PgPool) -> CiCostEventStore {
     CiCostEventStore::with_pg(pool)
 }
@@ -654,7 +653,7 @@ mod tests {
         for t in [
             JOB_QUEUE_TABLE,
             LOG_SEGMENT_TABLE,
-            COST_EVENT_TABLE,
+            CI_COST_EVENT_TABLE,
             CHECK_ATTEMPT_TABLE,
         ] {
             assert!(spec.hot_tables.is_hot(t), "`{t}` is declared hot");
