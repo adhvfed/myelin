@@ -66,9 +66,12 @@
 //! against the dev-stack Postgres (RLS isolation + the exactly-once PRIMARY KEY) is
 //! `tests/integration_ci_p6_dispatch_schema.rs` behind the `integration` cargo feature.
 
+pub mod config;
 pub mod dispatch;
 pub mod migrations;
 pub mod resolve;
+
+pub use config::{parse_ci_config, CiConfigError, ConfigFormat};
 
 pub use dispatch::{
     classify_trust, compile_trigger, git_trust_of, stamp_trust, trigger_matches, DedupLedger,

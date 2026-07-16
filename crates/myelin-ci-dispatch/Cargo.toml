@@ -73,6 +73,14 @@ myelin-flow = { path = "../myelin-flow" }
 # byte-identical-for-identical-input form the BLAKE3 content address is taken over — the
 # reproducibility floor, VISION §3). The `derive` feature is the workspace default; no DB edge.
 serde = { workspace = true }
+# CT-004b (M4): the AUTHORED `.myelin/ci.*` config-file parser (arch 02 §7.4 — "declarative
+# JSON-schema'd core, authored as YAML/TOML"). TOML is the primary authored surface; `toml` is
+# ALREADY a workspace-pinned dep (myelin-events reads `thresholds.toml` with it) — the lightest
+# maintained TOML lib, no NEW third-party crate enters the graph. JSON is parsed with the
+# serde_json already listed above (free — the JSON-schema'd core). YAML is DEFERRED (no workspace
+# YAML dep; serde_yaml is archived/unmaintained — adding it would violate minimal-deps). Both
+# formats are DB-free, build-time only.
+toml = { workspace = true }
 
 # ------------------------------------------------------------------------------------------
 # REAL live-stack schema apply behind the `integration` feature (CI-P6). The consumer_dedup ledger
