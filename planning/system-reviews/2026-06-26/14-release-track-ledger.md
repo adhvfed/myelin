@@ -453,7 +453,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 | Item | What | Status |
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
-| R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | UNBLOCKED — starting |
+| R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
 | R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | CT-004 grounding scout running |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | AFTER R4.1 |
 | R4.4 | Finding-burndown in Myelin's own tracker (needs minimal issues subsystem; until then findings land in this ledger) | QUEUED |
@@ -511,8 +511,22 @@ a real `git clone` back recovered BOTH commits + the merged Vision section. The 
 R3 exit gate is met on production infra. Remaining: the browser half (Playwright vs the real edge — R3's
 suite already proved it vs the dev-edge contract) and the ergonomics fixes F1/F3/F8/F9 + F5 dogfood.sh wiring.
 
-Burndown: F2 closed (symptom of F5). F4, F5 fixed. F6/F7 = documented workflow (not code). F1/F3/F8/F9 = fix
-batch in progress. This IS the R4.4 finding-burndown loop (recorded here until Myelin's own tracker stands up).
+Burndown: F2 closed (symptom of F5). F4, F5 fixed (`82b8fe6`). F6/F7 = documented workflow (not code). **F1/F3/F8/F9
+FIXED + re-verified end-to-end on the real edge (`0325a22`):** F1 credential-helper `git push` now works (401 carries
+`WWW-Authenticate: Basic realm="Myelin"` on wire routes only; absent on the JSON API — verified live); F3 clone_url is
+the honest HTTP wire path; F8 a PR opened with only head_ref auto-resolves head_oid and merges; F9 a fresh `git clone`
+checks out main with no dangling-HEAD warning. This IS the R4.4 finding-burndown loop (recorded here until Myelin's own
+tracker stands up).
+
+**R4.1 BROWSER HALF PROVEN (2026-07-16):** started the SolidStart app (`MYELIN_EDGE_URL=http://127.0.0.1:8080`)
+against the REAL edge; `/login` rendered the operator-token card from the real `/v1/auth/config`
+(`token_login_enabled:true`, SSO honestly unavailable); POSTing the real bootstrap token to the `loginWithToken`
+server action returned 302 + set the httpOnly `myelin_session` cookie + redirected to `/git/repos`; the authenticated
+repos page rendered the REAL repositories (`dogfood2`, `myelin/myelin`) through the SSR gateway. The one previously
+untested seam (real-edge response shapes → SSR gateway → rendered HTML) is confirmed — no dev-edge/real-edge contract
+drift. **R4.1 is complete: the founder's push/pull/PR flow works on production infra via git CLI, the JSON API, AND
+the browser.** Remaining R4 phases: R4.2 (CT-004 CI reconcile — decomposed above), R4.3 (backup/restore drill on the
+now-real dogfood data), R4.4 (stand up Myelin's own issue tracker to host the burndown that lived here).
 
 **CT-004 grounding (scouted 2026-07-16): RECONCILE + HARDEN, not green-field.** The census line "runs
 no CI work" is true only at the `serve(AppSpec)` layer: scheduler (CI-P12 claim/reap/DRR), pipeline
