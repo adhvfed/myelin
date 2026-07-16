@@ -1,0 +1,55 @@
+# R4.4 finding-burndown — peer adversarial review (2026-07-16)
+
+Source: an independent Fable session (on Adrian's Mac) ran **three adversarial review agents** over the
+R3–R4 commit range `787665e..HEAD` with instructions to falsify commit-message claims. Full report
+(with the "claims that HELD" list — do NOT re-verify those) is at `~/myelin-review-findings-2026-07-16.md`
+on this host. 21 verified findings below, triaged. This IS the R4.4 finding-burndown loop (lives here
+until Myelin's own issue tracker stands up).
+
+**Process note the reviewers flagged (taken):** the gaps cluster where a headline/ledger line says
+DONE/live/exactly-once while the honest caveat lives only in a code comment (findings 6/7/9 are the
+poster children). Fix forward: promote floor-confessions into the commit headline + ledger line itself
+so the ledger alone never overstates. See the ledger correction committed alongside this file.
+
+## Status legend
+DONE · IN-PROGRESS · TODO(pri) · WONTFIX(reason) · POLICY(needs founder call)
+
+| # | Sev | Area | Finding (file:line) | Status |
+|---|-----|------|---------------------|--------|
+| 1 | MED-HIGH sec | git | merge-gate `counting_approvals` (pr_store.rs) not per-reviewer-deduped nor agent-excluded → a lone reviewer or an agent satisfies required_approvals≥2 | **DONE `fe966e8`** (dedup by reviewer + `!is_agent` + regression test) |
+| 7 | HIGH | events | dedup mark commits BEFORE handler effect in a SEPARATE tx (consumer.rs:546) → kill-9 between → redelivery deduped → push arms nothing = AT-MOST-ONCE despite exactly-once claims (MR-023b floor named in dedup.rs:92-100) | **TODO(P1)** — needs same-tx co-commit of dedup mark + handler effect (or the outbox-relay's at-least-once + idempotent effect). Framework-level; own chunk. Affects CT-004b exactly-once claim. |
+| 6 | HIGH claim | ci-dispatch | prod `main.rs:133` `consumers = Vec::new()` — the "live" trigger consumer is NOT registered in prod (CAS BlobStore backing integration-gated); 381a0e4 headline + ledger overstated | **IN-PROGRESS** — honest floor was in the code comment + ledger body; ledger headline corrected (this commit). Actual prod registration needs the default-feature CAS BlobStore/git-read backing (CT-004d.2 deploy floor). |
+| 10 | MED-HIGH (once live) | ci-dispatch | `resolve.rs:297-314` `expand_matrix` materializes the full axis cross-product UNBOUNDED; no cap on config size/jobs/axes/values → a tenant OOMs the dispatch consumer on one push | **TODO(P1)** — cap config bytes/jobs/axes/values in `parse_ci_config`/`resolve_snapshot` before expansion. Fixable now (ci-dispatch). |
+| 2 | MED | git | JSON durable stores do read-modify-write with NO isolation (pr_threads.rs, pr_store.rs `put`, `next_pr_number` git_durable.rs:880) — concurrent writers clobber (lost comment; PR-number collision) | **TODO(P2)** — the PG-home migration (GT-003b) is the real fix; interim: a per-repo write lock or CAS. Doc conflates write-atomic with rmw-isolated. |
+| 9 | MED | ci-dispatch | `integration_ci_ct004b_trigger_consumer.rs:188` derives event ids deterministically so "redelivery adds no dup events" passes — but prod `OutboxReserveStore` mints FRESH ULIDs → prod WOULD duplicate. Test double stronger than prod; no restart leg. | **TODO(P2)** — make the test mirror prod ULID minting (or fix #8 so it's moot) + add a reopen leg. |
+| 8 | MED | ci-dispatch | duplicate run-started/check-updated events under documented dedup fail-open (fresh ULID per emit) — ci_run protected by deterministic run_id, co-emitted events are not | **TODO(P2)** — deterministic event ids for the co-emitted bundle (ties to #7/#9). |
+| 15 | MED | web | PR diff "Load remaining files" never reads `search.cursor` (prs/[n]/diff.tsx:60) → >50-file PRs can't page | **TODO(P2)** — wire the cursor read; add an e2e. |
+| 16 | MED | web | split-view commenting on old-side (deleted) lines silently no-ops (DiffViewer.tsx:490; composer side check diff.tsx:243) | **TODO(P2)** — anchor widget to the clicked side; e2e on a deleted line. |
+| 18 | MED-LOW | web | in-progress review batches orphan on reload (prs/[n]/index.tsx:350) — draft in local signal, never rehydrated from threads().reviews → "Start a review" double-creates | **TODO(P2)** |
+| 3 | LOW-MED | git | `DurablePrStore::list` silently skips unparseable records (pr_store.rs:620) → number REUSE via next_pr_number → live PR overwritten | **TODO(P2)** — fail-loud or reserve numbers durably. |
+| 5 | LOW | edge | absent-repo 404 leaks the on-disk rootfs path (durable.rs:1842) for granted-but-missing repos — layout leak, not existence oracle | **TODO(P3)** — generic NotFound message. |
+| 11 | LOW-MED | storage | stores migrated BETWEEN the colliding cost_event migrations (pre-CT-004m) have no repair path — money ledger to a wrong-shaped table | **TODO(P3)** — boot-time column-shape assertion on cost_event (dev-only ~7h window, accepted risk). |
+| 12 | LOW | ci-dispatch | `CI_TRIGGER_SUBJECTS` contains an EMPTY SubjectPattern (consumer.rs:109) under a "not empty" doc → a router iterating subjects() treats it as match-all | **TODO(P2)** — drop the empty pattern; whitelist test on the patterns not just _STRS. (Low but easy + a real match-all risk.) |
+| 13 | LOW | ci-controlplane | cost_id FNV-1a + ON CONFLICT DO NOTHING, no conflict verification (cost_store.rs:313) → a re-delivered settle with different amounts silently drops a unit | **TODO(P3)** — verify-on-conflict or a stronger key; it keys the billing table. |
+| 17 | LOW-MED latent | web | expand-context is an unwired pipeline (DiffViewer.tsx:51/68/177; getFileLines 0 call sites) | **TODO(P3)** — wire onExpandContext→buildRows or remove until CT wires it. |
+| 19 | LOW-MED | web | uncontrolled composers desync after posts (prs/[n]/index.tsx:442/539/578: onInput, no value bind) → duplicate post | **TODO(P2)** — bind value (the diff-page composer already does). |
+| 4 | LOW | edge | duplicate unreachable `MergeAttempt::RefRefused` match arm (git_durable.rs:3257); myelin-edge CI doesn't deny warnings | **TODO(P3)** — remove the arm; add `-D warnings` for myelin-edge. |
+| 20 | LOW | web | dev-contract.mjs:626 cross-repo `repo:"myelin/myelin"` but real edge emits the bare slug → cross-repo rows 404 vs harness, invisible in e2e | **TODO(P3)** — fixtures-mirror-contract check. |
+| 21a | LOW | web | cross-repo buckets: no pager, count chip shows page size not total (silent truncation) | **TODO(P3)** |
+| 21b | LOW | web | prs/index.tsx:86 renders raw err.message into a hidden DOM text node (no XSS, but against the range's rule) | **TODO(P3)** |
+| 21c | LOW→pre-external | web | login form actions lack origin/CSRF checks (sameSite=lax doesn't stop cross-site POST logging the victim in as attacker) — fine for single-founder dogfood, **fix before external users** | **TODO(P1-before-Tier-B)** |
+| 21d | minor a11y | web | review verdict panel (prs/[n]/index.tsx:458) ad-hoc role="dialog", no focus move/trap/Esc, unlike the DS Dialog | **TODO(P3)** — use the DS Dialog. |
+| 14 | POLICY | flow | R3.7b residuals: crash-after-settle-then-rerun-fails → billed-success/surfaced-failure divergence; failure-bills-zero = deliberate refund leak (always-failing tenant never billed) | **POLICY** — founder call on the billing policy; recorded. Core R3.7b fix HELD under re-attack. |
+
+## Codex peer-review option (from the reviewer)
+GPT 4.6 "Sol" via Codex CLI found real P1s in Fable-written fixes on ovim. NOT installed on this host.
+To use: `npm i -g @openai/codex` + login, OR route through Adrian's wrapper at
+`/Users/adrian/talk-to-codex/codex-session` (`start NAME`, `send NAME "msg"`). Pattern: give scope
+(commit range) + intent + pointed questions; it verifies empirically and blocks on real things.
+**Deferred — needs Adrian to install/enable.**
+
+## Next burndown actions (in loop priority order)
+1. #7 at-most-once dedup window (P1, framework) · #10 matrix/config resource caps (P1, DoS) · #6 finish
+   the prod consumer registration (with CT-004d.2) · #21c CSRF before Tier-B.
+2. P2 cluster: #2 rmw isolation, #12 empty subject, #15/#16/#18/#19 web PR-review UX, #3/#8/#9.
+3. P3 polish + #14 policy call.
