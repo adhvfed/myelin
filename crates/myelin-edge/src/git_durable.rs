@@ -878,9 +878,12 @@ impl DurableGitBackend {
     }
 
     fn next_pr_number(&self, loc: &RepoLoc) -> u64 {
+        // Peer-review finding #3: allocate from the FILENAME-authoritative max (not `list()`, which is a
+        // tolerant view that skips a corrupt record — deriving the next number from it would REUSE a
+        // corrupt highest PR's number and overwrite its file). A corrupt record still counts here.
         self.prs
-            .list(loc)
-            .map(|v| v.iter().map(|r| r.number).max().unwrap_or(0) + 1)
+            .max_pr_number(loc)
+            .map(|m| m.unwrap_or(0) + 1)
             .unwrap_or(1)
     }
 
