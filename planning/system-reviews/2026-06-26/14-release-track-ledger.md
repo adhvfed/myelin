@@ -570,7 +570,14 @@ CI-schema owner (likely myelin-storage). (2) storage cost_event [0050] vs CI cos
 the single-binary composition. Reconcile: a clear CI migration owner + schema/DB boundary (own schema OR
 ci_-prefixed names) so dispatch+controlplane point at the same migrated CI tables in dev AND prod. Design-heavy
 — ground the DB-per-service boundary first. Unblocks LIVE serve-wiring of CT-004a settle + CT-004b consumer +
-CT-004c/d. · **CT-004c** scheduler/lease loop live on `job_queue`
+CT-004c/d. — **DONE `8059a7b`**: confirmed ONE shared `myelin` DB for all services (per-service DB is
+aspirational); CI dormant → rename-in-place clean; CI `cost_event`→`ci_cost_event` (collision-complete, only
+that one collided); shared `ci_durable_migrations()` applied by BOTH CI mains (writer subset ci_run/check_attempt/
+ci_cost_event from the same DDL/ids as the full set — subset==full test); CT-004a/b tests now hit REAL migrated
+tables; new no-collision proof (both cost_event + ci_cost_event coexist, both stores write); real-boot sanity
+(each CI main creates the tables in public, no swallow, boot-order coupling gone). **CT-004d FLOOR:** ci_cost_event
+is FORCE-RLS but CiCostEventStore writes on a bare pool w/o the (tenant,region) GUC — live settle needs a
+tenant-scoped tx (CT-004d). · **CT-004c** scheduler/lease loop live on `job_queue`
 + reaper/autoscaler background loops (a) · **CT-004d** pipeline body + metering bookends live (b,c) ·
 **CT-004e** check/result producers live → closes the X-1 seam to the merge gate (d) · **CT-004f** log
 pipeline live substrate (a; SSE tail is CT-005) · **CT-004g** fleet/residency (c, optional split).
