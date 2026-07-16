@@ -199,7 +199,7 @@ impl MeteredResource {
 /// and markup as SEPARATE integer-minor-units columns (NEVER one conflated number) and `kind ∈ {ci,
 /// agent}` fronting both run kinds with the SAME schema. The PRIMARY KEY is `(tenant, cost_id)`; the
 /// `(run_id, job_id)` attribute the unit to its producing run/stage. This is the in-memory mirror of
-/// the row the durable `cost_event` table holds (the table DDL is [`crate::migrations::CREATE_COST_EVENT_DDL`]);
+/// the row the durable `ci_cost_event` table holds (the table DDL is [`crate::migrations::CREATE_CI_COST_EVENT_DDL`]);
 /// the live Postgres write lands with the OLTP driver (P-S12) — the row SHAPE + the wholesale ≠ markup
 /// invariant are complete + testable now.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -231,8 +231,10 @@ impl CostEventRow {
     }
 }
 
-/// **The durable `cost_event` settle INSERT (CI-P17 / CT-004 — the bind-param SQL the live stack
-/// records each metered unit through; the table DDL is [`crate::migrations::CREATE_COST_EVENT_DDL`]).**
+/// **The durable `ci_cost_event` settle INSERT (CI-P17 / CT-004 — the bind-param SQL the live stack
+/// records each metered unit through; the table DDL is [`crate::migrations::CREATE_CI_COST_EVENT_DDL`]).**
+/// CT-004m: the physical table is `ci_cost_event` (CI-namespaced, distinct from Storage's money-ledger
+/// `cost_event`, migration `0050`, in the shared `myelin` DB).
 /// This is the durable counterpart of the in-memory [`CostEventRow`] / [`meter_resource_seconds`] model
 /// — the SAME row shape, written to real Postgres. ONE row per metered unit (the
 /// `cost_events_per_unit == 1` invariant, arch 02 §8), attributed to its producing `(run_id, job_id)`,
@@ -245,7 +247,7 @@ impl CostEventRow {
 /// Bind: `$1 tenant_id`, `$2 region`, `$3 cost_id`, `$4 run_id`, `$5 job_id`, `$6 meter`, `$7 amount`,
 /// `$8 wholesale_minor_units`, `$9 markup_minor_units`, `$10 kind`.
 pub const INSERT_COST_EVENT_QUERY: &str = "\
-INSERT INTO cost_event
+INSERT INTO ci_cost_event
   (tenant_id, region, cost_id, run_id, job_id, meter, amount, wholesale_minor_units, markup_minor_units, kind)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 ON CONFLICT (tenant_id, cost_id) DO NOTHING";
@@ -256,7 +258,7 @@ ON CONFLICT (tenant_id, cost_id) DO NOTHING";
 /// `(tenant_id, run_id)`. Bind: `$1 tenant_id`, `$2 run_id`.
 pub const SELECT_COST_EVENTS_FOR_RUN_QUERY: &str = "\
 SELECT job_id, meter, amount, wholesale_minor_units, markup_minor_units, kind
-FROM cost_event
+FROM ci_cost_event
 WHERE tenant_id = $1 AND run_id = $2
 ORDER BY job_id, meter";
 

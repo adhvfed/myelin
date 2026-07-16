@@ -18,12 +18,18 @@
 //!      deterministic `cost_id`), and the read-back count is unchanged — the reserve/settle bookends
 //!      do not double-bill through the CI projection.
 //!
-//! **Isolation.** The store executes the BYTE-IDENTICAL production constants (`INTO cost_event`,
-//! hardcoded). To keep that verbatim while staying isolated from other tests AND from Storage's
-//! money-ledger `cost_event` (the migration-`0050` name collision documented on
-//! `myelin_ci_controlplane::ci_cost_event_store`), each pool sets its `search_path` to a per-pid
-//! schema in which ONLY CI's `cost_event` (CI schema) exists — so the store's unqualified `cost_event`
-//! resolves there, unmodified.
+//! **CT-004m — the tables come from the REAL migration path.** The store executes the BYTE-IDENTICAL
+//! production constants (`INTO ci_cost_event`, hardcoded). Rather than a hand-written bare CREATE, this
+//! test now applies the REAL forward-only [`myelin_ci_controlplane::ci_durable_migrations`] set (the
+//! SAME migrations both CI service mains apply at boot — `ci_run` + `check_attempt` + `ci_cost_event`,
+//! each `(tenant, region)`-first + FORCE-RLS via the platform `myelin_make_tenant_scoped` helper) into
+//! a per-pid schema. So the durability proof runs against the tables exactly as the real migration
+//! path produces them — no stopgap bare DDL. The per-pid schema keeps concurrent runs isolated; the
+//! CT-004m rename (CI's table is `ci_cost_event`, distinct from Storage's money-ledger `cost_event`,
+//! migration `0050`) is what lets the two coexist in the ONE shared `myelin` DB (proven in the sibling
+//! `integration_ci_ct004m_cost_event_no_collision`). The pool connects as the migration/owner role
+//! (`myelin_admin`, BYPASSRLS) so the store's bare-pool ops exercise the table shape under FORCE-RLS;
+//! the tenant-scoped-tx production write is CT-004d.
 //!
 //! Gated behind the `integration` cargo feature. Run against the docker-compose dev stack:
 //!
@@ -32,7 +38,9 @@
 //!     --test integration_ci_ct004a_cost_store_durability -- --nocapture
 #![cfg(feature = "integration")]
 
-use myelin_ci_controlplane::{CiCostEventStore, CostEventRow, CostKind, Meter, CREATE_COST_EVENT_DDL};
+use myelin_ci_controlplane::{
+    ci_durable_migrations, CiCostEventStore, CostEventRow, CostKind, Meter,
+};
 use myelin_flow::MinorUnits;
 use myelin_tenancy::TenantId;
 use sqlx::types::Uuid;
@@ -64,8 +72,10 @@ async fn reopen() -> PgPool {
         .after_connect(move |conn, _meta| {
             let schema = schema.clone();
             Box::pin(async move {
-                // Pin the search_path so the store's unqualified `cost_event` resolves to our schema.
-                conn.execute(format!("SET search_path TO {schema}").as_str())
+                // Pin the search_path so the store's unqualified `ci_cost_event` resolves to our
+                // schema first; `public` follows so the platform RLS helper `myelin_make_tenant_scoped`
+                // (defined in public, called by the real ci_durable_migrations) resolves.
+                conn.execute(format!("SET search_path TO {schema}, public").as_str())
                     .await?;
                 Ok(())
             })
@@ -142,11 +152,15 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
         .execute(&p1)
         .await
         .expect("create the per-pid schema");
-    // The pool's search_path already points at `schema`; the unqualified DDL lands there.
-    sqlx::query(CREATE_COST_EVENT_DDL)
-        .execute(&p1)
-        .await
-        .expect("apply CI cost_event DDL into the isolated schema");
+    // The pool's search_path already points at `schema`; apply the REAL forward-only CI durable
+    // migration set (ci_run + check_attempt + ci_cost_event, each with FORCE-RLS) — the SAME set both
+    // CI mains apply at boot. Each migration DDL is multi-statement (CREATE + myelin_make_tenant_scoped),
+    // so it runs via the simple-query protocol (`Executor::execute(&str)`), landing in `schema`.
+    for m in ci_durable_migrations().0.iter() {
+        p1.execute(m.ddl)
+            .await
+            .unwrap_or_else(|e| panic!("apply CI durable migration {} into the schema: {e}", m.id));
+    }
 
     // ── COMMITTED settle THROUGH the store (its own tx → commit). ──
     let store1 = CiCostEventStore::with_pg(p1.clone());

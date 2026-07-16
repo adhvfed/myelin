@@ -89,6 +89,22 @@ async fn main() {
         eprintln!("ci-dispatch: cannot apply the durable migration aggregate (identity/pseudonym/placement/kms/cost/erasure): {e}");
         std::process::exit(1);
     }
+    // CT-004m — apply the SHARED CI durable writer subset (`ci_run` + `check_attempt` + `ci_cost_event`)
+    // at boot. ci-dispatch's reserve/start co-commit writes `ci_run` (owned by myelin-ci-controlplane);
+    // its own `serve(AppSpec)` migrate applies ONLY `consumer_dedup`, so before CT-004m the `ci_run`
+    // write depended on ci-controlplane booting first (a boot-order coupling in the ONE shared `myelin`
+    // DB). Applying the SAME forward-only set (same ids/DDL) both mains carry breaks that coupling — the
+    // writer tables exist regardless of boot order (idempotent, advisory-locked). FAIL LOUD.
+    if let Err(e) = provider
+        .migrate(
+            &myelin_ci_controlplane::ci_durable_migrations(),
+            &myelin_ci_controlplane::ci_durable_hot_tables(),
+        )
+        .await
+    {
+        eprintln!("ci-dispatch: cannot apply the shared CI durable migrations (ci_run/check_attempt/ci_cost_event): {e}");
+        std::process::exit(1);
+    }
     // The DURABLE outbox (SI-007): committed events live in Postgres, not a per-process mutex.
     let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
         provider.db_pool().clone(),
@@ -106,9 +122,10 @@ async fn main() {
     // The FOURTH — the CAS `BlobStore` the resolver writes the definition snapshot to (contract
     // 11.2, `S3BlobStore` over RustFS/Scaleway) — is INTEGRATION-GATED in this crate's Cargo.toml
     // (`aws-sdk-s3` + `myelin-storage/integration`), so a DEFAULT-features binary has no CAS backing
-    // to construct here; that + the cross-service git-read hop + the `myelin-storage` durable
-    // `ci_run` backing (the `ci_run` table is owned by `myelin-ci-controlplane`, NOT applied by
-    // `all_durable_migrations()` here) are the NAMED wiring floors. The consumer LOGIC + the durable
+    // to construct here; that + the cross-service git-read hop are the NAMED wiring floors. (CT-004m
+    // discharged the `ci_run`-table floor: `ci_run` is created at THIS main's boot via the shared
+    // `ci_durable_migrations()` applied above — no longer a boot-order dependency on ci-controlplane.)
+    // The consumer LOGIC + the durable
     // reserve/idempotency are proven end-to-end on live PG in
     // `tests/integration_ci_ct004b_trigger_consumer.rs`. Until the CAS-blob backing is wired into
     // this default build, the production binary boots the shell (no consumer registered) rather than
