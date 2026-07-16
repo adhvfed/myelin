@@ -367,20 +367,55 @@ avoid myelin-agent-service overlap; fix shape settled (persist HitlGate in the a
 `agent_hitl_gate` table, MCP re-drive presents a server-issued gate-id looked up server-side, step-6
 gate + batch approval key per-effect not by bare tool name).
 
-## R3–R6
+## R3 — Git/PR UX + first-run (OPENED 2026-07-16, design-first)
 
-Tracked here at phase granularity once entered; R3 rows will be added when its design sketches start
-(design-before-frontend, VISION §3 — R3.1–R3.7), R4–R6 when their phases open.
+Entered at HEAD `6fd7e3a` (post-R2 exit). Design sketches precede all frontend code (VISION §3).
+Design deliverable: `design-planning/09-r3-sketches/` — implementation-ready sketch pack (IA, flows,
+full R-21 state sets) extending the frozen 08-design-system + 6c finalist-A (Instrument) direction;
+orchestrator gates the pack against `design-planning/05-user-facing-surfaces/git.md` G-1..G-9 DoDs
+before any build wave. Frontend is **SolidJS/SolidStart** (`frontend/apps/web`), not the React noted
+in older design docs — the code wins.
+
+| # | Item | Source | Status | Commit(s) | Proof |
+|---|---|---|---|---|---|
+| R3.0 | Design sketch pack (PR list, PR overview/context pane, PR diff, review/merge, repo browsing, first-run) | VISION §3 gate | DONE (2026-07-16) | (pack commit) | 5 surfaces × (sketch HTMLs + NOTES: routes, R-21 states, EXISTING/NEW data contract, keyboard/SR, component reuse); every surface gated in `design-planning/09-r3-sketches/_gate.md` — one rails violation found+fixed (04 ref-switcher outline), one cross-pack API conflict reconciled (canonical thread-store, object_key-keyed); all open questions decided at the gate |
+| R3.1 | PR list + navigation front door (per-repo + cross-repo; edge `GET …/prs` wiring of existing `compose_pr_list_query`) | ux-git crit 1 | BLOCKED on R3.0 | — | — |
+| R3.2 | PR diff / files-changed (head_oid vs base_ref; side-by-side+unified; comment anchoring; G-7 keyboard/SR) | ux-git crit 2 | BLOCKED on R3.0 | — | — |
+| R3.3 | PR context pane (title/body, linked issue/run/doc chips via refs graph, discussion, commits-in-PR; checks ErrorBoundary + check→run links) | ux-git crit 3, findings 5/9 | BLOCKED on R3.0 | — | — |
+| R3.4 | Repo browsing completeness (tree-at-path, nested blob, README, branch/tag switcher, default_branch, 404 catch-all, error-state mapping, binary fallback) | ux-git 4/6/8/10/12/13, firstrun 1 | BLOCKED on R3.0 | — | — |
+| R3.5 | First-run flow (login→tenant→repo→push→first CI as one path; onboarding empty states; real inbox; palette client-side nav) | ux-firstrun 2/3/5/6 | BLOCKED on R3.0 | — | — |
+| R3.6 | A11y AA batch (palette focus ring, rail active=surface-hover, commit-link contrast, skeleton+aria-busy, inline-style hover, button-primary token, dvh) + fe-ds 7 findings | ux-a11y 1–7, fe-ds | DONE | `2be4342` | All 7 ux-a11y + 7 fe-ds findings fixed; Skeleton contributed to design-system (aria-busy + one polite region); +17 DS tests, +2 e2e; gates orchestrator-run: DS 49 pass, web 10 pass, tsc/lint clean, Playwright+axe 15 pass. Deferred (named): position.ts BOUNDED collision-hardening stands; Toast Undo accent-as-text flagged for a future pass |
+| R3.7a | GT-004b PR review/merge UI (G-8: batched verdicts, merge action, gate_admitted stays authoritative) | ledger 11 follow-up | READY (design gated in) | — | — |
+| R3.7b | Flow budget-reservation leak on retry-exhaustion (settle/refund; re-drive safe) | flow #1 HIGH | DONE | `6dc24ab` | Settle on both outcomes (failure bills zero → full refund), un-gated on fresh (idempotent re-drive reconciles crash windows), telemetry parity kept; +2 tests; verifier CONFIRMED-SOUND (reproduced pre-fix leak; 8 adversarial crash/concurrency attacks). Non-blocking follow-ups in commit msg: silent settle-error discard on failure path; latent P-ST-19 wallet-reseed credit; job.rs settle still fresh-gated |
+
+**Backend endpoint gaps the R3 screens need** (from the 2026-07-16 frontend/API census — each becomes
+part of its item's build wave): PR list GET (logic exists in `myelin-git/src/list_filter.rs`, unexposed);
+PR head-vs-base diff; PR title/body in `PrVM`; PR discussion/comments (no store exists — scope decision
+in R3.0); linked-refs-for-PR endpoint (myelin-refs crate exists, no edge surface); commits-in-PR;
+tree-at-path + nested blob; branches/tags list + `default_branch` in RepoHomeVM; check→run refs in
+`PrChecksVM`. PR-list MUST use the leak-free `list_objects` prefilter path (`repo_authz.rs`), not
+post-filter.
+
+R3 exit gate: the founder reviews and merges a real Myelin PR entirely inside Myelin (notification →
+diff → merge), and the axe/Playwright a11y suite is green on the PR surfaces.
+
+## R4–R6
+
+Tracked here at phase granularity once entered; R4–R6 rows added when their phases open.
 
 | Phase | Status |
 |---|---|
-| R3 Git/PR UX + first-run | NOT STARTED |
 | R4 dogfood cutover (Tier D) | NOT STARTED |
 | R5 production ops | NOT STARTED |
 | R6 graduation gate | NOT STARTED |
 
 ## Decision log
 
+- 2026-07-16: **R3 opened** at HEAD `6fd7e3a`. Design-first per VISION §3: sketch pack
+  (`design-planning/09-r3-sketches/`) gates all frontend items; R3.6 (a11y fixes to existing chrome)
+  and R3.7b (flow budget leak, backend) run in parallel un-gated. Census confirmed the frontend is
+  SolidStart (older design docs said React — code wins) and enumerated the backend endpoint gaps
+  (recorded in the R3 section above).
 - 2026-07-06: Ledger opened; R0 execution begins at HEAD `2f38fce`.
 - 2026-07-06: **R0 complete** (7/7, HEAD `5f47dd8`). Builder/verifier/commit process throughout; R2.1a
   carried forward (wire the R0.2/R0.3 gates live). **Next: R1** — MR-009b W3b–W7 (ledger 13) with the

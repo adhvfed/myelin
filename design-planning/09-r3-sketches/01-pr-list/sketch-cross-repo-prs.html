@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<!-- R3 · PR list + navigation front door · Screen 2 of 3 — CROSS-REPO FRONT DOOR, POPULATED.
+     Route: /prs   (the "what needs me" front door; buckets: Your PRs / Needs your review).
+     Argues placement: NOT a 6th rail item (PRs aren't a sixth subsystem — P1); reached from the
+     Code-rail landing + repo headers + inbox links + ⌘K. See NOTES.md §Nav change.
+     Direction A "Instrument", FROZEN. Links GENERATED ../tokens.css. One German string. -->
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your pull requests · Myelin</title>
+<link rel="stylesheet" href="../tokens.css">
+<style>
+  html,body{height:100%}
+  body{margin:0;background:var(--surface);color:var(--text-primary);
+       font:var(--fs-body-sm)/var(--lh-body) var(--font-sans);-webkit-font-smoothing:antialiased;overflow:hidden}
+  .mono{font-family:var(--font-mono)}
+  button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+  a{color:inherit}
+  code{font-family:var(--font-mono);font-size:var(--fs-code)}
+
+  .shell{display:grid;grid-template-rows:40px 1fr;height:100dvh;overflow:hidden}
+  .topbar{display:flex;align-items:center;gap:var(--space-3);padding-inline:var(--space-3);
+          border-block-end:var(--hairline) solid var(--border);background:var(--surface-raised)}
+  .brand{display:flex;align-items:center;gap:7px;font-weight:var(--weight-semibold);letter-spacing:.01em}
+  .brand .g{width:14px;height:14px;border:1.5px solid var(--text-muted);border-radius:var(--radius-1);position:relative}
+  .brand .g::after{content:"";position:absolute;inset:3px 3px auto auto;width:4px;height:4px;background:var(--accent)}
+  .scope{display:flex;align-items:center;gap:6px;border:var(--hairline) solid var(--border);
+         border-radius:var(--radius-1);padding:3px 8px;color:var(--text-muted);font-size:var(--fs-caption)}
+  .scope b{color:var(--text-primary);font-weight:var(--weight-medium)}
+  .kbar{margin-inline-start:auto;display:flex;align-items:center;gap:var(--space-2)}
+  .cmdk{display:flex;align-items:center;gap:8px;height:var(--control-h);padding-inline:9px;min-width:230px;
+        border:var(--hairline) solid var(--border-strong);border-radius:var(--radius-1);
+        color:var(--text-subtle);background:var(--surface)}
+  .cmdk .k{margin-inline-start:auto;font-family:var(--font-mono);font-size:11px;color:var(--text-subtle);
+           border:var(--hairline) solid var(--border);border-radius:var(--radius-1);padding:1px 5px}
+  .resid{display:flex;align-items:center;gap:5px;font-family:var(--font-mono);font-size:11px;color:var(--text-muted);
+         border:var(--hairline) solid var(--border);border-radius:var(--radius-1);padding:4px 8px}
+  .resid .dot{width:6px;height:6px;border-radius:50%;background:var(--success)}
+  .avatar{width:22px;height:22px;border-radius:50%;background:var(--surface-hover);display:grid;place-items:center;
+          font-size:10px;color:var(--text-muted)}
+
+  .body{display:grid;grid-template-columns:48px 224px 1fr;min-height:0}
+  .rail{display:flex;flex-direction:column;align-items:center;gap:2px;padding-block-start:var(--space-2);
+        border-inline-end:var(--hairline) solid var(--border);background:var(--surface-raised)}
+  .rail a{width:34px;height:34px;display:grid;place-items:center;color:var(--text-subtle);
+          border-radius:var(--radius-1);text-decoration:none}
+  .rail a.on{color:var(--text-primary);background:var(--surface-hover)}
+  .rail a.on svg{color:var(--accent)}
+  .rail a:hover{color:var(--text-primary)}
+  .rail .sep{flex:1}
+
+  .side{overflow:auto;min-height:0;border-inline-end:var(--hairline) solid var(--border);
+        background:var(--surface-raised);padding-block:var(--space-2)}
+  .side h4{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--text-subtle);
+           padding:10px 12px 4px;font-weight:var(--weight-semibold);margin:0}
+  .side .srow{display:flex;align-items:center;gap:8px;padding:5px 12px;color:var(--text-muted);
+              font-size:12.5px;text-decoration:none;min-height:var(--target-min)}
+  .side .srow:hover{background:var(--surface-hover);color:var(--text-primary)}
+  .side .srow.on{color:var(--text-primary);background:var(--surface-hover);font-weight:var(--weight-medium)}
+  .side .srow .ct{margin-inline-start:auto;font-family:var(--font-mono);font-size:11px;color:var(--text-subtle)}
+  .side .srow.on .ct{color:var(--text-muted)}
+
+  .content{overflow:auto;min-height:0}
+  .crumb{display:flex;align-items:center;gap:6px;font-size:var(--fs-caption);color:var(--text-muted);padding:12px 20px 0}
+  .crumb a{text-decoration:none;color:var(--text-muted)}
+  .crumb a:hover{color:var(--text-primary);text-decoration:underline}
+  .crumb .sep{color:var(--text-subtle)}
+  .head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 20px 4px}
+  .head h1{font-size:var(--fs-h2);font-weight:var(--weight-semibold);letter-spacing:-.01em;margin:0}
+
+  /* a bucket = a labelled section (a saved query on the one PR list) */
+  .bucket{padding-block:8px}
+  .bhead{display:flex;align-items:center;gap:8px;padding:12px 20px 8px}
+  .bhead h2{font-size:13px;font-weight:var(--weight-semibold);color:var(--text-primary);margin:0;
+            display:inline-flex;align-items:center;gap:7px}
+  .bhead .c{font-family:var(--font-mono);font-size:11px;color:var(--text-muted);
+            border:var(--hairline) solid var(--border);border-radius:var(--radius-pill);padding:0 7px}
+  .bhead .all{margin-inline-start:auto;font-size:12px;color:var(--text-muted);text-decoration:none}
+  .bhead .all:hover{color:var(--text-primary);text-decoration:underline}
+  .bhead .hint{padding:0 20px 4px;color:var(--text-subtle);font-size:11.5px}
+
+  .list{list-style:none;margin:0;padding:0;border-block-start:var(--hairline) solid var(--border)}
+  .prrow{display:grid;grid-template-columns:auto 1fr auto;align-items:start;gap:14px;
+         padding:11px 20px;border-block-end:var(--hairline) solid var(--border);text-decoration:none;color:inherit}
+  .prrow:hover{background:var(--surface-hover)}
+  .pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:var(--weight-medium);
+        border:var(--hairline) solid var(--border);border-radius:var(--radius-pill);padding:2px 9px;
+        color:var(--text-primary);white-space:nowrap}
+  .pill svg{flex:none}
+  .pill.open .ic{color:var(--success)}
+  .pill.draft .ic{color:var(--text-subtle)} .pill.draft{color:var(--text-muted)}
+  .pill.merged .ic{color:var(--agent)}
+  .main{min-width:0;display:flex;flex-direction:column;gap:3px}
+  .ttl{font-size:13.5px;font-weight:var(--weight-medium);color:var(--text-primary);line-height:var(--lh-tight)}
+  .ttl .num{color:var(--text-subtle);font-family:var(--font-mono);font-weight:var(--weight-regular);font-size:12px}
+  .sub{display:flex;flex-wrap:wrap;align-items:center;gap:5px 12px;color:var(--text-muted);font-size:11.5px}
+  /* repo chip — cross-repo rows carry their repo (a reference chip, compact density) */
+  .repochip{display:inline-flex;align-items:center;gap:5px;color:var(--text-muted);font-family:var(--font-mono);
+            border:var(--hairline) solid var(--border);border-radius:var(--radius-1);padding:0 6px;font-size:11px;
+            background:var(--surface-raised)}
+  .refs{display:inline-flex;align-items:center;gap:5px}
+  .refs code{color:var(--text-muted);background:var(--surface-raised);border:var(--hairline) solid var(--border);
+             border-radius:var(--radius-1);padding:0 4px;font-size:11px}
+  .refs .arr{color:var(--text-subtle)}
+  .idb{display:inline-flex;align-items:center;gap:5px;color:var(--text-muted)}
+  .idb .ava{width:15px;height:15px;border-radius:50%;background:var(--surface-hover);display:grid;place-items:center;
+            font-size:8.5px;color:var(--text-muted)}
+  .idb.agent .mark{width:14px;height:14px;border:1.5px solid var(--agent);border-radius:2px;display:grid;place-items:center}
+  .idb.agent .mark i{width:4px;height:4px;background:var(--agent)}
+  .idb.agent .alabel{font-size:9px;letter-spacing:.04em;text-transform:uppercase;color:var(--agent);
+                     border:var(--hairline) solid var(--agent);border-radius:var(--radius-1);padding:0 4px}
+  .rmeta{display:flex;flex-direction:column;align-items:flex-end;gap:5px;white-space:nowrap;font-size:11.5px}
+  .checks{display:inline-flex;align-items:center;gap:5px;color:var(--text-muted)}
+  .checks.pass .ic{color:var(--success)} .checks.fail .ic{color:var(--danger)} .checks.run .ic{color:var(--warning)}
+  .checks.none{color:var(--text-subtle)}
+  .rlow{display:inline-flex;align-items:center;gap:12px;color:var(--text-subtle)}
+  .rev{display:inline-flex;align-items:center;gap:4px;color:var(--text-muted)}
+  .updated{color:var(--text-subtle);font-variant-numeric:tabular-nums}
+  /* a "needs review" row carries a quiet requested-reviewer marker */
+  .youtag{display:inline-flex;align-items:center;gap:5px;color:var(--info);font-size:11px}
+
+  .skiplink{position:absolute;inset-inline-start:-999px}
+  .skiplink:focus{inset-inline-start:8px;top:8px;z-index:var(--z-toast);background:var(--surface-overlay);
+                  color:var(--text-primary);padding:6px 10px;border:var(--hairline) solid var(--focus-ring);
+                  border-radius:var(--radius-1)}
+  .live{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+</style>
+</head>
+<body>
+<a href="#main" class="skiplink">Skip to content</a>
+<div class="shell">
+  <header class="topbar" role="banner">
+    <span class="brand"><span class="g"></span>myelin</span>
+    <span class="scope">Code <b>·</b> <b>Pull requests</b></span>
+    <div class="kbar">
+      <button class="cmdk" aria-haspopup="dialog" aria-keyshortcuts="Meta+K Control+K">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M11 11l3 3"/></svg>
+        Search or run a command <span class="k">⌘K</span>
+      </button>
+      <span class="resid"><span class="dot"></span>EU-WEST · Frankfurt</span>
+      <span class="avatar" title="Adrian H.">AH</span>
+    </div>
+  </header>
+
+  <div class="body">
+    <nav class="rail" aria-label="Surfaces">
+      <a href="#" class="on" aria-current="page" title="Code" aria-label="Code">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M6 5L3 8l3 3M10 5l3 3-3 3"/></svg>
+      </a>
+      <a href="#" title="Issues" aria-label="Issues"><svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3.5"/><circle cx="8" cy="11" r=".6" fill="currentColor"/></svg></a>
+      <a href="#" title="Chat" aria-label="Chat"><svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 4h10v6H7l-3 2.5V10H3z"/></svg></a>
+      <a href="#" title="CI" aria-label="CI"><svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.5"/></svg></a>
+      <a href="#" title="Knowledge" aria-label="Knowledge"><svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 3h6l2 2v8H4z"/><path d="M6 6h4M6 8.5h4"/></svg></a>
+      <span class="sep"></span>
+      <a href="#" title="Inbox" aria-label="Inbox, 2 unread"><svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 9l1.5-5h7L13 9v3H3z"/><path d="M3 9h3l1 1.5h2L10 9h3"/></svg></a>
+    </nav>
+
+    <!-- sidebar: buckets (saved filters on the one PR list) + scope switch -->
+    <aside class="side" aria-label="Pull request views">
+      <h4>Pull requests</h4>
+      <a class="srow on" href="#" aria-current="true">Needs your review <span class="ct">3</span></a>
+      <a class="srow" href="#">Your PRs <span class="ct">4</span></a>
+      <a class="srow" href="#">Mentioned you <span class="ct">1</span></a>
+      <a class="srow" href="#">Recently merged <span class="ct">—</span></a>
+      <h4>By repository</h4>
+      <a class="srow" href="#">myelin/myelin <span class="ct">6</span></a>
+      <a class="srow" href="#">myelin/edge-gateway <span class="ct">2</span></a>
+      <a class="srow" href="#">myelin/design-system <span class="ct">1</span></a>
+    </aside>
+
+    <main class="content" id="main" tabindex="-1">
+      <nav class="crumb" aria-label="Breadcrumb">
+        <a href="#">Code</a><span class="sep">/</span><span aria-current="page">Pull requests</span>
+      </nav>
+      <div class="head"><h1>Your pull requests</h1></div>
+      <p class="live" role="status" aria-live="polite">3 pull requests need your review. 4 pull requests authored by you.</p>
+
+      <!-- BUCKET 1 · Needs your review (the attention surface) -->
+      <section class="bucket" aria-labelledby="b-review">
+        <div class="bhead">
+          <h2 id="b-review"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 8s2-4 5-4 5 4 5 4-2 4-5 4-5-4-5-4z"/><circle cx="8" cy="8" r="1.6"/></svg> Needs your review</h2>
+          <span class="c">3</span>
+          <a class="all" href="#">Open all in list →</a>
+        </div>
+        <p class="hint">You are a requested reviewer. Merge stays gated to a human even where an agent has reviewed.</p>
+        <ul class="list" role="list" aria-label="Pull requests needing your review, 3 items">
+          <li role="listitem"><a class="prrow" href="#">
+            <span class="pill open" title="State: Open"><svg class="ic" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="5" cy="4" r="2"/><circle cx="5" cy="12" r="2"/><path d="M5 6v4"/><path d="M11 12a5 5 0 00-5-5"/><circle cx="11" cy="12" r="1.6"/></svg>Open</span>
+            <span class="main">
+              <span class="ttl">AuthzScanner: eliminate 2 residual reach-arounds <span class="num">myelin/myelin#46</span></span>
+              <span class="sub">
+                <span class="repochip"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="3" width="10" height="10" rx="1"/></svg> myelin/myelin</span>
+                <span class="refs"><code>agent/scanner-reach-arounds</code><span class="arr">→</span><code>main</code></span>
+                <span class="idb agent" title="Agent · on behalf of Adrian H."><span class="mark" aria-hidden="true"><i></i></span> AuthzScanner <span class="alabel">Agent</span></span>
+              </span>
+            </span>
+            <span class="rmeta">
+              <span class="checks pass" title="Checks: all passing"><svg class="ic" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M5.2 8.2l2 2 3.6-4"/></svg>all passing</span>
+              <span class="rlow"><span class="youtag" title="Your review requested"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M8 2v12M2 8h12"/></svg>review requested</span><span class="updated">yesterday</span></span>
+            </span>
+          </a></li>
+
+          <li role="listitem"><a class="prrow" href="#">
+            <span class="pill open" title="State: Open"><svg class="ic" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="5" cy="4" r="2"/><circle cx="5" cy="12" r="2"/><path d="M5 6v4"/><path d="M11 12a5 5 0 00-5-5"/><circle cx="11" cy="12" r="1.6"/></svg>Open</span>
+            <span class="main">
+              <span class="ttl">Speculative merge-queue: patch-id chain de-dup <span class="num">myelin/edge-gateway#89</span></span>
+              <span class="sub">
+                <span class="repochip"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="3" width="10" height="10" rx="1"/></svg> myelin/edge-gateway</span>
+                <span class="refs"><code>feat/patch-id-chain</code><span class="arr">→</span><code>main</code></span>
+                <span class="idb"><span class="ava">MØ</span> Mara Ø.</span>
+              </span>
+            </span>
+            <span class="rmeta">
+              <span class="checks fail" title="Checks: 2 failing"><svg class="ic" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M5.7 5.7l4.6 4.6M10.3 5.7l-4.6 4.6"/></svg>2 failing</span>
+              <span class="rlow"><span class="youtag" title="Your review requested"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M8 2v12M2 8h12"/></svg>review requested</span><span class="updated">6h ago</span></span>
+            </span>
+          </a></li>
+
+          <li role="listitem"><a class="prrow" href="#">
+            <span class="pill draft" title="State: Draft"><svg class="ic" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="2.4 2" aria-hidden="true"><circle cx="8" cy="8" r="5.5"/></svg>Draft</span>
+            <span class="main">
+              <span class="ttl">R2.5 Grobkörnige Berechtigungsprüfung entfernen <span class="num">myelin/myelin#44</span></span>
+              <span class="sub">
+                <span class="repochip"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="3" width="10" height="10" rx="1"/></svg> myelin/myelin</span>
+                <span class="refs"><code>refactor/coarse-authz-removal</code><span class="arr">→</span><code>main</code></span>
+                <span class="idb"><span class="ava">JV</span> Jürgen Vögel</span>
+              </span>
+            </span>
+            <span class="rmeta">
+              <span class="checks none" title="No checks reported yet"><svg class="ic" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="1.3" fill="currentColor"/></svg>no checks</span>
+              <span class="rlow"><span class="youtag" title="Early feedback requested"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M8 2v12M2 8h12"/></svg>feedback requested</span><span class="updated">2d ago</span></span>
+            </span>
+          </a></li>
+        </ul>
+      </section>
+
+      <!-- BUCKET 2 · Your PRs (authored by you, across repos) -->
+      <section class="bucket" aria-labelledby="b-yours">
+        <div class="bhead">
+          <h2 id="b-yours"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="5" r="2.4"/><path d="M3.5 13c0-2.5 2-4 4.5-4s4.5 1.5 4.5 4"/></svg> Your PRs</h2>
+          <span class="c">4</span>
+          <a class="all" href="#">Open all in list →</a>
+        </div>
+        <ul class="list" role="list" aria-label="Pull requests you authored, 4 items">
+          <li role="listitem"><a class="prrow" href="#">
+            <span class="pill open" title="State: Open"><svg class="ic" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="5" cy="4" r="2"/><circle cx="5" cy="12" r="2"/><path d="M5 6v4"/><path d="M11 12a5 5 0 00-5-5"/><circle cx="11" cy="12" r="1.6"/></svg>Open</span>
+            <span class="main">
+              <span class="ttl">R2.4 MCP HITL server-side verdicts <span class="num">myelin/myelin#48</span></span>
+              <span class="sub">
+                <span class="repochip"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="3" width="10" height="10" rx="1"/></svg> myelin/myelin</span>
+                <span class="refs"><code>feat/mcp-hitl-verdicts</code><span class="arr">→</span><code>main</code></span>
+              </span>
+            </span>
+            <span class="rmeta">
+              <span class="checks run" title="Checks: 1 running"><svg class="ic" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M8 5v3l2 1.5"/></svg>1 running</span>
+              <span class="rlow"><span class="rev" title="2 reviews"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 4h10v6H7l-3 2.5V10H3z"/></svg>2</span><span class="updated">3h ago</span></span>
+            </span>
+          </a></li>
+
+          <li role="listitem"><a class="prrow" href="#">
+            <span class="pill open" title="State: Open"><svg class="ic" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="5" cy="4" r="2"/><circle cx="5" cy="12" r="2"/><path d="M5 6v4"/><path d="M11 12a5 5 0 00-5-5"/><circle cx="11" cy="12" r="1.6"/></svg>Open</span>
+            <span class="main">
+              <span class="ttl">R2.9 CI-report is a Service-producer capability <span class="num">myelin/myelin#43</span></span>
+              <span class="sub">
+                <span class="repochip"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="3" width="10" height="10" rx="1"/></svg> myelin/myelin</span>
+                <span class="refs"><code>feat/ci-report-capability</code><span class="arr">→</span><code>main</code></span>
+              </span>
+            </span>
+            <span class="rmeta">
+              <span class="checks pass" title="Checks: all passing"><svg class="ic" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M5.2 8.2l2 2 3.6-4"/></svg>all passing</span>
+              <span class="rlow"><span class="rev" title="1 review"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 4h10v6H7l-3 2.5V10H3z"/></svg>1</span><span class="updated">2d ago</span></span>
+            </span>
+          </a></li>
+
+          <li role="listitem"><a class="prrow" href="#">
+            <span class="pill merged" title="State: Merged"><svg class="ic" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="5" cy="4" r="2"/><circle cx="5" cy="12" r="2"/><path d="M5 6v4"/><path d="M5 8h3a3 3 0 013 3"/><circle cx="11" cy="12" r="1.6"/></svg>Merged</span>
+            <span class="main">
+              <span class="ttl">R2.6 authz scanner TRUE ZERO reach-arounds <span class="num">myelin/myelin#39</span></span>
+              <span class="sub">
+                <span class="repochip"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="3" width="10" height="10" rx="1"/></svg> myelin/myelin</span>
+                <span class="refs"><code>chore/scanner-true-zero</code><span class="arr">→</span><code>main</code></span>
+              </span>
+            </span>
+            <span class="rmeta">
+              <span class="checks pass" title="Merged — checks were green"><svg class="ic" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M5.2 8.2l2 2 3.6-4"/></svg>merged green</span>
+              <span class="rlow"><span class="rev" title="3 reviews"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 4h10v6H7l-3 2.5V10H3z"/></svg>3</span><span class="updated">3d ago</span></span>
+            </span>
+          </a></li>
+
+          <li role="listitem"><a class="prrow" href="#">
+            <span class="pill open" title="State: Open"><svg class="ic" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="5" cy="4" r="2"/><circle cx="5" cy="12" r="2"/><path d="M5 6v4"/><path d="M11 12a5 5 0 00-5-5"/><circle cx="11" cy="12" r="1.6"/></svg>Open</span>
+            <span class="main">
+              <span class="ttl">Tokens: derive focus-ring ≠ accent for design-system <span class="num">myelin/design-system#12</span></span>
+              <span class="sub">
+                <span class="repochip"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="3" width="10" height="10" rx="1"/></svg> myelin/design-system</span>
+                <span class="refs"><code>fix/focus-token-derivation</code><span class="arr">→</span><code>main</code></span>
+              </span>
+            </span>
+            <span class="rmeta">
+              <span class="checks pass" title="Checks: all passing"><svg class="ic" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M5.2 8.2l2 2 3.6-4"/></svg>all passing</span>
+              <span class="rlow"><span class="rev" title="0 reviews"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 4h10v6H7l-3 2.5V10H3z"/></svg>0</span><span class="updated">5d ago</span></span>
+            </span>
+          </a></li>
+        </ul>
+      </section>
+    </main>
+  </div>
+</div>
+</body>
+</html>

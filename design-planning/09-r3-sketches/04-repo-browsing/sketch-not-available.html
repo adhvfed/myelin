@@ -1,0 +1,131 @@
+<title>Honest rail &amp; NotAvailable — myelin · R3 sketch</title>
+<link rel="stylesheet" href="../tokens.css" />
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--surface);color:var(--text-primary);font-family:var(--font-sans);font-size:var(--fs-body);line-height:var(--lh-body);-webkit-font-smoothing:antialiased}
+  .mono,code{font-family:var(--font-mono)}
+  a{color:inherit;text-decoration:none}
+  .app{display:grid;grid-template-rows:auto 1fr;height:100dvh}
+  .hdr{display:flex;align-items:center;gap:var(--space-3);height:var(--space-7);padding-inline:var(--space-3);border-block-end:var(--hairline) solid var(--border);background:var(--surface-raised)}
+  .brand{display:flex;align-items:center;gap:var(--space-2);font-weight:var(--weight-semibold)}
+  .kbar{display:flex;align-items:center;gap:var(--space-2);flex:1;max-width:420px;padding:var(--space-1) var(--space-2);border:var(--hairline) solid var(--border);border-radius:var(--radius-1);color:var(--text-subtle);background:var(--surface);cursor:text}
+  .kbar kbd{margin-inline-start:auto;font-family:var(--font-mono);font-size:var(--fs-caption);color:var(--text-subtle);border:var(--hairline) solid var(--border);border-radius:var(--radius-1);padding:0 var(--space-1)}
+  .hdr-right{margin-inline-start:auto;display:flex;align-items:center;gap:var(--space-2)}
+  .icon-btn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:var(--hairline) solid transparent;border-radius:var(--radius-1);background:none;color:var(--text-muted);cursor:pointer}
+  .icon-btn:hover{background:var(--surface-hover);color:var(--text-primary)}
+  .body{display:grid;grid-template-columns:var(--space-7) 1fr;min-height:0}
+  .rail{display:flex;flex-direction:column;align-items:center;gap:var(--space-1);padding-block:var(--space-2);border-inline-end:var(--hairline) solid var(--border);background:var(--surface-raised)}
+  .rail-item{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;width:40px;height:44px;border:none;border-radius:var(--radius-1);background:none;color:var(--text-muted);cursor:pointer;font-size:9px}
+  .rail-item:hover{background:var(--surface-hover);color:var(--text-primary)}
+  .rail-item[aria-current="page"]{background:var(--surface-hover);color:var(--text-primary)}
+  /* honest treatment for unbuilt destinations: muted (--text-subtle) + a "soon" dot, NEVER accent, NEVER disabled */
+  .rail-item.soon{color:var(--text-subtle)}
+  .rail-item .soon-dot{position:absolute;top:4px;inset-inline-end:5px;width:5px;height:5px;border-radius:var(--radius-pill);background:var(--text-subtle)}
+  .rail-item.soon[aria-current="page"]{background:var(--surface-hover);color:var(--text-muted)}
+  .main{min-height:0;overflow:auto;padding:var(--space-5)}
+  .wrap{max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:var(--space-4)}
+  svg.i{width:20px;height:20px;stroke:currentColor;stroke-width:1.6;fill:none;stroke-linecap:round;stroke-linejoin:round;flex:none}
+  svg.i.sm{width:16px;height:16px}
+  svg.i.lg{width:24px;height:24px}
+  svg.i.xl{width:36px;height:36px;stroke-width:1.3}
+  .crumbs{display:flex;align-items:center;gap:var(--space-1);font-size:var(--fs-body-sm);color:var(--text-muted)}
+  .crumbs .sep{color:var(--text-subtle)}
+  .na{display:flex;flex-direction:column;align-items:center;text-align:center;gap:var(--space-2);padding:var(--space-7) var(--space-5);border:var(--hairline) solid var(--border);border-radius:var(--radius-1);background:var(--surface-raised)}
+  .na .glyph{color:var(--text-subtle)}
+  .na h1{font-size:var(--fs-h2);margin:0}
+  .na p{margin:0;color:var(--text-muted);max-width:44ch}
+  .na .soon-tag{display:inline-flex;align-items:center;gap:4px;font-size:var(--fs-caption);color:var(--text-muted);border:var(--hairline) solid var(--border);border-radius:var(--radius-pill);padding:2px var(--space-2)}
+  .na .actions{display:flex;gap:var(--space-2);margin-block-start:var(--space-3)}
+  .btn{display:inline-flex;align-items:center;gap:var(--space-1);height:var(--control-h);padding-inline:var(--space-2);border:var(--hairline) solid var(--border-strong);border-radius:var(--radius-1);background:var(--surface);color:var(--text-primary);font:inherit;font-size:var(--fs-body-sm);cursor:pointer}
+  .btn:hover{background:var(--surface-hover)}
+  .btn.primary{background:var(--c-btn-primary-bg);color:var(--c-btn-primary-text);border-color:transparent;font-weight:var(--weight-medium)}
+  .lbl{display:block;font-size:var(--fs-caption);color:var(--text-subtle);margin-block-end:var(--space-1)}
+  .note{border:var(--hairline) solid var(--border);border-radius:var(--radius-1);background:var(--surface-raised);padding:var(--space-3);font-size:var(--fs-body-sm);color:var(--text-muted)}
+  .note code{color:var(--text-primary)}
+  .rail-variants{display:flex;gap:var(--space-5);align-items:flex-start;flex-wrap:wrap}
+  .mini-rail{display:flex;flex-direction:column;align-items:center;gap:var(--space-1);padding:var(--space-2);border:var(--hairline) solid var(--border);border-radius:var(--radius-1);background:var(--surface-raised);width:60px}
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="ic-code" viewBox="0 0 24 24"><polyline points="9 8 5 12 9 16"/><polyline points="15 8 19 12 15 16"/></symbol>
+  <symbol id="ic-issues" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><line x1="12" y1="8" x2="12" y2="12"/><circle cx="12" cy="16" r=".6"/></symbol>
+  <symbol id="ic-chat" viewBox="0 0 24 24"><path d="M4 5h16v11H9l-4 4z"/></symbol>
+  <symbol id="ic-ci" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><polyline points="12 7 12 12 16 14"/></symbol>
+  <symbol id="ic-knowledge" viewBox="0 0 24 24"><path d="M5 4h9a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3z"/><line x1="9" y1="9" x2="14" y2="9"/></symbol>
+  <symbol id="ic-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><line x1="16" y1="16" x2="20" y2="20"/></symbol>
+  <symbol id="ic-inbox" viewBox="0 0 24 24"><path d="M4 5h16v14H4z"/><path d="M4 14h4l1 2h6l1-2h4"/></symbol>
+  <symbol id="ic-human" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3"/><path d="M5 20a7 7 0 0 1 14 0"/></symbol>
+</svg>
+
+<div class="app">
+  <header class="hdr">
+    <span class="brand"><svg class="i lg"><use href="#ic-code"/></svg> Myelin</span>
+    <div class="kbar" role="button" tabindex="0"><svg class="i sm"><use href="#ic-search"/></svg> Search or run a command <kbd>⌘K</kbd></div>
+    <div class="hdr-right">
+      <button class="icon-btn" aria-label="Inbox"><svg class="i"><use href="#ic-inbox"/></svg></button>
+      <button class="icon-btn" aria-label="Account"><svg class="i"><use href="#ic-human"/></svg></button>
+    </div>
+  </header>
+  <div class="body">
+    <!-- Issues is the visited (unbuilt) destination: honest muted + soon-dot, still keyboard-reachable, aria-current -->
+    <nav class="rail" aria-label="Primary">
+      <a class="rail-item" href="#"><svg class="i"><use href="#ic-code"/></svg>Code</a>
+      <a class="rail-item soon" href="#" aria-current="page" title="Issues — bald verfügbar"><span class="soon-dot"></span><svg class="i"><use href="#ic-issues"/></svg>Issues</a>
+      <a class="rail-item soon" href="#" title="Chat — coming soon"><span class="soon-dot"></span><svg class="i"><use href="#ic-chat"/></svg>Chat</a>
+      <a class="rail-item soon" href="#" title="CI — coming soon"><span class="soon-dot"></span><svg class="i"><use href="#ic-ci"/></svg>CI</a>
+      <a class="rail-item soon" href="#" title="Knowledge — coming soon"><span class="soon-dot"></span><svg class="i"><use href="#ic-knowledge"/></svg>Wissen</a>
+    </nav>
+
+    <main class="main">
+      <div class="wrap">
+        <span class="lbl">STATE · unbuilt subsystem reached (Issues) — NotAvailable inside the shell, NOT a raw 404</span>
+        <nav class="crumbs" aria-label="Breadcrumb"><a href="#">Myelin</a><span class="sep">/</span><span>Issues</span></nav>
+
+        <!-- The dignified NotAvailable, upgraded to teach (empty-state discipline R-20) -->
+        <section class="na" role="note" aria-labelledby="na-h">
+          <svg class="i xl glyph"><use href="#ic-issues"/></svg>
+          <span class="soon-tag">Bald verfügbar</span>
+          <h1 id="na-h">Issues isn't here yet</h1>
+          <p>The issue tracker lands in a later release. It shares the same shell, palette, and reference chips
+             you already use in Code — nothing to re-learn.</p>
+          <div class="actions">
+            <a class="btn primary" href="#"><svg class="i sm"><use href="#ic-code"/></svg> Go to Code</a>
+            <button class="btn"><svg class="i sm"><use href="#ic-search"/></svg> Open command palette</button>
+          </div>
+        </section>
+
+        <div class="note">
+          <strong>Why this, not a framework 404:</strong> a catch-all route (<code>src/routes/[...404].tsx</code>)
+          and per-subsystem index routes render this <code>&lt;NotAvailable&gt;</code> <em>inside</em> the shell, so
+          the rail, palette and header stay put. Dissolves firstrun finding 1 (four nav 404s).
+        </div>
+
+        <div>
+          <h3 style="font-size:var(--fs-body-sm);color:var(--text-subtle);text-transform:uppercase;letter-spacing:.05em;margin:var(--space-3) 0 var(--space-2)">Rail honesty — three treatments (argued within the manual)</h3>
+          <div class="rail-variants">
+            <div>
+              <span class="lbl">Built · active</span>
+              <div class="mini-rail"><a class="rail-item" href="#" aria-current="page"><svg class="i"><use href="#ic-code"/></svg>Code</a></div>
+              <p style="font-size:var(--fs-caption);color:var(--text-subtle);max-width:16ch;text-align:center;margin:var(--space-1) auto 0">--surface-hover fill + --text-primary (R1). No accent bar.</p>
+            </div>
+            <div>
+              <span class="lbl">Built · inactive</span>
+              <div class="mini-rail"><a class="rail-item" href="#"><svg class="i"><use href="#ic-code"/></svg>Code</a></div>
+              <p style="font-size:var(--fs-caption);color:var(--text-subtle);max-width:16ch;text-align:center;margin:var(--space-1) auto 0">--text-muted, no dot.</p>
+            </div>
+            <div>
+              <span class="lbl">Unbuilt · "soon"</span>
+              <div class="mini-rail"><a class="rail-item soon" href="#" title="coming soon"><span class="soon-dot"></span><svg class="i"><use href="#ic-issues"/></svg>Issues</a></div>
+              <p style="font-size:var(--fs-caption);color:var(--text-subtle);max-width:18ch;text-align:center;margin:var(--space-1) auto 0">--text-subtle + neutral dot + title tooltip. Never disabled (P3 keyboard), never accent (rationed).</p>
+            </div>
+          </div>
+          <p style="color:var(--text-subtle);font-size:var(--fs-caption);margin-block-start:var(--space-3)">
+            Honesty rails: the dot/tooltip <em>state the truth</em> (not yet built) without lying or shouting — the
+            destination is still reachable and lands on a teaching NotAvailable, not a dead end. The marker is a
+            neutral dot, not a saturated fill (status-not-by-colour), and not the rationed accent.
+          </p>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>

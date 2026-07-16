@@ -1,0 +1,292 @@
+<!-- R3.5 first-run · SKETCH 3/4 · The moment after first push — repo appears (SSE/refresh) + the HONEST CI floor.
+     /ci is NOT built: checks render from the real PrChecksVM projection as "waiting for a report"; the run-detail
+     surface is a dignified NotAvailable (no fabricated pipeline, no fake green). Links ../tokens.css. Direction A. -->
+<title>acme/api · Code · Myelin — post-first-push sketch</title>
+<link rel="stylesheet" href="../tokens.css" />
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{font-family:var(--font-sans);font-size:var(--fs-body);line-height:var(--lh-body);
+    background:var(--surface);color:var(--text-primary);-webkit-font-smoothing:antialiased}
+  .icon{width:1.25em;height:1.25em;display:inline-block;vertical-align:-0.18em;flex:none}
+  .mono{font-family:var(--font-mono)}
+  .muted{color:var(--text-muted)}
+  .subtle{color:var(--text-subtle)}
+  .small{font-size:var(--fs-caption)}
+  .vh{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+    clip:rect(0 0 0 0);white-space:nowrap;border:0}
+  .skip-link{position:absolute;inset-inline-start:var(--space-2);inset-block-start:-4rem;
+    background:var(--surface-overlay);color:var(--text-primary);padding:var(--space-2) var(--space-3);
+    border:var(--hairline) solid var(--border-strong);border-radius:var(--radius-1);z-index:var(--z-toast);
+    text-decoration:none;transition:inset-block-start var(--dur-fast) var(--ease-standard)}
+  .skip-link:focus{inset-block-start:var(--space-2)}
+
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--space-2);
+    padding:var(--space-2) var(--space-3);border:var(--hairline) solid var(--border-strong);
+    border-radius:var(--radius-1);background:var(--surface);color:var(--text-primary);
+    font:inherit;font-weight:var(--weight-medium);cursor:pointer;text-decoration:none;
+    transition:background var(--dur-fast) var(--ease-standard)}
+  .btn:hover{background:var(--surface-hover)}
+  .btn-sm{padding:var(--space-1) var(--space-2);font-size:var(--fs-body-sm)}
+  .btn[aria-disabled="true"]{cursor:not-allowed;color:var(--text-subtle);background:var(--surface);border-color:var(--border)}
+  .btn[aria-disabled="true"]:hover{background:var(--surface)}
+
+  .shell{display:grid;grid-template-columns:auto 1fr;grid-template-rows:auto 1fr;
+    height:100vh;height:100dvh;min-height:0;overflow:hidden}
+  .topbar{grid-column:1 / 3;display:flex;align-items:center;gap:var(--space-3);
+    padding:var(--space-2) var(--space-3);border-block-end:var(--hairline) solid var(--border);
+    background:var(--surface-raised);z-index:var(--z-chrome)}
+  .brand{font-size:var(--fs-h3);font-weight:var(--weight-semibold);letter-spacing:.02em}
+  .omnibox{display:flex;align-items:center;gap:var(--space-2);flex:1;max-width:28rem;
+    padding:var(--space-2) var(--space-3);border:var(--hairline) solid var(--border);
+    border-radius:var(--radius-1);background:var(--surface);color:var(--text-muted);cursor:pointer;
+    text-align:start;font:inherit;transition:background var(--dur-fast) var(--ease-standard)}
+  .omnibox:hover{background:var(--surface-hover)}
+  .omnibox kbd{font-family:var(--font-mono);font-size:var(--fs-caption);color:var(--text-subtle)}
+  .spacer{flex:1}
+  .residency{display:inline-flex;align-items:center;gap:var(--space-1);padding:var(--space-1) var(--space-2);
+    border:var(--hairline) solid var(--border);border-radius:var(--radius-pill);color:var(--text-muted);font-size:var(--fs-caption)}
+  .residency strong{color:var(--text-primary);font-weight:var(--weight-medium)}
+  .iconbtn{display:inline-flex;align-items:center;gap:var(--space-1);padding:var(--space-2);
+    border:var(--hairline) solid var(--border);border-radius:var(--radius-1);background:var(--surface);
+    color:var(--text-primary);cursor:pointer;font:inherit;transition:background var(--dur-fast) var(--ease-standard)}
+  .iconbtn:hover{background:var(--surface-hover)}
+  .identity{display:inline-flex;align-items:center;gap:var(--space-2);padding:var(--space-2) var(--space-3);
+    border:var(--hairline) solid var(--border);border-radius:var(--radius-1);background:var(--surface);
+    color:var(--text-primary);cursor:pointer;font:inherit}
+  .identity:hover{background:var(--surface-hover)}
+
+  .rail{grid-row:2;display:flex;flex-direction:column;gap:var(--space-1);padding:var(--space-2);
+    border-inline-end:var(--hairline) solid var(--border);background:var(--surface-raised)}
+  .rail-item{position:relative;display:flex;align-items:center;justify-content:center;width:2.25rem;height:2.25rem;
+    border-radius:var(--radius-1);color:var(--text-muted);background:transparent;text-decoration:none;
+    transition:background var(--dur-fast) var(--ease-standard),color var(--dur-fast) var(--ease-standard)}
+  .rail-item:hover{background:var(--surface-hover);color:var(--text-primary)}
+  .rail-item[aria-current="page"]{background:var(--surface-hover);color:var(--text-primary)}
+  .rail-item[aria-current="page"] .icon{color:var(--accent)}
+  .rail-item[data-unavailable]{color:var(--text-subtle)}
+  .rail-item[data-unavailable]:hover{background:var(--surface-hover);color:var(--text-muted)}
+  .rail-item[data-unavailable]::after{content:"";position:absolute;inset-block-start:5px;inset-inline-end:5px;width:4px;height:4px;background:var(--border-strong)}
+
+  .body{grid-row:2;display:grid;grid-template-columns:1fr;min-height:0;min-width:0}
+  .main{min-height:0;min-width:0;overflow:auto;padding:var(--space-6)}
+  .content{max-width:60rem;margin:0 auto;display:flex;flex-direction:column;gap:var(--space-5)}
+  h1{font-size:var(--fs-h1);margin:0}
+  h2{font-size:var(--fs-h3);margin:0}
+
+  .list-head{display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap}
+  .live{display:inline-flex;align-items:center;gap:var(--space-2);font-size:var(--fs-caption);color:var(--text-muted)}
+  .live-dot{width:8px;height:8px;background:var(--success);flex:none}
+  .live-dot.stale{background:var(--warning)}
+
+  .repo-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:var(--space-2)}
+  .repo-row{border:var(--hairline) solid var(--border);border-radius:var(--radius-1);
+    background:var(--surface-raised);padding:var(--space-3);display:flex;flex-direction:column;gap:var(--space-1)}
+  .repo-row.fresh{border-color:var(--border-strong)}
+  .repo-link{display:flex;align-items:center;gap:var(--space-2);color:var(--text-primary);text-decoration:none}
+  .repo-link:hover{text-decoration:underline}
+  .repo-meta{display:flex;gap:var(--space-3);align-items:center;color:var(--text-subtle);font-size:var(--fs-caption);flex-wrap:wrap}
+  .badge-new{display:inline-flex;align-items:center;gap:var(--space-1);font-size:var(--fs-caption);
+    color:var(--text-primary);border:var(--hairline) solid var(--border-strong);border-radius:var(--radius-1);padding:0 var(--space-1)}
+
+  .card{border:var(--hairline) solid var(--border);border-radius:var(--radius-2);background:var(--surface-raised);padding:var(--space-4);
+    display:flex;flex-direction:column;gap:var(--space-3)}
+  .pr-head{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap}
+  .pill{display:inline-flex;align-items:center;gap:var(--space-1);padding:var(--space-1) var(--space-2);
+    border:var(--hairline) solid var(--border-strong);border-radius:var(--radius-pill);font-size:var(--fs-caption)}
+  .checks{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:var(--space-1)}
+  .check{display:flex;align-items:center;gap:var(--space-2);padding:var(--space-2);
+    border:var(--hairline) solid var(--border);border-radius:var(--radius-1);background:var(--surface)}
+  .check .ctx{font-family:var(--font-mono);font-size:var(--fs-code)}
+  .check .status{margin-inline-start:auto;display:inline-flex;align-items:center;gap:var(--space-1);font-size:var(--fs-caption)}
+  .s-pending{color:var(--warning)}
+  .s-pass{color:var(--success)}
+  .gate-row{display:flex;align-items:center;gap:var(--space-2);padding:var(--space-3);
+    border:var(--hairline) solid var(--warning);border-radius:var(--radius-1);background:var(--warning-subtle);color:var(--text-primary)}
+
+  .notavail{display:flex;gap:var(--space-2);align-items:flex-start;padding:var(--space-3);
+    border:var(--hairline) solid var(--border);border-radius:var(--radius-1);background:var(--surface);color:var(--text-muted)}
+  .notavail .icon{margin-block-start:2px;color:var(--text-subtle)}
+
+  .variant-label{font-size:var(--fs-caption);color:var(--text-subtle);text-transform:uppercase;letter-spacing:.06em;
+    border-block-start:var(--hairline) solid var(--border);padding-block-start:var(--space-2)}
+  .sketch-tools{position:fixed;inset-block-start:var(--space-2);inset-inline-end:var(--space-2);display:flex;gap:var(--space-1);
+    z-index:var(--z-toast);background:var(--surface-overlay);border:var(--hairline) solid var(--border);border-radius:var(--radius-1);padding:var(--space-1)}
+  .sketch-tools button{font:inherit;font-size:var(--fs-caption);padding:2px var(--space-2);border:var(--hairline) solid var(--border);
+    border-radius:var(--radius-1);background:var(--surface);color:var(--text-muted);cursor:pointer}
+  .sketch-tools button:hover{background:var(--surface-hover);color:var(--text-primary)}
+  @media print{.sketch-tools{display:none}}
+</style>
+
+<svg class="vh" aria-hidden="true"><defs>
+  <symbol id="i-nav-code" viewBox="0 0 24 24"> <path d="M9 7 L4 12 L9 17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M15 7 L20 12 L15 17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-nav-issues" viewBox="0 0 24 24"> <path d="M12 3 C16.9706 3, 21 7.02944, 21 12 C21 16.9706, 16.9706 21, 12 21 C7.02944 21, 3 16.9706, 3 12 C3 7.02944, 7.02944 3, 12 3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M12 10 C13.1046 10, 14 10.8954, 14 12 C14 13.1046, 13.1046 14, 12 14 C10.8954 14, 10 13.1046, 10 12 C10 10.8954, 10.8954 10, 12 10Z" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-nav-chat" viewBox="0 0 24 24"> <path d="M11 4.83333 C11 4.3731, 11.4197 4, 11.9375 4 L19.0625 4 C19.5803 4, 20 4.3731, 20 4.83333 L20 11.1667 C20 11.6269, 19.5803 12, 19.0625 12 L11.9375 12 C11.4197 12, 11 11.6269, 11 11.1667Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M4 9.83333 C4 9.3731, 4.51301 9, 5.14583 9 L13.8542 9 C14.487 9, 15 9.3731, 15 9.83333 L15 16.1667 C15 16.6269, 14.487 17, 13.8542 17 L5.14583 17 C4.51301 17, 4 16.6269, 4 16.1667Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M7 17 L6 20 L10 17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-nav-ci" viewBox="0 0 24 24"> <path d="M12 3 C16.9706 3, 21 7.02944, 21 12 C21 16.9706, 16.9706 21, 12 21 C7.02944 21, 3 16.9706, 3 12 C3 7.02944, 7.02944 3, 12 3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M10 8 L16 12 L10 16Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-nav-knowledge" viewBox="0 0 24 24"> <path d="M12 5 L12 19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M12 5 L7 4 L4 5 L4 18 L7 17 L12 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M12 5 L17 4 L20 5 L20 18 L17 17 L12 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-inbox" viewBox="0 0 24 24"> <path d="M4 4 L4 15 L8 15 L9 18 L15 18 L16 15 L20 15 L20 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M4 15 L9 15 L10 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"> <path d="M10 4 C13.3137 4, 16 6.68629, 16 10 C16 13.3137, 13.3137 16, 10 16 C6.68629 16, 4 13.3137, 4 10 C4 6.68629, 6.68629 4, 10 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M15 15 L20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-human" viewBox="0 0 24 24"> <path d="M12 4 C14.2091 4, 16 5.79086, 16 8 C16 10.2091, 14.2091 12, 12 12 C9.79086 12, 8 10.2091, 8 8 C8 5.79086, 9.79086 4, 12 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M5 20 L5 17 L9 14 L15 14 L19 17 L19 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"> <path d="M9 5 L16 12 L9 19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"> <path d="M12 4 C15.866 4, 19 5.11929, 19 6.5 C19 7.88071, 15.866 9, 12 9 C8.13401 9, 5 7.88071, 5 6.5 C5 5.11929, 8.13401 4, 12 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M19 6.5 L19 17.5 A7 2.5 0 0 1 5 17.5 L5 6.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M19 10.5 A7 2.5 0 0 1 5 10.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M19 14 A7 2.5 0 0 1 5 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-repo" viewBox="0 0 24 24"> <path d="M5 3.75 C5 3.33579, 5.26117 3, 5.58333 3 L18.4167 3 C18.7388 3, 19 3.33579, 19 3.75 L19 20.25 C19 20.6642, 18.7388 21, 18.4167 21 L5.58333 21 C5.26117 21, 5 20.6642, 5 20.25Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M9 3 L9 21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M13 7 L16 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"> <path d="M9 12 L15 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M10 16 A6 4 0 0 1 10 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M14 8 A6 4 0 0 1 14 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-gate" viewBox="0 0 24 24"> <path d="M5 11.75 C5 11.3358, 5.52233 11, 6.16667 11 L17.8333 11 C18.4777 11, 19 11.3358, 19 11.75 L19 19.25 C19 19.6642, 18.4777 20, 17.8333 20 L6.16667 20 C5.52233 20, 5 19.6642, 5 19.25Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M8 11 L8 9 A4 4 0 0 1 16 9 L16 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-pull-request" viewBox="0 0 24 24"> <path d="M7 8 L7 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M17 8 L17 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M14 11 L17 8 L20 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M7 4 C8.65685 4, 10 5.34315, 10 7 C10 8.65685, 8.65685 10, 7 10 C5.34315 10, 4 8.65685, 4 7 C4 5.34315, 5.34315 4, 7 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M7 14 C8.65685 14, 10 15.3431, 10 17 C10 18.6569, 8.65685 20, 7 20 C5.34315 20, 4 18.6569, 4 17 C4 15.3431, 5.34315 14, 7 14Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M17 14 C18.6569 14, 20 15.3431, 20 17 C20 18.6569, 18.6569 20, 17 20 C15.3431 20, 14 18.6569, 14 17 C14 15.3431, 15.3431 14, 17 14Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-check-pass" viewBox="0 0 24 24"> <path d="M12 4 C16.4183 4, 20 7.58172, 20 12 C20 16.4183, 16.4183 20, 12 20 C7.58172 20, 4 16.4183, 4 12 C4 7.58172, 7.58172 4, 12 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M8 12 L11 15 L16 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-check-pending" viewBox="0 0 24 24"> <path d="M12 4 C16.4183 4, 20 7.58172, 20 12 C20 16.4183, 16.4183 20, 12 20 C7.58172 20, 4 16.4183, 4 12 C4 7.58172, 7.58172 4, 12 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M12 8 L12 12 L15 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-approve" viewBox="0 0 24 24"> <path d="M5 13 L10 18 L19 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-branch" viewBox="0 0 24 24"> <path d="M7 7 L7 17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M7 12 A11 11 0 0 1 17 10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M7 4 C8.65685 4, 10 5.34315, 10 7 C10 8.65685, 8.65685 10, 7 10 C5.34315 10, 4 8.65685, 4 7 C4 5.34315, 5.34315 4, 7 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M7 14 C8.65685 14, 10 15.3431, 10 17 C10 18.6569, 8.65685 20, 7 20 C5.34315 20, 4 18.6569, 4 17 C4 15.3431, 5.34315 14, 7 14Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M17 4 C18.6569 4, 20 5.34315, 20 7 C20 8.65685, 18.6569 10, 17 10 C15.3431 10, 14 8.65685, 14 7 C14 5.34315, 15.3431 4, 17 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+</defs></svg>
+
+<div class="sketch-tools" role="group" aria-label="Sketch controls (not part of the product)">
+  <button type="button" data-theme-set="dark">dark</button>
+  <button type="button" data-theme-set="light">light</button>
+  <button type="button" data-theme-set="high-contrast">HC</button>
+  <button type="button" data-dir-toggle>dir</button>
+</div>
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<div class="shell">
+  <header class="topbar" role="banner">
+    <span class="brand">Myelin</span>
+    <button type="button" class="omnibox" aria-keyshortcuts="Meta+K Control+K" aria-haspopup="dialog">
+      <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>
+      <span class="spacer" style="text-align:start">Search or run a command</span><kbd>⌘K</kbd>
+    </button>
+    <span class="spacer"></span>
+    <span class="residency" title="Tenant acme">
+      <svg class="icon" aria-hidden="true"><use href="#i-database"/></svg> Data region: <strong>EU-West</strong>
+    </span>
+    <!-- One unread now: a review request from the first PR. Badge is glyph+count, driven by real state. -->
+    <button type="button" class="iconbtn" aria-haspopup="dialog" aria-label="Inbox, 1 unread notification">
+      <svg class="icon" aria-hidden="true"><use href="#i-inbox"/></svg>
+      <span aria-hidden="true" class="badge-new">1</span>
+    </button>
+    <button type="button" class="identity" aria-haspopup="menu">
+      <svg class="icon" aria-hidden="true"><use href="#i-human"/></svg><span>Ada Osei</span>
+      <svg class="icon" aria-hidden="true"><use href="#i-chevron"/></svg>
+    </button>
+  </header>
+
+  <nav class="rail" aria-label="Surfaces">
+    <a class="rail-item" href="/git/repos" aria-current="page" aria-label="Code"><svg class="icon" aria-hidden="true"><use href="#i-nav-code"/></svg></a>
+    <a class="rail-item" href="/issues" data-unavailable aria-label="Issues — not available yet"><svg class="icon" aria-hidden="true"><use href="#i-nav-issues"/></svg></a>
+    <a class="rail-item" href="/chat" data-unavailable aria-label="Chat — not available yet"><svg class="icon" aria-hidden="true"><use href="#i-nav-chat"/></svg></a>
+    <a class="rail-item" href="/ci" data-unavailable aria-label="CI — not available yet"><svg class="icon" aria-hidden="true"><use href="#i-nav-ci"/></svg></a>
+    <a class="rail-item" href="/knowledge" data-unavailable aria-label="Knowledge — not available yet"><svg class="icon" aria-hidden="true"><use href="#i-nav-knowledge"/></svg></a>
+  </nav>
+
+  <div class="body">
+    <main id="main" class="main" tabindex="-1">
+      <div class="content">
+
+        <!-- ============ FRAME A · repos list, moments after first push (live-appeared) ============ -->
+        <div class="list-head">
+          <h1 id="repos-heading">Repositories</h1>
+          <span class="spacer"></span>
+          <!-- Live affordance: the list updates in place over SSE; glyph+label, never colour-alone. -->
+          <span class="live" role="status" data-testid="repos-live">
+            <span class="live-dot" aria-hidden="true"></span> Live · updated just now
+          </span>
+          <button type="button" class="btn btn-sm"><svg class="icon" aria-hidden="true"><use href="#i-search"/></svg> Refresh</button>
+        </div>
+
+        <ul class="repo-list" data-testid="repos-list">
+          <li class="repo-row fresh">
+            <a class="repo-link" href="/git/repos/api">
+              <svg class="icon" aria-hidden="true"><use href="#i-repo"/></svg>
+              <strong>acme/api</strong>
+              <span class="badge-new"><svg class="icon" aria-hidden="true"><use href="#i-approve"/></svg> New</span>
+            </a>
+            <span class="muted">Internal HTTP API for the acme platform.</span>
+            <span class="repo-meta">
+              <span><svg class="icon" aria-hidden="true"><use href="#i-branch"/></svg> main</span>
+              <span>Added just now · via push</span>
+              <code class="mono">https://git.eu.myelin.dev/acme/api.git</code>
+            </span>
+          </li>
+        </ul>
+
+        <!-- ============ STATE · live feed dropped (stale / reconnecting) — fails static ============ -->
+        <p class="variant-label">State · Live feed dropped (stale / reconnecting) — the list fails static, never blank</p>
+        <div class="list-head">
+          <span class="live" role="status">
+            <span class="live-dot stale" aria-hidden="true"></span> Reconnecting… last updated 12s ago
+          </span>
+          <button type="button" class="btn btn-sm"><svg class="icon" aria-hidden="true"><use href="#i-search"/></svg> Refresh now</button>
+        </div>
+
+        <!-- ============ FRAME B · first PR → Checks: THE HONEST CI FLOOR ============ -->
+        <p class="variant-label">First PR → Checks · the honest floor while /ci is not built</p>
+        <section class="card" aria-labelledby="pr-head">
+          <div class="pr-head" id="pr-head">
+            <svg class="icon" aria-hidden="true"><use href="#i-pull-request"/></svg>
+            <strong>#1 · Add request-scoped auth guard</strong>
+            <span class="pill"><svg class="icon" aria-hidden="true"><use href="#i-pull-request"/></svg> Open</span>
+            <span class="pill"><svg class="icon" aria-hidden="true"><use href="#i-branch"/></svg> add-authz → main</span>
+          </div>
+
+          <div>
+            <h2 id="checks-h">Checks <span class="subtle small">(2 required)</span></h2>
+            <!-- Rows render from PrChecksVM.required_contexts. None are in green_contexts yet, so each is
+                 honestly "waiting for a report" — a real pending CI verdict (ring is legitimate here). -->
+            <ul class="checks" aria-labelledby="checks-h">
+              <li class="check">
+                <svg class="icon s-pending" aria-hidden="true"><use href="#i-check-pending"/></svg>
+                <span class="ctx">ci/build</span>
+                <span class="status s-pending">Waiting for a report</span>
+              </li>
+              <li class="check">
+                <svg class="icon s-pending" aria-hidden="true"><use href="#i-check-pending"/></svg>
+                <span class="ctx">ci/test</span>
+                <span class="status s-pending">Waiting for a report</span>
+              </li>
+            </ul>
+          </div>
+
+          <!-- Merge gate is AUTHORITATIVE from PrChecksVM.gate_admitted (the UI never recomputes policy). -->
+          <div class="gate-row" role="status">
+            <svg class="icon" aria-hidden="true"><use href="#i-gate"/></svg>
+            <span><strong>Merge blocked</strong> — the required checks haven't reported yet.</span>
+          </div>
+          <!-- i18n expansion test: the same gate string for a de-DE viewer (labels grow ~+35%). -->
+          <p class="small subtle" lang="de" style="margin:0">
+            de-DE: <strong>Zusammenführen blockiert</strong> — die erforderlichen Prüfungen wurden noch nicht gemeldet.
+          </p>
+
+          <!-- The honest CI floor: no run to link to. NotAvailable, not a fabricated pipeline. -->
+          <div class="notavail" role="note" data-testid="ci-not-available">
+            <svg class="icon" aria-hidden="true"><use href="#i-nav-ci"/></svg>
+            <div>
+              <div style="color:var(--text-primary);font-weight:var(--weight-medium)">CI runs aren't available yet</div>
+              <p style="margin:var(--space-1) 0 0">
+                No CI provider is connected to this tenant, so there's no run to open. When a provider reports a
+                status for <code class="mono">ci/build</code> or <code class="mono">ci/test</code>, that check and
+                the merge gate above update here automatically. Myelin won't show a run that isn't real.
+              </p>
+              <button type="button" class="btn btn-sm" aria-disabled="true" style="margin-block-start:var(--space-2)">
+                <svg class="icon" aria-hidden="true"><use href="#i-external-link"/></svg> View run · not available
+              </button>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </main>
+  </div>
+</div>
+
+<svg class="vh" aria-hidden="true"><defs>
+  <symbol id="i-external-link" viewBox="0 0 24 24"> <path d="M12 5 L5 5 L5 19 L19 19 L19 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M13 5 L19 5 L19 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M19 5 L11 13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+</defs></svg>
+
+<script>
+  for (const b of document.querySelectorAll("[data-theme-set]"))
+    b.addEventListener("click", () => document.documentElement.setAttribute("data-theme", b.dataset.themeSet));
+  document.querySelector("[data-dir-toggle]").addEventListener("click", () => {
+    const el = document.documentElement;
+    el.setAttribute("dir", el.getAttribute("dir") === "rtl" ? "ltr" : "rtl");
+  });
+</script>

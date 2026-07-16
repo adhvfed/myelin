@@ -1,0 +1,176 @@
+<title>Commit log — myelin · R3 sketch</title>
+<link rel="stylesheet" href="../tokens.css" />
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--surface);color:var(--text-primary);font-family:var(--font-sans);font-size:var(--fs-body);line-height:var(--lh-body);-webkit-font-smoothing:antialiased}
+  .mono,code{font-family:var(--font-mono)}
+  a{color:inherit;text-decoration:none}
+  .app{display:grid;grid-template-rows:auto 1fr;height:100dvh}
+  .hdr{display:flex;align-items:center;gap:var(--space-3);height:var(--space-7);padding-inline:var(--space-3);border-block-end:var(--hairline) solid var(--border);background:var(--surface-raised)}
+  .brand{display:flex;align-items:center;gap:var(--space-2);font-weight:var(--weight-semibold)}
+  .kbar{display:flex;align-items:center;gap:var(--space-2);flex:1;max-width:420px;padding:var(--space-1) var(--space-2);border:var(--hairline) solid var(--border);border-radius:var(--radius-1);color:var(--text-subtle);background:var(--surface);cursor:text}
+  .kbar kbd{margin-inline-start:auto;font-family:var(--font-mono);font-size:var(--fs-caption);color:var(--text-subtle);border:var(--hairline) solid var(--border);border-radius:var(--radius-1);padding:0 var(--space-1)}
+  .hdr-right{margin-inline-start:auto;display:flex;align-items:center;gap:var(--space-2)}
+  .icon-btn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:var(--hairline) solid transparent;border-radius:var(--radius-1);background:none;color:var(--text-muted);cursor:pointer}
+  .icon-btn:hover{background:var(--surface-hover);color:var(--text-primary)}
+  .body{display:grid;grid-template-columns:var(--space-7) 1fr;min-height:0}
+  .rail{display:flex;flex-direction:column;align-items:center;gap:var(--space-1);padding-block:var(--space-2);border-inline-end:var(--hairline) solid var(--border);background:var(--surface-raised)}
+  .rail-item{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;width:40px;height:44px;border:none;border-radius:var(--radius-1);background:none;color:var(--text-muted);cursor:pointer;font-size:9px}
+  .rail-item:hover{background:var(--surface-hover);color:var(--text-primary)}
+  .rail-item[aria-current="page"]{background:var(--surface-hover);color:var(--text-primary)}
+  .rail-item.soon{color:var(--text-subtle)}
+  .rail-item .soon-dot{position:absolute;top:4px;inset-inline-end:5px;width:5px;height:5px;border-radius:var(--radius-pill);background:var(--text-subtle)}
+  .main{min-height:0;overflow:auto;padding:var(--space-5)}
+  .wrap{max-width:1080px;margin:0 auto;display:flex;flex-direction:column;gap:var(--space-4)}
+  svg.i{width:20px;height:20px;stroke:currentColor;stroke-width:1.6;fill:none;stroke-linecap:round;stroke-linejoin:round;flex:none}
+  svg.i.sm{width:16px;height:16px}
+  svg.i.lg{width:24px;height:24px}
+  .crumbs{display:flex;align-items:center;gap:var(--space-1);flex-wrap:wrap;font-size:var(--fs-body-sm);color:var(--text-muted)}
+  .crumbs a:hover{color:var(--text-primary);text-decoration:underline}
+  .crumbs .sep{color:var(--text-subtle)}
+  .crumbs [aria-current]{color:var(--text-primary);font-weight:var(--weight-medium)}
+  .crumbs .refpill{display:inline-flex;align-items:center;gap:4px;border:var(--hairline) solid var(--border);border-radius:var(--radius-1);padding:0 var(--space-1)}
+  h1.title{font-size:var(--fs-h1);margin:0;display:flex;align-items:center;gap:var(--space-2)}
+  h1.title .ref{color:var(--text-subtle);font-size:var(--fs-body-sm)}
+  .btn{display:inline-flex;align-items:center;gap:var(--space-1);height:var(--control-h);padding-inline:var(--space-2);border:var(--hairline) solid var(--border-strong);border-radius:var(--radius-1);background:var(--surface-raised);color:var(--text-primary);font:inherit;font-size:var(--fs-body-sm);cursor:pointer}
+  .btn:hover{background:var(--surface-hover)}
+  .btn[aria-disabled="true"]{color:var(--text-subtle);border-color:var(--border);cursor:default;background:var(--surface)}
+  .log{list-style:none;margin:0;padding:0;border:var(--hairline) solid var(--border);border-radius:var(--radius-1);background:var(--surface-raised)}
+  .log li{display:flex;flex-direction:column;gap:2px;padding:var(--space-3);border-block-start:var(--hairline) solid var(--border)}
+  .log li:first-child{border-block-start:none}
+  .log li:hover{background:var(--surface-hover)}
+  .row1{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap}
+  .row1 a.oid{font-family:var(--font-mono);color:var(--info);text-decoration:underline}
+  .row1 strong{font-weight:var(--weight-medium)}
+  .badge{display:inline-flex;align-items:center;gap:4px;font-size:var(--fs-caption);color:var(--text-muted);border:var(--hairline) solid var(--border);border-radius:var(--radius-1);padding:0 var(--space-1)}
+  .badge.ok{color:var(--success)}
+  .sub{color:var(--text-subtle);font-size:var(--fs-caption)}
+  /* pager with position feedback */
+  .pager{display:flex;align-items:center;gap:var(--space-2)}
+  .pager .pos{margin-inline:auto;color:var(--text-subtle);font-size:var(--fs-body-sm)}
+  .daygroup{font-size:var(--fs-caption);color:var(--text-subtle);text-transform:uppercase;letter-spacing:.04em;margin:var(--space-2) 0 0}
+  .lbl{display:inline-block;font-size:var(--fs-caption);color:var(--text-subtle);margin-block-end:var(--space-1)}
+  .state-strip{border-block-start:var(--hairline) dashed var(--border-strong);padding-block-start:var(--space-4);margin-block-start:var(--space-2)}
+  .state-strip h3{font-size:var(--fs-body-sm);color:var(--text-subtle);text-transform:uppercase;letter-spacing:.05em;margin:0 0 var(--space-2)}
+  .sk{background:var(--surface-hover);border-radius:var(--radius-1);height:12px}
+  .empty{padding:var(--space-5);text-align:center;color:var(--text-muted)}
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="ic-code" viewBox="0 0 24 24"><polyline points="9 8 5 12 9 16"/><polyline points="15 8 19 12 15 16"/></symbol>
+  <symbol id="ic-issues" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><line x1="12" y1="8" x2="12" y2="12"/><circle cx="12" cy="16" r=".6"/></symbol>
+  <symbol id="ic-chat" viewBox="0 0 24 24"><path d="M4 5h16v11H9l-4 4z"/></symbol>
+  <symbol id="ic-ci" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><polyline points="12 7 12 12 16 14"/></symbol>
+  <symbol id="ic-knowledge" viewBox="0 0 24 24"><path d="M5 4h9a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3z"/><line x1="9" y1="9" x2="14" y2="9"/></symbol>
+  <symbol id="ic-branch" viewBox="0 0 24 24"><circle cx="7" cy="6" r="2"/><circle cx="7" cy="18" r="2"/><circle cx="17" cy="8" r="2"/><path d="M7 8v8M17 10c0 4-3 4-6 5"/></symbol>
+  <symbol id="ic-chevron" viewBox="0 0 24 24"><polyline points="9 6 15 12 9 18"/></symbol>
+  <symbol id="ic-commit" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.5"/><line x1="4" y1="12" x2="8.5" y2="12"/><line x1="15.5" y1="12" x2="20" y2="12"/></symbol>
+  <symbol id="ic-merge" viewBox="0 0 24 24"><circle cx="7" cy="6" r="2"/><circle cx="7" cy="18" r="2"/><circle cx="17" cy="9" r="2"/><path d="M7 8v8M17 11c0 4-4 4-10 5"/></symbol>
+  <symbol id="ic-check-pass" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><polyline points="8.5 12 11 14.5 15.5 9.5"/></symbol>
+  <symbol id="ic-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><line x1="16" y1="16" x2="20" y2="20"/></symbol>
+  <symbol id="ic-inbox" viewBox="0 0 24 24"><path d="M4 5h16v14H4z"/><path d="M4 14h4l1 2h6l1-2h4"/></symbol>
+  <symbol id="ic-human" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3"/><path d="M5 20a7 7 0 0 1 14 0"/></symbol>
+</svg>
+
+<div class="app">
+  <header class="hdr">
+    <span class="brand"><svg class="i lg"><use href="#ic-code"/></svg> Myelin</span>
+    <div class="kbar" role="button" tabindex="0"><svg class="i sm"><use href="#ic-search"/></svg> Search or run a command <kbd>⌘K</kbd></div>
+    <div class="hdr-right">
+      <button class="icon-btn" aria-label="Inbox"><svg class="i"><use href="#ic-inbox"/></svg></button>
+      <button class="icon-btn" aria-label="Account"><svg class="i"><use href="#ic-human"/></svg></button>
+    </div>
+  </header>
+  <div class="body">
+    <nav class="rail" aria-label="Primary">
+      <a class="rail-item" href="#" aria-current="page"><svg class="i"><use href="#ic-code"/></svg>Code</a>
+      <a class="rail-item soon" href="#" title="Issues — coming soon"><span class="soon-dot"></span><svg class="i"><use href="#ic-issues"/></svg>Issues</a>
+      <a class="rail-item soon" href="#" title="Chat — coming soon"><span class="soon-dot"></span><svg class="i"><use href="#ic-chat"/></svg>Chat</a>
+      <a class="rail-item soon" href="#" title="CI — coming soon"><span class="soon-dot"></span><svg class="i"><use href="#ic-ci"/></svg>CI</a>
+      <a class="rail-item soon" href="#" title="Knowledge — coming soon"><span class="soon-dot"></span><svg class="i"><use href="#ic-knowledge"/></svg>Wissen</a>
+    </nav>
+
+    <main class="main">
+      <div class="wrap">
+        <span class="lbl">STATE · populated · page 2 (G-3 commit log) — ref carried from r3-git-ux, NOT hardcoded main</span>
+
+        <!-- breadcrumb KEEPS the ref you came from (default_branch is a VM field, not literal 'main') -->
+        <nav class="crumbs" aria-label="Breadcrumb">
+          <a href="#">Repositories</a><span class="sep">/</span>
+          <a href="#">myelin</a><span class="sep">/</span>
+          <span class="refpill"><svg class="i sm"><use href="#ic-branch"/></svg><a href="#" class="mono">r3-git-ux</a></span><span class="sep">/</span>
+          <span aria-current="page">Commits</span>
+        </nav>
+
+        <div style="display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap">
+          <h1 class="title"><svg class="i lg"><use href="#ic-commit"/></svg> Commits <span class="ref">auf <span class="mono">r3-git-ux</span></span></h1>
+          <button class="btn" style="margin-inline-start:auto" aria-haspopup="listbox" aria-expanded="false" aria-label="Verzweigung wechseln">
+            <svg class="i sm"><use href="#ic-branch"/></svg> <span class="mono">r3-git-ux</span> <svg class="i sm"><use href="#ic-chevron"/></svg>
+          </button>
+        </div>
+
+        <ol class="log" aria-label="Commit log">
+          <li>
+            <div class="row1"><a class="oid" href="#">6fd7e3a</a><strong>R2 COMPLETE — EXITED: all 10 items + blocker fix merged</strong>
+              <span class="badge ok"><svg class="i sm"><use href="#ic-check-pass"/></svg> signed</span></div>
+            <div class="sub">a4d…helvik · 16 Jul 2026, 03:41</div>
+          </li>
+          <li>
+            <div class="row1"><a class="oid" href="#">e698b2d</a><strong>R2-exit blocker fix (re-applied on R2.1): ProtectedPush ruleset</strong></div>
+            <div class="sub">a4d…helvik · 16 Jul 2026, 01:12</div>
+          </li>
+          <li>
+            <div class="row1"><a class="oid" href="#">27b4a02</a><strong>R2-exit blocker fix: CI-report is a Service-producer capability</strong>
+              <span class="badge"><svg class="i sm"><use href="#ic-merge"/></svg> merge</span></div>
+            <div class="sub">c1b…jordan · 15 Jul 2026, 22:58</div>
+          </li>
+          <li>
+            <div class="row1"><a class="oid" href="#">787665e</a><strong>R2 exit red-team: MCP/SSE/search PASS; edge+wire found 1 HIGH blocker</strong></div>
+            <div class="sub">a4d…helvik · 15 Jul 2026, 20:04</div>
+          </li>
+          <li>
+            <div class="row1"><a class="oid" href="#">e80cf59</a><strong>R2 ledger: all 10 items merged; scanner TRUE ZERO</strong>
+              <span class="badge ok"><svg class="i sm"><use href="#ic-check-pass"/></svg> signed</span></div>
+            <div class="sub">a4d…helvik · 15 Jul 2026, 18:22</div>
+          </li>
+        </ol>
+
+        <!-- bidirectional pager WITH position feedback -->
+        <nav class="pager" aria-label="Commit log pagination">
+          <a class="btn" href="#" rel="prev"><svg class="i sm" style="transform:rotate(180deg)"><use href="#ic-chevron"/></svg> Neuere</a>
+          <span class="pos" aria-live="polite">Commits 31–60 · Seite 2</span>
+          <a class="btn" href="#" rel="next">Ältere <svg class="i sm"><use href="#ic-chevron"/></svg></a>
+        </nav>
+
+        <!-- other states -->
+        <div class="state-strip">
+          <h3>First page (no Newer) · empty · skeleton</h3>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-5);align-items:start">
+            <div>
+              <span class="lbl">Page 1 — "Newer" disabled (honest boundary)</span>
+              <nav class="pager" aria-label="Pagination (first page)" style="border:var(--hairline) solid var(--border);border-radius:var(--radius-1);padding:var(--space-2)">
+                <span class="btn" aria-disabled="true"><svg class="i sm" style="transform:rotate(180deg)"><use href="#ic-chevron"/></svg> Neuere</span>
+                <span class="pos">Commits 1–30 · Seite 1</span>
+                <a class="btn" href="#">Ältere <svg class="i sm"><use href="#ic-chevron"/></svg></a>
+              </nav>
+              <span class="lbl" style="margin-block-start:var(--space-4)">Empty ref</span>
+              <div class="log"><div class="empty">No commits on this ref yet.</div></div>
+            </div>
+            <div>
+              <span class="lbl">Skeleton (aria-busy; row structure preserved)</span>
+              <div class="log" aria-busy="true">
+                <li><div class="sk" style="width:60%"></div><div class="sk" style="width:30%;margin-block-start:6px"></div></li>
+                <li><div class="sk" style="width:52%"></div><div class="sk" style="width:28%;margin-block-start:6px"></div></li>
+                <li><div class="sk" style="width:66%"></div><div class="sk" style="width:32%;margin-block-start:6px"></div></li>
+              </div>
+            </div>
+          </div>
+          <p style="color:var(--text-subtle);font-size:var(--fs-caption);margin-block-start:var(--space-3)">
+            no-access · not-found · error → shared trio in
+            <a href="sketch-error-states.html" style="color:var(--info);text-decoration:underline">sketch-error-states.html</a>.
+          </p>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
