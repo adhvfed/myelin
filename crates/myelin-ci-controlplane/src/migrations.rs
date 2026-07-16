@@ -99,6 +99,15 @@ pub const SECRET_BINDING_TABLE: &str = "secret_binding";
 /// markup_minor_units, kind`). Before the rename `CREATE TABLE IF NOT EXISTS cost_event` would no-op
 /// against whichever applied first, silently leaving the other's INSERT to fail on missing columns.
 pub const CI_COST_EVENT_TABLE: &str = "ci_cost_event";
+/// CT-004d.1 — the durable `JobSpec` store table. One row per DISPATCHED stage job: the
+/// digest-pinned [`myelin_ci_sandbox::JobSpec`] (image/command/egress/limits/trust/workspace/run-token/
+/// meter/idem) the runner resolves + EXECUTES, keyed by the `(tenant_id, job_id)` the leased
+/// `job_queue` row carries. The spec round-trips faithfully as a single `jsonb` column (the whole
+/// serde value — every field, no lossy column projection), co-persisted with the `job_queue` row on
+/// the dispatch's shared `idem_token`. NAMED distinct from every other CI table; single-owner (the
+/// control-plane dispatch writes it, the control-plane runner reads it) so it lives ONLY in the full
+/// [`ci_controlplane_migrations`] set, NOT the shared writer subset (the SAME posture as `job_queue`).
+pub const CI_JOB_SPEC_TABLE: &str = "ci_job_spec";
 
 /// The scheduler index names (arch 01 §3.3 — the hot-path claim surface). The behaviour (the
 /// `FOR UPDATE SKIP LOCKED` claim) is CI-P12; the SHAPES land here so the claim has its indexes.
@@ -374,6 +383,24 @@ CREATE TABLE IF NOT EXISTS ci_cost_event (
   PRIMARY KEY (tenant_id, cost_id)
 )";
 
+/// `ci_job_spec` (CT-004d.1) — the durable `JobSpec` store. One row per dispatched stage job: the
+/// digest-pinned spec the runner resolves + executes, keyed `(tenant_id, job_id)` (the leased
+/// `job_queue` row's identity). The spec is a single `jsonb` column (the whole serde value — faithful
+/// round-trip of every field; the stored spec is what EXECUTES, so no lossy per-column projection).
+/// `run_id` + `idem_token` are carried alongside for co-keying with the `job_queue` enqueue (the
+/// dispatch writes BOTH rows in one tx on the shared `idem_token`). `(tenant, region)`-first + RLS-on
+/// like every CI table; NOT hot (insert-once-at-dispatch / read-once-at-claim, no claim-churn UPDATEs).
+pub const CREATE_CI_JOB_SPEC_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS ci_job_spec (
+  tenant_id  text  NOT NULL,
+  region     text  NOT NULL,
+  job_id     uuid  NOT NULL,
+  run_id     uuid  NOT NULL,
+  idem_token text  NOT NULL,
+  spec       jsonb NOT NULL,
+  PRIMARY KEY (tenant_id, job_id)
+)";
+
 /// Every CI Control-Plane CREATE-TABLE DDL paired with its table name + a stable migration id, in
 /// FK-dependency order (`ci_run` before `ci_job`). The `job_queue` create rides with its three
 /// indexes appended (an empty fresh table — no hot-table lock; the create is atomic). One ordered
@@ -455,6 +482,11 @@ fn create_statements() -> Vec<(&'static str, &'static str, String)> {
             CI_COST_EVENT_TABLE,
             CREATE_CI_COST_EVENT_DDL.to_string(),
         ),
+        (
+            "ci_0015_ci_job_spec",
+            CI_JOB_SPEC_TABLE,
+            CREATE_CI_JOB_SPEC_DDL.to_string(),
+        ),
     ]
 }
 
@@ -518,7 +550,7 @@ pub fn ci_controlplane_migrations() -> Migrations {
 /// [`CI_DURABLE_WRITER_IDS`]).
 ///
 /// **Why it exists.** The platform runs ONE shared `myelin` Postgres for every service (docs/
-/// dev-stack.md). ci-controlplane applies the full 14-table CI schema through its `serve(AppSpec)`
+/// dev-stack.md). ci-controlplane applies the full 15-table CI schema through its `serve(AppSpec)`
 /// migrate; ci-dispatch's `serve(AppSpec)` applies ONLY `consumer_dedup` — so before CT-004m,
 /// ci-dispatch's reserve/start `ci_run` write depended on ci-controlplane having booted first (a
 /// boot-order coupling). BOTH CI service mains now apply THIS set at boot (idempotent, advisory-locked,
@@ -561,11 +593,12 @@ pub fn ci_controlplane_hot_tables() -> HotTables {
 mod tests {
     use super::*;
 
-    /// **All fourteen CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
-    /// The complete arch 01 §3 control-plane schema lands here; `ci_run` precedes `ci_job` (the FK
-    /// dependency). This is the prompt's "the complete forward-only data-model migrations" gate.
+    /// **All fifteen CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
+    /// The complete arch 01 §3 control-plane schema (+ CT-004d.1's `ci_job_spec`) lands here; `ci_run`
+    /// precedes `ci_job` (the FK dependency). This is the prompt's "the complete forward-only
+    /// data-model migrations" gate.
     #[test]
-    fn all_fourteen_controlplane_tables_are_present_fk_ordered() {
+    fn all_fifteen_controlplane_tables_are_present_fk_ordered() {
         let migrations = ci_controlplane_migrations();
         let tables: Vec<&str> = migrations.0.iter().map(|m| m.table.unwrap()).collect();
         assert_eq!(
@@ -585,8 +618,9 @@ mod tests {
                 DEPLOYMENT_TABLE,
                 SECRET_BINDING_TABLE,
                 CI_COST_EVENT_TABLE,
+                CI_JOB_SPEC_TABLE,
             ],
-            "all 14 control-plane tables, FK-dependency ordered (ci_run before ci_job)"
+            "all 15 control-plane tables, FK-dependency ordered (ci_run before ci_job)"
         );
         // ci_run precedes ci_job (the FK target before the FK source).
         let run_pos = tables.iter().position(|t| *t == CI_RUN_TABLE).unwrap();
@@ -625,8 +659,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            14,
-            "14 forward migrations, one per table"
+            15,
+            "15 forward migrations, one per table"
         );
         for m in &migrations.0 {
             assert!(
@@ -662,8 +696,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            14,
-            "the runner applied all 14 control-plane migrations"
+            15,
+            "the runner applied all 15 control-plane migrations"
         );
         assert_eq!(
             runner.applied()[0],
