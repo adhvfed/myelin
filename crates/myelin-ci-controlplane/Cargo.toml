@@ -102,7 +102,14 @@ serde_json = { workspace = true }
 # are EXTERNAL crates only; no new myelin edge is added. The test reads DATABASE_URL inline (no
 # myelin-config edge — same posture as refs-service/identity).
 # ------------------------------------------------------------------------------------------
-sqlx = { workspace = true, optional = true }
+# CT-004a (CI backend reconcile-and-harden): sqlx is now a NON-OPTIONAL production dependency — the
+# durable CI `cost_event` projection store (`cost_store::CiCostEventStore`) executes the metering SQL
+# constants against the real OLTP pool in the DEFAULT build (turning the "model-only" metering path
+# into a production-callable store). This follows the identity-service durable-by-default precedent
+# ("tokio/sqlx/myelin-config non-optional; `integration` is a test-selector"). The build stays DB-free
+# (connecting happens at RUNTIME, never at build); the `integration` feature only gates the live-stack
+# tests that need a running Postgres.
+sqlx = { workspace = true }
 # MR-009b W3b.6: tokio + myelin-config are REGULAR deps now — the durable service main.rs
 # (provider-from-env → migrate_foundation → OutboxStore::durable, fail-loud) needs them. The
 # `integration` feature no longer carries their dep: activation; the build stays DB-free
@@ -182,7 +189,6 @@ test-support = [
 # `myelin-storage/integration` exposes the s3blob module (the real S3BlobStore over RustFS/Scaleway)
 # the CI-P20 log-pipeline seal flushes its sealed segments to.
 integration = [
-    "dep:sqlx",
     "dep:aws-sdk-s3",
     "myelin-storage/integration",
 ]
