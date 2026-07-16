@@ -1,52 +1,51 @@
-//! **CT-004b — the LIVE `ci-dispatch.trigger` consumer, DURABILITY PROVEN through the reserve store
-//! on live Postgres.**
+//! **CT-004b — the LIVE `ci-dispatch.trigger` consumer, DURABILITY PROVEN on live Postgres, now with
+//! the H1 (peer-review #7 re-prosecution) TRUE co-commit + LIVELOCK-CLOSED proofs.**
 //!
-//! The unit tests (`src/consumer.rs`) prove the pipeline branches DB-free (no config → skip;
-//! malformed → surfaced skip; non-matching trigger → skip; floating tag → surfaced resolve skip;
-//! happy path → atomic bundle). This test proves the LAST mile the prompt asks for: **a real
-//! `git.ref.updated` envelope, fed to the consumer with a valid digest-pinned `.myelin/ci.toml` at
-//! `new_oid`, produces a DURABLE `ci_run` row + a queued `ci.check.updated` + `ci.run.started` — all
-//! in ONE transaction (the atomic bundle) — and a re-delivered identical envelope (same `event_id`)
-//! does NOT double-start** (the deterministic `run_id` + `ON CONFLICT (tenant_id, run_id) DO NOTHING`).
+//! Three live-PG proofs (all in an isolated per-pid schema, `myelin_admin` = BYPASSRLS so the reserve
+//! exercises the FORCE-RLS `ci_run` shape):
 //!
-//! ## Cross-service delivery reality (named, per the prompt)
-//! The git service emits `git.ref.updated` to ITS outbox/NATS; whether ci-dispatch RECEIVES it
-//! cross-cell over the structured `evt.<tenant>.git.*` subject is a deploy-substrate floor. So this
-//! test INJECTS a synthetic-but-real `git.ref.updated` envelope (real payload + a real digest-pinned
-//! config at the ref) rather than a real cross-service NATS hop — the accepted proof of the CONSUMER
-//! logic end-to-end (envelope in → durable ci_run + queued check out). The real cross-service NATS
-//! delivery is the named deploy floor.
+//!  1. **`h1_true_cocommit_ci_run_events_and_mark_in_one_tx_idempotent`** — the honest #7 shape: a real
+//!     `git.ref.updated` push, delivered through the FULL `Consumer` runtime with a DURABLE
+//!     `consumer_dedup` ledger, co-commits the `ci_run` ROW + `ci.run.started` + the queued
+//!     `ci.check.updated` events + the dedup MARK in ONE transaction (the reserve store rides the
+//!     co-commit connection `tx.connection::<sqlx::PgConnection>()`). A redelivery (same `event_id`)
+//!     is `Deduplicated` — 1 run, 3 events, 0 duplicates.
+//!  2. **`h1_crash_window_rolls_back_everything_then_reruns`** — the crash-window: persist on the
+//!     co-commit tx then ROLL BACK (kill-9 before commit) → NOTHING lands (no ci_run, no events, no
+//!     mark); the redelivery re-runs the WHOLE dispatch + persist and COMMITS → all present exactly
+//!     once; a further redelivery is deduped. NO livelock, NO duplicate, NO `Err`-retry.
+//!  3. **`h1_production_outbox_absorb_closes_the_livelock`** — the PRODUCTION `OutboxReserveStore`
+//!     separate-tx path over the REAL durable outbox: persisting the SAME armed run TWICE (a
+//!     crash-window redelivery re-emitting the SAME deterministic ids) both return `Ok` — the second
+//!     is ABSORBED (`commit_absorb` → `ON CONFLICT (event_id) DO NOTHING`), NOT rejected into the
+//!     unbounded `Retry` LIVELOCK the reject-arm `commit` caused. Events present exactly once.
 //!
-//! ## The `ci_run` table is created by the REAL shared CI migration path (CT-004m)
-//! The `ci_run` table is owned by `myelin-ci-controlplane`. CT-004m gives BOTH CI mains the shared
-//! [`myelin_ci_controlplane::ci_durable_migrations`] set (`ci_run` + `check_attempt` + `ci_cost_event`),
-//! applied at boot — so ci-dispatch no longer depends on ci-controlplane booting first to have `ci_run`.
-//! This test stands the tables up via that SAME real forward-only migration set (each `(tenant, region)`-
-//! first + FORCE-RLS) into an ISOLATED per-pid schema, and drives a `PgReserveStore` that co-commits the
-//! `ci_run` row + the outbox events in ONE tx — proving the atomic bundle against the tables as the real
-//! migration path produces them. The pool connects as the migration/owner role (`myelin_admin`,
-//! BYPASSRLS) so the reserve exercises the table shape under FORCE-RLS. The PRODUCTION durable reserve
-//! writer that wires this into the live dispatch consumer with a tenant-scoped tx is the named follow-on.
-//!
-//! Gated behind the `integration` cargo feature. Run against the docker-compose dev stack:
+//! The pre-fix bug (H1): `OutboxReserveStore` committed via the reject-arm; `PgRelay::commit_staged_atomic`
+//! mapped a duplicate `event_id` to `Err("duplicate emit")`, so a crash-window redelivery re-emitted the
+//! same ids → `Err` → the handler returned `Retry` → the message NEVER acked = a permanent livelock.
 //!
 //!   eval "$(scripts/dev-stack.sh env)"
 //!   cargo test -p myelin-ci-dispatch --features integration \
 //!     --test integration_ci_ct004b_trigger_consumer -- --nocapture
 #![cfg(feature = "integration")]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use myelin_ci_controlplane::ci_durable_migrations;
 use myelin_ci_dispatch::{
     plan_dispatch, ArmedRun, CiTriggerHandler, DispatchOutcome, GitConfigReader, GitReadError,
-    ReserveError, ReserveStore,
+    OutboxReserveStore, ReserveError, ReserveStore,
 };
+use myelin_events::consumer::{Consumer, Delivered, Message, Subscription};
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventHandler, EventId,
-    EventType, HandleOutcome, Timestamp, Visibility,
+    Actor, AggregateKey, ArtifactRef, ConsumerName, CorrelationId, DataRole, DedupLedger,
+    DurableDedup, EventEnvelope, EventId, EventType, HandlerTx, OutboxStore, PrefetchBound,
+    Timestamp, UlidMinter, Visibility, CONSUMER_DEDUP_MIGRATION, OUTBOX_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+use myelin_storage::events_durable::DurableDedupBacking;
+use myelin_storage::outbox_durable::PgOutboxBacking;
 use myelin_storage::{BlobStore, FsBlobStore};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool, Row};
@@ -60,24 +59,25 @@ fn admin_url() -> String {
     app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
 
-/// The per-pid schema every pool pins `search_path` to — so the store's unqualified `ci_run` /
-/// `ci_reserve_outbox` resolve to ISOLATED tables (never another test's rows).
-fn schema_name() -> String {
-    format!("ci_ct004b_{}", std::process::id())
+fn uniq() -> u64 {
+    static N: AtomicU64 = AtomicU64::new(0);
+    N.fetch_add(1, Ordering::SeqCst)
 }
 
-/// Open an admin pool whose connections pin `search_path` to the per-pid schema (the CT-004a
-/// posture). Reopening after `drop(prev)` models a process restart (the kill-9 durability proof).
-async fn reopen() -> PgPool {
-    let schema = schema_name();
+/// A per-(pid, counter) schema so each test isolates its tables (never another test's rows).
+fn schema_name(k: u64) -> String {
+    format!("ci_ct004b_{}_{}", std::process::id(), k)
+}
+
+/// Open an admin pool whose connections pin `search_path` to `schema` (the CT-004a posture; admin =
+/// BYPASSRLS so the reserve exercises the FORCE-RLS ci_run shape).
+async fn reopen(schema: &str) -> PgPool {
+    let schema = schema.to_string();
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
         .after_connect(move |conn, _meta| {
             let schema = schema.clone();
             Box::pin(async move {
-                // `public` follows the per-pid schema so the platform RLS helper
-                // `myelin_make_tenant_scoped` (in public, called by the real ci_durable_migrations)
-                // resolves, while unqualified table CREATEs land in the per-pid schema first.
                 conn.execute(format!("SET search_path TO {schema}, public").as_str())
                     .await?;
                 Ok(())
@@ -88,9 +88,32 @@ async fn reopen() -> PgPool {
         .expect("reconnect to dev Postgres (is the stack up? eval \"$(scripts/dev-stack.sh env)\")")
 }
 
-/// The outbox-shaped table the reserve co-commit writes the two events into (the dispatch service's
-/// `outbox` in production; a minimal isolated mirror here so the one-tx co-commit is assertable
-/// alongside the `ci_run` row).
+/// Stand up the isolated schema + the shared CI tables (ci_run etc.) + consumer_dedup + a reserve
+/// outbox mirror. Returns a pool pinned to the schema.
+async fn setup_schema(schema: &str, reserve_outbox_ddl: &str) -> PgPool {
+    let p = reopen(schema).await;
+    p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .expect("drop prior schema");
+    p.execute(format!("CREATE SCHEMA {schema}").as_str())
+        .await
+        .expect("create schema");
+    for m in ci_durable_migrations().0.iter() {
+        p.execute(m.ddl)
+            .await
+            .unwrap_or_else(|e| panic!("apply CI durable migration {}: {e}", m.id));
+    }
+    p.execute(CONSUMER_DEDUP_MIGRATION)
+        .await
+        .expect("apply consumer_dedup migration");
+    p.execute(reserve_outbox_ddl)
+        .await
+        .expect("apply reserve outbox DDL");
+    p
+}
+
+/// The outbox-shaped mirror the TRUE co-commit reserve store writes the two events into (alongside the
+/// ci_run row, in the co-commit tx). A minimal isolated table so the one-tx co-commit is assertable.
 const CREATE_RESERVE_OUTBOX_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS ci_reserve_outbox (
   event_id  text PRIMARY KEY,
@@ -101,7 +124,6 @@ CREATE TABLE IF NOT EXISTS ci_reserve_outbox (
   payload   jsonb NOT NULL
 )";
 
-/// A digest-pinned `.myelin/ci.toml` a push arms on (a build job + a test job that `needs` build).
 const VALID_CI_TOML: &str = "\
 on = \"push\"
 
@@ -115,9 +137,6 @@ image = \"registry.example/test@sha256:ffeeddccbbaa00000000000000000000000000000
 needs = [\"build\"]
 ";
 
-/// A minimal in-test [`GitConfigReader`]: serves `VALID_CI_TOML` for `.myelin/ci.toml` at the pushed
-/// `(repo, oid)`, `Ok(None)` elsewhere. (The REAL myelin-git `read_blob_at_path` adapter is
-/// `DurableGitConfigReader`; here a fixture reader keeps the test's focus on the DURABLE persistence.)
 struct FixtureGitReader {
     repo: String,
     oid: String,
@@ -140,27 +159,17 @@ impl GitConfigReader for FixtureGitReader {
     }
 }
 
-/// **The durable reserve store: co-commit the `ci_run` row + the two events in ONE Postgres tx.**
-/// This is the myelin-storage-backing floor, modelled in-test (the CT-004a `settle_in_tx` posture):
-/// `persist_async` opens ONE `tx`, INSERTs the `ci_run` row (`ON CONFLICT (tenant_id, run_id) DO
-/// NOTHING` — idempotent), INSERTs `ci.run.started` + every queued `ci.check.updated` into the outbox
-/// (deterministic `event_id`, `ON CONFLICT DO NOTHING`), and commits — all-or-nothing.
-struct PgReserveStore {
-    pool: PgPool,
+/// **The TRUE co-commit reserve store (H1): write the `ci_run` row + the two events on the CO-COMMIT
+/// CONNECTION** (`tx.connection::<sqlx::PgConnection>()`) — the SAME `sqlx` transaction the dedup mark
+/// is in. So the whole bundle + the mark commit or roll back as ONE unit. This is what the production
+/// `myelin-storage` `ci_run`-writer floor will do; the leaf `OutboxReserveStore` cannot name `sqlx`.
+struct CoCommitReserveStore {
     rt: tokio::runtime::Handle,
 }
 
-impl PgReserveStore {
-    async fn persist_async(&self, armed: &ArmedRun) -> Result<(), ReserveError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| ReserveError(format!("begin: {e}")))?;
-
+impl CoCommitReserveStore {
+    async fn write(conn: &mut sqlx::PgConnection, armed: &ArmedRun) -> Result<(), ReserveError> {
         let rw = &armed.handoff.run_write;
-        // The `ci_run` row (state=queued) — the thin index over the workflow run. The uuid columns
-        // are bound as text + cast ::uuid (the deterministic ids are valid uuid strings).
         sqlx::query(
             "INSERT INTO ci_run (tenant_id, region, run_id, project_id, pipeline_id, wf_run_id, \
              definition_snapshot, trigger_kind, trust_tier, state, correlation_id, cause_event_id) \
@@ -179,15 +188,21 @@ impl PgReserveStore {
         .bind(&rw.state)
         .bind(&armed.reserve.correlation_id)
         .bind(&rw.cause_event_id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await
         .map_err(|e| ReserveError(format!("ci_run insert: {e}")))?;
 
-        // ci.run.started + every queued ci.check.updated — co-committed in the SAME tx.
         let mut drafts: Vec<(String, &myelin_events::EventDraft)> = Vec::new();
-        drafts.push((format!("{}:ci.run.started", rw.run_id), &armed.handoff.run_started));
-        for (i, c) in armed.handoff.queued_checks.iter().enumerate() {
-            drafts.push((format!("{}:check:{i}", rw.run_id), c));
+        drafts.push((
+            format!("evt:{}", armed.handoff.run_started.subject.0),
+            &armed.handoff.run_started,
+        ));
+        for c in armed.handoff.queued_checks.iter() {
+            // H3: the deterministic check id includes the run_id (distinct runs do not collide).
+            drafts.push((
+                format!("evt:{}:{}", rw.run_id, c.subject.0),
+                c,
+            ));
         }
         for (event_id, d) in &drafts {
             sqlx::query(
@@ -200,26 +215,24 @@ impl PgReserveStore {
             .bind(&d.subject.0)
             .bind(serde_json::to_string(&d.aggregate.0).unwrap())
             .bind(serde_json::to_string(&d.payload).unwrap())
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await
             .map_err(|e| ReserveError(format!("outbox insert: {e}")))?;
         }
-
-        tx.commit().await.map_err(|e| ReserveError(format!("commit: {e}")))
+        Ok(())
     }
 }
 
-impl ReserveStore for PgReserveStore {
-    fn persist(&self, armed: &ArmedRun) -> Result<(), ReserveError> {
-        // Bridge the sync trait to async sqlx (the PgOutboxBacking idiom). Called from within a
-        // `spawn_blocking` in the test so `block_on` does not nest a runtime.
+impl ReserveStore for CoCommitReserveStore {
+    fn persist(&self, armed: &ArmedRun, tx: &mut HandlerTx<'_>) -> Result<(), ReserveError> {
+        // THE TRUE CO-COMMIT: downcast the runtime co-commit connection and write the bundle on the
+        // SAME tx as the dedup mark. A durable handler with NO tx fails-closed (never writes outside).
+        let conn = tx
+            .connection::<sqlx::PgConnection>()
+            .ok_or_else(|| ReserveError("no co-commit tx (durable handler fails closed)".into()))?;
         let armed = armed.clone();
         let rt = self.rt.clone();
-        let this = PgReserveStore {
-            pool: self.pool.clone(),
-            rt: self.rt.clone(),
-        };
-        rt.block_on(async move { this.persist_async(&armed).await })
+        tokio::task::block_in_place(|| rt.block_on(async { Self::write(conn, &armed).await }))
     }
 }
 
@@ -231,7 +244,6 @@ fn principal() -> Principal {
     )
 }
 
-/// A real `git.ref.updated` envelope for `repo` pushing `new_oid`, event id `ev`.
 fn push_envelope(ev: &str, repo: &str, new_oid: &str) -> EventEnvelope {
     EventEnvelope {
         event_id: EventId(ev.into()),
@@ -271,154 +283,199 @@ async fn count(pool: &PgPool, sql: &str, run_id: &str) -> i64 {
         .get::<i64, _>("n")
 }
 
-#[tokio::test]
-async fn a_push_arms_a_durable_ci_run_and_queued_checks_idempotently() {
-    let schema = schema_name();
+async fn dedup_present(pool: &PgPool, consumer: &str, id: &str) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM consumer_dedup WHERE consumer = $1 AND event_id = $2)",
+    )
+    .bind(consumer)
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("dedup read")
+}
+
+fn armed_for(ev: &EventEnvelope, repo: &str, oid: &str) -> ArmedRun {
+    let blobs = FsBlobStore::new();
+    let reader = FixtureGitReader {
+        repo: repo.into(),
+        oid: oid.into(),
+    };
+    match plan_dispatch(ev, &reader, &blobs) {
+        DispatchOutcome::Arm(a) => *a,
+        other => panic!("the push must arm a run, got {other:?}"),
+    }
+}
+
+// =================================================================================================
+// (1) TRUE co-commit through the FULL Consumer runtime: ci_run + events + mark in ONE tx, idempotent.
+// =================================================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h1_true_cocommit_ci_run_events_and_mark_in_one_tx_idempotent() {
+    let schema = schema_name(uniq());
     let repo = "web";
     let oid = "deadbeefcafe0000000000000000000000000000";
+    let p = setup_schema(&schema, CREATE_RESERVE_OUTBOX_DDL).await;
+    let rt = tokio::runtime::Handle::current();
 
-    // ── Fresh isolated schema + the ci_run table (owned by controlplane) + the reserve outbox. ──
-    let p1 = reopen().await;
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&p1)
-        .await
-        .expect("drop any prior schema");
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
-        .execute(&p1)
-        .await
-        .expect("create the per-pid schema");
-    // Apply the REAL shared CI durable migration set (ci_run + check_attempt + ci_cost_event, each
-    // FORCE-RLS) — the SAME set both CI mains apply at boot. Multi-statement DDL via the simple-query
-    // protocol lands in the search_path'd per-pid schema.
-    for m in ci_durable_migrations().0.iter() {
-        p1.execute(m.ddl)
-            .await
-            .unwrap_or_else(|e| panic!("apply CI durable migration {} into the schema: {e}", m.id));
-    }
-    sqlx::query(CREATE_RESERVE_OUTBOX_DDL)
-        .execute(&p1)
-        .await
-        .expect("apply the reserve outbox DDL");
-
-    // ── The LIVE consumer: the fixture git reader + the in-memory CAS + the durable reserve store. ──
     let reader: Arc<dyn GitConfigReader> = Arc::new(FixtureGitReader {
         repo: repo.into(),
         oid: oid.into(),
     });
     let blobs: Arc<dyn BlobStore + Send + Sync> = Arc::new(FsBlobStore::new());
-    let store = Arc::new(PgReserveStore {
-        pool: p1.clone(),
-        rt: tokio::runtime::Handle::current(),
-    });
-    let handler = Arc::new(CiTriggerHandler::new(reader, blobs, store.clone()));
+    let store = Arc::new(CoCommitReserveStore { rt: rt.clone() });
+    let handler = CiTriggerHandler::new(reader, blobs, store);
+    let cname = handler.consumer_name().to_string();
 
-    // The armed run's deterministic run_id (for the read-back assertions) — from plan_dispatch.
+    let ledger = {
+        let backing = DurableDedupBacking::new(p.clone(), rt.clone());
+        DedupLedger::durable(Arc::new(backing) as Arc<dyn DurableDedup>)
+    };
+    let sub = Subscription::bind(
+        ConsumerName(cname.clone()),
+        &["myelin://acme/git/"],
+        PrefetchBound::DEFAULT,
+    )
+    .unwrap();
+    let consumer = Consumer::new(handler, sub, ledger);
+
     let ev = push_envelope("ev-push-1", repo, oid);
-    let run_id = {
-        let blobs2 = FsBlobStore::new();
-        let reader2 = FixtureGitReader {
-            repo: repo.into(),
-            oid: oid.into(),
-        };
-        match plan_dispatch(&ev, &reader2, &blobs2) {
-            DispatchOutcome::Arm(a) => a.handoff.run_write.run_id.clone(),
-            other => panic!("the push must arm a run, got {other:?}"),
-        }
+    let run_id = armed_for(&ev, repo, oid).handoff.run_write.run_id;
+    let msg = Message {
+        subject: ev.subject.0.clone(),
+        envelope: ev.clone(),
     };
 
-    // ── Deliver the envelope through the FULL handler (envelope in → durable rows out). ──
-    let h1 = Arc::clone(&handler);
-    let ev1 = ev.clone();
-    let outcome = tokio::task::spawn_blocking(move || h1.handle(&ev1, &mut myelin_events::HandlerTx::none()))
+    // Delivery 1: the co-commit opens a tx (marks dedup), the handler writes ci_run + events on that
+    // SAME tx, and `Done` commits mark + ci_run + events together.
+    let out = tokio::task::block_in_place(|| consumer.deliver(&msg));
+    assert_eq!(out, Delivered::Acked, "the push armed + co-committed the bundle");
+
+    let runs = count(&p, "SELECT count(*)::bigint AS n FROM ci_run WHERE run_id=$1::uuid", &run_id).await;
+    assert_eq!(runs, 1, "one durable ci_run row");
+    let events = count(&p, "SELECT count(*)::bigint AS n FROM ci_reserve_outbox WHERE run_id=$1", &run_id).await;
+    assert_eq!(events, 3, "ci.run.started + 2 queued ci.check.updated (build, test)");
+    assert!(dedup_present(&p, &cname, &ev.event_id.0).await, "the dedup mark co-committed");
+
+    // Delivery 2 (same event_id): DEDUPLICATED — the handler does not re-run, 0 duplicates.
+    let out2 = tokio::task::block_in_place(|| consumer.deliver(&msg));
+    assert_eq!(out2, Delivered::Deduplicated, "the committed mark dedups the redelivery");
+    let runs2 = count(&p, "SELECT count(*)::bigint AS n FROM ci_run WHERE run_id=$1::uuid", &run_id).await;
+    let events2 = count(&p, "SELECT count(*)::bigint AS n FROM ci_reserve_outbox WHERE run_id=$1", &run_id).await;
+    assert_eq!((runs2, events2), (1, 3), "redelivery added nothing (idempotent)");
+
+    p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str()).await.ok();
+    println!("[H1/1] PASS true co-commit: ci_run + 3 events + dedup mark in ONE tx; redelivery deduped (1 run, 3 events).");
+}
+
+// =================================================================================================
+// (2) CRASH-WINDOW: persist on the co-commit tx then ROLL BACK → nothing lands; the redelivery
+//     re-runs the WHOLE dispatch+persist and commits → all present exactly once; further → deduped.
+// =================================================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h1_crash_window_rolls_back_everything_then_reruns() {
+    let schema = schema_name(uniq());
+    let repo = "web";
+    let oid = "cafe00000000000000000000000000000000beef";
+    let p = setup_schema(&schema, CREATE_RESERVE_OUTBOX_DDL).await;
+    let rt = tokio::runtime::Handle::current();
+
+    let backing = DurableDedupBacking::new(p.clone(), rt.clone());
+    let ledger = DedupLedger::durable(Arc::new(backing) as Arc<dyn DurableDedup>);
+    let store = CoCommitReserveStore { rt: rt.clone() };
+    let cname = ConsumerName("ci-dispatch.trigger".into());
+    let tenant = TenantId("acme".into());
+    let region = Region("fr-par".into());
+
+    let ev = push_envelope("ev-crash-1", repo, oid);
+    let armed = armed_for(&ev, repo, oid);
+    let run_id = armed.handoff.run_write.run_id.clone();
+
+    // (A) CRASH BEFORE COMMIT: open the co-commit tx (marks dedup within it), persist the bundle on
+    //     the SAME tx, then ROLL BACK (the process dies before commit).
+    tokio::task::block_in_place(|| {
+        let (mut cotx, fresh) = ledger.begin_co_commit(&cname, &ev.event_id, &tenant, &region);
+        assert!(fresh, "first delivery marks the dedup row FRESH");
+        {
+            let conn = cotx.connection().expect("co-commit exposes a connection");
+            let mut htx = HandlerTx::with_connection(conn);
+            store.persist(&armed, &mut htx).expect("persist on the co-commit tx");
+        }
+        cotx.rollback(); // kill-9 before commit.
+    });
+    assert!(!dedup_present(&p, &cname.0, &ev.event_id.0).await, "crash: mark did NOT persist");
+    assert_eq!(count(&p, "SELECT count(*)::bigint AS n FROM ci_run WHERE run_id=$1::uuid", &run_id).await, 0, "crash: no ci_run row");
+    assert_eq!(count(&p, "SELECT count(*)::bigint AS n FROM ci_reserve_outbox WHERE run_id=$1", &run_id).await, 0, "crash: no events");
+
+    // (B) REDELIVERY re-runs the WHOLE dispatch + persist (still fresh — nothing was marked) and
+    //     COMMITS: everything lands exactly once. No livelock, no Err-retry.
+    tokio::task::block_in_place(|| {
+        let armed = armed_for(&ev, repo, oid); // re-run dispatch, as the redelivered handler would.
+        let (mut cotx, fresh) = ledger.begin_co_commit(&cname, &ev.event_id, &tenant, &region);
+        assert!(fresh, "after the rollback the redelivery is STILL FRESH (0 lost)");
+        {
+            let conn = cotx.connection().unwrap();
+            let mut htx = HandlerTx::with_connection(conn);
+            store.persist(&armed, &mut htx).expect("persist on the redelivery tx");
+        }
+        cotx.commit().expect("commit the co-commit tx");
+    });
+    assert!(dedup_present(&p, &cname.0, &ev.event_id.0).await, "redelivery committed the mark");
+    assert_eq!(count(&p, "SELECT count(*)::bigint AS n FROM ci_run WHERE run_id=$1::uuid", &run_id).await, 1, "one ci_run row");
+    assert_eq!(count(&p, "SELECT count(*)::bigint AS n FROM ci_reserve_outbox WHERE run_id=$1", &run_id).await, 3, "3 events exactly once");
+
+    // (C) A further REDELIVERY is deduped (mark present) → 0 duplicates.
+    tokio::task::block_in_place(|| {
+        let (cotx, fresh) = ledger.begin_co_commit(&cname, &ev.event_id, &tenant, &region);
+        assert!(!fresh, "the committed mark makes a redelivery a DUPLICATE");
+        cotx.rollback();
+    });
+    assert_eq!(count(&p, "SELECT count(*)::bigint AS n FROM ci_run WHERE run_id=$1::uuid", &run_id).await, 1, "still one run");
+    assert_eq!(count(&p, "SELECT count(*)::bigint AS n FROM ci_reserve_outbox WHERE run_id=$1", &run_id).await, 3, "still 3 events");
+
+    p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str()).await.ok();
+    println!("[H1/2] PASS crash-window: rollback leaves nothing; redelivery re-runs + commits (1 run, 3 events); further redelivery deduped.");
+}
+
+// =================================================================================================
+// (3) PRODUCTION OutboxReserveStore over the REAL durable outbox: the LIVELOCK is closed — persisting
+//     the SAME armed run TWICE (deterministic ids) both return Ok (the second ABSORBED, not Err), and
+//     the events are present exactly once. Pre-fix the second persist Err'd → the handler Retry'd forever.
+// =================================================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h1_production_outbox_absorb_closes_the_livelock() {
+    let schema = schema_name(uniq());
+    let repo = "web";
+    let oid = "1234000000000000000000000000000000005678";
+    // The real outbox table lives in the schema too.
+    let p = setup_schema(&schema, OUTBOX_MIGRATION).await;
+    let rt = tokio::runtime::Handle::current();
+
+    let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(p.clone(), rt.clone())));
+    let store = OutboxReserveStore::new(outbox, Arc::new(UlidMinter::new()));
+
+    let ev = push_envelope("ev-livelock-1", repo, oid);
+    let armed = armed_for(&ev, repo, oid);
+
+    // First persist: emits ci.run.started + 2 checks with deterministic ids. Ok.
+    let mut htx = HandlerTx::none();
+    store.persist(&armed, &mut htx).expect("first persist commits the events");
+
+    // The crash-window redelivery re-runs the WHOLE persist with the SAME deterministic ids. Pre-fix
+    // this Err'd ("duplicate emit") → the handler returned Retry → an unbounded livelock. With
+    // commit_absorb it is ABSORBED → Ok.
+    let mut htx2 = HandlerTx::none();
+    store
+        .persist(&armed, &mut htx2)
+        .expect("H1: the deterministic re-emit is ABSORBED (no livelock), not Err");
+
+    // Exactly once: 1 ci.run.started + 2 ci.check.updated in the real outbox = 3 rows, no duplicates
+    // (the absorb of the deterministic re-emit added nothing).
+    let total: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM outbox")
+        .fetch_one(&p)
         .await
         .unwrap();
-    assert_eq!(outcome, HandleOutcome::Done, "the consumer handled the push");
+    assert_eq!(total, 3, "exactly 3 outbox rows (1 started + 2 checks) — the absorb added no duplicates");
 
-    // (1) A DURABLE ci_run row (state=queued) carrying the stamped tier + trigger kind.
-    let row = sqlx::query("SELECT state, trigger_kind, trust_tier, definition_snapshot FROM ci_run WHERE run_id = $1::uuid")
-        .bind(&run_id)
-        .fetch_one(&p1)
-        .await
-        .expect("the ci_run row is durable");
-    assert_eq!(row.get::<String, _>("state"), "queued", "the run is reserved queued");
-    assert_eq!(row.get::<String, _>("trigger_kind"), "push", "the push trigger kind");
-    assert_eq!(row.get::<String, _>("trust_tier"), "trusted", "a member push is trusted");
-    assert!(
-        row.get::<String, _>("definition_snapshot").contains("ci/snapshot/"),
-        "the CAS snapshot ref rides the row"
-    );
-
-    // (2) ci.run.started + one queued ci.check.updated PER top-level job (build, test) — the atomic
-    //     bundle, co-committed in the SAME tx as the ci_run row.
-    let started = count(
-        &p1,
-        "SELECT count(*)::bigint AS n FROM ci_reserve_outbox WHERE run_id=$1 AND type='ci.run.started'",
-        &run_id,
-    )
-    .await;
-    assert_eq!(started, 1, "exactly one ci.run.started event");
-    let checks = count(
-        &p1,
-        "SELECT count(*)::bigint AS n FROM ci_reserve_outbox WHERE run_id=$1 AND type='ci.check.updated'",
-        &run_id,
-    )
-    .await;
-    assert_eq!(checks, 2, "one queued ci.check.updated per top-level job (build, test)");
-
-    // ── (3) IDEMPOTENCY: re-deliver the SAME envelope (same event_id → same deterministic run_id). ──
-    let h2 = Arc::clone(&handler);
-    let ev2 = ev.clone();
-    let outcome2 = tokio::task::spawn_blocking(move || h2.handle(&ev2, &mut myelin_events::HandlerTx::none()))
-        .await
-        .unwrap();
-    assert_eq!(outcome2, HandleOutcome::Done, "the redelivery is handled");
-    let runs = count(
-        &p1,
-        "SELECT count(*)::bigint AS n FROM ci_run WHERE run_id=$1::uuid",
-        &run_id,
-    )
-    .await;
-    assert_eq!(runs, 1, "the redelivery did NOT double-start (ON CONFLICT DO NOTHING — one run)");
-    let events = count(
-        &p1,
-        "SELECT count(*)::bigint AS n FROM ci_reserve_outbox WHERE run_id=$1",
-        &run_id,
-    )
-    .await;
-    assert_eq!(events, 3, "the redelivery added no duplicate events (1 started + 2 checks)");
-
-    // ── (4) ATOMICITY / no-ghost: an UNCOMMITTED reserve leaves NOTHING. ──
-    {
-        let mut tx = p1.begin().await.unwrap();
-        sqlx::query(
-            "INSERT INTO ci_run (tenant_id, region, run_id, project_id, pipeline_id, wf_run_id, \
-             definition_snapshot, trigger_kind, trust_tier, state, correlation_id) \
-             VALUES ('acme','fr-par', gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), \
-             gen_random_uuid(), 'x', 'push', 'trusted', 'queued', 'corr-crash')",
-        )
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-        // Drop the tx WITHOUT commit → the crash before the co-commit completes.
-        drop(tx);
-    }
-    let ghost = count(
-        &p1,
-        "SELECT count(*)::bigint AS n FROM ci_run WHERE correlation_id=$1",
-        "corr-crash",
-    )
-    .await;
-    assert_eq!(ghost, 0, "the uncommitted reserve left NO ghost run (all-or-nothing)");
-
-    // ── Cleanup. ──
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&p1)
-        .await
-        .ok();
-    println!(
-        "[CT-004b] PASS trigger consumer: a git.ref.updated push with a digest-pinned .myelin/ci.toml \
-         at new_oid → a DURABLE ci_run row (queued, trusted, push, CAS snapshot ref) + ci.run.started \
-         + 2 queued ci.check.updated, co-committed in ONE tx; redelivery (same event_id) → 1 run, 0 \
-         duplicate events (idempotent); uncommitted reserve → 0 ghost (all-or-nothing)"
-    );
+    p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str()).await.ok();
+    println!("[H1/3] PASS livelock closed: the production OutboxReserveStore ABSORBS the deterministic re-emit (2× persist → Ok, 3 rows exactly once), no Err-retry livelock.");
 }

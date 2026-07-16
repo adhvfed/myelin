@@ -149,23 +149,35 @@ impl DurableDedup for DurableDedupBacking {
         tenant: &TenantId,
         region: &Region,
     ) -> (Box<dyn CoCommitTx>, bool) {
-        // **The #7/MR-023b same-transaction co-commit.** Acquire a pooled connection, BEGIN, set the
-        // `(tenant, region)` GUC TRANSACTION-scoped (the `with_tenant_tx` RLS convention so the
-        // handler's tenant-scoped writes on THIS connection are RLS-isolated + discarded on
-        // commit/rollback), then `INSERT (consumer, event_id) ON CONFLICT DO NOTHING` WITHIN the tx.
-        // The mark is NOT committed here — the consumer runtime commits/rolls back AFTER the handler
-        // co-commits its effect on the same connection.
-        let acquired: Result<(sqlx::pool::PoolConnection<sqlx::Postgres>, bool), sqlx::Error> = self
+        // **The #7/MR-023b same-transaction co-commit.** Open a NATIVE `sqlx::Transaction` (via
+        // `Pool::begin`), set the `(tenant, region)` GUC TRANSACTION-scoped (the `with_tenant_tx` RLS
+        // convention so the handler's tenant-scoped writes on THIS connection are RLS-isolated +
+        // discarded on commit/rollback), then `INSERT (consumer, event_id) ON CONFLICT DO NOTHING`
+        // WITHIN the tx. The mark is NOT committed here — the consumer runtime commits/rolls back
+        // AFTER the handler co-commits its effect on the same connection.
+        //
+        // **H2 (peer-review #7 re-prosecution — the panic-leak, FIXED):** this was raw
+        // `BEGIN`/`COMMIT`/`ROLLBACK` on a bare `PoolConnection` with NO `Drop`. A tokio-task PANIC in
+        // the handler (an unwind, not process death) dropped that connection mid-transaction; sqlx did
+        // not know about the hand-rolled `BEGIN`, so it returned the connection to the pool STILL IN
+        // THE TRANSACTION (the `after_release` `RESET ALL` runs happily inside an open tx). The next
+        // `begin_co_commit` reused it, its raw `BEGIN` was a no-op nested-tx, and its `COMMIT` durably
+        // committed the PANICKED delivery's mark + partial effect → the panicked event read `!fresh`
+        // on redelivery → Deduplicated → its valid effect LOST (MR-023b resurrected). A native
+        // `sqlx::Transaction` closes this STRUCTURALLY: its `Drop` queues a `ROLLBACK` onto the
+        // connection before it returns to the pool, so a dropped-mid-tx handle can NEVER leak an open
+        // transaction into a reused pool connection. (`Consumer::deliver` also `catch_unwind`s the
+        // handler as defense-in-depth, dead-lettering the bug loudly — see `consumer.rs`.)
+        let acquired: Result<(sqlx::Transaction<'static, sqlx::Postgres>, bool), sqlx::Error> = self
             .block(async {
-                let mut conn = self.pool.acquire().await?;
-                sqlx::query("BEGIN").execute(&mut *conn).await?;
+                let mut tx = self.pool.begin().await?;
                 sqlx::query(
                     "SELECT set_config('myelin.tenant_id', $1, true), \
                             set_config('myelin.region', $2, true)",
                 )
                 .bind(&tenant.0)
                 .bind(&region.0)
-                .execute(&mut *conn)
+                .execute(&mut *tx)
                 .await?;
                 let res = sqlx::query(
                     "INSERT INTO consumer_dedup (consumer, event_id) VALUES ($1, $2) \
@@ -173,14 +185,14 @@ impl DurableDedup for DurableDedupBacking {
                 )
                 .bind(&consumer.0)
                 .bind(&event_id.0)
-                .execute(&mut *conn)
+                .execute(&mut *tx)
                 .await?;
-                Ok((conn, res.rows_affected() == 1))
+                Ok((tx, res.rows_affected() == 1))
             });
         match acquired {
-            Ok((conn, fresh)) => (
+            Ok((tx, fresh)) => (
                 Box::new(DurableCoCommit {
-                    conn: Some(conn),
+                    tx: Some(tx),
                     rt: self.rt.clone(),
                 }),
                 fresh,
@@ -193,14 +205,23 @@ impl DurableDedup for DurableDedupBacking {
     }
 }
 
-/// **The durable same-transaction co-commit handle (#7/MR-023b).** Owns a pooled connection with an
-/// OPEN transaction that already holds the (uncommitted) dedup mark; the consumer runtime hands the
-/// handler this connection (type-erased) to run its state write on, then [`commit`](CoCommitTx::commit)s
-/// (mark + effect land together) or [`rollback`](CoCommitTx::rollback)s (both vanish → a redelivery
-/// re-runs). `BEGIN`/`COMMIT`/`ROLLBACK` are raw SQL on the owned `PoolConnection` (kept `'static` so
-/// it survives the sync handler call and is erasable behind `&mut dyn Any`).
+/// **The durable same-transaction co-commit handle (#7/MR-023b).** Owns a NATIVE `sqlx::Transaction`
+/// (its own `'static` pooled connection with an OPEN transaction) that already holds the (uncommitted)
+/// dedup mark; the consumer runtime hands the handler this connection (type-erased) to run its state
+/// write on, then [`commit`](CoCommitTx::commit)s (mark + effect land together) or
+/// [`rollback`](CoCommitTx::rollback)s (both vanish → a redelivery re-runs).
+///
+/// **H2 — the leak is now STRUCTURALLY impossible.** The handle wraps `sqlx::Transaction`, whose `Drop`
+/// queues a `ROLLBACK` before the connection is returned to the pool. So a handle dropped WITHOUT an
+/// explicit `commit`/`rollback` — the exact path a handler PANIC took (the unwind dropped the boxed
+/// handle) — rolls the transaction back rather than returning an open transaction to the pool for the
+/// next delivery to unknowingly `COMMIT`. The prior raw-SQL `BEGIN`/`COMMIT`/`ROLLBACK` on a bare
+/// `PoolConnection` had no such `Drop`; sqlx did not know a transaction was open, so a dropped
+/// connection leaked it (the resurrected MR-023b bug). `Transaction<'static, Postgres>` derefs to
+/// `&mut PgConnection`, so the type-erased `connection()` seam is unchanged (the handler still
+/// downcasts to `&mut sqlx::PgConnection`).
 struct DurableCoCommit {
-    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    tx: Option<sqlx::Transaction<'static, sqlx::Postgres>>,
     rt: tokio::runtime::Handle,
 }
 
@@ -214,29 +235,34 @@ impl CoCommitTx for DurableCoCommit {
     fn connection(&mut self) -> Option<&mut dyn core::any::Any> {
         // Hand out the transaction-bound `PgConnection` type-erased; the handler downcasts to
         // `&mut sqlx::PgConnection` and runs its writes on the SAME tx the dedup mark is in.
-        self.conn
+        // `Transaction` derefs to its `&mut PgConnection`.
+        self.tx
             .as_mut()
-            .map(|c| (&mut **c) as &mut dyn core::any::Any)
+            .map(|t| (&mut **t) as &mut dyn core::any::Any)
     }
 
     fn commit(mut self: Box<Self>) -> Result<(), CoCommitError> {
-        let Some(mut conn) = self.conn.take() else {
+        let Some(tx) = self.tx.take() else {
             return Ok(());
         };
-        self.block(async { sqlx::query("COMMIT").execute(&mut *conn).await })
+        self.block(async { tx.commit().await })
             .map(|_| ())
             .map_err(|e| CoCommitError(e.to_string()))
-        // `conn` drops → returns to the pool (RESET ALL scrubs any residue).
     }
 
     fn rollback(mut self: Box<Self>) {
-        if let Some(mut conn) = self.conn.take() {
-            // Best-effort ROLLBACK; if it fails, dropping the connection aborts the tx anyway (an
-            // in-flight tx on a dropped connection is rolled back by Postgres).
-            let _ = self.block(async { sqlx::query("ROLLBACK").execute(&mut *conn).await });
+        if let Some(tx) = self.tx.take() {
+            // Explicit best-effort ROLLBACK; even if this errs (or if we never reach it — a drop),
+            // `sqlx::Transaction::Drop` guarantees the transaction is rolled back before the
+            // connection returns to the pool. H2: no open tx can ever leak to a reused connection.
+            let _ = self.block(async { tx.rollback().await });
         }
     }
 }
+
+// **H2 — no explicit `Drop` needed.** `DurableCoCommit` holds a `sqlx::Transaction`, whose own `Drop`
+// rolls the transaction back (queues `ROLLBACK` before the connection returns to the pool). Wrapping it
+// in a hand-rolled `Drop` would be redundant and risk double-handling; the native type IS the fix.
 
 /// **The fail-direction no-op co-commit handle (#7/MR-023b).** Returned when the DB could not be
 /// reached to open the co-commit tx: carries no connection (a durable handler fails-closed on

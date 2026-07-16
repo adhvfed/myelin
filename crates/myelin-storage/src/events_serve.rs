@@ -275,13 +275,33 @@ impl EventsRuntime {
                     subject: envelope.subject.0.clone(),
                     envelope,
                 };
-                match consumer.deliver(&msg) {
+                // **H2 (peer-review #7 re-prosecution) — defense in depth at the pump boundary.**
+                // `Consumer::deliver` already `catch_unwind`s the handler (a handler panic becomes a
+                // graceful dead-letter, and the durable co-commit tx is a native `sqlx::Transaction`
+                // that rolls back on drop — no leaked open tx). This OUTER guard covers a panic in the
+                // delivery machinery ITSELF (a framework bug around `deliver`): it must not tear down
+                // the whole pump task, and it must NEVER ack (a non-terminal panic leaves the message
+                // pending so a later redelivery can re-run — 0 lost). A deterministic framework panic
+                // is surfaced LOUDLY on every pass (never a silent swallow); the operator sees it.
+                let delivered_outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| consumer.deliver(&msg)));
+                match delivered_outcome {
                     // Terminal: the cursor advances — ack the broker message so it does not redeliver.
-                    Delivered::Acked | Delivered::Deduplicated | Delivered::DeadLettered(_) => {
+                    Ok(Delivered::Acked | Delivered::Deduplicated | Delivered::DeadLettered(_)) => {
                         self.bus.ack(&self.consumer_name, &event_id);
                     }
                     // NOT terminal: a Retry/Throttle stays pending — do NOT ack (it redelivers; 0 lost).
-                    Delivered::Retried(_) | Delivered::Throttled(_) => {}
+                    Ok(Delivered::Retried(_) | Delivered::Throttled(_)) => {}
+                    // A panic in the delivery machinery itself (should never happen — the handler is
+                    // already guarded inside `deliver`). Surface loudly, do NOT ack (0 lost), keep the
+                    // pump alive so other subjects/tenants keep flowing.
+                    Err(_panic) => {
+                        eprintln!(
+                            "[events-pump] LOUD: delivery machinery PANICKED for event_id={} \
+                             subject={} — NOT acked (redeliverable; 0 lost), pump continues",
+                            event_id.0, msg.subject
+                        );
+                    }
                 }
                 delivered += 1;
             }

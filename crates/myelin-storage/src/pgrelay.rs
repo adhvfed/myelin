@@ -491,6 +491,11 @@ impl PgRelay {
     /// error (reject parity with the in-memory arm — NOT `ON CONFLICT DO NOTHING`). A racing
     /// (`aggregate`, `seq`) collision under concurrency is retried (bounded) so the loser gets the
     /// next contiguous seq → gap-free, true-commit-order seqs (EB-03, durably).
+    ///
+    /// **This is the REJECT arm.** A caller that emits DETERMINISTIC ids (derived from a triggering
+    /// `event_id`) and needs an idempotent crash-window re-emit uses
+    /// [`commit_staged_absorb`](Self::commit_staged_absorb) instead (H1) — it `ON CONFLICT (event_id)
+    /// DO NOTHING`s a byte-identical re-emit while still rejecting a divergent-payload collision.
     pub async fn commit_staged_atomic(&self, rows: &[OutboxRow]) -> Result<(), PgError> {
         if rows.is_empty() {
             return Ok(());
@@ -544,6 +549,99 @@ impl PgRelay {
         match tx.commit().await {
             Ok(()) => CommitAttempt::Committed,
             // The UNIQUE(aggregate, seq) collision can also surface at COMMIT under concurrency.
+            Err(e) => classify_insert_error(e, ""),
+        }
+    }
+
+    /// **The ABSORB-mode commit (H1 — peer-review #7 re-prosecution): commit staged rows idempotently,
+    /// ABSORBING a DETERMINISTIC duplicate `event_id` instead of rejecting it.** Identical to
+    /// [`commit_staged_atomic`](Self::commit_staged_atomic) EXCEPT a re-inserted `event_id` is
+    /// `ON CONFLICT (event_id) DO NOTHING` (absorbed, not `Err`) — AFTER verifying the stored
+    /// envelope is byte-identical to the re-emitted one (a divergent payload under the same id is a
+    /// GENUINE collision and is still rejected, preserving the reject-parity safety the plain INSERT
+    /// gave). This is the path the CI dispatcher's DETERMINISTIC co-emitted `ci.run.started` /
+    /// `ci.check.updated` (ids derived from the run + subject) take: a crash-window redelivery re-runs
+    /// the handler and re-emits the SAME ids; without absorb-mode `commit_staged_atomic` returns
+    /// `Err("duplicate emit")` → the handler returns `Retry` → the message NEVER acks → an UNBOUNDED
+    /// LIVELOCK (H1). Absorbing the deterministic re-emit lets the redelivery return `Done`, the
+    /// consumer-runtime dedup mark commits, and the events stay present exactly once.
+    ///
+    /// The per-aggregate seq is allocated in-tx exactly as the reject arm; a `DO NOTHING` conflict
+    /// consumes NO seq (the row is not inserted), so gap-freeness across true inserts is preserved. A
+    /// racing `(aggregate, seq)` collision is retried (bounded) the same way.
+    pub async fn commit_staged_absorb(&self, rows: &[OutboxRow]) -> Result<(), PgError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for _ in 0..SEQ_CONTENTION_RETRIES {
+            match self.try_commit_staged_absorb(rows).await {
+                CommitAttempt::Committed => return Ok(()),
+                CommitAttempt::SeqContention => continue,
+                CommitAttempt::DuplicateEventId(id) => {
+                    // Here a "DuplicateEventId" means a DIVERGENT payload under an already-present id —
+                    // a genuine collision, NOT the benign deterministic re-emit (which was absorbed).
+                    return Err(PgError::Query(format!(
+                        "outbox event_id {id} already present with a DIFFERENT payload — a genuine \
+                         collision (absorb-mode verifies payload equality; a deterministic re-emit is \
+                         byte-identical and is absorbed, this is not)"
+                    )))
+                }
+                CommitAttempt::Db(e) => return Err(e),
+            }
+        }
+        Err(PgError::Query(
+            "outbox commit_staged_absorb exhausted seq-contention retries (hot-aggregate livelock?)"
+                .into(),
+        ))
+    }
+
+    async fn try_commit_staged_absorb(&self, rows: &[OutboxRow]) -> CommitAttempt {
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => return CommitAttempt::Db(PgError::Query(e.to_string())),
+        };
+        for row in rows {
+            let payload = match serde_json::to_value(&row.envelope) {
+                Ok(v) => v,
+                Err(e) => {
+                    return CommitAttempt::Db(PgError::Query(format!("serialize envelope: {e}")))
+                }
+            };
+            // ON CONFLICT (event_id) DO NOTHING: a deterministic re-emit is ABSORBED (rows_affected
+            // == 0); a genuine seq collision still surfaces on the (aggregate, seq) unique for a retry.
+            let res = sqlx::query(
+                "INSERT INTO outbox (event_id, aggregate, seq, subject, envelope) \
+                 VALUES ($1, $2, \
+                 COALESCE((SELECT MAX(seq) + 1 FROM outbox WHERE aggregate = $2), 0), $3, $4) \
+                 ON CONFLICT (event_id) DO NOTHING",
+            )
+            .bind(&row.event_id.0)
+            .bind(&row.aggregate.0)
+            .bind(&row.subject.0)
+            .bind(&payload)
+            .execute(&mut *tx)
+            .await;
+            let res = match res {
+                Ok(r) => r,
+                Err(e) => return classify_insert_error(e, &row.event_id.0),
+            };
+            if res.rows_affected() == 0 {
+                // Absorbed (the id was already present). VERIFY payload equality WITHIN the tx: a
+                // divergent payload under the same id is a genuine collision → reject (reject-parity).
+                let existing: Result<serde_json::Value, sqlx::Error> =
+                    sqlx::query_scalar("SELECT envelope FROM outbox WHERE event_id = $1")
+                        .bind(&row.event_id.0)
+                        .fetch_one(&mut *tx)
+                        .await;
+                match existing {
+                    Ok(stored) if stored == payload => { /* byte-identical deterministic re-emit — absorb. */ }
+                    Ok(_) => return CommitAttempt::DuplicateEventId(row.event_id.0.clone()),
+                    Err(e) => return CommitAttempt::Db(PgError::Query(e.to_string())),
+                }
+            }
+        }
+        match tx.commit().await {
+            Ok(()) => CommitAttempt::Committed,
             Err(e) => classify_insert_error(e, ""),
         }
     }

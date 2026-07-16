@@ -42,11 +42,21 @@
 //!
 //! ## What is DURABLE here vs the NAMED floors (be honest)
 //! - **Durable, dispatch-owned (shipped LIVE):** the `ci.run.started` + queued `ci.check.updated`
-//!   events, co-committed through the injected DURABLE [`OutboxStore`] ([`OutboxReserveStore`]) — the
+//!   events, committed through the injected DURABLE [`OutboxStore`] ([`OutboxReserveStore`]) — the
 //!   production `main.rs` binds `OutboxStore::durable(PgOutboxBacking)`, so these events survive a
 //!   restart. The exactly-once effect rides the `Consumer` runtime's `consumer_dedup` ledger (one
 //!   triggering `event_id` = one effect) PLUS a deterministic `run_id` derived from the `event_id`
 //!   (so a redelivered trigger mints the SAME run — `ON CONFLICT DO NOTHING` at the `ci_run` PK).
+//! - **H1 (be brutally honest about the production outbox tx):** [`OutboxReserveStore`] commits the
+//!   events in its OWN outbox transaction — SEPARATE from the `consumer_dedup` mark's co-commit tx
+//!   (this leaf crate cannot name `sqlx` outside `--features integration`, so it cannot ride the
+//!   type-erased co-commit connection). A crash between that outbox commit and the mark's commit makes
+//!   the redelivery re-run and re-emit the SAME deterministic ids; the commit therefore uses
+//!   [`OutboxTransaction::commit_absorb`] (`ON CONFLICT (event_id) DO NOTHING` + payload verify) so the
+//!   re-emit is ABSORBED, NOT rejected into a `Retry` LIVELOCK (the H1 bug: the old `commit` reject-arm
+//!   `Err`ed on the duplicate → permanent stuck consumer). The TRUE single-tx co-commit (ci_run + events
+//!   + mark all atomic) is proven in the integration test's `PgReserveStore` (which rides the co-commit
+//!   connection) and is the named `myelin-storage`-`ci_run`-writer production follow-on below.
 //! - **The `ci_run` ROW one-tx co-commit (PROVEN in test, NAMED as a floor for production):** the
 //!   `ci_run` table is owned by `myelin-ci-controlplane` (its `CREATE_CI_RUN_DDL`), NOT by
 //!   ci-dispatch — `all_durable_migrations()` (what this service's `main.rs` applies) does NOT create
@@ -251,17 +261,37 @@ impl std::fmt::Display for ReserveError {
 
 impl std::error::Error for ReserveError {}
 
-/// **The seam that DURABLY persists the atomic reserve/start bundle.** The production impl
-/// ([`OutboxReserveStore`]) co-commits the `ci.run.started` + queued `ci.check.updated` events through
-/// the injected DURABLE [`OutboxStore`]; the integration test's `PgReserveStore` additionally writes
-/// the `ci_run` ROW in the SAME tx (the full atomic bundle proven on live PG). A unit test uses
-/// [`RecordingReserveStore`]. The trait is SYNC to match the [`EventHandler::handle`] body (the
-/// durable impls bridge to async at their own boundary, the `PgOutboxBacking` idiom).
+/// **The seam that DURABLY persists the atomic reserve/start bundle.** Two shapes, both idempotent:
+///
+/// - **True co-commit (the target / proven path):** the reserve bundle rides the consumer-runtime
+///   co-commit connection ([`HandlerTx::connection`] → the SAME `sqlx` transaction the dedup mark is
+///   in), so the `ci_run` ROW + `ci.run.started` + queued `ci.check.updated` + the dedup mark ALL
+///   commit or ALL roll back in ONE tx. A crash rolls back EVERYTHING; a redelivery re-runs cleanly.
+///   The integration test's `PgReserveStore` implements this (it can name `sqlx`). This is the honest
+///   #7 shape and the one the H1 probe proves.
+/// - **Separate-tx outbox + ABSORB (the production floor):** [`OutboxReserveStore`] runs in the
+///   production leaf crate, which cannot name `sqlx` outside `--features integration`, so it CANNOT
+///   ride the type-erased co-commit connection. It commits the events through its own DURABLE
+///   [`OutboxStore`] in a SEPARATE tx, using [`OutboxTransaction::commit_absorb`] so a crash-window
+///   redelivery (mark not yet committed) re-emits the SAME deterministic ids and is ABSORBED — no
+///   `Err`-into-`Retry` LIVELOCK (the H1 bug). The `ci_run` ROW is the named `myelin-storage`-backing
+///   floor here (not written by this path yet). Wiring the true co-commit into production (a
+///   `myelin-storage` `ci_run` writer riding the co-commit connection) is the named follow-on.
+///
+/// A unit test uses [`RecordingReserveStore`]. The trait is SYNC to match the [`EventHandler::handle`]
+/// body (the durable impls bridge to async at their own boundary, the `PgOutboxBacking` idiom).
 pub trait ReserveStore: Send + Sync {
     /// Persist the armed run's atomic bundle. Idempotent on the run identity (a redelivered trigger
-    /// mints the SAME `run_id`, so the durable write is `ON CONFLICT DO NOTHING` — one run, never
-    /// two). Returns `Ok(())` whether it inserted or absorbed a duplicate.
-    fn persist(&self, armed: &ArmedRun) -> Result<(), ReserveError>;
+    /// mints the SAME `run_id` + the SAME deterministic event ids). `tx` is the consumer-runtime
+    /// co-commit handle (#7/MR-023b): an impl that can name `sqlx` (the integration `PgReserveStore`)
+    /// downcasts `tx.connection::<sqlx::PgConnection>()` and writes the bundle on the SAME tx as the
+    /// dedup mark (true co-commit); the production [`OutboxReserveStore`] ignores `tx` and rides its
+    /// own DURABLE outbox with [`OutboxTransaction::commit_absorb`] (absorb-mode idempotency).
+    fn persist(
+        &self,
+        armed: &ArmedRun,
+        tx: &mut myelin_events::HandlerTx<'_>,
+    ) -> Result<(), ReserveError>;
 }
 
 /// **The production reserve store: co-commit the reserve bundle's EVENTS through the DURABLE
@@ -285,10 +315,17 @@ impl OutboxReserveStore {
 }
 
 impl ReserveStore for OutboxReserveStore {
-    fn persist(&self, armed: &ArmedRun) -> Result<(), ReserveError> {
-        // ONE outbox transaction: ci.run.started + every queued ci.check.updated commit together
-        // (emit-iff-committed). The staged-state-change records that the ci_run row is the co-commit
-        // partner the myelin-storage backing floor will make durable in the SAME tx (named above).
+    fn persist(
+        &self,
+        armed: &ArmedRun,
+        _tx: &mut myelin_events::HandlerTx<'_>,
+    ) -> Result<(), ReserveError> {
+        // **The production separate-tx floor.** This leaf crate cannot name `sqlx` outside
+        // `--features integration`, so it CANNOT ride the type-erased co-commit connection (`_tx`) —
+        // it commits the events through its OWN durable outbox in a separate tx (the true single-tx
+        // co-commit of the ci_run row + events + mark is the integration `PgReserveStore` + the named
+        // `myelin-storage` `ci_run`-writer floor). The staged-state-change records the ci_run row as
+        // the co-commit partner that floor will make durable.
         let mut tx = self
             .outbox
             .begin(Arc::clone(&self.minter), armed.emit_ctx.clone());
@@ -298,10 +335,16 @@ impl ReserveStore for OutboxReserveStore {
         ));
         // **Peer-review #8: DETERMINISTIC co-emitted event ids.** The `ci.run.started` + each queued
         // `ci.check.updated` id is derived from the (deterministic) `run_id` + the event's stable
-        // subject, so a REDELIVERED trigger re-emits the SAME ids and the outbox
-        // `ON CONFLICT (event_id) DO NOTHING` dedups them (no duplicate run.started/check.updated).
-        // With #7's co-commit a re-run only happens on a genuine crash-before-commit (nothing was
-        // emitted); this closes the residual duplication if the durable emit ever re-runs.
+        // subject, so a REDELIVERED trigger re-emits the SAME ids.
+        //
+        // **H3 (peer-review #7 re-prosecution) — the check id includes the run_id.** The check subject
+        // is `repo#commit-<oid>/check-<context>` with NO run_id; two DISTINCT triggers on the same
+        // (repo, commit, context) — a re-opened PR on the same head, the same commit on a second ref,
+        // two PRs sharing a head — mint DISTINCT runs but would have minted the SAME check id with
+        // DIFFERENT payloads (a collision → the absorb-mode payload check would REJECT the second, or,
+        // pre-fix, silently drop it). Seeding with the run_id (`evt:<run_id>:<subject>`) makes a
+        // redelivery of the SAME run still dedup (same run_id) while distinct runs diverge. `run.started`
+        // already carries the run_id in its subject (`ci/run/<run_id>`), so it is per-run unique already.
         let started_id = EventId(deterministic_uuid(&format!(
             "evt:{}",
             armed.handoff.run_started.subject.0
@@ -309,12 +352,17 @@ impl ReserveStore for OutboxReserveStore {
         tx.emit_with_id(started_id, armed.handoff.run_started.clone(), None)
             .map_err(|e| ReserveError(format!("ci.run.started emit: {e:?}")))?;
         for check in &armed.handoff.queued_checks {
-            let check_id = EventId(deterministic_uuid(&format!("evt:{}", check.subject.0)));
+            let check_id = check_event_id(&armed.handoff.run_write.run_id, &check.subject.0);
             tx.emit_with_id(check_id, check.clone(), None)
                 .map_err(|e| ReserveError(format!("queued ci.check.updated emit: {e:?}")))?;
         }
-        tx.commit()
-            .map_err(|e| ReserveError(format!("outbox commit: {e:?}")))
+        // **H1 — ABSORB-mode commit (not the reject-arm `commit`).** A crash-window redelivery (the
+        // dedup mark not yet committed) re-runs this whole method and re-emits the SAME deterministic
+        // ids; `commit_absorb` `ON CONFLICT (event_id) DO NOTHING`s the byte-identical re-emit instead
+        // of `Err`ing → `Retry` → the UNBOUNDED LIVELOCK the reject-arm `commit` caused (H1). The events
+        // stay present exactly once; a divergent-payload collision still rejects.
+        tx.commit_absorb()
+            .map_err(|e| ReserveError(format!("outbox commit_absorb: {e:?}")))
     }
 }
 
@@ -426,6 +474,22 @@ fn on_trigger_for_type(event_type: &str) -> Option<OnTrigger> {
     } else {
         None
     }
+}
+
+/// **The DETERMINISTIC `ci.check.updated` event id for a (run, check-subject) pair (H3 — peer-review
+/// #7 re-prosecution).** Seeded with the `run_id` so a REDELIVERY of the SAME run (same deterministic
+/// run_id) re-mints the SAME id (dedup/absorb), while two DISTINCT runs on the same
+/// `(repo, commit, context)` — a re-opened PR on the same head, the same commit on a second ref, two
+/// PRs sharing a head — diverge (distinct ids, no collision). The check SUBJECT alone omits the run_id
+/// (`repo#commit-<oid>/check-<context>`), so seeding on the subject ONLY (the pre-fix bug) made those
+/// distinct runs collide on the same id with DIFFERENT payloads.
+///
+/// LOW aside (named, not fixed): [`deterministic_uuid`] is a 2×-salted FNV-64 (non-cryptographic) over
+/// possibly attacker-authored job/context names; it guards a DEDUP boundary (a collision would merge
+/// two runs' checks), not an auth boundary. FNV is fine for the dedup role; if this ever gates trust,
+/// swap to a keyed/crypto hash. Documented here, not silently relied upon.
+pub fn check_event_id(run_id: &str, check_subject: &str) -> EventId {
+    EventId(deterministic_uuid(&format!("evt:{run_id}:{check_subject}")))
 }
 
 /// **A deterministic uuid-shaped string from a seed (FNV-1a fill).** The `ci_run` `run_id` /
@@ -661,9 +725,12 @@ impl EventHandler for CiTriggerHandler {
         ci_trigger_subjects()
     }
 
-    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         match plan_dispatch(ev, self.reader.as_ref(), self.blobs.as_ref()) {
-            DispatchOutcome::Arm(armed) => match self.reserve.persist(&armed) {
+            // Thread the consumer-runtime co-commit handle (`tx`) into the reserve store: the true
+            // co-commit impl writes the bundle on the SAME tx as the dedup mark (#7); the production
+            // outbox impl ignores it and rides its own absorb-mode outbox (H1).
+            DispatchOutcome::Arm(armed) => match self.reserve.persist(&armed, tx) {
                 Ok(()) => {
                     self.record(format!(
                         "armed run_id={} repo={} snapshot={}",
@@ -782,7 +849,11 @@ impl RecordingReserveStore {
 
 #[cfg(any(test, feature = "test-support"))]
 impl ReserveStore for RecordingReserveStore {
-    fn persist(&self, armed: &ArmedRun) -> Result<(), ReserveError> {
+    fn persist(
+        &self,
+        armed: &ArmedRun,
+        _tx: &mut myelin_events::HandlerTx<'_>,
+    ) -> Result<(), ReserveError> {
         self.persisted
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1043,6 +1114,29 @@ mod tests {
         );
         // The surfaced trace shows the armed run (never a silent swallow).
         assert!(handler.trace().iter().any(|l| l.starts_with("armed run_id=")));
+    }
+
+    /// **H3: the check event id includes the run_id — distinct runs on the SAME (repo, commit,
+    /// context) do NOT collide, and a redelivery of the SAME run re-mints the SAME id.** The check
+    /// SUBJECT is run-agnostic (`repo#commit-<oid>/check-<context>`), so seeding on the subject alone
+    /// (the pre-fix bug) minted ONE id for two distinct runs with DIFFERENT payloads (a collision).
+    #[test]
+    fn check_event_id_diverges_across_runs_stable_within_a_run() {
+        let subject = "myelin://acme/git/ref/web:refs/heads/main#commit-deadbeef/check-build";
+        let run_a = deterministic_uuid("run:ev-A");
+        let run_b = deterministic_uuid("run:ev-B");
+        // Same run + same subject → SAME id (a redelivery dedups/absorbs).
+        assert_eq!(
+            check_event_id(&run_a, subject),
+            check_event_id(&run_a, subject),
+            "same run + subject is stable (redelivery dedups)"
+        );
+        // DISTINCT runs + same subject → DISTINCT ids (no collision across runs).
+        assert_ne!(
+            check_event_id(&run_a, subject),
+            check_event_id(&run_b, subject),
+            "distinct runs on the same (repo, commit, context) must NOT collide (H3)"
+        );
     }
 
     /// **deterministic_uuid is a valid uuid shape + stable per seed + distinct across seeds.**

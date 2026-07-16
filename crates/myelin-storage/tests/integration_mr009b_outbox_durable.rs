@@ -27,7 +27,6 @@ use std::sync::{Arc, OnceLock};
 use myelin_config::MyelinConfig;
 use myelin_storage::outbox_durable::PgOutboxBacking;
 use myelin_storage::pgrelay::PgRelay;
-use myelin_storage::tenant_tx::connect_pool_with_reset;
 
 use myelin_events::relay::{InProcessBus, Relay};
 use myelin_events::{
@@ -125,12 +124,61 @@ async fn fresh_durable_store(pool: &PgPool) -> OutboxStore {
     OutboxStore::durable(Arc::new(backing))
 }
 
+/// The per-pid schema this binary's `outbox` lives in.
+///
+/// **Test-isolation (2026-07 re-prosecution finding):** these tests leave UNSENT rows in the `outbox`
+/// (e.g. `concurrent_seq_scenario` commits 32 rows and never drains them). In the shared `public.outbox`
+/// those rows RACE cross-binary with WHOLE-TABLE relay/count ops in OTHER integration binaries
+/// (`smoke_backends::pg_outbox_relay_drains_to_bus` claims up to 16 whole-table rows and asserts n==2;
+/// `integration_mr023_events_serve` counts `outbox_depth`). Pinning every connection here to a per-pid
+/// schema keeps this binary's rows OUT of `public.outbox`, so those cross-binary whole-table assertions
+/// are deterministic. `db_lock` still serializes WITHIN this binary; the per-pid schema isolates ACROSS.
+fn schema() -> String {
+    format!("mr009b_outbox_{}", std::process::id())
+}
+
+/// Serializes the one-time per-pid schema + foundation-table creation across this binary's
+/// concurrently-starting tests (each calls `connect()` BEFORE acquiring `db_lock`). `CREATE SCHEMA /
+/// TABLE IF NOT EXISTS` are NOT atomic in Postgres (the existence check races the insert → 23505), so
+/// setup runs exactly once under this guard rather than racing.
+fn setup_once() -> &'static tokio::sync::Mutex<bool> {
+    static S: OnceLock<tokio::sync::Mutex<bool>> = OnceLock::new();
+    S.get_or_init(|| tokio::sync::Mutex::new(false))
+}
+
 async fn connect() -> PgPool {
     let cfg = MyelinConfig::dev();
-    let pool = connect_pool_with_reset(&admin_url(&cfg), &cfg.region, 8)
-        .await
-        .expect("connect Postgres");
-    ensure_foundation(&pool).await;
+    let s = schema();
+    let pool = {
+        let s = s.clone();
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(8)
+            .after_connect(move |conn, _meta| {
+                let s = s.clone();
+                Box::pin(async move {
+                    sqlx::Executor::execute(
+                        conn,
+                        format!("SET search_path TO {s}, public").as_str(),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .connect(&admin_url(&cfg))
+            .await
+            .expect("connect Postgres")
+    };
+    {
+        let mut done = setup_once().lock().await;
+        if !*done {
+            sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {s}"))
+                .execute(&pool)
+                .await
+                .expect("create per-pid schema");
+            ensure_foundation(&pool).await;
+            *done = true;
+        }
+    }
     pool
 }
 
@@ -274,6 +322,64 @@ async fn cdc_parity_duplicate_event_id_rejected() {
     let store = fresh_durable_store(&pool).await;
     duplicate_rejected_scenario(&store);
     eprintln!("PARITY OK — duplicate event_id REJECTED (not silently ignored) on both backends");
+}
+
+// ----------------------------------------------------------------------------------------------
+// (2b) H1 (peer-review #7 re-prosecution) — ABSORB-mode commit: a byte-identical deterministic
+//      re-emit is ABSORBED (Ok, no duplicate, no livelock); a DIVERGENT payload under the SAME id is
+//      STILL REJECTED (the payload-equality safety that keeps absorb from silently swallowing a
+//      genuine collision) — BOTH backends.
+// ----------------------------------------------------------------------------------------------
+
+fn absorb_scenario(store: &OutboxStore) {
+    let stuck: Arc<dyn IdMinter> = Arc::new(StuckMinter(format!("01JABS{}", uniq())));
+
+    // tx1: commit id X with draft A.
+    let mut tx1 = store.begin(Arc::clone(&stuck), ctx_base());
+    tx1.emit(draft("issues.issue.created", "issue:ABS"), None)
+        .unwrap();
+    tx1.commit().unwrap();
+    assert_eq!(store.committed_count(), 1);
+
+    // tx2: ABSORB the SAME id X with the SAME draft (a byte-identical crash-window re-emit) → Ok,
+    // NOT the reject-arm Err → no `Retry` livelock. No duplicate row.
+    let mut tx2 = store.begin(Arc::clone(&stuck), ctx_base());
+    tx2.emit(draft("issues.issue.created", "issue:ABS"), None)
+        .unwrap();
+    tx2.commit_absorb()
+        .expect("H1: byte-identical deterministic re-emit is ABSORBED (no livelock)");
+    assert_eq!(store.committed_count(), 1, "absorb added NO duplicate");
+
+    // tx3: a DIVERGENT payload under the SAME id X → STILL REJECTED (payload-equality safety: absorb
+    // must not silently swallow a genuine id collision with a different payload).
+    let mut tx3 = store.begin(Arc::clone(&stuck), ctx_base());
+    tx3.emit(draft("issues.issue.updated", "issue:ABS"), None)
+        .unwrap();
+    let err = tx3.commit_absorb().unwrap_err();
+    assert!(
+        err.0.contains("DIFFERENT payload") || err.0.contains("collision"),
+        "a divergent payload under the same id must still REJECT, got: {}",
+        err.0
+    );
+    assert_eq!(
+        store.committed_count(),
+        1,
+        "the rejected divergent commit staged nothing new"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn cdc_parity_absorb_mode_idempotent_but_rejects_divergent_payload() {
+    absorb_scenario(&OutboxStore::new());
+
+    let pool = connect().await;
+    let _guard = db_lock().lock().await;
+    let store = fresh_durable_store(&pool).await;
+    absorb_scenario(&store);
+    eprintln!(
+        "PARITY OK (H1) — absorb-mode ABSORBS a byte-identical re-emit (no livelock) but REJECTS a \
+         divergent-payload collision, on both backends"
+    );
 }
 
 // ----------------------------------------------------------------------------------------------

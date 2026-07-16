@@ -578,12 +578,50 @@ impl<H: EventHandler> Consumer<H> {
         // dedup mark (#7/MR-023b); an in-memory / outbox-seam handler ignores the tx. A reaction it
         // emits calls `OutboxTx::emit(draft, cause = Some(&envelope))` (§5.3). The `HandlerTx`
         // borrows the transaction; it is dropped before the runtime commits/rolls back the tx.
-        let outcome = {
+        //
+        // **H2 (peer-review #7 re-prosecution) — DEFENSE IN DEPTH against a handler PANIC.** The
+        // handler is arbitrary code; a bug can `panic!` (an unwind). WITHOUT a guard the unwind
+        // propagates out of `deliver` and tears down the pump task, and — before H2's native-tx fix in
+        // the durable backing — leaked the OPEN co-commit tx to the pool (the next delivery then
+        // `COMMIT`ed the panicked delivery's mark+effect → its valid effect LOST). We `catch_unwind`
+        // the handler (the handler is `&self`, so `AssertUnwindSafe` is sound — we touch no broken
+        // invariant after the unwind: we only ROLL BACK the tx and dead-letter). On unwind we ROLL
+        // BACK the co-commit tx (mark + any partial write vanish together) and DEAD-LETTER the message
+        // (surfaced, terminal → acked so it does not redeliver-and-re-panic in a loop). We deliberately
+        // do NOT record a dedup tombstone (unlike the `NonRetryable` poison path): a panic is a BUG,
+        // not poison — the event may carry a VALID effect that the buggy code failed to apply, so the
+        // undeduped event stays replayable from the dead-letter set after the bug is fixed + redeployed
+        // (never a silent loss). A `Retry` was rejected here because a deterministic panic would
+        // livelock the subject (panic-loop); a dead-letter quarantines the bug loudly and lets the
+        // subject progress.
+        let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut htx = match cotx.connection() {
                 Some(conn) => HandlerTx::with_connection(conn),
                 None => HandlerTx::none(),
             };
             self.handler.handle(&envelope, &mut htx)
+        }));
+        let outcome = match handled {
+            Ok(outcome) => outcome,
+            Err(panic) => {
+                // The handler panicked (a bug). Roll back the co-commit tx (H2: mark + any partial
+                // effect vanish; the native `sqlx::Transaction` also rolls back on drop, so the pool
+                // connection is never leaked mid-tx), then dead-letter LOUDLY without a tombstone.
+                cotx.rollback();
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                let reason = Reason(format!(
+                    "handler PANICKED (a bug, dead-lettered without a dedup tombstone so the valid \
+                     effect stays replayable): {detail}"
+                ));
+                self.clear_pending(&msg.subject);
+                self.clear_tenant_inflight(&tenant, &event_id);
+                self.push_dead_letter(envelope, reason.clone());
+                return Delivered::DeadLettered(reason);
+            }
         };
         match outcome {
             HandleOutcome::Done => {
