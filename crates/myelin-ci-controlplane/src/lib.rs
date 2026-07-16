@@ -104,6 +104,24 @@ pub mod e2e_wedge;
 pub mod events;
 pub mod fairness;
 pub mod fleet;
+/// CT-004c.1 (CI backend reconcile-and-harden — the DURABILITY-PLUMBING half of making the CI
+/// scheduler live): the REAL durable `job_queue` store ([`job_queue_store::CiJobQueueStore`]) + the
+/// dead-runner reaper loop ([`job_queue_store::JobQueueReaper`]). Turns the previously two-form
+/// scheduler (the `&str` SQL constants + the DB-free [`scheduler::SchedulerState`] model) into a
+/// genuine pool-backed store that runs the BYTE-IDENTICAL claim/reap/cancel-superseded SQL under a
+/// tenant-/region-scoped transaction (the FORCE-RLS `job_queue` table). It is the durable equivalent
+/// of BOTH the controlplane `SchedulerState` and the sandbox `JobLeaseStore` — the ONE store both
+/// will claim from in CT-004c.2 (which binds the runner + starts the pipeline body on the executor;
+/// this chunk leases a row and launches NOTHING). Constructed at the composition root by
+/// [`ci_job_queue_store`]; the reaper is spawned by the service `main` onto the serve runtime.
+pub mod job_queue_store;
+/// CT-004c.1: the REGION-scoped, CROSS-TENANT half of the durable scheduler — the raw `CLAIM_QUERY` /
+/// `REAP_QUERY` executions (a hosted runner claims across ALL tenants in its region; the DRR fairness
+/// spans tenants). Isolated here so it is a NAMED, LOUD `tenant-predicate` exclusion (the
+/// `placement_durable.rs` control-plane-routing posture) while the per-tenant
+/// enqueue/cancel/complete/heartbeat queries in [`job_queue_store`] stay FULLY linted. Not part of
+/// the public surface — [`job_queue_store::CiJobQueueStore::claim`] / `reap` delegate to it.
+pub mod job_queue_region;
 pub mod floor_followons;
 pub mod holder;
 pub mod live_tail;
@@ -361,7 +379,19 @@ pub use surfacing_tools::{
 
 pub use scheduler::{
     lane_token, state_token, ClaimRequest, Claimed, EnqueueOutcome, JobState, Lane, QueuedJob,
-    SchedulerState, CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, REAP_QUERY,
+    SchedulerState, CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, COMPLETE_JOB_QUERY, HEARTBEAT_QUERY,
+    INSERT_JOB_QUEUE_QUERY, REAP_QUERY,
+};
+
+// CT-004c.1 (CI backend reconcile-and-harden — durability plumbing): the REAL durable `job_queue`
+// store + the dead-runner reaper loop. The scheduler is no longer model-only — `CiJobQueueStore`
+// runs the claim/reap/cancel-superseded/enqueue/complete/heartbeat SQL against the OLTP pool under
+// the tenant-/region-scoped RLS transaction the `job_queue` table requires. `JobQueueReaper` is the
+// periodic lease-driven driver the service `main` spawns onto the serve runtime. The runner-binds-to-
+// this-store + starts-the-body handoff is CT-004c.2 (adversarially verified — the trust-tier claim
+// predicate + the sandbox exec path).
+pub use job_queue_store::{
+    CiJobQueueStore, DurableEnqueue, JobQueueReaper, JobQueueStoreError, LeasedJob,
 };
 
 // CI-P14 (P-357): the EU fleet autoscaler — the FleetProvider impl + autoscale-on-queue-depth +
@@ -534,6 +564,25 @@ pub fn run_controlplane(
 /// `ci_cost_event` table) — the SCHEMA it writes to is now sound.
 pub fn ci_cost_event_store(pool: sqlx::PgPool) -> CiCostEventStore {
     CiCostEventStore::with_pg(pool)
+}
+
+/// **Construct the durable CI `job_queue` store at the composition root (CT-004c.1).** The service
+/// `main` builds this from the MR-022 `SubstrateProvider` pool (`provider.db_pool().clone()`) after
+/// the migrations have run, so the scheduler has a real, production-callable [`CiJobQueueStore`] — not
+/// the prior two-form (SQL-constants + in-memory `SchedulerState` model). A thin composition seam
+/// (over [`CiJobQueueStore::with_pg`]) so the wiring point is named in ONE place. The `job_queue` +
+/// `fair_deficit` tables it needs are created by the full [`ci_controlplane_migrations`] the
+/// ci-controlplane `serve(AppSpec)` applies at boot (job_queue is the control plane's hot claim
+/// surface — single-owner, so it stays in the full control-plane migration set, NOT the shared
+/// `ci_durable_migrations` writer subset that exists for tables BOTH CI mains write; ci-dispatch does
+/// not touch `job_queue`).
+///
+/// **CT-004c.2** binds the `RunnerAgent` to this store (long-poll [`CiJobQueueStore::claim`] → lease a
+/// row → hand it to the AG-D4-gated sandbox executor → heartbeat/complete) and starts the pipeline
+/// body — the surfaces the adversarial verifier must cover (the trust-tier claim predicate + the
+/// sandbox exec path). CT-004c.1 leases a row and launches NOTHING.
+pub fn ci_job_queue_store(pool: sqlx::PgPool) -> CiJobQueueStore {
+    CiJobQueueStore::with_pg(pool)
 }
 
 #[cfg(test)]

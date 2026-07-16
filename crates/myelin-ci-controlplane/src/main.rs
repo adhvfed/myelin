@@ -119,6 +119,21 @@ async fn main() {
     // wraps the pool — no query runs at boot.
     let _ci_cost_events =
         myelin_ci_controlplane::ci_cost_event_store(provider.db_pool().clone());
+    // CT-004c.1: construct the REAL durable `job_queue` store + spawn the dead-runner reaper loop onto
+    // the serve runtime (minimal-impact wiring — a bounded background task hung off the existing
+    // lifecycle, NOT a new AppSpec schema field). The `job_queue` table the reaper sweeps is created
+    // by the full `ci_controlplane_migrations` the `serve(AppSpec)` below applies at boot; the reaper
+    // delays its first sweep one interval so that boot-migrate has completed. The reaper is SAFE — it
+    // only re-queues expired leases (`leased`→`queued`); it launches NO untrusted code (binding the
+    // runner + starting the pipeline body on the sandbox executor is CT-004c.2). The claim path is
+    // dormant at the shell (no runner drives `claim` yet — CT-004c.2 wires it).
+    let ci_job_queue = myelin_ci_controlplane::ci_job_queue_store(provider.db_pool().clone());
+    let reaper = myelin_ci_controlplane::JobQueueReaper::new(
+        ci_job_queue,
+        provider.config().region.clone(),
+        std::time::Duration::from_secs(15),
+    );
+    tokio::spawn(reaper.run());
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).
     match run_controlplane(Config::default(), outbox) {
