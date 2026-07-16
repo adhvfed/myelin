@@ -578,7 +578,18 @@ tables; new no-collision proof (both cost_event + ci_cost_event coexist, both st
 (each CI main creates the tables in public, no swallow, boot-order coupling gone). **CT-004d FLOOR:** ci_cost_event
 is FORCE-RLS but CiCostEventStore writes on a bare pool w/o the (tenant,region) GUC — live settle needs a
 tenant-scoped tx (CT-004d). · **CT-004c** scheduler/lease loop live on `job_queue`
-+ reaper/autoscaler background loops (a) · **CT-004d** pipeline body + metering bookends live (b,c) ·
++ reaper/autoscaler background loops (a). **SCOUTED + SPLIT for risk (untrusted-exec isolation):** every piece
+exists but is unit-only — no pool-backed store, no running loop; TWO parallel in-memory lease models
+(controlplane `SchedulerState` + sandbox `JobLeaseStore`) are NOT connected. **CT-004c.1 (IN PROGRESS — durability
+plumbing, NO exec):** a pool-backed `DurableJobQueue` store running CLAIM/REAP/CANCEL_SUPERSEDED under a
+tenant-scoped RLS tx (the ONE durable store both lease models unify onto) + the reaper wired into the serve
+lifecycle. **CT-004c.2 (NEXT — SECURITY-CRITICAL, needs an independent adversarial verifier):** bind the
+RunnerAgent to claim from the durable store → `SandboxBackend::launch` untrusted code → job.done; start the
+`ci.pipeline` body (`run_ci_pipeline_body`/CI_PIPELINE_WF_TYPE) on a real FlowExecutor with the pre-minted
+wf_run_id + SchedulerJobRunner as the injected JobRunner. Verifier surfaces: the trust-tier claim predicate
+(untrusted_fork must never reach a trusted runner), residency pin, RunnerHooks fail-closed, heartbeat/lease-lost
+double-run guard, references-not-payloads at job.done. Sandbox prod-exec itself is PROVEN (CT-002/003, 0 escapes).
+· **CT-004d** pipeline body + metering bookends live (b,c) ·
 **CT-004e** check/result producers live → closes the X-1 seam to the merge gate (d) · **CT-004f** log
 pipeline live substrate (a; SSE tail is CT-005) · **CT-004g** fleet/residency (c, optional split).
 
