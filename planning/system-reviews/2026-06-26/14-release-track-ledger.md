@@ -587,12 +587,18 @@ exclusion [placement_durable precedent, honest — only the 2 cross-tenant queri
 serve runtime, minimal-impact; proven on live PG incl. the trust-tier gate [trusted-only claim NEVER leases
 untrusted_fork/self_hosted], SKIP-LOCKED no-double-lease, reap-no-orphan/no-dup, kill-9, RLS under myelin_app;
 lints 175/0, unit 400/0. Floor: region-scoped scheduler DB role for prod non-superuser claim/reap [region GUC
-already set]). **CT-004c.2 (IN PROGRESS — SECURITY-CRITICAL, WILL get an independent adversarial verifier):** bind the
-RunnerAgent to claim from the durable store → `SandboxBackend::launch` untrusted code → job.done; start the
-`ci.pipeline` body (`run_ci_pipeline_body`/CI_PIPELINE_WF_TYPE) on a real FlowExecutor with the pre-minted
-wf_run_id + SchedulerJobRunner as the injected JobRunner. Verifier surfaces: the trust-tier claim predicate
-(untrusted_fork must never reach a trusted runner), residency pin, RunnerHooks fail-closed, heartbeat/lease-lost
-double-run guard, references-not-payloads at job.done. Sandbox prod-exec itself is PROVEN (CT-002/003, 0 escapes).
+already set]). **CT-004c.2 DONE + VERIFIED `8757a4d`:** the durable-backed RunnerAgent claims from CiJobQueueStore →
+`SandboxBackend::launch` executes untrusted code in a REAL runsc guest → job.done → settle. `LeaseStore` port
+trait keeps `run_one` byte-for-byte; `DurableLeaseAdapter` forwards region+labels+allowed_tiers VERBATIM
+(empty-tiers = ANY('{}') = claims nothing, fail-closed). Gated behind `MYELIN_CI_RUNNER=1` (default OFF) + a
+no-op spec resolver → untrusted exec doubly-gated until CT-004d. **Independent Fable adversarial verifier:
+CONFIRMED-SOUND** (own probes: trusted-only runner hammered 20× never leases fork; empty-tiers claims nothing;
+region-gated) — no path for untrusted code to reach a trusted runner / escape the gate / bypass the sandbox /
+leak guest bytes. **ORCHESTRATOR CAUGHT:** builder reported 4/4 but the 3 security assertions were silently
+DYING at per-pid schema-collision setup (UNPROVEN) — fixed test-schema uniqueness, now genuinely 4/4 stable.
+**CT-004d must-fix (verifier MEDIUM, latent):** lease_ttl_secs=30 < job timeout(60) → a long real job could
+lapse mid-run → re-execute (at-least-once by design; exactly-once WAKE holds) — raise TTL above max timeout OR
+heartbeat during launch when real specs land. Sandbox prod-exec PROVEN (CT-002/003, 0 escapes).
 · **CT-004d** pipeline body + metering bookends live (b,c) ·
 **CT-004e** check/result producers live → closes the X-1 seam to the merge gate (d) · **CT-004f** log
 pipeline live substrate (a; SSE tail is CT-005) · **CT-004g** fleet/residency (c, optional split).
