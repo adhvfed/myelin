@@ -23,6 +23,8 @@ import {
   prJson,
   prChecksJson,
   prThreadsJson,
+  prDiffJson,
+  fileLinesJson,
   prCommitsEnvelope,
   devPost,
   repoPrsEnvelope,
@@ -179,6 +181,18 @@ const server = createServer((req, res) => {
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/checks$/))) {
       const v = prChecksJson(seg(m[1]), Number(m[2]));
       return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("pull request"));
+    }
+    // R3.2 · G-7 — the PR three-dot diff.
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/diff$/))) {
+      const v = prDiffJson(seg(m[1]), Number(m[2]));
+      return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("pull request"));
+    }
+    // R3.2 · G-7 N2 — expand-context lines at a blob oid.
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/file-lines\/([^/]+)$/))) {
+      const start = Number(url.searchParams.get("start") ?? 1);
+      const end = Number(url.searchParams.get("end") ?? 0);
+      const v = fileLinesJson(seg(m[1]), seg(m[2]), start, end);
+      return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("file"));
     }
     // R3.3 — the PR discussion + review batches.
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/threads$/))) {

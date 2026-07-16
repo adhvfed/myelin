@@ -18,6 +18,19 @@ export {
 // PaneSection owns the W1 "the pane assembles itself" contract (label-before-content, fail-static).
 export { Chip, type ChipProps, type ChipType, type ChipState } from "./Chip";
 export { PaneSection, type PaneSectionProps } from "./PaneSection";
+// The R-17 §5.1 hard component — the ONE diff / files-changed viewer (R3.2 · G-7), consumed by the PR
+// diff (G-7), compare (G-4), and commit detail (G-3). Change kind is TEXT (SR prefix + line numbers),
+// never colour; the line grid is one tab stop (roving focus); side-by-side + unified.
+export {
+  DiffViewer,
+  DiffToolbar,
+  ExpandContextControl,
+  type DiffViewerProps,
+  type DiffViewerFile,
+  type DiffViewerHunk,
+  type DiffViewerLine,
+  type ExpandedContext,
+} from "./DiffViewer";
 // Tier-1 overlay primitives (Dialog · ConfirmDialog · Popover · Menu · Tooltip · Toast) + the shared
 // substrate (one focus-trap/portal/scroll-lock/z-index layer). See ./overlays.
 export * from "./overlays";

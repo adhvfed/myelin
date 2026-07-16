@@ -41,7 +41,7 @@ use myelin_events::MonotonicMinter;
 use myelin_git::api::{http_catalogue, Method as GitMethod};
 use myelin_git::check_status::GitOid;
 use myelin_git::core::{Oid as CoreOid, RepoLoc};
-use myelin_git::durable::{BlobPathLookup, CommitDetail, CommitMeta, TreePathLookup};
+use myelin_git::durable::{BlobPathLookup, CommitDetail, CommitMeta, PrDiff, TreePathLookup};
 use myelin_git::durable::{DurableError, DurableGitRepo, DurableGitStore};
 use myelin_git::lifecycle::{
     BranchProtectionRuleset, PrState, PullRequest, ReviewState, ReviewVerdict,
@@ -59,7 +59,8 @@ use myelin_git::receive_pack::{
     PushOutcome, PushSession, Pusher, QuarantineMigration, QuarantineObject, RefName, RefStore,
 };
 use myelin_git::web::{
-    CommitDiff, CommitRow, DiffFile, DiffLineView, RepoHome, WebEditOutcome,
+    CommitDiff, CommitRow, DiffFile, DiffLineView, PrDiffFile, PrDiffHunk, PrDiffLine, PrDiffVM,
+    RepoHome, WebEditOutcome,
 };
 use myelin_identity::{Principal, PrincipalKind};
 use serde_json::{json, Value};
@@ -472,6 +473,68 @@ impl DurableGitBackend {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc)?;
         Ok(repo.commit_detail(oid)?.map(commit_diff_vm))
+    }
+
+    // ── R3.2 · G-7 — the PR three-dot diff (N1) + expand-context (N2) ──
+
+    /// The PR three-dot diff page (`GET …/prs/{n}/diff`) as a [`PrDiffVM`]. Resolves the PR record
+    /// (404 if absent — a thread/diff op on a missing PR is the overview's 0-leak 404), computes
+    /// `merge-base(base_ref, head_oid) … head_oid` over the durable repo, and pages FILES (MR-014
+    /// envelope) at `offset`/`limit`. `restricted_files` is COUNT-ONLY — under the current repo-level
+    /// `Pull` guard a viewer who may see the PR may see every file, so it is 0 (the per-path ACL is a
+    /// named follow-on; the field is wired non-leaking so a future ACL feeds a count, never paths).
+    fn pr_diff(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        number: u64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<PrDiffVM>, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        let Some(rec) = self.prs.get(&loc, number)? else {
+            return Ok(None);
+        };
+        let repo = self.store.open_repo(&loc)?;
+        let Some(diff) = repo.pr_diff(&rec.base_ref, &rec.head_oid, PR_DIFF_PER_FILE_LINE_CAP)? else {
+            // A malformed/absent head oid — an honest empty diff (the UI renders the empty state, not
+            // an error): no files, the base_ref labelled, three_dot false.
+            return Ok(Some(PrDiffVM {
+                number,
+                base_ref: rec.base_ref.clone(),
+                base_oid: String::new(),
+                head_oid: rec.head_oid.clone(),
+                three_dot: false,
+                files: Vec::new(),
+                restricted_files: 0,
+                total_files: 0,
+                total_additions: 0,
+                total_deletions: 0,
+                next_cursor: None,
+                limit,
+            }));
+        };
+        Ok(Some(pr_diff_vm(number, &rec.base_ref, diff, offset, limit)))
+    }
+
+    /// Expand-context lines (`GET …/file-lines/{oid}?path=&start=&end=`) — the raw context of a blob at
+    /// `oid`, `start..=end`. `path` is carried for the client's column mapping only; the authz is the
+    /// SAME object check as the blob route (`Pull` at the edge). `None` if the oid is malformed/absent.
+    fn file_lines(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        oid: &str,
+        start: usize,
+        end: usize,
+    ) -> Result<Option<Vec<PrDiffLine>>, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        let repo = self.store.open_repo(&loc)?;
+        Ok(repo
+            .file_lines(oid, start, end)?
+            .map(|lines| lines.into_iter().map(pr_diff_line).collect()))
     }
 
     // ── R3.4 repo-browsing completeness: refs · tree-at-path · nested blob · raw/download ──
@@ -2151,6 +2214,75 @@ fn commit_diff_vm(d: CommitDetail) -> CommitDiff {
     }
 }
 
+/// The per-file rendered-line cap for the PR diff (over-cap files carry `truncated == true` + an
+/// "Expand all" refetch). Generous for dogfood-scale reviews; the wire never dumps an unbounded file.
+const PR_DIFF_PER_FILE_LINE_CAP: usize = 4000;
+
+/// Map one durable [`myelin_git::durable::DiffLineDelta`] to the [`PrDiffLine`] VM.
+fn pr_diff_line(l: myelin_git::durable::DiffLineDelta) -> PrDiffLine {
+    PrDiffLine {
+        origin: l.origin,
+        content: l.content,
+        old_no: l.old_no,
+        new_no: l.new_no,
+    }
+}
+
+/// Map the raw [`PrDiff`] to the [`PrDiffVM`], paging FILES (MR-014) at `offset`/`limit`. The whole
+/// diff is computed in one libgit2 pass; the RESPONSE is paged (dogfood scale — a genuinely lazy
+/// per-file compute is a named follow-on). `restricted_files` is 0 under the repo-level `Pull` guard.
+fn pr_diff_vm(number: u64, base_ref: &str, diff: PrDiff, offset: usize, limit: usize) -> PrDiffVM {
+    let total_files = diff.total_files;
+    let files: Vec<PrDiffFile> = diff
+        .files
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|f| PrDiffFile {
+            path: f.path,
+            old_path: f.old_path,
+            status: f.status,
+            kind: f.kind.as_str().to_string(),
+            additions: f.additions,
+            deletions: f.deletions,
+            size_bytes: f.size_bytes,
+            hunks: f
+                .hunks
+                .into_iter()
+                .map(|h| PrDiffHunk {
+                    header: h.header,
+                    old_start: h.old_start,
+                    old_lines: h.old_lines,
+                    new_start: h.new_start,
+                    new_lines: h.new_lines,
+                    lines: h.lines.into_iter().map(pr_diff_line).collect(),
+                })
+                .collect(),
+            deleted_body_available: f.deleted_body_available,
+            truncated: f.truncated,
+        })
+        .collect();
+    let next_cursor = if offset.saturating_add(limit) < total_files {
+        Some(offset.saturating_add(limit).to_string())
+    } else {
+        None
+    };
+    PrDiffVM {
+        number,
+        base_ref: base_ref.to_string(),
+        base_oid: diff.base_oid,
+        head_oid: diff.head_oid,
+        three_dot: diff.three_dot,
+        files,
+        restricted_files: 0,
+        total_files,
+        total_additions: diff.total_additions,
+        total_deletions: diff.total_deletions,
+        next_cursor,
+        limit,
+    }
+}
+
 fn map_durable_err(e: DurableError) -> EdgeError {
     match e {
         DurableError::NotFound(m) => EdgeError::NotFound(m),
@@ -2522,6 +2654,72 @@ impl Handler for DPrCommits {
             200,
             &page_envelope(json!(items), next, ctx.page.limit),
         ))
+    }
+}
+
+/// **GET …/prs/{n}/diff?cursor=&view= — the PR three-dot diff (R3.2 · G-7 N1).** `Pull`-guarded
+/// (read = PR view; 0-leak 404 on an absent PR). `?view=` is the layout hint the client owns (the
+/// server is layout-agnostic); `cursor` pages FILES (MR-014). `restricted_files` is count-only.
+struct DPrDiff {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DPrDiff {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let offset = ctx
+            .page
+            .cursor
+            .as_deref()
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(0);
+        let limit = ctx.page.limit;
+        let vm = self
+            .be
+            .pr_diff(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+                num_param(ctx, "n")?,
+                offset,
+                limit,
+            )
+            .map_err(map_durable_err)?
+            .ok_or_else(|| EdgeError::NotFound("no such pull request".into()))?;
+        Ok(EdgeResponse::json(200, &vm.to_json()))
+    }
+}
+
+/// **GET …/file-lines/{oid}?path=&start=&end= — expand-context (R3.2 · G-7 N2).** `Pull`-guarded
+/// (the SAME object check as the blob route). Returns `{ lines: [...] }` (context lines at a blob
+/// oid); an absent/malformed oid → an empty `lines` (never a 500 for a stale expand request).
+struct DFileLines {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DFileLines {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let start = ctx
+            .request
+            .query_param("start")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1);
+        let end = ctx
+            .request
+            .query_param("end")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0); // 0 = to end-of-file
+        let lines = self
+            .be
+            .file_lines(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+                param(ctx, "oid")?,
+                start,
+                end,
+            )
+            .map_err(map_durable_err)?
+            .unwrap_or_default();
+        let items: Vec<Value> = lines.iter().map(PrDiffLine::to_json).collect();
+        Ok(EdgeResponse::json(200, &json!({ "lines": items })))
     }
 }
 
@@ -3266,6 +3464,20 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         &reroot("/api/git/repos/{repo}/prs/{n}/commits"),
         "git.pr.commits",
         guarded(&be, Pull, Arc::new(DPrCommits { be: be.clone() })),
+    );
+    // ── R3.2 · G-7 — the PR three-dot diff (N1) + expand-context (N2). Both `Pull` (read = PR view /
+    //    the same object-check as the blob route). 0-leak 404 on deny; restricted files count-only. ──
+    b = b.route(
+        get,
+        &reroot("/api/git/repos/{repo}/prs/{n}/diff"),
+        "git.pr.diff",
+        guarded(&be, Pull, Arc::new(DPrDiff { be: be.clone() })),
+    );
+    b = b.route(
+        get,
+        &reroot("/api/git/repos/{repo}/file-lines/{oid}"),
+        "git.file.lines",
+        guarded(&be, Pull, Arc::new(DFileLines { be: be.clone() })),
     );
     // ── R3.3 / R3.2 — the thread + review-batch surface. READ = `Pull` (thread read = PR view);
     //    WRITE = `Push` (comment/review write is a real write grant, never a permissive authorizer). ──
@@ -4050,5 +4262,82 @@ mod pr_thread_tests {
             .expect("merge handler returns a body (409 is an Ok EdgeResponse, not an Err)");
         assert_eq!(resp["error"]["code"], "merge_blocked");
         assert_eq!(resp["checks"]["gate_admitted"], false, "the 409 carries the fresh gate state");
+    }
+
+    /// Seed a repo with a real base commit on `main` + a head commit branched off it (modifying
+    /// file.txt), open a PR at the real head oid, and return the backend + a reader + the head oid.
+    fn setup_diff(tag: &str) -> (Arc<DurableGitBackend>, Principal, String) {
+        let root = temp_root(tag);
+        let authz = GrantBackedRepos::new()
+            .grant_write("u:writer", TENANT, SLUG)
+            .grant_read("u:reader", TENANT, SLUG);
+        let writer = human("u:writer");
+        let reader = human("u:reader");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
+        be.create_repo_as(TENANT, REGION, SLUG, &writer).unwrap();
+        let loc = DurableGitBackend::loc(TENANT, REGION, SLUG);
+        let repo = be.store.open_repo(&loc).unwrap();
+        let b0 = repo.write_blob(b"a\nb\nc\n").unwrap();
+        let t0 = repo.write_tree(&[("file.txt", &b0)]).unwrap();
+        let base = repo
+            .write_commit(&t0, &[], "base", "psn@acme.noreply", "psn@acme.noreply")
+            .unwrap();
+        repo.update_ref_cas("refs/heads/main", None, Some(&base), "c", "psn@acme.noreply")
+            .unwrap();
+        let bh = repo.write_blob(b"a\nB\nc\nd\n").unwrap();
+        let th = repo.write_tree(&[("file.txt", &bh)]).unwrap();
+        let head = repo
+            .write_commit(&th, &[&base], "head", "psn@acme.noreply", "psn@acme.noreply")
+            .unwrap();
+        be.open_pr(
+            TENANT,
+            REGION,
+            SLUG,
+            &json!({ "title": "diff pr", "base_ref": "refs/heads/main",
+                     "head_ref": "refs/heads/feature", "head_oid": head.0, "draft": false }),
+            &writer,
+        )
+        .unwrap();
+        (Arc::new(be), reader, head.0)
+    }
+
+    /// **R3.2 · G-7 N1 — the PR diff is `Pull`-guarded, 0-leak, three-dot, count-only restricted.** A
+    /// reader (PR view) gets the three-dot diff; a stranger with NO grant gets a 0-leak 404 (never a
+    /// distinguishable Forbidden, never a leaked path). `restricted_files` is count-only (0 here).
+    #[test]
+    fn pr_diff_is_pull_guarded_zero_leak_and_three_dot() {
+        let (be, reader, _head) = setup_diff("diffauthz");
+        let guard = guarded(&be, RepoPermission::Pull, Arc::new(DPrDiff { be: be.clone() }));
+        // The reader sees the three-dot diff of file.txt (the PR's own change).
+        let v = serve(&*guard, "GET", &reader, &[("repo", SLUG), ("n", "1")], Value::Null)
+            .expect("a reader may view the PR diff");
+        assert_eq!(v["number"], 1);
+        assert_eq!(v["three_dot"], true, "durable repos are libgit2-backed → merge-base");
+        assert_eq!(v["total_files"], 1);
+        assert_eq!(v["files"][0]["path"], "file.txt");
+        assert_eq!(v["files"][0]["status"], "M");
+        assert_eq!(v["files"][0]["kind"], "text");
+        // Line numbers cross the wire additively.
+        let lines = v["files"][0]["hunks"][0]["lines"].as_array().unwrap();
+        assert!(lines.iter().any(|l| l["origin"] == "+" && l["content"] == "d" && l["new_no"] == 4));
+        // Restricted disclosure is COUNT-ONLY — the field is a number, never a path list.
+        assert_eq!(v["restricted_files"], 0, "count-only; 0 under the repo-level Pull guard");
+        assert!(v["restricted_files"].is_number());
+
+        // A STRANGER with no grant → a 0-leak 404 (NotFound), never a distinguishable Forbidden.
+        let stranger = human("u:stranger");
+        let err = serve(&*guard, "GET", &stranger, &[("repo", SLUG), ("n", "1")], Value::Null)
+            .expect_err("a stranger must not view the diff");
+        assert!(matches!(err, EdgeError::NotFound(_)), "0-leak 404, got {err:?}");
+    }
+
+    /// A diff request for an ABSENT PR is a clean 404 (exactly like the overview — never a 500).
+    #[test]
+    fn pr_diff_absent_pr_is_not_found() {
+        let (be, reader, _head) = setup_diff("diffabsent");
+        let guard = guarded(&be, RepoPermission::Pull, Arc::new(DPrDiff { be: be.clone() }));
+        let err = serve(&*guard, "GET", &reader, &[("repo", SLUG), ("n", "999")], Value::Null)
+            .expect_err("absent PR");
+        assert!(matches!(err, EdgeError::NotFound(_)), "got {err:?}");
     }
 }

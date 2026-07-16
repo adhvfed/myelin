@@ -1233,5 +1233,127 @@ impl CommitDiff {
     }
 }
 
+// ───────────────────────────── PR diff ViewModel (R3.2 · G-7 N1) ─────────────────────────────────
+
+/// One PR-diff line — origin + BOTH line numbers (`old_no` null on `+`, `new_no` null on `-`). The
+/// SR prefix and the anchor/deep-link machinery need the numbers as first-class data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrDiffLine {
+    pub origin: char,
+    pub content: String,
+    pub old_no: Option<u32>,
+    pub new_no: Option<u32>,
+}
+
+impl PrDiffLine {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "origin": self.origin.to_string(),
+            "content": self.content,
+            "old_no": self.old_no,
+            "new_no": self.new_no,
+        })
+    }
+}
+
+/// One hunk of a PR-diff file — the `@@` header + boundaries + lines (collapsed-run + expand-context
+/// need the boundaries a flat `lines[]` can't carry).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrDiffHunk {
+    pub header: String,
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
+    pub lines: Vec<PrDiffLine>,
+}
+
+impl PrDiffHunk {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "header": self.header,
+            "old_start": self.old_start,
+            "old_lines": self.old_lines,
+            "new_start": self.new_start,
+            "new_lines": self.new_lines,
+            "lines": self.lines.iter().map(PrDiffLine::to_json).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// One changed file in a PR diff. A RESTRICTED file is NEVER in this list — the count-only disclosure
+/// lives on [`PrDiffVM::restricted_files`] (non-leak by construction: no path/diffstat crosses the wire).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrDiffFile {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub status: char,
+    /// `text` / `binary` / `lfs` / `submodule` — drives the R-21 binary/LFS row (never a garbled dump).
+    pub kind: String,
+    pub additions: u32,
+    pub deletions: u32,
+    pub size_bytes: Option<u64>,
+    pub hunks: Vec<PrDiffHunk>,
+    pub deleted_body_available: bool,
+    pub truncated: bool,
+}
+
+impl PrDiffFile {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "path": self.path,
+            "old_path": self.old_path,
+            "status": self.status.to_string(),
+            "kind": self.kind,
+            "additions": self.additions,
+            "deletions": self.deletions,
+            "size_bytes": self.size_bytes,
+            "hunks": self.hunks.iter().map(PrDiffHunk::to_json).collect::<Vec<_>>(),
+            "deleted_body_available": self.deleted_body_available,
+            "truncated": self.truncated,
+        })
+    }
+}
+
+/// The **PR diff page** (`GET …/prs/{n}/diff`) — the three-dot `merge-base(base, head) … head` diff.
+/// `restricted_files` is COUNT-ONLY (no path/diffstat); `three_dot == false` labels the two-dot floor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrDiffVM {
+    pub number: u64,
+    pub base_ref: String,
+    pub base_oid: String,
+    pub head_oid: String,
+    pub three_dot: bool,
+    pub files: Vec<PrDiffFile>,
+    pub restricted_files: u64,
+    pub total_files: usize,
+    pub total_additions: u32,
+    pub total_deletions: u32,
+    /// The MR-014 file cursor + the viewer-local viewed marks are client-side; the wire carries only
+    /// the page cursor (viewed = localStorage, R3 Q6 floor).
+    pub next_cursor: Option<String>,
+    pub limit: usize,
+}
+
+impl PrDiffVM {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "number": self.number,
+            "base_ref": self.base_ref,
+            "base_oid": self.base_oid,
+            "short_base_oid": short_oid(&self.base_oid),
+            "head_oid": self.head_oid,
+            "short_head_oid": short_oid(&self.head_oid),
+            "three_dot": self.three_dot,
+            "files": self.files.iter().map(PrDiffFile::to_json).collect::<Vec<_>>(),
+            "restricted_files": self.restricted_files,
+            "total_files": self.total_files,
+            "total_additions": self.total_additions,
+            "total_deletions": self.total_deletions,
+            "page": { "next_cursor": self.next_cursor, "limit": self.limit },
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests;

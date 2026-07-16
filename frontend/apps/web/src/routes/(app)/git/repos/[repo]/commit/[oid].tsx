@@ -1,23 +1,45 @@
-// Commit diff (GT-004) — `/git/repos/{repo}/commit/{oid}`. Renders the edge's CommitDiff ViewModel
-// (libgit2 tree-to-tree diff over the durable repo): the commit header (short oid / summary / full
-// message / pseudonymous author / UTC time) + per-file unified diffs. The diff is a11y-accessible: the
-// change status and each line carry a GLYPH + TEXT (the `+`/`-`/` ` prefix), never colour alone (WCAG
-// 1.4.1). Semantic tokens only.
-import { ErrorBoundary, For, Show, Suspense } from "solid-js";
+// Commit diff (GT-004 · G-3) — `/git/repos/{repo}/commit/{oid}`. Renders the edge's CommitDiff
+// ViewModel (libgit2 tree-to-tree diff over the durable repo) on the SHARED <DiffViewer> (R3.2 · G-7)
+// — the bespoke FileDiff/DiffRow are retired (G-3 "commit detail = diff, reuses G-7"). The diff is
+// a11y-accessible by construction in the viewer: change kind + line numbers are announced as TEXT,
+// never colour alone (WCAG 1.4.1); the line grid is one tab stop. Semantic tokens only.
+import { ErrorBoundary, Show, Suspense, createSignal } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, useParams, useSearchParams } from "@solidjs/router";
-import { Skeleton, SkeletonBlock } from "@myelin/design-system";
-import { getCommit, type DiffFileVM, type DiffLineVM } from "~/lib/api";
+import { Skeleton, SkeletonBlock, DiffViewer, type DiffViewerFile } from "@myelin/design-system";
+import { getCommit, type DiffFileVM } from "~/lib/api";
 import { fmtDate } from "~/lib/format";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 
-const STATUS_LABEL: Record<string, string> = { A: "added", M: "modified", D: "deleted", R: "renamed", C: "copied" };
+/** The commit-diff VM carries flat `lines[]` (no hunks); wrap them in ONE synthetic hunk so the shared
+ *  DiffViewer (hunk-structured) renders them. Line numbers are absent on this legacy shape — the viewer
+ *  tolerates their absence (the gutters render empty, the SR prefix says "line ?"). */
+function toViewerFile(f: DiffFileVM): DiffViewerFile {
+  return {
+    path: f.path,
+    old_path: f.old_path,
+    status: f.status,
+    kind: "text",
+    additions: f.lines.filter((l) => l.origin === "+").length,
+    deletions: f.lines.filter((l) => l.origin === "-").length,
+    hunks: [
+      {
+        header: "",
+        old_start: 0,
+        old_lines: 0,
+        new_start: 0,
+        new_lines: 0,
+        lines: f.lines.map((l) => ({ origin: l.origin, content: l.content, old_no: l.old_no ?? null, new_no: l.new_no ?? null })),
+      },
+    ],
+  };
+}
 
 export default function CommitDiffScreen() {
   const params = useParams();
   const [search] = useSearchParams();
-  // The commit diff KEEPS the arrival ref (finding 6: never reset the breadcrumb to a hardcoded
-  // 'main'). The commits log links here with `?ref=<the ref>`; absent it, fall back to `main`.
+  const [view, setView] = createSignal<"split" | "unified">("unified");
+  // The commit diff KEEPS the arrival ref (finding 6: never reset the breadcrumb to a hardcoded 'main').
   const arrivalRef = () => (typeof search.ref === "string" && search.ref ? search.ref : "main");
   const ready = () => Boolean(params.repo && params.oid);
   const commit = createAsync(async () => {
@@ -47,71 +69,33 @@ export default function CommitDiffScreen() {
           }
         >
           <Show when={ready()} fallback={<RepoErrorState kind="not-found" repo={params.repo} />}>
-          <Show when={commit()} keyed>
-            {(c) => (
-              <>
-                <header style={{ border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)", padding: "var(--space-3)", background: "var(--surface-raised)", display: "flex", "flex-direction": "column", gap: "var(--space-1)" }}>
-                  <h1 id="diff-heading" style={{ "font-size": "var(--fs-h3)", margin: "0" }}>{c.summary}</h1>
-                  <span style={{ color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>
-                    <code style={{ "font-family": "var(--font-mono)" }}>{c.short_oid}</code> · {c.author} · {fmtDate(c.committed_at)}
-                  </span>
-                  <Show when={c.message.trim() && c.message.trim() !== c.summary}>
-                    <pre style={{ margin: "var(--space-2) 0 0", "white-space": "pre-wrap", "font-family": "var(--font-mono)", color: "var(--text-muted)" }}>{c.message}</pre>
-                  </Show>
-                </header>
+            <Show when={commit()} keyed>
+              {(c) => (
+                <>
+                  <header style={{ border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)", padding: "var(--space-3)", background: "var(--surface-raised)", display: "flex", "flex-direction": "column", gap: "var(--space-1)" }}>
+                    <h1 id="diff-heading" style={{ "font-size": "var(--fs-h3)", margin: "0" }}>{c.summary}</h1>
+                    <span style={{ color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>
+                      <code style={{ "font-family": "var(--font-mono)" }}>{c.short_oid}</code> · {c.author} · {fmtDate(c.committed_at)}
+                    </span>
+                    <Show when={c.message.trim() && c.message.trim() !== c.summary}>
+                      <pre style={{ margin: "var(--space-2) 0 0", "white-space": "pre-wrap", "font-family": "var(--font-mono)", color: "var(--text-muted)" }}>{c.message}</pre>
+                    </Show>
+                  </header>
 
-                <Show
-                  when={c.files.length > 0}
-                  fallback={<p style={{ color: "var(--text-muted)" }} data-testid="diff-empty">This commit changed no files.</p>}
-                >
-                  <ul data-testid="diff-files" style={{ "list-style": "none", margin: "0", padding: "0", display: "flex", "flex-direction": "column", gap: "var(--space-3)" }}>
-                    <For each={c.files}>{(f) => <FileDiff file={f} />}</For>
-                  </ul>
-                </Show>
-              </>
-            )}
-          </Show>
+                  <Show
+                    when={c.files.length > 0}
+                    fallback={<p style={{ color: "var(--text-muted)" }} data-testid="diff-empty">This commit changed no files.</p>}
+                  >
+                    <div data-testid="diff-files">
+                      <DiffViewer files={c.files.map(toViewerFile)} view={view()} onToggleView={setView} />
+                    </div>
+                  </Show>
+                </>
+              )}
+            </Show>
           </Show>
         </Suspense>
       </ErrorBoundary>
     </section>
-  );
-}
-
-function FileDiff(props: { file: DiffFileVM }) {
-  return (
-    <li style={{ border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)", overflow: "hidden" }}>
-      <h2 style={{ "font-size": "var(--fs-body)", margin: "0", padding: "var(--space-2) var(--space-3)", background: "var(--surface-overlay)", display: "flex", "align-items": "center", gap: "var(--space-2)" }}>
-        <span style={{ "font-size": "var(--fs-caption)", padding: "0 var(--space-1)", border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)", color: "var(--text-muted)" }}>
-          {STATUS_LABEL[props.file.status] ?? props.file.status}
-        </span>
-        <Show when={props.file.old_path}>
-          {(old) => <code style={{ "font-family": "var(--font-mono)", color: "var(--text-subtle)" }}>{old()} →</code>}
-        </Show>
-        <code style={{ "font-family": "var(--font-mono)" }}>{props.file.path}</code>
-      </h2>
-      <table style={{ width: "100%", "border-collapse": "collapse", "font-family": "var(--font-mono)", "font-size": "var(--fs-body-sm)" }}>
-        <tbody>
-          <For each={props.file.lines}>{(line) => <DiffRow line={line} />}</For>
-        </tbody>
-      </table>
-    </li>
-  );
-}
-
-function DiffRow(props: { line: DiffLineVM }) {
-  const color = () =>
-    props.line.origin === "+" ? "var(--success)" : props.line.origin === "-" ? "var(--danger)" : "var(--text-primary)";
-  const label = () => (props.line.origin === "+" ? "added line" : props.line.origin === "-" ? "removed line" : "context line");
-  return (
-    <tr style={{ color: color() }}>
-      <td aria-hidden="true" style={{ width: "1.5rem", "text-align": "center", "user-select": "none", color: "var(--text-subtle)", "border-inline-end": "var(--hairline) solid var(--border)" }}>
-        {props.line.origin === " " ? "" : props.line.origin}
-      </td>
-      <td style={{ padding: "0 var(--space-2)", "white-space": "pre-wrap" }}>
-        <span class="sr-only">{label()}: </span>
-        {props.line.content || " "}
-      </td>
-    </tr>
   );
 }
