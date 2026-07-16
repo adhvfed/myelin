@@ -1,0 +1,191 @@
+<!-- R3.5 first-run · SKETCH 1/4 · Login (logged-out) — real OIDC primary, dev seam gated, honest SSO-unavailable + error + loading.
+     Dissolves ux-ux-firstrun #6 and ux-ux-a11y-visual #6 (primary rides --c-btn-primary-bg) & #7 (100dvh).
+     Self-contained; links the generated ../tokens.css (semantic tokens only). Direction A "Instrument". -->
+<title>Sign in · Myelin — first-run sketch</title>
+<link rel="stylesheet" href="../tokens.css" />
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{font-family:var(--font-sans);font-size:var(--fs-body);line-height:var(--lh-body);
+    background:var(--surface);color:var(--text-primary);-webkit-font-smoothing:antialiased}
+  .icon{width:1.25em;height:1.25em;display:inline-block;vertical-align:-0.18em;flex:none}
+  .mono{font-family:var(--font-mono)}
+  .muted{color:var(--text-muted)}
+  .subtle{color:var(--text-subtle)}
+  .small{font-size:var(--fs-caption)}
+  .vh{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+    clip:rect(0 0 0 0);white-space:nowrap;border:0}
+
+  .skip-link{position:absolute;inset-inline-start:var(--space-2);inset-block-start:-4rem;
+    background:var(--surface-overlay);color:var(--text-primary);padding:var(--space-2) var(--space-3);
+    border:var(--hairline) solid var(--border-strong);border-radius:var(--radius-1);z-index:var(--z-toast);
+    transition:inset-block-start var(--dur-fast) var(--ease-standard);text-decoration:none}
+  .skip-link:focus{inset-block-start:var(--space-2)}
+
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--space-2);
+    padding:var(--space-2) var(--space-3);border:var(--hairline) solid var(--border-strong);
+    border-radius:var(--radius-1);background:var(--surface);color:var(--text-primary);
+    font:inherit;font-weight:var(--weight-medium);cursor:pointer;text-decoration:none;
+    transition:background var(--dur-fast) var(--ease-standard)}
+  .btn:hover{background:var(--surface-hover)}
+  .btn-block{width:100%}
+  .btn-primary{background:var(--c-btn-primary-bg);color:var(--c-btn-primary-text);
+    border-color:transparent;font-weight:var(--weight-semibold)}
+  .btn-primary:hover{filter:brightness(1.07)}
+  .btn[aria-disabled="true"],.btn:disabled{cursor:not-allowed;color:var(--text-subtle);
+    background:var(--surface);border-color:var(--border);filter:none}
+  .btn[aria-disabled="true"]:hover,.btn:disabled:hover{background:var(--surface)}
+
+  .login-main{min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:var(--space-6);padding:var(--space-6) var(--space-4)}
+  .login-card{width:100%;max-width:24rem;display:flex;flex-direction:column;gap:var(--space-4);
+    padding:var(--space-5);border:var(--hairline) solid var(--border-strong);
+    border-radius:var(--radius-2);background:var(--surface-raised)}
+  .login-card h1{font-size:var(--fs-h2);margin:0;display:flex;align-items:center;gap:var(--space-2)}
+  .sso-sub{margin:0;color:var(--text-subtle);font-size:var(--fs-caption)}
+  .residency-line{margin:0;display:flex;align-items:center;gap:var(--space-1);
+    color:var(--text-muted);font-size:var(--fs-caption)}
+  .residency-line strong{color:var(--text-primary);font-weight:var(--weight-medium)}
+  .divider{border:0;border-block-start:var(--hairline) solid var(--border);margin:0}
+  .dev-seam{display:flex;flex-direction:column;gap:var(--space-2);
+    border:var(--hairline) dashed var(--border);border-radius:var(--radius-1);padding:var(--space-3)}
+  .seam-label{margin:0;display:inline-flex;align-items:center;gap:var(--space-1);
+    color:var(--text-subtle);font-size:var(--fs-caption);text-transform:uppercase;letter-spacing:.04em}
+
+  .reason{margin:0;display:flex;gap:var(--space-2);align-items:flex-start;
+    color:var(--text-muted);font-size:var(--fs-body-sm);
+    border:var(--hairline) solid var(--warning);border-radius:var(--radius-1);
+    padding:var(--space-2) var(--space-3);background:var(--warning-subtle)}
+  .alert{margin:0;display:flex;gap:var(--space-2);align-items:flex-start;
+    color:var(--text-primary);font-size:var(--fs-body-sm);
+    border:var(--hairline) solid var(--danger);border-radius:var(--radius-1);
+    padding:var(--space-2) var(--space-3);background:var(--danger-subtle)}
+  .alert .icon,.reason .icon{margin-block-start:2px}
+
+  /* Sketch-only annotation chrome (not part of the product). */
+  .variant-label{max-width:24rem;width:100%;margin:0 auto;font-size:var(--fs-caption);
+    color:var(--text-subtle);text-transform:uppercase;letter-spacing:.06em;
+    border-block-start:var(--hairline) solid var(--border);padding-block-start:var(--space-2)}
+  .sketch-tools{position:fixed;inset-block-start:var(--space-2);inset-inline-end:var(--space-2);
+    display:flex;gap:var(--space-1);z-index:var(--z-toast);
+    background:var(--surface-overlay);border:var(--hairline) solid var(--border);
+    border-radius:var(--radius-1);padding:var(--space-1)}
+  .sketch-tools button{font:inherit;font-size:var(--fs-caption);padding:2px var(--space-2);
+    border:var(--hairline) solid var(--border);border-radius:var(--radius-1);
+    background:var(--surface);color:var(--text-muted);cursor:pointer}
+  .sketch-tools button:hover{background:var(--surface-hover);color:var(--text-primary)}
+  @media print{.sketch-tools{display:none}}
+</style>
+
+<svg class="vh" aria-hidden="true"><defs>
+  <symbol id="i-human" viewBox="0 0 24 24"><path d="M12 4 C14.2091 4, 16 5.79086, 16 8 C16 10.2091, 14.2091 12, 12 12 C9.79086 12, 8 10.2091, 8 8 C8 5.79086, 9.79086 4, 12 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 20 L5 17 L9 14 L15 14 L19 17 L19 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><path d="M12 4 C15.866 4, 19 5.11929, 19 6.5 C19 7.88071, 15.866 9, 12 9 C8.13401 9, 5 7.88071, 5 6.5 C5 5.11929, 8.13401 4, 12 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M19 6.5 L19 17.5 A7 2.5 0 0 1 5 17.5 L5 6.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M19 10.5 A7 2.5 0 0 1 5 10.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M19 14 A7 2.5 0 0 1 5 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-gate" viewBox="0 0 24 24"><path d="M5 11.75 C5 11.3358, 5.52233 11, 6.16667 11 L17.8333 11 C18.4777 11, 19 11.3358, 19 11.75 L19 19.25 C19 19.6642, 18.4777 20, 17.8333 20 L6.16667 20 C5.52233 20, 5 19.6642, 5 19.25Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M8 11 L8 9 A4 4 0 0 1 16 9 L16 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+</defs></svg>
+
+<div class="sketch-tools" role="group" aria-label="Sketch controls (not part of the product)">
+  <button type="button" data-theme-set="dark">dark</button>
+  <button type="button" data-theme-set="light">light</button>
+  <button type="button" data-theme-set="high-contrast">HC</button>
+  <button type="button" data-dir-toggle>dir</button>
+</div>
+
+<a class="skip-link" href="#login-main">Skip to content</a>
+
+<main id="login-main" class="login-main" tabindex="-1">
+
+  <!-- ============ PRIMARY STATE — logged-out, SSO configured ============ -->
+  <section class="login-card" aria-labelledby="login-h">
+    <h1 id="login-h"><svg class="icon" aria-hidden="true"><use href="#i-human"/></svg> Sign in to Myelin</h1>
+
+    <!-- Real OIDC login (landed R2.5). PRIMARY affordance rides the derived --c-btn-primary-bg
+         (NOT raw --accent) — fixes ux-ux-a11y-visual #6. A server POST starts the provider redirect. -->
+    <form method="post" action="/v1/auth/oidc/start" style="margin:0;display:flex;flex-direction:column;gap:var(--space-2)">
+      <button type="submit" class="btn btn-primary btn-block" data-testid="sso-login">
+        <svg class="icon" aria-hidden="true"><use href="#i-human"/></svg>
+        Continue with single sign-on
+      </button>
+      <p class="sso-sub">You'll be redirected to your organization's identity provider, then back to Myelin.</p>
+    </form>
+
+    <!-- Ambient residency cue (P9, T0). One German string: "Datenregion" (i18n expansion test). -->
+    <p class="residency-line">
+      <svg class="icon" aria-hidden="true"><use href="#i-database"/></svg>
+      Datenregion: <strong>EU-West · Frankfurt</strong>
+    </p>
+
+    <hr class="divider" />
+
+    <!-- Dev seam — RELEGATED below the divider and GATED to dev builds. Rendered here only because
+         `import.meta.env.DEV` (server) is true; a production build tree-shakes it out entirely
+         (dissolves ux-ux-firstrun #6 "dev seam not gated"). -->
+    <div class="dev-seam" data-dev-only>
+      <p class="seam-label"><svg class="icon" aria-hidden="true"><use href="#i-gate"/></svg> Development builds only</p>
+      <form method="post" action="/dev/login" style="margin:0">
+        <button type="submit" class="btn btn-block" data-testid="dev-login">Continue as Dev Operator</button>
+      </form>
+      <p class="subtle small">A local session seam — never issued by a production build.</p>
+    </div>
+  </section>
+
+  <!-- ============ STATE — SSO not configured (unavailable) ============ -->
+  <p class="variant-label">State · SSO unavailable (JWKS / trust-anchors not configured)</p>
+  <section class="login-card" aria-labelledby="login-h2">
+    <h1 id="login-h2"><svg class="icon" aria-hidden="true"><use href="#i-human"/></svg> Sign in to Myelin</h1>
+    <button type="button" class="btn btn-primary btn-block" aria-disabled="true" aria-describedby="sso-reason">
+      <svg class="icon" aria-hidden="true"><use href="#i-human"/></svg>
+      Continue with single sign-on
+    </button>
+    <!-- The reason is VISIBLE TEXT, not a title tooltip — fixes ux-ux-firstrun #6 (mouse-only reason). -->
+    <p class="reason" id="sso-reason">
+      <svg class="icon" aria-hidden="true"><use href="#i-gate"/></svg>
+      <span>Single sign-on isn't available yet on this deployment — an administrator needs to configure
+      the identity provider (JWKS &amp; trust anchors). Contact your Myelin administrator.</span>
+    </p>
+    <hr class="divider" />
+    <div class="dev-seam" data-dev-only>
+      <p class="seam-label"><svg class="icon" aria-hidden="true"><use href="#i-gate"/></svg> Development builds only</p>
+      <form method="post" action="/dev/login" style="margin:0">
+        <button type="submit" class="btn btn-block">Continue as Dev Operator</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- ============ STATE — login failure (error) ============ -->
+  <p class="variant-label">State · Sign-in failed (provider error / cancelled)</p>
+  <section class="login-card" aria-labelledby="login-h3">
+    <h1 id="login-h3"><svg class="icon" aria-hidden="true"><use href="#i-human"/></svg> Sign in to Myelin</h1>
+    <!-- System-blaming, one quiet line + a path; never a raw err.message (R-21). role=alert announces. -->
+    <p class="alert" role="alert">
+      <svg class="icon" aria-hidden="true"><use href="#i-gate"/></svg>
+      <span>Sign-in couldn't be completed. The identity provider didn't return a valid session.
+      You can try again, or contact your administrator if it keeps happening.</span>
+    </p>
+    <form method="post" action="/v1/auth/oidc/start" style="margin:0">
+      <button type="submit" class="btn btn-primary btn-block">
+        <svg class="icon" aria-hidden="true"><use href="#i-human"/></svg> Try single sign-on again
+      </button>
+    </form>
+  </section>
+
+  <!-- ============ STATE — redirecting (loading / busy) ============ -->
+  <p class="variant-label">State · Redirecting to provider (loading)</p>
+  <section class="login-card" aria-labelledby="login-h4">
+    <h1 id="login-h4"><svg class="icon" aria-hidden="true"><use href="#i-human"/></svg> Sign in to Myelin</h1>
+    <button type="button" class="btn btn-primary btn-block" aria-disabled="true" aria-busy="true">
+      Redirecting to your provider…
+    </button>
+    <p class="sso-sub" role="status">Taking you to your identity provider.</p>
+  </section>
+
+</main>
+
+<script>
+  // Sketch-only: theme + direction toggles so a reviewer can check all three themes + RTL (design manual §3.1/§6).
+  for (const b of document.querySelectorAll("[data-theme-set]"))
+    b.addEventListener("click", () => document.documentElement.setAttribute("data-theme", b.dataset.themeSet));
+  document.querySelector("[data-dir-toggle]").addEventListener("click", () => {
+    const el = document.documentElement;
+    el.setAttribute("dir", el.getAttribute("dir") === "rtl" ? "ltr" : "rtl");
+  });
+</script>

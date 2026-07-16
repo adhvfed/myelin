@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<!-- R3 sketch · 02-pr-overview-context · SKETCH 2: W1 — THE PANE ASSEMBLES ITSELF (loading-skeleton)
+     The wedge motion: the SCAFFOLD renders instantly (route + durable PR record resolve first), then the
+     labelled slots — Description / Checks / Commits / Discussion in content, Linked issue / CI run /
+     Linked doc / Agent in the pane — fill independently as their bundles resolve. NO spinner, NO
+     "Loading…" text: structure-matching skeletons, aria-busy per slot, ONE debounced polite live region.
+     Snapshot moment sketched: PR record + CHECKS already resolved (checks bundle landed first); the rest
+     still skeleton. Type-icons in pane slots are already TYPE-TRUE (known from the ref URN before the
+     title resolves — reference-chip spec §2.1). Slots fill in place: no layout shift, no scroll-jump.
+     Timing: each fill uses --dur-fast + --ease-enter; reduced-motion → instant flip (tokens.css handles). -->
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Myelin · myelin/myelin · PR #84 · Overview (assembling)</title>
+<link rel="stylesheet" href="../tokens.css">
+<style>
+html,body{height:100%}
+body{margin:0;background:var(--surface);color:var(--text-primary);font:var(--fs-body-sm)/var(--lh-body) var(--font-sans);-webkit-font-smoothing:antialiased;overflow:hidden}
+.mono{font-family:var(--font-mono)}
+button,input{font:inherit;color:inherit;background:none;border:0}
+button{cursor:pointer}
+a{color:inherit}
+.sr-only{position:absolute;inline-size:1px;block-size:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+svg{flex:none}
+.skiplink{position:absolute;inset-inline-start:-999px}
+.skiplink:focus{inset-inline-start:8px;inset-block-start:8px;z-index:var(--z-toast);background:var(--surface-overlay);color:var(--text-primary);padding:6px 10px;border:var(--hairline) solid var(--focus-ring);border-radius:var(--radius-1)}
+
+.shell{display:grid;grid-template-rows:40px minmax(0,1fr);height:100dvh}
+.topbar{display:flex;align-items:center;gap:var(--space-3);border-block-end:var(--hairline) solid var(--border);padding-inline:var(--space-3);background:var(--surface-raised)}
+.brand{display:flex;align-items:center;gap:7px;font-weight:var(--weight-semibold)}
+.brand .glyph{inline-size:14px;block-size:14px;border:1.5px solid var(--text-muted);border-radius:var(--radius-1);position:relative}
+.brand .glyph::after{content:"";position:absolute;inset-block-start:3px;inset-inline-end:3px;inline-size:4px;block-size:4px;background:var(--accent);border-radius:1px}
+.scope{display:flex;align-items:center;gap:7px;border:var(--hairline) solid var(--border);border-radius:var(--radius-1);padding:3px 8px;color:var(--text-muted);font-size:var(--fs-caption)}
+.scope b{color:var(--text-primary);font-weight:var(--weight-medium)}
+.resid{display:flex;align-items:center;gap:5px;font-family:var(--font-mono);font-size:11px;color:var(--text-muted)}
+.resid .dot{inline-size:6px;block-size:6px;border-radius:var(--radius-pill);background:var(--success)}
+.kbar{margin-inline-start:auto;display:flex;align-items:center;gap:var(--space-2)}
+.cmdk{display:flex;align-items:center;gap:8px;block-size:var(--control-h);padding-inline:9px;min-inline-size:220px;border:var(--hairline) solid var(--border-strong);border-radius:var(--radius-1);color:var(--text-subtle);background:var(--surface)}
+.cmdk .k{margin-inline-start:auto;font-family:var(--font-mono);font-size:11px;border:var(--hairline) solid var(--border);border-radius:var(--radius-1);padding:1px 5px}
+.theme{font-size:11px;color:var(--text-subtle);border:var(--hairline) solid var(--border);border-radius:var(--radius-1);padding:4px 8px}
+.avatar{inline-size:22px;block-size:22px;border-radius:var(--radius-pill);background:var(--surface-hover);display:grid;place-items:center;font-size:10px;color:var(--text-muted);flex:none}
+
+.body{display:grid;grid-template-columns:48px 224px minmax(0,1fr) 332px;min-height:0}
+.rail{border-inline-end:var(--hairline) solid var(--border);background:var(--surface-raised);display:flex;flex-direction:column;align-items:center;padding-block-start:var(--space-2);gap:2px}
+.rail a{inline-size:34px;block-size:34px;display:grid;place-items:center;color:var(--text-subtle);border-radius:var(--radius-1);text-decoration:none}
+.rail a:hover{color:var(--text-primary);background:var(--surface-hover)}
+.rail a.on{color:var(--text-primary);background:var(--surface-hover)}
+.side{border-inline-end:var(--hairline) solid var(--border);overflow:auto;min-height:0;overscroll-behavior:contain;background:var(--surface-raised);padding-block:var(--space-2)}
+.side h4{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--text-subtle);padding:8px 12px 4px;margin:0;font-weight:var(--weight-semibold)}
+.side .row{display:flex;align-items:flex-start;gap:8px;padding:6px 12px;color:var(--text-muted);font-size:12.5px;text-decoration:none;min-block-size:var(--target-min)}
+.side .row.on{background:var(--surface-hover);color:var(--text-primary)}
+.side .row:hover{background:var(--surface-hover);color:var(--text-primary)}
+.side .row .tx{flex:1;min-inline-size:0}
+.content{overflow:auto;min-height:0;overscroll-behavior:contain}
+.pane{border-inline-start:var(--hairline) solid var(--border);overflow:auto;min-height:0;overscroll-behavior:contain;background:var(--surface-raised)}
+.ok{color:var(--success)}.bad{color:var(--danger)}.pend{color:var(--text-subtle)}.info-c{color:var(--info)}
+
+/* ===== skeleton primitives: structure-matching, shimmer via surfaces only ===== */
+.skbar{block-size:9px;background:var(--surface-hover);border-radius:2px;background-image:linear-gradient(90deg,var(--surface-hover),var(--surface-overlay),var(--surface-hover));background-size:200% 100%;animation:sk 1.4s linear infinite}
+@keyframes sk{to{background-position:-200% 0}}
+.w40{inline-size:40%}.w58{inline-size:58%}.w72{inline-size:72%}.w85{inline-size:85%}
+.skrow{display:flex;align-items:center;gap:10px;padding:8px 12px;border-block-end:var(--hairline) solid var(--border)}
+.skrow:last-child{border-block-end:0}
+.skrow .skc{inline-size:13px;block-size:13px;border:1.5px solid var(--border-strong);border-radius:var(--radius-pill);flex:none} /* the CI ring, pre-verdict */
+.skrow .skbar{flex:1}
+.skdot{inline-size:22px;block-size:22px;border-radius:var(--radius-pill);background:var(--surface-hover);flex:none}
+
+.prhead{border-block-end:var(--hairline) solid var(--border);padding:14px 18px}
+.prtitle{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.prnum{color:var(--text-subtle);font-family:var(--font-mono)}
+.prtitle h1{font-size:var(--fs-h3);font-weight:var(--weight-semibold);margin:0}
+.pill{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:var(--weight-medium);border:var(--hairline) solid var(--border);border-radius:var(--radius-pill);padding:2px 9px}
+.prmeta{margin-block-start:8px;color:var(--text-muted);font-size:var(--fs-caption);display:flex;gap:16px;flex-wrap:wrap}
+.prmeta b{color:var(--text-primary);font-weight:var(--weight-medium)}
+.tabs{display:flex;gap:2px;border-block-end:var(--hairline) solid var(--border);padding-inline:18px}
+.tabs a{padding:9px 12px;color:var(--text-subtle);text-decoration:none;font-size:12.5px;border-block-end:2px solid transparent;border-radius:0}
+.tabs a.on{color:var(--text-primary);font-weight:var(--weight-medium);border-block-end-color:var(--accent)}
+.tabs a .n{color:var(--text-subtle);font-size:11px;font-family:var(--font-mono)}
+.section{padding:16px 18px;border-block-end:var(--hairline) solid var(--border)}
+.section h2{font-size:var(--fs-caption);text-transform:uppercase;letter-spacing:.08em;color:var(--text-subtle);margin:0 0 10px;font-weight:var(--weight-semibold)}
+.chk{border:var(--hairline) solid var(--border);border-radius:var(--radius-1);overflow:hidden}
+.crow{display:flex;align-items:center;gap:10px;padding:8px 12px;border-block-end:var(--hairline) solid var(--border);font-size:12.5px;text-decoration:none;color:inherit}
+.crow:last-child{border-block-end:0}
+.crow:hover{background:var(--surface-hover)}
+.crow .st{display:inline-flex;align-items:center;gap:5px;min-inline-size:88px}
+.crow .nm{color:var(--text-primary);font-family:var(--font-mono);font-size:var(--fs-code)}
+.crow .du{margin-inline-start:auto;color:var(--text-subtle);font-size:11.5px;font-family:var(--font-mono)}
+
+.pane h2{position:absolute;inline-size:1px;block-size:1px;overflow:hidden;clip-path:inset(50%)}
+.pane h3{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--text-subtle);padding:12px 14px 6px;margin:0;font-weight:var(--weight-semibold)}
+.card{margin:0 12px 8px;border:var(--hairline) solid var(--border);border-radius:var(--radius-1);background:var(--surface);overflow:hidden}
+.card .ch{display:flex;align-items:flex-start;gap:8px;padding:8px 10px;font-size:var(--fs-caption);border-block-end:var(--hairline) solid var(--border)}
+.card .ch .cico{color:var(--text-subtle);margin-block-start:1px}
+.card .ch .tt{color:var(--text-primary);font-weight:var(--weight-medium);flex:1;min-inline-size:0}
+.card .cb{padding:8px 10px;color:var(--text-muted);font-size:var(--fs-caption)}
+.card .cb .ln{display:flex;gap:8px;margin-block-start:3px;align-items:baseline}
+.card .cb .ln span{color:var(--text-subtle);flex:none;min-inline-size:64px}
+.card .cb .ln b{color:var(--text-primary);font-weight:var(--weight-medium)}
+.card .skbar{margin:6px 10px}
+.chip{display:inline-flex;align-items:center;gap:5px;border:var(--hairline) solid var(--c-chip-border);border-radius:var(--radius-1);padding:1px 6px;font-size:11.5px;color:var(--text-muted);background:var(--c-chip-bg)}
+.pane .foot{padding:10px 14px;color:var(--text-subtle);font-size:11px;font-family:var(--font-mono);border-block-start:var(--hairline) solid var(--border)}
+@media (max-width:1280px){.body{grid-template-columns:48px 224px minmax(0,1fr)}.pane{display:none}}
+@media (max-width:900px){.body{grid-template-columns:48px minmax(0,1fr)}.side{display:none}}
+</style>
+</head>
+<body>
+<a href="#main" class="skiplink">Skip to content</a>
+<div class="shell">
+  <header class="topbar" role="banner">
+    <span class="brand"><span class="glyph" aria-hidden="true"></span>myelin</span>
+    <span class="scope">Code <b>·</b> <b>myelin/myelin</b> <span class="resid"><span class="dot" aria-hidden="true"></span>EU-NORD · Oslo</span></span>
+    <div class="kbar">
+      <button class="cmdk">Search or run a command <span class="k">⌘K</span></button>
+      <button class="theme" id="themebtn">Theme: dark</button>
+      <span class="avatar" title="Adrian Helvik">AH</span>
+    </div>
+  </header>
+
+  <div class="body">
+    <nav class="rail" aria-label="Surfaces">
+      <a href="#" class="on" aria-current="page" aria-label="Code"><svg data-icon="nav-code" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M5.5 4.5L2 8l3.5 3.5M10.5 4.5L14 8l-3.5 3.5"/></svg></a>
+      <a href="#" aria-label="CI"><svg data-icon="nav-ci" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M6.5 5.5l4 2.5-4 2.5z"/></svg></a>
+      <a href="#" aria-label="Issues"><svg data-icon="nav-issues" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/></svg></a>
+      <a href="#" aria-label="Knowledge"><svg data-icon="nav-knowledge" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M3.5 2.5h9v11h-8a1 1 0 01-1-1z"/><path d="M3.5 11h9"/></svg></a>
+      <a href="#" aria-label="Chat"><svg data-icon="nav-chat" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M2.5 3h11v8h-6l-3 2.5V11h-2z"/></svg></a>
+    </nav>
+
+    <!-- the sidebar resolved from its own (cached) bundle — regions load independently, no full-shell skeleton -->
+    <aside class="side" aria-label="Pull requests in myelin/myelin">
+      <h4>Pull requests · myelin/myelin</h4>
+      <a class="row on" href="#" aria-current="page"><span class="tx">#84 R2.1: object-level authz on the git JSON product API</span></a>
+      <a class="row" href="#"><span class="tx">#83 R2.6: remove the action-level AllowAll from the prod edge</span></a>
+      <a class="row" href="#"><span class="tx">#82 R2.5: wire real OIDC login at the edge</span></a>
+      <a class="row" href="#"><span class="tx">#79 Konfigurierbare Branch-Schutzregeln für geschützte Zweige</span></a>
+    </aside>
+
+    <main class="content" id="main" aria-labelledby="pr-h1">
+      <!-- SCAFFOLD, instantly: number from the route; title/pill from the durable PR record (first,
+           smallest fetch). The rest of the header meta is skeleton until the record lands — here the
+           record HAS landed, so header is real while heavier bundles still resolve. -->
+      <div class="prhead">
+        <div class="prtitle">
+          <span class="prnum">#84</span>
+          <h1 id="pr-h1">R2.1: object-level authz on the git JSON product API</h1>
+          <span class="pill"><svg data-icon="pull-request" class="info-c" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="4.5" cy="4" r="1.8"/><circle cx="4.5" cy="12" r="1.8"/><path d="M4.5 6v4"/><path d="M11.5 10.2V7.5a3 3 0 00-3-3"/><circle cx="11.5" cy="12" r="1.8"/></svg>Open</span>
+        </div>
+        <div class="prmeta">
+          <span><b class="mono">r2.1/object-level-authz</b> → <b class="mono">main</b></span>
+          <span>by <b>Adrian Helvik</b></span>
+          <!-- diff stat comes with the (not yet resolved) diff bundle -->
+          <span class="skbar" style="inline-size:96px" aria-hidden="true"></span>
+        </div>
+      </div>
+
+      <nav class="tabs" aria-label="Pull request views">
+        <a href="#" class="on" aria-current="page">Overview</a>
+        <a href="#">Commits <span class="skbar" style="inline-size:14px;display:inline-block" aria-hidden="true"></span></a>
+        <a href="#">Diff</a>
+        <a href="#">Checks <span class="n">6</span></a>
+        <a href="#">Discussion</a>
+      </nav>
+
+      <!-- SLOT: Description (labelled; skeleton matches final paragraph structure) -->
+      <section class="section" aria-labelledby="desc-h" aria-busy="true">
+        <h2 id="desc-h">Description</h2>
+        <div style="max-inline-size:72ch;display:flex;flex-direction:column;gap:7px">
+          <div class="skbar w85" aria-hidden="true"></div>
+          <div class="skbar w72" aria-hidden="true"></div>
+          <div class="skbar w58" aria-hidden="true"></div>
+        </div>
+      </section>
+
+      <!-- SLOT: Checks — RESOLVED FIRST (the checks projection is the smallest hot bundle; W4 warmth).
+           It filled IN PLACE: same rows the skeleton promised. This is the "assembling" beat. -->
+      <section class="section" aria-labelledby="checks-h">
+        <h2 id="checks-h">Checks — 4 passed · 1 failing · 1 pending</h2>
+        <div class="chk" role="group" aria-label="Required checks">
+          <a class="crow" href="#"><span class="st ok"><svg data-icon="check-pass" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="8" cy="8" r="6.2"/><path d="M5.2 8.4l1.9 1.9 3.7-4.2"/></svg>passed</span><span class="nm">build · cargo</span><span class="du">1m42s</span></a>
+          <a class="crow" href="#"><span class="st ok"><svg data-icon="check-pass" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="8" cy="8" r="6.2"/><path d="M5.2 8.4l1.9 1.9 3.7-4.2"/></svg>passed</span><span class="nm">test · unit</span><span class="du">3m18s</span></a>
+          <a class="crow" href="#"><span class="st bad"><svg data-icon="check-fail" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="8" cy="8" r="6.2"/><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/></svg>failed</span><span class="nm">test · integration · edge-authz</span><span class="du">run #4117</span></a>
+          <a class="crow" href="#"><span class="st ok"><svg data-icon="check-pass" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="8" cy="8" r="6.2"/><path d="M5.2 8.4l1.9 1.9 3.7-4.2"/></svg>passed</span><span class="nm">lint · clippy</span><span class="du">24s</span></a>
+          <a class="crow" href="#"><span class="st ok"><svg data-icon="check-pass" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="8" cy="8" r="6.2"/><path d="M5.2 8.4l1.9 1.9 3.7-4.2"/></svg>passed</span><span class="nm">scanner · no-permissive-authorizer-in-prod</span><span class="du">9s</span></a>
+          <a class="crow" href="#"><span class="st pend"><svg data-icon="check-pending" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="8" cy="8" r="6.2"/><path d="M5.5 8h5"/></svg>running</span><span class="nm">audit · cargo-deny</span><span class="du">1m03s elapsed</span></a>
+        </div>
+      </section>
+
+      <!-- SLOT: Commits (skeleton rows: oid stub + summary bar — matches final row shape) -->
+      <section class="section" aria-labelledby="cmt-h" aria-busy="true">
+        <h2 id="cmt-h">Commits</h2>
+        <div class="chk">
+          <div class="skrow"><span class="skbar" style="inline-size:52px;flex:none" aria-hidden="true"></span><span class="skbar w72" aria-hidden="true"></span></div>
+          <div class="skrow"><span class="skbar" style="inline-size:52px;flex:none" aria-hidden="true"></span><span class="skbar w58" aria-hidden="true"></span></div>
+          <div class="skrow"><span class="skbar" style="inline-size:52px;flex:none" aria-hidden="true"></span><span class="skbar w85" aria-hidden="true"></span></div>
+        </div>
+      </section>
+
+      <!-- SLOT: Discussion (skeleton comments: avatar circle + header bar + two body bars) -->
+      <section class="section" aria-labelledby="disc-h" aria-busy="true" style="border-block-end:0">
+        <h2 id="disc-h">Discussion</h2>
+        <div style="display:flex;flex-direction:column;gap:12px;max-inline-size:76ch">
+          <div style="border:var(--hairline) solid var(--border);border-radius:var(--radius-1)">
+            <div class="skrow"><span class="skdot" aria-hidden="true"></span><span class="skbar w40" aria-hidden="true"></span></div>
+            <div style="padding:4px 12px 12px;display:flex;flex-direction:column;gap:7px"><div class="skbar w85" aria-hidden="true"></div><div class="skbar w58" aria-hidden="true"></div></div>
+          </div>
+          <div style="border:var(--hairline) solid var(--border);border-radius:var(--radius-1)">
+            <div class="skrow"><span class="skdot" aria-hidden="true"></span><span class="skbar w40" aria-hidden="true"></span></div>
+            <div style="padding:4px 12px 12px;display:flex;flex-direction:column;gap:7px"><div class="skbar w72" aria-hidden="true"></div></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- THE PANE ASSEMBLING: every slot labelled + type-true icon BEFORE resolution (icon is in the
+         ref URN type). CI run slot resolved; issue/doc/agent still shimmer. Each slot aria-busy alone. -->
+    <aside class="pane" id="ctx" aria-labelledby="ctx-h">
+      <h2 id="ctx-h">Pull request context</h2>
+
+      <section aria-labelledby="ctx-issue" aria-busy="true"><h3 id="ctx-issue">Linked issue</h3>
+      <div class="card">
+        <div class="ch"><svg class="cico" data-icon="issue" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6.2"/><circle cx="8" cy="8" r="1.4" fill="currentColor" stroke="none"/></svg>
+          <span class="skbar w72" style="margin-block-start:2px" aria-hidden="true"></span></div>
+        <div class="skbar w58" aria-hidden="true"></div>
+        <div class="skbar w40" aria-hidden="true"></div>
+      </div></section>
+
+      <!-- resolved: filled in place, same card shape the skeleton promised -->
+      <section aria-labelledby="ctx-run"><h3 id="ctx-run">CI run · latest</h3>
+      <a class="card" style="display:block;text-decoration:none" href="#">
+        <div class="ch"><svg class="cico" data-icon="run" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6.2"/><path d="M6.5 5.5l4 2.5-4 2.5z"/></svg>
+          <span class="tt">run #4117 · integration · edge-authz</span><span class="chip bad"><svg data-icon="check-fail" width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="8" cy="8" r="6.2"/><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/></svg>failed</span></div>
+        <div class="cb"><div class="ln"><span>Step 5 / 7</span><b class="mono">cross_tenant_read_denied</b></div></div>
+      </a></section>
+
+      <section aria-labelledby="ctx-doc" aria-busy="true"><h3 id="ctx-doc">Linked doc</h3>
+      <div class="card">
+        <div class="ch"><svg class="cico" data-icon="doc" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 2h5l3 3v9H4z"/><path d="M9 2v3h3"/></svg>
+          <span class="skbar w58" style="margin-block-start:2px" aria-hidden="true"></span></div>
+        <div class="skbar w72" aria-hidden="true"></div>
+      </div></section>
+
+      <section aria-labelledby="ctx-agent" aria-busy="true"><h3 id="ctx-agent">Agent</h3>
+      <div class="card">
+        <div class="ch"><span style="inline-size:14px;block-size:14px;border:1.5px solid var(--c-agent-mark);border-radius:2px;display:grid;place-items:center;flex:none" aria-hidden="true"><i style="inline-size:4px;block-size:4px;background:var(--c-agent-mark)"></i></span>
+          <span class="skbar w40" style="margin-block-start:2px" aria-hidden="true"></span></div>
+        <div class="skbar w85" aria-hidden="true"></div>
+        <div class="skbar w58" aria-hidden="true"></div>
+      </div></section>
+
+      <div class="foot">⌘K act · g d diff · g k checks · . comment · x context</div>
+    </aside>
+  </div>
+</div>
+<!-- ONE debounced polite live region: announces once per settle-burst, e.g. "Pull request context
+     loaded — checks, linked issue, discussion." Never one announcement per slot. -->
+<div class="sr-only" role="status" aria-live="polite" id="live">Checks loaded. Remaining context is loading.</div>
+<script>
+var tb=document.getElementById('themebtn'),T=['dark','light','high-contrast'];
+tb.addEventListener('click',function(){var r=document.documentElement,i=(T.indexOf(r.dataset.theme||'dark')+1)%T.length;r.dataset.theme=T[i];tb.textContent='Theme: '+T[i];});
+</script>
+</body>
+</html>

@@ -1,0 +1,347 @@
+<!-- R3.5 first-run · SKETCH 2/4 · Fresh empty tenant — onboarding-forward repos list + honest chrome.
+     Dissolves ux-ux-firstrun #2 (empty teaches push-to-create), #3 (no fake inbox / no fake badge),
+     #1 (rail honest about unbuilt destinations), and ux-ux-a11y-visual #2 (rail active = surface-hover,
+     not accent fill) & #4 (skeleton + aria-busy loading). Links ../tokens.css. Direction A "Instrument". -->
+<title>Code · Myelin — first-run (empty tenant) sketch</title>
+<link rel="stylesheet" href="../tokens.css" />
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{font-family:var(--font-sans);font-size:var(--fs-body);line-height:var(--lh-body);
+    background:var(--surface);color:var(--text-primary);-webkit-font-smoothing:antialiased}
+  .icon{width:1.25em;height:1.25em;display:inline-block;vertical-align:-0.18em;flex:none}
+  .icon-lg{width:2.5em;height:2.5em}
+  .mono{font-family:var(--font-mono)}
+  .muted{color:var(--text-muted)}
+  .subtle{color:var(--text-subtle)}
+  .small{font-size:var(--fs-caption)}
+  .vh{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+    clip:rect(0 0 0 0);white-space:nowrap;border:0}
+
+  .skip-link{position:absolute;inset-inline-start:var(--space-2);inset-block-start:-4rem;
+    background:var(--surface-overlay);color:var(--text-primary);padding:var(--space-2) var(--space-3);
+    border:var(--hairline) solid var(--border-strong);border-radius:var(--radius-1);
+    z-index:var(--z-toast);text-decoration:none;transition:inset-block-start var(--dur-fast) var(--ease-standard)}
+  .skip-link:focus{inset-block-start:var(--space-2)}
+
+  /* ---- buttons ---- */
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--space-2);
+    padding:var(--space-2) var(--space-3);border:var(--hairline) solid var(--border-strong);
+    border-radius:var(--radius-1);background:var(--surface);color:var(--text-primary);
+    font:inherit;font-weight:var(--weight-medium);cursor:pointer;text-decoration:none;
+    transition:background var(--dur-fast) var(--ease-standard)}
+  .btn:hover{background:var(--surface-hover)}
+  .btn-primary{background:var(--c-btn-primary-bg);color:var(--c-btn-primary-text);
+    border-color:transparent;font-weight:var(--weight-semibold)}
+  .btn-primary:hover{filter:brightness(1.07)}
+  .btn-sm{padding:var(--space-1) var(--space-2);font-size:var(--fs-body-sm)}
+
+  /* ---- shell ---- */
+  .shell{display:grid;grid-template-columns:auto 1fr;grid-template-rows:auto 1fr;
+    height:100vh;height:100dvh;min-height:0;overflow:hidden}
+  .topbar{grid-column:1 / 3;display:flex;align-items:center;gap:var(--space-3);
+    padding:var(--space-2) var(--space-3);border-block-end:var(--hairline) solid var(--border);
+    background:var(--surface-raised);z-index:var(--z-chrome)}
+  .brand{font-size:var(--fs-h3);font-weight:var(--weight-semibold);letter-spacing:.02em}
+  .omnibox{display:flex;align-items:center;gap:var(--space-2);flex:1;max-width:28rem;
+    padding:var(--space-2) var(--space-3);border:var(--hairline) solid var(--border);
+    border-radius:var(--radius-1);background:var(--surface);color:var(--text-muted);
+    cursor:pointer;text-align:start;font:inherit;
+    transition:background var(--dur-fast) var(--ease-standard)}
+  .omnibox:hover{background:var(--surface-hover)}
+  .omnibox kbd{font-family:var(--font-mono);font-size:var(--fs-caption);color:var(--text-subtle)}
+  .spacer{flex:1}
+  .residency{display:inline-flex;align-items:center;gap:var(--space-1);
+    padding:var(--space-1) var(--space-2);border:var(--hairline) solid var(--border);
+    border-radius:var(--radius-pill);color:var(--text-muted);font-size:var(--fs-caption)}
+  .residency strong{color:var(--text-primary);font-weight:var(--weight-medium)}
+  .iconbtn{display:inline-flex;align-items:center;gap:var(--space-1);padding:var(--space-2);
+    border:var(--hairline) solid var(--border);border-radius:var(--radius-1);
+    background:var(--surface);color:var(--text-primary);cursor:pointer;font:inherit;
+    transition:background var(--dur-fast) var(--ease-standard)}
+  .iconbtn:hover{background:var(--surface-hover)}
+  .identity{display:inline-flex;align-items:center;gap:var(--space-2);padding:var(--space-2) var(--space-3);
+    border:var(--hairline) solid var(--border);border-radius:var(--radius-1);background:var(--surface);
+    color:var(--text-primary);cursor:pointer;font:inherit}
+  .identity:hover{background:var(--surface-hover)}
+
+  /* ---- rail (active = surface-hover fill + text-primary + accent-tinted glyph; NO accent tile) ---- */
+  .rail{grid-row:2;display:flex;flex-direction:column;gap:var(--space-1);padding:var(--space-2);
+    border-inline-end:var(--hairline) solid var(--border);background:var(--surface-raised)}
+  .rail-item{position:relative;display:flex;align-items:center;justify-content:center;
+    width:2.25rem;height:2.25rem;border-radius:var(--radius-1);color:var(--text-muted);
+    background:transparent;text-decoration:none;
+    transition:background var(--dur-fast) var(--ease-standard),color var(--dur-fast) var(--ease-standard)}
+  .rail-item:hover{background:var(--surface-hover);color:var(--text-primary)}
+  .rail-item[aria-current="page"]{background:var(--surface-hover);color:var(--text-primary)}
+  .rail-item[aria-current="page"] .icon{color:var(--accent)}
+  .rail-item[data-unavailable]{color:var(--text-subtle)}
+  .rail-item[data-unavailable]:hover{background:var(--surface-hover);color:var(--text-muted)}
+  /* square-cut "not built yet" marker (R1: any edge marker must be square, never a rounded pill) */
+  .rail-item[data-unavailable]::after{content:"";position:absolute;inset-block-start:5px;
+    inset-inline-end:5px;width:4px;height:4px;background:var(--border-strong)}
+
+  /* ---- main / content ---- */
+  .body{grid-row:2;display:grid;grid-template-columns:1fr;min-height:0;min-width:0}
+  .main{min-height:0;min-width:0;overflow:auto;padding:var(--space-6)}
+  .content{max-width:60rem;margin:0 auto;display:flex;flex-direction:column;gap:var(--space-5)}
+  h1{font-size:var(--fs-h1);margin:0}
+  h2{font-size:var(--fs-h3);margin:0}
+  .lede{margin:0;color:var(--text-muted);max-width:44rem}
+
+  .onboard-grid{display:grid;grid-template-columns:minmax(0,1fr) 17rem;gap:var(--space-5);align-items:start}
+  @media (max-width:52rem){.onboard-grid{grid-template-columns:1fr}}
+
+  .card{border:var(--hairline) solid var(--border);border-radius:var(--radius-2);
+    background:var(--surface-raised);padding:var(--space-4)}
+  .steps{display:flex;flex-direction:column;gap:var(--space-4)}
+  .step{display:grid;grid-template-columns:auto 1fr;gap:var(--space-3);align-items:start}
+  .step-n{display:inline-flex;align-items:center;justify-content:center;width:1.5rem;height:1.5rem;
+    border:var(--hairline) solid var(--border-strong);border-radius:var(--radius-pill);
+    font-size:var(--fs-caption);font-weight:var(--weight-semibold);color:var(--text-primary)}
+  .step-body{display:flex;flex-direction:column;gap:var(--space-2);min-width:0}
+  .step-title{font-weight:var(--weight-semibold)}
+  .code-row{display:flex;align-items:stretch;gap:var(--space-2)}
+  .code-block{flex:1;min-width:0;font-family:var(--font-mono);font-size:var(--fs-code);
+    background:var(--surface);border:var(--hairline) solid var(--border);border-radius:var(--radius-1);
+    padding:var(--space-2) var(--space-3);white-space:pre;overflow-x:auto;margin:0;color:var(--text-primary)}
+
+  .whatnext{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:var(--space-2)}
+  .whatnext li{display:flex;align-items:flex-start;gap:var(--space-2);color:var(--text-muted)}
+  .whatnext .icon{color:var(--text-subtle);margin-block-start:1px}
+
+  /* waiting-for-push live affordance (NOT a CI verdict ring — a neutral live indicator) */
+  .waiting{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap;
+    border:var(--hairline) solid var(--border);border-radius:var(--radius-1);
+    padding:var(--space-3);background:var(--surface)}
+  .live-dot{width:8px;height:8px;background:var(--accent);flex:none}
+  .waiting-text{font-weight:var(--weight-medium)}
+
+  /* ---- first-run checklist ---- */
+  .checklist{display:flex;flex-direction:column;gap:var(--space-3)}
+  .checklist h2{margin-block-end:var(--space-1)}
+  .cl-item{display:grid;grid-template-columns:auto 1fr;gap:var(--space-2);align-items:start}
+  .mk{width:1.25rem;height:1.25rem;flex:none;display:inline-flex;align-items:center;justify-content:center}
+  .mk-cur{background:var(--accent)}            /* current: filled accent square (shape+position, +label) */
+  .mk-todo{border:var(--border-2) solid var(--border-strong);border-radius:var(--radius-pill)}
+  .cl-cur .cl-label{color:var(--text-primary);font-weight:var(--weight-medium)}
+  .cl-todo .cl-label{color:var(--text-subtle)}
+  .cl-sub{font-size:var(--fs-caption);color:var(--text-subtle)}
+
+  /* ---- skeleton (static; no shimmer — ambient/looping motion is banned) ---- */
+  .skel-list{display:flex;flex-direction:column;gap:var(--space-2)}
+  .skel-row{border:var(--hairline) solid var(--border);border-radius:var(--radius-1);
+    background:var(--surface-raised);padding:var(--space-3);display:flex;flex-direction:column;gap:var(--space-2)}
+  .skel{background:var(--surface-hover);border-radius:var(--radius-1);height:.9rem}
+
+  /* ---- sketch-only annotation chrome ---- */
+  .variant-label{font-size:var(--fs-caption);color:var(--text-subtle);text-transform:uppercase;
+    letter-spacing:.06em;border-block-start:var(--hairline) solid var(--border);padding-block-start:var(--space-2)}
+  .sketch-tools{position:fixed;inset-block-start:var(--space-2);inset-inline-end:var(--space-2);
+    display:flex;gap:var(--space-1);z-index:var(--z-toast);background:var(--surface-overlay);
+    border:var(--hairline) solid var(--border);border-radius:var(--radius-1);padding:var(--space-1)}
+  .sketch-tools button{font:inherit;font-size:var(--fs-caption);padding:2px var(--space-2);
+    border:var(--hairline) solid var(--border);border-radius:var(--radius-1);
+    background:var(--surface);color:var(--text-muted);cursor:pointer}
+  .sketch-tools button:hover{background:var(--surface-hover);color:var(--text-primary)}
+  @media print{.sketch-tools{display:none}}
+</style>
+
+<svg class="vh" aria-hidden="true"><defs>
+  <symbol id="i-nav-code" viewBox="0 0 24 24"> <path d="M9 7 L4 12 L9 17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M15 7 L20 12 L15 17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-nav-issues" viewBox="0 0 24 24"> <path d="M12 3 C16.9706 3, 21 7.02944, 21 12 C21 16.9706, 16.9706 21, 12 21 C7.02944 21, 3 16.9706, 3 12 C3 7.02944, 7.02944 3, 12 3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M12 10 C13.1046 10, 14 10.8954, 14 12 C14 13.1046, 13.1046 14, 12 14 C10.8954 14, 10 13.1046, 10 12 C10 10.8954, 10.8954 10, 12 10Z" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-nav-chat" viewBox="0 0 24 24"> <path d="M11 4.83333 C11 4.3731, 11.4197 4, 11.9375 4 L19.0625 4 C19.5803 4, 20 4.3731, 20 4.83333 L20 11.1667 C20 11.6269, 19.5803 12, 19.0625 12 L11.9375 12 C11.4197 12, 11 11.6269, 11 11.1667Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M4 9.83333 C4 9.3731, 4.51301 9, 5.14583 9 L13.8542 9 C14.487 9, 15 9.3731, 15 9.83333 L15 16.1667 C15 16.6269, 14.487 17, 13.8542 17 L5.14583 17 C4.51301 17, 4 16.6269, 4 16.1667Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M7 17 L6 20 L10 17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-nav-ci" viewBox="0 0 24 24"> <path d="M12 3 C16.9706 3, 21 7.02944, 21 12 C21 16.9706, 16.9706 21, 12 21 C7.02944 21, 3 16.9706, 3 12 C3 7.02944, 7.02944 3, 12 3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M10 8 L16 12 L10 16Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-nav-knowledge" viewBox="0 0 24 24"> <path d="M12 5 L12 19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M12 5 L7 4 L4 5 L4 18 L7 17 L12 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M12 5 L17 4 L20 5 L20 18 L17 17 L12 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-inbox" viewBox="0 0 24 24"> <path d="M4 4 L4 15 L8 15 L9 18 L15 18 L16 15 L20 15 L20 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M4 15 L9 15 L10 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"> <path d="M10 4 C13.3137 4, 16 6.68629, 16 10 C16 13.3137, 13.3137 16, 10 16 C6.68629 16, 4 13.3137, 4 10 C4 6.68629, 6.68629 4, 10 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M15 15 L20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-human" viewBox="0 0 24 24"> <path d="M12 4 C14.2091 4, 16 5.79086, 16 8 C16 10.2091, 14.2091 12, 12 12 C9.79086 12, 8 10.2091, 8 8 C8 5.79086, 9.79086 4, 12 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M5 20 L5 17 L9 14 L15 14 L19 17 L19 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"> <path d="M9 5 L16 12 L9 19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"> <path d="M12 4 C15.866 4, 19 5.11929, 19 6.5 C19 7.88071, 15.866 9, 12 9 C8.13401 9, 5 7.88071, 5 6.5 C5 5.11929, 8.13401 4, 12 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M19 6.5 L19 17.5 A7 2.5 0 0 1 5 17.5 L5 6.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M19 10.5 A7 2.5 0 0 1 5 10.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M19 14 A7 2.5 0 0 1 5 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-repo" viewBox="0 0 24 24"> <path d="M5 3.75 C5 3.33579, 5.26117 3, 5.58333 3 L18.4167 3 C18.7388 3, 19 3.33579, 19 3.75 L19 20.25 C19 20.6642, 18.7388 21, 18.4167 21 L5.58333 21 C5.26117 21, 5 20.6642, 5 20.25Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M9 3 L9 21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M13 7 L16 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"> <path d="M9 12 L15 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M10 16 A6 4 0 0 1 10 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M14 8 A6 4 0 0 1 14 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-gate" viewBox="0 0 24 24"> <path d="M5 11.75 C5 11.3358, 5.52233 11, 6.16667 11 L17.8333 11 C18.4777 11, 19 11.3358, 19 11.75 L19 19.25 C19 19.6642, 18.4777 20, 17.8333 20 L6.16667 20 C5.52233 20, 5 19.6642, 5 19.25Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M8 11 L8 9 A4 4 0 0 1 16 9 L16 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-check-pass" viewBox="0 0 24 24"> <path d="M12 4 C16.4183 4, 20 7.58172, 20 12 C20 16.4183, 16.4183 20, 12 20 C7.58172 20, 4 16.4183, 4 12 C4 7.58172, 7.58172 4, 12 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M8 12 L11 15 L16 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+  <symbol id="i-approve" viewBox="0 0 24 24"> <path d="M5 13 L10 18 L19 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+</defs></svg>
+
+<div class="sketch-tools" role="group" aria-label="Sketch controls (not part of the product)">
+  <button type="button" data-theme-set="dark">dark</button>
+  <button type="button" data-theme-set="light">light</button>
+  <button type="button" data-theme-set="high-contrast">HC</button>
+  <button type="button" data-dir-toggle>dir</button>
+</div>
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<div class="shell">
+  <!-- ===================== TOPBAR (honest chrome) ===================== -->
+  <header class="topbar" role="banner">
+    <span class="brand">Myelin</span>
+    <button type="button" class="omnibox" aria-keyshortcuts="Meta+K Control+K" aria-haspopup="dialog">
+      <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>
+      <span class="spacer" style="text-align:start">Search or run a command</span>
+      <kbd>⌘K</kbd>
+    </button>
+    <span class="spacer"></span>
+    <span class="residency" title="Tenant acme">
+      <svg class="icon" aria-hidden="true"><use href="#i-database"/></svg>
+      Data region: <strong>EU-West</strong>
+    </span>
+    <!-- Inbox driven by REAL state: zero unread → NO badge, honest empty (fixes firstrun #3). -->
+    <button type="button" class="iconbtn" aria-haspopup="dialog" aria-label="Inbox, no unread notifications">
+      <svg class="icon" aria-hidden="true"><use href="#i-inbox"/></svg>
+    </button>
+    <button type="button" class="identity" aria-haspopup="menu">
+      <svg class="icon" aria-hidden="true"><use href="#i-human"/></svg>
+      <span>Ada Osei</span>
+      <svg class="icon" aria-hidden="true"><use href="#i-chevron"/></svg>
+    </button>
+  </header>
+
+  <!-- ===================== RAIL (honest about unbuilt destinations) ===================== -->
+  <nav class="rail" aria-label="Surfaces">
+    <a class="rail-item" href="/git/repos" aria-current="page" aria-label="Code">
+      <svg class="icon" aria-hidden="true"><use href="#i-nav-code"/></svg>
+    </a>
+    <a class="rail-item" href="/issues" data-unavailable aria-label="Issues — not available yet">
+      <svg class="icon" aria-hidden="true"><use href="#i-nav-issues"/></svg>
+    </a>
+    <a class="rail-item" href="/chat" data-unavailable aria-label="Chat — not available yet">
+      <svg class="icon" aria-hidden="true"><use href="#i-nav-chat"/></svg>
+    </a>
+    <a class="rail-item" href="/ci" data-unavailable aria-label="CI — not available yet">
+      <svg class="icon" aria-hidden="true"><use href="#i-nav-ci"/></svg>
+    </a>
+    <a class="rail-item" href="/knowledge" data-unavailable aria-label="Knowledge — not available yet">
+      <svg class="icon" aria-hidden="true"><use href="#i-nav-knowledge"/></svg>
+    </a>
+  </nav>
+
+  <!-- ===================== BODY ===================== -->
+  <div class="body">
+    <main id="main" class="main" tabindex="-1">
+      <div class="content">
+        <div style="display:flex;flex-direction:column;gap:var(--space-2)">
+          <h1 id="repos-heading">Repositories</h1>
+          <p class="lede">
+            This tenant has no repositories yet. Myelin creates a repository the first time you push to it —
+            there's nothing to set up here first.
+          </p>
+        </div>
+
+        <div class="onboard-grid">
+          <!-- LEFT: teach push-to-create -->
+          <section class="card" aria-labelledby="get-code-in" data-testid="repos-empty">
+            <div class="steps">
+              <h2 id="get-code-in">Get your first repository in</h2>
+
+              <div class="step">
+                <span class="step-n" aria-hidden="true">1</span>
+                <div class="step-body">
+                  <span class="step-title">Point a local repo at Myelin</span>
+                  <div class="code-row">
+                    <pre class="code-block" id="cmd-remote">git remote add myelin https://git.eu.myelin.dev/acme/&lt;name&gt;.git</pre>
+                    <button type="button" class="btn btn-sm" aria-label="Copy: git remote add" data-copy="#cmd-remote">
+                      <svg class="icon" aria-hidden="true"><use href="#i-link"/></svg> Copy
+                    </button>
+                  </div>
+                  <span class="small subtle">Swap <code class="mono">&lt;name&gt;</code> for your repository name — that's what it will be called.</span>
+                </div>
+              </div>
+
+              <div class="step">
+                <span class="step-n" aria-hidden="true">2</span>
+                <div class="step-body">
+                  <span class="step-title">Push your default branch</span>
+                  <div class="code-row">
+                    <pre class="code-block" id="cmd-push">git push -u myelin main</pre>
+                    <button type="button" class="btn btn-sm" aria-label="Copy: git push" data-copy="#cmd-push">
+                      <svg class="icon" aria-hidden="true"><use href="#i-link"/></svg> Copy
+                    </button>
+                  </div>
+                  <span class="small subtle">The repository is created on this first push. No “New repository” button — the push is the create.</span>
+                </div>
+              </div>
+
+              <!-- What happens next -->
+              <div class="step">
+                <span class="step-n" aria-hidden="true">3</span>
+                <div class="step-body">
+                  <span class="step-title">What happens next</span>
+                  <ul class="whatnext">
+                    <li><svg class="icon" aria-hidden="true"><use href="#i-repo"/></svg> Your repository appears in this list.</li>
+                    <li><svg class="icon" aria-hidden="true"><use href="#i-pull-request"/></svg> Open a pull request to propose changes.</li>
+                    <li><svg class="icon" aria-hidden="true"><use href="#i-gate"/></svg> Checks report on the PR once a CI provider is connected.</li>
+                  </ul>
+                </div>
+              </div>
+
+              <!-- Live "waiting for first push" affordance (SSE-backed; neutral live dot, not a CI ring) -->
+              <div class="waiting" data-testid="waiting-first-push">
+                <span class="live-dot" aria-hidden="true"></span>
+                <!-- One German string (i18n expansion test; de-DE viewer locale) -->
+                <span class="waiting-text" lang="de">Warte auf deinen ersten Push …</span>
+                <span class="spacer"></span>
+                <button type="button" class="btn btn-sm">
+                  <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg> Refresh
+                </button>
+              </div>
+              <p class="small subtle" style="margin:0" role="status">
+                This list updates on its own the moment your push lands — you don't need to reload.
+              </p>
+            </div>
+          </section>
+
+          <!-- RIGHT: first-run checklist (compact, calm, no delight) -->
+          <aside class="card checklist" aria-labelledby="first-run">
+            <h2 id="first-run">First run</h2>
+            <div class="cl-item cl-cur">
+              <span class="mk mk-cur" role="img" aria-label="Current step"></span>
+              <div><div class="cl-label">Push your first repository</div><div class="cl-sub">In progress</div></div>
+            </div>
+            <div class="cl-item cl-todo">
+              <span class="mk mk-todo" role="img" aria-label="Not started"></span>
+              <div><div class="cl-label">Open a pull request</div></div>
+            </div>
+            <div class="cl-item cl-todo">
+              <span class="mk mk-todo" role="img" aria-label="Not started"></span>
+              <div><div class="cl-label">A check reports on the PR</div></div>
+            </div>
+            <div class="cl-item cl-todo">
+              <span class="mk mk-todo" role="img" aria-label="Not started"></span>
+              <div><div class="cl-label">Merge to your default branch</div></div>
+            </div>
+            <p class="small subtle" style="margin:0">Disappears once you've merged your first PR.</p>
+          </aside>
+        </div>
+
+        <!-- ============ STATE · loading skeleton (annotated variant) ============ -->
+        <p class="variant-label">State · Loading the repos list (skeleton + aria-busy + one polite live region)</p>
+        <div class="skel-list" aria-busy="true" aria-describedby="skel-status">
+          <span id="skel-status" class="vh" role="status">Loading repositories…</span>
+          <div class="skel-row"><span class="skel" style="width:34%"></span><span class="skel" style="width:60%"></span></div>
+          <div class="skel-row"><span class="skel" style="width:28%"></span><span class="skel" style="width:52%"></span></div>
+          <div class="skel-row"><span class="skel" style="width:40%"></span><span class="skel" style="width:46%"></span></div>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<svg class="vh" aria-hidden="true"><defs>
+  <symbol id="i-pull-request" viewBox="0 0 24 24"> <path d="M7 8 L7 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M17 8 L17 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M14 11 L17 8 L20 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M7 4 C8.65685 4, 10 5.34315, 10 7 C10 8.65685, 8.65685 10, 7 10 C5.34315 10, 4 8.65685, 4 7 C4 5.34315, 5.34315 4, 7 4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M7 14 C8.65685 14, 10 15.3431, 10 17 C10 18.6569, 8.65685 20, 7 20 C5.34315 20, 4 18.6569, 4 17 C4 15.3431, 5.34315 14, 7 14Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /> <path d="M17 14 C18.6569 14, 20 15.3431, 20 17 C20 18.6569, 18.6569 20, 17 20 C15.3431 20, 14 18.6569, 14 17 C14 15.3431, 15.3431 14, 17 14Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></symbol>
+</defs></svg>
+
+<script>
+  for (const b of document.querySelectorAll("[data-theme-set]"))
+    b.addEventListener("click", () => document.documentElement.setAttribute("data-theme", b.dataset.themeSet));
+  document.querySelector("[data-dir-toggle]").addEventListener("click", () => {
+    const el = document.documentElement;
+    el.setAttribute("dir", el.getAttribute("dir") === "rtl" ? "ltr" : "rtl");
+  });
+  // Sketch-only: make the copy buttons actually copy (the real screen uses navigator.clipboard).
+  for (const b of document.querySelectorAll("[data-copy]")) b.addEventListener("click", () => {
+    const t = document.querySelector(b.dataset.copy); if (t) navigator.clipboard?.writeText(t.textContent.trim()).catch(()=>{});
+  });
+</script>

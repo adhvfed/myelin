@@ -1,0 +1,327 @@
+<title>Repo home — myelin · R3 sketch</title>
+<link rel="stylesheet" href="../tokens.css" />
+<style>
+  /* ============================ shared shell (repeated per self-contained file) ============================ */
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--surface);color:var(--text-primary);font-family:var(--font-sans);font-size:var(--fs-body);line-height:var(--lh-body);-webkit-font-smoothing:antialiased}
+  .mono,code{font-family:var(--font-mono)}
+  a{color:inherit;text-decoration:none}
+  .app{display:grid;grid-template-rows:auto 1fr;height:100dvh}
+  .hdr{display:flex;align-items:center;gap:var(--space-3);height:var(--space-7);padding-inline:var(--space-3);border-block-end:var(--hairline) solid var(--border);background:var(--surface-raised)}
+  .brand{display:flex;align-items:center;gap:var(--space-2);font-weight:var(--weight-semibold)}
+  .kbar{display:flex;align-items:center;gap:var(--space-2);flex:1;max-width:420px;padding:var(--space-1) var(--space-2);border:var(--hairline) solid var(--border);border-radius:var(--radius-1);color:var(--text-subtle);background:var(--surface);cursor:text}
+  .kbar kbd{margin-inline-start:auto;font-family:var(--font-mono);font-size:var(--fs-caption);color:var(--text-subtle);border:var(--hairline) solid var(--border);border-radius:var(--radius-1);padding:0 var(--space-1)}
+  .hdr-right{margin-inline-start:auto;display:flex;align-items:center;gap:var(--space-2)}
+  .icon-btn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:var(--hairline) solid transparent;border-radius:var(--radius-1);background:none;color:var(--text-muted);cursor:pointer}
+  .icon-btn:hover{background:var(--surface-hover);color:var(--text-primary)}
+  .body{display:grid;grid-template-columns:var(--space-7) 1fr;min-height:0}
+  .rail{display:flex;flex-direction:column;align-items:center;gap:var(--space-1);padding-block:var(--space-2);border-inline-end:var(--hairline) solid var(--border);background:var(--surface-raised)}
+  .rail-item{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;width:40px;height:44px;border:none;border-radius:var(--radius-1);background:none;color:var(--text-muted);cursor:pointer;font-size:9px}
+  .rail-item:hover{background:var(--surface-hover);color:var(--text-primary)}
+  .rail-item[aria-current="page"]{background:var(--surface-hover);color:var(--text-primary)}
+  .rail-item.soon{color:var(--text-subtle)}
+  .rail-item .soon-dot{position:absolute;top:4px;inset-inline-end:5px;width:5px;height:5px;border-radius:var(--radius-pill);background:var(--text-subtle)}
+  .main{min-height:0;overflow:auto;padding:var(--space-5)}
+  .wrap{max-width:1080px;margin:0 auto;display:flex;flex-direction:column;gap:var(--space-4)}
+  svg.i{width:20px;height:20px;stroke:currentColor;stroke-width:1.6;fill:none;stroke-linecap:round;stroke-linejoin:round;flex:none}
+  svg.i.sm{width:16px;height:16px}
+  svg.i.lg{width:24px;height:24px}
+  /* ---- content primitives ---- */
+  .crumbs{display:flex;align-items:center;gap:var(--space-1);flex-wrap:wrap;font-size:var(--fs-body-sm);color:var(--text-muted)}
+  .crumbs a:hover{color:var(--text-primary);text-decoration:underline}
+  .crumbs .sep{color:var(--text-subtle)}
+  .crumbs [aria-current]{color:var(--text-primary);font-weight:var(--weight-medium)}
+  h1.repo{font-size:var(--fs-h1);margin:0;display:flex;align-items:center;gap:var(--space-2)}
+  .chip{display:inline-flex;align-items:center;gap:var(--space-1);font-size:var(--fs-caption);color:var(--text-muted);border:var(--hairline) solid var(--c-chip-border);background:var(--c-chip-bg);border-radius:var(--radius-1);padding:1px var(--space-1)}
+  .toolbar{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap}
+  .btn{display:inline-flex;align-items:center;gap:var(--space-1);height:var(--control-h);padding-inline:var(--space-2);border:var(--hairline) solid var(--border-strong);border-radius:var(--radius-1);background:var(--surface-raised);color:var(--text-primary);font:inherit;font-size:var(--fs-body-sm);cursor:pointer}
+  .btn:hover{background:var(--surface-hover)}
+  .btn .chev{transition:transform var(--dur-fast) var(--ease-standard)}
+  .clone{display:inline-flex;align-items:center;gap:var(--space-1);height:var(--control-h);padding-inline:var(--space-2);border:var(--hairline) solid var(--border);border-radius:var(--radius-1);background:var(--surface);color:var(--text-muted);font-size:var(--fs-body-sm)}
+  .clone code{color:var(--text-muted)}
+  .card{border:var(--hairline) solid var(--border);border-radius:var(--radius-1);background:var(--surface-raised)}
+  /* ---- latest-commit bar ---- */
+  .latest{display:flex;align-items:center;gap:var(--space-2);padding:var(--space-2) var(--space-3);border-block-end:var(--hairline) solid var(--border);font-size:var(--fs-body-sm);color:var(--text-muted)}
+  .latest a.oid{font-family:var(--font-mono);color:var(--info);text-decoration:underline}
+  .latest .who{color:var(--text-primary)}
+  .latest .when{margin-inline-start:auto;color:var(--text-subtle);white-space:nowrap}
+  /* ---- tree table ---- */
+  table.tree{width:100%;border-collapse:collapse;font-size:var(--fs-body-sm)}
+  table.tree th{text-align:start;font-weight:var(--weight-medium);color:var(--text-subtle);font-size:var(--fs-caption);padding:var(--space-1) var(--space-3)}
+  table.tree td{padding:var(--space-2) var(--space-3);border-block-start:var(--hairline) solid var(--border);vertical-align:middle}
+  table.tree tr:first-child td{border-block-start:none}
+  table.tree tr.row:hover{background:var(--surface-hover)}
+  .name{display:inline-flex;align-items:center;gap:var(--space-2)}
+  .name a{color:var(--text-primary)}
+  .name a:hover{text-decoration:underline}
+  .name .dir{color:var(--info)}
+  .msg{color:var(--text-muted)}
+  .msg a:hover{text-decoration:underline;color:var(--text-primary)}
+  td.when{color:var(--text-subtle);white-space:nowrap;text-align:end}
+  /* ---- README render ---- */
+  .readme-head{display:flex;align-items:center;gap:var(--space-2);padding:var(--space-2) var(--space-3);border-block-end:var(--hairline) solid var(--border);color:var(--text-muted);font-size:var(--fs-body-sm)}
+  .readme{padding:var(--space-4) var(--space-5);max-width:76ch}
+  .readme h1{font-size:var(--fs-h2);margin:0 0 var(--space-2)}
+  .readme h2{font-size:var(--fs-h3);margin:var(--space-4) 0 var(--space-2);padding-block-end:var(--space-1);border-block-end:var(--hairline) solid var(--border)}
+  .readme p{margin:0 0 var(--space-3);color:var(--text-primary);line-height:var(--lh-reading)}
+  .readme ul{margin:0 0 var(--space-3);padding-inline-start:var(--space-4);color:var(--text-primary);line-height:var(--lh-reading)}
+  .readme code{background:var(--surface-overlay);border-radius:var(--radius-1);padding:0 4px;font-size:var(--fs-code)}
+  .readme pre{background:var(--surface);border:var(--hairline) solid var(--border);border-radius:var(--radius-1);padding:var(--space-3);overflow:auto;font-size:var(--fs-code);line-height:var(--lh-body)}
+  .readme pre code{background:none;padding:0}
+  .readme a.lnk{color:var(--info);text-decoration:underline}
+  /* ---- ref switcher popover ---- */
+  .pop{width:320px;border:var(--hairline) solid var(--border-strong);border-radius:var(--radius-1);background:var(--surface-overlay);box-shadow:var(--shadow-popover)}
+  .pop .filter{display:flex;align-items:center;gap:var(--space-2);margin:var(--space-2);padding:var(--space-1) var(--space-2);border:var(--hairline) solid var(--border);border-radius:var(--radius-1);background:var(--surface);color:var(--text-subtle)}
+  /* focus ring moves to the wrapper (manual §6 / must-ship #5: NEVER outline:none without a
+     :focus-within replacement — the combobox filter is the palette-input case) */
+  .pop .filter:focus-within{outline:2px solid var(--focus-ring);outline-offset:1px}
+  .pop .filter input{flex:1;border:none;outline:none;background:none;color:var(--text-primary);font:inherit;font-size:var(--fs-body-sm)}
+  .pop .grp{font-size:var(--fs-caption);color:var(--text-subtle);padding:var(--space-1) var(--space-3);text-transform:uppercase;letter-spacing:.04em}
+  .pop ul{list-style:none;margin:0;padding:0}
+  .pop li{display:flex;align-items:center;gap:var(--space-2);padding:var(--space-2) var(--space-3);cursor:pointer;font-size:var(--fs-body-sm)}
+  .pop li:hover{background:var(--surface-hover)}
+  .pop li[aria-selected="true"]{background:var(--accent-weak,var(--surface-hover));font-weight:var(--weight-medium)}
+  .pop li .tickspace{width:16px;display:inline-flex;color:var(--info)}
+  .pop li .default{margin-inline-start:auto}
+  /* ---- side panels ---- */
+  .cols{display:grid;grid-template-columns:1fr 300px;gap:var(--space-4);align-items:start}
+  .panel-title{font-size:var(--fs-body-sm);font-weight:var(--weight-semibold);color:var(--text-primary);padding:var(--space-2) var(--space-3);border-block-end:var(--hairline) solid var(--border)}
+  .act{display:flex;flex-direction:column}
+  .act .item{display:flex;flex-direction:column;gap:2px;padding:var(--space-2) var(--space-3);border-block-start:var(--hairline) solid var(--border);font-size:var(--fs-body-sm)}
+  .act .item:first-child{border-block-start:none}
+  .act .item .top{display:flex;align-items:center;gap:var(--space-2)}
+  .act .item .sub{color:var(--text-subtle);font-size:var(--fs-caption)}
+  .act .item a.oid{font-family:var(--font-mono);color:var(--info);text-decoration:underline}
+  .refbar{display:flex;align-items:center;gap:var(--space-3);font-size:var(--fs-body-sm);color:var(--text-muted)}
+  .refbar a:hover{text-decoration:underline;color:var(--text-primary)}
+  /* ---- state gallery ---- */
+  .state-strip{border-block-start:var(--hairline) dashed var(--border-strong);padding-block-start:var(--space-4);margin-block-start:var(--space-2)}
+  .state-strip h3{font-size:var(--fs-body-sm);color:var(--text-subtle);text-transform:uppercase;letter-spacing:.05em;margin:0 0 var(--space-2)}
+  .sk{background:linear-gradient(90deg,var(--surface-overlay),var(--surface-hover),var(--surface-overlay));border-radius:var(--radius-1);height:12px}
+  .empty{padding:var(--space-5);text-align:center;color:var(--text-muted);display:flex;flex-direction:column;align-items:center;gap:var(--space-2)}
+  .empty .cta{color:var(--text-primary);font-weight:var(--weight-medium)}
+  .empty pre{text-align:start;background:var(--surface);border:var(--hairline) solid var(--border);border-radius:var(--radius-1);padding:var(--space-3);font-size:var(--fs-code);margin:0}
+  .lbl{display:inline-block;font-size:var(--fs-caption);color:var(--text-subtle);margin-block-end:var(--space-1)}
+</style>
+
+<!-- inline icon sprite (currentColor, theme-inheriting) -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="ic-code" viewBox="0 0 24 24"><polyline points="9 8 5 12 9 16"/><polyline points="15 8 19 12 15 16"/></symbol>
+  <symbol id="ic-issues" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><line x1="12" y1="8" x2="12" y2="12"/><circle cx="12" cy="16" r=".6"/></symbol>
+  <symbol id="ic-chat" viewBox="0 0 24 24"><path d="M4 5h16v11H9l-4 4z"/></symbol>
+  <symbol id="ic-ci" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><polyline points="12 7 12 12 16 14"/></symbol>
+  <symbol id="ic-knowledge" viewBox="0 0 24 24"><path d="M5 4h9a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3z"/><line x1="9" y1="9" x2="14" y2="9"/></symbol>
+  <symbol id="ic-repo" viewBox="0 0 24 24"><path d="M6 4h12v16H7a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/><line x1="8" y1="16" x2="18" y2="16"/></symbol>
+  <symbol id="ic-folder" viewBox="0 0 24 24"><path d="M4 6h5l2 2h9v11H4z"/></symbol>
+  <symbol id="ic-file" viewBox="0 0 24 24"><path d="M7 3h7l4 4v14H7z"/><polyline points="14 3 14 7 18 7"/></symbol>
+  <symbol id="ic-doc" viewBox="0 0 24 24"><path d="M7 3h7l4 4v14H7z"/><line x1="10" y1="12" x2="15" y2="12"/><line x1="10" y1="15" x2="15" y2="15"/></symbol>
+  <symbol id="ic-branch" viewBox="0 0 24 24"><circle cx="7" cy="6" r="2"/><circle cx="7" cy="18" r="2"/><circle cx="17" cy="8" r="2"/><path d="M7 8v8M17 10c0 4-3 4-6 5"/></symbol>
+  <symbol id="ic-tag" viewBox="0 0 24 24"><path d="M4 4h7l9 9-7 7-9-9z"/><circle cx="8.5" cy="8.5" r="1"/></symbol>
+  <symbol id="ic-commit" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.5"/><line x1="4" y1="12" x2="8.5" y2="12"/><line x1="15.5" y1="12" x2="20" y2="12"/></symbol>
+  <symbol id="ic-chevron" viewBox="0 0 24 24"><polyline points="9 6 15 12 9 18"/></symbol>
+  <symbol id="ic-check-pass" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><polyline points="8.5 12 11 14.5 15.5 9.5"/></symbol>
+  <symbol id="ic-check-fail" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><line x1="9.5" y1="9.5" x2="14.5" y2="14.5"/><line x1="14.5" y1="9.5" x2="9.5" y2="14.5"/></symbol>
+  <symbol id="ic-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5 .5l2-2a4 4 0 0 0-5.5-5.5l-1 1"/><path d="M14 10a4 4 0 0 0-5-.5l-2 2a4 4 0 0 0 5.5 5.5l1-1"/></symbol>
+  <symbol id="ic-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><line x1="16" y1="16" x2="20" y2="20"/></symbol>
+  <symbol id="ic-inbox" viewBox="0 0 24 24"><path d="M4 5h16v14H4z"/><path d="M4 14h4l1 2h6l1-2h4"/></symbol>
+  <symbol id="ic-human" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3"/><path d="M5 20a7 7 0 0 1 14 0"/></symbol>
+  <symbol id="ic-check-tick" viewBox="0 0 24 24"><polyline points="5 12 10 17 19 7"/></symbol>
+</svg>
+
+<div class="app">
+  <!-- ============ header (shell-owned) ============ -->
+  <header class="hdr">
+    <span class="brand"><svg class="i lg"><use href="#ic-code"/></svg> Myelin</span>
+    <div class="kbar" role="button" tabindex="0"><svg class="i sm"><use href="#ic-search"/></svg> Search or run a command <kbd>⌘K</kbd></div>
+    <div class="hdr-right">
+      <button class="icon-btn" aria-label="Inbox"><svg class="i"><use href="#ic-inbox"/></svg></button>
+      <button class="icon-btn" aria-label="Account"><svg class="i"><use href="#ic-human"/></svg></button>
+    </div>
+  </header>
+
+  <div class="body">
+    <!-- ============ rail (shell-owned; Code active, others honest) ============ -->
+    <nav class="rail" aria-label="Primary">
+      <a class="rail-item" href="#" aria-current="page"><svg class="i"><use href="#ic-code"/></svg>Code</a>
+      <a class="rail-item soon" href="#" title="Ausgaben — bald verfügbar"><span class="soon-dot"></span><svg class="i"><use href="#ic-issues"/></svg>Issues</a>
+      <a class="rail-item soon" href="#" title="Chat — coming soon"><span class="soon-dot"></span><svg class="i"><use href="#ic-chat"/></svg>Chat</a>
+      <a class="rail-item soon" href="#" title="CI — coming soon"><span class="soon-dot"></span><svg class="i"><use href="#ic-ci"/></svg>CI</a>
+      <a class="rail-item soon" href="#" title="Knowledge — coming soon"><span class="soon-dot"></span><svg class="i"><use href="#ic-knowledge"/></svg>Wissen</a>
+    </nav>
+
+    <!-- ============ main (surface) ============ -->
+    <main class="main">
+      <div class="wrap">
+        <span class="lbl">STATE · populated (G-1 repo home)</span>
+
+        <!-- breadcrumb + title -->
+        <nav class="crumbs" aria-label="Breadcrumb">
+          <a href="#">Repositories</a><span class="sep">/</span>
+          <a href="#" aria-current="page">myelin</a>
+        </nav>
+        <div style="display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap">
+          <h1 class="repo"><svg class="i lg"><use href="#ic-repo"/></svg> myelin</h1>
+          <span class="chip"><svg class="i sm"><use href="#ic-human"/></svg> Private</span>
+        </div>
+
+        <!-- toolbar: ref switcher + clone + commits -->
+        <div class="toolbar">
+          <button class="btn" aria-haspopup="listbox" aria-expanded="false"
+                  aria-label="Verzweigung oder Tag wechseln">
+            <svg class="i sm"><use href="#ic-branch"/></svg> <span class="mono">main</span>
+            <svg class="i sm chev"><use href="#ic-chevron"/></svg>
+          </button>
+          <span class="refbar">
+            <a href="#"><svg class="i sm" style="vertical-align:-3px"><use href="#ic-branch"/></svg> 4 branches</a>
+            <a href="#"><svg class="i sm" style="vertical-align:-3px"><use href="#ic-tag"/></svg> 2 tags</a>
+          </span>
+          <span style="margin-inline-start:auto"></span>
+          <span class="clone"><svg class="i sm"><use href="#ic-link"/></svg> <code>git@myelin.dev:acme/myelin.git</code></span>
+          <a class="btn" href="#"><svg class="i sm"><use href="#ic-commit"/></svg> Commits</a>
+        </div>
+
+        <!-- tree card with latest-commit bar + activity per row -->
+        <div class="card" role="region" aria-label="Files">
+          <div class="latest">
+            <svg class="i sm"><use href="#ic-commit"/></svg>
+            <span class="who">a4d…helvik</span>
+            <a class="oid" href="#">6fd7e3a</a>
+            <span>R2 COMPLETE — EXITED: all 10 items + blocker fix merged</span>
+            <span class="when">vor 2 Stunden · 1 284 commits</span>
+          </div>
+          <table class="tree">
+            <thead><tr>
+              <th style="width:34%">Name</th><th>Letzte Änderung</th><th style="text-align:end">Zuletzt geändert</th>
+            </tr></thead>
+            <tbody>
+              <!-- directories first, CLICKABLE (→ tree-at-path) -->
+              <tr class="row"><td><span class="name"><svg class="i sm dir"><use href="#ic-folder"/></svg><a href="#">crates</a></span></td>
+                <td class="msg"><a href="#">R2-exit blocker fix: ProtectedPush ruleset</a></td><td class="when">vor 2 Stunden</td></tr>
+              <tr class="row"><td><span class="name"><svg class="i sm dir"><use href="#ic-folder"/></svg><a href="#">frontend</a></span></td>
+                <td class="msg"><a href="#">R2 ledger: web routes + api.ts VMs</a></td><td class="when">vor 6 Stunden</td></tr>
+              <tr class="row"><td><span class="name"><svg class="i sm dir"><use href="#ic-folder"/></svg><a href="#">planning</a></span></td>
+                <td class="msg"><a href="#">release-track ledger §R3</a></td><td class="when">gestern</td></tr>
+              <tr class="row"><td><span class="name"><svg class="i sm dir"><use href="#ic-folder"/></svg><a href="#">design-planning</a></span></td>
+                <td class="msg"><a href="#">R3 sketch pack — shared brief</a></td><td class="when">gestern</td></tr>
+              <tr class="row"><td><span class="name"><svg class="i sm dir"><use href="#ic-folder"/></svg><a href="#">reviews</a></span></td>
+                <td class="msg"><a href="#">2026-07-06 ux review kept findings</a></td><td class="when">vor 10 Tagen</td></tr>
+              <!-- files -->
+              <tr class="row"><td><span class="name"><svg class="i sm"><use href="#ic-file"/></svg><a href="#" class="mono">Cargo.toml</a></span></td>
+                <td class="msg"><a href="#">workspace: add myelin-authz crate</a></td><td class="when">vor 3 Tagen</td></tr>
+              <tr class="row"><td><span class="name"><svg class="i sm"><use href="#ic-file"/></svg><a href="#" class="mono">Cargo.lock</a></span></td>
+                <td class="msg"><a href="#">bump libgit2, axum</a></td><td class="when">vor 3 Tagen</td></tr>
+              <tr class="row"><td><span class="name"><svg class="i sm"><use href="#ic-doc"/></svg><a href="#" class="mono">README.md</a></span></td>
+                <td class="msg"><a href="#">docs: EU-sovereign, agent-native one-liner</a></td><td class="when">vor 5 Tagen</td></tr>
+              <tr class="row"><td><span class="name"><svg class="i sm"><use href="#ic-file"/></svg><a href="#" class="mono">flake.nix</a></span></td>
+                <td class="msg"><a href="#">pin rust 1.83 toolchain</a></td><td class="when">vor 12 Tagen</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- README full render (editor read-path) + activity -->
+        <div class="cols">
+          <div class="card">
+            <div class="readme-head"><svg class="i sm"><use href="#ic-doc"/></svg> <span class="mono">README.md</span></div>
+            <article class="readme">
+              <h1>Myelin</h1>
+              <p>One EU-sovereign, agent-native platform that fuses <strong>git hosting, CI/CD, an issue
+                 tracker, a knowledge base, and chat</strong> — five subsystems that read as one product.</p>
+              <h2>Why one product</h2>
+              <p>Coherence is the feature. The same <code>ArtifactRef</code> renders the same chip
+                 everywhere; the same <code>Principal</code> renders the same badge everywhere.</p>
+              <h2>Getting started</h2>
+              <pre><code>git clone git@myelin.dev:acme/myelin.git
+cd myelin
+cargo build --workspace
+cd frontend &amp;&amp; pnpm install &amp;&amp; pnpm dev</code></pre>
+              <h2>Layout</h2>
+              <ul>
+                <li><code>crates/</code> — the Rust backend (git, authz, edge, gateway).</li>
+                <li><code>frontend/</code> — SolidStart web app + the design-system package.</li>
+                <li><code>planning/</code> — architecture, ADRs, the release-track ledger.</li>
+              </ul>
+              <p>See <a class="lnk" href="#">planning/02-holistic-architecture/design-language.md</a> for the
+                 point of view, and the <a class="lnk" href="#">live styleguide</a> for the real tokens.</p>
+            </article>
+          </div>
+
+          <!-- Recent activity -->
+          <div class="card">
+            <div class="panel-title">Aktivität</div>
+            <div class="act">
+              <div class="item"><div class="top"><svg class="i sm"><use href="#ic-commit"/></svg>
+                <a class="oid" href="#">6fd7e3a</a> <span>pushed to <span class="mono">main</span></span></div>
+                <div class="sub">R2 COMPLETE — EXITED · vor 2 Stunden</div></div>
+              <div class="item"><div class="top"><svg class="i sm"><use href="#ic-branch"/></svg>
+                <span>branch <span class="mono">r3-git-ux</span> created</span></div>
+                <div class="sub">from <span class="mono">main</span> · vor 5 Stunden</div></div>
+              <div class="item"><div class="top"><svg class="i sm"><use href="#ic-tag"/></svg>
+                <span>tag <span class="mono">v0.2.0-rc1</span></span></div>
+                <div class="sub">R2 authz cut · gestern</div></div>
+              <div class="item"><div class="top"><svg class="i sm" style="color:var(--success)"><use href="#ic-check-pass"/></svg>
+                <span>CI passed on <span class="mono">main</span></span></div>
+                <div class="sub">gate admitted · gestern</div></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ================= OTHER STATES (same surface) ================= -->
+        <div class="state-strip">
+          <h3>Switcher open · empty · skeleton</h3>
+          <div style="display:grid;grid-template-columns:340px 1fr;gap:var(--space-5);align-items:start">
+
+            <!-- ref switcher popover (open) -->
+            <div>
+              <span class="lbl">Branch/Tag switcher — Menu+filter combobox (open)</span>
+              <div class="pop" role="dialog" aria-label="Switch branch or tag">
+                <div class="filter"><svg class="i sm"><use href="#ic-search"/></svg>
+                  <input type="text" placeholder="Branch/Tag filtern…" aria-label="Filter branches and tags" value="" />
+                </div>
+                <div class="grp" id="grp-b">Branches</div>
+                <ul role="listbox" aria-labelledby="grp-b" aria-activedescendant="opt-main">
+                  <li id="opt-main" role="option" aria-selected="true"><span class="tickspace"><svg class="i sm"><use href="#ic-check-tick"/></svg></span><span class="mono">main</span><span class="chip default">default</span></li>
+                  <li role="option" aria-selected="false"><span class="tickspace"></span><span class="mono">r3-git-ux</span></li>
+                  <li role="option" aria-selected="false"><span class="tickspace"></span><span class="mono">r2-authz</span></li>
+                  <li role="option" aria-selected="false"><span class="tickspace"></span><span class="mono">release/ga</span></li>
+                </ul>
+                <div class="grp" id="grp-t">Tags</div>
+                <ul role="listbox" aria-labelledby="grp-t">
+                  <li role="option" aria-selected="false"><span class="tickspace"></span><span class="mono">v0.2.0-rc1</span></li>
+                  <li role="option" aria-selected="false"><span class="tickspace"></span><span class="mono">v0.1.0</span></li>
+                </ul>
+              </div>
+            </div>
+
+            <div style="display:flex;flex-direction:column;gap:var(--space-4)">
+              <!-- empty -->
+              <div>
+                <span class="lbl">Empty (no commits yet) — onboarding-forward (R-20)</span>
+                <div class="card"><div class="empty">
+                  <svg class="i lg" style="color:var(--text-subtle)"><use href="#ic-repo"/></svg>
+                  <div class="cta">This repository has no commits yet.</div>
+                  <div style="color:var(--text-muted)">Push your first commit to get started.</div>
+                  <pre>git clone git@myelin.dev:acme/myelin.git
+git push -u origin main</pre>
+                </div></div>
+              </div>
+              <!-- skeleton -->
+              <div>
+                <span class="lbl">Skeleton (aria-busy; structure-matching, no spinner)</span>
+                <div class="card" aria-busy="true">
+                  <div class="latest"><div class="sk" style="width:120px"></div><div class="sk" style="width:60%"></div></div>
+                  <div style="padding:var(--space-2) var(--space-3);display:flex;flex-direction:column;gap:var(--space-3)">
+                    <div class="sk" style="width:40%"></div><div class="sk" style="width:55%"></div>
+                    <div class="sk" style="width:48%"></div><div class="sk" style="width:35%"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p style="color:var(--text-subtle);font-size:var(--fs-caption);margin-block-start:var(--space-3)">
+            no-access · not-found · retryable-error share the trio pattern → see <a href="sketch-error-states.html" style="color:var(--info);text-decoration:underline">sketch-error-states.html</a>.
+          </p>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
