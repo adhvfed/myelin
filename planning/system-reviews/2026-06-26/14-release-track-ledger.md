@@ -434,18 +434,65 @@ real myelin-edge binary + real repo data, which R4 stands up. R3 hands a verifie
 to that first dogfood act. **Blocking real external use (tracked): the OIDC browser-start route (task
 #11) — self-serve login ships the honest "SSO unavailable" state until it lands.**
 
-## R4–R6
+## R4 — dogfood cutover (Tier D) — OPENED 2026-07-16 at HEAD `3ee0503`
 
-Tracked here at phase granularity once entered; R4–R6 rows added when their phases open.
+Plan items (planning/08-release/01 §R4): R4.1 mirror Myelin-into-Myelin + founder daily flow · R4.2
+CT-007 CI cutover (prereqs CT-004/CT-005 from ledger 12 still open) · R4.3 backup/restore drill on
+real dogfood data · R4.4 finding-burndown loop in Myelin's own tracker.
+
+**Census (scouted 2026-07-16, session open):** the R4.1 blocker cluster is AUTH BOOTSTRAP — nothing
+can authenticate against the real `edge`: (1) `CellTokenAuthority::generate()` is EPHEMERAL per-boot
+(main.rs ~122; the persisted load is the named P-527/MR-025 follow-on), no mint endpoint/CLI exists,
+`POST /v1/auth/login` refuses by design, the dev-login seam is frontend-mock-only; (2) no
+tenant/principal bootstrap surface anywhere; (3) the git wire is Bearer-only — vanilla `git push`
+sends HTTP Basic; (4) no script boots the edge; `dev-stack.sh env` omits MYELIN_KMS_SEAL_KEY; (5)
+frontend `MYELIN_EDGE_URL` defaults to the mock :8787; (6) CI inert (checks never run — merge needs
+protection-without-required-checks or manual check-report); (7) wire push path needs `runsc` on PATH
+(present on this host).
+
+| Item | What | Status |
+|---|---|---|
+| R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | BACKEND DONE+VERIFIED (commit pending); web login half in progress |
+| R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | BLOCKED ON R4.0 |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | CT-004 grounding scout running |
+| R4.3 | Backup/restore drill (repeating) on real dogfood data | AFTER R4.1 |
+| R4.4 | Finding-burndown in Myelin's own tracker (needs minimal issues subsystem; until then findings land in this ledger) | QUEUED |
+
+R4 exit gate: 4 consecutive weeks where the founder never needed GitHub for daily work.
+
+**CT-004 grounding (scouted 2026-07-16): RECONCILE + HARDEN, not green-field.** The census line "runs
+no CI work" is true only at the `serve(AppSpec)` layer: scheduler (CI-P12 claim/reap/DRR), pipeline
+body (CI-P15), metering (CI-P17), check emitter (CI-P18), result rollup (CI-P19), log pipeline
+(CI-P20/21), fleet (CI-P14), dispatch trigger/resolve (CI-P10/11) all EXIST as tested modules — but
+both CI mains register `consumers: Vec::new()`, so nothing subscribes, claims, or drives live. The
+Git side (CheckStatusConsumer, merge gate/queue) is already live against a synthetic emitter. Named
+gaps found: metering has NO durable PG impl (model-only); the `.myelin/ci.*` YAML/TOML text parser +
+JSON-Schema validation is missing (`resolve_snapshot` takes pre-parsed `CiDefinition`); runner rides
+an in-memory `JobLeaseStore` + `CountingFirehose`/`FsBlobStore` floors; check ingestion is bus-only
+(no HTTP report endpoint — "only CI may git.checks.report" is an authz token, not a mounted route).
+Decomposition (scout, deps in parens): **CT-004a** durable kill-9 harden + real PG metering (starts
+now) · **CT-004b** dispatch trigger consumer live (git.ref.updated→compile→dedup→stamp→resolve→
+reserve_and_start) + the real ci.* parser (a) · **CT-004c** scheduler/lease loop live on `job_queue`
++ reaper/autoscaler background loops (a) · **CT-004d** pipeline body + metering bookends live (b,c) ·
+**CT-004e** check/result producers live → closes the X-1 seam to the merge gate (d) · **CT-004f** log
+pipeline live substrate (a; SSE tail is CT-005) · **CT-004g** fleet/residency (c, optional split).
+
+## R5–R6
 
 | Phase | Status |
 |---|---|
-| R4 dogfood cutover (Tier D) | NOT STARTED |
 | R5 production ops | NOT STARTED |
 | R6 graduation gate | NOT STARTED |
 
 ## Decision log
 
+- 2026-07-16: **R4 opened** at HEAD `3ee0503`. R4.0 (founder auth bootstrap) inserted ahead of the
+  planned R4.1–R4.4: the census showed no authentication path exists against the real edge, so the
+  cutover is structurally impossible without it. Design decision: operator-trust mint (a `bootstrap`
+  subcommand sharing the edge composition root — possession of DATABASE_URL + MYELIN_KMS_SEAL_KEY IS
+  the mint capability), explicitly NOT a network mint endpoint; web login = paste-token verified
+  against real `whoami`, gated on a new `token_login_enabled` edge flag; git-wire-only Basic→Bearer
+  (password = token, GitHub-PAT shape) so vanilla `git push` works.
 - 2026-07-16: **R3 opened** at HEAD `6fd7e3a`. Design-first per VISION §3: sketch pack
   (`design-planning/09-r3-sketches/`) gates all frontend items; R3.6 (a11y fixes to existing chrome)
   and R3.7b (flow budget leak, backend) run in parallel un-gated. Census confirmed the frontend is

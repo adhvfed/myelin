@@ -118,6 +118,7 @@ pub fn foundation_migrations() -> Migrations {
 /// | `post_pit_durable_migrations`      | `0052`        |
 /// | `bus_erasure_durable_migrations`   | `0053`        |
 /// | `hitl_gate_durable_migrations`     | `0054`        |
+/// | `cell_root_durable_migrations`     | `0060`        |
 ///
 /// The substrate FOUNDATION (`0000`–`0001`, outbox + consumer_dedup) is deliberately NOT in this list:
 /// it stays the separate [`foundation_migrations`] / [`SubstrateProvider::migrate_foundation`] call
@@ -135,6 +136,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::reerase_durable::post_pit_durable_migrations(),
         crate::events_durable::bus_erasure_durable_migrations(),
         crate::hitl_gate_durable::hitl_gate_durable_migrations(),
+        crate::cell_root_durable::cell_root_durable_migrations(),
     ]
 }
 
@@ -286,9 +288,9 @@ mod boot_migrations_tests {
                 w[1]
             );
         }
-        // Non-vacuity: the full set is present (identity 0010 … agent hitl-gate 0054).
+        // Non-vacuity: the full set is present (identity 0010 … cell-authority root 0060).
         assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
-        assert_eq!(*ids.last().unwrap(), "0054_agent_hitl_gate");
+        assert_eq!(*ids.last().unwrap(), "0060_cell_token_root");
     }
 
     /// STRUCTURAL anti-drift: the aggregate is EXACTLY the flattened concatenation of every group in

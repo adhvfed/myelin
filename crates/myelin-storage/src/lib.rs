@@ -739,6 +739,11 @@ pub mod placement_durable;
 // production boot wiring + kill-9 proof is MR-009. EXTENDS kms.rs — there is ONE KmsEngine.
 pub mod kms_durable;
 
+// The durable capability-token CELL AUTHORITY ROOT backing (R4.0 / P-527 / MR-025 follow-on): the
+// software-sealed Ed25519 seed + macaroon MAC key over the OLTP pool, with `load_or_generate`
+// (fail-closed on a wrong seal key) under the SAME env seal-key. EXTENDS kms.rs's seal mechanism.
+pub mod cell_root_durable;
+
 pub use agent_run_gate::{AgentRunGate, AgentRunGateSignal, DispatchError, InFlightRun, RunKind};
 pub use backup::{
     BackupError, BackupSet, BaseBackup, ContinuousArchiver, EpochSecs, LogTierSeal,
@@ -936,4 +941,11 @@ pub use placement_durable::{
 pub use kms_durable::{
     kms_durable_migrations, seal_key_from_env, DurableKmsBacking, KmsDurableError,
     KMS_SEALED_ROOT_MIGRATION, KMS_WRAPPED_DEK_MIGRATION, KMS_WRAPPED_KEK_MIGRATION, SEAL_KEY_ENV,
+};
+
+// The durable cell-authority-root backing (R4.0): the sealed capability-token cell root (Ed25519 seed
+// + macaroon MAC key) recovered across a restart, so a token minted before a kill-9 verifies after it.
+pub use cell_root_durable::{
+    cell_root_durable_migrations, CellRootError, CellRootMaterial, DurableCellRootBacking,
+    CELL_TOKEN_ROOT_MIGRATION,
 };

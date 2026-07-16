@@ -1,43 +1,77 @@
-//! # `edge` — the edge-gateway binary (MR-014)
+//! # `edge` — the edge-gateway binary (MR-014 / R4.0)
 //!
-//! The thin deployable shim: build the [`Gateway`] over the real auth components and serve it on a
-//! TCP listener with the hyper transport. Like the other service mains it does NOTHING but compose +
-//! hand off to the one transport call ([`serve_edge`]).
+//! The thin deployable shim. With NO arguments it composes the [`Gateway`] over the real auth
+//! components and SERVES it on a TCP listener (as before). With the `bootstrap` / `revoke` operator
+//! subcommands it runs the SAME config/provider/migrations/KMS/cell-root composition and then performs
+//! an operator-plane action instead of serving:
 //!
-//! **Floors named (EI-01 §4):** the production composition root that injects the cell trust anchor +
-//! the seeded S1 principal store + the Identity-M1 authorizer (so real tokens authenticate against a
-//! real directory) is the MR-015+ wiring; here the binary boots a structurally-complete gateway over
-//! a freshly-generated cell authority + the refuse-not-mock human verifier + the R2.6
-//! `AuthenticatedActionPolicy` action gate (the explicit mounted-action allowlist — the `AllowAll`
-//! fixture is test-only now), with the `whoami` proof handler + an SSE stream registered. The OS-signal → graceful
-//! drain wiring lands with the rest of the transport. The bind address is `MYELIN_EDGE_ADDR` (default
-//! `127.0.0.1:8080`).
+//! - `edge` (no args) → serve.
+//! - `edge bootstrap --tenant <t> --principal <id> [--display-name <s>] [--ttl-days <n>] [--region <r>]`
+//!   → idempotently seed the principal + mint a capability token that authenticates against a
+//!   SEPARATELY-running serving edge (same DB + seal key). Prints the token to STDOUT exactly once.
+//! - `edge revoke --jti <jti> --tenant <t> [--region <r>]` → durably revoke a token (S7 denylist).
+//!
+//! **The R4.0 make-or-break (P-527 / MR-025 follow-on):** the cell token authority is now DURABLE —
+//! [`DurableCellRootBacking::load_or_generate`] recovers the sealed Ed25519 seed + macaroon MAC key
+//! from the `cell_token_root` row under the SAME `MYELIN_KMS_SEAL_KEY` the KMS root uses, so a token
+//! minted before a restart still verifies after it (the old `CellTokenAuthority::generate()` was
+//! ephemeral per boot, orphaning every minted token — no mint path could exist). Fail-loud on every
+//! error path; a wrong/absent seal key is fail-closed and NEVER regenerates the root.
+//!
+//! **The operator trust boundary (stated):** anyone with the `DATABASE_URL` creds + the seal key can
+//! run `bootstrap`/`revoke` and mint/revoke for any principal. That is ACCEPTED operator-plane
+//! infrastructure (the same boundary the seal key already draws); there is deliberately NO HTTP
+//! endpoint that mints.
 
 use myelin_config::{Mode, MyelinConfig};
 use myelin_edge::{
-    register_git_durable, register_git_wire, serve_edge, AuthProvider, AuthPublicConfig,
-    AuthenticatedActionPolicy, CheckBackedRepoAuthorizer, DurableGitBackend, Gateway, Method,
-    TupleRepoBootstrap, WhoamiHandler,
+    bootstrap_principal_and_mint, register_git_durable, register_git_wire, serve_edge, AuthProvider,
+    AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
+    DurableGitBackend, Gateway, Method, TupleRepoBootstrap, WhoamiHandler,
 };
-use myelin_events::OutboxStore;
-use myelin_identity::FragmentAdmit;
+use myelin_events::{OutboxStore, Timestamp};
+use myelin_identity::{FragmentAdmit, Principal, PrincipalId, PrincipalKind, RevokeTarget};
 use myelin_identity_service::{
     CapabilityAuthenticator, CellTokenAuthority, HumanSsoAuthenticator, JwkSet, OidcConfig,
     PasetoCapabilityVerifier, PrincipalStore, RevocationStore, StoreBackedCheck,
 };
 use myelin_storage::{
-    all_durable_migrations, seal_key_from_env, DurableKmsBacking, DurablePrincipalBacking,
-    DurableRevocationBacking, HotTables, PgOutboxBacking, SubstrateProvider,
+    all_durable_migrations, seal_key_from_env, DurableCellRootBacking, DurableKmsBacking,
+    DurablePrincipalBacking, DurableRevocationBacking, HotTables, KmsEngine, PgOutboxBacking,
+    SubstrateProvider, TenantScope,
 };
+use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
 
-#[tokio::main]
-async fn main() {
-    // MR-009b Wave 2 — the DURABLE-BY-DEFAULT composition root: the identity S1 principal + S7
-    // revocation stores are wired via `with_pg` over the MR-022 SubstrateProvider pool (the in-memory
-    // doubles moved behind `test-support`, so the production edge binary never constructs them). The
-    // provider connects to the dev docker stack by default (`MyelinConfig::from_env`); a boot that
-    // cannot reach the durable pool FAILS LOUD (exit non-zero) — never a silent in-memory fallback.
+/// The default operator-token scheme the edge resolves a bearer/basic credential under when the client
+/// sends no `X-Myelin-Token-Scheme` header. R4.0 sets this to `agent` (the scheme `edge bootstrap`
+/// mints under): it is the only mintable token type today (a `pat` requires DPoP that git/curl cannot
+/// produce; human login is deferred), so a bootstrap token authenticates over git (Bearer or Basic) and
+/// curl with ZERO extra headers. Every edge test already sets its own scheme explicitly, so this is a
+/// no-op for them; a real `pat` presented WITH an explicit `pat` scheme header is still DPoP-enforced.
+const EDGE_DEFAULT_TOKEN_SCHEME: &str = "agent";
+
+// =================================================================================================
+// Shared composition — the config/provider/migrations/KMS/cell-root core BOTH serve and the operator
+// subcommands build. Fail-loud (exit non-zero) on every error, never a silent fallback.
+// =================================================================================================
+
+/// The composed durable core: the provider pool + the durable KMS engine + the DURABLE cell token
+/// authority + the runtime handle. Built once by [`compose_core`]; consumed by [`serve`] /
+/// [`operator_bootstrap`] / [`operator_revoke`].
+struct ComposedCore {
+    provider: SubstrateProvider,
+    kms: Arc<KmsEngine>,
+    cell: Arc<CellTokenAuthority>,
+    handle: tokio::runtime::Handle,
+}
+
+/// Build the shared durable core (the DURABLE-BY-DEFAULT composition root, MR-009b + R4.0). Connects
+/// the MR-022 provider pool, applies the substrate foundation + the full durable migration aggregate
+/// (now including `0060_cell_token_root`), loads the KMS root and the CELL TOKEN AUTHORITY ROOT — both
+/// sealed under `MYELIN_KMS_SEAL_KEY`, both fail-closed on a wrong/absent seal key (NEVER a fresh
+/// root). A boot that cannot reach the pool / unseal a root FAILS LOUD (exit non-zero).
+async fn compose_core() -> ComposedCore {
     let config = MyelinConfig::from_env(Mode::DevDefaults).unwrap_or_else(|e| {
         eprintln!("edge: invalid config: {e}");
         std::process::exit(1);
@@ -52,58 +86,38 @@ async fn main() {
         }
     };
     let handle = tokio::runtime::Handle::current();
-    // MR-009b W3b.4 — the DURABLE transactional outbox (SI-007): the git backend's ref-CAS
-    // co-commits its `git.ref.updated` into the PG-backed `outbox` table (survives restart), never
-    // a per-process in-memory buffer. The substrate foundation tables (the frozen `outbox` +
-    // `consumer_dedup` DDL) are applied first through the MR-022 migrator — FAIL LOUD, no fallback.
+    // The substrate foundation (outbox/consumer_dedup) first — FAIL LOUD, no fallback.
     if let Err(e) = provider.migrate_foundation().await {
         eprintln!(
             "edge: cannot apply the substrate foundation migrations (outbox/consumer_dedup): {e}"
         );
         std::process::exit(1);
     }
-    // W7.2 (doc-18 Part 5) — THE BOOT-MIGRATIONS FIX: apply the FULL durable migration aggregate
-    // (identity 0010–0019, pseudonym 0020–0022, placement 0030–0039, kms 0040–0042, cost/erasure
-    // 0050–0053) right after the foundation, so every durable store this main constructs has its
-    // tables. Previously this main migrated ONLY foundation + KMS, so the identity tables the
-    // `PrincipalStore::with_pg`/`RevocationStore::with_pg` stores below bind to (`principal`,
-    // `revocation`, …) were NEVER migrated — the first principal write failed at runtime on a fresh
-    // DB. The aggregate is idempotent + advisory-locked (safe on re-boot). FAIL LOUD, no fallback.
+    // The FULL durable migration aggregate (identity/pseudonym/placement/kms/cost/erasure + the R4.0
+    // `0060_cell_token_root`). Idempotent + advisory-locked (safe on re-boot). FAIL LOUD.
     if let Err(e) = provider
         .migrate(&all_durable_migrations(), &HotTables::none())
         .await
     {
-        eprintln!("edge: cannot apply the durable migration aggregate (identity/pseudonym/placement/kms/cost/erasure): {e}");
+        eprintln!("edge: cannot apply the durable migration aggregate: {e}");
         std::process::exit(1);
     }
-    let git_outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
-        provider.db_pool().clone(),
-        handle.clone(),
-    )));
-    // THE W3b.3 NAMED CONDITION: the composition root wires the UNIQUE production id source
-    // (`UlidMinter`, the P-S12 stand-in) — NEVER the default `MonotonicMinter`, which resets per
-    // instance so two roots mint colliding `event_id`s that the durable co-commit path's
-    // `ON CONFLICT (event_id) DO NOTHING` silently DROPS (probe-proven in W3b.3).
-    let git_minter: Arc<dyn myelin_events::IdMinter> = Arc::new(myelin_events::UlidMinter::new());
-    // The shared cell KMS (the crypto-shred substrate) — DURABLE-BY-DEFAULT (MR-009b Wave 5 /
-    // SI-006): the software-sealed root + wrapped KEKs/DEKs load from the `kms_sealed_root`/
-    // `kms_wrapped_kek`/`kms_wrapped_dek` tables via `load_or_generate` (MR-025), and every key
-    // minted at runtime writes through — keys survive a kill-9 restart. FAIL LOUD, never a silent
-    // in-memory fallback: a missing/malformed MYELIN_KMS_SEAL_KEY, an unreachable store, or a
-    // sealed root that does not unseal under the supplied key (WrongSealKey — fail-closed, NEVER a
-    // fresh root that would orphan every existing ciphertext) each exit non-zero.
+    // The operator-held seal key (the SAME key unseals the KMS root AND the cell token-authority root
+    // — one operator secret, one blast radius). Fail-closed at boot: a missing/malformed key exits.
     let seal_key = match seal_key_from_env() {
         Ok(k) => k,
         Err(e) => {
-            eprintln!("edge: KMS refused to start (durable-by-default requires the seal key): {e}");
+            eprintln!("edge: refused to start (durable-by-default requires the seal key): {e}");
             std::process::exit(1);
         }
     };
-    // The KMS tables (0040–0042) are migrated by the W7.2 durable aggregate applied above — no
-    // separate per-group KMS migrate call here anymore (the aggregate folds it in exactly once).
-    // The cell whose sealed root this edge serves (a namespace, not a secret — dev default).
+    // The cell whose sealed roots this edge serves (a namespace, not a secret — dev default). The KMS
+    // root AND the cell token-authority root are both scoped to this cell id.
     let cell_id = std::env::var("MYELIN_CELL_ID").unwrap_or_else(|_| "cell-dev".to_string());
-    let kms_backing = DurableKmsBacking::new(provider.db_pool().clone(), cell_id);
+    // The shared cell KMS (crypto-shred substrate) — DURABLE-BY-DEFAULT. A missing/malformed seal
+    // key, an unreachable store, or a root that does not unseal (WrongSealKey — fail-closed, NEVER a
+    // fresh root that would orphan every ciphertext) each exit non-zero.
+    let kms_backing = DurableKmsBacking::new(provider.db_pool().clone(), cell_id.clone());
     let kms = match kms_backing.load_or_generate(&seal_key).await {
         Ok(engine) => Arc::new(engine),
         Err(e) => {
@@ -113,13 +127,80 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // R4.0 — the DURABLE cell TOKEN AUTHORITY root (P-527 / MR-025 follow-on): the Ed25519 seed +
+    // macaroon MAC key sealed in `cell_token_root` under the SAME seal key. This replaces the ephemeral
+    // `CellTokenAuthority::generate()` — a token minted before a restart now verifies after it. A wrong/
+    // absent seal key (a sealed root that does not unseal) is fail-closed and NEVER a fresh root (that
+    // would orphan every token ever minted under the old root).
+    let cell_backing = DurableCellRootBacking::new(provider.db_pool().clone(), cell_id);
+    let cell_material = match cell_backing.load_or_generate(&seal_key).await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "edge: cell token authority refused to start (fail-closed, never a fresh root that \
+                 would orphan every minted token): {e}"
+            );
+            std::process::exit(1);
+        }
+    };
+    let cell = Arc::new(
+        CellTokenAuthority::from_material(&cell_material).unwrap_or_else(|e| {
+            eprintln!("edge: durable cell token-authority material is invalid: {e:?}");
+            std::process::exit(1);
+        }),
+    );
+    ComposedCore {
+        provider,
+        kms,
+        cell,
+        handle,
+    }
+}
 
-    // The REAL PASETO Bearer verifier over a freshly-generated cell authority (genuine Ed25519 crypto
-    // — a forged token is rejected). The production cell-root LOAD + the seeded S1 directory is the
-    // MR-015+ composition root; here a generated cell makes the bootable shell do real crypto.
-    // Arc'd because the R2.1a StoreBackedCheck (the per-run-token minter inside it) shares the SAME
-    // cell authority the Bearer verifier trusts — one cell, one trust anchor.
-    let cell = Arc::new(CellTokenAuthority::generate());
+// =================================================================================================
+// argv dispatch — no args = serve; `bootstrap` / `revoke` = operator-plane actions.
+// =================================================================================================
+
+#[tokio::main]
+async fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => serve(compose_core().await).await,
+        Some("bootstrap") => operator_bootstrap(compose_core().await, &args[1..]).await,
+        Some("revoke") => operator_revoke(compose_core().await, &args[1..]).await,
+        Some(other) => {
+            eprintln!(
+                "edge: unknown subcommand `{other}` (expected: <none> = serve | bootstrap | revoke)"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+// =================================================================================================
+// serve — the request-lifecycle gateway (unchanged behaviour; now over the DURABLE cell authority).
+// =================================================================================================
+
+async fn serve(core: ComposedCore) {
+    let ComposedCore {
+        provider,
+        kms,
+        cell,
+        handle,
+    } = core;
+
+    // The DURABLE transactional outbox (SI-007) for the git backend's ref-CAS co-commit.
+    let git_outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
+        provider.db_pool().clone(),
+        handle.clone(),
+    )));
+    // The UNIQUE production id source (P-S12) — never the per-instance MonotonicMinter.
+    let git_minter: Arc<dyn myelin_events::IdMinter> = Arc::new(myelin_events::UlidMinter::new());
+
+    // The REAL PASETO Bearer verifier over the DURABLE cell authority (genuine Ed25519 — a forged
+    // token is rejected; a token minted before a restart still verifies, R4.0). Arc'd because the
+    // R2.1a StoreBackedCheck (the per-run-token minter) shares the SAME cell authority the verifier
+    // trusts — one cell, one trust anchor.
     let authn = Arc::new(CapabilityAuthenticator::with_verifier(
         PrincipalStore::with_pg(
             kms.clone(),
@@ -132,26 +213,21 @@ async fn main() {
             handle.clone(),
         ),
     ));
-    // R2.5 — the human/SSO login over the durable S1 principal directory. If an OIDC IdP is
-    // configured (`MYELIN_OIDC_ISSUER` + `MYELIN_OIDC_AUDIENCE` + a static JWKS via
-    // `MYELIN_OIDC_JWKS`/`MYELIN_OIDC_JWKS_FILE`), the REAL OidcVerifier is wired for the `oidc`
-    // scheme — a genuinely IdP-signed ID token authenticates (tenant/region from the VERIFIED
-    // claims, never a path). If OIDC is UNCONFIGURED, login stays refuse-not-mock (every scheme
-    // refuses) — boot still succeeds (OIDC login is opt-in). A configured-but-MALFORMED JWKS JSON is
-    // a FAIL-LOUD boot abort (never a silent no-OIDC fallback), matching the rest of this main.
+
+    // R2.5 — the human/SSO login over the durable S1 directory (OIDC opt-in; refuse-not-mock otherwise).
     let oidc_settings = provider.config().oidc.clone();
     let human_store = PrincipalStore::with_pg(
         kms.clone(),
         DurablePrincipalBacking::new(provider.clone()),
         handle.clone(),
     );
-    // R3.5 — the UNAUTHENTICATED public auth surface (`GET /v1/auth/config`) the logged-out login
-    // page reads to render honestly: SSO-configured drives the primary button (enabled vs the honest
-    // "SSO unavailable" reason); `dev_login_enabled` (edge `MYELIN_DEV_LOGIN`) belt-and-braces the
-    // frontend's build-time PROD kill switch on the dev seam. Derived from the OIDC config BEFORE it
-    // is moved into the human-login match below. Projects NO secret (issuer/audience/JWKS stay
-    // server-side; only a generic provider label is exposed).
+    // R3.5 / R4.0 — the UNAUTHENTICATED public auth surface (`GET /v1/auth/config`). `dev_login_enabled`
+    // (`MYELIN_DEV_LOGIN`) + `token_login_enabled` (`MYELIN_TOKEN_LOGIN`, the R4.0 operator-token web
+    // login gate) are env-driven at composition time and project NO secret.
     let dev_login_enabled = std::env::var("MYELIN_DEV_LOGIN")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let token_login_enabled = std::env::var("MYELIN_TOKEN_LOGIN")
         .map(|v| v == "1")
         .unwrap_or(false);
     let auth_config = match oidc_settings.as_ref() {
@@ -162,11 +238,13 @@ async fn main() {
                 label: "Single sign-on".to_string(),
             }],
             dev_login_enabled,
+            token_login_enabled,
         },
         None => AuthPublicConfig {
             sso_configured: false,
             providers: Vec::new(),
             dev_login_enabled,
+            token_login_enabled,
         },
     };
     let human_login = Arc::new(match oidc_settings {
@@ -194,24 +272,15 @@ async fn main() {
         }
     });
 
-    // ── R2.1a — the LIVE per-repo object authz (R0.3) + the git wire endpoints (R0.2 fires with
-    // them). The production `check` slot: the depth-bounded Zanzibar engine over the DURABLE S3
-    // tuple store (`rebac_tuple`) + S7 revocation denylist, through the SAME provider pool/KMS/cell
-    // this main already composes. FAIL LOUD on every construction step — never a silent
-    // allow-everything git wire. ──
+    // ── R2.1a — the LIVE per-repo object authz (R0.3) + the git wire endpoints. ──
     let check =
         StoreBackedCheck::with_pg(provider.clone(), kms.clone(), cell.clone(), handle.clone());
-    // Admit the frozen Git ReBAC fragment (contract 4.9) so the compiled `pull`/`push`/
-    // `protected_push` permissions resolve; an un-admitted fragment would deny every repo (fail-
-    // closed but useless) — a rejected admit is a boot failure, loudly.
     for admit in check.admit_git_fragment() {
         if let FragmentAdmit::Rejected { reason } = admit {
             eprintln!("edge: the Git ReBAC fragment did not admit (authz would deny everything): {reason}");
             std::process::exit(1);
         }
     }
-    // The fail-static bound (contract 1.10/4.11) from the canonical thresholds file:
-    // static_max ≤ revocation SLA, enforced structurally by the gate constructor (P-S18).
     let thresholds = match myelin_substrate::Thresholds::load_canonical() {
         Ok(t) => t,
         Err(e) => {
@@ -220,9 +289,6 @@ async fn main() {
         }
     };
     let revocation_sla_secs = thresholds.revocation.sla_mins * 60;
-    // The production RepoAuthorizer: Read → check(pull), Write → check(push), against the live
-    // fragment through the GIT-P14 fail-static gate. Replaces the AllowAllRepos fixture at the
-    // wire seam — deny-by-default, per-repo, tenant-partitioned.
     let repo_authz = match CheckBackedRepoAuthorizer::try_new(
         check.clone(),
         revocation_sla_secs,
@@ -236,60 +302,43 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    // The creator→admin bootstrap grant writer (over the SAME S3 store the checker reads): a repo
-    // created through the edge is immediately reachable by its creator — without this, deny-by-
-    // default would orphan every fresh repo (the R2.1a make-or-break).
     let repo_bootstrap = Arc::new(TupleRepoBootstrap::new(check.tuples().clone()));
 
-    // The Git subsystem wired through the edge over the DURABLE on-disk backend (GT-003): its
-    // `/v1/git/...` write handlers PERSIST on real on-disk bare repos (GT-001) under the verified tenant
-    // scope + the merge-gate/fork-trust policy, and its reads reflect the durable state. The on-disk root
-    // is `MYELIN_GIT_ROOT` (default a per-host data dir) — the same `<tenant>/<region>/<repo>.git` layout
-    // the read backend resolves against. The reconciler (`myelin_git::reconcile`) heals the
-    // apply-after-outbox-commit window before the store serves; the cross-restart recovery runs in the
-    // production composition root (here the shell boots a fresh-or-existing durable backend).
+    // The Git subsystem over the DURABLE on-disk backend (GT-003), rooted at `MYELIN_GIT_ROOT`.
     let git_root = std::env::var("MYELIN_GIT_ROOT").unwrap_or_else(|_| {
         std::env::temp_dir()
             .join("myelin-git-data")
             .to_string_lossy()
             .into()
     });
-    // R2.1a: the durable git backend carries the LIVE CheckEngine-backed per-repo authorizer (R0.3
-    // no longer latent — AllowAllRepos is out of the production composition root) + the bootstrap
-    // grant writer the create path consults.
     let git_backend = Arc::new(
         DurableGitBackend::rooted(git_root, git_outbox, git_minter)
             .with_repo_authorizer(repo_authz)
             .with_repo_bootstrap(repo_bootstrap),
     );
 
-    // R2.6 — the action-level gate is a REAL policy, not the AllowAll fixture: an explicit
-    // allowlist of exactly the mounted edge action verbs (deny-by-default for any other action
-    // string; authn + tenant scope are enforced upstream by the gateway lifecycle, and per-OBJECT
-    // authz is the R2.1/R2.1a repo-authz layer wired above). `AllowAll` itself is now a
-    // test-support-gated double the production binary cannot construct, and the
-    // `no-permissive-authorizer-in-prod` scanner keeps it out of this composition root.
-    let mut builder = Gateway::builder(authn, human_login, Arc::new(AuthenticatedActionPolicy::mounted()))
-        .with_auth_config(auth_config)
-        .route(
-            Method::Get,
-            "/v1/whoami",
-            "edge.whoami",
-            Arc::new(WhoamiHandler),
-        )
-        .route(
-            Method::Get,
-            "/v1/t/{tenant}/whoami",
-            "edge.whoami",
-            Arc::new(WhoamiHandler),
-        )
-        .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge");
+    // R2.6 — the action-level allowlist gate + the DEFAULT operator-token scheme (R4.0: `agent`).
+    let mut builder = Gateway::builder(
+        authn,
+        human_login,
+        Arc::new(AuthenticatedActionPolicy::mounted()),
+    )
+    .default_token_scheme(EDGE_DEFAULT_TOKEN_SCHEME)
+    .with_auth_config(auth_config)
+    .route(
+        Method::Get,
+        "/v1/whoami",
+        "edge.whoami",
+        Arc::new(WhoamiHandler),
+    )
+    .route(
+        Method::Get,
+        "/v1/t/{tenant}/whoami",
+        "edge.whoami",
+        Arc::new(WhoamiHandler),
+    )
+    .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge");
     builder = register_git_durable(builder, git_backend.clone());
-    // R2.1a: mount the git smart-HTTP WIRE endpoints (info/refs + upload-pack + receive-pack) in
-    // PROD — previously only the oracle tests registered them, so clone/fetch/push did not exist on
-    // the production edge at all. With the wire live, the R0.2 branch-protection gate fires on the
-    // receive-pack path (`evaluate_protected_ref_push`) and the R0.3 per-repo authorizer above
-    // gates every wire byte (READ-deny → 0-leak 404, WRITE-deny → 403).
     builder = register_git_wire(builder, git_backend);
     let gateway = Arc::new(builder.build());
 
@@ -306,4 +355,148 @@ async fn main() {
         eprintln!("edge: serve error: {e}");
         std::process::exit(1);
     }
+}
+
+// =================================================================================================
+// operator subcommands — `bootstrap` (mint) + `revoke` (S7 denylist). Never an HTTP surface.
+// =================================================================================================
+
+async fn operator_bootstrap(core: ComposedCore, args: &[String]) {
+    let ComposedCore {
+        provider,
+        kms,
+        cell,
+        handle,
+    } = core;
+
+    let tenant = required_flag(args, "--tenant");
+    let principal = required_flag(args, "--principal");
+    let display_name = flag(args, "--display-name");
+    let region = flag(args, "--region").unwrap_or_else(default_region);
+    let ttl_days: u32 = flag(args, "--ttl-days")
+        .map(|v| {
+            v.parse().unwrap_or_else(|_| {
+                eprintln!("edge bootstrap: --ttl-days must be a non-negative integer, got `{v}`");
+                std::process::exit(2);
+            })
+        })
+        .unwrap_or(30);
+
+    // The DURABLE S1 store the serving edge also reads — the seeded principal + credential link
+    // persist in PG, so the minted token authenticates against a separately-running serving edge.
+    let store = PrincipalStore::with_pg(
+        kms.clone(),
+        DurablePrincipalBacking::new(provider.clone()),
+        handle.clone(),
+    );
+    let now_unix = now_unix();
+    let outcome = bootstrap_principal_and_mint(
+        &store,
+        &cell,
+        &BootstrapParams {
+            tenant: &tenant,
+            region: &region,
+            principal: &principal,
+            display: display_name.as_deref(),
+            ttl_days,
+        },
+        now_unix,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("edge bootstrap: {e}");
+        std::process::exit(1);
+    });
+
+    // Print the token to STDOUT EXACTLY ONCE (never a log/file/audit body). The rest of the metadata
+    // is the operator's handle to the principal + the revocation id + the expiry.
+    println!("{}", outcome.token);
+    eprintln!("edge bootstrap: minted an operator capability token");
+    eprintln!("  tenant       = {}", outcome.tenant);
+    eprintln!("  region       = {}", outcome.region);
+    eprintln!("  principal    = {}", outcome.principal_id);
+    eprintln!("  subject_key  = {}", outcome.subject_key);
+    eprintln!("  jti          = {}", outcome.jti);
+    eprintln!("  expiry_unix  = {}", outcome.expiry_unix);
+    eprintln!(
+        "  scheme       = {} (send `Authorization: Bearer <token>` or, on the git wire, HTTP Basic \
+         with the token as the password)",
+        myelin_edge::BOOTSTRAP_SCHEME
+    );
+    eprintln!("  revoke with  : edge revoke --jti {} --tenant {}", outcome.jti, outcome.tenant);
+    // Never leave the token in this process' env / anywhere else.
+}
+
+async fn operator_revoke(core: ComposedCore, args: &[String]) {
+    let ComposedCore {
+        provider, handle, ..
+    } = core;
+
+    let jti = required_flag(args, "--jti");
+    // The S7 denylist is `(tenant, region)`-partitioned, so a revoke MUST name the token's partition.
+    let tenant = required_flag(args, "--tenant");
+    let region = flag(args, "--region").unwrap_or_else(default_region);
+
+    let revocations = RevocationStore::with_pg(
+        DurableRevocationBacking::new(provider.clone()),
+        handle.clone(),
+    );
+    // The verified `(tenant, region)` scope (operator plane — the trust boundary is the DB creds +
+    // seal key, stated above). A plain jti revoke denies regardless of the recorded instant.
+    let scope = TenantScope::from_verified_token(
+        &Principal::stub(
+            PrincipalId("revoke-operator".into()),
+            PrincipalKind::Human,
+            TenantId(tenant.clone()),
+        ),
+        Region(region.clone()),
+    );
+    revocations.revoke(&scope, &RevokeTarget::Jti(jti.clone()), now_rfc3339());
+    eprintln!("edge revoke: token jti `{jti}` revoked in tenant `{tenant}` region `{region}` (durable S7 denylist — the deny survives restart)");
+}
+
+// =================================================================================================
+// Tiny hand-rolled argv helpers (no clap — clap is not a workspace dep; the repo idiom for a main is
+// std::env::args parsing). Each is total over a malformed argv.
+// =================================================================================================
+
+/// The value of `--name <value>` in `args`, or `None`. A flag with no following value is `None`.
+fn flag(args: &[String], name: &str) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == name {
+            return it.next().cloned();
+        }
+        // Also accept `--name=value`.
+        if let Some(v) = a.strip_prefix(&format!("{name}=")) {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// A required `--name <value>`; a missing one is a loud usage error (exit 2).
+fn required_flag(args: &[String], name: &str) -> String {
+    flag(args, name).unwrap_or_else(|| {
+        eprintln!("edge: missing required flag `{name}`");
+        std::process::exit(2);
+    })
+}
+
+/// The default residency region — `MYELIN_REGION` (the dev-stack contract) or `fr-par`.
+fn default_region() -> String {
+    std::env::var("MYELIN_REGION").unwrap_or_else(|_| "fr-par".to_string())
+}
+
+/// The current Unix-seconds instant (for the token `exp`).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The current instant as an RFC-3339 [`Timestamp`] (the revocation record's `now`).
+fn now_rfc3339() -> Timestamp {
+    let dt = chrono::DateTime::from_timestamp(now_unix(), 0).unwrap_or_default();
+    Timestamp(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }

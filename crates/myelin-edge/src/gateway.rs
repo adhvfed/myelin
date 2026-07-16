@@ -75,6 +75,12 @@ pub struct AuthPublicConfig {
     /// Whether the dev-login seam may render at all (belt-and-braces with the frontend build-time
     /// PROD kill switch). Reflects the edge's `MYELIN_DEV_LOGIN` env at composition time.
     pub dev_login_enabled: bool,
+    /// **Whether the operator-TOKEN login seam may render (R4.0 item D).** Gates the (separate, later)
+    /// web "paste your `edge bootstrap` token" login the founder uses to sign in before SSO exists.
+    /// Reflects the edge's `MYELIN_TOKEN_LOGIN == "1"` env at composition time. Additive + defaults
+    /// `false` (a `serde`-additive field: an older client that does not read it is unaffected), so a
+    /// prod edge with no operator-login configured projects the honest `false`.
+    pub token_login_enabled: bool,
 }
 
 /// One login provider projected to the logged-out page — a stable `id` (the credential scheme, e.g.
@@ -436,8 +442,14 @@ impl Gateway {
         // of the operating tenant (the cardinal rule). Most routes carry no `{tenant}` at all.
         let path_tenant = params.get("tenant").map(|t| TenantId(t.clone()));
 
+        // R4.0 item C: the git smart-HTTP WIRE routes (and ONLY those) additionally accept HTTP Basic
+        // (git's native `http://…` credential shape), where the password is the capability token. The
+        // JSON product API stays Bearer-only. The gate is the route's declared action verb, so the
+        // Basic seam can never leak onto a non-wire route.
+        let allow_basic = route.action.starts_with("git.wire.");
+
         // (1) authenticate → the verified Principal (uniform 401 on ANY failure).
-        let principal = self.authenticate(req, path_tenant.as_ref())?;
+        let principal = self.authenticate(req, path_tenant.as_ref(), allow_basic)?;
         // (2) resolve + set the tenant scope (reject + audit a cross-tenant path here).
         let scope = self.resolve_scope(&principal, path_tenant.as_ref())?;
         // (3) re-authorize the action (fail-closed → 403); the seam is consulted on EVERY call.
@@ -509,17 +521,34 @@ impl Gateway {
         &self,
         req: &EdgeRequest,
         path_tenant: Option<&TenantId>,
+        allow_basic: bool,
     ) -> Result<Principal, EdgeError> {
-        if let Some(material) = req.bearer() {
-            let scheme = req
-                .header("x-myelin-token-scheme")
+        let scheme_of = || {
+            req.header("x-myelin-token-scheme")
                 .unwrap_or(&self.default_scheme)
-                .to_string();
-            let cred = Credential { scheme, material: material.to_string() };
+                .to_string()
+        };
+        if let Some(material) = req.bearer() {
+            let cred = Credential { scheme: scheme_of(), material: material.to_string() };
             return self
                 .authn
                 .authenticate(&cred, path_tenant)
                 .map_err(|e| EdgeError::Unauthorized(format!("bearer auth failed: {e:?}")));
+        }
+        // R4.0 item C — git smart-HTTP WIRE ONLY: accept HTTP Basic where the PASSWORD is the
+        // capability-token material (the username is ignored). SAME verify path as Bearer (same scheme
+        // resolution, same `authn.authenticate`), so a valid token authorizes identically. A malformed/
+        // empty Basic header is `None` and falls through to the uniform missing-credential 401 below —
+        // no distinct oracle. The token is never logged (the error carries the AuthzError, not the
+        // material). Bearer callers are entirely unaffected (this arm is reached only when NO Bearer).
+        if allow_basic {
+            if let Some(material) = req.basic_password() {
+                let cred = Credential { scheme: scheme_of(), material };
+                return self
+                    .authn
+                    .authenticate(&cred, path_tenant)
+                    .map_err(|e| EdgeError::Unauthorized(format!("basic auth failed: {e:?}")));
+            }
         }
         if let Some(sid) = req.cookie(SESSION_COOKIE) {
             // The session carries the Bearer server-side (never exposed to client JS).
@@ -573,6 +602,7 @@ impl Gateway {
                 "sso_configured": self.auth_config.sso_configured,
                 "providers": providers,
                 "dev_login_enabled": self.auth_config.dev_login_enabled,
+                "token_login_enabled": self.auth_config.token_login_enabled,
             }),
         )
     }
@@ -839,6 +869,7 @@ mod tests {
                     label: "Single sign-on".into(),
                 }],
                 dev_login_enabled: false,
+                token_login_enabled: true,
             })
             .build();
         // No Authorization header, no session cookie — still 200 (unauthenticated by construction).
@@ -847,6 +878,7 @@ mod tests {
         let b = resp.json_body().unwrap();
         assert_eq!(b["sso_configured"], true);
         assert_eq!(b["dev_login_enabled"], false);
+        assert_eq!(b["token_login_enabled"], true);
         assert_eq!(b["providers"][0]["id"], "oidc");
         assert_eq!(b["providers"][0]["label"], "Single sign-on");
     }
@@ -861,6 +893,7 @@ mod tests {
                     sso_configured: false,
                     providers: vec![],
                     dev_login_enabled: enabled,
+                    token_login_enabled: false,
                 })
                 .build();
             let resp = gw.handle(EdgeRequest::new("GET", "/v1/auth/config", "", vec![], vec![]));
@@ -1033,5 +1066,179 @@ mod tests {
         assert!(!is_bounded_resource_id("a b"));
         assert!(!is_bounded_resource_id(""));
         assert!(!is_bounded_resource_id(&"x".repeat(129)));
+    }
+}
+
+/// R4.0 item C — HTTP Basic → Bearer on the git smart-HTTP WIRE routes ONLY. `git push/clone http://…`
+/// sends `Authorization: Basic base64(user:pass)` where the PASSWORD is the capability token; on the
+/// git-wire routes that translates to the SAME PASETO verify path as Bearer. The JSON product API stays
+/// Bearer-only. These seam-level tests drive the real gateway lifecycle with a real PASETO verifier +
+/// a seeded principal (no socket), so the Basic scoping is proven without the runsc wire harness.
+#[cfg(test)]
+mod git_wire_basic_auth_tests {
+    use super::*;
+    use crate::authz::AllowAll;
+    use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
+    use myelin_identity_service::{
+        CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
+        PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
+    };
+    use myelin_storage::KmsEngine;
+
+    const REGION: &str = "eu-west";
+
+    /// A gateway with a seeded `agent`-scheme principal (`subj-1` → `svc:founder`), a whoami (JSON)
+    /// route and a git-wire `info/refs` route, plus a freshly-minted token for that principal. The
+    /// default token scheme is `agent` (as the production edge sets it), so a bearer/basic credential
+    /// with no scheme header resolves under `agent`.
+    fn seeded_gateway() -> (Gateway, String) {
+        let cell = CellTokenAuthority::from_seed(&[3u8; 32], &[4u8; 32]).expect("cell");
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        let scope = TenantScope::from_verified_token(
+            &Principal::stub(
+                PrincipalId("admin".into()),
+                PrincipalKind::Human,
+                TenantId("acme".into()),
+            ),
+            myelin_tenancy::Region(REGION.into()),
+        );
+        store
+            .put_principal(
+                &scope,
+                PrincipalId("svc:founder".into()),
+                PrincipalKind::Service,
+                DataRole::Controller,
+                PrincipalStatus::Active,
+                None,
+            )
+            .expect("seed principal");
+        store
+            .link_credential(&scope, "agent", "subj-1", &PrincipalId("svc:founder".into()))
+            .expect("link credential");
+        let authn = Arc::new(CapabilityAuthenticator::with_verifier(
+            store,
+            Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
+            RevocationStore::new(),
+        ));
+        let human = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(
+            KmsEngine::new(),
+        ))));
+        let token = cell.mint(&CapabilityMintSpec {
+            tenant: "acme".into(),
+            region: REGION.into(),
+            subject_key: "subj-1".into(),
+            jti: "jti-basic".into(),
+            exp_unix: 9_999_999_999,
+            authority: vec!["agent:run".into()],
+            dpop_jkt: None,
+        });
+        let gw = Gateway::builder(authn, human, Arc::new(AllowAll))
+            .default_token_scheme("agent")
+            .route(
+                Method::Get,
+                "/v1/whoami",
+                "edge.whoami",
+                Arc::new(WhoamiHandler),
+            )
+            .route(
+                Method::Get,
+                "/{tenant}/{region}/{repo}/info/refs",
+                "git.wire.upload_pack",
+                Arc::new(WhoamiHandler),
+            )
+            .build();
+        (gw, token)
+    }
+
+    fn basic_header(user: &str, pass: &str) -> (String, String) {
+        use base64::Engine as _;
+        let b64 =
+            base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}").as_bytes());
+        ("authorization".to_string(), format!("Basic {b64}"))
+    }
+
+    const WIRE: &str = "/acme/eu-west/widgets/info/refs";
+
+    /// **Basic auth (password = token) authorizes on the git wire — the SAME verify path as Bearer.**
+    #[test]
+    fn basic_password_token_authorizes_on_the_git_wire() {
+        let (gw, token) = seeded_gateway();
+        let resp = gw.handle(EdgeRequest::new(
+            "GET",
+            WIRE,
+            "",
+            vec![basic_header("x-access-token", &token)],
+            vec![],
+        ));
+        assert_eq!(
+            resp.status(),
+            200,
+            "the git wire accepts HTTP Basic where the password is the capability token"
+        );
+    }
+
+    /// **Malformed / empty Basic is the SAME uniform 401 as a missing credential (no distinct oracle).**
+    #[test]
+    fn basic_garbage_is_same_as_missing_401() {
+        let (gw, _t) = seeded_gateway();
+        let cases: Vec<(String, String)> = vec![
+            ("authorization".into(), "Basic !!!not-base64".into()), // malformed base64
+            ("authorization".into(), "Basic ".into()),              // empty
+            basic_header("user", ""),                               // empty password
+            basic_header("user-no-colon", "x"), // (has colon via helper; sanity path still 401 unless token)
+        ];
+        for h in cases {
+            let resp = gw.handle(EdgeRequest::new("GET", WIRE, "", vec![h], vec![]));
+            assert_eq!(
+                resp.status(),
+                401,
+                "malformed/empty/non-token Basic is the uniform missing-credential 401"
+            );
+        }
+        // Totally missing credential → the identical 401.
+        let none = gw.handle(EdgeRequest::new("GET", WIRE, "", vec![], vec![]));
+        assert_eq!(none.status(), 401);
+    }
+
+    /// **Bearer is unchanged on the git wire** (Basic is only a fallback when no Bearer is present).
+    #[test]
+    fn bearer_unchanged_on_the_git_wire() {
+        let (gw, token) = seeded_gateway();
+        let resp = gw.handle(EdgeRequest::new(
+            "GET",
+            WIRE,
+            "",
+            vec![("authorization".into(), format!("Bearer {token}"))],
+            vec![],
+        ));
+        assert_eq!(resp.status(), 200, "Bearer still authorizes on the git wire");
+    }
+
+    /// **The JSON product API stays Bearer-only: Basic is refused (401) even with a valid token, but
+    /// Bearer works.** The Basic seam is gated on the `git.wire.*` action verb, so it never leaks onto
+    /// a JSON route.
+    #[test]
+    fn json_api_is_bearer_only_basic_refused() {
+        let (gw, token) = seeded_gateway();
+        let basic = gw.handle(EdgeRequest::new(
+            "GET",
+            "/v1/whoami",
+            "",
+            vec![basic_header("x", &token)],
+            vec![],
+        ));
+        assert_eq!(
+            basic.status(),
+            401,
+            "the JSON API refuses HTTP Basic (Bearer-only) even with a valid token"
+        );
+        let bearer = gw.handle(EdgeRequest::new(
+            "GET",
+            "/v1/whoami",
+            "",
+            vec![("authorization".into(), format!("Bearer {token}"))],
+            vec![],
+        ));
+        assert_eq!(bearer.status(), 200, "Bearer still authorizes the JSON API");
     }
 }

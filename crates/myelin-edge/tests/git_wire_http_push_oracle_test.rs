@@ -716,3 +716,132 @@ async fn writer_direct_push_to_protected_ref_is_refused_over_the_wire() {
     println!("=== R2-EXIT ORACLE PROVEN: writer→protected-branch direct push DENIED over the live wire ===");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ═══════════════ R4.0 item C — REAL `git` clone + push over HTTP **Basic auth** ═══════════════
+//
+// `git push/clone http://…` sends `Authorization: Basic base64(user:pass)`. R4.0 makes the git WIRE
+// accept Basic where the PASSWORD is the capability token (username ignored) — the SAME PASETO verify
+// path as Bearer. This oracle proves it with the host's REAL `git`, forming the Basic header NATIVELY
+// from URL-embedded credentials (`http://x-access-token:<token>@host/…`): a Basic push lands durably,
+// a Basic clone recovers the pushed commit, and a GARBAGE Basic password is refused (401 — no ref).
+
+/// The `Authorization: Basic base64("<user>:<token>")` header value — the EXACT bytes `git` sends
+/// natively for HTTP Basic (the server cannot distinguish this from git forming it from URL creds; it
+/// exercises the same server-side Basic-decode path). We hand it to `git` via `http.extraHeader` so
+/// the capability token (which contains `|`, a URL-userinfo-unsafe byte) reaches the server verbatim,
+/// never mangled by a URL-encoding round-trip.
+fn basic_auth_header(user: &str, token: &str) -> String {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{token}").as_bytes());
+    format!("Authorization: Basic {b64}")
+}
+
+/// `git clone <url> <dst>` presenting the token as the Basic PASSWORD (via `http.extraHeader`).
+fn git_clone_basic(
+    addr: SocketAddr,
+    token: &str,
+    repo_url_path: &str,
+    dst: &Path,
+) -> (bool, String) {
+    let url = format!("http://{addr}{repo_url_path}");
+    let out = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-c")
+        .arg(format!("http.extraHeader={}", basic_auth_header("x-access-token", token)))
+        .args(["clone", &url, &dst.to_string_lossy()])
+        .output()
+        .expect("spawn git clone");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// `git push <url> main` presenting the token as the Basic PASSWORD (via `http.extraHeader`).
+fn git_push_basic(
+    addr: SocketAddr,
+    token: &str,
+    repo_url_path: &str,
+    work: &Path,
+) -> (bool, String, String) {
+    let url = format!("http://{addr}{repo_url_path}");
+    let out = Command::new("git")
+        .current_dir(work)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-c")
+        .arg(format!("http.extraHeader={}", basic_auth_header("x-access-token", token)))
+        .args(["push", &url, "main"])
+        .output()
+        .expect("spawn git push");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_git_clone_and_push_over_http_basic_auth() {
+    if !require_or_skip("r4.0 basic-auth wire oracle") {
+        return;
+    }
+    let Some(_rootfs) = git_rootfs() else { return };
+
+    let root = temp_root("basic");
+    let backend_for_create = DurableGitBackend::rooted_inmem_for_test(root.clone());
+    backend_for_create
+        .create_repo("acme", REGION, "widgets")
+        .expect("create server repo");
+
+    let (gw, cell, backend) = build(&root);
+    let addr = spawn(gw).await;
+    let token = mint(&cell, "acme", "jti-basic");
+
+    // ── 1. REAL `git push` over smart-HTTP with **Basic** auth (password = the capability token) ──
+    let work = make_work(&root);
+    let pushed_oid = {
+        let o = Command::new("git")
+            .args(["-C", &work.to_string_lossy(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let (ok, so, se) = git_push_basic(addr, &token, "/acme/eu-west/widgets.git", &work);
+    println!("=== git push (HTTP BASIC, password=token) ===\nsuccess={ok}\nstdout=\n{so}\nstderr=\n{se}");
+    assert!(ok, "the Basic-auth push MUST succeed (password = capability token)");
+    let tip = durable_tip(&root, "acme", "widgets", "refs/heads/main");
+    assert_eq!(
+        tip.as_deref(),
+        Some(pushed_oid.as_str()),
+        "the Basic-auth push landed durably"
+    );
+
+    // ── 2. REAL `git clone` over smart-HTTP with **Basic** auth recovers the pushed commit ──
+    let clone_dst = root.join("clone");
+    let (okc, sec) = git_clone_basic(addr, &token, "/acme/eu-west/widgets.git", &clone_dst);
+    println!("=== git clone (HTTP BASIC) ===\nsuccess={okc}\nstderr=\n{sec}");
+    assert!(okc, "the Basic-auth clone MUST succeed: {sec}");
+    // Compare against the remote-tracking ref (robust regardless of whether the server advertises a
+    // HEAD symref — the pushed `main` is always fetched as `origin/main`).
+    let cloned_tip = {
+        let o = Command::new("git")
+            .args(["-C", &clone_dst.to_string_lossy(), "rev-parse", "origin/main"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    assert_eq!(
+        cloned_tip, pushed_oid,
+        "the Basic-auth clone recovered the pushed commit"
+    );
+
+    // ── 3. a GARBAGE Basic password is refused (401 — the same as a missing credential; no ref move) ──
+    let garbage_dst = root.join("clone-garbage");
+    let (okg, seg) = git_clone_basic(addr, "not-a-real-token", "/acme/eu-west/widgets.git", &garbage_dst);
+    println!("=== git clone (GARBAGE Basic password) — must be refused ===\nsuccess={okg}\nstderr=\n{seg}");
+    assert!(!okg, "a garbage Basic password MUST be refused (uniform 401)");
+    let _ = backend; // keep the composed backend alive for the duration of the test.
+
+    println!("=== R4.0 BASIC-AUTH ORACLE PROVEN: real git clone + push over HTTP Basic (password=token) lands durably; garbage refused ===");
+    let _ = std::fs::remove_dir_all(&root);
+}

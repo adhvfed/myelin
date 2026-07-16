@@ -368,6 +368,35 @@ impl SealKey {
     fn cipher(&self) -> Aes256Gcm {
         self.0.cipher()
     }
+
+    /// **Seal ARBITRARY plaintext under the seal key (AES-256-GCM), returning `(nonce, ciphertext)`.**
+    /// The generic analogue of [`CellRoot::seal`] — used to seal cell-infra key material that is NOT a
+    /// 32-byte [`CellRoot`] (e.g. the 64-byte capability-token cell-authority root: the Ed25519 seed ‖
+    /// the macaroon MAC key, sealed by [`crate::cell_root_durable::DurableCellRootBacking`]). Reuses
+    /// the SAME vetted AEAD + the SAME per-seal random nonce discipline as every other seal in this
+    /// module — never a hand-rolled cipher, never a fixed nonce. The plaintext is the CALLER's secret;
+    /// only the returned ciphertext is safe to persist (the seal key is the operator-held unseal root).
+    pub fn seal_bytes(&self, plaintext: &[u8]) -> ([u8; NONCE_LEN], Vec<u8>) {
+        let nonce = Aes256Gcm::generate_nonce(OsRng);
+        let ct = self
+            .cipher()
+            .encrypt(&nonce, plaintext)
+            .expect("AES-256-GCM seal arbitrary bytes under the seal key");
+        let mut n = [0u8; NONCE_LEN];
+        n.copy_from_slice(nonce.as_slice());
+        (n, ct)
+    }
+
+    /// **Unseal a `(nonce, ciphertext)` produced by [`Self::seal_bytes`].** Returns `None` if the
+    /// ciphertext does not authenticate under this seal key — a WRONG / absent seal key or a tampered
+    /// row. The caller MUST then fail closed + loud and NEVER regenerate the material (a fresh cell
+    /// root would orphan every token minted under the old one — the SAME §7.5 fail-closed posture as
+    /// [`CellRoot::unseal`]).
+    pub fn open_bytes(&self, nonce: &[u8; NONCE_LEN], ciphertext: &[u8]) -> Option<Vec<u8>> {
+        self.cipher()
+            .decrypt(Nonce::from_slice(nonce), ciphertext)
+            .ok()
+    }
 }
 
 impl fmt::Debug for SealKey {
