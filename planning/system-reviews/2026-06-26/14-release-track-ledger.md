@@ -580,10 +580,14 @@ is FORCE-RLS but CiCostEventStore writes on a bare pool w/o the (tenant,region) 
 tenant-scoped tx (CT-004d). · **CT-004c** scheduler/lease loop live on `job_queue`
 + reaper/autoscaler background loops (a). **SCOUTED + SPLIT for risk (untrusted-exec isolation):** every piece
 exists but is unit-only — no pool-backed store, no running loop; TWO parallel in-memory lease models
-(controlplane `SchedulerState` + sandbox `JobLeaseStore`) are NOT connected. **CT-004c.1 (IN PROGRESS — durability
-plumbing, NO exec):** a pool-backed `DurableJobQueue` store running CLAIM/REAP/CANCEL_SUPERSEDED under a
-tenant-scoped RLS tx (the ONE durable store both lease models unify onto) + the reaper wired into the serve
-lifecycle. **CT-004c.2 (NEXT — SECURITY-CRITICAL, needs an independent adversarial verifier):** bind the
+(controlplane `SchedulerState` + sandbox `JobLeaseStore`) are NOT connected. **CT-004c.1 DONE `c9c6766`** (`CiJobQueueStore`:
+per-tenant enqueue/complete/heartbeat/cancel under `with_tenant_tx` RLS; region-scoped cross-tenant claim/reap
+under `with_region_tx` [clears tenant GUC, no bleed] isolated in job_queue_region.rs with a NAMED tenant-predicate
+exclusion [placement_durable precedent, honest — only the 2 cross-tenant queries]; JobQueueReaper spawned off the
+serve runtime, minimal-impact; proven on live PG incl. the trust-tier gate [trusted-only claim NEVER leases
+untrusted_fork/self_hosted], SKIP-LOCKED no-double-lease, reap-no-orphan/no-dup, kill-9, RLS under myelin_app;
+lints 175/0, unit 400/0. Floor: region-scoped scheduler DB role for prod non-superuser claim/reap [region GUC
+already set]). **CT-004c.2 (IN PROGRESS — SECURITY-CRITICAL, WILL get an independent adversarial verifier):** bind the
 RunnerAgent to claim from the durable store → `SandboxBackend::launch` untrusted code → job.done; start the
 `ci.pipeline` body (`run_ci_pipeline_body`/CI_PIPELINE_WF_TYPE) on a real FlowExecutor with the pre-minted
 wf_run_id + SchedulerJobRunner as the injected JobRunner. Verifier surfaces: the trust-tier claim predicate
