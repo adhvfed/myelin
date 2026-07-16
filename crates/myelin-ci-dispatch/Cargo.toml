@@ -118,10 +118,22 @@ myelin-events = { path = "../myelin-events", features = ["test-support"] }
 # (`cargo tree -e no-dev` shows no test-support edge) — the SAME idiom as the other subsystem crates'
 # storage test-support dev-deps (git/search/issues/knowledge/chat).
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
+# CT-004b: the live-PG trigger-consumer durability test (`integration_ci_ct004b_trigger_consumer`)
+# stands up the `ci_run` table in an isolated schema to PROVE the atomic reserve co-commit on real
+# Postgres — the `ci_run` table is OWNED by myelin-ci-controlplane (its `CREATE_CI_RUN_DDL`), NOT by
+# ci-dispatch. This is a DEV-dependency (test-only; no production DAG edge — `cargo tree -e no-dev`
+# shows none) so the test uses the REAL frozen DDL constant (no drift), the SAME posture the CT-004a
+# / p28 durability drills use from inside the controlplane crate.
+myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
 
 [features]
 default = []
+# CT-004b: the `test-support`-gated in-memory doubles (`MapGitConfigReader`, `RecordingReserveStore`)
+# the trigger-consumer unit tests + downstream drills drive DB-free. Never in the production DAG (the
+# `no-in-memory-durable-store` scanner strips `test-support`-gated types as test doubles).
+test-support = []
 # `myelin-storage/integration` exposes the s3blob module (the real S3BlobStore over RustFS/Scaleway).
+# The CT-004b live-PG trigger-consumer durability test rides `integration` (real ci_run co-commit).
 integration = [
     "dep:sqlx",
     "dep:aws-sdk-s3",
