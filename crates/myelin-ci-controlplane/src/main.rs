@@ -148,22 +148,37 @@ async fn main() {
         std::time::Duration::from_secs(15),
     );
     tokio::spawn(reaper.run());
-    // CT-004c.2: OPT-IN spawn the bounded CI runner loop — it claims from the durable `job_queue` and
-    // EXECUTES the leased job in a REAL gVisor (`runsc`) guest (the AG-D4 gate). Gated behind
-    // `MYELIN_CI_RUNNER=1` (default OFF): a control-plane node runs untrusted code ONLY when explicitly
-    // enabled as a runner host — never implicitly on every boot. The loop runs on a DEDICATED thread
-    // (off the tokio runtime) so `RunnerAgent::run_one` (sync, blocking for the whole in-line job) does
-    // not starve a worker; the lease adapter bridges its async DB calls onto the runtime handle. The
-    // trust-tier/region claim predicate is CT-004c.1's durable store, forwarded UNCHANGED (an
-    // `untrusted_fork` job is never claimed by this trusted-only runner). The digest-pinned JobSpec
-    // store (the resolver's real backing) + the shared durable executor the `job.done` wakes are the
-    // CT-004d handoff — until then the resolver is a safe no-op (a leased-but-unresolved row is reaped),
-    // so enabling the runner before CT-004d never launches an unresolved job.
+    // CT-004c.2 + CT-004d.1: OPT-IN spawn the bounded CI runner loop — it claims from the durable
+    // `job_queue`, RESOLVES the leased row to its digest-pinned `JobSpec` via the durable `ci_job_spec`
+    // store (CT-004d.1's real resolver), and EXECUTES it in a REAL gVisor (`runsc`) guest (the AG-D4
+    // gate). Gated behind `MYELIN_CI_RUNNER=1` (default OFF): a control-plane node runs untrusted code
+    // ONLY when explicitly enabled as a runner host — never implicitly on every boot. The loop runs on
+    // a DEDICATED thread (off the tokio runtime) so `RunnerAgent::run_one` (sync, blocking for the whole
+    // in-line job) does not starve a worker; the lease adapter + the spec resolver bridge their async DB
+    // calls onto the runtime handle. The trust-tier/region claim predicate is CT-004c.1's durable store,
+    // forwarded UNCHANGED (an `untrusted_fork` job is never claimed by this trusted-only runner).
+    //
+    // CT-004d.1 replaces the CT-004c.2 fail-closed no-op resolver with the REAL
+    // `durable_spec_resolver` over `ci_job_spec` (the dispatch co-persists the spec there); a
+    // leased-but-unresolved row (spec absent/corrupt) still resolves fail-closed → the row stays leased
+    // and is reaped, never an unresolved/fabricated launch. The lease TTL is `CI_RUNNER_LEASE_TTL_SECS`
+    // (ABOVE the max job timeout the spec store enforces) so a long job never lapses its lease mid-run
+    // (the CT-004c.2 double-run fix). The shared durable executor the `job.done` wakes a REAL parked
+    // `ci.pipeline` body on (registering/starting that body) is CT-004d.2; the live settle bookend is
+    // CT-004d.3 — here the executor is the composition placeholder proving the one signal path.
     if std::env::var("MYELIN_CI_RUNNER").as_deref() == Ok("1") {
         let region = provider.config().region.clone();
         let runner_store = myelin_ci_controlplane::ci_job_queue_store(provider.db_pool().clone());
-        // The `job.done` target executor (CT-004d shares this with the parked `ci.pipeline` body). A
-        // hosted runner is cross-tenant; the per-run tenant scoping is the CT-004d executor's — this is
+        // The REAL durable spec resolver (CT-004d.1): resolve a leased row → the spec the dispatch
+        // co-persisted into `ci_job_spec`. Fail-closed (missing/corrupt spec → no launch, reaped).
+        let spec_store = myelin_ci_controlplane::ci_job_spec_store(provider.db_pool().clone());
+        let resolver = myelin_ci_controlplane::durable_spec_resolver(
+            spec_store,
+            region.clone(),
+            tokio::runtime::Handle::current(),
+        );
+        // The `job.done` target executor (CT-004d.2 shares this with the parked `ci.pipeline` body). A
+        // hosted runner is cross-tenant; the per-run tenant scoping is the CT-004d.2 executor's — this is
         // the composition placeholder proving the one signal path (`EngineTerminalReporter`).
         let executor = myelin_flow::FlowExecutor::new(
             Arc::new(myelin_events::MonotonicMinter::new()),
@@ -176,10 +191,10 @@ async fn main() {
             vec!["linux".to_string()],
             vec![myelin_ci_sandbox::TrustTier::Trusted],
             region,
-            30,
+            myelin_ci_controlplane::CI_RUNNER_LEASE_TTL_SECS,
             runner_store,
             tokio::runtime::Handle::current(),
-            myelin_ci_controlplane::spec_store_unavailable_resolver(),
+            resolver,
             executor,
             runner_hooks(),
         );

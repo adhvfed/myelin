@@ -21,7 +21,7 @@
 //!     liveness must not check deps; readiness gates on the DB pool + the declared critical deps
 //!     (arch 00 §4: DB + broker + authz + at-least-one-healthy-runner-pool);
 //!   - runs the **complete forward-only data-model migrations** ([`migrations::ci_controlplane_migrations`]):
-//!     all fourteen CI Control-Plane tables (`ci_run`, `ci_job`, `check_attempt`, `job_queue` +
+//!     all fifteen CI Control-Plane tables (`ci_run`, `ci_job`, `check_attempt`, `job_queue` +
 //!     its three claim indexes, `fair_deficit`, `runner`, `log_segment`, `log_anchor`, `artifact`,
 //!     `cache_entry`, `environment`, `deployment`, `secret_binding`, `cost_event`), each
 //!     `(tenant_id, region)`-first + RLS-on (contract 11.1/12.1/1.5);
@@ -115,6 +115,17 @@ pub mod fleet;
 /// this chunk leases a row and launches NOTHING). Constructed at the composition root by
 /// [`ci_job_queue_store`]; the reaper is spawned by the service `main` onto the serve runtime.
 pub mod job_queue_store;
+/// CT-004d.1 — the durable `JobSpec` store ([`job_spec_store::CiJobSpecStore`]) + the dispatch→durable
+/// co-persist. The missing half of the dispatch→durable→resolve bridge: CT-004c.1 landed the durable
+/// `job_queue` (scheduling metadata only) and CT-004c.2 wired the runner to claim from it, but the
+/// production spec-resolver was a fail-closed no-op ([`spec_store_unavailable_resolver`]). This store is
+/// the real backing that resolver reads — it persists a dispatched stage's [`myelin_ci_sandbox::JobSpec`]
+/// as one `spec jsonb` column keyed `(tenant, job_id)`, co-committed with the `job_queue` row in one
+/// tenant-scoped tx on the shared `idem_token`, feeding the claim-gating `trust_tier` FROM the spec
+/// (never widened). Constructed at the composition root by [`ci_job_spec_store`]; the real resolver is
+/// [`runner_bind::durable_spec_resolver`]. Registering/starting the `ci.pipeline` body on the executor +
+/// the live settle bookend are CT-004d.2/.3 (NOT this chunk).
+pub mod job_spec_store;
 /// CT-004c.1: the REGION-scoped, CROSS-TENANT half of the durable scheduler — the raw `CLAIM_QUERY` /
 /// `REAP_QUERY` executions (a hosted runner claims across ALL tenants in its region; the DRR fairness
 /// spans tenants). Isolated here so it is a NAMED, LOUD `tenant-predicate` exclusion (the
@@ -401,10 +412,23 @@ pub use job_queue_store::{
     CiJobQueueStore, DurableEnqueue, JobQueueReaper, JobQueueStoreError, LeasedJob,
 };
 
+// CT-004d.1: the durable `JobSpec` store + the dispatch→durable co-persist + the fail-closed
+// resolve. `CiJobSpecStore::co_persist_dispatch` writes the `job_queue` row AND the digest-pinned
+// `JobSpec` (as one `spec jsonb`) in ONE tenant-scoped tx on the shared `idem_token`, feeding the
+// claim-gating `trust_tier` FROM the spec (a mismatch is refused fail-closed). `get_spec` resolves a
+// leased row back to its exact spec (corrupt/missing → fail-closed, never a default). `MAX_JOB_TIMEOUT_SECS`
+// is the wall-clock ceiling below the runner's lease TTL (the CT-004c.2 double-run fix).
+pub use job_spec_store::{
+    CiJobSpecStore, CiJobSpecStoreError, DispatchOutcome, INSERT_JOB_SPEC_QUERY,
+    MAX_JOB_TIMEOUT_SECS, SELECT_JOB_SPEC_QUERY,
+};
+
 // CT-004c.2: the runner exec binding — the durable-store lease adapter + the bounded runner loop the
-// service `main` spawns (WIRES `RunnerAgent` to `CiJobQueueStore` + a real gVisor backend).
+// service `main` spawns (WIRES `RunnerAgent` to `CiJobQueueStore` + a real gVisor backend). CT-004d.1
+// adds the REAL spec resolver (`durable_spec_resolver`) + the lease-TTL floor (`CI_RUNNER_LEASE_TTL_SECS`).
 pub use runner_bind::{
-    spec_store_unavailable_resolver, CiRunnerLoop, DurableLeaseAdapter, JobSpecResolver,
+    durable_spec_resolver, spec_store_unavailable_resolver, CiRunnerLoop, DurableLeaseAdapter,
+    JobSpecResolver, CI_RUNNER_LEASE_TTL_SECS,
 };
 
 // CI-P14 (P-357): the EU fleet autoscaler — the FleetProvider impl + autoscale-on-queue-depth +
@@ -432,12 +456,12 @@ pub use migrations::{
     ci_durable_migrations, make_tenant_scoped_ddl, ARTIFACT_TABLE, CACHE_ENTRY_TABLE,
     CHECK_ATTEMPT_TABLE, CI_COST_EVENT_TABLE, CI_DURABLE_WRITER_IDS, CI_JOB_TABLE, CI_RUN_TABLE,
     CREATE_ARTIFACT_DDL, CREATE_CACHE_ENTRY_DDL, CREATE_CHECK_ATTEMPT_DDL,
-    CREATE_CI_COST_EVENT_DDL, CREATE_CI_JOB_DDL, CREATE_CI_RUN_DDL, CREATE_DEPLOYMENT_DDL,
-    CREATE_ENVIRONMENT_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
+    CREATE_CI_COST_EVENT_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL,
+    CREATE_DEPLOYMENT_DDL, CREATE_ENVIRONMENT_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
     CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL, CREATE_RUNNER_DDL,
-    CREATE_SECRET_BINDING_DDL, DEPLOYMENT_TABLE, ENVIRONMENT_TABLE, FAIR_DEFICIT_TABLE,
-    JOB_QUEUE_TABLE, JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX, JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE,
-    LOG_SEGMENT_TABLE, RUNNER_TABLE, SECRET_BINDING_TABLE,
+    CREATE_SECRET_BINDING_DDL, CI_JOB_SPEC_TABLE, DEPLOYMENT_TABLE, ENVIRONMENT_TABLE,
+    FAIR_DEFICIT_TABLE, JOB_QUEUE_TABLE, JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX, JQ_SERIALIZE_INDEX,
+    LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE, RUNNER_TABLE, SECRET_BINDING_TABLE,
 };
 
 pub use permanent_gates::{
@@ -495,7 +519,7 @@ fn controlplane_critical() -> CriticalDependencies {
 ///
 /// `config` is the validated, env-first config (§3.2; `Config::from_env()` lands with the driver,
 /// P-S15 — the shell boots over the validated default today). The complete forward-only data-model
-/// migrations create all fourteen control-plane tables `(tenant, region)`-first + RLS-on; the four
+/// migrations create all fifteen control-plane tables `(tenant, region)`-first + RLS-on; the four
 /// hot tables are declared; `broker` / `authz` / `runner_pool` are declared critical. No consumers
 /// are registered here — the scheduler/check-emitter behaviour is the per-table follow-ons (named in
 /// [`migrations`]); the dedup consumer is the Trigger & Dispatch shell.
@@ -596,6 +620,20 @@ pub fn ci_cost_event_store(pool: sqlx::PgPool) -> CiCostEventStore {
 /// sandbox exec path). CT-004c.1 leases a row and launches NOTHING.
 pub fn ci_job_queue_store(pool: sqlx::PgPool) -> CiJobQueueStore {
     CiJobQueueStore::with_pg(pool)
+}
+
+/// **Construct the durable CI `ci_job_spec` store at the composition root (CT-004d.1).** The service
+/// `main` builds this from the MR-022 `SubstrateProvider` pool after the migrations have run, so the
+/// dispatch has a real, production-callable [`CiJobSpecStore`] to co-persist a stage's [`JobSpec`] into
+/// and the runner's real resolver ([`durable_spec_resolver`]) has a store to read back from. A thin
+/// composition seam (over [`CiJobSpecStore::with_pg`]) so the wiring point is named in ONE place. The
+/// `ci_job_spec` table it needs is created by the full [`ci_controlplane_migrations`] the
+/// ci-controlplane `serve(AppSpec)` applies at boot — a single-owner control-plane table (the
+/// control-plane dispatch writes it, the control-plane runner reads it), so it stays in the full set,
+/// NOT the shared `ci_durable_migrations` writer subset (the SAME posture as `job_queue`; ci-dispatch
+/// does not touch `ci_job_spec` in CT-004d.1 — the dispatch consumer is CT-004d.2).
+pub fn ci_job_spec_store(pool: sqlx::PgPool) -> CiJobSpecStore {
+    CiJobSpecStore::with_pg(pool)
 }
 
 #[cfg(test)]
@@ -704,8 +742,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            14,
-            "all 14 control-plane tables are in the forward-only migration set"
+            15,
+            "all 15 control-plane tables are in the forward-only migration set"
         );
         assert!(
             spec.consumers.is_empty(),

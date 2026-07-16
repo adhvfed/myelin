@@ -59,7 +59,21 @@ use myelin_ci_sandbox::{
 use myelin_flow::FlowExecutor;
 use myelin_tenancy::{Region, TenantId};
 
-use crate::{CiJobQueueStore, LeasedJob};
+use crate::job_spec_store::MAX_JOB_TIMEOUT_SECS;
+use crate::{CiJobQueueStore, CiJobSpecStore, LeasedJob};
+
+/// **The runner's lease TTL, wired ABOVE the max job timeout (CT-004d.1 — the CT-004c.2 verifier's
+/// MEDIUM fix).** [`RunnerAgent::run_one`](myelin_ci_sandbox::RunnerAgent) BLOCKS for the whole in-line
+/// job and heartbeats only BEFORE + AFTER the blocking launch (never mid-launch, absent a structural
+/// change to the sandbox launch). So if the lease TTL were below the job's wall-clock, the lease would
+/// lapse mid-run → the reaper re-queues it → a second runner double-executes. Setting the TTL strictly
+/// above [`MAX_JOB_TIMEOUT_SECS`] (which the spec store enforces as the per-job ceiling) makes that
+/// impossible: a leased job provably finishes before its lease can lapse. The tighter fix — a
+/// heartbeat thread DURING the blocking launch, which would let this shrink back toward the reaper
+/// cadence — is the named CT-004d follow-on (it needs a structural hook in the sandbox launch, out of
+/// scope for CT-004d.1, which must not touch `run_one`'s security body). The `+ 600` is the margin
+/// over the ceiling (reaper-cadence + clock-skew headroom).
+pub const CI_RUNNER_LEASE_TTL_SECS: i64 = MAX_JOB_TIMEOUT_SECS as i64 + 600;
 
 /// **Resolve a leased `job_queue` row to its digest-pinned [`JobSpec`] (the CT-004d spec-store seam).**
 /// The durable queue holds scheduling metadata, not the spec; this maps a claimed [`LeasedJob`] to the
@@ -405,5 +419,32 @@ pub fn spec_store_unavailable_resolver() -> JobSpecResolver {
              job — leaving it leased for the reaper",
             leased.job_id
         ))
+    })
+}
+
+/// **The REAL production spec-resolver over the durable `ci_job_spec` store (CT-004d.1).** Replaces
+/// [`spec_store_unavailable_resolver`]: resolves a leased `job_queue` row to the exact [`JobSpec`] the
+/// dispatch co-persisted, via [`CiJobSpecStore::get_spec`] keyed on `(leased.tenant_id, leased.job_id)`.
+/// `region` is the runner's residency region (the tenant-scoped-tx scope the read runs under); `rt` is
+/// the runtime handle the sync resolver bridges its async DB read onto (the SAME off-runtime
+/// `block_on` convention the lease adapter uses — the resolver is called INSIDE
+/// [`DurableLeaseAdapter::claim_for_labels`], already on the runner's dedicated thread).
+///
+/// **Fail-closed by construction:** a missing spec ([`CiJobSpecStoreError::SpecNotFound`]) or a corrupt
+/// one ([`CiJobSpecStoreError::CorruptSpec`]) returns `Err` — the claim becomes a no-op (`None`), the
+/// row stays leased, and the reaper recovers it. The runner NEVER launches a fabricated/default spec;
+/// the stored spec is the only thing that executes.
+pub fn durable_spec_resolver(
+    store: CiJobSpecStore,
+    region: impl Into<String>,
+    rt: tokio::runtime::Handle,
+) -> JobSpecResolver {
+    let region = region.into();
+    Arc::new(move |leased: &LeasedJob| {
+        bridge(
+            &rt,
+            store.get_spec(&leased.tenant_id, &region, &leased.job_id.to_string()),
+        )
+        .map_err(|e| e.to_string())
     })
 }

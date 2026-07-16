@@ -1,0 +1,407 @@
+//! # `job_spec_store` — CT-004d.1: the durable `JobSpec` store + the dispatch→durable co-persist
+//!
+//! **Owning architecture doc (byte-authoritative):**
+//! `planning/04-subsystem-architectures/continuous-integration/architecture/02-internals-and-algorithms.md`
+//! §3.3 (the `SCHEDULE_AND_RUN_JOB` handshake — the dispatch enqueues the stage's job) + §2.1 (the
+//! pull-lease claim the runner resolves against) + §5.3 (the digest-pinned [`JobSpec`] is what the
+//! sandbox EXECUTES). **Reconciliation:** §OQ-F (the deterministic `idem_token` producer/consumer
+//! agree on — one token keys BOTH the `job_queue` row and this spec row).
+//!
+//! ## What CT-004d.1 ships — the missing half of the dispatch→durable→resolve bridge
+//! CT-004c.1 landed the durable [`CiJobQueueStore`](crate::CiJobQueueStore) (enqueue/claim/reap) —
+//! but the `job_queue` row is **scheduling metadata only** (job_id / run_id / lane / labels /
+//! trust_tier / fair_key / idem_token); it carries NO digest-pinned [`JobSpec`] (image / command /
+//! egress / limits / trust / workspace / run-token / meter). CT-004c.2 wired the runner to claim from
+//! the durable queue but resolved the spec through an INJECTED [`JobSpecResolver`](crate::JobSpecResolver)
+//! that the production path left as a fail-closed no-op ([`crate::spec_store_unavailable_resolver`]).
+//!
+//! [`CiJobSpecStore`] is the real backing that resolver reads: it persists a dispatched stage's
+//! [`JobSpec`] keyed by `(tenant_id, job_id)` — the SAME identity the leased `job_queue` row carries —
+//! so the runner can resolve a claimed row → its exact spec → execute it. It is the durable
+//! system-of-record for "what a leased job runs".
+//!
+//! ## The spec is a SINGLE `jsonb` column — a faithful round-trip
+//! [`JobSpec`] (and every field type it composes) derives `serde::{Serialize, Deserialize}`, so the
+//! whole value round-trips through ONE `spec jsonb` column with NO lossy per-column projection. The
+//! stored spec is what EXECUTES, so fidelity is load-bearing: a corrupt / missing / mistyped spec is a
+//! **fail-closed** [`CiJobSpecStoreError`] (the runner then does NOT launch — the leased row is left for
+//! the reaper), NEVER a fabricated default spec.
+//!
+//! ## Dispatch co-persists the spec + the `job_queue` row in ONE tx, idempotent on the `idem_token`
+//! [`CiJobSpecStore::co_persist_dispatch`] writes BOTH the `job_queue` row (via the byte-identical
+//! [`INSERT_JOB_QUEUE_QUERY`]) AND the `ci_job_spec` row in a single tenant-scoped transaction, so a
+//! crash between the two cannot leave a claimable `job_queue` row with no resolvable spec (which would
+//! wedge on the reaper forever). Both inserts are idempotent — the `job_queue` row on the
+//! `(tenant_id, idem_token)` `jq_idem` unique, the spec row on the `(tenant_id, job_id)` PK — so a
+//! re-dispatch (control-plane replay) or a reaper re-queue collapses to ONE of each (effectively-once).
+//!
+//! ## THE SECURITY INVARIANT — the `job_queue` row's `trust_tier` comes from the SPEC, never widened
+//! The eligibility gate CT-004c.1/c.2 enforce is the `job_queue` row's `trust_tier` (an `untrusted_fork`
+//! job is never leased by a trusted-only runner). [`co_persist_dispatch`](CiJobSpecStore::co_persist_dispatch)
+//! **feeds that gate from the real dispatched spec**: it refuses fail-closed
+//! ([`CiJobSpecStoreError::TrustTierMismatch`]) if the enqueue's declared `trust_tier` does not equal
+//! `spec.trust_tier` — so the row that gates the claim can never carry a WIDER tier than the spec that
+//! will execute. The residency `region` is the run's honest residency pin carried on the enqueue (no
+//! global pool, no default). This does not weaken the gate — it wires the gate to the truth.
+//!
+//! ## The lease-TTL floor (the CT-004c.2 verifier's MEDIUM fix)
+//! [`RunnerAgent::run_one`](myelin_ci_sandbox::RunnerAgent) BLOCKS for the whole in-line job and only
+//! heartbeats BEFORE + AFTER the blocking launch (never mid-launch, without a structural change to the
+//! sandbox launch). So a job whose wall-clock exceeds the lease TTL would lapse its lease mid-run → the
+//! reaper re-queues it → a second runner double-executes. CT-004d.1 makes that impossible on TWO ends:
+//! (1) [`MAX_JOB_TIMEOUT_SECS`] is the ceiling this store enforces at persist ([`CiJobSpecStoreError::TimeoutTooLong`]
+//! fail-closed) — a spec whose `timeout_secs` exceeds it never becomes a claimable job; and (2) the
+//! runner is wired with `lease_ttl_secs = ` [`CI_RUNNER_LEASE_TTL_SECS`](crate::runner_bind::CI_RUNNER_LEASE_TTL_SECS)
+//! `> MAX_JOB_TIMEOUT_SECS`, so a leased job provably cannot outlive its lease. (The mid-launch
+//! heartbeat is the tighter fix — named as the follow-on that would let the lease TTL shrink again.)
+
+use myelin_ci_sandbox::{JobSpec, TrustTier};
+use myelin_storage::{with_tenant_tx, PgError};
+use sqlx::postgres::PgPool;
+use sqlx::Row;
+
+use crate::job_queue_store::{parse_id, trust_token};
+use crate::scheduler::{EnqueueOutcome, INSERT_JOB_QUEUE_QUERY};
+use crate::DurableEnqueue;
+
+/// **The wall-clock ceiling a dispatched [`JobSpec`]'s `timeout_secs` may not exceed (CT-004d.1).**
+/// The runner's lease TTL is wired ABOVE this (see [`crate::runner_bind::CI_RUNNER_LEASE_TTL_SECS`]),
+/// so a leased job can never outlive its lease mid-run (the CT-004c.2 double-run guard, closed at the
+/// dispatch). 6 h (GitHub-Actions parity) — comfortably above every real CI job (the workspace's
+/// longest configured job is 2 h) so this rejects nothing legitimate; a spec above it is refused
+/// fail-closed rather than admitted as a lease-outliving double-run hazard.
+pub const MAX_JOB_TIMEOUT_SECS: u32 = 6 * 60 * 60;
+
+/// **Persist a dispatched stage's [`JobSpec`] keyed `(tenant_id, job_id)`, idempotent on the PK
+/// ([`CiJobSpecStore::co_persist_dispatch`] co-writes it with the `job_queue` row).** Binds:
+/// `$1 tenant_id`, `$2 region`, `$3 job_id` (uuid), `$4 run_id` (uuid), `$5 idem_token`,
+/// `$6 spec` (jsonb). `ON CONFLICT (tenant_id, job_id) DO NOTHING` makes a re-dispatch a no-op — the
+/// stored spec is deterministic on the dispatch position, so a re-write would be identical anyway.
+/// `RETURNING job_id` is present iff a fresh row was inserted (absent on the idempotent conflict).
+pub const INSERT_JOB_SPEC_QUERY: &str = "\
+INSERT INTO ci_job_spec (tenant_id, region, job_id, run_id, idem_token, spec)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (tenant_id, job_id) DO NOTHING
+RETURNING job_id";
+
+/// **Read a leased job's persisted [`JobSpec`] back (the runner's resolve path).** Keyed on the
+/// `(tenant_id, job_id)` the leased `job_queue` row carries. Binds `$1 tenant_id`, `$2 job_id` (uuid).
+/// Returns the `spec jsonb` for deserialization; NO row → the loud [`CiJobSpecStoreError::SpecNotFound`]
+/// (fail-closed — the runner does not launch an unresolved job).
+pub const SELECT_JOB_SPEC_QUERY: &str = "\
+SELECT spec FROM ci_job_spec WHERE tenant_id = $1 AND job_id = $2";
+
+// =================================================================================================
+// Typed, fail-loud error (no silent drop / coerce / fabricated-default spec).
+// =================================================================================================
+
+/// A durable `JobSpec`-store failure. Loud + typed — a persist/resolve NEVER silently drops, coerces,
+/// or fabricates a default spec (the stored spec is what EXECUTES, so a corrupt/missing spec is a
+/// fail-closed resolve error). Safe to log: carries only the structural fault + the opaque
+/// tenant/job/idem tokens the CI schema already keys on, never the spec's inner material.
+#[derive(Debug)]
+pub enum CiJobSpecStoreError {
+    /// A durable-store DB error (the statement did NOT succeed) — never a silent partial write.
+    Db(String),
+    /// A `job_id`/`run_id` presented to the store is not a UUID (the durable column type) — refused
+    /// loudly (never truncated/coerced), the SAME rule as the `job_queue` store.
+    BadId {
+        /// Which field failed (`job_id` | `run_id`).
+        field: &'static str,
+        /// The offending value (an opaque CI id token — not PII).
+        value: String,
+    },
+    /// No spec row for `(tenant, job_id)` — the runner cannot resolve the leased job to a spec. A
+    /// fail-closed resolve error (the row stays leased, the reaper recovers it), NEVER a default spec.
+    SpecNotFound {
+        /// The tenant partition of the missing spec.
+        tenant_id: String,
+        /// The job id whose spec is absent.
+        job_id: String,
+    },
+    /// A stored `spec jsonb` did not deserialize back to a [`JobSpec`] (a corrupt durable write) —
+    /// surfaced loudly (never silently coerced to a default). The stored spec is what executes, so an
+    /// un-decodable one MUST fail the resolve closed.
+    CorruptSpec {
+        /// The job id whose spec failed to decode.
+        job_id: String,
+        /// The serde error (structural — not the spec's inner material).
+        detail: String,
+    },
+    /// A serialize of the [`JobSpec`] to jsonb failed (should not happen for a well-formed spec) —
+    /// refused loudly rather than persisting a partial/empty spec.
+    SpecEncode(String),
+    /// The enqueue's declared `trust_tier` does not equal the dispatched spec's `trust_tier` — the
+    /// SECURITY invariant fail-closed: the `job_queue` row's gate tier MUST come from the spec that
+    /// executes; a mismatch is a widening/narrowing attempt refused before any row is written.
+    TrustTierMismatch {
+        /// The tier the enqueue declared (the would-be `job_queue.trust_tier`).
+        enqueue: &'static str,
+        /// The dispatched spec's real tier (the truth the gate must carry).
+        spec: &'static str,
+    },
+    /// The spec's `timeout_secs` exceeds [`MAX_JOB_TIMEOUT_SECS`] — refused fail-closed so a leased
+    /// job can never outlive the runner's lease (the CT-004c.2 double-run guard, closed at dispatch).
+    TimeoutTooLong {
+        /// The spec's requested wall-clock timeout.
+        requested: u32,
+        /// The enforced ceiling.
+        ceiling: u32,
+    },
+}
+
+impl core::fmt::Display for CiJobSpecStoreError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CiJobSpecStoreError::Db(e) => write!(f, "durable ci_job_spec store error: {e}"),
+            CiJobSpecStoreError::BadId { field, value } => write!(
+                f,
+                "durable ci_job_spec op refused: {field} `{value}` is not a UUID (the \
+                 ci_job_spec.{field} column is uuid — CI job/run ids are uuids in production)"
+            ),
+            CiJobSpecStoreError::SpecNotFound { tenant_id, job_id } => write!(
+                f,
+                "no durable JobSpec for tenant `{tenant_id}` job `{job_id}` — the runner cannot \
+                 resolve the leased job to a spec (fail-closed; the row stays leased for the reaper, \
+                 never a fabricated default spec)"
+            ),
+            CiJobSpecStoreError::CorruptSpec { job_id, detail } => write!(
+                f,
+                "corrupt durable JobSpec for job `{job_id}` (jsonb did not decode to a JobSpec — the \
+                 stored spec is what executes, so this fails the resolve closed): {detail}"
+            ),
+            CiJobSpecStoreError::SpecEncode(e) => {
+                write!(f, "durable ci_job_spec persist refused: JobSpec did not serialize to jsonb: {e}")
+            }
+            CiJobSpecStoreError::TrustTierMismatch { enqueue, spec } => write!(
+                f,
+                "durable dispatch refused (SECURITY): the job_queue row's trust_tier `{enqueue}` does \
+                 not match the dispatched spec's trust_tier `{spec}` — the claim-gating tier MUST come \
+                 from the spec that executes (no widening/defaulting)"
+            ),
+            CiJobSpecStoreError::TimeoutTooLong { requested, ceiling } => write!(
+                f,
+                "durable dispatch refused: spec timeout_secs {requested} exceeds the {ceiling}s \
+                 ceiling — a job may not outlive the runner's lease (double-run guard, fail-closed)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CiJobSpecStoreError {}
+
+impl CiJobSpecStoreError {
+    /// Map a storage-layer [`PgError`] into the store's typed error (fail-loud, no swallow).
+    fn from_pg(e: PgError) -> Self {
+        CiJobSpecStoreError::Db(e.to_string())
+    }
+}
+
+// =================================================================================================
+// The outcome of a co-persist dispatch.
+// =================================================================================================
+
+/// The result of [`CiJobSpecStore::co_persist_dispatch`] — whether each of the two co-committed rows
+/// was freshly INSERTED or an idempotent no-op (the effectively-once guarantee firing). Both being a
+/// duplicate is a re-dispatch that correctly created nothing new.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DispatchOutcome {
+    /// The `job_queue` enqueue outcome (Inserted | DuplicateIdem on `jq_idem`).
+    pub enqueue: EnqueueOutcome,
+    /// Whether the `ci_job_spec` row was freshly inserted (false = the `(tenant, job_id)` PK collapsed
+    /// a re-dispatch to a no-op — the spec was already persisted).
+    pub spec_inserted: bool,
+}
+
+// =================================================================================================
+// The store.
+// =================================================================================================
+
+/// **The REAL durable CI `ci_job_spec` store (CT-004d.1).** Holds the OLTP [`PgPool`] and persists /
+/// resolves a dispatched stage's [`JobSpec`] as a single `spec jsonb` column, each under the
+/// tenant-/region-scoped transaction the FORCE-RLS `ci_job_spec` table requires (the CT-004c.1
+/// [`with_tenant_tx`] pattern). Cloneable (the pool is an `Arc`-backed handle). Named `…Store` +
+/// carries a `PgPool` field so the `no-in-memory-durable-store` scanner reads it as a genuine durable
+/// store. The caller must have applied the CI control-plane migrations (which create `ci_job_spec` +
+/// `job_queue`) — the ci-controlplane `serve(AppSpec)` boot migrate does this.
+#[derive(Clone)]
+pub struct CiJobSpecStore {
+    pool: PgPool,
+}
+
+impl CiJobSpecStore {
+    /// Wrap the controlplane OLTP pool as the durable `ci_job_spec` store. The production composition
+    /// root constructs this from the MR-022 `SubstrateProvider` pool ([`crate::ci_job_spec_store`]).
+    pub fn with_pg(pool: PgPool) -> CiJobSpecStore {
+        CiJobSpecStore { pool }
+    }
+
+    /// The pool this store is bound to.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// **Co-persist a dispatched stage: the `job_queue` row + its [`JobSpec`], in ONE tenant-scoped tx
+    /// (arch §3.3 step 1).** Writes the `job_queue` enqueue (via the byte-identical
+    /// [`INSERT_JOB_QUEUE_QUERY`]) AND the `ci_job_spec` row atomically, so a crash between them cannot
+    /// leave a claimable job with no resolvable spec. Both are idempotent (the enqueue on
+    /// `(tenant, idem_token)`, the spec on `(tenant, job_id)`) — a re-dispatch / reaper re-queue
+    /// collapses to ONE of each.
+    ///
+    /// **SECURITY (the gate is fed, not bypassed):** the `job_queue` row's `trust_tier` is written as
+    /// `enq.trust_tier`, and this refuses fail-closed ([`CiJobSpecStoreError::TrustTierMismatch`]) if
+    /// that does not equal `spec.trust_tier` — so the claim-gating tier ALWAYS equals the tier of the
+    /// spec that executes (an `untrusted_fork` spec can never be enqueued behind a widened `trusted`
+    /// gate). The `region` is `enq.region` (the run's honest residency pin). The spec's `timeout_secs`
+    /// is capped at [`MAX_JOB_TIMEOUT_SECS`] (else [`CiJobSpecStoreError::TimeoutTooLong`]) so a leased
+    /// job can never outlive the runner's lease.
+    pub async fn co_persist_dispatch(
+        &self,
+        enq: &DurableEnqueue,
+        spec: &JobSpec,
+    ) -> Result<DispatchOutcome, CiJobSpecStoreError> {
+        // ── the two fail-closed dispatch invariants (SECURITY trust-tier + the lease-TTL floor). ──
+        validate_dispatch(enq.trust_tier, spec)?;
+
+        let job_uuid = parse_id_local("job_id", &enq.job_id)?;
+        let run_uuid = parse_id_local("run_id", &enq.run_id)?;
+        let spec_json = serde_json::to_value(spec)
+            .map_err(|e| CiJobSpecStoreError::SpecEncode(e.to_string()))?;
+
+        let labels = enq.labels.clone();
+        let group = enq.concurrency_group.clone();
+        let lane = enq.lane.as_str();
+        let trust = trust_token(enq.trust_tier);
+        let tenant_id = enq.tenant_id.clone();
+        let region = enq.region.clone();
+        let fair_key = enq.fair_key.clone();
+        let idem = enq.idem_token.clone();
+
+        let (enqueued, spec_inserted) =
+            with_tenant_tx(&self.pool, &enq.tenant_id, &enq.region, move |conn| {
+                Box::pin(async move {
+                    // (1) the job_queue row (the eligibility gate) — idempotent on jq_idem.
+                    let jq_row = sqlx::query(INSERT_JOB_QUEUE_QUERY)
+                        .bind(&tenant_id) // $1 tenant_id (the RLS/tenant predicate)
+                        .bind(&region) // $2 region
+                        .bind(job_uuid) // $3 job_id
+                        .bind(run_uuid) // $4 run_id
+                        .bind(lane) // $5 lane
+                        .bind(&labels) // $6 labels text[]
+                        .bind(trust) // $7 trust_tier (== spec.trust_tier, verified above)
+                        .bind(group.as_deref()) // $8 concurrency_group (nullable)
+                        .bind(&fair_key) // $9 fair_key
+                        .bind(&idem) // $10 idem_token
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|e| PgError::Query(e.to_string()))?;
+                    // (2) the spec row (what EXECUTES) — idempotent on the (tenant, job_id) PK.
+                    let spec_row = sqlx::query(INSERT_JOB_SPEC_QUERY)
+                        .bind(&tenant_id) // $1 tenant_id (the RLS/tenant predicate)
+                        .bind(&region) // $2 region
+                        .bind(job_uuid) // $3 job_id
+                        .bind(run_uuid) // $4 run_id
+                        .bind(&idem) // $5 idem_token (co-key with the queue row)
+                        .bind(&spec_json) // $6 spec jsonb (the whole value — faithful round-trip)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|e| PgError::Query(e.to_string()))?;
+                    Ok((jq_row.is_some(), spec_row.is_some()))
+                })
+            })
+            .await
+            .map_err(CiJobSpecStoreError::from_pg)?;
+
+        Ok(DispatchOutcome {
+            enqueue: if enqueued {
+                EnqueueOutcome::Inserted
+            } else {
+                EnqueueOutcome::DuplicateIdem
+            },
+            spec_inserted,
+        })
+    }
+
+    /// **Resolve a leased job's persisted [`JobSpec`] (the runner's resolve path — arch §5.3).** Reads
+    /// the `spec jsonb` for `(tenant, job_id)` under the tenant-scoped tx and deserializes it back to a
+    /// [`JobSpec`] — the WHOLE value, every field, no lossy projection. Fail-closed: no row →
+    /// [`CiJobSpecStoreError::SpecNotFound`]; an un-decodable jsonb → [`CiJobSpecStoreError::CorruptSpec`].
+    /// NEVER a fabricated default spec (the stored spec is what executes). `region` is the runner's
+    /// residency region (the RLS/tenant-tx scope).
+    pub async fn get_spec(
+        &self,
+        tenant_id: &str,
+        region: &str,
+        job_id: &str,
+    ) -> Result<JobSpec, CiJobSpecStoreError> {
+        let job_uuid = parse_id_local("job_id", job_id)?;
+        let tenant_id_owned = tenant_id.to_string();
+        let row = with_tenant_tx(&self.pool, tenant_id, region, move |conn| {
+            Box::pin(async move {
+                sqlx::query(SELECT_JOB_SPEC_QUERY)
+                    .bind(&tenant_id_owned) // $1 tenant_id (the RLS/tenant predicate)
+                    .bind(job_uuid) // $2 job_id
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| PgError::Query(e.to_string()))
+            })
+        })
+        .await
+        .map_err(CiJobSpecStoreError::from_pg)?;
+
+        let row = row.ok_or_else(|| CiJobSpecStoreError::SpecNotFound {
+            tenant_id: tenant_id.to_string(),
+            job_id: job_id.to_string(),
+        })?;
+        let spec_json: serde_json::Value = row
+            .try_get("spec")
+            .map_err(|e| CiJobSpecStoreError::Db(e.to_string()))?;
+        decode_spec(job_id, spec_json)
+    }
+}
+
+/// **The two fail-closed dispatch invariants (pure, so the unit suite proves them DB-free).**
+/// (1) SECURITY — the `job_queue` row's `trust_tier` (`enq_trust`) MUST equal `spec.trust_tier`, so the
+/// claim-gating tier always equals the tier of the spec that executes (no widen/default). (2) the
+/// lease-TTL floor — `spec.limits.timeout_secs` may not exceed [`MAX_JOB_TIMEOUT_SECS`], so a leased
+/// job can never outlive the runner's lease. A violation is a typed fail-closed error, NEVER coerced.
+fn validate_dispatch(enq_trust: TrustTier, spec: &JobSpec) -> Result<(), CiJobSpecStoreError> {
+    if enq_trust != spec.trust_tier {
+        return Err(CiJobSpecStoreError::TrustTierMismatch {
+            enqueue: trust_token(enq_trust),
+            spec: trust_token(spec.trust_tier),
+        });
+    }
+    if spec.limits.timeout_secs > MAX_JOB_TIMEOUT_SECS {
+        return Err(CiJobSpecStoreError::TimeoutTooLong {
+            requested: spec.limits.timeout_secs,
+            ceiling: MAX_JOB_TIMEOUT_SECS,
+        });
+    }
+    Ok(())
+}
+
+/// **Decode a stored `spec jsonb` back to a [`JobSpec`] (the resolve path's fail-closed deserialize).**
+/// Pure over the jsonb value so the unit suite proves both the faithful round-trip AND the corrupt →
+/// fail-closed behaviour DB-free. An un-decodable value is [`CiJobSpecStoreError::CorruptSpec`] (the
+/// stored spec is what executes, so a corrupt one fails the resolve closed) — NEVER a default spec.
+fn decode_spec(job_id: &str, spec_json: serde_json::Value) -> Result<JobSpec, CiJobSpecStoreError> {
+    serde_json::from_value::<JobSpec>(spec_json).map_err(|e| CiJobSpecStoreError::CorruptSpec {
+        job_id: job_id.to_string(),
+        detail: e.to_string(),
+    })
+}
+
+/// Parse a `job_id`/`run_id` token into the durable `uuid` column type — a non-uuid is a loud refusal.
+/// (Delegates to the `job_queue` store's `parse_id`, re-mapping the error into this store's type so the
+/// UUID-column rule is authored ONCE.)
+fn parse_id_local(field: &'static str, value: &str) -> Result<sqlx::types::Uuid, CiJobSpecStoreError> {
+    parse_id(field, value).map_err(|_| CiJobSpecStoreError::BadId {
+        field,
+        value: value.to_string(),
+    })
+}
+
+#[cfg(test)]
+#[path = "job_spec_store_tests.rs"]
+mod tests;
