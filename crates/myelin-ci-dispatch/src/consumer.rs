@@ -71,7 +71,7 @@
 //!   are deterministic placeholders derived from the repo ref here; the real registry that maps a
 //!   pushed repo to its CI project/pipeline is the named follow-on.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use myelin_events::{
     Actor, EmitContextBase, EventEnvelope, EventHandler, HandleOutcome, IdMinter, OutboxStore,
@@ -106,11 +106,29 @@ use crate::resolve::{
 /// structured subject `evt.<tenant>.git.*` (`myelin_events::partition`); the cross-cell stream that
 /// filters git events for this consumer is the deploy-substrate follow-on. The prefilter here is the
 /// in-process/ArtifactRef form the `dispatch_app_spec` harness uses today.
-pub static CI_TRIGGER_SUBJECTS: &[SubjectPattern] = &[SubjectPattern(String::new())];
+pub fn ci_trigger_subjects() -> &'static [SubjectPattern] {
+    // Peer-review finding 2026-07-16 #12: this was `SubjectPattern(String::new())` — an EMPTY prefix,
+    // and `Subscription::matches` is `subject.starts_with(&p.0)`, so an empty pattern MATCHES EVERY
+    // subject (match-all) — directly contradicting the doc above ("deliberately NOT */>/empty"). Any
+    // router iterating `EventHandler::subjects()` would treat it as a firehose subscription. Fixed to
+    // the SAME bounded `myelin://` prefix the live `Subscription` binds (`CI_TRIGGER_SUBJECT_STRS`),
+    // built via `OnceLock` (a non-empty `SubjectPattern` holds a `String`, not const-constructible in a
+    // plain `static` — the `myelin_git::check_status` precedent). The precise arming stays `handle`'s
+    // O(1) type match; this only bounds the transport-level whitelist so it is never over-broad.
+    static SUBJECTS: OnceLock<Vec<SubjectPattern>> = OnceLock::new();
+    SUBJECTS
+        .get_or_init(|| {
+            CI_TRIGGER_SUBJECT_STRS
+                .iter()
+                .map(|s| SubjectPattern((*s).to_string()))
+                .collect()
+        })
+        .as_slice()
+}
 
-/// The `&str` subjects the live [`myelin_events::consumer::Subscription`] binds — the same whitelist
-/// as [`CI_TRIGGER_SUBJECTS`], as the borrow the `Subscription::bind` constructor takes. `myelin://`
-/// is the bounded (non-`*`) transport prefix; the exact arming is `handle`'s type match.
+/// The `&str` subjects the live [`myelin_events::consumer::Subscription`] binds — the SOURCE OF TRUTH
+/// [`ci_trigger_subjects`] maps into `SubjectPattern`s, and the borrow the `Subscription::bind`
+/// constructor takes. `myelin://` is the bounded (non-`*`) transport prefix; the arming is `handle`'s type match.
 pub const CI_TRIGGER_SUBJECT_STRS: &[&str] = &["myelin://"];
 
 // =================================================================================================
@@ -629,7 +647,7 @@ pub fn build_trigger_consumer(
 
 impl EventHandler for CiTriggerHandler {
     fn subjects(&self) -> &'static [SubjectPattern] {
-        CI_TRIGGER_SUBJECTS
+        ci_trigger_subjects()
     }
 
     fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
@@ -844,6 +862,21 @@ mod tests {
             assert_ne!(*s, ">", "no `>` in the whitelist");
             assert!(!s.is_empty(), "no empty (over-broad) subject");
         }
+        // Finding #12: the `SubjectPattern` form a router iterating `subjects()` sees must ALSO be
+        // bounded — an empty pattern is `starts_with("")` = match-all. Assert non-empty + non-wildcard,
+        // and that it mirrors the `&str` whitelist exactly (one source of truth).
+        let patterns = ci_trigger_subjects();
+        assert!(!patterns.is_empty(), "subjects() is a non-empty whitelist");
+        for p in patterns {
+            assert!(!p.0.is_empty(), "no EMPTY (match-all) SubjectPattern in subjects() — finding #12");
+            assert_ne!(p.0, "*");
+            assert_ne!(p.0, ">");
+        }
+        assert_eq!(
+            patterns.iter().map(|p| p.0.as_str()).collect::<Vec<_>>(),
+            CI_TRIGGER_SUBJECT_STRS.to_vec(),
+            "subjects() mirrors the &str whitelist exactly"
+        );
     }
 
     /// **No `.myelin/ci.*` at the pushed ref → a clean NoConfig skip (NOT an error, no run).**

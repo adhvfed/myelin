@@ -77,7 +77,7 @@ pub use config::{parse_ci_config, CiConfigError, ConfigFormat};
 pub use consumer::{
     build_trigger_consumer, plan_dispatch, resolve_ci_config, ArmedRun, CiTriggerHandler,
     DispatchOutcome, DurableGitConfigReader, GitConfigReader, GitReadError, OutboxReserveStore,
-    ReserveError, ReserveFacts, ReserveStore, SkipReason, CI_TRIGGER_SUBJECTS,
+    ReserveError, ReserveFacts, ReserveStore, SkipReason, ci_trigger_subjects,
     CI_TRIGGER_SUBJECT_STRS,
 };
 
