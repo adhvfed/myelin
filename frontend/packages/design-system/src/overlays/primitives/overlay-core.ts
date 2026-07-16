@@ -106,6 +106,10 @@ export function hideOthers(contentEl: HTMLElement): () => void {
     if (!(child instanceof HTMLElement)) continue;
     if (child.contains(contentEl)) continue; // the portal root holding the overlay — keep live
     if (child.hasAttribute("inert")) continue; // already inert (an outer modal) — don't double-touch
+    // Keep a persistent live layer (the Toast region) reachable + announced even over a modal: it
+    // paints ABOVE the modal (z-toast > z-modal), so inert-ing it would contradict the visual stack
+    // and silence a toast raised while a dialog is open (WCAG 4.1.3) + trap its Undo away from F6.
+    if (child.hasAttribute("data-overlay-live") || child.querySelector("[data-overlay-live]")) continue;
     child.setAttribute("inert", "");
     child.setAttribute("data-overlay-inert", "");
     hidden.push(child);

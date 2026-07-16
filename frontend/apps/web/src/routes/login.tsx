@@ -10,8 +10,8 @@ import { loginDev } from "../lib/auth";
 export default function Login() {
   return (
     <main
+      class="login-main"
       style={{
-        "min-height": "100vh",
         display: "flex",
         "align-items": "center",
         "justify-content": "center",
@@ -44,12 +44,14 @@ export default function Login() {
           <button
             type="submit"
             data-testid="dev-login"
+            // Primary action rides the DERIVED button token (→ focus-ring, 6.55:1), never raw
+            // --accent (which sits at the AA floor in light) — DESIGN-MANUAL §3.1.
             style={{
               padding: "var(--space-2) var(--space-3)",
               border: "none",
               "border-radius": "var(--radius-1)",
-              background: "var(--accent)",
-              color: "var(--on-accent)",
+              background: "var(--c-btn-primary-bg)",
+              color: "var(--c-btn-primary-text)",
               cursor: "pointer",
               "font-weight": "600",
             }}
@@ -58,11 +60,11 @@ export default function Login() {
           </button>
         </form>
 
-        <div style={{ "border-block-start": "var(--hairline) solid var(--border)", "padding-block-start": "var(--space-3)" }}>
+        <div style={{ "border-block-start": "var(--hairline) solid var(--border)", "padding-block-start": "var(--space-3)", display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
           <button
             type="button"
             disabled
-            title="The real OIDC/SSO login is deferred (MR-012): the edge refuses until JWKS/trust-anchors are configured."
+            aria-describedby="sso-disabled-reason"
             style={{
               width: "100%",
               padding: "var(--space-2) var(--space-3)",
@@ -75,6 +77,11 @@ export default function Login() {
           >
             Sign in with SSO (deferred)
           </button>
+          {/* The disabled reason is VISIBLE text, not a title tooltip (which is hidden from keyboard
+              and touch users and most AT) — everyone sees why SSO is unavailable. */}
+          <p id="sso-disabled-reason" style={{ margin: "0", color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>
+            The real OIDC/SSO login is deferred (MR-012): the edge refuses until JWKS/trust-anchors are configured.
+          </p>
         </div>
       </section>
     </main>

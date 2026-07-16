@@ -102,10 +102,11 @@ export function CommandPalette(props: CommandPaletteProps) {
               matches().length ? `cmdk-opt-${active()}` : undefined
             }
             aria-label="Search or run a command"
+            // No inline `outline: none` — the shared zero-specificity `:focus-visible` ring
+            // (tokens.css) must reach the autofocused palette input (DESIGN-MANUAL §6 / must-ship #5).
             style={{
               flex: "1",
               border: "none",
-              outline: "none",
               background: "transparent",
               color: "var(--text-primary)",
               font: "inherit",

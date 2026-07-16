@@ -7,7 +7,7 @@
 import { ErrorBoundary, For, Show, Suspense, createMemo } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, useParams } from "@solidjs/router";
-import { Icon, type IconName } from "@myelin/design-system";
+import { Icon, Skeleton, SkeletonBlock, type IconName } from "@myelin/design-system";
 import { getPr, getPrChecks, type PrChecksVM } from "~/lib/api";
 import { NotAvailable } from "~/components/NotAvailable";
 
@@ -57,7 +57,15 @@ export default function PrOverviewScreen() {
           </div>
         )}
       >
-        <Suspense fallback={<p style={{ color: "var(--text-muted)" }}>Loading pull request…</p>}>
+        <Suspense
+          fallback={
+            <Skeleton label="Loading pull request…" data-testid="pr-loading">
+              <SkeletonBlock height="var(--fs-h1)" width="16rem" />
+              <SkeletonBlock height="1.25rem" width="24rem" style={{ "margin-block-start": "var(--space-2)" }} />
+              <SkeletonBlock height="8rem" style={{ "margin-block-start": "var(--space-3)" }} />
+            </Skeleton>
+          }
+        >
           <Show when={ready()} fallback={<NotAvailable kind="pull request" />}>
           <Show when={pr()} keyed>
             {(p) => {
@@ -75,7 +83,7 @@ export default function PrOverviewScreen() {
                     {" · "}by {p.author} · {p.reviews} review{p.reviews === 1 ? "" : "s"}
                   </p>
 
-                  <Show when={checks()} keyed fallback={<p style={{ color: "var(--text-muted)" }}>Loading checks…</p>}>
+                  <Show when={checks()} keyed fallback={<Skeleton label="Loading checks…" rows={3} rowHeight="2rem" data-testid="checks-loading" />}>
                     {(ck) => <ChecksAndMerge checks={ck} />}
                   </Show>
 

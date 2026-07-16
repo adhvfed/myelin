@@ -36,7 +36,7 @@ export interface TooltipProps {
 
 export function Tooltip(props: TooltipProps): JSX.Element {
   const [open, setOpen] = createSignal(false);
-  const [pos, setPos] = createSignal({ left: 0, top: 0 });
+  const [pos, setPos] = createSignal({ left: 0, top: 0, maxBlockSize: 0 });
   let anchor: HTMLElement | undefined;
   let tip: HTMLDivElement | undefined;
   let hideTimer: ReturnType<typeof setTimeout> | undefined;
@@ -62,7 +62,7 @@ export function Tooltip(props: TooltipProps): JSX.Element {
   createEffect(() => {
     if (!open() || !anchor || !tip) return;
     const p = computePosition(anchor, tip, props.placement ?? "bottom-start");
-    setPos({ left: p.left, top: p.top });
+    setPos({ left: p.left, top: p.top, maxBlockSize: p.maxBlockSize });
   });
 
   const triggerProps: TooltipTriggerProps = {
@@ -96,6 +96,9 @@ export function Tooltip(props: TooltipProps): JSX.Element {
               top: `${pos().top}px`,
               "z-index": "var(--z-popover)",
               "max-inline-size": "16rem",
+              // Apply the positioner's viewport clamp so a long tooltip scrolls, never overflows (finding 2).
+              "max-block-size": pos().maxBlockSize > 0 ? `${pos().maxBlockSize}px` : undefined,
+              "overflow-y": "auto",
               background: "var(--surface-overlay)",
               color: "var(--text-primary)",
               border: "var(--hairline) solid var(--border)",

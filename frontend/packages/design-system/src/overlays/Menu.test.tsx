@@ -77,4 +77,46 @@ describe("Menu", () => {
     expect(screen.queryByRole("menu")).toBeNull();
     expect(document.activeElement).toBe(trigger);
   });
+
+  it("Tab closes the menu and returns focus to the trigger (APG)", () => {
+    const { trigger } = renderMenu();
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "ArrowDown" }); // open
+    fireEvent.keyDown(document.activeElement!, { key: "Tab" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("applies the positioner's viewport clamp so a long menu scrolls, never overflows (finding 2)", () => {
+    const { trigger } = renderMenu();
+    fireEvent.click(trigger);
+    const menu = screen.getByRole("menu");
+    expect(menu.style.overflowY).toBe("auto");
+    // The computed max-block-size is applied (a bounded, positive px length — not unset).
+    expect(menu.style.maxBlockSize).toMatch(/^\d+(\.\d+)?px$/);
+  });
+});
+
+describe("Menu disabled items (APG: aria-disabled, not native disabled — finding 4)", () => {
+  it("keeps a disabled item in the a11y tree (perceivable) but not activatable", () => {
+    const del = vi.fn();
+    const items: MenuItemSpec[] = [
+      { label: "Rename", onSelect: vi.fn() },
+      { label: "Delete", onSelect: del, disabled: true },
+    ];
+    render(() => <Menu label="Row actions" items={items} triggerLabel="Actions" />);
+    const trigger = screen.getByRole("button", { name: /Actions/ });
+    fireEvent.click(trigger);
+
+    // Both items are present in the menu (the disabled one is NOT dropped from the tree).
+    const menuitems = screen.getAllByRole("menuitem");
+    expect(menuitems).toHaveLength(2);
+    const del_item = screen.getByRole("menuitem", { name: "Delete" });
+    // aria-disabled (perceivable) and NOT the native disabled attribute (which would remove it).
+    expect(del_item.getAttribute("aria-disabled")).toBe("true");
+    expect((del_item as HTMLButtonElement).disabled).toBe(false);
+    // Clicking the disabled item does not fire its action.
+    fireEvent.click(del_item);
+    expect(del).not.toHaveBeenCalled();
+  });
 });

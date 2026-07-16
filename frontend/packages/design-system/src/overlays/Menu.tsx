@@ -43,7 +43,7 @@ export function Menu(props: MenuProps): JSX.Element {
 
   const [open, setOpen] = createSignal(false);
   const [active, setActive] = createSignal(0);
-  const [pos, setPos] = createSignal({ left: 0, top: 0 });
+  const [pos, setPos] = createSignal({ left: 0, top: 0, maxBlockSize: 0 });
   let trigger: HTMLButtonElement | undefined;
   let menu: HTMLDivElement | undefined;
   const itemEls: (HTMLButtonElement | undefined)[] = [];
@@ -84,7 +84,7 @@ export function Menu(props: MenuProps): JSX.Element {
   createEffect(() => {
     if (!open() || !trigger || !menu) return;
     const p = computePosition(trigger, menu, local.placement);
-    setPos({ left: p.left, top: p.top });
+    setPos({ left: p.left, top: p.top, maxBlockSize: p.maxBlockSize });
   });
   createEffect(() => {
     if (!open()) return;
@@ -206,6 +206,10 @@ export function Menu(props: MenuProps): JSX.Element {
               top: `${pos().top}px`,
               "z-index": "var(--z-popover)",
               "min-inline-size": "12rem",
+              // Apply the positioner's viewport clamp so a long menu SCROLLS instead of overflowing
+              // off-screen (fe-ds finding 2 — otherwise roved-to items render invisibly below the fold).
+              "max-block-size": pos().maxBlockSize > 0 ? `${pos().maxBlockSize}px` : undefined,
+              "overflow-y": "auto",
               background: "var(--surface-overlay)",
               border: "var(--hairline) solid var(--border)",
               "border-radius": "var(--radius-1)",
@@ -231,7 +235,10 @@ export function Menu(props: MenuProps): JSX.Element {
                     type="button"
                     role="menuitem"
                     tabindex={active() === i() ? 0 : -1}
-                    disabled={item.disabled}
+                    // aria-disabled ONLY — never the native `disabled` attribute, which drops the item
+                    // from the a11y tree entirely so SR users can't perceive the action exists and the
+                    // announced item count diverges from the visual list (APG, fe-ds finding 4). The
+                    // enabledIndexes() roving-skip + the onClick early-return already prevent activation.
                     aria-disabled={item.disabled}
                     onClick={() => {
                       if (item.disabled) return;

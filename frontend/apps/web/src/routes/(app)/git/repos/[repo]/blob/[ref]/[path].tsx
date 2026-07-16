@@ -5,7 +5,7 @@
 import { ErrorBoundary, Show, Suspense, For } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, useParams } from "@solidjs/router";
-import { Icon } from "@myelin/design-system";
+import { Icon, Skeleton, SkeletonBlock } from "@myelin/design-system";
 import { getBlob } from "~/lib/api";
 import { NotAvailable } from "~/components/NotAvailable";
 
@@ -36,7 +36,14 @@ export default function BlobScreen() {
           </p>
         )}
       >
-        <Suspense fallback={<p style={{ color: "var(--text-muted)" }}>Loading file…</p>}>
+        <Suspense
+          fallback={
+            <Skeleton label="Loading file…" data-testid="blob-loading">
+              <SkeletonBlock height="1.5rem" width="18rem" />
+              <SkeletonBlock height="14rem" style={{ "margin-block-start": "var(--space-3)" }} />
+            </Skeleton>
+          }
+        >
           <Show when={ready()} fallback={<NotAvailable kind="file" />}>
           <Show when={blob()} keyed>
             {(file) => (

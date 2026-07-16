@@ -89,11 +89,11 @@ export function AppShell(props: AppShellProps) {
     <>
       <a class="skip-link" href="#main">Skip to content</a>
       <div
+        class="app-shell"
         style={{
           display: "grid",
           "grid-template-columns": "auto 1fr",
           "grid-template-rows": "auto 1fr",
-          height: "100vh",
           "min-height": "0",
         }}
       >
@@ -115,6 +115,7 @@ export function AppShell(props: AppShellProps) {
           {/* The ⌘K command-palette trigger — looks like search, opens the palette. */}
           <button
             type="button"
+            class="cmdk-trigger"
             onClick={() => setPaletteOpen(true)}
             aria-keyshortcuts="Meta+K Control+K"
             aria-haspopup="dialog"
@@ -127,8 +128,6 @@ export function AppShell(props: AppShellProps) {
               padding: "var(--space-2) var(--space-3)",
               border: "var(--hairline) solid var(--border)",
               "border-radius": "var(--radius-1)",
-              background: "var(--surface)",
-              color: "var(--text-muted)",
               cursor: "pointer",
               "text-align": "start",
             }}
@@ -145,6 +144,7 @@ export function AppShell(props: AppShellProps) {
           {/* Inbox affordance — glyph + visible unread count (never color-only; WCAG 1.4.1). */}
           <button
             type="button"
+            class="inbox-button"
             onClick={() => setInboxOpen(true)}
             aria-haspopup="dialog"
             aria-label="Inbox, 2 unread"
@@ -155,8 +155,6 @@ export function AppShell(props: AppShellProps) {
               padding: "var(--space-2)",
               border: "var(--hairline) solid var(--border)",
               "border-radius": "var(--radius-1)",
-              background: "var(--surface)",
-              color: "var(--text-primary)",
               cursor: "pointer",
             }}
           >
@@ -214,8 +212,11 @@ export function AppShell(props: AppShellProps) {
               return (
                 <A
                   href={item.href}
+                  class="nav-rail-item"
                   aria-label={item.label}
                   aria-current={isActive() ? "page" : undefined}
+                  // Colour/active/hover come from the .nav-rail-item class (surface-hover fill +
+                  // brighter text, no accent fill — R1 binding). Only layout stays inline.
                   style={{
                     display: "flex",
                     "align-items": "center",
@@ -223,8 +224,6 @@ export function AppShell(props: AppShellProps) {
                     width: "2.25rem",
                     height: "2.25rem",
                     "border-radius": "var(--radius-1)",
-                    color: isActive() ? "var(--on-accent)" : "var(--text-muted)",
-                    background: isActive() ? "var(--accent)" : "transparent",
                   }}
                 >
                   <Icon name={item.icon} title={item.label} />
