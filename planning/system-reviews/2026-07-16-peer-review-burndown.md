@@ -17,7 +17,7 @@ DONE · IN-PROGRESS · TODO(pri) · WONTFIX(reason) · POLICY(needs founder call
 | # | Sev | Area | Finding (file:line) | Status |
 |---|-----|------|---------------------|--------|
 | 1 | MED-HIGH sec | git | merge-gate `counting_approvals` (pr_store.rs) not per-reviewer-deduped nor agent-excluded → a lone reviewer or an agent satisfies required_approvals≥2 | **DONE `fe966e8`** (dedup by reviewer + `!is_agent` + regression test) |
-| 7 | HIGH | events | dedup mark commits BEFORE handler effect in a SEPARATE tx (consumer.rs:546) → kill-9 between → redelivery deduped → push arms nothing = AT-MOST-ONCE despite exactly-once claims (MR-023b floor named in dedup.rs:92-100) | **TODO(P1)** — needs same-tx co-commit of dedup mark + handler effect (or the outbox-relay's at-least-once + idempotent effect). Framework-level; own chunk. Affects CT-004b exactly-once claim. |
+| 7 | HIGH | events | dedup mark commits BEFORE handler effect in a SEPARATE tx (consumer.rs:546) → kill-9 between → redelivery deduped → push arms nothing = AT-MOST-ONCE despite exactly-once claims (MR-023b floor named in dedup.rs:92-100) | **TODO(P1) — DESIGN CAPTURED (below); NOT urgent-now (consumer not live in prod, #6), MUST land before CT-004d.2 wires it live.** Own chunk + adversarial verifier. |
 | 6 | HIGH claim | ci-dispatch | prod `main.rs:133` `consumers = Vec::new()` — the "live" trigger consumer is NOT registered in prod (CAS BlobStore backing integration-gated); 381a0e4 headline + ledger overstated | **IN-PROGRESS** — honest floor was in the code comment + ledger body; ledger headline corrected (this commit). Actual prod registration needs the default-feature CAS BlobStore/git-read backing (CT-004d.2 deploy floor). |
 | 10 | MED-HIGH (once live) | ci-dispatch | `resolve.rs:297-314` `expand_matrix` materializes the full axis cross-product UNBOUNDED; no cap on config size/jobs/axes/values → a tenant OOMs the dispatch consumer on one push | **DONE `f6ccb3c`** (saturating instance-count cap `MAX_TOTAL_MATRIX_INSTANCES=1024`, refused fail-closed BEFORE materialization; test: 10^8 → MatrixTooLarge, 3×4 still resolves). Follow-on P3: also cap raw config bytes + job count at parse. |
 | 2 | MED | git | JSON durable stores do read-modify-write with NO isolation (pr_threads.rs, pr_store.rs `put`, `next_pr_number` git_durable.rs:880) — concurrent writers clobber (lost comment; PR-number collision) | **TODO(P2)** — the PG-home migration (GT-003b) is the real fix; interim: a per-repo write lock or CAS. Doc conflates write-atomic with rmw-isolated. |
@@ -29,7 +29,7 @@ DONE · IN-PROGRESS · TODO(pri) · WONTFIX(reason) · POLICY(needs founder call
 | 3 | LOW-MED | git | `DurablePrStore::list` silently skips unparseable records (pr_store.rs:620) → number REUSE via next_pr_number → live PR overwritten | **TODO(P2)** — fail-loud or reserve numbers durably. |
 | 5 | LOW | edge | absent-repo 404 leaks the on-disk rootfs path (durable.rs:1842) for granted-but-missing repos — layout leak, not existence oracle | **TODO(P3)** — generic NotFound message. |
 | 11 | LOW-MED | storage | stores migrated BETWEEN the colliding cost_event migrations (pre-CT-004m) have no repair path — money ledger to a wrong-shaped table | **TODO(P3)** — boot-time column-shape assertion on cost_event (dev-only ~7h window, accepted risk). |
-| 12 | LOW | ci-dispatch | `CI_TRIGGER_SUBJECTS` contains an EMPTY SubjectPattern (consumer.rs:109) under a "not empty" doc → a router iterating subjects() treats it as match-all | **TODO(P2)** — drop the empty pattern; whitelist test on the patterns not just _STRS. (Low but easy + a real match-all risk.) |
+| 12 | LOW | ci-dispatch | `CI_TRIGGER_SUBJECTS` contains an EMPTY SubjectPattern (consumer.rs:109) under a "not empty" doc → a router iterating subjects() treats it as match-all | **DONE `93862eb`** (`ci_trigger_subjects()` OnceLock → bounded `myelin://`; test now covers the SubjectPattern form, not just _STRS). |
 | 13 | LOW | ci-controlplane | cost_id FNV-1a + ON CONFLICT DO NOTHING, no conflict verification (cost_store.rs:313) → a re-delivered settle with different amounts silently drops a unit | **TODO(P3)** — verify-on-conflict or a stronger key; it keys the billing table. |
 | 17 | LOW-MED latent | web | expand-context is an unwired pipeline (DiffViewer.tsx:51/68/177; getFileLines 0 call sites) | **TODO(P3)** — wire onExpandContext→buildRows or remove until CT wires it. |
 | 19 | LOW-MED | web | uncontrolled composers desync after posts (prs/[n]/index.tsx:442/539/578: onInput, no value bind) → duplicate post | **TODO(P2)** — bind value (the diff-page composer already does). |
@@ -40,6 +40,35 @@ DONE · IN-PROGRESS · TODO(pri) · WONTFIX(reason) · POLICY(needs founder call
 | 21c | LOW→pre-external | web | login form actions lack origin/CSRF checks (sameSite=lax doesn't stop cross-site POST logging the victim in as attacker) — fine for single-founder dogfood, **fix before external users** | **TODO(P1-before-Tier-B)** |
 | 21d | minor a11y | web | review verdict panel (prs/[n]/index.tsx:458) ad-hoc role="dialog", no focus move/trap/Esc, unlike the DS Dialog | **TODO(P3)** — use the DS Dialog. |
 | 14 | POLICY | flow | R3.7b residuals: crash-after-settle-then-rerun-fails → billed-success/surfaced-failure divergence; failure-bills-zero = deliberate refund leak (always-failing tenant never billed) | **POLICY** — founder call on the billing policy; recorded. Core R3.7b fix HELD under re-attack. |
+
+## Finding #7 design analysis (grounded 2026-07-16 — for the dedicated chunk)
+
+Current flow (`consumer.rs` ~540): `mark_handled` (INSERT..ON CONFLICT, COMMITS immediately) → run
+`handler.handle` → on `Retry` REVERT the mark, on `Done` ack. The dedup mark and the handler's effect
+(e.g. the ci-dispatch reserve bundle, committed later in its own tx) are SEPARATE transactions. Kill-9
+between the mark-commit and the effect-commit → redelivery sees the mark → `Deduplicated` → ack → the
+effect is LOST forever. This is the MR-023b floor `dedup.rs:92-100` explicitly names ("the in-the-SAME-
+transaction-as-the-handler's-state-write co-commit requires the consumer runtime to thread a transaction
+INTO the handler — a runtime change beyond this seam"). Fail-direction on DB-unreachable is already
+correct (report FRESH → at-least-once, never lost).
+
+Two fixes:
+- **Option A (the named MR-023b fix): thread a tx into `handle`** so the dedup INSERT + the handler's
+  state writes co-commit. CORRECT exactly-once-with-effect. Cost: the `EventHandler::handle` contract
+  gains a tx/connection param; every handler runs its writes on it. Invasive (all consumers), touches
+  the frozen consumer contract — architecturally weighty; the "right" fix.
+- **Option B (mark-AFTER-effect + idempotent effect): move `mark_handled` to AFTER `Done`.** Then a
+  kill-9 between effect-commit and mark-commit → redelivery RE-RUNS the handler → the effect must be
+  IDEMPOTENT. Less framework churn, but pushes idempotency onto every handler + REQUIRES fixing #8
+  (the co-emitted `ci.run.started`/`ci.check.updated` mint FRESH ULIDs → would duplicate on re-run;
+  need deterministic ids). The CI `ci_run` row is already idempotent (deterministic run_id), so with #8
+  fixed, Option B makes the CI path effectively-once.
+
+**Recommendation:** Option A is the correct, contract-honest fix the codebase already names. Scope it as
+its own chunk with an adversarial verifier on the kill-9 co-commit invariant (a probe that crashes
+between mark and effect and asserts the redelivery re-runs). Do #8 (deterministic co-emitted event ids)
+alongside either option — it's independently correct. Sequence BEFORE CT-004d.2 registers the consumer
+in prod (so the exactly-once claim is true when it goes live).
 
 ## Codex peer-review option (from the reviewer)
 GPT 4.6 "Sol" via Codex CLI found real P1s in Fable-written fixes on ovim. NOT installed on this host.
