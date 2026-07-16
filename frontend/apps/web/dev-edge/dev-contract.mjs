@@ -225,6 +225,92 @@ export function prChecksJson(repo, n) {
   return repo === "myelin" && SEED_PRS[n] ? SEED_PRS[n].checks : null;
 }
 
+// ── R3.1 PR-list rows (PrListRowVM) — a spread that exercises the states the screens render:
+// open/draft/merged, agent + human authors, pass/running/none checks, a title + a legacy #number
+// fallback (title: null), and a "review requested" row for the cross-repo bucket. ──
+const SEED_PR_ROWS = [
+  {
+    number: 48, title: "R2.4 MCP HITL server-side verdicts", pr_state: "open",
+    base_ref: "refs/heads/main", head_ref: "refs/heads/feat/mcp-hitl-verdicts",
+    author: "u_dev_operator@acme.noreply", author_is_agent: false,
+    reviews: 2, review_state: "none", you_are_requested: false,
+    checks_summary: { verdict: "running", passing: 4, failing: 0, total: 5 },
+    updated_at: 1719446400, repo: "myelin/myelin",
+  },
+  {
+    number: 46, title: "AuthzScanner: eliminate 2 residual reach-arounds", pr_state: "open",
+    base_ref: "refs/heads/main", head_ref: "refs/heads/agent/scanner-reach-arounds",
+    author: "AuthzScanner@acme.noreply", author_is_agent: true,
+    reviews: 0, review_state: "requested", you_are_requested: true,
+    checks_summary: { verdict: "pass", passing: 5, failing: 0, total: 5 },
+    updated_at: 1719360000, repo: "myelin/myelin",
+  },
+  {
+    number: 44, title: "R2.5 Grobkörnige Berechtigungsprüfung entfernen", pr_state: "draft",
+    base_ref: "refs/heads/main", head_ref: "refs/heads/refactor/coarse-authz-removal",
+    author: "j_voegel@acme.noreply", author_is_agent: false,
+    reviews: 0, review_state: "none", you_are_requested: false,
+    checks_summary: { verdict: "none", passing: 0, failing: 0, total: 0 },
+    updated_at: 1719273600, repo: "myelin/myelin",
+  },
+  {
+    number: 39, title: null, pr_state: "merged",
+    base_ref: "refs/heads/main", head_ref: "refs/heads/chore/scanner-true-zero",
+    author: "u_dev_operator@acme.noreply", author_is_agent: false,
+    reviews: 3, review_state: "approved", you_are_requested: false,
+    checks_summary: { verdict: "pass", passing: 1, failing: 0, total: 1 },
+    updated_at: 1719100000, repo: "myelin/myelin",
+  },
+];
+
+function countBy(rows) {
+  const open = rows.filter((r) => r.pr_state === "open" || r.pr_state === "draft").length;
+  const merged = rows.filter((r) => r.pr_state === "merged").length;
+  const closed = rows.filter((r) => r.pr_state === "closed").length;
+  const yours = rows.filter((r) => r.author === "u_dev_operator@acme.noreply").length;
+  const needs_review = rows.filter((r) => r.you_are_requested).length;
+  return { open, merged, closed, all: rows.length, yours, needs_review };
+}
+
+/** GET /v1/git/repos/{repo}/prs?state=&sort= → the PrListPage (null = 404, the no-access analogue). */
+export function repoPrsEnvelope(repo, state = "open", limit = 50) {
+  // `sandbox` (the seeded empty repo) → an empty list (the teaching empty state); `myelin` → the seed;
+  // anything else → a 0-leak 404 (the no-access / absent-repo analogue).
+  if (repo === "sandbox") {
+    return {
+      items: [],
+      page: { next_cursor: null, prev_cursor: null, limit, offset: 0, total: 0 },
+      counts: { open: 0, merged: 0, closed: 0, all: 0, yours: 0, needs_review: 0 },
+    };
+  }
+  if (repo !== "myelin") return null;
+  const counts = countBy(SEED_PR_ROWS);
+  const wanted =
+    state === "merged" ? ["merged"]
+    : state === "closed" ? ["closed"]
+    : state === "all" ? ["draft", "open", "merged", "closed"]
+    : ["draft", "open"];
+  const items = SEED_PR_ROWS.filter((r) => wanted.includes(r.pr_state));
+  return {
+    items,
+    page: { next_cursor: null, prev_cursor: null, limit, offset: 0, total: items.length },
+    counts,
+  };
+}
+
+/** GET /v1/git/prs?bucket=needs-review|yours → the cross-repo PrListPage (never 404 — empty if none). */
+export function myPrsEnvelope(bucket = "needs-review", limit = 50) {
+  const items =
+    bucket === "yours"
+      ? SEED_PR_ROWS.filter((r) => r.author === "u_dev_operator@acme.noreply" && r.pr_state !== "closed")
+      : SEED_PR_ROWS.filter((r) => r.you_are_requested && r.author !== "u_dev_operator@acme.noreply");
+  return {
+    items,
+    page: { next_cursor: null, prev_cursor: null, limit, offset: 0, total: items.length },
+    counts: { bucket: items.length },
+  };
+}
+
 /** The edge's `{error:{message, code}}` envelope (error.rs) — a uniform 404. */
 export function notFoundEnvelope(what) {
   return { error: { message: `${what} not found`, code: "not_found" } };

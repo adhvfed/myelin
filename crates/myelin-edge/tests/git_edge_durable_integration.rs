@@ -292,7 +292,7 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
     // ===== ATTACK (A+B): the author opens a PR to PROTECTED main supplying loose policy + greens in the
     // body (all IGNORED), then SELF-approves, then tries to merge. Must be BLOCKED. =====
     let attack_body = format!(
-        r#"{{"base_ref":"refs/heads/main","head_ref":"refs/heads/feature","head_oid":"{head_oid}","required_contexts":[],"required_approvals":0,"green_contexts":["ci/build"]}}"#
+        r#"{{"title":"Attack PR","base_ref":"refs/heads/main","head_ref":"refs/heads/feature","head_oid":"{head_oid}","required_contexts":[],"required_approvals":0,"green_contexts":["ci/build"]}}"#
     );
     let (oc1, _o1) = http(addr, "POST", "/v1/git/repos/svc/prs", &hdr(&author), attack_body.into_bytes()).await;
     assert_eq!(oc1, 201);
@@ -317,7 +317,7 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
 
     // open a fresh PR #2 (the proposal only — no policy/greens accepted).
     let body2 = format!(
-        r#"{{"base_ref":"refs/heads/main","head_ref":"refs/heads/feature","head_oid":"{head_oid}"}}"#
+        r#"{{"title":"PR two","base_ref":"refs/heads/main","head_ref":"refs/heads/feature","head_oid":"{head_oid}"}}"#
     );
     http(addr, "POST", "/v1/git/repos/svc/prs", &hdr(&author), body2.into_bytes()).await;
 
@@ -356,7 +356,7 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
     // ===== INVALID HEAD: a PR naming a bogus head_oid is refused (no advance to an arbitrary oid). =====
     let bogus = "0".repeat(40);
     let body3 = format!(
-        r#"{{"base_ref":"refs/heads/feat2","head_ref":"refs/heads/x","head_oid":"{bogus}"}}"#
+        r#"{{"title":"PR three","base_ref":"refs/heads/feat2","head_ref":"refs/heads/x","head_oid":"{bogus}"}}"#
     );
     http(addr, "POST", "/v1/git/repos/svc/prs", &hdr(&author), body3.into_bytes()).await;
     let (m3, _m3v) = http(addr, "POST", "/v1/git/repos/svc/prs/3/merge", &hdr(&author), vec![]).await;

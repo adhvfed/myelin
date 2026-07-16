@@ -3,7 +3,7 @@
 // that survived the single refresh + retry) the query throws a `/login` redirect — the canon's
 // 401→/login behaviour, applied centrally.
 import { query, redirect } from "@solidjs/router";
-import { edgeGet, Unauthorized } from "../server/gateway";
+import { edgeGet, GatewayError, Unauthorized } from "../server/gateway";
 
 /** A tree entry in a populated repo (RepoHome::to_json, crates/myelin-git/src/web.rs). */
 export interface RepoEntry {
@@ -99,6 +99,51 @@ export interface PrChecksVM {
   durable: boolean;
 }
 
+/** The rolled-up checks posture for a PR list row (edge `checks_summary`; the ring stays reserved for
+ *  the CI verdict trio). `verdict` is the load-bearing leak-free signal; the counts refine the label.
+ *  `unavailable` = the projection could not be read (the row fails static — it still lists). */
+export interface ChecksSummaryVM {
+  verdict: "pass" | "fail" | "running" | "none" | "unavailable";
+  passing: number;
+  failing: number;
+  total: number;
+}
+
+/** One PR list row (DurableGitBackend::pr_list_row_json). `title` is `null` for a legacy record with
+ *  no stored title — the UI renders `#number` (honest, never a fabricated title). `repo` is present
+ *  only on the cross-repo front door (the repo chip). `updated_at` is unix seconds (formatted via
+ *  Intl client-side, never hand-formatted). */
+export interface PrListRowVM {
+  number: number;
+  title: string | null;
+  pr_state: "draft" | "open" | "merged" | "closed";
+  base_ref: string;
+  head_ref: string;
+  author: string;
+  author_is_agent: boolean;
+  reviews: number;
+  review_state: "requested" | "approved" | "changes" | "none";
+  you_are_requested: boolean;
+  checks_summary: ChecksSummaryVM;
+  updated_at: number | null;
+  repo: string | null;
+}
+
+/** The R3.1 PR-list envelope: the rows + the bidirectional cursor (`prev_cursor` added for the
+ *  Newer/Older pager, fixes ux-git #12) + `counts` computed over the LEAK-FREE set (a forbidden PR
+ *  never contributes to a tab/sidebar badge — the anti-oracle rule). */
+export interface PrListPage {
+  items: PrListRowVM[];
+  page: {
+    next_cursor: string | null;
+    prev_cursor: string | null;
+    limit: number;
+    offset?: number;
+    total?: number;
+  };
+  counts: Record<string, number>;
+}
+
 /** Run an edge GET through the gateway, mapping a surviving 401 to the `/login` redirect. */
 async function authed<T>(fetcher: () => Promise<T>): Promise<T> {
   try {
@@ -158,6 +203,59 @@ export const getCommit = query(
     );
   },
   "git-commit",
+);
+
+/** The "no access" sentinel — a `Pull` denial is the 0-leak 404 (indistinguishable from an absent
+ *  repo, by design), surfaced here as the dignified "not available to you" state (never leaks whether
+ *  PRs exist or their count). */
+export interface PrListRestricted {
+  restricted: true;
+}
+export type PrListResult = PrListPage | PrListRestricted;
+
+/** The per-repo PR list (GET /v1/git/repos/{repo}/prs?state=&sort=&cursor=). Leak-free by the `Pull`
+ *  object guard (`pull_request.view = parent_repo->pull`): a viewer who cannot pull gets the 0-leak
+ *  404 the query surfaces as the "no access" state (a real transport failure still throws → the
+ *  scoped error state). */
+export const getRepoPrs = query(
+  async (input: {
+    repo: string;
+    state?: string;
+    sort?: string;
+    cursor?: string;
+  }): Promise<PrListResult> => {
+    "use server";
+    const p = new URLSearchParams();
+    if (input.state) p.set("state", input.state);
+    if (input.sort) p.set("sort", input.sort);
+    if (input.cursor) p.set("cursor", input.cursor);
+    const q = p.toString();
+    return authed(async () => {
+      try {
+        return await edgeGet<PrListPage>(
+          `/v1/git/repos/${seg(input.repo)}/prs${q ? `?${q}` : ""}`,
+        );
+      } catch (e) {
+        // A 0-leak 404 (no pull grant, or an absent repo) → the dignified no-access state; any other
+        // status still throws so the route renders the SCOPED error (never a raw err.message).
+        if (e instanceof GatewayError && e.status === 404) return { restricted: true };
+        throw e;
+      }
+    });
+  },
+  "git-prs",
+);
+
+/** The cross-repo PR front door (GET /v1/git/prs?bucket=needs-review|yours&cursor=). Prefiltered by
+ *  the `visible_repos` list_objects seam — a repo the viewer cannot pull never contributes a PR. */
+export const getMyPrs = query(
+  async (input: { bucket: "needs-review" | "yours"; cursor?: string }): Promise<PrListPage> => {
+    "use server";
+    const p = new URLSearchParams({ bucket: input.bucket });
+    if (input.cursor) p.set("cursor", input.cursor);
+    return authed(() => edgeGet<PrListPage>(`/v1/git/prs?${p.toString()}`));
+  },
+  "git-prs-cross",
 );
 
 /** A PR record (GET /v1/git/repos/{repo}/prs/{n}). */

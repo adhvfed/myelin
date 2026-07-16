@@ -71,6 +71,9 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "git.repo.view",
     "git.commits.log",
     "git.commit.diff",
+    // -- the R3.1 PR-list reads register_git_durable adds beyond the catalogue --
+    "git.prs.list",
+    "git.prs.mine",
     // -- the git smart-HTTP wire (register_git_wire) --
     "git.wire.upload_pack",
     "git.wire.receive_pack",

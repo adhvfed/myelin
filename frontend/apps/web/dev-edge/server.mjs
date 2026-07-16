@@ -22,6 +22,8 @@ import {
   commitDiffJson,
   prJson,
   prChecksJson,
+  repoPrsEnvelope,
+  myPrsEnvelope,
   unauthorizedEnvelope,
   notFoundEnvelope,
 } from "./dev-contract.mjs";
@@ -76,7 +78,12 @@ const server = createServer((req, res) => {
     const limit = Number(url.searchParams.get("limit") ?? 50);
     const seg = (s) => decodeURIComponent(s);
     let m;
-    // Order: more-specific (/prs/{n}/checks) before /prs/{n}.
+    // R3.1 — the cross-repo front door (no {repo}).
+    if (path === "/v1/git/prs") {
+      const bucket = url.searchParams.get("bucket") ?? "needs-review";
+      return send(res, 200, myPrsEnvelope(bucket, limit));
+    }
+    // Order: more-specific (/prs/{n}/checks) before /prs/{n} before the /prs collection.
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/checks$/))) {
       const v = prChecksJson(seg(m[1]), Number(m[2]));
       return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("pull request"));
@@ -84,6 +91,12 @@ const server = createServer((req, res) => {
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)$/))) {
       const v = prJson(seg(m[1]), Number(m[2]));
       return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("pull request"));
+    }
+    // R3.1 — the per-repo PR list collection.
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs$/))) {
+      const state = url.searchParams.get("state") ?? "open";
+      const v = repoPrsEnvelope(seg(m[1]), state, limit);
+      return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("repository"));
     }
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/blob\/([^/]+)\/([^/]+)$/))) {
       const v = blobJson(seg(m[1]), seg(m[2]), seg(m[3]));

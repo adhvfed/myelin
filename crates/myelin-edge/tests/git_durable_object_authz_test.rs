@@ -240,7 +240,7 @@ impl Harness {
             creator_key,
             "POST",
             &format!("/v1/git/repos/{slug}/prs"),
-            br#"{"base_ref":"refs/heads/main","head_ref":"refs/heads/feature","head_oid":"a"}"#,
+            br#"{"title":"Seed PR","base_ref":"refs/heads/main","head_ref":"refs/heads/feature","head_oid":"a"}"#,
         );
         assert_eq!(st, 201, "open PR on {slug}: {v}");
     }
@@ -373,7 +373,7 @@ fn push_grant_does_not_admit_merge_branch_protection_or_endorse() {
         "subj-dev",
         "POST",
         "/v1/git/repos/alpha/prs",
-        br#"{"head_oid":"b"}"#,
+        br#"{"title":"Writer PR","head_oid":"b"}"#,
     );
     assert_eq!(st, 201, "writer opens PR: {v}");
     let (st, v) = h.call(
@@ -582,6 +582,7 @@ fn backend_with_open_pr(tag: &str) -> (DurableGitBackend, PathBuf) {
         REGION,
         "widgets",
         &json!({
+            "title": "PR #1",
             "base_ref": "refs/heads/main",
             "head_ref": "refs/heads/feature",
             "head_oid": "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff",

@@ -143,7 +143,7 @@ fn open_pr_routes_through_effect_api_and_persists_durably() {
     let resp = server
         .handle_line(&call(
             "git.open_pr",
-            serde_json::json!({ "repo": "alpha", "head_oid": "deadbeef", "base_ref": "refs/heads/main" }),
+            serde_json::json!({ "repo": "alpha", "title": "Alpha PR", "head_oid": "deadbeef", "base_ref": "refs/heads/main" }),
         ))
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
@@ -203,7 +203,7 @@ fn merge_is_hitl_gated_then_reflects_the_server_gate_block() {
             TENANT,
             REGION,
             "alpha",
-            &serde_json::json!({ "head_oid": "deadbeef" }),
+            &serde_json::json!({ "title": "Alpha PR", "head_oid": "deadbeef" }),
             &agent_principal("agent:claude"),
         )
         .expect("open pr");

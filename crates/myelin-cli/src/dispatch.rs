@@ -141,8 +141,11 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
         }
         // POST /v1/git/repos/<repo>/prs {base_ref, head_ref, head_oid, draft} → open a PR. The body
         // carries ONLY the proposal (never branch-protection policy or check facts — the GT-003 fix).
-        CliCommand::PrOpen { repo, base_ref, head_ref, head_oid, draft } => {
-            let mut body = json!({ "draft": draft });
+        CliCommand::PrOpen { repo, title, body: body_md, base_ref, head_ref, head_oid, draft } => {
+            let mut body = json!({ "draft": draft, "title": title });
+            if let Some(b) = body_md {
+                body["body"] = json!(b);
+            }
             if let Some(b) = base_ref {
                 body["base_ref"] = json!(b);
             }

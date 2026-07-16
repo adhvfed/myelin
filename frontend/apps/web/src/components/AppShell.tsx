@@ -6,7 +6,7 @@
 // Built from the MR-016 design-system (<Icon>, semantic tokens) + the MR-017 overlays (Dialog/Menu/
 // Toast); semantic-tokens-only; a11y per the design manual (landmarks, skip link, aria-current).
 import { For, Show, createSignal, onCleanup, onMount, type JSX } from "solid-js";
-import { A, useAction, useLocation } from "@solidjs/router";
+import { A, useAction, useLocation, useNavigate } from "@solidjs/router";
 import { Icon, Menu, Dialog, useToast, type IconName, type MenuItemSpec } from "@myelin/design-system";
 import { logout, type Viewer } from "../lib/auth";
 import { CommandPalette, type Command } from "./CommandPalette";
@@ -39,8 +39,16 @@ export interface AppShellProps {
 
 export function AppShell(props: AppShellProps) {
   const location = useLocation();
+  const navigate = useNavigate();
   const toast = useToast();
   const doLogout = useAction(logout);
+
+  // The repo slug of the current per-repo route (`/git/repos/{repo}/…`), for the repo-scoped palette
+  // entry. `undefined` off a repo route.
+  const currentRepo = (): string | undefined => {
+    const m = /^\/git\/repos\/([^/]+)/.exec(location.pathname);
+    return m?.[1];
+  };
 
   const [paletteOpen, setPaletteOpen] = createSignal(false);
   const [inboxOpen, setInboxOpen] = createSignal(false);
@@ -74,6 +82,19 @@ export function AppShell(props: AppShellProps) {
         window.location.assign(n.href);
       },
     })),
+    // R3.1 — PR palette entries (client-side navigation via useNavigate, never window.location).
+    ...(currentRepo()
+      ? [
+          {
+            id: "pr:repo",
+            label: "Go to pull requests",
+            icon: "pull-request" as IconName,
+            run: () => navigate(`/git/repos/${currentRepo()}/prs`),
+          },
+        ]
+      : []),
+    { id: "pr:needs-review", label: "Pull requests needing my review", icon: "pull-request", run: () => navigate("/prs?bucket=needs-review") },
+    { id: "pr:mine", label: "My pull requests", icon: "pull-request", run: () => navigate("/prs?bucket=yours") },
     { id: "inbox", label: "Open inbox", icon: "inbox", run: () => setInboxOpen(true) },
     { id: "theme", label: "Toggle theme", icon: "settings", run: cycleTheme },
     { id: "logout", label: "Sign out", icon: "human", run: () => void doLogout() },
@@ -277,7 +298,11 @@ export function AppShell(props: AppShellProps) {
         <ul style={{ "list-style": "none", margin: "0", padding: "0", display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
           <li style={{ display: "flex", gap: "var(--space-2)", "align-items": "center" }}>
             <Icon name="pull-request" />
-            <span>A pull request needs your review</span>
+            {/* R3.1 — the inbox PR row is now a real link into the cross-repo "needs review" bucket.
+                (A per-item deep-link to the specific PR lands when the inbox is data-driven — floor.) */}
+            <A href="/prs?bucket=needs-review" onClick={() => setInboxOpen(false)} style={{ color: "var(--text-primary)" }}>
+              A pull request needs your review
+            </A>
           </li>
           <li style={{ display: "flex", gap: "var(--space-2)", "align-items": "center" }}>
             <Icon name="check-pass" />

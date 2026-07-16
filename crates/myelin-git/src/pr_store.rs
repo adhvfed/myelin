@@ -136,6 +136,26 @@ impl ReviewRecord {
 pub struct PrRecord {
     /// The per-repo PR number (git's stable canonical key).
     pub number: u64,
+    /// **The human title (R3.1 — required at create through the edge).** `#[serde(default)]` so a
+    /// PR record persisted BEFORE the title store existed deserializes with an EMPTY title — the list
+    /// renders such a legacy PR as its `#number` (an honest fallback, never a fabricated title). The
+    /// on-disk JSON store's additive-field schema evolution is the durable equivalent of a migration
+    /// (there is no `pr` SQL table to `ALTER` — the PG home is the named GT-003b follow-on).
+    #[serde(default)]
+    pub title: String,
+    /// **The optional Markdown body (R3.1).** `None` for a legacy record or a PR opened without one.
+    #[serde(default)]
+    pub body_md: Option<String>,
+    /// **Whether the PR AUTHOR is an agent (ADR-08 legibility).** Set at open from the opener's
+    /// [`PrincipalKind`]; drives the row's four-channel agent badge (`is_agent` is REQUIRED, never
+    /// disguised as a human). `#[serde(default)]` = `false` for a legacy record.
+    #[serde(default)]
+    pub author_is_agent: bool,
+    /// **Last-touched wall-clock (unix seconds), for the list's "updated" column + `sort=updated`.**
+    /// Set at open and bumped on each authored mutation through the edge. `None` for a legacy record
+    /// (the row omits the timestamp rather than fabricating one).
+    #[serde(default)]
+    pub updated_at: Option<i64>,
     /// The lifecycle state.
     pub state: PrState,
     /// The base ref the PR targets (the ref a merge advances; the policy keys on it).
@@ -167,6 +187,10 @@ impl PrRecord {
     pub fn open(pr: &PullRequest, head_oid: impl Into<String>) -> PrRecord {
         PrRecord {
             number: pr.number,
+            title: String::new(),
+            body_md: None,
+            author_is_agent: false,
+            updated_at: None,
             state: pr.state,
             base_ref: pr.base_ref.clone(),
             head_ref: pr.head_ref.clone(),
@@ -200,6 +224,125 @@ impl PrRecord {
             .iter()
             .filter(|r| r.is_current_approval() && r.reviewer_pseudonym != self.author_pseudonym)
             .count() as u32
+    }
+
+    /// **The row-level review posture (R3.1 list VM).** `changes` if any current review requests
+    /// changes; else `approved` if a non-author approval counts; else `requested` if any reviewer is
+    /// still in the requested state; else `none`. Drives the quiet review marker on the list row.
+    pub fn review_state_label(&self) -> &'static str {
+        if self.reviews.iter().any(|r| r.is_blocking()) {
+            "changes"
+        } else if self.counting_approvals() > 0 {
+            "approved"
+        } else if self
+            .reviews
+            .iter()
+            .any(|r| matches!(r.state, ReviewState::Requested))
+        {
+            "requested"
+        } else {
+            "none"
+        }
+    }
+
+    /// **Is `viewer_pseudonym` a REQUESTED reviewer on this PR?** (the cross-repo "needs your review"
+    /// bucket predicate + the row's "review requested" marker.) A requested review whose reviewer is
+    /// the viewer — never leaks another reviewer's request.
+    pub fn is_review_requested_of(&self, viewer_pseudonym: &str) -> bool {
+        self.reviews.iter().any(|r| {
+            matches!(r.state, ReviewState::Requested) && r.reviewer_pseudonym == viewer_pseudonym
+        })
+    }
+
+    /// **The checks-summary rollup for the list row (R3.1 / gate Q4 — rolled up IN the list pass, no
+    /// N+1).** Derived from the durable check FACTS on this record (the CI-reported `green_contexts`)
+    /// against the REPO-OWNED `ruleset`'s required set — the same facts [`evaluate_merge`] reads, so
+    /// the row never contradicts the merge gate. **Honest floor:** the record persists only SUCCESS
+    /// facts (greens), so a required context that is not yet green is `pending` (verdict `running`) —
+    /// this projection cannot distinguish a genuine FAILURE from a still-running check (`failing`
+    /// stays 0 until the per-commit `check_status` projection is joined here; a named follow-on). The
+    /// `verdict` is the load-bearing, leak-free signal; the counts refine it.
+    pub fn checks_summary(&self, ruleset: &BranchProtectionRuleset) -> ChecksSummary {
+        let total = ruleset.required_contexts.len() as u32;
+        let passing = ruleset
+            .required_contexts
+            .iter()
+            .filter(|c| self.green_contexts.iter().any(|g| g == *c))
+            .count() as u32;
+        let verdict = if total == 0 {
+            // No required checks: "pass" if the record carries greens (a merged/green PR), else none.
+            if self.green_contexts.is_empty() {
+                ChecksVerdict::None
+            } else {
+                ChecksVerdict::Pass
+            }
+        } else if passing >= total {
+            ChecksVerdict::Pass
+        } else {
+            ChecksVerdict::Running
+        };
+        ChecksSummary {
+            verdict,
+            passing,
+            failing: 0,
+            total,
+        }
+    }
+}
+
+/// The list-row checks verdict (glyph+label; the ring stays reserved for this CI trio). `None` = no
+/// checks reported; `Unavailable` = the projection could not be read (the row FAILS STATIC — it still
+/// lists, the checks glyph shows a neutral "checks unavailable", never a blanked row; ux-git #5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChecksVerdict {
+    /// Every required check is green (or a green-carrying merged PR).
+    Pass,
+    /// A required check reported a failure (reserved — the record cannot yet witness this; see the
+    /// [`PrRecord::checks_summary`] floor).
+    Fail,
+    /// A required check is not yet green (running/pending — the record cannot distinguish these).
+    Running,
+    /// No required checks and no greens reported.
+    None,
+    /// The checks projection could not be read for this row (degraded — fail static, still lists).
+    Unavailable,
+}
+
+impl ChecksVerdict {
+    /// The stable wire token the row VM emits (the frontend maps it to a glyph+label).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChecksVerdict::Pass => "pass",
+            ChecksVerdict::Fail => "fail",
+            ChecksVerdict::Running => "running",
+            ChecksVerdict::None => "none",
+            ChecksVerdict::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// The rolled-up checks posture for one list row — `verdict` + the refining counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChecksSummary {
+    /// The load-bearing, leak-free verdict.
+    pub verdict: ChecksVerdict,
+    /// Required contexts currently green.
+    pub passing: u32,
+    /// Required contexts witnessed as FAILED (0 until the check_status projection is joined — floor).
+    pub failing: u32,
+    /// Required contexts in total.
+    pub total: u32,
+}
+
+impl ChecksSummary {
+    /// The degraded summary a row shows when the checks projection could not be read (fail static).
+    pub fn unavailable() -> ChecksSummary {
+        ChecksSummary {
+            verdict: ChecksVerdict::Unavailable,
+            passing: 0,
+            failing: 0,
+            total: 0,
+        }
     }
 }
 
@@ -575,6 +718,14 @@ pub fn merge_pr<P: RepoPathResolver>(
             pr.transition(PrTransition::Merge, true)
                 .map_err(|e| DurableError::Git(format!("PR merge transition: {e}")))?;
             rec.state = pr.state;
+            // Merge is a mutation: bump `updated_at` so `sort=updated` doesn't rank a merged
+            // PR by its pre-merge activity (verifier note, R3.1).
+            rec.updated_at = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or_default(),
+            );
             store.put(repo_loc, &rec)?;
             Ok(MergeAttempt::Merged {
                 base_ref: rec.base_ref,
@@ -709,6 +860,103 @@ mod tests {
             "a corrupt branch-protection.json must be Err (fail-closed), got {result:?}"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **R3.1 — the title/body store round-trips durably** (a fresh store over the same root reads
+    /// the title + body back).
+    #[test]
+    fn title_and_body_round_trip_durably() {
+        let root = temp_root("title");
+        let gitstore = DurableGitStore::rooted(&root);
+        gitstore.create_repo(&loc()).unwrap();
+        let store = DurablePrStore::rooted(&root);
+        let mut rec = open_record(1, "refs/heads/main", &"a".repeat(40), "psn:author@acme");
+        rec.title = "R2.4 MCP HITL server-side verdicts".into();
+        rec.body_md = Some("The gate withholds until a human approves.".into());
+        rec.author_is_agent = true;
+        rec.updated_at = Some(1_752_000_000);
+        store.open_pr(&loc(), &rec).unwrap();
+
+        let back = DurablePrStore::rooted(&root)
+            .get(&loc(), 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.title, "R2.4 MCP HITL server-side verdicts");
+        assert_eq!(back.body_md.as_deref(), Some("The gate withholds until a human approves."));
+        assert!(back.author_is_agent);
+        assert_eq!(back.updated_at, Some(1_752_000_000));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **R3.1 — the on-disk "migration": a PR record written BEFORE the title store existed (no
+    /// `title`/`body_md`/`author_is_agent`/`updated_at` keys) still deserializes** — the additive
+    /// `#[serde(default)]` fields default (empty title → the list's honest `#number` fallback; not an
+    /// error, not a fabricated title). This is the durable-schema-evolution analogue of a boot
+    /// migration for the JSON store (there is no `pr` SQL table to `ALTER` — GT-003b).
+    #[test]
+    fn a_legacy_record_without_title_deserializes_with_defaults() {
+        // A pre-R3.1 record shape: only the fields that existed before the title store.
+        let legacy = serde_json::json!({
+            "number": 7,
+            "state": "Open",
+            "base_ref": "refs/heads/main",
+            "head_ref": "refs/heads/feature",
+            "head_oid": "deadbeef",
+            "author_pseudonym": "psn:old@acme",
+            "reviews": [],
+            "green_contexts": [],
+            "fork_unendorsed_contexts": [],
+            "endorsed_contexts": [],
+            "codeowner_review_satisfied": false,
+            "outstanding_conversations": 0
+        });
+        let rec: PrRecord = serde_json::from_value(legacy).expect("legacy record deserializes");
+        assert_eq!(rec.number, 7);
+        assert_eq!(rec.title, "", "no title → empty (the list renders #number, honest)");
+        assert_eq!(rec.body_md, None);
+        assert!(!rec.author_is_agent);
+        assert_eq!(rec.updated_at, None);
+    }
+
+    /// **R3.1 — the checks-summary rollup matches the merge-gate facts** (pass when all required are
+    /// green; running when a required one is not yet green; none when nothing is required/reported).
+    #[test]
+    fn checks_summary_rolls_up_from_greens_and_required_set() {
+        let ruleset = BranchProtectionRuleset {
+            ref_pattern: "refs/heads/main".into(),
+            required_contexts: vec!["ci/build".into(), "ci/test".into()],
+            required_approvals: 0,
+            require_codeowner_review: false,
+            require_conversation_resolution: false,
+            allow_force_push: false,
+        };
+        let mut rec = open_record(1, "refs/heads/main", "abc", "psn:a@acme");
+
+        // Nothing green yet → running (2 required, 0 passing).
+        let s = rec.checks_summary(&ruleset);
+        assert_eq!(s.verdict, ChecksVerdict::Running);
+        assert_eq!((s.passing, s.failing, s.total), (0, 0, 2));
+
+        // One green → still running.
+        rec.green_contexts = vec!["ci/build".into()];
+        assert_eq!(rec.checks_summary(&ruleset).verdict, ChecksVerdict::Running);
+
+        // Both green → pass.
+        rec.green_contexts = vec!["ci/build".into(), "ci/test".into()];
+        let s = rec.checks_summary(&ruleset);
+        assert_eq!(s.verdict, ChecksVerdict::Pass);
+        assert_eq!(s.passing, 2);
+
+        // No required contexts + no greens → none.
+        let empty_rs = BranchProtectionRuleset {
+            required_contexts: vec![],
+            ..ruleset.clone()
+        };
+        let mut fresh = open_record(2, "refs/heads/main", "abc", "psn:a@acme");
+        assert_eq!(fresh.checks_summary(&empty_rs).verdict, ChecksVerdict::None);
+        // …but greens on an unrequired ref still read as pass (a green merged PR).
+        fresh.green_contexts = vec!["ci/build".into()];
+        assert_eq!(fresh.checks_summary(&empty_rs).verdict, ChecksVerdict::Pass);
     }
 
     /// Minimal recursive file walk (test-only) — returns every file path under `dir`.

@@ -160,7 +160,7 @@ async fn durable_create_open_view_round_trip() {
 
     // pr open → a durable PR #1.
     let (oc, _oout, oerr) =
-        run_cli(&edge, &token, &["git", "pr", "open", "alpha", "--head-oid", "deadbeef"]);
+        run_cli(&edge, &token, &["git", "pr", "open", "alpha", "--title", "Alpha PR", "--head-oid", "deadbeef"]);
     assert_eq!(oc, 0, "pr open succeeds; stderr={oerr}");
 
     // pr view reads it back (durable).
@@ -200,7 +200,7 @@ async fn merge_blocked_by_gate_is_a_clean_cli_error() {
     )
     .expect("set branch protection");
     assert_eq!(
-        run_cli(&edge, &token, &["git", "pr", "open", "alpha", "--head-oid", "deadbeef"]).0,
+        run_cli(&edge, &token, &["git", "pr", "open", "alpha", "--title", "Alpha PR", "--head-oid", "deadbeef"]).0,
         0
     );
 
