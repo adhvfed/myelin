@@ -562,7 +562,13 @@ persist the atomic reserve/start bundle; proven on live PG — envelope→durabl
 + ci.run.started in one tx, idempotent [redelivery→0 dup]; trigger-match = type-family equality NOT
 EventMatcher [authz run-object gate — documented seam]; config/resolve errors = fail-closed surfaced skips;
 main.rs still boots the SHELL [no default-feature CAS BlobStore/git-read backing]; live pipeline EXECUTION =
-CT-004d). **★ CT-004m (NEXT — shared foundation blocker from BOTH a+b): CI durable-table migration/ownership
+CT-004d). **⚠ CLAIM CORRECTION (peer review 2026-07-16, findings 6/7/9 — see
+`planning/system-reviews/2026-07-16-peer-review-burndown.md`):** "consumer DONE" = the consumer LOGIC is built +
+proven in test; it is NOT registered in the prod ci-dispatch main (`main.rs:133` `consumers = Vec::new()` —
+CAS-BlobStore-gated deploy floor, #6). And the exactly-once claim is OVERSTATED: the dedup mark commits before
+the handler effect in a separate tx (#7) → a kill-9 window is AT-MOST-ONCE (MR-023b floor); the CT-004b
+idempotency test derives deterministic event ids that prod's fresh-ULID emit does NOT (#9). #7/#10 are P1
+burndown. Lesson: floor-confessions belong in the HEADLINE, not just a code comment. **★ CT-004m (NEXT — shared foundation blocker from BOTH a+b): CI durable-table migration/ownership
 reconcile.** The 14 CI tables (ci_run…cost_event) are owned by `ci_controlplane_migrations()` via the CI
 serve AppSpec; each service takes its own DATABASE_URL. (1) ci-DISPATCH writes ci_run but doesn't apply the
 CI migrations → prod-per-service-DB lacks it; the production durable ci_run writer belongs in a shared
