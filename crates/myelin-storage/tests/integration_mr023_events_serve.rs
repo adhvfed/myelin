@@ -121,9 +121,41 @@ impl EventHandler for CountingHandler {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mr023_serve_zero_lost_zero_ghost_under_crash() {
     let cfg = MyelinConfig::dev();
-    let pool = connect_pool_with_reset(&admin_url(&cfg), &cfg.region, 6)
+    // **Test-isolation (2026-07 re-prosecution finding):** this test does WHOLE-TABLE `outbox` ops
+    // (`outbox_depth` counts every unsent row; `drain_relay_to_empty` publishes every unsent row and
+    // asserts the exact count == N). Run in the shared `public.outbox`, it RACES cross-binary with
+    // `integration_mr009b_outbox_durable`'s `concurrent_seq_scenario` (which leaves 32 unsent rows) —
+    // a non-deterministic FLAKE (`outbox_depth` reads 8 + others' rows). Pin every connection to a
+    // per-pid schema so this test's `outbox` is ISOLATED (the established ci-dispatch / CT-004a
+    // pattern), making the whole-table assertions deterministic regardless of concurrent binaries.
+    let schema = format!("mr023_serve_{}", std::process::id());
+    let pool = {
+        let s = schema.clone();
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(6)
+            .after_connect(move |conn, _meta| {
+                let s = s.clone();
+                Box::pin(async move {
+                    sqlx::Executor::execute(
+                        conn,
+                        format!("SET search_path TO {s}, public").as_str(),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .connect(&admin_url(&cfg))
+            .await
+            .expect("connect Postgres (is the stack up?)")
+    };
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
         .await
-        .expect("connect Postgres (is the stack up?)");
+        .expect("drop prior schema");
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&pool)
+        .await
+        .expect("create per-pid schema");
     ensure_foundation(&pool).await;
 
     let tag = uniq();
@@ -254,13 +286,8 @@ async fn mr023_serve_zero_lost_zero_ghost_under_crash() {
          outbox_depth=0  backend=real-PG+real-NATS-JetStream via EventsRuntime"
     );
 
-    // cleanup
-    sqlx::query("DELETE FROM outbox WHERE aggregate = $1")
-        .bind(&agg)
-        .execute(&pool)
-        .await
-        .ok();
-    sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {state_table}"))
+    // cleanup: drop the whole per-pid schema (outbox + consumer_dedup + state table live in it).
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
         .execute(&pool)
         .await
         .ok();

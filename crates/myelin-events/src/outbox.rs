@@ -279,8 +279,26 @@ impl Default for OutboxStore {
 pub trait DurableOutboxBacking: Send + Sync {
     /// The durable arm of [`OutboxTransaction::commit`]: durably + atomically commit every staged
     /// row (all-or-nothing — a partial commit would be silent data loss). Assigns the per-aggregate
-    /// commit-order `seq` the same way the in-memory store does (gap-free, true commit order).
+    /// commit-order `seq` the same way the in-memory store does (gap-free, true commit order). A
+    /// duplicate `event_id` REJECTS (returns `Err`) — reject-parity with the in-memory arm.
     fn commit_staged(&self, rows: Vec<OutboxRow>) -> Result<()>;
+
+    /// **The ABSORB arm of [`OutboxTransaction::commit_absorb`] (H1 — peer-review #7 re-prosecution).**
+    /// Like [`commit_staged`](Self::commit_staged), but a DETERMINISTIC duplicate `event_id` is
+    /// ABSORBED (`ON CONFLICT (event_id) DO NOTHING`) instead of rejected — AFTER verifying the stored
+    /// row is byte-identical (a divergent payload under the same id is a genuine collision and still
+    /// `Err`s). This is what a handler emitting deterministic ids (the CI dispatcher's co-emitted
+    /// `ci.run.started` / `ci.check.updated`) needs so a crash-window redelivery that re-runs the
+    /// handler re-emits the SAME ids WITHOUT the reject-arm's `Err("duplicate emit")` → `Retry` →
+    /// UNBOUNDED LIVELOCK (the H1 bug). The events stay present exactly once.
+    ///
+    /// **Default = the reject arm** (delegates to [`commit_staged`](Self::commit_staged)): a backing
+    /// that has not implemented true absorb-mode keeps the safe reject behavior (fail-closed, never a
+    /// silent absorb). The production PG backing (`myelin_storage::outbox_durable::PgOutboxBacking`)
+    /// OVERRIDES this with the real `ON CONFLICT DO NOTHING` + payload-equality verification.
+    fn commit_staged_absorb(&self, rows: Vec<OutboxRow>) -> Result<()> {
+        self.commit_staged(rows)
+    }
 
     /// The `outbox_depth` survival signal (contract 1.8): the number of unsent rows.
     fn outbox_depth(&self) -> usize;
@@ -604,6 +622,49 @@ impl OutboxTransaction {
     /// `COALESCE(MAX(seq)+1, 0)` for the aggregate inside the caller's transaction, protected by
     /// the `UNIQUE(aggregate, seq)` constraint (a racing commit retries) — same observable
     /// property. The in-memory store models exactly that under the store lock.
+    /// **Commit in ABSORB mode (H1 — peer-review #7 re-prosecution).** Identical to
+    /// [`commit`](Self::commit) EXCEPT a DETERMINISTIC duplicate `event_id` (a re-emit whose id is
+    /// derived from a triggering `event_id`) is ABSORBED (`ON CONFLICT (event_id) DO NOTHING`, after
+    /// verifying byte-identical payload) instead of rejected. A handler that emits deterministic ids
+    /// (the CI dispatcher) uses THIS on a crash-window redelivery so the re-emit does not `Err` into an
+    /// unbounded `Retry` livelock. The rows still commit exactly once. On the in-memory arm the absorb
+    /// is modeled by skipping an already-present byte-identical id (see below); a divergent payload
+    /// under the same id still rejects.
+    pub fn commit_absorb(mut self) -> Result<()> {
+        if let Some(backing) = self.store.durable_backing() {
+            let rows: Vec<OutboxRow> = self.staged_rows.drain(..).collect();
+            return backing.commit_staged_absorb(rows);
+        }
+        // Memory arm (test-support): absorb a byte-identical already-present id; reject a divergent one.
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let mut inner = self.store.mem().expect("memory backend");
+            for row in &self.staged_rows {
+                if let Some(existing) = inner.rows.get(&row.event_id) {
+                    if existing.envelope != row.envelope {
+                        return Err(OutboxError(format!(
+                            "outbox event_id {:?} already present with a DIFFERENT payload — genuine collision",
+                            row.event_id
+                        )));
+                    }
+                }
+            }
+            for mut row in self.staged_rows.drain(..) {
+                if inner.rows.contains_key(&row.event_id) {
+                    continue; // deterministic re-emit — absorb (already present, byte-identical).
+                }
+                let slot = inner.next_seq.entry(row.aggregate.clone()).or_insert(0);
+                row.seq = *slot;
+                *slot += 1;
+                inner.order.push(row.event_id.clone());
+                inner.rows.insert(row.event_id.clone(), row);
+            }
+            return Ok(());
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        unreachable!("a production OutboxStore is Durable-only (the Memory arm is test-support-gated)")
+    }
+
     pub fn commit(mut self) -> Result<()> {
         // Durable dispatch: the whole staged buffer commits atomically through the backing (the
         // durable arm of the co-commit). The backing assigns the per-aggregate seq the same way.
@@ -665,11 +726,18 @@ impl OutboxTransaction {
     /// [`OutboxTx::emit`] (same causality derivation via [`derive_envelope`]) EXCEPT the stable id is
     /// the supplied `id` instead of a freshly-minted ULID. A reaction whose id is derived
     /// deterministically from its triggering `event_id` (e.g. the CI dispatcher's co-emitted
-    /// `ci.run.started` / `ci.check.updated`) mints the SAME id on a re-run, so the outbox
-    /// `UNIQUE(event_id)` / `ON CONFLICT (event_id) DO NOTHING` dedups the re-emit — no duplicate
-    /// events even if the triggering handler runs twice. This is NOT a raw-publish (it stages into
-    /// the same co-commit buffer as `emit`; the `no-raw-publish` lint guards `publish_now` /
-    /// `BusTransport::put`, not the emit family).
+    /// `ci.run.started` / `ci.check.updated`) mints the SAME id on a re-run.
+    ///
+    /// **H1 (peer-review #7 re-prosecution) — the dedup is NOT automatic on `commit`.** The default
+    /// [`commit`](OutboxTransaction::commit) is the REJECT arm: a duplicate `event_id` returns
+    /// `Err("duplicate emit")` (reject-parity). So a deterministic re-emit committed with plain
+    /// `commit` would `Err` → the handler `Retry`s → an UNBOUNDED LIVELOCK. To get the "dedup the
+    /// re-emit, no duplicate events" behavior, the caller MUST commit the deterministic-id transaction
+    /// with [`commit_absorb`](OutboxTransaction::commit_absorb) (the `ON CONFLICT (event_id) DO
+    /// NOTHING` + payload-equality path). A prior doc here WRONGLY claimed the reject-arm `commit`
+    /// itself did `ON CONFLICT DO NOTHING` — it does not; that was the H1 livelock. This is NOT a
+    /// raw-publish (it stages into the same co-commit buffer as `emit`; the `no-raw-publish` lint
+    /// guards `publish_now` / `BusTransport::put`, not the emit family).
     pub fn emit_with_id(
         &mut self,
         id: EventId,

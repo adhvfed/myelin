@@ -108,6 +108,19 @@ impl myelin_events::DurableOutboxBacking for PgOutboxBacking {
         })
     }
 
+    /// **H1 (peer-review #7 re-prosecution) — the real absorb arm.** Delegates to
+    /// [`PgRelay::commit_staged_absorb`]: `ON CONFLICT (event_id) DO NOTHING` + payload-equality
+    /// verification, so a deterministic crash-window re-emit is absorbed (no `Err` → no `Retry`
+    /// livelock) while a divergent-payload collision still rejects.
+    fn commit_staged_absorb(&self, rows: Vec<OutboxRow>) -> Result<()> {
+        self.block(async {
+            self.relay()
+                .commit_staged_absorb(&rows)
+                .await
+                .map_err(|e| OutboxError(e.to_string()))
+        })
+    }
+
     fn outbox_depth(&self) -> usize {
         self.block(async { self.relay().unsent_depth().await.unwrap_or(0).max(0) as usize })
     }
