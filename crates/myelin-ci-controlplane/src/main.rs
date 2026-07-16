@@ -95,6 +95,13 @@ async fn main() {
         provider.db_pool().clone(),
         tokio::runtime::Handle::current(),
     )));
+    // CT-004a: construct the REAL durable CI `cost_event` projection store from the provider pool —
+    // proving the metering path is a production-callable store (not model-only). DORMANT at the shell
+    // (no consumer drives it yet); CT-004d attaches it to the `SCHEDULE_AND_RUN_JOB` dispatch settle
+    // bookend (and must first reconcile the `cost_event` table-name collision documented on
+    // `ci_cost_event_store`). Building it only wraps the pool — no query runs at boot.
+    let _ci_cost_events =
+        myelin_ci_controlplane::ci_cost_event_store(provider.db_pool().clone());
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).
     match run_controlplane(Config::default(), outbox) {

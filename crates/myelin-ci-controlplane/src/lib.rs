@@ -53,6 +53,17 @@
 pub mod artifact_cache;
 pub mod check_emitter;
 pub mod ci_pipeline;
+/// CT-004a (CI backend reconcile-and-harden — the FOUNDATION chunk): the REAL durable `cost_event`
+/// projection store ([`cost_store::CiCostEventStore`]). Turns the previously model-only CI metering
+/// path (SQL constants + the in-memory [`metering::CostEventRow`] model, no production-callable store)
+/// into a genuine durable store that executes the BYTE-IDENTICAL [`metering::INSERT_COST_EVENT_QUERY`]
+/// / [`metering::SELECT_COST_EVENTS_FOR_RUN_QUERY`] against the OLTP pool. It owns ONLY the CI
+/// `cost_event` PROJECTION (run/job-attributed, meter-dimensioned reporting rows); the reserve/settle
+/// MONEY-truth stays in `myelin_storage::reserve_settle::CostLedger` (delegated via
+/// [`metering::CiMeter`]/[`myelin_flow::BudgetGate`]) — see the module docs for the split. Constructed
+/// at the composition root by [`ci_cost_event_store`]; the live consumer that drives a real settle
+/// through it (co-committing the run-state transition) is CT-004d.
+pub mod cost_store;
 pub mod ci_result_signal;
 pub mod crypto_shred_erase;
 pub mod deployment;
@@ -231,6 +242,13 @@ pub use metering::{
 // non-existent item.
 #[cfg(any(test, feature = "test-support"))]
 pub use metering::reserve_settle_parity_drill;
+
+// CT-004a (CI backend reconcile-and-harden, FOUNDATION): the REAL durable `cost_event` projection
+// store + its deterministic idempotency-key derivation + the typed fail-loud error. The metering
+// path is no longer model-only — `CiCostEventStore::settle_in_tx` co-commits the CI projection rows a
+// settle produces, and `cost_events_for_run` reads them back (wholesale ≠ markup intact). The
+// storage-`CostLedger`-vs-CI-projection split + the CT-004d live-wiring follow-on are in the module docs.
+pub use cost_store::{cost_id_for, CiCostEventStore, CiCostStoreError};
 
 pub use holder::{
     ci_store_classifier, register_ci_holders, CiHolder, CiHolderRegistration, CiStoreClass,
@@ -487,6 +505,36 @@ pub fn run_controlplane(
     outbox: myelin_events::OutboxStore,
 ) -> Result<(), ServeError> {
     serve(controlplane_app_spec(config, outbox))
+}
+
+/// **Construct the durable CI `cost_event` projection store at the composition root (CT-004a).** The
+/// service `main` builds this from the MR-022 `SubstrateProvider` pool (`provider.db_pool().clone()`)
+/// after the migrations have run, so the metering path has a real, production-callable
+/// [`CiCostEventStore`] — not the prior model-only SQL-constants-plus-in-memory-model. It is a thin,
+/// explicit composition seam (over [`CiCostEventStore::with_pg`]) so the wiring point is named + the
+/// CT-004d follow-on is documented in ONE place.
+///
+/// **DORMANT at the shell (CT-004a scope).** No consumer drives this yet: constructing it only wraps
+/// the pool (no query runs at boot), so it is safe to build in the composition root even though the
+/// live settle path is not attached. **CT-004d** attaches it to the `SCHEDULE_AND_RUN_JOB` dispatch
+/// settle bookend (a real `job.done` co-commits its run-state transition + `settle_in_tx` here).
+///
+/// **⚠ CT-004d BLOCKER — the `cost_event` table-name collision (a discovered, pre-existing latent
+/// defect, recorded here so it is never silently relied upon).** The single-binary `main.rs` applies
+/// `myelin_storage::all_durable_migrations()` (which includes the reserve/settle MONEY ledger's
+/// `cost_event`, migration `0050` — Storage's `(tenant, region, run, ord, unit, wholesale, markup)`
+/// schema) AND, via `serve(AppSpec)`, CI's projection `cost_event` (`ci_0014` —
+/// `(tenant, region, cost_id, run_id, job_id, meter, amount, …, kind)`). Both are
+/// `CREATE TABLE IF NOT EXISTS cost_event`, so on one shared pool the FIRST-applied (Storage's) schema
+/// wins and CI's projection DDL silently no-ops — this store's INSERT would then fail at runtime on the
+/// missing CI columns. This is DORMANT today (nothing executes the CI `cost_event` yet). Per the arch
+/// "each service its own Postgres, no cross-DB", the two tables never coexist in production — the
+/// conflation is a dev single-binary artifact. CT-004d must reconcile it (CI on its own DB, or the CI
+/// main not applying Storage's `0050` cost tables, or a distinct CI projection table name) BEFORE
+/// driving a live settle through this store. CT-004a keeps its scope to the store + its kill-9 proof
+/// (proven against an ISOLATED `cost_event` in the durability test's own schema).
+pub fn ci_cost_event_store(pool: sqlx::PgPool) -> CiCostEventStore {
+    CiCostEventStore::with_pg(pool)
 }
 
 #[cfg(test)]
