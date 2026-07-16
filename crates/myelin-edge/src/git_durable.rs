@@ -3257,9 +3257,6 @@ impl Handler for DMerge {
             MergeAttempt::RefRefused(reason) => Err(EdgeError::Conflict(format!(
                 "merge ref advance refused: {reason:?}"
             ))),
-            MergeAttempt::RefRefused(reason) => Err(EdgeError::Conflict(format!(
-                "merge ref advance refused: {reason:?}"
-            ))),
             // An arbitrary / non-existent / non-descendant head — refused, no ref advance (never advance
             // a protected ref to an arbitrary oid). 422: the merge target is unprocessable.
             MergeAttempt::InvalidHead(why) => {
