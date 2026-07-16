@@ -12,7 +12,7 @@ import { Show, Suspense } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { createAsync, useSearchParams, useSubmission } from "@solidjs/router";
 import { Icon } from "@myelin/design-system";
-import { getAuthConfig, loginDev, startSso } from "../lib/auth";
+import { getAuthConfig, loginDev, loginWithToken, startSso } from "../lib/auth";
 
 // The card chrome, shared by every state.
 const card = {
@@ -43,12 +43,33 @@ const primaryBtn = {
   cursor: "pointer",
 } as const;
 
+// A secondary (outline) button — used for the operator-token submit WHEN SSO is the primary. When SSO
+// is unconfigured, the token card is the primary affordance instead and rides `primaryBtn`.
+const secondaryBtn = {
+  display: "inline-flex",
+  "align-items": "center",
+  "justify-content": "center",
+  gap: "var(--space-2)",
+  width: "100%",
+  padding: "var(--space-2) var(--space-3)",
+  border: "var(--hairline) solid var(--border-strong)",
+  "border-radius": "var(--radius-1)",
+  background: "var(--surface)",
+  color: "var(--text-primary)",
+  "font-weight": "500",
+  cursor: "pointer",
+} as const;
+
 export default function Login() {
   const config = createAsync(() => getAuthConfig());
   const [params] = useSearchParams();
   const ssoPending = useSubmission(startSso);
+  const tokenPending = useSubmission(loginWithToken);
 
   const hasError = () => Boolean(params.error);
+  // R4.0 — the operator-token failure has its OWN honest copy (blames the token/bootstrap, not the
+  // user), distinct from the SSO-not-wired message. Key off the `?error=` value.
+  const isTokenError = () => params.error === "token_invalid";
 
   return (
     <main
@@ -79,7 +100,8 @@ export default function Login() {
         <Show when={hasError()}>
           <p
             role="alert"
-            data-testid="login-error"
+            id="login-error-msg"
+            data-testid={isTokenError() ? "login-error-token" : "login-error"}
             style={{
               margin: "0",
               display: "flex",
@@ -93,11 +115,23 @@ export default function Login() {
             }}
           >
             <Icon name="gate" />
-            <span>
-              Sign-in couldn't be completed. Single sign-on isn't fully wired on this deployment yet —
-              an administrator needs to finish connecting the identity provider. You can try again, or
-              contact your Myelin administrator.
-            </span>
+            {/* Token failures blame the token/bootstrap step; every other error keeps the SSO copy. */}
+            <Show
+              when={isTokenError()}
+              fallback={
+                <span>
+                  Sign-in couldn't be completed. Single sign-on isn't fully wired on this deployment yet
+                  — an administrator needs to finish connecting the identity provider. You can try again,
+                  or contact your Myelin administrator.
+                </span>
+              }
+            >
+              <span>
+                That operator token didn't work — it's likely invalid or expired. Re-run{" "}
+                <code style={{ "font-family": "var(--font-mono)" }}>edge bootstrap</code> to print a
+                fresh token, then paste it below. Nothing's wrong on your end.
+              </span>
+            </Show>
           </p>
         </Show>
 
@@ -163,6 +197,66 @@ export default function Login() {
                         ? "Taking you to your identity provider."
                         : "You'll be redirected to your organization's identity provider, then back to Myelin."}
                     </p>
+                  </form>
+                </Show>
+
+                {/* R4.0 — OPERATOR-TOKEN LOGIN. A REAL working path (verifies against the live edge),
+                    gated on the edge flag. When SSO is unconfigured this is the PRIMARY affordance and
+                    rides the derived primary token; otherwise it's the secondary/outline alternative. */}
+                <Show when={cfg.token_login_enabled}>
+                  <form
+                    action={loginWithToken}
+                    method="post"
+                    data-testid="token-login-form"
+                    style={{ margin: "0", display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}
+                  >
+                    {/* The control is NESTED in its label (the codebase's association convention) — the
+                        visible label text is the <span>; the input is the labelled control. */}
+                    <label style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
+                      <span style={{ display: "flex", "align-items": "center", gap: "var(--space-1)", "font-size": "var(--fs-body-sm)", "font-weight": "500", color: "var(--text-primary)" }}>
+                        <Icon name="agent" /> Operator token
+                      </span>
+                      <input
+                        id="operator-token"
+                        name="token"
+                        type="password"
+                        required
+                        autocomplete="off"
+                        autocapitalize="off"
+                        autocorrect="off"
+                        spellcheck={false}
+                        data-testid="token-input"
+                        placeholder="Paste your capability token"
+                        // The error alert (when present) + the helper are both referenced — the reason
+                        // is VISIBLE TEXT, never a title tooltip.
+                        aria-describedby={isTokenError() ? "login-error-msg token-help" : "token-help"}
+                        aria-invalid={isTokenError() ? "true" : undefined}
+                        style={{
+                          width: "100%",
+                          padding: "var(--space-2) var(--space-3)",
+                          border: `var(--hairline) solid ${isTokenError() ? "var(--danger)" : "var(--border-strong)"}`,
+                          "border-radius": "var(--radius-1)",
+                          background: "var(--surface)",
+                          color: "var(--text-primary)",
+                          "font-family": "var(--font-mono)",
+                          "font-size": "var(--fs-body-sm)",
+                        }}
+                      />
+                    </label>
+                    <p id="token-help" data-testid="token-help" style={{ margin: "0", color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>
+                      Paste the token from{" "}
+                      <code style={{ "font-family": "var(--font-mono)" }}>edge bootstrap</code>. It never
+                      leaves your session — it's sent once to verify, then held server-side.
+                    </p>
+                    <button
+                      type="submit"
+                      data-testid="token-login"
+                      aria-busy={tokenPending.pending ? "true" : undefined}
+                      style={cfg.sso_configured ? secondaryBtn : primaryBtn}
+                    >
+                      <Icon name="agent" />
+                      {tokenPending.pending ? "Verifying token…" : "Sign in with operator token"}
+                    </button>
                   </form>
                 </Show>
 

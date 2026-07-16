@@ -48,6 +48,11 @@ const state = {
   // Whether the login page's dev seam may render (the `dev_login_enabled` server flag). Default on so
   // the harness's dev-login seam is reachable; a test flips it off to assert the seam disappears.
   devLoginEnabled: true,
+  // R4.0 — whether the edge advertises the OPERATOR-TOKEN login (`token_login_enabled`). Default OFF so
+  // the existing first-run spec's login posture is unchanged; the token-login spec flips it on. The
+  // whoami route below already verifies a pasted token (Bearer === DEV_ACCESS_TOKEN), so with this on
+  // the paste→verify→session flow runs end-to-end against this double.
+  tokenLoginEnabled: false,
 };
 
 function send(res, status, json, headers = {}) {
@@ -77,6 +82,7 @@ const server = createServer((req, res) => {
       sso_configured: false,
       providers: [],
       dev_login_enabled: state.devLoginEnabled,
+      token_login_enabled: state.tokenLoginEnabled,
     });
   }
 
@@ -90,6 +96,7 @@ const server = createServer((req, res) => {
         const body = raw ? JSON.parse(raw) : {};
         if (typeof body.emptyRepos === "boolean") state.emptyRepos = body.emptyRepos;
         if (typeof body.devLoginEnabled === "boolean") state.devLoginEnabled = body.devLoginEnabled;
+        if (typeof body.tokenLoginEnabled === "boolean") state.tokenLoginEnabled = body.tokenLoginEnabled;
       } catch {
         /* ignore malformed control body */
       }
