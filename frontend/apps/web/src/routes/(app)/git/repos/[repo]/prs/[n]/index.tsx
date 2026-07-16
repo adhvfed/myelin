@@ -353,6 +353,17 @@ function ReviewsSection(props: {
   const [summaryText, setSummaryText] = createSignal("");
   const submitted = createMemo(() => props.reviews.filter((r) => r.verdict !== "in_progress"));
 
+  // Rehydrate the in-progress batch from the server (finding #18): `threads().reviews` returns the
+  // viewer's OWN un-submitted draft (the projection hides other reviewers' drafts — pr_threads.rs
+  // `view_for`), so on load/reload we RESUME it instead of leaving "Start a review" to double-create a
+  // second orphan batch. Only seeds while `draft()` is null, so it never clobbers live local edits;
+  // submit/discard clear the draft AFTER the reviews refetch, so a resolved batch is not resurrected.
+  createEffect(() => {
+    if (draft()) return;
+    const resumable = props.reviews.find((r) => r.verdict === "in_progress");
+    if (resumable) setDraft(resumable);
+  });
+
   const start = async () => {
     try {
       const r = await doMutate({ op: "review-start", repo: props.repo, n: props.n });
@@ -378,10 +389,12 @@ function ReviewsSection(props: {
     if (!d) return;
     try {
       await doMutate({ op: "review-submit", repo: props.repo, n: props.n, reviewId: d.id, verdict, summary_md: summaryText() });
+      // Refetch FIRST so `props.reviews` no longer carries an in_progress batch, THEN drop the local
+      // draft — otherwise the rehydrate effect would re-seed the just-submitted batch from stale data.
+      await props.onChange();
       setDraft(null);
       setVerdictOpen(false);
       setSummaryText("");
-      await props.onChange();
       props.toast.show({ title: "Review submitted", variant: "success" });
     } catch {
       props.toast.show({ title: "Could not submit the review", variant: "danger" });
@@ -392,6 +405,8 @@ function ReviewsSection(props: {
     if (!d) return;
     try {
       await doMutate({ op: "review-discard", repo: props.repo, n: props.n, reviewId: d.id });
+      // Drop the server draft so the rehydrate effect can't resurrect it, THEN clear the local draft.
+      await props.onChange();
     } catch {
       /* a discard failure is non-fatal — the draft is the reviewer's private state */
     }
@@ -441,6 +456,7 @@ function ReviewsSection(props: {
             </span>
             <textarea
               aria-label="Pending review comment"
+              value={pendingText()}
               onInput={(e) => setPendingText(e.currentTarget.value)}
               rows={2}
               placeholder="Add a comment to this review…"
@@ -505,11 +521,10 @@ function DiscussionSection(props: {
   loading: boolean;
   onChange: () => Promise<void>;
 }) {
-  // Uncontrolled (ref-read) — a controlled `value={}` binding blocks the test driver's fill AND is
-  // unnecessary here; the text is preserved on failure (the ref keeps it, never lost).
   const doMutate = useAction(prMutate);
-  // Uncontrolled signal via onInput (no `value` binding — that resets under the test driver's fill; no
-  // ref — that mis-points under SSR hydration). The text is preserved on failure (the signal keeps it).
+  // CONTROLLED via a signal (finding #19): `value` is bound so a successful post that clears the signal
+  // also clears the DOM — an uncontrolled field kept the stale text and a second submit duplicate-posted.
+  // The text is preserved on failure (the signal keeps it, never lost).
   const [composer, setComposer] = createSignal("");
   const post = async () => {
     const text = composer().trim();
@@ -536,7 +551,7 @@ function DiscussionSection(props: {
       </Show>
       {/* The composer (a read-only viewer's write is server-rejected → the toast; the field never lies). */}
       <div style={{ display: "flex", "flex-direction": "column", gap: "var(--space-1)" }}>
-        <textarea aria-label="New comment" onInput={(e) => setComposer(e.currentTarget.value)} rows={2} placeholder="Start a discussion…" style={textareaStyle} />
+        <textarea aria-label="New comment" value={composer()} onInput={(e) => setComposer(e.currentTarget.value)} rows={2} placeholder="Start a discussion…" style={textareaStyle} />
         <button type="button" data-testid="post-thread" onClick={() => void post()} class="btn-primary" style={{ ...barBtnPrimary, "align-self": "flex-start" }}>Comment</button>
       </div>
     </section>
@@ -575,7 +590,7 @@ function ThreadView(props: { repo: string; n: number; thread: PrThreadVM; onChan
         )}
       </For>
       <div style={{ display: "flex", gap: "var(--space-1)" }}>
-        <input aria-label="Reply" onInput={(e) => setReply(e.currentTarget.value)} placeholder="Reply…" style={{ ...textareaStyle, flex: "1" }} />
+        <input aria-label="Reply" value={reply()} onInput={(e) => setReply(e.currentTarget.value)} placeholder="Reply…" style={{ ...textareaStyle, flex: "1" }} />
         <button type="button" onClick={() => void send()} class="btn-secondary" style={barBtn}>Reply</button>
       </div>
     </li>

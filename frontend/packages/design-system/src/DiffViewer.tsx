@@ -453,17 +453,39 @@ function CodeCell(props: {
 
 /** An ALWAYS-PRESENT widget row (thread + composer) beneath a line — stable row count (content is
  *  conditional INSIDE, never a conditional sibling <tr>, so a dynamic open/close never trips the
- *  table reconciler). A row with no thread/composer renders an empty, zero-height <tr>. */
-function WidgetRow(props: { cols: number; section: SectionProps; side: "old" | "new"; line: number }) {
+ *  table reconciler). A row with no thread/composer renders an empty, zero-height <tr>.
+ *  `targets` is the set of (side,line) the row can host a widget for: unified rows carry ONE, split
+ *  rows carry BOTH the old (left) and new (right) sides so a comment on a DELETED (old-side) line
+ *  opens its composer under the clicked side — never silently anchored to the new side only. */
+function WidgetRow(props: { cols: number; section: SectionProps; targets: { side: "old" | "new"; line: number }[] }) {
   const s = props.section;
-  const thread = () => s.renderThread?.(s.file.path, props.side, props.line);
-  const composer = () => s.renderComposer?.(s.file.path, props.side, props.line);
+  // A row carries an optional OLD (left/deleted) and NEW (right/added) target. Two keying rules:
+  //   • THREADS are anchored by (path, line), side-agnostic — render per DISTINCT line, so a modified
+  //     row with old_no === new_no shows its thread ONCE, but old_no !== new_no shows both lines.
+  //   • COMPOSERS are side-keyed and self-gate on the exact (path, side, line) — render for EACH side
+  //     so a click on the deleted (old) cell opens the composer under the OLD side, not only the new.
+  // Explicit <Show> slots (not <For>) keep each call in a TRACKED scope so it re-runs when the
+  // consumer's open-composer / thread signals change (a <For> callback is memoised and would not).
+  const oldT = () => props.targets.find((t) => t.side === "old");
+  const newT = () => props.targets.find((t) => t.side === "new");
+  const threadAt = (t?: { side: "old" | "new"; line: number }) => (t ? s.renderThread?.(s.file.path, t.side, t.line) : undefined);
+  const composerAt = (t?: { side: "old" | "new"; line: number }) => (t ? s.renderComposer?.(s.file.path, t.side, t.line) : undefined);
+  const oldThread = () => threadAt(oldT());
+  const newThread = () => {
+    const nt = newT();
+    const ot = oldT();
+    return nt && (!ot || ot.line !== nt.line) ? threadAt(nt) : undefined; // dedupe same-line sides
+  };
+  // Dynamic JSX children (`{fn()}`) — each is its own TRACKED scope, so the composer re-renders when
+  // the consumer's open-composer signal flips (a <Show>/<For> render-prop body is called once, not re-run).
   return (
     <tr data-diff-widget>
       <td colSpan={props.cols} style={{ padding: "0", background: "var(--surface-raised)" }}>
-        <Show when={s.mounted && (thread() || composer())}>
-          {thread()}
-          {composer()}
+        <Show when={s.mounted}>
+          {oldThread()}
+          {newThread()}
+          {composerAt(oldT())}
+          {composerAt(newT())}
         </Show>
       </td>
     </tr>
@@ -482,7 +504,7 @@ function UnifiedRow(props: { row: Extract<DiffRow, { t: "uline" }>; } & SectionP
         <Gutter no={line().new_no} />
         <CodeCell line={line()} section={props} side={side()} />
       </tr>
-      <WidgetRow cols={props.cols} section={props} side={side()} line={lineNo()} />
+      <WidgetRow cols={props.cols} section={props} targets={[{ side: side(), line: lineNo() }]} />
     </>
   );
 }
@@ -490,8 +512,18 @@ function UnifiedRow(props: { row: Extract<DiffRow, { t: "uline" }>; } & SectionP
 function SplitRow(props: { row: Extract<DiffRow, { t: "sline" }>; } & SectionProps) {
   const left = () => props.row.left;
   const right = () => props.row.right;
-  const anchorSide = (): "old" | "new" => (right() ? "new" : "old");
-  const anchorLine = () => right()?.new_no ?? left()?.old_no ?? 0;
+  // Widget targets: a context row pairs the SAME line object on both sides (splitRows pushes
+  // `{ left: l, right: l }`) → one target on the new side. A changed row has distinct old/new lines →
+  // a target for EACH side present, so a comment on the deleted (left) cell opens under the old side.
+  const targets = (): { side: "old" | "new"; line: number }[] => {
+    const l = left();
+    const r = right();
+    if (l && r && l === r) return [{ side: "new", line: r.new_no ?? 0 }];
+    const t: { side: "old" | "new"; line: number }[] = [];
+    if (l) t.push({ side: "old", line: l.old_no ?? 0 });
+    if (r) t.push({ side: "new", line: r.new_no ?? 0 });
+    return t;
+  };
   return (
     <>
       <tr>
@@ -502,7 +534,7 @@ function SplitRow(props: { row: Extract<DiffRow, { t: "sline" }>; } & SectionPro
           {(r) => (<><Gutter no={r().new_no} /><CodeCell line={r()} section={props} side="new" /></>)}
         </Show>
       </tr>
-      <WidgetRow cols={props.cols} section={props} side={anchorSide()} line={anchorLine()} />
+      <WidgetRow cols={props.cols} section={props} targets={targets()} />
     </>
   );
 }
