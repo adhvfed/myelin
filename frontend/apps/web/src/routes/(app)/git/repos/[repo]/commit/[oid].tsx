@@ -5,17 +5,20 @@
 // 1.4.1). Semantic tokens only.
 import { ErrorBoundary, For, Show, Suspense } from "solid-js";
 import { Title } from "@solidjs/meta";
-import { A, createAsync, useParams } from "@solidjs/router";
-import { Icon, Skeleton, SkeletonBlock } from "@myelin/design-system";
+import { A, createAsync, useParams, useSearchParams } from "@solidjs/router";
+import { Skeleton, SkeletonBlock } from "@myelin/design-system";
 import { getCommit, type DiffFileVM, type DiffLineVM } from "~/lib/api";
 import { fmtDate } from "~/lib/format";
-import { NotAvailable } from "~/components/NotAvailable";
+import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 
 const STATUS_LABEL: Record<string, string> = { A: "added", M: "modified", D: "deleted", R: "renamed", C: "copied" };
 
 export default function CommitDiffScreen() {
   const params = useParams();
-  // Guard the route segments: a deep-link missing {repo,oid} renders a dignified not-found.
+  const [search] = useSearchParams();
+  // The commit diff KEEPS the arrival ref (finding 6: never reset the breadcrumb to a hardcoded
+  // 'main'). The commits log links here with `?ref=<the ref>`; absent it, fall back to `main`.
+  const arrivalRef = () => (typeof search.ref === "string" && search.ref ? search.ref : "main");
   const ready = () => Boolean(params.repo && params.oid);
   const commit = createAsync(async () => {
     const repo = params.repo;
@@ -26,21 +29,15 @@ export default function CommitDiffScreen() {
   return (
     <section aria-labelledby="diff-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-3)" }}>
       <Title>{(params.oid ?? "commit").slice(0, 12)} · {params.repo} · Myelin</Title>
-      <nav aria-label="Breadcrumb" style={{ "font-size": "var(--fs-caption)", display: "flex", gap: "var(--space-1)" }}>
+      <nav aria-label="Breadcrumb" style={{ "font-size": "var(--fs-caption)", display: "flex", gap: "var(--space-1)", "align-items": "center", "flex-wrap": "wrap" }}>
         <A href="/git/repos" style={{ color: "var(--text-muted)" }}>Repositories</A>
         <span aria-hidden="true">/</span>
         <A href={`/git/repos/${params.repo}`} style={{ color: "var(--text-muted)" }}>{params.repo}</A>
         <span aria-hidden="true">/</span>
-        <A href={`/git/repos/${params.repo}/commits/main`} style={{ color: "var(--text-muted)" }}>commits</A>
+        <A href={`/git/repos/${params.repo}/commits/${encodeURIComponent(arrivalRef())}`} style={{ color: "var(--text-muted)" }}>commits on {arrivalRef()}</A>
       </nav>
 
-      <ErrorBoundary
-        fallback={(err) => (
-          <p role="alert" style={{ color: "var(--danger)", border: "var(--hairline) solid var(--danger)", padding: "var(--space-3)", "border-radius": "var(--radius-1)" }}>
-            <Icon name="check-fail" /> Could not load this commit: {String(err.message ?? err)}
-          </p>
-        )}
-      >
+      <ErrorBoundary fallback={(err, reset) => <RepoErrorState kind={errKind(err)} repo={params.repo} onRetry={reset} />}>
         <Suspense
           fallback={
             <Skeleton label="Loading commit…" data-testid="commit-loading">
@@ -49,7 +46,7 @@ export default function CommitDiffScreen() {
             </Skeleton>
           }
         >
-          <Show when={ready()} fallback={<NotAvailable kind="commit" />}>
+          <Show when={ready()} fallback={<RepoErrorState kind="not-found" repo={params.repo} />}>
           <Show when={commit()} keyed>
             {(c) => (
               <>

@@ -71,10 +71,15 @@ fn is_bounded_resource_id(id: &str) -> bool {
         && !id.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// One route segment — a literal or a `{name}` path parameter.
+/// One route segment — a literal, a single-segment `{name}` path parameter, or a trailing
+/// **catch-all** `{...name}` that captures the remaining path segments joined by `/` (the nested
+/// tree/blob path grammar, R3.4). A `Rest` segment is only meaningful as the LAST segment of a
+/// pattern; [`match_route`] enforces that a `Rest` binds every remaining segment (zero or more, so
+/// `tree/{ref}` root maps to the same route with an empty path).
 enum Seg {
     Lit(String),
     Param(String),
+    Rest(String),
 }
 
 /// What a matched route dispatches to.
@@ -106,6 +111,8 @@ fn parse_pattern(pattern: &str) -> Vec<Seg> {
         .split('/')
         .filter(|s| !s.is_empty())
         .map(|s| match s.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
+            // `{...name}` = a trailing catch-all that binds the remaining path segments (R3.4).
+            Some(name) if name.starts_with("...") => Seg::Rest(name[3..].to_string()),
             Some(name) => Seg::Param(name.to_string()),
             None => Seg::Lit(s.to_string()),
         })
@@ -527,19 +534,38 @@ impl Gateway {
             .filter(|s| !s.is_empty())
             .collect();
         'routes: for (i, r) in self.routes.iter().enumerate() {
-            if r.method != method || r.segs.len() != parts.len() {
+            if r.method != method {
+                continue;
+            }
+            // A trailing catch-all (`{...name}`, R3.4) binds zero-or-more remaining segments, so its
+            // route matches any path with at least the fixed prefix length; a fixed route still needs
+            // an exact segment-count match.
+            let has_rest = matches!(r.segs.last(), Some(Seg::Rest(_)));
+            if has_rest {
+                if parts.len() + 1 < r.segs.len() {
+                    continue; // not even the fixed prefix (before the catch-all) is present.
+                }
+            } else if r.segs.len() != parts.len() {
                 continue;
             }
             let mut params = BTreeMap::new();
-            for (seg, part) in r.segs.iter().zip(parts.iter()) {
+            for (idx, seg) in r.segs.iter().enumerate() {
                 match seg {
                     Seg::Lit(l) => {
-                        if l != part {
+                        if parts.get(idx) != Some(&l.as_str()) {
                             continue 'routes;
                         }
                     }
-                    Seg::Param(name) => {
-                        params.insert(name.clone(), (*part).to_string());
+                    Seg::Param(name) => match parts.get(idx) {
+                        Some(part) => {
+                            params.insert(name.clone(), (*part).to_string());
+                        }
+                        None => continue 'routes,
+                    },
+                    // The catch-all: everything from here on, joined by `/` (empty for the root path).
+                    Seg::Rest(name) => {
+                        let rest = parts[idx..].join("/");
+                        params.insert(name.clone(), rest);
                     }
                 }
             }
@@ -622,6 +648,19 @@ mod tests {
     fn unknown_route_is_404() {
         let resp = gw().handle(EdgeRequest::new("GET", "/v1/nope", "", vec![], vec![]));
         assert_eq!(resp.status(), 404);
+    }
+
+    /// R3.4: `{...name}` parses to a trailing catch-all [`Seg::Rest`]; `{name}` stays a single-segment
+    /// param and a literal stays a literal (the nested tree/blob path grammar).
+    #[test]
+    fn parse_pattern_recognizes_the_catch_all_rest_segment() {
+        let segs = parse_pattern("/v1/git/repos/{repo}/tree/{ref}/{...path}");
+        assert!(matches!(segs.last(), Some(Seg::Rest(n)) if n == "path"));
+        assert!(matches!(&segs[3], Seg::Param(n) if n == "repo"));
+        assert!(matches!(&segs[4], Seg::Lit(l) if l == "tree"));
+        // A plain `{path}` is NOT a catch-all.
+        let single = parse_pattern("/v1/git/repos/{repo}/blob/{ref}/{path}");
+        assert!(matches!(single.last(), Some(Seg::Param(n)) if n == "path"));
     }
 
     #[test]

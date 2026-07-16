@@ -51,9 +51,9 @@ export default function PrOverviewScreen() {
       </nav>
 
       <ErrorBoundary
-        fallback={(err) => (
+        fallback={() => (
           <div role="note" data-testid="pr-restricted" style={{ ...card, color: "var(--text-muted)", display: "flex", "align-items": "center", gap: "var(--space-2)" }}>
-            <Icon name="gate" /> <span>This pull request is not available: {String(err.message ?? err)}</span>
+            <Icon name="gate" /> <span>This pull request is not available.</span>
           </div>
         )}
       >

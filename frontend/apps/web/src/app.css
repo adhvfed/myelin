@@ -70,6 +70,25 @@ button {
   color: var(--text-primary);
   background: var(--surface-hover);
 }
+/* Honest treatment for unbuilt destinations (R3.4 §6): muted (one step below --text-muted) + a
+   neutral "soon" dot, NEVER accent, NEVER disabled. Active state stays R1 (--surface-hover fill), text
+   stays muted so the "soon" read holds. */
+.nav-rail-item.soon {
+  color: var(--text-subtle);
+}
+.nav-rail-item.soon[aria-current="page"] {
+  color: var(--text-muted);
+  background: var(--surface-hover);
+}
+.nav-rail-item .soon-dot {
+  position: absolute;
+  top: 4px;
+  inset-inline-end: 5px;
+  width: 5px;
+  height: 5px;
+  border-radius: var(--radius-pill);
+  background: var(--text-subtle);
+}
 
 /* The ⌘K trigger — reads as a muted search field, brightens on hover. */
 .cmdk-trigger {
@@ -88,6 +107,32 @@ button {
 }
 .inbox-button:hover {
   background: var(--surface-hover);
+}
+
+/* The ref-switcher filter input wrapper (R3.4). The gate fix (must-ship #5): the input has NO bare
+   `outline:none`; the wrapper carries a `:focus-within` focus ring so keyboard focus on the filter is
+   visible — the shared token, not a hand-rolled colour. */
+.ref-filter {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-1);
+  background: var(--surface);
+  color: var(--text-muted);
+}
+.ref-filter:focus-within {
+  outline: var(--focus-width, 2px) solid var(--c-focus-ring, var(--focus-ring));
+  outline-offset: var(--focus-offset, 2px);
+}
+.ref-filter-input {
+  flex: 1;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  /* NO `outline:none` — the wrapper's :focus-within ring carries the focus obligation. */
 }
 
 /* The skip link (WCAG 2.4.1 bypass blocks) — visible only on focus. */

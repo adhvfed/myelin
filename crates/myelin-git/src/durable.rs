@@ -196,6 +196,78 @@ pub struct CommitDetail {
     pub files: Vec<FileDelta>,
 }
 
+/// One entry in a nested tree listing (R3.4 repo-browsing). `size` is the blob byte size for files
+/// (`None` for directories) — the tree row's size affordance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeEntryInfo {
+    /// The entry basename (never the full path).
+    pub name: String,
+    /// `true` for a subdirectory (links to `tree/…`), `false` for a file (links to `blob/…`).
+    pub is_dir: bool,
+    /// The blob byte size (files only).
+    pub size: Option<u64>,
+}
+
+/// Resolving a `{...path}` under a ref as a TREE (R3.4). [`TreePathLookup::IsFile`] drives the
+/// tree→blob client redirect (the gate's kind-mismatch decision), never a spurious 404.
+pub enum TreePathLookup {
+    /// The path is a directory — its immediate entries (dirs first, then files, each sorted).
+    Dir(Vec<TreeEntryInfo>),
+    /// The path resolves to a blob → the caller redirects to the blob route.
+    IsFile,
+    /// No such path under the ref.
+    Missing,
+}
+
+/// Resolving a `{...path}` under a ref as a BLOB (R3.4). [`BlobPathLookup::IsDir`] drives the
+/// blob→tree client redirect (kind mismatch).
+pub enum BlobPathLookup {
+    /// The blob bytes + its content-address + server-side binary detection + byte size.
+    Found {
+        /// The raw file bytes.
+        bytes: Vec<u8>,
+        /// The blob content-address (the GF-6 CAS base).
+        oid: Oid,
+        /// `true` if the bytes look binary (a NUL in the first 8000 bytes) — the download-fallback gate.
+        is_binary: bool,
+        /// The blob byte size.
+        size: u64,
+    },
+    /// The path resolves to a directory → the caller redirects to the tree route.
+    IsDir,
+    /// No such path under the ref.
+    Missing,
+}
+
+/// Branches + tags + the default branch for the ref switcher (R3.4). Names are SHORT (no `refs/…`).
+pub struct RefsView {
+    /// `refs/heads/*` as `(short_name, tip)`, sorted.
+    pub branches: Vec<(String, Oid)>,
+    /// `refs/tags/*` as `(short_name, tip)`, sorted.
+    pub tags: Vec<(String, Oid)>,
+    /// HEAD's symbolic target (short), falling back to `main`.
+    pub default_branch: String,
+}
+
+/// The git binary-file heuristic: a NUL byte within the first 8000 bytes marks the content binary
+/// (so the UI renders the download fallback instead of a garbled `split('\n')` text dump — R3.4).
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(8000).any(|b| *b == 0)
+}
+
+/// **Nested-path traversal guard (R3.4).** A tree-relative path may never carry a `..` or `.` segment
+/// or be absolute — such a path can only be an attempt to escape the committed tree (or a malformed
+/// client path), so it resolves to "no such path" cleanly (never a host-file read, never a 500). An
+/// empty/root path is safe (it selects the root tree). Called before `Tree::get_path`.
+fn is_safe_tree_path(clean: &str) -> bool {
+    if clean.is_empty() {
+        return true;
+    }
+    clean
+        .split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
 /// Project a libgit2 commit into the PII-free [`CommitMeta`] read shape.
 fn commit_meta(c: &git2::Commit<'_>) -> CommitMeta {
     let author = c.author();
@@ -545,6 +617,33 @@ impl DurableGitRepo {
     // ── working-tree reads + the single-file commit build (GT-003 web-edit) ──
 
     /// Resolve a ref to its tip commit (`None` if the ref does not exist).
+    /// Resolve a revspec (a bare branch/tag name, an oid, or a fully-qualified `refs/…`) to its commit
+    /// — `None` if it does not resolve (an absent ref/oid is an empty browse, not an error). Uses
+    /// libgit2's `revparse_single` (the same resolution `git show <rev>` uses) so branches, tags, and
+    /// oids all work through the one browse path (R3.4).
+    fn resolve_commit<'r>(
+        &self,
+        repo: &'r git2::Repository,
+        revspec: &str,
+    ) -> Result<Option<git2::Commit<'r>>, DurableError> {
+        match repo.revparse_single(revspec) {
+            Ok(obj) => match obj.peel_to_commit() {
+                Ok(c) => Ok(Some(c)),
+                Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+                Err(e) => Err(git_err("peel_to_commit", e)),
+            },
+            Err(e)
+                if matches!(
+                    e.code(),
+                    git2::ErrorCode::NotFound | git2::ErrorCode::InvalidSpec
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(git_err("revparse_single", e)),
+        }
+    }
+
     fn tip_commit(&self, repo: &git2::Repository, ref_name: &str) -> Result<Option<git2::Oid>, DurableError> {
         match repo.find_reference(ref_name) {
             Ok(r) => Ok(r.target()),
@@ -594,6 +693,235 @@ impl DurableGitRepo {
             out.push((entry.name().unwrap_or_default().to_string(), is_dir));
         }
         out.sort();
+        Ok(out)
+    }
+
+    // ── nested tree-at-path + blob-at-path + ref switcher (R3.4 repo-browsing completeness) ──
+
+    /// Resolve a `{...path}` under a ref as a TREE (R3.4). The root (empty `path`) lists the top-level
+    /// tree; a nested `path` navigates via libgit2's `Tree::get_path` (never a reimplemented walk). If
+    /// the path resolves to a BLOB (a file requested under `tree/`), returns [`TreePathLookup::IsFile`]
+    /// so the caller can client-redirect to the blob route (the gate's kind-mismatch decision) rather
+    /// than a spurious 404; a wholly-absent path is [`TreePathLookup::Missing`]. Entry sizes are read for
+    /// blob children (dirs carry `None`). An absent ref lists as an empty dir (not an error).
+    pub fn tree_at_path(
+        &self,
+        ref_name: &str,
+        path: &str,
+    ) -> Result<TreePathLookup, DurableError> {
+        let repo = self.open_git()?;
+        let Some(commit) = self.resolve_commit(&repo, ref_name)? else {
+            return Ok(TreePathLookup::Dir(Vec::new()));
+        };
+        let root = commit.tree().map_err(|e| git_err("commit tree", e))?;
+        let clean = path.trim_matches('/');
+        if !is_safe_tree_path(clean) {
+            return Ok(TreePathLookup::Missing); // a `..`/absolute path cannot name an in-tree entry.
+        }
+        let tree = if clean.is_empty() {
+            root
+        } else {
+            let entry = match root.get_path(std::path::Path::new(clean)) {
+                Ok(e) => e,
+                Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                    return Ok(TreePathLookup::Missing)
+                }
+                Err(e) => return Err(git_err("tree get_path", e)),
+            };
+            match entry.kind() {
+                Some(git2::ObjectType::Tree) => {
+                    let obj = entry.to_object(&repo).map_err(|e| git_err("entry object", e))?;
+                    obj.as_tree()
+                        .cloned()
+                        .ok_or_else(|| DurableError::Git("tree object not a tree".into()))?
+                }
+                // A file requested under `tree/` → tell the caller to redirect to the blob route.
+                Some(git2::ObjectType::Blob) => return Ok(TreePathLookup::IsFile),
+                _ => return Ok(TreePathLookup::Missing),
+            }
+        };
+        let mut out = Vec::new();
+        for entry in tree.iter() {
+            let is_dir = matches!(entry.kind(), Some(git2::ObjectType::Tree));
+            let size = if is_dir {
+                None
+            } else {
+                entry
+                    .to_object(&repo)
+                    .ok()
+                    .and_then(|o| o.as_blob().map(|b| b.size() as u64))
+            };
+            out.push(TreeEntryInfo {
+                name: entry.name().unwrap_or_default().to_string(),
+                is_dir,
+                size,
+            });
+        }
+        out.sort_by(|a, b| (!a.is_dir, &a.name).cmp(&(!b.is_dir, &b.name)));
+        Ok(TreePathLookup::Dir(out))
+    }
+
+    /// Resolve a `{...path}` under a ref as a BLOB (R3.4 — the nested blob read). Navigates the nested
+    /// path via `Tree::get_path`; a directory requested under `blob/` returns [`BlobPathLookup::IsDir`]
+    /// (the caller client-redirects to the tree route), an absent path is [`BlobPathLookup::Missing`].
+    /// **Binary detection is server-side** (a NUL byte in the first 8000 bytes — the git heuristic) so
+    /// the UI never `split('\n')`s a binary into a garbled dump; the byte size is the real blob size.
+    pub fn read_blob_at_path(
+        &self,
+        ref_name: &str,
+        path: &str,
+    ) -> Result<BlobPathLookup, DurableError> {
+        let repo = self.open_git()?;
+        let Some(commit) = self.resolve_commit(&repo, ref_name)? else {
+            return Ok(BlobPathLookup::Missing);
+        };
+        let root = commit.tree().map_err(|e| git_err("commit tree", e))?;
+        let clean = path.trim_matches('/');
+        if clean.is_empty() {
+            return Ok(BlobPathLookup::IsDir); // the repo root is a tree, not a file.
+        }
+        if !is_safe_tree_path(clean) {
+            return Ok(BlobPathLookup::Missing); // a `..`/absolute path cannot name an in-tree blob.
+        }
+        let entry = match root.get_path(std::path::Path::new(clean)) {
+            Ok(e) => e,
+            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(BlobPathLookup::Missing),
+            Err(e) => return Err(git_err("tree get_path", e)),
+        };
+        match entry.kind() {
+            Some(git2::ObjectType::Blob) => {
+                let obj = entry.to_object(&repo).map_err(|e| git_err("entry object", e))?;
+                let blob = obj
+                    .as_blob()
+                    .ok_or_else(|| DurableError::Git("blob object not a blob".into()))?;
+                let bytes = blob.content().to_vec();
+                let is_binary = looks_binary(&bytes);
+                let size = bytes.len() as u64;
+                Ok(BlobPathLookup::Found {
+                    bytes,
+                    oid: Oid::new(entry.id().to_string()),
+                    is_binary,
+                    size,
+                })
+            }
+            Some(git2::ObjectType::Tree) => Ok(BlobPathLookup::IsDir),
+            _ => Ok(BlobPathLookup::Missing),
+        }
+    }
+
+    /// The branches + tags + default branch for the ref switcher (R3.4). Branches are `refs/heads/*`,
+    /// tags `refs/tags/*` (both as SHORT names); the default branch is HEAD's symbolic target (falling
+    /// back to `main`). Reads the on-disk refdb — never a seeded list.
+    pub fn refs_view(&self) -> Result<RefsView, DurableError> {
+        let repo = self.open_git()?;
+        let mut branches = Vec::new();
+        let mut tags = Vec::new();
+        for (name, oid) in self.list_refs()? {
+            if let Some(b) = name.strip_prefix("refs/heads/") {
+                branches.push((b.to_string(), oid));
+            } else if let Some(t) = name.strip_prefix("refs/tags/") {
+                tags.push((t.to_string(), oid));
+            }
+        }
+        // HEAD's symbolic target names the default branch — but only if that branch actually EXISTS
+        // (libgit2 `init.bare` may leave HEAD pointing at `master` while pushes land on `main`). Resolve
+        // to: HEAD's target if it exists, else `main` if present, else the first branch, else `main`.
+        let head_target = repo
+            .find_reference("HEAD")
+            .ok()
+            .and_then(|h| h.symbolic_target().ok().flatten().map(String::from))
+            .and_then(|t| t.strip_prefix("refs/heads/").map(String::from));
+        let has = |name: &str| branches.iter().any(|(n, _)| n == name);
+        let default_branch = match head_target {
+            Some(t) if has(&t) => t,
+            _ if has("main") => "main".to_string(),
+            _ => branches
+                .first()
+                .map(|(n, _)| n.clone())
+                .unwrap_or_else(|| "main".to_string()),
+        };
+        Ok(RefsView {
+            branches,
+            tags,
+            default_branch,
+        })
+    }
+
+    /// **Per-entry latest commit via ONE bounded history walk (R3.4 gate decision).** Walks the ref's
+    /// history newest-first up to `cap` commits, resolving the newest commit that touched each immediate
+    /// child of `dir_path`. Entries not resolved within the cap are simply absent from the map (the
+    /// caller renders those rows name-only — graceful degrade, never an N-walk-per-entry blow-up). The
+    /// diff is pathspec-scoped to `dir_path` so a deep repo only pays for that subtree.
+    pub fn latest_commits_in_dir(
+        &self,
+        ref_name: &str,
+        dir_path: &str,
+        cap: usize,
+    ) -> Result<std::collections::BTreeMap<String, CommitMeta>, DurableError> {
+        let repo = self.open_git()?;
+        let Some(tip_commit) = self.resolve_commit(&repo, ref_name)? else {
+            return Ok(Default::default());
+        };
+        let tip = tip_commit.id();
+        let prefix = {
+            let c = dir_path.trim_matches('/');
+            if c.is_empty() {
+                String::new()
+            } else {
+                format!("{c}/")
+            }
+        };
+        let mut walk = repo.revwalk().map_err(|e| git_err("revwalk", e))?;
+        walk.set_sorting(git2::Sort::TIME).map_err(|e| git_err("revwalk sort", e))?;
+        walk.push(tip).map_err(|e| git_err("revwalk push", e))?;
+        let mut out: std::collections::BTreeMap<String, CommitMeta> = Default::default();
+        let mut seen = 0usize;
+        for oid_res in walk {
+            if seen >= cap {
+                break;
+            }
+            seen += 1;
+            let oid = oid_res.map_err(|e| git_err("revwalk next", e))?;
+            let commit = repo.find_commit(oid).map_err(|e| git_err("find_commit", e))?;
+            let tree = commit.tree().map_err(|e| git_err("commit tree", e))?;
+            let parent_tree = if commit.parent_count() > 0 {
+                Some(
+                    commit
+                        .parent(0)
+                        .map_err(|e| git_err("parent", e))?
+                        .tree()
+                        .map_err(|e| git_err("parent tree", e))?,
+                )
+            } else {
+                None
+            };
+            let mut opts = git2::DiffOptions::new();
+            if !prefix.is_empty() {
+                opts.pathspec(prefix.trim_end_matches('/'));
+            }
+            let diff = repo
+                .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))
+                .map_err(|e| git_err("diff_tree_to_tree", e))?;
+            let meta = commit_meta(&commit);
+            for delta in diff.deltas() {
+                for file in [delta.new_file().path(), delta.old_file().path()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let p = file.to_string_lossy();
+                    let Some(rel) = p.strip_prefix(&prefix) else {
+                        continue;
+                    };
+                    // The immediate child of dir_path (a file directly here, or the dir it lives in).
+                    let child = rel.split('/').next().unwrap_or_default();
+                    if child.is_empty() {
+                        continue;
+                    }
+                    // First (newest) commit to touch this child wins; later (older) commits don't override.
+                    out.entry(child.to_string()).or_insert_with(|| meta.clone());
+                }
+            }
+        }
         Ok(out)
     }
 
@@ -1560,5 +1888,205 @@ mod tests {
         );
         std::fs::remove_dir_all(&src_root).ok();
         std::fs::remove_dir_all(&dst_root).ok();
+    }
+
+    // ── R3.4 repo-browsing completeness: nested tree/blob, kind mismatch, binary, refs, bounded walk ──
+
+    /// Build a real commit with NESTED content on `refs/heads/main`:
+    /// `README.md` (text), `crates/inner/deep.rs` (text), `assets/logo.bin` (binary — has NUL bytes).
+    /// Returns the seeded [`DurableGitRepo`]. Uses git2 directly (the crate's dep) to construct subtrees
+    /// bottom-up, since [`DurableGitRepo::write_tree`] only builds flat trees.
+    fn seed_nested_repo(root: &std::path::Path) -> DurableGitRepo {
+        let store = DurableGitStore::rooted(root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let git = git2::Repository::open_bare(repo.path()).expect("open bare");
+
+        let readme = git.blob(b"# nested repo\n\nhello\n").unwrap();
+        let deep = git.blob(b"pub fn deep() {}\n").unwrap();
+        let binary = git.blob(&[0x89, b'P', b'N', b'G', 0x00, 0x01, 0x02, 0x00, 0xff]).unwrap();
+
+        // inner tree { deep.rs }
+        let mut b = git.treebuilder(None).unwrap();
+        b.insert("deep.rs", deep, 0o100644).unwrap();
+        let inner = b.write().unwrap();
+        // crates tree { inner/ }
+        let mut b = git.treebuilder(None).unwrap();
+        b.insert("inner", inner, 0o040000).unwrap();
+        let crates = b.write().unwrap();
+        // assets tree { logo.bin }
+        let mut b = git.treebuilder(None).unwrap();
+        b.insert("logo.bin", binary, 0o100644).unwrap();
+        let assets = b.write().unwrap();
+        // root tree { README.md, crates/, assets/ }
+        let mut b = git.treebuilder(None).unwrap();
+        b.insert("README.md", readme, 0o100644).unwrap();
+        b.insert("crates", crates, 0o040000).unwrap();
+        b.insert("assets", assets, 0o040000).unwrap();
+        let root_tree = b.write().unwrap();
+
+        let sig = git2::Signature::now("psn-7@acme.noreply", "psn-7@acme.noreply").unwrap();
+        let tree_obj = git.find_tree(root_tree).unwrap();
+        let commit = git
+            .commit(None, &sig, &sig, "feat: nested seed", &tree_obj, &[])
+            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&Oid::new(commit.to_string())),
+            "seed main",
+            "psn-7@acme.noreply",
+        )
+        .expect("set main");
+        // Also tag it, to prove the ref switcher separates branches from tags.
+        repo.update_ref_cas(
+            "refs/tags/v1.0",
+            None,
+            Some(&Oid::new(commit.to_string())),
+            "tag v1.0",
+            "psn-7@acme.noreply",
+        )
+        .expect("set tag");
+        repo
+    }
+
+    /// **Nested tree navigation + the tree→file kind-mismatch hint (R3.4).**
+    #[test]
+    fn tree_at_path_navigates_nested_dirs_and_flags_a_file() {
+        let root = temp_root("tree-nested");
+        let repo = seed_nested_repo(&root);
+
+        // Root lists README.md + crates/ + assets/, dirs sorted before files.
+        let TreePathLookup::Dir(top) = repo.tree_at_path("main", "").unwrap() else {
+            panic!("root is a dir");
+        };
+        let names: Vec<&str> = top.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["assets", "crates", "README.md"], "dirs first, then files");
+        assert!(top.iter().find(|e| e.name == "assets").unwrap().is_dir);
+        assert!(!top.iter().find(|e| e.name == "README.md").unwrap().is_dir);
+
+        // Nested dir navigation.
+        let TreePathLookup::Dir(inner) = repo.tree_at_path("main", "crates/inner").unwrap() else {
+            panic!("crates/inner is a dir");
+        };
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner[0].name, "deep.rs");
+        assert!(inner[0].size.unwrap() > 0, "a file entry carries its size");
+
+        // A FILE requested under tree/ → IsFile (the client redirects to blob), not a 404.
+        assert!(matches!(
+            repo.tree_at_path("main", "crates/inner/deep.rs").unwrap(),
+            TreePathLookup::IsFile
+        ));
+        // An absent path → Missing.
+        assert!(matches!(
+            repo.tree_at_path("main", "crates/nope").unwrap(),
+            TreePathLookup::Missing
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **Nested blob read + server-side binary detection + the blob→dir kind-mismatch hint (R3.4).**
+    #[test]
+    fn read_blob_at_path_detects_binary_and_flags_a_dir() {
+        let root = temp_root("blob-nested");
+        let repo = seed_nested_repo(&root);
+
+        // A nested TEXT blob: not binary, real size, real oid.
+        let BlobPathLookup::Found { bytes, is_binary, size, .. } =
+            repo.read_blob_at_path("main", "crates/inner/deep.rs").unwrap()
+        else {
+            panic!("deep.rs is a blob");
+        };
+        assert!(!is_binary, "a text file is not binary");
+        assert_eq!(size as usize, bytes.len());
+        assert!(String::from_utf8_lossy(&bytes).contains("deep"));
+
+        // A BINARY blob (NUL bytes): flagged binary so the UI never split('\n')s it.
+        let BlobPathLookup::Found { is_binary, .. } =
+            repo.read_blob_at_path("main", "assets/logo.bin").unwrap()
+        else {
+            panic!("logo.bin is a blob");
+        };
+        assert!(is_binary, "a file with NUL bytes is detected binary server-side");
+
+        // A DIRECTORY requested under blob/ → IsDir (the client redirects to tree), not a 404.
+        assert!(matches!(
+            repo.read_blob_at_path("main", "crates/inner").unwrap(),
+            BlobPathLookup::IsDir
+        ));
+        // The repo root under blob/ is a dir too.
+        assert!(matches!(
+            repo.read_blob_at_path("main", "").unwrap(),
+            BlobPathLookup::IsDir
+        ));
+        // An absent file → Missing.
+        assert!(matches!(
+            repo.read_blob_at_path("main", "no/such/file").unwrap(),
+            BlobPathLookup::Missing
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **Nested-path traversal safety (R3.4): a `../`-laden path never escapes the tree** — libgit2's
+    /// `Tree::get_path` treats the path as tree-relative and refuses to walk above the root, so a
+    /// traversal attempt resolves to Missing (never a file OUTSIDE the committed tree, never a panic).
+    #[test]
+    fn nested_path_traversal_is_contained() {
+        let root = temp_root("traversal");
+        let repo = seed_nested_repo(&root);
+        for escape in [
+            "../../../etc/passwd",
+            "crates/../../etc/passwd",
+            "crates/inner/../../../../secret",
+            "/etc/passwd",
+        ] {
+            // Neither tree nor blob resolution may reach OUTSIDE the committed tree.
+            let t = repo.tree_at_path("main", escape).unwrap();
+            assert!(
+                matches!(t, TreePathLookup::Missing | TreePathLookup::Dir(_) | TreePathLookup::IsFile),
+                "no panic for `{escape}`"
+            );
+            // The load-bearing property: it never yields bytes from OUTSIDE the tree. `../` that happens
+            // to normalise back INTO the tree is fine; what must never happen is escaping it. `/etc/passwd`
+            // and deep `../` escapes resolve to Missing (no host-file bytes).
+            if escape.contains("etc/passwd") || escape.contains("secret") {
+                assert!(
+                    matches!(repo.read_blob_at_path("main", escape).unwrap(), BlobPathLookup::Missing),
+                    "traversal `{escape}` must not read host bytes"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The ref switcher source separates branches from tags + names the default (R3.4).**
+    #[test]
+    fn refs_view_separates_branches_tags_and_default() {
+        let root = temp_root("refs-view");
+        let repo = seed_nested_repo(&root);
+        let view = repo.refs_view().unwrap();
+        assert!(view.branches.iter().any(|(n, _)| n == "main"));
+        assert!(view.tags.iter().any(|(n, _)| n == "v1.0"));
+        assert!(!view.branches.iter().any(|(n, _)| n == "v1.0"), "a tag is not a branch");
+        // The default branch is HEAD's target (init_bare points HEAD at main).
+        assert_eq!(view.default_branch, "main");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The bounded per-entry latest-commit walk resolves the newest touching commit (R3.4).**
+    #[test]
+    fn latest_commits_in_dir_bounded_walk_resolves_entries() {
+        let root = temp_root("latest-walk");
+        let repo = seed_nested_repo(&root);
+        let map = repo.latest_commits_in_dir("main", "", 500).unwrap();
+        // Every top-level entry was introduced by the single seed commit → all resolved.
+        assert!(map.contains_key("README.md"));
+        assert!(map.contains_key("crates"));
+        assert!(map.contains_key("assets"));
+        assert_eq!(map["README.md"].summary, "feat: nested seed");
+        // A cap of ZERO resolves nothing (graceful degrade → name-only rows), never an error.
+        let none = repo.latest_commits_in_dir("main", "", 0).unwrap();
+        assert!(none.is_empty(), "cap 0 → no per-entry commits, degrade to name-only");
+        std::fs::remove_dir_all(&root).ok();
     }
 }

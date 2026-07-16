@@ -32,24 +32,60 @@ export function whoamiJson() {
   };
 }
 
-// Two repos in the verified tenant — a POPULATED one and an EMPTY one — so the screen exercises both
-// the data row AND an unglamorous (empty/onboarding) state. Shapes match RepoHome::to_json exactly.
+// A brief commit projection (the latest-commit bar + per-entry activity — R3.4).
+const LATEST = {
+  short_oid: "b2c3d4e5f607",
+  oid: "b2c3d4e5f60718293a4b5c6d7e8f900112233445",
+  summary: "docs: expand the README",
+  author: "u_dev_operator@acme.noreply",
+  committed_at: 1719446400,
+};
+
+// The acme/myelin working tree (R3.4) — a NESTED structure so the browse surface exercises tree-at-path
+// + nested blobs. `{ file }` = a blob (text unless `binary`), `{ dir }` = a subtree.
+const MYELIN_TREE = {
+  "README.md": {
+    file:
+      "# acme/myelin\n\nThe make-it-real spine.\n\n## Usage\n\n- Browse the tree\n- Open a file\n\nSee `crates/` for the code.\n",
+  },
+  "Cargo.toml": { file: '[workspace]\nmembers = ["crates/*"]\n' },
+  crates: {
+    dir: {
+      "myelin-edge": {
+        dir: {
+          "lib.rs": { file: "pub fn edge() {\n    // the product edge\n}\n" },
+          "README.md": { file: "# myelin-edge\n\nThe product edge crate.\n" },
+        },
+      },
+    },
+  },
+};
+
+// Two repos in the verified tenant — a POPULATED one (enriched: default_branch, full README, latest
+// commit, counts, name+activity entries) and an EMPTY one — so the screen exercises both the data row
+// AND an unglamorous (empty/onboarding) state. Shapes match the R3.4 edge RepoHome VM.
 export const SEED_REPOS = [
   {
     state: "populated",
     slug: "acme/myelin",
+    default_branch: "main",
+    readme: MYELIN_TREE["README.md"].file,
     readme_excerpt: "# acme/myelin\n\nThe make-it-real spine.",
     clone_url: "ssh://git@myelin/acme/myelin.git",
+    latest_commit: LATEST,
+    counts: { branches: 2, tags: 1 },
     entries: [
-      { path: "README.md", is_dir: false },
-      { path: "crates", is_dir: true },
-      { path: "Cargo.toml", is_dir: false },
+      { name: "crates", path: "crates", is_dir: true, latest_commit: LATEST },
+      { name: "Cargo.toml", path: "Cargo.toml", is_dir: false, size: 34, latest_commit: LATEST },
+      { name: "README.md", path: "README.md", is_dir: false, size: 120, latest_commit: LATEST },
     ],
   },
   {
     state: "empty",
     slug: "acme/sandbox",
+    default_branch: "main",
     clone_url: "ssh://git@myelin/acme/sandbox.git",
+    counts: { branches: 0, tags: 0 },
   },
 ];
 
@@ -76,19 +112,95 @@ export function repoHomeJson(repo) {
   return SEED_REPOS.find((r) => bareName(r.slug) === repo) ?? null;
 }
 
-// One file in acme/myelin@main (WebEditForm::to_json).
-const SEED_BLOBS = {
-  "myelin/main/README.md": {
-    path: "README.md",
-    contents: "# acme/myelin\n\nThe make-it-real spine.\n",
+// ── R3.4: the ref switcher + nested tree + enriched blob (all keyed off MYELIN_TREE) ──
+
+/** Walk MYELIN_TREE to a node at `path` (""=root). Returns `{ node, kind }` or null (absent). */
+function walkTree(path) {
+  const parts = (path ?? "").split("/").filter(Boolean);
+  let node = MYELIN_TREE;
+  for (let i = 0; i < parts.length; i++) {
+    const entry = node[parts[i]];
+    if (!entry) return null;
+    if (entry.dir) {
+      node = entry.dir;
+      if (i === parts.length - 1) return { node: entry.dir, kind: "dir" };
+    } else {
+      // A file: only valid if it is the LAST segment.
+      return i === parts.length - 1 ? { node: entry, kind: "file" } : null;
+    }
+  }
+  return { node, kind: "dir" };
+}
+
+function entriesOf(dirNode, base) {
+  return Object.keys(dirNode)
+    .map((name) => {
+      const e = dirNode[name];
+      const full = base ? `${base}/${name}` : name;
+      const is_dir = Boolean(e.dir);
+      const row = { name, path: full, is_dir, latest_commit: LATEST };
+      if (!is_dir) row.size = (e.file ?? "").length;
+      return row;
+    })
+    .sort((a, b) => (a.is_dir === b.is_dir ? a.name.localeCompare(b.name) : a.is_dir ? -1 : 1));
+}
+
+/** GET /v1/git/repos/{repo}/refs → the RefsVM (null = 404). */
+export function refsJson(repo) {
+  if (repo !== "myelin") return null;
+  return {
+    branches: [
+      { name: "main", oid: LATEST.oid, is_default: true },
+      { name: "feature", oid: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334" },
+    ],
+    tags: [{ name: "v0.1", oid: LATEST.oid }],
+    default_branch: "main",
+  };
+}
+
+/** GET /v1/git/repos/{repo}/tree/{ref}/{...path} → the TreeVM (null = 404). */
+export function treeJson(repo, _ref, path) {
+  if (repo !== "myelin") return null;
+  const hit = walkTree(path);
+  if (!hit) return { __status: 404 };
+  if (hit.kind === "file") return { redirect_to_blob: true, ref: _ref, path };
+  const base = (path ?? "").replace(/^\/+|\/+$/g, "");
+  const readme = hit.node["README.md"]?.file ?? null;
+  return { ref: _ref, path: base, entries: entriesOf(hit.node, base), readme };
+}
+
+/** GET /v1/git/repos/{repo}/blob/{ref}/{...path} → the enriched BlobVM (null = 404). */
+export function blobJson(repo, ref, path) {
+  if (repo !== "myelin") return null;
+  const hit = walkTree(path);
+  if (!hit) return { __status: 404 };
+  if (hit.kind === "dir") return { redirect_to_tree: true, ref, path };
+  const content = hit.node.file ?? "";
+  const is_binary = Boolean(hit.node.binary);
+  return {
+    path,
+    contents: is_binary ? "" : content,
     base_oid: "blake3:readmecontentaddress0001",
     viewer_may_edit: true,
-  },
-};
+    is_binary,
+    size_bytes: content.length,
+    is_truncated: false,
+    raw_url: `/v1/git/repos/${repo}/raw/${ref}/${path}`,
+    download_url: `/v1/git/repos/${repo}/download/${ref}/${path}`,
+  };
+}
 
-/** GET /v1/git/repos/{repo}/blob/{ref}/{path} → the WebEditForm ViewModel (null = 404). */
-export function blobJson(repo, ref, path) {
-  return SEED_BLOBS[`${repo}/${ref}/${path}`] ?? null;
+/** GET raw/download bytes (R3.4) — returns `{ body, contentType, attachment }` (null = 404). */
+export function rawBytes(repo, _ref, path, attachment) {
+  if (repo !== "myelin") return null;
+  const hit = walkTree(path);
+  if (!hit || hit.kind !== "file") return null;
+  const filename = path.split("/").pop() || "download";
+  return {
+    body: hit.node.file ?? "",
+    contentType: hit.node.binary ? "application/octet-stream" : "text/plain; charset=utf-8",
+    disposition: `${attachment ? "attachment" : "inline"}; filename="${filename}"`,
+  };
 }
 
 // A real two-commit history for acme/myelin (CommitRow::to_json).
@@ -115,11 +227,25 @@ const SEED_COMMITS = {
   ],
 };
 
-/** GET /v1/git/repos/{repo}/commits/{ref} → the `{items,page}` commit-log envelope (null = 404). */
-export function commitsEnvelope(repo, limit = 50) {
-  const items = SEED_COMMITS[repo];
-  if (!items) return null;
-  return { items, page: { next_cursor: null, limit } };
+/** GET /v1/git/repos/{repo}/commits/{ref} → the `{items,page}` commit-log envelope (null = 404). R3.4:
+ *  bidirectional cursor + honest range/page position (no fabricated total). */
+export function commitsEnvelope(repo, limit = 50, cursor) {
+  const all = SEED_COMMITS[repo];
+  if (!all) return null;
+  const offset = Number.parseInt(cursor ?? "0", 10) || 0;
+  const items = all.slice(offset, offset + limit);
+  const next = offset + limit < all.length ? String(offset + limit) : null;
+  const prev = offset > 0 ? String(Math.max(0, offset - limit)) : null;
+  return {
+    items,
+    page: {
+      next_cursor: next,
+      prev_cursor: prev,
+      limit,
+      offset,
+      range: { from: items.length ? offset + 1 : 0, to: offset + items.length },
+    },
+  };
 }
 
 // The per-commit diff (CommitDiff::to_json).
