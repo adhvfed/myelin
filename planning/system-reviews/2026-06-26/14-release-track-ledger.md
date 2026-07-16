@@ -554,7 +554,12 @@ cost_id idempotency; owns ONLY the CI reporting projection, money-truth stays in
 CT-004d attaches it. Kill-9 durability proven through the store 1/1 + p28 regression 4/4. **CT-004d PREREQ found:**
 Storage `cost_event` [0050] vs CI `cost_event` [ci_0014] table-name collision in the single-binary composition —
 harmless today, must reconcile [CI own DB / distinct name] before a live settle.) · **CT-004b** dispatch trigger consumer live (git.ref.updated→compile→dedup→stamp→resolve→
-reserve_and_start) + the real ci.* parser (a) · **CT-004c** scheduler/lease loop live on `job_queue`
+reserve_and_start) + the real ci.* parser (a) — **PARSER DONE `3e14285`** (`parse_ci_config` TOML+JSON,
+deny_unknown_fields fail-closed, YAML deferred [serde_yaml archived]; structural-validation half, resolver
+keeps DAG/digest/matrix; 17 tests + compose proof). **CONSUMER IN PROGRESS** (live `ci-dispatch.trigger`
+EventHandler → read `.myelin/ci.*` at new_oid via myelin-git read backend → parse → resolve_snapshot →
+persist the atomic reserve/start bundle [ci_run + queued check + ci.run.started]; live pipeline EXECUTION =
+CT-004d) · **CT-004c** scheduler/lease loop live on `job_queue`
 + reaper/autoscaler background loops (a) · **CT-004d** pipeline body + metering bookends live (b,c) ·
 **CT-004e** check/result producers live → closes the X-1 seam to the merge gate (d) · **CT-004f** log
 pipeline live substrate (a; SSE tail is CT-005) · **CT-004g** fleet/residency (c, optional split).
