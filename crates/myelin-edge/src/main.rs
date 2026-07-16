@@ -15,9 +15,9 @@
 
 use myelin_config::{Mode, MyelinConfig};
 use myelin_edge::{
-    register_git_durable, register_git_wire, serve_edge, AuthenticatedActionPolicy,
-    CheckBackedRepoAuthorizer, DurableGitBackend, Gateway, Method, TupleRepoBootstrap,
-    WhoamiHandler,
+    register_git_durable, register_git_wire, serve_edge, AuthProvider, AuthPublicConfig,
+    AuthenticatedActionPolicy, CheckBackedRepoAuthorizer, DurableGitBackend, Gateway, Method,
+    TupleRepoBootstrap, WhoamiHandler,
 };
 use myelin_events::OutboxStore;
 use myelin_identity::FragmentAdmit;
@@ -145,6 +145,30 @@ async fn main() {
         DurablePrincipalBacking::new(provider.clone()),
         handle.clone(),
     );
+    // R3.5 — the UNAUTHENTICATED public auth surface (`GET /v1/auth/config`) the logged-out login
+    // page reads to render honestly: SSO-configured drives the primary button (enabled vs the honest
+    // "SSO unavailable" reason); `dev_login_enabled` (edge `MYELIN_DEV_LOGIN`) belt-and-braces the
+    // frontend's build-time PROD kill switch on the dev seam. Derived from the OIDC config BEFORE it
+    // is moved into the human-login match below. Projects NO secret (issuer/audience/JWKS stay
+    // server-side; only a generic provider label is exposed).
+    let dev_login_enabled = std::env::var("MYELIN_DEV_LOGIN")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let auth_config = match oidc_settings.as_ref() {
+        Some(_) => AuthPublicConfig {
+            sso_configured: true,
+            providers: vec![AuthProvider {
+                id: "oidc".to_string(),
+                label: "Single sign-on".to_string(),
+            }],
+            dev_login_enabled,
+        },
+        None => AuthPublicConfig {
+            sso_configured: false,
+            providers: Vec::new(),
+            dev_login_enabled,
+        },
+    };
     let human_login = Arc::new(match oidc_settings {
         Some(oidc) => {
             let jwks = JwkSet::from_jwks_json(&oidc.jwks_json).unwrap_or_else(|e| {
@@ -246,6 +270,7 @@ async fn main() {
     // test-support-gated double the production binary cannot construct, and the
     // `no-permissive-authorizer-in-prod` scanner keeps it out of this composition root.
     let mut builder = Gateway::builder(authn, human_login, Arc::new(AuthenticatedActionPolicy::mounted()))
+        .with_auth_config(auth_config)
         .route(
             Method::Get,
             "/v1/whoami",
