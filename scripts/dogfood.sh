@@ -28,6 +28,9 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/myelin"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/myelin"
 SEAL_KEY_FILE="${STATE_DIR}/seal.key"
 GIT_ROOT_DEFAULT="${DATA_DIR}/git-data"
+# The git WIRE (clone/fetch/push) runs a real `git` inside a gVisor sandbox, so it needs a git-bearing
+# rootfs staged (scripts/stage-git-rootfs.sh). Default location mirrors resolved_gvisor_git_rootfs().
+GIT_ROOTFS_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/gvisor-assets/git-rootfs"
 
 # Generate the seal key ONCE (0600), reuse thereafter. openssl if present, else /dev/urandom. NEVER
 # regenerated over an existing key (that would orphan the KMS root + every minted token, fail-closed).
@@ -51,9 +54,10 @@ ensure_seal_key() {
 # Print the eval-able env contract: the dev-stack data-layer env + the edge-only env.
 print_env() {
   ensure_seal_key
-  local seal git_root region db_app db_admin
+  local seal git_root git_rootfs region db_app db_admin
   seal="$(cat "${SEAL_KEY_FILE}")"
   git_root="${MYELIN_GIT_ROOT:-${GIT_ROOT_DEFAULT}}"
+  git_rootfs="${MYELIN_GVISOR_GIT_ROOTFS:-${GIT_ROOTFS_DEFAULT}}"
   region="${MYELIN_REGION:-fr-par}"
   # The data-layer contract (DATABASE_URL / S3_* / REDIS_URL / NATS_URL / MYELIN_REGION).
   "${REPO_ROOT}/scripts/dev-stack.sh" env
@@ -73,6 +77,7 @@ export MYELIN_GIT_ROOT="${git_root}"   # on-disk bare-repo root
 export MYELIN_REGION="${region}"       # residency region
 export MYELIN_EDGE_ADDR="\${MYELIN_EDGE_ADDR:-127.0.0.1:8080}"
 export MYELIN_TOKEN_LOGIN="\${MYELIN_TOKEN_LOGIN:-1}"  # surface the operator-token web login in /v1/auth/config
+export MYELIN_GVISOR_GIT_ROOTFS="\${MYELIN_GVISOR_GIT_ROOTFS:-${git_rootfs}}"  # the sandboxed git-wire rootfs (stage-git-rootfs.sh)
 EOF
 }
 
@@ -92,6 +97,11 @@ case "${cmd}" in
     ;;
   edge)
     load_env
+    # Stage the sandboxed git-wire rootfs once (idempotent) so clone/fetch/push work out of the box.
+    if [[ ! -x "${MYELIN_GVISOR_GIT_ROOTFS}/usr/bin/git" ]]; then
+      echo "dogfood: staging the git-wire rootfs (${MYELIN_GVISOR_GIT_ROOTFS}) …" >&2
+      "${REPO_ROOT}/scripts/stage-git-rootfs.sh" >/dev/null || echo "dogfood: WARN git-rootfs staging failed — the git WIRE (clone/push) will not work until it is staged" >&2
+    fi
     echo "dogfood: building + serving the edge on ${MYELIN_EDGE_ADDR} (git root ${MYELIN_GIT_ROOT})" >&2
     exec cargo run --quiet -p myelin-edge --bin edge
     ;;
@@ -114,8 +124,8 @@ case "${cmd}" in
 export MYELIN_EDGE_URL="http://127.0.0.1:8080"
 cd frontend/apps/web && pnpm install && pnpm dev
 # The operator-token login surface is gated by MYELIN_TOKEN_LOGIN=1 on the edge (see \`dogfood.sh env\`);
-# the web login form that consumes it is the SEPARATE frontend deliverable (R4.0 frontend half). Until
-# then, use the CLI: \`myelin login --token <token> --scheme agent\` or a git remote (see docs/dogfood.md).
+# the web login form that consumes it landed in R4.0 (paste the \`edge bootstrap\` token on /login). The
+# CLI (\`myelin login --token <token> --scheme agent\`) and a git remote (see docs/dogfood.md) also work.
 # (Re-run with EXEC=1 ./scripts/dogfood.sh web to actually start it.)
 EOF
     ;;

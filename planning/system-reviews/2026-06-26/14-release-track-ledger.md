@@ -452,13 +452,67 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 
 | Item | What | Status |
 |---|---|---|
-| R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | BACKEND DONE+VERIFIED (commit pending); web login half in progress |
-| R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | BLOCKED ON R4.0 |
+| R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
+| R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | UNBLOCKED — starting |
 | R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | CT-004 grounding scout running |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | AFTER R4.1 |
 | R4.4 | Finding-burndown in Myelin's own tracker (needs minimal issues subsystem; until then findings land in this ledger) | QUEUED |
 
 R4 exit gate: 4 consecutive weeks where the founder never needed GitHub for daily work.
+
+**R4.1 dogfood findings (2026-07-16, drove the REAL edge binary end-to-end — the first act no test covered).**
+Boot + bootstrap + repo-create all worked first try (edge up on :8080, `token_login_enabled:true` served,
+`edge bootstrap --tenant myelin --principal founder` minted a 326-char token, `whoami` 200 / no-token 401,
+`POST /v1/git/repos` 201 durable). Then the real `git push` surfaced what the green oracle tests could not:
+- **F1 (BLOCKER, auth):** the git-wire 401 carries NO `WWW-Authenticate: Basic` header, so a real `git
+  push/clone` using a credential helper/manager/interactive prompt never sends its Basic creds — it fails
+  auth after the unauthenticated probe. The oracle test passed only because it injects the header via
+  `http.extraHeader` (preemptive on every request), bypassing git's challenge-response handshake entirely.
+  Fix: emit `WWW-Authenticate: Basic realm="myelin"` on git-wire-route 401s ONLY (never the JSON API — a
+  browser Basic popup there would wreck the web login UX). `curl -u` worked, proving the decode path is fine.
+- **F2 (BUG):** `GET info/refs?service=git-upload-pack` on an EMPTY repo → HTTP 500 (receive-pack advertise
+  is 200). Empty-repo upload-pack advertise must return an empty ref list (200), not crash.
+- **F5 (ENV/runbook BLOCKER):** with preemptive Bearer, auth passes and the pack uploads, then receive-pack
+  fails at `index-pack`: the sandboxed quarantine needs a staged gVisor git-rootfs at
+  `~/.local/share/gvisor-assets/git-rootfs` (`MYELIN_GVISOR_GIT_ROOTFS`), which `dogfood.sh` never
+  provisions. A base busybox rootfs + host `/usr/bin/git` + its libs ARE present, so it is stageable (the
+  recipe is `crates/myelin-ci-sandbox/tests/git_wire_prod_exec_test.rs::stage_git_rootfs`). Fix: a staging
+  script + `dogfood.sh` wiring `MYELIN_GVISOR_GIT_ROOTFS`.
+- **F3 (papercut):** the repo list advertises `clone_url: ssh://git@myelin/...` but there is NO SSH server;
+  the wire is HTTP-only. Misleading for dogfood — advertise the HTTP wire URL (or omit until SSH lands).
+- **F4 (stale doc):** `dogfood.sh web` help still says the operator-token web login is "the SEPARATE
+  frontend deliverable ... Until then use the CLI" — it landed (`c80a3e6`).
+Continuing the drive PAST the push blockers surfaced the rest of the flow — and it WORKS end-to-end:
+- **F5 FIXED** by `scripts/stage-git-rootfs.sh` (bakes host `git` + libs + git-core helpers + mount points
+  into `~/.local/share/gvisor-assets/git-rootfs` from the base busybox rootfs) — after staging, the push
+  cleared the gVisor `index-pack` quarantine. **F2 was a symptom of F5** (upload-pack advertise shells the
+  sandbox; empty-repo 500 was the absent rootfs) — now 200. Both closed.
+- **F6 (working policy, workflow friction):** the pseudonymous-commit floor (`enforce_pseudonymous_commit`,
+  grammar `<pseudonym>@<tenant>.noreply`) REJECTS real-email history → you cannot bulk-mirror an existing
+  GitHub repo's commits. Correct behavior; the dogfood workflow is `git config user.email
+  <handle>@<tenant>.noreply` going forward (the policy checks grammar+tenant only, NOT ownership — attribution
+  is the authenticated `pusher_pseudonym`, so any well-formed handle passes; `founder@myelin.noreply` works).
+  Aligns with the plan's "GitHub stays read-only for a quarter". Document in the runbook.
+- **F7 (solo-operator):** the default ruleset is `required_approvals: 1` and self-approval is deliberately
+  excluded (`pr_store.rs:231` filters `reviewer != author`), so a solo founder can't merge. Fix for dogfood:
+  `POST .../branch-protection {rulesets:[{ref_pattern:"refs/heads/main",required_approvals:0}]}`. Document.
+- **F8 (UX BLOCKER):** `POST .../prs` without `head_oid` yields a PR that FAILS to merge ("invalid merge head:
+  head_oid  is not a commit"); the API does NOT auto-resolve `head_oid` from `head_ref`. Passing it explicitly
+  works. Fix: resolve head_oid from head_ref at open (and/or at merge). FIX NEEDED.
+- **F9 (BUG):** a fresh repo's default `HEAD` symref is never pointed at `refs/heads/main`, so a real
+  `git clone` warns "remote HEAD refers to nonexistent ref, unable to checkout" (refs+content ARE all
+  present — origin/main had both commits + the merged README). Fix: set HEAD→default branch on first push
+  (or repo create). FIX NEEDED.
+
+**R4.1 CORE ACCEPTANCE PROVEN (2026-07-16):** against the REAL edge binary — bootstrap→token, repo create,
+`git push main` + feature branch (pseudonymous, over the wire, THROUGH the gVisor sandbox), open PR #2 (with
+head_oid), review, set branch protection (0 approvals), `merge` → main advanced durably (`merged:true`), then
+a real `git clone` back recovered BOTH commits + the merged Vision section. The CLI/API + wire half of the
+R3 exit gate is met on production infra. Remaining: the browser half (Playwright vs the real edge — R3's
+suite already proved it vs the dev-edge contract) and the ergonomics fixes F1/F3/F8/F9 + F5 dogfood.sh wiring.
+
+Burndown: F2 closed (symptom of F5). F4, F5 fixed. F6/F7 = documented workflow (not code). F1/F3/F8/F9 = fix
+batch in progress. This IS the R4.4 finding-burndown loop (recorded here until Myelin's own tracker stands up).
 
 **CT-004 grounding (scouted 2026-07-16): RECONCILE + HARDEN, not green-field.** The census line "runs
 no CI work" is true only at the `serve(AppSpec)` layer: scheduler (CI-P12 claim/reap/DRR), pipeline
