@@ -7,11 +7,14 @@ import { Title } from "@solidjs/meta";
 import { A, createAsync } from "@solidjs/router";
 import { Icon, Skeleton } from "@myelin/design-system";
 import { getRepos, type RepoHomeVM } from "~/lib/api";
+import { getViewer } from "~/lib/auth";
 import { bareRepo } from "~/lib/format";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
+import { ReposEmptyState } from "~/components/ReposEmptyState";
 
 export default function ReposScreen() {
   const repos = createAsync(() => getRepos());
+  const viewer = createAsync(() => getViewer());
 
   return (
     <section aria-labelledby="repos-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-4)" }}>
@@ -33,11 +36,7 @@ export default function ReposScreen() {
             {(page) => (
               <Show
                 when={page.items.length > 0}
-                fallback={
-                  <p style={{ color: "var(--text-muted)" }} data-testid="repos-empty">
-                    No repositories in this tenant yet.
-                  </p>
-                }
+                fallback={<ReposEmptyState tenant={viewer()?.tenant ?? "your-org"} />}
               >
                 <ul
                   data-testid="repos-list"

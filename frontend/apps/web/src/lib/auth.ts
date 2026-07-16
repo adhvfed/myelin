@@ -7,13 +7,37 @@ import {
   getSessionRecord,
   issueSession,
 } from "../server/session";
+import { edgeGetPublic } from "../server/gateway";
 import {
   DEV_ACCESS_TOKEN,
   DEV_PRINCIPAL,
   DEV_REFRESH_TOKEN,
   DEV_SCHEME,
 } from "../../dev-edge/dev-contract.mjs";
-import { devLoginAllowed } from "./dev-login-guard";
+import { devLoginAllowed, devSeamAllowed, type DevLoginEnv } from "./dev-login-guard";
+
+/** One SSO provider the login page names on its primary button (edge `GET /v1/auth/config`). */
+export interface AuthProvider {
+  id: string;
+  label: string;
+}
+
+/** The logged-out login page's honest render source — the edge's SSO posture (`sso_configured` +
+ *  `providers`) plus whether the dev seam may render. Fetched UNAUTHENTICATED via
+ *  `GET /v1/auth/config`. `dev_login_enabled` here is the FRONTEND-authoritative render gate (see
+ *  {@link getAuthConfig}), belt-and-braces with the build-time PROD kill switch. */
+export interface AuthConfig {
+  sso_configured: boolean;
+  providers: AuthProvider[];
+  dev_login_enabled: boolean;
+}
+
+/** The edge's raw `/v1/auth/config` shape (its `dev_login_enabled` reflects the EDGE env). */
+interface EdgeAuthConfig {
+  sso_configured?: boolean;
+  providers?: AuthProvider[];
+  dev_login_enabled?: boolean;
+}
 
 /** The PII-free viewer facts the chrome renders (identity menu + residency cue). Null = no session. */
 export interface Viewer {
@@ -105,6 +129,52 @@ export const loginDev = action(async () => {
   });
   throw redirect("/git/repos");
 }, "login-dev");
+
+/**
+ * The logged-out login page's config (R3.5 / OQ-3). Reads the edge's UNAUTHENTICATED
+ * `GET /v1/auth/config` for the SSO posture + provider labels, then computes the FRONTEND-
+ * authoritative `dev_login_enabled` render gate ({@link devSeamAllowed}) — the frontend owns the dev
+ * seam, so its build/env truth wins, with the edge flag as one more required gate. Floor-tolerant: if
+ * the edge is unreachable the page renders fail-closed (SSO unavailable, no dev seam) rather than
+ * throwing — a logged-out user is never shown a stack trace.
+ */
+export const getAuthConfig = query(async (): Promise<AuthConfig> => {
+  "use server";
+  let edge: EdgeAuthConfig = {};
+  try {
+    edge = await edgeGetPublic<EdgeAuthConfig>("/v1/auth/config");
+  } catch {
+    // Fail-closed render: no SSO, no dev seam. The login page still renders (honest "unavailable").
+    edge = { sso_configured: false, providers: [], dev_login_enabled: false };
+  }
+  return {
+    sso_configured: edge.sso_configured ?? false,
+    providers: edge.providers ?? [],
+    // The RENDER gate is the frontend-authoritative composition (build + frontend env + edge flag).
+    dev_login_enabled: devSeamAllowed(
+      edge.dev_login_enabled ?? false,
+      process.env as DevLoginEnv,
+      import.meta.env.PROD,
+    ),
+  };
+}, "auth-config");
+
+/**
+ * **Begin SSO login (R3.5).** The primary button posts here when SSO is configured. VERIFIED FLOOR:
+ * R2.5 landed only the OIDC VERIFICATION half at the edge (`POST /v1/auth/login` validates an ID
+ * token the caller already holds) — there is NO browser authorization-code INITIATION route
+ * (`/v1/auth/oidc/start` → 302 to the IdP does not exist; the edge config carries issuer/audience/
+ * JWKS for verification only, no authorization_endpoint/client_id/redirect_uri). So this action
+ * surfaces the honest login-error state (system-blaming, never the user) rather than fabricating a
+ * redirect that cannot complete. When the interactive initiation half lands, THIS is the seam it
+ * wires into — the button + copy do not change. See `design-planning/09-r3-sketches/05-first-run`.
+ */
+export const startSso = action(async () => {
+  "use server";
+  // The interactive OIDC start is not wired at the edge yet (verify-only, R2.5). Blame the
+  // deployment's missing initiation surface, not the user — same posture as the CI floor.
+  throw redirect("/login?error=sso_start_unavailable");
+}, "start-sso");
 
 /** Log out: clear the server-side session + the cookie, return to /login. */
 export const logout = action(async () => {

@@ -36,6 +36,18 @@ import {
 
 const PORT = Number(process.env.DEV_EDGE_PORT ?? 8787);
 
+// ── Mutable dev-double state (test-controllable, NEVER shipped) ──
+// The dev edge is a clearly-marked test double; a test-control seam on it is legitimate scaffolding
+// (it lets the first-run E2E model a fresh empty tenant + a dev-seam-off deployment against the SAME
+// single harness). Toggled via `POST /__test/config`; reset by the test in a finally.
+const state = {
+  // A fresh tenant has no repos yet — the first-run onboarding empty state.
+  emptyRepos: process.env.DEV_EDGE_EMPTY_REPOS === "1",
+  // Whether the login page's dev seam may render (the `dev_login_enabled` server flag). Default on so
+  // the harness's dev-login seam is reachable; a test flips it off to assert the seam disappears.
+  devLoginEnabled: true,
+};
+
 function send(res, status, json, headers = {}) {
   const body = json === null ? "" : JSON.stringify(json);
   res.writeHead(status, { "content-type": "application/json", ...headers });
@@ -54,6 +66,35 @@ const server = createServer((req, res) => {
   const method = req.method ?? "GET";
 
   if (path === "/healthz") return send(res, 200, { ok: true });
+
+  // R3.5 — the UNAUTHENTICATED public auth surface the logged-out login page reads. Matched BEFORE
+  // the Bearer gate (reachable with no session), exactly like the real edge's built-in route.
+  if (method === "GET" && path === "/v1/auth/config") {
+    return send(res, 200, {
+      // The default real deployment has no IdP configured — the honest "SSO unavailable" render.
+      sso_configured: false,
+      providers: [],
+      dev_login_enabled: state.devLoginEnabled,
+    });
+  }
+
+  // Test-control seam (dev double ONLY — never a real edge route). Flips the fixture's first-run
+  // posture so a single harness can exercise empty-tenant + dev-seam-off.
+  if (method === "POST" && path === "/__test/config") {
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => {
+      try {
+        const body = raw ? JSON.parse(raw) : {};
+        if (typeof body.emptyRepos === "boolean") state.emptyRepos = body.emptyRepos;
+        if (typeof body.devLoginEnabled === "boolean") state.devLoginEnabled = body.devLoginEnabled;
+      } catch {
+        /* ignore malformed control body */
+      }
+      send(res, 200, { ok: true, state });
+    });
+    return;
+  }
 
   // The refresh round-trip: a valid refresh token mints a fresh access token (here, the same dev
   // token — the dev seam's token is long-lived); anything else is a uniform 401.
@@ -98,7 +139,26 @@ const server = createServer((req, res) => {
   if (method === "GET" && path === "/v1/git/repos") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
     const limit = Number(url.searchParams.get("limit") ?? 50);
+    // A fresh tenant (test-controlled) serves the empty envelope → the onboarding empty state.
+    if (state.emptyRepos) return send(res, 200, { items: [], page: { next_cursor: null, limit } });
     return send(res, 200, reposEnvelope(limit));
+  }
+
+  // R3.5 — the unified tenant firehose. The real edge emits typed repo.created/repo.pushed frames
+  // here; the dev double holds the stream OPEN (a keepalive comment) but emits none (the named floor),
+  // so the browser EventSource connects cleanly (no reconnect storm) and the manual Refresh is the
+  // fallback. Bearer-gated like every data route.
+  if (method === "GET" && /^\/v1\/t\/[^/]+\/events$/.test(path)) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+    });
+    res.write(": connected\n\n");
+    const keepalive = setInterval(() => res.write(": keepalive\n\n"), 15000);
+    req.on("close", () => clearInterval(keepalive));
+    return;
   }
 
   // GT-004 + R3.4 browse + PR routes (every one Bearer-gated; a missing seed is the uniform 404).

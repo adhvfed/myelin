@@ -19,6 +19,7 @@ import {
 import { A, useAction, useLocation, useNavigate } from "@solidjs/router";
 import { Icon, Menu, Dialog, useToast, type IconName, type MenuItemSpec } from "@myelin/design-system";
 import { logout, type Viewer } from "../lib/auth";
+import { createInbox } from "../lib/notifications";
 import { CommandPalette, type Command } from "./CommandPalette";
 
 /** The shell context a nested route uses to fill the shell-owned context-pane region (§1b). A route
@@ -138,6 +139,14 @@ export function AppShell(props: AppShellProps) {
   const paneThunk = (): (() => JSX.Element) | null => ctxPaneThunk();
   const hasPane = () => paneThunk() != null;
   const paneLabel = () => ctxPaneLabel();
+  // The inbox binds to REAL notification state (empty today — the honest floor), never a hardcoded
+  // count or demo rows.
+  const inbox = createInbox();
+  const inboxLabel = () => {
+    const n = inbox.unreadCount();
+    if (n === 0) return "Inbox, no unread notifications";
+    return `Inbox, ${n} unread notification${n === 1 ? "" : "s"}`;
+  };
 
   const cycleTheme = () => {
     const el = document.documentElement;
@@ -291,13 +300,15 @@ export function AppShell(props: AppShellProps) {
             </button>
           </Show>
 
-          {/* Inbox affordance — glyph + visible unread count (never color-only; WCAG 1.4.1). */}
+          {/* Inbox affordance — glyph + a visible unread COUNT badge (never color-only; WCAG 1.4.1).
+              Badge + aria-label are driven by REAL notification state: ZERO unread → NO badge, and
+              the accessible name says "no unread notifications" (dissolves firstrun #3 fake inbox). */}
           <button
             type="button"
             class="inbox-button"
             onClick={() => setInboxOpen(true)}
             aria-haspopup="dialog"
-            aria-label="Inbox, 2 unread"
+            aria-label={inboxLabel()}
             style={{
               display: "inline-flex",
               "align-items": "center",
@@ -309,20 +320,23 @@ export function AppShell(props: AppShellProps) {
             }}
           >
             <Icon name="inbox" />
-            <span
-              aria-hidden="true"
-              style={{
-                "min-width": "1.1rem",
-                "text-align": "center",
-                "font-size": "var(--fs-caption)",
-                background: "var(--accent)",
-                color: "var(--on-accent)",
-                "border-radius": "var(--radius-pill)",
-                padding: "0 var(--space-1)",
-              }}
-            >
-              2
-            </span>
+            <Show when={inbox.unreadCount() > 0}>
+              <span
+                data-testid="inbox-badge"
+                aria-hidden="true"
+                style={{
+                  "min-width": "1.1rem",
+                  "text-align": "center",
+                  "font-size": "var(--fs-caption)",
+                  background: "var(--accent)",
+                  color: "var(--on-accent)",
+                  "border-radius": "var(--radius-pill)",
+                  padding: "0 var(--space-1)",
+                }}
+              >
+                {inbox.unreadCount()}
+              </span>
+            </Show>
           </button>
 
           <Menu
@@ -464,23 +478,47 @@ export function AppShell(props: AppShellProps) {
         open={inboxOpen()}
         onClose={() => setInboxOpen(false)}
         title="Inbox"
-        description="Notifications arrive here. Live delivery (SSE) is a later wiring."
+        description="Things that need you land here."
         size="sm"
       >
-        <ul style={{ "list-style": "none", margin: "0", padding: "0", display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
-          <li style={{ display: "flex", gap: "var(--space-2)", "align-items": "center" }}>
-            <Icon name="pull-request" />
-            {/* R3.1 — the inbox PR row is now a real link into the cross-repo "needs review" bucket.
-                (A per-item deep-link to the specific PR lands when the inbox is data-driven — floor.) */}
-            <A href="/prs?bucket=needs-review" onClick={() => setInboxOpen(false)} style={{ color: "var(--text-primary)" }}>
-              A pull request needs your review
-            </A>
-          </li>
-          <li style={{ display: "flex", gap: "var(--space-2)", "align-items": "center" }}>
-            <Icon name="check-pass" />
-            <span>CI passed on acme/myelin</span>
-          </li>
-        </ul>
+        {/* Bound to REAL notification state. Empty today (the honest floor — the durable inbox
+            endpoint + its SSE delivery are a later wiring); NEVER fabricated rows. */}
+        <Show
+          when={inbox.items().length > 0}
+          fallback={
+            <div
+              role="status"
+              data-testid="inbox-empty"
+              style={{ display: "flex", "flex-direction": "column", "align-items": "center", gap: "var(--space-2)", padding: "var(--space-5) var(--space-3)", "text-align": "center", color: "var(--text-muted)" }}
+            >
+              <Icon name="inbox" />
+              <strong style={{ color: "var(--text-primary)" }}>You're all caught up</strong>
+              <span style={{ "font-size": "var(--fs-body-sm)" }}>
+                When a pull request needs your review or someone mentions you, it'll show up here.
+              </span>
+            </div>
+          }
+        >
+          <ul style={{ "list-style": "none", margin: "0", padding: "0", display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
+            <For each={inbox.items()}>
+              {(item) => (
+                <li style={{ display: "flex", gap: "var(--space-2)", "align-items": "center" }}>
+                  <Icon name="inbox" />
+                  <Show
+                    when={item.href}
+                    fallback={<span>{item.title}</span>}
+                  >
+                    {(href) => (
+                      <A href={href()} onClick={() => setInboxOpen(false)} style={{ color: "var(--text-primary)" }}>
+                        {item.title}
+                      </A>
+                    )}
+                  </Show>
+                </li>
+              )}
+            </For>
+          </ul>
+        </Show>
       </Dialog>
     </>
   );

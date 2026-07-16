@@ -10,7 +10,7 @@
 // real `myelin-edge` binary can't yet issue a human a capability token — MR-012 deferred). Pointing
 // this at the real `edge` binary is a one-line env change, not new plumbing.
 
-import { runGateway, Unauthorized } from "./gateway-core";
+import { runGateway, GatewayError, Unauthorized } from "./gateway-core";
 import {
   clearCurrentSession,
   getSessionRecord,
@@ -31,6 +31,25 @@ export async function edgeGet<T = unknown>(path: string): Promise<T> {
 /** POST to the edge (write verbs) through the full auth lifecycle. */
 export async function edgePost<T = unknown>(path: string, body?: unknown): Promise<T> {
   return edgeRequest<T>("POST", path, body);
+}
+
+/**
+ * GET an UNAUTHENTICATED edge endpoint (no Bearer, no session) — for the logged-out `GET
+ * /v1/auth/config` the login page reads before any session exists (R3.5). No auth lifecycle: a
+ * non-2xx is a `GatewayError` the caller may floor-tolerate (the login page falls back to the
+ * fail-closed "SSO unavailable" render if the edge is unreachable). Still server-only — the URL/env
+ * never reach client JS.
+ */
+export async function edgeGetPublic<T = unknown>(path: string): Promise<T> {
+  const res = await fetch(`${edgeUrl()}${path}`, {
+    method: "GET",
+    headers: { accept: "application/json" },
+  });
+  const bodyText = await res.text();
+  if (res.status < 200 || res.status >= 300) {
+    throw new GatewayError(`auth/config GET failed (${res.status})`, res.status, undefined, bodyText);
+  }
+  return JSON.parse(bodyText) as T;
 }
 
 async function edgeRequest<T>(method: string, path: string, body?: unknown): Promise<T> {
