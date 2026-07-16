@@ -926,7 +926,7 @@ impl EventHandler for IncrementalIndexer {
     /// `consumer_dedup` outer guard, rule 1) AND on `doc_id` (the engine's delete-then-add upsert) —
     /// belt and braces. A malformed event is a non-retryable poison; a transient owner hiccup is a
     /// Retry (0 lost — the runtime redelivers, the dedup mark is reverted so it re-runs).
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         match self.index(ev) {
             Ok(()) => HandleOutcome::Done,
             Err(IndexEventError::Malformed(why)) => HandleOutcome::NonRetryable(Reason(why)),
@@ -1103,7 +1103,7 @@ mod tests {
             r,
             serde_json::json!({ "zookie": "zk-7", "version": 3 }),
         );
-        assert_eq!(ix.handle(&ev), HandleOutcome::Done);
+        assert_eq!(ix.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
 
         // The owner's project was fetched (NOT a DB read — the no-cross-db floor; this is the only
         // ingest path).
@@ -1215,7 +1215,7 @@ mod tests {
             "not-a-ref",
             serde_json::json!({}),
         );
-        match ix.handle(&ev) {
+        match ix.handle(&ev, &mut myelin_events::HandlerTx::none()) {
             HandleOutcome::NonRetryable(Reason(r)) => {
                 assert!(r.contains("not a myelin"), "names it: {r}")
             }
@@ -1233,7 +1233,7 @@ mod tests {
         let fetcher = Arc::new(FakeFetcher::with(r, proj_with("x", fields)));
         let ix = indexer_with(vec![issue_spec()], fetcher);
         let ev = event("01J-1", "issue.issue.created", r, serde_json::json!({}));
-        match ix.handle(&ev) {
+        match ix.handle(&ev, &mut myelin_events::HandlerTx::none()) {
             HandleOutcome::NonRetryable(Reason(m)) => {
                 assert!(m.contains("severity"), "names the facet: {m}")
             }
@@ -1256,7 +1256,7 @@ mod tests {
             r,
             serde_json::json!({ "zookie": "z" }),
         );
-        assert_eq!(ix.handle(&ev), HandleOutcome::Done);
+        assert_eq!(ix.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
 
         // The doc carries a vector under the SAME doc_id (one doc-id space, §3.2): a semantic query for
         // the SAME text returns it (the mock embed is deterministic, so the doc's own text is its
@@ -1327,7 +1327,7 @@ mod tests {
             r,
             serde_json::json!({ "zookie": "zk-1" }),
         );
-        assert_eq!(ix.handle(&create), HandleOutcome::Done);
+        assert_eq!(ix.handle(&create, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
         assert_eq!(
             ix.indexed_zookie_of(&tenant(), &region(), r).as_deref(),
             Some("zk-1")
@@ -1341,7 +1341,7 @@ mod tests {
             r,
             serde_json::json!({ "zookie": "zk-2", "refs": [r] }),
         );
-        assert_eq!(ix.handle(&perm), HandleOutcome::Done);
+        assert_eq!(ix.handle(&perm, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
 
         // The doc's indexed_zookie ADVANCED — and the body was NOT re-fetched (same content, new token).
         assert_eq!(
@@ -1374,7 +1374,7 @@ mod tests {
             serde_json::json!({ "zookie": "zk-2", "refs": ["myelin://acme/issue/issue/NONE"] }),
         );
         assert_eq!(
-            ix.handle(&perm),
+            ix.handle(&perm, &mut myelin_events::HandlerTx::none()),
             HandleOutcome::Done,
             "a perm change on an un-indexed object is a no-op"
         );
@@ -1393,7 +1393,7 @@ mod tests {
             serde_json::json!({}),
         );
         assert!(
-            matches!(ix.handle(&perm), HandleOutcome::NonRetryable(_)),
+            matches!(ix.handle(&perm, &mut myelin_events::HandlerTx::none()), HandleOutcome::NonRetryable(_)),
             "missing zookie/refs → poison"
         );
     }
@@ -1412,7 +1412,7 @@ mod tests {
             "issue.issue.created",
             r,
             serde_json::json!({}),
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         assert_eq!(ix.live_count(&tenant(), &region()), 1);
 
         // A `*.erased` removes it (the erasure path, through the live consumer).
@@ -1422,7 +1422,7 @@ mod tests {
             r,
             serde_json::json!({ "ref": r }),
         );
-        assert_eq!(ix.handle(&erased), HandleOutcome::Done);
+        assert_eq!(ix.handle(&erased, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
         assert_eq!(
             ix.live_count(&tenant(), &region()),
             0,
@@ -1442,7 +1442,7 @@ mod tests {
             "issue.issue.created",
             r,
             serde_json::json!({}),
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         assert_eq!(ix.live_count(&tenant(), &region()), 1);
 
         // The owner now projects GONE (the artifact was deleted) — a re-index removes the doc.
@@ -1453,7 +1453,7 @@ mod tests {
                 "issue.issue.updated",
                 r,
                 serde_json::json!({})
-            )),
+            ), &mut myelin_events::HandlerTx::none()),
             HandleOutcome::Done
         );
         assert_eq!(
@@ -1480,7 +1480,7 @@ mod tests {
             sub_ref,
             serde_json::json!({}),
         );
-        assert_eq!(ix.handle(&ev), HandleOutcome::Done);
+        assert_eq!(ix.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
 
         // The doc is keyed by the full sub-URN; the ACL clause that admits it pins on the PARENT.
         let by_parent = ix
@@ -1617,7 +1617,7 @@ mod tests {
 
         // First handle: the owner is down → Retry (NOT a poison, NOT a fabricated empty doc).
         assert!(
-            matches!(ix.handle(&ev), HandleOutcome::Retry(_)),
+            matches!(ix.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Retry(_)),
             "a transient hiccup retries"
         );
         assert_eq!(
@@ -1627,7 +1627,7 @@ mod tests {
         );
         // Redelivery: the owner is back → Done, the doc indexes (0 lost).
         assert_eq!(
-            ix.handle(&ev),
+            ix.handle(&ev, &mut myelin_events::HandlerTx::none()),
             HandleOutcome::Done,
             "the redelivery succeeds"
         );
@@ -1653,7 +1653,7 @@ mod tests {
             "issue.issue.created",
             r,
             serde_json::json!({}),
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         assert_eq!(
             ix.index_lag(),
             0,

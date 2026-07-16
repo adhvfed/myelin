@@ -240,7 +240,7 @@ fn transient_owner_unavailable_retries_never_fabricates() {
 
     // First handle: the owner is down → Retry (NOT acked, NOT a poison, NOTHING indexed).
     assert!(
-        matches!(indexer.handle(&ev), HandleOutcome::Retry(_)),
+        matches!(indexer.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Retry(_)),
         "a transient hiccup retries"
     );
     assert_eq!(
@@ -250,7 +250,7 @@ fn transient_owner_unavailable_retries_never_fabricates() {
     );
     // Redelivery: the owner is back → Done, the doc indexes (0 lost).
     assert_eq!(
-        indexer.handle(&ev),
+        indexer.handle(&ev, &mut myelin_events::HandlerTx::none()),
         HandleOutcome::Done,
         "the redelivery succeeds"
     );

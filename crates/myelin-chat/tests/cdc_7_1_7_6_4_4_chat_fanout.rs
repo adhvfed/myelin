@@ -101,7 +101,7 @@ fn seed_engine(deltas: &[TupleDelta]) -> Expand {
     let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
     relay.drain_to_empty();
     for env in bus.consume("") {
-        consumer.handle(&env);
+        consumer.handle(&env, &mut myelin_events::HandlerTx::none());
     }
     Expand::new(store, NamespaceEngine::with_core_hierarchy(), index)
 }

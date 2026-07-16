@@ -159,8 +159,8 @@ fn consumer_inbound_signal_delegates_and_is_idempotent_past_the_event_id_guard()
     let run = start_a_run(&ex);
     let consumer = FlowSignalConsumer::new(ex.clone(), subjects());
 
-    let first = consumer.handle(&signal_event(&run, "job.done", "tok-1", "evt-1"));
-    let second = consumer.handle(&signal_event(&run, "job.done", "tok-1", "evt-2"));
+    let first = consumer.handle(&signal_event(&run, "job.done", "tok-1", "evt-1"), &mut myelin_events::HandlerTx::none());
+    let second = consumer.handle(&signal_event(&run, "job.done", "tok-1", "evt-2"), &mut myelin_events::HandlerTx::none());
     assert_eq!(
         first,
         HandleOutcome::Done,
@@ -205,7 +205,7 @@ fn the_bus_path_and_the_direct_path_produce_the_same_buffered_signal() {
     let ex_bus = executor();
     let run_b = start_a_run(&ex_bus);
     let consumer = FlowSignalConsumer::new(ex_bus.clone(), subjects());
-    consumer.handle(&signal_event(&run_b, "approval", "card-7", "evt-1"));
+    consumer.handle(&signal_event(&run_b, "approval", "card-7", "evt-1"), &mut myelin_events::HandlerTx::none());
     let bus = ex_bus
         .signals()
         .get(&tenant(), &run_b.0, "approval", "card-7")
@@ -236,7 +236,7 @@ fn a_malformed_inbound_signal_is_surfaced_through_the_consumer_seam() {
     let mut ev = signal_event(&run, "job.done", "tok-1", "evt-1");
     ev.payload = serde_json::json!({ "signal_name": "job.done" }); // no idem_key → poison.
     assert!(
-        matches!(consumer.handle(&ev), HandleOutcome::NonRetryable(_)),
+        matches!(consumer.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::NonRetryable(_)),
         "a malformed signal is non-retryable poison (dead-lettered), never a silent drop"
     );
     assert_eq!(

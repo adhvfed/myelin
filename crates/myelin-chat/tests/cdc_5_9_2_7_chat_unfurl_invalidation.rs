@@ -103,7 +103,7 @@ fn cdc_5_9_ci_check_updated_busts_the_chat_unfurl_card() {
 
     // PROVIDER: a `ci.check.updated` on the PR ref → CONSUMER busts the shared entry, returns Done.
     let ev = producer_event(CI_CHECK_UPDATED, PR_REF);
-    assert_eq!(invalidator.handle(&ev), HandleOutcome::Done);
+    assert_eq!(invalidator.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
     assert!(
         !cache.contains(&RefsRef(PR_REF.into())),
         "the ci.check.updated busted the chat unfurl card (it re-resolves the fresh check state)"
@@ -127,7 +127,7 @@ fn cdc_2_7_erased_busts_the_chat_unfurl_card() {
 
     // PROVIDER: an `issue.issue.erased` on the issue ref → CONSUMER busts the shared entry.
     let ev = producer_event("issue.issue.erased", ISSUE_REF);
-    assert_eq!(invalidator.handle(&ev), HandleOutcome::Done);
+    assert_eq!(invalidator.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
     assert!(
         !cache.contains(&RefsRef(ISSUE_REF.into())),
         "the *.erased busted the chat unfurl card (no durable snapshot; re-resolves to a tombstone)"
@@ -142,9 +142,9 @@ fn cdc_5_9_2_7_consumer_is_idempotent_on_redelivery() {
     let invalidator = UnfurlInvalidator::new(cache.clone());
 
     let ev = producer_event(CI_CHECK_UPDATED, PR_REF);
-    assert_eq!(invalidator.handle(&ev), HandleOutcome::Done);
+    assert_eq!(invalidator.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
     // redelivery (at-least-once): still Done, still busted, never an error.
-    assert_eq!(invalidator.handle(&ev), HandleOutcome::Done);
+    assert_eq!(invalidator.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
     assert!(!cache.contains(&RefsRef(PR_REF.into())));
 }
 

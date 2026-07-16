@@ -97,7 +97,7 @@ impl EventHandler for CurrentShapeHandler {
         // the same prefix). The runtime rejects a `*` subscription at bind time.
         &[]
     }
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         self.seen_ver.store(ev.schema_ver, Ordering::SeqCst);
         if ev
             .payload

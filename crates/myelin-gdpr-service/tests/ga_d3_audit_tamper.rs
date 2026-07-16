@@ -83,7 +83,7 @@ fn ga_d3_a_retroactive_edit_is_detected_three_independent_ways() {
             &format!("01J-{i}"),
             "acme",
             &format!("myelin://acme/x/{i}"),
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         assert_eq!(outcome, myelin_events::HandleOutcome::Done);
     }
 
@@ -178,7 +178,7 @@ fn ga_d3_a_deleted_entry_is_detected() {
             &format!("01J-{i}"),
             "acme",
             &format!("myelin://acme/x/{i}"),
-        ));
+        ), &mut myelin_events::HandlerTx::none());
     }
     let published = auth.signed_tree_head(&tenant, "t").unwrap();
 

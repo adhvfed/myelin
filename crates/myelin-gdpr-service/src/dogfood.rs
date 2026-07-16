@@ -190,7 +190,7 @@ pub fn run_audit_consumer_on_dogfood(now_iso: &str) -> AuditDogfoodArtifact {
         let ev = dogfood_event(*action, i);
         // The consumer IS the EventHandler — `handle` is the live append path (the SAME path the
         // outbox subscription drives; it appends one minimised audit entry and returns `Done`).
-        let outcome = consumer.handle(&ev);
+        let outcome = consumer.handle(&ev, &mut myelin_events::HandlerTx::none());
         debug_assert_eq!(outcome, myelin_events::HandleOutcome::Done);
         *by_surface.entry(*action).or_insert(0) += 1;
     }

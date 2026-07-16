@@ -580,7 +580,7 @@ pub fn re_erase_at_backup_scale(
 
     // ── (1) STEADY-STATE: ingest every edge + warm every cached title (sealed under per-subject DEKs). ──
     for edge in &corpus.edges {
-        builder.handle(&corpus.edge_event(edge));
+        builder.handle(&corpus.edge_event(edge), &mut myelin_events::HandlerTx::none());
     }
     let mut subject_keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for subject_id in &corpus.subjects {
@@ -640,7 +640,7 @@ pub fn re_erase_at_backup_scale(
     //     post-backup tombstone.
     for edge in &corpus.edges {
         if subjects_to_erase.contains(&edge.subject_id) {
-            builder.handle(&corpus.edge_event(edge));
+            builder.handle(&corpus.edge_event(edge), &mut myelin_events::HandlerTx::none());
         }
     }
 

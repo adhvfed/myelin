@@ -231,7 +231,7 @@ fn chained_hit_then_updated_then_miss_then_re_resolve_through_the_chokepoint() {
     owner.set_outcome(SyntheticOwner::live("v2 title (fresh)")); // the owner now has a fresh title
     let inv = RefsProjectionInvalidator::with_cache(Arc::new(cache.clone()));
     assert_eq!(
-        inv.handle(&lifecycle_event("01J-u", "issue.issue.updated", &ref_.0)),
+        inv.handle(&lifecycle_event("01J-u", "issue.issue.updated", &ref_.0), &mut myelin_events::HandlerTx::none()),
         HandleOutcome::Done,
         "the *.updated busts the live cache entry"
     );
@@ -301,7 +301,7 @@ fn on_erasure_the_cache_re_resolves_never_serving_stale() {
     // the *.erased busts the entry; the owner now reports the artifact ERASED.
     let inv = RefsProjectionInvalidator::with_cache(Arc::new(cache.clone()));
     assert_eq!(
-        inv.handle(&lifecycle_event("01J-e", "issue.issue.erased", &ref_.0)),
+        inv.handle(&lifecycle_event("01J-e", "issue.issue.erased", &ref_.0), &mut myelin_events::HandlerTx::none()),
         HandleOutcome::Done,
         "the *.erased busts the cached title"
     );

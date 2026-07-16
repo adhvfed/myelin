@@ -75,7 +75,7 @@ fn feed_pending(outbox: &OutboxStore, consumer: &ReverseIndexConsumer) {
     let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
     relay.drain_to_empty();
     for env in bus.consume("") {
-        consumer.handle(&env);
+        consumer.handle(&env, &mut myelin_events::HandlerTx::none());
     }
 }
 

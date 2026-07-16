@@ -155,7 +155,7 @@ fn producer_reflex_consumer_binds_a_star_free_foreign_whitelist() {
         );
     }
     // the handle returns a terminal outcome for a well-formed reflex event.
-    let outcome = consumer.handle(&merge_event("p-1", "success"));
+    let outcome = consumer.handle(&merge_event("p-1", "success"), &mut myelin_events::HandlerTx::none());
     assert_eq!(outcome, HandleOutcome::Done);
 }
 

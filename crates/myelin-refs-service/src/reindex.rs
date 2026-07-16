@@ -380,7 +380,7 @@ impl RefsReindexer {
             })?;
             // The SAME `handle` the live consumer runs — `handle` routes the `.snapshot` type to
             // `apply_created` (cold == live). A poison snapshot surfaces LOUDLY (fail-closed).
-            match self.builder.handle(&row.envelope) {
+            match self.builder.handle(&row.envelope, &mut myelin_events::HandlerTx::none()) {
                 myelin_events::HandleOutcome::Done => ingested += 1,
                 myelin_events::HandleOutcome::NonRetryable(myelin_events::Reason(r)) => {
                     return Err(ReindexError::Poison(r));

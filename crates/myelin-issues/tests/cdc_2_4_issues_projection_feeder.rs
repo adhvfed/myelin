@@ -83,7 +83,7 @@ fn producer_issues_authors_a_star_free_issue_updated_handler() {
         "the feeder NEVER binds a wildcard subscription (BUS-3)"
     );
     // handle returns a terminal HandleOutcome (Done for a well-formed issue.updated).
-    let outcome = feeder.handle(&updated_event("p-1", "bug", &["severity"]));
+    let outcome = feeder.handle(&updated_event("p-1", "bug", &["severity"]), &mut myelin_events::HandlerTx::none());
     assert_eq!(outcome, HandleOutcome::Done);
 }
 

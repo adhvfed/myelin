@@ -44,11 +44,19 @@
 //! [`DedupLedger`]** whose semantics are byte-for-byte the 2.5 contract: `(consumer, event_id)` is
 //! the PK (a second insert of the same pair is the no-op idempotency check), per-consumer so two
 //! consumers of the same event each process it once. The frozen DDL
-//! ([`CONSUMER_DEDUP_MIGRATION`]) is the shape the runner applies. **Floor:** the real
-//! `INSERT … ON CONFLICT DO NOTHING` against the Storage pool, executed in the SAME transaction as
-//! the handler's state write (so the dedup mark and the side effect commit together — the
-//! atomicity that makes idempotency real, not best-effort), lands when the OLTP client is wired
-//! (P-007) + the consumer runtime runs inside `serve` (**P-S12**). The seam shape (the
+//! ([`CONSUMER_DEDUP_MIGRATION`]) is the shape the runner applies.
+//!
+//! ## The same-transaction co-commit — DELIVERED, no longer a floor (peer-review #7 / MR-023b)
+//! The real `INSERT … ON CONFLICT DO NOTHING` against the Storage pool is now executed in the SAME
+//! transaction as the handler's state write (so the dedup mark and the side effect commit together
+//! — the atomicity that makes idempotency real, not best-effort). This USED TO BE a named floor
+//! ("lands when the consumer runtime threads a tx into the handler"); it is now the shipped seam:
+//! [`DedupLedger::begin_co_commit`] opens ONE transaction, INSERTs the mark within it, and hands the
+//! transaction-bound connection to the handler (via [`crate::HandlerTx`]) so the effect co-commits;
+//! the [`crate::consumer::Consumer`] runtime commits on `Done` / rolls back on `Retry`/failure. A
+//! crash before commit leaves NEITHER the mark NOR the effect → a redelivery re-runs
+//! (exactly-once-with-effect), closing the old at-most-once floor. The durable impl is
+//! `myelin_storage::events_durable::DurableDedupBacking::begin_co_commit`. The seam shape (the
 //! `(consumer, event_id)` key, the `mark_handled` primitive) does NOT change.
 
 use crate::ConsumerName;
@@ -80,6 +88,44 @@ CREATE TABLE IF NOT EXISTS consumer_dedup (
     CONSTRAINT consumer_dedup_pk PRIMARY KEY (consumer, event_id)
 );";
 
+/// **Why a co-commit transaction failed (peer-review #7 / MR-023b).** Surfaced (never swallowed):
+/// a failed commit means the dedup mark + the handler's effect did NOT land, so the consumer runtime
+/// treats it like a `Retry` (do NOT ack — a redelivery re-runs; 0 lost).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoCommitError(pub String);
+
+impl core::fmt::Display for CoCommitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "consumer co-commit failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for CoCommitError {}
+
+/// **The same-transaction co-commit handle (peer-review #7 / MR-023b — the atomicity that makes
+/// idempotency real, not best-effort).** The consumer runtime opens ONE transaction via
+/// [`DedupLedger::begin_co_commit`], which INSERTs the `(consumer, event_id)` dedup mark WITHIN it
+/// (the freshness check) and returns this handle; the runtime hands the handler the
+/// transaction-bound connection (via [`crate::HandlerTx`]) so the handler's durable state write runs
+/// on the SAME transaction, then the runtime [`commit`](CoCommitTx::commit)s (mark + effect land
+/// together) on `Done` or [`rollback`](CoCommitTx::rollback)s (both vanish) on `Retry`/failure. A
+/// crash before commit leaves NEITHER, so a redelivery re-runs — exactly-once-with-effect, never a
+/// committed mark with a lost effect (the old at-most-once floor).
+///
+/// The handle is boxed + `Send` so the sync consumer runtime can move it across the outcome match.
+/// `myelin-events` is a §2.9 DAG SINK, so the connection is type-erased behind `&mut dyn Any`; the
+/// durable PG impl lives in `myelin_storage::events_durable`.
+pub trait CoCommitTx: Send {
+    /// The type-erased, transaction-bound DB connection the handler runs its writes on — the SAME
+    /// transaction the dedup mark is in. `None` on the in-memory model backend (no shared-DB write).
+    fn connection(&mut self) -> Option<&mut dyn core::any::Any>;
+    /// Commit — the dedup mark + the handler's writes become durable together (`Done`).
+    fn commit(self: Box<Self>) -> Result<(), CoCommitError>;
+    /// Roll back — the dedup mark + the handler's writes vanish so a redelivery re-runs (`Retry` /
+    /// a `Deduplicated` no-op where nothing needs to persist).
+    fn rollback(self: Box<Self>);
+}
+
 /// **The durable backing seam for the `consumer_dedup` ledger (SI-023, MR-023).** A real
 /// `(consumer, event_id)` PK table over the OLTP pool implements this so consumer idempotency
 /// **survives a process restart**: a redelivered event after a restart is still deduped because the
@@ -89,14 +135,16 @@ CREATE TABLE IF NOT EXISTS consumer_dedup (
 /// internally (`block_in_place` + `block_on`), the same bridge [`crate::nats::NatsJetStreamBus`]
 /// uses (the production impl is `myelin_storage::events_durable::DurableDedupBacking`).
 ///
-/// **The atomicity FLOOR (named, not silently skipped — MR-023b):** the in-the-SAME-transaction-
-/// as-the-handler's-state-write co-commit (so a rolled-back handler rolls back its dedup mark for
-/// free) requires the consumer runtime to thread a transaction INTO the handler — a runtime change
-/// beyond this seam. THIS seam delivers **durability-across-restart** (the mark persists); the
-/// same-tx atomicity stays the documented floor [`crate::consumer`] already names. Fail-direction:
-/// when a durable [`DurableDedup::mark_handled`] cannot reach the DB it MUST report FRESH (run the
-/// handler), never a silent "already handled" (which would be a skipped → lost event) — effectively-
-/// once degrades to at-least-once under a DB outage, never to data loss.
+/// **The same-tx atomicity is now DELIVERED, not a floor (peer-review #7 / MR-023b — FIXED):**
+/// [`begin_co_commit`](DurableDedup::begin_co_commit) opens ONE transaction, sets the `(tenant,
+/// region)` RLS scope, INSERTs the dedup mark within it, and returns a [`CoCommitTx`] the consumer
+/// runtime commits AFTER the handler's write co-commits (or rolls back on failure). So a rolled-back
+/// handler rolls back its dedup mark for free — the in-the-SAME-transaction-as-the-handler's-
+/// state-write co-commit the module docs used to name only as a floor. Fail-direction: when a
+/// durable [`DurableDedup::mark_handled`] / [`begin_co_commit`](DurableDedup::begin_co_commit)
+/// cannot reach the DB it MUST report FRESH (run the handler), never a silent "already handled"
+/// (which would be a skipped → lost event) — effectively-once degrades to at-least-once under a DB
+/// outage, never to data loss.
 pub trait DurableDedup: Send + Sync {
     /// `INSERT (consumer, event_id) ON CONFLICT DO NOTHING` → `true` iff freshly inserted.
     fn mark_handled(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool;
@@ -106,6 +154,20 @@ pub trait DurableDedup: Send + Sync {
     fn revert(&self, consumer: &ConsumerName, event_id: &crate::EventId);
     /// Forget the pair (the reindex-after-wipe path); `true` iff a mark was removed.
     fn forget(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool;
+    /// **Open the same-transaction co-commit (peer-review #7 / MR-023b).** Acquire a connection,
+    /// BEGIN, set the `(tenant, region)` GUC transaction-scoped (RLS, the `with_tenant_tx`
+    /// convention), `INSERT (consumer, event_id) ON CONFLICT DO NOTHING` WITHIN the transaction, and
+    /// return `(handle, fresh)`: `fresh == true` iff the mark was newly inserted (run the handler on
+    /// this tx). The runtime commits the handle on `Done` (mark + effect together) or rolls it back
+    /// on `Retry`/failure (both vanish). Fail-direction: on a DB error report FRESH with a no-op
+    /// handle (run the handler, at-least-once), NEVER a silent "already handled".
+    fn begin_co_commit(
+        &self,
+        consumer: &ConsumerName,
+        event_id: &crate::EventId,
+        tenant: &crate::TenantId,
+        region: &crate::Region,
+    ) -> (Box<dyn CoCommitTx>, bool);
 }
 
 /// The dedup-ledger backend (MR-023, the MR-007/008 backend-enum pattern). `Memory` is the
@@ -137,6 +199,40 @@ enum DedupBackend {
 impl Default for DedupBackend {
     fn default() -> Self {
         DedupBackend::Memory(Arc::new(Mutex::new(HashSet::new())))
+    }
+}
+
+/// **The in-memory co-commit handle (peer-review #7 / MR-023b) — TEST DOUBLE.** Models the
+/// same-transaction atomicity of the durable path against the in-memory `HashSet`: `begin_co_commit`
+/// already inserted the `(consumer, event_id)` mark; `commit` KEEPS it (the effect "landed"),
+/// `rollback` REMOVES it iff this call inserted it (a `Retry`/failure re-runs on redelivery — this
+/// IS the old `revert`, now structural). Carries no connection (an in-memory handler writes to its
+/// own state, not a shared DB). Compiled only under `#[cfg(any(test, feature = "test-support"))]`.
+#[cfg(any(test, feature = "test-support"))]
+struct MemoryCoCommit {
+    set: Arc<Mutex<HashSet<(ConsumerName, crate::EventId)>>>,
+    key: (ConsumerName, crate::EventId),
+    /// Whether THIS begin inserted the mark (fresh). A rollback only removes a mark it inserted, so
+    /// rolling back a duplicate delivery never disturbs the pre-existing mark.
+    inserted: bool,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl CoCommitTx for MemoryCoCommit {
+    fn connection(&mut self) -> Option<&mut dyn core::any::Any> {
+        None
+    }
+    fn commit(self: Box<Self>) -> Result<(), CoCommitError> {
+        // Keep the mark — the (in-memory) effect and the mark "co-commit". Nothing to persist.
+        Ok(())
+    }
+    fn rollback(self: Box<Self>) {
+        if self.inserted {
+            self.set
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.key);
+        }
     }
 }
 
@@ -216,6 +312,45 @@ impl DedupLedger {
         }
     }
 
+    /// **Open the same-transaction co-commit for one delivery (peer-review #7 / MR-023b — FIXED).**
+    /// Returns `(handle, fresh)`: the handle carries a transaction with the `(consumer, event_id)`
+    /// dedup mark already INSERTed within it (not yet committed), and `fresh == true` iff the mark
+    /// was newly inserted (the handler should run on this tx). The consumer runtime commits the
+    /// handle on `Done` (the dedup mark + the handler's durable effect land together) or rolls it
+    /// back on `Retry`/failure (both vanish, so a redelivery re-runs — no lost effect). On the
+    /// in-memory backend the handle models this atomicity: commit keeps the mark, rollback removes
+    /// it (the old `revert`, now structural). `tenant`/`region` scope the durable tx's RLS (ignored
+    /// in memory).
+    pub fn begin_co_commit(
+        &self,
+        consumer: &ConsumerName,
+        event_id: &crate::EventId,
+        tenant: &crate::TenantId,
+        region: &crate::Region,
+    ) -> (Box<dyn CoCommitTx>, bool) {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            DedupBackend::Memory(inner) => {
+                let key = (consumer.clone(), event_id.clone());
+                // The `INSERT … ON CONFLICT DO NOTHING` model: `insert` returns `true` iff the pair
+                // was newly added (FRESH). A duplicate leaves the existing mark untouched.
+                let fresh = inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key.clone());
+                (
+                    Box::new(MemoryCoCommit {
+                        set: Arc::clone(inner),
+                        key,
+                        inserted: fresh,
+                    }),
+                    fresh,
+                )
+            }
+            DedupBackend::Durable(d) => d.begin_co_commit(consumer, event_id, tenant, region),
+        }
+    }
+
     /// Has `(consumer, event_id)` already been handled? (Read-only check; `mark_handled` is the
     /// transactional one.)
     pub fn is_handled(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool {
@@ -232,10 +367,15 @@ impl DedupLedger {
     /// Remove `(consumer, event_id)` from the ledger. A consumer-template `Retry` is NOT a
     /// completed handle, so the runtime reverts the mark a delivery speculatively took — a later
     /// redelivery must re-run the handler (else a transient failure would be permanently swallowed:
-    /// silent data loss). The real `consumer_dedup` row is written in the SAME transaction as the
-    /// handler's state write (P-007/P-S12; the same-tx atomicity floor — MR-023b), so a rolled-back
-    /// handler rolls back its dedup mark for free — this models that atomicity. Crate-internal.
-    pub(crate) fn revert(&self, consumer: &ConsumerName, event_id: &crate::EventId) {
+    /// silent data loss). With the #7/MR-023b co-commit the runtime's `Retry` path rolls back the
+    /// whole co-commit transaction (mark + effect together) rather than calling this — so this verb
+    /// is now the standalone mirror for the reindex / manual paths.
+    ///
+    /// **Superseded internally by [`DedupLedger::begin_co_commit`] (#7/MR-023b):** the consumer
+    /// runtime no longer speculatively marks-then-reverts — a `Retry` rolls back the co-commit
+    /// transaction (which removes the mark atomically with the handler's effect). This verb is kept
+    /// as the ledger's explicit mirror of [`DurableDedup::revert`] (the reindex / manual paths).
+    pub fn revert(&self, consumer: &ConsumerName, event_id: &crate::EventId) {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             DedupBackend::Memory(inner) => {

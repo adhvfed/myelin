@@ -623,7 +623,7 @@ impl EventHandler for AuditConsumer {
     /// envelope (no external dependency can make it fail), so it never retries or dead-letters —
     /// the consumer runtime's idempotency (dedup on `event_id`) guarantees a redelivery is a no-op,
     /// so the same action is never double-appended.
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         self.append_event(ev);
         HandleOutcome::Done
     }
@@ -708,7 +708,7 @@ mod tests {
             "01J-root",
             None,
         );
-        assert_eq!(c.handle(&ev), HandleOutcome::Done);
+        assert_eq!(c.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
 
         let tenant = TenantId("acme".into());
         let entries = c.log().entries_for(&tenant);
@@ -760,7 +760,7 @@ mod tests {
             "01J-root",
             None,
         );
-        c.handle(&ev);
+        c.handle(&ev, &mut myelin_events::HandlerTx::none());
         let e = &c.log().entries_for(&TenantId("acme".into()))[0];
 
         // The frozen pseudonym grammar `<pseudonym>@<tenant>.noreply` (contract 4.8).
@@ -799,7 +799,7 @@ mod tests {
             "01J-root",
             None,
         );
-        c.handle(&ev);
+        c.handle(&ev, &mut myelin_events::HandlerTx::none());
         let e = &c.log().entries_for(&TenantId("acme".into()))[0];
         assert_eq!(e.actor.actor, "agent-7@acme.noreply");
         assert_eq!(e.actor.actor_kind, "agent");
@@ -824,7 +824,7 @@ mod tests {
             "01J-root",
             Some("01J-parent"),
         );
-        c.handle(&ev);
+        c.handle(&ev, &mut myelin_events::HandlerTx::none());
         let e = &c.log().entries_for(&TenantId("acme".into()))[0];
         assert_eq!(
             e.correlation_id, "01J-root",
@@ -862,7 +862,7 @@ mod tests {
             "01J-root",
             None,
         );
-        c.handle(&ev);
+        c.handle(&ev, &mut myelin_events::HandlerTx::none());
         assert_eq!(
             c.log().len_for(&TenantId("acme".into())),
             1,
@@ -886,7 +886,7 @@ mod tests {
             "myelin://acme/x",
             "r1",
             None,
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         c.handle(&action_event(
             "01J-b1",
             human("u", "globex"),
@@ -894,7 +894,7 @@ mod tests {
             "myelin://globex/x",
             "r2",
             None,
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         c.handle(&action_event(
             "01J-a2",
             human("u", "acme"),
@@ -902,7 +902,7 @@ mod tests {
             "myelin://acme/y",
             "r3",
             None,
-        ));
+        ), &mut myelin_events::HandlerTx::none());
 
         let acme = c.log().entries_for(&TenantId("acme".into()));
         let globex = c.log().entries_for(&TenantId("globex".into()));
@@ -929,7 +929,7 @@ mod tests {
                 &format!("myelin://acme/x/{i}"),
                 "r",
                 None,
-            ));
+            ), &mut myelin_events::HandlerTx::none());
         }
         let tenant = TenantId("acme".into());
         let entries = c.log().entries_for(&tenant);
@@ -1020,7 +1020,7 @@ mod tests {
                 "myelin://acme/x",
                 "r",
                 None,
-            ));
+            ), &mut myelin_events::HandlerTx::none());
             c.handle(&action_event(
                 "01J-2",
                 human("u", "acme"),
@@ -1028,7 +1028,7 @@ mod tests {
                 "myelin://acme/y",
                 "r",
                 None,
-            ));
+            ), &mut myelin_events::HandlerTx::none());
             c
         };
         let tenant = TenantId("acme".into());
@@ -1048,7 +1048,7 @@ mod tests {
             "myelin://acme/z",
             "r",
             None,
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         let after = c.log().root(&tenant);
         assert_ne!(
             before, after,
@@ -1074,7 +1074,7 @@ mod tests {
             "myelin://acme/x",
             "r",
             None,
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         assert_eq!(
             c.append_lag(),
             0,
