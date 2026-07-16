@@ -250,6 +250,14 @@ pub mod reconcile;
 /// conversations) and advances the target ref via the durable per-ref CAS ONLY on a fully-admitted gate —
 /// never a policy bypass. The PG home for these rows (MR-022 provider) is the named GT-003b follow-on.
 pub mod pr_store;
+/// **R3.3 / R3.2 (shared) — the DURABLE PR review-thread / comment / review-batch store.** The ONE
+/// canonical conversation store both R3 packs consume (the `_gate.md` §02/§03 cross-pack
+/// reconciliation): the model is THREADS (an optional content anchor; comments belong to threads);
+/// review batching layers on via `review_id` + the [`pr_threads::ReviewBatch`] lifecycle; pending
+/// comments are visible only to their author until submit; submit yields exactly ONE batch event
+/// (R-BATCH-1). Keyed by the canonical [`myelin_refs::object_key`] tuple key so issues/docs mount the
+/// SAME store later. JSON-on-disk (the [`pr_store`] pattern; the PG home is the GT-003b follow-on).
+pub mod pr_threads;
 /// **GT-002 (E1.1) — REAL git-repo backup + DESTRUCTIVE restore.** [`backup::GitRepoBackup`] captures
 /// a GT-001 on-disk bare repo's complete object graph + refs into a single self-contained artifact (a
 /// ref snapshot + a non-thin libgit2 packfile — the canonical `git bundle`-style mechanism, NOT a

@@ -301,11 +301,18 @@ const SEED_PRS = {
     pr: {
       number: 1,
       pr_state: "open",
+      title: "R3.3 PR overview + context pane",
+      body_md: "This wires the **context pane** and the checks panel.\n\nThe gate is authoritative.",
       base_ref: "refs/heads/main",
       head_ref: "refs/heads/feature",
       head_oid: C2,
       author: "u_dev_operator@acme.noreply",
+      author_is_agent: false,
       reviews: 0,
+      created_at: 1719360000,
+      updated_at: 1719446400,
+      commits_count: 2,
+      commits_count_capped: false,
       durable: true,
     },
     checks: {
@@ -315,6 +322,8 @@ const SEED_PRS = {
       endorsed_contexts: [],
       fork_unendorsed_contexts: ["ci/test"],
       gate_admitted: false,
+      changes_requested: false,
+      current_approvals: 0,
       durable: true,
     },
   },
@@ -322,11 +331,18 @@ const SEED_PRS = {
     pr: {
       number: 2,
       pr_state: "open",
+      title: "Hotfix: saturating cursor arithmetic",
+      body_md: null,
       base_ref: "refs/heads/main",
       head_ref: "refs/heads/hotfix",
       head_oid: C1,
       author: "u_dev_operator@acme.noreply",
+      author_is_agent: false,
       reviews: 1,
+      created_at: 1719100000,
+      updated_at: 1719200000,
+      commits_count: 1,
+      commits_count_capped: false,
       durable: true,
     },
     checks: {
@@ -336,18 +352,151 @@ const SEED_PRS = {
       endorsed_contexts: [],
       fork_unendorsed_contexts: [],
       gate_admitted: true,
+      changes_requested: false,
+      current_approvals: 0,
       durable: true,
     },
   },
+  // PR #3 — the checks-degrade fixture: the record exists, its checks route 404s (see prChecksJson).
+  3: {
+    pr: {
+      number: 3,
+      pr_state: "open",
+      title: "Checks-degrade fixture",
+      body_md: null,
+      base_ref: "refs/heads/main",
+      head_ref: "refs/heads/degrade",
+      head_oid: C2,
+      author: "u_dev_operator@acme.noreply",
+      author_is_agent: false,
+      reviews: 0,
+      created_at: 1719000000,
+      updated_at: 1719000000,
+      commits_count: 1,
+      commits_count_capped: false,
+      durable: true,
+    },
+    // `checks` is intentionally never served for #3 (prChecksJson 404s) — the local-degrade path.
+    checks: { required_contexts: [], required_approvals: 0, green_contexts: [], endorsed_contexts: [], fork_unendorsed_contexts: [], gate_admitted: false, durable: true },
+  },
 };
+
+// ── R3.3 — a per-process mutable thread/review store (the dev-edge stateful surface the e2e drives).
+//    Keyed by `${repo}:${n}`; a fresh process starts empty (an honest "No discussion yet"). ──
+const THREADS = new Map();
+let threadSeq = 0;
+function subjectKey(repo, n) {
+  return `${repo}:${n}`;
+}
+function subjectDoc(repo, n) {
+  const k = subjectKey(repo, n);
+  if (!THREADS.has(k)) THREADS.set(k, { threads: [], reviews: [] });
+  return THREADS.get(k);
+}
+/** GET …/threads → the viewer-scoped envelope (the dev-edge treats the dev operator as the viewer, so
+ *  pending comments authored by them are visible to them; a real edge filters per principal). */
+export function prThreadsJson(repo, n, viewer = "u_dev_operator@acme.noreply") {
+  if (repo !== "myelin" || !SEED_PRS[n]) return null;
+  const doc = subjectDoc(repo, n);
+  const visible = doc.threads
+    .map((t) => ({
+      ...t,
+      comments: t.comments.filter((c) => !c.pending || c.author.display === viewer),
+    }))
+    .filter((t) => t.comments.length > 0);
+  const reviews = doc.reviews.filter((r) => r.submitted_at != null || r.reviewer.display === viewer);
+  return {
+    discussion: visible.filter((t) => t.anchor == null),
+    anchored: visible.filter((t) => t.anchor != null),
+    threads: visible,
+    reviews,
+    durable: true,
+  };
+}
+/** GET …/prs/{n}/commits → the MR-014 commits envelope. */
+export function prCommitsEnvelope(repo, n, limit = 50) {
+  if (repo !== "myelin" || !SEED_PRS[n]) return null;
+  const items = [
+    { oid: C2, short_oid: C2.slice(0, 7), summary: "Wire the context pane region", author: "u_dev_operator@acme.noreply", committed_at: 1719360000, parents: [C1] },
+  ];
+  return { items, page: { next_cursor: null, limit, offset: 0 } };
+}
+/** POST handlers (stateful). Return the same `{ applied: … }` envelope the edge does. */
+export function devPost(repo, n, tail, body, viewer = "u_dev_operator@acme.noreply") {
+  if (repo !== "myelin" || !SEED_PRS[n]) return { status: 404 };
+  const doc = subjectDoc(repo, n);
+  const who = { kind: "human", display: viewer, on_behalf_of: null, trigger: null };
+  const id = (p) => `${p}-${++threadSeq}`;
+  // POST …/threads
+  if (tail === "threads") {
+    const thread = { id: id("t"), anchor: null, resolved: false, comments: [
+      { id: id("c"), author: who, body_md: body.body_md, created_at: 1719450000, edited_at: null, state: "visible", review_id: null, pending: false },
+    ] };
+    doc.threads.push(thread);
+    return { status: 201, json: { applied: { action: "git.pr.thread.create", thread }, durable: true } };
+  }
+  // POST …/threads/{tid}/comments
+  let m;
+  if ((m = tail.match(/^threads\/([^/]+)\/comments$/))) {
+    const t = doc.threads.find((x) => x.id === m[1]);
+    if (!t) return { status: 404 };
+    const comment = { id: id("c"), author: who, body_md: body.body_md, created_at: 1719450001, edited_at: null, state: "visible", review_id: null, pending: false };
+    t.comments.push(comment);
+    return { status: 201, json: { applied: { action: "git.pr.comment.create", comment }, durable: true } };
+  }
+  // POST …/reviews/start
+  if (tail === "reviews/start") {
+    const review = { id: id("r"), reviewer: who, verdict: "in_progress", advisory: false, submitted_at: null, summary_md: null };
+    doc.reviews.push(review);
+    return { status: 201, json: { applied: { action: "git.pr.review.start", review }, durable: true } };
+  }
+  // POST …/reviews/{rid}/comments
+  if ((m = tail.match(/^reviews\/([^/]+)\/comments$/))) {
+    const thread = { id: id("t"), anchor: null, resolved: false, comments: [
+      { id: id("c"), author: who, body_md: body.body_md, created_at: 1719450002, edited_at: null, state: "visible", review_id: m[1], pending: true },
+    ] };
+    doc.threads.push(thread);
+    return { status: 201, json: { applied: { action: "git.pr.review.comment", comment: thread.comments[0] }, durable: true } };
+  }
+  // POST …/reviews/{rid}/submit
+  if ((m = tail.match(/^reviews\/([^/]+)\/submit$/))) {
+    const r = doc.reviews.find((x) => x.id === m[1]);
+    if (!r) return { status: 404 };
+    const first = r.submitted_at == null;
+    if (first) {
+      r.verdict = body.verdict ?? "commented";
+      r.submitted_at = 1719450003;
+      r.summary_md = body.summary_md ?? null;
+      for (const t of doc.threads) for (const c of t.comments) if (c.review_id === r.id) c.pending = false;
+    }
+    return { status: 200, json: { applied: { action: "git.pr.review.submit", result: { emitted: first, review: r } }, durable: true } };
+  }
+  // POST …/reviews/{rid}/discard
+  if ((m = tail.match(/^reviews\/([^/]+)\/discard$/))) {
+    doc.threads = doc.threads.filter((t) => (t.comments = t.comments.filter((c) => c.review_id !== m[1])).length > 0);
+    doc.reviews = doc.reviews.filter((r) => r.id !== m[1]);
+    return { status: 200, json: { applied: { action: "git.pr.review.discard", result: { discarded: m[1] } }, durable: true } };
+  }
+  // POST …/merge — PR 2 is mergeable (gate admitted); PR 1 is blocked (409 + fresh checks, N6).
+  if (tail === "merge") {
+    if (SEED_PRS[n].checks.gate_admitted) {
+      return { status: 200, json: { applied: { action: "git.pr.merge", merged: true, base_ref: SEED_PRS[n].pr.base_ref, new_oid: SEED_PRS[n].pr.head_oid }, durable: true } };
+    }
+    return { status: 409, json: { error: { code: "merge_blocked", message: "merge blocked by branch protection" }, checks: SEED_PRS[n].checks, durable: true } };
+  }
+  return { status: 404 };
+}
 
 /** GET /v1/git/repos/{repo}/prs/{n} → the durable PR record (null = 404). */
 export function prJson(repo, n) {
   return repo === "myelin" && SEED_PRS[n] ? SEED_PRS[n].pr : null;
 }
 
-/** GET /v1/git/repos/{repo}/prs/{n}/checks → the checks + merge-gate projection (null = 404). */
+/** GET /v1/git/repos/{repo}/prs/{n}/checks → the checks + merge-gate projection (null = 404). PR #3
+ *  deliberately 404s its checks (the record exists) so the e2e can drive the LOCAL checks-degrade
+ *  state (the PR stays live around a "Checks unavailable" region — ux-git finding 5). */
 export function prChecksJson(repo, n) {
+  if (repo === "myelin" && n === 3) return null;
   return repo === "myelin" && SEED_PRS[n] ? SEED_PRS[n].checks : null;
 }
 

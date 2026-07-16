@@ -13,6 +13,11 @@ export {
   type PrStateValue,
   type CheckVerdict,
 } from "./StatusPill";
+// The inline reference chip (<ReferenceChip>) + the labelled context-pane slot (R3.3, contributed
+// DOWN). Chip owns the reference-chip §5 state renders (no_access withholds its title — non-leak);
+// PaneSection owns the W1 "the pane assembles itself" contract (label-before-content, fail-static).
+export { Chip, type ChipProps, type ChipType, type ChipState } from "./Chip";
+export { PaneSection, type PaneSectionProps } from "./PaneSection";
 // Tier-1 overlay primitives (Dialog · ConfirmDialog · Popover · Menu · Tooltip · Toast) + the shared
 // substrate (one focus-trap/portal/scroll-lock/z-index layer). See ./overlays.
 export * from "./overlays";
