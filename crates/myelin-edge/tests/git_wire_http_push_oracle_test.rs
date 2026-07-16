@@ -845,3 +845,176 @@ async fn real_git_clone_and_push_over_http_basic_auth() {
     println!("=== R4.0 BASIC-AUTH ORACLE PROVEN: real git clone + push over HTTP Basic (password=token) lands durably; garbage refused ===");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ═══════════════ F1 (R4.1 dogfood) — REAL `git` over a CREDENTIAL HELPER needs the 401 challenge ═══
+//
+// A real `git push/clone` using a credential helper/manager/interactive prompt (NOT preemptive
+// `http.extraHeader`) only OFFERS its Basic credential AFTER a 401 that carries `WWW-Authenticate:
+// Basic …`. Before F1 the edge's git-wire 401 had no such header, so git never sent the credential and
+// the operation failed auth (proven: `curl -u` worked, `http.extraHeader` worked, a helper did NOT).
+// This oracle drives the host's REAL `git` with a credential helper (no preemptive header) and proves a
+// clone + push now succeed — i.e. the challenge is present and git offers the credential.
+
+/// An inline `credential.helper` that answers `get` with `username=x-access-token` + the token as the
+/// password (double-quoted so the token's `|` bytes are literal to the helper's `sh`). This is the
+/// NON-preemptive path: git invokes it ONLY after a `WWW-Authenticate: Basic` 401.
+fn credential_helper_arg(token: &str) -> String {
+    // The leading `!` makes git run the value via the shell; it receives the op (`get`) as $1.
+    format!("credential.helper=!f() {{ echo username=x-access-token; echo \"password={token}\"; }}; f")
+}
+
+/// `git clone <url> <dst>` authenticating ONLY through a credential helper (no `http.extraHeader`).
+fn git_clone_via_helper(
+    addr: SocketAddr,
+    token: &str,
+    repo_url_path: &str,
+    dst: &Path,
+) -> (bool, String) {
+    let url = format!("http://{addr}{repo_url_path}");
+    let out = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-c")
+        .arg(credential_helper_arg(token))
+        .args(["clone", &url, &dst.to_string_lossy()])
+        .output()
+        .expect("spawn git clone (helper)");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// `git push <url> main` authenticating ONLY through a credential helper (no `http.extraHeader`).
+fn git_push_via_helper(
+    addr: SocketAddr,
+    token: &str,
+    repo_url_path: &str,
+    work: &Path,
+) -> (bool, String) {
+    let url = format!("http://{addr}{repo_url_path}");
+    let out = Command::new("git")
+        .current_dir(work)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-c")
+        .arg(credential_helper_arg(token))
+        .args(["push", &url, "main"])
+        .output()
+        .expect("spawn git push (helper)");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f1_real_git_over_credential_helper_needs_the_basic_challenge() {
+    if !require_or_skip("f1 credential-helper wire oracle") {
+        return;
+    }
+    let Some(_rootfs) = git_rootfs() else { return };
+
+    let root = temp_root("f1-helper");
+    let backend_for_create = DurableGitBackend::rooted_inmem_for_test(root.clone());
+    backend_for_create
+        .create_repo("acme", REGION, "widgets")
+        .expect("create server repo");
+
+    let (gw, cell, backend) = build(&root);
+    let addr = spawn(gw).await;
+    let token = mint(&cell, "acme", "jti-f1-helper");
+
+    // ── PUSH via a credential helper (no preemptive header) — must succeed thanks to the 401 challenge.
+    let work = make_work(&root);
+    let (ok_push, se_push) =
+        git_push_via_helper(addr, &token, "/acme/eu-west/widgets.git", &work);
+    println!("=== F1 git push (credential HELPER, no extraHeader) ===\nsuccess={ok_push}\nstderr=\n{se_push}");
+    assert!(
+        ok_push,
+        "F1: a helper-driven push MUST succeed — the git-wire 401 now carries WWW-Authenticate: Basic \
+         so git offers the credential (stderr: {se_push})"
+    );
+
+    // ── CLONE via a credential helper — must succeed likewise.
+    let dst = root.join("clone-helper");
+    let (ok_clone, se_clone) =
+        git_clone_via_helper(addr, &token, "/acme/eu-west/widgets.git", &dst);
+    println!("=== F1 git clone (credential HELPER) ===\nsuccess={ok_clone}\nstderr=\n{se_clone}");
+    assert!(
+        ok_clone,
+        "F1: a helper-driven clone MUST succeed (stderr: {se_clone})"
+    );
+    let _ = backend;
+
+    println!("=== F1 ORACLE PROVEN: real git over a credential helper authenticates (the 401 Basic challenge is present) ===");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ═══════════════ F9 (R4.1 dogfood) — a fresh `git clone` checks out `main` (HEAD symref healed) ═════
+//
+// A freshly-created repo's on-disk HEAD is left at `init_bare`'s `refs/heads/master` while pushes land
+// on `main`, so `git clone` warned "remote HEAD refers to nonexistent ref, unable to checkout" (refs +
+// objects present; only HEAD dangling). F9 heals HEAD on the first push. This oracle pushes `main`, then
+// a plain `git clone` and asserts the WORKING TREE checked out (README present), no warning, and the
+// server bare repo's HEAD symref targets `refs/heads/main`.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f9_fresh_clone_checks_out_main_and_server_head_symref_is_main() {
+    if !require_or_skip("f9 head-symref clone oracle") {
+        return;
+    }
+    let Some(_rootfs) = git_rootfs() else { return };
+
+    let root = temp_root("f9-head");
+    let backend_for_create = DurableGitBackend::rooted_inmem_for_test(root.clone());
+    backend_for_create
+        .create_repo("acme", REGION, "widgets")
+        .expect("create server repo");
+
+    let (gw, cell, backend) = build(&root);
+    let addr = spawn(gw).await;
+    let token = mint(&cell, "acme", "jti-f9");
+
+    // Push `main` (auth via extraHeader — F9 is about HEAD, not the auth path).
+    let work = make_work(&root);
+    let (ok, _so, se) = git_push(addr, Some(&token), "/acme/eu-west/widgets.git", &work);
+    assert!(ok, "the setup push must land: {se}");
+
+    // The server bare repo's on-disk HEAD symref now targets refs/heads/main (healed on first push).
+    let bare = root.join("acme/eu-west/widgets.git");
+    let symref = Command::new("git")
+        .args(["--git-dir", &bare.to_string_lossy(), "symbolic-ref", "HEAD"])
+        .output()
+        .unwrap();
+    let symref_target = String::from_utf8_lossy(&symref.stdout).trim().to_string();
+    println!("=== F9 server HEAD symref = {symref_target:?} ===");
+    assert_eq!(
+        symref_target, "refs/heads/main",
+        "F9: the on-disk HEAD symref must target the pushed default branch"
+    );
+
+    // A plain `git clone` (default checkout) recovers a checked-out working tree with NO warning.
+    let dst = root.join("f9-clone");
+    let out = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-c")
+        .arg(format!("http.extraHeader=Authorization: Bearer {token}"))
+        .args(["clone", &format!("http://{addr}/acme/eu-west/widgets.git"), &dst.to_string_lossy()])
+        .output()
+        .expect("spawn git clone");
+    let clone_stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    println!("=== F9 git clone ===\nsuccess={}\nstderr=\n{clone_stderr}", out.status.success());
+    assert!(out.status.success(), "the clone must succeed: {clone_stderr}");
+    assert!(
+        !clone_stderr.contains("unable to checkout")
+            && !clone_stderr.contains("nonexistent ref"),
+        "F9: a clone must NOT warn about a dangling HEAD: {clone_stderr}"
+    );
+    assert!(
+        dst.join("README.md").is_file(),
+        "F9: the working tree checked out `main` (README.md present) — HEAD resolved on the server"
+    );
+    let _ = backend;
+
+    println!("=== F9 ORACLE PROVEN: fresh clone checks out main; server HEAD symref = refs/heads/main ===");
+    let _ = std::fs::remove_dir_all(&root);
+}
