@@ -287,7 +287,7 @@ impl EventHandler for RefsProjectionInvalidator {
     /// Idempotent on `event_id` (the runtime's `consumer_dedup` outer guard, rule 1) — a redelivery
     /// never re-busts. A malformed invalidation event is a non-retryable poison
     /// ([`HandleOutcome::NonRetryable`]) — surfaced, never a silent stale-ref.
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         match self.invalidate_for(ev) {
             Ok(()) => HandleOutcome::Done,
             Err(InvalidateError(reason)) => HandleOutcome::NonRetryable(Reason(reason)),
@@ -381,7 +381,7 @@ mod tests {
         let ev = lifecycle_event("01J-u1", "knowledge.page.updated", ref_);
 
         assert_eq!(
-            inv.handle(&ev),
+            inv.handle(&ev, &mut myelin_events::HandlerTx::none()),
             HandleOutcome::Done,
             "an *.updated busts the cache"
         );
@@ -417,7 +417,7 @@ mod tests {
         let inv = RefsProjectionInvalidator::with_cache(Arc::new(shim.clone()));
         let ref_ = "myelin://acme/issue/issue/ENG-1";
         let ev = lifecycle_event("01J-e1", "issue.issue.erased", ref_);
-        assert_eq!(inv.handle(&ev), HandleOutcome::Done);
+        assert_eq!(inv.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
         assert_eq!(
             shim.call_count(),
             1,
@@ -435,7 +435,7 @@ mod tests {
         let inv = RefsProjectionInvalidator::with_cache(Arc::new(shim.clone()));
         let ref_ = "myelin://acme/knowledge/page/7c2#block-9";
         let ev = lifecycle_event("01J-u2", "knowledge.page.updated", ref_);
-        assert_eq!(inv.handle(&ev), HandleOutcome::Done);
+        assert_eq!(inv.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
         assert_eq!(
             shim.invalidations()[0].ref_.0,
             ref_,
@@ -457,7 +457,7 @@ mod tests {
             "myelin://acme/issue/issue/ENG-2",
         );
         assert_eq!(
-            inv.handle(&ev),
+            inv.handle(&ev, &mut myelin_events::HandlerTx::none()),
             HandleOutcome::Done,
             "a created event is handled (no-op)"
         );
@@ -477,7 +477,7 @@ mod tests {
         let mut ev = lifecycle_event("01J-bad", "knowledge.page.updated", "");
         ev.subject = ArtifactRef(String::new());
         ev.payload = serde_json::json!({ "title": "x" }); // no ref/subject field.
-        match inv.handle(&ev) {
+        match inv.handle(&ev, &mut myelin_events::HandlerTx::none()) {
             HandleOutcome::NonRetryable(Reason(r)) => {
                 assert!(
                     r.contains("ArtifactRef"),
@@ -498,7 +498,7 @@ mod tests {
         let mut ev = lifecycle_event("01J-u3", "chat.message.updated", "");
         ev.subject = ArtifactRef(String::new());
         ev.payload = serde_json::json!({ "ref": "myelin://acme/chat/message/m1" });
-        assert_eq!(inv.handle(&ev), HandleOutcome::Done);
+        assert_eq!(inv.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
         assert_eq!(
             shim.invalidations()[0].ref_.0,
             "myelin://acme/chat/message/m1"
@@ -518,8 +518,8 @@ mod tests {
         ev_a.tenant = TenantId("acme".into());
         let mut ev_b = lifecycle_event("01J-b", "knowledge.page.updated", ref_);
         ev_b.tenant = TenantId("other".into());
-        inv.handle(&ev_a);
-        inv.handle(&ev_b);
+        inv.handle(&ev_a, &mut myelin_events::HandlerTx::none());
+        inv.handle(&ev_b, &mut myelin_events::HandlerTx::none());
         let calls = shim.invalidations();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].tenant.0, "acme");
@@ -543,7 +543,7 @@ mod tests {
             "01J-u",
             "issue.issue.updated",
             "myelin://acme/issue/issue/E1",
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         // The shim recorded the call but holds no projection state (no get/contains — it is no-op).
         assert_eq!(
             shim.call_count(),

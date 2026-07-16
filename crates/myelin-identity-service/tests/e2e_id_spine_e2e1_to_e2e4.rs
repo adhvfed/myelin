@@ -553,7 +553,7 @@ fn rebuild_from_cold(
     let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
     relay.drain_to_empty();
     for env in bus.consume("") {
-        consumer.handle(&env);
+        consumer.handle(&env, &mut myelin_events::HandlerTx::none());
     }
     (
         ListObjects::with_cap(store.clone(), namespace, index.clone(), 0), // cap 0 → Filter (S8 JOIN)

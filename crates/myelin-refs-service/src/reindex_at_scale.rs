@@ -320,7 +320,7 @@ pub fn run_full_scale_reindex_parity(
         truth.record(edge.clone());
         // Ingest the live reference event — the SAME payload shape the snapshot replay carries (that IS
         // the cold==live invariant), driven through the live `handle`.
-        live.handle(&live_reference_event(tenant, region, edge, &ctx_base));
+        live.handle(&live_reference_event(tenant, region, edge, &ctx_base), &mut myelin_events::HandlerTx::none());
     }
     let live_proj = live.projection();
     // Project BOTH TE-7 mirrors into the live index (the first + second real mirror).

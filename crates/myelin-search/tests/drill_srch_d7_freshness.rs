@@ -136,7 +136,7 @@ fn srch_d7_synthetic_event_is_searchable_within_the_freshness_budget() {
 
     // The synthetic event arrives; measure the time to searchable.
     let t0 = Instant::now();
-    assert_eq!(indexer.handle(&event("01J-1", r)), HandleOutcome::Done);
+    assert_eq!(indexer.handle(&event("01J-1", r), &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
     let hits = indexer
         .search_ft(&tenant(), &region(), &AclFilter::ids([r]), "raft", 10)
         .expect("search");
@@ -207,7 +207,7 @@ fn srch_d7_index_lag_is_observable_mid_flight() {
 
     let ix = indexer.clone();
     let ev = event("01J-7", r);
-    let h = std::thread::spawn(move || ix.handle(&ev));
+    let h = std::thread::spawn(move || ix.handle(&ev, &mut myelin_events::HandlerTx::none()));
 
     // Wait until the indexer has entered the pipeline (the owner fetch started) — index_lag is now > 0.
     started_rx.recv().expect("the indexer entered the pipeline");

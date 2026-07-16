@@ -519,7 +519,7 @@ impl EventHandler for ProjectionFeeder {
     /// guard, on top of the runtime's `consumer_dedup` ledger), and a facet already promoted is not
     /// re-provisioned. Always returns `Done` for a well-formed `issue.updated` (a non-`issue.updated`
     /// subject is a misroute → `NonRetryable`).
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         if ev.type_.0 != ISSUE_UPDATED {
             return HandleOutcome::NonRetryable(Reason(format!(
                 "projection feeder bound to `{ISSUE_UPDATED}` received `{}` — misroute",

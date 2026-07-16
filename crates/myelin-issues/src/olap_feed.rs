@@ -410,7 +410,7 @@ impl EventHandler for IssueOlapConsumer {
     /// A non-analytics token (one not on the whitelist — defence in depth on top of the subscription
     /// filter) is dropped as [`HandleOutcome::Done`]. An out-of-region event is a non-retryable poison
     /// (a misrouted event can never become in-region by retry — the residency boundary, §3.4).
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         // Defence in depth: a token not on the analytics whitelist is dropped (it was mis-routed; the
         // subscription filter should have excluded it — we never project a non-analytics token).
         if !is_analytics_token(&ev.type_.0) {

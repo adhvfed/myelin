@@ -600,7 +600,7 @@ impl EventHandler for RollupConsumer {
     /// coalesce); the actual recompute + the `input_hash`-suppressed emit is the [`RollupConsumer::flush`]
     /// pass (a burst of N deltas under one ancestor → ONE recompute). A malformed event (no subject ref)
     /// is non-retryable (poison) — it can never become well-formed by retry.
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         let mut state = self.state.lock().expect("rollup state lock");
         // Idempotent on event_id (contract 2.4 / ADR-04.1) — a redelivery is a no-op.
         if !state.seen_events.insert(ev.event_id.0.clone()) {

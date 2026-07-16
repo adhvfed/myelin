@@ -85,7 +85,7 @@ fn provider(scope: &TenantScope, tuples: &[TupleDelta]) -> StoreBackedCheck {
     let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
     relay.drain_to_empty();
     for env in bus.consume("") {
-        consumer.handle(&env);
+        consumer.handle(&env, &mut myelin_events::HandlerTx::none());
     }
     let svc = StoreBackedCheck::with_index(store, index);
     for admit in svc.admit_knowledge_fragment() {

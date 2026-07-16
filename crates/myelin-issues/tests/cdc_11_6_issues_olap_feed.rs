@@ -107,7 +107,7 @@ fn consumer_issue_feed_drives_the_shared_frame() {
         events::SLA_MET,
         "myelin://acme/issue/issue/ENG-1",
         "issue:ENG-1",
-    ));
+    ), &mut myelin_events::HandlerTx::none());
     assert_eq!(
         c.doc_count(),
         1,
@@ -124,8 +124,8 @@ fn consumer_issue_feed_drives_the_shared_frame() {
 fn consumer_honours_the_restriction_flag() {
     let flag = RestrictionFlag::new();
     let c = IssueOlapConsumer::new(region(), flag.clone());
-    c.handle(&ev("a1", events::SLA_MET, "psn:alice", "issue:A"));
-    c.handle(&ev("b1", events::SLA_MET, "psn:bob", "issue:B"));
+    c.handle(&ev("a1", events::SLA_MET, "psn:alice", "issue:A"), &mut myelin_events::HandlerTx::none());
+    c.handle(&ev("b1", events::SLA_MET, "psn:bob", "issue:B"), &mut myelin_events::HandlerTx::none());
     c.analytics(|a| assert_eq!(a.velocity(), 2, "both contribute unrestricted"));
     flag.set("psn:alice", true);
     c.analytics(|a| {
@@ -145,8 +145,8 @@ fn consumer_honours_the_restriction_flag() {
 fn consumer_and_provider_project_the_same_read_model() {
     // The Issues consumer feed.
     let c = IssueOlapConsumer::new(region(), RestrictionFlag::new());
-    c.handle(&ev("e1", events::SLA_MET, "psn:a", "issue:1"));
-    c.handle(&ev("e2", events::ISSUE_TRANSITIONED, "psn:b", "issue:2"));
+    c.handle(&ev("e1", events::SLA_MET, "psn:a", "issue:1"), &mut myelin_events::HandlerTx::none());
+    c.handle(&ev("e2", events::ISSUE_TRANSITIONED, "psn:b", "issue:2"), &mut myelin_events::HandlerTx::none());
 
     // The raw frame, fed the SAME events via the SAME from_envelope seam.
     let mut raw = OlapReadStore::pinned_to(region());

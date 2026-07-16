@@ -217,7 +217,7 @@ fn missed_ledger_entry_resurrects_pii_red_counter_case() {
 
     // Steady-state: ingest + warm everything.
     for edge in &corpus.edges {
-        builder.handle(&corpus.edge_event(edge));
+        builder.handle(&corpus.edge_event(edge), &mut myelin_events::HandlerTx::none());
     }
     let projection = builder.projection().clone();
     for subject_id in &corpus.subjects {
@@ -257,7 +257,7 @@ fn missed_ledger_entry_resurrects_pii_red_counter_case() {
         cache
             .fill(&tenant(), &region(), &edge.source, &proj)
             .unwrap();
-        builder.handle(&corpus.edge_event(edge));
+        builder.handle(&corpus.edge_event(edge), &mut myelin_events::HandlerTx::none());
     }
 
     // RE-ERASE from the (EMPTY) ledger — the forgotten subject is NOT replayed.

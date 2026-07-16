@@ -503,7 +503,7 @@ impl EventHandler for ReverseIndexConsumer {
     /// event is ignored (the whitelist binds only that token; defence-in-depth here too). A
     /// structurally-malformed `iam.tuple_written` (no zookie) is a non-retryable poison — never a
     /// silent corruption of the projection.
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         if ev.type_.0 != IAM_TUPLE_WRITTEN {
             // Defence-in-depth: the whitelist binds iam.tuple.written, but a mis-delivery is a no-op
             // (never project a foreign event into the authz index).
@@ -607,7 +607,7 @@ mod tests {
         let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
         relay.drain_to_empty();
         for env in bus.consume("") {
-            consumer.handle(&env);
+            consumer.handle(&env, &mut myelin_events::HandlerTx::none());
         }
         z
     }
@@ -896,7 +896,7 @@ mod tests {
             // NO zookie in the payload → malformed.
             payload: serde_json::json!({ "deltas": [] }),
         };
-        let outcome = consumer.handle(&ev);
+        let outcome = consumer.handle(&ev, &mut myelin_events::HandlerTx::none());
         assert!(
             matches!(outcome, HandleOutcome::NonRetryable(_)),
             "a zookie-less iam.tuple_written is a non-retryable poison, never a silent corruption"

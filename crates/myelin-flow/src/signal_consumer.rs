@@ -179,7 +179,7 @@ impl<E: DurableExecutor + Send + Sync> EventHandler for FlowSignalConsumer<E> {
     /// idempotency working, not an error). A malformed event, or a signal to an unknown run, is a
     /// non-retryable POISON (dead-lettered immediately, rule 5 — never a head-of-line stall, never a
     /// silent drop, EI-02 §4).
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         match self.deliver(ev) {
             // Buffered OR Duplicate: the workflow has its one buffered copy — ack Done either way.
             Ok(_) => HandleOutcome::Done,
@@ -294,7 +294,7 @@ mod tests {
 
         let ev = signal_event(&run, "job.done", "tok-1", "evt-1");
         assert_eq!(
-            consumer.handle(&ev),
+            consumer.handle(&ev, &mut myelin_events::HandlerTx::none()),
             HandleOutcome::Done,
             "a good signal acks Done"
         );
@@ -321,8 +321,8 @@ mod tests {
         let consumer = FlowSignalConsumer::new(ex.clone(), subjects());
 
         // two DISTINCT bus events (distinct event_id) carrying the SAME (run, signal_name, idem_key).
-        let first = consumer.handle(&signal_event(&run, "job.done", "tok-1", "evt-1"));
-        let second = consumer.handle(&signal_event(&run, "job.done", "tok-1", "evt-2"));
+        let first = consumer.handle(&signal_event(&run, "job.done", "tok-1", "evt-1"), &mut myelin_events::HandlerTx::none());
+        let second = consumer.handle(&signal_event(&run, "job.done", "tok-1", "evt-2"), &mut myelin_events::HandlerTx::none());
         assert_eq!(first, HandleOutcome::Done);
         assert_eq!(
             second,
@@ -353,7 +353,7 @@ mod tests {
         let mut ev = signal_event(&run, "job.done", "tok-1", "evt-1");
         ev.payload = serde_json::json!({ "idem_key": "tok-1" }); // no signal_name → poison.
         assert!(
-            matches!(consumer.handle(&ev), HandleOutcome::NonRetryable(_)),
+            matches!(consumer.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::NonRetryable(_)),
             "a malformed signal is non-retryable poison (dead-lettered, no silent drop)"
         );
         assert_eq!(
@@ -372,7 +372,7 @@ mod tests {
         let consumer = FlowSignalConsumer::new(ex.clone(), subjects());
         let ev = signal_event(&RunId("no-such-run".into()), "job.done", "tok-1", "evt-1");
         assert!(
-            matches!(consumer.handle(&ev), HandleOutcome::NonRetryable(_)),
+            matches!(consumer.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::NonRetryable(_)),
             "a signal to an unknown run is surfaced (dead-lettered), never silently swallowed"
         );
     }

@@ -173,8 +173,8 @@ fn cdc_consumer_refs_reindexer_cold_equals_live_byte_parity() {
 
     // LIVE projection (steady-state ingest of the live edge log).
     let live_builder = RefsEdgeBuilder::new(EdgeProjection::new());
-    live_builder.handle(&live_edge_event("01J-1", "s1", "t1", "mentions"));
-    live_builder.handle(&live_edge_event("01J-2", "s2", "t2", "embeds"));
+    live_builder.handle(&live_edge_event("01J-1", "s1", "t1", "mentions"), &mut myelin_events::HandlerTx::none());
+    live_builder.handle(&live_edge_event("01J-2", "s2", "t2", "embeds"), &mut myelin_events::HandlerTx::none());
     let live = live_builder.projection().clone();
 
     // The owner's source of truth (the same edges) → the reindex source.

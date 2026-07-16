@@ -92,7 +92,7 @@ impl EventHandler for RecordingHandler {
     fn subjects(&self) -> &'static [SubjectPattern] {
         SUBJECTS
     }
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         self.runs.fetch_add(1, Ordering::SeqCst);
         self.processed.lock().unwrap().push(ev.event_id.0.clone());
         HandleOutcome::Done
@@ -251,7 +251,7 @@ fn drill_sub_d2_slow_subject_does_not_block_fast_subject() {
         fn subjects(&self) -> &'static [SubjectPattern] {
             SUBJECTS
         }
-        fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+        fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
             if ev.subject.0.contains("/slow/") {
                 HandleOutcome::Retry(myelin_events::Backoff { seconds: 30 })
             } else {

@@ -260,7 +260,7 @@ fn consumer_leg_dead_letters_a_foreign_type() {
     // Deliver it directly to the handler (the subject still matches the prefix; the handler's own
     // type-guard is the second line of defence).
     assert!(matches!(
-        consumer.handler().handle(&env),
+        consumer.handler().handle(&env, &mut myelin_events::HandlerTx::none()),
         myelin_events::HandleOutcome::NonRetryable(_)
     ));
 }

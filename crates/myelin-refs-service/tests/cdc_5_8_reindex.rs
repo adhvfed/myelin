@@ -89,7 +89,7 @@ fn reindex_scope_rebuilds_byte_parity_cold_equals_live() {
         // Mirror the live log into the owner's source of truth (cold == live MEANS these are equal).
         truth.record(source_edge(&format!("refs.edge:{i}"), 1, s, t, r));
         // and ingest the live event into the live index.
-        live.handle(&snapshot_to_live_event(&truth, i));
+        live.handle(&snapshot_to_live_event(&truth, i), &mut myelin_events::HandlerTx::none());
     }
     let live_proj = live.projection().clone();
     assert_eq!(live_proj.live_count(&tenant(), &region()), 3);

@@ -102,7 +102,7 @@ impl myelin_events::EventHandler for DegradingConsumer {
     fn subjects(&self) -> &'static [SubjectPattern] {
         SUBJECTS
     }
-    fn handle(&self, ev: &myelin_events::EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &myelin_events::EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         if ev.type_.0 == BUS_ERASED_TYPE {
             *self.seen_tombstones.lock().unwrap() += 1;
             return degrade_on_tombstone(ev);

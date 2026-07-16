@@ -88,19 +88,19 @@ fn provider_exports_a_scope_and_the_auditor_consumer_verifies_the_chain_of_custo
     // Seed the per-tenant audit log: 3 actions about subject-A, 2 about subject-B.
     authority
         .consumer()
-        .handle(&action("1", "acme", "myelin://acme/subj/A", "r-1"));
+        .handle(&action("1", "acme", "myelin://acme/subj/A", "r-1"), &mut myelin_events::HandlerTx::none());
     authority
         .consumer()
-        .handle(&action("2", "acme", "myelin://acme/subj/B", "r-2"));
+        .handle(&action("2", "acme", "myelin://acme/subj/B", "r-2"), &mut myelin_events::HandlerTx::none());
     authority
         .consumer()
-        .handle(&action("3", "acme", "myelin://acme/subj/A", "r-3"));
+        .handle(&action("3", "acme", "myelin://acme/subj/A", "r-3"), &mut myelin_events::HandlerTx::none());
     authority
         .consumer()
-        .handle(&action("4", "acme", "myelin://acme/subj/A", "r-4"));
+        .handle(&action("4", "acme", "myelin://acme/subj/A", "r-4"), &mut myelin_events::HandlerTx::none());
     authority
         .consumer()
-        .handle(&action("5", "acme", "myelin://acme/subj/B", "r-5"));
+        .handle(&action("5", "acme", "myelin://acme/subj/B", "r-5"), &mut myelin_events::HandlerTx::none());
 
     let exporter = EDiscoveryExporter::new(&authority, &holds);
     let scope = EDiscoveryScope::Subject {
@@ -130,13 +130,13 @@ fn the_auditor_consumer_rejects_a_tampered_or_forged_bundle() {
     let holds = LegalHoldRegistry::new();
     authority
         .consumer()
-        .handle(&action("1", "acme", "myelin://acme/subj/A", "r-1"));
+        .handle(&action("1", "acme", "myelin://acme/subj/A", "r-1"), &mut myelin_events::HandlerTx::none());
     authority
         .consumer()
-        .handle(&action("2", "acme", "myelin://acme/subj/A", "r-2"));
+        .handle(&action("2", "acme", "myelin://acme/subj/A", "r-2"), &mut myelin_events::HandlerTx::none());
     authority
         .consumer()
-        .handle(&action("3", "acme", "myelin://acme/subj/A", "r-3"));
+        .handle(&action("3", "acme", "myelin://acme/subj/A", "r-3"), &mut myelin_events::HandlerTx::none());
 
     let exporter = EDiscoveryExporter::new(&authority, &holds);
     let bundle = exporter
@@ -175,7 +175,7 @@ fn the_export_is_legal_hold_frozen_so_a_concurrent_erase_is_deferred() {
     let holds = LegalHoldRegistry::new();
     authority
         .consumer()
-        .handle(&action("1", "acme", "u-A", "r-1"));
+        .handle(&action("1", "acme", "u-A", "r-1"), &mut myelin_events::HandlerTx::none());
 
     let principal = Principal::stub(
         PrincipalId("u-A".into()),

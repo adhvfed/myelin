@@ -90,7 +90,7 @@ fn iss_d8a_10k_import_coalesces_to_a_bounded_recompute_count() {
         consumer.add_parent_edge(&child, story);
         consumer.put_leaf(&child, LeafFact::new(Some(1), StateCategory::Started));
         // The off-the-bus delta (one per imported child).
-        let outcome = consumer.handle(&updated_event(&format!("imp-{i}"), &child.0));
+        let outcome = consumer.handle(&updated_event(&format!("imp-{i}"), &child.0), &mut myelin_events::HandlerTx::none());
         assert_eq!(outcome, HandleOutcome::Done);
     }
 
@@ -148,7 +148,7 @@ fn iss_d8b_reindex_from_source_rebuilds_drift_free() {
         let t = r(&format!("myelin://acme/issue/issue/ENG-T{i}"));
         consumer.add_parent_edge(&t, &story);
         consumer.put_leaf(&t, LeafFact::new(Some(2), cat));
-        consumer.handle(&updated_event(&format!("d8b-{i}"), &t.0));
+        consumer.handle(&updated_event(&format!("d8b-{i}"), &t.0), &mut myelin_events::HandlerTx::none());
     }
     let _ = consumer.flush();
     let live = aggregate_snapshot(&consumer);
@@ -189,7 +189,7 @@ fn chained_mutation_e2e_import_bounded_replay_drift_free() {
             StateCategory::Started
         };
         consumer.put_leaf(&t, LeafFact::new(Some(1), cat));
-        consumer.handle(&updated_event(&format!("chain-{i}"), &t.0));
+        consumer.handle(&updated_event(&format!("chain-{i}"), &t.0), &mut myelin_events::HandlerTx::none());
     }
     // BOUNDED: 50 deltas → 2 distinct ancestors (epic + story).
     assert_eq!(consumer.pending_recompute_count(), 2);

@@ -134,7 +134,7 @@ fn wired_with_grants(cap: usize, s: &TenantScope, subj: &str, n: usize) -> ListO
     let relay = Relay::new(outbox, bus.clone(), || Timestamp("t".into()));
     relay.drain_to_empty();
     for env in bus.consume("") {
-        consumer.handle(&env);
+        consumer.handle(&env, &mut myelin_events::HandlerTx::none());
     }
     ListObjects::with_cap(store, repo_namespace(), index, cap)
 }
@@ -371,7 +371,7 @@ fn id32_reverse_index_lag_slo_finalised_and_fallback_honoured() {
             .expect("surge write");
         relay.drain_to_empty();
         for env in bus.consume("") {
-            consumer.handle(&env);
+            consumer.handle(&env, &mut myelin_events::HandlerTx::none());
         }
         // The lag the instant after the surge step's projection drained — 0 in steady state on the
         // synchronous apply (the SLO is the time-to-project, which the synchronous path keeps at 0).

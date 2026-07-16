@@ -256,8 +256,8 @@ fn handle_is_idempotent_on_event_id() {
     let feeder = ProjectionFeeder::new();
     let ev = updated_event("ev-1", "acme", "bug", &["severity"]);
     // deliver the SAME event twice; the second is a no-op (deduped on event_id).
-    assert_eq!(feeder.handle(&ev), HandleOutcome::Done);
-    assert_eq!(feeder.handle(&ev), HandleOutcome::Done);
+    assert_eq!(feeder.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+    assert_eq!(feeder.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
     // the facet appearance from the issue.updated delta is counted at most once (the redelivery is a
     // no-op); since no view executions drove the share, it is not promoted regardless.
     assert!(!feeder.is_promoted(&FacetKey::new("acme", "bug", "severity")));
@@ -269,7 +269,7 @@ fn a_misrouted_event_is_non_retryable() {
     let feeder = ProjectionFeeder::new();
     let mut ev = updated_event("ev-2", "acme", "bug", &["severity"]);
     ev.type_ = EventType("issue.issue.created".into());
-    match feeder.handle(&ev) {
+    match feeder.handle(&ev, &mut myelin_events::HandlerTx::none()) {
         HandleOutcome::NonRetryable(_) => {}
         other => panic!("a misroute must be NonRetryable, got {other:?}"),
     }
@@ -292,7 +292,7 @@ fn handle_promotes_a_hot_facet_off_the_bus() {
     assert!(!feeder.is_promoted(&facet), "not yet seen on the bus");
     // an issue.updated delta touching `severity` → the consumer promotes it (measured threshold met).
     assert_eq!(
-        feeder.handle(&updated_event("ev-3", "acme", "bug", &["severity"])),
+        feeder.handle(&updated_event("ev-3", "acme", "bug", &["severity"]), &mut myelin_events::HandlerTx::none()),
         HandleOutcome::Done
     );
     assert!(
@@ -311,7 +311,7 @@ fn an_event_without_field_deltas_promotes_nothing() {
     let feeder = ProjectionFeeder::new();
     let mut ev = updated_event("ev-4", "acme", "bug", &[]);
     ev.payload = serde_json::json!({ "ref": "myelin://acme/issue/issue/ENG-1" });
-    assert_eq!(feeder.handle(&ev), HandleOutcome::Done);
+    assert_eq!(feeder.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
     assert!(!feeder.is_promoted(&FacetKey::new("acme", "bug", "severity")));
 }
 

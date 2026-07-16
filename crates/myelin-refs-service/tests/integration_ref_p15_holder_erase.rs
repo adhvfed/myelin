@@ -117,7 +117,7 @@ async fn holder_erase_purges_cache_pii_on_real_valkey_zero_recoverable() {
     let builder = RefsEdgeBuilder::new(EdgeProjection::new());
     let src = "myelin://acme/chat/message/m1";
     let tgt = "myelin://acme/knowledge/page/7c2";
-    builder.handle(&edge_event(&t, "e1", "p-erase-me", src, tgt));
+    builder.handle(&edge_event(&t, "e1", "p-erase-me", src, tgt), &mut myelin_events::HandlerTx::none());
     let projection_handle = builder.projection().clone();
 
     // warm the subject's cached title (a name) into REAL Valkey, sealed under the per-tenant DEK.

@@ -102,7 +102,7 @@ fn cdc_10_6_provider_emits_via_outbox_consumer_appends_minimised_hash_chained_en
     // CONSUMER: the audit consumer (the outbox subscription) appends the delivered action.
     let audit = AuditConsumer::new();
     assert_eq!(
-        audit.handle(&published[0]),
+        audit.handle(&published[0], &mut myelin_events::HandlerTx::none()),
         HandleOutcome::Done,
         "the audit consumer appends + acks"
     );

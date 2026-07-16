@@ -122,20 +122,20 @@ fn e2e_3_audit_tamper_on_the_lineage_anchor_is_detected() {
         let outcome = auth.consumer().handle(&deploy_audit_action(
             &format!("01J-pre-{i}"),
             &ArtifactRef(format!("myelin://acme/x/{i}")),
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         assert_eq!(outcome, HandleOutcome::Done);
     }
     let lineage_entry_seq = auth.consumer().log().len_for(&tenant);
     let outcome = auth
         .consumer()
-        .handle(&deploy_audit_action("01J-deploy-lineage", &anchor));
+        .handle(&deploy_audit_action("01J-deploy-lineage", &anchor), &mut myelin_events::HandlerTx::none());
     assert_eq!(outcome, HandleOutcome::Done);
     // The chat go/no-go decision references the deploy (the lineage tail) — so the lineage entry is a
     // MIDDLE entry (a tail truncation alone leaves a dense chain; a middle deletion breaks the seq).
     let outcome = auth.consumer().handle(&deploy_audit_action(
         "01J-chat-gonogo",
         &ArtifactRef("myelin://acme/chat/thread/go-no-go".into()),
-    ));
+    ), &mut myelin_events::HandlerTx::none());
     assert_eq!(outcome, HandleOutcome::Done);
 
     // The pristine chain verifies intact (the baseline).

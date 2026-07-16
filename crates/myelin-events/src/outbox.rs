@@ -660,6 +660,46 @@ impl OutboxTransaction {
     pub fn staged_len(&self) -> usize {
         self.staged_rows.len()
     }
+
+    /// **Emit with a caller-supplied DETERMINISTIC `event_id` (peer-review #8).** Identical to
+    /// [`OutboxTx::emit`] (same causality derivation via [`derive_envelope`]) EXCEPT the stable id is
+    /// the supplied `id` instead of a freshly-minted ULID. A reaction whose id is derived
+    /// deterministically from its triggering `event_id` (e.g. the CI dispatcher's co-emitted
+    /// `ci.run.started` / `ci.check.updated`) mints the SAME id on a re-run, so the outbox
+    /// `UNIQUE(event_id)` / `ON CONFLICT (event_id) DO NOTHING` dedups the re-emit — no duplicate
+    /// events even if the triggering handler runs twice. This is NOT a raw-publish (it stages into
+    /// the same co-commit buffer as `emit`; the `no-raw-publish` lint guards `publish_now` /
+    /// `BusTransport::put`, not the emit family).
+    pub fn emit_with_id(
+        &mut self,
+        id: EventId,
+        draft: EventDraft,
+        cause: Option<&EventEnvelope>,
+    ) -> Result<EventId> {
+        let aggregate = draft.aggregate.clone();
+        let subject = draft.subject.clone();
+        let ctx = EmitContext {
+            event_id: id.clone(),
+            tenant: self.ctx_base.tenant.clone(),
+            region: self.ctx_base.region.clone(),
+            actor: self.ctx_base.actor.clone(),
+            schema_ver: self.ctx_base.schema_ver,
+            occurred_at: self.ctx_base.occurred_at.clone(),
+            recorded_at: self.ctx_base.recorded_at.clone(),
+            caused_by: self.ctx_base.caused_by.clone(),
+        };
+        let envelope = derive_envelope(draft, ctx, cause);
+        self.staged_rows.push(OutboxRow {
+            event_id: id.clone(),
+            aggregate,
+            seq: 0,
+            subject,
+            envelope,
+            published_at: None,
+            attempts: 0,
+        });
+        Ok(id)
+    }
 }
 
 // **Emit-iff-committed (BUS-D4) is structural, not a Drop hook.** There is deliberately NO
