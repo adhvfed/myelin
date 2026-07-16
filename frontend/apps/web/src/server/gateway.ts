@@ -10,7 +10,7 @@
 // real `myelin-edge` binary can't yet issue a human a capability token — MR-012 deferred). Pointing
 // this at the real `edge` binary is a one-line env change, not new plumbing.
 
-import { runGateway } from "./gateway-core";
+import { runGateway, Unauthorized } from "./gateway-core";
 import {
   clearCurrentSession,
   getSessionRecord,
@@ -68,4 +68,55 @@ async function edgeRequest<T>(method: string, path: string, body?: unknown): Pro
     },
     clearSession: () => clearCurrentSession(),
   });
+}
+
+/** The RAW byte-fetch (R3.4 raw/download proxy). Streams an edge blob through the SAME server-side
+ *  auth (Bearer from the session cookie; never a public signed URL — the sovereignty rail), with ONE
+ *  refresh retry on 401. Returns the status, the edge's content-type + content-disposition (so the
+ *  proxy route forwards `attachment`), and the raw bytes. Binary-safe (never text-decodes the body). */
+export interface RawEdgeResponse {
+  status: number;
+  contentType: string;
+  contentDisposition: string | null;
+  body: ArrayBuffer;
+}
+
+export async function edgeGetRaw(path: string): Promise<RawEdgeResponse> {
+  const scheme = getSessionRecord()?.scheme ?? "pat";
+  const doFetch = (token: string) =>
+    fetch(`${edgeUrl()}${path}`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${token}`, "x-myelin-token-scheme": scheme },
+    });
+
+  const token = getSessionRecord()?.token;
+  if (!token) throw new Unauthorized("no session token (not authenticated)");
+  let res = await doFetch(token);
+  if (res.status === 401) {
+    // ONE refresh round-trip + retry (mirrors runGateway), then give up.
+    const rec = getSessionRecord();
+    let fresh: string | null = null;
+    if (rec) {
+      const rr = await fetch(`${edgeUrl()}/v1/auth/refresh`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${rec.refreshToken}`, "x-myelin-token-scheme": "refresh" },
+      });
+      if (rr.status === 200) {
+        const json = (await rr.json().catch(() => null)) as { access_token?: string } | null;
+        fresh = json?.access_token ?? rec.token;
+        updateSessionToken(fresh);
+      }
+    }
+    if (!fresh) {
+      clearCurrentSession();
+      throw new Unauthorized("still unauthorized after one refresh");
+    }
+    res = await doFetch(fresh);
+  }
+  return {
+    status: res.status,
+    contentType: res.headers.get("content-type") ?? "application/octet-stream",
+    contentDisposition: res.headers.get("content-disposition"),
+    body: await res.arrayBuffer(),
+  };
 }

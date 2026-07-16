@@ -22,6 +22,9 @@ import {
   commitDiffJson,
   prJson,
   prChecksJson,
+  refsJson,
+  treeJson,
+  rawBytes,
   unauthorizedEnvelope,
   notFoundEnvelope,
 } from "./dev-contract.mjs";
@@ -70,11 +73,14 @@ const server = createServer((req, res) => {
     return send(res, 200, reposEnvelope(limit));
   }
 
-  // GT-004 browse + PR routes (every one Bearer-gated; a missing seed is the uniform 404 envelope).
+  // GT-004 + R3.4 browse + PR routes (every one Bearer-gated; a missing seed is the uniform 404).
   if (method === "GET") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
     const limit = Number(url.searchParams.get("limit") ?? 50);
+    const cursor = url.searchParams.get("cursor") ?? undefined;
     const seg = (s) => decodeURIComponent(s);
+    // Decode a nested `{...path}` (keep the `/` separators).
+    const nested = (s) => s.split("/").map(decodeURIComponent).join("/");
     let m;
     // Order: more-specific (/prs/{n}/checks) before /prs/{n}.
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/checks$/))) {
@@ -85,12 +91,36 @@ const server = createServer((req, res) => {
       const v = prJson(seg(m[1]), Number(m[2]));
       return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("pull request"));
     }
-    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/blob\/([^/]+)\/([^/]+)$/))) {
-      const v = blobJson(seg(m[1]), seg(m[2]), seg(m[3]));
-      return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("file"));
+    // R3.4: the ref switcher.
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/refs$/))) {
+      const v = refsJson(seg(m[1]));
+      return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("repository"));
+    }
+    // R3.4: tree-at-path (root = /tree/{ref}; nested = /tree/{ref}/{...path}).
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/tree\/([^/]+)(?:\/(.+))?$/))) {
+      const v = treeJson(seg(m[1]), seg(m[2]), m[3] ? nested(m[3]) : "");
+      if (!v || v.__status === 404) return send(res, 404, notFoundEnvelope("path"));
+      return send(res, 200, v);
+    }
+    // R3.4: raw/download byte-serving (Content-Disposition set here).
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/(raw|download)\/([^/]+)\/(.+)$/))) {
+      const b = rawBytes(seg(m[1]), seg(m[3]), nested(m[4]), m[2] === "download");
+      if (!b) return send(res, 404, notFoundEnvelope("file"));
+      res.writeHead(200, {
+        "content-type": b.contentType,
+        "content-disposition": b.disposition,
+        "x-content-type-options": "nosniff",
+      });
+      return res.end(b.body);
+    }
+    // R3.4: nested blob.
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/blob\/([^/]+)\/(.+)$/))) {
+      const v = blobJson(seg(m[1]), seg(m[2]), nested(m[3]));
+      if (!v || v.__status === 404) return send(res, 404, notFoundEnvelope("file"));
+      return send(res, 200, v);
     }
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/commits\/([^/]+)$/))) {
-      const v = commitsEnvelope(seg(m[1]), limit);
+      const v = commitsEnvelope(seg(m[1]), limit, cursor);
       return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("repository"));
     }
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/commit\/([^/]+)$/))) {

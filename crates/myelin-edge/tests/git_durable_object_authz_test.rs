@@ -256,6 +256,9 @@ fn ungranted_in_tenant_principal_is_denied_on_every_object_route() {
     h.seed_repo_with_pr("subj-creator", "alpha");
 
     // READS → the 0-leak 404 (repo existence is not leaked; identical to the absent-repo body).
+    // R3.4: the new browse read routes (refs / tree-at-path / nested blob / raw / download) go through
+    // the SAME `guarded(Pull)` wrapper — they must inherit the identical 0-leak posture (no ref/path
+    // existence leak on deny).
     for path in [
         "/v1/git/repos/alpha",
         "/v1/git/repos/alpha/commits/main",
@@ -263,6 +266,12 @@ fn ungranted_in_tenant_principal_is_denied_on_every_object_route() {
         "/v1/git/repos/alpha/blob/main/README.md",
         "/v1/git/repos/alpha/prs/1",
         "/v1/git/repos/alpha/prs/1/checks",
+        "/v1/git/repos/alpha/refs",
+        "/v1/git/repos/alpha/tree/main",
+        "/v1/git/repos/alpha/tree/main/crates/inner",
+        "/v1/git/repos/alpha/blob/main/crates/inner/deep.rs",
+        "/v1/git/repos/alpha/raw/main/README.md",
+        "/v1/git/repos/alpha/download/main/README.md",
     ] {
         let (st, v) = h.call("subj-mallory", "GET", path, b"");
         assert_eq!(st, 404, "un-granted READ {path} must be the 0-leak 404: {v}");

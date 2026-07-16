@@ -8,6 +8,7 @@ import { A, createAsync } from "@solidjs/router";
 import { Icon, Skeleton } from "@myelin/design-system";
 import { getRepos, type RepoHomeVM } from "~/lib/api";
 import { bareRepo } from "~/lib/format";
+import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 
 export default function ReposScreen() {
   const repos = createAsync(() => getRepos());
@@ -19,13 +20,7 @@ export default function ReposScreen() {
         Repositories
       </h1>
 
-      <ErrorBoundary
-        fallback={(err) => (
-          <p role="alert" style={{ color: "var(--danger)", border: "var(--hairline) solid var(--danger)", padding: "var(--space-3)", "border-radius": "var(--radius-1)" }}>
-            <Icon name="check-fail" /> Could not load repositories: {String(err.message ?? err)}
-          </p>
-        )}
-      >
+      <ErrorBoundary fallback={(err, reset) => <RepoErrorState kind={errKind(err)} onRetry={reset} />}>
         <Suspense fallback={<Skeleton label="Loading repositories…" rows={4} rowHeight="4rem" data-testid="repos-loading" />}>
           <Show when={repos()} keyed>
             {(page) => (
