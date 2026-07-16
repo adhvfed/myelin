@@ -1838,8 +1838,12 @@ impl<P: RepoPathResolver> DurableGitStore<P> {
     pub fn open_repo(&self, repo: &RepoLoc) -> Result<DurableGitRepo, DurableError> {
         let path = self.repo_path(repo)?;
         // Probe with a real open so a missing/!valid repo is a clean NotFound, not a later op error.
+        // Peer-review finding 2026-07-16 #5: the NotFound message names the repo by its LOGICAL slug
+        // (which the caller already supplied), NEVER the on-disk `path.display()` — a granted-but-
+        // missing repo must not leak the server's filesystem layout (the authz guard runs upstream, so
+        // this is not an existence oracle, but the host path is still not the client's to see).
         git2::Repository::open(&path)
-            .map_err(|_| DurableError::NotFound(format!("bare repo {}", path.display())))?;
+            .map_err(|_| DurableError::NotFound(format!("bare repo {}", repo.repo)))?;
         Ok(DurableGitRepo { path })
     }
 
