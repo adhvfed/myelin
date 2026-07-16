@@ -469,11 +469,11 @@ fn handle_is_idempotent_on_event_id() {
     consumer.add_parent_edge(&child, &parent);
 
     let ev = updated_event("01J-1", &child.0);
-    assert_eq!(consumer.handle(&ev), HandleOutcome::Done);
+    assert_eq!(consumer.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
     assert_eq!(consumer.pending_recompute_count(), 1);
 
     // A redelivery of the SAME event_id is a no-op (the coalescer is not re-dirtied; the count holds).
-    assert_eq!(consumer.handle(&ev), HandleOutcome::Done);
+    assert_eq!(consumer.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
     assert_eq!(
         consumer.pending_recompute_count(),
         1,
@@ -489,7 +489,7 @@ fn malformed_event_is_non_retryable() {
     let mut ev = updated_event("01J-2", "");
     ev.subject = ArtifactRef(String::new());
     assert!(matches!(
-        consumer.handle(&ev),
+        consumer.handle(&ev, &mut myelin_events::HandlerTx::none()),
         HandleOutcome::NonRetryable(_)
     ));
 }

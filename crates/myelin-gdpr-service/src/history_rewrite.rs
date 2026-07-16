@@ -623,7 +623,7 @@ impl RewriteAudit {
     ) -> u64 {
         let seq = consumer.log().len_for(&request.tenant);
         let ev = RewriteAudit::audit_event(request, outcome, seq);
-        consumer.handle(&ev);
+        consumer.handle(&ev, &mut myelin_events::HandlerTx::none());
         seq
     }
 }

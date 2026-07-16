@@ -402,7 +402,7 @@ pub use crosscell_propagation::{
     pointer_for_propagation, propagated_carried_fields, CrossCellPropagator, CrossCellStream,
     PropagatedPointer,
 };
-pub use dedup::{DedupLedger, DurableDedup, CONSUMER_DEDUP_MIGRATION};
+pub use dedup::{CoCommitError, CoCommitTx, DedupLedger, DurableDedup, CONSUMER_DEDUP_MIGRATION};
 /// The firehose resume-cursor subscription protocol (contract 3.5, the Bus-owned zero-loss-replay
 /// half — EB-21 / P-141, built FIRST per EI-04 §2.2). `Firehose::publish`/`tail`/`subscribe`/`resume`
 /// implement the §5.5 surface: a per-`(stream, scope)` monotonic `seq`, `(last_seq, now]` backfill on
@@ -567,6 +567,58 @@ pub enum HandleOutcome {
     Retry(Backoff),
 }
 
+/// **The same-transaction co-commit handle threaded into a handler (peer-review #7 / MR-023b —
+/// FIXED).** The [`consumer::Consumer`] runtime opens ONE database transaction, INSERTs the
+/// `(consumer, event_id)` dedup mark WITHIN it, and passes this handle to [`EventHandler::handle`];
+/// a handler runs its durable state writes on the SAME transaction, so the dedup mark and the
+/// effect **commit atomically or roll back together**. This is what makes the consumer
+/// exactly-once-WITH-EFFECT instead of at-most-once: a crash between the dedup mark and the commit
+/// leaves NEITHER the mark NOR the effect, so a redelivery RE-RUNS the handler and the effect lands
+/// (never a committed mark with a lost effect — the MR-023b floor, now closed).
+///
+/// **Why type-erased:** `myelin-events` is a §2.9 DAG SINK — it cannot name `sqlx`. So the handle
+/// carries the concrete database connection **type-erased** behind `&mut dyn Any`. A durable handler
+/// (in a storage-aware crate) recovers the real connection with [`HandlerTx::connection`]
+/// (downcasting to `&mut sqlx::PgConnection`) and runs its writes on it. A handler whose effect is an
+/// in-memory projection (not a shared-DB write on this pool) legitimately IGNORES the handle — its
+/// durable-projection co-commit is that subsystem's named floor, not an open re-instance of #7
+/// (there is no durable effect on THIS pool to lose). A durable handler that finds no connection
+/// ([`HandlerTx::is_durable`] false / [`HandlerTx::connection`] `None`) MUST fail-closed (return
+/// [`HandleOutcome::Retry`]) rather than silently write outside the tx — writing outside the tx
+/// re-opens the exact at-most-once bug.
+pub struct HandlerTx<'a> {
+    conn: Option<&'a mut dyn core::any::Any>,
+}
+
+impl<'a> HandlerTx<'a> {
+    /// Wrap a type-erased, transaction-bound connection the handler downcasts to write on (the
+    /// DURABLE co-commit path — the same tx the dedup mark is in).
+    pub fn with_connection(conn: &'a mut dyn core::any::Any) -> HandlerTx<'a> {
+        HandlerTx { conn: Some(conn) }
+    }
+
+    /// A handle carrying NO co-commit connection — the in-memory model / unit-test path (a handler
+    /// whose effect is not a shared-DB write; the dedup ledger models the mark's atomicity in
+    /// memory). A durable handler treats this as "no tx available" and fails-closed.
+    pub fn none() -> HandlerTx<'static> {
+        HandlerTx { conn: None }
+    }
+
+    /// Recover the concrete transaction-bound connection to run the handler's writes on (downcast
+    /// from the erased handle — e.g. `tx.connection::<sqlx::PgConnection>()`). `None` on the
+    /// in-memory path (or a type mismatch). A durable handler MUST treat `None` as fail-closed
+    /// (Retry), NEVER a silent write outside the tx (that re-opens the at-most-once bug — #7).
+    pub fn connection<T: core::any::Any>(&mut self) -> Option<&mut T> {
+        self.conn.as_deref_mut().and_then(|c| c.downcast_mut::<T>())
+    }
+
+    /// Whether a co-commit connection is present (a handler can branch: durable co-commit write vs
+    /// the in-memory model). `true` only on the durable runtime path.
+    pub fn is_durable(&self) -> bool {
+        self.conn.is_some()
+    }
+}
+
 /// The one consumer template (architecture §5; contract 2.4; BUS-3). Built from this
 /// single trait so the seven encoded rules cannot be skipped per-consumer. `subjects()`
 /// is a whitelist, **NEVER `*`** (an over-broad subscription head-of-line-blocks
@@ -575,13 +627,23 @@ pub enum HandleOutcome {
 /// The consumer runtime (the seven rules + the dedup ledger) is [`consumer::Consumer`]
 /// (**shipped in P-S08**); the upcaster registry that runs before `handle` is **P-S09**
 /// (the [`consumer::Consumer::with_upcaster`] hook). The trait shape is frozen here.
+///
+/// **The [`HandlerTx`] co-commit seam (#7 / MR-023b — FIXED):** `handle` receives a same-transaction
+/// handle so a handler's durable state write co-commits with the dedup mark (both land or neither).
+/// A handler with a shared-DB effect writes on `tx.connection::<sqlx::PgConnection>()`; an in-memory
+/// / outbox-seam handler ignores it (documented per impl).
 pub trait EventHandler {
     /// Whitelist — NEVER `*` (BUS-3, D7-i). [`consumer::Subscription::bind`] enforces the
     /// `*`-rejection at registration so an over-broad subscription is unconstructable.
     fn subjects(&self) -> &'static [SubjectPattern];
     /// Idempotent on `event_id` (ADR-04.1). Body is the consumer's; the runtime around
     /// it (dedup, ack-after-enqueue, bounded prefetch, lag metric) is [`consumer::Consumer`].
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome;
+    ///
+    /// `tx` is the same-transaction co-commit handle (#7 / MR-023b): a handler's durable state
+    /// write runs on `tx.connection::<sqlx::PgConnection>()` so it co-commits with the dedup mark.
+    /// An in-memory / outbox-seam handler accepts and ignores it (its durable-projection co-commit
+    /// is that subsystem's named floor).
+    fn handle(&self, ev: &EventEnvelope, tx: &mut HandlerTx<'_>) -> HandleOutcome;
 }
 
 #[cfg(test)]
@@ -723,13 +785,16 @@ mod tests {
             fn subjects(&self) -> &'static [SubjectPattern] {
                 SUBJECTS
             }
-            fn handle(&self, _ev: &EventEnvelope) -> HandleOutcome {
+            fn handle(&self, _ev: &EventEnvelope, _tx: &mut HandlerTx<'_>) -> HandleOutcome {
                 HandleOutcome::Done
             }
         }
         let h = Idx;
         assert!(h.subjects().is_empty());
-        assert_eq!(h.handle(&sample_envelope()), HandleOutcome::Done);
+        assert_eq!(
+            h.handle(&sample_envelope(), &mut HandlerTx::none()),
+            HandleOutcome::Done
+        );
     }
 
     fn sample_envelope() -> EventEnvelope {

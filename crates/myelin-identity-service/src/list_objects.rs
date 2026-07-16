@@ -518,7 +518,7 @@ mod tests {
         let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
         relay.drain_to_empty();
         for env in bus.consume("") {
-            consumer.handle(&env);
+            consumer.handle(&env, &mut myelin_events::HandlerTx::none());
         }
 
         ListObjects::with_cap(store, namespace, index, cap)

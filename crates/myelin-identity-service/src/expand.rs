@@ -614,7 +614,7 @@ mod tests {
         let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
         relay.drain_to_empty();
         for env in bus.consume("") {
-            consumer.handle(&env);
+            consumer.handle(&env, &mut myelin_events::HandlerTx::none());
         }
         (store, index, NamespaceEngine::with_core_hierarchy())
     }
@@ -737,7 +737,7 @@ mod tests {
         let bus = InProcessBus::new();
         Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into())).drain_to_empty();
         for env in bus.consume("") {
-            consumer.handle(&env);
+            consumer.handle(&env, &mut myelin_events::HandlerTx::none());
         }
         let expand = Expand::new(store, ns, index);
         let tree = expand.list_subjects(

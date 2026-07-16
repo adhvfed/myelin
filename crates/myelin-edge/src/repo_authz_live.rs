@@ -787,7 +787,7 @@ mod tests {
         let relay = Relay::new(outbox, bus.clone(), || Timestamp("t".into()));
         relay.drain_to_empty();
         for env in bus.consume("") {
-            let _ = consumer.handle(&env);
+            let _ = consumer.handle(&env, &mut myelin_events::HandlerTx::none());
         }
         let authz = authorizer(sbc);
         let candidates = vec!["alpha".to_string(), "beta".to_string()];

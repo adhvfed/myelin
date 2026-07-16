@@ -704,7 +704,7 @@ mod tests {
                 &format!("01J-{tenant}-{i}"),
                 tenant,
                 &format!("myelin://{tenant}/x/{i}"),
-            ));
+            ), &mut myelin_events::HandlerTx::none());
         }
     }
 
@@ -984,7 +984,7 @@ mod tests {
             "01J-1",
             "acme",
             "myelin://acme/SENSITIVE-SUBJECT",
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         let sth = auth.signed_tree_head(&tenant, "t1").unwrap();
         let witness = NotaryWitness::new(CellSigningKey::from_seed("notary"));
         let attestation = auth.anchor_to_witness(&sth, &witness);

@@ -76,7 +76,7 @@ fn cdc_10_6_provider_serves_proofs_consumer_auditor_verifies() {
             &format!("01J-{i}"),
             "acme",
             &format!("myelin://acme/x/{i}"),
-        ));
+        ), &mut myelin_events::HandlerTx::none());
     }
 
     // The provider commits an STH (size 6) and serves an inclusion proof for leaf 4.
@@ -96,7 +96,7 @@ fn cdc_10_6_provider_serves_proofs_consumer_auditor_verifies() {
             &format!("01J-{i}"),
             "acme",
             &format!("myelin://acme/x/{i}"),
-        ));
+        ), &mut myelin_events::HandlerTx::none());
     }
     let sth_v2 = provider
         .signed_tree_head(&tenant, "2026-06-20T01:00:00Z")

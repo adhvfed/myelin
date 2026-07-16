@@ -651,7 +651,7 @@ impl EventHandler for CheckStatusConsumer {
     /// applies the monotonic [`supersedes`] rule. A wrong-type event or a malformed payload is a LOUD
     /// [`HandleOutcome::NonRetryable`] (dead-letter — never silently dropped, never the wrong shape
     /// into the projection). A valid fact is applied and `Done` (the runtime acks + dedup-marks it).
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         // The handler binds only `ci.check.updated`; a foreign type slipping through the whitelist is
         // a wiring bug — dead-letter it loudly (rule 5), never apply it.
         if ev.type_.0 != CI_CHECK_UPDATED {

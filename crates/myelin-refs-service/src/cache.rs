@@ -778,7 +778,7 @@ mod tests {
         let inv = RefsProjectionInvalidator::with_cache(Arc::new(c.clone()));
         let ev = lifecycle_event("01J-u", "issue.issue.updated", &ref_.0);
         assert_eq!(
-            inv.handle(&ev),
+            inv.handle(&ev, &mut myelin_events::HandlerTx::none()),
             myelin_events::HandleOutcome::Done,
             "the invalidator busts the live entry"
         );

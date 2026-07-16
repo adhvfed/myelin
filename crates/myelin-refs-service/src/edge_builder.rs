@@ -673,7 +673,7 @@ impl EventHandler for RefsEdgeBuilder {
     /// Idempotent on the deterministic `edge_id` (the upsert) AND on `event_id` (the runtime's
     /// `consumer_dedup` outer guard, rule 1) — belt and braces. A structurally-malformed event is a
     /// non-retryable poison ([`HandleOutcome::NonRetryable`]) — never a silent corruption.
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         match self.project(ev) {
             Ok(()) => HandleOutcome::Done,
             Err(ProjectError(reason)) => HandleOutcome::NonRetryable(Reason(reason)),
@@ -778,9 +778,9 @@ mod tests {
         let tgt = "myelin://acme/knowledge/page/7c2#block-3";
         let ev = edge_event("01J-1", "refs.edge.created", src, tgt, "embeds");
 
-        assert_eq!(b.handle(&ev), HandleOutcome::Done);
+        assert_eq!(b.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
         // replay the SAME event → still one row (idempotent on edge_id).
-        assert_eq!(b.handle(&ev), HandleOutcome::Done);
+        assert_eq!(b.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
         assert_eq!(
             b.projection().live_count(&tenant(), &region()),
             1,
@@ -824,7 +824,7 @@ mod tests {
         let src = "myelin://acme/issue/issue/ENG-1";
         let tgt = "myelin://acme/issue/issue/ENG-2";
         let ev = edge_event("01J-rel", "issue.relation.created", src, tgt, "blocks");
-        assert_eq!(b.handle(&ev), HandleOutcome::Done);
+        assert_eq!(b.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
         let id = edge_id(&tenant(), src, tgt, "blocks");
         let row = b
             .projection()
@@ -845,7 +845,7 @@ mod tests {
         let mut ev = edge_event("01J-pg", "knowledge.page.created", "x", "y", "z");
         ev.payload = serde_json::json!({ "title_ref": "r1" }); // no source/target/rel.
         assert_eq!(
-            b.handle(&ev),
+            b.handle(&ev, &mut myelin_events::HandlerTx::none()),
             HandleOutcome::Done,
             "no edge payload → no-op, not poison"
         );
@@ -863,7 +863,7 @@ mod tests {
         let b = RefsEdgeBuilder::new(EdgeProjection::new());
         let mut ev = edge_event("01J-bad", "refs.edge.created", "s", "t", "mentions");
         ev.payload = serde_json::json!({ "target": "t", "rel": "mentions" }); // no source.
-        match b.handle(&ev) {
+        match b.handle(&ev, &mut myelin_events::HandlerTx::none()) {
             HandleOutcome::NonRetryable(Reason(r)) => {
                 assert!(r.contains("source"), "names the field: {r}")
             }
@@ -887,12 +887,12 @@ mod tests {
             src,
             tgt,
             "mentions",
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         assert_eq!(b.projection().live_count(&tenant(), &region()), 1);
 
         // remove by the (source, target, rel) triple → tombstone.
         let rm = edge_event("01J-r", "refs.edge.removed", src, tgt, "mentions");
-        assert_eq!(b.handle(&rm), HandleOutcome::Done);
+        assert_eq!(b.handle(&rm, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
         assert_eq!(
             b.projection().live_count(&tenant(), &region()),
             0,
@@ -904,7 +904,7 @@ mod tests {
             "row retained for audit"
         );
         // redelivered removal is a no-op (idempotent).
-        assert_eq!(b.handle(&rm), HandleOutcome::Done);
+        assert_eq!(b.handle(&rm, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
         assert_eq!(b.projection().total_count(&tenant(), &region()), 1);
 
         let id = edge_id(&tenant(), src, tgt, "mentions");
@@ -923,7 +923,7 @@ mod tests {
         let b = RefsEdgeBuilder::new(EdgeProjection::new());
         let rm = edge_event("01J-r", "refs.edge.removed", "s", "t", "mentions");
         assert_eq!(
-            b.handle(&rm),
+            b.handle(&rm, &mut myelin_events::HandlerTx::none()),
             HandleOutcome::Done,
             "removal of absent edge is a no-op"
         );
@@ -942,9 +942,9 @@ mod tests {
             src,
             tgt,
             "mentions",
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         let er = edge_event("01J-e", "chat.message.erased", src, tgt, "mentions");
-        assert_eq!(b.handle(&er), HandleOutcome::Done);
+        assert_eq!(b.handle(&er, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
         assert_eq!(
             b.projection().live_count(&tenant(), &region()),
             0,
@@ -966,7 +966,7 @@ mod tests {
             "s",
             "t",
             "mentions",
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         assert_eq!(b.index_lag(), 0, "index_lag returns to 0 after projection");
         assert_eq!(
             RefsEdgeBuilder::INDEX_LAG_SIGNAL,
