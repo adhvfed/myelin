@@ -1247,7 +1247,13 @@ impl DurableGitRepo {
             .map_err(|e| git_err("pr diff_tree_to_tree", e))?;
 
         let files: std::cell::RefCell<Vec<PrFileDelta>> = std::cell::RefCell::new(Vec::new());
+        // Rendered-line count for the CURRENT file — bounds memory: once a file reaches its cap we
+        // stop ACCUMULATING lines (still counting the true diffstat), so a huge single-hunk file never
+        // materializes wholesale in the response Vec (R3.2 verifier HOLD — the cap is a load bound, not
+        // just a post-hoc trim). Reset when a new file delta begins.
+        let rendered = std::cell::RefCell::new(0usize);
         let mut file_cb = |delta: git2::DiffDelta<'_>, _p: f32| {
+            *rendered.borrow_mut() = 0;
             let path = delta
                 .new_file()
                 .path()
@@ -1334,18 +1340,25 @@ impl DurableGitRepo {
                 {
                     f.kind = FileKind::Lfs;
                 }
+                // The diffstat (additions/deletions) always reflects the TRUE totals, even past the cap.
                 match origin {
                     '+' => f.additions += 1,
                     '-' => f.deletions += 1,
                     _ => {}
                 }
-                if let Some(h) = f.hunks.last_mut() {
+                // Bound accumulation at the per-file cap: past it, count but don't store the line, and
+                // flag the file truncated. `cap == 0` means unbounded (caller opted out).
+                let mut r = rendered.borrow_mut();
+                if per_file_line_cap > 0 && *r >= per_file_line_cap {
+                    f.truncated = true;
+                } else if let Some(h) = f.hunks.last_mut() {
                     h.lines.push(DiffLineDelta {
                         origin,
                         content,
                         old_no: line.old_lineno(),
                         new_no: line.new_lineno(),
                     });
+                    *r += 1;
                 }
             }
             true
@@ -1364,21 +1377,12 @@ impl DurableGitRepo {
             if f.kind != FileKind::Text {
                 f.hunks.clear();
             }
-            // Per-file line cap: keep whole hunks until the cap, drop the rest, flag truncated.
-            if per_file_line_cap > 0 {
-                let mut seen = 0usize;
-                let mut cut = None;
-                for (i, h) in f.hunks.iter().enumerate() {
-                    if seen >= per_file_line_cap {
-                        cut = Some(i);
-                        break;
-                    }
-                    seen += h.lines.len();
-                }
-                if let Some(i) = cut {
-                    f.hunks.truncate(i);
-                    f.truncated = true;
-                }
+            // `line_cb` already bounded accumulation at `per_file_line_cap` (within a hunk, so a huge
+            // single-hunk file is capped — R3.2 verifier HOLD). A truncated file may carry trailing
+            // hunks that received no lines (the cap hit before them); drop those empty hunks so the
+            // wire never ships a bare hunk header.
+            if f.truncated {
+                f.hunks.retain(|h| !h.lines.is_empty());
             }
         }
         let total_files = files.len();
@@ -2027,6 +2031,48 @@ mod tests {
 
         // A malformed/absent head → None (the edge renders the empty state, not a 500).
         assert!(repo.pr_diff("refs/heads/main", "not-an-oid", 4000).unwrap().is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **R3.2 verifier HOLD: a huge SINGLE-HUNK file (a new file = one `@@ -0,0 +1,N @@` hunk) is
+    /// capped, not dumped wholesale.** The cap must bind WITHIN a hunk (the pre-fix code only dropped
+    /// whole trailing hunks, so a one-hunk file sailed past the cap). The diffstat stays truthful.
+    #[test]
+    fn pr_diff_caps_a_single_huge_hunk_not_only_at_hunk_boundaries() {
+        let root = temp_root("prcap");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+
+        // base: empty tree (no files).
+        let t0 = repo.write_tree(&[]).unwrap();
+        let base = repo
+            .write_commit(&t0, &[], "base", "psn@acme.noreply", "psn@acme.noreply")
+            .unwrap();
+        repo.update_ref_cas("refs/heads/main", None, Some(&base), "create", "psn@acme.noreply")
+            .unwrap();
+
+        // head: add ONE new 5000-line file — a single `@@ -0,0 +1,5000 @@` hunk.
+        let big: String = (0..5000).map(|i| format!("line {i}\n")).collect();
+        let bh = repo.write_blob(big.as_bytes()).unwrap();
+        let th = repo.write_tree(&[("big.txt", &bh)]).unwrap();
+        let head = repo
+            .write_commit(&th, &[&base], "add big", "psn@acme.noreply", "psn@acme.noreply")
+            .unwrap();
+
+        let cap = 100;
+        let diff = repo.pr_diff("refs/heads/main", &head.0, cap).unwrap().unwrap();
+        assert_eq!(diff.total_files, 1);
+        let f = &diff.files[0];
+        assert_eq!(f.path, "big.txt");
+        assert!(f.truncated, "a file over the cap MUST be flagged truncated");
+        let rendered: usize = f.hunks.iter().map(|h| h.lines.len()).sum();
+        assert!(rendered <= cap, "rendered lines ({rendered}) must not exceed the cap ({cap})");
+        assert_eq!(f.additions, 5000, "the diffstat still reports the TRUE addition count");
+        // Uncapped (cap=0) renders the whole file — the opt-out path.
+        let full = repo.pr_diff("refs/heads/main", &head.0, 0).unwrap().unwrap();
+        let full_rendered: usize = full.files[0].hunks.iter().map(|h| h.lines.len()).sum();
+        assert_eq!(full_rendered, 5000, "cap=0 is uncapped");
+        assert!(!full.files[0].truncated);
         std::fs::remove_dir_all(&root).ok();
     }
 
