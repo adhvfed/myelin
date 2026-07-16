@@ -116,16 +116,33 @@ git config user.name  "founder@acme.noreply"
 > Only the git **wire** routes accept HTTP Basic. The JSON product API (`/v1/git/...`, `/v1/whoami`)
 > is **Bearer-only** — send `Authorization: Bearer $TOKEN` (the CLI does this for you).
 
-## 6. Use the token — web (coming in the frontend half)
+## 6. Use the token — web
 
 The edge exposes an operator-token login gate at `GET /v1/auth/config` (`token_login_enabled`), turned
-on by `MYELIN_TOKEN_LOGIN=1` (the dogfood env sets it). The web form that consumes it — paste your
-`edge bootstrap` token to sign in — is the **separate R4.0 frontend deliverable**. Point the web app
-at the edge meanwhile:
+on by `MYELIN_TOKEN_LOGIN=1` (the dogfood env sets it). The `/login` page renders a token card: paste
+your `edge bootstrap` token to sign in (it is verified server-side against the edge `whoami`). Point the
+web app at the edge:
 
 ```sh
 ./scripts/dogfood.sh web       # prints the env + instructions (EXEC=1 to actually start pnpm/vinxi)
 ```
+
+## 6a. Solo-operator merges (branch protection)
+
+A fresh repo's default ruleset requires **1 approval**, and Myelin does **not** count an author's approval
+of their own PR (a deliberate policy). A solo founder therefore cannot merge until a second reviewer exists.
+For single-operator dogfood, set the ref's required approvals to 0 (a repo-admin write):
+
+```sh
+curl -sS -X POST "$MYELIN_EDGE_URL/v1/git/repos/<repo>/branch-protection" \
+  -H "authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"rulesets":[{"ref_pattern":"refs/heads/main","required_approvals":0,"required_contexts":[]}]}'
+```
+
+> Open PRs with an explicit `head_oid` (`git rev-parse <head_ref>`) — a PR opened without it currently
+> cannot be merged. Mirroring an existing GitHub repo's *history* is rejected by the pseudonymous-commit
+> gate (real emails are not pseudonyms); dogfood new work with a `<handle>@<tenant>.noreply` identity and
+> keep GitHub as the read-only history mirror.
 
 ## 7. Revoke a token
 

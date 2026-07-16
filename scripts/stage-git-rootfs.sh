@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Stage a git-bearing gVisor rootfs for the Myelin git WIRE (R4.1 / CT-006d).
+#
+# The receive-pack (push) and upload-pack (clone/fetch) paths ingest/serve the UNTRUSTED pack inside a
+# gVisor (`runsc`) sandbox that runs a REAL `git` in the guest (`git index-pack`, `git <svc>
+# --advertise-refs`/`--stateless-rpc`). That guest needs a rootfs containing `git` + its shared libs +
+# the git-core helpers. This script bakes one from the base busybox rootfs + the host's own `git`,
+# exactly as the CT-006 prod-exec tests stage it
+# (crates/myelin-ci-sandbox/tests/git_wire_prod_exec_test.rs::stage_git_rootfs) — so `dogfood.sh` can
+# provision it once and point MYELIN_GVISOR_GIT_ROOTFS at it.
+#
+# PRODUCTION staging would bake an immutable, digest-pinned OCI git image; this host-git copy is the
+# single-founder dogfood floor (the guest still runs NON-ROOT as uid 65534 — the CT-002 security lesson).
+#
+#   ./scripts/stage-git-rootfs.sh          stage into ~/.local/share/gvisor-assets/git-rootfs (idempotent)
+#   FORCE=1 ./scripts/stage-git-rootfs.sh  re-stage from scratch (removes the existing staged tree)
+#
+# Prereqs: a base gVisor rootfs at ~/.local/share/gvisor-assets/rootfs (MYELIN_GVISOR_ROOTFS overrides),
+# a host `git` on PATH, and `runsc` if you intend to actually run the wire.
+set -euo pipefail
+
+ASSETS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gvisor-assets"
+BASE_ROOTFS="${MYELIN_GVISOR_ROOTFS:-${ASSETS_DIR}/rootfs}"
+STAGED="${MYELIN_GVISOR_GIT_ROOTFS:-${ASSETS_DIR}/git-rootfs}"
+
+die() { echo "stage-git-rootfs: $*" >&2; exit 1; }
+
+[[ -d "${BASE_ROOTFS}" ]] || die "base rootfs absent at ${BASE_ROOTFS} — build/stage it first (MYELIN_GVISOR_ROOTFS overrides)"
+HOST_GIT="$(command -v git)" || die "no host \`git\` on PATH to bake into the guest"
+
+# Idempotent: a staged tree with a guest git already present is a no-op unless FORCE=1.
+if [[ "${FORCE:-0}" != "1" && -x "${STAGED}/usr/bin/git" ]]; then
+  echo "stage-git-rootfs: already staged at ${STAGED} (FORCE=1 to re-stage)" >&2
+  echo "${STAGED}"
+  exit 0
+fi
+
+echo "stage-git-rootfs: baking a git rootfs at ${STAGED} from base ${BASE_ROOTFS} + ${HOST_GIT}" >&2
+rm -rf "${STAGED}"
+mkdir -p "${STAGED}"
+# Copy the whole base rootfs (busybox + its glibc) preserving symlinks/perms.
+cp -a "${BASE_ROOTFS}/." "${STAGED}/"
+
+# The host `git` (a single multi-call binary; upload-pack/receive-pack dispatch off argv[0]).
+install -Dm755 "${HOST_GIT}" "${STAGED}/usr/bin/git"
+
+# Copy a host lib (resolving symlinks) into BOTH /usr/lib and /lib, recreating the soname symlink so
+# the in-guest dynamic linker finds it. Mirrors the test's stage_lib.
+stage_lib() {
+  local soname="$1" host_path="$2" real real_name libdir dst link
+  [[ -e "${host_path}" ]] || die "expected host lib ${host_path} (git's dependency) is absent"
+  real="$(readlink -f "${host_path}")"
+  real_name="$(basename "${real}")"
+  for libdir in usr/lib lib; do
+    dst="${STAGED}/${libdir}/${real_name}"
+    install -Dm644 "${real}" "${dst}"
+    link="${STAGED}/${libdir}/${soname}"
+    rm -f "${link}"
+    ln -s "${real_name}" "${link}"
+  done
+}
+# The two shared libs `git` needs beyond glibc (discover the exact paths from the host's own git).
+resolve_lib() { ldd "${HOST_GIT}" | sed -n "s/.*${1}[^ ]* => \([^ ]*\).*/\1/p" | head -1; }
+stage_lib "libpcre2-8.so.0"  "$(resolve_lib libpcre2-8)"
+stage_lib "libz-ng.so.2"     "$(resolve_lib libz-ng)"
+
+# The git-core exec dir: helpers are symlinks back to the single `git` binary
+# (/usr/lib/git-core/../../bin/git = /usr/bin/git). GIT_EXEC_PATH points the sandboxed git here.
+mkdir -p "${STAGED}/usr/lib/git-core"
+for helper in git-upload-pack git-receive-pack; do
+  ln -sf "../../bin/git" "${STAGED}/usr/lib/git-core/${helper}"
+done
+
+# The bind-mount TARGET dirs must PRE-EXIST in the read-only root (runsc cannot create a mount point
+# inside a readonly:true rootfs — exactly as /tmp pre-exists for the tmpfs mount).
+mkdir -p "${STAGED}/repo" "${STAGED}/quarantine"
+
+echo "stage-git-rootfs: done — set MYELIN_GVISOR_GIT_ROOTFS=${STAGED}" >&2
+echo "${STAGED}"
