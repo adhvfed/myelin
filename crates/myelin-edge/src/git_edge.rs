@@ -133,7 +133,12 @@ impl GitEdgeState {
     /// and a code hit. Used by the deployable binary's bootable demo + the integration proofs.
     pub fn seed_demo(self, tenant: &str) -> GitEdgeState {
         let slug = format!("{tenant}/myelin");
-        let clone_url = format!("ssh://git@myelin/{tenant}/myelin.git");
+        // F3 (R4.1 dogfood): advertise the HONEST HTTP git-wire clone URL — the wire path grammar is
+        // `/{tenant}/{region}/{repo}.git` over HTTP smart-transport (there is NO SSH server). The demo
+        // fixture is keyed only by (tenant, slug), so it renders a relative wire path with the demo
+        // residency region; never the old `ssh://git@myelin/…` (wrong scheme, missing region).
+        let region = std::env::var("MYELIN_REGION").unwrap_or_else(|_| "fr-par".to_string());
+        let clone_url = format!("/{tenant}/{region}/myelin.git");
         self.with_repo(
             tenant,
             "myelin",

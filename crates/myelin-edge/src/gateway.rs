@@ -412,7 +412,38 @@ impl Gateway {
     pub fn handle(&self, req: EdgeRequest) -> EdgeResponse {
         match self.handle_inner(&req) {
             Ok(resp) => resp,
-            Err(e) => EdgeResponse::error(&e),
+            Err(e) => {
+                let mut resp = EdgeResponse::error(&e);
+                // F1 (R4.1 dogfood) — the git smart-HTTP wire's HTTP-Basic challenge. A real `git
+                // push`/`clone` over a credential helper/manager/interactive prompt only OFFERS its
+                // Basic credential AFTER a 401 that carries `WWW-Authenticate: Basic …`; without the
+                // header git never sends the credential and the push fails auth (proven: `curl -u`
+                // and preemptive `http.extraHeader` both work, a helper-driven push did not). Emit the
+                // challenge on a git-wire route 401 ONLY — NEVER on the JSON product API (a browser
+                // Basic popup on `/v1/…` would wreck the cookie-session web login), NEVER on 200/403
+                // (a successful or Bearer/Basic-authenticated wire call is untouched). The 401 body
+                // stays byte-identical + oracle-free — only this header is added.
+                if e.status() == 401 && self.is_git_wire_route(&req) {
+                    resp = resp.with_header("WWW-Authenticate", r#"Basic realm="Myelin""#);
+                }
+                resp
+            }
+        }
+    }
+
+    /// **F1 — is this request's path a registered git smart-HTTP WIRE route?** Re-runs the SAME
+    /// method-parse + route match the lifecycle uses and checks the matched route's declared action
+    /// verb (`git.wire.*`) — the exact gate `handle_inner` computes `allow_basic` from (~L449), so the
+    /// Basic-challenge scope can never drift onto a non-wire route. TOTAL over attacker bytes: an
+    /// unparseable method or an unmatched path is simply `false` (no challenge). This is a pure
+    /// path/action classification — it does NOT re-authenticate or weaken any check.
+    fn is_git_wire_route(&self, req: &EdgeRequest) -> bool {
+        let Some(method) = Method::parse(&req.method) else {
+            return false;
+        };
+        match self.match_route(method, &req.path) {
+            Some((idx, _)) => self.routes[idx].action.starts_with("git.wire."),
+            None => false,
         }
     }
 
@@ -836,6 +867,87 @@ mod tests {
         let b = resp.json_body().unwrap();
         assert_eq!(b["error"]["message"], "authentication required");
         assert_eq!(b["error"]["code"], "unauthorized");
+    }
+
+    /// The `WWW-Authenticate` header on an [`EdgeResponse`], if present (case-insensitive) — the
+    /// seam-level accessor for the F1 challenge assertions.
+    fn www_authenticate(resp: &EdgeResponse) -> Option<String> {
+        match resp {
+            EdgeResponse::Bytes { headers, .. } | EdgeResponse::Sse { headers, .. } => headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("www-authenticate"))
+                .map(|(_, v)| v.clone()),
+        }
+    }
+
+    /// A gateway carrying BOTH a JSON product route (`/v1/whoami`) and a git smart-HTTP WIRE route
+    /// (a `git.wire.*` action) — the fixture for the F1 challenge-scoping assertions.
+    fn gw_with_wire() -> Gateway {
+        Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll))
+            .route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler))
+            .route(
+                Method::Get,
+                "/{tenant}/{region}/{repo}/info/refs",
+                "git.wire.upload_pack",
+                Arc::new(WhoamiHandler),
+            )
+            .build()
+    }
+
+    /// **F1 (R4.1 dogfood) — a git-wire 401 carries the HTTP Basic challenge; the JSON API 401 does
+    /// NOT.** A real `git push/clone` over a credential helper only OFFERS its Basic credential after a
+    /// 401 that names `WWW-Authenticate: Basic …`; without it git never sends the credential and the
+    /// operation fails auth. The challenge MUST be scoped to git-wire routes: a browser Basic popup on
+    /// the JSON product API (the cookie-session web login surface) would wreck the UX.
+    #[test]
+    fn f1_git_wire_401_carries_basic_challenge_json_api_does_not() {
+        let gw = gw_with_wire();
+
+        // (i) a git-wire route with NO credential → 401 WITH the challenge.
+        let wire = gw.handle(EdgeRequest::new(
+            "GET",
+            "/acme/eu-west/widgets.git/info/refs",
+            "service=git-upload-pack",
+            vec![],
+            vec![],
+        ));
+        assert_eq!(wire.status(), 401, "an unauthenticated wire request is a 401");
+        assert_eq!(
+            www_authenticate(&wire).as_deref(),
+            Some(r#"Basic realm="Myelin""#),
+            "the git-wire 401 MUST carry the Basic challenge so git offers its credential (F1)"
+        );
+        // The body stays the oracle-free uniform envelope — only the header was added.
+        assert_eq!(
+            wire.json_body().unwrap()["error"]["message"],
+            "authentication required"
+        );
+
+        // (ii) the JSON product API with NO credential → 401 WITHOUT the challenge (no Basic popup).
+        let json = gw.handle(EdgeRequest::new("GET", "/v1/whoami", "", vec![], vec![]));
+        assert_eq!(json.status(), 401);
+        assert_eq!(
+            www_authenticate(&json),
+            None,
+            "the JSON API 401 must NOT carry a Basic challenge (would break web login)"
+        );
+
+        // (iii) a forged Bearer on the wire is still a 401 — the challenge is keyed on 401-ness (an
+        // authenticated 200/403 carries none; proven end-to-end in the real-git dogfood oracle).
+        let forged = gw.handle(EdgeRequest::new(
+            "GET",
+            "/acme/eu-west/widgets.git/info/refs",
+            "service=git-upload-pack",
+            vec![("authorization".into(), "Bearer acme|eu-west|s|j|0|".into())],
+            vec![],
+        ));
+        assert_eq!(forged.status(), 401);
+        assert_eq!(www_authenticate(&forged).as_deref(), Some(r#"Basic realm="Myelin""#));
+
+        // A non-existent (non-wire) path 404 carries no challenge (is_git_wire_route is false).
+        let miss = gw.handle(EdgeRequest::new("GET", "/v1/nope", "", vec![], vec![]));
+        assert_eq!(miss.status(), 404);
+        assert_eq!(www_authenticate(&miss), None);
     }
 
     #[test]

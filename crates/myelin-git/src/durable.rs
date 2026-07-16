@@ -946,6 +946,40 @@ impl DurableGitRepo {
         })
     }
 
+    /// **F9 (R4.1 dogfood) — heal a dangling HEAD symref so a fresh `git clone` checks out.** libgit2's
+    /// `init_bare` leaves HEAD symbolically pointing at `refs/heads/master`, but Myelin pushes land on
+    /// `main` (or whatever the FIRST branch pushed is) — so a freshly-created repo has a DANGLING HEAD
+    /// and `git clone` warns "remote HEAD refers to nonexistent ref, unable to checkout" (the refs +
+    /// objects ARE present; only the HEAD pointer is wrong). Call on the first push that lands a branch:
+    /// if HEAD does NOT already resolve to a live branch, repoint it (the WRITE side) at the default
+    /// branch — `main` if present, else the first branch by sorted name — mirroring the read-side
+    /// resolution in [`Self::refs_view`]. A HEAD that already resolves to a live branch is left
+    /// UNTOUCHED (an admin-chosen default is preserved). No-op when the repo has no branch yet (an
+    /// empty repo clones cleanly with a still-symbolic HEAD). Idempotent.
+    pub fn heal_head_symref(&self) -> Result<(), DurableError> {
+        let repo = self.open_git()?;
+        // `head()` errs (`UnbornBranch`) exactly when HEAD's symbolic target names a nonexistent
+        // branch — the dangling-HEAD condition. If it resolves, HEAD is already fine: leave it.
+        if repo.head().is_ok() {
+            return Ok(());
+        }
+        let branches: Vec<String> = self
+            .list_refs()?
+            .into_iter()
+            .filter_map(|(n, _)| n.strip_prefix("refs/heads/").map(str::to_string))
+            .collect();
+        let target = if branches.iter().any(|b| b == "main") {
+            "main".to_string()
+        } else if let Some(first) = branches.first() {
+            first.clone()
+        } else {
+            return Ok(()); // no branch on disk yet — nothing to point HEAD at (empty repo is fine).
+        };
+        repo.set_head(&format!("refs/heads/{target}"))
+            .map_err(|e| git_err("set HEAD symref (F9)", e))?;
+        Ok(())
+    }
+
     /// **Per-entry latest commit via ONE bounded history walk (R3.4 gate decision).** Walks the ref's
     /// history newest-first up to `cap` commits, resolving the newest commit that touched each immediate
     /// child of `dir_path`. Entries not resolved within the cap are simply absent from the map (the
@@ -1860,6 +1894,71 @@ mod tests {
         // Idempotent: a second create opens, does not clobber.
         assert!(store.create_repo(&loc()).is_ok());
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **F9 (R4.1 dogfood) — the first push heals a dangling HEAD so a fresh `git clone` checks out.**
+    /// `init_bare` leaves HEAD symbolically at `refs/heads/master`, but pushes land on `main` — so HEAD
+    /// dangles until healed and a clone warns "remote HEAD refers to nonexistent ref, unable to
+    /// checkout". After landing the first branch on `main` + [`DurableGitRepo::heal_head_symref`], HEAD
+    /// resolves to `refs/heads/main`.
+    #[test]
+    fn f9_heal_head_symref_points_head_at_the_pushed_default_branch() {
+        let root = temp_root("f9-head");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+
+        // A fresh bare repo: HEAD is unborn/dangling (points at the nonexistent `master`).
+        let g = git2::Repository::open(repo.path()).unwrap();
+        assert!(g.head().is_err(), "fresh init_bare HEAD dangles (a clone would warn)");
+
+        // Land the first branch on `main` (exactly what a real first push does).
+        let c = seed_commit(&repo, b"first push\n");
+        repo.update_ref_cas("refs/heads/main", None, Some(&c), "create", "psn@acme.noreply")
+            .expect("create main");
+        // Still dangling until we heal — the read-side workaround exists, but a clone reads on-disk HEAD.
+        assert!(
+            git2::Repository::open(repo.path()).unwrap().head().is_err(),
+            "HEAD still dangles after the push until it is healed"
+        );
+
+        repo.heal_head_symref().expect("heal HEAD");
+
+        // HEAD now resolves to refs/heads/main → a fresh clone checks out `main` with no warning.
+        let g2 = git2::Repository::open(repo.path()).unwrap();
+        let head = g2.head().expect("HEAD resolves after heal");
+        assert_eq!(
+            head.name().unwrap(),
+            "refs/heads/main",
+            "F9: HEAD points at the pushed default branch"
+        );
+
+        // Idempotent + non-clobbering: a repo whose HEAD already resolves is left untouched.
+        repo.heal_head_symref().expect("heal is idempotent");
+        assert_eq!(
+            git2::Repository::open(repo.path()).unwrap().head().unwrap().name().unwrap(),
+            "refs/heads/main"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **F9 — a first push to a NON-`main` branch heals HEAD to that branch (git's own behavior).** If
+    /// the first branch a repo receives is e.g. `develop`, HEAD should follow it (not stay dangling).
+    #[test]
+    fn f9_heal_head_symref_follows_the_first_branch_when_no_main() {
+        let root = temp_root("f9-head-develop");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let c = seed_commit(&repo, b"develop\n");
+        repo.update_ref_cas("refs/heads/develop", None, Some(&c), "create", "psn@acme.noreply")
+            .expect("create develop");
+        repo.heal_head_symref().expect("heal");
+        assert_eq!(
+            git2::Repository::open(repo.path()).unwrap().head().unwrap().name().unwrap(),
+            "refs/heads/develop",
+            "F9: with no main, HEAD follows the first branch pushed"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

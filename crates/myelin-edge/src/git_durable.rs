@@ -79,8 +79,15 @@ pub struct DurableGitBackend {
     threads: DurablePrThreadStore,
     outbox: OutboxStore,
     minter: Arc<dyn IdMinter>,
-    /// The `ssh://` clone host rendered into the repo-home ViewModel.
-    clone_host: String,
+    /// **F3 (R4.1 dogfood) — the PUBLIC base URL prefix for the HTTP git-wire clone URL.** The wire is
+    /// HTTP smart-transport ONLY (there is NO SSH server), and its real path grammar is
+    /// `/{tenant}/{region}/{repo}.git` — so the clone URL rendered into every repo-home ViewModel must
+    /// be `{base}/{tenant}/{region}/{repo}.git`, never the old hardcoded `ssh://git@myelin/{tenant}/…`
+    /// (wrong scheme, missing region, wrong slug). The edge does not inherently know its own external
+    /// origin, so the base is read from `MYELIN_PUBLIC_BASE_URL` at construction (e.g.
+    /// `https://git.example.com`); UNSET → the empty string, which yields an HONEST relative
+    /// `/{tenant}/{region}/{repo}.git` (a real path on this host) rather than a fabricated hostname.
+    clone_base: String,
     /// The on-disk root holding `<tenant>/<region>/<repo>.git` bare repos — retained so the wire-serving
     /// tier (CT-006b) composes its sandboxed `GitCore` over the SAME root the durable store reads/writes.
     root: PathBuf,
@@ -136,7 +143,8 @@ impl DurableGitBackend {
             threads: DurablePrThreadStore::rooted(root.clone()),
             outbox,
             minter,
-            clone_host: "ssh://git@myelin".into(),
+            // F3: the public HTTP base for clone URLs — env-driven, honest empty default (relative path).
+            clone_base: public_clone_base(),
             root,
             // R2.6: the prod constructor default is FAIL-CLOSED (`DenyAllRepos`) — a composition root
             // that forgets `with_repo_authorizer` denies every repo rather than serving all of them.
@@ -409,14 +417,22 @@ impl DurableGitBackend {
             let Ok(repo) = self.store.open_repo(&loc) else {
                 continue;
             };
-            out.push(self.repo_home(tenant, &slug, &repo));
+            out.push(self.repo_home(tenant, region, &slug, &repo));
         }
         out
     }
 
-    fn repo_home(&self, tenant: &str, slug: &str, repo: &DurableGitRepo) -> RepoHome {
+    /// **F3 — the HTTP git-wire clone URL for a repo.** The wire path grammar is
+    /// `/{tenant}/{region}/{repo}.git` (the ONLY transport is HTTP smart-protocol), prefixed by the
+    /// configured public base (`MYELIN_PUBLIC_BASE_URL`; empty → an honest relative path). Never the
+    /// old `ssh://git@myelin/…` (no SSH server exists; the region segment + real slug were missing).
+    fn clone_url(&self, tenant: &str, region: &str, slug: &str) -> String {
+        format!("{}/{tenant}/{region}/{slug}.git", self.clone_base)
+    }
+
+    fn repo_home(&self, tenant: &str, region: &str, slug: &str, repo: &DurableGitRepo) -> RepoHome {
         let full_slug = format!("{tenant}/{slug}");
-        let clone_url = format!("{}/{tenant}/{slug}.git", self.clone_host);
+        let clone_url = self.clone_url(tenant, region, slug);
         let entries = repo
             .tree_entries_at_ref("refs/heads/main")
             .unwrap_or_default();
@@ -568,7 +584,7 @@ impl DurableGitBackend {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc)?; // NotFound → 404 (0-leak)
         let full_slug = format!("{tenant}/{slug}");
-        let clone_url = format!("{}/{tenant}/{slug}.git", self.clone_host);
+        let clone_url = self.clone_url(tenant, region, slug);
         let refs = repo.refs_view()?;
         let default_branch = refs.default_branch.clone();
         let counts = json!({ "branches": refs.branches.len(), "tags": refs.tags.len() });
@@ -877,7 +893,7 @@ impl DurableGitBackend {
         principal: &Principal,
     ) -> Result<PrRecord, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        self.store.open_repo(&loc)?; // 404 if the repo is absent
+        let repo = self.store.open_repo(&loc)?; // 404 if the repo is absent
                                      // The PR-open body carries ONLY the proposal (base/head/head_oid/draft) — NEVER branch-protection
                                      // POLICY (required set / approval threshold) or check FACTS (greens). Policy is repo-owned (set
                                      // via the repo-admin branch-protection op); facts are set by authorized producers (the CI
@@ -898,6 +914,34 @@ impl DurableGitBackend {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        // F8 (R4.1 dogfood): if the caller omitted `head_oid`, RESOLVE it from `head_ref`'s CURRENT tip
+        // in the durable repo. Previously an absent head_oid was stored EMPTY and the PR was silently
+        // unmergeable — a merge later failed with the confusing "invalid merge head: head_oid  is not a
+        // commit in the repo". Resolving at OPEN time both (a) makes the ref-only open path mergeable
+        // (the stored head_oid is the branch tip) and (b) turns a non-existent head_ref into a CLEAR
+        // 400 the moment the PR is proposed, not a mystifying failure at merge. The explicit-head_oid
+        // path is UNCHANGED — an author who pins a specific oid keeps exactly that oid.
+        let head_oid = if head_oid.is_empty() {
+            // Qualify a bare branch name to `refs/heads/<name>`; a fully-qualified `refs/…` is used as-is.
+            let qualified = if head_ref.starts_with("refs/") {
+                head_ref.clone()
+            } else {
+                format!("refs/heads/{head_ref}")
+            };
+            match repo.read_ref(&qualified)? {
+                Some(tip) => tip.0,
+                // 400 at OPEN (map_durable_err routes a "missing" `Git` error to BadRequest) — never a
+                // stored empty head that wedges the merge dialog with a confusing error later.
+                None => {
+                    return Err(DurableError::Git(format!(
+                        "open-PR head_ref `{head_ref}` does not exist in the repo — no branch tip to \
+                         open against (missing head)"
+                    )))
+                }
+            }
+        } else {
+            head_oid
+        };
         // R3.1: the title is REQUIRED at create (a hollow list is the ux-git #3 defect). A missing or
         // blank title is a clean 400 — never a silent empty title on a NEW PR (a legacy record with no
         // title predates the store and honestly renders as `#number`; a fresh create must carry one).
@@ -1862,7 +1906,15 @@ impl DurableGitBackend {
         let _ = std::fs::remove_dir_all(&qdir); // the host quarantine is discarded either way
 
         match outcome.map_err(|e| DurableError::Git(format!("ref-CAS: {e:?}")))? {
-            PushOutcome::Accepted { .. } => Ok(report_status("ok", &per_ref_status)),
+            PushOutcome::Accepted { .. } => {
+                // F9 (R4.1 dogfood): the first push that lands a branch heals a dangling `init_bare`
+                // HEAD (→ the default branch) so a fresh `git clone` checks out with NO "nonexistent
+                // ref, unable to checkout" warning. Best-effort: the push already committed durably and
+                // the read-side resolver (`refs_view`) remains the fallback, so a heal hiccup must never
+                // turn an ACCEPTED push into a failure.
+                let _ = repo.heal_head_symref();
+                Ok(report_status("ok", &per_ref_status))
+            }
             // A policy/non-ff refusal moved NO ref and discarded the quarantine — LOUD `ng` per ref.
             PushOutcome::Rejected(reason) => Ok(report_status(
                 "ok",
@@ -1980,6 +2032,18 @@ impl QuarantineMigration for ObjectPromotion<'_> {
 
 fn region_of<'a>(ctx: &'a HandlerCtx<'_>) -> &'a str {
     ctx.scope.region().0.as_str()
+}
+
+/// **F3 (R4.1 dogfood) — the public base URL prefix for HTTP git-wire clone URLs.** Read once from
+/// `MYELIN_PUBLIC_BASE_URL` at backend construction. UNSET (or empty) → the empty string, which makes
+/// [`DurableGitBackend::clone_url`] emit an HONEST relative `/{tenant}/{region}/{repo}.git` (a real
+/// path on whatever origin the edge is served from) rather than a fabricated hostname. A configured
+/// value has any trailing `/` trimmed so the `{base}/{tenant}/…` join never doubles the slash.
+fn public_clone_base() -> String {
+    std::env::var("MYELIN_PUBLIC_BASE_URL")
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .to_string()
 }
 
 /// Wall-clock unix seconds for the durable `updated_at` stamp (the list's "updated" column +
@@ -4048,6 +4112,88 @@ mod pr_list_tests {
         assert_eq!(row["number"], 9);
         assert_eq!(row["checks_summary"]["verdict"], "unavailable", "fails static, still lists");
         assert_eq!(row["updated_at"], Value::Null);
+    }
+
+    /// **F3 (R4.1 dogfood) — the repo-home clone URL is the HONEST HTTP git-wire shape, never
+    /// `ssh://git@myelin/…`.** The wire is HTTP smart-transport ONLY (no SSH server) and its path
+    /// grammar is `/{tenant}/{region}/{repo}.git` — so the advertised clone URL must end in the real
+    /// `(tenant, region, repo)` path and carry no `ssh://` scheme / fabricated host.
+    #[test]
+    fn f3_clone_url_is_http_wire_shape_never_ssh() {
+        let root = temp_root("f3-clone-url");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root);
+        // The builder: `{base}/{tenant}/{region}/{repo}.git` (base empty by default → a relative path).
+        let url = be.clone_url(TENANT, REGION, "widgets");
+        assert!(
+            url.ends_with("/acme/eu-west/widgets.git"),
+            "the wire path grammar is /{{tenant}}/{{region}}/{{repo}}.git — got {url}"
+        );
+        assert!(!url.contains("ssh://"), "no ssh scheme (there is no SSH server): {url}");
+        assert!(!url.contains("git@myelin"), "no fabricated ssh host: {url}");
+
+        // End-to-end through the repo-home projection (an empty repo still advertises the URL).
+        let author = human("u:author");
+        be.create_repo_as(TENANT, REGION, "widgets", &author).unwrap();
+        let loc = DurableGitBackend::loc(TENANT, REGION, "widgets");
+        let repo = be.store.open_repo(&loc).expect("open repo");
+        let advertised = match be.repo_home(TENANT, REGION, "widgets", &repo) {
+            RepoHome::Empty { clone_url, .. } | RepoHome::Populated { clone_url, .. } => clone_url,
+            other => panic!("a fresh repo projects an Empty/Populated home, got {other:?}"),
+        };
+        assert!(advertised.ends_with("/acme/eu-west/widgets.git"), "got {advertised}");
+        assert!(!advertised.contains("ssh://"), "no ssh in the projection: {advertised}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **F8 (R4.1 dogfood) — open a PR with a `head_ref` but NO `head_oid` → the stored PR carries the
+    /// ref's CURRENT tip (so it is mergeable), and a non-existent `head_ref` is refused with a clear
+    /// 400 at OPEN (never the confusing "invalid merge head" at merge time).**
+    #[test]
+    fn f8_open_pr_resolves_head_oid_from_head_ref_tip() {
+        let root = temp_root("f8-resolve-head");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root);
+        let author = human("u:author");
+        be.create_repo_as(TENANT, REGION, "core", &author).unwrap();
+
+        // Seed a real commit as the tip of `refs/heads/feature` (the proposed head branch).
+        let loc = DurableGitBackend::loc(TENANT, REGION, "core");
+        let repo = be.store.open_repo(&loc).expect("open repo");
+        let blob = repo.write_blob(b"hello\n").expect("blob");
+        let tree = repo.write_tree(&[("f.txt", &blob)]).expect("tree");
+        let tip = repo
+            .write_commit(&tree, &[], "seed", "psn@acme.noreply", "psn@acme.noreply")
+            .expect("commit");
+        repo.update_ref_cas("refs/heads/feature", None, Some(&tip), "create", "psn@acme.noreply")
+            .expect("create feature ref");
+
+        // Open with head_ref but NO head_oid → the resolver fills in the branch tip.
+        let body = json!({
+            "title": "resolve my head",
+            "base_ref": "refs/heads/main",
+            "head_ref": "refs/heads/feature",
+            // head_oid deliberately OMITTED
+        });
+        let rec = be.open_pr(TENANT, REGION, "core", &body, &author).expect("open PR");
+        assert_eq!(
+            rec.head_oid, tip.0,
+            "F8: an omitted head_oid is resolved from head_ref's current tip"
+        );
+
+        // A bare (unqualified) head_ref resolves too (qualified to refs/heads/<name>).
+        let body_bare = json!({ "title": "bare head_ref", "head_ref": "feature" });
+        let rec2 = be.open_pr(TENANT, REGION, "core", &body_bare, &author).expect("open PR");
+        assert_eq!(rec2.head_oid, tip.0, "F8: a bare branch name also resolves to the tip");
+
+        // A non-existent head_ref → a clean 400 at OPEN (mapped from the durable error), NOT an empty
+        // head_oid that wedges the merge dialog with "invalid merge head" later.
+        let bad = json!({ "title": "ghost branch", "head_ref": "refs/heads/does-not-exist" });
+        let err = be.open_pr(TENANT, REGION, "core", &bad, &author).expect_err("must refuse");
+        assert_eq!(
+            map_durable_err(err).status(),
+            400,
+            "F8: a non-existent head_ref is a 400 at open, not a merge-time surprise"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }
 
