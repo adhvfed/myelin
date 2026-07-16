@@ -47,8 +47,8 @@ use myelin_git::lifecycle::{
     BranchProtectionRuleset, PrState, PullRequest, ReviewState, ReviewVerdict,
 };
 use myelin_git::pr_store::{
-    effective_ruleset, evaluate_merge, merge_pr, BranchProtectionConfig, DurablePrStore,
-    MergeAttempt, PrRecord, ReviewRecord,
+    effective_ruleset, evaluate_merge, merge_pr, BranchProtectionConfig, ChecksSummary,
+    DurablePrStore, MergeAttempt, PrRecord, ReviewRecord,
 };
 use myelin_git::receive_pack::{
     evaluate_protected_ref_push, CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate,
@@ -91,6 +91,17 @@ pub struct DurableGitBackend {
     /// (paired with the `AllowAllRepos` fixture, where no grant is needed). A grant failure ABORTS
     /// the create (fail-closed — never a repo no one can reach).
     bootstrap: Arc<dyn RepoBootstrapGrants>,
+}
+
+/// One PR enriched for a list row (R3.1): the durable record + the rolled-up checks summary (Q4 —
+/// rolled up in ONE pass, no N+1) + whether the viewer is a requested reviewer + the repo slug
+/// (cross-repo rows only). The `summary` FAILS STATIC (`Unavailable`) if the repo's branch-protection
+/// config could not be read — the row still lists (ux-git #5: a checks hiccup never blanks the row).
+struct EnrichedPr {
+    rec: PrRecord,
+    summary: ChecksSummary,
+    you_requested: bool,
+    repo_slug: Option<String>,
 }
 
 impl DurableGitBackend {
@@ -234,6 +245,12 @@ impl DurableGitBackend {
     /// The GIT-1 tenant pseudonym for a principal (`<principal>@<tenant>.noreply`) — never a raw identity.
     fn pseudonym(tenant: &str, principal: &Principal) -> String {
         format!("{}@{}.noreply", principal.principal_id.0, tenant)
+    }
+
+    /// Whether a principal is an AGENT (ADR-08 legibility — an agent author is stamped `is_agent`,
+    /// never disguised as a human).
+    fn is_agent(principal: &Principal) -> bool {
+        matches!(principal.kind, PrincipalKind::Agent { .. })
     }
 
     fn open_durable_refstore(
@@ -618,6 +635,28 @@ impl DurableGitBackend {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        // R3.1: the title is REQUIRED at create (a hollow list is the ux-git #3 defect). A missing or
+        // blank title is a clean 400 — never a silent empty title on a NEW PR (a legacy record with no
+        // title predates the store and honestly renders as `#number`; a fresh create must carry one).
+        let title = body
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DurableError::Git("open-PR body missing a non-empty `title`".into()))?
+            .to_string();
+        // Cap the title (verifier note, R3.1): it is echoed in every list row — an unbounded
+        // title is a response-bloat vector. 512 bytes is generous for a real title.
+        if title.len() > 512 {
+            return Err(DurableError::Git(
+                "open-PR `title` exceeds 512 bytes".into(),
+            ));
+        }
+        let body_md = body
+            .get("body_md")
+            .or_else(|| body.get("body"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let number = self.next_pr_number(&loc);
         let pr = PullRequest::open(
             number,
@@ -626,9 +665,152 @@ impl DurableGitBackend {
             Self::pseudonym(tenant, principal),
             body.get("draft").and_then(Value::as_bool).unwrap_or(false),
         );
-        let rec = PrRecord::open(&pr, head_oid);
+        let mut rec = PrRecord::open(&pr, head_oid);
+        rec.title = title;
+        rec.body_md = body_md;
+        rec.author_is_agent = Self::is_agent(principal);
+        rec.updated_at = Some(now_unix());
         self.prs.open_pr(&loc, &rec)?;
         Ok(rec)
+    }
+
+    // ── R3.1 — the leak-free PR LIST (per-repo + cross-repo front door) ──────────────────────────
+    //
+    // **The leak-free prefilter (the anti-oracle rule).** The frozen Git ReBAC fragment defines
+    // `pull_request.view = parent_repo->pull` (repo_authz.rs / contract 4.9), so the PR-list
+    // permission `myelin_git::list_filter::PR_LIST_PERMISSION` (`"view"`) REDUCES, for every PR in a
+    // repo, to the viewer's `pull` on the PARENT repo. Two consequences the wiring rides:
+    //   • **per-repo `/repos/{repo}/prs`** is guarded by the SAME [`RepoObjectGuard`] `Pull` check as
+    //     every other repo read (registered in `register_git_durable`): a viewer who cannot `pull`
+    //     gets the 0-leak 404 (the "no access" state), and once past it EVERY PR in the repo is
+    //     `view`-able — so counts/tab-badges/cursors computed over the on-disk set never leak a
+    //     hidden PR (there is none to hide);
+    //   • **cross-repo `/prs`** prefilters the repo candidate set through
+    //     [`RepoAuthorizer::visible_repos`] (the `list_objects(viewer, pull, repo)` seam) FIRST, then
+    //     lists PRs only within the visible repos — a forbidden repo's PRs never enter any bucket,
+    //     count, or cursor.
+    // This realises `compose_pr_list_query` / `PR_LIST_PERMISSION`'s leak-free *semantics* over the
+    // on-disk JSON PR store. The SQL composer in `list_filter.rs` targets a `pr` table (the PG home,
+    // GT-003b) that this store does not yet materialise, so it is not the literal execution path here
+    // — the reduction to the repo `pull` prefilter is (named floor; identical leak-free guarantee).
+
+    /// Enrich every PR under one repo for the list: read the repo-owned branch-protection config
+    /// ONCE (no N+1 — the effective ruleset per PR is a pure function of that config + the PR's
+    /// base_ref), roll up each PR's checks summary against its effective required set, and mark the
+    /// viewer's requested-reviewer status. On a config-READ error the whole repo's rows fail static
+    /// (`Unavailable`) rather than dropping PRs (a checks-projection hiccup must not hide PRs).
+    fn enrich_prs(
+        &self,
+        loc: &RepoLoc,
+        viewer_pseudonym: &str,
+        repo_slug: Option<&str>,
+    ) -> Result<Vec<EnrichedPr>, DurableError> {
+        let records = self.prs.list(loc)?;
+        // ONE config read for the whole repo (fail static on error — see above).
+        let config = match self.prs.get_protection(loc) {
+            Ok(cfg) => Some(cfg),
+            Err(_) => None, // read failed → every row's summary degrades to Unavailable below.
+        };
+        let config_readable = config.is_some();
+        let config = config.flatten();
+        Ok(records
+            .into_iter()
+            .map(|rec| {
+                let summary = if config_readable {
+                    let ruleset = effective_ruleset(config.as_ref(), &rec.base_ref);
+                    rec.checks_summary(&ruleset)
+                } else {
+                    ChecksSummary::unavailable()
+                };
+                let you_requested = rec.is_review_requested_of(viewer_pseudonym);
+                EnrichedPr {
+                    rec,
+                    summary,
+                    you_requested,
+                    repo_slug: repo_slug.map(str::to_string),
+                }
+            })
+            .collect())
+    }
+
+    /// **The per-repo PR list (R3.1).** Every PR in the repo (the caller has already cleared the
+    /// `Pull` object guard, so all are `view`-able), enriched with the checks rollup + the viewer's
+    /// review status. The handler applies the `state`/`sort`/cursor + computes tab/sidebar counts
+    /// over THIS (already leak-free) set.
+    fn list_prs_for_repo(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        principal: &Principal,
+    ) -> Result<Vec<EnrichedPr>, DurableError> {
+        let loc = Self::loc(tenant, region, slug);
+        self.store.open_repo(&loc)?; // 404 if the repo is absent (never a phantom empty list).
+        self.enrich_prs(&loc, &Self::pseudonym(tenant, principal), None)
+    }
+
+    /// **The cross-repo PR front door (R3.1, single-cell for R3 — Q5).** Prefilter the on-disk repo
+    /// candidates through the `visible_repos` `list_objects` seam FIRST (a forbidden repo never
+    /// contributes a PR), then enrich the PRs under each visible repo, tagging each row with its repo
+    /// slug. The bucket predicate (`yours` = authored-by-viewer; `needs-review` = viewer is a
+    /// requested reviewer) is applied by the handler over this leak-free set.
+    fn list_prs_cross(
+        &self,
+        tenant: &str,
+        region: &str,
+        principal: &Principal,
+    ) -> Result<Vec<EnrichedPr>, DurableError> {
+        let candidates = self.scan_repo_slugs(tenant, region);
+        let visible = self
+            .repo_authz
+            .visible_repos(principal, tenant, region, &candidates);
+        let viewer = Self::pseudonym(tenant, principal);
+        let mut out = Vec::new();
+        for slug in visible {
+            let loc = Self::loc(tenant, region, &slug);
+            if self.store.open_repo(&loc).is_err() {
+                continue; // a slug that lost its repo dir — skip, never error the whole front door.
+            }
+            out.extend(self.enrich_prs(&loc, &viewer, Some(&slug))?);
+        }
+        Ok(out)
+    }
+
+    /// The stable state token for a PR (matches [`Self::pr_json`]).
+    fn pr_state_token(state: PrState) -> &'static str {
+        match state {
+            PrState::Draft => "draft",
+            PrState::Open => "open",
+            PrState::Merged => "merged",
+            PrState::Closed => "closed",
+        }
+    }
+
+    /// The list-row VM JSON for one enriched PR (`PrListRowVM`). An empty `title` (a legacy record)
+    /// serialises as `null` so the frontend renders the honest `#number` fallback, never a blank
+    /// title masquerading as real.
+    fn pr_list_row_json(e: &EnrichedPr) -> Value {
+        let rec = &e.rec;
+        json!({
+            "number": rec.number,
+            "title": if rec.title.is_empty() { Value::Null } else { json!(rec.title) },
+            "pr_state": Self::pr_state_token(rec.state),
+            "base_ref": rec.base_ref,
+            "head_ref": rec.head_ref,
+            "author": rec.author_pseudonym,
+            "author_is_agent": rec.author_is_agent,
+            "reviews": rec.reviews.len(),
+            "review_state": rec.review_state_label(),
+            "you_are_requested": e.you_requested,
+            "checks_summary": {
+                "verdict": e.summary.verdict.as_str(),
+                "passing": e.summary.passing,
+                "failing": e.summary.failing,
+                "total": e.summary.total,
+            },
+            "updated_at": rec.updated_at,
+            "repo": e.repo_slug,
+        })
     }
 
     /// **Repo-admin: set the branch-protection policy (GT-003).** The required set + thresholds the merge
@@ -756,6 +938,7 @@ impl DurableGitBackend {
         {
             rec.outstanding_conversations = n as u32;
         }
+        rec.updated_at = Some(now_unix());
         self.prs.put(&loc, &rec)?;
         Ok(rec)
     }
@@ -787,8 +970,9 @@ impl DurableGitBackend {
         rec.reviews.push(ReviewRecord {
             reviewer_pseudonym: Self::pseudonym(tenant, principal),
             state: ReviewState::Submitted(v),
-            is_agent: false,
+            is_agent: Self::is_agent(principal),
         });
+        rec.updated_at = Some(now_unix());
         self.prs.put(&loc, &rec)?;
         Ok(rec)
     }
@@ -821,6 +1005,7 @@ impl DurableGitBackend {
                 rec.endorsed_contexts.push(c);
             }
         }
+        rec.updated_at = Some(now_unix());
         self.prs.put(&loc, &rec)?;
         Ok(rec)
     }
@@ -1159,17 +1344,18 @@ impl DurableGitBackend {
     fn pr_json(rec: &PrRecord) -> Value {
         json!({
             "number": rec.number,
-            "pr_state": match rec.state {
-                PrState::Draft => "draft",
-                PrState::Open => "open",
-                PrState::Merged => "merged",
-                PrState::Closed => "closed",
-            },
+            // R3.1: the title/body store. An empty title (a legacy record) is `null` — the honest
+            // `#number` fallback, never a fabricated title.
+            "title": if rec.title.is_empty() { Value::Null } else { json!(rec.title) },
+            "body_md": rec.body_md,
+            "pr_state": Self::pr_state_token(rec.state),
             "base_ref": rec.base_ref,
             "head_ref": rec.head_ref,
             "head_oid": rec.head_oid,
             "author": rec.author_pseudonym,
+            "author_is_agent": rec.author_is_agent,
             "reviews": rec.reviews.len(),
+            "updated_at": rec.updated_at,
             "durable": true,
         })
     }
@@ -1210,6 +1396,28 @@ impl QuarantineMigration for ObjectPromotion<'_> {
 
 fn region_of<'a>(ctx: &'a HandlerCtx<'_>) -> &'a str {
     ctx.scope.region().0.as_str()
+}
+
+/// Wall-clock unix seconds for the durable `updated_at` stamp (the list's "updated" column +
+/// `sort=updated`). Best-effort — a clock before the epoch stamps 0 (the row simply omits the time).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Parse the `?state=` tab filter to the set of PR-state tokens it selects. `open` (the default)
+/// covers both `open` and `draft` (a draft is an open-in-progress PR — the sketch lists it under
+/// Open); `merged`/`closed` are exact; `all` selects everything. An unknown value falls back to
+/// `open` (never an empty list on a typo).
+fn state_filter(state: Option<&str>) -> &'static [&'static str] {
+    match state.unwrap_or("open") {
+        "merged" => &["merged"],
+        "closed" => &["closed"],
+        "all" => &["draft", "open", "merged", "closed"],
+        _ => &["draft", "open"],
+    }
 }
 
 /// Qualify a bare ref (`main`) to `refs/heads/main`; a fully-qualified `refs/…` passes through.
@@ -1257,9 +1465,13 @@ fn commit_diff_vm(d: CommitDetail) -> CommitDiff {
 fn map_durable_err(e: DurableError) -> EdgeError {
     match e {
         DurableError::NotFound(m) => EdgeError::NotFound(m),
-        // A traversal-rejected slug / bad input surfaces as a clean 400 (never a silent wrong path).
+        // A traversal-rejected slug / malformed body (e.g. R3.1 open-PR with no `title`) surfaces as a
+        // clean 400 (never a silent wrong path, never a 500 for a client input error).
         DurableError::Git(m)
-            if m.contains("traversal") || m.contains("segment") || m.contains("slug") =>
+            if m.contains("traversal")
+                || m.contains("segment")
+                || m.contains("slug")
+                || m.contains("missing") =>
         {
             EdgeError::BadRequest(m)
         }
@@ -1293,8 +1505,8 @@ impl Handler for DRepoList {
             .take(limit)
             .map(|r| r.to_json())
             .collect();
-        let next = if offset + limit < all.len() {
-            Some((offset + limit).to_string())
+        let next = if offset.saturating_add(limit) < all.len() {
+            Some(offset.saturating_add(limit).to_string())
         } else {
             None
         };
@@ -1375,7 +1587,7 @@ impl Handler for DCommitLog {
             .map_err(map_durable_err)?;
         let items: Vec<Value> = rows.iter().map(CommitRow::to_json).collect();
         let next = if has_more {
-            Some((offset + limit).to_string())
+            Some(offset.saturating_add(limit).to_string())
         } else {
             None
         };
@@ -1543,6 +1755,138 @@ impl Handler for DPrChecks {
                 "gate_admitted": eval.admitted(),
                 "durable": true,
             }),
+        ))
+    }
+}
+
+/// Build the R3.1 PR-list envelope: sort newest-first, paginate over an offset cursor (with BOTH
+/// `next_cursor` and `prev_cursor` — the bidirectional pager, fixes ux-git #12), and attach `counts`
+/// (computed over the ALREADY-leak-free `enriched` set — a forbidden PR never reached it, the anti-
+/// oracle rule). `enriched` is the prefiltered+bucketed set; `counts` is the caller-supplied tally.
+fn pr_list_envelope(mut enriched: Vec<EnrichedPr>, ctx: &HandlerCtx<'_>, counts: Value) -> Value {
+    let sort = ctx.request.query_param("sort");
+    // Newest-first. `sort=created` orders by the monotonic PR number (a create-order proxy — the
+    // record has no created_at); the default `sort=updated` orders by the durable updated stamp,
+    // tie-broken by number so the order is total + stable (cursor stability).
+    match sort.as_deref() {
+        Some("created") => enriched.sort_by(|a, b| b.rec.number.cmp(&a.rec.number)),
+        _ => enriched.sort_by(|a, b| {
+            b.rec
+                .updated_at
+                .cmp(&a.rec.updated_at)
+                .then(b.rec.number.cmp(&a.rec.number))
+        }),
+    }
+    let total = enriched.len();
+    let offset = ctx
+        .page
+        .cursor
+        .as_deref()
+        .and_then(|c| c.parse::<usize>().ok())
+        .unwrap_or(0);
+    let limit = ctx.page.limit;
+    let items: Vec<Value> = enriched
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(DurableGitBackend::pr_list_row_json)
+        .collect();
+    // saturating: `cursor` is attacker-supplied; usize::MAX must yield an empty page, never
+    // an add-overflow panic (verifier finding, R3.1).
+    let next_cursor = if offset.saturating_add(limit) < total {
+        Some(offset.saturating_add(limit).to_string())
+    } else {
+        None
+    };
+    // `prev_cursor` is `None` at the head (the "Newer" control is aria-disabled, not removed).
+    let prev_cursor = if offset > 0 {
+        Some(offset.saturating_sub(limit).to_string())
+    } else {
+        None
+    };
+    json!({
+        "items": items,
+        "page": {
+            "next_cursor": next_cursor,
+            "prev_cursor": prev_cursor,
+            "limit": limit,
+            "offset": offset,
+            "total": total,
+        },
+        "counts": counts,
+    })
+}
+
+/// **`GET /v1/git/repos/{repo}/prs` — the per-repo PR list (R3.1).** Registered through the
+/// [`RepoObjectGuard`] `Pull` check (the leak-free prefilter: `pull_request.view = parent_repo->pull`
+/// — a viewer who cannot pull gets the 0-leak 404 "no access" state; once past it every PR is
+/// view-able). The `?state=` tab filters the returned rows; `counts` (open/merged/closed/all + the
+/// sidebar's yours/needs-review) are computed over the FULL leak-free set so a tab badge never leaks.
+struct DRepoPrList {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DRepoPrList {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let all = self
+            .be
+            .list_prs_for_repo(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?, ctx.principal)
+            .map_err(map_durable_err)?;
+        let viewer =
+            DurableGitBackend::pseudonym(tenant_of(ctx), ctx.principal);
+        // Counts over the FULL (already leak-free) set — never a post-filtered subset.
+        let count = |pred: &dyn Fn(&EnrichedPr) -> bool| all.iter().filter(|e| pred(e)).count();
+        let counts = json!({
+            "open": count(&|e| matches!(e.rec.state, PrState::Open | PrState::Draft)),
+            "merged": count(&|e| matches!(e.rec.state, PrState::Merged)),
+            "closed": count(&|e| matches!(e.rec.state, PrState::Closed)),
+            "all": all.len(),
+            "yours": count(&|e| e.rec.author_pseudonym == viewer),
+            "needs_review": count(&|e| e.you_requested),
+        });
+        // The `?state=` tab filter (leak-free: it narrows an already-authorised set).
+        let wanted = state_filter(ctx.request.query_param("state").as_deref());
+        let filtered: Vec<EnrichedPr> = all
+            .into_iter()
+            .filter(|e| wanted.contains(&DurableGitBackend::pr_state_token(e.rec.state)))
+            .collect();
+        Ok(EdgeResponse::json(
+            200,
+            &pr_list_envelope(filtered, ctx, counts),
+        ))
+    }
+}
+
+/// **`GET /v1/git/prs?bucket=needs-review|yours` — the cross-repo front door (R3.1, single-cell).**
+/// NOT object-guarded (no `{repo}` segment): the prefilter is [`DurableGitBackend::list_prs_cross`]'s
+/// `visible_repos` seam (a forbidden repo's PRs never enter the set). The `bucket` predicate then
+/// selects `yours` (authored-by-viewer) or `needs-review` (viewer is a requested reviewer) — the
+/// default is `needs-review` (the attention job). Each row carries its `repo` slug (the repo chip).
+struct DMyPrs {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DMyPrs {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let all = self
+            .be
+            .list_prs_cross(tenant_of(ctx), region_of(ctx), ctx.principal)
+            .map_err(map_durable_err)?;
+        let viewer = DurableGitBackend::pseudonym(tenant_of(ctx), ctx.principal);
+        let bucket = ctx.request.query_param("bucket");
+        let in_bucket = |e: &EnrichedPr| match bucket.as_deref().unwrap_or("needs-review") {
+            "yours" => e.rec.author_pseudonym == viewer,
+            // "needs-review" (default): the viewer is a requested reviewer AND not the author (you
+            // do not review your own PR). Closed/merged PRs never need review.
+            _ => {
+                e.you_requested
+                    && e.rec.author_pseudonym != viewer
+                    && matches!(e.rec.state, PrState::Open | PrState::Draft)
+            }
+        };
+        let bucketed: Vec<EnrichedPr> = all.into_iter().filter(|e| in_bucket(e)).collect();
+        let counts = json!({ "bucket": bucketed.len() });
+        Ok(EdgeResponse::json(
+            200,
+            &pr_list_envelope(bucketed, ctx, counts),
         ))
     }
 }
@@ -1889,6 +2233,24 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
     // catalogue routes (the gateway owns auth/scope/IDOR/error/pagination per route). All GET (reads),
     // all object-guarded on `Pull` (R2.1).
     let get = map_method(GitMethod::Get);
+    // R3.1 — the per-repo PR LIST. Object-guarded on `Pull`: the leak-free prefilter is the frozen
+    // `pull_request.view = parent_repo->pull` reduction (a viewer who cannot pull gets the 0-leak 404
+    // "no access" state; once past it every PR in the repo is view-able, so counts never leak).
+    b = b.route(
+        get,
+        &reroot("/api/git/repos/{repo}/prs"),
+        "git.prs.list",
+        guarded(&be, Pull, Arc::new(DRepoPrList { be: be.clone() })),
+    );
+    // R3.1 — the CROSS-REPO PR front door (`/prs`). NOT object-guarded (no `{repo}`): the prefilter is
+    // the `visible_repos` `list_objects` seam inside the handler (stronger than a single object check
+    // — a forbidden repo's PRs never enter the set), so it registers action-gated only, like `/repos`.
+    b = b.route(
+        get,
+        &reroot("/api/git/prs"),
+        "git.prs.mine",
+        Arc::new(DMyPrs { be: be.clone() }),
+    );
     b = b.route(
         get,
         &reroot("/api/git/repos/{repo}"),
@@ -2083,5 +2445,269 @@ mod create_compensation_tests {
         assert_eq!(boot.grants.lock().unwrap().len(), 1, "granted only on the first create");
         assert!(boot.revokes.lock().unwrap().is_empty(), "no compensation");
         std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod pr_list_tests {
+    //! **R3.1 — the PR-list endpoints: leak-free prefilter, no-oracle counts, cursor stability.** The
+    //! per-repo list rides the SAME `Pull` [`RepoObjectGuard`] as every repo read (tested elsewhere);
+    //! these drive the list HANDLERS directly to prove: (a) the cross-repo front door never surfaces a
+    //! PR from a repo the viewer cannot `pull` (even one the viewer AUTHORED) — the prefilter runs
+    //! before the bucket predicate; (b) tab/bucket counts are computed over the leak-free set; (c) the
+    //! bidirectional cursor pages the sorted set with no gaps/dups; (d) a legacy record with no title
+    //! rows as `#number` and a config-read failure fails static ("checks unavailable"), never blanks.
+
+    use super::*;
+    use crate::catalogue::Page;
+    use crate::repo_authz::GrantBackedRepos;
+    use crate::request::EdgeRequest;
+    use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
+    use myelin_storage::TenantScope;
+    use myelin_tenancy::{Region as IdRegion, TenantId};
+    use std::collections::BTreeMap;
+
+    const TENANT: &str = "acme";
+    const REGION: &str = "eu-west";
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("myelin-prlist-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    fn human(id: &str) -> Principal {
+        Principal::new(
+            TenantId(TENANT.into()),
+            IdRegion(REGION.into()),
+            PrincipalId(id.into()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        )
+    }
+
+    fn open_pr(be: &DurableGitBackend, slug: &str, title: &str, opener: &Principal) {
+        be.create_repo_as(TENANT, REGION, slug, opener).ok(); // idempotent-ish (409 → already there)
+        let body = json!({
+            "title": title,
+            "base_ref": "refs/heads/main",
+            "head_ref": "refs/heads/feature",
+            "head_oid": "0".repeat(40),
+            "draft": false,
+        });
+        be.open_pr(TENANT, REGION, slug, &body, opener)
+            .unwrap_or_else(|e| panic!("open PR in {slug}: {e:?}"));
+    }
+
+    /// Drive a list handler with a viewer + query string, returning the parsed JSON body.
+    fn serve(
+        handler: &dyn Handler,
+        viewer: &Principal,
+        repo: Option<&str>,
+        query: &str,
+    ) -> Value {
+        let scope = TenantScope::from_verified_token(viewer, viewer.region.clone());
+        let mut params = BTreeMap::new();
+        if let Some(r) = repo {
+            params.insert("repo".to_string(), r.to_string());
+        }
+        let req = EdgeRequest::new("GET", "/v1/git/prs", query, vec![], vec![]);
+        let page = Page::from_request(&req);
+        let ctx = HandlerCtx {
+            principal: viewer,
+            scope: &scope,
+            params: &params,
+            page: &page,
+            request: &req,
+        };
+        match handler.handle(&ctx) {
+            Ok(resp) => resp.json_body().expect("json body"),
+            Err(e) => panic!("handler errored: {e:?}"),
+        }
+    }
+
+    /// **A forged cursor never panics (verifier finding, R3.1): `?cursor=usize::MAX` must yield a
+    /// clean empty page** — the offset+limit arithmetic saturates instead of overflowing (which
+    /// panicked under overflow-checks, i.e. every debug/CI profile → a 500 on a crafted query).
+    #[test]
+    fn forged_max_cursor_yields_empty_page_never_panics() {
+        let root = temp_root("forged-cursor");
+        let authz = GrantBackedRepos::new().grant_read("u:viewer", TENANT, "core");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root)
+            .with_repo_authorizer(Arc::new(authz));
+        let viewer = human("u:viewer");
+        open_pr(&be, "core", "Only PR", &viewer);
+        let handler = DRepoPrList { be: Arc::new(be) };
+        let body = serve(
+            &handler,
+            &viewer,
+            Some("core"),
+            &format!("state=all&cursor={}", usize::MAX),
+        );
+        assert_eq!(body["items"].as_array().unwrap().len(), 0, "past-the-end page is empty");
+        assert!(body["page"]["next_cursor"].is_null(), "no next past the end");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The PR title is capped at create (verifier note, R3.1)** — an unbounded title is echoed
+    /// into every list row (response-bloat vector). >512 bytes is a clean error, never stored.
+    #[test]
+    fn oversized_title_is_rejected_at_create() {
+        let root = temp_root("title-cap");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root);
+        let author = human("u:author");
+        be.create_repo_as(TENANT, REGION, "core", &author).unwrap();
+        let body = json!({
+            "title": "x".repeat(513),
+            "base_ref": "refs/heads/main",
+            "head_ref": "refs/heads/feature",
+            "head_oid": "0".repeat(40),
+        });
+        let err = be.open_pr(TENANT, REGION, "core", &body, &author);
+        assert!(err.is_err(), "513-byte title must be rejected");
+        // At the cap is fine.
+        let ok_body = json!({
+            "title": "x".repeat(512),
+            "base_ref": "refs/heads/main",
+            "head_ref": "refs/heads/feature",
+            "head_oid": "0".repeat(40),
+        });
+        assert!(be.open_pr(TENANT, REGION, "core", &ok_body, &author).is_ok());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The cross-repo front door is leak-free: a PR in a repo the viewer cannot `pull` NEVER
+    /// appears — even one the viewer AUTHORED.** The `visible_repos` prefilter runs BEFORE the bucket
+    /// predicate, so a forbidden repo contributes nothing to the items OR the count (the anti-oracle
+    /// rule). This is the PR-list analogue of the `visible_repos_filters_to_the_granted_set` proof.
+    #[test]
+    fn cross_repo_bucket_never_leaks_a_forbidden_repos_pr() {
+        let root = temp_root("cross-leak");
+        // Viewer is granted `read` on `alpha` only; `beta` is invisible to them.
+        let authz = GrantBackedRepos::new().grant_read("u:viewer", TENANT, "alpha");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root)
+            .with_repo_authorizer(Arc::new(authz));
+        let viewer = human("u:viewer");
+        // The viewer AUTHORS a PR in BOTH repos (so the bucket predicate `yours` WOULD match beta if
+        // the prefilter leaked).
+        open_pr(&be, "alpha", "Alpha change", &viewer);
+        open_pr(&be, "beta", "Beta change (forbidden repo)", &viewer);
+
+        let handler = DMyPrs { be: Arc::new(be) };
+        let body = serve(&handler, &viewer, None, "bucket=yours");
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "only the visible repo's PR is listed");
+        assert_eq!(items[0]["repo"], "alpha");
+        assert_eq!(items[0]["title"], "Alpha change");
+        // The count is over the leak-free set — beta's PR never contributes.
+        assert_eq!(body["counts"]["bucket"], 1);
+        assert_eq!(body["page"]["total"], 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The per-repo list: rows carry the title, tab/sidebar counts are over the full authorised set,
+    /// and the `?state=` filter narrows the returned rows without changing the counts** (a badge never
+    /// under-counts because a tab is active).
+    #[test]
+    fn per_repo_list_rows_titles_and_counts() {
+        let root = temp_root("per-repo");
+        let authz = GrantBackedRepos::new().grant_read("u:viewer", TENANT, "core");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root)
+            .with_repo_authorizer(Arc::new(authz));
+        let viewer = human("u:viewer");
+        open_pr(&be, "core", "First PR", &viewer);
+        open_pr(&be, "core", "Second PR", &viewer);
+
+        let handler = DRepoPrList { be: Arc::new(be) };
+        // Default (state=open) — both open PRs listed, titles present.
+        let body = serve(&handler, &viewer, Some("core"), "");
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        let titles: Vec<&str> = items.iter().map(|i| i["title"].as_str().unwrap()).collect();
+        assert!(titles.contains(&"First PR") && titles.contains(&"Second PR"));
+        // Counts over the full set.
+        assert_eq!(body["counts"]["open"], 2);
+        assert_eq!(body["counts"]["all"], 2);
+        assert_eq!(body["counts"]["merged"], 0);
+        assert_eq!(body["counts"]["yours"], 2, "the viewer authored both");
+        // A tab with no matches returns zero rows but the counts are unchanged (no under-count).
+        let merged = serve(&handler, &viewer, Some("core"), "state=merged");
+        assert_eq!(merged["items"].as_array().unwrap().len(), 0);
+        assert_eq!(merged["counts"]["open"], 2, "the Open badge still reads 2 on the Merged tab");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **Cursor stability: paging the sorted set with `limit` visits every row exactly once, in a
+    /// stable order, with a correct bidirectional cursor** (`prev_cursor` None at the head; `next`
+    /// None at the tail).
+    #[test]
+    fn per_repo_list_cursor_is_stable_and_bidirectional() {
+        let root = temp_root("cursor");
+        let authz = GrantBackedRepos::new().grant_read("u:viewer", TENANT, "core");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root)
+            .with_repo_authorizer(Arc::new(authz));
+        let viewer = human("u:viewer");
+        for i in 1..=5 {
+            open_pr(&be, "core", &format!("PR {i}"), &viewer);
+        }
+        let handler = DRepoPrList { be: Arc::new(be) };
+
+        // Page 1 (limit 2): head → prev None, next = "2".
+        let p1 = serve(&handler, &viewer, Some("core"), "state=all&limit=2");
+        assert_eq!(p1["items"].as_array().unwrap().len(), 2);
+        assert_eq!(p1["page"]["total"], 5);
+        assert!(p1["page"]["prev_cursor"].is_null(), "head has no Newer");
+        assert_eq!(p1["page"]["next_cursor"], "2");
+
+        // Page 2: prev = "0", next = "4".
+        let p2 = serve(&handler, &viewer, Some("core"), "state=all&limit=2&cursor=2");
+        assert_eq!(p2["page"]["prev_cursor"], "0");
+        assert_eq!(p2["page"]["next_cursor"], "4");
+
+        // Page 3 (tail): 1 row, next None.
+        let p3 = serve(&handler, &viewer, Some("core"), "state=all&limit=2&cursor=4");
+        assert_eq!(p3["items"].as_array().unwrap().len(), 1);
+        assert!(p3["page"]["next_cursor"].is_null(), "tail has no Older");
+
+        // The three pages cover all 5 numbers exactly once (no gaps/dups — stable order).
+        let mut seen: Vec<u64> = Vec::new();
+        for pg in [&p1, &p2, &p3] {
+            for it in pg["items"].as_array().unwrap() {
+                seen.push(it["number"].as_u64().unwrap());
+            }
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, vec![1, 2, 3, 4, 5]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **A legacy record (empty title) rows as `null` title (→ `#number` fallback) and a degraded
+    /// checks projection fails static** — the row VM is honest, never fabricates, never blanks.
+    #[test]
+    fn row_vm_title_null_and_checks_unavailable_are_honest() {
+        // A legacy record: empty title, no updated stamp.
+        let pr = myelin_git::lifecycle::PullRequest::open(
+            9,
+            "refs/heads/main",
+            "refs/heads/feature",
+            "psn:old@acme",
+            false,
+        );
+        let rec = PrRecord::open(&pr, "abc");
+        assert_eq!(rec.title, "");
+        let enriched = EnrichedPr {
+            rec,
+            summary: ChecksSummary::unavailable(),
+            you_requested: false,
+            repo_slug: Some("core".into()),
+        };
+        let row = DurableGitBackend::pr_list_row_json(&enriched);
+        assert!(row["title"].is_null(), "empty title → null (the #number fallback is honest)");
+        assert_eq!(row["number"], 9);
+        assert_eq!(row["checks_summary"]["verdict"], "unavailable", "fails static, still lists");
+        assert_eq!(row["updated_at"], Value::Null);
     }
 }

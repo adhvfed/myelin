@@ -74,6 +74,10 @@ export default function RepoHomeScreen() {
                     <A href={`/git/repos/${params.repo}/commits/main`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-primary)" }}>
                       <Icon name="commit" /> Commits
                     </A>
+                    {/* R3.1 — the missing front door: mirror the Commits link (ux-git critical #1). */}
+                    <A href={`/git/repos/${params.repo}/prs`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-primary)" }}>
+                      <Icon name="pull-request" /> Pull requests
+                    </A>
                   </div>
 
                   <section aria-labelledby="tree-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>

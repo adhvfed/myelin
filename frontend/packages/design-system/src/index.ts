@@ -4,6 +4,15 @@ export { Icon, SPRITE_HREF_DEFAULT, type IconProps } from "./Icon";
 export { ICON_NAMES, type IconName } from "./icon-names";
 // The loading primitive (structure-matching skeleton + one debounced polite live region; §5.3/§6).
 export { Skeleton, SkeletonBlock, type SkeletonProps, type SkeletonBlockProps } from "./Skeleton";
+// The shared status pill (glyph+label; pr-state + check-verdict variants; R3.1). Status is TEXT,
+// never colour alone; the verdict ring stays reserved for the CI trio.
+export {
+  StatusPill,
+  checkVerdictLabel,
+  type StatusPillProps,
+  type PrStateValue,
+  type CheckVerdict,
+} from "./StatusPill";
 // Tier-1 overlay primitives (Dialog · ConfirmDialog · Popover · Menu · Tooltip · Toast) + the shared
 // substrate (one focus-trap/portal/scroll-lock/z-index layer). See ./overlays.
 export * from "./overlays";

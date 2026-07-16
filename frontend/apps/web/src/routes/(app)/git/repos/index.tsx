@@ -15,9 +15,16 @@ export default function ReposScreen() {
   return (
     <section aria-labelledby="repos-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-4)" }}>
       <Title>Code · Myelin</Title>
-      <h1 id="repos-heading" style={{ "font-size": "var(--fs-h1)", margin: "0" }}>
-        Repositories
-      </h1>
+      <div style={{ display: "flex", "align-items": "center", gap: "var(--space-3)", "flex-wrap": "wrap" }}>
+        <h1 id="repos-heading" style={{ "font-size": "var(--fs-h1)", margin: "0" }}>
+          Repositories
+        </h1>
+        <div style={{ flex: "1" }} />
+        {/* R3.1 — the cross-repo "what needs me" front door (the front door for the review job). */}
+        <A href="/prs" style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-primary)", "text-decoration": "none" }}>
+          <Icon name="pull-request" /> Your pull requests
+        </A>
+      </div>
 
       <ErrorBoundary
         fallback={(err) => (

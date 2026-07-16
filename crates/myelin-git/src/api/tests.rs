@@ -97,15 +97,23 @@ fn cli_parses_the_arch_section_3_2_verbs() {
         }
     );
     assert_eq!(
-        parse_cli(&["pr", "open", "core", "--head-oid", "abc", "--draft"]).unwrap(),
+        parse_cli(&["pr", "open", "core", "--title", "My change", "--head-oid", "abc", "--draft"])
+            .unwrap(),
         CliCommand::PrOpen {
             repo: "core".into(),
+            title: "My change".into(),
+            body: None,
             base_ref: None,
             head_ref: None,
             head_oid: Some("abc".into()),
             draft: true,
         }
     );
+    // `pr open` without `--title` is a clean parse error (R3.1: title required at create).
+    assert!(matches!(
+        parse_cli(&["pr", "open", "core", "--head-oid", "abc"]),
+        Err(CliParseError::MissingArg { what: "title" })
+    ));
     assert_eq!(
         parse_cli(&["pr", "view", "core", "42"]).unwrap(),
         CliCommand::PrView {
@@ -213,6 +221,8 @@ fn cli_write_commands_are_classified_for_the_bus2_gate() {
     assert!(CliCommand::RepoCreate { slug: "r".into() }.is_write());
     assert!(CliCommand::PrOpen {
         repo: "r".into(),
+        title: "t".into(),
+        body: None,
         base_ref: None,
         head_ref: None,
         head_oid: None,

@@ -243,6 +243,11 @@ pub enum CliCommand {
     PrOpen {
         /// The repo slug the PR is opened against.
         repo: String,
+        /// **The human title (R3.1 — required at create).** A PR without a title is a hollow list row
+        /// (ux-git #3); the CLI requires `--title`.
+        title: String,
+        /// The optional Markdown body (`--body`).
+        body: Option<String>,
         /// The base ref (default `refs/heads/main`).
         base_ref: Option<String>,
         /// The head ref (default `refs/heads/feature`).
@@ -407,6 +412,10 @@ fn parse_pr(rest: &[&str]) -> Result<CliCommand, CliParseError> {
             let repo = positional(args, 0).ok_or(CliParseError::MissingArg { what: "repo" })?;
             Ok(CliCommand::PrOpen {
                 repo: repo.to_string(),
+                title: flag_value(args, "--title")
+                    .filter(|t| !t.trim().is_empty())
+                    .ok_or(CliParseError::MissingArg { what: "title" })?,
+                body: flag_value(args, "--body"),
                 base_ref: flag_value(args, "--base"),
                 head_ref: flag_value(args, "--head"),
                 head_oid: flag_value(args, "--head-oid"),
