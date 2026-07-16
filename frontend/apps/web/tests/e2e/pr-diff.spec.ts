@@ -76,6 +76,39 @@ test.describe("R3.2 PR diff / files-changed — real browser", () => {
     await expect(page.getByText("Does this clamp handle limit == 0?")).toBeVisible();
   });
 
+  test("commenting on a DELETED (old-side) line in split view opens the composer + posts (finding #16)", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/1/diff");
+    await page.waitForSelector("[data-rowkey]"); await page.waitForTimeout(1200); // hydrate
+    // Split view is the default at 1440px. Click the DELETED line's LEFT (old-side) cell — before the
+    // fix the widget row anchored to the NEW side only, so this click silently no-op'd.
+    const deleted = page.locator('[data-side="old"]', { hasText: "let cap = 50;" });
+    await expect(deleted).toBeVisible();
+    await deleted.click();
+    const box = page.getByRole("textbox", { name: /Comment on src\/list_filter.rs line 2/ });
+    await expect(box).toBeVisible();
+    await box.fill("Why drop the old default here?");
+    await page.getByRole("button", { name: "Add single comment" }).click();
+    await expect(page.getByText("Why drop the old default here?")).toBeVisible();
+  });
+
+  test("a >50-file PR pages to the next set via 'Load remaining files' (finding #15)", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/4/diff");
+    await page.waitForSelector("[data-rowkey]"); await page.waitForTimeout(600);
+    // Page 1: files 0–49 rendered; the honest "10 more files weren't rendered" + the paging link.
+    await expect(page.getByText("src/paged/file_000.txt").first()).toBeVisible();
+    await expect(page.getByTestId("load-remaining")).toContainText("10 more files weren't rendered");
+    // A page-2-only file is NOT present yet.
+    await expect(page.getByText("src/paged/file_055.txt")).toHaveCount(0);
+    // Click the link → the cursor threads into getPrDiff and page 2 loads (files 50–59).
+    await page.getByRole("link", { name: "Load remaining files" }).click();
+    await expect(page).toHaveURL(/cursor=c50/);
+    await expect(page.getByText("src/paged/file_055.txt").first()).toBeVisible();
+    // Page 2 is the last page — no further paging link.
+    await expect(page.getByTestId("load-remaining")).toHaveCount(0);
+  });
+
   test("F7 walks to the next change row", async ({ page }) => {
     await devLogin(page);
     await page.goto("/git/repos/myelin/prs/1/diff");

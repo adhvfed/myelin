@@ -191,7 +191,7 @@ const server = createServer((req, res) => {
     }
     // R3.2 · G-7 — the PR three-dot diff.
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/diff$/))) {
-      const v = prDiffJson(seg(m[1]), Number(m[2]));
+      const v = prDiffJson(seg(m[1]), Number(m[2]), url.searchParams.get("cursor") ?? undefined);
       return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("pull request"));
     }
     // R3.2 · G-7 N2 — expand-context lines at a blob oid.

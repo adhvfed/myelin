@@ -53,12 +53,16 @@ export default function PrDiffScreen() {
 
   // Layout: ?view= wins; else split ≥960px, unified below; <720px forces unified (the switcher hides).
   const viewParam = () => (typeof search.view === "string" && (search.view === "split" || search.view === "unified") ? search.view : undefined);
+  // The MR-014 file cursor (?cursor=) — the "Load remaining files" link SETS it; the query must READ
+  // it (mirrors the PR-list route) or a >50-file PR can never page. `getPrDiff` accepts it.
+  const cursor = () => (typeof search.cursor === "string" ? search.cursor : undefined);
 
   const pr = createAsync(async () => (ready() ? getPr({ repo: repo(), n: n() }) : undefined));
   // NB: the diff query does NOT depend on `view` — layout (split/unified) is a CLIENT concern; the
-  // server is layout-agnostic, so toggling the view never refetches (and never remounts the grid).
+  // server is layout-agnostic, so toggling the view never refetches (and never remounts the grid). It
+  // DOES depend on `cursor` — a new page is a real refetch keyed by the file cursor.
   const diff = createAsync(async () =>
-    ready() ? getPrDiff({ repo: repo(), n: n() }) : undefined,
+    ready() ? getPrDiff({ repo: repo(), n: n(), cursor: cursor() }) : undefined,
   );
   const threads = createAsync(async () =>
     ready() ? getPrThreads({ repo: repo(), n: n() }) : undefined,

@@ -374,9 +374,10 @@ const SEED_ANCHORED = {
   ],
 };
 
-/** GET /v1/git/repos/{repo}/prs/{n}/diff → the PrDiffVM (null = 404). */
-export function prDiffJson(repo, n) {
+/** GET /v1/git/repos/{repo}/prs/{n}/diff?cursor= → the PrDiffVM (null = 404). PR #4 pages by cursor. */
+export function prDiffJson(repo, n, cursor) {
   if (repo !== "myelin" || !SEED_PRS[n]) return null;
+  if (n === 4) return pagedDiff(cursor);
   return SEED_PR_DIFFS[n] ?? {
     number: n,
     base_ref: SEED_PRS[n].pr.base_ref,
@@ -488,7 +489,79 @@ const SEED_PRS = {
     // `checks` is intentionally never served for #3 (prChecksJson 404s) — the local-degrade path.
     checks: { required_contexts: [], required_approvals: 0, green_contexts: [], endorsed_contexts: [], fork_unendorsed_contexts: [], gate_admitted: false, durable: true },
   },
+  // PR #4 — the >50-file paging fixture: its diff is served in two pages via the MR-014 file cursor
+  // (see prDiffJson). Proves "Load remaining files" actually pages (finding #15).
+  4: {
+    pr: {
+      number: 4,
+      pr_state: "open",
+      title: "Big refactor across many files",
+      body_md: null,
+      base_ref: "refs/heads/main",
+      head_ref: "refs/heads/big",
+      head_oid: C2,
+      author: "u_dev_operator@acme.noreply",
+      author_is_agent: false,
+      reviews: 0,
+      created_at: 1718900000,
+      updated_at: 1718900000,
+      commits_count: 1,
+      commits_count_capped: false,
+      durable: true,
+    },
+    checks: { required_contexts: [], required_approvals: 0, green_contexts: [], endorsed_contexts: [], fork_unendorsed_contexts: [], gate_admitted: false, durable: true },
+  },
 };
+
+// PR #4's paged diff: 60 changed files served 50-per-page via the file cursor. Page 1 (no cursor)
+// carries files 0–49 + `next_cursor: "c50"`; page 2 (?cursor=c50) carries files 50–59 + no cursor.
+const PAGED_TOTAL_FILES = 60;
+const PAGED_PAGE = 50;
+function pagedFile(i) {
+  const idx = String(i).padStart(3, "0");
+  return {
+    path: `src/paged/file_${idx}.txt`,
+    old_path: null,
+    status: "A",
+    kind: "text",
+    additions: 1,
+    deletions: 0,
+    size_bytes: null,
+    hunks: [
+      {
+        header: `@@ -0,0 +1 @@ file_${idx}`,
+        old_start: 0,
+        old_lines: 0,
+        new_start: 1,
+        new_lines: 1,
+        lines: [{ origin: "+", content: `line for file ${idx}`, old_no: null, new_no: 1 }],
+      },
+    ],
+    deleted_body_available: false,
+    truncated: false,
+  };
+}
+function pagedDiff(cursor) {
+  const start = cursor === "c50" ? PAGED_PAGE : 0;
+  const end = Math.min(start + PAGED_PAGE, PAGED_TOTAL_FILES);
+  const files = [];
+  for (let i = start; i < end; i++) files.push(pagedFile(i));
+  return {
+    number: 4,
+    base_ref: "refs/heads/main",
+    base_oid: C1,
+    short_base_oid: C1.slice(0, 7),
+    head_oid: C2,
+    short_head_oid: C2.slice(0, 7),
+    three_dot: true,
+    files,
+    restricted_files: 0,
+    total_files: PAGED_TOTAL_FILES,
+    total_additions: PAGED_TOTAL_FILES,
+    total_deletions: 0,
+    page: { next_cursor: end < PAGED_TOTAL_FILES ? "c50" : null, limit: PAGED_PAGE },
+  };
+}
 
 // ── R3.3 — a per-process mutable thread/review store (the dev-edge stateful surface the e2e drives).
 //    Keyed by `${repo}:${n}`; a fresh process starts empty (an honest "No discussion yet"). ──

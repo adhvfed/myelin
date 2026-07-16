@@ -90,6 +90,44 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
     await expect(page.getByTestId("discussion").getByText("Kicking off the discussion.")).toBeVisible();
   });
 
+  test("an in-progress review batch RESUMES on reload — 'Start a review' does not double-create (finding #18)", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/4"); // isolated fixture — no other test drives PR #4's reviews.
+    await page.waitForLoadState("networkidle");
+
+    // Start a review → the server records an in_progress batch owned by the viewer.
+    await page.getByTestId("start-review").click();
+    await expect(page.getByTestId("review-batch")).toBeVisible();
+
+    // Reload: the draft is a LOCAL signal, but the server still returns the in_progress batch. The page
+    // must rehydrate it (resume) instead of showing "Start a review" again (which would double-create).
+    await page.reload();
+    await page.waitForLoadState("networkidle");
+    await expect(page.getByTestId("review-batch")).toBeVisible();
+    await expect(page.getByTestId("start-review")).toHaveCount(0);
+
+    // Clean up the shared per-process fixture so it can't leak into another test.
+    await page.getByRole("button", { name: "Discard" }).click();
+    await expect(page.getByTestId("start-review")).toBeVisible();
+  });
+
+  test("a discussion composer CLEARS after a successful post — no duplicate on a second submit (finding #19)", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/4"); // isolated fixture.
+    await page.waitForLoadState("networkidle");
+
+    const box = page.getByLabel("New comment");
+    await box.fill("One-shot comment.");
+    await page.getByTestId("post-thread").click();
+    await expect(page.getByTestId("discussion").getByText("One-shot comment.")).toBeVisible();
+
+    // The controlled composer is now empty (the signal cleared AND the DOM followed) — a stale DOM value
+    // was the finding: a second click would duplicate-post. Empty field ⇒ the second post is a no-op.
+    await expect(box).toHaveValue("");
+    await page.getByTestId("post-thread").click();
+    await expect(page.getByTestId("discussion").getByText("One-shot comment.")).toHaveCount(1);
+  });
+
   test("a mergeable PR opens the merge ConfirmDialog (alertdialog, safe-action focus)", async ({ page }) => {
     await devLogin(page);
     await page.goto("/git/repos/myelin/prs/2"); // gate admitted.
