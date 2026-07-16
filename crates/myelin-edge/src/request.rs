@@ -63,6 +63,32 @@ impl EdgeRequest {
             .map(str::trim)
     }
 
+    /// **The PASSWORD from an `Authorization: Basic base64(user:pass)` header (the git smart-HTTP wire
+    /// credential).** `git push`/`git clone http://…` sends HTTP Basic, and on the Myelin git wire the
+    /// PASSWORD carries the capability-token material (the username is IGNORED — git sends an arbitrary
+    /// one, e.g. `x-access-token`). Total over attacker bytes: a non-Basic scheme, malformed base64,
+    /// non-UTF-8, no `:` separator, or an EMPTY password all return `None` — so the caller treats them
+    /// EXACTLY like a missing credential (the same uniform 401, no distinct oracle). The token material
+    /// is NEVER logged. Only consulted on the git wire routes (the JSON product API stays Bearer-only).
+    pub fn basic_password(&self) -> Option<String> {
+        use base64::Engine as _;
+        let raw = self.header("authorization")?;
+        let b64 = raw
+            .strip_prefix("Basic ")
+            .or_else(|| raw.strip_prefix("basic "))?
+            .trim();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .ok()?;
+        let creds = String::from_utf8(decoded).ok()?;
+        // `user:pass` — the username (before the first `:`) is ignored; the password is the token.
+        let (_user, pass) = creds.split_once(':')?;
+        if pass.is_empty() {
+            return None;
+        }
+        Some(pass.to_string())
+    }
+
     /// A cookie value by name (parses the `Cookie` header — total over a malformed header).
     pub fn cookie(&self, name: &str) -> Option<String> {
         let raw = self.header("cookie")?;

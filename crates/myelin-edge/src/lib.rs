@@ -66,6 +66,7 @@
 //! gateway is TOTAL over a malformed request (no panic — every parse is checked).
 
 pub mod authz;
+pub mod bootstrap;
 pub mod catalogue;
 pub mod error;
 pub mod gateway;
@@ -87,6 +88,10 @@ pub mod sse;
 #[cfg(any(test, feature = "test-support"))]
 pub use authz::AllowAll;
 pub use authz::{AuthenticatedActionPolicy, MOUNTED_EDGE_ACTIONS};
+pub use bootstrap::{
+    bootstrap_principal_and_mint, BootstrapError, BootstrapOutcome, BootstrapParams,
+    BOOTSTRAP_AUTHORITY, BOOTSTRAP_SCHEME,
+};
 pub use catalogue::{
     page_envelope, Handler, HandlerCtx, Method, Page, API_VERSION, DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,

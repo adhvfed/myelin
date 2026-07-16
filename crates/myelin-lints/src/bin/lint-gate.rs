@@ -96,6 +96,16 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // identity_durable.rs stays FULLY linted. NAMED, LOUD exclusion (see the module note in
     // kms_durable.rs), never a silent skip; the lint is NOT weakened.
     "myelin-storage/src/kms_durable.rs",
+    // The durable capability-token CELL AUTHORITY ROOT backing (R4.0 / P-527 / MR-025 follow-on): the
+    // software-sealed cell-authority root (`cell_token_root` — the Ed25519 seed + macaroon MAC key,
+    // sealed under the SAME operator seal key as the KMS root). EXACTLY the kms_durable.rs posture:
+    // cell-INFRA key material (the cell authority signs tokens for ALL tenants in the cell), PII-free
+    // (key ciphertext + opaque `cell_id`), the `cell_token_root` table carries NO tenant column (the
+    // root is per-CELL), and it connects to the OLTP pool DIRECTLY (not via with_tenant_tx/RLS). Like
+    // kms_durable.rs this is infra, NOT a per-request tenant data store, so it carries no per-row
+    // tenant predicate. pg.rs / identity_durable.rs stay FULLY linted. NAMED, LOUD exclusion (see the
+    // module note in cell_root_durable.rs), never a silent skip; the lint is NOT weakened.
+    "myelin-storage/src/cell_root_durable.rs",
     // The FIREHOSE transport (EB-21 / P-141): `firehose::publish(stream, scope, frame)` is the
     // FROZEN contract-3.5 / §5.5 method name for the EPHEMERAL firehose transport — a DIFFERENT
     // seam from the durable bus the `no-raw-publish` lint guards. §4.3 is explicit: "the durable bus

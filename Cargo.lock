@@ -2504,7 +2504,9 @@ dependencies = [
 name = "myelin-edge"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "bytes",
+ "chrono",
  "http-body-util",
  "hyper",
  "hyper-util",

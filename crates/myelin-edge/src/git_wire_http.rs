@@ -12,14 +12,20 @@
 //!     `Content-Type: application/x-git-upload-pack-advertisement`.
 //! - `POST /<tenant>/<region>/<repo>.git/git-upload-pack`
 //!   → [`GitCore::serve`]`(UploadPack, body)`, `Content-Type: application/x-git-upload-pack-result`.
-//! - `POST /<tenant>/<region>/<repo>.git/git-receive-pack` (push) → **403, not yet** — the durable
-//!   quarantine-intake + one-tx ref-CAS push path over the wire is **CT-006d** (stated, not built here).
+//! - `POST /<tenant>/<region>/<repo>.git/git-receive-pack` (push) → **LIVE** (CT-006d): the durable
+//!   quarantine-intake + one-tx ref-CAS + `git.ref.updated` outbox push path over the wire. A real
+//!   `git push` lands here (proven by the push oracle); the R0.2 branch-protection gate + the R0.3
+//!   per-repo WRITE authorizer fire on it.
 //!
 //! ## AUTH / AUTHZ (the security floor — reused, never forked)
 //! The gateway owns the lifecycle (authenticate → resolve tenant-from-token → reject+audit a
 //! cross-tenant IDOR → re-authorize the action → dispatch), EXACTLY as for every durable git route.
 //! These wire routes carry a `{tenant}`/`{region}` path segment (git's URL grammar requires it), so:
-//!   - **unauthenticated** (no/invalid Bearer) → a uniform **401** (the real PASETO verifier);
+//!   - **credential** — the wire accepts BOTH `Authorization: Bearer <token>` AND (R4.0 item C) git's
+//!     native `Authorization: Basic base64(user:pass)` where the PASSWORD is the capability token (the
+//!     username is ignored) — both route to the SAME PASETO verify path. The JSON product API stays
+//!     Bearer-only; this Basic seam is git-wire-scoped (gated on the `git.wire.*` action verb);
+//!   - **unauthenticated** (no/invalid credential) → a uniform **401** (the real PASETO verifier);
 //!   - **cross-tenant** (token tenant ≠ URL tenant) → the gateway's audited IDOR **reject** (403),
 //!     fired BEFORE any repo lookup — so repo existence is NEVER leaked across tenants;
 //!   - the per-action **authorize** seam gates the read (`git.wire.upload_pack`) — a denial is a 403.
@@ -264,10 +270,12 @@ impl Handler for WireReceivePack {
     }
 }
 
-/// **Register the git smart-HTTP wire endpoints (read side) on the gateway.** The clone/fetch routes
-/// drive [`DurableGitBackend::wire_serving`]; the gateway owns auth/tenant-from-token/IDOR/authorize.
-/// The receive-pack route is registered as a LOUD 403 (push is CT-006d). The routes use git's literal
-/// URL grammar (`/<tenant>/<region>/<repo>.git/...`) so a real `git` client clones/fetches directly.
+/// **Register the git smart-HTTP wire endpoints on the gateway.** The clone/fetch (upload-pack) AND
+/// push (receive-pack) routes drive [`DurableGitBackend::wire_serving`]/[`DurableGitBackend::receive_pack`];
+/// the gateway owns auth/tenant-from-token/IDOR/authorize. Push is LIVE (CT-006d) — the receive-pack
+/// route runs the durable one-tx ref-CAS + outbox emit. The routes use git's literal URL grammar
+/// (`/<tenant>/<region>/<repo>.git/...`) so a real `git` client clones/fetches/pushes directly (over
+/// Bearer or HTTP Basic — R4.0 item C).
 pub fn register_git_wire(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -> GatewayBuilder {
     // GET .../info/refs — the ref advertisement (read; gated by the upload-pack read action).
     b = b.route(

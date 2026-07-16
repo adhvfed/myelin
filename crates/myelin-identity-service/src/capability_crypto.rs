@@ -206,6 +206,21 @@ impl CellTokenAuthority {
             .expect("a random 32-byte Ed25519 seed is always a valid cell authority")
     }
 
+    /// **Build the cell authority from DURABLE, seal-recovered material (R4.0 / P-527 / MR-025
+    /// follow-on).** The [`myelin_storage::CellRootMaterial`] is the Ed25519 seed + macaroon MAC key
+    /// that [`myelin_storage::DurableCellRootBacking::load_or_generate`] unsealed from the durable
+    /// `cell_token_root` row (under the operator seal key). This is the production replacement for the
+    /// ephemeral [`Self::generate`]: because the SAME seed/mac survive a restart, a token minted before
+    /// a kill-9 verifies after it (the cell PUBLIC key the verifier trusts is stable). The raw material
+    /// never leaves this constructor's argument — the resulting authority holds only the derived key
+    /// pair + mac key, never re-exports the seed. A malformed seed is a loud error (never a fabricated
+    /// key), exactly as [`Self::from_seed`].
+    pub fn from_material(
+        material: &myelin_storage::CellRootMaterial,
+    ) -> Result<CellTokenAuthority, AuthzError> {
+        CellTokenAuthority::from_seed(&material.ed25519_seed, &material.mac_key)
+    }
+
     /// The verifier's trust anchor (the cell PUBLIC key + the shared macaroon secret). Injected into a
     /// [`PasetoCapabilityVerifier`]; it carries NO Ed25519 private key (a verifier can check but never
     /// mint a token).
