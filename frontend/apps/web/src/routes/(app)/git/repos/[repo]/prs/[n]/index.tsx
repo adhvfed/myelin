@@ -25,7 +25,6 @@ import {
   Icon,
   Skeleton,
   SkeletonBlock,
-  StatusPill,
   Chip,
   PaneSection,
   ConfirmDialog,
@@ -47,10 +46,10 @@ import {
   type PrincipalVM,
 } from "~/lib/api";
 import { NotAvailable } from "~/components/NotAvailable";
+import { PrHeader } from "~/components/PrHeader";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 import { Markdown } from "~/components/Markdown";
 import { useContextPane } from "~/components/AppShell";
-import { fmtDate } from "~/lib/format";
 
 const card = {
   border: "var(--hairline) solid var(--border)",
@@ -155,7 +154,7 @@ export default function PrOverviewScreen() {
             <Show when={pr()}>
               {(p) => (
                 <>
-                  <PrHeader pr={p()} repo={repo()} commitsCount={p().commits_count} />
+                  <PrHeader pr={p()} repo={repo()} active="overview" commitsCount={p().commits_count} />
 
                   <Show when={p().body_md}>
                     <section aria-label="Description" style={{ ...card }}>
@@ -232,51 +231,6 @@ export default function PrOverviewScreen() {
 }
 
 // ── header ──────────────────────────────────────────────────────────────────────────────────────
-
-function PrHeader(props: { pr: PrVM; repo: string; commitsCount?: number | null }) {
-  const title = () => props.pr.title ?? `#${props.pr.number}`;
-  return (
-    <header style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
-      <div style={{ display: "flex", "align-items": "center", gap: "var(--space-2)", "flex-wrap": "wrap" }}>
-        <StatusPill kind="pr-state" state={props.pr.pr_state} />
-        <h1 id="pr-heading" style={{ "font-size": "var(--fs-h1)", margin: "0" }}>
-          {title()} <span style={{ color: "var(--text-subtle)", "font-weight": "400" }}>#{props.pr.number}</span>
-        </h1>
-      </div>
-      <p style={{ color: "var(--text-muted)", margin: "0", "font-size": "var(--fs-caption)" }}>
-        <code style={{ "font-family": "var(--font-mono)" }}>{props.pr.head_ref}</code>
-        {" → "}
-        <code style={{ "font-family": "var(--font-mono)" }}>{props.pr.base_ref}</code>
-        {" · by "}{props.pr.author}
-        <Show when={props.pr.author_is_agent}><span> · <Icon name="agent" /> agent</span></Show>
-        <Show when={props.pr.created_at}>{" · opened "}{fmtDate(props.pr.created_at as number)}</Show>
-      </p>
-      {/* Tabs (Overview · Files changed · Checks · Commits). Files/diff is the G-7 pack (link only). */}
-      <nav aria-label="Pull request sections" role="tablist" style={{ display: "flex", gap: "var(--space-1)", "border-block-end": "var(--hairline) solid var(--border)" }}>
-        <span role="tab" aria-selected="true" style={tabStyle(true)}>Overview</span>
-        <A role="tab" href={`/git/repos/${props.repo}/prs/${props.pr.number}/diff`} style={tabStyle(false)}>Files changed</A>
-        <A role="tab" href={`/git/repos/${props.repo}/prs/${props.pr.number}/checks`} style={tabStyle(false)}>Checks</A>
-        <A role="tab" href={`/git/repos/${props.repo}/prs/${props.pr.number}/commits`} style={tabStyle(false)}>
-          Commits
-          <Show when={props.commitsCount != null}>
-            {" "}<span aria-label={`${props.commitsCount} commits`}>({props.commitsCount}{props.pr.commits_count_capped ? "+" : ""})</span>
-          </Show>
-        </A>
-      </nav>
-    </header>
-  );
-}
-
-function tabStyle(active: boolean) {
-  return {
-    padding: "var(--space-2) var(--space-3)",
-    "text-decoration": "none",
-    color: active ? "var(--text-primary)" : "var(--text-muted)",
-    background: active ? "var(--surface-hover)" : "transparent",
-    "border-radius": "var(--radius-1) var(--radius-1) 0 0",
-    "font-size": "var(--fs-caption)",
-  } as const;
-}
 
 // ── checks panel (G-9) + its local failure state ──────────────────────────────────────────────────
 

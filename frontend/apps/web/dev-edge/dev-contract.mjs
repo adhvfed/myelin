@@ -295,6 +295,115 @@ export function commitDiffJson(repo, oid) {
   return SEED_DIFFS[oid] ?? null;
 }
 
+// ── R3.2 · G-7 — the PR three-dot diff + expand-context fixtures ──────────────────────────────────
+const B_OLD = "0000000000000000000000000000000000000001";
+const B_NEW = "0000000000000000000000000000000000000002";
+const SEED_PR_DIFFS = {
+  1: {
+    number: 1,
+    base_ref: "refs/heads/main",
+    base_oid: C1,
+    short_base_oid: C1.slice(0, 7),
+    head_oid: C2,
+    short_head_oid: C2.slice(0, 7),
+    three_dot: true,
+    files: [
+      {
+        path: "src/list_filter.rs",
+        old_path: null,
+        status: "M",
+        kind: "text",
+        additions: 2,
+        deletions: 1,
+        size_bytes: null,
+        hunks: [
+          {
+            header: "@@ -1,3 +1,4 @@ impl ListFilter {",
+            old_start: 1,
+            old_lines: 3,
+            new_start: 1,
+            new_lines: 4,
+            lines: [
+              { origin: " ", content: "impl ListFilter {", old_no: 1, new_no: 1 },
+              { origin: "-", content: "    let cap = 50;", old_no: 2, new_no: null },
+              { origin: "+", content: "    let cap = self.limit.min(100);", old_no: null, new_no: 2 },
+              { origin: " ", content: "    let cursor = 0;", old_no: 3, new_no: 3 },
+              { origin: "+", content: "    debug_assert!(cap > 0);", old_no: null, new_no: 4 },
+            ],
+          },
+        ],
+        deleted_body_available: false,
+        truncated: false,
+      },
+      {
+        path: "assets/logo.png",
+        old_path: null,
+        status: "A",
+        kind: "binary",
+        additions: 0,
+        deletions: 0,
+        size_bytes: 20480,
+        hunks: [],
+        deleted_body_available: false,
+        truncated: false,
+      },
+    ],
+    restricted_files: 0,
+    total_files: 2,
+    total_additions: 2,
+    total_deletions: 1,
+    page: { next_cursor: null, limit: 50 },
+  },
+};
+// A pre-seeded anchored thread + a rebase-orphan (outdated) thread on PR #1's diff — anchored threads
+// (anchor != null) never appear in the overview's discussion, so this is safe across surfaces.
+const SEED_ANCHORED = {
+  1: [
+    {
+      id: "seed-t1",
+      anchor: { path: "src/list_filter.rs", line: 2, anchor_state: "live" },
+      resolved: false,
+      comments: [{ id: "seed-c1", author: { kind: "human", display: "u_dev_operator@acme.noreply", on_behalf_of: null, trigger: null }, body_md: "Clamp looks right — nice.", created_at: 1719450500, edited_at: null, state: "visible", review_id: null, pending: false }],
+    },
+    {
+      id: "seed-t2",
+      anchor: { path: "src/list_filter.rs", line: 87, anchor_state: "outdated" },
+      resolved: false,
+      comments: [{ id: "seed-c2", author: { kind: "human", display: "u_dev_operator@acme.noreply", on_behalf_of: null, trigger: null }, body_md: "This was flagged before the rebase.", created_at: 1719450400, edited_at: null, state: "visible", review_id: null, pending: false }],
+    },
+  ],
+};
+
+/** GET /v1/git/repos/{repo}/prs/{n}/diff → the PrDiffVM (null = 404). */
+export function prDiffJson(repo, n) {
+  if (repo !== "myelin" || !SEED_PRS[n]) return null;
+  return SEED_PR_DIFFS[n] ?? {
+    number: n,
+    base_ref: SEED_PRS[n].pr.base_ref,
+    base_oid: C1,
+    short_base_oid: C1.slice(0, 7),
+    head_oid: SEED_PRS[n].pr.head_oid,
+    short_head_oid: SEED_PRS[n].pr.head_oid.slice(0, 7),
+    three_dot: true,
+    files: [],
+    restricted_files: 0,
+    total_files: 0,
+    total_additions: 0,
+    total_deletions: 0,
+    page: { next_cursor: null, limit: 50 },
+  };
+}
+
+/** GET /v1/git/repos/{repo}/file-lines/{oid} → expand-context lines (context, origin " "). */
+export function fileLinesJson(repo, oid, start, end) {
+  if (repo !== "myelin") return null;
+  const lines = [];
+  for (let i = start; i <= (end || start + 10); i++) {
+    lines.push({ origin: " ", content: `    // context line ${i}`, old_no: null, new_no: i });
+  }
+  return { lines };
+}
+
 // Two PRs: #1 blocked (a required check not green + an untrusted-fork run), #2 ready.
 const SEED_PRS = {
   1: {
@@ -405,10 +514,12 @@ export function prThreadsJson(repo, n, viewer = "u_dev_operator@acme.noreply") {
     }))
     .filter((t) => t.comments.length > 0);
   const reviews = doc.reviews.filter((r) => r.submitted_at != null || r.reviewer.display === viewer);
+  // The diff surface's pre-seeded anchored threads (live + rebase-orphan) merge in read-only.
+  const withSeed = [...(SEED_ANCHORED[n] ?? []), ...visible];
   return {
-    discussion: visible.filter((t) => t.anchor == null),
-    anchored: visible.filter((t) => t.anchor != null),
-    threads: visible,
+    discussion: withSeed.filter((t) => t.anchor == null),
+    anchored: withSeed.filter((t) => t.anchor != null),
+    threads: withSeed,
     reviews,
     durable: true,
   };
@@ -429,7 +540,9 @@ export function devPost(repo, n, tail, body, viewer = "u_dev_operator@acme.norep
   const id = (p) => `${p}-${++threadSeq}`;
   // POST …/threads
   if (tail === "threads") {
-    const thread = { id: id("t"), anchor: null, resolved: false, comments: [
+    // A line-anchored comment carries `{ anchor: { path, line, side? } }`; a discussion comment has none.
+    const anchor = body.anchor ? { path: body.anchor.path, line: body.anchor.line ?? null, anchor_state: "live" } : null;
+    const thread = { id: id("t"), anchor, resolved: false, comments: [
       { id: id("c"), author: who, body_md: body.body_md, created_at: 1719450000, edited_at: null, state: "visible", review_id: null, pending: false },
     ] };
     doc.threads.push(thread);

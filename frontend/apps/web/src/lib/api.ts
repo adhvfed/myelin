@@ -109,10 +109,58 @@ export interface CommitsPage {
   };
 }
 
-/** One unified-diff line: `+` add / `-` remove / ` ` context (the three-channel diff signal). */
+/** One unified-diff line: `+` add / `-` remove / ` ` context (the three-channel diff signal).
+ *  `old_no`/`new_no` are the additive R3.2 line-number fields (null on `+`/`-` respectively; absent
+ *  on the legacy commit-diff shape — the DiffViewer tolerates their absence). */
 export interface DiffLineVM {
   origin: string;
   content: string;
+  old_no?: number | null;
+  new_no?: number | null;
+}
+
+/** One hunk of a PR diff — the `@@` header + boundaries + lines (collapsed-run + expand-context need
+ *  the boundaries a flat `lines[]` can't carry). */
+export interface DiffHunkVM {
+  header: string;
+  old_start: number;
+  old_lines: number;
+  new_start: number;
+  new_lines: number;
+  lines: DiffLineVM[];
+}
+
+/** One changed file in a PR diff (PrDiffFile::to_json). A RESTRICTED file is NEVER in this list — the
+ *  count-only disclosure lives on `PrDiffVM.restricted_files` (non-leak by construction). */
+export interface PrDiffFileVM {
+  path: string;
+  old_path: string | null;
+  status: string;
+  kind: "text" | "binary" | "lfs" | "submodule";
+  additions: number;
+  deletions: number;
+  size_bytes: number | null;
+  hunks: DiffHunkVM[];
+  deleted_body_available: boolean;
+  truncated: boolean;
+}
+
+/** The PR three-dot diff page (PrDiffVM::to_json) — `merge-base(base, head) … head`. `three_dot`
+ *  false labels the two-dot floor; `restricted_files` is COUNT-ONLY (no paths cross the wire). */
+export interface PrDiffVM {
+  number: number;
+  base_ref: string;
+  base_oid: string;
+  short_base_oid: string;
+  head_oid: string;
+  short_head_oid: string;
+  three_dot: boolean;
+  files: PrDiffFileVM[];
+  restricted_files: number;
+  total_files: number;
+  total_additions: number;
+  total_deletions: number;
+  page: { next_cursor: string | null; limit: number };
 }
 
 /** One changed file in a commit diff (DiffFile::to_json). */
@@ -495,6 +543,48 @@ export const getPrCommits = query(
   "git-pr-commits",
 );
 
+/** The PR three-dot diff (GET /v1/git/repos/{repo}/prs/{n}/diff?cursor=&view=). `Pull`-guarded, 0-leak
+ *  (a denial is the same 404 as an absent PR — surfaced as the no-access state, never a leaked path). */
+export const getPrDiff = query(
+  async (input: { repo: string; n: number; cursor?: string; view?: string }): Promise<PrDiffVM> => {
+    "use server";
+    const p = new URLSearchParams();
+    if (input.cursor) p.set("cursor", input.cursor);
+    if (input.view) p.set("view", input.view);
+    const q = p.toString();
+    return authed(() =>
+      edgeGet<PrDiffVM>(`/v1/git/repos/${seg(input.repo)}/prs/${input.n}/diff${q ? `?${q}` : ""}`),
+    );
+  },
+  "git-pr-diff",
+);
+
+/** Expand-context lines (GET /v1/git/repos/{repo}/file-lines/{oid}?path=&start=&end=). Same object
+ *  check as the blob route (`Pull`). Returns context lines (origin " ") carrying their blob line
+ *  number in `new_no`; the client maps the old-side column from the surrounding hunk offset. */
+export const getFileLines = query(
+  async (input: {
+    repo: string;
+    oid: string;
+    path: string;
+    start: number;
+    end: number;
+  }): Promise<{ lines: DiffLineVM[] }> => {
+    "use server";
+    const p = new URLSearchParams({
+      path: input.path,
+      start: String(input.start),
+      end: String(input.end),
+    });
+    return authed(() =>
+      edgeGet<{ lines: DiffLineVM[] }>(
+        `/v1/git/repos/${seg(input.repo)}/file-lines/${seg(input.oid)}?${p.toString()}`,
+      ),
+    );
+  },
+  "git-file-lines",
+);
+
 // ── PR write paths (R3.3 G-8): threads, comments, review batches, merge. Server-only functions;
 //    the overview route calls them then revalidates the thread/checks queries. A 409 merge surfaces
 //    the fresh re-rendered checks so the UI re-renders the blocked card (N6), never merges on stale. ──
@@ -517,7 +607,7 @@ export type MergeResult = MergeOk | MergeBlocked;
  *  shape. The server-RPC (`action`) is the proven path with request/session context (a bare
  *  `"use server"` function did not bind reliably here). */
 export type PrMutation =
-  | { op: "thread"; repo: string; n: number; body_md: string }
+  | { op: "thread"; repo: string; n: number; body_md: string; anchor?: { path: string; line: number; side?: "old" | "new" } }
   | { op: "comment"; repo: string; n: number; threadId: string; body_md: string }
   | { op: "review-start"; repo: string; n: number }
   | { op: "review-comment"; repo: string; n: number; reviewId: string; body_md: string }
@@ -539,7 +629,10 @@ export const prMutate = action(async (m: PrMutation): Promise<PrMutationResult> 
   return authed(async () => {
     switch (m.op) {
       case "thread": {
-        const r = await edgePost<{ applied: { thread: PrThreadVM } }>(`${base}/threads`, { body_md: m.body_md });
+        const r = await edgePost<{ applied: { thread: PrThreadVM } }>(`${base}/threads`, {
+          body_md: m.body_md,
+          ...(m.anchor ? { anchor: m.anchor } : {}),
+        });
         return { thread: r.applied.thread };
       }
       case "comment": {

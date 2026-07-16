@@ -196,6 +196,94 @@ pub struct CommitDetail {
     pub files: Vec<FileDelta>,
 }
 
+// ───────────────────────────── PR diff raw read shapes (R3.2 · G-7 N1) ───────────────────────────
+
+/// The rendered kind of a changed file — drives the R-21 binary/LFS/submodule rows (never a garbled
+/// text dump). `Text` is the default (hunks render); the others carry NO hunks (a pointer/size row).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileKind {
+    Text,
+    Binary,
+    Lfs,
+    Submodule,
+}
+
+impl FileKind {
+    /// The stable wire token (the DiffViewer maps it to the row treatment).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileKind::Text => "text",
+            FileKind::Binary => "binary",
+            FileKind::Lfs => "lfs",
+            FileKind::Submodule => "submodule",
+        }
+    }
+}
+
+/// One diff line with BOTH line numbers (anchors, SR prefixes, deep-links need them). `old_no` is
+/// `None` on an added line, `new_no` is `None` on a removed line (a context line carries both).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffLineDelta {
+    /// `+` add / `-` remove / ` ` context.
+    pub origin: char,
+    /// The line content (newline-trimmed).
+    pub content: String,
+    /// The OLD-side line number (`None` on `+`).
+    pub old_no: Option<u32>,
+    /// The NEW-side line number (`None` on `-`).
+    pub new_no: Option<u32>,
+}
+
+/// One hunk of a file delta — its `@@` header + boundaries + lines. Boundaries let the client render
+/// collapsed unchanged runs and expand context (a flat `lines[]` can't).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffHunkDelta {
+    /// The full hunk header (`@@ -104,7 +104,9 @@ impl DurableGitEdge {`).
+    pub header: String,
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
+    pub lines: Vec<DiffLineDelta>,
+}
+
+/// One changed file in a PR diff — hunk-structured, with the kind + counts + size the R-21 rows need.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrFileDelta {
+    pub path: String,
+    pub old_path: Option<String>,
+    /// `A`/`M`/`D`/`R`/`C`.
+    pub status: char,
+    pub kind: FileKind,
+    pub additions: u32,
+    pub deletions: u32,
+    /// The new-side blob byte size (binary/LFS rows show it; `None` for a text/deleted file).
+    pub size_bytes: Option<u64>,
+    pub hunks: Vec<DiffHunkDelta>,
+    /// `true` for a deleted file whose contents are collapsed by default ("Show deleted contents").
+    pub deleted_body_available: bool,
+    /// `true` when the per-file line cap was hit (the client offers "Expand all" → a refetch).
+    pub truncated: bool,
+}
+
+/// A PR's three-dot diff (`merge-base(base, head) … head`) — the reviewer reviews the PR's OWN
+/// changes, not drift in the base. `base_oid` is the merge-base ACTUALLY diffed (honest even under
+/// the two-dot fallback — it is then the base tip, and the UI labels it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrDiff {
+    /// The merge-base actually diffed against (or the base tip under the two-dot fallback).
+    pub base_oid: String,
+    /// The head snapshot this diff renders.
+    pub head_oid: String,
+    /// `true` iff `base_oid` is a real merge-base (three-dot); `false` = the two-dot fallback (the UI
+    /// labels "compared against <ref> @ <oid>").
+    pub three_dot: bool,
+    pub files: Vec<PrFileDelta>,
+    pub total_files: usize,
+    pub total_additions: u32,
+    pub total_deletions: u32,
+}
+
 /// One entry in a nested tree listing (R3.4 repo-browsing). `size` is the blob byte size for files
 /// (`None` for directories) — the tree row's size affordance.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1100,6 +1188,254 @@ impl DurableGitRepo {
         }))
     }
 
+    /// **The PR three-dot diff (R3.2 · G-7 N1) — `merge-base(base_ref, head_oid) … head_oid`.** The
+    /// reviewer reviews the PR's OWN changes, never drift the base picked up. Reuses libgit2's
+    /// `merge_base` + `diff_tree_to_tree` over the REAL on-disk trees (no reimplementation). Hunk-
+    /// structured, with per-line old/new numbers, binary/submodule kinds, and a per-file line cap
+    /// (`truncated`). A malformed/absent head → `None` (the edge maps that to a dignified state, not a
+    /// 500). If `merge_base` can't resolve (a foreign/absent base), falls back to the base TIP as the
+    /// diff base and flags `three_dot == false` (the honest two-dot floor the UI labels).
+    ///
+    /// `per_file_line_cap` bounds each file's rendered line count (0 = uncapped); a file over the cap
+    /// keeps its first-cap lines + `truncated == true`.
+    pub fn pr_diff(
+        &self,
+        base_ref: &str,
+        head_oid: &str,
+        per_file_line_cap: usize,
+    ) -> Result<Option<PrDiff>, DurableError> {
+        let repo = self.open_git()?;
+        let head = match git2::Oid::from_str(head_oid) {
+            Ok(o) => o,
+            Err(_) => return Ok(None),
+        };
+        let head_commit = match repo.find_commit(head) {
+            Ok(c) => c,
+            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+            Err(e) => return Err(git_err("find head commit", e)),
+        };
+        // Resolve the base tip (try the ref as-is, then refs/heads/<ref> — R3.3's stored form varies).
+        let base_tip = match self.tip_commit(&repo, base_ref)? {
+            Some(t) => Some(t),
+            None if base_ref.starts_with("refs/") => None,
+            None => self.tip_commit(&repo, &format!("refs/heads/{base_ref}"))?,
+        };
+        // Three-dot: the merge-base of base and head. On any failure (no base, foreign histories),
+        // fall back to the base tip (two-dot) and flag it — honest, never a silent wrong base.
+        // `None` base_oid = no base ref at all → diff head against the empty tree (a brand-new branch).
+        let (base_oid, three_dot): (Option<git2::Oid>, bool) = match base_tip {
+            Some(bt) => match repo.merge_base(bt, head) {
+                Ok(mb) => (Some(mb), true),
+                Err(_) => (Some(bt), false),
+            },
+            None => (None, false),
+        };
+
+        let head_tree = head_commit.tree().map_err(|e| git_err("head tree", e))?;
+        let base_tree = match base_oid {
+            Some(o) => {
+                let base_commit = repo.find_commit(o).map_err(|e| git_err("find base commit", e))?;
+                Some(base_commit.tree().map_err(|e| git_err("base tree", e))?)
+            }
+            None => None,
+        };
+
+        let mut opts = git2::DiffOptions::new();
+        opts.include_typechange(true);
+        let diff = repo
+            .diff_tree_to_tree(base_tree.as_ref(), Some(&head_tree), Some(&mut opts))
+            .map_err(|e| git_err("pr diff_tree_to_tree", e))?;
+
+        let files: std::cell::RefCell<Vec<PrFileDelta>> = std::cell::RefCell::new(Vec::new());
+        let mut file_cb = |delta: git2::DiffDelta<'_>, _p: f32| {
+            let path = delta
+                .new_file()
+                .path()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let old_path = delta
+                .old_file()
+                .path()
+                .map(|p| p.to_string_lossy().to_string())
+                .filter(|o| o != &path);
+            let status = match delta.status() {
+                git2::Delta::Added => 'A',
+                git2::Delta::Deleted => 'D',
+                git2::Delta::Renamed => 'R',
+                git2::Delta::Copied => 'C',
+                _ => 'M',
+            };
+            // Kind: a submodule is a gitlink (filemode Commit); a binary is libgit2's binary flag; LFS
+            // is a text pointer file we sniff below once its content is seen. size = the new blob size.
+            let kind = if matches!(delta.new_file().mode(), git2::FileMode::Commit)
+                || matches!(delta.old_file().mode(), git2::FileMode::Commit)
+            {
+                FileKind::Submodule
+            } else if delta.flags().contains(git2::DiffFlags::BINARY) {
+                FileKind::Binary
+            } else {
+                FileKind::Text
+            };
+            let size_bytes = delta.new_file().size();
+            let size_bytes = if size_bytes > 0 { Some(size_bytes) } else { None };
+            files.borrow_mut().push(PrFileDelta {
+                path,
+                old_path,
+                status,
+                kind,
+                additions: 0,
+                deletions: 0,
+                size_bytes,
+                hunks: Vec::new(),
+                deleted_body_available: status == 'D',
+                truncated: false,
+            });
+            true
+        };
+        let mut binary_cb = |_d: git2::DiffDelta<'_>, _b: git2::DiffBinary<'_>| {
+            if let Some(f) = files.borrow_mut().last_mut() {
+                if f.kind == FileKind::Text {
+                    f.kind = FileKind::Binary;
+                }
+            }
+            true
+        };
+        let mut hunk_cb = |_d: git2::DiffDelta<'_>, hunk: git2::DiffHunk<'_>| {
+            if let Some(f) = files.borrow_mut().last_mut() {
+                f.hunks.push(DiffHunkDelta {
+                    header: String::from_utf8_lossy(hunk.header())
+                        .trim_end_matches('\n')
+                        .to_string(),
+                    old_start: hunk.old_start(),
+                    old_lines: hunk.old_lines(),
+                    new_start: hunk.new_start(),
+                    new_lines: hunk.new_lines(),
+                    lines: Vec::new(),
+                });
+            }
+            true
+        };
+        let mut line_cb = |_d: git2::DiffDelta<'_>,
+                           _h: Option<git2::DiffHunk<'_>>,
+                           line: git2::DiffLine<'_>| {
+            let origin = line.origin();
+            if !matches!(origin, '+' | '-' | ' ') {
+                return true; // skip file/hunk header context lines libgit2 emits with other origins.
+            }
+            let content = String::from_utf8_lossy(line.content())
+                .trim_end_matches('\n')
+                .to_string();
+            // LFS sniff: a pointer file's first added line is `version https://git-lfs…`.
+            let mut fs = files.borrow_mut();
+            if let Some(f) = fs.last_mut() {
+                if f.kind == FileKind::Text
+                    && origin == '+'
+                    && content.starts_with("version https://git-lfs")
+                {
+                    f.kind = FileKind::Lfs;
+                }
+                match origin {
+                    '+' => f.additions += 1,
+                    '-' => f.deletions += 1,
+                    _ => {}
+                }
+                if let Some(h) = f.hunks.last_mut() {
+                    h.lines.push(DiffLineDelta {
+                        origin,
+                        content,
+                        old_no: line.old_lineno(),
+                        new_no: line.new_lineno(),
+                    });
+                }
+            }
+            true
+        };
+        diff.foreach(
+            &mut file_cb,
+            Some(&mut binary_cb),
+            Some(&mut hunk_cb),
+            Some(&mut line_cb),
+        )
+        .map_err(|e| git_err("pr diff foreach", e))?;
+
+        let mut files = files.into_inner();
+        // Binary/LFS/submodule files carry NO text hunks (never a garbled dump).
+        for f in &mut files {
+            if f.kind != FileKind::Text {
+                f.hunks.clear();
+            }
+            // Per-file line cap: keep whole hunks until the cap, drop the rest, flag truncated.
+            if per_file_line_cap > 0 {
+                let mut seen = 0usize;
+                let mut cut = None;
+                for (i, h) in f.hunks.iter().enumerate() {
+                    if seen >= per_file_line_cap {
+                        cut = Some(i);
+                        break;
+                    }
+                    seen += h.lines.len();
+                }
+                if let Some(i) = cut {
+                    f.hunks.truncate(i);
+                    f.truncated = true;
+                }
+            }
+        }
+        let total_files = files.len();
+        let total_additions = files.iter().map(|f| f.additions).sum();
+        let total_deletions = files.iter().map(|f| f.deletions).sum();
+        Ok(Some(PrDiff {
+            base_oid: base_oid.map(|o| o.to_string()).unwrap_or_default(),
+            head_oid: head_commit.id().to_string(),
+            three_dot,
+            files,
+            total_files,
+            total_additions,
+            total_deletions,
+        }))
+    }
+
+    /// **Expand-context (R3.2 · G-7 N2) — the raw lines of a blob at `oid`, `start..=end` (1-based).**
+    /// Serves Expand ↑/↓/all and "Show deleted contents" (via the old-side blob oid). Returns context
+    /// lines (origin `' '`) carrying their blob line number in `new_no` (the client maps the old-side
+    /// column from the surrounding hunk offset). A malformed/absent oid or a non-blob → `None`. The
+    /// object-check is the caller's (the edge Pull-guards it exactly like the blob route).
+    pub fn file_lines(
+        &self,
+        oid: &str,
+        start: usize,
+        end: usize,
+    ) -> Result<Option<Vec<DiffLineDelta>>, DurableError> {
+        let repo = self.open_git()?;
+        let goid = match git2::Oid::from_str(oid) {
+            Ok(o) => o,
+            Err(_) => return Ok(None),
+        };
+        let blob = match repo.find_blob(goid) {
+            Ok(b) => b,
+            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+            Err(e) => return Err(git_err("find blob", e)),
+        };
+        if blob.is_binary() {
+            return Ok(Some(Vec::new())); // never expand a binary into a garbled dump.
+        }
+        let text = String::from_utf8_lossy(blob.content());
+        let (start, end) = (start.max(1), end);
+        let out = text
+            .split('\n')
+            .enumerate()
+            .map(|(i, l)| (i + 1, l))
+            .filter(|(n, _)| *n >= start && (end == 0 || *n <= end))
+            .map(|(n, l)| DiffLineDelta {
+                origin: ' ',
+                content: l.trim_end_matches('\r').to_string(),
+                old_no: None,
+                new_no: Some(n as u32),
+            })
+            .collect();
+        Ok(Some(out))
+    }
+
     /// **Build a single-file web-edit commit (GT-003).** Write `contents` as a blob, rebuild the ref's
     /// top-level tree with `path` set to that blob (seeded from the current tree so OTHER entries are
     /// preserved; empty for a first commit), and write a commit whose parent is the ref's current tip.
@@ -1629,6 +1965,110 @@ mod tests {
         // A malformed/absent oid → None (a clean 404 upstream; never a panic).
         assert!(repo.commit_detail("not-a-real-oid").unwrap().is_none());
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **R3.2 · G-7 N1 — the PR diff is THREE-DOT: `merge-base(base, head) … head`.** It shows the
+    /// PR's OWN changes and excludes drift the base picked up after the branch point. Line numbers
+    /// (old_no/new_no), hunk boundaries, and status are all correct.
+    #[test]
+    fn pr_diff_is_three_dot_and_carries_line_numbers() {
+        let root = temp_root("prdiff");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+
+        // base @ main: file.txt = a,b,c
+        let b0 = repo.write_blob(b"a\nb\nc\n").unwrap();
+        let t0 = repo.write_tree(&[("file.txt", &b0)]).unwrap();
+        let base = repo
+            .write_commit(&t0, &[], "base", "psn@acme.noreply", "psn@acme.noreply")
+            .unwrap();
+        repo.update_ref_cas("refs/heads/main", None, Some(&base), "create", "psn@acme.noreply")
+            .unwrap();
+
+        // head branch off base: modify line 2 + add line 4
+        let bh = repo.write_blob(b"a\nB\nc\nd\n").unwrap();
+        let th = repo.write_tree(&[("file.txt", &bh)]).unwrap();
+        let head = repo
+            .write_commit(&th, &[&base], "head", "psn@acme.noreply", "psn@acme.noreply")
+            .unwrap();
+
+        // DRIFT: main advances past the branch point with an unrelated file the PR never touched.
+        let bd = repo.write_blob(b"unrelated\n").unwrap();
+        let td = repo.write_tree(&[("file.txt", &b0), ("other.txt", &bd)]).unwrap();
+        let drift = repo
+            .write_commit(&td, &[&base], "drift on main", "psn@acme.noreply", "psn@acme.noreply")
+            .unwrap();
+        repo.update_ref_cas("refs/heads/main", Some(&base), Some(&drift), "ff", "psn@acme.noreply")
+            .unwrap();
+
+        let diff = repo.pr_diff("refs/heads/main", &head.0, 4000).unwrap().unwrap();
+        assert!(diff.three_dot, "durable repos are libgit2-backed → real merge-base");
+        assert_eq!(diff.base_oid, base.0, "base = merge-base(main, head), NOT main's tip");
+        // ONLY file.txt — other.txt is main's drift, NOT the PR's change (three-dot excludes it).
+        assert_eq!(diff.total_files, 1, "three-dot shows only the PR's own files");
+        assert_eq!(diff.files[0].path, "file.txt");
+        assert_eq!(diff.files[0].status, 'M');
+        assert_eq!(diff.files[0].kind, FileKind::Text);
+        assert_eq!(diff.files[0].additions, 2, "line 2 changed (+B) + line 4 added (+d)");
+        assert_eq!(diff.files[0].deletions, 1, "line 2's old (-b)");
+        // Line numbers: the added "d" carries new_no == 4 and old_no == None.
+        let hunk = &diff.files[0].hunks[0];
+        let added_d = hunk.lines.iter().find(|l| l.origin == '+' && l.content == "d").unwrap();
+        assert_eq!(added_d.new_no, Some(4));
+        assert_eq!(added_d.old_no, None);
+        let removed_b = hunk.lines.iter().find(|l| l.origin == '-' && l.content == "b").unwrap();
+        assert_eq!(removed_b.old_no, Some(2));
+        assert_eq!(removed_b.new_no, None);
+        // Context line "a" carries BOTH numbers.
+        let ctx_a = hunk.lines.iter().find(|l| l.origin == ' ' && l.content == "a").unwrap();
+        assert_eq!(ctx_a.old_no, Some(1));
+        assert_eq!(ctx_a.new_no, Some(1));
+
+        // A malformed/absent head → None (the edge renders the empty state, not a 500).
+        assert!(repo.pr_diff("refs/heads/main", "not-an-oid", 4000).unwrap().is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **R3.2 · G-7 — a binary file diffs as `kind=binary` with NO text hunks (never a garbled dump).**
+    #[test]
+    fn pr_diff_flags_binary_with_no_hunk_dump() {
+        let root = temp_root("prbin");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let base = seed_commit(&repo, b"a\n");
+        repo.update_ref_cas("refs/heads/main", None, Some(&base), "c", "psn@acme.noreply").unwrap();
+        // A NUL-containing blob is binary to libgit2.
+        let bin = repo.write_blob(&[0u8, 1, 2, 0, 255, 3]).unwrap();
+        let tb = repo.write_tree(&[("logo.png", &bin)]).unwrap();
+        let head = repo
+            .write_commit(&tb, &[&base], "add binary", "psn@acme.noreply", "psn@acme.noreply")
+            .unwrap();
+        let diff = repo.pr_diff("refs/heads/main", &head.0, 4000).unwrap().unwrap();
+        let f = diff.files.iter().find(|f| f.path == "logo.png").unwrap();
+        assert_eq!(f.kind, FileKind::Binary);
+        assert!(f.hunks.is_empty(), "a binary file carries NO text hunks");
+        assert!(f.size_bytes.is_some(), "the size is available for the binary row");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **R3.2 · G-7 N2 — expand-context reads a blob's lines; a binary blob never dumps garbled text.**
+    #[test]
+    fn file_lines_expands_context_and_is_binary_safe() {
+        let root = temp_root("filelines");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let blob = repo.write_blob(b"one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let lines = repo.file_lines(&blob.0, 2, 4).unwrap().unwrap();
+        assert_eq!(lines.len(), 3, "lines 2..=4");
+        assert_eq!(lines[0].content, "two");
+        assert_eq!(lines[0].new_no, Some(2));
+        assert_eq!(lines[2].content, "four");
+        // A malformed oid → None (a stale expand never 500s).
+        assert!(repo.file_lines("not-an-oid", 1, 10).unwrap().is_none());
+        // A binary blob → an empty expansion (never a garbled dump).
+        let bin = repo.write_blob(&[0u8, 1, 2, 0]).unwrap();
+        assert!(repo.file_lines(&bin.0, 1, 10).unwrap().unwrap().is_empty());
         std::fs::remove_dir_all(&root).ok();
     }
 
