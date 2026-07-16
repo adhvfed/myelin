@@ -1497,10 +1497,12 @@ impl DurableGitBackend {
             .get("summary_md")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let actor = Self::thread_principal(tenant, principal);
         let submitted = self.threads.submit_review(
             &loc,
             &key,
             review_id,
+            &actor,
             verdict,
             summary_md,
             now_unix(),
@@ -1544,11 +1546,13 @@ impl DurableGitBackend {
         slug: &str,
         number: u64,
         review_id: &str,
+        principal: &Principal,
     ) -> Result<Value, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         self.require_pr(&loc, number)?;
         let key = Self::pr_object_key(slug, number);
-        self.threads.discard_review(&loc, &key, review_id)?;
+        let actor = Self::thread_principal(tenant, principal);
+        self.threads.discard_review(&loc, &key, review_id, &actor)?;
         Ok(json!({ "discarded": review_id }))
     }
 
@@ -2918,6 +2922,7 @@ impl Handler for DPrReviewDiscard {
                 param(ctx, "repo")?,
                 num_param(ctx, "n")?,
                 param(ctx, "rid")?,
+                ctx.principal,
             )
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(
