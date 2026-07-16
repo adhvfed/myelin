@@ -561,7 +561,7 @@ impl EventHandler for ReflexConsumer {
     ///
     /// A `NoOp` effect (an irrelevant event — a branch with no issue key, a non-create-issue chat
     /// message) is acked, NOT dead-lettered: not every foreign event is a reflex trigger.
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         let mut state = self.state.lock().expect("reflex state lock");
         // Idempotent on event_id (contract 2.4) — a redelivery is a no-op (0 duplicate staged).
         if !state.seen_events.insert(ev.event_id.0.clone()) {
@@ -1060,11 +1060,11 @@ mod tests {
                 "trust_tier": "trusted",
             }),
         );
-        assert_eq!(consumer.handle(&e), HandleOutcome::Done);
+        assert_eq!(consumer.handle(&e, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
         let after_first = consumer.staged_count();
         assert_eq!(after_first, 1, "the merge staged one Link (the auto-close)");
         // REPLAY the same event_id: 0 duplicate (the within-handler dedup absorbs it).
-        assert_eq!(consumer.handle(&e), HandleOutcome::Done);
+        assert_eq!(consumer.handle(&e, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
         assert_eq!(
             consumer.staged_count(),
             after_first,
@@ -1087,7 +1087,7 @@ mod tests {
             GIT_BRANCH_CREATED,
             serde_json::json!({ "issue_ref": issue, "artifact_ref": "myelin://acme/git/branch/b" }),
         );
-        consumer.handle(&branch);
+        consumer.handle(&branch, &mut myelin_events::HandlerTx::none());
         // (a real consumer would advance the projection; the drill seeds it to In Progress)
         consumer.set_state(issue, AUTO_STATE_IN_PROGRESS);
         let merge = ev_with_id(
@@ -1100,15 +1100,15 @@ mod tests {
                 "trust_tier": "trusted",
             }),
         );
-        consumer.handle(&merge);
+        consumer.handle(&merge, &mut myelin_events::HandlerTx::none());
         let after = consumer.staged_count();
         assert_eq!(
             after, 2,
             "the branch link + the merge close are two staged effects"
         );
         // REPLAY both: 0 duplicate.
-        consumer.handle(&branch);
-        consumer.handle(&merge);
+        consumer.handle(&branch, &mut myelin_events::HandlerTx::none());
+        consumer.handle(&merge, &mut myelin_events::HandlerTx::none());
         assert_eq!(
             consumer.staged_count(),
             after,
@@ -1150,7 +1150,7 @@ mod tests {
                 "trust_tier": "trusted",
             }),
         );
-        consumer.handle(&merge);
+        consumer.handle(&merge, &mut myelin_events::HandlerTx::none());
         let staged = consumer.staged();
         // the link landed
         assert!(staged.iter().any(|e| matches!(

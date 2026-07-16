@@ -329,7 +329,7 @@ async fn a_push_arms_a_durable_ci_run_and_queued_checks_idempotently() {
     // ── Deliver the envelope through the FULL handler (envelope in → durable rows out). ──
     let h1 = Arc::clone(&handler);
     let ev1 = ev.clone();
-    let outcome = tokio::task::spawn_blocking(move || h1.handle(&ev1))
+    let outcome = tokio::task::spawn_blocking(move || h1.handle(&ev1, &mut myelin_events::HandlerTx::none()))
         .await
         .unwrap();
     assert_eq!(outcome, HandleOutcome::Done, "the consumer handled the push");
@@ -368,7 +368,7 @@ async fn a_push_arms_a_durable_ci_run_and_queued_checks_idempotently() {
     // ── (3) IDEMPOTENCY: re-deliver the SAME envelope (same event_id → same deterministic run_id). ──
     let h2 = Arc::clone(&handler);
     let ev2 = ev.clone();
-    let outcome2 = tokio::task::spawn_blocking(move || h2.handle(&ev2))
+    let outcome2 = tokio::task::spawn_blocking(move || h2.handle(&ev2, &mut myelin_events::HandlerTx::none()))
         .await
         .unwrap();
     assert_eq!(outcome2, HandleOutcome::Done, "the redelivery is handled");

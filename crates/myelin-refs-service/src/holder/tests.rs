@@ -73,19 +73,19 @@ fn populated_projection() -> EdgeProjection {
         "p-erase-me",
         "myelin://acme/chat/message/m1",
         "myelin://acme/knowledge/page/7c2",
-    ));
+    ), &mut myelin_events::HandlerTx::none());
     builder.handle(&edge_event(
         "e2",
         "p-erase-me",
         "myelin://acme/chat/message/m2",
         "myelin://acme/issue/issue/ENG-1",
-    ));
+    ), &mut myelin_events::HandlerTx::none());
     builder.handle(&edge_event(
         "e3",
         "p-other",
         "myelin://acme/chat/message/m3",
         "myelin://acme/issue/issue/ENG-2",
-    ));
+    ), &mut myelin_events::HandlerTx::none());
     builder.projection().clone()
 }
 
@@ -282,7 +282,7 @@ fn cache_purge_evicts_every_distinct_ref_the_subject_touches() {
             "p-same",
             "myelin://acme/chat/message/q1",
             "myelin://acme/issue/issue/ENG-A",
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         b.projection().clone()
     };
     let proj_many = {
@@ -292,19 +292,19 @@ fn cache_purge_evicts_every_distinct_ref_the_subject_touches() {
             "p-same",
             "myelin://acme/chat/message/q1",
             "myelin://acme/issue/issue/ENG-A",
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         b.handle(&edge_event(
             "m2",
             "p-same",
             "myelin://acme/chat/message/q2",
             "myelin://acme/issue/issue/ENG-B",
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         b.handle(&edge_event(
             "m3",
             "p-same",
             "myelin://acme/chat/message/q3",
             "myelin://acme/issue/issue/ENG-C",
-        ));
+        ), &mut myelin_events::HandlerTx::none());
         b.projection().clone()
     };
     let r_few = RefsCacheHolder::with_cache(cache.clone(), proj_few)

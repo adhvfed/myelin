@@ -133,7 +133,7 @@ fn dropping_the_issue_relation_mirror_flips_parity_red() {
             &region(),
             edge,
             &ctx_base(),
-        ));
+        ), &mut myelin_events::HandlerTx::none());
     }
     for ev in &corpus.page_parent_snapshot {
         project_typed_event(live.projection(), &tenant(), &region(), ev).unwrap();

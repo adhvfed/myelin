@@ -203,10 +203,10 @@ fn handler_is_idempotent_and_always_done() {
     let invalidator = UnfurlInvalidator::new(cache.clone());
     let ev = envelope("issue.issue.updated", ISSUE_REF);
 
-    assert_eq!(invalidator.handle(&ev), HandleOutcome::Done);
+    assert_eq!(invalidator.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
     assert!(!cache.contains(&issue_ref()));
     // re-handle (redelivery) — still Done, still busted, no error.
-    assert_eq!(invalidator.handle(&ev), HandleOutcome::Done);
+    assert_eq!(invalidator.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
 }
 
 /// **A `#sub`-anchored subject busts the ROOT entry (§4.2 — the cache keys the root projection).** An

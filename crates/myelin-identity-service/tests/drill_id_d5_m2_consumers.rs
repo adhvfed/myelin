@@ -134,7 +134,7 @@ fn wired(scope: &TenantScope, grants: &[TupleDelta]) -> (StoreBackedCheck, Rever
     let bus = InProcessBus::new();
     Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into())).drain_to_empty();
     for env in bus.consume("") {
-        consumer.handle(&env);
+        consumer.handle(&env, &mut myelin_events::HandlerTx::none());
     }
 
     // The slot shares the SAME S8 index the live feed populates (so list_objects/list_subjects read

@@ -441,15 +441,15 @@ mod tests {
     fn seed(auth: &AuditAuthority<CellSigningKey>) {
         // Three actions about subject-A, two about subject-B, one matter "m-7" (about subject-B).
         auth.consumer()
-            .handle(&action_event("1", "acme", "myelin://acme/subj/A", "r-1"));
+            .handle(&action_event("1", "acme", "myelin://acme/subj/A", "r-1"), &mut myelin_events::HandlerTx::none());
         auth.consumer()
-            .handle(&action_event("2", "acme", "myelin://acme/subj/B", "r-2"));
+            .handle(&action_event("2", "acme", "myelin://acme/subj/B", "r-2"), &mut myelin_events::HandlerTx::none());
         auth.consumer()
-            .handle(&action_event("3", "acme", "myelin://acme/subj/A", "r-3"));
+            .handle(&action_event("3", "acme", "myelin://acme/subj/A", "r-3"), &mut myelin_events::HandlerTx::none());
         auth.consumer()
-            .handle(&action_event("4", "acme", "myelin://acme/subj/A", "m-7"));
+            .handle(&action_event("4", "acme", "myelin://acme/subj/A", "m-7"), &mut myelin_events::HandlerTx::none());
         auth.consumer()
-            .handle(&action_event("5", "acme", "myelin://acme/subj/B", "m-7"));
+            .handle(&action_event("5", "acme", "myelin://acme/subj/B", "m-7"), &mut myelin_events::HandlerTx::none());
     }
 
     /// **A subject-scoped export carries every in-scope record, each inclusion-proof-bearing, and

@@ -253,7 +253,7 @@ impl EventHandler for UnfurlInvalidator {
     /// Busts the shared entry on a matching `*.updated`/`*.erased`/`ci.check.updated` event; a no-op
     /// otherwise. Always [`HandleOutcome::Done`] — a bust is total (it cannot poison): an absent entry
     /// is a no-op, never an error, so there is no NonRetryable/Retry path here.
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         self.invalidate(ev);
         HandleOutcome::Done
     }

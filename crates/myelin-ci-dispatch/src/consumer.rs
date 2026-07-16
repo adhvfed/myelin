@@ -74,8 +74,8 @@
 use std::sync::{Arc, Mutex};
 
 use myelin_events::{
-    Actor, EmitContextBase, EventEnvelope, EventHandler, HandleOutcome, IdMinter, OutboxStore,
-    OutboxTx, SubjectPattern,
+    Actor, EmitContextBase, EventEnvelope, EventHandler, EventId, HandleOutcome, IdMinter,
+    OutboxStore, SubjectPattern,
 };
 use myelin_storage::BlobStore;
 use myelin_tenancy::TenantId;
@@ -278,10 +278,21 @@ impl ReserveStore for OutboxReserveStore {
             "ci_run {} reserved (queued) — the durable row co-commit is the myelin-storage backing floor",
             armed.handoff.run_write.run_id
         ));
-        tx.emit(armed.handoff.run_started.clone(), None)
+        // **Peer-review #8: DETERMINISTIC co-emitted event ids.** The `ci.run.started` + each queued
+        // `ci.check.updated` id is derived from the (deterministic) `run_id` + the event's stable
+        // subject, so a REDELIVERED trigger re-emits the SAME ids and the outbox
+        // `ON CONFLICT (event_id) DO NOTHING` dedups them (no duplicate run.started/check.updated).
+        // With #7's co-commit a re-run only happens on a genuine crash-before-commit (nothing was
+        // emitted); this closes the residual duplication if the durable emit ever re-runs.
+        let started_id = EventId(deterministic_uuid(&format!(
+            "evt:{}",
+            armed.handoff.run_started.subject.0
+        )));
+        tx.emit_with_id(started_id, armed.handoff.run_started.clone(), None)
             .map_err(|e| ReserveError(format!("ci.run.started emit: {e:?}")))?;
         for check in &armed.handoff.queued_checks {
-            tx.emit(check.clone(), None)
+            let check_id = EventId(deterministic_uuid(&format!("evt:{}", check.subject.0)));
+            tx.emit_with_id(check_id, check.clone(), None)
                 .map_err(|e| ReserveError(format!("queued ci.check.updated emit: {e:?}")))?;
         }
         tx.commit()
@@ -632,7 +643,7 @@ impl EventHandler for CiTriggerHandler {
         CI_TRIGGER_SUBJECTS
     }
 
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         match plan_dispatch(ev, self.reader.as_ref(), self.blobs.as_ref()) {
             DispatchOutcome::Arm(armed) => match self.reserve.persist(&armed) {
                 Ok(()) => {
@@ -986,8 +997,8 @@ mod tests {
         let store = Arc::new(RecordingReserveStore::new());
         let handler = CiTriggerHandler::new(reader, blobs, store.clone());
 
-        assert_eq!(handler.handle(&ev), HandleOutcome::Done);
-        assert_eq!(handler.handle(&ev), HandleOutcome::Done, "redelivery is handled");
+        assert_eq!(handler.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(handler.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done, "redelivery is handled");
         let persisted = store.persisted();
         // The ReserveStore itself is called twice (the runtime's consumer_dedup is what suppresses the
         // second delivery in production; here we prove BOTH calls mint the SAME run_id — the second

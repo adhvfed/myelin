@@ -860,7 +860,7 @@ mod tests {
             fn subjects(&self) -> &'static [SubjectPattern] {
                 SUBJECTS
             }
-            fn handle(&self, _ev: &EventEnvelope) -> HandleOutcome {
+            fn handle(&self, _ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
                 self.runs.fetch_add(1, Ordering::SeqCst);
                 HandleOutcome::Done
             }
@@ -1159,7 +1159,7 @@ mod tests {
             fn subjects(&self) -> &'static [SubjectPattern] {
                 SUBJECTS
             }
-            fn handle(&self, _ev: &EventEnvelope) -> HandleOutcome {
+            fn handle(&self, _ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
                 self.runs.fetch_add(1, Ordering::SeqCst);
                 HandleOutcome::NonRetryable(Reason("poison".into()))
             }

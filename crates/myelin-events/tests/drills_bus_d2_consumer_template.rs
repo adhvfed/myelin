@@ -93,7 +93,7 @@ impl EventHandler for CountingHandler {
     fn subjects(&self) -> &'static [SubjectPattern] {
         SUBJECTS
     }
-    fn handle(&self, _ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, _ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         self.runs.fetch_add(1, Ordering::SeqCst);
         HandleOutcome::Done
     }
@@ -303,7 +303,7 @@ fn drill_eb05_per_tenant_surge_is_bounded_other_tenant_not_starved() {
         fn subjects(&self) -> &'static [SubjectPattern] {
             SUBJECTS
         }
-        fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+        fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
             if ev.tenant.0 == "surge" {
                 HandleOutcome::Retry(Backoff { seconds: 5 })
             } else {
@@ -580,7 +580,7 @@ fn bus_d2_and_fairness_register_into_the_permanent_drill_suite() {
             fn subjects(&self) -> &'static [SubjectPattern] {
                 SUBJECTS
             }
-            fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+            fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
                 if ev.tenant.0 == "surge" {
                     HandleOutcome::Retry(Backoff { seconds: 5 })
                 } else {

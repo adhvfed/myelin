@@ -418,7 +418,7 @@ impl myelin_events::EventHandler for KnowledgeLivingDocHandler {
     /// [`emit_change`] in the same transaction) is KN-P19/P20/P21. A non-trigger event is still
     /// `Done` (acked) — it simply has no living-doc effect (the whitelist is the subject filter; the
     /// type filter here is belt-and-braces so an over-broad subject can never drive a wrong reaction).
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         if KnowledgeLivingDocHandler::reacts_to(&ev.type_.0) {
             self.observed
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

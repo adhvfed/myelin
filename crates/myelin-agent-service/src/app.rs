@@ -133,7 +133,7 @@ impl EventHandler for SkeletonDispatchConsumer {
     /// notifies; it does NOT auto-spawn a costed run here (that is the explicit-run path through the
     /// reserve/settle gate). Idempotent on `event_id` (the runtime's dedup ledger). Returns `Done` —
     /// the notification is delivered; the COSTED run is the SKELETON loop's, fronted by reserve.
-    fn handle(&self, _ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, _ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         // Explicit-first: deliver/notify into the inbox. No auto-spawn (no costed run started here).
         // The SKELETON's `handle_run` is driven by an EXPLICIT run event (behind the cost gate).
         HandleOutcome::Done
@@ -446,7 +446,7 @@ mod tests {
             payload: serde_json::json!({}),
         };
         assert_eq!(
-            consumer.handle(&ev),
+            consumer.handle(&ev, &mut myelin_events::HandlerTx::none()),
             HandleOutcome::Done,
             "explicit-first: a delivered match NOTIFIES (Done); it does not auto-spawn a costed run"
         );

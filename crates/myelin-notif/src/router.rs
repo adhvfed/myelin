@@ -829,7 +829,7 @@ impl EventHandler for SignalRouter {
     /// **non-retryable poison** ([`HandleOutcome::NonRetryable`]) — terminated immediately (rule 5),
     /// so it does NOT block the subject behind it (NOTIF-D10 head-of-line isolation). The emit rides
     /// the outbox (the co-commit happens inside [`SignalRouter::route`]).
-    fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
         match self.route(ev) {
             Ok(_) => HandleOutcome::Done,
             // A poison Signal terminates immediately (dead-letter, rule 5) — never a silent drop,

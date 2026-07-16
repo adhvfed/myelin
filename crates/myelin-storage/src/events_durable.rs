@@ -43,8 +43,8 @@
 use sqlx::postgres::PgPool;
 
 use myelin_events::{
-    ConsumerName, DurableBusErasure, DurableDedup, ErasedSubject, EventId, PiiKeyRef, Region,
-    TenantId, Timestamp,
+    CoCommitError, CoCommitTx, ConsumerName, DurableBusErasure, DurableDedup, ErasedSubject,
+    EventId, PiiKeyRef, Region, TenantId, Timestamp,
 };
 
 use crate::migration::{Migration, Migrations};
@@ -112,9 +112,11 @@ impl DurableDedup for DurableDedupBacking {
     }
 
     fn revert(&self, consumer: &ConsumerName, event_id: &EventId) {
-        // A `Retry` reverts its speculative mark so a redelivery re-runs the handler. Best-effort
-        // (an error leaves the mark; the same-tx-as-handler atomicity that makes revert truly atomic
-        // with the handler rollback is the MR-023b floor named in `dedup.rs`).
+        // A standalone `revert` (the reindex / manual paths). Best-effort (an error leaves the
+        // mark). NOTE: the consumer runtime no longer calls this on a `Retry` — the #7/MR-023b
+        // co-commit (`begin_co_commit`) rolls back the SAME transaction the mark is in, so the mark
+        // and the handler's effect revert together atomically (this standalone verb is the
+        // non-co-commit mirror of the in-memory ledger's `revert`).
         self.block(async {
             let _ = sqlx::query("DELETE FROM consumer_dedup WHERE consumer = $1 AND event_id = $2")
                 .bind(&consumer.0)
@@ -139,6 +141,117 @@ impl DurableDedup for DurableDedupBacking {
             }
         })
     }
+
+    fn begin_co_commit(
+        &self,
+        consumer: &ConsumerName,
+        event_id: &EventId,
+        tenant: &TenantId,
+        region: &Region,
+    ) -> (Box<dyn CoCommitTx>, bool) {
+        // **The #7/MR-023b same-transaction co-commit.** Acquire a pooled connection, BEGIN, set the
+        // `(tenant, region)` GUC TRANSACTION-scoped (the `with_tenant_tx` RLS convention so the
+        // handler's tenant-scoped writes on THIS connection are RLS-isolated + discarded on
+        // commit/rollback), then `INSERT (consumer, event_id) ON CONFLICT DO NOTHING` WITHIN the tx.
+        // The mark is NOT committed here — the consumer runtime commits/rolls back AFTER the handler
+        // co-commits its effect on the same connection.
+        let acquired: Result<(sqlx::pool::PoolConnection<sqlx::Postgres>, bool), sqlx::Error> = self
+            .block(async {
+                let mut conn = self.pool.acquire().await?;
+                sqlx::query("BEGIN").execute(&mut *conn).await?;
+                sqlx::query(
+                    "SELECT set_config('myelin.tenant_id', $1, true), \
+                            set_config('myelin.region', $2, true)",
+                )
+                .bind(&tenant.0)
+                .bind(&region.0)
+                .execute(&mut *conn)
+                .await?;
+                let res = sqlx::query(
+                    "INSERT INTO consumer_dedup (consumer, event_id) VALUES ($1, $2) \
+                     ON CONFLICT (consumer, event_id) DO NOTHING",
+                )
+                .bind(&consumer.0)
+                .bind(&event_id.0)
+                .execute(&mut *conn)
+                .await?;
+                Ok((conn, res.rows_affected() == 1))
+            });
+        match acquired {
+            Ok((conn, fresh)) => (
+                Box::new(DurableCoCommit {
+                    conn: Some(conn),
+                    rt: self.rt.clone(),
+                }),
+                fresh,
+            ),
+            // Fail-direction (0-lost): a DB error reports FRESH with a NO-OP handle so the handler
+            // RUNS (at-least-once) — never a silent "already handled" (skip → lost event). A durable
+            // handler that needs a tx sees `connection() == None` and fails-closed (Retry).
+            Err(_) => (Box::new(NoopCoCommit), true),
+        }
+    }
+}
+
+/// **The durable same-transaction co-commit handle (#7/MR-023b).** Owns a pooled connection with an
+/// OPEN transaction that already holds the (uncommitted) dedup mark; the consumer runtime hands the
+/// handler this connection (type-erased) to run its state write on, then [`commit`](CoCommitTx::commit)s
+/// (mark + effect land together) or [`rollback`](CoCommitTx::rollback)s (both vanish → a redelivery
+/// re-runs). `BEGIN`/`COMMIT`/`ROLLBACK` are raw SQL on the owned `PoolConnection` (kept `'static` so
+/// it survives the sync handler call and is erasable behind `&mut dyn Any`).
+struct DurableCoCommit {
+    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    rt: tokio::runtime::Handle,
+}
+
+impl DurableCoCommit {
+    fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
+        tokio::task::block_in_place(|| self.rt.block_on(fut))
+    }
+}
+
+impl CoCommitTx for DurableCoCommit {
+    fn connection(&mut self) -> Option<&mut dyn core::any::Any> {
+        // Hand out the transaction-bound `PgConnection` type-erased; the handler downcasts to
+        // `&mut sqlx::PgConnection` and runs its writes on the SAME tx the dedup mark is in.
+        self.conn
+            .as_mut()
+            .map(|c| (&mut **c) as &mut dyn core::any::Any)
+    }
+
+    fn commit(mut self: Box<Self>) -> Result<(), CoCommitError> {
+        let Some(mut conn) = self.conn.take() else {
+            return Ok(());
+        };
+        self.block(async { sqlx::query("COMMIT").execute(&mut *conn).await })
+            .map(|_| ())
+            .map_err(|e| CoCommitError(e.to_string()))
+        // `conn` drops → returns to the pool (RESET ALL scrubs any residue).
+    }
+
+    fn rollback(mut self: Box<Self>) {
+        if let Some(mut conn) = self.conn.take() {
+            // Best-effort ROLLBACK; if it fails, dropping the connection aborts the tx anyway (an
+            // in-flight tx on a dropped connection is rolled back by Postgres).
+            let _ = self.block(async { sqlx::query("ROLLBACK").execute(&mut *conn).await });
+        }
+    }
+}
+
+/// **The fail-direction no-op co-commit handle (#7/MR-023b).** Returned when the DB could not be
+/// reached to open the co-commit tx: carries no connection (a durable handler fails-closed on
+/// `connection() == None`), and commit/rollback are no-ops. Paired with `fresh == true` so the
+/// handler RUNS (effectively-once degrades to at-least-once under a DB outage, never to data loss).
+struct NoopCoCommit;
+
+impl CoCommitTx for NoopCoCommit {
+    fn connection(&mut self) -> Option<&mut dyn core::any::Any> {
+        None
+    }
+    fn commit(self: Box<Self>) -> Result<(), CoCommitError> {
+        Ok(())
+    }
+    fn rollback(self: Box<Self>) {}
 }
 
 // =================================================================================================

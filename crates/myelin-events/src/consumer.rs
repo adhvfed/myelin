@@ -64,18 +64,20 @@
 //! - **Re-confirm SUB-D1 end-to-end through a consumer:** the dedup ledger absorbs the relay's
 //!   redelivery on a re-claim → **0 dup** even when SUB-D1's at-least-once redelivery fires.
 //!
-//! ## DEVIATION / FLOOR — the in-memory ledger models the SQL `consumer_dedup` table
-//! There is **no live OLTP DB in M0** (the OLTP tier client is **P-007 / P-ST-01**; the
-//! migration runner is **P-S15**). So the `consumer_dedup` ledger ([`crate::DedupLedger`],
-//! EB-06) is modeled in-memory with byte-for-byte the 2.5 semantics; its frozen DDL
-//! ([`crate::CONSUMER_DEDUP_MIGRATION`]) is the shape the runner applies. **Floor:** the real
-//! `INSERT … ON CONFLICT DO NOTHING` against the Storage pool, executed in the SAME transaction
-//! as the handler's state write (so the dedup mark and the side effect commit together — the
-//! atomicity that makes idempotency real, not best-effort), lands when the OLTP client is wired
-//! (P-007) + the consumer runtime runs inside `serve` (**P-S12**). The seam shape (the
-//! `EventHandler` trait, the `(consumer, event_id)` key, the lag signal) does NOT change. The
+//! ## The same-transaction co-commit — DELIVERED (peer-review #7 / MR-023b — FIXED)
+//! The `consumer_dedup` ledger ([`crate::DedupLedger`], EB-06) is modeled in-memory with
+//! byte-for-byte the 2.5 semantics (its frozen DDL [`crate::CONSUMER_DEDUP_MIGRATION`] is the shape
+//! the runner applies) AND binds to a durable PG backing in `serve`. **The atomicity floor is
+//! closed:** [`deliver`](Consumer::deliver) no longer marks-then-hopes — it opens ONE transaction
+//! via [`crate::DedupLedger::begin_co_commit`] (the `INSERT … ON CONFLICT DO NOTHING` WITHIN it),
+//! runs the handler on that transaction (the handler co-commits its durable state write via the
+//! [`crate::HandlerTx`] connection), then **commits on `Done` (mark + effect together) / rolls back
+//! on `Retry`/failure (both vanish)**. So a kill-9 between the mark and the commit leaves NEITHER →
+//! a redelivery re-runs and the effect lands (exactly-once-with-effect), never the old committed-
+//! mark-with-lost-effect at-most-once floor. The seam shape (the `EventHandler` trait — now with the
+//! `HandlerTx` param — the `(consumer, event_id)` key, the lag signal) is otherwise unchanged. The
 //! durable broker cursor + the real `dlq.<tenant>.<subsystem>` subject is EB-04's / EB-05's
-//! refinement of this floor (named, not silently skipped).
+//! refinement (named, not silently skipped).
 //!
 //! ## The upcaster runs BEFORE handle (P-S09 — contract 2.8)
 //! The consumer runtime calls the `(type, from_ver) → to_ver` upcaster registry
@@ -88,10 +90,16 @@
 //! registry installed the hook is the identity map (no evolution declared → every event is
 //! already current).
 
-use crate::{DedupLedger, EventEnvelope, EventHandler, HandleOutcome, Reason, SubjectPattern};
+use crate::{
+    DedupLedger, EventEnvelope, EventHandler, HandleOutcome, HandlerTx, Reason, SubjectPattern,
+};
 use myelin_tenancy::TenantId;
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+/// The backoff (seconds) the runtime asks for when the co-commit COMMIT itself fails (a DB hiccup
+/// AFTER a `Done` handler — the mark + effect did not land, so the message redelivers; #7/MR-023b).
+const DEFAULT_COMMIT_RETRY_BACKOFF_SECS: u64 = 2;
 
 /// The stable, durable consumer name (rule 4: bind-by-name). Two `Consumer`s with the SAME name
 /// share the SAME dedup ledger key-space + cursor — a reconnect re-binds this name rather than
@@ -541,11 +549,19 @@ impl<H: EventHandler> Consumer<H> {
             "an upcaster never changes event_id"
         );
 
-        // Rule 1: idempotent on `event_id` via the (consumer, event_id) dedup ledger. A FRESH
-        // pair runs the handler; a DUPLICATE (redelivery) SKIPs it and acks — 0 dup.
-        let fresh = self.dedup.mark_handled(self.name(), &event_id);
+        // Rule 1 + the #7/MR-023b same-transaction co-commit: open ONE transaction and INSERT the
+        // `(consumer, event_id)` dedup mark WITHIN it (the freshness check). A FRESH pair runs the
+        // handler ON THIS TRANSACTION; a DUPLICATE (redelivery) SKIPs it and acks — 0 dup. The mark
+        // is NOT yet committed: it commits only when the handler returns `Done` (mark + effect
+        // together) and rolls back on `Retry`/failure (both vanish, so a redelivery re-runs — never
+        // a committed mark with a lost effect, which was the old at-most-once floor).
+        let (mut cotx, fresh) =
+            self.dedup
+                .begin_co_commit(self.name(), &event_id, &tenant, &msg.envelope.region);
         if !fresh {
-            // Already handled by this consumer: skip + ack (the cursor advances; lag clears).
+            // Already handled by this consumer: skip + ack (the cursor advances; lag clears). Roll
+            // back the (empty) transaction — the pre-existing mark is untouched.
+            cotx.rollback();
             self.clear_pending(&msg.subject);
             return Delivered::Deduplicated;
         }
@@ -557,34 +573,64 @@ impl<H: EventHandler> Consumer<H> {
         // fills its cap and throttles, while other tenants flow.
         self.bump_tenant_inflight(&tenant, &event_id);
 
-        // Run the handler (the consumer's body). A reaction it emits calls
-        // `OutboxTx::emit(draft, cause = Some(&envelope))` (§5.3) — provided by the caller's tx.
-        match self.handler.handle(&envelope) {
+        // Run the handler (the consumer's body) ON THE CO-COMMIT TRANSACTION. A durable handler
+        // runs its state write on `tx.connection::<sqlx::PgConnection>()` so it co-commits with the
+        // dedup mark (#7/MR-023b); an in-memory / outbox-seam handler ignores the tx. A reaction it
+        // emits calls `OutboxTx::emit(draft, cause = Some(&envelope))` (§5.3). The `HandlerTx`
+        // borrows the transaction; it is dropped before the runtime commits/rolls back the tx.
+        let outcome = {
+            let mut htx = match cotx.connection() {
+                Some(conn) => HandlerTx::with_connection(conn),
+                None => HandlerTx::none(),
+            };
+            self.handler.handle(&envelope, &mut htx)
+        };
+        match outcome {
             HandleOutcome::Done => {
-                // Rule 2: ack AFTER the handler succeeded — the cursor advances, lag clears.
-                self.clear_pending(&msg.subject);
-                self.clear_tenant_inflight(&tenant, &event_id);
-                Delivered::Acked
+                // Rule 2: ack AFTER the handler succeeded — but ONLY once the co-commit COMMITS (the
+                // dedup mark + the handler's durable effect land together). A commit failure means
+                // NEITHER landed → treat it as a Retry (do NOT ack; the redelivery re-runs — 0 lost).
+                match cotx.commit() {
+                    Ok(()) => {
+                        self.clear_pending(&msg.subject);
+                        self.clear_tenant_inflight(&tenant, &event_id);
+                        Delivered::Acked
+                    }
+                    Err(_e) => {
+                        // The tx did not commit (DB hiccup) — mark + effect both absent. Redeliver
+                        // (0 lost); keep the in-flight slot (the work is still outstanding).
+                        self.bump_pending(&msg.subject);
+                        Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS)
+                    }
+                }
             }
             HandleOutcome::NonRetryable(reason) => {
-                // Rule 5: poison terminates immediately — dead-letter + ack so it does NOT burn
-                // the redelivery budget and does NOT block the subject behind it.
+                // Rule 5: poison terminates immediately — dead-letter + ack so it does NOT burn the
+                // redelivery budget and does NOT block the subject behind it.
                 //
-                // The dedup mark stays (this event_id is terminal for this consumer): a
-                // redelivery of a dead-lettered message is itself deduplicated, never re-poisons.
+                // Roll back the co-commit tx FIRST so any speculative partial write the poison
+                // handler made is discarded (a malformed event must leave no partial effect). Then
+                // record a STANDALONE tombstone mark so a redelivered dead-letter is itself
+                // deduplicated (never re-poisons) — there is no valid effect to co-commit for a
+                // poison, so the standalone mark is correct here (it does not re-open #7: #7 is about
+                // losing a VALID effect; a poison has none). This PRESERVES the existing rule-5
+                // "redelivered dead-letter is Deduplicated" semantics.
+                cotx.rollback();
+                self.dedup.mark_handled(self.name(), &event_id);
                 self.clear_pending(&msg.subject);
                 self.clear_tenant_inflight(&tenant, &event_id);
                 self.push_dead_letter(envelope, reason.clone());
                 Delivered::DeadLettered(reason)
             }
             HandleOutcome::Retry(backoff) => {
-                // NOT acked (rule 2): the message stays pending → it redelivers, and lag rises.
-                // The per-tenant in-flight slot is KEPT (the work is still outstanding) — this is
-                // what makes a surging tenant whose events keep retrying eventually hit its cap and
-                // throttle. The dedup mark must be REVERTED — a retry is NOT a completed handle, so
-                // a later redelivery must run the handler again (else a transient failure would be
-                // permanently swallowed: silent data loss).
-                self.dedup_revert(&event_id);
+                // NOT acked (rule 2): the message stays pending → it redelivers, and lag rises. The
+                // per-tenant in-flight slot is KEPT (the work is still outstanding) — this is what
+                // makes a surging tenant whose events keep retrying eventually hit its cap and
+                // throttle. Roll back the co-commit tx: the dedup mark AND any handler write vanish
+                // together (a retry is NOT a completed handle, so a later redelivery must run the
+                // handler again — this IS the old speculative-mark-revert, now atomic with the
+                // handler's effect).
+                cotx.rollback();
                 self.bump_pending(&msg.subject);
                 Delivered::Retried(backoff.seconds)
             }
@@ -662,14 +708,6 @@ impl<H: EventHandler> Consumer<H> {
         }
     }
 
-    /// Revert a dedup mark (a `Retry` is not a completed handle — the pair must be removed so a
-    /// redelivery re-runs the handler). Delegates to [`DedupLedger::revert`]; the real
-    /// `consumer_dedup` row is written in the SAME transaction as the handler's state write
-    /// (P-007/P-S12), so a rolled-back handler rolls back its dedup mark for free — this models
-    /// that atomicity.
-    fn dedup_revert(&self, event_id: &crate::EventId) {
-        self.dedup.revert(self.name(), event_id);
-    }
 }
 
 #[cfg(test)]
@@ -735,7 +773,7 @@ mod tests {
         fn subjects(&self) -> &'static [SubjectPattern] {
             self.subjects
         }
-        fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+        fn handle(&self, ev: &EventEnvelope, _tx: &mut HandlerTx<'_>) -> HandleOutcome {
             self.runs.fetch_add(1, Ordering::SeqCst);
             (self.outcome)(ev)
         }
@@ -1052,7 +1090,7 @@ mod tests {
             fn subjects(&self) -> &'static [SubjectPattern] {
                 SUBJECTS
             }
-            fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+            fn handle(&self, ev: &EventEnvelope, _tx: &mut HandlerTx<'_>) -> HandleOutcome {
                 let mut seen = self.seen.lock().unwrap();
                 if seen.insert(ev.event_id.0.clone()) {
                     HandleOutcome::Retry(Backoff { seconds: 2 })
@@ -1160,7 +1198,7 @@ mod tests {
             fn subjects(&self) -> &'static [SubjectPattern] {
                 SUBJECTS
             }
-            fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+            fn handle(&self, ev: &EventEnvelope, _tx: &mut HandlerTx<'_>) -> HandleOutcome {
                 self.seen.store(ev.schema_ver, Ordering::SeqCst);
                 HandleOutcome::Done
             }
@@ -1309,7 +1347,7 @@ mod tests {
             fn subjects(&self) -> &'static [SubjectPattern] {
                 SUBJECTS
             }
-            fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+            fn handle(&self, ev: &EventEnvelope, _tx: &mut HandlerTx<'_>) -> HandleOutcome {
                 if ev.tenant.0 == "surge" {
                     HandleOutcome::Retry(Backoff { seconds: 5 })
                 } else {
@@ -1380,7 +1418,7 @@ mod tests {
             fn subjects(&self) -> &'static [SubjectPattern] {
                 SUBJECTS
             }
-            fn handle(&self, ev: &EventEnvelope) -> HandleOutcome {
+            fn handle(&self, ev: &EventEnvelope, _tx: &mut HandlerTx<'_>) -> HandleOutcome {
                 let mut f = self.failed.lock().unwrap();
                 if f.insert(ev.event_id.0.clone()) {
                     HandleOutcome::Retry(Backoff { seconds: 1 })
