@@ -64,6 +64,11 @@
     <path id="b1" d="M15 5 L19 9 L9 19 L5 19 L5 15Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
         <path id="t1" d="M13 7 L17 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
   </symbol>
+  <symbol id="download" viewBox="0 0 24 24">
+    <path id="sh" d="M12 4 L12 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+        <path id="ar" d="M7 10 L12 15 L17 10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+        <path id="tr" d="M5 19 L19 19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+  </symbol>
   <symbol id="external-link" viewBox="0 0 24 24">
     <path id="b1" d="M12 5 L5 5 L5 19 L19 19 L19 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
         <path id="ar" d="M13 5 L19 5 L19 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
