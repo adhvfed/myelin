@@ -696,7 +696,7 @@ const SEED_PR_ROWS = [
     author: "u_dev_operator@acme.noreply", author_is_agent: false,
     reviews: 2, review_state: "none", you_are_requested: false,
     checks_summary: { verdict: "running", passing: 4, failing: 0, total: 5 },
-    updated_at: 1719446400, repo: "myelin/myelin",
+    updated_at: 1719446400, repo: "myelin",
   },
   {
     number: 46, title: "AuthzScanner: eliminate 2 residual reach-arounds", pr_state: "open",
@@ -704,7 +704,7 @@ const SEED_PR_ROWS = [
     author: "AuthzScanner@acme.noreply", author_is_agent: true,
     reviews: 0, review_state: "requested", you_are_requested: true,
     checks_summary: { verdict: "pass", passing: 5, failing: 0, total: 5 },
-    updated_at: 1719360000, repo: "myelin/myelin",
+    updated_at: 1719360000, repo: "myelin",
   },
   {
     number: 44, title: "R2.5 Grobkörnige Berechtigungsprüfung entfernen", pr_state: "draft",
@@ -712,7 +712,7 @@ const SEED_PR_ROWS = [
     author: "j_voegel@acme.noreply", author_is_agent: false,
     reviews: 0, review_state: "none", you_are_requested: false,
     checks_summary: { verdict: "none", passing: 0, failing: 0, total: 0 },
-    updated_at: 1719273600, repo: "myelin/myelin",
+    updated_at: 1719273600, repo: "myelin",
   },
   {
     number: 39, title: null, pr_state: "merged",
@@ -720,9 +720,22 @@ const SEED_PR_ROWS = [
     author: "u_dev_operator@acme.noreply", author_is_agent: false,
     reviews: 3, review_state: "approved", you_are_requested: false,
     checks_summary: { verdict: "pass", passing: 1, failing: 0, total: 1 },
-    updated_at: 1719100000, repo: "myelin/myelin",
+    updated_at: 1719100000, repo: "myelin",
   },
 ];
+
+// FIXTURES-MIRROR-CONTRACT (peer-review #20): the real edge emits `PrListRowVM.repo` as the BARE repo
+// slug (`e.repo_slug` = a single-segment `scan_repo_slugs` name like `myelin`/`sandbox`), and the repo
+// route param is that bare name. A tenant-qualified `owner/repo` here (the prior `myelin/myelin`) makes
+// every cross-repo row's link 404 against the harness — a divergence invisible in e2e because the
+// fixture is self-consistent. Fail LOUD at load if a fixture row re-introduces a non-bare slug.
+for (const r of SEED_PR_ROWS) {
+  if (typeof r.repo !== "string" || r.repo.includes("/")) {
+    throw new Error(
+      `dev-contract SEED_PR_ROWS: repo must be a BARE slug to mirror the edge (PrListRowVM.repo = e.repo_slug); got ${JSON.stringify(r.repo)} on PR #${r.number}`,
+    );
+  }
+}
 
 function countBy(rows) {
   const open = rows.filter((r) => r.pr_state === "open" || r.pr_state === "draft").length;
