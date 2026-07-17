@@ -115,8 +115,12 @@ async fn main() {
     // via `myelin_ci_dispatch::build_trigger_consumer` and handed to `run_dispatch` as one
     // `ConsumerReg` (replacing the shell's former `Vec::new()`). Three of the four backings are
     // available here today:
-    //   - the durable reserve store: `OutboxReserveStore::new(outbox.clone(), minter)` co-commits
-    //     `ci.run.started` + the queued `ci.check.updated` through the DURABLE outbox above;
+    //   - the durable reserve store (CT-004d.2 chunk 4): `CoCommitReserveStore::new(ci_run_store,
+    //     outbox.clone(), minter, rt)` co-commits the durable `ci_run` ROW on the consumer's co-commit
+    //     `HandlerTx` connection (ATOMIC with the dedup mark) via
+    //     `myelin_ci_controlplane::ci_run_store_factory(provider.db_pool().clone())`, and emits
+    //     `ci.run.started` + the queued `ci.check.updated` through the DURABLE outbox above in ABSORB
+    //     mode (the honest #7 H1 split: the run-of-record ROW co-commits; the events are absorb);
     //   - the git read backend: `DurableGitConfigReader::new(DurableGitStore::with_root(<git root>))`;
     //   - the exactly-once `DedupLedger` for the `Consumer` runtime.
     // The FOURTH — the CAS `BlobStore` the resolver writes the definition snapshot to (contract
@@ -125,11 +129,11 @@ async fn main() {
     // to construct here; that + the cross-service git-read hop are the NAMED wiring floors. (CT-004m
     // discharged the `ci_run`-table floor: `ci_run` is created at THIS main's boot via the shared
     // `ci_durable_migrations()` applied above — no longer a boot-order dependency on ci-controlplane.)
-    // The consumer LOGIC + the durable
-    // reserve/idempotency are proven end-to-end on live PG in
-    // `tests/integration_ci_ct004b_trigger_consumer.rs`. Until the CAS-blob backing is wired into
-    // this default build, the production binary boots the shell (no consumer registered) rather than
-    // half-wire a consumer that cannot content-address its snapshot.
+    // The consumer LOGIC + the durable reserve/idempotency + the `ci_run` ROW ⇄ mark co-commit are
+    // proven end-to-end on live PG in `tests/integration_ci_ct004b_trigger_consumer.rs`. REGISTERING /
+    // driving the consumer (+ starting the `ci.pipeline` body on the executor) is CT-004d.2 chunk 2/3;
+    // until the CAS-blob backing is wired into this default build, the production binary boots the shell
+    // (no consumer registered) rather than half-wire a consumer that cannot content-address its snapshot.
     let consumers = Vec::new();
 
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the

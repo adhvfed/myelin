@@ -126,6 +126,17 @@ pub mod job_queue_store;
 /// [`runner_bind::durable_spec_resolver`]. Registering/starting the `ci.pipeline` body on the executor +
 /// the live settle bookend are CT-004d.2/.3 (NOT this chunk).
 pub mod job_spec_store;
+/// CT-004d.2 chunk 4 — the durable `ci_run` writer ([`ci_run_store::CiRunStore`]): the CI
+/// run-of-record. The `ci-dispatch.trigger` consumer's reserve bundle must persist a durable `ci_run`
+/// row (`state = queued`), but the production reserve store only staged a NOTE — the row was written
+/// durably ONLY in the CT-004b integration test's `CoCommitReserveStore`. This is the production writer
+/// that test proved: it co-commits the run-of-record ROW on the consumer's co-commit `HandlerTx`
+/// connection (the SAME tx as the dedup mark — atomic), while the co-emitted events stay absorb-mode
+/// through the outbox (the honest #7 H1 split). Constructed at the composition root by
+/// [`ci_run_store_factory`]; the `ci_run` table it writes is created by the shared
+/// [`ci_durable_migrations`] both CI mains apply at boot. Registering/starting the `ci.pipeline` body is
+/// CT-004d.2 chunk 2/3 (NOT this chunk).
+pub mod ci_run_store;
 /// CT-004c.1: the REGION-scoped, CROSS-TENANT half of the durable scheduler — the raw `CLAIM_QUERY` /
 /// `REAP_QUERY` executions (a hosted runner claims across ALL tenants in its region; the DRR fairness
 /// spans tenants). Isolated here so it is a NAMED, LOUD `tenant-predicate` exclusion (the
@@ -423,6 +434,15 @@ pub use job_spec_store::{
     MAX_JOB_TIMEOUT_SECS, SELECT_JOB_SPEC_QUERY,
 };
 
+// CT-004d.2 chunk 4: the durable `ci_run` writer (the CI run-of-record). `CiRunStore::co_commit_insert`
+// writes the `ci_run` row on the consumer's co-commit `HandlerTx` connection (atomic with the dedup
+// mark); `insert_ci_run`/`get_ci_run` are the pool-based tenant-scoped write/read (the run-view /
+// check-emitter resolve path). Idempotent on the `(tenant_id, run_id)` PK (`ON CONFLICT DO NOTHING`);
+// the co-emitted events stay absorb-mode through the outbox (the honest #7 H1 split).
+pub use ci_run_store::{
+    CiRunInsert, CiRunRecord, CiRunStore, CiRunStoreError, INSERT_CI_RUN_QUERY, SELECT_CI_RUN_QUERY,
+};
+
 // CT-004c.2: the runner exec binding — the durable-store lease adapter + the bounded runner loop the
 // service `main` spawns (WIRES `RunnerAgent` to `CiJobQueueStore` + a real gVisor backend). CT-004d.1
 // adds the REAL spec resolver (`durable_spec_resolver`) + the lease-TTL floor (`CI_RUNNER_LEASE_TTL_SECS`).
@@ -634,6 +654,19 @@ pub fn ci_job_queue_store(pool: sqlx::PgPool) -> CiJobQueueStore {
 /// does not touch `ci_job_spec` in CT-004d.1 — the dispatch consumer is CT-004d.2).
 pub fn ci_job_spec_store(pool: sqlx::PgPool) -> CiJobSpecStore {
     CiJobSpecStore::with_pg(pool)
+}
+
+/// **Construct the durable CI `ci_run` store at the composition root (CT-004d.2 chunk 4).** The service
+/// `main` builds this from the MR-022 `SubstrateProvider` pool after the migrations have run, so the
+/// `ci-dispatch.trigger` consumer's reserve path has a real, production-callable [`CiRunStore`] to
+/// co-commit the run-of-record ROW into (on the consumer's co-commit `HandlerTx` connection — atomic
+/// with the dedup mark) and the run-view / check-emitter read path has a store to resolve `ci_run` from.
+/// A thin composition seam (over [`CiRunStore::with_pg`]) so the wiring point is named in ONE place. The
+/// `ci_run` table it writes is created by the SHARED [`ci_durable_migrations`] BOTH CI mains apply at
+/// boot (`ci_0001_ci_run` — the writer subset, not the full control-plane set), so the writer table
+/// exists regardless of which CI service booted first.
+pub fn ci_run_store_factory(pool: sqlx::PgPool) -> CiRunStore {
+    CiRunStore::with_pg(pool)
 }
 
 #[cfg(test)]

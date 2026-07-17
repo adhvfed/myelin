@@ -1,8 +1,16 @@
 //! **CT-004b — the LIVE `ci-dispatch.trigger` consumer, DURABILITY PROVEN on live Postgres, now with
-//! the H1 (peer-review #7 re-prosecution) TRUE co-commit + LIVELOCK-CLOSED proofs.**
+//! the H1 (peer-review #7 re-prosecution) TRUE co-commit + LIVELOCK-CLOSED proofs, PLUS the CT-004d.2
+//! chunk 4 PRODUCTION durable `ci_run` writer (`CoCommitReserveStore`) proofs.**
 //!
-//! Three live-PG proofs (all in an isolated per-pid schema, `myelin_admin` = BYPASSRLS so the reserve
-//! exercises the FORCE-RLS `ci_run` shape):
+//! Five live-PG proofs (all in an isolated per-pid schema, `myelin_admin` = BYPASSRLS so the reserve
+//! exercises the FORCE-RLS `ci_run` shape; the app-role RLS block is proven separately in
+//! `myelin-ci-controlplane`'s `integration_ci_ct004d2_ci_run_store`):
+//!
+//! Proofs (1)–(3) use the test-local `IdealCoCommitReserveStore` (the ASPIRATIONAL all-in-one-tx shape:
+//! `ci_run` ROW + BOTH events + mark in ONE tx) + the production `OutboxReserveStore` (events-only
+//! absorb). Proofs (4)–(5) use the PRODUCTION `CoCommitReserveStore` (CT-004d.2 chunk 4): the `ci_run`
+//! ROW co-commits with the mark via `CiRunStore::co_commit_insert`, the co-emitted EVENTS stay absorb
+//! through the REAL durable outbox (the honest #7 split shipped to production).
 //!
 //!  1. **`h1_true_cocommit_ci_run_events_and_mark_in_one_tx_idempotent`** — the honest #7 shape: a real
 //!     `git.ref.updated` push, delivered through the FULL `Consumer` runtime with a DURABLE
@@ -32,10 +40,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use myelin_ci_controlplane::ci_durable_migrations;
+use myelin_ci_controlplane::{ci_durable_migrations, ci_run_store_factory};
 use myelin_ci_dispatch::{
-    plan_dispatch, ArmedRun, CiTriggerHandler, DispatchOutcome, GitConfigReader, GitReadError,
-    OutboxReserveStore, ReserveError, ReserveStore,
+    plan_dispatch, ArmedRun, CiTriggerHandler, CoCommitReserveStore, DispatchOutcome,
+    GitConfigReader, GitReadError, OutboxReserveStore, ReserveError, ReserveStore,
 };
 use myelin_events::consumer::{Consumer, Delivered, Message, Subscription};
 use myelin_events::{
@@ -163,11 +171,11 @@ impl GitConfigReader for FixtureGitReader {
 /// CONNECTION** (`tx.connection::<sqlx::PgConnection>()`) — the SAME `sqlx` transaction the dedup mark
 /// is in. So the whole bundle + the mark commit or roll back as ONE unit. This is what the production
 /// `myelin-storage` `ci_run`-writer floor will do; the leaf `OutboxReserveStore` cannot name `sqlx`.
-struct CoCommitReserveStore {
+struct IdealCoCommitReserveStore {
     rt: tokio::runtime::Handle,
 }
 
-impl CoCommitReserveStore {
+impl IdealCoCommitReserveStore {
     async fn write(conn: &mut sqlx::PgConnection, armed: &ArmedRun) -> Result<(), ReserveError> {
         let rw = &armed.handoff.run_write;
         sqlx::query(
@@ -223,7 +231,7 @@ impl CoCommitReserveStore {
     }
 }
 
-impl ReserveStore for CoCommitReserveStore {
+impl ReserveStore for IdealCoCommitReserveStore {
     fn persist(&self, armed: &ArmedRun, tx: &mut HandlerTx<'_>) -> Result<(), ReserveError> {
         // THE TRUE CO-COMMIT: downcast the runtime co-commit connection and write the bundle on the
         // SAME tx as the dedup mark. A durable handler with NO tx fails-closed (never writes outside).
@@ -322,7 +330,7 @@ async fn h1_true_cocommit_ci_run_events_and_mark_in_one_tx_idempotent() {
         oid: oid.into(),
     });
     let blobs: Arc<dyn BlobStore + Send + Sync> = Arc::new(FsBlobStore::new());
-    let store = Arc::new(CoCommitReserveStore { rt: rt.clone() });
+    let store = Arc::new(IdealCoCommitReserveStore { rt: rt.clone() });
     let handler = CiTriggerHandler::new(reader, blobs, store);
     let cname = handler.consumer_name().to_string();
 
@@ -381,7 +389,7 @@ async fn h1_crash_window_rolls_back_everything_then_reruns() {
 
     let backing = DurableDedupBacking::new(p.clone(), rt.clone());
     let ledger = DedupLedger::durable(Arc::new(backing) as Arc<dyn DurableDedup>);
-    let store = CoCommitReserveStore { rt: rt.clone() };
+    let store = IdealCoCommitReserveStore { rt: rt.clone() };
     let cname = ConsumerName("ci-dispatch.trigger".into());
     let tenant = TenantId("acme".into());
     let region = Region("fr-par".into());
@@ -478,4 +486,160 @@ async fn h1_production_outbox_absorb_closes_the_livelock() {
 
     p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str()).await.ok();
     println!("[H1/3] PASS livelock closed: the production OutboxReserveStore ABSORBS the deterministic re-emit (2× persist → Ok, 3 rows exactly once), no Err-retry livelock.");
+}
+
+// =================================================================================================
+// (4) CT-004d.2 chunk 4 — the PRODUCTION `CoCommitReserveStore` (the durable `ci_run` writer): the
+//     run-of-record ROW co-commits with the dedup mark on the co-commit `HandlerTx` connection
+//     (`CiRunStore::co_commit_insert`), while the co-emitted EVENTS go through the REAL durable outbox
+//     in ABSORB mode (the honest #7 H1 split). Delivered through the FULL Consumer runtime; redelivery
+//     is deduped → 1 ci_run, 3 outbox events, 0 duplicates.
+// =================================================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chunk4_production_cocommit_row_with_mark_events_absorb() {
+    let schema = schema_name(uniq());
+    let repo = "web";
+    let oid = "aa11bb22cc33000000000000000000000000dd44";
+    // The REAL outbox table (OUTBOX_MIGRATION) lives in the schema alongside the ci tables + dedup.
+    let p = setup_schema(&schema, OUTBOX_MIGRATION).await;
+    let rt = tokio::runtime::Handle::current();
+
+    let reader: Arc<dyn GitConfigReader> = Arc::new(FixtureGitReader {
+        repo: repo.into(),
+        oid: oid.into(),
+    });
+    let blobs: Arc<dyn BlobStore + Send + Sync> = Arc::new(FsBlobStore::new());
+    // The PRODUCTION reserve store: the durable ci_run writer (over the schema pool) + the real durable
+    // outbox (events absorb) + the ULID minter + the serve runtime handle.
+    let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(p.clone(), rt.clone())));
+    let store = Arc::new(CoCommitReserveStore::new(
+        ci_run_store_factory(p.clone()),
+        outbox,
+        Arc::new(UlidMinter::new()),
+        rt.clone(),
+    ));
+    let handler = CiTriggerHandler::new(reader, blobs, store);
+    let cname = handler.consumer_name().to_string();
+
+    let ledger = {
+        let backing = DurableDedupBacking::new(p.clone(), rt.clone());
+        DedupLedger::durable(Arc::new(backing) as Arc<dyn DurableDedup>)
+    };
+    let sub = Subscription::bind(
+        ConsumerName(cname.clone()),
+        &["myelin://acme/git/"],
+        PrefetchBound::DEFAULT,
+    )
+    .unwrap();
+    let consumer = Consumer::new(handler, sub, ledger);
+
+    let ev = push_envelope("ev-chunk4-1", repo, oid);
+    let run_id = armed_for(&ev, repo, oid).handoff.run_write.run_id;
+    let msg = Message {
+        subject: ev.subject.0.clone(),
+        envelope: ev.clone(),
+    };
+
+    // Delivery 1: the co-commit tx marks dedup + the handler co-commits the ci_run ROW on the SAME tx;
+    // `Done` commits (row + mark together). The EVENTS commit through the real outbox (absorb).
+    let out = tokio::task::block_in_place(|| consumer.deliver(&msg));
+    assert_eq!(out, Delivered::Acked, "the push co-committed the ci_run ROW + the mark");
+
+    let runs = count(&p, "SELECT count(*)::bigint AS n FROM ci_run WHERE run_id=$1::uuid", &run_id).await;
+    assert_eq!(runs, 1, "one durable ci_run row (the run-of-record, co-committed with the mark)");
+    assert!(dedup_present(&p, &cname, &ev.event_id.0).await, "the dedup mark co-committed with the ROW");
+    let events: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM outbox").fetch_one(&p).await.unwrap();
+    assert_eq!(events, 3, "ci.run.started + 2 queued ci.check.updated in the REAL outbox (absorb)");
+    // The row is attributed correctly (state=queued, the deterministic run_id, the trust tier).
+    let row = sqlx::query("SELECT state, trust_tier, trigger_kind, correlation_id FROM ci_run WHERE run_id=$1::uuid")
+        .bind(&run_id).fetch_one(&p).await.unwrap();
+    assert_eq!(row.get::<String, _>("state"), "queued", "reserve state");
+    assert_eq!(row.get::<String, _>("trust_tier"), "trusted", "a member push is trusted");
+    assert_eq!(row.get::<String, _>("trigger_kind"), "push");
+    assert_eq!(row.get::<String, _>("correlation_id"), format!("corr-{}", "ev-chunk4-1"));
+
+    // Delivery 2 (same event_id): DEDUPLICATED — the handler does not re-run; the ON CONFLICT + absorb
+    // guarantee 0 duplicates even if it had.
+    let out2 = tokio::task::block_in_place(|| consumer.deliver(&msg));
+    assert_eq!(out2, Delivered::Deduplicated, "the committed mark dedups the redelivery");
+    let runs2 = count(&p, "SELECT count(*)::bigint AS n FROM ci_run WHERE run_id=$1::uuid", &run_id).await;
+    let events2: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM outbox").fetch_one(&p).await.unwrap();
+    assert_eq!((runs2, events2), (1, 3), "redelivery added nothing (idempotent: 1 run, 3 events)");
+
+    p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str()).await.ok();
+    println!("[chunk4/1] PASS production co-commit: the ci_run ROW co-commits with the dedup mark (1 row), events absorb through the real outbox (3), redelivery deduped exactly once.");
+}
+
+// =================================================================================================
+// (5) CT-004d.2 chunk 4 — the HONEST SPLIT under a crash: persist writes the ci_run ROW on the
+//     co-commit tx (uncommitted) and commits the EVENTS through the outbox (a SEPARATE tx, immediately
+//     durable). A crash (rollback) between leaves NO ci_run + NO mark, but the events ARE durable (the
+//     documented split). The redelivery re-runs → the ROW + mark commit, the events re-absorb (no dup)
+//     → converges to exactly once. This PROVES the row⇄mark atomicity AND the events-absorb consistency.
+// =================================================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chunk4_crash_window_row_and_mark_rollback_events_absorb_then_reconverge() {
+    let schema = schema_name(uniq());
+    let repo = "web";
+    let oid = "99ee88ff77000000000000000000000000aa11bb";
+    let p = setup_schema(&schema, OUTBOX_MIGRATION).await;
+    let rt = tokio::runtime::Handle::current();
+
+    let backing = DurableDedupBacking::new(p.clone(), rt.clone());
+    let ledger = DedupLedger::durable(Arc::new(backing) as Arc<dyn DurableDedup>);
+    let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(p.clone(), rt.clone())));
+    let store = CoCommitReserveStore::new(
+        ci_run_store_factory(p.clone()),
+        outbox,
+        Arc::new(UlidMinter::new()),
+        rt.clone(),
+    );
+    let cname = ConsumerName("ci-dispatch.trigger".into());
+    let tenant = TenantId("acme".into());
+    let region = Region("fr-par".into());
+
+    let ev = push_envelope("ev-chunk4-crash", repo, oid);
+    let armed = armed_for(&ev, repo, oid);
+    let run_id = armed.handoff.run_write.run_id.clone();
+
+    // (A) CRASH BEFORE COMMIT: open the co-commit tx (marks dedup within it), persist the bundle — the
+    //     ci_run ROW lands on the co-commit tx (uncommitted); the events commit through the outbox in a
+    //     SEPARATE tx (durable NOW) — then ROLL BACK the co-commit tx (kill-9 before commit).
+    tokio::task::block_in_place(|| {
+        let (mut cotx, fresh) = ledger.begin_co_commit(&cname, &ev.event_id, &tenant, &region);
+        assert!(fresh, "first delivery marks the dedup row FRESH");
+        {
+            let conn = cotx.connection().expect("co-commit exposes a connection");
+            let mut htx = HandlerTx::with_connection(conn);
+            store.persist(&armed, &mut htx).expect("persist: ci_run on the co-commit tx + events absorb");
+        }
+        cotx.rollback(); // kill-9 before commit → the ci_run ROW + the mark vanish together.
+    });
+    assert!(!dedup_present(&p, &cname.0, &ev.event_id.0).await, "crash: the mark did NOT persist");
+    assert_eq!(count(&p, "SELECT count(*)::bigint AS n FROM ci_run WHERE run_id=$1::uuid", &run_id).await, 0, "crash: NO ci_run row (rolled back with the mark)");
+    // The EVENTS are the honest split: they committed in the outbox's separate tx, so they ARE durable
+    // even though the ROW + mark rolled back (documented — absorb-idempotent, converges on redelivery).
+    let events_after_crash: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM outbox").fetch_one(&p).await.unwrap();
+    assert_eq!(events_after_crash, 3, "honest split: the events led the row (durable), the ROW+mark rolled back");
+
+    // (B) REDELIVERY re-runs (still fresh — the mark rolled back) and COMMITS: the ROW + mark land; the
+    //     events RE-ABSORB (same deterministic ids → ON CONFLICT DO NOTHING, no duplicate).
+    tokio::task::block_in_place(|| {
+        let armed = armed_for(&ev, repo, oid);
+        let (mut cotx, fresh) = ledger.begin_co_commit(&cname, &ev.event_id, &tenant, &region);
+        assert!(fresh, "after the rollback the redelivery is STILL FRESH (0 lost)");
+        {
+            let conn = cotx.connection().unwrap();
+            let mut htx = HandlerTx::with_connection(conn);
+            store.persist(&armed, &mut htx).expect("persist on the redelivery tx");
+        }
+        cotx.commit().expect("commit the co-commit tx (ROW + mark together)");
+    });
+    assert!(dedup_present(&p, &cname.0, &ev.event_id.0).await, "redelivery committed the mark");
+    assert_eq!(count(&p, "SELECT count(*)::bigint AS n FROM ci_run WHERE run_id=$1::uuid", &run_id).await, 1, "one ci_run row (converged exactly once)");
+    let events_final: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM outbox").fetch_one(&p).await.unwrap();
+    assert_eq!(events_final, 3, "3 events exactly once (the re-emit ABSORBED — no duplicate)");
+
+    p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str()).await.ok();
+    println!("[chunk4/2] PASS honest split under crash: ROW+mark roll back together (0 ci_run), events lead durable (absorb), redelivery converges to exactly once (1 run, 3 events).");
 }
