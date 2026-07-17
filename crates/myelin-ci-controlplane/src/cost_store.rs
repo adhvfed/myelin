@@ -82,7 +82,8 @@ use sqlx::types::Uuid;
 use sqlx::Row;
 
 use crate::metering::{
-    CostEventRow, CostKind, Meter, INSERT_COST_EVENT_QUERY, SELECT_COST_EVENTS_FOR_RUN_QUERY,
+    CostEventRow, CostKind, Meter, INSERT_COST_EVENT_QUERY, SELECT_COST_EVENT_BY_ID_QUERY,
+    SELECT_COST_EVENTS_FOR_RUN_QUERY,
 };
 
 /// A durable CI-metering-store failure. Loud + typed — a settle/read NEVER silently drops or coerces
@@ -113,6 +114,18 @@ pub enum CiCostStoreError {
     /// A read-back row carries a `meter`/`kind` token outside the frozen CHECK-constraint set — a
     /// corrupt durable write, surfaced loudly (never silently coerced).
     CorruptRow(String),
+    /// **Verify-on-conflict divergence (peer-review #13).** A re-delivered settle derived the SAME
+    /// `cost_id` (the `(tenant, run_id, job_id, meter)` idempotency key) as an already-recorded unit,
+    /// but a MONETARY column differs. `ON CONFLICT DO NOTHING` would silently keep the first amount and
+    /// drop this one — a hidden billing-table divergence. Surfaced loudly instead (never a silent drop).
+    AmountDivergence {
+        /// Which monetary column diverged (`amount` | `wholesale` | `markup`).
+        column: &'static str,
+        /// The value already recorded (the first settle's).
+        recorded: i64,
+        /// The incoming re-delivered value that disagrees.
+        incoming: i64,
+    },
 }
 
 impl core::fmt::Display for CiCostStoreError {
@@ -132,6 +145,12 @@ impl core::fmt::Display for CiCostStoreError {
             CiCostStoreError::CorruptRow(e) => {
                 write!(f, "corrupt durable cost_event row (outside the frozen token set): {e}")
             }
+            CiCostStoreError::AmountDivergence { column, recorded, incoming } => write!(
+                f,
+                "durable CI cost_event settle refused: a re-delivered unit (same cost_id) disagrees \
+                 on {column} — recorded {recorded}, incoming {incoming} (never a silent drop of a \
+                 divergent bill; the idempotency key is (tenant, run, job, meter), not the amount)"
+            ),
         }
     }
 }
@@ -199,6 +218,28 @@ impl CiCostEventStore {
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| CiCostStoreError::Db(e.to_string()))?;
+            if done.rows_affected() == 0 {
+                // VERIFY-ON-CONFLICT (#13): the `ON CONFLICT (tenant_id, cost_id) DO NOTHING` absorbed a
+                // re-delivery. Because `cost_id` keys on `(tenant, run, job, meter)` — NOT the amount —
+                // read the recorded amounts back and confirm they MATCH the incoming unit. A divergence
+                // is a metering anomaly `DO NOTHING` would silently hide; surface it loudly (this keys
+                // the billing table). Same-amount re-delivery is the normal idempotent no-op (returns 0).
+                let existing = sqlx::query(SELECT_COST_EVENT_BY_ID_QUERY)
+                    .bind(tenant_id) // $1 tenant_id
+                    .bind(cost_id) // $2 cost_id
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|e| CiCostStoreError::Db(e.to_string()))?;
+                for (column, incoming, recorded) in [
+                    ("amount", amount, existing.get::<i64, _>("amount")),
+                    ("wholesale", wholesale, existing.get::<i64, _>("wholesale_minor_units")),
+                    ("markup", markup, existing.get::<i64, _>("markup_minor_units")),
+                ] {
+                    if incoming != recorded {
+                        return Err(CiCostStoreError::AmountDivergence { column, recorded, incoming });
+                    }
+                }
+            }
             affected += done.rows_affected();
         }
         Ok(affected)
