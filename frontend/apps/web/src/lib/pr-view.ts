@@ -73,3 +73,21 @@ export function isFilteredNoResults(
   const total = counts?.all ?? 0;
   return itemsLen === 0 && total > 0;
 }
+
+/** The honest count + truncation state for one cross-repo bucket (peer-review #21a). The count CHIP
+ *  must show the TRUE total (`page.total`), not the page size (`items.length`) — otherwise a limited
+ *  response reads as if it were complete. `truncated` is true when fewer rows are shown than the total
+ *  (or the server offers a `next_cursor`), so the screen can DISCLOSE the shortfall instead of silently
+ *  dropping the rest. Falls back to the shown count when the server sends no `total` (then nothing is
+ *  hidden, so `truncated` is false). Pure — unit-tested; the endpoint returns everything today, but this
+ *  keeps the surface honest-by-construction if/when the cross-repo list starts paginating. */
+export function bucketPageSummary(page: {
+  items: { length: number };
+  page: { total?: number; next_cursor?: string | null };
+}): { count: number; shown: number; truncated: boolean } {
+  const shown = page.items.length;
+  const total = page.page.total ?? shown;
+  const count = Math.max(total, shown); // never report fewer than we actually show
+  const truncated = shown < count || (page.page.next_cursor != null);
+  return { count, shown, truncated };
+}
