@@ -911,9 +911,10 @@ pub use pseudonym_durable::{
     DurablePseudonymBacking, DurablePseudonymRow,
 };
 // The MR-009b W6b durable storage-ledger backings + their migration sets (0050/0051/0052).
+// Plus the CT-004d.2 chunk 6 / #7b durable consumer dead-letter backing (foundation id 0002).
 pub use events_durable::{
-    bus_erasure_durable_migrations, DurableBusErasureBacking, DurableDedupBacking,
-    BUS_ERASURE_LEDGER_MIGRATION,
+    bus_erasure_durable_migrations, consumer_dead_letter_migrations, DurableBusErasureBacking,
+    DurableDeadLetterBacking, DurableDedupBacking, BUS_ERASURE_LEDGER_MIGRATION,
 };
 pub use outbox_durable::PgOutboxBacking;
 pub use reerase_durable::{

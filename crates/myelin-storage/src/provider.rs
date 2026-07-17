@@ -96,6 +96,13 @@ pub fn foundation_migrations() -> Migrations {
             "0001_consumer_dedup",
             myelin_events::CONSUMER_DEDUP_MIGRATION,
         ),
+        // CT-004d.2 chunk 6 / #7b: the durable consumer DEAD-LETTER set — part of the foundation set
+        // (like `consumer_dedup`, every service's embedded set needs it) so a dead-lettered event
+        // (esp. the H2 panic path) survives a restart.
+        Migration::plain(
+            "0002_consumer_dead_letter",
+            myelin_events::CONSUMER_DEAD_LETTER_MIGRATION,
+        ),
     ])
 }
 

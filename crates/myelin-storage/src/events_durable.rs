@@ -43,8 +43,8 @@
 use sqlx::postgres::PgPool;
 
 use myelin_events::{
-    CoCommitError, CoCommitTx, ConsumerName, DurableBusErasure, DurableDedup, ErasedSubject,
-    EventId, PiiKeyRef, Region, TenantId, Timestamp,
+    CoCommitError, CoCommitTx, ConsumerName, DeadLetterRecord, DurableBusErasure, DurableDeadLetter,
+    DurableDedup, ErasedSubject, EventId, PiiKeyRef, Region, TenantId, Timestamp,
 };
 
 use crate::migration::{Migration, Migrations};
@@ -278,6 +278,128 @@ impl CoCommitTx for NoopCoCommit {
         Ok(())
     }
     fn rollback(self: Box<Self>) {}
+}
+
+// =================================================================================================
+// Durable PG backing for the consumer DEAD-LETTER set (CT-004d.2 chunk 6 / peer-review #7b)
+//
+// The consumer's dead-letter set was `Mutex<Vec<DeadLetter>>` — in-memory only, so a dead-lettered
+// event (esp. the H2 panic path) VANISHED on a restart even though the pump had acked it and the
+// broker cursor had advanced. This is the REAL durable backing the `myelin_events::DeadLetterSink`
+// binds to via the `myelin_events::DurableDeadLetter` seam, so the poison SURVIVES a restart —
+// exactly mirroring the `DurableDedupBacking` above.
+//
+// **PII-SAFETY (references-not-payloads):** the `consumer_dead_letter` table stores ONLY the
+// `event_id` (a ULID / trace label) + a bounded PII-free `reason` — NEVER the raw envelope/payload
+// (which may carry inline PII). The reason is already bounded by `DeadLetterSink::push`
+// (`bounded_reason`) before it reaches `record`. Like `DurableDedupBacking`, the table is keyed
+// `(consumer, event_id)` with no tenant column (dedup/DLQ is per-consumer, cross-tenant by design) —
+// a NAMED, LOUD tenant-predicate exclusion (`tests/workspace_clean.rs`), never a silent skip.
+//
+// **The H2 close:** on the panic path the co-commit tx was ROLLED BACK — `record` MUST run on a
+// FRESH pool connection, never the rolled-back conn. It executes against `&self.pool` (a fresh
+// connection), so a panicked event's poison persists on its own connection.
+// =================================================================================================
+
+/// The frozen forward-only migration set the durable consumer dead-letter set binds to. This is part
+/// of the substrate FOUNDATION (applied beside `0000_outbox` / `0001_consumer_dedup` — see
+/// [`crate::provider::foundation_migrations`] + the substrate boot), NOT a `durable_migration_groups`
+/// entry, because — like `consumer_dedup` — every service's embedded set needs it. Id `0002` (the
+/// next free foundation id after `0001_consumer_dedup`; the durable aggregate starts at `0010`, so
+/// this stays disjoint). Idempotent on re-boot (`CREATE TABLE IF NOT EXISTS`).
+pub fn consumer_dead_letter_migrations() -> Migrations {
+    Migrations::of([Migration::plain(
+        "0002_consumer_dead_letter",
+        myelin_events::CONSUMER_DEAD_LETTER_MIGRATION,
+    )])
+}
+
+/// The REAL durable `consumer_dead_letter` backing over the OLTP `PgPool` (CT-004d.2 chunk 6 / #7b).
+/// Cloneable (the pool is an `Arc`-backed handle). Constructed by the events `serve()` composition
+/// root over the SAME pool the relay/stores/dedup use, and injected into
+/// [`myelin_events::DeadLetterSink::durable`]. The sync [`DurableDeadLetter`] seam bridges onto the
+/// tokio runtime handle (`block_in_place` + `block_on`, the same bridge [`DurableDedupBacking`] uses).
+#[derive(Clone)]
+pub struct DurableDeadLetterBacking {
+    pool: PgPool,
+    rt: tokio::runtime::Handle,
+}
+
+impl DurableDeadLetterBacking {
+    /// Wrap a pool as the durable consumer dead-letter backing. `rt` is the runtime handle the sync
+    /// trait methods drive the async sqlx client on. The caller must have applied
+    /// [`myelin_events::CONSUMER_DEAD_LETTER_MIGRATION`] (via [`consumer_dead_letter_migrations`] in
+    /// the foundation set at boot).
+    pub fn new(pool: PgPool, rt: tokio::runtime::Handle) -> DurableDeadLetterBacking {
+        DurableDeadLetterBacking { pool, rt }
+    }
+
+    fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
+        tokio::task::block_in_place(|| self.rt.block_on(fut))
+    }
+}
+
+impl DurableDeadLetter for DurableDeadLetterBacking {
+    fn record(
+        &self,
+        consumer: &ConsumerName,
+        event_id: &EventId,
+        reason: &str,
+    ) -> Result<(), String> {
+        // `INSERT … ON CONFLICT DO NOTHING`: idempotent (a redelivered dead-letter re-inserts a
+        // no-op). The row SURVIVES a process restart — the whole point. Runs on `&self.pool` (a
+        // FRESH connection), NOT the rolled-back co-commit tx (the H2 panic-path correctness point).
+        //
+        // Fail-direction (never a silent loss of the poison): on a DB error return `Err` so
+        // `DeadLetterSink::push` logs LOUDLY + falls back to the in-process Vec — the poison is never
+        // silently dropped (mirrors `DurableDedup`'s fail-loud discipline).
+        self.block(async {
+            sqlx::query(
+                "INSERT INTO consumer_dead_letter (consumer, event_id, reason) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (consumer, event_id) DO NOTHING",
+            )
+            .bind(&consumer.0)
+            .bind(&event_id.0)
+            .bind(reason)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+    }
+
+    fn dead_letters(&self, consumer: &ConsumerName) -> Vec<DeadLetterRecord> {
+        // The `(consumer)`-scoped, time-ordered ops snapshot (PII-free rows). On a store fault, log
+        // LOUDLY and return empty (a failed introspection read is not a data-loss path — the WRITE is
+        // the load-bearing durability; the poison already persisted).
+        self.block(async {
+            let rows: Vec<(String, String)> = match sqlx::query_as(
+                "SELECT event_id, reason FROM consumer_dead_letter \
+                 WHERE consumer = $1 ORDER BY occurred_at, event_id",
+            )
+            .bind(&consumer.0)
+            .fetch_all(&self.pool)
+            .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    eprintln!(
+                        "[consumer-dlq] LOUD: durable dead_letters read failed for consumer={}: {e}",
+                        consumer.0
+                    );
+                    return Vec::new();
+                }
+            };
+            rows.into_iter()
+                .map(|(event_id, reason)| DeadLetterRecord {
+                    consumer: consumer.clone(),
+                    event_id: EventId(event_id),
+                    reason,
+                })
+                .collect()
+        })
+    }
 }
 
 // =================================================================================================
