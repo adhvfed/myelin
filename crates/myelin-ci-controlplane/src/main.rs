@@ -211,6 +211,10 @@ async fn main() {
             resolver,
             reporter,
             runner_hooks(),
+            // CT-004f sub-step 5: the live log sink's backings — the shared OLTP pool (log_segment/
+            // log_anchor writer + ci.log.available outbox) + the S3 CAS config (sealed log segments).
+            provider.db_pool().clone(),
+            provider.config().s3.clone(),
         );
         runner.spawn();
         // Drive the pipeline engine on a DEDICATED thread (off the tokio runtime, like the runner): the
