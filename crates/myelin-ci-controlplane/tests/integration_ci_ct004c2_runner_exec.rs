@@ -32,9 +32,14 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use myelin_ci_controlplane::{
-    ci_job_queue_store, DurableEnqueue, DurableLeaseAdapter, EnqueueOutcome, JobSpecResolver, Lane,
-    LeasedJob, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
+    ci_job_queue_store, DurableEnqueue, DurableLeaseAdapter, DurableLogPersist, EnqueueOutcome,
+    JobSpecResolver, Lane, LeasedJob, LogPipelineSink, CREATE_FAIR_DEFICIT_DDL,
+    CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL,
 };
+use myelin_config::MyelinConfig;
+use myelin_events::OUTBOX_MIGRATION;
+use myelin_storage::s3blob::S3BlobStore;
+use myelin_storage::{BlobStore, ContentHash};
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, EgressPolicy, FirehoseSink, IdemToken, ImageRef, JobKind, JobSpec,
@@ -102,6 +107,29 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(CREATE_FAIR_DEFICIT_DDL)
         .await
         .expect("create fair_deficit");
+}
+
+/// CT-004f capstone: also create the log index tables + the durable outbox in the schema (the live
+/// `LogPipelineSink`/`DurableLogPersist` seal to `log_segment`/`log_anchor` + emit `ci.log.available`
+/// to the outbox, all unqualified → the pinned `search_path` resolves them here).
+async fn create_log_tables(admin: &PgPool) {
+    for (base, ddl) in [
+        ("log_segment", CREATE_LOG_SEGMENT_DDL),
+        ("log_anchor", CREATE_LOG_ANCHOR_DDL),
+    ] {
+        admin
+            .execute(ddl)
+            .await
+            .unwrap_or_else(|e| panic!("create {base}: {e}"));
+        admin
+            .execute(format!("SELECT myelin_make_tenant_scoped('{base}')").as_str())
+            .await
+            .expect("RLS-scope the log index table");
+    }
+    admin
+        .execute(OUTBOX_MIGRATION)
+        .await
+        .expect("create the durable outbox");
 }
 
 async fn drop_schema(admin: &PgPool, schema: &str) {
@@ -387,6 +415,144 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
     println!(
         "[CT-004c.2] PASS end-to-end: durable claim → REAL runsc guest ran `echo hello-ct004c2` \
          (exit 0) → job.done buffered ONCE (references-not-payloads) → durable lease completed"
+    );
+}
+
+// ═══════════ 1b. CT-004f CAPSTONE — real runsc guest → LIVE log sink → readable from CAS ══════════
+
+/// **The full CT-004f live path, end to end against real `runsc` + live PG + live S3.** Drives the
+/// SAME durable-claim → REAL runsc guest → `job.done` cycle as the e2e test above, but with the
+/// PRODUCTION firehose the runner now wires ([`LogPipelineSink`] over the real [`S3BlobStore`] +
+/// [`DurableLogPersist`]) instead of a capturing stub. Proves the composition that joins the
+/// independently-proven legs: a guest's stdout is redacted at the boundary (empty plan today), sealed
+/// to the real S3 CAS, indexed in `log_segment`/`log_anchor`, and the `ci.log.available` pointer is
+/// co-committed to the outbox — and the guest's output is READABLE BACK from the CAS via the index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_sink() {
+    if !require_or_skip("ct004f-capstone") {
+        return;
+    }
+    const MARKER: &str = "CAPSTONE-LOG-MARKER-9f3a";
+    let schema = schema_name("capstone");
+    let region = "fr-par";
+    let tenant = "tenantA";
+    let admin = admin_pool("capstone").await;
+    create_schema(&admin, &schema).await;
+    create_log_tables(&admin).await;
+    let store = ci_job_queue_store(admin.clone());
+
+    let run_uuid = uid("capstone-run").to_string();
+    let idem = job_idem_token(&run_uuid, "ci.pipeline:0");
+    let job = enq(tenant, region, "capstone-job", "capstone-run", TrustTier::Trusted, &["linux"], &idem);
+    assert_eq!(store.enqueue(&job).await.expect("enqueue"), EnqueueOutcome::Inserted);
+
+    let executor = FlowExecutor::new(
+        Arc::new(FixedMinter(run_uuid.clone())),
+        TenantId(tenant.into()),
+        Region(region.into()),
+    );
+    executor.register_definition("ci.pipeline");
+    executor
+        .start(StartSpec {
+            wf_type: "ci.pipeline".into(),
+            input: vec![],
+            budget: None,
+            idem_key: "ci:capstone-run".into(),
+        })
+        .expect("start the run");
+
+    let idem_for_resolver = idem.clone();
+    let resolve: JobSpecResolver = Arc::new(move |_l: &LeasedJob| {
+        Ok(compute_spec(
+            vec!["sh".into(), "-c".into(), format!("echo {MARKER}; exit 0")],
+            &idem_for_resolver,
+        ))
+    });
+    let adapter = DurableLeaseAdapter::new(store.clone(), region, tokio::runtime::Handle::current(), resolve);
+    let backend = GvisorBackend::new();
+
+    // THE PRODUCTION FIREHOSE — the exact sink `CiRunnerLoop` now wires (sub-step 5): the per-job
+    // LogPipeline seals to the REAL S3 CAS; DurableLogPersist writes the index + the outbox pointer.
+    let cfg = MyelinConfig::dev();
+    let handle = tokio::runtime::Handle::current();
+    let firehose = LogPipelineSink::new(
+        Region(region.into()),
+        S3BlobStore::connect(&cfg.s3, handle.clone()),
+        DurableLogPersist::with_pg(admin.clone(), handle.clone()),
+    );
+    let reporter = myelin_ci_sandbox::EngineTerminalReporter::new(executor.clone());
+    let agent = RunnerAgent::new(
+        "capstone-worker",
+        vec!["linux".into()],
+        vec![TrustTier::Trusted],
+        Region(region.into()),
+        30,
+        adapter,
+        &backend,
+        &firehose,
+        &reporter,
+        ok_hooks(),
+    );
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let outcome = agent.run_one(now).expect("claim + REAL runsc + seal logs + job.done");
+    assert!(outcome.report.passed, "the runsc guest exited 0");
+
+    // ── the index landed: a sealed segment (with a CAS blob_ref) + the step anchor closed `passed`. ──
+    let run_id = uid("capstone-run");
+    let job_id = uid("capstone-job");
+    let seg_rows: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT blob_ref FROM log_segment WHERE run_id = $1 AND job_id = $2")
+            .bind(run_id)
+            .bind(job_id)
+            .fetch_all(&admin)
+            .await
+            .expect("read log_segment rows");
+    assert!(!seg_rows.is_empty(), "the guest's output sealed to at least one log_segment");
+    let anchor_status: String = sqlx::query_scalar(
+        "SELECT status FROM log_anchor WHERE run_id = $1 AND job_id = $2",
+    )
+    .bind(run_id)
+    .bind(job_id)
+    .fetch_one(&admin)
+    .await
+    .expect("the step anchor landed");
+    assert_eq!(anchor_status, "passed", "the anchor closed with the job verdict");
+
+    // ── the ci.log.available pointer co-committed to the outbox. ──
+    let aggregate = format!("ci/run/{run_uuid}/job/{}", job_id);
+    let pointer_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outbox WHERE aggregate = $1 AND envelope->>'type_' = 'ci.log.available'",
+    )
+    .bind(&aggregate)
+    .fetch_one(&admin)
+    .await
+    .expect("count ci.log.available");
+    assert!(pointer_count >= 1, "a ci.log.available pointer rode the outbox");
+
+    // ── THE PAYOFF: the guest's stdout is READABLE BACK from the real S3 CAS via the index. ──
+    let cas = S3BlobStore::connect(&cfg.s3, handle);
+    let mut sealed = Vec::new();
+    for blob_ref in seg_rows.into_iter().flatten() {
+        let addr = ContentHash::parse(&blob_ref).expect("blob_ref parses");
+        let bytes = cas
+            .get(&TenantId(tenant.into()), &addr)
+            .expect("read the sealed log segment back from the real S3 CAS");
+        sealed.extend_from_slice(&bytes);
+    }
+    let readable = String::from_utf8_lossy(&sealed);
+    assert!(
+        readable.contains(MARKER),
+        "the REAL runsc guest's stdout must be readable back from the CAS via the log index. got: {readable:?}"
+    );
+
+    drop_schema(&admin, &schema).await;
+    println!(
+        "[CT-004f] PASS capstone: durable claim → REAL runsc guest ran `echo {MARKER}` → sealed to \
+         S3 CAS → log_segment/log_anchor index + ci.log.available outbox → guest stdout readable from CAS"
     );
 }
 
