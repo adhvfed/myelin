@@ -31,6 +31,7 @@ use myelin_ci_controlplane::{
     SINGLE_STEP_ID,
 };
 use myelin_ci_sandbox::FirehoseSink;
+use myelin_events::OUTBOX_MIGRATION;
 use myelin_storage::FsBlobStore;
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, Row};
@@ -107,6 +108,12 @@ async fn setup_schema(admin: &sqlx::PgPool) {
             .await
             .unwrap_or_else(|e| panic!("apply CI durable migration {} into the schema: {e}", m.id));
     }
+    // The durable outbox (sub-step 4b: the ci.log.available pointer co-commits here on the SAME tx as
+    // the index rows). Relay-internal, NOT tenant-scoped (no RLS) — created before the grant below.
+    admin
+        .execute(OUTBOX_MIGRATION)
+        .await
+        .expect("apply the outbox migration into the schema");
     // Grant the RLS-enforced app role access to the schema + its tables (the real tenant-scoped write
     // runs as this role; FORCE-RLS + the tx GUC — not a grant — is what isolates it to the tenant).
     admin
@@ -169,6 +176,20 @@ async fn read_back(
     (seg_count, status, byte_end, dangling)
 }
 
+/// The count of `ci.log.available` outbox rows for a run/job aggregate (sub-step 4b). The outbox is
+/// relay-internal (no RLS), so no tenant GUC is needed to read it.
+async fn outbox_count(app: &sqlx::PgPool, run: &str, job: &str) -> i64 {
+    let aggregate = format!("ci/run/{run}/job/{job}");
+    sqlx::query(
+        "SELECT COUNT(*) AS c FROM outbox WHERE aggregate = $1 AND envelope->>'type_' = 'ci.log.available'",
+    )
+    .bind(aggregate)
+    .fetch_one(app)
+    .await
+    .unwrap()
+    .get("c")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn live_log_path_writes_the_index_through_the_tenant_scoped_store() {
     let admin = pool(&admin_url()).await;
@@ -205,6 +226,11 @@ async fn live_log_path_writes_the_index_through_the_tenant_scoped_store() {
     assert_eq!(status, "passed", "the step anchor closed as passed");
     assert!(byte_end.is_some(), "the finished step's anchor is closed (byte_end set)");
     assert_eq!(dangling, 0, "0 dangling anchors — every anchor's span is within the sealed bytes");
+    // Sub-step 4b: the ci.log.available pointer co-committed to the outbox on the SAME tx.
+    assert!(
+        outbox_count(&app, &run, &job).await >= 1,
+        "a ci.log.available pointer landed in the outbox (co-committed with the index)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -266,4 +292,12 @@ async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
     );
     assert_eq!(status, "passed");
     assert_eq!(dangling, 0);
+    // Sub-step 4b idempotency: the re-delivered persist did NOT duplicate the outbox pointers — the
+    // deterministic event_id + ON CONFLICT (event_id) DO NOTHING dedups (double-emit 0).
+    assert_eq!(
+        outbox_count(&app, &run, &job).await as usize,
+        flushed.pointers.len(),
+        "re-delivery did NOT duplicate ci.log.available outbox rows"
+    );
+    assert!(!flushed.pointers.is_empty(), "the flush produced at least one pointer");
 }
