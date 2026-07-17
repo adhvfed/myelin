@@ -17,19 +17,24 @@
 //!
 //! NOT "the logs contain nothing sensitive."
 //!
-//! ## Fail-closed seam — currently empty BY CONSTRUCTION
+//! ## Unbypassable choke point — currently empty BY CONSTRUCTION
 //! Today the platform injects **no** secrets into any job: [`SecretBroker`] exists but is not wired
 //! into any launch path (the guest receives env-var NAMES only, never resolved material). So every
 //! [`RedactionPlan`] is [`RedactionPlan::none`] and the mask is a runtime no-op — there is nothing to
-//! redact. The seam exists now so the property is STRUCTURAL, not a future comment:
+//! redact. Be PRECISE about what this seam guarantees today (co-review 2026-07-17, P1):
 //!
-//! - every capture→result path takes a `&RedactionPlan` and applies it as the final step, so no
-//!   un-redacted capture can bypass it (a new backend cannot forget — it is a required argument);
-//! - [`RedactionPlan::for_job`] is the ONE seam CI-1 secret injection must populate: when injection
-//!   is wired, the resolved secret material MUST be threaded here at the SAME site it is injected into
-//!   the guest, so injection and masking land together;
-//! - a future launch that injects a secret into the guest but leaves this plan `none()` is the
-//!   forbidden state the injection change is responsible for preventing (fail-closed).
+//! - **A choke point that cannot be skipped (holds now):** every capture→result path takes a
+//!   `&RedactionPlan` and applies it as the final step, so no backend can forward un-redacted captured
+//!   bytes — a new backend cannot forget the step, it is a REQUIRED argument.
+//!
+//! What this seam does NOT yet guarantee — and is the **named obligation of the future CI-1 secret
+//! injection feature**, not buildable here because injection does not exist — is that the plan is
+//! CORRECTLY POPULATED with every injected secret. A required argument ensures *a* plan is passed, not
+//! that it covers what was injected. So injection MUST, in ITS own change:
+//!   - derive the guest secret env AND this plan from ONE inseparable resolved-secrets value (you
+//!     cannot inject a secret env entry without its needle), threaded via [`RedactionPlan::for_job`]; and
+//!   - REJECT the launch if the injected-secret set and the plan's coverage disagree.
+//! Until injection exists there is nothing to couple; this module is the choke point it plugs into.
 //!
 //! Per the co-review (2026-07-17), the production MASKER semantics — streaming across capture-chunk
 //! boundaries, overlapping/encoded/transformed values, a minimum-length floor, performance — are
@@ -43,7 +48,7 @@
 pub const REDACTION_MARKER: &[u8] = b"***";
 
 /// A set of exact-value needles to mask from a job's captured output at the sandbox boundary. See the
-/// module docs for the (precise, do-not-overclaim) security model and the fail-closed-seam rationale.
+/// module docs for the (precise, do-not-overclaim) security model and the choke-point rationale.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RedactionPlan {
     /// The exact byte values to mask. EMPTY today (the platform injects no secrets); populated by CI-1
