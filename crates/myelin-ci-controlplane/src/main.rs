@@ -177,15 +177,22 @@ async fn main() {
             region.clone(),
             tokio::runtime::Handle::current(),
         );
-        // The `job.done` target executor (CT-004d.2 shares this with the parked `ci.pipeline` body). A
-        // hosted runner is cross-tenant; the per-run tenant scoping is the CT-004d.2 executor's — this is
-        // the composition placeholder proving the one signal path (`EngineTerminalReporter`).
-        let executor = myelin_flow::FlowExecutor::new(
-            Arc::new(myelin_events::MonotonicMinter::new()),
-            myelin_tenancy::TenantId("ci-runner".into()),
-            myelin_tenancy::Region(region.clone()),
-        );
-        executor.register_definition(myelin_ci_controlplane::CI_PIPELINE_WF_TYPE);
+        // CT-004d.2 CULMINATION (chunks 2/3/5): the CI pipeline DRIVER — the SHARED `FlowExecutor` the
+        // runner's `job.done` wakes + registers/drives `run_ci_pipeline_body` (chunk 5's `DurableJobRunner`
+        // dispatches each stage into the DURABLE `job_queue`+`ci_job_spec`, trust_tier/region forwarded
+        // UNCHANGED). The runner's terminal reporter is the driver's `CiPipelineReporter` (re-encodes the
+        // verdict + wakes the parked run — the ONE signal path). The pinned-snapshot→JobSpec resolver is
+        // the fail-closed `unresolved_stage_spec_builder` floor (a real builder is the CT-004d follow-on;
+        // the mechanism is proven end-to-end against real `runsc` in the CT-004d.2 integration test).
+        let driver = std::sync::Arc::new(myelin_ci_controlplane::CiPipelineDriver::new(
+            myelin_tenancy::TenantId("ci-controlplane".into()),
+            region.clone(),
+            myelin_ci_controlplane::ci_job_spec_store(provider.db_pool().clone()),
+            tokio::runtime::Handle::current(),
+            myelin_ci_controlplane::unresolved_stage_spec_builder(),
+            outbox.clone(),
+        ));
+        let reporter = driver.reporter();
         let runner = myelin_ci_controlplane::CiRunnerLoop::new(
             format!("ci-runner-{}", std::process::id()),
             vec!["linux".to_string()],
@@ -195,10 +202,27 @@ async fn main() {
             runner_store,
             tokio::runtime::Handle::current(),
             resolver,
-            executor,
+            reporter,
             runner_hooks(),
         );
         runner.spawn();
+        // Drive the pipeline engine on a DEDICATED thread (off the tokio runtime, like the runner): the
+        // body's durable dispatch bridges its async co-persist onto the runtime, and driving off-runtime
+        // keeps `block_on` correct. NAMED FLOOR: the `ci_run`-poll STARTER (reading queued `ci_run` rows
+        // and `start_run`-ing them under their pre-minted `wf_run_id`) is the production autonomy wire —
+        // the integration test drives `start_run` directly to prove the whole spine. Until the starter
+        // lands, this loop drives no runs (a cheap idle sweep); the composition is LIVE + correct.
+        std::thread::Builder::new()
+            .name("ci-pipeline-driver".into())
+            .spawn(move || loop {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                driver.drive_once(now, "1970-01-01T00:00:00Z");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            })
+            .expect("spawn the ci-pipeline-driver thread");
     }
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).

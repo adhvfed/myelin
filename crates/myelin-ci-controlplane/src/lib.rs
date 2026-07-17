@@ -137,6 +137,16 @@ pub mod job_spec_store;
 /// [`ci_durable_migrations`] both CI mains apply at boot. Registering/starting the `ci.pipeline` body is
 /// CT-004d.2 chunk 2/3 (NOT this chunk).
 pub mod ci_run_store;
+/// CT-004d.2 CULMINATION (chunks 2/3/5): the CI pipeline DRIVER — a pushed CI trigger runs a REAL
+/// pipeline end-to-end. [`ci_pipeline_driver::DurableJobRunner`] (chunk 5) dispatches each stage into
+/// the DURABLE `job_queue` + `ci_job_spec` via [`job_spec_store::CiJobSpecStore::co_persist_dispatch`]
+/// (the run's `trust_tier`/`region` forwarded UNCHANGED — the security invariant);
+/// [`ci_pipeline_driver::CiPipelineDriver`] (chunks 2+3) registers + drives the `ci.pipeline` body over
+/// a shared [`myelin_flow::FlowExecutor`] and starts the parked run under the pre-minted `wf_run_id`;
+/// [`ci_pipeline_driver::CiPipelineReporter`] bridges the runner's `passed` marker to the stage-verdict
+/// codec + wakes the parked run (so the CT-004c.2 runner's `job.done` from a real `runsc` guest
+/// advances the pipeline to completion).
+pub mod ci_pipeline_driver;
 /// CT-004c.1: the REGION-scoped, CROSS-TENANT half of the durable scheduler — the raw `CLAIM_QUERY` /
 /// `REAP_QUERY` executions (a hosted runner claims across ALL tenants in its region; the DRR fairness
 /// spans tenants). Isolated here so it is a NAMED, LOUD `tenant-predicate` exclusion (the
@@ -449,6 +459,18 @@ pub use ci_run_store::{
 pub use runner_bind::{
     durable_spec_resolver, spec_store_unavailable_resolver, CiRunnerLoop, DurableLeaseAdapter,
     JobSpecResolver, CI_RUNNER_LEASE_TTL_SECS,
+};
+
+// CT-004d.2 CULMINATION (chunks 2/3/5): the CI pipeline driver — `DurableJobRunner` (chunk 5) dispatches
+// each stage into the DURABLE `job_queue`+`ci_job_spec` (trust_tier/region forwarded UNCHANGED);
+// `CiPipelineDriver` (chunks 2+3) registers+drives `run_ci_pipeline_body` over a shared `FlowExecutor`
+// and starts the parked run under the pre-minted `wf_run_id`; `CiPipelineReporter` bridges the runner's
+// `passed` marker to the stage-verdict codec + wakes the parked run. `fixed_command_spec_builder` is the
+// digest-pinned compute-spec seam the integration test injects (a real `runsc` guest); the real
+// pinned-snapshot→JobSpec resolver is the named `unresolved_stage_spec_builder` follow-on.
+pub use ci_pipeline_driver::{
+    fixed_command_spec_builder, unresolved_stage_spec_builder, CiPipelineDriver, CiPipelineReporter,
+    DurableJobRunner, StageSpecBuilder, StageVerdictBridge, StartRunError,
 };
 
 // CI-P14 (P-357): the EU fleet autoscaler — the FleetProvider impl + autoscale-on-queue-depth +

@@ -53,12 +53,11 @@ use std::time::Duration;
 
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
-    CountingFirehose, EngineTerminalReporter, JobSpec, LeaseStore, QueuedJob, RunnerError,
-    RunnerHooks, TrustTier,
+    CountingFirehose, JobSpec, LeaseStore, QueuedJob, RunnerError, RunnerHooks, TrustTier,
 };
-use myelin_flow::FlowExecutor;
 use myelin_tenancy::{Region, TenantId};
 
+use crate::ci_pipeline_driver::CiPipelineReporter;
 use crate::job_spec_store::MAX_JOB_TIMEOUT_SECS;
 use crate::{CiJobQueueStore, CiJobSpecStore, LeasedJob};
 
@@ -250,11 +249,14 @@ impl LeaseStore for DurableLeaseAdapter {
 /// background driver, no new `AppSpec` field, LOUD on failure and resilient (a launch failure logs and
 /// continues; the §OQ-F dispatch retry re-runs the job).
 ///
-/// **Reporter note (the CT-004d handoff):** the terminal `job.done` is delivered to `executor` — the
-/// SAME durable executor the `ci.pipeline` body parks on. Starting that body on a shared executor (so
-/// the report wakes a real parked run) is CT-004d; here the reporter is the ONE signal path
-/// (`EngineTerminalReporter` → `DurableExecutor::signal`, exactly-once on `idem_token`), proven end to
-/// end in the CT-004c.2 integration test.
+/// **Reporter note (CT-004d.2 CULMINATION — the handoff is now WIRED):** the terminal `job.done` is
+/// delivered through a [`CiPipelineReporter`] over the SAME shared [`myelin_flow::FlowExecutor`] the
+/// `ci.pipeline` body parks on ([`crate::CiPipelineDriver`] chunks 2/3 register + drive that body). The
+/// reporter re-encodes the runner's derived `passed` into the stage-verdict codec the body decodes
+/// (CT-004d.2 chunk 5's [`crate::StageVerdictBridge`]) and WAKES the parked run — so a real `runsc`
+/// guest's `job.done` advances the pipeline. It remains the ONE signal path (→ `DurableExecutor::signal`,
+/// exactly-once on `idem_token`); a job with no stage mapping falls back to the raw `passed` marker
+/// (identical to the CT-004c.2 `EngineTerminalReporter` behaviour).
 pub struct CiRunnerLoop {
     worker_id: String,
     labels: Vec<String>,
@@ -264,7 +266,7 @@ pub struct CiRunnerLoop {
     store: CiJobQueueStore,
     rt: tokio::runtime::Handle,
     resolve: JobSpecResolver,
-    executor: FlowExecutor,
+    reporter: CiPipelineReporter,
     hooks: RunnerHooks,
     idle_backoff: Duration,
     error_backoff: Duration,
@@ -274,7 +276,9 @@ impl CiRunnerLoop {
     /// Construct the runner loop. `worker_id`/`labels`/`allowed_tiers`/`region`/`lease_ttl_secs` are
     /// the claim predicates + lease TTL; `store` is the durable `job_queue` store; `rt` bridges the
     /// sync runner onto the async pool; `resolve` provides the `JobSpec` for a leased row (CT-004d
-    /// seam); `executor` is the `job.done` target; `hooks` are the four-guarantee wiring.
+    /// seam); `reporter` is the [`CiPipelineReporter`] over the shared executor the parked `ci.pipeline`
+    /// body runs on (CT-004d.2 — it re-encodes the verdict + wakes the parked run); `hooks` are the
+    /// four-guarantee wiring. Build the reporter from [`crate::CiPipelineDriver::reporter`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         worker_id: impl Into<String>,
@@ -285,7 +289,7 @@ impl CiRunnerLoop {
         store: CiJobQueueStore,
         rt: tokio::runtime::Handle,
         resolve: JobSpecResolver,
-        executor: FlowExecutor,
+        reporter: CiPipelineReporter,
         hooks: RunnerHooks,
     ) -> CiRunnerLoop {
         CiRunnerLoop {
@@ -297,7 +301,7 @@ impl CiRunnerLoop {
             store,
             rt,
             resolve,
-            executor,
+            reporter,
             hooks,
             idle_backoff: Duration::from_millis(500),
             error_backoff: Duration::from_secs(2),
@@ -338,7 +342,7 @@ impl CiRunnerLoop {
             store,
             rt,
             resolve,
-            executor,
+            reporter,
             hooks,
             idle_backoff,
             error_backoff,
@@ -346,7 +350,6 @@ impl CiRunnerLoop {
 
         let backend = GvisorBackend::new();
         let firehose = CountingFirehose::new();
-        let reporter = EngineTerminalReporter::new(executor);
         let adapter = DurableLeaseAdapter::new(store, region.clone(), rt, resolve);
         let agent = myelin_ci_sandbox::RunnerAgent::new(
             worker_id.clone(),
