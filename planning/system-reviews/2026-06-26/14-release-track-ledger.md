@@ -605,7 +605,20 @@ DYING at per-pid schema-collision setup (UNPROVEN) — fixed test-schema uniquen
 **CT-004d must-fix (verifier MEDIUM, latent):** lease_ttl_secs=30 < job timeout(60) → a long real job could
 lapse mid-run → re-execute (at-least-once by design; exactly-once WAKE holds) — raise TTL above max timeout OR
 heartbeat during launch when real specs land. Sandbox prod-exec PROVEN (CT-002/003, 0 escapes).
-· **CT-004d** pipeline body + metering bookends live (b,c) ·
+· **CT-004d** pipeline body + metering bookends live (b,c). **d.1 DONE (dispatch→durable-JobSpec→resolve
+bridge, real specs execute in runsc). d.2 SCOUTED (2026-07-17) — pure orchestration glue (untrusted-exec is
+c.2, done+verified); 6 chunks:** (1) executor start-with-id [`DurableExecutor::start` mints its own run_id +
+drops the consumer's pre-minted `wf_run_id`; add a caller run_id — foundational, no security surface, blocks
+2/3] · (2) register+drive the ci.pipeline BODY in prod [`FlowDispatcher::register(CI_PIPELINE_WF_TYPE, body)`
++ tick, IN ci-controlplane same-process as CiRunnerLoop so job.done wakes the parked run — pattern:
+`flow/dogfood.rs:165-206`, `flow/app.rs:151-200`] · (3) the start call at reserve→start · (4) durable
+`CiRunStore::with_pg` [mirror CiJobSpecStore — the run-of-record, currently only written in the test path] ·
+(5) durable JobRunner for the body's dispatch [sync-over-async → `CiJobSpecStore::co_persist_dispatch`;
+SECURITY-ADJACENT: forwards trust-tier==spec-tier unchanged] · (6) #7b durable consumer DLQ [mirror
+DurableDedup — a `consumer_dead_letter` table + backing]. **ARCHITECTURAL FLOOR found: no durable RunStore/
+executor exists across processes (FlowExecutor is in-memory, per-process) — either drive the run in-process
+with a durable-backed RunStore, or job.done rides the bus (sig.<tenant>.). A durable RunStore backing is an
+implied floor; flag if chunks 2/3 hit a real fork.** Start chunk 1 (no-dep). ·
 **CT-004e** check/result producers live → closes the X-1 seam to the merge gate (d) · **CT-004f** log
 pipeline live substrate (a; SSE tail is CT-005) · **CT-004g** fleet/residency (c, optional split).
 
