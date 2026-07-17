@@ -53,13 +53,14 @@ use std::time::Duration;
 
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
-    CountingFirehose, JobSpec, LeaseStore, QueuedJob, RunnerError, RunnerHooks, TrustTier,
+    JobSpec, LeaseStore, QueuedJob, RunnerError, RunnerHooks, TrustTier,
 };
+use myelin_storage::s3blob::S3BlobStore;
 use myelin_tenancy::{Region, TenantId};
 
 use crate::ci_pipeline_driver::CiPipelineReporter;
 use crate::job_spec_store::MAX_JOB_TIMEOUT_SECS;
-use crate::{CiJobQueueStore, CiJobSpecStore, LeasedJob};
+use crate::{CiJobQueueStore, CiJobSpecStore, DurableLogPersist, LeasedJob, LogPipelineSink};
 
 /// **The runner's lease TTL, wired ABOVE the max job timeout (CT-004d.1 — the CT-004c.2 verifier's
 /// MEDIUM fix).** [`RunnerAgent::run_one`](myelin_ci_sandbox::RunnerAgent) BLOCKS for the whole in-line
@@ -270,6 +271,12 @@ pub struct CiRunnerLoop {
     hooks: RunnerHooks,
     idle_backoff: Duration,
     error_backoff: Duration,
+    // CT-004f sub-step 5: the durable log path the live runner seals captured job output through. The
+    // pool + S3 config build the `LogPipelineSink` (per-(tenant,run,job) LogPipeline over the real
+    // S3 CAS) + `DurableLogPersist` (the log_segment/log_anchor writer + ci.log.available outbox emit)
+    // INSIDE `run()` on the dedicated runner thread (the LogPipeline is non-Send).
+    pool: sqlx::postgres::PgPool,
+    s3: myelin_config::S3Config,
 }
 
 impl CiRunnerLoop {
@@ -278,7 +285,10 @@ impl CiRunnerLoop {
     /// sync runner onto the async pool; `resolve` provides the `JobSpec` for a leased row (CT-004d
     /// seam); `reporter` is the [`CiPipelineReporter`] over the shared executor the parked `ci.pipeline`
     /// body runs on (CT-004d.2 — it re-encodes the verdict + wakes the parked run); `hooks` are the
-    /// four-guarantee wiring. Build the reporter from [`crate::CiPipelineDriver::reporter`].
+    /// four-guarantee wiring. Build the reporter from [`crate::CiPipelineDriver::reporter`]. `pool` +
+    /// `s3` back the live log sink (CT-004f sub-step 5): the OLTP pool writes the `log_segment`/
+    /// `log_anchor` index + the `ci.log.available` outbox pointer; `s3` is the CAS the sealed log
+    /// segments flush to (the same shared pool + object store the rest of the control plane uses).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         worker_id: impl Into<String>,
@@ -291,6 +301,8 @@ impl CiRunnerLoop {
         resolve: JobSpecResolver,
         reporter: CiPipelineReporter,
         hooks: RunnerHooks,
+        pool: sqlx::postgres::PgPool,
+        s3: myelin_config::S3Config,
     ) -> CiRunnerLoop {
         CiRunnerLoop {
             worker_id: worker_id.into(),
@@ -303,6 +315,8 @@ impl CiRunnerLoop {
             resolve,
             reporter,
             hooks,
+            pool,
+            s3,
             idle_backoff: Duration::from_millis(500),
             error_backoff: Duration::from_secs(2),
         }
@@ -344,12 +358,23 @@ impl CiRunnerLoop {
             resolve,
             reporter,
             hooks,
+            pool,
+            s3,
             idle_backoff,
             error_backoff,
         } = self;
 
         let backend = GvisorBackend::new();
-        let firehose = CountingFirehose::new();
+        // CT-004f sub-step 5: the LIVE log sink (was the `CountingFirehose` stub). Built HERE on the
+        // dedicated runner thread because the per-job `LogPipeline` is non-Send (its firehose uses Rc);
+        // the pool + rt handle are cheap Clones. Captured guest stdout/stderr → redacted at the sandbox
+        // boundary (the `RedactionPlan` seam, empty today) → sealed to the real S3 CAS → `log_segment`/
+        // `log_anchor` index + the `ci.log.available` outbox pointer, all tenant-scoped (FORCE-RLS).
+        let firehose = LogPipelineSink::new(
+            Region(region.clone()),
+            S3BlobStore::connect(&s3, rt.clone()),
+            DurableLogPersist::with_pg(pool, rt.clone()),
+        );
         let adapter = DurableLeaseAdapter::new(store, region.clone(), rt, resolve);
         let agent = myelin_ci_sandbox::RunnerAgent::new(
             worker_id.clone(),
