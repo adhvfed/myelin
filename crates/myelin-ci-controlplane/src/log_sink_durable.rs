@@ -26,9 +26,7 @@
 //! pointer's event_id is DETERMINISTIC on `(aggregate, byte_start, byte_end)`, so a re-delivered
 //! `finish` derives the same id and `ON CONFLICT (event_id) DO NOTHING` absorbs it (double-emit 0).
 
-use myelin_events::{
-    derive_envelope, Actor, AggregateKey, EmitContext, EventEnvelope, EventId, Timestamp,
-};
+use myelin_events::{derive_envelope, Actor, EmitContext, EventEnvelope, EventId, Timestamp};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::pgrelay::PgRelay;
 use myelin_storage::{with_tenant_tx, PgError};
@@ -149,7 +147,7 @@ fn ci_log_available_envelope(
 ) -> EventEnvelope {
     let draft = ptr.to_draft();
     let ctx = EmitContext {
-        event_id: ci_log_event_id(&draft.aggregate, ptr.byte_start, ptr.byte_end),
+        event_id: ci_log_event_id(tenant, ptr),
         tenant: tenant.clone(),
         region: Region::new(region.to_string()),
         actor: Actor(Principal::stub(
@@ -167,12 +165,27 @@ fn ci_log_available_envelope(
     derive_envelope(draft, ctx, None)
 }
 
-/// The DETERMINISTIC `ci.log.available` event id — stable on `(aggregate, byte_start, byte_end)` so a
-/// re-delivered `finish` derives the SAME id and the outbox `ON CONFLICT (event_id)` dedups it (a
-/// fresh ULID would double-emit the notification). A fast FNV-1a idempotency key, not a security
-/// primitive (the same idiom as `cost_id_for` / `snapshot_event_id`).
-fn ci_log_event_id(aggregate: &AggregateKey, byte_start: i64, byte_end: i64) -> EventId {
-    let keyed = format!("{}@{byte_start}:{byte_end}", aggregate.0);
+/// The DETERMINISTIC `ci.log.available` event id — stable on `(tenant, run, job, step, byte_start,
+/// byte_end)` so a re-delivered `finish` derives the SAME id and the outbox `ON CONFLICT (event_id)`
+/// dedups it (a fresh ULID would double-emit the notification). A fast FNV-1a idempotency key, not a
+/// security primitive (the same idiom as `cost_id_for` / `snapshot_event_id`).
+///
+/// The key includes the `tenant` (the shared `outbox` `UNIQUE(event_id)` is GLOBAL, not tenant-scoped
+/// — so two tenants must never collide) and the run/job ids in their CANONICAL uuid form (so the key
+/// matches the `uuid`-PK normalization the `log_segment`/`log_anchor` rows dedup on — a redelivery
+/// that carried the id in a different textual form still derives the same key). A non-uuid id (which
+/// would already have aborted the row inserts before this runs) falls back to the raw string.
+fn ci_log_event_id(tenant: &TenantId, ptr: &LogAvailablePointer) -> EventId {
+    let canon = |id: &str| Uuid::parse_str(id).map(|u| u.to_string()).unwrap_or_else(|_| id.into());
+    let keyed = format!(
+        "{}\u{0}{}\u{0}{}\u{0}{}@{}:{}",
+        tenant.as_str(),
+        canon(&ptr.coord.run_id),
+        canon(&ptr.coord.job_id),
+        ptr.coord.step_id,
+        ptr.byte_start,
+        ptr.byte_end,
+    );
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
     for b in keyed.as_bytes() {
         hash ^= u64::from(*b);

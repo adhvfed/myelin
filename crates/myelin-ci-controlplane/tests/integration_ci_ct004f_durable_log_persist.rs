@@ -301,3 +301,74 @@ async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
     );
     assert!(!flushed.pointers.is_empty(), "the flush produced at least one pointer");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn byte_budget_coalesce_pointer_without_a_seal_persists() {
+    // The mid-stream COALESCE pointer path (segment_ref = None): a long job crosses the byte budget
+    // before a segment seals, so the drained set at finish carries a pointer that names a byte range
+    // with NO sealed-segment ref. This path is reachable via the real sink (drain_pointers returns
+    // ALL buffered pointers at finish) but was previously unexercised end-to-end (verifier gap).
+    let admin = pool(&admin_url()).await;
+    setup_schema(&admin).await;
+    let app = pool(&app_url()).await;
+
+    let tenant = TenantId::from_token("acme-ct004f-coalesce");
+    let region = Region::new("fr-par");
+    let run = uid("ct004f-coalesce-run");
+    let job = uid("ct004f-coalesce-job");
+
+    // Small COALESCE budget + a LARGE seal threshold → a pointer emits from coalescing (segment_ref
+    // None) with no seal.
+    let flushed = {
+        let mut p = LogPipeline::new(
+            tenant.clone(),
+            region.clone(),
+            FsBlobStore::new(),
+            SecretRedactor::default(),
+        )
+        .with_thresholds(
+            CoalesceBudget { bytes_per_pointer: 10 },
+            SealThreshold { seal_at_bytes: 1_000_000 },
+        );
+        let coord = LogCoord::new(&run, &job, SINGLE_STEP_ID);
+        for _ in 0..4 {
+            p.ship_line(&coord, "0123456789").expect("ship"); // 10 bytes each → crosses the 10-byte budget
+        }
+        p.close_step(&coord, AnchorStatus::Passed).expect("close");
+        // Do NOT flush_job here — we want the pre-seal coalesce pointer, not a seal pointer.
+        let pointers = p.drain_pointers();
+        assert!(
+            pointers.iter().any(|pt| pt.segment_ref.is_none()),
+            "a coalesce pointer with NO sealed-segment ref was produced"
+        );
+        FlushedJobLogs {
+            run_id: run.clone(),
+            job_id: job.clone(),
+            segments: p.segment_rows().to_vec(),
+            anchors: p.anchor_rows().into_iter().cloned().collect(),
+            pointers,
+        }
+    };
+    let pointer_count = flushed.pointers.len();
+
+    let app_for_thread = app.clone();
+    let rt = tokio::runtime::Handle::current();
+    let (t1, f1) = (tenant.clone(), flushed);
+    std::thread::spawn(move || {
+        let persist = DurableLogPersist::with_pg(app_for_thread, rt);
+        persist.persist(&t1, f1).expect("persist the coalesce-only index");
+    })
+    .join()
+    .expect("the persist thread joins");
+
+    // The segment_ref=None pointer co-committed to the outbox (the anchor closed even with no seal).
+    assert_eq!(
+        outbox_count(&app, &run, &job).await as usize,
+        pointer_count,
+        "the coalesce pointer(s) landed in the outbox"
+    );
+    let (_seg, status, byte_end, _dangling) =
+        read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
+    assert_eq!(status, "passed", "the anchor closed even with no sealed segment");
+    assert!(byte_end.is_some());
+}
