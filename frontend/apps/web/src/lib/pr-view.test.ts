@@ -10,6 +10,7 @@ import {
   stateTabs,
   reviewMarker,
   isFilteredNoResults,
+  bucketPageSummary,
 } from "./pr-view";
 
 describe("pr-view mapping", () => {
@@ -65,5 +66,43 @@ describe("pr-view mapping", () => {
     expect(isFilteredNoResults(0, { all: 0 })).toBe(false);
     // Non-empty → neither.
     expect(isFilteredNoResults(3, { all: 148 })).toBe(false);
+  });
+});
+
+describe("bucketPageSummary (#21a — honest count + truncation disclosure)", () => {
+  const mk = (shown: number, page: { total?: number; next_cursor?: string | null }) => ({
+    items: { length: shown },
+    page,
+  });
+
+  it("the chip shows the TRUE total, not the page size", () => {
+    const s = bucketPageSummary(mk(50, { total: 148 }));
+    expect(s.count).toBe(148); // NOT 50 (the page size / silent-truncation lie)
+    expect(s.shown).toBe(50);
+    expect(s.truncated).toBe(true);
+  });
+
+  it("is NOT truncated when the whole set is shown (total === shown)", () => {
+    const s = bucketPageSummary(mk(3, { total: 3 }));
+    expect(s.count).toBe(3);
+    expect(s.truncated).toBe(false);
+  });
+
+  it("falls back to the shown count when the server sends no total (nothing hidden)", () => {
+    const s = bucketPageSummary(mk(7, {}));
+    expect(s.count).toBe(7);
+    expect(s.truncated).toBe(false);
+  });
+
+  it("treats a present next_cursor as truncation even if total is absent", () => {
+    const s = bucketPageSummary(mk(50, { next_cursor: "c2" }));
+    expect(s.truncated).toBe(true);
+    expect(s.shown).toBe(50);
+  });
+
+  it("never reports fewer than actually shown (a stale/small total cannot hide rows)", () => {
+    const s = bucketPageSummary(mk(5, { total: 2 }));
+    expect(s.count).toBe(5); // max(total, shown)
+    expect(s.truncated).toBe(false);
   });
 });

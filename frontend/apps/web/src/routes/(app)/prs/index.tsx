@@ -8,7 +8,7 @@ import { Title } from "@solidjs/meta";
 import { A, createAsync } from "@solidjs/router";
 import { Icon, Skeleton, SkeletonBlock, StatusPill } from "@myelin/design-system";
 import { getMyPrs, type PrListRowVM, type PrListPage } from "~/lib/api";
-import { prTitleText, isTitleFallback, updatedLabel, reviewMarker } from "~/lib/pr-view";
+import { prTitleText, isTitleFallback, updatedLabel, reviewMarker, bucketPageSummary } from "~/lib/pr-view";
 
 export default function CrossRepoPrsScreen() {
   const needsReview = createAsync(() => getMyPrs({ bucket: "needs-review" }));
@@ -76,7 +76,20 @@ function Bucket(props: {
       <h2 id={`${props.testid}-h`} style={{ "font-size": "var(--fs-h3)", margin: "0", display: "flex", "align-items": "center", gap: "var(--space-2)" }}>
         <Icon name={props.icon} /> {props.heading}
         <Show when={props.data}>
-          {(d) => <span style={{ "font-family": "var(--font-mono)", "font-size": "var(--fs-caption)", color: "var(--text-muted)", border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-pill)", padding: "0 var(--space-2)" }}>{d().items.length}</span>}
+          {(d) => {
+            // #21a: the chip shows the TRUE total (page.total), not the page size — never a page count
+            // masquerading as the whole.
+            const summary = () => bucketPageSummary(d());
+            return (
+              <span
+                data-testid={`${props.testid}-count`}
+                title={summary().truncated ? `Showing ${summary().shown} of ${summary().count}` : undefined}
+                style={{ "font-family": "var(--font-mono)", "font-size": "var(--fs-caption)", color: "var(--text-muted)", border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-pill)", padding: "0 var(--space-2)" }}
+              >
+                {summary().count}
+              </span>
+            );
+          }}
         </Show>
       </h2>
       <Show when={props.hint}>
@@ -105,6 +118,18 @@ function Bucket(props: {
                 )}
               </For>
             </ul>
+            {/* #21a: DISCLOSE truncation instead of silently dropping the rest (the chip already shows the
+                true total). The cross-repo list returns everything today, so this only appears if/when the
+                endpoint starts paginating — never a silent shortfall. */}
+            <Show when={props.data && bucketPageSummary(props.data)} keyed>
+              {(s) => (
+                <Show when={s.truncated}>
+                  <p data-testid={`${props.testid}-truncated`} style={{ margin: "0", color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>
+                    Showing {s.shown} of {s.count}. Open a repository's pull requests to see the rest.
+                  </p>
+                </Show>
+              )}
+            </Show>
           </Show>
         </Suspense>
       </ErrorBoundary>
