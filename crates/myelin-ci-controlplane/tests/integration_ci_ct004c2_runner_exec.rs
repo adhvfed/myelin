@@ -193,9 +193,10 @@ struct CapturingFirehose {
     bytes: Arc<Mutex<Vec<u8>>>,
 }
 impl FirehoseSink for CapturingFirehose {
-    fn ship_frame(&self, _run_id: &str, _job_id: &str, frame: &[u8]) {
+    fn ship_frame(&self, _run_id: &str, _job_id: &str, _tenant: &TenantId, frame: &[u8]) {
         self.bytes.lock().unwrap().extend_from_slice(frame);
     }
+    fn finish(&self, _run_id: &str, _job_id: &str, _tenant: &TenantId, _passed: bool) {}
 }
 impl CapturingFirehose {
     fn captured(&self) -> Vec<u8> {
