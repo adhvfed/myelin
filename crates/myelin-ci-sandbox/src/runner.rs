@@ -410,11 +410,14 @@ pub trait FirehoseSink {
     /// Ship one firehose frame (a captured stdout/stderr chunk) for `(run_id, job_id)` within
     /// `tenant`. The STUB counts; the real sink appends to the open segment + publishes the live tail.
     fn ship_frame(&self, run_id: &str, job_id: &str, tenant: &TenantId, frame: &[u8]);
-    /// The job's output is complete — seal the open segment, flush the `(job, step, byte-range)`
-    /// index, and emit the coalesced `ci.log.available` pointer. The STUB is a no-op; the real sink
-    /// drives `LogPipeline::flush_job` + drains pointers to the outbox. Idempotent (a re-delivered
-    /// terminal report calls this again → no double seal).
-    fn finish(&self, run_id: &str, job_id: &str, tenant: &TenantId);
+    /// The job's output is complete — CLOSE the step anchor with the job's verdict (`passed`), seal
+    /// the open segment, flush the `(job, step, byte-range)` index, and emit the coalesced
+    /// `ci.log.available` pointer. `passed` becomes the anchor status (`passed`/`failed`) the
+    /// jump-to-failure deep-link reads (a single-command job = one step, so the job verdict IS the
+    /// step verdict). The STUB is a no-op; the real sink drives `LogPipeline::flush_job` + drains
+    /// pointers to the outbox. Idempotent (a re-delivered terminal report calls this again → no
+    /// double seal).
+    fn finish(&self, run_id: &str, job_id: &str, tenant: &TenantId, passed: bool);
 }
 
 /// A counting [`FirehoseSink`] stub — the test floor. Counts frames shipped so a test can assert the
@@ -445,7 +448,7 @@ impl FirehoseSink for CountingFirehose {
     fn ship_frame(&self, _run_id: &str, _job_id: &str, _tenant: &TenantId, _frame: &[u8]) {
         *self.count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     }
-    fn finish(&self, _run_id: &str, _job_id: &str, _tenant: &TenantId) {
+    fn finish(&self, _run_id: &str, _job_id: &str, _tenant: &TenantId, _passed: bool) {
         *self.finished.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     }
 }
@@ -740,11 +743,15 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
             self.firehose
                 .ship_frame(&job.run_id, &job.job_id, &job.tenant, &result.stderr);
         }
-        // The job's output is complete — seal the open segment, flush the (job, step, byte-range)
-        // index, and emit the coalesced `ci.log.available` pointer (the real sink; a no-op in the
-        // counting stub). Called BEFORE the terminal report so the pointer the report references is
-        // durably backed. Idempotent — a re-delivered report path does not re-seal.
-        self.firehose.finish(&job.run_id, &job.job_id, &job.tenant);
+        // The job's output is complete — CLOSE the step anchor with the derived verdict, seal the
+        // open segment, flush the (job, step, byte-range) index, and emit the `ci.log.available`
+        // pointer (the real sink; a no-op in the counting stub). `passed` is derived here (a clean
+        // exit that did not time out) — the SAME value the terminal report carries below. Called
+        // BEFORE the terminal report so the pointer the report references is durably backed.
+        // Idempotent — a re-delivered report path does not re-seal.
+        let passed = result.passed();
+        self.firehose
+            .finish(&job.run_id, &job.job_id, &job.tenant, passed);
         // Re-heartbeat (a long job renews its lease so it does not lapse mid-run).
         self.leases.heartbeat(
             &self.worker_id,
@@ -764,7 +771,7 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
         // carry the `ci.log.available` pointer (references-not-payloads) the firehose pipeline
         // publishes for the captured streams — never the bytes themselves.
         let report = TerminalReport {
-            passed: result.passed(),
+            passed,
             result_refs: vec![ArtifactRef(format!(
                 "myelin://{}/ci/run/{}/job/{}/log.available",
                 job.tenant.0, job.run_id, job.job_id
