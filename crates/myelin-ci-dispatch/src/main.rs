@@ -110,31 +110,77 @@ async fn main() {
         provider.db_pool().clone(),
         tokio::runtime::Handle::current(),
     )));
-    // CT-004b — the LIVE `ci-dispatch.trigger` consumer construction site. It is built from the
-    // provider pool + the git read backend + the tenant CAS blob store + the durable reserve store
-    // via `myelin_ci_dispatch::build_trigger_consumer` and handed to `run_dispatch` as one
-    // `ConsumerReg` (replacing the shell's former `Vec::new()`). Three of the four backings are
-    // available here today:
-    //   - the durable reserve store (CT-004d.2 chunk 4): `CoCommitReserveStore::new(ci_run_store,
-    //     outbox.clone(), minter, rt)` co-commits the durable `ci_run` ROW on the consumer's co-commit
-    //     `HandlerTx` connection (ATOMIC with the dedup mark) via
-    //     `myelin_ci_controlplane::ci_run_store_factory(provider.db_pool().clone())`, and emits
-    //     `ci.run.started` + the queued `ci.check.updated` through the DURABLE outbox above in ABSORB
-    //     mode (the honest #7 H1 split: the run-of-record ROW co-commits; the events are absorb);
-    //   - the git read backend: `DurableGitConfigReader::new(DurableGitStore::with_root(<git root>))`;
-    //   - the exactly-once `DedupLedger` for the `Consumer` runtime.
-    // The FOURTH — the CAS `BlobStore` the resolver writes the definition snapshot to (contract
-    // 11.2, `S3BlobStore` over RustFS/Scaleway) — is INTEGRATION-GATED in this crate's Cargo.toml
-    // (`aws-sdk-s3` + `myelin-storage/integration`), so a DEFAULT-features binary has no CAS backing
-    // to construct here; that + the cross-service git-read hop are the NAMED wiring floors. (CT-004m
-    // discharged the `ci_run`-table floor: `ci_run` is created at THIS main's boot via the shared
-    // `ci_durable_migrations()` applied above — no longer a boot-order dependency on ci-controlplane.)
-    // The consumer LOGIC + the durable reserve/idempotency + the `ci_run` ROW ⇄ mark co-commit are
-    // proven end-to-end on live PG in `tests/integration_ci_ct004b_trigger_consumer.rs`. REGISTERING /
-    // driving the consumer (+ starting the `ci.pipeline` body on the executor) is CT-004d.2 chunk 2/3;
-    // until the CAS-blob backing is wired into this default build, the production binary boots the shell
-    // (no consumer registered) rather than half-wire a consumer that cannot content-address its snapshot.
-    let consumers = Vec::new();
+    // CT-004b / finding #6 — REGISTER the LIVE `ci-dispatch.trigger` consumer (was the `Vec::new()`
+    // shell that registered NO consumer in production). The four backings are constructed here and
+    // handed to `build_dispatch_consumers` (the `sqlx`-touching `CiRunStore` + dedup backing are
+    // built from `provider.db_pool()` by inference — this main names no `sqlx`, the same idiom as the
+    // outbox above):
+    //   - reserve = `CoCommitReserveStore` (CT-004d.2 chunk 4): the run-of-record `ci_run` ROW
+    //     co-commits ATOMICALLY with the dedup mark on the consumer's `HandlerTx`
+    //     (`CiRunStore::co_commit_insert`); the events ride the DURABLE outbox in ABSORB mode (the
+    //     honest #7 H1 split). Its `ci_run`/`consumer_dedup` tables are migrated above (foundation +
+    //     CT-004m), so no boot-order coupling.
+    //   - CAS = the real `S3BlobStore` (RustFS/Scaleway). The former "INTEGRATION-GATED CAS" note was
+    //     STALE: `aws-sdk-s3` is a NON-OPTIONAL dep via `myelin-storage` (MR-009b Wave 1), so the CAS
+    //     store is default-reachable — `cargo tree -p myelin-ci-dispatch -i aws-sdk-s3` shows it in the
+    //     default graph; no `myelin-storage/integration` needed.
+    //   - git-read = `DurableGitConfigReader` over `DurableGitStore::rooted(MYELIN_GIT_ROOT)` — reads
+    //     the pushed repo's `.myelin/ci.*` from the SAME on-disk git-root the edge writes (shared-
+    //     volume deploy; the env default mirrors `myelin-edge` main).
+    //   - dedup = the durable `DedupLedger` over the shared pool (the exactly-once effect anchor).
+    // The consumer LOGIC + the durable `ci_run` ROW ⇄ mark co-commit are proven end-to-end on live PG
+    // in `tests/integration_ci_ct004b_trigger_consumer.rs` proofs (4)/(5); this is the production
+    // registration that drives it. The cross-service NATS delivery remains the named deploy floor.
+    let git_root = std::env::var("MYELIN_GIT_ROOT").unwrap_or_else(|_| {
+        std::env::temp_dir()
+            .join("myelin-git-data")
+            .to_string_lossy()
+            .into()
+    });
+    // OBSERVABILITY (review of finding #6): the whole point of this fix is a consumer that no longer
+    // silently does nothing — so make the git-read root VISIBLE at boot. If ci-dispatch and the edge
+    // resolve DIFFERENT roots (or `MYELIN_GIT_ROOT` is unset here but set on the edge), every push
+    // reads an empty root → `NoConfig` skip → CI silently never arms. We do NOT fail loud (the edge
+    // may create the root lazily / boot later — fail-loud would reintroduce a boot-order coupling);
+    // we surface the resolved root + a warning when it is absent so the condition is diagnosable.
+    if std::path::Path::new(&git_root).is_dir() {
+        eprintln!("ci-dispatch: reading CI config (.myelin/ci.*) from git-root {git_root}");
+    } else {
+        eprintln!(
+            "ci-dispatch: WARNING git-root {git_root} does not exist yet (MYELIN_GIT_ROOT); until it \
+             is present + shared with the edge, pushes read an empty root and CI will not arm"
+        );
+    }
+    let minter: Arc<dyn myelin_events::IdMinter> = Arc::new(myelin_events::UlidMinter::new());
+    let ci_run = myelin_ci_controlplane::ci_run_store_factory(provider.db_pool().clone());
+    let dedup = myelin_events::DedupLedger::durable(Arc::new(
+        myelin_storage::events_durable::DurableDedupBacking::new(
+            provider.db_pool().clone(),
+            tokio::runtime::Handle::current(),
+        ),
+    ) as Arc<dyn myelin_events::DurableDedup>);
+    // A SEPARATE durable outbox handle for the reserve store's event-absorb: the `outbox` above is
+    // MOVED into `run_dispatch` below; both are cheap handles over the same pool.
+    let reserve_outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
+        provider.db_pool().clone(),
+        tokio::runtime::Handle::current(),
+    )));
+    let s3 = provider.config().s3.clone();
+    let consumers = myelin_ci_dispatch::build_dispatch_consumers(
+        git_root,
+        &s3,
+        ci_run,
+        reserve_outbox,
+        dedup,
+        minter,
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap_or_else(|e| {
+        // Fail LOUD: a service that cannot register its trigger consumer must not boot as a silent
+        // shell (that was exactly finding #6). Non-zero exit, never swallowed.
+        eprintln!("ci-dispatch: cannot register the ci-dispatch.trigger consumer: {e:?}");
+        std::process::exit(1);
+    });
 
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).
