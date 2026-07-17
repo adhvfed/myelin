@@ -20,16 +20,25 @@
 //! thread); `with_tenant_tx` is async. The bridge is `block_on` guarded by `block_in_place` (the SAME
 //! `PgOutboxBacking` / `DurableLeaseAdapter` idiom).
 //!
-//! **What is NOT here (sub-step 4b):** the `ci.log.available` pointer → OUTBOX co-emit on the SAME tx.
-//! The index rows ARE the durable truth the `details_ref` resolves against (losing a pointer does not
-//! corrupt the index — a re-drive re-emits); the atomic pointer co-commit is the next slice.
+//! **Sub-step 4b — the pointer co-emit (DONE).** The coalesced `ci.log.available` pointers ride the
+//! durable OUTBOX via [`PgRelay::co_commit_in_tx`] on the SAME `with_tenant_tx` connection as the
+//! index rows — atomic (both commit or both roll back), the relay publishes iff committed. The
+//! pointer's event_id is DETERMINISTIC on `(aggregate, byte_start, byte_end)`, so a re-delivered
+//! `finish` derives the same id and `ON CONFLICT (event_id) DO NOTHING` absorbs it (double-emit 0).
 
+use myelin_events::{
+    derive_envelope, Actor, AggregateKey, EmitContext, EventEnvelope, EventId, Timestamp,
+};
+use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+use myelin_storage::pgrelay::PgRelay;
 use myelin_storage::{with_tenant_tx, PgError};
-use myelin_tenancy::TenantId;
+use myelin_tenancy::{Region, TenantId};
 use sqlx::postgres::PgPool;
 use sqlx::types::Uuid;
 
-use crate::log_pipeline::{INSERT_LOG_SEGMENT_QUERY, UPSERT_LOG_ANCHOR_QUERY};
+use crate::log_pipeline::{
+    LogAvailablePointer, INSERT_LOG_SEGMENT_QUERY, UPSERT_LOG_ANCHOR_QUERY,
+};
 use crate::log_sink::{FlushedJobLogs, LogPersist};
 
 /// **The durable `log_segment` / `log_anchor` writer (CT-004f sub-step 4a).** Holds the OLTP pool +
@@ -70,6 +79,10 @@ impl DurableLogPersist {
             return Ok(());
         };
         let tenant_str = tenant.as_str().to_string();
+        // Owned copies for the emit-context INSIDE the closure (the `&tenant_str`/`&region` below are
+        // borrowed by `with_tenant_tx` for the GUC set, so the `move` closure cannot take them too).
+        let tenant_owned = tenant.clone();
+        let region_owned = region.clone();
         with_tenant_tx(&self.pool, &tenant_str, &region, move |conn| {
             Box::pin(async move {
                 for seg in &flushed.segments {
@@ -105,11 +118,67 @@ impl DurableLogPersist {
                         .await
                         .map_err(|e| PgError::Query(e.to_string()))?;
                 }
+                // CT-004f sub-step 4b — co-emit the coalesced `ci.log.available` pointers to the
+                // durable OUTBOX on the SAME tx as the index rows (atomic: both commit or both roll
+                // back; the relay publishes iff committed — `no-raw-publish` green). The event_id is
+                // DETERMINISTIC on the pointer identity, so a re-delivered `finish` derives the same
+                // id and `ON CONFLICT (event_id) DO NOTHING` absorbs it (double-emit 0 — parity with
+                // the index upserts). references-not-payloads: the pointer names byte ranges + the
+                // sealed-segment ref, never log bytes.
+                for ptr in &flushed.pointers {
+                    let envelope = ci_log_available_envelope(&tenant_owned, &region_owned, ptr);
+                    let aggregate = envelope.aggregate.0.clone();
+                    PgRelay::co_commit_in_tx(&mut *conn, &aggregate, &envelope)
+                        .await
+                        .map_err(|e| PgError::Query(e.to_string()))?;
+                }
                 Ok(())
             })
         })
         .await
     }
+}
+
+/// Assemble the `ci.log.available` [`EventEnvelope`] for one pointer, as the CI control-plane SERVICE
+/// principal (mirroring the CI producer emit-context convention — a `Service` principal, `schema_ver`
+/// 1, root causality). references-not-payloads (the draft carries the byte range + ref, never bytes).
+fn ci_log_available_envelope(
+    tenant: &TenantId,
+    region: &str,
+    ptr: &LogAvailablePointer,
+) -> EventEnvelope {
+    let draft = ptr.to_draft();
+    let ctx = EmitContext {
+        event_id: ci_log_event_id(&draft.aggregate, ptr.byte_start, ptr.byte_end),
+        tenant: tenant.clone(),
+        region: Region::new(region.to_string()),
+        actor: Actor(Principal::stub(
+            PrincipalId("ci-controlplane".into()),
+            PrincipalKind::Service,
+            tenant.clone(),
+        )),
+        schema_ver: 1,
+        // The CI producer convention (`ci_pipeline_driver::service_ctx_base`) stamps a fixed service
+        // timestamp; the log-availability fact's ordering is the per-aggregate `seq`, not the clock.
+        occurred_at: Timestamp("2026-07-17T00:00:00Z".into()),
+        recorded_at: Timestamp("2026-07-17T00:00:00Z".into()),
+        caused_by: None,
+    };
+    derive_envelope(draft, ctx, None)
+}
+
+/// The DETERMINISTIC `ci.log.available` event id — stable on `(aggregate, byte_start, byte_end)` so a
+/// re-delivered `finish` derives the SAME id and the outbox `ON CONFLICT (event_id)` dedups it (a
+/// fresh ULID would double-emit the notification). A fast FNV-1a idempotency key, not a security
+/// primitive (the same idiom as `cost_id_for` / `snapshot_event_id`).
+fn ci_log_event_id(aggregate: &AggregateKey, byte_start: i64, byte_end: i64) -> EventId {
+    let keyed = format!("{}@{byte_start}:{byte_end}", aggregate.0);
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    for b in keyed.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a prime
+    }
+    EventId(format!("cilog-{hash:016x}"))
 }
 
 impl LogPersist for DurableLogPersist {
