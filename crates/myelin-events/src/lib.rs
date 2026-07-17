@@ -329,6 +329,7 @@ pub mod check_seam;
 pub mod consumer;
 pub mod crosscell;
 pub mod crosscell_propagation;
+pub mod dead_letter;
 pub mod dedup;
 pub mod envelope;
 pub mod firehose;
@@ -401,6 +402,14 @@ pub use crosscell::{
 pub use crosscell_propagation::{
     pointer_for_propagation, propagated_carried_fields, CrossCellPropagator, CrossCellStream,
     PropagatedPointer,
+};
+/// The DURABLE consumer dead-letter set (CT-004d.2 chunk 6 / peer-review #7b) — mirrors the
+/// [`dedup`] `DurableDedup` seam so a dead-lettered event (esp. the H2 panic path) SURVIVES a
+/// restart. PII-safe (references-not-payloads: `event_id` + a bounded PII-free `reason`, never the
+/// envelope/payload). The PG backing is `myelin_storage::events_durable::DurableDeadLetterBacking`.
+pub use dead_letter::{
+    bounded_reason, DeadLetterRecord, DeadLetterSink, DurableDeadLetter,
+    CONSUMER_DEAD_LETTER_MIGRATION, MAX_REASON_LEN,
 };
 pub use dedup::{CoCommitError, CoCommitTx, DedupLedger, DurableDedup, CONSUMER_DEDUP_MIGRATION};
 /// The firehose resume-cursor subscription protocol (contract 3.5, the Bus-owned zero-loss-replay

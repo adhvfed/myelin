@@ -90,6 +90,7 @@
 //! registry installed the hook is the identity map (no evolution declared → every event is
 //! already current).
 
+use crate::dead_letter::{DeadLetterRecord, DeadLetterSink};
 use crate::{
     DedupLedger, EventEnvelope, EventHandler, HandleOutcome, HandlerTx, Reason, SubjectPattern,
 };
@@ -383,8 +384,11 @@ pub struct Consumer<H: EventHandler> {
     /// `num_pending` per subject (rule 7: consumer lag). A message that retries (not acked)
     /// counts toward lag; an acked/deduped/dead-lettered message does not.
     pending: Mutex<HashMap<String, u64>>,
-    /// Dead-lettered (poison) messages (rule 5), surfaced.
-    dead_letters: Mutex<Vec<DeadLetter>>,
+    /// Dead-lettered (poison) messages (rule 5), surfaced. **CT-004d.2 chunk 6 / #7b:** now a
+    /// [`DeadLetterSink`] (was a bare `Mutex<Vec<DeadLetter>>`) so the durable arm makes a
+    /// dead-lettered event — especially the H2 panic path — SURVIVE a restart. The in-memory arm is
+    /// the default (unchanged behavior); the durable arm is opt-in via [`Consumer::with_dead_letter_sink`].
+    dead_letters: DeadLetterSink,
     /// The per-tenant in-flight fairness cap (rule 6, EB-05). A tenant at its cap is throttled
     /// (deferred, not dropped) so one tenant's surge cannot starve another's events.
     per_tenant_cap: PerTenantInflight,
@@ -408,7 +412,7 @@ impl<H: EventHandler> Consumer<H> {
             dedup,
             upcaster: Box::new(Ok),
             pending: Mutex::new(HashMap::new()),
-            dead_letters: Mutex::new(Vec::new()),
+            dead_letters: DeadLetterSink::in_memory(),
             per_tenant_cap: PerTenantInflight::DEFAULT,
             tenant_inflight: Mutex::new(HashMap::new()),
         }
@@ -424,6 +428,17 @@ impl<H: EventHandler> Consumer<H> {
     /// The per-tenant in-flight fairness cap this consumer enforces (rule 6).
     pub fn per_tenant_inflight_cap(&self) -> PerTenantInflight {
         self.per_tenant_cap
+    }
+
+    /// **Inject a DURABLE dead-letter sink (CT-004d.2 chunk 6 / #7b).** By default the consumer's
+    /// dead-letter set is in-memory ([`DeadLetterSink::in_memory`]) — the unchanged behavior. The
+    /// events `serve()` composition root (`myelin_storage::events_serve::EventsRuntime::consumer`)
+    /// wires the PG-backed [`DeadLetterSink::durable`] here so a dead-lettered event — especially the
+    /// H2 panic path — SURVIVES a restart (it stays in the `consumer_dead_letter` table after the pump
+    /// acks it and the broker cursor advances). Mirrors how the durable [`DedupLedger`] is injected.
+    pub fn with_dead_letter_sink(mut self, sink: DeadLetterSink) -> Self {
+        self.dead_letters = sink;
+        self
     }
 
     /// The current in-flight (delivered-but-not-terminal, distinct-event) count for ONE tenant
@@ -481,12 +496,21 @@ impl<H: EventHandler> Consumer<H> {
         self.pending().get(subject).copied().unwrap_or(0)
     }
 
-    /// The dead-lettered (poison) messages so far (rule 5), surfaced.
+    /// The dead-lettered (poison) messages so far (rule 5), surfaced IN-PROCESS. On the in-memory
+    /// sink this is the full list; on the durable sink it is the fail-fallback list only (poison the
+    /// durable `record` could not persist) — the restart-surviving durable rows are read via
+    /// [`Consumer::durable_dead_letters`] (mirrors [`DedupLedger::len`] returning the in-process view
+    /// on the durable backend).
     pub fn dead_letters(&self) -> Vec<DeadLetter> {
-        self.dead_letters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.dead_letters.surfaced()
+    }
+
+    /// **The DURABLE dead-letter snapshot for ops (CT-004d.2 chunk 6 / #7b).** The PII-free
+    /// restart-surviving rows for THIS consumer (`event_id` + bounded `reason`, never the envelope).
+    /// Empty on the in-memory sink (there is no durable table). A dead-lettered event — especially the
+    /// H2 panic path — is still present here after a restart (the whole point of the durable sink).
+    pub fn durable_dead_letters(&self) -> Vec<DeadLetterRecord> {
+        self.dead_letters.durable_dead_letters(self.name())
     }
 
     /// **Deliver ONE message through the seven rules.** Applies, in order:
@@ -591,7 +615,13 @@ impl<H: EventHandler> Consumer<H> {
         // do NOT record a dedup tombstone (unlike the `NonRetryable` poison path): a panic is a BUG,
         // not poison — the event may carry a VALID effect that the buggy code failed to apply, so the
         // undeduped event stays replayable from the dead-letter set after the bug is fixed + redeployed
-        // (never a silent loss). A `Retry` was rejected here because a deterministic panic would
+        // (never a silent loss). **CT-004d.2 chunk 6 / #7b — this replayability is now DURABLE:** the
+        // `push_dead_letter` below writes through the [`DeadLetterSink`]; with a durable sink the poison
+        // persists to the `consumer_dead_letter` table on its OWN fresh pool connection (the co-commit
+        // tx here was just rolled back — it cannot be reused), so after the pump acks this (terminal)
+        // and the broker cursor advances, the record SURVIVES a restart (before #7b it lived only in a
+        // volatile `Vec` that vanished with the process — the "stays replayable" claim was self-
+        // defeating as shipped). A `Retry` was rejected here because a deterministic panic would
         // livelock the subject (panic-loop); a dead-letter quarantines the bug loudly and lets the
         // subject progress.
         let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -613,10 +643,24 @@ impl<H: EventHandler> Consumer<H> {
                     .map(|s| s.to_string())
                     .or_else(|| panic.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "<non-string panic payload>".to_string());
-                let reason = Reason(format!(
+                // #7b PII-SAFETY: the panic `detail` is developer-authored but can interpolate event
+                // content (e.g. `panic!("bad {field}", …)`), so it may carry inline PII. It goes to the
+                // EPHEMERAL loud log ONLY — NEVER into the durable `consumer_dead_letter.reason` (a
+                // crypto-shred/erasure-strict store that subject erasure does not reach). The persisted
+                // reason is a PII-FREE constant; the event_id (a ULID) + this constant are enough for
+                // ops to find the poison and correlate it with the logged detail.
+                eprintln!(
+                    "[consumer:{}] handler PANICKED for event {} — dead-lettered (no tombstone; effect \
+                     replayable): {detail}",
+                    self.name().0,
+                    event_id.0
+                );
+                let reason = Reason(
                     "handler PANICKED (a bug, dead-lettered without a dedup tombstone so the valid \
-                     effect stays replayable): {detail}"
-                ));
+                     effect stays replayable; panic detail in the loud log, kept OUT of the durable \
+                     DLQ to stay PII-safe)"
+                        .to_string(),
+                );
                 self.clear_pending(&msg.subject);
                 self.clear_tenant_inflight(&tenant, &event_id);
                 self.push_dead_letter(envelope, reason.clone());
@@ -692,11 +736,15 @@ impl<H: EventHandler> Consumer<H> {
             .collect()
     }
 
+    /// Record a poison through the dead-letter sink (rule 5). **CT-004d.2 chunk 6 / #7b:** on the
+    /// durable arm this persists a PII-free `(consumer, event_id, bounded_reason)` row on the sink's
+    /// OWN fresh pool connection so it survives a restart. This matters most on the H2 panic path,
+    /// whose co-commit tx was already ROLLED BACK — the durable backing must (and does) acquire a
+    /// fresh connection, never the rolled-back co-commit conn. Fail-loud on a DB error (fall back to
+    /// in-memory), never a silent drop.
     fn push_dead_letter(&self, envelope: EventEnvelope, reason: Reason) {
         self.dead_letters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(DeadLetter { envelope, reason });
+            .push(self.name(), DeadLetter { envelope, reason });
     }
 
     fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<String, u64>> {

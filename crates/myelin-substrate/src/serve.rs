@@ -693,6 +693,12 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
             "0001_consumer_dedup",
             myelin_events::CONSUMER_DEDUP_MIGRATION,
         ),
+        // CT-004d.2 chunk 6 / #7b: the durable consumer DEAD-LETTER set (foundation id 0002) so a
+        // dead-lettered event (esp. the H2 panic path) survives a restart.
+        Migration::plain(
+            "0002_consumer_dead_letter",
+            myelin_events::CONSUMER_DEAD_LETTER_MIGRATION,
+        ),
     ]);
     full_migrations.0.extend(migrations.0);
     runner.run(&full_migrations, &hot_tables)?;

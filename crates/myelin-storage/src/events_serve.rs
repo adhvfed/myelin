@@ -51,10 +51,13 @@ use myelin_events::consumer::{Consumer, ConsumerSpec, Delivered, Message, Subscr
 use myelin_events::nats::NatsJetStreamBus;
 use myelin_events::relay::{BusTransport, TransportError};
 use myelin_events::{
-    BusErasureLedger, DedupLedger, DurableBusErasure, DurableDedup, EventHandler, Region, TenantId,
+    BusErasureLedger, DeadLetterSink, DedupLedger, DurableBusErasure, DurableDeadLetter,
+    DurableDedup, EventHandler, Region, TenantId,
 };
 
-use crate::events_durable::{DurableBusErasureBacking, DurableDedupBacking};
+use crate::events_durable::{
+    DurableBusErasureBacking, DurableDeadLetterBacking, DurableDedupBacking,
+};
 use crate::pg::PgError;
 use crate::pgrelay::PgRelay;
 use crate::provider::SubstrateProvider;
@@ -107,6 +110,7 @@ pub struct EventsRuntime {
     relay: PgRelay,
     bus: NatsJetStreamBus,
     dedup_backing: DurableDedupBacking,
+    dead_letter_backing: DurableDeadLetterBacking,
     bus_erasure_backing: DurableBusErasureBacking,
 }
 
@@ -156,6 +160,7 @@ impl EventsRuntime {
         )?;
         let relay = PgRelay::new(pool.clone());
         let dedup_backing = DurableDedupBacking::new(pool.clone(), rt.clone());
+        let dead_letter_backing = DurableDeadLetterBacking::new(pool.clone(), rt.clone());
         let bus_erasure_backing = DurableBusErasureBacking::new(pool.clone(), rt);
         Ok(EventsRuntime {
             pool,
@@ -165,6 +170,7 @@ impl EventsRuntime {
             relay,
             bus,
             dedup_backing,
+            dead_letter_backing,
             bus_erasure_backing,
         })
     }
@@ -185,6 +191,19 @@ impl EventsRuntime {
     /// a restart) share the dedup state (it is in PG, not a per-process `HashSet`).
     pub fn dedup_ledger(&self) -> DedupLedger {
         DedupLedger::durable(Arc::new(self.dedup_backing.clone()) as Arc<dyn DurableDedup>)
+    }
+
+    /// **The DURABLE consumer dead-letter sink (CT-004d.2 chunk 6 / #7b)** — bound to the PG
+    /// `consumer_dead_letter` table so a dead-lettered event (especially the H2 panic path) SURVIVES
+    /// a process restart. The pump acks a dead-letter (terminal) so the broker cursor advances; with
+    /// the in-memory sink that record vanished on restart (a debt the #7 H2 fix introduced) — the
+    /// durable sink persists the PII-free `(consumer, event_id, reason)` row so the poison stays
+    /// replayable after the bug is fixed + redeployed. Injected into every [`Consumer`] this runtime
+    /// builds ([`EventsRuntime::consumer`]).
+    pub fn dead_letter_sink(&self) -> DeadLetterSink {
+        DeadLetterSink::durable(
+            Arc::new(self.dead_letter_backing.clone()) as Arc<dyn DurableDeadLetter>
+        )
     }
 
     /// **The DURABLE Bus erasure ledger (contract 10.8, W6c-events)** — bound to the PG
@@ -210,7 +229,10 @@ impl EventsRuntime {
         spec: ConsumerSpec,
         handler: H,
     ) -> Result<Consumer<H>, SubscribeError> {
+        // Wire the DURABLE dead-letter sink (CT-004d.2 chunk 6 / #7b) alongside the durable dedup
+        // ledger so a service that opts into `serve()` gets a restart-surviving consumer DLQ.
         myelin_events::consume(spec, handler, self.dedup_ledger())
+            .map(|c| c.with_dead_letter_sink(self.dead_letter_sink()))
     }
 
     /// **The MR-022 tenant-scoped-transaction convention bound to this runtime's pool.** A caller
