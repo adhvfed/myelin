@@ -165,6 +165,7 @@ pub mod floor_followons;
 pub mod holder;
 pub mod live_tail;
 pub mod log_pipeline;
+pub mod log_sink;
 pub mod metering;
 pub mod migrations;
 pub mod permanent_gates;
@@ -346,6 +347,11 @@ pub use log_pipeline::{
     LogPipeline, LogSegmentRow, LogWritePin, SealThreshold, SecretRedactor, CI_LOG_STREAM,
     INSERT_LOG_SEGMENT_QUERY, REDACTION_MARKER, UPSERT_LOG_ANCHOR_QUERY,
 };
+
+// CT-004f (CI-P20): the cycle-safe binding of the runner's `FirehoseSink` seam to the real
+// `LogPipeline` — `LogPipelineSink` (per-`(tenant, run, job)` pipeline, boundary-redaction-honest)
+// + the `LogPersist` durable-write seam the sealed index/pointers flush through (sub-step 4 fills it).
+pub use log_sink::{FlushedJobLogs, LogPersist, LogPipelineSink, SINGLE_STEP_ID};
 
 // CI-P21 (P-364): the resume-cursor live-tail VIEWER + the `details_ref` jump-to-failure resolution
 // (CI-D11). The `LiveTail` viewer composes the frozen firehose `subscribe`/`resume` on the bounded
