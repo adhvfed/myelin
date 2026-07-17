@@ -39,7 +39,7 @@
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
-    ci_durable_migrations, CiCostEventStore, CostEventRow, CostKind, Meter,
+    ci_durable_migrations, CiCostEventStore, CiCostStoreError, CostEventRow, CostKind, Meter,
 };
 use myelin_flow::MinorUnits;
 use myelin_tenancy::TenantId;
@@ -180,6 +180,32 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
         redelivered, 0,
         "a doubly-delivered settle records ONCE (double-effect = 0 — the bookends do not double-bill)"
     );
+
+    // ── VERIFY-ON-CONFLICT (#13): a re-delivery of the SAME unit (same cost_id) with a DIFFERENT
+    //    amount is REFUSED LOUDLY, not silently dropped. The idempotency key is (tenant, run, job,
+    //    meter) — not the amount — so `ON CONFLICT DO NOTHING` alone would keep the first amount and
+    //    hide the divergence in the billing table. ──
+    let mut divergent = settle_rows(&tenant, run, job);
+    divergent[0].amount = 999; // same (run, job, CpuSeconds) → same cost_id; amount 999 ≠ recorded 120
+    let err = store1
+        .settle(region, &divergent)
+        .await
+        .expect_err("a divergent re-delivered settle must be refused, never silently dropped");
+    match err {
+        CiCostStoreError::AmountDivergence { column, recorded, incoming } => {
+            assert_eq!(column, "amount");
+            assert_eq!(recorded, 120, "the FIRST settle's amount is preserved (never overwritten)");
+            assert_eq!(incoming, 999, "the divergent incoming amount is surfaced");
+        }
+        other => panic!("expected AmountDivergence, got {other}"),
+    }
+    // The refusal did NOT mutate the recorded row: the read-back is still the original amount.
+    let after = store1
+        .cost_events_for_run(&tenant, &run.to_string())
+        .await
+        .expect("read back after the refused divergent settle");
+    let cpu = after.iter().find(|r| r.meter == Meter::CpuSeconds).expect("the CpuSeconds unit");
+    assert_eq!(cpu.amount, 120, "the divergent settle was refused — the recorded amount is unchanged");
 
     // ── UNCOMMITTED settle THROUGH the store: run on a tx, then DROP it without commit. ──
     {

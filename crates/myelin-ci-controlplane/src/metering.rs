@@ -262,6 +262,18 @@ FROM ci_cost_event
 WHERE tenant_id = $1 AND run_id = $2
 ORDER BY job_id, meter";
 
+/// **The VERIFY-ON-CONFLICT read-back for one metered unit (peer-review #13).** When
+/// [`INSERT_COST_EVENT_QUERY`]'s `ON CONFLICT (tenant_id, cost_id) DO NOTHING` absorbs a re-delivery
+/// (0 rows affected), the settle path reads the ALREADY-RECORDED amounts back with this and compares
+/// them to the incoming unit. Since the idempotency key `cost_id` is derived from `(tenant, run_id,
+/// job_id, meter)` — NOT the amount — a re-delivery whose amounts DIFFER is a metering anomaly; without
+/// this check `DO NOTHING` would silently keep the first amount and drop the divergence (this keys the
+/// billing table). Bind: `$1 tenant_id`, `$2 cost_id`.
+pub const SELECT_COST_EVENT_BY_ID_QUERY: &str = "\
+SELECT amount, wholesale_minor_units, markup_minor_units
+FROM ci_cost_event
+WHERE tenant_id = $1 AND cost_id = $2";
+
 /// **The resource-second → markup SEAM (the arch 06 R-2 named follow-on, owned by Commercial).** A
 /// pure function from a sampled `(meter, amount, wholesale)` to the markup minor-units recorded in the
 /// distinct `markup_minor_units` column. CI carries the SEAM (so the meter is testable end-to-end
