@@ -71,7 +71,7 @@ export default function RepoPrListScreen() {
       </div>
 
       <ErrorBoundary
-        fallback={(err) => (
+        fallback={() => (
           // System-blaming, scoped to the list, filters kept — never a raw err.message (ux-git #7).
           <div role="alert" data-testid="prs-error" style={errBox}>
             <Icon name="check-fail" title="Error" />
@@ -83,7 +83,6 @@ export default function RepoPrListScreen() {
                   <Icon name="cycle" /> Retry
                 </button>
               </div>
-              <span style={{ display: "none" }}>{String(err?.message ?? "")}</span>
             </div>
           </div>
         )}
