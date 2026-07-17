@@ -75,10 +75,10 @@ pub mod resolve;
 pub use config::{parse_ci_config, CiConfigError, ConfigFormat};
 
 pub use consumer::{
-    build_trigger_consumer, plan_dispatch, resolve_ci_config, ArmedRun, CiTriggerHandler,
-    DispatchOutcome, DurableGitConfigReader, GitConfigReader, GitReadError, OutboxReserveStore,
-    ReserveError, ReserveFacts, ReserveStore, SkipReason, ci_trigger_subjects,
-    CI_TRIGGER_SUBJECT_STRS,
+    build_trigger_consumer, ci_run_insert_from_armed, plan_dispatch, resolve_ci_config, ArmedRun,
+    CiTriggerHandler, CoCommitReserveStore, DispatchOutcome, DurableGitConfigReader,
+    GitConfigReader, GitReadError, OutboxReserveStore, ReserveError, ReserveFacts, ReserveStore,
+    SkipReason, ci_trigger_subjects, CI_TRIGGER_SUBJECT_STRS,
 };
 
 pub use dispatch::{
