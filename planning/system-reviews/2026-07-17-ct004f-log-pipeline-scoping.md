@@ -1,5 +1,8 @@
 # CT-004f (CI-P20) — CI log pipeline live-binding scoping
 
+> **STATUS: COMPLETE (2026-07-17).** seam (`cf22fee`) → adapter (`b1e165c`) → row persist (`dbaa092`) → pointer persist (`6bab572`) → adversarial-verify + harden (`58a89d0`) → integration-suite repair (`1f28d14`) → boundary-redaction seam (`cc568e6`, codex-reviewed `4a58c44`) → live bind (`97767bf`) → **end-to-end runsc capstone (`bb4f669`)**. A real gVisor guest's stdout now seals to the live S3 CAS, indexes in `log_segment`/`log_anchor` + `ci.log.available` outbox, and is readable back from the CAS — proven on live runsc+PG+S3. Readable CI logs are LIVE. Follow-on (NOT CT-004f): CI-1 secret injection must co-populate the `RedactionPlan` (see sub-step 1); the production streaming masker; the git-wire token ambient-secret hardening.
+
+
 _2026-07-17 — autonomous scoping pass. The contained peer-review burndown is complete; this de-risks the next CI phase so it can begin with a clear plan (or be re-prioritized by the founder against CT-005)._
 
 ## State: BUILT vs the live-binding gap
