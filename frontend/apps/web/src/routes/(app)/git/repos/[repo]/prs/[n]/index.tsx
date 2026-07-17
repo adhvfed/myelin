@@ -28,6 +28,7 @@ import {
   Chip,
   PaneSection,
   ConfirmDialog,
+  Dialog,
   useToast,
   type IconName,
 } from "@myelin/design-system";
@@ -469,9 +470,11 @@ function ReviewsSection(props: {
               </button>
               <button type="button" onClick={() => void discard()} class="btn-secondary" style={barBtn}>Discard</button>
             </div>
-            {/* The verdict popover (radiogroup-style; Submit). */}
-            <Show when={verdictOpen()}>
-              <div role="dialog" aria-label="Submit review" data-testid="verdict-panel" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)", border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)", padding: "var(--space-2)" }}>
+            {/* The verdict submission (#21d: the sanctioned DS Dialog — focus move/trap, Esc + backdrop
+                dismiss, return-focus, scroll-lock, APG role=dialog+aria-modal — replaces the former
+                ad-hoc role="dialog" div that had none of those). */}
+            <Dialog open={verdictOpen()} onClose={() => setVerdictOpen(false)} title="Submit review" size="sm">
+              <div data-testid="verdict-panel" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
                 <textarea onInput={(e) => setSummaryText(e.currentTarget.value)} aria-label="Review summary" rows={2} placeholder="Summary (optional)…" style={textareaStyle} />
                 <div style={{ display: "flex", gap: "var(--space-2)", "flex-wrap": "wrap" }}>
                   <button type="button" data-testid="verdict-approve" onClick={() => void submit("approved")} class="btn-secondary" style={{ ...barBtn, color: "var(--success)" }}><Icon name="approve" /> Approve</button>
@@ -479,7 +482,7 @@ function ReviewsSection(props: {
                   <button type="button" data-testid="verdict-comment" onClick={() => void submit("commented")} class="btn-secondary" style={barBtn}><Icon name="message" /> Comment</button>
                 </div>
               </div>
-            </Show>
+            </Dialog>
           </div>
       </Show>
     </section>
