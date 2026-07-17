@@ -42,8 +42,8 @@ use std::sync::Arc;
 
 use myelin_ci_controlplane::{ci_durable_migrations, ci_run_store_factory};
 use myelin_ci_dispatch::{
-    plan_dispatch, ArmedRun, CiTriggerHandler, CoCommitReserveStore, DispatchOutcome,
-    GitConfigReader, GitReadError, OutboxReserveStore, ReserveError, ReserveStore,
+    build_dispatch_consumers, plan_dispatch, ArmedRun, CiTriggerHandler, CoCommitReserveStore,
+    DispatchOutcome, GitConfigReader, GitReadError, OutboxReserveStore, ReserveError, ReserveStore,
 };
 use myelin_events::consumer::{Consumer, Delivered, Message, Subscription};
 use myelin_events::{
@@ -642,4 +642,60 @@ async fn chunk4_crash_window_row_and_mark_rollback_events_absorb_then_reconverge
 
     p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str()).await.ok();
     println!("[chunk4/2] PASS honest split under crash: ROW+mark roll back together (0 ci_run), events lead durable (absorb), redelivery converges to exactly once (1 run, 3 events).");
+}
+
+// =================================================================================================
+// (6) FINDING #6 — the PRODUCTION `main.rs` REGISTRATION path. `main.rs` used to ship
+//     `let consumers = Vec::new();` (NO consumer registered in prod). It now calls
+//     `build_dispatch_consumers`, which constructs the SAME four production backings proof (4) uses
+//     (the `CoCommitReserveStore` durable `ci_run` writer + the real `S3BlobStore` CAS +
+//     `DurableGitConfigReader` over the on-disk git-root + the durable `DedupLedger`) and returns ONE
+//     bound `ConsumerReg`. This asserts the registration is NON-EMPTY over real durable backings —
+//     the finding-#6 regression guard. The consumer's end-to-end BEHAVIOUR is proven by proofs (4)/(5)
+//     above; here we only prove `main.rs`'s wiring path yields a registered consumer, not the shell.
+// =================================================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn finding6_build_dispatch_consumers_registers_the_live_trigger_consumer() {
+    let schema = schema_name(uniq());
+    let p = setup_schema(&schema, OUTBOX_MIGRATION).await;
+    let rt = tokio::runtime::Handle::current();
+
+    // The real durable outbox over the schema pool (events-absorb side of the reserve store).
+    let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(p.clone(), rt.clone())));
+    // The durable exactly-once ledger over the schema pool.
+    let dedup = {
+        let backing = DurableDedupBacking::new(p.clone(), rt.clone());
+        DedupLedger::durable(Arc::new(backing) as Arc<dyn DurableDedup>)
+    };
+    // A dev-shaped S3Config — `S3BlobStore::connect` builds the client WITHOUT any network I/O, so no
+    // live object store is needed to prove registration (the CAS round-trip is proof (4)'s job).
+    let s3 = myelin_config::S3Config {
+        endpoint: "http://127.0.0.1:9000".into(),
+        region: "us-east-1".into(),
+        access_key: "test".into(),
+        secret_key: "test".into(),
+        bucket: "ci".into(),
+        force_path_style: true,
+    };
+    let git_root = std::env::temp_dir().join(format!("myelin-ci-finding6-{schema}"));
+
+    let consumers = build_dispatch_consumers(
+        &git_root,
+        &s3,
+        ci_run_store_factory(p.clone()),
+        outbox,
+        dedup,
+        Arc::new(UlidMinter::new()),
+        rt.clone(),
+    )
+    .expect("build_dispatch_consumers registers the trigger consumer");
+
+    assert_eq!(
+        consumers.len(),
+        1,
+        "finding #6: production main.rs must register exactly ONE ci-dispatch.trigger consumer (was Vec::new())"
+    );
+
+    p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str()).await.ok();
+    println!("[finding6] PASS: build_dispatch_consumers registers 1 live trigger consumer over real durable backings (no more Vec::new() shell).");
 }

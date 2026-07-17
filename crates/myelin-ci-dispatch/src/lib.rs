@@ -103,6 +103,50 @@ pub use migrations::{dispatch_migrations, CONSUMER_DEDUP_TABLE, CREATE_CONSUMER_
 /// `ci-dispatch` binary (`src/main.rs`) and the `AppSpec` both read this.
 pub const SERVICE_NAME: &str = "ci-dispatch";
 
+/// **Finding #6 — construct the LIVE `ci-dispatch.trigger` consumer set for production `main.rs`.**
+/// Builds the four backings the trigger consumer needs and returns ONE bound [`ConsumerReg`] —
+/// replacing the former `main.rs` `Vec::new()` shell that registered NO consumer in production.
+/// Split out of `main()` so the registration is unit-reachable (a `main()` body is not testable).
+///
+/// The two `sqlx`-touching backings ([`myelin_ci_controlplane::CiRunStore`] and the durable dedup
+/// ledger) are constructed by the CALLER from the provider pool and passed in opaque, so THIS
+/// function names no `sqlx` and compiles in the DEFAULT (DB-free) build — the same inference idiom
+/// `main.rs` already uses to hand `provider.db_pool()` to `PgOutboxBacking`.
+///
+/// Backings:
+/// - **reserve** = [`CoCommitReserveStore`] (CT-004d.2 chunk 4): the run-of-record `ci_run` ROW
+///   co-commits ATOMICALLY with the dedup mark (`CiRunStore::co_commit_insert` on the `HandlerTx`),
+///   the co-emitted events ride the durable outbox in absorb mode — the honest #7 H1 split, proven
+///   on live PG in `tests/integration_ci_ct004b_trigger_consumer.rs` proofs (4)/(5). NOT the
+///   events-only [`OutboxReserveStore`] (which does not write the row).
+/// - **CAS** = the real [`myelin_storage::s3blob::S3BlobStore`] (RustFS/Scaleway). `aws-sdk-s3` is a
+///   NON-OPTIONAL dep via `myelin-storage`, so the CAS store is default-reachable — the former
+///   "integration-gated CAS" note was STALE (MR-009b Wave 1 made it a normal dep;
+///   `cargo tree -p myelin-ci-dispatch -i aws-sdk-s3` shows it in the default graph).
+/// - **git-read** = [`DurableGitConfigReader`] over `DurableGitStore::rooted(git_root)` — reads the
+///   pushed repo's `.myelin/ci.*` from the SAME on-disk git-root the edge writes (shared-volume
+///   deploy; `git_root` is the `MYELIN_GIT_ROOT` the caller resolves, mirroring `myelin-edge` main).
+/// - **dedup** = the caller's durable [`DedupLedger`] (the exactly-once effect anchor).
+pub fn build_dispatch_consumers(
+    git_root: impl Into<std::path::PathBuf>,
+    s3: &myelin_config::S3Config,
+    ci_run: myelin_ci_controlplane::CiRunStore,
+    outbox: myelin_events::OutboxStore,
+    dedup: myelin_events::DedupLedger,
+    minter: std::sync::Arc<dyn myelin_events::IdMinter>,
+    rt: tokio::runtime::Handle,
+) -> Result<Vec<ConsumerReg>, myelin_events::SubscribeError> {
+    use std::sync::Arc;
+    let reader: Arc<dyn consumer::GitConfigReader> = Arc::new(consumer::DurableGitConfigReader::new(
+        myelin_git::durable::DurableGitStore::rooted(git_root),
+    ));
+    let blobs: Arc<dyn myelin_storage::BlobStore + Send + Sync> =
+        Arc::new(myelin_storage::s3blob::S3BlobStore::connect(s3, rt.clone()));
+    let reserve: Arc<dyn consumer::ReserveStore> =
+        Arc::new(consumer::CoCommitReserveStore::new(ci_run, outbox, minter, rt));
+    Ok(vec![build_trigger_consumer(reader, blobs, reserve, dedup)?])
+}
+
 /// The critical-dependency set the metrics-health readiness probe reads (§4.3, SUB-D9). The OLTP
 /// store is implicitly critical (the harness adds it). Trigger & Dispatch declares:
 /// - `broker` — Trigger & Dispatch is "close to the bus" (arch 00 §4): it consumes the triggering
