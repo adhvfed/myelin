@@ -389,22 +389,41 @@ impl LeaseStore for JobLeaseStore {
 // The firehose STUB seam — the full log pipeline is CI-P20 (named floor).
 // =================================================================================================
 
-/// **The firehose frame sink the runner streams to (STUBBED — the full pipeline is CI-P20).** The
-/// runner ships each redacted log line as a firehose frame keyed by `(run, job, step)` (arch 02
-/// §7.1); the live tail rides the resume-cursor protocol and sealed segments flush to the T3 log
-/// tier with the `(job, step, byte-range)` index — ALL of that is **CI-P20**. Here the sink only
-/// COUNTS frames so the runner's "I streamed N frames, here is the `ci.log.available` pointer" path
-/// is exercised end to end; the production sink (the firehose transport) is wired at CI-P20.
+/// **The firehose frame sink the runner streams to (the CI-P20 live-log seam).** The runner ships
+/// each captured stdout/stderr chunk as a frame keyed by `(run, job)` within a `tenant` (arch 02
+/// §7.1), then calls [`finish`](FirehoseSink::finish) once the job's output is complete so the sink
+/// can seal + index + emit the `ci.log.available` pointer. The live tail rides the resume-cursor
+/// protocol and sealed segments flush to the T2 log tier with the `(job, step, byte-range)` index.
+///
+/// **Cycle-safe seam (CT-004f F1/F2):** this trait lives in `ci-sandbox` (the LOWER crate — the
+/// runner cannot depend on `ci-controlplane`'s `LogPipeline`). The real
+/// `LogPipelineSink` in `ci-controlplane` (the HIGHER crate, which CAN name both) implements this
+/// and drives the pipeline. `tenant` is threaded per frame because a runner is MULTI-TENANT (its
+/// claim has no tenant filter), so the shared sink opens a per-`(tenant, run, job)` pipeline lazily;
+/// `region` is NOT on the seam (a runner serves ONE region — the sink holds it at construction).
+///
+/// **Redaction is NOT this seam's job (CT-004f F3):** the frames the runner ships MUST already be
+/// redacted at the sandbox BOUNDARY (where the broker resolved the plaintext) — the least-privilege
+/// runner holds only opaque `SecretRef`s, so it cannot mask here. The pipeline's redactor is empty
+/// defence-in-depth. See `planning/system-reviews/2026-07-17-ct004f-log-pipeline-scoping.md`.
 pub trait FirehoseSink {
-    /// Ship one firehose frame for `(run_id, job_id)`. The STUB counts; CI-P20 publishes.
-    fn ship_frame(&self, run_id: &str, job_id: &str, frame: &[u8]);
+    /// Ship one firehose frame (a captured stdout/stderr chunk) for `(run_id, job_id)` within
+    /// `tenant`. The STUB counts; the real sink appends to the open segment + publishes the live tail.
+    fn ship_frame(&self, run_id: &str, job_id: &str, tenant: &TenantId, frame: &[u8]);
+    /// The job's output is complete — seal the open segment, flush the `(job, step, byte-range)`
+    /// index, and emit the coalesced `ci.log.available` pointer. The STUB is a no-op; the real sink
+    /// drives `LogPipeline::flush_job` + drains pointers to the outbox. Idempotent (a re-delivered
+    /// terminal report calls this again → no double seal).
+    fn finish(&self, run_id: &str, job_id: &str, tenant: &TenantId);
 }
 
-/// A counting [`FirehoseSink`] stub — the CI-P20 floor. Counts frames shipped so a test can assert
-/// the runner streamed; the real firehose transport replaces it at CI-P20 with NO runner change.
+/// A counting [`FirehoseSink`] stub — the test floor. Counts frames shipped so a test can assert the
+/// runner streamed; the real firehose transport ([`LogPipelineSink`](../../myelin_ci_controlplane))
+/// replaces it with NO runner change. `finish` is a no-op here (nothing to seal in a counter).
 #[derive(Clone, Default)]
 pub struct CountingFirehose {
     count: Arc<Mutex<u64>>,
+    finished: Arc<Mutex<u64>>,
 }
 
 impl CountingFirehose {
@@ -416,11 +435,18 @@ impl CountingFirehose {
     pub fn frames_shipped(&self) -> u64 {
         *self.count.lock().unwrap_or_else(|e| e.into_inner())
     }
+    /// The number of `finish` calls (the terminal-flush observable — one per completed job).
+    pub fn jobs_finished(&self) -> u64 {
+        *self.finished.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 impl FirehoseSink for CountingFirehose {
-    fn ship_frame(&self, _run_id: &str, _job_id: &str, _frame: &[u8]) {
+    fn ship_frame(&self, _run_id: &str, _job_id: &str, _tenant: &TenantId, _frame: &[u8]) {
         *self.count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    }
+    fn finish(&self, _run_id: &str, _job_id: &str, _tenant: &TenantId) {
+        *self.finished.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     }
 }
 
@@ -708,12 +734,17 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
         // a frame per non-empty stream; the full pipeline (byte-range index, resume cursor) is CI-P20.
         if !result.stdout.is_empty() {
             self.firehose
-                .ship_frame(&job.run_id, &job.job_id, &result.stdout);
+                .ship_frame(&job.run_id, &job.job_id, &job.tenant, &result.stdout);
         }
         if !result.stderr.is_empty() {
             self.firehose
-                .ship_frame(&job.run_id, &job.job_id, &result.stderr);
+                .ship_frame(&job.run_id, &job.job_id, &job.tenant, &result.stderr);
         }
+        // The job's output is complete — seal the open segment, flush the (job, step, byte-range)
+        // index, and emit the coalesced `ci.log.available` pointer (the real sink; a no-op in the
+        // counting stub). Called BEFORE the terminal report so the pointer the report references is
+        // durably backed. Idempotent — a re-delivered report path does not re-seal.
+        self.firehose.finish(&job.run_id, &job.job_id, &job.tenant);
         // Re-heartbeat (a long job renews its lease so it does not lapse mid-run).
         self.leases.heartbeat(
             &self.worker_id,
