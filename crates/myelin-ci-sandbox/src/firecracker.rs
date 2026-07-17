@@ -38,6 +38,7 @@
 use crate::hardening::{
     enforce_egress, EgressEnforceError, EgressEnforcer, EnforcedEgress, HardeningProfile,
 };
+use crate::redaction::RedactionPlan;
 use crate::{
     drain_capped, JobSpec, ResourceUsage, RunnerHooks, SandboxBackend, SandboxHandle,
     SandboxLaunch, SandboxResult, SANDBOX_CAPTURE_BOUND,
@@ -542,7 +543,7 @@ fn run_production_guest(spec: &JobSpec, profile: &HardeningProfile) -> Result<Gu
     // The script drive has been fully read by the guest; remove it now (the guest is gone).
     let _ = std::fs::remove_file(&script_drive);
 
-    let result = build_result_from_console(&outcome, &nonce, &cfg);
+    let result = build_result_from_console(&outcome, &nonce, &cfg, &RedactionPlan::for_job(spec));
     Ok(GuestRun {
         child: Box::new(child),
         cfg_path,
@@ -892,9 +893,27 @@ pub fn boot_and_capture(cfg_path: &Path) -> Result<(i32, String), String> {
 /// markers, HEAD-bounded to [`SANDBOX_CAPTURE_BOUND`] bytes EACH. A timeout / boot failure (markers
 /// absent) yields `exit_code = None` (surfaced honestly — never fabricated as 0). Usage is the REAL
 /// measured figure: host CPU-seconds from `/proc` (or a wall-clock ceil fallback) + mem-byte-seconds.
-fn build_result_from_console(o: &CaptureOutcome, nonce: &str, cfg: &FcMachineConfig) -> SandboxResult {
-    let stdout = capture_stream(&o.console, MARK_STDOUT_BEGIN, MARK_STDOUT_END, nonce);
-    let stderr = capture_stream(&o.console, MARK_STDERR_BEGIN, MARK_STDERR_END, nonce);
+fn build_result_from_console(
+    o: &CaptureOutcome,
+    nonce: &str,
+    cfg: &FcMachineConfig,
+    redaction: &RedactionPlan,
+) -> SandboxResult {
+    // BOUNDARY REDACTION (CT-004f sub-step 1): mask the job's CI-managed secret needles in the captured
+    // console streams before they populate `SandboxResult` (a required argument — no capture path can
+    // forward un-redacted bytes; empty today, populated by CI-1 injection — see `crate::redaction`).
+    let stdout = redaction.redact(&capture_stream(
+        &o.console,
+        MARK_STDOUT_BEGIN,
+        MARK_STDOUT_END,
+        nonce,
+    ));
+    let stderr = redaction.redact(&capture_stream(
+        &o.console,
+        MARK_STDERR_BEGIN,
+        MARK_STDERR_END,
+        nonce,
+    ));
     // A timed-out guest was killed mid-flight ⇒ no trustworthy exit code (do NOT fabricate one).
     let exit_code = if o.timed_out {
         None
@@ -1560,7 +1579,8 @@ mod tests {
         let s = spec(vec![]);
         let profile = HardeningProfile::derive(&s);
         let cfg = FcMachineConfig::from_spec(&s, &profile, false);
-        let res = build_result_from_console(&o, "n", &cfg);
+        let res =
+            build_result_from_console(&o, "n", &cfg, &crate::redaction::RedactionPlan::none());
         assert_eq!(res.exit_code, None, "a killed guest has no trustworthy code");
         assert!(res.timed_out);
         assert!(!res.passed());

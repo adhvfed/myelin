@@ -65,6 +65,7 @@ pub mod firecracker;
 pub mod gvisor;
 pub mod hardening;
 pub mod notif_rules;
+pub mod redaction;
 pub mod replay;
 pub mod runner;
 pub mod self_hosted;

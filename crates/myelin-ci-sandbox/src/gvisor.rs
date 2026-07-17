@@ -34,6 +34,7 @@
 //! exclusion of this one file (registered in `lint-gate` + `tests/workspace_clean.rs`).
 
 use crate::hardening::HardeningProfile;
+use crate::redaction::RedactionPlan;
 use crate::{
     drain_capped, EgressPolicy, HookError, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
     ResourceLimits, ResourceUsage, RunTokenRef, RunnerHooks, SandboxBackend, SandboxHandle,
@@ -627,7 +628,7 @@ fn run_production_container(spec: &JobSpec, cfg: &OciConfig) -> Result<Container
     // usually self-deletes on a clean exit, but the timeout path leaves it for us to reap).
     delete_container(&bin, &container_id);
 
-    let result = build_result(spec, &outcome);
+    let result = build_result(spec, &outcome, &RedactionPlan::for_job(spec));
     Ok(ContainerRun {
         child: Box::new(SpawnedRunsc { bin, container_id }),
         bundle_dir,
@@ -937,14 +938,21 @@ fn drain_to_temp_file<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
 /// bound the Firecracker backend uses (shared `lib.rs` const). Usage is the REAL measured figure: host
 /// CPU-seconds of the `runsc` process (or a wall-clock ceiling fallback so a real run never
 /// under-meters to 0) + mem-byte-seconds from the job's mem ceiling × wall-seconds.
-fn build_result(spec: &JobSpec, o: &RunscOutcome) -> SandboxResult {
+fn build_result(spec: &JobSpec, o: &RunscOutcome, redaction: &RedactionPlan) -> SandboxResult {
+    // BOUNDARY REDACTION (CT-004f sub-step 1): mask the job's CI-managed secret needles in the captured
+    // streams HERE — the last step before the bytes populate `SandboxResult` and cross back toward the
+    // durable log pipeline — so no injected secret is sealed into the content-addressed log store. The
+    // plan is EMPTY today (nothing injects secrets), so this is a no-op; it is a REQUIRED argument so no
+    // capture path can forward un-redacted bytes, and CI-1 secret injection must populate it (see
+    // `crate::redaction`). Redaction runs on the already-per-stream-bounded bytes.
+    //
     // The drain threads ALREADY applied the correct per-stream bound ([`run_and_capture`]): stdout is
     // bounded by its [`StdoutMode`] (256 KiB head for CI/agent; the generous git-wire cap, disk-staged),
     // stderr by [`SANDBOX_CAPTURE_BOUND`]. Re-truncating stdout to 256 KiB HERE would corrupt a real-size
     // wire packfile (CT-006c FU-1 — the original silent-truncation defect), so the already-bounded bytes
     // pass through unchanged. stderr is belt-and-braces clamped (it is already ≤ the bound).
-    let stdout = o.stdout.clone();
-    let mut stderr = o.stderr.clone();
+    let stdout = redaction.redact(&o.stdout);
+    let mut stderr = redaction.redact(&o.stderr);
     if stderr.len() > SANDBOX_CAPTURE_BOUND {
         stderr.truncate(SANDBOX_CAPTURE_BOUND);
     }
@@ -1747,7 +1755,13 @@ fn run_git_wire_container(
     delete_container(&bin, &container_id);
 
     let stdout_truncated = outcome.stdout_truncated;
-    let result = build_result(job, &outcome);
+    // The git-wire path's stdout is the git smart-transport packfile/protocol stream (StreamToFile),
+    // NOT job LOG output — it never reaches the durable log pipeline, and masking arbitrary bytes in a
+    // binary packfile would corrupt it. So this path NEVER redacts (an explicit `none()`, not
+    // `for_job`) — a deliberate distinction that matters the day CI-1 injection makes `for_job`
+    // non-empty. Boundary redaction is a LOG-path concern (the CappedHead capture in
+    // `run_production_container`), not a transport-path concern.
+    let result = build_result(job, &outcome, &RedactionPlan::none());
     Ok((
         ContainerRun {
             child: Box::new(SpawnedRunsc { bin, container_id }),
@@ -1812,6 +1826,42 @@ mod tests {
             attribute: Box::new(|_t| Ok(())),
             isolation_floor: Box::new(|_s| Ok(())),
         }
+    }
+
+    fn outcome(stdout: &[u8], stderr: &[u8]) -> RunscOutcome {
+        RunscOutcome {
+            exit: Some(0),
+            timed_out: false,
+            stdout: stdout.to_vec(),
+            stdout_truncated: false,
+            stderr: stderr.to_vec(),
+            wall: Duration::from_secs(1),
+            cpu_seconds: Some(1),
+        }
+    }
+
+    // CT-004f sub-step 1: `build_result` APPLIES the redaction plan to both captured streams — the
+    // boundary seam is wired, not just the `RedactionPlan` unit. A populated plan (the shape CI-1
+    // injection will pass) masks the needle before it reaches `SandboxResult`.
+    #[test]
+    fn build_result_masks_needles_in_both_streams() {
+        let s = spec(vec![]);
+        let plan = RedactionPlan::for_needles([b"AKIAsecret".to_vec()]);
+        let o = outcome(b"deploying with AKIAsecret now", b"error: AKIAsecret invalid");
+        let res = build_result(&s, &o, &plan);
+        assert_eq!(res.stdout, b"deploying with *** now".to_vec());
+        assert_eq!(res.stderr, b"error: *** invalid".to_vec());
+    }
+
+    // The empty plan (the ONLY state reachable today — nothing injects secrets) is a pass-through:
+    // captured output is byte-unchanged.
+    #[test]
+    fn build_result_empty_plan_is_byte_identity() {
+        let s = spec(vec![]);
+        let o = outcome(b"ordinary build log line", b"warning: deprecated");
+        let res = build_result(&s, &o, &RedactionPlan::none());
+        assert_eq!(res.stdout, b"ordinary build log line".to_vec());
+        assert_eq!(res.stderr, b"warning: deprecated".to_vec());
     }
 
     struct FakeRunsc;
