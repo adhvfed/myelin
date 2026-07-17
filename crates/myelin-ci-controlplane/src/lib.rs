@@ -166,6 +166,7 @@ pub mod holder;
 pub mod live_tail;
 pub mod log_pipeline;
 pub mod log_sink;
+pub mod log_sink_durable;
 pub mod metering;
 pub mod migrations;
 pub mod permanent_gates;
@@ -352,6 +353,9 @@ pub use log_pipeline::{
 // `LogPipeline` — `LogPipelineSink` (per-`(tenant, run, job)` pipeline, boundary-redaction-honest)
 // + the `LogPersist` durable-write seam the sealed index/pointers flush through (sub-step 4 fills it).
 pub use log_sink::{FlushedJobLogs, LogPersist, LogPipelineSink, SINGLE_STEP_ID};
+// CT-004f sub-step 4a: the DURABLE LogPersist — the live `log_segment`/`log_anchor` writer (frozen
+// bind-param SQL, one tenant-scoped FORCE-RLS tx per finished job).
+pub use log_sink_durable::DurableLogPersist;
 
 // CI-P21 (P-364): the resume-cursor live-tail VIEWER + the `details_ref` jump-to-failure resolution
 // (CI-D11). The `LiveTail` viewer composes the frozen firehose `subscribe`/`resume` on the bounded
