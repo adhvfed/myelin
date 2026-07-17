@@ -169,6 +169,13 @@ pub enum ExecutorError {
     UnknownWorkflow(String),
     /// `describe`/`cancel` named a `RunId` the executor has no record of.
     UnknownRun(String),
+    /// **A caller-provided `run_id` (`start_with_id`, CT-004d.2 chunk 1) COLLIDES with an existing,
+    /// DIFFERENT run** — same `run_id`, different `idem_key` (a deterministic-id collision or a bug).
+    /// FAIL CLOSED (EI-02 §4): the executor NEVER clobbers/adopts another run's [`RunRow`]
+    /// ([`crate::engine::RunStore::put`] REPLACES silently), so a colliding provided id is surfaced,
+    /// never silently overwritten. (An idempotent re-`start` under the SAME `idem_key` short-circuits
+    /// BEFORE this check — it returns the existing run, never a conflict.)
+    RunIdConflict(String),
 }
 
 impl std::fmt::Display for ExecutorError {
@@ -176,6 +183,9 @@ impl std::fmt::Display for ExecutorError {
         match self {
             ExecutorError::UnknownWorkflow(t) => write!(f, "unknown workflow type: {t}"),
             ExecutorError::UnknownRun(r) => write!(f, "unknown run: {r}"),
+            ExecutorError::RunIdConflict(r) => {
+                write!(f, "provided run_id collides with an existing run: {r}")
+            }
         }
     }
 }
@@ -196,7 +206,41 @@ pub trait DurableExecutor {
     /// [`RunId`] — a redelivered trigger is ONE run, not two. The `input` is stored references-not-
     /// payloads. Returns [`ExecutorError::UnknownWorkflow`] if `spec.wf_type` has no registered
     /// definition (surfaced, never a silent dropped run).
-    fn start(&self, spec: StartSpec) -> Result<RunId, ExecutorError>;
+    ///
+    /// The run id is MINTED by the engine (the ULID-ordered default). The caller-provided-id variant
+    /// is [`DurableExecutor::start_with_id`]; this `start` is the backward-compatible default that
+    /// mints (`start_with_id(spec, None)`), so every existing caller is unchanged.
+    fn start(&self, spec: StartSpec) -> Result<RunId, ExecutorError> {
+        self.start_with_id(spec, None)
+    }
+
+    /// **Start a durable run with a CALLER-PROVIDED run id** (CT-004d.2 chunk 1 — the foundational
+    /// id-plumbing seam). `run_id = None` MINTS the ULID-ordered id (identical to [`start`]);
+    /// `run_id = Some(id)` seeds the run under EXACTLY that id. This is the seam a pre-minted
+    /// deterministic id flows through: the CI dispatch consumer pre-mints
+    /// `wf_run_id = deterministic_uuid("wf:<event_id>")`, and the runner reports `job.done` to the
+    /// `job_queue` row's `run_id` — so the PARKED `ci.pipeline` run MUST carry that same id for the
+    /// wake to land. **CT-004d.2 chunk 3** (the dispatch consumer's `start` call) passes the
+    /// consumer's `wf_run_id` here as `Some(RunId(wf_run_id))`; this chunk only opens the seam (it
+    /// does NOT wire the consumer, register the `ci.pipeline` body, or add the durable ci_run store —
+    /// those are chunks 2–6).
+    ///
+    /// **The two subtle invariants this seam preserves:**
+    /// 1. **Idempotency on `idem_key` STILL WINS.** The `idem_key` short-circuit runs FIRST — a
+    ///    redelivered CI trigger re-provides the SAME deterministic `wf_run_id` AND the same
+    ///    `idem_key` and gets the EXISTING run back (never a second run, never a
+    ///    [`ExecutorError::RunIdConflict`]).
+    /// 2. **A provided id that COLLIDES with a DIFFERENT run FAILS CLOSED.** Once the `idem_key`
+    ///    check proves this key is new, a provided `run_id` that already names a run belongs to a
+    ///    different `idem_key`; the executor returns [`ExecutorError::RunIdConflict`] rather than
+    ///    clobber that run's [`RunRow`] ([`crate::engine::RunStore::put`] REPLACES silently).
+    ///
+    /// [`start`]: DurableExecutor::start
+    fn start_with_id(
+        &self,
+        spec: StartSpec,
+        run_id: Option<RunId>,
+    ) -> Result<RunId, ExecutorError>;
 
     /// **Deliver an inbound durable signal to a run — idempotent on `idem_key` (FROZEN, contract
     /// 9.1, P-FLOW-09).** Buffers the signal into `wf_signal` via `INSERT … ON CONFLICT (tenant,
@@ -369,7 +413,11 @@ impl FlowExecutor {
 }
 
 impl DurableExecutor for FlowExecutor {
-    fn start(&self, spec: StartSpec) -> Result<RunId, ExecutorError> {
+    fn start_with_id(
+        &self,
+        spec: StartSpec,
+        run_id: Option<RunId>,
+    ) -> Result<RunId, ExecutorError> {
         // The registered definition the engine would drive must exist — surfaced, never a silent run.
         let wf_version = *self
             .definitions
@@ -379,17 +427,39 @@ impl DurableExecutor for FlowExecutor {
             .ok_or_else(|| ExecutorError::UnknownWorkflow(spec.wf_type.clone()))?;
 
         let mut started = self.started.lock().unwrap();
-        // IDEMPOTENT on idem_key (FROZEN, contract 9.1): a re-start with the same key returns the
-        // SAME run — a redelivered trigger is ONE workflow, not two. The wf_type/input are NOT
-        // re-validated against the existing record (the first start won the race; this is a no-op
-        // return of its handle — exactly the effectively-once semantic).
+        // IDEMPOTENT on idem_key (FROZEN, contract 9.1) — this short-circuit runs FIRST, BEFORE any
+        // provided-run_id handling (CT-004d.2 chunk 1, invariant 1): a re-start with the same key
+        // returns the SAME run — a redelivered trigger is ONE workflow, not two. A redelivered CI
+        // trigger re-provides the SAME deterministic wf_run_id AND the same idem_key: it lands here
+        // and gets the existing run back (never a second run, never a RunIdConflict). The
+        // wf_type/input/run_id are NOT re-validated against the existing record (the first start won
+        // the race; this is a no-op return of its handle — exactly the effectively-once semantic).
         if let Some(existing) = started.by_idem.get(&spec.idem_key) {
             return Ok(existing.run_id.clone());
         }
 
-        // Mint the ULID-ordered run id, seed a runnable RunRow (state=running, cursor 0, unleased)
-        // the dispatcher then leases + drives, and record the references-not-payloads StartSpec.
-        let run_id = RunId(self.minter.mint().0);
+        // Choose the run id: caller-provided (CT-004d.2 chunk 3 passes the dispatch consumer's
+        // pre-minted wf_run_id) OR mint a fresh ULID-ordered id (the backward-compatible default).
+        let run_id = match run_id {
+            Some(id) => {
+                // FAIL CLOSED on a run_id collision (CT-004d.2 chunk 1, invariant 2). The idem_key
+                // short-circuit above already proved THIS idem_key is new, so a provided run_id that
+                // already names a run belongs to a DIFFERENT idem_key (a deterministic-id collision
+                // or a bug). RunStore::put REPLACES silently — so guard BEFORE the put and surface a
+                // typed error rather than clobber/adopt another run's RunRow. Check both the
+                // executor's run→idem index AND the run store (defence-in-depth against any run
+                // present in the store but not the index, e.g. after a restore rebuild).
+                if started.run_to_idem.contains_key(&id.0)
+                    || self.runs.get(&self.tenant, &id.0).is_some()
+                {
+                    return Err(ExecutorError::RunIdConflict(id.0));
+                }
+                id
+            }
+            None => RunId(self.minter.mint().0),
+        };
+        // Seed a runnable RunRow (state=running, cursor 0, unleased) the dispatcher then leases +
+        // drives, and record the references-not-payloads StartSpec.
         let partition = Self::partition_for(&run_id.0);
         // Seed the run with its PINNED wf_version (§4.6) so the divergence guard can detect a deploy
         // that bumps the definition while the run is in flight (P-FLOW-07).
@@ -604,6 +674,95 @@ mod tests {
         // a DIFFERENT idem_key starts a distinct run.
         let r3 = ex.start(spec("rule:evt-2")).expect("distinct start");
         assert_ne!(r1, r3, "a distinct idem_key is a distinct run");
+    }
+
+    /// **CT-004d.2 chunk 1: `start_with_id(spec, Some(id))` seeds the run under THAT id** (not a
+    /// minted one) — the seam the CI dispatch consumer's pre-minted `wf_run_id` flows through so the
+    /// parked `ci.pipeline` run's id equals the `job_queue` row's `run_id` the runner reports to.
+    #[test]
+    fn start_with_id_uses_the_provided_run_id() {
+        let ex = executor();
+        let provided = RunId("wf:evt-42".into());
+        let run = ex
+            .start_with_id(spec("rule:evt-42"), Some(provided.clone()))
+            .expect("start with a provided id");
+        assert_eq!(
+            run, provided,
+            "the created run carries the CALLER-PROVIDED id, not a minted one"
+        );
+        // the run is real: describe resolves it under exactly that id.
+        assert_eq!(
+            ex.describe(&provided).expect("describe the provided-id run").run_id,
+            provided
+        );
+    }
+
+    /// **CT-004d.2 chunk 1, invariant 1: idempotency on `idem_key` STILL WINS with a provided id.**
+    /// Two `start_with_id`s with the SAME idem_key AND the SAME provided run_id → ONE run; the second
+    /// returns the first (a redelivered CI trigger re-provides the same deterministic wf_run_id +
+    /// idem_key). No dup, no `RunIdConflict` — the idem_key short-circuit runs before the id handling.
+    #[test]
+    fn start_with_id_idem_key_wins_on_redelivery() {
+        let ex = executor();
+        let provided = RunId("wf:evt-7".into());
+        let r1 = ex
+            .start_with_id(spec("rule:evt-7"), Some(provided.clone()))
+            .expect("first start");
+        let r2 = ex
+            .start_with_id(spec("rule:evt-7"), Some(provided.clone()))
+            .expect("redelivery: same idem_key + same provided id returns the existing run");
+        assert_eq!(r1, provided);
+        assert_eq!(r2, provided, "the redelivery returned the EXISTING run (idem_key wins)");
+        // exactly ONE runnable run was seeded (not two).
+        let total: usize = (0..PARTITION_COUNT as i16)
+            .map(|p| ex.runs().runnable_lag(p, i64::MAX))
+            .sum();
+        assert_eq!(total, 1, "the redelivery was a no-op — exactly one run seeded");
+    }
+
+    /// **CT-004d.2 chunk 1, invariant 2: a provided run_id colliding with a DIFFERENT run FAILS
+    /// CLOSED.** Same run_id, DIFFERENT idem_key (a deterministic-id collision or a bug) → a typed
+    /// [`ExecutorError::RunIdConflict`], never a silent clobber of the first run's `RunRow`.
+    #[test]
+    fn start_with_id_collision_on_different_idem_key_fails_closed() {
+        let ex = executor();
+        let provided = RunId("wf:evt-clash".into());
+        let first = ex
+            .start_with_id(spec("rule:A"), Some(provided.clone()))
+            .expect("first run claims the id");
+        // a DIFFERENT idem_key re-using the SAME provided id must fail closed.
+        let err = ex
+            .start_with_id(spec("rule:B"), Some(provided.clone()))
+            .expect_err("a colliding provided id under a different idem_key is surfaced");
+        assert_eq!(err, ExecutorError::RunIdConflict("wf:evt-clash".into()));
+        // the first run is untouched (never clobbered/adopted) — it still describes as itself.
+        assert_eq!(
+            ex.describe(&first).expect("the first run is intact").run_id,
+            provided
+        );
+        // and exactly ONE run was seeded (the collision created nothing).
+        let total: usize = (0..PARTITION_COUNT as i16)
+            .map(|p| ex.runs().runnable_lag(p, i64::MAX))
+            .sum();
+        assert_eq!(total, 1, "the fail-closed collision seeded no second run");
+    }
+
+    /// **CT-004d.2 chunk 1, invariant 4: backward-compat — `start`/`start_with_id(None)` MINT as
+    /// before.** The engine-minted id is opaque/ULID-ordered (never the provided-id shape), and the
+    /// legacy `start` path is unchanged.
+    #[test]
+    fn start_with_none_mints_as_before() {
+        let ex = executor();
+        let minted = ex
+            .start_with_id(spec("rule:mint"), None)
+            .expect("None mints an id");
+        // via the legacy default `start`, a DISTINCT idem_key mints a DISTINCT id.
+        let legacy = ex.start(spec("rule:mint-2")).expect("legacy start still mints");
+        assert_ne!(minted, legacy, "each minted run has a distinct id");
+        // both resolve; neither is empty (the minter produced a real id).
+        assert!(!minted.0.is_empty() && !legacy.0.is_empty());
+        assert_eq!(ex.describe(&minted).unwrap().state, run_state::RUNNING);
+        assert_eq!(ex.describe(&legacy).unwrap().state, run_state::RUNNING);
     }
 
     /// **`start` of an unregistered `wf_type` is surfaced (never a silent dropped run, EI-02 §4).**
