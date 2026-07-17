@@ -305,7 +305,9 @@ pub use metering::reserve_settle_parity_drill;
 // path is no longer model-only — `CiCostEventStore::settle_in_tx` co-commits the CI projection rows a
 // settle produces, and `cost_events_for_run` reads them back (wholesale ≠ markup intact). The
 // storage-`CostLedger`-vs-CI-projection split + the CT-004d live-wiring follow-on are in the module docs.
-pub use cost_store::{cost_id_for, CiCostEventStore, CiCostStoreError};
+pub use cost_store::{
+    cost_id_for, verify_ci_cost_event_shape, CiCostEventStore, CiCostStoreError,
+};
 
 pub use holder::{
     ci_store_classifier, register_ci_holders, CiHolder, CiHolderRegistration, CiStoreClass,

@@ -114,6 +114,18 @@ pub enum CiCostStoreError {
     /// A read-back row carries a `meter`/`kind` token outside the frozen CHECK-constraint set — a
     /// corrupt durable write, surfaced loudly (never silently coerced).
     CorruptRow(String),
+    /// **Boot-time schema-shape mismatch (peer-review #11).** The `ci_cost_event` table the store binds
+    /// to does not match the CI metering-projection shape — a required column is absent or the wrong
+    /// type (e.g. a table left over from the pre-CT-004m `cost_event` name collision with Storage's
+    /// money-ledger). Surfaced LOUDLY at boot so a wrong-shaped MONEY table is never written to.
+    SchemaShapeMismatch {
+        /// The column that is absent / mis-typed.
+        column: String,
+        /// The type the CI metering projection requires.
+        expected: String,
+        /// What the durable table actually has (`<absent>` if the column is missing).
+        actual: String,
+    },
     /// **Verify-on-conflict divergence (peer-review #13).** A re-delivered settle derived the SAME
     /// `cost_id` (the `(tenant, run_id, job_id, meter)` idempotency key) as an already-recorded unit,
     /// but a MONETARY column differs. `ON CONFLICT DO NOTHING` would silently keep the first amount and
@@ -150,6 +162,12 @@ impl core::fmt::Display for CiCostStoreError {
                 "durable CI cost_event settle refused: a re-delivered unit (same cost_id) disagrees \
                  on {column} — recorded {recorded}, incoming {incoming} (never a silent drop of a \
                  divergent bill; the idempotency key is (tenant, run, job, meter), not the amount)"
+            ),
+            CiCostStoreError::SchemaShapeMismatch { column, expected, actual } => write!(
+                f,
+                "ci_cost_event schema-shape assertion FAILED: column `{column}` is `{actual}`, the \
+                 CI metering projection requires `{expected}` — refusing to bind the money table to a \
+                 wrong-shaped table (pre-CT-004m cost_event collision, or drift)"
             ),
         }
     }
@@ -342,6 +360,62 @@ fn parse_kind(token: &str) -> Result<CostKind, CiCostStoreError> {
             "unknown kind token `{other}`"
         ))),
     }
+}
+
+/// **Boot-time column-shape assertion for `ci_cost_event` (peer-review #11).** In the pre-CT-004m
+/// window CI's metering projection and Storage's money-ledger shared the physical name `cost_event`,
+/// so a store could bind to a WRONG-shaped table (`CREATE TABLE IF NOT EXISTS` silently no-ops on an
+/// existing table). CT-004m renamed CI's table to `ci_cost_event`, but a boot that inherits a stale /
+/// mis-shaped table has no repair path. This asserts — at boot, after the migrations apply — that the
+/// table the store will bind to has EXACTLY the CI metering-projection columns + types; a mismatch is
+/// a LOUD refusal, never a silent write of money data to a wrong-shaped table.
+///
+/// Resolves the table via `to_regclass` (search-path aware — the SAME table the unqualified store
+/// writes) and reads `pg_attribute`, so it is correct under a per-schema search_path (the test harness)
+/// and in the shared `myelin` DB alike. A NULL oid (absent table) is itself a loud failure.
+pub async fn verify_ci_cost_event_shape(pool: &PgPool) -> Result<(), CiCostStoreError> {
+    const EXPECTED: &[(&str, &str)] = &[
+        ("tenant_id", "text"),
+        ("region", "text"),
+        ("cost_id", "uuid"),
+        ("run_id", "uuid"),
+        ("job_id", "uuid"),
+        ("meter", "text"),
+        ("amount", "bigint"),
+        ("wholesale_minor_units", "bigint"),
+        ("markup_minor_units", "bigint"),
+        ("kind", "text"),
+    ];
+    let rows = sqlx::query(
+        "SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS typ \
+         FROM pg_attribute a \
+         WHERE a.attrelid = to_regclass('ci_cost_event') AND a.attnum > 0 AND NOT a.attisdropped",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| CiCostStoreError::Db(e.to_string()))?;
+    if rows.is_empty() {
+        return Err(CiCostStoreError::SchemaShapeMismatch {
+            column: "<table>".into(),
+            expected: "ci_cost_event (10 metering columns)".into(),
+            actual: "<absent — to_regclass resolved nothing>".into(),
+        });
+    }
+    let actual: std::collections::HashMap<String, String> = rows
+        .iter()
+        .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("typ")))
+        .collect();
+    for (col, want) in EXPECTED {
+        let got = actual.get(*col).map(String::as_str).unwrap_or("<absent>");
+        if got != *want {
+            return Err(CiCostStoreError::SchemaShapeMismatch {
+                column: (*col).to_string(),
+                expected: (*want).to_string(),
+                actual: got.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// **The deterministic `cost_event.cost_id` for one metered unit (the idempotency key).** A stable

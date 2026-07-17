@@ -28,7 +28,10 @@
 //!     --test integration_ci_ct004m_cost_event_no_collision -- --nocapture
 #![cfg(feature = "integration")]
 
-use myelin_ci_controlplane::{ci_durable_migrations, CiCostEventStore, CostEventRow, CostKind, Meter};
+use myelin_ci_controlplane::{
+    ci_durable_migrations, verify_ci_cost_event_shape, CiCostEventStore, CiCostStoreError,
+    CostEventRow, CostKind, Meter,
+};
 use myelin_flow::MinorUnits;
 use myelin_storage::{all_durable_migrations, reserve_settle_durable_migrations};
 use myelin_tenancy::TenantId;
@@ -233,6 +236,27 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
         .unwrap()
         .get("n");
     assert_eq!(runs, 1, "the ci_run row is durable in the shared DB");
+
+    // ── (4) #11 — the BOOT-TIME SHAPE ASSERTION. The correctly-migrated ci_cost_event PASSES. ──
+    verify_ci_cost_event_shape(&p)
+        .await
+        .expect("the correctly-migrated ci_cost_event passes the boot shape assertion");
+    // A WRONG-shaped ci_cost_event (the pre-CT-004m hazard: a table bound under the CI name but NOT the
+    // metering-projection shape) is REFUSED LOUDLY — the money table is never written wrong-shaped.
+    // (Done last: ci_cost_event is no longer needed, and the schema is dropped below.)
+    p.execute("DROP TABLE ci_cost_event")
+        .await
+        .expect("drop ci_cost_event for the wrong-shape leg");
+    p.execute("CREATE TABLE ci_cost_event (tenant_id text, cost_id uuid, ord bigint, unit text)")
+        .await
+        .expect("create a wrong-shaped ci_cost_event (money-ledger-ish; missing the projection columns)");
+    match verify_ci_cost_event_shape(&p).await {
+        Err(CiCostStoreError::SchemaShapeMismatch { column, actual, .. }) => {
+            assert_eq!(column, "region", "the first missing required column is surfaced");
+            assert_eq!(actual, "<absent>", "a missing column reads as <absent>, not silently accepted");
+        }
+        other => panic!("a wrong-shaped ci_cost_event must FAIL the boot shape assertion, got {other:?}"),
+    }
 
     // ── Cleanup. ──
     p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())

@@ -105,6 +105,14 @@ async fn main() {
         eprintln!("ci-dispatch: cannot apply the shared CI durable migrations (ci_run/check_attempt/ci_cost_event): {e}");
         std::process::exit(1);
     }
+    // #11 — BOOT-TIME SHAPE ASSERTION on the money table. `CREATE TABLE IF NOT EXISTS` above no-ops on
+    // a pre-existing (possibly pre-CT-004m mis-shaped) `ci_cost_event`, so assert the columns/types are
+    // the CI metering-projection shape before ANY settle can write money data. FAIL LOUD, never write
+    // to a wrong-shaped table.
+    if let Err(e) = myelin_ci_controlplane::verify_ci_cost_event_shape(provider.db_pool()).await {
+        eprintln!("ci-dispatch: ci_cost_event shape assertion failed: {e}");
+        std::process::exit(1);
+    }
     // The DURABLE outbox (SI-007): committed events live in Postgres, not a per-process mutex.
     let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
         provider.db_pool().clone(),
