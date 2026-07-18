@@ -574,6 +574,10 @@ impl HitlGate {
     /// tripped the gate (the distinct-approver anchor); it is structurally EXCLUDED from the
     /// persisted `approver_filter` so the requester is never an eligible approver of its own gate.
     pub fn to_gate_record(&self, requested_by: &str) -> GateRecord {
+        let opened_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .expect("system clock must be after the Unix epoch");
         GateRecord {
             gate_id: self.gate_id.0.clone(),
             run_id: self.run_id.clone(),
@@ -606,6 +610,11 @@ impl HitlGate {
             card_ref: Some(self.card_ref.clone()),
             requested_by: requested_by.to_string(),
             decided_by: None,
+            opened_at_unix,
+            decided_at_unix: None,
+            expires_at_unix: opened_at_unix
+                .saturating_add(myelin_storage::hitl_gate_durable::DEFAULT_HITL_GATE_TTL_SECS),
+            approval_consumed_at_unix: None,
         }
     }
 }
@@ -638,6 +647,10 @@ pub fn persist_gate_decision(
     gate: &HitlGate,
     decided_by: Option<&myelin_identity::Principal>,
 ) -> Result<(), GateDecideError> {
+    let decided_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .expect("system clock must be after the Unix epoch");
     debug_assert!(
         gate.state.is_terminal(),
         "persist_gate_decision is for a DECIDED gate (caller bug: still Waiting)"
@@ -645,23 +658,25 @@ pub fn persist_gate_decision(
     match gate.state {
         HitlGateState::Approved => {
             let approver = decided_by.ok_or(GateDecideError::NotEligible)?;
-            store.approve(
+            store.approve_at(
                 scope,
                 &gate.gate_id.0,
                 &approver.principal_id.0,
                 approver.kind.clone(),
+                decided_at_unix,
             )
         }
         HitlGateState::Rejected => {
             let decider = decided_by.ok_or(GateDecideError::NotEligible)?;
-            store.reject(
+            store.reject_at(
                 scope,
                 &gate.gate_id.0,
                 &decider.principal_id.0,
                 decider.kind.clone(),
+                decided_at_unix,
             )
         }
-        HitlGateState::Expired => store.expire(scope, &gate.gate_id.0),
+        HitlGateState::Expired => store.expire_at(scope, &gate.gate_id.0, decided_at_unix),
         HitlGateState::Waiting => Err(GateDecideError::NotFound),
     }
 }
@@ -1100,7 +1115,7 @@ mod tests {
         let rec = store.fetch(&scope(), &g.gate_id.0).unwrap();
         assert_eq!(rec.state, DurableGateState::Approved);
         assert_eq!(rec.decided_by.as_deref(), Some("psn:lead"));
-        assert!(rec.authorizes(&rec.effect_id.clone(), "agent:claude"));
+        assert!(rec.authorizes(&rec.effect_id.clone(), &rec.run_id.clone(), "agent:claude"));
 
         // A SELF-approval is refused server-side at persist time (the distinct-approver rule).
         let mut s2 = HitlVerdictStore::new();
