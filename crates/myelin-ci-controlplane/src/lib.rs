@@ -137,6 +137,14 @@ pub mod job_spec_store;
 /// [`ci_durable_migrations`] both CI mains apply at boot. Registering/starting the `ci.pipeline` body is
 /// CT-004d.2 chunk 2/3 (NOT this chunk).
 pub mod ci_run_store;
+/// Versioned, tenant-bound loader for the immutable CI execution plan stored in the definition
+/// snapshot CAS object. This module prepares and validates a plan; it deliberately does not start
+/// jobs or flatten the dependency DAG into a sequential workflow.
+pub mod run_plan;
+pub use run_plan::{
+    load_resolved_run_plan, PreparedRunPlan, RedispatchReason, ResolvedJobV1, ResolvedRunPlanV1,
+    RunPlanError,
+};
 /// CT-004d.2 CULMINATION (chunks 2/3/5): the CI pipeline DRIVER — a pushed CI trigger runs a REAL
 /// pipeline end-to-end. [`ci_pipeline_driver::DurableJobRunner`] (chunk 5) dispatches each stage into
 /// the DURABLE `job_queue` + `ci_job_spec` via [`job_spec_store::CiJobSpecStore::co_persist_dispatch`]
