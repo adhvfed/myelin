@@ -129,6 +129,36 @@ pub enum VersionedResolvedRunPlan {
     V2(ResolvedRunPlanV2),
 }
 
+/// Derive the exact concrete DAG-node name from an authored stage and its sorted matrix identity.
+/// Empty matrix identities retain the stage byte-for-byte; matrix identities are length-framed and
+/// BLAKE3-bound so distinct assignments cannot alias.
+pub fn derive_concrete_job_name(
+    stage: &str,
+    matrix_key: &BTreeMap<String, String>,
+) -> String {
+    if matrix_key.is_empty() {
+        return stage.to_string();
+    }
+    let mut identity = Vec::new();
+    identity.extend_from_slice(&(stage.len() as u64).to_be_bytes());
+    identity.extend_from_slice(stage.as_bytes());
+    identity.extend_from_slice(&(matrix_key.len() as u64).to_be_bytes());
+    for (key, value) in matrix_key {
+        identity.extend_from_slice(&(key.len() as u64).to_be_bytes());
+        identity.extend_from_slice(key.as_bytes());
+        identity.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        identity.extend_from_slice(value.as_bytes());
+    }
+    let digest = blake3::hash(&identity).to_hex();
+    let prefix: String = stage
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        .take(61)
+        .map(char::from)
+        .collect();
+    format!("{prefix}--{digest}")
+}
+
 impl ResolvedJobV1 {
     /// Collision-safe, deterministic identity bytes for the matrix assignment.
     ///
@@ -691,6 +721,15 @@ fn validate_plan_v2(plan: &ResolvedRunPlanV2) -> Result<(), RunPlanError> {
         .any(|job| !valid_machine_token(&job.stage, MAX_JOB_NAME_BYTES))
     {
         return invalid("every version-2 authored stage must be a bounded machine token");
+    }
+    for job in &plan.jobs {
+        let expected = derive_concrete_job_name(&job.stage, &job.matrix_key);
+        if job.name != expected {
+            return invalid(format!(
+                "version-2 concrete job name `{}` does not match stage `{}` and its matrix identity; expected `{expected}`",
+                job.name, job.stage
+            ));
+        }
     }
     let compatibility = ResolvedRunPlanV1 {
         schema_version: RUN_PLAN_SCHEMA_V1,

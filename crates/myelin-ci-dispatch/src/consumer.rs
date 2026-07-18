@@ -94,13 +94,13 @@ use myelin_events::{
 use myelin_storage::BlobStore;
 use myelin_tenancy::TenantId;
 
-use crate::config::{parse_ci_config, CiConfigError, ConfigFormat};
+use crate::config::{parse_versioned_ci_config, CiConfigError, ConfigFormat};
 use crate::dispatch::{
     compile_trigger, stamp_trust, OnTrigger, RunProvenance, TrustStamp, TRIGGER_CONSUMER,
 };
 use crate::resolve::{
-    reserve_and_start, resolve_snapshot, snapshot_ref, CheckContext, CiDefinition, ResolveError,
-    RunFacts, StartHandoff,
+    reserve_and_start, resolve_versioned_snapshot, snapshot_ref, CheckContext, ResolveError,
+    RunFacts, StartHandoff, VersionedCiDefinition,
 };
 
 // =================================================================================================
@@ -688,9 +688,11 @@ pub fn plan_dispatch(
         ConfigFormat::Toml => ".myelin/ci.toml",
         ConfigFormat::Json => ".myelin/ci.json",
     };
-    let def: CiDefinition = match parse_ci_config(&bytes, format_hint) {
+    let def: VersionedCiDefinition = match parse_versioned_ci_config(&bytes, format_hint) {
         Ok(d) => d,
-        Err(e) => return DispatchOutcome::Skip(SkipReason::ConfigError(e)),
+        Err(e) => {
+            return DispatchOutcome::Skip(SkipReason::ConfigError(e.into_legacy_surface()))
+        }
     };
 
     // 4. Compile the armed trigger and ask: does THIS event match? The config's `on:` compiles to the
@@ -722,7 +724,7 @@ pub fn plan_dispatch(
     let stamp: TrustStamp = stamp_trust(&provenance);
 
     // 6. Resolve the CAS snapshot — a ResolveError (floating tag / cycle) is a fail-closed skip.
-    let (_snapshot, address) = match resolve_snapshot(&def, blobs, &tenant) {
+    let (_snapshot, address) = match resolve_versioned_snapshot(&def, blobs, &tenant) {
         Ok(r) => r,
         Err(e) => return DispatchOutcome::Skip(SkipReason::ResolveError(e)),
     };
@@ -1009,7 +1011,7 @@ mod tests {
     };
     use myelin_git::events::{GIT_PR_OPENED, GIT_REF_UPDATED};
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-    use myelin_storage::FsBlobStore;
+    use myelin_storage::{ContentHash, FsBlobStore};
     use myelin_tenancy::{Region, TenantId};
 
     fn principal() -> Principal {
@@ -1054,6 +1056,20 @@ mod tests {
     fn valid_toml() -> &'static [u8] {
         concat!(
             "on = \"push\"\n\n",
+            "[[jobs]]\n",
+            "name = \"build\"\n",
+            "image = \"registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000\"\n",
+            "command = [\"build\"]\n",
+        )
+        .as_bytes()
+    }
+
+    fn valid_v2_toml() -> &'static [u8] {
+        concat!(
+            "schema_version = 2\n",
+            "on = \"push\"\n\n",
+            "[execution]\n",
+            "profile = \"linux-small-v1\"\n\n",
             "[[jobs]]\n",
             "name = \"build\"\n",
             "image = \"registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000\"\n",
@@ -1209,6 +1225,33 @@ mod tests {
         let insert = ci_run_insert_from_armed(&armed);
         assert_eq!(insert.triggered_by.as_deref(), Some("pusher"));
         assert_eq!(armed.tenant, TenantId("acme".into()));
+    }
+
+    #[test]
+    fn exact_v2_config_reaches_a_v2_cas_snapshot_through_the_production_consumer() {
+        let ev = push_envelope("web", "deadbeef");
+        let reader = MapGitConfigReader::new().with_file(
+            "web",
+            "deadbeef",
+            ".myelin/ci.toml",
+            valid_v2_toml(),
+        );
+        let blobs = FsBlobStore::new();
+        let DispatchOutcome::Arm(armed) = plan_dispatch(&ev, &reader, &blobs) else {
+            panic!("the exact V2 request must arm and persist its requested wire");
+        };
+        let digest = armed
+            .handoff
+            .run_write
+            .definition_snapshot
+            .0
+            .rsplit('/')
+            .next()
+            .unwrap();
+        let address = ContentHash::parse(digest).unwrap();
+        let bytes = blobs.get(&TenantId("acme".into()), &address).unwrap();
+        let decoded = myelin_ci_controlplane::decode_resolved_run_plan(&bytes).unwrap();
+        assert!(decoded.as_v2().is_some());
     }
 
     /// **A fork PR (is_fork) → an UntrustedFork stamp on BOTH the row AND every check (X-1).**

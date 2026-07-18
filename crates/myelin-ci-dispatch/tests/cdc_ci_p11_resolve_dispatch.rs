@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use myelin_ci_dispatch::resolve::{
     reserve_and_start, resolve_snapshot, snapshot_ref, CheckContext, CiDefinition, JobDef,
-    RunFacts, CI_PIPELINE_WF_TYPE,
+    ResolvedJob, ResolvedSnapshot, RunFacts, CI_PIPELINE_WF_TYPE,
 };
 use myelin_ci_dispatch::{stamp_trust, OnTrigger, RunProvenance};
 use myelin_events::{EventId, IdMinter, MonotonicMinter};
@@ -42,7 +42,6 @@ fn tenant() -> TenantId {
 
 fn definition() -> CiDefinition {
     CiDefinition {
-        contract: myelin_ci_dispatch::CiPlanContract::V1,
         on: OnTrigger::PullRequest,
         jobs: vec![
             JobDef::normal("build", PINNED_BUILD, ["build"]),
@@ -71,8 +70,9 @@ fn cdc_11_2_consumer_snapshot_is_content_addressed_through_blobstore() {
     let def = definition();
 
     // The consumer resolves + content-addresses through the provider trait.
-    let (snap, addr) =
+    let (snap, addr): (ResolvedSnapshot, ContentHash) =
         resolve_snapshot(&def, &store, &tenant()).expect("a digest-pinned def resolves");
+    let _: &ResolvedJob = &snap.jobs[0];
 
     // PROVIDER round-trip: the bytes at the address ARE the snapshot's canonical bytes.
     let bytes = store
