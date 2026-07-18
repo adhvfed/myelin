@@ -161,8 +161,9 @@ pub use machine_auth::{
     TokenVerifier, VerifiedCapabilityContext,
 };
 pub use mint::{
-    expires_at_of, run_token_jti, MintError, RevocationProof, RunTokenMinter,
-    StructuralTokenSigner, TokenSigner, RUN_GRANT_RELATION, SELFHOSTED_GRANT_PREFIX,
+    expires_at_of, run_token_jti, CiJobAuthorizationError, MintError, RevocationProof,
+    RunTokenMinter, StructuralTokenSigner, TokenSigner, RUN_GRANT_RELATION,
+    SELFHOSTED_GRANT_PREFIX,
 };
 pub use multi_cell::{
     CellPartition, CrossCellAudit, CrossCellGrant, CrossCellResolution, MigrationReceipt,

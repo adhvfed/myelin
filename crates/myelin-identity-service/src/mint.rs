@@ -113,6 +113,91 @@ pub struct RunTokenAuthorizer {
     now: Arc<dyn Fn() -> Timestamp + Send + Sync>,
 }
 
+/// Why a CI-job credential was refused at the final launch boundary.
+///
+/// Variants expose actionable policy facts only; opaque bearer material and verifier internals are
+/// deliberately never retained or rendered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CiJobAuthorizationError {
+    /// The caller did not name the exact non-empty job/run identifier it is about to launch.
+    EmptyExpectedIdentifier,
+    /// Signature, expiry, or signed caveat verification refused the credential.
+    CredentialVerificationRefused,
+    /// The verified credential was not minted under [`MachineKind::Ci`].
+    WrongMachineKind { actual: MachineKind },
+    /// The verified credential purpose was not [`CredentialPurpose::CiJob`].
+    WrongCredentialPurpose,
+    /// The signed CI job/run identifier did not equal the expected launch identifier.
+    JobIdentifierMismatch,
+    /// The public carrier JTI did not equal the cryptographically signed JTI.
+    CarrierJtiMismatch,
+    /// The signed tenant did not equal the launch boundary tenant.
+    TenantMismatch,
+    /// The signed region did not equal the launch boundary region.
+    RegionMismatch,
+    /// The signed subject did not equal the expected CI principal.
+    SubjectMismatch,
+    /// Durable S7 did not report the token as exactly live within its run lifetime.
+    NotLive { state: RunTokenState },
+    /// The attenuated signed authority omitted one capability required by this launch.
+    MissingCapability { capability: String },
+}
+
+impl std::fmt::Display for CiJobAuthorizationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyExpectedIdentifier => {
+                write!(f, "expected CI job/run identifier must be non-empty")
+            }
+            Self::CredentialVerificationRefused => write!(
+                f,
+                "CI job credential signature, expiry, or caveat verification refused"
+            ),
+            Self::WrongMachineKind { actual } => {
+                write!(f, "CI launch requires machine kind `Ci`, got `{actual:?}`")
+            }
+            Self::WrongCredentialPurpose => {
+                write!(f, "CI launch requires signed credential purpose `ci_job`")
+            }
+            Self::JobIdentifierMismatch => write!(
+                f,
+                "signed CI job/run identifier does not match the expected launch identifier"
+            ),
+            Self::CarrierJtiMismatch => {
+                write!(f, "run-token carrier JTI does not match the signed JTI")
+            }
+            Self::TenantMismatch => {
+                write!(f, "signed CI token tenant does not match the launch tenant")
+            }
+            Self::RegionMismatch => {
+                write!(f, "signed CI token region does not match the launch region")
+            }
+            Self::SubjectMismatch => {
+                write!(f, "signed CI token subject does not match the expected principal")
+            }
+            Self::NotLive { state } => {
+                write!(f, "CI job token is not live in durable S7 at launch ({state:?})")
+            }
+            Self::MissingCapability { capability } => write!(
+                f,
+                "CI launch requires capability `{capability}` outside the signed attenuated authority"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CiJobAuthorizationError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BoundaryCheckError {
+    CarrierJtiMismatch,
+    TenantMismatch,
+    RegionMismatch,
+    SubjectMismatch,
+    NotLive(RunTokenState),
+    MissingCapability(String),
+}
+
 impl RunTokenAuthorizer {
     /// Build the production-capable boundary over an injected cryptographic verifier and the SAME
     /// durable S7 store the minter/teardown path writes.
@@ -161,33 +246,124 @@ impl RunTokenAuthorizer {
             }
             _ => return Err("presented token purpose is not `agent_run`".into()),
         }
-        if verified.jti != run_token.jti {
-            return Err("run-token carrier jti does not match the signed jti".into());
+        self.check_boundary(
+            scope,
+            expected_principal,
+            run_token,
+            required_caps,
+            &verified,
+        )
+        .map_err(|error| match error {
+            BoundaryCheckError::CarrierJtiMismatch => {
+                "run-token carrier jti does not match the signed jti".into()
+            }
+            BoundaryCheckError::TenantMismatch | BoundaryCheckError::RegionMismatch => {
+                "run-token signed scope does not match the mutation boundary scope".into()
+            }
+            BoundaryCheckError::SubjectMismatch => {
+                "run-token signed subject does not match the acting principal".into()
+            }
+            BoundaryCheckError::NotLive(_) => {
+                "run token is unknown, torn down, or expired at the mutation boundary".into()
+            }
+            BoundaryCheckError::MissingCapability(capability) => format!(
+                "tool requires capability `{capability}` outside the signed attenuated run-token authority"
+            ),
+        })?;
+        Ok(verified)
+    }
+
+    /// Authorize one exact CI job immediately before launch.
+    ///
+    /// Verification is pinned to the `ci` credential scheme and requires an exact CI machine kind,
+    /// exact `ci_job` purpose and non-empty signed identifier, carrier/signed JTI equality, exact
+    /// tenant/region/subject binding, cryptographic and caveat validity, live S7 run state, and every
+    /// independently resolved launch capability. This method grants no runtime authority itself.
+    pub fn authorize_ci_job(
+        &self,
+        scope: &TenantScope,
+        expected_principal: &PrincipalId,
+        expected_job_run_id: &str,
+        run_token: &RunToken,
+        required_caps: &[String],
+    ) -> Result<CapabilityToken, CiJobAuthorizationError> {
+        if expected_job_run_id.is_empty() {
+            return Err(CiJobAuthorizationError::EmptyExpectedIdentifier);
         }
-        if verified.tenant != *scope.tenant() || verified.region != *scope.region() {
-            return Err("run-token signed scope does not match the mutation boundary scope".into());
+        let verified = self
+            .verifier
+            .verify(&Credential {
+                scheme: scheme::CI.into(),
+                material: run_token.token.clone(),
+            })
+            .map_err(|_| CiJobAuthorizationError::CredentialVerificationRefused)?;
+        if verified.kind != MachineKind::Ci {
+            return Err(CiJobAuthorizationError::WrongMachineKind {
+                actual: verified.kind,
+            });
+        }
+        match &verified.purpose {
+            CredentialPurpose::CiJob { run_id }
+                if !run_id.is_empty() && run_id == expected_job_run_id => {}
+            CredentialPurpose::CiJob { .. } => {
+                return Err(CiJobAuthorizationError::JobIdentifierMismatch)
+            }
+            _ => return Err(CiJobAuthorizationError::WrongCredentialPurpose),
+        }
+        self.check_boundary(
+            scope,
+            expected_principal,
+            run_token,
+            required_caps,
+            &verified,
+        )
+        .map_err(|error| match error {
+            BoundaryCheckError::CarrierJtiMismatch => CiJobAuthorizationError::CarrierJtiMismatch,
+            BoundaryCheckError::TenantMismatch => CiJobAuthorizationError::TenantMismatch,
+            BoundaryCheckError::RegionMismatch => CiJobAuthorizationError::RegionMismatch,
+            BoundaryCheckError::SubjectMismatch => CiJobAuthorizationError::SubjectMismatch,
+            BoundaryCheckError::NotLive(state) => CiJobAuthorizationError::NotLive { state },
+            BoundaryCheckError::MissingCapability(capability) => {
+                CiJobAuthorizationError::MissingCapability { capability }
+            }
+        })?;
+        Ok(verified)
+    }
+
+    fn check_boundary(
+        &self,
+        scope: &TenantScope,
+        expected_principal: &PrincipalId,
+        run_token: &RunToken,
+        required_caps: &[String],
+        verified: &CapabilityToken,
+    ) -> Result<(), BoundaryCheckError> {
+        if verified.jti != run_token.jti {
+            return Err(BoundaryCheckError::CarrierJtiMismatch);
+        }
+        if verified.tenant != *scope.tenant() {
+            return Err(BoundaryCheckError::TenantMismatch);
+        }
+        if verified.region != *scope.region() {
+            return Err(BoundaryCheckError::RegionMismatch);
         }
         if verified.subject_key != expected_principal.0 {
-            return Err("run-token signed subject does not match the acting principal".into());
+            return Err(BoundaryCheckError::SubjectMismatch);
         }
-        if self.revocations.run_token_state(
+        let state = self.revocations.run_token_state(
             scope,
             &RevokeTarget::Jti(verified.jti.clone()),
             &(self.now)(),
-        ) != RunTokenState::LiveWithinRunLife
-        {
-            return Err(
-                "run token is unknown, torn down, or expired at the mutation boundary".into(),
-            );
+        );
+        if state != RunTokenState::LiveWithinRunLife {
+            return Err(BoundaryCheckError::NotLive(state));
         }
-        for cap in required_caps {
-            if !verified.authority.holds(cap) {
-                return Err(format!(
-                    "tool requires capability `{cap}` outside the signed attenuated run-token authority"
-                ));
+        for capability in required_caps {
+            if !verified.authority.holds(capability) {
+                return Err(BoundaryCheckError::MissingCapability(capability.clone()));
             }
         }
-        Ok(verified)
+        Ok(())
     }
 }
 
@@ -908,6 +1084,15 @@ mod tests {
         TenantScope::from_verified_token(&p, Region("eu-west".into()))
     }
 
+    fn scope_in(tenant: &str, region: &str) -> TenantScope {
+        let p = Principal::stub(
+            PrincipalId("p-admin".into()),
+            PrincipalKind::Human,
+            TenantId(tenant.into()),
+        );
+        TenantScope::from_verified_token(&p, Region(region.into()))
+    }
+
     fn agent(id: &str, tenant: &str) -> Principal {
         let mut p = Principal::stub(
             PrincipalId(id.into()),
@@ -987,6 +1172,59 @@ mod tests {
                     trigger_actor: 1,
                 },
             },
+        }
+    }
+
+    fn mint_ci_token(
+        s7: &RevocationStore,
+        scope: &TenantScope,
+        subject: &str,
+        job_run_id: &str,
+        grants: &[&str],
+        lifetime_secs: u64,
+    ) -> RunToken {
+        RunTokenMinter::new(s7.clone())
+            .mint_run_token(
+                scope,
+                &PrincipalId(subject.into()),
+                &RunId(job_run_id.into()),
+                &agent(subject, &scope.tenant().0),
+                &human("p:human", &scope.tenant().0),
+                &input(grants, grants, grants, grants),
+                &caveats(grants),
+                MachineKind::Ci,
+                &ttl(lifetime_secs),
+                &ts("2026-06-19T00:00:00Z"),
+            )
+            .expect("mint CI job token")
+    }
+
+    #[derive(Clone)]
+    struct FixedCiSchemeVerifier(CapabilityToken);
+
+    impl TokenVerifier for FixedCiSchemeVerifier {
+        fn verify(&self, credential: &Credential) -> myelin_identity::Result<CapabilityToken> {
+            assert_eq!(
+                credential.scheme,
+                scheme::CI,
+                "CI boundary pins the verifier scheme"
+            );
+            Ok(self.0.clone())
+        }
+    }
+
+    fn fixed_capability(kind: MachineKind, purpose: CredentialPurpose) -> CapabilityToken {
+        CapabilityToken {
+            tenant: TenantId("acme".into()),
+            region: Region("eu-west".into()),
+            kind,
+            subject_key: "svc:ci".into(),
+            authority: auth(&["job.launch", "artifact.write"]),
+            jti: "fixed-jti".into(),
+            dpop_bound: false,
+            purpose,
+            audience: crate::machine_auth::CredentialAudience::Edge,
+            exp_unix: i64::MAX,
         }
     }
 
@@ -1160,6 +1398,347 @@ mod tests {
             )
             .expect_err("snapshot-less AgentRun must never reach a mutation adapter");
         assert!(denied.contains("durable delegation snapshot"));
+    }
+
+    #[test]
+    fn ci_job_final_boundary_binds_scheme_kind_purpose_identity_scope_and_authority() {
+        let s7 = RevocationStore::new();
+        let acme = scope("acme");
+        let token = mint_ci_token(
+            &s7,
+            &acme,
+            "svc:ci",
+            "job:run-17:build",
+            &["job.launch", "artifact.write"],
+            300,
+        );
+        let authorizer =
+            RunTokenAuthorizer::new(Arc::new(StructuralTokenVerifier::new()), s7.clone())
+                .with_clock(|| ts("2026-06-19T00:01:00Z"));
+
+        let authorized = authorizer
+            .authorize_ci_job(
+                &acme,
+                &PrincipalId("svc:ci".into()),
+                "job:run-17:build",
+                &token,
+                &["job.launch".into(), "artifact.write".into()],
+            )
+            .expect("the exact live CI job token is admitted immediately before launch");
+        assert_eq!(authorized.kind, MachineKind::Ci);
+        assert_eq!(
+            authorized.purpose,
+            CredentialPurpose::CiJob {
+                run_id: "job:run-17:build".into()
+            }
+        );
+
+        assert_eq!(
+            authorizer.authorize_ci_job(
+                &acme,
+                &PrincipalId("svc:ci".into()),
+                "",
+                &token,
+                &["job.launch".into()],
+            ),
+            Err(CiJobAuthorizationError::EmptyExpectedIdentifier)
+        );
+        assert_eq!(
+            authorizer.authorize_ci_job(
+                &acme,
+                &PrincipalId("svc:ci".into()),
+                "job:run-17:test",
+                &token,
+                &["job.launch".into()],
+            ),
+            Err(CiJobAuthorizationError::JobIdentifierMismatch)
+        );
+        assert_eq!(
+            authorizer.authorize_ci_job(
+                &scope("globex"),
+                &PrincipalId("svc:ci".into()),
+                "job:run-17:build",
+                &token,
+                &["job.launch".into()],
+            ),
+            Err(CiJobAuthorizationError::TenantMismatch)
+        );
+        assert_eq!(
+            authorizer.authorize_ci_job(
+                &scope_in("acme", "eu-north"),
+                &PrincipalId("svc:ci".into()),
+                "job:run-17:build",
+                &token,
+                &["job.launch".into()],
+            ),
+            Err(CiJobAuthorizationError::RegionMismatch)
+        );
+        assert_eq!(
+            authorizer.authorize_ci_job(
+                &acme,
+                &PrincipalId("svc:other".into()),
+                "job:run-17:build",
+                &token,
+                &["job.launch".into()],
+            ),
+            Err(CiJobAuthorizationError::SubjectMismatch)
+        );
+        let mut mixed_carrier = token.clone();
+        mixed_carrier.jti = "attacker-selected-jti".into();
+        assert_eq!(
+            authorizer.authorize_ci_job(
+                &acme,
+                &PrincipalId("svc:ci".into()),
+                "job:run-17:build",
+                &mixed_carrier,
+                &["job.launch".into()],
+            ),
+            Err(CiJobAuthorizationError::CarrierJtiMismatch)
+        );
+        assert_eq!(
+            authorizer.authorize_ci_job(
+                &acme,
+                &PrincipalId("svc:ci".into()),
+                "job:run-17:build",
+                &token,
+                &["secret.read".into()],
+            ),
+            Err(CiJobAuthorizationError::MissingCapability {
+                capability: "secret.read".into()
+            })
+        );
+    }
+
+    #[test]
+    fn ci_job_final_boundary_refuses_wrong_credentials_and_every_non_live_s7_state() {
+        let acme = scope("acme");
+        let live_s7 = RevocationStore::new();
+        let ci_token = mint_ci_token(
+            &live_s7,
+            &acme,
+            "svc:ci",
+            "job:run-18:test",
+            &["job.launch"],
+            300,
+        );
+
+        let agent_token = RunTokenMinter::new(live_s7.clone())
+            .mint_run_token(
+                &acme,
+                &PrincipalId("svc:ci".into()),
+                &RunId("job:run-18:test".into()),
+                &agent("svc:ci", "acme"),
+                &human("p:human", "acme"),
+                &input(
+                    &["job.launch"],
+                    &["job.launch"],
+                    &["job.launch"],
+                    &["job.launch"],
+                ),
+                &caveats(&["job.launch"]),
+                MachineKind::Agent,
+                &ttl(300),
+                &ts("2026-06-19T00:00:01Z"),
+            )
+            .unwrap();
+        let structural =
+            RunTokenAuthorizer::new(Arc::new(StructuralTokenVerifier::new()), live_s7.clone())
+                .with_clock(|| ts("2026-06-19T00:01:00Z"));
+        assert_eq!(
+            structural.authorize_ci_job(
+                &acme,
+                &PrincipalId("svc:ci".into()),
+                "job:run-18:test",
+                &agent_token,
+                &["job.launch".into()],
+            ),
+            Err(CiJobAuthorizationError::CredentialVerificationRefused),
+            "an Agent credential cannot be reinterpreted under the required `ci` scheme"
+        );
+        let per_job_token = RunTokenMinter::new(live_s7.clone())
+            .mint_run_token(
+                &acme,
+                &PrincipalId("svc:ci".into()),
+                &RunId("job:run-18:test".into()),
+                &agent("svc:ci", "acme"),
+                &human("p:human", "acme"),
+                &input(
+                    &["selfhosted:acme"],
+                    &["selfhosted:acme"],
+                    &["selfhosted:acme"],
+                    &["selfhosted:acme"],
+                ),
+                &caveats(&["selfhosted:acme"]),
+                MachineKind::PerJob,
+                &ttl(300),
+                &ts("2026-06-19T00:00:02Z"),
+            )
+            .unwrap();
+        assert_eq!(
+            structural.authorize_ci_job(
+                &acme,
+                &PrincipalId("svc:ci".into()),
+                "job:run-18:test",
+                &per_job_token,
+                &["selfhosted:acme".into()],
+            ),
+            Err(CiJobAuthorizationError::CredentialVerificationRefused),
+            "a PerJob credential cannot be reinterpreted under the required `ci` scheme"
+        );
+        let malformed = RunToken {
+            token: "not-a-verified-token".into(),
+            jti: "public-jti".into(),
+        };
+        let verification_error = structural
+            .authorize_ci_job(
+                &acme,
+                &PrincipalId("svc:ci".into()),
+                "job:run-18:test",
+                &malformed,
+                &["job.launch".into()],
+            )
+            .unwrap_err();
+        assert_eq!(
+            verification_error,
+            CiJobAuthorizationError::CredentialVerificationRefused
+        );
+        assert!(!verification_error.to_string().contains(&malformed.token));
+
+        for (kind, purpose, expected) in [
+            (
+                MachineKind::Agent,
+                CredentialPurpose::CiJob {
+                    run_id: "job:run-18:test".into(),
+                },
+                CiJobAuthorizationError::WrongMachineKind {
+                    actual: MachineKind::Agent,
+                },
+            ),
+            (
+                MachineKind::PerJob,
+                CredentialPurpose::CiJob {
+                    run_id: "job:run-18:test".into(),
+                },
+                CiJobAuthorizationError::WrongMachineKind {
+                    actual: MachineKind::PerJob,
+                },
+            ),
+            (
+                MachineKind::Pat,
+                CredentialPurpose::CiJob {
+                    run_id: "job:run-18:test".into(),
+                },
+                CiJobAuthorizationError::WrongMachineKind {
+                    actual: MachineKind::Pat,
+                },
+            ),
+            (
+                MachineKind::DeployKey,
+                CredentialPurpose::CiJob {
+                    run_id: "job:run-18:test".into(),
+                },
+                CiJobAuthorizationError::WrongMachineKind {
+                    actual: MachineKind::DeployKey,
+                },
+            ),
+            (
+                MachineKind::Ci,
+                CredentialPurpose::PerJob {
+                    run_id: "job:run-18:test".into(),
+                },
+                CiJobAuthorizationError::WrongCredentialPurpose,
+            ),
+            (
+                MachineKind::Ci,
+                CredentialPurpose::AgentRun {
+                    run_id: "job:run-18:test".into(),
+                    delegation_snapshot: Some(1),
+                },
+                CiJobAuthorizationError::WrongCredentialPurpose,
+            ),
+        ] {
+            let fixed = fixed_capability(kind, purpose);
+            let carrier = RunToken {
+                token: "opaque".into(),
+                jti: fixed.jti.clone(),
+            };
+            let authorizer = RunTokenAuthorizer::new(
+                Arc::new(FixedCiSchemeVerifier(fixed)),
+                RevocationStore::new(),
+            );
+            assert_eq!(
+                authorizer.authorize_ci_job(
+                    &acme,
+                    &PrincipalId("svc:ci".into()),
+                    "job:run-18:test",
+                    &carrier,
+                    &["job.launch".into()],
+                ),
+                Err(expected)
+            );
+        }
+
+        let authorize_with = |s7: RevocationStore, now: &'static str| {
+            RunTokenAuthorizer::new(Arc::new(StructuralTokenVerifier::new()), s7)
+                .with_clock(move || ts(now))
+                .authorize_ci_job(
+                    &acme,
+                    &PrincipalId("svc:ci".into()),
+                    "job:run-18:test",
+                    &ci_token,
+                    &["job.launch".into()],
+                )
+        };
+        assert_eq!(
+            authorize_with(RevocationStore::new(), "2026-06-19T00:01:00Z"),
+            Err(CiJobAuthorizationError::NotLive {
+                state: RunTokenState::Unknown
+            })
+        );
+        assert_eq!(
+            authorize_with(live_s7.clone(), "2026-06-19T00:06:00Z"),
+            Err(CiJobAuthorizationError::NotLive {
+                state: RunTokenState::Expired
+            })
+        );
+
+        let torn_down_s7 = RevocationStore::new();
+        let torn_down = mint_ci_token(
+            &torn_down_s7,
+            &acme,
+            "svc:ci",
+            "job:run-19:test",
+            &["job.launch"],
+            300,
+        );
+        torn_down_s7.tear_down_run_token(&acme, &torn_down.jti, ts("2026-06-19T00:01:00Z"));
+        assert_eq!(
+            RunTokenAuthorizer::new(Arc::new(StructuralTokenVerifier::new()), torn_down_s7,)
+                .with_clock(|| ts("2026-06-19T00:01:01Z"))
+                .authorize_ci_job(
+                    &acme,
+                    &PrincipalId("svc:ci".into()),
+                    "job:run-19:test",
+                    &torn_down,
+                    &["job.launch".into()],
+                ),
+            Err(CiJobAuthorizationError::NotLive {
+                state: RunTokenState::TornDown
+            })
+        );
+
+        let revoked_s7 = RevocationStore::new();
+        revoked_s7.revoke(
+            &acme,
+            &RevokeTarget::Jti(ci_token.jti.clone()),
+            ts("2026-06-19T00:00:30Z"),
+        );
+        assert_eq!(
+            authorize_with(revoked_s7, "2026-06-19T00:01:00Z"),
+            Err(CiJobAuthorizationError::NotLive {
+                state: RunTokenState::TornDown
+            })
+        );
     }
 
     /// **Minting re-checks "cannot delegate what you lack": the token's authority is the monotone
