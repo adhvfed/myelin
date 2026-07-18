@@ -457,7 +457,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 |---|---|---|
 | R4.0 | Founder auth+bootstrap: durable KMS-sealed cell token root (P-527/MR-025), `edge bootstrap` operator subcommand (mint via DB-creds+seal-key trust boundary, NO mint HTTP endpoint), Basic→Bearer on the git wire only, `token_login_enabled` auth-config flag, web operator-token login, dogfood scripts+runbook | **DONE + VERIFIED** (backend `c6e6057` Fable-ACCEPT; web `c80a3e6`) |
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
-| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | CT-004 grounding scout running |
+| R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — readable logs proven; execution-plan boundary built but production start remains disabled** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
 | R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **IN PROGRESS — durable store floor only** (`18362f1`, `7a3068b`); production edge/CLI remain intentionally unmounted pending atomic ReBAC tuple bootstrap |
 
@@ -478,10 +478,31 @@ byte-identical to the foundation table, and the Issues main invokes the real pro
 compensate with a proven transaction seam) the new issue row and its `issue#parent_project` ReBAC tuple;
 Identity currently owns that tuple transaction and exposes no connection-bound atomic bootstrap. Mounting
 the route now would create either an orphan row or an authorization bypass, so the surface stays closed.
-The live proof also reconfirmed the platform-wide migrate-as-owner/serve-as-app gap: `myelin_app` cannot
-create the migration ledger on a fresh database. Production roots need one shared split-credential boot
-convention; an Issues-only migration credential was not invented here. R4.4 remains open until those
-seams land and authenticated create/list/view/close are exercised through the real edge + CLI.
+The platform-wide migrate-as-owner/serve-as-app gap now has a shared guarded bootstrap and is live in
+Issues + Edge: production boot requires distinct credentials, performs DDL through the migration-only
+pool, re-validates the NOBYPASSRLS runtime role, closes the privileged pool, and erases its DSN before
+constructing stores or listeners. The remaining production roots still need that rollout. R4.4 remains
+open until the atomic ReBAC seam lands and authenticated create/list/view/close are exercised through
+the real edge + CLI.
+
+**Production-hardening increment (2026-07-18; foundations are not activation).** The shared PostgreSQL
+outbox now has a capability-minimal JetStream publisher adapter and an advisory-lock-elected drain pass.
+The live NATS proof creates zero consumers; the live PostgreSQL proof shows one publisher at a time,
+per-aggregate order, standby behavior, and broker outage rollback without consuming the permanent-failure
+budget. Publisher-only service roots no longer claim shared rows locally. This does **not** make the relay
+production-live: malformed-row quarantine, authoritative row/envelope validation, taxonomy/aggregate
+reconciliation, TLS/JWT/ACL wiring, validation-only stream binding, a real long-running health/shutdown
+lifecycle, and removal of CI Dispatch's private embedded relay are still blocking gates. In particular,
+the current adapter must not be activated while it can provision a stream or route invalid envelopes to a
+fallback subject.
+
+The CI track now owns a strict versioned executable DAG contract in `myelin-ci-controlplane`: canonical
+tenant-keyed CAS loading requires exact snapshot refs plus durable repo/commit provenance, enforces bounded
+commands/images/matrices, rejects unknown authority fields and legacy/unversioned snapshots, and preserves
+the DAG instead of silently flattening it. This is also **not execution activation**. Dispatch still has to
+produce the versioned plan and provenance, and durable workflow ownership, DAG-wave execution, runtime
+token/meter authority, per-check verdicts, authoritative attempts, and a tenant-scoped durable starter are
+still required before a real job can start.
 
 **R4.1 dogfood findings (2026-07-16, drove the REAL edge binary end-to-end — the first act no test covered).**
 Boot + bootstrap + repo-create all worked first try (edge up on :8080, `token_login_enabled:true` served,
