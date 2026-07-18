@@ -149,6 +149,7 @@ pub use run_plan::{
 /// the durable CI run's `queued -> running` transition.
 pub mod pg_pipeline_starter;
 pub use pg_pipeline_starter::{
+    decode_ci_claimed_input, CiWorkflowDefinitionPin, ClaimedCiInput, ClaimedCiInputError,
     PgCiPipelineStarter, PgCiStarterError, StartQueuedOutcome,
 };
 /// CT-004d.2 CULMINATION (chunks 2/3/5): the CI pipeline DRIVER — a pushed CI trigger runs a REAL

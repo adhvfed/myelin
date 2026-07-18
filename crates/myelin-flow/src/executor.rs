@@ -419,7 +419,10 @@ impl FlowExecutor {
 
 /// The stable worker partition for a run handle. Kept outside either executor implementation so
 /// memory and Postgres stamp exactly the same shard for the same run id.
-pub(crate) fn partition_for_run_id(run_id: &str) -> i16 {
+/// Deterministically assign a durable run id to its workflow partition. Product starters expose
+/// this only to verify that an idempotent PostgreSQL replay still carries the exact engine-owned
+/// partition selected at creation; callers must not use it for tenant discovery or routing.
+pub fn partition_for_run_id(run_id: &str) -> i16 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     run_id.hash(&mut h);

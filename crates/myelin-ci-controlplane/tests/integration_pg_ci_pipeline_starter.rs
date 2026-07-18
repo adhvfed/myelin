@@ -2,11 +2,13 @@
 #![cfg(feature = "integration")]
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use myelin_ci_controlplane::{
-    ci_artifact_ref, ci_run_ref, PgCiPipelineStarter, ResolvedJobV1, ResolvedRunPlanV1,
-    StartQueuedOutcome, CREATE_CI_RUN_DDL,
+    ci_artifact_ref, ci_run_ref, CiWorkflowDefinitionPin, PgCiPipelineStarter, ResolvedJobV1,
+    ResolvedRunPlanV1, StartQueuedOutcome, CREATE_CI_RUN_DDL,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::MonotonicMinter;
@@ -16,10 +18,47 @@ use myelin_flow::{
 };
 use myelin_refs::ArtifactRef;
 use myelin_storage::{
-    provider::foundation_migrations, BlobStore, FsBlobStore, HotTables, PgMigrator,
+    provider::foundation_migrations, BlobError, BlobMeta, BlobStore, ContentHash, FsBlobStore,
+    HotTables, PgMigrator,
 };
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool};
+
+const BODY_HASH: &str = "blake3:ci-pg-body-v1";
+const BODY_HASH_V2: &str = "blake3:ci-pg-body-v2";
+
+struct PausingBlobStore {
+    inner: Arc<FsBlobStore>,
+    pause_once: AtomicBool,
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl BlobStore for PausingBlobStore {
+    fn put(&self, tenant: &TenantId, bytes: &[u8]) -> Result<ContentHash, BlobError> {
+        self.inner.put(tenant, bytes)
+    }
+
+    fn get(&self, tenant: &TenantId, hash: &ContentHash) -> Result<Vec<u8>, BlobError> {
+        self.inner.get(tenant, hash)
+    }
+
+    fn head(&self, tenant: &TenantId, hash: &ContentHash) -> Result<BlobMeta, BlobError> {
+        if !self.pause_once.swap(true, Ordering::SeqCst) {
+            self.entered.send(()).expect("announce CAS preflight");
+            self.release
+                .lock()
+                .expect("release lock")
+                .recv()
+                .expect("release CAS preflight");
+        }
+        self.inner.head(tenant, hash)
+    }
+
+    fn delete(&self, tenant: &TenantId, hash: &ContentHash) -> Result<(), BlobError> {
+        self.inner.delete(tenant, hash)
+    }
+}
 
 fn app_url() -> String {
     std::env::var("DATABASE_URL").unwrap_or_else(|_| MyelinConfig::dev().database_url)
@@ -66,6 +105,20 @@ fn plan() -> ResolvedRunPlanV1 {
 }
 
 fn starter(pool: &PgPool, tenant: &str, blobs: Arc<FsBlobStore>) -> PgCiPipelineStarter {
+    starter_with(
+        pool,
+        tenant,
+        blobs,
+        CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
+    )
+}
+
+fn starter_with(
+    pool: &PgPool,
+    tenant: &str,
+    blobs: Arc<dyn BlobStore + Send + Sync>,
+    definition: CiWorkflowDefinitionPin,
+) -> PgCiPipelineStarter {
     PgCiPipelineStarter::new(
         pool.clone(),
         tokio::runtime::Handle::current(),
@@ -73,6 +126,7 @@ fn starter(pool: &PgPool, tenant: &str, blobs: Arc<FsBlobStore>) -> PgCiPipeline
         TenantId(tenant.into()),
         Region("fr-par".into()),
         blobs,
+        definition,
     )
     .expect("valid exact-cell starter")
 }
@@ -156,6 +210,30 @@ async fn expected_input(admin: &PgPool, tenant: &str, run_id: &str) -> Vec<Artif
     ]
 }
 
+async fn seed_exact_workflow(
+    app: &PgPool,
+    admin: &PgPool,
+    tenant: &str,
+    run_id: &str,
+    wf_run_id: &str,
+) {
+    let input = expected_input(admin, tenant, run_id).await;
+    let executor = flow_executor(app, tenant);
+    tokio::task::block_in_place(|| {
+        executor
+            .start_with_id(
+                StartSpec {
+                    wf_type: CI_PIPELINE_WF_TYPE.into(),
+                    input,
+                    budget: None,
+                    idem_key: format!("ci:{run_id}"),
+                },
+                Some(RunId(wf_run_id.into())),
+            )
+            .expect("seed exact workflow identity");
+    });
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated() {
     let schema = schema_name();
@@ -200,7 +278,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     let register = flow_executor(&admin, "tenant_a");
     tokio::task::block_in_place(|| {
         register
-            .register_definition(CI_PIPELINE_WF_TYPE, 1, "blake3:ci-pg-body-v1")
+            .register_definition(CI_PIPELINE_WF_TYPE, 1, BODY_HASH)
             .expect("register immutable workflow definition");
     });
 
@@ -387,6 +465,253 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .is_err());
     assert_atomic_started(&admin, "tenant_terminal", run8, false, true).await;
 
+    // Hold ID/key/input fixed and mutate every other starter-owned immutable workflow column in an
+    // isolated tenant. Each row is genuinely claimed and rejected by the post-start identity proof.
+    let immutable_mutations = [
+        (
+            "tenant_wf_version",
+            "11000000-0000-0000-0000-000000000001",
+            "21000000-0000-0000-0000-000000000001",
+            "UPDATE workflow_run SET wf_version=2 WHERE tenant_id=$1 AND run_id=$2",
+        ),
+        (
+            "tenant_budget",
+            "11000000-0000-0000-0000-000000000002",
+            "21000000-0000-0000-0000-000000000002",
+            "UPDATE workflow_run SET budget='{\"minor_units\":1}'::jsonb WHERE tenant_id=$1 AND run_id=$2",
+        ),
+        (
+            "tenant_correlation",
+            "11000000-0000-0000-0000-000000000003",
+            "21000000-0000-0000-0000-000000000003",
+            "UPDATE workflow_run SET correlation_id='foreign-correlation' WHERE tenant_id=$1 AND run_id=$2",
+        ),
+        (
+            "tenant_causation",
+            "11000000-0000-0000-0000-000000000004",
+            "21000000-0000-0000-0000-000000000004",
+            "UPDATE workflow_run SET causation_id='foreign-cause' WHERE tenant_id=$1 AND run_id=$2",
+        ),
+        (
+            "tenant_caused_by",
+            "11000000-0000-0000-0000-000000000005",
+            "21000000-0000-0000-0000-000000000005",
+            "UPDATE workflow_run SET caused_by='foreign-actor' WHERE tenant_id=$1 AND run_id=$2",
+        ),
+        (
+            "tenant_depth",
+            "11000000-0000-0000-0000-000000000006",
+            "21000000-0000-0000-0000-000000000006",
+            "UPDATE workflow_run SET depth=1 WHERE tenant_id=$1 AND run_id=$2",
+        ),
+        (
+            "tenant_partition",
+            "11000000-0000-0000-0000-000000000007",
+            "21000000-0000-0000-0000-000000000007",
+            "UPDATE workflow_run SET partition=((partition+1)%64)::smallint WHERE tenant_id=$1 AND run_id=$2",
+        ),
+    ];
+    for (tenant, run_id, wf_run_id, mutation) in immutable_mutations {
+        insert_run(&admin, blobs.as_ref(), tenant, run_id, wf_run_id).await;
+        seed_exact_workflow(&app, &admin, tenant, run_id, wf_run_id).await;
+        sqlx::query(mutation)
+            .bind(tenant)
+            .bind(wf_run_id)
+            .execute(&admin)
+            .await
+            .expect("mutate one immutable workflow field");
+        let error = starter(&app, tenant, blobs.clone())
+            .run_once()
+            .await
+            .expect_err("divergent immutable workflow identity must be refused");
+        assert!(error.to_string().contains("diverges"));
+        assert_atomic_started(&admin, tenant, run_id, false, true).await;
+    }
+
+    // The typed code pin is load-bearing even when the version number matches.
+    let run_hash = "12000000-0000-0000-0000-000000000001";
+    let wf_hash = "22000000-0000-0000-0000-000000000001";
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        "tenant_bad_code_pin",
+        run_hash,
+        wf_hash,
+    )
+    .await;
+    assert!(starter_with(
+        &app,
+        "tenant_bad_code_pin",
+        blobs.clone(),
+        CiWorkflowDefinitionPin::new(1, "blake3:not-the-body").unwrap(),
+    )
+    .run_once()
+    .await
+    .is_err());
+    assert_atomic_started(&admin, "tenant_bad_code_pin", run_hash, false, false).await;
+
+    // Queued lifecycle contradictions are refused before any workflow is created.
+    for (tenant, run_id, wf_run_id, mutation) in [
+        (
+            "tenant_cost_settled",
+            "12000000-0000-0000-0000-000000000002",
+            "22000000-0000-0000-0000-000000000002",
+            "UPDATE ci_run SET cost_settled=true WHERE tenant_id=$1 AND run_id=$2::uuid",
+        ),
+        (
+            "tenant_finished",
+            "12000000-0000-0000-0000-000000000003",
+            "22000000-0000-0000-0000-000000000003",
+            "UPDATE ci_run SET finished_at=now() WHERE tenant_id=$1 AND run_id=$2::uuid",
+        ),
+    ] {
+        insert_run(&admin, blobs.as_ref(), tenant, run_id, wf_run_id).await;
+        sqlx::query(mutation)
+            .bind(tenant)
+            .bind(run_id)
+            .execute(&admin)
+            .await
+            .unwrap();
+        assert!(starter(&app, tenant, blobs.clone())
+            .run_once()
+            .await
+            .is_err());
+        assert_atomic_started(&admin, tenant, run_id, false, false).await;
+    }
+
+    // CAS preflight holds no row lock: a concurrent authority mutation can commit, and the exact
+    // re-lock compares the complete row and refuses it before workflow creation.
+    let run_preflight = "12000000-0000-0000-0000-000000000004";
+    let wf_preflight = "22000000-0000-0000-0000-000000000004";
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        "tenant_preflight_mutation",
+        run_preflight,
+        wf_preflight,
+    )
+    .await;
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let pausing: Arc<dyn BlobStore + Send + Sync> = Arc::new(PausingBlobStore {
+        inner: blobs.clone(),
+        pause_once: AtomicBool::new(false),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    });
+    let preflight_starter = starter_with(
+        &app,
+        "tenant_preflight_mutation",
+        pausing,
+        CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
+    );
+    let runtime = tokio::runtime::Handle::current();
+    let preflight_thread =
+        std::thread::spawn(move || runtime.block_on(preflight_starter.run_once()));
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("starter reaches unlocked CAS preflight");
+    sqlx::query(
+        "UPDATE ci_run SET commit_oid='changed-during-preflight' \
+         WHERE tenant_id='tenant_preflight_mutation' AND run_id=$1::uuid",
+    )
+    .bind(run_preflight)
+    .execute(&admin)
+    .await
+    .expect("mutation is not blocked by object-store preflight");
+    release_tx.send(()).unwrap();
+    assert!(preflight_thread.join().unwrap().is_err());
+    assert_atomic_started(
+        &admin,
+        "tenant_preflight_mutation",
+        run_preflight,
+        false,
+        false,
+    )
+    .await;
+
+    // Likewise, a winner can complete while another starter is in CAS preflight. The loser re-locks
+    // the exact candidate, observes it is no longer queued, and returns Idle without a duplicate.
+    let run_winner = "12000000-0000-0000-0000-000000000005";
+    let wf_winner = "22000000-0000-0000-0000-000000000005";
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        "tenant_preflight_winner",
+        run_winner,
+        wf_winner,
+    )
+    .await;
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let pausing: Arc<dyn BlobStore + Send + Sync> = Arc::new(PausingBlobStore {
+        inner: blobs.clone(),
+        pause_once: AtomicBool::new(false),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    });
+    let losing_starter = starter_with(
+        &app,
+        "tenant_preflight_winner",
+        pausing,
+        CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
+    );
+    let runtime = tokio::runtime::Handle::current();
+    let losing_thread = std::thread::spawn(move || runtime.block_on(losing_starter.run_once()));
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("loser reaches unlocked CAS preflight");
+    assert!(matches!(
+        starter(&app, "tenant_preflight_winner", blobs.clone())
+            .run_once()
+            .await
+            .unwrap(),
+        StartQueuedOutcome::Started { .. }
+    ));
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        losing_thread.join().unwrap().unwrap(),
+        StartQueuedOutcome::Idle
+    );
+    assert_atomic_started(&admin, "tenant_preflight_winner", run_winner, true, true).await;
+
+    // Existing pinned v1 runs may recover while v1 is draining; fresh intake remains closed.
+    let run_draining = "12000000-0000-0000-0000-000000000006";
+    let wf_draining = "22000000-0000-0000-0000-000000000006";
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        "tenant_draining_replay",
+        run_draining,
+        wf_draining,
+    )
+    .await;
+    seed_exact_workflow(
+        &app,
+        &admin,
+        "tenant_draining_replay",
+        run_draining,
+        wf_draining,
+    )
+    .await;
+    sqlx::query("UPDATE wf_definition SET status='draining' WHERE wf_type=$1 AND version=1")
+        .bind(CI_PIPELINE_WF_TYPE)
+        .execute(&admin)
+        .await
+        .unwrap();
+    assert!(matches!(
+        starter(&app, "tenant_draining_replay", blobs.clone())
+            .run_once()
+            .await
+            .unwrap(),
+        StartQueuedOutcome::Started { .. }
+    ));
+    sqlx::query("UPDATE wf_definition SET status='active' WHERE wf_type=$1 AND version=1")
+        .bind(CI_PIPELINE_WF_TYPE)
+        .execute(&admin)
+        .await
+        .unwrap();
+
     // Invalid/absent CAS is refused before a workflow row exists and before lifecycle mutation.
     let run6 = "10000000-0000-0000-0000-000000000006";
     let wf6 = "20000000-0000-0000-0000-000000000006";
@@ -444,6 +769,38 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         StartQueuedOutcome::Idle
     );
     assert_atomic_started(&admin, "tenant_region", run_region, false, false).await;
+
+    // Fresh intake cannot silently bind an older pinned body when a newer active definition is the
+    // deterministic registry selection. The queued row remains untouched and no workflow appears.
+    let register_v2 = flow_executor(&admin, "tenant_fresh_old_pin");
+    tokio::task::block_in_place(|| {
+        register_v2
+            .register_definition(CI_PIPELINE_WF_TYPE, 2, BODY_HASH_V2)
+            .expect("register newer active workflow definition");
+    });
+    let run_old_pin = "12000000-0000-0000-0000-000000000007";
+    let wf_old_pin = "22000000-0000-0000-0000-000000000007";
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        "tenant_fresh_old_pin",
+        run_old_pin,
+        wf_old_pin,
+    )
+    .await;
+    let error = starter_with(
+        &app,
+        "tenant_fresh_old_pin",
+        blobs.clone(),
+        CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
+    )
+    .run_once()
+    .await
+    .expect_err("fresh v1 pin must not bypass active v2 selection");
+    assert!(error
+        .to_string()
+        .contains("active workflow selection does not equal pinned version 1"));
+    assert_atomic_started(&admin, "tenant_fresh_old_pin", run_old_pin, false, false).await;
 
     bare.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
         .await
