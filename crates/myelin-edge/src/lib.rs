@@ -76,6 +76,7 @@ pub mod git_effect;
 pub mod git_receive_pack;
 pub mod git_wire_exec;
 pub mod git_wire_http;
+pub mod issue_authz;
 pub mod repo_authz;
 pub mod repo_authz_live;
 pub mod request;
