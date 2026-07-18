@@ -182,21 +182,24 @@ impl PiiKeyRef {
     pub fn parse(uri: &str) -> Option<PiiKeyRef> {
         let rest = uri.strip_prefix("kms://")?;
         // Exactly three `/`-separated segments: <tenant> / <dek-epoch> / <class>. The class itself
-        // may CONTAIN a `:` (subject:<id>) but never a `/`, so a splitn(3) is exact.
-        let mut parts = rest.splitn(3, '/');
+        // may CONTAIN a `:` (subject:<id>) but never a `/`.
+        let mut parts = rest.split('/');
         let tenant = parts.next()?;
         let epoch = parts.next()?;
         let class = parts.next()?;
-        if tenant.is_empty() {
+        if tenant.is_empty() || parts.next().is_some() {
             return None;
         }
         let dek_epoch: u64 = epoch.parse().ok()?;
         let class = KeyClass::parse_token(class)?;
-        Some(PiiKeyRef {
+        let parsed = PiiKeyRef {
             tenant: TenantId(tenant.to_string()),
             dek_epoch,
             class,
-        })
+        };
+        // `to_uri` is the byte-exact formatter. Refuse alternate spellings such as a
+        // leading-zero epoch instead of silently normalising a wire authority.
+        (parsed.to_uri() == uri).then_some(parsed)
     }
 }
 
@@ -1455,6 +1458,14 @@ mod tests {
         assert!(
             PiiKeyRef::parse("kms://acme/0/subject:").is_none(),
             "empty subject id"
+        );
+        assert!(
+            PiiKeyRef::parse("kms://acme/0/subject:u42/extra").is_none(),
+            "a key ref has exactly three path segments"
+        );
+        assert!(
+            PiiKeyRef::parse("kms://acme/00/tenant").is_none(),
+            "the epoch spelling is canonical"
         );
     }
 

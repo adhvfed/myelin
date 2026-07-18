@@ -57,6 +57,7 @@
 //! `parse_error_display_is_loud_and_names_the_rule`.)
 
 use myelin_events::{ArtifactRef, ARTIFACT_TYPE_TOKENS, SUBSYSTEM_TOKENS};
+use myelin_tenancy::TenantId;
 use serde::{Deserialize, Serialize};
 
 /// The canonical URN scheme prefix. The ONLY scheme `parse` admits (a bare `https://…` or a
@@ -108,6 +109,27 @@ pub enum ParseError {
         /// The rejected `#sub` token (the text after `#`).
         sub: String,
     },
+}
+
+/// A canonical [`ArtifactRef`] together with the explicit scope parsed from its wire form.
+///
+/// Callers that enforce tenancy or route by artifact kind must use this typed result instead of
+/// splitting the URI again. [`parse`] remains the value-only compatibility surface and delegates
+/// to [`parse_scoped`], so both entry points have exactly one grammar authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedArtifactRef {
+    /// The canonical full reference, including any validated `#sub` suffix.
+    pub artifact_ref: ArtifactRef,
+    /// The explicit tenant authority from the first scope segment.
+    pub tenant: TenantId,
+    /// The canonical Bus subsystem token.
+    pub subsystem: String,
+    /// The canonical Bus artifact-type token.
+    pub type_: String,
+    /// The opaque root artifact id, excluding any `#sub` suffix.
+    pub id: String,
+    /// The typed sub-artifact suffix, when present.
+    pub sub: Option<Sub>,
 }
 
 impl core::fmt::Display for ParseError {
@@ -354,7 +376,7 @@ fn format_sub(sub: &Sub) -> String {
 /// 2. exactly four `/`-separated segments follow (`tenant/subsystem/type/id`), each non-empty;
 /// 3. `<subsystem>` ∈ Bus §6.2 [`SUBSYSTEM_TOKENS`]; `<type>` ∈ Bus §6.2 [`ARTIFACT_TYPE_TOKENS`];
 /// 4. if an `#sub` suffix is present, it is one of the frozen §3.5 kinds ([`Sub`]).
-pub fn parse(s: &str) -> Result<ArtifactRef, ParseError> {
+pub fn parse_scoped(s: &str) -> Result<ParsedArtifactRef, ParseError> {
     let rest = s
         .strip_prefix(SCHEME)
         .ok_or_else(|| ParseError::MissingScheme {
@@ -404,17 +426,33 @@ pub fn parse(s: &str) -> Result<ArtifactRef, ParseError> {
     }
 
     // Validate (and canonicalise) the `#sub` if present. A present-but-malformed sub is rejected.
-    let canonical = match sub_text {
+    let parsed_sub = match sub_text {
+        None => None,
+        Some(sub) => Some(parse_sub(sub)?),
+    };
+    let canonical = match &parsed_sub {
         None => format!("{SCHEME}{tenant}/{subsystem}/{type_}/{id}"),
-        Some(sub) => {
-            let parsed = parse_sub(sub)?;
+        Some(parsed) => {
             format!(
                 "{SCHEME}{tenant}/{subsystem}/{type_}/{id}#{}",
-                format_sub(&parsed)
+                format_sub(parsed)
             )
         }
     };
-    Ok(ArtifactRef(canonical))
+    Ok(ParsedArtifactRef {
+        artifact_ref: ArtifactRef(canonical),
+        tenant: TenantId(tenant.to_string()),
+        subsystem: subsystem.to_string(),
+        type_: type_.to_string(),
+        id: id.to_string(),
+        sub: parsed_sub,
+    })
+}
+
+/// Parse only the canonical [`ArtifactRef`] value. Scope-aware callers should use
+/// [`parse_scoped`] so tenant ownership is never recovered through a second URI parser.
+pub fn parse(s: &str) -> Result<ArtifactRef, ParseError> {
+    parse_scoped(s).map(|parsed| parsed.artifact_ref)
 }
 
 /// `format(&ArtifactRef) -> String` (contract 5.1) — the canonical rendering. Because [`parse`]
@@ -732,6 +770,18 @@ mod tests {
         assert_eq!(strip_sub(&root), root);
         // a bare root with no `#sub` accessor returns None.
         assert_eq!(sub_kind(&root), None);
+    }
+
+    #[test]
+    fn scoped_parse_returns_the_authoritative_tenant_and_components() {
+        let parsed = parse_scoped("myelin://acme/git/pr/42#comment-c9").expect("canonical ref");
+        assert_eq!(parsed.artifact_ref.0, "myelin://acme/git/pr/42#comment-c9");
+        assert_eq!(parsed.tenant, TenantId("acme".into()));
+        assert_eq!(parsed.subsystem, "git");
+        assert_eq!(parsed.type_, "pr");
+        assert_eq!(parsed.id, "42");
+        assert_eq!(parsed.sub, Some(Sub::Comment("c9".into())));
+        assert!(parse_scoped("https://acme/git/pr/42").is_err());
     }
 
     /// A `comment-…` is never mis-classified as a `b`/`h`/`check-` kind (prefix-overlap discipline).

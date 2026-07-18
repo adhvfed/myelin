@@ -51,7 +51,10 @@ pub use myelin_events::ArtifactRef;
 /// parser/formatter, the `#sub`-stripped root, the `#sub` kind accessor + the typed rejection
 /// taxonomy. These are the value-type behaviours every service consumes (REF-3 — never
 /// re-implemented per service).
-pub use parse::{format, mint, parse, strip_sub, sub_kind, ParseError, Sub, SubKind, SCHEME};
+pub use parse::{
+    format, mint, parse, parse_scoped, strip_sub, sub_kind, ParseError, ParsedArtifactRef, Sub,
+    SubKind, SCHEME,
+};
 
 /// The ONE canonical **type-qualified authz object key** (R2.2): maps either spelling of a check/
 /// match object (`repo:core` or `myelin://acme/git/repo/core`, `#sub`-anchored or not) onto the one
