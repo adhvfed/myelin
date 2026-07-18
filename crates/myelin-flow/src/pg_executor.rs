@@ -12,7 +12,7 @@ use crate::executor::{
     partition_for_run_id, DurableExecutor, ExecutorError, RunId, RunStatus, SignalOutcome,
     SignalSpec, StartSpec,
 };
-use myelin_events::IdMinter;
+use myelin_events::{HandlerTx, IdMinter};
 use myelin_storage::{with_tenant_tx, with_tenant_tx_error, PgError};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::postgres::PgPool;
@@ -98,6 +98,24 @@ impl PgFlowExecutor {
             tenant,
             region,
         }
+    }
+
+    /// Start a workflow on the caller's existing consumer transaction. The workflow row therefore
+    /// commits or rolls back with the event dedup mark and the caller's other durable effects. No
+    /// nested transaction is opened and a missing/type-mismatched co-commit handle fails closed.
+    pub fn start_with_id_on_conn(
+        &self,
+        tx: &mut HandlerTx<'_>,
+        spec: StartSpec,
+        run_id: Option<RunId>,
+    ) -> Result<RunId, ExecutorError> {
+        let conn = tx.connection::<sqlx::PgConnection>().ok_or_else(|| {
+            ExecutorError::Storage(
+                "start workflow on caller transaction: durable co-commit connection unavailable"
+                    .into(),
+            )
+        })?;
+        bridge(&self.rt, self.start_on_conn_async(conn, spec, run_id))
     }
 
     /// Register immutable workflow code. Re-registering the exact hash is idempotent; reusing a
@@ -301,6 +319,125 @@ impl PgFlowExecutor {
                 ExecutorError::RunIdConflict(error_run_id)
             } else {
                 store_error("start workflow", error)
+            }
+        })
+    }
+
+    async fn start_on_conn_async(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        spec: StartSpec,
+        requested_run_id: Option<RunId>,
+    ) -> Result<RunId, ExecutorError> {
+        bounded("wf_type", &spec.wf_type, 128)?;
+        bounded("idem_key", &spec.idem_key, 512)?;
+        validate_refs(&spec.input, &self.tenant)?;
+        if let Some(run_id) = requested_run_id.as_ref() {
+            bounded("run_id", &run_id.0, 256)?;
+        }
+        let tenant = self.tenant.0.clone();
+        let region = self.region.0.clone();
+        let minted = requested_run_id
+            .clone()
+            .unwrap_or_else(|| RunId(self.minter.mint().0));
+        let partition = partition_for_run_id(&minted.0);
+        let input = serde_json::to_string(&spec.input)
+            .map_err(|e| store_error("encode workflow input refs", e))?;
+        let budget = spec
+            .budget
+            .as_ref()
+            .map(|budget| serde_json::json!({ "minor_units": budget.minor_units }).to_string());
+        let requested_id = requested_run_id.is_some();
+        let error_wf_type = spec.wf_type.clone();
+        let error_run_id = minted.0.clone();
+
+        let result: Result<RunId, PgError> = async {
+            // The transaction is caller-owned but every query still carries explicit scope. The
+            // consumer runtime has already installed matching transaction-local RLS settings.
+            if let Some(existing) = sqlx::query_scalar::<_, String>(
+                "SELECT run_id FROM workflow_run WHERE tenant_id = $1 AND region = $2 \
+                 AND idem_key = $3",
+            )
+            .bind(&tenant)
+            .bind(&region)
+            .bind(&spec.idem_key)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| PgError::Query(format!("find idempotent workflow start: {e}")))?
+            {
+                return Ok(RunId(existing));
+            }
+
+            // Global code registry: tenant_id/region do not apply to code-only definitions.
+            let wf_version = sqlx::query_scalar::<_, i32>(
+                "SELECT version FROM wf_definition WHERE wf_type = $1 AND status = 'active' \
+                 /* global registry: tenant_id and region do not apply */ \
+                 ORDER BY version DESC LIMIT 1",
+            )
+            .bind(&spec.wf_type)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| PgError::Query(format!("resolve active workflow definition: {e}")))?;
+            let Some(wf_version) = wf_version else {
+                return Err(PgError::Query(format!(
+                    "unknown workflow type: {}",
+                    spec.wf_type
+                )));
+            };
+
+            let inserted = sqlx::query(
+                "INSERT INTO workflow_run (tenant_id, region, run_id, wf_type, wf_version, \
+                 input, state, cursor, budget, correlation_id, causation_id, caused_by, depth, \
+                 partition, idem_key) VALUES ($1, $2, $3, $4, $5, CAST($6 AS jsonb), \
+                 'running', 0, CAST($7 AS jsonb), $3, NULL, NULL, 0, $8, $9) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(&tenant)
+            .bind(&region)
+            .bind(&minted.0)
+            .bind(&spec.wf_type)
+            .bind(wf_version)
+            .bind(&input)
+            .bind(&budget)
+            .bind(partition)
+            .bind(&spec.idem_key)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| PgError::Query(format!("insert durable workflow run: {e}")))?;
+            if inserted.rows_affected() == 1 {
+                return Ok(minted);
+            }
+
+            if let Some(existing) = sqlx::query_scalar::<_, String>(
+                "SELECT run_id FROM workflow_run WHERE tenant_id = $1 AND region = $2 \
+                 AND idem_key = $3",
+            )
+            .bind(&tenant)
+            .bind(&region)
+            .bind(&spec.idem_key)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| PgError::Query(format!("resolve concurrent workflow start: {e}")))?
+            {
+                return Ok(RunId(existing));
+            }
+
+            let kind = if requested_id { "provided" } else { "minted" };
+            Err(PgError::Query(format!(
+                "{kind} run_id collision: {}",
+                minted.0
+            )))
+        }
+        .await;
+
+        result.map_err(|error| {
+            let text = error.to_string();
+            if text.contains("unknown workflow type:") {
+                ExecutorError::UnknownWorkflow(error_wf_type)
+            } else if text.contains("run_id collision:") {
+                ExecutorError::RunIdConflict(error_run_id)
+            } else {
+                store_error("start workflow on caller transaction", error)
             }
         })
     }
@@ -581,5 +718,33 @@ mod tests {
             ),
             Err(ExecutorError::InvalidInput(_))
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn caller_transaction_start_requires_a_durable_handler_connection() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+            .unwrap();
+        let executor = PgFlowExecutor::new(
+            pool,
+            tokio::runtime::Handle::current(),
+            Arc::new(myelin_events::MonotonicMinter::new()),
+            TenantId("acme".into()),
+            Region("fr-par".into()),
+        );
+        let mut tx = HandlerTx::none();
+        let error = executor
+            .start_with_id_on_conn(
+                &mut tx,
+                StartSpec {
+                    wf_type: "ci.pipeline".into(),
+                    input: Vec::new(),
+                    budget: None,
+                    idem_key: "event-1".into(),
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(error, ExecutorError::Storage(message) if message.contains("co-commit")));
     }
 }

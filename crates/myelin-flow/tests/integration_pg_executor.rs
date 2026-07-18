@@ -2,7 +2,7 @@
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
-use myelin_events::MonotonicMinter;
+use myelin_events::{HandlerTx, MonotonicMinter};
 use myelin_flow::{
     migrations::migrations, DurableExecutor, ExecutorError, PgFlowExecutor, RunId, SignalOutcome,
     SignalSpec, StartSpec,
@@ -94,6 +94,50 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
             Err(ExecutorError::DefinitionDrift(_))
         ));
     });
+
+    // The transaction-aware entry point writes on the caller's exact connection. Rolling the
+    // caller back removes the workflow start too; no nested transaction escaped the co-commit.
+    let mut caller_tx = pool.begin().await.expect("begin caller co-commit tx");
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)",
+    )
+    .bind("acme")
+    .bind("fr-par")
+    .execute(&mut *caller_tx)
+    .await
+    .expect("scope caller co-commit tx");
+    let rolled_back_run = tokio::task::block_in_place(|| {
+        let mut handler_tx = HandlerTx::with_connection(&mut *caller_tx);
+        let first = first_process
+            .start_with_id_on_conn(
+                &mut handler_tx,
+                start_spec("trigger:rolled-back"),
+                Some(RunId("run-rolled-back".into())),
+            )
+            .expect("start on caller transaction");
+        let replay = first_process
+            .start_with_id_on_conn(
+                &mut handler_tx,
+                start_spec("trigger:rolled-back"),
+                Some(RunId("different-requested-id".into())),
+            )
+            .expect("idempotency anchor wins within caller transaction");
+        assert_eq!(replay, first);
+        first
+    });
+    assert_eq!(rolled_back_run.0, "run-rolled-back");
+    caller_tx.rollback().await.expect("roll back caller tx");
+    let rolled_back_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM workflow_run WHERE tenant_id = 'acme' AND region = 'fr-par' \
+         AND idem_key = 'trigger:rolled-back'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("verify caller rollback");
+    assert_eq!(
+        rolled_back_count, 0,
+        "caller rollback removes workflow start"
+    );
 
     let run = tokio::task::block_in_place(|| {
         first_process
