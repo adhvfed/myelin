@@ -22,13 +22,10 @@
 //! `residency-pin` lint expects, recorded via `@residency-cell-pinned:file`) + clear the tenant GUC →
 //! op → COMMIT (the GUC discarded on commit, so the pooled connection carries no residual scope).
 //!
-//! **NAMED FLOOR (honest).** Under the `(tenant, region)` tenant-isolation FORCE-RLS policy a
-//! region-wide read returns nothing unless the scheduler connects under a role that reads the
-//! region's queue across tenants (a superuser / a dedicated region-scoped scheduler role). A
-//! region-scoped scheduler DB role / policy is the follow-on; the `region` GUC is set correctly here
-//! so a future policy keyed on `current_setting('myelin.region')` needs no code change. This is NOT a
-//! weakened tenant isolation — the per-tenant writes above enforce `(tenant, region)` RLS under the
-//! app role.
+//! **Dedicated capability boundary.** [`CiRegionQueueStore`] must be constructed over the constrained
+//! region-scheduler pool. PostgreSQL admits rows only when the authenticated `session_user` mapping,
+//! the row region, and this transaction's region GUC agree while the tenant GUC is empty. The type
+//! exposes only claim/reap; tenant writes remain impossible through this capability surface.
 //!
 //! @residency-cell-pinned:file — the region is pinned in-band on every op via the transaction-scoped
 //! `myelin.region` GUC (there is no region-less pool construction in this file; the pool is injected).
@@ -44,6 +41,47 @@ use sqlx::Row;
 
 use crate::job_queue_store::{trust_from_token, trust_token, JobQueueStoreError, LeasedJob};
 use crate::scheduler::{Lane, CLAIM_QUERY, REAP_QUERY};
+
+/// Region-wide scheduler capability over its dedicated constrained PostgreSQL pool. This type is
+/// intentionally separate from [`crate::CiJobQueueStore`]: a tenant application pool can enqueue,
+/// heartbeat, complete, and cancel, but cannot express claim/reap in the Rust API; the scheduler pool
+/// can claim/reap and exposes no tenant mutation verbs.
+#[derive(Clone)]
+pub struct CiRegionQueueStore {
+    pool: PgPool,
+}
+
+impl CiRegionQueueStore {
+    /// Bind the dedicated, startup-probed region-scheduler pool.
+    pub fn with_pg(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Lease one eligible row across tenants in the mapped region.
+    pub async fn claim(
+        &self,
+        region: &str,
+        runner_labels: &[String],
+        runner_allowed_tiers: &[TrustTier],
+        lease_owner: &str,
+        lease_secs: u64,
+    ) -> Result<Option<LeasedJob>, JobQueueStoreError> {
+        claim_region_scoped(
+            &self.pool,
+            region,
+            runner_labels,
+            runner_allowed_tiers,
+            lease_owner,
+            lease_secs,
+        )
+        .await
+    }
+
+    /// Re-queue expired leases across tenants in the mapped region.
+    pub async fn reap(&self, region: &str) -> Result<u64, JobQueueStoreError> {
+        reap_region_scoped(&self.pool, region).await
+    }
+}
 
 /// **The pull-lease claim raw execution (arch 02 §2.1; [`CLAIM_QUERY`]) — region-scoped, cross-tenant.**
 /// Runs [`CLAIM_QUERY`] under [`with_region_tx`] and rebuilds the leased row. See the module note: the
@@ -149,8 +187,9 @@ fn leased_from_row(r: &sqlx::postgres::PgRow) -> Result<LeasedJob, JobQueueStore
     let concurrency_group: Option<String> = r.get("concurrency_group");
     let fair_key: String = r.get("fair_key");
     let trust_token_str: String = r.get("trust_tier");
-    let lane = Lane::from_token(&lane_token)
-        .ok_or_else(|| JobQueueStoreError::CorruptRow(format!("unknown lane token `{lane_token}`")))?;
+    let lane = Lane::from_token(&lane_token).ok_or_else(|| {
+        JobQueueStoreError::CorruptRow(format!("unknown lane token `{lane_token}`"))
+    })?;
     let trust_tier = trust_from_token(&trust_token_str)?;
     Ok(LeasedJob {
         tenant_id,

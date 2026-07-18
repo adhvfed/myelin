@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use myelin_ci_controlplane::{
-    ci_job_queue_store, ci_job_spec_store, ci_run_store_factory, durable_spec_resolver,
+    ci_job_queue_store, ci_job_spec_store, ci_region_queue_store, ci_run_store_factory, durable_spec_resolver,
     fixed_command_spec_builder, CheckFacts, CiPipelineDriver, CiRunInsert, DurableLeaseAdapter,
     PipelineRun, PipelineStage, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL, CREATE_FAIR_DEFICIT_DDL,
     CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
@@ -320,6 +320,7 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         tokio::runtime::Handle::current(),
     );
     let adapter = DurableLeaseAdapter::new(
+        ci_region_queue_store(admin.clone()),
         ci_job_queue_store(admin.clone()),
         region,
         tokio::runtime::Handle::current(),

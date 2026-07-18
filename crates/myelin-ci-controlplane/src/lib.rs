@@ -53,6 +53,7 @@
 pub mod artifact_cache;
 pub mod check_emitter;
 pub mod ci_pipeline;
+pub mod ci_scheduler_db;
 /// CT-004a (CI backend reconcile-and-harden — the FOUNDATION chunk): the REAL durable `cost_event`
 /// projection store ([`cost_store::CiCostEventStore`]). Turns the previously model-only CI metering
 /// path (SQL constants + the in-memory [`metering::CostEventRow`] model, no production-callable store)
@@ -463,6 +464,7 @@ pub use scheduler::{
 pub use job_queue_store::{
     CiJobQueueStore, DurableEnqueue, JobQueueReaper, JobQueueStoreError, LeasedJob,
 };
+pub use job_queue_region::CiRegionQueueStore;
 
 // CT-004d.1: the durable `JobSpec` store + the dispatch→durable co-persist + the fail-closed
 // resolve. `CiJobSpecStore::co_persist_dispatch` writes the `job_queue` row AND the digest-pinned
@@ -484,6 +486,10 @@ pub use job_spec_store::{
 pub use ci_run_store::{
     CiRunInsert, CiRunRecord, CiRunStore, CiRunStoreError, INSERT_CI_RUN_QUERY, SELECT_CI_RUN_QUERY,
     VERIFY_CI_RUN_REPLAY_QUERY,
+};
+pub use ci_scheduler_db::{
+    CiSchedulerDbConfig, CiSchedulerDbError, CiSchedulerDbProvider,
+    CI_SCHEDULER_DATABASE_URL_ENV,
 };
 
 // CT-004c.2: the runner exec binding — the durable-store lease adapter + the bounded runner loop the
@@ -700,6 +706,12 @@ pub fn ci_job_queue_store(pool: sqlx::PgPool) -> CiJobQueueStore {
     CiJobQueueStore::with_pg(pool)
 }
 
+/// Construct the cross-tenant region scheduler store over its separately authenticated and probed
+/// scheduler pool. This capability exposes only claim/reap; never pass the tenant application pool.
+pub fn ci_region_queue_store(pool: sqlx::PgPool) -> CiRegionQueueStore {
+    CiRegionQueueStore::with_pg(pool)
+}
+
 /// **Construct the durable CI `ci_job_spec` store at the composition root (CT-004d.1).** The service
 /// `main` builds this from the MR-022 `SubstrateProvider` pool after the migrations have run, so the
 /// dispatch has a real, production-callable [`CiJobSpecStore`] to co-persist a stage's [`JobSpec`] into
@@ -833,8 +845,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            20,
-            "all 15 control-plane tables plus 4 top-level concurrent indexes and their ledger validator are in the migration set"
+            21,
+            "all 15 control-plane tables, 4 top-level concurrent indexes, the ledger validator, and the additive scheduler RLS boundary are in the migration set"
         );
         assert!(
             spec.consumers.is_empty(),
