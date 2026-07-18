@@ -93,7 +93,7 @@ pub enum Mode {
 /// that can embed a password in their userinfo
 /// (`postgres://user:PASSWORD@host/db`); a derived `{:?}` in a log line, a panic, or an error
 /// context would print that password in clear. The redacting impl below prints `<redacted>` for
-/// those two fields (and defers the S3 credential redaction to [`S3Config`]'s own impl).
+/// every credential-bearing DSN (and defers S3 credential redaction to [`S3Config`]'s own impl).
 #[derive(Clone, PartialEq, Eq)]
 pub struct MyelinConfig {
     /// Postgres OLTP connection string (OLTP + outbox + ReBAC tuple store + audit).
