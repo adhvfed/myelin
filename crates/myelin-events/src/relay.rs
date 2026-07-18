@@ -117,6 +117,32 @@ pub trait BusTransport: Send + Sync {
     fn purge(&self);
 }
 
+/// The narrow publish-only broker seam used by an outbox relay.
+///
+/// Production outbox publishers should implement this trait instead of acquiring consumer or
+/// destructive stream-management capabilities they do not need. Existing [`BusTransport`]
+/// implementations remain source-compatible through the blanket adapter below.
+pub trait EventPublisher: Send + Sync {
+    /// Durably publish an envelope with its stable event id as the broker deduplication key.
+    fn publish(
+        &self,
+        subject: &ArtifactRef,
+        envelope: &EventEnvelope,
+        dedup_id: &EventId,
+    ) -> std::result::Result<Delivery, TransportError>;
+}
+
+impl<T: BusTransport + ?Sized> EventPublisher for T {
+    fn publish(
+        &self,
+        subject: &ArtifactRef,
+        envelope: &EventEnvelope,
+        dedup_id: &EventId,
+    ) -> std::result::Result<Delivery, TransportError> {
+        self.put(subject, envelope, dedup_id)
+    }
+}
+
 /// The outcome of a [`BusTransport::put`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Delivery {

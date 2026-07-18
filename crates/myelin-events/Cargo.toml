@@ -17,10 +17,10 @@ serde.workspace = true
 serde_json.workspace = true
 
 # ------------------------------------------------------------------------------------------
-# REAL durable bus behind the `integration` feature (Stage 1 / infra). The BusTransport trait
+# REAL durable bus behind the `nats` feature (Stage 1 / infra). The BusTransport trait
 # (relay.rs) gets a NATS JetStream backing here in later prompts; the OPTIONAL async-nats +
-# tokio deps are pulled ONLY by `--features integration` (the live-NATS tests in
-# tests/integration_nats.rs). The default `cargo build --workspace` compiles neither — the
+# tokio deps are pulled by production's `--features nats` or by the `integration` live-test
+# selector. The default `cargo build --workspace` compiles neither — the
 # in-process InProcessBus remains the unit/floor transport.
 # ------------------------------------------------------------------------------------------
 async-nats = { workspace = true, optional = true }
@@ -31,7 +31,11 @@ futures = { workspace = true, optional = true }
 
 [features]
 default = []
-integration = ["dep:async-nats", "dep:tokio", "dep:myelin-config", "dep:futures"]
+# The real broker adapter is selectable by production binaries without also enabling the
+# integration-test surface (or its test doubles). `integration` remains the live-test selector and
+# includes the same broker implementation.
+nats = ["dep:async-nats", "dep:tokio", "dep:myelin-config", "dep:futures"]
+integration = ["nats"]
 
 # MR-009b Wave 0 — the `test-support` cargo feature (alias `memory`). It gates the events pipeline's
 # in-memory durable-store DOUBLES (OutboxStore, DedupLedger `Memory` arm, BusErasureLedger) so
