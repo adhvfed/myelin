@@ -14,6 +14,9 @@ fn production_main_destroys_the_privileged_pool_before_runtime_stores_and_bind()
     let durable = source
         .find("bootstrap\n        .migrate(&all_durable_migrations()")
         .expect("durable aggregate must run through PgBootstrap");
+    let issues = source
+        .find("&myelin_issues::issues_migrations()")
+        .expect("Issues saga schema must run through PgBootstrap");
     let handoff = source
         .find("bootstrap.into_runtime()")
         .expect("bootstrap must be consumed by the runtime handoff");
@@ -25,9 +28,31 @@ fn production_main_destroys_the_privileged_pool_before_runtime_stores_and_bind()
         .expect("serving listener must remain wired");
 
     assert!(foundation < durable);
-    assert!(durable < handoff);
+    assert!(durable < issues);
+    assert!(issues < handoff);
     assert!(handoff < first_runtime_store);
     assert!(handoff < bind);
+}
+
+#[test]
+fn production_edge_owns_the_durable_issue_saga_worker_without_an_in_memory_fallback() {
+    let main = include_str!("../src/main.rs");
+    let adapter = include_str!("../src/issue_authz.rs");
+    let dogfood = include_str!("../../../scripts/dogfood.sh");
+
+    assert!(main.contains("StoreBackedIssueAuthorizer::new(check.clone())"));
+    assert!(main.contains("myelin_issues::PgIssueStore::new("));
+    assert!(main.contains("spawn_issue_authorization_reconciler("));
+    assert!(main.contains("tokio::signal::ctrl_c()"));
+    assert!(main.contains("issue_reconciler.shutdown().await"));
+    assert!(!main.contains("KmsEngine::new()"));
+    assert!(!main.contains("StoreBackedCheck::new("));
+    assert!(!main.contains("OutboxStore::new()"));
+
+    assert!(adapter.contains("ListObjectsResult::Filter { .. }"));
+    assert!(!adapter.contains("Ok(VisibleIssues::All)"));
+    assert!(adapter.contains("MYELIN_ISSUES_RECONCILE_TENANTS"));
+    assert!(dogfood.contains("export MYELIN_ISSUES_RECONCILE_TENANTS="));
 }
 
 #[test]

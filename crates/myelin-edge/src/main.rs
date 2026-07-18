@@ -25,9 +25,11 @@
 
 use myelin_config::Mode;
 use myelin_edge::{
-    bootstrap_principal_and_mint, register_git_durable, register_git_wire, serve_edge, AuthProvider,
-    AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
-    DurableGitBackend, Gateway, Method, TupleRepoBootstrap, WhoamiHandler,
+    bootstrap_principal_and_mint, register_git_durable, register_git_wire, serve_edge,
+    spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig,
+    AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer, DurableGitBackend,
+    Gateway, IssueReconciliationConfig, Method, StoreBackedIssueAuthorizer, TupleRepoBootstrap,
+    WhoamiHandler,
 };
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{FragmentAdmit, Principal, PrincipalId, PrincipalKind, RevokeTarget};
@@ -96,6 +98,20 @@ async fn compose_core() -> ComposedCore {
         .await
     {
         eprintln!("edge: cannot apply the durable migration aggregate: {e}");
+        std::process::exit(1);
+    }
+    // The edge is the only deployable composition root that owns both the Issues subsystem and the
+    // Identity service implementation. Apply the complete Issues schema before constructing the
+    // restart-safe authorization reconciler; a missing binding table is a boot failure, never a
+    // silent in-memory or disabled-worker fallback.
+    if let Err(e) = bootstrap
+        .migrate(
+            &myelin_issues::issues_migrations(),
+            &myelin_issues::issues_hot_tables(),
+        )
+        .await
+    {
+        eprintln!("edge: cannot apply the Issues authorization-saga migrations: {e}");
         std::process::exit(1);
     }
     // Re-probe the constrained role, close the migration pool, and erase the migration DSN before
@@ -286,6 +302,30 @@ async fn serve(core: ComposedCore) {
             std::process::exit(1);
         }
     }
+    for admit in check.admit_issue_fragment() {
+        if let FragmentAdmit::Rejected { reason } = admit {
+            eprintln!(
+                "edge: the Issues ReBAC fragment did not admit (issue authz would deny everything): {reason}"
+            );
+            std::process::exit(1);
+        }
+    }
+    // Construct the real PostgreSQL Issues store over the SAME durable KMS + Identity engine used by
+    // the edge. It is deliberately not registered behind HTTP yet: the large-result Identity
+    // `Filter` arm is not spliced into PgIssueStore's list query, so exposing routes now would tempt
+    // an unsafe allow-all/post-filter fallback. The restart reconciler below is the deepest complete
+    // activation slice and never serves an issue row itself.
+    let issue_store = Arc::new(myelin_issues::PgIssueStore::new(
+        provider.clone(),
+        kms.clone(),
+        StoreBackedIssueAuthorizer::new(check.clone()),
+    ));
+    let issue_reconciliation_config =
+        IssueReconciliationConfig::from_env(Region::new(provider.config().region.clone()))
+            .unwrap_or_else(|error| {
+                eprintln!("edge: Issues authorization reconciler refused to start: {error}");
+                std::process::exit(1);
+            });
     let thresholds = match myelin_substrate::Thresholds::load_canonical() {
         Ok(t) => t,
         Err(e) => {
@@ -355,8 +395,19 @@ async fn serve(core: ComposedCore) {
             std::process::exit(1);
         }
     };
+    let issue_reconciler =
+        spawn_issue_authorization_reconciler(issue_store, check, issue_reconciliation_config);
     eprintln!("edge: listening on {addr}");
-    if let Err(e) = serve_edge(listener, gateway).await {
+    let server_result = tokio::select! {
+        result = serve_edge(listener, gateway) => result,
+        signal = tokio::signal::ctrl_c() => signal,
+    };
+    let reconciliation_result = issue_reconciler.shutdown().await;
+    if let Err(e) = reconciliation_result {
+        eprintln!("edge: Issues authorization reconciler did not drain cleanly: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = server_result {
         eprintln!("edge: serve error: {e}");
         std::process::exit(1);
     }
@@ -427,7 +478,10 @@ async fn operator_bootstrap(core: ComposedCore, args: &[String]) {
          with the token as the password)",
         myelin_edge::BOOTSTRAP_SCHEME
     );
-    eprintln!("  revoke with  : edge revoke --jti {} --tenant {}", outcome.jti, outcome.tenant);
+    eprintln!(
+        "  revoke with  : edge revoke --jti {} --tenant {}",
+        outcome.jti, outcome.tenant
+    );
     // Never leave the token in this process' env / anywhere else.
 }
 
