@@ -31,6 +31,7 @@ fn governance_audit_uses_minimized_tool_facts_never_trace_or_raw_reason() {
             scope: &scope,
             actor: &actor,
             run_id: &run,
+            gate_id: None,
             tool: "git.open_pr",
             jti: "jti:audit",
             phase: AuditPhase::Attempt,
@@ -47,6 +48,7 @@ fn governance_audit_uses_minimized_tool_facts_never_trace_or_raw_reason() {
             scope: &scope,
             actor: &actor,
             run_id: &run,
+            gate_id: None,
             tool: "git.open_pr",
             jti: "jti:audit",
             phase: AuditPhase::Outcome,
@@ -54,14 +56,48 @@ fn governance_audit_uses_minimized_tool_facts_never_trace_or_raw_reason() {
             now: &now,
         })
         .unwrap();
+    for phase in [
+        AuditPhase::Approved,
+        AuditPhase::Rejected,
+        AuditPhase::Expired,
+    ] {
+        audit
+            .record(GovernanceAuditRecord {
+                scope: &scope,
+                actor: &actor,
+                run_id: &run,
+                gate_id: Some("hitl:gate-audit"),
+                tool: "git.merge",
+                jti: "jti:audit",
+                phase,
+                outcome: None,
+                now: &now,
+            })
+            .unwrap();
+    }
 
     let rows = store.committed_rows();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 5);
     assert_eq!(rows[0].envelope.type_.0, "git.open_pr.attempted");
     assert_eq!(rows[1].envelope.type_.0, "git.open_pr.denied");
-    for row in rows {
+    for (index, row) in rows.into_iter().enumerate() {
+        assert!(
+            myelin_git::events::GIT_EVENT_TOKENS.contains(&row.envelope.type_.0.as_str()),
+            "production consumers must see every governance audit event in Git's registry"
+        );
         assert_ne!(row.envelope.type_.0, "agent.run.traced");
-        assert_eq!(row.envelope.subject.0, "myelin://acme/agent/run/run:audit");
+        if index < 2 {
+            assert_eq!(row.envelope.subject.0, "myelin://acme/agent/run/run:audit");
+        } else {
+            assert_eq!(
+                row.envelope.subject.0,
+                "myelin://acme/agent/run/run:audit/hitl-gate/hitl:gate-audit"
+            );
+            assert_eq!(
+                row.envelope.payload["gate_ref"],
+                "myelin://acme/agent/run/run:audit/hitl-gate/hitl:gate-audit"
+            );
+        }
         let payload = row.envelope.payload.to_string();
         assert!(!payload.contains("private@example.test"));
         assert!(!payload.contains("secret"));
@@ -81,6 +117,7 @@ fn governance_audit_refuses_unregistered_dynamic_tool_taxonomy() {
             scope: &scope,
             actor: &actor,
             run_id: &RunId("run:audit".into()),
+            gate_id: None,
             tool: "caller.controlled.tool",
             jti: "jti:audit",
             phase: AuditPhase::Attempt,

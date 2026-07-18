@@ -139,6 +139,58 @@ pub const GIT_PROTECTION_BYPASS_USED: &str = "git.protection.bypass_used";
 /// audit-relevant). Aggregate `git/pr/<n>`.
 pub const GIT_FORK_CI_ENDORSED: &str = "git.fork.ci_endorsed";
 
+// --- governed MCP intent/outcome audit (aggregate: mcp run) ----------------
+
+pub const GIT_MERGE_ATTEMPTED: &str = "git.merge.attempted";
+pub const GIT_MERGE_APPLIED: &str = "git.merge.applied";
+pub const GIT_MERGE_GATED: &str = "git.merge.gated";
+pub const GIT_MERGE_DENIED: &str = "git.merge.denied";
+pub const GIT_MERGE_INDETERMINATE: &str = "git.merge.indeterminate";
+pub const GIT_MERGE_APPROVED: &str = "git.merge.approved";
+pub const GIT_MERGE_REJECTED: &str = "git.merge.rejected";
+pub const GIT_MERGE_EXPIRED: &str = "git.merge.expired";
+pub const GIT_OPEN_PR_ATTEMPTED: &str = "git.open_pr.attempted";
+pub const GIT_OPEN_PR_APPLIED: &str = "git.open_pr.applied";
+pub const GIT_OPEN_PR_GATED: &str = "git.open_pr.gated";
+pub const GIT_OPEN_PR_DENIED: &str = "git.open_pr.denied";
+pub const GIT_OPEN_PR_INDETERMINATE: &str = "git.open_pr.indeterminate";
+pub const GIT_SUBMIT_REVIEW_ATTEMPTED: &str = "git.submit_review.attempted";
+pub const GIT_SUBMIT_REVIEW_APPLIED: &str = "git.submit_review.applied";
+pub const GIT_SUBMIT_REVIEW_GATED: &str = "git.submit_review.gated";
+pub const GIT_SUBMIT_REVIEW_DENIED: &str = "git.submit_review.denied";
+pub const GIT_SUBMIT_REVIEW_INDETERMINATE: &str = "git.submit_review.indeterminate";
+pub const GIT_ENDORSE_FORK_CI_ATTEMPTED: &str = "git.endorse_fork_ci.attempted";
+pub const GIT_ENDORSE_FORK_CI_APPLIED: &str = "git.endorse_fork_ci.applied";
+pub const GIT_ENDORSE_FORK_CI_GATED: &str = "git.endorse_fork_ci.gated";
+pub const GIT_ENDORSE_FORK_CI_DENIED: &str = "git.endorse_fork_ci.denied";
+pub const GIT_ENDORSE_FORK_CI_INDETERMINATE: &str = "git.endorse_fork_ci.indeterminate";
+
+pub const GIT_GOVERNANCE_AUDIT_EVENT_TOKENS: &[&str] = &[
+    GIT_MERGE_ATTEMPTED,
+    GIT_MERGE_APPLIED,
+    GIT_MERGE_GATED,
+    GIT_MERGE_DENIED,
+    GIT_MERGE_INDETERMINATE,
+    GIT_MERGE_APPROVED,
+    GIT_MERGE_REJECTED,
+    GIT_MERGE_EXPIRED,
+    GIT_OPEN_PR_ATTEMPTED,
+    GIT_OPEN_PR_APPLIED,
+    GIT_OPEN_PR_GATED,
+    GIT_OPEN_PR_DENIED,
+    GIT_OPEN_PR_INDETERMINATE,
+    GIT_SUBMIT_REVIEW_ATTEMPTED,
+    GIT_SUBMIT_REVIEW_APPLIED,
+    GIT_SUBMIT_REVIEW_GATED,
+    GIT_SUBMIT_REVIEW_DENIED,
+    GIT_SUBMIT_REVIEW_INDETERMINATE,
+    GIT_ENDORSE_FORK_CI_ATTEMPTED,
+    GIT_ENDORSE_FORK_CI_APPLIED,
+    GIT_ENDORSE_FORK_CI_GATED,
+    GIT_ENDORSE_FORK_CI_DENIED,
+    GIT_ENDORSE_FORK_CI_INDETERMINATE,
+];
+
 // --- cross-cutting *.erased tombstones (contract 2.7) ----------------------
 
 /// The `*.erased` tombstone for a repo (contract 2.7); consumers drop derived state. Emitted from
@@ -207,6 +259,30 @@ pub const GIT_EVENT_TOKENS: &[&str] = &[
     // audit-critical
     GIT_PROTECTION_BYPASS_USED,
     GIT_FORK_CI_ENDORSED,
+    // governed MCP intent/outcome audit
+    GIT_MERGE_ATTEMPTED,
+    GIT_MERGE_APPLIED,
+    GIT_MERGE_GATED,
+    GIT_MERGE_DENIED,
+    GIT_MERGE_INDETERMINATE,
+    GIT_MERGE_APPROVED,
+    GIT_MERGE_REJECTED,
+    GIT_MERGE_EXPIRED,
+    GIT_OPEN_PR_ATTEMPTED,
+    GIT_OPEN_PR_APPLIED,
+    GIT_OPEN_PR_GATED,
+    GIT_OPEN_PR_DENIED,
+    GIT_OPEN_PR_INDETERMINATE,
+    GIT_SUBMIT_REVIEW_ATTEMPTED,
+    GIT_SUBMIT_REVIEW_APPLIED,
+    GIT_SUBMIT_REVIEW_GATED,
+    GIT_SUBMIT_REVIEW_DENIED,
+    GIT_SUBMIT_REVIEW_INDETERMINATE,
+    GIT_ENDORSE_FORK_CI_ATTEMPTED,
+    GIT_ENDORSE_FORK_CI_APPLIED,
+    GIT_ENDORSE_FORK_CI_GATED,
+    GIT_ENDORSE_FORK_CI_DENIED,
+    GIT_ENDORSE_FORK_CI_INDETERMINATE,
     // cross-cutting *.erased tombstones (contract 2.7)
     GIT_REPO_ERASED,
     GIT_PR_ERASED,
@@ -310,6 +386,9 @@ mod tests {
         // the audit-critical tokens (contract 10.6)
         assert!(GIT_EVENT_TOKENS.contains(&GIT_PROTECTION_BYPASS_USED));
         assert!(GIT_EVENT_TOKENS.contains(&GIT_FORK_CI_ENDORSED));
+        for token in GIT_GOVERNANCE_AUDIT_EVENT_TOKENS {
+            assert!(GIT_EVENT_TOKENS.contains(token));
+        }
         // the cross-cutting *.erased + *.snapshot tokens (contracts 2.7 / 2.6)
         assert!(GIT_EVENT_TOKENS.contains(&GIT_REPO_ERASED));
         assert!(GIT_EVENT_TOKENS.contains(&GIT_BLOB_SNAPSHOT));
