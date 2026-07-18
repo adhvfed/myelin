@@ -724,6 +724,10 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
             "0002_consumer_dead_letter",
             myelin_events::CONSUMER_DEAD_LETTER_MIGRATION,
         ),
+        Migration::plain(
+            "0003_outbox_quarantine",
+            myelin_events::OUTBOX_QUARANTINE_MIGRATION,
+        ),
     ]);
     full_migrations.0.extend(migrations.0);
     runner.run(&full_migrations, &hot_tables)?;
