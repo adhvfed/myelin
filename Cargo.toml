@@ -196,6 +196,10 @@ members = [
     # §2.9 ten-crate DAG; the architecture §2.8 "no shared storage-API crate" is preserved
     # because this is the harness-wired mechanism, not a cross-subsystem data-access crate).
     "crates/myelin-storage",
+    # Cross-service migration-ledger compatibility probe. A test-support LEAF that assembles the
+    # migration sets from production composition roots without making storage's ordinary test graph
+    # depend back on every service crate.
+    "crates/myelin-migration-audit",
     # The Tenancy control-plane SERVICE crate (P-CP-05 → P-080): the three PII-free registry
     # tables (`cell` / `tenant_placement` / `cell_provisioning`) + the per-cell `local_tenant`
     # directory + the HARD placement invariant (multi-cell single-region by construction). Like

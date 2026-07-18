@@ -1,0 +1,34 @@
+[package]
+name = "myelin-migration-audit"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# A test-support LEAF above every production PgBootstrap composition root. Keeping the cross-service
+# catalog here avoids reverse service dependencies in myelin-storage and keeps ordinary storage
+# test compilation focused. Nothing in the production graph depends on this crate.
+[dependencies]
+myelin-storage = { path = "../myelin-storage" }
+myelin-identity-service = { path = "../myelin-identity-service" }
+myelin-issues = { path = "../myelin-issues" }
+myelin-flow = { path = "../myelin-flow" }
+myelin-notif = { path = "../myelin-notif" }
+myelin-search = { path = "../myelin-search" }
+myelin-knowledge = { path = "../myelin-knowledge" }
+myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
+myelin-ci-dispatch = { path = "../myelin-ci-dispatch" }
+
+[dev-dependencies]
+myelin-config.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+
+[features]
+default = []
+integration = []
+
+[[test]]
+name = "production_migration_checksum_audit"
+path = "tests/production_migration_checksum_audit.rs"
+required-features = ["integration"]
