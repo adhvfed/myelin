@@ -232,6 +232,23 @@ pub const WORKFLOW_RUN_IDEM_INDEX_DDL: &str = "\
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS wf_run_idem \
 ON workflow_run (tenant_id, region, idem_key) WHERE idem_key IS NOT NULL";
 
+/// Online lease-fencing expansion for the PostgreSQL drive store. `lease_epoch` closes the
+/// same-owner ABA window: every claim increments it, and renew/commit require the exact epoch that
+/// was claimed. The last drive id/fingerprint make a deterministic retry after commit observable as
+/// success while rejecting a different batch under the same id.
+pub const WORKFLOW_RUN_DRIVE_EXPAND_DDL: &str = "\
+ALTER TABLE workflow_run ADD COLUMN IF NOT EXISTS lease_epoch bigint NOT NULL DEFAULT 0;
+ALTER TABLE workflow_run ADD COLUMN IF NOT EXISTS last_drive_id text;
+ALTER TABLE workflow_run ADD COLUMN IF NOT EXISTS last_drive_fingerprint text";
+
+/// Tenant- and residency-leading runnable claim index. The historical index remains valid for
+/// existing deployments; this additive online index makes the production claim avoid scanning a
+/// cell-wide partition before applying the verified `(tenant_id, region)` scope.
+pub const WORKFLOW_RUN_SCOPED_RUNNABLE_INDEX_DDL: &str = "\
+CREATE INDEX CONCURRENTLY IF NOT EXISTS wf_runnable_scoped \
+ON workflow_run (tenant_id, region, partition, lease_expires, updated_at, run_id) \
+WHERE state = 'running'";
+
 /// The six `(table_id, ddl, table_name, rls_scoped)` tuples in migration order — the data-model
 /// slice. Each `ddl` is the fresh `CREATE TABLE` above (plus its hot dispatch index where §3 names
 /// one). `rls_scoped = true` rides a `myelin_make_tenant_scoped('<table>')` RLS-scope call on the
@@ -330,6 +347,18 @@ pub fn migrations() -> Migrations {
         MigrationPhase::Expand,
         "workflow_run",
     ));
+    items.push(Migration::phased(
+        "flow_0009_workflow_run_drive_expand",
+        WORKFLOW_RUN_DRIVE_EXPAND_DDL,
+        MigrationPhase::Expand,
+        "workflow_run",
+    ));
+    items.push(Migration::phased(
+        "flow_0010_workflow_run_scoped_runnable_index",
+        WORKFLOW_RUN_SCOPED_RUNNABLE_INDEX_DDL,
+        MigrationPhase::Expand,
+        "workflow_run",
+    ));
     Migrations::of(items)
 }
 
@@ -354,8 +383,8 @@ mod tests {
         let migrations = migrations();
         assert_eq!(
             migrations.0.len(),
-            8,
-            "six-table data model plus two online control-surface expands"
+            10,
+            "six-table data model plus four online control/drive expansions"
         );
         let mut runner = MigrationRunner::new();
         // workflow_run becomes hot after creation; its two follow-ons use the online expand path.
@@ -373,6 +402,8 @@ mod tests {
                 "flow_0006_wf_definition",
                 "flow_0007_workflow_run_control_expand",
                 "flow_0008_workflow_run_idem_index",
+                "flow_0009_workflow_run_drive_expand",
+                "flow_0010_workflow_run_scoped_runnable_index",
             ],
             "tables then online control expands, in order — 0 backward migration"
         );
@@ -385,6 +416,15 @@ mod tests {
         assert!(WORKFLOW_RUN_IDEM_INDEX_DDL.contains("UNIQUE INDEX CONCURRENTLY"));
         assert!(WORKFLOW_RUN_IDEM_INDEX_DDL.contains("tenant_id, region, idem_key"));
         assert!(WORKFLOW_RUN_IDEM_INDEX_DDL.contains("WHERE idem_key IS NOT NULL"));
+    }
+
+    #[test]
+    fn durable_drive_claim_is_fenced_and_tenant_region_indexed() {
+        assert!(WORKFLOW_RUN_DRIVE_EXPAND_DDL.contains("lease_epoch bigint NOT NULL DEFAULT 0"));
+        assert!(WORKFLOW_RUN_DRIVE_EXPAND_DDL.contains("last_drive_fingerprint text"));
+        assert!(WORKFLOW_RUN_SCOPED_RUNNABLE_INDEX_DDL.contains("INDEX CONCURRENTLY"));
+        assert!(WORKFLOW_RUN_SCOPED_RUNNABLE_INDEX_DDL
+            .contains("tenant_id, region, partition, lease_expires, updated_at, run_id"));
     }
 
     /// Every TENANT-scoped table is `(tenant, region)`-first: the DDL leads with `tenant_id` then
