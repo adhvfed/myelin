@@ -50,6 +50,9 @@ myelin-tenancy = { path = "../myelin-tenancy" }
 # by `crate_graph.rs`; `substrate_is_root()`/`identity_is_sink()` are unaffected). The subsystem never
 # depends on its transport — the edge knows about Git, Git does not know about the edge.
 myelin-git = { path = "../myelin-git" }
+# Issues owns the fail-closed row/binding saga; the edge is the composition layer that may depend on
+# both the subsystem and Identity service, so it supplies the concrete async tuple-writer adapter.
+myelin-issues = { path = "../myelin-issues" }
 # GT-005: the BRAIN-AGNOSTIC PLAN-THEN-APPLY chokepoint (`EffectApi` / `RunCtx` / `ProposedEffect` /
 # `EffectResult`, §8.2). The edge is the composition point that binds a concrete `EffectApi` body to the
 # durable git backend, so a governed MCP `tools/call` (mint_run_token → EffectApi::apply, MR-021) lands
