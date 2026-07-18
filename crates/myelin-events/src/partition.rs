@@ -45,6 +45,14 @@ use myelin_tenancy::{Region, TenantId};
 /// grammar has one authority and a typo cannot fork the routing namespace.
 pub const SUBJECT_ROOT: &str = "evt";
 
+/// A deliberately finite bound for one routing token. NATS permits large subjects, but accepting
+/// unbounded tenant or aggregate identifiers lets one corrupt outbox row create an oversized
+/// protocol line. Existing canonical identifiers are far below this limit.
+pub const MAX_SUBJECT_TOKEN_BYTES: usize = 255;
+
+/// The maximum wire-subject size produced by the event bus, including the `evt.` root.
+pub const MAX_STREAM_SUBJECT_BYTES: usize = 1024;
+
 /// The `(tenant, region)` first-class partition key the streams are keyed under (contract 12.1,
 /// **CONSUMED**; injected by the harness; ADR-11). This is the Bus's consumer side of 12.1: it
 /// composes the two `myelin-tenancy` value types ([`TenantId`] + [`Region`]) into the partition the
@@ -95,6 +103,12 @@ pub enum SubjectError {
     /// A token would contain a `.` (the NATS subject delimiter) or be empty — it cannot be a single
     /// subject token. Carries which field produced the bad token.
     BadSubjectToken { field: &'static str, token: String },
+    /// A token or the complete subject exceeded the event bus's finite protocol bound.
+    SubjectTooLong {
+        field: &'static str,
+        bytes: usize,
+        max_bytes: usize,
+    },
     /// A parsed subject did not start with the [`SUBJECT_ROOT`] (`evt`) token.
     NotAnEventSubject { subject: String },
     /// A parsed subject did not have exactly the six `evt.<tenant>.<subsystem>.<aggregate_type>.
@@ -115,8 +129,13 @@ impl std::fmt::Display for SubjectError {
             ),
             SubjectError::BadSubjectToken { field, token } => write!(
                 f,
-                "{field} token `{token}` is empty or contains a `.` (the subject delimiter)"
+                "{field} token `{token}` is empty or contains a subject delimiter, wildcard, or whitespace"
             ),
+            SubjectError::SubjectTooLong {
+                field,
+                bytes,
+                max_bytes,
+            } => write!(f, "{field} is {bytes} bytes (maximum {max_bytes})"),
             SubjectError::NotAnEventSubject { subject } => {
                 write!(
                     f,
@@ -134,13 +153,27 @@ impl std::fmt::Display for SubjectError {
 
 impl std::error::Error for SubjectError {}
 
-/// A single NATS subject token is well-formed iff it is non-empty and contains no `.` (the
-/// delimiter). We do NOT re-validate the full §6.1 taxonomy here — that is [`crate::taxonomy`]'s
-/// authority; the subject only needs each piece to be a *parseable* single token (so the round-trip
-/// is exact). A `:` inside the aggregate_id (the git per-ref `<repo>:<ref>` case, §2.2) is fine —
-/// it is not the subject delimiter.
-fn token_is_subject_safe(token: &str) -> bool {
-    !token.is_empty() && !token.contains('.')
+/// A single NATS literal token must not contain separators, wildcards, whitespace, or control
+/// characters. `:` and `/` remain valid because existing canonical aggregate identifiers use them.
+fn validate_subject_token(field: &'static str, token: &str) -> Result<(), SubjectError> {
+    if token.is_empty()
+        || token
+            .chars()
+            .any(|c| c == '.' || c == '*' || c == '>' || c.is_whitespace() || c.is_control())
+    {
+        return Err(SubjectError::BadSubjectToken {
+            field,
+            token: token.to_string(),
+        });
+    }
+    if token.len() > MAX_SUBJECT_TOKEN_BYTES {
+        return Err(SubjectError::SubjectTooLong {
+            field,
+            bytes: token.len(),
+            max_bytes: MAX_SUBJECT_TOKEN_BYTES,
+        });
+    }
+    Ok(())
 }
 
 /// The structured stream subject — the §2.2 routing + ordering key, round-trippable to/from the
@@ -185,21 +218,25 @@ impl StreamSubject {
             ("aggregate_id", aggregate_id.as_str()),
             ("event_name", event_name.as_str()),
         ] {
-            if !token_is_subject_safe(token) {
-                return Err(SubjectError::BadSubjectToken {
-                    field,
-                    token: token.to_string(),
-                });
-            }
+            validate_subject_token(field, token)?;
         }
 
-        Ok(Self {
+        let subject = Self {
             tenant,
             subsystem,
             aggregate_type,
             aggregate_id,
             event_name,
-        })
+        };
+        let bytes = subject.to_subject().len();
+        if bytes > MAX_STREAM_SUBJECT_BYTES {
+            return Err(SubjectError::SubjectTooLong {
+                field: "subject",
+                bytes,
+                max_bytes: MAX_STREAM_SUBJECT_BYTES,
+            });
+        }
+        Ok(subject)
     }
 
     /// The wire form: `evt.<tenant>.<subsystem>.<aggregate_type>.<aggregate_id>.<event_name>`
@@ -220,6 +257,13 @@ impl StreamSubject {
     /// [`StreamSubject::to_subject`]. The aggregate_id may itself contain a `:` (the git per-ref
     /// `<repo>:<ref>` case, §2.2) but never a `.`; the six tokens are split on `.` only.
     pub fn parse(subject: &str) -> Result<Self, SubjectError> {
+        if subject.len() > MAX_STREAM_SUBJECT_BYTES {
+            return Err(SubjectError::SubjectTooLong {
+                field: "subject",
+                bytes: subject.len(),
+                max_bytes: MAX_STREAM_SUBJECT_BYTES,
+            });
+        }
         let tokens: Vec<&str> = subject.split('.').collect();
         if tokens.len() != 6 {
             return Err(SubjectError::WrongTokenCount {
@@ -231,6 +275,15 @@ impl StreamSubject {
             return Err(SubjectError::NotAnEventSubject {
                 subject: subject.to_string(),
             });
+        }
+        for (field, token) in [
+            ("tenant", tokens[1]),
+            ("subsystem", tokens[2]),
+            ("aggregate_type", tokens[3]),
+            ("aggregate_id", tokens[4]),
+            ("event_name", tokens[5]),
+        ] {
+            validate_subject_token(field, token)?;
         }
         Ok(Self {
             tenant: TenantId(tokens[1].to_string()),
@@ -487,6 +540,36 @@ mod tests {
             StreamSubject::of(&env3),
             Err(SubjectError::BadSubjectToken {
                 field: "tenant",
+                ..
+            })
+        ));
+
+        for unsafe_tenant in ["ac me", "acme*", "acme>", "acme\n"] {
+            let mut unsafe_env = sample_envelope();
+            unsafe_env.tenant = TenantId(unsafe_tenant.into());
+            assert!(matches!(
+                StreamSubject::of(&unsafe_env),
+                Err(SubjectError::BadSubjectToken {
+                    field: "tenant",
+                    ..
+                })
+            ));
+        }
+
+        let mut oversized = sample_envelope();
+        oversized.aggregate = AggregateKey(format!("issue:{}", "x".repeat(256)));
+        assert!(matches!(
+            StreamSubject::of(&oversized),
+            Err(SubjectError::SubjectTooLong {
+                field: "aggregate_id",
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            StreamSubject::parse("evt.acme.issue.issue.*.created"),
+            Err(SubjectError::BadSubjectToken {
+                field: "aggregate_id",
                 ..
             })
         ));

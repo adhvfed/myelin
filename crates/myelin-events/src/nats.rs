@@ -191,18 +191,16 @@ fn validate_stream_config(
     }
 }
 
-fn event_subject(subject_root: &str, subject: &ArtifactRef, envelope: &EventEnvelope) -> String {
-    match crate::partition::StreamSubject::of(envelope) {
-        Ok(s) => format!("{subject_root}.{}", s.to_subject()),
-        Err(_) => {
-            let token: String = subject
-                .0
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect();
-            format!("{subject_root}._malformed.{token}")
-        }
+fn event_subject(subject_root: &str, envelope: &EventEnvelope) -> Result<String, TransportError> {
+    let structured = crate::partition::StreamSubject::of(envelope)
+        .map_err(|_| TransportError("invalid event routing subject".into()))?;
+    let subject = format!("{subject_root}.{}", structured.to_subject());
+    if subject.len() > crate::partition::MAX_STREAM_SUBJECT_BYTES {
+        return Err(TransportError(
+            "event routing subject exceeds byte limit".into(),
+        ));
     }
+    Ok(subject)
 }
 
 /// A capability-minimal production adapter for the elected shared-outbox relay.
@@ -255,11 +253,11 @@ impl NatsJetStreamPublisher {
 impl EventPublisher for NatsJetStreamPublisher {
     fn publish(
         &self,
-        subject: &ArtifactRef,
+        _subject: &ArtifactRef,
         envelope: &EventEnvelope,
         dedup_id: &EventId,
     ) -> Result<Delivery, TransportError> {
-        let nats_subject = event_subject(&self.subject_root, subject, envelope);
+        let nats_subject = event_subject(&self.subject_root, envelope)?;
         let body = serde_json::to_vec(envelope)
             .map_err(|e| TransportError(format!("serialize envelope: {e}")))?;
         let mut headers = async_nats::HeaderMap::new();
@@ -277,6 +275,64 @@ impl EventPublisher for NatsJetStreamPublisher {
         } else {
             Delivery::Accepted
         })
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+
+    use super::*;
+    use crate::{
+        Actor, AggregateKey, CorrelationId, DataRole, EventType, Region, TenantId, Timestamp,
+        Visibility,
+    };
+
+    fn envelope() -> EventEnvelope {
+        EventEnvelope {
+            event_id: EventId("01JROUTINGTEST".into()),
+            type_: EventType("issue.issue.created".into()),
+            schema_ver: 1,
+            tenant: TenantId("acme".into()),
+            region: Region("no-osl".into()),
+            actor: Actor(Principal::stub(
+                PrincipalId("relay-test".into()),
+                PrincipalKind::Service,
+                TenantId("acme".into()),
+            )),
+            subject: ArtifactRef("myelin://acme/issue/issue/ONE".into()),
+            aggregate: AggregateKey("issue:ONE".into()),
+            causation_id: None,
+            correlation_id: CorrelationId("01JROUTINGTEST".into()),
+            caused_by: None,
+            depth: 0,
+            contains_personal_data: false,
+            data_role: DataRole::Controller,
+            visibility: Visibility::Internal,
+            pii_key_ref: None,
+            occurred_at: Timestamp("2026-07-18T00:00:00Z".into()),
+            recorded_at: Timestamp("2026-07-18T00:00:00Z".into()),
+            payload: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn invalid_subject_is_rejected_before_any_transport_operation() {
+        let mut invalid = envelope();
+        invalid.aggregate = AggregateKey("issue:*".into());
+        assert_eq!(
+            event_subject("myelin.no-osl", &invalid),
+            Err(TransportError("invalid event routing subject".into()))
+        );
+    }
+
+    #[test]
+    fn subject_root_is_included_in_the_total_wire_bound() {
+        let error = event_subject(&"r".repeat(1000), &envelope()).expect_err("oversized wire");
+        assert_eq!(
+            error,
+            TransportError("event routing subject exceeds byte limit".into())
+        );
     }
 }
 
@@ -373,12 +429,10 @@ impl NatsJetStreamBus {
     /// `<root>.>` filter still captures every event and a `consume(subject_root)` still matches,
     /// while the subject carries the real §2.2 key.
     ///
-    /// If the envelope cannot yield a structured subject (a malformed `type_`/`aggregate` — caught
-    /// LOUD upstream by the taxonomy + outbox, never silently here), we fall back to the prior
-    /// sanitised opaque token under the same root so delivery is never dropped (lag, not loss) and
-    /// the reason is observable via the returned subject shape.
-    fn subject_for(&self, subject: &ArtifactRef, envelope: &EventEnvelope) -> String {
-        event_subject(&self.subject_root, subject, envelope)
+    /// A malformed envelope is rejected before a broker operation. Durable elected relays
+    /// quarantine it in PostgreSQL; transports must never invent a fallback routing namespace.
+    fn subject_for(&self, envelope: &EventEnvelope) -> Result<String, TransportError> {
+        event_subject(&self.subject_root, envelope)
     }
 
     fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
@@ -441,11 +495,11 @@ mod publisher_tests {
 impl BusTransport for NatsJetStreamBus {
     fn put(
         &self,
-        subject: &ArtifactRef,
+        _subject: &ArtifactRef,
         envelope: &EventEnvelope,
         dedup_id: &EventId,
     ) -> Result<Delivery, TransportError> {
-        let nats_subject = self.subject_for(subject, envelope);
+        let nats_subject = self.subject_for(envelope)?;
         let body = serde_json::to_vec(envelope)
             .map_err(|e| TransportError(format!("serialize envelope: {e}")))?;
 
