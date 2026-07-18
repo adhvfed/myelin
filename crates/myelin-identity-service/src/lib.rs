@@ -71,6 +71,7 @@ pub mod chat_fragment;
 pub mod check_engine;
 pub mod ci_fragment;
 pub mod delegation;
+pub mod delegation_policy;
 pub mod expand;
 pub mod failstatic_cache;
 pub mod git_fragment;
@@ -111,6 +112,10 @@ pub use ci_fragment::{
 pub use delegation::{
     authority_of, effective_policy_of, DelegationAlgebra, DelegationInput, IntersectionProof,
     EFFECTIVE_GRANT_CARRIER,
+};
+pub use delegation_policy::{
+    DelegationPolicyError, DelegationPolicySource, DelegationPolicyVersionCursor,
+    DelegationRunPolicyCursor, ResolvedDelegationPolicy,
 };
 pub use expand::Expand;
 pub use failstatic_cache::{
