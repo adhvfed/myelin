@@ -24,6 +24,7 @@
 use std::sync::Arc;
 
 use myelin_agent::{EffectApi, EffectAuthority, EffectResult, EventId, ProposedEffect, RunCtx};
+use myelin_git::core::RepoLoc;
 use myelin_git::pr_store::MergeAttempt;
 use myelin_identity::Principal;
 use myelin_identity_service::mint::RunTokenAuthorizer;
@@ -32,6 +33,7 @@ use myelin_tenancy::Region;
 use serde_json::Value;
 
 use crate::git_durable::DurableGitBackend;
+use crate::repo_authz::RepoPermission;
 
 /// **The concrete git `EffectApi` body (GT-005).** Binds the durable GT-003 backend to a single run's
 /// verified scope + acting principal. Injected into the MR-021 `GovernedRouter` by the composition root
@@ -95,10 +97,12 @@ impl GitEffectApi {
             .into_iter()
             .find(|def| def.name == proposed_tool)
             .ok_or_else(|| format!("unknown git tool `{proposed_tool}` at authority boundary"))?;
-        let required_caps: Vec<String> =
-            def.required_caps.iter().map(|cap| (*cap).to_string()).collect();
-        let scope =
-            TenantScope::from_verified_token(&self.principal, Region(self.region.clone()));
+        let required_caps: Vec<String> = def
+            .required_caps
+            .iter()
+            .map(|cap| (*cap).to_string())
+            .collect();
+        let scope = TenantScope::from_verified_token(&self.principal, Region(self.region.clone()));
         self.authority
             .authorize(
                 &scope,
@@ -118,6 +122,9 @@ impl GitEffectApi {
                     Some(s) => s,
                     None => return deny_missing("repo"),
                 };
+                if let Err(denied) = self.authorize_repo(repo, RepoPermission::Push) {
+                    return denied;
+                }
                 match self.backend.open_pr(t, r, repo, args, &self.principal) {
                     Ok(rec) => applied(run, tool, &format!("git.pr.open:#{}", rec.number)),
                     Err(e) => EffectResult::Denied(e.to_string()),
@@ -128,9 +135,24 @@ impl GitEffectApi {
                     Ok(v) => v,
                     Err(e) => return e,
                 };
+                // The compiled permission is
+                // `pull_request.review = reviewer ∪ parent_repo->push`. The filesystem PR store
+                // does not yet materialize the PR parent/reviewer tuples, so the sound available
+                // reduction is the parent repo's Push rung. This intentionally over-denies a
+                // reviewer-only grant; it never admits an ungranted reviewer.
+                if let Err(denied) = self.authorize_repo(repo, RepoPermission::Push) {
+                    return denied;
+                }
                 let verdict = str_arg(args, "verdict").unwrap_or("comment");
-                match self.backend.submit_review(t, r, repo, number, verdict, &self.principal) {
-                    Ok(rec) => applied(run, tool, &format!("git.pr.review:#{}:{}", rec.number, verdict)),
+                match self
+                    .backend
+                    .submit_review(t, r, repo, number, verdict, &self.principal)
+                {
+                    Ok(rec) => applied(
+                        run,
+                        tool,
+                        &format!("git.pr.review:#{}:{}", rec.number, verdict),
+                    ),
                     Err(e) => EffectResult::Denied(e.to_string()),
                 }
             }
@@ -139,8 +161,19 @@ impl GitEffectApi {
                     Ok(v) => v,
                     Err(e) => return e,
                 };
+                if let Err(denied) = self.authorize_repo(repo, RepoPermission::ApproveUntrustedCi) {
+                    return denied;
+                }
                 match self.backend.endorse_fork_ci(t, r, repo, number, args) {
-                    Ok(rec) => applied(run, tool, &format!("git.pr.endorse:#{}:{}", rec.number, rec.endorsed_contexts.len())),
+                    Ok(rec) => applied(
+                        run,
+                        tool,
+                        &format!(
+                            "git.pr.endorse:#{}:{}",
+                            rec.number,
+                            rec.endorsed_contexts.len()
+                        ),
+                    ),
                     Err(e) => EffectResult::Denied(e.to_string()),
                 }
             }
@@ -149,6 +182,9 @@ impl GitEffectApi {
                     Ok(v) => v,
                     Err(e) => return e,
                 };
+                if let Err(denied) = self.authorize_repo(repo, RepoPermission::ProtectedPush) {
+                    return denied;
+                }
                 match self.backend.merge(t, r, repo, number, &self.principal) {
                     Ok(MergeAttempt::Merged { base_ref, new_oid, .. }) => {
                         applied(run, tool, &format!("git.pr.merge:#{number}:{base_ref}@{new_oid}"))
@@ -175,6 +211,23 @@ impl GitEffectApi {
                 "git tool `{other}` is registered but not yet wired through GitEffectApi (GT-005b) \
                  — denied, never a silent no-op"
             )),
+        }
+    }
+
+    /// The object leg of the final mutation boundary. The router's signed capability check and this
+    /// live ReBAC decision are independent conjuncts: neither can substitute for the other.
+    fn authorize_repo(&self, repo: &str, permission: RepoPermission) -> Result<(), EffectResult> {
+        let loc = RepoLoc::new(&self.tenant, &self.region, repo);
+        if self.backend.repo_authorizer().authorize_repo_permission(
+            &self.principal,
+            &loc,
+            permission,
+        ) {
+            Ok(())
+        } else {
+            Err(EffectResult::Denied(format!(
+                "object authorization denied `{permission:?}` on repository `{repo}`"
+            )))
         }
     }
 }
@@ -269,7 +322,9 @@ mod tests {
             .as_nanos();
         root.push(format!("myelin-git-effect-authority-{nonce}"));
         let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(&root));
-        backend.create_repo("acme", "eu-west", "alpha").expect("repo");
+        backend
+            .create_repo("acme", "eu-west", "alpha")
+            .expect("repo");
         let mut principal = Principal::stub(
             PrincipalId("agent:claude".into()),
             PrincipalKind::Agent {
@@ -290,7 +345,10 @@ mod tests {
 
         let direct = api.apply(&RunCtx("direct".into()), effect.clone());
         assert!(matches!(direct, EffectResult::Denied(reason) if reason.contains("direct")));
-        assert!(backend.get_pr("acme", "eu-west", "alpha", 1).unwrap().is_none());
+        assert!(backend
+            .get_pr("acme", "eu-west", "alpha", 1)
+            .unwrap()
+            .is_none());
 
         let mismatched = api.apply_authorized(
             &RunCtx("mismatch".into()),
@@ -326,7 +384,10 @@ mod tests {
             principal_mismatch,
             EffectResult::Denied(reason) if reason.contains("adapter principal")
         ));
-        assert!(backend.get_pr("acme", "eu-west", "alpha", 1).unwrap().is_none());
+        assert!(backend
+            .get_pr("acme", "eu-west", "alpha", 1)
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 }

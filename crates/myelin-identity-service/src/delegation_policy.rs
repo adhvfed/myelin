@@ -13,7 +13,7 @@
 //! [`DelegationInput`]; production callers must be moved to this source in the token-auth integration
 //! slice before this durable source becomes the only mint authority.
 
-use crate::delegation::{DelegationAlgebra, DelegationInput};
+use crate::delegation::{authority_of, effective_policy_of, DelegationAlgebra, DelegationInput};
 use crate::machine_auth::Authority;
 use myelin_identity::{EffectivePolicy, Principal, PrincipalKind, PrincipalStatus, RunId};
 use myelin_storage::{
@@ -84,6 +84,65 @@ impl ResolvedDelegationPolicy {
 
     pub fn cursor(&self) -> DelegationRunPolicyCursor {
         self.cursor
+    }
+
+    /// Apply an additional authenticated authority ceiling without losing the durable run-policy
+    /// binding. Every raw conjunct is intersected and the effective policy is recomputed by the
+    /// equivalent monotone intersection (`old_effective ∩ ceiling`). The positive snapshot and
+    /// principal/run bindings are deliberately preserved, so callers can hand the result only to
+    /// the snapshot-aware mint path.
+    pub fn attenuate(mut self, ceiling: &Authority) -> Self {
+        self.input = DelegationInput {
+            agent_policy: self.input.agent_policy.attenuate(ceiling),
+            delegation: self.input.delegation.attenuate(ceiling),
+            tenant_policy: self.input.tenant_policy.attenuate(ceiling),
+            trigger_actor_held: self.input.trigger_actor_held.attenuate(ceiling),
+        };
+        self.effective_policy =
+            effective_policy_of(&authority_of(&self.effective_policy).attenuate(ceiling));
+        self
+    }
+
+    /// Build a positively snapshot-bound policy for tests. Production has no constructor from raw
+    /// policy material; it must resolve through [`DelegationPolicySource::resolve_for_run`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn synthetic_for_test(
+        run_id: RunId,
+        agent_id: myelin_identity::PrincipalId,
+        trigger_actor_id: myelin_identity::PrincipalId,
+        input: DelegationInput,
+        snapshot: i64,
+    ) -> Self {
+        assert!(snapshot > 0, "synthetic durable snapshot must be positive");
+        let delegated = input.delegation.attenuate(&input.trigger_actor_held);
+        let effective = input
+            .agent_policy
+            .attenuate(&delegated)
+            .attenuate(&input.tenant_policy);
+        let versions = DurableDelegationPolicyVersions {
+            agent: 1,
+            delegation: 1,
+            tenant: 1,
+            trigger_actor: 1,
+        };
+        let revisions = DurableDelegationPolicyRevisions {
+            agent: snapshot,
+            delegation: snapshot,
+            tenant: snapshot,
+            trigger_actor: snapshot,
+        };
+        Self {
+            run_id,
+            agent_id,
+            trigger_actor_id,
+            input,
+            effective_policy: effective_policy_of(&effective),
+            cursor: DelegationRunPolicyCursor {
+                snapshot,
+                versions,
+                revisions,
+            },
+        }
     }
 }
 
