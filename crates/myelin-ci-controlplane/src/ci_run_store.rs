@@ -200,7 +200,11 @@ SELECT
 FROM ci_run WHERE tenant_id = $1 AND run_id = $2::uuid";
 
 /// A durable `ci_run`-store failure. Loud + typed — a write/read NEVER silently drops or coerces. Safe
-/// to log: carries only the structural fault + the opaque `(tenant, run)` tokens the CI schema keys on.
+/// to log: carries only structural faults and immutable field names, never replay values.
+///
+/// This enum is non-exhaustive because the durable store can gain new fail-closed checks. Callers
+/// must retain a fallback arm instead of treating the current variants as the complete failure set.
+#[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub enum CiRunStoreError {
     /// A durable-store DB error (the statement did NOT succeed) — never a silent partial write.
