@@ -82,12 +82,23 @@ fn actor(tenant: &str, region: &str) -> Actor {
 }
 
 fn worker(pool: &PgPool, tenant: &str, region: &str, partition: i16, name: &str) -> PgFlowWorker {
+    worker_with_ttl(pool, tenant, region, partition, name, 60)
+}
+
+fn worker_with_ttl(
+    pool: &PgPool,
+    tenant: &str,
+    region: &str,
+    partition: i16,
+    name: &str,
+    lease_ttl_secs: i64,
+) -> PgFlowWorker {
     let scope = PgWorkerScope::new(
         TenantId(tenant.into()),
         Region(region.into()),
         partition,
         name,
-        60,
+        lease_ttl_secs,
         actor(tenant, region),
         1,
     )
@@ -268,5 +279,79 @@ async fn two_workers_skip_locked_drive_once_and_never_cross_tenant_or_region() {
         .unwrap();
         assert_eq!(state, "running", "neighbour scope was not observed");
     }
+    cleanup(bare, pool, schema).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renewal_failure_joins_body_before_run_once_returns_and_refuses_commit() {
+    let _guard = TEST_LOCK.lock().await;
+    let (bare, pool, schema) = setup("renewal_join").await;
+    let mut worker = worker_with_ttl(&pool, "acme", "no-osl", 7, "worker-fenced", 3);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+    let finish_rx = Arc::new(std::sync::Mutex::new(finish_rx));
+    let body_exited = Arc::new(AtomicUsize::new(0));
+    let wait_for_finish = Arc::clone(&finish_rx);
+    let exited = Arc::clone(&body_exited);
+    worker
+        .register_definition("wf.slow", 1, "slow-v1", move |_ctx| {
+            started_tx.send(()).expect("announce body start");
+            wait_for_finish
+                .lock()
+                .expect("finish receiver lock")
+                .recv()
+                .expect("test releases body");
+            exited.store(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        })
+        .unwrap();
+    seed_run(&pool, "acme", "no-osl", "R-slow", "wf.slow", 0, 7).await;
+    let worker = Arc::new(worker);
+    let task = {
+        let worker = Arc::clone(&worker);
+        tokio::spawn(async move { worker.run_once(1_752_796_800, "2026-07-18T00:00:00Z").await })
+    };
+    tokio::task::spawn_blocking(move || {
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("body started")
+    })
+    .await
+    .unwrap();
+
+    // Invalidate the exact owner+epoch while the synchronous body is still blocked. The next
+    // heartbeat observes LeaseLost, but run_once must continue joining the body rather than detach.
+    sqlx::query(
+        "UPDATE workflow_run SET lease_epoch = lease_epoch + 1 \
+         WHERE tenant_id='acme' AND region='no-osl' AND run_id='R-slow'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
+    assert!(
+        !task.is_finished(),
+        "renewal failure did not detach the live body"
+    );
+    assert_eq!(body_exited.load(Ordering::SeqCst), 0);
+
+    finish_tx.send(()).unwrap();
+    let result = task.await.unwrap();
+    assert!(result.is_err(), "lost lease refuses the stale drive commit");
+    assert_eq!(
+        body_exited.load(Ordering::SeqCst),
+        1,
+        "run_once returned only after the synchronous body exited"
+    );
+    let row = sqlx::query(
+        "SELECT state, cursor, last_drive_id FROM workflow_run \
+         WHERE tenant_id='acme' AND region='no-osl' AND run_id='R-slow'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "running");
+    assert_eq!(row.get::<i64, _>("cursor"), 0);
+    assert!(row.get::<Option<String>, _>("last_drive_id").is_none());
     cleanup(bare, pool, schema).await;
 }

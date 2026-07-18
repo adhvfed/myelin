@@ -434,6 +434,7 @@ impl PgFlowWorker {
         let renew_every = Duration::from_secs((self.scope.lease_ttl_secs as u64 / 3).max(1));
         let mut heartbeat =
             tokio::time::interval_at(tokio::time::Instant::now() + renew_every, renew_every);
+        let mut heartbeat_failure = None;
         let (ctx, body_result) = loop {
             tokio::select! {
                 result = &mut body_task => {
@@ -441,11 +442,22 @@ impl PgFlowWorker {
                         PgWorkerError::Staging(format!("workflow body task failed: {error}"))
                     })?;
                 }
-                _ = heartbeat.tick() => {
-                    self.store.renew_lease(lease, self.scope.lease_ttl_secs).await?;
+                _ = heartbeat.tick(), if heartbeat_failure.is_none() => {
+                    if let Err(error) = self.store.renew_lease(lease, self.scope.lease_ttl_secs).await {
+                        // A spawn_blocking JoinHandle DETACHES when dropped. Latch lost authority
+                        // but keep joining the synchronous body so run_once never returns/releases
+                        // while that body is still executing. We refuse the commit below. If lease
+                        // expiry allowed a successor to overlap an already-dispatched external
+                        // activity, the deterministic activity idem_token is the required dedup
+                        // anchor; lease fencing prevents this stale drive from persisting results.
+                        heartbeat_failure = Some(error);
+                    }
                 }
             }
         };
+        if let Some(error) = heartbeat_failure {
+            return Err(PgWorkerError::Store(error));
+        }
         let divergence = ctx.divergence().map(ToOwned::to_owned);
         let parked = ctx.parked();
         let outcome = if let Some(reason) = divergence {
