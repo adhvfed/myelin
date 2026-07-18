@@ -257,6 +257,12 @@ mod tests {
         assert!(is_blocking_alter(
             "ALTER TABLE issue ALTER COLUMN x TYPE BIGINT"
         ));
+        assert!(!is_blocking_alter(
+            "ALTER TABLE issue ALTER COLUMN reporter DROP NOT NULL"
+        ));
+        assert!(is_blocking_alter(
+            "ALTER TABLE issue ALTER COLUMN reporter DROP NOT NULL, ALTER COLUMN x TYPE BIGINT"
+        ));
         assert!(is_blocking_alter("CREATE INDEX idx ON issue (x)"));
         assert!(!is_blocking_alter(
             "CREATE INDEX CONCURRENTLY idx ON issue (x)"

@@ -150,7 +150,8 @@ async fn durable_create_list_view_close_is_rls_isolated_and_ciphertext_at_rest()
         .await
         .expect("connect admin for at-rest inspection");
     let row = sqlx::query(
-        "SELECT title, title_ciphertext, title_nonce, pii_key_ref \
+        "SELECT title, title_ciphertext, title_nonce, pii_key_ref, reporter, \
+                created_by_principal, contains_personal_data \
          FROM issue WHERE tenant_id = $1 AND id = $2::uuid",
     )
     .bind(&tenant_a)
@@ -164,7 +165,17 @@ async fn durable_create_list_view_close_is_rls_isolated_and_ciphertext_at_rest()
         .windows(secret_title.len())
         .any(|window| window == secret_title.as_bytes()));
     assert_eq!(row.get::<Vec<u8>, _>("title_nonce").len(), 12);
-    assert!(row.get::<String, _>("pii_key_ref").contains("/subject:"));
+    assert_eq!(row.get::<Option<sqlx::types::Uuid>, _>("reporter"), None);
+    assert_eq!(
+        row.get::<String, _>("created_by_principal"),
+        alice.principal_id.0
+    );
+    assert!(row.get::<bool, _>("contains_personal_data"));
+    assert!(
+        row.get::<String, _>("pii_key_ref")
+            .ends_with(&format!("/subject:{}", alice.principal_id.0)),
+        "the title DEK is assigned to the verified creator subject"
+    );
 
     // Exact test-tenant cleanup; no production row or broad collection is touched.
     for tenant in [&tenant_a, &tenant_b] {

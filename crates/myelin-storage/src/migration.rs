@@ -226,15 +226,25 @@ pub fn is_destructive(ddl: &str) -> bool {
 
 /// Whether a DDL statement is a **blocking `ALTER`** (takes a table lock at write QPS): an
 /// `ADD COLUMN … NOT NULL` without a `DEFAULT`, an in-place `ALTER … ALTER COLUMN`, or a
-/// non-concurrent `CREATE INDEX` (storage §3.1). On a HOT table any of these stalls writes — it
-/// must be the online idiom instead. Mirrors the substrate predicate. Case-insensitive.
+/// non-concurrent `CREATE INDEX` (storage §3.1). PostgreSQL's single-column `DROP NOT NULL` is the
+/// narrow exception: it only flips a catalog flag and neither scans nor rewrites the table. On a
+/// HOT table every other listed shape stalls writes and must use the online idiom instead. Mirrors
+/// the substrate predicate. Case-insensitive.
 pub fn is_blocking_alter(ddl: &str) -> bool {
     let lower = ddl.to_ascii_lowercase();
     let add_not_null = lower.contains("alter table")
         && lower.contains("add column")
         && lower.contains("not null")
         && !lower.contains("default");
-    let alter_column_inplace = lower.contains("alter table") && lower.contains("alter column");
+    let alter_column_inplace = lower.split(';').any(|statement| {
+        let normalized = statement.split_whitespace().collect::<Vec<_>>().join(" ");
+        let is_alter_column =
+            normalized.contains("alter table") && normalized.contains("alter column");
+        let metadata_only_drop_not_null = normalized.matches("alter column").count() == 1
+            && normalized.contains(" drop not null")
+            && !normalized.contains(',');
+        is_alter_column && !metadata_only_drop_not_null
+    });
     let non_concurrent_index = lower.contains("create index") && !lower.contains("concurrently");
     add_not_null || alter_column_inplace || non_concurrent_index
 }
@@ -700,6 +710,12 @@ mod tests {
         ));
         assert!(is_blocking_alter(
             "ALTER TABLE issue ALTER COLUMN x TYPE BIGINT"
+        ));
+        assert!(!is_blocking_alter(
+            "ALTER TABLE issue ALTER COLUMN reporter DROP NOT NULL"
+        ));
+        assert!(is_blocking_alter(
+            "ALTER TABLE issue ALTER COLUMN reporter DROP NOT NULL, ALTER COLUMN x TYPE BIGINT"
         ));
         assert!(is_blocking_alter("CREATE INDEX idx ON issue (x)"));
         assert!(!is_blocking_alter(

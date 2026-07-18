@@ -200,6 +200,14 @@ ALTER TABLE issue ADD COLUMN IF NOT EXISTS title_nonce bytea;
 ALTER TABLE issue ADD COLUMN IF NOT EXISTS title_ciphertext bytea;
 ALTER TABLE issue ADD COLUMN IF NOT EXISTS created_by_principal text;";
 
+/// Forward-only provenance repair for the legacy mandatory `reporter uuid` column. PostgreSQL's
+/// `DROP NOT NULL` changes only the catalog flag (no row rewrite or table scan), preserving every
+/// existing reporter while allowing new rows to leave it absent until Identity supplies a real
+/// pseudonymous reporter mapping. The shared hot-table classifier admits this one metadata-only
+/// `ALTER COLUMN` shape while continuing to reject type rewrites and other in-place alterations.
+pub const EXPAND_NULLABLE_REPORTER_DDL: &str =
+    "ALTER TABLE issue ALTER COLUMN reporter DROP NOT NULL;";
+
 /// `issue_relation` (arch 01 §4 — the TE-7 source of truth, contract 5.5). We write the FORWARD edge
 /// transactionally + emit ONE typed event; Refs materialises both directions. The FK constrains only
 /// the `src_issue` end (the far `dst_ref` may be cross-subsystem). HOT (typed-edge writes). The
@@ -468,6 +476,11 @@ pub fn issues_migrations() -> Migrations {
         EXPAND_ISSUE_DURABLE_STORE_DDL,
         ISSUE_TABLE,
     ));
+    migrations.push(Migration::plain_on(
+        "iss_0015_nullable_reporter_expand",
+        EXPAND_NULLABLE_REPORTER_DDL,
+        ISSUE_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -573,16 +586,17 @@ mod tests {
         }
     }
 
-    /// **The migration set applies forward-only (no DROP, no down) — the contract-1.5 floor.** Every
-    /// assembled DDL is forward-only-legal (`is_destructive` is false). The runner / lint enforce
-    /// this at boot / source-scan; this is the in-module proof.
+    /// **The migration set applies forward-only (no destructive DROP, no down) — the contract-1.5
+    /// floor.** Every assembled DDL is forward-only-legal (`is_destructive` is false). The one
+    /// `DROP NOT NULL` relaxes a constraint without deleting a row or column. The runner / lint
+    /// enforce this at boot / source-scan; this is the in-module proof.
     #[test]
     fn the_migration_set_is_forward_only() {
         let migrations = issues_migrations();
         assert_eq!(
             migrations.0.len(),
-            20,
-            "11 table creates + 8 concurrent indexes + 1 online expand"
+            21,
+            "11 table creates + 8 concurrent indexes + 2 online expands"
         );
         for m in &migrations.0 {
             assert!(
@@ -590,11 +604,6 @@ mod tests {
                 "migration {} is forward-only (no DROP): {}",
                 m.id,
                 m.ddl
-            );
-            assert!(
-                !m.ddl.to_ascii_uppercase().contains("DROP"),
-                "no DROP in migration {}",
-                m.id
             );
         }
     }
@@ -614,7 +623,7 @@ mod tests {
             .expect("the full Issue-Tracker spine applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            20,
+            21,
             "the runner applied every table/index/expand migration"
         );
         assert_eq!(
@@ -630,7 +639,7 @@ mod tests {
             .expect("the spine re-applies idempotently");
         assert_eq!(
             runner2.applied().len(),
-            20,
+            21,
             "the re-apply admits every migration again"
         );
     }
