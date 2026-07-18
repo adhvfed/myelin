@@ -35,10 +35,10 @@
 
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
-    merge_attempt_id, run_state, CheckFact, CiDispatch, CiDispatcher, DriveOutcome,
-    DurableExecutor, FlowDispatcher, FlowExecutor, FlowTelemetry, MergeOutcome, MergePerformer,
-    MergeRequest, RealCiResultProducer, RunStore, SignalStore, TimerStore, WfCtx, WfJournal,
-    WorkflowBody,
+    merge_attempt_id, partition_for_run_id, run_state, CheckFact, CiDispatch, CiDispatcher,
+    DriveOutcome, DurableExecutor, FlowDispatcher, FlowExecutor, FlowTelemetry, MergeOutcome,
+    MergePerformer, MergeRequest, RealCiResultProducer, RunStore, SignalStore, TimerStore, WfCtx,
+    WfJournal, WorkflowBody,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
@@ -145,13 +145,6 @@ struct Substrate {
     timers: TimerStore,
 }
 
-fn partition_for(run_id: &str) -> i16 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    run_id.hash(&mut h);
-    (h.finish() % myelin_flow::PARTITION_COUNT as u64) as i16
-}
-
 fn fresh_worker(
     sub: &Substrate,
     worker: &str,
@@ -217,7 +210,7 @@ fn x1_seam_e2e_green_rollup_from_real_producer_one_merge_across_restart() {
     let ci = Arc::new(CountingCi::default());
     let merger = Arc::new(CountingMerger::default());
     let (_ex, run, sub) = start("queue:main:pr-7");
-    let part = partition_for(&run.0);
+    let part = partition_for_run_id(&run.0);
 
     // WORKER 1: dispatch CI + PARK on ci.result (state=waiting, holds no runtime).
     let w1 = fresh_worker(&sub, "worker-1", part, ci.clone(), merger.clone());
@@ -336,7 +329,7 @@ fn x1_seam_e2e_superseding_failure_dequeues_zero_spurious_unblock() {
     let ci = Arc::new(CountingCi::default());
     let merger = Arc::new(CountingMerger::default());
     let (_ex, run, sub) = start("queue:main:pr-8");
-    let part = partition_for(&run.0);
+    let part = partition_for_run_id(&run.0);
 
     let w1 = fresh_worker(&sub, "worker-1", part, ci.clone(), merger.clone());
     assert_eq!(

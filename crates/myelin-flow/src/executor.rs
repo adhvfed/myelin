@@ -417,16 +417,33 @@ impl FlowExecutor {
     }
 }
 
-/// The stable worker partition for a run handle. Kept outside either executor implementation so
-/// memory and Postgres stamp exactly the same shard for the same run id.
-/// Deterministically assign a durable run id to its workflow partition. Product starters expose
-/// this only to verify that an idempotent PostgreSQL replay still carries the exact engine-owned
-/// partition selected at creation; callers must not use it for tenant discovery or routing.
+/// The frozen 64-bit partition hash for a durable run id.
+///
+/// Historical `workflow_run.partition` rows were assigned by Rust's zero-key
+/// `DefaultHasher`/`Hash for str` combination: SipHash-1-3 over the UTF-8 bytes followed by the
+/// `0xff` string terminator. `DefaultHasher` is explicitly unspecified and may change between Rust
+/// releases, so the production path spells out all three compatibility inputs: SipHash-1-3, keys
+/// `(0, 0)`, and the byte framing. Changing any of them would strand existing rows on a different
+/// worker partition.
+fn stable_partition_hash(run_id: &str) -> u64 {
+    use std::hash::Hasher;
+
+    let mut hasher = siphasher::sip::SipHasher13::new_with_keys(0, 0);
+    hasher.write(run_id.as_bytes());
+    hasher.write_u8(0xff);
+    hasher.finish()
+}
+
+/// Deterministically assign a durable run id to its workflow partition.
+///
+/// This is a persisted compatibility contract, not merely a distribution helper: it uses the
+/// frozen zero-key SipHash-1-3 mapping in [`stable_partition_hash`] so memory, PostgreSQL, and every
+/// deployment/toolchain continue to stamp exactly the same shard for an existing run id. Product
+/// starters expose this only to verify that an idempotent PostgreSQL replay still carries the exact
+/// engine-owned partition selected at creation; callers must not use it for tenant discovery or
+/// routing.
 pub fn partition_for_run_id(run_id: &str) -> i16 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    run_id.hash(&mut h);
-    (h.finish() % PARTITION_COUNT as u64) as i16
+    (stable_partition_hash(run_id) % PARTITION_COUNT as u64) as i16
 }
 
 impl DurableExecutor for FlowExecutor {
@@ -665,6 +682,95 @@ mod tests {
             .map_err(|e| format!("{e:?}"))?;
             Ok(vec![])
         })
+    }
+
+    /// Known answers freeze the FULL historical digest, not only today's modulo-16 partition. That
+    /// catches algorithm/key/framing drift even when a changed digest happens to land on the same
+    /// current shard, and preserves the mapping if a future migration uses 64 physical shards.
+    #[test]
+    fn durable_partition_hash_matches_frozen_known_answers() {
+        let vectors = [
+            ("", 0x3040_6ea5_23c5_3def_u64, 15_i16, 47_u64),
+            ("a", 0x719b_50b9_a4f0_e9f3, 3, 51),
+            ("run-rolled-back", 0x04ea_b0d1_24f5_7a61, 1, 33),
+            (
+                "00000000-0000-0000-0000-000000000000",
+                0xc104_447f_85ee_a341,
+                1,
+                1,
+            ),
+            (
+                "0190f8b0-7c00-7f3d-8000-000000000001",
+                0x9e9d_af38_43b9_f61c,
+                12,
+                28,
+            ),
+            ("wf:evt-42", 0xfe07_9a5f_b671_7967, 7, 39),
+            ("myelin://acme/flow/run/123", 0x5ca0_2bf3_f373_7ab2, 2, 50),
+            ("éclair", 0x31e1_0df2_2833_fc5b, 11, 27),
+            ("emoji-🧠", 0x4cbd_d88e_c2d0_0148, 8, 8),
+            ("nul\0inside", 0xacc6_c10a_e1da_2b31, 1, 49),
+        ];
+
+        for (run_id, expected_hash, expected_partition, expected_mod_64) in vectors {
+            let actual_hash = stable_partition_hash(run_id);
+            assert_eq!(
+                actual_hash, expected_hash,
+                "full digest drifted for {run_id:?}"
+            );
+            assert_eq!(
+                partition_for_run_id(run_id),
+                expected_partition,
+                "durable modulo-{PARTITION_COUNT} mapping drifted for {run_id:?}"
+            );
+            assert_eq!(
+                actual_hash % 64,
+                expected_mod_64,
+                "modulo-64 compatibility drifted for {run_id:?}"
+            );
+        }
+    }
+
+    /// Migration-only parity guard: compare the frozen implementation against the exact
+    /// `DefaultHasher` + `Hash for str` behavior that created historical rows. Production code must
+    /// never call this legacy reference because its algorithm is unspecified by Rust.
+    #[test]
+    fn frozen_partition_hash_has_broad_parity_with_the_legacy_mapping() {
+        use std::hash::{Hash, Hasher};
+
+        let fixed = [
+            "",
+            "a",
+            "run-rolled-back",
+            "00000000-0000-0000-0000-000000000000",
+            "0190f8b0-7c00-7f3d-8000-000000000001",
+            "wf:evt-42",
+            "myelin://acme/flow/run/123",
+            "éclair",
+            "emoji-🧠",
+            "nul\0inside",
+        ];
+        let generated = (0_u64..20_000).flat_map(|index| {
+            [
+                format!("run-{index}"),
+                format!("{index:016x}-{index:020}-tenant/acme"),
+                format!("workflow:🧠:{index}:\0:{:x}", index.rotate_left(29)),
+            ]
+        });
+
+        for run_id in fixed
+            .iter()
+            .map(|value| (*value).to_owned())
+            .chain(generated)
+        {
+            let mut legacy = std::collections::hash_map::DefaultHasher::new();
+            run_id.hash(&mut legacy);
+            assert_eq!(
+                stable_partition_hash(&run_id),
+                legacy.finish(),
+                "frozen hash diverged from the historical mapping for {run_id:?}"
+            );
+        }
     }
 
     /// **`start` is IDEMPOTENT on `idem_key` (FROZEN, contract 9.1).** A re-start with the SAME key

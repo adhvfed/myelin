@@ -58,12 +58,12 @@ use myelin_events::{
     EventType, IdMinter, MonotonicMinter, OutboxStore, Timestamp, Visibility,
 };
 use myelin_flow::{
-    merge_attempt_id, request_approval_and_wait, run_state, BudgetGate, CheckFact, CiDispatch,
-    CiDispatcher, DelegationCaveats, DriveOutcome, DurableExecutor, FlowDispatcher, FlowExecutor,
-    FlowTelemetry, JobKind, JobRunner, JobSpec, MergeOutcome, MergePerformer, MergeRequest,
-    MeteredUnit, MinorUnits, RealCiResultProducer, RetryPolicy, RunStore, RunTokenError,
-    RunTokenHandle, RunTokenLease, RunTokenMinter, SignalSpec, SignalStore, TimerStore,
-    WaitOutcome, Wallet, WfCtx, WfJournal, WorkflowBody, DECLINE_MARKER,
+    merge_attempt_id, partition_for_run_id, request_approval_and_wait, run_state, BudgetGate,
+    CheckFact, CiDispatch, CiDispatcher, DelegationCaveats, DriveOutcome, DurableExecutor,
+    FlowDispatcher, FlowExecutor, FlowTelemetry, JobKind, JobRunner, JobSpec, MergeOutcome,
+    MergePerformer, MergeRequest, MeteredUnit, MinorUnits, RealCiResultProducer, RetryPolicy,
+    RunStore, RunTokenError, RunTokenHandle, RunTokenLease, RunTokenMinter, SignalSpec,
+    SignalStore, TimerStore, WaitOutcome, Wallet, WfCtx, WfJournal, WorkflowBody, DECLINE_MARKER,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
@@ -105,13 +105,6 @@ fn unit(wholesale: u64, markup: u64) -> MeteredUnit {
         wholesale: MinorUnits(wholesale),
         markup: MinorUnits(markup),
     }
-}
-
-fn partition_for(run_id: &str) -> i16 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    run_id.hash(&mut h);
-    (h.finish() % myelin_flow::PARTITION_COUNT as u64) as i16
 }
 
 // ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -372,7 +365,7 @@ fn e2e2_durable_workflow_hitl_spine_across_kill_and_days_later_approval() {
         timers: TimerStore::new(),
         minter: minter(), // ONE shared minter — globally-unique outbox ULIDs across all workers.
     };
-    let part = partition_for(&triage.0);
+    let part = partition_for_run_id(&triage.0);
 
     // Pre-buffer the triage STEP's job.done (a fast triage runner — the long-park resolves in one
     // drive). The job dispatch is the FIRST command (agent.run:0), so its idem_token keys on that.
@@ -593,7 +586,7 @@ fn e2e2_durable_workflow_hitl_spine_across_kill_and_days_later_approval() {
             idem_key: "queue:main:pr-fix".into(),
         })
         .expect("the fix-PR is queued for merge");
-    let mq_part = partition_for(&mq.0);
+    let mq_part = partition_for_run_id(&mq.0);
 
     let fresh_mq_worker = |worker: &str| -> FlowDispatcher {
         let mut disp = FlowDispatcher::new(
@@ -772,7 +765,7 @@ fn e2e2_spine_days_later_decline_withholds_the_merge_zero_mutation() {
         timers: TimerStore::new(),
         minter: minter(),
     };
-    let part = partition_for(&triage.0);
+    let part = partition_for_run_id(&triage.0);
 
     let step_token = myelin_flow::job_idem_token(&triage.0, "agent.run:0");
     sub.signals.deliver(myelin_flow::SignalRow {

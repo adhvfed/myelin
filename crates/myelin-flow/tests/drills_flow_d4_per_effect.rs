@@ -31,9 +31,10 @@
 
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
-    apply_approved_effects, run_state, ApprovalCard, ApprovalDecision, DurableExecutor,
-    EffectOutcome, FlowDispatcher, FlowExecutor, FlowTelemetry, GatedEffect, RunStore, SignalSpec,
-    SignalStore, WaitOutcome, WfCtx, WfJournal, WorkflowBody, APPROVAL_SIGNAL_NAME, DECLINE_MARKER,
+    apply_approved_effects, partition_for_run_id, run_state, ApprovalCard, ApprovalDecision,
+    DurableExecutor, EffectOutcome, FlowDispatcher, FlowExecutor, FlowTelemetry, GatedEffect,
+    RunStore, SignalSpec, SignalStore, WaitOutcome, WfCtx, WfJournal, WorkflowBody,
+    APPROVAL_SIGNAL_NAME, DECLINE_MARKER,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
@@ -235,15 +236,6 @@ struct Substrate {
     tele: FlowTelemetry,
 }
 
-/// The deterministic partition a run is hashed into (`hash(run_id) % PARTITION_COUNT`, §7.2) — the same
-/// hash `FlowExecutor::start` stamps, so the worker built on this partition leases the run.
-fn partition_for(run_id: &str) -> i16 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    run_id.hash(&mut h);
-    (h.finish() % myelin_flow::PARTITION_COUNT as u64) as i16
-}
-
 /// A FRESH dispatcher over the shared substrate (a "restart" / a "redeploy" — a new worker process), on
 /// the run's partition so its lease scan finds it. The deploy re-registers the SAME-version body.
 fn fresh_worker(
@@ -347,7 +339,7 @@ fn flow_d4_per_effect_partial_approval_across_restart_and_deploy_double_click() 
     };
     let ledger: Ledger = Rc::new(RefCell::new(Vec::new()));
     let apply_count: ApplyCount = Rc::new(RefCell::new(0));
-    let part = partition_for(&run.0);
+    let part = partition_for_run_id(&run.0);
     // One process-global ULID source shared across the restart/deploy (event-id uniqueness is global).
     let id_source = minter();
 

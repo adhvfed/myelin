@@ -166,11 +166,7 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
     .await
     .expect("read caller-owned start before rollback");
     assert_eq!(persisted.get::<i32, _>("wf_version"), 1);
-    use std::hash::{Hash, Hasher};
-    let mut partition_hasher = std::collections::hash_map::DefaultHasher::new();
-    "run-rolled-back".hash(&mut partition_hasher);
-    let expected_partition =
-        (partition_hasher.finish() % u64::from(myelin_flow::PARTITION_COUNT)) as i16;
+    let expected_partition = myelin_flow::partition_for_run_id("run-rolled-back");
     assert_eq!(persisted.get::<i16, _>("partition"), expected_partition);
     assert_eq!(
         persisted.get::<serde_json::Value, _>("input"),

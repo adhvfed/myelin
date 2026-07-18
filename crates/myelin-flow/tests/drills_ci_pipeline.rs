@@ -31,9 +31,9 @@
 
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
-    job_idem_token, run_state, stage_verdict_marker, CiPipelineSpec, CiStage, DriveOutcome,
-    DurableExecutor, FlowDispatcher, FlowExecutor, FlowTelemetry, JobKind, JobRunner, JobSpec,
-    PipelineOutcome, RunStore, SignalOutcome, SignalSpec, SignalStore, TimerStore, WfCtx,
+    job_idem_token, partition_for_run_id, run_state, stage_verdict_marker, CiPipelineSpec, CiStage,
+    DriveOutcome, DurableExecutor, FlowDispatcher, FlowExecutor, FlowTelemetry, JobKind, JobRunner,
+    JobSpec, PipelineOutcome, RunStore, SignalOutcome, SignalSpec, SignalStore, TimerStore, WfCtx,
     WfJournal, WorkflowBody, CI_PIPELINE_WF_TYPE, JOB_DONE_SIGNAL,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -139,13 +139,6 @@ struct Substrate {
     timers: TimerStore,
 }
 
-fn partition_for(run_id: &str) -> i16 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    run_id.hash(&mut h);
-    (h.finish() % myelin_flow::PARTITION_COUNT as u64) as i16
-}
-
 fn fresh_worker(
     sub: &Substrate,
     worker: &str,
@@ -227,7 +220,7 @@ fn deliver_stage_done(
 fn ci_d9_ci_pipeline_replay_is_bit_identical_and_only_journaled_job_done_feeds_the_body() {
     let runner = Arc::new(CountingCiRunner::default());
     let (ex, run, sub) = start("ci.pipeline:pr-7:run-1");
-    let part = partition_for(&run.0);
+    let part = partition_for_run_id(&run.0);
 
     // DRIVE 1: dispatch stage `build` + park on its job.done (no job.done yet).
     let w1 = fresh_worker(&sub, "worker-1", part, runner.clone());
@@ -328,7 +321,7 @@ fn ci_d9_ci_pipeline_replay_is_bit_identical_and_only_journaled_job_done_feeds_t
 fn ci_d1_kill_runner_and_control_plane_mid_run_resumes_effectively_once() {
     let runner = Arc::new(CountingCiRunner::default());
     let (ex, run, sub) = start("ci.pipeline:pr-8:run-1");
-    let part = partition_for(&run.0);
+    let part = partition_for_run_id(&run.0);
 
     // WORKER 1: dispatch `build` + PARK. Then the worker CRASHES (drop) — the control plane is gone.
     let w1 = fresh_worker(&sub, "worker-1", part, runner.clone());
@@ -451,7 +444,7 @@ fn ci_d1_kill_runner_and_control_plane_mid_run_resumes_effectively_once() {
 fn ci_pipeline_failing_stage_stops_fast_under_the_dispatcher() {
     let runner = Arc::new(CountingCiRunner::default());
     let (ex, run, sub) = start("ci.pipeline:pr-9:run-1");
-    let part = partition_for(&run.0);
+    let part = partition_for_run_id(&run.0);
 
     let w1 = fresh_worker(&sub, "worker-1", part, runner.clone());
     assert_eq!(
