@@ -24,7 +24,7 @@
 
 use myelin_config::{Mode, MyelinConfig};
 use myelin_events::OutboxStore;
-use myelin_issues::run_issues;
+use myelin_issues::{issues_hot_tables, issues_migrations, run_issues};
 use myelin_storage::{all_durable_migrations, HotTables, PgOutboxBacking, SubstrateProvider};
 use myelin_substrate::Config;
 use std::sync::Arc;
@@ -77,6 +77,16 @@ async fn main() {
         .await
     {
         eprintln!("issues: cannot apply the durable migration aggregate (identity/pseudonym/placement/kms/cost/erasure): {e}");
+        std::process::exit(1);
+    }
+    // Apply the Issues-owned spine through the REAL provider migrator. The AppSpec migration list
+    // is also the DB-free lifecycle declaration, but it does not execute SQL; production boot must
+    // validate + execute this set before any issue store is opened. Fail loud on any schema fault.
+    if let Err(e) = provider
+        .migrate(&issues_migrations(), &issues_hot_tables())
+        .await
+    {
+        eprintln!("issues: cannot apply the issue-spine migrations: {e}");
         std::process::exit(1);
     }
     // The DURABLE outbox (SI-007): committed events live in Postgres, not a per-process mutex.

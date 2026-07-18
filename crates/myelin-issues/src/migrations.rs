@@ -189,6 +189,17 @@ pub const CREATE_ISSUE_INDEXES_DDL: &[(&str, &str)] = &[
     ),
 ];
 
+/// Forward-only nullable-column expand that makes the live issue store's free-text posture
+/// executable. The legacy `title` column remains as a non-PII sentinel during the expand phase;
+/// new writes put only ciphertext + nonce + the existing `pii_key_ref` in the row. A later measured
+/// backfill/contract migration may remove the sentinel column after every older row is converted.
+/// All three additions are nullable and carry no default, so this is an online metadata-only expand
+/// on the declared-HOT `issue` table.
+pub const EXPAND_ISSUE_DURABLE_STORE_DDL: &str = "\
+ALTER TABLE issue ADD COLUMN IF NOT EXISTS title_nonce bytea;
+ALTER TABLE issue ADD COLUMN IF NOT EXISTS title_ciphertext bytea;
+ALTER TABLE issue ADD COLUMN IF NOT EXISTS created_by_principal text;";
+
 /// `issue_relation` (arch 01 §4 — the TE-7 source of truth, contract 5.5). We write the FORWARD edge
 /// transactionally + emit ONE typed event; Refs materialises both directions. The FK constrains only
 /// the `src_issue` end (the far `dst_ref` may be cross-subsystem). HOT (typed-edge writes). The
@@ -361,25 +372,13 @@ pub fn make_tenant_scoped_ddl(table: &str) -> String {
 /// One ordered list so [`issues_migrations`] builds the [`Migrations`] set + the
 /// `forward-only-migration` lint reads the same DDL.
 fn create_statements() -> Vec<(&'static str, &'static str, String)> {
-    // issue: the create + its six hot-path indexes, assembled into ONE forward DDL (empty fresh).
-    let mut issue_ddl = String::from(CREATE_ISSUE_DDL);
-    issue_ddl.push(';');
-    for (_name, idx) in CREATE_ISSUE_INDEXES_DDL {
-        issue_ddl.push('\n');
-        issue_ddl.push_str(idx);
-        issue_ddl.push(';');
-    }
-    // issue_relation: the create + its two traversal indexes, assembled into ONE forward DDL.
-    let mut rel_ddl = String::from(CREATE_ISSUE_RELATION_DDL);
-    rel_ddl.push(';');
-    for (_name, idx) in CREATE_ISSUE_RELATION_INDEXES_DDL {
-        rel_ddl.push('\n');
-        rel_ddl.push_str(idx);
-        rel_ddl.push(';');
-    }
     vec![
-        ("iss_0001_issue", ISSUE_TABLE, issue_ddl),
-        ("iss_0002_issue_relation", ISSUE_RELATION_TABLE, rel_ddl),
+        ("iss_0001_issue", ISSUE_TABLE, CREATE_ISSUE_DDL.to_string()),
+        (
+            "iss_0002_issue_relation",
+            ISSUE_RELATION_TABLE,
+            CREATE_ISSUE_RELATION_DDL.to_string(),
+        ),
         (
             "iss_0003_issue_change_log",
             ISSUE_CHANGE_LOG_TABLE,
@@ -456,6 +455,23 @@ pub fn issues_migrations() -> Migrations {
         let ddl: &'static str = Box::leak(ddl.into_boxed_str());
         migrations.push(Migration::plain_on(id, ddl, table));
     }
+    // Each concurrent index is its OWN migration/query. PostgreSQL rejects
+    // `CREATE INDEX CONCURRENTLY` when it shares a simple-query message with other statements,
+    // because the message becomes an implicit transaction block. Keeping each index separate is
+    // both boot-applicable and non-blocking on the declared-hot tables.
+    for (name, ddl) in CREATE_ISSUE_INDEXES_DDL {
+        let id = Box::leak(format!("iss_0012_{name}").into_boxed_str());
+        migrations.push(Migration::plain_on(id, ddl, ISSUE_TABLE));
+    }
+    for (name, ddl) in CREATE_ISSUE_RELATION_INDEXES_DDL {
+        let id = Box::leak(format!("iss_0013_{name}").into_boxed_str());
+        migrations.push(Migration::plain_on(id, ddl, ISSUE_RELATION_TABLE));
+    }
+    migrations.push(Migration::plain_on(
+        "iss_0014_issue_durable_store_expand",
+        EXPAND_ISSUE_DURABLE_STORE_DDL,
+        ISSUE_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -479,7 +495,14 @@ mod tests {
     #[test]
     fn all_eleven_spine_tables_are_present_fk_ordered() {
         let migrations = issues_migrations();
-        let tables: Vec<&str> = migrations.0.iter().map(|m| m.table.unwrap()).collect();
+        let create_ids: std::collections::BTreeSet<&str> =
+            create_statements().iter().map(|(id, _, _)| *id).collect();
+        let tables: Vec<&str> = migrations
+            .0
+            .iter()
+            .filter(|m| create_ids.contains(m.id))
+            .map(|m| m.table.unwrap())
+            .collect();
         assert_eq!(
             tables,
             vec![
@@ -542,8 +565,15 @@ mod tests {
                 );
             }
         }
-        // The RLS scoping rides every domain migration (and NOT the outbox).
-        for m in &issues_migrations().0 {
+        // The RLS scoping rides every domain TABLE-CREATE migration (and NOT the outbox). Index and
+        // nullable-column expand steps operate on a table whose RLS policy is already installed.
+        let create_ids: std::collections::BTreeSet<&str> =
+            create_statements().iter().map(|(id, _, _)| *id).collect();
+        for m in issues_migrations()
+            .0
+            .iter()
+            .filter(|m| create_ids.contains(m.id))
+        {
             if m.table == Some(OUTBOX_TABLE) {
                 assert!(
                     !m.ddl.contains("myelin_make_tenant_scoped"),
@@ -567,8 +597,8 @@ mod tests {
         let migrations = issues_migrations();
         assert_eq!(
             migrations.0.len(),
-            11,
-            "11 forward migrations, one per table"
+            20,
+            "11 table creates + 8 concurrent indexes + 1 online expand"
         );
         for m in &migrations.0 {
             assert!(
@@ -600,8 +630,8 @@ mod tests {
             .expect("the full Issue-Tracker spine applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            11,
-            "the runner applied all 11 migrations"
+            20,
+            "the runner applied every table/index/expand migration"
         );
         assert_eq!(
             runner.applied()[0],
@@ -616,8 +646,8 @@ mod tests {
             .expect("the spine re-applies idempotently");
         assert_eq!(
             runner2.applied().len(),
-            11,
-            "the re-apply admits all 11 again"
+            20,
+            "the re-apply admits every migration again"
         );
     }
 
@@ -737,21 +767,28 @@ mod tests {
         );
     }
 
-    /// **The six `issue` hot-path indexes ride the `issue` migration, built `CONCURRENTLY` on the
-    /// declared-HOT table (arch 01 §2).** The board/roadmap/assignee/parent/cycle scans + the
-    /// custom-field GIN. CONCURRENTLY keeps the create non-blocking against live writes (so the same
-    /// DDL is legal empty or re-applied at QPS, §9.4).
+    /// **The six `issue` hot-path indexes each ride a separate migration/query, built
+    /// `CONCURRENTLY` on the declared-HOT table (arch 01 §2).** PostgreSQL refuses a concurrent
+    /// index inside a multi-statement implicit transaction, so separate steps are part of the
+    /// production boot contract, not merely cosmetic.
     #[test]
     fn the_six_issue_indexes_ride_the_migration_concurrently() {
-        let issue = issues_migrations()
-            .0
-            .into_iter()
-            .find(|m| m.table == Some(ISSUE_TABLE))
-            .unwrap();
-        for (name, _ddl) in CREATE_ISSUE_INDEXES_DDL {
-            assert!(
-                issue.ddl.contains(name),
-                "index `{name}` rides the issue migration"
+        let migrations = issues_migrations();
+        for (name, ddl) in CREATE_ISSUE_INDEXES_DDL {
+            let matching: Vec<_> = migrations
+                .0
+                .iter()
+                .filter(|m| m.table == Some(ISSUE_TABLE) && m.ddl == *ddl)
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "index `{name}` has exactly one standalone migration"
+            );
+            assert_eq!(
+                matching[0].ddl.matches(';').count(),
+                0,
+                "one SQL statement per concurrent-index query"
             );
         }
         // Every hot-table index is CONCURRENTLY (non-blocking against the declared-hot table).
