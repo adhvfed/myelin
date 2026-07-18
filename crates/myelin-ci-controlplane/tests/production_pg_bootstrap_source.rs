@@ -47,6 +47,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(!source.contains("unresolved_stage_spec_builder"));
     assert!(!source.contains("TenantId(\"ci-controlplane\""));
     assert!(!source.contains("synthetic tenant"));
+    assert!(source.contains("InvalidRunnerSetting(String)"));
 
     assert!(runner_gate < bootstrap);
     assert!(foundation < durable);
@@ -96,6 +97,23 @@ fn runner_activation_is_refused_before_any_database_attempt() {
     assert!(stderr.contains("real durable CostLedger reserve/settle authority"));
     assert!(stderr.contains("live per-run-token verification"));
     assert!(stderr.contains("production runner activation is refused"));
+    assert!(!stderr.contains("database bootstrap refused to start"));
+    assert!(!stderr.contains("DATABASE_URL"));
+    assert!(!stderr.contains("DATABASE_MIGRATION_URL"));
+}
+
+#[test]
+fn invalid_runner_setting_is_refused_before_any_database_attempt() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ci-controlplane"))
+        .env_clear()
+        .env("MYELIN_CI_RUNNER", "true")
+        .output()
+        .expect("CI Controlplane process must launch");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr must be UTF-8");
+    assert!(stderr.contains("invalid MYELIN_CI_RUNNER value \"true\""));
+    assert!(stderr.contains("allowed values are `0`, `1`, or unset"));
     assert!(!stderr.contains("database bootstrap refused to start"));
     assert!(!stderr.contains("DATABASE_URL"));
     assert!(!stderr.contains("DATABASE_MIGRATION_URL"));
