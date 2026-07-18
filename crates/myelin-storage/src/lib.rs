@@ -673,6 +673,9 @@ pub mod tenant_tx;
 // the stores. The seam every durable store is constructed through — the in-memory impls become
 // explicit test-doubles on this path.
 pub mod provider;
+// The durable, append-only four-conjunct delegation policies + per-run snapshots. Resolution is
+// tenant/region FORCE-RLS scoped and policy updates cannot widen an existing run snapshot.
+pub mod delegation_policy_durable;
 // The durable PG backings for the identity S1 principal + S3 tuple stores (MR-007 / SI-018/019):
 // reuses the rebac_tuple table/ops + adds the principal/credential_link tables (same RLS form), all
 // driven through the MR-022 with_tenant_tx convention. The identity-layer stores delegate to these.
@@ -899,6 +902,12 @@ pub use pg_migrator::{with_migration_lock, PgMigrator, MIGRATION_LOCK_KEY};
 // The MR-022 persistence foundation: the tenant-scoped-transaction convention (RESHAPE-002) + the
 // production composition root / real-pool provider (SI-022) + the validate→execute migration boot
 // reconciliation (SI-010). Compiled unconditionally as of MR-009b Wave 1.
+pub use delegation_policy_durable::{
+    delegation_policy_durable_migrations, DurableDelegationPolicyBacking,
+    DurableDelegationPolicyBundle, DurableDelegationPolicyError,
+    DurableDelegationPolicyHeadCursor, DurableDelegationPolicyRevisions,
+    DurableDelegationPolicySnapshot, DurableDelegationPolicyVersions,
+};
 pub use identity_durable::{
     identity_durable_migrations, DurablePrincipalBacking, DurablePrincipalRow, DurableProfileBlob,
     DurableRevocationBacking, DurableRevocationRow, DurableTupleBacking, TupleEdgeOp,
