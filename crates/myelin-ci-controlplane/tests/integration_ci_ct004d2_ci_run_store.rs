@@ -101,6 +101,7 @@ async fn chunk4_ci_run_store_round_trips_idempotent_and_rls_isolates() {
         .await
         .expect("get tenantA")
         .expect("the row is present");
+    assert_eq!(got.tenant_id, "tenantA", "authoritative tenant partition round-trips");
     assert_eq!(got.run_id, run_a, "run_id round-trips");
     assert_eq!(got.region, "fr-par");
     assert_eq!(got.project_id, "22222222-2222-2222-2222-222222222222");

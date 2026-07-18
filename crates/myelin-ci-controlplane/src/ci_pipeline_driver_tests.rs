@@ -26,6 +26,48 @@ fn flow_spec(target: &str, idem: &str) -> FlowJobSpec {
     s
 }
 
+fn ci_run_record(tenant_id: &str) -> CiRunRecord {
+    CiRunRecord {
+        tenant_id: tenant_id.into(),
+        run_id: "11111111-1111-1111-1111-111111111111".into(),
+        region: "fr-par".into(),
+        project_id: "22222222-2222-2222-2222-222222222222".into(),
+        pipeline_id: "33333333-3333-3333-3333-333333333333".into(),
+        wf_run_id: "44444444-4444-4444-4444-444444444444".into(),
+        repo_ref: Some("repo".into()),
+        commit_oid: Some("deadbeef".into()),
+        cause_event_id: Some("event-1".into()),
+        definition_snapshot: "blake3:abcd".into(),
+        trigger_kind: "push".into(),
+        trust_tier: "trusted".into(),
+        state: "queued".into(),
+        correlation_id: "corr-1".into(),
+    }
+}
+
+/// A region-wide starter must route a durable row to a driver for that exact tenant. The check runs
+/// before plan registration/start, preventing the former fixed `ci-controlplane` tenant from being
+/// stamped onto arbitrary queued runs.
+#[test]
+fn driver_refuses_a_durable_run_from_another_tenant() {
+    let record = ci_run_record("tenant-b");
+    let err = validate_driver_tenant(&TenantId("tenant-a".into()), &record)
+        .expect_err("cross-tenant run must be refused");
+    assert!(matches!(
+        err,
+        StartRunError::TenantMismatch {
+            driver_tenant,
+            record_tenant
+        } if driver_tenant == "tenant-a" && record_tenant == "tenant-b"
+    ));
+}
+
+#[test]
+fn driver_accepts_a_durable_run_for_its_exact_tenant() {
+    let record = ci_run_record("acme");
+    validate_driver_tenant(&TenantId("acme".into()), &record).expect("same-tenant run is admitted");
+}
+
 /// **THE SECURITY INVARIANT (unit half): the enqueue's trust_tier + region come from the run's terms,
 /// forwarded UNCHANGED, and the spec's trust_tier is STAMPED to match — a builder that returns a WIDER
 /// tier is overwritten.** An `untrusted_fork` run enqueues an `untrusted_fork` stage behind an

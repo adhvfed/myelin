@@ -100,6 +100,10 @@ pub struct CiRunInsert {
 /// PII-classification mirror ([`crate::schema::CiRunRow`]), which tags the same table for the GDPR lint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiRunRecord {
+    /// `ci_run.tenant_id` — the authoritative tenant partition carried into the per-tenant
+    /// pipeline starter. Omitting this made it possible for a composition root to stamp a
+    /// synthetic/fixed tenant onto another tenant's durable run.
+    pub tenant_id: String,
     /// `ci_run.run_id` (uuid rendered text).
     pub run_id: String,
     /// `ci_run.region`.
@@ -151,6 +155,7 @@ RETURNING run_id";
 /// tenant predicate + the run PK; `region` is the RLS scope (the `(tenant, region)` GUC the tx sets).
 pub const SELECT_CI_RUN_QUERY: &str = "\
 SELECT
+  tenant_id              AS tenant_id,
   run_id::text            AS run_id,
   region                  AS region,
   project_id::text        AS project_id,
@@ -305,6 +310,7 @@ impl CiRunStore {
         .map_err(CiRunStoreError::from_pg)?;
 
         Ok(row.map(|r| CiRunRecord {
+            tenant_id: r.get("tenant_id"),
             run_id: r.get("run_id"),
             region: r.get("region"),
             project_id: r.get("project_id"),
