@@ -49,7 +49,7 @@ pub mod env {
 /// separately (and never stored on a struct that derives Debug) so it cannot leak via a `{:?}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeConfig {
-    /// The edge base URL (`http://host:port`).
+    /// The edge base URL (`https://host:port` in production; loopback `http://` is development-only).
     pub url: String,
     /// The token scheme presented in `x-myelin-token-scheme`.
     pub scheme: String,
