@@ -440,9 +440,12 @@ pub use harness::{
 };
 pub use outbox::{
     DurableOutboxBacking, EmitContextBase, IdMinter, MonotonicMinter, OutboxRow, OutboxStore,
-    OutboxTransaction, Ulid, UlidMinter, OUTBOX_MIGRATION,
+    OutboxTransaction, Ulid, UlidMinter, OUTBOX_MIGRATION, OUTBOX_QUARANTINE_MIGRATION,
 };
-pub use partition::{stream_name_for, PartitionKey, StreamSubject, SubjectError, SUBJECT_ROOT};
+pub use partition::{
+    stream_name_for, PartitionKey, StreamSubject, SubjectError, MAX_STREAM_SUBJECT_BYTES,
+    MAX_SUBJECT_TOKEN_BYTES, SUBJECT_ROOT,
+};
 pub use relay::{
     dlq_subject, BusTransport, DeadLetterAlert, Delivery, DrainReport, InProcessBus, Relay,
     TransportError, MAX_PUBLISH_ATTEMPTS,

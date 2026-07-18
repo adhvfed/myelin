@@ -129,6 +129,30 @@ CREATE TABLE IF NOT EXISTS outbox (
 -- the relay claims unsent rows ordered (aggregate, seq) with FOR UPDATE SKIP LOCKED:
 CREATE INDEX IF NOT EXISTS outbox_unsent_idx ON outbox (aggregate, seq) WHERE published_at IS NULL;";
 
+/// Durable quarantine for outbox rows that cannot be safely decoded or routed.
+///
+/// The original row remains in `outbox` and stays unpublished. This table deliberately copies no
+/// envelope, payload, subject, tenant, or actor data: operators get a stable bounded reason while
+/// remediation retains the one authoritative raw row behind the foreign key.
+pub const OUTBOX_QUARANTINE_MIGRATION: &str = "\
+CREATE TABLE IF NOT EXISTS outbox_quarantine (
+    event_id         TEXT        PRIMARY KEY REFERENCES outbox(event_id) ON DELETE RESTRICT,
+    aggregate        TEXT        NOT NULL,
+    seq              BIGINT      NOT NULL,
+    reason_code      TEXT        NOT NULL,
+    reason_detail    TEXT        NOT NULL,
+    quarantined_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    acknowledged_at TIMESTAMPTZ,
+    CONSTRAINT outbox_quarantine_reason_code_bounded CHECK (
+        reason_code ~ '^[a-z0-9_]{1,64}$'
+    ),
+    CONSTRAINT outbox_quarantine_reason_detail_bounded CHECK (
+        octet_length(reason_detail) BETWEEN 1 AND 256
+    )
+);
+CREATE INDEX IF NOT EXISTS outbox_quarantine_aggregate_seq_idx
+    ON outbox_quarantine (aggregate, seq);";
+
 /// A stable ULID — the `event_id` (the idempotency / broker-side-dedup key, ADR-04.1). A
 /// distinct newtype from [`EventId`] at the minting boundary; `From<Ulid> for EventId` carries
 /// it onto the envelope. "Stable" = the SAME row always carries the SAME id across every
@@ -1009,6 +1033,24 @@ mod tests {
         }
         // forward-only: no destructive DROP on the down path (there is no down path).
         assert!(!OUTBOX_MIGRATION.contains("DROP TABLE"));
+    }
+
+    #[test]
+    fn quarantine_migration_keeps_payload_in_the_original_outbox_only() {
+        assert!(OUTBOX_QUARANTINE_MIGRATION.contains("PRIMARY KEY REFERENCES outbox(event_id)"));
+        for col in [
+            "aggregate",
+            "seq",
+            "reason_code",
+            "reason_detail",
+            "acknowledged_at",
+        ] {
+            assert!(OUTBOX_QUARANTINE_MIGRATION.contains(col));
+        }
+        assert!(!OUTBOX_QUARANTINE_MIGRATION.contains("envelope"));
+        assert!(!OUTBOX_QUARANTINE_MIGRATION.contains("payload"));
+        assert!(!OUTBOX_QUARANTINE_MIGRATION.contains("subject"));
+        assert!(!OUTBOX_QUARANTINE_MIGRATION.contains("DROP TABLE"));
     }
 
     /// A committed transaction makes its staged event + state change durable together — the
