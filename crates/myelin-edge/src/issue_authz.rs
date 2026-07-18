@@ -82,7 +82,9 @@ impl IssueAuthorizer for StoreBackedIssueAuthorizer {
     ) -> bool {
         let permission = match permission {
             IssuePermission::View => "view",
-            IssuePermission::Close => "manage",
+            // Close is a lifecycle transition. The frozen Issues fragment admits an assignee or
+            // a project viewer; `manage` would incorrectly exclude the assignee-only arm.
+            IssuePermission::Close => "transition",
         };
         self.allows(principal, permission, format!("issue:{issue_id}"))
     }

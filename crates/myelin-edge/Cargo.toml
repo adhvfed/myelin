@@ -76,7 +76,9 @@ myelin-events = { path = "../myelin-events" }
 # only (the validator replica is drift-pinned by a committed test), so no production edge ci→git either.
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
 # The {error:{message,code?}} envelope + the JSON view-model/data contract are serde_json::Value (the
-# one workspace-pinned shape). No derive needed — the edge builds/parses Value directly.
+# one workspace-pinned shape). Issues uses a deny-unknown-fields request carrier so duplicate,
+# surplus, or tenant-selecting fields fail before a durable mutation.
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 # base64 (0.22 — the SAME pin myelin-identity-service uses) decodes the git smart-HTTP `Authorization:

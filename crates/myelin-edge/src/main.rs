@@ -25,8 +25,8 @@
 
 use myelin_config::Mode;
 use myelin_edge::{
-    bootstrap_principal_and_mint, register_git_durable, register_git_wire, serve_edge,
-    spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig,
+    bootstrap_principal_and_mint, register_git_durable, register_git_wire, register_issues,
+    serve_edge, spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig,
     AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer, DurableGitBackend,
     Gateway, IssueReconciliationConfig, Method, StoreBackedIssueAuthorizer, TupleRepoBootstrap,
     WhoamiHandler,
@@ -311,14 +311,14 @@ async fn serve(core: ComposedCore) {
         }
     }
     // Construct the real PostgreSQL Issues store over the SAME durable KMS + Identity engine used by
-    // the edge. It is deliberately not registered behind HTTP yet: the large-result Identity
-    // `Filter` arm is not spliced into PgIssueStore's list query, so exposing routes now would tempt
-    // an unsafe allow-all/post-filter fallback. The restart reconciler below is the deepest complete
-    // activation slice and never serves an issue row itself.
+    // the edge. List is safe to expose because PgIssueStore accepts only the frozen effective
+    // `issue:view` Filter and joins the durable ready projection in SQL before pagination. The same
+    // authorizer is retained by the registration-time object guards, then checked again in-store.
+    let issue_authorizer = StoreBackedIssueAuthorizer::new(check.clone());
     let issue_store = Arc::new(myelin_issues::PgIssueStore::new(
         provider.clone(),
         kms.clone(),
-        StoreBackedIssueAuthorizer::new(check.clone()),
+        issue_authorizer.clone(),
     ));
     let issue_reconciliation_config =
         IssueReconciliationConfig::from_env(Region::new(provider.config().region.clone()))
@@ -385,6 +385,12 @@ async fn serve(core: ComposedCore) {
     .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge");
     builder = register_git_durable(builder, git_backend.clone());
     builder = register_git_wire(builder, git_backend);
+    builder = register_issues(
+        builder,
+        issue_store.clone(),
+        issue_authorizer,
+        handle.clone(),
+    );
     let gateway = Arc::new(builder.build());
 
     let addr = std::env::var("MYELIN_EDGE_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
