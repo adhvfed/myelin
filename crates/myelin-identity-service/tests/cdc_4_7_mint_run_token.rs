@@ -21,13 +21,17 @@
 //! consumer's promise (it honours the token iff `is_live`, refuses a torn-down / expired token, and
 //! re-mints on resume) are pinned here so a change to either side fails this test in the same CI job.
 
+use std::sync::Arc;
+
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{
     DelegationCaveats, FailStaticBound, Principal, PrincipalId, PrincipalKind, RunId, RunToken,
     RuntimeRef,
 };
+use myelin_identity_service::mint::RunTokenAuthorizer;
 use myelin_identity_service::{
-    Authority, DelegationInput, MachineKind, StoreBackedCheck, TupleStore,
+    Authority, CiJobAuthorizationError, CredentialPurpose, DelegationInput, MachineKind,
+    PasetoCapabilityVerifier, RunTokenState, StoreBackedCheck, TupleStore,
 };
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
@@ -149,6 +153,67 @@ fn cdc_4_7_minted_token_honoured_within_run_life() {
     assert!(
         dispatch_under_token_is_honoured(&svc, &s, &token, &ts("2026-06-19T00:02:00Z")),
         "the CI-dispatch consumer honours a live per-run token"
+    );
+}
+
+/// A CI launch consumer verifies the real signed CI-job token again at the final boundary, binding
+/// the exact subject/job/scope/capability and consulting the same S7 lifecycle the provider minted.
+#[test]
+fn cdc_4_7_ci_job_is_reauthorized_immediately_before_launch() {
+    let s = scope("acme");
+    let svc = provider();
+    let token = svc
+        .mint_run_token_in(
+            &s,
+            &PrincipalId("svc:ci".into()),
+            &RunId("job:run-22:build".into()),
+            &agent("svc:ci", "acme"),
+            &human("p:human", "acme"),
+            &input(
+                &["job.launch", "artifact.write"],
+                &["job.launch", "artifact.write"],
+                &["job.launch", "artifact.write"],
+                &["job.launch", "artifact.write"],
+            ),
+            &caveats(&["job.launch", "artifact.write"]),
+            MachineKind::Ci,
+            &ttl(300),
+            &ts("2026-06-19T00:00:00Z"),
+        )
+        .expect("mint real signed CI-job token");
+    let verifier =
+        PasetoCapabilityVerifier::new(svc.token_trust_anchor()).with_clock(|| 1_781_827_260);
+    let authorizer = RunTokenAuthorizer::new(Arc::new(verifier), svc.revocations().clone())
+        .with_clock(|| ts("2026-06-19T00:01:00Z"));
+    let verified = authorizer
+        .authorize_ci_job(
+            &s,
+            &PrincipalId("svc:ci".into()),
+            "job:run-22:build",
+            &token,
+            &["job.launch".into(), "artifact.write".into()],
+        )
+        .expect("live exact CI token authorizes the one launch");
+    assert_eq!(verified.kind, MachineKind::Ci);
+    assert_eq!(
+        verified.purpose,
+        CredentialPurpose::CiJob {
+            run_id: "job:run-22:build".into()
+        }
+    );
+
+    svc.tear_down_run_token_in(&s, &token, &ts("2026-06-19T00:02:00Z"));
+    assert_eq!(
+        authorizer.authorize_ci_job(
+            &s,
+            &PrincipalId("svc:ci".into()),
+            "job:run-22:build",
+            &token,
+            &["job.launch".into()],
+        ),
+        Err(CiJobAuthorizationError::NotLive {
+            state: RunTokenState::TornDown
+        })
     );
 }
 
