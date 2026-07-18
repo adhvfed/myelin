@@ -36,6 +36,15 @@ use myelin_issues::issues_app_spec;
 use myelin_storage::{PgOutboxBacking, SubstrateProvider};
 use myelin_substrate::{boot, Config};
 
+fn app_url() -> String {
+    std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://myelin_app:myelin_app_pw@localhost:5433/myelin".into())
+}
+
+fn admin_url() -> String {
+    app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
+}
+
 fn ctx_base(tenant: &str) -> EmitContextBase {
     let principal = Principal::stub(
         PrincipalId("p:w3b4".into()),
@@ -59,14 +68,22 @@ fn ctx_base(tenant: &str) -> EmitContextBase {
 async fn spec_built_app_emit_lands_in_pg_without_claiming_the_shared_relay() {
     // The SAME composition-root shape the rewired service mains use (W3b.4): provider from env →
     // foundation migrations → OutboxStore::durable(PgOutboxBacking).
-    let config = MyelinConfig::from_env(Mode::DevDefaults).expect("dev config");
-    let provider = SubstrateProvider::connect(config, 4)
+    let mut migration_config = MyelinConfig::from_env(Mode::DevDefaults).expect("dev config");
+    migration_config.database_url = admin_url();
+    let migrator = SubstrateProvider::connect(migration_config.clone(), 2)
         .await
-        .expect("connect the provider pool (is the dev stack up?)");
-    provider
+        .expect("connect the migration-owner pool (is the dev stack up?)");
+    migrator
         .migrate_foundation()
         .await
         .expect("apply the foundation migrations (outbox/consumer_dedup)");
+
+    // Runtime operations use the constrained NOBYPASSRLS app role. Production still needs one
+    // platform-wide way to supply this credential split; the test models the required boundary.
+    migration_config.database_url = app_url();
+    let provider = SubstrateProvider::connect(migration_config, 4)
+        .await
+        .expect("connect the RLS-enforced runtime pool");
     let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
         provider.db_pool().clone(),
         tokio::runtime::Handle::current(),
