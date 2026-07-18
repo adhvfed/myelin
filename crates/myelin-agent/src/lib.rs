@@ -202,6 +202,34 @@ pub struct ToolDef {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RunCtx(pub String);
 
+/// The exact per-run capability token and binding a governed external effect acts under.
+///
+/// This carrier is deliberately separate from [`RunCtx`]: `RunCtx` is audit/causality metadata,
+/// while this value is authorization input that MUST be cryptographically verified again at the
+/// final mutation boundary. Its fields are not themselves trusted merely because this struct was
+/// constructed; a concrete [`EffectApi`] must verify the signed token, its live run-token record,
+/// subject/scope, tool binding, and the tool's independently resolved required capabilities before
+/// applying anything.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EffectAuthority {
+    /// The signed, attenuated token minted for this run.
+    pub run_token: myelin_identity::RunToken,
+    /// The authenticated principal the router bound the run to.
+    pub principal_id: myelin_identity::PrincipalId,
+    /// The exact registered tool selected by the router.
+    pub tool: String,
+}
+
+impl core::fmt::Debug for EffectAuthority {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EffectAuthority")
+            .field("jti", &self.run_token.jti)
+            .field("principal_id", &self.principal_id)
+            .field("tool", &self.tool)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A proposed effect the brain wants the platform to apply (architecture §5.2; contract 8.2).
 /// Agents NEVER mutate directly — a `ProposedEffect` goes through the schema → capability →
 /// delegation → tenant → budget → HITL-gate → apply → meter pipeline (AG-P6 → P-218); opaque here.
@@ -319,6 +347,24 @@ pub trait EventInbox {
 pub trait EffectApi {
     /// Apply (or gate / deny) a proposed effect under the run's context.
     fn apply(&self, run: &RunCtx, effect: ProposedEffect) -> EffectResult;
+
+    /// Apply an externally routed effect under the exact minted run-token authority.
+    ///
+    /// Mutation-capable implementations exposed to MCP or another external router MUST override
+    /// this method and re-verify `authority` at their final mutation boundary. The default is a
+    /// fail-closed denial so adding this entry cannot silently turn a legacy `EffectApi` into an
+    /// externally callable mutation path.
+    fn apply_authorized(
+        &self,
+        _run: &RunCtx,
+        _authority: &EffectAuthority,
+        _effect: ProposedEffect,
+    ) -> EffectResult {
+        EffectResult::Denied(
+            "effect adapter does not implement signed run-token authority verification — denied"
+                .into(),
+        )
+    }
 }
 
 /// **`run --dry-run`** — plan-then-apply testability (architecture §7.1; contract 8.7). Returns the

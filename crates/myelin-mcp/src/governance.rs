@@ -9,18 +9,22 @@
 //!    the call ACTS UNDER it — NOT a bare human PAT;
 //! 2. **consults durable revocation** ([`RunTokenMinter::is_live`]) before acting — a revoked /
 //!    expired run token is **Denied**, never routed (MR-011 durable revocation);
-//! 3. **HITL-gates** a `requires_approval` tool (the FROZEN flag from git's `agent_tools()`) BEFORE
+//! 3. **checks every subsystem-declared required capability** against the exact effective grant set
+//!    recorded by the same intersection proof that minted the token; the concrete mutation adapter
+//!    independently verifies the signed token and repeats this check at its final boundary;
+//! 4. **HITL-gates** a `requires_approval` tool (the FROZEN flag from git's `agent_tools()`) BEFORE
 //!    apply — a gated tool with no approval is **withheld** and **does NOT mutate** (the AG-8 leg).
 //!    **R2.4:** the approval is a SERVER-SIDE VERDICT — the withhold opens a `waiting` row in the
 //!    durable verdict store (`agent_hitl_gate`, migration 0054) under an OPAQUE server-issued gate
 //!    id; the re-drive PRESENTS that id and the gate clears ONLY if the store says it is Approved
 //!    for that exact effect by a DISTINCT human principal. The caller-supplied `approval.granted`
 //!    boolean of the 2026-07-06 finding is dead — it is not even parsed;
-//! 4. **routes the effect through `EffectApi::apply`** (the platform-owned PLAN-THEN-APPLY chokepoint,
+//! 5. **routes the effect through `EffectApi::apply_authorized`** (the platform-owned
+//!    PLAN-THEN-APPLY chokepoint,
 //!    §8.2) under a [`RunCtx`] that carries the run-token `jti` + the principal — NOT a direct
 //!    mutation. `EffectApi` is **brain-agnostic** (identical for the mock runtime, a future hosted
 //!    LLM, and local Claude over MCP — the whole point of plan-then-apply);
-//! 5. **attributes every call** to the run (the jti + the principal + the tool + the outcome) in an
+//! 6. **attributes every call** to the run (the jti + the principal + the tool + the outcome) in an
 //!    auditable trail — this is what makes "agent governance real from day one".
 //!
 //! ## What is REAL vs the named boundary (honesty)
@@ -35,7 +39,7 @@
 
 use std::cell::RefCell;
 
-use myelin_agent::{EffectApi, EffectResult, ProposedEffect, RunCtx};
+use myelin_agent::{EffectApi, EffectAuthority, EffectResult, ProposedEffect, RunCtx};
 use myelin_events::Timestamp;
 use myelin_identity::{
     DelegationCaveats, FailStaticBound, Principal, PrincipalId, RunId, RunToken,
@@ -119,6 +123,8 @@ pub struct AuditEntry {
 #[derive(Default)]
 struct RunState {
     token: Option<RunToken>,
+    /// The exact effective grant set recorded by the same intersection proof that minted `token`.
+    effective_grants: std::collections::BTreeSet<String>,
     audit: Vec<AuditEntry>,
 }
 
@@ -204,9 +210,9 @@ impl GovernedRouter {
             return Ok(t);
         }
         let p = &self.principal;
-        let token = self
+        let (token, proof) = self
             .minter
-            .mint_run_token(
+            .mint_proved(
                 &p.scope,
                 &p.agent_id,
                 &p.run_id,
@@ -219,7 +225,9 @@ impl GovernedRouter {
                 now,
             )
             .map_err(|e| format!("per-run token mint refused: {e}"))?;
-        self.state.borrow_mut().token = Some(token.clone());
+        let mut state = self.state.borrow_mut();
+        state.effective_grants = proof.effective.into_iter().collect();
+        state.token = Some(token.clone());
         Ok(token)
     }
 
@@ -262,7 +270,31 @@ impl GovernedRouter {
             );
         }
 
-        // (3) HITL GATE (BEFORE apply) — a frozen `requires_approval` tool is withheld unless the
+        // (3) DECLARED CAPABILITY BINDING — the registered tool's subsystem-owned caps must all be
+        //     inside the exact effective intersection recorded by THIS token's mint proof. This is
+        //     an early fail-closed decision; the mutation adapter independently verifies the signed
+        //     token and resolves/rechecks the same declaration again at its final boundary.
+        let missing = {
+            let state = self.state.borrow();
+            tool.required_caps()
+                .iter()
+                .find(|cap| !state.effective_grants.contains(**cap))
+                .copied()
+        };
+        if let Some(cap) = missing {
+            return self.record(
+                tool.name(),
+                CallOutcome::Denied {
+                    reason: format!(
+                        "tool `{}` requires capability `{cap}` outside the exact minted delegation intersection",
+                        tool.name()
+                    ),
+                    jti,
+                },
+            );
+        }
+
+        // (4) HITL GATE (BEFORE apply) — a frozen `requires_approval` tool is withheld unless the
         //     SERVER-SIDE verdict store holds an `approved` gate for THIS exact effect, decided by
         //     a DISTINCT principal (R2.4). The flag is git's frozen `agent_tools()` default
         //     (git.merge = yes), REUSED — not re-decided here.
@@ -313,12 +345,17 @@ impl GovernedRouter {
             }
         }
 
-        // (4) ROUTE THE EFFECT THROUGH THE `EffectApi` CHOKEPOINT under a RunCtx that carries the
+        // (5) ROUTE THE EFFECT THROUGH THE `EffectApi` CHOKEPOINT under a RunCtx that carries the
         //     run-token jti + the principal (the attribution the audit + the platform key on). This
         //     is plan-then-apply: the brain proposes, the platform applies. NEVER a direct mutation.
         let run_ctx = run_ctx_for(&jti, &self.principal.agent_id.0, tool.name());
+        let authority = EffectAuthority {
+            run_token: token,
+            principal_id: self.principal.agent_id.clone(),
+            tool: tool.name().to_string(),
+        };
         let effect = proposed_effect_for(tool.name(), args);
-        let outcome = match self.effect_api.apply(&run_ctx, effect) {
+        let outcome = match self.effect_api.apply_authorized(&run_ctx, &authority, effect) {
             EffectResult::Applied(ev) => CallOutcome::Applied { event_id: ev.0, jti },
             EffectResult::Gated(g) => CallOutcome::Gated { gate_id: g.0, jti },
             EffectResult::Denied(reason) => CallOutcome::Denied { reason, jti },
@@ -455,5 +492,14 @@ impl EffectApi for SkeletonEffectApi {
         // The governance pipeline + attribution are REAL; the durable git effect is E1.1. A
         // deterministic Applied(event id) keyed to the run is a valid skeleton apply outcome.
         EffectResult::Applied(myelin_agent::EventId(format!("evt:{}", run.0)))
+    }
+
+    fn apply_authorized(
+        &self,
+        run: &RunCtx,
+        _authority: &EffectAuthority,
+        effect: ProposedEffect,
+    ) -> EffectResult {
+        self.apply(run, effect)
     }
 }

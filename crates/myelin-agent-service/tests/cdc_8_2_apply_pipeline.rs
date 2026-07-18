@@ -365,11 +365,10 @@ fn cdc_4_5_consumer_delegation_intersection_confines() {
     );
 }
 
-/// **The frozen 8.2 `EffectApi::apply(&RunCtx, ProposedEffect)` trait body works through the glue
-/// carrier (the dispatch/MCP entry).** The bridge parses the opaque [`ProposedEffect`] and drives
-/// the pipeline; a gated tool returns Gated and does NOT mutate (AG-8).
+/// **The frozen unbound `EffectApi::apply` shape cannot bypass external run-token authority.** MCP
+/// uses `apply_authorized`; an unbound carrier is denied before the pipeline or endpoint.
 #[test]
-fn cdc_8_2_glue_trait_body_through_the_carrier_gates_without_mutating() {
+fn cdc_8_2_unbound_glue_trait_body_denies_without_mutating() {
     let cat = Catalogue {
         defs: vec![tool(
             "git.merge",
@@ -411,12 +410,12 @@ fn cdc_8_2_glue_trait_body_through_the_carrier_gates_without_mutating() {
     merge_plan.cost.unit = "git.merge";
     let carrier: ProposedEffect = encode_proposed(&merge_plan);
     match bridge.apply(&RunCtx::default(), carrier) {
-        EffectResult::Gated(_) => {}
-        other => panic!("a requires_approval tool must Gate (AG-8); got {other:?}"),
+        EffectResult::Denied(reason) if reason.contains("signed run-token") => {}
+        other => panic!("an unbound external EffectApi call must deny; got {other:?}"),
     }
     assert_eq!(
         endpoint.applied.borrow().len(),
         0,
-        "a gated effect does NOT mutate (AG-8)"
+        "an unbound effect does NOT mutate"
     );
 }

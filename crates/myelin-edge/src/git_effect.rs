@@ -23,9 +23,12 @@
 
 use std::sync::Arc;
 
-use myelin_agent::{EffectApi, EffectResult, EventId, ProposedEffect, RunCtx};
+use myelin_agent::{EffectApi, EffectAuthority, EffectResult, EventId, ProposedEffect, RunCtx};
 use myelin_git::pr_store::MergeAttempt;
 use myelin_identity::Principal;
+use myelin_identity_service::mint::RunTokenAuthorizer;
+use myelin_storage::TenantScope;
+use myelin_tenancy::Region;
 use serde_json::Value;
 
 use crate::git_durable::DurableGitBackend;
@@ -41,6 +44,8 @@ pub struct GitEffectApi {
     region: String,
     /// The acting principal (the run's agent/operator — authored into the durable record's pseudonym).
     principal: Principal,
+    /// The signed-token + S7 verifier run again immediately before the durable mutation.
+    authority: Arc<RunTokenAuthorizer>,
 }
 
 impl GitEffectApi {
@@ -52,13 +57,56 @@ impl GitEffectApi {
         tenant: impl Into<String>,
         region: impl Into<String>,
         principal: Principal,
+        authority: Arc<RunTokenAuthorizer>,
     ) -> GitEffectApi {
         GitEffectApi {
             backend,
             tenant: tenant.into(),
             region: region.into(),
             principal,
+            authority,
         }
+    }
+
+    fn authorize_effect(
+        &self,
+        authority: &EffectAuthority,
+        proposed_tool: &str,
+    ) -> Result<(), String> {
+        if authority.tool != proposed_tool {
+            return Err(format!(
+                "run-token authority is bound to `{}`, not proposed tool `{proposed_tool}`",
+                authority.tool
+            ));
+        }
+        if authority.principal_id != self.principal.principal_id {
+            return Err(
+                "run-token authority principal does not match the mutation adapter principal"
+                    .into(),
+            );
+        }
+        if self.principal.tenant.0 != self.tenant || self.principal.region.0 != self.region {
+            return Err(
+                "git effect adapter scope does not match its authenticated principal — denied"
+                    .into(),
+            );
+        }
+        let def = myelin_git::api::agent_tools()
+            .into_iter()
+            .find(|def| def.name == proposed_tool)
+            .ok_or_else(|| format!("unknown git tool `{proposed_tool}` at authority boundary"))?;
+        let required_caps: Vec<String> =
+            def.required_caps.iter().map(|cap| (*cap).to_string()).collect();
+        let scope =
+            TenantScope::from_verified_token(&self.principal, Region(self.region.clone()));
+        self.authority
+            .authorize(
+                &scope,
+                &self.principal.principal_id,
+                &authority.run_token,
+                &required_caps,
+            )
+            .map(|_| ())
     }
 
     /// Apply one parsed git tool. Split out so it is unit-testable without the RunCtx wrapper.
@@ -132,9 +180,24 @@ impl GitEffectApi {
 }
 
 impl EffectApi for GitEffectApi {
-    fn apply(&self, run: &RunCtx, effect: ProposedEffect) -> EffectResult {
+    fn apply(&self, _run: &RunCtx, _effect: ProposedEffect) -> EffectResult {
+        EffectResult::Denied(
+            "git mutation requires the signed run-token authority entry — direct EffectApi::apply is denied"
+                .into(),
+        )
+    }
+
+    fn apply_authorized(
+        &self,
+        run: &RunCtx,
+        authority: &EffectAuthority,
+        effect: ProposedEffect,
+    ) -> EffectResult {
         match parse_proposed(&effect.0) {
-            Some((tool, args)) => self.apply_tool(run, &tool, &args),
+            Some((tool, args)) => match self.authorize_effect(authority, &tool) {
+                Ok(()) => self.apply_tool(run, &tool, &args),
+                Err(reason) => EffectResult::Denied(reason),
+            },
             None => EffectResult::Denied(format!(
                 "malformed proposed effect `{}` (expected `tool:<name>|args:<json>`)",
                 effect.0
@@ -180,6 +243,11 @@ fn repo_and_number(args: &Value) -> Result<(&str, u64), EffectResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use myelin_identity::{PrincipalId, PrincipalKind, RunToken, RuntimeRef};
+    use myelin_identity_service::machine_auth::StructuralTokenVerifier;
+    use myelin_identity_service::revocation::RevocationStore;
+    use myelin_tenancy::TenantId;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parse_proposed_round_trips_the_mcp_carrier() {
@@ -190,5 +258,75 @@ mod tests {
         assert_eq!(args["repo"], "alpha");
         // A malformed carrier is None (→ a loud Denied at the call site), never a panic.
         assert!(parse_proposed("garbage").is_none());
+    }
+
+    #[test]
+    fn direct_and_mismatched_tool_invocations_cannot_reach_the_git_mutation() {
+        let mut root = std::env::temp_dir();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        root.push(format!("myelin-git-effect-authority-{nonce}"));
+        let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(&root));
+        backend.create_repo("acme", "eu-west", "alpha").expect("repo");
+        let mut principal = Principal::stub(
+            PrincipalId("agent:claude".into()),
+            PrincipalKind::Agent {
+                runtime_ref: RuntimeRef("rt-local".into()),
+                on_behalf_of: None,
+            },
+            TenantId("acme".into()),
+        );
+        principal.region = Region("eu-west".into());
+        let authorizer = Arc::new(RunTokenAuthorizer::new(
+            Arc::new(StructuralTokenVerifier::new()),
+            RevocationStore::new(),
+        ));
+        let api = GitEffectApi::new(backend.clone(), "acme", "eu-west", principal, authorizer);
+        let effect = ProposedEffect(
+            r#"tool:git.open_pr|args:{"repo":"alpha","title":"blocked","head_oid":"deadbeef","base_ref":"refs/heads/main"}"#.into(),
+        );
+
+        let direct = api.apply(&RunCtx("direct".into()), effect.clone());
+        assert!(matches!(direct, EffectResult::Denied(reason) if reason.contains("direct")));
+        assert!(backend.get_pr("acme", "eu-west", "alpha", 1).unwrap().is_none());
+
+        let mismatched = api.apply_authorized(
+            &RunCtx("mismatch".into()),
+            &EffectAuthority {
+                run_token: RunToken {
+                    token: "not-trusted".into(),
+                    jti: "not-trusted".into(),
+                },
+                principal_id: PrincipalId("agent:claude".into()),
+                tool: "git.submit_review".into(),
+            },
+            effect,
+        );
+        assert!(matches!(
+            mismatched,
+            EffectResult::Denied(reason) if reason.contains("not proposed tool")
+        ));
+        let principal_mismatch = api.apply_authorized(
+            &RunCtx("principal-mismatch".into()),
+            &EffectAuthority {
+                run_token: RunToken {
+                    token: "not-trusted".into(),
+                    jti: "not-trusted".into(),
+                },
+                principal_id: PrincipalId("agent:other".into()),
+                tool: "git.open_pr".into(),
+            },
+            ProposedEffect(
+                r#"tool:git.open_pr|args:{"repo":"alpha","title":"blocked","head_oid":"deadbeef","base_ref":"refs/heads/main"}"#.into(),
+            ),
+        );
+        assert!(matches!(
+            principal_mismatch,
+            EffectResult::Denied(reason) if reason.contains("adapter principal")
+        ));
+        assert!(backend.get_pr("acme", "eu-west", "alpha", 1).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

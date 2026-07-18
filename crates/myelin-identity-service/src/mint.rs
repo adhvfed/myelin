@@ -75,15 +75,16 @@
 //!   the S7 store + the audit chain + the tuple store already do (one time convention).
 
 use crate::delegation::{authority_of, DelegationAlgebra, DelegationInput, IntersectionProof};
-use crate::machine_auth::MachineKind;
+use crate::machine_auth::{scheme, CapabilityToken, MachineKind, TokenVerifier};
 use crate::revocation::{RevocationStore, RunTokenState};
 use crate::tuple_store::TupleStore;
 use myelin_events::Timestamp;
 use myelin_identity::{
-    DelegationCaveats, FailStaticBound, ObjectId, Precondition, Principal, PrincipalId, RelName,
-    RelationTuple, RevokeTarget, RunId, RunToken, TupleDelta,
+    Credential, DelegationCaveats, FailStaticBound, ObjectId, Precondition, Principal, PrincipalId,
+    RelName, RelationTuple, RevokeTarget, RunId, RunToken, TupleDelta,
 };
 use myelin_storage::TenantScope;
+use std::sync::Arc;
 
 /// The grant prefix a self-hosted-runner run token's authority is ceiling-bounded to
 /// (`"selfhosted:<tenant>"`) — the SAME prefix [`crate::machine_auth`] enforces at `authenticate`
@@ -96,6 +97,95 @@ pub const SELFHOSTED_GRANT_PREFIX: &str = "selfhosted:";
 /// auto-expiring edge `run:<run_id>#bound@<agent_id>` — its `expires_at` IS the revoke-on-crash
 /// defence-in-depth at the TUPLE layer (the S7 TTL is the same defence at the token layer).
 pub const RUN_GRANT_RELATION: &str = "run_bound";
+
+/// Final-boundary verifier for an externally presented per-run token.
+///
+/// The router's successful mint is not itself authorization for a mutation adapter: the adapter
+/// calls this verifier immediately before its public endpoint. Verification is fail-closed and
+/// binds the signed token to the expected run-token record, tenant/region, principal, and every
+/// independently resolved capability required by the selected tool.
+#[derive(Clone)]
+pub struct RunTokenAuthorizer {
+    verifier: Arc<dyn TokenVerifier>,
+    revocations: RevocationStore,
+    now: Arc<dyn Fn() -> Timestamp + Send + Sync>,
+}
+
+impl RunTokenAuthorizer {
+    /// Build the production-capable boundary over an injected cryptographic verifier and the SAME
+    /// durable S7 store the minter/teardown path writes.
+    pub fn new(verifier: Arc<dyn TokenVerifier>, revocations: RevocationStore) -> Self {
+        Self {
+            verifier,
+            revocations,
+            now: Arc::new(system_now_timestamp),
+        }
+    }
+
+    /// Inject a deterministic boundary clock for tests and replay drills.
+    pub fn with_clock(
+        mut self,
+        now: impl Fn() -> Timestamp + Send + Sync + 'static,
+    ) -> Self {
+        self.now = Arc::new(now);
+        self
+    }
+
+    /// Verify and authorize a token for one exact final-boundary tool invocation.
+    pub fn authorize(
+        &self,
+        scope: &TenantScope,
+        expected_principal: &PrincipalId,
+        run_token: &RunToken,
+        required_caps: &[String],
+    ) -> Result<CapabilityToken, String> {
+        let verified = self
+            .verifier
+            .verify(&Credential {
+                scheme: scheme::AGENT.into(),
+                material: run_token.token.clone(),
+            })
+            .map_err(|e| format!("run-token signature/caveat verification refused: {e:?}"))?;
+
+        if verified.kind != MachineKind::Agent {
+            return Err("presented token is not an agent run token".into());
+        }
+        if verified.jti != run_token.jti {
+            return Err("run-token carrier jti does not match the signed jti".into());
+        }
+        if verified.tenant != *scope.tenant() || verified.region != *scope.region() {
+            return Err("run-token signed scope does not match the mutation boundary scope".into());
+        }
+        if verified.subject_key != expected_principal.0 {
+            return Err("run-token signed subject does not match the acting principal".into());
+        }
+        if self.revocations.run_token_state(
+            scope,
+            &RevokeTarget::Jti(verified.jti.clone()),
+            &(self.now)(),
+        ) != RunTokenState::LiveWithinRunLife
+        {
+            return Err("run token is unknown, torn down, or expired at the mutation boundary".into());
+        }
+        for cap in required_caps {
+            if !verified.authority.holds(cap) {
+                return Err(format!(
+                    "tool requires capability `{cap}` outside the signed attenuated run-token authority"
+                ));
+            }
+        }
+        Ok(verified)
+    }
+}
+
+fn system_now_timestamp() -> Timestamp {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let dt = chrono::DateTime::from_timestamp(secs, 0).unwrap_or_default();
+    Timestamp(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
 
 /// **An error the mint refuses LOUDLY on (never a fabricated/over-broad token).** A mint that cannot
 /// honour its invariants (a self-hosted run token naming another tenant's scope; a non-positive
@@ -659,7 +749,7 @@ fn days_in_month(y: i64, mo: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::machine_auth::Authority;
+    use crate::machine_auth::{Authority, StructuralTokenVerifier};
     use myelin_events::OutboxStore;
     use myelin_identity::{PrincipalKind, RuntimeRef};
     use myelin_tenancy::{Region, TenantId};
@@ -721,6 +811,126 @@ mod tests {
 
     fn caveats(g: &[&str]) -> DelegationCaveats {
         DelegationCaveats(g.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn final_boundary_rechecks_signed_attenuated_authority_and_liveness() {
+        let s7 = RevocationStore::new();
+        let minter = RunTokenMinter::new(s7.clone());
+        let acme = scope("acme");
+        let minted_at = ts("2026-06-19T00:00:00Z");
+        let token = minter
+            .mint_run_token(
+                &acme,
+                &PrincipalId("p:agent".into()),
+                &RunId("run-authority".into()),
+                &agent("p:agent", "acme"),
+                &human("p:human", "acme"),
+                &input(
+                    &["repo.push", "pull_request.merge"],
+                    &["repo.push"],
+                    &["repo.push", "pull_request.merge"],
+                    &["repo.push", "pull_request.merge"],
+                ),
+                &caveats(&["repo.push"]),
+                MachineKind::Agent,
+                &ttl(300),
+                &minted_at,
+            )
+            .expect("mint attenuated run token");
+        let authorizer = RunTokenAuthorizer::new(
+            Arc::new(StructuralTokenVerifier::new()),
+            s7.clone(),
+        )
+        .with_clock(|| ts("2026-06-19T00:01:00Z"));
+
+        authorizer
+            .authorize(
+                &acme,
+                &PrincipalId("p:agent".into()),
+                &token,
+                &["repo.push".into()],
+            )
+            .expect("the one capability surviving delegation is admitted");
+        let denied = authorizer
+            .authorize(
+                &acme,
+                &PrincipalId("p:agent".into()),
+                &token,
+                &["pull_request.merge".into()],
+            )
+            .expect_err("attenuated-away capability must be denied");
+        assert!(denied.contains("outside the signed attenuated"));
+
+        minter.teardown(&acme, &token, &ts("2026-06-19T00:02:00Z"));
+        let denied = authorizer
+            .authorize(
+                &acme,
+                &PrincipalId("p:agent".into()),
+                &token,
+                &["repo.push".into()],
+            )
+            .expect_err("a torn-down token must fail again at the mutation boundary");
+        assert!(denied.contains("torn down"));
+    }
+
+    #[test]
+    fn final_boundary_refuses_mixed_carrier_identity_and_scope() {
+        let s7 = RevocationStore::new();
+        let minter = RunTokenMinter::new(s7.clone());
+        let acme = scope("acme");
+        let token = minter
+            .mint_run_token(
+                &acme,
+                &PrincipalId("p:agent".into()),
+                &RunId("run-binding".into()),
+                &agent("p:agent", "acme"),
+                &human("p:human", "acme"),
+                &input(
+                    &["repo.push"],
+                    &["repo.push"],
+                    &["repo.push"],
+                    &["repo.push"],
+                ),
+                &caveats(&["repo.push"]),
+                MachineKind::Agent,
+                &ttl(300),
+                &ts("2026-06-19T00:00:00Z"),
+            )
+            .expect("mint");
+        let authorizer =
+            RunTokenAuthorizer::new(Arc::new(StructuralTokenVerifier::new()), s7)
+                .with_clock(|| ts("2026-06-19T00:01:00Z"));
+
+        let mut mixed = token.clone();
+        mixed.jti = "attacker-selected-jti".into();
+        assert!(authorizer
+            .authorize(
+                &acme,
+                &PrincipalId("p:agent".into()),
+                &mixed,
+                &["repo.push".into()],
+            )
+            .expect_err("carrier/signed jti mismatch")
+            .contains("does not match"));
+        assert!(authorizer
+            .authorize(
+                &acme,
+                &PrincipalId("p:other".into()),
+                &token,
+                &["repo.push".into()],
+            )
+            .expect_err("subject mismatch")
+            .contains("subject"));
+        assert!(authorizer
+            .authorize(
+                &scope("globex"),
+                &PrincipalId("p:agent".into()),
+                &token,
+                &["repo.push".into()],
+            )
+            .expect_err("scope mismatch")
+            .contains("scope"));
     }
 
     /// **Minting re-checks "cannot delegate what you lack": the token's authority is the monotone

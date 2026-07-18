@@ -440,6 +440,23 @@ mod tests {
         // the object-type halves ARE the canonical Git ReBAC names (4.9), not local strings.
         assert_eq!(git_objects::PULL_REQUEST, "pull_request");
         assert_eq!(git_objects::REPO, "repo");
+        let mcp_defs = myelin_git::api::agent_tools();
+        assert_eq!(
+            mcp_defs
+                .iter()
+                .find(|d| d.name == "git.merge")
+                .unwrap()
+                .required_caps,
+            git_merge_required_caps()
+        );
+        assert_eq!(
+            mcp_defs
+                .iter()
+                .find(|d| d.name == "git.open_pr")
+                .unwrap()
+                .required_caps,
+            open_pr_required_caps()
+        );
     }
 
     /// **`register_git_tools` registers BOTH producer ToolDefs into the ONE catalogue (8.1 / §6.1)

@@ -48,6 +48,11 @@ impl RegisteredTool {
         self.def.requires_approval
     }
 
+    /// The subsystem-declared capabilities this tool requires from the exact minted run token.
+    pub fn required_caps(&self) -> &[&str] {
+        self.def.required_caps
+    }
+
     /// Project this tool into the MCP `tools/list` entry shape. The `inputSchema` is a permissive
     /// object schema here (the rich per-tool JSON Schema is the `myelin_agent::ToolDef.input_schema`
     /// seam, seeded in the agent-fabric catalogue — AG-P8; the MCP surface projects the names +
@@ -141,6 +146,12 @@ mod tests {
         assert_eq!(names, git_names, "the registry is a verbatim projection of agent_tools()");
         assert!(names.contains(&"git.merge"));
         assert!(names.contains(&"git.submit_review"));
+        assert_eq!(reg.resolve("git.merge").unwrap().required_caps(), &["pull_request.merge"]);
+        assert_eq!(reg.resolve("git.open_pr").unwrap().required_caps(), &["repo.push"]);
+        assert_eq!(
+            reg.resolve("git.submit_review").unwrap().required_caps(),
+            &["pull_request.review"]
+        );
     }
 
     /// The FROZEN `requires_approval` defaults flow through: git.merge is HITL-gated, open_pr is not.
