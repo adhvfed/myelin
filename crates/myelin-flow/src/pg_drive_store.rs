@@ -114,6 +114,9 @@ pub struct DriveLease {
     pub lease_owner: String,
     pub lease_epoch: i64,
     pub lease_expires_unix_ms: i64,
+    /// Stable run-creation timestamp used as the detached outbox envelope clock. Replaying the
+    /// same deterministic drive therefore derives byte-identical rows for exact absorption.
+    pub created_at_rfc3339: String,
 }
 
 /// One ordered durable journal row loaded for replay.
@@ -263,7 +266,9 @@ impl PgFlowDriveStore {
                          RETURNING run.run_id, run.wf_type, run.wf_version, run.input, run.budget, \
                            run.correlation_id, run.causation_id, run.caused_by, run.depth, \
                            run.partition, run.cursor, run.lease_owner, run.lease_epoch, \
-                           (EXTRACT(EPOCH FROM run.lease_expires) * 1000)::bigint AS lease_ms",
+                           (EXTRACT(EPOCH FROM run.lease_expires) * 1000)::bigint AS lease_ms, \
+                           to_char(run.created_at AT TIME ZONE 'UTC', \
+                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_rfc3339",
                 )
                 .bind(&tenant)
                 .bind(&region)
@@ -273,6 +278,70 @@ impl PgFlowDriveStore {
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(|e| db("claim runnable workflow", e))?;
+                row.map(|row| decode_lease(row, &tenant, &region))
+                    .transpose()
+            })
+        })
+        .await
+    }
+
+    /// Claim one runnable row for an exact locally registered definition. Production dispatchers
+    /// use this form so a worker never leases a workflow type/version whose body is absent from the
+    /// process. Unsupported definitions remain untouched for their owning adapter.
+    pub async fn claim_runnable_definition(
+        &self,
+        partition: i16,
+        wf_type: &str,
+        wf_version: i32,
+        owner: &str,
+        ttl_secs: i64,
+    ) -> Result<Option<DriveLease>, DriveStoreError> {
+        bounded("workflow type", wf_type)?;
+        bounded("lease owner", owner)?;
+        validate_ttl(ttl_secs)?;
+        if wf_version <= 0 {
+            return Err(DriveStoreError::InvalidInput(
+                "workflow version must be positive".into(),
+            ));
+        }
+        let tenant = self.tenant.0.clone();
+        let region = self.region.0.clone();
+        let owner = owner.to_owned();
+        let wf_type = wf_type.to_owned();
+        let scope_tenant = tenant.clone();
+        let scope_region = region.clone();
+        with_tenant_tx_error(&self.pool, &scope_tenant, &scope_region, move |conn| {
+            Box::pin(async move {
+                let row = sqlx::query(
+                    "WITH candidate AS (\
+                       SELECT run_id FROM workflow_run \
+                       WHERE tenant_id = $1 AND region = $2 AND partition = $3 \
+                         AND wf_type = $6 AND wf_version = $7 AND state = 'running' \
+                         AND (lease_expires IS NULL OR lease_expires <= clock_timestamp()) \
+                       ORDER BY updated_at, run_id FOR UPDATE SKIP LOCKED LIMIT 1\
+                     ) \
+                     UPDATE workflow_run AS run SET lease_owner = $4, \
+                       lease_expires = clock_timestamp() + ($5 * INTERVAL '1 second'), \
+                       lease_epoch = run.lease_epoch + 1, updated_at = clock_timestamp() \
+                     FROM candidate WHERE run.tenant_id = $1 AND run.region = $2 \
+                       AND run.run_id = candidate.run_id \
+                     RETURNING run.run_id, run.wf_type, run.wf_version, run.input, run.budget, \
+                       run.correlation_id, run.causation_id, run.caused_by, run.depth, \
+                       run.partition, run.cursor, run.lease_owner, run.lease_epoch, \
+                       (EXTRACT(EPOCH FROM run.lease_expires) * 1000)::bigint AS lease_ms, \
+                       to_char(run.created_at AT TIME ZONE 'UTC', \
+                         'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_rfc3339",
+                )
+                .bind(&tenant)
+                .bind(&region)
+                .bind(partition)
+                .bind(&owner)
+                .bind(ttl_secs)
+                .bind(&wf_type)
+                .bind(wf_version)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| db("claim runnable workflow definition", e))?;
                 row.map(|row| decode_lease(row, &tenant, &region))
                     .transpose()
             })
@@ -373,7 +442,9 @@ impl PgFlowDriveStore {
                     let row = sqlx::query(
                         "SELECT run_id, wf_type, wf_version, input, budget, correlation_id, \
                            causation_id, caused_by, depth, partition, cursor, lease_owner, \
-                           lease_epoch, (EXTRACT(EPOCH FROM lease_expires) * 1000)::bigint AS lease_ms \
+                           lease_epoch, (EXTRACT(EPOCH FROM lease_expires) * 1000)::bigint AS lease_ms, \
+                           to_char(created_at AT TIME ZONE 'UTC', \
+                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_rfc3339 \
                          FROM workflow_run \
                          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND state = 'running' \
                            AND lease_owner = $4 AND lease_epoch = $5 AND cursor = $6 \
@@ -916,6 +987,9 @@ fn decode_lease(row: PgRow, tenant: &str, region: &str) -> Result<DriveLease, Dr
         lease_expires_unix_ms: row
             .try_get("lease_ms")
             .map_err(|e| db("decode lease expiry", e))?,
+        created_at_rfc3339: row
+            .try_get("created_rfc3339")
+            .map_err(|e| db("decode run creation time", e))?,
     })
 }
 

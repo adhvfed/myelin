@@ -1,0 +1,764 @@
+//! Tenant- and region-scoped PostgreSQL workflow worker.
+//!
+//! The workflow body executes against scratch timer/signal stores and a detached outbox buffer.
+//! Those buffers have no persistence path of their own: every journal row, signal consumption,
+//! timer arm, attempt, outbox row, run settlement, and lease release is handed to
+//! [`PgFlowDriveStore::commit_drive`] for one fenced PostgreSQL transaction.
+
+use crate::engine::{run_state, DriveOutcome, SignalRow, SignalStore};
+use crate::executor::{ExecutorError, PARTITION_COUNT};
+use crate::pg_drive_store::{
+    ActivityAttemptWrite, CommitOutcome, DriveCommit, DriveLease, DriveStoreError, HistoryWrite,
+    PgFlowDriveStore, SignalKey, TimerArm,
+};
+use crate::schema::{WfActivityAttemptRow, WfHistoryRow};
+use crate::{PgFlowExecutor, TimerStore, WfCtx};
+use myelin_events::{Actor, CausedBy, EmitContextBase, IdMinter, Timestamp, Ulid};
+use myelin_refs::ArtifactRef;
+use myelin_tenancy::{Region, TenantId};
+use sqlx::PgPool;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+const MAX_TOKEN_BYTES: usize = 512;
+const MAX_BATCH: usize = 1024;
+pub const OPERATIONAL_PROBE_WF_TYPE: &str = "myelin.flow.operational-probe";
+
+pub type PgWorkflowBody =
+    dyn Fn(&mut WfCtx) -> Result<Vec<ArtifactRef>, String> + Send + Sync + 'static;
+
+#[derive(Clone)]
+struct RegisteredBody {
+    body: Arc<PgWorkflowBody>,
+}
+
+/// One immutable production worker scope. There is deliberately no tenant discovery API.
+#[derive(Clone)]
+pub struct PgWorkerScope {
+    pub tenant: TenantId,
+    pub region: Region,
+    pub partition: i16,
+    pub worker: String,
+    pub lease_ttl_secs: i64,
+    pub actor: Actor,
+    pub schema_ver: u32,
+}
+
+impl PgWorkerScope {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tenant: TenantId,
+        region: Region,
+        partition: i16,
+        worker: impl Into<String>,
+        lease_ttl_secs: i64,
+        actor: Actor,
+        schema_ver: u32,
+    ) -> Result<Self, PgWorkerError> {
+        bounded("tenant", &tenant.0)?;
+        bounded("region", &region.0)?;
+        let worker = worker.into();
+        bounded("worker", &worker)?;
+        if !(0..PARTITION_COUNT as i16).contains(&partition) {
+            return Err(PgWorkerError::InvalidConfig(format!(
+                "partition must be between 0 and {}",
+                PARTITION_COUNT - 1
+            )));
+        }
+        if !(1..=300).contains(&lease_ttl_secs) {
+            return Err(PgWorkerError::InvalidConfig(
+                "lease TTL must be between 1 and 300 seconds".into(),
+            ));
+        }
+        if actor.0.tenant != tenant || actor.0.region != region {
+            return Err(PgWorkerError::InvalidConfig(
+                "worker actor must be pinned to the same tenant and region".into(),
+            ));
+        }
+        if schema_ver == 0 {
+            return Err(PgWorkerError::InvalidConfig(
+                "outbox schema version must be positive".into(),
+            ));
+        }
+        Ok(Self {
+            tenant,
+            region,
+            partition,
+            worker,
+            lease_ttl_secs,
+            actor,
+            schema_ver,
+        })
+    }
+
+    /// Load the mandatory production scope. Tenant, region, partition, worker id, and lease TTL
+    /// have no defaults: an incomplete deployment must not silently become a global worker.
+    pub fn from_env() -> Result<Self, PgWorkerError> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, PgWorkerError> {
+        fn required(
+            lookup: &mut impl FnMut(&str) -> Option<String>,
+            name: &str,
+        ) -> Result<String, PgWorkerError> {
+            let value = lookup(name).ok_or_else(|| {
+                PgWorkerError::InvalidConfig(format!(
+                    "required environment variable {name} is missing"
+                ))
+            })?;
+            bounded(name, &value)?;
+            Ok(value)
+        }
+
+        let tenant = TenantId(required(&mut lookup, "MYELIN_FLOW_TENANT")?);
+        let region = Region(required(&mut lookup, "MYELIN_FLOW_REGION")?);
+        let partition = required(&mut lookup, "MYELIN_FLOW_PARTITION")?
+            .parse::<i16>()
+            .map_err(|_| {
+                PgWorkerError::InvalidConfig("MYELIN_FLOW_PARTITION must be an integer".into())
+            })?;
+        let worker = required(&mut lookup, "MYELIN_FLOW_WORKER")?;
+        let lease_ttl_secs = required(&mut lookup, "MYELIN_FLOW_LEASE_TTL_SECS")?
+            .parse::<i64>()
+            .map_err(|_| {
+                PgWorkerError::InvalidConfig("MYELIN_FLOW_LEASE_TTL_SECS must be an integer".into())
+            })?;
+        let schema_ver = lookup("MYELIN_FLOW_SCHEMA_VER")
+            .unwrap_or_else(|| "1".into())
+            .parse::<u32>()
+            .map_err(|_| {
+                PgWorkerError::InvalidConfig(
+                    "MYELIN_FLOW_SCHEMA_VER must be a positive integer".into(),
+                )
+            })?;
+        let actor = Actor(myelin_identity::Principal::new(
+            tenant.clone(),
+            region.clone(),
+            myelin_identity::PrincipalId(format!("svc:myelin-flow/{worker}")),
+            myelin_identity::PrincipalKind::Service,
+            myelin_identity::DataRole::Processor,
+            myelin_identity::PrincipalStatus::Active,
+        ));
+        Self::new(
+            tenant,
+            region,
+            partition,
+            worker,
+            lease_ttl_secs,
+            actor,
+            schema_ver,
+        )
+    }
+}
+
+fn bounded(label: &str, value: &str) -> Result<(), PgWorkerError> {
+    if value.trim().is_empty() || value.len() > MAX_TOKEN_BYTES {
+        return Err(PgWorkerError::InvalidConfig(format!(
+            "{label} must be non-empty and at most {MAX_TOKEN_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Parse the mandatory compiled-definition allowlist. The service binary currently contains only
+/// the operational probe. Product definitions such as `ci.pipeline` and merge maintenance require
+/// subsystem-owned adapters and are rejected rather than leased under a fake body.
+pub fn configured_production_definitions() -> Result<Vec<(String, i32)>, PgWorkerError> {
+    configured_definitions_from(std::env::var("MYELIN_FLOW_DEFINITIONS").ok())
+}
+
+fn configured_definitions_from(value: Option<String>) -> Result<Vec<(String, i32)>, PgWorkerError> {
+    let value = value.ok_or_else(|| {
+        PgWorkerError::InvalidConfig(
+            "required environment variable MYELIN_FLOW_DEFINITIONS is missing".into(),
+        )
+    })?;
+    let mut definitions = Vec::new();
+    for token in value
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        let supported = format!("{OPERATIONAL_PROBE_WF_TYPE}@1");
+        if token != supported {
+            return Err(PgWorkerError::InvalidConfig(format!(
+                "unsupported compiled workflow definition `{token}`; this binary currently supports only `{supported}`; ci.pipeline/merge bodies require their subsystem adapters"
+            )));
+        }
+        if !definitions.contains(&(OPERATIONAL_PROBE_WF_TYPE.to_string(), 1)) {
+            definitions.push((OPERATIONAL_PROBE_WF_TYPE.to_string(), 1));
+        }
+    }
+    if definitions.is_empty() {
+        return Err(PgWorkerError::InvalidConfig(
+            "MYELIN_FLOW_DEFINITIONS must name at least one compiled definition".into(),
+        ));
+    }
+    Ok(definitions)
+}
+
+#[derive(Debug)]
+pub enum PgWorkerError {
+    InvalidConfig(String),
+    Definition(ExecutorError),
+    Store(DriveStoreError),
+    MissingDefinition { wf_type: String, version: i32 },
+    Staging(String),
+}
+
+impl std::fmt::Display for PgWorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for PgWorkerError {}
+
+impl From<DriveStoreError> for PgWorkerError {
+    fn from(value: DriveStoreError) -> Self {
+        Self::Store(value)
+    }
+}
+
+impl From<ExecutorError> for PgWorkerError {
+    fn from(value: ExecutorError) -> Self {
+        Self::Definition(value)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PgRunOnceOutcome {
+    Idle,
+    Driven {
+        run_id: String,
+        outcome: DriveOutcome,
+        commit: CommitOutcome,
+    },
+}
+
+/// A bounded loop result. `saturated` means the caller should schedule another bounded pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgDriveBatch {
+    pub driven: usize,
+    pub saturated: bool,
+}
+
+/// Production adapter joining the durable control surface to the fenced drive store.
+pub struct PgFlowWorker {
+    store: PgFlowDriveStore,
+    executor: PgFlowExecutor,
+    scope: PgWorkerScope,
+    bodies: HashMap<(String, i32), RegisteredBody>,
+}
+
+impl PgFlowWorker {
+    pub fn new(
+        pool: PgPool,
+        rt: tokio::runtime::Handle,
+        run_id_minter: Arc<dyn IdMinter>,
+        scope: PgWorkerScope,
+    ) -> Self {
+        let store = PgFlowDriveStore::new(pool.clone(), scope.tenant.clone(), scope.region.clone());
+        let executor = PgFlowExecutor::new(
+            pool,
+            rt,
+            run_id_minter,
+            scope.tenant.clone(),
+            scope.region.clone(),
+        );
+        Self {
+            store,
+            executor,
+            scope,
+            bodies: HashMap::new(),
+        }
+    }
+
+    pub fn executor(&self) -> &PgFlowExecutor {
+        &self.executor
+    }
+
+    /// Persist the immutable definition and install the matching deterministic body locally.
+    pub fn register_definition<F>(
+        &mut self,
+        wf_type: &str,
+        version: i32,
+        code_hash: &str,
+        body: F,
+    ) -> Result<(), PgWorkerError>
+    where
+        F: Fn(&mut WfCtx) -> Result<Vec<ArtifactRef>, String> + Send + Sync + 'static,
+    {
+        self.executor
+            .register_definition(wf_type, version, code_hash)?;
+        let key = (wf_type.to_owned(), version);
+        if self.bodies.contains_key(&key) {
+            return Err(PgWorkerError::InvalidConfig(format!(
+                "workflow body {wf_type}@{version} is already registered"
+            )));
+        }
+        self.bodies.insert(
+            key,
+            RegisteredBody {
+                body: Arc::new(body),
+            },
+        );
+        Ok(())
+    }
+
+    /// Claim and drive at most one run in this worker's exact scope.
+    pub async fn run_once(
+        &self,
+        now_unix_secs: i64,
+        now_rfc3339: &str,
+    ) -> Result<PgRunOnceOutcome, PgWorkerError> {
+        bounded("drive clock", now_rfc3339)?;
+        if self.bodies.is_empty() {
+            return Err(PgWorkerError::InvalidConfig(
+                "worker has no explicitly registered workflow definitions".into(),
+            ));
+        }
+        let mut definitions: Vec<_> = self.bodies.keys().cloned().collect();
+        definitions.sort();
+        let mut claimed = None;
+        for (wf_type, version) in definitions {
+            claimed = self
+                .store
+                .claim_runnable_definition(
+                    self.scope.partition,
+                    &wf_type,
+                    version,
+                    &self.scope.worker,
+                    self.scope.lease_ttl_secs,
+                )
+                .await?;
+            if claimed.is_some() {
+                break;
+            }
+        }
+        let Some(lease) = claimed else {
+            return Ok(PgRunOnceOutcome::Idle);
+        };
+
+        let result = self.drive_claimed(&lease, now_unix_secs, now_rfc3339).await;
+        if result.is_err() {
+            // Exact owner+epoch+cursor release cannot clear a successor's claim. If an uncertain
+            // commit actually landed, the lease is already gone and this guarded release is a no-op.
+            let _ = self.store.release_lease(&lease).await;
+        }
+        result
+    }
+
+    async fn drive_claimed(
+        &self,
+        lease: &DriveLease,
+        now_unix_secs: i64,
+        now_rfc3339: &str,
+    ) -> Result<PgRunOnceOutcome, PgWorkerError> {
+        let body = self
+            .bodies
+            .get(&(lease.wf_type.clone(), lease.wf_version))
+            .ok_or_else(|| PgWorkerError::MissingDefinition {
+                wf_type: lease.wf_type.clone(),
+                version: lease.wf_version,
+            })?
+            .body
+            .clone();
+
+        self.store
+            .renew_lease(lease, self.scope.lease_ttl_secs)
+            .await?;
+        let snapshot = self.store.load_drive(lease).await?;
+        let signals = SignalStore::new();
+        for pending in snapshot.pending_signals {
+            signals.deliver(SignalRow {
+                tenant: lease.tenant.clone(),
+                region: lease.region.clone(),
+                run_id: lease.run_id.clone(),
+                signal_name: pending.signal_name,
+                idem_key: pending.idem_key,
+                payload: pending.payload,
+                payload_key_ref: pending.payload_key_ref,
+                consumed_seq: None,
+            });
+        }
+        let history = snapshot
+            .history
+            .into_iter()
+            .map(|row| WfHistoryRow {
+                tenant: lease.tenant.clone(),
+                region: lease.region.clone(),
+                run_id: lease.run_id.clone(),
+                seq: row.seq,
+                kind: row.kind,
+                command_id: row.command_id,
+                result: row.result,
+                result_key_ref: row.result_key_ref,
+            })
+            .collect();
+        let emit_clock = Timestamp(lease.created_at_rfc3339.clone());
+        let ctx_base = EmitContextBase {
+            tenant: lease.tenant.clone(),
+            region: lease.region.clone(),
+            actor: self.scope.actor.clone(),
+            schema_ver: self.scope.schema_ver,
+            occurred_at: emit_clock.clone(),
+            recorded_at: emit_clock,
+            caused_by: lease.caused_by.clone().map(CausedBy),
+        };
+        let timers = TimerStore::new();
+        let mut ctx = WfCtx::resume_staged_versioned(
+            Arc::new(DriveIdMinter::new(&lease.run_id)),
+            ctx_base,
+            lease.run_id.clone(),
+            lease.wf_type.clone(),
+            now_rfc3339,
+            stable_seed(&lease.run_id),
+            history,
+            lease.wf_version,
+            lease.wf_version,
+        )
+        .with_timers(timers, lease.partition, now_unix_secs)
+        .with_signals(signals);
+
+        let body_result = body(&mut ctx);
+        let divergence = ctx.divergence().map(ToOwned::to_owned);
+        let parked = ctx.parked();
+        let outcome = if let Some(reason) = divergence {
+            DriveOutcome::Nondeterministic(reason)
+        } else {
+            match body_result {
+                Ok(_) if parked => DriveOutcome::Waiting,
+                Ok(result) => DriveOutcome::Completed(result),
+                Err(error) => DriveOutcome::Failed(error),
+            }
+        };
+        let staged = if matches!(outcome, DriveOutcome::Nondeterministic(_)) {
+            // Divergence halts without making the divergent body's newly-derived effects durable.
+            None
+        } else {
+            Some(
+                ctx.into_staged_drive()
+                    .map_err(|error| PgWorkerError::Staging(format!("{error:?}")))?,
+            )
+        };
+
+        self.store
+            .renew_lease(lease, self.scope.lease_ttl_secs)
+            .await?;
+        let commit = build_commit(lease, &outcome, staged)?;
+        let commit_outcome = self.store.commit_drive(lease, commit).await?;
+        Ok(PgRunOnceOutcome::Driven {
+            run_id: lease.run_id.clone(),
+            outcome,
+            commit: commit_outcome,
+        })
+    }
+
+    /// Drive until idle or until the explicit bound is reached.
+    pub async fn run_until_idle(
+        &self,
+        max_runs: usize,
+        now_unix_secs: i64,
+        now_rfc3339: &str,
+    ) -> Result<PgDriveBatch, PgWorkerError> {
+        if !(1..=MAX_BATCH).contains(&max_runs) {
+            return Err(PgWorkerError::InvalidConfig(format!(
+                "max_runs must be between 1 and {MAX_BATCH}"
+            )));
+        }
+        let mut driven = 0;
+        while driven < max_runs {
+            match self.run_once(now_unix_secs, now_rfc3339).await? {
+                PgRunOnceOutcome::Idle => {
+                    return Ok(PgDriveBatch {
+                        driven,
+                        saturated: false,
+                    })
+                }
+                PgRunOnceOutcome::Driven { .. } => driven += 1,
+            }
+        }
+        Ok(PgDriveBatch {
+            driven,
+            saturated: true,
+        })
+    }
+
+    /// Run bounded passes until shutdown. Each pass also fires at most one scoped due timer.
+    pub async fn run_until_shutdown(
+        &self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        poll_interval: Duration,
+        max_batch: usize,
+    ) -> Result<(), PgWorkerError> {
+        if poll_interval.is_zero() || max_batch == 0 || max_batch > MAX_BATCH {
+            return Err(PgWorkerError::InvalidConfig(
+                "runtime poll interval and batch bound must be positive and bounded".into(),
+            ));
+        }
+        loop {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            let (secs, stamp) = system_clock()?;
+            let _ = self
+                .store
+                .fire_due_timer(self.scope.partition, secs)
+                .await?;
+            self.run_until_idle(max_batch, secs, &stamp).await?;
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { return Ok(()); }
+                }
+                _ = tokio::time::sleep(poll_interval) => {}
+            }
+        }
+    }
+}
+
+fn build_commit(
+    lease: &DriveLease,
+    outcome: &DriveOutcome,
+    staged: Option<crate::StagedWfDrive>,
+) -> Result<DriveCommit, PgWorkerError> {
+    let staged = staged.unwrap_or_else(|| crate::StagedWfDrive {
+        history: Vec::new(),
+        attempts: Vec::new(),
+        timers: Vec::new(),
+        outbox: Vec::new(),
+        consumed_signals: Vec::new(),
+    });
+    let signal_keys: HashMap<_, _> = staged
+        .consumed_signals
+        .into_iter()
+        .map(|signal| {
+            (
+                signal.command_id,
+                SignalKey {
+                    signal_name: signal.signal_name,
+                    idem_key: signal.idem_key,
+                },
+            )
+        })
+        .collect();
+    let history = staged
+        .history
+        .into_iter()
+        .map(|row| HistoryWrite {
+            consume_signal: signal_keys.get(&row.command_id).cloned(),
+            seq: row.seq,
+            kind: row.kind,
+            command_id: row.command_id,
+            result: row.result,
+            result_key_ref: row.result_key_ref,
+        })
+        .collect();
+    let attempts = staged.attempts.into_iter().map(map_attempt).collect();
+    let timers = staged
+        .timers
+        .into_iter()
+        .map(|row| TimerArm {
+            timer_id: row.timer_id,
+            command_id: row.command_id,
+            fire_at_unix_secs: row.fire_at,
+            partition: row.partition,
+        })
+        .collect();
+    let next_state = match outcome {
+        DriveOutcome::Completed(_) => run_state::COMPLETED,
+        DriveOutcome::Failed(_) => run_state::FAILED,
+        DriveOutcome::Waiting => run_state::WAITING,
+        DriveOutcome::Nondeterministic(_) => run_state::NONDETERMINISTIC,
+    };
+    Ok(DriveCommit {
+        drive_id: format!(
+            "{}/cursor-{}/epoch-{}",
+            lease.run_id, lease.cursor, lease.lease_epoch
+        ),
+        expected_cursor: lease.cursor,
+        next_state: next_state.into(),
+        history,
+        attempts,
+        timers,
+        outbox: staged.outbox,
+    })
+}
+
+fn map_attempt(row: WfActivityAttemptRow) -> ActivityAttemptWrite {
+    ActivityAttemptWrite {
+        command_id: row.command_id,
+        attempt: row.attempt,
+        idem_token: row.idem_token,
+        state: row.state,
+        error: row.error,
+        // These optional strings are presentation timestamps in the in-memory model. PostgreSQL
+        // stamps its own durable row time; no lossy parser is introduced at this boundary.
+        started_unix_ms: None,
+        ended_unix_ms: None,
+    }
+}
+
+fn stable_seed(run_id: &str) -> u64 {
+    let hash = blake3::hash(run_id.as_bytes());
+    u64::from_be_bytes(hash.as_bytes()[..8].try_into().expect("eight hash bytes"))
+}
+
+struct DriveIdMinter {
+    prefix: u64,
+    ordinal: AtomicU64,
+}
+
+impl DriveIdMinter {
+    fn new(run_id: &str) -> Self {
+        Self {
+            prefix: stable_seed(run_id),
+            ordinal: AtomicU64::new(0),
+        }
+    }
+
+    fn render(mut value: u128) -> String {
+        const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+        let mut bytes = [0u8; 26];
+        for slot in bytes.iter_mut().rev() {
+            *slot = CROCKFORD[(value & 0x1f) as usize];
+            value >>= 5;
+        }
+        String::from_utf8(bytes.to_vec()).expect("Crockford alphabet is ASCII")
+    }
+}
+
+impl IdMinter for DriveIdMinter {
+    fn mint(&self) -> Ulid {
+        let ordinal = self.ordinal.fetch_add(1, Ordering::SeqCst);
+        Ulid(Self::render(
+            (u128::from(self.prefix) << 64) | u128::from(ordinal),
+        ))
+    }
+}
+
+/// Current epoch seconds plus an RFC-3339 UTC timestamp without a second clock dependency.
+fn system_clock() -> Result<(i64, String), PgWorkerError> {
+    let now = chrono::Utc::now();
+    Ok((
+        now.timestamp(),
+        now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use myelin_events::{AggregateKey, DataRole, EventDraft, EventType, Visibility};
+    use myelin_identity::{
+        DataRole as IdentityDataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus,
+    };
+
+    fn actor() -> Actor {
+        Actor(Principal::new(
+            TenantId("acme".into()),
+            Region("eu-north".into()),
+            PrincipalId("svc:flow".into()),
+            PrincipalKind::Service,
+            IdentityDataRole::Processor,
+            PrincipalStatus::Active,
+        ))
+    }
+
+    #[test]
+    fn scope_refuses_empty_or_cross_region_configuration() {
+        assert!(PgWorkerScope::new(
+            TenantId(String::new()),
+            Region("eu-north".into()),
+            0,
+            "worker",
+            30,
+            actor(),
+            1,
+        )
+        .is_err());
+        assert!(PgWorkerScope::new(
+            TenantId("acme".into()),
+            Region("wrong".into()),
+            0,
+            "worker",
+            30,
+            actor(),
+            1,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn production_scope_refuses_missing_or_empty_required_values() {
+        assert!(PgWorkerScope::from_lookup(|_| None).is_err());
+        let values = HashMap::from([
+            ("MYELIN_FLOW_TENANT", "acme"),
+            ("MYELIN_FLOW_REGION", "eu-north"),
+            ("MYELIN_FLOW_PARTITION", "0"),
+            ("MYELIN_FLOW_WORKER", ""),
+            ("MYELIN_FLOW_LEASE_TTL_SECS", "30"),
+        ]);
+        assert!(PgWorkerScope::from_lookup(|name| values.get(name).map(|v| (*v).into())).is_err());
+    }
+
+    #[test]
+    fn production_definition_allowlist_is_explicit_and_rejects_product_stubs() {
+        assert!(configured_definitions_from(None).is_err());
+        assert!(configured_definitions_from(Some(String::new())).is_err());
+        assert!(configured_definitions_from(Some("ci.pipeline@1".into())).is_err());
+        assert_eq!(
+            configured_definitions_from(Some(format!("{OPERATIONAL_PROBE_WF_TYPE}@1"))).unwrap(),
+            [(OPERATIONAL_PROBE_WF_TYPE.to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn drive_event_ids_and_command_ids_are_stable_across_replay() {
+        fn stage() -> (String, String) {
+            let mut ctx = WfCtx::resume_staged_versioned(
+                Arc::new(DriveIdMinter::new("run-1")),
+                EmitContextBase {
+                    tenant: TenantId("acme".into()),
+                    region: Region("eu-north".into()),
+                    actor: actor(),
+                    schema_ver: 1,
+                    occurred_at: Timestamp("2026-07-18T00:00:00Z".into()),
+                    recorded_at: Timestamp("2026-07-18T00:00:00Z".into()),
+                    caused_by: None,
+                },
+                "run-1",
+                "wf.test",
+                "2026-07-18T00:00:00Z",
+                stable_seed("run-1"),
+                Vec::new(),
+                1,
+                1,
+            );
+            ctx.now();
+            ctx.emit(
+                EventDraft {
+                    type_: EventType("flow.test.completed".into()),
+                    subject: ArtifactRef("myelin://acme/flow/run/run-1".into()),
+                    aggregate: AggregateKey("flow:run-1".into()),
+                    payload: serde_json::json!({"run_ref":"myelin://acme/flow/run/run-1"}),
+                    data_role: DataRole::Processor,
+                    visibility: Visibility::Internal,
+                    contains_personal_data: false,
+                    pii_key_ref: None,
+                },
+                None,
+            )
+            .unwrap();
+            let staged = ctx.into_staged_drive().unwrap();
+            (
+                staged.outbox[0].event_id.0.clone(),
+                staged.history[0].command_id.clone(),
+            )
+        }
+        assert_eq!(stage(), stage());
+    }
+}

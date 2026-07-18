@@ -80,10 +80,12 @@ myelin-storage = { path = "../myelin-storage" }
 # bridge requires) + `myelin-config` (the env-first durable config, fail-loud) are now regular
 # deps. Build stays DB-free: connecting happens at RUNTIME, never at build.
 myelin-config = { path = "../myelin-config" }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 # The production durable-executor control surface is backed by Postgres. Queries remain runtime-
 # checked (`sqlx::query`, never compile-time macros), so builds do not require a live database.
 sqlx = { workspace = true }
+# UTC formatting for the production worker's journaled `ctx.now()` clock.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
 # MR-009b W6b2 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN test
