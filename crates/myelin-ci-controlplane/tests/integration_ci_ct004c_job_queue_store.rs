@@ -36,7 +36,7 @@
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
-    ci_job_queue_store, CiJobQueueStore, DurableEnqueue, EnqueueOutcome, Lane,
+    ci_job_queue_store, ci_region_queue_store, CiJobQueueStore, DurableEnqueue, EnqueueOutcome, Lane,
     CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_FAIR_DEFICIT_DDL, INSERT_JOB_QUEUE_QUERY,
     make_tenant_scoped_ddl,
 };
@@ -198,6 +198,7 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
     let admin = reopen_admin().await;
     create_schema(&admin, &schema).await;
     let store = ci_job_queue_store(admin.clone());
+    let region_store = ci_region_queue_store(admin.clone());
 
     // ── 1. Seed via the STORE's enqueue (tenant-scoped path): a spread of eligibility cases. ──
     // interactive (newer) + batch (older) in-region trusted; out-of-region; wrong-label; and the two
@@ -227,7 +228,7 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
     // ── 2. CLAIM: a trusted linux/gpu runner leases the in-region INTERACTIVE trusted job. ──
     let runner_labels = vec!["linux".to_string(), "gpu".to_string()];
     let trusted_only = vec![TrustTier::Trusted];
-    let leased = store
+    let leased = region_store
         .claim(region, &runner_labels, &trusted_only, "r1", 30)
         .await
         .expect("claim")
@@ -245,7 +246,7 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
     // Claim repeatedly with only trusted tiers; assert the fork + self-hosted job ids never appear.
     let mut trusted_claims = Vec::new();
     for owner in ["t1", "t2", "t3", "t4", "t5"] {
-        if let Some(l) = store
+        if let Some(l) = region_store
             .claim(region, &runner_labels, &trusted_only, owner, 30)
             .await
             .expect("claim")
@@ -268,7 +269,7 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         "affinity: a windows-labelled job is never claimed by a linux/gpu runner"
     );
     // A claim that DOES list untrusted_fork leases the fork job (the tier gate is exact, not a blanket).
-    let fork_claim = store
+    let fork_claim = region_store
         .claim(region, &runner_labels, &[TrustTier::UntrustedFork], "fork-runner", 30)
         .await
         .expect("claim")
@@ -284,8 +285,8 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
     ] {
         store.enqueue(&j).await.expect("enqueue cc");
     }
-    let s_a = store.clone();
-    let s_b = store.clone();
+    let s_a = region_store.clone();
+    let s_b = region_store.clone();
     let labels_a = runner_labels.clone();
     let labels_b = runner_labels.clone();
     let (ra, rb) = tokio::join!(
@@ -317,7 +318,7 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         .await
         .unwrap()
         .get("n");
-    let reaped = store.reap(region).await.expect("reap");
+    let reaped = region_store.reap(region).await.expect("reap");
     assert!(reaped >= 1, "the dead lease is re-queued by the reaper (0 orphans): {reaped} swept");
     let state: String = sqlx::query("SELECT state FROM job_queue WHERE job_id = $1")
         .bind(uid("jint"))
@@ -340,7 +341,7 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         .get("n");
     assert_eq!(before_count, after_count, "0 duplicate enqueues after the reaper re-queue");
     // A fresh runner re-claims the recovered job.
-    let reclaim = store
+    let reclaim = region_store
         .claim(region, &runner_labels, &trusted_only, "live-runner", 30)
         .await
         .expect("re-claim")
@@ -355,7 +356,7 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
             .expect("heartbeat"),
         "the lease owner extends its lease"
     );
-    let swept = store.reap(region).await.expect("reap after heartbeat");
+    let swept = region_store.reap(region).await.expect("reap after heartbeat");
     let jint_state: String = sqlx::query("SELECT state FROM job_queue WHERE job_id = $1")
         .bind(uid("jint"))
         .fetch_one(&admin)

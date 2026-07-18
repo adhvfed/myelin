@@ -35,7 +35,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use myelin_ci_controlplane::{
-    ci_job_queue_store, ci_job_spec_store, durable_spec_resolver, CiJobSpecStoreError,
+    ci_job_queue_store, ci_job_spec_store, ci_region_queue_store, durable_spec_resolver, CiJobSpecStoreError,
     DurableEnqueue, DurableLeaseAdapter, EnqueueOutcome, Lane, CI_RUNNER_LEASE_TTL_SECS,
     CREATE_CI_JOB_SPEC_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
     CREATE_JOB_QUEUE_INDEXES_DDL, MAX_JOB_TIMEOUT_SECS,
@@ -325,6 +325,7 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
     // ── the durable adapter + the REAL durable resolver (over ci_job_spec) — NOT an injected closure. ──
     let resolver = durable_spec_resolver(specs.clone(), region, tokio::runtime::Handle::current());
     let adapter = DurableLeaseAdapter::new(
+        ci_region_queue_store(admin.clone()),
         queue.clone(),
         region,
         tokio::runtime::Handle::current(),
@@ -492,7 +493,7 @@ async fn trusted_runner_never_executes_a_dispatched_untrusted_fork() {
 
     // A trusted-only runner, using the REAL durable resolver, drives the exact run_one claim seam.
     let resolver = durable_spec_resolver(specs.clone(), region, tokio::runtime::Handle::current());
-    let adapter = DurableLeaseAdapter::new(queue.clone(), region, tokio::runtime::Handle::current(), resolver);
+    let adapter = DurableLeaseAdapter::new(ci_region_queue_store(admin.clone()), queue.clone(), region, tokio::runtime::Handle::current(), resolver);
     let claimed = adapter.claim_for_labels(
         "trusted-worker",
         &["linux".to_string()],
@@ -542,7 +543,7 @@ async fn a_leased_row_without_a_spec_resolves_fail_closed() {
 
     // Through the runner seam: claim resolves fail-closed → no launch → the row stays leased for the reaper.
     let resolver = durable_spec_resolver(specs.clone(), region, tokio::runtime::Handle::current());
-    let adapter = DurableLeaseAdapter::new(queue.clone(), region, tokio::runtime::Handle::current(), resolver);
+    let adapter = DurableLeaseAdapter::new(ci_region_queue_store(admin.clone()), queue.clone(), region, tokio::runtime::Handle::current(), resolver);
     let claimed = adapter.claim_for_labels(
         "worker",
         &["linux".to_string()],

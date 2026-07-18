@@ -32,7 +32,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use myelin_ci_controlplane::{
-    ci_job_queue_store, DurableEnqueue, DurableLeaseAdapter, DurableLogPersist, EnqueueOutcome,
+    ci_job_queue_store, ci_region_queue_store, DurableEnqueue, DurableLeaseAdapter, DurableLogPersist, EnqueueOutcome,
     JobSpecResolver, Lane, LeasedJob, LogPipelineSink, CREATE_FAIR_DEFICIT_DDL,
     CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL,
 };
@@ -288,6 +288,7 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
     let admin = admin_pool("e2e").await;
     create_schema(&admin, &schema).await;
     let store = ci_job_queue_store(admin.clone());
+    let region_store = ci_region_queue_store(admin.clone());
 
     // The durable run id is a uuid; the executor's started run must carry the SAME id (job.done target).
     let run_uuid = uid("e2e-run").to_string();
@@ -326,6 +327,7 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
         ))
     });
     let adapter = DurableLeaseAdapter::new(
+        region_store,
         store.clone(),
         region,
         tokio::runtime::Handle::current(),
@@ -440,6 +442,7 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
     create_schema(&admin, &schema).await;
     create_log_tables(&admin).await;
     let store = ci_job_queue_store(admin.clone());
+    let region_store = ci_region_queue_store(admin.clone());
 
     let run_uuid = uid("capstone-run").to_string();
     let idem = job_idem_token(&run_uuid, "ci.pipeline:0");
@@ -468,7 +471,7 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
             &idem_for_resolver,
         ))
     });
-    let adapter = DurableLeaseAdapter::new(store.clone(), region, tokio::runtime::Handle::current(), resolve);
+    let adapter = DurableLeaseAdapter::new(region_store, store.clone(), region, tokio::runtime::Handle::current(), resolve);
     let backend = GvisorBackend::new();
 
     // THE PRODUCTION FIREHOSE — the exact sink `CiRunnerLoop` now wires (sub-step 5): the per-job
@@ -566,6 +569,7 @@ async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
     let admin = admin_pool("tier").await;
     create_schema(&admin, &schema).await;
     let store = ci_job_queue_store(admin.clone());
+    let region_store = ci_region_queue_store(admin.clone());
 
     // ONLY an untrusted_fork job is queued (linux, in-region).
     let fork = enq(tenant, region, "fork-job", "fork-run", TrustTier::UntrustedFork, &["linux"], "idem-fork");
@@ -577,7 +581,7 @@ async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
         // If we ever reach here the tier filter was breached — force a loud failure.
         panic!("SECURITY BREACH: the resolver was called for a leased fork job {}!", l.job_id)
     });
-    let adapter = DurableLeaseAdapter::new(store.clone(), region, tokio::runtime::Handle::current(), resolve);
+    let adapter = DurableLeaseAdapter::new(region_store.clone(), store.clone(), region, tokio::runtime::Handle::current(), resolve);
     let claimed = adapter.claim_for_labels(
         "trusted-worker",
         &["linux".to_string()],
@@ -601,7 +605,7 @@ async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
     // Control: a fork-admitting adapter DOES claim it (the gate is exact, not a blanket deny).
     let resolve_ok: JobSpecResolver =
         Arc::new(|_l: &LeasedJob| Ok(compute_spec(vec!["true".into()], "idem-fork")));
-    let fork_adapter = DurableLeaseAdapter::new(store.clone(), region, tokio::runtime::Handle::current(), resolve_ok);
+    let fork_adapter = DurableLeaseAdapter::new(region_store, store.clone(), region, tokio::runtime::Handle::current(), resolve_ok);
     let ok = fork_adapter.claim_for_labels(
         "fork-worker",
         &["linux".to_string()],
@@ -626,6 +630,7 @@ async fn region_a_runner_never_claims_region_b_job() {
     let admin = admin_pool("region").await;
     create_schema(&admin, &schema).await;
     let store = ci_job_queue_store(admin.clone());
+    let region_store = ci_region_queue_store(admin.clone());
 
     // A trusted linux job in region B only.
     let jb = enq(tenant, "de-fra", "rb-job", "rb-run", TrustTier::Trusted, &["linux"], "idem-rb");
@@ -634,7 +639,7 @@ async fn region_a_runner_never_claims_region_b_job() {
     let resolve: JobSpecResolver = Arc::new(|l: &LeasedJob| {
         panic!("SECURITY BREACH: a region-A runner leased a region-B job {}!", l.job_id)
     });
-    let adapter = DurableLeaseAdapter::new(store.clone(), "fr-par", tokio::runtime::Handle::current(), resolve);
+    let adapter = DurableLeaseAdapter::new(region_store, store.clone(), "fr-par", tokio::runtime::Handle::current(), resolve);
     let claimed = adapter.claim_for_labels(
         "fr-par-worker",
         &["linux".to_string()],
@@ -668,6 +673,7 @@ async fn stolen_lease_fails_heartbeat_no_double_run() {
     let admin = admin_pool("steal").await;
     create_schema(&admin, &schema).await;
     let store = ci_job_queue_store(admin.clone());
+    let region_store = ci_region_queue_store(admin.clone());
 
     let job = enq(tenant, region, "steal-job", "steal-run", TrustTier::Trusted, &["linux"], "idem-steal");
     store.enqueue(&job).await.expect("enqueue");
@@ -675,7 +681,7 @@ async fn stolen_lease_fails_heartbeat_no_double_run() {
     let resolve: JobSpecResolver =
         Arc::new(|_l: &LeasedJob| Ok(compute_spec(vec!["true".into()], "idem-steal")));
     let adapter_a =
-        DurableLeaseAdapter::new(store.clone(), region, tokio::runtime::Handle::current(), resolve);
+        DurableLeaseAdapter::new(region_store.clone(), store.clone(), region, tokio::runtime::Handle::current(), resolve);
 
     // worker-A claims the job (through the adapter — the exact run_one Step-1 path).
     let claimed = adapter_a
@@ -694,8 +700,8 @@ async fn stolen_lease_fails_heartbeat_no_double_run() {
         )
         .await
         .unwrap();
-    assert!(store.reap(region).await.expect("reap") >= 1, "the dead lease is re-queued");
-    let stolen = store
+    assert!(region_store.reap(region).await.expect("reap") >= 1, "the dead lease is re-queued");
+    let stolen = region_store
         .claim(region, &["linux".to_string()], &[TrustTier::Trusted], "worker-B", 30)
         .await
         .expect("claim")

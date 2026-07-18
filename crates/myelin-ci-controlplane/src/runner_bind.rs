@@ -52,15 +52,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myelin_ci_sandbox::gvisor::GvisorBackend;
-use myelin_ci_sandbox::{
-    JobSpec, LeaseStore, QueuedJob, RunnerError, RunnerHooks, TrustTier,
-};
+use myelin_ci_sandbox::{JobSpec, LeaseStore, QueuedJob, RunnerError, RunnerHooks, TrustTier};
 use myelin_storage::s3blob::S3BlobStore;
 use myelin_tenancy::{Region, TenantId};
 
 use crate::ci_pipeline_driver::CiPipelineReporter;
 use crate::job_spec_store::MAX_JOB_TIMEOUT_SECS;
-use crate::{CiJobQueueStore, CiJobSpecStore, DurableLogPersist, LeasedJob, LogPipelineSink};
+use crate::{
+    CiJobQueueStore, CiJobSpecStore, CiRegionQueueStore, DurableLogPersist, LeasedJob,
+    LogPipelineSink,
+};
 
 /// **The runner's lease TTL, wired ABOVE the max job timeout (CT-004d.1 — the CT-004c.2 verifier's
 /// MEDIUM fix).** [`RunnerAgent::run_one`](myelin_ci_sandbox::RunnerAgent) BLOCKS for the whole in-line
@@ -95,36 +96,36 @@ fn bridge<F: std::future::Future>(rt: &tokio::runtime::Handle, fut: F) -> F::Out
     }
 }
 
-/// **The durable `job_queue` store adapted to the sandbox [`LeaseStore`] port (CT-004c.2).** Wraps the
-/// pool-backed [`CiJobQueueStore`] so the SAME [`RunnerAgent::run_one`](myelin_ci_sandbox::RunnerAgent)
-/// body claims / heartbeats / settles against live Postgres instead of the in-memory floor. It holds
-/// the store, the runner's residency `region` (the heartbeat/complete tenant-scoped tx keys on it), a
-/// tokio [`Handle`](tokio::runtime::Handle) for the async→sync bridge, and the [`JobSpecResolver`].
+/// **The split durable queue capabilities adapted to the sandbox [`LeaseStore`] port (CT-004c.2).**
+/// [`CiRegionQueueStore`] claims through the dedicated scheduler role; [`CiJobQueueStore`] performs
+/// tenant-scoped heartbeat/complete through the application role. Keeping both handles explicit
+/// prevents either credential from acquiring the other's mutation surface.
 ///
 /// **The security invariant (the adversarial-verifier surface):** [`claim_for_labels`](Self::claim_for_labels)
-/// forwards `allowed_tiers` + `region` to [`CiJobQueueStore::claim`] EXACTLY as received — no widening,
+/// forwards `allowed_tiers` + `region` to [`CiRegionQueueStore::claim`] EXACTLY as received — no widening,
 /// no default, no drop — so the durable `trust_tier = ANY($tiers) AND region = $region` predicate is
 /// the sole eligibility gate. This type carries a durable store handle (no in-memory collection of
 /// record), so it is NOT an in-memory durable store.
 pub struct DurableLeaseAdapter {
-    store: CiJobQueueStore,
+    region_store: CiRegionQueueStore,
+    tenant_store: CiJobQueueStore,
     region: String,
     rt: tokio::runtime::Handle,
     resolve: JobSpecResolver,
 }
 
 impl DurableLeaseAdapter {
-    /// Adapt the durable `job_queue` store to the runner's lease port. `region` is the runner's
-    /// residency region (the same region its claim filters on); `rt` is the runtime handle the sync
-    /// port bridges its async DB calls onto; `resolve` maps a leased row to its `JobSpec`.
+    /// Adapt the separate scheduler/tenant queue stores to the runner's lease port.
     pub fn new(
-        store: CiJobQueueStore,
+        region_store: CiRegionQueueStore,
+        tenant_store: CiJobQueueStore,
         region: impl Into<String>,
         rt: tokio::runtime::Handle,
         resolve: JobSpecResolver,
     ) -> DurableLeaseAdapter {
         DurableLeaseAdapter {
-            store,
+            region_store,
+            tenant_store,
             region: region.into(),
             rt,
             resolve,
@@ -134,7 +135,7 @@ impl DurableLeaseAdapter {
 
 impl LeaseStore for DurableLeaseAdapter {
     /// **Claim through the durable `FOR UPDATE SKIP LOCKED` predicate (arch 02 §2.1).** Forwards
-    /// `region` + `runner_labels` + `allowed_tiers` UNCHANGED to [`CiJobQueueStore::claim`]. On a
+    /// `region` + `runner_labels` + `allowed_tiers` UNCHANGED to [`CiRegionQueueStore::claim`]. On a
     /// leased row, resolves the [`JobSpec`] and builds the sandbox [`QueuedJob`]. `None` when nothing
     /// is eligible OR the spec is unresolved (the row stays leased; the reaper re-queues it — never a
     /// launch of an unresolved/ineligible job). A DB error is LOUD (never a silent drop) and yields
@@ -153,7 +154,7 @@ impl LeaseStore for DurableLeaseAdapter {
         // The eligibility gate (`trust_tier = ANY($tiers) AND region = $region`) is the store's.
         let claimed = bridge(
             &self.rt,
-            self.store
+            self.region_store
                 .claim(&region.0, runner_labels, allowed_tiers, worker, ttl),
         );
         let leased = match claimed {
@@ -209,7 +210,7 @@ impl LeaseStore for DurableLeaseAdapter {
         let ttl = lease_ttl_secs.max(0) as u64;
         match bridge(
             &self.rt,
-            self.store
+            self.tenant_store
                 .heartbeat(&tenant.0, &self.region, job_id, worker, ttl),
         ) {
             Ok(extended) => extended,
@@ -231,7 +232,7 @@ impl LeaseStore for DurableLeaseAdapter {
     fn settle(&self, tenant: &TenantId, job_id: &str) {
         if let Err(e) = bridge(
             &self.rt,
-            self.store.complete(&tenant.0, &self.region, job_id),
+            self.tenant_store.complete(&tenant.0, &self.region, job_id),
         ) {
             eprintln!(
                 "ci-runner: settle/complete FAILED for job {job_id} in region `{}` (the job.done \
@@ -264,7 +265,8 @@ pub struct CiRunnerLoop {
     allowed_tiers: Vec<TrustTier>,
     region: String,
     lease_ttl_secs: i64,
-    store: CiJobQueueStore,
+    region_store: CiRegionQueueStore,
+    tenant_store: CiJobQueueStore,
     rt: tokio::runtime::Handle,
     resolve: JobSpecResolver,
     reporter: CiPipelineReporter,
@@ -296,7 +298,8 @@ impl CiRunnerLoop {
         allowed_tiers: Vec<TrustTier>,
         region: impl Into<String>,
         lease_ttl_secs: i64,
-        store: CiJobQueueStore,
+        region_store: CiRegionQueueStore,
+        tenant_store: CiJobQueueStore,
         rt: tokio::runtime::Handle,
         resolve: JobSpecResolver,
         reporter: CiPipelineReporter,
@@ -310,7 +313,8 @@ impl CiRunnerLoop {
             allowed_tiers,
             region: region.into(),
             lease_ttl_secs,
-            store,
+            region_store,
+            tenant_store,
             rt,
             resolve,
             reporter,
@@ -353,7 +357,8 @@ impl CiRunnerLoop {
             allowed_tiers,
             region,
             lease_ttl_secs,
-            store,
+            region_store,
+            tenant_store,
             rt,
             resolve,
             reporter,
@@ -375,7 +380,8 @@ impl CiRunnerLoop {
             S3BlobStore::connect(&s3, rt.clone()),
             DurableLogPersist::with_pg(pool, rt.clone()),
         );
-        let adapter = DurableLeaseAdapter::new(store, region.clone(), rt, resolve);
+        let adapter =
+            DurableLeaseAdapter::new(region_store, tenant_store, region.clone(), rt, resolve);
         let agent = myelin_ci_sandbox::RunnerAgent::new(
             worker_id.clone(),
             labels,

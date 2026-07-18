@@ -36,19 +36,10 @@
 //! the app role (`myelin_app`, NOBYPASSRLS), not just as the admin/owner. (They bind `tenant_id`
 //! explicitly, so the `tenant-predicate` lint reads the IDOR guard on every one.)
 //!
-//! ### The claim + reap are REGION-scoped, CROSS-TENANT service operations (isolated + named honestly)
-//! [`CiJobQueueStore::claim`] / [`CiJobQueueStore::reap`] filter by `region` only, NOT by tenant — by
-//! architectural design: a hosted runner claims the next eligible job across ALL tenants in its
-//! region, and the DRR fairness (`fair_deficit.deficit DESC`) is explicitly cross-tenant ("prevents
-//! one tenant's matrix from starving every OTHER tenant", arch 02 §2.2). A single-tenant GUC cannot
-//! express a region-wide claim. Their raw executions live in [`crate::job_queue_region`] (a
-//! cross-tenant-by-design control-plane file, the SAME posture as `placement_durable.rs` — a NAMED,
-//! LOUD `tenant-predicate` exclusion) so THIS file's per-tenant queries stay FULLY linted. Under the
-//! `(tenant, region)` tenant-isolation policy a region-wide read needs the scheduler to connect under
-//! a role that can read the region's queue across tenants (a superuser / a dedicated region-scoped
-//! scheduler role) — a NAMED FLOOR (a region-scoped scheduler DB role / policy). The region GUC IS
-//! set in-band ([`crate::job_queue_region`]) so a future policy keyed on
-//! `current_setting('myelin.region')` needs no code change; this is NOT a weakened tenant isolation.
+//! ### Claim + reap are a separate REGION-scoped capability
+//! Cross-tenant claim/reap live only on [`crate::job_queue_region::CiRegionQueueStore`], constructed
+//! over the dedicated scheduler pool. They are deliberately absent from [`CiJobQueueStore`], making
+//! it impossible to accidentally run them through the tenant application pool.
 //!
 //! ## Fail-loud, typed, no silent drop
 //! Every DB error is a typed [`JobQueueStoreError::Db`] (never a swallowed drop). A `job_id`/`run_id`
@@ -114,7 +105,10 @@ impl core::fmt::Display for JobQueueStoreError {
                  job_queue.{field} column is uuid — CI job/run ids are uuids in production)"
             ),
             JobQueueStoreError::CorruptRow(e) => {
-                write!(f, "corrupt durable job_queue row (outside the frozen token set): {e}")
+                write!(
+                    f,
+                    "corrupt durable job_queue row (outside the frozen token set): {e}"
+                )
             }
         }
     }
@@ -219,7 +213,10 @@ impl CiJobQueueStore {
     /// [`EnqueueOutcome::Inserted`] iff a NEW row was inserted, or [`EnqueueOutcome::DuplicateIdem`]
     /// when the `jq_idem` unique made the insert a no-op (a reaper re-queue + a redundant re-dispatch
     /// = ONE row, never a duplicate — the CI-D1 effectively-once floor).
-    pub async fn enqueue(&self, job: &DurableEnqueue) -> Result<EnqueueOutcome, JobQueueStoreError> {
+    pub async fn enqueue(
+        &self,
+        job: &DurableEnqueue,
+    ) -> Result<EnqueueOutcome, JobQueueStoreError> {
         let job_uuid = parse_id("job_id", &job.job_id)?;
         let run_uuid = parse_id("run_id", &job.run_id)?;
         let labels = job.labels.clone();
@@ -256,49 +253,6 @@ impl CiJobQueueStore {
         } else {
             EnqueueOutcome::DuplicateIdem
         })
-    }
-
-    /// **The pull-lease claim (arch 02 §2.1) — lease ONE eligible row, launch NOTHING.** Region-scoped,
-    /// cross-tenant (see the module note): claims the highest-priority / fairest / label-eligible /
-    /// in-region / trust-allowed / non-serialized job via `FOR UPDATE OF q SKIP LOCKED` and marks it
-    /// `leased` with the owner + expiry. Concurrent runners never block each other — each takes a
-    /// DIFFERENT row (0 double-lease). Returns the leased row, or `None` when nothing is eligible.
-    ///
-    /// The raw execution is [`crate::job_queue_region::claim_region_scoped`] (the cross-tenant control-
-    /// plane file). This is the durable equivalent of BOTH
-    /// [`crate::scheduler::SchedulerState::claim`] and the sandbox `JobLeaseStore::claim_for_labels`;
-    /// it does NOT launch anything — CT-004c.2 hands the leased job to the sandbox executor.
-    ///
-    /// `runner_allowed_tiers` is the security-load-bearing bind: pass ONLY the tiers this runner may
-    /// execute so an `untrusted_fork` job is never leased by a trusted-only runner.
-    pub async fn claim(
-        &self,
-        region: &str,
-        runner_labels: &[String],
-        runner_allowed_tiers: &[TrustTier],
-        lease_owner: &str,
-        lease_secs: u64,
-    ) -> Result<Option<LeasedJob>, JobQueueStoreError> {
-        crate::job_queue_region::claim_region_scoped(
-            &self.pool,
-            region,
-            runner_labels,
-            runner_allowed_tiers,
-            lease_owner,
-            lease_secs,
-        )
-        .await
-    }
-
-    /// **The dead-runner reaper (arch 02 §2.1) — re-queue every expired lease in the region.**
-    /// Region-scoped, cross-tenant: a `leased` row whose `lease_expires < now()` is moved back to
-    /// `queued` (clearing the lease) so it is claimable again. SAFE — it only moves `leased`→`queued`
-    /// for expired rows; it launches nothing. 0 orphans (every expired lease is re-queued), 0
-    /// duplicate enqueues (it UPDATEs the existing row in place; the `jq_idem` unique rejects any
-    /// redundant re-dispatch). Returns the count of re-queued dead leases. The raw execution is
-    /// [`crate::job_queue_region::reap_region_scoped`].
-    pub async fn reap(&self, region: &str) -> Result<u64, JobQueueStoreError> {
-        crate::job_queue_region::reap_region_scoped(&self.pool, region).await
     }
 
     /// **Cancel-superseded (arch 02 §2.3; [`CANCEL_SUPERSEDED_QUERY`]) — a new push to a PR cancels
@@ -404,7 +358,7 @@ impl CiJobQueueStore {
 
 /// **The dead-runner reaper loop (arch 02 §2.1) — the lease-driven periodic driver.** A bounded
 /// background task the ci-controlplane `main` spawns onto the serve runtime (minimal-impact wiring —
-/// no new `AppSpec` field): every `interval` it calls [`CiJobQueueStore::reap`] for the cell region,
+/// no new `AppSpec` field): every `interval` it calls [`crate::CiRegionQueueStore::reap`] for the cell region,
 /// re-queuing expired leases so a dead runner's job becomes claimable again. This is the SAME
 /// lease-driven periodic shape as `WorkflowEngine::tick` (a lease sweep on a timer). The reaper is
 /// SAFE: it only moves `leased`→`queued` for expired rows; it launches nothing.
@@ -414,7 +368,7 @@ impl CiJobQueueStore {
 /// stderr) and the loop continues to the next tick. The first sweep is delayed one `interval` so the
 /// serve boot-migrate (which creates `job_queue`) has completed.
 pub struct JobQueueReaper {
-    store: CiJobQueueStore,
+    store: crate::CiRegionQueueStore,
     region: String,
     interval: Duration,
 }
@@ -423,7 +377,11 @@ impl JobQueueReaper {
     /// Construct the reaper for a cell region + sweep interval. `region` is the cell's residency
     /// region (the `SubstrateProvider` config `region`); `interval` is the sweep cadence (a few
     /// multiples of the runner heartbeat — a lease expiry is caught within one interval).
-    pub fn new(store: CiJobQueueStore, region: impl Into<String>, interval: Duration) -> Self {
+    pub fn new(
+        store: crate::CiRegionQueueStore,
+        region: impl Into<String>,
+        interval: Duration,
+    ) -> Self {
         JobQueueReaper {
             store,
             region: region.into(),
@@ -561,7 +519,8 @@ mod tests {
         // HEARTBEAT: four binds, owner-guarded, leased-only.
         assert!(HEARTBEAT_QUERY.contains("$4") && !HEARTBEAT_QUERY.contains("$5"));
         assert!(
-            HEARTBEAT_QUERY.contains("lease_owner = $3") && HEARTBEAT_QUERY.contains("state = 'leased'")
+            HEARTBEAT_QUERY.contains("lease_owner = $3")
+                && HEARTBEAT_QUERY.contains("state = 'leased'")
         );
     }
 
@@ -591,7 +550,13 @@ mod tests {
     #[test]
     fn a_non_uuid_id_is_a_loud_refusal() {
         let e = parse_id("job_id", "not-a-uuid").unwrap_err();
-        assert!(matches!(e, JobQueueStoreError::BadId { field: "job_id", .. }));
+        assert!(matches!(
+            e,
+            JobQueueStoreError::BadId {
+                field: "job_id",
+                ..
+            }
+        ));
         // A real uuid parses.
         assert!(parse_id("run_id", "00000000-0000-0000-0000-000000000001").is_ok());
     }

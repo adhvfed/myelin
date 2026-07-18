@@ -4,7 +4,9 @@
 fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let source = include_str!("../src/main.rs");
 
-    assert!(source.contains("PgBootstrap::from_env(Mode::RequireEnv)"));
+    assert!(source.contains("MyelinConfig::from_env(Mode::RequireEnv)"));
+    assert!(source.contains("CiSchedulerDbConfig::from_env(&platform_config)"));
+    assert!(source.contains("PgBootstrap::connect(platform_config, DEFAULT_MAX_CONNECTIONS)"));
     assert!(!source.contains("Mode::DevDefaults"));
     assert!(!source.contains("SubstrateProvider::connect"));
 
@@ -23,6 +25,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let handoff = source
         .find("bootstrap.into_runtime()")
         .expect("bootstrap must be consumed by the runtime handoff");
+    let scheduler_handoff = source
+        .find("CiSchedulerDbProvider::connect")
+        .expect("scheduler provider must validate its dedicated credential");
     let shape_check = source
         .find("verify_ci_cost_event_shape(provider.db_pool())")
         .expect("runtime must verify the CI money-table shape");
@@ -36,7 +41,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         .find("verify_startup_activation(runner_setting)")
         .expect("production runner activation must be refused explicitly");
     let bootstrap = source
-        .find("PgBootstrap::from_env(Mode::RequireEnv)")
+        .find("PgBootstrap::connect(platform_config, DEFAULT_MAX_CONNECTIONS)")
         .expect("database bootstrap must remain wired");
     let service = source
         .find("run_controlplane(Config::default()")
@@ -50,13 +55,16 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(source.contains("InvalidRunnerSetting(String)"));
     assert!(source.contains("NonUnicodeRunnerSetting(OsString)"));
     assert!(!source.contains("std::env::var(\"MYELIN_CI_RUNNER\").ok()"));
+    assert!(!source.contains("ci_job_queue_store(provider.db_pool().clone())"));
+    assert!(source.contains("scheduler_provider.region_queue_store()"));
 
     assert!(runner_gate < bootstrap);
     assert!(foundation < durable);
     assert!(durable < controlplane);
     assert!(controlplane < hot_tables);
     assert!(hot_tables < handoff);
-    assert!(handoff < shape_check);
+    assert!(handoff < scheduler_handoff);
+    assert!(scheduler_handoff < shape_check);
     assert!(shape_check < first_store);
     assert!(first_store < reaper);
     assert!(reaper < service);

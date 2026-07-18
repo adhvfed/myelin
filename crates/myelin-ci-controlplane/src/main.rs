@@ -33,9 +33,11 @@
 //! fails before database bootstrap until its durable billing and run-token authorities are wired.
 
 use myelin_ci_controlplane::run_controlplane;
-use myelin_config::Mode;
+use myelin_config::{Mode, MyelinConfig};
 use myelin_events::OutboxStore;
-use myelin_storage::{all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking};
+use myelin_storage::{
+    all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking, DEFAULT_MAX_CONNECTIONS,
+};
 use myelin_substrate::Config;
 use std::ffi::OsString;
 use std::fmt;
@@ -96,10 +98,26 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Production is strict: validate every endpoint plus distinct migration/runtime PostgreSQL
-    // roles before any DDL, durable store, reaper, or listener can be created. `PgBootstrap`
-    // alone owns the privileged pool.
-    let bootstrap = match PgBootstrap::from_env(Mode::RequireEnv).await {
+    // Production is strict: validate every endpoint plus three distinct PostgreSQL credentials
+    // before any DDL, durable store, reaper, or listener can be created. The scheduler credential
+    // is parsed here but is not connected until privileged migrations are complete.
+    let platform_config = match MyelinConfig::from_env(Mode::RequireEnv) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("ci-controlplane: platform configuration refused to start: {e}");
+            std::process::exit(1);
+        }
+    };
+    let scheduler_config =
+        match myelin_ci_controlplane::CiSchedulerDbConfig::from_env(&platform_config) {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("ci-controlplane: scheduler configuration refused to start: {e}");
+                std::process::exit(1);
+            }
+        };
+    // `PgBootstrap` alone owns the privileged pool.
+    let bootstrap = match PgBootstrap::connect(platform_config, DEFAULT_MAX_CONNECTIONS).await {
         Ok(bootstrap) => bootstrap,
         Err(e) => {
             eprintln!("ci-controlplane: database bootstrap refused to start: {e}");
@@ -152,6 +170,21 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // The scheduler credential is opened only after privileged migrations and is validated against
+    // the authenticated runtime role and the server-owned region map. Its provider exposes no raw
+    // pool and can construct only the region claim/reap capability.
+    let scheduler_provider = match myelin_ci_controlplane::CiSchedulerDbProvider::connect(
+        scheduler_config,
+        provider.db_pool(),
+    )
+    .await
+    {
+        Ok(provider) => provider,
+        Err(e) => {
+            eprintln!("ci-controlplane: scheduler database handoff refused to start: {e}");
+            std::process::exit(1);
+        }
+    };
     // #11 — BOOT-TIME SHAPE ASSERTION on the money table. `CREATE TABLE IF NOT EXISTS` above no-ops on
     // a pre-existing (possibly pre-CT-004m mis-shaped) `ci_cost_event`, so assert the columns/types are
     // the CI metering-projection shape before the settle path can write money data. FAIL LOUD.
@@ -179,9 +212,8 @@ async fn main() {
     // only re-queues expired leases (`leased`→`queued`); it launches NO untrusted code (binding the
     // runner + starting the pipeline body on the sandbox executor is CT-004c.2). The claim path is
     // dormant at the shell (production runner activation is refused above).
-    let ci_job_queue = myelin_ci_controlplane::ci_job_queue_store(provider.db_pool().clone());
     let reaper = myelin_ci_controlplane::JobQueueReaper::new(
-        ci_job_queue,
+        scheduler_provider.region_queue_store(),
         provider.config().region.clone(),
         std::time::Duration::from_secs(15),
     );
