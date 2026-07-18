@@ -154,6 +154,9 @@ impl<'a> CiResultSignal<'a> {
             payload: encode_ci_result(result),
             // No inline PII (references-not-payloads) → no crypto-shred key on the row.
             payload_key_ref: None,
+            // This in-memory compatibility producer has no wall-clock input. Production delivery
+            // uses PgFlowExecutor, which stamps the durable database receipt time.
+            received_unix_ms: 0,
             consumed_seq: None,
         };
         // `deliver` models INSERT … ON CONFLICT DO NOTHING: `true` = a NEW buffered row (the workflow

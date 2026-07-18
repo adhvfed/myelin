@@ -249,6 +249,7 @@ fn ci_d5_funded_ci_stage_starts_and_settles_into_the_shared_wallet() {
         idem_key: token,
         payload: vec![myelin_refs::ArtifactRef("myelin://acme/ci/green".into())],
         payload_key_ref: None,
+        received_unix_ms: 0,
         consumed_seq: None,
     });
 

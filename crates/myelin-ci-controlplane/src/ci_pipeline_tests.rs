@@ -159,6 +159,7 @@ fn deliver_done(signals: &SignalStore, token: &str, stage: &str, pass: bool) {
         idem_key: token.into(),
         payload: vec![stage_verdict_marker(stage, pass)],
         payload_key_ref: None,
+        received_unix_ms: 0,
         consumed_seq: None,
     });
 }
@@ -178,6 +179,7 @@ fn deliver_approval(signals: &SignalStore, stage: &str, approve: bool) {
         idem_key: format!("approval:{stage}"),
         payload,
         payload_key_ref: None,
+        received_unix_ms: 0,
         consumed_seq: None,
     });
 }
