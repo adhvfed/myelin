@@ -2,13 +2,15 @@
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
-use myelin_events::{HandlerTx, MonotonicMinter};
+use myelin_events::{ConsumerName, DedupLedger, DurableDedup, EventId, HandlerTx, MonotonicMinter};
 use myelin_flow::{
     migrations::migrations, DurableExecutor, ExecutorError, PgFlowExecutor, RunId, SignalOutcome,
     SignalSpec, StartSpec,
 };
 use myelin_refs::ArtifactRef;
-use myelin_storage::{HotTables, PgMigrator};
+use myelin_storage::{
+    events_durable::DurableDedupBacking, provider::foundation_migrations, HotTables, PgMigrator,
+};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool, Row};
 use std::sync::Arc;
@@ -77,6 +79,9 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
         .expect("create isolated probe schema");
 
     let pool = open_pinned_pool().await;
+    PgMigrator::apply(&pool, &foundation_migrations())
+        .await
+        .expect("apply shared durable consumer foundation");
     PgMigrator::apply_validated(&pool, &migrations(), &HotTables::declare(["workflow_run"]))
         .await
         .expect("apply the real flow migrations");
@@ -183,6 +188,99 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
         rolled_back_count, 0,
         "caller rollback removes workflow start"
     );
+
+    // The production consumer path owns the transaction: its durable dedup mark and the workflow
+    // start land together. A committed redelivery is deduplicated before it can create another run.
+    let ledger = DedupLedger::durable(Arc::new(DurableDedupBacking::new(
+        pool.clone(),
+        tokio::runtime::Handle::current(),
+    )) as Arc<dyn DurableDedup>);
+    let consumer = ConsumerName("flow.trigger".into());
+    let event_id = EventId("event-committed-start".into());
+    let committed_run = tokio::task::block_in_place(|| {
+        let (mut co_tx, fresh) = ledger.begin_co_commit(
+            &consumer,
+            &event_id,
+            &TenantId("acme".into()),
+            &Region("fr-par".into()),
+        );
+        assert!(fresh);
+        let run = {
+            let conn = co_tx.connection().expect("durable co-commit connection");
+            let mut handler_tx = HandlerTx::with_connection(conn);
+            let run = first_process
+                .start_with_id_on_conn(
+                    &mut handler_tx,
+                    start_spec("trigger:committed"),
+                    Some(RunId("run-committed".into())),
+                )
+                .expect("start on durable consumer transaction");
+            assert_eq!(
+                first_process
+                    .start_with_id_on_conn(
+                        &mut handler_tx,
+                        start_spec("trigger:committed"),
+                        Some(RunId("ignored-redelivery-id".into())),
+                    )
+                    .expect("idempotency key wins in the caller transaction"),
+                run
+            );
+            assert_eq!(
+                first_process.start_with_id_on_conn(
+                    &mut handler_tx,
+                    start_spec("trigger:colliding"),
+                    Some(run.clone()),
+                ),
+                Err(ExecutorError::RunIdConflict(run.0.clone())),
+                "caller-tx and standalone starts share run-id collision semantics"
+            );
+            run
+        };
+        co_tx
+            .commit()
+            .expect("commit dedup mark and workflow start");
+        run
+    });
+    assert_eq!(committed_run.0, "run-committed");
+    let committed_counts: (i64, i64) = (
+        sqlx::query_scalar(
+            "SELECT count(*) FROM workflow_run WHERE tenant_id='acme' AND region='fr-par' \
+             AND idem_key='trigger:committed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        sqlx::query_scalar(
+            "SELECT count(*) FROM consumer_dedup WHERE consumer='flow.trigger' \
+             AND event_id='event-committed-start'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        committed_counts,
+        (1, 1),
+        "start and dedup mark co-committed"
+    );
+    tokio::task::block_in_place(|| {
+        let (co_tx, fresh) = ledger.begin_co_commit(
+            &consumer,
+            &event_id,
+            &TenantId("acme".into()),
+            &Region("fr-par".into()),
+        );
+        assert!(!fresh, "committed delivery is durably deduplicated");
+        co_tx.rollback();
+    });
+    let after_redelivery: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM workflow_run WHERE tenant_id='acme' AND region='fr-par' \
+         AND idem_key='trigger:committed'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after_redelivery, 1);
 
     let run = tokio::task::block_in_place(|| {
         first_process

@@ -72,6 +72,100 @@ fn validate_refs(
     Ok(())
 }
 
+struct PreparedStart {
+    spec: StartSpec,
+    minted: RunId,
+    partition: i16,
+    input: String,
+    budget: Option<String>,
+    requested_id: bool,
+}
+
+async fn persist_prepared_start(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    prepared: PreparedStart,
+) -> Result<RunId, PgError> {
+    // The idempotency anchor wins before definition lookup. A replay after a deploy returns the
+    // original handle even if that definition is now draining.
+    if let Some(existing) = sqlx::query_scalar::<_, String>(
+        "SELECT run_id FROM workflow_run WHERE tenant_id = $1 AND region = $2 AND idem_key = $3",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(&prepared.spec.idem_key)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| PgError::Query(format!("find idempotent workflow start: {e}")))?
+    {
+        return Ok(RunId(existing));
+    }
+
+    // Global code registry: tenant_id/region do not apply to code-only definitions.
+    let wf_version = sqlx::query_scalar::<_, i32>(
+        "SELECT version FROM wf_definition WHERE wf_type = $1 AND status = 'active' \
+         /* global registry: tenant_id and region do not apply */ \
+         ORDER BY version DESC LIMIT 1",
+    )
+    .bind(&prepared.spec.wf_type)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| PgError::Query(format!("resolve active workflow definition: {e}")))?;
+    let Some(wf_version) = wf_version else {
+        return Err(PgError::Query(format!(
+            "unknown workflow type: {}",
+            prepared.spec.wf_type
+        )));
+    };
+
+    let inserted = sqlx::query(
+        "INSERT INTO workflow_run (tenant_id, region, run_id, wf_type, wf_version, input, state, \
+         cursor, budget, correlation_id, causation_id, caused_by, depth, partition, idem_key) \
+         VALUES ($1, $2, $3, $4, $5, CAST($6 AS jsonb), 'running', 0, CAST($7 AS jsonb), $3, \
+         NULL, NULL, 0, $8, $9) ON CONFLICT DO NOTHING",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(&prepared.minted.0)
+    .bind(&prepared.spec.wf_type)
+    .bind(wf_version)
+    .bind(&prepared.input)
+    .bind(&prepared.budget)
+    .bind(prepared.partition)
+    .bind(&prepared.spec.idem_key)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| PgError::Query(format!("insert durable workflow run: {e}")))?;
+    if inserted.rows_affected() == 1 {
+        return Ok(prepared.minted);
+    }
+
+    // A concurrent start under the same key is success and returns the winner.
+    if let Some(existing) = sqlx::query_scalar::<_, String>(
+        "SELECT run_id FROM workflow_run WHERE tenant_id = $1 AND region = $2 AND idem_key = $3",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(&prepared.spec.idem_key)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| PgError::Query(format!("resolve concurrent workflow start: {e}")))?
+    {
+        return Ok(RunId(existing));
+    }
+
+    let kind = if prepared.requested_id {
+        "provided"
+    } else {
+        "minted"
+    };
+    Err(PgError::Query(format!(
+        "{kind} run_id collision: {}",
+        prepared.minted.0
+    )))
+}
+
 /// Durable, tenant- and residency-scoped implementation of [`DurableExecutor`].
 #[derive(Clone)]
 pub struct PgFlowExecutor {
@@ -203,112 +297,16 @@ impl PgFlowExecutor {
         spec: StartSpec,
         requested_run_id: Option<RunId>,
     ) -> Result<RunId, ExecutorError> {
-        bounded("wf_type", &spec.wf_type, 128)?;
-        bounded("idem_key", &spec.idem_key, 512)?;
-        validate_refs(&spec.input, &self.tenant)?;
-        if let Some(run_id) = requested_run_id.as_ref() {
-            bounded("run_id", &run_id.0, 256)?;
-        }
+        let prepared = self.prepare_start(spec, requested_run_id)?;
         let scope_tenant = self.tenant.0.clone();
         let scope_region = self.region.0.clone();
         let tenant = scope_tenant.clone();
         let region = scope_region.clone();
-        let minted = requested_run_id
-            .clone()
-            .unwrap_or_else(|| RunId(self.minter.mint().0));
-        let partition = partition_for_run_id(&minted.0);
-        let input = serde_json::to_string(&spec.input)
-            .map_err(|e| store_error("encode workflow input refs", e))?;
-        let budget = spec
-            .budget
-            .as_ref()
-            .map(|budget| serde_json::json!({ "minor_units": budget.minor_units }).to_string());
-        let requested_id = requested_run_id.is_some();
-        let error_wf_type = spec.wf_type.clone();
-        let error_run_id = minted.0.clone();
+        let error_wf_type = prepared.spec.wf_type.clone();
+        let error_run_id = prepared.minted.0.clone();
 
         with_tenant_tx(&self.pool, &scope_tenant, &scope_region, move |conn| {
-            Box::pin(async move {
-                // The idempotency anchor wins before definition lookup. A replay after a deploy
-                // returns the original handle even if that definition is now draining.
-                if let Some(existing) = sqlx::query_scalar::<_, String>(
-                    "SELECT run_id FROM workflow_run WHERE tenant_id = $1 AND region = $2 \
-                     AND idem_key = $3",
-                )
-                .bind(&tenant)
-                .bind(&region)
-                .bind(&spec.idem_key)
-                .fetch_optional(&mut *conn)
-                .await
-                .map_err(|e| PgError::Query(format!("find idempotent workflow start: {e}")))?
-                {
-                    return Ok(RunId(existing));
-                }
-
-                // Global code registry: tenant_id/region do not apply to code-only definitions.
-                let tenant_id_not_applicable = sqlx::query_scalar::<_, i32>(
-                    "SELECT version FROM wf_definition WHERE wf_type = $1 AND status = 'active' \
-                     /* global registry: tenant_id and region do not apply */ \
-                     ORDER BY version DESC LIMIT 1",
-                );
-                let wf_version = tenant_id_not_applicable
-                    .bind(&spec.wf_type)
-                    .fetch_optional(&mut *conn)
-                    .await
-                    .map_err(|e| {
-                        PgError::Query(format!("resolve active workflow definition: {e}"))
-                    })?;
-                let Some(wf_version) = wf_version else {
-                    return Err(PgError::Query(format!(
-                        "unknown workflow type: {}",
-                        spec.wf_type
-                    )));
-                };
-
-                let inserted = sqlx::query(
-                    "INSERT INTO workflow_run (tenant_id, region, run_id, wf_type, wf_version, \
-                     input, state, cursor, budget, correlation_id, causation_id, caused_by, depth, \
-                     partition, idem_key) VALUES ($1, $2, $3, $4, $5, CAST($6 AS jsonb), \
-                     'running', 0, CAST($7 AS jsonb), $3, NULL, NULL, 0, $8, $9) \
-                     ON CONFLICT DO NOTHING",
-                )
-                .bind(&tenant)
-                .bind(&region)
-                .bind(&minted.0)
-                .bind(&spec.wf_type)
-                .bind(wf_version)
-                .bind(&input)
-                .bind(&budget)
-                .bind(partition)
-                .bind(&spec.idem_key)
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| PgError::Query(format!("insert durable workflow run: {e}")))?;
-                if inserted.rows_affected() == 1 {
-                    return Ok(minted);
-                }
-
-                // A concurrent start under the same key is success and returns the winner.
-                if let Some(existing) = sqlx::query_scalar::<_, String>(
-                    "SELECT run_id FROM workflow_run WHERE tenant_id = $1 AND region = $2 \
-                     AND idem_key = $3",
-                )
-                .bind(&tenant)
-                .bind(&region)
-                .bind(&spec.idem_key)
-                .fetch_optional(&mut *conn)
-                .await
-                .map_err(|e| PgError::Query(format!("resolve concurrent workflow start: {e}")))?
-                {
-                    return Ok(RunId(existing));
-                }
-
-                let kind = if requested_id { "provided" } else { "minted" };
-                Err(PgError::Query(format!(
-                    "{kind} run_id collision: {}",
-                    minted.0
-                )))
-            })
+            Box::pin(async move { persist_prepared_start(conn, &tenant, &region, prepared).await })
         })
         .await
         .map_err(|error| {
@@ -329,14 +327,34 @@ impl PgFlowExecutor {
         spec: StartSpec,
         requested_run_id: Option<RunId>,
     ) -> Result<RunId, ExecutorError> {
+        let prepared = self.prepare_start(spec, requested_run_id)?;
+        let error_wf_type = prepared.spec.wf_type.clone();
+        let error_run_id = prepared.minted.0.clone();
+        persist_prepared_start(conn, &self.tenant.0, &self.region.0, prepared)
+            .await
+            .map_err(|error| {
+                let text = error.to_string();
+                if text.contains("unknown workflow type:") {
+                    ExecutorError::UnknownWorkflow(error_wf_type)
+                } else if text.contains("run_id collision:") {
+                    ExecutorError::RunIdConflict(error_run_id)
+                } else {
+                    store_error("start workflow on caller transaction", error)
+                }
+            })
+    }
+
+    fn prepare_start(
+        &self,
+        spec: StartSpec,
+        requested_run_id: Option<RunId>,
+    ) -> Result<PreparedStart, ExecutorError> {
         bounded("wf_type", &spec.wf_type, 128)?;
         bounded("idem_key", &spec.idem_key, 512)?;
         validate_refs(&spec.input, &self.tenant)?;
         if let Some(run_id) = requested_run_id.as_ref() {
             bounded("run_id", &run_id.0, 256)?;
         }
-        let tenant = self.tenant.0.clone();
-        let region = self.region.0.clone();
         let minted = requested_run_id
             .clone()
             .unwrap_or_else(|| RunId(self.minter.mint().0));
@@ -348,97 +366,13 @@ impl PgFlowExecutor {
             .as_ref()
             .map(|budget| serde_json::json!({ "minor_units": budget.minor_units }).to_string());
         let requested_id = requested_run_id.is_some();
-        let error_wf_type = spec.wf_type.clone();
-        let error_run_id = minted.0.clone();
-
-        let result: Result<RunId, PgError> = async {
-            // The transaction is caller-owned but every query still carries explicit scope. The
-            // consumer runtime has already installed matching transaction-local RLS settings.
-            if let Some(existing) = sqlx::query_scalar::<_, String>(
-                "SELECT run_id FROM workflow_run WHERE tenant_id = $1 AND region = $2 \
-                 AND idem_key = $3",
-            )
-            .bind(&tenant)
-            .bind(&region)
-            .bind(&spec.idem_key)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|e| PgError::Query(format!("find idempotent workflow start: {e}")))?
-            {
-                return Ok(RunId(existing));
-            }
-
-            // Global code registry: tenant_id/region do not apply to code-only definitions.
-            let wf_version = sqlx::query_scalar::<_, i32>(
-                "SELECT version FROM wf_definition WHERE wf_type = $1 AND status = 'active' \
-                 /* global registry: tenant_id and region do not apply */ \
-                 ORDER BY version DESC LIMIT 1",
-            )
-            .bind(&spec.wf_type)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|e| PgError::Query(format!("resolve active workflow definition: {e}")))?;
-            let Some(wf_version) = wf_version else {
-                return Err(PgError::Query(format!(
-                    "unknown workflow type: {}",
-                    spec.wf_type
-                )));
-            };
-
-            let inserted = sqlx::query(
-                "INSERT INTO workflow_run (tenant_id, region, run_id, wf_type, wf_version, \
-                 input, state, cursor, budget, correlation_id, causation_id, caused_by, depth, \
-                 partition, idem_key) VALUES ($1, $2, $3, $4, $5, CAST($6 AS jsonb), \
-                 'running', 0, CAST($7 AS jsonb), $3, NULL, NULL, 0, $8, $9) \
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(&tenant)
-            .bind(&region)
-            .bind(&minted.0)
-            .bind(&spec.wf_type)
-            .bind(wf_version)
-            .bind(&input)
-            .bind(&budget)
-            .bind(partition)
-            .bind(&spec.idem_key)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| PgError::Query(format!("insert durable workflow run: {e}")))?;
-            if inserted.rows_affected() == 1 {
-                return Ok(minted);
-            }
-
-            if let Some(existing) = sqlx::query_scalar::<_, String>(
-                "SELECT run_id FROM workflow_run WHERE tenant_id = $1 AND region = $2 \
-                 AND idem_key = $3",
-            )
-            .bind(&tenant)
-            .bind(&region)
-            .bind(&spec.idem_key)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|e| PgError::Query(format!("resolve concurrent workflow start: {e}")))?
-            {
-                return Ok(RunId(existing));
-            }
-
-            let kind = if requested_id { "provided" } else { "minted" };
-            Err(PgError::Query(format!(
-                "{kind} run_id collision: {}",
-                minted.0
-            )))
-        }
-        .await;
-
-        result.map_err(|error| {
-            let text = error.to_string();
-            if text.contains("unknown workflow type:") {
-                ExecutorError::UnknownWorkflow(error_wf_type)
-            } else if text.contains("run_id collision:") {
-                ExecutorError::RunIdConflict(error_run_id)
-            } else {
-                store_error("start workflow on caller transaction", error)
-            }
+        Ok(PreparedStart {
+            spec,
+            minted,
+            partition,
+            input,
+            budget,
+            requested_id,
         })
     }
 
