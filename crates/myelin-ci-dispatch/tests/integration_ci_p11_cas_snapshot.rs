@@ -37,7 +37,6 @@ async fn cas_snapshot_round_trips_through_real_object_store_and_floating_tag_is_
 
     // A matrix definition: 2 os × 2 rust over `test`, plus a `build` it needs — 5 resolved instances.
     let def = CiDefinition {
-        contract: myelin_ci_dispatch::CiPlanContract::V1,
         on: OnTrigger::PullRequest,
         jobs: vec![
             JobDef::normal("build", PINNED_BUILD, ["build"]),
@@ -62,7 +61,7 @@ async fn cas_snapshot_round_trips_through_real_object_store_and_floating_tag_is_
             let (snap, address) = resolve_snapshot(&def, &store, &tenant)
                 .expect("a digest-pinned def resolves + writes the CAS snapshot to RustFS");
             assert_eq!(
-                snap.as_v1().unwrap().jobs.len(),
+                snap.jobs.len(),
                 5,
                 "build + (2 os × 2 rust) = 5 resolved instances"
             );
@@ -93,7 +92,6 @@ async fn cas_snapshot_round_trips_through_real_object_store_and_floating_tag_is_
     // digest-pin check runs in resolve_snapshot prior to the `put`). 0 un-digested references reach a
     // snapshot, even with the real store underneath.
     let floating = CiDefinition {
-        contract: myelin_ci_dispatch::CiPlanContract::V1,
         on: OnTrigger::Push,
         jobs: vec![JobDef::normal("build", "alpine:3", ["build"])],
     };

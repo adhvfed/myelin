@@ -72,7 +72,10 @@ pub mod dispatch;
 pub mod migrations;
 pub mod resolve;
 
-pub use config::{parse_ci_config, CiConfigError, ConfigFormat};
+pub use config::{
+    parse_ci_config, parse_versioned_ci_config, CiConfigError, ConfigFormat,
+    VersionedCiConfigError,
+};
 
 pub use consumer::{
     build_trigger_consumer, ci_run_insert_from_armed, plan_dispatch, resolve_ci_config, ArmedRun,
@@ -87,10 +90,11 @@ pub use dispatch::{
 };
 
 pub use resolve::{
-    reserve_and_start, resolve_snapshot, snapshot_ref, CheckContext, CiDefinition, CiPlanContract,
-    CiRunWrite, JobDef, JobKind, ResolveError, ResolvedJob, ResolvedJobV1, ResolvedJobV2,
-    ResolvedRunPlanV1, ResolvedRunPlanV2, ResolvedSnapshot, ResolvedSnapshotExt, RunFacts,
-    StartHandoff, StartSpec, CI_PIPELINE_WF_TYPE,
+    reserve_and_start, resolve_snapshot, resolve_versioned_snapshot, snapshot_ref, CheckContext,
+    CiDefinition, CiPlanContract, CiRunWrite, JobDef, JobKind, ResolveError, ResolvedJob,
+    ResolvedJobV1, ResolvedJobV2, ResolvedRunPlanV1, ResolvedRunPlanV2, ResolvedSnapshot,
+    ResolvedSnapshotExt, RunFacts, StartHandoff, StartSpec, VersionedCiDefinition,
+    VersionedResolvedSnapshot, CI_PIPELINE_WF_TYPE,
 };
 
 use myelin_substrate::{

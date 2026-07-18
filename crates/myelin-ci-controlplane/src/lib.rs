@@ -142,9 +142,9 @@ pub mod ci_run_store;
 /// jobs or flatten the dependency DAG into a sequential workflow.
 pub mod run_plan;
 pub use run_plan::{
-    decode_resolved_run_plan, load_resolved_run_plan, CiExecutionProfileV1,
-    CiExecutionRequestV1, PreparedRunPlan, RedispatchReason, ResolvedJobV1, ResolvedJobV2,
-    ResolvedRunPlanV1, ResolvedRunPlanV2, RunPlanError, VersionedResolvedRunPlan,
+    decode_resolved_run_plan, derive_concrete_job_name, load_resolved_run_plan,
+    CiExecutionProfileV1, CiExecutionRequestV1, PreparedRunPlan, RedispatchReason, ResolvedJobV1,
+    ResolvedJobV2, ResolvedRunPlanV1, ResolvedRunPlanV2, RunPlanError, VersionedResolvedRunPlan,
     EXECUTION_REQUEST_SCHEMA_V1, LAUNCH_REQUEST_DIGEST_V1_DOMAIN, RUN_PLAN_SCHEMA_V1,
     RUN_PLAN_SCHEMA_V2,
 };

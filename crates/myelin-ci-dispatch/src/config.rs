@@ -62,10 +62,11 @@
 
 use std::collections::BTreeMap;
 
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use crate::dispatch::OnTrigger;
-use crate::resolve::{CiDefinition, JobDef, JobKind};
+use crate::resolve::{CiDefinition, CiPlanContract, JobDef, JobKind, VersionedCiDefinition};
 
 pub const MAX_CI_CONFIG_BYTES: usize = 1024 * 1024;
 pub const MAX_AUTHORED_JOBS: usize = 256;
@@ -194,9 +195,6 @@ pub enum CiConfigError {
     InvalidImage { job: String },
     InvalidCommand { job: String, detail: String },
     TooManyMatrixAxes { job: String, actual: usize, maximum: usize },
-    PartialExecutionContract,
-    UnsupportedSchemaVersion { version: u32 },
-    UnsupportedExecutionProfile { profile: String },
 }
 
 impl std::fmt::Display for CiConfigError {
@@ -247,14 +245,55 @@ impl std::fmt::Display for CiConfigError {
             CiConfigError::InvalidImage { job } => write!(f, "job `{job}` image reference is empty or overlong"),
             CiConfigError::InvalidCommand { job, detail } => write!(f, "job `{job}` command is invalid: {detail}"),
             CiConfigError::TooManyMatrixAxes { job, actual, maximum } => write!(f, "job `{job}` declares {actual} matrix axes, above the {maximum}-axis limit"),
-            CiConfigError::PartialExecutionContract => write!(f, "version-2 CI execution requests require both `schema_version = 2` and `[execution] profile = \"linux-small-v1\"`; legacy version 1 must omit both fields"),
-            CiConfigError::UnsupportedSchemaVersion { version } => write!(f, "unsupported authored CI schema version `{version}` — omit it for legacy version 1 or use schema version 2"),
-            CiConfigError::UnsupportedExecutionProfile { profile } => write!(f, "unsupported CI execution profile `{profile}` — the first version-2 contract supports only `linux-small-v1`"),
         }
     }
 }
 
 impl std::error::Error for CiConfigError {}
+
+/// Typed refusals added by the parallel versioned authored-config API.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VersionedCiConfigError {
+    /// A refusal inherited unchanged from the legacy authored-config schema.
+    Legacy(CiConfigError),
+    /// Exactly one side of the schema-version/execution-profile pair was present.
+    PartialExecutionContract,
+    /// The authored top-level schema version is not supported.
+    UnsupportedSchemaVersion { version: u32 },
+    /// The authored execution profile is not supported.
+    UnsupportedExecutionProfile { profile: String },
+}
+
+impl std::fmt::Display for VersionedCiConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Legacy(error) => error.fmt(f),
+            Self::PartialExecutionContract => write!(f, "version-2 CI execution requests require both `schema_version = 2` and `[execution] profile = \"linux-small-v1\"`; legacy version 1 must omit both fields"),
+            Self::UnsupportedSchemaVersion { version } => write!(f, "unsupported authored CI schema version `{version}` — omit it for legacy version 1 or use schema version 2"),
+            Self::UnsupportedExecutionProfile { profile } => write!(f, "unsupported CI execution profile `{profile}` — the first version-2 contract supports only `linux-small-v1`"),
+        }
+    }
+}
+
+impl std::error::Error for VersionedCiConfigError {}
+
+impl From<CiConfigError> for VersionedCiConfigError {
+    fn from(error: CiConfigError) -> Self {
+        Self::Legacy(error)
+    }
+}
+
+impl VersionedCiConfigError {
+    pub(crate) fn into_legacy_surface(self) -> CiConfigError {
+        match self {
+            Self::Legacy(error) => error,
+            error => CiConfigError::Syntax {
+                format: "versioned",
+                message: error.to_string(),
+            },
+        }
+    }
+}
 
 // =================================================================================================
 // 3. The authored DTO (the serde surface — fail-closed on unknown fields).
@@ -267,6 +306,16 @@ impl std::error::Error for CiConfigError {}
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuthoredCi {
+    /// The armed trigger token (`push`/`pull_request`/`issue`/`manual`/`schedule`/`agent`) — maps
+    /// to an [`OnTrigger`], which compiles to the ONE `QueryAst` (arch 02 §7.4, NOT CEL).
+    on: String,
+    /// The jobs (the DAG). Required + must be non-empty (validated after deserialisation).
+    jobs: Vec<AuthoredJob>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionedAuthoredCi {
     #[serde(default)]
     schema_version: Option<u32>,
     #[serde(default)]
@@ -345,26 +394,6 @@ impl AuthoredCi {
     /// are the resolver's — NOT duplicated here.
     fn into_definition(self) -> Result<CiDefinition, CiConfigError> {
         let on = parse_trigger(&self.on)?;
-        let contract = match (self.schema_version, self.execution) {
-            (None, None) => crate::resolve::CiPlanContract::V1,
-            (Some(2), Some(execution)) => {
-                let Some(profile_name) = execution.profile else {
-                    return Err(CiConfigError::PartialExecutionContract);
-                };
-                let profile = match profile_name.as_str() {
-                    "linux-small-v1" => myelin_ci_controlplane::CiExecutionProfileV1::LinuxSmallV1,
-                    _ => return Err(CiConfigError::UnsupportedExecutionProfile { profile: profile_name }),
-                };
-                crate::resolve::CiPlanContract::V2(myelin_ci_controlplane::CiExecutionRequestV1 {
-                    schema_version: myelin_ci_controlplane::EXECUTION_REQUEST_SCHEMA_V1,
-                    profile,
-                })
-            }
-            (Some(version), _) if version != 2 => {
-                return Err(CiConfigError::UnsupportedSchemaVersion { version })
-            }
-            _ => return Err(CiConfigError::PartialExecutionContract),
-        };
 
         if self.jobs.is_empty() {
             return Err(CiConfigError::EmptyJobs);
@@ -433,7 +462,40 @@ impl AuthoredCi {
             });
         }
 
-        Ok(CiDefinition { contract, on, jobs })
+        Ok(CiDefinition { on, jobs })
+    }
+}
+
+impl VersionedAuthoredCi {
+    fn into_definition(self) -> Result<VersionedCiDefinition, VersionedCiConfigError> {
+        let contract = match (self.schema_version, self.execution) {
+            (None, None) => CiPlanContract::V1,
+            (Some(2), Some(execution)) => {
+                let Some(profile_name) = execution.profile else {
+                    return Err(VersionedCiConfigError::PartialExecutionContract);
+                };
+                let profile = match profile_name.as_str() {
+                    "linux-small-v1" => myelin_ci_controlplane::CiExecutionProfileV1::LinuxSmallV1,
+                    _ => return Err(VersionedCiConfigError::UnsupportedExecutionProfile { profile: profile_name }),
+                };
+                CiPlanContract::V2(myelin_ci_controlplane::CiExecutionRequestV1 {
+                    schema_version: myelin_ci_controlplane::EXECUTION_REQUEST_SCHEMA_V1,
+                    profile,
+                })
+            }
+            (Some(version), _) if version != 2 => {
+                return Err(VersionedCiConfigError::UnsupportedSchemaVersion { version })
+            }
+            _ => return Err(VersionedCiConfigError::PartialExecutionContract),
+        };
+        let definition = AuthoredCi { on: self.on, jobs: self.jobs }
+            .into_definition()
+            .map_err(VersionedCiConfigError::Legacy)?;
+        Ok(VersionedCiDefinition {
+            contract,
+            on: definition.on,
+            jobs: definition.jobs,
+        })
     }
 }
 
@@ -499,6 +561,24 @@ pub fn parse_ci_config(
     bytes: &[u8],
     filename_or_format: &str,
 ) -> Result<CiDefinition, CiConfigError> {
+    let authored: AuthoredCi = deserialize_ci_config(bytes, filename_or_format)?;
+    authored.into_definition()
+}
+
+/// Parse either the legacy V1 document or the exact authored V2 execution-request contract.
+pub fn parse_versioned_ci_config(
+    bytes: &[u8],
+    filename_or_format: &str,
+) -> Result<VersionedCiDefinition, VersionedCiConfigError> {
+    let authored: VersionedAuthoredCi =
+        deserialize_ci_config(bytes, filename_or_format).map_err(VersionedCiConfigError::Legacy)?;
+    authored.into_definition()
+}
+
+fn deserialize_ci_config<T: DeserializeOwned>(
+    bytes: &[u8],
+    filename_or_format: &str,
+) -> Result<T, CiConfigError> {
     if bytes.len() > MAX_CI_CONFIG_BYTES {
         return Err(CiConfigError::ConfigTooLarge { actual: bytes.len(), maximum: MAX_CI_CONFIG_BYTES });
     }
@@ -513,22 +593,23 @@ pub fn parse_ci_config(
         message: format!("not valid UTF-8: {e}"),
     })?;
 
-    let authored: AuthoredCi = match format {
+    Ok(match format {
         ConfigFormat::Toml => {
             toml::from_str(text).map_err(|e| classify_de_error("toml", e.to_string()))?
         }
         ConfigFormat::Json => {
             serde_json::from_str(text).map_err(|e| classify_de_error("json", e.to_string()))?
         }
-    };
-
-    authored.into_definition()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolve::{resolve_snapshot, CiPlanContract, ResolveError, ResolvedSnapshot, ResolvedSnapshotExt};
+    use crate::resolve::{
+        resolve_snapshot, resolve_versioned_snapshot, CiPlanContract, ResolveError,
+        ResolvedSnapshot, ResolvedSnapshotExt, VersionedCiDefinition,
+    };
     use myelin_storage::{BlobStore, ContentHash, FsBlobStore};
     use myelin_tenancy::TenantId;
 
@@ -631,12 +712,23 @@ command = ["build"]
 "#);
         let json = format!(r#"{{"schema_version":2,"execution":{{"profile":"linux-small-v1"}},"on":"push","jobs":[{{"name":"build","image":"{PINNED_BUILD}","command":["build"]}}]}}"#);
         for (bytes, hint) in [(toml.as_bytes(), ".myelin/ci.toml"), (json.as_bytes(), ".myelin/ci.json")] {
-            let def = parse_ci_config(bytes, hint).expect("valid V2 request");
+            let def = parse_versioned_ci_config(bytes, hint).expect("valid V2 request");
             assert_eq!(def.contract, CiPlanContract::V2(myelin_ci_controlplane::CiExecutionRequestV1 {
                 schema_version: myelin_ci_controlplane::EXECUTION_REQUEST_SCHEMA_V1,
                 profile: myelin_ci_controlplane::CiExecutionProfileV1::LinuxSmallV1,
             }));
+            assert!(matches!(
+                parse_ci_config(bytes, hint),
+                Err(CiConfigError::UnknownField { .. })
+            ));
         }
+        assert_eq!(
+            parse_versioned_ci_config(VALID_TOML.as_bytes(), "toml").unwrap(),
+            VersionedCiDefinition::v1(
+                OnTrigger::Push,
+                parse_ci_config(VALID_TOML.as_bytes(), "toml").unwrap().jobs,
+            )
+        );
     }
 
     #[test]
@@ -646,16 +738,16 @@ command = ["build"]
             "on=\"push\"\njobs=[]\n[execution]\nprofile=\"linux-small-v1\"\n",
             "schema_version=2\non=\"push\"\njobs=[]\n[execution]\n",
         ] {
-            assert_eq!(parse_ci_config(authored.as_bytes(), "toml"), Err(CiConfigError::PartialExecutionContract));
+            assert_eq!(parse_versioned_ci_config(authored.as_bytes(), "toml"), Err(VersionedCiConfigError::PartialExecutionContract));
         }
         assert_eq!(
-            parse_ci_config(b"schema_version=9\non=\"push\"\njobs=[]\n", "toml"),
-            Err(CiConfigError::UnsupportedSchemaVersion { version: 9 })
+            parse_versioned_ci_config(b"schema_version=9\non=\"push\"\njobs=[]\n", "toml"),
+            Err(VersionedCiConfigError::UnsupportedSchemaVersion { version: 9 })
         );
         let profile = "schema_version=2\non=\"push\"\njobs=[]\n[execution]\nprofile=\"gpu-large\"\n";
-        assert_eq!(parse_ci_config(profile.as_bytes(), "toml"), Err(CiConfigError::UnsupportedExecutionProfile { profile: "gpu-large".into() }));
+        assert_eq!(parse_versioned_ci_config(profile.as_bytes(), "toml"), Err(VersionedCiConfigError::UnsupportedExecutionProfile { profile: "gpu-large".into() }));
         let unknown = r#"{"schema_version":2,"execution":{"profile":"linux-small-v1","egress":true},"on":"push","jobs":[]}"#;
-        assert!(matches!(parse_ci_config(unknown.as_bytes(), "json"), Err(CiConfigError::UnknownField { .. })));
+        assert!(matches!(parse_versioned_ci_config(unknown.as_bytes(), "json"), Err(VersionedCiConfigError::Legacy(CiConfigError::UnknownField { .. }))));
     }
 
     // -------- 2. Fail-closed cases — each asserts the SPECIFIC CiConfigError --------
@@ -867,16 +959,25 @@ os = []
         let store = FsBlobStore::new();
         let (snap, addr): (ResolvedSnapshot, ContentHash) =
             resolve_snapshot(&def, &store, &tenant()).expect("the parsed def resolves");
+        let versioned = parse_versioned_ci_config(VALID_TOML.as_bytes(), ".myelin/ci.toml")
+            .expect("the same legacy document parses through the production versioned path");
+        let (versioned_snap, versioned_addr) =
+            resolve_versioned_snapshot(&versioned, &store, &tenant()).unwrap();
+        assert_eq!(
+            versioned_snap,
+            myelin_ci_controlplane::VersionedResolvedRunPlan::V1(snap.clone())
+        );
+        assert_eq!(versioned_addr, addr, "legacy bytes and CAS address stay exact");
 
         // build (1) + test 2×2 matrix (4) + gen-matrix (1) = 6 resolved instances.
-        assert_eq!(snap.as_v1().unwrap().jobs.len(), 6, "1 build + 4 test-matrix + 1 generator");
+        assert_eq!(snap.jobs.len(), 6, "1 build + 4 test-matrix + 1 generator");
         // The generator floor rides through the parser → resolver seam.
         assert!(!snap.has_dynamic_generation());
         // The CAS blob round-trips at the returned address (content-addressed by construction).
         assert_eq!(addr, ContentHash::blake3(&snap.canonical_bytes().unwrap()));
 
         // The matrix expanded deterministically (sorted-axis instance names).
-        let names: Vec<&str> = snap.as_v1().unwrap().jobs.iter().map(|j| j.name.as_str()).collect();
+        let names: Vec<&str> = snap.jobs.iter().map(|j| j.name.as_str()).collect();
         assert_eq!(names.iter().filter(|name| name.starts_with("test--")).count(), 4);
     }
 
@@ -896,10 +997,10 @@ command = ["test"]
 [jobs.matrix]
 os = ["linux", "macos"]
 "#);
-        let definition = parse_ci_config(toml.as_bytes(), "toml").unwrap();
+        let definition = parse_versioned_ci_config(toml.as_bytes(), "toml").unwrap();
         let store = FsBlobStore::new();
-        let (first, first_hash) = resolve_snapshot(&definition, &store, &tenant()).unwrap();
-        let (second, second_hash) = resolve_snapshot(&definition, &store, &tenant()).unwrap();
+        let (first, first_hash) = resolve_versioned_snapshot(&definition, &store, &tenant()).unwrap();
+        let (second, second_hash) = resolve_versioned_snapshot(&definition, &store, &tenant()).unwrap();
         assert_eq!(first, second);
         assert_eq!(first_hash, second_hash);
         let plan = first.as_v2().expect("V2 snapshot");
@@ -914,7 +1015,7 @@ os = ["linux", "macos"]
 
     #[test]
     fn v2_generator_request_is_refused_before_cas_write() {
-        let definition = CiDefinition::v2(
+        let definition = VersionedCiDefinition::v2(
             OnTrigger::Push,
             myelin_ci_controlplane::CiExecutionRequestV1 {
                 schema_version: myelin_ci_controlplane::EXECUTION_REQUEST_SCHEMA_V1,
@@ -923,7 +1024,7 @@ os = ["linux", "macos"]
             vec![JobDef::normal("generate", PINNED_BUILD, ["generate"]).as_generator()],
         );
         assert!(matches!(
-            resolve_snapshot(&definition, &FsBlobStore::new(), &tenant()),
+            resolve_versioned_snapshot(&definition, &FsBlobStore::new(), &tenant()),
             Err(ResolveError::InvalidPlan(detail)) if detail.contains("fragment ingestion")
         ));
     }

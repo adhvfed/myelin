@@ -119,13 +119,15 @@ fn valid_plan_v2() -> ResolvedRunPlanV2 {
     let mut test = job("test--os-linux");
     test.needs.push("build".into());
     test.matrix_key.insert("os".into(), "linux".into());
+    let mut test = convert("test", test);
+    test.name = derive_concrete_job_name(&test.stage, &test.matrix_key);
     ResolvedRunPlanV2 {
         schema_version: RUN_PLAN_SCHEMA_V2,
         execution: CiExecutionRequestV1 {
             schema_version: EXECUTION_REQUEST_SCHEMA_V1,
             profile: CiExecutionProfileV1::LinuxSmallV1,
         },
-        jobs: vec![build, convert("test", test)],
+        jobs: vec![build, test],
     }
 }
 
@@ -225,7 +227,7 @@ fn version_two_canonical_wire_and_launch_request_digest_are_pinned() {
     let expected = concat!(
         "{\"schema_version\":2,\"execution\":{\"schema_version\":1,\"profile\":\"linux-small-v1\"},\"jobs\":[",
         "{\"stage\":\"build\",\"name\":\"build\",\"image\":\"registry.example/build@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"command\":[\"/bin/test\",\"--locked\"],\"needs\":[],\"is_generator\":false,\"matrix_key\":{}},",
-        "{\"stage\":\"test\",\"name\":\"test--os-linux\",\"image\":\"registry.example/build@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"command\":[\"/bin/test\",\"--locked\"],\"needs\":[\"build\"],\"is_generator\":false,\"matrix_key\":{\"os\":\"linux\"}}]}"
+        "{\"stage\":\"test\",\"name\":\"test--f1a421a6c2c1159fe7bb9c489237a217bfe1d6d2a45f35b5c67d21730c69b358\",\"image\":\"registry.example/build@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"command\":[\"/bin/test\",\"--locked\"],\"needs\":[\"build\"],\"is_generator\":false,\"matrix_key\":{\"os\":\"linux\"}}]}"
     );
     assert_eq!(bytes, expected.as_bytes());
     assert_eq!(
@@ -234,7 +236,28 @@ fn version_two_canonical_wire_and_launch_request_digest_are_pinned() {
     );
     assert_eq!(
         plan.launch_request_digest_v1().expect("request digest"),
-        "blake3:07a06867c66a3396296e6524af5572a55b22ce1c1433e4630961aac707e708b6"
+        "blake3:e41fa8f911b554840fd4b3abe85833295869529566da294839c52bd21171610e"
+    );
+}
+
+#[test]
+fn concrete_job_name_derivation_is_pinned_and_binds_stage_and_matrix() {
+    assert_eq!(derive_concrete_job_name("build", &BTreeMap::new()), "build");
+    let matrix = BTreeMap::from([("os".into(), "linux".into())]);
+    assert_eq!(
+        derive_concrete_job_name("test", &matrix),
+        "test--f1a421a6c2c1159fe7bb9c489237a217bfe1d6d2a45f35b5c67d21730c69b358"
+    );
+    assert_ne!(
+        derive_concrete_job_name("test", &matrix),
+        derive_concrete_job_name("tests", &matrix)
+    );
+    assert_ne!(
+        derive_concrete_job_name("test", &matrix),
+        derive_concrete_job_name(
+            "test",
+            &BTreeMap::from([("os".into(), "macos".into())])
+        )
     );
 }
 
@@ -252,6 +275,31 @@ fn version_two_stage_and_static_dag_rules_are_fail_closed() {
     assert!(matches!(
         generator.canonical_bytes(),
         Err(RunPlanError::InvalidPlan { detail }) if detail.contains("fragment ingestion")
+    ));
+
+    let mut forged_name = valid_plan_v2();
+    forged_name.jobs.last_mut().unwrap().name = "test".into();
+    let mut forged_stage = valid_plan_v2();
+    forged_stage.jobs.last_mut().unwrap().stage = "tests".into();
+    let mut forged_matrix = valid_plan_v2();
+    forged_matrix
+        .jobs
+        .last_mut()
+        .unwrap()
+        .matrix_key
+        .insert("os".into(), "macos".into());
+    for mismatch in [forged_name, forged_stage, forged_matrix] {
+        assert!(matches!(
+            mismatch.canonical_bytes(),
+            Err(RunPlanError::InvalidPlan { detail }) if detail.contains("does not match stage")
+        ));
+    }
+
+    let mut empty_matrix_mismatch = valid_plan_v2();
+    empty_matrix_mismatch.jobs[0].name = "build--forged".into();
+    assert!(matches!(
+        empty_matrix_mismatch.canonical_bytes(),
+        Err(RunPlanError::InvalidPlan { detail }) if detail.contains("does not match stage")
     ));
 
     let unknown = valid_plan_v2().canonical_bytes().unwrap();
