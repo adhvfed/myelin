@@ -459,9 +459,29 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
 | R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | CT-004 grounding scout running |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
-| R4.4 | Finding-burndown in Myelin's own tracker (needs minimal issues subsystem; until then findings land in this ledger) | QUEUED |
+| R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **IN PROGRESS — durable store floor only** (`18362f1`, `7a3068b`); production edge/CLI remain intentionally unmounted pending atomic ReBAC tuple bootstrap |
 
 R4 exit gate: 4 consecutive weeks where the founder never needed GitHub for daily work.
+
+**R4.4 durable-store increment (2026-07-18; not the product-surface exit).** Issues now has a real
+`PgIssueStore` whose create/list/view/close operations take scope only from a verified principal, run
+through transaction-local `(tenant,region)` GUCs + FORCE RLS, bind every value, require an injected
+non-permissive object-authorizer, bound keyset pages to 100, encrypt titles under the creator's
+per-subject DEK, and make close durable + idempotent. The live PostgreSQL proof creates two tenants
+through the runtime app role, shows cross-tenant view/close/list stay invisible even with a deliberately
+permissive test authorizer, checks ciphertext-at-rest, and verifies close does not double-bump version.
+The formerly model-only migrations are now production-applicable: concurrent indexes run as standalone
+steps, the invalid expression primary key is a generated-column key, the shared `consumer_dedup` DDL is
+byte-identical to the foundation table, and the Issues main invokes the real provider migrator.
+
+**Honest R4.4 stop:** no `/v1/issues` route or CLI command is registered yet. A create must co-commit (or
+compensate with a proven transaction seam) the new issue row and its `issue#parent_project` ReBAC tuple;
+Identity currently owns that tuple transaction and exposes no connection-bound atomic bootstrap. Mounting
+the route now would create either an orphan row or an authorization bypass, so the surface stays closed.
+The live proof also reconfirmed the platform-wide migrate-as-owner/serve-as-app gap: `myelin_app` cannot
+create the migration ledger on a fresh database. Production roots need one shared split-credential boot
+convention; an Issues-only migration credential was not invented here. R4.4 remains open until those
+seams land and authenticated create/list/view/close are exercised through the real edge + CLI.
 
 **R4.1 dogfood findings (2026-07-16, drove the REAL edge binary end-to-end — the first act no test covered).**
 Boot + bootstrap + repo-create all worked first try (edge up on :8080, `token_login_enabled:true` served,
