@@ -580,7 +580,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             .provider
             .with_tenant_tx(&tenant_id.clone(), move |conn| {
                 Box::pin(async move {
-                    let locked = sqlx::query(&format!(
+                    let locked_sql = format!(
                         "SELECT b.state AS authz_state, b.zookie AS authz_zookie, \
                                 b.issue_object, b.project_userset, b.relation, b.created_event_id, \
                                 o.envelope AS request_envelope, {columns} \
@@ -592,18 +592,20 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                            AND i.tenant_id = $1 AND i.region = $2 \
                          FOR UPDATE OF b, i",
                         columns = SELECT_COLUMNS_QUALIFIED
-                    ))
-                    .bind(&tenant_id)
-                    .bind(&region)
-                    .bind(id)
-                    .fetch_optional(&mut *conn)
-                    .await
-                    .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?
-                    .ok_or_else(|| {
-                        myelin_storage::PgError::Query(
-                            "authorization binding disappeared before activation".into(),
-                        )
-                    })?;
+                    );
+                    let tenant_id_locked_query = sqlx::query(&locked_sql);
+                    let locked = tenant_id_locked_query
+                        .bind(&tenant_id)
+                        .bind(&region)
+                        .bind(id)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?
+                        .ok_or_else(|| {
+                            myelin_storage::PgError::Query(
+                                "authorization binding disappeared before activation".into(),
+                            )
+                        })?;
 
                     let state: String = locked.get("authz_state");
                     if state == "active" {
@@ -834,7 +836,9 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     let result = match visible {
                         QueryVisibility::None => unreachable!("handled before the transaction"),
                         QueryVisibility::All => {
-                            sqlx::query(&format!("{} ORDER BY i.id ASC LIMIT $4", SELECT_BASE))
+                            let query_sql = format!("{} ORDER BY i.id ASC LIMIT $4", SELECT_BASE);
+                            let tenant_id_query = sqlx::query(&query_sql);
+                            tenant_id_query
                                 .bind(&tenant_id)
                                 .bind(&region)
                                 .bind(cursor)
@@ -843,17 +847,19 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                                 .await
                         }
                         QueryVisibility::Ids(ids) => {
-                            sqlx::query(&format!(
+                            let query_sql = format!(
                                 "{} AND i.id = ANY($4) ORDER BY i.id ASC LIMIT $5",
                                 SELECT_BASE
-                            ))
-                            .bind(&tenant_id)
-                            .bind(&region)
-                            .bind(cursor)
-                            .bind(ids)
-                            .bind(fetch_limit)
-                            .fetch_all(&mut *conn)
-                            .await
+                            );
+                            let tenant_id_query = sqlx::query(&query_sql);
+                            tenant_id_query
+                                .bind(&tenant_id)
+                                .bind(&region)
+                                .bind(cursor)
+                                .bind(ids)
+                                .bind(fetch_limit)
+                                .fetch_all(&mut *conn)
+                                .await
                         }
                     };
                     result.map_err(|e| myelin_storage::PgError::Query(e.to_string()))
@@ -950,19 +956,21 @@ async fn select_one(
     region: &str,
     id: Uuid,
 ) -> Result<Option<sqlx::postgres::PgRow>, sqlx::Error> {
-    sqlx::query(&format!(
+    let query_sql = format!(
         "SELECT {SELECT_COLUMNS_QUALIFIED} FROM issue i \
          JOIN issue_authz_binding b \
            ON b.tenant_id = i.tenant_id AND b.region = i.region AND b.issue_id = i.id \
               AND b.state = 'active' \
          WHERE i.tenant_id = $1 AND i.region = $2 AND b.tenant_id = $1 AND b.region = $2 \
            AND i.id = $3 AND i.deleted_at IS NULL"
-    ))
-    .bind(tenant_id)
-    .bind(region)
-    .bind(id)
-    .fetch_optional(conn)
-    .await
+    );
+    let tenant_id_query = sqlx::query(&query_sql);
+    tenant_id_query
+        .bind(tenant_id)
+        .bind(region)
+        .bind(id)
+        .fetch_optional(conn)
+        .await
 }
 
 async fn select_one_for_update(
@@ -971,19 +979,21 @@ async fn select_one_for_update(
     region: &str,
     id: Uuid,
 ) -> Result<Option<sqlx::postgres::PgRow>, sqlx::Error> {
-    sqlx::query(&format!(
+    let query_sql = format!(
         "SELECT {SELECT_COLUMNS_QUALIFIED} FROM issue i \
          JOIN issue_authz_binding b \
            ON b.tenant_id = i.tenant_id AND b.region = i.region AND b.issue_id = i.id \
               AND b.state = 'active' \
          WHERE i.tenant_id = $1 AND i.region = $2 AND b.tenant_id = $1 AND b.region = $2 \
            AND i.id = $3 AND i.deleted_at IS NULL FOR UPDATE OF i"
-    ))
-    .bind(tenant_id)
-    .bind(region)
-    .bind(id)
-    .fetch_optional(conn)
-    .await
+    );
+    let tenant_id_query = sqlx::query(&query_sql);
+    tenant_id_query
+        .bind(tenant_id)
+        .bind(region)
+        .bind(id)
+        .fetch_optional(conn)
+        .await
 }
 
 fn decode_binding(
