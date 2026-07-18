@@ -206,11 +206,24 @@ mod tests {
     #[test]
     fn the_shell_carries_the_complete_spine_and_no_consumers() {
         let spec = issues_app_spec(Config::default(), OutboxStore::new());
-        assert_eq!(
-            spec.migrations.0.len(),
-            11,
-            "all 11 spine tables are in the forward-only migration set"
-        );
+        for table in [
+            "issue",
+            "issue_relation",
+            "issue_change_log",
+            "scheme",
+            "scheme_assignment",
+            "cycle",
+            "cycle_membership",
+            "milestone",
+            "prefix_counter",
+            "consumer_dedup",
+            "outbox",
+        ] {
+            assert!(
+                spec.migrations.0.iter().any(|migration| migration.table == Some(table)),
+                "spine table `{table}` is present alongside its standalone online index/expand steps"
+            );
+        }
         assert!(
             spec.consumers.is_empty(),
             "no consumers at the shell (the rollup/SLA/trigger/feeder consumers are the per-band follow-ons)"

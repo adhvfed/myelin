@@ -82,7 +82,7 @@
 //! `tests/integration_iss_p05_spine_schema.rs` (the `integration` cargo feature); the default
 //! `cargo build`/`cargo test --workspace` stay DB-free.
 
-use myelin_events::OUTBOX_MIGRATION;
+use myelin_events::{CONSUMER_DEDUP_MIGRATION, OUTBOX_MIGRATION};
 use myelin_substrate::{HotTables, Migration, Migrations};
 
 /// The Issue-Tracker spine table names (arch 01 §2–§8). PII-free opaque identifiers. The order is
@@ -280,10 +280,13 @@ CREATE TABLE IF NOT EXISTS scheme_assignment (
   type_id    uuid,
   project_id uuid,
   team_id    uuid,
-  PRIMARY KEY (tenant_id, kind,
-    COALESCE(type_id,    '00000000-0000-0000-0000-000000000000'::uuid),
-    COALESCE(project_id, '00000000-0000-0000-0000-000000000000'::uuid),
-    COALESCE(team_id,    '00000000-0000-0000-0000-000000000000'::uuid))
+  type_key    uuid GENERATED ALWAYS AS
+                (COALESCE(type_id, '00000000-0000-0000-0000-000000000000'::uuid)) STORED,
+  project_key uuid GENERATED ALWAYS AS
+                (COALESCE(project_id, '00000000-0000-0000-0000-000000000000'::uuid)) STORED,
+  team_key    uuid GENERATED ALWAYS AS
+                (COALESCE(team_id, '00000000-0000-0000-0000-000000000000'::uuid)) STORED,
+  PRIMARY KEY (tenant_id, kind, type_key, project_key, team_key)
 )";
 
 /// `cycle` (arch 01 §5 — the TIME AXIS) — a cycle is NOT an issue (no workflow state/assignee);
@@ -347,14 +350,7 @@ CREATE TABLE IF NOT EXISTS prefix_counter (
 /// `(tenant_id, region)`-first with the `(consumer, event_id)` dedup PK. The bus consumers (rollup /
 /// SLA / trigger / feeder) dedup on this so one delivery = one effect under at-least-once redelivery.
 /// The dedup LOGIC lands with the consumer bands; the SHAPE is the platform-frozen one (no fork).
-pub const CREATE_CONSUMER_DEDUP_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS consumer_dedup (
-  tenant_id text NOT NULL,
-  region    text NOT NULL,
-  consumer  text NOT NULL,
-  event_id  text NOT NULL,
-  PRIMARY KEY (consumer, event_id)
-)";
+pub const CREATE_CONSUMER_DEDUP_DDL: &str = CONSUMER_DEDUP_MIGRATION;
 
 /// The RLS scoping DDL for an Issue-Tracker table — the platform-wide `myelin_make_tenant_scoped`
 /// convention (FORCE row-level security + the `(tenant_id, region)` isolation policy). Issues does
@@ -445,7 +441,7 @@ pub fn issues_migrations() -> Migrations {
         // The outbox is the platform cross-seam cursor (keyed on (aggregate, seq), no tenant
         // partition columns — it is drained by the relay within the cell); it is the ONE table that
         // does NOT take the tenant-scoped RLS policy. Every Issues DOMAIN table is RLS-scoped.
-        if table != OUTBOX_TABLE {
+        if table != OUTBOX_TABLE && table != CONSUMER_DEDUP_TABLE {
             ddl.push('\n');
             ddl.push_str(&make_tenant_scoped_ddl(table));
             ddl.push(';');
@@ -534,13 +530,13 @@ mod tests {
     /// **Every Issues DOMAIN table is `(tenant_id, region)`-first with a tenant-first primary key
     /// (contract 12.1 / the tenant-predicate floor) and is RLS-scoped (0 un-scoped tables).** No key
     /// path can scan across tenants — `tenant_id` is the FIRST column on every domain table (arch 01
-    /// §2 "no cross-tenant query path"). The platform `outbox` (the cross-seam cursor) is the one
-    /// non-tenant-partitioned table (it is keyed on `(aggregate, seq)`); it is explicitly excluded.
+    /// §2 "no cross-tenant query path"). The platform `outbox` and `consumer_dedup` infrastructure
+    /// tables are cell-wide bus plumbing and are explicitly excluded.
     #[test]
     fn every_domain_table_is_tenant_region_first_and_rls_scoped() {
         for (_id, table, ddl) in create_statements() {
-            if table == OUTBOX_TABLE {
-                continue; // the cross-seam cursor — not tenant-partitioned (keyed on aggregate, seq).
+            if table == OUTBOX_TABLE || table == CONSUMER_DEDUP_TABLE {
+                continue;
             }
             let tenant_pos = ddl.find("tenant_id").expect("tenant_id column");
             let region_pos = ddl.find("region").expect("region column");
@@ -548,22 +544,10 @@ mod tests {
                 tenant_pos < region_pos,
                 "tenant_id is the FIRST column (before region) on `{table}`: {ddl}"
             );
-            // The domain tables are tenant-first in the PRIMARY KEY. `consumer_dedup` is the ONE
-            // documented exception: its PK is the platform consumer template's exactly-once
-            // `(consumer, event_id)` dedup key (contract 2.5) — `tenant_id`/`region` still LEAD the
-            // row (the partition prefix + the RLS isolation columns), but the PK is the dedup anchor,
-            // not a re-invented tenant-first key (the same shape `myelin-ci-dispatch` carries).
-            if table == CONSUMER_DEDUP_TABLE {
-                assert!(
-                    ddl.contains("PRIMARY KEY (consumer, event_id)"),
-                    "consumer_dedup's PK is the platform (consumer, event_id) dedup key: {ddl}"
-                );
-            } else {
-                assert!(
-                    ddl.contains("PRIMARY KEY (tenant_id"),
-                    "the primary key is tenant-first on `{table}`: {ddl}"
-                );
-            }
+            assert!(
+                ddl.contains("PRIMARY KEY (tenant_id"),
+                "the primary key is tenant-first on `{table}`: {ddl}"
+            );
         }
         // The RLS scoping rides every domain TABLE-CREATE migration (and NOT the outbox). Index and
         // nullable-column expand steps operate on a table whose RLS policy is already installed.
@@ -574,10 +558,10 @@ mod tests {
             .iter()
             .filter(|m| create_ids.contains(m.id))
         {
-            if m.table == Some(OUTBOX_TABLE) {
+            if m.table == Some(OUTBOX_TABLE) || m.table == Some(CONSUMER_DEDUP_TABLE) {
                 assert!(
                     !m.ddl.contains("myelin_make_tenant_scoped"),
-                    "the cross-seam outbox is not tenant-scoped (it is the cell-wide relay cursor)"
+                    "cell-wide bus plumbing is not given an Issues-local RLS policy"
                 );
             } else {
                 assert!(
@@ -838,11 +822,12 @@ mod tests {
     }
 
     /// **The `consumer_dedup` ledger is the platform exactly-once shape (contract 2.5).**
-    /// `(tenant_id, region)`-first with the `(consumer, event_id)` dedup PK — the platform consumer
-    /// template's idempotency anchor (the bus consumers dedup on it). One shape, no fork (EI-01 §7).
+    /// It is byte-identical to the shared event-bus DDL and may already exist from foundation boot;
+    /// Issues never forks or attempts to retrofit its own RLS columns onto that table.
     #[test]
     fn the_consumer_dedup_ledger_is_the_platform_2_5_shape() {
-        for col in ["tenant_id", "region", "consumer", "event_id"] {
+        assert_eq!(CREATE_CONSUMER_DEDUP_DDL, CONSUMER_DEDUP_MIGRATION);
+        for col in ["consumer", "event_id", "recorded_at"] {
             assert!(
                 CREATE_CONSUMER_DEDUP_DDL.contains(col),
                 "the 2.5 column `{col}` is declared"

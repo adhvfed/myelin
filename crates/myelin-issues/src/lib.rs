@@ -292,6 +292,7 @@ pub mod migrations;
 pub mod move_crdt;
 pub mod my_work;
 pub mod olap_feed;
+pub mod pg_issue_store;
 pub mod planner;
 pub mod projection_feeder;
 pub mod pseudonym;
@@ -338,6 +339,10 @@ pub use migrations::{
     ISSUE_CHANGE_LOG_TABLE, ISSUE_CYCLE_INDEX, ISSUE_PARENT_INDEX, ISSUE_PROPS_GIN_INDEX,
     ISSUE_RELATION_TABLE, ISSUE_ROADMAP_INDEX, ISSUE_TABLE, MILESTONE_TABLE, OUTBOX_TABLE,
     PREFIX_COUNTER_TABLE, SCHEME_ASSIGNMENT_TABLE, SCHEME_TABLE,
+};
+pub use pg_issue_store::{
+    CreateIssue, IssueAuthorizer, IssuePage, IssuePageRequest, IssuePermission, IssueStoreError,
+    PgIssueStore, StoredIssue, VisibleIssues,
 };
 
 // ISS-P06 (P-372, M4): the silent-data-loss-safe write path. `apply_mutation` runs validate →
