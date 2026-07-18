@@ -40,9 +40,10 @@ use myelin_substrate::Config;
 use std::fmt;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum StartupRefusal {
     IncompleteProductionRunner,
+    InvalidRunnerSetting(String),
 }
 
 impl fmt::Display for StartupRefusal {
@@ -53,6 +54,10 @@ impl fmt::Display for StartupRefusal {
                 "MYELIN_CI_RUNNER=1 requires a real durable CostLedger reserve/settle authority \
                  and live per-run-token verification; production runner activation is refused"
             ),
+            Self::InvalidRunnerSetting(value) => write!(
+                f,
+                "invalid MYELIN_CI_RUNNER value {value:?}; allowed values are `0`, `1`, or unset"
+            ),
         }
     }
 }
@@ -60,10 +65,10 @@ impl fmt::Display for StartupRefusal {
 impl std::error::Error for StartupRefusal {}
 
 fn verify_startup_activation(runner_setting: Option<&str>) -> Result<(), StartupRefusal> {
-    if runner_setting == Some("1") {
-        Err(StartupRefusal::IncompleteProductionRunner)
-    } else {
-        Ok(())
+    match runner_setting {
+        None | Some("0") => Ok(()),
+        Some("1") => Err(StartupRefusal::IncompleteProductionRunner),
+        Some(value) => Err(StartupRefusal::InvalidRunnerSetting(value.to_owned())),
     }
 }
 
@@ -191,6 +196,10 @@ mod tests {
             Err(StartupRefusal::IncompleteProductionRunner)
         );
         assert_eq!(verify_startup_activation(None), Ok(()));
-        assert_eq!(verify_startup_activation(Some("true")), Ok(()));
+        assert_eq!(verify_startup_activation(Some("0")), Ok(()));
+        assert_eq!(
+            verify_startup_activation(Some("true")),
+            Err(StartupRefusal::InvalidRunnerSetting("true".to_owned()))
+        );
     }
 }
