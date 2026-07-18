@@ -228,7 +228,7 @@ pub fn foundation_migrations() -> Migrations {
 /// | `restore_verify_durable_migrations`| `0051`        |
 /// | `post_pit_durable_migrations`      | `0052`        |
 /// | `bus_erasure_durable_migrations`   | `0053`        |
-/// | `hitl_gate_durable_migrations`     | `0054`        |
+/// | `hitl_gate_durable_migrations`     | `0054`-`0055` |
 /// | `cell_root_durable_migrations`     | `0060`        |
 /// | `delegation_policy_durable_migrations` | `0061`–`0066` |
 /// | `authz_projection_durable_migrations` | `0067`–`0069` |

@@ -36,7 +36,7 @@
 //! `0004_create_agent_hitl_gate`) but that group was NEVER in [`crate::provider::all_durable_migrations`]
 //! (the W7.2 boot aggregate spans the storage-owned groups `0010`–`0053` only, and storage cannot
 //! depend on the agent-service crate). So nothing boot-applied the table — the declared schema was
-//! dead. [`hitl_gate_durable_migrations`] (id `0054`) is the EXECUTED boot declaration, now in
+//! dead. [`hitl_gate_durable_migrations`] (ids `0054`-`0055`) is the EXECUTED boot declaration, now in
 //! [`crate::provider::durable_migration_groups`]; the agent-service crate (which depends on this one)
 //! carries a parity test asserting its §4.4 model DDL columns are a subset of THIS boot DDL, so the
 //! two declarations cannot drift silently. The boot DDL adds two audit/enforcement columns the §4.4
@@ -48,6 +48,9 @@ use crate::rls::TenantScope;
 use myelin_identity::PrincipalKind;
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
+
+/// Default lifetime for a surfaced HITL approval window.
+pub const DEFAULT_HITL_GATE_TTL_SECS: i64 = 3600;
 
 // =================================================================================================
 // Migration 0054 — the tenant-owned (FORCE-RLS) agent_hitl_gate table (the §4.4 shape, executed).
@@ -82,17 +85,31 @@ DROP POLICY IF EXISTS myelin_tenant_isolation ON agent_hitl_gate;
 CREATE POLICY myelin_tenant_isolation ON agent_hitl_gate \
   USING (tenant_id = current_setting('myelin.tenant_id', true) \
          AND region = current_setting('myelin.region', true)) \
-  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
+              WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
               AND region = current_setting('myelin.region', true));";
 
-/// The forward-only migration set the durable HITL verdict store binds to (id `0054`, appended after
-/// the `0053` bus-erasure group). In [`crate::provider::durable_migration_groups`] → boot-applied by
+/// Forward-only expansion adding bounded approval lifetime and one-shot consumption. This is a
+/// separate migration because `0054_agent_hitl_gate` may already be recorded in production and its
+/// checksum must never be rewritten.
+pub const AGENT_HITL_GATE_LIFETIME_MIGRATION: &str = "\
+ALTER TABLE agent_hitl_gate
+  ADD COLUMN IF NOT EXISTS opened_at_unix bigint NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS decided_at_unix bigint,
+  ADD COLUMN IF NOT EXISTS expires_at_unix bigint NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS approval_consumed_at_unix bigint;";
+
+/// The forward-only migration set the durable HITL verdict store binds to (`0054` plus the
+/// forward-only lifetime/consumption extension in `0055`, appended after the `0053` bus-erasure
+/// group). In [`crate::provider::durable_migration_groups`] → boot-applied by
 /// `all_durable_migrations()` at every service main (W7.2 sequence); idempotent on re-boot.
 pub fn hitl_gate_durable_migrations() -> Migrations {
-    Migrations::of([Migration::plain(
-        "0054_agent_hitl_gate",
-        AGENT_HITL_GATE_MIGRATION,
-    )])
+    Migrations::of([
+        Migration::plain("0054_agent_hitl_gate", AGENT_HITL_GATE_MIGRATION),
+        Migration::plain(
+            "0055_agent_hitl_gate_lifetime",
+            AGENT_HITL_GATE_LIFETIME_MIGRATION,
+        ),
+    ])
 }
 
 /// **Mint an OPAQUE, unguessable gate id (R2.4 / R2.4b NIT).** 128 bits from the OS CSPRNG
@@ -195,17 +212,29 @@ pub struct GateRecord {
     pub requested_by: String,
     /// the principal that decided the gate (approve/reject); `None` while waiting or on expiry.
     pub decided_by: Option<String>,
+    /// Unix second at which the durable waiting row opened.
+    pub opened_at_unix: i64,
+    /// Unix second at which approve/reject/expiry made the row terminal.
+    pub decided_at_unix: Option<i64>,
+    /// Absolute Unix-second approval deadline. Waiting gates at or past this instant auto-expire.
+    pub expires_at_unix: i64,
+    /// Unix second at which an exact-bound approval was atomically consumed. `Some` is permanently
+    /// non-authorizing, preventing a successful re-drive from applying twice.
+    pub approval_consumed_at_unix: Option<i64>,
 }
 
 impl GateRecord {
     /// **The consult-time admission rule (the re-drive gate).** `true` IFF this gate is `Approved`,
-    /// its `effect_id` is exactly the effect being re-driven, AND the recorded approver is a
-    /// DISTINCT principal from the requester. Everything else — waiting, rejected, expired, a
-    /// different effect, a missing approver, a self-approval that somehow landed — is `false`
-    /// (fail-closed).
-    pub fn authorizes(&self, effect_id: &str, requester: &str) -> bool {
+    /// its `effect_id`, `run_id`, and original `requested_by` all exactly match the re-drive, the
+    /// recorded approver is distinct, and the approval has not already been consumed. This is an
+    /// observational pre-check only; callers must use [`HitlVerdictStore::consume_approval`] for
+    /// the atomic one-shot authorization decision.
+    pub fn authorizes(&self, effect_id: &str, run_id: &str, requester: &str) -> bool {
         self.state == GateState::Approved
             && self.effect_id == effect_id
+            && self.run_id == run_id
+            && self.requested_by == requester
+            && self.approval_consumed_at_unix.is_none()
             && matches!(self.decided_by.as_deref(), Some(d) if d != requester)
     }
 }
@@ -254,6 +283,8 @@ pub enum GateDecideError {
     /// two in-tenant machine principals could clear a gate). Refused even if the machine sits in the
     /// `approver_filter` and differs from the requester.
     MachineApproverRefused,
+    /// the durable approval window elapsed before this Human decision arrived.
+    ApprovalWindowExpired,
 }
 
 impl core::fmt::Display for GateDecideError {
@@ -275,18 +306,50 @@ impl core::fmt::Display for GateDecideError {
                 "a non-human (machine/agent/service) principal cannot approve a HITL gate — the \
                  gate structurally requires a distinct HUMAN approver"
             ),
+            GateDecideError::ApprovalWindowExpired => {
+                write!(f, "the hitl gate approval window has expired")
+            }
         }
     }
 }
 
 impl std::error::Error for GateDecideError {}
 
+/// A refusal consuming an approved gate for one effect application.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GateConsumeError {
+    NotFound,
+    NotApproved,
+    BindingMismatch,
+    AlreadyConsumed,
+    Expired,
+}
+
+impl core::fmt::Display for GateConsumeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            GateConsumeError::NotFound => write!(f, "no such hitl gate in this tenant scope"),
+            GateConsumeError::NotApproved => write!(f, "hitl gate is not approved"),
+            GateConsumeError::BindingMismatch => {
+                write!(
+                    f,
+                    "hitl approval does not belong to this effect, run, and requester"
+                )
+            }
+            GateConsumeError::AlreadyConsumed => write!(f, "hitl approval was already consumed"),
+            GateConsumeError::Expired => write!(f, "hitl approval has expired"),
+        }
+    }
+}
+
+impl std::error::Error for GateConsumeError {}
+
 // =================================================================================================
 // The role struct + backend enum (the MR-009b durable-by-default shape).
 // =================================================================================================
 
 /// **The HITL verdict store role struct.** The production arm is the pool-backed
-/// [`DurableHitlGates`] over the FORCE-RLS `agent_hitl_gate` table (migration `0054`); the
+/// [`DurableHitlGates`] over the FORCE-RLS `agent_hitl_gate` table (migrations `0054`-`0055`); the
 /// `test-support`-gated `Memory` arm is the DB-free TEST DOUBLE the unit tests + the MCP/agent
 /// test compositions use. The method surface is identical across arms — the core verdict-lookup
 /// logic is unit-testable DB-free.
@@ -321,7 +384,7 @@ impl HitlVerdictStore {
     }
 
     /// Wrap the durable PG backing as the production store (over `agent_hitl_gate`, boot-applied by
-    /// migration `0054`). **Must be called inside a tokio runtime** (the durable backing captures
+    /// migrations `0054`-`0055`). **Must be called inside a tokio runtime** (the durable backing captures
     /// `Handle::current()` for its sync→async bridge).
     pub fn with_pg(provider: crate::provider::SubstrateProvider) -> HitlVerdictStore {
         HitlVerdictStore {
@@ -357,6 +420,17 @@ impl HitlVerdictStore {
         approver: &str,
         approver_kind: PrincipalKind,
     ) -> Result<(), GateDecideError> {
+        self.approve_at(scope, gate_id, approver, approver_kind, system_unix_now())
+    }
+
+    pub fn approve_at(
+        &mut self,
+        scope: &TenantScope,
+        gate_id: &str,
+        approver: &str,
+        approver_kind: PrincipalKind,
+        decided_at_unix: i64,
+    ) -> Result<(), GateDecideError> {
         let is_human = matches!(approver_kind, PrincipalKind::Human);
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
@@ -366,6 +440,7 @@ impl HitlVerdictStore {
                 GateState::Approved,
                 Some(approver),
                 is_human,
+                decided_at_unix,
             ),
             HitlVerdictBackend::Durable(d) => d.decide(
                 scope,
@@ -373,6 +448,7 @@ impl HitlVerdictStore {
                 GateState::Approved,
                 Some(approver),
                 is_human,
+                decided_at_unix,
             ),
         }
     }
@@ -387,27 +463,116 @@ impl HitlVerdictStore {
         decider: &str,
         decider_kind: PrincipalKind,
     ) -> Result<(), GateDecideError> {
+        self.reject_at(scope, gate_id, decider, decider_kind, system_unix_now())
+    }
+
+    pub fn reject_at(
+        &mut self,
+        scope: &TenantScope,
+        gate_id: &str,
+        decider: &str,
+        decider_kind: PrincipalKind,
+        decided_at_unix: i64,
+    ) -> Result<(), GateDecideError> {
         let is_human = matches!(decider_kind, PrincipalKind::Human);
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            HitlVerdictBackend::Memory(m) => {
-                m.decide(scope, gate_id, GateState::Rejected, Some(decider), is_human)
-            }
-            HitlVerdictBackend::Durable(d) => {
-                d.decide(scope, gate_id, GateState::Rejected, Some(decider), is_human)
-            }
+            HitlVerdictBackend::Memory(m) => m.decide(
+                scope,
+                gate_id,
+                GateState::Rejected,
+                Some(decider),
+                is_human,
+                decided_at_unix,
+            ),
+            HitlVerdictBackend::Durable(d) => d.decide(
+                scope,
+                gate_id,
+                GateState::Rejected,
+                Some(decider),
+                is_human,
+                decided_at_unix,
+            ),
         }
     }
 
     /// **EXPIRE a waiting gate** (the approval window lapsed — auto-deny; `decided_by` stays NULL).
     pub fn expire(&mut self, scope: &TenantScope, gate_id: &str) -> Result<(), GateDecideError> {
+        self.expire_at(scope, gate_id, system_unix_now())
+    }
+
+    pub fn expire_at(
+        &mut self,
+        scope: &TenantScope,
+        gate_id: &str,
+        decided_at_unix: i64,
+    ) -> Result<(), GateDecideError> {
+        match &mut self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            HitlVerdictBackend::Memory(m) => m.decide(
+                scope,
+                gate_id,
+                GateState::Expired,
+                None,
+                false,
+                decided_at_unix,
+            ),
+            HitlVerdictBackend::Durable(d) => d.decide(
+                scope,
+                gate_id,
+                GateState::Expired,
+                None,
+                false,
+                decided_at_unix,
+            ),
+        }
+    }
+
+    /// Expire every waiting or approved-but-unconsumed gate whose durable deadline has elapsed,
+    /// returning the exact rows that transitioned so the caller can emit minimized audit outcomes.
+    /// A consumed approval remains immutable evidence of the one authorized attempt.
+    pub fn expire_due(&mut self, scope: &TenantScope, now_unix: i64) -> Vec<GateRecord> {
+        match &mut self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            HitlVerdictBackend::Memory(m) => m.expire_due(scope, now_unix),
+            HitlVerdictBackend::Durable(d) => d.expire_due(scope, now_unix),
+        }
+    }
+
+    /// Settle one exact gate as expired when its durable deadline has elapsed. This is the
+    /// operator-decision counterpart to [`Self::expire_due`], avoiding a stale waiting row when an
+    /// approve/reject command arrives on the deadline.
+    pub fn expire_if_due(
+        &mut self,
+        scope: &TenantScope,
+        gate_id: &str,
+        now_unix: i64,
+    ) -> Option<GateRecord> {
+        match &mut self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            HitlVerdictBackend::Memory(m) => m.expire_if_due(scope, gate_id, now_unix),
+            HitlVerdictBackend::Durable(d) => d.expire_if_due(scope, gate_id, now_unix),
+        }
+    }
+
+    /// Atomically consume one approved gate. Success is the authorization grant itself: the same
+    /// gate can never return success again, even after a process restart.
+    pub fn consume_approval(
+        &mut self,
+        scope: &TenantScope,
+        gate_id: &str,
+        effect_id: &str,
+        run_id: &str,
+        requester: &str,
+        now_unix: i64,
+    ) -> Result<(), GateConsumeError> {
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
             HitlVerdictBackend::Memory(m) => {
-                m.decide(scope, gate_id, GateState::Expired, None, false)
+                m.consume_approval(scope, gate_id, effect_id, run_id, requester, now_unix)
             }
             HitlVerdictBackend::Durable(d) => {
-                d.decide(scope, gate_id, GateState::Expired, None, false)
+                d.consume_approval(scope, gate_id, effect_id, run_id, requester, now_unix)
             }
         }
     }
@@ -478,12 +643,69 @@ impl MemoryHitlGates {
         to: GateState,
         decider: Option<&str>,
         approver_is_human: bool,
+        decided_at_unix: i64,
     ) -> Result<(), GateDecideError> {
         let key = Self::key(scope, gate_id);
         let row = self.rows.get_mut(&key).ok_or(GateDecideError::NotFound)?;
-        decide_rules(row, to, decider, approver_is_human)?;
+        decide_rules(row, to, decider, approver_is_human, decided_at_unix)?;
         row.state = to;
         row.decided_by = decider.map(str::to_string);
+        row.decided_at_unix = Some(decided_at_unix);
+        Ok(())
+    }
+
+    fn expire_due(&mut self, scope: &TenantScope, now_unix: i64) -> Vec<GateRecord> {
+        let (tenant, region) = (scope.tenant().0.as_str(), scope.region().0.as_str());
+        let mut expired = Vec::new();
+        for ((row_tenant, row_region, _), row) in &mut self.rows {
+            if row_tenant == tenant
+                && row_region == region
+                && matches!(row.state, GateState::Waiting | GateState::Approved)
+                && row.approval_consumed_at_unix.is_none()
+                && row.expires_at_unix <= now_unix
+            {
+                row.state = GateState::Expired;
+                row.decided_at_unix = Some(now_unix);
+                expired.push(row.clone());
+            }
+        }
+        expired
+    }
+
+    fn expire_if_due(
+        &mut self,
+        scope: &TenantScope,
+        gate_id: &str,
+        now_unix: i64,
+    ) -> Option<GateRecord> {
+        let row = self.rows.get_mut(&Self::key(scope, gate_id))?;
+        if matches!(row.state, GateState::Waiting | GateState::Approved)
+            && row.approval_consumed_at_unix.is_none()
+            && row.expires_at_unix <= now_unix
+        {
+            row.state = GateState::Expired;
+            row.decided_at_unix = Some(now_unix);
+            Some(row.clone())
+        } else {
+            None
+        }
+    }
+
+    fn consume_approval(
+        &mut self,
+        scope: &TenantScope,
+        gate_id: &str,
+        effect_id: &str,
+        run_id: &str,
+        requester: &str,
+        now_unix: i64,
+    ) -> Result<(), GateConsumeError> {
+        let row = self
+            .rows
+            .get_mut(&Self::key(scope, gate_id))
+            .ok_or(GateConsumeError::NotFound)?;
+        consume_rules(row, effect_id, run_id, requester, now_unix)?;
+        row.approval_consumed_at_unix = Some(now_unix);
         Ok(())
     }
 
@@ -521,11 +743,15 @@ fn decide_rules(
     to: GateState,
     decider: Option<&str>,
     approver_is_human: bool,
+    decided_at_unix: i64,
 ) -> Result<(), GateDecideError> {
     if row.state.is_terminal() {
         return Err(GateDecideError::AlreadyDecided(row.state));
     }
     if matches!(to, GateState::Approved | GateState::Rejected) {
+        if row.expires_at_unix <= decided_at_unix {
+            return Err(GateDecideError::ApprovalWindowExpired);
+        }
         let Some(approver) = decider else {
             return Err(GateDecideError::NotEligible);
         };
@@ -547,11 +773,43 @@ fn decide_rules(
     Ok(())
 }
 
+fn consume_rules(
+    row: &GateRecord,
+    effect_id: &str,
+    run_id: &str,
+    requester: &str,
+    now_unix: i64,
+) -> Result<(), GateConsumeError> {
+    if row.state != GateState::Approved {
+        return Err(GateConsumeError::NotApproved);
+    }
+    if row.effect_id != effect_id || row.run_id != run_id || row.requested_by != requester {
+        return Err(GateConsumeError::BindingMismatch);
+    }
+    if !matches!(row.decided_by.as_deref(), Some(decider) if decider != requester) {
+        return Err(GateConsumeError::BindingMismatch);
+    }
+    if row.approval_consumed_at_unix.is_some() {
+        return Err(GateConsumeError::AlreadyConsumed);
+    }
+    if row.expires_at_unix <= now_unix {
+        return Err(GateConsumeError::Expired);
+    }
+    Ok(())
+}
+
+fn system_unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .expect("system clock must be after the Unix epoch")
+}
+
 // =================================================================================================
 // DurableHitlGates — the always-compiled production arm over agent_hitl_gate (FORCE RLS).
 // =================================================================================================
 
-/// The REAL durable HITL gate store (production default) over the `agent_hitl_gate` table (0054),
+/// The REAL durable HITL gate store (production default) over the `agent_hitl_gate` table (0054-0055),
 /// RLS-scoped through the MR-022 `with_tenant_tx` convention. Cloneable; holds the tokio runtime
 /// handle so the SYNC store API bridges onto the async pool (the DurableCostLedger convention).
 #[derive(Clone)]
@@ -607,8 +865,9 @@ impl DurableHitlGates {
                 sqlx::query(
                     "INSERT INTO agent_hitl_gate \
                        (tenant_id, region, gate_id, run_id, effect_id, risk_summary, cost_estimate, \
-                        approver_filter, state, card_ref, requested_by, decided_by) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL)",
+                        approver_filter, state, card_ref, requested_by, decided_by, opened_at_unix, \
+                        decided_at_unix, expires_at_unix, approval_consumed_at_unix) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL, $12, NULL, $13, NULL)",
                 )
                 .bind(&tenant)
                 .bind(&region)
@@ -621,6 +880,8 @@ impl DurableHitlGates {
                 .bind(GateState::Waiting.as_str())
                 .bind(&record.card_ref)
                 .bind(&record.requested_by)
+                .bind(record.opened_at_unix)
+                .bind(record.expires_at_unix)
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
@@ -636,6 +897,7 @@ impl DurableHitlGates {
         to: GateState,
         decider: Option<&str>,
         approver_is_human: bool,
+        decided_at_unix: i64,
     ) -> Result<(), GateDecideError> {
         let region = self.region();
         let tenant = scope.tenant().0.clone();
@@ -649,7 +911,8 @@ impl DurableHitlGates {
                         // memory arm applies (typed refusal), then write the terminal state + decided_by.
                         let row = sqlx::query(
                     "SELECT run_id, effect_id, risk_summary, cost_estimate, approver_filter, \
-                            state, card_ref, requested_by, decided_by \
+                            state, card_ref, requested_by, decided_by, opened_at_unix, \
+                            decided_at_unix, expires_at_unix, approval_consumed_at_unix \
                      FROM agent_hitl_gate \
                      WHERE tenant_id = $1 AND region = $2 AND gate_id = $3 FOR UPDATE",
                 )
@@ -663,13 +926,18 @@ impl DurableHitlGates {
                             return Ok(Err(GateDecideError::NotFound));
                         };
                         let record = row_to_record(&gate_id, &row);
-                        if let Err(e) =
-                            decide_rules(&record, to, decider.as_deref(), approver_is_human)
-                        {
+                        if let Err(e) = decide_rules(
+                            &record,
+                            to,
+                            decider.as_deref(),
+                            approver_is_human,
+                            decided_at_unix,
+                        ) {
                             return Ok(Err(e));
                         }
                         sqlx::query(
-                            "UPDATE agent_hitl_gate SET state = $4, decided_by = $5 \
+                            "UPDATE agent_hitl_gate SET state = $4, decided_by = $5, \
+                                                       decided_at_unix = $6 \
                      WHERE tenant_id = $1 AND region = $2 AND gate_id = $3 AND state = 'waiting'",
                         )
                         .bind(&tenant)
@@ -677,6 +945,7 @@ impl DurableHitlGates {
                         .bind(&gate_id)
                         .bind(to.as_str())
                         .bind(&decider)
+                        .bind(decided_at_unix)
                         .execute(&mut *conn)
                         .await
                         .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
@@ -696,7 +965,8 @@ impl DurableHitlGates {
                     Box::pin(async move {
                         let row = sqlx::query(
                     "SELECT run_id, effect_id, risk_summary, cost_estimate, approver_filter, \
-                            state, card_ref, requested_by, decided_by \
+                            state, card_ref, requested_by, decided_by, opened_at_unix, \
+                            decided_at_unix, expires_at_unix, approval_consumed_at_unix \
                      FROM agent_hitl_gate \
                      WHERE tenant_id = $1 AND region = $2 AND gate_id = $3",
                 )
@@ -728,7 +998,9 @@ impl DurableHitlGates {
                     Box::pin(async move {
                         let row = sqlx::query(
                             "SELECT gate_id, run_id, effect_id, risk_summary, cost_estimate, \
-                            approver_filter, state, card_ref, requested_by, decided_by \
+                            approver_filter, state, card_ref, requested_by, decided_by, \
+                            opened_at_unix, decided_at_unix, expires_at_unix, \
+                            approval_consumed_at_unix \
                      FROM agent_hitl_gate \
                      WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND effect_id = $4 \
                        AND state = 'waiting' \
@@ -746,6 +1018,148 @@ impl DurableHitlGates {
                             let gid: String = r.get("gate_id");
                             row_to_record(&gid, &r)
                         }))
+                    })
+                }),
+        )
+    }
+
+    fn expire_due(&self, scope: &TenantScope, now_unix: i64) -> Vec<GateRecord> {
+        let region = self.region();
+        let tenant = scope.tenant().0.clone();
+        self.block(
+            self.provider
+                .with_tenant_tx(&scope.tenant().0, move |conn| {
+                    Box::pin(async move {
+                        let rows = sqlx::query(
+                            "UPDATE agent_hitl_gate \
+                     SET state = 'expired', decided_at_unix = $3 \
+                     WHERE tenant_id = $1 AND region = $2 \
+                       AND state IN ('waiting', 'approved') \
+                       AND approval_consumed_at_unix IS NULL \
+                       AND expires_at_unix <= $3 \
+                     RETURNING gate_id, run_id, effect_id, risk_summary, cost_estimate, \
+                               approver_filter, state, card_ref, requested_by, decided_by, \
+                               opened_at_unix, decided_at_unix, expires_at_unix, \
+                               approval_consumed_at_unix",
+                        )
+                        .bind(&tenant)
+                        .bind(&region)
+                        .bind(now_unix)
+                        .fetch_all(&mut *conn)
+                        .await
+                        .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                        Ok(rows
+                            .iter()
+                            .map(|row| {
+                                use sqlx::Row as _;
+                                let gate_id: String = row.get("gate_id");
+                                row_to_record(&gate_id, row)
+                            })
+                            .collect())
+                    })
+                }),
+        )
+    }
+
+    fn expire_if_due(
+        &self,
+        scope: &TenantScope,
+        gate_id: &str,
+        now_unix: i64,
+    ) -> Option<GateRecord> {
+        let region = self.region();
+        let tenant = scope.tenant().0.clone();
+        let gate_id = gate_id.to_string();
+        self.block(
+            self.provider
+                .with_tenant_tx(&scope.tenant().0, move |conn| {
+                    Box::pin(async move {
+                        let row = sqlx::query(
+                            "UPDATE agent_hitl_gate \
+                     SET state = 'expired', decided_at_unix = $4 \
+                     WHERE tenant_id = $1 AND region = $2 AND gate_id = $3 \
+                       AND state IN ('waiting', 'approved') \
+                       AND approval_consumed_at_unix IS NULL \
+                       AND expires_at_unix <= $4 \
+                     RETURNING gate_id, run_id, effect_id, risk_summary, cost_estimate, \
+                               approver_filter, state, card_ref, requested_by, decided_by, \
+                               opened_at_unix, decided_at_unix, expires_at_unix, \
+                               approval_consumed_at_unix",
+                        )
+                        .bind(&tenant)
+                        .bind(&region)
+                        .bind(&gate_id)
+                        .bind(now_unix)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                        Ok(row.map(|row| {
+                            use sqlx::Row as _;
+                            let gate_id: String = row.get("gate_id");
+                            row_to_record(&gate_id, &row)
+                        }))
+                    })
+                }),
+        )
+    }
+
+    fn consume_approval(
+        &self,
+        scope: &TenantScope,
+        gate_id: &str,
+        effect_id: &str,
+        run_id: &str,
+        requester: &str,
+        now_unix: i64,
+    ) -> Result<(), GateConsumeError> {
+        let region = self.region();
+        let tenant = scope.tenant().0.clone();
+        let gate_id = gate_id.to_string();
+        let effect_id = effect_id.to_string();
+        let run_id = run_id.to_string();
+        let requester = requester.to_string();
+        self.block(
+            self.provider
+                .with_tenant_tx(&scope.tenant().0, move |conn| {
+                    Box::pin(async move {
+                        let row = sqlx::query(
+                    "SELECT run_id, effect_id, risk_summary, cost_estimate, approver_filter, \
+                            state, card_ref, requested_by, decided_by, opened_at_unix, \
+                            decided_at_unix, expires_at_unix, approval_consumed_at_unix \
+                     FROM agent_hitl_gate \
+                     WHERE tenant_id = $1 AND region = $2 AND gate_id = $3 FOR UPDATE",
+                )
+                .bind(&tenant)
+                .bind(&region)
+                .bind(&gate_id)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                        let Some(row) = row else {
+                            return Ok(Err(GateConsumeError::NotFound));
+                        };
+                        let record = row_to_record(&gate_id, &row);
+                        if let Err(error) =
+                            consume_rules(&record, &effect_id, &run_id, &requester, now_unix)
+                        {
+                            return Ok(Err(error));
+                        }
+                        let updated = sqlx::query(
+                            "UPDATE agent_hitl_gate SET approval_consumed_at_unix = $4 \
+                     WHERE tenant_id = $1 AND region = $2 AND gate_id = $3 \
+                       AND approval_consumed_at_unix IS NULL",
+                        )
+                        .bind(&tenant)
+                        .bind(&region)
+                        .bind(&gate_id)
+                        .bind(now_unix)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                        if updated.rows_affected() != 1 {
+                            return Ok(Err(GateConsumeError::AlreadyConsumed));
+                        }
+                        Ok(Ok(()))
                     })
                 }),
         )
@@ -771,6 +1185,14 @@ fn row_to_record(gate_id: &str, row: &sqlx::postgres::PgRow) -> GateRecord {
         requested_by: row.get("requested_by"),
         decided_by: row
             .try_get::<Option<String>, _>("decided_by")
+            .unwrap_or(None),
+        opened_at_unix: row.get("opened_at_unix"),
+        decided_at_unix: row
+            .try_get::<Option<i64>, _>("decided_at_unix")
+            .unwrap_or(None),
+        expires_at_unix: row.get("expires_at_unix"),
+        approval_consumed_at_unix: row
+            .try_get::<Option<i64>, _>("approval_consumed_at_unix")
             .unwrap_or(None),
     }
 }
@@ -806,6 +1228,10 @@ mod tests {
             card_ref: Some("card:R1:0".into()),
             requested_by: "agent:claude".into(),
             decided_by: None,
+            opened_at_unix: 100,
+            decided_at_unix: None,
+            expires_at_unix: i64::MAX,
+            approval_consumed_at_unix: None,
         }
     }
 
@@ -1008,21 +1434,37 @@ mod tests {
 
         // waiting → not authorized.
         let rec = s.fetch(&scope(), "gate:a").unwrap();
-        assert!(!rec.authorizes("gate:git.merge:myelin://acme/git/pr/40", "agent:claude"));
+        assert!(!rec.authorizes(
+            "gate:git.merge:myelin://acme/git/pr/40",
+            "mcp-run-1",
+            "agent:claude"
+        ));
 
         s.approve(&scope(), "gate:a", "psn:lead", PrincipalKind::Human)
             .unwrap();
         let rec = s.fetch(&scope(), "gate:a").unwrap();
         assert!(
-            rec.authorizes("gate:git.merge:myelin://acme/git/pr/40", "agent:claude"),
-            "approved + same effect + distinct approver → authorized"
+            rec.authorizes(
+                "gate:git.merge:myelin://acme/git/pr/40",
+                "mcp-run-1",
+                "agent:claude"
+            ),
+            "approved + same effect/run/requester + distinct approver → authorized"
         );
         assert!(
-            !rec.authorizes("gate:git.merge:myelin://acme/git/pr/41", "agent:claude"),
+            !rec.authorizes(
+                "gate:git.merge:myelin://acme/git/pr/41",
+                "mcp-run-1",
+                "agent:claude"
+            ),
             "an approval is bound to ITS effect — a sibling sharing the tool name is NOT authorized"
         );
         assert!(
-            !rec.authorizes("gate:git.merge:myelin://acme/git/pr/40", "psn:lead"),
+            !rec.authorizes(
+                "gate:git.merge:myelin://acme/git/pr/40",
+                "mcp-run-1",
+                "psn:lead"
+            ),
             "the approver themselves re-driving is not a distinct-principal apply"
         );
 
@@ -1032,7 +1474,140 @@ mod tests {
         s2.reject(&scope(), "gate:b", "psn:lead", PrincipalKind::Human)
             .unwrap();
         let rec = s2.fetch(&scope(), "gate:b").unwrap();
-        assert!(!rec.authorizes("gate:git.merge:myelin://acme/git/pr/40", "agent:claude"));
+        assert!(!rec.authorizes(
+            "gate:git.merge:myelin://acme/git/pr/40",
+            "mcp-run-1",
+            "agent:claude"
+        ));
+    }
+
+    #[test]
+    fn approval_is_exact_run_requester_bound_and_consumed_once() {
+        let effect = "gate:git.merge:myelin://acme/git/pr/40";
+        for (run_id, requester) in [
+            ("different-run", "agent:claude"),
+            ("mcp-run-1", "agent:different"),
+        ] {
+            let mut store = HitlVerdictStore::new();
+            store.open(&scope(), waiting("gate:bound")).unwrap();
+            store
+                .approve_at(
+                    &scope(),
+                    "gate:bound",
+                    "psn:lead",
+                    PrincipalKind::Human,
+                    110,
+                )
+                .unwrap();
+            assert_eq!(
+                store.consume_approval(&scope(), "gate:bound", effect, run_id, requester, 120,),
+                Err(GateConsumeError::BindingMismatch)
+            );
+        }
+
+        let mut store = HitlVerdictStore::new();
+        store.open(&scope(), waiting("gate:once")).unwrap();
+        store
+            .approve_at(&scope(), "gate:once", "psn:lead", PrincipalKind::Human, 110)
+            .unwrap();
+        store
+            .consume_approval(
+                &scope(),
+                "gate:once",
+                effect,
+                "mcp-run-1",
+                "agent:claude",
+                120,
+            )
+            .expect("the exact originating run consumes once");
+        assert_eq!(
+            store.consume_approval(
+                &scope(),
+                "gate:once",
+                effect,
+                "mcp-run-1",
+                "agent:claude",
+                121,
+            ),
+            Err(GateConsumeError::AlreadyConsumed)
+        );
+        assert!(!store.fetch(&scope(), "gate:once").unwrap().authorizes(
+            effect,
+            "mcp-run-1",
+            "agent:claude"
+        ));
+    }
+
+    #[test]
+    fn elapsed_waiting_gate_expires_with_durable_timestamps() {
+        let mut record = waiting("gate:elapsed");
+        record.expires_at_unix = 200;
+        let mut store = HitlVerdictStore::new();
+        store.open(&scope(), record).unwrap();
+        assert_eq!(store.expire_due(&scope(), 199), Vec::new());
+        let expired = store.expire_due(&scope(), 200);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].state, GateState::Expired);
+        assert_eq!(expired[0].opened_at_unix, 100);
+        assert_eq!(expired[0].decided_at_unix, Some(200));
+        assert_eq!(store.expire_due(&scope(), 201), Vec::new());
+
+        let mut targeted = waiting("gate:targeted");
+        targeted.expires_at_unix = 400;
+        store.open(&scope(), targeted).unwrap();
+        assert_eq!(store.expire_if_due(&scope(), "gate:targeted", 399), None);
+        let expired = store
+            .expire_if_due(&scope(), "gate:targeted", 400)
+            .expect("the operator path settles the exact due row");
+        assert_eq!(expired.state, GateState::Expired);
+        assert_eq!(expired.decided_at_unix, Some(400));
+        assert_eq!(store.expire_if_due(&scope(), "gate:targeted", 401), None);
+    }
+
+    #[test]
+    fn elapsed_unconsumed_approval_expires_but_consumed_evidence_does_not() {
+        let effect = "gate:git.merge:myelin://acme/git/pr/40";
+        let mut unconsumed = waiting("gate:unconsumed");
+        unconsumed.expires_at_unix = 200;
+        let mut store = HitlVerdictStore::new();
+        store.open(&scope(), unconsumed).unwrap();
+        store
+            .approve_at(
+                &scope(),
+                "gate:unconsumed",
+                "psn:lead",
+                PrincipalKind::Human,
+                110,
+            )
+            .unwrap();
+        assert_eq!(store.expire_due(&scope(), 200)[0].state, GateState::Expired);
+
+        let mut consumed = waiting("gate:consumed");
+        consumed.expires_at_unix = 300;
+        store.open(&scope(), consumed).unwrap();
+        store
+            .approve_at(
+                &scope(),
+                "gate:consumed",
+                "psn:lead",
+                PrincipalKind::Human,
+                210,
+            )
+            .unwrap();
+        store
+            .consume_approval(
+                &scope(),
+                "gate:consumed",
+                effect,
+                "mcp-run-1",
+                "agent:claude",
+                220,
+            )
+            .unwrap();
+        assert_eq!(store.expire_due(&scope(), 300), Vec::new());
+        let row = store.fetch(&scope(), "gate:consumed").unwrap();
+        assert_eq!(row.state, GateState::Approved);
+        assert_eq!(row.approval_consumed_at_unix, Some(220));
     }
 
     /// Expire is waiting-only and records no decider; find_waiting resurfaces the pending gate for
@@ -1070,14 +1645,14 @@ mod tests {
         );
     }
 
-    /// The migration group is the single `0054` forward-only entry with the §4.4 columns + the two
-    /// enforcement columns, FORCE-RLS'd (the boot aggregate folds it in — provider tests assert the
-    /// ordering).
+    /// The migration group preserves deployed `0054` and appends `0055` for gate lifetime and
+    /// one-shot approval consumption.
     #[test]
     fn migration_0054_carries_the_gate_shape_and_rls() {
         let m = hitl_gate_durable_migrations();
-        assert_eq!(m.0.len(), 1);
+        assert_eq!(m.0.len(), 2);
         assert_eq!(m.0[0].id, "0054_agent_hitl_gate");
+        assert_eq!(m.0[1].id, "0055_agent_hitl_gate_lifetime");
         for col in [
             "gate_id",
             "run_id",
@@ -1101,5 +1676,14 @@ mod tests {
             AGENT_HITL_GATE_MIGRATION.contains("risk_summary    bytea"),
             "the PII slot stays an encrypted byte carrier"
         );
+        for column in [
+            "opened_at_unix",
+            "decided_at_unix",
+            "expires_at_unix",
+            "approval_consumed_at_unix",
+        ] {
+            assert!(AGENT_HITL_GATE_LIFETIME_MIGRATION.contains(column));
+            assert!(!AGENT_HITL_GATE_MIGRATION.contains(column));
+        }
     }
 }

@@ -69,6 +69,10 @@ fn waiting(tenant_tag: &str, gate_id: &str, effect: &str) -> GateRecord {
         card_ref: Some("card:R1:0".into()),
         requested_by: "agent:claude".into(),
         decided_by: None,
+        opened_at_unix: 100,
+        decided_at_unix: None,
+        expires_at_unix: 200,
+        approval_consumed_at_unix: None,
     }
 }
 
