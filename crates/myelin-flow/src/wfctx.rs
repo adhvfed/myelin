@@ -518,6 +518,10 @@ pub struct WfCtx {
     /// (a consumed signal drops the buffered depth). The FLOW-D4 drill asserts EXACTLY ONE consume per
     /// delivered approval (a double-click delivers one buffered row → one consume).
     consumed_signals: Vec<(String, String)>,
+    /// Exact command-to-signal bindings exported by the PostgreSQL drive adapter. The in-memory
+    /// dispatcher only needs the pair above; the durable commit must additionally name the
+    /// journal command whose `signal_waited` row is upgraded under the same transaction.
+    consumed_signal_commands: Vec<ConsumedSignalCommand>,
     /// **The reserve/settle bookend the spend-bearing dispatches reserve/settle against (P-FLOW-16,
     /// contract 9.5/§4.9).** `None` on an UN-METERED `WfCtx` (the pure activity/now/rand/sleep/signal
     /// surface) — a `metered_activity`/`metered_schedule_and_run_job` then runs WITHOUT a reserve (the
@@ -546,11 +550,33 @@ pub struct WfCtx {
 /// `WfCtx` returns the SAME value the original drive produced, WITHOUT re-executing the side effect.
 #[derive(Clone, Debug)]
 struct ReplayedCommand {
+    /// The existing journal sequence. A `signal_waited` -> `signal_received` upgrade rewrites this
+    /// exact row; allocating a new sequence would violate the PostgreSQL journal fence.
+    seq: i64,
     /// The `wf_history.kind` of the journaled row (`activity_completed`/`activity_failed`/
     /// `side_marker`) — the replay branch selector.
     kind: String,
     /// The journaled activity result refs (for `activity_completed`) — returned verbatim on replay.
     result: Option<Vec<myelin_refs::ArtifactRef>>,
+}
+
+/// Exact signal consumed by one staged workflow command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumedSignalCommand {
+    pub command_id: String,
+    pub signal_name: String,
+    pub idem_key: String,
+}
+
+/// Pure output of a detached workflow drive. Nothing in this value is durable until a caller
+/// moves every row into one caller-owned transaction (the PostgreSQL drive store does that).
+#[derive(Clone, Debug)]
+pub struct StagedWfDrive {
+    pub history: Vec<WfHistoryRow>,
+    pub attempts: Vec<WfActivityAttemptRow>,
+    pub timers: Vec<crate::timer::TimerRow>,
+    pub outbox: Vec<myelin_events::OutboxRow>,
+    pub consumed_signals: Vec<ConsumedSignalCommand>,
 }
 
 impl WfCtx {
@@ -573,6 +599,22 @@ impl WfCtx {
         let tenant = ctx_base.tenant.clone();
         let region = ctx_base.region.clone();
         let tx = outbox.begin(minter, ctx_base);
+        Self::begin_with_tx(
+            tx, journal, tenant, region, run_id, wf_type, now_clock, rand_seed,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_with_tx(
+        tx: OutboxTransaction,
+        journal: WfJournal,
+        tenant: TenantId,
+        region: Region,
+        run_id: impl Into<String>,
+        wf_type: impl Into<String>,
+        now_clock: impl Into<String>,
+        rand_seed: u64,
+    ) -> Self {
         Self {
             tenant,
             region,
@@ -596,6 +638,7 @@ impl WfCtx {
             signals: None,
             parked_on_signal: false,
             consumed_signals: Vec::new(),
+            consumed_signal_commands: Vec::new(),
             budget: None,
             run_identity: None,
             reminted_tokens: 0,
@@ -671,6 +714,7 @@ impl WfCtx {
             ctx.replay_history.insert(
                 row.command_id,
                 ReplayedCommand {
+                    seq: row.seq,
                     kind: row.kind,
                     result: row.result,
                 },
@@ -710,6 +754,60 @@ impl WfCtx {
         // engine is replaying a DIFFERENT definition version, halt as nondeterministic BEFORE running
         // a single command — replaying a new body over an old journal is a silent divergence. The
         // latch is set eagerly so even an empty body (no commands) halts.
+        if run_version != replay_version {
+            ctx.latch_divergence(format!(
+                "wf_version pin mismatch: run pinned to v{run_version} but replayed with v{replay_version} \
+                 (a deploy diverged an in-flight run, §4.6)"
+            ));
+        }
+        ctx
+    }
+
+    /// Resume into a pure staging buffer for a larger PostgreSQL drive transaction. This is not a
+    /// second persistence implementation: emitted rows remain unallocated and unpublished, and
+    /// [`WfCtx::into_staged_drive`] is the only successful terminal operation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_staged_versioned(
+        minter: Arc<dyn IdMinter>,
+        ctx_base: EmitContextBase,
+        run_id: impl Into<String>,
+        wf_type: impl Into<String>,
+        now_clock: impl Into<String>,
+        rand_seed: u64,
+        history: Vec<WfHistoryRow>,
+        run_version: i32,
+        replay_version: i32,
+    ) -> Self {
+        let tenant = ctx_base.tenant.clone();
+        let region = ctx_base.region.clone();
+        let tx = OutboxTransaction::detached(minter, ctx_base);
+        let mut ctx = Self::begin_with_tx(
+            tx,
+            WfJournal::new(),
+            tenant,
+            region,
+            run_id,
+            wf_type,
+            now_clock,
+            rand_seed,
+        );
+        ctx.history_seq = history
+            .iter()
+            .map(|row| row.seq)
+            .max()
+            .map(|seq| seq + 1)
+            .unwrap_or(0);
+        for row in history {
+            ctx.replay_history.insert(
+                row.command_id,
+                ReplayedCommand {
+                    seq: row.seq,
+                    kind: row.kind,
+                    result: row.result,
+                },
+            );
+        }
+        ctx.pinned_wf_version = Some(run_version);
         if run_version != replay_version {
             ctx.latch_divergence(format!(
                 "wf_version pin mismatch: run pinned to v{run_version} but replayed with v{replay_version} \
@@ -800,6 +898,25 @@ impl WfCtx {
             result,
             // references-not-payloads: the WfCtx core writes NO inline-PII result (the rare
             // crypto-shred case is a later, explicit opt-in). The key ref stays None by default.
+            result_key_ref: None,
+        });
+    }
+
+    fn stage_history_at(
+        &mut self,
+        seq: i64,
+        kind: &str,
+        command_id: String,
+        result: Option<Vec<myelin_refs::ArtifactRef>>,
+    ) {
+        self.staged_history.push(WfHistoryRow {
+            tenant: self.tenant.clone(),
+            region: self.region.clone(),
+            run_id: self.run_id.clone(),
+            seq,
+            kind: kind.to_string(),
+            command_id,
+            result,
             result_key_ref: None,
         });
     }
@@ -1252,10 +1369,20 @@ impl WfCtx {
             // re-scan never re-consumes it. The consume is idempotent on `consumed_seq IS NULL` (a re-
             // drive races to the same NULL guard) — if a concurrent drive already consumed it we would
             // see it as consumed (None from the scan); here the scan returned it unconsumed so we win.
-            let received_seq = self.history_seq; // the seq the signal_received row will get.
+            let received_seq = self
+                .replay_history
+                .get(&command_id)
+                .filter(|row| row.kind == history_kind::SIGNAL_WAITED)
+                .map(|row| row.seq)
+                .unwrap_or(self.history_seq);
             signals.consume(&self.tenant, &self.run_id, name, &idem_key, received_seq);
             self.consumed_signals
                 .push((name.to_string(), idem_key.clone()));
+            self.consumed_signal_commands.push(ConsumedSignalCommand {
+                command_id: command_id.clone(),
+                signal_name: name.to_string(),
+                idem_key: idem_key.clone(),
+            });
             // Journal the `signal_received` row carrying the consumed signal (idem_key + payload refs)
             // so replay returns the SAME signal (consume-exactly-once). references-not-payloads.
             self.stage_received(
@@ -1394,11 +1521,25 @@ impl WfCtx {
             )));
         }
         result.extend(payload.iter().cloned());
-        self.stage_history(
-            crate::wfctx::history_kind::SIGNAL_RECEIVED,
-            command_id,
-            Some(result),
-        );
+        let replayed_wait_seq = self
+            .replay_history
+            .get(&command_id)
+            .filter(|row| row.kind == history_kind::SIGNAL_WAITED)
+            .map(|row| row.seq);
+        if let Some(seq) = replayed_wait_seq {
+            self.stage_history_at(
+                seq,
+                crate::wfctx::history_kind::SIGNAL_RECEIVED,
+                command_id,
+                Some(result),
+            );
+        } else {
+            self.stage_history(
+                crate::wfctx::history_kind::SIGNAL_RECEIVED,
+                command_id,
+                Some(result),
+            );
+        }
     }
 
     /// **Whether this drive PARKED on a durable timer (a `sleep` into the future, §4.2).** The engine
@@ -1455,6 +1596,33 @@ impl WfCtx {
         cause: Option<&EventEnvelope>,
     ) -> EmitResult<EventId> {
         self.tx.emit(draft, cause)
+    }
+
+    /// Consume a detached drive and export every staged side effect without persisting any of it.
+    /// The returned rows must be committed together; splitting them would violate FLOW-D5.
+    pub fn into_staged_drive(self) -> WfResult<StagedWfDrive> {
+        let timers = self
+            .timers
+            .as_ref()
+            .map(|(store, _, _)| store.rows_for_run(&self.tenant, &self.region, &self.run_id))
+            .unwrap_or_default();
+        let WfCtx {
+            tx,
+            staged_history,
+            staged_attempts,
+            consumed_signal_commands,
+            ..
+        } = self;
+        let outbox = tx
+            .into_staged_rows()
+            .map_err(|error| WfError::CoCommit(error.0))?;
+        Ok(StagedWfDrive {
+            history: staged_history,
+            attempts: staged_attempts,
+            timers,
+            outbox,
+            consumed_signals: consumed_signal_commands,
+        })
     }
 
     /// **`commit()` — the atomic journal/outbox co-commit (FLOW-D5).** The staged `wf_history` +

@@ -386,6 +386,24 @@ impl TimerStore {
             .cloned()
     }
 
+    /// Snapshot timers staged for one exact workflow run. Production adapters use a fresh scratch
+    /// store per drive, then move these rows into the caller-owned PostgreSQL commit.
+    pub fn rows_for_run(&self, tenant: &TenantId, region: &Region, run_id: &str) -> Vec<TimerRow> {
+        let mut rows: Vec<_> = self
+            .lock()
+            .timers
+            .values()
+            .filter(|row| {
+                row.tenant == *tenant
+                    && row.region == *region
+                    && row.run_id.as_deref() == Some(run_id)
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| left.timer_id.cmp(&right.timer_id));
+        rows
+    }
+
     /// **The timer-wheel LAG (the SC-11 health signal, contract 1.8 / §5.4): the count of DUE timers
     /// (`bucket <= now AND NOT fired`) awaiting firing in `partition`.** A healthy wheel keeps this at
     /// ~0 (it fires due timers within the tick budget); a growing lag is the "the wheel is falling

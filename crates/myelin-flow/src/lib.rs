@@ -349,6 +349,6 @@ pub use timer::{
     TimerWheel, SECS_PER_MINUTE,
 };
 pub use wfctx::{
-    attempt_state, history_kind, ActivityError, RetryPolicy, WaitOutcome, WfCtx, WfError,
-    WfJournal, WfResult,
+    attempt_state, history_kind, ActivityError, ConsumedSignalCommand, RetryPolicy, StagedWfDrive,
+    WaitOutcome, WfCtx, WfError, WfJournal, WfResult,
 };

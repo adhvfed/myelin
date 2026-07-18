@@ -88,14 +88,13 @@
 
 use crate::relay::{BusTransport, DrainReport};
 use crate::{
-    derive_envelope, AggregateKey, EmitContext, EventDraft, EventEnvelope, EventId, OutboxTx,
-    Result,
+    derive_envelope, AggregateKey, EmitContext, EventDraft, EventEnvelope, EventId, OutboxError,
+    OutboxTx, Result,
 };
 // Used only by the `test-support`-gated memory arm (MR-009b W3b.6).
 #[cfg(any(test, feature = "test-support"))]
-use crate::OutboxError;
-#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -436,7 +435,7 @@ impl OutboxStore {
     /// emit derives from.
     pub fn begin(&self, minter: Arc<dyn IdMinter>, ctx_base: EmitContextBase) -> OutboxTransaction {
         OutboxTransaction {
-            store: self.clone(),
+            store: Some(self.clone()),
             minter,
             ctx_base,
             staged_rows: Vec::new(),
@@ -604,7 +603,9 @@ pub struct EmitContextBase {
 /// [`commit`](Self::commit), and **not at all** if the transaction is dropped without it
 /// (emit-iff-committed, BUS-D4).
 pub struct OutboxTransaction {
-    store: OutboxStore,
+    /// The backing used by the ordinary commit APIs. `None` is a detached staging buffer whose
+    /// caller must move the rows into a larger caller-owned database transaction.
+    store: Option<OutboxStore>,
     minter: Arc<dyn IdMinter>,
     ctx_base: EmitContextBase,
     /// The rows emitted-but-not-yet-committed (the buffer the co-commit makes durable atomically).
@@ -615,6 +616,54 @@ pub struct OutboxTransaction {
 }
 
 impl OutboxTransaction {
+    /// Open a detached outbox staging buffer. This derives canonical envelopes through the same
+    /// [`OutboxTx`] implementation as an ordinary transaction but owns no persistence backing;
+    /// [`into_staged_rows`](Self::into_staged_rows) is the only successful terminal operation.
+    /// Durable workflow engines use this to move emitted rows into their journal/run-state
+    /// transaction, avoiding a second outbox commit and preserving emit-iff-domain-committed.
+    pub fn detached(minter: Arc<dyn IdMinter>, ctx_base: EmitContextBase) -> Self {
+        Self {
+            store: None,
+            minter,
+            ctx_base,
+            staged_rows: Vec::new(),
+            state_committed: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Consume a detached buffer and return its canonical unpublished rows. A transaction created
+    /// by [`OutboxStore::begin`] cannot use this escape hatch: it must commit through its backing.
+    pub fn into_staged_rows(mut self) -> Result<Vec<OutboxRow>> {
+        if self.store.is_some() {
+            return Err(OutboxError(
+                "only a detached outbox transaction may export staged rows".into(),
+            ));
+        }
+        let mut event_ids = HashSet::with_capacity(self.staged_rows.len());
+        for row in &self.staged_rows {
+            if !event_ids.insert(row.event_id.clone()) {
+                return Err(OutboxError(
+                    "detached outbox batch contains a duplicate event_id".into(),
+                ));
+            }
+            if row.seq != 0 || row.published_at.is_some() || row.attempts != 0 {
+                return Err(OutboxError(
+                    "detached outbox rows must retain the unallocated, unpublished staging shape"
+                        .into(),
+                ));
+            }
+            if row.event_id != row.envelope.event_id
+                || row.aggregate != row.envelope.aggregate
+                || row.subject != row.envelope.subject
+            {
+                return Err(OutboxError(
+                    "detached outbox row routing must exactly match its canonical envelope".into(),
+                ));
+            }
+        }
+        Ok(self.staged_rows.drain(..).collect())
+    }
+
     /// Stage the caller's own state mutation into THIS transaction (the "state change" half of
     /// the co-commit). In a real service this is the row the handler writes to its own table in
     /// the same DB transaction the outbox row is inserted into; here it is recorded so a test
@@ -655,14 +704,17 @@ impl OutboxTransaction {
     /// is modeled by skipping an already-present byte-identical id (see below); a divergent payload
     /// under the same id still rejects.
     pub fn commit_absorb(mut self) -> Result<()> {
-        if let Some(backing) = self.store.durable_backing() {
+        let store = self.store.take().ok_or_else(|| {
+            OutboxError("detached outbox rows require a caller-owned atomic commit".into())
+        })?;
+        if let Some(backing) = store.durable_backing() {
             let rows: Vec<OutboxRow> = self.staged_rows.drain(..).collect();
             return backing.commit_staged_absorb(rows);
         }
         // Memory arm (test-support): absorb a byte-identical already-present id; reject a divergent one.
         #[cfg(any(test, feature = "test-support"))]
         {
-            let mut inner = self.store.mem().expect("memory backend");
+            let mut inner = store.mem().expect("memory backend");
             for row in &self.staged_rows {
                 if let Some(existing) = inner.rows.get(&row.event_id) {
                     if existing.envelope != row.envelope {
@@ -686,13 +738,18 @@ impl OutboxTransaction {
             return Ok(());
         }
         #[cfg(not(any(test, feature = "test-support")))]
-        unreachable!("a production OutboxStore is Durable-only (the Memory arm is test-support-gated)")
+        unreachable!(
+            "a production OutboxStore is Durable-only (the Memory arm is test-support-gated)"
+        )
     }
 
     pub fn commit(mut self) -> Result<()> {
+        let store = self.store.take().ok_or_else(|| {
+            OutboxError("detached outbox rows require a caller-owned atomic commit".into())
+        })?;
         // Durable dispatch: the whole staged buffer commits atomically through the backing (the
         // durable arm of the co-commit). The backing assigns the per-aggregate seq the same way.
-        if let Some(backing) = self.store.durable_backing() {
+        if let Some(backing) = store.durable_backing() {
             let rows: Vec<OutboxRow> = self.staged_rows.drain(..).collect();
             return backing.commit_staged(rows);
         }
@@ -700,7 +757,7 @@ impl OutboxTransaction {
         // build `durable_backing()` is always `Some` — the enum presents only `Durable`).
         #[cfg(any(test, feature = "test-support"))]
         {
-            let mut inner = self.store.mem().expect("memory backend");
+            let mut inner = store.mem().expect("memory backend");
             // First pass: every staged row's event_id must be unique (the UNIQUE(event_id)
             // constraint) — reject the WHOLE commit loudly before mutating anything (atomicity: a
             // partial commit would be silent data loss). The minter is monotonic so this cannot
@@ -1111,6 +1168,73 @@ mod tests {
         );
         assert_eq!(store.committed_count(), 0, "no ghost row from an abort");
         assert_eq!(store.dead_letter_count(), 0);
+    }
+
+    #[test]
+    fn detached_transaction_exports_only_canonical_unallocated_rows() {
+        let (_, minter) = store_and_minter();
+        let mut tx = OutboxTransaction::detached(minter, ctx_base());
+        let id = tx
+            .emit(draft("issues.issue.created", "issue:DETACHED"), None)
+            .unwrap();
+
+        let rows = tx.into_staged_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_id, id);
+        assert_eq!(rows[0].event_id, rows[0].envelope.event_id);
+        assert_eq!(
+            rows[0].seq, 0,
+            "the durable co-commit owns sequence allocation"
+        );
+        assert!(rows[0].published_at.is_none());
+        assert_eq!(rows[0].attempts, 0);
+    }
+
+    #[test]
+    fn detached_transaction_rejects_commit_and_preallocated_sequence() {
+        let (_, minter) = store_and_minter();
+        let mut commit_tx = OutboxTransaction::detached(Arc::clone(&minter), ctx_base());
+        commit_tx
+            .emit(draft("issues.issue.created", "issue:DETACHED"), None)
+            .unwrap();
+        assert!(
+            commit_tx.commit().is_err(),
+            "there is no second publish path"
+        );
+
+        let mut staged_tx = OutboxTransaction::detached(minter, ctx_base());
+        staged_tx
+            .emit(draft("issues.issue.created", "issue:DETACHED"), None)
+            .unwrap();
+        staged_tx.staged_rows[0].seq = 7;
+        assert!(staged_tx.into_staged_rows().is_err());
+    }
+
+    #[test]
+    fn detached_transaction_rejects_duplicate_event_ids_within_one_drive() {
+        struct ConstantMinter;
+        impl IdMinter for ConstantMinter {
+            fn mint(&self) -> Ulid {
+                Ulid("01DETACHEDDUPLICATE0000000".into())
+            }
+        }
+
+        let mut tx = OutboxTransaction::detached(Arc::new(ConstantMinter), ctx_base());
+        tx.emit(draft("issues.issue.created", "issue:ONE"), None)
+            .unwrap();
+        tx.emit(draft("issues.issue.created", "issue:TWO"), None)
+            .unwrap();
+        assert!(tx.into_staged_rows().is_err());
+    }
+
+    #[test]
+    fn store_backed_transaction_cannot_export_around_its_commit_boundary() {
+        let (store, minter) = store_and_minter();
+        let mut tx = store.begin(minter, ctx_base());
+        tx.emit(draft("issues.issue.created", "issue:BACKED"), None)
+            .unwrap();
+        assert!(tx.into_staged_rows().is_err());
+        assert_eq!(store.outbox_depth(), 0);
     }
 
     /// `emit` derives causality through the trait (a caused event sets depth = parent+1 and
