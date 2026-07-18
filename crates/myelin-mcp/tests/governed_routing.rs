@@ -64,6 +64,21 @@ fn service_principal(id: &str, tenant: &str) -> Principal {
 /// Build a server with a governed router over a REAL minter (shared S7 store returned so a test can
 /// revoke the run token).
 fn governed_router() -> GovernedRouter {
+    let grants = [
+        "pull_request.merge",
+        "repo.push",
+        "pull_request.review",
+        "repo.approve_untrusted_ci",
+    ];
+    governed_router_with_input(DelegationInput {
+        agent_policy: Authority::of(grants),
+        delegation: Authority::of(grants),
+        tenant_policy: Authority::of(grants),
+        trigger_actor_held: Authority::of(grants),
+    })
+}
+
+fn governed_router_with_input(input: DelegationInput) -> GovernedRouter {
     let s7 = RevocationStore::new();
     // A REAL per-run minter (the structural floor signer is the EI-01 §1 named seam; the real
     // PASETO/Ed25519 signer swaps in behind the SAME `TokenSigner` trait — the mint's intersection +
@@ -76,13 +91,7 @@ fn governed_router() -> GovernedRouter {
     let trigger = human_principal("human:operator", "acme");
     let scope = TenantScope::from_verified_token(&trigger, Region("eu-west".into()));
 
-    let grants = ["git:run"];
-    let input = DelegationInput {
-        agent_policy: Authority::of(grants),
-        delegation: Authority::of(grants),
-        tenant_policy: Authority::of(grants),
-        trigger_actor_held: Authority::of(grants),
-    };
+    let caveats = input.delegation.grants().map(str::to_string).collect();
 
     let principal = RunPrincipal {
         scope,
@@ -91,7 +100,7 @@ fn governed_router() -> GovernedRouter {
         trigger_actor: trigger,
         run_id: RunId("mcp-run-1".into()),
         input,
-        caveats: DelegationCaveats(vec!["git:run".into()]),
+        caveats: DelegationCaveats(caveats),
         kind: MachineKind::Agent,
         ttl: FailStaticBound { static_max_secs: 300 },
     };
@@ -113,6 +122,38 @@ fn governed_server() -> McpServer {
         governed_router(),
         Arc::new(now),
     )
+}
+
+#[test]
+fn declared_caps_fail_closed_for_missing_and_attenuated_delegation() {
+    let registry = ToolRegistry::with_git();
+    let open_pr = registry.resolve("git.open_pr").expect("registered tool");
+
+    let no_grant = governed_router_with_input(DelegationInput {
+        agent_policy: Authority::of(["pull_request.review"]),
+        delegation: Authority::of(["pull_request.review"]),
+        tenant_policy: Authority::of(["pull_request.review"]),
+        trigger_actor_held: Authority::of(["pull_request.review"]),
+    });
+    let outcome = no_grant.call(open_pr, &serde_json::json!({"repo": "alpha"}), &now(), None);
+    match outcome {
+        CallOutcome::Denied { reason, .. } => assert!(reason.contains("repo.push")),
+        other => panic!("missing declared capability must deny before EffectApi: {other:?}"),
+    }
+
+    // Agent + tenant + delegator-held all contain repo.push, but the delegation caveat attenuates
+    // it away. A union bug or a check against only the agent ceiling would incorrectly apply.
+    let attenuated = governed_router_with_input(DelegationInput {
+        agent_policy: Authority::of(["repo.push", "pull_request.review"]),
+        delegation: Authority::of(["pull_request.review"]),
+        tenant_policy: Authority::of(["repo.push", "pull_request.review"]),
+        trigger_actor_held: Authority::of(["repo.push", "pull_request.review"]),
+    });
+    let outcome = attenuated.call(open_pr, &serde_json::json!({"repo": "alpha"}), &now(), None);
+    match outcome {
+        CallOutcome::Denied { reason, .. } => assert!(reason.contains("repo.push")),
+        other => panic!("attenuated-away capability must deny: {other:?}"),
+    }
 }
 
 /// Exchange lines within one logical session. Some HITL tests pause between exchanges while a human

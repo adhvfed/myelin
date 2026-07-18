@@ -23,8 +23,12 @@ use myelin_identity::{
     DelegationCaveats, FailStaticBound, Principal, PrincipalId, PrincipalKind, RunId, RuntimeRef,
 };
 use myelin_identity_service::delegation::DelegationInput;
-use myelin_identity_service::machine_auth::{Authority, MachineKind};
-use myelin_identity_service::mint::{RunTokenMinter, StructuralTokenSigner};
+use myelin_identity_service::machine_auth::{
+    Authority, MachineKind, StructuralTokenVerifier,
+};
+use myelin_identity_service::mint::{
+    RunTokenAuthorizer, RunTokenMinter, StructuralTokenSigner,
+};
 use myelin_identity_service::revocation::RevocationStore;
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
@@ -68,6 +72,10 @@ fn human_principal(id: &str) -> Principal {
 /// Build a governed MCP server whose `EffectApi` body is the REAL git effect over `backend`.
 fn governed_git_server(backend: Arc<DurableGitBackend>) -> McpServer {
     let s7 = RevocationStore::new();
+    let boundary_authorizer = Arc::new(
+        RunTokenAuthorizer::new(Arc::new(StructuralTokenVerifier::new()), s7.clone())
+            .with_clock(now),
+    );
     let minter =
         RunTokenMinter::with_signer_and_tuples(s7, None, Arc::new(StructuralTokenSigner::new()));
 
@@ -75,7 +83,12 @@ fn governed_git_server(backend: Arc<DurableGitBackend>) -> McpServer {
     let trigger = human_principal("human:operator");
     let scope = TenantScope::from_verified_token(&trigger, Region(REGION.into()));
 
-    let grants = ["git:run"];
+    let grants = [
+        "pull_request.merge",
+        "repo.push",
+        "pull_request.review",
+        "repo.approve_untrusted_ci",
+    ];
     let input = DelegationInput {
         agent_policy: Authority::of(grants),
         delegation: Authority::of(grants),
@@ -90,7 +103,7 @@ fn governed_git_server(backend: Arc<DurableGitBackend>) -> McpServer {
         trigger_actor: trigger,
         run_id: RunId("mcp-run-1".into()),
         input,
-        caveats: DelegationCaveats(vec!["git:run".into()]),
+        caveats: DelegationCaveats(grants.iter().map(|g| (*g).to_string()).collect()),
         kind: MachineKind::Agent,
         ttl: FailStaticBound { static_max_secs: 300 },
     };
@@ -98,7 +111,13 @@ fn governed_git_server(backend: Arc<DurableGitBackend>) -> McpServer {
     // THE GT-005 INJECTION: the concrete git EffectApi body over the durable backend, bound to the
     // run's verified (tenant, region) + acting principal. R2.4: + the server-side HITL verdict
     // store (the in-memory double of the durable agent_hitl_gate arm) and the approver set.
-    let effect = GitEffectApi::new(backend, TENANT, REGION, agent);
+    let effect = GitEffectApi::new(
+        backend,
+        TENANT,
+        REGION,
+        agent,
+        boundary_authorizer,
+    );
     let router = GovernedRouter::new(
         minter,
         principal,

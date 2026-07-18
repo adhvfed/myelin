@@ -525,6 +525,9 @@ pub struct AgentToolDef {
     pub name: &'static str,
     /// `true` iff the tool requires a HITL approval before `EffectApi::apply` runs (frozen default).
     pub requires_approval: bool,
+    /// Capabilities the exact minted/delegated run-token authority must carry. These travel with
+    /// the subsystem-owned MCP definition so routing never invents a second permission map.
+    pub required_caps: &'static [&'static str],
     /// The handler this tool's effect lowers to (the same already-built handler the UI/CLI route into).
     pub handler: Handler,
 }
@@ -537,16 +540,19 @@ pub fn agent_tools() -> Vec<AgentToolDef> {
         AgentToolDef {
             name: "git.merge",
             requires_approval: true,
+            required_caps: &["pull_request.merge"],
             handler: Handler::MergeGate,
         },
         AgentToolDef {
             name: "git.open_pr",
             requires_approval: false,
+            required_caps: &["repo.push"],
             handler: Handler::Lifecycle,
         },
         AgentToolDef {
             name: "git.submit_review",
             requires_approval: false,
+            required_caps: &["pull_request.review"],
             handler: Handler::Lifecycle,
         },
         AgentToolDef {
@@ -555,6 +561,7 @@ pub fn agent_tools() -> Vec<AgentToolDef> {
             // tool layer; the SECURITY gate is the ABAC capability, not a HITL card (the human-with-cap
             // IS the gate). Not a HITL-default tool.
             requires_approval: false,
+            required_caps: &["repo.approve_untrusted_ci"],
             handler: Handler::ForkEndorse,
         },
     ]

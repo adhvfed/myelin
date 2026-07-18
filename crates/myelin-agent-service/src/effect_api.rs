@@ -73,15 +73,19 @@
 //!   the BUDGET step reads the reserve balance (11.7); the runaway-loop drill is AG-P14's.
 
 use myelin_agent::{
-    EffectApi, EffectKind, EffectResult, EventId, GateId, ProposedEffect, RunCtx, ToolDef,
-    ToolName, ToolSurface,
+    EffectApi, EffectAuthority, EffectKind, EffectResult, EventId, GateId, ProposedEffect, RunCtx,
+    ToolDef, ToolName, ToolSurface,
 };
 use myelin_identity::{
     CaveatContext, Consistency, ConsistencyMode, Decision, EffectivePolicy, FieldId, Permission,
     Principal, TransitionId, Zookie,
 };
-use myelin_storage::reserve_settle::{MeteredUnit, MinorUnits};
-use myelin_tenancy::ArtifactRef;
+use myelin_identity_service::mint::RunTokenAuthorizer;
+use myelin_storage::{
+    reserve_settle::{MeteredUnit, MinorUnits},
+    TenantScope,
+};
+use myelin_tenancy::{ArtifactRef, Region};
 
 // ───────────────────────── the structured planned effect (the brain's proposal) ─────────────────
 
@@ -618,6 +622,7 @@ where
 /// use.
 pub struct EffectApiBridge<'a, S, C, D, T, A, B>(
     core::cell::RefCell<PlanThenApply<'a, S, C, D, T, A, B>>,
+    Option<std::sync::Arc<RunTokenAuthorizer>>,
 )
 where
     S: ToolSurface,
@@ -638,7 +643,15 @@ where
 {
     /// Wrap a [`PlanThenApply`] pipeline as the frozen-shape [`EffectApi`] entry.
     pub fn new(pipeline: PlanThenApply<'a, S, C, D, T, A, B>) -> Self {
-        EffectApiBridge(core::cell::RefCell::new(pipeline))
+        EffectApiBridge(core::cell::RefCell::new(pipeline), None)
+    }
+
+    /// Wrap a pipeline for an external router, requiring a final-boundary signed run-token check.
+    pub fn with_run_token_authorizer(
+        pipeline: PlanThenApply<'a, S, C, D, T, A, B>,
+        authorizer: std::sync::Arc<RunTokenAuthorizer>,
+    ) -> Self {
+        EffectApiBridge(core::cell::RefCell::new(pipeline), Some(authorizer))
     }
 }
 
@@ -651,9 +664,58 @@ where
     A: SubsystemApply,
     B: EffectBudget,
 {
-    fn apply(&self, _run: &RunCtx, effect: ProposedEffect) -> EffectResult {
+    fn apply(&self, _run: &RunCtx, _effect: ProposedEffect) -> EffectResult {
+        EffectResult::Denied(
+            "external plan-then-apply requires the signed run-token authority entry — direct apply denied"
+                .into(),
+        )
+    }
+
+    fn apply_authorized(
+        &self,
+        _run: &RunCtx,
+        authority: &EffectAuthority,
+        effect: ProposedEffect,
+    ) -> EffectResult {
         match decode_proposed(&effect) {
-            Ok(plan) => self.0.borrow_mut().apply_planned(&plan),
+            Ok(plan) => {
+                if authority.tool != plan.tool.0 {
+                    return EffectResult::Denied(format!(
+                        "run-token authority is bound to `{}`, not proposed tool `{}`",
+                        authority.tool, plan.tool.0
+                    ));
+                }
+                let Some(authorizer) = &self.1 else {
+                    return EffectResult::Denied(
+                        "plan-then-apply bridge has no final-boundary run-token authorizer — denied"
+                            .into(),
+                    );
+                };
+                let pipeline = self.0.borrow();
+                if authority.principal_id != pipeline.agent.principal_id {
+                    return EffectResult::Denied(
+                        "run-token authority principal does not match the plan-then-apply principal"
+                            .into(),
+                    );
+                }
+                let Some(def) = pipeline.catalogue.resolve(&plan.tool) else {
+                    return EffectResult::Denied(format!("unknown tool {}", plan.tool.0));
+                };
+                let scope = TenantScope::from_verified_token(
+                    &pipeline.agent,
+                    Region(pipeline.agent.region.0.clone()),
+                );
+                if let Err(reason) = authorizer.authorize(
+                    &scope,
+                    &pipeline.agent.principal_id,
+                    &authority.run_token,
+                    &def.required_caps,
+                ) {
+                    return EffectResult::Denied(reason);
+                }
+                drop(pipeline);
+                self.0.borrow_mut().apply_planned(&plan)
+            }
             Err(reason) => {
                 // Fail-closed: a carrier we cannot parse is Denied (it never mutates). Count it.
                 let mut p = self.0.borrow_mut();
@@ -1694,11 +1756,11 @@ mod tests {
 
     // ───────────────────────── the glue EffectApi (8.2) bridge via the opaque carrier ───────────
 
-    /// **The frozen 8.2 `EffectApi::apply(&RunCtx, ProposedEffect) -> EffectResult` body works
-    /// through the opaque carrier round-trip.** `encode_proposed` → `apply` → the structured
-    /// pipeline; a malformed carrier is Denied.
+    /// **The unbound 8.2 `EffectApi::apply` entry cannot bypass run-token authority.** Structured
+    /// internal dispatch uses `apply_planned`; external routing must use `apply_authorized` with a
+    /// configured final-boundary verifier.
     #[test]
-    fn glue_effect_api_bridge_round_trips_the_carrier() {
+    fn glue_effect_api_bridge_denies_the_unbound_entry() {
         let cat = Catalogue {
             defs: vec![tool_def(
                 "issue.create",
@@ -1739,17 +1801,18 @@ mod tests {
         let carrier = encode_proposed(&plan("issue.create", r#"{"title":"x"}"#));
         let out = bridge.apply(&RunCtx::default(), carrier);
         assert!(
-            matches!(out, EffectResult::Applied(_)),
-            "the glue bridge applies: {out:?}"
+            matches!(out, EffectResult::Denied(ref reason) if reason.contains("signed run-token")),
+            "the unbound bridge must deny: {out:?}"
         );
+        assert!(endpoint.applied.borrow().is_empty());
 
-        // a malformed carrier is Denied (fail-closed).
+        // Even a malformed direct carrier cannot select a weaker parsing path.
         let bad = bridge.apply(
             &RunCtx::default(),
             ProposedEffect("garbage-no-fields".into()),
         );
         assert!(
-            matches!(bad, EffectResult::Denied(ref r) if r.contains("malformed")),
+            matches!(bad, EffectResult::Denied(ref r) if r.contains("signed run-token")),
             "{bad:?}"
         );
     }
