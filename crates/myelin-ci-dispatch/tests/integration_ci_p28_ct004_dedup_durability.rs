@@ -46,8 +46,14 @@ async fn consumer_dedup_double_delivery_lands_once_across_kill9() {
     let tbl = format!("consumer_dedup_ct004_{suffix}");
 
     let p1 = reopen().await;
-    sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}")).execute(&p1).await.ok();
-    sqlx::query(&CREATE_CONSUMER_DEDUP_DDL.replace("EXISTS consumer_dedup (", &format!("EXISTS {tbl} (")))
+    sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
+        .execute(&p1)
+        .await
+        .ok();
+    let create = CREATE_CONSUMER_DEDUP_DDL
+        .replace("EXISTS consumer_dedup (", &format!("EXISTS {tbl} ("))
+        .replace("consumer_dedup_pk", &format!("{tbl}_pk"));
+    sqlx::query(&create)
         .execute(&p1)
         .await
         .expect("apply the consumer_dedup DDL");
@@ -57,8 +63,8 @@ async fn consumer_dedup_double_delivery_lands_once_across_kill9() {
         let tbl = tbl.clone();
         async move {
             sqlx::query(&format!(
-                "INSERT INTO {tbl} (tenant_id, region, consumer, event_id) \
-                 VALUES ('acme','fr-par','ci-dispatch.trigger','{event}') \
+                "INSERT INTO {tbl} (consumer, event_id) \
+                 VALUES ('ci-dispatch.trigger','{event}') \
                  ON CONFLICT (consumer, event_id) DO NOTHING"
             ))
             .execute(&pool)
@@ -87,7 +93,11 @@ async fn consumer_dedup_double_delivery_lands_once_across_kill9() {
          (a crash-then-redeliver does NOT double-run)"
     );
     // A genuinely NEW event still fires (the ledger isn't wedged).
-    assert_eq!(deliver(&p2, "evt-push-2").await, 1, "a new event still fires once after reopen");
+    assert_eq!(
+        deliver(&p2, "evt-push-2").await,
+        1,
+        "a new event still fires once after reopen"
+    );
 
     let count: i64 = sqlx::query(&format!(
         "SELECT count(*)::bigint AS n FROM {tbl} WHERE consumer='ci-dispatch.trigger' AND event_id='evt-push-1'"
@@ -96,9 +106,15 @@ async fn consumer_dedup_double_delivery_lands_once_across_kill9() {
     .await
     .unwrap()
     .get("n");
-    assert_eq!(count, 1, "double-effect = 0: the doubly-delivered event lands EXACTLY once");
+    assert_eq!(
+        count, 1,
+        "double-effect = 0: the doubly-delivered event lands EXACTLY once"
+    );
 
-    sqlx::query(&format!("DROP TABLE {tbl}")).execute(&p2).await.ok();
+    sqlx::query(&format!("DROP TABLE {tbl}"))
+        .execute(&p2)
+        .await
+        .ok();
     println!(
         "[CT-004] PASS dispatch dedup: deliver(evt-push-1)=1 then kill-9 → reopen → re-deliver=0 \
          (lands once, double-effect=0); a new event still fires once"
