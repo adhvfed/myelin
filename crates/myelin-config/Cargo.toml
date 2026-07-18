@@ -6,7 +6,7 @@ license.workspace = true
 publish = false
 
 # myelin-config is the env-driven CONFIG layer — the dev<->prod CONFIG SWAP seam (Stage 1).
-# It reads the standard-interface endpoints (DATABASE_URL, S3_*, REDIS_URL, NATS_URL,
+# It reads the standard-interface endpoints (DATABASE_URL, DATABASE_MIGRATION_URL, S3_*, REDIS_URL, NATS_URL,
 # MYELIN_REGION) from the environment so swapping the docker-compose dev stack for the
 # Scaleway (fr-par) prod backends is a config change, not a code change.
 #

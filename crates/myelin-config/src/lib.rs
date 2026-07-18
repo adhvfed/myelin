@@ -11,7 +11,8 @@
 //!
 //! | var              | meaning                                  | dev default                                                  |
 //! |------------------|------------------------------------------|--------------------------------------------------------------|
-//! | `DATABASE_URL`   | Postgres OLTP + outbox + ReBAC + audit   | `postgres://myelin_app:myelin_app_pw@localhost:5433/myelin`  |
+//! | `DATABASE_URL`   | Postgres runtime (OLTP/outbox/ReBAC)     | `postgres://myelin_app:myelin_app_pw@localhost:5433/myelin`  |
+//! | `DATABASE_MIGRATION_URL` | Postgres migration-only credential | `postgres://myelin_admin:myelin_dev_pw@localhost:5433/myelin` |
 //! | `S3_ENDPOINT`    | S3-compatible object-store endpoint      | `http://localhost:9000`                                      |
 //! | `S3_REGION`      | S3 region label                          | `fr-par`                                                     |
 //! | `S3_ACCESS_KEY`  | S3 access key id                         | `myelin_dev_access`                                          |
@@ -65,6 +66,8 @@ pub const DEFAULT_REGION: &str = "fr-par";
 
 // ---- dev defaults: every one points at docker-compose.dev.yml ----
 const DEV_DATABASE_URL: &str = "postgres://myelin_app:myelin_app_pw@localhost:5433/myelin";
+const DEV_DATABASE_MIGRATION_URL: &str =
+    "postgres://myelin_admin:myelin_dev_pw@localhost:5433/myelin";
 const DEV_S3_ENDPOINT: &str = "http://localhost:9000";
 const DEV_S3_REGION: &str = "fr-par";
 const DEV_S3_ACCESS_KEY: &str = "myelin_dev_access";
@@ -85,8 +88,9 @@ pub enum Mode {
 
 /// The validated, env-first runtime config — the dev<->prod swap target.
 ///
-/// R0.7-C: `Debug` is hand-written (NOT derived) because [`MyelinConfig::database_url`] and
-/// [`MyelinConfig::redis_url`] are connection DSNs that embed a password in their userinfo
+/// R0.7-C: `Debug` is hand-written (NOT derived) because [`MyelinConfig::database_url`],
+/// [`MyelinConfig::database_migration_url`], and [`MyelinConfig::redis_url`] are connection DSNs
+/// that can embed a password in their userinfo
 /// (`postgres://user:PASSWORD@host/db`); a derived `{:?}` in a log line, a panic, or an error
 /// context would print that password in clear. The redacting impl below prints `<redacted>` for
 /// those two fields (and defers the S3 credential redaction to [`S3Config`]'s own impl).
@@ -94,6 +98,9 @@ pub enum Mode {
 pub struct MyelinConfig {
     /// Postgres OLTP connection string (OLTP + outbox + ReBAC tuple store + audit).
     pub database_url: String,
+    /// Postgres migration-only connection string. This privileged credential is consumed only by
+    /// the storage bootstrap and must never be retained by a serving provider.
+    pub database_migration_url: String,
     /// The S3-compatible object-store config (RustFS in dev, Scaleway Object Storage in prod).
     pub s3: S3Config,
     /// Valkey/Redis cache URL.
@@ -140,7 +147,10 @@ impl core::fmt::Debug for OidcSettings {
         f.debug_struct("OidcSettings")
             .field("issuer", &self.issuer)
             .field("audience", &self.audience)
-            .field("jwks_json", &format_args!("<{} bytes>", self.jwks_json.len()))
+            .field(
+                "jwks_json",
+                &format_args!("<{} bytes>", self.jwks_json.len()),
+            )
             .finish()
     }
 }
@@ -184,12 +194,13 @@ impl core::fmt::Debug for S3Config {
 }
 
 impl core::fmt::Debug for MyelinConfig {
-    /// R0.7-C: redact the credential-bearing DSN fields (`database_url`, `redis_url`) so a `{:?}`
-    /// never prints the password embedded in their userinfo. `s3` defers to [`S3Config`]'s own
-    /// redacting impl; `nats_url`/`region` carry no credential and print normally.
+    /// R0.7-C: redact every credential-bearing DSN so a `{:?}` never prints the password embedded
+    /// in its userinfo. `s3` defers to [`S3Config`]'s own redacting impl; `nats_url`/`region` carry
+    /// no credential and print normally.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MyelinConfig")
             .field("database_url", &"<redacted>")
+            .field("database_migration_url", &"<redacted>")
             .field("s3", &self.s3)
             .field("redis_url", &"<redacted>")
             .field("nats_url", &self.nats_url)
@@ -207,6 +218,14 @@ impl MyelinConfig {
     /// (fail-fast). `MYELIN_REGION` defaults to `fr-par` in BOTH modes — the residency pin.
     pub fn from_env(mode: Mode) -> Result<MyelinConfig, ConfigError> {
         let database_url = req(mode, "DATABASE_URL", DEV_DATABASE_URL)?;
+        let database_migration_url =
+            req(mode, "DATABASE_MIGRATION_URL", DEV_DATABASE_MIGRATION_URL)?;
+        if database_url == database_migration_url {
+            return Err(ConfigError::Invalid {
+                var: "DATABASE_MIGRATION_URL",
+                reason: "must use a credential distinct from DATABASE_URL".into(),
+            });
+        }
         let s3 = S3Config {
             endpoint: req(mode, "S3_ENDPOINT", DEV_S3_ENDPOINT)?,
             region: req(mode, "S3_REGION", DEV_S3_REGION)?,
@@ -237,6 +256,7 @@ impl MyelinConfig {
 
         Ok(MyelinConfig {
             database_url,
+            database_migration_url,
             s3,
             redis_url,
             nats_url,
@@ -263,12 +283,20 @@ fn read(_mode: Mode, var: &'static str) -> Option<String> {
 
 /// Resolve a required endpoint var per `mode`: dev falls back to `dev_default`; prod fails fast.
 fn req(mode: Mode, var: &'static str, dev_default: &str) -> Result<String, ConfigError> {
-    match read(mode, var) {
-        Some(v) => Ok(v),
-        None => match mode {
+    match env::var(var) {
+        Ok(v) if v.trim().is_empty() => Err(ConfigError::Invalid {
+            var,
+            reason: "must not be empty".into(),
+        }),
+        Ok(v) => Ok(v),
+        Err(env::VarError::NotPresent) => match mode {
             Mode::DevDefaults => Ok(dev_default.to_string()),
             Mode::RequireEnv => Err(ConfigError::Missing(var)),
         },
+        Err(env::VarError::NotUnicode(_)) => Err(ConfigError::Invalid {
+            var,
+            reason: "must be valid UTF-8".into(),
+        }),
     }
 }
 
@@ -335,6 +363,7 @@ mod tests {
     fn clear() {
         for v in [
             "DATABASE_URL",
+            "DATABASE_MIGRATION_URL",
             "S3_ENDPOINT",
             "S3_REGION",
             "S3_ACCESS_KEY",
@@ -358,6 +387,8 @@ mod tests {
         clear();
         let cfg = MyelinConfig::from_env(Mode::DevDefaults).unwrap();
         assert_eq!(cfg.database_url, DEV_DATABASE_URL);
+        assert_eq!(cfg.database_migration_url, DEV_DATABASE_MIGRATION_URL);
+        assert_ne!(cfg.database_url, cfg.database_migration_url);
         assert_eq!(cfg.s3.endpoint, "http://localhost:9000");
         assert_eq!(cfg.s3.bucket, "myelin-dev");
         assert!(cfg.s3.force_path_style);
@@ -373,6 +404,54 @@ mod tests {
         clear();
         let err = MyelinConfig::from_env(Mode::RequireEnv).unwrap_err();
         assert_eq!(err, ConfigError::Missing("DATABASE_URL"));
+
+        env::set_var("DATABASE_URL", "postgres://runtime-secret@prod/myelin");
+        let err = MyelinConfig::from_env(Mode::RequireEnv).unwrap_err();
+        assert_eq!(err, ConfigError::Missing("DATABASE_MIGRATION_URL"));
+        assert!(!format!("{err:?} {err}").contains("runtime-secret"));
+        clear();
+    }
+
+    #[test]
+    fn database_credentials_reject_empty_and_identical_values() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear();
+        env::set_var("DATABASE_URL", " ");
+        let err = MyelinConfig::from_env(Mode::DevDefaults).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::Invalid {
+                var: "DATABASE_URL",
+                reason: "must not be empty".into(),
+            }
+        );
+
+        env::set_var("DATABASE_URL", "postgres://runtime:secret@prod/myelin");
+        env::set_var("DATABASE_MIGRATION_URL", "\t");
+        let err = MyelinConfig::from_env(Mode::DevDefaults).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::Invalid {
+                var: "DATABASE_MIGRATION_URL",
+                reason: "must not be empty".into(),
+            }
+        );
+
+        env::set_var(
+            "DATABASE_MIGRATION_URL",
+            "postgres://runtime:secret@prod/myelin",
+        );
+        let err = MyelinConfig::from_env(Mode::DevDefaults).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "DATABASE_MIGRATION_URL",
+                ..
+            }
+        ));
+        let rendered = format!("{err:?} {err}");
+        assert!(!rendered.contains("runtime:secret"));
+        clear();
     }
 
     #[test]
@@ -381,6 +460,7 @@ mod tests {
         clear();
         // Supply every endpoint var but NOT MYELIN_REGION.
         env::set_var("DATABASE_URL", "postgres://prod/db");
+        env::set_var("DATABASE_MIGRATION_URL", "postgres://migrator@prod/db");
         env::set_var("S3_ENDPOINT", "https://s3.fr-par.scw.cloud");
         env::set_var("S3_REGION", "fr-par");
         env::set_var("S3_ACCESS_KEY", "k");
@@ -399,6 +479,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         clear();
         env::set_var("DATABASE_URL", "postgres://custom/x");
+        env::set_var("DATABASE_MIGRATION_URL", "postgres://custom-admin/x");
         env::set_var("MYELIN_REGION", "fr-par");
         let cfg = MyelinConfig::from_env(Mode::DevDefaults).unwrap();
         assert_eq!(cfg.database_url, "postgres://custom/x");
@@ -411,7 +492,14 @@ mod tests {
     fn debug_redacts_secrets() {
         let _g = ENV_LOCK.lock().unwrap();
         clear();
-        env::set_var("DATABASE_URL", "postgres://dbuser:SUPER_SECRET_DB_PW@host:5432/myelin");
+        env::set_var(
+            "DATABASE_URL",
+            "postgres://dbuser:SUPER_SECRET_DB_PW@host:5432/myelin",
+        );
+        env::set_var(
+            "DATABASE_MIGRATION_URL",
+            "postgres://migrator:MIGRATION_SECRET_DB_PW@host:5432/myelin",
+        );
         env::set_var("S3_ENDPOINT", "https://s3.fr-par.scw.cloud");
         env::set_var("S3_REGION", "fr-par");
         env::set_var("S3_ACCESS_KEY", "AKIA_SECRET_ACCESS_ID");
@@ -423,17 +511,45 @@ mod tests {
 
         // S3Config on its own redacts both credential fields.
         let s3_dbg = format!("{:?}", cfg.s3);
-        assert!(!s3_dbg.contains("AKIA_SECRET_ACCESS_ID"), "access_key leaked: {s3_dbg}");
-        assert!(!s3_dbg.contains("TOP_SECRET_S3_KEY_MATERIAL"), "secret_key leaked: {s3_dbg}");
-        assert!(s3_dbg.contains("<redacted>"), "expected a redaction marker: {s3_dbg}");
-        assert!(s3_dbg.contains("myelin-prod"), "non-secret bucket should still print: {s3_dbg}");
+        assert!(
+            !s3_dbg.contains("AKIA_SECRET_ACCESS_ID"),
+            "access_key leaked: {s3_dbg}"
+        );
+        assert!(
+            !s3_dbg.contains("TOP_SECRET_S3_KEY_MATERIAL"),
+            "secret_key leaked: {s3_dbg}"
+        );
+        assert!(
+            s3_dbg.contains("<redacted>"),
+            "expected a redaction marker: {s3_dbg}"
+        );
+        assert!(
+            s3_dbg.contains("myelin-prod"),
+            "non-secret bucket should still print: {s3_dbg}"
+        );
 
         // The whole config's Debug redacts the S3 secret AND the DSN passwords.
         let dbg = format!("{cfg:?}");
-        assert!(!dbg.contains("TOP_SECRET_S3_KEY_MATERIAL"), "s3 secret leaked via MyelinConfig: {dbg}");
-        assert!(!dbg.contains("SUPER_SECRET_DB_PW"), "db password leaked: {dbg}");
-        assert!(!dbg.contains("REDIS_SECRET_PW"), "redis password leaked: {dbg}");
-        assert!(dbg.contains("<redacted>"), "expected a redaction marker: {dbg}");
+        assert!(
+            !dbg.contains("TOP_SECRET_S3_KEY_MATERIAL"),
+            "s3 secret leaked via MyelinConfig: {dbg}"
+        );
+        assert!(
+            !dbg.contains("SUPER_SECRET_DB_PW"),
+            "db password leaked: {dbg}"
+        );
+        assert!(
+            !dbg.contains("MIGRATION_SECRET_DB_PW"),
+            "migration db password leaked: {dbg}"
+        );
+        assert!(
+            !dbg.contains("REDIS_SECRET_PW"),
+            "redis password leaked: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "expected a redaction marker: {dbg}"
+        );
         clear();
     }
 
@@ -443,9 +559,13 @@ mod tests {
     fn oidc_absent_is_none_and_boots() {
         let _g = ENV_LOCK.lock().unwrap();
         clear();
-        assert!(MyelinConfig::from_env(Mode::DevDefaults).unwrap().oidc.is_none());
+        assert!(MyelinConfig::from_env(Mode::DevDefaults)
+            .unwrap()
+            .oidc
+            .is_none());
         // A fully-configured prod env (no OIDC) still boots with oidc == None.
         env::set_var("DATABASE_URL", "postgres://prod/db");
+        env::set_var("DATABASE_MIGRATION_URL", "postgres://migrator@prod/db");
         env::set_var("S3_ENDPOINT", "https://s3.fr-par.scw.cloud");
         env::set_var("S3_REGION", "fr-par");
         env::set_var("S3_ACCESS_KEY", "k");
@@ -453,7 +573,10 @@ mod tests {
         env::set_var("S3_BUCKET", "myelin-prod");
         env::set_var("REDIS_URL", "rediss://prod:6379");
         env::set_var("NATS_URL", "nats://prod:4222");
-        assert!(MyelinConfig::from_env(Mode::RequireEnv).unwrap().oidc.is_none());
+        assert!(MyelinConfig::from_env(Mode::RequireEnv)
+            .unwrap()
+            .oidc
+            .is_none());
         clear();
     }
 
@@ -473,8 +596,14 @@ mod tests {
         assert_eq!(oidc.jwks_json, jwks);
         // The JWKS document (public keys) is not dumped in Debug — a byte summary instead.
         let dbg = format!("{oidc:?}");
-        assert!(dbg.contains("<"), "jwks_json should print a byte summary: {dbg}");
-        assert!(!dbg.contains("AQAB"), "jwks_json body should not be dumped: {dbg}");
+        assert!(
+            dbg.contains("<"),
+            "jwks_json should print a byte summary: {dbg}"
+        );
+        assert!(
+            !dbg.contains("AQAB"),
+            "jwks_json body should not be dumped: {dbg}"
+        );
         clear();
     }
 
@@ -496,7 +625,13 @@ mod tests {
         env::set_var("MYELIN_OIDC_JWKS", "{}");
         env::set_var("MYELIN_OIDC_JWKS_FILE", "/tmp/nope.json");
         let err = MyelinConfig::from_env(Mode::DevDefaults).unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid { var: "MYELIN_OIDC_JWKS", .. }));
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "MYELIN_OIDC_JWKS",
+                ..
+            }
+        ));
         clear();
     }
 
