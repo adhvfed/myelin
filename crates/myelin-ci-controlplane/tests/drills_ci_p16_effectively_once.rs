@@ -39,10 +39,10 @@ use myelin_ci_controlplane::{
 use myelin_ci_sandbox::events::{CI_CHECK_UPDATED, CI_RESULT, CI_RUN_SUCCEEDED};
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
-    job_idem_token, run_state, stage_verdict_marker, CiStage, DriveOutcome, DurableExecutor,
-    FlowDispatcher, FlowExecutor, FlowTelemetry, JobKind, JobRunner, JobSpec, MinorUnits, RunStore,
-    SignalOutcome, SignalSpec, SignalStore, TimerStore, WfCtx, WfJournal, WorkflowBody,
-    JOB_DONE_SIGNAL,
+    job_idem_token, partition_for_run_id, run_state, stage_verdict_marker, CiStage, DriveOutcome,
+    DurableExecutor, FlowDispatcher, FlowExecutor, FlowTelemetry, JobKind, JobRunner, JobSpec,
+    MinorUnits, RunStore, SignalOutcome, SignalSpec, SignalStore, TimerStore, WfCtx, WfJournal,
+    WorkflowBody, JOB_DONE_SIGNAL,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
@@ -172,13 +172,6 @@ struct Substrate {
     timers: TimerStore,
 }
 
-fn partition_for(run_id: &str) -> i16 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    run_id.hash(&mut h);
-    (h.finish() % myelin_flow::PARTITION_COUNT as u64) as i16
-}
-
 /// A FRESH dispatcher worker (a NEW control-plane process — the "kill the control plane" injection: a
 /// new worker re-drives the run off the shared journal/run-store).
 fn fresh_worker(
@@ -254,7 +247,7 @@ fn deliver_stage_done(
 #[test]
 fn ci_d1_kill_runner_and_control_plane_mid_run_is_effectively_once() {
     let (ex, run, sub) = start("ci.pipeline:pr-7:run-1");
-    let part = partition_for(&run.0);
+    let part = partition_for_run_id(&run.0);
     let scheduler = Arc::new(Mutex::new(SchedulerState::new()));
     let runner = CountingSchedulerRunner::new(scheduler.clone(), &run.0);
 

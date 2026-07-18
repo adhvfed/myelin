@@ -60,11 +60,11 @@ use myelin_tenancy::{Region, TenantId};
 use crate::merge_queue::{encode_ci_result, merge_attempt_id, MergeRequest};
 use crate::timer::sla::sla_timer_id;
 use crate::{
-    run_state, stage_verdict_marker, ActivityError, CiDispatch, CiDispatcher, CiPipelineSpec,
-    CiStage, DriveOutcome, DurableExecutor, FlowDispatcher, FlowExecutor, FlowTelemetry, JobKind,
-    JobRunner, JobSpec, MergeOutcome, MergePerformer, ReArmOutcome, RunStore, SignalSpec,
-    SignalStore, TimerRow, TimerStore, WfCtx, WfJournal, WorkflowBody, CI_PIPELINE_WF_TYPE,
-    CI_RESULT_SIGNAL, JOB_DONE_SIGNAL, PARTITION_COUNT,
+    partition_for_run_id, run_state, stage_verdict_marker, ActivityError, CiDispatch, CiDispatcher,
+    CiPipelineSpec, CiStage, DriveOutcome, DurableExecutor, FlowDispatcher, FlowExecutor,
+    FlowTelemetry, JobKind, JobRunner, JobSpec, MergeOutcome, MergePerformer, ReArmOutcome,
+    RunStore, SignalSpec, SignalStore, TimerRow, TimerStore, WfCtx, WfJournal, WorkflowBody,
+    CI_PIPELINE_WF_TYPE, CI_RESULT_SIGNAL, JOB_DONE_SIGNAL,
 };
 
 /// The Myelin self-tenant id (the platform self-hosts as exactly one cell — P-508 / CP-M6). Opaque,
@@ -98,13 +98,6 @@ fn ctx_base() -> EmitContextBase {
         recorded_at: Timestamp("2026-06-26T00:00:00Z".into()),
         caused_by: None,
     }
-}
-
-fn partition_for(run_id: &str) -> i16 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    run_id.hash(&mut h);
-    (h.finish() % PARTITION_COUNT as u64) as i16
 }
 
 /// The shared durable substrate a dogfood worker drives over (survives a worker restart — so the
@@ -275,7 +268,7 @@ impl PipelineFace {
 pub fn run_myelin_ci_pipeline() -> PipelineFace {
     let runner = Arc::new(CountingCiRunner::default());
     let (ex, run, sub) = start_pipeline("ci.pipeline:myelin:self-host:run-1");
-    let part = partition_for(&run.0);
+    let part = partition_for_run_id(&run.0);
     let stages = ["build", "test", "lint"];
 
     // Worker 1: dispatch build + park. Then the worker crashes (the control plane is gone) — exactly
@@ -446,7 +439,7 @@ pub fn run_myelin_merge_queue() -> MergeFace {
     let ci = Arc::new(CountingCi::default());
     let merger = Arc::new(CountingMerger::default());
     let (ex, run, sub) = start_merge("queue:myelin:main:pr-516");
-    let part = partition_for(&run.0);
+    let part = partition_for_run_id(&run.0);
 
     // Worker 1: dispatch CI + park. Then the worker crashes while parked (the merge-queue wake path).
     {

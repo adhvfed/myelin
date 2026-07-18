@@ -283,6 +283,10 @@ toml = "0.8"
 # self-describing content-address string + the fs key path.
 blake3 = "1"
 hex = "0.4"
+# Durable workflow rows persist a partition derived from the run id. Freeze the exact historical
+# algorithm (SipHash-1-3) through the dedicated pure-Rust `siphasher` implementation instead of
+# relying on `std::collections::hash_map::DefaultHasher`, whose algorithm is explicitly unspecified.
+siphasher = "1.0.3"
 # SHA-256 — the read-side integrity verification for git-imported objects/packs (P-ST-22 /
 # contract 11.2 git pack tier). Git addresses its objects by SHA (SHA-1 legacy / SHA-256
 # modern); the BlobStore admits a self-describing `sha256:` multihash tag (P-ST-03) so a

@@ -28,10 +28,10 @@ use myelin_ci_controlplane::CI_PIPELINE_WF_TYPE;
 use myelin_ci_sandbox::events::{CI_CHECK_UPDATED, CI_RESULT, CI_RUN_SUCCEEDED};
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
-    job_idem_token, run_state, stage_verdict_marker, CiStage, DriveOutcome, DurableExecutor,
-    FlowDispatcher, FlowExecutor, FlowTelemetry, JobKind, JobRunner, JobSpec, MinorUnits, RunStore,
-    SignalOutcome, SignalSpec, SignalStore, TimerStore, WfCtx, WfJournal, WorkflowBody,
-    JOB_DONE_SIGNAL,
+    job_idem_token, partition_for_run_id, run_state, stage_verdict_marker, CiStage, DriveOutcome,
+    DurableExecutor, FlowDispatcher, FlowExecutor, FlowTelemetry, JobKind, JobRunner, JobSpec,
+    MinorUnits, RunStore, SignalOutcome, SignalSpec, SignalStore, TimerStore, WfCtx, WfJournal,
+    WorkflowBody, JOB_DONE_SIGNAL,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
@@ -139,13 +139,6 @@ struct Substrate {
     timers: TimerStore,
 }
 
-fn partition_for(run_id: &str) -> i16 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    run_id.hash(&mut h);
-    (h.finish() % myelin_flow::PARTITION_COUNT as u64) as i16
-}
-
 fn fresh_worker(
     sub: &Substrate,
     worker: &str,
@@ -222,7 +215,7 @@ fn deliver_stage_done(
 fn ci_d9_ci_pipeline_body_replay_bit_identical_and_emits_x1_producer_facts() {
     let runner = Arc::new(CountingCiRunner::default());
     let (ex, run, sub) = start("ci.pipeline:pr-7:run-1");
-    let part = partition_for(&run.0);
+    let part = partition_for_run_id(&run.0);
 
     // DRIVE 1: dispatch `build` + park on its job.done.
     let w1 = fresh_worker(&sub, "worker-1", part, runner.clone());

@@ -17,9 +17,9 @@
 
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
-    approval_wait_name, request_approval_and_wait, run_state, DurableExecutor, FlowDispatcher,
-    FlowExecutor, FlowTelemetry, RetryPolicy, RunStore, SignalSpec, SignalStore, WaitOutcome,
-    WfCtx, WfJournal, WorkflowBody, DECLINE_MARKER,
+    approval_wait_name, partition_for_run_id, request_approval_and_wait, run_state,
+    DurableExecutor, FlowDispatcher, FlowExecutor, FlowTelemetry, RetryPolicy, RunStore,
+    SignalSpec, SignalStore, WaitOutcome, WfCtx, WfJournal, WorkflowBody, DECLINE_MARKER,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
@@ -106,15 +106,6 @@ struct Substrate {
     tele: FlowTelemetry,
 }
 
-/// The deterministic partition a run is hashed into (`hash(run_id) % PARTITION_COUNT`, §7.2) — the
-/// same hash `FlowExecutor::start` stamps, so the worker built on this partition leases the run.
-fn partition_for(run_id: &str) -> i16 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    run_id.hash(&mut h);
-    (h.finish() % myelin_flow::PARTITION_COUNT as u64) as i16
-}
-
 /// A FRESH dispatcher over the shared substrate (a "restart" / a "redeploy" — a new worker process),
 /// on the run's partition so its lease scan finds it.
 fn fresh_worker(sub: &Substrate, worker: &str, partition: i16) -> FlowDispatcher {
@@ -158,7 +149,7 @@ fn flow_d4_multiday_hitl_approve_across_restart_and_deploy_consumes_once() {
     };
 
     // WORKER 1 ticks: the body requests the approval card + PARKS (state=waiting holds no runtime).
-    let part = partition_for(&run.0);
+    let part = partition_for_run_id(&run.0);
     let w1 = fresh_worker(&sub, "worker-1", part);
     let o1 = w1
         .tick(1_000, "2026-06-21T00:00:00Z", 7)
@@ -273,7 +264,7 @@ fn flow_d4_multiday_hitl_deny_withholds_zero_mutation() {
     };
 
     // WORKER 1: request the card + park.
-    let part = partition_for(&run.0);
+    let part = partition_for_run_id(&run.0);
     let w1 = fresh_worker(&sub, "worker-1", part);
     assert_eq!(
         w1.tick(1_000, "2026-06-21T00:00:00Z", 7).unwrap(),

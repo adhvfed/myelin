@@ -25,10 +25,10 @@
 use myelin_events::check_seam::CiOverall;
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
-    encode_ci_result, merge_attempt_id, run_state, CiDispatch, CiDispatcher, DriveOutcome,
-    DurableExecutor, FlowDispatcher, FlowExecutor, FlowTelemetry, MergeOutcome, MergePerformer,
-    MergeRequest, RunStore, SignalOutcome, SignalSpec, SignalStore, TimerStore, WfCtx, WfJournal,
-    WorkflowBody, CI_RESULT_SIGNAL,
+    encode_ci_result, merge_attempt_id, partition_for_run_id, run_state, CiDispatch, CiDispatcher,
+    DriveOutcome, DurableExecutor, FlowDispatcher, FlowExecutor, FlowTelemetry, MergeOutcome,
+    MergePerformer, MergeRequest, RunStore, SignalOutcome, SignalSpec, SignalStore, TimerStore,
+    WfCtx, WfJournal, WorkflowBody, CI_RESULT_SIGNAL,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
@@ -135,13 +135,6 @@ struct Substrate {
     timers: TimerStore,
 }
 
-fn partition_for(run_id: &str) -> i16 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    run_id.hash(&mut h);
-    (h.finish() % myelin_flow::PARTITION_COUNT as u64) as i16
-}
-
 fn fresh_worker(
     sub: &Substrate,
     worker: &str,
@@ -224,7 +217,7 @@ fn merge_queue_success_double_delivery_one_wake_one_merge_across_restart() {
     let ci = Arc::new(CountingCi::default());
     let merger = Arc::new(CountingMerger::default());
     let (ex, run, sub) = start("queue:main:pr-7");
-    let part = partition_for(&run.0);
+    let part = partition_for_run_id(&run.0);
 
     // WORKER 1: dispatch CI + PARK on ci.result (state=waiting holds no runtime).
     let w1 = fresh_worker(&sub, "worker-1", part, ci.clone(), merger.clone());
@@ -341,7 +334,7 @@ fn merge_queue_failure_one_dequeue_humanised_reason() {
     let ci = Arc::new(CountingCi::default());
     let merger = Arc::new(CountingMerger::default());
     let (ex, run, sub) = start("queue:main:pr-8");
-    let part = partition_for(&run.0);
+    let part = partition_for_run_id(&run.0);
 
     let w1 = fresh_worker(&sub, "worker-1", part, ci.clone(), merger.clone());
     assert_eq!(
@@ -406,7 +399,7 @@ fn merge_queue_vanished_ci_run_timeout_bounds_the_wait() {
     let ci = Arc::new(CountingCi::default());
     let merger = Arc::new(CountingMerger::default());
     let (_ex, run, sub) = start("queue:main:pr-9");
-    let part = partition_for(&run.0);
+    let part = partition_for_run_id(&run.0);
 
     // WORKER 1 at clock=1000 with a 3600s SLA (the body's timeout) → dispatch + park.
     let w1 = fresh_worker(&sub, "worker-1", part, ci.clone(), merger.clone());
