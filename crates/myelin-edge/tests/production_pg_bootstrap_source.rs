@@ -42,6 +42,7 @@ fn production_edge_owns_the_durable_issue_saga_worker_without_an_in_memory_fallb
 
     assert!(main.contains("StoreBackedIssueAuthorizer::new(check.clone())"));
     assert!(main.contains("myelin_issues::PgIssueStore::new("));
+    assert!(main.contains("register_issues("));
     assert!(main.contains("spawn_issue_authorization_reconciler("));
     assert!(main.contains("tokio::signal::ctrl_c()"));
     assert!(main.contains("issue_reconciler.shutdown().await"));
@@ -49,7 +50,17 @@ fn production_edge_owns_the_durable_issue_saga_worker_without_an_in_memory_fallb
     assert!(!main.contains("StoreBackedCheck::new("));
     assert!(!main.contains("OutboxStore::new()"));
 
-    assert!(adapter.contains("ListObjectsResult::Filter { .. }"));
+    let routes = include_str!("../src/issues_http.rs");
+    assert!(routes.contains("/v1/issues"));
+    assert!(routes.contains("self.api.store.list(ctx.principal, request)"));
+    assert!(routes.contains("self.api.store.create(ctx.principal, proposal)"));
+    assert!(routes.contains("self.api.store.view(ctx.principal, id)"));
+    assert!(routes.contains("self.api.store.close(ctx.principal, id)"));
+    assert!(routes.contains("IssuePermission::View"));
+    assert!(routes.contains("IssuePermission::Close"));
+    assert!(!routes.contains("VisibleIssues::All"));
+
+    assert!(adapter.contains("VisibleIssues::effective_issue_view_filter()"));
     assert!(!adapter.contains("Ok(VisibleIssues::All)"));
     assert!(adapter.contains("MYELIN_ISSUES_RECONCILE_TENANTS"));
     assert!(dogfood.contains("export MYELIN_ISSUES_RECONCILE_TENANTS="));

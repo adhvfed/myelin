@@ -524,4 +524,47 @@ mod tests {
             "git.pr.merge"
         ));
     }
+
+    #[test]
+    fn issues_actions_require_their_exact_signed_capability() {
+        let view = identity(
+            CredentialPurpose::AgentRun {
+                run_id: "run-issues-view".into(),
+                delegation_snapshot: Some(9),
+            },
+            CredentialAudience::Edge,
+            &["issue.view"],
+        );
+        assert!(authorize_edge_action(&AllowAll, &view, "issues.list"));
+        assert!(authorize_edge_action(&AllowAll, &view, "issues.view"));
+        assert!(!authorize_edge_action(&AllowAll, &view, "issues.create"));
+        assert!(!authorize_edge_action(&AllowAll, &view, "issues.close"));
+
+        let transition = identity(
+            CredentialPurpose::AgentRun {
+                run_id: "run-issues-close".into(),
+                delegation_snapshot: Some(10),
+            },
+            CredentialAudience::Edge,
+            &["issue.transition"],
+        );
+        assert!(authorize_edge_action(
+            &AllowAll,
+            &transition,
+            "issues.close"
+        ));
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &transition,
+            "issues.view"
+        ));
+
+        let create = identity(
+            CredentialPurpose::Pat,
+            CredentialAudience::Edge,
+            &["issue.create"],
+        );
+        assert!(authorize_edge_action(&AllowAll, &create, "issues.create"));
+        assert!(!authorize_edge_action(&AllowAll, &create, "issues.close"));
+    }
 }
