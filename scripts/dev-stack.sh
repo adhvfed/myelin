@@ -42,6 +42,7 @@ case "${cmd}" in
   env)
     cat <<'EOF'
 export DATABASE_URL="postgres://myelin_app:myelin_app_pw@localhost:5433/myelin"
+export DATABASE_MIGRATION_URL="postgres://myelin_admin:myelin_dev_pw@localhost:5433/myelin"
 export S3_ENDPOINT="http://localhost:9000"
 export S3_REGION="fr-par"
 export S3_ACCESS_KEY="myelin_dev_access"
