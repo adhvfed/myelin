@@ -698,6 +698,9 @@ impl DurableGitBackend {
             BlobPathLookup::Missing => Err(DurableError::NotFound(format!(
                 "no such file `{path}` at `{gitref}`"
             ))),
+            BlobPathLookup::TooLarge { .. } => Err(DurableError::Git(
+                "unbounded edge blob read unexpectedly returned TooLarge".into(),
+            )),
             BlobPathLookup::Found {
                 bytes,
                 oid,
@@ -761,6 +764,9 @@ impl DurableGitBackend {
             }
             BlobPathLookup::Missing => {
                 return Err(EdgeError::NotFound("no such file at that ref".into()))
+            }
+            BlobPathLookup::TooLarge { .. } => {
+                return Err(EdgeError::Internal("unbounded blob read returned TooLarge".into()))
             }
         };
         // A conservative content-type: text stays `text/plain; charset=utf-8` (never executed),
