@@ -61,7 +61,7 @@ async fn main() {
     }
     // The AppSpec declaration is lifecycle metadata; production executes the six-table flow schema.
     if let Err(e) = bootstrap
-        .migrate(&flow_migrations(), &HotTables::none())
+        .migrate(&flow_migrations(), &HotTables::declare(["workflow_run"]))
         .await
     {
         eprintln!("myelin-flow: cannot apply the service-owned migrations: {e}");

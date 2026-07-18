@@ -87,10 +87,9 @@ pub fn flow_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         config,
         // The P-FLOW-01 six-table data model (the migrate phase the boot lifecycle runs → ready).
         migrations: flow_service_migrations(),
-        // The flow tables are fresh `CREATE TABLE`s at this milestone (no high-write expand→
-        // backfill→contract discipline yet); the per-table hot declaration is the engine's (M5
-        // scale, P-FLOW-19+). None here — a fresh table never needs the online ALTER idiom.
-        hot_tables: HotTables::none(),
+        // workflow_run is the engine's high-write control table. Declaring it hot makes every
+        // follow-on pass the online expand/backfill/contract gate; its initial CREATE remains safe.
+        hot_tables: HotTables::declare(["workflow_run"]),
         // The public surface (gateway-fronted, tenant-from-token) — the durable-execution API route
         // bodies are the engine prompts. The harness opens the live tenant-from-token surface.
         public: PublicRoutes::default(),
@@ -311,8 +310,8 @@ mod tests {
         );
     }
 
-    /// **The AppSpec wires the P-FLOW-01 six-table migration set + the EMPTY consumer seam.** The
-    /// migrate phase runs over the six tables; the `consumers` slot is empty (the replay engine +
+    /// **The AppSpec wires the six-table schema plus online control expands and the EMPTY consumer
+    /// seam.** The `consumers` slot is empty (the replay engine +
     /// the signal/timer consumers are the P-FLOW-04..05/09/13 floor — this shell has NO executor).
     #[test]
     fn shell_wires_the_six_table_migration_set_and_empty_consumer_seam() {
@@ -324,8 +323,8 @@ mod tests {
         );
         assert_eq!(
             spec.migrations.0.len(),
-            6,
-            "the AppSpec wires the P-FLOW-01 six-table data model (the migrate phase)"
+            8,
+            "six table creates plus two online workflow control expands"
         );
         assert_eq!(
             spec.migrations,
@@ -427,7 +426,7 @@ mod tests {
     }
 
     /// **The engine-wired AppSpec returns a dispatcher whose tick drives a runnable run (P-FLOW-05).**
-    /// `flow_app_spec_with_engine` assembles the SAME six-table spec PLUS the replay/lease worker
+    /// `flow_app_spec_with_engine` assembles the SAME schema/control set PLUS the replay/lease worker
     /// loop; a registered body + a seeded runnable run drive to completion on one tick — the consumer
     /// seam is filled by the engine's worker (not a bus subscriber). The spec still wires the six
     /// tables (the migrate phase is unchanged).
@@ -465,11 +464,11 @@ mod tests {
             "worker-1",
             30,
         );
-        // the six-table migrate phase is unchanged (the engine wiring does not add a second schema).
+        // Engine wiring does not add a second schema.
         assert_eq!(
             spec.migrations.0.len(),
-            6,
-            "the engine-wired spec still wires the six tables"
+            8,
+            "the engine-wired spec keeps the schema and online control expands"
         );
 
         // register a body + seed a runnable run; one tick drives it to completion.
