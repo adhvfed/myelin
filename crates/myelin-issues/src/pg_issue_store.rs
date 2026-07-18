@@ -12,18 +12,23 @@
 //! bypass object authorization.
 
 use crate::dek::{decrypt_free_text, encrypt_free_text, IssueFreeText};
-use myelin_identity::Principal;
+use myelin_identity::{Principal, PrincipalKind};
 use myelin_storage::encryption::{EncryptedColumn, SubjectId};
 use myelin_storage::kms::{KmsEngine, PiiKeyRef, NONCE_LEN};
 use myelin_storage::{SubstrateProvider, TenantScope};
 use sqlx::types::Uuid;
 use sqlx::Row;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Maximum issue title bytes accepted at the durable boundary.
 pub const MAX_TITLE_BYTES: usize = 512;
 /// Maximum page size; callers cannot request an unbounded tenant scan.
 pub const MAX_PAGE_SIZE: u32 = 100;
+/// Maximum materialised Identity allow-set accepted before any database transaction is opened.
+/// Larger sets must use Identity's push-down/filter representation rather than allocating a huge
+/// `ANY(uuid[])` parameter at the Issues boundary.
+pub const MAX_AUTHORIZED_ISSUE_IDS: usize = 10_000;
 
 /// Object permission checked before an issue read or transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +49,13 @@ pub enum VisibleIssues {
     All,
     /// A bounded, pre-authorized issue-id set to conjoin with the tenant-scoped SQL query.
     Ids(Vec<String>),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum QueryVisibility {
+    None,
+    All,
+    Ids(Vec<Uuid>),
 }
 
 /// Required production authorization seam. The live implementation is Identity/ReBAC; there is no
@@ -190,7 +202,13 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         }
 
         let tenant = principal.tenant.clone();
-        let subject = SubjectId::new(principal.principal_id.0.clone());
+        // The title is controller-authored free text, so its erasure subject is the verified creator.
+        // For an agent acting on behalf of a human, Identity's explicit `on_behalf_of` subject owns
+        // the title DEK; otherwise the stable opaque creator principal does. This gives a reachable
+        // individual crypto-shred lever without fabricating a reporter identity. A title that names
+        // some unrelated third party remains the platform-wide third-party-content residual; no
+        // single row key can infer every person mentioned inside opaque free text.
+        let subject = SubjectId::new(title_dek_subject(principal));
         let sealed = encrypt_free_text(
             &self.kms,
             &principal.region,
@@ -226,11 +244,13 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                          INSERT INTO issue (\
                            tenant_id, region, id, key, prefix, type_id, type_rank, state, \
                            state_category, reporter, project_id, rank, title, title_nonce, \
-                           title_ciphertext, created_by_principal, pii_key_ref, version\
+                           title_ciphertext, created_by_principal, pii_key_ref, \
+                           contains_personal_data, version\
                          ) \
                          SELECT $1, $2, gen_random_uuid(), $3 || '-' || high_water::text, $3, $4, \
-                           0, 'Todo', 'unstarted', gen_random_uuid(), $5, \
-                           '0|' || lpad(high_water::text, 20, '0'), '<encrypted>', $6, $7, $8, $9, 1 \
+                           0, 'Todo', 'unstarted', NULL, $5, \
+                           '0|' || lpad(high_water::text, 20, '0'), '<encrypted>', $6, $7, $8, $9, \
+                           true, 1 \
                          FROM allocated \
                          RETURNING id, key, project_id, state, state_category, title_nonce, \
                            title_ciphertext, pii_key_ref, version, created_at::text, updated_at::text",
@@ -291,11 +311,12 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         page: IssuePageRequest,
     ) -> Result<IssuePage, IssueStoreError> {
         let scope = self.scope(principal)?;
-        let visible = self
-            .authorizer
-            .visible_issues(principal)
-            .map_err(IssueStoreError::AuthorizationUnavailable)?;
-        if visible == VisibleIssues::None {
+        let visible = normalize_visible(
+            self.authorizer
+                .visible_issues(principal)
+                .map_err(IssueStoreError::AuthorizationUnavailable)?,
+        )?;
+        if visible == QueryVisibility::None {
             return Ok(IssuePage {
                 items: Vec::new(),
                 next_cursor: None,
@@ -314,25 +335,15 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             .with_tenant_tx(&tenant_id.clone(), move |conn| {
                 Box::pin(async move {
                     let result = match visible {
-                        VisibleIssues::None => unreachable!("handled before the transaction"),
-                        VisibleIssues::All => {
+                        QueryVisibility::None => unreachable!("handled before the transaction"),
+                        QueryVisibility::All => {
                             sqlx::query(&format!("{} ORDER BY id ASC LIMIT $2", SELECT_BASE))
                                 .bind(cursor)
                                 .bind(fetch_limit)
                                 .fetch_all(&mut *conn)
                                 .await
                         }
-                        VisibleIssues::Ids(ids) => {
-                            let ids: Result<Vec<Uuid>, _> =
-                                ids.iter().map(|id| Uuid::parse_str(id)).collect();
-                            let ids = ids.map_err(|_| {
-                                myelin_storage::PgError::Query(
-                                    "authorization returned a malformed issue UUID".into(),
-                                )
-                            })?;
-                            if ids.is_empty() {
-                                return Ok(Vec::new());
-                            }
+                        QueryVisibility::Ids(ids) => {
                             sqlx::query(&format!(
                                 "{} AND id = ANY($2) ORDER BY id ASC LIMIT $3",
                                 SELECT_BASE
@@ -509,6 +520,44 @@ fn validate_create(proposal: &CreateIssue) -> Result<(), IssueStoreError> {
     Ok(())
 }
 
+fn title_dek_subject(principal: &Principal) -> String {
+    match &principal.kind {
+        PrincipalKind::Agent {
+            on_behalf_of: Some(subject),
+            ..
+        } => subject.0.clone(),
+        _ => principal.principal_id.0.clone(),
+    }
+}
+
+fn normalize_visible(visible: VisibleIssues) -> Result<QueryVisibility, IssueStoreError> {
+    match visible {
+        VisibleIssues::None => Ok(QueryVisibility::None),
+        VisibleIssues::All => Ok(QueryVisibility::All),
+        VisibleIssues::Ids(ids) => {
+            if ids.len() > MAX_AUTHORIZED_ISSUE_IDS {
+                return Err(IssueStoreError::AuthorizationUnavailable(format!(
+                    "Identity materialised more than {MAX_AUTHORIZED_ISSUE_IDS} issue ids; a bounded push-down filter is required"
+                )));
+            }
+            let mut unique = BTreeSet::new();
+            for id in ids {
+                let id = Uuid::parse_str(&id).map_err(|_| {
+                    IssueStoreError::AuthorizationUnavailable(
+                        "Identity returned a malformed issue UUID".into(),
+                    )
+                })?;
+                unique.insert(id);
+            }
+            if unique.is_empty() {
+                Ok(QueryVisibility::None)
+            } else {
+                Ok(QueryVisibility::Ids(unique.into_iter().collect()))
+            }
+        }
+    }
+}
+
 fn parse_uuid(field: &str, value: &str) -> Result<Uuid, IssueStoreError> {
     Uuid::parse_str(value).map_err(|_| IssueStoreError::BadInput(format!("{field} must be a UUID")))
 }
@@ -516,6 +565,8 @@ fn parse_uuid(field: &str, value: &str) -> Result<Uuid, IssueStoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use myelin_identity::{DataRole, PrincipalId, PrincipalStatus, RuntimeRef};
+    use myelin_tenancy::{Region, TenantId};
 
     #[test]
     fn pagination_is_bounded_and_cursor_is_typed() {
@@ -544,5 +595,43 @@ mod tests {
         bad = valid;
         bad.project_id = "path-tenant-smuggling".into();
         assert!(validate_create(&bad).is_err());
+    }
+
+    #[test]
+    fn materialised_visibility_is_bounded_deduplicated_and_typed_before_sql() {
+        let id = "11111111-1111-1111-1111-111111111111".to_string();
+        let normalized = normalize_visible(VisibleIssues::Ids(vec![id.clone(), id])).unwrap();
+        assert!(matches!(normalized, QueryVisibility::Ids(ids) if ids.len() == 1));
+        assert!(normalize_visible(VisibleIssues::Ids(vec!["not-a-uuid".into()])).is_err());
+        assert!(normalize_visible(VisibleIssues::Ids(vec![
+            "11111111-1111-1111-1111-111111111111".into();
+            MAX_AUTHORIZED_ISSUE_IDS + 1
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn title_dek_subject_uses_explicit_on_behalf_of_else_stable_creator() {
+        let human = Principal::new(
+            TenantId::from_token("acme"),
+            Region::new("fr-par"),
+            PrincipalId("human:ada".into()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        );
+        assert_eq!(title_dek_subject(&human), "human:ada");
+        let agent = Principal::new(
+            TenantId::from_token("acme"),
+            Region::new("fr-par"),
+            PrincipalId("agent:reviewer".into()),
+            PrincipalKind::Agent {
+                runtime_ref: RuntimeRef("runtime:1".into()),
+                on_behalf_of: Some(PrincipalId("human:ada".into())),
+            },
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        );
+        assert_eq!(title_dek_subject(&agent), "human:ada");
     }
 }
