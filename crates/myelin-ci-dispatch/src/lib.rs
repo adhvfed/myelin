@@ -87,9 +87,10 @@ pub use dispatch::{
 };
 
 pub use resolve::{
-    reserve_and_start, resolve_snapshot, snapshot_ref, CheckContext, CiDefinition, CiRunWrite,
-    JobDef, JobKind, ResolveError, ResolvedJob, ResolvedSnapshot, ResolvedSnapshotExt, RunFacts, StartHandoff,
-    StartSpec, CI_PIPELINE_WF_TYPE,
+    reserve_and_start, resolve_snapshot, snapshot_ref, CheckContext, CiDefinition, CiPlanContract,
+    CiRunWrite, JobDef, JobKind, ResolveError, ResolvedJob, ResolvedJobV1, ResolvedJobV2,
+    ResolvedRunPlanV1, ResolvedRunPlanV2, ResolvedSnapshot, ResolvedSnapshotExt, RunFacts,
+    StartHandoff, StartSpec, CI_PIPELINE_WF_TYPE,
 };
 
 use myelin_substrate::{

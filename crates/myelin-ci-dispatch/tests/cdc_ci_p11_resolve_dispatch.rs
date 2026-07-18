@@ -42,6 +42,7 @@ fn tenant() -> TenantId {
 
 fn definition() -> CiDefinition {
     CiDefinition {
+        contract: myelin_ci_dispatch::CiPlanContract::V1,
         on: OnTrigger::PullRequest,
         jobs: vec![
             JobDef::normal("build", PINNED_BUILD, ["build"]),

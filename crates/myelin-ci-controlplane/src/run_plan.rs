@@ -14,8 +14,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::ci_run_store::CiRunRecord;
 
-/// The only schema version this loader can execute.
+/// The legacy DAG-only schema version the current PostgreSQL starter can execute.
 pub const RUN_PLAN_SCHEMA_V1: u32 = 1;
+/// The resolved request schema that preserves authored stages and names the requested execution
+/// profile without granting any runtime authority.
+pub const RUN_PLAN_SCHEMA_V2: u32 = 2;
+/// Version of the execution-profile request nested in a version-2 run plan.
+pub const EXECUTION_REQUEST_SCHEMA_V1: u32 = 1;
+/// Frozen domain for the version-1 launch-request digest.
+pub const LAUNCH_REQUEST_DIGEST_V1_DOMAIN: &str = "myelin.ci.launch-request.v1";
 /// Maximum plaintext or stored snapshot size accepted by the execution boundary.
 pub const MAX_RUN_PLAN_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum number of resolved jobs in one plan.
@@ -63,6 +70,65 @@ pub struct ResolvedJobV1 {
     pub matrix_key: BTreeMap<String, String>,
 }
 
+/// The one execution profile that the first version-2 authored request can name.
+///
+/// This is a request, not a server grant: it carries no trust, token, secret, egress, workspace,
+/// resource, scheduling, metering, or check authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CiExecutionProfileV1 {
+    #[serde(rename = "linux-small-v1")]
+    LinuxSmallV1,
+}
+
+/// Versioned authored execution request nested in a version-2 resolved plan.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CiExecutionRequestV1 {
+    /// Must equal [`EXECUTION_REQUEST_SCHEMA_V1`].
+    pub schema_version: u32,
+    /// Requested profile. Policy-aware control-plane code must still grant or refuse it later.
+    pub profile: CiExecutionProfileV1,
+}
+
+/// Version-2 resolved run-plan wire. Field order is part of its canonical JSON representation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedRunPlanV2 {
+    /// Must equal [`RUN_PLAN_SCHEMA_V2`].
+    pub schema_version: u32,
+    /// Authored profile request, never server launch authority.
+    pub execution: CiExecutionRequestV1,
+    /// Resolved jobs, sorted strictly by concrete [`ResolvedJobV2::name`].
+    pub jobs: Vec<ResolvedJobV2>,
+}
+
+/// One resolved version-2 DAG node.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedJobV2 {
+    /// Authored DAG-stage name and check context. Matrix instances intentionally share it.
+    pub stage: String,
+    /// Unique concrete matrix-expanded DAG-node name.
+    pub name: String,
+    /// Digest-pinned image request.
+    pub image: String,
+    /// Exact argv request. No shell or fallback executable is inferred.
+    pub command: Vec<String>,
+    /// Concrete DAG-node dependencies, sorted strictly.
+    pub needs: Vec<String>,
+    /// Reserved generator marker. Version 2 refuses `true` until fragment ingestion exists.
+    pub is_generator: bool,
+    /// Deterministically ordered resolved matrix axes.
+    pub matrix_key: BTreeMap<String, String>,
+}
+
+/// Public carrier for either canonical resolved-plan wire version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VersionedResolvedRunPlan {
+    V1(ResolvedRunPlanV1),
+    V2(ResolvedRunPlanV2),
+}
+
 impl ResolvedJobV1 {
     /// Collision-safe, deterministic identity bytes for the matrix assignment.
     ///
@@ -96,6 +162,82 @@ impl ResolvedRunPlanV1 {
         }
         Ok(bytes)
     }
+}
+
+impl ResolvedRunPlanV2 {
+    /// Validate semantics and return the deterministic compact JSON representation.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, RunPlanError> {
+        validate_plan_v2(self)?;
+        canonical_json(self)
+    }
+
+    /// Digest the complete ordered launch request without converting it into runtime authority.
+    ///
+    /// The BLAKE3 derive-key input is one `u64`-big-endian length-prefixed frame for the canonical
+    /// execution request followed by one frame for each canonical job in deterministic plan order.
+    pub fn launch_request_digest_v1(&self) -> Result<String, RunPlanError> {
+        validate_plan_v2(self)?;
+        let mut hasher = blake3::Hasher::new_derive_key(LAUNCH_REQUEST_DIGEST_V1_DOMAIN);
+        let request = canonical_json_unbounded(&self.execution)?;
+        update_digest_frame(&mut hasher, &request);
+        for job in &self.jobs {
+            let bytes = canonical_json_unbounded(job)?;
+            update_digest_frame(&mut hasher, &bytes);
+        }
+        Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+    }
+}
+
+impl VersionedResolvedRunPlan {
+    pub fn schema_version(&self) -> u32 {
+        match self {
+            Self::V1(plan) => plan.schema_version,
+            Self::V2(plan) => plan.schema_version,
+        }
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, RunPlanError> {
+        match self {
+            Self::V1(plan) => plan.canonical_bytes(),
+            Self::V2(plan) => plan.canonical_bytes(),
+        }
+    }
+
+    pub fn as_v1(&self) -> Option<&ResolvedRunPlanV1> {
+        match self {
+            Self::V1(plan) => Some(plan),
+            Self::V2(_) => None,
+        }
+    }
+
+    pub fn as_v2(&self) -> Option<&ResolvedRunPlanV2> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(plan) => Some(plan),
+        }
+    }
+}
+
+fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, RunPlanError> {
+    let bytes = canonical_json_unbounded(value)?;
+    if bytes.len() > MAX_RUN_PLAN_BYTES {
+        return Err(RunPlanError::SnapshotTooLarge {
+            actual: bytes.len(),
+            maximum: MAX_RUN_PLAN_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
+fn canonical_json_unbounded<T: Serialize>(value: &T) -> Result<Vec<u8>, RunPlanError> {
+    serde_json::to_vec(value).map_err(|error| RunPlanError::WireMalformed {
+        detail: error.to_string(),
+    })
+}
+
+fn update_digest_frame(hasher: &mut blake3::Hasher, frame: &[u8]) {
+    hasher.update(&(frame.len() as u64).to_be_bytes());
+    hasher.update(frame);
 }
 
 /// A fully parsed and validated plan, still carrying its authoritative tenant and content address.
@@ -142,6 +284,8 @@ pub enum RunPlanError {
     TenantMismatch { record: String, reference: String },
     /// A legacy or unsupported snapshot must be rebuilt by current dispatch.
     RedispatchRequired(RedispatchReason),
+    /// The current V1-only starter encountered a valid V2 request but launch authority is absent.
+    LaunchAuthorityRequired { version: u32 },
     /// The CAS metadata/read operation failed.
     Blob(BlobError),
     /// The advertised or returned object is above the hard size ceiling.
@@ -182,6 +326,10 @@ impl std::fmt::Display for RunPlanError {
                     "CI run-plan schema version {version} is unsupported; re-dispatch is required"
                 )
             }
+            RunPlanError::LaunchAuthorityRequired { version } => write!(
+                f,
+                "CI run-plan schema version {version} is a valid request but cannot execute until durable launch authority is materialized"
+            ),
             RunPlanError::Blob(error) => write!(f, "CI run-plan blob access failed: {error}"),
             RunPlanError::SnapshotTooLarge { actual, maximum } => write!(
                 f,
@@ -191,7 +339,7 @@ impl std::fmt::Display for RunPlanError {
                 write!(f, "CI run-plan CAS metadata address mismatch")
             }
             RunPlanError::WireMalformed { detail } => {
-                write!(f, "malformed CI run-plan v1 wire: {detail}")
+                write!(f, "malformed CI run-plan wire: {detail}")
             }
             RunPlanError::InvalidPlan { detail } => write!(f, "invalid CI run plan: {detail}"),
         }
@@ -234,7 +382,14 @@ pub fn load_resolved_run_plan<B: BlobStore + ?Sized>(
             maximum: MAX_RUN_PLAN_BYTES,
         });
     }
-    let plan = decode_plan(&bytes)?;
+    let plan = match decode_resolved_run_plan(&bytes)? {
+        VersionedResolvedRunPlan::V1(plan) => plan,
+        VersionedResolvedRunPlan::V2(plan) => {
+            return Err(RunPlanError::LaunchAuthorityRequired {
+                version: plan.schema_version,
+            })
+        }
+    };
 
     Ok(PreparedRunPlan {
         tenant,
@@ -323,7 +478,14 @@ fn valid_tenant_token(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
-fn decode_plan(bytes: &[u8]) -> Result<ResolvedRunPlanV1, RunPlanError> {
+/// Decode either supported canonical plan wire without granting it execution authority.
+pub fn decode_resolved_run_plan(bytes: &[u8]) -> Result<VersionedResolvedRunPlan, RunPlanError> {
+    if bytes.len() > MAX_RUN_PLAN_BYTES {
+        return Err(RunPlanError::SnapshotTooLarge {
+            actual: bytes.len(),
+            maximum: MAX_RUN_PLAN_BYTES,
+        });
+    }
     let envelope: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|error| RunPlanError::WireMalformed {
             detail: error.to_string(),
@@ -343,20 +505,30 @@ fn decode_plan(bytes: &[u8]) -> Result<ResolvedRunPlanV1, RunPlanError> {
         .ok_or_else(|| RunPlanError::WireMalformed {
             detail: "schema_version must be an unsigned integer".into(),
         })?;
-    if version != u64::from(RUN_PLAN_SCHEMA_V1) {
-        return Err(RunPlanError::RedispatchRequired(
-            RedispatchReason::UnsupportedVersion(version),
-        ));
-    }
-
-    let plan: ResolvedRunPlanV1 =
-        serde_json::from_value(envelope).map_err(|error| RunPlanError::WireMalformed {
-            detail: error.to_string(),
-        })?;
-    validate_plan(&plan)?;
-    let canonical = serde_json::to_vec(&plan).map_err(|error| RunPlanError::WireMalformed {
-        detail: error.to_string(),
-    })?;
+    let plan = match version {
+        version if version == u64::from(RUN_PLAN_SCHEMA_V1) => {
+            let plan: ResolvedRunPlanV1 =
+                serde_json::from_value(envelope).map_err(|error| RunPlanError::WireMalformed {
+                    detail: error.to_string(),
+                })?;
+            validate_plan(&plan)?;
+            VersionedResolvedRunPlan::V1(plan)
+        }
+        version if version == u64::from(RUN_PLAN_SCHEMA_V2) => {
+            let plan: ResolvedRunPlanV2 =
+                serde_json::from_value(envelope).map_err(|error| RunPlanError::WireMalformed {
+                    detail: error.to_string(),
+                })?;
+            validate_plan_v2(&plan)?;
+            VersionedResolvedRunPlan::V2(plan)
+        }
+        version => {
+            return Err(RunPlanError::RedispatchRequired(
+                RedispatchReason::UnsupportedVersion(version),
+            ))
+        }
+    };
+    let canonical = plan.canonical_bytes()?;
     if bytes != canonical {
         return Err(RunPlanError::WireMalformed {
             detail: "snapshot bytes are not canonical compact JSON".into(),
@@ -499,6 +671,43 @@ fn validate_plan(plan: &ResolvedRunPlanV1) -> Result<(), RunPlanError> {
         return invalid("job dependency graph contains a cycle");
     }
     Ok(())
+}
+
+fn validate_plan_v2(plan: &ResolvedRunPlanV2) -> Result<(), RunPlanError> {
+    if plan.schema_version != RUN_PLAN_SCHEMA_V2 {
+        return Err(RunPlanError::RedispatchRequired(
+            RedispatchReason::UnsupportedVersion(u64::from(plan.schema_version)),
+        ));
+    }
+    if plan.execution.schema_version != EXECUTION_REQUEST_SCHEMA_V1 {
+        return invalid(format!(
+            "execution request schema version {} is unsupported",
+            plan.execution.schema_version
+        ));
+    }
+    if plan
+        .jobs
+        .iter()
+        .any(|job| !valid_machine_token(&job.stage, MAX_JOB_NAME_BYTES))
+    {
+        return invalid("every version-2 authored stage must be a bounded machine token");
+    }
+    let compatibility = ResolvedRunPlanV1 {
+        schema_version: RUN_PLAN_SCHEMA_V1,
+        jobs: plan
+            .jobs
+            .iter()
+            .map(|job| ResolvedJobV1 {
+                name: job.name.clone(),
+                image: job.image.clone(),
+                command: job.command.clone(),
+                needs: job.needs.clone(),
+                is_generator: job.is_generator,
+                matrix_key: job.matrix_key.clone(),
+            })
+            .collect(),
+    };
+    validate_plan(&compatibility)
 }
 
 fn validate_matrix(job: &ResolvedJobV1) -> Result<(), RunPlanError> {
