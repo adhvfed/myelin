@@ -35,7 +35,9 @@ fn envelope(aggregate: &str, seq: u32) -> EventEnvelope {
             PrincipalKind::Service,
             TenantId("elected-relay-tenant".into()),
         )),
-        subject: ArtifactRef(format!("myelin://elected-relay/issues/issue/{aggregate}")),
+        subject: ArtifactRef(format!(
+            "myelin://elected-relay-tenant/issue/issue/{aggregate}"
+        )),
         aggregate: AggregateKey(aggregate.into()),
         causation_id: None,
         correlation_id: CorrelationId(format!("corr-{aggregate}-{seq}")),

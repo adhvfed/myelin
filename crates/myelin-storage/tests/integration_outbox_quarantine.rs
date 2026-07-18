@@ -7,7 +7,7 @@ use myelin_config::MyelinConfig;
 use myelin_events::relay::{Delivery, EventPublisher, TransportError};
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventId, EventType,
-    InProcessBus, Timestamp, Visibility, OUTBOX_MIGRATION, OUTBOX_QUARANTINE_MIGRATION,
+    InProcessBus, PiiKeyRef, Timestamp, Visibility, OUTBOX_MIGRATION, OUTBOX_QUARANTINE_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::elected_relay::{ElectedDrainOutcome, ElectedPgRelay};
@@ -131,6 +131,19 @@ async fn strict_relay_quarantines_permanent_rows_and_preserves_transient_rows() 
         .await
         .expect("enqueue good row");
 
+    let mut good_pii = envelope(
+        "good-pii",
+        "issue:good-pii",
+        "no-osl",
+        serde_json::json!({"ciphertext_ref": "blob:opaque"}),
+    );
+    good_pii.contains_personal_data = true;
+    // Epoch zero is the KMS authority's valid initial generation, not a malformed epoch.
+    good_pii.pii_key_ref = Some(PiiKeyRef("kms://relay-quarantine/0/subject:u42".into()));
+    raw.enqueue("issue:good-pii", 0, &good_pii)
+        .await
+        .expect("enqueue valid PII row");
+
     insert_raw(
         &pool,
         "bad-json",
@@ -199,6 +212,87 @@ async fn strict_relay_quarantines_permanent_rows_and_preserves_transient_rows() 
         .await
         .expect("enqueue invalid taxonomy");
 
+    let mut false_with_key = envelope(
+        "false-with-key",
+        "issue:false-with-key",
+        "no-osl",
+        serde_json::json!({}),
+    );
+    false_with_key.pii_key_ref = Some(PiiKeyRef("kms://relay-quarantine/0/tenant".into()));
+    raw.enqueue("issue:false-with-key", 0, &false_with_key)
+        .await
+        .expect("enqueue false/key mismatch");
+
+    let mut true_without_key = envelope(
+        "true-without-key",
+        "issue:true-without-key",
+        "no-osl",
+        serde_json::json!({}),
+    );
+    true_without_key.contains_personal_data = true;
+    raw.enqueue("issue:true-without-key", 0, &true_without_key)
+        .await
+        .expect("enqueue true/no-key mismatch");
+
+    let mut malformed_key = envelope(
+        "malformed-key",
+        "issue:malformed-key",
+        "no-osl",
+        serde_json::json!({}),
+    );
+    malformed_key.contains_personal_data = true;
+    malformed_key.pii_key_ref = Some(PiiKeyRef(
+        "kms://relay-quarantine/0/subject:u42/extra".into(),
+    ));
+    raw.enqueue("issue:malformed-key", 0, &malformed_key)
+        .await
+        .expect("enqueue malformed key ref");
+
+    let mut cross_tenant_key = envelope(
+        "cross-tenant-key",
+        "issue:cross-tenant-key",
+        "no-osl",
+        serde_json::json!({}),
+    );
+    cross_tenant_key.contains_personal_data = true;
+    cross_tenant_key.pii_key_ref = Some(PiiKeyRef("kms://foreign/0/blob".into()));
+    raw.enqueue("issue:cross-tenant-key", 0, &cross_tenant_key)
+        .await
+        .expect("enqueue cross-tenant key ref");
+
+    let mut malformed_subject = envelope(
+        "malformed-subject",
+        "issue:malformed-subject",
+        "no-osl",
+        serde_json::json!({}),
+    );
+    malformed_subject.subject = ArtifactRef("https://relay-quarantine/issue/issue/one".into());
+    raw.enqueue("issue:malformed-subject", 0, &malformed_subject)
+        .await
+        .expect("enqueue malformed subject");
+
+    let mut cross_tenant_subject = envelope(
+        "cross-tenant-subject",
+        "issue:cross-tenant-subject",
+        "no-osl",
+        serde_json::json!({}),
+    );
+    cross_tenant_subject.subject = ArtifactRef("myelin://foreign/issue/issue/one".into());
+    raw.enqueue("issue:cross-tenant-subject", 0, &cross_tenant_subject)
+        .await
+        .expect("enqueue cross-tenant subject");
+
+    let mut zero_schema = envelope(
+        "zero-schema",
+        "issue:zero-schema",
+        "no-osl",
+        serde_json::json!({}),
+    );
+    zero_schema.schema_ver = 0;
+    raw.enqueue("issue:zero-schema", 0, &zero_schema)
+        .await
+        .expect("enqueue zero schema version");
+
     let wrong_region = envelope(
         "wrong-region",
         "issue:wrong-region",
@@ -258,14 +352,14 @@ async fn strict_relay_quarantines_permanent_rows_and_preserves_transient_rows() 
             .drain_once(publisher.as_ref(), 64)
             .await
             .expect("strict pass"),
-        ElectedDrainOutcome::Published(1)
+        ElectedDrainOutcome::Published(2)
     );
     assert_eq!(
         *publisher
             .ids
             .lock()
             .unwrap_or_else(|error| error.into_inner()),
-        vec!["good".to_string()]
+        vec!["good".to_string(), "good-pii".to_string()]
     );
 
     let quarantined: Vec<(String, String)> =
@@ -280,11 +374,21 @@ async fn strict_relay_quarantines_permanent_rows_and_preserves_transient_rows() 
             ("aggregate-mismatch".into(), "aggregate_mismatch".into()),
             ("bad-json".into(), "invalid_envelope_json".into()),
             ("blocked-head".into(), "subject_mismatch".into()),
+            ("cross-tenant-key".into(), "pii_key_tenant_mismatch".into()),
+            (
+                "cross-tenant-subject".into(),
+                "subject_tenant_mismatch".into()
+            ),
+            ("false-with-key".into(), "pii_presence_mismatch".into()),
             ("invalid-taxonomy".into(), "invalid_event_taxonomy".into()),
+            ("malformed-key".into(), "invalid_pii_key_ref".into()),
+            ("malformed-subject".into(), "invalid_artifact_ref".into()),
             ("outside-id".into(), "event_id_mismatch".into()),
             ("oversized".into(), "envelope_too_large".into()),
+            ("true-without-key".into(), "pii_presence_mismatch".into()),
             ("wildcard".into(), "invalid_stream_subject".into()),
             ("wrong-region".into(), "wrong_relay_region".into()),
+            ("zero-schema".into(), "invalid_schema_version".into()),
         ]
     );
     let blocked: (bool, i32) = sqlx::query_as(
@@ -309,7 +413,7 @@ async fn strict_relay_quarantines_permanent_rows_and_preserves_transient_rows() 
         .fetch_one(&pool)
         .await
         .expect("persistent quarantine count");
-    assert_eq!(quarantine_count, 9);
+    assert_eq!(quarantine_count, 16);
 
     // A permanent defect discovered earlier in a pass is not half-committed if a later broker
     // operation fails: both the quarantine insert and the published marks share one transaction.

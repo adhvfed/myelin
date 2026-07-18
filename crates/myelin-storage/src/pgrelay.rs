@@ -31,6 +31,7 @@ use sqlx::postgres::PgPool;
 use sqlx::Row;
 use std::collections::HashSet;
 
+use crate::kms::PiiKeyRef as KmsPiiKeyRef;
 use crate::pg::PgError;
 
 /// How many times a racing (`aggregate`, `seq`) collision retries in [`PgRelay::commit_staged_atomic`]
@@ -154,6 +155,12 @@ fn validate_claimed_row(
             "outbox aggregate disagrees with the envelope aggregate",
         ));
     }
+    if envelope.schema_ver == 0 {
+        return Err(PermanentRowError::new(
+            "invalid_schema_version",
+            "event schema_ver must be at least one",
+        ));
+    }
     if validate_event_type(&envelope.type_.0).is_err() {
         return Err(PermanentRowError::new(
             "invalid_event_taxonomy",
@@ -171,6 +178,47 @@ fn validate_claimed_row(
             "actor_tenant_mismatch",
             "event actor tenant disagrees with the envelope tenant",
         ));
+    }
+    let parsed_subject = myelin_refs::parse_scoped(&envelope.subject.0).map_err(|_| {
+        PermanentRowError::new(
+            "invalid_artifact_ref",
+            "event subject is not a canonical ArtifactRef",
+        )
+    })?;
+    if parsed_subject.artifact_ref != envelope.subject {
+        return Err(PermanentRowError::new(
+            "invalid_artifact_ref",
+            "event subject is not the canonical ArtifactRef spelling",
+        ));
+    }
+    if parsed_subject.tenant != envelope.tenant {
+        return Err(PermanentRowError::new(
+            "subject_tenant_mismatch",
+            "event subject tenant disagrees with the envelope tenant",
+        ));
+    }
+    match (envelope.contains_personal_data, &envelope.pii_key_ref) {
+        (false, None) => {}
+        (true, Some(key_ref)) => {
+            let parsed = KmsPiiKeyRef::parse(&key_ref.0).ok_or_else(|| {
+                PermanentRowError::new(
+                    "invalid_pii_key_ref",
+                    "event pii_key_ref is not a canonical KMS key reference",
+                )
+            })?;
+            if parsed.tenant != envelope.tenant {
+                return Err(PermanentRowError::new(
+                    "pii_key_tenant_mismatch",
+                    "event pii_key_ref tenant disagrees with the envelope tenant",
+                ));
+            }
+        }
+        _ => {
+            return Err(PermanentRowError::new(
+                "pii_presence_mismatch",
+                "contains_personal_data and pii_key_ref presence disagree",
+            ));
+        }
     }
     if envelope.region != config.region {
         return Err(PermanentRowError::new(
@@ -987,7 +1035,59 @@ impl PgRelay {
 
 #[cfg(test)]
 mod validation_config_tests {
+    use myelin_events::{Actor, CorrelationId, DataRole, EventType, PiiKeyRef, Visibility};
+    use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+    use myelin_tenancy::TenantId;
+
     use super::*;
+
+    fn envelope() -> EventEnvelope {
+        EventEnvelope {
+            event_id: EventId("unit-event".into()),
+            type_: EventType("issue.issue.updated".into()),
+            schema_ver: 1,
+            tenant: TenantId("acme".into()),
+            region: Region("no-osl".into()),
+            actor: Actor(Principal::stub(
+                PrincipalId("relay-unit".into()),
+                PrincipalKind::Service,
+                TenantId("acme".into()),
+            )),
+            subject: ArtifactRef("myelin://acme/issue/issue/one".into()),
+            aggregate: AggregateKey("issue:one".into()),
+            causation_id: None,
+            correlation_id: CorrelationId("unit-event".into()),
+            caused_by: None,
+            depth: 0,
+            contains_personal_data: false,
+            data_role: DataRole::Controller,
+            visibility: Visibility::Internal,
+            pii_key_ref: None,
+            occurred_at: Timestamp("2026-07-18T00:00:00Z".into()),
+            recorded_at: Timestamp("2026-07-18T00:00:01Z".into()),
+            payload: serde_json::json!({}),
+        }
+    }
+
+    fn claimed(envelope: &EventEnvelope) -> ClaimedRow {
+        ClaimedRow {
+            event_id: envelope.event_id.0.clone(),
+            aggregate: envelope.aggregate.0.clone(),
+            seq: 0,
+            subject: envelope.subject.0.clone(),
+            payload: serde_json::to_value(envelope).expect("serialize unit envelope"),
+        }
+    }
+
+    fn validation() -> RelayValidationConfig {
+        RelayValidationConfig::new(Region("no-osl".into()), 64 * 1024).expect("valid scope")
+    }
+
+    fn reason(envelope: &EventEnvelope) -> &'static str {
+        validate_claimed_row(&claimed(envelope), &validation())
+            .expect_err("invalid envelope")
+            .code
+    }
 
     #[test]
     fn strict_relay_scope_requires_region_and_a_real_finite_limit() {
@@ -1008,5 +1108,49 @@ mod validation_config_tests {
             })
         );
         assert!(RelayValidationConfig::new(Region("no-osl".into()), 256 * 1024).is_ok());
+    }
+
+    #[test]
+    fn strict_validation_uses_typed_subject_and_pii_key_authorities() {
+        let mut valid_pii = envelope();
+        valid_pii.contains_personal_data = true;
+        valid_pii.pii_key_ref = Some(PiiKeyRef("kms://acme/0/subject:u42".into()));
+        assert!(validate_claimed_row(&claimed(&valid_pii), &validation()).is_ok());
+
+        let mut false_with_key = envelope();
+        false_with_key.pii_key_ref = Some(PiiKeyRef("kms://acme/0/tenant".into()));
+        assert_eq!(reason(&false_with_key), "pii_presence_mismatch");
+
+        let mut true_without_key = envelope();
+        true_without_key.contains_personal_data = true;
+        assert_eq!(reason(&true_without_key), "pii_presence_mismatch");
+
+        let mut malformed_key = valid_pii.clone();
+        malformed_key.pii_key_ref = Some(PiiKeyRef("kms://acme/0/subject:u42/extra".into()));
+        assert_eq!(reason(&malformed_key), "invalid_pii_key_ref");
+
+        let mut cross_tenant_key = valid_pii;
+        cross_tenant_key.pii_key_ref = Some(PiiKeyRef("kms://foreign/0/tenant".into()));
+        assert_eq!(reason(&cross_tenant_key), "pii_key_tenant_mismatch");
+
+        let mut malformed_subject = envelope();
+        malformed_subject.subject = ArtifactRef("https://acme/issue/issue/one".into());
+        assert_eq!(reason(&malformed_subject), "invalid_artifact_ref");
+
+        let mut noncanonical_subject = envelope();
+        noncanonical_subject.subject =
+            ArtifactRef("myelin://acme/issue/issue/one#step-01".into());
+        assert_eq!(reason(&noncanonical_subject), "invalid_artifact_ref");
+
+        let mut cross_tenant_subject = envelope();
+        cross_tenant_subject.subject = ArtifactRef("myelin://foreign/issue/issue/one".into());
+        assert_eq!(reason(&cross_tenant_subject), "subject_tenant_mismatch");
+    }
+
+    #[test]
+    fn schema_versions_are_one_based() {
+        let mut zero = envelope();
+        zero.schema_ver = 0;
+        assert_eq!(reason(&zero), "invalid_schema_version");
     }
 }

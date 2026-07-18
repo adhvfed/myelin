@@ -2889,6 +2889,7 @@ dependencies = [
  "myelin-harness",
  "myelin-identity",
  "myelin-lints",
+ "myelin-refs",
  "myelin-refs-service",
  "myelin-search",
  "myelin-storage",
