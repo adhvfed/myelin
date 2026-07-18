@@ -533,8 +533,13 @@ impl<H: EventHandler> Consumer<H> {
             // A message off-whitelist should never have been routed here; treat it as poison so
             // it is surfaced, not silently swallowed.
             let reason = Reason(format!("subject {} not on consumer whitelist", msg.subject));
-            self.push_dead_letter(msg.envelope.clone(), reason.clone());
-            return Delivered::DeadLettered(reason);
+            return match self.push_dead_letter(msg.envelope.clone(), reason.clone()) {
+                Ok(()) => Delivered::DeadLettered(reason),
+                Err(_) => {
+                    self.bump_pending(&msg.subject);
+                    Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS)
+                }
+            };
         }
 
         // Rule 6, per-tenant fairness (EB-05): if this tenant is already at its in-flight cap AND
@@ -563,9 +568,16 @@ impl<H: EventHandler> Consumer<H> {
         let envelope = match (self.upcaster)(msg.envelope.clone()) {
             Ok(env) => env,
             Err(reason) => {
-                self.clear_pending(&msg.subject);
-                self.push_dead_letter(msg.envelope.clone(), reason.clone());
-                return Delivered::DeadLettered(reason);
+                return match self.push_dead_letter(msg.envelope.clone(), reason.clone()) {
+                    Ok(()) => {
+                        self.clear_pending(&msg.subject);
+                        Delivered::DeadLettered(reason)
+                    }
+                    Err(_) => {
+                        self.bump_pending(&msg.subject);
+                        Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS)
+                    }
+                };
             }
         };
         debug_assert_eq!(
@@ -661,10 +673,19 @@ impl<H: EventHandler> Consumer<H> {
                      DLQ to stay PII-safe)"
                         .to_string(),
                 );
-                self.clear_pending(&msg.subject);
-                self.clear_tenant_inflight(&tenant, &event_id);
-                self.push_dead_letter(envelope, reason.clone());
-                return Delivered::DeadLettered(reason);
+                return match self.push_dead_letter(envelope, reason.clone()) {
+                    Ok(()) => {
+                        self.clear_pending(&msg.subject);
+                        self.clear_tenant_inflight(&tenant, &event_id);
+                        Delivered::DeadLettered(reason)
+                    }
+                    Err(_) => {
+                        // The poison itself is known, but its durable replay/quarantine record did
+                        // not commit. Keep the event outstanding and withhold the broker ack.
+                        self.bump_pending(&msg.subject);
+                        Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS)
+                    }
+                };
             }
         };
         match outcome {
@@ -698,11 +719,20 @@ impl<H: EventHandler> Consumer<H> {
                 // losing a VALID effect; a poison has none). This PRESERVES the existing rule-5
                 // "redelivered dead-letter is Deduplicated" semantics.
                 cotx.rollback();
-                self.dedup.mark_handled(self.name(), &event_id);
-                self.clear_pending(&msg.subject);
-                self.clear_tenant_inflight(&tenant, &event_id);
-                self.push_dead_letter(envelope, reason.clone());
-                Delivered::DeadLettered(reason)
+                match self.push_dead_letter(envelope, reason.clone()) {
+                    Ok(()) => {
+                        // The poison is durably replayable/quarantined. Only now may the terminal
+                        // dedup tombstone land and the service-level broker cursor advance.
+                        self.dedup.mark_handled(self.name(), &event_id);
+                        self.clear_pending(&msg.subject);
+                        self.clear_tenant_inflight(&tenant, &event_id);
+                        Delivered::DeadLettered(reason)
+                    }
+                    Err(_) => {
+                        self.bump_pending(&msg.subject);
+                        Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS)
+                    }
+                }
             }
             HandleOutcome::Retry(backoff) => {
                 // NOT acked (rule 2): the message stays pending → it redelivers, and lag rises. The
@@ -740,11 +770,11 @@ impl<H: EventHandler> Consumer<H> {
     /// durable arm this persists a PII-free `(consumer, event_id, bounded_reason)` row on the sink's
     /// OWN fresh pool connection so it survives a restart. This matters most on the H2 panic path,
     /// whose co-commit tx was already ROLLED BACK — the durable backing must (and does) acquire a
-    /// fresh connection, never the rolled-back co-commit conn. Fail-loud on a DB error (fall back to
-    /// in-memory), never a silent drop.
-    fn push_dead_letter(&self, envelope: EventEnvelope, reason: Reason) {
+    /// fresh connection, never the rolled-back co-commit conn. A durable write failure is returned
+    /// to the delivery path, which converts it to Retry and withholds the broker ack.
+    fn push_dead_letter(&self, envelope: EventEnvelope, reason: Reason) -> Result<(), String> {
         self.dead_letters
-            .push(self.name(), DeadLetter { envelope, reason });
+            .push(self.name(), DeadLetter { envelope, reason })
     }
 
     fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<String, u64>> {
@@ -1118,6 +1148,55 @@ mod tests {
             c.dead_letters().len(),
             1,
             "still exactly one dead-letter (not re-poisoned)"
+        );
+    }
+
+    /// A poison is terminal only after its durable DLQ row commits. If that storage write fails,
+    /// delivery returns Retry, leaves the dedup mark absent, and keeps lag/in-flight non-zero so a
+    /// service-level broker pump must withhold its ack.
+    #[test]
+    fn durable_dead_letter_failure_is_retryable_never_terminally_acked() {
+        struct FailingDlq;
+        impl crate::DurableDeadLetter for FailingDlq {
+            fn record(
+                &self,
+                _consumer: &ConsumerName,
+                _event_id: &crate::EventId,
+                _reason: &str,
+            ) -> Result<(), String> {
+                Err("durable DLQ unavailable".into())
+            }
+
+            fn dead_letters(&self, _consumer: &ConsumerName) -> Vec<crate::DeadLetterRecord> {
+                Vec::new()
+            }
+        }
+
+        let h = CountingHandler {
+            runs: AtomicU32::new(0),
+            subjects: SUBJECTS,
+            outcome: |_| HandleOutcome::NonRetryable(Reason("malformed".into())),
+        };
+        let ledger = DedupLedger::new();
+        let c = Consumer::new(
+            h,
+            sub("indexer", &["myelin://acme/issues/"]),
+            ledger.clone(),
+        )
+        .with_dead_letter_sink(DeadLetterSink::durable(Arc::new(FailingDlq)));
+        let poison = msg("01J-dlq-down", "myelin://acme/issues/issue/PROJ-1");
+
+        assert_eq!(
+            c.deliver(&poison),
+            Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS),
+            "a failed durable quarantine write is non-terminal"
+        );
+        assert!(!ledger.is_handled(c.name(), &poison.envelope.event_id));
+        assert_eq!(c.lag(), 1, "the unacked poison remains visible as lag");
+        assert_eq!(
+            c.dead_letters().len(),
+            1,
+            "the process-local fallback remains operator-visible without authorizing ack"
         );
     }
 
