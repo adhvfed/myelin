@@ -11,7 +11,7 @@ use myelin_events::relay::EventPublisher;
 use sqlx::postgres::PgPool;
 
 use crate::pg::PgError;
-use crate::pgrelay::PgRelay;
+use crate::pgrelay::{PgRelay, RelayValidationConfig};
 
 /// Stable cell-local election key for the one shared-outbox publisher.
 ///
@@ -62,11 +62,12 @@ impl std::error::Error for ElectedRelayError {}
 pub struct ElectedPgRelay {
     pool: PgPool,
     relay: PgRelay,
+    validation: RelayValidationConfig,
 }
 
 impl ElectedPgRelay {
     /// Use the stable shared-outbox election namespace.
-    pub fn new(pool: PgPool) -> Result<Self, ElectedRelayError> {
+    pub fn new(pool: PgPool, validation: RelayValidationConfig) -> Result<Self, ElectedRelayError> {
         // One connection holds the session advisory lock while PgRelay opens the transaction that
         // claims rows. Refuse a one-connection pool instead of deadlocking at runtime.
         if pool.options().get_max_connections() < 2 {
@@ -78,6 +79,7 @@ impl ElectedPgRelay {
         Ok(Self {
             relay: PgRelay::new(pool.clone()),
             pool,
+            validation,
         })
     }
 
@@ -115,7 +117,10 @@ impl ElectedPgRelay {
             return Ok(ElectedDrainOutcome::Standby);
         }
 
-        let relay_result = self.relay.relay_once(publisher, batch).await;
+        let relay_result = self
+            .relay
+            .relay_once_scoped(publisher, batch, &self.validation)
+            .await;
         let unlock_result = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
             .bind(SHARED_OUTBOX_PUBLISHER_LOCK_ID)
             .fetch_one(&mut *election)
@@ -152,7 +157,9 @@ mod tests {
             .max_connections(1)
             .connect_lazy("postgres://myelin:myelin@127.0.0.1/myelin")
             .expect("lazy pool");
-        let error = match ElectedPgRelay::new(pool) {
+        let validation = RelayValidationConfig::new(myelin_events::Region("no-osl".into()), 1024)
+            .expect("valid scope");
+        let error = match ElectedPgRelay::new(pool, validation) {
             Ok(_) => panic!("one connection would deadlock"),
             Err(error) => error,
         };
