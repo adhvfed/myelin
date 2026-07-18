@@ -2,7 +2,7 @@
 #![cfg(feature = "integration")]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use myelin_config::MyelinConfig;
@@ -12,7 +12,9 @@ use myelin_events::{
     EventType, InProcessBus, Timestamp, Visibility, OUTBOX_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_storage::elected_relay::{ElectedDrainOutcome, ElectedPgRelay};
+use myelin_storage::elected_relay::{
+    ElectedDrainOutcome, ElectedPgRelay, SHARED_OUTBOX_PUBLISHER_LOCK_ID,
+};
 use myelin_storage::pgrelay::PgRelay;
 use myelin_tenancy::{Region, TenantId};
 
@@ -49,34 +51,11 @@ fn envelope(aggregate: &str, seq: u32) -> EventEnvelope {
     }
 }
 
+#[derive(Default)]
 struct SlowRecordingPublisher {
     active: AtomicUsize,
     max_active: AtomicUsize,
     published: Mutex<Vec<(String, u32)>>,
-    first_publish_released: Mutex<bool>,
-    first_publish_gate: Condvar,
-}
-
-impl Default for SlowRecordingPublisher {
-    fn default() -> Self {
-        Self {
-            active: AtomicUsize::new(0),
-            max_active: AtomicUsize::new(0),
-            published: Mutex::new(Vec::new()),
-            first_publish_released: Mutex::new(false),
-            first_publish_gate: Condvar::new(),
-        }
-    }
-}
-
-impl SlowRecordingPublisher {
-    fn release_first_publish(&self) {
-        *self
-            .first_publish_released
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = true;
-        self.first_publish_gate.notify_all();
-    }
 }
 
 impl EventPublisher for SlowRecordingPublisher {
@@ -88,23 +67,6 @@ impl EventPublisher for SlowRecordingPublisher {
     ) -> Result<Delivery, TransportError> {
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active.fetch_max(active, Ordering::SeqCst);
-        if self
-            .published
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
-        {
-            let mut released = self
-                .first_publish_released
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            while !*released {
-                released = self
-                    .first_publish_gate
-                    .wait(released)
-                    .unwrap_or_else(|e| e.into_inner());
-            }
-        }
         std::thread::sleep(Duration::from_millis(75));
         self.published
             .lock()
@@ -166,7 +128,7 @@ async fn elected_relay_serializes_contenders_preserves_order_and_retains_outage_
     let publisher = Arc::new(SlowRecordingPublisher::default());
     let start = Arc::new(tokio::sync::Barrier::new(3));
 
-    let mut one = {
+    let one = {
         let publisher = Arc::clone(&publisher);
         let start = Arc::clone(&start);
         tokio::spawn(async move {
@@ -174,7 +136,7 @@ async fn elected_relay_serializes_contenders_preserves_order_and_retains_outage_
             first.drain_once(publisher.as_ref(), 32).await
         })
     };
-    let mut two = {
+    let two = {
         let publisher = Arc::clone(&publisher);
         let start = Arc::clone(&start);
         tokio::spawn(async move {
@@ -183,22 +145,26 @@ async fn elected_relay_serializes_contenders_preserves_order_and_retains_outage_
         })
     };
     start.wait().await;
-    let (standby, one_finished) = tokio::time::timeout(Duration::from_secs(2), async {
-        tokio::select! {
-            result = &mut one => (result.expect("first task").expect("first drain"), true),
-            result = &mut two => (result.expect("second task").expect("second drain"), false),
-        }
+    let outcomes = tokio::time::timeout(Duration::from_secs(5), async {
+        let (one, two) = tokio::join!(one, two);
+        [
+            one.expect("first task").expect("first drain"),
+            two.expect("second task").expect("second drain"),
+        ]
     })
     .await
-    .expect("standby contender must return while leader is publishing");
-    assert_eq!(standby, ElectedDrainOutcome::Standby);
-    publisher.release_first_publish();
-    let published = if one_finished {
-        two.await.expect("leader task").expect("leader drain")
-    } else {
-        one.await.expect("leader task").expect("leader drain")
-    };
-    assert_eq!(published, ElectedDrainOutcome::Published(4));
+    .expect("bounded publishers make both contenders terminate");
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ElectedDrainOutcome::Published(4)))
+            .count(),
+        1
+    );
+    assert!(outcomes.iter().any(|outcome| matches!(
+        outcome,
+        ElectedDrainOutcome::Standby | ElectedDrainOutcome::Published(0)
+    )));
     assert_eq!(publisher.max_active.load(Ordering::SeqCst), 1);
     assert_eq!(
         *publisher
@@ -212,6 +178,30 @@ async fn elected_relay_serializes_contenders_preserves_order_and_retains_outage_
             ("B".into(), 1),
         ]
     );
+
+    // Prove the Standby outcome without timing: a separate PostgreSQL session holds the exact
+    // fixed election key, so an elected relay must fail its non-blocking try-lock immediately.
+    let mut lock_holder = pool.acquire().await.expect("lock-holder connection");
+    lock_holder.close_on_drop();
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(SHARED_OUTBOX_PUBLISHER_LOCK_ID)
+        .fetch_one(&mut *lock_holder)
+        .await
+        .expect("hold election lock");
+    assert!(locked);
+    let standby = ElectedPgRelay::new(pool.clone())
+        .expect("standby relay")
+        .drain_once(publisher.as_ref(), 32)
+        .await
+        .expect("standby outcome");
+    assert_eq!(standby, ElectedDrainOutcome::Standby);
+    let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+        .bind(SHARED_OUTBOX_PUBLISHER_LOCK_ID)
+        .fetch_one(&mut *lock_holder)
+        .await
+        .expect("release election lock");
+    assert!(unlocked);
+    drop(lock_holder);
 
     sqlx::query("TRUNCATE outbox")
         .execute(&pool)
