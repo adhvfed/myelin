@@ -57,6 +57,11 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     // -- the edge's own routes (main.rs) --
     "edge.whoami",
     "edge.events.subscribe",
+    // -- the durable Issues product API (register_issues) --
+    "issues.list",
+    "issues.create",
+    "issues.view",
+    "issues.close",
     // -- the git JSON product API (register_git_durable over Git's catalogue) --
     "git.repos.list",
     "git.repo.create",
@@ -153,6 +158,10 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
         "edge.events.subscribe",
         OP_AGENT_PAT
     ),
+    requirement!("issues.list", "issue.view", OP_AGENT_PAT),
+    requirement!("issues.create", "issue.create", OP_AGENT_PAT),
+    requirement!("issues.view", "issue.view", OP_AGENT_PAT),
+    requirement!("issues.close", "issue.transition", OP_AGENT_PAT),
     requirement!("git.repos.list", "repo.pull", OP_AGENT_PAT),
     requirement!("git.repo.create", "repo.create", OP_PAT),
     requirement!("git.pr.view", "repo.pull", OP_AGENT_PAT),
