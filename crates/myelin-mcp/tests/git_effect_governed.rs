@@ -106,7 +106,7 @@ fn governed_git_server(backend: Arc<DurableGitBackend>) -> McpServer {
         myelin_storage::hitl_gate_durable::HitlVerdictStore::new(),
         vec![PrincipalId("human:operator".into())],
     );
-    McpServer::with_router(ToolRegistry::with_git(), router, now())
+    McpServer::with_router_and_clock(ToolRegistry::with_git(), router, Arc::new(now))
 }
 
 fn call(name: &str, args: serde_json::Value) -> String {
