@@ -402,19 +402,10 @@ CREATE TABLE IF NOT EXISTS ci_job_spec (
 )";
 
 /// Every CI Control-Plane CREATE-TABLE DDL paired with its table name + a stable migration id, in
-/// FK-dependency order (`ci_run` before `ci_job`). The `job_queue` create rides with its three
-/// indexes appended (an empty fresh table — no hot-table lock; the create is atomic). One ordered
-/// list so [`ci_controlplane_migrations`] builds the [`Migrations`] set + the
-/// `forward-only-migration` lint reads the same DDL.
+/// FK-dependency order (`ci_run` before `ci_job`). Indexes are deliberately not bundled here:
+/// PostgreSQL requires `CREATE INDEX CONCURRENTLY` to be its own top-level command, outside the
+/// implicit transaction used for a multi-statement simple query.
 fn create_statements() -> Vec<(&'static str, &'static str, String)> {
-    // job_queue: the create + the three indexes, assembled into ONE forward DDL (empty fresh table).
-    let mut job_queue_ddl = String::from(CREATE_JOB_QUEUE_DDL);
-    job_queue_ddl.push(';');
-    for (_name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
-        job_queue_ddl.push('\n');
-        job_queue_ddl.push_str(idx);
-        job_queue_ddl.push(';');
-    }
     vec![
         (
             "ci_0001_ci_run",
@@ -431,7 +422,11 @@ fn create_statements() -> Vec<(&'static str, &'static str, String)> {
             CHECK_ATTEMPT_TABLE,
             CREATE_CHECK_ATTEMPT_DDL.to_string(),
         ),
-        ("ci_0004_job_queue", JOB_QUEUE_TABLE, job_queue_ddl),
+        (
+            "ci_0004_job_queue",
+            JOB_QUEUE_TABLE,
+            CREATE_JOB_QUEUE_DDL.to_string(),
+        ),
         (
             "ci_0005_fair_deficit",
             FAIR_DEFICIT_TABLE,
@@ -490,6 +485,14 @@ fn create_statements() -> Vec<(&'static str, &'static str, String)> {
     ]
 }
 
+/// Stable migration ids paired with the three non-transactional concurrent index statements. The
+/// ids sort immediately after the `ci_0004_job_queue` table/RLS migration and before `ci_0005`.
+pub const CI_JOB_QUEUE_INDEX_MIGRATIONS: &[(&str, &str)] = &[
+    ("ci_0004a_jq_claimable", JQ_CLAIMABLE_INDEX),
+    ("ci_0004b_jq_serialize", JQ_SERIALIZE_INDEX),
+    ("ci_0004c_jq_idem", JQ_IDEM_INDEX),
+];
+
 /// The stable migration ids of the WRITER-CRITICAL CI durable tables both CI service mains must have
 /// present regardless of boot order (CT-004m): `ci_run` (ci-dispatch's reserve/start co-commit + the
 /// control-plane run state), `check_attempt` (the control-plane monotonic counter), and
@@ -527,20 +530,34 @@ pub fn make_tenant_scoped_ddl(table: &str) -> String {
 }
 
 /// **The complete CI Control-Plane forward-only migration set** (contract 1.5 / 11.1; arch 01 §3).
-/// One [`Migration`] per table (`Plain` — a CREATE on an empty table is a plain forward migration;
-/// no expand→backfill→contract is needed to CREATE), in FK-dependency order, each carrying its
-/// CREATE-TABLE DDL + the platform RLS scoping (and, for `job_queue`, the three claim indexes). The
-/// runner applies them forward-only at boot; the `forward-only-migration` lint reads the same DDL.
+/// One table/RLS [`Migration`] per table, in FK-dependency order, plus three separately versioned
+/// `CREATE INDEX CONCURRENTLY` migrations immediately after `job_queue`. Keeping each concurrent
+/// index as one top-level command makes the same set executable by live PostgreSQL.
+///
+/// Compatibility: the prior `ci_0004_job_queue` bundled these concurrent indexes into one
+/// multi-statement command. PostgreSQL rejected that command atomically before [`PgMigrator`]
+/// could record the id, and the production Controlplane main never submitted the full AppSpec set
+/// to the live migrator. The live activation-boundary test pins both rollback and non-recording, so
+/// retaining `ci_0004_job_queue` for the now-executable table/RLS command does not mutate an applied
+/// production migration. [`PgMigrator`] currently skips an existing id without comparing its stored
+/// checksum; that general checksum-read gap remains separate, and no future applied id may rely on it.
+///
+/// [`PgMigrator`]: myelin_storage::PgMigrator
 pub fn ci_controlplane_migrations() -> Migrations {
-    // Each migration is assembled through the ONE `assemble_ci_migration` seam (CREATE + any indexes +
-    // the platform RLS scoping). `Migration::plain_on` carries the table so the runner can match it
-    // against the hot-table declaration (the hot tables refuse a blocking ALTER; the CREATE is Plain).
-    Migrations::of(
-        create_statements()
-            .into_iter()
-            .map(|(id, table, create)| assemble_ci_migration(id, table, create))
-            .collect::<Vec<_>>(),
-    )
+    let mut migrations = Vec::new();
+    for (id, table, create) in create_statements() {
+        migrations.push(assemble_ci_migration(id, table, create));
+        if table == JOB_QUEUE_TABLE {
+            for ((index_id, expected_name), (actual_name, ddl)) in CI_JOB_QUEUE_INDEX_MIGRATIONS
+                .iter()
+                .zip(CREATE_JOB_QUEUE_INDEXES_DDL.iter())
+            {
+                debug_assert_eq!(expected_name, actual_name);
+                migrations.push(Migration::plain_on(index_id, ddl, JOB_QUEUE_TABLE));
+            }
+        }
+    }
+    Migrations::of(migrations)
 }
 
 /// **The shared, writer-critical CI durable-migration subset (CT-004m).** The tables the CT-004a
@@ -600,7 +617,12 @@ mod tests {
     #[test]
     fn all_fifteen_controlplane_tables_are_present_fk_ordered() {
         let migrations = ci_controlplane_migrations();
-        let tables: Vec<&str> = migrations.0.iter().map(|m| m.table.unwrap()).collect();
+        let tables: Vec<&str> = migrations
+            .0
+            .iter()
+            .filter(|m| m.ddl.contains("CREATE TABLE"))
+            .map(|m| m.table.unwrap())
+            .collect();
         assert_eq!(
             tables,
             vec![
@@ -659,8 +681,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            15,
-            "15 forward migrations, one per table"
+            18,
+            "15 table/RLS + 3 concurrent-index migrations"
         );
         for m in &migrations.0 {
             assert!(
@@ -674,12 +696,26 @@ mod tests {
                 "no DROP in migration {}",
                 m.id
             );
-            // every table is made RLS-tenant-scoped via the platform helper.
-            assert!(
-                m.ddl.contains("myelin_make_tenant_scoped"),
-                "migration {} installs the platform RLS policy",
-                m.id
-            );
+            if m.ddl.contains("CREATE TABLE") {
+                assert!(
+                    m.ddl.contains("myelin_make_tenant_scoped"),
+                    "table migration {} installs the platform RLS policy",
+                    m.id
+                );
+            } else {
+                assert!(
+                    m.ddl.starts_with("CREATE INDEX CONCURRENTLY")
+                        || m.ddl.starts_with("CREATE UNIQUE INDEX CONCURRENTLY"),
+                    "the only non-table migrations are concurrent indexes: {}",
+                    m.id
+                );
+                assert_eq!(
+                    m.ddl.matches(';').count(),
+                    0,
+                    "a concurrent index must be one top-level command: {}",
+                    m.id
+                );
+            }
         }
     }
 
@@ -696,8 +732,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            15,
-            "the runner applied all 15 control-plane migrations"
+            18,
+            "the runner applied all 15 table/RLS and 3 concurrent-index migrations"
         );
         assert_eq!(
             runner.applied()[0],
@@ -779,14 +815,16 @@ mod tests {
             idem.contains("UNIQUE") && idem.contains("(tenant_id, idem_token)"),
             "jq_idem is the per-tenant enqueue-dedup unique"
         );
-        // The job_queue migration carries the create + all three indexes + the RLS scoping.
-        let jq = ci_controlplane_migrations()
-            .0
-            .into_iter()
-            .find(|m| m.table == Some(JOB_QUEUE_TABLE))
-            .unwrap();
+        // Each concurrent index is a separately versioned top-level command after the table/RLS.
+        let migrations = ci_controlplane_migrations();
         for name in [JQ_CLAIMABLE_INDEX, JQ_SERIALIZE_INDEX, JQ_IDEM_INDEX] {
-            assert!(jq.ddl.contains(name), "index `{name}` rides the migration");
+            let index = migrations
+                .0
+                .iter()
+                .find(|migration| migration.ddl.contains(name))
+                .unwrap_or_else(|| panic!("index `{name}` has a migration"));
+            assert_eq!(index.table, Some(JOB_QUEUE_TABLE));
+            assert_eq!(index.ddl.matches(';').count(), 0);
         }
     }
 
