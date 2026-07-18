@@ -28,35 +28,58 @@
 //!
 //! **Floor:** the substrate AppSpec config still uses its validated default, while every production
 //! endpoint and both PostgreSQL roles are explicit through `Mode::RequireEnv`. The per-table
-//! behaviour (the scheduler
-//! claim, the check emitter, the log index, the metering) is the CI-P12..CI-P24 surface — this
-//! shell runs no job yet.
+//! behaviour (the scheduler claim, the check emitter, the log index, the metering) is the
+//! CI-P12..CI-P24 surface. This shell runs no job: requesting the incomplete production runner
+//! fails before database bootstrap until its durable billing and run-token authorities are wired.
 
 use myelin_ci_controlplane::run_controlplane;
 use myelin_config::Mode;
 use myelin_events::OutboxStore;
 use myelin_storage::{all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking};
 use myelin_substrate::Config;
+use std::fmt;
 use std::sync::Arc;
 
-/// The four-guarantee hooks the runner drives on every launch (X-6; arch 02 §5.2). The gVisor backend
-/// ALSO enforces the mandatory hardening profile internally (isolation floor) regardless of the hook,
-/// so these accept and let the launch reach the real `runsc` run. The REAL metering reserve/settle
-/// (against the cost store) + the per-run token attribution are the CT-004d bookend — wired here as the
-/// four-guarantee seam the sandbox drives (never bypassed).
-fn runner_hooks() -> myelin_ci_sandbox::RunnerHooks {
-    myelin_ci_sandbox::RunnerHooks {
-        reserve: Box::new(|m| Ok(myelin_ci_sandbox::ReserveHandle(m.reserve_id.clone()))),
-        settle: Box::new(|_h, _u| Ok(())),
-        attribute: Box::new(|_t| Ok(())),
-        isolation_floor: Box::new(|_s| Ok(())),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupRefusal {
+    IncompleteProductionRunner,
+}
+
+impl fmt::Display for StartupRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IncompleteProductionRunner => write!(
+                f,
+                "MYELIN_CI_RUNNER=1 requires a real durable CostLedger reserve/settle authority \
+                 and live per-run-token verification; production runner activation is refused"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StartupRefusal {}
+
+fn verify_startup_activation(runner_setting: Option<&str>) -> Result<(), StartupRefusal> {
+    if runner_setting == Some("1") {
+        Err(StartupRefusal::IncompleteProductionRunner)
+    } else {
+        Ok(())
     }
 }
 
 #[tokio::main]
 async fn main() {
+    // The former runner composition reached sandbox execution with accept-all billing/attribution
+    // hooks, placeholder tenancy, and an unresolved stage-spec builder. Keep the flag reserved,
+    // but refuse it before PostgreSQL bootstrap until all launch authorities are real and durable.
+    let runner_setting = std::env::var("MYELIN_CI_RUNNER").ok();
+    if let Err(e) = verify_startup_activation(runner_setting.as_deref()) {
+        eprintln!("ci-controlplane: startup refused: {e}");
+        std::process::exit(1);
+    }
+
     // Production is strict: validate every endpoint plus distinct migration/runtime PostgreSQL
-    // roles before any DDL, durable store, reaper, runner, or listener can be created. `PgBootstrap`
+    // roles before any DDL, durable store, reaper, or listener can be created. `PgBootstrap`
     // alone owns the privileged pool.
     let bootstrap = match PgBootstrap::from_env(Mode::RequireEnv).await {
         Ok(bootstrap) => bootstrap,
@@ -91,7 +114,7 @@ async fn main() {
     }
     // Apply the COMPLETE Controlplane-owned schema through the privileged pool. The AppSpec still
     // declares this exact set for lifecycle/model checks, but production cannot defer real SQL until
-    // after cost stores, the reaper, or an optional runner have already been constructed.
+    // after cost stores or the reaper have already been constructed.
     if let Err(e) = bootstrap
         .migrate(
             &myelin_ci_controlplane::ci_controlplane_migrations(),
@@ -103,7 +126,7 @@ async fn main() {
         std::process::exit(1);
     }
     // Re-probe the constrained runtime role, close the privileged pool, and erase its DSN before
-    // any runtime query/store/reaper/runner/listener is created.
+    // any runtime query/store/reaper/listener is created.
     let provider = match bootstrap.into_runtime().await {
         Ok(provider) => provider,
         Err(e) => {
@@ -129,8 +152,7 @@ async fn main() {
     // bookend. CT-004m resolved the former `cost_event` table-name collision (CI's table is now
     // `ci_cost_event`, created by the shared `ci_durable_migrations` applied above). Building it only
     // wraps the pool — no query runs at boot.
-    let _ci_cost_events =
-        myelin_ci_controlplane::ci_cost_event_store(provider.db_pool().clone());
+    let _ci_cost_events = myelin_ci_controlplane::ci_cost_event_store(provider.db_pool().clone());
     // CT-004c.1: construct the REAL durable `job_queue` store + spawn the dead-runner reaper loop onto
     // the serve runtime (minimal-impact wiring — a bounded background task hung off the existing
     // lifecycle, NOT a new AppSpec schema field). The `job_queue` table the reaper sweeps is created
@@ -138,7 +160,7 @@ async fn main() {
     // delays its first sweep one interval so that boot-migrate has completed. The reaper is SAFE — it
     // only re-queues expired leases (`leased`→`queued`); it launches NO untrusted code (binding the
     // runner + starting the pipeline body on the sandbox executor is CT-004c.2). The claim path is
-    // dormant at the shell (no runner drives `claim` yet — CT-004c.2 wires it).
+    // dormant at the shell (production runner activation is refused above).
     let ci_job_queue = myelin_ci_controlplane::ci_job_queue_store(provider.db_pool().clone());
     let reaper = myelin_ci_controlplane::JobQueueReaper::new(
         ci_job_queue,
@@ -146,86 +168,6 @@ async fn main() {
         std::time::Duration::from_secs(15),
     );
     tokio::spawn(reaper.run());
-    // CT-004c.2 + CT-004d.1: OPT-IN spawn the bounded CI runner loop — it claims from the durable
-    // `job_queue`, RESOLVES the leased row to its digest-pinned `JobSpec` via the durable `ci_job_spec`
-    // store (CT-004d.1's real resolver), and EXECUTES it in a REAL gVisor (`runsc`) guest (the AG-D4
-    // gate). Gated behind `MYELIN_CI_RUNNER=1` (default OFF): a control-plane node runs untrusted code
-    // ONLY when explicitly enabled as a runner host — never implicitly on every boot. The loop runs on
-    // a DEDICATED thread (off the tokio runtime) so `RunnerAgent::run_one` (sync, blocking for the whole
-    // in-line job) does not starve a worker; the lease adapter + the spec resolver bridge their async DB
-    // calls onto the runtime handle. The trust-tier/region claim predicate is CT-004c.1's durable store,
-    // forwarded UNCHANGED (an `untrusted_fork` job is never claimed by this trusted-only runner).
-    //
-    // CT-004d.1 replaces the CT-004c.2 fail-closed no-op resolver with the REAL
-    // `durable_spec_resolver` over `ci_job_spec` (the dispatch co-persists the spec there); a
-    // leased-but-unresolved row (spec absent/corrupt) still resolves fail-closed → the row stays leased
-    // and is reaped, never an unresolved/fabricated launch. The lease TTL is `CI_RUNNER_LEASE_TTL_SECS`
-    // (ABOVE the max job timeout the spec store enforces) so a long job never lapses its lease mid-run
-    // (the CT-004c.2 double-run fix). The shared durable executor the `job.done` wakes a REAL parked
-    // `ci.pipeline` body on (registering/starting that body) is CT-004d.2; the live settle bookend is
-    // CT-004d.3 — here the executor is the composition placeholder proving the one signal path.
-    if std::env::var("MYELIN_CI_RUNNER").as_deref() == Ok("1") {
-        let region = provider.config().region.clone();
-        let runner_store = myelin_ci_controlplane::ci_job_queue_store(provider.db_pool().clone());
-        // The REAL durable spec resolver (CT-004d.1): resolve a leased row → the spec the dispatch
-        // co-persisted into `ci_job_spec`. Fail-closed (missing/corrupt spec → no launch, reaped).
-        let spec_store = myelin_ci_controlplane::ci_job_spec_store(provider.db_pool().clone());
-        let resolver = myelin_ci_controlplane::durable_spec_resolver(
-            spec_store,
-            region.clone(),
-            tokio::runtime::Handle::current(),
-        );
-        // CT-004d.2 CULMINATION (chunks 2/3/5): the CI pipeline DRIVER — the SHARED `FlowExecutor` the
-        // runner's `job.done` wakes + registers/drives `run_ci_pipeline_body` (chunk 5's `DurableJobRunner`
-        // dispatches each stage into the DURABLE `job_queue`+`ci_job_spec`, trust_tier/region forwarded
-        // UNCHANGED). The runner's terminal reporter is the driver's `CiPipelineReporter` (re-encodes the
-        // verdict + wakes the parked run — the ONE signal path). The pinned-snapshot→JobSpec resolver is
-        // the fail-closed `unresolved_stage_spec_builder` floor (a real builder is the CT-004d follow-on;
-        // the mechanism is proven end-to-end against real `runsc` in the CT-004d.2 integration test).
-        let driver = std::sync::Arc::new(myelin_ci_controlplane::CiPipelineDriver::new(
-            myelin_tenancy::TenantId("ci-controlplane".into()),
-            region.clone(),
-            myelin_ci_controlplane::ci_job_spec_store(provider.db_pool().clone()),
-            tokio::runtime::Handle::current(),
-            myelin_ci_controlplane::unresolved_stage_spec_builder(),
-            outbox.clone(),
-        ));
-        let reporter = driver.reporter();
-        let runner = myelin_ci_controlplane::CiRunnerLoop::new(
-            format!("ci-runner-{}", std::process::id()),
-            vec!["linux".to_string()],
-            vec![myelin_ci_sandbox::TrustTier::Trusted],
-            region,
-            myelin_ci_controlplane::CI_RUNNER_LEASE_TTL_SECS,
-            runner_store,
-            tokio::runtime::Handle::current(),
-            resolver,
-            reporter,
-            runner_hooks(),
-            // CT-004f sub-step 5: the live log sink's backings — the shared OLTP pool (log_segment/
-            // log_anchor writer + ci.log.available outbox) + the S3 CAS config (sealed log segments).
-            provider.db_pool().clone(),
-            provider.config().s3.clone(),
-        );
-        runner.spawn();
-        // Drive the pipeline engine on a DEDICATED thread (off the tokio runtime, like the runner): the
-        // body's durable dispatch bridges its async co-persist onto the runtime, and driving off-runtime
-        // keeps `block_on` correct. NAMED FLOOR: the `ci_run`-poll STARTER (reading queued `ci_run` rows
-        // and `start_run`-ing them under their pre-minted `wf_run_id`) is the production autonomy wire —
-        // the integration test drives `start_run` directly to prove the whole spine. Until the starter
-        // lands, this loop drives no runs (a cheap idle sweep); the composition is LIVE + correct.
-        std::thread::Builder::new()
-            .name("ci-pipeline-driver".into())
-            .spawn(move || loop {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                driver.drive_once(now, "1970-01-01T00:00:00Z");
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            })
-            .expect("spawn the ci-pipeline-driver thread");
-    }
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).
     match run_controlplane(Config::default(), outbox) {
@@ -235,5 +177,20 @@ async fn main() {
             eprintln!("ci-controlplane service failed: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{verify_startup_activation, StartupRefusal};
+
+    #[test]
+    fn production_runner_flag_has_a_typed_fail_closed_verdict() {
+        assert_eq!(
+            verify_startup_activation(Some("1")),
+            Err(StartupRefusal::IncompleteProductionRunner)
+        );
+        assert_eq!(verify_startup_activation(None), Ok(()));
+        assert_eq!(verify_startup_activation(Some("true")), Ok(()));
     }
 }

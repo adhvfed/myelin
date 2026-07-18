@@ -33,12 +33,22 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         .find("JobQueueReaper::new")
         .expect("production reaper must remain wired");
     let runner_gate = source
-        .find("MYELIN_CI_RUNNER")
-        .expect("optional production runner must remain wired");
+        .find("verify_startup_activation(runner_setting.as_deref())")
+        .expect("production runner activation must be refused explicitly");
+    let bootstrap = source
+        .find("PgBootstrap::from_env(Mode::RequireEnv)")
+        .expect("database bootstrap must remain wired");
     let service = source
         .find("run_controlplane(Config::default()")
         .expect("service lifecycle must remain wired");
 
+    assert!(!source.contains("runner_hooks"));
+    assert!(!source.contains("CiPipelineDriver"));
+    assert!(!source.contains("unresolved_stage_spec_builder"));
+    assert!(!source.contains("TenantId(\"ci-controlplane\""));
+    assert!(!source.contains("synthetic tenant"));
+
+    assert!(runner_gate < bootstrap);
     assert!(foundation < durable);
     assert!(durable < controlplane);
     assert!(controlplane < hot_tables);
@@ -46,8 +56,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(handoff < shape_check);
     assert!(shape_check < first_store);
     assert!(first_store < reaper);
-    assert!(reaper < runner_gate);
-    assert!(runner_gate < service);
+    assert!(reaper < service);
 }
 
 #[test]
@@ -63,7 +72,7 @@ fn missing_migration_credential_exits_before_reaper_runner_or_service_boot() {
         .env("REDIS_URL", "redis://cache.invalid")
         .env("NATS_URL", "nats://bus.invalid")
         .env("MYELIN_REGION", "fr-par")
-        .env("MYELIN_CI_RUNNER", "1")
+        .env_remove("MYELIN_CI_RUNNER")
         .output()
         .expect("CI Controlplane process must launch");
 
@@ -72,4 +81,22 @@ fn missing_migration_credential_exits_before_reaper_runner_or_service_boot() {
     assert!(stderr.contains("DATABASE_MIGRATION_URL"));
     assert!(!stderr.contains("spawn the ci-pipeline-driver thread"));
     assert!(!stderr.contains("ci-controlplane service failed"));
+}
+
+#[test]
+fn runner_activation_is_refused_before_any_database_attempt() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ci-controlplane"))
+        .env_clear()
+        .env("MYELIN_CI_RUNNER", "1")
+        .output()
+        .expect("CI Controlplane process must launch");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr must be UTF-8");
+    assert!(stderr.contains("real durable CostLedger reserve/settle authority"));
+    assert!(stderr.contains("live per-run-token verification"));
+    assert!(stderr.contains("production runner activation is refused"));
+    assert!(!stderr.contains("database bootstrap refused to start"));
+    assert!(!stderr.contains("DATABASE_URL"));
+    assert!(!stderr.contains("DATABASE_MIGRATION_URL"));
 }
