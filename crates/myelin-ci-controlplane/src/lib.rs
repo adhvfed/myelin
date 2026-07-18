@@ -816,8 +816,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            15,
-            "all 15 control-plane tables are in the forward-only migration set"
+            18,
+            "all 15 control-plane tables plus 3 top-level concurrent indexes are in the migration set"
         );
         assert!(
             spec.consumers.is_empty(),
