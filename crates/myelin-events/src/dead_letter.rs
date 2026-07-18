@@ -111,7 +111,9 @@ pub struct DeadLetterRecord {
 /// (a fresh connection), never the handler's tx.
 ///
 /// **Fail-direction (never a silent loss):** [`record`] returns `Err` when it cannot reach the DB;
-/// [`DeadLetterSink::push`] logs loudly + falls back to an in-process Vec — never a silent drop.
+/// [`DeadLetterSink::push`] logs loudly, keeps an in-process operator copy, and returns `Err` so
+/// the broker delivery remains unacked — never a silent drop or a cursor advance without durable
+/// quarantine.
 ///
 /// [`record`]: DurableDeadLetter::record
 /// [`dead_letters`]: DurableDeadLetter::dead_letters
@@ -184,32 +186,37 @@ impl DeadLetterSink {
     /// **Write a poison through the sink (rule 5).** In-memory: append the full [`DeadLetter`]
     /// (unchanged behavior). Durable: record the PII-free `(consumer, event_id, bounded_reason)` on a
     /// FRESH pool connection (the H2 panic path's co-commit tx was rolled back — the durable backing
-    /// acquires its own connection). Fail-direction: on a DB error, log LOUDLY and fall back to the
-    /// in-process Vec — the poison is NEVER silently dropped.
-    pub fn push(&self, consumer: &ConsumerName, dead: DeadLetter) {
+    /// acquires its own connection). Fail-direction: on a DB error, log LOUDLY, retain the record
+    /// in the process-local fallback for operator visibility, and return `Err`. The consumer MUST
+    /// then treat the delivery as retryable so the broker cursor cannot advance past a poison whose
+    /// durable quarantine record did not commit.
+    pub fn push(&self, consumer: &ConsumerName, dead: DeadLetter) -> Result<(), String> {
         match self {
             DeadLetterSink::InMemory(v) => {
                 v.lock().unwrap_or_else(|e| e.into_inner()).push(dead);
+                Ok(())
             }
             DeadLetterSink::Durable { backing, fallback } => {
                 // PII-safety: store references-not-payloads — the event_id + a BOUNDED PII-free
                 // reason, never the envelope/payload.
                 let reason = bounded_reason(&dead.reason.0);
                 match backing.record(consumer, &dead.envelope.event_id, &reason) {
-                    Ok(()) => {}
+                    Ok(()) => Ok(()),
                     Err(e) => {
-                        // Fail-direction: the durable record could not land. Do NOT lose the poison —
-                        // log loudly and keep it in-process (surfaced for THIS process at least).
+                        // Preserve a surfaced process-local copy, but do not report terminal
+                        // success: the caller must withhold the broker ack until durable storage
+                        // recovers and this write succeeds.
                         eprintln!(
                             "[consumer-dlq] LOUD: durable dead-letter record FAILED for \
-                             consumer={} event_id={} — falling back to in-memory (poison NOT \
-                             dropped): {e}",
+                             consumer={} event_id={} — retaining an in-memory operator copy and \
+                             WITHHOLDING broker ack: {e}",
                             consumer.0, dead.envelope.event_id.0
                         );
                         fallback
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .push(dead);
+                        Err(e)
                     }
                 }
             }
@@ -301,8 +308,8 @@ mod tests {
         let c = consumer("indexer");
         assert!(sink.surfaced().is_empty(), "fresh sink is empty");
 
-        sink.push(&c, dead("01J-a", "malformed"));
-        sink.push(&c, dead("01J-b", "poison"));
+        sink.push(&c, dead("01J-a", "malformed")).unwrap();
+        sink.push(&c, dead("01J-b", "poison")).unwrap();
         let surfaced = sink.surfaced();
         assert_eq!(surfaced.len(), 2, "both poison records surfaced in-process");
         assert_eq!(surfaced[0].envelope.event_id, EventId("01J-a".into()));
@@ -367,9 +374,9 @@ mod tests {
         let sink = DeadLetterSink::durable(mock.clone());
         let c = consumer("indexer");
 
-        sink.push(&c, dead("01J-a", "malformed"));
+        sink.push(&c, dead("01J-a", "malformed")).unwrap();
         // A REDELIVERED dead-letter (same consumer+event_id) re-records — idempotent no-op row-wise.
-        sink.push(&c, dead("01J-a", "malformed"));
+        sink.push(&c, dead("01J-a", "malformed")).unwrap();
         assert_eq!(
             mock.record_calls.load(Ordering::SeqCst),
             2,
@@ -387,8 +394,8 @@ mod tests {
         );
     }
 
-    /// **Fail-direction:** a DB-unreachable `record` does NOT silently drop the poison — it logs
-    /// loudly and falls back to the in-process Vec (surfaced for THIS process). Never a silent loss.
+    /// **Fail-direction:** a DB-unreachable `record` does NOT silently drop the poison — it logs,
+    /// retains an operator copy, and returns `Err` so callers withhold the broker ack.
     #[test]
     fn durable_record_failure_falls_back_to_in_memory_never_silently_dropped() {
         let mock = Arc::new(MockDurable {
@@ -398,7 +405,11 @@ mod tests {
         let sink = DeadLetterSink::durable(mock.clone());
         let c = consumer("indexer");
 
-        sink.push(&c, dead("01J-poison", "handler PANICKED"));
+        assert_eq!(
+            sink.push(&c, dead("01J-poison", "handler PANICKED")),
+            Err("DB unreachable (mock)".into()),
+            "durable failure must be non-terminal to the caller"
+        );
         assert_eq!(mock.record_calls.load(Ordering::SeqCst), 1, "record tried");
         assert!(
             mock.dead_letters(&c).is_empty(),
