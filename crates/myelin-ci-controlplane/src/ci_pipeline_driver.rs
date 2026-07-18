@@ -762,8 +762,8 @@ fn deterministic_uuid(seed: &str) -> String {
     )
 }
 
-/// **A digest-pinned compute [`SandboxJobSpec`] builder for a fixed `command` (the CT-004d.2 test seam
-/// + a minimal production default).** Produces a `kind=ci` spec running `command` in a `runsc` guest,
+/// **A digest-pinned compute [`SandboxJobSpec`] builder for a fixed `command` (the CT-004d.2 test
+/// seam and minimal production default).** Produces a `kind=ci` spec running `command` in a `runsc` guest,
 /// default-deny egress, a read-only workspace. The `trust_tier` + `idem_token` are placeholders the
 /// [`DurableJobRunner`] OVERWRITES from the run's terms + the dispatch (so this builder can never widen
 /// the tier). `image` MUST be digest-pinned (fail-closed via [`ImageRef::pinned`]).
