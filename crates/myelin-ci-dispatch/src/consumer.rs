@@ -582,17 +582,49 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| SkipReason::MalformedPayload("missing `new_oid`/`head_oid`".into()))?
         .to_string();
-    // Fork provenance: a PR from a fork carries `is_fork`/`forked`; a push is a member push.
-    let is_fork = p
-        .get("is_fork")
-        .or_else(|| p.get("forked"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // Fork provenance is trust input, not a best-effort hint. PR producers MUST provide an
+    // explicit boolean. Push producers predate the field, so absence remains a member push; any
+    // alias they do provide is nevertheless validated and preserved. If canonical + legacy aliases
+    // coexist they must agree, otherwise field ordering could choose which trust result wins.
+    let requires_fork_evidence = ev.type_.0 == myelin_git::events::GIT_PR_OPENED
+        || ev.type_.0 == myelin_git::events::GIT_PR_SYNCHRONIZED;
+    let is_fork = parse_fork_evidence(p, requires_fork_evidence)?;
     Ok(TriggerFacts {
         repo,
         new_oid,
         is_fork,
     })
+}
+
+/// Parse and reconcile canonical/legacy fork provenance without ever defaulting malformed trust
+/// input to a trusted member run. PR events require evidence; push events preserve legacy absence.
+fn parse_fork_evidence(payload: &serde_json::Value, required: bool) -> Result<bool, SkipReason> {
+    let canonical = payload.get("is_fork");
+    let legacy = payload.get("forked");
+    let parse = |name: &str, value: &serde_json::Value| {
+        value
+            .as_bool()
+            .ok_or_else(|| SkipReason::MalformedPayload(format!("`{name}` must be a boolean")))
+    };
+
+    match (canonical, legacy) {
+        (None, None) if required => Err(SkipReason::MalformedPayload(
+            "missing explicit boolean fork evidence (`is_fork` or legacy `forked`)".into(),
+        )),
+        (None, None) => Ok(false),
+        (Some(value), None) => parse("is_fork", value),
+        (None, Some(value)) => parse("forked", value),
+        (Some(canonical), Some(legacy)) => {
+            let canonical = parse("is_fork", canonical)?;
+            let legacy = parse("forked", legacy)?;
+            if canonical != legacy {
+                return Err(SkipReason::MalformedPayload(
+                    "conflicting fork evidence: `is_fork` and `forked` must agree".into(),
+                ));
+            }
+            Ok(canonical)
+        }
+    }
 }
 
 /// Which [`OnTrigger`] an event TYPE could arm (the reverse of [`OnTrigger::event_types`]). `None`
@@ -1009,7 +1041,7 @@ mod tests {
         Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventId, EventType, Timestamp,
         Visibility,
     };
-    use myelin_git::events::{GIT_PR_OPENED, GIT_REF_UPDATED};
+    use myelin_git::events::{GIT_PR_OPENED, GIT_PR_SYNCHRONIZED, GIT_REF_UPDATED};
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
     use myelin_storage::{ContentHash, FsBlobStore};
     use myelin_tenancy::{Region, TenantId};
@@ -1053,6 +1085,14 @@ mod tests {
         }
     }
 
+    fn pr_envelope(event_type: &str, fork_fields: serde_json::Value) -> EventEnvelope {
+        let mut ev = push_envelope("web", "deadbeef");
+        ev.type_ = EventType(event_type.into());
+        ev.payload = serde_json::json!({ "repo": "web", "head_oid": "deadbeef" });
+        ev.payload.as_object_mut().unwrap().extend(fork_fields.as_object().unwrap().clone());
+        ev
+    }
+
     fn valid_toml() -> &'static [u8] {
         concat!(
             "on = \"push\"\n\n",
@@ -1076,6 +1116,50 @@ mod tests {
             "command = [\"build\"]\n",
         )
         .as_bytes()
+    }
+
+    fn valid_pr_toml() -> &'static [u8] {
+        concat!(
+            "on = \"pull_request\"\n\n",
+            "[[jobs]]\nname = \"build\"\n",
+            "image = \"registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000\"\n",
+            "command = [\"build\"]\n"
+        )
+        .as_bytes()
+    }
+
+    struct NoConfigRead;
+
+    impl GitConfigReader for NoConfigRead {
+        fn read_repo_file(
+            &self, _tenant: &str, _region: &str, _repo: &str, _oid: &str, _path: &str,
+        ) -> Result<Option<Vec<u8>>, GitReadError> {
+            panic!("malformed provenance reached a config read")
+        }
+    }
+
+    struct NoCasAccess;
+
+    impl BlobStore for NoCasAccess {
+        fn put(&self, _tenant: &TenantId, _bytes: &[u8]) -> myelin_storage::blob::Result<ContentHash> {
+            panic!("malformed provenance reached CAS")
+        }
+        fn get(&self, _tenant: &TenantId, _hash: &ContentHash) -> myelin_storage::blob::Result<Vec<u8>> {
+            panic!("malformed provenance reached CAS")
+        }
+        fn head(&self, _tenant: &TenantId, _hash: &ContentHash) -> myelin_storage::blob::Result<myelin_storage::blob::BlobMeta> {
+            panic!("malformed provenance reached CAS")
+        }
+        fn delete(&self, _tenant: &TenantId, _hash: &ContentHash) -> myelin_storage::blob::Result<()> {
+            panic!("malformed provenance reached CAS")
+        }
+    }
+
+    fn assert_malformed_before_side_effects(ev: &EventEnvelope) {
+        assert!(matches!(
+            plan_dispatch(ev, &NoConfigRead, &NoCasAccess),
+            DispatchOutcome::Skip(SkipReason::MalformedPayload(_))
+        ));
     }
 
     fn arm(ev: &EventEnvelope, reader: &dyn GitConfigReader) -> DispatchOutcome {
@@ -1194,6 +1278,81 @@ mod tests {
         assert!(matches!(
             arm(&ev, &MapGitConfigReader::new()),
             DispatchOutcome::Skip(SkipReason::MalformedPayload(_))
+        ));
+    }
+
+    #[test]
+    fn both_pr_events_refuse_missing_mistyped_or_conflicting_fork_evidence_before_side_effects() {
+        let malformed = [
+            serde_json::json!({}),
+            serde_json::json!({ "is_fork": "false" }),
+            serde_json::json!({ "forked": 0 }),
+            serde_json::json!({ "is_fork": true, "forked": false }),
+            serde_json::json!({ "is_fork": true, "forked": "true" }),
+        ];
+        for event_type in [GIT_PR_OPENED, GIT_PR_SYNCHRONIZED] {
+            for fields in &malformed {
+                assert_malformed_before_side_effects(&pr_envelope(event_type, fields.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn both_pr_events_accept_boolean_canonical_legacy_and_equal_alias_evidence() {
+        let cases = [
+            (serde_json::json!({ "is_fork": false }), "trusted"),
+            (serde_json::json!({ "forked": false }), "trusted"),
+            (serde_json::json!({ "is_fork": false, "forked": false }), "trusted"),
+            (serde_json::json!({ "is_fork": true }), "untrusted_fork"),
+            (serde_json::json!({ "forked": true }), "untrusted_fork"),
+            (serde_json::json!({ "is_fork": true, "forked": true }), "untrusted_fork"),
+        ];
+        for event_type in [GIT_PR_OPENED, GIT_PR_SYNCHRONIZED] {
+            for (fields, expected_tier) in &cases {
+                let ev = pr_envelope(event_type, fields.clone());
+                let reader = MapGitConfigReader::new().with_file("web", "deadbeef", ".myelin/ci.toml", valid_pr_toml());
+                let DispatchOutcome::Arm(armed) = arm(&ev, &reader) else {
+                    panic!("explicit boolean fork evidence must reach the matching PR config");
+                };
+                assert_eq!(armed.handoff.run_write.trust_tier, *expected_tier);
+            }
+        }
+    }
+
+    #[test]
+    fn push_preserves_absence_and_true_but_refuses_mistyped_or_conflicting_fork_evidence() {
+        let reader = MapGitConfigReader::new().with_file("web", "deadbeef", ".myelin/ci.toml", valid_toml());
+        let DispatchOutcome::Arm(absent) = arm(&push_envelope("web", "deadbeef"), &reader) else {
+            panic!("legacy push without fork evidence remains compatible");
+        };
+        assert_eq!(absent.handoff.run_write.trust_tier, "trusted");
+
+        let mut fork = push_envelope("web", "deadbeef");
+        fork.payload["is_fork"] = serde_json::json!(true);
+        let DispatchOutcome::Arm(fork) = arm(&fork, &reader) else {
+            panic!("well-typed push fork evidence must be preserved");
+        };
+        assert_eq!(fork.handoff.run_write.trust_tier, "untrusted_fork");
+
+        for fields in [
+            serde_json::json!({ "is_fork": "false" }),
+            serde_json::json!({ "forked": null }),
+            serde_json::json!({ "is_fork": false, "forked": true }),
+        ] {
+            let mut ev = push_envelope("web", "deadbeef");
+            ev.payload.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+            assert_malformed_before_side_effects(&ev);
+        }
+    }
+
+    #[test]
+    fn unknown_event_type_remains_not_a_trigger_before_payload_parsing() {
+        let mut ev = push_envelope("web", "deadbeef");
+        ev.type_ = EventType("git.pr.closed".into());
+        ev.payload["is_fork"] = serde_json::json!("not-a-boolean");
+        assert!(matches!(
+            plan_dispatch(&ev, &NoConfigRead, &NoCasAccess),
+            DispatchOutcome::Skip(SkipReason::NotATrigger(t)) if t == "git.pr.closed"
         ));
     }
 
