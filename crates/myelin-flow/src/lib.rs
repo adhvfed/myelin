@@ -302,6 +302,7 @@ pub use engine::{
     drive, drive_full, drive_versioned, drive_with_timers, run_state, DriveOutcome, FlowDispatcher,
     FlowTelemetry, RunRow, RunStore, SignalRow, SignalStore, WorkflowBody,
 };
+pub use executor::partition_for_run_id;
 pub use executor::{
     DurableExecutor, ExecutorError, FlowExecutor, RunBudget, RunId, RunStatus, SignalOutcome,
     SignalSpec, StartSpec, PARTITION_COUNT,
