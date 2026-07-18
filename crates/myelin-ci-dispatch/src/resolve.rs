@@ -55,16 +55,12 @@
 //! (the bundle is one value the consumer commits together).
 //!
 //! ## FLOOR named (the prompt DoD)
-//! - **The sandboxed dynamic-generation escape hatch** (arch 02 §7.4): a job that *emits* a pipeline
-//!   fragment is the named programmatic-fan-out path. [`CiDefinition`] models it as a
-//!   [`JobDef::kind`] = [`JobKind::Generate`] — the generation step is a NORMAL job on the CI-P3
-//!   runner (it runs in the SAME sandbox as any untrusted code; there is NO privileged config-eval
-//!   path). [`resolve_snapshot`] resolves the generator job's OWN image to a digest like any other
-//!   job (so the generator itself is digest-pinned + sandboxed); the fragment the generator emits is
-//!   re-resolved through THIS same resolver on a follow-up dispatch. The hook is wired here
-//!   ([`ResolvedSnapshot::has_dynamic_generation`]); the in-sandbox EXECUTION of the generation step
-//!   (running the generator, ingesting its emitted fragment, re-dispatching) lands with the runner +
-//!   the `ci.pipeline` body (CI-P15 / `myelin_flow::ci_pipeline`). State this.
+//! - **The sandboxed dynamic-generation escape hatch** (arch 02 §7.4): [`CiDefinition`] models a
+//!   generator as [`JobDef::kind`] = [`JobKind::Generate`], but [`resolve_snapshot`] currently
+//!   refuses it. The shared execution contract cannot ingest and re-resolve emitted fragments yet,
+//!   so persisting an apparently executable generator plan would be dishonest. Generator execution,
+//!   fragment ingestion, and re-dispatch remain the named CI-P15 follow-on; there is no privileged
+//!   config-evaluation path in the meantime.
 //! - **The tag→digest registry resolution** (the real lookup + sigstore verify): CI-P23 (CI-D4).
 //!   CI-P11 enforces the fail-closed PLAN-time half only.
 //!
@@ -109,9 +105,9 @@ use crate::dispatch::{OnTrigger, TrustStamp};
 /// - [`JobKind::Generate`] — the **sandboxed dynamic-generation escape hatch**: a job that *emits* a
 ///   pipeline fragment for genuinely programmatic fan-out. It is a NORMAL job in every other respect
 ///   (digest-pinned image, runs on the CI-P3 runner, the SAME sandbox as any untrusted code — NO
-///   privileged config-eval path). The fragment it emits is re-resolved through [`resolve_snapshot`]
-///   on a follow-up dispatch; the in-sandbox EXECUTION of the generation step is CI-P15's runner
-///   path (the named floor).
+///   privileged config-eval path). The type reserves the authored contract, while
+///   [`resolve_snapshot`] refuses generator plans until CI-P15 supplies sandbox execution, fragment
+///   ingestion, and re-dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
     /// An ordinary build/test/deploy job.
@@ -289,8 +285,9 @@ impl std::fmt::Display for ResolveError {
 
 impl std::error::Error for ResolveError {}
 
-/// Render a deterministic instance name for a matrix assignment: `<job>[k1=v1,k2=v2]` with axes in
-/// SORTED key order (so the same assignment always renders the same name — the reproducibility floor).
+/// Render a deterministic machine-token instance name for a matrix assignment. The full authored
+/// job name and sorted assignment are length-framed into a BLAKE3 identity, retaining a bounded
+/// human-readable job prefix without allowing distinct assignments to alias.
 fn instance_name(job: &str, assignment: &BTreeMap<String, String>) -> String {
     if assignment.is_empty() {
         return job.to_string();
@@ -1068,7 +1065,7 @@ mod tests {
     /// The generator runs in the SAME sandbox (no privileged config-eval path); the in-sandbox
     /// EXECUTION lands with the runner (CI-P15).
     #[test]
-    fn the_dynamic_generation_escape_hatch_is_hooked() {
+    fn dynamic_generation_is_refused_until_fragment_ingestion_exists() {
         let def = CiDefinition {
             on: OnTrigger::Push,
             jobs: vec![JobDef::normal("gen-matrix", PINNED, ["generate"]).as_generator()],

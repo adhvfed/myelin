@@ -270,7 +270,7 @@ struct AuthoredCi {
 
 /// One authored job. `image` is the RAW reference as authored — it MAY be a floating tag at parse
 /// time; the digest-pin-or-fail-closed control is the RESOLVER's (`resolve_snapshot`), not the
-/// parser's. `needs`/`matrix`/`kind` default to empty/normal so the common job is terse.
+/// parser's. `command` is required; `needs`/`matrix`/`kind` default to empty/normal.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuthoredJob {
