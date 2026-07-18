@@ -434,6 +434,16 @@ fn stable_partition_hash(run_id: &str) -> u64 {
     hasher.finish()
 }
 
+/// Map a run id onto a caller-supplied shard cardinality using the ONE frozen durable hash.
+///
+/// This is crate-visible so the timer wheel can share the exact workflow-row authority without
+/// exposing a second public routing primitive. `shards == 0` retains the timer API's historical
+/// floor to one shard. A shard-count change is a persisted-data migration: callers must not change
+/// it for existing rows without rewriting their stored partitions in the same rollout.
+pub(crate) fn partition_for_shards(run_id: &str, shards: u32) -> i16 {
+    (stable_partition_hash(run_id) % u64::from(shards.max(1))) as i16
+}
+
 /// Deterministically assign a durable run id to its workflow partition.
 ///
 /// This is a persisted compatibility contract, not merely a distribution helper: it uses the
@@ -443,7 +453,7 @@ fn stable_partition_hash(run_id: &str) -> u64 {
 /// engine-owned partition selected at creation; callers must not use it for tenant discovery or
 /// routing.
 pub fn partition_for_run_id(run_id: &str) -> i16 {
-    (stable_partition_hash(run_id) % PARTITION_COUNT as u64) as i16
+    partition_for_shards(run_id, PARTITION_COUNT)
 }
 
 impl DurableExecutor for FlowExecutor {
@@ -724,7 +734,7 @@ mod tests {
                 "durable modulo-{PARTITION_COUNT} mapping drifted for {run_id:?}"
             );
             assert_eq!(
-                actual_hash % 64,
+                partition_for_shards(run_id, 64) as u64,
                 expected_mod_64,
                 "modulo-64 compatibility drifted for {run_id:?}"
             );

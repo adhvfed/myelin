@@ -643,22 +643,20 @@ impl TimerWheel {
     }
 }
 
-/// **The worker-shard partition for a run id — `partition = hash(run_id) % shards` (§7.2).** The
-/// SAME `partition = hash(run_id) % N` the engine's lease scan uses ([`crate::engine::RunRow::partition`]),
-/// so a timer is co-located with its run on ONE shard: the per-partition wheel scan
-/// ([`TimerStore::scan_due`] filters `partition = p`) means shard `p` reads ONLY its own timers, and no
-/// two shards ever scan the SAME timer (the structural half of "0 double-claim at cell scale", §7.3).
-/// Deterministic + stable (the FNV-1a hash) so a run's partition never drifts across restarts. `shards`
-/// must be ≥ 1 (a 0-shard fleet is a config error — floored to 1).
+/// **The worker-shard partition for a run id — `partition = hash(run_id) % shards` (§7.2).**
+///
+/// Delegates to the ONE frozen workflow-row algorithm (zero-key SipHash-1-3 over the run id's UTF-8
+/// bytes plus the historical `0xff` string terminator), so the timer and its run are co-located on
+/// one shard. The per-partition wheel scan ([`TimerStore::scan_due`] filters `partition = p`) means
+/// shard `p` reads only its own timers and no two shards scan the same timer (the structural half of
+/// "0 double-claim at cell scale", §7.3).
+///
+/// `shards` must equal the cardinality used to stamp the corresponding workflow row (currently
+/// [`crate::PARTITION_COUNT`]). It is persisted-data authority, not a live tuning knob: changing it
+/// for existing runs requires an explicit row migration. A zero-shard fleet retains the historical
+/// API behavior and floors to one shard.
 pub fn partition_for(run_id: &str, shards: u16) -> i16 {
-    let n = shards.max(1) as u64;
-    // FNV-1a 64-bit — a stable, well-distributed hash (no std Hasher seed drift across processes).
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in run_id.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    (h % n) as i16
+    crate::executor::partition_for_shards(run_id, u32::from(shards))
 }
 
 /// **The per-cell worker-sharding wheel fleet — N per-partition [`TimerWheel`] workers over ONE shared
@@ -1401,6 +1399,35 @@ mod tests {
         );
     }
 
+    /// **The timer wheel and durable workflow rows share ONE partition authority.** These are the
+    /// same fixed known-answer inputs used to freeze the historical full digest in `executor`; at
+    /// the durable shard count the public timer helper must always equal `partition_for_run_id`.
+    #[test]
+    fn timer_partition_matches_the_durable_run_partition_for_known_answers() {
+        let durable_shards = u16::try_from(crate::PARTITION_COUNT)
+            .expect("the durable partition count fits the timer API");
+        let run_ids = [
+            "",
+            "a",
+            "run-rolled-back",
+            "00000000-0000-0000-0000-000000000000",
+            "0190f8b0-7c00-7f3d-8000-000000000001",
+            "wf:evt-42",
+            "myelin://acme/flow/run/123",
+            "éclair",
+            "emoji-🧠",
+            "nul\0inside",
+        ];
+
+        for run_id in run_ids {
+            assert_eq!(
+                partition_for(run_id, durable_shards),
+                crate::partition_for_run_id(run_id),
+                "the timer and durable run partition diverged for {run_id:?}"
+            );
+        }
+    }
+
     /// **`partition_for` is deterministic, stable, and bounded to `0..shards` (§7.2).** The SAME run id
     /// always hashes to the SAME partition (so a run's timers never drift across shards/restarts), every
     /// partition is in range, and a 0-shard fleet floors to a single partition 0 (a config error, never a
@@ -1416,8 +1443,20 @@ mod tests {
             let p = partition_for(&format!("R-{i}"), 16);
             assert!((0..16).contains(&p), "every partition is in 0..shards");
         }
-        // a 0-shard fleet floors to one partition (no divide-by-zero, no out-of-range).
-        assert_eq!(partition_for("R-x", 0), 0, "0 shards floors to partition 0");
+        // A 0-shard fleet preserves the public API's one-shard floor for every input (no
+        // divide-by-zero, no out-of-range partition, and exactly the same mapping as shards=1).
+        for run_id in ["", "R-x", "emoji-🧠", "nul\0inside"] {
+            assert_eq!(
+                partition_for(run_id, 0),
+                partition_for(run_id, 1),
+                "0 shards retains the historical one-shard floor for {run_id:?}"
+            );
+            assert_eq!(
+                partition_for(run_id, 0),
+                0,
+                "one shard has only partition 0 for {run_id:?}"
+            );
+        }
     }
 
     /// **The worker-sharding split does NOT double-claim a timer at scale (§7.2/§7.3 — the FLOW-D3-full
