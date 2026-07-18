@@ -601,6 +601,7 @@ impl<'a> MockCiResultProducer<'a> {
             idem_key: merge_attempt_id.to_string(),
             payload: encode_ci_result(&result),
             payload_key_ref: None,
+            received_unix_ms: 0,
             consumed_seq: None,
         })
     }
@@ -818,6 +819,7 @@ impl<'a> RealCiResultProducer<'a> {
             idem_key: merge_attempt_id.to_string(),
             payload: encode_ci_result(&result),
             payload_key_ref: None,
+            received_unix_ms: 0,
             consumed_seq: None,
         })
     }
@@ -1452,6 +1454,7 @@ mod tests {
             idem_key: attempt,
             payload: vec![ArtifactRef("ci.result:context:build".into())], // no verdict ref
             payload_key_ref: None,
+            received_unix_ms: 0,
             consumed_seq: None,
         });
 

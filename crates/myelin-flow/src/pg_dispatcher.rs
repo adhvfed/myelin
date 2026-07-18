@@ -64,6 +64,13 @@ impl From<&DriveLease> for PgClaimedDriveInput {
     }
 }
 
+/// A deterministic production workflow definition.
+///
+/// `Fn` prevents ordinary mutable captures, but Rust cannot exclude interior mutability such as an
+/// `Arc<Mutex<_>>`. A production body must derive every effect-selecting fact from its immutable
+/// [`PgClaimedDriveInput`] and journaled [`WfCtx`] reads. Captured adapters may provide side-effect
+/// implementations, but they must not carry mutable workflow decisions or foreign tenant/run state.
+/// This is a registration contract enforced by review and replay tests, not by the type system.
 pub type PgWorkflowBody = dyn Fn(&PgClaimedDriveInput, &mut WfCtx) -> Result<Vec<ArtifactRef>, String>
     + Send
     + Sync
@@ -322,6 +329,10 @@ impl PgFlowWorker {
     }
 
     /// Persist the immutable definition and install the matching deterministic body locally.
+    ///
+    /// The closure follows [`PgWorkflowBody`]'s capture contract: interior-mutable captures are
+    /// technically possible, but must be limited to scope-safe effect adapters. Workflow branching,
+    /// targets, time, and other replay-sensitive facts come only from the claimed input or `WfCtx`.
     pub fn register_definition<F>(
         &mut self,
         wf_type: &str,
@@ -429,6 +440,7 @@ impl PgFlowWorker {
                 idem_key: pending.idem_key,
                 payload: pending.payload,
                 payload_key_ref: pending.payload_key_ref,
+                received_unix_ms: pending.received_unix_ms,
                 consumed_seq: None,
             });
         }
@@ -611,6 +623,7 @@ fn build_commit(
         timers: Vec::new(),
         outbox: Vec::new(),
         consumed_signals: Vec::new(),
+        disarmed_timer_ids: Vec::new(),
     });
     let signal_keys: HashMap<_, _> = staged
         .consumed_signals
@@ -664,6 +677,7 @@ fn build_commit(
         history,
         attempts,
         timers,
+        timer_disarms: staged.disarmed_timer_ids,
         outbox: staged.outbox,
     })
 }

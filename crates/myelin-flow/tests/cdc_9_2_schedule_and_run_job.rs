@@ -136,6 +136,7 @@ fn deliver_job_done(signals: &SignalStore, idem_token: &str, result: Vec<Artifac
         idem_key: idem_token.into(),
         payload: result,
         payload_key_ref: None,
+        received_unix_ms: 0,
         consumed_seq: None,
     });
 }

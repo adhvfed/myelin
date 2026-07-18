@@ -222,6 +222,7 @@ fn deliver_approval(signals: &SignalStore, call_id: &str, payload: Vec<ArtifactR
         idem_key: format!("card:{call_id}"),
         payload,
         payload_key_ref: None,
+        received_unix_ms: 0,
         consumed_seq: None,
     });
 }

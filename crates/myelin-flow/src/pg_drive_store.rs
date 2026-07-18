@@ -7,7 +7,7 @@
 //! outbox rows, and the run settlement in one tenant-scoped PostgreSQL transaction.
 
 use crate::engine::run_state;
-use crate::wfctx::{WAIT_IDEM_PREFIX, WAIT_KEYREF_PREFIX};
+use crate::wfctx::{WAIT_IDEM_PREFIX, WAIT_KEYREF_PREFIX, WAIT_SIGNAL_NAME_PREFIX};
 use myelin_events::OutboxRow;
 use myelin_refs::ArtifactRef;
 use myelin_storage::pgrelay::PgRelay;
@@ -196,6 +196,7 @@ pub struct DriveCommit {
     pub history: Vec<HistoryWrite>,
     pub attempts: Vec<ActivityAttemptWrite>,
     pub timers: Vec<TimerArm>,
+    pub timer_disarms: Vec<String>,
     pub outbox: Vec<OutboxRow>,
 }
 
@@ -708,6 +709,7 @@ impl PgFlowDriveStore {
 
                     persist_attempts(conn, &tenant, &region, &lease.run_id, &commit.attempts).await?;
                     persist_timer_arms(conn, &tenant, &region, &lease, &commit.timers).await?;
+                    persist_timer_disarms(conn, &tenant, &region, &lease, &commit.timer_disarms).await?;
                     PgRelay::co_commit_rows_in_tx(conn, &commit.outbox)
                         .await
                         .map_err(DriveStoreError::from)?;
@@ -1178,15 +1180,22 @@ async fn consume_exact_signal(
     let already: Option<i64> = row
         .try_get("consumed_seq")
         .map_err(|e| db("decode consumed signal seq", e))?;
-    let mut expected = vec![ArtifactRef(format!(
+    let mut legacy_expected = vec![ArtifactRef(format!(
         "{WAIT_IDEM_PREFIX}{}",
         signal.idem_key
     ))];
     if let Some(key_ref) = &key_ref {
-        expected.push(ArtifactRef(format!("{WAIT_KEYREF_PREFIX}{key_ref}")));
+        legacy_expected.push(ArtifactRef(format!("{WAIT_KEYREF_PREFIX}{key_ref}")));
     }
-    expected.extend(payload_refs);
-    if write.result.as_ref() != Some(&expected) || write.result_key_ref.is_some() {
+    legacy_expected.extend(payload_refs);
+    let mut bound_expected = legacy_expected.clone();
+    bound_expected.insert(
+        1,
+        ArtifactRef(format!("{WAIT_SIGNAL_NAME_PREFIX}{}", signal.signal_name)),
+    );
+    let receipt_matches = write.result.as_ref() == Some(&bound_expected)
+        || write.result.as_ref() == Some(&legacy_expected);
+    if !receipt_matches || write.result_key_ref.is_some() {
         return Err(DriveStoreError::SignalConflict(format!(
             "signal receipt {} does not match buffered payload",
             signal.idem_key
@@ -1334,6 +1343,34 @@ async fn persist_timer_arms(
     Ok(())
 }
 
+async fn persist_timer_disarms(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    lease: &DriveLease,
+    timer_ids: &[String],
+) -> Result<(), DriveStoreError> {
+    for timer_id in timer_ids {
+        let result = sqlx::query(
+            "UPDATE wf_timer SET fired = true \
+             WHERE tenant_id = $1 AND region = $2 AND timer_id = $3 AND run_id = $4",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(timer_id)
+        .bind(&lease.run_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| db("disarm workflow timer", e))?;
+        if result.rows_affected() != 1 {
+            return Err(DriveStoreError::TimerConflict(format!(
+                "missing or foreign timer disarm `{timer_id}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn drive_fingerprint(commit: &DriveCommit) -> Result<String, DriveStoreError> {
     let history = commit.history.iter().map(|write| {
         serde_json::json!({
@@ -1395,6 +1432,7 @@ fn drive_fingerprint(commit: &DriveCommit) -> Result<String, DriveStoreError> {
         "history": history,
         "attempts": attempts,
         "timers": timers,
+        "timer_disarms": commit.timer_disarms,
         "outbox": outbox,
     });
     let bytes = serde_json::to_vec(&value).map_err(|e| db("encode drive fingerprint", e))?;

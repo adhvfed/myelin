@@ -237,6 +237,7 @@ fn drill_flow_d6_runaway_dispatch_loop_refused_when_exhausted_runner_never_calle
             idem_key: token,
             payload: vec![ArtifactRef("myelin://acme/ci/green".into())],
             payload_key_ref: None,
+            received_unix_ms: 0,
             consumed_seq: None,
         });
 

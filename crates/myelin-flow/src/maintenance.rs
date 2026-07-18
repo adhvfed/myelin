@@ -643,7 +643,11 @@ mod tests {
             dispatched: Mutex::new(Vec::new()),
         };
 
-        let mut ctx = begin(&outbox, journal).with_signals(signals);
+        let mut ctx = begin(&outbox, journal).with_signals(signals).with_timers(
+            crate::TimerStore::new(),
+            0,
+            1_000,
+        );
         let out = ctx
             .run_heavy_maintenance(
                 MaintenanceOp::Repack,

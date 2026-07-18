@@ -192,6 +192,8 @@ const WAIT_DEADLINE_PREFIX: &str = "wait:deadline:";
 /// The exact idempotency key a keyed wait expects. New exact waits journal this alongside their
 /// deadline so changing a DAG join key between drives is a replay divergence, not a chance match.
 const WAIT_EXPECTED_IDEM_PREFIX: &str = "myelin://flow/wait-idem/";
+const WAIT_EXPECTED_NAME_PREFIX: &str = "myelin://flow/wait-name/";
+pub(crate) const WAIT_SIGNAL_NAME_PREFIX: &str = "myelin://flow/signal-name/";
 /// The marker a TIMED-OUT wait journals as its `signal_received` idem_key + key_ref (so replay returns
 /// [`WaitOutcome::TimedOut`] deterministically) — a machine token, no PII.
 const WAIT_TIMEOUT_MARKER: &str = "wait:timeout";
@@ -220,6 +222,8 @@ fn decode_received(result: &Option<Vec<myelin_refs::ArtifactRef>>) -> WaitOutcom
                 .or_else(|| r.0.strip_prefix(LEGACY_WAIT_IDEM_PREFIX))
         {
             idem_key = k.to_string();
+        } else if r.0.starts_with(WAIT_SIGNAL_NAME_PREFIX) {
+            // Binding metadata, not workflow payload.
         } else if let Some(kr) =
             r.0.strip_prefix(WAIT_KEYREF_PREFIX)
                 .or_else(|| r.0.strip_prefix(LEGACY_WAIT_KEYREF_PREFIX))
@@ -237,6 +241,15 @@ fn decode_received(result: &Option<Vec<myelin_refs::ArtifactRef>>) -> WaitOutcom
         payload,
         payload_key_ref,
     }
+}
+
+fn decode_received_signal_name(result: &Option<Vec<myelin_refs::ArtifactRef>>) -> Option<String> {
+    result.as_ref()?.iter().find_map(|artifact| {
+        artifact
+            .0
+            .strip_prefix(WAIT_SIGNAL_NAME_PREFIX)
+            .map(ToOwned::to_owned)
+    })
 }
 
 /// The retry policy for [`WfCtx::activity`] (§4.4) — the bounded attempt count. The `idem_token`
@@ -554,6 +567,12 @@ pub struct WfCtx {
     /// the gate reads it to assert a resume DID re-mint. `0` on a drive that never resumed (a cold first
     /// drive that parked, or a pure non-waiting body).
     pub(crate) reminted_tokens: u64,
+    /// Dispatch identities reconstructed from journaled activity results during this deterministic
+    /// drive. Job joins validate opaque handles against this registry and enforce earliest-deadline
+    /// ordering, so caller material cannot select a sibling or extend its SLA.
+    pub(crate) job_dispatches: std::collections::HashMap<String, (String, Option<i64>, String)>,
+    pub(crate) joined_job_dispatches: std::collections::HashSet<String>,
+    pub(crate) disarmed_timer_ids: Vec<String>,
 }
 
 /// One journaled command outcome a replay reads back (§4.1) — the result an `activity` returns on
@@ -588,6 +607,7 @@ pub struct StagedWfDrive {
     pub timers: Vec<crate::timer::TimerRow>,
     pub outbox: Vec<myelin_events::OutboxRow>,
     pub consumed_signals: Vec<ConsumedSignalCommand>,
+    pub disarmed_timer_ids: Vec<String>,
 }
 
 impl WfCtx {
@@ -653,6 +673,9 @@ impl WfCtx {
             budget: None,
             run_identity: None,
             reminted_tokens: 0,
+            job_dispatches: std::collections::HashMap::new(),
+            joined_job_dispatches: std::collections::HashSet::new(),
+            disarmed_timer_ids: Vec::new(),
         }
     }
 
@@ -843,7 +866,7 @@ impl WfCtx {
 
     /// Latch the FIRST divergence reason (sticky — a later command never clears it). Idempotent on a
     /// re-latch: only the first reason is kept (the position the body first diverged).
-    fn latch_divergence(&mut self, reason: String) {
+    pub(crate) fn latch_divergence(&mut self, reason: String) {
         if self.divergence.is_none() {
             self.divergence = Some(reason);
         }
@@ -881,6 +904,13 @@ impl WfCtx {
     /// counter untouched (the `activity` that follows consumes it for real).
     pub(crate) fn peek_next_command_id(&self) -> String {
         format!("{}:{}", self.wf_type, self.command_seq)
+    }
+
+    /// Whether the deterministic command position is already present in the loaded durable
+    /// journal. Side resources co-committed with that row (such as a dispatch-time SLA timer) must
+    /// not be recreated during replay.
+    pub(crate) fn is_replaying_command(&self, command_id: &str) -> bool {
+        self.replay_history.contains_key(command_id)
     }
 
     /// The next per-run monotonic history `seq` (the replay-order PK, §3.2).
@@ -1330,7 +1360,7 @@ impl WfCtx {
         name: &str,
         timeout_secs: Option<i64>,
     ) -> WfResult<WaitOutcome> {
-        self.wait_for_signal_inner(name, None, timeout_secs, None)
+        self.wait_for_signal_inner(name, None, timeout_secs, None, true)
     }
 
     /// Wait for one exact `(signal_name, idem_key)` pair. This is the join primitive for parallel
@@ -1342,7 +1372,7 @@ impl WfCtx {
         idem_key: &str,
         timeout_secs: Option<i64>,
     ) -> WfResult<WaitOutcome> {
-        self.wait_for_signal_inner(name, Some(idem_key), timeout_secs, None)
+        self.wait_for_signal_inner(name, Some(idem_key), timeout_secs, None, true)
     }
 
     /// Wait for an exact signal with an absolute deadline fixed by an earlier dispatch. The
@@ -1354,7 +1384,16 @@ impl WfCtx {
         idem_key: &str,
         deadline_unix_secs: Option<i64>,
     ) -> WfResult<WaitOutcome> {
-        self.wait_for_signal_inner(name, Some(idem_key), None, deadline_unix_secs)
+        self.wait_for_signal_inner(name, Some(idem_key), None, deadline_unix_secs, true)
+    }
+
+    pub(crate) fn wait_for_signal_exact_until_prearmed(
+        &mut self,
+        name: &str,
+        idem_key: &str,
+        deadline_unix_secs: Option<i64>,
+    ) -> WfResult<WaitOutcome> {
+        self.wait_for_signal_inner(name, Some(idem_key), None, deadline_unix_secs, false)
     }
 
     fn wait_for_signal_inner(
@@ -1363,6 +1402,7 @@ impl WfCtx {
         expected_idem_key: Option<&str>,
         timeout_secs: Option<i64>,
         absolute_deadline: Option<i64>,
+        arm_timeout: bool,
     ) -> WfResult<WaitOutcome> {
         // DIVERGENCE HALT (P-FLOW-07): a latched divergence freezes the wait (the run already halts).
         if let Some(reason) = self.divergence.clone() {
@@ -1391,6 +1431,18 @@ impl WfCtx {
                             );
                             self.latch_divergence(reason.clone());
                             return Err(WfError::Nondeterministic(reason));
+                        }
+                    }
+                    if expected_idem_key.is_some() {
+                        if let Some(recorded_name) = decode_received_signal_name(&replayed.result) {
+                            if recorded_name != name {
+                                let reason = format!(
+                                    "replay divergence at {command_id}: exact wait expected signal \
+                                     name `{name}` but the journal records `{recorded_name}`"
+                                );
+                                self.latch_divergence(reason.clone());
+                                return Err(WfError::Nondeterministic(reason));
+                            }
                         }
                     }
                     return Ok(outcome);
@@ -1437,7 +1489,35 @@ impl WfCtx {
                     return Err(WfError::Nondeterministic(reason));
                 }
             }
+            if expected_idem_key.is_some() {
+                if let Some(recorded_name) = self.replayed_wait_expected_name(&command_id) {
+                    if recorded_name != name {
+                        let reason = format!(
+                            "replay divergence at {command_id}: exact wait expected signal name \
+                             `{name}` but the journaled wait expects `{recorded_name}`"
+                        );
+                        self.latch_divergence(reason.clone());
+                        return Err(WfError::Nondeterministic(reason));
+                    }
+                }
+            }
         }
+
+        let now_secs = self.timers.as_ref().map(|(_, _, n)| *n).unwrap_or(0);
+        let effective_deadline =
+            (timeout_secs.is_some() || absolute_deadline.is_some()).then(|| {
+                if already_waited {
+                    self.replayed_wait_deadline(&command_id).unwrap_or_else(|| {
+                        absolute_deadline.unwrap_or_else(|| {
+                            now_secs.saturating_add(timeout_secs.unwrap_or_default())
+                        })
+                    })
+                } else {
+                    absolute_deadline.unwrap_or_else(|| {
+                        now_secs.saturating_add(timeout_secs.unwrap_or_default())
+                    })
+                }
+            });
 
         let candidate = match expected_idem_key {
             Some(idem_key) => signals
@@ -1446,6 +1526,24 @@ impl WfCtx {
             None => signals.first_unconsumed_for(&self.tenant, &self.run_id, name),
         };
         if let Some((idem_key, row)) = candidate {
+            // A result received exactly at the deadline is accepted; one received even a
+            // millisecond later loses to the timeout. Receipt time, not timer-wheel processing
+            // order, decides this race.
+            if effective_deadline
+                .is_some_and(|deadline| row.received_unix_ms > deadline.saturating_mul(1000))
+            {
+                self.stage_received(
+                    command_id,
+                    Some(name),
+                    WAIT_TIMEOUT_MARKER,
+                    &[],
+                    Some(WAIT_TIMEOUT_MARKER),
+                );
+                if already_waited {
+                    self.remint_if_resuming()?;
+                }
+                return Ok(WaitOutcome::TimedOut);
+            }
             // **THE SIGNAL ARRIVED — consume it EXACTLY ONCE (§4.3).** Stamp its `consumed_seq` (the
             // history seq the `signal_received` row will land at) so the signal-buffer-depth drops and a
             // re-scan never re-consumes it. The consume is idempotent on `consumed_seq IS NULL` (a re-
@@ -1469,6 +1567,7 @@ impl WfCtx {
             // so replay returns the SAME signal (consume-exactly-once). references-not-payloads.
             self.stage_received(
                 command_id,
+                Some(name),
                 &idem_key,
                 &row.payload,
                 row.payload_key_ref.as_deref(),
@@ -1493,25 +1592,15 @@ impl WfCtx {
         // **NO SIGNAL YET.** If a timeout was set and the timeout-timer's deadline has PASSED relative to
         // the engine's live clock, the wait TIMES OUT (the §6.3 auto-deny branch) — a deterministic
         // outcome the next re-drive reads off the same clock. Otherwise the run PARKS (`waiting`).
-        let now_secs = self.timers.as_ref().map(|(_, _, n)| *n).unwrap_or(0);
-        if timeout_secs.is_some() || absolute_deadline.is_some() {
+        if let Some(deadline) = effective_deadline {
             // The absolute timeout deadline: on the FIRST park it is now + timeout; on a resume it is the
             // deadline captured in the `signal_waited` marker (so the deadline is stable across re-drives).
-            let deadline = if already_waited {
-                self.replayed_wait_deadline(&command_id).unwrap_or_else(|| {
-                    absolute_deadline.unwrap_or_else(|| {
-                        now_secs.saturating_add(timeout_secs.unwrap_or_default())
-                    })
-                })
-            } else {
-                absolute_deadline
-                    .unwrap_or_else(|| now_secs.saturating_add(timeout_secs.unwrap_or_default()))
-            };
             if now_secs >= deadline {
                 // the timeout fired before the signal arrived — journal a `signal_received` carrying the
                 // TIMEOUT marker (so replay returns TimedOut deterministically) and take the timeout path.
                 self.stage_received(
                     command_id,
+                    Some(name),
                     WAIT_TIMEOUT_MARKER,
                     &[],
                     Some(WAIT_TIMEOUT_MARKER),
@@ -1529,31 +1618,82 @@ impl WfCtx {
             // so the wheel wakes the run at the deadline even if the signal never arrives. Best-effort: a
             // wait with no timer wheel still parks (the signal delivery wakes it; the timeout is the
             // wheel's job when present).
-            if let Some((timers, partition, _)) = self.timers.clone() {
-                let timer_id = format!("{}/{}/timeout", self.run_id, command_id);
-                let bucket = crate::timer::epoch_minute(deadline);
-                timers.arm(crate::timer::TimerRow {
-                    tenant: self.tenant.clone(),
-                    region: self.region.clone(),
-                    timer_id,
-                    run_id: Some(self.run_id.clone()),
-                    command_id: command_id.clone(),
-                    fire_at: deadline,
-                    bucket,
-                    fired: false,
-                    partition,
-                });
+            if arm_timeout {
+                if let Some((timers, partition, _)) = self.timers.clone() {
+                    let timer_id = format!("{}/{}/timeout", self.run_id, command_id);
+                    let bucket = crate::timer::epoch_minute(deadline);
+                    timers.arm(crate::timer::TimerRow {
+                        tenant: self.tenant.clone(),
+                        region: self.region.clone(),
+                        timer_id,
+                        run_id: Some(self.run_id.clone()),
+                        command_id: command_id.clone(),
+                        fire_at: deadline,
+                        bucket,
+                        fired: false,
+                        partition,
+                    });
+                }
             }
             // park, recording the deadline so the resume reads a STABLE deadline.
             if !already_waited {
-                self.stage_waited(command_id, Some(deadline), expected_idem_key);
+                self.stage_waited(
+                    command_id,
+                    Some(deadline),
+                    expected_idem_key.map(|_| name),
+                    expected_idem_key,
+                );
             }
         } else if !already_waited {
             // an unbounded wait — journal `signal_waited` (no deadline) on the first park only.
-            self.stage_waited(command_id, None, expected_idem_key);
+            self.stage_waited(
+                command_id,
+                None,
+                expected_idem_key.map(|_| name),
+                expected_idem_key,
+            );
         }
         self.parked_on_signal = true;
         Ok(WaitOutcome::Parked)
+    }
+
+    pub(crate) fn arm_job_deadline(
+        &mut self,
+        dispatch_command_id: &str,
+        deadline: i64,
+    ) -> WfResult<()> {
+        let (timers, partition, _) = self.timers.clone().ok_or_else(|| {
+            WfError::CoCommit(
+                "a timed job dispatch requires a durable timer wheel (WfCtx::with_timers)".into(),
+            )
+        })?;
+        let command_id = format!("{dispatch_command_id}/job-timeout");
+        timers.arm(crate::timer::TimerRow {
+            tenant: self.tenant.clone(),
+            region: self.region.clone(),
+            timer_id: format!("{}/{command_id}", self.run_id),
+            run_id: Some(self.run_id.clone()),
+            command_id,
+            fire_at: deadline,
+            bucket: crate::timer::epoch_minute(deadline),
+            fired: false,
+            partition,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn disarm_job_deadline(&mut self, dispatch_command_id: &str) -> WfResult<()> {
+        let (timers, _, _) = self.timers.clone().ok_or_else(|| {
+            WfError::CoCommit(
+                "a timed job join requires a durable timer wheel (WfCtx::with_timers)".into(),
+            )
+        })?;
+        let timer_id = format!("{}/{dispatch_command_id}/job-timeout", self.run_id);
+        timers.disarm(&self.tenant, &timer_id);
+        if !self.disarmed_timer_ids.contains(&timer_id) {
+            self.disarmed_timer_ids.push(timer_id);
+        }
+        Ok(())
     }
 
     /// The deadline captured in a journaled `signal_waited` marker (the stable timeout deadline a resume
@@ -1586,6 +1726,19 @@ impl WfCtx {
         })
     }
 
+    fn replayed_wait_expected_name(&self, command_id: &str) -> Option<String> {
+        let replayed = self.replay_history.get(command_id)?;
+        if replayed.kind != crate::wfctx::history_kind::SIGNAL_WAITED {
+            return None;
+        }
+        replayed.result.as_ref()?.iter().find_map(|artifact| {
+            artifact
+                .0
+                .strip_prefix(WAIT_EXPECTED_NAME_PREFIX)
+                .map(ToOwned::to_owned)
+        })
+    }
+
     /// Stage a `signal_waited` row (the park marker, §4.3) carrying the optional timeout deadline so a
     /// resume reads a STABLE deadline. references-not-payloads (no PII body). STAGED — durable iff
     /// commit (FLOW-D5).
@@ -1593,6 +1746,7 @@ impl WfCtx {
         &mut self,
         command_id: String,
         deadline: Option<i64>,
+        expected_signal_name: Option<&str>,
         expected_idem_key: Option<&str>,
     ) {
         let mut markers = Vec::new();
@@ -1604,6 +1758,11 @@ impl WfCtx {
         if let Some(idem_key) = expected_idem_key {
             markers.push(myelin_refs::ArtifactRef(format!(
                 "{WAIT_EXPECTED_IDEM_PREFIX}{idem_key}"
+            )));
+        }
+        if let Some(signal_name) = expected_signal_name {
+            markers.push(myelin_refs::ArtifactRef(format!(
+                "{WAIT_EXPECTED_NAME_PREFIX}{signal_name}"
             )));
         }
         let result = (!markers.is_empty()).then_some(markers);
@@ -1621,6 +1780,7 @@ impl WfCtx {
     fn stage_received(
         &mut self,
         command_id: String,
+        signal_name: Option<&str>,
         idem_key: &str,
         payload: &[myelin_refs::ArtifactRef],
         payload_key_ref: Option<&str>,
@@ -1628,6 +1788,11 @@ impl WfCtx {
         let mut result = vec![myelin_refs::ArtifactRef(format!(
             "{WAIT_IDEM_PREFIX}{idem_key}"
         ))];
+        if let Some(signal_name) = signal_name {
+            result.push(myelin_refs::ArtifactRef(format!(
+                "{WAIT_SIGNAL_NAME_PREFIX}{signal_name}"
+            )));
+        }
         if let Some(kr) = payload_key_ref {
             result.push(myelin_refs::ArtifactRef(format!(
                 "{WAIT_KEYREF_PREFIX}{kr}"
@@ -1724,6 +1889,7 @@ impl WfCtx {
             staged_history,
             staged_attempts,
             consumed_signal_commands,
+            disarmed_timer_ids,
             ..
         } = self;
         let outbox = tx
@@ -1735,6 +1901,7 @@ impl WfCtx {
             timers,
             outbox,
             consumed_signals: consumed_signal_commands,
+            disarmed_timer_ids,
         })
     }
 
@@ -2783,6 +2950,7 @@ mod tests {
             idem_key: idem.into(),
             payload,
             payload_key_ref: None,
+            received_unix_ms: 0,
             consumed_seq: None,
         });
     }
@@ -2882,6 +3050,148 @@ mod tests {
     }
 
     #[test]
+    fn exact_wait_name_change_is_a_replay_divergence() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let signals = SignalStore::new();
+        let mut first = begin(&outbox, journal.clone()).with_signals(signals.clone());
+        assert_eq!(
+            first
+                .wait_for_signal_exact("job.done", "job-a", None)
+                .unwrap(),
+            WaitOutcome::Parked
+        );
+        first.commit().unwrap();
+
+        let mut replay = WfCtx::resume(
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            journal.history_for(&tenant(), "R1"),
+        )
+        .with_signals(signals);
+        let error = replay
+            .wait_for_signal_exact("ci.result", "job-a", None)
+            .unwrap_err();
+        assert!(error.is_nondeterministic());
+    }
+
+    #[test]
+    fn consumed_exact_wait_binds_signal_name_on_replay() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let signals = SignalStore::new();
+        buffer_signal(
+            &signals,
+            "job.done",
+            "job-a",
+            vec![ArtifactRef("myelin://acme/ci/result/a".into())],
+        );
+        let mut first = begin(&outbox, journal.clone()).with_signals(signals.clone());
+        assert!(matches!(
+            first
+                .wait_for_signal_exact("job.done", "job-a", None)
+                .unwrap(),
+            WaitOutcome::Signalled { .. }
+        ));
+        first.commit().unwrap();
+
+        let mut replay = WfCtx::resume(
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            journal.history_for(&tenant(), "R1"),
+        );
+        let error = replay
+            .wait_for_signal_exact("ci.result", "job-a", None)
+            .unwrap_err();
+        assert!(error.is_nondeterministic());
+    }
+
+    #[test]
+    fn exact_wait_accepts_legacy_rows_without_signal_name_binding() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        journal.append_history_for_test(WfHistoryRow {
+            tenant: tenant(),
+            region: region(),
+            run_id: "R1".into(),
+            seq: 0,
+            kind: history_kind::SIGNAL_WAITED.into(),
+            command_id: "agent.run:0".into(),
+            result: Some(vec![ArtifactRef(format!(
+                "{WAIT_EXPECTED_IDEM_PREFIX}job-a"
+            ))]),
+            result_key_ref: None,
+        });
+        let signals = SignalStore::new();
+        let mut replay = WfCtx::resume(
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            journal.history_for(&tenant(), "R1"),
+        )
+        .with_signals(signals);
+        assert_eq!(
+            replay
+                .wait_for_signal_exact("job.done", "job-a", None)
+                .unwrap(),
+            WaitOutcome::Parked
+        );
+    }
+
+    #[test]
+    fn exact_receipt_accepts_legacy_rows_without_signal_name_binding() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        journal.append_history_for_test(WfHistoryRow {
+            tenant: tenant(),
+            region: region(),
+            run_id: "R1".into(),
+            seq: 0,
+            kind: history_kind::SIGNAL_RECEIVED.into(),
+            command_id: "agent.run:0".into(),
+            result: Some(vec![
+                ArtifactRef(format!("{WAIT_IDEM_PREFIX}job-a")),
+                ArtifactRef("myelin://acme/ci/result/a".into()),
+            ]),
+            result_key_ref: None,
+        });
+        let mut replay = WfCtx::resume(
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            journal.history_for(&tenant(), "R1"),
+        );
+        assert!(matches!(
+            replay
+                .wait_for_signal_exact("job.done", "job-a", None)
+                .unwrap(),
+            WaitOutcome::Signalled { idem_key, .. } if idem_key == "job-a"
+        ));
+    }
+
+    #[test]
     fn replay_decoder_accepts_legacy_signal_receipt_markers() {
         let outcome = decode_received(&Some(vec![
             ArtifactRef("wait:idem:job-a".into()),
@@ -2895,6 +3205,62 @@ mod tests {
                 payload: vec![ArtifactRef("myelin://acme/ci/result/a".into())],
                 payload_key_ref: Some("kms://acme/key-1".into()),
             }
+        );
+    }
+
+    #[test]
+    fn receipt_at_deadline_is_accepted_even_when_the_wheel_runs_late() {
+        let outbox = OutboxStore::new();
+        let signals = SignalStore::new();
+        signals.deliver(SignalRow {
+            tenant: tenant(),
+            region: region(),
+            run_id: "R1".into(),
+            signal_name: "job.done".into(),
+            idem_key: "job-a".into(),
+            payload: vec![ArtifactRef("myelin://acme/ci/result/a".into())],
+            payload_key_ref: None,
+            received_unix_ms: 110_000,
+            consumed_seq: None,
+        });
+        let mut ctx = begin(&outbox, WfJournal::new())
+            .with_signals(signals.clone())
+            .with_timers(crate::timer::TimerStore::new(), 0, 120);
+        assert!(matches!(
+            ctx.wait_for_signal_exact_until("job.done", "job-a", Some(110))
+                .unwrap(),
+            WaitOutcome::Signalled { .. }
+        ));
+        assert_eq!(signals.buffered_depth(), 0);
+    }
+
+    #[test]
+    fn receipt_after_deadline_times_out_even_when_timer_processing_lags() {
+        let outbox = OutboxStore::new();
+        let signals = SignalStore::new();
+        signals.deliver(SignalRow {
+            tenant: tenant(),
+            region: region(),
+            run_id: "R1".into(),
+            signal_name: "job.done".into(),
+            idem_key: "job-a".into(),
+            payload: vec![ArtifactRef("myelin://acme/ci/result/a".into())],
+            payload_key_ref: None,
+            received_unix_ms: 110_001,
+            consumed_seq: None,
+        });
+        let mut ctx = begin(&outbox, WfJournal::new())
+            .with_signals(signals.clone())
+            .with_timers(crate::timer::TimerStore::new(), 0, 120);
+        assert_eq!(
+            ctx.wait_for_signal_exact_until("job.done", "job-a", Some(110))
+                .unwrap(),
+            WaitOutcome::TimedOut
+        );
+        assert_eq!(
+            signals.buffered_depth(),
+            1,
+            "the losing late result remains unconsumed for audit/cleanup"
         );
     }
 

@@ -601,6 +601,7 @@ mod tests {
             idem_key: idem_token.into(),
             payload: result,
             payload_key_ref: None,
+            received_unix_ms: 0,
             consumed_seq: None,
         });
     }
