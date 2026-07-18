@@ -500,19 +500,19 @@ impl CiPipelineDriver {
         pipeline: PipelineRun,
         labels: Vec<String>,
     ) -> Result<RunId, StartRunError> {
+        validate_driver_tenant(&self.tenant, record)?;
         // Forward the run's STAMPED trust tier UNCHANGED (parse the ci_run.trust_tier CHECK token). A
         // corrupt token is a loud refusal — never a silent widen/default.
-        let trust_tier =
-            trust_from_token(&record.trust_tier).map_err(StartRunError::TrustTier)?;
+        let trust_tier = trust_from_token(&record.trust_tier).map_err(StartRunError::TrustTier)?;
         let terms = JobScheduleTerms {
-            tenant_id: self.tenant.0.clone(),
+            tenant_id: record.tenant_id.clone(),
             region: record.region.clone(),
             run_id: record.wf_run_id.clone(),
             lane: Lane::Interactive, // a PR/push CI check is the interactive lane (arch 02 §2.3)
             labels,
             trust_tier,
             concurrency_group: None,
-            fair_key: self.tenant.0.clone(),
+            fair_key: record.tenant_id.clone(),
         };
         self.plans.lock().unwrap_or_else(|e| e.into_inner()).insert(
             record.wf_run_id.clone(),
@@ -660,6 +660,15 @@ impl CiPipelineDriver {
 /// failure (unknown workflow / a pre-minted-id collision with a DIFFERENT run). Surfaced, never swallowed.
 #[derive(Debug)]
 pub enum StartRunError {
+    /// The durable run belongs to a different tenant than this per-tenant driver. Refused before a
+    /// plan is registered or an engine run/job is created, so a region-wide starter cannot stamp
+    /// one tenant's authority or fair-queue key onto another tenant's run.
+    TenantMismatch {
+        /// Tenant this driver was composed for.
+        driver_tenant: String,
+        /// Authoritative tenant read from `ci_run.tenant_id`.
+        record_tenant: String,
+    },
     /// The `ci_run.trust_tier` token was outside the frozen CHECK vocabulary (a corrupt run-of-record) —
     /// refused loudly rather than defaulting the tier the durable dispatch gates on.
     TrustTier(JobQueueStoreError),
@@ -671,6 +680,13 @@ pub enum StartRunError {
 impl std::fmt::Display for StartRunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            StartRunError::TenantMismatch {
+                driver_tenant,
+                record_tenant,
+            } => write!(
+                f,
+                "ci.pipeline start refused: driver tenant `{driver_tenant}` does not match durable ci_run tenant `{record_tenant}`"
+            ),
             StartRunError::TrustTier(e) => {
                 write!(f, "ci.pipeline start refused: corrupt trust_tier token: {e}")
             }
@@ -680,6 +696,23 @@ impl std::fmt::Display for StartRunError {
 }
 
 impl std::error::Error for StartRunError {}
+
+/// Enforce the per-tenant driver boundary before any mutable in-memory/durable orchestration state
+/// is touched. A future region-wide queued-run poller must route each record to a driver composed for
+/// exactly this authoritative tenant; it may never reuse a synthetic service tenant.
+fn validate_driver_tenant(
+    driver_tenant: &TenantId,
+    record: &CiRunRecord,
+) -> Result<(), StartRunError> {
+    if driver_tenant.0 == record.tenant_id {
+        Ok(())
+    } else {
+        Err(StartRunError::TenantMismatch {
+            driver_tenant: driver_tenant.0.clone(),
+            record_tenant: record.tenant_id.clone(),
+        })
+    }
+}
 
 // =================================================================================================
 // Helpers.
