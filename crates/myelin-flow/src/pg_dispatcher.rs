@@ -424,7 +424,28 @@ impl PgFlowWorker {
         .with_timers(timers, lease.partition, now_unix_secs)
         .with_signals(signals);
 
-        let body_result = body(&mut ctx);
+        // The body is synchronous by contract, so run it off the async executor while this task
+        // heartbeats the exact owner+epoch lease. A body that outlives one TTL cannot commit under
+        // stale authority; a failed renewal aborts the drive and the guarded release path runs.
+        let mut body_task = tokio::task::spawn_blocking(move || {
+            let result = body(&mut ctx);
+            (ctx, result)
+        });
+        let renew_every = Duration::from_secs((self.scope.lease_ttl_secs as u64 / 3).max(1));
+        let mut heartbeat =
+            tokio::time::interval_at(tokio::time::Instant::now() + renew_every, renew_every);
+        let (ctx, body_result) = loop {
+            tokio::select! {
+                result = &mut body_task => {
+                    break result.map_err(|error| {
+                        PgWorkerError::Staging(format!("workflow body task failed: {error}"))
+                    })?;
+                }
+                _ = heartbeat.tick() => {
+                    self.store.renew_lease(lease, self.scope.lease_ttl_secs).await?;
+                }
+            }
+        };
         let divergence = ctx.divergence().map(ToOwned::to_owned);
         let parked = ctx.parked();
         let outcome = if let Some(reason) = divergence {
