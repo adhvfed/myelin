@@ -372,7 +372,24 @@ impl PgRelay {
         aggregate: &str,
         envelope: &EventEnvelope,
     ) -> Result<(), PgError> {
+        Self::lock_outbox_aggregates_in_tx(conn, vec![aggregate]).await?;
         Self::insert_envelope_in_tx(conn, aggregate, envelope).await
+    }
+
+    async fn lock_outbox_aggregates_in_tx(
+        conn: &mut sqlx::PgConnection,
+        mut aggregates: Vec<&str>,
+    ) -> Result<(), PgError> {
+        aggregates.sort_unstable();
+        aggregates.dedup();
+        for aggregate in aggregates {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(aggregate)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| PgError::Query(format!("lock outbox aggregate {aggregate}: {e}")))?;
+        }
+        Ok(())
     }
 
     async fn insert_envelope_in_tx(
@@ -441,16 +458,8 @@ impl PgRelay {
             Self::validate_staged_shape(row)?;
         }
 
-        let mut aggregates: Vec<&str> = rows.iter().map(|row| row.aggregate.0.as_str()).collect();
-        aggregates.sort_unstable();
-        aggregates.dedup();
-        for aggregate in aggregates {
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(aggregate)
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| PgError::Query(format!("lock outbox aggregate {aggregate}: {e}")))?;
-        }
+        let aggregates = rows.iter().map(|row| row.aggregate.0.as_str()).collect();
+        Self::lock_outbox_aggregates_in_tx(conn, aggregates).await?;
 
         for row in rows {
             Self::insert_envelope_in_tx(conn, &row.aggregate.0, &row.envelope).await?;
@@ -931,6 +940,10 @@ impl PgRelay {
             Ok(tx) => tx,
             Err(e) => return CommitAttempt::Db(PgError::Query(e.to_string())),
         };
+        let aggregates = rows.iter().map(|row| row.aggregate.0.as_str()).collect();
+        if let Err(error) = Self::lock_outbox_aggregates_in_tx(&mut tx, aggregates).await {
+            return CommitAttempt::Db(error);
+        }
         for row in rows {
             let payload = match serde_json::to_value(&row.envelope) {
                 Ok(v) => v,
@@ -1009,6 +1022,10 @@ impl PgRelay {
             Ok(tx) => tx,
             Err(e) => return CommitAttempt::Db(PgError::Query(e.to_string())),
         };
+        let aggregates = rows.iter().map(|row| row.aggregate.0.as_str()).collect();
+        if let Err(error) = Self::lock_outbox_aggregates_in_tx(&mut tx, aggregates).await {
+            return CommitAttempt::Db(error);
+        }
         for row in rows {
             let payload = match serde_json::to_value(&row.envelope) {
                 Ok(v) => v,
