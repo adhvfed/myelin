@@ -13,13 +13,15 @@
 //! jti) without corrupting the principal, and BOTH tokens authenticate.
 //!
 //! Run (dev docker stack up):
-//!   DATABASE_URL=postgres://…  cargo test -p myelin-edge --features integration \
+//!   DATABASE_URL=postgres://… DATABASE_MIGRATION_URL=postgres://… \
+//!     cargo test -p myelin-edge --features integration \
 //!     --test integration_r40_bootstrap_auth -- --nocapture
 //!
-//! Skips gracefully if `DATABASE_URL` is unset (hermetic without a DB).
+//! Skips gracefully if `DATABASE_URL` is unset (hermetic without a DB). The live path migrates with
+//! the admin credential, closes it, and drives every store through the constrained runtime pool.
 #![cfg(feature = "integration")]
 
-use myelin_config::MyelinConfig;
+use myelin_config::{Mode, MyelinConfig};
 use myelin_edge::{
     bootstrap_principal_and_mint, register_git_durable, serve_edge, AllowAll, BootstrapParams,
     DurableGitBackend, Gateway, Method, WhoamiHandler,
@@ -30,7 +32,7 @@ use myelin_identity_service::{
 };
 use myelin_storage::{
     all_durable_migrations, DurableCellRootBacking, DurableKmsBacking, DurablePrincipalBacking,
-    DurableRevocationBacking, HotTables, SealKey, SubstrateProvider,
+    DurableRevocationBacking, HotTables, PgBootstrap, SealKey,
 };
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -39,17 +41,6 @@ use tokio::net::TcpListener;
 
 const REGION: &str = "eu-west";
 const SEAL_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-
-/// Cell-infra tables (kms_*, cell_token_root) have no RLS; DDL runs as the admin/owner role. This test
-/// drives BOTH DDL + DML through the admin pool (the same posture as the MR-025 KMS integration test);
-/// RLS isolation is proven separately (edge_tenant_scope_integration + principal_store unit tests).
-fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
-    let mut c = cfg.clone();
-    c.database_url = c
-        .database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
-    c
-}
 
 fn uniq() -> String {
     format!(
@@ -115,22 +106,27 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
         eprintln!("SKIP bootstrap_token_authenticates_and_drives_the_product_surface: DATABASE_URL unset");
         return;
     };
-    let provider = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 8).await {
-        Ok(p) => p,
+    let config = MyelinConfig::from_env(Mode::DevDefaults).expect("dev config");
+    let bootstrap = match PgBootstrap::connect(config, 8).await {
+        Ok(bootstrap) => bootstrap,
         Err(_) => {
             eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
             return;
         }
     };
     let handle = tokio::runtime::Handle::current();
-    provider
+    bootstrap
         .migrate_foundation()
         .await
         .expect("migrate foundation");
-    provider
+    bootstrap
         .migrate(&all_durable_migrations(), &HotTables::none())
         .await
         .expect("migrate the full durable aggregate (incl 0060_cell_token_root)");
+    let provider = bootstrap
+        .into_runtime()
+        .await
+        .expect("close the privileged pool and hand off to the constrained runtime role");
 
     let seal = SealKey::from_encoded(SEAL_HEX).expect("seal key");
     let cell_id = format!("cell-r40b-{}", uniq());

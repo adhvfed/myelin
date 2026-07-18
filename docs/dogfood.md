@@ -37,7 +37,8 @@ cat "${XDG_STATE_HOME:-$HOME/.local/state}/myelin/seal.key"   # copy this to a s
 
 The edge applies all migrations (incl. the R4.0 `cell_token_root`), loads the durable KMS root + the
 durable cell token authority, and serves. It stays in the foreground; run the next steps in a second
-terminal.
+terminal. `scripts/dogfood.sh env` keeps `DATABASE_URL` on the constrained `myelin_app` role and
+supplies `DATABASE_MIGRATION_URL` as `myelin_admin`; the edge closes the latter before binding.
 
 ## 3. Mint an operator token (`edge bootstrap`)
 
@@ -63,10 +64,10 @@ whoami, events). The edge default token scheme is `agent`, so clients need **no*
 
 ### The operator trust boundary
 
-Anyone with the `DATABASE_URL` credentials **and** the seal key can run `edge bootstrap` and mint a
-token for any principal in any tenant. That is accepted operator-plane infrastructure (the same
-boundary the seal key already draws). There is **deliberately no HTTP endpoint that mints** — minting
-is an action on the box, never network-reachable.
+Anyone with both database credentials (`DATABASE_URL` and `DATABASE_MIGRATION_URL`) **and** the seal
+key can run `edge bootstrap` and mint a token for any principal in any tenant. That is accepted
+operator-plane infrastructure. There is **deliberately no HTTP endpoint that mints** — minting is an
+action on the box, never network-reachable.
 
 ## 4. Use the token — CLI
 

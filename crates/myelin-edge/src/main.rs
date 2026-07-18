@@ -18,12 +18,12 @@
 //! ephemeral per boot, orphaning every minted token — no mint path could exist). Fail-loud on every
 //! error path; a wrong/absent seal key is fail-closed and NEVER regenerates the root.
 //!
-//! **The operator trust boundary (stated):** anyone with the `DATABASE_URL` creds + the seal key can
-//! run `bootstrap`/`revoke` and mint/revoke for any principal. That is ACCEPTED operator-plane
-//! infrastructure (the same boundary the seal key already draws); there is deliberately NO HTTP
-//! endpoint that mints.
+//! **The operator trust boundary (stated):** anyone with the runtime `DATABASE_URL`, the migration
+//! `DATABASE_MIGRATION_URL`, and the seal key can run `bootstrap`/`revoke` and mint/revoke for any
+//! principal. That is ACCEPTED operator-plane infrastructure; there is deliberately NO HTTP endpoint
+//! that mints. The migration credential is destroyed before any serving store or listener exists.
 
-use myelin_config::{Mode, MyelinConfig};
+use myelin_config::Mode;
 use myelin_edge::{
     bootstrap_principal_and_mint, register_git_durable, register_git_wire, serve_edge, AuthProvider,
     AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
@@ -37,8 +37,8 @@ use myelin_identity_service::{
 };
 use myelin_storage::{
     all_durable_migrations, seal_key_from_env, DurableCellRootBacking, DurableKmsBacking,
-    DurablePrincipalBacking, DurableRevocationBacking, HotTables, KmsEngine, PgOutboxBacking,
-    SubstrateProvider, TenantScope,
+    DurablePrincipalBacking, DurableRevocationBacking, HotTables, KmsEngine, PgBootstrap,
+    PgOutboxBacking, SubstrateProvider, TenantScope,
 };
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
@@ -66,28 +66,24 @@ struct ComposedCore {
     handle: tokio::runtime::Handle,
 }
 
-/// Build the shared durable core (the DURABLE-BY-DEFAULT composition root, MR-009b + R4.0). Connects
-/// the MR-022 provider pool, applies the substrate foundation + the full durable migration aggregate
-/// (now including `0060_cell_token_root`), loads the KMS root and the CELL TOKEN AUTHORITY ROOT — both
-/// sealed under `MYELIN_KMS_SEAL_KEY`, both fail-closed on a wrong/absent seal key (NEVER a fresh
-/// root). A boot that cannot reach the pool / unseal a root FAILS LOUD (exit non-zero).
+/// Build the shared durable core (the DURABLE-BY-DEFAULT composition root, MR-009b + R4.0). Validates
+/// separate migration/runtime roles, applies the substrate foundation + the full durable migration
+/// aggregate (now including `0060_cell_token_root`), then destroys the privileged pool before any
+/// runtime store is built. The KMS root and CELL TOKEN AUTHORITY ROOT are sealed under
+/// `MYELIN_KMS_SEAL_KEY` and fail closed on a wrong/absent key (NEVER a fresh root).
 async fn compose_core() -> ComposedCore {
-    let config = MyelinConfig::from_env(Mode::DevDefaults).unwrap_or_else(|e| {
-        eprintln!("edge: invalid config: {e}");
-        std::process::exit(1);
-    });
-    let provider = match SubstrateProvider::connect(config, 8).await {
-        Ok(p) => p,
+    // This is a production binary: every endpoint and both PostgreSQL credentials must be explicit.
+    // Pair validation runs before DDL and before the edge can bind its serving port.
+    let bootstrap = match PgBootstrap::from_env(Mode::RequireEnv).await {
+        Ok(bootstrap) => bootstrap,
         Err(e) => {
-            eprintln!(
-                "edge: cannot reach the durable OLTP pool (durable-by-default requires PG): {e}"
-            );
+            eprintln!("edge: database bootstrap refused to start: {e}");
             std::process::exit(1);
         }
     };
     let handle = tokio::runtime::Handle::current();
     // The substrate foundation (outbox/consumer_dedup) first — FAIL LOUD, no fallback.
-    if let Err(e) = provider.migrate_foundation().await {
+    if let Err(e) = bootstrap.migrate_foundation().await {
         eprintln!(
             "edge: cannot apply the substrate foundation migrations (outbox/consumer_dedup): {e}"
         );
@@ -95,13 +91,22 @@ async fn compose_core() -> ComposedCore {
     }
     // The FULL durable migration aggregate (identity/pseudonym/placement/kms/cost/erasure + the R4.0
     // `0060_cell_token_root`). Idempotent + advisory-locked (safe on re-boot). FAIL LOUD.
-    if let Err(e) = provider
+    if let Err(e) = bootstrap
         .migrate(&all_durable_migrations(), &HotTables::none())
         .await
     {
         eprintln!("edge: cannot apply the durable migration aggregate: {e}");
         std::process::exit(1);
     }
+    // Re-probe the constrained role, close the migration pool, and erase the migration DSN before
+    // constructing the KMS, token authority, outbox, identity, or ReBAC runtime stores.
+    let provider = match bootstrap.into_runtime().await {
+        Ok(provider) => provider,
+        Err(e) => {
+            eprintln!("edge: database runtime handoff refused to start: {e}");
+            std::process::exit(1);
+        }
+    };
     // The operator-held seal key (the SAME key unseals the KMS root AND the cell token-authority root
     // — one operator secret, one blast radius). Fail-closed at boot: a missing/malformed key exits.
     let seal_key = match seal_key_from_env() {

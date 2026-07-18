@@ -74,7 +74,8 @@ compose stack; prod supplies every var via the environment.
 
 | Var             | Meaning                                | Dev default                                                 |
 |-----------------|----------------------------------------|-------------------------------------------------------------|
-| `DATABASE_URL`  | Postgres OLTP + outbox + ReBAC + audit | `postgres://myelin_app:myelin_app_pw@localhost:5433/myelin` |
+| `DATABASE_URL`  | Postgres runtime OLTP + outbox + ReBAC | `postgres://myelin_app:myelin_app_pw@localhost:5433/myelin` |
+| `DATABASE_MIGRATION_URL` | Postgres migration-only credential | `postgres://myelin_admin:myelin_dev_pw@localhost:5433/myelin` |
 | `S3_ENDPOINT`   | S3-compatible object-store endpoint    | `http://localhost:9000`                                     |
 | `S3_REGION`     | S3 region label                        | `fr-par`                                                    |
 | `S3_ACCESS_KEY` | S3 access key id                       | `myelin_dev_access`                                         |
@@ -98,7 +99,8 @@ Same vars, prod values — the swap is config only:
 
 | Var             | Scaleway (fr-par) value (shape)                                        |
 |-----------------|-----------------------------------------------------------------------|
-| `DATABASE_URL`  | `postgres://<user>:<pw>@<id>.pg.fr-par.scw.cloud:<port>/myelin?sslmode=require` |
+| `DATABASE_URL`  | `postgres://<runtime-user>:<pw>@<id>.pg.fr-par.scw.cloud:<port>/myelin?sslmode=require` |
+| `DATABASE_MIGRATION_URL` | `postgres://<migration-user>:<pw>@<id>.pg.fr-par.scw.cloud:<port>/myelin?sslmode=require` |
 | `S3_ENDPOINT`   | `https://s3.fr-par.scw.cloud`                                          |
 | `S3_REGION`     | `fr-par`                                                               |
 | `S3_ACCESS_KEY` | Scaleway IAM access key                                                |
@@ -108,7 +110,8 @@ Same vars, prod values — the swap is config only:
 | `NATS_URL`      | `nats://<nats-host>:4222` (NATS container on Scaleway compute)         |
 | `MYELIN_REGION` | `fr-par` (residency pinned)                                            |
 
-Residency is pinned to `MYELIN_REGION=fr-par` in prod. Scaleway Managed PostgreSQL → `DATABASE_URL`;
+Residency is pinned to `MYELIN_REGION=fr-par` in prod. Scaleway Managed PostgreSQL supplies distinct
+runtime and migration credentials via `DATABASE_URL` and `DATABASE_MIGRATION_URL`;
 Scaleway Object Storage → `S3_*`; Scaleway Managed Redis → `REDIS_URL`; the NATS JetStream +
 durable-workflow containers run on Scaleway compute → `NATS_URL`.
 

@@ -54,23 +54,18 @@ ensure_seal_key() {
 # Print the eval-able env contract: the dev-stack data-layer env + the edge-only env.
 print_env() {
   ensure_seal_key
-  local seal git_root git_rootfs region db_app db_admin
+  local seal git_root git_rootfs region
   seal="$(cat "${SEAL_KEY_FILE}")"
   git_root="${MYELIN_GIT_ROOT:-${GIT_ROOT_DEFAULT}}"
   git_rootfs="${MYELIN_GVISOR_GIT_ROOTFS:-${GIT_ROOTFS_DEFAULT}}"
   region="${MYELIN_REGION:-fr-par}"
   # The data-layer contract (DATABASE_URL / S3_* / REDIS_URL / NATS_URL / MYELIN_REGION).
   "${REPO_ROOT}/scripts/dev-stack.sh" env
-  # The edge SELF-MIGRATES at boot (CREATE TABLE …), so it needs a DB role WITH `CREATE` on schema
-  # `public`. The dev-stack `myelin_app` role is least-privilege (no CREATE), so for single-founder
-  # dogfood — where the operator owns the box AND the DB — we run the edge as the schema-owner
-  # (`myelin_admin`). (A real multi-tenant deployment runs migrations under a privileged role and the
-  # serving edge under the app role; that split is a deployment concern, not a dogfood one.)
-  db_app="$("${REPO_ROOT}/scripts/dev-stack.sh" env | sed -n 's/^export DATABASE_URL="\(.*\)"$/\1/p')"
-  db_admin="${DATABASE_URL_ADMIN:-${db_app/myelin_app:myelin_app_pw/myelin_admin:myelin_dev_pw}}"
+  # `dev-stack.sh env` exports split credentials: DATABASE_URL stays the constrained `myelin_app`
+  # runtime role while DATABASE_MIGRATION_URL is the schema-owning `myelin_admin` bootstrap role.
+  # The edge validates the pair, runs DDL only through the latter, then closes it before serving.
   cat <<EOF
 # ── the edge (R4.0) env ──
-export DATABASE_URL="${db_admin}"      # schema-owner role: the edge self-migrates at boot (needs CREATE)
 export MYELIN_CELL_ID="\${MYELIN_CELL_ID:-cell-dogfood}"  # a DEDICATED cell (the shared 'cell-dev' root may be sealed under a different key)
 export MYELIN_KMS_SEAL_KEY="${seal}"   # the operator seal key (unseals the KMS root AND the token cell root)
 export MYELIN_GIT_ROOT="${git_root}"   # on-disk bare-repo root
