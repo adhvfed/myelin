@@ -182,6 +182,14 @@ impl GovernedRouter {
         self.state.borrow().token.clone()
     }
 
+    /// Explicitly revoke the current session token. Safe before the first call and idempotent after
+    /// EOF/error teardown; the token is retained for audit attribution and becomes non-live.
+    pub fn teardown(&self, now: &Timestamp) {
+        if let Some(token) = self.current_token() {
+            self.minter.teardown(&self.principal.scope, &token, now);
+        }
+    }
+
     /// The audit trail accumulated for this run (every governed call, attributed to the jti).
     pub fn audit(&self) -> Vec<AuditEntry> {
         self.state.borrow().audit.clone()

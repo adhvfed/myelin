@@ -12,8 +12,8 @@
 //!   - a REVOKED run token → denied (never routed);
 //!   - a malformed request → a JSON-RPC error, no panic.
 
-use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use myelin_events::Timestamp;
 use myelin_identity::{
@@ -63,7 +63,7 @@ fn service_principal(id: &str, tenant: &str) -> Principal {
 
 /// Build a server with a governed router over a REAL minter (shared S7 store returned so a test can
 /// revoke the run token).
-fn governed_server() -> McpServer {
+fn governed_router() -> GovernedRouter {
     let s7 = RevocationStore::new();
     // A REAL per-run minter (the structural floor signer is the EI-01 §1 named seam; the real
     // PASETO/Ed25519 signer swaps in behind the SAME `TokenSigner` trait — the mint's intersection +
@@ -104,21 +104,24 @@ fn governed_server() -> McpServer {
         PrincipalId("human:operator".into()),
         PrincipalId("agent:claude".into()),
     ];
-    let router =
-        GovernedRouter::new(minter, principal, Box::new(SkeletonEffectApi::new()), verdicts, approvers);
-    McpServer::with_router(ToolRegistry::with_git(), router, now())
+    GovernedRouter::new(minter, principal, Box::new(SkeletonEffectApi::new()), verdicts, approvers)
 }
 
-/// Drive the server over a real reader/writer with newline-delimited JSON-RPC (the stdio framing).
+fn governed_server() -> McpServer {
+    McpServer::with_router_and_clock(
+        ToolRegistry::with_git(),
+        governed_router(),
+        Arc::new(now),
+    )
+}
+
+/// Exchange lines within one logical session. Some HITL tests pause between exchanges while a human
+/// decides a gate, so EOF teardown is exercised separately rather than between these turns.
 fn drive(server: &McpServer, lines: &[&str]) -> Vec<serde_json::Value> {
-    let input = lines.join("\n");
-    let mut out = Vec::new();
-    server.run(Cursor::new(input.into_bytes()), &mut out).expect("run loop");
-    String::from_utf8(out)
-        .unwrap()
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).expect("each response line is JSON"))
+    lines
+        .iter()
+        .filter_map(|line| server.handle_line(line))
+        .map(|line| serde_json::from_str(&line).expect("each response line is JSON"))
         .collect()
 }
 
@@ -412,4 +415,59 @@ fn malformed_request_is_a_jsonrpc_error_no_panic() {
     let server = governed_server();
     let resps = drive(&server, &["{ not valid json"]);
     assert_eq!(resps[0]["error"]["code"], -32700, "parse error, never a panic");
+}
+
+#[test]
+fn stdio_eof_tears_down_the_minted_run_token() {
+    let server = governed_server();
+    let request =
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":1}}}"#;
+    let mut output = Vec::new();
+
+    server.run(request.as_bytes(), &mut output).expect("stdio session");
+
+    let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(response["result"]["isError"], false);
+    let router = server.router().unwrap();
+    let token = router.current_token().expect("the session minted a run token");
+    assert!(
+        !router.minter().is_live(&router.principal().scope, &token, &now()),
+        "EOF immediately revokes the session token"
+    );
+}
+
+#[test]
+fn governed_calls_read_the_clock_afresh() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let clock_reads = Arc::clone(&reads);
+    let clock = Arc::new(move || {
+        if clock_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+            Timestamp("2026-06-26T00:00:00Z".into())
+        } else {
+            Timestamp("2026-06-26T00:05:01Z".into())
+        }
+    });
+    let server = McpServer::with_router_and_clock(
+        ToolRegistry::with_git(),
+        governed_router(),
+        clock,
+    );
+    let call = |id| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"git.submit_review","arguments":{{"number":{id}}}}}}}"#
+        )
+    };
+
+    let first: serde_json::Value =
+        serde_json::from_str(&server.handle_line(&call(1)).unwrap()).unwrap();
+    let second: serde_json::Value =
+        serde_json::from_str(&server.handle_line(&call(2)).unwrap()).unwrap();
+
+    assert_eq!(first["result"]["isError"], false);
+    assert_eq!(second["result"]["isError"], true);
+    assert!(second["result"]["_meta"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("expired"));
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
 }

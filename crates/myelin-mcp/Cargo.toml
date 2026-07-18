@@ -62,6 +62,10 @@ myelin-events = { path = "../myelin-events" }
 # ethos — do not pull an unvetted MCP SDK).
 serde_json = { workspace = true }
 
+# Format the process wall clock as the RFC-3339 `Timestamp` consumed by the run-token mint and
+# revocation checks. Parsing/formatting only: no chrono clock feature is needed.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
 [dev-dependencies]
 # GT-005 integration: bind the concrete git `EffectApi` body (`myelin_edge::GitEffectApi`) to the
 # DURABLE GT-003 backend (`DurableGitBackend`) and inject it into the GovernedRouter — proving a

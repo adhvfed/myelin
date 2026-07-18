@@ -41,4 +41,4 @@ pub mod server;
 
 pub use governance::{CallOutcome, GovernedRouter, RunPrincipal, SkeletonEffectApi};
 pub use registry::{RegisteredTool, ToolRegistry};
-pub use server::McpServer;
+pub use server::{Clock, McpServer, MAX_FRAME_BYTES};

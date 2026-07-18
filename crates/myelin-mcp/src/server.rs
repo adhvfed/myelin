@@ -14,14 +14,15 @@
 //!   "not wired" JSON-RPC error — the per-run minter + the `EffectApi` body are injected by the
 //!   composition root (myelin-agent-service), never constructed in the protocol shell.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
 use crate::governance::{CallOutcome, GovernedRouter};
 use crate::protocol::{
     error_response, parse_request, success, RpcError, GOVERNANCE_NOT_WIRED, INVALID_PARAMS,
-    METHOD_NOT_FOUND,
+    INVALID_REQUEST, METHOD_NOT_FOUND,
 };
 use crate::registry::ToolRegistry;
 use myelin_events::Timestamp;
@@ -29,15 +30,23 @@ use myelin_events::Timestamp;
 /// The MCP protocol version this server advertises (the MCP revision string).
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// Maximum JSON-RPC frame payload accepted over stdio. This bounds memory use before JSON parsing;
+/// an oversized frame is drained and rejected without terminating the session.
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// An injectable RFC-3339 clock. Production reads it for every governed call and at teardown;
+/// tests can supply a fixed instant without freezing a long-lived production process in time.
+pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
+
 /// The MCP server — the tool registry + an OPTIONAL governance router. With a router wired,
 /// `tools/call` routes through `mint_run_token → EffectApi::apply`; without one, the protocol +
 /// catalogue (`initialize` / `tools/list`) are fully live and `tools/call` is honestly "not wired".
 pub struct McpServer {
     registry: ToolRegistry,
     router: Option<GovernedRouter>,
-    /// The clock the governed call mints/consults under. Injected so a test is deterministic; the
-    /// real wall-clock source is the substrate clock binding (the SAME convention the mint uses).
-    now: Timestamp,
+    /// The clock each governed call mints/consults under. Production uses a wall clock; tests can
+    /// inject a deterministic clock.
+    clock: Clock,
 }
 
 impl McpServer {
@@ -46,13 +55,26 @@ impl McpServer {
         McpServer {
             registry: ToolRegistry::with_git(),
             router: None,
-            now: Timestamp(default_now()),
+            clock: Arc::new(system_now),
         }
     }
 
-    /// A server with a governance router wired (the governed path — the composition root / tests).
-    pub fn with_router(registry: ToolRegistry, router: GovernedRouter, now: Timestamp) -> McpServer {
-        McpServer { registry, router: Some(router), now }
+    /// A production server with governed routing and a fresh wall-clock read for every call.
+    pub fn with_router(registry: ToolRegistry, router: GovernedRouter) -> McpServer {
+        McpServer::with_router_and_clock(registry, router, Arc::new(system_now))
+    }
+
+    /// A server with governed routing and an injected dynamic clock.
+    pub fn with_router_and_clock(
+        registry: ToolRegistry,
+        router: GovernedRouter,
+        clock: Clock,
+    ) -> McpServer {
+        McpServer {
+            registry,
+            router: Some(router),
+            clock,
+        }
     }
 
     /// The tool registry (so a host/test can inspect the catalogue).
@@ -89,23 +111,45 @@ impl McpServer {
             },
             _ => error_response(
                 req.id,
-                RpcError::new(METHOD_NOT_FOUND, format!("method not found: {}", req.method)),
+                RpcError::new(
+                    METHOD_NOT_FOUND,
+                    format!("method not found: {}", req.method),
+                ),
             ),
         };
         Some(write_value(&response))
     }
 
-    /// **Run the stdio loop** — read newline-delimited JSON-RPC from `reader`, write responses to
-    /// `writer` (one message per line). Returns on EOF. Never panics on a malformed line.
-    pub fn run(&self, reader: impl BufRead, mut writer: impl Write) -> std::io::Result<()> {
-        for line in reader.lines() {
-            let line = line?;
-            if let Some(resp) = self.handle_line(&line) {
-                writeln!(writer, "{resp}")?;
-                writer.flush()?;
+    /// **Run the stdio loop** — read bounded newline-delimited JSON-RPC frames, write responses, and
+    /// tear down any minted run token on EOF or I/O failure. Malformed and oversized frames do not
+    /// panic or terminate an otherwise healthy session.
+    pub fn run(&self, mut reader: impl BufRead, mut writer: impl Write) -> std::io::Result<()> {
+        let result = (|| {
+            loop {
+                let frame = match read_frame(&mut reader)? {
+                    Frame::Eof => break,
+                    Frame::Payload(frame) => frame,
+                    Frame::Oversized => {
+                        let error = error_response(
+                            Value::Null,
+                            RpcError::new(
+                                INVALID_REQUEST,
+                                format!("JSON-RPC frame exceeds {MAX_FRAME_BYTES} bytes"),
+                            ),
+                        );
+                        write_response(&mut writer, &write_value(&error))?;
+                        continue;
+                    }
+                };
+                if let Some(resp) = self.handle_line(&frame) {
+                    write_response(&mut writer, &resp)?;
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+
+        self.teardown();
+        result
     }
 
     /// The `initialize` result — the protocol version + capabilities (tools) + server info.
@@ -119,9 +163,10 @@ impl McpServer {
 
     /// `tools/call` — resolve the tool + route through the governance chokepoint.
     fn tools_call(&self, params: &Value) -> Result<Value, RpcError> {
-        let name = params.get("name").and_then(Value::as_str).ok_or_else(|| {
-            RpcError::new(INVALID_PARAMS, "tools/call requires a string `name`")
-        })?;
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::new(INVALID_PARAMS, "tools/call requires a string `name`"))?;
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
         // Resolve against the catalogue (sourced from agent_tools()). Unknown ⇒ Invalid params,
@@ -154,9 +199,76 @@ impl McpServer {
             .and_then(|a| a.get("gateId"))
             .and_then(Value::as_str);
 
-        let outcome = router.call(&tool, &args, &self.now, presented_gate_id);
+        let now = (self.clock)();
+        let outcome = router.call(&tool, &args, &now, presented_gate_id);
         Ok(call_result_json(name, &outcome))
     }
+
+    /// Revoke the session's minted run token, if any. Idempotent and also invoked automatically by
+    /// [`McpServer::run`] on every exit path.
+    pub fn teardown(&self) {
+        if let Some(router) = &self.router {
+            router.teardown(&(self.clock)());
+        }
+    }
+}
+
+enum Frame {
+    Eof,
+    Payload(String),
+    Oversized,
+}
+
+/// Read one bounded line. If it crosses the cap, discard through the next newline so the following
+/// request starts on a clean frame boundary.
+fn read_frame(reader: &mut impl BufRead) -> std::io::Result<Frame> {
+    let mut bytes = Vec::with_capacity(4096);
+    let read = reader
+        .take((MAX_FRAME_BYTES + 1) as u64)
+        .read_until(b'\n', &mut bytes)?;
+    if read == 0 {
+        return Ok(Frame::Eof);
+    }
+
+    let ended = bytes.last() == Some(&b'\n');
+    let payload_len = bytes.len().saturating_sub(usize::from(ended));
+    if payload_len > MAX_FRAME_BYTES || !ended && bytes.len() > MAX_FRAME_BYTES {
+        if !ended {
+            drain_through_newline(reader)?;
+        }
+        return Ok(Frame::Oversized);
+    }
+
+    if ended {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    Ok(Frame::Payload(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn drain_through_newline(reader: &mut impl BufRead) -> std::io::Result<()> {
+    loop {
+        let buffered = reader.fill_buf()?;
+        if buffered.is_empty() {
+            return Ok(());
+        }
+        let consumed = buffered
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buffered.len(), |position| position + 1);
+        let reached_newline = buffered.get(consumed.saturating_sub(1)) == Some(&b'\n');
+        reader.consume(consumed);
+        if reached_newline {
+            return Ok(());
+        }
+    }
+}
+
+fn write_response(writer: &mut impl Write, response: &str) -> std::io::Result<()> {
+    writeln!(writer, "{response}")?;
+    writer.flush()
 }
 
 /// Map a governed [`CallOutcome`] to the MCP `tools/call` result body. `isError` is set for a denied
@@ -164,9 +276,10 @@ impl McpServer {
 /// run-token `jti` under `_meta` — the attribution that makes the call auditable to the run.
 fn call_result_json(tool: &str, outcome: &CallOutcome) -> Value {
     let (text, is_error) = match outcome {
-        CallOutcome::Applied { event_id, .. } => {
-            (format!("`{tool}` applied through EffectApi (event {event_id})."), false)
-        }
+        CallOutcome::Applied { event_id, .. } => (
+            format!("`{tool}` applied through EffectApi (event {event_id})."),
+            false,
+        ),
         CallOutcome::Gated { gate_id, .. } => (
             format!("`{tool}` is withheld pending HITL approval (gate {gate_id}); not applied."),
             false,
@@ -196,10 +309,14 @@ fn write_value(v: &Value) -> String {
     })
 }
 
-/// A floor RFC-3339 `now` for the catalogue-only shell (no mint happens there). The real wall-clock
-/// source is the substrate clock binding (the SAME named floor the mint uses).
-fn default_now() -> String {
-    "2026-06-26T00:00:00Z".to_string()
+/// The production wall clock formatted for the identity mint/revocation contract.
+fn system_now() -> Timestamp {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let now = chrono::DateTime::from_timestamp(secs, 0).unwrap_or_default();
+    Timestamp(now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
 #[cfg(test)]
@@ -209,7 +326,8 @@ mod tests {
     #[test]
     fn initialize_returns_capabilities_and_server_info() {
         let s = McpServer::new_catalogue_only();
-        let resp = s.handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        let resp = s
+            .handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
             .expect("response");
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["result"]["protocolVersion"], json!(MCP_PROTOCOL_VERSION));
@@ -220,7 +338,9 @@ mod tests {
     #[test]
     fn tools_list_exposes_the_git_tools_with_requires_approval() {
         let s = McpServer::new_catalogue_only();
-        let resp = s.handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).expect("resp");
+        let resp = s
+            .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+            .expect("resp");
         let v: Value = serde_json::from_str(&resp).unwrap();
         let tools = v["result"]["tools"].as_array().unwrap();
         let merge = tools.iter().find(|t| t["name"] == "git.merge").unwrap();
@@ -230,7 +350,9 @@ mod tests {
     #[test]
     fn a_notification_yields_no_response() {
         let s = McpServer::new_catalogue_only();
-        assert!(s.handle_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
+        assert!(s
+            .handle_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .is_none());
     }
 
     #[test]
@@ -244,7 +366,9 @@ mod tests {
     #[test]
     fn unknown_method_is_method_not_found() {
         let s = McpServer::new_catalogue_only();
-        let resp = s.handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"frobnicate"}"#).unwrap();
+        let resp = s
+            .handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"frobnicate"}"#)
+            .unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["error"]["code"], json!(METHOD_NOT_FOUND));
     }
@@ -253,7 +377,9 @@ mod tests {
     fn tools_call_without_a_router_is_honestly_not_wired() {
         let s = McpServer::new_catalogue_only();
         let resp = s
-            .handle_line(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"git.merge"}}"#)
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"git.merge"}}"#,
+            )
             .unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["error"]["code"], json!(GOVERNANCE_NOT_WIRED));
@@ -263,9 +389,49 @@ mod tests {
     fn tools_call_unknown_tool_is_invalid_params() {
         let s = McpServer::new_catalogue_only();
         let resp = s
-            .handle_line(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"git.nope"}}"#)
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"git.nope"}}"#,
+            )
             .unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["error"]["code"], json!(INVALID_PARAMS));
+    }
+
+    #[test]
+    fn oversized_frame_is_rejected_and_the_next_frame_is_processed() {
+        let s = McpServer::new_catalogue_only();
+        let input = format!(
+            "{}\n{{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/list\"}}\n",
+            "x".repeat(MAX_FRAME_BYTES + 1)
+        );
+        let mut output = Vec::new();
+
+        s.run(input.as_bytes(), &mut output).unwrap();
+
+        let responses: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["code"], json!(INVALID_REQUEST));
+        assert_eq!(responses[1]["id"], json!(9));
+        assert!(responses[1]["result"]["tools"].is_array());
+    }
+
+    #[test]
+    fn frame_at_the_limit_is_accepted() {
+        let mut frame = r#"{"jsonrpc":"2.0","id":10,"method":"tools/list","padding":""#.to_string();
+        frame.push_str(&"x".repeat(MAX_FRAME_BYTES - frame.len() - 2));
+        frame.push_str("\"}\n");
+        assert_eq!(frame.len(), MAX_FRAME_BYTES + 1);
+        let mut output = Vec::new();
+
+        McpServer::new_catalogue_only()
+            .run(frame.as_bytes(), &mut output)
+            .unwrap();
+
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(response["id"], json!(10));
     }
 }
