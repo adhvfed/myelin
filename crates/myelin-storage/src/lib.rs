@@ -703,6 +703,7 @@ pub mod hitl_gate_durable;
 // The OLTP-co-located outbox relay (the one legitimate broker-publish site, BUS-2) — kept in its
 // own module so the broker-publish call is isolated to a single named relay file (the same
 // posture as myelin-events/src/relay.rs).
+pub mod authz_projection_durable;
 pub mod backend;
 pub mod elected_relay;
 pub mod pgrelay;
@@ -902,11 +903,14 @@ pub use pg_migrator::{with_migration_lock, PgMigrator, MIGRATION_LOCK_KEY};
 // The MR-022 persistence foundation: the tenant-scoped-transaction convention (RESHAPE-002) + the
 // production composition root / real-pool provider (SI-022) + the validate→execute migration boot
 // reconciliation (SI-010). Compiled unconditionally as of MR-009b Wave 1.
+pub use authz_projection_durable::{
+    authz_projection_durable_migrations, AUTHZ_PROJECTION_STATE_MIGRATION,
+};
 pub use delegation_policy_durable::{
     delegation_policy_durable_migrations, DurableDelegationPolicyBacking,
-    DurableDelegationPolicyBundle, DurableDelegationPolicyError,
-    DurableDelegationPolicyHeadCursor, DurableDelegationPolicyRevisions,
-    DurableDelegationPolicySnapshot, DurableDelegationPolicyVersions,
+    DurableDelegationPolicyBundle, DurableDelegationPolicyError, DurableDelegationPolicyHeadCursor,
+    DurableDelegationPolicyRevisions, DurableDelegationPolicySnapshot,
+    DurableDelegationPolicyVersions,
 };
 pub use identity_durable::{
     identity_durable_migrations, DurablePrincipalBacking, DurablePrincipalRow, DurableProfileBlob,

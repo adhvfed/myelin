@@ -101,6 +101,40 @@ pub const CONSUMER_DEDUP_TABLE: &str = "consumer_dedup";
 pub const OUTBOX_TABLE: &str = "outbox";
 /// Issues-owned durable saga ledger for the cross-service issue-row -> Identity tuple bootstrap.
 pub const ISSUE_AUTHZ_BINDING_TABLE: &str = "issue_authz_binding";
+/// Issues-specific effective-permission projection. The generic `authz_visible` name remains
+/// reserved for the legacy direct-relation lowerer; this table deliberately has `permission`.
+pub const ISSUE_AUTHZ_VISIBLE_TABLE: &str = "issue_authz_visible";
+
+pub const CREATE_ISSUE_AUTHZ_VISIBLE_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS issue_authz_visible (
+  tenant_id   text NOT NULL,
+  region      text NOT NULL,
+  projection  text NOT NULL CHECK (projection = 'issue:view'),
+  subject     text NOT NULL,
+  permission  text NOT NULL CHECK (permission = 'view'),
+  object_type text NOT NULL CHECK (object_type = 'issue'),
+  object_id   text NOT NULL,
+  revision    bigint NOT NULL CHECK (revision > 0),
+  PRIMARY KEY (tenant_id, region, projection, subject, permission, object_type, object_id),
+  FOREIGN KEY (tenant_id, region, projection)
+    REFERENCES authz_projection_state (tenant_id, region, projection)
+);
+CREATE INDEX IF NOT EXISTS issue_authz_visible_lookup
+  ON issue_authz_visible
+    (tenant_id, region, subject, permission, object_type, revision, object_id);"#;
+
+/// Invalidate the durable effective `issue:view` projection for every issue-domain mutation.
+/// This intentionally uses a coarse tenant/region revision: false invalidations cost rebuild work,
+/// while a missed invalidation could serve a revoked grant. The shared function is installed by
+/// storage migration 0069 before the Issues-owned migration set runs at production boot.
+pub const CREATE_ISSUE_AUTHZ_INVALIDATION_TRIGGERS_DDL: &str = r#"
+CREATE TRIGGER issue_invalidate_issue_view
+  AFTER INSERT OR UPDATE OR DELETE ON issue
+  FOR EACH ROW EXECUTE FUNCTION myelin_invalidate_issue_view_projection();
+
+CREATE TRIGGER issue_authz_binding_invalidate_issue_view
+  AFTER INSERT OR UPDATE OR DELETE ON issue_authz_binding
+  FOR EACH ROW EXECUTE FUNCTION myelin_invalidate_issue_view_projection();"#;
 
 /// The `issue` hot-board / list scan index names (arch 01 §2 — the index-range hot path the
 /// board/roadmap/assignee/cycle reads ride). The behaviour (the scan) is the read path; the SHAPES
@@ -542,6 +576,24 @@ pub fn issues_migrations() -> Migrations {
         EXPAND_ISSUE_AUTHZ_CREATED_EVENT_DDL,
         ISSUE_AUTHZ_BINDING_TABLE,
     ));
+    let issue_authz_visible_ddl = Box::leak(
+        format!(
+            "{}\n{};",
+            CREATE_ISSUE_AUTHZ_VISIBLE_DDL,
+            make_tenant_scoped_ddl(ISSUE_AUTHZ_VISIBLE_TABLE)
+        )
+        .into_boxed_str(),
+    );
+    migrations.push(Migration::plain_on(
+        "iss_0018_issue_authz_visible",
+        issue_authz_visible_ddl,
+        ISSUE_AUTHZ_VISIBLE_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        "iss_0019_issue_authz_invalidation_triggers",
+        CREATE_ISSUE_AUTHZ_INVALIDATION_TRIGGERS_DDL,
+        ISSUE_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -676,7 +728,10 @@ mod tests {
             "issue_authz_binding_pending_region",
             "tenant_id, region, state, created_at, issue_id",
         ] {
-            assert!(expand.ddl.contains(invariant), "expansion pins `{invariant}`");
+            assert!(
+                expand.ddl.contains(invariant),
+                "expansion pins `{invariant}`"
+            );
         }
     }
 
@@ -689,8 +744,8 @@ mod tests {
         let migrations = issues_migrations();
         assert_eq!(
             migrations.0.len(),
-            23,
-            "11 spine-table creates + 8 concurrent indexes + 2 issue expands + 2 authz saga migrations"
+            25,
+            "11 spine-table creates + 8 concurrent indexes + 2 issue expands + 4 authz migrations"
         );
         for m in &migrations.0 {
             assert!(
@@ -700,6 +755,33 @@ mod tests {
                 m.ddl
             );
         }
+    }
+
+    #[test]
+    fn effective_projection_migrations_require_the_storage_invalidator_first() {
+        let durable_ids: Vec<_> = myelin_storage::all_durable_migrations()
+            .0
+            .iter()
+            .map(|migration| migration.id)
+            .collect();
+        assert_eq!(
+            durable_ids.last(),
+            Some(&"0069_authz_projection_invalidator")
+        );
+        let issues = issues_migrations();
+        assert!(issues
+            .0
+            .iter()
+            .any(|migration| migration.id == "iss_0018_issue_authz_visible"));
+        assert_eq!(
+            issues.0.last().map(|migration| migration.id),
+            Some("iss_0019_issue_authz_invalidation_triggers")
+        );
+        assert!(CREATE_ISSUE_AUTHZ_INVALIDATION_TRIGGERS_DDL
+            .contains("EXECUTE FUNCTION myelin_invalidate_issue_view_projection()"));
+        assert!(!CREATE_ISSUE_AUTHZ_INVALIDATION_TRIGGERS_DDL.contains("to_regprocedure"));
+        assert!(CREATE_ISSUE_AUTHZ_VISIBLE_DDL.contains("permission  text NOT NULL"));
+        assert!(!CREATE_ISSUE_AUTHZ_VISIBLE_DDL.contains("relation  text NOT NULL"));
     }
 
     /// **The runner admits the whole set forward-only at boot, FK-ordered (contract 1.5).** The
@@ -717,7 +799,7 @@ mod tests {
             .expect("the full Issue-Tracker spine applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            23,
+            25,
             "the runner applied every table/index/expand migration"
         );
         assert_eq!(
@@ -733,7 +815,7 @@ mod tests {
             .expect("the spine re-applies idempotently");
         assert_eq!(
             runner2.applied().len(),
-            23,
+            25,
             "the re-apply admits every migration again"
         );
     }

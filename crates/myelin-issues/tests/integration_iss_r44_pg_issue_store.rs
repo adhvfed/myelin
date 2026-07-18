@@ -15,7 +15,10 @@ use myelin_issues::{
     IssuePageRequest, IssuePermission, IssueStoreError, IssueTupleWriter, PgIssueStore,
     VisibleIssues,
 };
-use myelin_storage::{DurableTupleBacking, KmsEngine, PgBootstrap, TenantScope};
+use myelin_storage::{
+    all_durable_migrations, DurableTupleBacking, KmsEngine, PgBootstrap, TenantScope,
+};
+use myelin_substrate::HotTables;
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 use sqlx::Row;
 use std::future::Future;
@@ -71,7 +74,7 @@ impl IssueAuthorizer for RebacAuthorizer {
     // The test deliberately makes the SQL active-binding join, rather than an Identity allow-set,
     // carry the list proof. Object reads above still use the real ReBAC engine.
     fn visible_issues(&self, _principal: &Principal) -> Result<VisibleIssues, String> {
-        Ok(VisibleIssues::All)
+        Ok(VisibleIssues::effective_issue_view_filter())
     }
 }
 
@@ -158,6 +161,10 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         .migrate_foundation()
         .await
         .expect("apply shared outbox and durable Identity tuple foundation");
+    bootstrap
+        .migrate(&all_durable_migrations(), &HotTables::none())
+        .await
+        .expect("apply durable projection substrate");
     bootstrap
         .migrate(&issues_migrations(), &issues_hot_tables())
         .await
@@ -262,12 +269,12 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         Err(IssueStoreError::NotFound),
         "no tuple means ReBAC denies the pending object"
     );
-    assert!(store
-        .list(&creator, IssuePageRequest::new(20, None).unwrap())
-        .await
-        .unwrap()
-        .items
-        .is_empty());
+    assert!(matches!(
+        store
+            .list(&creator, IssuePageRequest::new(20, None).unwrap())
+            .await,
+        Err(IssueStoreError::AuthorizationUnavailable(_))
+    ));
     assert_eq!(
         store.pending_authorization_ids(&worker, 10).await.unwrap(),
         vec![staged.id.clone()],
@@ -302,12 +309,12 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         store.view(&creator, &staged.id).await,
         Err(IssueStoreError::NotFound)
     );
-    assert!(store
-        .list(&creator, IssuePageRequest::new(20, None).unwrap())
-        .await
-        .unwrap()
-        .items
-        .is_empty());
+    assert!(matches!(
+        store
+            .list(&creator, IssuePageRequest::new(20, None).unwrap())
+            .await,
+        Err(IssueStoreError::AuthorizationUnavailable(_))
+    ));
 
     // Reconstruct the store as a process restart would, then retry the exact persisted intent.
     let restarted = PgIssueStore::new(provider.clone(), kms, authorizer.clone());
@@ -324,6 +331,10 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
             .unwrap()
             .newly_activated
     );
+    restarted
+        .rebuild_effective_issue_view(&worker)
+        .await
+        .expect("publish effective list projection after activation");
     assert_eq!(
         restarted.view(&creator, &staged.id).await.unwrap().id,
         staged.id
@@ -437,6 +448,10 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
     .execute(&admin)
     .await
     .unwrap();
+    restarted
+        .rebuild_effective_issue_view(&worker)
+        .await
+        .expect("rebuild after issue-domain mutations");
     let listed = restarted
         .list(&creator, IssuePageRequest::new(100, None).unwrap())
         .await
@@ -457,6 +472,8 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         "DELETE FROM issue WHERE tenant_id = $1",
         "DELETE FROM prefix_counter WHERE tenant_id = $1",
         "DELETE FROM rebac_tuple WHERE tenant_id = $1",
+        "DELETE FROM issue_authz_visible WHERE tenant_id = $1",
+        "DELETE FROM authz_projection_state WHERE tenant_id = $1",
         "DELETE FROM outbox WHERE envelope->>'tenant' = $1",
     ] {
         sqlx::query(statement)

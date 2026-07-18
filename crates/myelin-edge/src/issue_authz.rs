@@ -7,9 +7,9 @@
 
 use myelin_events::Timestamp;
 use myelin_identity::{
-    Consistency, ConsistencyMode, DataRole, Decision, IdentityService, ListObjectsResult, ObjectId,
-    ObjectType, Permission, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RelName,
-    RelationTuple, TupleDelta, Zookie,
+    Consistency, ConsistencyMode, DataRole, Decision, IdentityService, ObjectId, Permission,
+    Principal, PrincipalId, PrincipalKind, PrincipalStatus, RelName, RelationTuple, TupleDelta,
+    Zookie,
 };
 use myelin_identity_service::{StoreBackedCheck, TupleStore};
 use myelin_issues::pg_issue_store::MAX_PAGE_SIZE;
@@ -40,9 +40,8 @@ const MAX_TENANTS_PER_SWEEP: usize = 32;
 /// Production Issue authorization over the exact durable Identity engine composed by the edge.
 ///
 /// Object checks are strong and admit only an explicit `Allow`. List authorization consumes
-/// Identity's leak-free materialised `Ids` result. The current `PgIssueStore` cannot yet splice a
-/// large-result `Filter` into its query, so that result fails closed instead of falling back to
-/// `VisibleIssues::All` or post-filtering rows.
+/// the exact effective `issue:view` SetExpr. PgIssueStore binds that frozen shape to the durable
+/// projection watermark; this adapter never consults the process-local reverse index for lists.
 #[derive(Clone)]
 pub struct StoreBackedIssueAuthorizer {
     identity: StoreBackedCheck,
@@ -88,38 +87,8 @@ impl IssueAuthorizer for StoreBackedIssueAuthorizer {
         self.allows(principal, permission, format!("issue:{issue_id}"))
     }
 
-    fn visible_issues(&self, principal: &Principal) -> Result<VisibleIssues, String> {
-        let result = self
-            .identity
-            .list_objects(
-                principal,
-                &Permission("view".into()),
-                &ObjectType("issue".into()),
-                &Consistency {
-                    at_least: Zookie(String::new()),
-                    mode: ConsistencyMode::Strong,
-                },
-            )
-            .map_err(|_| "identity_issue_list_failed".to_string())?;
-        match result {
-            ListObjectsResult::Ids { ids, .. } => {
-                let mut visible = Vec::with_capacity(ids.len());
-                for object in ids {
-                    let Some(id) = object.0.strip_prefix("issue:") else {
-                        return Err("identity_issue_list_object_malformed".into());
-                    };
-                    visible.push(id.to_string());
-                }
-                if visible.is_empty() {
-                    Ok(VisibleIssues::None)
-                } else {
-                    Ok(VisibleIssues::Ids(visible))
-                }
-            }
-            ListObjectsResult::Filter { .. } => {
-                Err("identity_issue_filter_pushdown_not_bound_to_pg_store".into())
-            }
-        }
+    fn visible_issues(&self, _principal: &Principal) -> Result<VisibleIssues, String> {
+        Ok(VisibleIssues::effective_issue_view_filter())
     }
 }
 
@@ -244,6 +213,10 @@ pub struct IssueReconciliationReport {
     pub newly_activated: u64,
     pub already_active: u64,
     pub failures: u64,
+    pub projections_rebuilt: u64,
+    pub projected_grants: u64,
+    pub projection_failures: u64,
+    pub max_projection_lag: u64,
 }
 
 trait IssueAuthorizationSweeper: Send + Sync + 'static {
@@ -294,6 +267,28 @@ impl IssueAuthorizationSweeper for PgIssueAuthorizationSweeper {
                     }
                     Err(_) => report.failures += 1,
                 }
+                match self.store.effective_issue_view_lag(worker).await {
+                    Ok(Some(0)) => {}
+                    Ok(lag) => {
+                        report.max_projection_lag = report
+                            .max_projection_lag
+                            .max(lag.unwrap_or(1).unsigned_abs());
+                        match self.store.rebuild_effective_issue_view(worker).await {
+                            Ok(rebuilt) => {
+                                report.projections_rebuilt += 1;
+                                report.projected_grants += rebuilt.effective_grants;
+                            }
+                            Err(_) => {
+                                report.projection_failures += 1;
+                                report.failures += 1;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        report.projection_failures += 1;
+                        report.failures += 1;
+                    }
+                }
             }
             report
         })
@@ -308,6 +303,10 @@ pub struct IssueReconciliationMetrics {
     newly_activated: AtomicU64,
     already_active: AtomicU64,
     failures: AtomicU64,
+    projections_rebuilt: AtomicU64,
+    projected_grants: AtomicU64,
+    projection_failures: AtomicU64,
+    max_projection_lag: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -317,6 +316,10 @@ pub struct IssueReconciliationMetricsSnapshot {
     pub newly_activated: u64,
     pub already_active: u64,
     pub failures: u64,
+    pub projections_rebuilt: u64,
+    pub projected_grants: u64,
+    pub projection_failures: u64,
+    pub max_projection_lag: u64,
 }
 
 impl IssueReconciliationMetrics {
@@ -327,6 +330,10 @@ impl IssueReconciliationMetrics {
             newly_activated: self.newly_activated.load(Ordering::Relaxed),
             already_active: self.already_active.load(Ordering::Relaxed),
             failures: self.failures.load(Ordering::Relaxed),
+            projections_rebuilt: self.projections_rebuilt.load(Ordering::Relaxed),
+            projected_grants: self.projected_grants.load(Ordering::Relaxed),
+            projection_failures: self.projection_failures.load(Ordering::Relaxed),
+            max_projection_lag: self.max_projection_lag.load(Ordering::Relaxed),
         }
     }
 
@@ -339,6 +346,14 @@ impl IssueReconciliationMetrics {
         self.already_active
             .fetch_add(report.already_active, Ordering::Relaxed);
         self.failures.fetch_add(report.failures, Ordering::Relaxed);
+        self.projections_rebuilt
+            .fetch_add(report.projections_rebuilt, Ordering::Relaxed);
+        self.projected_grants
+            .fetch_add(report.projected_grants, Ordering::Relaxed);
+        self.projection_failures
+            .fetch_add(report.projection_failures, Ordering::Relaxed);
+        self.max_projection_lag
+            .fetch_max(report.max_projection_lag, Ordering::Relaxed);
     }
 }
 
@@ -432,11 +447,14 @@ async fn run_reconciliation_loop(
         metrics.record(report);
         if report.pending_seen > 0 || report.failures > 0 {
             eprintln!(
-                "issues authz reconciler: pending_seen={} newly_activated={} already_active={} failures={} region={}",
+                "issues authz reconciler: pending_seen={} newly_activated={} already_active={} failures={} projections_rebuilt={} projection_failures={} max_projection_lag={} region={}",
                 report.pending_seen,
                 report.newly_activated,
                 report.already_active,
                 report.failures,
+                report.projections_rebuilt,
+                report.projection_failures,
+                report.max_projection_lag,
                 config.region.as_str(),
             );
         }
@@ -702,6 +720,7 @@ mod tests {
             newly_activated: 1,
             already_active: 1,
             failures: 0,
+            ..IssueReconciliationReport::default()
         }]));
         let handle = spawn_reconciliation_loop(sweeper.clone(), test_config());
         wait_for_sweeps(handle.metrics(), 1).await;
@@ -718,6 +737,7 @@ mod tests {
                 newly_activated: 1,
                 already_active: 0,
                 failures: 0,
+                ..IssueReconciliationReport::default()
             },
             IssueReconciliationReport::default(),
         ]));

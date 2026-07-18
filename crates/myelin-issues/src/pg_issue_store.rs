@@ -30,7 +30,7 @@ use myelin_events::{
     derive_envelope, Actor, AggregateKey, DataRole, EmitContext, EventDraft, EventEnvelope,
     EventId, EventType, IdMinter, Timestamp, UlidMinter, Visibility,
 };
-use myelin_identity::{Principal, PrincipalKind, Zookie};
+use myelin_identity::{ColRef, Principal, PrincipalKind, RelName, SetExpr, Zookie};
 use myelin_storage::encryption::{EncryptedColumn, SubjectId};
 use myelin_storage::kms::{KmsEngine, PiiKeyRef, NONCE_LEN};
 use myelin_storage::pgrelay::PgRelay;
@@ -38,7 +38,6 @@ use myelin_storage::{SubstrateProvider, TenantScope};
 use myelin_tenancy::ArtifactRef;
 use sqlx::types::Uuid;
 use sqlx::Row;
-use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -71,13 +70,32 @@ pub enum VisibleIssues {
     All,
     /// A bounded, pre-authorized issue-id set to conjoin with the tenant-scoped SQL query.
     Ids(Vec<String>),
+    /// Frozen effective-permission pushdown. PgIssueStore accepts only the exact `issue.id IN
+    /// issue:view` shape and binds it to its durable source/applied projection watermark.
+    Filter { set_expr: SetExpr },
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum QueryVisibility {
-    None,
-    All,
-    Ids(Vec<Uuid>),
+impl VisibleIssues {
+    /// The only production list shape. Subject, tenant, and region remain derived from the verified
+    /// principal; callers cannot smuggle them into this expression.
+    pub fn effective_issue_view_filter() -> Self {
+        Self::Filter {
+            set_expr: SetExpr::InRelation {
+                relation: RelName("view".into()),
+                via_column: ColRef {
+                    table: "issue".into(),
+                    column: "id".into(),
+                },
+            },
+        }
+    }
+}
+
+/// Result of atomically rebuilding one tenant/region effective `issue:view` projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssueViewProjectionRevision {
+    pub revision: i64,
+    pub effective_grants: u64,
 }
 
 /// Required production authorization seam. The live implementation is Identity/ReBAC; there is no
@@ -802,25 +820,23 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         decode_row(&self.kms, &principal.region, row)
     }
 
-    /// Leak-free list: obtain the Identity prefilter first, then conjoin it inside the SQL query.
+    /// Leak-free list over the durable effective-permission projection.
+    ///
+    /// The one SQL statement returns a projection-status sentinel plus only rows joined to the
+    /// exact ready revision. Missing, pending, rebuilding, or revision-mismatched state therefore
+    /// returns `AuthorizationUnavailable`; it is never confused with an authorized empty page.
     pub async fn list(
         &self,
         principal: &Principal,
         page: IssuePageRequest,
     ) -> Result<IssuePage, IssueStoreError> {
         let scope = self.scope(principal)?;
-        let visible = normalize_visible(
+        let set_expr = normalize_visible(
             self.authorizer
                 .visible_issues(principal)
                 .map_err(IssueStoreError::AuthorizationUnavailable)?,
         )?;
-        if visible == QueryVisibility::None {
-            return Ok(IssuePage {
-                items: Vec::new(),
-                next_cursor: None,
-                limit: page.limit,
-            });
-        }
+        validate_issue_view_filter(&set_expr)?;
         let cursor = page
             .cursor
             .as_deref()
@@ -829,45 +845,36 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         let fetch_limit = i64::from(page.limit) + 1;
         let tenant_id = scope.tenant().0.clone();
         let region = scope.region().0.clone();
+        let principal_id = principal.principal_id.0.clone();
         let rows = self
             .provider
             .with_tenant_tx(&tenant_id.clone(), move |conn| {
                 Box::pin(async move {
-                    let result = match visible {
-                        QueryVisibility::None => unreachable!("handled before the transaction"),
-                        QueryVisibility::All => {
-                            let query_sql = format!("{} ORDER BY i.id ASC LIMIT $4", SELECT_BASE);
-                            let tenant_id_query = sqlx::query(&query_sql);
-                            tenant_id_query
-                                .bind(&tenant_id)
-                                .bind(&region)
-                                .bind(cursor)
-                                .bind(fetch_limit)
-                                .fetch_all(&mut *conn)
-                                .await
-                        }
-                        QueryVisibility::Ids(ids) => {
-                            let query_sql = format!(
-                                "{} AND i.id = ANY($4) ORDER BY i.id ASC LIMIT $5",
-                                SELECT_BASE
-                            );
-                            let tenant_id_query = sqlx::query(&query_sql);
-                            tenant_id_query
-                                .bind(&tenant_id)
-                                .bind(&region)
-                                .bind(cursor)
-                                .bind(ids)
-                                .bind(fetch_limit)
-                                .fetch_all(&mut *conn)
-                                .await
-                        }
-                    };
-                    result.map_err(|e| myelin_storage::PgError::Query(e.to_string()))
+                    sqlx::query(LIST_EFFECTIVE_ISSUE_VIEW_SQL)
+                        .bind(&tenant_id)
+                        .bind(&region)
+                        .bind(&principal_id)
+                        .bind(cursor)
+                        .bind(fetch_limit)
+                        .fetch_all(&mut *conn)
+                        .await
+                        .map_err(|e| myelin_storage::PgError::Query(e.to_string()))
                 })
             })
             .await
             .map_err(|e| IssueStoreError::Storage(e.to_string()))?;
 
+        let mut rows = rows.into_iter();
+        let sentinel = rows.next().ok_or_else(|| {
+            IssueStoreError::Storage("issue visibility query omitted its status sentinel".into())
+        })?;
+        let status: String = sentinel.get("projection_status");
+        if status != "ready" {
+            return Err(IssueStoreError::AuthorizationUnavailable(format!(
+                "effective issue:view projection is {status}"
+            )));
+        }
+        let rows: Vec<_> = rows.collect();
         let has_more = rows.len() > page.limit as usize;
         let mut items = Vec::with_capacity(rows.len().min(page.limit as usize));
         for row in rows.into_iter().take(page.limit as usize) {
@@ -881,6 +888,192 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             next_cursor,
             limit: page.limit,
         })
+    }
+
+    /// Rebuild the effective `issue:view` rows for one verified tenant/region.
+    ///
+    /// The projection state row is locked before the source is read and remains locked through
+    /// publication. Tuple and issue triggers take the same row lock when advancing the source
+    /// revision, so a concurrent mutation either precedes this snapshot or commits afterward and
+    /// leaves it pending. A crash rolls the delete/insert/status transition back atomically.
+    pub async fn rebuild_effective_issue_view(
+        &self,
+        worker: &Principal,
+    ) -> Result<IssueViewProjectionRevision, IssueStoreError> {
+        self.rebuild_effective_issue_view_inner(worker, None).await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Deterministic race seam: pause only after the projection state row is locked.
+    pub async fn rebuild_effective_issue_view_paused_for_test(
+        &self,
+        worker: &Principal,
+        pause: std::time::Duration,
+        locked: Arc<tokio::sync::Notify>,
+    ) -> Result<IssueViewProjectionRevision, IssueStoreError> {
+        self.rebuild_effective_issue_view_inner(worker, Some((pause, locked)))
+            .await
+    }
+
+    async fn rebuild_effective_issue_view_inner(
+        &self,
+        worker: &Principal,
+        pause_after_lock: Option<(std::time::Duration, Arc<tokio::sync::Notify>)>,
+    ) -> Result<IssueViewProjectionRevision, IssueStoreError> {
+        let scope = self.scope(worker)?;
+        let tenant_id = scope.tenant().0.clone();
+        let region = scope.region().0.clone();
+        self.provider
+            .with_tenant_tx(&tenant_id.clone(), move |conn| {
+                Box::pin(async move {
+                    sqlx::query(
+                        "INSERT INTO authz_projection_state \
+                           (tenant_id, region, projection, source_revision, applied_revision, status) \
+                         VALUES ($1, $2, 'issue:view', 1, 0, 'pending') \
+                         ON CONFLICT (tenant_id, region, projection) DO NOTHING",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
+
+                    let revision: i64 = sqlx::query_scalar(
+                        "SELECT source_revision FROM authz_projection_state \
+                         WHERE tenant_id = $1 AND region = $2 AND projection = 'issue:view' \
+                         FOR UPDATE",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
+
+                    if let Some((pause, locked)) = pause_after_lock {
+                        locked.notify_one();
+                        tokio::time::sleep(pause).await;
+                    }
+
+                    sqlx::query(
+                        "UPDATE authz_projection_state SET status = 'rebuilding', rebuilt_at = NULL \
+                         WHERE tenant_id = $1 AND region = $2 AND projection = 'issue:view'",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
+
+                    let unsupported_sql = format!(
+                        "{ISSUE_VIEW_WALK_CTE} \
+                         SELECT object_id || '#' || relation FROM walk \
+                         WHERE NOT supported OR depth >= 16 ORDER BY depth, object_id LIMIT 1"
+                    );
+                    let unsupported: Option<String> = sqlx::query_scalar(&unsupported_sql)
+                        .bind(&tenant_id)
+                        .bind(&region)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
+                    if let Some(node) = unsupported {
+                        return Err(myelin_storage::PgError::Query(format!(
+                            "unsupported or over-depth userset in issue:view rebuild: {node}"
+                        )));
+                    }
+
+                    sqlx::query(
+                        "DELETE FROM issue_authz_visible \
+                         WHERE tenant_id = $1 AND region = $2 AND projection = 'issue:view'",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
+
+                    let insert_sql = format!(
+                        "{ISSUE_VIEW_WALK_CTE} {ISSUE_VIEW_MEMBERS_CTE} \
+                         INSERT INTO issue_authz_visible \
+                           (tenant_id, region, projection, subject, permission, object_type, \
+                            object_id, revision) \
+                         SELECT $1, $2, 'issue:view', subject, 'view', 'issue', issue_id, $3 \
+                         FROM effective"
+                    );
+                    let inserted = sqlx::query(&insert_sql)
+                        .bind(&tenant_id)
+                        .bind(&region)
+                        .bind(revision)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?
+                        .rows_affected();
+
+                    let published = sqlx::query(
+                        "UPDATE authz_projection_state \
+                         SET applied_revision = $3, status = 'ready', rebuilt_at = now() \
+                         WHERE tenant_id = $1 AND region = $2 AND projection = 'issue:view' \
+                           AND source_revision = $3",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .bind(revision)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
+                    if published.rows_affected() != 1 {
+                        return Err(myelin_storage::PgError::Query(
+                            "issue:view source revision changed during locked rebuild".into(),
+                        ));
+                    }
+                    Ok(IssueViewProjectionRevision {
+                        revision,
+                        effective_grants: inserted,
+                    })
+                })
+            })
+            .await
+            .map_err(|error| match error.to_string().contains("unsupported or over-depth userset") {
+                true => IssueStoreError::AuthorizationUnavailable(error.to_string()),
+                false => IssueStoreError::Storage(error.to_string()),
+            })
+    }
+
+    /// Durable readiness/lag probe for the bounded reconciler. `None` is absent state and therefore
+    /// unavailable; `Some(0)` is serveable only when status is also `ready`.
+    pub async fn effective_issue_view_lag(
+        &self,
+        worker: &Principal,
+    ) -> Result<Option<i64>, IssueStoreError> {
+        let scope = self.scope(worker)?;
+        let tenant_id = scope.tenant().0.clone();
+        let region = scope.region().0.clone();
+        self.provider
+            .with_tenant_tx(&tenant_id.clone(), move |conn| {
+                Box::pin(async move {
+                    let row = sqlx::query(
+                        "SELECT source_revision, applied_revision, status \
+                         FROM authz_projection_state \
+                         WHERE tenant_id = $1 AND region = $2 AND projection = 'issue:view'",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
+                    Ok(row.map(|row| {
+                        let source: i64 = row.get("source_revision");
+                        let applied: i64 = row.get("applied_revision");
+                        let status: String = row.get("status");
+                        if status == "ready" && source == applied {
+                            0
+                        } else {
+                            source.saturating_sub(applied).max(1)
+                        }
+                    }))
+                })
+            })
+            .await
+            .map_err(|error| IssueStoreError::Storage(error.to_string()))
     }
 
     /// Object-authorize, lock the row, and durably transition it to `completed`. Repeated closes are
@@ -942,13 +1135,154 @@ const SELECT_COLUMNS: &str = "id, key, project_id, state, state_category, title_
 title_ciphertext, pii_key_ref, version, created_at::text, updated_at::text";
 const SELECT_COLUMNS_QUALIFIED: &str = "i.id, i.key, i.project_id, i.state, i.state_category, \
 i.title_nonce, i.title_ciphertext, i.pii_key_ref, i.version, i.created_at::text, i.updated_at::text";
-const SELECT_BASE: &str = "SELECT i.id, i.key, i.project_id, i.state, i.state_category, \
-i.title_nonce, i.title_ciphertext, i.pii_key_ref, i.version, i.created_at::text, i.updated_at::text \
-FROM issue i JOIN issue_authz_binding b \
-  ON b.tenant_id = i.tenant_id AND b.region = i.region AND b.issue_id = i.id \
-     AND b.state = 'active' \
-WHERE i.tenant_id = $1 AND i.region = $2 AND b.tenant_id = $1 AND b.region = $2 \
-  AND i.deleted_at IS NULL AND ($3::uuid IS NULL OR i.id > $3)";
+const LIST_EFFECTIVE_ISSUE_VIEW_SQL: &str = r#"
+WITH projection AS MATERIALIZED (
+  SELECT source_revision, applied_revision, status
+  FROM authz_projection_state
+  WHERE tenant_id = $1 AND region = $2 AND projection = 'issue:view'
+),
+gate AS MATERIALIZED (
+  SELECT source_revision AS revision
+  FROM projection
+  WHERE status = 'ready' AND applied_revision = source_revision
+),
+authorized AS (
+  SELECT i.id, i.key, i.project_id, i.state, i.state_category,
+         i.title_nonce, i.title_ciphertext, i.pii_key_ref, i.version,
+         i.created_at::text AS created_at, i.updated_at::text AS updated_at
+  FROM gate g
+  JOIN issue_authz_visible av
+    ON av.tenant_id = $1 AND av.region = $2
+   AND av.projection = 'issue:view' AND av.subject = $3
+   AND av.permission = 'view' AND av.object_type = 'issue'
+   AND av.revision = g.revision
+  JOIN issue i
+    ON i.tenant_id = av.tenant_id AND i.region = av.region
+   AND i.id::text = av.object_id
+  JOIN issue_authz_binding b
+    ON b.tenant_id = i.tenant_id AND b.region = i.region
+   AND b.issue_id = i.id AND b.state = 'active'
+  WHERE i.tenant_id = $1 AND i.region = $2
+    AND i.deleted_at IS NULL AND ($4::uuid IS NULL OR i.id > $4)
+  ORDER BY i.id ASC
+  LIMIT $5
+)
+SELECT 0::int AS sort_key,
+       CASE
+         WHEN EXISTS (SELECT 1 FROM gate) THEN 'ready'
+         WHEN NOT EXISTS (SELECT 1 FROM projection) THEN 'missing'
+         WHEN (SELECT status FROM projection) = 'ready' THEN 'stale'
+         ELSE (SELECT status FROM projection)
+       END::text AS projection_status,
+       NULL::uuid AS id, NULL::text AS key, NULL::uuid AS project_id,
+       NULL::text AS state, NULL::text AS state_category,
+       NULL::bytea AS title_nonce, NULL::bytea AS title_ciphertext,
+       NULL::text AS pii_key_ref, NULL::bigint AS version,
+       NULL::text AS created_at, NULL::text AS updated_at
+UNION ALL
+SELECT 1, 'ready', id, key, project_id, state, state_category,
+       title_nonce, title_ciphertext, pii_key_ref, version, created_at, updated_at
+FROM authorized
+ORDER BY sort_key ASC, id ASC NULLS FIRST
+"#;
+
+/// Resolve the fixed core org→team→project hierarchy plus direct-relation usersets. A userset that
+/// leaves those supported group types is surfaced as `supported=false`; rebuild then fails closed
+/// instead of silently under-materializing an unknown permission rewrite.
+const ISSUE_VIEW_WALK_CTE: &str = r#"
+WITH RECURSIVE roots(issue_id, arm, object_id, relation, depth, path, supported) AS (
+  SELECT i.id::text, root.arm,
+         CASE WHEN root.arm = 'base'
+              THEN split_part(b.project_userset, '#', 1)
+              ELSE b.issue_object END,
+         root.relation, 0,
+         ARRAY[(CASE WHEN root.arm = 'base'
+                     THEN split_part(b.project_userset, '#', 1)
+                     ELSE b.issue_object END) || '#' || root.relation]::text[],
+         true
+  FROM issue i
+  JOIN issue_authz_binding b
+    ON b.tenant_id = i.tenant_id AND b.region = i.region
+   AND b.issue_id = i.id AND b.state = 'active'
+  CROSS JOIN (VALUES
+      ('base'::text, 'view'::text),
+      ('confidential'::text, 'confidential'::text),
+      ('grant'::text, 'confidential_grant'::text)
+  ) AS root(arm, relation)
+  WHERE i.tenant_id = $1 AND i.region = $2 AND i.deleted_at IS NULL
+),
+walk(issue_id, arm, object_id, relation, depth, path, supported) AS (
+  SELECT issue_id, arm, object_id, relation, depth, path, supported FROM roots
+  UNION ALL
+  SELECT w.issue_id, w.arm, child.object_id, child.relation, w.depth + 1,
+         w.path || (child.object_id || '#' || child.relation), child.supported
+  FROM walk w
+  CROSS JOIN LATERAL (
+    SELECT split_part(t.subject, '#', 1) AS object_id,
+           split_part(t.subject, '#', 2) AS relation,
+           split_part(t.subject, ':', 1) IN ('org', 'team', 'project')
+             AND split_part(t.subject, '#', 2) <> '' AS supported
+    FROM rebac_tuple t
+    WHERE t.tenant_id = $1 AND t.region = $2
+      AND t.object_id = w.object_id AND t.relation = w.relation
+      AND position('#' IN t.subject) > 0
+      AND NOT (w.relation = 'view'
+               AND split_part(w.object_id, ':', 1) IN ('org', 'team', 'project'))
+
+    UNION ALL
+
+    SELECT w.object_id, direct.relation, true
+    FROM (VALUES
+      ('project'::text, 'reader'::text),
+      ('project'::text, 'writer'::text),
+      ('team'::text, 'member'::text),
+      ('org'::text, 'member'::text),
+      ('org'::text, 'admin'::text)
+    ) AS direct(object_type, relation)
+    WHERE w.relation = 'view'
+      AND split_part(w.object_id, ':', 1) = direct.object_type
+
+    UNION ALL
+
+    SELECT split_part(t.subject, '#', 1), split_part(t.subject, '#', 2),
+           split_part(t.subject, ':', 1) IN ('org', 'team', 'project')
+             AND split_part(t.subject, '#', 2) <> ''
+    FROM (VALUES
+      ('project'::text, 'parent_team'::text),
+      ('team'::text, 'parent_org'::text)
+    ) AS inherited(object_type, tupleset)
+    JOIN rebac_tuple t
+      ON t.tenant_id = $1 AND t.region = $2
+     AND t.object_id = w.object_id AND t.relation = inherited.tupleset
+    WHERE w.relation = 'view'
+      AND split_part(w.object_id, ':', 1) = inherited.object_type
+      AND position('#' IN t.subject) > 0
+      AND split_part(t.subject, '#', 2) = 'view'
+  ) AS child
+  WHERE w.supported AND w.depth < 16
+    AND NOT ((child.object_id || '#' || child.relation) = ANY(w.path))
+)
+"#;
+
+const ISSUE_VIEW_MEMBERS_CTE: &str = r#"
+, members(issue_id, arm, subject) AS (
+  SELECT w.issue_id, w.arm, t.subject
+  FROM walk w
+  JOIN rebac_tuple t
+    ON t.tenant_id = $1 AND t.region = $2
+   AND t.object_id = w.object_id AND t.relation = w.relation
+  WHERE w.supported AND position('#' IN t.subject) = 0
+    AND NOT (w.relation = 'view'
+             AND split_part(w.object_id, ':', 1) IN ('org', 'team', 'project'))
+),
+effective(issue_id, subject) AS (
+  (SELECT issue_id, subject FROM members WHERE arm = 'base'
+   EXCEPT
+   SELECT issue_id, subject FROM members WHERE arm = 'confidential')
+  UNION
+  SELECT issue_id, subject FROM members WHERE arm = 'grant'
+)
+"#;
 
 async fn select_one(
     conn: &mut sqlx::PgConnection,
@@ -1263,32 +1597,28 @@ fn title_dek_subject(principal: &Principal) -> String {
     }
 }
 
-fn normalize_visible(visible: VisibleIssues) -> Result<QueryVisibility, IssueStoreError> {
+fn normalize_visible(visible: VisibleIssues) -> Result<SetExpr, IssueStoreError> {
     match visible {
-        VisibleIssues::None => Ok(QueryVisibility::None),
-        VisibleIssues::All => Ok(QueryVisibility::All),
-        VisibleIssues::Ids(ids) => {
-            if ids.len() > MAX_AUTHORIZED_ISSUE_IDS {
-                return Err(IssueStoreError::AuthorizationUnavailable(format!(
-                    "Identity materialised more than {MAX_AUTHORIZED_ISSUE_IDS} issue ids; a bounded push-down filter is required"
-                )));
-            }
-            let mut unique = BTreeSet::new();
-            for id in ids {
-                let id = Uuid::parse_str(&id).map_err(|_| {
-                    IssueStoreError::AuthorizationUnavailable(
-                        "Identity returned a malformed issue UUID".into(),
-                    )
-                })?;
-                unique.insert(id);
-            }
-            if unique.is_empty() {
-                Ok(QueryVisibility::None)
-            } else {
-                Ok(QueryVisibility::Ids(unique.into_iter().collect()))
-            }
+        VisibleIssues::Filter { set_expr } => Ok(set_expr),
+        VisibleIssues::None | VisibleIssues::All | VisibleIssues::Ids(_) => {
+            Err(IssueStoreError::AuthorizationUnavailable(
+                "durable issue lists require the frozen effective issue:view filter".into(),
+            ))
         }
     }
+}
+
+fn validate_issue_view_filter(set_expr: &SetExpr) -> Result<(), IssueStoreError> {
+    let expected = match VisibleIssues::effective_issue_view_filter() {
+        VisibleIssues::Filter { set_expr } => set_expr,
+        _ => unreachable!("constructor always returns a filter"),
+    };
+    if set_expr != &expected {
+        return Err(IssueStoreError::AuthorizationUnavailable(
+            "Identity returned a non-frozen issue visibility expression".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_uuid(field: &str, value: &str) -> Result<Uuid, IssueStoreError> {
@@ -1331,16 +1661,11 @@ mod tests {
     }
 
     #[test]
-    fn materialised_visibility_is_bounded_deduplicated_and_typed_before_sql() {
-        let id = "11111111-1111-1111-1111-111111111111".to_string();
-        let normalized = normalize_visible(VisibleIssues::Ids(vec![id.clone(), id])).unwrap();
-        assert!(matches!(normalized, QueryVisibility::Ids(ids) if ids.len() == 1));
-        assert!(normalize_visible(VisibleIssues::Ids(vec!["not-a-uuid".into()])).is_err());
-        assert!(normalize_visible(VisibleIssues::Ids(vec![
-            "11111111-1111-1111-1111-111111111111".into();
-            MAX_AUTHORIZED_ISSUE_IDS + 1
-        ]))
-        .is_err());
+    fn only_the_frozen_effective_filter_reaches_sql() {
+        let frozen = normalize_visible(VisibleIssues::effective_issue_view_filter()).unwrap();
+        assert!(validate_issue_view_filter(&frozen).is_ok());
+        assert!(normalize_visible(VisibleIssues::All).is_err());
+        assert!(validate_issue_view_filter(&SetExpr::All).is_err());
     }
 
     #[test]
