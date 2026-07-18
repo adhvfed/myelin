@@ -52,6 +52,11 @@ Flags: `--tenant <slug>` (required), `--principal <id>` (required), `--display-n
 `--ttl-days <n>` (default 30), `--region <r>` (default `MYELIN_REGION`). Running it again for the same
 principal mints a **new** token (a new revocation id) without disturbing the principal.
 
+The edge's issue-authorization restart scanner is deliberately partitioned. Dogfood defaults
+`MYELIN_ISSUES_RECONCILE_TENANTS` to this runbook's `acme` tenant. If you bootstrap a different or
+additional tenant, export the complete comma-separated tenant list before starting `dogfood.sh edge`;
+otherwise new issues in that tenant remain safely pending and invisible rather than activating.
+
 Capture the token in a shell var for the next steps:
 
 ```sh
