@@ -177,11 +177,9 @@ pub fn agent_app_spec(config: Config, outbox: myelin_events::OutboxStore) -> App
         holders: AppSpec::auto(),
         stores: StoreManifest::new(),
         // The transactional outbox relay (BUS-2 — the ONLY emit path; the SKELETON's trace emit rides
-        // this). The relay drains the INJECTED store (MR-009b W3b.6 — the named W3b.4 debt
-        // discharged: this builder no longer constructs the memory floor). The in-process broker
-        // fake stays the default TRANSPORT (durability lives in the store); the JetStream-class
-        // adapter is a config swap (dev<->prod), never a code change.
-        outbox: OutboxSpec::new(outbox, myelin_events::InProcessBus::new()),
+        // this). The service only produces into the shared durable table; the elected cell relay
+        // publishes it. A process-local relay must never claim another subsystem's row.
+        outbox: OutboxSpec::external_relay(outbox),
         // The agent OLTP store is implicitly critical; no further critical downstream at the shell.
         critical: CriticalDependencies::default(),
     }

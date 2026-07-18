@@ -45,7 +45,7 @@
 //! indexes) is `tests/integration_iss_p05_spine_schema.rs` behind the `integration` cargo feature.
 
 use crate::migrations::{issues_hot_tables, issues_migrations};
-use myelin_events::{InProcessBus, OutboxStore};
+use myelin_events::OutboxStore;
 use myelin_substrate::{
     boot, serve, AppSpec, Config, CriticalDependencies, InternalRpc, OutboxSpec, PublicRoutes,
     ServeError, ServeHandle, StoreManifest,
@@ -96,9 +96,8 @@ pub fn issues_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         // the shell — every spine table lives in the one Postgres; it auto-registers as H3 (the only
         // store the shell owns; the blob attachments tier is declared by ISS-P19's behaviour band).
         stores: StoreManifest::new(),
-        // The relay drains the INJECTED store (W3b.4). The in-process broker fake stays the
-        // default TRANSPORT (durability lives in the store); EB-04's adapter is a config swap.
-        outbox: OutboxSpec::new(outbox, InProcessBus::new()),
+        // Producer-only shared durable outbox. The elected cell relay is the only publisher.
+        outbox: OutboxSpec::external_relay(outbox),
         critical: issues_critical(),
     }
 }

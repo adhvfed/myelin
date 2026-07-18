@@ -582,9 +582,9 @@ pub fn knowledge_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         holders: AppSpec::auto(),
         stores: StoreManifest::new(),
         // The outbox relay hook (architecture 03 §4 — emit-via-outbox-only, the no-raw-publish
-        // discipline) over the INJECTED store (W3b.4). The in-process broker fake stays the
-        // default TRANSPORT (durability lives in the store); EB-04's adapter is a config swap.
-        outbox: OutboxSpec::new(outbox, InProcessBus::new()),
+        // discipline). The service only produces into the shared durable table; the elected cell
+        // relay is the only publisher.
+        outbox: OutboxSpec::external_relay(outbox),
         // No further critical downstream declared on the shell floor (the Id/Search/Refs client
         // dependencies wire their critical set as those clients land — KN-P14/P16/P21).
         critical: CriticalDependencies::default(),
@@ -625,7 +625,8 @@ pub fn knowledge_app_spec_with_consumers(
     // durable-backed store (and pairs emits with a UNIQUE id source — never the per-store-
     // resetting default `MonotonicMinter`; `myelin_events::UlidMinter` is the production source);
     // a test passes the in-memory double.
-    let mut spec = knowledge_app_spec(config, outbox);
+    let mut spec = knowledge_app_spec(config, outbox.clone());
+    spec.outbox = OutboxSpec::new(outbox, InProcessBus::new());
 
     // Register the living-doc consumer through the sanctioned `consume` (rule 3 rejects `*`/empty;
     // rule 4 binds the durable name). A malformed/over-broad subject is a LOUD registration error —

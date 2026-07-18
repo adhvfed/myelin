@@ -38,7 +38,7 @@
 //! preserved — a subsystem service is the graph's terminal consumer).
 
 use crate::migrations::migrations as flow_migrations;
-use myelin_events::{InProcessBus, OutboxStore};
+use myelin_events::OutboxStore;
 use myelin_substrate::{
     boot, serve, AppSpec, Config, CriticalDependencies, HotTables, InternalRpc, Migrations,
     OutboxSpec, PublicRoutes, ServeError, ServeHandle, StoreManifest,
@@ -104,10 +104,8 @@ pub fn flow_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         // workflow_run/wf_history/wf_signal lands at P-FLOW-03 (P-201).
         holders: AppSpec::auto(),
         stores: StoreManifest::new(),
-        // The transactional outbox relay (BUS-2 — the ONLY emit path; §10 no second publish path)
-        // over the INJECTED store (W3b.4). The in-process broker fake stays the default TRANSPORT
-        // (durability lives in the store); EB-04's JetStream-class adapter is a config swap.
-        outbox: OutboxSpec::new(outbox, InProcessBus::new()),
+        // Producer-only shared durable outbox. The elected cell relay is the only publisher.
+        outbox: OutboxSpec::external_relay(outbox),
         // The engine declares no further critical downstream at the shell; the OLTP store is implicit.
         critical: CriticalDependencies::default(),
     }

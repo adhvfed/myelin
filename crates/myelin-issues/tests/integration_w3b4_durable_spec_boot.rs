@@ -11,9 +11,9 @@
 //! This is the W3b.4 exit proof the design contract names: an emit through a SPEC-BUILT app (the
 //! `issues_app_spec(config, outbox)` injection seam + the harness `boot` lifecycle) lands in the
 //! REAL PG `outbox` table (verified with an independent raw SELECT, not the store's own reads),
-//! and the lifecycle's relay drain (`ServeHandle::tick` → `Relay::drain_once` → the
-//! `DurableOutboxBacking` composite verb → `PgRelay::drain_once_dead_letter`) publishes it
-//! (`published_at` stamped in PG). The id source is the PRODUCTION `UlidMinter` (the P-S12
+//! while the service lifecycle cannot claim or stamp the shared row. The separately elected cell
+//! publisher owns publication; this proof prevents a service-local relay from stealing another
+//! subsystem's row into a process-private bus. The id source is the PRODUCTION `UlidMinter` (the P-S12
 //! stand-in), satisfying the W3b.3 named condition — a per-run-unique `event_id`, never the
 //! per-instance-resetting default `MonotonicMinter` whose collisions the durable
 //! `ON CONFLICT (event_id) DO NOTHING` path silently drops.
@@ -53,10 +53,10 @@ fn ctx_base(tenant: &str) -> EmitContextBase {
     }
 }
 
-/// The W3b.4 exit proof: spec-built app + injected durable outbox → emit lands in PG (independent
-/// SELECT) → the lifecycle's relay drain publishes it (published_at stamped in PG).
+/// The shared-outbox producer proof: the spec-built app commits to PG, while its lifecycle leaves
+/// publication to the elected cell relay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spec_built_app_emit_lands_in_pg_outbox_and_relay_drain_publishes() {
+async fn spec_built_app_emit_lands_in_pg_without_claiming_the_shared_relay() {
     // The SAME composition-root shape the rewired service mains use (W3b.4): provider from env →
     // foundation migrations → OutboxStore::durable(PgOutboxBacking).
     let config = MyelinConfig::from_env(Mode::DevDefaults).expect("dev config");
@@ -72,8 +72,7 @@ async fn spec_built_app_emit_lands_in_pg_outbox_and_relay_drain_publishes() {
         tokio::runtime::Handle::current(),
     )));
 
-    // The SPEC-BUILT app: the injected store flows through `issues_app_spec` into the harness
-    // lifecycle; `boot` starts the relay OVER THE DURABLE STORE.
+    // The SPEC-BUILT app owns the durable producer store but deliberately has no embedded relay.
     let handle = boot(issues_app_spec(Config::default(), outbox.clone())).expect("boot");
 
     // Emit through the spec's outbox with the PRODUCTION UlidMinter (the W3b.3 named condition:
@@ -133,9 +132,7 @@ async fn spec_built_app_emit_lands_in_pg_outbox_and_relay_drain_publishes() {
         "a freshly committed row is unsent (published_at IS NULL)"
     );
 
-    // The lifecycle's relay drain: `tick` routes `Relay::drain_to_empty` through the durable
-    // backing's composite drain verb (PgRelay claim → publish → mark-sent). The production
-    // publisher — no hand-rolled drain here.
+    // A service tick must not claim the global table. The elected cell publisher runs separately.
     handle.tick();
 
     let sent_after: (bool,) =
@@ -145,8 +142,8 @@ async fn spec_built_app_emit_lands_in_pg_outbox_and_relay_drain_publishes() {
             .await
             .expect("select published flag after drain");
     assert!(
-        sent_after.0,
-        "the lifecycle relay drain published the committed row (published_at stamped in PG)"
+        !sent_after.0,
+        "the producer lifecycle must leave publication to the elected cell relay"
     );
 
     // The durable store's own read agrees (the dispatching read path — no memory arm involved).
@@ -155,8 +152,8 @@ async fn spec_built_app_emit_lands_in_pg_outbox_and_relay_drain_publishes() {
         .row(&event_id)
         .expect("the durable store re-reads the row from PG");
     assert!(
-        row.published_at.is_some(),
-        "store read reflects the publish"
+        row.published_at.is_none(),
+        "store read confirms the shared row was not claimed locally"
     );
 
     // Graceful drain still works over the durable arm (stop intake, finish in-flight, ack-exit).
