@@ -1243,6 +1243,8 @@ mod git_wire_basic_auth_tests {
             exp_unix: 9_999_999_999,
             authority: vec!["agent:run".into()],
             dpop_jkt: None,
+            purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
+            audience: myelin_identity_service::CredentialAudience::Edge,
         });
         let gw = Gateway::builder(authn, human, Arc::new(AllowAll))
             .default_token_scheme("agent")

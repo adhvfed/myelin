@@ -75,6 +75,7 @@
 //!   the S7 store + the audit chain + the tuple store already do (one time convention).
 
 use crate::delegation::{authority_of, DelegationAlgebra, DelegationInput, IntersectionProof};
+use crate::delegation_policy::ResolvedDelegationPolicy;
 use crate::machine_auth::{scheme, CapabilityToken, MachineKind, TokenVerifier};
 use crate::revocation::{RevocationStore, RunTokenState};
 use crate::tuple_store::TupleStore;
@@ -123,10 +124,7 @@ impl RunTokenAuthorizer {
     }
 
     /// Inject a deterministic boundary clock for tests and replay drills.
-    pub fn with_clock(
-        mut self,
-        now: impl Fn() -> Timestamp + Send + Sync + 'static,
-    ) -> Self {
+    pub fn with_clock(mut self, now: impl Fn() -> Timestamp + Send + Sync + 'static) -> Self {
         self.now = Arc::new(now);
         self
     }
@@ -165,7 +163,9 @@ impl RunTokenAuthorizer {
             &(self.now)(),
         ) != RunTokenState::LiveWithinRunLife
         {
-            return Err("run token is unknown, torn down, or expired at the mutation boundary".into());
+            return Err(
+                "run token is unknown, torn down, or expired at the mutation boundary".into(),
+            );
         }
         for cap in required_caps {
             if !verified.authority.holds(cap) {
@@ -199,6 +199,8 @@ pub enum MintError {
     /// The requested TTL is zero — a per-run token MUST have a finite, positive life (its life ==
     /// run life). A zero-TTL token could be mistaken for "never expires"; refused.
     NonPositiveTtl,
+    /// A durable run-policy cursor must be a positive storage snapshot.
+    InvalidDelegationSnapshot(i64),
 }
 
 impl core::fmt::Display for MintError {
@@ -214,6 +216,10 @@ impl core::fmt::Display for MintError {
                 f,
                 "a per-run token TTL must be positive (life == run life) — a zero-TTL token is \
                  refused (it could be mistaken for never-expiring)"
+            ),
+            MintError::InvalidDelegationSnapshot(snapshot) => write!(
+                f,
+                "durable delegation snapshot `{snapshot}` is not a positive storage cursor — refused"
             ),
         }
     }
@@ -239,6 +245,9 @@ pub trait TokenSigner: Send + Sync {
         region: &str,
         subject_key: &str,
         jti: &str,
+        run_id: &str,
+        delegation_snapshot: Option<i64>,
+        expires_at: &Timestamp,
         grants: &[&str],
     ) -> String;
 }
@@ -267,13 +276,17 @@ impl TokenSigner for StructuralTokenSigner {
         region: &str,
         subject_key: &str,
         jti: &str,
+        run_id: &str,
+        delegation_snapshot: Option<i64>,
+        _expires_at: &Timestamp,
         grants: &[&str],
     ) -> String {
         // A per-run token is TTL-constrained, not DPoP-bound (§4) → dpop = 0. The grant list is the
         // already-attenuated effective authority (comma-separated; empty ⇒ no grants).
         format!(
-            "{tenant}|{region}|{subject_key}|{jti}|0|{}",
-            grants.join(",")
+            "{tenant}|{region}|{subject_key}|{jti}|0|{}|agent_run|edge|{run_id}|{}",
+            grants.join(","),
+            delegation_snapshot.map_or_else(String::new, |snapshot| snapshot.to_string()),
         )
     }
 }
@@ -458,6 +471,72 @@ impl RunTokenMinter {
         ttl: &FailStaticBound,
         now: &Timestamp,
     ) -> Result<(RunToken, IntersectionProof), MintError> {
+        self.mint_proved_with_snapshot(
+            scope,
+            agent_id,
+            run_id,
+            agent,
+            trigger_actor,
+            input,
+            delegation_caveats,
+            kind,
+            ttl,
+            now,
+            None,
+        )
+    }
+
+    /// Mint from a server-resolved durable delegation policy. This is the authoritative run-token
+    /// path: the signed credential binds both the run id and the exact durable policy snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mint_from_resolved_policy(
+        &self,
+        scope: &TenantScope,
+        agent_id: &PrincipalId,
+        run_id: &RunId,
+        agent: &Principal,
+        trigger_actor: &Principal,
+        resolved: &ResolvedDelegationPolicy,
+        delegation_caveats: &DelegationCaveats,
+        kind: MachineKind,
+        ttl: &FailStaticBound,
+        now: &Timestamp,
+    ) -> Result<RunToken, MintError> {
+        let snapshot = resolved.cursor.snapshot;
+        if snapshot <= 0 {
+            return Err(MintError::InvalidDelegationSnapshot(snapshot));
+        }
+        let (token, _) = self.mint_proved_with_snapshot(
+            scope,
+            agent_id,
+            run_id,
+            agent,
+            trigger_actor,
+            &resolved.input,
+            delegation_caveats,
+            kind,
+            ttl,
+            now,
+            Some(snapshot),
+        )?;
+        Ok(token)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mint_proved_with_snapshot(
+        &self,
+        scope: &TenantScope,
+        agent_id: &PrincipalId,
+        run_id: &RunId,
+        agent: &Principal,
+        trigger_actor: &Principal,
+        input: &DelegationInput,
+        delegation_caveats: &DelegationCaveats,
+        kind: MachineKind,
+        ttl: &FailStaticBound,
+        now: &Timestamp,
+        delegation_snapshot: Option<i64>,
+    ) -> Result<(RunToken, IntersectionProof), MintError> {
         // (0) A per-run token MUST have a finite, positive life (life == run life). A zero-TTL token
         //     could be mistaken for never-expiring — refuse it (never mint a no-expiry per-run token).
         if ttl.static_max_secs == 0 {
@@ -491,6 +570,10 @@ impl RunTokenMinter {
         //     the run's life. A per-run token is single-purpose; its jti is the revocation handle.
         let jti = run_token_jti(agent_id, run_id, now);
 
+        // Compute the authoritative run deadline before signing so the outer cryptographic `exp` and
+        // the durable S7 lifecycle record share the same boundary.
+        let expires_at = expires_at_of(now, ttl);
+
         // (4) Sign the (already-attenuated) effective authority into the bearer material (the floor
         //     structural envelope → the real crypto signer behind the seam). The signer NEVER widens
         //     the authority — it carries exactly the effective set the intersection produced.
@@ -500,6 +583,9 @@ impl RunTokenMinter {
             &scope.region().0,
             &agent_id.0,
             &jti,
+            &run_id.0,
+            delegation_snapshot,
+            &expires_at,
             &grants,
         );
 
@@ -511,7 +597,6 @@ impl RunTokenMinter {
         //     expiry as dead. We register the TTL so the token's death at run-life is RECORDED in the
         //     durable S7 mirror (so a crash-recovered cell still knows the run-life boundary). This
         //     is the per-run-token TTL store P-ID-14 (`register_run_token_ttl`) shipped for this mint.
-        let expires_at = expires_at_of(now, ttl);
         self.revocations
             .register_run_token_ttl(scope, &jti, now.clone(), expires_at.clone());
 
@@ -838,11 +923,9 @@ mod tests {
                 &minted_at,
             )
             .expect("mint attenuated run token");
-        let authorizer = RunTokenAuthorizer::new(
-            Arc::new(StructuralTokenVerifier::new()),
-            s7.clone(),
-        )
-        .with_clock(|| ts("2026-06-19T00:01:00Z"));
+        let authorizer =
+            RunTokenAuthorizer::new(Arc::new(StructuralTokenVerifier::new()), s7.clone())
+                .with_clock(|| ts("2026-06-19T00:01:00Z"));
 
         authorizer
             .authorize(
@@ -898,9 +981,8 @@ mod tests {
                 &ts("2026-06-19T00:00:00Z"),
             )
             .expect("mint");
-        let authorizer =
-            RunTokenAuthorizer::new(Arc::new(StructuralTokenVerifier::new()), s7)
-                .with_clock(|| ts("2026-06-19T00:01:00Z"));
+        let authorizer = RunTokenAuthorizer::new(Arc::new(StructuralTokenVerifier::new()), s7)
+            .with_clock(|| ts("2026-06-19T00:01:00Z"));
 
         let mut mixed = token.clone();
         mixed.jti = "attacker-selected-jti".into();
@@ -1291,9 +1373,10 @@ mod tests {
     }
 
     /// **The minted token round-trips through the `authenticate` envelope shape (one token
-    /// convention).** The floor signer emits the SAME `<tenant>|<region>|<subject_key>|<jti>|<dpop>|
-    /// <grants>` envelope `StructuralTokenVerifier` parses — six `|`-fields, dpop=0 (a per-run token
-    /// is TTL-constrained, not DPoP-bound).
+    /// convention).** The floor signer emits the SAME signed-fact envelope
+    /// `StructuralTokenVerifier` parses, including purpose, audience, run id, and optional durable
+    /// delegation snapshot. The legacy caller-supplied mint leaves the snapshot empty, so it can
+    /// exercise mint algebra but cannot authenticate as an authoritative edge run credential.
     #[test]
     fn minted_token_uses_the_authenticate_envelope_shape() {
         let s7 = RevocationStore::new();
@@ -1319,7 +1402,7 @@ mod tests {
             )
             .expect("mint");
         let parts: Vec<&str> = token.token.split('|').collect();
-        assert_eq!(parts.len(), 6, "the envelope has six |-fields");
+        assert_eq!(parts.len(), 10, "the envelope has all signed-fact fields");
         assert_eq!(parts[0], "acme", "tenant from the verified scope");
         assert_eq!(parts[1], "eu-west", "region from the verified scope");
         assert_eq!(parts[2], "svc:agent", "subject_key is the agent id");
@@ -1334,6 +1417,13 @@ mod tests {
         assert_eq!(
             parts[5], "agent:run",
             "the grants are the attenuated effective authority"
+        );
+        assert_eq!(parts[6], "agent_run");
+        assert_eq!(parts[7], "edge");
+        assert_eq!(parts[8], "run-9");
+        assert_eq!(
+            parts[9], "",
+            "caller-supplied legacy mint has no durable policy snapshot"
         );
     }
 }

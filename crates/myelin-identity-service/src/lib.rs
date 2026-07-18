@@ -156,8 +156,9 @@ pub use capability_crypto::{
     DpopClientKey, DpopReplayGuard, PasetoCapabilitySigner, PasetoCapabilityVerifier,
 };
 pub use machine_auth::{
-    Authority, CapabilityAuthenticator, CapabilityToken, MachineKind, StructuralTokenVerifier,
-    TokenVerifier,
+    Authority, CapabilityAuthenticator, CapabilityToken, CredentialAudience, CredentialContext,
+    CredentialPurpose, DpopState, MachineKind, RequestIdentity, StructuralTokenVerifier,
+    TokenVerifier, VerifiedCapabilityContext,
 };
 pub use mint::{
     expires_at_of, run_token_jti, MintError, RevocationProof, RunTokenMinter,
@@ -555,15 +556,6 @@ pub struct StoreBackedCheck {
     cell_authority: std::sync::Arc<CellTokenAuthority>,
 }
 
-/// **The fixed PASETO `exp` ceiling (seconds) the production per-run-token signer stamps (MR-012).**
-/// The [`mint::TokenSigner`] seam does not receive the per-mint run-life TTL, so the production
-/// [`PasetoCapabilitySigner`] uses this generous fixed ceiling for the token's own `exp`. The
-/// AUTHORITATIVE per-run-life expiry is the `expires_at == run-life` TTL the mint registers in the
-/// durable S7 [`revocation::RevocationStore`] (the `is_live`/`is_revoked` consult every surface runs);
-/// the PASETO `exp` is a secondary fail-static ceiling. (Threading the per-mint TTL into the signer
-/// seam is a named follow-on; it does not affect the S7-authoritative run-life boundary.)
-pub const PROD_RUN_TOKEN_PASETO_TTL_SECS: i64 = 3600;
-
 impl StoreBackedCheck {
     /// Wire the real `check` engine over the S3 [`TupleStore`], with the **core org/team/project
     /// hierarchy** pre-loaded into the namespace engine (the M3/M4 subsystem fragments are admitted
@@ -597,10 +589,7 @@ impl StoreBackedCheck {
         // the named follow-on (P-527/MR-025). The same authority's PUBLIC half verifies the token
         // (`token_trust_anchor`), so the mint→verify round-trip is real crypto end-to-end.
         let cell_authority = std::sync::Arc::new(CellTokenAuthority::generate());
-        let signer = std::sync::Arc::new(PasetoCapabilitySigner::new(
-            cell_authority.clone(),
-            PROD_RUN_TOKEN_PASETO_TTL_SECS,
-        ));
+        let signer = std::sync::Arc::new(PasetoCapabilitySigner::new(cell_authority.clone()));
         // The minter shares THIS slot's S7 store + S3 tuple store (one revocation oracle, one write
         // primitive): a mint registers the per-run TTL into the SAME denylist `check`/`authenticate`
         // consult, and the auto-expiring per-run grant tuple goes through the SAME write_tuples path.
@@ -718,10 +707,7 @@ impl StoreBackedCheck {
         );
         // The REAL PASETO v4.public (Ed25519) run-token signer over the cell authority (one signer,
         // one revocation oracle): the minter registers per-run TTLs into the SAME durable S7 store.
-        let signer = std::sync::Arc::new(PasetoCapabilitySigner::new(
-            cell_authority.clone(),
-            PROD_RUN_TOKEN_PASETO_TTL_SECS,
-        ));
+        let signer = std::sync::Arc::new(PasetoCapabilitySigner::new(cell_authority.clone()));
         let minter = mint::RunTokenMinter::with_signer_and_tuples(
             revocations.clone(),
             Some(tuples.clone()),
@@ -1332,6 +1318,37 @@ impl StoreBackedCheck {
             agent,
             trigger_actor,
             input,
+            delegation_caveats,
+            kind,
+            ttl,
+            now,
+        )
+    }
+
+    /// Mint an authoritative agent-run credential from a server-resolved durable policy snapshot.
+    /// Unlike [`Self::mint_run_token_in`], this stamps the positive storage snapshot into the signed
+    /// credential context and is therefore suitable for gateway authorization.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mint_run_token_from_resolved_policy_in(
+        &self,
+        scope: &myelin_storage::TenantScope,
+        agent_id: &myelin_identity::PrincipalId,
+        run_id: &myelin_identity::RunId,
+        agent: &Principal,
+        trigger_actor: &Principal,
+        resolved: &delegation_policy::ResolvedDelegationPolicy,
+        delegation_caveats: &myelin_identity::DelegationCaveats,
+        kind: MachineKind,
+        ttl: &myelin_identity::FailStaticBound,
+        now: &myelin_events::Timestamp,
+    ) -> Result<myelin_identity::RunToken, mint::MintError> {
+        self.minter.mint_from_resolved_policy(
+            scope,
+            agent_id,
+            run_id,
+            agent,
+            trigger_actor,
+            resolved,
             delegation_caveats,
             kind,
             ttl,

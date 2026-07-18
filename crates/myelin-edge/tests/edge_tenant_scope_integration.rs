@@ -138,6 +138,8 @@ async fn edge_sets_the_tenant_scope_in_a_real_transaction() {
         exp_unix: exp,
         authority: vec!["agent:run".into()],
         dpop_jkt: None,
+        purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
+        audience: myelin_identity_service::CredentialAudience::Edge,
     });
 
     let stream = TcpStream::connect(addr).await.unwrap();

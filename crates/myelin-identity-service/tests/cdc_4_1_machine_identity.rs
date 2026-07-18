@@ -51,7 +51,7 @@ fn material(
     grants: &[&str],
 ) -> String {
     format!(
-        "{tenant}|{region}|{subject_key}|{jti}|{}|{}",
+        "{tenant}|{region}|{subject_key}|{jti}|{}|{}|test_kind|edge||",
         if dpop { "1" } else { "0" },
         grants.join(",")
     )

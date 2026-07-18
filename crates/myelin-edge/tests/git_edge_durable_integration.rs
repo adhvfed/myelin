@@ -137,6 +137,8 @@ fn mint_as(cell: &CellTokenAuthority, tenant: &str, subject_key: &str, jti: &str
         exp_unix: now() + 3600,
         authority: vec!["agent:run".into()],
         dpop_jkt: None,
+        purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
+        audience: myelin_identity_service::CredentialAudience::Edge,
     })
 }
 
