@@ -3256,7 +3256,7 @@ impl Handler for DMerge {
                     &json!({
                         "error": {
                             "code": "merge_blocked",
-                            "message": "merge blocked by branch protection",
+                            "message": "merge blocked by policy: branch protection requirements are unmet",
                         },
                         "checks": checks,
                         "durable": true,
