@@ -311,7 +311,8 @@ pub use holder::{
     FlowHolderRegistration, RestrictSet, WfHistoryHolder, FLOW_OLTP_STORE,
 };
 pub use job::{
-    job_dispatch_marker, job_idem_token, JobKind, JobOutcome, JobRunner, JobSpec, JOB_DONE_SIGNAL,
+    job_dispatch_marker, job_idem_token, DispatchedJob, JobKind, JobOutcome, JobRunner, JobSpec,
+    JOB_DONE_SIGNAL,
 };
 pub use loopsafety::{
     CausalGuard, LoopVerdict, RefusalReason, ACTIVITY_POOL_CAP, CEILING, SHARED_ROOT_WINDOW_CAP,
@@ -333,8 +334,8 @@ pub use pg_drive_store::{
     PgFlowDriveStore, SignalKey, TimerArm,
 };
 pub use pg_dispatcher::{
-    configured_production_definitions, PgDriveBatch, PgFlowWorker, PgRunOnceOutcome, PgWorkerError,
-    PgWorkerScope, PgWorkflowBody, OPERATIONAL_PROBE_WF_TYPE,
+    configured_production_definitions, PgClaimedDriveInput, PgDriveBatch, PgFlowWorker,
+    PgRunOnceOutcome, PgWorkerError, PgWorkerScope, PgWorkflowBody, OPERATIONAL_PROBE_WF_TYPE,
 };
 pub use pg_executor::PgFlowExecutor;
 pub use remint::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenLease, RunTokenMinter};

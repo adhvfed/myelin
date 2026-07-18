@@ -107,7 +107,7 @@ async fn main() {
                 OPERATIONAL_PROBE_WF_TYPE,
                 1,
                 code_hash.as_str(),
-                |_ctx| Ok(Vec::new()),
+                |_input, _ctx| Ok(Vec::new()),
             ) {
                 eprintln!("myelin-flow: cannot register operational probe definition: {e}");
                 std::process::exit(1);

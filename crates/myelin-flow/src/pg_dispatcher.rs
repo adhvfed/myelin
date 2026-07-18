@@ -8,8 +8,8 @@
 use crate::engine::{run_state, DriveOutcome, SignalRow, SignalStore};
 use crate::executor::{ExecutorError, PARTITION_COUNT};
 use crate::pg_drive_store::{
-    ActivityAttemptWrite, CommitOutcome, DriveCommit, DriveLease, DriveStoreError, HistoryWrite,
-    PgFlowDriveStore, SignalKey, TimerArm,
+    ActivityAttemptWrite, CommitOutcome, DriveCommit, DriveLease, DriveSnapshot, DriveStoreError,
+    HistoryWrite, PgFlowDriveStore, SignalKey, TimerArm,
 };
 use crate::schema::{WfActivityAttemptRow, WfHistoryRow};
 use crate::{PgFlowExecutor, TimerStore, WfCtx};
@@ -26,8 +26,48 @@ const MAX_TOKEN_BYTES: usize = 512;
 const MAX_BATCH: usize = 1024;
 pub const OPERATIONAL_PROBE_WF_TYPE: &str = "myelin.flow.operational-probe";
 
-pub type PgWorkflowBody =
-    dyn Fn(&mut WfCtx) -> Result<Vec<ArtifactRef>, String> + Send + Sync + 'static;
+/// Immutable run data supplied to a PostgreSQL workflow body from the claimed drive. Product
+/// bodies receive their pinned input and causality here rather than reaching around `WfCtx` or
+/// capturing mutable dispatch state in their registration closure.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PgClaimedDriveInput {
+    pub tenant: TenantId,
+    pub region: Region,
+    pub run_id: String,
+    pub wf_type: String,
+    pub wf_version: i32,
+    pub input: Vec<ArtifactRef>,
+    pub budget: Option<serde_json::Value>,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub caused_by: Option<String>,
+    pub depth: i32,
+    pub partition: i16,
+}
+
+impl From<&DriveLease> for PgClaimedDriveInput {
+    fn from(lease: &DriveLease) -> Self {
+        Self {
+            tenant: lease.tenant.clone(),
+            region: lease.region.clone(),
+            run_id: lease.run_id.clone(),
+            wf_type: lease.wf_type.clone(),
+            wf_version: lease.wf_version,
+            input: lease.input.clone(),
+            budget: lease.budget.clone(),
+            correlation_id: lease.correlation_id.clone(),
+            causation_id: lease.causation_id.clone(),
+            caused_by: lease.caused_by.clone(),
+            depth: lease.depth,
+            partition: lease.partition,
+        }
+    }
+}
+
+pub type PgWorkflowBody = dyn Fn(&PgClaimedDriveInput, &mut WfCtx) -> Result<Vec<ArtifactRef>, String>
+    + Send
+    + Sync
+    + 'static;
 
 #[derive(Clone)]
 struct RegisteredBody {
@@ -290,7 +330,10 @@ impl PgFlowWorker {
         body: F,
     ) -> Result<(), PgWorkerError>
     where
-        F: Fn(&mut WfCtx) -> Result<Vec<ArtifactRef>, String> + Send + Sync + 'static,
+        F: Fn(&PgClaimedDriveInput, &mut WfCtx) -> Result<Vec<ArtifactRef>, String>
+            + Send
+            + Sync
+            + 'static,
     {
         self.executor
             .register_definition(wf_type, version, code_hash)?;
@@ -371,9 +414,13 @@ impl PgFlowWorker {
         self.store
             .renew_lease(lease, self.scope.lease_ttl_secs)
             .await?;
-        let snapshot = self.store.load_drive(lease).await?;
+        let DriveSnapshot {
+            run: claimed_run,
+            history: loaded_history,
+            pending_signals,
+        } = self.store.load_drive(lease).await?;
         let signals = SignalStore::new();
-        for pending in snapshot.pending_signals {
+        for pending in pending_signals {
             signals.deliver(SignalRow {
                 tenant: lease.tenant.clone(),
                 region: lease.region.clone(),
@@ -385,8 +432,7 @@ impl PgFlowWorker {
                 consumed_seq: None,
             });
         }
-        let history = snapshot
-            .history
+        let history = loaded_history
             .into_iter()
             .map(|row| WfHistoryRow {
                 tenant: lease.tenant.clone(),
@@ -410,6 +456,7 @@ impl PgFlowWorker {
             caused_by: lease.caused_by.clone().map(CausedBy),
         };
         let timers = TimerStore::new();
+        let drive_input = PgClaimedDriveInput::from(&claimed_run);
         let mut ctx = WfCtx::resume_staged_versioned(
             Arc::new(DriveIdMinter::new(&lease.run_id)),
             ctx_base,
@@ -428,7 +475,7 @@ impl PgFlowWorker {
         // heartbeats the exact owner+epoch lease. A body that outlives one TTL cannot commit under
         // stale authority; a failed renewal aborts the drive and the guarded release path runs.
         let mut body_task = tokio::task::spawn_blocking(move || {
-            let result = body(&mut ctx);
+            let result = body(&drive_input, &mut ctx);
             (ctx, result)
         });
         let renew_every = Duration::from_secs((self.scope.lease_ttl_secs as u64 / 3).max(1));
@@ -747,6 +794,37 @@ mod tests {
             configured_definitions_from(Some(format!("{OPERATIONAL_PROBE_WF_TYPE}@1"))).unwrap(),
             [(OPERATIONAL_PROBE_WF_TYPE.to_string(), 1)]
         );
+    }
+
+    #[test]
+    fn claimed_drive_input_projects_pinned_body_data_without_lease_authority() {
+        let lease = DriveLease {
+            tenant: TenantId("acme".into()),
+            region: Region("eu-north".into()),
+            run_id: "run-1".into(),
+            wf_type: "ci.pipeline".into(),
+            wf_version: 3,
+            input: vec![ArtifactRef("myelin://acme/ci/run/1".into())],
+            budget: Some(serde_json::json!({"minor_units": 42})),
+            correlation_id: "corr-1".into(),
+            causation_id: Some("cause-1".into()),
+            caused_by: Some("event-1".into()),
+            depth: 2,
+            partition: 7,
+            cursor: 4,
+            lease_owner: "worker-secret".into(),
+            lease_epoch: 9,
+            lease_expires_unix_ms: 123_000,
+            created_at_rfc3339: "2026-07-18T00:00:00Z".into(),
+        };
+
+        let input = PgClaimedDriveInput::from(&lease);
+        assert_eq!(input.run_id, "run-1");
+        assert_eq!(input.wf_version, 3);
+        assert_eq!(input.input, lease.input);
+        assert_eq!(input.budget, lease.budget);
+        assert_eq!(input.correlation_id, "corr-1");
+        assert_eq!(input.partition, 7);
     }
 
     #[test]
