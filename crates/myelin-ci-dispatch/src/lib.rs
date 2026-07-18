@@ -88,7 +88,7 @@ pub use dispatch::{
 
 pub use resolve::{
     reserve_and_start, resolve_snapshot, snapshot_ref, CheckContext, CiDefinition, CiRunWrite,
-    JobDef, JobKind, ResolveError, ResolvedJob, ResolvedSnapshot, RunFacts, StartHandoff,
+    JobDef, JobKind, ResolveError, ResolvedJob, ResolvedSnapshot, ResolvedSnapshotExt, RunFacts, StartHandoff,
     StartSpec, CI_PIPELINE_WF_TYPE,
 };
 
