@@ -15,26 +15,27 @@
 //!
 //! **DURABLE-BY-DEFAULT (MR-009b W3b.6 / SI-007):** the outbox the relay drains is the PG-backed
 //! `outbox` table (`OutboxStore::durable(PgOutboxBacking)`) over the MR-022 `SubstrateProvider`
-//! pool, with the substrate foundation migrations (`outbox` + `consumer_dedup`) applied at boot —
+//! runtime pool, after a privileged migration pool applies the complete schema and is destroyed —
 //! committed events survive a process restart. **FAIL LOUD on missing durable config** (the W3b.4
-//! service-main pattern): a missing `DATABASE_URL`, an unreachable pool, or a failed foundation
-//! migration each exit non-zero — NEVER a silent in-memory fallback (the in-memory
+//! service-main pattern): missing/distinct `DATABASE_URL` and `DATABASE_MIGRATION_URL`, an
+//! unreachable pool, or a failed migration each exit non-zero — NEVER a silent in-memory fallback
+//! (the in-memory
 //! `OutboxStore::new()` is `test-support`-gated and does not even compile here).
 //!
 //! The runtime is the multi-thread `#[tokio::main]` flavor (required): the sync
 //! `DurableOutboxBacking` verbs bridge to async sqlx via `block_in_place` + `block_on`, which
 //! panics on a current-thread runtime.
 //!
-//! **Floor:** the env-first `Config::from_env()` parse for the substrate AppSpec config lands with
-//! the driver (P-S15); the shell boots over the validated default (the durable config THIS root
-//! depends on is the PG DSN, required explicitly above). The per-table behaviour (the scheduler
+//! **Floor:** the substrate AppSpec config still uses its validated default, while every production
+//! endpoint and both PostgreSQL roles are explicit through `Mode::RequireEnv`. The per-table
+//! behaviour (the scheduler
 //! claim, the check emitter, the log index, the metering) is the CI-P12..CI-P24 surface — this
 //! shell runs no job yet.
 
 use myelin_ci_controlplane::run_controlplane;
-use myelin_config::{Mode, MyelinConfig};
+use myelin_config::Mode;
 use myelin_events::OutboxStore;
-use myelin_storage::{all_durable_migrations, HotTables, PgOutboxBacking, SubstrateProvider};
+use myelin_storage::{all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking};
 use myelin_substrate::Config;
 use std::sync::Arc;
 
@@ -54,29 +55,13 @@ fn runner_hooks() -> myelin_ci_sandbox::RunnerHooks {
 
 #[tokio::main]
 async fn main() {
-    // FAIL LOUD on missing durable config (the W3b.4 pattern): the durable outbox requires the PG
-    // DSN. No DATABASE_URL → refuse to boot (exit non-zero) — never a silent in-memory fallback.
-    if std::env::var("DATABASE_URL")
-        .map(|v| v.trim().is_empty())
-        .unwrap_or(true)
-    {
-        eprintln!(
-            "ci-controlplane: DATABASE_URL is required (durable-by-default outbox, MR-009b \
-             W3b.6): refusing to boot without durable config — there is no in-memory fallback"
-        );
-        std::process::exit(1);
-    }
-    let config = MyelinConfig::from_env(Mode::DevDefaults).unwrap_or_else(|e| {
-        eprintln!("ci-controlplane: invalid config: {e}");
-        std::process::exit(1);
-    });
-    let provider = match SubstrateProvider::connect(config, 8).await {
-        Ok(p) => p,
+    // Production is strict: validate every endpoint plus distinct migration/runtime PostgreSQL
+    // roles before any DDL, durable store, reaper, runner, or listener can be created. `PgBootstrap`
+    // alone owns the privileged pool.
+    let bootstrap = match PgBootstrap::from_env(Mode::RequireEnv).await {
+        Ok(bootstrap) => bootstrap,
         Err(e) => {
-            eprintln!(
-                "ci-controlplane: cannot reach the durable OLTP pool (durable-by-default \
-                 requires PG): {e}"
-            );
+            eprintln!("ci-controlplane: database bootstrap refused to start: {e}");
             std::process::exit(1);
         }
     };
@@ -84,7 +69,7 @@ async fn main() {
     // before the durable store binds — applied through the MR-022 migrator (idempotent,
     // forward-only, advisory-locked). Only the foundation set is applied here: the tables THIS
     // root's durable path needs, never a silently-widened migration surface.
-    if let Err(e) = provider.migrate_foundation().await {
+    if let Err(e) = bootstrap.migrate_foundation().await {
         eprintln!(
             "ci-controlplane: cannot apply the substrate foundation migrations \
              (outbox/consumer_dedup): {e}"
@@ -97,29 +82,35 @@ async fn main() {
     // tables on a fresh DB (doc-18: a main that migrated only a piecemeal subset left the stores it
     // constructs writing to un-migrated tables). Idempotent + advisory-locked (safe on re-boot);
     // FAIL LOUD, never a silent fallback.
-    if let Err(e) = provider
+    if let Err(e) = bootstrap
         .migrate(&all_durable_migrations(), &HotTables::none())
         .await
     {
         eprintln!("ci-controlplane: cannot apply the durable migration aggregate (identity/pseudonym/placement/kms/cost/erasure): {e}");
         std::process::exit(1);
     }
-    // CT-004m — apply the SHARED CI durable writer subset (`ci_run` + `check_attempt` + `ci_cost_event`)
-    // at boot, BEFORE the cost store is constructed and independent of `serve(AppSpec)` order. This is
-    // the SAME forward-only set (same ids/DDL) `serve` applies as part of the full 14-table
-    // `ci_controlplane_migrations`, so the overlap no-ops (idempotent, advisory-locked). ci-dispatch
-    // applies the identical set at its boot, so the writer tables exist regardless of which CI service
-    // boots first (breaking the former boot-order coupling). FAIL LOUD.
-    if let Err(e) = provider
+    // Apply the COMPLETE Controlplane-owned schema through the privileged pool. The AppSpec still
+    // declares this exact set for lifecycle/model checks, but production cannot defer real SQL until
+    // after cost stores, the reaper, or an optional runner have already been constructed.
+    if let Err(e) = bootstrap
         .migrate(
-            &myelin_ci_controlplane::ci_durable_migrations(),
-            &myelin_ci_controlplane::ci_durable_hot_tables(),
+            &myelin_ci_controlplane::ci_controlplane_migrations(),
+            &myelin_ci_controlplane::ci_controlplane_hot_tables(),
         )
         .await
     {
-        eprintln!("ci-controlplane: cannot apply the shared CI durable migrations (ci_run/check_attempt/ci_cost_event): {e}");
+        eprintln!("ci-controlplane: cannot apply the complete Controlplane migrations: {e}");
         std::process::exit(1);
     }
+    // Re-probe the constrained runtime role, close the privileged pool, and erase its DSN before
+    // any runtime query/store/reaper/runner/listener is created.
+    let provider = match bootstrap.into_runtime().await {
+        Ok(provider) => provider,
+        Err(e) => {
+            eprintln!("ci-controlplane: database runtime handoff refused to start: {e}");
+            std::process::exit(1);
+        }
+    };
     // #11 — BOOT-TIME SHAPE ASSERTION on the money table. `CREATE TABLE IF NOT EXISTS` above no-ops on
     // a pre-existing (possibly pre-CT-004m mis-shaped) `ci_cost_event`, so assert the columns/types are
     // the CI metering-projection shape before the settle path can write money data. FAIL LOUD.
