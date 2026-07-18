@@ -200,7 +200,7 @@ fn ci_dispatch_self_hosted_token_is_bounded_to_its_tenants_ci() {
     // MR-012: the minted token is a REAL signed PASETO token; read its grants via the verify
     // round-trip through the provider's cell trust anchor, not a plaintext substring.
     let minted = svc
-        .introspect_run_token("per_job", &token)
+        .introspect_run_token_at("per_job", &token, &Timestamp("2026-06-22T00:00:01Z".into()))
         .expect("a minted self-hosted token verifies through the real cell trust anchor (MR-012)")
         .authority;
     assert!(

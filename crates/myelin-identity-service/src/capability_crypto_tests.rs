@@ -68,6 +68,14 @@ fn with_dpop(material: &str, proof: &str) -> String {
     )
 }
 
+fn mint_raw_claims(cell: &CellTokenAuthority, claims: serde_json::Value) -> String {
+    let bytes = serde_json::to_vec(&claims).unwrap();
+    let paseto = paseto_v4_public_sign(&cell.signing_key, &bytes);
+    let signature = paseto_root_signature(&paseto).unwrap();
+    let tail = macaroon_root_tag(&cell.mac_key, &signature);
+    encode_material(&paseto, &[], &tail, None)
+}
+
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 // POSITIVES
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -91,6 +99,48 @@ fn positive_signed_token_verifies() {
     assert!(token.authority.holds("repo:acme/web#read"));
     assert!(token.authority.holds("repo:acme/web#write"));
     assert!(!token.dpop_bound);
+}
+
+#[test]
+fn signed_purpose_must_match_the_transport_selected_machine_kind() {
+    let c = cell();
+    let mut ci = spec("acme", &["ci.checks.report"], None);
+    ci.purpose = CredentialPurpose::CiJob {
+        run_id: "ci-run-1".into(),
+    };
+    let material = c.mint(&ci);
+    assert!(verifier(c.trust_anchor())
+        .verify_material(&material, MachineKind::Ci)
+        .is_ok());
+    assert!(matches!(
+        verifier(c.trust_anchor()).verify_material(&material, MachineKind::Agent),
+        Err(AuthzError::FailClosed(_))
+    ));
+}
+
+#[test]
+fn purpose_less_legacy_capability_is_refused_with_rebootstrap_guidance() {
+    let c = cell();
+    let material = mint_raw_claims(
+        &c,
+        serde_json::json!({
+            "tenant": "acme",
+            "region": "eu-west",
+            "sub": "subj-1",
+            "jti": "legacy-jti",
+            "exp": NOW + 300,
+            "aud": "edge",
+            "auth": ["edge.operator"]
+        }),
+    );
+    let error = verifier(c.trust_anchor())
+        .verify_material(&material, MachineKind::Agent)
+        .expect_err("purpose-less legacy credentials are ambiguous");
+    assert!(matches!(
+        error,
+        AuthzError::FailClosed(message)
+            if message.contains("re-mint/re-bootstrap")
+    ));
 }
 
 /// **A correctly-attenuated child verifies with the NARROWED authority (offline, no secrets).** The
@@ -447,8 +497,10 @@ fn signer_verifier_seam_round_trip() {
         "eu-west",
         "svc:agent",
         "runtok:1",
-        "run:1",
-        Some(42),
+        &CredentialPurpose::AgentRun {
+            run_id: "run:1".into(),
+            delegation_snapshot: Some(42),
+        },
         &myelin_events::Timestamp("2023-11-14T22:18:20Z".into()),
         &["agent:run"],
     );
@@ -490,8 +542,10 @@ fn signer_malformed_run_deadline_produces_unusable_token() {
         "eu-west",
         "svc:agent",
         "runtok:bad-exp",
-        "run:bad-exp",
-        Some(42),
+        &CredentialPurpose::AgentRun {
+            run_id: "run:bad-exp".into(),
+            delegation_snapshot: Some(42),
+        },
         &myelin_events::Timestamp("not-a-deadline".into()),
         &["repo.pull"],
     );

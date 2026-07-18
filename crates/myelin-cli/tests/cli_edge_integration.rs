@@ -22,8 +22,7 @@
 use myelin_edge::{register_git, serve_edge, AllowAll, Gateway, GitEdgeState, Method, WhoamiHandler};
 use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
-    CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
-    PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
+    CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator, PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
 };
 use myelin_storage::{KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
@@ -43,11 +42,7 @@ fn now() -> i64 {
 
 fn admin_scope(tenant: &str) -> TenantScope {
     TenantScope::from_verified_token(
-        &myelin_identity::Principal::stub(
-            PrincipalId("admin".into()),
-            PrincipalKind::Human,
-            TenantId(tenant.into()),
-        ),
+        &myelin_identity::Principal::stub(PrincipalId("admin".into()), PrincipalKind::Human, TenantId(tenant.into())),
         Region(REGION.into()),
     )
 }
@@ -82,17 +77,10 @@ fn build() -> (Arc<Gateway>, CellTokenAuthority) {
         Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
         RevocationStore::new(),
     ));
-    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(
-        KmsEngine::new(),
-    ))));
+    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(KmsEngine::new()))));
 
     let git_state = Arc::new(GitEdgeState::new().seed_demo("acme"));
-    let mut builder = Gateway::builder(authn, human_login, Arc::new(AllowAll)).route(
-        Method::Get,
-        "/v1/whoami",
-        "edge.whoami",
-        Arc::new(WhoamiHandler),
-    );
+    let mut builder = Gateway::builder(authn, human_login, Arc::new(AllowAll)).route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler));
     builder = register_git(builder, git_state);
     (Arc::new(builder.build()), cell)
 }
@@ -104,7 +92,7 @@ fn mint(cell: &CellTokenAuthority, tenant: &str, jti: &str) -> String {
         subject_key: "subj-1".into(),
         jti: jti.into(),
         exp_unix: now() + 3600,
-        authority: vec!["agent:run".into()],
+        authority: vec!["edge.operator".into()],
         dpop_jkt: None, // an UNBOUND per-run token (the CLI's posture).
         purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
         audience: myelin_identity_service::CredentialAudience::Edge,
@@ -156,8 +144,7 @@ async fn git_repo_list_end_to_end_renders_the_viewmodel() {
     let token = mint(&cell, "acme", "jti-e2e");
 
     // Human form: one line per repo (the seeded demo tenant has the `acme/myelin` repo).
-    let (code, stdout, stderr) =
-        run_cli(&edge, Some(&token), &["git", "repo", "list"]);
+    let (code, stdout, stderr) = run_cli(&edge, Some(&token), &["git", "repo", "list"]);
     assert_eq!(code, 0, "exit 0 on success; stderr={stderr}");
     assert!(
         stdout.contains("acme/myelin") && stdout.contains("[populated]"),

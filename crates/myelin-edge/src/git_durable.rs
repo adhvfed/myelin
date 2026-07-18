@@ -513,7 +513,8 @@ impl DurableGitBackend {
             return Ok(None);
         };
         let repo = self.store.open_repo(&loc)?;
-        let Some(diff) = repo.pr_diff(&rec.base_ref, &rec.head_oid, PR_DIFF_PER_FILE_LINE_CAP)? else {
+        let Some(diff) = repo.pr_diff(&rec.base_ref, &rec.head_oid, PR_DIFF_PER_FILE_LINE_CAP)?
+        else {
             // A malformed/absent head oid — an honest empty diff (the UI renders the empty state, not
             // an error): no files, the base_ref labelled, three_dot false.
             return Ok(Some(PrDiffVM {
@@ -580,7 +581,12 @@ impl DurableGitBackend {
     /// The enriched RepoHomeVM (`GET /repos/{repo}`) — default_branch, full README, latest_commit,
     /// per-entry latest-commit (ONE bounded walk), branch/tag counts, name-carrying entries. Built from
     /// the durable on-disk state; `NotFound` (404) if the repo is absent under the verified tenant.
-    fn repo_home_json(&self, tenant: &str, region: &str, slug: &str) -> Result<Value, DurableError> {
+    fn repo_home_json(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+    ) -> Result<Value, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc)?; // NotFound → 404 (0-leak)
         let full_slug = format!("{tenant}/{slug}");
@@ -757,16 +763,25 @@ impl DurableGitBackend {
     ) -> Result<EdgeResponse, EdgeError> {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc).map_err(map_durable_err)?;
-        let (bytes, is_binary) = match repo.read_blob_at_path(gitref, path).map_err(map_durable_err)? {
-            BlobPathLookup::Found { bytes, is_binary, .. } => (bytes, is_binary),
+        let (bytes, is_binary) = match repo
+            .read_blob_at_path(gitref, path)
+            .map_err(map_durable_err)?
+        {
+            BlobPathLookup::Found {
+                bytes, is_binary, ..
+            } => (bytes, is_binary),
             BlobPathLookup::IsDir => {
-                return Err(EdgeError::BadRequest("path is a directory, not a file".into()))
+                return Err(EdgeError::BadRequest(
+                    "path is a directory, not a file".into(),
+                ))
             }
             BlobPathLookup::Missing => {
                 return Err(EdgeError::NotFound("no such file at that ref".into()))
             }
             BlobPathLookup::TooLarge { .. } => {
-                return Err(EdgeError::Internal("unbounded blob read returned TooLarge".into()))
+                return Err(EdgeError::Internal(
+                    "unbounded blob read returned TooLarge".into(),
+                ))
             }
         };
         // A conservative content-type: text stays `text/plain; charset=utf-8` (never executed),
@@ -903,11 +918,11 @@ impl DurableGitBackend {
     ) -> Result<PrRecord, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc)?; // 404 if the repo is absent
-                                     // The PR-open body carries ONLY the proposal (base/head/head_oid/draft) — NEVER branch-protection
-                                     // POLICY (required set / approval threshold) or check FACTS (greens). Policy is repo-owned (set
-                                     // via the repo-admin branch-protection op); facts are set by authorized producers (the CI
-                                     // check-report op, the review op, the endorse op). This is the GT-003 bypass fix: a PR author
-                                     // cannot weaken the gate by supplying loose policy or self-claimed greens at open.
+                                                // The PR-open body carries ONLY the proposal (base/head/head_oid/draft) — NEVER branch-protection
+                                                // POLICY (required set / approval threshold) or check FACTS (greens). Policy is repo-owned (set
+                                                // via the repo-admin branch-protection op); facts are set by authorized producers (the CI
+                                                // check-report op, the review op, the endorse op). This is the GT-003 bypass fix: a PR author
+                                                // cannot weaken the gate by supplying loose policy or self-claimed greens at open.
         let base_ref = body
             .get("base_ref")
             .and_then(Value::as_str)
@@ -941,12 +956,10 @@ impl DurableGitBackend {
                 Some(tip) => tip.0,
                 // 400 at OPEN (map_durable_err routes a "missing" `Git` error to BadRequest) — never a
                 // stored empty head that wedges the merge dialog with a confusing error later.
-                None => {
-                    return Err(DurableError::Git(format!(
-                        "open-PR head_ref `{head_ref}` does not exist in the repo — no branch tip to \
+                None => return Err(DurableError::Git(format!(
+                    "open-PR head_ref `{head_ref}` does not exist in the repo — no branch tip to \
                          open against (missing head)"
-                    )))
-                }
+                ))),
             }
         } else {
             head_oid
@@ -1445,9 +1458,9 @@ impl DurableGitBackend {
         let key = Self::pr_object_key(slug, number);
         let body_md = require_body_md(body)?;
         let author = Self::thread_principal(tenant, principal);
-        let comment = self
-            .threads
-            .add_comment(&loc, &key, thread_id, author, body_md, now_unix())?;
+        let comment =
+            self.threads
+                .add_comment(&loc, &key, thread_id, author, body_md, now_unix())?;
         self.bump_pr_updated(&loc, number);
         Ok(comment_json(&comment))
     }
@@ -1465,8 +1478,12 @@ impl DurableGitBackend {
         let loc = Self::loc(tenant, region, slug);
         self.require_pr(&loc, number)?;
         let key = Self::pr_object_key(slug, number);
-        let resolved = body.get("resolved").and_then(Value::as_bool).unwrap_or(true);
-        self.threads.resolve_thread(&loc, &key, thread_id, resolved)?;
+        let resolved = body
+            .get("resolved")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        self.threads
+            .resolve_thread(&loc, &key, thread_id, resolved)?;
         Ok(json!({ "thread_id": thread_id, "resolved": resolved }))
     }
 
@@ -1543,7 +1560,9 @@ impl DurableGitBackend {
             }
             Some("commented") | Some("comment") | None => BatchVerdict::Commented,
             Some(other) => {
-                return Err(DurableError::Git(format!("unknown review verdict `{other}`")))
+                return Err(DurableError::Git(format!(
+                    "unknown review verdict `{other}`"
+                )))
             }
         };
         let summary_md = body
@@ -1999,9 +2018,7 @@ impl DurableGitBackend {
     /// keeps it O(cap); the count is exact for dogfood-scale PRs (the named floor is `cap+`).
     fn commits_in_pr_count(&self, loc: &RepoLoc, rec: &PrRecord) -> Option<(u64, bool)> {
         let repo = self.store.open_repo(loc).ok()?;
-        let (rows, has_more) = repo
-            .commits_in_pr(&rec.base_ref, &rec.head_oid, 500)
-            .ok()?;
+        let (rows, has_more) = repo.commits_in_pr(&rec.base_ref, &rec.head_oid, 500).ok()?;
         Some((rows.len() as u64, has_more))
     }
 }
@@ -2508,7 +2525,10 @@ impl Handler for DCommitLog {
             "offset": offset,
             "range": { "from": range_from, "to": range_to },
         });
-        Ok(EdgeResponse::json(200, &json!({ "items": items, "page": page })))
+        Ok(EdgeResponse::json(
+            200,
+            &json!({ "items": items, "page": page }),
+        ))
     }
 }
 
@@ -2722,11 +2742,12 @@ impl Handler for DPrCommits {
         let (metas, has_more) = repo
             .commits_in_pr(&rec.base_ref, &rec.head_oid, ctx.page.limit.min(500))
             .map_err(map_durable_err)?;
-        let items: Vec<Value> = metas
-            .into_iter()
-            .map(|m| commit_row(m).to_json())
-            .collect();
-        let next = if has_more { Some("more".to_string()) } else { None };
+        let items: Vec<Value> = metas.into_iter().map(|m| commit_row(m).to_json()).collect();
+        let next = if has_more {
+            Some("more".to_string())
+        } else {
+            None
+        };
         Ok(EdgeResponse::json(
             200,
             &page_envelope(json!(items), next, ctx.page.limit),
@@ -3017,7 +3038,10 @@ impl Handler for DPrChecks {
             .get(&loc, num_param(ctx, "n")?)
             .map_err(map_durable_err)?
             .ok_or_else(|| EdgeError::NotFound("no such pull request".into()))?;
-        let vm = self.be.pr_checks_json(&loc, &rec).map_err(map_durable_err)?;
+        let vm = self
+            .be
+            .pr_checks_json(&loc, &rec)
+            .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(200, &vm))
     }
 }
@@ -3092,10 +3116,14 @@ impl Handler for DRepoPrList {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let all = self
             .be
-            .list_prs_for_repo(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?, ctx.principal)
+            .list_prs_for_repo(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+                ctx.principal,
+            )
             .map_err(map_durable_err)?;
-        let viewer =
-            DurableGitBackend::pseudonym(tenant_of(ctx), ctx.principal);
+        let viewer = DurableGitBackend::pseudonym(tenant_of(ctx), ctx.principal);
         // Counts over the FULL (already leak-free) set — never a post-filtered subset.
         let count = |pred: &dyn Fn(&EnrichedPr) -> bool| all.iter().filter(|e| pred(e)).count();
         let counts = json!({
@@ -3368,11 +3396,11 @@ impl Handler for RepoObjectGuard {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let slug = param(ctx, "repo")?;
         let loc = RepoLoc::new(tenant_of(ctx), region_of(ctx), slug);
-        if !self
-            .be
-            .repo_authorizer()
-            .authorize_repo_permission(ctx.principal, &loc, self.permission)
-        {
+        if !self.be.repo_authorizer().authorize_repo_permission(
+            ctx.principal,
+            &loc,
+            self.permission,
+        ) {
             return Err(match self.permission {
                 // The 0-leak read posture (the wire's `map_wire_err` convention): an un-granted
                 // reader learns nothing an absent repo would not also say.
@@ -3482,7 +3510,11 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
             // The X-1 endorsement: the DISTINCT approve_untrusted_ci relation (never collapsed to
             // write — endorsing an untrusted fork run is its own trust decision).
             (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/endorse-fork-ci") => (
-                guarded(&be, ApproveUntrustedCi, Arc::new(DEndorse { be: be.clone() })),
+                guarded(
+                    &be,
+                    ApproveUntrustedCi,
+                    Arc::new(DEndorse { be: be.clone() }),
+                ),
                 "git.pr.endorse_fork_ci",
             ),
             // Merge: `pull_request.merge = parent_repo->protected_push` (§5-frozen) — the guard
@@ -3711,7 +3743,10 @@ mod create_compensation_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("myelin-compensation-{tag}-{}-{nanos}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "myelin-compensation-{tag}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 
     /// A recording bootstrap double: counts grant/revoke calls and records the (creator, slug) each
@@ -3759,8 +3794,7 @@ mod create_compensation_tests {
     fn successful_create_grants_and_does_not_revoke() {
         let root = temp_root("ok");
         let boot = Arc::new(RecordingBootstrap::default());
-        let be = DurableGitBackend::rooted_inmem_for_test(&root)
-            .with_repo_bootstrap(boot.clone());
+        let be = DurableGitBackend::rooted_inmem_for_test(&root).with_repo_bootstrap(boot.clone());
         let creator = principal("svc:creator", "acme");
 
         let created = be
@@ -3782,8 +3816,7 @@ mod create_compensation_tests {
         let root = temp_root("fail");
         block_on_disk_create(&root, "acme", "fr-par");
         let boot = Arc::new(RecordingBootstrap::default());
-        let be = DurableGitBackend::rooted_inmem_for_test(&root)
-            .with_repo_bootstrap(boot.clone());
+        let be = DurableGitBackend::rooted_inmem_for_test(&root).with_repo_bootstrap(boot.clone());
         let creator = principal("svc:creator", "acme");
 
         let err = be
@@ -3819,14 +3852,17 @@ mod create_compensation_tests {
             revoke_fails: true,
             ..Default::default()
         });
-        let be = DurableGitBackend::rooted_inmem_for_test(&root)
-            .with_repo_bootstrap(boot.clone());
+        let be = DurableGitBackend::rooted_inmem_for_test(&root).with_repo_bootstrap(boot.clone());
         let creator = principal("svc:creator", "acme");
 
         let err = be
             .create_repo_as("acme", "fr-par", "widgets", &creator)
             .expect_err("create fails");
-        assert_eq!(boot.revokes.lock().unwrap().len(), 1, "compensation was attempted");
+        assert_eq!(
+            boot.revokes.lock().unwrap().len(),
+            1,
+            "compensation was attempted"
+        );
         let msg = err.to_string();
         assert!(
             msg.contains("ORPHANED") && msg.contains("compensation error"),
@@ -3841,8 +3877,7 @@ mod create_compensation_tests {
     fn existing_repo_neither_grants_nor_revokes() {
         let root = temp_root("exists");
         let boot = Arc::new(RecordingBootstrap::default());
-        let be = DurableGitBackend::rooted_inmem_for_test(&root)
-            .with_repo_bootstrap(boot.clone());
+        let be = DurableGitBackend::rooted_inmem_for_test(&root).with_repo_bootstrap(boot.clone());
         let creator = principal("svc:creator", "acme");
         assert!(be
             .create_repo_as("acme", "fr-par", "widgets", &creator)
@@ -3851,7 +3886,11 @@ mod create_compensation_tests {
         assert!(!be
             .create_repo_as("acme", "fr-par", "widgets", &creator)
             .unwrap());
-        assert_eq!(boot.grants.lock().unwrap().len(), 1, "granted only on the first create");
+        assert_eq!(
+            boot.grants.lock().unwrap().len(),
+            1,
+            "granted only on the first create"
+        );
         assert!(boot.revokes.lock().unwrap().is_empty(), "no compensation");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -3884,7 +3923,10 @@ mod pr_list_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("myelin-prlist-{tag}-{}-{nanos}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "myelin-prlist-{tag}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 
     fn human(id: &str) -> Principal {
@@ -3912,12 +3954,7 @@ mod pr_list_tests {
     }
 
     /// Drive a list handler with a viewer + query string, returning the parsed JSON body.
-    fn serve(
-        handler: &dyn Handler,
-        viewer: &Principal,
-        repo: Option<&str>,
-        query: &str,
-    ) -> Value {
+    fn serve(handler: &dyn Handler, viewer: &Principal, repo: Option<&str>, query: &str) -> Value {
         let scope = TenantScope::from_verified_token(viewer, viewer.region.clone());
         let mut params = BTreeMap::new();
         if let Some(r) = repo {
@@ -3925,7 +3962,9 @@ mod pr_list_tests {
         }
         let req = EdgeRequest::new("GET", "/v1/git/prs", query, vec![], vec![]);
         let page = Page::from_request(&req);
+        let identity = crate::catalogue::test_request_identity(viewer, &scope);
         let ctx = HandlerCtx {
+            identity: &identity,
             principal: viewer,
             scope: &scope,
             params: &params,
@@ -3945,8 +3984,8 @@ mod pr_list_tests {
     fn forged_max_cursor_yields_empty_page_never_panics() {
         let root = temp_root("forged-cursor");
         let authz = GrantBackedRepos::new().grant_read("u:viewer", TENANT, "core");
-        let be = DurableGitBackend::rooted_inmem_for_test(&root)
-            .with_repo_authorizer(Arc::new(authz));
+        let be =
+            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
         let viewer = human("u:viewer");
         open_pr(&be, "core", "Only PR", &viewer);
         let handler = DRepoPrList { be: Arc::new(be) };
@@ -3956,8 +3995,15 @@ mod pr_list_tests {
             Some("core"),
             &format!("state=all&cursor={}", usize::MAX),
         );
-        assert_eq!(body["items"].as_array().unwrap().len(), 0, "past-the-end page is empty");
-        assert!(body["page"]["next_cursor"].is_null(), "no next past the end");
+        assert_eq!(
+            body["items"].as_array().unwrap().len(),
+            0,
+            "past-the-end page is empty"
+        );
+        assert!(
+            body["page"]["next_cursor"].is_null(),
+            "no next past the end"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -3984,7 +4030,9 @@ mod pr_list_tests {
             "head_ref": "refs/heads/feature",
             "head_oid": "0".repeat(40),
         });
-        assert!(be.open_pr(TENANT, REGION, "core", &ok_body, &author).is_ok());
+        assert!(be
+            .open_pr(TENANT, REGION, "core", &ok_body, &author)
+            .is_ok());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -3997,8 +4045,8 @@ mod pr_list_tests {
         let root = temp_root("cross-leak");
         // Viewer is granted `read` on `alpha` only; `beta` is invisible to them.
         let authz = GrantBackedRepos::new().grant_read("u:viewer", TENANT, "alpha");
-        let be = DurableGitBackend::rooted_inmem_for_test(&root)
-            .with_repo_authorizer(Arc::new(authz));
+        let be =
+            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
         let viewer = human("u:viewer");
         // The viewer AUTHORS a PR in BOTH repos (so the bucket predicate `yours` WOULD match beta if
         // the prefilter leaked).
@@ -4024,8 +4072,8 @@ mod pr_list_tests {
     fn per_repo_list_rows_titles_and_counts() {
         let root = temp_root("per-repo");
         let authz = GrantBackedRepos::new().grant_read("u:viewer", TENANT, "core");
-        let be = DurableGitBackend::rooted_inmem_for_test(&root)
-            .with_repo_authorizer(Arc::new(authz));
+        let be =
+            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
         let viewer = human("u:viewer");
         open_pr(&be, "core", "First PR", &viewer);
         open_pr(&be, "core", "Second PR", &viewer);
@@ -4045,7 +4093,10 @@ mod pr_list_tests {
         // A tab with no matches returns zero rows but the counts are unchanged (no under-count).
         let merged = serve(&handler, &viewer, Some("core"), "state=merged");
         assert_eq!(merged["items"].as_array().unwrap().len(), 0);
-        assert_eq!(merged["counts"]["open"], 2, "the Open badge still reads 2 on the Merged tab");
+        assert_eq!(
+            merged["counts"]["open"], 2,
+            "the Open badge still reads 2 on the Merged tab"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -4056,8 +4107,8 @@ mod pr_list_tests {
     fn per_repo_list_cursor_is_stable_and_bidirectional() {
         let root = temp_root("cursor");
         let authz = GrantBackedRepos::new().grant_read("u:viewer", TENANT, "core");
-        let be = DurableGitBackend::rooted_inmem_for_test(&root)
-            .with_repo_authorizer(Arc::new(authz));
+        let be =
+            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
         let viewer = human("u:viewer");
         for i in 1..=5 {
             open_pr(&be, "core", &format!("PR {i}"), &viewer);
@@ -4072,12 +4123,22 @@ mod pr_list_tests {
         assert_eq!(p1["page"]["next_cursor"], "2");
 
         // Page 2: prev = "0", next = "4".
-        let p2 = serve(&handler, &viewer, Some("core"), "state=all&limit=2&cursor=2");
+        let p2 = serve(
+            &handler,
+            &viewer,
+            Some("core"),
+            "state=all&limit=2&cursor=2",
+        );
         assert_eq!(p2["page"]["prev_cursor"], "0");
         assert_eq!(p2["page"]["next_cursor"], "4");
 
         // Page 3 (tail): 1 row, next None.
-        let p3 = serve(&handler, &viewer, Some("core"), "state=all&limit=2&cursor=4");
+        let p3 = serve(
+            &handler,
+            &viewer,
+            Some("core"),
+            "state=all&limit=2&cursor=4",
+        );
         assert_eq!(p3["items"].as_array().unwrap().len(), 1);
         assert!(p3["page"]["next_cursor"].is_null(), "tail has no Older");
 
@@ -4114,9 +4175,15 @@ mod pr_list_tests {
             repo_slug: Some("core".into()),
         };
         let row = DurableGitBackend::pr_list_row_json(&enriched);
-        assert!(row["title"].is_null(), "empty title → null (the #number fallback is honest)");
+        assert!(
+            row["title"].is_null(),
+            "empty title → null (the #number fallback is honest)"
+        );
         assert_eq!(row["number"], 9);
-        assert_eq!(row["checks_summary"]["verdict"], "unavailable", "fails static, still lists");
+        assert_eq!(
+            row["checks_summary"]["verdict"], "unavailable",
+            "fails static, still lists"
+        );
         assert_eq!(row["updated_at"], Value::Null);
     }
 
@@ -4134,20 +4201,30 @@ mod pr_list_tests {
             url.ends_with("/acme/eu-west/widgets.git"),
             "the wire path grammar is /{{tenant}}/{{region}}/{{repo}}.git — got {url}"
         );
-        assert!(!url.contains("ssh://"), "no ssh scheme (there is no SSH server): {url}");
+        assert!(
+            !url.contains("ssh://"),
+            "no ssh scheme (there is no SSH server): {url}"
+        );
         assert!(!url.contains("git@myelin"), "no fabricated ssh host: {url}");
 
         // End-to-end through the repo-home projection (an empty repo still advertises the URL).
         let author = human("u:author");
-        be.create_repo_as(TENANT, REGION, "widgets", &author).unwrap();
+        be.create_repo_as(TENANT, REGION, "widgets", &author)
+            .unwrap();
         let loc = DurableGitBackend::loc(TENANT, REGION, "widgets");
         let repo = be.store.open_repo(&loc).expect("open repo");
         let advertised = match be.repo_home(TENANT, REGION, "widgets", &repo) {
             RepoHome::Empty { clone_url, .. } | RepoHome::Populated { clone_url, .. } => clone_url,
             other => panic!("a fresh repo projects an Empty/Populated home, got {other:?}"),
         };
-        assert!(advertised.ends_with("/acme/eu-west/widgets.git"), "got {advertised}");
-        assert!(!advertised.contains("ssh://"), "no ssh in the projection: {advertised}");
+        assert!(
+            advertised.ends_with("/acme/eu-west/widgets.git"),
+            "got {advertised}"
+        );
+        assert!(
+            !advertised.contains("ssh://"),
+            "no ssh in the projection: {advertised}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -4169,8 +4246,14 @@ mod pr_list_tests {
         let tip = repo
             .write_commit(&tree, &[], "seed", "psn@acme.noreply", "psn@acme.noreply")
             .expect("commit");
-        repo.update_ref_cas("refs/heads/feature", None, Some(&tip), "create", "psn@acme.noreply")
-            .expect("create feature ref");
+        repo.update_ref_cas(
+            "refs/heads/feature",
+            None,
+            Some(&tip),
+            "create",
+            "psn@acme.noreply",
+        )
+        .expect("create feature ref");
 
         // Open with head_ref but NO head_oid → the resolver fills in the branch tip.
         let body = json!({
@@ -4179,7 +4262,9 @@ mod pr_list_tests {
             "head_ref": "refs/heads/feature",
             // head_oid deliberately OMITTED
         });
-        let rec = be.open_pr(TENANT, REGION, "core", &body, &author).expect("open PR");
+        let rec = be
+            .open_pr(TENANT, REGION, "core", &body, &author)
+            .expect("open PR");
         assert_eq!(
             rec.head_oid, tip.0,
             "F8: an omitted head_oid is resolved from head_ref's current tip"
@@ -4187,13 +4272,20 @@ mod pr_list_tests {
 
         // A bare (unqualified) head_ref resolves too (qualified to refs/heads/<name>).
         let body_bare = json!({ "title": "bare head_ref", "head_ref": "feature" });
-        let rec2 = be.open_pr(TENANT, REGION, "core", &body_bare, &author).expect("open PR");
-        assert_eq!(rec2.head_oid, tip.0, "F8: a bare branch name also resolves to the tip");
+        let rec2 = be
+            .open_pr(TENANT, REGION, "core", &body_bare, &author)
+            .expect("open PR");
+        assert_eq!(
+            rec2.head_oid, tip.0,
+            "F8: a bare branch name also resolves to the tip"
+        );
 
         // A non-existent head_ref → a clean 400 at OPEN (mapped from the durable error), NOT an empty
         // head_oid that wedges the merge dialog with "invalid merge head" later.
         let bad = json!({ "title": "ghost branch", "head_ref": "refs/heads/does-not-exist" });
-        let err = be.open_pr(TENANT, REGION, "core", &bad, &author).expect_err("must refuse");
+        let err = be
+            .open_pr(TENANT, REGION, "core", &bad, &author)
+            .expect_err("must refuse");
         assert_eq!(
             map_durable_err(err).status(),
             400,
@@ -4230,7 +4322,10 @@ mod pr_thread_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("myelin-prthread-{tag}-{}-{nanos}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "myelin-prthread-{tag}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 
     fn human(id: &str) -> Principal {
@@ -4264,7 +4359,9 @@ mod pr_thread_tests {
         };
         let req = EdgeRequest::new(method, "/v1/git/x", "", vec![], bytes);
         let page = Page::from_request(&req);
+        let identity = crate::catalogue::test_request_identity(viewer, &scope);
         let ctx = HandlerCtx {
+            identity: &identity,
             principal: viewer,
             scope: &scope,
             params: &pmap,
@@ -4282,7 +4379,8 @@ mod pr_thread_tests {
             .grant_read("u:reader", TENANT, SLUG);
         let writer = human("u:writer");
         let reader = human("u:reader");
-        let be = DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
+        let be =
+            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
         be.create_repo_as(TENANT, REGION, SLUG, &writer).unwrap();
         let body = json!({
             "title": "R3.3 flagship", "base_ref": "refs/heads/main",
@@ -4298,13 +4396,26 @@ mod pr_thread_tests {
     fn thread_read_is_pr_view_but_write_needs_a_real_write_grant() {
         let (be, _writer, reader) = setup("authz", &"0".repeat(40));
         // The reader may LIST (Pull-guarded read).
-        let list = guarded(&be, RepoPermission::Pull, Arc::new(DPrThreads { be: be.clone() }));
-        let v = serve(&*list, "GET", &reader, &[("repo", SLUG), ("n", "1")], Value::Null)
-            .expect("reader may read threads");
+        let list = guarded(
+            &be,
+            RepoPermission::Pull,
+            Arc::new(DPrThreads { be: be.clone() }),
+        );
+        let v = serve(
+            &*list,
+            "GET",
+            &reader,
+            &[("repo", SLUG), ("n", "1")],
+            Value::Null,
+        )
+        .expect("reader may read threads");
         assert!(v["threads"].is_array());
         // The reader may NOT create a comment (Push-guarded write) — 403, never a silent allow.
-        let create =
-            guarded(&be, RepoPermission::Push, Arc::new(DPrThreadCreate { be: be.clone() }));
+        let create = guarded(
+            &be,
+            RepoPermission::Push,
+            Arc::new(DPrThreadCreate { be: be.clone() }),
+        );
         let err = serve(
             &*create,
             "POST",
@@ -4326,8 +4437,18 @@ mod pr_thread_tests {
         let submit = Arc::new(DPrReviewSubmit { be: be.clone() });
 
         // The reader (a real reviewer with read) starts a batch + drafts a pending comment.
-        let batch = serve(&*start, "POST", &reader, &[("repo", SLUG), ("n", "1")], Value::Null).unwrap();
-        let rid = batch["applied"]["review"]["id"].as_str().unwrap().to_string();
+        let batch = serve(
+            &*start,
+            "POST",
+            &reader,
+            &[("repo", SLUG), ("n", "1")],
+            Value::Null,
+        )
+        .unwrap();
+        let rid = batch["applied"]["review"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         serve(
             &*pending,
             "POST",
@@ -4338,9 +4459,24 @@ mod pr_thread_tests {
         .unwrap();
 
         // The WRITER (a different viewer) sees NO thread and NO draft batch.
-        let seen = serve(&*threads, "GET", &writer, &[("repo", SLUG), ("n", "1")], Value::Null).unwrap();
-        assert_eq!(seen["threads"].as_array().unwrap().len(), 0, "pending comment is private");
-        assert_eq!(seen["reviews"].as_array().unwrap().len(), 0, "draft batch is hidden");
+        let seen = serve(
+            &*threads,
+            "GET",
+            &writer,
+            &[("repo", SLUG), ("n", "1")],
+            Value::Null,
+        )
+        .unwrap();
+        assert_eq!(
+            seen["threads"].as_array().unwrap().len(),
+            0,
+            "pending comment is private"
+        );
+        assert_eq!(
+            seen["reviews"].as_array().unwrap().len(),
+            0,
+            "draft batch is hidden"
+        );
 
         // Submit → ONE event (emitted true); a re-submit is idempotent (emitted false).
         let first = serve(
@@ -4360,11 +4496,25 @@ mod pr_thread_tests {
             json!({ "verdict": "commented" }),
         )
         .unwrap();
-        assert_eq!(again["applied"]["result"]["emitted"], false, "no double event");
+        assert_eq!(
+            again["applied"]["result"]["emitted"], false,
+            "no double event"
+        );
 
         // Now the writer sees the (submitted) thread.
-        let seen = serve(&*threads, "GET", &writer, &[("repo", SLUG), ("n", "1")], Value::Null).unwrap();
-        assert_eq!(seen["threads"].as_array().unwrap().len(), 1, "submit makes it public");
+        let seen = serve(
+            &*threads,
+            "GET",
+            &writer,
+            &[("repo", SLUG), ("n", "1")],
+            Value::Null,
+        )
+        .unwrap();
+        assert_eq!(
+            seen["threads"].as_array().unwrap().len(),
+            1,
+            "submit makes it public"
+        );
     }
 
     /// A submitted human `changes_requested` batch flips the merge gate → the checks projection reads
@@ -4376,8 +4526,18 @@ mod pr_thread_tests {
         let submit = Arc::new(DPrReviewSubmit { be: be.clone() });
         let checks = Arc::new(DPrChecks { be: be.clone() });
 
-        let batch = serve(&*start, "POST", &reader, &[("repo", SLUG), ("n", "1")], Value::Null).unwrap();
-        let rid = batch["applied"]["review"]["id"].as_str().unwrap().to_string();
+        let batch = serve(
+            &*start,
+            "POST",
+            &reader,
+            &[("repo", SLUG), ("n", "1")],
+            Value::Null,
+        )
+        .unwrap();
+        let rid = batch["applied"]["review"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         serve(
             &*submit,
             "POST",
@@ -4386,9 +4546,22 @@ mod pr_thread_tests {
             json!({ "verdict": "changes_requested" }),
         )
         .unwrap();
-        let ck = serve(&*checks, "GET", &reader, &[("repo", SLUG), ("n", "1")], Value::Null).unwrap();
-        assert_eq!(ck["changes_requested"], true, "the gate ingests changes_requested");
-        assert_eq!(ck["gate_admitted"], false, "a live request-changes blocks the merge");
+        let ck = serve(
+            &*checks,
+            "GET",
+            &reader,
+            &[("repo", SLUG), ("n", "1")],
+            Value::Null,
+        )
+        .unwrap();
+        assert_eq!(
+            ck["changes_requested"], true,
+            "the gate ingests changes_requested"
+        );
+        assert_eq!(
+            ck["gate_admitted"], false,
+            "a live request-changes blocks the merge"
+        );
     }
 
     /// A blocked merge returns a 409 carrying the FRESH re-rendered checks (N6 — the UI re-renders the
@@ -4414,11 +4587,24 @@ mod pr_thread_tests {
             &writer,
         )
         .unwrap();
-        let merge = guarded(&be, RepoPermission::ProtectedPush, Arc::new(DMerge { be: be.clone() }));
-        let resp = serve(&*merge, "POST", &writer, &[("repo", SLUG), ("n", "1")], Value::Null)
-            .expect("merge handler returns a body (409 is an Ok EdgeResponse, not an Err)");
+        let merge = guarded(
+            &be,
+            RepoPermission::ProtectedPush,
+            Arc::new(DMerge { be: be.clone() }),
+        );
+        let resp = serve(
+            &*merge,
+            "POST",
+            &writer,
+            &[("repo", SLUG), ("n", "1")],
+            Value::Null,
+        )
+        .expect("merge handler returns a body (409 is an Ok EdgeResponse, not an Err)");
         assert_eq!(resp["error"]["code"], "merge_blocked");
-        assert_eq!(resp["checks"]["gate_admitted"], false, "the 409 carries the fresh gate state");
+        assert_eq!(
+            resp["checks"]["gate_admitted"], false,
+            "the 409 carries the fresh gate state"
+        );
     }
 
     /// Seed a repo with a real base commit on `main` + a head commit branched off it (modifying
@@ -4430,7 +4616,8 @@ mod pr_thread_tests {
             .grant_read("u:reader", TENANT, SLUG);
         let writer = human("u:writer");
         let reader = human("u:reader");
-        let be = DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
+        let be =
+            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
         be.create_repo_as(TENANT, REGION, SLUG, &writer).unwrap();
         let loc = DurableGitBackend::loc(TENANT, REGION, SLUG);
         let repo = be.store.open_repo(&loc).unwrap();
@@ -4439,12 +4626,24 @@ mod pr_thread_tests {
         let base = repo
             .write_commit(&t0, &[], "base", "psn@acme.noreply", "psn@acme.noreply")
             .unwrap();
-        repo.update_ref_cas("refs/heads/main", None, Some(&base), "c", "psn@acme.noreply")
-            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&base),
+            "c",
+            "psn@acme.noreply",
+        )
+        .unwrap();
         let bh = repo.write_blob(b"a\nB\nc\nd\n").unwrap();
         let th = repo.write_tree(&[("file.txt", &bh)]).unwrap();
         let head = repo
-            .write_commit(&th, &[&base], "head", "psn@acme.noreply", "psn@acme.noreply")
+            .write_commit(
+                &th,
+                &[&base],
+                "head",
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
             .unwrap();
         be.open_pr(
             TENANT,
@@ -4464,37 +4663,74 @@ mod pr_thread_tests {
     #[test]
     fn pr_diff_is_pull_guarded_zero_leak_and_three_dot() {
         let (be, reader, _head) = setup_diff("diffauthz");
-        let guard = guarded(&be, RepoPermission::Pull, Arc::new(DPrDiff { be: be.clone() }));
+        let guard = guarded(
+            &be,
+            RepoPermission::Pull,
+            Arc::new(DPrDiff { be: be.clone() }),
+        );
         // The reader sees the three-dot diff of file.txt (the PR's own change).
-        let v = serve(&*guard, "GET", &reader, &[("repo", SLUG), ("n", "1")], Value::Null)
-            .expect("a reader may view the PR diff");
+        let v = serve(
+            &*guard,
+            "GET",
+            &reader,
+            &[("repo", SLUG), ("n", "1")],
+            Value::Null,
+        )
+        .expect("a reader may view the PR diff");
         assert_eq!(v["number"], 1);
-        assert_eq!(v["three_dot"], true, "durable repos are libgit2-backed → merge-base");
+        assert_eq!(
+            v["three_dot"], true,
+            "durable repos are libgit2-backed → merge-base"
+        );
         assert_eq!(v["total_files"], 1);
         assert_eq!(v["files"][0]["path"], "file.txt");
         assert_eq!(v["files"][0]["status"], "M");
         assert_eq!(v["files"][0]["kind"], "text");
         // Line numbers cross the wire additively.
         let lines = v["files"][0]["hunks"][0]["lines"].as_array().unwrap();
-        assert!(lines.iter().any(|l| l["origin"] == "+" && l["content"] == "d" && l["new_no"] == 4));
+        assert!(lines
+            .iter()
+            .any(|l| l["origin"] == "+" && l["content"] == "d" && l["new_no"] == 4));
         // Restricted disclosure is COUNT-ONLY — the field is a number, never a path list.
-        assert_eq!(v["restricted_files"], 0, "count-only; 0 under the repo-level Pull guard");
+        assert_eq!(
+            v["restricted_files"], 0,
+            "count-only; 0 under the repo-level Pull guard"
+        );
         assert!(v["restricted_files"].is_number());
 
         // A STRANGER with no grant → a 0-leak 404 (NotFound), never a distinguishable Forbidden.
         let stranger = human("u:stranger");
-        let err = serve(&*guard, "GET", &stranger, &[("repo", SLUG), ("n", "1")], Value::Null)
-            .expect_err("a stranger must not view the diff");
-        assert!(matches!(err, EdgeError::NotFound(_)), "0-leak 404, got {err:?}");
+        let err = serve(
+            &*guard,
+            "GET",
+            &stranger,
+            &[("repo", SLUG), ("n", "1")],
+            Value::Null,
+        )
+        .expect_err("a stranger must not view the diff");
+        assert!(
+            matches!(err, EdgeError::NotFound(_)),
+            "0-leak 404, got {err:?}"
+        );
     }
 
     /// A diff request for an ABSENT PR is a clean 404 (exactly like the overview — never a 500).
     #[test]
     fn pr_diff_absent_pr_is_not_found() {
         let (be, reader, _head) = setup_diff("diffabsent");
-        let guard = guarded(&be, RepoPermission::Pull, Arc::new(DPrDiff { be: be.clone() }));
-        let err = serve(&*guard, "GET", &reader, &[("repo", SLUG), ("n", "999")], Value::Null)
-            .expect_err("absent PR");
+        let guard = guarded(
+            &be,
+            RepoPermission::Pull,
+            Arc::new(DPrDiff { be: be.clone() }),
+        );
+        let err = serve(
+            &*guard,
+            "GET",
+            &reader,
+            &[("repo", SLUG), ("n", "999")],
+            Value::Null,
+        )
+        .expect_err("absent PR");
         assert!(matches!(err, EdgeError::NotFound(_)), "got {err:?}");
     }
 }

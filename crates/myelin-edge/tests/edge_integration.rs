@@ -22,7 +22,8 @@ use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use myelin_edge::{
-    serve_edge, sse_scope_for_resource, sse_scope_for_tenant, AllowAll, Gateway, Method, SseEvent, WhoamiHandler,
+    serve_edge, sse_scope_for_resource, sse_scope_for_tenant, AllowAll, Gateway, Method, SseEvent,
+    WhoamiHandler,
 };
 use myelin_events::Timestamp;
 use myelin_identity::{
@@ -45,12 +46,19 @@ const OTHER_TENANT: &str = "globex";
 const SCHEME: &str = "agent"; // a TTL-constrained token (no DPoP) — simplest real proof.
 
 fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 fn admin_scope(tenant: &str) -> TenantScope {
     TenantScope::from_verified_token(
-        &Principal::stub(PrincipalId("admin".into()), PrincipalKind::Human, TenantId(tenant.into())),
+        &Principal::stub(
+            PrincipalId("admin".into()),
+            PrincipalKind::Human,
+            TenantId(tenant.into()),
+        ),
         Region(REGION.into()),
     )
 }
@@ -81,13 +89,18 @@ fn build_gateway() -> (Arc<Gateway>, CellTokenAuthority, RevocationStore) {
         Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
         revocations.clone(),
     ));
-    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(
-        KmsEngine::new(),
-    ))));
+    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
+        Arc::new(KmsEngine::new()),
+    )));
 
     let gateway = Arc::new(
         Gateway::builder(authn, human_login, Arc::new(AllowAll))
-            .route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler))
+            .route(
+                Method::Get,
+                "/v1/whoami",
+                "edge.whoami",
+                Arc::new(WhoamiHandler),
+            )
             .route(
                 Method::Get,
                 "/v1/t/{tenant}/whoami",
@@ -99,7 +112,7 @@ fn build_gateway() -> (Arc<Gateway>, CellTokenAuthority, RevocationStore) {
             // sse_route refuses an object-addressing pattern at composition time).
             .sse_route_scoped(
                 "/v1/t/{tenant}/repos/{repo}/events",
-                "git.repo.events.subscribe",
+                "edge.events.subscribe",
                 "git",
                 "repo",
             )
@@ -116,7 +129,7 @@ fn mint(cell: &CellTokenAuthority, tenant: &str, jti: &str, exp_unix: i64) -> St
         subject_key: "subj-1".into(),
         jti: jti.into(),
         exp_unix,
-        authority: vec!["agent:run".into()],
+        authority: vec!["edge.operator".into()],
         dpop_jkt: None,
         purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
         audience: myelin_identity_service::CredentialAudience::Edge,
@@ -161,7 +174,10 @@ async fn open(
     tokio::spawn(async move {
         let _ = conn.await;
     });
-    let mut builder = Request::builder().method(method).uri(path).header("host", "edge.test");
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "edge.test");
     for (k, v) in headers {
         builder = builder.header(*k, *v);
     }
@@ -209,7 +225,10 @@ async fn forged_token_is_401_with_envelope() {
     let (status, body) = http(addr, "GET", "/v1/whoami", &hdr(&h), vec![]).await;
     assert_eq!(status, 401, "a forged token is rejected");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["error"]["message"], "authentication required", "envelope shape (d)");
+    assert_eq!(
+        v["error"]["message"], "authentication required",
+        "envelope shape (d)"
+    );
     assert_eq!(v["error"]["code"], "unauthorized");
 }
 
@@ -264,7 +283,10 @@ async fn tenant_isolation_at_the_edge_is_the_idor_floor() {
         vec![],
     )
     .await;
-    assert_eq!(status, 403, "a cross-tenant path is rejected at the edge: {body}");
+    assert_eq!(
+        status, 403,
+        "a cross-tenant path is rejected at the edge: {body}"
+    );
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["error"]["code"], "forbidden");
     assert_eq!(
@@ -274,10 +296,20 @@ async fn tenant_isolation_at_the_edge_is_the_idor_floor() {
     );
 
     // The SAME token on its OWN tenant path is served against the token's tenant.
-    let (ok, ok_body) = http(addr, "GET", &format!("/v1/t/{TENANT}/whoami"), &hdr(&h), vec![]).await;
+    let (ok, ok_body) = http(
+        addr,
+        "GET",
+        &format!("/v1/t/{TENANT}/whoami"),
+        &hdr(&h),
+        vec![],
+    )
+    .await;
     assert_eq!(ok, 200, "the own-tenant path is served");
     let ov: serde_json::Value = serde_json::from_str(&ok_body).unwrap();
-    assert_eq!(ov["tenant"], TENANT, "served against the TOKEN's tenant, never the path");
+    assert_eq!(
+        ov["tenant"], TENANT,
+        "served against the TOKEN's tenant, never the path"
+    );
 }
 
 /// (e) A malformed request → a clean error, no panic (the edge is total over garbage input).
@@ -316,7 +348,14 @@ async fn sse_endpoint_streams_a_frame() {
     let addr = spawn(gw.clone()).await;
 
     // Open the SSE stream (authenticated; scoped to the verified tenant).
-    let resp = open(addr, "GET", &format!("/v1/t/{TENANT}/events"), &hdr(&h), vec![]).await;
+    let resp = open(
+        addr,
+        "GET",
+        &format!("/v1/t/{TENANT}/events"),
+        &hdr(&h),
+        vec![],
+    )
+    .await;
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
         resp.headers().get("content-type").unwrap(),
@@ -344,8 +383,14 @@ async fn sse_endpoint_streams_a_frame() {
         }
     }
     let frame = got.expect("an SSE frame should stream to the client");
-    assert!(frame.contains("event: ping"), "the SSE frame carries the event type: {frame}");
-    assert!(frame.contains("data: {\"hello\":true}"), "the SSE frame carries the data: {frame}");
+    assert!(
+        frame.contains("event: ping"),
+        "the SSE frame carries the event type: {frame}"
+    );
+    assert!(
+        frame.contains("data: {\"hello\":true}"),
+        "the SSE frame carries the data: {frame}"
+    );
 }
 
 /// (g) R2.2: an OBJECT-ADDRESSED SSE route subscribes at the tenant+resource scope — NOT the
@@ -379,10 +424,16 @@ async fn scoped_sse_route_isolates_per_object() {
     for _ in 0..20 {
         // Frames the widgets subscriber must NEVER receive: the tenant-coarse scope and another
         // object's scope (different (stream, scope) channels entirely).
-        gw.sse_hub().broadcast("git", &coarse, SseEvent::typed("leak", "{\"coarse\":true}"));
-        gw.sse_hub().broadcast("git", &other, SseEvent::typed("leak", "{\"other\":true}"));
+        gw.sse_hub()
+            .broadcast("git", &coarse, SseEvent::typed("leak", "{\"coarse\":true}"));
+        gw.sse_hub()
+            .broadcast("git", &other, SseEvent::typed("leak", "{\"other\":true}"));
         // The frame it MUST receive: its own derived (tenant, repo) scope.
-        gw.sse_hub().broadcast("git", &widgets, SseEvent::typed("push", "{\"repo\":\"widgets\"}"));
+        gw.sse_hub().broadcast(
+            "git",
+            &widgets,
+            SseEvent::typed("push", "{\"repo\":\"widgets\"}"),
+        );
         match tokio::time::timeout(Duration::from_millis(100), body.frame()).await {
             Ok(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {

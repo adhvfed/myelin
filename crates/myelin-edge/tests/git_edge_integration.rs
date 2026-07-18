@@ -43,7 +43,10 @@ const REGION: &str = "eu-west";
 const SCHEME: &str = "agent";
 
 fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 fn admin_scope(tenant: &str) -> TenantScope {
@@ -97,16 +100,21 @@ fn build() -> (Arc<Gateway>, CellTokenAuthority) {
         Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
         RevocationStore::new(),
     ));
-    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(
-        KmsEngine::new(),
-    ))));
+    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
+        Arc::new(KmsEngine::new()),
+    )));
 
     let git_state = Arc::new(
         GitEdgeState::new()
             .with_repo("acme", "alpha", repo("acme/alpha"))
             .with_repo("acme", "beta", repo("acme/beta"))
             .with_repo("acme", "gamma", repo("acme/gamma"))
-            .with_pr("acme", "alpha", 1, switch_test_representative_pr_page("acme"))
+            .with_pr(
+                "acme",
+                "alpha",
+                1,
+                switch_test_representative_pr_page("acme"),
+            )
             .with_blob(
                 "acme",
                 "alpha",
@@ -121,7 +129,12 @@ fn build() -> (Arc<Gateway>, CellTokenAuthority) {
             )
             // globex — DISTINCT data, so an acme token must never see it.
             .with_repo("globex", "zeta", repo("globex/zeta"))
-            .with_pr("globex", "zeta", 7, switch_test_representative_pr_page("globex")),
+            .with_pr(
+                "globex",
+                "zeta",
+                7,
+                switch_test_representative_pr_page("globex"),
+            ),
     );
 
     let mut builder = Gateway::builder(authn, human_login, Arc::new(AllowAll)).route(
@@ -141,7 +154,7 @@ fn mint(cell: &CellTokenAuthority, tenant: &str, jti: &str) -> String {
         subject_key: "subj-1".into(),
         jti: jti.into(),
         exp_unix: now() + 3600,
-        authority: vec!["agent:run".into()],
+        authority: vec!["edge.operator".into()],
         dpop_jkt: None,
         purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
         audience: myelin_identity_service::CredentialAudience::Edge,
@@ -170,7 +183,10 @@ async fn open(
     tokio::spawn(async move {
         let _ = conn.await;
     });
-    let mut builder = Request::builder().method(method).uri(path).header("host", "edge.test");
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "edge.test");
     for (k, v) in headers {
         builder = builder.header(*k, *v);
     }
@@ -215,7 +231,10 @@ async fn repos_list_and_pr_overview_serve_the_viewmodel_json() {
     assert_eq!(status, 200, "repos list: {v}");
     let items = v["items"].as_array().expect("items array");
     assert_eq!(items.len(), 3, "acme has 3 repos");
-    assert_eq!(items[0]["state"], "populated", "the RepoHome ViewModel vocabulary");
+    assert_eq!(
+        items[0]["state"], "populated",
+        "the RepoHome ViewModel vocabulary"
+    );
     assert!(items[0]["slug"].as_str().unwrap().starts_with("acme/"));
     assert_eq!(v["page"]["limit"], 50, "the default page limit");
 
@@ -232,11 +251,21 @@ async fn repos_list_and_pr_overview_serve_the_viewmodel_json() {
     assert_eq!(pr["checks"]["state"], "live", "the checks panel ViewModel");
     assert_eq!(pr["checks"]["rows"][0]["context"], "ci/build");
     assert_eq!(pr["checks"]["rows"][0]["cue"]["label"], "passed");
-    assert_eq!(pr["merge"]["state"], "ready", "the merge-readiness ViewModel");
+    assert_eq!(
+        pr["merge"]["state"], "ready",
+        "the merge-readiness ViewModel"
+    );
     assert_eq!(pr["merge"]["approvals"]["required"], 2);
 
     // the checks sub-endpoint returns the SAME checks ViewModel.
-    let (cs, checks) = http(addr, "GET", "/v1/git/repos/alpha/prs/1/checks", &hdr(&h), vec![]).await;
+    let (cs, checks) = http(
+        addr,
+        "GET",
+        "/v1/git/repos/alpha/prs/1/checks",
+        &hdr(&h),
+        vec![],
+    )
+    .await;
     assert_eq!(cs, 200);
     assert_eq!(checks["state"], "live");
     assert_eq!(checks["rows"][0]["required"], true);
@@ -274,7 +303,14 @@ async fn tenant_isolation_git_data_is_partitioned_by_the_verified_token() {
     let (st, _) = http(addr, "GET", "/v1/git/repos/zeta/prs/7", &hdr(&acme), vec![]).await;
     assert_eq!(st, 404, "globex's PR is invisible to an acme token");
     // globex CAN read its own PR #7.
-    let (st_ok, gpr) = http(addr, "GET", "/v1/git/repos/zeta/prs/7", &hdr(&globex), vec![]).await;
+    let (st_ok, gpr) = http(
+        addr,
+        "GET",
+        "/v1/git/repos/zeta/prs/7",
+        &hdr(&globex),
+        vec![],
+    )
+    .await;
     assert_eq!(st_ok, 200);
     assert!(gpr["title"].as_str().unwrap().contains("globex"));
 }
@@ -317,7 +353,10 @@ async fn repo_list_pagination_limit_and_cursor() {
     )
     .await;
     assert_eq!(p2["items"].as_array().unwrap().len(), 1, "the last page");
-    assert!(p2["page"]["next_cursor"].is_null(), "no cursor past the end");
+    assert!(
+        p2["page"]["next_cursor"].is_null(),
+        "no cursor past the end"
+    );
 }
 
 /// Writes: `POST …/merge` is wired (200) but HONESTLY `durable: false` (E1.1); a web-edit against a
@@ -338,7 +377,10 @@ async fn writes_are_wired_but_durable_effect_is_deferred_to_e1_1() {
     )
     .await;
     assert_eq!(st, 200, "the merge route is wired: {mv}");
-    assert_eq!(mv["durable"], false, "the durable effect is honestly deferred to E1.1");
+    assert_eq!(
+        mv["durable"], false,
+        "the durable effect is honestly deferred to E1.1"
+    );
     assert_eq!(mv["applied"]["action"], "git.pr.merge");
     assert!(mv["note"].as_str().unwrap().contains("E1.1"));
 

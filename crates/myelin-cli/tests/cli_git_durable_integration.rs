@@ -33,12 +33,18 @@ const REGION: &str = "eu-west";
 const SCHEME: &str = "agent";
 
 fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 fn temp_root(tag: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     p.push(format!("myelin-cli-gt005-{tag}-{nanos}"));
     p
 }
@@ -83,9 +89,9 @@ fn build(root: &PathBuf) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBac
         Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
         RevocationStore::new(),
     ));
-    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(
-        KmsEngine::new(),
-    ))));
+    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
+        Arc::new(KmsEngine::new()),
+    )));
 
     let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(root.clone()));
     let mut builder = Gateway::builder(authn, human_login, Arc::new(AllowAll)).route(
@@ -105,7 +111,7 @@ fn mint(cell: &CellTokenAuthority, tenant: &str, jti: &str) -> String {
         subject_key: "subj-1".into(),
         jti: jti.into(),
         exp_unix: now() + 3600,
-        authority: vec!["agent:run".into()],
+        authority: vec!["edge.operator".into()],
         dpop_jkt: None,
         purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
         audience: myelin_identity_service::CredentialAudience::Edge,
@@ -127,7 +133,10 @@ fn run_cli(edge: &str, token: &str, args: &[&str]) -> (i32, String, String) {
     cmd.env("MYELIN_EDGE", edge)
         .env("MYELIN_TOKEN_SCHEME", SCHEME)
         .env("MYELIN_TOKEN", token)
-        .env("MYELIN_CONFIG_DIR", std::env::temp_dir().join("myelin-cli-gt005-empty"));
+        .env(
+            "MYELIN_CONFIG_DIR",
+            std::env::temp_dir().join("myelin-cli-gt005-empty"),
+        );
     cmd.args(args);
     let out = cmd.output().expect("spawn myelin binary");
     (
@@ -150,23 +159,49 @@ async fn durable_create_open_view_round_trip() {
     // repo create → exit 0, durable.
     let (code, out, err) = run_cli(&edge, &token, &["git", "repo", "create", "alpha"]);
     assert_eq!(code, 0, "repo create succeeds; stderr={err}");
-    assert!(out.contains("git.repo.create") || out.contains("alpha"), "create echoed; got {out}");
+    assert!(
+        out.contains("git.repo.create") || out.contains("alpha"),
+        "create echoed; got {out}"
+    );
 
     // repo list reflects the new durable repo.
     let (lc, lout, _) = run_cli(&edge, &token, &["--json", "git", "repo", "list"]);
     assert_eq!(lc, 0);
     let v: serde_json::Value = serde_json::from_str(&lout).expect("--json valid");
-    let slugs: Vec<&str> =
-        v["items"].as_array().unwrap().iter().filter_map(|i| i["slug"].as_str()).collect();
-    assert!(slugs.iter().any(|s| s.contains("alpha")), "repo list reflects create; got {lout}");
+    let slugs: Vec<&str> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["slug"].as_str())
+        .collect();
+    assert!(
+        slugs.iter().any(|s| s.contains("alpha")),
+        "repo list reflects create; got {lout}"
+    );
 
     // pr open → a durable PR #1.
-    let (oc, _oout, oerr) =
-        run_cli(&edge, &token, &["git", "pr", "open", "alpha", "--title", "Alpha PR", "--head-oid", "deadbeef"]);
+    let (oc, _oout, oerr) = run_cli(
+        &edge,
+        &token,
+        &[
+            "git",
+            "pr",
+            "open",
+            "alpha",
+            "--title",
+            "Alpha PR",
+            "--head-oid",
+            "deadbeef",
+        ],
+    );
     assert_eq!(oc, 0, "pr open succeeds; stderr={oerr}");
 
     // pr view reads it back (durable).
-    let (vc, vout, verr) = run_cli(&edge, &token, &["--json", "git", "pr", "view", "alpha", "1"]);
+    let (vc, vout, verr) = run_cli(
+        &edge,
+        &token,
+        &["--json", "git", "pr", "view", "alpha", "1"],
+    );
     assert_eq!(vc, 0, "pr view succeeds; stderr={verr}");
     let pr: serde_json::Value = serde_json::from_str(&vout).expect("--json valid");
     assert_eq!(pr["number"], 1, "the durable PR round-trips; got {vout}");
@@ -187,7 +222,10 @@ async fn merge_blocked_by_gate_is_a_clean_cli_error() {
 
     // Create the repo via the CLI, then set repo-owned branch protection requiring a never-green CI
     // context (the merge gate must block). Policy is repo-owned — never author input (the GT-003 fix).
-    assert_eq!(run_cli(&edge, &token, &["git", "repo", "create", "alpha"]).0, 0);
+    assert_eq!(
+        run_cli(&edge, &token, &["git", "repo", "create", "alpha"]).0,
+        0
+    );
     be.set_branch_protection(
         "acme",
         REGION,
@@ -202,20 +240,44 @@ async fn merge_blocked_by_gate_is_a_clean_cli_error() {
     )
     .expect("set branch protection");
     assert_eq!(
-        run_cli(&edge, &token, &["git", "pr", "open", "alpha", "--title", "Alpha PR", "--head-oid", "deadbeef"]).0,
+        run_cli(
+            &edge,
+            &token,
+            &[
+                "git",
+                "pr",
+                "open",
+                "alpha",
+                "--title",
+                "Alpha PR",
+                "--head-oid",
+                "deadbeef"
+            ]
+        )
+        .0,
         0
     );
 
     // pr merge → the server gate BLOCKS → a clean CLI error (exit 1) naming the reason; never a panic.
     let (code, stdout, stderr) = run_cli(&edge, &token, &["git", "pr", "merge", "alpha", "1"]);
-    assert_eq!(code, 1, "a gate-blocked merge is a clean edge error (exit 1); stderr={stderr}");
-    assert!(stderr.contains("merge blocked by policy"), "the gate reason is surfaced; got {stderr}");
+    assert_eq!(
+        code, 1,
+        "a gate-blocked merge is a clean edge error (exit 1); stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("merge blocked by policy"),
+        "the gate reason is surfaced; got {stderr}"
+    );
     assert!(!stderr.contains("panicked"), "never a panic");
     assert!(stdout.is_empty(), "no view-model on a blocked merge");
 
     // The gate was NOT bypassed: the PR is still open on disk.
     let rec = be.get_pr("acme", REGION, "alpha", 1).unwrap().unwrap();
-    assert_ne!(format!("{:?}", rec.state), "Merged", "the CLI cannot bypass the server gate");
+    assert_ne!(
+        format!("{:?}", rec.state),
+        "Merged",
+        "the CLI cannot bypass the server gate"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

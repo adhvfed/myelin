@@ -307,7 +307,7 @@ fn id_d6_mutation_floor_re_check_and_auto_expire_are_mandatory_core() {
     // anchor and assert on the trust-rooted authority (NOT a plaintext substring, which would make
     // this mutation floor vacuous against an opaque token).
     let minted_authority = svc
-        .introspect_run_token("agent", &token)
+        .introspect_run_token_at("agent", &token, &ts("2026-06-19T00:00:01Z"))
         .expect("a minted per-run token verifies through the real cell trust anchor (MR-012)")
         .authority;
     assert!(

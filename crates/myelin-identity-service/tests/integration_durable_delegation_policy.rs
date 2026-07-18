@@ -345,12 +345,12 @@ async fn shared_tenant_policy_supports_two_agents_and_two_actors() {
         .resolve_for_run(&scope_b, &agent_b, &actor_b, &RunId("run:pair:b".into()))
         .await
         .expect("pair B resolves");
-    assert!(resolved_a.input.delegation.holds("pair:a"));
-    assert!(!resolved_a.input.delegation.holds("pair:b"));
-    assert!(resolved_b.input.delegation.holds("pair:b"));
-    assert!(!resolved_b.input.delegation.holds("pair:a"));
-    assert_eq!(resolved_a.effective_policy.caveats, ["common", "pair:a"]);
-    assert_eq!(resolved_b.effective_policy.caveats, ["common", "pair:b"]);
+    assert!(resolved_a.input().delegation.holds("pair:a"));
+    assert!(!resolved_a.input().delegation.holds("pair:b"));
+    assert!(resolved_b.input().delegation.holds("pair:b"));
+    assert!(!resolved_b.input().delegation.holds("pair:a"));
+    assert_eq!(resolved_a.effective_policy().caveats, ["common", "pair:a"]);
+    assert_eq!(resolved_b.effective_policy().caveats, ["common", "pair:b"]);
 
     let head_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM delegation_policy_head WHERE tenant_id = $1 AND region = $2",
@@ -412,11 +412,11 @@ async fn concurrent_update_and_resolution_never_observe_a_torn_bundle() {
     updater.await.expect("updater task").expect("v2 update");
     for reader in readers {
         let resolved = reader.await.expect("reader task").expect("snapshot");
-        let versions = resolved.cursor.versions;
+        let versions = resolved.cursor().versions;
         assert_eq!(versions.delegation, 1);
         assert_eq!(versions.tenant, 1);
         assert_eq!(versions.trigger_actor, 1);
-        let has_admin = resolved.input.agent_policy.holds("repo:admin");
+        let has_admin = resolved.input().agent_policy.holds("repo:admin");
         assert_eq!(has_admin, versions.agent == 2);
         assert!(
             !resolved

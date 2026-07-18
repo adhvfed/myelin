@@ -247,12 +247,14 @@ impl CellTokenAuthority {
         claims.insert("exp".into(), spec.exp_unix.into());
         claims.insert("purpose".into(), spec.purpose.claim().into());
         claims.insert("aud".into(), spec.audience.claim().into());
+        if let Some(run_id) = spec.purpose.run_id() {
+            claims.insert("run_id".into(), run_id.into());
+        }
         if let CredentialPurpose::AgentRun {
-            run_id,
             delegation_snapshot,
+            ..
         } = &spec.purpose
         {
-            claims.insert("run_id".into(), run_id.clone().into());
             if let Some(snapshot) = delegation_snapshot {
                 claims.insert("delegation_snapshot".into(), (*snapshot).into());
             }
@@ -777,9 +779,17 @@ impl PasetoCapabilityVerifier {
                     .transpose()?,
             },
             "pat" => CredentialPurpose::Pat,
-            "ci_job" => CredentialPurpose::CiJob,
+            "ci_job" => CredentialPurpose::CiJob {
+                run_id: str_claim(&claims, "run_id").map_err(|_| {
+                    refuse("signed CI-job credential is missing its non-empty `run_id` binding")
+                })?,
+            },
             "deploy_key" => CredentialPurpose::DeployKey,
-            "per_job" => CredentialPurpose::PerJob,
+            "per_job" => CredentialPurpose::PerJob {
+                run_id: str_claim(&claims, "run_id").map_err(|_| {
+                    refuse("signed per-job credential is missing its non-empty `run_id` binding")
+                })?,
+            },
             other => {
                 return Err(refuse(format!(
                     "unknown signed credential purpose `{other}` — refused"
@@ -803,7 +813,7 @@ impl PasetoCapabilityVerifier {
                 )))
             }
         };
-        if !purpose.is_agent_run() && claims.get("run_id").is_some() {
+        if !purpose.is_run_scoped() && claims.get("run_id").is_some() {
             return Err(refuse(
                 "a non-run credential carries a `run_id` binding — ambiguous purpose refused",
             ));
@@ -1001,8 +1011,7 @@ impl crate::mint::TokenSigner for PasetoCapabilitySigner {
         region: &str,
         subject_key: &str,
         jti: &str,
-        run_id: &str,
-        delegation_snapshot: Option<i64>,
+        purpose: &CredentialPurpose,
         expires_at: &myelin_events::Timestamp,
         grants: &[&str],
     ) -> String {
@@ -1020,10 +1029,7 @@ impl crate::mint::TokenSigner for PasetoCapabilitySigner {
             exp_unix: exp,
             authority: grants.iter().map(|g| g.to_string()).collect(),
             dpop_jkt: None, // a per-run token is TTL-constrained, not DPoP-bound (§4).
-            purpose: CredentialPurpose::AgentRun {
-                run_id: run_id.to_string(),
-                delegation_snapshot,
-            },
+            purpose: purpose.clone(),
             audience: CredentialAudience::Edge,
         })
     }

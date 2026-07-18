@@ -47,7 +47,10 @@
 //!   the Bearer token SERVER-SIDE; tokens never reach client JS. The login endpoint runs the real
 //!   [`HumanSsoAuthenticator::production`](myelin_identity_service::HumanSsoAuthenticator) — and since
 //!   the human verifier config (JWKS/trust-anchors) is **MR-012-deferred, login REFUSES loudly (503),
-//!   never mocks** a session. The cookie-session machinery + the 401→refresh semantics are real.
+//!   never mocks** a session. Consequently every currently live session is capability-backed and is
+//!   re-authenticated to a complete signed [`RequestIdentity`](myelin_identity_service::RequestIdentity);
+//!   there is not yet a human-session credential-context variant. The cookie-session machinery +
+//!   the 401→refresh semantics are real.
 //!
 //! ## The API conventions (the headline)
 //! - **Error model:** the `{error:{message, code?}}` envelope ([`error::EdgeError`]) — the typed
@@ -88,7 +91,10 @@ pub mod sse;
 // action authorizer is `AuthenticatedActionPolicy` over the `MOUNTED_EDGE_ACTIONS` allowlist.
 #[cfg(any(test, feature = "test-support"))]
 pub use authz::AllowAll;
-pub use authz::{AuthenticatedActionPolicy, MOUNTED_EDGE_ACTIONS};
+pub use authz::{
+    action_requirement, authorize_edge_action, AcceptedPurpose, ActionRequirement,
+    AuthenticatedActionPolicy, ACTION_REQUIREMENTS, MOUNTED_EDGE_ACTIONS,
+};
 pub use bootstrap::{
     bootstrap_principal_and_mint, BootstrapError, BootstrapOutcome, BootstrapParams,
     BOOTSTRAP_AUTHORITY, BOOTSTRAP_SCHEME,

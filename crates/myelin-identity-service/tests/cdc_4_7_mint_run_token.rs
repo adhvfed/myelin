@@ -73,7 +73,7 @@ fn auth(grants: &[&str]) -> Authority {
 /// (the real crypto round-trip) — never by string-matching the now-opaque token bytes. (These tokens
 /// are minted under `MachineKind::Agent` → the `agent` scheme.)
 fn minted_authority(svc: &StoreBackedCheck, token: &RunToken) -> Authority {
-    svc.introspect_run_token("agent", token)
+    svc.introspect_run_token_at("agent", token, &ts("2026-06-19T00:00:01Z"))
         .expect("a minted per-run token verifies through the real cell trust anchor (MR-012)")
         .authority
 }

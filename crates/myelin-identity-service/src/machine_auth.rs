@@ -19,9 +19,9 @@
 //! row 11.1 (the S1 token records this body resolves) — CONSUMED.
 //!
 //! ## What this module ships (P-ID-07 — the token/machine-identity half of `authenticate`)
-//! [`CapabilityAuthenticator::authenticate`] resolves the **three capability-token types** (PAT,
-//! CI-job, agent-run) and the **two machine-identity surfaces** (repo-scoped deploy-key, per-job /
-//! self-hosted-runner token) — each to the ONE polymorphic [`Principal`] backed by the S1
+//! [`CapabilityAuthenticator::authenticate_identity`] resolves PAT/operator credentials, the three
+//! run-scoped types (CI-job, agent-run, per-job/self-hosted runner), and repo-scoped deploy keys —
+//! each to the ONE polymorphic [`Principal`] plus verified credential context, backed by the S1
 //! [`crate::principal_store::PrincipalStore`]. The pipeline is:
 //!
 //! ```text
@@ -159,12 +159,12 @@ pub enum CredentialPurpose {
     },
     /// A DPoP-bound personal access token.
     Pat,
-    /// A CI job credential.
-    CiJob,
+    /// A CI job credential bound to one run lifecycle.
+    CiJob { run_id: String },
     /// A repository deploy key credential.
     DeployKey,
-    /// A self-hosted per-job credential.
-    PerJob,
+    /// A self-hosted per-job credential bound to one run lifecycle.
+    PerJob { run_id: String },
 }
 
 impl CredentialPurpose {
@@ -174,9 +174,9 @@ impl CredentialPurpose {
             CredentialPurpose::OperatorBootstrap => "operator_bootstrap",
             CredentialPurpose::AgentRun { .. } => "agent_run",
             CredentialPurpose::Pat => "pat",
-            CredentialPurpose::CiJob => "ci_job",
+            CredentialPurpose::CiJob { .. } => "ci_job",
             CredentialPurpose::DeployKey => "deploy_key",
-            CredentialPurpose::PerJob => "per_job",
+            CredentialPurpose::PerJob { .. } => "per_job",
         }
     }
 
@@ -187,15 +187,35 @@ impl CredentialPurpose {
                 MachineKind::Agent
             }
             CredentialPurpose::Pat => MachineKind::Pat,
-            CredentialPurpose::CiJob => MachineKind::Ci,
+            CredentialPurpose::CiJob { .. } => MachineKind::Ci,
             CredentialPurpose::DeployKey => MachineKind::DeployKey,
-            CredentialPurpose::PerJob => MachineKind::PerJob,
+            CredentialPurpose::PerJob { .. } => MachineKind::PerJob,
         }
     }
 
     /// Whether this is the durable run-bound credential shape.
     pub fn is_agent_run(&self) -> bool {
         matches!(self, CredentialPurpose::AgentRun { .. })
+    }
+
+    /// Whether the credential is valid only while a known S7 run lifecycle is live.
+    pub fn is_run_scoped(&self) -> bool {
+        matches!(
+            self,
+            CredentialPurpose::AgentRun { .. }
+                | CredentialPurpose::CiJob { .. }
+                | CredentialPurpose::PerJob { .. }
+        )
+    }
+
+    /// The signed run id for a run-scoped credential.
+    pub fn run_id(&self) -> Option<&str> {
+        match self {
+            CredentialPurpose::AgentRun { run_id, .. }
+            | CredentialPurpose::CiJob { run_id }
+            | CredentialPurpose::PerJob { run_id } => Some(run_id),
+            _ => None,
+        }
     }
 }
 
@@ -505,15 +525,23 @@ impl TokenVerifier for StructuralTokenVerifier {
                 },
             },
             "pat" => CredentialPurpose::Pat,
-            "ci_job" => CredentialPurpose::CiJob,
+            "ci_job" if !run_id.is_empty() => CredentialPurpose::CiJob {
+                run_id: run_id.to_string(),
+            },
             "deploy_key" => CredentialPurpose::DeployKey,
-            "per_job" => CredentialPurpose::PerJob,
+            "per_job" if !run_id.is_empty() => CredentialPurpose::PerJob {
+                run_id: run_id.to_string(),
+            },
             "test_kind" => match kind {
                 MachineKind::Pat => CredentialPurpose::Pat,
-                MachineKind::Ci => CredentialPurpose::CiJob,
+                MachineKind::Ci => CredentialPurpose::CiJob {
+                    run_id: subject_key.to_string(),
+                },
                 MachineKind::Agent => CredentialPurpose::OperatorBootstrap,
                 MachineKind::DeployKey => CredentialPurpose::DeployKey,
-                MachineKind::PerJob => CredentialPurpose::PerJob,
+                MachineKind::PerJob => CredentialPurpose::PerJob {
+                    run_id: subject_key.to_string(),
+                },
             },
             other => {
                 return Err(AuthzError::BadRequest(format!(
@@ -685,26 +713,25 @@ impl CapabilityAuthenticator {
         //     complete denies rather than admit a possibly-revoked token.
         let now = (self.now)();
         let target = RevokeTarget::Jti(token.jti.clone());
-        if token.purpose.is_agent_run() {
-            let CredentialPurpose::AgentRun {
+        if token.purpose.is_run_scoped() {
+            if let CredentialPurpose::AgentRun {
                 delegation_snapshot,
                 ..
             } = &token.purpose
-            else {
-                unreachable!("is_agent_run matched a non-run purpose")
-            };
-            if !matches!(delegation_snapshot, Some(snapshot) if *snapshot > 0) {
-                return Err(AuthzError::FailClosed(
-                    "agent-run credential has no valid durable delegation-policy snapshot; \
-                     caller-supplied legacy run mints are not authorization credentials"
-                        .into(),
-                ));
+            {
+                if !matches!(delegation_snapshot, Some(snapshot) if *snapshot > 0) {
+                    return Err(AuthzError::FailClosed(
+                        "agent-run credential has no valid durable delegation-policy snapshot; \
+                         caller-supplied legacy run mints are not authorization credentials"
+                            .into(),
+                    ));
+                }
             }
             let state = self.revocations.run_token_state(&scope, &target, &now);
             if state != RunTokenState::LiveWithinRunLife {
                 return Err(AuthzError::FailClosed(format!(
-                    "agent-run token `{}` is not live in durable S7 ({state:?}) — expired, torn-down, \
-                     and unknown run credentials are refused",
+                    "run-scoped token `{}` is not live in durable S7 ({state:?}) — expired, \
+                     torn-down, and unknown run credentials are refused",
                     token.jti
                 )));
             }
@@ -906,7 +933,7 @@ mod tests {
     }
 
     /// The frozen verified-token envelope
-    /// `<tenant>|<region>|<subject_key>|<jti>|<dpop:0|1>|<grants>`.
+    /// `<tenant>|<region>|<subject>|<jti>|<dpop>|<grants>|<purpose>|<aud>|<run>|<snapshot>`.
     fn material(
         tenant: &str,
         region: &str,
@@ -947,7 +974,24 @@ mod tests {
         .unwrap();
         st.link_credential(&sc, scheme, subject_key, &PrincipalId(principal_id.into()))
             .unwrap();
-        CapabilityAuthenticator::new(st)
+        let revocations = RevocationStore::new();
+        // Legacy structural fixtures exercise several fixed CI/per-job jtis. They now obey the same
+        // positive run-lifecycle rule as production credentials, so seed explicit live S7 records.
+        if matches!(scheme, scheme::CI | scheme::PER_JOB) {
+            for jti in ["jti-1", "jti-ci", "jti-live", "jti-r1", "jti-r2", "jti-x"] {
+                revocations.register_run_token_ttl(
+                    &sc,
+                    jti,
+                    Timestamp("2020-01-01T00:00:00Z".into()),
+                    Timestamp("2099-01-01T00:00:00Z".into()),
+                );
+            }
+        }
+        CapabilityAuthenticator::with_verifier(
+            st,
+            Arc::new(StructuralTokenVerifier::new()),
+            revocations,
+        )
     }
 
     fn cred(scheme: &str, material: String) -> Credential {
@@ -1009,12 +1053,22 @@ mod tests {
     }
 
     fn run_material(jti: &str) -> String {
-        format!(
-            "acme|eu-west|run-subject|{jti}|0|repo.pull|agent_run|edge|run-1|42"
-        )
+        format!("acme|eu-west|run-subject|{jti}|0|repo.pull|agent_run|edge|run-1|42")
     }
 
-    fn run_authenticator(revocations: RevocationStore, now: &'static str) -> CapabilityAuthenticator {
+    fn run_authenticator(
+        revocations: RevocationStore,
+        now: &'static str,
+    ) -> CapabilityAuthenticator {
+        scoped_run_authenticator(scheme::AGENT, "run-subject", revocations, now)
+    }
+
+    fn scoped_run_authenticator(
+        credential_scheme: &str,
+        subject_key: &str,
+        revocations: RevocationStore,
+        now: &'static str,
+    ) -> CapabilityAuthenticator {
         let st = store();
         let sc = scope("acme", "eu-west");
         st.put_principal(
@@ -1028,8 +1082,8 @@ mod tests {
         .unwrap();
         st.link_credential(
             &sc,
-            scheme::AGENT,
-            "run-subject",
+            credential_scheme,
+            subject_key,
             &PrincipalId("svc:agent".into()),
         )
         .unwrap();
@@ -1105,6 +1159,78 @@ mod tests {
         let material = "acme|eu-west|run-subject|jti-legacy|0|repo.pull|agent_run|edge|run-1|";
         let result = auth.authenticate_identity(&cred(scheme::AGENT, material.into()), None);
         assert!(matches!(result, Err(AuthzError::FailClosed(_))));
+    }
+
+    /// CI-job and self-hosted per-job credentials are run credentials too: neither may use the
+    /// generic revocation path to survive an unknown, expired, or torn-down S7 lifecycle.
+    #[test]
+    fn ci_and_per_job_require_live_durable_s7_state() {
+        for (credential_scheme, purpose, subject, grants) in [
+            (scheme::CI, "ci_job", "ci-run", "ci.checks.report"),
+            (scheme::PER_JOB, "per_job", "runner-job", "selfhosted:acme"),
+        ] {
+            let material = |jti: &str| {
+                format!("acme|eu-west|{subject}|{jti}|0|{grants}|{purpose}|edge|run-7|")
+            };
+            let sc = scope("acme", "eu-west");
+
+            let live_s7 = RevocationStore::new();
+            live_s7.register_run_token_ttl(
+                &sc,
+                "jti-live-kind",
+                Timestamp("2026-07-18T10:00:00Z".into()),
+                Timestamp("2026-07-18T10:05:00Z".into()),
+            );
+            scoped_run_authenticator(credential_scheme, subject, live_s7, "2026-07-18T10:01:00Z")
+                .authenticate_identity(&cred(credential_scheme, material("jti-live-kind")), None)
+                .expect("known live run-scoped credential");
+
+            let unknown = scoped_run_authenticator(
+                credential_scheme,
+                subject,
+                RevocationStore::new(),
+                "2026-07-18T10:01:00Z",
+            )
+            .authenticate_identity(&cred(credential_scheme, material("jti-unknown-kind")), None);
+            assert!(matches!(unknown, Err(AuthzError::FailClosed(_))));
+
+            let expired_s7 = RevocationStore::new();
+            expired_s7.register_run_token_ttl(
+                &sc,
+                "jti-expired-kind",
+                Timestamp("2026-07-18T10:00:00Z".into()),
+                Timestamp("2026-07-18T10:05:00Z".into()),
+            );
+            let expired = scoped_run_authenticator(
+                credential_scheme,
+                subject,
+                expired_s7,
+                "2026-07-18T10:05:00Z",
+            )
+            .authenticate_identity(&cred(credential_scheme, material("jti-expired-kind")), None);
+            assert!(matches!(expired, Err(AuthzError::FailClosed(_))));
+
+            let torn_s7 = RevocationStore::new();
+            torn_s7.register_run_token_ttl(
+                &sc,
+                "jti-torn-kind",
+                Timestamp("2026-07-18T10:00:00Z".into()),
+                Timestamp("2026-07-18T10:05:00Z".into()),
+            );
+            torn_s7.tear_down_run_token(
+                &sc,
+                "jti-torn-kind",
+                Timestamp("2026-07-18T10:01:00Z".into()),
+            );
+            let torn = scoped_run_authenticator(
+                credential_scheme,
+                subject,
+                torn_s7,
+                "2026-07-18T10:02:00Z",
+            )
+            .authenticate_identity(&cred(credential_scheme, material("jti-torn-kind")), None);
+            assert!(matches!(torn, Err(AuthzError::FailClosed(_))));
+        }
     }
 
     /// **A deploy key resolves to a repo-scoped Service principal (architecture §3, C6).** Its
@@ -1470,9 +1596,9 @@ mod tests {
         .unwrap();
         // Revoke the jti through the DURABLE store, in the token's `(tenant, region)` partition.
         let sc = scope("acme", "eu-west");
-        auth.revocations().revoke(
+        auth.revocations().tear_down_run_token(
             &sc,
-            &RevokeTarget::Jti("jti-live".into()),
+            "jti-live",
             Timestamp("2026-06-26T00:00:00Z".into()),
         );
         // After revocation: fail-closed.

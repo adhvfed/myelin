@@ -51,7 +51,7 @@ fn material(
     grants: &[&str],
 ) -> String {
     format!(
-        "{tenant}|{region}|{subject_key}|{jti}|{}|{}|test_kind|edge||",
+        "{tenant}|{region}|{subject_key}|{jti}|{}|{}|per_job|edge|{subject_key}|",
         if dpop { "1" } else { "0" },
         grants.join(",")
     )
@@ -84,10 +84,19 @@ fn provider() -> CapabilityAuthenticator {
     // CDC test exercises the resolution body (tenant-from-token / scope ceiling / revocation consult)
     // over the mock floor verifier, injected explicitly via the production `with_verifier` seam
     // (constructing a `Structural*` double in a `tests/` file is admitted — the scanner excludes tests/).
+    let revocations = RevocationStore::new();
+    for jti in ["jti-1", "jti-2"] {
+        revocations.register_run_token_ttl(
+            &s,
+            jti,
+            myelin_events::Timestamp("2020-01-01T00:00:00Z".into()),
+            myelin_events::Timestamp("2099-01-01T00:00:00Z".into()),
+        );
+    }
     CapabilityAuthenticator::with_verifier(
         store,
         Arc::new(StructuralTokenVerifier::new()),
-        RevocationStore::new(),
+        revocations,
     )
 }
 

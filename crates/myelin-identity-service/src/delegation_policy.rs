@@ -49,11 +49,42 @@ pub struct DelegationRunPolicyCursor {
 /// The exact four-conjunct snapshot and its durable cursor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedDelegationPolicy {
-    pub input: DelegationInput,
+    /// Durable binding facts derived by the resolver; the mint rejects any caller arguments that
+    /// do not match them.
+    pub(crate) run_id: RunId,
+    pub(crate) agent_id: myelin_identity::PrincipalId,
+    pub(crate) trigger_actor_id: myelin_identity::PrincipalId,
+    pub(crate) input: DelegationInput,
     /// The three policy sets after the trigger-held re-check and monotone intersection. Consumers
     /// should mint from this result, never treat an individual raw conjunct as effective authority.
-    pub effective_policy: EffectivePolicy,
-    pub cursor: DelegationRunPolicyCursor,
+    pub(crate) effective_policy: EffectivePolicy,
+    pub(crate) cursor: DelegationRunPolicyCursor,
+}
+
+impl ResolvedDelegationPolicy {
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    pub fn agent_id(&self) -> &myelin_identity::PrincipalId {
+        &self.agent_id
+    }
+
+    pub fn trigger_actor_id(&self) -> &myelin_identity::PrincipalId {
+        &self.trigger_actor_id
+    }
+
+    pub fn input(&self) -> &DelegationInput {
+        &self.input
+    }
+
+    pub fn effective_policy(&self) -> &EffectivePolicy {
+        &self.effective_policy
+    }
+
+    pub fn cursor(&self) -> DelegationRunPolicyCursor {
+        self.cursor
+    }
 }
 
 /// Fail-closed validation and durable resolution errors.
@@ -261,6 +292,9 @@ impl DelegationPolicySource {
         };
         let effective_policy = DelegationAlgebra::new().delegation(agent, trigger_actor, &input);
         Ok(ResolvedDelegationPolicy {
+            run_id: run_id.clone(),
+            agent_id: agent.principal_id.clone(),
+            trigger_actor_id: trigger_actor.principal_id.clone(),
             input,
             effective_policy,
             cursor: DelegationRunPolicyCursor {

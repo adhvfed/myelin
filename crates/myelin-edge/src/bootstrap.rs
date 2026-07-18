@@ -15,14 +15,13 @@
 //! boundary the KMS seal key already draws). There is deliberately **no HTTP endpoint** that mints —
 //! minting is an operator action on the box, never a network-reachable surface.
 //!
-//! ## Why the `agent` scheme + `["agent:run"]` authority (sufficient AND minimal)
+//! ## Why the `agent` scheme + signed operator purpose
 //! See [`BOOTSTRAP_SCHEME`] / [`BOOTSTRAP_AUTHORITY`]: `agent` is a real machine scheme with NO DPoP
 //! requirement (a `pat` requires DPoP sender-constraint that a `git`/`curl` client cannot produce) and
-//! NO authority ceiling (unlike `deploy_key`/`per_job`). The per-OBJECT gate is the ReBAC creator→admin
-//! grant the repo-create path writes (`TupleRepoBootstrap`), and the action gate is the verb-only
-//! allowlist — NEITHER consults the token's authority grant strings for the `agent` kind. So the
-//! `["agent:run"]` grant the oracle tests mint is exactly sufficient for the full product surface (repo
-//! create, git wire pull/push, PR open/review/merge, whoami, events) and nothing wider is needed.
+//! NO authority ceiling (unlike `deploy_key`/`per_job`). The signed `OperatorBootstrap` purpose is
+//! deliberately distinct from a delegated `AgentRun`; only that operator purpose may use the
+//! `edge.operator` authority as an override across mapped Edge actions. Per-object ReBAC remains a
+//! required second conjunct. Re-bootstrap is required for legacy tokens without a signed purpose.
 
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
@@ -33,15 +32,11 @@ use myelin_tenancy::{Region, TenantId};
 
 /// The credential scheme the operator bootstrap token is minted + linked under (`agent`). A real
 /// machine scheme: NO DPoP requirement (so a bearer/basic `git`/`curl` client authenticates) and NO
-/// authority ceiling — exactly what the git-wire + product-API oracle tests prove sufficient. The edge
-/// default token scheme is ALSO set to this, so a bootstrap token works over git (Bearer or Basic) and
-/// curl with no `X-Myelin-Token-Scheme` header.
+/// authority ceiling — exactly what the git-wire + product-API oracle tests prove sufficient.
 pub const BOOTSTRAP_SCHEME: &str = "agent";
 
-/// The authority grant set the bootstrap token carries — `["agent:run"]`, EXACTLY what the oracle
-/// tests mint and prove sufficient for the full surface. Sufficient AND minimal (see the module docs:
-/// the per-object gate is ReBAC, the action gate is a verb allowlist; neither reads this grant for the
-/// `agent` kind).
+/// The authority grant set carried only by a signed `OperatorBootstrap` credential. It is not a
+/// delegated agent capability and never makes `agent:run` a super-capability.
 pub const BOOTSTRAP_AUTHORITY: &[&str] = &["edge.operator"];
 
 /// The parameters an operator bootstrap needs (validated here — empty required fields are refused).
@@ -124,13 +119,19 @@ pub fn bootstrap_principal_and_mint(
     now_unix: i64,
 ) -> Result<BootstrapOutcome, BootstrapError> {
     if params.tenant.trim().is_empty() {
-        return Err(BootstrapError::BadParam("--tenant must be non-empty".into()));
+        return Err(BootstrapError::BadParam(
+            "--tenant must be non-empty".into(),
+        ));
     }
     if params.region.trim().is_empty() {
-        return Err(BootstrapError::BadParam("--region must be non-empty".into()));
+        return Err(BootstrapError::BadParam(
+            "--region must be non-empty".into(),
+        ));
     }
     if params.principal.trim().is_empty() {
-        return Err(BootstrapError::BadParam("--principal must be non-empty".into()));
+        return Err(BootstrapError::BadParam(
+            "--principal must be non-empty".into(),
+        ));
     }
 
     // The verified `(tenant, region)` write scope. The only TenantScope constructor is
@@ -150,21 +151,18 @@ pub fn bootstrap_principal_and_mint(
     // (1) Idempotent upsert of the Human principal. A display name (optional) is sealed under the
     //     per-subject DEK via the durable KMS; with no display name we provision NO profile (and no
     //     DEK) — the common case. The email column is left empty (the founder has no PII to store).
-    let profile = params
-        .display
-        .filter(|d| !d.trim().is_empty())
-        .map(|d| {
-            // Field-shorthand init (locals of the same name) — the SAME pattern principal_store.rs's
-            // test `profile()` helper uses so the live `no-untagged-personal-data` field scanner does
-            // not read this initialiser as an untagged PII field DEFINITION (the tagged definition
-            // lives on `PrincipalProfile`, where the lint must see it).
-            let email = String::new();
-            let display_name = d.to_string();
-            PrincipalProfile {
-                email,
-                display_name,
-            }
-        });
+    let profile = params.display.filter(|d| !d.trim().is_empty()).map(|d| {
+        // Field-shorthand init (locals of the same name) — the SAME pattern principal_store.rs's
+        // test `profile()` helper uses so the live `no-untagged-personal-data` field scanner does
+        // not read this initialiser as an untagged PII field DEFINITION (the tagged definition
+        // lives on `PrincipalProfile`, where the lint must see it).
+        let email = String::new();
+        let display_name = d.to_string();
+        PrincipalProfile {
+            email,
+            display_name,
+        }
+    });
     store
         .put_principal(
             &scope,

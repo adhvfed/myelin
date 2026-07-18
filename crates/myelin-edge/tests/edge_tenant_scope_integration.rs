@@ -74,7 +74,11 @@ impl Handler for TenantScopeProbe {
 
 fn admin_scope(tenant: &str) -> TenantScope {
     TenantScope::from_verified_token(
-        &Principal::stub(PrincipalId("admin".into()), PrincipalKind::Human, TenantId(tenant.into())),
+        &Principal::stub(
+            PrincipalId("admin".into()),
+            PrincipalKind::Human,
+            TenantId(tenant.into()),
+        ),
         Region(REGION.into()),
     )
 }
@@ -111,11 +115,14 @@ async fn edge_sets_the_tenant_scope_in_a_real_transaction() {
         Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
         RevocationStore::new(),
     ));
-    let human = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(
-        KmsEngine::new(),
-    ))));
+    let human = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
+        Arc::new(KmsEngine::new()),
+    )));
 
-    let probe = Arc::new(TenantScopeProbe { pool, rt: tokio::runtime::Handle::current() });
+    let probe = Arc::new(TenantScopeProbe {
+        pool,
+        rt: tokio::runtime::Handle::current(),
+    });
     let gateway = Arc::new(
         Gateway::builder(authn, human, Arc::new(AllowAll))
             .route(Method::Get, "/v1/scope-probe", "edge.scope.probe", probe)
@@ -129,14 +136,18 @@ async fn edge_sets_the_tenant_scope_in_a_real_transaction() {
     });
 
     // Mint a real token for acme and call the probe over real HTTP.
-    let exp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 + 3600;
+    let exp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3600;
     let token = cell.mint(&CapabilityMintSpec {
         tenant: TENANT.into(),
         region: REGION.into(),
         subject_key: "subj-1".into(),
         jti: "jti-scope".into(),
         exp_unix: exp,
-        authority: vec!["agent:run".into()],
+        authority: vec!["edge.operator".into()],
         dpop_jkt: None,
         purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
         audience: myelin_identity_service::CredentialAudience::Edge,
