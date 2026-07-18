@@ -55,6 +55,11 @@ myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-storage = { path = "../myelin-storage" }
 # Timestamp — the RFC-3339 mint instant + revocation-consult `now`.
 myelin-events = { path = "../myelin-events" }
+# The shared production Git mutation adapter and durable filesystem backend. MCP is a leaf binary;
+# myelin-edge does not depend on myelin-mcp, so this promotion is acyclic.
+myelin-edge = { path = "../myelin-edge" }
+myelin-config = { workspace = true }
+myelin-substrate = { path = "../myelin-substrate" }
 
 # The JSON-RPC 2.0 envelopes + the MCP message bodies are serde_json::Value (the ONE workspace-pinned
 # JSON shape — the same convention myelin-edge / myelin-cli use). MCP is JSON-RPC 2.0 over stdio;
@@ -65,6 +70,9 @@ serde_json = { workspace = true }
 # Format the process wall clock as the RFC-3339 `Timestamp` consumed by the run-token mint and
 # revocation checks. Parsing/formatting only: no chrono clock feature is needed.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+zeroize = "1"
+libc = "0.2"
 
 [dev-dependencies]
 # GT-005 integration: bind the concrete git `EffectApi` body (`myelin_edge::GitEffectApi`) to the
@@ -85,3 +93,8 @@ myelin-identity-service = { path = "../myelin-identity-service", features = ["te
 # production shell uses the always-compiled durable arm (`HitlVerdictStore::with_pg` over the
 # `agent_hitl_gate` table, migration 0054), injected by the composition root.
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
+sqlx = { workspace = true }
+
+[features]
+default = []
+integration = ["myelin-storage/integration", "myelin-edge/integration"]

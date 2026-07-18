@@ -12,26 +12,69 @@
 //!   - a REVOKED run token → denied (never routed);
 //!   - a malformed request → a JSON-RPC error, no panic.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use myelin_events::Timestamp;
+struct FailingWriter;
+
+impl std::io::Write for FailingWriter {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "injected broken stdout",
+        ))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+use myelin_events::{MonotonicMinter, OutboxStore, Timestamp};
 use myelin_identity::{
-    DelegationCaveats, FailStaticBound, Principal, PrincipalId, PrincipalKind, RunId, RuntimeRef,
+    DelegationCaveats, FailStaticBound, Principal, PrincipalId, PrincipalKind, RevokeTarget, RunId,
+    RuntimeRef,
 };
 use myelin_identity_service::delegation::DelegationInput;
 use myelin_identity_service::machine_auth::{Authority, MachineKind};
 use myelin_identity_service::mint::{RunTokenMinter, StructuralTokenSigner};
 use myelin_identity_service::revocation::RevocationStore;
+use myelin_identity_service::ResolvedDelegationPolicy;
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
 
 use myelin_mcp::governance::SkeletonEffectApi;
-use myelin_mcp::{CallOutcome, GovernedRouter, McpServer, RunPrincipal, ToolRegistry};
+use myelin_mcp::{
+    AuditPhase, CallOutcome, GateApproverPolicy, GovernanceAudit, GovernanceAuditRecord,
+    GovernedRouter, McpServer, OutboxGovernanceAudit, RunPrincipal, ToolRegistry,
+};
 use myelin_storage::hitl_gate_durable::{GateDecideError, GateState, HitlVerdictStore};
 
 fn now() -> Timestamp {
     Timestamp("2026-06-26T00:00:00Z".into())
+}
+
+struct TestApprovers(Vec<PrincipalId>);
+
+impl GateApproverPolicy for TestApprovers {
+    fn eligible_approvers(
+        &self,
+        _tool: &str,
+        _args: &serde_json::Value,
+    ) -> Result<Vec<PrincipalId>, String> {
+        Ok(self.0.clone())
+    }
+}
+
+struct FailOutcomeAudit;
+
+impl GovernanceAudit for FailOutcomeAudit {
+    fn record(&self, record: GovernanceAuditRecord<'_>) -> Result<(), String> {
+        match record.phase {
+            AuditPhase::Attempt => Ok(()),
+            AuditPhase::Outcome => Err("injected durable audit outage".into()),
+        }
+    }
 }
 
 fn agent_principal(id: &str, tenant: &str) -> Principal {
@@ -48,7 +91,11 @@ fn agent_principal(id: &str, tenant: &str) -> Principal {
 }
 
 fn human_principal(id: &str, tenant: &str) -> Principal {
-    let mut p = Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId(tenant.into()));
+    let mut p = Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        TenantId(tenant.into()),
+    );
     p.region = Region("eu-west".into());
     p
 }
@@ -56,7 +103,11 @@ fn human_principal(id: &str, tenant: &str) -> Principal {
 /// A non-human machine principal (R2.4b — used to prove the distinct-HUMAN approver rule refuses a
 /// machine/service approver even when it is distinct from the requester).
 fn service_principal(id: &str, tenant: &str) -> Principal {
-    let mut p = Principal::stub(PrincipalId(id.into()), PrincipalKind::Service, TenantId(tenant.into()));
+    let mut p = Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Service,
+        TenantId(tenant.into()),
+    );
     p.region = Region("eu-west".into());
     p
 }
@@ -79,6 +130,31 @@ fn governed_router() -> GovernedRouter {
 }
 
 fn governed_router_with_input(input: DelegationInput) -> GovernedRouter {
+    governed_router_with_trigger(input, "trigger-jti", i64::MAX)
+}
+
+fn governed_router_with_trigger(
+    input: DelegationInput,
+    trigger_jti: &str,
+    trigger_expires_at_unix: i64,
+) -> GovernedRouter {
+    governed_router_with_trigger_and_audit(
+        input,
+        trigger_jti,
+        trigger_expires_at_unix,
+        Arc::new(OutboxGovernanceAudit::new(
+            OutboxStore::new(),
+            Arc::new(MonotonicMinter::new()),
+        )),
+    )
+}
+
+fn governed_router_with_trigger_and_audit(
+    input: DelegationInput,
+    trigger_jti: &str,
+    trigger_expires_at_unix: i64,
+    audit: Arc<dyn GovernanceAudit>,
+) -> GovernedRouter {
     let s7 = RevocationStore::new();
     // A REAL per-run minter (the structural floor signer is the EI-01 §1 named seam; the real
     // PASETO/Ed25519 signer swaps in behind the SAME `TokenSigner` trait — the mint's intersection +
@@ -93,16 +169,29 @@ fn governed_router_with_input(input: DelegationInput) -> GovernedRouter {
 
     let caveats = input.delegation.grants().map(str::to_string).collect();
 
+    let run_id = RunId("mcp-run-1".into());
+    let agent_id = PrincipalId("agent:claude".into());
+    let resolved_policy = ResolvedDelegationPolicy::synthetic_for_test(
+        run_id.clone(),
+        agent_id.clone(),
+        trigger.principal_id.clone(),
+        input,
+        1,
+    );
     let principal = RunPrincipal {
         scope,
-        agent_id: PrincipalId("agent:claude".into()),
+        agent_id,
         agent,
         trigger_actor: trigger,
-        run_id: RunId("mcp-run-1".into()),
-        input,
+        trigger_credential_jti: trigger_jti.into(),
+        trigger_expires_at_unix,
+        run_id,
+        resolved_policy,
         caveats: DelegationCaveats(caveats),
         kind: MachineKind::Agent,
-        ttl: FailStaticBound { static_max_secs: 300 },
+        ttl: FailStaticBound {
+            static_max_secs: 300,
+        },
     };
 
     // R2.4: the SERVER-SIDE verdict store (in-memory test double of the durable agent_hitl_gate
@@ -113,15 +202,18 @@ fn governed_router_with_input(input: DelegationInput) -> GovernedRouter {
         PrincipalId("human:operator".into()),
         PrincipalId("agent:claude".into()),
     ];
-    GovernedRouter::new(minter, principal, Box::new(SkeletonEffectApi::new()), verdicts, approvers)
+    GovernedRouter::with_approver_policy(
+        minter,
+        principal,
+        Box::new(SkeletonEffectApi::new()),
+        verdicts,
+        Arc::new(TestApprovers(approvers)),
+        audit,
+    )
 }
 
 fn governed_server() -> McpServer {
-    McpServer::with_router_and_clock(
-        ToolRegistry::with_git(),
-        governed_router(),
-        Arc::new(now),
-    )
+    McpServer::with_router_and_clock(ToolRegistry::with_git(), governed_router(), Arc::new(now))
 }
 
 #[test]
@@ -182,8 +274,14 @@ fn handshake_and_tools_list_over_the_running_protocol() {
     assert_eq!(resps[0]["result"]["serverInfo"]["name"], "myelin-mcp");
     let tools = resps[1]["result"]["tools"].as_array().unwrap();
     let merge = tools.iter().find(|t| t["name"] == "git.merge").unwrap();
-    assert_eq!(merge["annotations"]["requiresApproval"], true, "git.merge is HITL-gated");
-    let review = tools.iter().find(|t| t["name"] == "git.submit_review").unwrap();
+    assert_eq!(
+        merge["annotations"]["requiresApproval"], true,
+        "git.merge is HITL-gated"
+    );
+    let review = tools
+        .iter()
+        .find(|t| t["name"] == "git.submit_review")
+        .unwrap();
     assert_eq!(review["annotations"]["requiresApproval"], false);
 }
 
@@ -193,24 +291,38 @@ fn non_gated_tool_mints_a_run_token_and_routes_through_effect_api() {
     // git.submit_review is NOT requires_approval → it flows mint -> is_live -> EffectApi::apply.
     let resps = drive(
         &server,
-        &[r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":7}}}"#],
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":7}}}"#,
+        ],
     );
     let r = &resps[0];
     assert_eq!(r["result"]["isError"], false);
     let jti = r["result"]["_meta"]["runToken"].as_str().unwrap();
-    assert!(jti.starts_with("runtok:agent:claude:mcp-run-1"), "the run token jti is bound to (agent, run): {jti}");
+    assert!(
+        jti.starts_with("runtok:agent:claude:mcp-run-1"),
+        "the run token jti is bound to (agent, run): {jti}"
+    );
 
     // The EVENT ID is produced by SkeletonEffectApi FROM the RunCtx it was handed — so its presence
     // proves the call genuinely routed THROUGH EffectApi::apply, and its contents prove the RunCtx
     // carried the minted jti + the principal (the audit attribution).
     let event_id = r["result"]["_meta"]["eventId"].as_str().unwrap();
-    assert!(event_id.contains(jti), "the effect was applied under the minted run token (attribution): {event_id}");
-    assert!(event_id.contains("principal:agent:claude"), "attributed to the agent principal: {event_id}");
+    assert!(
+        event_id.contains(jti),
+        "the effect was applied under the minted run token (attribution): {event_id}"
+    );
+    assert!(
+        event_id.contains("principal:agent:claude"),
+        "attributed to the agent principal: {event_id}"
+    );
     assert!(event_id.contains("tool:git.submit_review"));
 
     // The run actually minted a per-run token (not a bare PAT) + audited the call to the run.
     let router = server.router().unwrap();
-    assert!(router.current_token().is_some(), "a per-run token was minted");
+    assert!(
+        router.current_token().is_some(),
+        "a per-run token was minted"
+    );
     let audit = router.audit();
     assert_eq!(audit.len(), 1);
     assert_eq!(audit[0].principal, "agent:claude");
@@ -224,12 +336,23 @@ fn requires_approval_tool_is_hitl_gated_before_apply() {
     // git.merge is requires_approval = true (frozen). With NO approval → withheld (Gated), NOT applied.
     let resps = drive(
         &server,
-        &[r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7}}}"#],
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7}}}"#,
+        ],
     );
     let r = &resps[0];
-    assert!(r["result"]["_meta"]["gateId"].is_string(), "git.merge is gated on HITL");
-    assert!(r["result"]["_meta"]["eventId"].is_null(), "a gated effect was NOT applied (no event id)");
-    assert!(matches!(server.router().unwrap().audit()[0].outcome, CallOutcome::Gated { .. }));
+    assert!(
+        r["result"]["_meta"]["gateId"].is_string(),
+        "git.merge is gated on HITL"
+    );
+    assert!(
+        r["result"]["_meta"]["eventId"].is_null(),
+        "a gated effect was NOT applied (no event id)"
+    );
+    assert!(matches!(
+        server.router().unwrap().audit()[0].outcome,
+        CallOutcome::Gated { .. }
+    ));
 }
 
 /// **R2.4 Defect A (the caller-boolean bypass, closed):** a bare `{"approval":{"granted":true}}`
@@ -242,7 +365,9 @@ fn a_caller_supplied_granted_boolean_never_applies() {
     let server = governed_server();
     let resps = drive(
         &server,
-        &[r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7},"approval":{"granted":true}}}"#],
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7},"approval":{"granted":true}}}"#,
+        ],
     );
     let r = &resps[0];
     assert!(
@@ -265,12 +390,14 @@ fn a_caller_supplied_granted_boolean_never_applies() {
 /// on the SAME server re-surfaces the SAME pending gate (no duplicate spawn).
 #[test]
 fn a_gated_tool_returns_an_opaque_unguessable_gate_id() {
-    let call =
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7}}}"#;
+    let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7}}}"#;
 
     let server = governed_server();
     let resps = drive(&server, &[call]);
-    let gate_id = resps[0]["result"]["_meta"]["gateId"].as_str().unwrap().to_string();
+    let gate_id = resps[0]["result"]["_meta"]["gateId"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let jti = resps[0]["result"]["_meta"]["runToken"].as_str().unwrap();
 
     // NOT the guessable deterministic display string, and not derived from the visible jti.
@@ -287,8 +414,13 @@ fn a_gated_tool_returns_an_opaque_unguessable_gate_id() {
     // A second, independent server gating the IDENTICAL call mints a DIFFERENT id.
     let other = governed_server();
     let other_resps = drive(&other, &[call]);
-    let other_gate = other_resps[0]["result"]["_meta"]["gateId"].as_str().unwrap();
-    assert_ne!(gate_id, other_gate, "gate ids are unpredictable across servers/processes");
+    let other_gate = other_resps[0]["result"]["_meta"]["gateId"]
+        .as_str()
+        .unwrap();
+    assert_ne!(
+        gate_id, other_gate,
+        "gate ids are unpredictable across servers/processes"
+    );
 
     // A RETRY on the same server re-surfaces the SAME pending gate (one row, one card).
     let retry = drive(&server, &[call]);
@@ -307,15 +439,19 @@ fn a_gated_tool_returns_an_opaque_unguessable_gate_id() {
 #[test]
 fn approval_is_a_server_side_verdict_by_a_distinct_human_principal() {
     let server = governed_server();
-    let call =
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7}}}"#;
+    let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7}}}"#;
 
     // (1) WITHHELD → an opaque gate id, a `waiting` row server-side, 0 mutation.
     let gated = drive(&server, &[call]);
-    let gate_id = gated[0]["result"]["_meta"]["gateId"].as_str().unwrap().to_string();
+    let gate_id = gated[0]["result"]["_meta"]["gateId"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(gated[0]["result"]["_meta"]["eventId"].is_null());
     let router = server.router().unwrap();
-    let rec = router.gate_verdict(&gate_id).expect("the gate is a server-side row");
+    let rec = router
+        .gate_verdict(&gate_id)
+        .expect("the gate is a server-side row");
     assert_eq!(rec.state, GateState::Waiting);
     assert_eq!(rec.requested_by, "agent:claude");
     assert!(
@@ -355,7 +491,10 @@ fn approval_is_a_server_side_verdict_by_a_distinct_human_principal() {
         "a still-waiting gate does not apply: {}",
         pending[0]
     );
-    assert_eq!(pending[0]["result"]["_meta"]["gateId"].as_str().unwrap(), gate_id);
+    assert_eq!(
+        pending[0]["result"]["_meta"]["gateId"].as_str().unwrap(),
+        gate_id
+    );
 
     // (4) A DISTINCT human principal approves — SERVER-SIDE.
     router
@@ -367,8 +506,13 @@ fn approval_is_a_server_side_verdict_by_a_distinct_human_principal() {
 
     // (5) The re-drive presenting the approved gate id now applies through EffectApi.
     let applied = drive(&server, &[redrive.as_str()]);
-    let event_id = applied[0]["result"]["_meta"]["eventId"].as_str().expect("applied");
-    assert!(event_id.contains("tool:git.merge"), "the approved effect applied: {event_id}");
+    let event_id = applied[0]["result"]["_meta"]["eventId"]
+        .as_str()
+        .expect("applied");
+    assert!(
+        event_id.contains("tool:git.merge"),
+        "the approved effect applied: {event_id}"
+    );
 }
 
 /// **R2.4: a made-up / forged gate id is DENIED** — the store has no such verdict; the caller
@@ -378,13 +522,21 @@ fn a_made_up_gate_id_is_denied() {
     let server = governed_server();
     let resps = drive(
         &server,
-        &[r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7},"approval":{"gateId":"gate:0123456789abcdef0123456789abcdef"}}}"#],
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7},"approval":{"gateId":"gate:0123456789abcdef0123456789abcdef"}}}"#,
+        ],
     );
     let r = &resps[0];
-    assert_eq!(r["result"]["isError"], true, "a forged gate id is a loud deny: {r}");
+    assert_eq!(
+        r["result"]["isError"], true,
+        "a forged gate id is a loud deny: {r}"
+    );
     assert!(r["result"]["_meta"]["eventId"].is_null(), "0 mutation");
     let reason = r["result"]["_meta"]["reason"].as_str().unwrap();
-    assert!(reason.contains("not granted server-side"), "the deny names the rule: {reason}");
+    assert!(
+        reason.contains("not granted server-side"),
+        "the deny names the rule: {reason}"
+    );
 }
 
 /// **R2.4: an approval is bound to the EXACT effect (tool + args), never the tool name** — an
@@ -393,36 +545,52 @@ fn a_made_up_gate_id_is_denied() {
 #[test]
 fn an_approval_never_transfers_to_a_sibling_effect_and_a_reject_is_final() {
     let server = governed_server();
-    let call7 =
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7}}}"#;
+    let call7 = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7}}}"#;
     let gated = drive(&server, &[call7]);
-    let gate7 = gated[0]["result"]["_meta"]["gateId"].as_str().unwrap().to_string();
+    let gate7 = gated[0]["result"]["_meta"]["gateId"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let router = server.router().unwrap();
-    router.approve_gate(&human_principal("human:operator", "acme"), &gate7).unwrap();
+    router
+        .approve_gate(&human_principal("human:operator", "acme"), &gate7)
+        .unwrap();
 
     // The approved gate for PR 7 does NOT clear a re-drive of PR 8 (same tool, different effect).
     let cross = format!(
         r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"git.merge","arguments":{{"repo":"acme/web","number":8}},"approval":{{"gateId":"{gate7}"}}}}}}"#
     );
     let denied = drive(&server, &[cross.as_str()]);
-    assert_eq!(denied[0]["result"]["isError"], true, "approval never transfers across effects");
+    assert_eq!(
+        denied[0]["result"]["isError"], true,
+        "approval never transfers across effects"
+    );
     assert!(denied[0]["result"]["_meta"]["eventId"].is_null());
 
     // A REJECTED gate is final: re-driving with it is denied (never re-approvable).
-    let call9 =
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":9}}}"#;
+    let call9 = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":9}}}"#;
     let gated9 = drive(&server, &[call9]);
-    let gate9 = gated9[0]["result"]["_meta"]["gateId"].as_str().unwrap().to_string();
-    router.reject_gate(&PrincipalId("human:operator".into()), &gate9).unwrap();
+    let gate9 = gated9[0]["result"]["_meta"]["gateId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    router
+        .reject_gate(&human_principal("human:operator", "acme"), &gate9)
+        .unwrap();
     assert!(
-        router.approve_gate(&human_principal("human:operator", "acme"), &gate9).is_err(),
+        router
+            .approve_gate(&human_principal("human:operator", "acme"), &gate9)
+            .is_err(),
         "a rejected gate never re-transitions"
     );
     let redrive9 = format!(
         r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"git.merge","arguments":{{"repo":"acme/web","number":9}},"approval":{{"gateId":"{gate9}"}}}}}}"#
     );
     let d9 = drive(&server, &[redrive9.as_str()]);
-    assert_eq!(d9[0]["result"]["isError"], true, "a rejected effect is withheld forever (AG-8)");
+    assert_eq!(
+        d9[0]["result"]["isError"], true,
+        "a rejected effect is withheld forever (AG-8)"
+    );
     assert!(d9[0]["result"]["_meta"]["eventId"].is_null(), "0 mutation");
 }
 
@@ -439,42 +607,188 @@ fn a_revoked_run_token_is_denied_never_routed() {
     // The run is killed mid-flight → the per-run token's jti is torn down (MR-011 durable revocation).
     let router = server.router().unwrap();
     let token = router.current_token().unwrap();
-    router.minter().teardown(&router.principal().scope, &token, &now());
+    router
+        .minter()
+        .teardown(&router.principal().scope, &token, &now());
 
     // A subsequent tools/call under the REVOKED run token is DENIED — never routed to EffectApi.
     let second = server
         .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":2}}}"#)
         .unwrap();
     let second: serde_json::Value = serde_json::from_str(&second).unwrap();
-    assert_eq!(second["result"]["isError"], true, "a revoked run token is denied");
+    assert_eq!(
+        second["result"]["isError"], true,
+        "a revoked run token is denied"
+    );
     let reason = second["result"]["_meta"]["reason"].as_str().unwrap();
-    assert!(reason.contains("revoked"), "denied for revocation: {reason}");
+    assert!(
+        reason.contains("revoked"),
+        "denied for revocation: {reason}"
+    );
+}
+
+#[test]
+fn lazy_mint_refuses_expired_or_revoked_trigger_and_clamps_run_life() {
+    let input = || DelegationInput {
+        agent_policy: Authority::of(["repo.push"]),
+        delegation: Authority::of(["repo.push"]),
+        tenant_policy: Authority::of(["repo.push"]),
+        trigger_actor_held: Authority::of(["repo.push"]),
+    };
+    let at = Timestamp("2026-06-26T00:00:00Z".into());
+    let at_unix = chrono::DateTime::parse_from_rfc3339(&at.0)
+        .unwrap()
+        .timestamp();
+    let registry = ToolRegistry::with_git();
+    let tool = registry.resolve("git.open_pr").unwrap();
+    let args = serde_json::json!({"repo":"alpha"});
+
+    let expired = governed_router_with_trigger(input(), "expired-trigger", at_unix);
+    assert!(matches!(
+        expired.call(tool, &args, &at, None),
+        CallOutcome::Denied { reason, .. } if reason.contains("trigger credential is expired")
+    ));
+    assert!(expired.current_token().is_none());
+
+    let revoked = governed_router_with_trigger(input(), "revoked-trigger", at_unix + 60);
+    revoked.minter().revocations().revoke(
+        &revoked.principal().scope,
+        &RevokeTarget::Jti("revoked-trigger".into()),
+        at.clone(),
+    );
+    assert!(matches!(
+        revoked.call(tool, &args, &at, None),
+        CallOutcome::Denied { reason, .. } if reason.contains("trigger credential is revoked")
+    ));
+    assert!(revoked.current_token().is_none());
+
+    let clamped = governed_router_with_trigger(input(), "short-trigger", at_unix + 2);
+    assert!(matches!(
+        clamped.call(tool, &args, &at, None),
+        CallOutcome::Applied { .. }
+    ));
+    let token = clamped.current_token().unwrap();
+    let after_trigger = Timestamp("2026-06-26T00:00:03Z".into());
+    assert!(
+        !clamped
+            .minter()
+            .is_live(&clamped.principal().scope, &token, &after_trigger),
+        "run token must not outlive its authenticated trigger credential"
+    );
 }
 
 #[test]
 fn malformed_request_is_a_jsonrpc_error_no_panic() {
     let server = governed_server();
     let resps = drive(&server, &["{ not valid json"]);
-    assert_eq!(resps[0]["error"]["code"], -32700, "parse error, never a panic");
+    assert_eq!(
+        resps[0]["error"]["code"], -32700,
+        "parse error, never a panic"
+    );
 }
 
 #[test]
 fn stdio_eof_tears_down_the_minted_run_token() {
     let server = governed_server();
-    let request =
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":1}}}"#;
+    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":1}}}"#;
     let mut output = Vec::new();
 
-    server.run(request.as_bytes(), &mut output).expect("stdio session");
+    server
+        .run(request.as_bytes(), &mut output)
+        .expect("stdio session");
 
     let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(response["result"]["isError"], false);
     let router = server.router().unwrap();
-    let token = router.current_token().expect("the session minted a run token");
+    let token = router
+        .current_token()
+        .expect("the session minted a run token");
     assert!(
-        !router.minter().is_live(&router.principal().scope, &token, &now()),
+        !router
+            .minter()
+            .is_live(&router.principal().scope, &token, &now()),
         "EOF immediately revokes the session token"
     );
+}
+
+#[test]
+fn stdio_output_error_still_tears_down_the_minted_run_token() {
+    let server = governed_server();
+    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":1}}}"#;
+    let error = server
+        .run(request.as_bytes(), FailingWriter)
+        .expect_err("broken stdout must surface");
+    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    let router = server.router().unwrap();
+    let token = router
+        .current_token()
+        .expect("request minted before write failed");
+    assert!(
+        !router
+            .minter()
+            .is_live(&router.principal().scope, &token, &now()),
+        "every output-error exit path tears down the run token"
+    );
+}
+
+#[test]
+fn post_mutation_audit_failure_is_indeterminate_terminal_and_tears_down() {
+    let grants = ["repo.push"];
+    let router = governed_router_with_trigger_and_audit(
+        DelegationInput {
+            agent_policy: Authority::of(grants),
+            delegation: Authority::of(grants),
+            tenant_policy: Authority::of(grants),
+            trigger_actor_held: Authority::of(grants),
+        },
+        "trigger-jti",
+        i64::MAX,
+        Arc::new(FailOutcomeAudit),
+    );
+    let server = McpServer::with_router_and_clock(ToolRegistry::with_git(), router, Arc::new(now));
+    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.open_pr","arguments":{"repo":"alpha"}}}"#;
+    let mut output = Vec::new();
+    let error = server
+        .run(request.as_bytes(), &mut output)
+        .expect_err("indeterminate session must stop after its response");
+    assert!(error.to_string().contains("indeterminate"));
+    let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(response["result"]["_meta"]["fatal"], true);
+    let router = server.router().unwrap();
+    assert!(router.is_fatal());
+    let token = router.current_token().unwrap();
+    assert!(
+        !router
+            .minter()
+            .is_live(&router.principal().scope, &token, &now()),
+        "terminal output path must teardown the run token"
+    );
+}
+
+#[test]
+fn post_gate_open_audit_failure_is_also_indeterminate_and_terminal() {
+    let grants = ["pull_request.merge"];
+    let router = governed_router_with_trigger_and_audit(
+        DelegationInput {
+            agent_policy: Authority::of(grants),
+            delegation: Authority::of(grants),
+            tenant_policy: Authority::of(grants),
+            trigger_actor_held: Authority::of(grants),
+        },
+        "trigger-jti",
+        i64::MAX,
+        Arc::new(FailOutcomeAudit),
+    );
+    let registry = ToolRegistry::with_git();
+    let outcome = router.call(
+        registry.resolve("git.merge").unwrap(),
+        &serde_json::json!({"repo":"alpha","number":1}),
+        &now(),
+        None,
+    );
+    assert!(matches!(outcome, CallOutcome::Indeterminate { .. }));
+    assert!(router.is_fatal());
 }
 
 #[test]
@@ -488,11 +802,8 @@ fn governed_calls_read_the_clock_afresh() {
             Timestamp("2026-06-26T00:05:01Z".into())
         }
     });
-    let server = McpServer::with_router_and_clock(
-        ToolRegistry::with_git(),
-        governed_router(),
-        clock,
-    );
+    let server =
+        McpServer::with_router_and_clock(ToolRegistry::with_git(), governed_router(), clock);
     let call = |id| {
         format!(
             r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"git.submit_review","arguments":{{"number":{id}}}}}}}"#

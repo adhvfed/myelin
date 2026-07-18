@@ -2770,15 +2770,21 @@ name = "myelin-mcp"
 version = "0.0.0"
 dependencies = [
  "chrono",
+ "libc",
  "myelin-agent",
+ "myelin-config",
  "myelin-edge",
  "myelin-events",
  "myelin-git",
  "myelin-identity",
  "myelin-identity-service",
  "myelin-storage",
+ "myelin-substrate",
  "myelin-tenancy",
  "serde_json",
+ "sqlx",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

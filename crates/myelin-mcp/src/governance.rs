@@ -27,30 +27,32 @@
 //! 6. **attributes every call** to the run (the jti + the principal + the tool + the outcome) in an
 //!    auditable trail — this is what makes "agent governance real from day one".
 //!
-//! ## What is REAL vs the named boundary (honesty)
-//! - **REAL:** the per-run token mint, the revocation consult, the HITL gate on the frozen flag, the
-//!   routing through the `EffectApi` trait, and the per-run audit attribution.
-//! - **INJECTED:** the concrete `EffectApi` body. The eight-step PlanThenApply pipeline (schema →
-//!   capability → delegation → tenant → budget → HITL → apply-via-public-endpoint → meter) lives in
-//!   `myelin-agent-service`; the composition root injects it. [`SkeletonEffectApi`] is a reference
-//!   chokepoint impl (records the `RunCtx` it received, returns `Applied`) used to prove the ROUTING.
-//! - **DEFERRED:** the durable git-backend EFFECT (a real merge/PR write) is the Git track **E1.1**.
-//!   The governance pipeline + the audit attribution are what's real here; the durable mutation is not.
+//! ## Durable composition and transaction boundary
+//! The production binary injects the durable Git effect adapter and PostgreSQL-backed identity,
+//! revocation, delegation, HITL, and outbox stores. [`SkeletonEffectApi`] remains only a reference
+//! test adapter. Governance audit intent commits before a mutation; the Git backend then commits its
+//! own authoritative domain event with the mutation. Those are separate durable boundaries: this
+//! module does not claim atomicity between the PostgreSQL audit intent and filesystem-backed Git.
 
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use myelin_agent::{EffectApi, EffectAuthority, EffectResult, ProposedEffect, RunCtx};
-use myelin_events::Timestamp;
-use myelin_identity::{
-    DelegationCaveats, FailStaticBound, Principal, PrincipalId, RunId, RunToken,
+use myelin_events::{
+    Actor, AggregateKey, ArtifactRef, CausedBy, DataRole, EventDraft, EventType, IdMinter,
+    OutboxStore, OutboxTx, Timestamp, Visibility,
 };
-use myelin_identity_service::delegation::DelegationInput;
+use myelin_identity::{
+    DelegationCaveats, FailStaticBound, Principal, PrincipalId, RevokeTarget, RunId, RunToken,
+};
+use myelin_identity_service::delegation::authority_of;
+use myelin_identity_service::delegation_policy::ResolvedDelegationPolicy;
 use myelin_identity_service::machine_auth::MachineKind;
 use myelin_identity_service::mint::RunTokenMinter;
 use myelin_storage::hitl_gate_durable::{
     opaque_gate_id, GateDecideError, GateRecord, GateState, HitlVerdictStore,
 };
-use myelin_storage::TenantScope;
+use myelin_storage::{ContentHash, TenantScope};
 
 use crate::registry::RegisteredTool;
 
@@ -68,10 +70,15 @@ pub struct RunPrincipal {
     pub agent: Principal,
     /// The human/operator the run acts on behalf of (the trigger actor — the held-set re-check).
     pub trigger_actor: Principal,
+    /// Signed trigger credential revocation handle, reconsulted immediately before lazy run mint.
+    pub trigger_credential_jti: String,
+    /// Signed trigger expiry. The run token TTL is clamped so it cannot outlive this credential.
+    pub trigger_expires_at_unix: i64,
     /// The run id (the MCP session is one run; the token's life == the run's life).
     pub run_id: RunId,
-    /// The delegation conjuncts the mint intersection composes.
-    pub input: DelegationInput,
+    /// Server-resolved durable policy, including the positive snapshot cursor signed into the
+    /// AgentRun credential. Production has no raw-policy fallback.
+    pub resolved_policy: ResolvedDelegationPolicy,
     /// The frozen-ABI delegation caveat carrier (the projection of `input.delegation`).
     pub caveats: DelegationCaveats,
     /// The token kind (`Agent` for a local-Claude run — a per-run agent token).
@@ -91,6 +98,9 @@ pub enum CallOutcome {
     Gated { gate_id: String, jti: String },
     /// The effect was denied (a revoked/expired run token, a refused mint, or an `EffectApi` deny).
     Denied { reason: String, jti: String },
+    /// Application may have happened, but the post-apply audit observation did not durably commit.
+    /// The process must stop after returning this honest outcome; retry safety is unknown.
+    Indeterminate { reason: String, jti: String },
 }
 
 impl CallOutcome {
@@ -99,7 +109,8 @@ impl CallOutcome {
         match self {
             CallOutcome::Applied { jti, .. }
             | CallOutcome::Gated { jti, .. }
-            | CallOutcome::Denied { jti, .. } => jti,
+            | CallOutcome::Denied { jti, .. }
+            | CallOutcome::Indeterminate { jti, .. } => jti,
         }
     }
 }
@@ -118,6 +129,132 @@ pub struct AuditEntry {
     pub outcome: CallOutcome,
 }
 
+/// The durable audit phases surrounding a mutation. An `Attempt` is committed before
+/// [`EffectApi::apply_authorized`], so an unavailable audit store prevents the effect. `Outcome`
+/// records the observed result afterwards; it is intentionally not claimed atomic with a
+/// filesystem-backed Git mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditPhase {
+    Attempt,
+    Outcome,
+}
+
+/// One bounded governance audit fact. Grouping the attribution fields keeps the persistence
+/// interface difficult to call with accidentally reordered string arguments.
+pub struct GovernanceAuditRecord<'a> {
+    pub scope: &'a TenantScope,
+    pub actor: &'a Principal,
+    pub run_id: &'a RunId,
+    pub tool: &'a str,
+    pub jti: &'a str,
+    pub phase: AuditPhase,
+    pub outcome: Option<&'a CallOutcome>,
+    pub now: &'a Timestamp,
+}
+
+/// Persistence boundary for MCP governance audit. Production injects [`OutboxGovernanceAudit`]
+/// over the PostgreSQL outbox; tests may inject the same type over the test-support store.
+pub trait GovernanceAudit: Send + Sync {
+    fn record(&self, record: GovernanceAuditRecord<'_>) -> Result<(), String>;
+}
+
+/// Governance audit committed through the shared transactional outbox.
+pub struct OutboxGovernanceAudit {
+    outbox: OutboxStore,
+    minter: Arc<dyn IdMinter>,
+}
+
+impl OutboxGovernanceAudit {
+    pub fn new(outbox: OutboxStore, minter: Arc<dyn IdMinter>) -> Self {
+        Self { outbox, minter }
+    }
+}
+
+impl GovernanceAudit for OutboxGovernanceAudit {
+    fn record(&self, record: GovernanceAuditRecord<'_>) -> Result<(), String> {
+        let GovernanceAuditRecord {
+            scope,
+            actor,
+            run_id,
+            tool,
+            jti,
+            phase,
+            outcome,
+            now,
+        } = record;
+        let event_type = audit_event_type(tool, phase, outcome)?;
+        let run_ref = format!("myelin://{}/agent/run/{}", scope.tenant().0, run_id.0);
+        let mut tx = self.outbox.begin(
+            self.minter.clone(),
+            myelin_events::EmitContextBase {
+                tenant: scope.tenant().clone(),
+                region: scope.region().clone(),
+                actor: Actor(actor.clone()),
+                schema_ver: 1,
+                occurred_at: now.clone(),
+                recorded_at: now.clone(),
+                caused_by: Some(CausedBy(format!("mcp:{}", run_id.0))),
+            },
+        );
+        tx.emit(
+            EventDraft {
+                type_: EventType(event_type.into()),
+                subject: ArtifactRef(run_ref.clone()),
+                aggregate: AggregateKey(format!("mcp-run:{}", run_id.0)),
+                payload: serde_json::json!({
+                    "run_ref": run_ref,
+                    "token_ref": format!("jti:{jti}"),
+                }),
+                data_role: DataRole::Controller,
+                visibility: Visibility::Internal,
+                contains_personal_data: false,
+                pii_key_ref: None,
+            },
+            None,
+        )
+        .map_err(|error| error.0)?;
+        tx.commit().map_err(|error| error.0)
+    }
+}
+
+fn audit_event_type(
+    tool: &str,
+    phase: AuditPhase,
+    outcome: Option<&CallOutcome>,
+) -> Result<&'static str, String> {
+    let suffix = match (phase, outcome) {
+        (AuditPhase::Attempt, None) => "attempted",
+        (AuditPhase::Outcome, Some(CallOutcome::Applied { .. })) => "applied",
+        (AuditPhase::Outcome, Some(CallOutcome::Gated { .. })) => "gated",
+        (AuditPhase::Outcome, Some(CallOutcome::Denied { .. })) => "denied",
+        (AuditPhase::Outcome, Some(CallOutcome::Indeterminate { .. })) => "indeterminate",
+        _ => return Err("invalid governance audit phase/outcome pairing".into()),
+    };
+    match (tool, suffix) {
+        ("git.merge", "attempted") => Ok("git.merge.attempted"),
+        ("git.merge", "applied") => Ok("git.merge.applied"),
+        ("git.merge", "gated") => Ok("git.merge.gated"),
+        ("git.merge", "denied") => Ok("git.merge.denied"),
+        ("git.merge", "indeterminate") => Ok("git.merge.indeterminate"),
+        ("git.open_pr", "attempted") => Ok("git.open_pr.attempted"),
+        ("git.open_pr", "applied") => Ok("git.open_pr.applied"),
+        ("git.open_pr", "gated") => Ok("git.open_pr.gated"),
+        ("git.open_pr", "denied") => Ok("git.open_pr.denied"),
+        ("git.open_pr", "indeterminate") => Ok("git.open_pr.indeterminate"),
+        ("git.submit_review", "attempted") => Ok("git.submit_review.attempted"),
+        ("git.submit_review", "applied") => Ok("git.submit_review.applied"),
+        ("git.submit_review", "gated") => Ok("git.submit_review.gated"),
+        ("git.submit_review", "denied") => Ok("git.submit_review.denied"),
+        ("git.submit_review", "indeterminate") => Ok("git.submit_review.indeterminate"),
+        ("git.endorse_fork_ci", "attempted") => Ok("git.endorse_fork_ci.attempted"),
+        ("git.endorse_fork_ci", "applied") => Ok("git.endorse_fork_ci.applied"),
+        ("git.endorse_fork_ci", "gated") => Ok("git.endorse_fork_ci.gated"),
+        ("git.endorse_fork_ci", "denied") => Ok("git.endorse_fork_ci.denied"),
+        ("git.endorse_fork_ci", "indeterminate") => Ok("git.endorse_fork_ci.indeterminate"),
+        _ => Err("governance audit refused an unregistered tool/outcome taxonomy".into()),
+    }
+}
+
 /// Per-run mutable state (the minted token + the audit trail). Behind a `RefCell` because the glue
 /// `EffectApi::apply` is `&self` and the stdio loop is single-threaded.
 #[derive(Default)]
@@ -126,6 +263,18 @@ struct RunState {
     /// The exact effective grant set recorded by the same intersection proof that minted `token`.
     effective_grants: std::collections::BTreeSet<String>,
     audit: Vec<AuditEntry>,
+    fatal: bool,
+}
+
+/// Resolve the active Human principals eligible to decide one exact gated effect. Production uses
+/// a live object-scoped Git ReBAC policy. Tests inject their own explicit fixture implementation;
+/// there is no production static-list constructor.
+pub trait GateApproverPolicy: Send + Sync {
+    fn eligible_approvers(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Result<Vec<PrincipalId>, String>;
 }
 
 /// **THE GOVERNANCE ROUTER** — the MR-006 chokepoint for MCP `tools/call`. Holds the per-run token
@@ -148,7 +297,8 @@ pub struct GovernedRouter {
     /// `list_subjects(object, approve_perm)`, supplied by the composition root). The run's own
     /// agent principal is structurally EXCLUDED at gate-open time, so a self-approval is
     /// unrepresentable even if the composition lists it here.
-    approvers: Vec<PrincipalId>,
+    approver_policy: Arc<dyn GateApproverPolicy>,
+    audit_sink: Arc<dyn GovernanceAudit>,
 }
 
 impl GovernedRouter {
@@ -156,12 +306,14 @@ impl GovernedRouter {
     /// (the platform-owned governance chokepoint — `myelin_agent_service::PlanThenApply` in
     /// production, [`SkeletonEffectApi`] for the routing proof), the server-side HITL verdict
     /// store (R2.4 — durable in production), and the approver set for this run's gates.
-    pub fn new(
+    /// Build a router with a per-effect, object-scoped approver resolver.
+    pub fn with_approver_policy(
         minter: RunTokenMinter,
         principal: RunPrincipal,
         effect_api: Box<dyn EffectApi>,
         verdicts: HitlVerdictStore,
-        approvers: Vec<PrincipalId>,
+        approver_policy: Arc<dyn GateApproverPolicy>,
+        audit_sink: Arc<dyn GovernanceAudit>,
     ) -> GovernedRouter {
         GovernedRouter {
             minter,
@@ -169,7 +321,8 @@ impl GovernedRouter {
             effect_api,
             state: RefCell::new(RunState::default()),
             verdicts: RefCell::new(verdicts),
-            approvers,
+            approver_policy,
+            audit_sink,
         }
     }
 
@@ -186,6 +339,12 @@ impl GovernedRouter {
     /// The per-run token the run has minted + is acting under (`None` before the first call).
     pub fn current_token(&self) -> Option<RunToken> {
         self.state.borrow().token.clone()
+    }
+
+    /// A post-apply audit failure makes the session terminal: serving another request could turn an
+    /// ambiguous mutation into an unsafe retry chain.
+    pub fn is_fatal(&self) -> bool {
+        self.state.borrow().fatal
     }
 
     /// Explicitly revoke the current session token. Safe before the first call and idempotent after
@@ -210,23 +369,44 @@ impl GovernedRouter {
             return Ok(t);
         }
         let p = &self.principal;
-        let (token, proof) = self
+        let now_unix = chrono::DateTime::parse_from_rfc3339(&now.0)
+            .map_err(|_| "current time is not a valid RFC3339 instant".to_string())?
+            .timestamp();
+        if now_unix >= p.trigger_expires_at_unix {
+            return Err("authenticated MCP trigger credential is expired".into());
+        }
+        if self.minter.revocations().is_revoked(
+            &p.scope,
+            &RevokeTarget::Jti(p.trigger_credential_jti.clone()),
+            now,
+        ) {
+            return Err("authenticated MCP trigger credential is revoked".into());
+        }
+        let remaining = u64::try_from(p.trigger_expires_at_unix - now_unix)
+            .map_err(|_| "trigger credential remaining lifetime is invalid".to_string())?;
+        let ttl = FailStaticBound {
+            static_max_secs: p.ttl.static_max_secs.min(remaining),
+        };
+        let token = self
             .minter
-            .mint_proved(
+            .mint_from_resolved_policy(
                 &p.scope,
                 &p.agent_id,
                 &p.run_id,
                 &p.agent,
                 &p.trigger_actor,
-                &p.input,
+                &p.resolved_policy,
                 &p.caveats,
                 p.kind,
-                &p.ttl,
+                &ttl,
                 now,
             )
             .map_err(|e| format!("per-run token mint refused: {e}"))?;
         let mut state = self.state.borrow_mut();
-        state.effective_grants = proof.effective.into_iter().collect();
+        state.effective_grants = authority_of(p.resolved_policy.effective_policy())
+            .grants()
+            .map(str::to_string)
+            .collect();
         state.token = Some(token.clone());
         Ok(token)
     }
@@ -253,7 +433,14 @@ impl GovernedRouter {
             Ok(t) => t,
             // No token was minted ⇒ attribute the deny to the (would-be) run, jti unknown.
             Err(reason) => {
-                return self.record(tool.name(), CallOutcome::Denied { reason, jti: "<unminted>".into() })
+                return self.record(
+                    tool.name(),
+                    CallOutcome::Denied {
+                        reason,
+                        jti: "<unminted>".into(),
+                    },
+                    now,
+                )
             }
         };
         let jti = token.jti.clone();
@@ -267,6 +454,7 @@ impl GovernedRouter {
                         .into(),
                     jti,
                 },
+                now,
             );
         }
 
@@ -290,7 +478,7 @@ impl GovernedRouter {
                         tool.name()
                     ),
                     jti,
-                },
+                }, now,
             );
         }
 
@@ -301,11 +489,53 @@ impl GovernedRouter {
         if tool.requires_approval() {
             let effect_key = mcp_effect_key(tool.name(), args);
             match presented_gate_id {
-                // No gate presented → withhold: open (or resurface) the pending gate row and
-                // return its OPAQUE server-issued id. 0 mutation.
+                // No gate presented → withhold the Git effect, but open (or resurface) a durable
+                // pending gate row and return its OPAQUE server-issued id. Opening the row is a
+                // governance-state mutation, so its durable audit intent is recorded first.
                 None => {
-                    let gate_id = self.open_or_resurface_gate(&effect_key);
-                    return self.record(tool.name(), CallOutcome::Gated { gate_id, jti });
+                    if self
+                        .audit_sink
+                        .record(GovernanceAuditRecord {
+                            scope: &self.principal.scope,
+                            actor: &self.principal.agent,
+                            run_id: &self.principal.run_id,
+                            tool: tool.name(),
+                            jti: &jti,
+                            phase: AuditPhase::Attempt,
+                            outcome: None,
+                            now,
+                        })
+                        .is_err()
+                    {
+                        return self.push_local_audit(
+                            tool.name(),
+                            CallOutcome::Denied {
+                                reason: "durable pre-gate audit is unavailable; effect withheld"
+                                    .into(),
+                                jti,
+                            },
+                        );
+                    }
+                    let gate_id = match self.open_or_resurface_gate(tool.name(), args, &effect_key)
+                    {
+                        Ok(gate) => gate,
+                        Err(reason) => {
+                            return self.record(
+                                tool.name(),
+                                CallOutcome::Denied { reason, jti },
+                                now,
+                            )
+                        }
+                    };
+                    let outcome = CallOutcome::Gated {
+                        gate_id: gate_id.0,
+                        jti,
+                    };
+                    return if gate_id.1 {
+                        self.record_after_mutation(tool.name(), outcome, now)
+                    } else {
+                        self.record(tool.name(), outcome, now)
+                    };
                 }
                 // A gate id presented → LOOK IT UP in the verdict store. Never trust the caller.
                 Some(gid) => {
@@ -320,7 +550,11 @@ impl GovernedRouter {
                         {
                             return self.record(
                                 tool.name(),
-                                CallOutcome::Gated { gate_id: gid.to_string(), jti },
+                                CallOutcome::Gated {
+                                    gate_id: gid.to_string(),
+                                    jti,
+                                },
+                                now,
                             );
                         }
                         // Everything else — unknown/forged id, rejected/expired gate, an approval
@@ -338,6 +572,7 @@ impl GovernedRouter {
                                     ),
                                     jti,
                                 },
+                                now,
                             );
                         }
                     }
@@ -355,12 +590,41 @@ impl GovernedRouter {
             tool: tool.name().to_string(),
         };
         let effect = proposed_effect_for(tool.name(), args);
-        let outcome = match self.effect_api.apply_authorized(&run_ctx, &authority, effect) {
-            EffectResult::Applied(ev) => CallOutcome::Applied { event_id: ev.0, jti },
+        if self
+            .audit_sink
+            .record(GovernanceAuditRecord {
+                scope: &self.principal.scope,
+                actor: &self.principal.agent,
+                run_id: &self.principal.run_id,
+                tool: tool.name(),
+                jti: &jti,
+                phase: AuditPhase::Attempt,
+                outcome: None,
+                now,
+            })
+            .is_err()
+        {
+            return self.record(
+                tool.name(),
+                CallOutcome::Denied {
+                    reason: "durable pre-apply audit is unavailable; effect withheld".into(),
+                    jti,
+                },
+                now,
+            );
+        }
+        let outcome = match self
+            .effect_api
+            .apply_authorized(&run_ctx, &authority, effect)
+        {
+            EffectResult::Applied(ev) => CallOutcome::Applied {
+                event_id: ev.0,
+                jti,
+            },
             EffectResult::Gated(g) => CallOutcome::Gated { gate_id: g.0, jti },
             EffectResult::Denied(reason) => CallOutcome::Denied { reason, jti },
         };
-        self.record(tool.name(), outcome)
+        self.record_after_mutation(tool.name(), outcome, now)
     }
 
     /// **Open (or resurface) the pending gate row for `effect_key` (R2.4 withhold).** If a
@@ -368,14 +632,33 @@ impl GovernedRouter {
     /// call re-surfaces the SAME pending gate — no duplicate spawn); otherwise a fresh row is
     /// INSERTed under an OPAQUE random gate id. The run's own agent principal is structurally
     /// excluded from the persisted approver filter.
-    fn open_or_resurface_gate(&self, effect_key: &str) -> String {
+    fn open_or_resurface_gate(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+        effect_key: &str,
+    ) -> Result<(String, bool), String> {
+        let requested_by = self.principal.agent_id.0.clone();
+        let mut approvers = self
+            .approver_policy
+            .eligible_approvers(tool, args)?
+            .into_iter()
+            .map(|principal| principal.0)
+            .filter(|principal| principal != &requested_by)
+            .collect::<Vec<_>>();
+        approvers.sort();
+        approvers.dedup();
+        if approvers.is_empty() {
+            return Err(
+                "no active object-authorized Human approver is available for this effect".into(),
+            );
+        }
         let mut verdicts = self.verdicts.borrow_mut();
         if let Some(existing) =
             verdicts.find_waiting(&self.principal.scope, &self.principal.run_id.0, effect_key)
         {
-            return existing.gate_id;
+            return Ok((existing.gate_id, false));
         }
-        let requested_by = self.principal.agent_id.0.clone();
         let gate_id = opaque_gate_id();
         let record = GateRecord {
             gate_id: gate_id.clone(),
@@ -383,12 +666,7 @@ impl GovernedRouter {
             effect_id: effect_key.to_string(),
             risk_summary: Vec::new(),
             cost_estimate: 0,
-            approver_filter: self
-                .approvers
-                .iter()
-                .map(|p| p.0.clone())
-                .filter(|p| *p != requested_by)
-                .collect(),
+            approver_filter: approvers,
             state: GateState::Waiting,
             card_ref: None,
             requested_by,
@@ -396,8 +674,8 @@ impl GovernedRouter {
         };
         verdicts
             .open(&self.principal.scope, record)
-            .expect("a freshly minted opaque gate id never collides");
-        gate_id
+            .map_err(|error| format!("durable HITL gate open refused: {error}"))?;
+        Ok((gate_id, true))
     }
 
     /// **The server-side APPROVAL surface (R2.4 / R2.4b).** The human decision path (the approval
@@ -417,8 +695,13 @@ impl GovernedRouter {
 
     /// **The server-side REJECT surface (R2.4).** Settles the gate `rejected` — the effect is
     /// withheld forever (0 mutation, AG-8); a later re-drive presenting this gate id is denied.
-    pub fn reject_gate(&self, decider: &PrincipalId, gate_id: &str) -> Result<(), GateDecideError> {
-        self.verdicts.borrow_mut().reject(&self.principal.scope, gate_id, &decider.0)
+    pub fn reject_gate(&self, decider: &Principal, gate_id: &str) -> Result<(), GateDecideError> {
+        self.verdicts.borrow_mut().reject(
+            &self.principal.scope,
+            gate_id,
+            &decider.principal_id.0,
+            decider.kind.clone(),
+        )
     }
 
     /// Read a gate's current verdict row (the operator/test observability read).
@@ -427,14 +710,64 @@ impl GovernedRouter {
     }
 
     /// Append the outcome to the run's audit trail, attributed to the jti + the principal + the tool.
-    fn record(&self, tool: &str, outcome: CallOutcome) -> CallOutcome {
-        let entry = AuditEntry {
+    fn record(&self, tool: &str, outcome: CallOutcome, now: &Timestamp) -> CallOutcome {
+        let recorded = match self.audit_sink.record(GovernanceAuditRecord {
+            scope: &self.principal.scope,
+            actor: &self.principal.agent,
+            run_id: &self.principal.run_id,
+            tool,
+            jti: outcome.jti(),
+            phase: AuditPhase::Outcome,
+            outcome: Some(&outcome),
+            now,
+        }) {
+            Ok(()) => outcome,
+            Err(_) => CallOutcome::Denied {
+                reason: "durable governance audit is unavailable; no effect was attempted".into(),
+                jti: outcome.jti().to_string(),
+            },
+        };
+        self.push_local_audit(tool, recorded)
+    }
+
+    /// Record an outcome after entering the application boundary. A durable audit failure at this
+    /// point is not a denial: the backend may already have mutated and emitted its domain event.
+    fn record_after_mutation(
+        &self,
+        tool: &str,
+        outcome: CallOutcome,
+        now: &Timestamp,
+    ) -> CallOutcome {
+        let recorded = match self.audit_sink.record(GovernanceAuditRecord {
+            scope: &self.principal.scope,
+            actor: &self.principal.agent,
+            run_id: &self.principal.run_id,
+            tool,
+            jti: outcome.jti(),
+            phase: AuditPhase::Outcome,
+            outcome: Some(&outcome),
+            now,
+        }) {
+            Ok(()) => outcome,
+            Err(_) => {
+                self.state.borrow_mut().fatal = true;
+                CallOutcome::Indeterminate {
+                    reason: "effect outcome is indeterminate because post-apply audit persistence failed; session terminated"
+                        .into(),
+                    jti: outcome.jti().to_string(),
+                }
+            }
+        };
+        self.push_local_audit(tool, recorded)
+    }
+
+    fn push_local_audit(&self, tool: &str, outcome: CallOutcome) -> CallOutcome {
+        self.state.borrow_mut().audit.push(AuditEntry {
             jti: outcome.jti().to_string(),
             principal: self.principal.agent_id.0.clone(),
             tool: tool.to_string(),
             outcome: outcome.clone(),
-        };
-        self.state.borrow_mut().audit.push(entry);
+        });
         outcome
     }
 }
@@ -444,7 +777,86 @@ impl GovernedRouter {
 /// a `BTreeMap`), so an approval granted for `git.merge {number: 7}` NEVER clears a re-drive of
 /// `git.merge {number: 8}` — the approval is bound to the exact effect, not the tool name.
 pub fn mcp_effect_key(tool: &str, args: &serde_json::Value) -> String {
-    format!("mcp:{tool}:{args}")
+    let canonical = canonical_json(args);
+    let mut bound = Vec::with_capacity(tool.len() + 1 + canonical.to_string().len());
+    bound.extend_from_slice(tool.as_bytes());
+    bound.push(0);
+    bound.extend_from_slice(canonical.to_string().as_bytes());
+    let digest = ContentHash::blake3(&bound).to_multihash_string();
+    if tool == "git.merge" {
+        if let Some(repo) = args
+            .get("repo")
+            .and_then(serde_json::Value::as_str)
+            .filter(|repo| !repo.is_empty() && repo.len() <= 255)
+        {
+            return format!(
+                "mcp:v1:git.merge:repohex:{}:{digest}",
+                hex_encode(repo.as_bytes())
+            );
+        }
+    }
+    format!("mcp:v1:{tool}:{digest}")
+}
+
+/// Recover the bounded repository name deliberately bound into a canonical git.merge gate key.
+/// Operator decisions use this server-created value for their live object authorization check;
+/// caller-supplied CLI values never select the authorization object.
+pub fn git_merge_repo_from_effect_key(effect_key: &str) -> Option<String> {
+    let rest = effect_key.strip_prefix("mcp:v1:git.merge:repohex:")?;
+    let (encoded, digest) = rest.split_once(":blake3:")?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes = hex_decode(encoded)?;
+    if bytes.is_empty() || bytes.len() > 255 {
+        return None;
+    }
+    let repo = String::from_utf8(bytes).ok()?;
+    myelin_git::gix_backend::validate_repo_slug(&repo).ok()?;
+    Some(repo)
+}
+
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut result = serde_json::Map::new();
+            for key in keys {
+                result.insert(key.clone(), canonical_json(&object[key]));
+            }
+            serde_json::Value::Object(result)
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonical_json).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn hex_decode(encoded: &str) -> Option<Vec<u8>> {
+    if !encoded.len().is_multiple_of(2) || encoded.len() > 510 {
+        return None;
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let hi = (pair[0] as char).to_digit(16)?;
+            let lo = (pair[1] as char).to_digit(16)?;
+            Some(((hi << 4) | lo) as u8)
+        })
+        .collect()
 }
 
 /// Build the [`RunCtx`] an effect is applied under — it carries the run-token `jti` + the principal +
@@ -476,7 +888,9 @@ pub struct SkeletonEffectApi {
 impl SkeletonEffectApi {
     /// A fresh recording skeleton chokepoint.
     pub fn new() -> SkeletonEffectApi {
-        SkeletonEffectApi { calls: RefCell::new(Vec::new()) }
+        SkeletonEffectApi {
+            calls: RefCell::new(Vec::new()),
+        }
     }
 
     /// The `(RunCtx, ProposedEffect)` pairs this chokepoint was handed — proof the routing went
@@ -488,7 +902,9 @@ impl SkeletonEffectApi {
 
 impl EffectApi for SkeletonEffectApi {
     fn apply(&self, run: &RunCtx, effect: ProposedEffect) -> EffectResult {
-        self.calls.borrow_mut().push((run.0.clone(), effect.0.clone()));
+        self.calls
+            .borrow_mut()
+            .push((run.0.clone(), effect.0.clone()));
         // The governance pipeline + attribution are REAL; the durable git effect is E1.1. A
         // deterministic Applied(event id) keyed to the run is a valid skeleton apply outcome.
         EffectResult::Applied(myelin_agent::EventId(format!("evt:{}", run.0)))
@@ -501,5 +917,53 @@ impl EffectApi for SkeletonEffectApi {
         effect: ProposedEffect,
     ) -> EffectResult {
         self.apply(run, effect)
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::{git_merge_repo_from_effect_key, mcp_effect_key};
+
+    #[test]
+    fn effect_key_is_canonical_bounded_and_binds_the_validated_repo() {
+        let mut first = serde_json::Map::new();
+        first.insert("repo".into(), serde_json::json!("team/alpha"));
+        first.insert("number".into(), serde_json::json!(7));
+        let mut second = serde_json::Map::new();
+        second.insert("number".into(), serde_json::json!(7));
+        second.insert("repo".into(), serde_json::json!("team/alpha"));
+        let first = mcp_effect_key("git.merge", &serde_json::Value::Object(first));
+        let second = mcp_effect_key("git.merge", &serde_json::Value::Object(second));
+        assert_eq!(
+            first, second,
+            "object insertion order cannot change gate identity"
+        );
+        assert!(first.len() < 700);
+        assert_eq!(
+            git_merge_repo_from_effect_key(&first).as_deref(),
+            Some("team/alpha")
+        );
+
+        let huge = mcp_effect_key(
+            "git.open_pr",
+            &serde_json::json!({"title":"x".repeat(900_000)}),
+        );
+        assert!(
+            huge.len() < 128,
+            "caller args are represented only by a digest"
+        );
+    }
+
+    #[test]
+    fn merge_effect_key_parser_refuses_malformed_or_aliasing_repo_names() {
+        let traversal = mcp_effect_key(
+            "git.merge",
+            &serde_json::json!({"repo":"../secrets","number":1}),
+        );
+        assert!(git_merge_repo_from_effect_key(&traversal).is_none());
+        assert!(git_merge_repo_from_effect_key(
+            "mcp:v1:git.merge:repohex:zz:blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )
+        .is_none());
     }
 }

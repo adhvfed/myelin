@@ -18,26 +18,38 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use myelin_events::Timestamp;
+use myelin_events::{MonotonicMinter, OutboxStore, Timestamp};
 use myelin_identity::{
     DelegationCaveats, FailStaticBound, Principal, PrincipalId, PrincipalKind, RunId, RuntimeRef,
 };
 use myelin_identity_service::delegation::DelegationInput;
-use myelin_identity_service::machine_auth::{
-    Authority, MachineKind, StructuralTokenVerifier,
-};
-use myelin_identity_service::mint::{
-    RunTokenAuthorizer, RunTokenMinter, StructuralTokenSigner,
-};
+use myelin_identity_service::machine_auth::{Authority, MachineKind, StructuralTokenVerifier};
+use myelin_identity_service::mint::{RunTokenAuthorizer, RunTokenMinter, StructuralTokenSigner};
 use myelin_identity_service::revocation::RevocationStore;
+use myelin_identity_service::ResolvedDelegationPolicy;
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
 
-use myelin_edge::{DurableGitBackend, GitEffectApi};
-use myelin_mcp::{GovernedRouter, McpServer, RunPrincipal, ToolRegistry};
+use myelin_edge::{DenyAllRepos, DurableGitBackend, GitEffectApi, GrantBackedRepos};
+use myelin_mcp::{
+    GateApproverPolicy, GovernedRouter, McpServer, OutboxGovernanceAudit, RunPrincipal,
+    ToolRegistry,
+};
 
 const TENANT: &str = "acme";
 const REGION: &str = "eu-west";
+
+struct TestApprovers(Vec<PrincipalId>);
+
+impl GateApproverPolicy for TestApprovers {
+    fn eligible_approvers(
+        &self,
+        _tool: &str,
+        _args: &serde_json::Value,
+    ) -> Result<Vec<PrincipalId>, String> {
+        Ok(self.0.clone())
+    }
+}
 
 fn now() -> Timestamp {
     Timestamp("2026-06-29T00:00:00Z".into())
@@ -45,7 +57,10 @@ fn now() -> Timestamp {
 
 fn temp_root(tag: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     p.push(format!("myelin-mcp-gt005-{tag}-{nanos}"));
     p
 }
@@ -64,13 +79,29 @@ fn agent_principal(id: &str) -> Principal {
 }
 
 fn human_principal(id: &str) -> Principal {
-    let mut p = Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, TenantId(TENANT.into()));
+    let mut p = Principal::stub(
+        PrincipalId(id.into()),
+        PrincipalKind::Human,
+        TenantId(TENANT.into()),
+    );
     p.region = Region(REGION.into());
     p
 }
 
 /// Build a governed MCP server whose `EffectApi` body is the REAL git effect over `backend`.
 fn governed_git_server(backend: Arc<DurableGitBackend>) -> McpServer {
+    governed_git_server_with_grants(
+        backend,
+        &[
+            "pull_request.merge",
+            "repo.push",
+            "pull_request.review",
+            "repo.approve_untrusted_ci",
+        ],
+    )
+}
+
+fn governed_git_server_with_grants(backend: Arc<DurableGitBackend>, grants: &[&str]) -> McpServer {
     let s7 = RevocationStore::new();
     let boundary_authorizer = Arc::new(
         RunTokenAuthorizer::new(Arc::new(StructuralTokenVerifier::new()), s7.clone())
@@ -83,49 +114,108 @@ fn governed_git_server(backend: Arc<DurableGitBackend>) -> McpServer {
     let trigger = human_principal("human:operator");
     let scope = TenantScope::from_verified_token(&trigger, Region(REGION.into()));
 
-    let grants = [
-        "pull_request.merge",
-        "repo.push",
-        "pull_request.review",
-        "repo.approve_untrusted_ci",
-    ];
     let input = DelegationInput {
-        agent_policy: Authority::of(grants),
-        delegation: Authority::of(grants),
-        tenant_policy: Authority::of(grants),
-        trigger_actor_held: Authority::of(grants),
+        agent_policy: Authority::of(grants.iter().copied()),
+        delegation: Authority::of(grants.iter().copied()),
+        tenant_policy: Authority::of(grants.iter().copied()),
+        trigger_actor_held: Authority::of(grants.iter().copied()),
     };
 
+    let run_id = RunId("mcp-run-1".into());
+    let agent_id = PrincipalId("agent:claude".into());
+    let resolved_policy = ResolvedDelegationPolicy::synthetic_for_test(
+        run_id.clone(),
+        agent_id.clone(),
+        trigger.principal_id.clone(),
+        input,
+        1,
+    );
     let principal = RunPrincipal {
         scope,
-        agent_id: PrincipalId("agent:claude".into()),
+        agent_id,
         agent: agent.clone(),
         trigger_actor: trigger,
-        run_id: RunId("mcp-run-1".into()),
-        input,
+        trigger_credential_jti: "trigger-jti".into(),
+        trigger_expires_at_unix: i64::MAX,
+        run_id,
+        resolved_policy,
         caveats: DelegationCaveats(grants.iter().map(|g| (*g).to_string()).collect()),
         kind: MachineKind::Agent,
-        ttl: FailStaticBound { static_max_secs: 300 },
+        ttl: FailStaticBound {
+            static_max_secs: 300,
+        },
     };
 
     // THE GT-005 INJECTION: the concrete git EffectApi body over the durable backend, bound to the
     // run's verified (tenant, region) + acting principal. R2.4: + the server-side HITL verdict
     // store (the in-memory double of the durable agent_hitl_gate arm) and the approver set.
-    let effect = GitEffectApi::new(
-        backend,
-        TENANT,
-        REGION,
-        agent,
-        boundary_authorizer,
-    );
-    let router = GovernedRouter::new(
+    let effect = GitEffectApi::new(backend, TENANT, REGION, agent, boundary_authorizer);
+    let router = GovernedRouter::with_approver_policy(
         minter,
         principal,
         Box::new(effect),
         myelin_storage::hitl_gate_durable::HitlVerdictStore::new(),
-        vec![PrincipalId("human:operator".into())],
+        Arc::new(TestApprovers(vec![PrincipalId("human:operator".into())])),
+        Arc::new(OutboxGovernanceAudit::new(
+            OutboxStore::new(),
+            Arc::new(MonotonicMinter::new()),
+        )),
     );
     McpServer::with_router_and_clock(ToolRegistry::with_git(), router, Arc::new(now))
+}
+
+#[test]
+fn capability_and_object_rebac_are_independent_required_conjuncts() {
+    let root_denied = temp_root("object-denied");
+    let denied = DurableGitBackend::rooted_inmem_for_test(&root_denied);
+    denied
+        .create_repo(TENANT, REGION, "alpha")
+        .expect("create repo");
+    let denied = Arc::new(denied.with_repo_authorizer(Arc::new(DenyAllRepos)));
+    let capability_only = governed_git_server(denied.clone());
+    let response = capability_only
+        .handle_line(&call(
+            "git.open_pr",
+            serde_json::json!({"repo":"alpha","title":"must not land","head_oid":"deadbeef"}),
+        ))
+        .unwrap();
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["result"]["isError"], true);
+    assert!(response["result"]["_meta"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("object authorization denied"));
+    assert!(denied.get_pr(TENANT, REGION, "alpha", 1).unwrap().is_none());
+
+    let root_cap_denied = temp_root("cap-denied");
+    let object_granted = DurableGitBackend::rooted_inmem_for_test(&root_cap_denied);
+    object_granted
+        .create_repo(TENANT, REGION, "alpha")
+        .expect("create repo");
+    let object_granted = Arc::new(object_granted.with_repo_authorizer(Arc::new(
+        GrantBackedRepos::new().grant_write("agent:claude", TENANT, "alpha"),
+    )));
+    let object_only =
+        governed_git_server_with_grants(object_granted.clone(), &["pull_request.review"]);
+    let response = object_only
+        .handle_line(&call(
+            "git.open_pr",
+            serde_json::json!({"repo":"alpha","title":"must not land","head_oid":"deadbeef"}),
+        ))
+        .unwrap();
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["result"]["isError"], true);
+    assert!(response["result"]["_meta"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("outside the exact minted delegation intersection"));
+    assert!(object_granted
+        .get_pr(TENANT, REGION, "alpha", 1)
+        .unwrap()
+        .is_none());
+
+    let _ = std::fs::remove_dir_all(root_denied);
+    let _ = std::fs::remove_dir_all(root_cap_denied);
 }
 
 fn call(name: &str, args: serde_json::Value) -> String {
@@ -152,12 +242,17 @@ fn call_with_gate(name: &str, args: serde_json::Value, gate_id: &str) -> String 
 fn open_pr_routes_through_effect_api_and_persists_durably() {
     let root = temp_root("openpr");
     let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(&root));
-    backend.create_repo(TENANT, REGION, "alpha").expect("create repo");
+    backend
+        .create_repo(TENANT, REGION, "alpha")
+        .expect("create repo");
 
     let server = governed_git_server(backend.clone());
 
     // Pre-state: no PR yet.
-    assert!(backend.get_pr(TENANT, REGION, "alpha", 1).unwrap().is_none());
+    assert!(backend
+        .get_pr(TENANT, REGION, "alpha", 1)
+        .unwrap()
+        .is_none());
 
     let resp = server
         .handle_line(&call(
@@ -172,9 +267,18 @@ fn open_pr_routes_through_effect_api_and_persists_durably() {
     // tool — the event id is produced by GitEffectApi from the RunCtx it was handed.
     let jti = v["result"]["_meta"]["runToken"].as_str().unwrap();
     let event_id = v["result"]["_meta"]["eventId"].as_str().unwrap();
-    assert!(event_id.contains("git.pr.open"), "the durable git effect ran: {event_id}");
-    assert!(event_id.contains(jti), "attributed to the minted run token: {event_id}");
-    assert!(event_id.contains("principal:agent:claude"), "attributed to the principal: {event_id}");
+    assert!(
+        event_id.contains("git.pr.open"),
+        "the durable git effect ran: {event_id}"
+    );
+    assert!(
+        event_id.contains(jti),
+        "attributed to the minted run token: {event_id}"
+    );
+    assert!(
+        event_id.contains("principal:agent:claude"),
+        "attributed to the principal: {event_id}"
+    );
     assert!(event_id.contains("tool:git.open_pr"));
 
     // THE DURABLE EFFECT: a FRESH read of the on-disk backend reflects the new PR.
@@ -187,7 +291,10 @@ fn open_pr_routes_through_effect_api_and_persists_durably() {
 
     // A SECOND fresh backend instance over the SAME root (a simulated restart) still serves it.
     let fresh = DurableGitBackend::rooted_inmem_for_test(&root);
-    assert!(fresh.get_pr(TENANT, REGION, "alpha", 1).unwrap().is_some(), "survives a fresh backend");
+    assert!(
+        fresh.get_pr(TENANT, REGION, "alpha", 1).unwrap().is_some(),
+        "survives a fresh backend"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -200,7 +307,9 @@ fn open_pr_routes_through_effect_api_and_persists_durably() {
 fn merge_is_hitl_gated_then_reflects_the_server_gate_block() {
     let root = temp_root("merge");
     let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(&root));
-    backend.create_repo(TENANT, REGION, "alpha").expect("create repo");
+    backend
+        .create_repo(TENANT, REGION, "alpha")
+        .expect("create repo");
     // Repo-owned branch protection: require a CI context that is never green → the merge gate must block.
     backend
         .set_branch_protection(
@@ -232,11 +341,20 @@ fn merge_is_hitl_gated_then_reflects_the_server_gate_block() {
     // (1) WITHOUT approval → HITL-gated (withheld, NOT applied). No EffectApi::apply ran. The
     //     gate id is the R2.4 opaque server-issued token backing a `waiting` verdict row.
     let gated = server
-        .handle_line(&call("git.merge", serde_json::json!({ "repo": "alpha", "number": 1 })))
+        .handle_line(&call(
+            "git.merge",
+            serde_json::json!({ "repo": "alpha", "number": 1 }),
+        ))
         .unwrap();
     let g: serde_json::Value = serde_json::from_str(&gated).unwrap();
-    let gate_id = g["result"]["_meta"]["gateId"].as_str().expect("git.merge is HITL-gated").to_string();
-    assert!(g["result"]["_meta"]["eventId"].is_null(), "a gated merge did NOT apply");
+    let gate_id = g["result"]["_meta"]["gateId"]
+        .as_str()
+        .expect("git.merge is HITL-gated")
+        .to_string();
+    assert!(
+        g["result"]["_meta"]["eventId"].is_null(),
+        "a gated merge did NOT apply"
+    );
 
     // (2) A DISTINCT human approves SERVER-SIDE (R2.4 — never a caller boolean), then the re-drive
     //     presenting the gate id routes through EffectApi::apply → the server merge gate BLOCKS.
@@ -254,9 +372,15 @@ fn merge_is_hitl_gated_then_reflects_the_server_gate_block() {
         ))
         .unwrap();
     let d: serde_json::Value = serde_json::from_str(&denied).unwrap();
-    assert_eq!(d["result"]["isError"], true, "the gate-blocked merge is denied: {d}");
+    assert_eq!(
+        d["result"]["isError"], true,
+        "the gate-blocked merge is denied: {d}"
+    );
     let reason = d["result"]["_meta"]["reason"].as_str().unwrap();
-    assert!(reason.contains("merge blocked by policy"), "the gate reason is surfaced: {reason}");
+    assert!(
+        reason.contains("merge blocked by policy"),
+        "the gate reason is surfaced: {reason}"
+    );
 
     // THE GATE WAS NOT BYPASSED: the PR is still open on disk (never merged).
     let rec = backend.get_pr(TENANT, REGION, "alpha", 1).unwrap().unwrap();
