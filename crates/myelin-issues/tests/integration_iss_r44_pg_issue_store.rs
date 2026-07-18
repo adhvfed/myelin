@@ -7,19 +7,14 @@ use myelin_issues::{
     issues_hot_tables, issues_migrations, CreateIssue, IssueAuthorizer, IssuePageRequest,
     IssuePermission, IssueStoreError, PgIssueStore, VisibleIssues,
 };
-use myelin_storage::KmsEngine;
-use myelin_storage::SubstrateProvider;
+use myelin_storage::{KmsEngine, PgBootstrap};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::Row;
 use std::sync::Arc;
 
-fn app_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://myelin_app:myelin_app_pw@localhost:5433/myelin".into())
-}
-
 fn admin_url() -> String {
-    app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
+    std::env::var("DATABASE_MIGRATION_URL")
+        .unwrap_or_else(|_| "postgres://myelin_admin:myelin_dev_pw@localhost:5433/myelin".into())
 }
 
 #[derive(Clone)]
@@ -57,27 +52,26 @@ fn principal(tenant: &str, id: &str) -> Principal {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn durable_create_list_view_close_is_rls_isolated_and_ciphertext_at_rest() {
-    let mut migration_config = MyelinConfig::from_env(Mode::DevDefaults).expect("dev config");
-    migration_config.database_url = admin_url();
-    migration_config.region = "fr-par".into();
-    let migrator = SubstrateProvider::connect(migration_config.clone(), 2)
+    let mut config = MyelinConfig::from_env(Mode::DevDefaults).expect("dev config");
+    config.region = "fr-par".into();
+    let bootstrap = PgBootstrap::connect(config, 4)
         .await
-        .expect("connect migration provider (is docker-compose.dev.yml up?)");
-    migrator
+        .expect("validate split database roles (is docker-compose.dev.yml up?)");
+    bootstrap
         .migrate_foundation()
         .await
         .expect("apply shared outbox/dedup foundation");
-    migrator
+    bootstrap
         .migrate(&issues_migrations(), &issues_hot_tables())
         .await
         .expect("apply boot-applicable Issues table/index/expand migrations");
 
-    // Runtime uses the non-owner NOBYPASSRLS app role, never the migration/owner credentials.
-    let mut app_config = migration_config;
-    app_config.database_url = app_url();
-    let provider = SubstrateProvider::connect(app_config, 4)
+    // Runtime uses the non-owner NOBYPASSRLS app role; handoff has closed the privileged pool and
+    // erased its credential from retained config before the Issue store exists.
+    let provider = bootstrap
+        .into_runtime()
         .await
-        .expect("connect RLS-enforced app provider");
+        .expect("handoff to the RLS-enforced app provider");
 
     let store = PgIssueStore::new(provider, Arc::new(KmsEngine::new()), ExplicitAuthz);
     let suffix = format!("{}_{}", std::process::id(), now_nanos());
