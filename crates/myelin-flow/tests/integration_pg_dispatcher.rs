@@ -154,7 +154,11 @@ async fn restarted_worker_replays_history_without_reexecuting_and_releases_termi
     let mut first_process = worker(&pool, "acme", "no-osl", 2, "worker-before-restart");
     let observed = Arc::clone(&executions);
     first_process
-        .register_definition("wf.recover", 1, "recover-v1", move |ctx| {
+        .register_definition("wf.recover", 1, "recover-v1", move |input, ctx| {
+            assert_eq!(input.run_id, "R-recover");
+            assert_eq!(input.wf_type, "wf.recover");
+            assert_eq!(input.wf_version, 1);
+            assert!(input.input.is_empty());
             ctx.activity(RetryPolicy { max_attempts: 1 }, |_, _| {
                 observed.fetch_add(1, Ordering::SeqCst);
                 Ok(Vec::new())
@@ -177,7 +181,11 @@ async fn restarted_worker_replays_history_without_reexecuting_and_releases_termi
     let mut restarted = worker(&pool, "acme", "no-osl", 2, "worker-after-restart");
     let observed = Arc::clone(&executions);
     restarted
-        .register_definition("wf.recover", 1, "recover-v1", move |ctx| {
+        .register_definition("wf.recover", 1, "recover-v1", move |input, ctx| {
+            assert_eq!(input.run_id, "R-recover");
+            assert_eq!(input.wf_type, "wf.recover");
+            assert_eq!(input.wf_version, 1);
+            assert!(input.input.is_empty());
             ctx.activity(RetryPolicy { max_attempts: 1 }, |_, _| {
                 observed.fetch_add(1, Ordering::SeqCst);
                 Ok(Vec::new())
@@ -227,12 +235,12 @@ async fn two_workers_skip_locked_drive_once_and_never_cross_tenant_or_region() {
     let (bare, pool, schema) = setup("workers").await;
     let mut one = worker(&pool, "acme", "no-osl", 4, "worker-one");
     let mut two = worker(&pool, "acme", "no-osl", 4, "worker-two");
-    one.register_definition("wf.once", 1, "once-v1", |ctx| {
+    one.register_definition("wf.once", 1, "once-v1", |_input, ctx| {
         ctx.now();
         Ok(Vec::new())
     })
     .unwrap();
-    two.register_definition("wf.once", 1, "once-v1", |ctx| {
+    two.register_definition("wf.once", 1, "once-v1", |_input, ctx| {
         ctx.now();
         Ok(Vec::new())
     })
@@ -294,7 +302,7 @@ async fn renewal_failure_joins_body_before_run_once_returns_and_refuses_commit()
     let wait_for_finish = Arc::clone(&finish_rx);
     let exited = Arc::clone(&body_exited);
     worker
-        .register_definition("wf.slow", 1, "slow-v1", move |_ctx| {
+        .register_definition("wf.slow", 1, "slow-v1", move |_input, _ctx| {
             started_tx.send(()).expect("announce body start");
             wait_for_finish
                 .lock()
