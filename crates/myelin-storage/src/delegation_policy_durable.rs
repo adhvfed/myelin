@@ -299,10 +299,9 @@ impl PolicyKey {
         ]
     }
 
-    fn lock_identity(&self, tenant: &str, region: &str) -> String {
+    fn lock_identity(&self, region: &str) -> String {
         format!(
-            "{}:{tenant}{}:{region}{}:{}{}:{}{}:{}",
-            tenant.len(),
+            "{}:{region}{}:{}{}:{}{}:{}",
             region.len(),
             self.kind.len(),
             self.kind,
@@ -579,28 +578,35 @@ impl DurableDelegationPolicyBacking {
 /// heads; provisioning locks the one head it changes. Hash collisions only over-serialize.
 async fn lock_policy_keys(
     conn: &mut sqlx::PgConnection,
-    tenant: &str,
+    tenant_id: &str,
     region: &str,
     keys: &[PolicyKey],
     shared: bool,
 ) -> Result<(), PgError> {
-    let mut identities: Vec<String> = keys
-        .iter()
-        .map(|key| key.lock_identity(tenant, region))
-        .collect();
+    let mut identities: Vec<String> = keys.iter().map(|key| key.lock_identity(region)).collect();
     identities.sort();
     identities.dedup();
-    let sql = if shared {
-        "SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))"
-    } else {
-        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
-    };
     for identity in identities {
-        sqlx::query(sql)
-            .bind(identity)
+        let result = if shared {
+            sqlx::query(
+                "SELECT pg_advisory_xact_lock_shared( \
+                    hashtextextended(length($2)::text || ':' || $2 || ':' || $1, 0))",
+            )
+            .bind(&identity)
+            .bind(tenant_id)
             .execute(&mut *conn)
             .await
-            .map_err(|error| PgError::Query(error.to_string()))?;
+        } else {
+            sqlx::query(
+                "SELECT pg_advisory_xact_lock( \
+                    hashtextextended(length($2)::text || ':' || $2 || ':' || $1, 0))",
+            )
+            .bind(&identity)
+            .bind(tenant_id)
+            .execute(&mut *conn)
+            .await
+        };
+        result.map_err(|error| PgError::Query(error.to_string()))?;
     }
     Ok(())
 }
@@ -704,18 +710,7 @@ async fn load_heads_for_share(
     agent: &str,
     actor: &str,
 ) -> Result<BTreeMap<String, PolicyRow>, PgError> {
-    load_heads(conn, tenant, region, agent, actor, "FOR SHARE OF h, v").await
-}
-
-async fn load_heads(
-    conn: &mut sqlx::PgConnection,
-    tenant: &str,
-    region: &str,
-    agent: &str,
-    actor: &str,
-    lock: &str,
-) -> Result<BTreeMap<String, PolicyRow>, PgError> {
-    let sql = format!(
+    let rows = sqlx::query(
         "SELECT h.policy_kind, h.version, h.revision, v.status, v.grants \
          FROM delegation_policy_head h \
          JOIN delegation_policy_version v \
@@ -727,16 +722,15 @@ async fn load_heads(
               (h.policy_kind = 'delegation' AND h.subject_id = $3 AND h.trigger_actor_id = $4) OR \
               (h.policy_kind = 'tenant' AND h.subject_id = '' AND h.trigger_actor_id = '') OR \
               (h.policy_kind = 'trigger_actor' AND h.subject_id = $4 AND h.trigger_actor_id = '') \
-         ) {lock}"
-    );
-    let rows = sqlx::query(&sql)
-        .bind(tenant)
-        .bind(region)
-        .bind(agent)
-        .bind(actor)
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(|error| PgError::Query(error.to_string()))?;
+         ) FOR SHARE OF h, v",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(agent)
+    .bind(actor)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|error| PgError::Query(error.to_string()))?;
     Ok(rows
         .into_iter()
         .map(|row| {
