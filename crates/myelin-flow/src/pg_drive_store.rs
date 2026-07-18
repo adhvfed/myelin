@@ -7,6 +7,7 @@
 //! outbox rows, and the run settlement in one tenant-scoped PostgreSQL transaction.
 
 use crate::engine::run_state;
+use crate::wfctx::{WAIT_IDEM_PREFIX, WAIT_KEYREF_PREFIX};
 use myelin_events::OutboxRow;
 use myelin_refs::ArtifactRef;
 use myelin_storage::pgrelay::PgRelay;
@@ -32,8 +33,6 @@ const HISTORY_KINDS: &[&str] = &[
     "side_marker",
 ];
 const ATTEMPT_STATES: &[&str] = &["scheduled", "running", "succeeded", "failed", "retrying"];
-const WAIT_IDEM_PREFIX: &str = "myelin://flow/signal-idem/";
-const WAIT_KEYREF_PREFIX: &str = "myelin://flow/signal-key-ref/";
 
 /// A fail-closed drive-storage error. Invariant errors are separate from database errors so a
 /// dispatcher can distinguish retryable infrastructure failure from work that has lost authority.

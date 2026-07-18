@@ -178,7 +178,106 @@ pub enum JobOutcome {
     TimedOut,
 }
 
+/// A replay-stable handle returned once a job dispatch has been durably journaled. The absolute
+/// deadline is fixed at dispatch time, allowing a workflow to dispatch a DAG frontier first and
+/// join its nodes later without extending any node's SLA.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DispatchedJob {
+    pub idem_token: String,
+    pub deadline_unix_secs: Option<i64>,
+}
+
+const JOB_DISPATCH_DEADLINE_PREFIX: &str = "job:dispatch-deadline:";
+
 impl WfCtx {
+    /// Dispatch one job as a journaled, replay-safe activity without joining it. A replay returns
+    /// the same handle and never calls the runner again.
+    pub fn dispatch_job<R>(
+        &mut self,
+        spec: JobSpec,
+        runner: &R,
+        timeout_secs: Option<i64>,
+    ) -> WfResult<DispatchedJob>
+    where
+        R: JobRunner,
+    {
+        let dispatch_command_id = self.peek_next_command_id();
+        let idem_token = job_idem_token(self.run_id(), &dispatch_command_id);
+        let deadline_unix_secs =
+            timeout_secs.map(|timeout| self.drive_now_unix_secs().saturating_add(timeout));
+        let dispatched = JobSpec {
+            idem_token: idem_token.clone(),
+            ..spec
+        };
+        let dispatch_marker = job_dispatch_marker(&idem_token, dispatched.kind);
+        let deadline_marker = deadline_unix_secs.map(|deadline| {
+            myelin_refs::ArtifactRef(format!("{JOB_DISPATCH_DEADLINE_PREFIX}{deadline}"))
+        });
+        let spec_for_closure = dispatched.clone();
+        let marker_for_closure = dispatch_marker.clone();
+        let result = self.activity(
+            crate::RetryPolicy::default_policy(),
+            move |act_idem, _attempt| {
+                debug_assert!(
+                    act_idem.ends_with("/act"),
+                    "the activity's own BUS-2 token is the /act token; the JOB token is /job"
+                );
+                runner.dispatch(&spec_for_closure)?;
+                let mut result = vec![marker_for_closure.clone()];
+                if let Some(deadline) = &deadline_marker {
+                    result.push(deadline.clone());
+                }
+                Ok(result)
+            },
+        )?;
+
+        if !result.iter().any(|artifact| artifact == &dispatch_marker) {
+            return Err(WfError::Nondeterministic(format!(
+                "job dispatch journal at {dispatch_command_id} does not describe `{idem_token}`"
+            )));
+        }
+        let recorded_deadline = result
+            .iter()
+            .find_map(|artifact| artifact.0.strip_prefix(JOB_DISPATCH_DEADLINE_PREFIX))
+            .map(|deadline| {
+                deadline.parse::<i64>().map_err(|_| {
+                    WfError::Nondeterministic(format!(
+                        "job dispatch journal at {dispatch_command_id} has a malformed deadline"
+                    ))
+                })
+            })
+            .transpose()?;
+
+        Ok(DispatchedJob {
+            idem_token,
+            // A journal created before split dispatches carried no dispatch deadline. Retain
+            // compatibility by using the caller's deterministic candidate; an existing wait marker
+            // still wins when the legacy combined primitive replays its join.
+            deadline_unix_secs: recorded_deadline.or(deadline_unix_secs),
+        })
+    }
+
+    /// Join one previously dispatched job by its exact completion key. Sibling `job.done` signals
+    /// cannot satisfy this join and remain buffered for their own branch.
+    pub fn join_dispatched_job(&mut self, job: &DispatchedJob) -> WfResult<JobOutcome> {
+        match self.wait_for_signal_exact_until(
+            JOB_DONE_SIGNAL,
+            &job.idem_token,
+            job.deadline_unix_secs,
+        )? {
+            WaitOutcome::Signalled {
+                idem_key,
+                payload,
+                payload_key_ref: _,
+            } => Ok(JobOutcome::Completed {
+                idem_token: idem_key,
+                result: payload,
+            }),
+            WaitOutcome::Parked => Ok(JobOutcome::Parked),
+            WaitOutcome::TimedOut => Ok(JobOutcome::TimedOut),
+        }
+    }
+
     /// **`schedule_and_run_job(spec, runner, timeout)` (contract 9.2/9.4, §4.9) — the
     /// `SCHEDULE_AND_RUN_JOB` long-park-completed-by-signal idiom.** Dispatch-and-return + park-on-
     /// `job.done` + idempotent completion, composing the existing activity (§4.4) / signal (§4.3) /
@@ -233,37 +332,7 @@ impl WfCtx {
         // `<run_id>/<command_id>/job` (a distinct, deterministic-on-position token the runner echoes).
         // We peek the NEXT command_id (the dispatch position) to derive the job token BEFORE the
         // activity consumes it, so the token is stable + available for the wait.
-        let dispatch_command_id = self.peek_next_command_id();
-        let idem_token = job_idem_token(self.run_id(), &dispatch_command_id);
-
-        // Stamp the deterministic token on the spec the runner receives (the no-coordination
-        // agreement: the runner echoes THIS token on the job.done signal — §4.9).
-        let dispatched = JobSpec {
-            idem_token: idem_token.clone(),
-            ..spec
-        };
-
-        // The dispatch result refs the activity journals (references-not-payloads): a single marker
-        // ref encoding the dispatched job's idem_token + kind, so the journaled
-        // `activity_completed{job_dispatched: true, idem_token}` carries the dispatch evidence (§4.9).
-        let marker_for_closure = job_dispatch_marker(&idem_token, dispatched.kind);
-        let spec_for_closure = dispatched.clone();
-
-        // Run the dispatch as an ordinary journaled activity. The closure hands the (already-stamped)
-        // spec to the runner; a dispatch failure RETRIES (reusing the same idem_token — the runner
-        // dedups a re-dispatched job on it, §4.9). On replay the activity SHORT-CIRCUITS (the job is
-        // NOT re-dispatched) and returns the journaled marker — so the worker never re-hands the spec.
-        self.activity(
-            crate::RetryPolicy::default_policy(),
-            move |act_idem, _attempt| {
-                debug_assert!(
-                    act_idem.ends_with("/act"),
-                    "the activity's own BUS-2 token is the /act token; the JOB token is /job"
-                );
-                runner.dispatch(&spec_for_closure)?;
-                Ok(vec![marker_for_closure.clone()])
-            },
-        )?;
+        let dispatched = self.dispatch_job(spec, runner, timeout_secs)?;
 
         // ── Step 2: PARK on the durable `job.done` signal keyed by the idem_token (§4.3). The wait
         // composes the existing wait_for_signal: it consumes a buffered job.done (the runner already
@@ -280,35 +349,7 @@ impl WfCtx {
         // settles the job + runs its continuation) executes under a token whose life == activity life,
         // never the days-long workflow life. No separate re-mint call is needed here: the long-park
         // resume IS a wait resume, so the wait owns the one re-mint (no double-mint per resume).
-        let outcome = self.wait_for_signal(JOB_DONE_SIGNAL, timeout_secs)?;
-
-        // Step 3: map the wait outcome to the job outcome. A consumed job.done is the completion (the
-        // runner echoed the idem_token; we surface the result refs). A park / timeout pass through.
-        match outcome {
-            WaitOutcome::Signalled {
-                idem_key,
-                payload,
-                payload_key_ref: _,
-            } => {
-                // The runner is REQUIRED to echo the dispatch idem_token on the job.done signal (the
-                // no-coordination agreement, §4.9). A mismatch is a runner protocol violation — surface
-                // it as a loud CoCommit error rather than silently completing on the wrong key (EI-01
-                // §2: never a silent data-correctness bug). On replay the journaled signal carries the
-                // same idem_key, so this check is replay-stable.
-                if idem_key != idem_token {
-                    return Err(WfError::CoCommit(format!(
-                        "job.done idem_key `{idem_key}` does not match the dispatched idem_token \
-                         `{idem_token}` (the runner did not echo the no-coordination dedup key, §4.9)"
-                    )));
-                }
-                Ok(JobOutcome::Completed {
-                    idem_token,
-                    result: payload,
-                })
-            }
-            WaitOutcome::Parked => Ok(JobOutcome::Parked),
-            WaitOutcome::TimedOut => Ok(JobOutcome::TimedOut),
-        }
+        self.join_dispatched_job(&dispatched)
     }
 
     /// **`metered_schedule_and_run_job(spec, runner, timeout, cost, units)` (contract 9.5/9.2/9.4,
@@ -857,36 +898,137 @@ mod tests {
         );
     }
 
-    /// **A runner that does NOT echo the dispatch token is a LOUD error (§4.9, EI-01 §2).** The
-    /// no-coordination dedup agreement requires the runner to echo the dispatch `idem_token` on the
-    /// `job.done` signal; a wrong key surfaces a CoCommit error, never a silent completion on the wrong
-    /// job.
+    /// A completion under another key cannot wake this job. It remains buffered for the branch that
+    /// owns it while the exact join parks.
     #[test]
-    fn job_done_with_a_mismatched_idem_key_is_a_loud_error() {
+    fn job_done_with_a_mismatched_idem_key_remains_buffered() {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let signals = SignalStore::new();
         let runner = RecordingRunner::default();
 
-        // the runner delivered job.done under the WRONG key (a protocol violation).
+        // Another DAG branch completed first under the same shared signal name.
         deliver_job_done(
             &signals,
             "the-wrong-token",
             vec![ArtifactRef("x://y".into())],
         );
 
-        let mut ctx = begin(&outbox, journal, signals);
-        let err = ctx
+        let mut ctx = begin(&outbox, journal, signals.clone());
+        let outcome = ctx
             .schedule_and_run_job(
                 JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"),
                 &runner,
                 None,
             )
-            .expect_err("a mismatched job.done idem_key is a loud error");
-        assert!(
-            matches!(err, WfError::CoCommit(ref m) if m.contains("does not match the dispatched idem_token")),
-            "the mismatch is a loud CoCommit error, got {err:?}"
+            .expect("an unrelated completion is not a protocol error");
+        assert_eq!(outcome, JobOutcome::Parked);
+        assert_eq!(signals.buffered_depth(), 1);
+    }
+
+    #[test]
+    fn dag_joins_consume_exact_keys_when_completions_arrive_out_of_order() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let signals = SignalStore::new();
+        let runner = RecordingRunner::default();
+        let token_a = job_idem_token("R1", "merge.queue:0");
+        let token_b = job_idem_token("R1", "merge.queue:1");
+
+        deliver_job_done(
+            &signals,
+            &token_b,
+            vec![ArtifactRef("myelin://acme/ci/result/b".into())],
         );
+        deliver_job_done(
+            &signals,
+            &token_a,
+            vec![ArtifactRef("myelin://acme/ci/result/a".into())],
+        );
+
+        let mut ctx = begin(&outbox, journal, signals.clone());
+        let a = ctx
+            .dispatch_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/a"),
+                &runner,
+                None,
+            )
+            .unwrap();
+        let b = ctx
+            .dispatch_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/b"),
+                &runner,
+                None,
+            )
+            .unwrap();
+        assert_eq!(a.idem_token, token_a);
+        assert_eq!(b.idem_token, token_b);
+
+        assert_eq!(
+            ctx.join_dispatched_job(&a).unwrap(),
+            JobOutcome::Completed {
+                idem_token: token_a,
+                result: vec![ArtifactRef("myelin://acme/ci/result/a".into())],
+            }
+        );
+        assert_eq!(
+            ctx.join_dispatched_job(&b).unwrap(),
+            JobOutcome::Completed {
+                idem_token: token_b,
+                result: vec![ArtifactRef("myelin://acme/ci/result/b".into())],
+            }
+        );
+        assert_eq!(signals.buffered_depth(), 0);
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn split_join_keeps_the_deadline_fixed_at_dispatch_time() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let signals = SignalStore::new();
+        let timers = crate::timer::TimerStore::new();
+        let runner = RecordingRunner::default();
+
+        let mut first =
+            begin(&outbox, journal.clone(), signals.clone()).with_timers(timers.clone(), 0, 100);
+        let dispatched = first
+            .dispatch_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/a"),
+                &runner,
+                Some(10),
+            )
+            .unwrap();
+        assert_eq!(dispatched.deadline_unix_secs, Some(110));
+        first.commit().unwrap();
+
+        let history = journal.history_for(&tenant(), "R1");
+        let mut resumed = WfCtx::resume(
+            &outbox,
+            minter(),
+            journal,
+            ctx_base(),
+            "R1",
+            "merge.queue",
+            "2026-06-21T00:00:00Z",
+            42,
+            history,
+        )
+        .with_signals(signals)
+        .with_timers(timers, 0, 200);
+        let replayed = resumed
+            .dispatch_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/a"),
+                &runner,
+                Some(10),
+            )
+            .unwrap();
+        assert_eq!(replayed.deadline_unix_secs, Some(110));
+        assert_eq!(
+            resumed.join_dispatched_job(&replayed).unwrap(),
+            JobOutcome::TimedOut
+        );
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
     }
 
     /// **A dispatch that fails RETRIES, reusing the SAME `idem_token` (§4.4/§4.9).** The runner's first

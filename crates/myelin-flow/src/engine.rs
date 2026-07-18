@@ -480,6 +480,20 @@ impl SignalStore {
             .map(|s| (s.idem_key.clone(), s.clone()))
     }
 
+    /// Read the exact buffered, unconsumed signal named by the workflow join. Unlike
+    /// [`Self::first_unconsumed_for`], this never lets a completion for a sibling DAG node satisfy
+    /// the current wait merely because both nodes use the same signal name.
+    pub fn unconsumed_for_exact(
+        &self,
+        tenant: &TenantId,
+        run_id: &str,
+        signal_name: &str,
+        idem_key: &str,
+    ) -> Option<SignalRow> {
+        self.get(tenant, run_id, signal_name, idem_key)
+            .filter(|row| row.consumed_seq.is_none())
+    }
+
     /// **Mark a buffered signal CONSUMED — stamp its `consumed_seq` (P-FLOW-11, §4.3).** The consuming
     /// wait stamps the `wf_history` seq that consumed it so the signal-buffer-depth drops by one and a
     /// re-scan never re-consumes it (consume-exactly-once). Idempotent: a re-consume of an already-
