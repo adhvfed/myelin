@@ -4,6 +4,12 @@
 //! reap across tenants. This module opens the separately configured scheduler credential only after
 //! migrations, validates its server-owned region mapping and exact least-privilege posture, and
 //! exposes the pool solely as [`crate::CiRegionQueueStore`].
+//!
+//! **Named lint exclusion.** This file's SQL reads only PostgreSQL identity, catalog, privilege, and
+//! server-owned scheduler-region metadata. Those are database/cell authorization facts spanning
+//! roles by design, not tenant-store reads, so no `TenantId` predicate exists to bind. The actual
+//! queue data path remains in `job_queue_region.rs` under its mapped-region RLS boundary, while all
+//! tenant mutation verbs remain fully linted in `job_queue_store.rs`.
 
 use myelin_config::MyelinConfig;
 use myelin_storage::connect_pool_with_reset;
@@ -92,6 +98,10 @@ pub enum CiSchedulerDbError {
     BypassRls,
     CreateDatabase,
     CreateRole,
+    DatabaseCreate,
+    PublicSchemaUsageMissing,
+    PublicSchemaCreate,
+    PublicSchemaOwnerMembership,
     CapabilityMembershipMissing,
     CapabilityNotInherited,
     CapabilityCanSetRole,
@@ -130,6 +140,18 @@ impl core::fmt::Display for CiSchedulerDbError {
             Self::BypassRls => "CI scheduler database role can bypass row-level security",
             Self::CreateDatabase => "CI scheduler database role can create databases",
             Self::CreateRole => "CI scheduler database role can create roles",
+            Self::DatabaseCreate => {
+                "CI scheduler database role can create schemas in the target database"
+            }
+            Self::PublicSchemaUsageMissing => {
+                "CI scheduler database role cannot use the application schema"
+            }
+            Self::PublicSchemaCreate => {
+                "CI scheduler database role can create objects in the application schema"
+            }
+            Self::PublicSchemaOwnerMembership => {
+                "CI scheduler database role is a member of the application schema owner"
+            }
             Self::CapabilityMembershipMissing => {
                 "CI scheduler login lacks the region-scheduler capability membership"
             }
@@ -198,13 +220,16 @@ struct SchedulerProbe {
     server_port: Option<i32>,
     session_user: String,
     current_user: String,
-    mapped_region: Option<String>,
     login: bool,
     inherit: bool,
     superuser: bool,
     bypass_rls: bool,
     create_database: bool,
     create_role: bool,
+    database_create: bool,
+    public_schema_usage: bool,
+    public_schema_create: bool,
+    public_schema_owner_member: bool,
     capability_member: bool,
     capability_usage: bool,
     membership_inherit: bool,
@@ -233,15 +258,16 @@ async fn validate_scheduler_pool(
     runtime_pool: &PgPool,
     configured_region: &str,
 ) -> Result<(), CiSchedulerDbError> {
-    let scheduler = scheduler_probe(scheduler_pool).await?;
     let runtime = runtime_identity(runtime_pool).await?;
-    validate_probe(&scheduler, &runtime, configured_region)
+    let scheduler = scheduler_probe(scheduler_pool).await?;
+    validate_probe_before_mapping(&scheduler, &runtime)?;
+    let mapped_region = scheduler_region(scheduler_pool).await?;
+    validate_mapped_region(mapped_region.as_deref(), configured_region)
 }
 
-fn validate_probe(
+fn validate_probe_before_mapping(
     scheduler: &SchedulerProbe,
     runtime: &RuntimeIdentity,
-    configured_region: &str,
 ) -> Result<(), CiSchedulerDbError> {
     if scheduler.database != runtime.database
         || scheduler.database_oid != runtime.database_oid
@@ -271,6 +297,18 @@ fn validate_probe(
     if scheduler.create_role {
         return Err(CiSchedulerDbError::CreateRole);
     }
+    if scheduler.database_create {
+        return Err(CiSchedulerDbError::DatabaseCreate);
+    }
+    if !scheduler.public_schema_usage {
+        return Err(CiSchedulerDbError::PublicSchemaUsageMissing);
+    }
+    if scheduler.public_schema_create {
+        return Err(CiSchedulerDbError::PublicSchemaCreate);
+    }
+    if scheduler.public_schema_owner_member {
+        return Err(CiSchedulerDbError::PublicSchemaOwnerMembership);
+    }
     if !scheduler.capability_member {
         return Err(CiSchedulerDbError::CapabilityMembershipMissing);
     }
@@ -282,13 +320,6 @@ fn validate_probe(
     }
     if scheduler.unexpected_membership {
         return Err(CiSchedulerDbError::UnexpectedMembership);
-    }
-    let mapped_region = scheduler
-        .mapped_region
-        .as_deref()
-        .ok_or(CiSchedulerDbError::RegionUnmapped)?;
-    if mapped_region != configured_region {
-        return Err(CiSchedulerDbError::RegionMismatch);
     }
     if !(scheduler.job_select
         && scheduler.job_update_state
@@ -303,6 +334,24 @@ fn validate_probe(
         return Err(CiSchedulerDbError::ExcessPrivileges);
     }
     Ok(())
+}
+
+fn validate_mapped_region(
+    mapped_region: Option<&str>,
+    configured_region: &str,
+) -> Result<(), CiSchedulerDbError> {
+    let mapped_region = mapped_region.ok_or(CiSchedulerDbError::RegionUnmapped)?;
+    if mapped_region != configured_region {
+        return Err(CiSchedulerDbError::RegionMismatch);
+    }
+    Ok(())
+}
+
+async fn scheduler_region(pool: &PgPool) -> Result<Option<String>, CiSchedulerDbError> {
+    sqlx::query_scalar("SELECT public.myelin_ci_scheduler_region()")
+        .fetch_one(pool)
+        .await
+        .map_err(|_| CiSchedulerDbError::ProbeFailed)
 }
 
 async fn runtime_identity(pool: &PgPool) -> Result<RuntimeIdentity, CiSchedulerDbError> {
@@ -335,13 +384,28 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                 inet_server_port() AS server_port,
                 session_user::text AS session_user,
                 current_user::text AS current_user,
-                public.myelin_ci_scheduler_region() AS mapped_region,
                 login.rolcanlogin AS login,
                 login.rolinherit AS inherit,
                 login.rolsuper AS superuser,
                 login.rolbypassrls AS bypass_rls,
                 login.rolcreatedb AS create_database,
                 login.rolcreaterole AS create_role,
+                pg_catalog.has_database_privilege(
+                  session_user, current_database(), 'CREATE'
+                ) AS database_create,
+                pg_catalog.has_schema_privilege(
+                  session_user, 'public', 'USAGE'
+                ) AS public_schema_usage,
+                pg_catalog.has_schema_privilege(
+                  session_user, 'public', 'CREATE'
+                ) AS public_schema_create,
+                pg_catalog.pg_has_role(
+                  session_user,
+                  (SELECT namespace.nspowner
+                     FROM pg_catalog.pg_namespace AS namespace
+                    WHERE namespace.nspname = 'public'),
+                  'MEMBER'
+                ) AS public_schema_owner_member,
                 pg_catalog.pg_has_role(session_user, $1, 'MEMBER') AS capability_member,
                 pg_catalog.pg_has_role(session_user, $1, 'USAGE') AS capability_usage,
                 COALESCE(membership.inherit_option, false) AS membership_inherit,
@@ -470,13 +534,16 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
         server_port: row.get("server_port"),
         session_user: row.get("session_user"),
         current_user: row.get("current_user"),
-        mapped_region: row.get("mapped_region"),
         login: row.get("login"),
         inherit: row.get("inherit"),
         superuser: row.get("superuser"),
         bypass_rls: row.get("bypass_rls"),
         create_database: row.get("create_database"),
         create_role: row.get("create_role"),
+        database_create: row.get("database_create"),
+        public_schema_usage: row.get("public_schema_usage"),
+        public_schema_create: row.get("public_schema_create"),
+        public_schema_owner_member: row.get("public_schema_owner_member"),
         capability_member: row.get("capability_member"),
         capability_usage: row.get("capability_usage"),
         membership_inherit: row.get("membership_inherit"),
@@ -547,6 +614,10 @@ mod tests {
             CiSchedulerDbError::BypassRls,
             CiSchedulerDbError::CreateDatabase,
             CiSchedulerDbError::CreateRole,
+            CiSchedulerDbError::DatabaseCreate,
+            CiSchedulerDbError::PublicSchemaUsageMissing,
+            CiSchedulerDbError::PublicSchemaCreate,
+            CiSchedulerDbError::PublicSchemaOwnerMembership,
             CiSchedulerDbError::CapabilityMembershipMissing,
             CiSchedulerDbError::CapabilityNotInherited,
             CiSchedulerDbError::CapabilityCanSetRole,

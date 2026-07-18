@@ -36,7 +36,7 @@
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
-    ci_job_queue_store, ci_region_queue_store, CiJobQueueStore, DurableEnqueue, EnqueueOutcome, Lane,
+    ci_job_queue_store, ci_region_queue_store_test_support, CiJobQueueStore, DurableEnqueue, EnqueueOutcome, Lane,
     CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_FAIR_DEFICIT_DDL, INSERT_JOB_QUEUE_QUERY,
     make_tenant_scoped_ddl,
 };
@@ -198,7 +198,7 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
     let admin = reopen_admin().await;
     create_schema(&admin, &schema).await;
     let store = ci_job_queue_store(admin.clone());
-    let region_store = ci_region_queue_store(admin.clone());
+    let region_store = ci_region_queue_store_test_support(admin.clone());
 
     // ── 1. Seed via the STORE's enqueue (tenant-scoped path): a spread of eligibility cases. ──
     // interactive (newer) + batch (older) in-region trusted; out-of-region; wrong-label; and the two

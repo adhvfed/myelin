@@ -57,6 +57,11 @@ does not fight a host-native Postgres/Redis.
 - **`myelin_app`** — the runtime application role. It is `NOSUPERUSER NOBYPASSRLS`: a superuser or
   a `BYPASSRLS` role silently ignores every policy, so the runtime role must be neither. The app
   connects as `myelin_app`; migrations run as `myelin_admin`.
+- **`myelin_ci_region_scheduler` / `myelin_ci_scheduler_fr_par`** — a `NOLOGIN` least-privilege
+  scheduler capability and its constrained dev login. The login is mapped to `fr-par` in a private,
+  admin-owned table and receives only queue `SELECT`, updates to the three lease columns, and
+  fairness reads. It cannot assume the capability role or use a client-selected region to widen its
+  server-owned region boundary.
 - **Session GUCs** `myelin.tenant_id` / `myelin.region` — the app sets these per transaction
   (`SELECT set_config('myelin.tenant_id', $1, true)`); RLS policies reference
   `current_setting('myelin.tenant_id', true)`.
@@ -76,6 +81,7 @@ compose stack; prod supplies every var via the environment.
 |-----------------|----------------------------------------|-------------------------------------------------------------|
 | `DATABASE_URL`  | Postgres runtime OLTP + outbox + ReBAC | `postgres://myelin_app:myelin_app_pw@localhost:5433/myelin` |
 | `DATABASE_MIGRATION_URL` | Postgres migration-only credential | `postgres://myelin_admin:myelin_dev_pw@localhost:5433/myelin` |
+| `MYELIN_CI_SCHEDULER_DATABASE_URL` | CI region claim/reap credential | `postgres://myelin_ci_scheduler_fr_par:myelin_ci_scheduler_dev_pw@localhost:5433/myelin` |
 | `S3_ENDPOINT`   | S3-compatible object-store endpoint    | `http://localhost:9000`                                     |
 | `S3_REGION`     | S3 region label                        | `fr-par`                                                    |
 | `S3_ACCESS_KEY` | S3 access key id                       | `myelin_dev_access`                                         |
@@ -101,6 +107,7 @@ Same vars, prod values — the swap is config only:
 |-----------------|-----------------------------------------------------------------------|
 | `DATABASE_URL`  | `postgres://<runtime-user>:<pw>@<id>.pg.fr-par.scw.cloud:<port>/myelin?sslmode=require` |
 | `DATABASE_MIGRATION_URL` | `postgres://<migration-user>:<pw>@<id>.pg.fr-par.scw.cloud:<port>/myelin?sslmode=require` |
+| `MYELIN_CI_SCHEDULER_DATABASE_URL` | `postgres://<fr-par-scheduler-user>:<pw>@<id>.pg.fr-par.scw.cloud:<port>/myelin?sslmode=require` |
 | `S3_ENDPOINT`   | `https://s3.fr-par.scw.cloud`                                          |
 | `S3_REGION`     | `fr-par`                                                               |
 | `S3_ACCESS_KEY` | Scaleway IAM access key                                                |
@@ -111,7 +118,8 @@ Same vars, prod values — the swap is config only:
 | `MYELIN_REGION` | `fr-par` (residency pinned)                                            |
 
 Residency is pinned to `MYELIN_REGION=fr-par` in prod. Scaleway Managed PostgreSQL supplies distinct
-runtime and migration credentials via `DATABASE_URL` and `DATABASE_MIGRATION_URL`;
+runtime, migration, and constrained CI scheduler credentials via `DATABASE_URL`,
+`DATABASE_MIGRATION_URL`, and `MYELIN_CI_SCHEDULER_DATABASE_URL`;
 Scaleway Object Storage → `S3_*`; Scaleway Managed Redis → `REDIS_URL`; the NATS JetStream +
 durable-workflow containers run on Scaleway compute → `NATS_URL`.
 

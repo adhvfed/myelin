@@ -3,6 +3,8 @@
 #[test]
 fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let source = include_str!("../src/main.rs");
+    let library_source = include_str!("../src/lib.rs");
+    let region_store_source = include_str!("../src/job_queue_region.rs");
 
     assert!(source.contains("MyelinConfig::from_env(Mode::RequireEnv)"));
     assert!(source.contains("CiSchedulerDbConfig::from_env(&platform_config)"));
@@ -57,6 +59,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(!source.contains("std::env::var(\"MYELIN_CI_RUNNER\").ok()"));
     assert!(!source.contains("ci_job_queue_store(provider.db_pool().clone())"));
     assert!(source.contains("scheduler_provider.region_queue_store()"));
+    assert!(!library_source.contains("pub fn ci_region_queue_store("));
+    assert!(!region_store_source.contains("pub fn with_pg"));
 
     assert!(runner_gate < bootstrap);
     assert!(foundation < durable);

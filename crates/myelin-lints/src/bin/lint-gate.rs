@@ -158,6 +158,13 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // LOUD exclusion of a single file (see the module note in job_queue_region.rs), never a silent
     // skip; the lint is NOT weakened.
     "myelin-ci-controlplane/src/job_queue_region.rs",
+    // The CI scheduler DATABASE AUTHORIZATION PROBE reads only PostgreSQL identity/catalog grants
+    // and the private session_user→region authorization function. These are database/cell control-
+    // plane facts spanning roles by design, not tenant-store rows, so the tenant-predicate scanner's
+    // `sqlx::query` fingerprint is a false positive. Queue data access remains isolated in
+    // job_queue_region.rs and every tenant mutation remains fully linted in job_queue_store.rs.
+    // NAMED, LOUD exclusion of this single provider file (see its module note), never a silent skip.
+    "myelin-ci-controlplane/src/ci_scheduler_db.rs",
     // The CHAT FIREHOSE-ONLY LIVE-DELIVERY surface (CHAT-P10 / P-404): `LiveDelivery::deliver` calls
     // `firehose.publish(stream=fan.<tenant>, scope=channel:<id>, frame)` — the EPHEMERAL live
     // message/presence/typing/read-state/partial frames the arch sites FIREHOSE-ONLY (02 §7 / 03 §1.2
