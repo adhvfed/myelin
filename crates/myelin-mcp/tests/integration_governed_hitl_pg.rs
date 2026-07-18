@@ -8,7 +8,7 @@
 #![cfg(feature = "integration")]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 use myelin_agent::{EffectApi, EffectAuthority, EffectResult, ProposedEffect, RunCtx};
 use myelin_config::MyelinConfig;
@@ -21,12 +21,13 @@ use myelin_identity_service::machine_auth::{Authority, MachineKind};
 use myelin_identity_service::mint::{RunTokenMinter, StructuralTokenSigner};
 use myelin_identity_service::revocation::RevocationStore;
 use myelin_identity_service::ResolvedDelegationPolicy;
+use myelin_mcp::governance::mcp_effect_key;
 use myelin_mcp::{
     CallOutcome, GateApproverPolicy, GovernedRouter, OutboxGovernanceAudit, RunPrincipal,
     ToolRegistry,
 };
 use myelin_storage::hitl_gate_durable::{
-    hitl_gate_durable_migrations, GateDecideError, HitlVerdictStore,
+    hitl_gate_durable_migrations, GateDecideError, GateRecord, GateState, HitlVerdictStore,
 };
 use myelin_storage::{
     identity_durable_migrations, DurablePrincipalBacking, DurablePrincipalRow, HotTables,
@@ -98,6 +99,26 @@ fn router(
     agent_id: &str,
     applies: Arc<AtomicUsize>,
 ) -> GovernedRouter {
+    router_with_audit(
+        provider,
+        tenant,
+        region,
+        run_id,
+        agent_id,
+        applies,
+        OutboxStore::new(),
+    )
+}
+
+fn router_with_audit(
+    provider: SubstrateProvider,
+    tenant: &str,
+    region: &str,
+    run_id: &str,
+    agent_id: &str,
+    applies: Arc<AtomicUsize>,
+    audit_store: OutboxStore,
+) -> GovernedRouter {
     let s7 = RevocationStore::new();
     let minter =
         RunTokenMinter::with_signer_and_tuples(s7, None, Arc::new(StructuralTokenSigner::new()));
@@ -139,7 +160,7 @@ fn router(
         HitlVerdictStore::with_pg(provider),
         Arc::new(TestApprovers(vec![PrincipalId("human:lead".into())])),
         Arc::new(OutboxGovernanceAudit::new(
-            OutboxStore::new(),
+            audit_store,
             Arc::new(MonotonicMinter::new()),
         )),
     )
@@ -183,6 +204,94 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
     let merge = registry.resolve("git.merge").unwrap();
     let now = Timestamp("2026-07-18T00:00:00Z".into());
     let applies = Arc::new(AtomicUsize::new(0));
+
+    // MCP's lazy expiry selector is exact-bound at the SQL mutation boundary. A due row owned by
+    // another shared gate producer must remain waiting while the exact MCP gate expires and emits
+    // its gate-identifying terminal audit.
+    let expiry_run = "run:expiry-proof";
+    let expiry_agent = "agent:mcp-expiry";
+    let expiry_args = serde_json::json!({"repo":"alpha","number":99});
+    let expiry_effect = mcp_effect_key("git.merge", &expiry_args);
+    let expiry_scope = TenantScope::from_verified_token(
+        &principal("human:trigger", &tenant, &region, true),
+        Region(region.clone()),
+    );
+    let exact_gate = format!("gate:exact-expiry-{suffix}");
+    let unrelated_gate = format!("gate:agent-service-expiry-{suffix}");
+    let mut expiry_store = HitlVerdictStore::with_pg(app1.clone());
+    for record in [
+        GateRecord {
+            gate_id: exact_gate.clone(),
+            run_id: expiry_run.into(),
+            effect_id: expiry_effect.clone(),
+            risk_summary: Vec::new(),
+            cost_estimate: 0,
+            approver_filter: vec!["human:lead".into()],
+            state: GateState::Waiting,
+            card_ref: None,
+            requested_by: expiry_agent.into(),
+            decided_by: None,
+            opened_at_unix: 1,
+            decided_at_unix: None,
+            expires_at_unix: 2,
+            approval_consumed_at_unix: None,
+        },
+        GateRecord {
+            gate_id: unrelated_gate.clone(),
+            run_id: "agent-service:run".into(),
+            effect_id: "agent-service:v1:deploy:opaque".into(),
+            risk_summary: Vec::new(),
+            cost_estimate: 0,
+            approver_filter: vec!["human:lead".into()],
+            state: GateState::Waiting,
+            card_ref: None,
+            requested_by: "agent:shared-service".into(),
+            decided_by: None,
+            opened_at_unix: 1,
+            decided_at_unix: None,
+            expires_at_unix: 2,
+            approval_consumed_at_unix: None,
+        },
+    ] {
+        expiry_store.open(&expiry_scope, record).unwrap();
+    }
+    let expiry_audit = OutboxStore::new();
+    assert!(matches!(
+        router_with_audit(
+            app1.clone(),
+            &tenant,
+            &region,
+            expiry_run,
+            expiry_agent,
+            applies.clone(),
+            expiry_audit.clone(),
+        )
+        .call(merge, &expiry_args, &now, None),
+        CallOutcome::Gated { .. }
+    ));
+    assert_eq!(
+        expiry_store
+            .fetch(&expiry_scope, &exact_gate)
+            .unwrap()
+            .state,
+        GateState::Expired
+    );
+    assert_eq!(
+        expiry_store
+            .fetch(&expiry_scope, &unrelated_gate)
+            .unwrap()
+            .state,
+        GateState::Waiting,
+        "MCP must not mutate a due gate owned by another shared producer"
+    );
+    assert!(expiry_audit.committed_rows().iter().any(|row| {
+        row.envelope.type_.0 == "git.merge.expired"
+            && row
+                .envelope
+                .subject
+                .0
+                .ends_with(&format!("/hitl-gate/{exact_gate}"))
+    }));
 
     let first = router(
         app1.clone(),
@@ -304,6 +413,64 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
         1,
         "a consumed approval cannot mutate twice"
     );
+
+    // Two fresh processes racing the same approved durable gate get one authorization grant total.
+    let concurrent_gate = match first.call(
+        merge,
+        &serde_json::json!({"repo":"alpha","number":3}),
+        &now,
+        None,
+    ) {
+        CallOutcome::Gated { gate_id, .. } => gate_id,
+        other => panic!("expected concurrent gate, got {other:?}"),
+    };
+    second
+        .approve_gate(
+            &principal("human:lead", &tenant, &region, true),
+            &concurrent_gate,
+            &now,
+        )
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let mut racers = Vec::new();
+    for provider in [app1.clone(), app2.clone()] {
+        let barrier = barrier.clone();
+        let tenant = tenant.clone();
+        let region = region.clone();
+        let gate_id = concurrent_gate.clone();
+        let now = now.clone();
+        let applies = applies.clone();
+        racers.push(tokio::task::spawn_blocking(move || {
+            let registry = ToolRegistry::with_git();
+            let merge = registry.resolve("git.merge").unwrap();
+            let racer = router(
+                provider,
+                &tenant,
+                &region,
+                "run:restart-proof",
+                "agent:mcp",
+                applies,
+            );
+            barrier.wait();
+            racer.call(
+                merge,
+                &serde_json::json!({"repo":"alpha","number":3}),
+                &now,
+                Some(&gate_id),
+            )
+        }));
+    }
+    let mut applied = 0;
+    let mut denied = 0;
+    for racer in racers {
+        match racer.await.unwrap() {
+            CallOutcome::Applied { .. } => applied += 1,
+            CallOutcome::Denied { .. } => denied += 1,
+            other => panic!("unexpected concurrent outcome: {other:?}"),
+        }
+    }
+    assert_eq!((applied, denied), (1, 1));
+    assert_eq!(applies.load(Ordering::SeqCst), 2);
 
     let rejected_gate = match first.call(
         merge,

@@ -71,7 +71,7 @@ fn waiting(tenant_tag: &str, gate_id: &str, effect: &str) -> GateRecord {
         decided_by: None,
         opened_at_unix: 100,
         decided_at_unix: None,
-        expires_at_unix: 200,
+        expires_at_unix: i64::MAX,
         approval_consumed_at_unix: None,
     }
 }
@@ -121,7 +121,7 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
     assert_eq!(rec.state, GateState::Waiting);
     assert_eq!(rec.requested_by, "agent:claude");
     assert!(
-        !rec.authorizes(effect, "agent:claude"),
+        !rec.authorizes(effect, &rec.run_id, "agent:claude"),
         "a waiting gate authorizes nothing"
     );
 
@@ -163,9 +163,13 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
     let rec = store1.fetch(&scope, &gate_id).unwrap();
     assert_eq!(rec.state, GateState::Approved);
     assert_eq!(rec.decided_by.as_deref(), Some("psn:lead"));
-    assert!(rec.authorizes(effect, "agent:claude"));
+    assert!(rec.authorizes(effect, &rec.run_id, "agent:claude"));
     assert!(
-        !rec.authorizes("gate:git.merge:myelin://acme/git/pr/41", "agent:claude"),
+        !rec.authorizes(
+            "gate:git.merge:myelin://acme/git/pr/41",
+            &rec.run_id,
+            "agent:claude"
+        ),
         "the approval is bound to ITS effect (never the tool name)"
     );
     // Terminal: a re-decide refuses durably.
@@ -186,7 +190,7 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
     let rec2 = store2.fetch(&scope, &gate2).unwrap();
     assert_eq!(rec2.state, GateState::Rejected);
     assert!(
-        !rec2.authorizes(effect2, "agent:claude"),
+        !rec2.authorizes(effect2, &rec2.run_id, "agent:claude"),
         "a rejected gate never authorizes"
     );
 

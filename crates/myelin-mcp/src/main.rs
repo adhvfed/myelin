@@ -130,14 +130,12 @@ async fn main() {
 async fn dispatch() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = parse_command(&args)?;
+    preflight_command(&command)?;
     match command {
         Command::Serve => serve(compose_core().await?).await,
         Command::Approve(gate_id) => decide(compose_core().await?, &gate_id, true).await,
         Command::Reject(gate_id) => decide(compose_core().await?, &gate_id, false).await,
-        Command::Bootstrap(parsed) => {
-            validate_bootstrap_scheme(&required_env(MCP_SCHEME_ENV)?)?;
-            bootstrap(compose_core().await?, parsed).await
-        }
+        Command::Bootstrap(parsed) => bootstrap(compose_core().await?, parsed).await,
     }
 }
 
@@ -146,6 +144,39 @@ enum Command {
     Approve(String),
     Reject(String),
     Bootstrap(BootstrapArgs),
+}
+
+/// Pure/configuration preflight that must finish before database connection, migrations, or key
+/// loading. Authentication itself remains after key load, but malformed scope config and unsafe
+/// credential files cannot trigger stateful composition work.
+fn preflight_command(command: &Command) -> Result<(), String> {
+    let tenant = required_env(MCP_TENANT_ENV)?;
+    let region = required_env(MCP_REGION_ENV)?;
+    validate_partition_token(MCP_TENANT_ENV, &tenant)?;
+    validate_partition_token(MCP_REGION_ENV, &region)?;
+    let scheme = required_env(MCP_SCHEME_ENV)?;
+    validate_bootstrap_scheme(&scheme)?;
+    if !matches!(command, Command::Bootstrap(_)) {
+        let path = PathBuf::from(required_env(MCP_CREDENTIAL_FILE_ENV)?);
+        let mut checked_material = read_secret_file(&path)?;
+        checked_material.zeroize();
+    }
+    Ok(())
+}
+
+fn validate_partition_token(name: &str, value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 255
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        Err(format!(
+            "{name} must be a non-empty bounded ASCII partition token"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_command(args: &[String]) -> Result<Command, String> {
@@ -1163,6 +1194,10 @@ mod tests {
         ));
         assert!(parse_command(&args(&["approve", "--gate-id", "bad"])).is_err());
         assert!(validate_bootstrap_scheme("bearer").is_err());
+        assert!(validate_partition_token(MCP_TENANT_ENV, "tenant_01:cell-a").is_ok());
+        for invalid_scope in ["", "tenant name", "tenant/escape", &"x".repeat(256)] {
+            assert!(validate_partition_token(MCP_TENANT_ENV, invalid_scope).is_err());
+        }
 
         for invalid_principal in [
             "",

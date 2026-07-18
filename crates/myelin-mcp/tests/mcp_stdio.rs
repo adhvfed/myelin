@@ -10,6 +10,9 @@ fn binary_refuses_to_serve_without_explicit_durable_configuration() {
         .arg("serve")
         .env_remove("DATABASE_URL")
         .env_remove("DATABASE_MIGRATION_URL")
+        .env_remove("MYELIN_MCP_TENANT")
+        .env_remove("MYELIN_MCP_REGION")
+        .env_remove("MYELIN_MCP_CREDENTIAL_SCHEME")
         .env_remove("MYELIN_MCP_CREDENTIAL_FILE")
         .output()
         .expect("spawn myelin-mcp");
@@ -24,7 +27,7 @@ fn binary_refuses_to_serve_without_explicit_durable_configuration() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("database bootstrap refused"),
-        "missing durable configuration fails loudly: {stderr}"
+        stderr.contains("MYELIN_MCP_TENANT is missing"),
+        "pure scope preflight must fail before database composition: {stderr}"
     );
 }

@@ -528,13 +528,19 @@ impl GovernedRouter {
         //     (git.merge = yes), REUSED — not re-decided here.
         let mut approval_to_consume = None;
         if tool.requires_approval() {
-            // Production expiry path: every gated call advances elapsed waiting rows before it
-            // consults or opens a verdict. State and terminal audit are separate commits: an audit
-            // outage after expiry is therefore fail-loud and makes this session terminal.
-            let expired = self
-                .verdicts
-                .borrow_mut()
-                .expire_due(&self.principal.scope, now_unix);
+            let effect_key = mcp_effect_key(tool.name(), args);
+            // Production expiry is deliberately lazy and ownership-scoped: a gated call advances
+            // only elapsed rows for this exact MCP run, requester, and canonical effect. Other
+            // shared agent-service gates remain untouched until their owning path reconciles them.
+            // State and terminal audit are separate commits: an audit outage after expiry is
+            // therefore fail-loud and makes this session terminal.
+            let expired = self.verdicts.borrow_mut().expire_due_for_effect(
+                &self.principal.scope,
+                &self.principal.run_id.0,
+                &self.principal.agent_id.0,
+                &effect_key,
+                now_unix,
+            );
             if !expired.is_empty() && self.record_expired_gates(&expired, now).is_err() {
                 self.state.borrow_mut().fatal = true;
                 return self.push_local_audit(
@@ -546,7 +552,6 @@ impl GovernedRouter {
                     },
                 );
             }
-            let effect_key = mcp_effect_key(tool.name(), args);
             match presented_gate_id {
                 // No gate presented → withhold the Git effect, but open (or resurface) a durable
                 // pending gate row and return its OPAQUE server-issued id. Opening the row is a
