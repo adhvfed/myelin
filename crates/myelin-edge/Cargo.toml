@@ -100,7 +100,7 @@ hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time", "signal"] }
 # BroadcastStream — adapts the SSE hub's tokio broadcast channel into the streaming response body.
 tokio-stream = { version = "0.1", features = ["sync"] }
 

@@ -107,6 +107,11 @@ pub use git_edge::{register_git, GitEdgeState};
 pub use git_effect::GitEffectApi;
 pub use git_wire_exec::{production_git_core, production_git_core_default, GitWireExecutor};
 pub use git_wire_http::register_git_wire;
+pub use issue_authz::{
+    spawn_issue_authorization_reconciler, IdentityIssueTupleWriter, IssueReconciliationConfig,
+    IssueReconciliationHandle, IssueReconciliationMetrics, IssueReconciliationMetricsSnapshot,
+    IssueReconciliationReport, StoreBackedIssueAuthorizer, ISSUE_RECONCILE_TENANTS_ENV,
+};
 pub use repo_authz::{AllowAllRepos, DenyAllRepos, GrantBackedRepos, RepoAccess, RepoAuthorizer};
 pub use repo_authz_live::{
     repo_object_id, repo_object_ref, CheckBackedRepoAuthorizer, NoRepoBootstrap,
