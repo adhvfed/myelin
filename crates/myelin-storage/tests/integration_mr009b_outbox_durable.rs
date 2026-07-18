@@ -30,9 +30,9 @@ use myelin_storage::pgrelay::PgRelay;
 
 use myelin_events::relay::{InProcessBus, Relay};
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, CausedBy, DataRole, EmitContextBase, EventDraft, EventType,
-    IdMinter, MonotonicMinter, OutboxRow, OutboxStore, OutboxTx, Timestamp, Ulid, Visibility,
-    MAX_PUBLISH_ATTEMPTS, OUTBOX_MIGRATION,
+    Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, DataRole, EmitContextBase,
+    EventDraft, EventEnvelope, EventId, EventType, IdMinter, MonotonicMinter, OutboxRow,
+    OutboxStore, OutboxTx, Timestamp, Ulid, Visibility, MAX_PUBLISH_ATTEMPTS, OUTBOX_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{Region, TenantId};
@@ -56,7 +56,11 @@ fn db_lock() -> &'static tokio::sync::Mutex<()> {
 
 fn uniq() -> String {
     static N: AtomicU64 = AtomicU64::new(0);
-    format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst))
+    format!(
+        "{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    )
 }
 
 fn principal() -> Principal {
@@ -89,6 +93,41 @@ fn draft(type_: &str, aggregate: &str) -> EventDraft {
         visibility: Visibility::Internal,
         contains_personal_data: false,
         pii_key_ref: None,
+    }
+}
+
+fn staged_row(id: &str, aggregate: &str) -> OutboxRow {
+    let subject = ArtifactRef(format!("myelin://acme/issues/issue/{aggregate}"));
+    let aggregate = AggregateKey(aggregate.into());
+    let envelope = EventEnvelope {
+        event_id: EventId(id.into()),
+        type_: EventType("issues.issue.updated".into()),
+        schema_ver: 1,
+        tenant: TenantId("acme".into()),
+        region: Region("fr-par".into()),
+        actor: Actor(principal()),
+        subject: subject.clone(),
+        aggregate: aggregate.clone(),
+        causation_id: None,
+        correlation_id: CorrelationId(id.into()),
+        caused_by: None,
+        depth: 0,
+        contains_personal_data: false,
+        data_role: DataRole::Controller,
+        visibility: Visibility::Internal,
+        pii_key_ref: None,
+        occurred_at: Timestamp("2026-07-18T00:00:00Z".into()),
+        recorded_at: Timestamp("2026-07-18T00:00:01Z".into()),
+        payload: serde_json::json!({ "ref": subject.0 }),
+    };
+    OutboxRow {
+        event_id: envelope.event_id.clone(),
+        aggregate,
+        seq: 0,
+        subject,
+        envelope,
+        published_at: None,
+        attempts: 0,
     }
 }
 
@@ -198,9 +237,15 @@ fn commit_read_drain_scenario(store: &OutboxStore) -> Vec<(String, String, u64)>
     // Commit 2 events to aggregate A and 1 to aggregate B in ONE transaction.
     let mut tx = store.begin(m, ctx_base());
     tx.stage_state_change("state");
-    let a0 = tx.emit(draft("issues.issue.created", "issue:A"), None).unwrap();
-    let b0 = tx.emit(draft("issues.issue.created", "issue:B"), None).unwrap();
-    let a1 = tx.emit(draft("issues.issue.updated", "issue:A"), None).unwrap();
+    let a0 = tx
+        .emit(draft("issues.issue.created", "issue:A"), None)
+        .unwrap();
+    let b0 = tx
+        .emit(draft("issues.issue.created", "issue:B"), None)
+        .unwrap();
+    let a1 = tx
+        .emit(draft("issues.issue.updated", "issue:A"), None)
+        .unwrap();
     // emit-iff-committed: nothing durable before commit.
     assert_eq!(store.outbox_depth(), 0, "open tx wrote nothing");
     tx.commit().unwrap();
@@ -309,7 +354,11 @@ fn duplicate_rejected_scenario(store: &OutboxStore) {
         err.0
     );
     // atomicity: the rejected commit staged NOTHING new — the original row is untouched.
-    assert_eq!(store.outbox_depth(), 1, "a rejected commit stages nothing new");
+    assert_eq!(
+        store.outbox_depth(),
+        1,
+        "a rejected commit stages nothing new"
+    );
     assert_eq!(store.committed_count(), 1);
 }
 
@@ -411,15 +460,30 @@ fn dead_letter_scenario(store: &OutboxStore) {
             assert_eq!(r.failed, 0);
         }
     }
-    assert_eq!(store.outbox_depth(), 0, "the poison row left the unsent set");
-    assert_eq!(store.dead_letter_count(), 1, "quarantined, not silently lost");
+    assert_eq!(
+        store.outbox_depth(),
+        0,
+        "the poison row left the unsent set"
+    );
+    assert_eq!(
+        store.dead_letter_count(),
+        1,
+        "quarantined, not silently lost"
+    );
     let dl = store.dead_letters();
     assert_eq!(dl.len(), 1);
-    assert_eq!(dl[0].attempts, MAX_PUBLISH_ATTEMPTS, "attempts hit the bound");
+    assert_eq!(
+        dl[0].attempts, MAX_PUBLISH_ATTEMPTS,
+        "attempts hit the bound"
+    );
     assert_eq!(dl[0].event_id, id);
     // a dead-lettered row reads as absent from the live set (parity with the memory arm).
     assert!(store.row(&id).is_none(), "dead row absent from live rows");
-    assert_eq!(store.committed_count(), 0, "dead row not counted committed-live");
+    assert_eq!(
+        store.committed_count(),
+        0,
+        "dead row not counted committed-live"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -480,6 +544,77 @@ async fn eb03_seq_gap_free_under_concurrent_committers_both_backends() {
     eprintln!("EB-03 OK (DURABLE) — gap-free per-aggregate seq under 32 concurrent PG committers");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn domain_batch_and_ordinary_staged_writer_share_the_same_aggregate_lock() {
+    let pool = connect().await;
+    let _guard = db_lock().lock().await;
+    let _store = fresh_durable_store(&pool).await;
+    let tag = uniq().replace('-', "_");
+    let domain_table = format!("outbox_domain_race_{tag}");
+    sqlx::query(&format!(
+        "CREATE TABLE {domain_table} (id text PRIMARY KEY)"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create domain state table");
+
+    let aggregate = format!("issue:DOMAIN-RACE-{tag}");
+    let domain_row = staged_row(&format!("domain-{tag}"), &aggregate);
+    let ordinary_row = staged_row(&format!("ordinary-{tag}"), &aggregate);
+    let mut domain_tx = pool.begin().await.expect("begin domain transaction");
+    sqlx::query(&format!(
+        "INSERT INTO {domain_table} (id) VALUES ('committed')"
+    ))
+    .execute(&mut *domain_tx)
+    .await
+    .expect("stage domain state");
+    PgRelay::co_commit_rows_in_tx(&mut domain_tx, &[domain_row])
+        .await
+        .expect("stage domain outbox row while holding the aggregate lock");
+
+    let relay = PgRelay::new(pool.clone());
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let ordinary = tokio::spawn(async move {
+        let _ = entered_tx.send(());
+        relay.commit_staged_atomic(&[ordinary_row]).await
+    });
+    entered_rx.await.expect("ordinary writer entered");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !ordinary.is_finished(),
+        "the ordinary staged writer waits for the domain writer's aggregate lock"
+    );
+
+    domain_tx
+        .commit()
+        .await
+        .expect("domain state and its outbox row commit together");
+    ordinary
+        .await
+        .expect("ordinary writer task")
+        .expect("ordinary writer commits after the domain transaction");
+
+    let domain_count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {domain_table}"))
+        .fetch_one(&pool)
+        .await
+        .expect("count domain state");
+    assert_eq!(
+        domain_count, 1,
+        "the domain state was not partially rolled back"
+    );
+    let seqs: Vec<i64> =
+        sqlx::query_scalar("SELECT seq FROM outbox WHERE aggregate = $1 ORDER BY seq")
+            .bind(&aggregate)
+            .fetch_all(&pool)
+            .await
+            .expect("read raced aggregate sequence");
+    assert_eq!(
+        seqs,
+        [0, 1],
+        "both writers commit with contiguous distinct seqs"
+    );
+}
+
 // ----------------------------------------------------------------------------------------------
 // (6) crash-window re-publish idempotency (durable-only) — mirrors relay_once_crash_after.
 // ----------------------------------------------------------------------------------------------
@@ -514,8 +649,16 @@ async fn crash_window_republish_is_idempotent_zero_ghost_zero_lost() {
         .expect("crash drain");
     assert_eq!(published_before_crash, 2, "2 forwarded before the crash");
     // The marks rolled back: all 4 rows are still unsent (0 lost).
-    assert_eq!(store.outbox_depth(), 4, "0 lost — crash rolled back the marks");
-    assert_eq!(bus.delivered_count(), 2, "2 delivered to the broker pre-crash");
+    assert_eq!(
+        store.outbox_depth(),
+        4,
+        "0 lost — crash rolled back the marks"
+    );
+    assert_eq!(
+        bus.delivered_count(),
+        2,
+        "2 delivered to the broker pre-crash"
+    );
 
     // RESTART: drain again. The 2 re-claimed already-delivered rows are DEDUPLICATED (0 ghost),
     // the other 2 are freshly published — every committed event delivered exactly once.
@@ -523,7 +666,10 @@ async fn crash_window_republish_is_idempotent_zero_ghost_zero_lost() {
         Timestamp("2026-06-19T00:00:09Z".into())
     })
     .drain_to_empty();
-    assert_eq!(report.deduplicated, 2, "the 2 re-claims were deduplicated (0 ghost)");
+    assert_eq!(
+        report.deduplicated, 2,
+        "the 2 re-claims were deduplicated (0 ghost)"
+    );
     assert_eq!(report.published, 2, "the other 2 freshly published");
     assert_eq!(report.drain_errors, 0);
     assert_eq!(store.outbox_depth(), 0, "depth drains after restart");
@@ -534,7 +680,10 @@ async fn crash_window_republish_is_idempotent_zero_ghost_zero_lost() {
     );
     let delivered = bus.delivered_ids();
     for id in &ids {
-        assert!(delivered.contains(id), "every committed event was delivered");
+        assert!(
+            delivered.contains(id),
+            "every committed event was delivered"
+        );
     }
     eprintln!("SUB-D1 OK (DURABLE) — crash-window re-publish idempotent: 0 ghost / 0 lost");
 }
