@@ -131,7 +131,10 @@ yrs = { workspace = true }
 # `cargo build`/`cargo test --workspace` stay DB-free. EXTERNAL crates only; no new myelin edge. The
 # test reads DATABASE_URL inline (no myelin-config edge — same posture as ci-controlplane/refs).
 # ------------------------------------------------------------------------------------------
-sqlx = { workspace = true, optional = true }
+# R4.4: the production Issues OLTP store is always compiled and binds through
+# `SubstrateProvider::with_tenant_tx`; sqlx is no longer test-only. Connecting still happens only at
+# runtime, so ordinary builds remain DB-free.
+sqlx = { workspace = true }
 # MR-009b W3b.4 — the DURABLE composition root in `src/main.rs` (SubstrateProvider from env →
 # foundation migrations → `OutboxStore::durable(PgOutboxBacking)`) is the ALWAYS-COMPILED default
 # (the Wave-2 identity-service posture), so `tokio` (the multi-thread runtime the sync→async
@@ -231,4 +234,4 @@ test-support = ["myelin-storage/test-support"]
 # (in-memory KmsEngine), so the integration test only adds the real at-rest round-trip.
 # (tokio is a regular dep since W3b.4 — the durable main.rs needs it; the feature now only
 # pulls the raw-sqlx test harness.)
-integration = ["dep:sqlx"]
+integration = []
