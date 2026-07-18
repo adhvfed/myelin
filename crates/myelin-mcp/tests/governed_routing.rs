@@ -72,7 +72,26 @@ impl GovernanceAudit for FailOutcomeAudit {
     fn record(&self, record: GovernanceAuditRecord<'_>) -> Result<(), String> {
         match record.phase {
             AuditPhase::Attempt => Ok(()),
-            AuditPhase::Outcome => Err("injected durable audit outage".into()),
+            AuditPhase::Outcome
+            | AuditPhase::Approved
+            | AuditPhase::Rejected
+            | AuditPhase::Expired => Err("injected durable audit outage".into()),
+        }
+    }
+}
+
+struct FailExpiryAudit;
+
+impl GovernanceAudit for FailExpiryAudit {
+    fn record(&self, record: GovernanceAuditRecord<'_>) -> Result<(), String> {
+        if record.phase == AuditPhase::Expired {
+            assert!(
+                record.gate_id.is_some(),
+                "an expiry fact must identify the exact durable gate"
+            );
+            Err("injected expiry-audit outage".into())
+        } else {
+            Ok(())
         }
     }
 }
@@ -155,6 +174,22 @@ fn governed_router_with_trigger_and_audit(
     trigger_expires_at_unix: i64,
     audit: Arc<dyn GovernanceAudit>,
 ) -> GovernedRouter {
+    governed_router_with_trigger_audit_and_ttl(
+        input,
+        trigger_jti,
+        trigger_expires_at_unix,
+        audit,
+        300,
+    )
+}
+
+fn governed_router_with_trigger_audit_and_ttl(
+    input: DelegationInput,
+    trigger_jti: &str,
+    trigger_expires_at_unix: i64,
+    audit: Arc<dyn GovernanceAudit>,
+    run_ttl_secs: u64,
+) -> GovernedRouter {
     let s7 = RevocationStore::new();
     // A REAL per-run minter (the structural floor signer is the EI-01 §1 named seam; the real
     // PASETO/Ed25519 signer swaps in behind the SAME `TokenSigner` trait — the mint's intersection +
@@ -190,7 +225,7 @@ fn governed_router_with_trigger_and_audit(
         caveats: DelegationCaveats(caveats),
         kind: MachineKind::Agent,
         ttl: FailStaticBound {
-            static_max_secs: 300,
+            static_max_secs: run_ttl_secs,
         },
     };
 
@@ -463,7 +498,7 @@ fn approval_is_a_server_side_verdict_by_a_distinct_human_principal() {
     //     its own gate, whatever it sends).
     assert!(
         matches!(
-            router.approve_gate(&agent_principal("agent:claude", "acme"), &gate_id),
+            router.approve_gate(&agent_principal("agent:claude", "acme"), &gate_id, &now(),),
             Err(GateDecideError::SelfApproval) | Err(GateDecideError::NotEligible)
         ),
         "the agent principal cannot approve its own gate"
@@ -471,7 +506,7 @@ fn approval_is_a_server_side_verdict_by_a_distinct_human_principal() {
     // (2b) R2.4b — a DISTINCT NON-HUMAN principal (a service/agent) cannot approve either: the
     //      HITL gate structurally requires a HUMAN approver (closes the machine-collusion gap).
     assert_eq!(
-        router.approve_gate(&service_principal("svc:ci-robot", "acme"), &gate_id),
+        router.approve_gate(&service_principal("svc:ci-robot", "acme"), &gate_id, &now(),),
         Err(GateDecideError::MachineApproverRefused),
         "a distinct MACHINE principal is refused — the gate requires a HUMAN approver"
     );
@@ -498,7 +533,7 @@ fn approval_is_a_server_side_verdict_by_a_distinct_human_principal() {
 
     // (4) A DISTINCT human principal approves — SERVER-SIDE.
     router
-        .approve_gate(&human_principal("human:operator", "acme"), &gate_id)
+        .approve_gate(&human_principal("human:operator", "acme"), &gate_id, &now())
         .expect("a distinct eligible human approves");
     let rec = router.gate_verdict(&gate_id).unwrap();
     assert_eq!(rec.state, GateState::Approved);
@@ -553,7 +588,7 @@ fn an_approval_never_transfers_to_a_sibling_effect_and_a_reject_is_final() {
         .to_string();
     let router = server.router().unwrap();
     router
-        .approve_gate(&human_principal("human:operator", "acme"), &gate7)
+        .approve_gate(&human_principal("human:operator", "acme"), &gate7, &now())
         .unwrap();
 
     // The approved gate for PR 7 does NOT clear a re-drive of PR 8 (same tool, different effect).
@@ -575,11 +610,11 @@ fn an_approval_never_transfers_to_a_sibling_effect_and_a_reject_is_final() {
         .unwrap()
         .to_string();
     router
-        .reject_gate(&human_principal("human:operator", "acme"), &gate9)
+        .reject_gate(&human_principal("human:operator", "acme"), &gate9, &now())
         .unwrap();
     assert!(
         router
-            .approve_gate(&human_principal("human:operator", "acme"), &gate9)
+            .approve_gate(&human_principal("human:operator", "acme"), &gate9, &now(),)
             .is_err(),
         "a rejected gate never re-transitions"
     );
@@ -668,6 +703,15 @@ fn lazy_mint_refuses_expired_or_revoked_trigger_and_clamps_run_life() {
         CallOutcome::Applied { .. }
     ));
     let token = clamped.current_token().unwrap();
+    clamped.minter().revocations().revoke(
+        &clamped.principal().scope,
+        &RevokeTarget::Jti("short-trigger".into()),
+        at.clone(),
+    );
+    assert!(matches!(
+        clamped.call(tool, &args, &Timestamp("2026-06-26T00:00:01Z".into()), None),
+        CallOutcome::Applied { .. }
+    ));
     let after_trigger = Timestamp("2026-06-26T00:00:03Z".into());
     assert!(
         !clamped
@@ -788,6 +832,51 @@ fn post_gate_open_audit_failure_is_also_indeterminate_and_terminal() {
         None,
     );
     assert!(matches!(outcome, CallOutcome::Indeterminate { .. }));
+    assert!(router.is_fatal());
+}
+
+#[test]
+fn expiry_audit_failure_is_fail_loud_after_state_commit_and_terminates_session() {
+    let grants = ["pull_request.merge"];
+    let router = governed_router_with_trigger_audit_and_ttl(
+        DelegationInput {
+            agent_policy: Authority::of(grants),
+            delegation: Authority::of(grants),
+            tenant_policy: Authority::of(grants),
+            trigger_actor_held: Authority::of(grants),
+        },
+        "trigger-jti",
+        i64::MAX,
+        Arc::new(FailExpiryAudit),
+        7_200,
+    );
+    let registry = ToolRegistry::with_git();
+    let merge = registry.resolve("git.merge").unwrap();
+    let opened_at = Timestamp("2026-06-26T00:00:00Z".into());
+    let gate_id = match router.call(
+        merge,
+        &serde_json::json!({"repo":"alpha","number":1}),
+        &opened_at,
+        None,
+    ) {
+        CallOutcome::Gated { gate_id, .. } => gate_id,
+        other => panic!("expected gate, got {other:?}"),
+    };
+
+    let expired_at = Timestamp("2026-06-26T01:00:00Z".into());
+    assert!(matches!(
+        router.call(
+            merge,
+            &serde_json::json!({"repo":"alpha","number":1}),
+            &expired_at,
+            Some(&gate_id),
+        ),
+        CallOutcome::Indeterminate { .. }
+    ));
+    assert_eq!(
+        router.gate_verdict(&gate_id).unwrap().state,
+        GateState::Expired
+    );
     assert!(router.is_fatal());
 }
 

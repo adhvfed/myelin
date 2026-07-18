@@ -51,6 +51,7 @@ use myelin_identity_service::machine_auth::MachineKind;
 use myelin_identity_service::mint::RunTokenMinter;
 use myelin_storage::hitl_gate_durable::{
     opaque_gate_id, GateDecideError, GateRecord, GateState, HitlVerdictStore,
+    DEFAULT_HITL_GATE_TTL_SECS,
 };
 use myelin_storage::{ContentHash, TenantScope};
 
@@ -137,6 +138,9 @@ pub struct AuditEntry {
 pub enum AuditPhase {
     Attempt,
     Outcome,
+    Approved,
+    Rejected,
+    Expired,
 }
 
 /// One bounded governance audit fact. Grouping the attribution fields keeps the persistence
@@ -145,6 +149,8 @@ pub struct GovernanceAuditRecord<'a> {
     pub scope: &'a TenantScope,
     pub actor: &'a Principal,
     pub run_id: &'a RunId,
+    /// Opaque durable gate identifier for decision/expiry facts. Ordinary tool calls omit it.
+    pub gate_id: Option<&'a str>,
     pub tool: &'a str,
     pub jti: &'a str,
     pub phase: AuditPhase,
@@ -176,6 +182,7 @@ impl GovernanceAudit for OutboxGovernanceAudit {
             scope,
             actor,
             run_id,
+            gate_id,
             tool,
             jti,
             phase,
@@ -184,6 +191,15 @@ impl GovernanceAudit for OutboxGovernanceAudit {
         } = record;
         let event_type = audit_event_type(tool, phase, outcome)?;
         let run_ref = format!("myelin://{}/agent/run/{}", scope.tenant().0, run_id.0);
+        let gate_ref = gate_id.map(|gate_id| format!("{run_ref}/hitl-gate/{gate_id}"));
+        let subject_ref = gate_ref.clone().unwrap_or_else(|| run_ref.clone());
+        let mut payload = serde_json::json!({
+            "run_ref": run_ref,
+            "token_ref": format!("jti:{jti}"),
+        });
+        if let Some(gate_ref) = gate_ref {
+            payload["gate_ref"] = serde_json::Value::String(gate_ref);
+        }
         let mut tx = self.outbox.begin(
             self.minter.clone(),
             myelin_events::EmitContextBase {
@@ -199,12 +215,9 @@ impl GovernanceAudit for OutboxGovernanceAudit {
         tx.emit(
             EventDraft {
                 type_: EventType(event_type.into()),
-                subject: ArtifactRef(run_ref.clone()),
+                subject: ArtifactRef(subject_ref),
                 aggregate: AggregateKey(format!("mcp-run:{}", run_id.0)),
-                payload: serde_json::json!({
-                    "run_ref": run_ref,
-                    "token_ref": format!("jti:{jti}"),
-                }),
+                payload,
                 data_role: DataRole::Controller,
                 visibility: Visibility::Internal,
                 contains_personal_data: false,
@@ -228,29 +241,41 @@ fn audit_event_type(
         (AuditPhase::Outcome, Some(CallOutcome::Gated { .. })) => "gated",
         (AuditPhase::Outcome, Some(CallOutcome::Denied { .. })) => "denied",
         (AuditPhase::Outcome, Some(CallOutcome::Indeterminate { .. })) => "indeterminate",
+        (AuditPhase::Approved, None) => "approved",
+        (AuditPhase::Rejected, None) => "rejected",
+        (AuditPhase::Expired, None) => "expired",
         _ => return Err("invalid governance audit phase/outcome pairing".into()),
     };
     match (tool, suffix) {
-        ("git.merge", "attempted") => Ok("git.merge.attempted"),
-        ("git.merge", "applied") => Ok("git.merge.applied"),
-        ("git.merge", "gated") => Ok("git.merge.gated"),
-        ("git.merge", "denied") => Ok("git.merge.denied"),
-        ("git.merge", "indeterminate") => Ok("git.merge.indeterminate"),
-        ("git.open_pr", "attempted") => Ok("git.open_pr.attempted"),
-        ("git.open_pr", "applied") => Ok("git.open_pr.applied"),
-        ("git.open_pr", "gated") => Ok("git.open_pr.gated"),
-        ("git.open_pr", "denied") => Ok("git.open_pr.denied"),
-        ("git.open_pr", "indeterminate") => Ok("git.open_pr.indeterminate"),
-        ("git.submit_review", "attempted") => Ok("git.submit_review.attempted"),
-        ("git.submit_review", "applied") => Ok("git.submit_review.applied"),
-        ("git.submit_review", "gated") => Ok("git.submit_review.gated"),
-        ("git.submit_review", "denied") => Ok("git.submit_review.denied"),
-        ("git.submit_review", "indeterminate") => Ok("git.submit_review.indeterminate"),
-        ("git.endorse_fork_ci", "attempted") => Ok("git.endorse_fork_ci.attempted"),
-        ("git.endorse_fork_ci", "applied") => Ok("git.endorse_fork_ci.applied"),
-        ("git.endorse_fork_ci", "gated") => Ok("git.endorse_fork_ci.gated"),
-        ("git.endorse_fork_ci", "denied") => Ok("git.endorse_fork_ci.denied"),
-        ("git.endorse_fork_ci", "indeterminate") => Ok("git.endorse_fork_ci.indeterminate"),
+        ("git.merge", "attempted") => Ok(myelin_git::events::GIT_MERGE_ATTEMPTED),
+        ("git.merge", "applied") => Ok(myelin_git::events::GIT_MERGE_APPLIED),
+        ("git.merge", "gated") => Ok(myelin_git::events::GIT_MERGE_GATED),
+        ("git.merge", "denied") => Ok(myelin_git::events::GIT_MERGE_DENIED),
+        ("git.merge", "indeterminate") => Ok(myelin_git::events::GIT_MERGE_INDETERMINATE),
+        ("git.merge", "approved") => Ok(myelin_git::events::GIT_MERGE_APPROVED),
+        ("git.merge", "rejected") => Ok(myelin_git::events::GIT_MERGE_REJECTED),
+        ("git.merge", "expired") => Ok(myelin_git::events::GIT_MERGE_EXPIRED),
+        ("git.open_pr", "attempted") => Ok(myelin_git::events::GIT_OPEN_PR_ATTEMPTED),
+        ("git.open_pr", "applied") => Ok(myelin_git::events::GIT_OPEN_PR_APPLIED),
+        ("git.open_pr", "gated") => Ok(myelin_git::events::GIT_OPEN_PR_GATED),
+        ("git.open_pr", "denied") => Ok(myelin_git::events::GIT_OPEN_PR_DENIED),
+        ("git.open_pr", "indeterminate") => Ok(myelin_git::events::GIT_OPEN_PR_INDETERMINATE),
+        ("git.submit_review", "attempted") => Ok(myelin_git::events::GIT_SUBMIT_REVIEW_ATTEMPTED),
+        ("git.submit_review", "applied") => Ok(myelin_git::events::GIT_SUBMIT_REVIEW_APPLIED),
+        ("git.submit_review", "gated") => Ok(myelin_git::events::GIT_SUBMIT_REVIEW_GATED),
+        ("git.submit_review", "denied") => Ok(myelin_git::events::GIT_SUBMIT_REVIEW_DENIED),
+        ("git.submit_review", "indeterminate") => {
+            Ok(myelin_git::events::GIT_SUBMIT_REVIEW_INDETERMINATE)
+        }
+        ("git.endorse_fork_ci", "attempted") => {
+            Ok(myelin_git::events::GIT_ENDORSE_FORK_CI_ATTEMPTED)
+        }
+        ("git.endorse_fork_ci", "applied") => Ok(myelin_git::events::GIT_ENDORSE_FORK_CI_APPLIED),
+        ("git.endorse_fork_ci", "gated") => Ok(myelin_git::events::GIT_ENDORSE_FORK_CI_GATED),
+        ("git.endorse_fork_ci", "denied") => Ok(myelin_git::events::GIT_ENDORSE_FORK_CI_DENIED),
+        ("git.endorse_fork_ci", "indeterminate") => {
+            Ok(myelin_git::events::GIT_ENDORSE_FORK_CI_INDETERMINATE)
+        }
         _ => Err("governance audit refused an unregistered tool/outcome taxonomy".into()),
     }
 }
@@ -363,7 +388,10 @@ impl GovernedRouter {
     /// **Mint the per-run token (idempotent for the run).** The run's first `tools/call` mints the
     /// token; subsequent calls act under the SAME token (the run's life == the session's life). A
     /// mint refusal (a non-positive TTL / a self-hosted scope violation) is surfaced LOUDLY — never a
-    /// fabricated token.
+    /// fabricated token. The trigger credential is rechecked immediately before this lazy mint.
+    /// After mint, the session is governed by the independently revocable run token whose expiry is
+    /// clamped to the trigger expiry; trigger revocation does not retroactively rewrite that signed
+    /// run credential.
     fn ensure_run_token(&self, now: &Timestamp) -> Result<RunToken, String> {
         if let Some(t) = self.state.borrow().token.clone() {
             return Ok(t);
@@ -428,6 +456,18 @@ impl GovernedRouter {
         now: &Timestamp,
         presented_gate_id: Option<&str>,
     ) -> CallOutcome {
+        let now_unix = match timestamp_to_unix(now) {
+            Ok(value) => value,
+            Err(reason) => {
+                return self.push_local_audit(
+                    tool.name(),
+                    CallOutcome::Denied {
+                        reason,
+                        jti: "<unminted>".into(),
+                    },
+                )
+            }
+        };
         // (1) MINT the per-run attenuated token (NOT a bare PAT). A refusal is a loud Denied.
         let token = match self.ensure_run_token(now) {
             Ok(t) => t,
@@ -486,7 +526,26 @@ impl GovernedRouter {
         //     SERVER-SIDE verdict store holds an `approved` gate for THIS exact effect, decided by
         //     a DISTINCT principal (R2.4). The flag is git's frozen `agent_tools()` default
         //     (git.merge = yes), REUSED — not re-decided here.
+        let mut approval_to_consume = None;
         if tool.requires_approval() {
+            // Production expiry path: every gated call advances elapsed waiting rows before it
+            // consults or opens a verdict. State and terminal audit are separate commits: an audit
+            // outage after expiry is therefore fail-loud and makes this session terminal.
+            let expired = self
+                .verdicts
+                .borrow_mut()
+                .expire_due(&self.principal.scope, now_unix);
+            if !expired.is_empty() && self.record_expired_gates(&expired, now).is_err() {
+                self.state.borrow_mut().fatal = true;
+                return self.push_local_audit(
+                    tool.name(),
+                    CallOutcome::Indeterminate {
+                        reason: "HITL expiry committed but its governance audit did not; session terminated"
+                            .into(),
+                        jti,
+                    },
+                );
+            }
             let effect_key = mcp_effect_key(tool.name(), args);
             match presented_gate_id {
                 // No gate presented → withhold the Git effect, but open (or resurface) a durable
@@ -499,6 +558,7 @@ impl GovernedRouter {
                             scope: &self.principal.scope,
                             actor: &self.principal.agent,
                             run_id: &self.principal.run_id,
+                            gate_id: None,
                             tool: tool.name(),
                             jti: &jti,
                             phase: AuditPhase::Attempt,
@@ -516,17 +576,18 @@ impl GovernedRouter {
                             },
                         );
                     }
-                    let gate_id = match self.open_or_resurface_gate(tool.name(), args, &effect_key)
-                    {
-                        Ok(gate) => gate,
-                        Err(reason) => {
-                            return self.record(
-                                tool.name(),
-                                CallOutcome::Denied { reason, jti },
-                                now,
-                            )
-                        }
-                    };
+                    let gate_id =
+                        match self.open_or_resurface_gate(tool.name(), args, &effect_key, now_unix)
+                        {
+                            Ok(gate) => gate,
+                            Err(reason) => {
+                                return self.record(
+                                    tool.name(),
+                                    CallOutcome::Denied { reason, jti },
+                                    now,
+                                )
+                            }
+                        };
                     let outcome = CallOutcome::Gated {
                         gate_id: gate_id.0,
                         jti,
@@ -543,10 +604,21 @@ impl GovernedRouter {
                     match verdict {
                         // Approved, for THIS effect, by a distinct principal → the gate clears;
                         // fall through to EffectApi::apply.
-                        Some(rec) if rec.authorizes(&effect_key, &self.principal.agent_id.0) => {}
+                        Some(rec)
+                            if rec.authorizes(
+                                &effect_key,
+                                &self.principal.run_id.0,
+                                &self.principal.agent_id.0,
+                            ) =>
+                        {
+                            approval_to_consume = Some(gid.to_string());
+                        }
                         // The gate is real and pending for this effect → still withheld.
                         Some(rec)
-                            if rec.state == GateState::Waiting && rec.effect_id == effect_key =>
+                            if rec.state == GateState::Waiting
+                                && rec.effect_id == effect_key
+                                && rec.run_id == self.principal.run_id.0
+                                && rec.requested_by == self.principal.agent_id.0 =>
                         {
                             return self.record(
                                 tool.name(),
@@ -596,6 +668,7 @@ impl GovernedRouter {
                 scope: &self.principal.scope,
                 actor: &self.principal.agent,
                 run_id: &self.principal.run_id,
+                gate_id: None,
                 tool: tool.name(),
                 jti: &jti,
                 phase: AuditPhase::Attempt,
@@ -612,6 +685,25 @@ impl GovernedRouter {
                 },
                 now,
             );
+        }
+        if let Some(gate_id) = approval_to_consume {
+            if let Err(error) = self.verdicts.borrow_mut().consume_approval(
+                &self.principal.scope,
+                &gate_id,
+                &mcp_effect_key(tool.name(), args),
+                &self.principal.run_id.0,
+                &self.principal.agent_id.0,
+                now_unix,
+            ) {
+                return self.record(
+                    tool.name(),
+                    CallOutcome::Denied {
+                        reason: format!("HITL approval consumption refused: {error}"),
+                        jti,
+                    },
+                    now,
+                );
+            }
         }
         let outcome = match self
             .effect_api
@@ -637,6 +729,7 @@ impl GovernedRouter {
         tool: &str,
         args: &serde_json::Value,
         effect_key: &str,
+        opened_at_unix: i64,
     ) -> Result<(String, bool), String> {
         let requested_by = self.principal.agent_id.0.clone();
         let mut approvers = self
@@ -671,6 +764,10 @@ impl GovernedRouter {
             card_ref: None,
             requested_by,
             decided_by: None,
+            opened_at_unix,
+            decided_at_unix: None,
+            expires_at_unix: opened_at_unix.saturating_add(DEFAULT_HITL_GATE_TTL_SECS),
+            approval_consumed_at_unix: None,
         };
         verdicts
             .open(&self.principal.scope, record)
@@ -684,23 +781,37 @@ impl GovernedRouter {
     /// **`Human`** (R2.4b — a machine/agent/service is refused even if listed), is eligible
     /// (∈ the gate's `approver_filter`), and is distinct from the gate's requester. A refusal
     /// leaves the gate `waiting`.
-    pub fn approve_gate(&self, approver: &Principal, gate_id: &str) -> Result<(), GateDecideError> {
-        self.verdicts.borrow_mut().approve(
+    pub fn approve_gate(
+        &self,
+        approver: &Principal,
+        gate_id: &str,
+        now: &Timestamp,
+    ) -> Result<(), GateDecideError> {
+        let decided_at_unix = timestamp_to_unix(now).map_err(|_| GateDecideError::NotEligible)?;
+        self.verdicts.borrow_mut().approve_at(
             &self.principal.scope,
             gate_id,
             &approver.principal_id.0,
             approver.kind.clone(),
+            decided_at_unix,
         )
     }
 
     /// **The server-side REJECT surface (R2.4).** Settles the gate `rejected` — the effect is
     /// withheld forever (0 mutation, AG-8); a later re-drive presenting this gate id is denied.
-    pub fn reject_gate(&self, decider: &Principal, gate_id: &str) -> Result<(), GateDecideError> {
-        self.verdicts.borrow_mut().reject(
+    pub fn reject_gate(
+        &self,
+        decider: &Principal,
+        gate_id: &str,
+        now: &Timestamp,
+    ) -> Result<(), GateDecideError> {
+        let decided_at_unix = timestamp_to_unix(now).map_err(|_| GateDecideError::NotEligible)?;
+        self.verdicts.borrow_mut().reject_at(
             &self.principal.scope,
             gate_id,
             &decider.principal_id.0,
             decider.kind.clone(),
+            decided_at_unix,
         )
     }
 
@@ -709,12 +820,44 @@ impl GovernedRouter {
         self.verdicts.borrow().fetch(&self.principal.scope, gate_id)
     }
 
+    fn record_expired_gates(&self, expired: &[GateRecord], now: &Timestamp) -> Result<(), String> {
+        let actor = Principal::new(
+            self.principal.scope.tenant().clone(),
+            self.principal.scope.region().clone(),
+            PrincipalId("service:mcp-hitl-expiry".into()),
+            myelin_identity::PrincipalKind::Service,
+            myelin_identity::DataRole::Controller,
+            myelin_identity::PrincipalStatus::Active,
+        );
+        for gate in expired {
+            let tool = if git_merge_repo_from_effect_key(&gate.effect_id).is_some() {
+                "git.merge"
+            } else {
+                return Err("expired gate has no registered governance audit taxonomy".into());
+            };
+            let run_id = RunId(gate.run_id.clone());
+            self.audit_sink.record(GovernanceAuditRecord {
+                scope: &self.principal.scope,
+                actor: &actor,
+                run_id: &run_id,
+                gate_id: Some(&gate.gate_id),
+                tool,
+                jti: "system:hitl-expiry",
+                phase: AuditPhase::Expired,
+                outcome: None,
+                now,
+            })?;
+        }
+        Ok(())
+    }
+
     /// Append the outcome to the run's audit trail, attributed to the jti + the principal + the tool.
     fn record(&self, tool: &str, outcome: CallOutcome, now: &Timestamp) -> CallOutcome {
         let recorded = match self.audit_sink.record(GovernanceAuditRecord {
             scope: &self.principal.scope,
             actor: &self.principal.agent,
             run_id: &self.principal.run_id,
+            gate_id: None,
             tool,
             jti: outcome.jti(),
             phase: AuditPhase::Outcome,
@@ -742,6 +885,7 @@ impl GovernedRouter {
             scope: &self.principal.scope,
             actor: &self.principal.agent,
             run_id: &self.principal.run_id,
+            gate_id: None,
             tool,
             jti: outcome.jti(),
             phase: AuditPhase::Outcome,
@@ -776,6 +920,12 @@ impl GovernedRouter {
 /// canonical `serde_json` serialisation (object keys are sorted — `serde_json`'s default `Map` is
 /// a `BTreeMap`), so an approval granted for `git.merge {number: 7}` NEVER clears a re-drive of
 /// `git.merge {number: 8}` — the approval is bound to the exact effect, not the tool name.
+fn timestamp_to_unix(timestamp: &Timestamp) -> Result<i64, String> {
+    chrono::DateTime::parse_from_rfc3339(&timestamp.0)
+        .map(|value| value.timestamp())
+        .map_err(|_| "internal governance clock did not produce a valid RFC-3339 timestamp".into())
+}
+
 pub fn mcp_effect_key(tool: &str, args: &serde_json::Value) -> String {
     let canonical = canonical_json(args);
     let mut bound = Vec::with_capacity(tool.len() + 1 + canonical.to_string().len());

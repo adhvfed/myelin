@@ -13,7 +13,7 @@ use myelin_edge::repo_authz::RepoPermission;
 use myelin_edge::{
     CheckBackedRepoAuthorizer, DurableGitBackend, GitEffectApi, RepoAuthorizer, TupleRepoBootstrap,
 };
-use myelin_events::{IdMinter, OutboxStore, UlidMinter};
+use myelin_events::{IdMinter, OutboxStore, Timestamp, UlidMinter};
 use myelin_git::core::RepoLoc;
 use myelin_git::gix_backend::validate_repo_slug;
 use myelin_identity::{
@@ -27,8 +27,9 @@ use myelin_identity_service::{
     RevocationStore, StoreBackedCheck,
 };
 use myelin_mcp::{
-    git_merge_repo_from_effect_key, GateApproverPolicy, GovernedRouter, McpServer,
-    OutboxGovernanceAudit, RunPrincipal, ToolRegistry, MAX_FRAME_BYTES,
+    git_merge_repo_from_effect_key, AuditPhase, GateApproverPolicy, GovernanceAudit,
+    GovernanceAuditRecord, GovernedRouter, McpServer, OutboxGovernanceAudit, RunPrincipal,
+    ToolRegistry, MAX_FRAME_BYTES,
 };
 use myelin_storage::hitl_gate_durable::HitlVerdictStore;
 use myelin_storage::{
@@ -58,10 +59,10 @@ struct Core {
 }
 
 struct GitMergeApproverPolicy {
-    authorizer: Arc<CheckBackedRepoAuthorizer>,
-    candidates: Vec<Principal>,
-    tenant: String,
-    region: String,
+    authorizer: Arc<dyn RepoAuthorizer>,
+    principals: PrincipalStore,
+    candidate_ids: Vec<PrincipalId>,
+    scope: myelin_storage::TenantScope,
 }
 
 impl GateApproverPolicy for GitMergeApproverPolicy {
@@ -81,18 +82,31 @@ impl GateApproverPolicy for GitMergeApproverPolicy {
             .filter(|repo| !repo.is_empty() && repo.len() <= 255)
             .ok_or_else(|| "git.merge requires a bounded string `repo`".to_string())?;
         validate_repo_slug(repo).map_err(|_| "git.merge repository slug is invalid".to_string())?;
-        let loc = RepoLoc::new(&self.tenant, &self.region, repo);
+        let loc = RepoLoc::new(
+            self.scope.tenant().0.as_str(),
+            self.scope.region().0.as_str(),
+            repo,
+        );
         let eligible = self
-            .candidates
+            .candidate_ids
             .iter()
-            .filter(|candidate| {
-                self.authorizer.authorize_repo_permission(
-                    candidate,
-                    &loc,
-                    RepoPermission::ProtectedPush,
-                )
+            .filter_map(|candidate_id| {
+                let row = self.principals.get_principal(&self.scope, candidate_id)?;
+                if row.kind != PrincipalKind::Human || row.status != PrincipalStatus::Active {
+                    return None;
+                }
+                let candidate = Principal::new(
+                    row.tenant,
+                    row.region,
+                    row.principal_id,
+                    row.kind,
+                    row.data_role,
+                    row.status,
+                );
+                self.authorizer
+                    .authorize_repo_permission(&candidate, &loc, RepoPermission::ProtectedPush)
+                    .then_some(candidate.principal_id)
             })
-            .map(|candidate| candidate.principal_id.clone())
             .collect::<Vec<_>>();
         if eligible.is_empty() {
             Err(
@@ -115,27 +129,42 @@ async fn main() {
 
 async fn dispatch() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let command = parse_command(&args)?;
+    match command {
+        Command::Serve => serve(compose_core().await?).await,
+        Command::Approve(gate_id) => decide(compose_core().await?, &gate_id, true).await,
+        Command::Reject(gate_id) => decide(compose_core().await?, &gate_id, false).await,
+        Command::Bootstrap(parsed) => {
+            validate_bootstrap_scheme(&required_env(MCP_SCHEME_ENV)?)?;
+            bootstrap(compose_core().await?, parsed).await
+        }
+    }
+}
+
+enum Command {
+    Serve,
+    Approve(String),
+    Reject(String),
+    Bootstrap(BootstrapArgs),
+}
+
+fn parse_command(args: &[String]) -> Result<Command, String> {
     if args.len() > MAX_OPERATOR_ARGS {
         return Err(format!(
             "refusing more than {MAX_OPERATOR_ARGS} command arguments"
         ));
     }
     match args.first().map(String::as_str) {
-        None => serve(compose_core().await?).await,
-        Some("serve") if args.len() == 1 => serve(compose_core().await?).await,
+        None => Ok(Command::Serve),
+        Some("serve") if args.len() == 1 => Ok(Command::Serve),
         Some("serve") => Err("serve accepts no arguments".into()),
-        Some("approve") => {
-            let gate_id = parse_decision_args(&args[1..])?.to_string();
-            decide(compose_core().await?, &gate_id, true).await
-        }
-        Some("reject") => {
-            let gate_id = parse_decision_args(&args[1..])?.to_string();
-            decide(compose_core().await?, &gate_id, false).await
-        }
-        Some("bootstrap") => {
-            let parsed = parse_bootstrap_args(&args[1..])?;
-            bootstrap(compose_core().await?, parsed).await
-        }
+        Some("approve") => Ok(Command::Approve(
+            parse_decision_args(&args[1..])?.to_string(),
+        )),
+        Some("reject") => Ok(Command::Reject(
+            parse_decision_args(&args[1..])?.to_string(),
+        )),
+        Some("bootstrap") => Ok(Command::Bootstrap(parse_bootstrap_args(&args[1..])?)),
         Some(other) => Err(format!(
             "unknown subcommand `{other}` (expected serve, approve, reject, or bootstrap)"
         )),
@@ -405,12 +434,12 @@ async fn serve(core: Core) -> Result<(), String> {
         agent.clone(),
         boundary,
     );
-    let approvers = configured_human_approvers(&core, &trigger_identity.scope, &agent_id)?;
+    let approver_ids = configured_approver_ids(&agent_id)?;
     let approver_policy = Arc::new(GitMergeApproverPolicy {
         authorizer: repo_authz,
-        candidates: approvers,
-        tenant: trigger_identity.scope.tenant().0.clone(),
-        region: trigger_identity.scope.region().0.clone(),
+        principals: principal_store(&core),
+        candidate_ids: approver_ids,
+        scope: trigger_identity.scope.clone(),
     });
     let ttl = FailStaticBound {
         static_max_secs: thresholds.fail_static.agent_token_ttl_secs,
@@ -487,10 +516,42 @@ fn configured_human_approvers(
     Ok(result)
 }
 
-async fn decide(core: Core, gate_id: &str, approve: bool) -> Result<(), String> {
-    if gate_id.len() > 256 || !gate_id.starts_with("gate:") {
-        return Err("gate id is malformed or exceeds 256 bytes".into());
+fn configured_approver_ids(requester: &PrincipalId) -> Result<Vec<PrincipalId>, String> {
+    let raw = required_env("MYELIN_MCP_APPROVERS")?;
+    let mut result = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| *value != requester.0)
+        .map(|value| PrincipalId(value.to_string()))
+        .collect::<Vec<_>>();
+    result.sort_by(|left, right| left.0.cmp(&right.0));
+    result.dedup();
+    if result.is_empty()
+        || result
+            .iter()
+            .any(|id| validate_bootstrap_principal(&id.0).is_err())
+    {
+        return Err(
+            "MYELIN_MCP_APPROVERS must contain bounded distinct principal tokens other than the requester"
+                .into(),
+        );
     }
+    Ok(result)
+}
+
+fn governance_audit(core: &Core) -> OutboxGovernanceAudit {
+    OutboxGovernanceAudit::new(
+        OutboxStore::durable(Arc::new(PgOutboxBacking::new(
+            core.provider.db_pool().clone(),
+            core.handle.clone(),
+        ))),
+        Arc::new(UlidMinter::new()),
+    )
+}
+
+async fn decide(core: Core, gate_id: &str, approve: bool) -> Result<(), String> {
+    validate_gate_id(gate_id)?;
     let identity = authenticate_from_secure_file(&core)?;
     if identity.principal.kind != PrincipalKind::Human
         || identity.principal.status != PrincipalStatus::Active
@@ -506,7 +567,43 @@ async fn decide(core: Core, gate_id: &str, approve: bool) -> Result<(), String> 
             "HITL decision credential lacks `{MCP_HITL_DECIDE_CAP}`"
         ));
     }
+    let now = timestamp_now();
+    let now_unix = unix_now()?;
     let mut verdicts = HitlVerdictStore::with_pg(core.provider.clone());
+    let audit = governance_audit(&core);
+    let observed_gate = verdicts
+        .fetch(&identity.scope, gate_id)
+        .ok_or_else(|| "gate is absent from the verified tenant/region scope".to_string())?;
+    git_merge_repo_from_effect_key(&observed_gate.effect_id)
+        .ok_or_else(|| "gate is not a bounded canonical git.merge effect".to_string())?;
+    if let Some(expired_gate) = verdicts.expire_if_due(&identity.scope, gate_id, now_unix) {
+        let expiry_actor = Principal::new(
+            identity.scope.tenant().clone(),
+            identity.scope.region().clone(),
+            PrincipalId("service:mcp-hitl-expiry".into()),
+            PrincipalKind::Service,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        );
+        let expired_run_id = RunId(expired_gate.run_id);
+        audit
+            .record(GovernanceAuditRecord {
+                scope: &identity.scope,
+                actor: &expiry_actor,
+                run_id: &expired_run_id,
+                gate_id: Some(gate_id),
+                tool: "git.merge",
+                jti: "system:hitl-expiry",
+                phase: AuditPhase::Expired,
+                outcome: None,
+                now: &now,
+            })
+            .map_err(|_| {
+                "HITL expiry committed but its terminal audit did not; outcome is indeterminate"
+                    .to_string()
+            })?;
+        return Err("gate decision refused because its approval window expired".into());
+    }
     let gate = verdicts
         .fetch(&identity.scope, gate_id)
         .ok_or_else(|| "gate is absent from the verified tenant/region scope".to_string())?;
@@ -556,25 +653,65 @@ async fn decide(core: Core, gate_id: &str, approve: bool) -> Result<(), String> 
                 .into(),
         );
     }
+    let run_id = RunId(gate.run_id.clone());
+    // The durable intent precedes the decision, while the terminal audit follows it. These are not
+    // one PostgreSQL transaction today: a missing pre-intent prevents the decision; a missing
+    // terminal fact returns an explicit indeterminate error after the decision instead of claiming
+    // success. The router still requires and one-shot consumes the exact durable approval.
+    audit
+        .record(GovernanceAuditRecord {
+            scope: &identity.scope,
+            actor: &identity.principal,
+            run_id: &run_id,
+            gate_id: Some(gate_id),
+            tool: "git.merge",
+            jti: &identity.capability().jti,
+            phase: AuditPhase::Attempt,
+            outcome: None,
+            now: &now,
+        })
+        .map_err(|_| "durable pre-decision governance audit is unavailable".to_string())?;
     if approve {
         verdicts
-            .approve(
-                &identity.scope,
-                gate_id,
-                &identity.principal.principal_id.0,
-                identity.principal.kind,
-            )
-            .map_err(|error| format!("approval refused: {error:?}"))?;
-    } else {
-        verdicts
-            .reject(
+            .approve_at(
                 &identity.scope,
                 gate_id,
                 &identity.principal.principal_id.0,
                 identity.principal.kind.clone(),
+                now_unix,
+            )
+            .map_err(|error| format!("approval refused: {error:?}"))?;
+    } else {
+        verdicts
+            .reject_at(
+                &identity.scope,
+                gate_id,
+                &identity.principal.principal_id.0,
+                identity.principal.kind.clone(),
+                now_unix,
             )
             .map_err(|error| format!("rejection refused: {error:?}"))?;
     }
+    audit
+        .record(GovernanceAuditRecord {
+            scope: &identity.scope,
+            actor: &identity.principal,
+            run_id: &run_id,
+            gate_id: Some(gate_id),
+            tool: "git.merge",
+            jti: &identity.capability().jti,
+            phase: if approve {
+                AuditPhase::Approved
+            } else {
+                AuditPhase::Rejected
+            },
+            outcome: None,
+            now: &now,
+        })
+        .map_err(|_| {
+            "HITL decision committed but its governance audit did not; outcome is indeterminate"
+                .to_string()
+        })?;
     eprintln!("myelin-mcp: gate decision committed");
     Ok(())
 }
@@ -582,32 +719,17 @@ async fn decide(core: Core, gate_id: &str, approve: bool) -> Result<(), String> 
 async fn bootstrap(core: Core, parsed: BootstrapArgs) -> Result<(), String> {
     let principal_id = parsed.principal.as_str();
     validate_bootstrap_principal(principal_id)?;
+    validate_bootstrap_semantics(&parsed)?;
     let ttl_secs = parsed.ttl_secs;
-    if !(60..=86_400).contains(&ttl_secs) {
-        return Err("--ttl-secs must be within 60..=86400".into());
-    }
     let requested: std::collections::BTreeSet<&str> =
         parsed.capabilities.iter().map(String::as_str).collect();
-    let mut allowed: std::collections::BTreeSet<&str> = myelin_git::api::agent_tools()
-        .into_iter()
-        .flat_map(|tool| tool.required_caps.iter().copied())
-        .collect();
-    allowed.insert(MCP_HITL_DECIDE_CAP);
-    if requested.is_empty() || requested.iter().any(|cap| !allowed.contains(*cap)) {
-        return Err(format!(
-            "bootstrap requires explicit catalogue-bounded --cap values; allowed: {}",
-            allowed.iter().copied().collect::<Vec<_>>().join(",")
-        ));
-    }
     let tenant = required_env(MCP_TENANT_ENV)?;
     let region = required_env(MCP_REGION_ENV)?;
     if core.provider.config().region != region {
         return Err("configured MCP region does not match the runtime database region".into());
     }
     let scheme = required_env(MCP_SCHEME_ENV)?;
-    if scheme != "agent" {
-        return Err("MCP bootstrap currently requires the `agent` credential scheme".into());
-    }
+    validate_bootstrap_scheme(&scheme)?;
     let provisional = Principal::new(
         myelin_tenancy::TenantId(tenant.clone()),
         Region(region.clone()),
@@ -620,24 +742,17 @@ async fn bootstrap(core: Core, parsed: BootstrapArgs) -> Result<(), String> {
         myelin_storage::TenantScope::from_verified_token(&provisional, Region(region.clone()));
     let store = principal_store(&core);
     store
-        .put_principal(
+        .provision_principal_credential(
             &scope,
             PrincipalId(principal_id.to_string()),
             PrincipalKind::Human,
             DataRole::Controller,
             PrincipalStatus::Active,
-            None,
-        )
-        .map_err(|error| format!("principal provisioning failed: {error}"))?;
-    store
-        .link_credential(
-            &scope,
             &scheme,
             principal_id,
-            &PrincipalId(principal_id.to_string()),
         )
-        .map_err(|error| format!("credential link failed: {error}"))?;
-    let now = unix_now();
+        .map_err(|error| format!("atomic principal/credential provisioning failed: {error}"))?;
+    let now = unix_now()?;
     let token = core.cell.mint(&CapabilityMintSpec {
         tenant,
         region,
@@ -789,7 +904,10 @@ fn required_env(name: &str) -> Result<String, String> {
 
 fn parse_decision_args(args: &[String]) -> Result<&str, String> {
     match args {
-        [flag, gate_id] if flag == "--gate-id" && !gate_id.starts_with("--") => Ok(gate_id),
+        [flag, gate_id] if flag == "--gate-id" && !gate_id.starts_with("--") => {
+            validate_gate_id(gate_id)?;
+            Ok(gate_id)
+        }
         _ => Err("decision accepts exactly `--gate-id <opaque-id>`".into()),
     }
 }
@@ -860,11 +978,52 @@ fn parse_bootstrap_args(args: &[String]) -> Result<BootstrapArgs, String> {
     }
     let principal = principal.ok_or_else(|| "bootstrap requires --principal".to_string())?;
     validate_bootstrap_principal(&principal)?;
-    Ok(BootstrapArgs {
+    let parsed = BootstrapArgs {
         principal,
         ttl_secs: ttl_secs.unwrap_or(3600),
         capabilities,
-    })
+    };
+    validate_bootstrap_semantics(&parsed)?;
+    Ok(parsed)
+}
+
+fn validate_gate_id(gate_id: &str) -> Result<(), String> {
+    if gate_id.len() > 256 || !gate_id.starts_with("gate:") {
+        Err("gate id is malformed or exceeds 256 bytes".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_bootstrap_scheme(scheme: &str) -> Result<(), String> {
+    if scheme == "agent" {
+        Ok(())
+    } else {
+        Err("MCP bootstrap currently requires the `agent` credential scheme".into())
+    }
+}
+
+fn validate_bootstrap_semantics(parsed: &BootstrapArgs) -> Result<(), String> {
+    if !(60..=86_400).contains(&parsed.ttl_secs) {
+        return Err("--ttl-secs must be within 60..=86400".into());
+    }
+    let mut allowed: std::collections::BTreeSet<&str> = myelin_git::api::agent_tools()
+        .into_iter()
+        .flat_map(|tool| tool.required_caps.iter().copied())
+        .collect();
+    allowed.insert(MCP_HITL_DECIDE_CAP);
+    if parsed.capabilities.is_empty()
+        || parsed
+            .capabilities
+            .iter()
+            .any(|cap| !allowed.contains(cap.as_str()))
+    {
+        return Err(format!(
+            "bootstrap requires explicit catalogue-bounded --cap values; allowed: {}",
+            allowed.iter().copied().collect::<Vec<_>>().join(",")
+        ));
+    }
+    Ok(())
 }
 
 fn validate_bootstrap_principal(principal: &str) -> Result<(), String> {
@@ -887,11 +1046,18 @@ fn fresh_nonce() -> String {
     UlidMinter::new().mint().0
 }
 
-fn unix_now() -> i64 {
+fn unix_now() -> Result<i64, String> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+        .map_err(|_| "system clock is before the Unix epoch".to_string())
+}
+
+fn timestamp_now() -> Timestamp {
+    Timestamp(
+        chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
 }
 
 #[cfg(test)]
@@ -935,6 +1101,8 @@ mod tests {
         for invalid in [
             args(&[]),
             args(&["--gate-id"]),
+            args(&["--gate-id", "wrong-prefix"]),
+            args(&["--gate-id", &format!("gate:{}", "x".repeat(257))]),
             args(&["--gate-id", "gate:a", "--gate-id", "gate:b"]),
             args(&["--unknown", "gate:a"]),
         ] {
@@ -970,9 +1138,31 @@ mod tests {
                 "--ack-db-seal-operator-trust",
             ]),
             args(&["--principal", "p", "--cap", "--ack-db-seal-operator-trust"]),
+            args(&[
+                "--principal",
+                "p",
+                "--ttl-secs",
+                "1",
+                "--cap",
+                "repo.push",
+                "--ack-db-seal-operator-trust",
+            ]),
+            args(&[
+                "--principal",
+                "p",
+                "--cap",
+                "root.everything",
+                "--ack-db-seal-operator-trust",
+            ]),
         ] {
             assert!(parse_bootstrap_args(&invalid).is_err());
         }
+        assert!(matches!(
+            parse_command(&args(&["approve", "--gate-id", "gate:abc"])),
+            Ok(Command::Approve(gate_id)) if gate_id == "gate:abc"
+        ));
+        assert!(parse_command(&args(&["approve", "--gate-id", "bad"])).is_err());
+        assert!(validate_bootstrap_scheme("bearer").is_err());
 
         for invalid_principal in [
             "",
@@ -993,6 +1183,8 @@ mod tests {
     fn secure_credential_file_requires_single_owned_0600_inode_and_utf8() {
         let base = std::env::temp_dir().join(format!("myelin-mcp-secret-test-{}", fresh_nonce()));
         let link = base.with_extension("hardlink");
+        let symlink = base.with_extension("symlink");
+        let oversized = base.with_extension("oversized");
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1003,6 +1195,12 @@ mod tests {
         file.flush().unwrap();
         drop(file);
         assert_eq!(read_secret_file(&base).unwrap(), "secret-token");
+
+        std::os::unix::fs::symlink(&base, &symlink).unwrap();
+        assert!(read_secret_file(&symlink)
+            .unwrap_err()
+            .contains("non-symlink"));
+        std::fs::remove_file(&symlink).unwrap();
 
         std::fs::hard_link(&base, &link).unwrap();
         assert!(read_secret_file(&base).unwrap_err().contains("hard link"));
@@ -1020,6 +1218,19 @@ mod tests {
         file.flush().unwrap();
         drop(file);
         assert!(read_secret_file(&base).unwrap_err().contains("UTF-8"));
+        let mut oversized_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&oversized)
+            .unwrap();
+        oversized_file
+            .write_all(&vec![b'x'; MAX_CREDENTIAL_BYTES as usize + 1])
+            .unwrap();
+        oversized_file.flush().unwrap();
+        drop(oversized_file);
+        assert!(read_secret_file(&oversized).unwrap_err().contains("1..="));
+        std::fs::remove_file(&oversized).unwrap();
         std::fs::remove_file(&base).unwrap();
     }
 
@@ -1033,5 +1244,60 @@ mod tests {
             assert_eq!(ulid.len(), 26);
             assert!(ulid.bytes().all(|byte| byte.is_ascii_alphanumeric()));
         }
+    }
+
+    #[test]
+    fn gate_open_refreshes_candidate_status_instead_of_using_startup_snapshots() {
+        let kms = Arc::new(KmsEngine::new());
+        let principals = PrincipalStore::new(kms);
+        let tenant = myelin_tenancy::TenantId("acme".into());
+        let region = Region("eu-west".into());
+        let scope_principal = Principal::new(
+            tenant,
+            region.clone(),
+            PrincipalId("human:trigger".into()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        );
+        let scope = myelin_storage::TenantScope::from_verified_token(&scope_principal, region);
+        let candidate = PrincipalId("human:lead".into());
+        principals
+            .put_principal(
+                &scope,
+                candidate.clone(),
+                PrincipalKind::Human,
+                DataRole::Controller,
+                PrincipalStatus::Active,
+                None,
+            )
+            .unwrap();
+        let policy = GitMergeApproverPolicy {
+            authorizer: Arc::new(myelin_edge::AllowAllRepos),
+            principals: principals.clone(),
+            candidate_ids: vec![candidate.clone()],
+            scope: scope.clone(),
+        };
+        assert_eq!(
+            policy
+                .eligible_approvers("git.merge", &serde_json::json!({"repo":"alpha"}))
+                .unwrap(),
+            vec![candidate.clone()]
+        );
+
+        principals
+            .put_principal(
+                &scope,
+                candidate,
+                PrincipalKind::Human,
+                DataRole::Controller,
+                PrincipalStatus::Suspended,
+                None,
+            )
+            .unwrap();
+        assert!(policy
+            .eligible_approvers("git.merge", &serde_json::json!({"repo":"alpha"}))
+            .unwrap_err()
+            .contains("no configured active Human"));
     }
 }
