@@ -10,11 +10,9 @@
 //! **DURABLE-BY-DEFAULT (MR-009b W3b.4 / SI-007):** the outbox the relay drains is the PG-backed
 //! `outbox` table (`OutboxStore::durable(PgOutboxBacking)`) over the MR-022 `SubstrateProvider`
 //! pool, with the substrate foundation migrations (`outbox` + `consumer_dedup`) applied at boot —
-//! committed events survive a process restart. **FAIL LOUD on missing durable config** (the W5
-//! edge-main pattern): a missing `DATABASE_URL`, an unreachable pool, or a failed foundation
-//! migration each exit non-zero — NEVER a silent in-memory fallback. The remaining endpoints keep
-//! their dev-stack defaults (`Mode::DevDefaults`) until their own durable waves land; the durable
-//! config THIS root depends on is the PG DSN, and that one is required explicitly.
+//! committed events survive a process restart. Production boot requires the complete endpoint
+//! contract and distinct `DATABASE_MIGRATION_URL` / `DATABASE_URL` credentials. Only the bootstrap
+//! owns the privileged pool; it closes that pool before returning the constrained runtime provider.
 //!
 //! The runtime is the multi-thread `#[tokio::main]` flavor (required): the sync
 //! `DurableOutboxBacking` verbs bridge to async sqlx via `block_in_place` + `block_on`, which
@@ -22,45 +20,29 @@
 //!
 //! A failed boot / incomplete drain returns non-zero (§3.1) — loud, never a silent success.
 
-use myelin_config::{Mode, MyelinConfig};
+use myelin_config::Mode;
 use myelin_events::OutboxStore;
 use myelin_issues::{issues_hot_tables, issues_migrations, run_issues};
-use myelin_storage::{all_durable_migrations, HotTables, PgOutboxBacking, SubstrateProvider};
+use myelin_storage::{all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking};
 use myelin_substrate::Config;
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
-    // FAIL LOUD on missing durable config (W3b.4): the durable outbox requires the PG DSN. No
-    // DATABASE_URL → refuse to boot (exit non-zero) — never a silent in-memory fallback.
-    if std::env::var("DATABASE_URL")
-        .map(|v| v.trim().is_empty())
-        .unwrap_or(true)
-    {
-        eprintln!(
-            "issues: DATABASE_URL is required (durable-by-default outbox, MR-009b W3b.4): \
-             refusing to boot without durable config — there is no in-memory fallback"
-        );
-        std::process::exit(1);
-    }
-    let config = MyelinConfig::from_env(Mode::DevDefaults).unwrap_or_else(|e| {
-        eprintln!("issues: invalid config: {e}");
-        std::process::exit(1);
-    });
-    let provider = match SubstrateProvider::connect(config, 8).await {
-        Ok(p) => p,
+    // Production is strict: validate every endpoint plus the split runtime/migration role pair
+    // before any DDL or listener can be created. `PgBootstrap` alone owns the privileged pool.
+    let bootstrap = match PgBootstrap::from_env(Mode::RequireEnv).await {
+        Ok(bootstrap) => bootstrap,
         Err(e) => {
-            eprintln!(
-                "issues: cannot reach the durable OLTP pool (durable-by-default requires PG): {e}"
-            );
+            eprintln!("issues: database bootstrap refused to start: {e}");
             std::process::exit(1);
         }
     };
     // The substrate foundation tables (the frozen `outbox` + `consumer_dedup` DDL) must exist
     // before the durable store binds — applied through the MR-022 migrator (idempotent,
-    // forward-only, advisory-locked). Only the foundation set is applied here: the tables THIS
-    // root's durable path needs, never a silently-widened migration surface.
-    if let Err(e) = provider.migrate_foundation().await {
+    // forward-only, advisory-locked). Foundation is deliberately first; the durable aggregate and
+    // Issues-owned migration set follow in that validated order.
+    if let Err(e) = bootstrap.migrate_foundation().await {
         eprintln!(
             "issues: cannot apply the substrate foundation migrations (outbox/consumer_dedup): {e}"
         );
@@ -72,7 +54,7 @@ async fn main() {
     // tables on a fresh DB (doc-18: a main that migrated only a piecemeal subset left the stores it
     // constructs writing to un-migrated tables). Idempotent + advisory-locked (safe on re-boot);
     // FAIL LOUD, never a silent fallback.
-    if let Err(e) = provider
+    if let Err(e) = bootstrap
         .migrate(&all_durable_migrations(), &HotTables::none())
         .await
     {
@@ -82,13 +64,22 @@ async fn main() {
     // Apply the Issues-owned spine through the REAL provider migrator. The AppSpec migration list
     // is also the DB-free lifecycle declaration, but it does not execute SQL; production boot must
     // validate + execute this set before any issue store is opened. Fail loud on any schema fault.
-    if let Err(e) = provider
+    if let Err(e) = bootstrap
         .migrate(&issues_migrations(), &issues_hot_tables())
         .await
     {
         eprintln!("issues: cannot apply the issue-spine migrations: {e}");
         std::process::exit(1);
     }
+    // The handoff reconnects and re-validates the constrained role, closes the migration pool, and
+    // erases its DSN from the retained config. No serving store is constructed before this point.
+    let provider = match bootstrap.into_runtime().await {
+        Ok(provider) => provider,
+        Err(e) => {
+            eprintln!("issues: database runtime handoff refused to start: {e}");
+            std::process::exit(1);
+        }
+    };
     // The DURABLE outbox (SI-007): committed events live in Postgres, not a per-process mutex.
     let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
         provider.db_pool().clone(),
