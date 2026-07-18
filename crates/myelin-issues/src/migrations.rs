@@ -99,6 +99,8 @@ pub const MILESTONE_TABLE: &str = "milestone";
 pub const PREFIX_COUNTER_TABLE: &str = "prefix_counter";
 pub const CONSUMER_DEDUP_TABLE: &str = "consumer_dedup";
 pub const OUTBOX_TABLE: &str = "outbox";
+/// Issues-owned durable saga ledger for the cross-service issue-row -> Identity tuple bootstrap.
+pub const ISSUE_AUTHZ_BINDING_TABLE: &str = "issue_authz_binding";
 
 /// The `issue` hot-board / list scan index names (arch 01 §2 — the index-range hot path the
 /// board/roadmap/assignee/cycle reads ride). The behaviour (the scan) is the read path; the SHAPES
@@ -207,6 +209,41 @@ ALTER TABLE issue ADD COLUMN IF NOT EXISTS created_by_principal text;";
 /// `ALTER COLUMN` shape while continuing to reject type rewrites and other in-place alterations.
 pub const EXPAND_NULLABLE_REPORTER_DDL: &str =
     "ALTER TABLE issue ALTER COLUMN reporter DROP NOT NULL;";
+
+/// Durable, fail-closed authorization-bootstrap ledger.
+///
+/// Identity owns `rebac_tuple`, so Issues must never write that table directly or pretend a future
+/// per-service database can share a transaction with it. Instead creation commits an invisible
+/// issue row, this exact tuple intent, and `issue.issue.authorization_requested` to the outbox in
+/// one Issues transaction. A retryable worker asks Identity to idempotently add the tuple, then
+/// changes this row to `active` and co-emits the externally visible `issue.issue.created` event.
+/// Every Issues read joins only `active` bindings, making any crash window fail closed.
+pub const CREATE_ISSUE_AUTHZ_BINDING_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS issue_authz_binding (
+  tenant_id        text        NOT NULL,
+  region           text        NOT NULL,
+  issue_id         uuid        NOT NULL,
+  project_id       uuid        NOT NULL,
+  issue_object     text        NOT NULL,
+  project_userset  text        NOT NULL,
+  relation         text        NOT NULL CHECK (relation = 'parent_project'),
+  request_event_id text        NOT NULL,
+  created_event_id text        NOT NULL,
+  state            text        NOT NULL CHECK (state IN ('pending','active')),
+  zookie           text,
+  attempts         int         NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  last_error       text,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  activated_at     timestamptz,
+  PRIMARY KEY (tenant_id, issue_id),
+  UNIQUE (request_event_id),
+  UNIQUE (created_event_id),
+  FOREIGN KEY (tenant_id, issue_id) REFERENCES issue (tenant_id, id),
+  CHECK ((state = 'pending' AND zookie IS NULL AND activated_at IS NULL) OR
+         (state = 'active' AND zookie IS NOT NULL AND activated_at IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS issue_authz_binding_pending
+  ON issue_authz_binding (tenant_id, region, state, created_at, issue_id);";
 
 /// `issue_relation` (arch 01 §4 — the TE-7 source of truth, contract 5.5). We write the FORWARD edge
 /// transactionally + emit ONE typed event; Refs materialises both directions. The FK constrains only
@@ -481,6 +518,19 @@ pub fn issues_migrations() -> Migrations {
         EXPAND_NULLABLE_REPORTER_DDL,
         ISSUE_TABLE,
     ));
+    let authz_binding_ddl = Box::leak(
+        format!(
+            "{}\n{};",
+            CREATE_ISSUE_AUTHZ_BINDING_DDL,
+            make_tenant_scoped_ddl(ISSUE_AUTHZ_BINDING_TABLE)
+        )
+        .into_boxed_str(),
+    );
+    migrations.push(Migration::plain_on(
+        "iss_0016_issue_authz_binding",
+        authz_binding_ddl,
+        ISSUE_AUTHZ_BINDING_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -584,6 +634,28 @@ mod tests {
                 );
             }
         }
+        let binding = issues_migrations()
+            .0
+            .into_iter()
+            .find(|m| m.table == Some(ISSUE_AUTHZ_BINDING_TABLE))
+            .expect("authorization binding migration");
+        assert!(CREATE_ISSUE_AUTHZ_BINDING_DDL
+            .starts_with("CREATE TABLE IF NOT EXISTS issue_authz_binding (\n  tenant_id"));
+        assert!(CREATE_ISSUE_AUTHZ_BINDING_DDL.contains("\n  region"));
+        assert!(binding.ddl.contains("myelin_make_tenant_scoped"));
+        for invariant in [
+            "request_event_id text",
+            "created_event_id text",
+            "UNIQUE (request_event_id)",
+            "UNIQUE (created_event_id)",
+            "state IN ('pending','active')",
+            "FOREIGN KEY (tenant_id, issue_id)",
+        ] {
+            assert!(
+                binding.ddl.contains(invariant),
+                "authorization binding pins `{invariant}`"
+            );
+        }
     }
 
     /// **The migration set applies forward-only (no destructive DROP, no down) — the contract-1.5
@@ -595,8 +667,8 @@ mod tests {
         let migrations = issues_migrations();
         assert_eq!(
             migrations.0.len(),
-            21,
-            "11 table creates + 8 concurrent indexes + 2 online expands"
+            22,
+            "11 spine-table creates + 8 concurrent indexes + 2 online expands + the authz saga ledger"
         );
         for m in &migrations.0 {
             assert!(
@@ -623,7 +695,7 @@ mod tests {
             .expect("the full Issue-Tracker spine applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            21,
+            22,
             "the runner applied every table/index/expand migration"
         );
         assert_eq!(
@@ -639,7 +711,7 @@ mod tests {
             .expect("the spine re-applies idempotently");
         assert_eq!(
             runner2.applied().len(),
-            21,
+            22,
             "the re-apply admits every migration again"
         );
     }
