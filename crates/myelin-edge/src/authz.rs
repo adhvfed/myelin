@@ -31,11 +31,15 @@
 //! `Arc::new(AllowAllRepos)` construction outside a test gate so it cannot return.
 
 use myelin_identity::Principal;
+use myelin_identity_service::{
+    CredentialAudience, CredentialPurpose, RequestIdentity, VerifiedCapabilityContext,
+};
 use myelin_substrate::Authorizer;
 use std::collections::BTreeSet;
 
-/// **The canonical allowlist of action verbs mounted on the production edge** — the single place
-/// the composition root (`main.rs`) seeds [`AuthenticatedActionPolicy`] from. One entry per action
+/// Compatibility projection of action verbs mounted on the production edge. The canonical source
+/// used by production authorization is [`ACTION_REQUIREMENTS`]; a bidirectional equality test keeps
+/// this older exported list synchronized. One entry per action
 /// string the production route registrations declare:
 ///  - `edge.*` — the whoami proof routes + the SSE subscribe route (`main.rs`).
 ///  - `git.*` (JSON product API) — the actions [`crate::register_git_durable`] binds over Git's
@@ -74,10 +78,171 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     // -- the R3.1 PR-list reads register_git_durable adds beyond the catalogue --
     "git.prs.list",
     "git.prs.mine",
+    "git.pr.commits",
+    "git.pr.diff",
+    "git.file.lines",
+    "git.pr.threads.list",
+    "git.pr.thread.create",
+    "git.pr.comment.create",
+    "git.pr.thread.resolve",
+    "git.pr.review.start",
+    "git.pr.review.comment",
+    "git.pr.review.submit",
+    "git.pr.review.discard",
+    "git.refs.list",
+    "git.tree.view",
+    "git.blob.raw",
+    "git.blob.download",
     // -- the git smart-HTTP wire (register_git_wire) --
     "git.wire.upload_pack",
     "git.wire.receive_pack",
 ];
+
+/// Purpose classes accepted by an Edge action requirement. The signed purpose, never an unsigned
+/// request header or the resolved principal kind, selects one of these classes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcceptedPurpose {
+    OperatorBootstrap,
+    AgentRun,
+    Pat,
+    CiJob,
+    DeployKey,
+}
+
+const OP_AGENT_PAT: &[AcceptedPurpose] = &[
+    AcceptedPurpose::OperatorBootstrap,
+    AcceptedPurpose::AgentRun,
+    AcceptedPurpose::Pat,
+];
+const OP_PAT: &[AcceptedPurpose] = &[AcceptedPurpose::OperatorBootstrap, AcceptedPurpose::Pat];
+const OP_AGENT_PAT_DEPLOY: &[AcceptedPurpose] = &[
+    AcceptedPurpose::OperatorBootstrap,
+    AcceptedPurpose::AgentRun,
+    AcceptedPurpose::Pat,
+    AcceptedPurpose::DeployKey,
+];
+const CI_ONLY: &[AcceptedPurpose] = &[AcceptedPurpose::CiJob];
+
+/// One auditable action-to-capability rule. Action strings route requests; capability strings are
+/// signed authority vocabulary. They are deliberately distinct and never inferred from each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActionRequirement {
+    pub action: &'static str,
+    pub required_capability: &'static str,
+    pub accepted_purposes: &'static [AcceptedPurpose],
+}
+
+macro_rules! requirement {
+    ($action:literal, $capability:literal, $purposes:expr) => {
+        ActionRequirement {
+            action: $action,
+            required_capability: $capability,
+            accepted_purposes: $purposes,
+        }
+    };
+}
+
+/// Canonical capability catalogue for every mounted Edge route. A missing entry denies before
+/// dispatch. `repo.create` is an explicit tenant-level capability; check reporting is restricted to
+/// a dedicated CI purpose/capability. Operator bootstrap is a signed-purpose-limited override and
+/// must itself carry `edge.operator`; `agent:run` is never an override or special capability.
+pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
+    requirement!("edge.whoami", "edge.identity.read", OP_AGENT_PAT),
+    requirement!(
+        "edge.events.subscribe",
+        "edge.events.subscribe",
+        OP_AGENT_PAT
+    ),
+    requirement!("git.repos.list", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.repo.create", "repo.create", OP_PAT),
+    requirement!("git.pr.view", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.pr.checks", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.blob.view", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.blob.commit", "repo.push", OP_AGENT_PAT),
+    requirement!("git.pr.open", "repo.push", OP_AGENT_PAT),
+    requirement!("git.pr.review", "pull_request.review", OP_AGENT_PAT),
+    requirement!(
+        "git.pr.endorse_fork_ci",
+        "repo.approve_untrusted_ci",
+        OP_AGENT_PAT
+    ),
+    requirement!("git.pr.merge", "pull_request.merge", OP_AGENT_PAT),
+    requirement!("git.repo.branch_protection.set", "repo.administer", OP_PAT),
+    requirement!("git.checks.report", "ci.checks.report", CI_ONLY),
+    requirement!("git.search.code", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.repo.view", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.commits.log", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.commit.diff", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.prs.list", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.prs.mine", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.pr.commits", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.pr.diff", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.file.lines", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.pr.threads.list", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.pr.thread.create", "pull_request.review", OP_AGENT_PAT),
+    requirement!("git.pr.comment.create", "pull_request.review", OP_AGENT_PAT),
+    requirement!("git.pr.thread.resolve", "pull_request.review", OP_AGENT_PAT),
+    requirement!("git.pr.review.start", "pull_request.review", OP_AGENT_PAT),
+    requirement!("git.pr.review.comment", "pull_request.review", OP_AGENT_PAT),
+    requirement!("git.pr.review.submit", "pull_request.review", OP_AGENT_PAT),
+    requirement!("git.pr.review.discard", "pull_request.review", OP_AGENT_PAT),
+    requirement!("git.refs.list", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.tree.view", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.blob.raw", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.blob.download", "repo.pull", OP_AGENT_PAT),
+    requirement!("git.wire.upload_pack", "repo.pull", OP_AGENT_PAT_DEPLOY),
+    requirement!("git.wire.receive_pack", "repo.push", OP_AGENT_PAT_DEPLOY),
+];
+
+pub fn action_requirement(action: &str) -> Option<&'static ActionRequirement> {
+    ACTION_REQUIREMENTS
+        .iter()
+        .find(|rule| rule.action == action)
+}
+
+fn purpose_class(purpose: &CredentialPurpose) -> Option<AcceptedPurpose> {
+    match purpose {
+        CredentialPurpose::OperatorBootstrap => Some(AcceptedPurpose::OperatorBootstrap),
+        CredentialPurpose::AgentRun { .. } => Some(AcceptedPurpose::AgentRun),
+        CredentialPurpose::Pat => Some(AcceptedPurpose::Pat),
+        CredentialPurpose::CiJob { .. } => Some(AcceptedPurpose::CiJob),
+        CredentialPurpose::DeployKey => Some(AcceptedPurpose::DeployKey),
+        CredentialPurpose::PerJob { .. } => None,
+    }
+}
+
+/// Final coarse Edge action boundary. Both the injected verb policy and this signed capability
+/// requirement must allow. Object-addressed handlers then apply their independent ReBAC guard.
+pub fn authorize_edge_action(
+    verb_policy: &dyn Authorizer,
+    identity: &RequestIdentity,
+    action: &str,
+) -> bool {
+    if !verb_policy.authorize(&identity.principal, action) {
+        return false;
+    }
+    let capability: &VerifiedCapabilityContext = identity.capability();
+    if capability.audience != CredentialAudience::Edge {
+        return false;
+    }
+    let Some(rule) = action_requirement(action) else {
+        return false;
+    };
+    let Some(class) = purpose_class(&capability.purpose) else {
+        return false;
+    };
+    if !rule.accepted_purposes.contains(&class) {
+        return false;
+    }
+    match capability.purpose {
+        CredentialPurpose::OperatorBootstrap => {
+            capability.effective_authority.holds("edge.operator")
+        }
+        _ => capability
+            .effective_authority
+            .holds(rule.required_capability),
+    }
+}
 
 /// **The production action-level authorizer (R2.6).** Authorizes an authenticated, tenant-scoped
 /// principal for exactly the allowlisted edge action verbs — deny-by-default for everything else.
@@ -101,10 +266,9 @@ impl AuthenticatedActionPolicy {
         }
     }
 
-    /// The production policy: exactly the mounted edge actions ([`MOUNTED_EDGE_ACTIONS`]) — what
-    /// the composition root (`main.rs`) injects into `Gateway::builder`.
+    /// The production policy: exactly the canonical capability catalogue's actions.
     pub fn mounted() -> AuthenticatedActionPolicy {
-        AuthenticatedActionPolicy::new(MOUNTED_EDGE_ACTIONS.iter().copied())
+        AuthenticatedActionPolicy::new(ACTION_REQUIREMENTS.iter().map(|rule| rule.action))
     }
 }
 
@@ -141,11 +305,40 @@ impl Authorizer for AllowAll {
 mod tests {
     use super::*;
     use myelin_identity::{PrincipalId, PrincipalKind};
+    use myelin_identity_service::{
+        Authority, CredentialContext, DpopState, VerifiedCapabilityContext,
+    };
+    use myelin_storage::TenantScope;
     use myelin_substrate::DenyAll;
-    use myelin_tenancy::TenantId;
+    use myelin_tenancy::{Region, TenantId};
 
     fn principal() -> Principal {
-        Principal::stub(PrincipalId("p".into()), PrincipalKind::Human, TenantId("acme".into()))
+        Principal::stub(
+            PrincipalId("p".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        )
+    }
+
+    fn identity(
+        purpose: CredentialPurpose,
+        audience: CredentialAudience,
+        grants: &[&str],
+    ) -> RequestIdentity {
+        let principal = principal();
+        let scope = TenantScope::from_verified_token(&principal, Region("eu-west".into()));
+        RequestIdentity {
+            principal,
+            scope,
+            credential: CredentialContext::Capability(VerifiedCapabilityContext {
+                purpose,
+                audience,
+                jti: "jti-test".into(),
+                effective_authority: Authority::of(grants.iter().copied()),
+                expires_at_unix: i64::MAX,
+                dpop: DpopState::Unbound,
+            }),
+        }
     }
 
     #[test]
@@ -174,10 +367,10 @@ mod tests {
         let p = principal();
         for unknown in [
             "edge.does.not.exist",
-            "git.repo.delete",     // a plausible FUTURE verb — not mounted, must be denied
+            "git.repo.delete", // a plausible FUTURE verb — not mounted, must be denied
             "git.unmapped:/api/git/future", // the fail-honest placeholder — deliberately denied
-            "",                    // the degenerate empty action
-            "edge.whoami2",        // a near-miss must not prefix-match
+            "",                // the degenerate empty action
+            "edge.whoami2",    // a near-miss must not prefix-match
         ] {
             assert!(
                 !policy.authorize(&p, unknown),
@@ -215,5 +408,111 @@ mod tests {
         let p = principal();
         assert!(policy.authorize(&p, "edge.whoami"));
         assert!(!policy.authorize(&p, "edge.events.subscribe"));
+    }
+
+    #[test]
+    fn capability_catalogue_exactly_covers_the_compatibility_action_list() {
+        let mapped: BTreeSet<&str> = ACTION_REQUIREMENTS.iter().map(|rule| rule.action).collect();
+        let mounted: BTreeSet<&str> = MOUNTED_EDGE_ACTIONS.iter().copied().collect();
+        assert_eq!(
+            mapped.len(),
+            ACTION_REQUIREMENTS.len(),
+            "duplicate action rule"
+        );
+        assert_eq!(
+            mapped, mounted,
+            "mounted actions and capability rules drifted"
+        );
+    }
+
+    #[test]
+    fn signed_audience_purpose_and_narrow_authority_are_all_enforced() {
+        let agent_pull = identity(
+            CredentialPurpose::AgentRun {
+                run_id: "run-1".into(),
+                delegation_snapshot: Some(7),
+            },
+            CredentialAudience::Edge,
+            &["repo.pull"],
+        );
+        assert!(authorize_edge_action(
+            &AllowAll,
+            &agent_pull,
+            "git.pr.commits"
+        ));
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &agent_pull,
+            "git.pr.merge"
+        ));
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &agent_pull,
+            "git.repo.create"
+        ));
+
+        let wrong_audience = identity(
+            CredentialPurpose::Pat,
+            CredentialAudience::Mcp,
+            &["repo.pull"],
+        );
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &wrong_audience,
+            "git.pr.commits"
+        ));
+
+        let empty_operator = identity(
+            CredentialPurpose::OperatorBootstrap,
+            CredentialAudience::Edge,
+            &[],
+        );
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &empty_operator,
+            "edge.whoami"
+        ));
+    }
+
+    #[test]
+    fn operator_override_never_becomes_ci_attestation_or_agent_supercap() {
+        let operator = identity(
+            CredentialPurpose::OperatorBootstrap,
+            CredentialAudience::Edge,
+            &["edge.operator", "ci.checks.report"],
+        );
+        assert!(authorize_edge_action(
+            &AllowAll,
+            &operator,
+            "git.repo.create"
+        ));
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &operator,
+            "git.checks.report"
+        ));
+
+        let ci = identity(
+            CredentialPurpose::CiJob {
+                run_id: "ci-run-1".into(),
+            },
+            CredentialAudience::Edge,
+            &["ci.checks.report"],
+        );
+        assert!(authorize_edge_action(&AllowAll, &ci, "git.checks.report"));
+
+        let legacy_agent_run = identity(
+            CredentialPurpose::AgentRun {
+                run_id: "run-2".into(),
+                delegation_snapshot: Some(9),
+            },
+            CredentialAudience::Edge,
+            &["agent:run"],
+        );
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &legacy_agent_run,
+            "git.pr.merge"
+        ));
     }
 }

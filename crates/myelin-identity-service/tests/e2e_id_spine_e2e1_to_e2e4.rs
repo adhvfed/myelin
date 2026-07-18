@@ -384,7 +384,7 @@ fn e2e2_triage_agent_runs_under_delegation_and_mint_exactly_once_merge() {
     // MR-012: the token is a REAL signed PASETO token; assert on the verified authority (read through
     // the provider's cell trust anchor), not a plaintext substring of the now-opaque bytes.
     let minted_authority = svc
-        .introspect_run_token("agent", &token)
+        .introspect_run_token_at("agent", &token, &ts("2026-06-24T00:00:01Z"))
         .expect("the per-run token verifies through the real cell trust anchor (MR-012)")
         .authority;
     assert!(

@@ -19,16 +19,17 @@
 //! a failure is a clean typed [`EdgeError`], never a panic), and FAIL-CLOSED (any authenticate failure
 //! → a uniform 401; an authorize denial → 403).
 
+use crate::authz::authorize_edge_action;
 use crate::catalogue::{Handler, HandlerCtx, Method, Page};
 use crate::error::EdgeError;
 use crate::request::{EdgeRequest, EdgeResponse};
 use crate::session::{SessionStore, SESSION_COOKIE};
 use crate::sse::{SseEvent, SseHub};
 use myelin_identity::{AuthzError, Credential, Principal, PrincipalKind};
-use myelin_identity_service::{CapabilityAuthenticator, HumanSsoAuthenticator};
+use myelin_identity_service::{CapabilityAuthenticator, HumanSsoAuthenticator, RequestIdentity};
 use myelin_storage::TenantScope;
 use myelin_substrate::{Authorizer, InjectedIdentity, PublicSurface};
-use myelin_tenancy::TenantId;
+use myelin_tenancy::{Region, TenantId};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -128,7 +129,10 @@ fn repo_lifecycle_event(
             })
             .map(|slug| ("repo.created", slug)),
         // The wire receive-pack (push) route binds `{repo}` in its path — the pushed repo slug.
-        "git.wire.receive_pack" => params.get("repo").cloned().map(|slug| ("repo.pushed", slug)),
+        "git.wire.receive_pack" => params
+            .get("repo")
+            .cloned()
+            .map(|slug| ("repo.pushed", slug)),
         _ => None,
     }
 }
@@ -185,12 +189,14 @@ fn parse_pattern(pattern: &str) -> Vec<Seg> {
         .trim_matches('/')
         .split('/')
         .filter(|s| !s.is_empty())
-        .map(|s| match s.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
-            // `{...name}` = a trailing catch-all that binds the remaining path segments (R3.4).
-            Some(name) if name.starts_with("...") => Seg::Rest(name[3..].to_string()),
-            Some(name) => Seg::Param(name.to_string()),
-            None => Seg::Lit(s.to_string()),
-        })
+        .map(
+            |s| match s.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
+                // `{...name}` = a trailing catch-all that binds the remaining path segments (R3.4).
+                Some(name) if name.starts_with("...") => Seg::Rest(name[3..].to_string()),
+                Some(name) => Seg::Param(name.to_string()),
+                None => Seg::Lit(s.to_string()),
+            },
+        )
         .collect()
 }
 
@@ -209,6 +215,13 @@ pub struct GatewayBuilder {
 }
 
 impl GatewayBuilder {
+    /// The actions declared by routes registered so far. This is an audit/composition seam used to
+    /// prove the final capability catalogue covers the actual router, not a parallel hand-written
+    /// list.
+    pub fn registered_actions(&self) -> impl Iterator<Item = &str> {
+        self.routes.iter().map(|route| route.action.as_str())
+    }
+
     /// Register a normal route (`method` + `pattern` like `/v1/git/repos/{repo}/prs/{n}`), gated by
     /// the re-authorized `action`, dispatching to `handler`.
     ///
@@ -472,6 +485,7 @@ impl Gateway {
         // The special `{tenant}` path param is used ONLY to detect/reject an IDOR — NEVER the source
         // of the operating tenant (the cardinal rule). Most routes carry no `{tenant}` at all.
         let path_tenant = params.get("tenant").map(|t| TenantId(t.clone()));
+        let path_region = params.get("region").map(|r| Region(r.clone()));
 
         // R4.0 item C: the git smart-HTTP WIRE routes (and ONLY those) additionally accept HTTP Basic
         // (git's native `http://…` credential shape), where the password is the capability token. The
@@ -479,15 +493,31 @@ impl Gateway {
         // Basic seam can never leak onto a non-wire route.
         let allow_basic = route.action.starts_with("git.wire.");
 
-        // (1) authenticate → the verified Principal (uniform 401 on ANY failure).
-        let principal = self.authenticate(req, path_tenant.as_ref(), allow_basic)?;
+        // (1) authenticate → the complete verified identity (uniform 401 on ANY failure).
+        let identity = self.authenticate(req, path_tenant.as_ref(), allow_basic)?;
         // (2) resolve + set the tenant scope (reject + audit a cross-tenant path here).
-        let scope = self.resolve_scope(&principal, path_tenant.as_ref())?;
-        // (3) re-authorize the action (fail-closed → 403); the seam is consulted on EVERY call.
-        if !self.authorizer.authorize(&principal, &route.action) {
+        let scope = self.resolve_scope(
+            &identity.principal,
+            path_tenant.as_ref(),
+            path_region.as_ref(),
+        )?;
+        debug_assert_eq!(scope, identity.scope);
+        // A receive-pack advertisement shares Git's GET info/refs route with upload-pack. Select
+        // the stronger signed capability before dispatch; the handler's object Write check remains
+        // the independent second conjunct.
+        let authorization_action = if route.action == "git.wire.upload_pack"
+            && req.query_param("service").as_deref() == Some("git-receive-pack")
+        {
+            "git.wire.receive_pack"
+        } else {
+            route.action.as_str()
+        };
+        // (3) re-authorize the action (fail-closed → 403). Signed Edge audience, purpose, and
+        // capability authority are conjunctive with the injected verb policy on EVERY call.
+        if !authorize_edge_action(self.authorizer.as_ref(), &identity, authorization_action) {
             return Err(EdgeError::Forbidden(format!(
                 "authorization denied for action `{}`",
-                route.action
+                authorization_action
             )));
         }
         // (4) dispatch.
@@ -495,7 +525,8 @@ impl Gateway {
             RouteKind::Normal(handler) => {
                 let page = Page::from_request(req);
                 let ctx = HandlerCtx {
-                    principal: &principal,
+                    identity: &identity,
+                    principal: &identity.principal,
                     scope: &scope,
                     params: &params,
                     page: &page,
@@ -544,7 +575,8 @@ impl Gateway {
         }
     }
 
-    /// Authenticate a request to a [`Principal`]: Bearer capability token first, then session cookie.
+    /// Authenticate a request to a complete [`RequestIdentity`]: Bearer capability token first,
+    /// then a capability-backed session cookie.
     /// ANY failure (forged/expired/revoked/absent) collapses to a uniform [`EdgeError::Unauthorized`]
     /// (401) — the client cannot distinguish the cause (oracle-free). The verified principal's
     /// tenant/region is the request scope; a forged token never resolves a Principal (real PASETO).
@@ -553,17 +585,20 @@ impl Gateway {
         req: &EdgeRequest,
         path_tenant: Option<&TenantId>,
         allow_basic: bool,
-    ) -> Result<Principal, EdgeError> {
+    ) -> Result<RequestIdentity, EdgeError> {
         let scheme_of = || {
             req.header("x-myelin-token-scheme")
                 .unwrap_or(&self.default_scheme)
                 .to_string()
         };
         if let Some(material) = req.bearer() {
-            let cred = Credential { scheme: scheme_of(), material: material.to_string() };
+            let cred = Credential {
+                scheme: scheme_of(),
+                material: material.to_string(),
+            };
             return self
                 .authn
-                .authenticate(&cred, path_tenant)
+                .authenticate_identity(&cred, path_tenant)
                 .map_err(|e| EdgeError::Unauthorized(format!("bearer auth failed: {e:?}")));
         }
         // R4.0 item C — git smart-HTTP WIRE ONLY: accept HTTP Basic where the PASSWORD is the
@@ -574,20 +609,26 @@ impl Gateway {
         // material). Bearer callers are entirely unaffected (this arm is reached only when NO Bearer).
         if allow_basic {
             if let Some(material) = req.basic_password() {
-                let cred = Credential { scheme: scheme_of(), material };
+                let cred = Credential {
+                    scheme: scheme_of(),
+                    material,
+                };
                 return self
                     .authn
-                    .authenticate(&cred, path_tenant)
+                    .authenticate_identity(&cred, path_tenant)
                     .map_err(|e| EdgeError::Unauthorized(format!("basic auth failed: {e:?}")));
             }
         }
         if let Some(sid) = req.cookie(SESSION_COOKIE) {
             // The session carries the Bearer server-side (never exposed to client JS).
             if let Some(rec) = self.sessions.get(&sid) {
-                let cred = Credential { scheme: rec.scheme, material: rec.material };
+                let cred = Credential {
+                    scheme: rec.scheme,
+                    material: rec.material,
+                };
                 return self
                     .authn
-                    .authenticate(&cred, path_tenant)
+                    .authenticate_identity(&cred, path_tenant)
                     .map_err(|e| EdgeError::Unauthorized(format!("session auth failed: {e:?}")));
             }
             return Err(EdgeError::Unauthorized(
@@ -607,14 +648,31 @@ impl Gateway {
         &self,
         principal: &Principal,
         path_tenant: Option<&TenantId>,
+        path_region: Option<&Region>,
     ) -> Result<TenantScope, EdgeError> {
         if let Some(pt) = path_tenant {
             let id = InjectedIdentity::new(principal.clone());
             self.public_surface
                 .resolve_tenant(&id, pt)
-                .map_err(|reject| EdgeError::Forbidden(format!("cross-tenant IDOR rejected: {reject}")))?;
+                .map_err(|reject| {
+                    EdgeError::Forbidden(format!("cross-tenant IDOR rejected: {reject}"))
+                })?;
         }
-        Ok(TenantScope::from_verified_token(principal, principal.region.clone()))
+        if let Some(path_region) = path_region {
+            if path_region != &principal.region {
+                // PublicSurface currently exposes only a tenant-IDOR audit carrier. Refuse the
+                // region mismatch here before authorization/dispatch; adding a region audit record
+                // requires extending that substrate API rather than mislabelling it as a tenant IDOR.
+                return Err(EdgeError::Forbidden(format!(
+                    "cross-region scope rejected: path region `{}` does not match verified region",
+                    path_region.0
+                )));
+            }
+        }
+        Ok(TenantScope::from_verified_token(
+            principal,
+            principal.region.clone(),
+        ))
     }
 
     /// `GET /v1/auth/config` (UNAUTHENTICATED) — the logged-out login page's honest render source
@@ -676,7 +734,10 @@ impl Gateway {
             .get("material")
             .and_then(|v| v.as_str())
             .ok_or_else(|| EdgeError::BadRequest("login body missing `material`".into()))?;
-        let cred = Credential { scheme: scheme.to_string(), material: material.to_string() };
+        let cred = Credential {
+            scheme: scheme.to_string(),
+            material: material.to_string(),
+        };
         match self.human_login.authenticate(&cred, None) {
             Ok(_principal) => Err(EdgeError::Unavailable(
                 "human login verified, but server-side token minting for a human principal is not \
@@ -711,14 +772,16 @@ impl Gateway {
         let sid = req
             .cookie(SESSION_COOKIE)
             .ok_or_else(|| EdgeError::Unauthorized("no session cookie to refresh".into()))?;
-        let rec = self
-            .sessions
-            .get(&sid)
-            .ok_or_else(|| EdgeError::Unauthorized("session cookie does not resolve a live session".into()))?;
-        let cred = Credential { scheme: rec.scheme, material: rec.material };
-        self.authn
-            .authenticate(&cred, None)
-            .map_err(|e| EdgeError::Unauthorized(format!("stale session (re-auth failed): {e:?}")))?;
+        let rec = self.sessions.get(&sid).ok_or_else(|| {
+            EdgeError::Unauthorized("session cookie does not resolve a live session".into())
+        })?;
+        let cred = Credential {
+            scheme: rec.scheme,
+            material: rec.material,
+        };
+        self.authn.authenticate_identity(&cred, None).map_err(|e| {
+            EdgeError::Unauthorized(format!("stale session (re-auth failed): {e:?}"))
+        })?;
         Ok(EdgeResponse::json(200, &json!({ "refreshed": true })))
     }
 
@@ -806,15 +869,15 @@ mod tests {
     use super::*;
     use crate::authz::AllowAll;
     use myelin_identity_service::{
-        CapabilityAuthenticator, CellTokenAuthority, HumanSsoAuthenticator, PasetoCapabilityVerifier,
-        PrincipalStore, RevocationStore,
+        CapabilityAuthenticator, CellTokenAuthority, HumanSsoAuthenticator,
+        PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
     };
     use myelin_storage::KmsEngine;
 
     fn human_login() -> Arc<HumanSsoAuthenticator> {
-        Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(
-            KmsEngine::new(),
-        ))))
+        Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
+            Arc::new(KmsEngine::new()),
+        )))
     }
 
     fn authn_empty() -> Arc<CapabilityAuthenticator> {
@@ -830,7 +893,12 @@ mod tests {
 
     fn gw() -> Gateway {
         Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll))
-            .route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler))
+            .route(
+                Method::Get,
+                "/v1/whoami",
+                "edge.whoami",
+                Arc::new(WhoamiHandler),
+            )
             .build()
     }
 
@@ -884,7 +952,12 @@ mod tests {
     /// (a `git.wire.*` action) — the fixture for the F1 challenge-scoping assertions.
     fn gw_with_wire() -> Gateway {
         Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll))
-            .route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler))
+            .route(
+                Method::Get,
+                "/v1/whoami",
+                "edge.whoami",
+                Arc::new(WhoamiHandler),
+            )
             .route(
                 Method::Get,
                 "/{tenant}/{region}/{repo}/info/refs",
@@ -911,7 +984,11 @@ mod tests {
             vec![],
             vec![],
         ));
-        assert_eq!(wire.status(), 401, "an unauthenticated wire request is a 401");
+        assert_eq!(
+            wire.status(),
+            401,
+            "an unauthenticated wire request is a 401"
+        );
         assert_eq!(
             www_authenticate(&wire).as_deref(),
             Some(r#"Basic realm="Myelin""#),
@@ -942,7 +1019,10 @@ mod tests {
             vec![],
         ));
         assert_eq!(forged.status(), 401);
-        assert_eq!(www_authenticate(&forged).as_deref(), Some(r#"Basic realm="Myelin""#));
+        assert_eq!(
+            www_authenticate(&forged).as_deref(),
+            Some(r#"Basic realm="Myelin""#)
+        );
 
         // A non-existent (non-wire) path 404 carries no challenge (is_git_wire_route is false).
         let miss = gw.handle(EdgeRequest::new("GET", "/v1/nope", "", vec![], vec![]));
@@ -958,12 +1038,19 @@ mod tests {
             "/v1/whoami",
             "",
             vec![
-                ("authorization".into(), "Bearer acme|eu-west|subj|jti|0|".into()),
+                (
+                    "authorization".into(),
+                    "Bearer acme|eu-west|subj|jti|0|".into(),
+                ),
                 ("x-myelin-token-scheme".into(), "agent".into()),
             ],
             vec![],
         ));
-        assert_eq!(resp.status(), 401, "a forged token never resolves a principal");
+        assert_eq!(
+            resp.status(),
+            401,
+            "a forged token never resolves a principal"
+        );
     }
 
     // ── R3.5 — the unauthenticated public auth surface + the repo-lifecycle firehose wiring ──
@@ -985,8 +1072,18 @@ mod tests {
             })
             .build();
         // No Authorization header, no session cookie — still 200 (unauthenticated by construction).
-        let resp = gw.handle(EdgeRequest::new("GET", "/v1/auth/config", "", vec![], vec![]));
-        assert_eq!(resp.status(), 200, "auth/config must be reachable logged-out");
+        let resp = gw.handle(EdgeRequest::new(
+            "GET",
+            "/v1/auth/config",
+            "",
+            vec![],
+            vec![],
+        ));
+        assert_eq!(
+            resp.status(),
+            200,
+            "auth/config must be reachable logged-out"
+        );
         let b = resp.json_body().unwrap();
         assert_eq!(b["sso_configured"], true);
         assert_eq!(b["dev_login_enabled"], false);
@@ -1008,11 +1105,23 @@ mod tests {
                     token_login_enabled: false,
                 })
                 .build();
-            let resp = gw.handle(EdgeRequest::new("GET", "/v1/auth/config", "", vec![], vec![]));
+            let resp = gw.handle(EdgeRequest::new(
+                "GET",
+                "/v1/auth/config",
+                "",
+                vec![],
+                vec![],
+            ));
             assert_eq!(resp.json_body().unwrap()["dev_login_enabled"], enabled);
         }
         // The default (no `.with_auth_config`) is fail-closed: SSO off, dev seam off.
-        let dflt = gw().handle(EdgeRequest::new("GET", "/v1/auth/config", "", vec![], vec![]));
+        let dflt = gw().handle(EdgeRequest::new(
+            "GET",
+            "/v1/auth/config",
+            "",
+            vec![],
+            vec![],
+        ));
         let b = dflt.json_body().unwrap();
         assert_eq!(b["sso_configured"], false);
         assert_eq!(b["dev_login_enabled"], false);
@@ -1043,7 +1152,10 @@ mod tests {
 
         // A FAILED create (non-2xx) announces nothing.
         let conflict = EdgeResponse::json(409, &json!({ "error": { "message": "exists" } }));
-        assert_eq!(repo_lifecycle_event("git.repo.create", &empty, &conflict), None);
+        assert_eq!(
+            repo_lifecycle_event("git.repo.create", &empty, &conflict),
+            None
+        );
         // An unrelated action never announces.
         assert_eq!(repo_lifecycle_event("git.pr.view", &empty, &created), None);
     }
@@ -1075,7 +1187,9 @@ mod tests {
         );
         gw.broadcast_repo_lifecycle("git.repo.create", &BTreeMap::new(), &scope, &resp);
 
-        let frame = rx.try_recv().expect("a repo.created frame reached the tenant subscriber");
+        let frame = rx
+            .try_recv()
+            .expect("a repo.created frame reached the tenant subscriber");
         assert_eq!(frame.event.as_deref(), Some("repo.created"));
         let data: serde_json::Value = serde_json::from_str(&frame.data).unwrap();
         assert_eq!(data["type"], "repo.created");
@@ -1086,14 +1200,25 @@ mod tests {
     fn login_refuses_not_mocks() {
         // The production human verifier is config-deferred (MR-012) → login REFUSES (503), never a
         // mock session (no Set-Cookie).
-        let body = serde_json::to_vec(&json!({"scheme":"oidc","material":"acme|eu-west|subj-1"})).unwrap();
+        let body =
+            serde_json::to_vec(&json!({"scheme":"oidc","material":"acme|eu-west|subj-1"})).unwrap();
         let resp = gw().handle(EdgeRequest::new("POST", "/v1/auth/login", "", vec![], body));
-        assert_eq!(resp.status(), 503, "human login refuses-not-mocks until configured");
+        assert_eq!(
+            resp.status(),
+            503,
+            "human login refuses-not-mocks until configured"
+        );
     }
 
     #[test]
     fn malformed_login_body_is_400_no_panic() {
-        let resp = gw().handle(EdgeRequest::new("POST", "/v1/auth/login", "", vec![], b"{garbage".to_vec()));
+        let resp = gw().handle(EdgeRequest::new(
+            "POST",
+            "/v1/auth/login",
+            "",
+            vec![],
+            b"{garbage".to_vec(),
+        ));
         assert_eq!(resp.status(), 400);
     }
 
@@ -1119,12 +1244,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "does not carry")]
     fn scoped_route_requires_the_resource_param_in_the_pattern() {
-        let _ = Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll)).sse_route_scoped(
-            "/v1/t/{tenant}/events",
-            "git.repo.events.subscribe",
-            "git",
-            "repo",
-        );
+        let _ = Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll))
+            .sse_route_scoped(
+                "/v1/t/{tenant}/events",
+                "git.repo.events.subscribe",
+                "git",
+                "repo",
+            );
     }
 
     /// `tenant` is the IDOR-check parameter, never a resource id — binding the scope to it is
@@ -1132,12 +1258,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "not a resource id")]
     fn scoped_route_refuses_tenant_as_the_resource_param() {
-        let _ = Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll)).sse_route_scoped(
-            "/v1/t/{tenant}/events",
-            "edge.events.subscribe",
-            "edge",
-            "tenant",
-        );
+        let _ = Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll))
+            .sse_route_scoped(
+                "/v1/t/{tenant}/events",
+                "edge.events.subscribe",
+                "edge",
+                "tenant",
+            );
     }
 
     /// The legitimate registrations still compose: the tenant-wide `{tenant}`-only pattern through
@@ -1204,6 +1331,18 @@ mod git_wire_basic_auth_tests {
     /// default token scheme is `agent` (as the production edge sets it), so a bearer/basic credential
     /// with no scheme header resolves under `agent`.
     fn seeded_gateway() -> (Gateway, String) {
+        seeded_gateway_with(
+            myelin_identity_service::CredentialPurpose::OperatorBootstrap,
+            &["edge.operator"],
+            "jti-basic",
+        )
+    }
+
+    fn seeded_gateway_with(
+        purpose: myelin_identity_service::CredentialPurpose,
+        authority: &[&str],
+        jti: &str,
+    ) -> (Gateway, String) {
         let cell = CellTokenAuthority::from_seed(&[3u8; 32], &[4u8; 32]).expect("cell");
         let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
         let scope = TenantScope::from_verified_token(
@@ -1225,25 +1364,39 @@ mod git_wire_basic_auth_tests {
             )
             .expect("seed principal");
         store
-            .link_credential(&scope, "agent", "subj-1", &PrincipalId("svc:founder".into()))
+            .link_credential(
+                &scope,
+                "agent",
+                "subj-1",
+                &PrincipalId("svc:founder".into()),
+            )
             .expect("link credential");
+        let revocations = RevocationStore::new();
+        if purpose.is_run_scoped() {
+            revocations.register_run_token_ttl(
+                &scope,
+                jti,
+                myelin_events::Timestamp("2020-01-01T00:00:00Z".into()),
+                myelin_events::Timestamp("2099-01-01T00:00:00Z".into()),
+            );
+        }
         let authn = Arc::new(CapabilityAuthenticator::with_verifier(
             store,
             Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
-            RevocationStore::new(),
+            revocations,
         ));
-        let human = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(
-            KmsEngine::new(),
-        ))));
+        let human = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
+            Arc::new(KmsEngine::new()),
+        )));
         let token = cell.mint(&CapabilityMintSpec {
             tenant: "acme".into(),
             region: REGION.into(),
             subject_key: "subj-1".into(),
-            jti: "jti-basic".into(),
+            jti: jti.into(),
             exp_unix: 9_999_999_999,
-            authority: vec!["agent:run".into()],
+            authority: authority.iter().map(|grant| (*grant).into()).collect(),
             dpop_jkt: None,
-            purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
+            purpose,
             audience: myelin_identity_service::CredentialAudience::Edge,
         });
         let gw = Gateway::builder(authn, human, Arc::new(AllowAll))
@@ -1325,7 +1478,65 @@ mod git_wire_basic_auth_tests {
             vec![("authorization".into(), format!("Bearer {token}"))],
             vec![],
         ));
-        assert_eq!(resp.status(), 200, "Bearer still authorizes on the git wire");
+        assert_eq!(
+            resp.status(),
+            200,
+            "Bearer still authorizes on the git wire"
+        );
+    }
+
+    #[test]
+    fn receive_pack_advertisement_requires_push_capability_not_pull() {
+        let (gw, pull_only) = seeded_gateway_with(
+            myelin_identity_service::CredentialPurpose::AgentRun {
+                run_id: "run-wire".into(),
+                delegation_snapshot: Some(11),
+            },
+            &["repo.pull"],
+            "jti-pull-only",
+        );
+        let header = vec![("authorization".into(), format!("Bearer {pull_only}"))];
+        let fetch = gw.handle(EdgeRequest::new(
+            "GET",
+            WIRE,
+            "service=git-upload-pack",
+            header.clone(),
+            vec![],
+        ));
+        assert_eq!(
+            fetch.status(),
+            200,
+            "pull capability may advertise upload-pack"
+        );
+        let push = gw.handle(EdgeRequest::new(
+            "GET",
+            WIRE,
+            "service=git-receive-pack",
+            header,
+            vec![],
+        ));
+        assert_eq!(
+            push.status(),
+            403,
+            "receive-pack advertisement requires repo.push even though the shared route is GET"
+        );
+    }
+
+    #[test]
+    fn wire_path_region_must_match_verified_region() {
+        let (gw, token) = seeded_gateway();
+        let resp = gw.handle(EdgeRequest::new(
+            "GET",
+            "/acme/us-east/widgets/info/refs",
+            "service=git-upload-pack",
+            vec![("authorization".into(), format!("Bearer {token}"))],
+            vec![],
+        ));
+        assert_eq!(
+            resp.status(),
+            403,
+            "path region is an assertion, never scope authority"
+        );
     }
 
     /// **The JSON product API stays Bearer-only: Basic is refused (401) even with a valid token, but

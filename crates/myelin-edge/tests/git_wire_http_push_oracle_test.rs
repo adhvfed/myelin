@@ -234,7 +234,7 @@ fn mint(cell: &CellTokenAuthority, tenant: &str, jti: &str) -> String {
         subject_key: "subj-1".into(),
         jti: jti.into(),
         exp_unix: now() + 3600,
-        authority: vec!["agent:run".into()],
+        authority: vec!["edge.operator".into()],
         dpop_jkt: None,
         purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
         audience: myelin_identity_service::CredentialAudience::Edge,
@@ -523,7 +523,7 @@ fn mint_for(cell: &CellTokenAuthority, jti: &str, subject_key: &str) -> String {
         subject_key: subject_key.into(),
         jti: jti.into(),
         exp_unix: now() + 3600,
-        authority: vec!["agent:run".into()],
+        authority: vec!["edge.operator".into()],
         dpop_jkt: None,
         purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
         audience: myelin_identity_service::CredentialAudience::Edge,
@@ -667,9 +667,13 @@ async fn writer_direct_push_to_protected_ref_is_refused_over_the_wire() {
     // ADMITS the push, but the protected-ref gate does not find the admin bypass, and holds the direct
     // push to the full ruleset.
     let backend = Arc::new(
-        DurableGitBackend::rooted_inmem_for_test(root.to_path_buf()).with_repo_authorizer(Arc::new(
-            myelin_edge::GrantBackedRepos::new().grant_write("svc:agent", "acme", "widgets"),
-        )),
+        DurableGitBackend::rooted_inmem_for_test(root.to_path_buf()).with_repo_authorizer(
+            Arc::new(myelin_edge::GrantBackedRepos::new().grant_write(
+                "svc:agent",
+                "acme",
+                "widgets",
+            )),
+        ),
     );
     backend
         .create_repo("acme", REGION, "widgets")
@@ -736,7 +740,8 @@ async fn writer_direct_push_to_protected_ref_is_refused_over_the_wire() {
 /// never mangled by a URL-encoding round-trip.
 fn basic_auth_header(user: &str, token: &str) -> String {
     use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{token}").as_bytes());
+    let b64 =
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{token}").as_bytes());
     format!("Authorization: Basic {b64}")
 }
 
@@ -751,7 +756,10 @@ fn git_clone_basic(
     let out = Command::new("git")
         .env("GIT_TERMINAL_PROMPT", "0")
         .arg("-c")
-        .arg(format!("http.extraHeader={}", basic_auth_header("x-access-token", token)))
+        .arg(format!(
+            "http.extraHeader={}",
+            basic_auth_header("x-access-token", token)
+        ))
         .args(["clone", &url, &dst.to_string_lossy()])
         .output()
         .expect("spawn git clone");
@@ -773,7 +781,10 @@ fn git_push_basic(
         .current_dir(work)
         .env("GIT_TERMINAL_PROMPT", "0")
         .arg("-c")
-        .arg(format!("http.extraHeader={}", basic_auth_header("x-access-token", token)))
+        .arg(format!(
+            "http.extraHeader={}",
+            basic_auth_header("x-access-token", token)
+        ))
         .args(["push", &url, "main"])
         .output()
         .expect("spawn git push");
@@ -811,8 +822,13 @@ async fn real_git_clone_and_push_over_http_basic_auth() {
         String::from_utf8_lossy(&o.stdout).trim().to_string()
     };
     let (ok, so, se) = git_push_basic(addr, &token, "/acme/eu-west/widgets.git", &work);
-    println!("=== git push (HTTP BASIC, password=token) ===\nsuccess={ok}\nstdout=\n{so}\nstderr=\n{se}");
-    assert!(ok, "the Basic-auth push MUST succeed (password = capability token)");
+    println!(
+        "=== git push (HTTP BASIC, password=token) ===\nsuccess={ok}\nstdout=\n{so}\nstderr=\n{se}"
+    );
+    assert!(
+        ok,
+        "the Basic-auth push MUST succeed (password = capability token)"
+    );
     let tip = durable_tip(&root, "acme", "widgets", "refs/heads/main");
     assert_eq!(
         tip.as_deref(),
@@ -829,7 +845,12 @@ async fn real_git_clone_and_push_over_http_basic_auth() {
     // HEAD symref — the pushed `main` is always fetched as `origin/main`).
     let cloned_tip = {
         let o = Command::new("git")
-            .args(["-C", &clone_dst.to_string_lossy(), "rev-parse", "origin/main"])
+            .args([
+                "-C",
+                &clone_dst.to_string_lossy(),
+                "rev-parse",
+                "origin/main",
+            ])
             .output()
             .unwrap();
         String::from_utf8_lossy(&o.stdout).trim().to_string()
@@ -841,9 +862,17 @@ async fn real_git_clone_and_push_over_http_basic_auth() {
 
     // ── 3. a GARBAGE Basic password is refused (401 — the same as a missing credential; no ref move) ──
     let garbage_dst = root.join("clone-garbage");
-    let (okg, seg) = git_clone_basic(addr, "not-a-real-token", "/acme/eu-west/widgets.git", &garbage_dst);
+    let (okg, seg) = git_clone_basic(
+        addr,
+        "not-a-real-token",
+        "/acme/eu-west/widgets.git",
+        &garbage_dst,
+    );
     println!("=== git clone (GARBAGE Basic password) — must be refused ===\nsuccess={okg}\nstderr=\n{seg}");
-    assert!(!okg, "a garbage Basic password MUST be refused (uniform 401)");
+    assert!(
+        !okg,
+        "a garbage Basic password MUST be refused (uniform 401)"
+    );
     let _ = backend; // keep the composed backend alive for the duration of the test.
 
     println!("=== R4.0 BASIC-AUTH ORACLE PROVEN: real git clone + push over HTTP Basic (password=token) lands durably; garbage refused ===");
@@ -864,7 +893,9 @@ async fn real_git_clone_and_push_over_http_basic_auth() {
 /// NON-preemptive path: git invokes it ONLY after a `WWW-Authenticate: Basic` 401.
 fn credential_helper_arg(token: &str) -> String {
     // The leading `!` makes git run the value via the shell; it receives the op (`get`) as $1.
-    format!("credential.helper=!f() {{ echo username=x-access-token; echo \"password={token}\"; }}; f")
+    format!(
+        "credential.helper=!f() {{ echo username=x-access-token; echo \"password={token}\"; }}; f"
+    )
 }
 
 /// `git clone <url> <dst>` authenticating ONLY through a credential helper (no `http.extraHeader`).
@@ -929,8 +960,7 @@ async fn f1_real_git_over_credential_helper_needs_the_basic_challenge() {
 
     // ── PUSH via a credential helper (no preemptive header) — must succeed thanks to the 401 challenge.
     let work = make_work(&root);
-    let (ok_push, se_push) =
-        git_push_via_helper(addr, &token, "/acme/eu-west/widgets.git", &work);
+    let (ok_push, se_push) = git_push_via_helper(addr, &token, "/acme/eu-west/widgets.git", &work);
     println!("=== F1 git push (credential HELPER, no extraHeader) ===\nsuccess={ok_push}\nstderr=\n{se_push}");
     assert!(
         ok_push,
@@ -1002,15 +1032,24 @@ async fn f9_fresh_clone_checks_out_main_and_server_head_symref_is_main() {
         .env("GIT_TERMINAL_PROMPT", "0")
         .arg("-c")
         .arg(format!("http.extraHeader=Authorization: Bearer {token}"))
-        .args(["clone", &format!("http://{addr}/acme/eu-west/widgets.git"), &dst.to_string_lossy()])
+        .args([
+            "clone",
+            &format!("http://{addr}/acme/eu-west/widgets.git"),
+            &dst.to_string_lossy(),
+        ])
         .output()
         .expect("spawn git clone");
     let clone_stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    println!("=== F9 git clone ===\nsuccess={}\nstderr=\n{clone_stderr}", out.status.success());
-    assert!(out.status.success(), "the clone must succeed: {clone_stderr}");
+    println!(
+        "=== F9 git clone ===\nsuccess={}\nstderr=\n{clone_stderr}",
+        out.status.success()
+    );
     assert!(
-        !clone_stderr.contains("unable to checkout")
-            && !clone_stderr.contains("nonexistent ref"),
+        out.status.success(),
+        "the clone must succeed: {clone_stderr}"
+    );
+    assert!(
+        !clone_stderr.contains("unable to checkout") && !clone_stderr.contains("nonexistent ref"),
         "F9: a clone must NOT warn about a dangling HEAD: {clone_stderr}"
     );
     assert!(

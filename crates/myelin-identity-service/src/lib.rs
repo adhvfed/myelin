@@ -754,6 +754,31 @@ impl StoreBackedCheck {
         )
     }
 
+    /// Deterministic-clock variant used by tests whose run lifecycle is intentionally pinned to a
+    /// historical fixture instant.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn introspect_run_token_at(
+        &self,
+        scheme: &str,
+        token: &myelin_identity::RunToken,
+        now: &myelin_events::Timestamp,
+    ) -> myelin_identity::Result<CapabilityToken> {
+        use machine_auth::TokenVerifier;
+        let now = chrono::DateTime::parse_from_rfc3339(&now.0)
+            .map_err(|error| {
+                myelin_identity::AuthzError::BadRequest(format!(
+                    "malformed deterministic introspection instant: {error}"
+                ))
+            })?
+            .timestamp();
+        PasetoCapabilityVerifier::new(self.cell_authority.trust_anchor())
+            .with_clock(move || now)
+            .verify(&myelin_identity::Credential {
+                scheme: scheme.to_string(),
+                material: token.token.clone(),
+            })
+    }
+
     /// The shared S7 revocation list / token denylist (P-ID-14) this `check` slot consults — so a
     /// caller can `revoke` / SCIM-disable a principal and observe the cross-surface deny, and a
     /// drill can read the `revocation_lag` telemetry. Every clone of this `StoreBackedCheck` shares

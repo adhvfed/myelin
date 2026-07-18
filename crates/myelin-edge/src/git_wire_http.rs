@@ -351,7 +351,9 @@ mod tests {
             vec![],
         );
         let page = Page::from_request(&req);
+        let identity = crate::catalogue::test_request_identity(be_principal, scope);
         let ctx = HandlerCtx {
+            identity: &identity,
             principal: be_principal,
             scope,
             params: &params,

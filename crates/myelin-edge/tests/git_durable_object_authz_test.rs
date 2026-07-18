@@ -47,12 +47,21 @@ const SCHEME: &str = "agent";
 const TENANT: &str = "acme";
 
 fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 fn temp_root(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    std::env::temp_dir().join(format!("myelin-r21-authz-{tag}-{}-{nanos}", std::process::id()))
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "myelin-r21-authz-{tag}-{}-{nanos}",
+        std::process::id()
+    ))
 }
 
 /// The thresholds-file `[fail_static]` seed (mirrors the `repo_authz_live.rs` fixture).
@@ -99,6 +108,9 @@ fn seed_principal(store: &PrincipalStore, pid: &str, subject_key: &str) {
     store
         .link_credential(&scope, SCHEME, subject_key, &PrincipalId(pid.into()))
         .expect("link credential");
+    store
+        .link_credential(&scope, "ci", subject_key, &PrincipalId(pid.into()))
+        .expect("link CI credential");
 }
 
 /// The R2.1 harness: the REAL gateway over the production object-authz composition —
@@ -109,6 +121,7 @@ struct Harness {
     gw: Gateway,
     cell: CellTokenAuthority,
     sbc: StoreBackedCheck,
+    revocations: RevocationStore,
 }
 
 impl Harness {
@@ -123,10 +136,11 @@ impl Harness {
         seed_principal(&store, "svc:bot", "subj-bot");
         seed_principal(&store, "svc:other", "subj-other");
 
+        let revocations = RevocationStore::new();
         let authn = Arc::new(CapabilityAuthenticator::with_verifier(
             store,
             Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
-            RevocationStore::new(),
+            revocations.clone(),
         ));
         let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
             Arc::new(KmsEngine::new()),
@@ -156,21 +170,51 @@ impl Harness {
             Arc::new(WhoamiHandler),
         );
         builder = register_git_durable(builder, backend);
-        Harness { gw: builder.build(), cell, sbc }
+        Harness {
+            gw: builder.build(),
+            cell,
+            sbc,
+            revocations,
+        }
     }
 
-    fn token(&self, subject_key: &str) -> String {
-        self.cell.mint(&CapabilityMintSpec {
+    fn token(&self, subject_key: &str, ci_job: bool) -> (String, String) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let jti = format!("jti-{subject_key}-{nonce}");
+        let purpose = if ci_job {
+            let scope = admin_scope();
+            self.revocations.register_run_token_ttl(
+                &scope,
+                &jti,
+                myelin_events::Timestamp("2020-01-01T00:00:00Z".into()),
+                myelin_events::Timestamp("2099-01-01T00:00:00Z".into()),
+            );
+            myelin_identity_service::CredentialPurpose::CiJob {
+                run_id: format!("ci-{subject_key}"),
+            }
+        } else {
+            myelin_identity_service::CredentialPurpose::OperatorBootstrap
+        };
+        let scheme = if ci_job { "ci" } else { SCHEME };
+        let token = self.cell.mint(&CapabilityMintSpec {
             tenant: TENANT.into(),
             region: REGION.into(),
             subject_key: subject_key.into(),
-            jti: format!("jti-{subject_key}-{}", now()),
+            jti,
             exp_unix: now() + 3600,
-            authority: vec!["agent:run".into()],
+            authority: vec![if ci_job {
+                "ci.checks.report".into()
+            } else {
+                "edge.operator".into()
+            }],
             dpop_jkt: None,
-            purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
+            purpose,
             audience: myelin_identity_service::CredentialAudience::Edge,
-        })
+        });
+        (scheme.into(), token)
     }
 
     /// Drive one request through the FULL gateway lifecycle (real Bearer authn → action gate →
@@ -182,14 +226,31 @@ impl Harness {
         path: &str,
         body: &[u8],
     ) -> (u16, serde_json::Value) {
-        let token = self.token(subject_key);
+        self.call_with_ci_purpose(
+            subject_key,
+            method,
+            path,
+            body,
+            method == "POST" && path.ends_with("/checks"),
+        )
+    }
+
+    fn call_with_ci_purpose(
+        &self,
+        subject_key: &str,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        ci_job: bool,
+    ) -> (u16, serde_json::Value) {
+        let (scheme, token) = self.token(subject_key, ci_job);
         let resp: EdgeResponse = self.gw.handle(EdgeRequest::new(
             method,
             path,
             "",
             vec![
                 ("authorization".into(), format!("Bearer {token}")),
-                ("x-myelin-token-scheme".into(), SCHEME.into()),
+                ("x-myelin-token-scheme".into(), scheme),
             ],
             body.to_vec(),
         ));
@@ -276,7 +337,10 @@ fn ungranted_in_tenant_principal_is_denied_on_every_object_route() {
         "/v1/git/repos/alpha/download/main/README.md",
     ] {
         let (st, v) = h.call("subj-mallory", "GET", path, b"");
-        assert_eq!(st, 404, "un-granted READ {path} must be the 0-leak 404: {v}");
+        assert_eq!(
+            st, 404,
+            "un-granted READ {path} must be the 0-leak 404: {v}"
+        );
         assert_eq!(
             v["error"]["message"], "repository not found",
             "the deny body must be indistinguishable from an absent repo ({path}): {v}"
@@ -356,7 +420,12 @@ fn creator_bootstrap_admin_is_admitted_per_permission() {
 
     // Merge: PAST the object seam (403/404 would be the seam refusing an admin — the bug); the
     // merge GATE then rules on policy (409/422 acceptable — an authz outcome is not).
-    let (st, v) = h.call("subj-creator", "POST", "/v1/git/repos/alpha/prs/1/merge", b"");
+    let (st, v) = h.call(
+        "subj-creator",
+        "POST",
+        "/v1/git/repos/alpha/prs/1/merge",
+        b"",
+    );
     assert!(
         st != 403 && st != 404,
         "the admin creator must pass the merge OBJECT seam (got {st}: {v})"
@@ -408,7 +477,10 @@ fn push_grant_does_not_admit_merge_branch_protection_or_endorse() {
         "/v1/git/repos/alpha/branch-protection",
         br#"{"rulesets":[]}"#,
     );
-    assert_eq!(st, 403, "a push-only writer must NOT set branch protection: {v}");
+    assert_eq!(
+        st, 403,
+        "a push-only writer must NOT set branch protection: {v}"
+    );
     let (st, v) = h.call(
         "subj-dev",
         "POST",
@@ -428,7 +500,12 @@ fn reader_grant_admits_reads_not_writes() {
 
     let (st, v) = h.call("subj-reader", "GET", "/v1/git/repos/alpha", b"");
     assert_eq!(st, 200, "reader repo home: {v}");
-    let (st, v) = h.call("subj-reader", "GET", "/v1/git/repos/alpha/blob/main/README.md", b"");
+    let (st, v) = h.call(
+        "subj-reader",
+        "GET",
+        "/v1/git/repos/alpha/blob/main/README.md",
+        b"",
+    );
     assert_eq!(st, 200, "reader blob view: {v}");
     let (st, v) = h.call("subj-reader", "GET", "/v1/git/repos/alpha/prs/1", b"");
     assert_eq!(st, 200, "reader PR view (pull covers PR reads): {v}");
@@ -461,7 +538,10 @@ fn endorser_grant_admits_endorse_only() {
     assert_eq!(st, 200, "the endorser endorses: {v}");
 
     let (st, v) = h.call("subj-bot", "GET", "/v1/git/repos/alpha", b"");
-    assert_eq!(st, 404, "the endorsement relation confers NO read (0-leak 404): {v}");
+    assert_eq!(
+        st, 404,
+        "the endorsement relation confers NO read (0-leak 404): {v}"
+    );
     let (st, v) = h.call(
         "subj-bot",
         "POST",
@@ -492,13 +572,20 @@ fn cross_repo_isolation_and_leak_free_list() {
         !body.contains("beta"),
         "creator must NOT see beta anywhere in the list body (leak): {v}"
     );
-    assert_eq!(v["items"].as_array().unwrap().len(), 1, "exactly one visible repo: {v}");
+    assert_eq!(
+        v["items"].as_array().unwrap().len(),
+        1,
+        "exactly one visible repo: {v}"
+    );
 
     let (st, v) = h.call("subj-other", "GET", "/v1/git/repos", b"");
     assert_eq!(st, 200);
     let body = v.to_string();
     assert!(body.contains("beta"), "other sees beta: {v}");
-    assert!(!body.contains("alpha"), "other must NOT see alpha (leak): {v}");
+    assert!(
+        !body.contains("alpha"),
+        "other must NOT see alpha (leak): {v}"
+    );
 
     let (st, v) = h.call("subj-mallory", "GET", "/v1/git/repos", b"");
     assert_eq!(st, 200);
@@ -522,7 +609,12 @@ fn cross_repo_isolation_and_leak_free_list() {
         br#"{"head_oid":"c"}"#,
     );
     assert_eq!(st, 403, "cross-repo WRITE is 403: {v}");
-    let (st, v) = h.call("subj-creator", "POST", "/v1/git/repos/beta/prs/1/merge", b"");
+    let (st, v) = h.call(
+        "subj-creator",
+        "POST",
+        "/v1/git/repos/beta/prs/1/merge",
+        b"",
+    );
     assert_eq!(st, 403, "cross-repo MERGE is 403: {v}");
 }
 
@@ -534,6 +626,18 @@ fn report_checks_requires_the_repo_write_grant() {
     let h = Harness::new("report-checks");
     h.seed_repo_with_pr("subj-creator", "alpha");
     h.write_relation("svc:dev", "writer", "alpha");
+
+    let (st, v) = h.call_with_ci_purpose(
+        "subj-dev",
+        "POST",
+        "/v1/git/repos/alpha/prs/1/checks",
+        br#"{"green_contexts":["ci/operator-forged"]}"#,
+        false,
+    );
+    assert_eq!(
+        st, 403,
+        "an edge.operator credential cannot self-certify CI facts even with object write: {v}"
+    );
 
     let (st, v) = h.call(
         "subj-mallory",
@@ -586,7 +690,8 @@ fn principal_of_kind(id: &str, kind: PrincipalKind) -> Principal {
 fn backend_with_open_pr(tag: &str) -> (DurableGitBackend, PathBuf) {
     let root = temp_root(tag);
     let be = DurableGitBackend::rooted_inmem_for_test(&root);
-    be.create_repo(TENANT, REGION, "widgets").expect("create repo");
+    be.create_repo(TENANT, REGION, "widgets")
+        .expect("create repo");
     let author = principal_of_kind("author", PrincipalKind::Human);
     be.open_pr(
         TENANT,

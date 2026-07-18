@@ -35,6 +35,7 @@
 use crate::error::EdgeError;
 use crate::request::{EdgeRequest, EdgeResponse};
 use myelin_identity::Principal;
+use myelin_identity_service::RequestIdentity;
 use myelin_storage::TenantScope;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -137,10 +138,15 @@ pub fn page_envelope(items: Value, next_cursor: Option<String>, limit: usize) ->
 /// extracted path params, the parsed page, and the raw request (for the body). A handler NEVER sees a
 /// raw credential or a client-supplied tenant.
 pub struct HandlerCtx<'a> {
+    /// The complete verified request identity. Final-boundary policy consumes signed purpose,
+    /// audience, authority, expiry, DPoP state, and run binding from here without reparsing headers.
+    pub identity: &'a RequestIdentity,
     /// The verified principal the gateway resolved (tenant/region are authoritative).
+    /// Compatibility projection for existing handlers; authorization code must use `identity`.
     pub principal: &'a Principal,
     /// The set `(tenant, region)` scope (built from the verified token — the ONLY scope the handler
     /// may query under; the IDOR floor).
+    /// Compatibility projection of `identity.scope` for existing storage callers.
     pub scope: &'a TenantScope,
     /// The extracted path params (`{repo}` → "core", `{n}` → "42"). `{tenant}` is consumed by the
     /// gateway's IDOR guard before dispatch — a handler reads resource params, never the tenant.
@@ -149,6 +155,24 @@ pub struct HandlerCtx<'a> {
     pub page: &'a Page,
     /// The raw request (for the body / extra headers).
     pub request: &'a EdgeRequest,
+}
+
+#[cfg(test)]
+pub(crate) fn test_request_identity(principal: &Principal, scope: &TenantScope) -> RequestIdentity {
+    RequestIdentity {
+        principal: principal.clone(),
+        scope: scope.clone(),
+        credential: myelin_identity_service::CredentialContext::Capability(
+            myelin_identity_service::VerifiedCapabilityContext {
+                purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
+                audience: myelin_identity_service::CredentialAudience::Edge,
+                jti: "test-handler-context".into(),
+                effective_authority: myelin_identity_service::Authority::of(["edge.operator"]),
+                expires_at_unix: i64::MAX,
+                dpop: myelin_identity_service::DpopState::Unbound,
+            },
+        ),
+    }
 }
 
 /// **The handler seam every subsystem implements.** The gateway calls `handle(ctx)` after it has

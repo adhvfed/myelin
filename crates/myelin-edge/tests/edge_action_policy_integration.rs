@@ -22,8 +22,8 @@ use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use myelin_edge::{
-    register_git_durable, register_git_wire, serve_edge, AuthenticatedActionPolicy,
-    DurableGitBackend, Gateway, Method, WhoamiHandler,
+    action_requirement, register_git_durable, register_git_wire, serve_edge,
+    AuthenticatedActionPolicy, DurableGitBackend, Gateway, Method, WhoamiHandler,
 };
 use myelin_git::api::{http_catalogue, Method as GitMethod};
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
@@ -43,12 +43,18 @@ const REGION: &str = "eu-west";
 const SCHEME: &str = "agent";
 
 fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 fn temp_root(tag: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     p.push(format!("myelin-edge-r26-{tag}-{nanos}"));
     p
 }
@@ -105,7 +111,12 @@ fn build(root: &std::path::Path) -> (Arc<Gateway>, CellTokenAuthority) {
         human_login,
         Arc::new(AuthenticatedActionPolicy::mounted()),
     )
-    .route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler))
+    .route(
+        Method::Get,
+        "/v1/whoami",
+        "edge.whoami",
+        Arc::new(WhoamiHandler),
+    )
     .route(
         Method::Get,
         "/v1/t/{tenant}/whoami",
@@ -122,6 +133,22 @@ fn build(root: &std::path::Path) -> (Arc<Gateway>, CellTokenAuthority) {
     );
     builder = register_git_durable(builder, backend.clone());
     builder = register_git_wire(builder, backend);
+    let registered: Vec<String> = builder.registered_actions().map(str::to_string).collect();
+    let missing: Vec<&str> = registered
+        .iter()
+        .map(String::as_str)
+        .filter(|action| {
+            *action != "edge.test.unmounted_probe" && action_requirement(action).is_none()
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "registered route actions without capability rules: {missing:?}"
+    );
+    assert!(
+        registered.iter().any(|action| action == "git.pr.commits"),
+        "composition regression must include a route discovered missing from the old allowlist"
+    );
     (Arc::new(builder.build()), cell)
 }
 
@@ -132,7 +159,7 @@ fn mint(cell: &CellTokenAuthority, tenant: &str, jti: &str) -> String {
         subject_key: "subj-1".into(),
         jti: jti.into(),
         exp_unix: now() + 3600,
-        authority: vec!["agent:run".into()],
+        authority: vec!["edge.operator".into()],
         dpop_jkt: None,
         purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
         audience: myelin_identity_service::CredentialAudience::Edge,
@@ -161,7 +188,10 @@ async fn open(
     tokio::spawn(async move {
         let _ = conn.await;
     });
-    let mut builder = Request::builder().method(method).uri(path).header("host", "edge.test");
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "edge.test");
     for (k, v) in headers {
         builder = builder.header(*k, *v);
     }
@@ -235,8 +265,18 @@ async fn the_mounted_policy_admits_every_production_route() {
     assert_eq!(st, 200, "whoami must pass the action gate: {v}");
 
     // Create the repo the concrete catalogue paths resolve against (also proves git.repo.create).
-    let (st, v) = http(addr, "POST", "/v1/git/repos", &hdr(&h), br#"{"slug":"alpha"}"#.to_vec()).await;
-    assert_eq!(st, 201, "create-repo must pass the action gate and apply: {v}");
+    let (st, v) = http(
+        addr,
+        "POST",
+        "/v1/git/repos",
+        &hdr(&h),
+        br#"{"slug":"alpha"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(
+        st, 201,
+        "create-repo must pass the action gate and apply: {v}"
+    );
 
     // Every git catalogue route, re-rooted exactly as register_git_durable re-roots it.
     for ep in http_catalogue() {
@@ -246,6 +286,13 @@ async fn the_mounted_policy_admits_every_production_route() {
             GitMethod::Post => ("POST", b"{}".to_vec()),
         };
         let (st, v) = http(addr, method, &path, &hdr(&h), body).await;
+        if path.ends_with("/checks") && method == "POST" {
+            assert_eq!(
+                st, 403,
+                "OperatorBootstrap is deliberately not a CI attestation purpose: {v}"
+            );
+            continue;
+        }
         assert!(
             !is_action_gate_denial(st, &v),
             "the action gate DENIED the mounted catalogue route {method} {path} \
@@ -268,7 +315,10 @@ async fn the_mounted_policy_admits_every_production_route() {
 
     // The git smart-HTTP wire routes (register_git_wire).
     for (method, path) in [
-        ("GET", "/acme/eu-west/alpha/info/refs?service=git-upload-pack"),
+        (
+            "GET",
+            "/acme/eu-west/alpha/info/refs?service=git-upload-pack",
+        ),
         ("POST", "/acme/eu-west/alpha/git-upload-pack"),
         ("POST", "/acme/eu-west/alpha/git-receive-pack"),
     ] {
@@ -296,8 +346,14 @@ async fn an_unmounted_action_is_denied_with_the_action_gate_403() {
          (the handler would have answered 200 if admitted — same handler as whoami): {v}"
     );
     // The denial envelope stays UNIFORM/oracle-free (never names the action/resource to the client).
-    assert_eq!(v["error"]["code"], "forbidden", "uniform forbidden envelope: {v}");
-    assert_eq!(v["error"]["message"], "forbidden", "no detail leak in the 403 body: {v}");
+    assert_eq!(
+        v["error"]["code"], "forbidden",
+        "uniform forbidden envelope: {v}"
+    );
+    assert_eq!(
+        v["error"]["message"], "forbidden",
+        "no detail leak in the 403 body: {v}"
+    );
 }
 
 /// The policy never weakens authn: a mounted action WITHOUT a token is still the uniform 401 (the
@@ -309,5 +365,8 @@ async fn a_mounted_action_without_a_token_is_still_401() {
     let addr = spawn(gw).await;
 
     let (st, v) = http(addr, "GET", "/v1/whoami", &[], vec![]).await;
-    assert_eq!(st, 401, "no token → uniform 401 (never a policy allow): {v}");
+    assert_eq!(
+        st, 401,
+        "no token → uniform 401 (never a policy allow): {v}"
+    );
 }
