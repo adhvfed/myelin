@@ -3,8 +3,10 @@
 pub fn assert_split_role_source(source: &str, service_migration: &str, serve_call: &str) {
     assert!(source.contains("PgBootstrap::from_env(Mode::RequireEnv)"));
     assert!(!source.contains("Mode::DevDefaults"));
-    assert!(!source.contains("SubstrateProvider::connect"));
+    assert!(!source.contains("SubstrateProvider::"));
     assert!(!source.contains("provider.migrate_foundation()"));
+    assert!(!source.contains("provider.migrate("));
+    assert!(!source.contains("provider\n        .migrate("));
 
     let foundation = source
         .find("bootstrap.migrate_foundation()")

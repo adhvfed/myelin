@@ -15,7 +15,7 @@
 //!   primary-key prefix (12.1, ADR-11): the partition key, from the verified token, never the path.
 //!   This is the `residency-pin` / `tenant-predicate` lint floor (every key is tenant-first; there is
 //!   no cross-tenant query path). **Exception, by design:** `humanise_template` admits a NULL tenant
-//!   (the platform-default row, §2.5) via `COALESCE(tenant_id, '<platform>')` in its PK.
+//!   (the platform-default row, §2.5) via a stored `COALESCE(tenant_id, '<platform>')` key.
 //! - **RLS-enabled** — a trailing `SELECT myelin_make_tenant_scoped('<table>')` makes the table
 //!   `ENABLE`+`FORCE ROW LEVEL SECURITY` + installs the standard `(tenant_id, region)` isolation
 //!   policy (the dev/prod Postgres convention, `scripts/pg-init/00-rls-conventions.sql`). With the app
@@ -204,17 +204,19 @@ CREATE TABLE notif_escalation_run (\
 /// The `humanise_template` table DDL (§2.5) — the ONE platform templating store (ICU MessageFormat,
 /// platform-defaulted + tenant/locale-overridable). The ONLY table whose `tenant_id` is NULLABLE: a
 /// NULL-tenant row is the platform default; a tenant row overrides (brand/locale). The PK uses
-/// `COALESCE(tenant_id, '<platform>')` so the platform default + a tenant override coexist (§2.5).
+/// a generated `COALESCE(tenant_id, '<platform>')` key so the platform default + a tenant override
+/// coexist (§2.5). PostgreSQL does not admit expressions directly inside a primary-key column list.
 /// Written by NOTIF-P9.
 pub const HUMANISE_TEMPLATE_DDL: &str = "\
 CREATE TABLE notif_humanise_template (\
   tenant_id text, \
   region text NOT NULL, \
+  tenant_scope text GENERATED ALWAYS AS (COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000')) STORED, \
   template_key text NOT NULL, \
   locale text NOT NULL DEFAULT 'en', \
   template_body text NOT NULL, \
   dek_ref text NOT NULL, \
-  PRIMARY KEY (COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'), region, template_key, locale))";
+  PRIMARY KEY (tenant_scope, region, template_key, locale))";
 
 /// The `mute` table DDL (§2.6) — per-principal thread/subject mutes; `(tenant, region)`-first.
 /// `subject_root` is a ref-root (a chat thread / a PR), never a payload. Suppresses delivery, never
@@ -343,7 +345,7 @@ mod tests {
     /// Every migration is `(tenant, region)`-first: the DDL leads with `tenant_id` then `region`,
     /// and the primary key leads with `(tenant_id, region` (12.1 — the residency-pin / tenant-predicate
     /// floor, no cross-tenant query path). `humanise_template` is the ONE exception by design (its PK
-    /// is `COALESCE(tenant_id, …)` for the platform-default NULL-tenant row, §2.5) — still tenant-first.
+    /// is a generated `COALESCE(tenant_id, …)` key for the platform-default NULL row, §2.5.
     #[test]
     fn every_table_is_tenant_region_first_with_a_tenant_first_pk() {
         for (_id, ddl, table) in TABLE_DDLS {
@@ -358,10 +360,12 @@ mod tests {
                 "second column must be region ({table}): {ddl}"
             );
             if *table == "notif_humanise_template" {
-                // The platform-default exception: tenant-first via COALESCE (§2.5).
+                // PostgreSQL requires the platform-default COALESCE expression in a generated
+                // column; expressions cannot appear directly in a PRIMARY KEY column list.
                 assert!(
-                    ddl.contains("PRIMARY KEY (COALESCE(tenant_id"),
-                    "humanise_template PK is COALESCE(tenant_id, …) (the platform-default NULL row, §2.5)"
+                    ddl.contains("tenant_scope text GENERATED ALWAYS AS (COALESCE(tenant_id")
+                        && ddl.contains("PRIMARY KEY (tenant_scope, region"),
+                    "humanise_template has a generated tenant scope PK for the platform-default NULL row"
                 );
             } else {
                 assert!(
