@@ -114,6 +114,11 @@ pub const CI_JOB_SPEC_TABLE: &str = "ci_job_spec";
 pub const JQ_CLAIMABLE_INDEX: &str = "jq_claimable";
 pub const JQ_SERIALIZE_INDEX: &str = "jq_serialize";
 pub const JQ_IDEM_INDEX: &str = "jq_idem";
+/// Exact-cell run-ledger lookup used by [`crate::PgCiPipelineStarter`].
+pub const CI_JOB_RUN_LEDGER_INDEX: &str = "ci_job_run_ledger";
+/// Forward-only migration id for [`CI_JOB_RUN_LEDGER_INDEX`]. Kept separate from the already-applied
+/// `ci_0002_ci_job` table/RLS migration so its checksum is never rewritten.
+pub const CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID: &str = "ci_0002a_ci_job_run_ledger";
 
 // ============================================================================================
 // The forward-only CREATE-TABLE DDL constants (arch 01 §3, verbatim intent; tenant_id/region named
@@ -169,6 +174,12 @@ CREATE TABLE IF NOT EXISTS ci_job (
   PRIMARY KEY (tenant_id, job_id),
   FOREIGN KEY (tenant_id, run_id) REFERENCES ci_run(tenant_id, run_id)
 )";
+
+/// Exact `(tenant_id, region, run_id)` lookup for materializing and replay-verifying one run's
+/// canonical `ci_job` ledger. This is a separately versioned, top-level concurrent migration: the
+/// applied `ci_0002_ci_job` table/RLS migration remains byte-identical.
+pub const CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL: &str =
+    "CREATE INDEX CONCURRENTLY IF NOT EXISTS ci_job_run_ledger ON ci_job (tenant_id, region, run_id)";
 
 /// `check_attempt` (arch 01 §3.2) — the per-`(commit_oid, context)` monotonic attempt counter; CI's
 /// source of `run_attempt` for the X-1 CheckStatus fact. HOT (bumped on each re-dispatch).
@@ -530,9 +541,10 @@ pub fn make_tenant_scoped_ddl(table: &str) -> String {
 }
 
 /// **The complete CI Control-Plane forward-only migration set** (contract 1.5 / 11.1; arch 01 §3).
-/// One table/RLS [`Migration`] per table, in FK-dependency order, plus three separately versioned
-/// `CREATE INDEX CONCURRENTLY` migrations immediately after `job_queue`. Keeping each concurrent
-/// index as one top-level command makes the same set executable by live PostgreSQL.
+/// One table/RLS [`Migration`] per table, in FK-dependency order, plus four separately versioned
+/// `CREATE INDEX CONCURRENTLY` migrations: the run-ledger index immediately after `ci_job`, and the
+/// three scheduler indexes immediately after `job_queue`. Keeping each concurrent index as one
+/// top-level command makes the same set executable by live PostgreSQL.
 ///
 /// Compatibility: the prior `ci_0004_job_queue` bundled these concurrent indexes into one
 /// multi-statement command. PostgreSQL rejected that command atomically before [`PgMigrator`]
@@ -547,6 +559,13 @@ pub fn ci_controlplane_migrations() -> Migrations {
     let mut migrations = Vec::new();
     for (id, table, create) in create_statements() {
         migrations.push(assemble_ci_migration(id, table, create));
+        if table == CI_JOB_TABLE {
+            migrations.push(Migration::plain_on(
+                CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID,
+                CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
+                CI_JOB_TABLE,
+            ));
+        }
         if table == JOB_QUEUE_TABLE {
             for ((index_id, expected_name), (actual_name, ddl)) in CI_JOB_QUEUE_INDEX_MIGRATIONS
                 .iter()
@@ -681,8 +700,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            18,
-            "15 table/RLS + 3 concurrent-index migrations"
+            19,
+            "15 table/RLS + 4 concurrent-index migrations"
         );
         for m in &migrations.0 {
             assert!(
@@ -732,8 +751,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            18,
-            "the runner applied all 15 table/RLS and 3 concurrent-index migrations"
+            19,
+            "the runner applied all 15 table/RLS and 4 concurrent-index migrations"
         );
         assert_eq!(
             runner.applied()[0],
@@ -826,6 +845,48 @@ mod tests {
             assert_eq!(index.table, Some(JOB_QUEUE_TABLE));
             assert_eq!(index.ddl.matches(';').count(), 0);
         }
+    }
+
+    /// The canonical DAG ledger lookup is an additive, separately versioned concurrent index placed
+    /// directly after the immutable `ci_0002_ci_job` table/RLS migration.
+    #[test]
+    fn ci_job_run_ledger_index_is_exact_cell_separate_and_ordered() {
+        assert_eq!(CI_JOB_RUN_LEDGER_INDEX, "ci_job_run_ledger");
+        assert!(
+            !CREATE_CI_JOB_DDL.contains(CI_JOB_RUN_LEDGER_INDEX),
+            "the applied ci_0002 table/RLS migration remains byte-identical; index is additive"
+        );
+        assert_eq!(
+            CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS ci_job_run_ledger ON ci_job (tenant_id, region, run_id)"
+        );
+        assert_eq!(
+            CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL.matches(';').count(),
+            0,
+            "the concurrent index is one top-level command"
+        );
+
+        let migrations = ci_controlplane_migrations();
+        let table_pos = migrations
+            .0
+            .iter()
+            .position(|migration| migration.id == "ci_0002_ci_job")
+            .expect("immutable ci_job table migration");
+        let index_pos = migrations
+            .0
+            .iter()
+            .position(|migration| migration.id == CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID)
+            .expect("separate ci_job ledger-index migration");
+        let next_table_pos = migrations
+            .0
+            .iter()
+            .position(|migration| migration.id == "ci_0003_check_attempt")
+            .expect("next table migration");
+        assert_eq!(index_pos, table_pos + 1);
+        assert_eq!(next_table_pos, index_pos + 1);
+        let migration = &migrations.0[index_pos];
+        assert_eq!(migration.table, Some(CI_JOB_TABLE));
+        assert_eq!(migration.ddl, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL);
     }
 
     /// **The frozen value-set vocabularies are CHECK constraints, not enum types (forward-only

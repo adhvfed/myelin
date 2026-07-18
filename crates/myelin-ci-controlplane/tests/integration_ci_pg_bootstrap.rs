@@ -22,7 +22,23 @@ fn with_search_path(url: &str, schema: &str) -> String {
     format!("{url}{separator}options=-csearch_path%3D{schema}%2Cpublic")
 }
 
-async fn exercise(admin: &sqlx::PgPool, schema: &str, suffix: &str) -> Result<(), String> {
+fn test_config() -> MyelinConfig {
+    let mut config = MyelinConfig::dev();
+    if let Ok(url) = std::env::var("DATABASE_URL") {
+        config.database_url = url;
+    }
+    if let Ok(url) = std::env::var("DATABASE_MIGRATION_URL") {
+        config.database_migration_url = url;
+    }
+    config
+}
+
+async fn exercise(
+    admin: &sqlx::PgPool,
+    schema: &str,
+    suffix: &str,
+    base: &MyelinConfig,
+) -> Result<(), String> {
     sqlx::raw_sql(&format!(
         "CREATE SCHEMA {schema} AUTHORIZATION myelin_admin;
          GRANT USAGE ON SCHEMA {schema} TO myelin_app;
@@ -35,7 +51,7 @@ async fn exercise(admin: &sqlx::PgPool, schema: &str, suffix: &str) -> Result<()
     .await
     .map_err(|e| format!("set up isolated Controlplane schema: {e}"))?;
 
-    let mut config = MyelinConfig::dev();
+    let mut config = base.clone();
     config.region = format!("ci-controlplane-bootstrap-{suffix}");
     config.database_url = with_search_path(&config.database_url, schema);
     config.database_migration_url = with_search_path(&config.database_migration_url, schema);
@@ -96,6 +112,21 @@ async fn exercise(admin: &sqlx::PgPool, schema: &str, suffix: &str) -> Result<()
         }
     }
 
+    let ledger_index_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM pg_indexes
+              WHERE schemaname = $1 AND tablename = 'ci_job' AND indexname = $2
+         )",
+    )
+    .bind(schema)
+    .bind(myelin_ci_controlplane::CI_JOB_RUN_LEDGER_INDEX)
+    .fetch_one(provider.db_pool())
+    .await
+    .map_err(|e| format!("inspect migrated ci_job run-ledger index: {e}"))?;
+    if !ledger_index_exists {
+        return Err("Controlplane bootstrap omitted ci_job_run_ledger index migration".into());
+    }
+
     if sqlx::query("CREATE TABLE runtime_must_not_create (id integer)")
         .execute(provider.db_pool())
         .await
@@ -129,7 +160,7 @@ async fn exercise(admin: &sqlx::PgPool, schema: &str, suffix: &str) -> Result<()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn complete_controlplane_migrations_precede_constrained_runtime_handoff() {
-    let base = MyelinConfig::dev();
+    let base = test_config();
     let admin = match PgPoolOptions::new()
         .max_connections(2)
         .connect(&base.database_migration_url)
@@ -144,7 +175,7 @@ async fn complete_controlplane_migrations_precede_constrained_runtime_handoff() 
 
     let suffix = unique_suffix();
     let schema = format!("ci_controlplane_bootstrap_{suffix}");
-    let result = exercise(&admin, &schema, &suffix).await;
+    let result = exercise(&admin, &schema, &suffix, &base).await;
     let cleanup = sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&admin)
         .await;

@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use myelin_ci_controlplane::{
     ci_artifact_ref, ci_job_id_v1, ci_run_ref, CiWorkflowDefinitionPin, PgCiPipelineStarter,
-    ResolvedJobV1, ResolvedRunPlanV1, StartQueuedOutcome, CREATE_CI_JOB_DDL, CREATE_CI_RUN_DDL,
+    ResolvedJobV1, ResolvedRunPlanV1, StartQueuedOutcome, CI_JOB_RUN_LEDGER_INDEX,
+    CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_RUN_DDL,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::MonotonicMinter;
@@ -299,6 +300,49 @@ async fn visible_job_count(app: &PgPool, tenant: &str, region: &str) -> i64 {
     count
 }
 
+async fn assert_run_ledger_index_is_used(admin: &PgPool, tenant: &str, run_id: &str) {
+    let indexdef: String = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes \
+         WHERE schemaname = current_schema() AND tablename = 'ci_job' AND indexname = $1",
+    )
+    .bind(CI_JOB_RUN_LEDGER_INDEX)
+    .fetch_one(admin)
+    .await
+    .expect("ci_job run-ledger index exists");
+    assert!(
+        indexdef.contains("(tenant_id, region, run_id)"),
+        "exact-cell ledger index has the frozen key order: {indexdef}"
+    );
+
+    // Disable only sequential scans inside this probe. PostgreSQL may choose either an Index Scan or
+    // Bitmap Index Scan; both prove the index can serve the exact tenant+region+run predicate without
+    // making a brittle cost/cardinality assertion.
+    let mut transaction = admin.begin().await.expect("begin planner probe");
+    sqlx::query("SET LOCAL enable_seqscan = off")
+        .execute(&mut *transaction)
+        .await
+        .expect("disable sequential scans for deterministic planner proof");
+    let plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN (COSTS OFF) SELECT job_id FROM ci_job \
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid FOR UPDATE",
+    )
+    .bind(tenant)
+    .bind("fr-par")
+    .bind(run_id)
+    .fetch_all(&mut *transaction)
+    .await
+    .expect("explain exact ci_job ledger lookup");
+    assert!(
+        plan.iter()
+            .any(|line| line.contains(CI_JOB_RUN_LEDGER_INDEX)),
+        "planner uses {CI_JOB_RUN_LEDGER_INDEX} for tenant+region+run lookup: {plan:?}"
+    );
+    transaction
+        .rollback()
+        .await
+        .expect("rollback planner probe");
+}
+
 async fn expected_input(admin: &PgPool, tenant: &str, run_id: &str) -> Vec<ArtifactRef> {
     let snapshot: String = sqlx::query_scalar(
         "SELECT definition_snapshot FROM ci_run WHERE tenant_id=$1 AND run_id=$2::uuid",
@@ -369,6 +413,10 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     admin.execute(CREATE_CI_RUN_DDL).await.expect("ci_run DDL");
     admin.execute(CREATE_CI_JOB_DDL).await.expect("ci_job DDL");
     admin
+        .execute(CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL)
+        .await
+        .expect("ci_job run-ledger concurrent index DDL");
+    admin
         .execute("SELECT myelin_make_tenant_scoped('ci_run')")
         .await
         .expect("force RLS on ci_run");
@@ -419,6 +467,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     );
     assert_atomic_started(&admin, "tenant_a", run1, true, true).await;
     assert_exact_jobs(&admin, "tenant_a", run1).await;
+    assert_run_ledger_index_is_used(&admin, "tenant_a", run1).await;
     assert_eq!(visible_job_count(&app, "tenant_a", "fr-par").await, 3);
     assert_eq!(visible_job_count(&app, "tenant_empty", "fr-par").await, 0);
     assert_eq!(visible_job_count(&app, "tenant_a", "de-fra").await, 0);

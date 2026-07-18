@@ -47,6 +47,14 @@ FROM ci_run
 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND state = 'queued'
 FOR UPDATE";
 
+const LOCK_EXACT_CI_JOB_LEDGER: &str = "\
+SELECT tenant_id, region, job_id, run_id, stage, name, needs, matrix_key, spec_ref,
+       state, attempt, result_summary
+FROM ci_job
+WHERE tenant_id = $1 AND region = $2
+  AND (run_id = $3 OR job_id = ANY($4::uuid[]))
+FOR UPDATE";
+
 /// Frozen BLAKE3 derive-key context for the version-1 canonical CI DAG-node identity.
 ///
 /// The hash input is four ordered `u64::to_be_bytes()` length-prefixed frames: tenant id, the
@@ -696,19 +704,16 @@ async fn materialize_ci_jobs_v1(
     let run_id = expected.first().map(|job| job.run_id).ok_or_else(|| {
         PgCiStarterError::CorruptRun("validated run plan materialized no ci_job rows".into())
     })?;
-    let rows = sqlx::query(
-        "SELECT tenant_id, region, job_id, run_id, stage, name, needs, matrix_key, spec_ref, \
-                state, attempt, result_summary \
-         FROM ci_job \
-         WHERE tenant_id = $1 AND (run_id = $2 OR job_id = ANY($3::uuid[])) \
-         FOR UPDATE",
-    )
-    .bind(&record.tenant_id)
-    .bind(run_id)
-    .bind(&expected_ids)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(|error| PgCiStarterError::Database(format!("lock exact ci_job ledger: {error}")))?;
+    let rows = sqlx::query(LOCK_EXACT_CI_JOB_LEDGER)
+        .bind(&record.tenant_id)
+        .bind(&record.region)
+        .bind(run_id)
+        .bind(&expected_ids)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|error| {
+            PgCiStarterError::Database(format!("lock exact ci_job ledger: {error}"))
+        })?;
 
     let mut actual_by_id = BTreeMap::new();
     for row in rows {
@@ -1094,6 +1099,14 @@ mod tests {
             assert_eq!(id.as_bytes()[6] >> 4, 8, "RFC 9562 UUID version 8");
             assert_eq!(id.as_bytes()[8] >> 6, 2, "RFC variant bits are 10");
         }
+    }
+
+    #[test]
+    fn exact_job_ledger_lock_is_region_explicit_and_bind_ordered() {
+        assert!(LOCK_EXACT_CI_JOB_LEDGER.contains("tenant_id = $1 AND region = $2"));
+        assert!(LOCK_EXACT_CI_JOB_LEDGER.contains("run_id = $3"));
+        assert!(LOCK_EXACT_CI_JOB_LEDGER.contains("job_id = ANY($4::uuid[])"));
+        assert!(LOCK_EXACT_CI_JOB_LEDGER.ends_with("FOR UPDATE"));
     }
 
     #[test]
