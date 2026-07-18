@@ -20,6 +20,11 @@ fn verifier(anchor: CellTrustAnchor) -> PasetoCapabilityVerifier {
 }
 
 fn spec(tenant: &str, grants: &[&str], jkt: Option<String>) -> CapabilityMintSpec {
+    let purpose = if jkt.is_some() {
+        CredentialPurpose::Pat
+    } else {
+        CredentialPurpose::OperatorBootstrap
+    };
     CapabilityMintSpec {
         tenant: tenant.into(),
         region: "eu-west".into(),
@@ -28,6 +33,8 @@ fn spec(tenant: &str, grants: &[&str], jkt: Option<String>) -> CapabilityMintSpe
         exp_unix: NOW + 300,
         authority: grants.iter().map(|s| s.to_string()).collect(),
         dpop_jkt: jkt,
+        purpose,
+        audience: CredentialAudience::Edge,
     }
 }
 
@@ -434,8 +441,17 @@ fn signer_verifier_seam_round_trip() {
     use crate::machine_auth::TokenVerifier;
     use crate::mint::TokenSigner;
     let c = std::sync::Arc::new(cell());
-    let signer = PasetoCapabilitySigner::new(c.clone(), 300).with_clock(|| NOW);
-    let material = signer.sign("acme", "eu-west", "svc:agent", "runtok:1", &["agent:run"]);
+    let signer = PasetoCapabilitySigner::new(c.clone()).with_clock(|| NOW);
+    let material = signer.sign(
+        "acme",
+        "eu-west",
+        "svc:agent",
+        "runtok:1",
+        "run:1",
+        Some(42),
+        &myelin_events::Timestamp("2023-11-14T22:18:20Z".into()),
+        &["agent:run"],
+    );
     let v = verifier(c.trust_anchor());
     let cred = myelin_identity::Credential {
         scheme: "agent".into(),
@@ -447,8 +463,46 @@ fn signer_verifier_seam_round_trip() {
     assert_eq!(token.tenant.0, "acme");
     assert_eq!(token.subject_key, "svc:agent");
     assert!(token.authority.holds("agent:run"));
+    assert_eq!(
+        token.purpose,
+        CredentialPurpose::AgentRun {
+            run_id: "run:1".into(),
+            delegation_snapshot: Some(42),
+        }
+    );
     assert!(
         !token.dpop_bound,
         "a per-run token is TTL-constrained, not DPoP-bound"
+    );
+}
+
+/// Malformed lifecycle data never widens the outer cryptographic lifetime. The signer stamps an
+/// already-expired boundary, so verification fails closed at the mint clock.
+#[test]
+fn signer_malformed_run_deadline_produces_unusable_token() {
+    use crate::machine_auth::TokenVerifier;
+    use crate::mint::TokenSigner;
+
+    let c = std::sync::Arc::new(cell());
+    let signer = PasetoCapabilitySigner::new(c.clone()).with_clock(|| NOW);
+    let material = signer.sign(
+        "acme",
+        "eu-west",
+        "svc:agent",
+        "runtok:bad-exp",
+        "run:bad-exp",
+        Some(42),
+        &myelin_events::Timestamp("not-a-deadline".into()),
+        &["repo.pull"],
+    );
+    let error = verifier(c.trust_anchor())
+        .verify(&myelin_identity::Credential {
+            scheme: "agent".into(),
+            material,
+        })
+        .expect_err("a malformed deadline must not receive the historical fixed TTL");
+    assert!(
+        matches!(error, AuthzError::FailClosed(message) if message.contains("expired")),
+        "malformed deadline should fail as an expired token"
     );
 }

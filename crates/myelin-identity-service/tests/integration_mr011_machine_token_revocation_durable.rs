@@ -140,6 +140,8 @@ async fn revoked_machine_token_stays_denied_across_a_fresh_store_instance() {
         exp_unix: NOW_UNIX + 3600,
         authority: vec!["ci:run".into()],
         dpop_jkt: None,
+        purpose: myelin_identity_service::CredentialPurpose::CiJob,
+        audience: myelin_identity_service::CredentialAudience::Edge,
     });
     let cred = Credential {
         scheme: "ci".into(),
@@ -217,5 +219,7 @@ fn cell_fresh_token(tenant: &str, region: &str, subject_key: &str) -> String {
         exp_unix: NOW_UNIX + 3600,
         authority: vec!["ci:run".into()],
         dpop_jkt: None,
+        purpose: myelin_identity_service::CredentialPurpose::CiJob,
+        audience: myelin_identity_service::CredentialAudience::Edge,
     })
 }

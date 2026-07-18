@@ -134,6 +134,8 @@ fn mint(cell: &CellTokenAuthority, tenant: &str, jti: &str) -> String {
         exp_unix: now() + 3600,
         authority: vec!["agent:run".into()],
         dpop_jkt: None,
+        purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
+        audience: myelin_identity_service::CredentialAudience::Edge,
     })
 }
 

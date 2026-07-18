@@ -67,7 +67,7 @@
 
 use crate::authenticate::{scheme as human_scheme, AuthTelemetry, IdorCounters};
 use crate::principal_store::PrincipalStore;
-use crate::revocation::RevocationStore;
+use crate::revocation::{RevocationStore, RunTokenState};
 use myelin_events::Timestamp;
 use myelin_identity::{
     AuthzError, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RevokeTarget,
@@ -141,6 +141,92 @@ pub enum MachineKind {
     /// A per-job / self-hosted-runner token (a Service principal scoped to one tenant's
     /// `SelfHosted` jobs).
     PerJob,
+}
+
+/// The signed purpose of a capability credential. This is distinct from both the transport scheme
+/// and [`PrincipalKind`]: an operator bootstrap credential and a delegated agent-run credential use
+/// the `agent` verifier, but have deliberately different authorization semantics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CredentialPurpose {
+    /// A human-operated bootstrap credential minted by the offline operator command.
+    OperatorBootstrap,
+    /// A short-lived delegated credential bound to one durable run.
+    AgentRun {
+        run_id: String,
+        /// Durable delegation-policy snapshot used to resolve the four authority conjuncts. Older
+        /// caller-supplied mint paths leave this absent and are refused at an authorization surface.
+        delegation_snapshot: Option<i64>,
+    },
+    /// A DPoP-bound personal access token.
+    Pat,
+    /// A CI job credential.
+    CiJob,
+    /// A repository deploy key credential.
+    DeployKey,
+    /// A self-hosted per-job credential.
+    PerJob,
+}
+
+impl CredentialPurpose {
+    /// The stable signed claim token for this purpose.
+    pub fn claim(&self) -> &'static str {
+        match self {
+            CredentialPurpose::OperatorBootstrap => "operator_bootstrap",
+            CredentialPurpose::AgentRun { .. } => "agent_run",
+            CredentialPurpose::Pat => "pat",
+            CredentialPurpose::CiJob => "ci_job",
+            CredentialPurpose::DeployKey => "deploy_key",
+            CredentialPurpose::PerJob => "per_job",
+        }
+    }
+
+    /// The machine verifier kind this signed purpose is valid under.
+    pub fn machine_kind(&self) -> MachineKind {
+        match self {
+            CredentialPurpose::OperatorBootstrap | CredentialPurpose::AgentRun { .. } => {
+                MachineKind::Agent
+            }
+            CredentialPurpose::Pat => MachineKind::Pat,
+            CredentialPurpose::CiJob => MachineKind::Ci,
+            CredentialPurpose::DeployKey => MachineKind::DeployKey,
+            CredentialPurpose::PerJob => MachineKind::PerJob,
+        }
+    }
+
+    /// Whether this is the durable run-bound credential shape.
+    pub fn is_agent_run(&self) -> bool {
+        matches!(self, CredentialPurpose::AgentRun { .. })
+    }
+}
+
+/// The signed service audience. A token minted for a future MCP endpoint cannot silently be replayed
+/// at the ordinary product edge, and vice versa.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialAudience {
+    /// The HTTP product and Git edge.
+    Edge,
+    /// The governed MCP endpoint (not mounted yet).
+    Mcp,
+}
+
+impl CredentialAudience {
+    /// The stable signed claim token.
+    pub fn claim(self) -> &'static str {
+        match self {
+            CredentialAudience::Edge => "edge",
+            CredentialAudience::Mcp => "mcp",
+        }
+    }
+}
+
+/// Sender-constraint state retained after verification. A handler never reparses an untrusted DPoP
+/// header to recover this decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DpopState {
+    /// The signed credential was not sender-constrained.
+    Unbound,
+    /// The verifier validated the request proof against the signed key binding.
+    Verified,
 }
 
 impl MachineKind {
@@ -254,6 +340,48 @@ pub struct CapabilityToken {
     /// Is this (long-lived PAT) token DPoP sender-constrained (RFC 9449, §4)? Required for a PAT;
     /// `false`/irrelevant for the short-lived per-run tokens (their TTL is the constraint).
     pub dpop_bound: bool,
+    /// The signed credential purpose (never inferred from an HTTP header).
+    pub purpose: CredentialPurpose,
+    /// The signed service audience.
+    pub audience: CredentialAudience,
+    /// The signed outer expiry as a Unix instant. It was checked by the verifier and remains
+    /// available to downstream final-boundary policy and audit code.
+    pub exp_unix: i64,
+}
+
+/// The verified capability facts retained through the request lifecycle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedCapabilityContext {
+    pub purpose: CredentialPurpose,
+    pub audience: CredentialAudience,
+    pub jti: String,
+    pub effective_authority: Authority,
+    pub expires_at_unix: i64,
+    pub dpop: DpopState,
+}
+
+/// The credential context associated with a request. Human sessions can become an additive variant;
+/// capability authentication never collapses to a bare principal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CredentialContext {
+    Capability(VerifiedCapabilityContext),
+}
+
+/// The trusted request identity passed from authentication through action and object authorization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestIdentity {
+    pub principal: Principal,
+    pub scope: TenantScope,
+    pub credential: CredentialContext,
+}
+
+impl RequestIdentity {
+    /// The verified capability facts for this request.
+    pub fn capability(&self) -> &VerifiedCapabilityContext {
+        match &self.credential {
+            CredentialContext::Capability(capability) => capability,
+        }
+    }
 }
 
 /// The pluggable token-verification seam (the EI-01 §1 named floor — the SAME posture as the
@@ -319,15 +447,28 @@ impl TokenVerifier for StructuralTokenVerifier {
         // Parse the frozen verified-token envelope. The real PASETO/biscuit/DPoP verification is the
         // named floor; this is the structural stand-in.
         let parts: Vec<&str> = credential.material.split('|').collect();
-        if parts.len() != 6 {
+        if parts.len() != 10 {
             return Err(AuthzError::BadRequest(
                 "malformed verified-token envelope (expected \
-                 `<tenant>|<region>|<subject_key>|<jti>|<dpop:0|1>|<grants>`)"
+                 `<tenant>|<region>|<subject_key>|<jti>|<dpop:0|1>|<grants>|<purpose>|<aud>|<run_id>|<delegation_snapshot>`)"
                     .into(),
             ));
         }
-        let (tenant, region, subject_key, jti, dpop, grants_csv) =
-            (parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]);
+        let (
+            tenant,
+            region,
+            subject_key,
+            jti,
+            dpop,
+            grants_csv,
+            purpose,
+            audience,
+            run_id,
+            delegation_snapshot,
+        ) = (
+            parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], parts[7],
+            parts[8], parts[9],
+        );
         if tenant.is_empty() || region.is_empty() || subject_key.is_empty() || jti.is_empty() {
             return Err(AuthzError::BadRequest(
                 "malformed verified-token envelope: tenant/region/subject_key/jti must be non-empty"
@@ -349,6 +490,52 @@ impl TokenVerifier for StructuralTokenVerifier {
         } else {
             Authority::of(grants_csv.split(',').map(str::to_string))
         };
+        let purpose = match purpose {
+            "operator_bootstrap" => CredentialPurpose::OperatorBootstrap,
+            "agent_run" if !run_id.is_empty() => CredentialPurpose::AgentRun {
+                run_id: run_id.to_string(),
+                delegation_snapshot: if delegation_snapshot.is_empty() {
+                    None
+                } else {
+                    Some(delegation_snapshot.parse::<i64>().map_err(|_| {
+                        AuthzError::BadRequest(
+                            "signed delegation snapshot must be an integer".into(),
+                        )
+                    })?)
+                },
+            },
+            "pat" => CredentialPurpose::Pat,
+            "ci_job" => CredentialPurpose::CiJob,
+            "deploy_key" => CredentialPurpose::DeployKey,
+            "per_job" => CredentialPurpose::PerJob,
+            "test_kind" => match kind {
+                MachineKind::Pat => CredentialPurpose::Pat,
+                MachineKind::Ci => CredentialPurpose::CiJob,
+                MachineKind::Agent => CredentialPurpose::OperatorBootstrap,
+                MachineKind::DeployKey => CredentialPurpose::DeployKey,
+                MachineKind::PerJob => CredentialPurpose::PerJob,
+            },
+            other => {
+                return Err(AuthzError::BadRequest(format!(
+                    "unknown or incomplete signed credential purpose `{other}`"
+                )))
+            }
+        };
+        if purpose.machine_kind() != kind {
+            return Err(AuthzError::FailClosed(format!(
+                "credential scheme kind `{kind:?}` does not match signed purpose `{}`",
+                purpose.claim()
+            )));
+        }
+        let audience = match audience {
+            "edge" => CredentialAudience::Edge,
+            "mcp" => CredentialAudience::Mcp,
+            other => {
+                return Err(AuthzError::BadRequest(format!(
+                    "unknown signed credential audience `{other}`"
+                )))
+            }
+        };
 
         Ok(CapabilityToken {
             tenant: TenantId(tenant.to_string()),
@@ -358,6 +545,9 @@ impl TokenVerifier for StructuralTokenVerifier {
             authority,
             jti: jti.to_string(),
             dpop_bound,
+            purpose,
+            audience,
+            exp_unix: i64::MAX,
         })
     }
 }
@@ -472,11 +662,11 @@ impl CapabilityAuthenticator {
     ///    resolution count = 0, C6);
     /// 6. **S1 token-record lookup** within the verified scope → the [`Principal`];
     /// 7. **fail-closed** if the principal is `Suspended`/`Disabled`.
-    pub fn authenticate(
+    pub fn authenticate_identity(
         &self,
         credential: &myelin_identity::Credential,
         path_tenant: Option<&TenantId>,
-    ) -> myelin_identity::Result<Principal> {
+    ) -> myelin_identity::Result<RequestIdentity> {
         // (0) Observability is part of the pass: every decision (success OR failure) emits exactly
         //     one auth_decision_latency observation, recorded FIRST so no early return can skip it.
         self.telemetry.observe();
@@ -493,10 +683,32 @@ impl CapabilityAuthenticator {
         //     (fail-closed). With `with_pg`, the deny survives a restart (the durable source of truth).
         //     The store's read is itself fail-closed (a PG read error denies), so a consult that cannot
         //     complete denies rather than admit a possibly-revoked token.
-        if self
-            .revocations
-            .is_revoked(&scope, &RevokeTarget::Jti(token.jti.clone()), &(self.now)())
-        {
+        let now = (self.now)();
+        let target = RevokeTarget::Jti(token.jti.clone());
+        if token.purpose.is_agent_run() {
+            let CredentialPurpose::AgentRun {
+                delegation_snapshot,
+                ..
+            } = &token.purpose
+            else {
+                unreachable!("is_agent_run matched a non-run purpose")
+            };
+            if !matches!(delegation_snapshot, Some(snapshot) if *snapshot > 0) {
+                return Err(AuthzError::FailClosed(
+                    "agent-run credential has no valid durable delegation-policy snapshot; \
+                     caller-supplied legacy run mints are not authorization credentials"
+                        .into(),
+                ));
+            }
+            let state = self.revocations.run_token_state(&scope, &target, &now);
+            if state != RunTokenState::LiveWithinRunLife {
+                return Err(AuthzError::FailClosed(format!(
+                    "agent-run token `{}` is not live in durable S7 ({state:?}) — expired, torn-down, \
+                     and unknown run credentials are refused",
+                    token.jti
+                )));
+            }
+        } else if self.revocations.is_revoked(&scope, &target, &now) {
             return Err(AuthzError::FailClosed(format!(
                 "token `{}` is revoked (durable S7 revocation store) — fail-closed (the deny survives \
                  restart; tenant `{}`)",
@@ -567,14 +779,41 @@ impl CapabilityAuthenticator {
         // The one polymorphic Principal (§3): a machine credential resolves to the SAME record. The
         // kind discriminant (Service for a machine identity) changes governance metadata, never the
         // authz code path. tenant/region are the VERIFIED token's.
-        Ok(Principal::new(
-            token.tenant,
-            token.region,
+        let principal = Principal::new(
+            token.tenant.clone(),
+            token.region.clone(),
             row.principal_id,
             row.kind,
             row.data_role,
             row.status,
-        ))
+        );
+        Ok(RequestIdentity {
+            principal,
+            scope,
+            credential: CredentialContext::Capability(VerifiedCapabilityContext {
+                purpose: token.purpose,
+                audience: token.audience,
+                jti: token.jti,
+                effective_authority: token.authority,
+                expires_at_unix: token.exp_unix,
+                dpop: if token.dpop_bound {
+                    DpopState::Verified
+                } else {
+                    DpopState::Unbound
+                },
+            }),
+        })
+    }
+
+    /// Compatibility projection for callers that only resolve a principal. Authorization surfaces
+    /// must use [`Self::authenticate_identity`] so credential authority is not discarded.
+    pub fn authenticate(
+        &self,
+        credential: &myelin_identity::Credential,
+        path_tenant: Option<&TenantId>,
+    ) -> myelin_identity::Result<Principal> {
+        self.authenticate_identity(credential, path_tenant)
+            .map(|identity| identity.principal)
     }
 
     /// The frozen-4.1 trait form of `authenticate` (no `path_tenant`) — delegates to the path-aware
@@ -677,7 +916,7 @@ mod tests {
         grants: &[&str],
     ) -> String {
         format!(
-            "{tenant}|{region}|{subject_key}|{jti}|{}|{}",
+            "{tenant}|{region}|{subject_key}|{jti}|{}|{}|test_kind|edge||",
             if dpop { "1" } else { "0" },
             grants.join(",")
         )
@@ -767,6 +1006,105 @@ mod tests {
                 "scheme {s} machine → Service"
             );
         }
+    }
+
+    fn run_material(jti: &str) -> String {
+        format!(
+            "acme|eu-west|run-subject|{jti}|0|repo.pull|agent_run|edge|run-1|42"
+        )
+    }
+
+    fn run_authenticator(revocations: RevocationStore, now: &'static str) -> CapabilityAuthenticator {
+        let st = store();
+        let sc = scope("acme", "eu-west");
+        st.put_principal(
+            &sc,
+            PrincipalId("svc:agent".into()),
+            PrincipalKind::Service,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+            None,
+        )
+        .unwrap();
+        st.link_credential(
+            &sc,
+            scheme::AGENT,
+            "run-subject",
+            &PrincipalId("svc:agent".into()),
+        )
+        .unwrap();
+        CapabilityAuthenticator::with_verifier(
+            st,
+            Arc::new(StructuralTokenVerifier::new()),
+            revocations,
+        )
+        .with_clock(move || Timestamp(now.into()))
+    }
+
+    /// Agent-run authentication is a positive lifecycle check: only a known S7 record inside its
+    /// run-life window is accepted; unknown, expired, and explicitly torn-down credentials deny.
+    #[test]
+    fn agent_run_requires_live_durable_s7_state() {
+        let sc = scope("acme", "eu-west");
+
+        let live_s7 = RevocationStore::new();
+        live_s7.register_run_token_ttl(
+            &sc,
+            "jti-live",
+            Timestamp("2026-07-18T10:00:00Z".into()),
+            Timestamp("2026-07-18T10:05:00Z".into()),
+        );
+        let identity = run_authenticator(live_s7, "2026-07-18T10:01:00Z")
+            .authenticate_identity(&cred(scheme::AGENT, run_material("jti-live")), None)
+            .expect("a known run token inside its run life is live");
+        assert_eq!(identity.capability().effective_authority.len(), 1);
+
+        let unknown = run_authenticator(RevocationStore::new(), "2026-07-18T10:01:00Z")
+            .authenticate_identity(&cred(scheme::AGENT, run_material("jti-unknown")), None);
+        assert!(matches!(unknown, Err(AuthzError::FailClosed(_))));
+
+        let expired_s7 = RevocationStore::new();
+        expired_s7.register_run_token_ttl(
+            &sc,
+            "jti-expired",
+            Timestamp("2026-07-18T10:00:00Z".into()),
+            Timestamp("2026-07-18T10:05:00Z".into()),
+        );
+        let expired = run_authenticator(expired_s7, "2026-07-18T10:05:00Z")
+            .authenticate_identity(&cred(scheme::AGENT, run_material("jti-expired")), None);
+        assert!(matches!(expired, Err(AuthzError::FailClosed(_))));
+
+        let torn_down_s7 = RevocationStore::new();
+        torn_down_s7.register_run_token_ttl(
+            &sc,
+            "jti-torn-down",
+            Timestamp("2026-07-18T10:00:00Z".into()),
+            Timestamp("2026-07-18T10:05:00Z".into()),
+        );
+        torn_down_s7.tear_down_run_token(
+            &sc,
+            "jti-torn-down",
+            Timestamp("2026-07-18T10:01:00Z".into()),
+        );
+        let torn_down = run_authenticator(torn_down_s7, "2026-07-18T10:02:00Z")
+            .authenticate_identity(&cred(scheme::AGENT, run_material("jti-torn-down")), None);
+        assert!(matches!(torn_down, Err(AuthzError::FailClosed(_))));
+    }
+
+    #[test]
+    fn agent_run_without_durable_snapshot_fails_closed() {
+        let sc = scope("acme", "eu-west");
+        let s7 = RevocationStore::new();
+        s7.register_run_token_ttl(
+            &sc,
+            "jti-legacy",
+            Timestamp("2026-07-18T10:00:00Z".into()),
+            Timestamp("2026-07-18T10:05:00Z".into()),
+        );
+        let auth = run_authenticator(s7, "2026-07-18T10:01:00Z");
+        let material = "acme|eu-west|run-subject|jti-legacy|0|repo.pull|agent_run|edge|run-1|";
+        let result = auth.authenticate_identity(&cred(scheme::AGENT, material.into()), None);
+        assert!(matches!(result, Err(AuthzError::FailClosed(_))));
     }
 
     /// **A deploy key resolves to a repo-scoped Service principal (architecture §3, C6).** Its

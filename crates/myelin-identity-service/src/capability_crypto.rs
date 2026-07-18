@@ -45,7 +45,9 @@
 //! per-request DPoP binding wiring (the gateway threading the real `htm`/`htu`) is the same injected
 //! seam the SSH challenge wiring is.
 
-use crate::machine_auth::{Authority, CapabilityToken, MachineKind};
+use crate::machine_auth::{
+    Authority, CapabilityToken, CredentialAudience, CredentialPurpose, MachineKind,
+};
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use myelin_identity::{AuthzError, Credential};
@@ -243,6 +245,18 @@ impl CellTokenAuthority {
         claims.insert("sub".into(), spec.subject_key.clone().into());
         claims.insert("jti".into(), spec.jti.clone().into());
         claims.insert("exp".into(), spec.exp_unix.into());
+        claims.insert("purpose".into(), spec.purpose.claim().into());
+        claims.insert("aud".into(), spec.audience.claim().into());
+        if let CredentialPurpose::AgentRun {
+            run_id,
+            delegation_snapshot,
+        } = &spec.purpose
+        {
+            claims.insert("run_id".into(), run_id.clone().into());
+            if let Some(snapshot) = delegation_snapshot {
+                claims.insert("delegation_snapshot".into(), (*snapshot).into());
+            }
+        }
         let auth: Vec<serde_json::Value> = spec
             .authority
             .iter()
@@ -292,6 +306,10 @@ pub struct CapabilityMintSpec {
     pub authority: Vec<String>,
     /// The DPoP-bound client thumbprint (`cnf.jkt`) for a long-lived PAT (`None` for per-run tokens).
     pub dpop_jkt: Option<String>,
+    /// The signed credential purpose. Transport headers may select a verifier but cannot override it.
+    pub purpose: CredentialPurpose,
+    /// The signed service audience.
+    pub audience: CredentialAudience,
 }
 
 // ================================================================================================
@@ -737,6 +755,64 @@ impl PasetoCapabilityVerifier {
             .get("exp")
             .and_then(|v| v.as_i64())
             .ok_or_else(|| refuse("verified token missing integer `exp`"))?;
+        let purpose_claim = str_claim(&claims, "purpose").map_err(|_| {
+            refuse(
+                "capability token has no signed credential purpose; ambiguous legacy credentials are \
+                 refused — re-mint/re-bootstrap the credential",
+            )
+        })?;
+        let purpose = match purpose_claim.as_str() {
+            "operator_bootstrap" => CredentialPurpose::OperatorBootstrap,
+            "agent_run" => CredentialPurpose::AgentRun {
+                run_id: str_claim(&claims, "run_id").map_err(|_| {
+                    refuse("signed agent-run credential is missing its non-empty `run_id` binding")
+                })?,
+                delegation_snapshot: claims
+                    .get("delegation_snapshot")
+                    .map(|value| {
+                        value.as_i64().ok_or_else(|| {
+                            refuse("signed `delegation_snapshot` must be an integer")
+                        })
+                    })
+                    .transpose()?,
+            },
+            "pat" => CredentialPurpose::Pat,
+            "ci_job" => CredentialPurpose::CiJob,
+            "deploy_key" => CredentialPurpose::DeployKey,
+            "per_job" => CredentialPurpose::PerJob,
+            other => {
+                return Err(refuse(format!(
+                    "unknown signed credential purpose `{other}` — refused"
+                )))
+            }
+        };
+        if purpose.machine_kind() != kind {
+            return Err(refuse(format!(
+                "credential scheme selects kind `{kind:?}` but the signed purpose `{}` requires \
+                 `{:?}` — refused",
+                purpose.claim(),
+                purpose.machine_kind()
+            )));
+        }
+        let audience = match str_claim(&claims, "aud")?.as_str() {
+            "edge" => CredentialAudience::Edge,
+            "mcp" => CredentialAudience::Mcp,
+            other => {
+                return Err(refuse(format!(
+                    "unknown signed audience `{other}` — refused"
+                )))
+            }
+        };
+        if !purpose.is_agent_run() && claims.get("run_id").is_some() {
+            return Err(refuse(
+                "a non-run credential carries a `run_id` binding — ambiguous purpose refused",
+            ));
+        }
+        if !purpose.is_agent_run() && claims.get("delegation_snapshot").is_some() {
+            return Err(refuse(
+                "a non-run credential carries a delegation snapshot — ambiguous purpose refused",
+            ));
+        }
         let root_grants: BTreeSet<String> = match claims.get("auth") {
             Some(serde_json::Value::Array(arr)) => arr
                 .iter()
@@ -835,6 +911,9 @@ impl PasetoCapabilityVerifier {
             authority: Authority::of(effective),
             jti,
             dpop_bound,
+            purpose,
+            audience,
+            exp_unix: exp,
         })
     }
 }
@@ -884,25 +963,24 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// **The REAL per-run-token signer (MR-011) — plugs into the [`crate::mint::TokenSigner`] seam.** The
 /// mint applies the monotone intersection and hands this signer the ALREADY-attenuated effective
-/// authority; the signer stamps a PASETO v4.public token (Ed25519) with `exp = now + ttl` (a per-run
-/// token is TTL-constrained, not DPoP-bound → no `cnf`), seeds the macaroon chain, and returns the
+/// authority; the signer stamps a PASETO v4.public token (Ed25519) whose `exp` is exactly the mint's
+/// authoritative run deadline (a per-run token is TTL-constrained, not DPoP-bound → no `cnf`), and
+/// returns the
 /// credential material a [`PasetoCapabilityVerifier`] round-trips. The mint's intersection + scope +
 /// TTL logic is unchanged (the signer never widens the authority it is given).
 #[derive(Clone)]
 pub struct PasetoCapabilitySigner {
     authority: Arc<CellTokenAuthority>,
     now: NowFn,
-    ttl_secs: i64,
 }
 
 impl PasetoCapabilitySigner {
-    /// Build over the cell's token authority, with the system clock and a per-run-token `exp` of
-    /// `now + ttl_secs` (the run-life ceiling the mint ALSO registers in the durable S7 store).
-    pub fn new(authority: Arc<CellTokenAuthority>, ttl_secs: i64) -> PasetoCapabilitySigner {
+    /// Build over the cell's token authority with the system clock. Each call receives the exact
+    /// durable S7 run deadline and stamps that same instant into the outer token.
+    pub fn new(authority: Arc<CellTokenAuthority>) -> PasetoCapabilitySigner {
         PasetoCapabilitySigner {
             authority,
             now: Arc::new(system_now),
-            ttl_secs,
         }
     }
 
@@ -923,9 +1001,17 @@ impl crate::mint::TokenSigner for PasetoCapabilitySigner {
         region: &str,
         subject_key: &str,
         jti: &str,
+        run_id: &str,
+        delegation_snapshot: Option<i64>,
+        expires_at: &myelin_events::Timestamp,
         grants: &[&str],
     ) -> String {
-        let exp = (self.now)().saturating_add(self.ttl_secs);
+        // The mint's durable S7 deadline is authoritative. Canonical production timestamps parse to
+        // the exact same Unix instant; malformed lifecycle data fails closed by producing an already-
+        // expired outer token rather than falling back to the historical wider fixed ceiling.
+        let exp = chrono::DateTime::parse_from_rfc3339(&expires_at.0)
+            .map(|instant| instant.timestamp())
+            .unwrap_or_else(|_| (self.now)());
         self.authority.mint(&CapabilityMintSpec {
             tenant: tenant.to_string(),
             region: region.to_string(),
@@ -934,6 +1020,11 @@ impl crate::mint::TokenSigner for PasetoCapabilitySigner {
             exp_unix: exp,
             authority: grants.iter().map(|g| g.to_string()).collect(),
             dpop_jkt: None, // a per-run token is TTL-constrained, not DPoP-bound (§4).
+            purpose: CredentialPurpose::AgentRun {
+                run_id: run_id.to_string(),
+                delegation_snapshot,
+            },
+            audience: CredentialAudience::Edge,
         })
     }
 }

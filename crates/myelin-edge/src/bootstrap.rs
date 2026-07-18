@@ -42,7 +42,7 @@ pub const BOOTSTRAP_SCHEME: &str = "agent";
 /// tests mint and prove sufficient for the full surface. Sufficient AND minimal (see the module docs:
 /// the per-object gate is ReBAC, the action gate is a verb allowlist; neither reads this grant for the
 /// `agent` kind).
-pub const BOOTSTRAP_AUTHORITY: &[&str] = &["agent:run"];
+pub const BOOTSTRAP_AUTHORITY: &[&str] = &["edge.operator"];
 
 /// The parameters an operator bootstrap needs (validated here — empty required fields are refused).
 pub struct BootstrapParams<'a> {
@@ -196,6 +196,8 @@ pub fn bootstrap_principal_and_mint(
         exp_unix: expiry_unix,
         authority: BOOTSTRAP_AUTHORITY.iter().map(|g| g.to_string()).collect(),
         dpop_jkt: None, // a TTL-constrained operator token, not DPoP-bound (git/curl cannot prove DPoP).
+        purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
+        audience: myelin_identity_service::CredentialAudience::Edge,
     });
 
     Ok(BootstrapOutcome {
