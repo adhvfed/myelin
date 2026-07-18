@@ -4,9 +4,12 @@
 use myelin_config::MyelinConfig;
 use myelin_events::{Actor, IdMinter, MonotonicMinter, OutboxStore};
 use myelin_flow::{
-    boot_flow, migrations::migrations, PgFlowWorker, PgRunOnceOutcome, PgWorkerScope, RetryPolicy,
+    boot_flow, job_idem_token, migrations::migrations, ActivityError, DurableExecutor, JobKind,
+    JobOutcome, JobRunner, JobSpec, PgFlowDriveStore, PgFlowWorker, PgRunOnceOutcome,
+    PgWorkerScope, RetryPolicy, SignalSpec,
 };
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
+use myelin_refs::ArtifactRef;
 use myelin_storage::{provider::foundation_migrations, HotTables, PgMigrator, PgOutboxBacking};
 use myelin_substrate::Config;
 use myelin_tenancy::{Region, TenantId};
@@ -16,6 +19,18 @@ use std::sync::Arc;
 
 static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[derive(Default)]
+struct RecordingJobRunner {
+    calls: AtomicUsize,
+}
+
+impl JobRunner for RecordingJobRunner {
+    fn dispatch(&self, _spec: &JobSpec) -> Result<(), ActivityError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
 
 fn admin_url() -> String {
     std::env::var("DATABASE_URL")
@@ -361,5 +376,335 @@ async fn renewal_failure_joins_body_before_run_once_returns_and_refuses_commit()
     assert_eq!(row.get::<String, _>("state"), "running");
     assert_eq!(row.get::<i64, _>("cursor"), 0);
     assert!(row.get::<Option<String>, _>("last_drive_id").is_none());
+    cleanup(bare, pool, schema).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dispatch_frontier_arms_both_deadlines_and_fired_earliest_replays_without_reopening() {
+    let _guard = TEST_LOCK.lock().await;
+    let (bare, pool, schema) = setup("job_frontier").await;
+    let runner = Arc::new(RecordingJobRunner::default());
+    let mut flow = worker(&pool, "acme", "no-osl", 9, "worker-frontier");
+    let body_runner = Arc::clone(&runner);
+    flow.register_definition("wf.frontier", 1, "frontier-v1", move |_input, ctx| {
+        let earlier = ctx
+            .dispatch_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/earlier"),
+                body_runner.as_ref(),
+                Some(10),
+            )
+            .map_err(|error| format!("{error:?}"))?;
+        let later = ctx
+            .dispatch_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/later"),
+                body_runner.as_ref(),
+                Some(120),
+            )
+            .map_err(|error| format!("{error:?}"))?;
+
+        match ctx
+            .join_dispatched_job(&earlier)
+            .map_err(|error| format!("{error:?}"))?
+        {
+            JobOutcome::Parked => return Ok(Vec::new()),
+            JobOutcome::TimedOut => {}
+            JobOutcome::Completed { .. } => return Err("earlier job unexpectedly completed".into()),
+        }
+        match ctx
+            .join_dispatched_job(&later)
+            .map_err(|error| format!("{error:?}"))?
+        {
+            JobOutcome::Completed { result, .. } => Ok(result),
+            JobOutcome::Parked => Ok(Vec::new()),
+            JobOutcome::TimedOut => Err("later job unexpectedly timed out".into()),
+        }
+    })
+    .unwrap();
+    seed_run(&pool, "acme", "no-osl", "R-frontier", "wf.frontier", 0, 9).await;
+    let base = chrono::Utc::now().timestamp();
+    assert!(matches!(
+        flow.run_once(base, "2026-07-18T00:00:00Z").await.unwrap(),
+        PgRunOnceOutcome::Driven { .. }
+    ));
+    let timer_rows = sqlx::query(
+        "SELECT timer_id, command_id, EXTRACT(EPOCH FROM fire_at)::bigint AS fire_at, fired \
+         FROM wf_timer WHERE tenant_id='acme' AND region='no-osl' AND run_id='R-frontier' \
+         ORDER BY fire_at",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        timer_rows.len(),
+        2,
+        "both sibling SLAs arm before the first join"
+    );
+    assert_eq!(timer_rows[0].get::<i64, _>("fire_at"), base + 10);
+    assert_eq!(timer_rows[1].get::<i64, _>("fire_at"), base + 120);
+
+    let later_token = job_idem_token("R-frontier", "wf.frontier:1");
+    assert_eq!(
+        tokio::task::block_in_place(|| flow.executor().signal(SignalSpec {
+            run: myelin_flow::RunId("R-frontier".into()),
+            signal_name: "job.done".into(),
+            idem_key: later_token.clone(),
+            payload: vec![ArtifactRef("myelin://acme/ci/artifact/later".into())],
+            payload_key_ref: None,
+        }))
+        .unwrap(),
+        myelin_flow::SignalOutcome::Buffered
+    );
+    // The sibling completion wakes the run, but deterministic earliest ordering re-parks on A.
+    flow.run_once(base + 1, "2026-07-18T00:00:01Z")
+        .await
+        .unwrap();
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM workflow_run WHERE tenant_id='acme' AND region='no-osl' \
+         AND run_id='R-frontier'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "waiting");
+
+    let drive_store = PgFlowDriveStore::new(
+        pool.clone(),
+        TenantId("acme".into()),
+        Region("no-osl".into()),
+    );
+    let fired = drive_store
+        .fire_due_timer(9, base + 10)
+        .await
+        .unwrap()
+        .expect("earliest sibling timer is due");
+    assert_eq!(fired.command_id, "wf.frontier:0/job-timeout");
+    assert!(
+        drive_store
+            .fire_due_timer(9, base + 10)
+            .await
+            .unwrap()
+            .is_none(),
+        "the same deadline fires effectively once"
+    );
+
+    flow.run_once(base + 11, "2026-07-18T00:00:11Z")
+        .await
+        .unwrap();
+    let final_state: String = sqlx::query_scalar(
+        "SELECT state FROM workflow_run WHERE tenant_id='acme' AND region='no-osl' \
+         AND run_id='R-frontier'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(final_state, "completed");
+    let fired_flags: Vec<bool> = sqlx::query_scalar(
+        "SELECT fired FROM wf_timer WHERE tenant_id='acme' AND region='no-osl' \
+         AND run_id='R-frontier' ORDER BY fire_at",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        fired_flags,
+        vec![true, true],
+        "replayed dispatch did not reopen A; successful B disarmed its SLA"
+    );
+    let fire_history: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wf_history WHERE tenant_id='acme' AND region='no-osl' \
+         AND run_id='R-frontier' AND kind='timer_fired' \
+         AND command_id='wf.frontier:0/job-timeout/fired'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(fire_history, 1, "one durable wake/history row");
+    let later_consumed: Option<i64> = sqlx::query_scalar(
+        "SELECT consumed_seq FROM wf_signal WHERE tenant_id='acme' AND region='no-osl' \
+         AND run_id='R-frontier' AND signal_name='job.done' AND idem_key=$1",
+    )
+    .bind(&later_token)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(later_consumed.is_some());
+    let bound_receipt: serde_json::Value = sqlx::query_scalar(
+        "SELECT result FROM wf_history WHERE tenant_id='acme' AND region='no-osl' \
+         AND run_id='R-frontier' AND command_id='wf.frontier:3' AND kind='signal_received'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        bound_receipt,
+        serde_json::json!([
+            format!("myelin://flow/signal-idem/{later_token}"),
+            "myelin://flow/signal-name/job.done",
+            "myelin://acme/ci/artifact/later"
+        ]),
+        "the durable exact receipt binds signal name, idem key, and payload"
+    );
+    assert_eq!(
+        runner.calls.load(Ordering::SeqCst),
+        2,
+        "replay never redispatched"
+    );
+    cleanup(bare, pool, schema).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_receipt_time_accepts_equality_and_late_result_never_satisfies_timed_out_join() {
+    let _guard = TEST_LOCK.lock().await;
+    let (bare, pool, schema) = setup("receipt_race").await;
+    let runner = Arc::new(RecordingJobRunner::default());
+    let mut flow = worker(&pool, "acme", "no-osl", 10, "worker-receipt");
+    let body_runner = Arc::clone(&runner);
+    flow.register_definition("wf.receipt", 1, "receipt-v1", move |_input, ctx| {
+        let job = ctx
+            .dispatch_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/receipt"),
+                body_runner.as_ref(),
+                Some(10),
+            )
+            .map_err(|error| format!("{error:?}"))?;
+        match ctx
+            .join_dispatched_job(&job)
+            .map_err(|error| format!("{error:?}"))?
+        {
+            JobOutcome::Completed { result, .. } => Ok(result),
+            JobOutcome::Parked => Ok(Vec::new()),
+            JobOutcome::TimedOut => match ctx
+                .wait_for_signal("finish", None)
+                .map_err(|error| format!("{error:?}"))?
+            {
+                myelin_flow::WaitOutcome::Signalled { payload, .. } => Ok(payload),
+                myelin_flow::WaitOutcome::Parked => Ok(Vec::new()),
+                myelin_flow::WaitOutcome::TimedOut => unreachable!("finish is unbounded"),
+            },
+        }
+    })
+    .unwrap();
+    let base = chrono::Utc::now().timestamp();
+
+    seed_run(&pool, "acme", "no-osl", "R-equal", "wf.receipt", 0, 10).await;
+    flow.run_once(base, "2026-07-18T00:00:00Z").await.unwrap();
+    let equal_token = job_idem_token("R-equal", "wf.receipt:0");
+    sqlx::query(
+        "INSERT INTO wf_signal \
+           (tenant_id,region,run_id,signal_name,idem_key,payload,received_at) \
+         VALUES ('acme','no-osl','R-equal','job.done',$1,$2,to_timestamp($3))",
+    )
+    .bind(&equal_token)
+    .bind(serde_json::json!(["myelin://acme/ci/artifact/equal"]))
+    .bind((base + 10) as f64)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE workflow_run SET state='running' \
+         WHERE tenant_id='acme' AND region='no-osl' AND run_id='R-equal'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    flow.run_once(base + 20, "2026-07-18T00:00:20Z")
+        .await
+        .unwrap();
+    let equal: (String, Option<i64>) = sqlx::query_as(
+        "SELECT run.state, signal.consumed_seq FROM workflow_run AS run \
+         JOIN wf_signal AS signal ON signal.tenant_id=run.tenant_id \
+           AND signal.region=run.region AND signal.run_id=run.run_id \
+         WHERE run.tenant_id='acme' AND run.region='no-osl' AND run.run_id='R-equal'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(equal.0, "completed");
+    assert!(
+        equal.1.is_some(),
+        "receipt exactly at the deadline is accepted"
+    );
+
+    seed_run(&pool, "acme", "no-osl", "R-late", "wf.receipt", 0, 10).await;
+    flow.run_once(base, "2026-07-18T00:00:00Z").await.unwrap();
+    let late_token = job_idem_token("R-late", "wf.receipt:0");
+    sqlx::query(
+        "INSERT INTO wf_signal \
+           (tenant_id,region,run_id,signal_name,idem_key,payload,received_at) \
+         VALUES ('acme','no-osl','R-late','job.done',$1,$2,to_timestamp($3))",
+    )
+    .bind(&late_token)
+    .bind(serde_json::json!(["myelin://acme/ci/artifact/late"]))
+    .bind((base + 10) as f64 + 0.001)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE workflow_run SET state='running' \
+         WHERE tenant_id='acme' AND region='no-osl' AND run_id='R-late'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    flow.run_once(base + 20, "2026-07-18T00:00:20Z")
+        .await
+        .unwrap();
+    let late_after_timeout: Option<i64> = sqlx::query_scalar(
+        "SELECT consumed_seq FROM wf_signal WHERE tenant_id='acme' AND region='no-osl' \
+         AND run_id='R-late' AND signal_name='job.done' AND idem_key=$1",
+    )
+    .bind(&late_token)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        late_after_timeout, None,
+        "late completion loses and remains unconsumed"
+    );
+    let waiting: String = sqlx::query_scalar(
+        "SELECT state FROM workflow_run WHERE tenant_id='acme' AND region='no-osl' \
+         AND run_id='R-late'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        waiting, "waiting",
+        "timeout receipt committed before the next wait"
+    );
+
+    tokio::task::block_in_place(|| {
+        flow.executor().signal(SignalSpec {
+            run: myelin_flow::RunId("R-late".into()),
+            signal_name: "finish".into(),
+            idem_key: "finish-1".into(),
+            payload: Vec::new(),
+            payload_key_ref: None,
+        })
+    })
+    .unwrap();
+    flow.run_once(base + 21, "2026-07-18T00:00:21Z")
+        .await
+        .unwrap();
+    let late_final: (String, Option<i64>) = sqlx::query_as(
+        "SELECT run.state, signal.consumed_seq FROM workflow_run AS run \
+         JOIN wf_signal AS signal ON signal.tenant_id=run.tenant_id \
+           AND signal.region=run.region AND signal.run_id=run.run_id \
+           AND signal.signal_name='job.done' \
+         WHERE run.tenant_id='acme' AND run.region='no-osl' AND run.run_id='R-late'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(late_final.0, "completed");
+    assert_eq!(
+        late_final.1, None,
+        "replay short-circuits to the journaled timeout and never consumes the late row"
+    );
+    assert_eq!(
+        runner.calls.load(Ordering::SeqCst),
+        2,
+        "one dispatch per run"
+    );
     cleanup(bare, pool, schema).await;
 }
