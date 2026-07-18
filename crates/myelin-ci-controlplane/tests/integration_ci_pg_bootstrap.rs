@@ -112,19 +112,44 @@ async fn exercise(
         }
     }
 
-    let ledger_index_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM pg_indexes
-              WHERE schemaname = $1 AND tablename = 'ci_job' AND indexname = $2
-         )",
+    let ledger_index_valid_and_ready: Option<bool> = sqlx::query_scalar(
+        "SELECT index_state.indisvalid AND index_state.indisready
+           FROM pg_catalog.pg_index AS index_state
+           JOIN pg_catalog.pg_class AS index_relation
+             ON index_relation.oid = index_state.indexrelid
+           JOIN pg_catalog.pg_class AS table_relation
+             ON table_relation.oid = index_state.indrelid
+           JOIN pg_catalog.pg_namespace AS relation_namespace
+             ON relation_namespace.oid = table_relation.relnamespace
+          WHERE relation_namespace.nspname = $1
+            AND table_relation.relname = 'ci_job'
+            AND table_relation.relkind = 'r'
+            AND index_relation.relnamespace = relation_namespace.oid
+            AND index_relation.relname = $2
+            AND index_relation.relkind = 'i'",
     )
     .bind(schema)
     .bind(myelin_ci_controlplane::CI_JOB_RUN_LEDGER_INDEX)
+    .fetch_optional(provider.db_pool())
+    .await
+    .map_err(|e| format!("inspect migrated ci_job run-ledger index state: {e}"))?;
+    if ledger_index_valid_and_ready != Some(true) {
+        return Err(format!(
+            "Controlplane bootstrap left ci_job_run_ledger missing, invalid, or not ready: {ledger_index_valid_and_ready:?}"
+        ));
+    }
+
+    let validation_applied: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM myelin_applied_migration WHERE id = $1
+         )",
+    )
+    .bind(myelin_ci_controlplane::CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID)
     .fetch_one(provider.db_pool())
     .await
-    .map_err(|e| format!("inspect migrated ci_job run-ledger index: {e}"))?;
-    if !ledger_index_exists {
-        return Err("Controlplane bootstrap omitted ci_job_run_ledger index migration".into());
+    .map_err(|e| format!("inspect applied ci_job run-ledger validator: {e}"))?;
+    if !validation_applied {
+        return Err("Controlplane bootstrap did not execute ci_job_run_ledger validator".into());
     }
 
     if sqlx::query("CREATE TABLE runtime_must_not_create (id integer)")
