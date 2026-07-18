@@ -209,6 +209,7 @@ stack; kill-9 drills green.
 | R2.3 | Fail-static authz cache full-key comparison | **DONE** | `2154e38` (merge; `d3ebd3b`+`ff334e8`) |
 | R2.4 | MCP HITL server-side verdict; batch partial-approval by approval-id | **DONE** | `d248644` (merge; `d6b9d1e`+`5f60037`) |
 | R2.4-fu | Wire GovernedRouter + durable HitlVerdictStore into MCP prod main (currently GOVERNANCE_NOT_WIRED) | PENDING (tracked; MCP-serve composition root) | — |
+| R2.4-h | MCP stdio lifecycle hardening: bounded frames, per-call wall clock, EOF/error run-token teardown | **DONE** | `4aa6aaf` |
 | R2.1 | Object-level authz at the edge, platform-wide (extends R0.3 seam; git_edge template first) | **DONE** | `083831d` (merge; `fc06f54`) |
 | R2.5 | Real OIDC login at edge; dev-login structurally dead in prod | **DONE** | `fb7fd1e` (merge; `a9e4e57`) |
 | R2.6 | AllowAll removed from main.rs + lint | **DONE** | `3b1fda0` (merge; `e149dee`) + `75223a0` (followup: object-seam default fail-closed → scanner TRUE ZERO) |
@@ -234,7 +235,9 @@ TRUE ZERO).**
 1. **#12 — MCP GovernedRouter not wired in prod** (`new_catalogue_only` → GOVERNANCE_NOT_WIRED; MCP tool
    EXECUTION is not live — fail-closed, not a vuln). Before wiring: inject `HitlVerdictStore::with_pg`; fix the
    latent gate findings (F1 approved-gate-not-single-use → per-effect idem ledger; run_id consult conjunct;
-   durable-panic-not-caught-by-stdio-handler). Product-surface piece (R3-ish).
+   durable-panic-not-caught-by-stdio-handler). Product-surface piece (R3-ish). The stdio transport itself is
+   now bounded, reads a fresh clock per governed call, and tears down the run token on EOF/error (`4aa6aaf`);
+   that does not make tool execution live.
 2. **#13-residual — CI-producer relation:** the report_checks Service-kind floor is coarse (any in-tenant
    Service principal, not the specific ci_producer for that repo/run). Full `repo.report_checks`/`ci_producer`
    fragment relation is the R2+ follow-on; the realistic Human-developer vector is fully closed.
