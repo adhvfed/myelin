@@ -78,7 +78,12 @@ use myelin_events::{ArtifactRef, DataRole, EventDraft, EventType, Visibility};
 use myelin_storage::{BlobStore, ContentHash};
 use myelin_tenancy::TenantId;
 
-pub use myelin_ci_controlplane::{ResolvedJobV1 as ResolvedJob, ResolvedRunPlanV1 as ResolvedSnapshot};
+pub use myelin_ci_controlplane::{
+    CiExecutionRequestV1, ResolvedJobV1, ResolvedJobV2, ResolvedRunPlanV1, ResolvedRunPlanV2,
+    VersionedResolvedRunPlan as ResolvedSnapshot,
+};
+/// Legacy V1 job alias retained for source compatibility.
+pub type ResolvedJob = ResolvedJobV1;
 
 /// Dispatch compatibility helpers for the shared resolved-plan wire.
 pub trait ResolvedSnapshotExt {
@@ -88,7 +93,10 @@ pub trait ResolvedSnapshotExt {
 
 impl ResolvedSnapshotExt for ResolvedSnapshot {
     fn has_dynamic_generation(&self) -> bool {
-        self.jobs.iter().any(|job| job.is_generator)
+        match self {
+            ResolvedSnapshot::V1(plan) => plan.jobs.iter().any(|job| job.is_generator),
+            ResolvedSnapshot::V2(plan) => plan.jobs.iter().any(|job| job.is_generator),
+        }
     }
 }
 
@@ -178,10 +186,28 @@ impl JobDef {
 /// the jobs are the DAG [`resolve_snapshot`] content-addresses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiDefinition {
+    /// Versioned authored request contract. V2 still carries no server launch authority.
+    pub contract: CiPlanContract,
     /// The armed trigger (the `on:` block — compiled to the one `QueryAst`, CI-P10).
     pub on: OnTrigger,
     /// The jobs (the DAG). MUST be non-empty + acyclic — validated in [`resolve_snapshot`].
     pub jobs: Vec<JobDef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CiPlanContract {
+    V1,
+    V2(CiExecutionRequestV1),
+}
+
+impl CiDefinition {
+    pub fn v1(on: OnTrigger, jobs: Vec<JobDef>) -> Self {
+        Self { contract: CiPlanContract::V1, on, jobs }
+    }
+
+    pub fn v2(on: OnTrigger, execution: CiExecutionRequestV1, jobs: Vec<JobDef>) -> Self {
+        Self { contract: CiPlanContract::V2(execution), on, jobs }
+    }
 }
 
 // =================================================================================================
@@ -464,7 +490,7 @@ pub fn resolve_snapshot(
     }
 
     // Resolve + expand. Collect into a Vec, then sort by instance name for the deterministic order.
-    let mut resolved: Vec<ResolvedJob> = Vec::new();
+    let mut resolved: Vec<ResolvedJobV2> = Vec::new();
     for j in &def.jobs {
         // DIGEST-PIN-OR-REJECT (fail-closed). REUSES the frozen ImageRef::digest_pinned rule — NOT a
         // second digest grammar. The real tag→digest registry resolution is CI-P23; here a
@@ -479,7 +505,8 @@ pub fn resolve_snapshot(
             });
         }
         for assignment in expand_matrix(&j.matrix) {
-            resolved.push(ResolvedJob {
+            resolved.push(ResolvedJobV2 {
+                stage: j.name.clone(),
                 name: instance_name(&j.name, &assignment),
                 image: j.image.clone(),
                 command: j.command.clone(),
@@ -507,7 +534,24 @@ pub fn resolve_snapshot(
         if pair[0].name == pair[1].name { return Err(ResolveError::ConcreteNameCollision(pair[0].name.clone())); }
     }
 
-    let snapshot = ResolvedSnapshot { schema_version: myelin_ci_controlplane::run_plan::RUN_PLAN_SCHEMA_V1, jobs: resolved };
+    let snapshot = match &def.contract {
+        CiPlanContract::V1 => ResolvedSnapshot::V1(ResolvedRunPlanV1 {
+            schema_version: myelin_ci_controlplane::RUN_PLAN_SCHEMA_V1,
+            jobs: resolved.into_iter().map(|job| ResolvedJobV1 {
+                name: job.name,
+                image: job.image,
+                command: job.command,
+                needs: job.needs,
+                is_generator: job.is_generator,
+                matrix_key: job.matrix_key,
+            }).collect(),
+        }),
+        CiPlanContract::V2(execution) => ResolvedSnapshot::V2(ResolvedRunPlanV2 {
+            schema_version: myelin_ci_controlplane::RUN_PLAN_SCHEMA_V2,
+            execution: execution.clone(),
+            jobs: resolved,
+        }),
+    };
     let bytes = snapshot.canonical_bytes().map_err(|error| ResolveError::InvalidPlan(error.to_string()))?;
     let address = blobs
         .put(tenant, &bytes)
@@ -816,6 +860,7 @@ mod tests {
     #[test]
     fn a_floating_tag_is_rejected_fail_closed() {
         let def = CiDefinition {
+            contract: CiPlanContract::V1,
             on: OnTrigger::Push,
             jobs: vec![JobDef::normal("build", "alpine:3", ["build"])],
         };
@@ -839,6 +884,7 @@ mod tests {
             "foo@:abc",
         ] {
             let def = CiDefinition {
+                contract: CiPlanContract::V1,
                 on: OnTrigger::Push,
                 jobs: vec![JobDef::normal("j", bad, ["run"])],
             };
@@ -866,7 +912,7 @@ mod tests {
                 (0..10u32).map(|v| v.to_string()).collect(),
             );
         }
-        let def = CiDefinition { on: OnTrigger::Push, jobs: vec![job] };
+        let def = CiDefinition::v1(OnTrigger::Push, vec![job]);
         let err = resolve_snapshot(&def, &blobs(), &tenant())
             .expect_err("an astronomical matrix must be refused");
         assert!(
@@ -879,10 +925,10 @@ mod tests {
         let ok = JobDef::normal("test", PINNED2, ["test"])
             .with_matrix("os", vec!["linux".into(), "mac".into(), "win".into()])
             .with_matrix("v", vec!["1".into(), "2".into(), "3".into(), "4".into()]);
-        let def_ok = CiDefinition { on: OnTrigger::Push, jobs: vec![ok] };
+        let def_ok = CiDefinition::v1(OnTrigger::Push, vec![ok]);
         let (snap, _addr) = resolve_snapshot(&def_ok, &blobs(), &tenant())
             .expect("a modestly-sized matrix resolves");
-        assert_eq!(snap.jobs.len(), 12, "3×4 expands to 12 instances");
+        assert_eq!(snap.as_v1().unwrap().jobs.len(), 12, "3×4 expands to 12 instances");
     }
 
     /// **A digest-pinned definition resolves + content-addresses (the happy path).** Every image is
@@ -891,6 +937,7 @@ mod tests {
     fn a_digest_pinned_definition_resolves_and_content_addresses() {
         let store = blobs();
         let def = CiDefinition {
+            contract: CiPlanContract::V1,
             on: OnTrigger::Push,
             jobs: vec![
                 JobDef::normal("build", PINNED, ["build"]),
@@ -899,7 +946,7 @@ mod tests {
         };
         let (snap, addr) =
             resolve_snapshot(&def, &store, &tenant()).expect("a digest-pinned def resolves");
-        assert_eq!(snap.jobs.len(), 2, "two resolved jobs");
+        assert_eq!(snap.as_v1().unwrap().jobs.len(), 2, "two resolved jobs");
         // The CAS blob exists at the returned address + round-trips to the canonical bytes.
         let bytes = store
             .get(&tenant(), &addr)
@@ -922,6 +969,7 @@ mod tests {
     fn the_matrix_expands_deterministically() {
         let store = blobs();
         let def = CiDefinition {
+            contract: CiPlanContract::V1,
             on: OnTrigger::Push,
             jobs: vec![JobDef::normal("test", PINNED, ["test"])
                 .with_matrix("os", vec!["linux".into(), "macos".into()])
@@ -929,9 +977,9 @@ mod tests {
         };
         let (snap, addr) = resolve_snapshot(&def, &store, &tenant()).expect("resolves");
         // 2 os × 2 rust = 4 instances.
-        assert_eq!(snap.jobs.len(), 4, "the 2×2 matrix expands to 4 instances");
+        assert_eq!(snap.as_v1().unwrap().jobs.len(), 4, "the 2×2 matrix expands to 4 instances");
         // Instance names are rendered in SORTED axis order (os before rust) + sorted overall.
-        let names: Vec<&str> = snap.jobs.iter().map(|j| j.name.as_str()).collect();
+        let names: Vec<&str> = snap.as_v1().unwrap().jobs.iter().map(|j| j.name.as_str()).collect();
         assert_eq!(names.len(), 4);
         assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(names.iter().all(|name| name.starts_with("test--")));
@@ -945,7 +993,7 @@ mod tests {
 
     #[test]
     fn command_hash_and_concrete_matrix_fan_in_are_deterministic() {
-        let definition = |command: &str| CiDefinition { on: OnTrigger::Push, jobs: vec![
+        let definition = |command: &str| CiDefinition { contract: CiPlanContract::V1, on: OnTrigger::Push, jobs: vec![
             JobDef::normal("build", PINNED, [command]).with_matrix("os", vec!["linux".into(), "macos".into()]),
             JobDef::normal("test", PINNED2, ["test"]).with_needs(["build"])
                 .with_matrix("rust", vec!["stable".into(), "beta".into()]),
@@ -955,10 +1003,10 @@ mod tests {
         let (_, changed) = resolve_snapshot(&definition("build-v2"), &blobs(), &tenant()).unwrap();
         assert_eq!(hash, repeat);
         assert_ne!(hash, changed);
-        let builds: Vec<String> = first.jobs.iter().filter(|job| job.name.starts_with("build--"))
+        let builds: Vec<String> = first.as_v1().unwrap().jobs.iter().filter(|job| job.name.starts_with("build--"))
             .map(|job| job.name.clone()).collect();
         assert_eq!(builds.len(), 2);
-        for test in first.jobs.iter().filter(|job| job.name.starts_with("test--")) {
+        for test in first.as_v1().unwrap().jobs.iter().filter(|job| job.name.starts_with("test--")) {
             assert_eq!(test.needs, builds);
         }
     }
@@ -966,15 +1014,15 @@ mod tests {
     #[test]
     fn malformed_programmatic_plans_fail_closed_without_name_collisions() {
         let prefix = "a".repeat(70);
-        let def = CiDefinition { on: OnTrigger::Push, jobs: vec![
+        let def = CiDefinition { contract: CiPlanContract::V1, on: OnTrigger::Push, jobs: vec![
             JobDef::normal(format!("{prefix}x"), PINNED, ["a"]).with_matrix("os", vec!["linux".into()]),
             JobDef::normal(format!("{prefix}y"), PINNED2, ["b"]).with_matrix("os", vec!["linux".into()]),
         ] };
         let (plan, _) = resolve_snapshot(&def, &blobs(), &tenant()).unwrap();
-        assert_ne!(plan.jobs[0].name, plan.jobs[1].name);
-        let bad = CiDefinition { on: OnTrigger::Push, jobs: vec![JobDef::normal("unicode-雪", PINNED, ["run"])] };
+        assert_ne!(plan.as_v1().unwrap().jobs[0].name, plan.as_v1().unwrap().jobs[1].name);
+        let bad = CiDefinition { contract: CiPlanContract::V1, on: OnTrigger::Push, jobs: vec![JobDef::normal("unicode-雪", PINNED, ["run"])] };
         assert!(matches!(resolve_snapshot(&bad, &blobs(), &tenant()), Err(ResolveError::InvalidPlan(_))));
-        let empty = CiDefinition { on: OnTrigger::Push, jobs: vec![JobDef::normal("build", PINNED, std::iter::empty::<String>())] };
+        let empty = CiDefinition { contract: CiPlanContract::V1, on: OnTrigger::Push, jobs: vec![JobDef::normal("build", PINNED, std::iter::empty::<String>())] };
         assert!(matches!(resolve_snapshot(&empty, &blobs(), &tenant()), Err(ResolveError::InvalidPlan(_))));
     }
 
@@ -997,6 +1045,7 @@ mod tests {
         assert_eq!(
             resolve_snapshot(
                 &CiDefinition {
+                    contract: CiPlanContract::V1,
                     on: OnTrigger::Push,
                     jobs: vec![]
                 },
@@ -1009,6 +1058,7 @@ mod tests {
         assert!(matches!(
             resolve_snapshot(
                 &CiDefinition {
+                    contract: CiPlanContract::V1,
                     on: OnTrigger::Push,
                     jobs: vec![JobDef::normal("a", PINNED, ["a"]).with_needs(["ghost"])],
                 },
@@ -1021,6 +1071,7 @@ mod tests {
         assert_eq!(
             resolve_snapshot(
                 &CiDefinition {
+                    contract: CiPlanContract::V1,
                     on: OnTrigger::Push,
                     jobs: vec![
                         JobDef::normal("a", PINNED, ["a"]).with_needs(["b"]),
@@ -1036,6 +1087,7 @@ mod tests {
         assert!(matches!(
             resolve_snapshot(
                 &CiDefinition {
+                    contract: CiPlanContract::V1,
                     on: OnTrigger::Push,
                     jobs: vec![JobDef::normal("a", PINNED, ["a"]), JobDef::normal("a", PINNED2, ["a"])],
                 },
@@ -1045,12 +1097,12 @@ mod tests {
             Err(ResolveError::DuplicateJob(n)) if n == "a"
         ));
         assert_eq!(
-            resolve_snapshot(&CiDefinition { on: OnTrigger::Push,
+            resolve_snapshot(&CiDefinition { contract: CiPlanContract::V1, on: OnTrigger::Push,
                 jobs: vec![JobDef::normal("a", PINNED, ["a"]).with_needs(["a"])] }, &store, &tenant()),
             Err(ResolveError::SelfNeed("a".into()))
         );
         assert_eq!(
-            resolve_snapshot(&CiDefinition { on: OnTrigger::Push, jobs: vec![
+            resolve_snapshot(&CiDefinition { contract: CiPlanContract::V1, on: OnTrigger::Push, jobs: vec![
                 JobDef::normal("a", PINNED, ["a"]),
                 JobDef::normal("b", PINNED2, ["b"]).with_needs(["a", "a"]),
             ] }, &store, &tenant()),
@@ -1067,12 +1119,14 @@ mod tests {
     #[test]
     fn dynamic_generation_is_refused_until_fragment_ingestion_exists() {
         let def = CiDefinition {
+            contract: CiPlanContract::V1,
             on: OnTrigger::Push,
             jobs: vec![JobDef::normal("gen-matrix", PINNED, ["generate"]).as_generator()],
         };
         assert!(matches!(resolve_snapshot(&def, &blobs(), &tenant()), Err(ResolveError::InvalidPlan(_))));
         // A normal definition has no generator.
         let plain = CiDefinition {
+            contract: CiPlanContract::V1,
             on: OnTrigger::Push,
             jobs: vec![JobDef::normal("build", PINNED, ["build"])],
         };

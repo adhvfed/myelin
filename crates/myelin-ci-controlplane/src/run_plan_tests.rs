@@ -105,6 +105,30 @@ fn valid_plan() -> ResolvedRunPlanV1 {
     }
 }
 
+fn valid_plan_v2() -> ResolvedRunPlanV2 {
+    let convert = |stage: &str, job: ResolvedJobV1| ResolvedJobV2 {
+        stage: stage.into(),
+        name: job.name,
+        image: job.image,
+        command: job.command,
+        needs: job.needs,
+        is_generator: job.is_generator,
+        matrix_key: job.matrix_key,
+    };
+    let build = convert("build", job("build"));
+    let mut test = job("test--os-linux");
+    test.needs.push("build".into());
+    test.matrix_key.insert("os".into(), "linux".into());
+    ResolvedRunPlanV2 {
+        schema_version: RUN_PLAN_SCHEMA_V2,
+        execution: CiExecutionRequestV1 {
+            schema_version: EXECUTION_REQUEST_SCHEMA_V1,
+            profile: CiExecutionProfileV1::LinuxSmallV1,
+        },
+        jobs: vec![build, convert("test", test)],
+    }
+}
+
 fn run_for(hash: &ContentHash) -> CiRunRecord {
     CiRunRecord {
         tenant_id: "tenant_01".into(),
@@ -180,10 +204,66 @@ fn canonical_bytes_are_stable_and_matrix_identity_is_collision_safe() {
     assert_ne!(left.matrix_identity(), right.matrix_identity());
 
     let plan = valid_plan();
+    let bytes = plan.canonical_bytes().expect("first");
+    assert_eq!(bytes, plan.canonical_bytes().expect("second"));
     assert_eq!(
-        plan.canonical_bytes().expect("first"),
-        plan.canonical_bytes().expect("second")
+        bytes,
+        concat!(
+            "{\"schema_version\":1,\"jobs\":[",
+            "{\"name\":\"build\",\"image\":\"registry.example/build@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"command\":[\"/bin/test\",\"--locked\"],\"needs\":[],\"is_generator\":false,\"matrix_key\":{}},",
+            "{\"name\":\"test\",\"image\":\"registry.example/build@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"command\":[\"/bin/test\",\"--locked\"],\"needs\":[\"build\"],\"is_generator\":false,\"matrix_key\":{}}]}"
+        )
+        .as_bytes(),
+        "the V1 wire stays byte-identical"
     );
+}
+
+#[test]
+fn version_two_canonical_wire_and_launch_request_digest_are_pinned() {
+    let plan = valid_plan_v2();
+    let bytes = plan.canonical_bytes().expect("canonical V2 plan");
+    let expected = concat!(
+        "{\"schema_version\":2,\"execution\":{\"schema_version\":1,\"profile\":\"linux-small-v1\"},\"jobs\":[",
+        "{\"stage\":\"build\",\"name\":\"build\",\"image\":\"registry.example/build@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"command\":[\"/bin/test\",\"--locked\"],\"needs\":[],\"is_generator\":false,\"matrix_key\":{}},",
+        "{\"stage\":\"test\",\"name\":\"test--os-linux\",\"image\":\"registry.example/build@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"command\":[\"/bin/test\",\"--locked\"],\"needs\":[\"build\"],\"is_generator\":false,\"matrix_key\":{\"os\":\"linux\"}}]}"
+    );
+    assert_eq!(bytes, expected.as_bytes());
+    assert_eq!(
+        decode_resolved_run_plan(&bytes).expect("decode canonical V2"),
+        VersionedResolvedRunPlan::V2(plan.clone())
+    );
+    assert_eq!(
+        plan.launch_request_digest_v1().expect("request digest"),
+        "blake3:07a06867c66a3396296e6524af5572a55b22ce1c1433e4630961aac707e708b6"
+    );
+}
+
+#[test]
+fn version_two_stage_and_static_dag_rules_are_fail_closed() {
+    let mut bad_stage = valid_plan_v2();
+    bad_stage.jobs[0].stage = "bad stage".into();
+    assert!(matches!(
+        bad_stage.canonical_bytes(),
+        Err(RunPlanError::InvalidPlan { detail }) if detail.contains("stage")
+    ));
+
+    let mut generator = valid_plan_v2();
+    generator.jobs[0].is_generator = true;
+    assert!(matches!(
+        generator.canonical_bytes(),
+        Err(RunPlanError::InvalidPlan { detail }) if detail.contains("fragment ingestion")
+    ));
+
+    let unknown = valid_plan_v2().canonical_bytes().unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&unknown).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("trust_tier".into(), serde_json::json!("trusted"));
+    assert!(matches!(
+        decode_resolved_run_plan(&serde_json::to_vec(&value).unwrap()),
+        Err(RunPlanError::WireMalformed { .. })
+    ));
 }
 
 #[test]
@@ -354,8 +434,8 @@ fn legacy_and_unknown_versions_loudly_require_redispatch() {
             RedispatchReason::LegacyUnversioned,
         ),
         (
-            br#"{"schema_version":2,"jobs":[]}"#.to_vec(),
-            RedispatchReason::UnsupportedVersion(2),
+            br#"{"schema_version":3,"jobs":[]}"#.to_vec(),
+            RedispatchReason::UnsupportedVersion(3),
         ),
     ] {
         let (store, run) = store_and_run(bytes);
@@ -363,6 +443,30 @@ fn legacy_and_unknown_versions_loudly_require_redispatch() {
         assert_eq!(error, RunPlanError::RedispatchRequired(reason));
         assert!(error.requires_redispatch());
     }
+}
+
+#[test]
+fn current_v1_starter_loader_explicitly_refuses_v2_without_launch_authority() {
+    let bytes = valid_plan_v2().canonical_bytes().unwrap();
+    let (store, run) = store_and_run(bytes);
+    assert_eq!(
+        load_resolved_run_plan(&store, &run),
+        Err(RunPlanError::LaunchAuthorityRequired {
+            version: RUN_PLAN_SCHEMA_V2,
+        })
+    );
+}
+
+#[test]
+fn public_versioned_decoder_refuses_oversized_input_before_parsing() {
+    let bytes = vec![b' '; MAX_RUN_PLAN_BYTES + 1];
+    assert_eq!(
+        decode_resolved_run_plan(&bytes),
+        Err(RunPlanError::SnapshotTooLarge {
+            actual: MAX_RUN_PLAN_BYTES + 1,
+            maximum: MAX_RUN_PLAN_BYTES,
+        })
+    );
 }
 
 #[test]
