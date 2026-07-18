@@ -217,6 +217,18 @@ async fn assert_atomic_started(
     );
 }
 
+type CiJobLedgerRow = (
+    sqlx::types::Uuid,
+    String,
+    String,
+    Vec<sqlx::types::Uuid>,
+    Option<serde_json::Value>,
+    String,
+    String,
+    i32,
+    Option<serde_json::Value>,
+);
+
 async fn assert_exact_jobs(admin: &PgPool, tenant: &str, run_id: &str) {
     let snapshot: String = sqlx::query_scalar(
         "SELECT definition_snapshot FROM ci_run WHERE tenant_id=$1 AND run_id=$2::uuid",
@@ -243,17 +255,7 @@ async fn assert_exact_jobs(admin: &PgPool, tenant: &str, run_id: &str) {
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let rows: Vec<(
-        sqlx::types::Uuid,
-        String,
-        String,
-        Vec<sqlx::types::Uuid>,
-        Option<serde_json::Value>,
-        String,
-        String,
-        i32,
-        Option<serde_json::Value>,
-    )> = sqlx::query_as(
+    let rows: Vec<CiJobLedgerRow> = sqlx::query_as(
         "SELECT job_id, stage, name, needs, matrix_key, spec_ref, state, attempt, result_summary \
          FROM ci_job WHERE tenant_id=$1 AND run_id=$2::uuid ORDER BY name",
     )

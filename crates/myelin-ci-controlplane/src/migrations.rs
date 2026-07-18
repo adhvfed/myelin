@@ -119,6 +119,8 @@ pub const CI_JOB_RUN_LEDGER_INDEX: &str = "ci_job_run_ledger";
 /// Forward-only migration id for [`CI_JOB_RUN_LEDGER_INDEX`]. Kept separate from the already-applied
 /// `ci_0002_ci_job` table/RLS migration so its checksum is never rewritten.
 pub const CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID: &str = "ci_0002a_ci_job_run_ledger";
+/// Forward-only postcondition check for [`CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID`].
+pub const CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID: &str = "ci_0002b_validate_ci_job_run_ledger";
 
 // ============================================================================================
 // The forward-only CREATE-TABLE DDL constants (arch 01 §3, verbatim intent; tenant_id/region named
@@ -180,6 +182,35 @@ CREATE TABLE IF NOT EXISTS ci_job (
 /// applied `ci_0002_ci_job` table/RLS migration remains byte-identical.
 pub const CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL: &str =
     "CREATE INDEX CONCURRENTLY IF NOT EXISTS ci_job_run_ledger ON ci_job (tenant_id, region, run_id)";
+
+/// Fail startup when `CREATE INDEX CONCURRENTLY IF NOT EXISTS` encountered a same-named index left
+/// invalid or not ready by an interrupted prior build. Catalog identity is constrained to the exact
+/// index and table in the active migration schema, not merely a same-named object on the search path.
+pub const VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL: &str = "\
+DO $myelin$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_index AS index_state
+      JOIN pg_catalog.pg_class AS index_relation
+        ON index_relation.oid = index_state.indexrelid
+      JOIN pg_catalog.pg_class AS table_relation
+        ON table_relation.oid = index_state.indrelid
+      JOIN pg_catalog.pg_namespace AS relation_namespace
+        ON relation_namespace.oid = table_relation.relnamespace
+     WHERE relation_namespace.nspname = current_schema()
+       AND table_relation.relname = 'ci_job'
+       AND table_relation.relkind = 'r'
+       AND index_relation.relnamespace = relation_namespace.oid
+       AND index_relation.relname = 'ci_job_run_ledger'
+       AND index_relation.relkind = 'i'
+       AND index_state.indisvalid
+       AND index_state.indisready
+  ) THEN
+    RAISE EXCEPTION 'ci_job_run_ledger on %.ci_job is missing, invalid, or not ready; verify the index exists, then repair it with REINDEX INDEX CONCURRENTLY %.ci_job_run_ledger before restarting', current_schema(), current_schema();
+  END IF;
+END
+$myelin$";
 
 /// `check_attempt` (arch 01 §3.2) — the per-`(commit_oid, context)` monotonic attempt counter; CI's
 /// source of `run_attempt` for the X-1 CheckStatus fact. HOT (bumped on each re-dispatch).
@@ -542,9 +573,10 @@ pub fn make_tenant_scoped_ddl(table: &str) -> String {
 
 /// **The complete CI Control-Plane forward-only migration set** (contract 1.5 / 11.1; arch 01 §3).
 /// One table/RLS [`Migration`] per table, in FK-dependency order, plus four separately versioned
-/// `CREATE INDEX CONCURRENTLY` migrations: the run-ledger index immediately after `ci_job`, and the
-/// three scheduler indexes immediately after `job_queue`. Keeping each concurrent index as one
-/// top-level command makes the same set executable by live PostgreSQL.
+/// `CREATE INDEX CONCURRENTLY` migrations and one post-index validation migration: the run-ledger
+/// index and validator immediately after `ci_job`, and the three scheduler indexes immediately after
+/// `job_queue`. Keeping each concurrent index as one top-level command makes the same set executable
+/// by live PostgreSQL.
 ///
 /// Compatibility: the prior `ci_0004_job_queue` bundled these concurrent indexes into one
 /// multi-statement command. PostgreSQL rejected that command atomically before [`PgMigrator`]
@@ -563,6 +595,11 @@ pub fn ci_controlplane_migrations() -> Migrations {
             migrations.push(Migration::plain_on(
                 CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID,
                 CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
+                CI_JOB_TABLE,
+            ));
+            migrations.push(Migration::plain_on(
+                CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID,
+                VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
                 CI_JOB_TABLE,
             ));
         }
@@ -700,8 +737,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            19,
-            "15 table/RLS + 4 concurrent-index migrations"
+            20,
+            "15 table/RLS + 4 concurrent-index + 1 index-validation migrations"
         );
         for m in &migrations.0 {
             assert!(
@@ -721,11 +758,13 @@ mod tests {
                     "table migration {} installs the platform RLS policy",
                     m.id
                 );
+            } else if m.id == CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID {
+                assert_eq!(m.ddl, VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL);
             } else {
                 assert!(
                     m.ddl.starts_with("CREATE INDEX CONCURRENTLY")
                         || m.ddl.starts_with("CREATE UNIQUE INDEX CONCURRENTLY"),
-                    "the only non-table migrations are concurrent indexes: {}",
+                    "the only other non-table migrations are concurrent indexes: {}",
                     m.id
                 );
                 assert_eq!(
@@ -751,8 +790,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            19,
-            "the runner applied all 15 table/RLS and 4 concurrent-index migrations"
+            20,
+            "the runner applied all 15 table/RLS, 4 concurrent-index, and 1 index-validation migrations"
         );
         assert_eq!(
             runner.applied()[0],
@@ -848,7 +887,8 @@ mod tests {
     }
 
     /// The canonical DAG ledger lookup is an additive, separately versioned concurrent index placed
-    /// directly after the immutable `ci_0002_ci_job` table/RLS migration.
+    /// directly after the immutable `ci_0002_ci_job` table/RLS migration, followed by an exact
+    /// catalog postcondition validator.
     #[test]
     fn ci_job_run_ledger_index_is_exact_cell_separate_and_ordered() {
         assert_eq!(CI_JOB_RUN_LEDGER_INDEX, "ci_job_run_ledger");
@@ -877,16 +917,42 @@ mod tests {
             .iter()
             .position(|migration| migration.id == CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID)
             .expect("separate ci_job ledger-index migration");
+        let validation_pos = migrations
+            .0
+            .iter()
+            .position(|migration| migration.id == CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID)
+            .expect("separate ci_job ledger-index validation migration");
         let next_table_pos = migrations
             .0
             .iter()
             .position(|migration| migration.id == "ci_0003_check_attempt")
             .expect("next table migration");
         assert_eq!(index_pos, table_pos + 1);
-        assert_eq!(next_table_pos, index_pos + 1);
+        assert_eq!(validation_pos, index_pos + 1);
+        assert_eq!(next_table_pos, validation_pos + 1);
         let migration = &migrations.0[index_pos];
         assert_eq!(migration.table, Some(CI_JOB_TABLE));
         assert_eq!(migration.ddl, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL);
+        let validation = &migrations.0[validation_pos];
+        assert_eq!(validation.table, Some(CI_JOB_TABLE));
+        assert_eq!(validation.ddl, VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL);
+        for required_catalog_fragment in [
+            "FROM pg_catalog.pg_index AS index_state",
+            "JOIN pg_catalog.pg_class AS index_relation",
+            "JOIN pg_catalog.pg_class AS table_relation",
+            "JOIN pg_catalog.pg_namespace AS relation_namespace",
+            "relation_namespace.nspname = current_schema()",
+            "table_relation.relname = 'ci_job'",
+            "index_relation.relname = 'ci_job_run_ledger'",
+            "index_state.indisvalid",
+            "index_state.indisready",
+            "REINDEX INDEX CONCURRENTLY",
+        ] {
+            assert!(
+                validation.ddl.contains(required_catalog_fragment),
+                "validator pins `{required_catalog_fragment}`"
+            );
+        }
     }
 
     /// **The frozen value-set vocabularies are CHECK constraints, not enum types (forward-only
