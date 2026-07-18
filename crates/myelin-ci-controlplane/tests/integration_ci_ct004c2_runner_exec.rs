@@ -32,7 +32,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use myelin_ci_controlplane::{
-    ci_job_queue_store, ci_region_queue_store, DurableEnqueue, DurableLeaseAdapter, DurableLogPersist, EnqueueOutcome,
+    ci_job_queue_store, ci_region_queue_store_test_support, DurableEnqueue, DurableLeaseAdapter, DurableLogPersist, EnqueueOutcome,
     JobSpecResolver, Lane, LeasedJob, LogPipelineSink, CREATE_FAIR_DEFICIT_DDL,
     CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL,
 };
@@ -288,7 +288,7 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
     let admin = admin_pool("e2e").await;
     create_schema(&admin, &schema).await;
     let store = ci_job_queue_store(admin.clone());
-    let region_store = ci_region_queue_store(admin.clone());
+    let region_store = ci_region_queue_store_test_support(admin.clone());
 
     // The durable run id is a uuid; the executor's started run must carry the SAME id (job.done target).
     let run_uuid = uid("e2e-run").to_string();
@@ -442,7 +442,7 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
     create_schema(&admin, &schema).await;
     create_log_tables(&admin).await;
     let store = ci_job_queue_store(admin.clone());
-    let region_store = ci_region_queue_store(admin.clone());
+    let region_store = ci_region_queue_store_test_support(admin.clone());
 
     let run_uuid = uid("capstone-run").to_string();
     let idem = job_idem_token(&run_uuid, "ci.pipeline:0");
@@ -569,7 +569,7 @@ async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
     let admin = admin_pool("tier").await;
     create_schema(&admin, &schema).await;
     let store = ci_job_queue_store(admin.clone());
-    let region_store = ci_region_queue_store(admin.clone());
+    let region_store = ci_region_queue_store_test_support(admin.clone());
 
     // ONLY an untrusted_fork job is queued (linux, in-region).
     let fork = enq(tenant, region, "fork-job", "fork-run", TrustTier::UntrustedFork, &["linux"], "idem-fork");
@@ -630,7 +630,7 @@ async fn region_a_runner_never_claims_region_b_job() {
     let admin = admin_pool("region").await;
     create_schema(&admin, &schema).await;
     let store = ci_job_queue_store(admin.clone());
-    let region_store = ci_region_queue_store(admin.clone());
+    let region_store = ci_region_queue_store_test_support(admin.clone());
 
     // A trusted linux job in region B only.
     let jb = enq(tenant, "de-fra", "rb-job", "rb-run", TrustTier::Trusted, &["linux"], "idem-rb");
@@ -673,7 +673,7 @@ async fn stolen_lease_fails_heartbeat_no_double_run() {
     let admin = admin_pool("steal").await;
     create_schema(&admin, &schema).await;
     let store = ci_job_queue_store(admin.clone());
-    let region_store = ci_region_queue_store(admin.clone());
+    let region_store = ci_region_queue_store_test_support(admin.clone());
 
     let job = enq(tenant, region, "steal-job", "steal-run", TrustTier::Trusted, &["linux"], "idem-steal");
     store.enqueue(&job).await.expect("enqueue");

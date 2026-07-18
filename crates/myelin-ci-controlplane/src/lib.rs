@@ -706,9 +706,11 @@ pub fn ci_job_queue_store(pool: sqlx::PgPool) -> CiJobQueueStore {
     CiJobQueueStore::with_pg(pool)
 }
 
-/// Construct the cross-tenant region scheduler store over its separately authenticated and probed
-/// scheduler pool. This capability exposes only claim/reap; never pass the tenant application pool.
-pub fn ci_region_queue_store(pool: sqlx::PgPool) -> CiRegionQueueStore {
+/// Test-only raw-pool seam for legacy scheduler algorithm integration fixtures. Production must
+/// construct this capability only through [`CiSchedulerDbProvider::region_queue_store`].
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn ci_region_queue_store_test_support(pool: sqlx::PgPool) -> CiRegionQueueStore {
     CiRegionQueueStore::with_pg(pool)
 }
 

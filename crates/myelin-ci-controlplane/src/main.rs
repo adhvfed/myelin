@@ -17,8 +17,9 @@
 //! `outbox` table (`OutboxStore::durable(PgOutboxBacking)`) over the MR-022 `SubstrateProvider`
 //! runtime pool, after a privileged migration pool applies the complete schema and is destroyed —
 //! committed events survive a process restart. **FAIL LOUD on missing durable config** (the W3b.4
-//! service-main pattern): missing/distinct `DATABASE_URL` and `DATABASE_MIGRATION_URL`, an
-//! unreachable pool, or a failed migration each exit non-zero — NEVER a silent in-memory fallback
+//! service-main pattern): missing/distinct `DATABASE_URL`, `DATABASE_MIGRATION_URL`, and
+//! `MYELIN_CI_SCHEDULER_DATABASE_URL`, an unreachable pool, or a failed migration each exit
+//! non-zero — NEVER a silent in-memory fallback
 //! (the in-memory
 //! `OutboxStore::new()` is `test-support`-gated and does not even compile here).
 //!

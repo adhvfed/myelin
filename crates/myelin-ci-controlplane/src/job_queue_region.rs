@@ -53,7 +53,7 @@ pub struct CiRegionQueueStore {
 
 impl CiRegionQueueStore {
     /// Bind the dedicated, startup-probed region-scheduler pool.
-    pub fn with_pg(pool: PgPool) -> Self {
+    pub(crate) fn with_pg(pool: PgPool) -> Self {
         Self { pool }
     }
 
