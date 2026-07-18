@@ -217,7 +217,7 @@ pub const SERVICE_NAME: &str = "identity";
 /// P-S15). The PII columns (email/display_name) are NOT in this skeletal DDL; they live encrypted
 /// under the per-subject DEK ([`principal_store::PrincipalProfile`], 11.3/11.4) — the DDL holds the
 /// `profile_ref` (the erasable handle), keeping the §X-7 split structural. Forward-only.
-fn identity_migrations() -> Migrations {
+pub fn identity_service_migrations() -> Migrations {
     Migrations::of([
         Migration::plain(
             "0100_identity_schema_marker",
@@ -1737,7 +1737,7 @@ pub fn identity_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
         config,
-        migrations: identity_migrations(),
+        migrations: identity_service_migrations(),
         hot_tables: myelin_substrate::HotTables::none(),
         // The public surface (gateway-fronted, tenant-from-token); the authenticate route bodies
         // are P-ID-06/07. The harness opens the live tenant-from-token PublicSurface (P-S13).

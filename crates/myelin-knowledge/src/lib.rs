@@ -324,7 +324,7 @@ pub const HOT_TABLES: [&str; 3] = ["block", "db_row", "doc_op"];
 /// `(tenant, region)`-partitioned with the hot-table flags on `block`/`db_row`/`doc_op`. The chain
 /// stays forward-only (the marker, then the additive `02xx_*` table DDL — no backward/destructive
 /// migration). The outbox table + the relay/consumer wiring remains the KN-P06 follow-on.
-fn knowledge_migrations() -> Migrations {
+pub fn knowledge_service_migrations() -> Migrations {
     let mut migrations = vec![Migration::plain(
         "0200_knowledge_schema_marker",
         "CREATE TABLE IF NOT EXISTS knowledge_schema_marker (applied_at TEXT)",
@@ -563,7 +563,7 @@ pub fn knowledge_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
         config,
-        migrations: knowledge_migrations(),
+        migrations: knowledge_service_migrations(),
         // The hot-table flags (contract 1.5) — declared here so the high-write tables KN-P05
         // creates (block / db_row / doc_op) are protected by the expand→backfill→contract online
         // runner from the first migration. The runner refuses a blocking ALTER on one at boot.
@@ -794,7 +794,7 @@ mod tests {
     /// `forward-only-migration` lint (P-S11) enforces the same over source.
     #[test]
     fn migrations_are_forward_only() {
-        let migrations = knowledge_migrations();
+        let migrations = knowledge_service_migrations();
         for m in &migrations.0 {
             assert!(
                 !myelin_substrate::is_destructive(m.ddl),
