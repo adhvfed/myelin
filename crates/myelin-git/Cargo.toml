@@ -94,8 +94,8 @@ serde_json.workspace = true
 # `cargo build --workspace` stays DB-free (the binding data-layer policy). The live `check_status`
 # table + the same-tx idempotent-on-`event_id` + monotonic supersession apply (contract 5.9 / X-1 §6.1)
 # is proven against the dev Postgres stack by `tests/integration_git_d10_check_status_projection.rs`.
-sqlx = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
+sqlx.workspace = true
+tokio.workspace = true
 myelin-config = { workspace = true, optional = true }
 
 # BLAKE3 content-addresses the IMMUTABLE git commit object (GIT-P25 / P-ID-25, M3): the commit OID
@@ -191,4 +191,4 @@ toml.workspace = true
 # stays DB-free; proven green against the docker-compose dev Postgres stack.
 # `myelin-storage/integration` pulls in the REAL `ValkeyCache` (the `fork:<pr_id>` cache-confinement
 # integration test, GIT-P22 / P-284, `tests/integration_git_p22_fork_cache_confinement.rs`).
-integration = ["dep:sqlx", "dep:tokio", "dep:myelin-config", "myelin-storage/integration"]
+integration = ["dep:myelin-config", "myelin-storage/integration"]

@@ -250,6 +250,8 @@ pub mod reconcile;
 /// conversations) and advances the target ref via the durable per-ref CAS ONLY on a fully-admitted gate —
 /// never a policy bypass. The PG home for these rows (MR-022 provider) is the named GT-003b follow-on.
 pub mod pr_store;
+/// GT-003b — the forward-only PostgreSQL PR lifecycle schema and provider-backed store.
+pub mod pg_pr_store;
 /// **R3.3 / R3.2 (shared) — the DURABLE PR review-thread / comment / review-batch store.** The ONE
 /// canonical conversation store both R3 packs consume (the `_gate.md` §02/§03 cross-pack
 /// reconciliation): the model is THREADS (an optional content anchor; comments belong to threads);

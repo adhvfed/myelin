@@ -122,7 +122,10 @@ impl ReviewRecord {
         matches!(self.state, ReviewState::Submitted(ReviewVerdict::Approve))
     }
     fn is_blocking(&self) -> bool {
-        matches!(self.state, ReviewState::Submitted(ReviewVerdict::RequestChanges))
+        matches!(
+            self.state,
+            ReviewState::Submitted(ReviewVerdict::RequestChanges)
+        )
     }
 }
 
@@ -167,6 +170,13 @@ pub struct PrRecord {
     pub base_ref: String,
     /// The head ref the PR proposes to land.
     pub head_ref: String,
+    /// The repository that AUTHORITATIVELY owns `head_ref` and `head_oid`.
+    ///
+    /// New production rows always persist this explicitly. The empty default exists only so legacy
+    /// filesystem records remain importable; callers must resolve it to the target repository during
+    /// import and must never treat an empty value as fork-trust evidence.
+    #[serde(default)]
+    pub head_repo_slug: String,
     /// The head commit oid a merge advances `base_ref` to (validated as a real FF target at merge).
     pub head_oid: String,
     /// The PR author's OPAQUE pseudonym (GIT-1) — a self-approval by this pseudonym does NOT count.
@@ -200,6 +210,7 @@ impl PrRecord {
             state: pr.state,
             base_ref: pr.base_ref.clone(),
             head_ref: pr.head_ref.clone(),
+            head_repo_slug: String::new(),
             head_oid: head_oid.into(),
             author_pseudonym: pr.author_pseudonym.clone(),
             reviews: Vec::new(),
@@ -398,7 +409,12 @@ impl std::fmt::Display for GateInputError {
 }
 impl std::error::Error for GateInputError {}
 
-fn synthetic_fact(head: &GitOid, ctx: CheckContext, state: CheckState, trust: TrustTier) -> CheckStatus {
+fn synthetic_fact(
+    head: &GitOid,
+    ctx: CheckContext,
+    state: CheckState,
+    trust: TrustTier,
+) -> CheckStatus {
     use myelin_tenancy::{ArtifactRef, TenantId};
     CheckStatus {
         tenant: TenantId("_gate".into()),
@@ -438,10 +454,20 @@ pub fn evaluate_merge(
         crate::merge_gate::parse_required_context(s).map_err(|e| GateInputError(e.to_string()))
     };
     for c in &rec.green_contexts {
-        proj.apply(&synthetic_fact(&head, parse(c)?, CheckState::Success, TrustTier::Trusted));
+        proj.apply(&synthetic_fact(
+            &head,
+            parse(c)?,
+            CheckState::Success,
+            TrustTier::Trusted,
+        ));
     }
     for c in &rec.fork_unendorsed_contexts {
-        proj.apply(&synthetic_fact(&head, parse(c)?, CheckState::Success, TrustTier::UntrustedFork));
+        proj.apply(&synthetic_fact(
+            &head,
+            parse(c)?,
+            CheckState::Success,
+            TrustTier::UntrustedFork,
+        ));
     }
     let endorsed: Vec<CheckContext> = rec
         .endorsed_contexts
@@ -564,10 +590,9 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
     ) -> Result<Option<BranchProtectionConfig>, DurableError> {
         let path = self.protection_path(repo)?;
         match std::fs::read(&path) {
-            Ok(bytes) => Ok(Some(
-                serde_json::from_slice(&bytes)
-                    .map_err(|e| DurableError::Io(format!("parse {}: {e}", path.display())))?,
-            )),
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|e| {
+                DurableError::Io(format!("parse {}: {e}", path.display()))
+            })?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(DurableError::Io(format!("read {}: {e}", path.display()))),
         }
@@ -598,10 +623,9 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
     pub fn get(&self, repo: &RepoLoc, number: u64) -> Result<Option<PrRecord>, DurableError> {
         let path = self.pr_path(repo, number)?;
         match std::fs::read(&path) {
-            Ok(bytes) => Ok(Some(
-                serde_json::from_slice(&bytes)
-                    .map_err(|e| DurableError::Io(format!("parse {}: {e}", path.display())))?,
-            )),
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|e| {
+                DurableError::Io(format!("parse {}: {e}", path.display()))
+            })?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(DurableError::Io(format!("read {}: {e}", path.display()))),
         }
@@ -837,12 +861,32 @@ mod tests {
     /// left pointing at c1.
     fn seed_main_then_descendant(repo: &DurableGitRepo) -> (CoreOid, CoreOid) {
         let (c1, _b1, _p1) = repo
-            .build_file_commit("refs/heads/main", "a.txt", b"v1\n", "c1", "psn@acme.noreply", "psn@acme.noreply")
+            .build_file_commit(
+                "refs/heads/main",
+                "a.txt",
+                b"v1\n",
+                "c1",
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
             .unwrap();
-        repo.update_ref_cas("refs/heads/main", None, Some(&c1), "create", "psn@acme.noreply")
-            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&c1),
+            "create",
+            "psn@acme.noreply",
+        )
+        .unwrap();
         let (c2, _b2, _p2) = repo
-            .build_file_commit("refs/heads/main", "a.txt", b"v2\n", "c2", "psn@acme.noreply", "psn@acme.noreply")
+            .build_file_commit(
+                "refs/heads/main",
+                "a.txt",
+                b"v2\n",
+                "c2",
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
             .unwrap();
         (c1, c2)
     }
@@ -936,7 +980,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(back.title, "R2.4 MCP HITL server-side verdicts");
-        assert_eq!(back.body_md.as_deref(), Some("The gate withholds until a human approves."));
+        assert_eq!(
+            back.body_md.as_deref(),
+            Some("The gate withholds until a human approves.")
+        );
         assert!(back.author_is_agent);
         assert_eq!(back.updated_at, Some(1_752_000_000));
         std::fs::remove_dir_all(&root).ok();
@@ -966,7 +1013,10 @@ mod tests {
         });
         let rec: PrRecord = serde_json::from_value(legacy).expect("legacy record deserializes");
         assert_eq!(rec.number, 7);
-        assert_eq!(rec.title, "", "no title → empty (the list renders #number, honest)");
+        assert_eq!(
+            rec.title, "",
+            "no title → empty (the list renders #number, honest)"
+        );
         assert_eq!(rec.body_md, None);
         assert!(!rec.author_is_agent);
         assert_eq!(rec.updated_at, None);
@@ -1039,11 +1089,17 @@ mod tests {
         let (_c1, c2) = seed_main_then_descendant(&repo);
         let store = DurablePrStore::rooted(&root);
         store
-            .open_pr(&loc(), &open_record(1, "refs/heads/main", &c2.0, "psn:author@acme"))
+            .open_pr(
+                &loc(),
+                &open_record(1, "refs/heads/main", &c2.0, "psn:author@acme"),
+            )
             .unwrap();
         let rs = durable_ref_store(repo.clone());
         let attempt = merge_pr(&store, &loc(), 1, &rs, &repo, "psn:author@acme").unwrap();
-        assert!(matches!(attempt, MergeAttempt::Blocked(_)), "default-closed blocks: {attempt:?}");
+        assert!(
+            matches!(attempt, MergeAttempt::Blocked(_)),
+            "default-closed blocks: {attempt:?}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1073,7 +1129,10 @@ mod tests {
             )
             .unwrap();
         store
-            .open_pr(&loc(), &open_record(1, "refs/heads/main", &c2.0, "psn:author@acme"))
+            .open_pr(
+                &loc(),
+                &open_record(1, "refs/heads/main", &c2.0, "psn:author@acme"),
+            )
             .unwrap();
         let rs = durable_ref_store(repo.clone());
 
@@ -1093,7 +1152,10 @@ mod tests {
         });
         store.put(&loc(), &rec).unwrap();
         assert!(
-            matches!(merge_pr(&store, &loc(), 1, &rs, &repo, "psn:m@acme").unwrap(), MergeAttempt::Blocked(_)),
+            matches!(
+                merge_pr(&store, &loc(), 1, &rs, &repo, "psn:m@acme").unwrap(),
+                MergeAttempt::Blocked(_)
+            ),
             "a self-approval must NOT satisfy the approval threshold"
         );
 
@@ -1109,7 +1171,10 @@ mod tests {
             MergeAttempt::Merged { new_oid, .. } => assert_eq!(new_oid, c2.0),
             other => panic!("expected Merged, got {other:?}"),
         }
-        assert_eq!(rs.tip(&RefName::new("refs/heads/main")), Some(PushOid::new(c2.0)));
+        assert_eq!(
+            rs.tip(&RefName::new("refs/heads/main")),
+            Some(PushOid::new(c2.0))
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1122,14 +1187,28 @@ mod tests {
         let root = temp_root("prnum");
         let store = DurablePrStore::rooted(&root);
         // Two valid PRs (#1, #2) + a corrupt #3.json (unparseable content).
-        store.open_pr(&loc(), &open_record(1, "refs/heads/main", &"a".repeat(40), "psn:a@acme")).unwrap();
-        store.open_pr(&loc(), &open_record(2, "refs/heads/main", &"b".repeat(40), "psn:a@acme")).unwrap();
+        store
+            .open_pr(
+                &loc(),
+                &open_record(1, "refs/heads/main", &"a".repeat(40), "psn:a@acme"),
+            )
+            .unwrap();
+        store
+            .open_pr(
+                &loc(),
+                &open_record(2, "refs/heads/main", &"b".repeat(40), "psn:a@acme"),
+            )
+            .unwrap();
         let corrupt = store.pr_path(&loc(), 3).unwrap();
         std::fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
         std::fs::write(&corrupt, b"{ this is not valid PrRecord json").unwrap();
 
         // `list()` (the tolerant view) skips the corrupt record → sees only #1, #2.
-        assert_eq!(store.list(&loc()).unwrap().len(), 2, "list() tolerantly skips the corrupt record");
+        assert_eq!(
+            store.list(&loc()).unwrap().len(),
+            2,
+            "list() tolerantly skips the corrupt record"
+        );
         // But number allocation counts it → next is #4, NOT #3 (no reuse / no overwrite).
         assert_eq!(
             store.max_pr_number(&loc()).unwrap(),
@@ -1156,11 +1235,19 @@ mod tests {
         rec.reviews.push(approve("psn:rev1@acme", false));
         rec.reviews.push(approve("psn:rev1@acme", false));
         rec.reviews.push(approve("psn:rev1@acme", false));
-        assert_eq!(rec.counting_approvals(), 1, "N approvals by ONE reviewer count once");
+        assert_eq!(
+            rec.counting_approvals(),
+            1,
+            "N approvals by ONE reviewer count once"
+        );
 
         // An AGENT approval never counts (ADR-08 advisory) — even alongside the human.
         rec.reviews.push(approve("psn:agent@acme", true));
-        assert_eq!(rec.counting_approvals(), 1, "an agent approval must not count toward the gate");
+        assert_eq!(
+            rec.counting_approvals(),
+            1,
+            "an agent approval must not count toward the gate"
+        );
 
         // The AUTHOR's own approval never counts.
         rec.reviews.push(approve("psn:author@acme", false));
@@ -1168,7 +1255,11 @@ mod tests {
 
         // A SECOND distinct human reviewer brings the count to 2 (a real required_approvals>=2 path).
         rec.reviews.push(approve("psn:rev2@acme", false));
-        assert_eq!(rec.counting_approvals(), 2, "two DISTINCT human reviewers count as two");
+        assert_eq!(
+            rec.counting_approvals(),
+            2,
+            "two DISTINCT human reviewers count as two"
+        );
     }
 
     /// (c) A non-existent or non-descendant head_oid is refused — the protected ref is never advanced to
@@ -1192,7 +1283,10 @@ mod tests {
                     commit_oids: vec![PushOid::new(c2.0.clone())],
                 }],
                 quarantine: vec![],
-                pusher: Pusher { pseudonym: "psn:m@acme".into(), is_agent: false },
+                pusher: Pusher {
+                    pseudonym: "psn:m@acme".into(),
+                    is_agent: false,
+                },
             },
             &InMemoryObjectDb::new(),
             CrashPoint::None,
@@ -1202,7 +1296,10 @@ mod tests {
         // A non-existent head → InvalidHead.
         let bogus = "0".repeat(40);
         store
-            .open_pr(&loc(), &open_record(1, "refs/heads/feat", &bogus, "psn:author@acme"))
+            .open_pr(
+                &loc(),
+                &open_record(1, "refs/heads/feat", &bogus, "psn:author@acme"),
+            )
             .unwrap();
         assert!(matches!(
             merge_pr(&store, &loc(), 1, &rs, &repo, "psn:m@acme").unwrap(),
@@ -1211,7 +1308,10 @@ mod tests {
 
         // A real commit that is an ANCESTOR (not descendant) of feat's tip c2 → not a fast-forward.
         store
-            .open_pr(&loc(), &open_record(2, "refs/heads/feat", &c1.0, "psn:author@acme"))
+            .open_pr(
+                &loc(),
+                &open_record(2, "refs/heads/feat", &c1.0, "psn:author@acme"),
+            )
             .unwrap();
         assert!(
             matches!(
