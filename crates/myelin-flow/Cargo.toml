@@ -80,10 +80,9 @@ myelin-storage = { path = "../myelin-storage" }
 # deps. Build stays DB-free: connecting happens at RUNTIME, never at build.
 myelin-config = { path = "../myelin-config" }
 tokio = { workspace = true }
-# REAL Postgres raw-sqlx test harness behind the `integration` feature (Stage 1 / infra): pulled
-# ONLY by `--features integration` (tests/integration_flow_schema.rs against the docker dev
-# stack). The default `cargo build --workspace` stays DB-free (the binding-policy floor).
-sqlx = { workspace = true, optional = true }
+# The production durable-executor control surface is backed by Postgres. Queries remain runtime-
+# checked (`sqlx::query`, never compile-time macros), so builds do not require a live database.
+sqlx = { workspace = true }
 
 [dev-dependencies]
 # MR-009b W6b2 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN test
@@ -136,7 +135,7 @@ myelin-agent = { path = "../myelin-agent" }
 # The live-PG integration test (tests/integration_flow_schema.rs). DB-free by default.
 # (tokio + myelin-config are regular deps since W3b.4 — the durable main.rs needs them; the
 # feature now only pulls the raw-sqlx test harness.)
-integration = ["dep:sqlx"]
+integration = []
 # MR-009b W6b2 — the `test-support` cargo feature. It gates `BudgetGate::new(wallet)` (which
 # constructs the now-`test-support`-gated in-memory `CostLedger::new()`) + the ci_pipeline test
 # helpers behind `#[cfg(any(test, feature = "test-support"))]`, so downstream crates (ci-controlplane)

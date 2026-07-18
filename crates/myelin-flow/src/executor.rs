@@ -176,6 +176,14 @@ pub enum ExecutorError {
     /// never silently overwritten. (An idempotent re-`start` under the SAME `idem_key` short-circuits
     /// BEFORE this check — it returns the existing run, never a conflict.)
     RunIdConflict(String),
+    /// A persisted definition reused `(wf_type, version)` with different executable bytes. Workflow
+    /// history is replayed against a pinned version, so accepting this drift would be unsafe.
+    DefinitionDrift(String),
+    /// A caller supplied an empty, over-broad, malformed, or cross-tenant control value.
+    InvalidInput(String),
+    /// The durable control store could not complete an operation. The message is operational and
+    /// PII-free; callers retry/alert rather than falling back to process memory.
+    Storage(String),
 }
 
 impl std::fmt::Display for ExecutorError {
@@ -186,6 +194,9 @@ impl std::fmt::Display for ExecutorError {
             ExecutorError::RunIdConflict(r) => {
                 write!(f, "provided run_id collides with an existing run: {r}")
             }
+            ExecutorError::DefinitionDrift(d) => write!(f, "workflow definition drift: {d}"),
+            ExecutorError::InvalidInput(e) => write!(f, "invalid workflow control input: {e}"),
+            ExecutorError::Storage(e) => write!(f, "durable workflow store failed: {e}"),
         }
     }
 }
@@ -236,11 +247,8 @@ pub trait DurableExecutor {
     ///    clobber that run's [`RunRow`] ([`crate::engine::RunStore::put`] REPLACES silently).
     ///
     /// [`start`]: DurableExecutor::start
-    fn start_with_id(
-        &self,
-        spec: StartSpec,
-        run_id: Option<RunId>,
-    ) -> Result<RunId, ExecutorError>;
+    fn start_with_id(&self, spec: StartSpec, run_id: Option<RunId>)
+        -> Result<RunId, ExecutorError>;
 
     /// **Deliver an inbound durable signal to a run — idempotent on `idem_key` (FROZEN, contract
     /// 9.1, P-FLOW-09).** Buffers the signal into `wf_signal` via `INSERT … ON CONFLICT (tenant,
@@ -394,10 +402,7 @@ impl FlowExecutor {
     /// The deterministic partition for `run_id` (`hash(run_id) % N`, §7.2) — the worker shard the
     /// dispatcher's partition-scoped lease scan claims it from.
     fn partition_for(run_id: &str) -> i16 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        run_id.hash(&mut h);
-        (h.finish() % PARTITION_COUNT as u64) as i16
+        partition_for_run_id(run_id)
     }
 
     /// Refresh the runnable-run-lag gauge across all partitions (the §1.8 signal) — called after a
@@ -410,6 +415,15 @@ impl FlowExecutor {
         }
         self.telemetry.set_runnable_lag(total);
     }
+}
+
+/// The stable worker partition for a run handle. Kept outside either executor implementation so
+/// memory and Postgres stamp exactly the same shard for the same run id.
+pub(crate) fn partition_for_run_id(run_id: &str) -> i16 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    run_id.hash(&mut h);
+    (h.finish() % PARTITION_COUNT as u64) as i16
 }
 
 impl DurableExecutor for FlowExecutor {
@@ -692,7 +706,9 @@ mod tests {
         );
         // the run is real: describe resolves it under exactly that id.
         assert_eq!(
-            ex.describe(&provided).expect("describe the provided-id run").run_id,
+            ex.describe(&provided)
+                .expect("describe the provided-id run")
+                .run_id,
             provided
         );
     }
@@ -712,12 +728,18 @@ mod tests {
             .start_with_id(spec("rule:evt-7"), Some(provided.clone()))
             .expect("redelivery: same idem_key + same provided id returns the existing run");
         assert_eq!(r1, provided);
-        assert_eq!(r2, provided, "the redelivery returned the EXISTING run (idem_key wins)");
+        assert_eq!(
+            r2, provided,
+            "the redelivery returned the EXISTING run (idem_key wins)"
+        );
         // exactly ONE runnable run was seeded (not two).
         let total: usize = (0..PARTITION_COUNT as i16)
             .map(|p| ex.runs().runnable_lag(p, i64::MAX))
             .sum();
-        assert_eq!(total, 1, "the redelivery was a no-op — exactly one run seeded");
+        assert_eq!(
+            total, 1,
+            "the redelivery was a no-op — exactly one run seeded"
+        );
     }
 
     /// **CT-004d.2 chunk 1, invariant 2: a provided run_id colliding with a DIFFERENT run FAILS
@@ -757,7 +779,9 @@ mod tests {
             .start_with_id(spec("rule:mint"), None)
             .expect("None mints an id");
         // via the legacy default `start`, a DISTINCT idem_key mints a DISTINCT id.
-        let legacy = ex.start(spec("rule:mint-2")).expect("legacy start still mints");
+        let legacy = ex
+            .start(spec("rule:mint-2"))
+            .expect("legacy start still mints");
         assert_ne!(minted, legacy, "each minted run has a distinct id");
         // both resolve; neither is empty (the minter produced a real id).
         assert!(!minted.0.is_empty() && !legacy.0.is_empty());

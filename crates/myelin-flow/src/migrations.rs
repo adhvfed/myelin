@@ -220,6 +220,18 @@ CREATE TABLE wf_definition (\
   registered_at timestamptz NOT NULL DEFAULT now(), \
   PRIMARY KEY (wf_type, version))";
 
+/// Online expand for the durable control plane. Existing runs remain readable with NULL values;
+/// every new Postgres-backed start writes its idempotency key, and cancel writes a machine reason.
+pub const WORKFLOW_RUN_CONTROL_EXPAND_DDL: &str = "\
+ALTER TABLE workflow_run ADD COLUMN IF NOT EXISTS idem_key text;
+ALTER TABLE workflow_run ADD COLUMN IF NOT EXISTS cancel_reason text";
+
+/// Idempotent start is enforced by Postgres, not a read-then-write process mutex. This is separate
+/// from the column expand because PostgreSQL requires `CONCURRENTLY` outside a transaction/script.
+pub const WORKFLOW_RUN_IDEM_INDEX_DDL: &str = "\
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS wf_run_idem \
+ON workflow_run (tenant_id, region, idem_key) WHERE idem_key IS NOT NULL";
+
 /// The six `(table_id, ddl, table_name, rls_scoped)` tuples in migration order — the data-model
 /// slice. Each `ddl` is the fresh `CREATE TABLE` above (plus its hot dispatch index where §3 names
 /// one). `rls_scoped = true` rides a `myelin_make_tenant_scoped('<table>')` RLS-scope call on the
@@ -274,31 +286,51 @@ pub fn rls_scope_sql(table: &str) -> String {
 /// (an empty fresh table; no hot-table lock). The DDL is held as `&str` constants (NOT mistaken for
 /// live Rust by the lint), then assembled + `'static`-leaked once at boot.
 pub fn migrations() -> Migrations {
-    Migrations::of(
-        TABLE_DDLS
-            .iter()
-            .map(|(id, create_ddl, table, rls_scoped)| {
-                let mut ddl = String::new();
-                ddl.push_str(create_ddl);
-                ddl.push(';');
-                for (idx_table, idx_ddl) in TABLE_INDEXES {
-                    if idx_table == table {
-                        ddl.push('\n');
-                        ddl.push_str(idx_ddl);
-                        ddl.push(';');
-                    }
-                }
-                if *rls_scoped {
+    let mut items = TABLE_DDLS
+        .iter()
+        .map(|(id, create_ddl, table, rls_scoped)| {
+            let mut ddl = String::new();
+            ddl.push_str(create_ddl);
+            ddl.push(';');
+            for (idx_table, idx_ddl) in TABLE_INDEXES {
+                if idx_table == table {
                     ddl.push('\n');
-                    ddl.push_str(&rls_scope_sql(table));
+                    ddl.push_str(idx_ddl);
                     ddl.push(';');
                 }
-                // One-time, bounded leak — the migration set is built once at boot/serve; the substrate
-                // `Migration` holds `&'static str` (the same pattern `myelin-notif` uses).
-                let ddl: &'static str = Box::leak(ddl.into_boxed_str());
+            }
+            if *rls_scoped {
+                ddl.push('\n');
+                ddl.push_str(&rls_scope_sql(table));
+                ddl.push(';');
+            }
+            // One-time, bounded leak — the migration set is built once at boot/serve; the substrate
+            // `Migration` holds `&'static str` (the same pattern `myelin-notif` uses).
+            let ddl: &'static str = Box::leak(ddl.into_boxed_str());
+            // A table does not become hot until this first create finishes. The historical
+            // workflow_run migration also builds its initial index non-concurrently while the
+            // table is empty, so it deliberately has no hot-table target. Every later
+            // workflow_run migration below names the table and is checked as hot.
+            if *table == "workflow_run" {
+                Migration::plain(id, ddl)
+            } else {
                 Migration::phased(id, ddl, MigrationPhase::Plain, table)
-            }),
-    )
+            }
+        })
+        .collect::<Vec<_>>();
+    items.push(Migration::phased(
+        "flow_0007_workflow_run_control_expand",
+        WORKFLOW_RUN_CONTROL_EXPAND_DDL,
+        MigrationPhase::Expand,
+        "workflow_run",
+    ));
+    items.push(Migration::phased(
+        "flow_0008_workflow_run_idem_index",
+        WORKFLOW_RUN_IDEM_INDEX_DDL,
+        MigrationPhase::Expand,
+        "workflow_run",
+    ));
+    Migrations::of(items)
 }
 
 /// Whether `ddl` is forward-only-LEGAL (no destructive `DROP`, no down/rollback). The framework's
@@ -318,18 +350,18 @@ mod tests {
     /// forward-only through the substrate runner — 6 tables created, 0 destructive, in order. The
     /// applied ids are recorded in migration order (contract 1.5).
     #[test]
-    fn the_six_migrations_apply_forward_only_in_order() {
+    fn the_schema_and_control_migrations_apply_forward_only_in_order() {
         let migrations = migrations();
         assert_eq!(
             migrations.0.len(),
-            6,
-            "the six-table data model (§3.1..§3.6)"
+            8,
+            "six-table data model plus two online control-surface expands"
         );
         let mut runner = MigrationRunner::new();
-        // The six tables are brand-new `CREATE TABLE`s (cold at creation) — `none()` hot set.
+        // workflow_run becomes hot after creation; its two follow-ons use the online expand path.
         runner
-            .run(&migrations, &HotTables::none())
-            .expect("the six migrations apply forward-only");
+            .run(&migrations, &HotTables::declare(["workflow_run"]))
+            .expect("the flow migrations apply forward-only");
         assert_eq!(
             runner.applied(),
             &[
@@ -339,9 +371,20 @@ mod tests {
                 "flow_0004_wf_signal",
                 "flow_0005_wf_activity_attempt",
                 "flow_0006_wf_definition",
+                "flow_0007_workflow_run_control_expand",
+                "flow_0008_workflow_run_idem_index",
             ],
-            "6 tables created, in order — 0 backward migration"
+            "tables then online control expands, in order — 0 backward migration"
         );
+    }
+
+    #[test]
+    fn durable_control_idempotency_is_an_online_database_constraint() {
+        assert!(WORKFLOW_RUN_CONTROL_EXPAND_DDL.contains("idem_key text"));
+        assert!(WORKFLOW_RUN_CONTROL_EXPAND_DDL.contains("cancel_reason text"));
+        assert!(WORKFLOW_RUN_IDEM_INDEX_DDL.contains("UNIQUE INDEX CONCURRENTLY"));
+        assert!(WORKFLOW_RUN_IDEM_INDEX_DDL.contains("tenant_id, region, idem_key"));
+        assert!(WORKFLOW_RUN_IDEM_INDEX_DDL.contains("WHERE idem_key IS NOT NULL"));
     }
 
     /// Every TENANT-scoped table is `(tenant, region)`-first: the DDL leads with `tenant_id` then

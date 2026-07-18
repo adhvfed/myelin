@@ -251,6 +251,7 @@ pub mod loopsafety;
 pub mod maintenance;
 pub mod merge_queue;
 pub mod migrations;
+pub mod pg_executor;
 pub mod remint;
 // MR-009b W3b.5: the FLOW-D10 restore-verify drill re-hydrates a RESTORED in-memory outbox via
 // the `test-support`-gated `OutboxStore::new()` + `restore_committed_row_for_test` seam — a
@@ -324,6 +325,7 @@ pub use merge_queue::{
     CI_RESULT_SIGNAL, GIT_PR_MERGED_EVENT,
 };
 pub use myelin_storage::reserve_settle::{MeteredUnit, MinorUnits};
+pub use pg_executor::PgFlowExecutor;
 pub use remint::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenLease, RunTokenMinter};
 #[cfg(any(test, feature = "test-support"))]
 pub use restore_verify::{
