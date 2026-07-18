@@ -10,7 +10,7 @@ use myelin_flow::{
 use myelin_refs::ArtifactRef;
 use myelin_storage::{HotTables, PgMigrator};
 use myelin_tenancy::{Region, TenantId};
-use sqlx::{Executor, PgPool};
+use sqlx::{Executor, PgPool, Row};
 use std::sync::Arc;
 
 fn admin_url() -> String {
@@ -123,9 +123,54 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
             )
             .expect("idempotency anchor wins within caller transaction");
         assert_eq!(replay, first);
+
+        let invalid = first_process.start_with_id_on_conn(
+            &mut handler_tx,
+            StartSpec {
+                wf_type: "ci.pipeline".into(),
+                input: vec![ArtifactRef("myelin://other/ci/run/cross-tenant".into())],
+                budget: None,
+                idem_key: "trigger:invalid".into(),
+            },
+            None,
+        );
+        assert!(matches!(invalid, Err(ExecutorError::InvalidInput(_))));
+
+        let unknown = first_process.start_with_id_on_conn(
+            &mut handler_tx,
+            StartSpec {
+                wf_type: "unknown.workflow".into(),
+                input: Vec::new(),
+                budget: None,
+                idem_key: "trigger:unknown".into(),
+            },
+            None,
+        );
+        assert_eq!(
+            unknown,
+            Err(ExecutorError::UnknownWorkflow("unknown.workflow".into()))
+        );
         first
     });
     assert_eq!(rolled_back_run.0, "run-rolled-back");
+    let persisted = sqlx::query(
+        "SELECT wf_version, partition, input FROM workflow_run \
+         WHERE tenant_id = 'acme' AND region = 'fr-par' AND run_id = 'run-rolled-back'",
+    )
+    .fetch_one(&mut *caller_tx)
+    .await
+    .expect("read caller-owned start before rollback");
+    assert_eq!(persisted.get::<i32, _>("wf_version"), 1);
+    use std::hash::{Hash, Hasher};
+    let mut partition_hasher = std::collections::hash_map::DefaultHasher::new();
+    "run-rolled-back".hash(&mut partition_hasher);
+    let expected_partition =
+        (partition_hasher.finish() % u64::from(myelin_flow::PARTITION_COUNT)) as i16;
+    assert_eq!(persisted.get::<i16, _>("partition"), expected_partition);
+    assert_eq!(
+        persisted.get::<serde_json::Value, _>("input"),
+        serde_json::json!([])
+    );
     caller_tx.rollback().await.expect("roll back caller tx");
     let rolled_back_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM workflow_run WHERE tenant_id = 'acme' AND region = 'fr-par' \
