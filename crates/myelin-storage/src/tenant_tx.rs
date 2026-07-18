@@ -56,6 +56,53 @@ use crate::pg::PgError;
 /// transaction-scoped connection (`'c`). A store op is `|conn| Box::pin(async move { … })`.
 pub type TxScope<'c, R> = Pin<Box<dyn Future<Output = Result<R, PgError>> + Send + 'c>>;
 
+/// A transaction-scoped operation that can preserve a caller's typed domain error. Durable
+/// subsystem stores use this form when a lost lease, stale cursor, or invariant violation must be
+/// distinguished from a database failure without giving up the one RLS/GUC transaction convention.
+pub type TypedTxScope<'c, R, E> = Pin<Box<dyn Future<Output = Result<R, E>> + Send + 'c>>;
+
+/// Generic form of [`with_tenant_tx`] that preserves typed caller errors and rolls the transaction
+/// back whenever the operation returns one. `E: From<PgError>` keeps begin/scope/commit failures on
+/// the same error channel while allowing a subsystem to fail closed with its own machine variants.
+pub async fn with_tenant_tx_error<R, F, E>(
+    pool: &PgPool,
+    tenant: &str,
+    region: &str,
+    op: F,
+) -> Result<R, E>
+where
+    F: for<'c> FnOnce(&'c mut PgConnection) -> TypedTxScope<'c, R, E> + Send,
+    R: Send,
+    E: From<PgError>,
+{
+    let mut tx = pool.begin().await.map_err(|e| {
+        E::from(PgError::Query(format!(
+            "begin tenant-scoped transaction: {e}"
+        )))
+    })?;
+
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        E::from(PgError::Query(format!(
+            "set transaction-scoped tenant GUC: {e}"
+        )))
+    })?;
+
+    let out = op(&mut tx).await?;
+    tx.commit().await.map_err(|e| {
+        E::from(PgError::Query(format!(
+            "commit tenant-scoped transaction: {e}"
+        )))
+    })?;
+    Ok(out)
+}
+
 /// **The tenant-scoped-transaction convention (RESHAPE-002).** Acquire a connection, open a
 /// transaction, set the `(tenant, region)` GUC TRANSACTION-scoped (`set_config(..., true)`), run
 /// `op` on the transaction-bound connection, then COMMIT — so the GUC is discarded on commit and the
@@ -84,32 +131,7 @@ where
     F: for<'c> FnOnce(&'c mut PgConnection) -> TxScope<'c, R> + Send,
     R: Send,
 {
-    // acquire → BEGIN.
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| PgError::Query(format!("begin tenant-scoped transaction: {e}")))?;
-
-    // set the (tenant, region) GUC TRANSACTION-scoped (is_local = true == SET LOCAL): it lives only
-    // for THIS transaction and is discarded at COMMIT/ROLLBACK — no residual scope on the pooled
-    // connection. One round trip sets both GUCs the RLS policy's `(tenant, region)` predicate keys on.
-    sqlx::query(
-        "SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)",
-    )
-    .bind(tenant)
-    .bind(region)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| PgError::Query(format!("set transaction-scoped tenant GUC: {e}")))?;
-
-    // run the store op on the transaction-bound connection.
-    let out = op(&mut tx).await?;
-
-    // COMMIT — the GUC is discarded here (and reset-on-release scrubs any residue as defence in depth).
-    tx.commit()
-        .await
-        .map_err(|e| PgError::Query(format!("commit tenant-scoped transaction: {e}")))?;
-    Ok(out)
+    with_tenant_tx_error(pool, tenant, region, op).await
 }
 
 /// Open a bounded sqlx pool with **reset-on-release** wired (RESHAPE-002 defence-in-depth). The

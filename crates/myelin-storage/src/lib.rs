@@ -937,7 +937,9 @@ pub use restore_verify_durable::{
     restore_verify_durable_migrations, DurableRestoreErasureLedger,
     RESTORE_ERASURE_LEDGER_MIGRATION,
 };
-pub use tenant_tx::{connect_pool_with_reset, with_tenant_tx, TxScope};
+pub use tenant_tx::{
+    connect_pool_with_reset, with_tenant_tx, with_tenant_tx_error, TxScope, TypedTxScope,
+};
 // `events_serve` STAYS behind `integration` (it consumes the real NATS broker `myelin_events::nats`,
 // gated by `myelin-events/integration`) — see the module declaration above.
 #[cfg(feature = "integration")]
