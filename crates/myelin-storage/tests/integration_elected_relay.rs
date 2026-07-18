@@ -9,13 +9,13 @@ use myelin_config::MyelinConfig;
 use myelin_events::relay::{Delivery, EventPublisher, TransportError};
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, DataRole, EventEnvelope, EventId,
-    EventType, InProcessBus, Timestamp, Visibility, OUTBOX_MIGRATION,
+    EventType, InProcessBus, Timestamp, Visibility, OUTBOX_MIGRATION, OUTBOX_QUARANTINE_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::elected_relay::{
     ElectedDrainOutcome, ElectedPgRelay, SHARED_OUTBOX_PUBLISHER_LOCK_ID,
 };
-use myelin_storage::pgrelay::PgRelay;
+use myelin_storage::pgrelay::{PgRelay, RelayValidationConfig};
 use myelin_tenancy::{Region, TenantId};
 
 fn admin_url(cfg: &MyelinConfig) -> String {
@@ -26,7 +26,7 @@ fn admin_url(cfg: &MyelinConfig) -> String {
 fn envelope(aggregate: &str, seq: u32) -> EventEnvelope {
     EventEnvelope {
         event_id: EventId(format!("01JTEST{aggregate}{seq:019}")),
-        type_: EventType("issues.issue.updated".into()),
+        type_: EventType("issue.issue.updated".into()),
         schema_ver: 1,
         tenant: TenantId("elected-relay-tenant".into()),
         region: Region("no-osl".into()),
@@ -49,6 +49,10 @@ fn envelope(aggregate: &str, seq: u32) -> EventEnvelope {
         recorded_at: Timestamp("2026-07-18T00:00:00Z".into()),
         payload: serde_json::json!({ "aggregate": aggregate, "seq": seq }),
     }
+}
+
+fn validation() -> RelayValidationConfig {
+    RelayValidationConfig::new(Region("no-osl".into()), 256 * 1024).expect("valid relay scope")
 }
 
 #[derive(Default)]
@@ -111,20 +115,29 @@ async fn elected_relay_serializes_contenders_preserves_order_and_retains_outage_
         .execute(&pool)
         .await
         .expect("migrate isolated outbox");
-    sqlx::query("TRUNCATE outbox")
+    sqlx::raw_sql(OUTBOX_QUARANTINE_MIGRATION)
+        .execute(&pool)
+        .await
+        .expect("migrate isolated quarantine");
+    sqlx::query("TRUNCATE outbox_quarantine, outbox")
         .execute(&pool)
         .await
         .expect("clean outbox");
 
     let raw = PgRelay::new(pool.clone());
-    for (aggregate, seq) in [("A", 0), ("B", 0), ("A", 1), ("B", 1)] {
+    for (aggregate, seq) in [
+        ("issue:A", 0),
+        ("issue:B", 0),
+        ("issue:A", 1),
+        ("issue:B", 1),
+    ] {
         raw.enqueue(aggregate, seq, &envelope(aggregate, seq as u32))
             .await
             .expect("enqueue");
     }
 
-    let first = ElectedPgRelay::new(pool.clone()).expect("first contender");
-    let second = ElectedPgRelay::new(pool.clone()).expect("second contender");
+    let first = ElectedPgRelay::new(pool.clone(), validation()).expect("first contender");
+    let second = ElectedPgRelay::new(pool.clone(), validation()).expect("second contender");
     let publisher = Arc::new(SlowRecordingPublisher::default());
     let start = Arc::new(tokio::sync::Barrier::new(3));
 
@@ -172,10 +185,10 @@ async fn elected_relay_serializes_contenders_preserves_order_and_retains_outage_
             .lock()
             .unwrap_or_else(|e| e.into_inner()),
         vec![
-            ("A".into(), 0),
-            ("A".into(), 1),
-            ("B".into(), 0),
-            ("B".into(), 1),
+            ("issue:A".into(), 0),
+            ("issue:A".into(), 1),
+            ("issue:B".into(), 0),
+            ("issue:B".into(), 1),
         ]
     );
 
@@ -189,7 +202,7 @@ async fn elected_relay_serializes_contenders_preserves_order_and_retains_outage_
         .await
         .expect("hold election lock");
     assert!(locked);
-    let standby = ElectedPgRelay::new(pool.clone())
+    let standby = ElectedPgRelay::new(pool.clone(), validation())
         .expect("standby relay")
         .drain_once(publisher.as_ref(), 32)
         .await
@@ -203,16 +216,16 @@ async fn elected_relay_serializes_contenders_preserves_order_and_retains_outage_
     assert!(unlocked);
     drop(lock_holder);
 
-    sqlx::query("TRUNCATE outbox")
+    sqlx::query("TRUNCATE outbox_quarantine, outbox")
         .execute(&pool)
         .await
         .expect("reset outbox");
-    raw.enqueue("outage", 0, &envelope("outage", 0))
+    raw.enqueue("issue:outage", 0, &envelope("issue:outage", 0))
         .await
         .expect("enqueue outage row");
     let severed = InProcessBus::new();
     severed.sever();
-    let elected = ElectedPgRelay::new(pool.clone()).expect("outage relay");
+    let elected = ElectedPgRelay::new(pool.clone(), validation()).expect("outage relay");
     let error = elected
         .drain_once(&severed, 32)
         .await

@@ -23,9 +23,13 @@
 use myelin_events::relay::{
     BusTransport, Delivery, DrainReport, EventPublisher, MAX_PUBLISH_ATTEMPTS,
 };
-use myelin_events::{AggregateKey, ArtifactRef, EventEnvelope, EventId, OutboxRow, Timestamp};
+use myelin_events::{
+    validate_event_type, AggregateKey, ArtifactRef, EventEnvelope, EventId, OutboxRow, Region,
+    StreamSubject, Timestamp,
+};
 use sqlx::postgres::PgPool;
 use sqlx::Row;
+use std::collections::HashSet;
 
 use crate::pg::PgError;
 
@@ -33,6 +37,149 @@ use crate::pg::PgError;
 /// before giving up. A concurrent committer that lost the `MAX(seq)+1` race retries with the next
 /// contiguous seq; the bound only needs to exceed the realistic concurrency on one hot aggregate.
 const SEQ_CONTENTION_RETRIES: u32 = 128;
+
+/// A defensive ceiling on configuration itself. The elected relay still requires callers to choose
+/// their lower operational envelope limit explicitly; this prevents `usize::MAX` from becoming an
+/// accidental "bounded" production setting.
+pub const MAX_CONFIGURED_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Cell scope and finite message bound required by the strict elected-relay path.
+///
+/// Legacy [`PgRelay::new`] + [`PgRelay::relay_once`] remain unscoped for existing integration and
+/// migration callers. The elected production wrapper accepts this type at construction and invokes
+/// only [`PgRelay::relay_once_scoped`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayValidationConfig {
+    region: Region,
+    max_envelope_bytes: usize,
+}
+
+impl RelayValidationConfig {
+    pub fn new(
+        region: Region,
+        max_envelope_bytes: usize,
+    ) -> Result<Self, RelayValidationConfigError> {
+        if region.0.trim().is_empty() {
+            return Err(RelayValidationConfigError::EmptyRegion);
+        }
+        if !(1..=MAX_CONFIGURED_ENVELOPE_BYTES).contains(&max_envelope_bytes) {
+            return Err(RelayValidationConfigError::InvalidEnvelopeLimit {
+                max: MAX_CONFIGURED_ENVELOPE_BYTES,
+            });
+        }
+        Ok(Self {
+            region,
+            max_envelope_bytes,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RelayValidationConfigError {
+    EmptyRegion,
+    InvalidEnvelopeLimit { max: usize },
+}
+
+impl core::fmt::Display for RelayValidationConfigError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::EmptyRegion => write!(f, "relay region must not be empty"),
+            Self::InvalidEnvelopeLimit { max } => {
+                write!(f, "relay envelope limit must be between 1 and {max} bytes")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RelayValidationConfigError {}
+
+#[derive(Clone, Copy)]
+struct PermanentRowError {
+    code: &'static str,
+    detail: &'static str,
+}
+
+impl PermanentRowError {
+    const fn new(code: &'static str, detail: &'static str) -> Self {
+        Self { code, detail }
+    }
+}
+
+struct ClaimedRow {
+    event_id: String,
+    aggregate: String,
+    seq: i64,
+    subject: String,
+    payload: serde_json::Value,
+}
+
+fn validate_claimed_row(
+    row: &ClaimedRow,
+    config: &RelayValidationConfig,
+) -> Result<EventEnvelope, PermanentRowError> {
+    let encoded = serde_json::to_vec(&row.payload).map_err(|_| {
+        PermanentRowError::new(
+            "invalid_envelope_json",
+            "outbox envelope could not be encoded as canonical JSON",
+        )
+    })?;
+    if encoded.len() > config.max_envelope_bytes {
+        return Err(PermanentRowError::new(
+            "envelope_too_large",
+            "serialized event envelope exceeds the configured byte limit",
+        ));
+    }
+
+    let envelope: EventEnvelope = serde_json::from_value(row.payload.clone()).map_err(|_| {
+        PermanentRowError::new(
+            "invalid_envelope_json",
+            "outbox envelope is not a canonical EventEnvelope",
+        )
+    })?;
+    if row.event_id != envelope.event_id.0 {
+        return Err(PermanentRowError::new(
+            "event_id_mismatch",
+            "outbox event_id disagrees with the envelope event_id",
+        ));
+    }
+    if row.subject != envelope.subject.0 {
+        return Err(PermanentRowError::new(
+            "subject_mismatch",
+            "outbox subject disagrees with the envelope subject",
+        ));
+    }
+    if row.aggregate != envelope.aggregate.0 {
+        return Err(PermanentRowError::new(
+            "aggregate_mismatch",
+            "outbox aggregate disagrees with the envelope aggregate",
+        ));
+    }
+    if validate_event_type(&envelope.type_.0).is_err() {
+        return Err(PermanentRowError::new(
+            "invalid_event_taxonomy",
+            "event type is not admitted by the canonical taxonomy",
+        ));
+    }
+    if StreamSubject::of(&envelope).is_err() {
+        return Err(PermanentRowError::new(
+            "invalid_stream_subject",
+            "event cannot form a safe canonical stream subject",
+        ));
+    }
+    if envelope.actor.0.tenant != envelope.tenant {
+        return Err(PermanentRowError::new(
+            "actor_tenant_mismatch",
+            "event actor tenant disagrees with the envelope tenant",
+        ));
+    }
+    if envelope.region != config.region {
+        return Err(PermanentRowError::new(
+            "wrong_relay_region",
+            "event region disagrees with the relay cell region",
+        ));
+    }
+    Ok(envelope)
+}
 
 /// The `SELECT` projection for reconstructing an [`OutboxRow`]: every outbox column plus the
 /// `published_at` cast to an RFC-3339 UTC string (`published_at_str`).
@@ -264,6 +411,95 @@ impl PgRelay {
 
             sqlx::query("UPDATE outbox SET published_at = now() WHERE event_id = $1")
                 .bind(&event_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| PgError::Query(e.to_string()))?;
+            published += 1;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(published)
+    }
+
+    /// Strict elected-relay drain: validate every durable row before publication, quarantine a
+    /// permanent row defect without copying its payload, and preserve per-aggregate order by
+    /// blocking every later row behind the first quarantined sequence.
+    ///
+    /// A broker or database failure aborts this transaction. Accepted-but-uncommitted publishes are
+    /// safe to replay through the stable event id, while no retry/dead-letter attempt is consumed.
+    pub async fn relay_once_scoped<P: EventPublisher + ?Sized>(
+        &self,
+        publisher: &P,
+        batch: i64,
+        config: &RelayValidationConfig,
+    ) -> Result<usize, PgError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+
+        let rows = sqlx::query(
+            "SELECT o.event_id, o.aggregate, o.seq, o.subject, o.envelope FROM outbox o \
+             WHERE o.published_at IS NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM outbox_quarantine own WHERE own.event_id = o.event_id \
+               ) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM outbox_quarantine prior \
+                    WHERE prior.aggregate = o.aggregate AND prior.seq < o.seq \
+               ) \
+             ORDER BY o.aggregate, o.seq \
+             FOR UPDATE OF o SKIP LOCKED LIMIT $1",
+        )
+        .bind(batch)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+
+        let mut blocked_aggregates = HashSet::new();
+        let mut published = 0usize;
+        for row in rows {
+            let claimed = ClaimedRow {
+                event_id: row.get("event_id"),
+                aggregate: row.get("aggregate"),
+                seq: row.get("seq"),
+                subject: row.get("subject"),
+                payload: row.get("envelope"),
+            };
+            if blocked_aggregates.contains(&claimed.aggregate) {
+                continue;
+            }
+
+            let envelope = match validate_claimed_row(&claimed, config) {
+                Ok(envelope) => envelope,
+                Err(reason) => {
+                    sqlx::query(
+                        "INSERT INTO outbox_quarantine \
+                         (event_id, aggregate, seq, reason_code, reason_detail) \
+                         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (event_id) DO NOTHING",
+                    )
+                    .bind(&claimed.event_id)
+                    .bind(&claimed.aggregate)
+                    .bind(claimed.seq)
+                    .bind(reason.code)
+                    .bind(reason.detail)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| PgError::Query(e.to_string()))?;
+                    blocked_aggregates.insert(claimed.aggregate);
+                    continue;
+                }
+            };
+
+            match publisher.publish(&envelope.subject, &envelope, &envelope.event_id) {
+                Ok(Delivery::Accepted) | Ok(Delivery::Deduplicated) => {}
+                Err(e) => return Err(PgError::Publish(e.0)),
+            }
+            sqlx::query("UPDATE outbox SET published_at = now() WHERE event_id = $1")
+                .bind(&claimed.event_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| PgError::Query(e.to_string()))?;
@@ -746,5 +982,31 @@ impl PgRelay {
         .await
         .map_err(|e| PgError::Query(e.to_string()))?;
         rows.iter().map(row_from_pg).collect()
+    }
+}
+
+#[cfg(test)]
+mod validation_config_tests {
+    use super::*;
+
+    #[test]
+    fn strict_relay_scope_requires_region_and_a_real_finite_limit() {
+        assert_eq!(
+            RelayValidationConfig::new(Region(" ".into()), 1024),
+            Err(RelayValidationConfigError::EmptyRegion)
+        );
+        assert_eq!(
+            RelayValidationConfig::new(Region("no-osl".into()), 0),
+            Err(RelayValidationConfigError::InvalidEnvelopeLimit {
+                max: MAX_CONFIGURED_ENVELOPE_BYTES
+            })
+        );
+        assert_eq!(
+            RelayValidationConfig::new(Region("no-osl".into()), MAX_CONFIGURED_ENVELOPE_BYTES + 1,),
+            Err(RelayValidationConfigError::InvalidEnvelopeLimit {
+                max: MAX_CONFIGURED_ENVELOPE_BYTES
+            })
+        );
+        assert!(RelayValidationConfig::new(Region("no-osl".into()), 256 * 1024).is_ok());
     }
 }
