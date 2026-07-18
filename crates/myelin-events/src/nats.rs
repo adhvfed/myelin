@@ -5,8 +5,8 @@
 //! [`crate::relay::InProcessBus`] floor models in process. It implements the EXACT frozen
 //! `put/consume/ack/purge` shape behind the existing [`BusTransport`] trait — it does NOT fork
 //! or redefine the trait (EI-01 §7 coherence). The in-process fake remains the unit/default
-//! transport; this real backing is config-selected and compiled ONLY under `--features
-//! integration`.
+//! transport; this real backing is config-selected under production's `nats` feature (also
+//! included by the live-test `integration` feature).
 //!
 //! ## The JetStream wiring (durable stream + durable PULL consumer + ack)
 //! - A durable **stream** captures the subject set, with `MsgId`-based **dedup** so a second
@@ -27,11 +27,258 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_nats::jetstream::consumer::PullConsumer;
+use async_nats::jetstream::stream::{
+    Config as StreamConfig, DiscardPolicy, RetentionPolicy, StorageType,
+};
 use async_nats::jetstream::{self, Context};
 use futures::StreamExt;
 
-use crate::relay::{BusTransport, Delivery, TransportError};
+use crate::relay::{BusTransport, Delivery, EventPublisher, TransportError};
 use crate::{ArtifactRef, EventEnvelope, EventId};
+
+/// Explicit capacity and durability policy for the shared production event stream.
+///
+/// There are deliberately no unlimited defaults: callers must choose finite byte and message
+/// bounds, a retention age, a deduplication window, and a replica count appropriate for the NATS
+/// cluster they operate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JetStreamPublisherConfig {
+    pub nats_url: String,
+    pub stream_name: String,
+    pub subject_root: String,
+    pub max_age: std::time::Duration,
+    pub max_bytes: i64,
+    pub max_messages: i64,
+    pub replicas: usize,
+    pub duplicate_window: std::time::Duration,
+}
+
+impl JetStreamPublisherConfig {
+    /// Refuse incomplete, unlimited, or internally inconsistent production stream settings.
+    pub fn validate(&self) -> Result<(), TransportError> {
+        if self.nats_url.trim().is_empty() {
+            return Err(TransportError("NATS URL must not be empty".into()));
+        }
+        if self.stream_name.is_empty()
+            || self
+                .stream_name
+                .chars()
+                .any(|c| c.is_whitespace() || c == '.')
+        {
+            return Err(TransportError(
+                "JetStream stream name must be non-empty and contain no whitespace or dots".into(),
+            ));
+        }
+        if !valid_subject_root(&self.subject_root) {
+            return Err(TransportError(
+                "JetStream subject root must contain non-empty literal dot-separated tokens".into(),
+            ));
+        }
+        if self.max_age.is_zero() {
+            return Err(TransportError("JetStream max_age must be positive".into()));
+        }
+        if self.max_bytes <= 0 {
+            return Err(TransportError(
+                "JetStream max_bytes must be a finite positive bound".into(),
+            ));
+        }
+        if self.max_messages <= 0 {
+            return Err(TransportError(
+                "JetStream max_messages must be a finite positive bound".into(),
+            ));
+        }
+        if !(1..=5).contains(&self.replicas) {
+            return Err(TransportError(
+                "JetStream replicas must be between 1 and 5".into(),
+            ));
+        }
+        if self.duplicate_window.is_zero() || self.duplicate_window > self.max_age {
+            return Err(TransportError(
+                "JetStream duplicate_window must be positive and no greater than max_age".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn stream_config(&self) -> StreamConfig {
+        StreamConfig {
+            name: self.stream_name.clone(),
+            subjects: vec![format!("{}.>", self.subject_root)],
+            retention: RetentionPolicy::Limits,
+            storage: StorageType::File,
+            max_age: self.max_age,
+            max_bytes: self.max_bytes,
+            max_messages: self.max_messages,
+            num_replicas: self.replicas,
+            duplicate_window: self.duplicate_window,
+            discard: DiscardPolicy::Old,
+            ..Default::default()
+        }
+    }
+}
+
+fn valid_subject_root(root: &str) -> bool {
+    !root.is_empty()
+        && root.split('.').all(|token| {
+            !token.is_empty()
+                && token
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+}
+
+fn validate_stream_config(
+    actual: &StreamConfig,
+    expected: &StreamConfig,
+) -> Result<(), TransportError> {
+    let mut drift = Vec::new();
+    if actual.storage != StorageType::File {
+        drift.push(format!("storage={:?} (expected File)", actual.storage));
+    }
+    if actual.retention != RetentionPolicy::Limits {
+        drift.push(format!(
+            "retention={:?} (expected Limits)",
+            actual.retention
+        ));
+    }
+    if actual.discard != DiscardPolicy::Old {
+        drift.push(format!("discard={:?} (expected Old)", actual.discard));
+    }
+    if actual.max_age != expected.max_age {
+        drift.push(format!(
+            "max_age={:?} (expected {:?})",
+            actual.max_age, expected.max_age
+        ));
+    }
+    if actual.max_bytes != expected.max_bytes {
+        drift.push(format!(
+            "max_bytes={} (expected {})",
+            actual.max_bytes, expected.max_bytes
+        ));
+    }
+    if actual.max_messages != expected.max_messages {
+        drift.push(format!(
+            "max_messages={} (expected {})",
+            actual.max_messages, expected.max_messages
+        ));
+    }
+    if actual.num_replicas != expected.num_replicas {
+        drift.push(format!(
+            "replicas={} (expected {})",
+            actual.num_replicas, expected.num_replicas
+        ));
+    }
+    if actual.subjects != expected.subjects {
+        drift.push(format!(
+            "subjects={:?} (expected {:?})",
+            actual.subjects, expected.subjects
+        ));
+    }
+    if actual.duplicate_window != expected.duplicate_window {
+        drift.push(format!(
+            "duplicate_window={:?} (expected {:?})",
+            actual.duplicate_window, expected.duplicate_window
+        ));
+    }
+
+    if drift.is_empty() {
+        Ok(())
+    } else {
+        Err(TransportError(format!(
+            "existing JetStream stream configuration is incompatible: {}",
+            drift.join(", ")
+        )))
+    }
+}
+
+fn event_subject(subject_root: &str, subject: &ArtifactRef, envelope: &EventEnvelope) -> String {
+    match crate::partition::StreamSubject::of(envelope) {
+        Ok(s) => format!("{subject_root}.{}", s.to_subject()),
+        Err(_) => {
+            let token: String = subject
+                .0
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            format!("{subject_root}._malformed.{token}")
+        }
+    }
+}
+
+/// A capability-minimal production adapter for the elected shared-outbox relay.
+///
+/// Construction provisions or validates the shared stream and creates no consumer. Its public
+/// surface implements only [`EventPublisher`], so the relay cannot consume, acknowledge, or purge
+/// production history.
+pub struct NatsJetStreamPublisher {
+    js: Context,
+    subject_root: String,
+    rt: tokio::runtime::Handle,
+}
+
+impl NatsJetStreamPublisher {
+    pub fn connect(
+        config: JetStreamPublisherConfig,
+        rt: tokio::runtime::Handle,
+    ) -> Result<Self, TransportError> {
+        config.validate()?;
+        let expected = config.stream_config();
+        let subject_root = config.subject_root.clone();
+
+        let js = tokio::task::block_in_place(|| {
+            rt.block_on(async {
+                let client = async_nats::connect(&config.nats_url)
+                    .await
+                    .map_err(|e| TransportError(format!("nats connect: {e}")))?;
+                let js = jetstream::new(client);
+                let stream = js
+                    .get_or_create_stream(expected.clone())
+                    .await
+                    .map_err(|e| TransportError(format!("create/get stream: {e}")))?;
+                validate_stream_config(&stream.cached_info().config, &expected)?;
+                Ok::<Context, TransportError>(js)
+            })
+        })?;
+
+        Ok(Self {
+            js,
+            subject_root,
+            rt,
+        })
+    }
+
+    fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
+        tokio::task::block_in_place(|| self.rt.block_on(fut))
+    }
+}
+
+impl EventPublisher for NatsJetStreamPublisher {
+    fn publish(
+        &self,
+        subject: &ArtifactRef,
+        envelope: &EventEnvelope,
+        dedup_id: &EventId,
+    ) -> Result<Delivery, TransportError> {
+        let nats_subject = event_subject(&self.subject_root, subject, envelope);
+        let body = serde_json::to_vec(envelope)
+            .map_err(|e| TransportError(format!("serialize envelope: {e}")))?;
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert("Nats-Msg-Id", dedup_id.0.as_str());
+        let ack = self.block(async {
+            self.js
+                .publish_with_headers(nats_subject, headers, body.into())
+                .await
+                .map_err(|e| TransportError(format!("publish: {e}")))?
+                .await
+                .map_err(|e| TransportError(format!("publish ack: {e}")))
+        })?;
+        Ok(if ack.duplicate {
+            Delivery::Deduplicated
+        } else {
+            Delivery::Accepted
+        })
+    }
+}
 
 /// The [`BusTransport`] backed by a real NATS JetStream stream + durable PULL consumer.
 pub struct NatsJetStreamBus {
@@ -131,23 +378,63 @@ impl NatsJetStreamBus {
     /// sanitised opaque token under the same root so delivery is never dropped (lag, not loss) and
     /// the reason is observable via the returned subject shape.
     fn subject_for(&self, subject: &ArtifactRef, envelope: &EventEnvelope) -> String {
-        match crate::partition::StreamSubject::of(envelope) {
-            Ok(s) => format!("{}.{}", self.subject_root, s.to_subject()),
-            Err(_) => {
-                // Defensive fallback: a single sanitised token under the root (the dedup id, not
-                // the subject, carries identity — the subject only needs to be stably filtered).
-                let token: String = subject
-                    .0
-                    .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                    .collect();
-                format!("{}._malformed.{}", self.subject_root, token)
-            }
-        }
+        event_subject(&self.subject_root, subject, envelope)
     }
 
     fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
         tokio::task::block_in_place(|| self.rt.block_on(fut))
+    }
+}
+
+#[cfg(test)]
+mod publisher_tests {
+    use super::*;
+
+    fn config() -> JetStreamPublisherConfig {
+        JetStreamPublisherConfig {
+            nats_url: "nats://127.0.0.1:4222".into(),
+            stream_name: "MYELIN_EVENTS".into(),
+            subject_root: "myelin.events".into(),
+            max_age: std::time::Duration::from_secs(90 * 24 * 60 * 60),
+            max_bytes: 64 * 1024 * 1024,
+            max_messages: 100_000,
+            replicas: 3,
+            duplicate_window: std::time::Duration::from_secs(120),
+        }
+    }
+
+    #[test]
+    fn production_stream_config_is_finite_file_backed_limits_retention() {
+        let cfg = config();
+        cfg.validate().expect("valid explicit config");
+        let stream = cfg.stream_config();
+        assert_eq!(stream.storage, StorageType::File);
+        assert_eq!(stream.retention, RetentionPolicy::Limits);
+        assert_eq!(stream.discard, DiscardPolicy::Old);
+        assert_eq!(stream.max_age, cfg.max_age);
+        assert_eq!(stream.max_bytes, cfg.max_bytes);
+        assert_eq!(stream.max_messages, cfg.max_messages);
+        assert_eq!(stream.num_replicas, cfg.replicas);
+        assert_eq!(stream.subjects, vec!["myelin.events.>"]);
+        assert_eq!(stream.duplicate_window, cfg.duplicate_window);
+    }
+
+    #[test]
+    fn refuses_unbounded_or_drifted_stream_configuration() {
+        let mut cfg = config();
+        cfg.max_bytes = -1;
+        assert!(cfg.validate().is_err());
+
+        let expected = config().stream_config();
+        let mut actual = expected.clone();
+        actual.num_replicas = 1;
+        let err = validate_stream_config(&actual, &expected).expect_err("replica drift");
+        assert!(err.0.contains("replicas=1"));
+
+        let mut actual = expected.clone();
+        actual.discard = DiscardPolicy::New;
+        let err = validate_stream_config(&actual, &expected).expect_err("discard drift");
+        assert!(err.0.contains("discard=New"));
     }
 }
 
