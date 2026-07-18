@@ -37,6 +37,7 @@ use myelin_config::Mode;
 use myelin_events::OutboxStore;
 use myelin_storage::{all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking};
 use myelin_substrate::Config;
+use std::ffi::OsString;
 use std::fmt;
 use std::sync::Arc;
 
@@ -44,6 +45,7 @@ use std::sync::Arc;
 enum StartupRefusal {
     IncompleteProductionRunner,
     InvalidRunnerSetting(String),
+    NonUnicodeRunnerSetting(OsString),
 }
 
 impl fmt::Display for StartupRefusal {
@@ -58,17 +60,28 @@ impl fmt::Display for StartupRefusal {
                 f,
                 "invalid MYELIN_CI_RUNNER value {value:?}; allowed values are `0`, `1`, or unset"
             ),
+            Self::NonUnicodeRunnerSetting(value) => write!(
+                f,
+                "invalid MYELIN_CI_RUNNER value {value:?} contains non-UTF-8 bytes; allowed values \
+                 are `0`, `1`, or unset"
+            ),
         }
     }
 }
 
 impl std::error::Error for StartupRefusal {}
 
-fn verify_startup_activation(runner_setting: Option<&str>) -> Result<(), StartupRefusal> {
+fn verify_startup_activation(
+    runner_setting: Result<String, std::env::VarError>,
+) -> Result<(), StartupRefusal> {
     match runner_setting {
-        None | Some("0") => Ok(()),
-        Some("1") => Err(StartupRefusal::IncompleteProductionRunner),
-        Some(value) => Err(StartupRefusal::InvalidRunnerSetting(value.to_owned())),
+        Err(std::env::VarError::NotPresent) => Ok(()),
+        Ok(value) if value == "0" => Ok(()),
+        Ok(value) if value == "1" => Err(StartupRefusal::IncompleteProductionRunner),
+        Ok(value) => Err(StartupRefusal::InvalidRunnerSetting(value)),
+        Err(std::env::VarError::NotUnicode(value)) => {
+            Err(StartupRefusal::NonUnicodeRunnerSetting(value))
+        }
     }
 }
 
@@ -77,8 +90,8 @@ async fn main() {
     // The former runner composition reached sandbox execution with accept-all billing/attribution
     // hooks, placeholder tenancy, and an unresolved stage-spec builder. Keep the flag reserved,
     // but refuse it before PostgreSQL bootstrap until all launch authorities are real and durable.
-    let runner_setting = std::env::var("MYELIN_CI_RUNNER").ok();
-    if let Err(e) = verify_startup_activation(runner_setting.as_deref()) {
+    let runner_setting = std::env::var("MYELIN_CI_RUNNER");
+    if let Err(e) = verify_startup_activation(runner_setting) {
         eprintln!("ci-controlplane: startup refused: {e}");
         std::process::exit(1);
     }
@@ -188,18 +201,36 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::{verify_startup_activation, StartupRefusal};
+    use std::env::VarError;
 
     #[test]
     fn production_runner_flag_has_a_typed_fail_closed_verdict() {
         assert_eq!(
-            verify_startup_activation(Some("1")),
+            verify_startup_activation(Ok("1".to_owned())),
             Err(StartupRefusal::IncompleteProductionRunner)
         );
-        assert_eq!(verify_startup_activation(None), Ok(()));
-        assert_eq!(verify_startup_activation(Some("0")), Ok(()));
+        assert_eq!(verify_startup_activation(Err(VarError::NotPresent)), Ok(()));
+        assert_eq!(verify_startup_activation(Ok("0".to_owned())), Ok(()));
         assert_eq!(
-            verify_startup_activation(Some("true")),
+            verify_startup_activation(Ok("true".to_owned())),
             Err(StartupRefusal::InvalidRunnerSetting("true".to_owned()))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_runner_flag_has_a_typed_fail_closed_verdict() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = OsString::from_vec(vec![b'1', 0xff]);
+        let refusal = verify_startup_activation(Err(VarError::NotUnicode(invalid.clone())))
+            .expect_err("non-UTF-8 runner setting must be refused");
+
+        assert_eq!(refusal, StartupRefusal::NonUnicodeRunnerSetting(invalid));
+        assert!(refusal.to_string().contains("contains non-UTF-8 bytes"));
+        assert!(refusal
+            .to_string()
+            .contains("allowed values are `0`, `1`, or unset"));
     }
 }
