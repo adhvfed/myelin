@@ -654,7 +654,12 @@ pub fn persist_gate_decision(
         }
         HitlGateState::Rejected => {
             let decider = decided_by.ok_or(GateDecideError::NotEligible)?;
-            store.reject(scope, &gate.gate_id.0, &decider.principal_id.0)
+            store.reject(
+                scope,
+                &gate.gate_id.0,
+                &decider.principal_id.0,
+                decider.kind.clone(),
+            )
         }
         HitlGateState::Expired => store.expire(scope, &gate.gate_id.0),
         HitlGateState::Waiting => Err(GateDecideError::NotFound),
@@ -1068,7 +1073,10 @@ mod tests {
             crate::effect_api::effect_gate_key_str("git.merge", "myelin://acme/git/pr/42"),
             "the durable verdict is keyed by the SAME per-effect key step 6 consults"
         );
-        assert_eq!(rec.cost_estimate, 50, "the LIVE cost estimate rides the row");
+        assert_eq!(
+            rec.cost_estimate, 50,
+            "the LIVE cost estimate rides the row"
+        );
         assert_eq!(rec.requested_by, "agent:claude");
         assert!(
             !rec.approver_filter.contains(&"agent:claude".to_string()),
@@ -1076,9 +1084,9 @@ mod tests {
         );
     }
 
-    /// **The decision UPDATEs the durable state — approve (distinct HUMAN approver, recorded),
-    /// reject, expire — and the store refuses a self-approval AND a machine approver even at persist
-    /// time (R2.4 / R2.4b).**
+    /// **The decision UPDATEs the durable state — approve/reject (distinct eligible HUMAN decider,
+    /// recorded), expire (system-only) — and the store refuses self, machine, and out-of-filter
+    /// deciders at persist time (R2.4 / R2.4b).**
     #[test]
     fn a_decision_updates_the_durable_verdict_with_distinct_human_approver() {
         let mut store = HitlVerdictStore::new();
@@ -1100,8 +1108,13 @@ mod tests {
         persist_gate_open(&mut s2, &scope(), &g2, "agent:claude").unwrap();
         g2.approve().unwrap();
         assert!(
-            persist_gate_decision(&mut s2, &scope(), &g2, Some(&agent_principal("agent:claude")))
-                .is_err(),
+            persist_gate_decision(
+                &mut s2,
+                &scope(),
+                &g2,
+                Some(&agent_principal("agent:claude"))
+            )
+            .is_err(),
             "the requesting agent cannot approve its own gate — even through the persist path"
         );
         assert_eq!(
@@ -1114,11 +1127,17 @@ mod tests {
         let mut sm = HitlVerdictStore::new();
         let mut gm = open_waiting();
         // list the machine principal in the gate's approver filter so only the human check bites.
-        gm.approver_filter.push(PrincipalId("machine:ci-bot".into()));
+        gm.approver_filter
+            .push(PrincipalId("machine:ci-bot".into()));
         persist_gate_open(&mut sm, &scope(), &gm, "agent:claude").unwrap();
         gm.approve().unwrap();
         assert_eq!(
-            persist_gate_decision(&mut sm, &scope(), &gm, Some(&agent_principal("machine:ci-bot"))),
+            persist_gate_decision(
+                &mut sm,
+                &scope(),
+                &gm,
+                Some(&agent_principal("machine:ci-bot"))
+            ),
             Err(GateDecideError::MachineApproverRefused),
             "a distinct, in-filter MACHINE approver is refused (distinct-HUMAN, R2.4b)"
         );
@@ -1128,14 +1147,56 @@ mod tests {
             "the machine-refused approval left the durable row undecided"
         );
 
-        // REJECT + EXPIRE settle their durable states (0 mutation either way, AG-8). A reject may be
-        // any principal (declining grants nothing) — a machine decider is fine here.
+        // REJECT + EXPIRE settle their durable states (0 effect mutation either way, AG-8). A
+        // terminal reject is a DoS capability over the effect, so the shared verdict store requires
+        // the same distinct, eligible Human decision proof as approve. Only system expiry has no
+        // Human decider.
+        for (tag, decider, expected) in [
+            (
+                "self",
+                agent_principal("agent:claude"),
+                GateDecideError::SelfApproval,
+            ),
+            (
+                "stranger",
+                human_principal("psn:stranger"),
+                GateDecideError::NotEligible,
+            ),
+            (
+                "machine",
+                agent_principal("machine:ci-bot"),
+                GateDecideError::MachineApproverRefused,
+            ),
+        ] {
+            let mut denied_store = HitlVerdictStore::new();
+            let mut denied_gate = open_waiting();
+            denied_gate.gate_id.0.push_str(tag);
+            denied_gate
+                .approver_filter
+                .push(PrincipalId("machine:ci-bot".into()));
+            persist_gate_open(&mut denied_store, &scope(), &denied_gate, "agent:claude").unwrap();
+            denied_gate.reject("no").unwrap();
+            assert_eq!(
+                persist_gate_decision(&mut denied_store, &scope(), &denied_gate, Some(&decider),),
+                Err(expected)
+            );
+            assert_eq!(
+                denied_store
+                    .fetch(&scope(), &denied_gate.gate_id.0)
+                    .unwrap()
+                    .state,
+                DurableGateState::Waiting
+            );
+        }
         let mut s3 = HitlVerdictStore::new();
         let mut g3 = open_waiting();
         persist_gate_open(&mut s3, &scope(), &g3, "agent:claude").unwrap();
         g3.reject("no").unwrap();
         persist_gate_decision(&mut s3, &scope(), &g3, Some(&human_principal("psn:lead"))).unwrap();
-        assert_eq!(s3.fetch(&scope(), &g3.gate_id.0).unwrap().state, DurableGateState::Rejected);
+        assert_eq!(
+            s3.fetch(&scope(), &g3.gate_id.0).unwrap().state,
+            DurableGateState::Rejected
+        );
 
         let mut s4 = HitlVerdictStore::new();
         let mut g4 = open_waiting();

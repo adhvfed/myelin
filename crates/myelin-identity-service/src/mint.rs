@@ -149,6 +149,18 @@ impl RunTokenAuthorizer {
         if verified.kind != MachineKind::Agent {
             return Err("presented token is not an agent run token".into());
         }
+        match &verified.purpose {
+            CredentialPurpose::AgentRun {
+                delegation_snapshot: Some(snapshot),
+                ..
+            } if *snapshot > 0 => {}
+            CredentialPurpose::AgentRun { .. } => {
+                return Err(
+                    "agent run token is not bound to a positive durable delegation snapshot".into(),
+                )
+            }
+            _ => return Err("presented token purpose is not `agent_run`".into()),
+        }
         if verified.jti != run_token.jti {
             return Err("run-token carrier jti does not match the signed jti".into());
         }
@@ -984,19 +996,28 @@ mod tests {
         let minter = RunTokenMinter::new(s7.clone());
         let acme = scope("acme");
         let minted_at = ts("2026-06-19T00:00:00Z");
+        let agent = agent("p:agent", "acme");
+        let trigger = human("p:human", "acme");
+        let policy = resolved_policy(
+            "run-authority",
+            &agent,
+            &trigger,
+            input(
+                &["repo.push", "pull_request.merge"],
+                &["repo.push"],
+                &["repo.push", "pull_request.merge"],
+                &["repo.push", "pull_request.merge"],
+            ),
+            7,
+        );
         let token = minter
-            .mint_run_token(
+            .mint_from_resolved_policy(
                 &acme,
                 &PrincipalId("p:agent".into()),
                 &RunId("run-authority".into()),
-                &agent("p:agent", "acme"),
-                &human("p:human", "acme"),
-                &input(
-                    &["repo.push", "pull_request.merge"],
-                    &["repo.push"],
-                    &["repo.push", "pull_request.merge"],
-                    &["repo.push", "pull_request.merge"],
-                ),
+                &agent,
+                &trigger,
+                &policy,
                 &caveats(&["repo.push"]),
                 MachineKind::Agent,
                 &ttl(300),
@@ -1042,19 +1063,28 @@ mod tests {
         let s7 = RevocationStore::new();
         let minter = RunTokenMinter::new(s7.clone());
         let acme = scope("acme");
+        let agent = agent("p:agent", "acme");
+        let trigger = human("p:human", "acme");
+        let policy = resolved_policy(
+            "run-binding",
+            &agent,
+            &trigger,
+            input(
+                &["repo.push"],
+                &["repo.push"],
+                &["repo.push"],
+                &["repo.push"],
+            ),
+            9,
+        );
         let token = minter
-            .mint_run_token(
+            .mint_from_resolved_policy(
                 &acme,
                 &PrincipalId("p:agent".into()),
                 &RunId("run-binding".into()),
-                &agent("p:agent", "acme"),
-                &human("p:human", "acme"),
-                &input(
-                    &["repo.push"],
-                    &["repo.push"],
-                    &["repo.push"],
-                    &["repo.push"],
-                ),
+                &agent,
+                &trigger,
+                &policy,
                 &caveats(&["repo.push"]),
                 MachineKind::Agent,
                 &ttl(300),
@@ -1093,6 +1123,43 @@ mod tests {
             )
             .expect_err("scope mismatch")
             .contains("scope"));
+    }
+
+    #[test]
+    fn final_boundary_refuses_snapshotless_agent_run_even_when_capability_matches() {
+        let s7 = RevocationStore::new();
+        let minter = RunTokenMinter::new(s7.clone());
+        let acme = scope("acme");
+        let token = minter
+            .mint_run_token(
+                &acme,
+                &PrincipalId("p:agent".into()),
+                &RunId("legacy-raw-policy-run".into()),
+                &agent("p:agent", "acme"),
+                &human("p:human", "acme"),
+                &input(
+                    &["repo.push"],
+                    &["repo.push"],
+                    &["repo.push"],
+                    &["repo.push"],
+                ),
+                &caveats(&["repo.push"]),
+                MachineKind::Agent,
+                &ttl(300),
+                &ts("2026-06-19T00:00:00Z"),
+            )
+            .expect("legacy raw-policy mint remains available outside production routing");
+        let authorizer = RunTokenAuthorizer::new(Arc::new(StructuralTokenVerifier::new()), s7)
+            .with_clock(|| ts("2026-06-19T00:01:00Z"));
+        let denied = authorizer
+            .authorize(
+                &acme,
+                &PrincipalId("p:agent".into()),
+                &token,
+                &["repo.push".into()],
+            )
+            .expect_err("snapshot-less AgentRun must never reach a mutation adapter");
+        assert!(denied.contains("durable delegation snapshot"));
     }
 
     /// **Minting re-checks "cannot delegate what you lack": the token's authority is the monotone

@@ -116,7 +116,10 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
         .expect("the gate row is visible across store instances/pools");
     assert_eq!(rec.state, GateState::Waiting);
     assert_eq!(rec.requested_by, "agent:claude");
-    assert!(!rec.authorizes(effect, "agent:claude"), "a waiting gate authorizes nothing");
+    assert!(
+        !rec.authorizes(effect, "agent:claude"),
+        "a waiting gate authorizes nothing"
+    );
 
     // (2) The distinct-HUMAN-approver rule holds in the DURABLE arm: self-approval, a distinct
     //     MACHINE (R2.4b), and an out-of-filter principal are all refused and the row STAYS waiting.
@@ -130,7 +133,10 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
             &scope,
             &gate_id,
             "psn:lead",
-            PrincipalKind::Agent { runtime_ref: RuntimeRef("rt".into()), on_behalf_of: None }
+            PrincipalKind::Agent {
+                runtime_ref: RuntimeRef("rt".into()),
+                on_behalf_of: None
+            }
         ),
         Err(GateDecideError::MachineApproverRefused),
         "a distinct, in-filter MACHINE approver is refused durably (distinct-HUMAN, R2.4b)"
@@ -139,7 +145,10 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
         store2.approve(&scope, &gate_id, "psn:stranger", PrincipalKind::Human),
         Err(GateDecideError::NotEligible)
     );
-    assert_eq!(store1.fetch(&scope, &gate_id).unwrap().state, GateState::Waiting);
+    assert_eq!(
+        store1.fetch(&scope, &gate_id).unwrap().state,
+        GateState::Waiting
+    );
 
     // A distinct eligible HUMAN approves through instance TWO ...
     store2
@@ -164,11 +173,18 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
     // (3) A sibling gate rejected through ONE reads rejected from TWO (withheld forever).
     let gate2 = format!("gate:{suffix}-2");
     let effect2 = "gate:git.merge:myelin://acme/git/pr/41";
-    store1.open(&scope, waiting(&suffix, &gate2, effect2)).expect("second gate opens");
-    store1.reject(&scope, &gate2, "psn:lead").expect("rejects");
+    store1
+        .open(&scope, waiting(&suffix, &gate2, effect2))
+        .expect("second gate opens");
+    store1
+        .reject(&scope, &gate2, "psn:lead", PrincipalKind::Human)
+        .expect("rejects");
     let rec2 = store2.fetch(&scope, &gate2).unwrap();
     assert_eq!(rec2.state, GateState::Rejected);
-    assert!(!rec2.authorizes(effect2, "agent:claude"), "a rejected gate never authorizes");
+    assert!(
+        !rec2.authorizes(effect2, "agent:claude"),
+        "a rejected gate never authorizes"
+    );
 
     // Cleanup (admin role — RLS-bypassing owner).
     let _ = sqlx::query("DELETE FROM agent_hitl_gate WHERE tenant_id = $1 AND region = $2")

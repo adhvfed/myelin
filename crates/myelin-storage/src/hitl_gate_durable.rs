@@ -6,10 +6,10 @@
 //! CALLER-SUPPLIED boolean on the MCP `tools/call` body, and the gate id was a deterministic display
 //! string never stored or looked up. **This module is the server-side verdict authority that closes
 //! it**: a gated tool/effect INSERTs a `waiting` row here; approve/reject/expire UPDATE the row's
-//! state (approve enforcing distinct-HUMAN-approver + eligibility SERVER-SIDE); and a re-drive is admitted
-//! ONLY if the presented `gate_id` is `approved` in THIS store — lookup-able across requests AND
-//! processes (the durable arm). The caller's `approval.granted` boolean is no longer an enforcement
-//! input anywhere.
+//! state (both approve and reject enforce distinct-HUMAN eligibility SERVER-SIDE); and a re-drive is
+//! admitted ONLY if the presented `gate_id` is `approved` in THIS store — lookup-able across
+//! requests AND processes (the durable arm). The caller's `approval.granted` boolean is no longer
+//! an enforcement input anywhere.
 //!
 //! ## The role-struct + backing shape (MR-009b convention — durable-by-default)
 //! [`HitlVerdictStore`] is the role struct; its backend enum has the always-compiled production arm
@@ -19,7 +19,8 @@
 //! `no-in-memory-durable-store` scanner). Same shape as `reserve_settle::CostLedger` / the W3b outbox.
 //!
 //! ## The distinct-HUMAN-approver rule (enforced server-side, twice)
-//! 1. **At decide time** ([`HitlVerdictStore::approve`]): the approver must be a **`Human`
+//! 1. **At decide time** ([`HitlVerdictStore::approve`] and [`HitlVerdictStore::reject`]): the
+//!    decider must be a **`Human`
 //!    principal** (R2.4b — a machine/agent/service principal is refused even if it sits in the
 //!    filter, closing the machine-collusion gap), must be a member of the gate's `approver_filter`,
 //!    AND must differ from the gate's `requested_by` (the agent principal that tripped the gate). A
@@ -88,7 +89,10 @@ CREATE POLICY myelin_tenant_isolation ON agent_hitl_gate \
 /// the `0053` bus-erasure group). In [`crate::provider::durable_migration_groups`] → boot-applied by
 /// `all_durable_migrations()` at every service main (W7.2 sequence); idempotent on re-boot.
 pub fn hitl_gate_durable_migrations() -> Migrations {
-    Migrations::of([Migration::plain("0054_agent_hitl_gate", AGENT_HITL_GATE_MIGRATION)])
+    Migrations::of([Migration::plain(
+        "0054_agent_hitl_gate",
+        AGENT_HITL_GATE_MIGRATION,
+    )])
 }
 
 /// **Mint an OPAQUE, unguessable gate id (R2.4 / R2.4b NIT).** 128 bits from the OS CSPRNG
@@ -151,7 +155,9 @@ impl GateState {
             "approved" => GateState::Approved,
             "rejected" => GateState::Rejected,
             "expired" => GateState::Expired,
-            other => panic!("FAIL-STATIC: unknown agent_hitl_gate.state `{other}` (durable corruption)"),
+            other => {
+                panic!("FAIL-STATIC: unknown agent_hitl_gate.state `{other}` (durable corruption)")
+            }
         }
     }
 
@@ -220,7 +226,9 @@ pub enum GateOpenError {
 impl core::fmt::Display for GateOpenError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            GateOpenError::Duplicate => write!(f, "agent_hitl_gate row already exists for this gate_id"),
+            GateOpenError::Duplicate => {
+                write!(f, "agent_hitl_gate row already exists for this gate_id")
+            }
             GateOpenError::NotWaiting => write!(f, "a gate must open in the waiting state"),
         }
     }
@@ -292,7 +300,14 @@ enum HitlVerdictBackend {
     #[cfg(any(test, feature = "test-support"))]
     Memory(MemoryHitlGates),
     /// The durable production backing over the `agent_hitl_gate` table.
-    Durable(DurableHitlGates),
+    Durable(Box<DurableHitlGates>),
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Default for HitlVerdictStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HitlVerdictStore {
@@ -310,7 +325,7 @@ impl HitlVerdictStore {
     /// `Handle::current()` for its sync→async bridge).
     pub fn with_pg(provider: crate::provider::SubstrateProvider) -> HitlVerdictStore {
         HitlVerdictStore {
-            backend: HitlVerdictBackend::Durable(DurableHitlGates::new(provider)),
+            backend: HitlVerdictBackend::Durable(Box::new(DurableHitlGates::new(provider))),
         }
     }
 
@@ -345,33 +360,41 @@ impl HitlVerdictStore {
         let is_human = matches!(approver_kind, PrincipalKind::Human);
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            HitlVerdictBackend::Memory(m) => {
-                m.decide(scope, gate_id, GateState::Approved, Some(approver), is_human)
-            }
-            HitlVerdictBackend::Durable(d) => {
-                d.decide(scope, gate_id, GateState::Approved, Some(approver), is_human)
-            }
+            HitlVerdictBackend::Memory(m) => m.decide(
+                scope,
+                gate_id,
+                GateState::Approved,
+                Some(approver),
+                is_human,
+            ),
+            HitlVerdictBackend::Durable(d) => d.decide(
+                scope,
+                gate_id,
+                GateState::Approved,
+                Some(approver),
+                is_human,
+            ),
         }
     }
 
     /// **REJECT a waiting gate** (`decided_by = decider`; the reject reason rides the trace/audit
-    /// domain side, not this row). The eligibility/self-approval checks do NOT apply to a reject —
-    /// any principal may decline (declining grants nothing) — but the waiting-only rule does.
+    /// domain side, not this row). A terminal rejection is a denial-of-service capability over the
+    /// requested effect, so it requires the same distinct Human eligibility proof as approval.
     pub fn reject(
         &mut self,
         scope: &TenantScope,
         gate_id: &str,
         decider: &str,
+        decider_kind: PrincipalKind,
     ) -> Result<(), GateDecideError> {
-        // The human/eligibility checks do NOT apply to a reject (declining grants nothing) — the
-        // `is_human` flag is inert for a non-Approved transition (see `decide_rules`).
+        let is_human = matches!(decider_kind, PrincipalKind::Human);
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
             HitlVerdictBackend::Memory(m) => {
-                m.decide(scope, gate_id, GateState::Rejected, Some(decider), false)
+                m.decide(scope, gate_id, GateState::Rejected, Some(decider), is_human)
             }
             HitlVerdictBackend::Durable(d) => {
-                d.decide(scope, gate_id, GateState::Rejected, Some(decider), false)
+                d.decide(scope, gate_id, GateState::Rejected, Some(decider), is_human)
             }
         }
     }
@@ -380,8 +403,12 @@ impl HitlVerdictStore {
     pub fn expire(&mut self, scope: &TenantScope, gate_id: &str) -> Result<(), GateDecideError> {
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            HitlVerdictBackend::Memory(m) => m.decide(scope, gate_id, GateState::Expired, None, false),
-            HitlVerdictBackend::Durable(d) => d.decide(scope, gate_id, GateState::Expired, None, false),
+            HitlVerdictBackend::Memory(m) => {
+                m.decide(scope, gate_id, GateState::Expired, None, false)
+            }
+            HitlVerdictBackend::Durable(d) => {
+                d.decide(scope, gate_id, GateState::Expired, None, false)
+            }
         }
     }
 
@@ -428,7 +455,11 @@ struct MemoryHitlGates {
 #[cfg(any(test, feature = "test-support"))]
 impl MemoryHitlGates {
     fn key(scope: &TenantScope, gate_id: &str) -> (String, String, String) {
-        (scope.tenant().0.clone(), scope.region().0.clone(), gate_id.to_string())
+        (
+            scope.tenant().0.clone(),
+            scope.region().0.clone(),
+            gate_id.to_string(),
+        )
     }
 
     fn open(&mut self, scope: &TenantScope, record: GateRecord) -> Result<(), GateOpenError> {
@@ -460,25 +491,31 @@ impl MemoryHitlGates {
         self.rows.get(&Self::key(scope, gate_id)).cloned()
     }
 
-    fn find_waiting(&self, scope: &TenantScope, run_id: &str, effect_id: &str) -> Option<GateRecord> {
+    fn find_waiting(
+        &self,
+        scope: &TenantScope,
+        run_id: &str,
+        effect_id: &str,
+    ) -> Option<GateRecord> {
         let (t, rg) = (scope.tenant().0.as_str(), scope.region().0.as_str());
         self.rows
             .iter()
             .filter(|((kt, kr, _), _)| kt == t && kr == rg)
             .map(|(_, v)| v)
-            .find(|v| v.state == GateState::Waiting && v.run_id == run_id && v.effect_id == effect_id)
+            .find(|v| {
+                v.state == GateState::Waiting && v.run_id == run_id && v.effect_id == effect_id
+            })
             .cloned()
     }
 }
 
 /// The SHARED decide-time rules (the memory arm applies them in Rust; the durable arm applies the
 /// SAME predicate as the pre-read validation of its guarded SQL UPDATE, so the refusal is TYPED,
-/// not a bare rows-affected-0). Fail-closed: waiting-only; **approve** additionally requires (in
+/// not a bare rows-affected-0). Fail-closed: waiting-only; Human decisions additionally require (in
 /// order) a distinct principal, a HUMAN principal (R2.4b), and membership in the approver filter.
 ///
-/// The `approver_is_human` flag is the AUTHENTICATED approver's `PrincipalKind == Human` — it is
-/// only consulted for an `Approved` transition (a reject/expire grants nothing, so the human check
-/// does not apply and the flag is inert).
+/// The `approver_is_human` flag is the AUTHENTICATED decider's `PrincipalKind == Human`. It applies
+/// to approval and rejection; system expiry is the only decision without a Human.
 fn decide_rules(
     row: &GateRecord,
     to: GateState,
@@ -488,7 +525,7 @@ fn decide_rules(
     if row.state.is_terminal() {
         return Err(GateDecideError::AlreadyDecided(row.state));
     }
-    if to == GateState::Approved {
+    if matches!(to, GateState::Approved | GateState::Rejected) {
         let Some(approver) = decider else {
             return Err(GateDecideError::NotEligible);
         };
@@ -604,11 +641,13 @@ impl DurableHitlGates {
         let tenant = scope.tenant().0.clone();
         let gate_id = gate_id.to_string();
         let decider = decider.map(str::to_string);
-        self.block(self.provider.with_tenant_tx(&scope.tenant().0, move |conn| {
-            Box::pin(async move {
-                // One tenant-scoped tx: read the row FOR UPDATE, validate the SAME decide rules the
-                // memory arm applies (typed refusal), then write the terminal state + decided_by.
-                let row = sqlx::query(
+        self.block(
+            self.provider
+                .with_tenant_tx(&scope.tenant().0, move |conn| {
+                    Box::pin(async move {
+                        // One tenant-scoped tx: read the row FOR UPDATE, validate the SAME decide rules the
+                        // memory arm applies (typed refusal), then write the terminal state + decided_by.
+                        let row = sqlx::query(
                     "SELECT run_id, effect_id, risk_summary, cost_estimate, approver_filter, \
                             state, card_ref, requested_by, decided_by \
                      FROM agent_hitl_gate \
@@ -620,37 +659,42 @@ impl DurableHitlGates {
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                let Some(row) = row else {
-                    return Ok(Err(GateDecideError::NotFound));
-                };
-                let record = row_to_record(&gate_id, &row);
-                if let Err(e) = decide_rules(&record, to, decider.as_deref(), approver_is_human) {
-                    return Ok(Err(e));
-                }
-                sqlx::query(
-                    "UPDATE agent_hitl_gate SET state = $4, decided_by = $5 \
+                        let Some(row) = row else {
+                            return Ok(Err(GateDecideError::NotFound));
+                        };
+                        let record = row_to_record(&gate_id, &row);
+                        if let Err(e) =
+                            decide_rules(&record, to, decider.as_deref(), approver_is_human)
+                        {
+                            return Ok(Err(e));
+                        }
+                        sqlx::query(
+                            "UPDATE agent_hitl_gate SET state = $4, decided_by = $5 \
                      WHERE tenant_id = $1 AND region = $2 AND gate_id = $3 AND state = 'waiting'",
-                )
-                .bind(&tenant)
-                .bind(&region)
-                .bind(&gate_id)
-                .bind(to.as_str())
-                .bind(&decider)
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                Ok(Ok(()))
-            })
-        }))
+                        )
+                        .bind(&tenant)
+                        .bind(&region)
+                        .bind(&gate_id)
+                        .bind(to.as_str())
+                        .bind(&decider)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                        Ok(Ok(()))
+                    })
+                }),
+        )
     }
 
     fn fetch(&self, scope: &TenantScope, gate_id: &str) -> Option<GateRecord> {
         let region = self.region();
         let tenant = scope.tenant().0.clone();
         let gate_id = gate_id.to_string();
-        self.block(self.provider.with_tenant_tx(&scope.tenant().0, move |conn| {
-            Box::pin(async move {
-                let row = sqlx::query(
+        self.block(
+            self.provider
+                .with_tenant_tx(&scope.tenant().0, move |conn| {
+                    Box::pin(async move {
+                        let row = sqlx::query(
                     "SELECT run_id, effect_id, risk_summary, cost_estimate, approver_filter, \
                             state, card_ref, requested_by, decided_by \
                      FROM agent_hitl_gate \
@@ -662,40 +706,49 @@ impl DurableHitlGates {
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                Ok(row.map(|r| row_to_record(&gate_id, &r)))
-            })
-        }))
+                        Ok(row.map(|r| row_to_record(&gate_id, &r)))
+                    })
+                }),
+        )
     }
 
-    fn find_waiting(&self, scope: &TenantScope, run_id: &str, effect_id: &str) -> Option<GateRecord> {
+    fn find_waiting(
+        &self,
+        scope: &TenantScope,
+        run_id: &str,
+        effect_id: &str,
+    ) -> Option<GateRecord> {
         let region = self.region();
         let tenant = scope.tenant().0.clone();
         let run_id = run_id.to_string();
         let effect_id = effect_id.to_string();
-        self.block(self.provider.with_tenant_tx(&scope.tenant().0, move |conn| {
-            Box::pin(async move {
-                let row = sqlx::query(
-                    "SELECT gate_id, run_id, effect_id, risk_summary, cost_estimate, \
+        self.block(
+            self.provider
+                .with_tenant_tx(&scope.tenant().0, move |conn| {
+                    Box::pin(async move {
+                        let row = sqlx::query(
+                            "SELECT gate_id, run_id, effect_id, risk_summary, cost_estimate, \
                             approver_filter, state, card_ref, requested_by, decided_by \
                      FROM agent_hitl_gate \
                      WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND effect_id = $4 \
                        AND state = 'waiting' \
                      ORDER BY gate_id LIMIT 1",
-                )
-                .bind(&tenant)
-                .bind(&region)
-                .bind(&run_id)
-                .bind(&effect_id)
-                .fetch_optional(&mut *conn)
-                .await
-                .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                Ok(row.map(|r| {
-                    use sqlx::Row as _;
-                    let gid: String = r.get("gate_id");
-                    row_to_record(&gid, &r)
-                }))
-            })
-        }))
+                        )
+                        .bind(&tenant)
+                        .bind(&region)
+                        .bind(&run_id)
+                        .bind(&effect_id)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                        Ok(row.map(|r| {
+                            use sqlx::Row as _;
+                            let gid: String = r.get("gate_id");
+                            row_to_record(&gid, &r)
+                        }))
+                    })
+                }),
+        )
     }
 }
 
@@ -716,7 +769,9 @@ fn row_to_record(gate_id: &str, row: &sqlx::postgres::PgRow) -> GateRecord {
         state: GateState::parse(row.get::<String, _>("state").as_str()),
         card_ref: row.try_get::<Option<String>, _>("card_ref").unwrap_or(None),
         requested_by: row.get("requested_by"),
-        decided_by: row.try_get::<Option<String>, _>("decided_by").unwrap_or(None),
+        decided_by: row
+            .try_get::<Option<String>, _>("decided_by")
+            .unwrap_or(None),
     }
 }
 
@@ -759,7 +814,9 @@ mod tests {
     fn open_inserts_waiting_and_is_fetchable_by_gate_id() {
         let mut s = HitlVerdictStore::new();
         s.open(&scope(), waiting("gate:abc123")).expect("opens");
-        let rec = s.fetch(&scope(), "gate:abc123").expect("lookup-able by gate_id");
+        let rec = s
+            .fetch(&scope(), "gate:abc123")
+            .expect("lookup-able by gate_id");
         assert_eq!(rec.state, GateState::Waiting);
         assert_eq!(rec.requested_by, "agent:claude");
         assert_eq!(
@@ -768,7 +825,13 @@ mod tests {
             "a duplicate gate_id refuses"
         );
         assert_eq!(
-            s.open(&scope(), GateRecord { state: GateState::Approved, ..waiting("gate:x") }),
+            s.open(
+                &scope(),
+                GateRecord {
+                    state: GateState::Approved,
+                    ..waiting("gate:x")
+                }
+            ),
             Err(GateOpenError::NotWaiting),
             "a gate always opens undecided"
         );
@@ -837,7 +900,10 @@ mod tests {
                 "a distinct, in-filter MACHINE approver is still refused (distinct-HUMAN rule)"
             );
             // the refused approval left the gate undecided.
-            assert_eq!(s.fetch(&scope(), "gate:m").unwrap().state, GateState::Waiting);
+            assert_eq!(
+                s.fetch(&scope(), "gate:m").unwrap().state,
+                GateState::Waiting
+            );
         }
 
         // A distinct eligible HUMAN clears the same gate.
@@ -847,7 +913,62 @@ mod tests {
         s.open(&scope(), rec).unwrap();
         s.approve(&scope(), "gate:m2", "psn:lead", PrincipalKind::Human)
             .expect("a human approver clears the gate");
-        assert_eq!(s.fetch(&scope(), "gate:m2").unwrap().state, GateState::Approved);
+        assert_eq!(
+            s.fetch(&scope(), "gate:m2").unwrap().state,
+            GateState::Approved
+        );
+    }
+
+    #[test]
+    fn reject_requires_the_same_distinct_eligible_human_as_approve() {
+        let mut rec = waiting("gate:reject");
+        rec.approver_filter.push("agent:claude".into());
+        rec.approver_filter.push("machine:ci-bot".into());
+        let mut store = HitlVerdictStore::new();
+        store.open(&scope(), rec).unwrap();
+
+        assert_eq!(
+            store.reject(
+                &scope(),
+                "gate:reject",
+                "agent:claude",
+                PrincipalKind::Human,
+            ),
+            Err(GateDecideError::SelfApproval)
+        );
+        assert_eq!(
+            store.reject(
+                &scope(),
+                "gate:reject",
+                "psn:stranger",
+                PrincipalKind::Human,
+            ),
+            Err(GateDecideError::NotEligible)
+        );
+        for kind in [
+            PrincipalKind::Service,
+            PrincipalKind::Agent {
+                runtime_ref: myelin_identity::RuntimeRef("rt:reject".into()),
+                on_behalf_of: None,
+            },
+        ] {
+            assert_eq!(
+                store.reject(&scope(), "gate:reject", "machine:ci-bot", kind),
+                Err(GateDecideError::MachineApproverRefused)
+            );
+        }
+        assert_eq!(
+            store.fetch(&scope(), "gate:reject").unwrap().state,
+            GateState::Waiting,
+            "every refused reject leaves the gate waiting"
+        );
+        store
+            .reject(&scope(), "gate:reject", "psn:lead", PrincipalKind::Human)
+            .expect("eligible distinct Human may reject");
+        assert_eq!(
+            store.fetch(&scope(), "gate:reject").unwrap().state,
+            GateState::Rejected
+        );
     }
 
     /// A terminal gate never re-transitions (double-decide refused, both directions).
@@ -855,19 +976,21 @@ mod tests {
     fn a_terminal_gate_refuses_re_decision() {
         let mut s = HitlVerdictStore::new();
         s.open(&scope(), waiting("gate:a")).unwrap();
-        s.approve(&scope(), "gate:a", "psn:lead", PrincipalKind::Human).unwrap();
+        s.approve(&scope(), "gate:a", "psn:lead", PrincipalKind::Human)
+            .unwrap();
         assert_eq!(
             s.approve(&scope(), "gate:a", "psn:maintainer", PrincipalKind::Human),
             Err(GateDecideError::AlreadyDecided(GateState::Approved))
         );
         assert_eq!(
-            s.reject(&scope(), "gate:a", "psn:lead"),
+            s.reject(&scope(), "gate:a", "psn:lead", PrincipalKind::Human),
             Err(GateDecideError::AlreadyDecided(GateState::Approved))
         );
 
         let mut s2 = HitlVerdictStore::new();
         s2.open(&scope(), waiting("gate:b")).unwrap();
-        s2.reject(&scope(), "gate:b", "psn:lead").unwrap();
+        s2.reject(&scope(), "gate:b", "psn:lead", PrincipalKind::Human)
+            .unwrap();
         assert_eq!(
             s2.approve(&scope(), "gate:b", "psn:lead", PrincipalKind::Human),
             Err(GateDecideError::AlreadyDecided(GateState::Rejected)),
@@ -887,7 +1010,8 @@ mod tests {
         let rec = s.fetch(&scope(), "gate:a").unwrap();
         assert!(!rec.authorizes("gate:git.merge:myelin://acme/git/pr/40", "agent:claude"));
 
-        s.approve(&scope(), "gate:a", "psn:lead", PrincipalKind::Human).unwrap();
+        s.approve(&scope(), "gate:a", "psn:lead", PrincipalKind::Human)
+            .unwrap();
         let rec = s.fetch(&scope(), "gate:a").unwrap();
         assert!(
             rec.authorizes("gate:git.merge:myelin://acme/git/pr/40", "agent:claude"),
@@ -905,7 +1029,8 @@ mod tests {
         // A rejected gate never authorizes.
         let mut s2 = HitlVerdictStore::new();
         s2.open(&scope(), waiting("gate:b")).unwrap();
-        s2.reject(&scope(), "gate:b", "psn:lead").unwrap();
+        s2.reject(&scope(), "gate:b", "psn:lead", PrincipalKind::Human)
+            .unwrap();
         let rec = s2.fetch(&scope(), "gate:b").unwrap();
         assert!(!rec.authorizes("gate:git.merge:myelin://acme/git/pr/40", "agent:claude"));
     }
@@ -917,7 +1042,11 @@ mod tests {
         let mut s = HitlVerdictStore::new();
         s.open(&scope(), waiting("gate:a")).unwrap();
         let found = s
-            .find_waiting(&scope(), "mcp-run-1", "gate:git.merge:myelin://acme/git/pr/40")
+            .find_waiting(
+                &scope(),
+                "mcp-run-1",
+                "gate:git.merge:myelin://acme/git/pr/40",
+            )
             .expect("the pending gate is resurfaced (no duplicate spawn)");
         assert_eq!(found.gate_id, "gate:a");
 
@@ -926,8 +1055,12 @@ mod tests {
         assert_eq!(rec.state, GateState::Expired);
         assert_eq!(rec.decided_by, None, "an expiry has no decider");
         assert!(
-            s.find_waiting(&scope(), "mcp-run-1", "gate:git.merge:myelin://acme/git/pr/40")
-                .is_none(),
+            s.find_waiting(
+                &scope(),
+                "mcp-run-1",
+                "gate:git.merge:myelin://acme/git/pr/40"
+            )
+            .is_none(),
             "a decided gate is no longer waiting"
         );
         assert_eq!(
@@ -946,13 +1079,27 @@ mod tests {
         assert_eq!(m.0.len(), 1);
         assert_eq!(m.0[0].id, "0054_agent_hitl_gate");
         for col in [
-            "gate_id", "run_id", "effect_id", "risk_summary", "cost_estimate",
-            "approver_filter", "state", "card_ref", "requested_by", "decided_by",
+            "gate_id",
+            "run_id",
+            "effect_id",
+            "risk_summary",
+            "cost_estimate",
+            "approver_filter",
+            "state",
+            "card_ref",
+            "requested_by",
+            "decided_by",
         ] {
-            assert!(AGENT_HITL_GATE_MIGRATION.contains(col), "boot DDL carries `{col}`");
+            assert!(
+                AGENT_HITL_GATE_MIGRATION.contains(col),
+                "boot DDL carries `{col}`"
+            );
         }
         assert!(AGENT_HITL_GATE_MIGRATION.contains("PRIMARY KEY (tenant_id, region, gate_id)"));
         assert!(AGENT_HITL_GATE_MIGRATION.contains("FORCE ROW LEVEL SECURITY"));
-        assert!(AGENT_HITL_GATE_MIGRATION.contains("risk_summary    bytea"), "the PII slot stays an encrypted byte carrier");
+        assert!(
+            AGENT_HITL_GATE_MIGRATION.contains("risk_summary    bytea"),
+            "the PII slot stays an encrypted byte carrier"
+        );
     }
 }
