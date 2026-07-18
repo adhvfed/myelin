@@ -26,15 +26,18 @@
 //!      panic-safe backstop even if `pg_advisory_unlock` is never reached.
 //!   3. Under the lock, `CREATE TABLE IF NOT EXISTS myelin_applied_migration (…)` — the version
 //!      table that records what has been applied.
-//!   4. For each migration in order: if its `id` is already in `myelin_applied_migration`, SKIP it
-//!      (idempotent — the DDL never re-runs, so there is no concurrent `CREATE` to race). Otherwise
-//!      validate it is forward-only (reject a destructive `DROP` via [`is_destructive`]), run the
-//!      DDL, and INSERT the `(id, checksum)` row (`checksum` = BLAKE3 of the DDL — drift-detectable).
+//!   4. For each migration in order: compute the BLAKE3 checksum of its current DDL. If its `id` is
+//!      already in `myelin_applied_migration`, compare the recorded checksum and SKIP **only** when
+//!      it is identical. A changed DDL under an existing id is immutable-history drift and fails
+//!      loudly before any later migration runs. Otherwise validate it is forward-only (reject a
+//!      destructive `DROP` via [`is_destructive`]), run the DDL, and INSERT the `(id, checksum)` row.
 //!   5. Release the advisory lock.
 //!
-//! Because step 4 SKIPS an already-applied id while holding the lock, the migrator is both
+//! Because step 4 SKIPS an identically applied id while holding the lock, the migrator is both
 //! *idempotent* (re-running applies nothing) and *concurrency-safe* (the lock serialises the
-//! first-run DDL, the skip prevents a re-run). The regression test
+//! first-run DDL, the checksum-verified skip prevents a re-run). Migration ids are immutable: edit
+//! history by adding a new forward migration, never by changing the DDL behind an applied id. The
+//! regression test
 //! (`tests/integration_migrate_concurrent.rs`) spawns N≥8 concurrent migrators against one DB and
 //! asserts every one returns `Ok` and each id appears EXACTLY once — it fails WITHOUT the lock (it
 //! reproduces the original `pg_type_typname_nsp_index` race).
@@ -48,6 +51,7 @@ use crate::migration::{is_blocking_alter, is_destructive, HotTables, Migrations}
 use crate::pg::PgError;
 use sqlx::postgres::PgPool;
 use sqlx::Executor;
+use std::collections::BTreeMap;
 
 /// The FIXED app-wide Postgres advisory-lock key all migration serialises on. Derived from a stable
 /// string (`"myelin.schema.migrate"`) so the constant is documented + reproducible, NOT a magic
@@ -88,11 +92,61 @@ CREATE TABLE IF NOT EXISTS myelin_applied_migration (
 /// [`PgMigrator::apply`] takes the pool + the [`Migrations`] to apply.
 pub struct PgMigrator;
 
+/// One migration id that maps to different DDL checksums in two registered migration sets.
+/// Reusing an id for byte-identical DDL is harmless and is not a collision; reusing it for any
+/// other bytes is immutable-history drift that would make service startup order-dependent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrationChecksumCollision {
+    /// The duplicated migration id.
+    pub id: String,
+    /// Name of the first migration set in which the id appeared.
+    pub first_set: String,
+    /// Checksum registered by `first_set`.
+    pub first_checksum: String,
+    /// Name of the later migration set that reused the id with different DDL.
+    pub second_set: String,
+    /// Incompatible checksum registered by `second_set`.
+    pub second_checksum: String,
+}
+
+/// Find incompatible migration-id reuse across named migration sets. Exact `(id, DDL)` reuse is
+/// intentionally admitted—for example a writer-critical subset may share entries with its full
+/// service migration set. A shared id with different DDL is returned as a concrete collision.
+pub fn migration_checksum_collisions<'a>(
+    sets: impl IntoIterator<Item = (&'a str, &'a Migrations)>,
+) -> Vec<MigrationChecksumCollision> {
+    let mut first_by_id: BTreeMap<&str, (&str, String)> = BTreeMap::new();
+    let mut collisions = Vec::new();
+    for (set_name, migrations) in sets {
+        for migration in &migrations.0 {
+            let checksum = ddl_checksum(migration.ddl);
+            match first_by_id.get(migration.id) {
+                None => {
+                    first_by_id.insert(migration.id, (set_name, checksum));
+                }
+                Some((_first_set, first_checksum)) if *first_checksum == checksum => {}
+                Some((first_set, first_checksum)) => {
+                    collisions.push(MigrationChecksumCollision {
+                        id: migration.id.to_string(),
+                        first_set: (*first_set).to_string(),
+                        first_checksum: first_checksum.clone(),
+                        second_set: set_name.to_string(),
+                        second_checksum: checksum,
+                    });
+                }
+            }
+        }
+    }
+    collisions
+}
+
 impl PgMigrator {
     /// Apply `migrations` against `pool`, forward-only, idempotent, SERIALIZED (advisory lock), and
     /// version-recorded. See the module docs for the full discipline. Returns `Ok(())` once every
-    /// migration is recorded as applied (whether this call ran its DDL or skipped an already-applied
-    /// id). A destructive (`DROP`) migration is rejected ([`PgError::Migrate`]) before any DDL runs.
+    /// migration is recorded as applied (whether this call ran its DDL or checksum-verified an
+    /// already-applied id). A destructive (`DROP`) migration is rejected ([`PgError::Migrate`])
+    /// before any DDL runs. An existing id with a different checksum is rejected before any later
+    /// migration runs; changing an applied migration in place is never silently accepted.
     pub async fn apply(pool: &PgPool, migrations: &Migrations) -> Result<(), PgError> {
         // (1) A DEDICATED connection — the advisory lock is a SESSION lock, so it must live on one
         //     connection for its whole lifetime (a pool round-trip could land on a different
@@ -207,17 +261,22 @@ impl PgMigrator {
                 )));
             }
 
-            // Already applied? SKIP — never re-run the DDL (so there is no concurrent CREATE to
-            // race; the idempotency that makes re-runs + concurrent runs safe).
-            let already: Option<i32> =
-                sqlx::query_scalar("SELECT 1 FROM myelin_applied_migration WHERE id = $1")
+            // Already applied? SKIP only after proving the immutable DDL is byte-identical. The
+            // checksum is read under the same app-wide advisory lock as execution, so a concurrent
+            // migrator cannot change the decision between this probe and a later DDL. There are no
+            // implicit aliases: accepting a second checksum would hide exactly the drift this
+            // ledger exists to detect.
+            let expected_checksum = ddl_checksum(m.ddl);
+            let recorded_checksum: Option<String> =
+                sqlx::query_scalar("SELECT checksum FROM myelin_applied_migration WHERE id = $1")
                     .bind(m.id)
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(|e| {
                         PgError::Migrate(format!("check applied migration {}: {e}", m.id))
                     })?;
-            if already.is_some() {
+            if let Some(recorded_checksum) = recorded_checksum {
+                verify_recorded_checksum(m.id, &recorded_checksum, &expected_checksum)?;
                 continue;
             }
 
@@ -228,13 +287,12 @@ impl PgMigrator {
                 .map_err(|e| PgError::Migrate(format!("apply migration {}: {e}", m.id)))?;
 
             // Record it applied, with a BLAKE3 checksum of the DDL (drift-detectable).
-            let checksum = ddl_checksum(m.ddl);
             sqlx::query(
                 "INSERT INTO myelin_applied_migration (id, checksum) VALUES ($1, $2) \
                  ON CONFLICT (id) DO NOTHING",
             )
             .bind(m.id)
-            .bind(&checksum)
+            .bind(&expected_checksum)
             .execute(&mut *conn)
             .await
             .map_err(|e| PgError::Migrate(format!("record migration {}: {e}", m.id)))?;
@@ -264,6 +322,38 @@ impl PgMigrator {
                 .await
                 .map_err(|e| PgError::Migrate(format!("count applied migration {id}: {e}")))?;
         Ok(count)
+    }
+
+    /// Read-only checksum preflight for a migration set. Every applied id in `migrations` must have
+    /// the exact checksum of its current DDL; unapplied ids are allowed because this method audits
+    /// compatibility without executing or recording migrations. This is intended for deployment
+    /// probes and dogfood audits before enabling a stricter migrator on an existing database.
+    ///
+    /// Unlike [`apply`](Self::apply), this diagnostic does not take the migration lock. Production
+    /// startup must still call `apply`, which repeats the comparison while holding the lock before
+    /// it makes an apply/skip decision.
+    pub async fn audit_applied_checksums(
+        pool: &PgPool,
+        migrations: &Migrations,
+    ) -> Result<(), PgError> {
+        for migration in &migrations.0 {
+            let recorded_checksum: Option<String> =
+                sqlx::query_scalar("SELECT checksum FROM myelin_applied_migration WHERE id = $1")
+                    .bind(migration.id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| {
+                        PgError::Migrate(format!(
+                            "audit applied migration {} checksum: {e}",
+                            migration.id
+                        ))
+                    })?;
+            if let Some(recorded_checksum) = recorded_checksum {
+                let expected_checksum = ddl_checksum(migration.ddl);
+                verify_recorded_checksum(migration.id, &recorded_checksum, &expected_checksum)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -311,8 +401,27 @@ pub async fn with_migration_lock(pool: &PgPool, ddl: &str) -> Result<(), PgError
 /// convention (the SAME `blake3:<hex>` shape [`crate::blob`] uses). Recorded in
 /// `myelin_applied_migration.checksum` so a later run can detect a migration's DDL changed under a
 /// stable id.
-fn ddl_checksum(ddl: &str) -> String {
+pub fn ddl_checksum(ddl: &str) -> String {
     format!("blake3:{}", blake3::hash(ddl.as_bytes()).to_hex())
+}
+
+/// Admit an idempotent skip only when the recorded and current DDL checksums are identical.
+/// Kept as a pure helper so the fail-closed decision has a DB-free unit proof in addition to the
+/// live PostgreSQL regression tests.
+fn verify_recorded_checksum(
+    id: &str,
+    recorded_checksum: &str,
+    expected_checksum: &str,
+) -> Result<(), PgError> {
+    if recorded_checksum == expected_checksum {
+        return Ok(());
+    }
+
+    Err(PgError::Migrate(format!(
+        "migration checksum mismatch for existing id `{id}`: recorded `{recorded_checksum}`, \
+         current DDL is `{expected_checksum}`; applied migrations are immutable — restore the \
+         original DDL and add a new forward migration id"
+    )))
 }
 
 #[cfg(test)]
@@ -347,5 +456,51 @@ mod tests {
         assert!(a.starts_with("blake3:"));
         assert_eq!(a, b, "same DDL → same checksum");
         assert_ne!(a, c, "different DDL → different checksum");
+    }
+
+    #[test]
+    fn identical_recorded_checksum_admits_idempotent_skip() {
+        let checksum = ddl_checksum("CREATE TABLE stable (id text PRIMARY KEY)");
+        verify_recorded_checksum("0001_stable", &checksum, &checksum)
+            .expect("same id and same DDL checksum must remain idempotent");
+    }
+
+    #[test]
+    fn changed_ddl_under_existing_id_is_loudly_rejected() {
+        let recorded = ddl_checksum("CREATE TABLE stable (id text PRIMARY KEY)");
+        let current = ddl_checksum("CREATE TABLE stable (id text PRIMARY KEY, body text)");
+        let error = verify_recorded_checksum("0001_stable", &recorded, &current)
+            .expect_err("same id with different DDL must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("checksum mismatch"));
+        assert!(message.contains("0001_stable"));
+        assert!(message.contains(&recorded));
+        assert!(message.contains(&current));
+        assert!(message.contains("new forward migration id"));
+    }
+
+    #[test]
+    fn catalog_allows_exact_shared_entries_and_surfaces_incompatible_id_reuse() {
+        let first = Migrations::of([crate::migration::Migration::plain(
+            "0001_shared",
+            "CREATE TABLE shared (id text PRIMARY KEY)",
+        )]);
+        let exact_subset = first.clone();
+        let incompatible = Migrations::of([crate::migration::Migration::plain(
+            "0001_shared",
+            "CREATE TABLE shared (id text PRIMARY KEY, body text)",
+        )]);
+
+        assert!(migration_checksum_collisions(
+            [("full", &first), ("exact_subset", &exact_subset),]
+        )
+        .is_empty());
+        let collisions =
+            migration_checksum_collisions([("full", &first), ("incompatible", &incompatible)]);
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].id, "0001_shared");
+        assert_eq!(collisions[0].first_set, "full");
+        assert_eq!(collisions[0].second_set, "incompatible");
+        assert_ne!(collisions[0].first_checksum, collisions[0].second_checksum);
     }
 }
