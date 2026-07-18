@@ -21,7 +21,8 @@ struct Cli {
     /// the subsystem (e.g. `myelin --json git repo list`).
     #[arg(long, global = true)]
     json: bool,
-    /// The edge base URL (default `http://127.0.0.1:8080`, or `$MYELIN_EDGE`).
+    /// The edge base URL. Remote edges require verified HTTPS; the default loopback HTTP URL is for
+    /// local development (`http://127.0.0.1:8080`, or `$MYELIN_EDGE`).
     #[arg(long, global = true)]
     edge: Option<String>,
     /// The capability token (overrides `$MYELIN_TOKEN` / the stored token). Prefer `myelin login`.
