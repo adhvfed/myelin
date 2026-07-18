@@ -39,13 +39,15 @@ myelin-notif = { path = "../myelin-notif" }
 serde_json = { workspace = true }
 
 # ----------------------------------------------------------------------------------------------
-# THE HTTP CLIENT — hyper 1.x DIRECTLY (no reqwest). Every crate below is ALREADY in Cargo.lock (the
-# myelin-edge transport promoted exactly these), so the CLI's edge client adds ZERO new crates to the
-# tree. reqwest is NOT in the lock and would pull a large subtree (reqwest / h2 / tower / ...) —
-# rejected, same minimal-deps discipline the edge used to reject axum (frontend canon §0).
+# THE HTTP CLIENT — hyper 1.x + rustls DIRECTLY (no reqwest). Every crate below is ALREADY in
+# Cargo.lock through the storage/AWS stack, so promoting verified HTTPS support adds no new package.
+# Native roots admit enterprise/private CAs installed by the operator while rustls still verifies the
+# server name and certificate chain. Plain HTTP is accepted only for loopback development endpoints.
 # ----------------------------------------------------------------------------------------------
 hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "aws-lc-rs", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 http-body-util = "0.1"
 bytes = "1"
 tokio = { version = "1", features = ["rt", "net", "macros", "io-util"] }

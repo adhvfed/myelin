@@ -2442,6 +2442,7 @@ dependencies = [
  "clap",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "myelin-edge",
  "myelin-git",
@@ -2450,6 +2451,7 @@ dependencies = [
  "myelin-notif",
  "myelin-storage",
  "myelin-tenancy",
+ "rustls",
  "serde_json",
  "tokio",
 ]
