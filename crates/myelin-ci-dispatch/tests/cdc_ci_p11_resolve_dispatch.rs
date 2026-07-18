@@ -44,8 +44,8 @@ fn definition() -> CiDefinition {
     CiDefinition {
         on: OnTrigger::PullRequest,
         jobs: vec![
-            JobDef::normal("build", PINNED_BUILD),
-            JobDef::normal("test", PINNED_TEST).with_needs(["build"]),
+            JobDef::normal("build", PINNED_BUILD, ["build"]),
+            JobDef::normal("test", PINNED_TEST, ["test"]).with_needs(["build"]),
         ],
     }
 }
@@ -77,9 +77,9 @@ fn cdc_11_2_consumer_snapshot_is_content_addressed_through_blobstore() {
     let bytes = store
         .get(&tenant(), &addr)
         .expect("the CAS blob is present");
-    assert_eq!(bytes, snap.canonical_bytes(), "get returns the put bytes");
+    assert_eq!(bytes, snap.canonical_bytes().unwrap(), "get returns the put bytes");
     // The address IS the BLAKE3 content address of those bytes (content-addressed by construction).
-    assert_eq!(addr, ContentHash::blake3(&snap.canonical_bytes()));
+    assert_eq!(addr, ContentHash::blake3(&snap.canonical_bytes().unwrap()));
 
     // REPRODUCIBLE: re-resolving the SAME definition into a FRESH store yields the SAME address.
     let (_snap2, addr2) =

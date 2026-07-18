@@ -39,8 +39,8 @@ async fn cas_snapshot_round_trips_through_real_object_store_and_floating_tag_is_
     let def = CiDefinition {
         on: OnTrigger::PullRequest,
         jobs: vec![
-            JobDef::normal("build", PINNED_BUILD),
-            JobDef::normal("test", PINNED_TEST)
+            JobDef::normal("build", PINNED_BUILD, ["build"]),
+            JobDef::normal("test", PINNED_TEST, ["test"])
                 .with_needs(["build"])
                 .with_matrix("os", vec!["linux".into(), "macos".into()])
                 .with_matrix("rust", vec!["stable".into(), "beta".into()]),
@@ -71,7 +71,7 @@ async fn cas_snapshot_round_trips_through_real_object_store_and_floating_tag_is_
                 .get(&tenant, &address)
                 .expect("the CAS snapshot blob is present in the real bucket");
 
-            (snap.canonical_bytes(), address, got)
+            (snap.canonical_bytes().unwrap(), address, got)
         })
         .await
         .expect("blocking CAS-snapshot task")
@@ -93,7 +93,7 @@ async fn cas_snapshot_round_trips_through_real_object_store_and_floating_tag_is_
     // snapshot, even with the real store underneath.
     let floating = CiDefinition {
         on: OnTrigger::Push,
-        jobs: vec![JobDef::normal("build", "alpine:3")],
+        jobs: vec![JobDef::normal("build", "alpine:3", ["build"])],
     };
     let err = {
         let handle = handle.clone();

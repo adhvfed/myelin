@@ -82,6 +82,20 @@ use myelin_events::{ArtifactRef, DataRole, EventDraft, EventType, Visibility};
 use myelin_storage::{BlobStore, ContentHash};
 use myelin_tenancy::TenantId;
 
+pub use myelin_ci_controlplane::{ResolvedJobV1 as ResolvedJob, ResolvedRunPlanV1 as ResolvedSnapshot};
+
+/// Dispatch compatibility helpers for the shared resolved-plan wire.
+pub trait ResolvedSnapshotExt {
+    /// Whether the authored plan contains a dynamic generator node.
+    fn has_dynamic_generation(&self) -> bool;
+}
+
+impl ResolvedSnapshotExt for ResolvedSnapshot {
+    fn has_dynamic_generation(&self) -> bool {
+        self.jobs.iter().any(|job| job.is_generator)
+    }
+}
+
 use myelin_ci_sandbox::events::CI_RUN_STARTED;
 
 use crate::dispatch::{OnTrigger, TrustStamp};
@@ -116,6 +130,8 @@ pub struct JobDef {
     pub name: String,
     /// The RAW image reference as authored (may be a floating tag — resolved fail-closed later).
     pub image: String,
+    /// Exact executable argv. Dispatch never infers a shell or fallback command.
+    pub command: Vec<String>,
     /// The names this job depends on (the DAG edges — every name must exist in the definition).
     pub needs: Vec<String>,
     /// The job kind — [`JobKind::Generate`] marks the sandboxed dynamic-generation escape hatch.
@@ -127,10 +143,15 @@ pub struct JobDef {
 
 impl JobDef {
     /// A normal (non-matrix, non-generate) job over `image`.
-    pub fn normal(name: impl Into<String>, image: impl Into<String>) -> JobDef {
+    pub fn normal(
+        name: impl Into<String>,
+        image: impl Into<String>,
+        command: impl IntoIterator<Item = impl Into<String>>,
+    ) -> JobDef {
         JobDef {
             name: name.into(),
             image: image.into(),
+            command: command.into_iter().map(Into::into).collect(),
             needs: Vec::new(),
             kind: JobKind::Normal,
             matrix: BTreeMap::new(),
@@ -171,54 +192,6 @@ pub struct CiDefinition {
 // 2. Resolution → the content-addressed snapshot.
 // =================================================================================================
 
-/// One resolved, matrix-expanded job instance in the snapshot DAG. The `image` is now ALWAYS a
-/// digest-pinned reference (a floating tag never reaches here — fail-closed). `matrix_key` is the
-/// deterministic axis assignment for this instance (empty for a non-matrix job).
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ResolvedJob {
-    /// The instance name — `<job>` for a single job, `<job>[<axis>=<val>,..]` for a matrix instance
-    /// (the axis assignment rendered in SORTED axis order → deterministic).
-    pub name: String,
-    /// The digest-pinned image reference (resolution proved it `@<algo>:<hex>` — fail-closed).
-    pub image: String,
-    /// The DAG edges (the resolved-instance dependency names).
-    pub needs: Vec<String>,
-    /// Whether this instance is the dynamic-generation escape hatch (arch 02 §7.4) — the named floor.
-    pub is_generator: bool,
-    /// The deterministic matrix-axis assignment (axis key → value), sorted; empty for a single job.
-    pub matrix_key: BTreeMap<String, String>,
-}
-
-/// The resolved, content-addressable snapshot — the run's reproducible, auditable definition (arch
-/// 02 §1.4). Serialised to canonical JSON + written as a CAS blob (T2, contract 11.2); the returned
-/// [`ContentHash`] is the snapshot's address. IDENTICAL to the `myelin ci plan` output (shift-left).
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ResolvedSnapshot {
-    /// The resolved, matrix-expanded jobs, in DETERMINISTIC order (sorted by instance name).
-    pub jobs: Vec<ResolvedJob>,
-}
-
-impl ResolvedSnapshot {
-    /// **The dynamic-generation escape-hatch hook (arch 02 §7.4 — the named floor).** True iff the
-    /// snapshot contains a [`JobKind::Generate`] job. The generation step is a NORMAL digest-pinned
-    /// job on the CI-P3 runner (the SAME sandbox as any untrusted code); the IN-SANDBOX execution
-    /// (run the generator, ingest its emitted fragment, re-dispatch through this resolver) lands with
-    /// the runner + the `ci.pipeline` body (CI-P15). This hook lets the runner path detect the
-    /// programmatic-fan-out job without a second config-eval surface.
-    pub fn has_dynamic_generation(&self) -> bool {
-        self.jobs.iter().any(|j| j.is_generator)
-    }
-
-    /// Canonical JSON bytes — the byte-identical-for-identical-input serialisation the CAS address is
-    /// taken over (deterministic field + element order → reproducible). `serde_json` emits struct
-    /// fields in declaration order and the jobs/`matrix_key` are already deterministically ordered.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        // `to_vec` is deterministic for our value shape (declaration-order fields, sorted Vecs +
-        // BTreeMaps) — the reproducibility floor. Never `to_string_pretty` (whitespace would drift).
-        serde_json::to_vec(self).expect("a ResolvedSnapshot always serialises")
-    }
-}
-
 /// Why a definition fails to resolve (fail-closed — arch 02 §7.4 / EI-01 §3). LOUD, never silently
 /// coerced into a degraded snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,6 +216,10 @@ pub enum ResolveError {
         /// The non-existent name it depends on.
         need: String,
     },
+    /// A job names itself as a dependency.
+    SelfNeed(String),
+    /// A job repeats the same dependency instead of declaring a set.
+    DuplicateNeed { job: String, need: String },
     /// The job DAG has a cycle (it is not a DAG) — a run could never make progress.
     Cyclic,
     /// The CAS blob write failed (the snapshot could not be content-addressed) — surfaced, never
@@ -260,6 +237,10 @@ pub enum ResolveError {
         /// The enforced ceiling ([`MAX_TOTAL_MATRIX_INSTANCES`]).
         cap: usize,
     },
+    /// The resolved versioned plan violated the shared execution-boundary contract.
+    InvalidPlan(String),
+    /// Two expanded jobs resolved to the same concrete machine-token node name.
+    ConcreteNameCollision(String),
 }
 
 /// **The hard ceiling on the total number of matrix-expanded job instances a single CI definition may
@@ -288,6 +269,8 @@ impl std::fmt::Display for ResolveError {
                 f,
                 "job `{job}` needs `{need}`, which is not a job in the definition (dangling DAG edge)"
             ),
+            ResolveError::SelfNeed(job) => write!(f, "job `{job}` depends on itself"),
+            ResolveError::DuplicateNeed { job, need } => write!(f, "job `{job}` repeats dependency `{need}`"),
             ResolveError::Cyclic => write!(f, "the job DAG has a cycle — it is not a DAG"),
             ResolveError::BlobWrite(e) => {
                 write!(f, "the CAS snapshot blob write failed: {e} (no snapshot ⇒ no start)")
@@ -298,6 +281,8 @@ impl std::fmt::Display for ResolveError {
                  rejected fail-closed (a push cannot fan out unbounded; raise the config's matrix or \
                  split the pipeline)"
             ),
+            ResolveError::InvalidPlan(detail) => write!(f, "invalid resolved CI plan: {detail}"),
+            ResolveError::ConcreteNameCollision(name) => write!(f, "matrix expansion produced duplicate concrete job name `{name}`"),
         }
     }
 }
@@ -310,9 +295,22 @@ fn instance_name(job: &str, assignment: &BTreeMap<String, String>) -> String {
     if assignment.is_empty() {
         return job.to_string();
     }
-    // `BTreeMap` iterates in sorted key order — the deterministic render.
-    let parts: Vec<String> = assignment.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    format!("{job}[{}]", parts.join(","))
+    let mut identity = Vec::new();
+    identity.extend_from_slice(&(job.len() as u64).to_be_bytes());
+    identity.extend_from_slice(job.as_bytes());
+    identity.extend_from_slice(&(assignment.len() as u64).to_be_bytes());
+    for (key, value) in assignment {
+        identity.extend_from_slice(&(key.len() as u64).to_be_bytes());
+        identity.extend_from_slice(key.as_bytes());
+        identity.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        identity.extend_from_slice(value.as_bytes());
+    }
+    let digest = ContentHash::blake3(&identity).to_multihash_string();
+    let digest = digest.strip_prefix("blake3:").expect("blake3 multihash prefix");
+    let prefix: String = job.bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        .take(61).map(char::from).collect();
+    format!("{prefix}--{digest}")
 }
 
 /// Expand one job's matrix into its deterministic cross-product of axis assignments. The axes are
@@ -344,7 +342,12 @@ fn validate_dag(jobs: &[JobDef]) -> Result<(), ResolveError> {
     let names: BTreeSet<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
     // Every `needs` edge must point at an existing job.
     for j in jobs {
+        let mut seen_needs = BTreeSet::new();
         for need in &j.needs {
+            if need == &j.name { return Err(ResolveError::SelfNeed(j.name.clone())); }
+            if !seen_needs.insert(need.as_str()) {
+                return Err(ResolveError::DuplicateNeed { job: j.name.clone(), need: need.clone() });
+            }
             if !names.contains(need.as_str()) {
                 return Err(ResolveError::UnknownNeed {
                     job: j.name.clone(),
@@ -383,6 +386,34 @@ fn validate_dag(jobs: &[JobDef]) -> Result<(), ResolveError> {
     Ok(())
 }
 
+fn valid_machine_token(value: &str, maximum: usize) -> bool {
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else { return false; };
+    value.len() <= maximum && first.is_ascii_alphanumeric()
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn validate_authored_tokens(jobs: &[JobDef]) -> Result<(), ResolveError> {
+    use myelin_ci_controlplane::run_plan::{MAX_JOB_NAME_BYTES, MAX_MATRIX_AXES, MAX_MATRIX_KEY_BYTES, MAX_MATRIX_VALUE_BYTES};
+    for job in jobs {
+        if !valid_machine_token(&job.name, MAX_JOB_NAME_BYTES) {
+            return Err(ResolveError::InvalidPlan(format!("authored job name `{}` is not a bounded machine token", job.name)));
+        }
+        if job.matrix.len() > MAX_MATRIX_AXES {
+            return Err(ResolveError::InvalidPlan(format!("job `{}` declares more than {MAX_MATRIX_AXES} matrix axes", job.name)));
+        }
+        for (axis, values) in &job.matrix {
+            if !valid_machine_token(axis, MAX_MATRIX_KEY_BYTES) || values.is_empty() {
+                return Err(ResolveError::InvalidPlan(format!("job `{}` matrix axis `{axis}` is invalid or empty", job.name)));
+            }
+            if values.iter().any(|value| !valid_machine_token(value, MAX_MATRIX_VALUE_BYTES)) {
+                return Err(ResolveError::InvalidPlan(format!("job `{}` has an invalid matrix value for `{axis}`", job.name)));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// **Resolve a parsed [`CiDefinition`] to a content-addressed [`ResolvedSnapshot`] + write it as a
 /// T2 CAS blob (contract 11.2).** The full arch 02 §1.4 / §7.4 path:
 ///   1. **validate** — a non-empty, unique-named, acyclic job DAG (every `needs` resolves);
@@ -405,6 +436,7 @@ pub fn resolve_snapshot(
     if def.jobs.is_empty() {
         return Err(ResolveError::EmptyDefinition);
     }
+    validate_authored_tokens(&def.jobs)?;
     // Unique job names (DAG node ids).
     let mut seen = BTreeSet::new();
     for j in &def.jobs {
@@ -453,17 +485,33 @@ pub fn resolve_snapshot(
             resolved.push(ResolvedJob {
                 name: instance_name(&j.name, &assignment),
                 image: j.image.clone(),
-                needs: j.needs.clone(),
+                command: j.command.clone(),
+                needs: Vec::new(),
                 is_generator: j.kind == JobKind::Generate,
                 matrix_key: assignment,
             });
         }
     }
+    let concrete_by_authored: BTreeMap<&str, Vec<String>> = def.jobs.iter().map(|job| {
+        let mut names: Vec<_> = expand_matrix(&job.matrix).iter()
+            .map(|assignment| instance_name(&job.name, assignment)).collect();
+        names.sort(); names.dedup(); (job.name.as_str(), names)
+    }).collect();
+    for (job, authored) in resolved.iter_mut().zip(def.jobs.iter().flat_map(|job| {
+        std::iter::repeat_n(job, expand_matrix(&job.matrix).len())
+    })) {
+        job.needs = authored.needs.iter()
+            .flat_map(|need| concrete_by_authored[need.as_str()].iter().cloned()).collect();
+        job.needs.sort(); job.needs.dedup();
+    }
     // Deterministic order — the reproducibility floor (the same input → byte-identical snapshot).
     resolved.sort_by(|a, b| a.name.cmp(&b.name));
+    for pair in resolved.windows(2) {
+        if pair[0].name == pair[1].name { return Err(ResolveError::ConcreteNameCollision(pair[0].name.clone())); }
+    }
 
-    let snapshot = ResolvedSnapshot { jobs: resolved };
-    let bytes = snapshot.canonical_bytes();
+    let snapshot = ResolvedSnapshot { schema_version: myelin_ci_controlplane::run_plan::RUN_PLAN_SCHEMA_V1, jobs: resolved };
+    let bytes = snapshot.canonical_bytes().map_err(|error| ResolveError::InvalidPlan(error.to_string()))?;
     let address = blobs
         .put(tenant, &bytes)
         .map_err(|e| ResolveError::BlobWrite(e.to_string()))?;
@@ -772,7 +820,7 @@ mod tests {
     fn a_floating_tag_is_rejected_fail_closed() {
         let def = CiDefinition {
             on: OnTrigger::Push,
-            jobs: vec![JobDef::normal("build", "alpine:3")],
+            jobs: vec![JobDef::normal("build", "alpine:3", ["build"])],
         };
         let err = resolve_snapshot(&def, &blobs(), &tenant())
             .expect_err("a floating tag must be rejected fail-closed");
@@ -795,7 +843,7 @@ mod tests {
         ] {
             let def = CiDefinition {
                 on: OnTrigger::Push,
-                jobs: vec![JobDef::normal("j", bad)],
+                jobs: vec![JobDef::normal("j", bad, ["run"])],
             };
             assert!(
                 matches!(
@@ -814,7 +862,7 @@ mod tests {
     #[test]
     fn an_unbounded_matrix_is_refused_before_it_is_materialized() {
         // 8 axes × 10 values each = 10^8 instances — an OOM without the cap.
-        let mut job = JobDef::normal("build", PINNED);
+        let mut job = JobDef::normal("build", PINNED, ["build"]);
         for a in 0..8u32 {
             job = job.with_matrix(
                 format!("axis{a}"),
@@ -831,7 +879,7 @@ mod tests {
         );
 
         // A legitimate matrix (3 × 4 = 12 instances) still resolves + content-addresses.
-        let ok = JobDef::normal("test", PINNED2)
+        let ok = JobDef::normal("test", PINNED2, ["test"])
             .with_matrix("os", vec!["linux".into(), "mac".into(), "win".into()])
             .with_matrix("v", vec!["1".into(), "2".into(), "3".into(), "4".into()]);
         let def_ok = CiDefinition { on: OnTrigger::Push, jobs: vec![ok] };
@@ -848,8 +896,8 @@ mod tests {
         let def = CiDefinition {
             on: OnTrigger::Push,
             jobs: vec![
-                JobDef::normal("build", PINNED),
-                JobDef::normal("test", PINNED2).with_needs(["build"]),
+                JobDef::normal("build", PINNED, ["build"]),
+                JobDef::normal("test", PINNED2, ["test"]).with_needs(["build"]),
             ],
         };
         let (snap, addr) =
@@ -861,11 +909,11 @@ mod tests {
             .expect("the snapshot blob is present");
         assert_eq!(
             bytes,
-            snap.canonical_bytes(),
+            snap.canonical_bytes().unwrap(),
             "the blob IS the snapshot bytes"
         );
         // The address is the BLAKE3 content address of those bytes (content-addressed by construction).
-        assert_eq!(addr, ContentHash::blake3(&snap.canonical_bytes()));
+        assert_eq!(addr, ContentHash::blake3(&snap.canonical_bytes().unwrap()));
     }
 
     // -------- 2. Deterministic matrix expansion --------
@@ -878,7 +926,7 @@ mod tests {
         let store = blobs();
         let def = CiDefinition {
             on: OnTrigger::Push,
-            jobs: vec![JobDef::normal("test", PINNED)
+            jobs: vec![JobDef::normal("test", PINNED, ["test"])
                 .with_matrix("os", vec!["linux".into(), "macos".into()])
                 .with_matrix("rust", vec!["stable".into(), "beta".into()])],
         };
@@ -887,22 +935,60 @@ mod tests {
         assert_eq!(snap.jobs.len(), 4, "the 2×2 matrix expands to 4 instances");
         // Instance names are rendered in SORTED axis order (os before rust) + sorted overall.
         let names: Vec<&str> = snap.jobs.iter().map(|j| j.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec![
-                "test[os=linux,rust=beta]",
-                "test[os=linux,rust=stable]",
-                "test[os=macos,rust=beta]",
-                "test[os=macos,rust=stable]",
-            ],
-            "deterministic, sorted-axis instance names"
-        );
+        assert_eq!(names.len(), 4);
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(names.iter().all(|name| name.starts_with("test--")));
         // Re-resolving the SAME definition yields the SAME content address (byte-identical).
         let (_snap2, addr2) = resolve_snapshot(&def, &blobs(), &tenant()).expect("re-resolves");
         assert_eq!(
             addr, addr2,
             "the same input → the same content address (reproducible)"
         );
+    }
+
+    #[test]
+    fn command_hash_and_concrete_matrix_fan_in_are_deterministic() {
+        let definition = |command: &str| CiDefinition { on: OnTrigger::Push, jobs: vec![
+            JobDef::normal("build", PINNED, [command]).with_matrix("os", vec!["linux".into(), "macos".into()]),
+            JobDef::normal("test", PINNED2, ["test"]).with_needs(["build"])
+                .with_matrix("rust", vec!["stable".into(), "beta".into()]),
+        ] };
+        let (first, hash) = resolve_snapshot(&definition("build"), &blobs(), &tenant()).unwrap();
+        let (_, repeat) = resolve_snapshot(&definition("build"), &blobs(), &tenant()).unwrap();
+        let (_, changed) = resolve_snapshot(&definition("build-v2"), &blobs(), &tenant()).unwrap();
+        assert_eq!(hash, repeat);
+        assert_ne!(hash, changed);
+        let builds: Vec<String> = first.jobs.iter().filter(|job| job.name.starts_with("build--"))
+            .map(|job| job.name.clone()).collect();
+        assert_eq!(builds.len(), 2);
+        for test in first.jobs.iter().filter(|job| job.name.starts_with("test--")) {
+            assert_eq!(test.needs, builds);
+        }
+    }
+
+    #[test]
+    fn malformed_programmatic_plans_fail_closed_without_name_collisions() {
+        let prefix = "a".repeat(70);
+        let def = CiDefinition { on: OnTrigger::Push, jobs: vec![
+            JobDef::normal(format!("{prefix}x"), PINNED, ["a"]).with_matrix("os", vec!["linux".into()]),
+            JobDef::normal(format!("{prefix}y"), PINNED2, ["b"]).with_matrix("os", vec!["linux".into()]),
+        ] };
+        let (plan, _) = resolve_snapshot(&def, &blobs(), &tenant()).unwrap();
+        assert_ne!(plan.jobs[0].name, plan.jobs[1].name);
+        let bad = CiDefinition { on: OnTrigger::Push, jobs: vec![JobDef::normal("unicode-雪", PINNED, ["run"])] };
+        assert!(matches!(resolve_snapshot(&bad, &blobs(), &tenant()), Err(ResolveError::InvalidPlan(_))));
+        let empty = CiDefinition { on: OnTrigger::Push, jobs: vec![JobDef::normal("build", PINNED, std::iter::empty::<String>())] };
+        assert!(matches!(resolve_snapshot(&empty, &blobs(), &tenant()), Err(ResolveError::InvalidPlan(_))));
+    }
+
+    #[test]
+    fn snapshot_ref_is_exact_tenant_scoped_lowercase_blake3() {
+        let address = ContentHash::blake3(b"snapshot");
+        let reference = snapshot_ref(&tenant(), &address);
+        assert_eq!(reference.0, format!("myelin://acme/ci/snapshot/{}", address.to_multihash_string()));
+        let digest = reference.0.strip_prefix("myelin://acme/ci/snapshot/blake3:").unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
     }
 
     /// An empty definition + a structural-DAG defect (a cycle / a dangling need / a dup name) is
@@ -927,7 +1013,7 @@ mod tests {
             resolve_snapshot(
                 &CiDefinition {
                     on: OnTrigger::Push,
-                    jobs: vec![JobDef::normal("a", PINNED).with_needs(["ghost"])],
+                    jobs: vec![JobDef::normal("a", PINNED, ["a"]).with_needs(["ghost"])],
                 },
                 &store,
                 &tenant()
@@ -940,8 +1026,8 @@ mod tests {
                 &CiDefinition {
                     on: OnTrigger::Push,
                     jobs: vec![
-                        JobDef::normal("a", PINNED).with_needs(["b"]),
-                        JobDef::normal("b", PINNED).with_needs(["a"]),
+                        JobDef::normal("a", PINNED, ["a"]).with_needs(["b"]),
+                        JobDef::normal("b", PINNED, ["b"]).with_needs(["a"]),
                     ],
                 },
                 &store,
@@ -954,13 +1040,25 @@ mod tests {
             resolve_snapshot(
                 &CiDefinition {
                     on: OnTrigger::Push,
-                    jobs: vec![JobDef::normal("a", PINNED), JobDef::normal("a", PINNED2)],
+                    jobs: vec![JobDef::normal("a", PINNED, ["a"]), JobDef::normal("a", PINNED2, ["a"])],
                 },
                 &store,
                 &tenant()
             ),
             Err(ResolveError::DuplicateJob(n)) if n == "a"
         ));
+        assert_eq!(
+            resolve_snapshot(&CiDefinition { on: OnTrigger::Push,
+                jobs: vec![JobDef::normal("a", PINNED, ["a"]).with_needs(["a"])] }, &store, &tenant()),
+            Err(ResolveError::SelfNeed("a".into()))
+        );
+        assert_eq!(
+            resolve_snapshot(&CiDefinition { on: OnTrigger::Push, jobs: vec![
+                JobDef::normal("a", PINNED, ["a"]),
+                JobDef::normal("b", PINNED2, ["b"]).with_needs(["a", "a"]),
+            ] }, &store, &tenant()),
+            Err(ResolveError::DuplicateNeed { job: "b".into(), need: "a".into() })
+        );
     }
 
     // -------- 3. The dynamic-generation escape-hatch floor (named + hooked) --------
@@ -973,23 +1071,13 @@ mod tests {
     fn the_dynamic_generation_escape_hatch_is_hooked() {
         let def = CiDefinition {
             on: OnTrigger::Push,
-            jobs: vec![JobDef::normal("gen-matrix", PINNED).as_generator()],
+            jobs: vec![JobDef::normal("gen-matrix", PINNED, ["generate"]).as_generator()],
         };
-        let (snap, _addr) = resolve_snapshot(&def, &blobs(), &tenant()).expect("resolves");
-        assert!(
-            snap.has_dynamic_generation(),
-            "the snapshot exposes the dynamic-generation hook"
-        );
-        assert!(
-            snap.jobs[0].is_generator,
-            "the generator instance is marked"
-        );
-        // It is digest-pinned like any other job (the generator itself is sandboxed + pinned).
-        assert_eq!(snap.jobs[0].image, PINNED);
+        assert!(matches!(resolve_snapshot(&def, &blobs(), &tenant()), Err(ResolveError::InvalidPlan(_))));
         // A normal definition has no generator.
         let plain = CiDefinition {
             on: OnTrigger::Push,
-            jobs: vec![JobDef::normal("build", PINNED)],
+            jobs: vec![JobDef::normal("build", PINNED, ["build"])],
         };
         let (s2, _) = resolve_snapshot(&plain, &blobs(), &tenant()).unwrap();
         assert!(!s2.has_dynamic_generation());
