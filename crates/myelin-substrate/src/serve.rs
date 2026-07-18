@@ -82,13 +82,15 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// The auto-started outbox relay spec (architecture §3.3; contract 2.3). Carries the
-/// [`OutboxStore`] the service emits into (P-S07) and the [`BusTransport`] the relay publishes
-/// to (the in-process fake on the M0 floor; EB-04's JetStream-class adapter is the real one).
-/// `serve` starts the relay automatically (BUS-2 — there is no fire-and-forget publish path).
+/// A service's durable outbox plus an optional embedded relay transport.
+///
+/// Production services that share one PostgreSQL `outbox` table use [`Self::external_relay`]:
+/// they commit rows but never claim or mark them locally. One separately elected cell publisher
+/// owns that global drain. Tests and deliberately self-contained deployments may use [`Self::new`]
+/// to keep the embedded relay/consumer loop.
 pub struct OutboxSpec {
     store: OutboxStore,
-    transport: Box<dyn BusTransport>,
+    transport: Option<Box<dyn BusTransport>>,
 }
 
 impl OutboxSpec {
@@ -103,7 +105,7 @@ impl OutboxSpec {
     pub fn default_inproc() -> OutboxSpec {
         OutboxSpec {
             store: OutboxStore::new(),
-            transport: Box::new(InProcessBus::new()),
+            transport: Some(Box::new(InProcessBus::new())),
         }
     }
 
@@ -111,7 +113,7 @@ impl OutboxSpec {
     pub fn new(store: OutboxStore, transport: impl BusTransport + 'static) -> OutboxSpec {
         OutboxSpec {
             store,
-            transport: Box::new(transport),
+            transport: Some(Box::new(transport)),
         }
     }
 
@@ -126,7 +128,23 @@ impl OutboxSpec {
     /// in-process; durability lives in the store) — the NATS-by-default transport is the
     /// EventsRuntime/integration track, out of this wave's scope by design.
     pub fn durable(store: OutboxStore, transport: Box<dyn BusTransport>) -> OutboxSpec {
-        OutboxSpec { store, transport }
+        OutboxSpec {
+            store,
+            transport: Some(transport),
+        }
+    }
+
+    /// Bind a producer to the shared durable outbox without starting a process-local relay.
+    ///
+    /// This is the production-safe posture when multiple services share the same table: a local
+    /// relay could claim another service's row, publish it into a private process bus, and stamp it
+    /// sent. Consumers cannot be registered on this spec because no consumer transport is present;
+    /// boot fails loudly instead of presenting a healthy but inert consumer.
+    pub fn external_relay(store: OutboxStore) -> OutboxSpec {
+        OutboxSpec {
+            store,
+            transport: None,
+        }
     }
 
     /// The store the relay drains (so a test/handler can emit into it).
@@ -493,7 +511,7 @@ pub struct ServeHandle {
     name: &'static str,
     pool: OltpPool,
     outbox: OutboxStore,
-    relay: Relay<RelayTransport>,
+    relay: Option<Relay<RelayTransport>>,
     consumers: Vec<ConsumerReg>,
     holders: HolderRegistry,
     /// The full store manifest (implicit OLTP + the service's declared stores) the
@@ -592,20 +610,23 @@ impl ServeHandle {
         &self.telemetry
     }
 
-    /// **One steady-state tick:** drain the outbox relay to depth 0 (publish committed events),
-    /// then deliver the freshly-published events to the consumers (idempotent, P-S08). Returns
-    /// how many events each consumer acked/deduped. This is what the lifecycle loop runs while
-    /// serving; the graceful drain runs it once more to finish in-flight work.
+    /// **One steady-state tick:** an embedded test/deployment relay drains and delivers locally.
+    /// An external-relay producer only refreshes telemetry; the elected cell publisher owns its
+    /// rows and this process must not claim them.
     pub fn tick(&self) -> Vec<(ConsumerName, usize)> {
+        let Some(relay) = &self.relay else {
+            self.telemetry.observe(&self.outbox, &self.consumers);
+            return Vec::new();
+        };
         // 1. Relay: publish every committed-but-unsent outbox row (BUS-2; emit-iff-committed,
         //    so only committed events are ever published).
-        self.relay.drain_to_empty();
+        relay.drain_to_empty();
         // 2. Deliver the published events to each consumer (the bus → consumer leg). Each
         //    consumer reads only its whitelisted subjects (rule 3) and dedups (rule 1).
         let mut delivered = Vec::new();
         for c in &self.consumers {
             let mut count = 0usize;
-            for env in self.relay.transport().consume("") {
+            for env in relay.transport().consume("") {
                 let msg = Message {
                     subject: env.subject.0.clone(),
                     envelope: env.clone(),
@@ -650,6 +671,10 @@ impl ServeHandle {
         // ack-then-exit: re-observe so the final snapshot reflects depth 0 / lag 0.
         self.telemetry.observe(&self.outbox, &self.consumers);
         self.telemetry
+    }
+
+    fn owns_relay(&self) -> bool {
+        self.relay.is_some()
     }
 }
 
@@ -741,8 +766,16 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
         store: outbox_store,
         transport,
     } = outbox;
-    let relay = Relay::new(outbox_store.clone(), transport, || {
-        Timestamp("1970-01-01T00:00:00Z".into())
+    if transport.is_none() && !consumers.is_empty() {
+        return Err(ServeError(format!(
+            "service {name} registered consumers without a consumer transport; external-relay \
+             producer mode cannot consume"
+        )));
+    }
+    let relay = transport.map(|transport| {
+        Relay::new(outbox_store.clone(), transport, || {
+            Timestamp("1970-01-01T00:00:00Z".into())
+        })
     });
 
     // (6) ports — open the three surfaces (§4). The tenant-from-token public surface (SUB-D7) is
@@ -791,6 +824,7 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
 /// use [`boot`] + [`ServeHandle`] to drive multiple ticks and inspect telemetry deterministically.
 pub fn serve(spec: AppSpec) -> Result<(), ServeError> {
     let handle = boot(spec)?;
+    let owns_relay = handle.owns_relay();
     // serve until signalled — drive the steady-state once, then take the drain signal. (The
     // real event loop blocking on OS signals + inbound traffic is P-S13/P-S14.)
     handle.tick();
@@ -798,7 +832,7 @@ pub fn serve(spec: AppSpec) -> Result<(), ServeError> {
     // graceful drain — stop intake, finish in-flight, ack-then-exit. A clean drain leaves
     // outbox_depth == 0 (nothing committed is left unpublished/unprocessed).
     let final_telemetry = handle.drain();
-    if final_telemetry.outbox_depth() != 0 {
+    if owns_relay && final_telemetry.outbox_depth() != 0 {
         return Err(ServeError(format!(
             "graceful drain incomplete: outbox_depth = {} (expected 0)",
             final_telemetry.outbox_depth()
@@ -866,7 +900,11 @@ mod tests {
             fn subjects(&self) -> &'static [SubjectPattern] {
                 SUBJECTS
             }
-            fn handle(&self, _ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
+            fn handle(
+                &self,
+                _ev: &EventEnvelope,
+                _tx: &mut myelin_events::HandlerTx<'_>,
+            ) -> HandleOutcome {
                 self.runs.fetch_add(1, Ordering::SeqCst);
                 HandleOutcome::Done
             }
@@ -984,6 +1022,46 @@ mod tests {
     fn serve_runs_lifecycle_and_returns_ok() {
         let spec = AppSpec::minimal("svc", Config::default(), OutboxSpec::default_inproc());
         assert_eq!(serve(spec), Ok(()), "serve boots → … → drains cleanly");
+    }
+
+    #[test]
+    fn external_relay_producer_never_claims_shared_rows() {
+        let outbox = OutboxStore::new();
+        let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+        let mut tx = outbox.begin(minter, ctx_base());
+        tx.stage_state_change("owned by the elected cell relay");
+        tx.emit(draft("issues.issue.created"), None).unwrap();
+        tx.commit().unwrap();
+
+        let spec = AppSpec::minimal(
+            "producer",
+            Config::default(),
+            OutboxSpec::external_relay(outbox.clone()),
+        );
+        assert_eq!(serve(spec), Ok(()));
+        assert_eq!(
+            outbox.outbox_depth(),
+            1,
+            "a producer lifecycle must not claim or stamp the shared row"
+        );
+    }
+
+    #[test]
+    fn external_relay_mode_refuses_inert_consumers() {
+        let outbox = OutboxStore::new();
+        let (consumer, _) = hello_consumer(DedupLedger::new());
+        let mut spec = AppSpec::minimal(
+            "invalid-consumer",
+            Config::default(),
+            OutboxSpec::external_relay(outbox),
+        );
+        spec.consumers = vec![consumer];
+
+        let error = match boot(spec) {
+            Ok(_) => panic!("a consumer without a broker transport must fail boot"),
+            Err(error) => error,
+        };
+        assert!(error.0.contains("without a consumer transport"));
     }
 
     /// **A failed boot returns non-zero (an `Err`), never a silent success (§3.1).** A config
@@ -1165,7 +1243,11 @@ mod tests {
             fn subjects(&self) -> &'static [SubjectPattern] {
                 SUBJECTS
             }
-            fn handle(&self, _ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
+            fn handle(
+                &self,
+                _ev: &EventEnvelope,
+                _tx: &mut myelin_events::HandlerTx<'_>,
+            ) -> HandleOutcome {
                 self.runs.fetch_add(1, Ordering::SeqCst);
                 HandleOutcome::NonRetryable(Reason("poison".into()))
             }
