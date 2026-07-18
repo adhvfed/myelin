@@ -535,6 +535,61 @@ pub const CI_JOB_QUEUE_INDEX_MIGRATIONS: &[(&str, &str)] = &[
     ("ci_0004c_jq_idem", JQ_IDEM_INDEX),
 ];
 
+/// Dedicated region-scheduler RLS/grant boundary. This is deliberately a new additive migration:
+/// the historical table/RLS migration ids and checksums remain byte-unchanged.
+pub const CI_REGION_SCHEDULER_RLS_MIGRATION_ID: &str = "ci_0016_region_scheduler_rls";
+
+/// Install the cross-tenant, single-region scheduler policies over the existing FORCE-RLS queue
+/// tables. PostgreSQL combines the OR of applicable permissive policies with every applicable
+/// restrictive policy. The scheduler-targeted restrictive guard is therefore load-bearing: even if
+/// a scheduler sets a tenant GUC and becomes eligible for the PUBLIC tenant policy, it cannot escape
+/// the server-owned `session_user` region mapping or operate with a non-empty tenant scope.
+///
+/// Privileges are capability-minimal: claim/reap can read queue/fairness rows and update only the
+/// three lease columns. No insert, delete, fairness mutation, or unrelated-table privilege is added.
+pub const CREATE_CI_REGION_SCHEDULER_RLS_DDL: &str = "\
+CREATE POLICY myelin_ci_scheduler_job_queue_access ON job_queue
+  AS PERMISSIVE FOR ALL TO myelin_ci_region_scheduler
+  USING (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  )
+  WITH CHECK (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  );
+CREATE POLICY myelin_ci_scheduler_job_queue_guard ON job_queue
+  AS RESTRICTIVE FOR ALL TO myelin_ci_region_scheduler
+  USING (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  )
+  WITH CHECK (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  );
+CREATE POLICY myelin_ci_scheduler_fair_deficit_access ON fair_deficit
+  AS PERMISSIVE FOR SELECT TO myelin_ci_region_scheduler
+  USING (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  );
+CREATE POLICY myelin_ci_scheduler_fair_deficit_guard ON fair_deficit
+  AS RESTRICTIVE FOR SELECT TO myelin_ci_region_scheduler
+  USING (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  );
+GRANT SELECT ON job_queue TO myelin_ci_region_scheduler;
+GRANT UPDATE (state, lease_owner, lease_expires) ON job_queue TO myelin_ci_region_scheduler;
+GRANT SELECT ON fair_deficit TO myelin_ci_region_scheduler";
+
 /// The stable migration ids of the WRITER-CRITICAL CI durable tables both CI service mains must have
 /// present regardless of boot order (CT-004m): `ci_run` (ci-dispatch's reserve/start co-commit + the
 /// control-plane run state), `check_attempt` (the control-plane monotonic counter), and
@@ -542,8 +597,11 @@ pub const CI_JOB_QUEUE_INDEX_MIGRATIONS: &[(&str, &str)] = &[
 /// writes). These are the tables the CT-004a + CT-004b production stores touch. The ids are a SUBSET
 /// of [`create_statements`] — the SAME ids + the SAME DDL the full [`ci_controlplane_migrations`] set
 /// carries, so applying both is idempotent (the shared ids no-op on the second apply).
-pub const CI_DURABLE_WRITER_IDS: &[&str] =
-    &["ci_0001_ci_run", "ci_0003_check_attempt", "ci_0014_ci_cost_event"];
+pub const CI_DURABLE_WRITER_IDS: &[&str] = &[
+    "ci_0001_ci_run",
+    "ci_0003_check_attempt",
+    "ci_0014_ci_cost_event",
+];
 
 /// Assemble ONE forward-only [`Migration`] from a `(id, table, create-DDL)` triple: the CREATE (plus
 /// any indexes already appended to `create`) followed by the platform RLS scoping call. Single source
@@ -613,6 +671,11 @@ pub fn ci_controlplane_migrations() -> Migrations {
             }
         }
     }
+    migrations.push(Migration::plain_on(
+        CI_REGION_SCHEDULER_RLS_MIGRATION_ID,
+        CREATE_CI_REGION_SCHEDULER_RLS_DDL,
+        JOB_QUEUE_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -737,8 +800,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            20,
-            "15 table/RLS + 4 concurrent-index + 1 index-validation migrations"
+            21,
+            "15 table/RLS + 4 concurrent-index + 1 index-validation + 1 scheduler-boundary migration"
         );
         for m in &migrations.0 {
             assert!(
@@ -760,6 +823,8 @@ mod tests {
                 );
             } else if m.id == CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID {
                 assert_eq!(m.ddl, VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL);
+            } else if m.id == CI_REGION_SCHEDULER_RLS_MIGRATION_ID {
+                assert_eq!(m.ddl, CREATE_CI_REGION_SCHEDULER_RLS_DDL);
             } else {
                 assert!(
                     m.ddl.starts_with("CREATE INDEX CONCURRENTLY")
@@ -790,13 +855,85 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            20,
-            "the runner applied all 15 table/RLS, 4 concurrent-index, and 1 index-validation migrations"
+            21,
+            "the runner applied all 15 table/RLS, 4 concurrent-index, 1 index-validation, and 1 scheduler-boundary migrations"
         );
         assert_eq!(
             runner.applied()[0],
             "ci_0001_ci_run",
             "ci_run is applied first (FK order)"
+        );
+    }
+
+    #[test]
+    fn region_scheduler_boundary_is_additive_restrictive_and_least_privilege() {
+        let migrations = ci_controlplane_migrations();
+        let scheduler = migrations
+            .0
+            .last()
+            .expect("scheduler boundary is the final additive migration");
+        assert_eq!(scheduler.id, CI_REGION_SCHEDULER_RLS_MIGRATION_ID);
+        assert_eq!(scheduler.table, Some(JOB_QUEUE_TABLE));
+        assert_eq!(scheduler.ddl, CREATE_CI_REGION_SCHEDULER_RLS_DDL);
+
+        let ddl = scheduler.ddl;
+        assert_eq!(ddl.matches("AS PERMISSIVE").count(), 2);
+        assert_eq!(ddl.matches("AS RESTRICTIVE").count(), 2);
+        assert_eq!(
+            ddl.matches("TO myelin_ci_region_scheduler").count(),
+            7,
+            "four role-targeted policies plus three role-targeted grants"
+        );
+        for required in [
+            "current_setting('myelin.tenant_id', true) = ''",
+            "region = public.myelin_ci_scheduler_region()",
+            "region = current_setting('myelin.region', true)",
+            "GRANT SELECT ON job_queue",
+            "GRANT UPDATE (state, lease_owner, lease_expires) ON job_queue",
+            "GRANT SELECT ON fair_deficit",
+        ] {
+            assert!(
+                ddl.contains(required),
+                "scheduler boundary pins `{required}`"
+            );
+        }
+        for forbidden in [
+            "GRANT INSERT",
+            "GRANT DELETE",
+            "GRANT UPDATE ON fair_deficit",
+        ] {
+            assert!(
+                !ddl.contains(forbidden),
+                "scheduler boundary forbids `{forbidden}`"
+            );
+        }
+
+        let old_ids: Vec<&str> = create_statements().iter().map(|(id, _, _)| *id).collect();
+        assert!(!old_ids.contains(&CI_REGION_SCHEDULER_RLS_MIGRATION_ID));
+    }
+
+    #[test]
+    fn postgres_init_scheduler_identity_is_server_mapped_and_private() {
+        let init = include_str!("../../../scripts/pg-init/00-rls-conventions.sql");
+        for required in [
+            "CREATE ROLE myelin_ci_region_scheduler NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT",
+            "CREATE ROLE myelin_ci_scheduler_fr_par LOGIN PASSWORD 'myelin_ci_scheduler_dev_pw'",
+            "WITH INHERIT TRUE, SET FALSE",
+            "REVOKE myelin_ci_region_scheduler FROM myelin_app",
+            "WHERE mapping.session_role = session_user::name",
+            "SECURITY DEFINER",
+            "SET search_path = pg_catalog",
+            "REVOKE ALL ON FUNCTION public.myelin_ci_scheduler_region() FROM PUBLIC",
+            "GRANT EXECUTE ON FUNCTION public.myelin_ci_scheduler_region() TO myelin_ci_region_scheduler",
+        ] {
+            assert!(init.contains(required), "Postgres init pins `{required}`");
+        }
+        assert!(init.contains("VALUES ('myelin_ci_scheduler_fr_par', 'fr-par')"));
+        assert_eq!(
+            init.matches("REVOKE ALL ON TABLE public.myelin_ci_scheduler_region_map FROM")
+                .count(),
+            4,
+            "mapping table is hidden from PUBLIC, app, capability, and login"
         );
     }
 
