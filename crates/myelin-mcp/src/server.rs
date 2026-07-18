@@ -140,9 +140,22 @@ impl McpServer {
                         write_response(&mut writer, &write_value(&error))?;
                         continue;
                     }
+                    Frame::InvalidUtf8 => {
+                        let error = error_response(
+                            Value::Null,
+                            RpcError::new(INVALID_REQUEST, "JSON-RPC frame is not valid UTF-8"),
+                        );
+                        write_response(&mut writer, &write_value(&error))?;
+                        continue;
+                    }
                 };
                 if let Some(resp) = self.handle_line(&frame) {
                     write_response(&mut writer, &resp)?;
+                }
+                if self.router.as_ref().is_some_and(GovernedRouter::is_fatal) {
+                    return Err(std::io::Error::other(
+                        "governed MCP session reached an indeterminate mutation outcome",
+                    ));
                 }
             }
             Ok(())
@@ -188,6 +201,12 @@ impl McpServer {
                  protocol shell. See the governed_routing integration test for the end-to-end path.",
             )
         })?;
+        if router.is_fatal() {
+            return Err(RpcError::new(
+                GOVERNANCE_NOT_WIRED,
+                "governed session is terminal after an indeterminate mutation outcome",
+            ));
+        }
 
         // HITL (R2.4): a re-drive after a human approved the card PRESENTS the server-issued
         // opaque gate id (`approval.gateId`); the router looks it up in the SERVER-SIDE verdict
@@ -217,6 +236,7 @@ enum Frame {
     Eof,
     Payload(String),
     Oversized,
+    InvalidUtf8,
 }
 
 /// Read one bounded line. If it crosses the cap, discard through the next newline so the following
@@ -245,7 +265,10 @@ fn read_frame(reader: &mut impl BufRead) -> std::io::Result<Frame> {
             bytes.pop();
         }
     }
-    Ok(Frame::Payload(String::from_utf8_lossy(&bytes).into_owned()))
+    match String::from_utf8(bytes) {
+        Ok(frame) => Ok(Frame::Payload(frame)),
+        Err(_) => Ok(Frame::InvalidUtf8),
+    }
 }
 
 fn drain_through_newline(reader: &mut impl BufRead) -> std::io::Result<()> {
@@ -285,12 +308,20 @@ fn call_result_json(tool: &str, outcome: &CallOutcome) -> Value {
             false,
         ),
         CallOutcome::Denied { reason, .. } => (format!("`{tool}` denied: {reason}"), true),
+        CallOutcome::Indeterminate { reason, .. } => (
+            format!("`{tool}` has an indeterminate outcome: {reason}"),
+            true,
+        ),
     };
     let mut meta = json!({ "runToken": outcome.jti(), "tool": tool });
     match outcome {
         CallOutcome::Applied { event_id, .. } => meta["eventId"] = json!(event_id),
         CallOutcome::Gated { gate_id, .. } => meta["gateId"] = json!(gate_id),
         CallOutcome::Denied { reason, .. } => meta["reason"] = json!(reason),
+        CallOutcome::Indeterminate { reason, .. } => {
+            meta["reason"] = json!(reason);
+            meta["fatal"] = json!(true);
+        }
     }
     json!({
         "content": [ { "type": "text", "text": text } ],
@@ -417,6 +448,27 @@ mod tests {
         assert_eq!(responses[0]["error"]["code"], json!(INVALID_REQUEST));
         assert_eq!(responses[1]["id"], json!(9));
         assert!(responses[1]["result"]["tools"].is_array());
+    }
+
+    #[test]
+    fn invalid_utf8_is_rejected_without_lossy_reinterpretation_and_next_frame_survives() {
+        let server = McpServer::new_catalogue_only();
+        let mut input = vec![0xff, b'\n'];
+        input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/list\"}\n");
+        let mut output = Vec::new();
+        server.run(input.as_slice(), &mut output).unwrap();
+        let responses = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["code"], json!(INVALID_REQUEST));
+        assert!(responses[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("UTF-8"));
+        assert_eq!(responses[1]["id"], json!(11));
     }
 
     #[test]

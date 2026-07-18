@@ -1,4 +1,4 @@
-//! # `myelin-mcp` — the MCP server skeleton + tool-registration framework (E0.9 / MR-021)
+//! # `myelin-mcp` — governed MCP server + tool-registration framework (E0.9 / MR-021)
 //!
 //! The JSON-RPC-2.0-over-stdio surface a **local Claude** (Claude Code on the operator's machine)
 //! drives Myelin's git/issues/chat/docs/CI through as native MCP tools — under the **same governance
@@ -18,15 +18,12 @@
 //!   plan-then-apply chokepoint), HITL-gated where `requires_approval`, audited/attributed to the run.
 //!   NEVER a bare human PAT; NEVER a direct mutation.
 //!
-//! ## What is REAL vs deferred (honesty)
-//! - **REAL:** the protocol + the tool framework + the GOVERNANCE pipeline (per-run token mint, the
-//!   durable-revocation consult, the HITL gate on the frozen flag, the routing through the `EffectApi`
-//!   trait, and the per-run audit attribution).
-//! - **INJECTED:** the concrete `EffectApi` body — the eight-step `PlanThenApply` pipeline lives in
-//!   `myelin-agent-service`; the composition root injects it. [`governance::SkeletonEffectApi`] is a
-//!   reference chokepoint used to prove the routing.
-//! - **DEFERRED:** the durable git-backend EFFECT (a real merge/PR write) is the Git track **E1.1**;
-//!   the full per-subsystem tool coverage beyond git; and agent HOSTING (the real `LlmAgentRuntime`).
+//! ## Production composition
+//! The binary composes the protocol and registry with cryptographically authenticated trigger
+//! identity, snapshot-bound per-run authority, PostgreSQL-backed governance stores, object-scoped
+//! Git ReBAC, a durable Git effect adapter, and durable audit intent. The generic `EffectApi` remains
+//! injected so tests can use [`governance::SkeletonEffectApi`] and later runtimes can reuse the same
+//! governed boundary. Agent hosting (a real `LlmAgentRuntime`) remains outside this crate.
 //!
 //! ## DAG position
 //! A LEAF BINARY (like `myelin-cli` / `myelin-edge`): it REUSES git's `agent_tools()` + the agent
@@ -39,6 +36,9 @@ pub mod protocol;
 pub mod registry;
 pub mod server;
 
-pub use governance::{CallOutcome, GovernedRouter, RunPrincipal, SkeletonEffectApi};
+pub use governance::{
+    git_merge_repo_from_effect_key, AuditPhase, CallOutcome, GateApproverPolicy, GovernanceAudit,
+    GovernanceAuditRecord, GovernedRouter, OutboxGovernanceAudit, RunPrincipal, SkeletonEffectApi,
+};
 pub use registry::{RegisteredTool, ToolRegistry};
 pub use server::{Clock, McpServer, MAX_FRAME_BYTES};
