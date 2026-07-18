@@ -600,10 +600,9 @@ pub fn controlplane_app_spec(config: Config, outbox: myelin_events::OutboxStore)
         // the shell — every control-plane table lives in the one Postgres; the blob/cache/log-tier
         // stores are declared by their behaviour bands (CI-P20/CI-P22). Auto-registered as holders.
         stores: myelin_substrate::StoreManifest::new(),
-        // The relay drains the INJECTED store (MR-009b W3b.6 — the named W3b.4 debt discharged:
-        // this builder no longer constructs the memory floor). The in-process broker fake stays
-        // the default TRANSPORT (durability lives in the store); EB-04's adapter is a config swap.
-        outbox: OutboxSpec::new(outbox, myelin_events::InProcessBus::new()),
+        // Producer-only: the separately elected cell relay publishes the shared durable outbox.
+        // This process must not claim rows belonging to another subsystem.
+        outbox: OutboxSpec::external_relay(outbox),
         critical: controlplane_critical(),
     }
 }

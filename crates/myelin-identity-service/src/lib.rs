@@ -186,7 +186,7 @@ pub use webauthn::{
     WebauthnVerifier,
 };
 
-use myelin_events::{InProcessBus, OutboxStore};
+use myelin_events::OutboxStore;
 use myelin_identity::{
     AuthzError, CaveatContext, Consistency, Decision, IdentityService, ListObjectsResult,
     ObjectType, Permission, Principal, Zookie,
@@ -1752,9 +1752,8 @@ pub fn identity_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         // holders land with those stores (P-ID-05/P-ID-08); the OLTP store registers at boot.
         holders: AppSpec::auto(),
         stores: StoreManifest::new(),
-        // The relay drains the INJECTED store (W3b.4). The in-process broker fake stays the
-        // default TRANSPORT (durability lives in the store); EB-04's adapter is a config swap.
-        outbox: myelin_substrate::OutboxSpec::new(outbox, InProcessBus::new()),
+        // Producer-only shared durable outbox. The elected cell relay is the only publisher.
+        outbox: myelin_substrate::OutboxSpec::external_relay(outbox),
         // Identity is the dependency root — it declares no critical downstream of its own (§1).
         critical: CriticalDependencies::default(),
     }

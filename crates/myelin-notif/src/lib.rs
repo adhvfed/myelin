@@ -506,9 +506,8 @@ pub fn notif_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         // payloads structural erase tombstones an erased person's appearance for free.
         holders: AppSpec::auto(),
         stores: StoreManifest::new(),
-        // The relay drains the INJECTED store (W3b.4). The in-process broker fake stays the
-        // default TRANSPORT (durability lives in the store); EB-04's adapter is a config swap.
-        outbox: OutboxSpec::new(outbox, InProcessBus::new()),
+        // Producer-only shared durable outbox. The elected cell relay is the only publisher.
+        outbox: OutboxSpec::external_relay(outbox),
         // Notif declares no further critical downstream at the shell (its consumer call-sites —
         // Identity check, the bus — land with the router, NOTIF-P3); the OLTP store is implicit.
         critical: CriticalDependencies::default(),
@@ -558,7 +557,8 @@ pub fn notif_app_spec_with_router(
         }
     }
     // The routers emit into `outbox`; the relay drains the SAME injected store (one truth).
-    let mut spec = notif_app_spec(config, outbox);
+    let mut spec = notif_app_spec(config, outbox.clone());
+    spec.outbox = OutboxSpec::new(outbox, InProcessBus::new());
     spec.consumers = consumers;
     (spec, inbox)
 }

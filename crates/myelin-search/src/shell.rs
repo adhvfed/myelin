@@ -33,7 +33,7 @@
 //! indexer, no query path** here. `engine.search` stays private by construction (the SRCH-P01 lint
 //! holds — there is no public search path in this crate to add a bypass to).
 
-use myelin_events::{InProcessBus, OutboxStore};
+use myelin_events::OutboxStore;
 use myelin_substrate::{
     boot, serve, AppSpec, Config, CriticalDependencies, DeclaredStore, HotTables, InternalRpc,
     Migration, Migrations, OutboxSpec, PublicRoutes, ServeError, ServeHandle, StoreKind,
@@ -132,9 +132,8 @@ pub fn search_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         consumers: Vec::new(),
         holders: AppSpec::auto(),
         stores: search_stores(),
-        // The relay drains the INJECTED store (W3b.4). The in-process broker fake stays the
-        // default TRANSPORT (durability lives in the store); EB-04's adapter is a config swap.
-        outbox: OutboxSpec::new(outbox, InProcessBus::new()),
+        // Producer-only shared durable outbox. The elected cell relay is the only publisher.
+        outbox: OutboxSpec::external_relay(outbox),
         critical: search_critical(),
     }
 }
