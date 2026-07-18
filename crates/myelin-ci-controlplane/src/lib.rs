@@ -524,9 +524,10 @@ pub use fairness::{
 pub use migrations::{
     ci_controlplane_hot_tables, ci_controlplane_migrations, ci_durable_hot_tables,
     ci_durable_migrations, make_tenant_scoped_ddl, ARTIFACT_TABLE, CACHE_ENTRY_TABLE,
-    CHECK_ATTEMPT_TABLE, CI_COST_EVENT_TABLE, CI_DURABLE_WRITER_IDS, CI_JOB_TABLE, CI_RUN_TABLE,
-    CREATE_ARTIFACT_DDL, CREATE_CACHE_ENTRY_DDL, CREATE_CHECK_ATTEMPT_DDL,
-    CREATE_CI_COST_EVENT_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL,
+    CHECK_ATTEMPT_TABLE, CI_COST_EVENT_TABLE, CI_DURABLE_WRITER_IDS, CI_JOB_RUN_LEDGER_INDEX,
+    CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID, CI_JOB_TABLE, CI_RUN_TABLE, CREATE_ARTIFACT_DDL,
+    CREATE_CACHE_ENTRY_DDL, CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_COST_EVENT_DDL, CREATE_CI_JOB_DDL,
+    CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL,
     CREATE_DEPLOYMENT_DDL, CREATE_ENVIRONMENT_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
     CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL, CREATE_RUNNER_DDL,
     CREATE_SECRET_BINDING_DDL, CI_JOB_SPEC_TABLE, DEPLOYMENT_TABLE, ENVIRONMENT_TABLE,
@@ -824,8 +825,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            18,
-            "all 15 control-plane tables plus 3 top-level concurrent indexes are in the migration set"
+            19,
+            "all 15 control-plane tables plus 4 top-level concurrent indexes are in the migration set"
         );
         assert!(
             spec.consumers.is_empty(),
