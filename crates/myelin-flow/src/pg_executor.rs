@@ -3,9 +3,9 @@
 //! This module persists the externally visible control operations (`start`, `signal`, `describe`,
 //! and `cancel`) and the versioned definition registry. [`crate::pg_drive_store::PgFlowDriveStore`]
 //! now supplies the fenced PostgreSQL lease/load/commit boundary for journal, attempts, signals,
-//! timers, run state, and outbox. The remaining activation seam is a dispatcher adapter that turns
-//! a deterministic workflow body's staged commands into that durable commit batch; this control
-//! surface does not silently fall back to the in-memory engine.
+//! timers, run state, and outbox. [`crate::pg_dispatcher::PgFlowWorker`] is the production adapter
+//! that turns a deterministic workflow body's staged commands into that durable commit batch; this
+//! control surface does not silently fall back to the in-memory engine.
 
 use crate::engine::run_state;
 use crate::executor::{

@@ -663,7 +663,7 @@ impl ServeHandle {
     /// — drain the relay to outbox-depth 0 and deliver the last published events to the
     /// consumers so nothing committed is left unprocessed — then ack-then-exit. Returns the
     /// final producer telemetry snapshot (so the drain artifact records `outbox_depth == 0`).
-    fn drain(self) -> Telemetry {
+    pub fn drain(self) -> Telemetry {
         // stop intake.
         self.draining.store(true, Ordering::SeqCst);
         // finish in-flight: one more tick drains the relay + delivers to the consumers.

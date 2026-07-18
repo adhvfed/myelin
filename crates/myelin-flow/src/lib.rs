@@ -252,6 +252,7 @@ pub mod maintenance;
 pub mod merge_queue;
 pub mod migrations;
 pub mod pg_drive_store;
+pub mod pg_dispatcher;
 pub mod pg_executor;
 pub mod remint;
 // MR-009b W3b.5: the FLOW-D10 restore-verify drill re-hydrates a RESTORED in-memory outbox via
@@ -330,6 +331,10 @@ pub use pg_drive_store::{
     ActivityAttemptWrite, CommitOutcome as PgDriveCommitOutcome, DriveCommit, DriveLease,
     DriveSnapshot, DriveStoreError, FiredTimer, HistoryWrite, LoadedHistory, PendingSignal,
     PgFlowDriveStore, SignalKey, TimerArm,
+};
+pub use pg_dispatcher::{
+    configured_production_definitions, PgDriveBatch, PgFlowWorker, PgRunOnceOutcome, PgWorkerError,
+    PgWorkerScope, PgWorkflowBody, OPERATIONAL_PROBE_WF_TYPE,
 };
 pub use pg_executor::PgFlowExecutor;
 pub use remint::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenLease, RunTokenMinter};

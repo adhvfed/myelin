@@ -1,12 +1,9 @@
 //! # `myelin-flow` — the durable-workflow service binary (P-FLOW-02 → P-198, M2)
 //!
 //! The "every service `main.rs`" the contract-index row 1.1 names: it composes the DURABLE
-//! composition root (MR-009b W3b.4) and hands the flow [`AppSpec`](myelin_flow::flow_app_spec) to
-//! the harness's one call, [`run_flow`](myelin_flow::run_flow) (a thin wrapper over `serve`). The
-//! harness owns the whole lifecycle (boot → migrate → outbox relay → consumers → three ports →
-//! graceful drain, with liveness ≠ readiness); this `main` composes and hands off — no
-//! hand-rolled lifecycle logic (§10: the engine boots from `serve(AppSpec)`, there is no second
-//! emit/boot path).
+//! composition root (MR-009b W3b.4), boots the harness-owned surfaces, and keeps the scoped
+//! PostgreSQL workflow worker alive until an OS drain signal. The harness still owns boot, ports,
+//! relay metadata, and final graceful drain; the worker owns only its bounded polling lifecycle.
 //!
 //! **DURABLE-BY-DEFAULT (MR-009b W3b.4 / SI-007):** the outbox the relay drains is the PG-backed
 //! `outbox` table (`OutboxStore::durable(PgOutboxBacking)`) over the MR-022 `SubstrateProvider`
@@ -22,11 +19,15 @@
 //! A failed boot / incomplete drain returns non-zero (§3.1) — loud, never a silent success.
 
 use myelin_config::Mode;
-use myelin_events::OutboxStore;
-use myelin_flow::{migrations::migrations as flow_migrations, run_flow};
+use myelin_events::{OutboxStore, UlidMinter};
+use myelin_flow::{
+    boot_flow, configured_production_definitions, migrations::migrations as flow_migrations,
+    PgFlowWorker, PgWorkerScope, OPERATIONAL_PROBE_WF_TYPE,
+};
 use myelin_storage::{all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking};
 use myelin_substrate::Config;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
@@ -74,18 +75,100 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // A worker is always pinned to one explicitly configured tenant, residency region, and
+    // partition. Missing scope is a boot failure; this binary never discovers/scans all tenants.
+    let worker_scope = match PgWorkerScope::from_env() {
+        Ok(scope) => scope,
+        Err(e) => {
+            eprintln!("myelin-flow: PostgreSQL worker scope refused to start: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut worker = PgFlowWorker::new(
+        provider.db_pool().clone(),
+        tokio::runtime::Handle::current(),
+        Arc::new(UlidMinter::new()),
+        worker_scope,
+    );
+    let definitions = match configured_production_definitions() {
+        Ok(definitions) => definitions,
+        Err(e) => {
+            eprintln!("myelin-flow: configured workflow definitions refused to start: {e}");
+            std::process::exit(1);
+        }
+    };
+    for (wf_type, version) in definitions {
+        // This compiled body is deliberately an OPERATIONAL PROBE, not a product workflow stub.
+        // Unsupported configured product definitions fail above. ci.pipeline/merge/maintenance
+        // must be composed with their owning subsystem adapters before this binary can claim them.
+        if wf_type == OPERATIONAL_PROBE_WF_TYPE && version == 1 {
+            let code_hash = blake3::hash(b"myelin.flow.operational-probe@1:returns-empty").to_hex();
+            if let Err(e) = worker.register_definition(
+                OPERATIONAL_PROBE_WF_TYPE,
+                1,
+                code_hash.as_str(),
+                |_ctx| Ok(Vec::new()),
+            ) {
+                eprintln!("myelin-flow: cannot register operational probe definition: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     // The DURABLE outbox (SI-007): committed events live in Postgres, not a per-process mutex.
     let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
         provider.db_pool().clone(),
         tokio::runtime::Handle::current(),
     )));
-    // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
-    // shell boots over the validated default today (the durable config is the provider's above).
-    match run_flow(Config::default(), outbox) {
-        Ok(()) => {}
+    let service = match boot_flow(Config::default(), outbox) {
+        Ok(service) => service,
         Err(e) => {
-            // A failed boot / incomplete drain returns non-zero (§3.1) — loud, never swallowed.
-            eprintln!("myelin-flow service failed: {e}");
+            eprintln!("myelin-flow service boot failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let worker = Arc::new(worker);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let worker_task = {
+        let worker = Arc::clone(&worker);
+        tokio::spawn(async move {
+            worker
+                .run_until_shutdown(shutdown_rx, Duration::from_millis(250), 32)
+                .await
+        })
+    };
+    let mut worker_task = worker_task;
+    let mut service_tick = tokio::time::interval(Duration::from_millis(250));
+    let early_worker_result = loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                if let Err(e) = signal {
+                    eprintln!("myelin-flow: cannot install shutdown signal handler: {e}");
+                }
+                break None;
+            }
+            result = &mut worker_task => break Some(result),
+            _ = service_tick.tick() => { service.tick(); }
+        }
+    };
+    let _ = shutdown_tx.send(true);
+    let worker_result = match early_worker_result {
+        Some(result) => Ok(result),
+        None => tokio::time::timeout(Duration::from_secs(10), worker_task).await,
+    };
+    service.signal_drain();
+    let _final_telemetry = service.drain();
+    match worker_result {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => {
+            eprintln!("myelin-flow PostgreSQL worker failed: {e}");
+            std::process::exit(1);
+        }
+        Ok(Err(e)) => {
+            eprintln!("myelin-flow PostgreSQL worker task failed: {e}");
+            std::process::exit(1);
+        }
+        Err(_) => {
+            eprintln!("myelin-flow PostgreSQL worker did not drain within 10 seconds");
             std::process::exit(1);
         }
     }
