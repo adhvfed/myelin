@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS search_index_directory (
 /// are prepended by the harness; the indexer's dedup ledger (S3), the reindex cursor (S4), and the
 /// filter cache (S5) tables are the later slices' migrations (SRCH-P06/P16/P13 — named floors, not
 /// shipped here).
-fn search_migrations() -> Migrations {
+pub fn search_service_migrations() -> Migrations {
     Migrations::of([Migration::plain(
         "0010_search_index_directory",
         SEARCH_INDEX_DIR_MIGRATION,
@@ -121,7 +121,7 @@ pub fn search_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
         config,
-        migrations: search_migrations(),
+        migrations: search_service_migrations(),
         // No declared-hot table at the shell: the per-tenant index directory create is one-time per
         // tenant, not a write-QPS table. The high-write index-mutation tables (the indexer's, S1–S3)
         // declare their hot set as they land (SRCH-P06+ — measured-not-predicted, §9.4).

@@ -263,7 +263,8 @@ pub use restore_verify::{
     SearchRestoreInputs, SearchRestoreVerdict, SearchRestoreVerifyGate,
 };
 pub use shell::{
-    boot_search, run_search, search_app_spec, SEARCH_INDEX_DIR_MIGRATION, SERVICE_NAME,
+    boot_search, run_search, search_app_spec, search_service_migrations,
+    SEARCH_INDEX_DIR_MIGRATION, SERVICE_NAME,
 };
 pub use subartifact::{
     block_subdoc_projection, db_field_subdoc_projection, db_row_subdoc_projection,
