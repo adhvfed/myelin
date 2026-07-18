@@ -1,15 +1,25 @@
-//! Live PostgreSQL proof for the R4.4 durable Issue-store increment.
+//! Live PostgreSQL proof for the R4.4 fail-closed Issue/Identity authorization saga.
 #![cfg(feature = "integration")]
 
 use myelin_config::{Mode, MyelinConfig};
-use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
-use myelin_issues::{
-    issues_hot_tables, issues_migrations, CreateIssue, IssueAuthorizer, IssuePageRequest,
-    IssuePermission, IssueStoreError, PgIssueStore, VisibleIssues,
+use myelin_events::{EventEnvelope, Timestamp};
+use myelin_identity::{
+    Consistency, ConsistencyMode, DataRole, Decision, FragmentAdmit, IdentityService, ObjectId,
+    Permission, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RelName, RelationTuple,
+    TupleDelta, Zookie,
 };
-use myelin_storage::{KmsEngine, PgBootstrap};
-use myelin_tenancy::{Region, TenantId};
+use myelin_identity_service::{StoreBackedCheck, TupleStore};
+use myelin_issues::events::{ISSUE_AUTHORIZATION_REQUESTED, ISSUE_CREATED};
+use myelin_issues::{
+    issues_hot_tables, issues_migrations, CreateIssue, IssueAuthorizationBinding, IssueAuthorizer,
+    IssuePageRequest, IssuePermission, IssueStoreError, IssueTupleWriter, PgIssueStore,
+    VisibleIssues,
+};
+use myelin_storage::{DurableTupleBacking, KmsEngine, PgBootstrap, TenantScope};
+use myelin_tenancy::{ArtifactRef, Region, TenantId};
 use sqlx::Row;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 fn admin_url() -> String {
@@ -18,24 +28,102 @@ fn admin_url() -> String {
 }
 
 #[derive(Clone)]
-struct ExplicitAuthz;
+struct RebacAuthorizer {
+    identity: Arc<StoreBackedCheck>,
+}
 
-impl IssueAuthorizer for ExplicitAuthz {
-    fn may_create(&self, _principal: &Principal, _project_id: &str) -> bool {
-        true
+impl RebacAuthorizer {
+    fn allows(&self, principal: &Principal, permission: &str, object: String) -> bool {
+        matches!(
+            self.identity.check(
+                principal,
+                &Permission(permission.into()),
+                &ArtifactRef(object),
+                &Consistency {
+                    at_least: Zookie(String::new()),
+                    mode: ConsistencyMode::Strong,
+                },
+                None,
+            ),
+            Ok(Decision::Allow)
+        )
+    }
+}
+
+impl IssueAuthorizer for RebacAuthorizer {
+    fn may_create(&self, principal: &Principal, project_id: &str) -> bool {
+        self.allows(principal, "view", format!("project:{project_id}"))
     }
 
     fn may_access(
         &self,
-        _principal: &Principal,
-        _issue_id: &str,
-        _permission: IssuePermission,
+        principal: &Principal,
+        issue_id: &str,
+        permission: IssuePermission,
     ) -> bool {
-        true
+        let permission = match permission {
+            IssuePermission::View => "view",
+            IssuePermission::Close => "manage",
+        };
+        self.allows(principal, permission, format!("issue:{issue_id}"))
     }
 
+    // The test deliberately makes the SQL active-binding join, rather than an Identity allow-set,
+    // carry the list proof. Object reads above still use the real ReBAC engine.
     fn visible_issues(&self, _principal: &Principal) -> Result<VisibleIssues, String> {
         Ok(VisibleIssues::All)
+    }
+}
+
+#[derive(Clone)]
+struct DurableIdentityWriter {
+    tuples: TupleStore,
+}
+
+impl IssueTupleWriter for DurableIdentityWriter {
+    fn ensure_parent_project<'a>(
+        &'a self,
+        scope: &'a TenantScope,
+        actor: &'a Principal,
+        binding: &'a IssueAuthorizationBinding,
+    ) -> Pin<Box<dyn Future<Output = Result<Zookie, String>> + Send + 'a>> {
+        let tuples = self.tuples.clone();
+        let scope = scope.clone();
+        let actor = actor.clone();
+        let delta = TupleDelta::Add(RelationTuple {
+            object: ObjectId(binding.issue_object.clone()),
+            relation: RelName(binding.relation.clone()),
+            subject: PrincipalId(binding.project_userset.clone()),
+            caveat: None,
+        });
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                tuples.write_tuples(
+                    &scope,
+                    &actor,
+                    &[delta],
+                    None,
+                    None,
+                    Timestamp("2026-07-18T00:00:00Z".into()),
+                )
+            })
+            .await
+            .map_err(|_| "join failed".to_string())?
+            .map_err(|error| error.to_string())
+        })
+    }
+}
+
+struct SecretFailureWriter;
+
+impl IssueTupleWriter for SecretFailureWriter {
+    fn ensure_parent_project<'a>(
+        &'a self,
+        _scope: &'a TenantScope,
+        _actor: &'a Principal,
+        _binding: &'a IssueAuthorizationBinding,
+    ) -> Pin<Box<dyn Future<Output = Result<Zookie, String>> + Send + 'a>> {
+        Box::pin(async { Err("rpc bearer=top-secret customer@example.test".into()) })
     }
 }
 
@@ -50,140 +138,348 @@ fn principal(tenant: &str, id: &str) -> Principal {
     )
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn durable_create_list_view_close_is_rls_isolated_and_ciphertext_at_rest() {
+fn proposal(prefix: &str, title: &str) -> CreateIssue {
+    CreateIssue {
+        project_id: "11111111-1111-1111-1111-111111111111".into(),
+        type_id: "22222222-2222-2222-2222-222222222222".into(),
+        prefix: prefix.into(),
+        title: title.into(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent() {
     let mut config = MyelinConfig::from_env(Mode::DevDefaults).expect("dev config");
     config.region = "fr-par".into();
-    let bootstrap = PgBootstrap::connect(config, 4)
+    let bootstrap = PgBootstrap::connect(config, 8)
         .await
         .expect("validate split database roles (is docker-compose.dev.yml up?)");
     bootstrap
         .migrate_foundation()
         .await
-        .expect("apply shared outbox/dedup foundation");
+        .expect("apply shared outbox and durable Identity tuple foundation");
     bootstrap
         .migrate(&issues_migrations(), &issues_hot_tables())
         .await
-        .expect("apply boot-applicable Issues table/index/expand migrations");
+        .expect("apply Issues saga schema");
+    let provider = bootstrap.into_runtime().await.expect("RLS runtime handoff");
 
-    // Runtime uses the non-owner NOBYPASSRLS app role; handoff has closed the privileged pool and
-    // erased its credential from retained config before the Issue store exists.
-    let provider = bootstrap
-        .into_runtime()
-        .await
-        .expect("handoff to the RLS-enforced app provider");
+    let tuples = TupleStore::with_pg(
+        DurableTupleBacking::new(provider.clone()),
+        tokio::runtime::Handle::current(),
+    );
+    let identity = Arc::new(StoreBackedCheck::new(tuples.clone()));
+    for verdict in identity.admit_issue_fragment() {
+        assert!(matches!(verdict, FragmentAdmit::Admitted { .. }));
+    }
 
-    let store = PgIssueStore::new(provider, Arc::new(KmsEngine::new()), ExplicitAuthz);
     let suffix = format!("{}_{}", std::process::id(), now_nanos());
-    let tenant_a = format!("r44_a_{suffix}");
-    let tenant_b = format!("r44_b_{suffix}");
-    let alice = principal(&tenant_a, &format!("svc:alice:{suffix}"));
-    let bob = principal(&tenant_b, &format!("svc:bob:{suffix}"));
-    let project = "11111111-1111-1111-1111-111111111111";
-    let issue_type = "22222222-2222-2222-2222-222222222222";
-    let secret_title = format!("private title {suffix}");
-
-    let a = store
-        .create(
-            &alice,
-            CreateIssue {
-                project_id: project.into(),
-                type_id: issue_type.into(),
-                prefix: "ENG".into(),
-                title: secret_title.clone(),
-            },
+    let tenant = format!("r44_saga_{suffix}");
+    let creator = principal(&tenant, &format!("svc:creator:{suffix}"));
+    let worker = principal(&tenant, &format!("svc:reconciler:{suffix}"));
+    let scope = TenantScope::from_verified_token(&creator, creator.region.clone());
+    let project_reader = TupleDelta::Add(RelationTuple {
+        object: ObjectId("project:11111111-1111-1111-1111-111111111111".into()),
+        relation: RelName("reader".into()),
+        subject: creator.principal_id.clone(),
+        caveat: None,
+    });
+    let tuples_for_seed = tuples.clone();
+    let scope_for_seed = scope.clone();
+    let creator_for_seed = creator.clone();
+    tokio::task::spawn_blocking(move || {
+        tuples_for_seed.write_tuples(
+            &scope_for_seed,
+            &creator_for_seed,
+            &[project_reader],
+            None,
+            None,
+            Timestamp("2026-07-18T00:00:00Z".into()),
         )
-        .await
-        .expect("tenant A create");
-    let b = store
-        .create(
-            &bob,
-            CreateIssue {
-                project_id: project.into(),
-                type_id: issue_type.into(),
-                prefix: "ENG".into(),
-                title: "tenant B title".into(),
-            },
-        )
-        .await
-        .expect("tenant B create");
+    })
+    .await
+    .unwrap()
+    .expect("seed creator as project reader");
 
-    let page_a = store
-        .list(&alice, IssuePageRequest::new(10, None).unwrap())
-        .await
-        .expect("tenant A list");
-    assert!(page_a.items.iter().any(|item| item.id == a.id));
-    assert!(page_a.items.iter().all(|item| item.id != b.id));
-    assert_eq!(store.view(&alice, &a.id).await.unwrap().title, secret_title);
-    assert_eq!(
-        store.view(&bob, &a.id).await,
-        Err(IssueStoreError::NotFound),
-        "even an intentionally permissive test authorizer cannot cross the FORCE-RLS tenant boundary"
-    );
-    assert_eq!(
-        store.close(&bob, &a.id).await,
-        Err(IssueStoreError::NotFound)
-    );
-
-    let closed = store.close(&alice, &a.id).await.expect("durable close");
-    assert_eq!(closed.state_category, "completed");
-    let version = closed.version;
-    assert_eq!(
-        store
-            .close(&alice, &a.id)
-            .await
-            .expect("idempotent close")
-            .version,
-        version,
-        "an already-completed issue does not get another version bump"
-    );
-
+    let authorizer = RebacAuthorizer {
+        identity: identity.clone(),
+    };
+    let kms = Arc::new(KmsEngine::new());
+    let store = PgIssueStore::new(provider.clone(), kms.clone(), authorizer.clone());
+    let writer = DurableIdentityWriter {
+        tuples: tuples.clone(),
+    };
     let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
+        .max_connections(2)
         .connect(&admin_url())
         .await
-        .expect("connect admin for at-rest inspection");
-    let row = sqlx::query(
-        "SELECT title, title_ciphertext, title_nonce, pii_key_ref, reporter, \
-                created_by_principal, contains_personal_data \
-         FROM issue WHERE tenant_id = $1 AND id = $2::uuid",
-    )
-    .bind(&tenant_a)
-    .bind(&a.id)
-    .fetch_one(&admin)
-    .await
-    .expect("inspect exact test row");
-    assert_eq!(row.get::<String, _>("title"), "<encrypted>");
-    let ciphertext: Vec<u8> = row.get("title_ciphertext");
-    assert!(!ciphertext
-        .windows(secret_title.len())
-        .any(|window| window == secret_title.as_bytes()));
-    assert_eq!(row.get::<Vec<u8>, _>("title_nonce").len(), 12);
-    assert_eq!(row.get::<Option<sqlx::types::Uuid>, _>("reporter"), None);
+        .expect("admin inspection connection");
+
+    // The exact production transaction rolls back the row, prefix allocation, binding and outbox.
+    assert!(store
+        .create_then_abort_for_test(&creator, proposal("RBK", "must roll back"))
+        .await
+        .is_err());
+    for (table, count) in [
+        (
+            "issue",
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM issue WHERE tenant_id = $1")
+                .bind(&tenant)
+                .fetch_one(&admin)
+                .await
+                .unwrap(),
+        ),
+        (
+            "binding",
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM issue_authz_binding WHERE tenant_id = $1",
+            )
+            .bind(&tenant)
+            .fetch_one(&admin)
+            .await
+            .unwrap(),
+        ),
+        (
+            "prefix",
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM prefix_counter WHERE tenant_id = $1 AND prefix = 'RBK'",
+            )
+            .bind(&tenant)
+            .fetch_one(&admin)
+            .await
+            .unwrap(),
+        ),
+    ] {
+        assert_eq!(count, 0, "rollback left no {table} state");
+    }
+
+    let staged = store
+        .create(&creator, proposal("ENG", "private staged title"))
+        .await
+        .expect("stage invisible issue");
     assert_eq!(
-        row.get::<String, _>("created_by_principal"),
-        alice.principal_id.0
+        store.view(&creator, &staged.id).await,
+        Err(IssueStoreError::NotFound),
+        "no tuple means ReBAC denies the pending object"
     );
-    assert!(row.get::<bool, _>("contains_personal_data"));
-    assert!(
-        row.get::<String, _>("pii_key_ref")
-            .ends_with(&format!("/subject:{}", alice.principal_id.0)),
-        "the title DEK is assigned to the verified creator subject"
+    assert!(store
+        .list(&creator, IssuePageRequest::new(20, None).unwrap())
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+    assert_eq!(
+        store.pending_authorization_ids(&worker, 10).await.unwrap(),
+        vec![staged.id.clone()],
+        "a restart scanner can recover every staged pending binding"
     );
 
-    // Exact test-tenant cleanup; no production row or broad collection is touched.
-    for tenant in [&tenant_a, &tenant_b] {
-        sqlx::query("DELETE FROM issue WHERE tenant_id = $1")
-            .bind(tenant)
-            .execute(&admin)
+    // Persist only a machine class, never arbitrary RPC/Identity text.
+    assert!(matches!(
+        store
+            .reconcile_authorization(&worker, &staged.id, &SecretFailureWriter)
+            .await,
+        Err(IssueStoreError::AuthorizationUnavailable(_))
+    ));
+    let last_error: String = sqlx::query_scalar(
+        "SELECT last_error FROM issue_authz_binding WHERE tenant_id = $1 AND region = 'fr-par' \
+         AND issue_id = $2::uuid",
+    )
+    .bind(&tenant)
+    .bind(&staged.id)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(last_error, "identity_tuple_write_failed");
+
+    // Crash after Identity commit: tuple exists, but product reads remain fail-closed until retry.
+    assert!(store
+        .reconcile_then_crash_for_test(&worker, &staged.id, &writer)
+        .await
+        .is_err());
+    assert!(authorizer.allows(&creator, "view", format!("issue:{}", staged.id)));
+    assert_eq!(
+        store.view(&creator, &staged.id).await,
+        Err(IssueStoreError::NotFound)
+    );
+    assert!(store
+        .list(&creator, IssuePageRequest::new(20, None).unwrap())
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+
+    // Reconstruct the store as a process restart would, then retry the exact persisted intent.
+    let restarted = PgIssueStore::new(provider.clone(), kms, authorizer.clone());
+    let activated = restarted
+        .reconcile_authorization(&worker, &staged.id, &writer)
+        .await
+        .expect("retry activates after idempotent tuple add");
+    assert!(activated.newly_activated);
+    assert_eq!(activated.issue.title, "private staged title");
+    assert!(
+        !restarted
+            .reconcile_authorization(&worker, &staged.id, &writer)
             .await
-            .expect("clean issue fixture rows");
-        sqlx::query("DELETE FROM prefix_counter WHERE tenant_id = $1")
-            .bind(tenant)
-            .execute(&admin)
-            .await
-            .expect("clean counter fixture rows");
+            .unwrap()
+            .newly_activated
+    );
+    assert_eq!(
+        restarted.view(&creator, &staged.id).await.unwrap().id,
+        staged.id
+    );
+
+    // Persisted event IDs are canonical ULIDs, created is emitted once, PII-free, and attributes
+    // the original creator rather than the reconciliation worker.
+    let binding = sqlx::query(
+        "SELECT request_event_id, created_event_id FROM issue_authz_binding \
+         WHERE tenant_id = $1 AND region = 'fr-par' AND issue_id = $2::uuid",
+    )
+    .bind(&tenant)
+    .bind(&staged.id)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    let request_id: String = binding.get("request_event_id");
+    let created_id: String = binding.get("created_event_id");
+    assert!(is_canonical_ulid(&request_id));
+    assert!(is_canonical_ulid(&created_id));
+    assert_eq!(request_id, staged.authorization_request_event_id);
+    let request: EventEnvelope = envelope(&admin, &request_id).await;
+    let created: EventEnvelope = envelope(&admin, &created_id).await;
+    assert_eq!(request.type_.0, ISSUE_AUTHORIZATION_REQUESTED);
+    assert_eq!(created.type_.0, ISSUE_CREATED);
+    assert_eq!(created.actor.0.principal_id, creator.principal_id);
+    assert!(!created.contains_personal_data);
+    assert!(created.pii_key_ref.is_none());
+    assert_eq!(created.causation_id, Some(request.event_id));
+    let created_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox WHERE envelope->>'tenant' = $1 \
+         AND envelope->>'type_' = $2 AND aggregate = $3",
+    )
+    .bind(&tenant)
+    .bind(ISSUE_CREATED)
+    .bind(format!("issue:{}", staged.id))
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(created_count, 1);
+
+    // Concurrent reconcilers may repeat the idempotent Identity Add, but only one CAS emits created.
+    let raced = restarted
+        .create(&creator, proposal("RCE", "concurrent bootstrap"))
+        .await
+        .unwrap();
+    let mut joins = Vec::new();
+    for _ in 0..8 {
+        let store = restarted.clone();
+        let writer = writer.clone();
+        let worker = worker.clone();
+        let id = raced.id.clone();
+        joins.push(tokio::spawn(async move {
+            store.reconcile_authorization(&worker, &id, &writer).await
+        }));
     }
+    let mut winners = 0;
+    for join in joins {
+        if let Ok(outcome) = join.await.unwrap() {
+            winners += usize::from(outcome.newly_activated);
+        }
+    }
+    assert_eq!(winners, 1);
+    assert!(
+        !restarted
+            .reconcile_authorization(&worker, &raced.id, &writer)
+            .await
+            .unwrap()
+            .newly_activated,
+        "a scanner retry converges any transient concurrent Identity-write loser"
+    );
+    let tuple_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM rebac_tuple WHERE tenant_id = $1 AND region = 'fr-par' \
+         AND object_id = $2 AND relation = 'parent_project'",
+    )
+    .bind(&tenant)
+    .bind(format!("issue:{}", raced.id))
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(tuple_count, 1);
+    let race_created: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox WHERE envelope->>'tenant' = $1 \
+         AND envelope->>'type_' = $2 AND aggregate = $3",
+    )
+    .bind(&tenant)
+    .bind(ISSUE_CREATED)
+    .bind(format!("issue:{}", raced.id))
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(race_created, 1);
+
+    // Rollout audit: a pre-existing row with no reviewed binding remains present but invisible.
+    let legacy_id = sqlx::types::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO issue (tenant_id, region, id, key, prefix, type_id, type_rank, state, \
+           state_category, reporter, project_id, rank, title, title_nonce, title_ciphertext, \
+           created_by_principal, pii_key_ref, contains_personal_data, version) \
+         SELECT tenant_id, region, $3, $4, 'LEG', type_id, type_rank, state, state_category, \
+           reporter, project_id, $5, title, title_nonce, title_ciphertext, created_by_principal, \
+           pii_key_ref, contains_personal_data, version \
+         FROM issue WHERE tenant_id = $1 AND region = $2 AND id = $6::uuid",
+    )
+    .bind(&tenant)
+    .bind("fr-par")
+    .bind(legacy_id)
+    .bind(format!("LEG-{suffix}"))
+    .bind(format!("legacy|{suffix}"))
+    .bind(&staged.id)
+    .execute(&admin)
+    .await
+    .unwrap();
+    let listed = restarted
+        .list(&creator, IssuePageRequest::new(100, None).unwrap())
+        .await
+        .unwrap();
+    assert!(listed
+        .items
+        .iter()
+        .all(|item| item.id != legacy_id.to_string()));
+    assert!(!restarted
+        .pending_authorization_ids(&worker, 100)
+        .await
+        .unwrap()
+        .contains(&legacy_id.to_string()));
+
+    // Exact test-tenant cleanup; binding first because it references issue.
+    for statement in [
+        "DELETE FROM issue_authz_binding WHERE tenant_id = $1",
+        "DELETE FROM issue WHERE tenant_id = $1",
+        "DELETE FROM prefix_counter WHERE tenant_id = $1",
+        "DELETE FROM rebac_tuple WHERE tenant_id = $1",
+        "DELETE FROM outbox WHERE envelope->>'tenant' = $1",
+    ] {
+        sqlx::query(statement)
+            .bind(&tenant)
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+}
+
+async fn envelope(pool: &sqlx::PgPool, event_id: &str) -> EventEnvelope {
+    let value: serde_json::Value =
+        sqlx::query_scalar("SELECT envelope FROM outbox WHERE event_id = $1")
+            .bind(event_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    serde_json::from_value(value).unwrap()
+}
+
+fn is_canonical_ulid(value: &str) -> bool {
+    const CROCKFORD: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    value.len() == 26 && value.chars().all(|ch| CROCKFORD.contains(ch))
 }
 
 fn now_nanos() -> u128 {

@@ -93,6 +93,11 @@ pub const ISSUE_PARENT_CHANGED: &str = "issue.issue.parent_changed";
 pub const ISSUE_ARCHIVED: &str = "issue.issue.archived";
 /// An issue was reordered (the `order_key`/LexoRank CAS rank — ISS-P09). Aggregate `issue/<key>`.
 pub const ISSUE_REORDERED: &str = "issue.issue.reordered";
+/// Internal authorization-bootstrap request for a newly staged issue. This event is emitted in
+/// the SAME PostgreSQL transaction as the pending issue row and is consumed by the Identity tuple
+/// writer. It is deliberately distinct from [`ISSUE_CREATED`]: downstream product consumers must
+/// not observe an issue until Identity has durably installed its `parent_project` tuple.
+pub const ISSUE_AUTHORIZATION_REQUESTED: &str = "issue.issue.authorization_requested";
 
 // --- triage (on `issue`; agent-assist provenance — always attributed) -------
 
@@ -254,6 +259,7 @@ pub const ISSUE_EVENT_TOKENS: &[&str] = &[
     ISSUE_PARENT_CHANGED,
     ISSUE_ARCHIVED,
     ISSUE_REORDERED,
+    ISSUE_AUTHORIZATION_REQUESTED,
     // triage (agent-assist provenance)
     ISSUE_TRIAGED,
     ISSUE_DUPLICATE_SUSPECTED,
