@@ -43,12 +43,12 @@ use myelin_identity_service::ResolvedDelegationPolicy;
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
 
-use myelin_mcp::governance::SkeletonEffectApi;
+use myelin_mcp::governance::{mcp_effect_key, SkeletonEffectApi};
 use myelin_mcp::{
     AuditPhase, CallOutcome, GateApproverPolicy, GovernanceAudit, GovernanceAuditRecord,
     GovernedRouter, McpServer, OutboxGovernanceAudit, RunPrincipal, ToolRegistry,
 };
-use myelin_storage::hitl_gate_durable::{GateDecideError, GateState, HitlVerdictStore};
+use myelin_storage::hitl_gate_durable::{GateDecideError, GateRecord, GateState, HitlVerdictStore};
 
 fn now() -> Timestamp {
     Timestamp("2026-06-26T00:00:00Z".into())
@@ -190,6 +190,24 @@ fn governed_router_with_trigger_audit_and_ttl(
     audit: Arc<dyn GovernanceAudit>,
     run_ttl_secs: u64,
 ) -> GovernedRouter {
+    governed_router_with_verdicts(
+        input,
+        trigger_jti,
+        trigger_expires_at_unix,
+        audit,
+        run_ttl_secs,
+        HitlVerdictStore::new(),
+    )
+}
+
+fn governed_router_with_verdicts(
+    input: DelegationInput,
+    trigger_jti: &str,
+    trigger_expires_at_unix: i64,
+    audit: Arc<dyn GovernanceAudit>,
+    run_ttl_secs: u64,
+    verdicts: HitlVerdictStore,
+) -> GovernedRouter {
     let s7 = RevocationStore::new();
     // A REAL per-run minter (the structural floor signer is the EI-01 §1 named seam; the real
     // PASETO/Ed25519 signer swaps in behind the SAME `TokenSigner` trait — the mint's intersection +
@@ -232,7 +250,6 @@ fn governed_router_with_trigger_audit_and_ttl(
     // R2.4: the SERVER-SIDE verdict store (in-memory test double of the durable agent_hitl_gate
     // arm) + the approver set. The agent principal is deliberately INCLUDED here to prove the
     // router structurally excludes the requester from its own gate's eligible approvers.
-    let verdicts = HitlVerdictStore::new();
     let approvers = vec![
         PrincipalId("human:operator".into()),
         PrincipalId("agent:claude".into()),
@@ -878,6 +895,85 @@ fn expiry_audit_failure_is_fail_loud_after_state_commit_and_terminates_session()
         GateState::Expired
     );
     assert!(router.is_fatal());
+}
+
+#[test]
+fn mcp_expiry_leaves_unrelated_shared_gate_untouched_and_audits_exact_gate() {
+    let args = serde_json::json!({"repo":"alpha","number":77});
+    let exact_effect = mcp_effect_key("git.merge", &args);
+    let mut verdicts = HitlVerdictStore::new();
+    let scope = TenantScope::from_verified_token(
+        &human_principal("human:operator", "acme"),
+        Region("eu-west".into()),
+    );
+    let record = |gate_id: &str, run_id: &str, effect_id: &str, requester: &str| GateRecord {
+        gate_id: gate_id.into(),
+        run_id: run_id.into(),
+        effect_id: effect_id.into(),
+        risk_summary: Vec::new(),
+        cost_estimate: 0,
+        approver_filter: vec!["human:operator".into()],
+        state: GateState::Waiting,
+        card_ref: None,
+        requested_by: requester.into(),
+        decided_by: None,
+        opened_at_unix: 1,
+        decided_at_unix: None,
+        expires_at_unix: 2,
+        approval_consumed_at_unix: None,
+    };
+    verdicts
+        .open(
+            &scope,
+            record("gate:mcp-due", "mcp-run-1", &exact_effect, "agent:claude"),
+        )
+        .unwrap();
+    verdicts
+        .open(
+            &scope,
+            record(
+                "gate:shared-due",
+                "agent-service-run",
+                "agent-service:v1:deploy:opaque",
+                "agent:shared-service",
+            ),
+        )
+        .unwrap();
+    let audit_store = OutboxStore::new();
+    let grants = ["pull_request.merge"];
+    let router = governed_router_with_verdicts(
+        DelegationInput {
+            agent_policy: Authority::of(grants),
+            delegation: Authority::of(grants),
+            tenant_policy: Authority::of(grants),
+            trigger_actor_held: Authority::of(grants),
+        },
+        "trigger-jti",
+        i64::MAX,
+        Arc::new(OutboxGovernanceAudit::new(
+            audit_store.clone(),
+            Arc::new(MonotonicMinter::new()),
+        )),
+        7_200,
+        verdicts,
+    );
+    let registry = ToolRegistry::with_git();
+    assert!(matches!(
+        router.call(registry.resolve("git.merge").unwrap(), &args, &now(), None),
+        CallOutcome::Gated { .. }
+    ));
+    assert_eq!(
+        router.gate_verdict("gate:mcp-due").unwrap().state,
+        GateState::Expired
+    );
+    assert_eq!(
+        router.gate_verdict("gate:shared-due").unwrap().state,
+        GateState::Waiting
+    );
+    assert!(audit_store.committed_rows().iter().any(|row| {
+        row.envelope.type_.0 == "git.merge.expired"
+            && row.envelope.subject.0.ends_with("/hitl-gate/gate:mcp-due")
+    }));
 }
 
 #[test]

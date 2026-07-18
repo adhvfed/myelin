@@ -528,19 +528,31 @@ impl HitlVerdictStore {
         }
     }
 
-    /// Expire every waiting or approved-but-unconsumed gate whose durable deadline has elapsed,
-    /// returning the exact rows that transitioned so the caller can emit minimized audit outcomes.
-    /// A consumed approval remains immutable evidence of the one authorized attempt.
-    pub fn expire_due(&mut self, scope: &TenantScope, now_unix: i64) -> Vec<GateRecord> {
+    /// Expire only due gates owned by one exact `(run, requester, effect)` boundary, returning the
+    /// transitioned rows for terminal audit. SQL enforces every selector before mutation, so one
+    /// subsystem cannot expire another subsystem's unauditable gates. A consumed approval remains
+    /// immutable evidence of the one authorized attempt.
+    pub fn expire_due_for_effect(
+        &mut self,
+        scope: &TenantScope,
+        run_id: &str,
+        requester: &str,
+        effect_id: &str,
+        now_unix: i64,
+    ) -> Vec<GateRecord> {
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            HitlVerdictBackend::Memory(m) => m.expire_due(scope, now_unix),
-            HitlVerdictBackend::Durable(d) => d.expire_due(scope, now_unix),
+            HitlVerdictBackend::Memory(m) => {
+                m.expire_due_for_effect(scope, run_id, requester, effect_id, now_unix)
+            }
+            HitlVerdictBackend::Durable(d) => {
+                d.expire_due_for_effect(scope, run_id, requester, effect_id, now_unix)
+            }
         }
     }
 
     /// Settle one exact gate as expired when its durable deadline has elapsed. This is the
-    /// operator-decision counterpart to [`Self::expire_due`], avoiding a stale waiting row when an
+    /// operator-decision counterpart to [`Self::expire_due_for_effect`], avoiding a stale waiting row when an
     /// approve/reject command arrives on the deadline.
     pub fn expire_if_due(
         &mut self,
@@ -654,7 +666,14 @@ impl MemoryHitlGates {
         Ok(())
     }
 
-    fn expire_due(&mut self, scope: &TenantScope, now_unix: i64) -> Vec<GateRecord> {
+    fn expire_due_for_effect(
+        &mut self,
+        scope: &TenantScope,
+        run_id: &str,
+        requester: &str,
+        effect_id: &str,
+        now_unix: i64,
+    ) -> Vec<GateRecord> {
         let (tenant, region) = (scope.tenant().0.as_str(), scope.region().0.as_str());
         let mut expired = Vec::new();
         for ((row_tenant, row_region, _), row) in &mut self.rows {
@@ -662,6 +681,9 @@ impl MemoryHitlGates {
                 && row_region == region
                 && matches!(row.state, GateState::Waiting | GateState::Approved)
                 && row.approval_consumed_at_unix.is_none()
+                && row.run_id == run_id
+                && row.requested_by == requester
+                && row.effect_id == effect_id
                 && row.expires_at_unix <= now_unix
             {
                 row.state = GateState::Expired;
@@ -1023,20 +1045,31 @@ impl DurableHitlGates {
         )
     }
 
-    fn expire_due(&self, scope: &TenantScope, now_unix: i64) -> Vec<GateRecord> {
+    fn expire_due_for_effect(
+        &self,
+        scope: &TenantScope,
+        run_id: &str,
+        requester: &str,
+        effect_id: &str,
+        now_unix: i64,
+    ) -> Vec<GateRecord> {
         let region = self.region();
         let tenant = scope.tenant().0.clone();
+        let run_id = run_id.to_string();
+        let requester = requester.to_string();
+        let effect_id = effect_id.to_string();
         self.block(
             self.provider
                 .with_tenant_tx(&scope.tenant().0, move |conn| {
                     Box::pin(async move {
                         let rows = sqlx::query(
                             "UPDATE agent_hitl_gate \
-                     SET state = 'expired', decided_at_unix = $3 \
+                     SET state = 'expired', decided_at_unix = $6 \
                      WHERE tenant_id = $1 AND region = $2 \
                        AND state IN ('waiting', 'approved') \
                        AND approval_consumed_at_unix IS NULL \
-                       AND expires_at_unix <= $3 \
+                       AND run_id = $3 AND requested_by = $4 AND effect_id = $5 \
+                       AND expires_at_unix <= $6 \
                      RETURNING gate_id, run_id, effect_id, risk_summary, cost_estimate, \
                                approver_filter, state, card_ref, requested_by, decided_by, \
                                opened_at_unix, decided_at_unix, expires_at_unix, \
@@ -1044,6 +1077,9 @@ impl DurableHitlGates {
                         )
                         .bind(&tenant)
                         .bind(&region)
+                        .bind(&run_id)
+                        .bind(&requester)
+                        .bind(&effect_id)
                         .bind(now_unix)
                         .fetch_all(&mut *conn)
                         .await
@@ -1233,6 +1269,16 @@ mod tests {
             expires_at_unix: i64::MAX,
             approval_consumed_at_unix: None,
         }
+    }
+
+    fn expire_mcp_due(store: &mut HitlVerdictStore, now_unix: i64) -> Vec<GateRecord> {
+        store.expire_due_for_effect(
+            &scope(),
+            "mcp-run-1",
+            "agent:claude",
+            "gate:git.merge:myelin://acme/git/pr/40",
+            now_unix,
+        )
     }
 
     /// A pending gate INSERTs waiting, is fetchable by its opaque id, and a duplicate open refuses.
@@ -1544,13 +1590,26 @@ mod tests {
         record.expires_at_unix = 200;
         let mut store = HitlVerdictStore::new();
         store.open(&scope(), record).unwrap();
-        assert_eq!(store.expire_due(&scope(), 199), Vec::new());
-        let expired = store.expire_due(&scope(), 200);
+        let mut unrelated = waiting("gate:shared-agent-service");
+        unrelated.run_id = "agent-service-run".into();
+        unrelated.effect_id = "agent-service:v1:deploy:opaque".into();
+        unrelated.expires_at_unix = 200;
+        store.open(&scope(), unrelated).unwrap();
+        assert_eq!(expire_mcp_due(&mut store, 199), Vec::new());
+        let expired = expire_mcp_due(&mut store, 200);
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].state, GateState::Expired);
         assert_eq!(expired[0].opened_at_unix, 100);
         assert_eq!(expired[0].decided_at_unix, Some(200));
-        assert_eq!(store.expire_due(&scope(), 201), Vec::new());
+        assert_eq!(
+            store
+                .fetch(&scope(), "gate:shared-agent-service")
+                .unwrap()
+                .state,
+            GateState::Waiting,
+            "exact MCP ownership selection must not mutate an unrelated due gate"
+        );
+        assert_eq!(expire_mcp_due(&mut store, 201), Vec::new());
 
         let mut targeted = waiting("gate:targeted");
         targeted.expires_at_unix = 400;
@@ -1580,7 +1639,7 @@ mod tests {
                 110,
             )
             .unwrap();
-        assert_eq!(store.expire_due(&scope(), 200)[0].state, GateState::Expired);
+        assert_eq!(expire_mcp_due(&mut store, 200)[0].state, GateState::Expired);
 
         let mut consumed = waiting("gate:consumed");
         consumed.expires_at_unix = 300;
@@ -1604,7 +1663,7 @@ mod tests {
                 220,
             )
             .unwrap();
-        assert_eq!(store.expire_due(&scope(), 300), Vec::new());
+        assert_eq!(expire_mcp_due(&mut store, 300), Vec::new());
         let row = store.fetch(&scope(), "gate:consumed").unwrap();
         assert_eq!(row.state, GateState::Approved);
         assert_eq!(row.approval_consumed_at_unix, Some(220));
