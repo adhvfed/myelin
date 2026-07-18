@@ -701,6 +701,7 @@ pub mod hitl_gate_durable;
 // own module so the broker-publish call is isolated to a single named relay file (the same
 // posture as myelin-events/src/relay.rs).
 pub mod backend;
+pub mod elected_relay;
 pub mod pgrelay;
 // The durable PG backing for the consumer_dedup ledger (MR-023 / SI-023): the real
 // `(consumer, event_id)` table behind the `myelin_events::DurableDedup` seam so consumer

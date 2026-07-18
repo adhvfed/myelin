@@ -77,15 +77,18 @@ serde_json.workspace = true
 
 [features]
 default = []
+# Production-selectable NATS publisher support, independent of live integration tests.
+nats = ["myelin-events/nats"]
 # MR-009b Wave 1: `integration` is now a TEST-SELECTOR only — the durable deps (sqlx/aws/fred/
 # tokio/myelin-config) are non-optional [dependencies] above, so the durable code compiles in the
 # DEFAULT build; `integration` no longer carries any `dep:` activation. It remains the
 # `required-features` marker on tests/integration_*.rs (the live-PG/S3 drills) and it turns on the
 # downstream events live-bus surface: the real NATS JetStream broker (`myelin_events::nats`, used by
-# the `events_serve` composition root) lives behind `myelin-events/integration` (async-nats is still
-# optional in myelin-events), so storage's integration feature enables it transitively. Do NOT delete
+# the `events_serve` composition root) is optional behind the production `myelin-events/nats`
+# feature, so storage's integration feature enables it transitively. Do NOT delete
 # this feature — the live-backend tests still gate on it.
 integration = [
+    "nats",
     "myelin-events/integration",
     # MR-009b Wave 3: `integration` is a TEST-SELECTOR, so it also turns on the events in-memory
     # `test-support` doubles the live-PG integration/drill tests build against (e.g. the

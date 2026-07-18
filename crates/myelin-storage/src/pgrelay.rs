@@ -20,7 +20,9 @@
 //! `pg.rs` record); the per-POOL runtime region-pin is the STOR-D5 gate (P-ST-15 / P-102). The
 //! file-level waiver marker `@residency-cell-pinned:file` records this floor LOUDLY (EI-01 §4).
 
-use myelin_events::relay::{BusTransport, Delivery, DrainReport, MAX_PUBLISH_ATTEMPTS};
+use myelin_events::relay::{
+    BusTransport, Delivery, DrainReport, EventPublisher, MAX_PUBLISH_ATTEMPTS,
+};
 use myelin_events::{AggregateKey, ArtifactRef, EventEnvelope, EventId, OutboxRow, Timestamp};
 use sqlx::postgres::PgPool;
 use sqlx::Row;
@@ -222,7 +224,11 @@ impl PgRelay {
     /// Emit-iff-published: a row is marked sent only if its publish was Accepted/Deduplicated; a
     /// publish failure aborts the transaction (the claim releases, the row stays unsent to
     /// retry) — the 0-lost property the relay floor models.
-    pub async fn relay_once<B: BusTransport>(&self, bus: &B, batch: i64) -> Result<usize, PgError> {
+    pub async fn relay_once<P: EventPublisher + ?Sized>(
+        &self,
+        publisher: &P,
+        batch: i64,
+    ) -> Result<usize, PgError> {
         let mut tx = self
             .pool
             .begin()
@@ -251,7 +257,7 @@ impl PgRelay {
             // committed to the outbox; the relay forwards it with the stable event_id as the
             // broker-side dedup id (0 ghost). A transport error aborts the whole tx → the claim
             // releases, rows stay unsent.
-            match bus.put(&envelope.subject, &envelope, &envelope.event_id) {
+            match publisher.publish(&envelope.subject, &envelope, &envelope.event_id) {
                 Ok(Delivery::Accepted) | Ok(Delivery::Deduplicated) => {}
                 Err(e) => return Err(PgError::Publish(e.0)),
             }
@@ -409,9 +415,9 @@ impl PgRelay {
     ///
     /// Returns how many rows were published to the broker before the simulated crash (these are
     /// the rows that will be re-published-and-deduplicated by the post-restart relay).
-    pub async fn relay_once_crash_after<B: BusTransport>(
+    pub async fn relay_once_crash_after<P: EventPublisher + ?Sized>(
         &self,
-        bus: &B,
+        publisher: &P,
         batch: i64,
         crash_after: usize,
     ) -> Result<usize, PgError> {
@@ -439,7 +445,7 @@ impl PgRelay {
             let envelope: EventEnvelope = serde_json::from_value(payload)
                 .map_err(|e| PgError::Query(format!("deserialize envelope: {e}")))?;
 
-            match bus.put(&envelope.subject, &envelope, &envelope.event_id) {
+            match publisher.publish(&envelope.subject, &envelope, &envelope.event_id) {
                 Ok(Delivery::Accepted) | Ok(Delivery::Deduplicated) => {}
                 Err(e) => return Err(PgError::Publish(e.0)),
             }
