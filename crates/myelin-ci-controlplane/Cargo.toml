@@ -93,6 +93,7 @@ myelin-agent = { path = "../myelin-agent" }
 # serde_json (the same crate the envelope payload uses); no new myelin edge.
 serde_json = { workspace = true }
 serde = { workspace = true }
+blake3 = { workspace = true }
 
 # ------------------------------------------------------------------------------------------
 # REAL live-stack schema apply behind the `integration` feature (CI-P6). The complete CI

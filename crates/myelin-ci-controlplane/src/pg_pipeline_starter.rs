@@ -1,16 +1,18 @@
 //! PostgreSQL-backed starter for queued CI runs.
 //!
 //! A starter is composed for one explicit `(tenant, region)` cell. It never discovers tenants and
-//! never scans a region globally. The selected `ci_run` row, the pre-minted `workflow_run`, and the
-//! `queued -> running` transition are committed on one caller-owned PostgreSQL transaction.
+//! never scans a region globally. The selected `ci_run` row, its canonical `ci_job` DAG ledger, the
+//! pre-minted `workflow_run`, and the `queued -> running` transition are committed on one caller-owned
+//! PostgreSQL transaction.
 //!
 //! This module is deliberately not composed by the service main yet. The v1 plan and current CI
 //! schemas do not durably provide the runner lane/labels, timeout and resource authority, egress and
-//! workspace grants, per-run token, metering reservation, check-attempt/context facts, or restart-safe
-//! stage identity required to execute/report a job. Starting this durable control record is a bounded
-//! prerequisite; registering a production body or enabling runner dispatch remains gated on those
-//! authoritative fields and on replacing the main's no-op runner hooks.
+//! workspace grants, per-run token, metering reservation, or check-attempt/context facts required to
+//! execute/report a job. This starter now freezes restart-safe version-1 stage/DAG identity only;
+//! registering a production body or enabling runner dispatch remains gated on the other authoritative
+//! fields and on replacing the main's no-op runner hooks.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use myelin_events::{HandlerTx, IdMinter};
@@ -21,7 +23,7 @@ use myelin_tenancy::{Region, TenantId};
 use sqlx::{PgPool, Row};
 
 use crate::ci_run_store::CiRunRecord;
-use crate::run_plan::{load_resolved_run_plan, RunPlanError};
+use crate::run_plan::{load_resolved_run_plan, PreparedRunPlan, RunPlanError};
 use crate::surfacing::{ci_artifact_ref, ci_run_ref};
 
 const SELECT_QUEUED_RUN: &str = "\
@@ -44,6 +46,59 @@ SELECT tenant_id, run_id::text AS run_id, region, project_id::text AS project_id
 FROM ci_run
 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND state = 'queued'
 FOR UPDATE";
+
+/// Frozen BLAKE3 derive-key context for the version-1 canonical CI DAG-node identity.
+///
+/// The hash input is four ordered `u64::to_be_bytes()` length-prefixed frames: tenant id, the
+/// RFC-ordered 16 bytes of `ci_run.run_id`, the concrete resolved job name, and
+/// [`crate::ResolvedJobV1::matrix_identity`]. The first 16 digest bytes become an RFC 9562 UUIDv8 by setting
+/// the version and variant bits. Changing any byte of this contract requires a new versioned helper.
+pub const CI_JOB_ID_V1_DOMAIN: &str = "myelin.ci.job-id.v1";
+
+/// Derive the canonical durable `ci_job.job_id` for one resolved version-1 DAG node.
+///
+/// The caller must pass authority read from the locked `ci_run` and validated plan. In particular,
+/// `concrete_name` is the resolved node name (including any matrix suffix), never an authored alias.
+pub fn ci_job_id_v1(
+    tenant: &TenantId,
+    run_id: sqlx::types::Uuid,
+    concrete_name: &str,
+    matrix_identity: &[u8],
+) -> sqlx::types::Uuid {
+    let mut hasher = blake3::Hasher::new_derive_key(CI_JOB_ID_V1_DOMAIN);
+    for frame in [
+        tenant.0.as_bytes(),
+        run_id.as_bytes().as_slice(),
+        concrete_name.as_bytes(),
+        matrix_identity,
+    ] {
+        hasher.update(&(frame.len() as u64).to_be_bytes());
+        hasher.update(frame);
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    // RFC 9562: custom UUID version 8 and the RFC 4122/9562 variant (`10xx`).
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    sqlx::types::Uuid::from_bytes(bytes)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpectedCiJobV1 {
+    tenant_id: String,
+    region: String,
+    job_id: sqlx::types::Uuid,
+    run_id: sqlx::types::Uuid,
+    stage: String,
+    name: String,
+    needs: Vec<sqlx::types::Uuid>,
+    matrix_key: Option<serde_json::Value>,
+    spec_ref: String,
+    state: String,
+    attempt: i32,
+    result_summary: Option<serde_json::Value>,
+}
 
 /// Immutable code identity this starter is allowed to bind. `ci_run` does not yet carry this pin,
 /// so the bounded composition must supply the exact deployed body version and hash explicitly.
@@ -260,14 +315,14 @@ impl PgCiPipelineStarter {
     }
 
     /// Validate one preflight candidate outside a database lock, then re-lock and byte-compare that
-    /// exact row before starting it. `start_with_id_on_conn` receives the exact caller transaction;
-    /// the workflow identity proof and lifecycle update follow before one commit.
+    /// exact row before materializing its canonical DAG and starting it. The exact `ci_job` ledger,
+    /// `start_with_id_on_conn` workflow, identity proof, and lifecycle update share one transaction.
     pub async fn run_once(&self) -> Result<StartQueuedOutcome, PgCiStarterError> {
         let Some(candidate) = self.preflight_candidate().await? else {
             return Ok(StartQueuedOutcome::Idle);
         };
         validate_candidate(&self.tenant, &self.region, &candidate)?;
-        load_resolved_run_plan(self.blobs.as_ref(), &candidate.record)
+        let prepared = load_resolved_run_plan(self.blobs.as_ref(), &candidate.record)
             .map_err(PgCiStarterError::Plan)?;
         let workflow_input = workflow_input(&candidate.record)?;
 
@@ -299,6 +354,7 @@ impl PgCiPipelineStarter {
         }
         validate_candidate(&self.tenant, &self.region, &locked)?;
         let record = locked.record;
+        materialize_ci_jobs_v1(&mut transaction, &record, &prepared).await?;
         let replay = lock_existing_exact_workflow(&mut transaction, &record).await?;
         validate_definition_pin(&mut transaction, &self.definition, replay).await?;
         let started = {
@@ -509,6 +565,215 @@ fn workflow_input(record: &CiRunRecord) -> Result<Vec<ArtifactRef>, PgCiStarterE
     Ok(input)
 }
 
+fn expected_ci_jobs_v1(
+    record: &CiRunRecord,
+    prepared: &PreparedRunPlan,
+) -> Result<Vec<ExpectedCiJobV1>, PgCiStarterError> {
+    expected_ci_jobs_v1_with(record, prepared, ci_job_id_v1)
+}
+
+fn expected_ci_jobs_v1_with<F>(
+    record: &CiRunRecord,
+    prepared: &PreparedRunPlan,
+    mut derive_id: F,
+) -> Result<Vec<ExpectedCiJobV1>, PgCiStarterError>
+where
+    F: FnMut(&TenantId, sqlx::types::Uuid, &str, &[u8]) -> sqlx::types::Uuid,
+{
+    let tenant = TenantId(record.tenant_id.clone());
+    let expected_snapshot = format!(
+        "myelin://{}/ci/snapshot/{}",
+        tenant.0,
+        prepared.content_hash().to_multihash_string()
+    );
+    if prepared.tenant() != &tenant || record.definition_snapshot != expected_snapshot {
+        return Err(PgCiStarterError::CorruptRun(
+            "prepared plan provenance diverges from the locked ci_run".into(),
+        ));
+    }
+    let run_id = sqlx::types::Uuid::parse_str(&record.run_id).map_err(|error| {
+        PgCiStarterError::CorruptRun(format!("locked ci_run.run_id is not a UUID: {error}"))
+    })?;
+
+    // Pass one freezes every node id before any dependency is translated. The BTreeMap preserves
+    // the plan's canonical name language; the set catches a digest truncation collision loudly.
+    let mut ids_by_name = BTreeMap::new();
+    let mut unique_ids = BTreeSet::new();
+    for job in &prepared.plan().jobs {
+        let job_id = derive_id(&tenant, run_id, &job.name, &job.matrix_identity());
+        if !unique_ids.insert(job_id) {
+            return Err(PgCiStarterError::CorruptRun(format!(
+                "deterministic version-1 ci_job id collision at resolved node `{}`",
+                job.name
+            )));
+        }
+        if ids_by_name.insert(job.name.clone(), job_id).is_some() {
+            return Err(PgCiStarterError::CorruptRun(format!(
+                "validated plan repeated resolved node `{}`",
+                job.name
+            )));
+        }
+    }
+
+    let mut expected = Vec::with_capacity(prepared.plan().jobs.len());
+    for job in &prepared.plan().jobs {
+        // V1 COMPATIBILITY CONTRACT: `stage` is the concrete resolved node name because the v1 wire
+        // does not preserve a separate authored-stage identity. A future distinction requires v2.
+        let stage = job.name.clone();
+        // Needs are validated as strictly name-sorted by the run-plan loader. Translate in that exact
+        // canonical order; UUID byte order is deliberately not a second ordering authority.
+        let needs = job
+            .needs
+            .iter()
+            .map(|need| {
+                ids_by_name.get(need).copied().ok_or_else(|| {
+                    PgCiStarterError::CorruptRun(format!(
+                        "validated node `{}` needs unmapped node `{need}`",
+                        job.name
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let matrix_key = if job.matrix_key.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_value(&job.matrix_key).map_err(|error| {
+                PgCiStarterError::CorruptRun(format!(
+                    "encode matrix identity for `{}`: {error}",
+                    job.name
+                ))
+            })?)
+        };
+        expected.push(ExpectedCiJobV1 {
+            tenant_id: record.tenant_id.clone(),
+            region: record.region.clone(),
+            job_id: ids_by_name[&job.name],
+            run_id,
+            stage,
+            name: job.name.clone(),
+            needs,
+            matrix_key,
+            // V1 COMPATIBILITY CONTRACT: this is the whole locked resolved-plan CAS object that
+            // contains the job, not a per-job executable JobSpec. Runtime JobSpec authority remains
+            // deliberately disabled and belongs to the later `ci_job_spec` dispatch boundary.
+            spec_ref: record.definition_snapshot.clone(),
+            state: "queued".into(),
+            attempt: 1,
+            result_summary: None,
+        });
+    }
+    Ok(expected)
+}
+
+async fn materialize_ci_jobs_v1(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    record: &CiRunRecord,
+    prepared: &PreparedRunPlan,
+) -> Result<(), PgCiStarterError> {
+    let expected = expected_ci_jobs_v1(record, prepared)?;
+    for job in &expected {
+        sqlx::query(
+            "INSERT INTO ci_job (tenant_id, region, job_id, run_id, stage, name, needs, \
+                                matrix_key, spec_ref, state, attempt, result_summary) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', 1, NULL) \
+             ON CONFLICT (tenant_id, job_id) DO NOTHING",
+        )
+        .bind(&job.tenant_id)
+        .bind(&job.region)
+        .bind(job.job_id)
+        .bind(job.run_id)
+        .bind(&job.stage)
+        .bind(&job.name)
+        .bind(&job.needs)
+        .bind(&job.matrix_key)
+        .bind(&job.spec_ref)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| PgCiStarterError::Database(format!("materialize ci_job: {error}")))?;
+    }
+
+    let expected_ids = expected.iter().map(|job| job.job_id).collect::<Vec<_>>();
+    let run_id = expected.first().map(|job| job.run_id).ok_or_else(|| {
+        PgCiStarterError::CorruptRun("validated run plan materialized no ci_job rows".into())
+    })?;
+    let rows = sqlx::query(
+        "SELECT tenant_id, region, job_id, run_id, stage, name, needs, matrix_key, spec_ref, \
+                state, attempt, result_summary \
+         FROM ci_job \
+         WHERE tenant_id = $1 AND (run_id = $2 OR job_id = ANY($3::uuid[])) \
+         FOR UPDATE",
+    )
+    .bind(&record.tenant_id)
+    .bind(run_id)
+    .bind(&expected_ids)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|error| PgCiStarterError::Database(format!("lock exact ci_job ledger: {error}")))?;
+
+    let mut actual_by_id = BTreeMap::new();
+    for row in rows {
+        let actual = decode_ci_job(&row)?;
+        let id = actual.job_id;
+        if actual_by_id.insert(id, actual).is_some() {
+            return Err(PgCiStarterError::CorruptRun(format!(
+                "durable ci_job ledger repeated job id `{id}`"
+            )));
+        }
+    }
+    if actual_by_id.len() != expected.len() {
+        return Err(PgCiStarterError::CorruptRun(format!(
+            "durable ci_job ledger has {} rows but resolved plan requires {}",
+            actual_by_id.len(),
+            expected.len()
+        )));
+    }
+    for job in expected {
+        match actual_by_id.get(&job.job_id) {
+            Some(actual) if actual == &job => {}
+            Some(_) => {
+                return Err(PgCiStarterError::CorruptRun(format!(
+                    "durable ci_job `{}` diverges from locked version-1 run-plan authority",
+                    job.job_id
+                )))
+            }
+            None => {
+                return Err(PgCiStarterError::CorruptRun(format!(
+                    "durable ci_job `{}` is missing after materialization",
+                    job.job_id
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_ci_job(row: &sqlx::postgres::PgRow) -> Result<ExpectedCiJobV1, PgCiStarterError> {
+    macro_rules! field {
+        ($name:literal) => {
+            row.try_get($name).map_err(|error| {
+                PgCiStarterError::CorruptRun(format!(
+                    "cannot decode authoritative ci_job `{}` column: {error}",
+                    $name
+                ))
+            })?
+        };
+    }
+    Ok(ExpectedCiJobV1 {
+        tenant_id: field!("tenant_id"),
+        region: field!("region"),
+        job_id: field!("job_id"),
+        run_id: field!("run_id"),
+        stage: field!("stage"),
+        name: field!("name"),
+        needs: field!("needs"),
+        matrix_key: field!("matrix_key"),
+        spec_ref: field!("spec_ref"),
+        state: field!("state"),
+        attempt: field!("attempt"),
+        result_summary: field!("result_summary"),
+    })
+}
+
 async fn lock_existing_exact_workflow(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     record: &CiRunRecord,
@@ -679,6 +944,10 @@ async fn verify_started_workflow(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ResolvedJobV1;
+
+    const PINNED_IMAGE: &str =
+        "registry.example/build@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn tenant() -> TenantId {
         TenantId("acme".into())
@@ -689,6 +958,57 @@ mod tests {
             ci_artifact_ref("acme", &format!("snapshot-blake3:{}", "a".repeat(64))),
             ci_run_ref("acme", "10000000-0000-0000-0000-000000000001"),
         ]
+    }
+
+    fn prepared_plan(
+        tenant_id: &str,
+        run_id: &str,
+        jobs: Vec<ResolvedJobV1>,
+    ) -> (CiRunRecord, PreparedRunPlan) {
+        let tenant = TenantId(tenant_id.into());
+        let plan = crate::ResolvedRunPlanV1 {
+            schema_version: 1,
+            jobs,
+        };
+        let bytes = plan.canonical_bytes().expect("canonical test plan");
+        let blobs = myelin_storage::FsBlobStore::new();
+        let hash = blobs.put(&tenant, &bytes).expect("store test plan");
+        let record = CiRunRecord {
+            tenant_id: tenant_id.into(),
+            run_id: run_id.into(),
+            region: "fr-par".into(),
+            project_id: "22222222-2222-2222-2222-222222222222".into(),
+            pipeline_id: "33333333-3333-3333-3333-333333333333".into(),
+            wf_run_id: "20000000-0000-0000-0000-000000000001".into(),
+            repo_ref: Some("repo-1".into()),
+            commit_oid: Some("deadbeef".into()),
+            cause_event_id: None,
+            definition_snapshot: format!(
+                "myelin://{tenant_id}/ci/snapshot/{}",
+                hash.to_multihash_string()
+            ),
+            trigger_kind: "push".into(),
+            trust_tier: "trusted".into(),
+            state: "queued".into(),
+            correlation_id: run_id.into(),
+        };
+        let prepared = load_resolved_run_plan(&blobs, &record).expect("load prepared test plan");
+        (record, prepared)
+    }
+
+    fn resolved_job(
+        name: &str,
+        needs: Vec<&str>,
+        matrix_key: BTreeMap<String, String>,
+    ) -> ResolvedJobV1 {
+        ResolvedJobV1 {
+            name: name.into(),
+            image: PINNED_IMAGE.into(),
+            command: vec!["/bin/build".into()],
+            needs: needs.into_iter().map(str::to_string).collect(),
+            is_generator: false,
+            matrix_key,
+        }
     }
 
     #[test]
@@ -741,5 +1061,108 @@ mod tests {
         for input in cases {
             assert!(decode_ci_claimed_input(&tenant(), &input).is_err());
         }
+    }
+
+    #[test]
+    fn job_id_v1_known_answers_pin_domain_framing_version_and_variant() {
+        let tenant = TenantId("acme".into());
+        let run_id = sqlx::types::Uuid::parse_str("10000000-0000-0000-0000-000000000001")
+            .expect("test UUID");
+        let empty_matrix = ResolvedJobV1 {
+            name: "build".into(),
+            image: PINNED_IMAGE.into(),
+            command: vec!["/bin/build".into()],
+            needs: vec![],
+            is_generator: false,
+            matrix_key: BTreeMap::new(),
+        };
+        let mut axes = BTreeMap::new();
+        axes.insert("arch".into(), "x86_64".into());
+        axes.insert("os".into(), "linux".into());
+        let matrix = resolved_job("test-linux-x86_64", vec!["build"], axes);
+
+        let first = ci_job_id_v1(
+            &tenant,
+            run_id,
+            &empty_matrix.name,
+            &empty_matrix.matrix_identity(),
+        );
+        let second = ci_job_id_v1(&tenant, run_id, &matrix.name, &matrix.matrix_identity());
+        assert_eq!(first.to_string(), "114cfd80-99c2-8e5b-a51d-008f7176782a");
+        assert_eq!(second.to_string(), "f7b98ab0-9967-8d37-95a9-3ef7f3cc95e3");
+        for id in [first, second] {
+            assert_eq!(id.as_bytes()[6] >> 4, 8, "RFC 9562 UUID version 8");
+            assert_eq!(id.as_bytes()[8] >> 6, 2, "RFC variant bits are 10");
+        }
+    }
+
+    #[test]
+    fn job_id_v1_length_frames_and_every_authoritative_field_are_load_bearing() {
+        let run = sqlx::types::Uuid::parse_str("10000000-0000-0000-0000-000000000001").unwrap();
+        let other_run =
+            sqlx::types::Uuid::parse_str("10000000-0000-0000-0000-000000000002").unwrap();
+        let matrix_a = resolved_job("build", vec![], BTreeMap::from([("ab".into(), "c".into())]));
+        let matrix_b = resolved_job("build", vec![], BTreeMap::from([("a".into(), "bc".into())]));
+        let base = ci_job_id_v1(
+            &TenantId("ab".into()),
+            run,
+            "c",
+            &matrix_a.matrix_identity(),
+        );
+        let variants = [
+            ci_job_id_v1(
+                &TenantId("a".into()),
+                run,
+                "bc",
+                &matrix_a.matrix_identity(),
+            ),
+            ci_job_id_v1(
+                &TenantId("ab".into()),
+                other_run,
+                "c",
+                &matrix_a.matrix_identity(),
+            ),
+            ci_job_id_v1(
+                &TenantId("ab".into()),
+                run,
+                "different",
+                &matrix_a.matrix_identity(),
+            ),
+            ci_job_id_v1(
+                &TenantId("ab".into()),
+                run,
+                "c",
+                &matrix_b.matrix_identity(),
+            ),
+        ];
+        assert!(variants.into_iter().all(|candidate| candidate != base));
+    }
+
+    #[test]
+    fn v1_materialization_freezes_stage_snapshot_needs_and_refuses_id_collision() {
+        let mut matrix = BTreeMap::new();
+        matrix.insert("os".into(), "linux".into());
+        let (record, prepared) = prepared_plan(
+            "acme",
+            "10000000-0000-0000-0000-000000000001",
+            vec![
+                resolved_job("build", vec![], BTreeMap::new()),
+                resolved_job("test-linux", vec!["build"], matrix),
+            ],
+        );
+        let jobs = expected_ci_jobs_v1(&record, &prepared).expect("materialized identities");
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|job| job.stage == job.name));
+        assert!(jobs
+            .iter()
+            .all(|job| job.spec_ref == record.definition_snapshot));
+        assert_eq!(jobs[1].needs, vec![jobs[0].job_id]);
+        assert_eq!(jobs[0].matrix_key, None);
+        assert_eq!(jobs[1].matrix_key, Some(serde_json::json!({"os": "linux"})));
+
+        let error =
+            expected_ci_jobs_v1_with(&record, &prepared, |_, _, _, _| sqlx::types::Uuid::nil())
+                .expect_err("two nodes may not collapse to one truncated digest");
+        assert!(error.to_string().contains("id collision"));
     }
 }

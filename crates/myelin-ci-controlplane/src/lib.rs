@@ -145,12 +145,13 @@ pub use run_plan::{
     load_resolved_run_plan, PreparedRunPlan, RedispatchReason, ResolvedJobV1, ResolvedRunPlanV1,
     RunPlanError,
 };
-/// Exact `(tenant, region)` PostgreSQL starter that co-commits the pre-minted workflow start with
-/// the durable CI run's `queued -> running` transition.
+/// Exact `(tenant, region)` PostgreSQL starter that co-commits the canonical `ci_job` DAG ledger and
+/// pre-minted workflow start with the durable CI run's `queued -> running` transition.
 pub mod pg_pipeline_starter;
 pub use pg_pipeline_starter::{
-    decode_ci_claimed_input, CiWorkflowDefinitionPin, ClaimedCiInput, ClaimedCiInputError,
-    PgCiPipelineStarter, PgCiStarterError, StartQueuedOutcome,
+    ci_job_id_v1, decode_ci_claimed_input, CiWorkflowDefinitionPin, ClaimedCiInput,
+    ClaimedCiInputError, PgCiPipelineStarter, PgCiStarterError, StartQueuedOutcome,
+    CI_JOB_ID_V1_DOMAIN,
 };
 /// CT-004d.2 CULMINATION (chunks 2/3/5): the CI pipeline DRIVER — a pushed CI trigger runs a REAL
 /// pipeline end-to-end. [`ci_pipeline_driver::DurableJobRunner`] (chunk 5) dispatches each stage into

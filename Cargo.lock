@@ -2368,6 +2368,7 @@ name = "myelin-ci-controlplane"
 version = "0.0.0"
 dependencies = [
  "aws-sdk-s3",
+ "blake3",
  "myelin-agent",
  "myelin-ci-controlplane",
  "myelin-ci-sandbox",

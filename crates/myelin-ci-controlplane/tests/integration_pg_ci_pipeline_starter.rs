@@ -7,8 +7,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use myelin_ci_controlplane::{
-    ci_artifact_ref, ci_run_ref, CiWorkflowDefinitionPin, PgCiPipelineStarter, ResolvedJobV1,
-    ResolvedRunPlanV1, StartQueuedOutcome, CREATE_CI_RUN_DDL,
+    ci_artifact_ref, ci_job_id_v1, ci_run_ref, CiWorkflowDefinitionPin, PgCiPipelineStarter,
+    ResolvedJobV1, ResolvedRunPlanV1, StartQueuedOutcome, CREATE_CI_JOB_DDL, CREATE_CI_RUN_DDL,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::MonotonicMinter;
@@ -91,16 +91,36 @@ async fn pool_on(url: &str, schema: &str) -> PgPool {
 }
 
 fn plan() -> ResolvedRunPlanV1 {
+    let mut matrix = BTreeMap::new();
+    matrix.insert("os".into(), "linux".into());
     ResolvedRunPlanV1 {
         schema_version: 1,
-        jobs: vec![ResolvedJobV1 {
-            name: "build".into(),
-            image: format!("registry.example/build@sha256:{}", "a".repeat(64)),
-            command: vec!["/bin/build".into(), "--locked".into()],
-            needs: Vec::new(),
-            is_generator: false,
-            matrix_key: BTreeMap::new(),
-        }],
+        jobs: vec![
+            ResolvedJobV1 {
+                name: "build".into(),
+                image: format!("registry.example/build@sha256:{}", "a".repeat(64)),
+                command: vec!["/bin/build".into(), "--locked".into()],
+                needs: Vec::new(),
+                is_generator: false,
+                matrix_key: BTreeMap::new(),
+            },
+            ResolvedJobV1 {
+                name: "package".into(),
+                image: format!("registry.example/package@sha256:{}", "b".repeat(64)),
+                command: vec!["/bin/package".into()],
+                needs: vec!["build".into(), "test-linux".into()],
+                is_generator: false,
+                matrix_key: BTreeMap::new(),
+            },
+            ResolvedJobV1 {
+                name: "test-linux".into(),
+                image: format!("registry.example/test@sha256:{}", "c".repeat(64)),
+                command: vec!["/bin/test".into()],
+                needs: vec!["build".into()],
+                is_generator: false,
+                matrix_key: matrix,
+            },
+        ],
     }
 }
 
@@ -179,9 +199,10 @@ async fn assert_atomic_started(
     running: bool,
     workflow_exists: bool,
 ) {
-    let pair: (bool, bool) = sqlx::query_as(
+    let pair: (bool, bool, i64) = sqlx::query_as(
         "SELECT state = 'running', EXISTS (SELECT 1 FROM workflow_run w \
-         WHERE w.tenant_id = c.tenant_id AND w.region = c.region AND w.run_id = c.wf_run_id::text) \
+         WHERE w.tenant_id = c.tenant_id AND w.region = c.region AND w.run_id = c.wf_run_id::text), \
+         (SELECT count(*) FROM ci_job j WHERE j.tenant_id = c.tenant_id AND j.run_id = c.run_id) \
          FROM ci_run c WHERE tenant_id = $1 AND run_id = $2::uuid",
     )
     .bind(tenant)
@@ -189,7 +210,93 @@ async fn assert_atomic_started(
     .fetch_one(admin)
     .await
     .expect("read atomic run pair");
-    assert_eq!(pair, (running, workflow_exists));
+    assert_eq!(
+        pair,
+        (running, workflow_exists, if running { 3 } else { 0 })
+    );
+}
+
+async fn assert_exact_jobs(admin: &PgPool, tenant: &str, run_id: &str) {
+    let snapshot: String = sqlx::query_scalar(
+        "SELECT definition_snapshot FROM ci_run WHERE tenant_id=$1 AND run_id=$2::uuid",
+    )
+    .bind(tenant)
+    .bind(run_id)
+    .fetch_one(admin)
+    .await
+    .unwrap();
+    let run_uuid = sqlx::types::Uuid::parse_str(run_id).unwrap();
+    let expected_plan = plan();
+    let ids = expected_plan
+        .jobs
+        .iter()
+        .map(|job| {
+            (
+                job.name.clone(),
+                ci_job_id_v1(
+                    &TenantId(tenant.into()),
+                    run_uuid,
+                    &job.name,
+                    &job.matrix_identity(),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let rows: Vec<(
+        sqlx::types::Uuid,
+        String,
+        String,
+        Vec<sqlx::types::Uuid>,
+        Option<serde_json::Value>,
+        String,
+        String,
+        i32,
+        Option<serde_json::Value>,
+    )> = sqlx::query_as(
+        "SELECT job_id, stage, name, needs, matrix_key, spec_ref, state, attempt, result_summary \
+         FROM ci_job WHERE tenant_id=$1 AND run_id=$2::uuid ORDER BY name",
+    )
+    .bind(tenant)
+    .bind(run_id)
+    .fetch_all(admin)
+    .await
+    .expect("read canonical ci_job ledger");
+    assert_eq!(rows.len(), expected_plan.jobs.len());
+    for (row, job) in rows.iter().zip(&expected_plan.jobs) {
+        assert_eq!(row.0, ids[&job.name]);
+        assert_eq!(row.1, job.name, "v1 stage == concrete resolved name");
+        assert_eq!(row.2, job.name);
+        assert_eq!(
+            row.3,
+            job.needs.iter().map(|name| ids[name]).collect::<Vec<_>>()
+        );
+        let expected_matrix =
+            (!job.matrix_key.is_empty()).then(|| serde_json::to_value(&job.matrix_key).unwrap());
+        assert_eq!(row.4, expected_matrix);
+        assert_eq!(row.5, snapshot, "v1 spec_ref is the whole plan CAS ref");
+        assert_eq!(row.6, "queued");
+        assert_eq!(row.7, 1);
+        assert_eq!(row.8, None);
+    }
+}
+
+async fn visible_job_count(app: &PgPool, tenant: &str, region: &str) -> i64 {
+    let mut transaction = app.begin().await.expect("begin RLS probe");
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), \
+                set_config('myelin.region', $2, true)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .execute(&mut *transaction)
+    .await
+    .expect("scope RLS probe");
+    let count = sqlx::query_scalar("SELECT count(*) FROM ci_job")
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("count visible ci_job rows");
+    transaction.rollback().await.expect("rollback RLS probe");
+    count
 }
 
 async fn expected_input(admin: &PgPool, tenant: &str, run_id: &str) -> Vec<ArtifactRef> {
@@ -260,10 +367,15 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .await
     .expect("flow migrations");
     admin.execute(CREATE_CI_RUN_DDL).await.expect("ci_run DDL");
+    admin.execute(CREATE_CI_JOB_DDL).await.expect("ci_job DDL");
     admin
         .execute("SELECT myelin_make_tenant_scoped('ci_run')")
         .await
         .expect("force RLS on ci_run");
+    admin
+        .execute("SELECT myelin_make_tenant_scoped('ci_job')")
+        .await
+        .expect("force RLS on ci_job");
     admin
         .execute(format!("GRANT USAGE ON SCHEMA {schema} TO myelin_app").as_str())
         .await
@@ -306,6 +418,168 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         1
     );
     assert_atomic_started(&admin, "tenant_a", run1, true, true).await;
+    assert_exact_jobs(&admin, "tenant_a", run1).await;
+    assert_eq!(visible_job_count(&app, "tenant_a", "fr-par").await, 3);
+    assert_eq!(visible_job_count(&app, "tenant_empty", "fr-par").await, 0);
+    assert_eq!(visible_job_count(&app, "tenant_a", "de-fra").await, 0);
+
+    // Exact legacy replay is a byte-for-byte no-op on the complete DAG ledger. Re-open only the
+    // lifecycle split that this starter repairs; the existing workflow and all three jobs remain.
+    sqlx::query("UPDATE ci_run SET state='queued' WHERE tenant_id='tenant_a' AND run_id=$1::uuid")
+        .bind(run1)
+        .execute(&admin)
+        .await
+        .unwrap();
+    assert!(matches!(
+        starter(&app, "tenant_a", blobs.clone())
+            .run_once()
+            .await
+            .expect("exact ci_job replay"),
+        StartQueuedOutcome::Started { .. }
+    ));
+    assert_atomic_started(&admin, "tenant_a", run1, true, true).await;
+    assert_exact_jobs(&admin, "tenant_a", run1).await;
+
+    // A divergent immutable field and a non-pristine lifecycle field are each refused before the
+    // queued split can commit. Restore the adversarial edit between probes, never through starter.
+    for (mutation, restore) in [
+        (
+            "UPDATE ci_job SET spec_ref='myelin://tenant_a/ci/snapshot/blake3:forged' \
+             WHERE tenant_id='tenant_a' AND run_id=$1::uuid AND name='package'",
+            "UPDATE ci_job SET spec_ref=(SELECT definition_snapshot FROM ci_run \
+             WHERE tenant_id='tenant_a' AND run_id=$1::uuid) \
+             WHERE tenant_id='tenant_a' AND run_id=$1::uuid AND name='package'",
+        ),
+        (
+            "UPDATE ci_job SET state='running' \
+             WHERE tenant_id='tenant_a' AND run_id=$1::uuid AND name='package'",
+            "UPDATE ci_job SET state='queued' \
+             WHERE tenant_id='tenant_a' AND run_id=$1::uuid AND name='package'",
+        ),
+    ] {
+        sqlx::query(
+            "UPDATE ci_run SET state='queued' WHERE tenant_id='tenant_a' AND run_id=$1::uuid",
+        )
+        .bind(run1)
+        .execute(&admin)
+        .await
+        .unwrap();
+        sqlx::query(mutation)
+            .bind(run1)
+            .execute(&admin)
+            .await
+            .unwrap();
+        let error = starter(&app, "tenant_a", blobs.clone())
+            .run_once()
+            .await
+            .expect_err("divergent ci_job ledger must fail closed");
+        assert!(error.to_string().contains("ci_job"));
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM ci_run WHERE tenant_id='tenant_a' AND run_id=$1::uuid",
+        )
+        .bind(run1)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert_eq!(state, "queued");
+        sqlx::query(restore)
+            .bind(run1)
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+
+    // The run-id half of the exact SELECT catches an unexpected extra ledger row even though its
+    // job id is not one of the derived ids.
+    let extra_id = "80000000-0000-8000-8000-000000000001";
+    sqlx::query(
+        "INSERT INTO ci_job (tenant_id, region, job_id, run_id, stage, name, needs, matrix_key, \
+         spec_ref, state, attempt, result_summary) \
+         SELECT tenant_id, region, $2::uuid, run_id, 'extra', 'extra', '{}', NULL, \
+                definition_snapshot, 'queued', 1, NULL \
+         FROM ci_run WHERE tenant_id='tenant_a' AND run_id=$1::uuid",
+    )
+    .bind(run1)
+    .bind(extra_id)
+    .execute(&admin)
+    .await
+    .unwrap();
+    assert!(starter(&app, "tenant_a", blobs.clone())
+        .run_once()
+        .await
+        .expect_err("extra run ledger row must fail closed")
+        .to_string()
+        .contains("has 4 rows"));
+    sqlx::query("DELETE FROM ci_job WHERE tenant_id='tenant_a' AND job_id=$1::uuid")
+        .bind(extra_id)
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ci_run SET state='running' WHERE tenant_id='tenant_a' AND run_id=$1::uuid")
+        .bind(run1)
+        .execute(&admin)
+        .await
+        .unwrap();
+    assert_exact_jobs(&admin, "tenant_a", run1).await;
+
+    // The expected-id half catches a truncated-id collision owned by another run. The two otherwise
+    // fresh victim jobs inserted before verification roll back with the failed start.
+    let collision_run = "18000000-0000-0000-0000-000000000001";
+    let collision_wf = "28000000-0000-0000-0000-000000000001";
+    let owner_run = "18000000-0000-0000-0000-000000000002";
+    let owner_wf = "28000000-0000-0000-0000-000000000002";
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        "tenant_job_collision",
+        collision_run,
+        collision_wf,
+    )
+    .await;
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        "tenant_job_collision",
+        owner_run,
+        owner_wf,
+    )
+    .await;
+    let build = &plan().jobs[0];
+    let colliding_id = ci_job_id_v1(
+        &TenantId("tenant_job_collision".into()),
+        sqlx::types::Uuid::parse_str(collision_run).unwrap(),
+        &build.name,
+        &build.matrix_identity(),
+    );
+    sqlx::query(
+        "INSERT INTO ci_job (tenant_id, region, job_id, run_id, stage, name, needs, matrix_key, \
+         spec_ref, state, attempt, result_summary) \
+         SELECT tenant_id, region, $2, run_id, 'foreign', 'foreign', '{}', NULL, \
+                definition_snapshot, 'queued', 1, NULL \
+         FROM ci_run WHERE tenant_id='tenant_job_collision' AND run_id=$1::uuid",
+    )
+    .bind(owner_run)
+    .bind(colliding_id)
+    .execute(&admin)
+    .await
+    .unwrap();
+    let error = starter(&app, "tenant_job_collision", blobs.clone())
+        .run_once()
+        .await
+        .expect_err("cross-run deterministic id owner must fail closed");
+    assert!(error.to_string().contains("diverges"));
+    assert_atomic_started(&admin, "tenant_job_collision", collision_run, false, false).await;
+    let owner_jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ci_job WHERE tenant_id='tenant_job_collision' AND run_id=$1::uuid",
+    )
+    .bind(owner_run)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        owner_jobs, 1,
+        "foreign owner survives the rolled-back victim start"
+    );
 
     // A new process can recover a legacy split where the workflow exists but ci_run remains queued:
     // the idempotency winner is the pre-minted id and the restart only advances the durable row.
@@ -333,6 +607,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         StartQueuedOutcome::Started { ref wf_run_id, .. } if wf_run_id == wf2
     ));
     assert_atomic_started(&admin, "tenant_a", run2, true, true).await;
+    assert_exact_jobs(&admin, "tenant_a", run2).await;
 
     // A failure after workflow insertion (the trigger rejects the lifecycle CAS) rolls the workflow
     // back too. No queued->running row can exist without its workflow.
