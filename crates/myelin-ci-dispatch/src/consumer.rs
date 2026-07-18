@@ -179,6 +179,15 @@ pub trait GitConfigReader: Send + Sync {
         oid: &str,
         path: &str,
     ) -> Result<Option<Vec<u8>>, GitReadError>;
+    fn read_repo_file_bounded(
+        &self, tenant: &str, region: &str, repo: &str, oid: &str, path: &str, maximum_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, GitReadError> {
+        let bytes = self.read_repo_file(tenant, region, repo, oid, path)?;
+        if bytes.as_ref().is_some_and(|bytes| bytes.len() > maximum_bytes) {
+            return Err(GitReadError(format!("{path}@{oid} exceeds the {maximum_bytes}-byte config limit")));
+        }
+        Ok(bytes)
+    }
 }
 
 /// The `.myelin/ci.*` paths tried, in priority order: TOML (the primary authored surface, arch 02
@@ -201,7 +210,7 @@ pub fn resolve_ci_config(
     oid: &str,
 ) -> Result<Option<(Vec<u8>, ConfigFormat)>, GitReadError> {
     for (path, format) in CI_CONFIG_CANDIDATES {
-        if let Some(bytes) = reader.read_repo_file(tenant, region, repo, oid, path)? {
+        if let Some(bytes) = reader.read_repo_file_bounded(tenant, region, repo, oid, path, crate::config::MAX_CI_CONFIG_BYTES)? {
             return Ok(Some((bytes, *format)));
         }
     }
@@ -234,6 +243,8 @@ pub struct ReserveFacts {
     pub wf_run_id: String,
     /// The correlation id (`ci_run.correlation_id`) — the triggering envelope's correlation.
     pub correlation_id: String,
+    pub repo_ref: String,
+    pub commit_oid: String,
 }
 
 /// A fully-armed run ready to persist: the atomic [`StartHandoff`] bundle + the extra `ci_run` facts
@@ -384,10 +395,9 @@ fn emit_reserve_events(
 
 /// **Map an [`ArmedRun`] to the durable [`CiRunInsert`] the [`CiRunStore`] writes.** The mapping lives
 /// HERE (ci-controlplane cannot name `ArmedRun` — that edge would be a cycle). Every NOT-NULL `ci_run`
-/// column is set from the atomic bundle; `state = "queued"` (the reserve state). `repo_ref` /
-/// `commit_oid` / `triggered_by` are `None` (NULL) — the `ArmedRun` does not carry them in this chunk
-/// (the SAME shape the CT-004b co-commit proof wrote); populating them is the named repo→pipeline
-/// registry follow-on. `cause_event_id` IS carried (the triggering `event_id` provenance).
+/// column is set from the atomic bundle; `state = "queued"` (the reserve state). Repository,
+/// commit, and triggering pseudonym provenance come from the authoritative trigger envelope, never
+/// authored config. `cause_event_id` carries the triggering event identity.
 pub fn ci_run_insert_from_armed(armed: &ArmedRun) -> myelin_ci_controlplane::CiRunInsert {
     let rw = &armed.handoff.run_write;
     myelin_ci_controlplane::CiRunInsert {
@@ -403,9 +413,9 @@ pub fn ci_run_insert_from_armed(armed: &ArmedRun) -> myelin_ci_controlplane::CiR
         state: rw.state.clone(),
         correlation_id: armed.reserve.correlation_id.clone(),
         cause_event_id: Some(rw.cause_event_id.clone()),
-        repo_ref: None,
-        commit_oid: None,
-        triggered_by: None,
+        repo_ref: Some(armed.reserve.repo_ref.clone()),
+        commit_oid: Some(armed.reserve.commit_oid.clone()),
+        triggered_by: Some(armed.actor.0.principal_id.0.clone()),
     }
 }
 
@@ -742,6 +752,8 @@ pub fn plan_dispatch(
         pipeline_id: deterministic_uuid(&format!("pipeline:{}", facts.repo)),
         wf_run_id,
         correlation_id: ev.correlation_id.0.clone(),
+        repo_ref: facts.repo,
+        commit_oid: facts.new_oid,
     };
     let emit_ctx = EmitContextBase {
         tenant: tenant.clone(),
@@ -1045,6 +1057,7 @@ mod tests {
             "[[jobs]]\n",
             "name = \"build\"\n",
             "image = \"registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000\"\n",
+            "command = [\"build\"]\n",
         )
         .as_bytes()
     }
@@ -1117,6 +1130,15 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn an_oversized_config_is_refused_before_parsing() {
+        let ev = push_envelope("web", "deadbeef");
+        let reader = MapGitConfigReader::new().with_file(
+            "web", "deadbeef", ".myelin/ci.toml", vec![b' '; crate::config::MAX_CI_CONFIG_BYTES + 1],
+        );
+        assert!(matches!(arm(&ev, &reader), DispatchOutcome::Skip(SkipReason::ReadFailed(_))));
+    }
+
     /// **A non-matching trigger (a `pull_request` config on a push) → TriggerNotMatched skip.**
     #[test]
     fn a_non_matching_trigger_skips() {
@@ -1124,7 +1146,8 @@ mod tests {
         let pr_config = concat!(
             "on = \"pull_request\"\n\n",
             "[[jobs]]\nname = \"build\"\n",
-            "image = \"registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000\"\n"
+            "image = \"registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000\"\n",
+            "command = [\"build\"]\n"
         );
         let reader =
             MapGitConfigReader::new().with_file("web", "deadbeef", ".myelin/ci.toml", pr_config.as_bytes());
@@ -1138,7 +1161,7 @@ mod tests {
     #[test]
     fn a_floating_tag_is_a_surfaced_resolve_skip() {
         let ev = push_envelope("web", "deadbeef");
-        let floating = concat!("on = \"push\"\n\n[[jobs]]\nname = \"build\"\nimage = \"alpine:3\"\n");
+        let floating = "on = \"push\"\n\n[[jobs]]\nname = \"build\"\nimage = \"alpine:3\"\ncommand = [\"build\"]\n";
         let reader =
             MapGitConfigReader::new().with_file("web", "deadbeef", ".myelin/ci.toml", floating.as_bytes());
         assert!(matches!(
@@ -1181,6 +1204,10 @@ mod tests {
         assert_eq!(armed.handoff.run_write.run_id, deterministic_uuid("run:ev-push-1"));
         assert_eq!(armed.reserve.wf_run_id, deterministic_uuid("wf:ev-push-1"));
         assert_eq!(armed.reserve.correlation_id, "corr-1");
+        assert_eq!(armed.reserve.repo_ref, "web");
+        assert_eq!(armed.reserve.commit_oid, "deadbeef");
+        let insert = ci_run_insert_from_armed(&armed);
+        assert_eq!(insert.triggered_by.as_deref(), Some("pusher"));
         assert_eq!(armed.tenant, TenantId("acme".into()));
     }
 
@@ -1194,7 +1221,8 @@ mod tests {
         });
         let pr_config = concat!(
             "on = \"pull_request\"\n\n[[jobs]]\nname = \"build\"\n",
-            "image = \"registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000\"\n"
+            "image = \"registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000\"\n",
+            "command = [\"build\"]\n"
         );
         let reader =
             MapGitConfigReader::new().with_file("web", "deadbeef", ".myelin/ci.toml", pr_config.as_bytes());
@@ -1309,6 +1337,12 @@ impl<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> GitConfigReader
         oid: &str,
         path: &str,
     ) -> Result<Option<Vec<u8>>, GitReadError> {
+        self.read_repo_file_bounded(tenant, region, repo, oid, path, usize::MAX)
+    }
+
+    fn read_repo_file_bounded(
+        &self, tenant: &str, region: &str, repo: &str, oid: &str, path: &str, maximum_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, GitReadError> {
         let loc = myelin_git::core::RepoLoc::new(tenant, region, repo_name(repo));
         if !self.store.repo_exists(&loc) {
             // An unknown repo reads as "no config" (a clean skip) — a push for a repo whose object
@@ -1320,10 +1354,11 @@ impl<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> GitConfigReader
             .open_repo(&loc)
             .map_err(|e| GitReadError(format!("open {repo}: {e}")))?;
         match git
-            .read_blob_at_path(oid, path)
+            .read_blob_at_path_bounded(oid, path, maximum_bytes)
             .map_err(|e| GitReadError(format!("read {path}@{oid}: {e}")))?
         {
             myelin_git::durable::BlobPathLookup::Found { bytes, .. } => Ok(Some(bytes)),
+            myelin_git::durable::BlobPathLookup::TooLarge { size, maximum } => Err(GitReadError(format!("{path}@{oid} is {size} bytes, above the {maximum}-byte config limit"))),
             // Absent or a directory at that name → no config file (a clean skip).
             myelin_git::durable::BlobPathLookup::Missing
             | myelin_git::durable::BlobPathLookup::IsDir => Ok(None),

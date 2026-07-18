@@ -138,10 +138,12 @@ on = \"push\"
 [[jobs]]
 name = \"build\"
 image = \"registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000\"
+command = [\"build\"]
 
 [[jobs]]
 name = \"test\"
 image = \"registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000\"
+command = [\"test\"]
 needs = [\"build\"]
 ";
 
@@ -551,12 +553,15 @@ async fn chunk4_production_cocommit_row_with_mark_events_absorb() {
     let events: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM outbox").fetch_one(&p).await.unwrap();
     assert_eq!(events, 3, "ci.run.started + 2 queued ci.check.updated in the REAL outbox (absorb)");
     // The row is attributed correctly (state=queued, the deterministic run_id, the trust tier).
-    let row = sqlx::query("SELECT state, trust_tier, trigger_kind, correlation_id FROM ci_run WHERE run_id=$1::uuid")
+    let row = sqlx::query("SELECT state, trust_tier, trigger_kind, correlation_id, repo_ref, commit_oid, triggered_by FROM ci_run WHERE run_id=$1::uuid")
         .bind(&run_id).fetch_one(&p).await.unwrap();
     assert_eq!(row.get::<String, _>("state"), "queued", "reserve state");
     assert_eq!(row.get::<String, _>("trust_tier"), "trusted", "a member push is trusted");
     assert_eq!(row.get::<String, _>("trigger_kind"), "push");
     assert_eq!(row.get::<String, _>("correlation_id"), format!("corr-{}", "ev-chunk4-1"));
+    assert_eq!(row.get::<String, _>("repo_ref"), repo);
+    assert_eq!(row.get::<String, _>("commit_oid"), oid);
+    assert_eq!(row.get::<String, _>("triggered_by"), "pusher");
 
     // Delivery 2 (same event_id): DEDUPLICATED — the handler does not re-run; the ON CONFLICT + absorb
     // guarantee 0 duplicates even if it had.

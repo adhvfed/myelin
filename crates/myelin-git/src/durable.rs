@@ -321,6 +321,8 @@ pub enum BlobPathLookup {
         /// The blob byte size.
         size: u64,
     },
+    /// The blob exists but exceeds a caller-supplied pre-allocation byte ceiling.
+    TooLarge { size: u64, maximum: usize },
     /// The path resolves to a directory → the caller redirects to the tree route.
     IsDir,
     /// No such path under the ref.
@@ -870,6 +872,16 @@ impl DurableGitRepo {
         ref_name: &str,
         path: &str,
     ) -> Result<BlobPathLookup, DurableError> {
+        self.read_blob_at_path_bounded(ref_name, path, usize::MAX)
+    }
+
+    /// Resolve a blob while checking its ODB header before inflating/materializing content.
+    pub fn read_blob_at_path_bounded(
+        &self,
+        ref_name: &str,
+        path: &str,
+        maximum_bytes: usize,
+    ) -> Result<BlobPathLookup, DurableError> {
         let repo = self.open_git()?;
         let Some(commit) = self.resolve_commit(&repo, ref_name)? else {
             return Ok(BlobPathLookup::Missing);
@@ -889,6 +901,13 @@ impl DurableGitRepo {
         };
         match entry.kind() {
             Some(git2::ObjectType::Blob) => {
+                let odb = repo.odb().map_err(|e| git_err("open object database", e))?;
+                let (object_size, object_kind) = odb.read_header(entry.id())
+                    .map_err(|e| git_err("read object header", e))?;
+                if object_kind != git2::ObjectType::Blob { return Ok(BlobPathLookup::Missing); }
+                if object_size > maximum_bytes {
+                    return Ok(BlobPathLookup::TooLarge { size: object_size as u64, maximum: maximum_bytes });
+                }
                 let obj = entry.to_object(&repo).map_err(|e| git_err("entry object", e))?;
                 let blob = obj
                     .as_blob()
@@ -2665,6 +2684,10 @@ mod tests {
         assert!(!is_binary, "a text file is not binary");
         assert_eq!(size as usize, bytes.len());
         assert!(String::from_utf8_lossy(&bytes).contains("deep"));
+        assert!(matches!(
+            repo.read_blob_at_path_bounded("main", "crates/inner/deep.rs", 1).unwrap(),
+            BlobPathLookup::TooLarge { size, maximum: 1 } if size > 1
+        ));
 
         // A BINARY blob (NUL bytes): flagged binary so the UI never split('\n')s it.
         let BlobPathLookup::Found { is_binary, .. } =
