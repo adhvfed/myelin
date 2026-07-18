@@ -33,7 +33,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         .find("JobQueueReaper::new")
         .expect("production reaper must remain wired");
     let runner_gate = source
-        .find("verify_startup_activation(runner_setting.as_deref())")
+        .find("verify_startup_activation(runner_setting)")
         .expect("production runner activation must be refused explicitly");
     let bootstrap = source
         .find("PgBootstrap::from_env(Mode::RequireEnv)")
@@ -48,6 +48,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(!source.contains("TenantId(\"ci-controlplane\""));
     assert!(!source.contains("synthetic tenant"));
     assert!(source.contains("InvalidRunnerSetting(String)"));
+    assert!(source.contains("NonUnicodeRunnerSetting(OsString)"));
+    assert!(!source.contains("std::env::var(\"MYELIN_CI_RUNNER\").ok()"));
 
     assert!(runner_gate < bootstrap);
     assert!(foundation < durable);
