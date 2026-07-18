@@ -25,7 +25,7 @@
 //! creation. This is the honest outbox/Saga equivalent of atomicity at a cross-service boundary.
 
 use crate::dek::{decrypt_free_text, encrypt_free_text, IssueFreeText};
-use crate::events::{ISSUE_AUTHORIZATION_REQUESTED, ISSUE_CREATED};
+use crate::events::{ISSUE_AUTHORIZATION_REQUESTED, ISSUE_CLOSED, ISSUE_CREATED};
 use myelin_events::{
     derive_envelope, Actor, AggregateKey, DataRole, EmitContext, EventDraft, EventEnvelope,
     EventId, EventType, IdMinter, Timestamp, UlidMinter, Visibility,
@@ -1093,6 +1093,10 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         }
         let tenant_id = scope.tenant().0.clone();
         let region = scope.region().0.clone();
+        let actor = principal.clone();
+        // Mint before opening the transaction, just like create. An idempotent no-op close may
+        // discard this ID; a state-changing close persists it exactly once with the row update.
+        let closed_event_id: EventId = self.minter.mint().into();
         let row = self
             .provider
             .with_tenant_tx(&tenant_id.clone(), move |conn| {
@@ -1106,7 +1110,8 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     if current.get::<String, _>("state_category") == "completed" {
                         return Ok(Some(current));
                     }
-                    sqlx::query(&format!(
+                    let previous_state = current.get::<String, _>("state");
+                    let row = sqlx::query(&format!(
                         "UPDATE issue SET state = 'Done', state_category = 'completed', \
                          state_changed_at = now(), updated_at = now(), version = version + 1 \
                          WHERE tenant_id = $1 AND region = $2 AND id = $3 \
@@ -1121,7 +1126,20 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     .bind(id)
                     .fetch_optional(&mut *conn)
                     .await
-                    .map_err(|e| myelin_storage::PgError::Query(e.to_string()))
+                    .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
+                    let Some(row) = row else {
+                        return Ok(None);
+                    };
+                    let envelope = issue_closed_envelope(
+                        &actor,
+                        id,
+                        row.get::<String, _>("key").as_str(),
+                        previous_state.as_str(),
+                        closed_event_id,
+                    );
+                    let aggregate = envelope.aggregate.0.clone();
+                    PgRelay::co_commit_in_tx(&mut *conn, &aggregate, &envelope).await?;
+                    Ok(Some(row))
                 })
             })
             .await
@@ -1448,6 +1466,48 @@ fn issue_created_envelope(
             caused_by: request.caused_by.clone(),
         },
         Some(request),
+    )
+}
+
+/// References-only close event committed in the exact transaction that changes the issue row.
+/// The encrypted title never enters the outbox. A repeated close never calls this helper because
+/// the locked row's completed category returns early, preserving one event for one transition.
+fn issue_closed_envelope(
+    actor: &Principal,
+    issue_id: Uuid,
+    key: &str,
+    previous_state: &str,
+    event_id: EventId,
+) -> EventEnvelope {
+    let timestamp = now_rfc3339();
+    derive_envelope(
+        EventDraft {
+            type_: EventType(ISSUE_CLOSED.into()),
+            subject: issue_subject(actor.tenant.as_str(), issue_id),
+            aggregate: AggregateKey(format!("issue:{issue_id}")),
+            payload: serde_json::json!({
+                "issue_id": issue_id.to_string(),
+                "issue_key": key,
+                "from": previous_state,
+                "to": "Done",
+                "category": "completed",
+            }),
+            data_role: DataRole::Controller,
+            visibility: Visibility::Internal,
+            contains_personal_data: false,
+            pii_key_ref: None,
+        },
+        EmitContext {
+            event_id,
+            tenant: actor.tenant.clone(),
+            region: actor.region.clone(),
+            actor: Actor(actor.clone()),
+            schema_ver: 1,
+            occurred_at: timestamp.clone(),
+            recorded_at: timestamp,
+            caused_by: None,
+        },
+        None,
     )
 }
 
@@ -1795,5 +1855,34 @@ mod tests {
         tampered = request;
         tampered.payload["project_userset"] = serde_json::json!("project:other#view");
         assert!(validate(&tampered).is_err());
+    }
+
+    #[test]
+    fn close_event_is_canonical_references_only_and_actor_scoped() {
+        let actor = Principal::new(
+            TenantId::from_token("acme"),
+            Region::new("fr-par"),
+            PrincipalId("human:closer".into()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        );
+        let issue_id = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+        let event_id: EventId = UlidMinter::new().mint().into();
+        let closed =
+            issue_closed_envelope(&actor, issue_id, "ENG-7", "In Review", event_id.clone());
+
+        assert_eq!(closed.event_id, event_id);
+        assert_eq!(closed.type_.0, ISSUE_CLOSED);
+        assert_eq!(closed.tenant, actor.tenant);
+        assert_eq!(closed.region, actor.region);
+        assert_eq!(closed.actor, Actor(actor));
+        assert_eq!(closed.aggregate.0, format!("issue:{issue_id}"));
+        assert_eq!(closed.payload["issue_key"], "ENG-7");
+        assert_eq!(closed.payload["from"], "In Review");
+        assert_eq!(closed.payload["category"], "completed");
+        assert!(!closed.contains_personal_data);
+        assert!(closed.pii_key_ref.is_none());
+        assert!(!closed.payload.to_string().contains("title"));
     }
 }
