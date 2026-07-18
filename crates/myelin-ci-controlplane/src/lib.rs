@@ -478,10 +478,12 @@ pub use job_spec_store::{
 // CT-004d.2 chunk 4: the durable `ci_run` writer (the CI run-of-record). `CiRunStore::co_commit_insert`
 // writes the `ci_run` row on the consumer's co-commit `HandlerTx` connection (atomic with the dedup
 // mark); `insert_ci_run`/`get_ci_run` are the pool-based tenant-scoped write/read (the run-view /
-// check-emitter resolve path). Idempotent on the `(tenant_id, run_id)` PK (`ON CONFLICT DO NOTHING`);
-// the co-emitted events stay absorb-mode through the outbox (the honest #7 H1 split).
+// check-emitter resolve path). A conflict on `(tenant_id, run_id)` is accepted only after a separate
+// locking query verifies every immutable field; divergent/invisible conflicts fail typed and loud.
+// The co-emitted events stay absorb-mode through the outbox (the honest #7 H1 split).
 pub use ci_run_store::{
     CiRunInsert, CiRunRecord, CiRunStore, CiRunStoreError, INSERT_CI_RUN_QUERY, SELECT_CI_RUN_QUERY,
+    VERIFY_CI_RUN_REPLAY_QUERY,
 };
 
 // CT-004c.2: the runner exec binding — the durable-store lease adapter + the bounded runner loop the

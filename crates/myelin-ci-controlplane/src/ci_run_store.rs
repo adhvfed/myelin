@@ -32,12 +32,13 @@
 //!
 //! ## Idempotency + RLS (fail-closed)
 //! `ON CONFLICT (tenant_id, run_id) DO NOTHING` — a redelivered trigger mints the SAME deterministic
-//! `run_id` (derived from the triggering `event_id`), so the row inserts exactly ONCE. Every write is
-//! `(tenant, region)`-scoped: the pool-based [`CiRunStore::insert_ci_run`] / [`CiRunStore::get_ci_run`]
-//! acquire through [`with_tenant_tx`] (the RESHAPE-002 FORCE-RLS convention), and the co-commit path
-//! rides the co-commit tx, which the dedup backing already set the `(tenant, region)` GUC on. Named
-//! `…Store` + carries a `PgPool` so the `no-in-memory-durable-store` scanner reads it as a genuine
-//! durable store.
+//! `run_id` (derived from the triggering `event_id`), then a separate locking read verifies every
+//! immutable field before classifying it as an exact replay. A collision is typed and loud. Every
+//! write is `(tenant, region)`-scoped: the pool-based [`CiRunStore::insert_ci_run`] acquires through
+//! [`with_tenant_tx_error`] so domain errors survive the RESHAPE-002 FORCE-RLS transaction convention;
+//! [`CiRunStore::get_ci_run`] uses [`with_tenant_tx`], and the co-commit path rides the caller's scoped
+//! transaction. Named `…Store` + carries a `PgPool` so the `no-in-memory-durable-store` scanner reads
+//! it as a genuine durable store.
 //!
 //! ## Out of scope (named, not built — the CT-004d.2 chunk split)
 //! This is ONLY the durable `ci_run` writer + its co-commit wiring. It does NOT register/drive the
@@ -45,7 +46,7 @@
 //! scheduler/runner (chunk 5). The `ci_run` row it writes carries the PRE-MINTED `wf_run_id` those
 //! chunks start the workflow with.
 
-use myelin_storage::{with_tenant_tx, PgError};
+use myelin_storage::{with_tenant_tx, with_tenant_tx_error, PgError};
 use sqlx::postgres::PgPool;
 use sqlx::Row;
 
@@ -135,9 +136,9 @@ pub struct CiRunRecord {
 /// **INSERT a `ci_run` row, idempotent on the `(tenant_id, run_id)` PK.** Binds every column the writer
 /// sets (the `uuid` columns cast `$n::uuid` from text); the NULLABLE columns bind `Option` (→ `NULL`
 /// when `None`); `cost_settled` / `created_at` / `finished_at` take their DDL defaults.
-/// `ON CONFLICT (tenant_id, run_id) DO NOTHING` makes a redelivered trigger (same deterministic
-/// `run_id`) a no-op — the run-of-record lands exactly once. `RETURNING run_id` is present iff a fresh
-/// row was inserted (absent on the idempotent conflict), so the caller can report Inserted vs Duplicate.
+/// `ON CONFLICT (tenant_id, run_id) DO NOTHING` makes the initial write non-destructive. On conflict,
+/// [`VERIFY_CI_RUN_REPLAY_QUERY`] must verify the immutable identity in a separate statement before
+/// the operation can return `false`; a divergent or invisible conflict is an error.
 pub const INSERT_CI_RUN_QUERY: &str = "\
 INSERT INTO ci_run (
   tenant_id, region, run_id, project_id, pipeline_id, wf_run_id,
@@ -149,6 +150,33 @@ INSERT INTO ci_run (
 )
 ON CONFLICT (tenant_id, run_id) DO NOTHING
 RETURNING run_id";
+
+/// Read the immutable run identity after an `INSERT ... DO NOTHING` conflict. This deliberately is
+/// a **second statement**: under PostgreSQL READ COMMITTED, the statement that lost a concurrent
+/// insert race can observe the unique conflict without being able to read the winner in that same
+/// statement's snapshot. A new statement receives a new snapshot after the winner commits.
+///
+/// The explicit `(tenant, region, run)` predicate is defence in depth alongside FORCE RLS. If the
+/// unique conflict belongs to another residency region, the row remains invisible and the caller
+/// returns [`CiRunStoreError::ConflictNotVisible`] without disclosing either region.
+pub const VERIFY_CI_RUN_REPLAY_QUERY: &str = "\
+SELECT
+  region = $2                                      AS region_matches,
+  project_id = $4::uuid                            AS project_id_matches,
+  pipeline_id = $5::uuid                           AS pipeline_id_matches,
+  wf_run_id = $6::uuid                             AS wf_run_id_matches,
+  repo_ref IS NOT DISTINCT FROM $7::text           AS repo_ref_matches,
+  commit_oid IS NOT DISTINCT FROM $8::text         AS commit_oid_matches,
+  cause_event_id IS NOT DISTINCT FROM $9::text     AS cause_event_id_matches,
+  definition_snapshot = $10                        AS definition_snapshot_matches,
+  trigger_kind = $11                               AS trigger_kind_matches,
+  trust_tier = $12                                 AS trust_tier_matches,
+  correlation_id = $13                             AS correlation_id_matches,
+  (triggered_by IS NOT DISTINCT FROM $14::text
+    OR triggered_by = $15::text)                   AS triggered_by_matches
+FROM ci_run
+WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid
+FOR KEY SHARE";
 
 /// **Read a `ci_run` row back by `(tenant_id, run_id)` (the run-view / check-emitter resolve path).**
 /// The `uuid` columns are rendered `::text` so the read record is a plain `String`. Keyed on the RLS
@@ -173,10 +201,22 @@ FROM ci_run WHERE tenant_id = $1 AND run_id = $2::uuid";
 
 /// A durable `ci_run`-store failure. Loud + typed — a write/read NEVER silently drops or coerces. Safe
 /// to log: carries only the structural fault + the opaque `(tenant, run)` tokens the CI schema keys on.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum CiRunStoreError {
     /// A durable-store DB error (the statement did NOT succeed) — never a silent partial write.
     Db(String),
+    /// Reserve/start may create a run only in the canonical initial state (`queued`). Checked before
+    /// opening a transaction or executing SQL.
+    InvalidInitialState,
+    /// The primary key already exists, but its immutable run identity differs from this replay.
+    /// Field names only: submitted and stored values are deliberately never exposed in the error.
+    ReplayCollision {
+        /// Immutable fields that differ, in stable schema order.
+        differing_fields: Vec<&'static str>,
+    },
+    /// The insert proved a primary-key conflict, but the explicitly tenant/region-scoped verification
+    /// read could not see the row. This fails closed without disclosing where the row resides.
+    ConflictNotVisible,
     /// The co-commit [`myelin_events::HandlerTx`] carried NO connection (a durable handler on the
     /// in-memory / no-tx path). The writer FAILS CLOSED here (never a write outside the co-commit tx —
     /// that re-opens the at-most-once #7 bug), so the handler returns `Retry` and the redelivery
@@ -188,6 +228,18 @@ impl core::fmt::Display for CiRunStoreError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             CiRunStoreError::Db(e) => write!(f, "durable ci_run store error: {e}"),
+            CiRunStoreError::InvalidInitialState => {
+                write!(f, "durable ci_run insert requires the queued initial state")
+            }
+            CiRunStoreError::ReplayCollision { differing_fields } => write!(
+                f,
+                "durable ci_run replay collided on immutable fields: {}",
+                differing_fields.join(", ")
+            ),
+            CiRunStoreError::ConflictNotVisible => write!(
+                f,
+                "durable ci_run conflict could not be verified in the active tenant scope"
+            ),
             CiRunStoreError::NoCoCommitTx => write!(
                 f,
                 "durable ci_run co-commit refused: the HandlerTx carried no co-commit connection \
@@ -200,15 +252,15 @@ impl core::fmt::Display for CiRunStoreError {
 
 impl std::error::Error for CiRunStoreError {}
 
-impl CiRunStoreError {
-    fn from_pg(e: PgError) -> Self {
-        CiRunStoreError::Db(e.to_string())
+impl From<PgError> for CiRunStoreError {
+    fn from(e: PgError) -> Self {
+        Self::Db(e.to_string())
     }
 }
 
 /// **The REAL durable CI `ci_run` store (CT-004d.2 chunk 4) — the run-of-record writer.** Holds the
 /// OLTP [`PgPool`] and writes / reads the `ci_run` row, mirroring [`crate::job_spec_store::CiJobSpecStore`].
-/// Two write paths, both idempotent on `(tenant_id, run_id)`:
+/// Two write paths, both exact-replay safe on `(tenant_id, run_id)`:
 ///
 /// - **[`co_commit_insert`](CiRunStore::co_commit_insert) (the PRODUCTION reserve path):** writes the
 ///   row on the consumer's co-commit `HandlerTx` connection — the SAME tx as the dedup mark — so the
@@ -216,7 +268,8 @@ impl CiRunStoreError {
 ///   the caller's connection); needs a `tokio` runtime handle to bridge the async `sqlx` write to the
 ///   sync `ReserveStore::persist` body.
 /// - **[`insert_ci_run`](CiRunStore::insert_ci_run) (the pool-based standalone write):** acquires
-///   through [`with_tenant_tx`] (the FORCE-RLS convention) — the round-trip / control-plane-owned write.
+///   through [`with_tenant_tx_error`] (the typed FORCE-RLS convention) — the round-trip /
+///   control-plane-owned write.
 ///
 /// Plus [`get_ci_run`](CiRunStore::get_ci_run), the run-view / check-emitter read. Cloneable (the pool
 /// is an `Arc`-backed handle). The caller must have applied the CI durable migrations (which create
@@ -244,7 +297,8 @@ impl CiRunStore {
     /// (the SAME `sqlx` transaction `DedupLedger::begin_co_commit` opened + inserted the dedup mark
     /// within) and runs [`INSERT_CI_RUN_QUERY`] on it. So the row + the mark commit together (the
     /// runtime commits the tx on `Done`) or roll back together (on `Retry`/failure) — a crash between
-    /// leaves NEITHER, and a redelivery re-runs + lands both exactly once (`ON CONFLICT DO NOTHING`).
+    /// leaves NEITHER, and a redelivery re-runs + lands both exactly once. A primary-key conflict is
+    /// accepted only after exact immutable replay verification.
     ///
     /// **Fail-closed:** if the handle carries NO connection ([`CiRunStoreError::NoCoCommitTx`]) the
     /// writer refuses — it NEVER writes the run-of-record outside the mark's tx (that re-opens the
@@ -252,8 +306,8 @@ impl CiRunStore {
     ///
     /// **RLS:** the co-commit tx already `set_config('myelin.tenant_id'|'myelin.region', …, true)`
     /// (transaction-scoped) — see `DurableDedupBacking::begin_co_commit` — so this INSERT is
-    /// `(tenant, region)`-scoped WITHOUT re-opening a nested `with_tenant_tx`. Returns `true` iff a
-    /// fresh row was inserted (`false` on the idempotent `ON CONFLICT` no-op).
+    /// `(tenant, region)`-scoped WITHOUT re-opening a nested tenant transaction. Returns `true` iff a
+    /// fresh row was inserted and `false` only for a verified exact immutable replay.
     ///
     /// `rt` bridges the async `sqlx` write to the sync `persist` body (the `PgOutboxBacking` idiom); the
     /// downcast + the `block_on` are HERE (this crate names `sqlx`), so the ci-dispatch leaf crate only
@@ -264,6 +318,7 @@ impl CiRunStore {
         row: &CiRunInsert,
         rt: &tokio::runtime::Handle,
     ) -> Result<bool, CiRunStoreError> {
+        validate_initial_state(row)?;
         let conn = tx
             .connection::<sqlx::PgConnection>()
             .ok_or(CiRunStoreError::NoCoCommitTx)?;
@@ -271,18 +326,19 @@ impl CiRunStore {
     }
 
     /// **INSERT a `ci_run` row on the store's OWN pool under a tenant-scoped tx (the standalone /
-    /// round-trip write).** Acquires through [`with_tenant_tx`] (BEGIN → set the `(tenant, region)` GUC
-    /// transaction-scoped → INSERT → COMMIT), so it is RLS-isolated + leaves no residual scope. Idempotent
-    /// on the `(tenant_id, run_id)` PK. Returns `true` iff a fresh row was inserted.
+    /// round-trip write).** Acquires through [`with_tenant_tx_error`] (BEGIN → set the `(tenant,
+    /// region)` GUC transaction-scoped → INSERT/verify → COMMIT), so it is RLS-isolated, leaves no
+    /// residual scope, and preserves typed collision errors. Returns `true` iff fresh and `false`
+    /// only for a verified exact immutable replay.
     pub async fn insert_ci_run(&self, row: &CiRunInsert) -> Result<bool, CiRunStoreError> {
+        validate_initial_state(row)?;
         let row = row.clone();
         let tenant = row.tenant_id.clone();
         let region = row.region.clone();
-        with_tenant_tx(&self.pool, &tenant, &region, move |conn| {
-            Box::pin(async move { insert_on_conn(conn, &row).await.map_err(map_store_err) })
+        with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
+            Box::pin(async move { insert_on_conn(conn, &row).await })
         })
         .await
-        .map_err(CiRunStoreError::from_pg)
     }
 
     /// **Read a `ci_run` row back by `(tenant, run_id)` (the run-view / check-emitter resolve path).**
@@ -307,7 +363,7 @@ impl CiRunStore {
             })
         })
         .await
-        .map_err(CiRunStoreError::from_pg)?;
+        .map_err(CiRunStoreError::from)?;
 
         Ok(row.map(|r| CiRunRecord {
             tenant_id: r.get("tenant_id"),
@@ -330,11 +386,13 @@ impl CiRunStore {
 
 /// The ONE `ci_run` INSERT execution — bound identically whether it runs on the co-commit connection or
 /// the pool's tenant-scoped tx (so the durable write is authored EXACTLY ONCE, no drift). Returns `true`
-/// iff a fresh row was inserted (`RETURNING run_id` present) — `false` on the `ON CONFLICT` no-op.
+/// iff a fresh row was inserted (`RETURNING run_id` present). On conflict it executes a mandatory
+/// second statement and returns `false` only for a verified exact immutable replay.
 async fn insert_on_conn(
     conn: &mut sqlx::PgConnection,
     row: &CiRunInsert,
 ) -> Result<bool, CiRunStoreError> {
+    validate_initial_state(row)?;
     let inserted = sqlx::query(INSERT_CI_RUN_QUERY)
         .bind(&row.tenant_id) // $1 tenant_id (RLS/tenant predicate)
         .bind(&row.region) // $2 region
@@ -354,18 +412,80 @@ async fn insert_on_conn(
         .fetch_optional(&mut *conn)
         .await
         .map_err(|e| CiRunStoreError::Db(e.to_string()))?;
-    Ok(inserted.is_some())
+    if inserted.is_some() {
+        return Ok(true);
+    }
+
+    // This must remain a separate statement. A data-modifying CTE would reuse the losing INSERT's
+    // snapshot and can miss a concurrently committed winner under READ COMMITTED.
+    let stored = sqlx::query(VERIFY_CI_RUN_REPLAY_QUERY)
+        .bind(&row.tenant_id)
+        .bind(&row.region)
+        .bind(&row.run_id)
+        .bind(&row.project_id)
+        .bind(&row.pipeline_id)
+        .bind(&row.wf_run_id)
+        .bind(&row.repo_ref)
+        .bind(&row.commit_oid)
+        .bind(&row.cause_event_id)
+        .bind(&row.definition_snapshot)
+        .bind(&row.trigger_kind)
+        .bind(&row.trust_tier)
+        .bind(&row.correlation_id)
+        .bind(&row.triggered_by)
+        .bind(crate::ERASED_PSEUDONYM)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| CiRunStoreError::Db(e.to_string()))?
+        .ok_or(CiRunStoreError::ConflictNotVisible)?;
+
+    let mut differing_fields = Vec::new();
+    for (field, matches) in [
+        ("region", stored.get::<bool, _>("region_matches")),
+        ("project_id", stored.get::<bool, _>("project_id_matches")),
+        ("pipeline_id", stored.get::<bool, _>("pipeline_id_matches")),
+        ("wf_run_id", stored.get::<bool, _>("wf_run_id_matches")),
+        ("repo_ref", stored.get::<bool, _>("repo_ref_matches")),
+        ("commit_oid", stored.get::<bool, _>("commit_oid_matches")),
+        (
+            "cause_event_id",
+            stored.get::<bool, _>("cause_event_id_matches"),
+        ),
+        (
+            "definition_snapshot",
+            stored.get::<bool, _>("definition_snapshot_matches"),
+        ),
+        (
+            "trigger_kind",
+            stored.get::<bool, _>("trigger_kind_matches"),
+        ),
+        ("trust_tier", stored.get::<bool, _>("trust_tier_matches")),
+        (
+            "correlation_id",
+            stored.get::<bool, _>("correlation_id_matches"),
+        ),
+        (
+            "triggered_by",
+            stored.get::<bool, _>("triggered_by_matches"),
+        ),
+    ] {
+        if !matches {
+            differing_fields.push(field);
+        }
+    }
+
+    if differing_fields.is_empty() {
+        Ok(false)
+    } else {
+        Err(CiRunStoreError::ReplayCollision { differing_fields })
+    }
 }
 
-/// Bridge the pool-path insert's error into a [`PgError`] so [`with_tenant_tx`] can carry it (the
-/// tenant-tx helper's op returns `Result<_, PgError>`; the co-commit path returns the store error
-/// directly).
-fn map_store_err(e: CiRunStoreError) -> PgError {
-    match e {
-        CiRunStoreError::Db(m) => PgError::Query(m),
-        CiRunStoreError::NoCoCommitTx => {
-            PgError::Query("ci_run co-commit refused: no co-commit connection".into())
-        }
+fn validate_initial_state(row: &CiRunInsert) -> Result<(), CiRunStoreError> {
+    if row.state == "queued" {
+        Ok(())
+    } else {
+        Err(CiRunStoreError::InvalidInitialState)
     }
 }
 
@@ -403,18 +523,64 @@ mod tests {
         );
         // 15 bind placeholders ($1..$15) for the 15 writer-set columns.
         for n in 1..=15 {
-            assert!(
-                INSERT_CI_RUN_QUERY.contains(&format!("${n}")),
-                "binds ${n}"
-            );
+            assert!(INSERT_CI_RUN_QUERY.contains(&format!("${n}")), "binds ${n}");
         }
-        assert!(!INSERT_CI_RUN_QUERY.contains("$16"), "no over-bind past $15");
+        assert!(
+            !INSERT_CI_RUN_QUERY.contains("$16"),
+            "no over-bind past $15"
+        );
         // The uuid columns are cast from text (the CT-004b proven posture).
         assert!(INSERT_CI_RUN_QUERY.contains("$3::uuid"));
         // The row is constructable with every NOT-NULL column set + state = queued (the reserve state).
         let r = sample_row();
         assert_eq!(r.state, "queued");
         assert_eq!(r.trigger_kind, "push");
-        assert!(r.triggered_by.is_none(), "the proven shape leaves triggered_by NULL");
+        assert!(
+            r.triggered_by.is_none(),
+            "the proven shape leaves triggered_by NULL"
+        );
+    }
+
+    #[test]
+    fn replay_verification_is_a_region_bound_locking_statement() {
+        assert!(VERIFY_CI_RUN_REPLAY_QUERY.contains("tenant_id = $1"));
+        assert!(VERIFY_CI_RUN_REPLAY_QUERY.contains("region = $2"));
+        assert!(VERIFY_CI_RUN_REPLAY_QUERY.contains("run_id = $3::uuid"));
+        assert!(VERIFY_CI_RUN_REPLAY_QUERY.contains("FOR KEY SHARE"));
+        for field in [
+            "region",
+            "project_id",
+            "pipeline_id",
+            "wf_run_id",
+            "repo_ref",
+            "commit_oid",
+            "cause_event_id",
+            "definition_snapshot",
+            "trigger_kind",
+            "trust_tier",
+            "correlation_id",
+            "triggered_by",
+        ] {
+            assert!(
+                VERIFY_CI_RUN_REPLAY_QUERY.contains(field),
+                "selects {field}"
+            );
+        }
+        for mutable in ["state", "cost_settled", "finished_at", "created_at"] {
+            assert!(
+                !VERIFY_CI_RUN_REPLAY_QUERY.contains(mutable),
+                "excludes mutable {mutable}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_queued_insert_is_rejected_before_sql() {
+        let mut r = sample_row();
+        r.state = "running".into();
+        assert_eq!(
+            validate_initial_state(&r),
+            Err(CiRunStoreError::InvalidInitialState)
+        );
     }
 }
