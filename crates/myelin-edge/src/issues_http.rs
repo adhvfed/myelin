@@ -45,15 +45,22 @@ impl DurableIssueHttpApi {
     where
         F: Future<Output = Result<T, IssueStoreError>>,
     {
-        match Handle::try_current() {
-            Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| self.runtime.block_on(future))
-            }
-            Ok(_) => Err(IssueStoreError::AuthorizationUnavailable(
-                "Issues HTTP requires the Edge multi-thread runtime".into(),
-            )),
-            Err(_) => self.runtime.block_on(future),
+        drive_on_runtime(&self.runtime, future)
+    }
+}
+
+fn drive_on_runtime<F, T>(runtime: &Handle, future: F) -> Result<T, IssueStoreError>
+where
+    F: Future<Output = Result<T, IssueStoreError>>,
+{
+    match Handle::try_current() {
+        Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| runtime.block_on(future))
         }
+        Ok(_) => Err(IssueStoreError::AuthorizationUnavailable(
+            "Issues HTTP requires the Edge multi-thread runtime".into(),
+        )),
+        Err(_) => runtime.block_on(future),
     }
 }
 
@@ -109,7 +116,7 @@ fn is_canonical_uuid(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| match index {
             8 | 13 | 18 | 23 => byte == b'-',
-            _ => byte.is_ascii_hexdigit(),
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
         })
 }
 
@@ -282,7 +289,7 @@ fn guarded(
 /// idempotent close. Every action is separately capability-mapped in the Edge catalogue.
 pub fn register_issues(
     builder: GatewayBuilder,
-    store: Arc<ProductionIssueStore>,
+    store: Arc<PgIssueStore<StoreBackedIssueAuthorizer>>,
     authorizer: StoreBackedIssueAuthorizer,
     runtime: Handle,
 ) -> GatewayBuilder {
@@ -332,6 +339,7 @@ mod tests {
         assert!(!is_canonical_uuid("33333333333333333333333333333333"));
         assert!(!is_canonical_uuid("33333333-3333-3333-3333-33333333333/"));
         assert!(!is_canonical_uuid("*"));
+        assert!(!is_canonical_uuid("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"));
     }
 
     #[test]
@@ -377,5 +385,34 @@ mod tests {
             br#"{"project_id":"11111111-1111-1111-1111-111111111111","project_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","type_id":"22222222-2222-2222-2222-222222222222","prefix":"ENG","title":"x"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn current_thread_runtime_refuses_without_polling_or_panicking() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let current = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let target = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let polled = Arc::new(AtomicBool::new(false));
+        let polled_by_future = polled.clone();
+        let result = current.block_on(async {
+            drive_on_runtime(target.handle(), async move {
+                polled_by_future.store(true, Ordering::SeqCst);
+                Ok::<_, IssueStoreError>(())
+            })
+        });
+
+        assert!(matches!(
+            result,
+            Err(IssueStoreError::AuthorizationUnavailable(_))
+        ));
+        assert!(!polled.load(Ordering::SeqCst));
     }
 }
