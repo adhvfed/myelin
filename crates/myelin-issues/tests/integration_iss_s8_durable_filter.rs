@@ -1,0 +1,456 @@
+//! Live PostgreSQL proof for the durable effective `issue:view` projection.
+#![cfg(feature = "integration")]
+
+use myelin_config::{Mode, MyelinConfig};
+use myelin_events::Timestamp;
+use myelin_identity::{
+    DataRole, ObjectId, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RelName,
+    RelationTuple, TupleDelta, Zookie,
+};
+use myelin_identity_service::TupleStore;
+use myelin_issues::{
+    issues_hot_tables, issues_migrations, CreateIssue, IssueAuthorizationBinding, IssueAuthorizer,
+    IssuePageRequest, IssuePermission, IssueStoreError, IssueTupleWriter, PgIssueStore,
+    VisibleIssues,
+};
+use myelin_storage::{
+    all_durable_migrations, DurableTupleBacking, KmsEngine, PgBootstrap, TenantScope,
+};
+use myelin_substrate::HotTables;
+use myelin_tenancy::{Region, TenantId};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Clone)]
+struct FrozenFilterAuthorizer;
+
+impl IssueAuthorizer for FrozenFilterAuthorizer {
+    fn may_create(&self, _principal: &Principal, _project_id: &str) -> bool {
+        true
+    }
+
+    fn may_access(
+        &self,
+        _principal: &Principal,
+        _issue_id: &str,
+        _permission: IssuePermission,
+    ) -> bool {
+        true
+    }
+
+    fn visible_issues(&self, _principal: &Principal) -> Result<VisibleIssues, String> {
+        Ok(VisibleIssues::effective_issue_view_filter())
+    }
+}
+
+#[derive(Clone)]
+struct TupleWriter(TupleStore);
+
+impl IssueTupleWriter for TupleWriter {
+    fn ensure_parent_project<'a>(
+        &'a self,
+        scope: &'a TenantScope,
+        actor: &'a Principal,
+        binding: &'a IssueAuthorizationBinding,
+    ) -> Pin<Box<dyn Future<Output = Result<Zookie, String>> + Send + 'a>> {
+        let tuples = self.0.clone();
+        let scope = scope.clone();
+        let actor = actor.clone();
+        let delta = TupleDelta::Add(RelationTuple {
+            object: ObjectId(binding.issue_object.clone()),
+            relation: RelName("parent_project".into()),
+            subject: PrincipalId(binding.project_userset.clone()),
+            caveat: None,
+        });
+        Box::pin(async move {
+            write(&tuples, &scope, &actor, vec![delta])
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+fn principal(tenant: &str, region: &str, id: &str) -> Principal {
+    Principal::new(
+        TenantId::from_token(tenant),
+        Region::new(region),
+        PrincipalId(id.into()),
+        PrincipalKind::Service,
+        DataRole::Controller,
+        PrincipalStatus::Active,
+    )
+}
+
+fn tuple(op: bool, object: impl Into<String>, relation: &str, subject: &str) -> TupleDelta {
+    let edge = RelationTuple {
+        object: ObjectId(object.into()),
+        relation: RelName(relation.into()),
+        subject: PrincipalId(subject.into()),
+        caveat: None,
+    };
+    if op {
+        TupleDelta::Add(edge)
+    } else {
+        TupleDelta::Remove(edge)
+    }
+}
+
+async fn write(
+    tuples: &TupleStore,
+    scope: &TenantScope,
+    actor: &Principal,
+    deltas: Vec<TupleDelta>,
+) -> Result<Zookie, myelin_identity_service::WriteError> {
+    let tuples = tuples.clone();
+    let scope = scope.clone();
+    let actor = actor.clone();
+    tokio::task::spawn_blocking(move || {
+        tuples.write_tuples(
+            &scope,
+            &actor,
+            &deltas,
+            None,
+            None,
+            Timestamp("2026-07-18T00:00:00Z".into()),
+        )
+    })
+    .await
+    .expect("tuple writer joins")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races() {
+    let mut config = MyelinConfig::from_env(Mode::DevDefaults).expect("dev config");
+    config.region = "fr-par".into();
+    let bootstrap = PgBootstrap::connect(config.clone(), 8)
+        .await
+        .expect("live PostgreSQL");
+    bootstrap.migrate_foundation().await.expect("foundation");
+    bootstrap
+        .migrate(&all_durable_migrations(), &HotTables::none())
+        .await
+        .expect("storage 0067-0069 precedes Issues");
+    bootstrap
+        .migrate(&issues_migrations(), &issues_hot_tables())
+        .await
+        .expect("Issues projection table and strict triggers");
+    let provider = bootstrap.into_runtime().await.expect("runtime provider");
+
+    let suffix = format!("{}_{}", std::process::id(), now_nanos());
+    let tenant = format!("iss_s8_{suffix}");
+    let other_tenant = format!("iss_s8_other_{suffix}");
+    let alice = principal(&tenant, "fr-par", &format!("p:alice:{suffix}"));
+    let bob = principal(&tenant, "fr-par", &format!("p:bob:{suffix}"));
+    let outsider = principal(&tenant, "fr-par", &format!("p:outsider:{suffix}"));
+    let worker = principal(&tenant, "fr-par", &format!("svc:worker:{suffix}"));
+    let scope = TenantScope::from_verified_token(&alice, alice.region.clone());
+    let tuples = TupleStore::with_pg(
+        DurableTupleBacking::new(provider.clone()),
+        tokio::runtime::Handle::current(),
+    );
+    let writer = TupleWriter(tuples.clone());
+    let kms = Arc::new(KmsEngine::new());
+    let store = PgIssueStore::new(provider.clone(), kms.clone(), FrozenFilterAuthorizer);
+    let project = "11111111-1111-1111-1111-111111111111";
+
+    write(
+        &tuples,
+        &scope,
+        &alice,
+        vec![
+            tuple(
+                true,
+                format!("project:{project}"),
+                "reader",
+                &alice.principal_id.0,
+            ),
+            tuple(
+                true,
+                format!("project:{project}"),
+                "parent_team",
+                "team:eng#view",
+            ),
+            tuple(true, "team:eng", "member", &bob.principal_id.0),
+            // Malformed tuple-to-userset target: a concrete subject must never inherit project view.
+            tuple(
+                true,
+                format!("project:{project}"),
+                "parent_team",
+                &outsider.principal_id.0,
+            ),
+            // A tuple-to-userset target must name the computed `view`, not an arbitrary relation.
+            tuple(
+                true,
+                format!("project:{project}"),
+                "parent_team",
+                "team:bad#member",
+            ),
+            tuple(true, "team:bad", "member", &outsider.principal_id.0),
+        ],
+    )
+    .await
+    .expect("seed project viewers");
+
+    let staged = store
+        .create(
+            &alice,
+            CreateIssue {
+                project_id: project.into(),
+                type_id: "22222222-2222-2222-2222-222222222222".into(),
+                prefix: "S8D".into(),
+                title: "durable effective visibility".into(),
+            },
+        )
+        .await
+        .expect("stage issue");
+    store
+        .reconcile_authorization(&worker, &staged.id, &writer)
+        .await
+        .expect("activate normal production issue");
+
+    assert!(matches!(
+        store
+            .list(&alice, IssuePageRequest::new(20, None).unwrap())
+            .await,
+        Err(IssueStoreError::AuthorizationUnavailable(_))
+    ));
+    let built = store
+        .rebuild_effective_issue_view(&worker)
+        .await
+        .expect("worker rebuilds pending projection");
+    assert!(built.effective_grants >= 2);
+    assert_eq!(
+        store
+            .list(&alice, IssuePageRequest::new(20, None).unwrap())
+            .await
+            .unwrap()
+            .items[0]
+            .id,
+        staged.id
+    );
+    assert_eq!(
+        store
+            .list(&bob, IssuePageRequest::new(20, None).unwrap())
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert!(store
+        .list(&outsider, IssuePageRequest::new(20, None).unwrap())
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+
+    // Reconstruct the pool/store as a process restart: durable rows and watermark remain serveable.
+    drop(store);
+    let restarted_bootstrap = PgBootstrap::connect(config, 4)
+        .await
+        .expect("restart connection");
+    let restarted_provider = restarted_bootstrap
+        .into_runtime()
+        .await
+        .expect("restart runtime");
+    let restarted = PgIssueStore::new(restarted_provider, kms, FrozenFilterAuthorizer);
+    assert_eq!(
+        restarted
+            .list(&alice, IssuePageRequest::new(20, None).unwrap())
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+
+    // Confidential exclusion removes normal project viewers; an explicit grant unions one back.
+    let issue_object = format!("issue:{}", staged.id);
+    write(
+        &tuples,
+        &scope,
+        &alice,
+        vec![
+            tuple(true, &issue_object, "confidential", &alice.principal_id.0),
+            tuple(true, &issue_object, "confidential", &bob.principal_id.0),
+            tuple(
+                true,
+                &issue_object,
+                "confidential_grant",
+                &alice.principal_id.0,
+            ),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        restarted
+            .list(&alice, IssuePageRequest::new(20, None).unwrap())
+            .await,
+        Err(IssueStoreError::AuthorizationUnavailable(_))
+    ));
+    restarted
+        .rebuild_effective_issue_view(&worker)
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted
+            .list(&alice, IssuePageRequest::new(20, None).unwrap())
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert!(restarted
+        .list(&bob, IssuePageRequest::new(20, None).unwrap())
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+
+    // A revocation commits with the stale marker. It is unavailable before rebuild and absent after.
+    write(
+        &tuples,
+        &scope,
+        &alice,
+        vec![tuple(
+            false,
+            &issue_object,
+            "confidential_grant",
+            &alice.principal_id.0,
+        )],
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        restarted
+            .list(&alice, IssuePageRequest::new(20, None).unwrap())
+            .await,
+        Err(IssueStoreError::AuthorizationUnavailable(_))
+    ));
+    restarted
+        .rebuild_effective_issue_view(&worker)
+        .await
+        .unwrap();
+    let forbidden = restarted
+        .list(&alice, IssuePageRequest::new(20, None).unwrap())
+        .await
+        .unwrap();
+    assert!(forbidden.items.is_empty());
+    assert!(forbidden.next_cursor.is_none());
+
+    // Concurrent mutation waits behind the rebuild's state-row lock, then leaves the result pending.
+    write(
+        &tuples,
+        &scope,
+        &alice,
+        vec![tuple(
+            true,
+            &issue_object,
+            "confidential_grant",
+            &alice.principal_id.0,
+        )],
+    )
+    .await
+    .unwrap();
+    let locked = Arc::new(tokio::sync::Notify::new());
+    let rebuild_store = restarted.clone();
+    let rebuild_worker = worker.clone();
+    let rebuild_locked = locked.clone();
+    let rebuilding = tokio::spawn(async move {
+        rebuild_store
+            .rebuild_effective_issue_view_paused_for_test(
+                &rebuild_worker,
+                Duration::from_millis(300),
+                rebuild_locked,
+            )
+            .await
+    });
+    locked.notified().await;
+    let revoking = write(
+        &tuples,
+        &scope,
+        &alice,
+        vec![tuple(
+            false,
+            &issue_object,
+            "confidential_grant",
+            &alice.principal_id.0,
+        )],
+    );
+    let (_, revoked) = tokio::join!(rebuilding, revoking);
+    assert!(revoked.is_ok());
+    assert!(matches!(
+        restarted
+            .list(&alice, IssuePageRequest::new(20, None).unwrap())
+            .await,
+        Err(IssueStoreError::AuthorizationUnavailable(_))
+    ));
+    restarted
+        .rebuild_effective_issue_view(&worker)
+        .await
+        .unwrap();
+    assert!(restarted
+        .list(&alice, IssuePageRequest::new(20, None).unwrap())
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+
+    // Tenant and region cannot inherit the other partition's effective rows.
+    let other = principal(&other_tenant, "fr-par", &alice.principal_id.0);
+    let other_worker = principal(&other_tenant, "fr-par", "svc:worker:other");
+    restarted
+        .rebuild_effective_issue_view(&other_worker)
+        .await
+        .unwrap();
+    assert!(restarted
+        .list(&other, IssuePageRequest::new(20, None).unwrap())
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+    let wrong_region = principal(&tenant, "us-east", &alice.principal_id.0);
+    assert_eq!(
+        restarted
+            .list(&wrong_region, IssuePageRequest::new(20, None).unwrap())
+            .await,
+        Err(IssueStoreError::NotFound)
+    );
+
+    // Exact test partition cleanup (admin role; projection rows precede their state parent).
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(
+            &std::env::var("DATABASE_MIGRATION_URL").unwrap_or_else(|_| {
+                "postgres://myelin_admin:myelin_dev_pw@localhost:5433/myelin".into()
+            }),
+        )
+        .await
+        .unwrap();
+    for statement in [
+        "DELETE FROM issue_authz_visible WHERE tenant_id = ANY($1)",
+        "DELETE FROM issue_authz_binding WHERE tenant_id = ANY($1)",
+        "DELETE FROM issue WHERE tenant_id = ANY($1)",
+        "DELETE FROM prefix_counter WHERE tenant_id = ANY($1)",
+        "DELETE FROM rebac_tuple WHERE tenant_id = ANY($1)",
+        "DELETE FROM authz_projection_state WHERE tenant_id = ANY($1)",
+        "DELETE FROM outbox WHERE envelope->>'tenant' = ANY($1)",
+    ] {
+        sqlx::query(statement)
+            .bind(vec![tenant.clone(), other_tenant.clone()])
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+}
+
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos()
+}
