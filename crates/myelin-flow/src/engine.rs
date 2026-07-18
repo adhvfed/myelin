@@ -354,6 +354,10 @@ pub struct SignalRow {
     /// the crypto-shred key id IF the payload carries inline PII (the RARE case, §3.4) — the ONLY PII
     /// locator on the row; erasing a subject crypto-shreds the payload.
     pub payload_key_ref: Option<String>,
+    /// Durable receipt time in epoch milliseconds. Deadline-aware joins compare this producer-side
+    /// arrival time with their dispatch deadline, so a late result cannot win merely because timer
+    /// wheel processing lagged.
+    pub received_unix_ms: i64,
     /// the `wf_history` seq that consumed it (`None` = buffered, unconsumed, §3.4) — the consuming
     /// wait (P-FLOW-11) stamps it.
     pub consumed_seq: Option<i64>,

@@ -528,6 +528,7 @@ impl DurableExecutor for FlowExecutor {
             idem_key: spec.idem_key.clone(),
             payload: spec.payload.clone(),
             payload_key_ref: spec.payload_key_ref.clone(),
+            received_unix_ms: 0,
             consumed_seq: None,
         });
 

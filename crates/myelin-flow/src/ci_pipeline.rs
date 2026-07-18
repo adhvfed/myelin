@@ -429,6 +429,7 @@ mod tests {
             idem_key: idem_token.into(),
             payload: vec![stage_verdict_marker(stage, pass)],
             payload_key_ref: None,
+            received_unix_ms: 0,
             consumed_seq: None,
         });
     }

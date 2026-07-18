@@ -385,6 +385,7 @@ fn e2e2_durable_workflow_hitl_spine_across_kill_and_days_later_approval() {
         idem_key: step_token,
         payload: vec![ArtifactRef("myelin://acme/agent/triage/done".into())],
         payload_key_ref: None,
+        received_unix_ms: 0,
         consumed_seq: None,
     });
 
@@ -782,6 +783,7 @@ fn e2e2_spine_days_later_decline_withholds_the_merge_zero_mutation() {
         idem_key: step_token,
         payload: vec![ArtifactRef("myelin://acme/agent/triage/done".into())],
         payload_key_ref: None,
+        received_unix_ms: 0,
         consumed_seq: None,
     });
 

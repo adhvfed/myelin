@@ -304,6 +304,7 @@ async fn drive_commit_is_atomic_idempotent_consumes_signal_once_and_stages_outbo
             }],
             attempts: vec![],
             timers: vec![],
+            timer_disarms: Vec::new(),
             outbox: vec![],
         };
         assert!(matches!(
@@ -359,6 +360,7 @@ async fn drive_commit_is_atomic_idempotent_consumes_signal_once_and_stages_outbo
             fire_at_unix_secs: 1,
             partition: 4,
         }],
+        timer_disarms: Vec::new(),
         outbox: vec![event_row("01JFLOWDRIVECOMMIT00000001", "R-signal")],
     };
     assert_eq!(
@@ -474,6 +476,7 @@ async fn journal_and_outbox_roll_back_together_and_stale_owner_cannot_commit() {
             ended_unix_ms: None,
         }],
         timers: vec![],
+        timer_disarms: Vec::new(),
         outbox: vec![],
     };
     assert_eq!(
@@ -497,6 +500,7 @@ async fn journal_and_outbox_roll_back_together_and_stale_owner_cannot_commit() {
         }],
         attempts: vec![],
         timers: vec![],
+        timer_disarms: Vec::new(),
         outbox: vec![event_row("01JFLOWGAPROLLBACK000000001", "R-rollback")],
     };
     assert!(matches!(
@@ -532,6 +536,7 @@ async fn journal_and_outbox_roll_back_together_and_stale_owner_cannot_commit() {
             fire_at_unix_secs: 600,
             partition: 5,
         }],
+        timer_disarms: Vec::new(),
         outbox: vec![event_row("01JFLOWROLLBACK000000000001", "R-rollback")],
     };
     assert!(matches!(
@@ -585,6 +590,7 @@ async fn journal_and_outbox_roll_back_together_and_stale_owner_cannot_commit() {
         history: vec![],
         attempts: vec![],
         timers: vec![],
+        timer_disarms: Vec::new(),
         outbox: vec![],
     };
     assert_eq!(
@@ -761,6 +767,7 @@ async fn timer_fire_wakes_and_journals_once_without_crossing_tenant_or_region() 
             fire_at_unix_secs: 10,
             partition: 8,
         }],
+        timer_disarms: Vec::new(),
         outbox: vec![],
     };
     assert!(matches!(
