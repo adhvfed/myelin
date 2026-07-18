@@ -243,6 +243,12 @@ CREATE TABLE IF NOT EXISTS issue_authz_binding (
          (state = 'active' AND zookie IS NOT NULL AND activated_at IS NOT NULL))
 );
 CREATE INDEX IF NOT EXISTS issue_authz_binding_pending
+  ON issue_authz_binding (tenant_id, state, created_at, issue_id);";
+
+/// Forward expansion for the region-qualified recovery scan. The original authorization-ledger
+/// migration is immutable; this separately named index is an additive rollout improvement.
+pub const EXPAND_ISSUE_AUTHZ_CREATED_EVENT_DDL: &str = "\
+CREATE INDEX IF NOT EXISTS issue_authz_binding_pending_region
   ON issue_authz_binding (tenant_id, region, state, created_at, issue_id);";
 
 /// `issue_relation` (arch 01 §4 — the TE-7 source of truth, contract 5.5). We write the FORWARD edge
@@ -531,6 +537,11 @@ pub fn issues_migrations() -> Migrations {
         authz_binding_ddl,
         ISSUE_AUTHZ_BINDING_TABLE,
     ));
+    migrations.push(Migration::plain_on(
+        "iss_0017_issue_authz_created_event",
+        EXPAND_ISSUE_AUTHZ_CREATED_EVENT_DDL,
+        ISSUE_AUTHZ_BINDING_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -637,7 +648,7 @@ mod tests {
         let binding = issues_migrations()
             .0
             .into_iter()
-            .find(|m| m.table == Some(ISSUE_AUTHZ_BINDING_TABLE))
+            .find(|m| m.id == "iss_0016_issue_authz_binding")
             .expect("authorization binding migration");
         assert!(CREATE_ISSUE_AUTHZ_BINDING_DDL
             .starts_with("CREATE TABLE IF NOT EXISTS issue_authz_binding (\n  tenant_id"));
@@ -656,6 +667,17 @@ mod tests {
                 "authorization binding pins `{invariant}`"
             );
         }
+        let expand = issues_migrations()
+            .0
+            .into_iter()
+            .find(|m| m.id == "iss_0017_issue_authz_created_event")
+            .expect("authorization created-event expansion");
+        for invariant in [
+            "issue_authz_binding_pending_region",
+            "tenant_id, region, state, created_at, issue_id",
+        ] {
+            assert!(expand.ddl.contains(invariant), "expansion pins `{invariant}`");
+        }
     }
 
     /// **The migration set applies forward-only (no destructive DROP, no down) — the contract-1.5
@@ -667,8 +689,8 @@ mod tests {
         let migrations = issues_migrations();
         assert_eq!(
             migrations.0.len(),
-            22,
-            "11 spine-table creates + 8 concurrent indexes + 2 online expands + the authz saga ledger"
+            23,
+            "11 spine-table creates + 8 concurrent indexes + 2 issue expands + 2 authz saga migrations"
         );
         for m in &migrations.0 {
             assert!(
@@ -695,7 +717,7 @@ mod tests {
             .expect("the full Issue-Tracker spine applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            22,
+            23,
             "the runner applied every table/index/expand migration"
         );
         assert_eq!(
@@ -711,7 +733,7 @@ mod tests {
             .expect("the spine re-applies idempotently");
         assert_eq!(
             runner2.applied().len(),
-            22,
+            23,
             "the re-apply admits every migration again"
         );
     }
