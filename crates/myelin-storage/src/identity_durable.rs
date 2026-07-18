@@ -397,6 +397,70 @@ impl DurablePrincipalBacking {
             .await
     }
 
+    /// Atomically upsert a principal and its verified credential link in one tenant-scoped
+    /// transaction. A credential write failure rolls back the principal upsert as well.
+    pub async fn put_principal_and_link_credential(
+        &self,
+        tenant: &str,
+        row: DurablePrincipalRow,
+        link_key: &str,
+    ) -> Result<(), ProviderError> {
+        let tenant_owned = tenant.to_string();
+        let region = self.region();
+        let link_key = link_key.to_string();
+        self.provider
+            .with_tenant_tx(tenant, move |conn| {
+                Box::pin(async move {
+                    let (key_ref, nonce, ciphertext) = match &row.profile {
+                        Some(blob) => (
+                            Some(blob.key_ref.clone()),
+                            Some(blob.nonce.clone()),
+                            Some(blob.ciphertext.clone()),
+                        ),
+                        None => (None, None, None),
+                    };
+                    sqlx::query(
+                        "INSERT INTO principal \
+                           (tenant_id, region, principal_id, kind, data_role, status, \
+                            profile_key_ref, profile_nonce, profile_ciphertext) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                         ON CONFLICT (tenant_id, region, principal_id) DO UPDATE SET \
+                           kind = EXCLUDED.kind, data_role = EXCLUDED.data_role, \
+                           status = EXCLUDED.status, profile_key_ref = EXCLUDED.profile_key_ref, \
+                           profile_nonce = EXCLUDED.profile_nonce, \
+                           profile_ciphertext = EXCLUDED.profile_ciphertext",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region)
+                    .bind(&row.principal_id)
+                    .bind(&row.kind)
+                    .bind(&row.data_role)
+                    .bind(&row.status)
+                    .bind(key_ref)
+                    .bind(nonce)
+                    .bind(ciphertext)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                    sqlx::query(
+                        "INSERT INTO credential_link (tenant_id, region, link_key, principal_id) \
+                         VALUES ($1, $2, $3, $4) \
+                         ON CONFLICT (tenant_id, region, link_key) DO UPDATE SET \
+                           principal_id = EXCLUDED.principal_id",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region)
+                    .bind(&link_key)
+                    .bind(&row.principal_id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                    Ok(())
+                })
+            })
+            .await
+    }
+
     /// Read a single principal row (+ profile blob) in its `(tenant, region)` partition, or `None`.
     pub async fn get_principal(
         &self,
@@ -542,7 +606,9 @@ fn row_to_principal(r: &sqlx::postgres::PgRow) -> DurablePrincipalRow {
     let key_ref: Option<String> = r.get("profile_key_ref");
     let profile = key_ref.map(|key_ref| DurableProfileBlob {
         key_ref,
-        nonce: r.get::<Option<Vec<u8>>, _>("profile_nonce").unwrap_or_default(),
+        nonce: r
+            .get::<Option<Vec<u8>>, _>("profile_nonce")
+            .unwrap_or_default(),
         ciphertext: r
             .get::<Option<Vec<u8>>, _>("profile_ciphertext")
             .unwrap_or_default(),

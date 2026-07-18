@@ -519,6 +519,68 @@ impl PrincipalStore {
         }
     }
 
+    /// Atomically provision a profile-free principal together with its credential link. This is
+    /// the bootstrap path: callers never observe a principal row without the credential needed to
+    /// authenticate it.
+    pub fn provision_principal_credential(
+        &self,
+        scope: &TenantScope,
+        principal_id: PrincipalId,
+        kind: PrincipalKind,
+        data_role: myelin_identity::DataRole,
+        status: PrincipalStatus,
+        scheme: &str,
+        subject_key: &str,
+    ) -> Result<PrincipalRow, PrincipalError> {
+        let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
+        let row = PrincipalRow {
+            tenant: scope.tenant().clone(),
+            region: scope.region().clone(),
+            principal_id: principal_id.clone(),
+            kind,
+            profile_ref: None,
+            data_role,
+            status,
+        };
+        let link_key = Self::link_key(scheme, subject_key);
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            PrincipalBackend::Memory(inner_arc) => {
+                let part_key = Self::part_key(scope);
+                let mut inner = inner_arc.lock().unwrap_or_else(|error| error.into_inner());
+                inner
+                    .partitions
+                    .entry(part_key.clone())
+                    .or_default()
+                    .insert(principal_id.0.clone(), row.clone());
+                inner
+                    .credential_links
+                    .entry(part_key)
+                    .or_default()
+                    .insert(link_key, principal_id.0.clone());
+                Ok(row)
+            }
+            PrincipalBackend::Pg(pg) => {
+                let durable = myelin_storage::DurablePrincipalRow {
+                    principal_id: principal_id.0.clone(),
+                    kind: serde_json::to_string(&row.kind).expect("principal.kind serializes"),
+                    data_role: serde_json::to_string(&row.data_role)
+                        .expect("principal.data_role serializes"),
+                    status: serde_json::to_string(&row.status)
+                        .expect("principal.status serializes"),
+                    profile: None,
+                };
+                pg.block(pg.backing.put_principal_and_link_credential(
+                    &scope.tenant().0,
+                    durable,
+                    &link_key,
+                ))
+                .map_err(|error| PrincipalError::Storage(error.to_string()))?;
+                Ok(row)
+            }
+        }
+    }
+
     /// Seal a [`PrincipalProfile`] under the principal's per-SUBJECT DEK, returning the
     /// `(pii_key_ref, EncryptedProfile)`. Provisions the per-(tenant,region) KEK + the per-subject
     /// DEK (idempotent) and AES-256-GCM-seals the canonical profile bytes. The PII never leaves
@@ -1394,5 +1456,30 @@ mod tests {
         };
         assert_eq!(p.email, "alice@acme.test");
         assert_eq!(p.display_name, "Alice");
+    }
+
+    #[test]
+    fn bootstrap_provisioning_commits_principal_and_credential_as_one_operation() {
+        let store = PrincipalStore::new(kms());
+        let scope = scope("acme");
+        let principal_id = PrincipalId("human:mcp-operator".into());
+        store
+            .provision_principal_credential(
+                &scope,
+                principal_id.clone(),
+                PrincipalKind::Human,
+                DataRole::Controller,
+                PrincipalStatus::Active,
+                "agent",
+                "human:mcp-operator",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve_credential(&scope, "agent", "human:mcp-operator")
+                .unwrap()
+                .principal_id,
+            principal_id
+        );
     }
 }
