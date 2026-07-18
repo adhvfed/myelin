@@ -1,6 +1,5 @@
 //! **The forward-only `consumer_dedup` ledger migration for CI Trigger & Dispatch** (CI-P6 / P-349;
-//! contract 1.5 forward-only online migration; 11.1 OLTP; 12.1 the `(tenant, region)` partition key;
-//! 2.5 the dedup ledger).
+//! contract 1.5 forward-only online migration; 11.1 OLTP; 2.5 the dedup ledger).
 //!
 //! **Owning architecture doc (byte-authoritative):**
 //! `planning/04-subsystem-architectures/continuous-integration/architecture/01-tech-and-data-model.md`
@@ -8,30 +7,18 @@
 //! Trigger & Dispatch dedups on the triggering `event_id` so one push = one run). Trigger & Dispatch
 //! is "stateless except the dedup ledger" (arch 00 §4) — this is the ONE table it owns.
 //!
-//! ## What CI-P6 ships here — the table SHAPE, forward-only, RLS-ready (NOT the dedup logic)
-//! The `consumer_dedup` table is created exactly as frozen in arch 01 §3.8, as a **forward-only**
-//! migration (contract 1.5; no DROP) through the substrate framework so the boot-time RUNNER applies
-//! it AND the `forward-only-migration` lint reads it at source-scan. It is:
-//! - **`(tenant_id, region)`-first** (the partition prefix, contract 12.1) — the tenant-predicate
-//!   floor; the dedup PRIMARY KEY is `(consumer, event_id)` (the exactly-once-effect key), and the
-//!   row carries `tenant_id`/`region` as the leading partition columns so RLS isolates it;
-//! - **RLS-enforced** via the platform-wide `myelin_make_tenant_scoped(...)` convention (one helper,
-//!   no forked policy — EI-01 §7).
-//!
-//! ## Reconciliation: the §3.8 column name vs the platform RLS convention (documented deviation)
-//! Architecture §3.8 names the partition column `tenant uuid`; the platform-wide RLS helper binds
-//! its `(tenant_id, region)` isolation policy to `tenant_id text` + `region text` (storage §3.1).
-//! These migrations name the columns **`tenant_id text` + `region text`** (the convention's exact
-//! names) — the same deliberate, documented deviation `myelin-refs-service` / `myelin-knowledge`
-//! record (EI-01 §1: the convention wins over the literal column name so the RLS floor is the SAME
-//! one Postgres enforces for every tenant table).
+//! ## One shared schema authority
+//! The platform foundation already owns `consumer_dedup`; Dispatch must not fork that table. This
+//! module therefore reuses [`myelin_events::CONSUMER_DEDUP_MIGRATION`] byte-for-byte. The shared
+//! ledger is intentionally keyed only by `(consumer, event_id)` and carries `recorded_at`: the
+//! consumer name is deployment-unique and the event id is globally stable, so this infrastructure
+//! idempotency table is not tenant-queryable application data and does not use tenant RLS.
 //!
 //! ## The exactly-once-effect key (arch 01 §3.8 / contract 2.5)
 //! `PRIMARY KEY (consumer, event_id)` is the dedup anchor: an `INSERT … ON CONFLICT (consumer,
 //! event_id) DO NOTHING` makes the trigger handler idempotent — one push (= one triggering
 //! `event_id`) yields exactly one run even under the bus's at-least-once redelivery. The
-//! `(tenant_id, region)` columns lead the row (the partition prefix + RLS key); the dedup key is
-//! `(consumer, event_id)` per the frozen platform consumer template (contract 2.5).
+//! row also records `recorded_at` per the frozen platform consumer template (contract 2.5).
 //!
 //! ## Floor named (VISION §3 / prompt DoD)
 //! **This is the SCHEMA ONLY.** The dedup LOGIC — the `EventMatcher` (= `QueryAst`) match + the
@@ -49,41 +36,18 @@ pub const CONSUMER_DEDUP_TABLE: &str = "consumer_dedup";
 /// The stable, ordered, PII-free migration id for the dedup-ledger schema.
 pub const CONSUMER_DEDUP_MIGRATION_ID: &str = "ci_dispatch_0001_consumer_dedup";
 
-/// The forward-only DDL that creates the `consumer_dedup` ledger (arch 01 §3.8 shape, verbatim
-/// intent), `(tenant_id, region)`-first with the `(consumer, event_id)` exactly-once dedup PK. Held
-/// as a `&str` so it is NOT mistaken for live Rust by the lints; the migration framework carries the
-/// real DDL to the boot runner / the live integration test.
-pub const CREATE_CONSUMER_DEDUP_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS consumer_dedup (
-  tenant_id text NOT NULL,
-  region    text NOT NULL,
-  consumer  text NOT NULL,
-  event_id  text NOT NULL,
-  PRIMARY KEY (consumer, event_id)
-)";
-
-/// The RLS scoping DDL for the dedup ledger — the platform-wide `myelin_make_tenant_scoped`
-/// convention (FORCE row-level security + the `(tenant_id, region)` isolation policy). CI does NOT
-/// fork the RLS policy; it calls the ONE helper every tenant table uses (EI-01 §7).
-pub const MAKE_CONSUMER_DEDUP_TENANT_SCOPED_DDL: &str =
-    "SELECT myelin_make_tenant_scoped('consumer_dedup')";
+/// The single platform-owned forward-only DDL for `consumer_dedup`, re-exported for compatibility
+/// with CI's existing schema tests and consumers. Byte identity is load-bearing: the durable
+/// [`myelin_storage::events_durable::DurableDedupBacking`] binds this exact shared shape.
+pub const CREATE_CONSUMER_DEDUP_DDL: &str = myelin_events::CONSUMER_DEDUP_MIGRATION;
 
 /// **The CI Trigger & Dispatch forward-only migration set** (contract 1.5 / 2.5; arch 01 §3.8). ONE
-/// [`Migration`] (`Plain` — a CREATE on an empty table): the `consumer_dedup` ledger create + the
-/// platform RLS scoping, assembled into one forward DDL. The runner applies it forward-only at boot;
-/// the `forward-only-migration` lint reads the same DDL at source-scan.
+/// [`Migration`] (`Plain` — a CREATE on an empty table), using the foundation-owned DDL without a
+/// competing Dispatch-local schema or policy.
 pub fn dispatch_migrations() -> Migrations {
-    let mut ddl = String::from(CREATE_CONSUMER_DEDUP_DDL);
-    ddl.push(';');
-    ddl.push('\n');
-    ddl.push_str(MAKE_CONSUMER_DEDUP_TENANT_SCOPED_DDL);
-    ddl.push(';');
-    // The substrate `Migration` holds `&'static str`; the set is built once at boot/serve, so this
-    // is a one-time, bounded leak — the same shape the framework + refs-service expect.
-    let ddl: &'static str = Box::leak(ddl.into_boxed_str());
     Migrations::of([Migration::plain_on(
         CONSUMER_DEDUP_MIGRATION_ID,
-        ddl,
+        CREATE_CONSUMER_DEDUP_DDL,
         CONSUMER_DEDUP_TABLE,
     )])
 }
@@ -92,29 +56,25 @@ pub fn dispatch_migrations() -> Migrations {
 mod tests {
     use super::*;
 
-    /// **The dedup ledger is the §3.8 shape: `(tenant_id, region)`-first with the `(consumer,
-    /// event_id)` exactly-once PK.** The partition prefix leads the row; the dedup key is the
-    /// platform consumer template's `(consumer, event_id)` (contract 2.5).
+    /// **Dispatch uses the platform §2.5 shape byte-for-byte.**
     #[test]
-    fn the_dedup_ledger_is_the_3_8_shape() {
+    fn the_dedup_ledger_is_the_shared_foundation_shape() {
         let ddl = CREATE_CONSUMER_DEDUP_DDL;
-        for col in ["tenant_id", "region", "consumer", "event_id"] {
+        assert_eq!(ddl, myelin_events::CONSUMER_DEDUP_MIGRATION);
+        for col in ["consumer", "event_id", "recorded_at"] {
             assert!(ddl.contains(col), "the §3.8 column `{col}` is declared");
         }
-        let tenant_pos = ddl.find("tenant_id").unwrap();
-        let region_pos = ddl.find("region").unwrap();
-        assert!(tenant_pos < region_pos, "tenant_id is the FIRST column");
         assert!(
             ddl.contains("PRIMARY KEY (consumer, event_id)"),
             "the exactly-once dedup key is (consumer, event_id) — the platform consumer template"
         );
+        assert!(!ddl.contains("tenant_id"));
+        assert!(!ddl.contains("myelin_make_tenant_scoped"));
     }
 
-    /// **The migration applies forward-only (no DROP) + installs the RLS policy (contract 1.5).**
-    /// One forward migration; `is_destructive` is false; the platform RLS scoping rides it. The
-    /// runner / lint enforce this at boot / source-scan; this is the in-module proof.
+    /// **The migration applies the single shared forward-only DDL (contract 1.5).**
     #[test]
-    fn the_migration_is_forward_only_and_rls_scoped() {
+    fn the_migration_is_forward_only_and_byte_identical_to_foundation() {
         let migrations = dispatch_migrations();
         assert_eq!(
             migrations.0.len(),
@@ -132,11 +92,7 @@ mod tests {
             !m.ddl.to_ascii_uppercase().contains("DROP"),
             "no DROP in the dedup migration"
         );
-        assert!(
-            m.ddl
-                .contains("myelin_make_tenant_scoped('consumer_dedup')"),
-            "the RLS scoping rides the migration"
-        );
+        assert_eq!(m.ddl, myelin_events::CONSUMER_DEDUP_MIGRATION);
     }
 
     /// **The runner admits the dedup migration forward-only at boot (contract 1.5).** The substrate

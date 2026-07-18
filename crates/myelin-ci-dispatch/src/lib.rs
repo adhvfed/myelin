@@ -8,8 +8,8 @@
 //! dedup ledger"**) + §5 (cell topology); `01-tech-and-data-model.md` §3.8 (the `consumer_dedup`
 //! ledger — the platform consumer template's exactly-once-effect anchor). **Contracts:**
 //! `contract-index.md` rows 1.1 (`serve(AppSpec)` — the service shell), 1.2/1.3 (the three ports +
-//! liveness ≠ readiness), 1.5 (the forward-only migration), 11.1 (OLTP), 12.1 (the `(tenant,
-//! region)` partition key), 2.5 (the dedup ledger — one push = one run, exactly-once effect).
+//! liveness ≠ readiness), 1.5 (the forward-only migration), 11.1 (OLTP), and 2.5 (the dedup
+//! ledger — one push = one run, exactly-once effect).
 //!
 //! ## What CI-P6 ships here — the bootable SHELL + the dedup-ledger schema, NOT the dispatch logic
 //! [`dispatch_app_spec`] assembles the Trigger & Dispatch [`AppSpec`] the harness's ONE call drives
@@ -18,8 +18,8 @@
 //! / Refs / Identity / CI-Control-Plane shells. The shell:
 //!   - declares the **three ports** (public / internal / metrics-health) via the harness (1.2/1.3) —
 //!     liveness must not check deps; readiness gates on the DB pool + the declared critical deps;
-//!   - runs the **forward-only migration** for the ONE table this service owns: the `consumer_dedup`
-//!     ledger ([`migrations::dispatch_migrations`]) — `(tenant_id, region)`-first + RLS-on, the
+//!   - repeats the foundation-owned **forward-only migration** for `consumer_dedup`
+//!     ([`migrations::dispatch_migrations`]) byte-for-byte — one schema authority for the
 //!     exactly-once-effect anchor (contract 2.5);
 //!   - declares its critical downstreams (`broker` — the bus it consumes triggering events from and
 //!     starts the workflow on; `authz` — the ReBAC `read & !is_untrusted_fork` edge the trust-tier
@@ -63,7 +63,7 @@
 //!
 //! ## DB-free by default; the live-stack proof behind `integration`
 //! `cargo build --workspace` / `cargo test --workspace` stay DB-free. The REAL forward-only apply
-//! against the dev-stack Postgres (RLS isolation + the exactly-once PRIMARY KEY) is
+//! against the dev-stack Postgres (shared-schema byte identity + the exactly-once PRIMARY KEY) is
 //! `tests/integration_ci_p6_dispatch_schema.rs` behind the `integration` cargo feature.
 
 pub mod config;
@@ -165,8 +165,8 @@ fn dispatch_critical() -> CriticalDependencies {
 /// hand-rolled `main`.
 ///
 /// `config` is the validated, env-first config (§3.2; `Config::from_env()` lands with the driver,
-/// P-S15). The forward-only migration creates the `consumer_dedup` ledger `(tenant, region)`-first
-/// and RLS-on; `broker` / `authz` are declared critical. No consumers are registered at the SHELL —
+/// P-S15). The forward-only declaration reuses the foundation-owned `consumer_dedup` DDL
+/// byte-for-byte; `broker` / `authz` are declared critical. No consumers are registered at the SHELL —
 /// the dispatch BEHAVIOUR (the [`dispatch`] module's `EventMatcher` + dedup + trust stamp) is
 /// CI-P10's pure core; the bus-subscription consumer that drives it on each triggering event is
 /// wired in with CI-P11's reserve/start. This shell carries the ledger SHAPE the idempotency rides.
@@ -352,12 +352,12 @@ mod tests {
         assert_eq!(
             spec.migrations.0.len(),
             1,
-            "the dedup ledger is the one table Trigger & Dispatch owns"
+            "Dispatch repeats the one foundation-owned dedup declaration"
         );
         assert_eq!(
             spec.migrations.0[0].table,
             Some(CONSUMER_DEDUP_TABLE),
-            "the migration creates the consumer_dedup ledger"
+            "the migration declares the shared consumer_dedup ledger"
         );
         assert_eq!(
             spec.consumers.len(),
