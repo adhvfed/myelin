@@ -64,6 +64,7 @@ myelin-substrate = { path = "../myelin-substrate" }
 myelin-events = { path = "../myelin-events" }
 # serde_json — the EventDraft payload is a serde_json::Value (the WfCtx emit surface consumes it).
 serde_json = { workspace = true }
+blake3 = { workspace = true }
 # The reserve/settle cost gate (contract 11.7 CONSUMED, storage.md §9): CostLedger / MinorUnits /
 # RunId / ReserveError / MeteredUnit / SettleOutcome — the durable per-tenant reserve/settle ledger
 # the BudgetGate bookend (src/budget.rs, P-FLOW-16) reserves-at-dispatch / settles-on-completion

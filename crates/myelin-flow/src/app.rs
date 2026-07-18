@@ -323,8 +323,8 @@ mod tests {
         );
         assert_eq!(
             spec.migrations.0.len(),
-            8,
-            "six table creates plus two online workflow control expands"
+            10,
+            "six table creates plus four online workflow control/drive expands"
         );
         assert_eq!(
             spec.migrations,
@@ -467,7 +467,7 @@ mod tests {
         // Engine wiring does not add a second schema.
         assert_eq!(
             spec.migrations.0.len(),
-            8,
+            10,
             "the engine-wired spec keeps the schema and online control expands"
         );
 

@@ -7,6 +7,7 @@ use myelin_flow::{
     migrations::migrations, DurableExecutor, ExecutorError, PgFlowExecutor, RunId, SignalOutcome,
     SignalSpec, StartSpec,
 };
+use myelin_refs::ArtifactRef;
 use myelin_storage::{HotTables, PgMigrator};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool};
@@ -151,6 +152,60 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
         "signal insertion atomically wakes the run"
     );
 
+    let mut divergent_payload = signal();
+    divergent_payload.payload = vec![ArtifactRef("myelin://acme/ci/artifact/divergent".into())];
+    let divergent_payload_result =
+        tokio::task::block_in_place(|| restarted.signal(divergent_payload));
+    assert!(
+        matches!(
+            &divergent_payload_result,
+            Err(ExecutorError::InvalidInput(message))
+                if message.contains("divergent payload")
+        ),
+        "unexpected divergent payload result: {divergent_payload_result:?}"
+    );
+    let mut divergent_key_ref = signal();
+    divergent_key_ref.payload_key_ref = Some("kms://acme/0/subject:signal-owner".into());
+    assert!(matches!(
+        tokio::task::block_in_place(|| restarted.signal(divergent_key_ref)),
+        Err(ExecutorError::InvalidInput(message))
+            if message.contains("divergent payload")
+    ));
+
+    // Once history has consumed this exact signal, its at-least-once replay remains a successful
+    // Duplicate but cannot wake the run again.
+    sqlx::query(
+        "UPDATE wf_signal SET consumed_seq = 5 WHERE tenant_id = $1 AND region = $2 AND run_id = $3 \
+         AND signal_name = 'job.done' AND idem_key = 'job-token-1'",
+    )
+    .bind("acme")
+    .bind("fr-par")
+    .bind(&run.0)
+    .execute(&pool)
+    .await
+    .expect("mark the signal consumed");
+    sqlx::query(
+        "UPDATE workflow_run SET state = 'waiting' WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+    )
+    .bind("acme")
+    .bind("fr-par")
+    .bind(&run.0)
+    .execute(&pool)
+    .await
+    .expect("park after consuming the signal");
+    assert_eq!(
+        tokio::task::block_in_place(|| restarted.signal(signal()))
+            .expect("consumed exact duplicate remains idempotent"),
+        SignalOutcome::Duplicate
+    );
+    assert_eq!(
+        tokio::task::block_in_place(|| restarted.describe(&run))
+            .expect("describe after consumed duplicate")
+            .state,
+        "waiting",
+        "a consumed duplicate must not resurrect a parked run"
+    );
+
     tokio::task::block_in_place(|| restarted.cancel(&run, "operator_requested"))
         .expect("persist cancellation");
     drop(restarted);
@@ -161,6 +216,21 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
     assert_eq!(status.state, "terminated");
     tokio::task::block_in_place(|| after_second_restart.cancel(&run, "duplicate"))
         .expect("terminal cancellation is idempotent");
+    assert!(matches!(
+        tokio::task::block_in_place(|| after_second_restart.signal(signal())),
+        Err(ExecutorError::InvalidInput(message))
+            if message.contains("terminal workflow run")
+    ));
+    let signal_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wf_signal WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+    )
+    .bind("acme")
+    .bind("fr-par")
+    .bind(&run.0)
+    .fetch_one(&pool)
+    .await
+    .expect("count immutable terminal signal rows");
+    assert_eq!(signal_count, 1, "terminal delivery mutates no signal rows");
 
     let other_tenant = executor(&pool, "other");
     assert_eq!(

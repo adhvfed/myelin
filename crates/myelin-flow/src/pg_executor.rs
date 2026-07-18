@@ -1,9 +1,11 @@
 //! PostgreSQL-backed durable workflow control surface.
 //!
 //! This module persists the externally visible control operations (`start`, `signal`, `describe`,
-//! and `cancel`) and the versioned definition registry. It intentionally does not claim that the
-//! workflow body is production-drivable yet: journal, attempts, timers, run state, and outbox still
-//! need one transaction boundary before the service may activate the durable dispatcher.
+//! and `cancel`) and the versioned definition registry. [`crate::pg_drive_store::PgFlowDriveStore`]
+//! now supplies the fenced PostgreSQL lease/load/commit boundary for journal, attempts, signals,
+//! timers, run state, and outbox. The remaining activation seam is a dispatcher adapter that turns
+//! a deterministic workflow body's staged commands into that durable commit batch; this control
+//! surface does not silently fall back to the in-memory engine.
 
 use crate::engine::run_state;
 use crate::executor::{
@@ -11,7 +13,7 @@ use crate::executor::{
     SignalSpec, StartSpec,
 };
 use myelin_events::IdMinter;
-use myelin_storage::{with_tenant_tx, PgError};
+use myelin_storage::{with_tenant_tx, with_tenant_tx_error, PgError};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::postgres::PgPool;
 use sqlx::Row;
@@ -29,6 +31,19 @@ fn bridge<F: Future>(rt: &tokio::runtime::Handle, future: F) -> F::Output {
 
 fn store_error(operation: &str, error: impl std::fmt::Display) -> ExecutorError {
     ExecutorError::Storage(format!("{operation}: {error}"))
+}
+
+enum SignalStoreError {
+    UnknownRun,
+    TerminalRun,
+    DivergentReplay,
+    Storage(PgError),
+}
+
+impl From<PgError> for SignalStoreError {
+    fn from(error: PgError) -> Self {
+        Self::Storage(error)
+    }
 }
 
 fn bounded(label: &str, value: &str, max: usize) -> Result<(), ExecutorError> {
@@ -300,21 +315,31 @@ impl PgFlowExecutor {
         let tenant = scope_tenant.clone();
         let region = scope_region.clone();
         let run_id = spec.run.0.clone();
+        let error_run_id = run_id.clone();
         let payload = serde_json::to_string(&spec.payload)
             .map_err(|e| store_error("encode signal payload refs", e))?;
-        let outcome = with_tenant_tx(&self.pool, &scope_tenant, &scope_region, move |conn| {
+        let expected_payload = serde_json::to_value(&spec.payload)
+            .map_err(|e| store_error("encode signal payload refs", e))?;
+        with_tenant_tx_error(&self.pool, &scope_tenant, &scope_region, move |conn| {
             Box::pin(async move {
-                let exists = sqlx::query_scalar::<_, i32>(
-                    "SELECT 1 FROM workflow_run WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+                // Serialise signal delivery against drive commits/cancellation and pin the lifecycle
+                // decision in the same transaction as insertion. Terminal history is immutable.
+                let state = sqlx::query_scalar::<_, String>(
+                    "SELECT state FROM workflow_run WHERE tenant_id = $1 AND region = $2 AND run_id = $3 FOR UPDATE",
                 )
                 .bind(&tenant)
                 .bind(&region)
                 .bind(&run_id)
                 .fetch_optional(&mut *conn)
                 .await
-                .map_err(|e| PgError::Query(format!("find signal target run: {e}")))?;
-                if exists.is_none() {
-                    return Ok(None);
+                .map_err(|e| {
+                    PgError::Query(format!("lock signal target run: {e}"))
+                })?;
+                let Some(state) = state else {
+                    return Err(SignalStoreError::UnknownRun);
+                };
+                if run_state::is_terminal(&state) {
+                    return Err(SignalStoreError::TerminalRun);
                 }
 
                 let inserted = sqlx::query(
@@ -333,28 +358,74 @@ impl PgFlowExecutor {
                 .await
                 .map_err(|e| PgError::Query(format!("buffer durable workflow signal: {e}")))?;
 
+                let first_delivery = inserted.rows_affected() == 1;
+                let should_wake = if first_delivery {
+                    true
+                } else {
+                    let existing = sqlx::query(
+                        "SELECT payload, payload_key_ref, consumed_seq FROM wf_signal \
+                         WHERE tenant_id = $1 AND region = $2 AND run_id = $3 \
+                         AND signal_name = $4 AND idem_key = $5",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(&run_id)
+                    .bind(&spec.signal_name)
+                    .bind(&spec.idem_key)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        PgError::Query(format!("verify duplicate durable workflow signal: {e}"))
+                    })?;
+                    let stored_payload: serde_json::Value = existing.try_get("payload").map_err(|e| {
+                        PgError::Query(format!("decode duplicate signal payload: {e}"))
+                    })?;
+                    let stored_key_ref: Option<String> = existing
+                        .try_get("payload_key_ref")
+                        .map_err(|e| PgError::Query(format!("decode duplicate signal key ref: {e}")))?;
+                    let consumed_seq: Option<i64> = existing
+                        .try_get("consumed_seq")
+                        .map_err(|e| PgError::Query(format!("decode duplicate signal state: {e}")))?;
+                    if stored_payload != expected_payload || stored_key_ref != spec.payload_key_ref {
+                        return Err(SignalStoreError::DivergentReplay);
+                    }
+                    consumed_seq.is_none()
+                };
+
                 // Signal insertion and waiting→running wake are one transaction: a crash cannot
-                // leave a durable signal parked behind a sleeping run.
-                sqlx::query(
-                    "UPDATE workflow_run SET state = 'running', updated_at = now() \
-                     WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND state = 'waiting'",
-                )
-                .bind(&tenant)
-                .bind(&region)
-                .bind(&run_id)
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| PgError::Query(format!("wake signalled workflow run: {e}")))?;
-                Ok(Some(if inserted.rows_affected() == 1 {
+                // leave a new/pending durable signal parked behind a sleeping run. A duplicate
+                // already consumed by history is observational only and must never resurrect it.
+                if should_wake {
+                    sqlx::query(
+                        "UPDATE workflow_run SET state = 'running', updated_at = now() \
+                         WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND state = 'waiting'",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(&run_id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| PgError::Query(format!("wake signalled workflow run: {e}")))?;
+                }
+                Ok(if first_delivery {
                     SignalOutcome::Buffered
                 } else {
                     SignalOutcome::Duplicate
-                }))
+                })
             })
         })
         .await
-        .map_err(|e| store_error("signal workflow", e))?;
-        outcome.ok_or(ExecutorError::UnknownRun(spec.run.0))
+        .map_err(|error| match error {
+            SignalStoreError::UnknownRun => ExecutorError::UnknownRun(error_run_id),
+            SignalStoreError::TerminalRun => ExecutorError::InvalidInput(
+                "signals cannot target a terminal workflow run".into(),
+            ),
+            SignalStoreError::DivergentReplay => ExecutorError::InvalidInput(
+                "signal idempotency key was reused with a divergent payload or payload key reference"
+                    .into(),
+            ),
+            SignalStoreError::Storage(error) => store_error("signal workflow", error),
+        })
     }
 
     async fn describe_async(&self, run: &RunId) -> Result<RunStatus, ExecutorError> {

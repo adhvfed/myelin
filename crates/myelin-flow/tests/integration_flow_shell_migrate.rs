@@ -48,8 +48,8 @@ async fn flow_shell_migration_set_applies_against_live_postgres() {
     assert_eq!(spec.name, SERVICE_NAME);
     assert_eq!(
         spec.migrations.0.len(),
-        8,
-        "six table creates plus two online workflow control expands"
+        10,
+        "six table creates plus four online workflow control/drive expands"
     );
 
     // A per-process schema so concurrent test runs isolate + cleanup is a single DROP SCHEMA. All
