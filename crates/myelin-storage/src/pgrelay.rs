@@ -295,6 +295,39 @@ impl PgRelay {
         PgRelay { pool }
     }
 
+    /// Validate an unpublished staged row with the same strict authority used by the elected relay
+    /// before a domain transaction accepts it. This keeps malformed taxonomy, cross-tenant actor or
+    /// subject authority, PII-key mismatch, wrong-region events, and oversized envelopes out of the
+    /// durable outbox instead of relying on later quarantine as the first line of defence.
+    pub fn validate_staged_row(
+        row: &OutboxRow,
+        region: &Region,
+        max_envelope_bytes: usize,
+    ) -> Result<(), PgError> {
+        Self::validate_staged_shape(row)?;
+        let config = RelayValidationConfig::new(region.clone(), max_envelope_bytes)
+            .map_err(|e| PgError::Query(format!("invalid staged outbox validation config: {e}")))?;
+        let payload = serde_json::to_value(&row.envelope)
+            .map_err(|e| PgError::Query(format!("serialize staged outbox envelope: {e}")))?;
+        validate_claimed_row(
+            &ClaimedRow {
+                event_id: row.event_id.0.clone(),
+                aggregate: row.aggregate.0.clone(),
+                seq: 0,
+                subject: row.subject.0.clone(),
+                payload,
+            },
+            &config,
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            PgError::Query(format!(
+                "invalid staged outbox row ({}): {}",
+                error.code, error.detail
+            ))
+        })
+    }
+
     /// Insert an outbox row in the frozen `outbox` table shape: the envelope as JSONB,
     /// `published_at` NULL (so the relay's unsent index claims it). `aggregate`/`seq` carry the
     /// per-aggregate ordering key (`UNIQUE(aggregate, seq)`).
@@ -339,9 +372,17 @@ impl PgRelay {
         aggregate: &str,
         envelope: &EventEnvelope,
     ) -> Result<(), PgError> {
+        Self::insert_envelope_in_tx(conn, aggregate, envelope).await
+    }
+
+    async fn insert_envelope_in_tx(
+        conn: &mut sqlx::PgConnection,
+        aggregate: &str,
+        envelope: &EventEnvelope,
+    ) -> Result<(), PgError> {
         let payload = serde_json::to_value(envelope)
             .map_err(|e| PgError::Query(format!("serialize envelope: {e}")))?;
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO outbox (event_id, aggregate, seq, subject, envelope) \
              VALUES ($1, $2, COALESCE((SELECT MAX(seq) + 1 FROM outbox WHERE aggregate = $2), 0), \
              $3, $4) ON CONFLICT (event_id) DO NOTHING",
@@ -349,10 +390,87 @@ impl PgRelay {
         .bind(&envelope.event_id.0)
         .bind(aggregate)
         .bind(&envelope.subject.0)
-        .bind(payload)
-        .execute(conn)
+        .bind(&payload)
+        .execute(&mut *conn)
         .await
         .map_err(|e| PgError::Query(e.to_string()))?;
+        if inserted.rows_affected() == 0 {
+            let existing =
+                sqlx::query("SELECT aggregate, subject, envelope FROM outbox WHERE event_id = $1")
+                    .bind(&envelope.event_id.0)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|e| PgError::Query(format!("verify absorbed outbox row: {e}")))?;
+            let stored_aggregate: String = existing
+                .try_get("aggregate")
+                .map_err(|e| PgError::Query(format!("decode absorbed aggregate: {e}")))?;
+            let stored_subject: String = existing
+                .try_get("subject")
+                .map_err(|e| PgError::Query(format!("decode absorbed subject: {e}")))?;
+            let stored_envelope: serde_json::Value = existing
+                .try_get("envelope")
+                .map_err(|e| PgError::Query(format!("decode absorbed envelope: {e}")))?;
+            if stored_aggregate != aggregate
+                || stored_subject != envelope.subject.0
+                || stored_envelope != payload
+            {
+                return Err(PgError::Query(format!(
+                    "outbox event_id {} already exists with divergent aggregate, subject, or envelope",
+                    envelope.event_id.0
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Co-commit staged [`OutboxRow`]s into a caller-owned domain transaction. This is the batch
+    /// form durable workflow/state stores use: it preserves the relay's in-transaction per-aggregate
+    /// sequence allocation, serialises each aggregate with a transaction advisory lock so a domain
+    /// transaction cannot be left aborted by an avoidable sequence race, and absorbs only an exact
+    /// deterministic `event_id` replay. A divergent replay fails closed and rolls the caller's whole
+    /// transaction back.
+    pub async fn co_commit_rows_in_tx(
+        conn: &mut sqlx::PgConnection,
+        rows: &[OutboxRow],
+    ) -> Result<(), PgError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        for row in rows {
+            Self::validate_staged_shape(row)?;
+        }
+
+        let mut aggregates: Vec<&str> = rows.iter().map(|row| row.aggregate.0.as_str()).collect();
+        aggregates.sort_unstable();
+        aggregates.dedup();
+        for aggregate in aggregates {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(aggregate)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| PgError::Query(format!("lock outbox aggregate {aggregate}: {e}")))?;
+        }
+
+        for row in rows {
+            Self::insert_envelope_in_tx(conn, &row.aggregate.0, &row.envelope).await?;
+        }
+        Ok(())
+    }
+
+    fn validate_staged_shape(row: &OutboxRow) -> Result<(), PgError> {
+        if row.event_id != row.envelope.event_id
+            || row.aggregate != row.envelope.aggregate
+            || row.subject != row.envelope.subject
+            || row.seq != 0
+            || row.published_at.is_some()
+            || row.attempts != 0
+        {
+            return Err(PgError::Query(format!(
+                "staged outbox row {} does not match its canonical envelope, has a preallocated sequence, or is already published",
+                row.event_id.0
+            )));
+        }
         Ok(())
     }
 
@@ -803,7 +921,8 @@ impl PgRelay {
             }
         }
         Err(PgError::Query(
-            "outbox commit_staged exhausted seq-contention retries (hot-aggregate livelock?)".into(),
+            "outbox commit_staged exhausted seq-contention retries (hot-aggregate livelock?)"
+                .into(),
         ))
     }
 
@@ -874,7 +993,7 @@ impl PgRelay {
                         "outbox event_id {id} already present with a DIFFERENT payload — a genuine \
                          collision (absorb-mode verifies payload equality; a deterministic re-emit is \
                          byte-identical and is absorbed, this is not)"
-                    )))
+                    )));
                 }
                 CommitAttempt::Db(e) => return Err(e),
             }
@@ -924,7 +1043,8 @@ impl PgRelay {
                         .fetch_one(&mut *tx)
                         .await;
                 match existing {
-                    Ok(stored) if stored == payload => { /* byte-identical deterministic re-emit — absorb. */ }
+                    Ok(stored) if stored == payload => { /* byte-identical deterministic re-emit — absorb. */
+                    }
                     Ok(_) => return CommitAttempt::DuplicateEventId(row.event_id.0.clone()),
                     Err(e) => return CommitAttempt::Db(PgError::Query(e.to_string())),
                 }
@@ -1138,8 +1258,7 @@ mod validation_config_tests {
         assert_eq!(reason(&malformed_subject), "invalid_artifact_ref");
 
         let mut noncanonical_subject = envelope();
-        noncanonical_subject.subject =
-            ArtifactRef("myelin://acme/issue/issue/one#step-01".into());
+        noncanonical_subject.subject = ArtifactRef("myelin://acme/issue/issue/one#step-01".into());
         assert_eq!(reason(&noncanonical_subject), "invalid_artifact_ref");
 
         let mut cross_tenant_subject = envelope();
@@ -1152,5 +1271,25 @@ mod validation_config_tests {
         let mut zero = envelope();
         zero.schema_ver = 0;
         assert_eq!(reason(&zero), "invalid_schema_version");
+    }
+
+    #[test]
+    fn staged_rows_cannot_bypass_in_transaction_sequence_allocation() {
+        let envelope = envelope();
+        let mut row = OutboxRow {
+            event_id: envelope.event_id.clone(),
+            aggregate: envelope.aggregate.clone(),
+            seq: 0,
+            subject: envelope.subject.clone(),
+            envelope,
+            published_at: None,
+            attempts: 0,
+        };
+        assert!(PgRelay::validate_staged_shape(&row).is_ok());
+
+        row.seq = 7;
+        let error = PgRelay::validate_staged_shape(&row)
+            .expect_err("a staged caller must not preallocate the relay sequence");
+        assert!(error.to_string().contains("preallocated sequence"));
     }
 }
