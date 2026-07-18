@@ -2776,6 +2776,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-migration-audit"
+version = "0.0.0"
+dependencies = [
+ "myelin-ci-controlplane",
+ "myelin-ci-dispatch",
+ "myelin-config",
+ "myelin-flow",
+ "myelin-identity-service",
+ "myelin-issues",
+ "myelin-knowledge",
+ "myelin-notif",
+ "myelin-search",
+ "myelin-storage",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "myelin-notif"
 version = "0.0.0"
 dependencies = [
