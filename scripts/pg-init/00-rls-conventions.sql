@@ -5,7 +5,8 @@
 -- is enforced in Postgres, not just in app code). This script does NOT create the
 -- domain tables — each service owns its own schema/migrations (the no-cross-db rule).
 -- It creates:
---   1. a non-superuser application role that does NOT bypass RLS;
+--   1. non-superuser runtime roles that do NOT bypass RLS: the tenant application role and a
+--      dedicated region-scheduler capability + constrained dev login;
 --   2. a session GUC convention (myelin.tenant_id / myelin.region) the app sets per
 --      transaction so RLS policies can reference current_setting(...);
 --   3. a helper that every tenant-scoped migration calls to make a table RLS-ready
@@ -30,6 +31,31 @@ $$;
 GRANT CONNECT ON DATABASE myelin TO myelin_app;
 GRANT USAGE ON SCHEMA public TO myelin_app;
 
+-- The cross-tenant CI scheduler is a distinct least-privilege capability. The NOLOGIN role is the
+-- policy/grant target; the dev LOGIN inherits it but cannot SET ROLE to it, preserving session_user
+-- as the connection identity the scheduler-region mapping keys on.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'myelin_ci_region_scheduler') THEN
+    CREATE ROLE myelin_ci_region_scheduler NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'myelin_ci_scheduler_fr_par') THEN
+    CREATE ROLE myelin_ci_scheduler_fr_par LOGIN PASSWORD 'myelin_ci_scheduler_dev_pw'
+      NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE INHERIT;
+  END IF;
+END
+$$;
+
+ALTER ROLE myelin_ci_region_scheduler
+  NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
+ALTER ROLE myelin_ci_scheduler_fr_par
+  LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE INHERIT;
+GRANT myelin_ci_region_scheduler TO myelin_ci_scheduler_fr_par
+  WITH INHERIT TRUE, SET FALSE;
+REVOKE myelin_ci_region_scheduler FROM myelin_app;
+GRANT CONNECT ON DATABASE myelin TO myelin_ci_scheduler_fr_par;
+GRANT USAGE ON SCHEMA public TO myelin_ci_region_scheduler;
+
 -- Future tables/sequences created by the owner (myelin_admin) are usable by the app role.
 ALTER DEFAULT PRIVILEGES FOR ROLE myelin_admin IN SCHEMA public
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO myelin_app;
@@ -43,6 +69,41 @@ ALTER DEFAULT PRIVILEGES FOR ROLE myelin_admin IN SCHEMA public
 --    We register the custom GUC namespace so a fresh session reads '' (not an error).
 ALTER DATABASE myelin SET myelin.tenant_id TO '';
 ALTER DATABASE myelin SET myelin.region TO '';
+
+-- A scheduler's residency authority is server-owned, not a client-selected GUC. The private mapping
+-- is keyed by session_user (the authenticated LOGIN remains stable across SECURITY DEFINER/SET ROLE)
+-- and can be read only through the fixed-search-path function. `myelin.region` remains a required
+-- transaction-local corroborating pin; it is never sufficient on its own.
+BEGIN;
+CREATE TABLE IF NOT EXISTS public.myelin_ci_scheduler_region_map (
+  session_role name PRIMARY KEY,
+  region       text NOT NULL CHECK (region <> '')
+);
+ALTER TABLE public.myelin_ci_scheduler_region_map OWNER TO myelin_admin;
+REVOKE ALL ON TABLE public.myelin_ci_scheduler_region_map FROM PUBLIC;
+REVOKE ALL ON TABLE public.myelin_ci_scheduler_region_map FROM myelin_app;
+REVOKE ALL ON TABLE public.myelin_ci_scheduler_region_map FROM myelin_ci_region_scheduler;
+REVOKE ALL ON TABLE public.myelin_ci_scheduler_region_map FROM myelin_ci_scheduler_fr_par;
+
+INSERT INTO public.myelin_ci_scheduler_region_map (session_role, region)
+VALUES ('myelin_ci_scheduler_fr_par', 'fr-par')
+ON CONFLICT (session_role) DO UPDATE SET region = EXCLUDED.region;
+
+CREATE OR REPLACE FUNCTION public.myelin_ci_scheduler_region()
+RETURNS text
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+  SELECT mapping.region
+    FROM public.myelin_ci_scheduler_region_map AS mapping
+   WHERE mapping.session_role = session_user::name
+$$;
+ALTER FUNCTION public.myelin_ci_scheduler_region() OWNER TO myelin_admin;
+REVOKE ALL ON FUNCTION public.myelin_ci_scheduler_region() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.myelin_ci_scheduler_region() TO myelin_ci_region_scheduler;
+COMMIT;
 
 -- 3. The convention helper a tenant-scoped migration calls once per table. It makes the
 --    table RLS-ready: ENABLE + FORCE (so even the table owner is subject to policies),
