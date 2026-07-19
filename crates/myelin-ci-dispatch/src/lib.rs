@@ -73,15 +73,15 @@ pub mod migrations;
 pub mod resolve;
 
 pub use config::{
-    parse_ci_config, parse_versioned_ci_config, CiConfigError, ConfigFormat,
-    VersionedCiConfigError,
+    parse_ci_config, parse_versioned_ci_config, CiConfigError, ConfigFormat, VersionedCiConfigError,
 };
 
 pub use consumer::{
-    build_trigger_consumer, ci_run_insert_from_armed, plan_dispatch, resolve_ci_config, ArmedRun,
-    CiTriggerHandler, CoCommitReserveStore, DispatchOutcome, DurableGitConfigReader,
-    GitConfigReader, GitReadError, OutboxReserveStore, ReserveError, ReserveFacts, ReserveStore,
-    SkipReason, ci_trigger_subjects, CI_TRIGGER_SUBJECT_STRS,
+    build_trigger_consumer, ci_run_insert_from_armed, ci_trigger_subjects, plan_dispatch,
+    resolve_ci_config, ArmedRun, AuthoritativeGitRoot, CiTriggerHandler, CoCommitReserveStore,
+    DispatchOutcome, DurableGitConfigReader, GitConfigReader, GitReadError, GitRootError,
+    OutboxReserveStore, ReserveError, ReserveFacts, ReserveStore, SkipReason,
+    CI_TRIGGER_SUBJECT_STRS,
 };
 
 pub use dispatch::{
@@ -133,23 +133,34 @@ pub const SERVICE_NAME: &str = "ci-dispatch";
 ///   deploy; `git_root` is the `MYELIN_GIT_ROOT` the caller resolves, mirroring `myelin-edge` main).
 /// - **dedup** = the caller's durable [`DedupLedger`] (the exactly-once effect anchor).
 pub fn build_dispatch_consumers(
-    git_root: impl Into<std::path::PathBuf>,
+    git_root: AuthoritativeGitRoot,
     s3: &myelin_config::S3Config,
     ci_run: myelin_ci_controlplane::CiRunStore,
     outbox: myelin_events::OutboxStore,
     dedup: myelin_events::DedupLedger,
+    dead_letters: std::sync::Arc<dyn myelin_events::DurableDeadLetter>,
+    expected_region: impl Into<String>,
     minter: std::sync::Arc<dyn myelin_events::IdMinter>,
     rt: tokio::runtime::Handle,
 ) -> Result<Vec<ConsumerReg>, myelin_events::SubscribeError> {
     use std::sync::Arc;
-    let reader: Arc<dyn consumer::GitConfigReader> = Arc::new(consumer::DurableGitConfigReader::new(
-        myelin_git::durable::DurableGitStore::rooted(git_root),
-    ));
+    let reader: Arc<dyn consumer::GitConfigReader> =
+        Arc::new(consumer::DurableGitConfigReader::new(
+            myelin_git::durable::DurableGitStore::rooted(git_root.as_path()),
+        ));
     let blobs: Arc<dyn myelin_storage::BlobStore + Send + Sync> =
         Arc::new(myelin_storage::s3blob::S3BlobStore::connect(s3, rt.clone()));
-    let reserve: Arc<dyn consumer::ReserveStore> =
-        Arc::new(consumer::CoCommitReserveStore::new(ci_run, outbox, minter, rt));
-    Ok(vec![build_trigger_consumer(reader, blobs, reserve, dedup)?])
+    let reserve: Arc<dyn consumer::ReserveStore> = Arc::new(consumer::CoCommitReserveStore::new(
+        ci_run, outbox, minter, rt,
+    ));
+    Ok(vec![build_trigger_consumer(
+        reader,
+        blobs,
+        reserve,
+        dedup,
+        expected_region,
+        dead_letters,
+    )?])
 }
 
 /// The critical-dependency set the metrics-health readiness probe reads (§4.3, SUB-D9). The OLTP

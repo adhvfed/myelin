@@ -42,8 +42,9 @@ use std::sync::Arc;
 
 use myelin_ci_controlplane::{ci_durable_migrations, ci_run_store_factory};
 use myelin_ci_dispatch::{
-    build_dispatch_consumers, plan_dispatch, ArmedRun, CiTriggerHandler, CoCommitReserveStore,
-    DispatchOutcome, GitConfigReader, GitReadError, OutboxReserveStore, ReserveError, ReserveStore,
+    build_dispatch_consumers, plan_dispatch, ArmedRun, AuthoritativeGitRoot, CiTriggerHandler,
+    CoCommitReserveStore, DispatchOutcome, GitConfigReader, GitReadError, OutboxReserveStore,
+    ReserveError, ReserveStore,
 };
 use myelin_events::consumer::{Consumer, Delivered, Message, Subscription};
 use myelin_events::{
@@ -52,7 +53,7 @@ use myelin_events::{
     Timestamp, UlidMinter, Visibility, CONSUMER_DEDUP_MIGRATION, OUTBOX_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_storage::events_durable::DurableDedupBacking;
+use myelin_storage::events_durable::{DurableDeadLetterBacking, DurableDedupBacking};
 use myelin_storage::outbox_durable::PgOutboxBacking;
 use myelin_storage::{BlobStore, FsBlobStore};
 use myelin_tenancy::{Region, TenantId};
@@ -683,13 +684,19 @@ async fn finding6_build_dispatch_consumers_registers_the_live_trigger_consumer()
         force_path_style: true,
     };
     let git_root = std::env::temp_dir().join(format!("myelin-ci-finding6-{schema}"));
+    std::fs::create_dir_all(&git_root).expect("create authoritative Git root");
+    let git_root = AuthoritativeGitRoot::validate(&git_root).expect("validate Git root");
+    let dead_letters: Arc<dyn myelin_events::DurableDeadLetter> =
+        Arc::new(DurableDeadLetterBacking::new(p.clone(), rt.clone()));
 
     let consumers = build_dispatch_consumers(
-        &git_root,
+        git_root,
         &s3,
         ci_run_store_factory(p.clone()),
         outbox,
         dedup,
+        dead_letters,
+        "fr-par",
         Arc::new(UlidMinter::new()),
         rt.clone(),
     )
@@ -702,5 +709,6 @@ async fn finding6_build_dispatch_consumers_registers_the_live_trigger_consumer()
     );
 
     p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str()).await.ok();
+    std::fs::remove_dir_all(std::env::temp_dir().join(format!("myelin-ci-finding6-{schema}"))).ok();
     println!("[finding6] PASS: build_dispatch_consumers registers 1 live trigger consumer over real durable backings (no more Vec::new() shell).");
 }

@@ -928,6 +928,15 @@ impl DurableGitRepo {
         self.read_blob_at_path_bounded(ref_name, path, usize::MAX)
     }
 
+    /// Whether an exact revision resolves to a commit in this repository.
+    /// Availability-sensitive consumers use this before interpreting a missing path as a genuine
+    /// "no config" result; commits are immutable, so the check and subsequent tree read agree.
+    pub fn commit_exists(&self, revision: &str) -> Result<bool, DurableError> {
+        let repo = self.open_git()?;
+        let exists = self.resolve_commit(&repo, revision)?.is_some();
+        Ok(exists)
+    }
+
     /// Resolve a blob while checking its ODB header before inflating/materializing content.
     pub fn read_blob_at_path_bounded(
         &self,
