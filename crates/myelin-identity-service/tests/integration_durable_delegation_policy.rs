@@ -240,7 +240,7 @@ async fn updates_never_grow_an_existing_run_and_revocation_denies() {
         .resolve_for_run(&scope, &agent, &actor, &old_run)
         .await
         .expect("v1 snapshot");
-    assert!(!old.input.agent_policy.holds("repo:admin"));
+    assert!(!old.input().agent_policy.holds("repo:admin"));
 
     let widened = policy(&["repo:admin"]);
     let _agent_v2 = source
@@ -280,9 +280,9 @@ async fn updates_never_grow_an_existing_run_and_revocation_denies() {
         .resolve_for_run(&scope, &agent, &actor, &RunId("run:new".into()))
         .await
         .expect("new run sees v2");
-    assert!(new.input.agent_policy.holds("repo:admin"));
-    assert!(new.effective_policy.caveats.contains(&"repo:admin".into()));
-    assert_ne!(new.cursor.snapshot, old.cursor.snapshot);
+    assert!(new.input().agent_policy.holds("repo:admin"));
+    assert!(new.effective_policy().caveats.contains(&"repo:admin".into()));
+    assert_ne!(new.cursor().snapshot, old.cursor().snapshot);
 
     source
         .revoke_delegation(&scope, &agent, &actor, &delegation_v2)
@@ -420,7 +420,7 @@ async fn concurrent_update_and_resolution_never_observe_a_torn_bundle() {
         assert_eq!(has_admin, versions.agent == 2);
         assert!(
             !resolved
-                .effective_policy
+                .effective_policy()
                 .caveats
                 .contains(&"repo:admin".into()),
             "one widened raw conjunct is never effective authority"
