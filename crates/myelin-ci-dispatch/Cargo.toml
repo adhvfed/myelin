@@ -127,6 +127,8 @@ myelin-events = { path = "../myelin-events", features = ["test-support"] }
 # (`cargo tree -e no-dev` shows no test-support edge) — the SAME idiom as the other subsystem crates'
 # storage test-support dev-deps (git/search/issues/knowledge/chat).
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
+git2.workspace = true
+async-nats.workspace = true
 # CT-004m: myelin-ci-controlplane is now a PRODUCTION dependency (see `[dependencies]` above) — the
 # dispatch main applies its `ci_durable_migrations()` at boot. The CT-004b live-PG trigger-consumer
 # durability test uses the SAME crate's real migration set (no drift). No separate dev-dependency

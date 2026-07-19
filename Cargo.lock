@@ -2398,7 +2398,9 @@ dependencies = [
 name = "myelin-ci-dispatch"
 version = "0.0.0"
 dependencies = [
+ "async-nats",
  "aws-sdk-s3",
+ "git2",
  "myelin-ci-controlplane",
  "myelin-ci-sandbox",
  "myelin-config",
