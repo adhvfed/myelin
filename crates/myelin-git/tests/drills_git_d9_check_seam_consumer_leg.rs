@@ -254,6 +254,42 @@ fn consumer_leg_dead_letters_a_malformed_payload() {
     assert_eq!(consumer.handler().applied_count(), 0);
 }
 
+/// Payload fields cannot redirect a valid-looking envelope into another tenant, subject, or
+/// aggregate partition. Every mismatch is rejected before the projection lock is mutated.
+#[test]
+fn consumer_leg_rejects_adversarial_envelope_payload_provenance_mismatches() {
+    let base = synthetic_check_updated("build", 1, CheckState::Success, TrustTier::Trusted);
+    let mut cases = Vec::new();
+
+    let mut wrong_tenant = base.clone();
+    wrong_tenant.tenant = TenantId("other".into());
+    wrong_tenant.actor.0.tenant = TenantId("other".into());
+    cases.push(wrong_tenant);
+
+    let mut wrong_subject = base.clone();
+    wrong_subject.subject = check_subject(&commit(), "test").unwrap();
+    cases.push(wrong_subject);
+
+    let mut wrong_aggregate = base;
+    wrong_aggregate.aggregate = myelin_events::AggregateKey("commit:other:abc123def".into());
+    cases.push(wrong_aggregate);
+
+    for (index, envelope) in cases.into_iter().enumerate() {
+        let consumer = bind_consumer();
+        let message = Message {
+            subject: CI_CHECK_UPDATED.into(),
+            envelope,
+        };
+        assert!(
+            matches!(consumer.deliver(&message), Delivered::DeadLettered(_)),
+            "case {index} must fail closed"
+        );
+        assert!(consumer.handler().projection().is_empty());
+        assert_eq!(consumer.handler().applied_count(), 0);
+        assert_eq!(consumer.handler().dropped_stale_count(), 0);
+    }
+}
+
 /// **GIT-D9 / 5.9 LIVE — a foreign type slipping the whitelist dead-letters.** The handler binds only
 /// `ci.check.updated`; a non-ci.check.updated event is a wiring bug, dead-lettered loudly (rule 5).
 #[test]

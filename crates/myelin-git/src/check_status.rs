@@ -620,6 +620,40 @@ impl CheckStatusConsumer {
         })
     }
 
+    /// Bind the opaque producer fact back to the envelope provenance before it can become Git-owned
+    /// projection state. All comparisons use canonical typed derivation; payload strings never get
+    /// to choose a tenant, subject, or ordering partition independently.
+    fn validate_provenance(ev: &EventEnvelope, fact: &CheckStatus) -> Result<(), Reason> {
+        let invalid = || {
+            Reason("ci.check.updated envelope provenance does not match payload".into())
+        };
+        if fact.context.provider != CheckProvider::Ci || fact.tenant != ev.tenant {
+            return Err(invalid());
+        }
+        let repo = myelin_refs::parse_scoped(&fact.repo.0).map_err(|_| invalid())?;
+        if repo.artifact_ref != fact.repo
+            || repo.subsystem != "git"
+            || repo.type_ != "repo"
+            || repo.sub.is_some()
+            || repo.tenant != fact.tenant
+        {
+            return Err(invalid());
+        }
+        let commit = myelin_events::check_seam::CheckCommit::from_repo_root(
+            &repo.artifact_ref,
+            &fact.commit_oid.0,
+        )
+        .map_err(|_| invalid())?;
+        let expected_subject =
+            myelin_events::check_seam::check_subject(&commit, &fact.context.name)
+                .map_err(|_| invalid())?;
+        let expected_aggregate = myelin_events::check_seam::check_aggregate(&commit);
+        if ev.subject != expected_subject || ev.aggregate != expected_aggregate {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     /// Snapshot of the current projection (a clone) — the merge gate reads this. Cloned out under the
     /// lock so the gate scan never races a concurrent apply.
     pub fn projection(&self) -> CheckStatusProjection {
@@ -664,6 +698,9 @@ impl EventHandler for CheckStatusConsumer {
             Ok(f) => f,
             Err(reason) => return HandleOutcome::NonRetryable(reason),
         };
+        if let Err(reason) = Self::validate_provenance(ev, &fact) {
+            return HandleOutcome::NonRetryable(reason);
+        }
         let mut proj = self.projection.lock().unwrap_or_else(|e| e.into_inner());
         match proj.apply(&fact) {
             ApplyOutcome::Superseded { .. } => {
