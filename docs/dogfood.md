@@ -130,11 +130,13 @@ myelin issues view "$ISSUE_ID"
 
 The CLI never claims a 202 receipt is immediately visible; it prints the matching `myelin issues view
 <uuid>` command. A very early `view` can return the same leak-free 404 as an unauthorized/absent issue;
-retry after the worker's default five-second sweep. The create response's `Location` header points to
-the creator-only authorization status receipt: it returns `202` plus a bounded retry hint while pending
-and `200` plus the full Issue view after activation. It never exposes retry errors or attempt counts.
-The worker scans durable pending bindings directly. The separate outbox relay is not required to
-activate the issue and is not started implicitly here.
+retry after the worker's default five-second sweep. A viewer-capable client can use the receipt's
+`authorization.request_event_id` at `/v1/issues/authorization-requests/<request_event_id>`: it returns
+`202` plus a bounded retry hint while pending and `200` plus the full Issue view after activation. The
+create response deliberately has no `Location` header because a create-only credential has no
+`issue.view` authority; the status endpoint never weakens that boundary or exposes retry errors and
+attempt counts. The worker scans durable pending bindings directly. The separate outbox relay is not
+required to activate the issue and is not started implicitly here.
 
 `issues list` defaults to `--state open`; use `closed` or `all` explicitly for the other views. `--key`
 is a normalized Issue-key prefix filter (for example `MYL-`), never a title or free-text search. Keep
