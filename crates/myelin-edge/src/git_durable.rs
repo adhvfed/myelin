@@ -53,8 +53,9 @@ use myelin_git::pr_store::{
     DurablePrStore, MergeAttempt, PrRecord, ReviewRecord,
 };
 use myelin_git::pr_threads::{
-    AnchorState, BatchVerdict, CommentRecord, CommentState, DurablePrThreadStore, PrincipalRole,
-    ReviewBatch, ThreadAnchor, ThreadPrincipal, ThreadRecord, ViewedThreads,
+    AnchorState, BatchVerdict, CommentRecord, CommentState, DurablePrThreadStore,
+    PendingCommentRequest, PrincipalRole, ReviewBatch, SubmitReviewRequest, ThreadAnchor,
+    ThreadPrincipal, ThreadRecord, ViewedThreads,
 };
 use myelin_git::receive_pack::{
     evaluate_protected_ref_push, CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate,
@@ -2026,15 +2027,9 @@ impl DurableGitBackend {
         let body_md = require_body_md(body)?;
         let anchor = parse_anchor(body);
         let author = Self::thread_principal(tenant, principal);
-        let comment = self.threads.add_pending_comment(
-            &loc,
-            &key,
-            review_id,
-            anchor,
-            author,
-            body_md,
-            now_unix(),
-        )?;
+        let request =
+            PendingCommentRequest::new(loc, key, review_id, anchor, author, body_md, now_unix())?;
+        let comment = self.threads.add_pending_comment(request)?;
         Ok(comment_json(&comment))
     }
 
@@ -2072,15 +2067,16 @@ impl DurableGitBackend {
             .and_then(Value::as_str)
             .map(str::to_string);
         let actor = Self::thread_principal(tenant, principal);
-        let submitted = self.threads.submit_review(
-            &loc,
-            &key,
+        let request = SubmitReviewRequest::new(
+            loc.clone(),
+            key,
             review_id,
-            &actor,
+            actor,
             verdict,
             summary_md,
             now_unix(),
         )?;
+        let submitted = self.threads.submit_review(request)?;
         // Feed the merge gate: a NON-advisory approved/changes_requested verdict pushes a durable
         // review record (the gate reads `counting_approvals` + `has_blocking_review`). An agent batch
         // is advisory and a comment-only verdict adds no gate signal. Only the FIRST submit (Some)
