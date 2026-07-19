@@ -33,8 +33,9 @@ use myelin_ci_controlplane::{
     CostEventRow, CostKind, Meter,
 };
 use myelin_flow::MinorUnits;
-use myelin_storage::{all_durable_migrations, reserve_settle_durable_migrations};
-use myelin_tenancy::TenantId;
+use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+use myelin_storage::{all_durable_migrations, reserve_settle_durable_migrations, TenantScope};
+use myelin_tenancy::{Region, TenantId};
 use sqlx::types::Uuid;
 use sqlx::{Executor, PgPool, Row};
 
@@ -51,9 +52,20 @@ fn schema_name() -> String {
     format!("ci_ct004m_{}", std::process::id())
 }
 
+fn verified_scope(tenant: &TenantId, region: &str) -> TenantScope {
+    let mut principal = Principal::stub(
+        PrincipalId("cost-store-test".into()),
+        PrincipalKind::Service,
+        tenant.clone(),
+    );
+    principal.region = Region(region.into());
+    TenantScope::from_verified_token(&principal, principal.region.clone())
+}
+
 /// An admin pool pinned to the per-pid schema (with `public` in the path so the platform RLS helper
 /// `myelin_make_tenant_scoped` — defined in `public` — resolves, while unqualified CREATEs land in the
-/// per-pid schema first). Admin is BYPASSRLS so the store's bare-pool ops exercise the FORCE-RLS shape.
+/// per-pid schema first). Admin creates the isolated schema; store operations still carry verified
+/// tenant/region scope and transaction-local GUCs.
 async fn pool() -> PgPool {
     let schema = schema_name();
     sqlx::postgres::PgPoolOptions::new()
@@ -121,6 +133,7 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
     let schema = schema_name();
     let tenant = TenantId("acme".into());
     let region = "fr-par";
+    let scope = verified_scope(&tenant, region);
 
     let p = pool().await;
     p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
@@ -179,7 +192,7 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
     // ── (3a) A CT-004a settle records into ci_cost_event (NOT Storage's cost_event). ──
     let run = uid("ct004m-run");
     let job = uid("ct004m-job");
-    let store = CiCostEventStore::with_pg(p.clone());
+    let store = CiCostEventStore::with_pg(p.clone(), Region(region.into()));
     let rows = vec![CostEventRow {
         tenant: tenant.clone(),
         run_id: run.to_string(),
@@ -191,12 +204,12 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
         kind: CostKind::Ci,
     }];
     let affected = store
-        .settle(region, &rows)
+        .settle(&scope, &rows)
         .await
         .expect("the CT-004a settle records into ci_cost_event");
     assert_eq!(affected, 1, "one metered unit recorded into ci_cost_event");
     let read = store
-        .cost_events_for_run(&tenant, &run.to_string())
+        .cost_events_for_run(&scope, &run.to_string())
         .await
         .expect("read back the settled unit");
     assert_eq!(read.len(), 1, "the unit is in ci_cost_event");

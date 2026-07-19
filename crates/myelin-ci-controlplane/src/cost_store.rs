@@ -14,8 +14,8 @@
 //! [`CostEventRow`] model, and the [`crate::metering::CiMeter`] reserve/settle bookend — but NO
 //! production-callable store that executes those constants against a real pool. Every prior "durable"
 //! metering proof ran the RAW SQL against a per-test temp table, never through a store the composition
-//! root could construct. [`CiCostEventStore`] is that store: it holds a [`PgPool`], executes the
-//! BYTE-IDENTICAL production constants, and is constructed at the controlplane composition root
+//! root could construct. [`CiCostEventStore`] is that store: it holds a [`PgPool`], pins the provider
+//! [`Region`], executes the BYTE-IDENTICAL production constants, and is constructed at the root
 //! ([`crate::ci_cost_event_store`]).
 //!
 //! ## The storage-`CostLedger`-vs-CI-projection SPLIT (the anti-duplication decision)
@@ -71,28 +71,31 @@
 //! ONE shared `myelin` DB. CI's table is now `ci_cost_event` ([`crate::migrations::CI_COST_EVENT_TABLE`]),
 //! created by [`crate::ci_durable_migrations`] (applied by BOTH CI mains at boot). So this store's
 //! [`INSERT_COST_EVENT_QUERY`] targets a table that reliably exists with the right shape. CT-004d's
-//! remaining job is to DRIVE a live settle through it via a tenant-scoped tx (the `ci_cost_event`
-//! table is FORCE-RLS, so a production write must set the `(tenant, region)` GUC — the durability
-//! test connects as the migration/owner role to exercise the store shape).
+//! remaining job is to DRIVE a live settle through it. Standalone operations now take a verified
+//! [`TenantScope`] and use transaction-local tenant/region GUCs; a `settle_in_tx` caller supplies the
+//! same scoped transaction so the FORCE-RLS table never sees raw request authority.
 
 use myelin_flow::MinorUnits;
-use myelin_tenancy::TenantId;
+use myelin_storage::TenantScope;
+use myelin_tenancy::{Region, TenantId};
 use sqlx::postgres::PgPool;
 use sqlx::types::Uuid;
 use sqlx::Row;
 
 use crate::metering::{
-    CostEventRow, CostKind, Meter, INSERT_COST_EVENT_QUERY, SELECT_COST_EVENT_BY_ID_QUERY,
-    SELECT_COST_EVENTS_FOR_RUN_QUERY,
+    CostEventRow, CostKind, Meter, INSERT_COST_EVENT_QUERY, SELECT_COST_EVENTS_FOR_RUN_QUERY,
+    SELECT_COST_EVENT_BY_ID_QUERY,
 };
 
 /// A durable CI-metering-store failure. Loud + typed — a settle/read NEVER silently drops or coerces
-/// (the census theme-#2 silent-data-loss floor). Safe to log: carries only the structural fault, never
-/// tenant PII beyond the opaque tenant/run tokens the CI schema already keys on.
-#[derive(Debug)]
+/// (the census theme-#2 silent-data-loss floor). Safe to log: public formatting carries only the
+/// structural fault and redacts tenant, region, identifiers, corrupt tokens, and monetary values.
 pub enum CiCostStoreError {
     /// A durable-store DB error (the write/read did NOT succeed) — never a silent partial write.
-    Db(String),
+    Db(&'static str),
+    /// The verified request scope does not belong to this store's pinned residency cell, is empty,
+    /// or disagrees with a row presented for persistence. Carries no authority values by design.
+    ScopeMismatch,
     /// A `run_id`/`job_id` in a [`CostEventRow`] is not a UUID (the durable `cost_event.run_id` /
     /// `cost_event.job_id` column type). CI run/job ids ARE uuids in production; a non-uuid token
     /// (e.g. a `test-support` drill's synthetic `"ci/run/0"`) never reaches the durable projection —
@@ -100,8 +103,6 @@ pub enum CiCostStoreError {
     BadId {
         /// Which field failed (`run_id` | `job_id`).
         field: &'static str,
-        /// The offending value (an opaque CI id token — not PII).
-        value: String,
     },
     /// A minor-units / amount value does not fit the `bigint` durable column (a loud refusal, never a
     /// silent wrap — integer minor-units, arch 01 §3.7).
@@ -143,25 +144,30 @@ pub enum CiCostStoreError {
 impl core::fmt::Display for CiCostStoreError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            CiCostStoreError::Db(e) => write!(f, "durable CI cost_event store error: {e}"),
-            CiCostStoreError::BadId { field, value } => write!(
+            CiCostStoreError::Db(operation) => {
+                write!(f, "durable CI cost_event store error during {operation}")
+            }
+            CiCostStoreError::ScopeMismatch => {
+                write!(f, "durable CI cost_event scope rejected")
+            }
+            CiCostStoreError::BadId { field } => write!(
                 f,
-                "durable CI cost_event settle refused: {field} `{value}` is not a UUID (the \
+                "durable CI cost_event settle refused: {field} is not a UUID (the \
                  cost_event.{field} column is uuid — CI run/job ids are uuids in production)"
             ),
-            CiCostStoreError::AmountOverflow { column, value } => write!(
+            CiCostStoreError::AmountOverflow { column, .. } => write!(
                 f,
-                "durable CI cost_event settle refused: {column} value {value} does not fit the \
+                "durable CI cost_event settle refused: {column} value does not fit the \
                  bigint column (integer minor-units, never a silent wrap)"
             ),
-            CiCostStoreError::CorruptRow(e) => {
-                write!(f, "corrupt durable cost_event row (outside the frozen token set): {e}")
+            CiCostStoreError::CorruptRow(_) => {
+                write!(f, "corrupt durable cost_event row (outside the frozen token set)")
             }
-            CiCostStoreError::AmountDivergence { column, recorded, incoming } => write!(
+            CiCostStoreError::AmountDivergence { column, .. } => write!(
                 f,
                 "durable CI cost_event settle refused: a re-delivered unit (same cost_id) disagrees \
-                 on {column} — recorded {recorded}, incoming {incoming} (never a silent drop of a \
-                 divergent bill; the idempotency key is (tenant, run, job, meter), not the amount)"
+                 on {column} (never a silent drop of a divergent bill; the idempotency key is \
+                 (tenant, run, job, meter), not the amount)"
             ),
             CiCostStoreError::SchemaShapeMismatch { column, expected, actual } => write!(
                 f,
@@ -173,7 +179,82 @@ impl core::fmt::Display for CiCostStoreError {
     }
 }
 
+impl core::fmt::Debug for CiCostStoreError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Db(operation) => f.debug_tuple("Db").field(operation).finish(),
+            Self::ScopeMismatch => f.write_str("ScopeMismatch"),
+            Self::BadId { field } => f.debug_struct("BadId").field("field", field).finish(),
+            Self::AmountOverflow { column, .. } => f
+                .debug_struct("AmountOverflow")
+                .field("column", column)
+                .field("value", &"<redacted>")
+                .finish(),
+            Self::CorruptRow(_) => f.debug_tuple("CorruptRow").field(&"<redacted>").finish(),
+            Self::SchemaShapeMismatch {
+                column,
+                expected,
+                actual,
+            } => f
+                .debug_struct("SchemaShapeMismatch")
+                .field("column", column)
+                .field("expected", expected)
+                .field("actual", actual)
+                .finish(),
+            Self::AmountDivergence { column, .. } => f
+                .debug_struct("AmountDivergence")
+                .field("column", column)
+                .field("recorded", &"<redacted>")
+                .field("incoming", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
 impl std::error::Error for CiCostStoreError {}
+
+impl From<myelin_storage::PgError> for CiCostStoreError {
+    fn from(_: myelin_storage::PgError) -> Self {
+        Self::Db("tenant-scoped transaction")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct VerifiedCostScope {
+    tenant_id: TenantId,
+    region: Region,
+}
+
+impl VerifiedCostScope {
+    fn new(scope: &TenantScope, store_region: &Region) -> Result<Self, CiCostStoreError> {
+        if scope.tenant().as_str().is_empty()
+            || scope.region().0.is_empty()
+            || scope.region() != store_region
+        {
+            return Err(CiCostStoreError::ScopeMismatch);
+        }
+        Ok(Self {
+            tenant_id: scope.tenant().clone(),
+            region: scope.region().clone(),
+        })
+    }
+
+    fn verify_rows(&self, rows: &[CostEventRow]) -> Result<(), CiCostStoreError> {
+        if rows.iter().any(|row| row.tenant != self.tenant_id) {
+            return Err(CiCostStoreError::ScopeMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Debug for VerifiedCostScope {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VerifiedCostScope")
+            .field("tenant_id", &"<redacted>")
+            .field("region", &"<redacted>")
+            .finish()
+    }
+}
 
 /// **The REAL durable CI `cost_event` projection store (CT-004a).** Holds the OLTP [`PgPool`] and
 /// executes the BYTE-IDENTICAL production constants [`INSERT_COST_EVENT_QUERY`] /
@@ -185,13 +266,24 @@ impl std::error::Error for CiCostStoreError {}
 #[derive(Clone)]
 pub struct CiCostEventStore {
     pool: PgPool,
+    region: Region,
+}
+
+impl core::fmt::Debug for CiCostEventStore {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CiCostEventStore")
+            .field("pool", &"<redacted>")
+            .field("region", &"<redacted>")
+            .finish()
+    }
 }
 
 impl CiCostEventStore {
-    /// Wrap the controlplane OLTP pool as the durable CI metering projection store. The production
-    /// composition-root constructor is [`crate::ci_cost_event_store`] (from the MR-022 provider pool).
-    pub fn with_pg(pool: PgPool) -> CiCostEventStore {
-        CiCostEventStore { pool }
+    /// Wrap the controlplane OLTP pool as the durable CI metering projection store, pinned to the
+    /// provider's typed residency region. The production composition-root constructor is
+    /// [`crate::ci_cost_event_store`] (from the MR-022 provider pool).
+    pub fn with_pg(pool: PgPool, region: Region) -> CiCostEventStore {
+        CiCostEventStore { pool, region }
     }
 
     /// The pool this store is bound to (for a co-commit caller that wants to begin its own tx).
@@ -206,16 +298,20 @@ impl CiCostEventStore {
     /// row's `cost_id` is [`cost_id_for`] (deterministic on `(tenant, run_id, job_id, meter)`), so a
     /// re-delivered settle records each unit EXACTLY ONCE via the constant's `ON CONFLICT DO NOTHING`.
     /// Returns the number of rows the INSERTs affected (a re-delivery returns `0` — double-effect = 0).
-    /// `region` is the residency pin the `cost_event.region` column carries.
+    /// The verified scope supplies both the tenant predicate and residency region and must match the
+    /// typed region fixed at store construction.
     pub async fn settle_in_tx(
         &self,
         conn: &mut sqlx::PgConnection,
-        region: &str,
+        scope: &TenantScope,
         rows: &[CostEventRow],
     ) -> Result<u64, CiCostStoreError> {
+        let verified = VerifiedCostScope::new(scope, &self.region)?;
+        verified.verify_rows(rows)?;
         let mut affected = 0u64;
         for row in rows {
-            let tenant_id = row.tenant.as_str();
+            let tenant_id = &verified.tenant_id;
+            let region = &verified.region;
             let run_uuid = parse_id("run_id", &row.run_id)?;
             let job_uuid = parse_id("job_id", &row.job_id)?;
             let cost_id = cost_id_for(&row.tenant, run_uuid, job_uuid, row.meter);
@@ -223,8 +319,8 @@ impl CiCostEventStore {
             let wholesale = fit_bigint("wholesale", row.wholesale.0)?;
             let markup = fit_bigint("markup", row.markup.0)?;
             let done = sqlx::query(INSERT_COST_EVENT_QUERY)
-                .bind(tenant_id) // $1 tenant_id — the tenant predicate (RLS/partition key)
-                .bind(region) // $2 region
+                .bind(tenant_id.as_str()) // $1 tenant_id — verified RLS/partition key
+                .bind(&region.0) // $2 typed, store-pinned residency region
                 .bind(cost_id) // $3 cost_id (deterministic idempotency key)
                 .bind(run_uuid) // $4 run_id
                 .bind(job_uuid) // $5 job_id
@@ -235,7 +331,7 @@ impl CiCostEventStore {
                 .bind(row.kind.token()) // $10 kind
                 .execute(&mut *conn)
                 .await
-                .map_err(|e| CiCostStoreError::Db(e.to_string()))?;
+                .map_err(|_| CiCostStoreError::Db("record cost event"))?;
             if done.rows_affected() == 0 {
                 // VERIFY-ON-CONFLICT (#13): the `ON CONFLICT (tenant_id, cost_id) DO NOTHING` absorbed a
                 // re-delivery. Because `cost_id` keys on `(tenant, run, job, meter)` — NOT the amount —
@@ -243,11 +339,11 @@ impl CiCostEventStore {
                 // is a metering anomaly `DO NOTHING` would silently hide; surface it loudly (this keys
                 // the billing table). Same-amount re-delivery is the normal idempotent no-op (returns 0).
                 let existing = sqlx::query(SELECT_COST_EVENT_BY_ID_QUERY)
-                    .bind(tenant_id) // $1 tenant_id
+                    .bind(tenant_id.as_str()) // $1 verified tenant_id
                     .bind(cost_id) // $2 cost_id
                     .fetch_one(&mut *conn)
                     .await
-                    .map_err(|e| CiCostStoreError::Db(e.to_string()))?;
+                    .map_err(|_| CiCostStoreError::Db("verify existing cost event"))?;
                 for (column, incoming, recorded) in [
                     ("amount", amount, existing.get::<i64, _>("amount")),
                     ("wholesale", wholesale, existing.get::<i64, _>("wholesale_minor_units")),
@@ -266,22 +362,24 @@ impl CiCostEventStore {
     /// **Settle-and-commit convenience.** Opens a transaction, records the projection rows via
     /// [`Self::settle_in_tx`], and commits — the standalone-settle path (no co-commit with run-state).
     /// Returns the rows affected (0 on a full re-delivery). Fail-loud: a mid-settle DB error rolls the
-    /// whole tx back (no half-billed run) and returns [`CiCostStoreError::Db`].
+    /// whole tx back (no half-billed run) and returns [`CiCostStoreError::Db`]. The shared scoped-tx
+    /// helper sets transaction-local tenant/region GUCs and scrubs them at transaction end.
     pub async fn settle(
         &self,
-        region: &str,
+        scope: &TenantScope,
         rows: &[CostEventRow],
     ) -> Result<u64, CiCostStoreError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| CiCostStoreError::Db(e.to_string()))?;
-        let affected = self.settle_in_tx(&mut tx, region, rows).await?;
-        tx.commit()
-            .await
-            .map_err(|e| CiCostStoreError::Db(e.to_string()))?;
-        Ok(affected)
+        let verified = VerifiedCostScope::new(scope, &self.region)?;
+        verified.verify_rows(rows)?;
+        let tenant_id = verified.tenant_id.0.clone();
+        let region = verified.region.0.clone();
+        let store = self.clone();
+        let scope = scope.clone();
+        let rows = rows.to_vec();
+        myelin_storage::with_tenant_tx_error(&self.pool, &tenant_id, &region, move |conn| {
+            Box::pin(async move { store.settle_in_tx(conn, &scope, &rows).await })
+        })
+        .await
     }
 
     /// **Read back every metered unit attributed to a run (the durability/attribution verify side).**
@@ -291,17 +389,31 @@ impl CiCostEventStore {
     /// [`CiCostStoreError::CorruptRow`]. `run_id` must be a UUID (the durable column type).
     pub async fn cost_events_for_run(
         &self,
-        tenant: &TenantId,
+        scope: &TenantScope,
         run_id: &str,
     ) -> Result<Vec<CostEventRow>, CiCostStoreError> {
-        let tenant_id = tenant.as_str();
+        let verified = VerifiedCostScope::new(scope, &self.region)?;
+        let tenant = verified.tenant_id;
+        let transaction_tenant = tenant.0.clone();
+        let transaction_region = verified.region.0;
         let run_uuid = parse_id("run_id", run_id)?;
-        let sql_rows = sqlx::query(SELECT_COST_EVENTS_FOR_RUN_QUERY)
-            .bind(tenant_id) // $1 tenant_id — the tenant predicate
-            .bind(run_uuid) // $2 run_id
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| CiCostStoreError::Db(e.to_string()))?;
+        let tenant_id = tenant.clone();
+        let sql_rows = myelin_storage::with_tenant_tx_error(
+            &self.pool,
+            &transaction_tenant,
+            &transaction_region,
+            |conn| {
+                Box::pin(async move {
+                    sqlx::query(SELECT_COST_EVENTS_FOR_RUN_QUERY)
+                        .bind(tenant_id.as_str()) // $1 verified tenant_id
+                        .bind(run_uuid) // $2 run_id
+                        .fetch_all(&mut *conn)
+                        .await
+                        .map_err(|_| CiCostStoreError::Db("read cost events"))
+                })
+            },
+        )
+        .await?;
         let mut out = Vec::with_capacity(sql_rows.len());
         for r in &sql_rows {
             let job_uuid: Uuid = r.get("job_id");
@@ -338,10 +450,7 @@ impl CiCostEventStore {
 /// Parse a `run_id`/`job_id` token into the durable `uuid` column type. A non-uuid is a loud refusal
 /// (production CI run/job ids are uuids; a `test-support` drill's synthetic token never reaches here).
 fn parse_id(field: &'static str, value: &str) -> Result<Uuid, CiCostStoreError> {
-    Uuid::parse_str(value).map_err(|_| CiCostStoreError::BadId {
-        field,
-        value: value.to_string(),
-    })
+    Uuid::parse_str(value).map_err(|_| CiCostStoreError::BadId { field })
 }
 
 /// Widen a `u64` minor-units / amount to the `bigint` (`i64`) durable column, loudly refusing a value
@@ -386,14 +495,22 @@ pub async fn verify_ci_cost_event_shape(pool: &PgPool) -> Result<(), CiCostStore
         ("markup_minor_units", "bigint"),
         ("kind", "text"),
     ];
-    let rows = sqlx::query(
-        "SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS typ \
+    let rows: Vec<(String, String, bool, bool)> = sqlx::query_as(
+        "SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS typ, \
+                EXISTS (SELECT 1 FROM pg_attribute tenant_id \
+                         WHERE tenant_id.attrelid = a.attrelid \
+                           AND tenant_id.attname = 'tenant_id' \
+                           AND tenant_id.attnum > 0 AND NOT tenant_id.attisdropped) AS has_tenant_id, \
+                EXISTS (SELECT 1 FROM pg_attribute region_column \
+                         WHERE region_column.attrelid = a.attrelid \
+                           AND region_column.attname = 'region' \
+                           AND region_column.attnum > 0 AND NOT region_column.attisdropped) AS has_region \
          FROM pg_attribute a \
          WHERE a.attrelid = to_regclass('ci_cost_event') AND a.attnum > 0 AND NOT a.attisdropped",
     )
     .fetch_all(pool)
     .await
-    .map_err(|e| CiCostStoreError::Db(e.to_string()))?;
+    .map_err(|_| CiCostStoreError::Db("verify schema shape"))?;
     if rows.is_empty() {
         return Err(CiCostStoreError::SchemaShapeMismatch {
             column: "<table>".into(),
@@ -401,9 +518,18 @@ pub async fn verify_ci_cost_event_shape(pool: &PgPool) -> Result<(), CiCostStore
             actual: "<absent — to_regclass resolved nothing>".into(),
         });
     }
+    for (present, column) in [(rows[0].2, "tenant_id"), (rows[0].3, "region")] {
+        if !present {
+            return Err(CiCostStoreError::SchemaShapeMismatch {
+                column: column.into(),
+                expected: "text".into(),
+                actual: "<absent>".into(),
+            });
+        }
+    }
     let actual: std::collections::HashMap<String, String> = rows
-        .iter()
-        .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("typ")))
+        .into_iter()
+        .map(|(name, typ, _, _)| (name, typ))
         .collect();
     for (col, want) in EXPECTED {
         let got = actual.get(*col).map(String::as_str).unwrap_or("<absent>");
@@ -452,4 +578,74 @@ pub fn cost_id_for(tenant: &TenantId, run_id: Uuid, job_id: Uuid, meter: Meter) 
     }
     bytes[8..].copy_from_slice(&h2.to_be_bytes());
     Uuid::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+
+    fn scope(tenant: &str, region: &str) -> TenantScope {
+        let mut principal = Principal::stub(
+            PrincipalId("cost-store-subject".into()),
+            PrincipalKind::Service,
+            TenantId(tenant.into()),
+        );
+        principal.region = Region(region.into());
+        TenantScope::from_verified_token(&principal, principal.region.clone())
+    }
+
+    #[test]
+    fn verified_cost_scope_retains_types_and_redacts_authority() {
+        let request = scope("tenant-secret", "region-secret");
+        let verified = VerifiedCostScope::new(&request, &Region("region-secret".into()))
+            .expect("matching verified cost scope");
+        assert_eq!(verified.tenant_id, TenantId("tenant-secret".into()));
+        assert_eq!(verified.region, Region("region-secret".into()));
+
+        let debug = format!("{verified:?}");
+        for secret in ["tenant-secret", "region-secret"] {
+            assert!(!debug.contains(secret), "scope debug disclosed {secret}");
+        }
+
+        let mismatch = VerifiedCostScope::new(&request, &Region("provider-region-secret".into()))
+            .expect_err("a cross-region request must fail closed");
+        for rendered in [mismatch.to_string(), format!("{mismatch:?}")] {
+            for secret in ["tenant-secret", "region-secret", "provider-region-secret"] {
+                assert!(!rendered.contains(secret), "scope error disclosed {secret}");
+            }
+        }
+    }
+
+    #[test]
+    fn verified_cost_scope_rejects_mixed_tenant_rows_without_disclosure() {
+        let request = scope("tenant-secret", "region-secret");
+        let verified = VerifiedCostScope::new(&request, &Region("region-secret".into())).unwrap();
+        let rows = vec![CostEventRow {
+            tenant: TenantId("other-tenant-secret".into()),
+            run_id: Uuid::nil().to_string(),
+            job_id: Uuid::nil().to_string(),
+            meter: Meter::CpuSeconds,
+            amount: 1,
+            wholesale: MinorUnits(1),
+            markup: MinorUnits(0),
+            kind: CostKind::Ci,
+        }];
+
+        let error = verified
+            .verify_rows(&rows)
+            .expect_err("a row cannot override verified tenant authority");
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("tenant-secret"));
+            assert!(!rendered.contains("other-tenant-secret"));
+        }
+    }
+
+    #[test]
+    fn malformed_identifiers_are_redacted() {
+        let secret = "run-id-containing-customer-secret";
+        let error = parse_id("run_id", secret).expect_err("invalid UUID must be refused");
+        assert!(!error.to_string().contains(secret));
+        assert!(!format!("{error:?}").contains(secret));
+    }
 }
