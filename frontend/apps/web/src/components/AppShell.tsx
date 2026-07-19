@@ -55,12 +55,12 @@ interface NavItem {
   soon?: boolean;
 }
 
-// The primary subsystem rail. Only Code is wired to a real screen; the rest are the shell's declared
+// The primary subsystem rail. Code and the founder Issues floor are wired; the rest are declared
 // destinations (their surfaces land with each subsystem track) — present, HONEST about being unbuilt:
 // reachable "soon" links, not dead/disabled icons (the rail-honesty argument, §6).
 const NAV: NavItem[] = [
   { href: "/git/repos", icon: "nav-code", label: "Code" },
-  { href: "/issues", icon: "nav-issues", label: "Issues", soon: true },
+  { href: "/issues", icon: "nav-issues", label: "Issues" },
   { href: "/chat", icon: "nav-chat", label: "Chat", soon: true },
   { href: "/ci", icon: "nav-ci", label: "CI", soon: true },
   { href: "/knowledge", icon: "nav-knowledge", label: "Knowledge", soon: true },
@@ -205,6 +205,7 @@ export function AppShell(props: AppShellProps) {
       : []),
     { id: "pr:needs-review", label: "Pull requests needing my review", icon: "pull-request", run: () => navigate("/prs?bucket=needs-review") },
     { id: "pr:mine", label: "My pull requests", icon: "pull-request", run: () => navigate("/prs?bucket=yours") },
+    { id: "issue:new", label: "Create issue", icon: "issue", run: () => navigate("/issues?new=1") },
     { id: "inbox", label: "Open inbox", icon: "inbox", run: () => setInboxOpen(true) },
     { id: "theme", label: "Toggle theme", icon: "settings", run: cycleTheme },
     { id: "logout", label: "Sign out", icon: "human", run: () => void doLogout() },
