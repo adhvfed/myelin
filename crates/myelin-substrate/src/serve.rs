@@ -1021,6 +1021,41 @@ pub fn serve(spec: AppSpec) -> Result<(), ServeError> {
     Ok(())
 }
 
+/// Run the harness-owned steady-state loop until an external shutdown trigger resolves.
+///
+/// The shutdown future is deliberately supplied by the service binary so OS-specific signal
+/// registration stays at the process edge. Lifecycle ordering remains owned here: boot completes
+/// before intake, each tick is bounded, a shutdown wins over a simultaneously-ready tick, and drain
+/// is signalled before the final synchronous in-flight work is completed.
+pub async fn serve_until_shutdown<F>(spec: AppSpec, shutdown: F) -> Result<(), ServeError>
+where
+    F: std::future::Future<Output = ()>,
+{
+    let handle = boot(spec)?;
+    let owns_relay = handle.owns_relay();
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut shutdown => break,
+            _ = interval.tick() => { handle.tick(); }
+        }
+    }
+
+    handle.signal_drain();
+    let final_telemetry = handle.drain();
+    if owns_relay && final_telemetry.outbox_depth() != 0 {
+        return Err(ServeError(format!(
+            "graceful drain incomplete: outbox_depth = {} (expected 0)",
+            final_telemetry.outbox_depth()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1332,6 +1367,46 @@ mod tests {
         spec.consumers = consumers;
         spec.critical = CriticalDependencies::new(["broker"]);
         spec
+    }
+
+    #[tokio::test]
+    async fn shutdown_ready_at_boot_wins_before_the_first_intake_pull() {
+        let probe = PullProbe::default();
+        let observed = probe.clone();
+
+        serve_until_shutdown(external_consumer_spec(probe, Vec::new()), async {})
+            .await
+            .expect("immediate shutdown drains cleanly");
+
+        assert_eq!(
+            observed.state().pulls,
+            0,
+            "a ready shutdown future prevents fresh intake"
+        );
+    }
+
+    #[tokio::test]
+    async fn steady_state_ticks_until_shutdown_then_drains_without_an_extra_pull() {
+        let probe = PullProbe::default();
+        let observed = probe.clone();
+        let shutdown_probe = probe.clone();
+
+        serve_until_shutdown(external_consumer_spec(probe, Vec::new()), async move {
+            loop {
+                if shutdown_probe.state().pulls > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("signalled steady-state loop drains cleanly");
+
+        assert_eq!(
+            observed.state().pulls,
+            1,
+            "shutdown wins the next select and drain never starts another pull"
+        );
     }
 
     /// **THE hello-world boot test (the M0 "first runnable", contract 1.1).** A service boots
