@@ -6,7 +6,7 @@ use std::sync::Arc;
 use myelin_ci_controlplane::{ci_durable_migrations, ci_run_store_factory};
 use myelin_ci_dispatch::{
     build_dispatch_consumers, dispatch_app_spec_with_intake, git_intake_filter,
-    AuthoritativeGitRoot, EVENT_DURABLE_CONSUMER, EVENT_STREAM_NAME, EVENT_SUBJECT_ROOT,
+    AuthoritativeGitRoot, EVENT_SUBJECT_ROOT,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::nats::{
@@ -145,6 +145,14 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
     let schema = format!("ci_dispatch_transport_{nonce}");
     let tenant = format!("transport-{nonce}");
     let event_id = format!("transport-event-{nonce}");
+    let stream_name = format!("MYELIN_CI_DISPATCH_PROOF_{nonce}");
+    let subject_root = format!("myelin.ci_dispatch_proof_{nonce}");
+    let durable_name = format!("ci-dispatch-proof-{nonce}");
+    assert_eq!(
+        git_intake_filter(),
+        format!("{EVENT_SUBJECT_ROOT}.evt.*.git.>"),
+        "production intake derives its Git filter from the one production root"
+    );
     let pool = isolated_pool(&schema).await;
     let rt = tokio::runtime::Handle::current();
 
@@ -187,14 +195,11 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
     .await
     .unwrap();
 
-    let cleanup_client = async_nats::connect(&cfg.nats_url).await.unwrap();
-    let cleanup_js = async_nats::jetstream::new(cleanup_client);
-    let _ = cleanup_js.delete_stream(EVENT_STREAM_NAME).await;
     let publisher = NatsJetStreamPublisher::connect(
         JetStreamPublisherConfig {
             nats_url: cfg.nats_url.clone(),
-            stream_name: EVENT_STREAM_NAME.into(),
-            subject_root: EVENT_SUBJECT_ROOT.into(),
+            stream_name: stream_name.clone(),
+            subject_root: subject_root.clone(),
             max_age: std::time::Duration::from_secs(24 * 60 * 60),
             max_bytes: 64 * 1024 * 1024,
             max_messages: 100_000,
@@ -206,10 +211,10 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
     .unwrap();
     let intake_config = JetStreamConsumerConfig::bounded(
         &cfg.nats_url,
-        EVENT_STREAM_NAME,
-        EVENT_SUBJECT_ROOT,
-        git_intake_filter(),
-        EVENT_DURABLE_CONSUMER,
+        &stream_name,
+        &subject_root,
+        format!("{subject_root}.evt.*.git.>"),
+        &durable_name,
     );
     let intake = NatsJetStreamBus::connect_consumer(intake_config.clone(), rt.clone()).unwrap();
     let spec =
@@ -267,7 +272,9 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
     assert!(foreign_untouched, "dispatch never claims the shared outbox");
 
     handle.signal_drain();
-    handle.drain();
+    // `drain(self)` consumes and drops the original handle/boxed transport. Dropping the returned
+    // telemetry makes that ownership boundary explicit before a fresh client rebinds the durable.
+    drop(handle.drain());
     let rebound = NatsJetStreamBus::connect_consumer(intake_config, rt.clone()).unwrap();
     assert!(
         rebound.consume("").unwrap().is_empty(),
@@ -277,7 +284,7 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
     tokio::task::block_in_place(|| s3.delete(&TenantId(tenant), &address)).ok();
     let client = async_nats::connect(&cfg.nats_url).await.unwrap();
     async_nats::jetstream::new(client)
-        .delete_stream(EVENT_STREAM_NAME)
+        .delete_stream(&stream_name)
         .await
         .ok();
     pool.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
