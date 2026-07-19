@@ -34,6 +34,7 @@
 //!   - derive the guest secret env AND this plan from ONE inseparable resolved-secrets value (you
 //!     cannot inject a secret env entry without its needle), threaded via [`RedactionPlan::for_job`]; and
 //!   - REJECT the launch if the injected-secret set and the plan's coverage disagree.
+//!
 //! Until injection exists there is nothing to couple; this module is the choke point it plugs into.
 //!
 //! Per the co-review (2026-07-17), the production MASKER semantics — streaming across capture-chunk

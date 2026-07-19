@@ -206,7 +206,7 @@ fn parse_xml(xml: &str) -> Result<Element, AuthzError> {
     // Attach a finished element to its parent (or record it as the root). A second root is a refusal.
     fn attach(
         el: Element,
-        stack: &mut Vec<Element>,
+        stack: &mut [Element],
         root: &mut Option<Element>,
     ) -> Result<(), AuthzError> {
         match stack.last_mut() {

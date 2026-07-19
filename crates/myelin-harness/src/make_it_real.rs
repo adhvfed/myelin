@@ -21,6 +21,7 @@
 //!   * `output_digest = blake3(captured-output-bytes)` — the digest of the real output, and
 //!   * `hash = blake3(DOMAIN ∥ id ∥ PASS ∥ date ∥ argv ∥ output_digest)` — the attestation hash
 //!     that binds the verdict to that output.
+//!
 //! blake3 is the workspace-standard content hash (the same `blake3::hash(..).to_hex()` that
 //! `myelin-storage`'s ContentHash / `pg_migrator` use, P-047) — never a hand-rolled digest
 //! (VISION §4 / EI-01 §7). The attested scorecard is serialised to JSON
@@ -34,6 +35,7 @@
 //!   * a PASS row whose attestation is absent or whose recomputed hash ≠ the stored hash (a
 //!     tamper / hand-edited verdict / changed output bytes), or
 //!   * a stale row (its date older than the freshness window).
+//!
 //! Only an all-present, all-PASS, all-hash-valid, all-fresh scorecard is GREEN. This is the
 //! **red-by-default / fails-closed** property: any of the above leaves the gate RED.
 //!

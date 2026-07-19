@@ -79,11 +79,7 @@ fn cfg_line_flags(src: &str, is_gate: impl Fn(&str) -> bool) -> Vec<bool> {
         for ch in blank_string_literals(code).chars() {
             match ch {
                 '(' | '[' => nest += 1,
-                ')' | ']' => {
-                    if nest > 0 {
-                        nest -= 1;
-                    }
-                }
+                ')' | ']' if nest > 0 => nest -= 1,
                 '{' => {
                     depth += 1;
                     if pending {

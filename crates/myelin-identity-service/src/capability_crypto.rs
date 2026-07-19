@@ -251,13 +251,11 @@ impl CellTokenAuthority {
             claims.insert("run_id".into(), run_id.into());
         }
         if let CredentialPurpose::AgentRun {
-            delegation_snapshot,
+            delegation_snapshot: Some(snapshot),
             ..
         } = &spec.purpose
         {
-            if let Some(snapshot) = delegation_snapshot {
-                claims.insert("delegation_snapshot".into(), (*snapshot).into());
-            }
+            claims.insert("delegation_snapshot".into(), (*snapshot).into());
         }
         let auth: Vec<serde_json::Value> = spec
             .authority

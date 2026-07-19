@@ -644,7 +644,7 @@ impl ChallengeGuard {
     }
 
     /// **Consume the challenge `id` ONCE, returning its server-issued nonce.** This is the single-use
-    /// + freshness gate: an UNKNOWN id, an EXPIRED challenge, or an ALREADY-CONSUMED challenge (a
+    /// and freshness gate: an UNKNOWN id, an EXPIRED challenge, or an ALREADY-CONSUMED challenge (a
     /// replay) is a loud refusal. On success the entry is marked consumed (a later consume is a
     /// replay). The nonce returned is the SERVER's — never a credential-supplied value.
     pub fn consume(&self, id: &str) -> Result<Vec<u8>, AuthzError> {
