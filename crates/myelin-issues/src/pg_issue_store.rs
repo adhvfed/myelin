@@ -594,7 +594,12 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
     ) -> Result<IssueAuthorizationOutcome, IssueStoreError> {
         let scope = self.scope(worker)?;
         let id = parse_uuid("issue_id", issue_id)?;
-        let binding = self.load_authorization_binding(&scope, id).await?;
+        // Preflight the complete durable intent before crossing the database boundary. The tuple
+        // writer receives only canonical fields derived from the issue row, never mutable copies
+        // from issue_authz_binding.
+        let binding = self
+            .load_validated_authorization_binding(&scope, id)
+            .await?;
 
         if binding.state == IssueAuthorizationState::Active {
             let zookie = binding.zookie.clone().ok_or_else(|| {
@@ -640,8 +645,10 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             .with_tenant_tx(&tenant_id.clone(), move |conn| {
                 Box::pin(async move {
                     let locked_sql = format!(
-                        "SELECT b.state AS authz_state, b.zookie AS authz_zookie, \
-                                b.issue_object, b.project_userset, b.relation, b.created_event_id, \
+                        "SELECT b.issue_id, b.state AS authz_state, b.zookie AS authz_zookie, \
+                                b.project_id AS binding_project_id, b.issue_object, \
+                                b.project_userset, b.relation, b.request_event_id, \
+                                b.created_event_id, b.attempts, i.created_by_principal, \
                                 o.envelope AS request_envelope, {columns} \
                          FROM issue_authz_binding b \
                          JOIN issue i ON i.tenant_id = b.tenant_id AND i.region = b.region \
@@ -649,7 +656,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                          JOIN outbox o ON o.event_id = b.request_event_id \
                          WHERE b.tenant_id = $1 AND b.region = $2 AND b.issue_id = $3 \
                            AND i.tenant_id = $1 AND i.region = $2 \
-                         FOR UPDATE OF b, i",
+                         FOR UPDATE OF b, i, o",
                         columns = SELECT_COLUMNS_QUALIFIED
                     );
                     let tenant_id_locked_query = sqlx::query(&locked_sql);
@@ -666,46 +673,26 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                             )
                         })?;
 
-                    let state: String = locked.get("authz_state");
-                    if state == "active" {
-                        let committed: String = locked.try_get("authz_zookie").map_err(|_| {
+                    let (binding, request) =
+                        validated_binding_from_row(&locked, &tenant_id, &region, id)
+                            .map_err(myelin_storage::PgError::Query)?;
+                    if binding.state == IssueAuthorizationState::Active {
+                        let committed = binding.zookie.clone().ok_or_else(|| {
                             myelin_storage::PgError::Query(
                                 "active authorization binding has no zookie".into(),
                             )
                         })?;
-                        return Ok((locked, Zookie(committed), false));
+                        return Ok((locked, committed, false));
                     }
-                    if state != "pending" {
-                        return Err(myelin_storage::PgError::Query(format!(
-                            "unknown authorization binding state `{state}`"
-                        )));
-                    }
-
-                    let request_value: serde_json::Value = locked
-                        .try_get("request_envelope")
-                        .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
-                    let request: EventEnvelope =
-                        serde_json::from_value(request_value).map_err(|e| {
-                            myelin_storage::PgError::Query(format!(
-                                "decode authorization request envelope: {e}"
-                            ))
-                        })?;
-                    validate_authorization_request(
-                        &request,
-                        &tenant_id,
-                        &region,
-                        id,
-                        locked.get::<Uuid, _>("project_id"),
-                        &locked.get::<String, _>("issue_object"),
-                        &locked.get::<String, _>("project_userset"),
-                        &locked.get::<String, _>("relation"),
-                    )
-                    .map_err(myelin_storage::PgError::Query)?;
                     let created = issue_created_envelope(
-                        EventId(locked.get("created_event_id")),
+                        EventId(binding.created_event_id.clone()),
                         id,
                         &locked.get::<String, _>("key"),
-                        locked.get::<Uuid, _>("project_id"),
+                        Uuid::parse_str(&binding.project_id).map_err(|_| {
+                            myelin_storage::PgError::Query(
+                                "validated binding carried a malformed project id".into(),
+                            )
+                        })?,
                         &zookie_for_tx,
                         &request,
                     );
@@ -744,7 +731,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         })
     }
 
-    async fn load_authorization_binding(
+    async fn load_validated_authorization_binding(
         &self,
         scope: &TenantScope,
         issue_id: Uuid,
@@ -756,10 +743,17 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             .with_tenant_tx(&tenant_id.clone(), move |conn| {
                 Box::pin(async move {
                     sqlx::query(
-                        "SELECT issue_id, project_id, issue_object, project_userset, relation, \
-                                request_event_id, created_event_id, state, zookie, attempts \
-                         FROM issue_authz_binding \
-                         WHERE tenant_id = $1 AND region = $2 AND issue_id = $3",
+                        "SELECT b.issue_id, b.project_id AS binding_project_id, b.issue_object, \
+                                b.project_userset, b.relation, b.request_event_id, \
+                                b.created_event_id, b.state AS authz_state, \
+                                b.zookie AS authz_zookie, b.attempts, i.project_id, \
+                                i.created_by_principal, o.envelope AS request_envelope \
+                         FROM issue_authz_binding b \
+                         JOIN issue i ON i.tenant_id = b.tenant_id AND i.region = b.region \
+                                          AND i.id = b.issue_id \
+                         JOIN outbox o ON o.event_id = b.request_event_id \
+                         WHERE b.tenant_id = $1 AND b.region = $2 AND b.issue_id = $3 \
+                           AND i.tenant_id = $1 AND i.region = $2",
                     )
                     .bind(&tenant_id)
                     .bind(&region)
@@ -772,7 +766,14 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             .await
             .map_err(|e| IssueStoreError::Storage(e.to_string()))?
             .ok_or(IssueStoreError::NotFound)?;
-        decode_binding(row)
+        validated_binding_from_row(
+            &row,
+            scope.tenant().as_str(),
+            scope.region().as_str(),
+            issue_id,
+        )
+        .map(|(binding, _)| binding)
+        .map_err(IssueStoreError::Storage)
     }
 
     async fn record_bootstrap_failure(
@@ -1365,6 +1366,15 @@ FROM authorized
 ORDER BY sort_key ASC, updated_at_micros DESC NULLS FIRST, id DESC NULLS FIRST
 "#;
 
+/// Exact served list statement, exposed for production-plan verification against live PostgreSQL.
+/// Callers must not execute it outside the scoped store path; the Edge integration test only
+/// prefixes it with `EXPLAIN` and binds the same typed parameters.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
+pub fn authoritative_issue_list_sql() -> &'static str {
+    LIST_EFFECTIVE_ISSUE_VIEW_SQL
+}
+
 /// Resolve the fixed core org→team→project hierarchy plus direct-relation usersets. A userset that
 /// leaves those supported group types is surfaced as `supported=false`; rebuild then fails closed
 /// instead of silently under-materializing an unknown permission rewrite.
@@ -1509,34 +1519,78 @@ async fn select_one_for_update(
         .await
 }
 
-fn decode_binding(
-    row: sqlx::postgres::PgRow,
-) -> Result<IssueAuthorizationBinding, IssueStoreError> {
-    let state = match row.get::<String, _>("state").as_str() {
+fn validated_binding_from_row(
+    row: &sqlx::postgres::PgRow,
+    tenant: &str,
+    region: &str,
+    issue_id: Uuid,
+) -> Result<(IssueAuthorizationBinding, EventEnvelope), String> {
+    if row.get::<Uuid, _>("issue_id") != issue_id {
+        return Err("authorization binding issue id does not match the requested issue".into());
+    }
+    let project_id = row.get::<Uuid, _>("project_id");
+    if row.get::<Uuid, _>("binding_project_id") != project_id {
+        return Err("authorization binding project does not match its issue".into());
+    }
+    let canonical_issue_object = issue_object(issue_id);
+    let canonical_project_userset = project_userset(project_id);
+    if row.get::<String, _>("issue_object") != canonical_issue_object
+        || row.get::<String, _>("project_userset") != canonical_project_userset
+        || row.get::<String, _>("relation") != "parent_project"
+    {
+        return Err("authorization binding is not canonical for its issue".into());
+    }
+    let request_event_id: String = row.get("request_event_id");
+    let created_event_id: String = row.get("created_event_id");
+    if !is_canonical_request_event_id(&request_event_id)
+        || !is_canonical_request_event_id(&created_event_id)
+    {
+        return Err("authorization binding carries a malformed durable event id".into());
+    }
+    let request_value: serde_json::Value = row
+        .try_get("request_envelope")
+        .map_err(|error| error.to_string())?;
+    let request: EventEnvelope = serde_json::from_value(request_value)
+        .map_err(|error| format!("decode authorization request envelope: {error}"))?;
+    let created_by: String = row
+        .try_get("created_by_principal")
+        .map_err(|_| "issue creator is absent from authorization binding preflight".to_string())?;
+    validate_authorization_request(
+        &request,
+        tenant,
+        region,
+        issue_id,
+        project_id,
+        &canonical_issue_object,
+        &canonical_project_userset,
+        "parent_project",
+        &request_event_id,
+        &created_by,
+    )?;
+
+    let state = match row.get::<String, _>("authz_state").as_str() {
         "pending" => IssueAuthorizationState::Pending,
         "active" => IssueAuthorizationState::Active,
-        other => {
-            return Err(IssueStoreError::Storage(format!(
-                "unknown authorization binding state `{other}`"
-            )))
-        }
+        other => return Err(format!("unknown authorization binding state `{other}`")),
     };
     let attempts: i32 = row.get("attempts");
-    let attempts = u32::try_from(attempts).map_err(|_| {
-        IssueStoreError::Storage("authorization binding has a negative attempt count".into())
-    })?;
-    Ok(IssueAuthorizationBinding {
-        issue_id: row.get::<Uuid, _>("issue_id").to_string(),
-        project_id: row.get::<Uuid, _>("project_id").to_string(),
-        issue_object: row.get("issue_object"),
-        project_userset: row.get("project_userset"),
-        relation: row.get("relation"),
-        request_event_id: row.get("request_event_id"),
-        created_event_id: row.get("created_event_id"),
-        state,
-        zookie: row.get::<Option<String>, _>("zookie").map(Zookie),
-        attempts,
-    })
+    let attempts = u32::try_from(attempts)
+        .map_err(|_| "authorization binding has a negative attempt count".to_string())?;
+    Ok((
+        IssueAuthorizationBinding {
+            issue_id: issue_id.to_string(),
+            project_id: project_id.to_string(),
+            issue_object: canonical_issue_object,
+            project_userset: canonical_project_userset,
+            relation: "parent_project".into(),
+            request_event_id,
+            created_event_id,
+            state,
+            zookie: row.get::<Option<String>, _>("authz_zookie").map(Zookie),
+            attempts,
+        },
+        request,
+    ))
 }
 
 fn issue_object(issue_id: Uuid) -> String {
@@ -1684,6 +1738,8 @@ fn validate_authorization_request(
     issue_object: &str,
     project_userset: &str,
     relation: &str,
+    request_event_id: &str,
+    created_by_principal: &str,
 ) -> Result<(), String> {
     let expected_subject = issue_subject(tenant, issue_id);
     let expected_aggregate = AggregateKey(format!("issue:{issue_id}"));
@@ -1691,10 +1747,12 @@ fn validate_authorization_request(
     let expected_project_id = project_id.to_string();
     let payload = &request.payload;
     let valid = request.type_.0 == ISSUE_AUTHORIZATION_REQUESTED
+        && request.event_id.0 == request_event_id
         && request.tenant.as_str() == tenant
         && request.region.as_str() == region
         && request.actor.0.tenant.as_str() == tenant
         && request.actor.0.region.as_str() == region
+        && request.actor.0.principal_id.0 == created_by_principal
         && request.subject == expected_subject
         && request.aggregate == expected_aggregate
         && !request.contains_personal_data
@@ -2026,6 +2084,8 @@ mod tests {
             &issue_object,
             &userset,
             "parent_project",
+            &request_id.0,
+            &creator.principal_id.0,
         )
         .unwrap();
         let created = issue_created_envelope(
@@ -2071,6 +2131,7 @@ mod tests {
             &userset,
             UlidMinter::new().mint().into(),
         );
+        let request_event_id = request.event_id.0.clone();
         let validate = |candidate: &EventEnvelope| {
             validate_authorization_request(
                 candidate,
@@ -2081,6 +2142,8 @@ mod tests {
                 &object,
                 &userset,
                 "parent_project",
+                &request_event_id,
+                &creator.principal_id.0,
             )
         };
 

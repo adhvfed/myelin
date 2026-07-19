@@ -267,29 +267,20 @@ impl Handler for IssueCreateHandler {
             .map_err(map_store_error)?;
         // Creation is intentionally asynchronous: the row remains invisible until the durable
         // Identity tuple reconciler activates the staged binding.
-        Ok(no_store(
-            EdgeResponse::json(
-                202,
-                &json!({
-                    "issue": {
-                        "id": receipt.id,
-                        "key": receipt.key,
-                        "project_id": receipt.project_id,
-                    },
-                    "authorization": {
-                        "status": "pending",
-                        "request_event_id": receipt.authorization_request_event_id,
-                    }
-                }),
-            )
-            .with_header(
-                "Location",
-                format!(
-                    "/v1/issues/authorization-requests/{}",
-                    receipt.authorization_request_event_id
-                ),
-            ),
-        ))
+        Ok(no_store(EdgeResponse::json(
+            202,
+            &json!({
+                "issue": {
+                    "id": receipt.id,
+                    "key": receipt.key,
+                    "project_id": receipt.project_id,
+                },
+                "authorization": {
+                    "status": "pending",
+                    "request_event_id": receipt.authorization_request_event_id,
+                }
+            }),
+        )))
     }
 }
 

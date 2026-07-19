@@ -147,10 +147,16 @@ pub const ISSUE_CYCLE_INDEX: &str = "issue_cycle";
 pub const ISSUE_PROPS_GIN_INDEX: &str = "issue_props_gin";
 /// Recent authoritative list index; added separately at the end of history for online rollout.
 pub const ISSUE_RECENT_LIST_INDEX: &str = "issue_recent_list_idx";
+/// Selective key-prefix index; separate from recency so either filter shape has a bounded path.
+pub const ISSUE_KEY_PREFIX_LIST_INDEX: &str = "issue_key_prefix_list_idx";
 pub const CREATE_ISSUE_RECENT_LIST_INDEX_DDL: &str =
     "CREATE INDEX CONCURRENTLY IF NOT EXISTS issue_recent_list_idx \
      ON issue (tenant_id, region, updated_at DESC, id DESC) \
-     INCLUDE (state_category, key) WHERE deleted_at IS NULL";
+     INCLUDE (state_category, key) WHERE deleted_at IS NULL AND NOT archived";
+pub const CREATE_ISSUE_KEY_PREFIX_LIST_INDEX_DDL: &str =
+    "CREATE INDEX CONCURRENTLY IF NOT EXISTS issue_key_prefix_list_idx \
+     ON issue (tenant_id, region, key text_pattern_ops, updated_at DESC, id DESC) \
+     INCLUDE (state_category) WHERE deleted_at IS NULL AND NOT archived";
 
 // ============================================================================================
 // The forward-only CREATE-TABLE DDL constants (arch 01 §2–§8, verbatim intent; tenant_id/region
@@ -605,6 +611,11 @@ pub fn issues_migrations() -> Migrations {
         CREATE_ISSUE_RECENT_LIST_INDEX_DDL,
         ISSUE_TABLE,
     ));
+    migrations.push(Migration::plain_on(
+        "iss_0021_issue_key_prefix_list_idx",
+        CREATE_ISSUE_KEY_PREFIX_LIST_INDEX_DDL,
+        ISSUE_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -755,8 +766,8 @@ mod tests {
         let migrations = issues_migrations();
         assert_eq!(
             migrations.0.len(),
-            26,
-            "11 spine-table creates + 9 concurrent indexes + 2 issue expands + 4 authz migrations"
+            27,
+            "11 spine-table creates + 10 concurrent indexes + 2 issue expands + 4 authz migrations"
         );
         for m in &migrations.0 {
             assert!(
@@ -786,8 +797,20 @@ mod tests {
             .any(|migration| migration.id == "iss_0018_issue_authz_visible"));
         assert_eq!(
             issues.0.last().map(|migration| migration.id),
-            Some("iss_0020_issue_recent_list_idx")
+            Some("iss_0021_issue_key_prefix_list_idx")
         );
+        for invariant in [
+            "CREATE INDEX CONCURRENTLY",
+            "tenant_id, region, key text_pattern_ops, updated_at DESC, id DESC",
+            "WHERE deleted_at IS NULL AND NOT archived",
+        ] {
+            assert!(
+                CREATE_ISSUE_KEY_PREFIX_LIST_INDEX_DDL.contains(invariant),
+                "key-prefix index pins `{invariant}`"
+            );
+        }
+        assert!(CREATE_ISSUE_RECENT_LIST_INDEX_DDL
+            .contains("WHERE deleted_at IS NULL AND NOT archived"));
         assert!(CREATE_ISSUE_AUTHZ_INVALIDATION_TRIGGERS_DDL
             .contains("EXECUTE FUNCTION myelin_invalidate_issue_view_projection()"));
         assert!(!CREATE_ISSUE_AUTHZ_INVALIDATION_TRIGGERS_DDL.contains("to_regprocedure"));
@@ -810,7 +833,7 @@ mod tests {
             .expect("the full Issue-Tracker spine applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            26,
+            27,
             "the runner applied every table/index/expand migration"
         );
         assert_eq!(
@@ -826,7 +849,7 @@ mod tests {
             .expect("the spine re-applies idempotently");
         assert_eq!(
             runner2.applied().len(),
-            26,
+            27,
             "the re-apply admits every migration again"
         );
     }
