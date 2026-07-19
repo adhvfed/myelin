@@ -42,6 +42,26 @@ pub fn render(value: &Value, json_mode: bool) -> String {
         let region = value.get("region").and_then(Value::as_str).unwrap_or("?");
         return format!("{pid} ({kind})  tenant={tenant}  region={region}\n");
     }
+    // Issues create is asynchronous. Render the durable receipt honestly and pair it with the exact
+    // follow-up read; never claim the pending row is visible before the authorization reconciler.
+    if let (Some(issue), Some(authorization)) = (value.get("issue"), value.get("authorization")) {
+        if let (Some(id), Some(key)) = (
+            issue.get("id").and_then(Value::as_str),
+            issue.get("key").and_then(Value::as_str),
+        ) {
+            let status = authorization
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("pending");
+            return format!(
+                "{key} staged ({id}); authorization={status}\nnot visible yet; after reconciliation: myelin issues view {id}\n"
+            );
+        }
+    }
+    // An Issue view/close response.
+    if is_issue(value) {
+        return format!("{}\n", render_issue(value));
+    }
     // An unknown shape: pretty JSON (total — never a panic).
     format!("{}\n", serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()))
 }
@@ -49,6 +69,9 @@ pub fn render(value: &Value, json_mode: bool) -> String {
 /// Render one list item to a line. Known shapes: a RepoHome (`slug`/`state`) and a code-search hit
 /// (`repo`/`path`/`line`/`excerpt`); an unknown item falls back to compact JSON.
 fn render_item(item: &Value) -> String {
+    if is_issue(item) {
+        return render_issue(item);
+    }
     if let Some(slug) = item.get("slug").and_then(Value::as_str) {
         let state = item.get("state").and_then(Value::as_str).unwrap_or("?");
         return format!("{slug}  [{state}]");
@@ -62,6 +85,20 @@ fn render_item(item: &Value) -> String {
         return format!("{repo}:{path}:{line}  {excerpt}");
     }
     item.to_string()
+}
+
+fn is_issue(value: &Value) -> bool {
+    value.get("id").and_then(Value::as_str).is_some()
+        && value.get("key").and_then(Value::as_str).is_some()
+        && value.get("title").and_then(Value::as_str).is_some()
+}
+
+fn render_issue(value: &Value) -> String {
+    let key = value.get("key").and_then(Value::as_str).unwrap_or("?");
+    let title = value.get("title").and_then(Value::as_str).unwrap_or("");
+    let state = value.get("state").and_then(Value::as_str).unwrap_or("?");
+    let id = value.get("id").and_then(Value::as_str).unwrap_or("?");
+    format!("{key}  [{state}]  {title}  ({id})")
 }
 
 #[cfg(test)]
@@ -117,5 +154,35 @@ mod tests {
         assert!(out.contains("weird"));
         // empty list renders the explicit marker.
         assert!(render(&json!({"items":[]}), false).contains("(no items)"));
+    }
+
+    #[test]
+    fn pending_issue_receipt_never_claims_immediate_visibility() {
+        let id = "33333333-3333-3333-3333-333333333333";
+        let out = render(
+            &json!({
+                "issue": {"id": id, "key": "ENG-1", "project_id": "p"},
+                "authorization": {"status": "pending", "request_event_id": "evt"}
+            }),
+            false,
+        );
+        assert!(out.contains("authorization=pending"));
+        assert!(out.contains("not visible yet"));
+        assert!(out.contains(&format!("myelin issues view {id}")));
+        assert!(!out.contains("created successfully"));
+    }
+
+    #[test]
+    fn issue_list_and_view_have_a_human_row() {
+        let issue = json!({
+            "id":"33333333-3333-3333-3333-333333333333",
+            "key":"ENG-1",
+            "title":"Founder issue",
+            "state":"open"
+        });
+        let row = render(&issue, false);
+        assert!(row.contains("ENG-1  [open]  Founder issue"));
+        let list = render(&json!({"items":[issue],"page":{"next_cursor":null}}), false);
+        assert!(list.contains("ENG-1  [open]  Founder issue"));
     }
 }

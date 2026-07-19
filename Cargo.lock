@@ -2449,6 +2449,7 @@ dependencies = [
  "myelin-git",
  "myelin-identity",
  "myelin-identity-service",
+ "myelin-issues",
  "myelin-notif",
  "myelin-storage",
  "myelin-tenancy",

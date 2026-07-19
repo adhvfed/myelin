@@ -9,7 +9,7 @@
 use clap::{Parser, Subcommand};
 use myelin_cli::client::execute;
 use myelin_cli::config::{self, resolve_edge, resolve_token, store_token};
-use myelin_cli::dispatch::{git_dispatch, notif_dispatch, EdgeCall, HttpMethod};
+use myelin_cli::dispatch::{git_dispatch, issues_dispatch, notif_dispatch, EdgeCall, HttpMethod};
 use myelin_cli::error::CliError;
 use myelin_cli::render::render;
 
@@ -45,6 +45,12 @@ enum Command {
     /// Git commands — REUSES myelin-git's grammar: `repo list` | `pr view <n>` | `search code <q>` | …
     Git {
         /// The git subcommand + args, parsed by git's own `parse_cli`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Issue commands: `list` | `create --project … --type … --prefix … --title …` | `view` | `close`.
+    Issues {
+        /// The Issues subcommand + args, parsed by the subsystem's own total grammar.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -107,6 +113,11 @@ async fn run() -> Result<(), CliError> {
         Command::Git { args } => {
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let call = git_dispatch(&refs)?;
+            run_call(&cli, &getenv, &read_file, call).await
+        }
+        Command::Issues { args } => {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let call = issues_dispatch(&refs)?;
             run_call(&cli, &getenv, &read_file, call).await
         }
         Command::Notif { args } => {
