@@ -384,7 +384,7 @@ pub struct Consumer<H: EventHandler> {
     upcaster: Upcaster,
     /// `num_pending` per subject (rule 7: consumer lag). A message that retries (not acked)
     /// counts toward lag; an acked/deduped/dead-lettered message does not.
-    pending: Mutex<HashMap<String, u64>>,
+    pending: Mutex<HashMap<String, std::collections::HashSet<crate::EventId>>>,
     /// Dead-lettered (poison) messages (rule 5), surfaced. **CT-004d.2 chunk 6 / #7b:** now a
     /// [`DeadLetterSink`] (was a bare `Mutex<Vec<DeadLetter>>`) so the durable arm makes a
     /// dead-lettered event — especially the H2 panic path — SURVIVE a restart. The in-memory arm is
@@ -423,6 +423,36 @@ impl<H: EventHandler> Consumer<H> {
     /// Broker pumps use this before delivery so an event is never sent to an unrelated consumer.
     pub fn accepts(&self, subject: &str) -> bool {
         self.subscription.matches(subject)
+    }
+
+    /// Whether this consumer already committed the event's dedup mark.
+    pub fn is_handled(&self, event_id: &crate::EventId) -> bool {
+        self.dedup.is_handled(self.name(), event_id)
+    }
+
+    /// Durably quarantine a handler Retry whose broker delivery budget is exhausted.
+    ///
+    /// The handler's co-commit transaction has already rolled back on [`Delivered::Retried`], so
+    /// this path records no dedup tombstone. A later operator replay can therefore execute the
+    /// repaired handler. If durable DLQ persistence fails, the result remains `Retried` and the
+    /// broker must not terminate the delivery.
+    pub fn dead_letter_exhausted_retry(&self, msg: &Message, delivery_attempt: u64) -> Delivered {
+        let reason = Reason(format!(
+            "retry budget exhausted after {delivery_attempt} broker deliveries"
+        ));
+        match self.push_dead_letter(msg.envelope.clone(), reason.clone()) {
+            Ok(()) => {
+                self.clear_pending(&msg.subject, &msg.envelope.event_id);
+                self.clear_tenant_inflight(&msg.envelope.tenant, &msg.envelope.event_id);
+                Delivered::DeadLettered(reason)
+            }
+            Err(_) => {
+                // Pending is keyed by event id, so this is idempotent whether `deliver` recorded
+                // the retry in this process or a restart reached quarantine directly.
+                self.bump_pending(&msg.subject, &msg.envelope.event_id);
+                Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS)
+            }
+        }
     }
 
     /// Set the per-tenant in-flight fairness cap (rule 6, EB-05). [`consume`] wires this from the
@@ -494,13 +524,16 @@ impl<H: EventHandler> Consumer<H> {
     /// The contract-1.8 `consumer_lag` signal reads this; a drill asserts it recovers to 0 after
     /// a reconnect.
     pub fn lag(&self) -> u64 {
-        self.pending().values().copied().sum()
+        self.pending().values().map(|events| events.len() as u64).sum()
     }
 
     /// The un-acked backlog on ONE subject (rule 6+7: a slow subject's lag does not stall a fast
     /// one — the drill reads per-subject lag to assert no head-of-line block).
     pub fn lag_on(&self, subject: &str) -> u64 {
-        self.pending().get(subject).copied().unwrap_or(0)
+        self.pending()
+            .get(subject)
+            .map(|events| events.len() as u64)
+            .unwrap_or(0)
     }
 
     /// The dead-lettered (poison) messages so far (rule 5), surfaced IN-PROCESS. On the in-memory
@@ -541,9 +574,12 @@ impl<H: EventHandler> Consumer<H> {
             // it is surfaced, not silently swallowed.
             let reason = Reason(format!("subject {} not on consumer whitelist", msg.subject));
             return match self.push_dead_letter(msg.envelope.clone(), reason.clone()) {
-                Ok(()) => Delivered::DeadLettered(reason),
+                Ok(()) => {
+                    self.clear_pending(&msg.subject, &msg.envelope.event_id);
+                    Delivered::DeadLettered(reason)
+                }
                 Err(_) => {
-                    self.bump_pending(&msg.subject);
+                    self.bump_pending(&msg.subject, &msg.envelope.event_id);
                     Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS)
                 }
             };
@@ -562,7 +598,7 @@ impl<H: EventHandler> Consumer<H> {
         if !self.tenant_has_inflight(&tenant, &event_id)
             && self.tenant_inflight(&tenant) >= self.per_tenant_cap.get()
         {
-            self.bump_pending(&msg.subject);
+            self.bump_pending(&msg.subject, &event_id);
             return Delivered::Throttled(tenant);
         }
 
@@ -577,11 +613,11 @@ impl<H: EventHandler> Consumer<H> {
             Err(reason) => {
                 return match self.push_dead_letter(msg.envelope.clone(), reason.clone()) {
                     Ok(()) => {
-                        self.clear_pending(&msg.subject);
+                        self.clear_pending(&msg.subject, &event_id);
                         Delivered::DeadLettered(reason)
                     }
                     Err(_) => {
-                        self.bump_pending(&msg.subject);
+                        self.bump_pending(&msg.subject, &event_id);
                         Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS)
                     }
                 };
@@ -605,7 +641,7 @@ impl<H: EventHandler> Consumer<H> {
             // Already handled by this consumer: skip + ack (the cursor advances; lag clears). Roll
             // back the (empty) transaction — the pre-existing mark is untouched.
             cotx.rollback();
-            self.clear_pending(&msg.subject);
+            self.clear_pending(&msg.subject, &event_id);
             return Delivered::Deduplicated;
         }
 
@@ -682,14 +718,14 @@ impl<H: EventHandler> Consumer<H> {
                 );
                 return match self.push_dead_letter(envelope, reason.clone()) {
                     Ok(()) => {
-                        self.clear_pending(&msg.subject);
+                        self.clear_pending(&msg.subject, &event_id);
                         self.clear_tenant_inflight(&tenant, &event_id);
                         Delivered::DeadLettered(reason)
                     }
                     Err(_) => {
                         // The poison itself is known, but its durable replay/quarantine record did
                         // not commit. Keep the event outstanding and withhold the broker ack.
-                        self.bump_pending(&msg.subject);
+                        self.bump_pending(&msg.subject, &event_id);
                         Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS)
                     }
                 };
@@ -702,14 +738,14 @@ impl<H: EventHandler> Consumer<H> {
                 // NEITHER landed → treat it as a Retry (do NOT ack; the redelivery re-runs — 0 lost).
                 match cotx.commit() {
                     Ok(()) => {
-                        self.clear_pending(&msg.subject);
+                        self.clear_pending(&msg.subject, &event_id);
                         self.clear_tenant_inflight(&tenant, &event_id);
                         Delivered::Acked
                     }
                     Err(_e) => {
                         // The tx did not commit (DB hiccup) — mark + effect both absent. Redeliver
                         // (0 lost); keep the in-flight slot (the work is still outstanding).
-                        self.bump_pending(&msg.subject);
+                        self.bump_pending(&msg.subject, &event_id);
                         Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS)
                     }
                 }
@@ -731,12 +767,12 @@ impl<H: EventHandler> Consumer<H> {
                         // The poison is durably replayable/quarantined. Only now may the terminal
                         // dedup tombstone land and the service-level broker cursor advance.
                         self.dedup.mark_handled(self.name(), &event_id);
-                        self.clear_pending(&msg.subject);
+                        self.clear_pending(&msg.subject, &event_id);
                         self.clear_tenant_inflight(&tenant, &event_id);
                         Delivered::DeadLettered(reason)
                     }
                     Err(_) => {
-                        self.bump_pending(&msg.subject);
+                        self.bump_pending(&msg.subject, &event_id);
                         Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS)
                     }
                 }
@@ -750,7 +786,7 @@ impl<H: EventHandler> Consumer<H> {
                 // handler again — this IS the old speculative-mark-revert, now atomic with the
                 // handler's effect).
                 cotx.rollback();
-                self.bump_pending(&msg.subject);
+                self.bump_pending(&msg.subject, &event_id);
                 Delivered::Retried(backoff.seconds)
             }
         }
@@ -784,17 +820,26 @@ impl<H: EventHandler> Consumer<H> {
             .push(self.name(), DeadLetter { envelope, reason })
     }
 
-    fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<String, u64>> {
+    fn pending(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, std::collections::HashSet<crate::EventId>>> {
         self.pending.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn bump_pending(&self, subject: &str) {
-        *self.pending().entry(subject.to_string()).or_insert(0) += 1;
+    fn bump_pending(&self, subject: &str, event_id: &crate::EventId) {
+        self.pending()
+            .entry(subject.to_string())
+            .or_default()
+            .insert(event_id.clone());
     }
 
-    fn clear_pending(&self, subject: &str) {
-        if let Some(p) = self.pending().get_mut(subject) {
-            *p = p.saturating_sub(1);
+    fn clear_pending(&self, subject: &str, event_id: &crate::EventId) {
+        let mut pending = self.pending();
+        if let Some(events) = pending.get_mut(subject) {
+            events.remove(event_id);
+            if events.is_empty() {
+                pending.remove(subject);
+            }
         }
     }
 
@@ -842,7 +887,7 @@ mod tests {
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
     use myelin_tenancy::{Region, TenantId};
     use std::collections::HashSet;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
 
     fn principal() -> Principal {
@@ -1252,18 +1297,17 @@ mod tests {
     /// and a later redelivery RE-RUNS the handler (a transient failure is never swallowed — that
     /// would be silent data loss). When the redelivery succeeds, lag clears.
     #[test]
-    fn retry_does_not_ack_redelivery_reruns_then_succeeds() {
-        // The handler fails (Retry) the FIRST time it sees an id, then succeeds.
+    fn multiple_retries_track_one_pending_event_then_success_clears_lag() {
+        // The handler fails (Retry) twice, then succeeds.
         struct Flaky {
-            seen: Mutex<HashSet<String>>,
+            calls: AtomicU32,
         }
         impl EventHandler for Flaky {
             fn subjects(&self) -> &'static [SubjectPattern] {
                 SUBJECTS
             }
-            fn handle(&self, ev: &EventEnvelope, _tx: &mut HandlerTx<'_>) -> HandleOutcome {
-                let mut seen = self.seen.lock().unwrap();
-                if seen.insert(ev.event_id.0.clone()) {
+            fn handle(&self, _ev: &EventEnvelope, _tx: &mut HandlerTx<'_>) -> HandleOutcome {
+                if self.calls.fetch_add(1, Ordering::SeqCst) < 2 {
                     HandleOutcome::Retry(Backoff { seconds: 2 })
                 } else {
                     HandleOutcome::Done
@@ -1272,7 +1316,7 @@ mod tests {
         }
         let c = Consumer::new(
             Flaky {
-                seen: Mutex::new(HashSet::new()),
+                calls: AtomicU32::new(0),
             },
             sub("indexer", &["myelin://acme/issues/"]),
             DedupLedger::new(),
@@ -1287,7 +1331,11 @@ mod tests {
             "a retry leaves NO dedup mark"
         );
 
-        // redelivery: the handler RE-RUNS (0 lost) and now succeeds → acked, lag clears.
+        // A second redelivery is the SAME pending event, not another unit of lag.
+        assert_eq!(c.deliver(&m), Delivered::Retried(2));
+        assert_eq!(c.lag(), 1, "redelivery does not double-count pending lag");
+
+        // Third delivery: the handler RE-RUNS (0 lost) and now succeeds → acked, lag clears.
         assert_eq!(
             c.deliver(&m),
             Delivered::Acked,
@@ -1451,6 +1499,42 @@ mod tests {
             "the handler never ran for an off-whitelist subject"
         );
         assert_eq!(c.dead_letters().len(), 1);
+    }
+
+    #[test]
+    fn off_whitelist_dlq_failure_then_success_clears_pending_lag() {
+        struct FailOnce(AtomicBool);
+        impl crate::DurableDeadLetter for FailOnce {
+            fn record(
+                &self,
+                _consumer: &ConsumerName,
+                _event_id: &crate::EventId,
+                _reason: &str,
+            ) -> Result<(), String> {
+                if self.0.swap(false, Ordering::SeqCst) {
+                    Err("DLQ unavailable".into())
+                } else {
+                    Ok(())
+                }
+            }
+            fn dead_letters(&self, _consumer: &ConsumerName) -> Vec<crate::DeadLetterRecord> {
+                Vec::new()
+            }
+        }
+        let c = Consumer::new(
+            done_handler(),
+            sub("indexer", &["myelin://acme/issues/"]),
+            DedupLedger::new(),
+        )
+        .with_dead_letter_sink(DeadLetterSink::durable(Arc::new(FailOnce(AtomicBool::new(
+            true,
+        )))));
+        let off = msg("01J-off-retry", "myelin://acme/chat/message/1");
+
+        assert!(matches!(c.deliver(&off), Delivered::Retried(_)));
+        assert_eq!(c.lag(), 1);
+        assert!(matches!(c.deliver(&off), Delivered::DeadLettered(_)));
+        assert_eq!(c.lag(), 0);
     }
 
     // --- EB-05: the `consume(ConsumerSpec{ … }, handler)` entry-point ---
