@@ -42,10 +42,12 @@ export default function IssueDetail() {
       const result = await mutate({ op: "close", issueId: row.id });
       if (!result.ok) {
         setCloseError(result.error);
+        setConfirming(false);
         return;
       }
       if (result.op !== "close") {
         setCloseError("error");
+        setConfirming(false);
         return;
       }
       setReplacement(result.issue);
@@ -55,6 +57,7 @@ export default function IssueDetail() {
       toast.show({ title: `${result.issue.key} closed`, variant: "success" });
     } catch {
       setCloseError("error");
+      setConfirming(false);
     } finally {
       setClosing(false);
     }
@@ -119,8 +122,7 @@ export default function IssueDetail() {
 
 function closeErrorText(kind: IssueErrorKind): string {
   if (kind === "not-found") return "This issue is not available to you.";
-  if (kind === "unavailable") return "Issue authorization is temporarily unavailable. Try again.";
-  return "We couldn't close the issue. It has not been changed.";
+  return "We couldn't confirm whether this issue was closed. Refresh and check its current state before retrying.";
 }
 
 function IssueDetailError(props: { kind: IssueErrorKind }) {

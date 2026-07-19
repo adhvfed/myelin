@@ -847,7 +847,25 @@ const pagedOpenIssues = Array.from({ length: 49 }, (_, index) => {
   };
 });
 
-export const SEED_ISSUES = [...headlineIssues, ...pagedOpenIssues];
+// Enough terminal rows to exercise the closed cursor path independently from open rows. These use
+// a separate UUID namespace while retaining normal MYL keys and authoritative terminal categories.
+const pagedClosedIssues = Array.from({ length: 50 }, (_, index) => {
+  const number = 199 - index;
+  const instant = new Date(Date.parse("2026-07-18T09:59:00.000Z") - index * 60_000).toISOString();
+  return {
+    id: `20000000-0000-4000-8000-${String(number).padStart(12, "0")}`,
+    key: `MYL-${number}`,
+    project_id: DEV_ISSUE_TARGET.project_id,
+    state: "Done",
+    state_category: "completed",
+    title: `Closed dogfood finding ${number}`,
+    version: 2,
+    created_at: instant,
+    updated_at: instant,
+  };
+});
+
+export const SEED_ISSUES = [...headlineIssues, ...pagedOpenIssues, ...pagedClosedIssues];
 
 export function freshIssueFixtures() {
   return SEED_ISSUES.map((issue) => ({ ...issue }));

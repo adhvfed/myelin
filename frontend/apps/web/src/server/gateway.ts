@@ -23,9 +23,25 @@ function edgeUrl(): string {
   return process.env.MYELIN_EDGE_URL ?? "http://127.0.0.1:8787";
 }
 
+export interface GatewayRequestOptions {
+  /** One deadline signal spans the edge attempt, token refresh, and single retry. */
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+export function gatewayRequestSignal(options: GatewayRequestOptions = {}): AbortSignal | undefined {
+  const signals: AbortSignal[] = [];
+  if (options.signal) signals.push(options.signal);
+  if (options.timeoutMs !== undefined && options.timeoutMs > 0) {
+    signals.push(AbortSignal.timeout(options.timeoutMs));
+  }
+  if (signals.length === 0) return undefined;
+  return signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+}
+
 /** GET a JSON view-model from the edge through the full auth lifecycle. */
-export async function edgeGet<T = unknown>(path: string): Promise<T> {
-  return edgeRequest<T>("GET", path);
+export async function edgeGet<T = unknown>(path: string, options?: GatewayRequestOptions): Promise<T> {
+  return edgeRequest<T>("GET", path, undefined, options);
 }
 
 /** POST to the edge (write verbs) through the full auth lifecycle. */
@@ -87,8 +103,14 @@ export async function edgeWhoamiWithToken(token: string, scheme = "agent"): Prom
   return who;
 }
 
-async function edgeRequest<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function edgeRequest<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  options?: GatewayRequestOptions,
+): Promise<T> {
   const scheme = getSessionRecord()?.scheme ?? "pat";
+  const signal = gatewayRequestSignal(options);
   return runGateway<T>({
     getToken: () => getSessionRecord()?.token ?? null,
     doFetch: async (token) => {
@@ -100,6 +122,7 @@ async function edgeRequest<T>(method: string, path: string, body?: unknown): Pro
           ...(body !== undefined ? { "content-type": "application/json" } : {}),
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal,
       });
       return { status: res.status, bodyText: await res.text() };
     },
@@ -112,6 +135,7 @@ async function edgeRequest<T>(method: string, path: string, body?: unknown): Pro
           authorization: `Bearer ${rec.refreshToken}`,
           "x-myelin-token-scheme": "refresh",
         },
+        signal,
       });
       if (res.status !== 200) return null;
       // The refresh response may rotate the access token; persist it server-side and use it for the retry.

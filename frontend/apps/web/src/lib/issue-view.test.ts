@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import type { IssueVM, IssuesPage } from "./api";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { IssueAuthorizationStatus, IssueVM, IssuesPage } from "./api";
 import {
   isClosedCategory,
   issueErrorKind,
@@ -29,6 +29,8 @@ function issue(id: string): IssueVM {
 function page(items: IssueVM[], next: string | null = null): IssuesPage {
   return { items, page: { next_cursor: next, limit: 2 } };
 }
+
+afterEach(() => vi.useRealTimers());
 
 describe("issue list URL and filter mapping", () => {
   it("defaults unknown state to open and emits canonical URLs", () => {
@@ -139,5 +141,41 @@ describe("issue create and page state", () => {
     );
     expect(clock).toBe(250);
     expect(outcome.phase).toBe("active");
+  });
+
+  it("settles as unconfirmed when one status read never resolves past the budget", async () => {
+    vi.useFakeTimers();
+    const stalled = new Promise<never>(() => {});
+    let pollSignal: AbortSignal | undefined;
+    const outcome = pollIssueActivation("01REQUEST", async (_request, signal) => {
+      pollSignal = signal;
+      return stalled;
+    }, { budgetMs: 1_000 });
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await expect(outcome).resolves.toEqual({ phase: "unconfirmed" });
+    expect(pollSignal?.aborted).toBe(true);
+  });
+
+  it("aborts a stalled status read and ignores its late result", async () => {
+    const controller = new AbortController();
+    let resolvePoll: ((status: IssueAuthorizationStatus) => void) | undefined;
+    let pollSignal: AbortSignal | undefined;
+    const deferred = new Promise<IssueAuthorizationStatus>((resolve) => { resolvePoll = resolve; });
+    const outcome = pollIssueActivation("01REQUEST", async (_request, signal) => {
+      pollSignal = signal;
+      return deferred;
+    }, {
+      signal: controller.signal,
+    });
+
+    controller.abort();
+    await expect(outcome).resolves.toEqual({ phase: "unconfirmed" });
+    expect(pollSignal?.aborted).toBe(true);
+
+    resolvePoll?.({ status: "active", issue: issue("1") });
+    await Promise.resolve();
+    await expect(outcome).resolves.toEqual({ phase: "unconfirmed" });
   });
 });

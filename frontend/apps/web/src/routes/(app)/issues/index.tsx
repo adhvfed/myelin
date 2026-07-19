@@ -69,16 +69,33 @@ export default function IssuesIndex() {
   const [loadMoreError, setLoadMoreError] = createSignal(false);
   const [pending, setPending] = createSignal<PendingIssue[]>([]);
   const [activeRow, setActiveRow] = createSignal(0);
-  const pollControllers: AbortController[] = [];
-  onCleanup(() => pollControllers.forEach((controller) => controller.abort()));
+  const pollControllers = new Set<AbortController>();
+  let filterGeneration = 0;
+  let loadMoreRequest = 0;
+  let loadMoreController: AbortController | undefined;
+
+  const resetPagination = () => {
+    filterGeneration += 1;
+    loadMoreRequest += 1;
+    loadMoreController?.abort();
+    loadMoreController = undefined;
+    setExtraPages([]);
+    setLoadingMore(false);
+    setLoadMoreError(false);
+    setActiveRow(0);
+  };
+
+  onCleanup(() => {
+    loadMoreController?.abort();
+    pollControllers.forEach((controller) => controller.abort());
+    pollControllers.clear();
+  });
 
   createEffect(() => {
     setKeyDraft(rawKey());
     state();
     key();
-    setExtraPages([]);
-    setLoadMoreError(false);
-    setActiveRow(0);
+    resetPagination();
   });
 
   const firstPage = createAsync(async (): Promise<{
@@ -125,15 +142,38 @@ export default function IssuesIndex() {
   const loadMore = async () => {
     const cursor = nextCursor();
     if (!cursor || loadingMore()) return;
+    const generation = filterGeneration;
+    const request = ++loadMoreRequest;
+    const controller = new AbortController();
+    loadMoreController?.abort();
+    loadMoreController = controller;
+    const requestState = state();
+    const requestKey = key();
     setLoadingMore(true);
     setLoadMoreError(false);
     try {
-      const page = await getIssues({ state: state(), key: key(), cursor, limit: 50 });
+      const page = await getIssues({ state: requestState, key: requestKey, cursor, limit: 50 });
+      if (
+        controller.signal.aborted ||
+        generation !== filterGeneration ||
+        request !== loadMoreRequest
+      ) return;
       setExtraPages((pages) => [...pages, page]);
     } catch {
-      setLoadMoreError(true);
+      if (
+        !controller.signal.aborted &&
+        generation === filterGeneration &&
+        request === loadMoreRequest
+      ) setLoadMoreError(true);
     } finally {
-      setLoadingMore(false);
+      if (
+        !controller.signal.aborted &&
+        generation === filterGeneration &&
+        request === loadMoreRequest
+      ) {
+        loadMoreController = undefined;
+        setLoadingMore(false);
+      }
     }
   };
 
@@ -185,7 +225,7 @@ export default function IssuesIndex() {
     setPending((items) => [item, ...items.filter((entry) => entry.id !== item.id)]);
     toast.show({ title: `${item.key} accepted — activating access…`, variant: "info" });
     const controller = new AbortController();
-    pollControllers.push(controller);
+    pollControllers.add(controller);
     void pollIssueActivation(
       item.requestEventId,
       async (requestEventId) => {
@@ -198,6 +238,7 @@ export default function IssuesIndex() {
       if (controller.signal.aborted) return;
       if (outcome.phase === "active") {
         setPending((items) => items.filter((entry) => entry.id !== item.id));
+        resetPagination();
         void revalidate("issues-list");
         toast.show({ title: `${item.key} is ready`, variant: "success" });
       } else {
@@ -211,7 +252,7 @@ export default function IssuesIndex() {
           entry.id === item.id ? { ...entry, phase: "unconfirmed" } : entry,
         ));
       }
-    });
+    }).finally(() => pollControllers.delete(controller));
   };
 
   return (
@@ -280,9 +321,11 @@ export default function IssuesIndex() {
               {(receipt) => (
                 <li data-testid="pending-issue">
                   <code>{receipt.key}</code>
-                  <span><Icon name="cycle" /> {receipt.phase === "pending" ? "Activating access…" : "Activation isn’t confirmed yet"}</span>
+                  <span role="status" aria-live="polite" aria-atomic="true">
+                    <Icon name="cycle" /> {receipt.phase === "pending" ? "Activating access…" : "Activation could not be confirmed"}
+                  </span>
                   <Show when={receipt.phase === "unconfirmed"}>
-                    <small>It remains safely pending. Refresh later.</small>
+                    <small>No failure is inferred. Refresh the list later.</small>
                   </Show>
                 </li>
               )}
@@ -296,7 +339,7 @@ export default function IssuesIndex() {
           <Show when={firstPage()?.error} fallback={<Show when={firstPage()?.page}>
             <Show
               when={rows().length > 0}
-              fallback={<IssuesEmpty filtered={Boolean(key()) || state() !== "open"} clear={() => navigate("/issues")} create={openCreate} />}
+              fallback={<IssuesEmpty state={state()} filtered={Boolean(key())} clear={() => navigate("/issues")} create={openCreate} />}
             >
               <p class="sr-only" role="status" aria-live="polite">{rows().length} issues shown.</p>
               <ul class="issues-list" data-testid="issues-list">
@@ -370,14 +413,34 @@ function IssuesSkeleton() {
   );
 }
 
-function IssuesEmpty(props: { filtered: boolean; clear: () => void; create: () => void }) {
+function IssuesEmpty(props: {
+  state: IssueListState;
+  filtered: boolean;
+  clear: () => void;
+  create: () => void;
+}) {
+  const heading = () => props.filtered
+    ? "No issues match these filters"
+    : props.state === "open"
+      ? "No open issues"
+      : props.state === "closed"
+        ? "No closed issues"
+        : "No issues yet";
+  const description = () => props.filtered
+    ? "Try another issue key or state."
+    : props.state === "open"
+      ? "Nothing is currently open."
+      : props.state === "closed"
+        ? "Nothing has reached a closed state."
+        : "Capture the first rough edge in Myelin.";
+  const createAction = () => props.state === "open" || props.state === "all";
   return (
-    <div class="issues-empty" data-testid={props.filtered ? "issues-no-results" : "issues-empty"}>
+    <div class="issues-empty" data-testid={props.filtered ? "issues-no-results" : props.state === "all" ? "issues-empty" : "issues-state-empty"}>
       <Icon name="issue" />
-      <h2>{props.filtered ? "No issues match these filters" : "No issues yet"}</h2>
-      <p>{props.filtered ? "Try another issue key or state." : "Capture the first rough edge in Myelin."}</p>
-      <button type="button" class="issues-button issues-button-secondary" onClick={() => props.filtered ? props.clear() : props.create()}>
-        {props.filtered ? "Clear filters" : "Create the first issue"}
+      <h2>{heading()}</h2>
+      <p>{description()}</p>
+      <button type="button" class="issues-button issues-button-secondary" onClick={() => props.filtered || !createAction() ? props.clear() : props.create()}>
+        {props.filtered ? "Clear filters" : createAction() ? props.state === "all" ? "Create the first issue" : "Create issue" : "View open issues"}
       </button>
     </div>
   );

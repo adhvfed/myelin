@@ -7,13 +7,30 @@ const OPEN_ID = "00000000-0000-4000-8000-000000000102";
 async function setEdgeConfig(cfg: {
   resetIssues?: boolean;
   emptyIssues?: boolean;
+  onlyClosedIssues?: boolean;
   issuesUnavailable?: boolean;
   issueActivationPolls?: number;
+  issueActivationUnavailable?: boolean;
+  issueCreateUnavailable?: boolean;
+  issueCloseUnavailable?: boolean;
+  issueListCursorDelaysMs?: number[];
 }) {
   const context = await pwRequest.newContext();
   const response = await context.post(`${EDGE}/__test/config`, { data: cfg });
   expect(response.ok(), "dev-edge Issues config must be accepted").toBeTruthy();
   await context.dispose();
+}
+
+async function edgeIssueState(): Promise<{
+  issueListCursorRequests: number;
+  issueListCursorResponses: number;
+}> {
+  const context = await pwRequest.newContext();
+  const response = await context.post(`${EDGE}/__test/config`, { data: {} });
+  expect(response.ok()).toBeTruthy();
+  const body = await response.json();
+  await context.dispose();
+  return body.state;
 }
 
 async function devLogin(page: Page) {
@@ -82,6 +99,29 @@ test.describe("R4.4 founder Issues web floor", () => {
     await expect(page.getByText(/of \d+/)).toHaveCount(0);
   });
 
+  test("a delayed old cursor page cannot mix into a new filter generation", async ({ page }) => {
+    await setEdgeConfig({ issueListCursorDelaysMs: [250, 1_500] });
+    await devLogin(page);
+    await page.goto("/issues");
+    await expect(page.getByTestId("issue-row")).toHaveCount(50);
+
+    await page.getByRole("button", { name: "Load more" }).click();
+    await page.getByRole("tab", { name: "Closed" }).click();
+    await page.waitForURL("**/issues?state=closed");
+    await expect(page.getByTestId("issue-row")).toHaveCount(50);
+    await page.getByRole("button", { name: "Load more" }).click();
+    await expect.poll(async () => (await edgeIssueState()).issueListCursorRequests).toBe(2);
+    await expect.poll(async () => (await edgeIssueState()).issueListCursorResponses).toBe(1);
+
+    await expect(page.getByRole("button", { name: "Loading…" })).toBeDisabled();
+    await expect(page.getByTestId("issue-row")).toHaveCount(50);
+
+    await expect(page.getByTestId("issue-row")).toHaveCount(51);
+    await expect(page.getByText("Retire the ledger workaround")).toBeVisible();
+    await expect(page.getByTitle("State: Done")).toHaveCount(51);
+    await expect(page.getByTitle("State: Todo")).toHaveCount(0);
+  });
+
   test("quick capture is focus-safe from both the button and command palette", async ({ page }) => {
     await devLogin(page);
     await page.goto("/issues");
@@ -110,6 +150,8 @@ test.describe("R4.4 founder Issues web floor", () => {
     await setEdgeConfig({ issueActivationPolls: 2 });
     await devLogin(page);
     await page.goto("/issues");
+    await page.getByRole("button", { name: "Load more" }).click();
+    await expect(page.getByTestId("issue-row")).toHaveCount(51);
     await page.getByRole("button", { name: "New issue" }).click();
     await page.getByLabel("Title").fill("Capture the browser rough edge");
     await page.getByRole("button", { name: "Create issue" }).click();
@@ -122,6 +164,59 @@ test.describe("R4.4 founder Issues web floor", () => {
     await expect(page.getByText("Capture the browser rough edge")).toBeVisible();
     await expect(pending).toHaveCount(0);
     await expect(page.getByText(/is ready/)).toBeVisible();
+    await expect(page.getByTestId("issue-row")).toHaveCount(50);
+    await page.getByRole("button", { name: "Load more" }).click();
+    await expect(page.getByTestId("issue-row")).toHaveCount(52);
+    const ids = await page.getByTestId("issue-row").evaluateAll((rows) =>
+      rows.map((row) => row.getAttribute("href")),
+    );
+    expect(new Set(ids).size).toBe(52);
+
+    await page.reload();
+    await expect(page.getByTestId("issue-row")).toHaveCount(50);
+    await page.getByRole("button", { name: "Load more" }).click();
+    await expect(page.getByTestId("issue-row")).toHaveCount(52);
+    const freshIds = await page.getByTestId("issue-row").evaluateAll((rows) =>
+      rows.map((row) => row.getAttribute("href")),
+    );
+    expect(new Set(freshIds).size).toBe(52);
+    expect(freshIds).toEqual(ids);
+  });
+
+  test("an unavailable activation confirmation is announced without inferring failure", async ({ page }) => {
+    await setEdgeConfig({ issueActivationUnavailable: true });
+    await devLogin(page);
+    await page.goto("/issues");
+    await page.getByRole("button", { name: "New issue" }).click();
+    await page.getByLabel("Title").fill("Keep an honest activation status");
+    await page.getByRole("button", { name: "Create issue" }).click();
+
+    const status = page.getByTestId("pending-issue").getByRole("status");
+    await expect(status).toHaveText(/Activation could not be confirmed/);
+    await expect(page.getByTestId("pending-issue")).toContainText("No failure is inferred");
+    await expect(page.getByTestId("pending-issue")).not.toContainText("safely pending");
+  });
+
+  test("ambiguous create and close failures tell the founder to check before retrying", async ({ page }) => {
+    await setEdgeConfig({ issueCreateUnavailable: true });
+    await devLogin(page);
+    await page.goto("/issues");
+    await page.getByRole("button", { name: "New issue" }).click();
+    await page.getByLabel("Title").fill("Do not overclaim a failed create");
+    await page.getByRole("button", { name: "Create issue" }).click();
+    await expect(page.getByRole("alert")).toContainText(
+      "We couldn't confirm whether the issue was created. Check the list before retrying.",
+    );
+    await expect(page.getByRole("alert")).not.toContainText("Nothing was submitted twice");
+
+    await setEdgeConfig({ issueCreateUnavailable: false, issueCloseUnavailable: true });
+    await page.goto(`/issues/${OPEN_ID}`);
+    await page.getByRole("button", { name: "Close issue" }).click();
+    await page.getByRole("alertdialog").getByRole("button", { name: "Close issue" }).click();
+    await expect(page.getByRole("alert")).toContainText(
+      "We couldn't confirm whether this issue was closed. Refresh and check its current state before retrying.",
+    );
+    await expect(page.getByRole("alert")).not.toContainText("It has not been changed");
   });
 
   test("detail closes only after a safe-focus confirmation", async ({ page }) => {
@@ -141,7 +236,7 @@ test.describe("R4.4 founder Issues web floor", () => {
   test("empty, projection-unavailable, and leak-free not-available states stay distinct", async ({ page }) => {
     await setEdgeConfig({ emptyIssues: true });
     await devLogin(page);
-    await page.goto("/issues");
+    await page.goto("/issues?state=all");
     await expect(page.getByTestId("issues-empty")).toContainText("No issues yet");
 
     await setEdgeConfig({ issuesUnavailable: true });
@@ -151,6 +246,17 @@ test.describe("R4.4 founder Issues web floor", () => {
     await setEdgeConfig({ issuesUnavailable: false });
     await page.goto("/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
     await expect(page.getByTestId("issue-detail-error")).toContainText("not available to you");
+  });
+
+  test("an open-empty view never claims the tenant has no issues when closed work exists", async ({ page }) => {
+    await setEdgeConfig({ onlyClosedIssues: true });
+    await devLogin(page);
+    await page.goto("/issues");
+    await expect(page.getByTestId("issues-state-empty")).toContainText("No open issues");
+    await expect(page.getByText("No issues yet")).toHaveCount(0);
+
+    await page.getByRole("tab", { name: "Closed" }).click();
+    await expect(page.getByText("Retire the ledger workaround")).toBeVisible();
   });
 
   test("375px layout retains key, title, state, and actions without horizontal overflow", async ({ page }) => {
