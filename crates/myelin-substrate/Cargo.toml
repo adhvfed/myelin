@@ -29,6 +29,7 @@ serde.workspace = true
 # The versioned thresholds file (P-S22 / P-038): the single TOML source of truth every M0
 # drill reads its quantified threshold from. `toml` (de)serializes it.
 toml.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 # MR-009b Wave 3: enable `test-support` so this crate's DEV tests reach the events in-memory

@@ -2,8 +2,8 @@
 //!
 //! The "every service `main.rs`" the contract-index row 1.1 names: it composes the DURABLE
 //! composition root (MR-009b W3b.6, the W3b.4 pattern) and hands the CI Trigger & Dispatch
-//! [`AppSpec`](myelin_ci_dispatch::dispatch_app_spec) to the harness's one call,
-//! [`run_dispatch`](myelin_ci_dispatch::run_dispatch) (a thin wrapper over `serve`). The harness
+//! [`AppSpec`](myelin_ci_dispatch::dispatch_app_spec) to the harness-owned persistent lifecycle via
+//! [`run_dispatch_until_shutdown`](myelin_ci_dispatch::run_dispatch_until_shutdown). The harness
 //! owns the whole lifecycle (boot → migrate → outbox relay → consumers → three ports → graceful
 //! drain, with liveness ≠ readiness); this `main` composes and hands off.
 //!
@@ -11,8 +11,8 @@
 //! `consumer_dedup` ledger (the exactly-once-effect anchor) and auto-registers its OLTP store as a
 //! `PersonalDataHolder`. A failed boot / incomplete drain returns non-zero (§3.1) — loud.
 //!
-//! **DURABLE-BY-DEFAULT (MR-009b W3b.6 / SI-007):** the outbox the relay drains is the PG-backed
-//! `outbox` table (`OutboxStore::durable(PgOutboxBacking)`) over the MR-022 `SubstrateProvider`
+//! **DURABLE-BY-DEFAULT (MR-009b W3b.6 / SI-007):** emitted rows use the PG-backed `outbox` table
+//! (`OutboxStore::durable(PgOutboxBacking)`) over the MR-022 `SubstrateProvider`
 //! runtime pool, after a privileged migration pool applies the complete schema and is destroyed —
 //! committed events survive a process restart. **FAIL LOUD on missing durable config** (the W3b.4
 //! service-main pattern): missing/distinct `DATABASE_URL` and `DATABASE_MIGRATION_URL`, an
@@ -26,13 +26,16 @@
 //!
 //! **Floor:** the substrate AppSpec config still uses its validated default, while every production
 //! endpoint and both PostgreSQL roles are explicit through `Mode::RequireEnv`. The dispatch
-//! behaviour (the
-//! `EventMatcher`, the trust-tier stamp, the definition resolution → CAS snapshot, the
-//! reserve/start handoff) is CI-P10/CI-P11 — this shell matches no event and starts no workflow
-//! yet.
+//! intake is a named durable JetStream pull consumer; Git reads use a validated shared root; CAS
+//! snapshots use the configured S3 backing; the durable handler executes the CI-P10/CI-P11
+//! matcher, trust stamp, definition resolution, and reserve/start handoff.
 
-use myelin_ci_dispatch::run_dispatch;
+use myelin_ci_dispatch::{
+    git_intake_filter, run_dispatch_until_shutdown, AuthoritativeGitRoot, EVENT_DURABLE_CONSUMER,
+    EVENT_STREAM_NAME, EVENT_SUBJECT_ROOT,
+};
 use myelin_config::Mode;
+use myelin_events::nats::{JetStreamConsumerConfig, NatsJetStreamBus};
 use myelin_events::OutboxStore;
 use myelin_storage::{all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking};
 use myelin_substrate::Config;
@@ -144,27 +147,20 @@ async fn main() {
     //   - dedup = the durable `DedupLedger` over the shared pool (the exactly-once effect anchor).
     // The consumer LOGIC + the durable `ci_run` ROW ⇄ mark co-commit are proven end-to-end on live PG
     // in `tests/integration_ci_ct004b_trigger_consumer.rs` proofs (4)/(5); this is the production
-    // registration that drives it. The cross-service NATS delivery remains the named deploy floor.
-    let git_root = std::env::var("MYELIN_GIT_ROOT").unwrap_or_else(|_| {
-        std::env::temp_dir()
-            .join("myelin-git-data")
-            .to_string_lossy()
-            .into()
-    });
-    // OBSERVABILITY (review of finding #6): the whole point of this fix is a consumer that no longer
-    // silently does nothing — so make the git-read root VISIBLE at boot. If ci-dispatch and the edge
-    // resolve DIFFERENT roots (or `MYELIN_GIT_ROOT` is unset here but set on the edge), every push
-    // reads an empty root → `NoConfig` skip → CI silently never arms. We do NOT fail loud (the edge
-    // may create the root lazily / boot later — fail-loud would reintroduce a boot-order coupling);
-    // we surface the resolved root + a warning when it is absent so the condition is diagnosable.
-    if std::path::Path::new(&git_root).is_dir() {
-        eprintln!("ci-dispatch: reading CI config (.myelin/ci.*) from git-root {git_root}");
-    } else {
-        eprintln!(
-            "ci-dispatch: WARNING git-root {git_root} does not exist yet (MYELIN_GIT_ROOT); until it \
-             is present + shared with the edge, pushes read an empty root and CI will not arm"
-        );
-    }
+    // registration that drives it. Durable JetStream intake is constructed below only after the
+    // authoritative Git root and all effect backings have been validated/wired.
+    let git_root = std::env::var("MYELIN_GIT_ROOT")
+        .map_err(|_| "MYELIN_GIT_ROOT is required".to_string())
+        .and_then(|path| AuthoritativeGitRoot::validate(path).map_err(|error| error.to_string()))
+        .unwrap_or_else(|message| {
+            eprintln!("ci-dispatch: {message}; refusing broker intake");
+            std::process::exit(1);
+        });
+    eprintln!(
+        "ci-dispatch: authoritative Git reads use {} in cell region {}",
+        git_root.as_path().display(),
+        provider.config().region
+    );
     let minter: Arc<dyn myelin_events::IdMinter> = Arc::new(myelin_events::UlidMinter::new());
     let ci_run = myelin_ci_controlplane::ci_run_store_factory(provider.db_pool().clone());
     let dedup = myelin_events::DedupLedger::durable(Arc::new(
@@ -173,6 +169,12 @@ async fn main() {
             tokio::runtime::Handle::current(),
         ),
     ) as Arc<dyn myelin_events::DurableDedup>);
+    let dead_letters: Arc<dyn myelin_events::DurableDeadLetter> = Arc::new(
+        myelin_storage::events_durable::DurableDeadLetterBacking::new(
+            provider.db_pool().clone(),
+            tokio::runtime::Handle::current(),
+        ),
+    );
     // A SEPARATE durable outbox handle for the reserve store's event-absorb: the `outbox` above is
     // MOVED into `run_dispatch` below; both are cheap handles over the same pool.
     let reserve_outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
@@ -186,6 +188,8 @@ async fn main() {
         ci_run,
         reserve_outbox,
         dedup,
+        dead_letters,
+        provider.config().region.clone(),
         minter,
         tokio::runtime::Handle::current(),
     )
@@ -196,13 +200,76 @@ async fn main() {
         std::process::exit(1);
     });
 
+    // Intake is pull/ack/NAK/TERM only. The elected cell publisher owns the shared outbox drain;
+    // this process cannot claim or mark any outbox row. The server-side filter admits every tenant
+    // in this cell but only the git subsystem. Region is a cell property and is checked again by the
+    // handler before Git, S3, or PG effects.
+    let intake = NatsJetStreamBus::connect_consumer(
+        JetStreamConsumerConfig::bounded(
+            &provider.config().nats_url,
+            EVENT_STREAM_NAME,
+            EVENT_SUBJECT_ROOT,
+            git_intake_filter(),
+            EVENT_DURABLE_CONSUMER,
+        ),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!(
+            "ci-dispatch: durable JetStream intake refused to start: {}",
+            error.0
+        );
+        std::process::exit(1);
+    });
+
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).
-    match run_dispatch(Config::default(), outbox, consumers) {
+    match run_dispatch_until_shutdown(
+        Config::default(),
+        outbox,
+        consumers,
+        Box::new(intake),
+        shutdown_signal(),
+    )
+    .await
+    {
         Ok(()) => {}
         Err(e) => {
             // A failed boot / incomplete drain returns non-zero (§3.1) — loud, never swallowed.
             eprintln!("ci-dispatch service failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .unwrap_or_else(|error| {
+                    eprintln!("ci-dispatch: failed to install SIGTERM handler: {error}");
+                    std::process::exit(1);
+                });
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result {
+                    eprintln!("ci-dispatch: failed while waiting for SIGINT: {error}");
+                    std::process::exit(1);
+                }
+            }
+            signal = terminate.recv() => {
+                if signal.is_none() {
+                    eprintln!("ci-dispatch: SIGTERM stream closed unexpectedly");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            eprintln!("ci-dispatch: failed while waiting for shutdown signal: {error}");
             std::process::exit(1);
         }
     }

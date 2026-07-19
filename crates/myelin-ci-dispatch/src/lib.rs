@@ -107,6 +107,13 @@ pub use migrations::{dispatch_migrations, CONSUMER_DEDUP_TABLE, CREATE_CONSUMER_
 /// The deployable service name (the `AppSpec::name` + the telemetry/trace service identifier). The
 /// `ci-dispatch` binary (`src/main.rs`) and the `AppSpec` both read this.
 pub const SERVICE_NAME: &str = "ci-dispatch";
+pub const EVENT_STREAM_NAME: &str = "MYELIN_EVENTS";
+pub const EVENT_SUBJECT_ROOT: &str = "myelin.events";
+pub const EVENT_DURABLE_CONSUMER: &str = "ci-dispatch-trigger";
+
+pub fn git_intake_filter() -> String {
+    format!("{EVENT_SUBJECT_ROOT}.evt.*.git.>")
+}
 
 /// **Finding #6 — construct the LIVE `ci-dispatch.trigger` consumer set for production `main.rs`.**
 /// Builds the four backings the trigger consumer needs and returns ONE bound [`ConsumerReg`] —
@@ -217,12 +224,23 @@ pub fn dispatch_app_spec(
         // Trigger & Dispatch owns only its OLTP store (the dedup ledger lives in it); the harness
         // adds the implicit OLTP store + auto-registers it as a holder.
         stores: StoreManifest::new(),
-        // The relay drains the INJECTED store (MR-009b W3b.6 — the named W3b.4 debt discharged:
-        // this builder no longer constructs the memory floor). The in-process broker fake stays
-        // the default TRANSPORT (durability lives in the store); EB-04's adapter is a config swap.
-        outbox: OutboxSpec::new(outbox, myelin_events::InProcessBus::new()),
+        // The elected external publisher owns the shared outbox drain. This service only writes
+        // rows; it never instantiates a private relay that could claim another service's row.
+        outbox: OutboxSpec::external_relay(outbox),
         critical: dispatch_critical(),
     }
+}
+
+/// Assemble production dispatch with no local outbox relay and a dedicated durable intake.
+pub fn dispatch_app_spec_with_intake(
+    config: Config,
+    outbox: myelin_events::OutboxStore,
+    consumers: Vec<ConsumerReg>,
+    intake: Box<dyn myelin_events::EventConsumer>,
+) -> AppSpec {
+    let mut spec = dispatch_app_spec(config, outbox.clone(), consumers);
+    spec.outbox = OutboxSpec::external_relay_with_consumer(outbox, intake);
+    spec
 }
 
 /// **Boot the CI Trigger & Dispatch service to the pre-serve [`ServeHandle`]** (the harness's
@@ -236,15 +254,35 @@ pub fn boot_dispatch(
     boot(dispatch_app_spec(config, outbox, consumers))
 }
 
-/// **The CI Trigger & Dispatch service entry — the one `serve(AppSpec)` call (contract 1.1).** The
-/// `ci-dispatch` binary (`src/main.rs`) does nothing but hand [`dispatch_app_spec`] to this. A
-/// failed boot / incomplete drain returns non-zero (§3.1) — loud, never a silent success.
+/// Drive the deterministic one-tick lifecycle used by DB-free shell tests.
+/// Production uses [`run_dispatch_until_shutdown`] so intake remains active until a signal.
 pub fn run_dispatch(
     config: Config,
     outbox: myelin_events::OutboxStore,
     consumers: Vec<ConsumerReg>,
 ) -> Result<(), ServeError> {
     serve(dispatch_app_spec(config, outbox, consumers))
+}
+
+/// Run production dispatch until the supplied shutdown future resolves.
+///
+/// The broker pull is bounded by its configured `max_expires`; signalling drain prevents a final
+/// fresh pull, then the synchronous in-flight delivery finishes before exit.
+pub async fn run_dispatch_until_shutdown<F>(
+    config: Config,
+    outbox: myelin_events::OutboxStore,
+    consumers: Vec<ConsumerReg>,
+    intake: Box<dyn myelin_events::EventConsumer>,
+    shutdown: F,
+) -> Result<(), ServeError>
+where
+    F: std::future::Future<Output = ()>,
+{
+    myelin_substrate::serve_until_shutdown(
+        dispatch_app_spec_with_intake(config, outbox, consumers, intake),
+        shutdown,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -416,9 +454,16 @@ mod tests {
             sub,
             myelin_events::DedupLedger::new(),
         ));
+        let outbox = myelin_events::OutboxStore::new();
+        let mut spec = dispatch_app_spec(Config::default(), outbox.clone(), vec![reg]);
+        spec.outbox = OutboxSpec::new(outbox, myelin_events::InProcessBus::new());
+        let handle = boot(spec).expect("explicit embedded test intake boots");
+        handle.tick();
+        handle.signal_drain();
+        let final_telemetry = handle.drain();
         assert_eq!(
-            run_dispatch(Config::default(), myelin_events::OutboxStore::new(), vec![reg]),
-            Ok(()),
+            final_telemetry.outbox_depth(),
+            0,
             "the live trigger consumer boots → … → drains cleanly"
         );
     }
