@@ -94,9 +94,11 @@ impl SseSubscription {
 /// `(stream, scope)`; every connected subscriber on that key receives them. Cloneable (one hub shared
 /// by the gateway + every publisher). The scope passed in is ALWAYS the gateway-derived bounded scope
 /// (verified tenant + optional resource) — never a client-supplied selector.
+type SseChannels = HashMap<(String, String), broadcast::Sender<SseEvent>>;
+
 #[derive(Clone, Default)]
 pub struct SseHub {
-    inner: Arc<Mutex<HashMap<(String, String), broadcast::Sender<SseEvent>>>>,
+    inner: Arc<Mutex<SseChannels>>,
 }
 
 impl SseHub {

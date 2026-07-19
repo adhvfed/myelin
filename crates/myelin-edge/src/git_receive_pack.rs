@@ -123,6 +123,7 @@ pub(crate) fn parse_cat_file_batch(mut buf: &[u8]) -> Result<Vec<(String, String
 
 /// Build the `git-receive-pack` v0 ref-advertisement body (the part AFTER the smart-HTTP service header
 /// + flush): each `(ref_name, oid)`, the FIRST carrying the NUL-prefixed capability list; then a flush.
+///
 /// An empty repo advertises the `capabilities^{}` placeholder line. Sorted by the caller for determinism.
 pub(crate) fn build_receive_pack_refs(refs: &[(String, String)]) -> Vec<u8> {
     let mut out = Vec::new();
