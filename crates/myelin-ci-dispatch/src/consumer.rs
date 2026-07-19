@@ -1027,6 +1027,7 @@ pub fn build_trigger_consumer(
     )?;
     Ok(myelin_substrate::ConsumerReg::new(
         myelin_events::Consumer::new(handler, subscription, dedup)
+            .with_upcaster(myelin_git::receive_pack::git_ref_identity_upcasters().into_hook())
             .with_dead_letter_sink(myelin_events::DeadLetterSink::durable(dead_letters)),
     ))
 }

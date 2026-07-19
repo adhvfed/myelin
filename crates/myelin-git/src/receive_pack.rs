@@ -63,8 +63,8 @@
 
 use crate::events::GIT_REF_UPDATED;
 use myelin_events::{
-    AggregateKey, ArtifactRef, DataRole, EmitContextBase, EventDraft, EventType, IdMinter,
-    OutboxError, OutboxStore, OutboxTx, Visibility,
+    AggregateKey, ArtifactRef, DataRole, EmitContextBase, EventDraft, EventEnvelope, EventType,
+    IdMinter, OutboxError, OutboxStore, OutboxTx, UpcasterRegistry, Visibility,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -228,6 +228,49 @@ impl GitRefEventKey {
             self.encoded_ref.as_str()
         )
     }
+}
+
+/// Consume-time compatibility bridge for the pre-canonical `git.ref.updated` identity. The hop is
+/// intentionally strict: it rewrites only when the legacy subject and aggregate are exactly those
+/// derived from the payload's validated repo/ref pair. Any mismatch advances only the schema
+/// version, leaving the canonical consumer provenance gate to dead-letter it.
+pub fn git_ref_identity_upcasters() -> UpcasterRegistry {
+    let mut registry = UpcasterRegistry::new();
+    registry
+        .register(EventType(GIT_REF_UPDATED.into()), 1, 2, |mut envelope| {
+            upcast_git_ref_identity_v1(&mut envelope);
+            envelope.schema_ver = 2;
+            envelope
+        })
+        .expect("the Git ref identity registry has one adjacent v1-to-v2 hop");
+    registry
+}
+
+fn upcast_git_ref_identity_v1(envelope: &mut EventEnvelope) {
+    let Some(repo) = envelope.payload.get("repo").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let Some(ref_name) = envelope.payload.get("ref").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let ref_name = RefName::new(ref_name);
+    let Ok(key) = GitRefEventKey::new(repo, &ref_name) else {
+        return;
+    };
+    let legacy_aggregate = format!("{repo}:{}", ref_name.0);
+    let legacy_subject = format!(
+        "myelin://{}/git/ref/{repo}:{}",
+        envelope.tenant.as_str(),
+        ref_name.0
+    );
+    if envelope.aggregate.0 != legacy_aggregate || envelope.subject.0 != legacy_subject {
+        return;
+    }
+    let Ok(subject) = key.subject(envelope.tenant.as_str()) else {
+        return;
+    };
+    envelope.aggregate = key.aggregate();
+    envelope.subject = subject;
 }
 
 /// A Git ref event key could not be validated, encoded, or parsed canonically.
@@ -1228,9 +1271,11 @@ impl RefStore {
 
         // Open the outbox transaction (the same-tx co-commit). Everything staged on it — plus the
         // ref-row mutations we apply on commit — becomes durable IFF `tx.commit()` is called.
+        let mut emit_context = self.ctx_base.clone();
+        emit_context.schema_ver = 2;
         let mut tx = self
             .outbox
-            .begin(Arc::clone(&self.minter), self.ctx_base.clone());
+            .begin(Arc::clone(&self.minter), emit_context);
 
         // Stage each ref-CAS as the transaction's state change + emit its git.ref.updated together.
         let mut planned: Vec<(RefName, Oid, u64, Option<Oid>, myelin_events::EventId)> = Vec::new();
@@ -1820,6 +1865,81 @@ mod tests {
                 .aggregate_id,
             key.id()
         );
+    }
+
+    #[test]
+    fn legacy_git_ref_v1_upcasts_reserved_components_to_the_v2_identity() {
+        let outbox = OutboxStore::new();
+        let store = RefStore::open(
+            "team/repo.with.dot",
+            ctx_base(),
+            outbox.clone(),
+            Arc::new(MonotonicMinter::new()),
+        );
+        let ref_name = "refs/heads/feature/with/slash";
+        let emitted = match store
+            .receive(
+                &human_push(ref_name, Oid::zero(), Oid::new("abc123")),
+                &InMemoryObjectDb::new(),
+                CrashPoint::None,
+            )
+            .unwrap()
+        {
+            PushOutcome::Accepted { emitted, .. } => emitted,
+            other => panic!("{other:?}"),
+        };
+        let canonical = outbox.row(&emitted[0]).unwrap().envelope;
+        assert_eq!(canonical.schema_ver, 2, "new producers emit v2");
+
+        let mut legacy = canonical.clone();
+        legacy.schema_ver = 1;
+        legacy.aggregate = AggregateKey(format!("team/repo.with.dot:{ref_name}"));
+        legacy.subject = ArtifactRef(format!(
+            "myelin://acme/git/ref/team/repo.with.dot:{ref_name}"
+        ));
+        let upcast = git_ref_identity_upcasters().upcast(legacy).unwrap();
+        assert_eq!(upcast.schema_ver, 2);
+        assert_eq!(upcast.aggregate, canonical.aggregate);
+        assert_eq!(upcast.subject, canonical.subject);
+        assert_eq!(upcast.payload, canonical.payload);
+    }
+
+    #[test]
+    fn legacy_git_ref_v1_mismatch_bumps_only_and_cannot_be_normalized() {
+        let mut envelope = EventEnvelope {
+            event_id: myelin_events::EventId("legacy-mismatch".into()),
+            type_: EventType(GIT_REF_UPDATED.into()),
+            schema_ver: 1,
+            tenant: TenantId("acme".into()),
+            region: Region("fr-par".into()),
+            actor: ctx_base().actor,
+            subject: ArtifactRef("myelin://acme/git/ref/attacker:refs/heads/main".into()),
+            aggregate: AggregateKey("core:refs/heads/main".into()),
+            causation_id: None,
+            correlation_id: myelin_events::CorrelationId("legacy-mismatch".into()),
+            caused_by: None,
+            depth: 0,
+            contains_personal_data: false,
+            data_role: DataRole::Processor,
+            visibility: Visibility::Internal,
+            pii_key_ref: None,
+            occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
+            recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
+            payload: serde_json::json!({
+                "repo": "core",
+                "ref": "refs/heads/main",
+                "old_oid": "0",
+                "new_oid": "abc123",
+                "forced": false,
+                "update_seq": 1
+            }),
+        };
+        let original_subject = envelope.subject.clone();
+        let original_aggregate = envelope.aggregate.clone();
+        envelope = git_ref_identity_upcasters().upcast(envelope).unwrap();
+        assert_eq!(envelope.schema_ver, 2);
+        assert_eq!(envelope.subject, original_subject);
+        assert_eq!(envelope.aggregate, original_aggregate);
     }
 
     /// **emit-iff-committed: crash AFTER policy (before commit) emits NOTHING (0 ghost).** The ref
