@@ -2859,6 +2859,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "myelin-outbox-publisher"
+version = "0.0.0"
+dependencies = [
+ "myelin-events",
+ "myelin-identity",
+ "myelin-storage",
+ "myelin-tenancy",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "myelin-query"
 version = "0.0.0"
 dependencies = [
