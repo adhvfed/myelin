@@ -3,13 +3,14 @@ use std::sync::Arc;
 
 use myelin_events::nats::{JetStreamProvisioner, NatsJetStreamPublisher};
 use myelin_outbox_publisher::{
-    ElectedPublisher, PublisherConfig, PublisherDbProvider, PublisherRuntime,
+    ElectedPublisher, GitRefV2OperatorFence, PublisherConfig, PublisherDbProvider, PublisherRuntime,
 };
 
 #[derive(Clone, Copy)]
 enum Mode {
     Provision,
     Serve,
+    PreflightGitRefV2,
 }
 
 #[tokio::main]
@@ -44,6 +45,22 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    if matches!(mode, Mode::PreflightGitRefV2) {
+        let acknowledged = |name: &str| std::env::var(name).as_deref() == Ok("acknowledged");
+        let fence = GitRefV2OperatorFence {
+            consumer_upcaster_active: acknowledged("MYELIN_GIT_REF_V2_UPCASTER_ACTIVE"),
+            writer_quiesced: acknowledged("MYELIN_GIT_REF_V2_WRITER_QUIESCED"),
+        };
+        if let Err(error) = provider
+            .preflight_git_ref_v2(&config, "ci-dispatch-trigger", fence, rt)
+            .await
+        {
+            eprintln!("myelin-outbox-publisher: Git ref v2 preflight refused: {error}");
+            std::process::exit(1);
+        }
+        println!("myelin-outbox-publisher: Git ref v2 activation barrier is clear");
+        return;
+    }
     let relay = match provider.elected_relay(config.region(), config.max_envelope_bytes()) {
         Ok(relay) => relay,
         Err(error) => {
@@ -80,6 +97,7 @@ fn parse_mode() -> Result<Mode, ()> {
     let mode = match args.next().as_deref() {
         Some("provision") => Mode::Provision,
         Some("serve") => Mode::Serve,
+        Some("preflight-git-ref-v2") => Mode::PreflightGitRefV2,
         _ => return Err(()),
     };
     if args.next().is_some() {

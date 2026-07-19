@@ -480,6 +480,58 @@ impl JetStreamProvisioner {
     }
 }
 
+/// Read-only durable-consumer backlog used by rollout barriers. It exposes exactly the two
+/// JetStream counters needed to prove a consumer has neither queued nor delivered-unacked work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DurableConsumerBacklog {
+    pub num_pending: u64,
+    pub num_ack_pending: u64,
+}
+
+/// Capability-narrow JetStream inspector. It only opens an existing stream and consumer and reads
+/// their info; it never creates, updates, deletes, fetches, acknowledges, or publishes anything.
+pub struct JetStreamConsumerInspector;
+
+impl JetStreamConsumerInspector {
+    pub fn inspect_existing(
+        nats_url: &str,
+        stream_name: &str,
+        consumer_name: &str,
+        rt: tokio::runtime::Handle,
+    ) -> Result<DurableConsumerBacklog, TransportError> {
+        if nats_url.trim().is_empty()
+            || stream_name.trim().is_empty()
+            || consumer_name.trim().is_empty()
+        {
+            return Err(TransportError("consumer inspection configuration is empty".into()));
+        }
+        tokio::task::block_in_place(|| {
+            rt.block_on(async {
+                let client = async_nats::connect(nats_url)
+                    .await
+                    .map_err(|_| TransportError("NATS inspection connection failed".into()))?;
+                let js = jetstream::new(client);
+                let stream = js
+                    .get_stream(stream_name)
+                    .await
+                    .map_err(|_| TransportError("JetStream inspection stream unavailable".into()))?;
+                let mut consumer = stream
+                    .get_consumer::<jetstream::consumer::pull::Config>(consumer_name)
+                    .await
+                    .map_err(|_| TransportError("JetStream inspection consumer unavailable".into()))?;
+                let info = consumer
+                    .info()
+                    .await
+                    .map_err(|_| TransportError("JetStream consumer inspection failed".into()))?;
+                Ok(DurableConsumerBacklog {
+                    num_pending: info.num_pending,
+                    num_ack_pending: info.num_ack_pending as u64,
+                })
+            })
+        })
+    }
+}
+
 async fn publish_with_timeout<F, T>(
     timeout: std::time::Duration,
     future: F,

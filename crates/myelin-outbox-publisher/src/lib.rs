@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use myelin_events::nats::JetStreamPublisherConfig;
+use myelin_events::nats::JetStreamConsumerInspector;
 use myelin_events::relay::EventPublisher;
 use myelin_storage::elected_relay::{ElectedDrainOutcome, ElectedPgRelay, ElectedRelayError};
 use myelin_storage::pgrelay::RelayValidationConfig;
@@ -25,6 +26,47 @@ pub const PUBLISH_NATS_URL_ENV: &str = "MYELIN_OUTBOX_PUBLISH_NATS_URL";
 pub const PASS_TIMEOUT_ENV: &str = "MYELIN_OUTBOX_PUBLISHER_PASS_TIMEOUT_MS";
 
 const CAPABILITY_ROLE: &str = "myelin_outbox_publisher";
+
+/// Explicit human/orchestrator fences for the v1→v2 Git ref identity cutover. These are inputs,
+/// not inferred guesses: the consumer/upcaster must be deployed first and receive-pack must be
+/// quiesced before the read-only drain barrier may authorize v2 producer activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GitRefV2OperatorFence {
+    pub consumer_upcaster_active: bool,
+    pub writer_quiesced: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitRefV2CutoverError {
+    ConsumerUpcasterNotAcknowledged,
+    WriterNotQuiesced,
+    DatabaseProbeFailed,
+    LegacyOutboxPending,
+    LegacyQuarantinePending,
+    DurableConsumerUnavailable,
+    DurableMessagesPending,
+    DurableAcksPending,
+    UpdateSequenceOverlap,
+}
+
+impl core::fmt::Display for GitRefV2CutoverError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let message = match self {
+            Self::ConsumerUpcasterNotAcknowledged => "Git ref v2 consumer upcaster is not acknowledged",
+            Self::WriterNotQuiesced => "Git receive-pack writer is not acknowledged quiesced",
+            Self::DatabaseProbeFailed => "Git ref cutover database probe failed",
+            Self::LegacyOutboxPending => "legacy Git ref outbox rows remain unpublished",
+            Self::LegacyQuarantinePending => "legacy Git ref quarantine rows remain unresolved",
+            Self::DurableConsumerUnavailable => "Git ref durable consumer inspection failed",
+            Self::DurableMessagesPending => "Git ref durable consumer still has pending messages",
+            Self::DurableAcksPending => "Git ref durable consumer still has acknowledgement-pending messages",
+            Self::UpdateSequenceOverlap => "Git ref v2 update sequence does not follow legacy history",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for GitRefV2CutoverError {}
 
 #[derive(Clone)]
 struct PublisherDatabaseConfig {
@@ -449,6 +491,77 @@ impl PublisherDbProvider {
                 .map_err(|_| PublisherConfigError::OutOfBounds)?;
         ElectedPgRelay::new(self.pool.clone(), validation)
             .map_err(|_| PublisherConfigError::OutOfBounds)
+    }
+
+    /// Read-only activation barrier for the Git ref v2 producer. The publisher capability already
+    /// has SELECT-only access to outbox/quarantine; JetStream inspection reads existing consumer
+    /// info only. No row, stream, consumer, cursor, or acknowledgement is mutated.
+    pub async fn preflight_git_ref_v2(
+        &self,
+        config: &PublisherConfig,
+        consumer_name: &str,
+        fence: GitRefV2OperatorFence,
+        rt: tokio::runtime::Handle,
+    ) -> Result<(), GitRefV2CutoverError> {
+        if !fence.consumer_upcaster_active {
+            return Err(GitRefV2CutoverError::ConsumerUpcasterNotAcknowledged);
+        }
+        if !fence.writer_quiesced {
+            return Err(GitRefV2CutoverError::WriterNotQuiesced);
+        }
+        let row = sqlx::query(
+            "WITH ref_events AS (
+               SELECT o.event_id,
+                      o.published_at,
+                      COALESCE((o.envelope->>'schema_ver')::int, 0) AS schema_ver,
+                      o.envelope->'payload'->>'repo' AS repo,
+                      o.envelope->'payload'->>'ref' AS ref_name,
+                      CASE WHEN (o.envelope->'payload'->>'update_seq') ~ '^[0-9]+$'
+                           THEN (o.envelope->'payload'->>'update_seq')::numeric END AS update_seq
+                 FROM outbox o
+                WHERE o.envelope->>'type_' = 'git.ref.updated'
+             ), sequence_violation AS (
+               SELECT 1
+                 FROM ref_events legacy
+                 JOIN ref_events v2 USING (repo, ref_name)
+                WHERE legacy.schema_ver = 1 AND v2.schema_ver >= 2
+                GROUP BY legacy.repo, legacy.ref_name
+               HAVING MIN(v2.update_seq) <= MAX(legacy.update_seq)
+                LIMIT 1
+             )
+             SELECT COUNT(*) FILTER (WHERE r.schema_ver = 1 AND r.published_at IS NULL)::bigint AS legacy_unpublished,
+                    COUNT(*) FILTER (WHERE r.schema_ver = 1 AND q.event_id IS NOT NULL
+                                      AND q.acknowledged_at IS NULL)::bigint AS legacy_quarantine,
+                    EXISTS (SELECT 1 FROM sequence_violation) AS sequence_violation
+               FROM ref_events r
+               LEFT JOIN outbox_quarantine q ON q.event_id = r.event_id",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| GitRefV2CutoverError::DatabaseProbeFailed)?;
+        if row.get::<i64, _>("legacy_unpublished") != 0 {
+            return Err(GitRefV2CutoverError::LegacyOutboxPending);
+        }
+        if row.get::<i64, _>("legacy_quarantine") != 0 {
+            return Err(GitRefV2CutoverError::LegacyQuarantinePending);
+        }
+        if row.get::<bool, _>("sequence_violation") {
+            return Err(GitRefV2CutoverError::UpdateSequenceOverlap);
+        }
+        let backlog = JetStreamConsumerInspector::inspect_existing(
+            &config.provision_nats_url,
+            EVENT_STREAM_NAME,
+            consumer_name,
+            rt,
+        )
+        .map_err(|_| GitRefV2CutoverError::DurableConsumerUnavailable)?;
+        if backlog.num_pending != 0 {
+            return Err(GitRefV2CutoverError::DurableMessagesPending);
+        }
+        if backlog.num_ack_pending != 0 {
+            return Err(GitRefV2CutoverError::DurableAcksPending);
+        }
+        Ok(())
     }
 }
 
