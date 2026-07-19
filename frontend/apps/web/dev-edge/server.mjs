@@ -32,6 +32,10 @@ import {
   refsJson,
   treeJson,
   rawBytes,
+  DEV_ISSUE_TARGET,
+  freshIssueFixtures,
+  issuesEnvelope,
+  issueJson,
   unauthorizedEnvelope,
   notFoundEnvelope,
 } from "./dev-contract.mjs";
@@ -53,7 +57,26 @@ const state = {
   // whoami route below already verifies a pasted token (Bearer === DEV_ACCESS_TOKEN), so with this on
   // the paste→verify→session flow runs end-to-end against this double.
   tokenLoginEnabled: false,
+  // Issues test controls: empty/projection-unavailable states and how many status reads precede
+  // activation. Two proves the UI renders a genuine pending interval before active.
+  emptyIssues: false,
+  issuesUnavailable: false,
+  issueActivationPolls: 2,
 };
+
+let issueRows = freshIssueFixtures();
+const issueReceipts = new Map();
+let issueSequence = 200;
+const ISSUE_BASE_TIME_FOR_CREATE = Date.parse("2026-07-20T00:00:00.000Z");
+
+function resetIssues() {
+  issueRows = freshIssueFixtures();
+  issueReceipts.clear();
+  issueSequence = 200;
+  state.emptyIssues = false;
+  state.issuesUnavailable = false;
+  state.issueActivationPolls = 2;
+}
 
 function send(res, status, json, headers = {}) {
   const body = json === null ? "" : JSON.stringify(json);
@@ -97,6 +120,10 @@ const server = createServer((req, res) => {
         if (typeof body.emptyRepos === "boolean") state.emptyRepos = body.emptyRepos;
         if (typeof body.devLoginEnabled === "boolean") state.devLoginEnabled = body.devLoginEnabled;
         if (typeof body.tokenLoginEnabled === "boolean") state.tokenLoginEnabled = body.tokenLoginEnabled;
+        if (body.resetIssues === true) resetIssues();
+        if (typeof body.emptyIssues === "boolean") state.emptyIssues = body.emptyIssues;
+        if (typeof body.issuesUnavailable === "boolean") state.issuesUnavailable = body.issuesUnavailable;
+        if (Number.isInteger(body.issueActivationPolls)) state.issueActivationPolls = body.issueActivationPolls;
       } catch {
         /* ignore malformed control body */
       }
@@ -116,6 +143,67 @@ const server = createServer((req, res) => {
 
   // Every data route requires a valid Bearer (the auth floor). A missing/forged token → uniform 401.
   const authed = bearer(req) === DEV_ACCESS_TOKEN;
+
+  // R4.4 Issues writes. The create body is contract-checked against the one server-injected dogfood
+  // target; the dev edge never accepts browser-selected scope IDs either.
+  let im;
+  if (method === "POST" && path === "/v1/issues") {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    let raw = "";
+    req.on("data", (chunk) => (raw += chunk));
+    req.on("end", () => {
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return send(res, 400, { error: { message: "invalid issue create body", code: "bad_request" } });
+      }
+      if (
+        body.project_id !== DEV_ISSUE_TARGET.project_id ||
+        body.type_id !== DEV_ISSUE_TARGET.type_id ||
+        body.prefix !== DEV_ISSUE_TARGET.prefix ||
+        typeof body.title !== "string" ||
+        !body.title.trim()
+      ) {
+        return send(res, 400, { error: { message: "invalid issue create body", code: "bad_request" } });
+      }
+      const number = ++issueSequence;
+      const id = `10000000-0000-4000-8000-${String(number).padStart(12, "0")}`;
+      const key = `${DEV_ISSUE_TARGET.prefix}-${number}`;
+      const now = new Date(ISSUE_BASE_TIME_FOR_CREATE + number * 1_000).toISOString();
+      const row = {
+        id,
+        key,
+        project_id: DEV_ISSUE_TARGET.project_id,
+        state: "Todo",
+        state_category: "unstarted",
+        title: body.title.trim(),
+        version: 1,
+        created_at: now,
+        updated_at: now,
+      };
+      const requestEventId = `01J${String(number).padStart(23, "0")}`;
+      issueReceipts.set(requestEventId, { row, polls: 0, active: false });
+      return send(res, 202, {
+        issue: { id, key, project_id: row.project_id },
+        authorization: { status: "pending", request_event_id: requestEventId },
+      });
+    });
+    return;
+  }
+
+  if (method === "POST" && (im = path.match(/^\/v1\/issues\/([^/]+)\/close$/))) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    const row = issueJson(issueRows, decodeURIComponent(im[1]));
+    if (!row) return send(res, 404, notFoundEnvelope("issue"));
+    if (row.state_category !== "completed") {
+      row.state = "Done";
+      row.state_category = "completed";
+      row.version += 1;
+      row.updated_at = new Date(Date.parse(row.updated_at) + 1_000).toISOString();
+    }
+    return send(res, 200, row);
+  }
 
   // R3.3 — PR write paths (threads / reviews / merge). Stateful in-memory; the e2e drives these.
   let pm;
@@ -151,6 +239,60 @@ const server = createServer((req, res) => {
     // A fresh tenant (test-controlled) serves the empty envelope → the onboarding empty state.
     if (state.emptyRepos) return send(res, 200, { items: [], page: { next_cursor: null, limit } });
     return send(res, 200, reposEnvelope(limit));
+  }
+
+  if (method === "GET" && path === "/v1/issues") {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (state.issuesUnavailable) {
+      return send(res, 503, { error: { message: "issue authorization is temporarily unavailable", code: "unavailable" } });
+    }
+    const listState = url.searchParams.get("state") ?? "open";
+    const key = url.searchParams.get("key") ?? undefined;
+    const limit = Number(url.searchParams.get("limit") ?? 50);
+    const cursor = url.searchParams.get("cursor") ?? undefined;
+    return send(
+      res,
+      200,
+      issuesEnvelope(state.emptyIssues ? [] : issueRows, listState, key, limit, cursor),
+    );
+  }
+
+  if (
+    method === "GET" &&
+    (im = path.match(/^\/v1\/issues\/authorization-requests\/([^/]+)$/))
+  ) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (state.issuesUnavailable) {
+      return send(res, 503, { error: { message: "issue authorization is temporarily unavailable", code: "unavailable" } });
+    }
+    const receipt = issueReceipts.get(decodeURIComponent(im[1]));
+    if (!receipt) return send(res, 404, notFoundEnvelope("issue"));
+    receipt.polls += 1;
+    if (
+      !receipt.active &&
+      state.issueActivationPolls >= 0 &&
+      receipt.polls >= state.issueActivationPolls
+    ) {
+      receipt.active = true;
+      if (!issueJson(issueRows, receipt.row.id)) issueRows.push(receipt.row);
+    }
+    return receipt.active
+      ? send(res, 200, { status: "active", issue: receipt.row })
+      : send(res, 202, {
+          status: "pending",
+          issue: {
+            id: receipt.row.id,
+            key: receipt.row.key,
+            project_id: receipt.row.project_id,
+          },
+          retry_after_ms: 1_000,
+        });
+  }
+
+  if (method === "GET" && (im = path.match(/^\/v1\/issues\/([^/]+)$/))) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    const row = issueJson(issueRows, decodeURIComponent(im[1]));
+    return row ? send(res, 200, row) : send(res, 404, notFoundEnvelope("issue"));
   }
 
   // R3.5 — the unified tenant firehose. The real edge emits typed repo.created/repo.pushed frames
