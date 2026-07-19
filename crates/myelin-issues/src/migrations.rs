@@ -145,6 +145,12 @@ pub const ISSUE_ASSIGNEE_INDEX: &str = "issue_assignee";
 pub const ISSUE_PARENT_INDEX: &str = "issue_parent";
 pub const ISSUE_CYCLE_INDEX: &str = "issue_cycle";
 pub const ISSUE_PROPS_GIN_INDEX: &str = "issue_props_gin";
+/// Recent authoritative list index; added separately at the end of history for online rollout.
+pub const ISSUE_RECENT_LIST_INDEX: &str = "issue_recent_list_idx";
+pub const CREATE_ISSUE_RECENT_LIST_INDEX_DDL: &str =
+    "CREATE INDEX CONCURRENTLY IF NOT EXISTS issue_recent_list_idx \
+     ON issue (tenant_id, region, updated_at DESC, id DESC) \
+     INCLUDE (state_category, key) WHERE deleted_at IS NULL";
 
 // ============================================================================================
 // The forward-only CREATE-TABLE DDL constants (arch 01 §2–§8, verbatim intent; tenant_id/region
@@ -594,6 +600,11 @@ pub fn issues_migrations() -> Migrations {
         CREATE_ISSUE_AUTHZ_INVALIDATION_TRIGGERS_DDL,
         ISSUE_TABLE,
     ));
+    migrations.push(Migration::plain_on(
+        "iss_0020_issue_recent_list_idx",
+        CREATE_ISSUE_RECENT_LIST_INDEX_DDL,
+        ISSUE_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -744,8 +755,8 @@ mod tests {
         let migrations = issues_migrations();
         assert_eq!(
             migrations.0.len(),
-            25,
-            "11 spine-table creates + 8 concurrent indexes + 2 issue expands + 4 authz migrations"
+            26,
+            "11 spine-table creates + 9 concurrent indexes + 2 issue expands + 4 authz migrations"
         );
         for m in &migrations.0 {
             assert!(
@@ -775,7 +786,7 @@ mod tests {
             .any(|migration| migration.id == "iss_0018_issue_authz_visible"));
         assert_eq!(
             issues.0.last().map(|migration| migration.id),
-            Some("iss_0019_issue_authz_invalidation_triggers")
+            Some("iss_0020_issue_recent_list_idx")
         );
         assert!(CREATE_ISSUE_AUTHZ_INVALIDATION_TRIGGERS_DDL
             .contains("EXECUTE FUNCTION myelin_invalidate_issue_view_projection()"));
@@ -799,7 +810,7 @@ mod tests {
             .expect("the full Issue-Tracker spine applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            25,
+            26,
             "the runner applied every table/index/expand migration"
         );
         assert_eq!(
@@ -815,7 +826,7 @@ mod tests {
             .expect("the spine re-applies idempotently");
         assert_eq!(
             runner2.applied().len(),
-            25,
+            26,
             "the re-apply admits every migration again"
         );
     }

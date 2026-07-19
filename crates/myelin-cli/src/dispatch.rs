@@ -195,8 +195,12 @@ pub fn issues_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
 /// Map a validated Issues command to its tenant-less Edge call.
 pub fn issues_command_to_call(command: &IssuesCliCommand) -> EdgeCall {
     match command {
-        IssuesCliCommand::List { limit, cursor } => {
-            let mut query = format!("limit={limit}");
+        IssuesCliCommand::List { state, key, limit, cursor } => {
+            let mut query = format!("state={}&limit={limit}", state.as_str());
+            if let Some(key) = key {
+                query.push_str("&key=");
+                query.push_str(key);
+            }
             if let Some(cursor) = cursor {
                 query.push_str("&cursor=");
                 query.push_str(cursor);
@@ -354,13 +358,23 @@ mod tests {
         let project = "11111111-1111-1111-1111-111111111111";
         let type_id = "22222222-2222-2222-2222-222222222222";
         let issue = "33333333-3333-3333-3333-333333333333";
+        let cursor = myelin_issues::api::encode_issue_page_cursor(
+            myelin_issues::api::IssueListState::All,
+            Some("eng-"),
+            1_700_000_000_123_456,
+            issue,
+        )
+        .unwrap();
 
-        let list = issues_dispatch(&["list", "--limit", "10", "--cursor", issue]).unwrap();
+        let list = issues_dispatch(&[
+            "list", "--state", "all", "--key", "eng-", "--limit", "10", "--cursor", &cursor,
+        ])
+        .unwrap();
         assert_eq!(list.method, HttpMethod::Get);
         assert_eq!(list.path, "/v1/issues");
         assert_eq!(
-            list.query.as_deref(),
-            Some("limit=10&cursor=33333333-3333-3333-3333-333333333333")
+            list.query,
+            Some(format!("state=all&limit=10&key=ENG-&cursor={cursor}"))
         );
 
         let create = issues_dispatch(&[

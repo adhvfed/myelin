@@ -117,6 +117,13 @@ async fn compose_core() -> ComposedCore {
         std::process::exit(1);
     }
     if let Err(e) = bootstrap
+        .verify_index_ready(myelin_issues::ISSUE_RECENT_LIST_INDEX)
+        .await
+    {
+        eprintln!("edge: Issues recent-list index is not ready: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = bootstrap
         .migrate(
             &myelin_git::pg_pr_store::git_pr_migrations(),
             &myelin_git::pg_pr_store::git_pr_hot_tables(),
