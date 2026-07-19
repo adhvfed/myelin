@@ -3,9 +3,10 @@
 //! The `outbox` table is shared by service producers, so independently running relays are unsafe:
 //! `SKIP LOCKED` permits them to publish later aggregate sequence numbers before an earlier locked
 //! row, and repeated broker failures can multiply retry/dead-letter accounting. This primitive uses
-//! one PostgreSQL advisory lock to elect exactly one cooperating publisher for a drain pass, then
-//! delegates to [`PgRelay::relay_once`]. A broker outage therefore rolls the outbox transaction
-//! back: rows remain unsent and their permanent-failure `attempts` budget is untouched.
+//! one transaction-scoped PostgreSQL advisory lock to elect exactly one cooperating publisher for
+//! a drain pass. Election, claims, publication, quarantine, sent marks, and commit use the same
+//! transaction and connection. A broker outage therefore rolls the transaction back: rows remain
+//! unsent and their permanent-failure `attempts` budget is untouched.
 
 use myelin_events::relay::EventPublisher;
 use sqlx::postgres::PgPool;
@@ -61,33 +62,19 @@ impl std::error::Error for ElectedRelayError {}
 #[derive(Clone)]
 pub struct ElectedPgRelay {
     pool: PgPool,
-    relay: PgRelay,
     validation: RelayValidationConfig,
 }
 
 impl ElectedPgRelay {
     /// Use the stable shared-outbox election namespace.
     pub fn new(pool: PgPool, validation: RelayValidationConfig) -> Result<Self, ElectedRelayError> {
-        // One connection holds the session advisory lock while PgRelay opens the transaction that
-        // claims rows. Refuse a one-connection pool instead of deadlocking at runtime.
-        if pool.options().get_max_connections() < 2 {
-            return Err(ElectedRelayError::InvalidConfiguration(
-                "at least two connections are required (one election session and one relay tx)"
-                    .into(),
-            ));
-        }
-        Ok(Self {
-            relay: PgRelay::new(pool.clone()),
-            pool,
-            validation,
-        })
+        Ok(Self { pool, validation })
     }
 
     /// Try to become publisher leader for one ordered drain pass.
     ///
-    /// The election connection is marked `close_on_drop` before attempting the session lock. This
-    /// is load-bearing: cancellation or panic cannot return a still-locked session to the pool.
-    /// Normal completion also explicitly unlocks and verifies PostgreSQL reports ownership.
+    /// The transaction-scoped lock is released atomically by commit or rollback. Cancellation,
+    /// panic, connection loss, and publish failure therefore cannot leave a stale elected session.
     pub async fn drain_once<P: EventPublisher + ?Sized>(
         &self,
         publisher: &P,
@@ -99,51 +86,31 @@ impl ElectedPgRelay {
             ));
         }
 
-        let mut election = self
+        let mut tx = self
             .pool
-            .acquire()
+            .begin()
             .await
             .map_err(|e| ElectedRelayError::Election(PgError::Query(e.to_string())))?;
-        // If the lock query is cancelled after PostgreSQL acquired the lock, dropping this handle
-        // closes the server session instead of returning a poisoned locked session to the pool.
-        election.close_on_drop();
 
         // @tenant-cross-scope: the cell-local publisher election lock protects the shared outbox.
-        let elected: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        let elected: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
             .bind(SHARED_OUTBOX_PUBLISHER_LOCK_ID)
-            .fetch_one(&mut *election)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| ElectedRelayError::Election(PgError::Query(e.to_string())))?;
         if !elected {
             return Ok(ElectedDrainOutcome::Standby);
         }
 
-        let relay_result = self
-            .relay
-            .relay_once_scoped(publisher, batch, &self.validation)
-            .await;
-        // @tenant-cross-scope: releases the same cell-local shared-outbox election lock.
-        let unlock_result = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
-            .bind(SHARED_OUTBOX_PUBLISHER_LOCK_ID)
-            .fetch_one(&mut *election)
+        let relay = PgRelay::new(self.pool.clone());
+        let published = relay
+            .relay_once_scoped_in_tx(&mut tx, publisher, batch, &self.validation)
             .await
-            .map_err(|e| PgError::Query(e.to_string()))
-            .and_then(|unlocked| {
-                if unlocked {
-                    Ok(())
-                } else {
-                    Err(PgError::Query(
-                        "pg_advisory_unlock reported this session did not own the lock".into(),
-                    ))
-                }
-            });
-
-        match (relay_result, unlock_result) {
-            (Ok(published), Ok(())) => Ok(ElectedDrainOutcome::Published(published)),
-            (Err(relay), Ok(())) => Err(ElectedRelayError::Relay(relay)),
-            (Ok(_), Err(unlock)) => Err(ElectedRelayError::Unlock(unlock)),
-            (Err(relay), Err(unlock)) => Err(ElectedRelayError::RelayAndUnlock { relay, unlock }),
-        }
+            .map_err(ElectedRelayError::Relay)?;
+        tx.commit()
+            .await
+            .map_err(|e| ElectedRelayError::Relay(PgError::Query(e.to_string())))?;
+        Ok(ElectedDrainOutcome::Published(published))
     }
 }
 
@@ -154,7 +121,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn refuses_pool_that_cannot_hold_election_and_relay_connections() {
+    async fn one_connection_pool_is_valid() {
         // @residency-cell-pinned: lazy invalid test pool; the relay scope below pins its region.
         let pool = PgPoolOptions::new()
             .max_connections(1)
@@ -162,10 +129,6 @@ mod tests {
             .expect("lazy pool");
         let validation = RelayValidationConfig::new(myelin_events::Region("no-osl".into()), 1024)
             .expect("valid scope");
-        let error = match ElectedPgRelay::new(pool, validation) {
-            Ok(_) => panic!("one connection would deadlock"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, ElectedRelayError::InvalidConfiguration(_)));
+        ElectedPgRelay::new(pool, validation).expect("election and relay share one transaction");
     }
 }
