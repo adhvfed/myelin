@@ -565,6 +565,9 @@ pub enum SkipReason {
     NotATrigger(String),
     /// The event payload lacked a required field (`repo` / `new_oid`) — malformed, fail-closed.
     MalformedPayload(String),
+    /// Envelope provenance is contradictory or invalid. This is permanent poison, never an
+    /// authored-config skip: subject/aggregate/payload disagreement reaches the durable DLQ.
+    InvalidProvenance(String),
     /// A backend read of `.myelin/ci.*` failed (fail-closed — no run without a proven definition).
     ReadFailed(GitReadError),
     /// NO `.myelin/ci.*` at the pushed ref — a clean "no pipeline armed" skip (NOT an error).
@@ -584,6 +587,7 @@ impl std::fmt::Display for SkipReason {
         match self {
             SkipReason::NotATrigger(t) => write!(f, "not a CI trigger event: `{t}`"),
             SkipReason::MalformedPayload(m) => write!(f, "malformed trigger payload: {m}"),
+            SkipReason::InvalidProvenance(m) => write!(f, "invalid trigger provenance: {m}"),
             SkipReason::ReadFailed(e) => write!(f, "{e}"),
             SkipReason::NoConfig => write!(f, "no `.myelin/ci.*` at the pushed ref — no pipeline armed"),
             SkipReason::ConfigError(e) => write!(f, "malformed `.myelin/ci.*` (fail-closed): {e}"),
@@ -606,7 +610,7 @@ pub enum DispatchOutcome {
     Skip(SkipReason),
 }
 
-/// Extract `(repo, new_oid, ref, on-event-type-supported)` provenance from a triggering envelope.
+/// Canonical repository, immutable commit, and fork provenance from a triggering envelope.
 struct TriggerFacts {
     repo: String,
     new_oid: String,
@@ -625,14 +629,41 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| SkipReason::MalformedPayload("missing `repo`".into()))?
         .to_string();
-    // The head oid the run runs against: `new_oid` (push) or `head_oid` (PR).
-    let new_oid = p
-        .get("new_oid")
-        .or_else(|| p.get("head_oid"))
+    myelin_git::gix_backend::validate_repo_slug(&repo).map_err(|error| {
+        SkipReason::InvalidProvenance(format!("invalid payload repository {repo:?}: {error}"))
+    })?;
+
+    // Subject, aggregate, and payload are mutually distrustful provenance inputs. All three must
+    // identify the same push/PR before any Git or CAS read is attempted.
+    let oid_field = if ev.type_.0 == myelin_git::events::GIT_REF_UPDATED {
+        let ref_name = p.get("ref").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+            .ok_or_else(|| SkipReason::MalformedPayload("missing `ref`".into()))?;
+        validate_git_ref_name(ref_name)?;
+        validate_envelope_provenance(
+            ev,
+            &format!("myelin://{}/git/ref/{repo}:{ref_name}", ev.tenant.0),
+            &format!("{repo}:{ref_name}"),
+        )?;
+        "new_oid"
+    } else {
+        let number = p.get("number").and_then(|v| v.as_u64()).filter(|number| *number > 0)
+            .ok_or_else(|| SkipReason::InvalidProvenance("PR `number` must be a positive integer".into()))?;
+        validate_envelope_provenance(
+            ev,
+            &format!("myelin://{}/git/pr/{repo}:{number}", ev.tenant.0),
+            &format!("git/pr/{repo}:{number}"),
+        )?;
+        "head_oid"
+    };
+
+    // Only an immutable full SHA-1 oid is admitted. Refs, HEAD, revspecs, and abbreviations are
+    // permanently invalid and are refused before crossing the Git reader seam.
+    let raw_oid = p
+        .get(oid_field)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| SkipReason::MalformedPayload("missing `new_oid`/`head_oid`".into()))?
-        .to_string();
+        .ok_or_else(|| SkipReason::MalformedPayload(format!("missing `{oid_field}`")))?;
+    let new_oid = canonical_commit_oid(raw_oid)?;
     // Fork provenance is trust input, not a best-effort hint. PR producers MUST provide an
     // explicit boolean. Push producers predate the field, so absence remains a member push; any
     // alias they do provide is nevertheless validated and preserved. If canonical + legacy aliases
@@ -645,6 +676,53 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
         new_oid,
         is_fork,
     })
+}
+
+fn validate_envelope_provenance(
+    ev: &EventEnvelope,
+    expected_subject: &str,
+    expected_aggregate: &str,
+) -> Result<(), SkipReason> {
+    if ev.subject.0 != expected_subject {
+        return Err(SkipReason::InvalidProvenance(format!(
+            "subject/payload provenance mismatch: expected {expected_subject:?}, got {:?}", ev.subject.0
+        )));
+    }
+    if ev.aggregate.0 != expected_aggregate {
+        return Err(SkipReason::InvalidProvenance(format!(
+            "aggregate/payload provenance mismatch: expected {expected_aggregate:?}, got {:?}", ev.aggregate.0
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the canonical `check-ref-format` rules used by a fully-qualified provider ref.
+fn validate_git_ref_name(ref_name: &str) -> Result<(), SkipReason> {
+    let invalid = !ref_name.starts_with("refs/")
+        || ref_name.ends_with('/')
+        || ref_name.ends_with('.')
+        || ref_name.contains("//")
+        || ref_name.contains("..")
+        || ref_name.contains("@{")
+        || ref_name.contains([':', '\\'])
+        || ref_name.split('/').any(|part| {
+            part.is_empty() || part.starts_with('.') || part.ends_with(".lock")
+        })
+        || ref_name.chars().any(|c| c.is_ascii_control() || c.is_ascii_whitespace() || matches!(c, '~' | '^' | '?' | '*' | '['));
+    if invalid {
+        Err(SkipReason::InvalidProvenance(format!("invalid canonical Git ref {ref_name:?}")))
+    } else {
+        Ok(())
+    }
+}
+
+fn canonical_commit_oid(raw: &str) -> Result<String, SkipReason> {
+    if raw.len() != 40 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(SkipReason::ReadFailed(GitReadError::Invalid(
+            "commit oid must be exactly 40 hexadecimal characters; revspecs and abbreviated ids are refused".into(),
+        )));
+    }
+    Ok(raw.to_ascii_lowercase())
 }
 
 /// Parse and reconcile canonical/legacy fork provenance without ever defaulting malformed trust
@@ -1014,6 +1092,12 @@ impl EventHandler for CiTriggerHandler {
                 }
                 if matches!(&reason, SkipReason::ReadFailed(error) if error.is_retryable()) {
                     HandleOutcome::Retry(myelin_events::Backoff { seconds: 5 })
+                } else if matches!(reason, SkipReason::InvalidProvenance(_)) {
+                    // The detailed, attacker-controlled provenance stays only in the bounded
+                    // in-process trace above; the durable DLQ reason is deliberately PII-free.
+                    HandleOutcome::NonRetryable(myelin_events::Reason(
+                        "invalid trigger provenance".into(),
+                    ))
                 } else if let SkipReason::ReadFailed(error) = reason {
                     HandleOutcome::NonRetryable(myelin_events::Reason(error.to_string()))
                 } else if matches!(reason, SkipReason::ResolveError(ResolveError::BlobWrite(_))) {
@@ -1140,6 +1224,8 @@ mod tests {
     use myelin_storage::{ContentHash, FsBlobStore};
     use myelin_tenancy::{Region, TenantId};
 
+    const TEST_OID: &str = "dddddddddddddddddddddddddddddddddddddddd";
+
     fn principal() -> Principal {
         Principal::stub(
             PrincipalId("pusher".into()),
@@ -1158,7 +1244,7 @@ mod tests {
             region: Region("fr-par".into()),
             actor: Actor(principal()),
             subject: ArtifactRef(format!("myelin://acme/git/ref/{repo}:refs/heads/main")),
-            aggregate: AggregateKey(format!("git/ref/{repo}:refs/heads/main")),
+            aggregate: AggregateKey(format!("{repo}:refs/heads/main")),
             causation_id: None,
             correlation_id: CorrelationId("corr-1".into()),
             caused_by: None,
@@ -1180,9 +1266,11 @@ mod tests {
     }
 
     fn pr_envelope(event_type: &str, fork_fields: serde_json::Value) -> EventEnvelope {
-        let mut ev = push_envelope("web", "deadbeef");
+        let mut ev = push_envelope("web", TEST_OID);
         ev.type_ = EventType(event_type.into());
-        ev.payload = serde_json::json!({ "repo": "web", "head_oid": "deadbeef" });
+        ev.subject = ArtifactRef("myelin://acme/git/pr/web:42".into());
+        ev.aggregate = AggregateKey("git/pr/web:42".into());
+        ev.payload = serde_json::json!({ "repo": "web", "number": 42, "head_oid": TEST_OID });
         ev.payload.as_object_mut().unwrap().extend(fork_fields.as_object().unwrap().clone());
         ev
     }
@@ -1313,7 +1401,7 @@ mod tests {
         let consumer = runtime(handler, ledger.clone());
 
         assert!(matches!(
-            consumer.deliver(&message(push_envelope("web", "deadbeef"))),
+            consumer.deliver(&message(push_envelope("web", TEST_OID))),
             Delivered::DeadLettered(_)
         ));
         assert!(reserve.persisted().is_empty(), "region mismatch has zero reserve effects");
@@ -1384,7 +1472,7 @@ mod tests {
     #[test]
     fn oversized_config_is_terminal_poison_without_business_effect() {
         let reader: Arc<dyn GitConfigReader> = Arc::new(MapGitConfigReader::new().with_file(
-            "web", "deadbeef", ".myelin/ci.toml",
+            "web", TEST_OID, ".myelin/ci.toml",
             vec![b' '; crate::config::MAX_CI_CONFIG_BYTES + 1],
         ));
         let reserve = Arc::new(RecordingReserveStore::new());
@@ -1395,7 +1483,7 @@ mod tests {
         let consumer = runtime(handler, ledger.clone());
 
         assert!(matches!(
-            consumer.deliver(&message(push_envelope("web", "deadbeef"))),
+            consumer.deliver(&message(push_envelope("web", TEST_OID))),
             Delivered::DeadLettered(_)
         ));
         assert!(reserve.persisted().is_empty());
@@ -1422,7 +1510,7 @@ mod tests {
     #[test]
     fn cas_snapshot_write_failure_retries_without_dedup_or_reserve_effect() {
         let reader: Arc<dyn GitConfigReader> = Arc::new(
-            MapGitConfigReader::new().with_file("web", "deadbeef", ".myelin/ci.toml", valid_toml()),
+            MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", valid_toml()),
         );
         let reserve = Arc::new(RecordingReserveStore::new());
         let handler = CiTriggerHandler::for_region(
@@ -1432,7 +1520,7 @@ mod tests {
         let consumer = runtime(handler, ledger.clone());
 
         assert_eq!(
-            consumer.deliver(&message(push_envelope("web", "deadbeef"))),
+            consumer.deliver(&message(push_envelope("web", TEST_OID))),
             Delivered::Retried(5)
         );
         assert!(reserve.persisted().is_empty());
@@ -1474,7 +1562,7 @@ mod tests {
     /// **No `.myelin/ci.*` at the pushed ref → a clean NoConfig skip (NOT an error, no run).**
     #[test]
     fn no_config_is_a_clean_skip() {
-        let ev = push_envelope("web", "deadbeef");
+        let ev = push_envelope("web", TEST_OID);
         let reader = MapGitConfigReader::new();
         assert!(matches!(arm(&ev, &reader), DispatchOutcome::Skip(SkipReason::NoConfig)));
     }
@@ -1482,9 +1570,9 @@ mod tests {
     /// **A malformed `.myelin/ci.toml` → a fail-closed, SURFACED ConfigError skip (no run, no crash).**
     #[test]
     fn a_malformed_config_is_a_surfaced_skip() {
-        let ev = push_envelope("web", "deadbeef");
+        let ev = push_envelope("web", TEST_OID);
         let reader =
-            MapGitConfigReader::new().with_file("web", "deadbeef", ".myelin/ci.toml", &b"on = = broken"[..]);
+            MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", &b"on = = broken"[..]);
         assert!(matches!(
             arm(&ev, &reader),
             DispatchOutcome::Skip(SkipReason::ConfigError(_))
@@ -1494,8 +1582,8 @@ mod tests {
     /// **A backend read failure → a fail-closed ReadFailed skip (no run without a proven definition).**
     #[test]
     fn a_read_failure_is_fail_closed() {
-        let ev = push_envelope("web", "deadbeef");
-        let reader = MapGitConfigReader::new().with_failure("web", "deadbeef", ".myelin/ci.toml");
+        let ev = push_envelope("web", TEST_OID);
+        let reader = MapGitConfigReader::new().with_failure("web", TEST_OID, ".myelin/ci.toml");
         assert!(matches!(
             arm(&ev, &reader),
             DispatchOutcome::Skip(SkipReason::ReadFailed(_))
@@ -1504,9 +1592,9 @@ mod tests {
 
     #[test]
     fn an_oversized_config_is_refused_before_parsing() {
-        let ev = push_envelope("web", "deadbeef");
+        let ev = push_envelope("web", TEST_OID);
         let reader = MapGitConfigReader::new().with_file(
-            "web", "deadbeef", ".myelin/ci.toml", vec![b' '; crate::config::MAX_CI_CONFIG_BYTES + 1],
+            "web", TEST_OID, ".myelin/ci.toml", vec![b' '; crate::config::MAX_CI_CONFIG_BYTES + 1],
         );
         assert!(matches!(arm(&ev, &reader), DispatchOutcome::Skip(SkipReason::ReadFailed(_))));
     }
@@ -1514,7 +1602,7 @@ mod tests {
     /// **A non-matching trigger (a `pull_request` config on a push) → TriggerNotMatched skip.**
     #[test]
     fn a_non_matching_trigger_skips() {
-        let ev = push_envelope("web", "deadbeef");
+        let ev = push_envelope("web", TEST_OID);
         let pr_config = concat!(
             "on = \"pull_request\"\n\n",
             "[[jobs]]\nname = \"build\"\n",
@@ -1522,7 +1610,7 @@ mod tests {
             "command = [\"build\"]\n"
         );
         let reader =
-            MapGitConfigReader::new().with_file("web", "deadbeef", ".myelin/ci.toml", pr_config.as_bytes());
+            MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", pr_config.as_bytes());
         assert!(matches!(
             arm(&ev, &reader),
             DispatchOutcome::Skip(SkipReason::TriggerNotMatched)
@@ -1532,10 +1620,10 @@ mod tests {
     /// **A floating-tag config → a fail-closed ResolveError skip (the supply-chain control).**
     #[test]
     fn a_floating_tag_is_a_surfaced_resolve_skip() {
-        let ev = push_envelope("web", "deadbeef");
+        let ev = push_envelope("web", TEST_OID);
         let floating = "on = \"push\"\n\n[[jobs]]\nname = \"build\"\nimage = \"alpine:3\"\ncommand = [\"build\"]\n";
         let reader =
-            MapGitConfigReader::new().with_file("web", "deadbeef", ".myelin/ci.toml", floating.as_bytes());
+            MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", floating.as_bytes());
         assert!(matches!(
             arm(&ev, &reader),
             DispatchOutcome::Skip(SkipReason::ResolveError(ResolveError::FloatingTag { .. }))
@@ -1545,12 +1633,143 @@ mod tests {
     /// **A missing `repo`/`new_oid` payload → a fail-closed MalformedPayload skip.**
     #[test]
     fn a_malformed_payload_skips() {
-        let mut ev = push_envelope("web", "deadbeef");
+        let mut ev = push_envelope("web", TEST_OID);
         ev.payload = serde_json::json!({ "ref": "refs/heads/main" });
         assert!(matches!(
             arm(&ev, &MapGitConfigReader::new()),
             DispatchOutcome::Skip(SkipReason::MalformedPayload(_))
         ));
+    }
+
+    fn assert_invalid_provenance_is_poison_before_effects(ev: EventEnvelope) {
+        let reserve = Arc::new(RecordingReserveStore::new());
+        let handler = CiTriggerHandler::for_region(
+            Arc::new(NoConfigRead), Arc::new(NoCasAccess), reserve.clone(), "fr-par",
+        );
+        match handler.handle(&ev, &mut myelin_events::HandlerTx::none()) {
+            HandleOutcome::NonRetryable(myelin_events::Reason(reason)) => {
+                assert_eq!(reason, "invalid trigger provenance");
+                assert!(!reason.contains("ATTACKER_SENTINEL"));
+            }
+            other => panic!("invalid provenance must be permanent poison, got {other:?}"),
+        }
+        let ledger = DedupLedger::new();
+        let consumer = runtime(handler, ledger.clone());
+        assert!(matches!(consumer.deliver(&message(ev)), Delivered::DeadLettered(_)));
+        assert!(reserve.persisted().is_empty(), "invalid provenance has zero reserve effects");
+        assert_eq!(ledger.len(), 1, "permanent poison records a terminal tombstone after DLQ");
+    }
+
+    #[test]
+    fn push_subject_aggregate_payload_and_ref_provenance_must_cohere_before_effects() {
+        let mut cases = Vec::new();
+        let mut wrong_subject_repo = push_envelope("team/web", TEST_OID);
+        wrong_subject_repo.subject = ArtifactRef(
+            "myelin://acme/git/ref/other/web:refs/heads/main".into(),
+        );
+        cases.push(wrong_subject_repo);
+        let mut wrong_tenant = push_envelope("web", TEST_OID);
+        wrong_tenant.subject = ArtifactRef("myelin://other/git/ref/web:refs/heads/main".into());
+        cases.push(wrong_tenant);
+        let mut wrong_aggregate = push_envelope("web", TEST_OID);
+        wrong_aggregate.aggregate = AggregateKey("ATTACKER_SENTINEL:refs/heads/main".into());
+        cases.push(wrong_aggregate);
+        let mut invalid_repo = push_envelope("web", TEST_OID);
+        invalid_repo.payload["repo"] = serde_json::json!("../web");
+        cases.push(invalid_repo);
+        let mut invalid_ref = push_envelope("web", TEST_OID);
+        invalid_ref.payload["ref"] = serde_json::json!("HEAD");
+        cases.push(invalid_ref);
+        let mut hidden_ref_component = push_envelope("web", TEST_OID);
+        hidden_ref_component.payload["ref"] = serde_json::json!("refs/heads/.hidden");
+        cases.push(hidden_ref_component);
+        for event in cases {
+            assert_invalid_provenance_is_poison_before_effects(event);
+        }
+    }
+
+    #[test]
+    fn pr_subject_aggregate_payload_and_number_provenance_must_cohere_before_effects() {
+        let mut cases = Vec::new();
+        let mut wrong_subject = pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
+        wrong_subject.subject = ArtifactRef("myelin://acme/git/pr/other:42".into());
+        cases.push(wrong_subject);
+        let mut wrong_aggregate = pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
+        wrong_aggregate.aggregate = AggregateKey("git/pr/web:41".into());
+        cases.push(wrong_aggregate);
+        let mut invalid_repo = pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
+        invalid_repo.payload["repo"] = serde_json::json!("group//web");
+        cases.push(invalid_repo);
+        let mut invalid_number = pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
+        invalid_number.payload["number"] = serde_json::json!(0);
+        cases.push(invalid_number);
+        for event in cases {
+            assert_invalid_provenance_is_poison_before_effects(event);
+        }
+    }
+
+    #[test]
+    fn revspecs_refs_head_abbreviations_and_non_hex_oids_are_permanent_before_git_read() {
+        for invalid in ["HEAD", "main", "refs/heads/main", "deadbeef", "ATTACKER_SENTINEL"] {
+            let mut event = push_envelope("web", TEST_OID);
+            event.payload["new_oid"] = serde_json::json!(invalid);
+            assert!(matches!(
+                plan_dispatch(&event, &NoConfigRead, &NoCasAccess),
+                DispatchOutcome::Skip(SkipReason::ReadFailed(GitReadError::Invalid(_)))
+            ));
+        }
+        let mut event = push_envelope("web", TEST_OID);
+        event.payload["new_oid"] = serde_json::json!("ATTACKER_SENTINEL");
+        let handler = CiTriggerHandler::for_region(
+            Arc::new(NoConfigRead), Arc::new(NoCasAccess),
+            Arc::new(RecordingReserveStore::new()), "fr-par",
+        );
+        let HandleOutcome::NonRetryable(myelin_events::Reason(reason)) =
+            handler.handle(&event, &mut myelin_events::HandlerTx::none()) else {
+                panic!("invalid oid must be permanent poison");
+            };
+        assert!(!reason.contains("ATTACKER_SENTINEL"));
+    }
+
+    #[test]
+    fn uppercase_exact_oid_is_canonicalized_before_git_read_and_persistence() {
+        let uppercase = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+        let reader = MapGitConfigReader::new().with_file(
+            "web", TEST_OID, ".myelin/ci.toml", valid_toml(),
+        );
+        let DispatchOutcome::Arm(armed) = arm(&push_envelope("web", uppercase), &reader) else {
+            panic!("uppercase exact oid must canonicalize and arm");
+        };
+        assert_eq!(armed.reserve.commit_oid, TEST_OID);
+    }
+
+    #[test]
+    fn durable_reader_preserves_namespaced_repository_slugs() {
+        let root = temp_git_root("namespaced-repo");
+        let store = myelin_git::durable::DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&myelin_git::core::RepoLoc::new(
+            "acme", "fr-par", "team/web",
+        )).expect("create namespaced bare repo");
+        let raw = git2::Repository::open_bare(repo.path()).expect("open namespaced repo");
+        let blob = raw.blob(valid_toml()).expect("write CI config blob");
+        let mut ci = raw.treebuilder(None).expect("CI tree builder");
+        ci.insert("ci.toml", blob, 0o100644).expect("insert config");
+        let ci_tree = ci.write().expect("write CI tree");
+        let mut root_tree = raw.treebuilder(None).expect("root tree builder");
+        root_tree.insert(".myelin", ci_tree, 0o040000).expect("insert .myelin tree");
+        let root_tree = raw.find_tree(root_tree.write().expect("write root tree")).unwrap();
+        let signature = git2::Signature::now("ci", "ci@invalid").unwrap();
+        let commit = raw.commit(
+            Some("refs/heads/main"), &signature, &signature, "seed", &root_tree, &[],
+        ).expect("seed CI config").to_string();
+        let reader = DurableGitConfigReader::new(store);
+        let DispatchOutcome::Arm(armed) = arm(
+            &push_envelope("team/web", &commit), &reader,
+        ) else {
+            panic!("the full namespaced slug must select its own repository");
+        };
+        assert_eq!(armed.reserve.repo_ref, "team/web");
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1582,7 +1801,7 @@ mod tests {
         for event_type in [GIT_PR_OPENED, GIT_PR_SYNCHRONIZED] {
             for (fields, expected_tier) in &cases {
                 let ev = pr_envelope(event_type, fields.clone());
-                let reader = MapGitConfigReader::new().with_file("web", "deadbeef", ".myelin/ci.toml", valid_pr_toml());
+                let reader = MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", valid_pr_toml());
                 let DispatchOutcome::Arm(armed) = arm(&ev, &reader) else {
                     panic!("explicit boolean fork evidence must reach the matching PR config");
                 };
@@ -1593,13 +1812,13 @@ mod tests {
 
     #[test]
     fn push_preserves_absence_and_true_but_refuses_mistyped_or_conflicting_fork_evidence() {
-        let reader = MapGitConfigReader::new().with_file("web", "deadbeef", ".myelin/ci.toml", valid_toml());
-        let DispatchOutcome::Arm(absent) = arm(&push_envelope("web", "deadbeef"), &reader) else {
+        let reader = MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", valid_toml());
+        let DispatchOutcome::Arm(absent) = arm(&push_envelope("web", TEST_OID), &reader) else {
             panic!("legacy push without fork evidence remains compatible");
         };
         assert_eq!(absent.handoff.run_write.trust_tier, "trusted");
 
-        let mut fork = push_envelope("web", "deadbeef");
+        let mut fork = push_envelope("web", TEST_OID);
         fork.payload["is_fork"] = serde_json::json!(true);
         let DispatchOutcome::Arm(fork) = arm(&fork, &reader) else {
             panic!("well-typed push fork evidence must be preserved");
@@ -1611,7 +1830,7 @@ mod tests {
             serde_json::json!({ "forked": null }),
             serde_json::json!({ "is_fork": false, "forked": true }),
         ] {
-            let mut ev = push_envelope("web", "deadbeef");
+            let mut ev = push_envelope("web", TEST_OID);
             ev.payload.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
             assert_malformed_before_side_effects(&ev);
         }
@@ -1619,7 +1838,7 @@ mod tests {
 
     #[test]
     fn unknown_event_type_remains_not_a_trigger_before_payload_parsing() {
-        let mut ev = push_envelope("web", "deadbeef");
+        let mut ev = push_envelope("web", TEST_OID);
         ev.type_ = EventType("git.pr.closed".into());
         ev.payload["is_fork"] = serde_json::json!("not-a-boolean");
         assert!(matches!(
@@ -1633,9 +1852,9 @@ mod tests {
     /// deterministic run_id, and the Trusted (member push) stamp.
     #[test]
     fn the_happy_path_arms_the_atomic_bundle() {
-        let ev = push_envelope("web", "deadbeef");
+        let ev = push_envelope("web", TEST_OID);
         let reader =
-            MapGitConfigReader::new().with_file("web", "deadbeef", ".myelin/ci.toml", valid_toml());
+            MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", valid_toml());
         let DispatchOutcome::Arm(armed) = arm(&ev, &reader) else {
             panic!("the digest-pinned config on a matching push must arm a run");
         };
@@ -1652,7 +1871,7 @@ mod tests {
         assert_eq!(armed.reserve.wf_run_id, deterministic_uuid("wf:ev-push-1"));
         assert_eq!(armed.reserve.correlation_id, "corr-1");
         assert_eq!(armed.reserve.repo_ref, "web");
-        assert_eq!(armed.reserve.commit_oid, "deadbeef");
+        assert_eq!(armed.reserve.commit_oid, TEST_OID);
         let insert = ci_run_insert_from_armed(&armed);
         assert_eq!(insert.triggered_by.as_deref(), Some("pusher"));
         assert_eq!(armed.tenant, TenantId("acme".into()));
@@ -1660,10 +1879,10 @@ mod tests {
 
     #[test]
     fn exact_v2_config_reaches_a_v2_cas_snapshot_through_the_production_consumer() {
-        let ev = push_envelope("web", "deadbeef");
+        let ev = push_envelope("web", TEST_OID);
         let reader = MapGitConfigReader::new().with_file(
             "web",
-            "deadbeef",
+            TEST_OID,
             ".myelin/ci.toml",
             valid_v2_toml(),
         );
@@ -1688,18 +1907,14 @@ mod tests {
     /// **A fork PR (is_fork) → an UntrustedFork stamp on BOTH the row AND every check (X-1).**
     #[test]
     fn a_fork_pr_stamps_untrusted_fork() {
-        let mut ev = push_envelope("web", "deadbeef");
-        ev.type_ = EventType(GIT_PR_OPENED.into());
-        ev.payload = serde_json::json!({
-            "repo": "web", "head_oid": "deadbeef", "is_fork": true,
-        });
+        let ev = pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": true }));
         let pr_config = concat!(
             "on = \"pull_request\"\n\n[[jobs]]\nname = \"build\"\n",
             "image = \"registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000\"\n",
             "command = [\"build\"]\n"
         );
         let reader =
-            MapGitConfigReader::new().with_file("web", "deadbeef", ".myelin/ci.toml", pr_config.as_bytes());
+            MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", pr_config.as_bytes());
         let DispatchOutcome::Arm(armed) = arm(&ev, &reader) else {
             panic!("a fork PR with a matching config arms an untrusted-fork run");
         };
@@ -1720,9 +1935,9 @@ mod tests {
     /// (the SAME event_id → the SAME deterministic run_id → one persisted run, even delivered twice).
     #[test]
     fn the_handler_persists_and_is_idempotent() {
-        let ev = push_envelope("web", "deadbeef");
+        let ev = push_envelope("web", TEST_OID);
         let reader: Arc<dyn GitConfigReader> = Arc::new(
-            MapGitConfigReader::new().with_file("web", "deadbeef", ".myelin/ci.toml", valid_toml()),
+            MapGitConfigReader::new().with_file("web", TEST_OID, ".myelin/ci.toml", valid_toml()),
         );
         let blobs: Arc<dyn BlobStore + Send + Sync> = Arc::new(FsBlobStore::new());
         let store = Arc::new(RecordingReserveStore::new());
@@ -1817,7 +2032,7 @@ impl<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> GitConfigReader
     fn read_repo_file_bounded(
         &self, tenant: &str, region: &str, repo: &str, oid: &str, path: &str, maximum_bytes: usize,
     ) -> Result<Option<Vec<u8>>, GitReadError> {
-        let loc = myelin_git::core::RepoLoc::new(tenant, region, repo_name(repo));
+        let loc = myelin_git::core::RepoLoc::new(tenant, region, repo);
         if !self.store.repo_exists(&loc) {
             return Err(GitReadError::Unavailable(format!(
                 "repository {repo} is unavailable for tenant={tenant} region={region}"
@@ -1827,29 +2042,16 @@ impl<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> GitConfigReader
             .store
             .open_repo(&loc)
             .map_err(|e| GitReadError::Unavailable(format!("open {repo}: {e}")))?;
-        if !git
-            .commit_exists(oid)
-            .map_err(|e| GitReadError::Unavailable(format!("validate commit {oid}: {e}")))?
-        {
-            return Err(GitReadError::Unavailable(format!(
-                "commit {oid} is unavailable in repository {repo}"
-            )));
-        }
+        let oid = myelin_git::core::Oid::new(oid);
         match git
-            .read_blob_at_path_bounded(oid, path, maximum_bytes)
-            .map_err(|e| GitReadError::Unavailable(format!("read {path}@{oid}: {e}")))?
+            .read_blob_at_commit_oid_bounded(&oid, path, maximum_bytes)
+            .map_err(|e| GitReadError::Unavailable(format!("read {path}@{}: {e}", oid.as_str())))?
         {
             myelin_git::durable::BlobPathLookup::Found { bytes, .. } => Ok(Some(bytes)),
-            myelin_git::durable::BlobPathLookup::TooLarge { size, maximum } => Err(GitReadError::Invalid(format!("{path}@{oid} is {size} bytes, above the {maximum}-byte config limit"))),
+            myelin_git::durable::BlobPathLookup::TooLarge { size, maximum } => Err(GitReadError::Invalid(format!("{path}@{} is {size} bytes, above the {maximum}-byte config limit", oid.as_str()))),
             // Absent or a directory at that name → no config file (a clean skip).
             myelin_git::durable::BlobPathLookup::Missing
             | myelin_git::durable::BlobPathLookup::IsDir => Ok(None),
         }
     }
-}
-
-/// Extract the repo NAME from a repo ref: the last path segment of `myelin://<tenant>/git/repo/<name>`
-/// or a bare `<name>`. The `RepoLoc` keys on the short repo name (its on-disk path segment).
-fn repo_name(repo: &str) -> &str {
-    repo.rsplit(['/', ':']).next().filter(|s| !s.is_empty()).unwrap_or(repo)
 }

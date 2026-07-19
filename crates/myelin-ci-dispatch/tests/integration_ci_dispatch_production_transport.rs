@@ -113,7 +113,7 @@ fn push_event(tenant: &str, commit: &str, event_id: &str) -> EventEnvelope {
             "myelin://{tenant}/git/ref/web:refs/heads/main",
             tenant = tenant.0
         )),
-        aggregate: AggregateKey("git/ref/web:refs/heads/main".into()),
+        aggregate: AggregateKey("web:refs/heads/main".into()),
         causation_id: None,
         correlation_id: CorrelationId(event_id.into()),
         caused_by: None,
