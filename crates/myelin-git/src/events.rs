@@ -39,6 +39,53 @@
 //! when they do, they assert against THESE names — one token language, no drift (EI-01 §7).
 
 use myelin_events::validate_event_type;
+use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
+
+/// Stable tenant-bound actor pseudonym for Git event envelopes. Production emitters must never put
+/// the authenticated principal's raw subject locator in the durable outbox.
+pub fn event_actor_pseudonym(tenant: &str, subject: &str) -> String {
+    event_actor_field_pseudonym("principal", tenant, subject)
+}
+
+fn event_actor_field_pseudonym(field: &str, tenant: &str, subject: &str) -> String {
+    let digest = blake3::hash(
+        format!("myelin.git.event-actor.v1\0{field}\0{tenant}\0{subject}").as_bytes(),
+    );
+    format!("git-event:{}", &digest.to_hex()[..32])
+}
+
+/// Return the event-safe projection of an authenticated principal. Every identifier nested in an
+/// Agent principal is independently tenant-bound and domain-separated so neither the subject, the
+/// runtime locator, nor the delegating human can leak into the durable event envelope or be joined
+/// across fields by comparing equal pseudonyms.
+pub fn pseudonymized_event_principal(tenant: &str, principal: &Principal) -> Principal {
+    let mut projected = principal.clone();
+    projected.principal_id = PrincipalId(event_actor_pseudonym(
+        tenant,
+        &principal.principal_id.0,
+    ));
+    if let PrincipalKind::Agent {
+        runtime_ref,
+        on_behalf_of,
+    } = &principal.kind
+    {
+        projected.kind = PrincipalKind::Agent {
+            runtime_ref: RuntimeRef(event_actor_field_pseudonym(
+                "runtime-ref",
+                tenant,
+                &runtime_ref.0,
+            )),
+            on_behalf_of: on_behalf_of.as_ref().map(|delegator| {
+                PrincipalId(event_actor_field_pseudonym(
+                    "on-behalf-of",
+                    tenant,
+                    &delegator.0,
+                ))
+            }),
+        };
+    }
+    projected
+}
 
 // ===========================================================================
 // §1 — the complete git.* event token constants (the registration; dotted grammar)
@@ -310,6 +357,38 @@ pub fn register_git_tokens() -> Result<(), (&'static str, myelin_events::Taxonom
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_event_projection_scrubs_every_nested_identifier_with_separate_domains() {
+        let principal = Principal::stub(
+            PrincipalId("agent:raw-subject".into()),
+            PrincipalKind::Agent {
+                runtime_ref: RuntimeRef("runtime://raw-host/session".into()),
+                on_behalf_of: Some(PrincipalId("human:raw-delegator".into())),
+            },
+            myelin_tenancy::TenantId("acme".into()),
+        );
+        let projected = pseudonymized_event_principal("acme", &principal);
+        let serialized = serde_json::to_string(&myelin_events::Actor(projected.clone())).unwrap();
+        for raw in [
+            "agent:raw-subject",
+            "runtime://raw-host/session",
+            "human:raw-delegator",
+        ] {
+            assert!(!serialized.contains(raw), "raw nested identifier leaked: {raw}");
+        }
+        let PrincipalKind::Agent {
+            runtime_ref,
+            on_behalf_of,
+        } = projected.kind
+        else {
+            panic!("Agent discriminant must be preserved")
+        };
+        let delegator = on_behalf_of.expect("delegator projection");
+        assert_ne!(projected.principal_id.0, runtime_ref.0);
+        assert_ne!(projected.principal_id.0, delegator.0);
+        assert_ne!(runtime_ref.0, delegator.0, "field domains must not correlate");
+    }
 
     /// **THE GATE (contract 2.9): 0 ungrammatical tokens.** Every registered `git.*` token parses
     /// the Bus §6.1/§6.2 grammar via the one Bus validator — git registers against the grammar it

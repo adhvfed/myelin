@@ -336,6 +336,24 @@ pub trait DurableOutboxBacking: Send + Sync {
     fn row(&self, id: &EventId) -> Option<OutboxRow>;
     /// Snapshot the committed rows in per-aggregate commit order.
     fn committed_rows(&self) -> Vec<OutboxRow>;
+    /// Fallible committed-row snapshot for recovery/load-bearing callers. The default preserves
+    /// compatibility for infallible test backings; durable implementations override so storage
+    /// failures can never masquerade as an empty witness set.
+    fn try_committed_rows(&self) -> Result<Vec<OutboxRow>> {
+        Ok(self.committed_rows())
+    }
+    /// Fallible snapshot of every retained witness row, including terminal dead letters. This is
+    /// intentionally distinct from [`committed_rows`](Self::committed_rows), whose longstanding
+    /// contract is the live set only. Startup recovery must not lose a state-change witness merely
+    /// because broker publication exhausted its retry budget.
+    fn try_retained_rows(&self) -> Result<Vec<OutboxRow>> {
+        let mut rows = self.try_committed_rows()?;
+        rows.extend(self.dead_letters());
+        rows.sort_by(|left, right| {
+            (&left.aggregate.0, left.seq).cmp(&(&right.aggregate.0, right.seq))
+        });
+        Ok(rows)
+    }
     /// Snapshot the dead-lettered rows (the operator alert / a test).
     fn dead_letters(&self) -> Vec<OutboxRow>;
 
@@ -545,6 +563,33 @@ impl OutboxStore {
                     .iter()
                     .filter_map(|id| inner.rows.get(id).cloned())
                     .collect()
+            }
+        }
+    }
+
+    /// Fallible snapshot used by startup recovery. Unlike [`Self::committed_rows`], a durable query
+    /// failure is surfaced to the caller instead of being interpreted as zero committed witnesses.
+    pub fn try_committed_rows(&self) -> Result<Vec<OutboxRow>> {
+        match &self.backend {
+            OutboxBackend::Durable(b) => b.try_committed_rows(),
+            #[cfg(any(test, feature = "test-support"))]
+            OutboxBackend::Memory(_) => Ok(self.committed_rows()),
+        }
+    }
+
+    /// Fallible recovery-witness snapshot over all retained rows (live plus dead-lettered). A
+    /// durable read failure propagates; it can never be interpreted as an empty repository set.
+    pub fn try_retained_rows(&self) -> Result<Vec<OutboxRow>> {
+        match &self.backend {
+            OutboxBackend::Durable(b) => b.try_retained_rows(),
+            #[cfg(any(test, feature = "test-support"))]
+            OutboxBackend::Memory(_) => {
+                let mut rows = self.committed_rows();
+                rows.extend(self.dead_letters());
+                rows.sort_by(|left, right| {
+                    (&left.aggregate.0, left.seq).cmp(&(&right.aggregate.0, right.seq))
+                });
+                Ok(rows)
             }
         }
     }
@@ -1460,6 +1505,7 @@ mod tests {
     struct MockBacking {
         committed: Mutex<Vec<OutboxRow>>,
         drain_calls: Mutex<Vec<usize>>,
+        snapshot_fails: bool,
     }
 
     impl DurableOutboxBacking for MockBacking {
@@ -1509,6 +1555,13 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
         }
+        fn try_committed_rows(&self) -> Result<Vec<OutboxRow>> {
+            if self.snapshot_fails {
+                Err(OutboxError("injected committed-row snapshot failure".into()))
+            } else {
+                Ok(self.committed_rows())
+            }
+        }
         fn dead_letters(&self) -> Vec<OutboxRow> {
             Vec::new()
         }
@@ -1528,6 +1581,18 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+
+    #[test]
+    fn fallible_snapshot_propagates_backing_failure_instead_of_returning_empty() {
+        let store = OutboxStore::durable(Arc::new(MockBacking {
+            snapshot_fails: true,
+            ..MockBacking::default()
+        }));
+        let error = store
+            .try_retained_rows()
+            .expect_err("load-bearing recovery snapshot must fail loud");
+        assert!(error.0.contains("injected committed-row snapshot failure"));
     }
 
     /// **Commit dispatch routes the whole staged buffer to `commit_staged` (the durable arm of the

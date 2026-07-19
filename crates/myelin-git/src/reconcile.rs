@@ -22,13 +22,14 @@
 //! NOT reimplement ref storage or a parallel seq counter. (R0.4 / git #1 HIGH: this was the reflog LENGTH,
 //! which RESET on a ref's delete+recreate and broke the fence — the generation is now a monotonic
 //! config-backed counter keyed by ref name.) The committed events come from the already-frozen
-//! [`myelin_events::OutboxStore`] (in production the durable `outbox` table); [`refs_from_outbox`]
-//! extracts the `git.ref.updated` rows for one repo from that store.
+//! [`myelin_events::OutboxStore`] (in production the durable `outbox` table);
+//! [`refs_from_outbox_scoped`] extracts rows for one exact tenant/region/repository authority tuple.
 
 use crate::core::Oid;
 use crate::durable::{DurableError, DurableGitRepo};
 use crate::events::GIT_REF_UPDATED;
 use myelin_events::OutboxStore;
+use std::collections::BTreeSet;
 
 /// One committed `git.ref.updated` record — the durable witness of a ref move (the payload
 /// [`crate::receive_pack::RefStore::receive`] emits). The reconciler replays these; the durable per-ref
@@ -50,31 +51,48 @@ pub struct GitRefUpdatedRecord {
 }
 
 impl GitRefUpdatedRecord {
-    /// Parse a committed `git.ref.updated` payload into a record. Returns `None` if a required field is
-    /// missing (a malformed row is skipped loudly by the caller, never silently mis-applied).
-    pub fn from_payload(repo_filter: Option<&str>, payload: &serde_json::Value) -> Option<Self> {
-        let repo = payload.get("repo")?.as_str()?.to_string();
-        if let Some(want) = repo_filter {
-            if repo != want {
-                return None;
-            }
+    /// Parse a retained `git.ref.updated` witness. `Ok(None)` is reserved exclusively for a fully
+    /// valid witness naming a different repository; malformed scoped witnesses fail boot loudly.
+    pub fn from_payload(
+        repo_filter: Option<&str>,
+        payload: &serde_json::Value,
+    ) -> Result<Option<Self>, DurableError> {
+        fn required_string(
+            payload: &serde_json::Value,
+            field: &str,
+        ) -> Result<String, DurableError> {
+            payload
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    DurableError::Io(format!(
+                        "retained git.ref.updated witness has invalid `{field}`"
+                    ))
+                })
         }
-        Some(GitRefUpdatedRecord {
-            repo,
-            ref_name: payload.get("ref")?.as_str()?.to_string(),
-            old_oid: payload
-                .get("old_oid")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            new_oid: payload.get("new_oid")?.as_str()?.to_string(),
-            update_seq: payload.get("update_seq")?.as_u64()?,
-            pusher_pseudonym: payload
-                .get("pusher_pseudonym")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-        })
+
+        let record = GitRefUpdatedRecord {
+            repo: required_string(payload, "repo")?,
+            ref_name: required_string(payload, "ref")?,
+            old_oid: required_string(payload, "old_oid")?,
+            new_oid: required_string(payload, "new_oid")?,
+            update_seq: payload
+                .get("update_seq")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    DurableError::Io(
+                        "retained git.ref.updated witness has invalid `update_seq`".into(),
+                    )
+                })?,
+            pusher_pseudonym: required_string(payload, "pusher_pseudonym")?,
+        };
+        if repo_filter.is_some_and(|wanted| wanted != record.repo) {
+            return Ok(None);
+        }
+        Ok(Some(record))
     }
 
     fn new_is_delete(&self) -> bool {
@@ -86,15 +104,48 @@ impl GitRefUpdatedRecord {
     }
 }
 
-/// Extract every committed `git.ref.updated` record for a repo from the outbox (the durable witness set
-/// the reconciler replays). In production these are read from the durable `outbox` table on restart; the
-/// in-memory [`OutboxStore`] models the same committed sequence. Pass `Some(repo)` to scope to one repo.
-pub fn refs_from_outbox(outbox: &OutboxStore, repo: Option<&str>) -> Vec<GitRefUpdatedRecord> {
+/// Extract committed `git.ref.updated` records for one exact tenant/region/repository authority
+/// tuple. Repository slugs are tenant-local, so filtering only the payload slug can replay another
+/// tenant's same-named event into this repository. Authority is therefore checked on the envelope
+/// before the payload is decoded.
+pub fn refs_from_outbox_scoped(
+    outbox: &OutboxStore,
+    tenant: &str,
+    region: &str,
+    repo: &str,
+) -> Result<Vec<GitRefUpdatedRecord>, DurableError> {
     outbox
-        .committed_rows()
+        .try_retained_rows()
+        .map_err(|_| DurableError::Io("durable outbox witness snapshot failed".into()))?
         .into_iter()
         .filter(|row| row.envelope.type_.0 == GIT_REF_UPDATED)
-        .filter_map(|row| GitRefUpdatedRecord::from_payload(repo, &row.envelope.payload))
+        .filter(|row| row.envelope.tenant.0 == tenant && row.envelope.region.0 == region)
+        .map(|row| GitRefUpdatedRecord::from_payload(Some(repo), &row.envelope.payload))
+        .filter_map(Result::transpose)
+        .collect()
+}
+
+/// Repository slugs that have committed ref witnesses in one exact tenant/region partition. This is
+/// the durable boot-recovery discovery set; callers union it with repositories named by pending PR
+/// merge intents and never infer recovery authority from filesystem directory names.
+pub fn repo_slugs_from_outbox_scoped(
+    outbox: &OutboxStore,
+    tenant: &str,
+    region: &str,
+) -> Result<BTreeSet<String>, DurableError> {
+    outbox
+        .try_retained_rows()
+        .map_err(|_| DurableError::Io("durable outbox witness snapshot failed".into()))?
+        .into_iter()
+        .filter(|row| row.envelope.type_.0 == GIT_REF_UPDATED)
+        .filter(|row| row.envelope.tenant.0 == tenant && row.envelope.region.0 == region)
+        .map(|row| {
+            GitRefUpdatedRecord::from_payload(None, &row.envelope.payload).and_then(|record| {
+                record
+                    .map(|record| record.repo)
+                    .ok_or_else(|| DurableError::Io("valid ref witness unexpectedly skipped".into()))
+            })
+        })
         .collect()
 }
 

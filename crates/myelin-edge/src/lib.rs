@@ -109,7 +109,10 @@ pub use gateway::{
     sse_scope_for_resource, sse_scope_for_tenant, AuthProvider, AuthPublicConfig, Gateway,
     GatewayBuilder, WhoamiHandler,
 };
-pub use git_durable::{register_git_durable, DurableGitBackend};
+pub use git_durable::{
+    recover_placed_git_at_boot, register_git_durable, DurableGitBackend, GitBootRecoveryReport,
+    GitCellBootRecoveryReport,
+};
 pub use git_edge::{register_git, GitEdgeState};
 pub use git_effect::GitEffectApi;
 pub use git_wire_exec::{production_git_core, production_git_core_default, GitWireExecutor};

@@ -192,7 +192,7 @@ impl std::error::Error for RequiredContextParseError {}
 /// approvals/CODEOWNERS ([`crate::lifecycle::evaluate_ruleset`]), and the agent-needs-human HITL gate —
 /// those are the lifecycle/ReBAC halves the merge tool (GIT-P30) and the durable queue (GIT-P23)
 /// compose ON TOP of this.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MergeGateOutcome {
     /// Every required context has a CURRENT `success` row with an acceptable trust posture — the
     /// required-set gate is GREEN (the merge may proceed once the other `may_merge` legs pass).
@@ -214,7 +214,7 @@ impl MergeGateOutcome {
 }
 
 /// A required context that is NOT satisfied + the reason — the loud, typed "why this merge is blocked".
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UnmetContext {
     /// The required context that is unmet.
     pub context: CheckContext,
@@ -223,7 +223,7 @@ pub struct UnmetContext {
 }
 
 /// Why a required context did not satisfy the merge gate (humanisable; never a raw string).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UnmetReason {
     /// No CURRENT projection row for `(head_oid, context)` — CI has not (yet) reported this context for
     /// the head commit. The gate treats a missing required context as BLOCKING (fail-closed).

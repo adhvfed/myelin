@@ -181,6 +181,10 @@ pub struct PrRecord {
     pub head_oid: String,
     /// The PR author's OPAQUE pseudonym (GIT-1) — a self-approval by this pseudonym does NOT count.
     pub author_pseudonym: String,
+    /// Canonical GDPR/KMS subject locator: the normalized stable `principal_id`, kept distinct from
+    /// the display pseudonym. New PostgreSQL rows require it; the empty default is legacy-import only.
+    #[serde(default)]
+    pub author_subject_id: String,
     /// The reviews on this PR (durable; submitted via the authorized review op).
     pub reviews: Vec<ReviewRecord>,
     /// Contexts with a CURRENT TRUSTED success for `head_oid` (the CI check-report fact; producer M4).
@@ -213,6 +217,7 @@ impl PrRecord {
             head_repo_slug: String::new(),
             head_oid: head_oid.into(),
             author_pseudonym: pr.author_pseudonym.clone(),
+            author_subject_id: String::new(),
             reviews: Vec::new(),
             green_contexts: Vec::new(),
             fork_unendorsed_contexts: Vec::new(),
@@ -379,10 +384,11 @@ impl ChecksSummary {
 
 // ───────────────────────────── the merge-gate evaluation (reused logic) ───────────────────────────
 
-/// The combined merge-gate decision over the repo-owned ruleset + the durable PR facts — the required-set
-/// + fork-trust half ([`crate::merge_gate`]) AND the approvals / CODEOWNERS / conversations half
-/// ([`crate::lifecycle::evaluate_ruleset`]). A merge is admitted ONLY when BOTH admit.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The combined merge-gate decision over the repo-owned ruleset and durable PR facts. It combines
+/// the required-set and fork-trust half ([`crate::merge_gate`]) with the approvals, CODEOWNERS, and
+/// conversations half ([`crate::lifecycle::evaluate_ruleset`]). A merge is admitted only when both
+/// halves admit.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MergeEval {
     /// The required-set + fork-trust posture outcome.
     pub gate: MergeGateOutcome,

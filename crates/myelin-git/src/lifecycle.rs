@@ -545,7 +545,7 @@ pub struct MergeContext {
 /// proceed — the lifecycle's `Merge` transition is admitted), or it is BLOCKED with the SPECIFIC
 /// unmet reasons (humanised into the PR checks panel by Notif — never a raw string). Loud + typed: a
 /// blocked merge surfaces exactly why.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RulesetOutcome {
     /// Every condition the ruleset imposes is met — the merge is admitted (0 unprotected merges: a
     /// `Satisfied` is the ONLY outcome that lets `PrTransition::Merge` land).
@@ -565,7 +565,7 @@ impl RulesetOutcome {
 }
 
 /// A specific reason the branch-protection gate blocked a merge (humanisable; never a raw string).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BlockReason {
     /// A required CI context is not currently green-and-acceptable. Carries the context name.
     MissingRequiredContext(String),
