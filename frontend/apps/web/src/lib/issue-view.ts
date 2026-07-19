@@ -31,10 +31,54 @@ interface ActivationPollOptions {
   signal?: AbortSignal;
 }
 
+/** Settle one status read inside the remaining polling budget, even if transport never settles. */
+function pollWithinDeadline(
+  poll: (signal: AbortSignal) => Promise<IssueAuthorizationStatus>,
+  remainingMs: number,
+  outerSignal?: AbortSignal,
+): Promise<IssueAuthorizationStatus | null> {
+  const controller = new AbortController();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      outerSignal?.removeEventListener("abort", abort);
+    };
+    const finish = (value: IssueAuthorizationStatus | null) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const fail = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const abort = () => {
+      controller.abort();
+      finish(null);
+    };
+
+    if (outerSignal?.aborted || remainingMs <= 0) {
+      controller.abort();
+      resolve(null);
+      return;
+    }
+    outerSignal?.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(abort, remainingMs);
+    Promise.resolve()
+      .then(() => poll(controller.signal))
+      .then(finish, (error) => controller.signal.aborted ? finish(null) : fail(error));
+  });
+}
+
 /** Poll the uncached status action within a finite budget. Pending never becomes a false failure. */
 export async function pollIssueActivation(
   requestEventId: string,
-  poll: (requestEventId: string) => Promise<IssueAuthorizationStatus>,
+  poll: (requestEventId: string, signal: AbortSignal) => Promise<IssueAuthorizationStatus>,
   options: ActivationPollOptions = {},
 ): Promise<ActivationOutcome> {
   const budget = options.budgetMs ?? ISSUE_ACTIVATION_POLL_BUDGET_MS;
@@ -42,7 +86,13 @@ export async function pollIssueActivation(
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const started = now();
   while (!options.signal?.aborted) {
-    const status = await poll(requestEventId);
+    const remaining = budget - (now() - started);
+    const status = await pollWithinDeadline(
+      (signal) => poll(requestEventId, signal),
+      remaining,
+      options.signal,
+    );
+    if (!status) return { phase: "unconfirmed" };
     if (status.status === "active") return { phase: "active", issue: status.issue };
     const retryAfter = Number.isFinite(status.retry_after_ms) ? status.retry_after_ms : 250;
     const delay = Math.min(Math.max(retryAfter, 250), 5_000);

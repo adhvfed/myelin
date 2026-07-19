@@ -60,8 +60,15 @@ const state = {
   // Issues test controls: empty/projection-unavailable states and how many status reads precede
   // activation. Two proves the UI renders a genuine pending interval before active.
   emptyIssues: false,
+  onlyClosedIssues: false,
   issuesUnavailable: false,
   issueActivationPolls: 2,
+  issueActivationUnavailable: false,
+  issueCreateUnavailable: false,
+  issueCloseUnavailable: false,
+  issueListCursorDelaysMs: [],
+  issueListCursorRequests: 0,
+  issueListCursorResponses: 0,
 };
 
 let issueRows = freshIssueFixtures();
@@ -74,8 +81,15 @@ function resetIssues() {
   issueReceipts.clear();
   issueSequence = 200;
   state.emptyIssues = false;
+  state.onlyClosedIssues = false;
   state.issuesUnavailable = false;
   state.issueActivationPolls = 2;
+  state.issueActivationUnavailable = false;
+  state.issueCreateUnavailable = false;
+  state.issueCloseUnavailable = false;
+  state.issueListCursorDelaysMs = [];
+  state.issueListCursorRequests = 0;
+  state.issueListCursorResponses = 0;
 }
 
 function send(res, status, json, headers = {}) {
@@ -122,8 +136,16 @@ const server = createServer((req, res) => {
         if (typeof body.tokenLoginEnabled === "boolean") state.tokenLoginEnabled = body.tokenLoginEnabled;
         if (body.resetIssues === true) resetIssues();
         if (typeof body.emptyIssues === "boolean") state.emptyIssues = body.emptyIssues;
+        if (typeof body.onlyClosedIssues === "boolean") state.onlyClosedIssues = body.onlyClosedIssues;
         if (typeof body.issuesUnavailable === "boolean") state.issuesUnavailable = body.issuesUnavailable;
         if (Number.isInteger(body.issueActivationPolls)) state.issueActivationPolls = body.issueActivationPolls;
+        if (typeof body.issueActivationUnavailable === "boolean") state.issueActivationUnavailable = body.issueActivationUnavailable;
+        if (typeof body.issueCreateUnavailable === "boolean") state.issueCreateUnavailable = body.issueCreateUnavailable;
+        if (typeof body.issueCloseUnavailable === "boolean") state.issueCloseUnavailable = body.issueCloseUnavailable;
+        if (
+          Array.isArray(body.issueListCursorDelaysMs) &&
+          body.issueListCursorDelaysMs.every((delay) => Number.isInteger(delay) && delay >= 0 && delay <= 5_000)
+        ) state.issueListCursorDelaysMs = [...body.issueListCursorDelaysMs];
       } catch {
         /* ignore malformed control body */
       }
@@ -149,6 +171,9 @@ const server = createServer((req, res) => {
   let im;
   if (method === "POST" && path === "/v1/issues") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (state.issueCreateUnavailable) {
+      return send(res, 503, { error: { message: "issue creation is temporarily unavailable", code: "unavailable" } });
+    }
     let raw = "";
     req.on("data", (chunk) => (raw += chunk));
     req.on("end", () => {
@@ -194,6 +219,9 @@ const server = createServer((req, res) => {
 
   if (method === "POST" && (im = path.match(/^\/v1\/issues\/([^/]+)\/close$/))) {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (state.issueCloseUnavailable) {
+      return send(res, 503, { error: { message: "issue close is temporarily unavailable", code: "unavailable" } });
+    }
     const row = issueJson(issueRows, decodeURIComponent(im[1]));
     if (!row) return send(res, 404, notFoundEnvelope("issue"));
     if (row.state_category !== "completed") {
@@ -250,11 +278,22 @@ const server = createServer((req, res) => {
     const key = url.searchParams.get("key") ?? undefined;
     const limit = Number(url.searchParams.get("limit") ?? 50);
     const cursor = url.searchParams.get("cursor") ?? undefined;
-    return send(
-      res,
-      200,
-      issuesEnvelope(state.emptyIssues ? [] : issueRows, listState, key, limit, cursor),
-    );
+    const rows = state.emptyIssues
+      ? []
+      : state.onlyClosedIssues
+        ? issueRows.filter((issue) => issue.state_category === "completed" || issue.state_category === "cancelled")
+        : issueRows;
+    const envelope = issuesEnvelope(rows, listState, key, limit, cursor);
+    const delay = cursor ? state.issueListCursorDelaysMs.shift() ?? 0 : 0;
+    if (cursor) state.issueListCursorRequests += 1;
+    if (delay > 0) {
+      return setTimeout(() => {
+        state.issueListCursorResponses += 1;
+        send(res, 200, envelope);
+      }, delay);
+    }
+    if (cursor) state.issueListCursorResponses += 1;
+    return send(res, 200, envelope);
   }
 
   if (
@@ -262,7 +301,7 @@ const server = createServer((req, res) => {
     (im = path.match(/^\/v1\/issues\/authorization-requests\/([^/]+)$/))
   ) {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
-    if (state.issuesUnavailable) {
+    if (state.issuesUnavailable || state.issueActivationUnavailable) {
       return send(res, 503, { error: { message: "issue authorization is temporarily unavailable", code: "unavailable" } });
     }
     const receipt = issueReceipts.get(decodeURIComponent(im[1]));

@@ -692,6 +692,8 @@ export type IssueMutationResult =
   | { ok: true; op: "activation"; status: IssueAuthorizationStatus }
   | { ok: false; error: IssueErrorKind };
 
+export const ISSUE_ACTIVATION_STATUS_TIMEOUT_MS = 10_000;
+
 function isCanonicalUuid(value: string | undefined): value is string {
   return Boolean(
     value &&
@@ -734,6 +736,7 @@ export const issuesMutate = action(async (mutation: IssueMutation): Promise<Issu
       const status = await issueAuthed(() =>
         edgeGet<IssueAuthorizationStatus>(
           `/v1/issues/authorization-requests/${seg(mutation.requestEventId)}`,
+          { timeoutMs: ISSUE_ACTIVATION_STATUS_TIMEOUT_MS },
         ),
       );
       return { ok: true, op: "activation", status };

@@ -20,12 +20,10 @@ function actionError(kind: IssueErrorKind): string {
       return "Check the title and try again.";
     case "not-found":
       return "Issue creation isn't available to you.";
-    case "unavailable":
-      return "Issue authorization is temporarily unavailable. Try again shortly.";
     case "configuration":
       return "Issue creation isn't configured on this deployment.";
     default:
-      return "We couldn't create the issue. Nothing was submitted twice; try again.";
+      return "We couldn't confirm whether the issue was created. Check the list before retrying.";
   }
 }
 
@@ -65,13 +63,14 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
         return;
       }
       if (result.op !== "create") {
-        setError("We couldn't confirm the create response. Try again.");
+        setError("We couldn't confirm whether the issue was created. Check the list before retrying.");
+        titleInput?.focus();
         return;
       }
       props.onAccepted(result.receipt);
       props.onClose();
     } catch {
-      setError("We couldn't create the issue. Try again.");
+      setError("We couldn't confirm whether the issue was created. Check the list before retrying.");
       titleInput?.focus();
     } finally {
       setSubmitting(false);
