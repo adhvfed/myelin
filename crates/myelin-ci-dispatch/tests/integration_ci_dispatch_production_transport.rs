@@ -10,26 +10,29 @@ use myelin_ci_dispatch::{
 };
 use myelin_config::MyelinConfig;
 use myelin_events::nats::{
-    JetStreamConsumerConfig, JetStreamPublisherConfig, NatsJetStreamBus, NatsJetStreamPublisher,
+    JetStreamConsumerConfig, JetStreamProvisioner, JetStreamPublisherConfig, NatsJetStreamBus,
+    NatsJetStreamPublisher,
 };
-use myelin_events::relay::{EventConsumer, EventPublisher};
+use myelin_events::relay::EventConsumer;
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, BrokerDeliveryRef, CorrelationId, DataRole, DedupLedger,
     DeliveryQuarantineReason, DurableDedup, DurableDeliveryQuarantine, EventEnvelope, EventId,
     EventType, OutboxStore, Timestamp, UlidMinter, Visibility,
     CONSUMER_DEAD_LETTER_MIGRATION, CONSUMER_DEDUP_MIGRATION,
-    CONSUMER_DELIVERY_QUARANTINE_MIGRATION, OUTBOX_MIGRATION,
+    CONSUMER_DELIVERY_QUARANTINE_MIGRATION, OUTBOX_MIGRATION, OUTBOX_QUARANTINE_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::events_durable::{DurableDeadLetterBacking, DurableDedupBacking};
+use myelin_storage::elected_relay::{ElectedDrainOutcome, ElectedPgRelay};
 use myelin_storage::outbox_durable::PgOutboxBacking;
+use myelin_storage::pgrelay::{PgRelay, RelayValidationConfig};
 use myelin_storage::s3blob::S3BlobStore;
 use myelin_storage::{BlobStore, ContentHash};
 use myelin_substrate::{boot, Config};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool, Row};
 
-const CI_TOML: &[u8] = br#"on = "push"
+const CI_TOML: &[u8] = br#"on = "pull_request"
 
 [[jobs]]
 name = "build"
@@ -72,6 +75,7 @@ async fn isolated_pool(schema: &str) -> PgPool {
         OUTBOX_MIGRATION,
         CONSUMER_DEDUP_MIGRATION,
         CONSUMER_DEAD_LETTER_MIGRATION,
+        OUTBOX_QUARANTINE_MIGRATION,
         CONSUMER_DELIVERY_QUARANTINE_MIGRATION,
     ] {
         pool.execute(ddl).await.unwrap();
@@ -99,11 +103,11 @@ fn seed_git(root: &std::path::Path, tenant: &str, region: &str) -> String {
         .to_string()
 }
 
-fn push_event(tenant: &str, commit: &str, event_id: &str) -> EventEnvelope {
+fn trigger_event(tenant: &str, commit: &str, event_id: &str) -> EventEnvelope {
     let tenant = TenantId(tenant.into());
     EventEnvelope {
         event_id: EventId(event_id.into()),
-        type_: EventType("git.ref.updated".into()),
+        type_: EventType("git.pr.opened".into()),
         schema_ver: 1,
         tenant: tenant.clone(),
         region: Region("fr-par".into()),
@@ -112,11 +116,8 @@ fn push_event(tenant: &str, commit: &str, event_id: &str) -> EventEnvelope {
             PrincipalKind::Service,
             tenant.clone(),
         )),
-        subject: ArtifactRef(format!(
-            "myelin://{tenant}/git/ref/web:refs/heads/main",
-            tenant = tenant.0
-        )),
-        aggregate: AggregateKey("web:refs/heads/main".into()),
+        subject: ArtifactRef(format!("myelin://{}/git/pr/web:42", tenant.0)),
+        aggregate: AggregateKey("git/pr/web:42".into()),
         causation_id: None,
         correlation_id: CorrelationId(event_id.into()),
         caused_by: None,
@@ -128,14 +129,13 @@ fn push_event(tenant: &str, commit: &str, event_id: &str) -> EventEnvelope {
         occurred_at: Timestamp("2026-07-19T00:00:00Z".into()),
         recorded_at: Timestamp("2026-07-19T00:00:00Z".into()),
         payload: serde_json::json!({
-            "repo": "web", "ref": "refs/heads/main", "new_oid": commit,
-            "old_oid": "0000000000000000000000000000000000000000", "forced": false
+            "repo": "web", "number": 42, "head_oid": commit, "is_fork": false
         }),
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
+async fn elected_publisher_delivers_trigger_then_dispatch_leaves_new_rows_for_next_pass() {
     let cfg = MyelinConfig::dev();
     let nonce = format!(
         "{}_{}",
@@ -188,8 +188,8 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
     )
     .unwrap();
 
-    let envelope = push_event(&tenant, &commit, &event_id);
-    let second_envelope = push_event(&tenant, &commit, &second_event_id);
+    let envelope = trigger_event(&tenant, &commit, &event_id);
+    let second_envelope = trigger_event(&tenant, &commit, &second_event_id);
     sqlx::query(
         "INSERT INTO outbox(event_id, aggregate, seq, subject, envelope) VALUES ($1,$2,$3,$4,$5)",
     )
@@ -197,13 +197,12 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
     .bind("foreign/aggregate")
     .bind(1_i64)
     .bind("myelin://foreign/issues/ONE")
-    .bind(serde_json::to_value(push_event(&tenant, &commit, "foreign-envelope")).unwrap())
+    .bind(serde_json::to_value(trigger_event(&tenant, &commit, "foreign-envelope")).unwrap())
     .execute(&pool)
     .await
     .unwrap();
 
-    let publisher = NatsJetStreamPublisher::connect(
-        JetStreamPublisherConfig {
+    let publisher_config = JetStreamPublisherConfig {
             nats_url: cfg.nats_url.clone(),
             stream_name: stream_name.clone(),
             subject_root: subject_root.clone(),
@@ -213,10 +212,13 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
             replicas: 1,
             duplicate_window: std::time::Duration::from_secs(120),
             publish_ack_timeout: std::time::Duration::from_secs(2),
-        },
-        rt.clone(),
-    )
-    .unwrap();
+        };
+    JetStreamProvisioner::ensure(publisher_config.clone(), rt.clone()).unwrap();
+    let publisher = NatsJetStreamPublisher::connect_existing(publisher_config, rt.clone()).unwrap();
+    let elected = ElectedPgRelay::new(
+        pool.clone(),
+        RelayValidationConfig::new(Region("fr-par".into()), 256 * 1024).unwrap(),
+    ).unwrap();
     let intake_config = JetStreamConsumerConfig::bounded(
         &cfg.nats_url,
         &stream_name,
@@ -246,7 +248,8 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
         .unwrap()
         .await
         .unwrap();
-    publisher.publish(&envelope.subject, &envelope, &envelope.event_id).unwrap();
+    let relay_store = PgRelay::new(pool.clone());
+    relay_store.enqueue(&envelope.aggregate.0, 0, &envelope).await.unwrap();
     raw_js
         .publish(
             format!("{subject_root}.evt.{tenant}.git.poison.route_mismatch"),
@@ -256,10 +259,24 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
         .unwrap()
         .await
         .unwrap();
-    publisher
-        .publish(&second_envelope.subject, &second_envelope, &second_envelope.event_id)
-        .unwrap();
+    relay_store.enqueue(&second_envelope.aggregate.0, 1, &second_envelope).await.unwrap();
+    assert_eq!(
+        elected.drain_once(&publisher, 64).await.unwrap(),
+        ElectedDrainOutcome::Published(2),
+        "the elected relay publishes both committed trigger rows and quarantines foreign poison"
+    );
     handle.tick();
+
+    let source_rows_marked: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM outbox
+          WHERE event_id IN ($1, $2) AND published_at IS NOT NULL",
+    )
+    .bind(&event_id)
+    .bind(&second_event_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(source_rows_marked, 2);
 
     let run_count: i64 = sqlx::query_scalar(
         "SELECT count(*)::bigint FROM ci_run WHERE cause_event_id IN ($1, $2)",
@@ -291,6 +308,17 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
     .await
     .unwrap();
     assert_eq!(dedup_count, 2);
+    let newly_emitted: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM outbox
+          WHERE published_at IS NULL
+            AND event_id NOT IN ($1, $2, 'foreign-outbox-row')",
+    )
+    .bind(&event_id)
+    .bind(&second_event_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(newly_emitted > 0, "dispatch never embeds a relay; its emitted rows await election");
     let quarantine_reasons: Vec<String> = sqlx::query_scalar(
         "SELECT reason_code FROM consumer_delivery_quarantine \
          WHERE consumer=$1 ORDER BY stream_sequence",
@@ -353,13 +381,15 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
         after_redelivery, 2,
         "a second tick cannot duplicate either valid run"
     );
-    let foreign_untouched: bool = sqlx::query_scalar(
-        "SELECT published_at IS NULL AND attempts=0 FROM outbox WHERE event_id='foreign-outbox-row'",
+    let foreign_owned_by_shared_publisher: bool = sqlx::query_scalar(
+        "SELECT o.published_at IS NULL AND o.attempts=0
+                AND EXISTS (SELECT 1 FROM outbox_quarantine q WHERE q.event_id=o.event_id)
+           FROM outbox o WHERE o.event_id='foreign-outbox-row'",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(foreign_untouched, "dispatch never claims the shared outbox");
+    assert!(foreign_owned_by_shared_publisher, "dispatch never claims the shared outbox");
 
     handle.signal_drain();
     // `drain(self)` consumes and drops the original handle/boxed transport. Dropping the returned
