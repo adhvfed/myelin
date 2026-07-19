@@ -122,15 +122,23 @@ ISSUE_ID=<uuid-from-the-receipt>
 
 # Pending rows are deliberately invisible. Retry view after the reconciler activates the tuple.
 myelin issues view "$ISSUE_ID"
-myelin issues list --limit 25
+myelin issues list --state open --limit 25
+myelin issues list --state all --key "$PREFIX-" --limit 25
 myelin issues close "$ISSUE_ID"
 myelin issues view "$ISSUE_ID"
 ```
 
 The CLI never claims a 202 receipt is immediately visible; it prints the matching `myelin issues view
 <uuid>` command. A very early `view` can return the same leak-free 404 as an unauthorized/absent issue;
-retry after the worker's default five-second sweep. The worker scans durable pending bindings directly.
-The separate outbox relay is not required to activate the issue and is not started implicitly here.
+retry after the worker's default five-second sweep. The create response's `Location` header points to
+the creator-only authorization status receipt: it returns `202` plus a bounded retry hint while pending
+and `200` plus the full Issue view after activation. It never exposes retry errors or attempt counts.
+The worker scans durable pending bindings directly. The separate outbox relay is not required to
+activate the issue and is not started implicitly here.
+
+`issues list` defaults to `--state open`; use `closed` or `all` explicitly for the other views. `--key`
+is a normalized Issue-key prefix filter (for example `MYL-`), never a title or free-text search. Keep
+the same `--state` and `--key` values when passing the opaque `--cursor` printed for the next page.
 
 ## 5. Use the token — `git`
 

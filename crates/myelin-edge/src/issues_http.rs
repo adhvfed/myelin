@@ -12,8 +12,8 @@ use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
 use crate::{Method, StoreBackedIssueAuthorizer};
 use myelin_issues::{
-    CreateIssue, IssueAuthorizer, IssuePageRequest, IssuePermission, IssueStoreError, PgIssueStore,
-    StoredIssue,
+    api::IssueListState, is_canonical_request_event_id, CreateIssue, IssueAuthorizationStatus,
+    IssueAuthorizer, IssuePageRequest, IssuePermission, IssueStoreError, PgIssueStore, StoredIssue,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -24,6 +24,7 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 /// Tight per-route JSON bound. The transport's larger 100 MiB ceiling exists for Git packfiles;
 /// issue mutations carry at most a 512-byte title plus three short identifiers.
 pub const MAX_ISSUE_JSON_BYTES: usize = 4 * 1024;
+const AUTHORIZATION_STATUS_RETRY_AFTER_MS: u64 = 1_000;
 
 type ProductionIssueStore = PgIssueStore<StoreBackedIssueAuthorizer>;
 
@@ -112,6 +113,27 @@ fn issue_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
     Ok(value)
 }
 
+fn authorization_request_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
+    if !ctx.request.query.is_empty() || !ctx.request.body.is_empty() {
+        return Err(EdgeError::BadRequest(
+            "authorization status accepts no query parameters or request body".into(),
+        ));
+    }
+    let value = ctx
+        .params
+        .get("request_event_id")
+        .map(String::as_str)
+        .ok_or_else(|| {
+            EdgeError::BadRequest("route did not bind an authorization request id".into())
+        })?;
+    if !is_canonical_request_event_id(value) {
+        return Err(EdgeError::BadRequest(
+            "authorization request id must be a canonical ULID".into(),
+        ));
+    }
+    Ok(value)
+}
+
 fn is_canonical_uuid(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| match index {
@@ -159,8 +181,7 @@ struct IssueListHandler {
 
 impl Handler for IssueListHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let request = IssuePageRequest::new(ctx.page.limit as u32, ctx.page.cursor.clone())
-            .map_err(map_store_error)?;
+        let request = parse_issue_list_query(&ctx.request.query)?;
         let page = self
             .api
             .drive(self.api.store.list(ctx.principal, request))
@@ -171,6 +192,66 @@ impl Handler for IssueListHandler {
             &page_envelope(json!(items), page.next_cursor, page.limit as usize),
         )))
     }
+}
+
+fn parse_issue_list_query(query: &str) -> Result<IssuePageRequest, EdgeError> {
+    let mut state = None;
+    let mut key = None;
+    let mut limit = None;
+    let mut cursor = None;
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            let (name, value) = pair
+                .split_once('=')
+                .ok_or_else(|| EdgeError::BadRequest("malformed Issues query parameter".into()))?;
+            let duplicate = |field: &str| {
+                EdgeError::BadRequest(format!("duplicate Issues query parameter `{field}`"))
+            };
+            match name {
+                "state" => {
+                    if state.is_some() {
+                        return Err(duplicate("state"));
+                    }
+                    state = Some(IssueListState::parse(value).ok_or_else(|| {
+                        EdgeError::BadRequest("state must be open, closed, or all".into())
+                    })?);
+                }
+                "key" => {
+                    if key.is_some() {
+                        return Err(duplicate("key"));
+                    }
+                    key = Some(value.to_string());
+                }
+                "limit" => {
+                    if limit.is_some() {
+                        return Err(duplicate("limit"));
+                    }
+                    limit = Some(value.parse::<u32>().map_err(|_| {
+                        EdgeError::BadRequest("limit must be an integer between 1 and 100".into())
+                    })?);
+                }
+                "cursor" => {
+                    if cursor.is_some() {
+                        return Err(duplicate("cursor"));
+                    }
+                    cursor = Some(value.to_string());
+                }
+                "" => return Err(EdgeError::BadRequest("empty Issues query parameter".into())),
+                other => {
+                    return Err(EdgeError::BadRequest(format!(
+                        "unknown Issues query parameter `{other}`"
+                    )))
+                }
+            }
+        }
+    }
+    IssuePageRequest::filtered(
+        state.unwrap_or(IssueListState::Open),
+        key,
+        limit.unwrap_or(50),
+        cursor,
+    )
+    .map_err(map_store_error)
 }
 
 struct IssueCreateHandler {
@@ -201,8 +282,54 @@ impl Handler for IssueCreateHandler {
                     }
                 }),
             )
-            .with_header("Location", format!("/v1/issues/{}", receipt.id)),
+            .with_header(
+                "Location",
+                format!(
+                    "/v1/issues/authorization-requests/{}",
+                    receipt.authorization_request_event_id
+                ),
+            ),
         ))
+    }
+}
+
+struct IssueAuthorizationStatusHandler {
+    api: DurableIssueHttpApi,
+}
+
+impl Handler for IssueAuthorizationStatusHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let request_event_id = authorization_request_param(ctx)?;
+        let status = self
+            .api
+            .drive(
+                self.api
+                    .store
+                    .authorization_status(ctx.principal, request_event_id),
+            )
+            .map_err(map_store_error)?;
+        let (status_code, body) = match status {
+            IssueAuthorizationStatus::Pending(receipt) => (
+                202,
+                json!({
+                    "status": "pending",
+                    "issue": {
+                        "id": receipt.id,
+                        "key": receipt.key,
+                        "project_id": receipt.project_id,
+                    },
+                    "retry_after_ms": AUTHORIZATION_STATUS_RETRY_AFTER_MS,
+                }),
+            ),
+            IssueAuthorizationStatus::Active(issue) => (
+                200,
+                json!({
+                    "status": "active",
+                    "issue": issue_json(&issue),
+                }),
+            ),
+        };
+        Ok(no_store(EdgeResponse::json(status_code, &body)))
     }
 }
 
@@ -285,8 +412,8 @@ fn guarded(
     })
 }
 
-/// Mount the useful durable Issues floor: keyset list, create receipt, leak-free object view, and
-/// idempotent close. Every action is separately capability-mapped in the Edge catalogue.
+/// Mount the useful durable Issues floor: keyset list, create receipt/status, leak-free object
+/// view, and idempotent close. Every action is separately capability-mapped in the Edge catalogue.
 pub fn register_issues(
     builder: GatewayBuilder,
     store: Arc<PgIssueStore<StoreBackedIssueAuthorizer>>,
@@ -306,6 +433,14 @@ pub fn register_issues(
             "/v1/issues",
             "issues.create",
             Arc::new(IssueCreateHandler { api: api.clone() }),
+        )
+        // Register the fixed authorization-request namespace before the `{issue}` route so a
+        // request receipt can never be interpreted as an issue identifier.
+        .route(
+            Method::Get,
+            "/v1/issues/authorization-requests/{request_event_id}",
+            "issues.authorization_status",
+            Arc::new(IssueAuthorizationStatusHandler { api: api.clone() }),
         )
         .route(
             Method::Get,
@@ -334,12 +469,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn list_query_is_strict_normalized_and_defaults_to_open() {
+        assert_eq!(
+            parse_issue_list_query("").unwrap(),
+            IssuePageRequest::filtered(IssueListState::Open, None, 50, None).unwrap()
+        );
+        assert_eq!(
+            parse_issue_list_query("state=closed&key=eng-&limit=7").unwrap(),
+            IssuePageRequest::filtered(IssueListState::Closed, Some("ENG-".into()), 7, None,)
+                .unwrap()
+        );
+        for query in [
+            "state=OPEN",
+            "state=all&state=open",
+            "key=title search",
+            "limit=0",
+            "limit=nope",
+            "tenant=acme",
+            "cursor=not-opaque",
+            "state",
+        ] {
+            assert!(parse_issue_list_query(query).is_err(), "accepted `{query}`");
+        }
+    }
+
+    #[test]
     fn issue_ids_are_canonical_and_bounded() {
         assert!(is_canonical_uuid("33333333-3333-3333-3333-333333333333"));
         assert!(!is_canonical_uuid("33333333333333333333333333333333"));
         assert!(!is_canonical_uuid("33333333-3333-3333-3333-33333333333/"));
         assert!(!is_canonical_uuid("*"));
         assert!(!is_canonical_uuid("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"));
+    }
+
+    #[test]
+    fn authorization_request_ids_are_canonical_and_retry_is_bounded() {
+        assert!(is_canonical_request_event_id("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(!is_canonical_request_event_id("01arz3ndektsv4rrffq69g5fav"));
+        assert!((100..=10_000).contains(&AUTHORIZATION_STATUS_RETRY_AFTER_MS));
     }
 
     #[test]

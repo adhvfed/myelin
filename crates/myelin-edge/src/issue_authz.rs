@@ -74,6 +74,10 @@ impl IssueAuthorizer for StoreBackedIssueAuthorizer {
         self.allows(principal, "view", format!("project:{project_id}"))
     }
 
+    fn may_view_project(&self, principal: &Principal, project_id: &str) -> bool {
+        self.allows(principal, "view", format!("project:{project_id}"))
+    }
+
     fn may_access(
         &self,
         principal: &Principal,

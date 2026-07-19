@@ -60,6 +60,7 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     // -- the durable Issues product API (register_issues) --
     "issues.list",
     "issues.create",
+    "issues.authorization_status",
     "issues.view",
     "issues.close",
     // -- the git JSON product API (register_git_durable over Git's catalogue) --
@@ -160,6 +161,7 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     ),
     requirement!("issues.list", "issue.view", OP_AGENT_PAT),
     requirement!("issues.create", "issue.create", OP_AGENT_PAT),
+    requirement!("issues.authorization_status", "issue.view", OP_AGENT_PAT),
     requirement!("issues.view", "issue.view", OP_AGENT_PAT),
     requirement!("issues.close", "issue.transition", OP_AGENT_PAT),
     requirement!("git.repos.list", "repo.pull", OP_AGENT_PAT),
@@ -536,6 +538,11 @@ mod tests {
             &["issue.view"],
         );
         assert!(authorize_edge_action(&AllowAll, &view, "issues.list"));
+        assert!(authorize_edge_action(
+            &AllowAll,
+            &view,
+            "issues.authorization_status"
+        ));
         assert!(authorize_edge_action(&AllowAll, &view, "issues.view"));
         assert!(!authorize_edge_action(&AllowAll, &view, "issues.create"));
         assert!(!authorize_edge_action(&AllowAll, &view, "issues.close"));
