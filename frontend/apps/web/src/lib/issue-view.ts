@@ -31,6 +31,32 @@ interface ActivationPollOptions {
   signal?: AbortSignal;
 }
 
+function abortError(): Error {
+  const error = new Error("Operation aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+/** Stop awaiting a promise promptly on abort while still consuming any late settlement. */
+export function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = () => finish(() => reject(abortError()));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
+}
+
 /** Settle one status read inside the remaining polling budget, even if transport never settles. */
 function pollWithinDeadline(
   poll: (signal: AbortSignal) => Promise<IssueAuthorizationStatus>,
@@ -97,7 +123,14 @@ export async function pollIssueActivation(
     const retryAfter = Number.isFinite(status.retry_after_ms) ? status.retry_after_ms : 250;
     const delay = Math.min(Math.max(retryAfter, 250), 5_000);
     if (now() - started + delay > budget) return { phase: "unconfirmed" };
-    await sleep(delay);
+    try {
+      const pause = sleep(delay);
+      if (options.signal) await awaitWithAbort(pause, options.signal);
+      else await pause;
+    } catch (error) {
+      if (options.signal?.aborted) return { phase: "unconfirmed" };
+      throw error;
+    }
   }
   return { phase: "unconfirmed" };
 }

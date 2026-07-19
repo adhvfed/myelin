@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { IssueAuthorizationStatus, IssueVM, IssuesPage } from "./api";
 import {
+  awaitWithAbort,
   isClosedCategory,
   issueErrorKind,
   issueKeyError,
@@ -176,6 +177,45 @@ describe("issue create and page state", () => {
 
     resolvePoll?.({ status: "active", issue: issue("1") });
     await Promise.resolve();
+    await expect(outcome).resolves.toEqual({ phase: "unconfirmed" });
+  });
+
+  it("stops awaiting a production action promptly and ignores its late result", async () => {
+    const controller = new AbortController();
+    let resolveAction: ((value: string) => void) | undefined;
+    const action = new Promise<string>((resolve) => { resolveAction = resolve; });
+    const awaited = awaitWithAbort(action, controller.signal);
+
+    controller.abort();
+    await expect(awaited).rejects.toMatchObject({ name: "AbortError" });
+
+    resolveAction?.("late");
+    await Promise.resolve();
+    await expect(awaited).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("interrupts a stalled retry sleep promptly on outer abort", async () => {
+    const controller = new AbortController();
+    let sleepStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { sleepStarted = resolve; });
+    const outcome = pollIssueActivation(
+      "01REQUEST",
+      async () => ({
+        status: "pending",
+        issue: { id: "1", key: "MYL-1", project_id: "project" },
+        retry_after_ms: 1_000,
+      }),
+      {
+        signal: controller.signal,
+        sleep: async () => {
+          sleepStarted?.();
+          await new Promise<never>(() => {});
+        },
+      },
+    );
+
+    await started;
+    controller.abort();
     await expect(outcome).resolves.toEqual({ phase: "unconfirmed" });
   });
 });

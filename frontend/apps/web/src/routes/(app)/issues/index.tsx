@@ -40,6 +40,7 @@ import {
   issueListHref,
   issueListState,
   issueTimestamp,
+  awaitWithAbort,
   mergeIssuePages,
   normalizeIssueKey,
   pollIssueActivation,
@@ -69,6 +70,7 @@ export default function IssuesIndex() {
   const [loadMoreError, setLoadMoreError] = createSignal(false);
   const [pending, setPending] = createSignal<PendingIssue[]>([]);
   const [activeRow, setActiveRow] = createSignal(0);
+  const [activationRefreshing, setActivationRefreshing] = createSignal(false);
   const pollControllers = new Set<AbortController>();
   let filterGeneration = 0;
   let loadMoreRequest = 0;
@@ -95,6 +97,8 @@ export default function IssuesIndex() {
     setKeyDraft(rawKey());
     state();
     key();
+    // A filter change owns a new first-page query and is not blocked by an older activation refresh.
+    setActivationRefreshing(false);
     resetPagination();
   });
 
@@ -114,6 +118,7 @@ export default function IssuesIndex() {
   });
   const rows = createMemo(() => mergeIssuePages(firstPage()?.page ?? undefined, extraPages()));
   const nextCursor = () => {
+    if (activationRefreshing()) return null;
     const pages = extraPages();
     return pages.length
       ? pages[pages.length - 1]?.page.next_cursor ?? null
@@ -140,6 +145,7 @@ export default function IssuesIndex() {
   };
 
   const loadMore = async () => {
+    if (activationRefreshing()) return;
     const cursor = nextCursor();
     if (!cursor || loadingMore()) return;
     const generation = filterGeneration;
@@ -175,6 +181,28 @@ export default function IssuesIndex() {
         setLoadingMore(false);
       }
     }
+  };
+
+  const refreshActivatedList = async () => {
+    setActivationRefreshing(true);
+    resetPagination();
+    const generation = filterGeneration;
+    try {
+      await revalidate("issues-list");
+    } catch {
+      // Do not re-expose a cursor from the old first page after an ambiguous refresh failure.
+      if (generation === filterGeneration) {
+        toast.show({
+          title: "The issue is ready, but the list refresh could not be confirmed. Reload before loading more.",
+          variant: "warning",
+        });
+      }
+      return;
+    }
+    // A filter change during revalidation owns a newer generation and has already unlocked itself.
+    if (generation !== filterGeneration) return;
+    resetPagination();
+    setActivationRefreshing(false);
   };
 
   const focusRow = (index: number, elements: HTMLAnchorElement[]) => {
@@ -228,19 +256,22 @@ export default function IssuesIndex() {
     pollControllers.add(controller);
     void pollIssueActivation(
       item.requestEventId,
-      async (requestEventId) => {
-        const result = await act({ op: "activation", requestEventId });
+      async (requestEventId, signal) => {
+        const result = await awaitWithAbort(
+          act({ op: "activation", requestEventId }),
+          signal,
+        );
         if (!result.ok || result.op !== "activation") throw new Error("activation unavailable");
         return result.status;
       },
       { signal: controller.signal },
-    ).then((outcome) => {
+    ).then(async (outcome) => {
       if (controller.signal.aborted) return;
       if (outcome.phase === "active") {
         setPending((items) => items.filter((entry) => entry.id !== item.id));
-        resetPagination();
-        void revalidate("issues-list");
+        const refresh = refreshActivatedList();
         toast.show({ title: `${item.key} is ready`, variant: "success" });
+        await refresh;
       } else {
         setPending((items) => items.map((entry) =>
           entry.id === item.id ? { ...entry, phase: "unconfirmed" } : entry,
