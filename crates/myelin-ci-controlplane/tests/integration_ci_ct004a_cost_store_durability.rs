@@ -28,8 +28,8 @@
 //! CT-004m rename (CI's table is `ci_cost_event`, distinct from Storage's money-ledger `cost_event`,
 //! migration `0050`) is what lets the two coexist in the ONE shared `myelin` DB (proven in the sibling
 //! `integration_ci_ct004m_cost_event_no_collision`). The pool connects as the migration/owner role
-//! (`myelin_admin`, BYPASSRLS) so the store's bare-pool ops exercise the table shape under FORCE-RLS;
-//! the tenant-scoped-tx production write is CT-004d.
+//! (`myelin_admin`, BYPASSRLS) to create the isolated schema; store operations still carry a verified
+//! tenant/region scope and use the production transaction-local GUC convention.
 //!
 //! Gated behind the `integration` cargo feature. Run against the docker-compose dev stack:
 //!
@@ -42,7 +42,9 @@ use myelin_ci_controlplane::{
     ci_durable_migrations, CiCostEventStore, CiCostStoreError, CostEventRow, CostKind, Meter,
 };
 use myelin_flow::MinorUnits;
-use myelin_tenancy::TenantId;
+use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+use myelin_storage::TenantScope;
+use myelin_tenancy::{Region, TenantId};
 use sqlx::types::Uuid;
 use sqlx::{Executor, PgPool};
 
@@ -60,6 +62,16 @@ fn admin_url() -> String {
 /// nor another test's rows).
 fn schema_name() -> String {
     format!("ci_ct004a_{}", std::process::id())
+}
+
+fn verified_scope(tenant: &TenantId, region: &str) -> TenantScope {
+    let mut principal = Principal::stub(
+        PrincipalId("cost-store-test".into()),
+        PrincipalKind::Service,
+        tenant.clone(),
+    );
+    principal.region = Region(region.into());
+    TenantScope::from_verified_token(&principal, principal.region.clone())
 }
 
 /// Open a FRESH admin pool whose connections pin `search_path` to the per-pid schema. Calling this
@@ -137,6 +149,7 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
     let schema = schema_name();
     let tenant = TenantId("acme".into());
     let region = "fr-par";
+    let scope = verified_scope(&tenant, region);
     let run = uid("ct004a-run-ok");
     let job = uid("ct004a-job-ok");
     let crash_run = uid("ct004a-run-crash");
@@ -163,17 +176,17 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
     }
 
     // ── COMMITTED settle THROUGH the store (its own tx → commit). ──
-    let store1 = CiCostEventStore::with_pg(p1.clone());
+    let store1 = CiCostEventStore::with_pg(p1.clone(), Region(region.into()));
     let rows = settle_rows(&tenant, run, job);
     let affected = store1
-        .settle(region, &rows)
+        .settle(&scope, &rows)
         .await
         .expect("the committed settle records the metered units");
     assert_eq!(affected, 2, "two metered units recorded (cost_events_per_unit == 1 each)");
 
     // ── Money-parity: a RE-DELIVERED settle records EXACTLY ONCE (deterministic cost_id + ON CONFLICT). ──
     let redelivered = store1
-        .settle(region, &rows)
+        .settle(&scope, &rows)
         .await
         .expect("a re-delivered settle is a no-op success");
     assert_eq!(
@@ -188,7 +201,7 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
     let mut divergent = settle_rows(&tenant, run, job);
     divergent[0].amount = 999; // same (run, job, CpuSeconds) → same cost_id; amount 999 ≠ recorded 120
     let err = store1
-        .settle(region, &divergent)
+        .settle(&scope, &divergent)
         .await
         .expect_err("a divergent re-delivered settle must be refused, never silently dropped");
     match err {
@@ -201,7 +214,7 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
     }
     // The refusal did NOT mutate the recorded row: the read-back is still the original amount.
     let after = store1
-        .cost_events_for_run(&tenant, &run.to_string())
+        .cost_events_for_run(&scope, &run.to_string())
         .await
         .expect("read back after the refused divergent settle");
     let cpu = after.iter().find(|r| r.meter == Meter::CpuSeconds).expect("the CpuSeconds unit");
@@ -210,9 +223,18 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
     // ── UNCOMMITTED settle THROUGH the store: run on a tx, then DROP it without commit. ──
     {
         let mut tx = p1.begin().await.unwrap();
+        sqlx::query(
+            "SELECT set_config('myelin.tenant_id', $1, true), \
+                    set_config('myelin.region', $2, true)",
+        )
+        .bind(scope.tenant().as_str())
+        .bind(&scope.region().0)
+        .execute(&mut *tx)
+        .await
+        .expect("scope the caller-owned co-commit transaction");
         let crash_rows = settle_rows(&tenant, crash_run, crash_job);
         let n = store1
-            .settle_in_tx(&mut tx, region, &crash_rows)
+            .settle_in_tx(&mut tx, &scope, &crash_rows)
             .await
             .expect("the in-tx settle inserts (uncommitted)");
         assert_eq!(n, 2, "the in-tx settle wrote its rows (pending commit)");
@@ -226,11 +248,11 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
 
     // ── REOPEN: a brand-new pool + a FRESH store read the state back from Postgres. ──
     let p2 = reopen().await;
-    let store2 = CiCostEventStore::with_pg(p2.clone());
+    let store2 = CiCostEventStore::with_pg(p2.clone(), Region(region.into()));
 
     // (1) The committed settle survived kill-9/reopen — exact rows, attribution + wholesale ≠ markup.
     let read = store2
-        .cost_events_for_run(&tenant, &run.to_string())
+        .cost_events_for_run(&scope, &run.to_string())
         .await
         .expect("read back the settled units after reopen");
     assert_eq!(
@@ -257,7 +279,7 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
 
     // (2) The UNCOMMITTED (crashed-between-steps) settle left NO ghost cost row.
     let ghost = store2
-        .cost_events_for_run(&tenant, &crash_run.to_string())
+        .cost_events_for_run(&scope, &crash_run.to_string())
         .await
         .expect("read back the crashed run after reopen");
     assert!(
