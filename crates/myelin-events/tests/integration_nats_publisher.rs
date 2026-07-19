@@ -164,6 +164,71 @@ async fn durable_pull_rebind_redelivers_unacked_git_event_then_persists_ack() {
         .expect("delete test stream");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn existing_durable_consumer_with_semantic_drift_refuses_boot() {
+    let dev = MyelinConfig::dev();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let suffix = format!("{}_drift_{nonce}", std::process::id());
+    let stream_name = format!("MYELIN_CONSUMER_{suffix}");
+    let subject_root = format!("myelin.consumer_{suffix}");
+    let durable_name = format!("ci-dispatch-{suffix}");
+    NatsJetStreamPublisher::connect(
+        JetStreamPublisherConfig {
+            nats_url: dev.nats_url.clone(),
+            stream_name: stream_name.clone(),
+            subject_root: subject_root.clone(),
+            max_age: std::time::Duration::from_secs(24 * 60 * 60),
+            max_bytes: 16 * 1024 * 1024,
+            max_messages: 10_000,
+            replicas: 1,
+            duplicate_window: std::time::Duration::from_secs(120),
+        },
+        tokio::runtime::Handle::current(),
+    ).expect("provision publisher-only stream");
+
+    let client = async_nats::connect(&dev.nats_url).await.expect("connect raw NATS client");
+    let js = async_nats::jetstream::new(client);
+    let stream = js.get_stream(&stream_name).await.expect("get stream");
+    stream.create_consumer(async_nats::jetstream::consumer::pull::Config {
+        durable_name: Some(durable_name.clone()),
+        name: Some(durable_name.clone()),
+        deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::All,
+        ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
+        ack_wait: std::time::Duration::from_secs(30),
+        max_deliver: -1,
+        filter_subject: format!("{subject_root}.evt.*.git.>"),
+        replay_policy: async_nats::jetstream::consumer::ReplayPolicy::Instant,
+        max_waiting: 9, // production pins 8: this pre-existing durable has semantic drift.
+        max_ack_pending: 256,
+        max_batch: 256,
+        max_bytes: 4 * 1024 * 1024,
+        max_expires: std::time::Duration::from_secs(1),
+        ..Default::default()
+    }).await.expect("create intentionally drifted durable consumer");
+
+    let result = NatsJetStreamBus::connect_consumer(
+        JetStreamConsumerConfig::bounded(
+            &dev.nats_url,
+            &stream_name,
+            &subject_root,
+            format!("{subject_root}.evt.*.git.>"),
+            &durable_name,
+        ),
+        tokio::runtime::Handle::current(),
+    );
+    let error = match result {
+        Ok(_) => panic!("consumer drift must refuse boot"),
+        Err(error) => error,
+    };
+    assert!(error.0.contains("configuration drifted"), "unexpected refusal: {error:?}");
+    assert!(error.0.contains("max_waiting"), "drift field must be named: {error:?}");
+
+    js.delete_stream(&stream_name).await.expect("delete drift test stream");
+}
+
 /// Two-phase operator proof for the server/volume boundary. Run once with phase `seed`, restart the
 /// NATS service, then run with phase `verify`. It is ignored in ordinary suites because a test
 /// process must not restart shared infrastructure behind other concurrent tests.

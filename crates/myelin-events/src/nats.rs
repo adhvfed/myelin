@@ -287,6 +287,69 @@ fn validate_stream_config(
     }
 }
 
+/// Refuse any semantic drift in the durable pull consumer. Every field emitted by
+/// [`JetStreamConsumerConfig::pull_config`] is pinned, including the safety-relevant defaults:
+/// a pull (not push) consumer, no rate/sample/backoff overrides, disk-backed inherited storage,
+/// and no alternate filter set.
+fn validate_consumer_config(
+    actual: &jetstream::consumer::Config,
+    expected: &jetstream::consumer::pull::Config,
+) -> Result<(), TransportError> {
+    let mut drift = Vec::new();
+    macro_rules! pin {
+        ($field:ident) => {
+            if actual.$field != expected.$field {
+                drift.push(stringify!($field));
+            }
+        };
+    }
+
+    pin!(durable_name);
+    pin!(name);
+    pin!(description);
+    pin!(deliver_policy);
+    pin!(ack_policy);
+    pin!(ack_wait);
+    pin!(max_deliver);
+    pin!(filter_subject);
+    pin!(filter_subjects);
+    pin!(replay_policy);
+    pin!(rate_limit);
+    pin!(sample_frequency);
+    pin!(max_waiting);
+    pin!(max_ack_pending);
+    pin!(headers_only);
+    pin!(max_batch);
+    pin!(max_bytes);
+    pin!(max_expires);
+    pin!(inactive_threshold);
+    pin!(num_replicas);
+    pin!(memory_storage);
+    pin!(metadata);
+    pin!(backoff);
+    if actual.deliver_subject.is_some() {
+        drift.push("deliver_subject");
+    }
+    if actual.deliver_group.is_some() {
+        drift.push("deliver_group");
+    }
+    if actual.flow_control {
+        drift.push("flow_control");
+    }
+    if !actual.idle_heartbeat.is_zero() {
+        drift.push("idle_heartbeat");
+    }
+
+    if drift.is_empty() {
+        Ok(())
+    } else {
+        Err(TransportError(format!(
+            "durable consumer configuration drifted from bounded policy: {}",
+            drift.join(", ")
+        )))
+    }
+}
+
 fn event_subject(subject_root: &str, envelope: &EventEnvelope) -> Result<String, TransportError> {
     let structured = crate::partition::StreamSubject::of(envelope)
         .map_err(|_| TransportError("invalid event routing subject".into()))?;
@@ -526,20 +589,9 @@ impl NatsJetStreamBus {
                     .await
                     .map_err(|e| TransportError(format!("inspect consumer {consumer_name}: {e}")))?
                     .config;
-                if actual.durable_name.as_deref() != Some(consumer_name.as_str())
-                    || actual.deliver_policy != jetstream::consumer::DeliverPolicy::All
-                    || actual.ack_policy != jetstream::consumer::AckPolicy::Explicit
-                    || actual.ack_wait != config.ack_wait
-                    || actual.max_deliver != config.max_deliver
-                    || actual.filter_subject != config.filter_subject
-                    || actual.max_ack_pending != config.max_ack_pending
-                    || actual.max_batch != config.max_batch as i64
-                    || actual.max_expires != config.max_expires
-                {
-                    return Err(TransportError(format!(
-                        "durable consumer {consumer_name} configuration drifted from bounded policy"
-                    )));
-                }
+                validate_consumer_config(actual, &expected).map_err(|error| {
+                    TransportError(format!("durable consumer {consumer_name}: {}", error.0))
+                })?;
                 Ok::<Context, TransportError>(js)
             })
         })?;
@@ -693,6 +745,8 @@ impl NatsJetStreamBus {
 
 #[cfg(test)]
 mod publisher_tests {
+    use async_nats::jetstream::consumer::IntoConsumerConfig;
+
     use super::*;
 
     fn config() -> JetStreamPublisherConfig {
@@ -766,6 +820,61 @@ mod publisher_tests {
         let mut escaped = config;
         escaped.filter_subject = "other.events.>".into();
         assert!(escaped.validate().is_err());
+    }
+
+    #[test]
+    fn every_pinned_pull_consumer_field_refuses_semantic_drift() {
+        let expected = JetStreamConsumerConfig::bounded(
+            "nats://127.0.0.1:4222",
+            "MYELIN_EVENTS",
+            "myelin.events",
+            "myelin.events.evt.*.git.>",
+            "ci-dispatch-trigger",
+        ).pull_config();
+        let baseline = expected.clone().into_consumer_config();
+        validate_consumer_config(&baseline, &expected).expect("the exact policy matches");
+
+        let assert_drift = |actual: jetstream::consumer::Config, field: &str| {
+            let error = validate_consumer_config(&actual, &expected).expect_err(field);
+            assert!(error.0.contains(field), "{field} drift was not named: {error:?}");
+        };
+        macro_rules! drift {
+            ($field:ident, $value:expr) => {{
+                let mut actual = baseline.clone();
+                actual.$field = $value;
+                assert_drift(actual, stringify!($field));
+            }};
+        }
+
+        drift!(durable_name, Some("other".into()));
+        drift!(name, Some("other".into()));
+        drift!(description, Some("changed".into()));
+        drift!(deliver_subject, Some("push.target".into()));
+        drift!(deliver_group, Some("workers".into()));
+        drift!(deliver_policy, jetstream::consumer::DeliverPolicy::Last);
+        drift!(ack_policy, jetstream::consumer::AckPolicy::None);
+        drift!(ack_wait, std::time::Duration::from_secs(31));
+        drift!(max_deliver, 4);
+        drift!(filter_subject, "myelin.events.>".into());
+        drift!(filter_subjects, vec!["myelin.events.>".into()]);
+        drift!(replay_policy, jetstream::consumer::ReplayPolicy::Original);
+        drift!(rate_limit, 1);
+        drift!(sample_frequency, 1);
+        drift!(max_waiting, 9);
+        drift!(max_ack_pending, 257);
+        drift!(headers_only, true);
+        drift!(flow_control, true);
+        drift!(idle_heartbeat, std::time::Duration::from_secs(1));
+        drift!(max_batch, 257);
+        drift!(max_bytes, 4 * 1024 * 1024 + 1);
+        drift!(max_expires, std::time::Duration::from_secs(2));
+        drift!(inactive_threshold, std::time::Duration::from_secs(1));
+        drift!(num_replicas, 1);
+        drift!(memory_storage, true);
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("owner".into(), "other".into());
+        drift!(metadata, metadata);
+        drift!(backoff, vec![std::time::Duration::from_secs(1)]);
     }
 }
 
