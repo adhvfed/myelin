@@ -810,11 +810,15 @@ impl IncrementalIndexer {
 
     fn apply_upsert(&self, ev: &EventEnvelope) -> Result<(), IndexEventError> {
         let ref_ = &ev.subject;
+        // The rejection does NOT quote the offending subject. A Git blob ref embeds the raw
+        // repository name and file path, and this error rides the dead-letter store and the service
+        // log — so quoting it turns every malformed event into a disclosure of exactly the path
+        // material the `restrict` path exists to suppress. The event's own id/correlation locate it
+        // for an operator without restating its content.
         let (subsystem, type_) = Self::subsystem_type_of(ref_).ok_or_else(|| {
-            IndexEventError::Malformed(format!(
-                "event subject `{}` is not a myelin:// artifact ref",
-                ref_.0
-            ))
+            IndexEventError::Malformed(
+                "event subject is not a myelin:// artifact ref".to_string(),
+            )
         })?;
 
         // The IndexSpec for (subsystem, type) — a type with no registered spec is a NO-OP (Search does
@@ -872,9 +876,12 @@ impl IncrementalIndexer {
             // A facet the spec did not declare is a malformed projection (the producer drifted) — loud,
             // not silently indexed under an undeclared column.
             if !spec.struct_fields.contains_key(name) {
+                // Names the DRIFT (the undeclared facet + the spec it drifted from), never the
+                // artifact — the producer bug is identified by its schema, not by one document's
+                // path.
                 return Err(IndexEventError::Malformed(format!(
-                    "projection of `{}` carries facet `{name}` not declared in the IndexSpec for ({subsystem}, {type_})",
-                    ref_.0
+                    "a projection carries facet `{name}` not declared in the IndexSpec for \
+                     ({subsystem}, {type_})"
                 )));
             }
             doc = doc.with_field(name.clone(), value.clone());

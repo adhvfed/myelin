@@ -432,10 +432,13 @@ pub enum QueryError {
     /// cross-tenant query attempt. REJECTED (cross-tenant 0, SRCH-D3): the engine is the wrong
     /// tenant's index. (The tenant is from the verified token, never a path — this catches a
     /// mis-wired caller, never a spoofable path parameter.)
-    TenantMismatch {
-        viewer_tenant: String,
-        engine_tenant: String,
-    },
+    ///
+    /// **Carries no payload, deliberately.** It previously named both tenant ids, which put two
+    /// customer-identifying tokens into an error that is logged on a rejection path — and, being a
+    /// derived `Debug`, into any `{:?}` of it as well. The mismatch IS the signal; a caller that
+    /// wants the two tenants has both in hand at the call site. Same posture as
+    /// `myelin_identity_service`'s payload-free `TenantMismatch`.
+    TenantMismatch,
     /// **The authz reverse-index JOIN read a revision STALER than the required watermark (SRCH-P09 /
     /// contract 4.10).** A relational `SetExpr` leaf resolved to a reverse-index answer whose
     /// revision is BELOW the watermark the `list_objects` zookie required — the JOIN refuses to
@@ -455,14 +458,11 @@ impl std::fmt::Display for QueryError {
             QueryError::Compile(e) => write!(f, "query did not compile: {e}"),
             QueryError::Engine(e) => write!(f, "search engine error: {e}"),
             QueryError::Authz(e) => write!(f, "list_objects (authz) failed: {e:?}"),
-            QueryError::TenantMismatch {
-                viewer_tenant,
-                engine_tenant,
-            } => write!(
+            QueryError::TenantMismatch => write!(
                 f,
-                "cross-tenant query rejected: viewer tenant `{viewer_tenant}` != engine tenant \
-                 `{engine_tenant}` (SRCH-D3 — tenant from the verified token, the engine is the \
-                 wrong tenant's index)"
+                "cross-tenant query rejected: the viewer's tenant is not the tenant this engine \
+                 indexes (SRCH-D3 — tenant from the verified token, the engine is the wrong \
+                 tenant's index)"
             ),
             QueryError::StaleReverseIndex {
                 required,
@@ -842,10 +842,7 @@ fn query_consistent_with_vector<B: IndexBackend>(
     // The engine MUST be the viewer's-tenant index; a mismatch is a mis-wired caller → REJECT (no
     // cross-tenant read path exists). There is NO path/tenant parameter to spoof.
     if viewer.tenant.0 != engine.tenant {
-        return Err(QueryError::TenantMismatch {
-            viewer_tenant: viewer.tenant.0.clone(),
-            engine_tenant: engine.tenant.clone(),
-        });
+        return Err(QueryError::TenantMismatch);
     }
 
     // **STEP 0.1 — the REBUILD FENCE.** Placed here, above every other step, because this is the ONE
@@ -2046,7 +2043,7 @@ mod tests {
         )
         .expect_err("a cross-tenant query is rejected (SRCH-D3)");
         assert!(
-            matches!(err, QueryError::TenantMismatch { .. }),
+            matches!(err, QueryError::TenantMismatch),
             "cross-tenant ⇒ TenantMismatch"
         );
         // 0 engine branches ran AND 0 list_objects calls — the cross-tenant query never reaches the
@@ -2548,12 +2545,22 @@ mod tests {
     /// mutants).**
     #[test]
     fn query_error_messages_are_loud() {
-        let tm = QueryError::TenantMismatch {
-            viewer_tenant: "evil".into(),
-            engine_tenant: "acme".into(),
-        };
+        let tm = QueryError::TenantMismatch;
         let s = tm.to_string();
-        assert!(s.contains("evil") && s.contains("acme") && s.contains("SRCH-D3"));
+        assert!(
+            s.contains("cross-tenant") && s.contains("SRCH-D3"),
+            "the cross-tenant rejection is loud about WHAT was rejected"
+        );
+        // ...and loud WITHOUT naming either tenant. Two customer-identifying tokens in an error
+        // logged on a rejection path is a disclosure; the mismatch itself is the signal.
+        assert!(
+            !s.contains("evil") && !s.contains("acme"),
+            "the rejection must not name a tenant: {s}"
+        );
+        assert!(
+            !format!("{tm:?}").contains("acme"),
+            "and neither may its Debug render"
+        );
         let stale = QueryError::StaleReverseIndex {
             required: 9,
             served: 4,

@@ -658,22 +658,36 @@ impl TantivyBackend {
     /// doc from the side map while leaving it searchable (or the reverse) is exactly the corruption
     /// the gate exists to catch, and reading one map twice would hide it.
     ///
-    /// This is a maintenance scan over the whole per-tenant index, NOT a query: there is no scoring
-    /// and no ACL filter, and it returns bare ids to a caller that only ever counts and classifies
-    /// them (`crate::canonical`). It must never back a user-facing search path — the
-    /// `search-requires-acl-filter` ratchet governs those, and this is not one.
+    /// This is a maintenance SCAN over the whole per-tenant index, not a query. It walks each
+    /// segment's alive documents through the store reader and never executes a `Query` — so it
+    /// cannot score, cannot rank, and structurally has nothing an ACL filter could be conjoined
+    /// into. That is deliberate: running an `AllQuery` here would be the easier implementation, and
+    /// it would be a genuine `search-requires-acl-filter` violation — an unfiltered scored query
+    /// over every document. The ratchet is not something to satisfy with a token; the scan is not a
+    /// search, so it does not use the search path.
+    ///
+    /// It must never back a user-facing read: it returns bare ids to a caller that only counts and
+    /// classifies them (`crate::canonical`).
     ///
     /// Deterministic order (`doc_id`-sorted) so a parity receipt over the set is stable.
     pub fn indexed_doc_ids(&self) -> Result<Vec<String>, IndexError> {
-        use tantivy::collector::DocSetCollector;
-        use tantivy::query::AllQuery;
+        use tantivy::schema::Value;
 
         let reader = self.index.reader()?;
         let searcher = reader.searcher();
-        let addrs = searcher.search(&AllQuery, &DocSetCollector)?;
-        let mut out = Vec::with_capacity(addrs.len());
-        for addr in addrs {
-            out.push(self.doc_id_of(&searcher, addr)?);
+        let mut out: Vec<String> = Vec::new();
+        for segment_reader in searcher.segment_readers() {
+            let store = segment_reader
+                .get_store_reader(0)
+                .map_err(|e| IndexError::Engine(format!("segment store reader: {e}")))?;
+            for doc_id in segment_reader.doc_ids_alive() {
+                let doc: TantivyDocument = store.get(doc_id)?;
+                let id = doc
+                    .get_first(self.schema.doc_id)
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| IndexError::Engine("a document has no stored doc_id".into()))?;
+                out.push(id.to_string());
+            }
         }
         out.sort_unstable();
         out.dedup();

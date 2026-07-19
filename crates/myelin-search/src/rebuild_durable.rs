@@ -137,8 +137,13 @@ fn decode_owners(raw: &str) -> std::collections::BTreeSet<String> {
 impl RebuildJournal for PgRebuildJournal {
     fn load(&self, key: &RebuildKey) -> Result<Option<RebuildRecord>, RebuildError> {
         self.block(async {
+            // The tenant predicate is threaded explicitly (`tenant_id`), not reached through a
+            // field chain: this row is tenant-keyed, and the `tenant-predicate` ratchet reads the
+            // binding on the statement. Both halves of the partition key are bound — a rebuild job
+            // is per `(tenant, region)`, never cell-wide.
+            let tenant_id = key.tenant.0.as_str();
             let row = sqlx::query(SELECT_REBUILD_JOB_QUERY)
-                .bind(key.tenant.0.as_str())
+                .bind(tenant_id)
                 .bind(key.region.0.as_str())
                 .fetch_optional(&self.pool)
                 .await
@@ -171,12 +176,14 @@ impl RebuildJournal for PgRebuildJournal {
         next: &RebuildRecord,
     ) -> Result<bool, RebuildError> {
         let owners = encode_owners(&next.owners_replayed)?;
+        // The tenant predicate, threaded explicitly on both write statements (see `load`).
+        let tenant_id = key.tenant.0.as_str();
         self.block(async {
             let done = match expected_epoch {
                 // The initial claim: insert iff absent. A concurrent claimer that got there first
                 // leaves `rows_affected() == 0` — a lost race, not an error.
                 None => sqlx::query(INSERT_REBUILD_JOB_QUERY)
-                    .bind(key.tenant.0.as_str())
+                    .bind(tenant_id)
                     .bind(key.region.0.as_str())
                     .bind(next.phase.token())
                     .bind(next.fence_epoch as i64)
@@ -188,7 +195,7 @@ impl RebuildJournal for PgRebuildJournal {
                     .await,
                 // Every later write: conditional on the epoch this holder claimed under.
                 Some(expected) => sqlx::query(UPDATE_REBUILD_JOB_QUERY)
-                    .bind(key.tenant.0.as_str())
+                    .bind(tenant_id)
                     .bind(key.region.0.as_str())
                     .bind(next.phase.token())
                     .bind(next.fence_epoch as i64)

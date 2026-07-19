@@ -295,7 +295,7 @@ fn cdc_6_1_cross_tenant_zero() {
         &viewer("evil"),
     );
     let err = res.expect_err("a cross-tenant query is rejected (SRCH-D3)");
-    assert!(matches!(err, QueryError::TenantMismatch { .. }));
+    assert!(matches!(err, QueryError::TenantMismatch));
     assert_eq!(
         calls, 0,
         "the wrong-tenant query never reaches list_objects"

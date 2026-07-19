@@ -138,7 +138,7 @@ fn srch_d3_cross_tenant_idor_is_zero() {
     );
     let err = res.expect_err("a cross-tenant query MUST be rejected (SRCH-D3)");
     assert!(
-        matches!(err, QueryError::TenantMismatch { .. }),
+        matches!(err, QueryError::TenantMismatch),
         "cross-tenant ⇒ TenantMismatch: {err}"
     );
     // THE DRILL ARTIFACT: 0 cross-tenant results, AND the guard fired before any authz/engine work.
