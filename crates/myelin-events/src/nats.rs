@@ -45,7 +45,7 @@ use crate::{ArtifactRef, EventEnvelope, EventId};
 /// There are deliberately no unlimited defaults: callers must choose finite byte and message
 /// bounds, a retention age, a deduplication window, and a replica count appropriate for the NATS
 /// cluster they operate.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct JetStreamPublisherConfig {
     pub nats_url: String,
     pub stream_name: String,
@@ -55,6 +55,23 @@ pub struct JetStreamPublisherConfig {
     pub max_messages: i64,
     pub replicas: usize,
     pub duplicate_window: std::time::Duration,
+    pub publish_ack_timeout: std::time::Duration,
+}
+
+impl core::fmt::Debug for JetStreamPublisherConfig {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("JetStreamPublisherConfig")
+            .field("nats_url", &"<redacted>")
+            .field("stream_name", &self.stream_name)
+            .field("subject_root", &self.subject_root)
+            .field("max_age", &self.max_age)
+            .field("max_bytes", &self.max_bytes)
+            .field("max_messages", &self.max_messages)
+            .field("replicas", &self.replicas)
+            .field("duplicate_window", &self.duplicate_window)
+            .field("publish_ack_timeout", &self.publish_ack_timeout)
+            .finish()
+    }
 }
 
 /// Explicit bounded-capacity policy for a durable JetStream pull consumer.
@@ -197,6 +214,14 @@ impl JetStreamPublisherConfig {
                 "JetStream duplicate_window must be positive and no greater than max_age".into(),
             ));
         }
+        if self.publish_ack_timeout.is_zero()
+            || self.publish_ack_timeout > std::time::Duration::from_secs(60)
+        {
+            return Err(TransportError(
+                "JetStream publish acknowledgement timeout must be positive and at most 60 seconds"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -231,63 +256,41 @@ fn validate_stream_config(
     actual: &StreamConfig,
     expected: &StreamConfig,
 ) -> Result<(), TransportError> {
-    let mut drift = Vec::new();
+    let mut drifted = false;
     if actual.storage != StorageType::File {
-        drift.push(format!("storage={:?} (expected File)", actual.storage));
+        drifted = true;
     }
     if actual.retention != RetentionPolicy::Limits {
-        drift.push(format!(
-            "retention={:?} (expected Limits)",
-            actual.retention
-        ));
+        drifted = true;
     }
     if actual.discard != DiscardPolicy::Old {
-        drift.push(format!("discard={:?} (expected Old)", actual.discard));
+        drifted = true;
     }
     if actual.max_age != expected.max_age {
-        drift.push(format!(
-            "max_age={:?} (expected {:?})",
-            actual.max_age, expected.max_age
-        ));
+        drifted = true;
     }
     if actual.max_bytes != expected.max_bytes {
-        drift.push(format!(
-            "max_bytes={} (expected {})",
-            actual.max_bytes, expected.max_bytes
-        ));
+        drifted = true;
     }
     if actual.max_messages != expected.max_messages {
-        drift.push(format!(
-            "max_messages={} (expected {})",
-            actual.max_messages, expected.max_messages
-        ));
+        drifted = true;
     }
     if actual.num_replicas != expected.num_replicas {
-        drift.push(format!(
-            "replicas={} (expected {})",
-            actual.num_replicas, expected.num_replicas
-        ));
+        drifted = true;
     }
     if actual.subjects != expected.subjects {
-        drift.push(format!(
-            "subjects={:?} (expected {:?})",
-            actual.subjects, expected.subjects
-        ));
+        drifted = true;
     }
     if actual.duplicate_window != expected.duplicate_window {
-        drift.push(format!(
-            "duplicate_window={:?} (expected {:?})",
-            actual.duplicate_window, expected.duplicate_window
-        ));
+        drifted = true;
     }
 
-    if drift.is_empty() {
-        Ok(())
+    if drifted {
+        Err(TransportError(
+            "existing JetStream stream configuration is incompatible".into(),
+        ))
     } else {
-        Err(TransportError(format!(
-            "existing JetStream stream configuration is incompatible: {}",
-            drift.join(", ")
-        )))
+        Ok(())
     }
 }
 
@@ -450,44 +453,91 @@ fn drain_queued_settlements<T: Clone>(
     }
 }
 
+/// Administrative stream provisioning, deliberately separate from runtime publication.
+pub struct JetStreamProvisioner;
+
+impl JetStreamProvisioner {
+    /// Create the configured stream if absent, then refuse any policy drift.
+    pub fn ensure(
+        config: JetStreamPublisherConfig,
+        rt: tokio::runtime::Handle,
+    ) -> Result<(), TransportError> {
+        config.validate()?;
+        let expected = config.stream_config();
+        tokio::task::block_in_place(|| {
+            rt.block_on(async {
+                let client = async_nats::connect(&config.nats_url)
+                    .await
+                    .map_err(|_| TransportError("NATS provisioning connection failed".into()))?;
+                let js = jetstream::new(client);
+                let stream = js
+                    .get_or_create_stream(expected.clone())
+                    .await
+                    .map_err(|_| TransportError("JetStream provisioning request failed".into()))?;
+                validate_stream_config(&stream.cached_info().config, &expected)
+            })
+        })
+    }
+}
+
+async fn publish_with_timeout<F, T>(
+    timeout: std::time::Duration,
+    future: F,
+) -> Result<T, TransportError>
+where
+    F: std::future::Future<Output = Result<T, TransportError>>,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| TransportError("JetStream publish acknowledgement timed out".into()))?
+}
+
 /// A capability-minimal production adapter for the elected shared-outbox relay.
 ///
-/// Construction provisions or validates the shared stream and creates no consumer. Its public
-/// surface implements only [`EventPublisher`], so the relay cannot consume, acknowledge, or purge
-/// production history.
+/// [`connect_existing`](Self::connect_existing) performs no stream or consumer administration.
+/// Its public surface implements only [`EventPublisher`], so the relay cannot consume,
+/// acknowledge, alter, or purge production history.
 pub struct NatsJetStreamPublisher {
     js: Context,
     subject_root: String,
+    publish_ack_timeout: std::time::Duration,
     rt: tokio::runtime::Handle,
 }
 
 impl NatsJetStreamPublisher {
+    /// Compatibility composition for tests: provision with this authority, then open the
+    /// publish-only runtime adapter. Production callers should use explicit `provision` and
+    /// [`connect_existing`](Self::connect_existing) paths with separate authorities.
     pub fn connect(
         config: JetStreamPublisherConfig,
         rt: tokio::runtime::Handle,
     ) -> Result<Self, TransportError> {
+        JetStreamProvisioner::ensure(config.clone(), rt.clone())?;
+        Self::connect_existing(config, rt)
+    }
+
+    /// Connect the runtime publisher without stream/consumer create, update, or delete requests.
+    pub fn connect_existing(
+        config: JetStreamPublisherConfig,
+        rt: tokio::runtime::Handle,
+    ) -> Result<Self, TransportError> {
         config.validate()?;
-        let expected = config.stream_config();
         let subject_root = config.subject_root.clone();
+        let publish_ack_timeout = config.publish_ack_timeout;
 
         let js = tokio::task::block_in_place(|| {
             rt.block_on(async {
                 let client = async_nats::connect(&config.nats_url)
                     .await
-                    .map_err(|e| TransportError(format!("nats connect: {e}")))?;
-                let js = jetstream::new(client);
-                let stream = js
-                    .get_or_create_stream(expected.clone())
-                    .await
-                    .map_err(|e| TransportError(format!("create/get stream: {e}")))?;
-                validate_stream_config(&stream.cached_info().config, &expected)?;
-                Ok::<Context, TransportError>(js)
+                    .map_err(|_| TransportError("NATS publisher connection failed".into()))?;
+                Ok::<Context, TransportError>(jetstream::new(client))
             })
         })?;
 
         Ok(Self {
             js,
             subject_root,
+            publish_ack_timeout,
             rt,
         })
     }
@@ -506,17 +556,17 @@ impl EventPublisher for NatsJetStreamPublisher {
     ) -> Result<Delivery, TransportError> {
         let nats_subject = event_subject(&self.subject_root, envelope)?;
         let body = serde_json::to_vec(envelope)
-            .map_err(|e| TransportError(format!("serialize envelope: {e}")))?;
+            .map_err(|_| TransportError("event envelope serialization failed".into()))?;
         let mut headers = async_nats::HeaderMap::new();
         headers.insert("Nats-Msg-Id", dedup_id.0.as_str());
-        let ack = self.block(async {
+        let ack = self.block(publish_with_timeout(self.publish_ack_timeout, async {
             self.js
                 .publish_with_headers(nats_subject, headers, body.into())
                 .await
-                .map_err(|e| TransportError(format!("publish: {e}")))?
+                .map_err(|_| TransportError("JetStream publish request failed".into()))?
                 .await
-                .map_err(|e| TransportError(format!("publish ack: {e}")))
-        })?;
+                .map_err(|_| TransportError("JetStream publish acknowledgement failed".into()))
+        }))?;
         Ok(if ack.duplicate {
             Delivery::Deduplicated
         } else {
@@ -989,6 +1039,7 @@ mod publisher_tests {
             max_messages: 100_000,
             replicas: 3,
             duplicate_window: std::time::Duration::from_secs(120),
+            publish_ack_timeout: std::time::Duration::from_secs(2),
         }
     }
 
@@ -1018,12 +1069,38 @@ mod publisher_tests {
         let mut actual = expected.clone();
         actual.num_replicas = 1;
         let err = validate_stream_config(&actual, &expected).expect_err("replica drift");
-        assert!(err.0.contains("replicas=1"));
+        assert_eq!(err.0, "existing JetStream stream configuration is incompatible");
 
         let mut actual = expected.clone();
         actual.discard = DiscardPolicy::New;
         let err = validate_stream_config(&actual, &expected).expect_err("discard drift");
-        assert!(err.0.contains("discard=New"));
+        assert_eq!(err.0, "existing JetStream stream configuration is incompatible");
+    }
+
+    #[tokio::test]
+    async fn unresponsive_publish_ack_times_out_with_a_fixed_redacted_error() {
+        let error = publish_with_timeout(
+            std::time::Duration::from_millis(1),
+            std::future::pending::<Result<(), TransportError>>(),
+        )
+        .await
+        .expect_err("pending acknowledgement must time out");
+        assert_eq!(error.0, "JetStream publish acknowledgement timed out");
+    }
+
+    #[test]
+    fn publisher_config_debug_and_validation_errors_redact_authority() {
+        let sentinel = "NATS_AUTHORITY_SENTINEL";
+        let mut cfg = config();
+        cfg.nats_url = format!("nats://publisher:{sentinel}@broker.invalid:4222");
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains(sentinel));
+        assert!(!debug.contains("nats://"));
+
+        cfg.stream_name = "invalid.name".into();
+        let error = cfg.validate().expect_err("invalid stream name");
+        assert!(!error.0.contains(sentinel));
+        assert!(!error.0.contains("broker.invalid"));
     }
 
     #[test]

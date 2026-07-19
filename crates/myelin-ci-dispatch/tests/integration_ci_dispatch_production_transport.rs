@@ -212,6 +212,7 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
             max_messages: 100_000,
             replicas: 1,
             duplicate_window: std::time::Duration::from_secs(120),
+            publish_ack_timeout: std::time::Duration::from_secs(2),
         },
         rt.clone(),
     )
