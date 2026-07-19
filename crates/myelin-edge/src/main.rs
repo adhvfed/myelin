@@ -6,7 +6,8 @@
 //! an operator-plane action instead of serving:
 //!
 //! - `edge` (no args) → serve.
-//! - `edge bootstrap --tenant <t> --principal <id> [--display-name <s>] [--ttl-days <n>] [--region <r>]`
+//! - `edge bootstrap --tenant <t> --principal <id> --issues-project <uuid> [--display-name <s>]
+//!   [--ttl-days <n>] [--region <r>]`
 //!   → idempotently seed the principal + mint a capability token that authenticates against a
 //!   SEPARATELY-running serving edge (same DB + seal key). Prints the token to STDOUT exactly once.
 //! - `edge revoke --jti <jti> --tenant <t> [--region <r>]` → durably revoke a token (S7 denylist).
@@ -25,22 +26,22 @@
 
 use myelin_config::Mode;
 use myelin_edge::{
-    bootstrap_principal_and_mint, register_git_durable, register_git_wire, register_issues,
-    recover_placed_git_at_boot, serve_edge, spawn_issue_authorization_reconciler, AuthProvider,
-    AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
-    DurableGitBackend, Gateway, IssueReconciliationConfig, Method, StoreBackedIssueAuthorizer,
-    TupleRepoBootstrap, WhoamiHandler,
+    bootstrap_principal_and_mint, recover_placed_git_at_boot, register_git_durable,
+    register_git_wire, register_issues, serve_edge, spawn_issue_authorization_reconciler,
+    AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
+    CheckBackedRepoAuthorizer, DurableGitBackend, Gateway, IssueReconciliationConfig, Method,
+    StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
 };
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{FragmentAdmit, Principal, PrincipalId, PrincipalKind, RevokeTarget};
 use myelin_identity_service::{
     CapabilityAuthenticator, CellTokenAuthority, HumanSsoAuthenticator, JwkSet, OidcConfig,
-    PasetoCapabilityVerifier, PrincipalStore, RevocationStore, StoreBackedCheck,
+    PasetoCapabilityVerifier, PrincipalStore, RevocationStore, StoreBackedCheck, TupleStore,
 };
 use myelin_storage::{
     all_durable_migrations, seal_key_from_env, DurableCellRootBacking, DurableKmsBacking,
-    DurablePrincipalBacking, DurableRevocationBacking, HotTables, KmsEngine, PgBootstrap,
-    PgOutboxBacking, SubstrateProvider, TenantScope,
+    DurablePrincipalBacking, DurableRevocationBacking, DurableTupleBacking, HotTables, KmsEngine,
+    PgBootstrap, PgOutboxBacking, SubstrateProvider, TenantScope,
 };
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
@@ -482,6 +483,11 @@ async fn operator_bootstrap(core: ComposedCore, args: &[String]) {
 
     let tenant = required_flag(args, "--tenant");
     let principal = required_flag(args, "--principal");
+    let issues_project = required_flag(args, "--issues-project");
+    if !myelin_issues::api::is_canonical_uuid(&issues_project) {
+        eprintln!("edge bootstrap: --issues-project must be a canonical lowercase UUID");
+        std::process::exit(2);
+    }
     let display_name = flag(args, "--display-name");
     let region = flag(args, "--region").unwrap_or_else(default_region);
     let ttl_days: u32 = flag(args, "--ttl-days")
@@ -500,14 +506,17 @@ async fn operator_bootstrap(core: ComposedCore, args: &[String]) {
         DurablePrincipalBacking::new(provider.clone()),
         handle.clone(),
     );
+    let tuples = TupleStore::with_pg(DurableTupleBacking::new(provider.clone()), handle.clone());
     let now_unix = now_unix();
     let outcome = bootstrap_principal_and_mint(
         &store,
+        &tuples,
         &cell,
         &BootstrapParams {
             tenant: &tenant,
             region: &region,
             principal: &principal,
+            issues_project: &issues_project,
             display: display_name.as_deref(),
             ttl_days,
         },
@@ -525,6 +534,7 @@ async fn operator_bootstrap(core: ComposedCore, args: &[String]) {
     eprintln!("  tenant       = {}", outcome.tenant);
     eprintln!("  region       = {}", outcome.region);
     eprintln!("  principal    = {}", outcome.principal_id);
+    eprintln!("  issues grant = project:{issues_project}#reader");
     eprintln!("  subject_key  = {}", outcome.subject_key);
     eprintln!("  jti          = {}", outcome.jti);
     eprintln!("  expiry_unix  = {}", outcome.expiry_unix);

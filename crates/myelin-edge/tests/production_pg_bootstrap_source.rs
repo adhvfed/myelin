@@ -91,6 +91,61 @@ fn dogfood_exports_distinct_runtime_and_migration_credentials() {
 }
 
 #[test]
+fn founder_issue_identifiers_and_bootstrap_default_cannot_drift() {
+    const PROJECT: &str = "20aee030-c7fa-4757-8243-700faf528690";
+    const ISSUE_TYPE: &str = "7d457754-f6a1-4cd8-8738-21751570b627";
+
+    let dogfood = include_str!("../../../scripts/dogfood.sh");
+    let runbook = include_str!("../../../docs/dogfood.md");
+
+    for value in [PROJECT, ISSUE_TYPE] {
+        assert!(dogfood.contains(value));
+        assert!(runbook.contains(value));
+    }
+    assert!(dogfood.contains("DOGFOOD_ISSUES_PREFIX=\"MYL\""));
+    assert!(runbook.contains("PREFIX=MYL"));
+    assert!(dogfood.contains("set -- \"$@\" --issues-project \"${MYELIN_DOGFOOD_ISSUES_PROJECT}\""));
+    assert!(!dogfood.contains("11111111-1111-1111-1111-111111111111"));
+    assert!(!dogfood.contains("22222222-2222-2222-2222-222222222222"));
+    assert!(!runbook.contains("11111111-1111-1111-1111-111111111111"));
+    assert!(!runbook.contains("22222222-2222-2222-2222-222222222222"));
+}
+
+#[test]
+fn operator_bootstrap_validates_and_grants_the_explicit_issues_project_before_minting() {
+    let source = include_str!("../src/main.rs");
+    let bootstrap = source
+        .split_once("async fn operator_bootstrap")
+        .expect("operator bootstrap must remain wired")
+        .1;
+
+    let required_project = bootstrap
+        .find("required_flag(args, \"--issues-project\")")
+        .expect("the Issues project UUID is explicit and required");
+    let validate = bootstrap
+        .find("myelin_issues::api::is_canonical_uuid(&issues_project)")
+        .expect("the project UUID is validated locally");
+    let principal_store = bootstrap
+        .find("let store = PrincipalStore::with_pg")
+        .expect("durable principal store must remain wired");
+    let tuple_store = bootstrap
+        .find("let tuples = TupleStore::with_pg")
+        .expect("durable tuple store must remain wired");
+    let bootstrap_call = bootstrap
+        .find("bootstrap_principal_and_mint(")
+        .expect("the testable bootstrap body must remain wired");
+    let print_token = bootstrap
+        .find("println!(\"{}\", outcome.token)")
+        .expect("token output must remain after successful bootstrap");
+
+    assert!(required_project < validate);
+    assert!(validate < principal_store);
+    assert!(principal_store < tuple_store);
+    assert!(tuple_store < bootstrap_call);
+    assert!(bootstrap_call < print_token);
+}
+
+#[test]
 fn missing_migration_credential_exits_before_bind() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_edge"))
         .env("DATABASE_URL", "postgres://runtime.invalid/myelin")

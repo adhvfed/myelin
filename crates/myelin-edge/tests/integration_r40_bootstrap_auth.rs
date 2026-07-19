@@ -24,22 +24,26 @@
 use myelin_config::{Mode, MyelinConfig};
 use myelin_edge::{
     bootstrap_principal_and_mint, register_git_durable, serve_edge, AllowAll, BootstrapParams,
-    DurableGitBackend, Gateway, Method, WhoamiHandler,
+    DurableGitBackend, Gateway, Method, StoreBackedIssueAuthorizer, WhoamiHandler,
 };
+use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
     CapabilityAuthenticator, CellTokenAuthority, HumanSsoAuthenticator, PasetoCapabilityVerifier,
-    PrincipalStore, RevocationStore,
+    PrincipalStore, RevocationStore, StoreBackedCheck, TupleStore,
 };
+use myelin_issues::IssueAuthorizer;
 use myelin_storage::{
     all_durable_migrations, DurableCellRootBacking, DurableKmsBacking, DurablePrincipalBacking,
-    DurableRevocationBacking, HotTables, PgBootstrap, SealKey,
+    DurableRevocationBacking, DurableTupleBacking, HotTables, PgBootstrap, SealKey, TenantScope,
 };
+use myelin_tenancy::{Region, TenantId};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-const REGION: &str = "eu-west";
+const REGION: &str = "fr-par";
+const ISSUES_PROJECT: &str = "11111111-1111-1111-1111-111111111111";
 const SEAL_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
 fn uniq() -> String {
@@ -103,7 +107,9 @@ async fn spawn(gateway: Arc<Gateway>) -> SocketAddr {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
     let Ok(_) = std::env::var("DATABASE_URL") else {
-        eprintln!("SKIP bootstrap_token_authenticates_and_drives_the_product_surface: DATABASE_URL unset");
+        eprintln!(
+            "SKIP bootstrap_token_authenticates_and_drives_the_product_surface: DATABASE_URL unset"
+        );
         return;
     };
     let config = MyelinConfig::from_env(Mode::DevDefaults).expect("dev config");
@@ -151,23 +157,66 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
         DurablePrincipalBacking::new(provider.clone()),
         handle.clone(),
     );
+    let tuples = TupleStore::with_pg(DurableTupleBacking::new(provider.clone()), handle.clone());
 
     let tenant = format!("t-{}", uniq());
     let params = BootstrapParams {
         tenant: &tenant,
         region: REGION,
         principal: "founder",
+        issues_project: ISSUES_PROJECT,
         display: Some("The Founder"),
         ttl_days: 30,
     };
     // (B1) bootstrap — seed + mint. (B2) idempotent re-run — a NEW token, distinct jti, same principal.
-    let out1 = bootstrap_principal_and_mint(&store, &cell, &params, now_unix()).expect("bootstrap #1");
-    let out2 = bootstrap_principal_and_mint(&store, &cell, &params, now_unix()).expect("bootstrap #2");
+    let out1 = bootstrap_principal_and_mint(&store, &tuples, &cell, &params, now_unix())
+        .expect("bootstrap #1");
+    let out2 = bootstrap_principal_and_mint(&store, &tuples, &cell, &params, now_unix())
+        .expect("bootstrap #2");
     assert_ne!(
         out1.jti, out2.jti,
         "a re-run mints a NEW token (distinct revocation handle) for the SAME principal"
     );
     assert_eq!(out1.principal_id, "founder");
+
+    // A FRESH tuple-store handle proves the grant is durable. Re-bootstrap converges on exactly one
+    // project reader edge and grants no other project/relation.
+    let founder = Principal::new(
+        TenantId::from_token(tenant.clone()),
+        Region::new(REGION),
+        PrincipalId("founder".into()),
+        PrincipalKind::Human,
+        DataRole::Controller,
+        PrincipalStatus::Active,
+    );
+    let founder_scope = TenantScope::from_verified_token(&founder, Region::new(REGION));
+    let restarted_tuples =
+        TupleStore::with_pg(DurableTupleBacking::new(provider.clone()), handle.clone());
+    let durable_edges = restarted_tuples.tuples_in(&founder_scope);
+    assert_eq!(
+        durable_edges.len(),
+        1,
+        "re-bootstrap never duplicates or widens"
+    );
+    assert_eq!(
+        durable_edges[0].tuple.object.0,
+        format!("project:{ISSUES_PROJECT}")
+    );
+    assert_eq!(durable_edges[0].tuple.relation.0, "reader");
+    assert_eq!(durable_edges[0].tuple.subject.0, "founder");
+
+    // The product still goes through the ordinary may_create check: the exact project is admitted,
+    // while an ungranted project remains denied.
+    let issue_check = StoreBackedCheck::new(restarted_tuples);
+    for verdict in issue_check.admit_issue_fragment() {
+        assert!(matches!(
+            verdict,
+            myelin_identity::FragmentAdmit::Admitted { .. }
+        ));
+    }
+    let issue_authorizer = StoreBackedIssueAuthorizer::new(issue_check);
+    assert!(issue_authorizer.may_create(&founder, ISSUES_PROJECT));
+    assert!(!issue_authorizer.may_create(&founder, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"));
 
     // Compose a serving Gateway over the SAME durable stores + the SAME cell trust anchor, exactly as
     // production `serve()` authenticates (a SEPARATE PrincipalStore handle over the same PG backing,
@@ -219,7 +268,13 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
     assert_eq!(st2, 200, "the re-minted token also authenticates");
 
     // (2) create a repo.
-    let (st, cr) = http(addr, "POST", "/v1/git/repos", token, Some(r#"{"slug":"widgets"}"#));
+    let (st, cr) = http(
+        addr,
+        "POST",
+        "/v1/git/repos",
+        token,
+        Some(r#"{"slug":"widgets"}"#),
+    );
     assert_eq!(st, 201, "the token creates a repo: {cr}");
 
     // (3) a web-edit commit on a feature ref → a head oid.
@@ -241,7 +296,13 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
     let open_body = format!(
         r#"{{"title":"first PR","base_ref":"refs/heads/dev","head_ref":"refs/heads/feature","head_oid":"{head_oid}"}}"#
     );
-    let (st, pr) = http(addr, "POST", "/v1/git/repos/widgets/prs", token, Some(&open_body));
+    let (st, pr) = http(
+        addr,
+        "POST",
+        "/v1/git/repos/widgets/prs",
+        token,
+        Some(&open_body),
+    );
     assert_eq!(st, 201, "open PR: {pr}");
 
     let (st, rv) = http(
@@ -253,8 +314,17 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
     );
     assert_eq!(st, 200, "submit review: {rv}");
 
-    let (st, mg) = http(addr, "POST", "/v1/git/repos/widgets/prs/1/merge", token, Some("{}"));
-    assert_eq!(st, 200, "merge PR (unprotected base, 0 approvals required): {mg}");
+    let (st, mg) = http(
+        addr,
+        "POST",
+        "/v1/git/repos/widgets/prs/1/merge",
+        token,
+        Some("{}"),
+    );
+    assert_eq!(
+        st, 200,
+        "merge PR (unprotected base, 0 approvals required): {mg}"
+    );
     assert_eq!(mg["applied"]["merged"], true, "the PR merged: {mg}");
 
     // cleanup the durable cell-infra + principal rows for this test's cell/tenant.
@@ -269,6 +339,10 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
             .execute(pool)
             .await;
     }
+    let _ = sqlx::query("DELETE FROM rebac_tuple WHERE tenant_id = $1")
+        .bind(&tenant)
+        .execute(pool)
+        .await;
 
     println!(
         "OK: bootstrap token authenticates (whoami/create/open/review/merge) over the durable cell \

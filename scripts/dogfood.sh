@@ -7,7 +7,8 @@
 #   ./scripts/dogfood.sh edge              build + run the edge over the dogfood env (serves :8080)
 #   ./scripts/dogfood.sh bootstrap -- <flags>
 #                                          run `edge bootstrap <flags>` over the dogfood env, e.g.
-#                                            ./scripts/dogfood.sh bootstrap -- --tenant acme --principal founder
+#                                            ./scripts/dogfood.sh bootstrap -- --tenant acme --principal founder \
+#                                              --issues-project 20aee030-c7fa-4757-8243-700faf528690
 #                                          prints the capability token to STDOUT (nothing else)
 #   ./scripts/dogfood.sh web               print (or, with EXEC=1, run) the frontend start wired to
 #                                          MYELIN_EDGE_URL=http://127.0.0.1:8080
@@ -31,6 +32,9 @@ GIT_ROOT_DEFAULT="${DATA_DIR}/git-data"
 # The git WIRE (clone/fetch/push) runs a real `git` inside a gVisor sandbox, so it needs a git-bearing
 # rootfs staged (scripts/stage-git-rootfs.sh). Default location mirrors resolved_gvisor_git_rootfs().
 GIT_ROOTFS_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/gvisor-assets/git-rootfs"
+DOGFOOD_ISSUES_PROJECT="20aee030-c7fa-4757-8243-700faf528690"
+DOGFOOD_ISSUES_TYPE="7d457754-f6a1-4cd8-8738-21751570b627"
+DOGFOOD_ISSUES_PREFIX="MYL"
 
 # Generate the seal key ONCE (0600), reuse thereafter. openssl if present, else /dev/urandom. NEVER
 # regenerated over an existing key (that would orphan the KMS root + every minted token, fail-closed).
@@ -71,6 +75,9 @@ export MYELIN_KMS_SEAL_KEY="${seal}"   # the operator seal key (unseals the KMS 
 export MYELIN_GIT_ROOT="${git_root}"   # on-disk bare-repo root
 export MYELIN_REGION="${region}"       # residency region
 export MYELIN_ISSUES_RECONCILE_TENANTS="\${MYELIN_ISSUES_RECONCILE_TENANTS:-acme}"  # explicit FORCE-RLS partitions; defaults to the runbook's canonical dogfood tenant
+export MYELIN_DOGFOOD_ISSUES_PROJECT="\${MYELIN_DOGFOOD_ISSUES_PROJECT:-${DOGFOOD_ISSUES_PROJECT}}"  # canonical founder project UUID (bootstrap reader grant)
+export MYELIN_DOGFOOD_ISSUES_TYPE="\${MYELIN_DOGFOOD_ISSUES_TYPE:-${DOGFOOD_ISSUES_TYPE}}"        # explicit v1 type UUID (no type catalogue/FK yet)
+export MYELIN_DOGFOOD_ISSUES_PREFIX="\${MYELIN_DOGFOOD_ISSUES_PREFIX:-${DOGFOOD_ISSUES_PREFIX}}"                                     # canonical founder issue-key prefix
 export MYELIN_EDGE_ADDR="\${MYELIN_EDGE_ADDR:-127.0.0.1:8080}"
 export MYELIN_TOKEN_LOGIN="\${MYELIN_TOKEN_LOGIN:-1}"  # surface the operator-token web login in /v1/auth/config
 export MYELIN_GVISOR_GIT_ROOTFS="\${MYELIN_GVISOR_GIT_ROOTFS:-${git_rootfs}}"  # the sandboxed git-wire rootfs (stage-git-rootfs.sh)
@@ -106,6 +113,16 @@ case "${cmd}" in
     # Everything after an optional `--` is passed straight to `edge bootstrap`.
     if [[ "${1:-}" == "--" ]]; then shift; fi
     load_env
+    has_issues_project=0
+    for arg in "$@"; do
+      if [[ "${arg}" == "--issues-project" || "${arg}" == --issues-project=* ]]; then
+        has_issues_project=1
+        break
+      fi
+    done
+    if [[ "${has_issues_project}" == "0" ]]; then
+      set -- "$@" --issues-project "${MYELIN_DOGFOOD_ISSUES_PROJECT}"
+    fi
     echo "dogfood: minting an operator token (edge bootstrap $*) — the token prints to STDOUT" >&2
     exec cargo run --quiet -p myelin-edge --bin edge -- bootstrap "$@"
     ;;
