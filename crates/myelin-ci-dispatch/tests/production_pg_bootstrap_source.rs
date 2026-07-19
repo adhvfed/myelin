@@ -33,7 +33,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         .find("build_dispatch_consumers")
         .expect("production trigger consumer must remain wired");
     let service = source
-        .find("run_dispatch(Config::default()")
+        .find("run_dispatch_until_shutdown(")
         .expect("service lifecycle must remain wired");
 
     assert!(foundation < durable);
