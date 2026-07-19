@@ -1116,7 +1116,7 @@ impl WfCtx {
     /// The run's [`TenantId`] — the partition key the reserve/settle bookend (P-FLOW-16) keys its
     /// ledger reservations under (there is no cross-tenant ledger path; §1.1). Fixed for the run's
     /// lifetime.
-    pub(crate) fn tenant_id(&self) -> &TenantId {
+    pub fn tenant_id(&self) -> &TenantId {
         &self.tenant
     }
 

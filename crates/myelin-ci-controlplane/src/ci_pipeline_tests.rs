@@ -266,6 +266,47 @@ fn all_stages_pass_emits_success_checks_run_succeeded_and_ci_result() {
     );
 }
 
+/// The terminal lifecycle event stays on the exact run subject/aggregate minted by dispatch's
+/// `ci.run.started`; a canonical run ref is never treated as an unqualified id and prefixed again.
+#[test]
+fn terminal_run_identity_matches_the_started_lifecycle_partition() {
+    let run_ref = "myelin://acme/ci/run/run%2F7";
+    let draft = run_aggregate_draft(
+        CI_RUN_SUCCEEDED,
+        run_ref,
+        serde_json::json!({ "run": run_ref }),
+    )
+    .expect("canonical dispatch run ref");
+
+    assert_eq!(draft.subject.0, run_ref);
+    assert_eq!(draft.aggregate.0, "run:run%2F7");
+    assert!(myelin_refs::parse_scoped(&draft.subject.0).is_ok());
+}
+
+#[test]
+fn terminal_run_identity_rejects_unqualified_or_double_prefixed_refs() {
+    for invalid in ["run-7", "ci/run/run-7", "ci/run/myelin://acme/ci/run/run-7"] {
+        assert!(
+            run_aggregate_draft(CI_RUN_FAILED, invalid, serde_json::json!({})).is_err(),
+            "{invalid} must fail closed"
+        );
+    }
+}
+
+#[test]
+fn cross_tenant_pipeline_provenance_fails_before_dispatch_or_emit() {
+    let outbox = OutboxStore::new();
+    let runner = RecordingRunner::default();
+    let mut run = job_run();
+    run.facts.run_ref = "myelin://other/ci/run/run-7".into();
+    let mut ctx = begin(&outbox, SignalStore::new(), TimerStore::new(), 1000);
+
+    assert!(run_ci_pipeline_body(&mut ctx, &run, &runner).is_err());
+    assert_eq!(runner.count(), 0, "tenant mismatch fails before dispatch");
+    ctx.commit().expect("empty transaction commits");
+    assert_eq!(outbox.committed_count(), 0, "tenant mismatch emits nothing");
+}
+
 /// **A failing stage → FAILURE: a `ci.check.updated{failure}` PER context + `ci.run.failed`
 /// (structured) + `ci.result{failure}`; the later stage is NEVER dispatched (0 wasted spend).** The
 /// `build` stage reports `fail`; `test` is never dispatched.

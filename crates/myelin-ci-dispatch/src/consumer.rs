@@ -904,7 +904,7 @@ pub fn plan_dispatch(
         pipeline_id: deterministic_uuid(&format!("pipeline:{}", facts.repo)),
         wf_run_id,
         correlation_id: ev.correlation_id.0.clone(),
-        repo_ref: facts.repo,
+        repo_ref: run_facts.repo_root.0.clone(),
         commit_oid: facts.new_oid,
     };
     let emit_ctx = EmitContextBase {
@@ -1844,7 +1844,10 @@ mod tests {
         ) else {
             panic!("the full namespaced slug must select its own repository");
         };
-        assert_eq!(armed.reserve.repo_ref, "team/web");
+        assert_eq!(
+            armed.reserve.repo_ref,
+            "myelin://acme/git/repo/team%2Fweb"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1946,7 +1949,7 @@ mod tests {
         assert_eq!(armed.handoff.run_write.run_id, deterministic_uuid("run:ev-push-1"));
         assert_eq!(armed.reserve.wf_run_id, deterministic_uuid("wf:ev-push-1"));
         assert_eq!(armed.reserve.correlation_id, "corr-1");
-        assert_eq!(armed.reserve.repo_ref, "web");
+        assert_eq!(armed.reserve.repo_ref, "myelin://acme/git/repo/web");
         assert_eq!(armed.reserve.commit_oid, TEST_OID);
         let insert = ci_run_insert_from_armed(&armed);
         assert_eq!(insert.triggered_by.as_deref(), Some("pusher"));

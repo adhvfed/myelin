@@ -75,7 +75,7 @@
 //!   those prompts wire the monotonic counter + the end-to-end seam GATE.
 
 use myelin_events::check_seam::{check_updated_draft, ci_result_draft, rollup_ci_result, CiResult};
-use myelin_events::{ArtifactRef, EventDraft, EventType};
+use myelin_events::{EventDraft, EventType};
 use myelin_events::{DataRole, Visibility};
 use myelin_flow::{CiPipelineSpec, JobRunner, PipelineOutcome, WfCtx, WfResult};
 
@@ -376,6 +376,8 @@ pub fn run_ci_pipeline_body<R>(
 where
     R: JobRunner,
 {
+    validate_pipeline_provenance(ctx, &run.facts)?;
+
     // ── 1. The protected-env / manual GATES (9.4). The arch §3.1 pseudocode gates the deploy stages
     // on a `wait_for_signal("approval:<stage>", window)` BEFORE the stage's jobs run. A gate parks
     // (holds no runtime, may wait DAYS) until a human/automation approves; a deny or a window timeout
@@ -443,6 +445,32 @@ where
             Ok(RunVerdict::Parked)
         }
     }
+}
+
+/// Validate the immutable trigger provenance before the body performs a gate, dispatch, or emit.
+/// Repository, run, and workflow execution must all belong to the same tenant; canonical syntax
+/// alone is insufficient because a cross-tenant run ref would otherwise mint valid-looking facts.
+fn validate_pipeline_provenance(ctx: &WfCtx, facts: &CheckFacts) -> WfResult<()> {
+    let repo = myelin_refs::parse_scoped(&facts.repo)
+        .map_err(|_| myelin_flow::WfError::CoCommit("invalid canonical Git repository root".into()))?;
+    let run = myelin_refs::parse_scoped(&facts.run_ref)
+        .map_err(|_| myelin_flow::WfError::CoCommit("invalid canonical CI run root".into()))?;
+    if repo.subsystem != "git"
+        || repo.type_ != "repo"
+        || repo.sub.is_some()
+        || run.subsystem != "ci"
+        || run.type_ != "run"
+        || run.sub.is_some()
+        || repo.tenant != run.tenant
+        || repo.tenant != *ctx.tenant_id()
+    {
+        return Err(myelin_flow::WfError::CoCommit(
+            "pipeline provenance tenant or artifact kind mismatch".into(),
+        ));
+    }
+    myelin_events::SubjectComponent::parse(&run.id)
+        .map_err(|_| myelin_flow::WfError::CoCommit("invalid canonical CI run root".into()))?;
+    Ok(())
 }
 
 /// One protected-env / manual gate: `wait_for_signal("approval:<stage>", window)` (9.4). The approval
@@ -526,7 +554,7 @@ fn emit_run_terminal(
         // prior shape when only the stage is known (the `failed_stage` key is unchanged, CI-D9).
         payload["structured_failure"] = StructuredFailure::for_stage(stage).to_payload();
     }
-    let draft = run_aggregate_draft(type_, &facts.run_ref, payload);
+    let draft = run_aggregate_draft(type_, &facts.run_ref, payload)?;
     ctx.emit(draft, None)?;
     Ok(())
 }
@@ -538,7 +566,7 @@ fn emit_deployment_rejected(ctx: &mut WfCtx, facts: &CheckFacts, stage: &str) ->
         "commit_oid": facts.commit_oid,
         "stage": stage,
     });
-    let draft = run_aggregate_draft(CI_DEPLOYMENT_REJECTED, &facts.run_ref, payload);
+    let draft = run_aggregate_draft(CI_DEPLOYMENT_REJECTED, &facts.run_ref, payload)?;
     ctx.emit(draft, None)?;
     Ok(())
 }
@@ -599,19 +627,30 @@ enum GateOutcome {
 /// Build an `EventDraft` on the `ci/run/<run>` aggregate (the run-lifecycle / deployment events).
 /// Controller-classed (the FACT that a run reached a verdict is platform metadata), Internal-visible
 /// (it drives the repo's members' run view), PII-free (references-not-payloads).
-fn run_aggregate_draft(type_: &str, run_ref: &str, payload: serde_json::Value) -> EventDraft {
-    let subject = ArtifactRef(format!("ci/run/{run_ref}"));
-    let aggregate = myelin_events::AggregateKey(format!("ci/run/{run_ref}"));
-    EventDraft {
+fn run_aggregate_draft(
+    type_: &str,
+    run_ref: &str,
+    payload: serde_json::Value,
+) -> WfResult<EventDraft> {
+    let parsed = myelin_refs::parse_scoped(run_ref)
+        .map_err(|_| myelin_flow::WfError::CoCommit("invalid canonical CI run root".into()))?;
+    if parsed.subsystem != "ci" || parsed.type_ != "run" || parsed.sub.is_some() {
+        return Err(myelin_flow::WfError::CoCommit(
+            "invalid canonical CI run root".into(),
+        ));
+    }
+    let run_id = myelin_events::SubjectComponent::parse(&parsed.id)
+        .map_err(|_| myelin_flow::WfError::CoCommit("invalid canonical CI run root".into()))?;
+    Ok(EventDraft {
         type_: EventType(type_.to_string()),
-        subject,
-        aggregate,
+        subject: parsed.artifact_ref,
+        aggregate: myelin_events::AggregateKey(format!("run:{}", run_id.as_str())),
         payload,
         data_role: DataRole::Controller,
         visibility: Visibility::Internal,
         contains_personal_data: false,
         pii_key_ref: None,
-    }
+    })
 }
 
 #[cfg(test)]

@@ -40,6 +40,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use myelin_ci_controlplane::ci_pipeline::{run_ci_pipeline_body, CheckFacts, PipelineRun};
 use myelin_ci_controlplane::{ci_durable_migrations, ci_run_store_factory};
 use myelin_ci_dispatch::{
     build_dispatch_consumers, plan_dispatch, ArmedRun, AuthoritativeGitRoot, CiTriggerHandler,
@@ -49,11 +50,13 @@ use myelin_ci_dispatch::{
 use myelin_events::consumer::{Consumer, Delivered, Message, Subscription};
 use myelin_events::{
     Actor, ConsumerName, CorrelationId, DataRole, DedupLedger, DurableDedup, EventEnvelope, EventId,
-    EventType, HandlerTx, OutboxStore, PrefetchBound, Timestamp, UlidMinter, Visibility,
+    EmitContextBase, EventType, HandlerTx, OutboxStore, PrefetchBound, Timestamp, UlidMinter,
+    Visibility,
     CONSUMER_DEDUP_MIGRATION, OUTBOX_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_git::receive_pack::{GitRefEventKey, RefName};
+use myelin_flow::{ActivityError, JobRunner, JobSpec, WfCtx, WfJournal};
 use myelin_storage::events_durable::{DurableDeadLetterBacking, DurableDedupBacking};
 use myelin_storage::outbox_durable::PgOutboxBacking;
 use myelin_storage::{BlobStore, FsBlobStore};
@@ -72,6 +75,14 @@ fn admin_url() -> String {
 fn uniq() -> u64 {
     static N: AtomicU64 = AtomicU64::new(0);
     N.fetch_add(1, Ordering::SeqCst)
+}
+
+struct UnusedRunner;
+
+impl JobRunner for UnusedRunner {
+    fn dispatch(&self, _spec: &JobSpec) -> Result<(), ActivityError> {
+        panic!("the empty terminal round-trip must not dispatch a job")
+    }
 }
 
 /// A per-(pid, counter) schema so each test isolates its tables (never another test's rows).
@@ -562,9 +573,67 @@ async fn chunk4_production_cocommit_row_with_mark_events_absorb() {
     assert_eq!(row.get::<String, _>("trust_tier"), "trusted", "a member push is trusted");
     assert_eq!(row.get::<String, _>("trigger_kind"), "push");
     assert_eq!(row.get::<String, _>("correlation_id"), format!("corr-{}", "ev-chunk4-1"));
-    assert_eq!(row.get::<String, _>("repo_ref"), repo);
+    let persisted_repo = row.get::<String, _>("repo_ref");
+    assert_eq!(persisted_repo, format!("myelin://acme/git/repo/{repo}"));
+    let parsed_repo = myelin_refs::parse_scoped(&persisted_repo)
+        .expect("the dispatch-persisted repo_ref is accepted by the terminal pipeline");
+    assert_eq!((parsed_repo.subsystem.as_str(), parsed_repo.type_.as_str()), ("git", "repo"));
+    assert!(parsed_repo.sub.is_none(), "the pipeline requires a repository root");
     assert_eq!(row.get::<String, _>("commit_oid"), oid);
     assert_eq!(row.get::<String, _>("triggered_by"), "pusher");
+
+    // Feed the values actually written by dispatch back through the terminal pipeline. This proves
+    // the DB handoff, not just the individual parsers: the terminal lifecycle event must reuse the
+    // exact canonical subject and aggregate emitted by `ci.run.started`.
+    let started = sqlx::query(
+        "SELECT subject, aggregate FROM outbox WHERE envelope->>'type_' = 'ci.run.started'",
+    )
+    .fetch_one(&p)
+    .await
+    .unwrap();
+    let started_subject = started.get::<String, _>("subject");
+    let started_aggregate = started.get::<String, _>("aggregate");
+    let terminal_outbox = OutboxStore::new();
+    let mut wf = WfCtx::begin(
+        &terminal_outbox,
+        Arc::new(UlidMinter::new()),
+        WfJournal::new(),
+        EmitContextBase {
+            tenant: TenantId("acme".into()),
+            region: Region("fr-par".into()),
+            actor: Actor(principal()),
+            schema_ver: 1,
+            occurred_at: Timestamp("2026-07-16T00:00:00Z".into()),
+            recorded_at: Timestamp("2026-07-16T00:00:00Z".into()),
+            caused_by: None,
+        },
+        &run_id,
+        myelin_ci_controlplane::ci_pipeline::CI_PIPELINE_WF_TYPE,
+        "2026-07-16T00:00:00Z",
+        7,
+    );
+    let terminal_run = PipelineRun {
+        stages: Vec::new(),
+        contexts: Vec::new(),
+        facts: CheckFacts {
+            repo: persisted_repo,
+            commit_oid: oid.into(),
+            run_ref: started_subject.clone(),
+            run_attempt: 1,
+            trust_tier: "trusted".into(),
+            merge_idem_token: "round-trip".into(),
+        },
+    };
+    run_ci_pipeline_body(&mut wf, &terminal_run, &UnusedRunner)
+        .expect("dispatch-persisted facts reach terminal emission");
+    wf.commit().expect("terminal facts commit");
+    let terminal = terminal_outbox
+        .committed_rows()
+        .into_iter()
+        .find(|event| event.envelope.type_.0 == "ci.run.succeeded")
+        .expect("terminal lifecycle event");
+    assert_eq!(terminal.envelope.subject.0, started_subject);
+    assert_eq!(terminal.aggregate.0, started_aggregate);
 
     // Delivery 2 (same event_id): DEDUPLICATED — the handler does not re-run; the ON CONFLICT + absorb
     // guarantee 0 duplicates even if it had.
