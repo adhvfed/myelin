@@ -204,7 +204,10 @@ async fn main() {
     // bookend. CT-004m resolved the former `cost_event` table-name collision (CI's table is now
     // `ci_cost_event`, created by the shared `ci_durable_migrations` applied above). Building it only
     // wraps the pool — no query runs at boot.
-    let _ci_cost_events = myelin_ci_controlplane::ci_cost_event_store(provider.db_pool().clone());
+    let _ci_cost_events = myelin_ci_controlplane::ci_cost_event_store(
+        provider.db_pool().clone(),
+        myelin_tenancy::Region(provider.config().region.clone()),
+    );
     // CT-004c.1: construct the REAL durable `job_queue` store + spawn the dead-runner reaper loop onto
     // the serve runtime (minimal-impact wiring — a bounded background task hung off the existing
     // lifecycle, NOT a new AppSpec schema field). The `job_queue` table the reaper sweeps is created

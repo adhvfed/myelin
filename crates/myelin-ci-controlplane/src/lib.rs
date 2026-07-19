@@ -683,8 +683,8 @@ pub fn run_controlplane(
 /// BOTH CI service mains at boot). **CT-004d** remains the follow-on that DRIVES a live settle through
 /// this store (attaching it to the dispatch settle bookend with a tenant-scoped tx for the FORCE-RLS
 /// `ci_cost_event` table) — the SCHEMA it writes to is now sound.
-pub fn ci_cost_event_store(pool: sqlx::PgPool) -> CiCostEventStore {
-    CiCostEventStore::with_pg(pool)
+pub fn ci_cost_event_store(pool: sqlx::PgPool, region: myelin_tenancy::Region) -> CiCostEventStore {
+    CiCostEventStore::with_pg(pool, region)
 }
 
 /// **Construct the durable CI `job_queue` store at the composition root (CT-004c.1).** The service
