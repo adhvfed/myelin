@@ -132,6 +132,31 @@ pub trait EventPublisher: Send + Sync {
     ) -> std::result::Result<Delivery, TransportError>;
 }
 
+/// The narrow pull + explicit-ack broker seam used by event consumers.
+///
+/// This is deliberately separate from [`EventPublisher`]: a service that consumes from a shared
+/// stream must not acquire relay/publish ownership as a side effect of registering its intake.
+/// Unlike the legacy consumer methods on [`BusTransport`], failures are explicit so a production
+/// lifecycle can make readiness reflect whether it can currently receive and acknowledge work.
+pub trait EventConsumer: Send + Sync {
+    /// Pull one bounded batch from the durable consumer.
+    fn consume(
+        &self,
+        subject_prefix: &str,
+    ) -> std::result::Result<Vec<EventEnvelope>, TransportError>;
+
+    /// Explicitly acknowledge one terminal delivery.
+    fn ack(&self, consumer: &str, event_id: &EventId) -> std::result::Result<(), TransportError>;
+
+    /// Negatively acknowledge a retryable delivery with a bounded server-side delay.
+    fn retry(
+        &self,
+        consumer: &str,
+        event_id: &EventId,
+        delay_secs: u64,
+    ) -> std::result::Result<(), TransportError>;
+}
+
 impl<T: BusTransport + ?Sized> EventPublisher for T {
     fn publish(
         &self,
