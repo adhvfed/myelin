@@ -33,7 +33,7 @@ use async_nats::jetstream::stream::{
 use async_nats::jetstream::{self, AckKind, Context};
 use futures::StreamExt;
 
-use crate::relay::{BusTransport, Delivery, EventPublisher, TransportError};
+use crate::relay::{BrokerDelivery, BusTransport, Delivery, EventPublisher, TransportError};
 use crate::{ArtifactRef, EventEnvelope, EventId};
 
 /// Explicit capacity and durability policy for the shared production event stream.
@@ -576,7 +576,7 @@ impl NatsJetStreamBus {
         tokio::task::block_in_place(|| self.rt.block_on(fut))
     }
 
-    fn try_consume(&self) -> Result<Vec<EventEnvelope>, TransportError> {
+    fn try_consume(&self) -> Result<Vec<BrokerDelivery>, TransportError> {
         let consumer_name = self.consumer_name.clone();
         let stream_name = self.stream_name.clone();
         let msgs: Vec<jetstream::Message> = self.block(async {
@@ -615,8 +615,19 @@ impl NatsJetStreamBus {
                     msg.subject, expected_subject
                 )));
             }
+            let delivery_attempt = msg
+                .info()
+                .map_err(|e| TransportError(format!("read JetStream delivery metadata: {e}")))?
+                .delivered;
+            let delivery_attempt = u64::try_from(delivery_attempt)
+                .ok()
+                .filter(|attempt| *attempt > 0)
+                .ok_or_else(|| TransportError("invalid JetStream delivery attempt count".into()))?;
             pending.insert(envelope.event_id.0.clone(), msg);
-            decoded.push(envelope);
+            decoded.push(BrokerDelivery {
+                envelope,
+                delivery_attempt,
+            });
         }
         Ok(decoded)
     }
@@ -655,6 +666,24 @@ impl NatsJetStreamBus {
             msg.ack_with(AckKind::Nak(Some(delay)))
                 .await
                 .map_err(|e| TransportError(format!("NAK event {}: {e}", event_id.0)))
+        })
+    }
+
+    fn try_terminate(&self, event_id: &EventId) -> Result<(), TransportError> {
+        let msg = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.remove(&event_id.0)
+        }
+        .ok_or_else(|| {
+            TransportError(format!(
+                "no pending JetStream delivery for event {}",
+                event_id.0
+            ))
+        })?;
+        self.block(async {
+            msg.ack_with(AckKind::Term)
+                .await
+                .map_err(|e| TransportError(format!("TERM event {}: {e}", event_id.0)))
         })
     }
 }
@@ -775,7 +804,11 @@ impl BusTransport for NatsJetStreamBus {
         // stashed keyed by event_id so `ack` can ack exactly the delivered message (explicit
         // ack). Returns the decoded envelopes in delivery order. A pull with no messages within
         // the short expiry returns empty (a clean "nothing to consume right now").
-        self.try_consume().unwrap_or_default()
+        self.try_consume()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|delivery| delivery.envelope)
+            .collect()
     }
 
     fn ack(&self, _consumer: &str, event_id: &EventId) {
@@ -802,7 +835,7 @@ impl BusTransport for NatsJetStreamBus {
 }
 
 impl crate::relay::EventConsumer for NatsJetStreamBus {
-    fn consume(&self, _subject_prefix: &str) -> Result<Vec<EventEnvelope>, TransportError> {
+    fn consume(&self, _subject_prefix: &str) -> Result<Vec<BrokerDelivery>, TransportError> {
         self.try_consume()
     }
 
@@ -817,5 +850,9 @@ impl crate::relay::EventConsumer for NatsJetStreamBus {
         delay_secs: u64,
     ) -> Result<(), TransportError> {
         self.try_retry(event_id, delay_secs)
+    }
+
+    fn terminate(&self, _consumer: &str, event_id: &EventId) -> Result<(), TransportError> {
+        self.try_terminate(event_id)
     }
 }

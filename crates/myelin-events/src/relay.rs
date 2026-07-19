@@ -143,7 +143,7 @@ pub trait EventConsumer: Send + Sync {
     fn consume(
         &self,
         subject_prefix: &str,
-    ) -> std::result::Result<Vec<EventEnvelope>, TransportError>;
+    ) -> std::result::Result<Vec<BrokerDelivery>, TransportError>;
 
     /// Explicitly acknowledge one terminal delivery.
     fn ack(&self, consumer: &str, event_id: &EventId) -> std::result::Result<(), TransportError>;
@@ -155,6 +155,22 @@ pub trait EventConsumer: Send + Sync {
         event_id: &EventId,
         delay_secs: u64,
     ) -> std::result::Result<(), TransportError>;
+
+    /// Stop broker redelivery after the application durably quarantined an exhausted retry.
+    fn terminate(
+        &self,
+        consumer: &str,
+        event_id: &EventId,
+    ) -> std::result::Result<(), TransportError>;
+}
+
+/// One durable broker delivery plus the server-observed delivery attempt count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrokerDelivery {
+    pub envelope: EventEnvelope,
+    /// One-based JetStream delivery count. The application retry ceiling uses this metadata;
+    /// it is never inferred from volatile process state, so restarts do not reset the budget.
+    pub delivery_attempt: u64,
 }
 
 impl<T: BusTransport + ?Sized> EventPublisher for T {

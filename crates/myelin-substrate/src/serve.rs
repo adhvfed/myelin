@@ -189,7 +189,9 @@ impl Default for OutboxSpec {
 trait RunnableConsumer: Send + Sync {
     fn name(&self) -> ConsumerName;
     fn accepts(&self, subject: &str) -> bool;
+    fn is_handled(&self, event_id: &myelin_events::EventId) -> bool;
     fn deliver(&self, msg: &Message) -> Delivered;
+    fn dead_letter_exhausted_retry(&self, msg: &Message, delivery_attempt: u64) -> Delivered;
     fn lag(&self) -> u64;
 }
 
@@ -200,8 +202,14 @@ impl<H: EventHandler + Send + Sync> RunnableConsumer for Consumer<H> {
     fn accepts(&self, subject: &str) -> bool {
         Consumer::accepts(self, subject)
     }
+    fn is_handled(&self, event_id: &myelin_events::EventId) -> bool {
+        Consumer::is_handled(self, event_id)
+    }
     fn deliver(&self, msg: &Message) -> Delivered {
         Consumer::deliver(self, msg)
+    }
+    fn dead_letter_exhausted_retry(&self, msg: &Message, delivery_attempt: u64) -> Delivered {
+        Consumer::dead_letter_exhausted_retry(self, msg, delivery_attempt)
     }
     fn lag(&self) -> u64 {
         Consumer::lag(self)
@@ -231,8 +239,17 @@ impl ConsumerReg {
         self.inner.deliver(msg)
     }
 
+    fn dead_letter_exhausted_retry(&self, msg: &Message, delivery_attempt: u64) -> Delivered {
+        self.inner
+            .dead_letter_exhausted_retry(msg, delivery_attempt)
+    }
+
     fn accepts(&self, subject: &str) -> bool {
         self.inner.accepts(subject)
+    }
+
+    fn is_handled(&self, event_id: &myelin_events::EventId) -> bool {
+        self.inner.is_handled(event_id)
     }
 
     fn lag(&self) -> u64 {
@@ -556,6 +573,11 @@ pub struct ServeHandle {
 /// hold a concrete `Relay<RelayTransport>`). EB-04's adapter implements the same `BusTransport`.
 type RelayTransport = Box<dyn BusTransport>;
 
+/// Application retry ceiling. JetStream itself keeps unlimited redelivery so a final unacked
+/// attempt is never stranded; at this count the consumer must durably record its DLQ reference
+/// before the pump sends `TERM`.
+pub const MAX_CONSUMER_DELIVERIES: u64 = 20;
+
 impl ServeHandle {
     /// The booted service name.
     pub fn name(&self) -> &'static str {
@@ -669,7 +691,15 @@ impl ServeHandle {
                 }
             }
         } else if let Some(relay) = &self.relay {
-            relay.transport().consume("")
+            relay
+                .transport()
+                .consume("")
+                .into_iter()
+                .map(|envelope| myelin_events::BrokerDelivery {
+                    envelope,
+                    delivery_attempt: 1,
+                })
+                .collect()
         } else {
             self.telemetry.observe(&self.outbox, &self.consumers);
             return Vec::new();
@@ -680,7 +710,8 @@ impl ServeHandle {
             .iter()
             .map(|consumer| (consumer.name(), 0))
             .collect();
-        for env in batch {
+        for delivery in batch {
+            let env = delivery.envelope;
             let matching: Vec<usize> = self
                 .consumers
                 .iter()
@@ -698,21 +729,53 @@ impl ServeHandle {
 
             let consumer_name = self.consumers[matching[0]].name();
             let mut terminal = true;
+            let mut exhausted = false;
             let mut retry_after_secs = None;
             for index in matching {
                 let msg = Message {
                     subject: env.subject.0.clone(),
                     envelope: env.clone(),
                 };
-                match self.consumers[index].deliver(&msg) {
+                let retry_budget_already_exhausted = delivery.delivery_attempt
+                    > MAX_CONSUMER_DELIVERIES
+                    && !self.consumers[index].is_handled(&env.event_id);
+                let outcome = if retry_budget_already_exhausted {
+                    // A prior attempt already ran the handler and exhausted its budget. Retry only
+                    // the durable quarantine write; never execute the failing handler again.
+                    self.consumers[index]
+                        .dead_letter_exhausted_retry(&msg, delivery.delivery_attempt)
+                } else {
+                    self.consumers[index].deliver(&msg)
+                };
+                match outcome {
                     Delivered::Acked | Delivered::Deduplicated => delivered[index].1 += 1,
-                    Delivered::DeadLettered(_) => {}
+                    Delivered::DeadLettered(_) => {
+                        if retry_budget_already_exhausted {
+                            exhausted = true;
+                        }
+                    }
                     Delivered::Retried(delay_secs) => {
-                        terminal = false;
-                        retry_after_secs = Some(
-                            retry_after_secs
-                                .map_or(delay_secs, |current: u64| current.max(delay_secs)),
-                        );
+                        if delivery.delivery_attempt >= MAX_CONSUMER_DELIVERIES {
+                            match self.consumers[index]
+                                .dead_letter_exhausted_retry(&msg, delivery.delivery_attempt)
+                            {
+                                Delivered::DeadLettered(_) => exhausted = true,
+                                Delivered::Retried(dlq_retry_secs) => {
+                                    terminal = false;
+                                    retry_after_secs = Some(retry_after_secs.map_or(
+                                        dlq_retry_secs,
+                                        |current: u64| current.max(dlq_retry_secs),
+                                    ));
+                                }
+                                _ => unreachable!("retry exhaustion returns DLQ or Retry"),
+                            }
+                        } else {
+                            terminal = false;
+                            retry_after_secs = Some(
+                                retry_after_secs
+                                    .map_or(delay_secs, |current: u64| current.max(delay_secs)),
+                            );
+                        }
                     }
                     Delivered::Throttled(_) => {
                         terminal = false;
@@ -723,9 +786,14 @@ impl ServeHandle {
 
             if terminal {
                 if let Some(transport) = &self.consumer_transport {
-                    if let Err(error) = transport.ack(&consumer_name.0, &env.event_id) {
+                    let result = if exhausted {
+                        transport.terminate(&consumer_name.0, &env.event_id)
+                    } else {
+                        transport.ack(&consumer_name.0, &env.event_id)
+                    };
+                    if let Err(error) = result {
                         eprintln!(
-                            "[{}] broker ack failed for event {}: {}",
+                            "[{}] broker terminal acknowledgement failed for event {}: {}",
                             self.name, env.event_id.0, error.0
                         );
                         self.health_probe().mark_down("broker");
@@ -1053,10 +1121,11 @@ mod tests {
 
     #[derive(Default)]
     struct PullProbeState {
-        batches: VecDeque<Vec<EventEnvelope>>,
+        batches: VecDeque<Vec<myelin_events::BrokerDelivery>>,
         pulls: usize,
         acks: Vec<EventId>,
         retries: Vec<EventId>,
+        terms: Vec<EventId>,
         fail_ack: bool,
     }
 
@@ -1064,7 +1133,18 @@ mod tests {
         fn with_batches(batches: impl IntoIterator<Item = Vec<EventEnvelope>>) -> Self {
             Self {
                 state: Arc::new(Mutex::new(PullProbeState {
-                    batches: batches.into_iter().collect(),
+                    batches: batches
+                        .into_iter()
+                        .map(|batch| {
+                            batch
+                                .into_iter()
+                                .map(|envelope| myelin_events::BrokerDelivery {
+                                    envelope,
+                                    delivery_attempt: 1,
+                                })
+                                .collect()
+                        })
+                        .collect(),
                     ..Default::default()
                 })),
             }
@@ -1073,13 +1153,27 @@ mod tests {
         fn state(&self) -> std::sync::MutexGuard<'_, PullProbeState> {
             self.state.lock().unwrap_or_else(|error| error.into_inner())
         }
+
+        fn with_delivery(envelope: EventEnvelope, delivery_attempt: u64) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(PullProbeState {
+                    batches: [vec![myelin_events::BrokerDelivery {
+                        envelope,
+                        delivery_attempt,
+                    }]]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                })),
+            }
+        }
     }
 
     impl EventConsumer for PullProbe {
         fn consume(
             &self,
             _subject_prefix: &str,
-        ) -> Result<Vec<EventEnvelope>, myelin_events::TransportError> {
+        ) -> Result<Vec<myelin_events::BrokerDelivery>, myelin_events::TransportError> {
             let mut state = self.state();
             state.pulls += 1;
             Ok(state.batches.pop_front().unwrap_or_default())
@@ -1105,6 +1199,15 @@ mod tests {
             _delay_secs: u64,
         ) -> Result<(), myelin_events::TransportError> {
             self.state().retries.push(event_id.clone());
+            Ok(())
+        }
+
+        fn terminate(
+            &self,
+            _consumer: &str,
+            event_id: &EventId,
+        ) -> Result<(), myelin_events::TransportError> {
+            self.state().terms.push(event_id.clone());
             Ok(())
         }
     }
@@ -1139,6 +1242,85 @@ mod tests {
                 .unwrap(),
             DedupLedger::new(),
         ))
+    }
+
+    #[derive(Clone, Default)]
+    struct DlqProbe {
+        records: Arc<Mutex<Vec<myelin_events::DeadLetterRecord>>>,
+        fail_next: Arc<AtomicU32>,
+    }
+
+    impl myelin_events::DurableDeadLetter for DlqProbe {
+        fn record(
+            &self,
+            consumer: &ConsumerName,
+            event_id: &EventId,
+            reason: &str,
+        ) -> Result<(), String> {
+            if self
+                .fail_next
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    if left > 0 { Some(left - 1) } else { None }
+                })
+                .is_ok()
+            {
+                return Err("DLQ unavailable".into());
+            }
+            self.records
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(myelin_events::DeadLetterRecord {
+                    consumer: consumer.clone(),
+                    event_id: event_id.clone(),
+                    reason: reason.into(),
+                });
+            Ok(())
+        }
+
+        fn dead_letters(&self, consumer: &ConsumerName) -> Vec<myelin_events::DeadLetterRecord> {
+            self.records
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .filter(|record| &record.consumer == consumer)
+                .cloned()
+                .collect()
+        }
+    }
+
+    fn always_retry_consumer(
+        dedup: DedupLedger,
+        dlq: DlqProbe,
+    ) -> (ConsumerReg, Arc<AtomicU32>) {
+        struct H(Arc<AtomicU32>);
+        impl EventHandler for H {
+            fn subjects(&self) -> &'static [SubjectPattern] {
+                SUBJECTS
+            }
+            fn handle(
+                &self,
+                _event: &EventEnvelope,
+                _tx: &mut myelin_events::HandlerTx<'_>,
+            ) -> HandleOutcome {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                HandleOutcome::Retry(Backoff { seconds: 2 })
+            }
+        }
+        let calls = Arc::new(AtomicU32::new(0));
+        let consumer = ConsumerReg::new(
+            Consumer::new(
+                H(calls.clone()),
+                Subscription::bind(
+                    ConsumerName("retrying".into()),
+                    &["myelin://acme/issues/"],
+                    PrefetchBound::DEFAULT,
+                )
+                .unwrap(),
+                dedup,
+            )
+            .with_dead_letter_sink(myelin_events::DeadLetterSink::durable(Arc::new(dlq))),
+        );
+        (consumer, calls)
     }
 
     fn external_consumer_spec(probe: PullProbe, consumers: Vec<ConsumerReg>) -> AppSpec {
@@ -1351,6 +1533,110 @@ mod tests {
         handle.tick();
 
         assert!(!handle.metrics_health().readiness().is_ready());
+    }
+
+    #[test]
+    fn exhausted_retry_persists_dlq_then_terms_without_dedup_and_replay_can_execute() {
+        let event = event_for_transport();
+        let event_id = event.event_id.clone();
+        let probe = PullProbe::with_delivery(event.clone(), MAX_CONSUMER_DELIVERIES);
+        let dlq = DlqProbe::default();
+        let dedup = DedupLedger::new();
+        let (consumer, calls) = always_retry_consumer(dedup.clone(), dlq.clone());
+        let handle = boot(external_consumer_spec(
+            probe.clone(),
+            vec![consumer],
+        ))
+        .unwrap();
+
+        handle.tick();
+
+        let records = dlq
+            .records
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event_id, event_id);
+        assert_eq!(probe.state().terms, vec![event_id.clone()]);
+        assert!(probe.state().acks.is_empty());
+        assert_eq!(dedup.len(), 0, "retry exhaustion writes no dedup tombstone");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        struct Repaired;
+        impl EventHandler for Repaired {
+            fn subjects(&self) -> &'static [SubjectPattern] {
+                SUBJECTS
+            }
+            fn handle(
+                &self,
+                _event: &EventEnvelope,
+                _tx: &mut myelin_events::HandlerTx<'_>,
+            ) -> HandleOutcome {
+                HandleOutcome::Done
+            }
+        }
+        let repaired = Consumer::new(
+            Repaired,
+            Subscription::bind(
+                ConsumerName("retrying".into()),
+                &["myelin://acme/issues/"],
+                PrefetchBound::DEFAULT,
+            )
+            .unwrap(),
+            dedup.clone(),
+        );
+        assert_eq!(
+            repaired.deliver(&Message {
+                subject: event.subject.0.clone(),
+                envelope: event,
+            }),
+            Delivered::Acked,
+            "operator replay executes once after the backend is repaired"
+        );
+        assert_eq!(dedup.len(), 1);
+    }
+
+    #[test]
+    fn exhausted_retry_naks_when_durable_dlq_write_fails() {
+        let event = event_for_transport();
+        let event_id = event.event_id.clone();
+        let probe = PullProbe::with_delivery(event.clone(), MAX_CONSUMER_DELIVERIES);
+        probe
+            .state()
+            .batches
+            .push_back(vec![myelin_events::BrokerDelivery {
+                envelope: event,
+                delivery_attempt: MAX_CONSUMER_DELIVERIES + 1,
+            }]);
+        let dlq = DlqProbe::default();
+        dlq.fail_next.store(1, Ordering::SeqCst);
+        let (consumer, calls) = always_retry_consumer(DedupLedger::new(), dlq);
+        let handle = boot(external_consumer_spec(
+            probe.clone(),
+            vec![consumer],
+        ))
+        .unwrap();
+
+        handle.tick();
+
+        assert!(probe.state().terms.is_empty());
+        assert_eq!(probe.state().retries, vec![event_id.clone()]);
+        assert_eq!(handle.telemetry().consumer_lag("retrying"), Some(1));
+
+        handle.tick();
+
+        assert_eq!(probe.state().terms, vec![event_id]);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "attempts beyond the ceiling retry only the quarantine write"
+        );
+        assert_eq!(
+            handle.telemetry().consumer_lag("retrying"),
+            Some(0),
+            "the successful quarantine clears the one pending entry without phantom lag"
+        );
     }
 
     #[test]
