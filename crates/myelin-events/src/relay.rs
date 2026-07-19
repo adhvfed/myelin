@@ -168,7 +168,21 @@ pub trait EventConsumer: Send + Sync {
 /// Opaque process-local identity for one raw broker delivery handle. It is deliberately unrelated
 /// to `event_id`: duplicate ids and undecodable payloads must still settle independently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DeliveryToken(pub u64);
+pub struct DeliveryToken(u64);
+
+impl DeliveryToken {
+    /// Construct a non-zero adapter-owned delivery token.
+    ///
+    /// Application consumers must treat this value as opaque. Transport adapters are responsible
+    /// for assigning a distinct token to every simultaneously live raw delivery.
+    pub const fn new(value: u64) -> Option<Self> {
+        if value == 0 {
+            None
+        } else {
+            Some(Self(value))
+        }
+    }
+}
 
 /// Stable, payload-free JetStream identity suitable for durable quarantine idempotency.
 #[derive(Clone, Debug, PartialEq, Eq)]
