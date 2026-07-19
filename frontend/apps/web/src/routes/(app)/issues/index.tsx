@@ -29,6 +29,7 @@ import {
   getIssues,
   issuesMutate,
   type IssueCreateReceipt,
+  type IssueErrorKind,
   type IssueListState,
   type IssuesPage,
   type IssueVM,
@@ -68,7 +69,6 @@ export default function IssuesIndex() {
   const [loadMoreError, setLoadMoreError] = createSignal(false);
   const [pending, setPending] = createSignal<PendingIssue[]>([]);
   const [activeRow, setActiveRow] = createSignal(0);
-  const rowElements: (HTMLAnchorElement | undefined)[] = [];
   const pollControllers: AbortController[] = [];
   onCleanup(() => pollControllers.forEach((controller) => controller.abort()));
 
@@ -79,23 +79,28 @@ export default function IssuesIndex() {
     setExtraPages([]);
     setLoadMoreError(false);
     setActiveRow(0);
-    rowElements.length = 0;
   });
 
-  const firstPage = createAsync(async () => {
-    if (invalidUrlKey()) throw new Error("ISSUE_ERR:bad-input");
-    return getIssues({ state: state(), key: key(), limit: 50 });
+  const firstPage = createAsync(async (): Promise<{
+    page: IssuesPage | null;
+    error: IssueErrorKind | null;
+  }> => {
+    if (invalidUrlKey()) return { page: null, error: "bad-input" };
+    try {
+      return {
+        page: await getIssues({ state: state(), key: key(), limit: 50 }),
+        error: null,
+      };
+    } catch (error) {
+      return { page: null, error: issueErrorKind(error) };
+    }
   });
-  const rows = createMemo(() => mergeIssuePages(firstPage(), extraPages()));
-  createEffect(() => {
-    rows();
-    setActiveRow(0);
-  });
+  const rows = createMemo(() => mergeIssuePages(firstPage()?.page ?? undefined, extraPages()));
   const nextCursor = () => {
     const pages = extraPages();
     return pages.length
       ? pages[pages.length - 1]?.page.next_cursor ?? null
-      : firstPage()?.page.next_cursor ?? null;
+      : firstPage()?.page?.page.next_cursor ?? null;
   };
   const visiblePending = () => pending().filter((receipt) => {
     if (state() === "closed") return false;
@@ -132,27 +137,33 @@ export default function IssuesIndex() {
     }
   };
 
-  const focusRow = (index: number) => {
-    const count = rows().length;
+  const focusRow = (index: number, elements: HTMLAnchorElement[]) => {
+    const count = elements.length;
     if (!count) return;
     const next = ((index % count) + count) % count;
     setActiveRow(next);
-    rowElements[next]?.focus();
+    elements[next]?.focus();
   };
 
   const onListKeyDown = (event: KeyboardEvent) => {
+    const current = event.currentTarget as HTMLAnchorElement;
+    const elements = Array.from(
+      current.closest(".issues-list")?.querySelectorAll<HTMLAnchorElement>("[data-testid='issue-row']") ?? [],
+    );
+    const index = elements.indexOf(current);
+    if (index < 0) return;
     if (event.key === "ArrowDown" || event.key === "j") {
       event.preventDefault();
-      focusRow(activeRow() + 1);
+      focusRow(index + 1, elements);
     } else if (event.key === "ArrowUp" || event.key === "k") {
       event.preventDefault();
-      focusRow(activeRow() - 1);
+      focusRow(index - 1, elements);
     } else if (event.key === "Home") {
       event.preventDefault();
-      focusRow(0);
+      focusRow(0, elements);
     } else if (event.key === "End") {
       event.preventDefault();
-      focusRow(rows().length - 1);
+      focusRow(elements.length - 1, elements);
     }
   };
 
@@ -282,7 +293,7 @@ export default function IssuesIndex() {
 
       <ErrorBoundary fallback={(error) => <IssuesListError kind={issueErrorKind(error)} clear={() => navigate("/issues")} />}>
         <Suspense fallback={<IssuesSkeleton />}>
-          <Show when={firstPage()}>
+          <Show when={firstPage()?.error} fallback={<Show when={firstPage()?.page}>
             <Show
               when={rows().length > 0}
               fallback={<IssuesEmpty filtered={Boolean(key()) || state() !== "open"} clear={() => navigate("/issues")} create={openCreate} />}
@@ -293,7 +304,6 @@ export default function IssuesIndex() {
                   <IssueRow
                     issue={issue}
                     active={activeRow() === index()}
-                    setRef={(element) => { rowElements[index()] = element; }}
                     onFocus={() => setActiveRow(index())}
                     onKeyDown={onListKeyDown}
                   />
@@ -310,6 +320,8 @@ export default function IssuesIndex() {
                 </div>
               </Show>
             </Show>
+          </Show>}>
+            {(kind) => <IssuesListError kind={kind()} clear={() => navigate("/issues")} />}
           </Show>
         </Suspense>
       </ErrorBoundary>
@@ -322,14 +334,12 @@ export default function IssuesIndex() {
 function IssueRow(props: {
   issue: IssueVM;
   active: boolean;
-  setRef: (element: HTMLAnchorElement) => void;
   onFocus: () => void;
   onKeyDown: (event: KeyboardEvent) => void;
 }) {
   return (
     <li>
       <A
-        ref={props.setRef}
         href={`/issues/${encodeURIComponent(props.issue.id)}`}
         class="issue-row"
         data-testid="issue-row"

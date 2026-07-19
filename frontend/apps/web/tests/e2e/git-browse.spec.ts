@@ -169,16 +169,6 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await expectNoAxeViolations(page, "commit log pager");
   });
 
-  test("an unbuilt subsystem index renders the teaching NotAvailable inside the shell", async ({ page }) => {
-    await devLogin(page);
-    await page.goto("/issues");
-    await expect(page.getByTestId("not-available")).toContainText("Issues");
-    await expect(page.getByTestId("not-available")).toContainText("here yet");
-    // Still inside the shell (the primary rail is present, not a bare 404).
-    await expect(page.getByRole("navigation", { name: "Primary" })).toBeVisible();
-    await expectNoAxeViolations(page, "subsystem NotAvailable");
-  });
-
   test("the catch-all route renders NotAvailable (not a raw framework 404)", async ({ page }) => {
     await devLogin(page);
     await page.goto("/this/path/does/not/exist");

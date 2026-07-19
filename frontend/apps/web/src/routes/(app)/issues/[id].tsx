@@ -20,8 +20,18 @@ export default function IssueDetail() {
   const [confirming, setConfirming] = createSignal(false);
   const [closing, setClosing] = createSignal(false);
   const [closeError, setCloseError] = createSignal<IssueErrorKind | null>(null);
-  const issue = createAsync(async () => params.id ? getIssue(params.id) : undefined);
-  const current = createMemo(() => replacement() ?? issue());
+  const issue = createAsync(async (): Promise<{
+    issue: IssueVM | null;
+    error: IssueErrorKind | null;
+  }> => {
+    if (!params.id) return { issue: null, error: "not-found" };
+    try {
+      return { issue: await getIssue(params.id), error: null };
+    } catch (error) {
+      return { issue: null, error: issueErrorKind(error) };
+    }
+  });
+  const current = createMemo(() => replacement() ?? issue()?.issue);
 
   const close = async () => {
     const row = current();
@@ -53,7 +63,7 @@ export default function IssueDetail() {
   return (
     <ErrorBoundary fallback={(error) => <IssueDetailError kind={issueErrorKind(error)} />}>
       <Suspense fallback={<IssueDetailSkeleton />}>
-        <Show when={current()}>
+        <Show when={issue()?.error} fallback={<Show when={current()}>
           {(row) => (
             <article class="issue-detail" aria-labelledby="issue-detail-heading">
               <Title>{row().key} · Issues · Myelin</Title>
@@ -99,6 +109,8 @@ export default function IssueDetail() {
               />
             </article>
           )}
+        </Show>}>
+          {(kind) => <IssueDetailError kind={kind()} />}
         </Show>
       </Suspense>
     </ErrorBoundary>

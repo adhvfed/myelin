@@ -233,6 +233,7 @@ export function AppShell(props: AppShellProps) {
       >
         {/* Header (spans both columns): brand · ⌘K trigger · residency cue · inbox · identity. */}
         <header
+          class="app-shell-header"
           style={{
             "grid-column": "1 / 3",
             display: "flex",
@@ -267,11 +268,11 @@ export function AppShell(props: AppShellProps) {
             }}
           >
             <Icon name="search" />
-            <span style={{ flex: "1" }}>Search or run a command</span>
-            <kbd style={{ "font-family": "var(--font-mono)", "font-size": "var(--fs-caption)" }}>⌘K</kbd>
+            <span class="cmdk-trigger-label" style={{ flex: "1" }}>Search or run a command</span>
+            <kbd class="cmdk-trigger-shortcut" style={{ "font-family": "var(--font-mono)", "font-size": "var(--fs-caption)" }}>⌘K</kbd>
           </button>
 
-          <div style={{ flex: "1" }} />
+          <div class="app-shell-header-spacer" style={{ flex: "1" }} />
 
           <ResidencyCue region={props.viewer.region} tenant={props.viewer.tenant} />
 
@@ -346,8 +347,8 @@ export function AppShell(props: AppShellProps) {
             triggerLabel={
               <span style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-2)" }}>
                 <Icon name="human" />
-                <span>{props.viewer.displayName}</span>
-                <Icon name="chevron" />
+                <span class="app-shell-account-name">{props.viewer.displayName}</span>
+                <span class="app-shell-account-chevron"><Icon name="chevron" /></span>
               </span>
             }
             items={identityItems}
@@ -530,7 +531,9 @@ function ResidencyCue(props: { region: string; tenant: string }) {
   // the operator always knows which residency region their data lives in (a sovereignty-as-UX cue).
   return (
     <span
+      class="residency-cue"
       title={`Tenant ${props.tenant}`}
+      aria-label={`Data region: ${props.region}; tenant ${props.tenant}`}
       style={{
         display: "inline-flex",
         "align-items": "center",
@@ -543,7 +546,7 @@ function ResidencyCue(props: { region: string; tenant: string }) {
       }}
     >
       <Icon name="database" />
-      <span>Data region:</span>
+      <span class="residency-cue-label">Data region:</span>
       <strong style={{ color: "var(--text-primary)" }}>{props.region}</strong>
     </span>
   );
