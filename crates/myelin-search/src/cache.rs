@@ -384,6 +384,13 @@ impl FilterCache {
         compute: impl FnOnce() -> ListObjectsResult,
     ) -> Result<ListObjectsResult, KmsError> {
         // GATE: a zookie-stamped strong read bypasses the cache entirely (no read, no write).
+        //
+        // NOTE: this is the `list_objects` FILTER cache, and it is deliberately NOT rebuild-fenced.
+        // It caches an authorization answer — which objects a subject may reach — which is a fact
+        // about Identity's grants, not about Search's index. A rebuild wipes the index; it does not
+        // change who may see what. Fencing this cache would add no safety and would stall every
+        // permission lookup for a tenant mid-rebuild. The RESULT cache below IS fenced, because that
+        // one caches index content.
         if should_bypass(at) {
             self.stats.record_bypass();
             return Ok(compute());
@@ -517,6 +524,13 @@ pub struct ResultCache {
     /// per-key lock (coalesce) rather than launching a second engine query.
     inflight: Mutex<HashMap<ResultKey, std::sync::Arc<Mutex<()>>>>,
     stats: CacheStats,
+    /// **The index-rebuild read gate** ([`crate::rebuild::RebuildReadGate`]).
+    ///
+    /// The result cache sits ABOVE the query pipeline, so the pipeline's fence does not protect it:
+    /// an entry sealed BEFORE a rebuild started is still live, still openable, and would be served
+    /// as a cache hit describing an index generation that has since been wiped. The fence has to be
+    /// applied here too, or it is not a fence.
+    rebuild_gate: Option<crate::rebuild::RebuildReadGate>,
 }
 
 impl ResultCache {
@@ -534,7 +548,15 @@ impl ResultCache {
             entries: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
             stats: CacheStats::new(),
+            rebuild_gate: None,
         }
+    }
+
+    /// **Wire the index-rebuild read gate** so a cached pre-rebuild answer cannot outlive the wipe
+    /// that invalidated it. See [`ResultCache::rebuild_gate`].
+    pub fn with_rebuild_gate(mut self, gate: crate::rebuild::RebuildReadGate) -> ResultCache {
+        self.rebuild_gate = Some(gate);
+        self
     }
 
     /// The cache's telemetry counters (consumed by SRCH-P14).
@@ -579,6 +601,17 @@ impl ResultCache {
         key_ref: &PiiKeyRef,
         compute: impl FnOnce() -> RankedResults,
     ) -> Result<RankedResults, KmsError> {
+        // **The REBUILD FENCE, ahead of every cache path.** A tenant mid-rebuild must not be served
+        // a cached answer computed against the wiped generation, and must not have the fail-empty
+        // marker SEALED INTO the cache either — that would outlive the rebuild and keep reporting
+        // "rebuilding" long after reads reopened. So: short-circuit before both the read and the
+        // write, and never touch the entry map while fenced.
+        if let Some(gate) = &self.rebuild_gate {
+            if !gate.admits_intake(tenant, region) {
+                return Ok(RankedResults::rebuilding());
+            }
+        }
+
         if should_bypass(at) {
             self.stats.record_bypass();
             return Ok(compute());
@@ -618,6 +651,12 @@ impl ResultCache {
         // We are the FIRST: compute once, seal, cache.
         self.stats.record_miss();
         let results = compute();
+        // Belt to the fence's braces: a rebuild that began between the gate check above and the
+        // compute would produce a fail-empty marker, and sealing THAT into the cache would keep
+        // reporting "rebuilding" after the rebuild finished. A refusal is never a cacheable answer.
+        if results.rebuilding {
+            return Ok(results);
+        }
         let plaintext = encode_results(&results);
         let (nonce, ciphertext) = seal_under_dek(&self.dek, key_ref, region, &plaintext)?;
         let now = self.clock.now_secs();
@@ -761,6 +800,9 @@ fn decode_results(bytes: &[u8]) -> RankedResults {
         hits,
         zookie,
         post_fetch_fields,
+        // A decoded entry is a real cached ANSWER. A fail-empty rebuild marker is never sealed into
+        // the cache (see `get_or_compute`), so decoding one back is not a reachable state.
+        rebuilding: false,
     }
 }
 
@@ -1137,6 +1179,7 @@ mod tests {
 
     fn ranked(docs: &[(&str, f32)], zookie: &str) -> RankedResults {
         RankedResults {
+            rebuilding: false,
             hits: docs
                 .iter()
                 .map(|(d, s)| RankedResult {

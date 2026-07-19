@@ -227,6 +227,7 @@ fn cdc_caches_crypto_shred_under_the_index_dek() {
         &bounded(5),
         &key_ref,
         || myelin_search::RankedResults {
+            rebuilding: false,
             hits: vec![],
             zookie: "z@5".into(),
             post_fetch_fields: vec![],

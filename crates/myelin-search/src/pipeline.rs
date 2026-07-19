@@ -203,6 +203,12 @@ pub struct ScopedEngine<'a, B: IndexBackend> {
     /// The frozen field schema the AST is compiled + validated against (the producer's `IndexSpec`
     /// facet declaration; the real per-subsystem schemas arrive M3/M4 — named floor).
     schema: FieldSchema,
+    /// **The index-rebuild read gate** ([`crate::rebuild::RebuildReadGate`]).
+    ///
+    /// `None` means no rebuild coordinator is wired and reads proceed — the pre-migration posture.
+    /// When wired, every query through this engine consults it FIRST: an index mid-rebuild is
+    /// incomplete, not small, and serving from it returns confidently wrong answers.
+    rebuild_gate: Option<crate::rebuild::RebuildReadGate>,
 }
 
 impl<'a, B: IndexBackend> ScopedEngine<'a, B> {
@@ -220,6 +226,32 @@ impl<'a, B: IndexBackend> ScopedEngine<'a, B> {
             tenant: tenant.into(),
             region: region.into(),
             schema,
+            rebuild_gate: None,
+        }
+    }
+
+    /// **Wire the index-rebuild read gate.**
+    ///
+    /// Without this the gate is decorative: the coordinator can journal a fenced phase all it likes
+    /// while the query path happily serves the half-rebuilt index underneath it. This is the call
+    /// that makes fail-empty real, so the composition root must make it — a query path that forgets
+    /// it is the failure mode the whole fence exists to prevent.
+    pub fn with_rebuild_gate(
+        mut self,
+        gate: crate::rebuild::RebuildReadGate,
+    ) -> ScopedEngine<'a, B> {
+        self.rebuild_gate = Some(gate);
+        self
+    }
+
+    /// The read mode for this engine's `(tenant, region)` — `Open` when no gate is wired.
+    pub fn read_mode(&self) -> crate::rebuild::ReadMode {
+        match &self.rebuild_gate {
+            None => crate::rebuild::ReadMode::Open,
+            Some(gate) => gate.read_mode(
+                &myelin_tenancy::TenantId(self.tenant.clone()),
+                &myelin_tenancy::Region(self.region.clone()),
+            ),
         }
     }
 
@@ -260,6 +292,28 @@ pub struct RankedResults {
     /// is never a stored/indexed artifact — Search indexed only the inputs). Carried verbatim from
     /// the compiled plan so the caller knows what post-fetch evaluation it still owes.
     pub post_fetch_fields: Vec<String>,
+    /// **The index for this tenant is REBUILDING, so `hits` is empty for that reason and no other.**
+    ///
+    /// This flag is the difference between two claims a caller must never conflate: "nothing
+    /// matched" and "I cannot answer yet". An empty result with `rebuilding = false` is an answer;
+    /// with `rebuilding = true` it is a refusal, and a UI or agent that renders it as "no results"
+    /// is reporting a fact it does not have. Callers MUST branch on it.
+    pub rebuilding: bool,
+}
+
+impl RankedResults {
+    /// The explicit fail-empty answer for a tenant whose index is mid-rebuild.
+    ///
+    /// No hits, no zookie (there is no consistency point to report — the index is being rebuilt),
+    /// and `rebuilding` set so the caller cannot mistake this for "nothing matched".
+    pub fn rebuilding() -> RankedResults {
+        RankedResults {
+            hits: Vec::new(),
+            zookie: String::new(),
+            post_fetch_fields: Vec::new(),
+            rebuilding: true,
+        }
+    }
 }
 
 /// **Page request** — the bounded window over the ranked results (the engine fetches `offset+limit`
@@ -794,6 +848,20 @@ fn query_consistent_with_vector<B: IndexBackend>(
         });
     }
 
+    // **STEP 0.1 — the REBUILD FENCE.** Placed here, above every other step, because this is the ONE
+    // funnel every public query entry (`query`, `query_consistent`, `semantic`, `hybrid`) reduces to
+    // — a fence applied per-entry would be a fence one new entry forgets.
+    //
+    // An index mid-rebuild has been wiped and is being replayed: it holds a prefix of the corpus,
+    // and every query against it returns a confident, wrong, partial answer. Fail EMPTY and say so,
+    // rather than serving what happens to be there. Note this returns `Ok` with the marker rather
+    // than `Err`: a rebuild is an expected operational state, not a failure, and callers that
+    // degrade gracefully on empty should not be forced through an error path — but they must read
+    // the marker to tell this from "nothing matched".
+    if !engine.read_mode().serves() {
+        return Ok(RankedResults::rebuilding());
+    }
+
     // **STEP 0.5 — the fail-static bypass decision (contract 4.10/1.10).** A zookie-stamped strong
     // read bypasses the fail-static cache (it must see a just-revoked grant); a default-consistency
     // read may degrade-not-cascade. Recorded for the fail-static ratio (1.8). The cache itself is
@@ -829,6 +897,7 @@ fn query_consistent_with_vector<B: IndexBackend>(
     if matches!(conjoined.acl, AclFilter::None) {
         // The viewer sees nothing of this type — short-circuit (the engine is never queried).
         return Ok(RankedResults {
+            rebuilding: false,
             hits: Vec::new(),
             zookie,
             post_fetch_fields,
@@ -863,6 +932,7 @@ fn query_consistent_with_vector<B: IndexBackend>(
     // here we slice the page window (over the post-revalidation visible set).
     let paged = paginate(hits, page);
     Ok(RankedResults {
+        rebuilding: false,
         hits: paged
             .into_iter()
             .map(|h| RankedResult {
