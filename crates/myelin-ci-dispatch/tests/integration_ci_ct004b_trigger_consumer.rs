@@ -264,7 +264,7 @@ fn push_envelope(ev: &str, repo: &str, new_oid: &str) -> EventEnvelope {
         region: Region("fr-par".into()),
         actor: Actor(principal()),
         subject: ArtifactRef(format!("myelin://acme/git/ref/{repo}:refs/heads/main")),
-        aggregate: AggregateKey(format!("git/ref/{repo}:refs/heads/main")),
+        aggregate: AggregateKey(format!("{repo}:refs/heads/main")),
         causation_id: None,
         correlation_id: CorrelationId(format!("corr-{ev}")),
         caused_by: None,

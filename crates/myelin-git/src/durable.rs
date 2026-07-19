@@ -928,13 +928,25 @@ impl DurableGitRepo {
         self.read_blob_at_path_bounded(ref_name, path, usize::MAX)
     }
 
-    /// Whether an exact revision resolves to a commit in this repository.
-    /// Availability-sensitive consumers use this before interpreting a missing path as a genuine
-    /// "no config" result; commits are immutable, so the check and subsequent tree read agree.
-    pub fn commit_exists(&self, revision: &str) -> Result<bool, DurableError> {
+    /// Read a blob from one exact immutable commit object id. Unlike the browse-oriented
+    /// [`Self::read_blob_at_path_bounded`], this API never accepts a revspec.
+    pub fn read_blob_at_commit_oid_bounded(
+        &self,
+        oid: &Oid,
+        path: &str,
+        maximum_bytes: usize,
+    ) -> Result<BlobPathLookup, DurableError> {
         let repo = self.open_git()?;
-        let exists = self.resolve_commit(&repo, revision)?.is_some();
-        Ok(exists)
+        let oid = Self::parse_oid(oid)?;
+        let oid_text = oid.to_string();
+        let commit = match repo.find_commit(oid) {
+            Ok(commit) => commit,
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                return Err(DurableError::Git(format!("exact commit {oid_text} not found")))
+            }
+            Err(error) => return Err(git_err("find exact commit", error)),
+        };
+        Self::read_blob_from_commit(&repo, &commit, path, maximum_bytes)
     }
 
     /// Resolve a blob while checking its ODB header before inflating/materializing content.
@@ -948,6 +960,15 @@ impl DurableGitRepo {
         let Some(commit) = self.resolve_commit(&repo, ref_name)? else {
             return Ok(BlobPathLookup::Missing);
         };
+        Self::read_blob_from_commit(&repo, &commit, path, maximum_bytes)
+    }
+
+    fn read_blob_from_commit(
+        repo: &git2::Repository,
+        commit: &git2::Commit<'_>,
+        path: &str,
+        maximum_bytes: usize,
+    ) -> Result<BlobPathLookup, DurableError> {
         let root = commit.tree().map_err(|e| git_err("commit tree", e))?;
         let clean = path.trim_matches('/');
         if clean.is_empty() {
@@ -970,7 +991,7 @@ impl DurableGitRepo {
                 if object_size > maximum_bytes {
                     return Ok(BlobPathLookup::TooLarge { size: object_size as u64, maximum: maximum_bytes });
                 }
-                let obj = entry.to_object(&repo).map_err(|e| git_err("entry object", e))?;
+                let obj = entry.to_object(repo).map_err(|e| git_err("entry object", e))?;
                 let blob = obj
                     .as_blob()
                     .ok_or_else(|| DurableError::Git("blob object not a blob".into()))?;
