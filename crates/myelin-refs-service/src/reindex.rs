@@ -388,7 +388,8 @@ impl RefsReindexer {
                 // The builder never returns `Retry` on a snapshot ingest (a malformed edge is a
                 // NonRetryable poison, a well-formed one is Done). A `Retry` here would be an
                 // unexpected transient — surface it LOUDLY rather than silently dropping the snapshot.
-                myelin_events::HandleOutcome::Retry(_) => {
+                myelin_events::HandleOutcome::Retry(_)
+                | myelin_events::HandleOutcome::DependencyUnavailable { .. } => {
                     return Err(ReindexError::Poison(format!(
                         "unexpected retryable outcome ingesting snapshot {}",
                         id.0

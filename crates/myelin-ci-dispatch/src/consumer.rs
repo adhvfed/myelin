@@ -1100,7 +1100,19 @@ impl EventHandler for CiTriggerHandler {
                     ))
                 } else if let SkipReason::ReadFailed(error) = reason {
                     HandleOutcome::NonRetryable(myelin_events::Reason(error.to_string()))
+                } else if matches!(
+                    reason,
+                    SkipReason::ResolveError(ResolveError::BlobWrite(
+                        myelin_storage::BlobError::Backend(_)
+                    ))
+                ) {
+                    HandleOutcome::DependencyUnavailable {
+                        dependency: myelin_events::relay::IntakeDependency::Blob,
+                        backoff: myelin_events::Backoff { seconds: 5 },
+                    }
                 } else if matches!(reason, SkipReason::ResolveError(ResolveError::BlobWrite(_))) {
+                    // Preserve explicit retry semantics for non-backend BlobStore write failures;
+                    // a missing snapshot is never flattened into Done/ACK.
                     HandleOutcome::Retry(myelin_events::Backoff { seconds: 5 })
                 } else {
                     HandleOutcome::Done
@@ -1494,7 +1506,9 @@ mod tests {
 
     impl BlobStore for FailingBlobStore {
         fn put(&self, _tenant: &TenantId, _bytes: &[u8]) -> myelin_storage::blob::Result<ContentHash> {
-            Err(myelin_storage::blob::BlobError::MalformedAddress("injected S3 outage".into()))
+            Err(myelin_storage::blob::BlobError::Backend(
+                myelin_storage::blob::BlobDependencyError::Transient,
+            ))
         }
         fn get(&self, _: &TenantId, _: &ContentHash) -> myelin_storage::blob::Result<Vec<u8>> {
             panic!("CAS read reached during write-failure test")
@@ -1521,7 +1535,10 @@ mod tests {
 
         assert_eq!(
             consumer.deliver(&message(push_envelope("web", TEST_OID))),
-            Delivered::Retried(5)
+            Delivered::DependencyUnavailable(
+                myelin_events::relay::IntakeDependency::Blob,
+                5,
+            )
         );
         assert!(reserve.persisted().is_empty());
         assert!(ledger.is_empty(), "S3 retry rolls back the dedup mark");

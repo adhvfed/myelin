@@ -313,7 +313,7 @@ impl EventsRuntime {
                         self.bus.ack(&self.consumer_name, &event_id);
                     }
                     // NOT terminal: a Retry/Throttle stays pending — do NOT ack (it redelivers; 0 lost).
-                    Ok(Delivered::Retried(_) | Delivered::Throttled(_)) => {}
+                    Ok(Delivered::Retried(_) | Delivered::DependencyUnavailable(_, _) | Delivered::Throttled(_)) => {}
                     // A panic in the delivery machinery itself (should never happen — the handler is
                     // already guarded inside `deliver`). Surface loudly, do NOT ack (0 lost), keep the
                     // pump alive so other subjects/tenants keep flowing.

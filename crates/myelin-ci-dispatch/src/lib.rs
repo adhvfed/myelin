@@ -102,6 +102,7 @@ use myelin_substrate::{
     PublicRoutes, ServeError, ServeHandle, StoreManifest,
 };
 use std::sync::Arc;
+use std::sync::Mutex;
 
 pub use migrations::{dispatch_migrations, CONSUMER_DEDUP_TABLE, CREATE_CONSUMER_DEDUP_DDL};
 
@@ -111,6 +112,114 @@ pub const SERVICE_NAME: &str = "ci-dispatch";
 pub const EVENT_STREAM_NAME: &str = "MYELIN_EVENTS";
 pub const EVENT_SUBJECT_ROOT: &str = "myelin.events";
 pub const EVENT_DURABLE_CONSUMER: &str = "ci-dispatch-trigger";
+
+pub trait BlobIntakeReadiness: Send + Sync {
+    fn readiness(&self) -> Result<(), myelin_storage::blob::BlobDependencyError>;
+}
+
+impl BlobIntakeReadiness for myelin_storage::s3blob::S3BlobStore {
+    fn readiness(&self) -> Result<(), myelin_storage::blob::BlobDependencyError> {
+        myelin_storage::s3blob::S3BlobStore::readiness(self)
+    }
+}
+
+trait IntakeFactory: Send + Sync {
+    fn connect(&self) -> Result<Box<dyn myelin_events::EventConsumer>, myelin_events::TransportError>;
+}
+
+struct NatsIntakeFactory {
+    config: myelin_events::nats::JetStreamConsumerConfig,
+    rt: tokio::runtime::Handle,
+}
+
+impl IntakeFactory for NatsIntakeFactory {
+    fn connect(&self) -> Result<Box<dyn myelin_events::EventConsumer>, myelin_events::TransportError> {
+        myelin_events::nats::NatsJetStreamBus::connect_consumer(self.config.clone(), self.rt.clone())
+            .map(|consumer| Box::new(consumer) as Box<dyn myelin_events::EventConsumer>)
+    }
+}
+
+/// Blob-readiness gate plus lazy durable intake. Initial transient S3 failure creates no NATS
+/// connection. Once active, the consumer is retained across later outages for settlement flushes.
+pub struct RecoveringIntake {
+    durable_name: String,
+    blobs: Arc<dyn BlobIntakeReadiness>,
+    factory: Box<dyn IntakeFactory>,
+    active: Mutex<Option<Box<dyn myelin_events::EventConsumer>>>,
+}
+
+impl RecoveringIntake {
+    pub fn new(
+        config: myelin_events::nats::JetStreamConsumerConfig,
+        blobs: Arc<myelin_storage::s3blob::S3BlobStore>,
+        rt: tokio::runtime::Handle,
+    ) -> Self {
+        let durable_name = config.consumer_name.clone();
+        Self {
+            durable_name,
+            blobs,
+            factory: Box::new(NatsIntakeFactory { config, rt }),
+            active: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_factory(
+        durable_name: impl Into<String>,
+        blobs: Arc<dyn BlobIntakeReadiness>,
+        factory: Box<dyn IntakeFactory>,
+    ) -> Self {
+        Self { durable_name: durable_name.into(), blobs, factory, active: Mutex::new(None) }
+    }
+
+    fn with_active<R>(&self, operation: impl FnOnce(&dyn myelin_events::EventConsumer) -> Result<R, myelin_events::TransportError>)
+        -> Result<R, myelin_events::TransportError>
+    {
+        let guard = self.active.lock().unwrap_or_else(|error| error.into_inner());
+        let active = guard.as_deref().ok_or_else(|| myelin_events::TransportError("durable intake is not active".into()))?;
+        operation(active)
+    }
+}
+
+impl myelin_events::EventConsumer for RecoveringIntake {
+    fn durable_name(&self) -> &str { &self.durable_name }
+
+    fn pre_intake_readiness(&self)
+        -> Result<Option<myelin_events::relay::IntakeDependency>, myelin_events::relay::IntakeDependency>
+    {
+        self.blobs.readiness()
+            .map(|()| Some(myelin_events::relay::IntakeDependency::Blob))
+            .map_err(|_| myelin_events::relay::IntakeDependency::Blob)
+    }
+
+    fn consume(&self, subject_prefix: &str)
+        -> Result<Vec<myelin_events::BrokerDelivery>, myelin_events::TransportError>
+    {
+        self.blobs.readiness().map_err(|_| myelin_events::TransportError(
+            "blob dependency unavailable before broker intake".into()
+        ))?;
+        let mut guard = self.active.lock().unwrap_or_else(|error| error.into_inner());
+        if guard.is_none() { *guard = Some(self.factory.connect()?); }
+        guard.as_deref().expect("intake was connected").consume(subject_prefix)
+    }
+
+    fn flush_settlements(&self) -> Result<(), myelin_events::TransportError> {
+        let guard = self.active.lock().unwrap_or_else(|error| error.into_inner());
+        match guard.as_deref() { Some(active) => active.flush_settlements(), None => Ok(()) }
+    }
+
+    fn ack(&self, token: myelin_events::DeliveryToken) -> Result<(), myelin_events::TransportError> {
+        self.with_active(|active| active.ack(token))
+    }
+
+    fn retry(&self, token: myelin_events::DeliveryToken, delay_secs: u64) -> Result<(), myelin_events::TransportError> {
+        self.with_active(|active| active.retry(token, delay_secs))
+    }
+
+    fn terminate(&self, token: myelin_events::DeliveryToken) -> Result<(), myelin_events::TransportError> {
+        self.with_active(|active| active.terminate(token))
+    }
+}
 
 pub fn git_intake_filter() -> String {
     format!("{EVENT_SUBJECT_ROOT}.evt.*.git.>")
@@ -140,9 +249,10 @@ pub fn git_intake_filter() -> String {
 ///   pushed repo's `.myelin/ci.*` from the SAME on-disk git-root the edge writes (shared-volume
 ///   deploy; `git_root` is the `MYELIN_GIT_ROOT` the caller resolves, mirroring `myelin-edge` main).
 /// - **dedup** = the caller's durable [`DedupLedger`] (the exactly-once effect anchor).
+#[allow(clippy::too_many_arguments)] // production composition root: each durable authority is explicit
 pub fn build_dispatch_consumers(
     git_root: AuthoritativeGitRoot,
-    s3: &myelin_config::S3Config,
+    blobs: Arc<dyn myelin_storage::BlobStore + Send + Sync>,
     ci_run: myelin_ci_controlplane::CiRunStore,
     outbox: myelin_events::OutboxStore,
     dedup: myelin_events::DedupLedger,
@@ -156,8 +266,6 @@ pub fn build_dispatch_consumers(
         Arc::new(consumer::DurableGitConfigReader::new(
             myelin_git::durable::DurableGitStore::rooted(git_root.as_path()),
         ));
-    let blobs: Arc<dyn myelin_storage::BlobStore + Send + Sync> =
-        Arc::new(myelin_storage::s3blob::S3BlobStore::connect(s3, rt.clone()));
     let reserve: Arc<dyn consumer::ReserveStore> = Arc::new(consumer::CoCommitReserveStore::new(
         ci_run, outbox, minter, rt,
     ));
@@ -180,7 +288,7 @@ pub fn build_dispatch_consumers(
 ///   (contract 4.9) through Identity; a dead authz means CI cannot make the correct trust decision,
 ///   so it sheds rather than mis-stamping a trust tier (the poisoned-pipeline-execution defence).
 fn dispatch_critical() -> CriticalDependencies {
-    CriticalDependencies::new(["broker", "authz"])
+    CriticalDependencies::new(["broker", "authz", "blob"])
 }
 
 /// **Assemble the CI Trigger & Dispatch service [`AppSpec`] (contract 1.1; the service shell).** The
@@ -476,5 +584,82 @@ mod tests {
             0,
             "the live trigger consumer boots → … → drains cleanly"
         );
+    }
+
+    struct ToggleBlobReadiness(std::sync::atomic::AtomicBool);
+    impl BlobIntakeReadiness for ToggleBlobReadiness {
+        fn readiness(&self) -> Result<(), myelin_storage::blob::BlobDependencyError> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) { Ok(()) }
+            else { Err(myelin_storage::blob::BlobDependencyError::Transient) }
+        }
+    }
+
+    #[derive(Default)]
+    struct IntakeCounts {
+        connects: std::sync::atomic::AtomicUsize,
+        pulls: std::sync::atomic::AtomicUsize,
+    }
+    struct ProbeIntakeFactory(Arc<IntakeCounts>);
+    impl IntakeFactory for ProbeIntakeFactory {
+        fn connect(&self) -> Result<Box<dyn myelin_events::EventConsumer>, myelin_events::TransportError> {
+            self.0.connects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(ProbeIntake(self.0.clone())))
+        }
+    }
+    struct ProbeIntake(Arc<IntakeCounts>);
+    impl myelin_events::EventConsumer for ProbeIntake {
+        fn durable_name(&self) -> &str { "probe-intake" }
+        fn consume(&self, _: &str) -> Result<Vec<myelin_events::BrokerDelivery>, myelin_events::TransportError> {
+            self.0.pulls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        fn flush_settlements(&self) -> Result<(), myelin_events::TransportError> { Ok(()) }
+        fn ack(&self, _: myelin_events::DeliveryToken) -> Result<(), myelin_events::TransportError> { Ok(()) }
+        fn retry(&self, _: myelin_events::DeliveryToken, _: u64) -> Result<(), myelin_events::TransportError> { Ok(()) }
+        fn terminate(&self, _: myelin_events::DeliveryToken) -> Result<(), myelin_events::TransportError> { Ok(()) }
+    }
+    struct QuarantineNoop;
+    impl myelin_events::DurableDeliveryQuarantine for QuarantineNoop {
+        fn record(&self, _: &str, _: &myelin_events::BrokerDeliveryRef, _: myelin_events::DeliveryQuarantineReason, _: u64) -> Result<(), String> { Ok(()) }
+    }
+
+    fn recovering_probe(blob: Arc<ToggleBlobReadiness>, counts: Arc<IntakeCounts>) -> RecoveringIntake {
+        RecoveringIntake::with_factory(
+            "probe-intake", blob, Box::new(ProbeIntakeFactory(counts)),
+        )
+    }
+
+    #[test]
+    fn transient_blob_boot_is_immediately_not_ready_then_recovers_with_one_connect() {
+        let blob = Arc::new(ToggleBlobReadiness(std::sync::atomic::AtomicBool::new(false)));
+        let counts = Arc::new(IntakeCounts::default());
+        let handle = boot(dispatch_app_spec_with_intake(
+            Config::default(), myelin_events::OutboxStore::new(), Vec::new(),
+            Box::new(recovering_probe(blob.clone(), counts.clone())), Arc::new(QuarantineNoop),
+        )).unwrap();
+        assert_eq!(handle.metrics_health().liveness(), Liveness::Up);
+        assert!(!handle.metrics_health().readiness().is_ready());
+        assert_eq!(counts.connects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(counts.pulls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        blob.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        handle.tick();
+        handle.tick();
+        assert!(handle.metrics_health().readiness().is_ready());
+        assert_eq!(counts.connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(counts.pulls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn initial_blob_outage_shutdown_does_not_connect_or_pull() {
+        let blob = Arc::new(ToggleBlobReadiness(std::sync::atomic::AtomicBool::new(false)));
+        let counts = Arc::new(IntakeCounts::default());
+        let handle = boot(dispatch_app_spec_with_intake(
+            Config::default(), myelin_events::OutboxStore::new(), Vec::new(),
+            Box::new(recovering_probe(blob, counts.clone())), Arc::new(QuarantineNoop),
+        )).unwrap();
+        handle.drain_checked().unwrap();
+        assert_eq!(counts.connects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(counts.pulls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
