@@ -21,7 +21,7 @@
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
-use myelin_events::check_seam::{check_aggregate, check_subject, CheckSeamOrder};
+use myelin_events::check_seam::{check_aggregate, check_subject, CheckCommit, CheckSeamOrder};
 use myelin_events::nats::NatsJetStreamBus;
 use myelin_events::relay::{BusTransport, Delivery};
 use myelin_events::taxonomy::new_tokens::CI_CHECK_UPDATED;
@@ -33,6 +33,10 @@ use myelin_tenancy::{Region, TenantId};
 
 const REPO: &str = "myelin://acme/git/repo/core";
 const COMMIT: &str = "abc123def";
+
+fn commit() -> CheckCommit {
+    CheckCommit::from_repo_root(&myelin_events::ArtifactRef(REPO.into()), COMMIT).unwrap()
+}
 
 /// A `ci.check.updated` envelope carrying the OPAQUE CheckStatus payload (run_attempt + state), at a
 /// stable `event_id` per (context, attempt) so a re-publish carries the SAME id (the dedup key).
@@ -48,8 +52,8 @@ fn check_env(context: &str, attempt: u64, state: &str) -> EventEnvelope {
             PrincipalKind::Service,
             TenantId("acme".into()),
         )),
-        subject: check_subject(REPO, COMMIT, context),
-        aggregate: check_aggregate(REPO, COMMIT),
+        subject: check_subject(&commit(), context).unwrap(),
+        aggregate: check_aggregate(&commit()),
         causation_id: None,
         correlation_id: CorrelationId(format!("corr-{COMMIT}")),
         caused_by: None,
@@ -127,8 +131,8 @@ async fn check_seam_carriage_over_real_nats() {
     );
 
     // Envelope conformance survived the round-trip: every fact carries the §4.12 aggregate.
-    let expected_agg = check_aggregate(REPO, COMMIT);
-    let mut order = CheckSeamOrder::new(REPO, COMMIT);
+    let expected_agg = check_aggregate(&commit());
+    let mut order = CheckSeamOrder::new(&commit());
     for (i, d) in delivered.iter().enumerate() {
         assert_eq!(
             d.type_.0, CI_CHECK_UPDATED,

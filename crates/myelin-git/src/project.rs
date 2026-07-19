@@ -74,6 +74,7 @@
 //! `project_*_for_authorized_viewer` test; the id-grammar arms by `git_*_ref_round_trips` /
 //! `display_key_is_render_time_only`.
 
+use myelin_events::SubjectComponent;
 use myelin_identity::{
     Consistency, ConsistencyMode, Decision, IdentityService, Permission, Principal, Zookie,
 };
@@ -150,7 +151,13 @@ pub fn git_pr_ref(tenant: &str, repo: &str, number: u64) -> ArtifactRef {
 /// Mint the canonical **commit** `ArtifactRef`: `myelin://<tenant>/git/commit/<repo>:<sha>`. The
 /// `<sha>` is the immutable content-address — git's stable key, never a short-sha display.
 pub fn git_commit_ref(tenant: &str, repo: &str, sha: &str) -> ArtifactRef {
-    parse_git(&format!("myelin://{tenant}/git/commit/{repo}:{sha}"))
+    let repo = SubjectComponent::encode(repo).expect("validated Git repository id");
+    let sha = SubjectComponent::encode(sha).expect("validated Git object id");
+    parse_git(&format!(
+        "myelin://{tenant}/git/commit/{}:{}",
+        repo.as_str(),
+        sha.as_str()
+    ))
 }
 
 /// Mint the canonical **review** `ArtifactRef`: `myelin://<tenant>/git/review/<repo>:<n>:<reviewer>`.
@@ -170,7 +177,8 @@ pub fn git_review_ref(
 /// Mint the canonical **repo** `ArtifactRef`: `myelin://<tenant>/git/repo/<repo_id>`. The `<repo_id>`
 /// is the stable repo identifier (relocatable, never node-pinned — STOR-5).
 pub fn git_repo_ref(tenant: &str, repo_id: &str) -> ArtifactRef {
-    parse_git(&format!("myelin://{tenant}/git/repo/{repo_id}"))
+    let repo_id = SubjectComponent::encode(repo_id).expect("validated Git repository id");
+    parse_git(&format!("myelin://{tenant}/git/repo/{}", repo_id.as_str()))
 }
 
 /// Parse a git URN through the ONE refs codec. Git mints only well-formed scopes (the inputs here are
@@ -193,7 +201,7 @@ pub fn display_key(r: &ArtifactRef) -> Option<String> {
         // PR: the `<repo>:<n>` id renders to `#<n>` (the trailing number after the last `:`).
         GitArtifactType::Pr => id.rsplit(':').next().map(|n| format!("#{n}")),
         // Commit: the `<repo>:<sha>` id renders to the 7-char short-sha (the conventional display).
-        GitArtifactType::Commit => id.rsplit(':').next().map(short_sha),
+        GitArtifactType::Commit => commit_oid_from_id(&id).map(|oid| short_sha(&oid)),
         // Repo/review/blob: no `#n`/short-sha display form (slug/handle is render-time text, not a key).
         GitArtifactType::Repo | GitArtifactType::Review | GitArtifactType::Blob => None,
     }
@@ -216,6 +224,13 @@ fn canonical_id(r: &ArtifactRef) -> Option<String> {
 fn short_sha(sha: &str) -> String {
     let hex = sha.split_once(':').map(|(_, h)| h).unwrap_or(sha);
     hex.chars().take(7).collect()
+}
+
+fn commit_oid_from_id(id: &str) -> Option<String> {
+    let (_, encoded_oid) = id.split_once(':')?;
+    SubjectComponent::parse(encoded_oid)
+        .ok()
+        .map(|component| component.decode())
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -687,7 +702,8 @@ impl<I: IdentityService> Projector<I> {
                 reference: root.0.clone(),
             })?;
         let short = canonical_id(root)
-            .and_then(|id| id.rsplit(':').next().map(short_sha))
+            .and_then(|id| commit_oid_from_id(&id))
+            .map(|oid| short_sha(&oid))
             .unwrap_or_default();
         Ok(Projection {
             title: format!("{short} {}", meta.subject),
@@ -977,8 +993,18 @@ mod tests {
         let c = git_commit_ref("acme", "repo7", "blake3:deadbeefcafe0000");
         assert_eq!(
             myelin_refs::format(&c),
-            "myelin://acme/git/commit/repo7:blake3:deadbeefcafe0000"
+            "myelin://acme/git/commit/repo7:blake3%3Adeadbeefcafe0000"
         );
+        let dotted_repo = git_repo_ref("acme", "repo.with:delimiter%value");
+        assert_eq!(
+            dotted_repo.0,
+            "myelin://acme/git/repo/repo%2Ewith%3Adelimiter%25value"
+        );
+        let dotted_commit = git_commit_ref("acme", "repo.with:delimiter%value", "sha:dead.beef");
+        let checked = myelin_events::CheckCommit::from_repo_root(&dotted_repo, "sha:dead.beef")
+            .expect("Git repo mint and check-seam commit derivation share the component codec");
+        assert_eq!(checked.root(), &dotted_commit);
+        assert_eq!(checked.repo_id(), "repo.with:delimiter%value");
 
         let repo = git_repo_ref("acme", "repo7");
         assert_eq!(myelin_refs::format(&repo), "myelin://acme/git/repo/repo7");

@@ -638,9 +638,14 @@ fn e2e2_durable_workflow_hitl_spine_across_kill_and_days_later_approval() {
         },
     ];
     let attempt = merge_attempt_id(&mq.0, "merge.queue:0");
-    let producer = RealCiResultProducer::new(&sub.signals, tenant(), region(), &mq.0, REPO);
-    let d1 = producer.deliver(FIX_COMMIT, &facts, &required(), &attempt);
-    let d2 = producer.deliver(FIX_COMMIT, &facts, &required(), &attempt);
+    let producer =
+        RealCiResultProducer::new(&sub.signals, tenant(), region(), &mq.0, REPO).unwrap();
+    let d1 = producer
+        .deliver(FIX_COMMIT, &facts, &required(), &attempt)
+        .unwrap();
+    let d2 = producer
+        .deliver(FIX_COMMIT, &facts, &required(), &attempt)
+        .unwrap();
     assert!(d1, "the first green ci.result delivery is new");
     assert!(
         !d2,

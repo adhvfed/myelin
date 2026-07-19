@@ -315,14 +315,15 @@ fn assembled_draft_rides_the_frozen_envelope_grammar() {
         true,
         CostPosture::Settled,
         None,
-    );
+    )
+    .unwrap();
     assert_eq!(draft.type_.0, "ci.check.updated", "the X-1 token (2.9)");
     assert_eq!(
-        draft.subject.0, "myelin://acme/git/repo/core#commit-deadbeef/check-build",
-        "subject = repo#commit-<oid>/check-<context> (§4.12 — byte-identical to Git's consumer)"
+        draft.subject.0, "myelin://acme/git/commit/core:deadbeef#check-build",
+        "subject = canonical commit root plus #check-<context> (§4.12 — byte-identical to Git's consumer)"
     );
     assert_eq!(
-        draft.aggregate.0, "myelin://acme/git/repo/core#commit-deadbeef",
+        draft.aggregate.0, "commit:core:deadbeef",
         "aggregate = (repo, commit_oid) — all contexts for one commit share the ordering partition"
     );
     assert!(

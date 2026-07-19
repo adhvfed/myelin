@@ -34,7 +34,8 @@ use myelin_storage::{BlobStore, ContentHash, FsBlobStore};
 use myelin_tenancy::{Region, TenantId};
 
 const PINNED_BUILD: &str = "registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000";
-const PINNED_TEST: &str = "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000";
+const PINNED_TEST: &str =
+    "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000";
 
 fn tenant() -> TenantId {
     TenantId("acme".into())
@@ -53,7 +54,8 @@ fn definition() -> CiDefinition {
 fn facts(snapshot_run_id: &str) -> RunFacts {
     RunFacts {
         run_id: snapshot_run_id.into(),
-        repo_ref: "myelin://acme/git/repo/web".into(),
+        tenant: TenantId("acme".into()),
+        repo_root: myelin_git::project::git_repo_ref("acme", "web"),
         commit_oid: "deadbeef".into(),
         contexts: vec![CheckContext::ci("build"), CheckContext::ci("test/unit")],
         cause_event_id: EventId("ev-pr-1".into()),
@@ -78,7 +80,11 @@ fn cdc_11_2_consumer_snapshot_is_content_addressed_through_blobstore() {
     let bytes = store
         .get(&tenant(), &addr)
         .expect("the CAS blob is present");
-    assert_eq!(bytes, snap.canonical_bytes().unwrap(), "get returns the put bytes");
+    assert_eq!(
+        bytes,
+        snap.canonical_bytes().unwrap(),
+        "get returns the put bytes"
+    );
     // The address IS the BLAKE3 content address of those bytes (content-addressed by construction).
     assert_eq!(addr, ContentHash::blake3(&snap.canonical_bytes().unwrap()));
 
@@ -124,7 +130,8 @@ fn cdc_9_1_consumer_reserve_start_is_idempotent_through_durable_executor() {
         &stamp,
         &OnTrigger::PullRequest,
         &facts("run-9001"),
-    );
+    )
+    .unwrap();
 
     // The CONSUMER's StartSpec names the ci.pipeline workflow + starts on the snapshot ref.
     let spec: StartSpec = handoff.start_spec.clone();

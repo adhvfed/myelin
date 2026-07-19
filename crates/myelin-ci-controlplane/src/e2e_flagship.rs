@@ -247,7 +247,8 @@ pub fn run_e2e2_ci_flagship_slice() -> E2eArtifact {
         true,
         CostPosture::Settled,
         Some(FAILED_STEP),
-    );
+    )
+    .expect("canonical flagship check reference");
     let expected_anchor = details_ref(FAIL_RUN, CheckState::Failure, Some(FAILED_STEP));
     let fail_check_state =
         fail_check.payload.get("state").and_then(|v| v.as_str()) == Some("failure");
@@ -301,7 +302,8 @@ pub fn run_e2e2_ci_flagship_slice() -> E2eArtifact {
         true,
         CostPosture::Settled,
         None,
-    );
+    )
+    .expect("canonical flagship check reference");
     let fix_greens = green_check
         .payload
         .get("state")

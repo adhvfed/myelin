@@ -15,9 +15,9 @@ use myelin_events::nats::{
 };
 use myelin_events::relay::EventConsumer;
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, BrokerDeliveryRef, CorrelationId, DataRole, DedupLedger,
-    DeliveryQuarantineReason, DurableDedup, DurableDeliveryQuarantine, EventEnvelope, EventId,
-    EventType, OutboxStore, Timestamp, UlidMinter, Visibility,
+    Actor, BrokerDeliveryRef, CorrelationId, DataRole, DedupLedger, DeliveryQuarantineReason,
+    DurableDedup, DurableDeliveryQuarantine, EventEnvelope, EventId, EventType, OutboxStore,
+    Timestamp, UlidMinter, Visibility,
     CONSUMER_DEAD_LETTER_MIGRATION, CONSUMER_DEDUP_MIGRATION,
     CONSUMER_DELIVERY_QUARANTINE_MIGRATION, OUTBOX_MIGRATION, OUTBOX_QUARANTINE_MIGRATION,
 };
@@ -32,7 +32,7 @@ use myelin_substrate::{boot, Config};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool, Row};
 
-const CI_TOML: &[u8] = br#"on = "pull_request"
+const CI_TOML: &[u8] = br#"on = "push"
 
 [[jobs]]
 name = "build"
@@ -105,9 +105,14 @@ fn seed_git(root: &std::path::Path, tenant: &str, region: &str) -> String {
 
 fn trigger_event(tenant: &str, commit: &str, event_id: &str) -> EventEnvelope {
     let tenant = TenantId(tenant.into());
+    let ref_key = myelin_git::receive_pack::GitRefEventKey::new(
+        "web",
+        &myelin_git::receive_pack::RefName::new("refs/heads/main"),
+    )
+    .unwrap();
     EventEnvelope {
         event_id: EventId(event_id.into()),
-        type_: EventType("git.pr.opened".into()),
+        type_: EventType("git.ref.updated".into()),
         schema_ver: 1,
         tenant: tenant.clone(),
         region: Region("fr-par".into()),
@@ -116,8 +121,8 @@ fn trigger_event(tenant: &str, commit: &str, event_id: &str) -> EventEnvelope {
             PrincipalKind::Service,
             tenant.clone(),
         )),
-        subject: ArtifactRef(format!("myelin://{}/git/pr/web:42", tenant.0)),
-        aggregate: AggregateKey("git/pr/web:42".into()),
+        subject: ref_key.subject(&tenant.0).unwrap(),
+        aggregate: ref_key.aggregate(),
         causation_id: None,
         correlation_id: CorrelationId(event_id.into()),
         caused_by: None,
@@ -129,13 +134,13 @@ fn trigger_event(tenant: &str, commit: &str, event_id: &str) -> EventEnvelope {
         occurred_at: Timestamp("2026-07-19T00:00:00Z".into()),
         recorded_at: Timestamp("2026-07-19T00:00:00Z".into()),
         payload: serde_json::json!({
-            "repo": "web", "number": 42, "head_oid": commit, "is_fork": false
+            "repo": "web", "ref": "refs/heads/main", "new_oid": commit, "is_fork": false
         }),
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn elected_publisher_delivers_trigger_then_dispatch_leaves_new_rows_for_next_pass() {
+async fn elected_publisher_delivers_trigger_and_the_next_pass_publishes_dispatch_rows() {
     let cfg = MyelinConfig::dev();
     let nonce = format!(
         "{}_{}",
@@ -318,7 +323,39 @@ async fn elected_publisher_delivers_trigger_then_dispatch_leaves_new_rows_for_ne
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(newly_emitted > 0, "dispatch never embeds a relay; its emitted rows await election");
+    assert!(
+        newly_emitted > 0,
+        "dispatch never embeds a relay; its emitted rows await election"
+    );
+    assert_eq!(
+        elected.drain_once(&publisher, 64).await.unwrap(),
+        ElectedDrainOutcome::Published(usize::try_from(newly_emitted).unwrap()),
+        "the next elected pass publishes every canonical dispatch emission"
+    );
+    let valid_rows_still_unsent: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM outbox
+          WHERE published_at IS NULL
+            AND event_id NOT IN ($1, $2, 'foreign-outbox-row')",
+    )
+    .bind(&event_id)
+    .bind(&second_event_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(valid_rows_still_unsent, 0);
+    let valid_rows_quarantined: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint
+           FROM outbox_quarantine q
+           JOIN outbox o USING(event_id)
+          WHERE o.event_id <> 'foreign-outbox-row'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        valid_rows_quarantined, 0,
+        "valid dispatch emissions never quarantine"
+    );
     let quarantine_reasons: Vec<String> = sqlx::query_scalar(
         "SELECT reason_code FROM consumer_delivery_quarantine \
          WHERE consumer=$1 ORDER BY stream_sequence",

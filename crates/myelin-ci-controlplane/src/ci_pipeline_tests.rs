@@ -392,8 +392,12 @@ fn a_terminal_check_fact_decodes_to_the_frozen_git_checkstatus_shape() {
         "terminal but not settled until CI-P17's reserve/settle bookend closes (X-1 cost gate)"
     );
     // The subject grammar is byte-identical to the frozen check_seam subject (no drift from Git).
-    let expected =
-        myelin_events::check_seam::check_subject("myelin://acme/git/repo/r1", "deadbeef", "build");
+    let commit = myelin_events::check_seam::CheckCommit::from_repo_root(
+        &myelin_events::ArtifactRef("myelin://acme/git/repo/r1".into()),
+        "deadbeef",
+    )
+    .unwrap();
+    let expected = myelin_events::check_seam::check_subject(&commit, "build").unwrap();
     assert_eq!(
         row.envelope.subject, expected,
         "the X-1 subject grammar (no drift)"

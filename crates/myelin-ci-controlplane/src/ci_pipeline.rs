@@ -145,7 +145,7 @@ pub struct PipelineRun {
 /// PII-free.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckFacts {
-    /// The repo ref the check seam keys on (`repo#commit-<oid>/check-<context>`, X-1).
+    /// The canonical repo root from which the check seam derives its commit/check subject (X-1).
     pub repo: String,
     /// The commit OID the run ran against (the `(commit_oid, context)` key half).
     pub commit_oid: String,
@@ -478,9 +478,23 @@ fn emit_terminal_checks(
     contexts: &[String],
     success: bool,
 ) -> WfResult<()> {
+    let repo = myelin_refs::parse_scoped(&facts.repo).map_err(|_| {
+        myelin_flow::WfError::CoCommit("invalid canonical Git repository root".into())
+    })?;
+    if repo.subsystem != "git" || repo.type_ != "repo" || repo.sub.is_some() {
+        return Err(myelin_flow::WfError::CoCommit(
+            "invalid canonical Git repository root".into(),
+        ));
+    }
+    let commit = myelin_events::check_seam::CheckCommit::from_repo_root(
+        &repo.artifact_ref,
+        &facts.commit_oid,
+    )
+    .map_err(|_| myelin_flow::WfError::CoCommit("invalid canonical Git commit root".into()))?;
     for context in contexts {
         let status = terminal_check_status(facts, context, success);
-        let draft = check_updated_draft(&facts.repo, &facts.commit_oid, context, status);
+        let draft = check_updated_draft(&commit, context, status)
+            .map_err(|_| myelin_flow::WfError::CoCommit("invalid canonical CI check ref".into()))?;
         ctx.emit(draft, None)?;
     }
     Ok(())
@@ -552,7 +566,21 @@ fn emit_ci_result(
         &required,
         &facts.merge_idem_token,
     );
-    let draft = ci_result_draft(&facts.repo, &result);
+    let repo = myelin_refs::parse_scoped(&facts.repo).map_err(|_| {
+        myelin_flow::WfError::CoCommit("invalid canonical Git repository root".into())
+    })?;
+    if repo.subsystem != "git" || repo.type_ != "repo" || repo.sub.is_some() {
+        return Err(myelin_flow::WfError::CoCommit(
+            "invalid canonical Git repository root".into(),
+        ));
+    }
+    let commit = myelin_events::check_seam::CheckCommit::from_repo_root(
+        &repo.artifact_ref,
+        &facts.commit_oid,
+    )
+    .map_err(|_| myelin_flow::WfError::CoCommit("invalid canonical Git commit root".into()))?;
+    let draft = ci_result_draft(&commit, &result)
+        .map_err(|_| myelin_flow::WfError::CoCommit("invalid canonical CI result ref".into()))?;
     ctx.emit(draft, None)?;
     Ok(())
 }

@@ -10,9 +10,9 @@ use std::process::Command;
 use std::sync::Arc;
 
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, DataRole, EmitContextBase,
-    EventEnvelope, EventId, EventType, IdMinter, InProcessBus, MonotonicMinter, OutboxRow,
-    OutboxStore, Region, Relay, TenantId, Timestamp, Visibility, MAX_PUBLISH_ATTEMPTS,
+    Actor, CausedBy, CorrelationId, DataRole, EmitContextBase, EventEnvelope, EventId, EventType,
+    IdMinter, InProcessBus, MonotonicMinter, OutboxRow, OutboxStore, Region, Relay, TenantId,
+    Timestamp, Visibility, MAX_PUBLISH_ATTEMPTS,
 };
 use myelin_git::core::RepoLoc;
 use myelin_git::durable::{DurableGitRepo, DurableGitStore};
@@ -20,8 +20,8 @@ use myelin_git::reconcile::{
     reconcile_refs, refs_from_outbox_scoped, repo_slugs_from_outbox_scoped,
 };
 use myelin_git::receive_pack::{
-    CrashPoint, InMemoryObjectDb, Oid, ProposedRefUpdate, PushOutcome, PushSession, Pusher, RefName,
-    RefStore,
+    CrashPoint, GitRefEventKey, InMemoryObjectDb, Oid, ProposedRefUpdate, PushOutcome, PushSession,
+    Pusher, RefName, RefStore,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
@@ -95,8 +95,9 @@ fn git_fsck(repo_path: &std::path::Path) -> (bool, String) {
 
 fn retained_ref_witness(id: &str, payload: serde_json::Value) -> OutboxRow {
     let event_id = EventId(id.into());
-    let aggregate = AggregateKey("core:refs/heads/main".into());
-    let subject = ArtifactRef("myelin://acme/git/ref/core:refs/heads/main".into());
+    let key = GitRefEventKey::new("core", &RefName::new("refs/heads/main")).unwrap();
+    let aggregate = key.aggregate();
+    let subject = key.subject("acme").unwrap();
     OutboxRow {
         event_id: event_id.clone(),
         aggregate: aggregate.clone(),

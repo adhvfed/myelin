@@ -115,7 +115,7 @@ fn cdc_6_5_producer_git_emits_the_section_9_shape_per_changed_blob() {
 fn cdc_6_5_consumer_doc_facets_match_the_registered_6_3_spec() {
     let bp = BlobProjection {
         artifact_ref: myelin_events::ArtifactRef(
-            "myelin://acme/git/blob/core:refs/heads/main:src/lib.rs".into(),
+            "myelin://acme/git/blob/core:refs%2Fheads%2Fmain:src%2Flib%2Ers".into(),
         ),
         path: "src/lib.rs".into(),
         language: "rust".into(),

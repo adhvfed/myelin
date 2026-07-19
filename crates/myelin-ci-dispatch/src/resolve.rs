@@ -700,21 +700,16 @@ fn trust_tier_token(stamp: &TrustStamp) -> &'static str {
     }
 }
 
-/// The check-seam subject `repo#commit-<oid>/check-<context>` (X-1, arch 03 §4.12) — REUSES the
-/// frozen `myelin_events::check_seam::check_subject` so the subject grammar is byte-identical to what
-/// Git's gate consumes (no drift).
-fn check_subject(repo: &str, commit_oid: &str, context: &str) -> ArtifactRef {
-    myelin_events::check_seam::check_subject(repo, commit_oid, context)
-}
-
 /// The facts the reserve+start handoff needs about the run (provenance the snapshot does not carry):
 /// the repo + commit the checks key on, the per-context list, and the pseudonym actor.
 #[derive(Clone, Debug)]
 pub struct RunFacts {
     /// The opaque run id (a uuid string).
     pub run_id: String,
-    /// The repo ref the check seam keys on (X-1: `repo#commit-<oid>/check-<context>`).
-    pub repo_ref: String,
+    /// The validated tenant scope that owns the run and every emitted ArtifactRef.
+    pub tenant: TenantId,
+    /// The canonical Git repository root the check seam derives the commit root from.
+    pub repo_root: ArtifactRef,
     /// The commit oid the run ran against (the CheckStatus key half).
     pub commit_oid: String,
     /// The check contexts the run reports (one queued `ci.check.updated` each).
@@ -738,7 +733,7 @@ pub fn reserve_and_start(
     stamp: &TrustStamp,
     on: &OnTrigger,
     facts: &RunFacts,
-) -> StartHandoff {
+) -> Result<StartHandoff, DispatchRefError> {
     let trigger_kind = trigger_kind_token(on).to_string();
     let trust_tier = trust_tier_token(stamp).to_string();
 
@@ -764,12 +759,25 @@ pub fn reserve_and_start(
 
     // §1.2: ci.run.started carries trust_tier / trigger_kind / the CAS snapshot ref
     // (references-not-payloads — the snapshot is a ref, not the bytes).
+    let encoded_run_id = myelin_events::SubjectComponent::encode(&facts.run_id)
+        .map_err(|_| DispatchRefError::InvalidRunRef)?;
+    let run_ref = myelin_refs::parse(&format!(
+        "myelin://{}/ci/run/{}",
+        facts.tenant.as_str(),
+        encoded_run_id.as_str()
+    ))
+    .map_err(|_| DispatchRefError::InvalidRunRef)?;
+    let run_aggregate = AggregateKey(format!("run:{}", encoded_run_id.as_str()));
+    let commit =
+        myelin_events::check_seam::CheckCommit::from_repo_root(&facts.repo_root, &facts.commit_oid)
+            .map_err(|_| DispatchRefError::InvalidCommitRef)?;
+
     let run_started = EventDraft {
         type_: EventType(CI_RUN_STARTED.to_string()),
-        subject: ArtifactRef(format!("ci/run/{}", facts.run_id)),
-        aggregate: AggregateKey(format!("ci/run/{}", facts.run_id)),
+        subject: run_ref.clone(),
+        aggregate: run_aggregate,
         payload: serde_json::json!({
-            "run": format!("ci/run/{}", facts.run_id),
+            "run": run_ref.0,
             "trust_tier": trust_tier,
             "trigger_kind": trigger_kind,
             "definition_snapshot": snapshot.0,
@@ -788,38 +796,51 @@ pub fn reserve_and_start(
         .iter()
         .map(|ctx| {
             let check_status = serde_json::json!({
-                "repo": facts.repo_ref,
+                "repo": facts.repo_root.0,
                 "commit_oid": facts.commit_oid,
                 "context": { "provider": "ci", "name": ctx.name },
                 "state": "queued",
-                "run": format!("ci/run/{}", facts.run_id),
+                "run": run_ref.0,
                 "run_attempt": 1,
                 "trust_tier": git_trust_token(stamp),
                 "cost_settled": false,
             });
-            EventDraft {
-                type_: EventType(myelin_ci_sandbox::events::CI_CHECK_UPDATED.to_string()),
-                subject: check_subject(&facts.repo_ref, &facts.commit_oid, &ctx.name),
-                aggregate: myelin_events::check_seam::check_aggregate(
-                    &facts.repo_ref,
-                    &facts.commit_oid,
-                ),
-                payload: check_status,
-                data_role: DataRole::Controller,
-                visibility: Visibility::Internal,
-                contains_personal_data: false,
-                pii_key_ref: None,
-            }
+            myelin_events::check_seam::check_updated_draft(&commit, &ctx.name, check_status)
+                .map_err(|_| DispatchRefError::InvalidCheckRef)
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
-    StartHandoff {
+    Ok(StartHandoff {
         start_spec,
         run_write,
         run_started,
         queued_checks,
+    })
+}
+
+/// Canonical ArtifactRef derivation failed while assembling an atomic dispatch bundle.
+/// Fixed variants keep untrusted source strings out of logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchRefError {
+    /// The run id/tenant could not form a canonical CI run root.
+    InvalidRunRef,
+    /// The repository root/commit id could not form a canonical Git commit root.
+    InvalidCommitRef,
+    /// A context could not form a canonical check sub-anchor.
+    InvalidCheckRef,
+}
+
+impl std::fmt::Display for DispatchRefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRunRef => write!(f, "invalid canonical CI run reference"),
+            Self::InvalidCommitRef => write!(f, "invalid canonical Git commit reference"),
+            Self::InvalidCheckRef => write!(f, "invalid canonical CI check reference"),
+        }
     }
 }
+
+impl std::error::Error for DispatchRefError {}
 
 /// The `ci.check.updated.trust_tier` token (the 2-way merge-gate projection, X-1):
 /// `untrusted_fork` for a fork, `trusted` otherwise (a self-hosted member run is trusted CODE for the
@@ -836,6 +857,8 @@ fn git_trust_token(stamp: &TrustStamp) -> &'static str {
 mod tests {
     use super::*;
     use crate::dispatch::{stamp_trust, RunProvenance};
+    use myelin_events::{derive_envelope, Actor, EmitContext, Region, StreamSubject, Timestamp};
+    use myelin_identity::{Principal, PrincipalId, PrincipalKind};
     use myelin_storage::FsBlobStore;
 
     const PINNED: &str = "registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000";
@@ -923,7 +946,10 @@ mod tests {
                 (0..10u32).map(|v| v.to_string()).collect(),
             );
         }
-        let def = CiDefinition { on: OnTrigger::Push, jobs: vec![job] };
+        let def = CiDefinition {
+            on: OnTrigger::Push,
+            jobs: vec![job],
+        };
         let err = resolve_snapshot(&def, &blobs(), &tenant())
             .expect_err("an astronomical matrix must be refused");
         assert!(
@@ -936,7 +962,10 @@ mod tests {
         let ok = JobDef::normal("test", PINNED2, ["test"])
             .with_matrix("os", vec!["linux".into(), "mac".into(), "win".into()])
             .with_matrix("v", vec!["1".into(), "2".into(), "3".into(), "4".into()]);
-        let def_ok = CiDefinition { on: OnTrigger::Push, jobs: vec![ok] };
+        let def_ok = CiDefinition {
+            on: OnTrigger::Push,
+            jobs: vec![ok],
+        };
         let (snap, _addr) = resolve_snapshot(&def_ok, &blobs(), &tenant())
             .expect("a modestly-sized matrix resolves");
         assert_eq!(snap.jobs.len(), 12, "3×4 expands to 12 instances");
@@ -1007,20 +1036,33 @@ mod tests {
 
     #[test]
     fn command_hash_and_concrete_matrix_fan_in_are_deterministic() {
-        let definition = |command: &str| CiDefinition { on: OnTrigger::Push, jobs: vec![
-            JobDef::normal("build", PINNED, [command]).with_matrix("os", vec!["linux".into(), "macos".into()]),
-            JobDef::normal("test", PINNED2, ["test"]).with_needs(["build"])
-                .with_matrix("rust", vec!["stable".into(), "beta".into()]),
-        ] };
+        let definition = |command: &str| CiDefinition {
+            on: OnTrigger::Push,
+            jobs: vec![
+                JobDef::normal("build", PINNED, [command])
+                    .with_matrix("os", vec!["linux".into(), "macos".into()]),
+                JobDef::normal("test", PINNED2, ["test"])
+                    .with_needs(["build"])
+                    .with_matrix("rust", vec!["stable".into(), "beta".into()]),
+            ],
+        };
         let (first, hash) = resolve_snapshot(&definition("build"), &blobs(), &tenant()).unwrap();
         let (_, repeat) = resolve_snapshot(&definition("build"), &blobs(), &tenant()).unwrap();
         let (_, changed) = resolve_snapshot(&definition("build-v2"), &blobs(), &tenant()).unwrap();
         assert_eq!(hash, repeat);
         assert_ne!(hash, changed);
-        let builds: Vec<String> = first.jobs.iter().filter(|job| job.name.starts_with("build--"))
-            .map(|job| job.name.clone()).collect();
+        let builds: Vec<String> = first
+            .jobs
+            .iter()
+            .filter(|job| job.name.starts_with("build--"))
+            .map(|job| job.name.clone())
+            .collect();
         assert_eq!(builds.len(), 2);
-        for test in first.jobs.iter().filter(|job| job.name.starts_with("test--")) {
+        for test in first
+            .jobs
+            .iter()
+            .filter(|job| job.name.starts_with("test--"))
+        {
             assert_eq!(test.needs, builds);
         }
     }
@@ -1028,26 +1070,58 @@ mod tests {
     #[test]
     fn malformed_programmatic_plans_fail_closed_without_name_collisions() {
         let prefix = "a".repeat(70);
-        let def = CiDefinition { on: OnTrigger::Push, jobs: vec![
-            JobDef::normal(format!("{prefix}x"), PINNED, ["a"]).with_matrix("os", vec!["linux".into()]),
-            JobDef::normal(format!("{prefix}y"), PINNED2, ["b"]).with_matrix("os", vec!["linux".into()]),
-        ] };
+        let def = CiDefinition {
+            on: OnTrigger::Push,
+            jobs: vec![
+                JobDef::normal(format!("{prefix}x"), PINNED, ["a"])
+                    .with_matrix("os", vec!["linux".into()]),
+                JobDef::normal(format!("{prefix}y"), PINNED2, ["b"])
+                    .with_matrix("os", vec!["linux".into()]),
+            ],
+        };
         let (plan, _) = resolve_snapshot(&def, &blobs(), &tenant()).unwrap();
         assert_ne!(plan.jobs[0].name, plan.jobs[1].name);
-        let bad = CiDefinition { on: OnTrigger::Push, jobs: vec![JobDef::normal("unicode-雪", PINNED, ["run"])] };
-        assert!(matches!(resolve_snapshot(&bad, &blobs(), &tenant()), Err(ResolveError::InvalidPlan(_))));
-        let empty = CiDefinition { on: OnTrigger::Push, jobs: vec![JobDef::normal("build", PINNED, std::iter::empty::<String>())] };
-        assert!(matches!(resolve_snapshot(&empty, &blobs(), &tenant()), Err(ResolveError::InvalidPlan(_))));
+        let bad = CiDefinition {
+            on: OnTrigger::Push,
+            jobs: vec![JobDef::normal("unicode-雪", PINNED, ["run"])],
+        };
+        assert!(matches!(
+            resolve_snapshot(&bad, &blobs(), &tenant()),
+            Err(ResolveError::InvalidPlan(_))
+        ));
+        let empty = CiDefinition {
+            on: OnTrigger::Push,
+            jobs: vec![JobDef::normal(
+                "build",
+                PINNED,
+                std::iter::empty::<String>(),
+            )],
+        };
+        assert!(matches!(
+            resolve_snapshot(&empty, &blobs(), &tenant()),
+            Err(ResolveError::InvalidPlan(_))
+        ));
     }
 
     #[test]
     fn snapshot_ref_is_exact_tenant_scoped_lowercase_blake3() {
         let address = ContentHash::blake3(b"snapshot");
         let reference = snapshot_ref(&tenant(), &address);
-        assert_eq!(reference.0, format!("myelin://acme/ci/snapshot/{}", address.to_multihash_string()));
-        let digest = reference.0.strip_prefix("myelin://acme/ci/snapshot/blake3:").unwrap();
+        assert_eq!(
+            reference.0,
+            format!(
+                "myelin://acme/ci/snapshot/{}",
+                address.to_multihash_string()
+            )
+        );
+        let digest = reference
+            .0
+            .strip_prefix("myelin://acme/ci/snapshot/blake3:")
+            .unwrap();
         assert_eq!(digest.len(), 64);
-        assert!(digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert!(digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
     }
 
     /// An empty definition + a structural-DAG defect (a cycle / a dangling need / a dup name) is
@@ -1107,16 +1181,32 @@ mod tests {
             Err(ResolveError::DuplicateJob(n)) if n == "a"
         ));
         assert_eq!(
-            resolve_snapshot(&CiDefinition { on: OnTrigger::Push,
-                jobs: vec![JobDef::normal("a", PINNED, ["a"]).with_needs(["a"])] }, &store, &tenant()),
+            resolve_snapshot(
+                &CiDefinition {
+                    on: OnTrigger::Push,
+                    jobs: vec![JobDef::normal("a", PINNED, ["a"]).with_needs(["a"])]
+                },
+                &store,
+                &tenant()
+            ),
             Err(ResolveError::SelfNeed("a".into()))
         );
         assert_eq!(
-            resolve_snapshot(&CiDefinition { on: OnTrigger::Push, jobs: vec![
-                JobDef::normal("a", PINNED, ["a"]),
-                JobDef::normal("b", PINNED2, ["b"]).with_needs(["a", "a"]),
-            ] }, &store, &tenant()),
-            Err(ResolveError::DuplicateNeed { job: "b".into(), need: "a".into() })
+            resolve_snapshot(
+                &CiDefinition {
+                    on: OnTrigger::Push,
+                    jobs: vec![
+                        JobDef::normal("a", PINNED, ["a"]),
+                        JobDef::normal("b", PINNED2, ["b"]).with_needs(["a", "a"]),
+                    ]
+                },
+                &store,
+                &tenant()
+            ),
+            Err(ResolveError::DuplicateNeed {
+                job: "b".into(),
+                need: "a".into()
+            })
         );
     }
 
@@ -1132,7 +1222,10 @@ mod tests {
             on: OnTrigger::Push,
             jobs: vec![JobDef::normal("gen-matrix", PINNED, ["generate"]).as_generator()],
         };
-        assert!(matches!(resolve_snapshot(&def, &blobs(), &tenant()), Err(ResolveError::InvalidPlan(_))));
+        assert!(matches!(
+            resolve_snapshot(&def, &blobs(), &tenant()),
+            Err(ResolveError::InvalidPlan(_))
+        ));
         // A normal definition has no generator.
         let plain = CiDefinition {
             on: OnTrigger::Push,
@@ -1147,7 +1240,8 @@ mod tests {
     fn facts() -> RunFacts {
         RunFacts {
             run_id: "run-0001".into(),
-            repo_ref: "myelin://acme/git/repo/web".into(),
+            tenant: TenantId("acme".into()),
+            repo_root: myelin_git::project::git_repo_ref("acme", "web"),
             commit_oid: "deadbeef".into(),
             contexts: vec![CheckContext::ci("build"), CheckContext::ci("test/unit")],
             cause_event_id: EventId("ev-push-1".into()),
@@ -1160,7 +1254,8 @@ mod tests {
     #[test]
     fn the_reserve_start_handoff_is_an_atomic_bundle() {
         let snap = snapshot_ref(&tenant(), &ContentHash::blake3(b"snap"));
-        let handoff = reserve_and_start(&snap, &member_stamp(), &OnTrigger::Push, &facts());
+        let handoff =
+            reserve_and_start(&snap, &member_stamp(), &OnTrigger::Push, &facts()).unwrap();
 
         assert!(
             handoff.is_atomic_bundle(),
@@ -1186,6 +1281,34 @@ mod tests {
             assert_eq!(c.payload["state"], "queued");
             assert_eq!(c.payload["run_attempt"], 1);
         }
+        for (index, draft) in std::iter::once(&handoff.run_started)
+            .chain(handoff.queued_checks.iter())
+            .enumerate()
+        {
+            let parsed = myelin_refs::parse_scoped(&draft.subject.0)
+                .expect("every dispatch draft has a canonical ArtifactRef subject");
+            assert_eq!(parsed.tenant, tenant());
+            let envelope = derive_envelope(
+                draft.clone(),
+                EmitContext {
+                    event_id: EventId(format!("dispatch-boundary-{index}")),
+                    tenant: tenant(),
+                    region: Region("fr-par".into()),
+                    actor: Actor(Principal::stub(
+                        PrincipalId("ci".into()),
+                        PrincipalKind::Service,
+                        tenant(),
+                    )),
+                    schema_ver: 1,
+                    occurred_at: Timestamp("2026-07-19T00:00:00Z".into()),
+                    recorded_at: Timestamp("2026-07-19T00:00:01Z".into()),
+                    caused_by: None,
+                },
+                None,
+            );
+            StreamSubject::of(&envelope)
+                .expect("every dispatch draft forms a canonical transport subject");
+        }
         // The StartSpec names the ci.pipeline workflow + starts on the snapshot ref.
         assert_eq!(handoff.start_spec.wf_type, CI_PIPELINE_WF_TYPE);
         assert_eq!(handoff.start_spec.input, vec![snap]);
@@ -1199,7 +1322,8 @@ mod tests {
     #[test]
     fn the_trust_tier_rides_the_row_and_every_check_zero_divergence() {
         let snap = snapshot_ref(&tenant(), &ContentHash::blake3(b"snap"));
-        let handoff = reserve_and_start(&snap, &fork_stamp(), &OnTrigger::PullRequest, &facts());
+        let handoff =
+            reserve_and_start(&snap, &fork_stamp(), &OnTrigger::PullRequest, &facts()).unwrap();
         assert_eq!(
             handoff.run_write.trust_tier, "untrusted_fork",
             "the 3-way row tier"
@@ -1214,21 +1338,22 @@ mod tests {
         assert!(handoff.is_atomic_bundle());
     }
 
-    /// The queued check subject is the X-1 `repo#commit-<oid>/check-<context>` seam grammar (the
+    /// The queued check subject is the X-1 canonical commit root plus `#check-<context>` (the
     /// byte-identical Git-consumed subject — REUSES the frozen check_seam helper, no drift).
     #[test]
     fn the_queued_check_subject_is_the_x1_seam_grammar() {
         let snap = snapshot_ref(&tenant(), &ContentHash::blake3(b"snap"));
-        let handoff = reserve_and_start(&snap, &member_stamp(), &OnTrigger::Push, &facts());
+        let handoff =
+            reserve_and_start(&snap, &member_stamp(), &OnTrigger::Push, &facts()).unwrap();
         let build = &handoff.queued_checks[0];
         assert_eq!(
-            build.subject.0, "myelin://acme/git/repo/web#commit-deadbeef/check-build",
+            build.subject.0, "myelin://acme/git/commit/web:deadbeef#check-build",
             "the X-1 check subject grammar"
         );
         // The aggregate is the per-commit ordering partition (all contexts share it).
         for c in &handoff.queued_checks {
             assert_eq!(
-                c.aggregate.0, "myelin://acme/git/repo/web#commit-deadbeef",
+                c.aggregate.0, "commit:web:deadbeef",
                 "the per-commit aggregate (the ordering partition the contexts share)"
             );
         }
@@ -1247,7 +1372,7 @@ mod tests {
             (OnTrigger::Schedule, "schedule"),
             (OnTrigger::Agent, "agent"),
         ] {
-            let h = reserve_and_start(&snap, &member_stamp(), &on, &facts());
+            let h = reserve_and_start(&snap, &member_stamp(), &on, &facts()).unwrap();
             assert_eq!(h.run_write.trigger_kind, tok, "trigger_kind for {on:?}");
         }
     }

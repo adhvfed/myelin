@@ -53,6 +53,135 @@ pub const MAX_SUBJECT_TOKEN_BYTES: usize = 255;
 /// The maximum wire-subject size produced by the event bus, including the `evt.` root.
 pub const MAX_STREAM_SUBJECT_BYTES: usize = 1024;
 
+/// A reversible, canonical encoding for one logical identifier carried inside a NATS subject
+/// token. Only ASCII alphanumerics, `-`, and `_` remain literal; every other UTF-8 byte is encoded
+/// as strict uppercase `%XX`. In particular `.`, `/`, `:`, `#`, and `%` can never be mistaken for
+/// a transport or composed-key delimiter.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SubjectComponent(String);
+
+/// A component was empty, malformed, non-canonical, or too large for one bounded subject token.
+/// Variants deliberately carry no attacker-controlled input so trust-boundary errors are safe to
+/// log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubjectComponentError {
+    /// The logical component was empty.
+    Empty,
+    /// A `%` escape was malformed/lowercase, decoded UTF-8 was invalid, or literals were not the
+    /// canonical minimal representation.
+    NonCanonical,
+    /// The encoded component exceeds the finite subject-token bound.
+    TooLong,
+}
+
+impl std::fmt::Display for SubjectComponentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "subject component is empty"),
+            Self::NonCanonical => write!(f, "subject component encoding is non-canonical"),
+            Self::TooLong => write!(f, "subject component exceeds its bounded size"),
+        }
+    }
+}
+
+impl std::error::Error for SubjectComponentError {}
+
+impl SubjectComponent {
+    /// Encode a logical identifier into one delimiter-safe subject component.
+    pub fn encode(raw: &str) -> Result<Self, SubjectComponentError> {
+        if raw.is_empty() {
+            return Err(SubjectComponentError::Empty);
+        }
+        let mut encoded = String::with_capacity(raw.len());
+        for byte in raw.as_bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+                encoded.push(*byte as char);
+            } else {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                encoded.push('%');
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+        if encoded.len() > MAX_SUBJECT_TOKEN_BYTES {
+            return Err(SubjectComponentError::TooLong);
+        }
+        Ok(Self(encoded))
+    }
+
+    /// Parse a strict canonical encoded component. Lowercase escapes, escaped safe literals,
+    /// malformed escapes, and invalid UTF-8 are rejected rather than normalized.
+    pub fn parse(encoded: &str) -> Result<Self, SubjectComponentError> {
+        if encoded.is_empty() {
+            return Err(SubjectComponentError::Empty);
+        }
+        if encoded.len() > MAX_SUBJECT_TOKEN_BYTES {
+            return Err(SubjectComponentError::TooLong);
+        }
+        let bytes = encoded.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'%' => {
+                    if index + 2 >= bytes.len() {
+                        return Err(SubjectComponentError::NonCanonical);
+                    }
+                    let hi = decode_upper_hex(bytes[index + 1])
+                        .ok_or(SubjectComponentError::NonCanonical)?;
+                    let lo = decode_upper_hex(bytes[index + 2])
+                        .ok_or(SubjectComponentError::NonCanonical)?;
+                    decoded.push((hi << 4) | lo);
+                    index += 3;
+                }
+                byte if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') => {
+                    decoded.push(byte);
+                    index += 1;
+                }
+                _ => return Err(SubjectComponentError::NonCanonical),
+            }
+        }
+        let raw = std::str::from_utf8(&decoded).map_err(|_| SubjectComponentError::NonCanonical)?;
+        let canonical = Self::encode(raw)?;
+        if canonical.0 != encoded {
+            return Err(SubjectComponentError::NonCanonical);
+        }
+        Ok(canonical)
+    }
+
+    /// The canonical encoded bytes used inside an aggregate identifier.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Recover the logical identifier.
+    pub fn decode(&self) -> String {
+        let bytes = self.0.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' {
+                let hi = decode_upper_hex(bytes[index + 1]).expect("validated uppercase escape");
+                let lo = decode_upper_hex(bytes[index + 2]).expect("validated uppercase escape");
+                decoded.push((hi << 4) | lo);
+                index += 3;
+            } else {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+        String::from_utf8(decoded).expect("validated UTF-8 component")
+    }
+}
+
+fn decode_upper_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// The `(tenant, region)` first-class partition key the streams are keyed under (contract 12.1,
 /// **CONSUMED**; injected by the harness; ADR-11). This is the Bus's consumer side of 12.1: it
 /// composes the two `myelin-tenancy` value types ([`TenantId`] + [`Region`]) into the partition the
@@ -392,6 +521,21 @@ mod tests {
             occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
             recorded_at: Timestamp("2026-06-19T00:00:01Z".into()),
             payload: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn subject_component_is_reversible_strict_and_delimiter_safe() {
+        let raw = "repo.with/slash:and%percent#anchor";
+        let encoded = SubjectComponent::encode(raw).unwrap();
+        assert_eq!(
+            encoded.as_str(),
+            "repo%2Ewith%2Fslash%3Aand%25percent%23anchor"
+        );
+        assert_eq!(encoded.decode(), raw);
+        assert_eq!(SubjectComponent::parse(encoded.as_str()).unwrap(), encoded);
+        for malformed in ["repo%2ewith", "repo%2F%", "repo%41", "repo.with", ""] {
+            assert!(SubjectComponent::parse(malformed).is_err(), "{malformed}");
         }
     }
 

@@ -132,6 +132,30 @@ impl RefName {
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
+    /// Validate Git's canonical fully-qualified ref-name rules.
+    pub fn validate(&self) -> Result<(), RefNameError> {
+        let name = self.0.as_str();
+        let invalid = !name.starts_with("refs/")
+            || name.ends_with('/')
+            || name.ends_with('.')
+            || name.contains("//")
+            || name.contains("..")
+            || name.contains("@{")
+            || name.contains([':', '\\'])
+            || name
+                .split('/')
+                .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
+            || name.chars().any(|c| {
+                c.is_ascii_control()
+                    || c.is_ascii_whitespace()
+                    || matches!(c, '~' | '^' | '?' | '*' | '[')
+            });
+        if invalid {
+            Err(RefNameError)
+        } else {
+            Ok(())
+        }
+    }
     /// `true` iff this is a protected branch under the (modeled) ruleset — `refs/heads/main` and
     /// `refs/heads/release/*` here (the real ruleset is the GIT-P13/GIT-P26 branch-protection
     /// resolver; this is the minimal protected-set the policy gates on).
@@ -139,6 +163,84 @@ impl RefName {
         self.0 == "refs/heads/main" || self.0.starts_with("refs/heads/release/")
     }
 }
+
+/// A ref name failed Git's canonical check-ref-format subset. Fixed/redacted for safe logging.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefNameError;
+
+impl std::fmt::Display for RefNameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid canonical Git ref name")
+    }
+}
+
+impl std::error::Error for RefNameError {}
+
+/// The canonical delimiter-safe identity of one repository ref on the event bus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitRefEventKey {
+    encoded_repo: myelin_events::SubjectComponent,
+    encoded_ref: myelin_events::SubjectComponent,
+}
+
+impl GitRefEventKey {
+    /// Validate the logical ref name and encode repository/ref components exactly once.
+    pub fn new(repo: &str, ref_name: &RefName) -> Result<Self, GitRefEventKeyError> {
+        ref_name.validate().map_err(|_| GitRefEventKeyError)?;
+        Ok(Self {
+            encoded_repo: myelin_events::SubjectComponent::encode(repo)
+                .map_err(|_| GitRefEventKeyError)?,
+            encoded_ref: myelin_events::SubjectComponent::encode(&ref_name.0)
+                .map_err(|_| GitRefEventKeyError)?,
+        })
+    }
+
+    /// Parse a canonical composed id and recover the logical repository/ref pair.
+    pub fn parse_id(id: &str) -> Result<(String, RefName), GitRefEventKeyError> {
+        let (repo, ref_name) = id.split_once(':').ok_or(GitRefEventKeyError)?;
+        let repo = myelin_events::SubjectComponent::parse(repo)
+            .map_err(|_| GitRefEventKeyError)?
+            .decode();
+        let ref_name = RefName::new(
+            myelin_events::SubjectComponent::parse(ref_name)
+                .map_err(|_| GitRefEventKeyError)?
+                .decode(),
+        );
+        ref_name.validate().map_err(|_| GitRefEventKeyError)?;
+        Ok((repo, ref_name))
+    }
+
+    /// The aggregate `<type>:<id>` form used by StreamSubject.
+    pub fn aggregate(&self) -> AggregateKey {
+        AggregateKey(format!("ref:{}", self.id()))
+    }
+
+    /// Mint the canonical Git ref ArtifactRef through the shared Refs parser.
+    pub fn subject(&self, tenant: &str) -> Result<ArtifactRef, GitRefEventKeyError> {
+        myelin_refs::parse(&format!("myelin://{tenant}/git/ref/{}", self.id()))
+            .map_err(|_| GitRefEventKeyError)
+    }
+
+    fn id(&self) -> String {
+        format!(
+            "{}:{}",
+            self.encoded_repo.as_str(),
+            self.encoded_ref.as_str()
+        )
+    }
+}
+
+/// A Git ref event key could not be validated, encoded, or parsed canonically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GitRefEventKeyError;
+
+impl std::fmt::Display for GitRefEventKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid canonical Git ref event key")
+    }
+}
+
+impl std::error::Error for GitRefEventKeyError {}
 
 /// A git object id (rendered hex; the data model stores `bytea`, hash-agnostic — arch `01 §3.0`).
 /// The all-zeros oid is the **create/delete sentinel** (a push from zero is a create; a push to
@@ -224,6 +326,8 @@ pub struct PushSession {
 /// rule that fired (a rejected push is LOUD, never a silent partial write).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RejectReason {
+    /// A proposed update did not name a canonical, bus-encodable fully-qualified Git ref.
+    InvalidRefName,
     /// A force-push (non-fast-forward) was attempted on a protected ref (ruleset force-push ban).
     ForcePushOnProtected {
         /// the protected ref.
@@ -1012,15 +1116,17 @@ impl RefStore {
     /// separates the repo from the ref; the per-aggregate ordering the outbox enforces is per-ref
     /// (so different refs of one repo advance in parallel; one ref is strictly serialised).
     fn aggregate_for(&self, ref_name: &RefName) -> AggregateKey {
-        AggregateKey(format!("{}:{}", self.repo, ref_name.0))
+        GitRefEventKey::new(&self.repo, ref_name)
+            .expect("receive validates canonical Git ref event keys")
+            .aggregate()
     }
 
     /// The subject ref for the `git.ref.updated` event (`myelin://<tenant>/git/ref/<repo>:<ref>`).
     fn subject_for(&self, ref_name: &RefName) -> ArtifactRef {
-        ArtifactRef(format!(
-            "myelin://{}/git/ref/{}:{}",
-            self.ctx_base.tenant.0, self.repo, ref_name.0
-        ))
+        GitRefEventKey::new(&self.repo, ref_name)
+            .expect("receive validates canonical Git ref event keys")
+            .subject(&self.ctx_base.tenant.0)
+            .expect("validated Git ref key forms a canonical ArtifactRef")
     }
 
     /// **The receive-pack write path** (arch §2): policy → (reject-before-ref-move) → object
@@ -1043,6 +1149,13 @@ impl RefStore {
             tenant: self.ctx_base.tenant.0.clone(),
             ..PushPolicy::default()
         };
+        if push
+            .updates
+            .iter()
+            .any(|update| GitRefEventKey::new(&self.repo, &update.ref_name).is_err())
+        {
+            return Ok(PushOutcome::Rejected(RejectReason::InvalidRefName));
+        }
         if let Err(reason) = policy.evaluate(push) {
             // The quarantine is discarded (never promoted) — we simply do NOT call migration.
             return Ok(PushOutcome::Rejected(reason));
@@ -1638,7 +1751,7 @@ mod tests {
         assert_eq!(outbox.committed_count(), 1);
         // The quarantine was migrated (promoted into the object DB).
         assert!(db.contains(&Oid::new("cafe")));
-        // The emitted row is git.ref.updated on the per-ref aggregate `core:refs/heads/feature`.
+        // The emitted row is git.ref.updated on the delimiter-safe per-ref aggregate.
         let id = match store
             .receive(
                 &human_push("refs/heads/x", Oid::zero(), Oid::new("bb")),
@@ -1652,7 +1765,44 @@ mod tests {
         };
         let row = outbox.row(&id).unwrap();
         assert_eq!(row.envelope.type_.0, GIT_REF_UPDATED);
-        assert_eq!(row.aggregate, AggregateKey("core:refs/heads/x".into()));
+        assert_eq!(
+            row.aggregate,
+            AggregateKey("ref:core:refs%2Fheads%2Fx".into())
+        );
+        myelin_events::StreamSubject::of(&row.envelope)
+            .expect("a canonical pushed ref forms a transport subject");
+    }
+
+    #[test]
+    fn git_ref_event_key_round_trips_refs_heads_main_and_reserved_components() {
+        let key = GitRefEventKey::new(
+            "repo.with:delimiter%value",
+            &RefName::new("refs/heads/main"),
+        )
+        .unwrap();
+        assert_eq!(
+            key.aggregate().0,
+            "ref:repo%2Ewith%3Adelimiter%25value:refs%2Fheads%2Fmain"
+        );
+        assert_eq!(
+            key.subject("acme").unwrap().0,
+            "myelin://acme/git/ref/repo%2Ewith%3Adelimiter%25value:refs%2Fheads%2Fmain"
+        );
+        assert_eq!(
+            GitRefEventKey::parse_id(key.aggregate().0.strip_prefix("ref:").unwrap()).unwrap(),
+            (
+                "repo.with:delimiter%value".into(),
+                RefName::new("refs/heads/main")
+            )
+        );
+        for malformed in [
+            "repo:refs%2fheads%2Fmain",
+            "repo:refs/heads/main",
+            "repo%41:refs%2Fheads%2Fmain",
+            "repo:refs%2Fheads%2Fbad%2E%2Ename",
+        ] {
+            assert!(GitRefEventKey::parse_id(malformed).is_err(), "{malformed}");
+        }
     }
 
     /// **emit-iff-committed: crash AFTER policy (before commit) emits NOTHING (0 ghost).** The ref
@@ -2190,7 +2340,7 @@ mod tests {
             .collect();
         assert_eq!(seqs, vec![1, 2, 3], "update_seq is monotonic per ref");
         // The outbox carries three rows on the one per-ref aggregate, seqs 0,1,2 (per-aggregate order).
-        let agg = AggregateKey("core:refs/heads/feature".into());
+        let agg = AggregateKey("ref:core:refs%2Fheads%2Ffeature".into());
         let mut agg_seqs: Vec<u64> = ids
             .iter()
             .map(|id| {
@@ -2313,7 +2463,7 @@ mod tests {
             prev = new;
         }
         // The outbox per-aggregate seqs are gap-free 0..k-1 in push order (the ref-update order).
-        let agg = AggregateKey("core:refs/heads/hot".into());
+        let agg = AggregateKey("ref:core:refs%2Fheads%2Fhot".into());
         let outbox_seqs: Vec<u64> = ids
             .iter()
             .map(|id| {

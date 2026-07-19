@@ -48,11 +48,12 @@ use myelin_ci_dispatch::{
 };
 use myelin_events::consumer::{Consumer, Delivered, Message, Subscription};
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, ConsumerName, CorrelationId, DataRole, DedupLedger,
-    DurableDedup, EventEnvelope, EventId, EventType, HandlerTx, OutboxStore, PrefetchBound,
-    Timestamp, UlidMinter, Visibility, CONSUMER_DEDUP_MIGRATION, OUTBOX_MIGRATION,
+    Actor, ConsumerName, CorrelationId, DataRole, DedupLedger, DurableDedup, EventEnvelope, EventId,
+    EventType, HandlerTx, OutboxStore, PrefetchBound, Timestamp, UlidMinter, Visibility,
+    CONSUMER_DEDUP_MIGRATION, OUTBOX_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+use myelin_git::receive_pack::{GitRefEventKey, RefName};
 use myelin_storage::events_durable::{DurableDeadLetterBacking, DurableDedupBacking};
 use myelin_storage::outbox_durable::PgOutboxBacking;
 use myelin_storage::{BlobStore, FsBlobStore};
@@ -256,6 +257,7 @@ fn principal() -> Principal {
 }
 
 fn push_envelope(ev: &str, repo: &str, new_oid: &str) -> EventEnvelope {
+    let key = GitRefEventKey::new(repo, &RefName::new("refs/heads/main")).unwrap();
     EventEnvelope {
         event_id: EventId(ev.into()),
         type_: EventType(myelin_git::events::GIT_REF_UPDATED.into()),
@@ -263,8 +265,8 @@ fn push_envelope(ev: &str, repo: &str, new_oid: &str) -> EventEnvelope {
         tenant: TenantId("acme".into()),
         region: Region("fr-par".into()),
         actor: Actor(principal()),
-        subject: ArtifactRef(format!("myelin://acme/git/ref/{repo}:refs/heads/main")),
-        aggregate: AggregateKey(format!("{repo}:refs/heads/main")),
+        subject: key.subject("acme").unwrap(),
+        aggregate: key.aggregate(),
         causation_id: None,
         correlation_id: CorrelationId(format!("corr-{ev}")),
         caused_by: None,

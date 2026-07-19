@@ -40,6 +40,10 @@ use std::collections::BTreeMap;
 const REPO: &str = "myelin://acme/git/repo/core";
 const COMMIT: &str = "abc123def";
 
+fn commit() -> myelin_events::CheckCommit {
+    myelin_events::CheckCommit::from_repo_root(&TArtifactRef(REPO.into()), COMMIT).unwrap()
+}
+
 /// The SYNTHETIC `ci.check.updated` producer (the seam-floor emitter — CI's real producer is
 /// EB-27/M4). Builds a delivered envelope carrying the OPAQUE `CheckStatus` payload (the Bus carries
 /// it as a `serde_json::Value`; the consumer decodes it). `event_id` is stamped per (context,
@@ -83,8 +87,8 @@ fn synthetic_check_updated(
             PrincipalKind::Service,
             TenantId("acme".into()),
         )),
-        subject: check_subject(REPO, COMMIT, context),
-        aggregate: check_aggregate(REPO, COMMIT),
+        subject: check_subject(&commit(), context).unwrap(),
+        aggregate: check_aggregate(&commit()),
         causation_id: None,
         correlation_id: CorrelationId(format!("corr-{COMMIT}")),
         caused_by: None,
@@ -166,7 +170,7 @@ fn consumer_leg_per_aggregate_ordered_supersession_drops_stale() {
 
     // The Bus's per-aggregate ordering substrate (the carriage half) orders them by seq regardless of
     // the SCRAMBLED arrival (3, 1, 2) — this is what the consumer reads.
-    let mut order = CheckSeamOrder::new(REPO, COMMIT);
+    let mut order = CheckSeamOrder::new(&commit());
     assert!(order.ingest(&build2, 3).unwrap());
     assert!(order.ingest(&build1, 1).unwrap());
     assert!(order.ingest(&test1, 2).unwrap());
@@ -260,7 +264,9 @@ fn consumer_leg_dead_letters_a_foreign_type() {
     // Deliver it directly to the handler (the subject still matches the prefix; the handler's own
     // type-guard is the second line of defence).
     assert!(matches!(
-        consumer.handler().handle(&env, &mut myelin_events::HandlerTx::none()),
+        consumer
+            .handler()
+            .handle(&env, &mut myelin_events::HandlerTx::none()),
         myelin_events::HandleOutcome::NonRetryable(_)
     ));
 }

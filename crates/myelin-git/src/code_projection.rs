@@ -80,12 +80,13 @@ use std::collections::BTreeMap;
 
 use myelin_events::{
     AggregateKey, ArtifactRef, DataRole, EmitContextBase, EventDraft, EventType, IdMinter,
-    OutboxError, OutboxStore, OutboxTx, Visibility,
+    OutboxError, OutboxStore, OutboxTx, SubjectComponent, Visibility,
 };
 use myelin_query::FieldValue;
 use myelin_search::SearchProjection;
 
 use crate::events::GIT_BLOB_SNAPSHOT;
+use crate::receive_pack::{GitRefEventKey, RefName};
 use crate::search_projection::{FACET_BLOB_OID, FACET_LANGUAGE, FACET_PATH};
 
 // ───────────────────────────── the indexed-ref policy ────────────────────────────────────────────
@@ -598,26 +599,38 @@ impl<'a, R: RestrictionPolicy> CodeProjectionEmitter<'a, R> {
         }
     }
 
-    /// The per-blob artifact ref `myelin://<tenant>/git/blob/<repo>:<ref>:<path>` (§9 / contract 5.1).
-    fn blob_ref(&self, ref_name: &str, path: &str) -> ArtifactRef {
-        ArtifactRef(format!(
+    /// The per-blob artifact ref with each composed id component reversibly encoded.
+    fn blob_ref(&self, ref_name: &str, path: &str) -> Result<ArtifactRef, OutboxError> {
+        let repo = SubjectComponent::encode(&self.repo)
+            .map_err(|_| OutboxError("invalid blob repository component".into()))?;
+        let ref_name = SubjectComponent::encode(ref_name)
+            .map_err(|_| OutboxError("invalid blob ref component".into()))?;
+        let path = SubjectComponent::encode(path)
+            .map_err(|_| OutboxError("invalid blob path component".into()))?;
+        myelin_refs::parse(&format!(
             "myelin://{}/git/blob/{}:{}:{}",
-            self.ctx_base.tenant.0, self.repo, ref_name, path
+            self.ctx_base.tenant.0,
+            repo.as_str(),
+            ref_name.as_str(),
+            path.as_str()
         ))
+        .map_err(|_| OutboxError("invalid canonical blob reference".into()))
     }
 
     /// The per-ref aggregate for the projection emits — the SAME per-ref key the `git.ref.updated`
-    /// event uses (`<repo>:<ref>`), so a blob projection is ordered behind the ref move that produced
+    /// event uses (`ref:<encoded-repo>:<encoded-ref>`), so a blob projection is ordered behind the ref move that produced
     /// it (per-aggregate ordering, contract 2.3). One push's blob docs share the ref aggregate.
-    fn aggregate(&self, ref_name: &str) -> AggregateKey {
-        AggregateKey(format!("{}:{}", self.repo, ref_name))
+    fn aggregate(&self, ref_name: &str) -> Result<AggregateKey, OutboxError> {
+        GitRefEventKey::new(&self.repo, &RefName::new(ref_name))
+            .map(|key| key.aggregate())
+            .map_err(|_| OutboxError("invalid code projection ref key".into()))
     }
 
     /// Build the full [`BlobProjection`] for an upserted blob (the §9 per-blob doc). A restricted path
     /// suppresses the body (symbols/literals/text empty) — the tombstone-on-restrict (§6).
     fn project_upsert(
         &self,
-        ref_name: &str,
+        artifact_ref: ArtifactRef,
         path: &str,
         blob: &Blob,
         commit_message: &str,
@@ -629,7 +642,7 @@ impl<'a, R: RestrictionPolicy> CodeProjectionEmitter<'a, R> {
             String::from_utf8_lossy(&blob.bytes).into_owned()
         };
         BlobProjection {
-            artifact_ref: self.blob_ref(ref_name, path),
+            artifact_ref,
             path: path.to_string(),
             language: detect_language(path),
             symbols: if restricted {
@@ -680,6 +693,7 @@ impl<'a, R: RestrictionPolicy> CodeProjectionEmitter<'a, R> {
         // (the incremental skip). Its length is the changed-blob-count the GATE pins the emit to.
         let changes = diff_trees(last_indexed_tree, new_tip_tree);
         let changed_blob_count = changes.len();
+        let aggregate = self.aggregate(ref_name)?;
 
         // Stage one git.blob.snapshot per change in ONE outbox transaction (co-commit — the emits are
         // durable iff the transaction commits; the cursor advance is gated on the same commit).
@@ -695,9 +709,10 @@ impl<'a, R: RestrictionPolicy> CodeProjectionEmitter<'a, R> {
 
         let mut emitted = Vec::new();
         for change in &changes {
+            let subject = self.blob_ref(ref_name, change.path())?;
             let payload = match change {
                 BlobChange::Upserted { path, blob } => {
-                    let proj = self.project_upsert(ref_name, path, blob, commit_message);
+                    let proj = self.project_upsert(subject.clone(), path, blob, commit_message);
                     // references-not-payloads: the doc carries the blob ref + path + facets + the
                     // (restriction-suppressed) text. The body text is repo content under the processor
                     // posture, NOT inline subject PII — it is the indexable code (§9).
@@ -718,7 +733,7 @@ impl<'a, R: RestrictionPolicy> CodeProjectionEmitter<'a, R> {
                     // A delete tombstone: Search removes the stale doc (Gone is never silently dropped).
                     serde_json::json!({
                         "op": "delete",
-                        "artifact_ref": self.blob_ref(ref_name, path).0,
+                        "artifact_ref": subject.0,
                         "path": path,
                         "blob_oid": oid.0,
                         "acl_object_type": crate::search_projection::GIT_BLOB_ACL_OBJECT_TYPE,
@@ -727,8 +742,8 @@ impl<'a, R: RestrictionPolicy> CodeProjectionEmitter<'a, R> {
             };
             let draft = EventDraft {
                 type_: EventType(GIT_BLOB_SNAPSHOT.into()),
-                subject: self.blob_ref(ref_name, change.path()),
-                aggregate: self.aggregate(ref_name),
+                subject,
+                aggregate: aggregate.clone(),
                 payload,
                 // Repo content — the tenant org is the controller (processor posture, Art. 28 / §4.3).
                 data_role: DataRole::Processor,
@@ -1154,7 +1169,7 @@ mod tests {
         assert_eq!(pl["op"], serde_json::json!("upsert"));
         assert_eq!(
             pl["artifact_ref"],
-            serde_json::json!("myelin://acme/git/blob/core:refs/heads/main:src/main.rs")
+            serde_json::json!("myelin://acme/git/blob/core:refs%2Fheads%2Fmain:src%2Fmain%2Ers")
         );
         assert_eq!(pl["path"], serde_json::json!("src/main.rs"));
         assert_eq!(pl["language"], serde_json::json!("rust"));
@@ -1171,14 +1186,19 @@ mod tests {
         assert!(syms.iter().any(|s| s == "http"));
         let lits = pl["literals"].as_array().unwrap();
         assert!(lits.iter().any(|l| l == "http://x"));
-        // the per-ref aggregate is shared with git.ref.updated (<repo>:<ref>).
-        assert_eq!(row.aggregate, AggregateKey("core:refs/heads/main".into()));
+        // The canonical per-ref aggregate is shared with git.ref.updated.
+        assert_eq!(
+            row.aggregate,
+            AggregateKey("ref:core:refs%2Fheads%2Fmain".into())
+        );
     }
 
     #[test]
     fn into_search_projection_uses_the_spec_facets() {
         let bp = BlobProjection {
-            artifact_ref: ArtifactRef("myelin://acme/git/blob/core:refs/heads/main:a.rs".into()),
+            artifact_ref: ArtifactRef(
+                "myelin://acme/git/blob/core:refs%2Fheads%2Fmain:a%2Ers".into(),
+            ),
             path: "a.rs".into(),
             language: "rust".into(),
             symbols: vec!["parse".into(), "http".into()],

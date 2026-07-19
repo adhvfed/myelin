@@ -54,7 +54,7 @@
 //!
 //! ## references-not-payloads (2.2 outbox-only)
 //! Every fact rides the FROZEN [`myelin_events::check_seam::check_updated_draft`] (the canonical
-//! envelope: `subject = repo#commit-<oid>/check-<context>`, `aggregate = (repo, commit_oid)`) so the
+//! envelope: canonical commit subject plus `#check-<context>`, commit aggregate) so the
 //! grammar is byte-identical to what Git's gate consumes (0 drift). `run` / `details_ref` are
 //! `ArtifactRef`s (the producing run + the jump-to-failure sub-anchor), NEVER log bytes. Emitted via
 //! the OUTBOX ONLY (the `no-raw-publish` lint green); the producer plumbing onto `ctx.emit` is in
@@ -401,7 +401,7 @@ pub fn check_status_payload(
 }
 
 /// **Assemble the canonical `ci.check.updated` [`EventDraft`] for ONE context (arch §4 / 2.2).**
-/// REUSES the FROZEN [`check_updated_draft`] so the `subject = repo#commit-<oid>/check-<context>` +
+/// REUSES the FROZEN [`check_updated_draft`] so the canonical commit/check subject +
 /// `aggregate = (repo, commit_oid)` grammar is byte-identical to what Git's gate consumes (0 drift,
 /// EI-01 §7 reconcile-in-place). The payload is the frozen 5.9 `CheckStatus` shape from
 /// [`check_status_payload`]. The producer emits this via the OUTBOX ONLY (`ctx.emit`, in
@@ -415,9 +415,18 @@ pub fn assemble_check_status(
     required: bool,
     cost: CostPosture,
     fail_step: Option<u32>,
-) -> EventDraft {
+) -> Result<EventDraft, myelin_events::check_seam::CheckSeamError> {
     let payload = check_status_payload(ctx, provider, context, state, required, cost, fail_step);
-    check_updated_draft(&ctx.repo, &ctx.commit_oid, context, payload)
+    let repo = myelin_refs::parse_scoped(&ctx.repo)
+        .map_err(|_| myelin_events::check_seam::CheckSeamError::InvalidRepoRoot)?;
+    if repo.subsystem != "git" || repo.type_ != "repo" || repo.sub.is_some() {
+        return Err(myelin_events::check_seam::CheckSeamError::InvalidRepoRoot);
+    }
+    let commit = myelin_events::check_seam::CheckCommit::from_repo_root(
+        &repo.artifact_ref,
+        &ctx.commit_oid,
+    )?;
+    check_updated_draft(&commit, context, payload)
 }
 
 #[cfg(test)]

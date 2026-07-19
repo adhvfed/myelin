@@ -35,9 +35,10 @@
 //! rests on. The consumer leg (Git's projection) is EB-26/M3; the producer leg (CI) is EB-27/M4.
 
 use myelin_events::{
-    check_aggregate, check_subject, Actor, BusSignal, CheckSeamError, CheckSeamOrder, CiOverall,
-    CiResult, CiResultWaitSubstrate, CorrelationId, DataRole, EventEnvelope, EventId, EventType,
-    MetricRecorder, MetricSample, MetricsSink, Timestamp, Visibility, WakeOutcome,
+    check_aggregate, check_subject, Actor, ArtifactRef, BusSignal, CheckCommit, CheckSeamError,
+    CheckSeamOrder, CiOverall, CiResult, CiResultWaitSubstrate, CorrelationId, DataRole,
+    EventEnvelope, EventId, EventType, MetricRecorder, MetricSample, MetricsSink, Timestamp,
+    Visibility, WakeOutcome,
 };
 use myelin_harness::{Label, Predicate, SignalName, SignalSource};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -45,6 +46,10 @@ use myelin_tenancy::{Region, TenantId};
 
 const REPO: &str = "myelin://acme/git/repo/core";
 const COMMIT: &str = "deadbeefcafe";
+
+fn commit() -> CheckCommit {
+    CheckCommit::from_repo_root(&ArtifactRef(REPO.into()), COMMIT).unwrap()
+}
 
 /// Build a `ci.check.updated` envelope for `(REPO, COMMIT, context)` carrying an opaque
 /// `run_attempt`-stamped `CheckStatus` (the Bus carries it opaque; the drill stamps `run_attempt`
@@ -61,8 +66,8 @@ fn check_env(context: &str, run_attempt: u64, state: &str) -> EventEnvelope {
             PrincipalKind::Service,
             TenantId("acme".into()),
         )),
-        subject: check_subject(REPO, COMMIT, context),
-        aggregate: check_aggregate(REPO, COMMIT),
+        subject: check_subject(&commit(), context).unwrap(),
+        aggregate: check_aggregate(&commit()),
         causation_id: None,
         correlation_id: CorrelationId(format!("corr-{COMMIT}")),
         caused_by: None,
@@ -92,7 +97,7 @@ fn bridge(ordering_gap: i64, src: &mut SignalSource) {
         SignalName::ConsumerLag,
         vec![Label::new(
             "consumer",
-            format!("check-seam:{}", check_aggregate(REPO, COMMIT).0),
+            format!("check-seam:{}", check_aggregate(&commit()).0),
         )],
         ordering_gap,
     );
@@ -102,7 +107,7 @@ fn bridge(ordering_gap: i64, src: &mut SignalSource) {
 /// ordering-gap telemetry reads 0; supersession is deterministic.** The headline GATE.
 #[test]
 fn d11_check_seam_per_aggregate_ordering_holds_under_interleave_and_rerun() {
-    let mut order = CheckSeamOrder::new(REPO, COMMIT);
+    let mut order = CheckSeamOrder::new(&commit());
 
     // The outbox assigned these per-aggregate seqs (state-change order) for ONE commit:
     //   seq 1: build  attempt 1 (failure)
@@ -195,7 +200,7 @@ fn d11_check_seam_per_aggregate_ordering_holds_under_interleave_and_rerun() {
         SignalName::ConsumerLag,
         vec![Label::new(
             "consumer",
-            format!("check-seam:{}", check_aggregate(REPO, COMMIT).0),
+            format!("check-seam:{}", check_aggregate(&commit()).0),
         )],
         Predicate::Eq(0),
     )
@@ -256,7 +261,7 @@ fn d11_ci_result_wait_substrate_wakes_once_on_double_delivery() {
 /// A foreign event can never silently corrupt the partition order the supersession rule depends on.
 #[test]
 fn d11_foreign_event_rejected_from_the_ordering_partition() {
-    let mut order = CheckSeamOrder::new(REPO, COMMIT);
+    let mut order = CheckSeamOrder::new(&commit());
     let mut wrong = check_env("build", 1, "success");
     wrong.type_ = EventType("git.ref.updated".into());
     assert!(matches!(

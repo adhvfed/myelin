@@ -385,7 +385,8 @@ pub fn run_e2e1_pr_context_pane() -> E2eArtifact {
         true,
         CostPosture::Settled,
         Some(E2E1_FAIL_STEP),
-    );
+    )
+    .expect("canonical wedge check reference");
     // The failure fact carries the `#step-<n>` jump-to-failure anchor (resolved through CI-P21's log
     // index) — the pane's "jump to failure" target. Assert the anchor exists on the emitted fact.
     let expected_anchor = details_ref(&run_ref.0, CheckState::Failure, Some(E2E1_FAIL_STEP));

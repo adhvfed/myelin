@@ -646,8 +646,20 @@ pub struct RealCiResultProducer<'a> {
     tenant: myelin_tenancy::TenantId,
     region: myelin_tenancy::Region,
     run_id: String,
-    repo: String,
+    repo: ArtifactRef,
 }
+
+/// The real CI-result producer received an invalid canonical Git/check reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RealCiResultProducerError;
+
+impl std::fmt::Display for RealCiResultProducerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid canonical CI result producer reference")
+    }
+}
+
+impl std::error::Error for RealCiResultProducerError {}
 
 /// **One per-context `ci.check.updated` fact CI emits (the producer-leg input).** references-not-
 /// payloads: the context name, the run_attempt (Git's supersession key), the success verdict, and
@@ -676,14 +688,23 @@ impl<'a> RealCiResultProducer<'a> {
         region: myelin_tenancy::Region,
         run_id: impl Into<String>,
         repo: impl Into<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, RealCiResultProducerError> {
+        let repo = repo.into();
+        let parsed = myelin_refs::parse_scoped(&repo).map_err(|_| RealCiResultProducerError)?;
+        if parsed.tenant != tenant
+            || parsed.subsystem != "git"
+            || parsed.type_ != "repo"
+            || parsed.sub.is_some()
+        {
+            return Err(RealCiResultProducerError);
+        }
+        Ok(Self {
             signals,
             tenant,
             region,
             run_id: run_id.into(),
-            repo: repo.into(),
-        }
+            repo: parsed.artifact_ref,
+        })
     }
 
     /// **Derive the `ci.result` rollup CI emits (the REAL producer derivation, §6.5/§4.12).** Ingests
@@ -703,8 +724,10 @@ impl<'a> RealCiResultProducer<'a> {
         facts: &[CheckFact],
         required_contexts: &[String],
         merge_attempt_id: &str,
-    ) -> CiResult {
-        use myelin_events::check_seam::{check_updated_draft, rollup_ci_result, CheckSeamOrder};
+    ) -> Result<CiResult, RealCiResultProducerError> {
+        use myelin_events::check_seam::{
+            check_updated_draft, rollup_ci_result, CheckCommit, CheckSeamOrder,
+        };
         use myelin_events::{Actor, CorrelationId, EventEnvelope, EventId, Timestamp};
         use myelin_identity::{Principal, PrincipalId, PrincipalKind};
         use std::collections::BTreeMap;
@@ -718,22 +741,24 @@ impl<'a> RealCiResultProducer<'a> {
 
         // ── Step 1: INGEST the per-context facts through the Bus's per-aggregate ordering substrate
         // ([`CheckSeamOrder`]) — interleaved/out-of-`seq` arrivals stay per-aggregate ordered (D-11).
-        let mut order = CheckSeamOrder::new(&self.repo, commit_oid);
+        let commit = CheckCommit::from_repo_root(&self.repo, commit_oid)
+            .map_err(|_| RealCiResultProducerError)?;
+        let mut order = CheckSeamOrder::new(&commit);
         for fact in facts {
             // The producer-leg draft pins the §4.12 envelope shape (subject + aggregate); we wrap it
             // into a delivered envelope carrying the CI-owned opaque CheckStatus (context/run_attempt/
             // state), at the outbox seq the carriage assigned. The ordering substrate reads only
             // type_/aggregate/subject/payload off the envelope.
             let draft = check_updated_draft(
-                &self.repo,
-                commit_oid,
+                &commit,
                 &fact.context,
                 serde_json::json!({
                     "context": fact.context,
                     "run_attempt": fact.run_attempt,
                     "state": if fact.success { "success" } else { "failure" },
                 }),
-            );
+            )
+            .map_err(|_| RealCiResultProducerError)?;
             let env = EventEnvelope {
                 event_id: EventId(format!("evt-{}-{}", fact.context, fact.run_attempt)),
                 type_: draft.type_,
@@ -767,11 +792,11 @@ impl<'a> RealCiResultProducer<'a> {
         for check in order.in_order() {
             let attempt = check.check_status["run_attempt"].as_u64().unwrap_or(0);
             let success = check.check_status["state"].as_str() == Some("success");
-            // strip the `repo#commit-<oid>/check-` prefix to recover the context.
+            // Strip the canonical commit root plus `#check-` prefix to recover the context.
             let ctx = check
                 .subject
                 .0
-                .rsplit_once("/check-")
+                .rsplit_once("#check-")
                 .map(|(_, c)| c.to_string())
                 .unwrap_or_default();
             current
@@ -789,12 +814,12 @@ impl<'a> RealCiResultProducer<'a> {
 
         // ── Step 3: CI DERIVES THE ROLLUP over Git's required gate set (CI's real rollup_ci_result —
         // success iff EVERY required context succeeded; a missing/failed required context fails).
-        rollup_ci_result(
+        Ok(rollup_ci_result(
             commit_oid,
             &post_supersession,
             required_contexts,
             merge_attempt_id,
-        )
+        ))
     }
 
     /// **Deliver the REAL `ci.result` rollup for a merge attempt (§6.5).** Derives the rollup from the
@@ -809,9 +834,9 @@ impl<'a> RealCiResultProducer<'a> {
         facts: &[CheckFact],
         required_contexts: &[String],
         merge_attempt_id: &str,
-    ) -> bool {
-        let result = self.rollup(commit_oid, facts, required_contexts, merge_attempt_id);
-        self.signals.deliver(crate::SignalRow {
+    ) -> Result<bool, RealCiResultProducerError> {
+        let result = self.rollup(commit_oid, facts, required_contexts, merge_attempt_id)?;
+        Ok(self.signals.deliver(crate::SignalRow {
             tenant: self.tenant.clone(),
             region: self.region.clone(),
             run_id: self.run_id.clone(),
@@ -821,7 +846,7 @@ impl<'a> RealCiResultProducer<'a> {
             payload_key_ref: None,
             received_unix_ms: 0,
             consumed_seq: None,
-        })
+        }))
     }
 }
 
@@ -1532,7 +1557,7 @@ mod tests {
     #[test]
     fn real_producer_derives_green_rollup_from_out_of_order_checks() {
         let signals = SignalStore::new();
-        let producer = RealCiResultProducer::new(&signals, tenant(), region(), "R1", REPO);
+        let producer = RealCiResultProducer::new(&signals, tenant(), region(), "R1", REPO).unwrap();
         let facts = vec![
             CheckFact {
                 context: "build".into(),
@@ -1559,7 +1584,9 @@ mod tests {
                 seq: 2,
             }, // at-least-once duplicate — absorbed
         ];
-        let rollup = producer.rollup("deadbeef", &facts, &required(), "R1/merge.queue:0/merge");
+        let rollup = producer
+            .rollup("deadbeef", &facts, &required(), "R1/merge.queue:0/merge")
+            .unwrap();
         assert_eq!(
             rollup.overall,
             CiOverall::Success,
@@ -1579,7 +1606,7 @@ mod tests {
     #[test]
     fn real_producer_derives_failure_on_a_superseding_failure() {
         let signals = SignalStore::new();
-        let producer = RealCiResultProducer::new(&signals, tenant(), region(), "R1", REPO);
+        let producer = RealCiResultProducer::new(&signals, tenant(), region(), "R1", REPO).unwrap();
         let facts = vec![
             CheckFact {
                 context: "build".into(),
@@ -1600,7 +1627,9 @@ mod tests {
                 seq: 3,
             },
         ];
-        let rollup = producer.rollup("deadbeef", &facts, &required(), "R1/merge.queue:0/merge");
+        let rollup = producer
+            .rollup("deadbeef", &facts, &required(), "R1/merge.queue:0/merge")
+            .unwrap();
         assert_eq!(
             rollup.overall,
             CiOverall::Failure,
@@ -1613,7 +1642,7 @@ mod tests {
     #[test]
     fn real_producer_missing_required_context_is_failure() {
         let signals = SignalStore::new();
-        let producer = RealCiResultProducer::new(&signals, tenant(), region(), "R1", REPO);
+        let producer = RealCiResultProducer::new(&signals, tenant(), region(), "R1", REPO).unwrap();
         // only `build` reported — required `test` is absent.
         let facts = vec![CheckFact {
             context: "build".into(),
@@ -1621,7 +1650,9 @@ mod tests {
             success: true,
             seq: 1,
         }];
-        let rollup = producer.rollup("deadbeef", &facts, &required(), "R1/merge.queue:0/merge");
+        let rollup = producer
+            .rollup("deadbeef", &facts, &required(), "R1/merge.queue:0/merge")
+            .unwrap();
         assert_eq!(
             rollup.overall,
             CiOverall::Failure,
@@ -1634,7 +1665,7 @@ mod tests {
     #[test]
     fn real_producer_rollup_is_deterministic_across_arrival_order() {
         let signals = SignalStore::new();
-        let producer = RealCiResultProducer::new(&signals, tenant(), region(), "R1", REPO);
+        let producer = RealCiResultProducer::new(&signals, tenant(), region(), "R1", REPO).unwrap();
         let ordered = vec![
             CheckFact {
                 context: "build".into(),
@@ -1651,13 +1682,17 @@ mod tests {
         ];
         let mut scrambled = ordered.clone();
         scrambled.reverse();
-        let a = producer.rollup("deadbeef", &ordered, &required(), "R1/merge.queue:0/merge");
-        let b = producer.rollup(
-            "deadbeef",
-            &scrambled,
-            &required(),
-            "R1/merge.queue:0/merge",
-        );
+        let a = producer
+            .rollup("deadbeef", &ordered, &required(), "R1/merge.queue:0/merge")
+            .unwrap();
+        let b = producer
+            .rollup(
+                "deadbeef",
+                &scrambled,
+                &required(),
+                "R1/merge.queue:0/merge",
+            )
+            .unwrap();
         assert_eq!(
             a, b,
             "same facts, any arrival order → byte-identical rollup"
@@ -1670,7 +1705,7 @@ mod tests {
     #[test]
     fn real_producer_double_delivery_buffers_one_row() {
         let signals = SignalStore::new();
-        let producer = RealCiResultProducer::new(&signals, tenant(), region(), "R1", REPO);
+        let producer = RealCiResultProducer::new(&signals, tenant(), region(), "R1", REPO).unwrap();
         let facts = vec![
             CheckFact {
                 context: "build".into(),
@@ -1686,8 +1721,12 @@ mod tests {
             },
         ];
         let attempt = "R1/merge.queue:0/merge";
-        let first = producer.deliver("deadbeef", &facts, &required(), attempt);
-        let second = producer.deliver("deadbeef", &facts, &required(), attempt);
+        let first = producer
+            .deliver("deadbeef", &facts, &required(), attempt)
+            .unwrap();
+        let second = producer
+            .deliver("deadbeef", &facts, &required(), attempt)
+            .unwrap();
         assert!(first, "first delivery is new");
         assert!(!second, "the at-least-once double-delivery deduped");
         assert_eq!(signals.buffered_depth(), 1, "ONE buffered ci.result row");

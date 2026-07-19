@@ -53,9 +53,9 @@ fn strong() -> Consistency {
     }
 }
 
-/// The CI check subject — the `repo#commit-<oid>/check-<context>` sub-anchor the summary is about.
+/// The CI check subject — the canonical commit root plus check sub-anchor the summary is about.
 fn check_subject() -> ArtifactRef {
-    ArtifactRef("myelin://acme/git/repo/core#commit-abc123/check-build".into())
+    ArtifactRef("myelin://acme/git/commit/core:abc123#check-build".into())
 }
 
 /// The title a denied viewer must NEVER see (the leak-test payload — a private-repo check title).

@@ -152,7 +152,7 @@ fn git_ref_updated_provider_consumer_wire_shape_round_trips() {
     // pseudonymous payload carries NO inline PII (references-not-payloads).
     assert_eq!(env.type_.0, GIT_REF_UPDATED);
     assert_eq!(
-        env.aggregate.0, "core:refs/heads/main",
+        env.aggregate.0, "ref:core:refs%2Fheads%2Fmain",
         "the per-ref aggregate (2.3)"
     );
     assert!(

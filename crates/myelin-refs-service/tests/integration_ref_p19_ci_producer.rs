@@ -23,7 +23,7 @@
 
 use std::sync::Arc;
 
-use myelin_events::check_seam::{check_subject, check_updated_draft, CheckSeamOrder};
+use myelin_events::check_seam::{check_subject, check_updated_draft, CheckCommit, CheckSeamOrder};
 use myelin_events::{
     Actor, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventId, EventType, Timestamp,
     Visibility,
@@ -142,15 +142,21 @@ fn fact(
     }
 }
 
+fn check_commit(f: &CheckStatus) -> CheckCommit {
+    let repo = myelin_refs::parse_scoped(&f.repo.0).expect("canonical repo root");
+    CheckCommit::from_repo_root(&repo.artifact_ref, &f.commit_oid.0).unwrap()
+}
+
 /// Build a real `ci.check.updated` envelope carrying the fact OPAQUE (the producer leg the Bus carries
-/// per-aggregate ordered). The `subject` follows the §4.12 `repo#commit-<oid>/check-<context>` grammar.
+/// per-aggregate ordered). The `subject` is the canonical commit root plus `#check-<context>`.
 fn check_env(seq: u64, f: &CheckStatus) -> (EventEnvelope, u64) {
+    let commit = check_commit(f);
     let draft = check_updated_draft(
-        &f.repo.0,
-        &f.commit_oid.0,
+        &commit,
         &f.context.name,
         serde_json::to_value(f).expect("CheckStatus serialises"),
-    );
+    )
+    .unwrap();
     let env = EventEnvelope {
         event_id: EventId(format!("evt-{}-{}", f.context.name, f.run_attempt)),
         type_: EventType(draft.type_.0),
@@ -220,13 +226,13 @@ fn ref_d9_ci_check_and_step_anchors_resolve_through_the_one_ladder_root_carried(
 
     // ── Drive a REAL ci.check.updated through the Bus per-aggregate ordering + the supersession. ──
     let f = fact(commit, "build", 1, CheckState::Failure, "run-7", 2);
-    let mut order = CheckSeamOrder::new(&f.repo.0, &f.commit_oid.0);
+    let mut order = CheckSeamOrder::new(&check_commit(&f));
     let (env, seq) = check_env(1, &f);
     assert!(order.ingest(&env, seq).expect("ingest the check envelope"));
-    // The envelope subject follows the §4.12 sub-anchor grammar (repo#commit-<oid>/check-<context>).
+    // The envelope subject follows the §4.12 canonical commit/check grammar.
     assert_eq!(
         env.subject,
-        check_subject(&f.repo.0, &f.commit_oid.0, "build")
+        check_subject(&check_commit(&f), "build").unwrap()
     );
     // Decode the opaque payload back into the CI-owned fact (Git's consumer view) + feed the sub-anchor.
     let decoded: CheckStatus = order
@@ -303,7 +309,7 @@ fn out_of_order_ci_check_resolves_latest_by_run_attempt_through_the_real_carriag
     // (FAILURE) at seq 1. They ARRIVE reordered (seq 2 before seq 1) — the at-least-once transport.
     let lo = fact(commit, "build", 1, CheckState::Failure, "1", 3);
     let hi = fact(commit, "build", 2, CheckState::Success, "2", 3);
-    let mut order = CheckSeamOrder::new(&lo.repo.0, &lo.commit_oid.0);
+    let mut order = CheckSeamOrder::new(&check_commit(&lo));
     let (env_hi, _) = check_env(2, &hi);
     let (env_lo, _) = check_env(1, &lo);
     // Deliver out of order: the higher attempt first.

@@ -42,7 +42,7 @@ use myelin_events::validate_event_type;
 // ===========================================================================
 
 /// **The frozen X-1 per-context check fact** (aggregate `(repo, commit_oid)`, subject
-/// `repo#commit-<oid>/check-<context>`). Carries the CI-owned `CheckStatus` (small, PII-free,
+/// canonical commit root plus `#check-<context>`). Carries the CI-owned `CheckStatus` (small, PII-free,
 /// references-not-payloads). Last-writer-wins by `run_attempt` on Git's side; the Bus carries it
 /// per-aggregate ordered ([`myelin_events::check_seam`]). Pinned to the Bus's named seam token so
 /// CI and the Bus agree by construction.

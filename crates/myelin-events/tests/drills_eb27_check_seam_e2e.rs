@@ -34,9 +34,9 @@ use std::collections::BTreeMap;
 
 use myelin_events::{
     check_aggregate, check_updated_draft, ci_result_draft, ci_result_subject, rollup_ci_result,
-    Actor, BusSignal, CheckSeamOrder, CiOverall, CiResultWaitSubstrate, CorrelationId, DataRole,
-    EventEnvelope, EventId, EventType, MetricRecorder, MetricSample, MetricsSink, Timestamp,
-    Visibility, WakeOutcome,
+    Actor, ArtifactRef, BusSignal, CheckCommit, CheckSeamOrder, CiOverall, CiResultWaitSubstrate,
+    CorrelationId, DataRole, EventEnvelope, EventId, EventType, MetricRecorder, MetricSample,
+    MetricsSink, Timestamp, Visibility, WakeOutcome,
 };
 use myelin_harness::{Label, Predicate, SignalName, SignalSource};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -45,6 +45,10 @@ use myelin_tenancy::{Region, TenantId};
 const REPO: &str = "myelin://acme/git/repo/core";
 const COMMIT: &str = "deadbeefcafe";
 
+fn commit() -> CheckCommit {
+    CheckCommit::from_repo_root(&ArtifactRef(REPO.into()), COMMIT).unwrap()
+}
+
 /// Build a `ci.check.updated` envelope for `(REPO, COMMIT, context)` carrying an opaque
 /// `run_attempt`-stamped `CheckStatus` (the Bus carries it opaque). `trust_tier` is stamped so the
 /// fork-neutrality assertion can read it (the Bus does NOT interpret it — Git's gate does).
@@ -52,8 +56,7 @@ fn check_env(context: &str, run_attempt: u64, state: &str, trust_tier: &str) -> 
     // The producer-side draft pins the §4.12 envelope shape (subject + aggregate); the drill wraps
     // it into a delivered envelope at a stable event_id per (context, attempt).
     let draft = check_updated_draft(
-        REPO,
-        COMMIT,
+        &commit(),
         context,
         serde_json::json!({
             "context": context,
@@ -61,7 +64,8 @@ fn check_env(context: &str, run_attempt: u64, state: &str, trust_tier: &str) -> 
             "state": state,
             "trust_tier": trust_tier,
         }),
-    );
+    )
+    .unwrap();
     EventEnvelope {
         event_id: EventId(format!("evt-{context}-a{run_attempt}")),
         type_: EventType(draft.type_.0),
@@ -98,7 +102,7 @@ fn current_status(order: &CheckSeamOrder) -> BTreeMap<String, bool> {
         let ctx = c
             .subject
             .0
-            .rsplit("/check-")
+            .rsplit("#check-")
             .next()
             .expect("subject has a check- sub-anchor")
             .to_string();
@@ -126,7 +130,7 @@ fn d10_d8_check_seam_end_to_end_zero_double_merge() {
     let build2 = check_env("build", 2, "success", "trusted");
 
     // ===== (2) The Bus CARRIES them per-aggregate ordered (SCRAMBLED arrival + a duplicate) =====
-    let mut order = CheckSeamOrder::new(REPO, COMMIT);
+    let mut order = CheckSeamOrder::new(&commit());
     assert!(order.ingest(&build2, 3).unwrap()); // the re-run arrives first
     assert!(order.ingest(&test1, 2).unwrap());
     assert!(order.ingest(&build1, 1).unwrap());
@@ -162,14 +166,14 @@ fn d10_d8_check_seam_end_to_end_zero_double_merge() {
         "every required context passed (post-supersession) → Success"
     );
     // CI emits the rollup via the outbox on the same per-commit aggregate (§4.12).
-    let rollup_draft = ci_result_draft(REPO, &rollup);
+    let rollup_draft = ci_result_draft(&commit(), &rollup).unwrap();
     assert_eq!(rollup_draft.type_.0, "ci.result");
     assert_eq!(
         rollup_draft.aggregate,
-        check_aggregate(REPO, COMMIT),
+        check_aggregate(&commit()),
         "the rollup shares the per-commit aggregate (linearises after its checks)"
     );
-    assert_eq!(rollup_draft.subject, ci_result_subject(REPO, COMMIT));
+    assert_eq!(rollup_draft.subject, ci_result_subject(&commit()));
 
     // ===== (5) The merge-queue durable workflow parks + is doubly-delivered → ONE wake, ONE merge =====
     let mut sub = CiResultWaitSubstrate::new();
@@ -207,7 +211,7 @@ fn d10_d8_check_seam_end_to_end_zero_double_merge() {
         SignalName::ConsumerLag,
         vec![Label::new(
             "consumer",
-            format!("check-seam:{}", check_aggregate(REPO, COMMIT).0),
+            format!("check-seam:{}", check_aggregate(&commit()).0),
         )],
         order.ordering_gap() as i64,
     );
@@ -215,7 +219,7 @@ fn d10_d8_check_seam_end_to_end_zero_double_merge() {
         SignalName::ConsumerLag,
         vec![Label::new(
             "consumer",
-            format!("check-seam:{}", check_aggregate(REPO, COMMIT).0),
+            format!("check-seam:{}", check_aggregate(&commit()).0),
         )],
         Predicate::Eq(0),
     )
@@ -233,7 +237,7 @@ fn d10_d8_check_seam_end_to_end_zero_double_merge() {
 /// neutral until endorsed/re-run-trusted.
 #[test]
 fn d10_fork_self_green_is_neutral_for_gating() {
-    let mut order = CheckSeamOrder::new(REPO, COMMIT);
+    let mut order = CheckSeamOrder::new(&commit());
     // The fork's build self-greens (untrusted_fork) — carried faithfully by the Bus.
     let fork_build = check_env("build", 1, "success", "untrusted_fork");
     let trusted_test = check_env("test", 1, "success", "trusted");
@@ -248,7 +252,7 @@ fn d10_fork_self_green_is_neutral_for_gating() {
         if c.check_status["trust_tier"].as_str() == Some("untrusted_fork") {
             continue; // neutral for gating
         }
-        let ctx = c.subject.0.rsplit("/check-").next().unwrap().to_string();
+        let ctx = c.subject.0.rsplit("#check-").next().unwrap().to_string();
         trusted_current.insert(ctx, c.check_status["state"].as_str() == Some("success"));
     }
 

@@ -257,12 +257,17 @@ fn x1_seam_e2e_green_rollup_from_real_producer_one_merge_across_restart() {
     ];
 
     let attempt = merge_attempt_id(&run.0, "merge.queue:0");
-    let producer = RealCiResultProducer::new(&sub.signals, tenant(), region(), &run.0, REPO);
+    let producer =
+        RealCiResultProducer::new(&sub.signals, tenant(), region(), &run.0, REPO).unwrap();
 
     // The producer DERIVES the green rollup (build's current attempt is success#2, not the stale
     // failure#1; test is success) and delivers it TWICE (at-least-once).
-    let first = producer.deliver(COMMIT, &facts, &required(), &attempt);
-    let second = producer.deliver(COMMIT, &facts, &required(), &attempt);
+    let first = producer
+        .deliver(COMMIT, &facts, &required(), &attempt)
+        .unwrap();
+    let second = producer
+        .deliver(COMMIT, &facts, &required(), &attempt)
+        .unwrap();
     assert!(first, "the first ci.result delivery is new");
     assert!(
         !second,
@@ -362,15 +367,20 @@ fn x1_seam_e2e_superseding_failure_dequeues_zero_spurious_unblock() {
     ];
 
     let attempt = merge_attempt_id(&run.0, "merge.queue:0");
-    let producer = RealCiResultProducer::new(&sub.signals, tenant(), region(), &run.0, REPO);
+    let producer =
+        RealCiResultProducer::new(&sub.signals, tenant(), region(), &run.0, REPO).unwrap();
     // The REAL rollup must be FAILURE (test's current attempt failed) — never the stale green.
-    let rollup = producer.rollup(COMMIT, &facts, &required(), &attempt);
+    let rollup = producer
+        .rollup(COMMIT, &facts, &required(), &attempt)
+        .unwrap();
     assert_eq!(
         rollup.overall,
         myelin_events::check_seam::CiOverall::Failure,
         "the REAL rollup derives FAILURE — the superseding failure is the current verdict"
     );
-    producer.deliver(COMMIT, &facts, &required(), &attempt);
+    producer
+        .deliver(COMMIT, &facts, &required(), &attempt)
+        .unwrap();
     sub.runs.wake(&tenant(), &run.0);
 
     let w2 = fresh_worker(&sub, "worker-2", part, ci.clone(), merger.clone());
@@ -411,7 +421,8 @@ fn x1_seam_e2e_superseding_failure_dequeues_zero_spurious_unblock() {
 #[test]
 fn x1_seam_e2e_fork_self_green_is_neutral_for_gating() {
     let producer_signals = SignalStore::new();
-    let producer = RealCiResultProducer::new(&producer_signals, tenant(), region(), "R-fork", REPO);
+    let producer =
+        RealCiResultProducer::new(&producer_signals, tenant(), region(), "R-fork", REPO).unwrap();
 
     // The fork self-greens `build` only — the required `test` context is ABSENT (neutral until
     // endorsed; the fork cannot self-green a required check it does not actually run).
@@ -422,7 +433,9 @@ fn x1_seam_e2e_fork_self_green_is_neutral_for_gating() {
         seq: 1,
     }];
     let attempt = merge_attempt_id("R-fork", "merge.queue:0");
-    let rollup = producer.rollup(COMMIT, &facts, &required(), &attempt);
+    let rollup = producer
+        .rollup(COMMIT, &facts, &required(), &attempt)
+        .unwrap();
     assert_eq!(
         rollup.overall,
         myelin_events::check_seam::CiOverall::Failure,

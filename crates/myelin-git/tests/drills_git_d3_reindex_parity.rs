@@ -62,7 +62,7 @@ use std::sync::{Arc, Mutex};
 
 use myelin_events::{
     reindex as bus_reindex, Actor, EmitContextBase, MonotonicMinter, OutboxStore, Region,
-    ReindexSource, SnapshotScope, TenantId, Timestamp,
+    ReindexSource, SnapshotScope, SubjectComponent, TenantId, Timestamp,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_search::{
@@ -151,13 +151,17 @@ fn corpus() -> Vec<CorpusBlob> {
         .into_iter()
         .enumerate()
         .map(|(i, (path, lang, text, literals, msg, oid))| {
-            let blob_ref = format!("myelin://acme/git/blob/core:refs/heads/main:{path}");
+            let path = SubjectComponent::encode(path).unwrap();
+            let blob_ref = format!(
+                "myelin://acme/git/blob/core:refs%2Fheads%2Fmain:{}",
+                path.as_str()
+            );
             CorpusBlob {
                 aggregate: blob_ref.clone(),
                 blob_ref,
                 version: (i as u64) + 1,
                 input: GitBlobProjectionInput {
-                    path: path.into(),
+                    path: path.decode(),
                     language: lang.into(),
                     text: text.into(),
                     literals,

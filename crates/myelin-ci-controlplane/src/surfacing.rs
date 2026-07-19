@@ -208,7 +208,7 @@ pub fn run_step_line_ref(
 /// **The `#check-<context>` commit-check mint (contract 5.7, §7.1).** The CI-owned check-status
 /// sub-anchor — a check status on a commit, the X-1 / OQ-D check fact. Note the FROZEN canonical
 /// home of a `check-<context>` is a **Git-rooted** ref
-/// (`myelin://<t>/git/repo/<id>#commit-<oid>/check-<context>`, §7.1); CI mints the `check-` SUB onto
+/// (`myelin://<t>/git/commit/<repo-id>:<oid>#check-<context>`, §7.1); CI mints the `check-` SUB onto
 /// whatever root it stamps the check against. This helper mints `check-<context>` onto an arbitrary
 /// root through the ONE codec.
 pub fn commit_check_ref(

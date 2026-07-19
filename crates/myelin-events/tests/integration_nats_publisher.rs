@@ -191,8 +191,9 @@ async fn durable_pull_rebind_redelivers_unacked_git_event_then_persists_ack() {
 
     let mut event = envelope(&format!("01JNR{suffix:0>21}"));
     event.type_ = EventType("git.ref.updated".into());
-    event.subject = ArtifactRef("myelin://publisher-test/git/ref/web:refs/heads/main".into());
-    event.aggregate = AggregateKey("git/ref/web:refs/heads/main".into());
+    event.subject =
+        ArtifactRef("myelin://publisher-test/git/ref/web:refs%2Fheads%2Fmain".into());
+    event.aggregate = AggregateKey("ref:web:refs%2Fheads%2Fmain".into());
     publisher
         .publish(&event.subject, &event, &event.event_id)
         .expect("publish git event");
@@ -404,7 +405,9 @@ async fn jetstream_file_storage_survives_server_restart() {
         .expect("create file-backed stream");
         let mut event = envelope("server-restart-event");
         event.type_ = EventType("git.ref.updated".into());
-        event.subject = ArtifactRef("myelin://publisher-test/git/ref/web:refs/heads/main".into());
+        event.subject =
+            ArtifactRef("myelin://publisher-test/git/ref/web:refs%2Fheads%2Fmain".into());
+        event.aggregate = AggregateKey("ref:web:refs%2Fheads%2Fmain".into());
         publisher
             .publish(&event.subject, &event, &event.event_id)
             .expect("persist event before server restart");

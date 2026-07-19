@@ -306,15 +306,20 @@ fn consumer_reconciles_with_the_real_ci_producer_end_to_end() {
         region(),
         "R1",
         "myelin://acme/git/repo/core",
-    );
+    )
+    .unwrap();
     // The REAL rollup is success (supersession honoured); deliver it on the minted attempt id.
-    let derived = producer.rollup("deadbeef", &facts, &request().required_contexts, &attempt);
+    let derived = producer
+        .rollup("deadbeef", &facts, &request().required_contexts, &attempt)
+        .unwrap();
     assert_eq!(
         derived.overall,
         CiOverall::Success,
         "the REAL producer derives success (the stale failure was superseded)"
     );
-    producer.deliver("deadbeef", &facts, &request().required_contexts, &attempt);
+    producer
+        .deliver("deadbeef", &facts, &request().required_contexts, &attempt)
+        .unwrap();
 
     // CONSUMER (the merge queue): dispatch + consume the DERIVED rollup + merge.
     let mut ctx = begin(&outbox, journal, signals);

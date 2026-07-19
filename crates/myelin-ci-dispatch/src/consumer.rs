@@ -421,7 +421,7 @@ impl ReserveStore for OutboxReserveStore {
 /// a REDELIVERED trigger re-emits the SAME ids and `commit_absorb` `ON CONFLICT DO NOTHING`s them.
 ///
 /// **H3 (peer-review #7) — the check id includes the run_id.** The check subject is
-/// `repo#commit-<oid>/check-<context>` with NO run_id; two DISTINCT triggers on the same
+/// the canonical commit root plus `#check-<context>` with NO run_id; two DISTINCT triggers on the same
 /// (repo, commit, context) mint DISTINCT runs but would have minted the SAME check id with DIFFERENT
 /// payloads (a collision). Seeding with the run_id (`evt:<run_id>:<subject>`) makes a redelivery of the
 /// SAME run still dedup while distinct runs diverge. `run.started` already carries the run_id in its
@@ -638,11 +638,16 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
     let oid_field = if ev.type_.0 == myelin_git::events::GIT_REF_UPDATED {
         let ref_name = p.get("ref").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
             .ok_or_else(|| SkipReason::MalformedPayload("missing `ref`".into()))?;
-        validate_git_ref_name(ref_name)?;
+        let ref_name = myelin_git::receive_pack::RefName::new(ref_name);
+        let ref_key = myelin_git::receive_pack::GitRefEventKey::new(&repo, &ref_name)
+            .map_err(|_| SkipReason::InvalidProvenance("invalid canonical Git ref event key".into()))?;
         validate_envelope_provenance(
             ev,
-            &format!("myelin://{}/git/ref/{repo}:{ref_name}", ev.tenant.0),
-            &format!("{repo}:{ref_name}"),
+            &ref_key
+                .subject(&ev.tenant.0)
+                .map_err(|_| SkipReason::InvalidProvenance("invalid canonical Git ref subject".into()))?
+                .0,
+            &ref_key.aggregate().0,
         )?;
         "new_oid"
     } else {
@@ -694,26 +699,6 @@ fn validate_envelope_provenance(
         )));
     }
     Ok(())
-}
-
-/// Validate the canonical `check-ref-format` rules used by a fully-qualified provider ref.
-fn validate_git_ref_name(ref_name: &str) -> Result<(), SkipReason> {
-    let invalid = !ref_name.starts_with("refs/")
-        || ref_name.ends_with('/')
-        || ref_name.ends_with('.')
-        || ref_name.contains("//")
-        || ref_name.contains("..")
-        || ref_name.contains("@{")
-        || ref_name.contains([':', '\\'])
-        || ref_name.split('/').any(|part| {
-            part.is_empty() || part.starts_with('.') || part.ends_with(".lock")
-        })
-        || ref_name.chars().any(|c| c.is_ascii_control() || c.is_ascii_whitespace() || matches!(c, '~' | '^' | '?' | '*' | '['));
-    if invalid {
-        Err(SkipReason::InvalidProvenance(format!("invalid canonical Git ref {ref_name:?}")))
-    } else {
-        Ok(())
-    }
 }
 
 fn canonical_commit_oid(raw: &str) -> Result<String, SkipReason> {
@@ -777,7 +762,7 @@ fn on_trigger_for_type(event_type: &str) -> Option<OnTrigger> {
 /// run_id) re-mints the SAME id (dedup/absorb), while two DISTINCT runs on the same
 /// `(repo, commit, context)` — a re-opened PR on the same head, the same commit on a second ref, two
 /// PRs sharing a head — diverge (distinct ids, no collision). The check SUBJECT alone omits the run_id
-/// (`repo#commit-<oid>/check-<context>`), so seeding on the subject ONLY (the pre-fix bug) made those
+/// (canonical commit root plus `#check-<context>`), so seeding on the subject ONLY (the pre-fix bug) made those
 /// distinct runs collide on the same id with DIFFERENT payloads.
 ///
 /// LOW aside (named, not fixed): [`deterministic_uuid`] is a 2×-salted FNV-64 (non-cryptographic) over
@@ -902,12 +887,16 @@ pub fn plan_dispatch(
         .collect();
     let run_facts = RunFacts {
         run_id: run_id.clone(),
-        repo_ref: facts.repo.clone(),
+        tenant: tenant.clone(),
+        repo_root: myelin_git::project::git_repo_ref(&tenant.0, &facts.repo),
         commit_oid: facts.new_oid.clone(),
         contexts,
         cause_event_id: ev.event_id.clone(),
     };
-    let handoff = reserve_and_start(&snapshot, &stamp, &def.on, &run_facts);
+    let handoff = match reserve_and_start(&snapshot, &stamp, &def.on, &run_facts) {
+        Ok(handoff) => handoff,
+        Err(error) => return DispatchOutcome::Skip(SkipReason::InvalidProvenance(error.to_string())),
+    };
 
     let reserve = ReserveFacts {
         region: region.clone(),
@@ -1232,6 +1221,7 @@ mod tests {
         Timestamp, Visibility,
     };
     use myelin_git::events::{GIT_PR_OPENED, GIT_PR_SYNCHRONIZED, GIT_REF_UPDATED};
+    use myelin_git::receive_pack::{GitRefEventKey, RefName};
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
     use myelin_storage::{ContentHash, FsBlobStore};
     use myelin_tenancy::{Region, TenantId};
@@ -1248,6 +1238,7 @@ mod tests {
 
     /// A `git.ref.updated` envelope for `repo` pushing `new_oid`, with the given payload extras.
     fn push_envelope(repo: &str, new_oid: &str) -> EventEnvelope {
+        let key = GitRefEventKey::new(repo, &RefName::new("refs/heads/main")).unwrap();
         EventEnvelope {
             event_id: EventId("ev-push-1".into()),
             type_: EventType(GIT_REF_UPDATED.into()),
@@ -1255,8 +1246,8 @@ mod tests {
             tenant: TenantId("acme".into()),
             region: Region("fr-par".into()),
             actor: Actor(principal()),
-            subject: ArtifactRef(format!("myelin://acme/git/ref/{repo}:refs/heads/main")),
-            aggregate: AggregateKey(format!("{repo}:refs/heads/main")),
+            subject: key.subject("acme").unwrap(),
+            aggregate: key.aggregate(),
             causation_id: None,
             correlation_id: CorrelationId("corr-1".into()),
             caused_by: None,
@@ -1681,12 +1672,17 @@ mod tests {
     fn push_subject_aggregate_payload_and_ref_provenance_must_cohere_before_effects() {
         let mut cases = Vec::new();
         let mut wrong_subject_repo = push_envelope("team/web", TEST_OID);
-        wrong_subject_repo.subject = ArtifactRef(
-            "myelin://acme/git/ref/other/web:refs/heads/main".into(),
-        );
+        wrong_subject_repo.subject =
+            GitRefEventKey::new("other/web", &RefName::new("refs/heads/main"))
+                .unwrap()
+                .subject("acme")
+                .unwrap();
         cases.push(wrong_subject_repo);
         let mut wrong_tenant = push_envelope("web", TEST_OID);
-        wrong_tenant.subject = ArtifactRef("myelin://other/git/ref/web:refs/heads/main".into());
+        wrong_tenant.subject = GitRefEventKey::new("web", &RefName::new("refs/heads/main"))
+            .unwrap()
+            .subject("other")
+            .unwrap();
         cases.push(wrong_tenant);
         let mut wrong_aggregate = push_envelope("web", TEST_OID);
         wrong_aggregate.aggregate = AggregateKey("ATTACKER_SENTINEL:refs/heads/main".into());
@@ -1977,11 +1973,11 @@ mod tests {
 
     /// **H3: the check event id includes the run_id — distinct runs on the SAME (repo, commit,
     /// context) do NOT collide, and a redelivery of the SAME run re-mints the SAME id.** The check
-    /// SUBJECT is run-agnostic (`repo#commit-<oid>/check-<context>`), so seeding on the subject alone
+    /// SUBJECT is run-agnostic (canonical commit root plus `#check-<context>`), so seeding on the subject alone
     /// (the pre-fix bug) minted ONE id for two distinct runs with DIFFERENT payloads (a collision).
     #[test]
     fn check_event_id_diverges_across_runs_stable_within_a_run() {
-        let subject = "myelin://acme/git/ref/web:refs/heads/main#commit-deadbeef/check-build";
+        let subject = "myelin://acme/git/commit/web:deadbeef#check-build";
         let run_a = deterministic_uuid("run:ev-A");
         let run_b = deterministic_uuid("run:ev-B");
         // Same run + same subject → SAME id (a redelivery dedups/absorbs).

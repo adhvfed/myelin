@@ -42,7 +42,7 @@
 //! ## What CI registers on the ONE humanise surface (contract 7.3 — the summary templates)
 //! Every [`CheckState`](crate::events) verdict has a stable, PII-free `template_key`
 //! ([`summary_template_key`]) that maps to an ICU-subset render body
-//! ([`CI_SUMMARY_TEMPLATES`]) — `{0}` is the SUBJECT slot (the `repo#commit-<oid>/check-<context>`
+//! ([`CI_SUMMARY_TEMPLATES`]) — `{0}` is the SUBJECT slot (the canonical commit/check
 //! sub-anchor), resolved PER-VIEWER through Refs `resolve(Display)` so a check on a private repo
 //! humanises to a tombstone for a viewer who lacks access (NOTIF-D4, 0 title/PII leak — the SAME
 //! leak floor every other consumer's summary inherits, because the summary rides the ONE humanise
@@ -196,7 +196,7 @@ pub fn ci_summary(verdict: CheckVerdict, context_name: &str) -> CiSummary {
 
 /// **CI's status-summary render bodies (contract 7.3 — the ICU-subset templates CI registers on the
 /// ONE humanise surface).** `(template_key, body, icon)`. `{0}` is the SUBJECT slot (the
-/// `repo#commit-<oid>/check-<context>` sub-anchor, resolved PER-VIEWER → the check's title or a
+/// canonical commit/check sub-anchor, resolved PER-VIEWER → the check's title or a
 /// tombstone). ICU-subset bodies; a tenant overrides by putting its own `(tenant, key, locale)`
 /// row. These are the bodies a `CheckStatus.summary` [`HumanisedRef`] resolves to through humanise —
 /// permission-safe by construction (a check on a private repo → a tombstone, the title never leaks,

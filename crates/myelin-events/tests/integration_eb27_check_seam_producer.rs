@@ -26,7 +26,7 @@
 use myelin_config::MyelinConfig;
 use myelin_events::check_seam::{
     check_aggregate, check_updated_draft, ci_result_draft, ci_result_subject, rollup_ci_result,
-    CiOverall,
+    CheckCommit, CiOverall,
 };
 use myelin_events::nats::NatsJetStreamBus;
 use myelin_events::relay::{BusTransport, Delivery};
@@ -41,6 +41,10 @@ use std::collections::BTreeMap;
 
 const REPO: &str = "myelin://acme/git/repo/core";
 const COMMIT: &str = "abc123def";
+
+fn commit() -> CheckCommit {
+    CheckCommit::from_repo_root(&ArtifactRef(REPO.into()), COMMIT).unwrap()
+}
 
 /// Wrap a producer [`EventDraft`] into a delivered [`EventEnvelope`] at a stable `event_id` (the
 /// dedup key). The CI-owned payload rides OPAQUE; the Bus carries it untouched.
@@ -74,11 +78,11 @@ fn envelope(draft: EventDraft, event_id: &str) -> EventEnvelope {
 
 fn check_env(context: &str, attempt: u64, state: &str, event_id: &str) -> EventEnvelope {
     let draft = check_updated_draft(
-        REPO,
-        COMMIT,
+        &commit(),
         context,
         serde_json::json!({ "context": context, "run_attempt": attempt, "state": state }),
-    );
+    )
+    .unwrap();
     envelope(draft, event_id)
 }
 
@@ -126,7 +130,10 @@ async fn check_seam_producer_carriage_over_real_nats() {
     assert_eq!(rollup.overall, CiOverall::Success);
 
     // CI emits the rollup via the SAME outbox path, on the SAME per-commit aggregate (§4.12).
-    let rollup_env = envelope(ci_result_draft(REPO, &rollup), "eb27-ci-result");
+    let rollup_env = envelope(
+        ci_result_draft(&commit(), &rollup).unwrap(),
+        "eb27-ci-result",
+    );
     assert_eq!(
         bus.put(&subj(&rollup_env), &rollup_env, &rollup_env.event_id)
             .expect("put ci.result"),
@@ -149,7 +156,7 @@ async fn check_seam_producer_carriage_over_real_nats() {
         "3 checks + 1 ci.result (the duplicate rollup was deduped)"
     );
 
-    let expected_agg = check_aggregate(REPO, COMMIT);
+    let expected_agg = check_aggregate(&commit());
     let mut saw_rollup = false;
     let mut saw_checks = 0;
     for d in &delivered {
@@ -163,7 +170,7 @@ async fn check_seam_producer_carriage_over_real_nats() {
             CI_RESULT => {
                 saw_rollup = true;
                 // The rollup's subject is the §4.12 ci-result #sub on the same commit.
-                assert_eq!(d.subject, ci_result_subject(REPO, COMMIT));
+                assert_eq!(d.subject, ci_result_subject(&commit()));
                 // The opaque rollup payload round-trips to the frozen signal shape.
                 assert_eq!(d.payload["overall"], "success");
                 assert_eq!(d.payload["idem_token"], "merge-attempt-eb27");

@@ -14,8 +14,8 @@
 //! **The Bus OWNS (this module):**
 //! 1. **Envelope conformance.** [`check_updated_draft`] builds the canonical [`EventEnvelope`]
 //!    draft for a `ci.check.updated` fact with the §4.12 `subject` token grammar
-//!    (`repo#commit-<oid>/check-<context>`, a `#sub` sub-anchor) and the
-//!    **`aggregate = (repo, commit_oid)`** key (so all checks for one commit share an ordering
+//!    (`myelin://<tenant>/git/commit/<repo-id>:<oid>#check-<context>`) and the
+//!    **`aggregate = commit:<repo-id>:<oid>`** key (so all checks for one commit share an ordering
 //!    partition). The CI-owned `CheckStatus` rides in `payload` as an OPAQUE
 //!    [`serde_json::Value`] — the Bus does NOT name its fields.
 //! 2. **Per-aggregate ordering on `(repo, commit_oid)`.** [`CheckSeamOrder`] ingests
@@ -53,7 +53,8 @@
 
 use crate::taxonomy::new_tokens::{CI_CHECK_UPDATED, CI_RESULT};
 use crate::{
-    AggregateKey, ArtifactRef, DataRole, EventDraft, EventEnvelope, EventType, Visibility,
+    AggregateKey, ArtifactRef, DataRole, EventDraft, EventEnvelope, EventType, SubjectComponent,
+    Visibility,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -62,23 +63,136 @@ use std::collections::BTreeMap;
 // 1. Envelope conformance — the ci.check.updated subject + aggregate grammar
 // ---------------------------------------------------------------------------
 
+/// A validated canonical Git commit root used by the check seam.
+///
+/// `myelin-events` cannot depend on `myelin-refs` because Refs is above Events in the crate DAG.
+/// This narrow boundary therefore validates the exact Git commit-root form it consumes. Callers
+/// that already depend on Refs should parse the root there first, then cross this boundary. Once
+/// constructed, every check/result subject and aggregate is derived from this value rather than
+/// from independently supplied strings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckCommit {
+    root: ArtifactRef,
+    repo_id: String,
+    commit_oid: String,
+    encoded_repo_id: SubjectComponent,
+    encoded_commit_oid: SubjectComponent,
+}
+
+impl CheckCommit {
+    /// Derive a canonical commit root from a validated Git repository root and immutable object id.
+    pub fn from_repo_root(
+        repo_root: &ArtifactRef,
+        commit_oid: &str,
+    ) -> Result<Self, CheckSeamError> {
+        let rest = repo_root
+            .0
+            .strip_prefix("myelin://")
+            .ok_or(CheckSeamError::InvalidRepoRoot)?;
+        if rest.contains('#') {
+            return Err(CheckSeamError::InvalidRepoRoot);
+        }
+        let segments: Vec<&str> = rest.split('/').collect();
+        if segments.len() != 4
+            || segments[0].is_empty()
+            || segments[1] != "git"
+            || segments[2] != "repo"
+            || segments[3].is_empty()
+        {
+            return Err(CheckSeamError::InvalidRepoRoot);
+        }
+        let encoded_repo =
+            SubjectComponent::parse(segments[3]).map_err(|_| CheckSeamError::InvalidRepoRoot)?;
+        let encoded_oid =
+            SubjectComponent::encode(commit_oid).map_err(|_| CheckSeamError::InvalidCommitRoot)?;
+        Self::parse(&ArtifactRef(format!(
+            "myelin://{}/git/commit/{}:{commit_oid}",
+            segments[0],
+            encoded_repo.as_str(),
+            commit_oid = encoded_oid.as_str()
+        )))
+    }
+
+    /// Validate `myelin://<tenant>/git/commit/<repo-id>:<oid>` with no sub-anchor.
+    pub fn parse(root: &ArtifactRef) -> Result<Self, CheckSeamError> {
+        let rest = root
+            .0
+            .strip_prefix("myelin://")
+            .ok_or(CheckSeamError::InvalidCommitRoot)?;
+        if rest.contains('#') {
+            return Err(CheckSeamError::InvalidCommitRoot);
+        }
+        let mut segments = rest.split('/');
+        let tenant = segments.next().unwrap_or_default();
+        let subsystem = segments.next().unwrap_or_default();
+        let type_ = segments.next().unwrap_or_default();
+        let id = segments.next().unwrap_or_default();
+        if tenant.is_empty()
+            || subsystem != "git"
+            || type_ != "commit"
+            || id.is_empty()
+            || segments.next().is_some()
+        {
+            return Err(CheckSeamError::InvalidCommitRoot);
+        }
+        let (encoded_repo_id, encoded_commit_oid) = id
+            .split_once(':')
+            .ok_or(CheckSeamError::InvalidCommitRoot)?;
+        let encoded_repo_id = SubjectComponent::parse(encoded_repo_id)
+            .map_err(|_| CheckSeamError::InvalidCommitRoot)?;
+        let encoded_commit_oid = SubjectComponent::parse(encoded_commit_oid)
+            .map_err(|_| CheckSeamError::InvalidCommitRoot)?;
+        Ok(Self {
+            root: root.clone(),
+            repo_id: encoded_repo_id.decode(),
+            commit_oid: encoded_commit_oid.decode(),
+            encoded_repo_id,
+            encoded_commit_oid,
+        })
+    }
+
+    /// The validated canonical Git commit root.
+    pub fn root(&self) -> &ArtifactRef {
+        &self.root
+    }
+
+    /// The stable repository id carried by the commit root.
+    pub fn repo_id(&self) -> &str {
+        &self.repo_id
+    }
+
+    /// The immutable commit object id carried by the commit root.
+    pub fn commit_oid(&self) -> &str {
+        &self.commit_oid
+    }
+}
+
 /// The `(repo, commit_oid)` aggregate key for the check seam (§4.12). ALL `ci.check.updated`
 /// events for one commit share this aggregate, so they are per-aggregate ordered regardless of
 /// which `context` they belong to — the ordering partition Git's supersession rule rests on.
 ///
 /// PII-free identifiers (a repo ref + a git OID); never a payload. The Bus carries this opaque —
 /// it does not parse the repo ref's internals (Refs owns the `ArtifactRef` grammar, contract 5.7).
-pub fn check_aggregate(repo: &str, commit_oid: &str) -> AggregateKey {
-    // `repo#commit-<oid>` — the commit-anchored aggregate; every context for this commit lands here.
-    AggregateKey(format!("{repo}#commit-{commit_oid}"))
+pub fn check_aggregate(commit: &CheckCommit) -> AggregateKey {
+    AggregateKey(format!(
+        "commit:{}:{}",
+        commit.encoded_repo_id.as_str(),
+        commit.encoded_commit_oid.as_str()
+    ))
 }
 
-/// The `ci.check.updated` envelope `subject` (§4.12 / X-1): `repo#commit-<oid>/check-<context>` — a
-/// `#sub` sub-anchor (contract 5.7, the `check-` sub-anchor vocabulary is Refs-owned; the Bus only
-/// references it). The subject identifies the *per-context* fact; the AGGREGATE (above) is the
-/// per-commit ordering partition the contexts share.
-pub fn check_subject(repo: &str, commit_oid: &str, context: &str) -> ArtifactRef {
-    ArtifactRef(format!("{repo}#commit-{commit_oid}/check-{context}"))
+/// The `ci.check.updated` envelope subject (§4.12 / X-1): the canonical Git commit root with a
+/// `#check-<context>` sub-anchor. The subject identifies the *per-context* fact; the aggregate
+/// above is the per-commit ordering partition the contexts share.
+pub fn check_subject(commit: &CheckCommit, context: &str) -> Result<ArtifactRef, CheckSeamError> {
+    if context.is_empty()
+        || context
+            .chars()
+            .any(|c| c == '#' || c == '%' || c.is_whitespace() || c.is_control())
+    {
+        return Err(CheckSeamError::InvalidContext);
+    }
+    Ok(ArtifactRef(format!("{}#check-{context}", commit.root.0)))
 }
 
 /// Build the canonical [`EventDraft`] for a `ci.check.updated` fact. The Bus owns ENVELOPE
@@ -90,15 +204,14 @@ pub fn check_subject(repo: &str, commit_oid: &str, context: &str) -> ArtifactRef
 /// This is the producer-side helper CI uses (EB-27/M4); shipping it here in M2 pins the envelope
 /// shape the M3 consumer leg (Git) and the D-11 ordering drill assert against.
 pub fn check_updated_draft(
-    repo: &str,
-    commit_oid: &str,
+    commit: &CheckCommit,
     context: &str,
     check_status: serde_json::Value,
-) -> EventDraft {
-    EventDraft {
+) -> Result<EventDraft, CheckSeamError> {
+    Ok(EventDraft {
         type_: EventType(CI_CHECK_UPDATED.to_string()),
-        subject: check_subject(repo, commit_oid, context),
-        aggregate: check_aggregate(repo, commit_oid),
+        subject: check_subject(commit, context)?,
+        aggregate: check_aggregate(commit),
         payload: check_status,
         // The CheckStatus is references-not-payloads (run/details_ref refs, not log bytes); the
         // check fact is platform-controller data (CI is the processor of tenant code, but the
@@ -109,7 +222,7 @@ pub fn check_updated_draft(
         // No inline PII (references-not-payloads).
         contains_personal_data: false,
         pii_key_ref: None,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -124,7 +237,7 @@ pub struct OrderedCheck {
     /// The outbox `seq` within the aggregate — the linearisation key (§2.2). State-change order
     /// == outbox order == this `seq` (the `UNIQUE(aggregate, seq)` invariant).
     pub seq: u64,
-    /// The per-context fact subject (`repo#commit-<oid>/check-<context>`).
+    /// The per-context fact subject (canonical commit root plus `#check-<context>`).
     pub subject: ArtifactRef,
     /// The opaque CI-owned `CheckStatus` (the Bus carries it; Git interprets it).
     pub check_status: serde_json::Value,
@@ -141,7 +254,7 @@ pub struct OrderedCheck {
 /// supersession is deterministic regardless of physical arrival order).
 #[derive(Debug, Default)]
 pub struct CheckSeamOrder {
-    /// The aggregate this order is for (`repo#commit-<oid>`). One [`CheckSeamOrder`] per aggregate
+    /// The aggregate this order is for (`commit:<repo-id>:<oid>`). One [`CheckSeamOrder`] per aggregate
     /// — cross-aggregate order is explicitly NOT promised (§2.2).
     aggregate: String,
     /// `seq → OrderedCheck`. A `BTreeMap` keyed on the outbox `seq` so iteration is ALWAYS in
@@ -153,14 +266,14 @@ pub struct CheckSeamOrder {
 
 impl CheckSeamOrder {
     /// A fresh per-aggregate order for `(repo, commit_oid)`.
-    pub fn new(repo: &str, commit_oid: &str) -> CheckSeamOrder {
+    pub fn new(commit: &CheckCommit) -> CheckSeamOrder {
         CheckSeamOrder {
-            aggregate: check_aggregate(repo, commit_oid).0,
+            aggregate: check_aggregate(commit).0,
             by_seq: BTreeMap::new(),
         }
     }
 
-    /// The aggregate key string this order is keyed on (`repo#commit-<oid>`).
+    /// The aggregate key string this order is keyed on (`commit:<repo-id>:<oid>`).
     pub fn aggregate(&self) -> &str {
         &self.aggregate
     }
@@ -228,6 +341,14 @@ impl CheckSeamOrder {
 /// (the order Git's supersession rule depends on).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckSeamError {
+    /// A check producer did not provide a canonical, root-only Git repository ArtifactRef.
+    InvalidRepoRoot,
+    /// A check target was not a canonical, root-only Git commit ArtifactRef.
+    InvalidCommitRoot,
+    /// A check context could not be represented as one canonical `check-` sub-anchor.
+    InvalidContext,
+    /// A ci.result payload named a different commit than its canonical subject root.
+    ResultCommitMismatch,
     /// The envelope's `type_` is not `ci.check.updated`.
     WrongType(String),
     /// The envelope's aggregate is not the one this [`CheckSeamOrder`] partitions.
@@ -237,6 +358,18 @@ pub enum CheckSeamError {
 impl std::fmt::Display for CheckSeamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            CheckSeamError::InvalidRepoRoot => {
+                write!(f, "invalid canonical Git repository root")
+            }
+            CheckSeamError::InvalidCommitRoot => {
+                write!(f, "invalid canonical Git commit root")
+            }
+            CheckSeamError::InvalidContext => {
+                write!(f, "invalid canonical CI check context")
+            }
+            CheckSeamError::ResultCommitMismatch => {
+                write!(f, "ci.result commit does not match its canonical root")
+            }
             CheckSeamError::WrongType(t) => {
                 write!(f, "not a ci.check.updated event: type_={t}")
             }
@@ -284,12 +417,10 @@ pub struct CiResult {
     pub idem_token: String,
 }
 
-/// The `ci.result` rollup signal `subject` (§4.12 / X-1): `repo#commit-<oid>/ci-result` — a `#sub`
-/// sub-anchor on the same commit the per-context checks anchor on, so the rollup and its checks
-/// share the commit anchor (the merge-queue waits on the rollup; Git's projection reads the checks).
-/// The Bus only references the `#sub` sub-anchor vocabulary (Refs-owned, contract 5.7).
-pub fn ci_result_subject(repo: &str, commit_oid: &str) -> ArtifactRef {
-    ArtifactRef(format!("{repo}#commit-{commit_oid}/ci-result"))
+/// The `ci.result` rollup signal subject (§4.12 / X-1): the bare canonical Git commit root. The
+/// rollup and its checks therefore share the same commit identity and aggregate partition.
+pub fn ci_result_subject(commit: &CheckCommit) -> ArtifactRef {
+    commit.root.clone()
 }
 
 /// **Build the canonical [`EventDraft`] for the `ci.result` rollup signal (the PRODUCER leg, EB-27/
@@ -304,11 +435,17 @@ pub fn ci_result_subject(repo: &str, commit_oid: &str) -> ArtifactRef {
 /// `overall` verdict (CI derives it from required-context status) nor the merge (Git's gate). The
 /// `aggregate` deliberately matches [`check_aggregate`] so the rollup linearises after its checks on
 /// the one per-commit partition (§2.2/§4.12).
-pub fn ci_result_draft(repo: &str, result: &CiResult) -> EventDraft {
-    EventDraft {
+pub fn ci_result_draft(
+    commit: &CheckCommit,
+    result: &CiResult,
+) -> Result<EventDraft, CheckSeamError> {
+    if commit.commit_oid != result.commit_oid {
+        return Err(CheckSeamError::ResultCommitMismatch);
+    }
+    Ok(EventDraft {
         type_: EventType(CI_RESULT.to_string()),
-        subject: ci_result_subject(repo, &result.commit_oid),
-        aggregate: check_aggregate(repo, &result.commit_oid),
+        subject: ci_result_subject(commit),
+        aggregate: check_aggregate(commit),
         // The rollup signal payload `{commit_oid, overall, contexts, idem_token}` — PII-free
         // (references-not-payloads: context identifiers + a commit OID, never log bytes).
         payload: serde_json::to_value(result).expect("CiResult serialises (closed shape)"),
@@ -316,7 +453,7 @@ pub fn ci_result_draft(repo: &str, result: &CiResult) -> EventDraft {
         visibility: Visibility::Internal,
         contains_personal_data: false,
         pii_key_ref: None,
-    }
+    })
 }
 
 /// **Derive the `ci.result` rollup from the per-aggregate-ordered checks (the PRODUCER's roll-up,
@@ -463,11 +600,18 @@ mod tests {
         ))
     }
 
+    fn commit(repo_id: &str, commit_oid: &str) -> CheckCommit {
+        CheckCommit::parse(&ArtifactRef(format!(
+            "myelin://acme/git/commit/{repo_id}:{commit_oid}"
+        )))
+        .expect("canonical test commit")
+    }
+
     /// Build a `ci.check.updated` envelope for `(repo, commit_oid, context)` at a given outbox
     /// `seq`, carrying an opaque `run_attempt`-stamped CheckStatus payload (the Bus does not
     /// interpret it; the test stamps `run_attempt` so the assertions can read it back).
     fn check_env(
-        repo: &str,
+        repo_id: &str,
         commit_oid: &str,
         context: &str,
         run_attempt: u64,
@@ -480,8 +624,8 @@ mod tests {
             tenant: TenantId("acme".into()),
             region: Region("fr-par".into()),
             actor: ci_actor(),
-            subject: check_subject(repo, commit_oid, context),
-            aggregate: check_aggregate(repo, commit_oid),
+            subject: check_subject(&commit(repo_id, commit_oid), context).unwrap(),
+            aggregate: check_aggregate(&commit(repo_id, commit_oid)),
             causation_id: None,
             correlation_id: CorrelationId(format!("corr-{commit_oid}")),
             caused_by: None,
@@ -500,19 +644,20 @@ mod tests {
     /// The envelope `subject` + `aggregate` follow the §4.12 grammar exactly.
     #[test]
     fn envelope_conformance_subject_and_aggregate_grammar() {
+        let commit = commit("core", "abc123");
         let draft = check_updated_draft(
-            "myelin://acme/git/repo/core",
-            "abc123",
+            &commit,
             "build",
             serde_json::json!({ "state": "success", "run_attempt": 1 }),
-        );
+        )
+        .unwrap();
         assert_eq!(draft.type_.0, "ci.check.updated");
         assert_eq!(
-            draft.subject.0, "myelin://acme/git/repo/core#commit-abc123/check-build",
-            "subject = repo#commit-<oid>/check-<context> (§4.12)"
+            draft.subject.0, "myelin://acme/git/commit/core:abc123#check-build",
+            "subject = canonical commit root plus check sub-anchor"
         );
         assert_eq!(
-            draft.aggregate.0, "myelin://acme/git/repo/core#commit-abc123",
+            draft.aggregate.0, "commit:core:abc123",
             "aggregate = (repo, commit_oid) — all contexts for one commit share it"
         );
         // The Bus carries the CheckStatus OPAQUE — it round-trips untouched.
@@ -520,13 +665,59 @@ mod tests {
         assert!(!draft.contains_personal_data, "references-not-payloads");
     }
 
+    #[test]
+    fn encoded_repository_delimiters_round_trip_and_form_a_stream_subject() {
+        let repo_root =
+            ArtifactRef("myelin://acme/git/repo/repo%2Ewith%3Adelimiter%25value".into());
+        let commit = CheckCommit::from_repo_root(&repo_root, "blake3:dead.beef").unwrap();
+        assert_eq!(commit.repo_id(), "repo.with:delimiter%value");
+        assert_eq!(commit.commit_oid(), "blake3:dead.beef");
+        assert_eq!(
+            commit.root().0,
+            "myelin://acme/git/commit/repo%2Ewith%3Adelimiter%25value:blake3%3Adead%2Ebeef"
+        );
+        let draft = check_updated_draft(&commit, "build", serde_json::json!({})).unwrap();
+        let envelope = EventEnvelope {
+            event_id: EventId("encoded-commit".into()),
+            type_: draft.type_,
+            schema_ver: 1,
+            tenant: TenantId("acme".into()),
+            region: Region("fr-par".into()),
+            actor: ci_actor(),
+            subject: draft.subject,
+            aggregate: draft.aggregate,
+            causation_id: None,
+            correlation_id: CorrelationId("encoded-commit".into()),
+            caused_by: None,
+            depth: 0,
+            contains_personal_data: false,
+            data_role: DR::Controller,
+            visibility: Vis::Internal,
+            pii_key_ref: None,
+            occurred_at: Timestamp("2026-06-20T00:00:00Z".into()),
+            recorded_at: Timestamp("2026-06-20T00:00:01Z".into()),
+            payload: draft.payload,
+        };
+        crate::StreamSubject::of(&envelope).expect("encoded aggregate is transport-safe");
+
+        for malformed in [
+            "myelin://acme/git/repo/repo.with",
+            "myelin://acme/git/repo/repo%2ewith",
+            "myelin://acme/git/repo/repo%41",
+        ] {
+            assert!(
+                CheckCommit::from_repo_root(&ArtifactRef(malformed.into()), "deadbeef").is_err()
+            );
+        }
+    }
+
     /// All contexts for one commit share the SAME aggregate (the per-commit ordering partition);
     /// a different commit is a different aggregate (cross-aggregate order not promised).
     #[test]
     fn all_contexts_of_a_commit_share_one_aggregate() {
-        let a_build = check_aggregate("repo:core", "deadbeef");
-        let a_test = check_aggregate("repo:core", "deadbeef");
-        let a_other_commit = check_aggregate("repo:core", "cafef00d");
+        let a_build = check_aggregate(&commit("core", "deadbeef"));
+        let a_test = check_aggregate(&commit("core", "deadbeef"));
+        let a_other_commit = check_aggregate(&commit("core", "cafef00d"));
         assert_eq!(
             a_build, a_test,
             "build + test of one commit → one aggregate"
@@ -543,14 +734,14 @@ mod tests {
     /// the per-aggregate `seq` order — so Git's `run_attempt` supersession is well-defined.
     #[test]
     fn interleaved_and_late_arrivals_stay_per_aggregate_ordered() {
-        let mut order = CheckSeamOrder::new("repo:core", "deadbeef");
+        let mut order = CheckSeamOrder::new(&commit("core", "deadbeef"));
 
         // The outbox assigned these seqs (state-change order): build#1=1, test#1=2, build#2=3
         // (a re-run of build), test#2=4. They ARRIVE interleaved + out of order.
-        let build1 = check_env("repo:core", "deadbeef", "build", 1, "failure");
-        let test1 = check_env("repo:core", "deadbeef", "test", 1, "success");
-        let build2 = check_env("repo:core", "deadbeef", "build", 2, "success"); // a re-run
-        let test2 = check_env("repo:core", "deadbeef", "test", 2, "success");
+        let build1 = check_env("core", "deadbeef", "build", 1, "failure");
+        let test1 = check_env("core", "deadbeef", "test", 1, "success");
+        let build2 = check_env("core", "deadbeef", "build", 2, "success"); // a re-run
+        let test2 = check_env("core", "deadbeef", "test", 2, "success");
 
         // Deliver them in a SCRAMBLED arrival order: 3, 1, 4, 2 (interleaved across contexts; the
         // higher build re-run arrives before the lower one).
@@ -591,9 +782,9 @@ mod tests {
     /// its supersession stays deterministic.
     #[test]
     fn stale_redelivery_is_droppable_order_preserved() {
-        let mut order = CheckSeamOrder::new("repo:core", "deadbeef");
-        let build1 = check_env("repo:core", "deadbeef", "build", 1, "failure");
-        let build2 = check_env("repo:core", "deadbeef", "build", 2, "success");
+        let mut order = CheckSeamOrder::new(&commit("core", "deadbeef"));
+        let build1 = check_env("core", "deadbeef", "build", 1, "failure");
+        let build2 = check_env("core", "deadbeef", "build", 2, "success");
 
         assert!(order.ingest(&build1, 1).unwrap(), "first build is new");
         assert!(order.ingest(&build2, 2).unwrap(), "the re-run is new");
@@ -620,21 +811,18 @@ mod tests {
     /// gap closes to 0).
     #[test]
     fn ordering_gap_counts_in_flight_seqs() {
-        let mut order = CheckSeamOrder::new("repo:core", "deadbeef");
+        let mut order = CheckSeamOrder::new(&commit("core", "deadbeef"));
         // seqs 1 and 3 delivered; 2 is still in flight.
         order
-            .ingest(
-                &check_env("repo:core", "deadbeef", "build", 1, "success"),
-                1,
-            )
+            .ingest(&check_env("core", "deadbeef", "build", 1, "success"), 1)
             .unwrap();
         order
-            .ingest(&check_env("repo:core", "deadbeef", "lint", 1, "success"), 3)
+            .ingest(&check_env("core", "deadbeef", "lint", 1, "success"), 3)
             .unwrap();
         assert_eq!(order.ordering_gap(), 1, "seq 2 in flight → gap of 1");
         // the in-flight op arrives — the gap closes (0 lost).
         order
-            .ingest(&check_env("repo:core", "deadbeef", "test", 1, "success"), 2)
+            .ingest(&check_env("core", "deadbeef", "test", 1, "success"), 2)
             .unwrap();
         assert_eq!(
             order.ordering_gap(),
@@ -648,16 +836,16 @@ mod tests {
     /// partition order Git's supersession rule depends on.
     #[test]
     fn ingest_rejects_foreign_type_and_aggregate() {
-        let mut order = CheckSeamOrder::new("repo:core", "deadbeef");
+        let mut order = CheckSeamOrder::new(&commit("core", "deadbeef"));
 
-        let mut wrong_type = check_env("repo:core", "deadbeef", "build", 1, "success");
+        let mut wrong_type = check_env("core", "deadbeef", "build", 1, "success");
         wrong_type.type_ = EventType("git.ref.updated".into());
         assert!(matches!(
             order.ingest(&wrong_type, 1),
             Err(CheckSeamError::WrongType(_))
         ));
 
-        let wrong_agg = check_env("repo:core", "cafef00d", "build", 1, "success");
+        let wrong_agg = check_env("core", "cafef00d", "build", 1, "success");
         assert!(matches!(
             order.ingest(&wrong_agg, 1),
             Err(CheckSeamError::WrongAggregate { .. })
@@ -780,19 +968,20 @@ mod tests {
             contexts: vec!["build".into(), "test".into()],
             idem_token: "merge-7".into(),
         };
-        let draft = ci_result_draft("myelin://acme/git/repo/core", &result);
+        let commit = commit("core", "abc123");
+        let draft = ci_result_draft(&commit, &result).unwrap();
         assert_eq!(draft.type_.0, "ci.result");
         assert_eq!(
-            draft.subject.0, "myelin://acme/git/repo/core#commit-abc123/ci-result",
-            "subject = repo#commit-<oid>/ci-result (§4.12 #sub)"
+            draft.subject.0, "myelin://acme/git/commit/core:abc123",
+            "ci.result uses the canonical commit root (there is no ci-result sub kind)"
         );
         assert_eq!(
-            draft.aggregate.0, "myelin://acme/git/repo/core#commit-abc123",
+            draft.aggregate.0, "commit:core:abc123",
             "the rollup shares the per-commit aggregate so it linearises after its checks"
         );
         assert_eq!(
             draft.aggregate,
-            check_aggregate("myelin://acme/git/repo/core", "abc123"),
+            check_aggregate(&commit),
             "the rollup aggregate IS the checks' aggregate"
         );
         assert!(!draft.contains_personal_data, "references-not-payloads");

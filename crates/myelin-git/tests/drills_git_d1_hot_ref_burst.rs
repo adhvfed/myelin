@@ -41,13 +41,13 @@
 
 use myelin_events::relay::{BusTransport, InProcessBus, Relay};
 use myelin_events::{
-    Actor, AggregateKey, CausedBy, EmitContextBase, EventId, IdMinter, MonotonicMinter,
-    OutboxStore, Region, TenantId, Timestamp,
+    Actor, CausedBy, EmitContextBase, EventId, IdMinter, MonotonicMinter, OutboxStore, Region,
+    TenantId, Timestamp,
 };
 use myelin_git::events::GIT_REF_UPDATED;
 use myelin_git::receive_pack::{
-    CrashPoint, InMemoryObjectDb, Oid, ProposedRefUpdate, PushOutcome, PushSession, Pusher,
-    RefName, RefStore, RejectReason,
+    CrashPoint, GitRefEventKey, InMemoryObjectDb, Oid, ProposedRefUpdate, PushOutcome, PushSession,
+    Pusher, RefName, RefStore, RejectReason,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use std::collections::BTreeMap;
@@ -189,7 +189,9 @@ fn run_surge(multiplier: usize) -> (Arc<RefStore>, OutboxStore, SurgeResult) {
 /// the `(multiplier-1) × ROUNDS` losers are all non-fast-forward rejects (0 lost-update).
 #[test]
 fn git_d1_hot_ref_burst_per_ref_order_zero_lost_zero_ghost() {
-    let agg = AggregateKey(format!("{REPO}:{HOT_REF}"));
+    let key = GitRefEventKey::new(REPO, &RefName::new(HOT_REF)).unwrap();
+    let agg = key.aggregate();
+    let subject = key.subject(TENANT).unwrap();
 
     for multiplier in [1usize, 10, 30] {
         let (store, outbox, result) = run_surge(multiplier);
@@ -242,7 +244,7 @@ fn git_d1_hot_ref_burst_per_ref_order_zero_lost_zero_ghost() {
         r.drain_to_empty();
         let delivered_for_hot: Vec<u64> = r
             .transport()
-            .consume(&format!("myelin://{TENANT}/git/ref/{REPO}:{HOT_REF}"))
+            .consume(&subject.0)
             .iter()
             .map(|e| {
                 e.payload

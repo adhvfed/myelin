@@ -12,7 +12,7 @@
 //!
 //! **5.9 carriage — the PROVIDER (CI) ↔ CONSUMER (Git) agreement the BUS guarantees:**
 //! - the PROVIDER (CI) emits `ci.check.updated` with the §4.12 envelope shape: `type` =
-//!   `ci.check.updated`, `subject` = `repo#commit-<oid>/check-<context>` (the `#sub` sub-anchor),
+//!   `ci.check.updated`, `subject` = canonical commit root plus `#check-<context>`,
 //!   `aggregate` = `(repo, commit_oid)`, the CI-owned `CheckStatus` carried OPAQUE in `payload`;
 //! - the CONSUMER (Git) receives those events PER-AGGREGATE ORDERED on `(repo, commit_oid)` +
 //!   at-least-once — the ordering substrate its `run_attempt` supersession rule rests on. The Bus
@@ -29,15 +29,19 @@
 //! emit) lands EB-27/M4 (the seam goes end-to-end there). This pins the Bus's carriage NOW.
 
 use myelin_events::{
-    check_aggregate, check_subject, check_updated_draft, validate_event_type, Actor,
-    CheckSeamOrder, CiOverall, CiResult, CiResultWaitSubstrate, CorrelationId, DataRole,
-    EventEnvelope, EventId, EventType, Timestamp, Visibility, WakeOutcome,
+    check_aggregate, check_subject, check_updated_draft, validate_event_type, Actor, ArtifactRef,
+    CheckCommit, CheckSeamOrder, CiOverall, CiResult, CiResultWaitSubstrate, CorrelationId,
+    DataRole, EventEnvelope, EventId, EventType, Timestamp, Visibility, WakeOutcome,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{Region, TenantId};
 
 const REPO: &str = "myelin://acme/git/repo/core";
 const COMMIT: &str = "abc123def";
+
+fn commit() -> CheckCommit {
+    CheckCommit::from_repo_root(&ArtifactRef(REPO.into()), COMMIT).unwrap()
+}
 
 /// **PROVIDER side of 5.9 (CI emits `ci.check.updated`).** CI builds the envelope draft via the
 /// Bus's [`check_updated_draft`] carriage helper. The provider's promise: the `type`, `subject`
@@ -55,7 +59,7 @@ fn provider_ci_emits_ci_check_updated_with_the_412_envelope_shape() {
         "trust_tier": "trusted",
         "details_ref": "myelin://acme/ci/run/01J#step-3",
     });
-    let draft = check_updated_draft(REPO, COMMIT, "build", check_status.clone());
+    let draft = check_updated_draft(&commit(), "build", check_status.clone()).unwrap();
 
     // The PROVIDER's promise: a grammar-conformant `type` (the CONSUMER validator admits it).
     assert_eq!(draft.type_.0, "ci.check.updated");
@@ -64,14 +68,14 @@ fn provider_ci_emits_ci_check_updated_with_the_412_envelope_shape() {
         "the type is a §6.1 canonical name"
     );
 
-    // The §4.12 subject token grammar: repo#commit-<oid>/check-<context> (the #sub sub-anchor).
+    // The §4.12 subject token grammar: canonical commit root plus the check sub-anchor.
     assert_eq!(
         draft.subject.0,
-        format!("{REPO}#commit-{COMMIT}/check-build")
+        "myelin://acme/git/commit/core:abc123def#check-build"
     );
 
     // The aggregate is (repo, commit_oid) — the per-commit ordering partition all contexts share.
-    assert_eq!(draft.aggregate.0, format!("{REPO}#commit-{COMMIT}"));
+    assert_eq!(draft.aggregate.0, "commit:core:abc123def");
 
     // The CI-owned CheckStatus is carried OPAQUE — every field round-trips untouched (the Bus does
     // NOT interpret it; references-not-payloads, so no inline PII).
@@ -92,8 +96,8 @@ fn delivered(context: &str, run_attempt: u64, state: &str) -> EventEnvelope {
             PrincipalKind::Service,
             TenantId("acme".into()),
         )),
-        subject: check_subject(REPO, COMMIT, context),
-        aggregate: check_aggregate(REPO, COMMIT),
+        subject: check_subject(&commit(), context).unwrap(),
+        aggregate: check_aggregate(&commit()),
         causation_id: None,
         correlation_id: CorrelationId(format!("corr-{COMMIT}")),
         caused_by: None,
@@ -114,7 +118,7 @@ fn delivered(context: &str, run_attempt: u64, state: &str) -> EventEnvelope {
 /// CONSUMER agrees the order it reads is the per-aggregate `seq` order, never the arrival order.
 #[test]
 fn consumer_git_receives_ci_check_updated_per_aggregate_ordered() {
-    let mut order = CheckSeamOrder::new(REPO, COMMIT);
+    let mut order = CheckSeamOrder::new(&commit());
 
     // The at-least-once transport delivers two contexts + a re-run, scrambled: seq 3, 1, 2.
     assert!(order.ingest(&delivered("build", 2, "success"), 3).unwrap()); // a re-run, arrives first

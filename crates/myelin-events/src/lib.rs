@@ -358,7 +358,7 @@ pub mod upcast;
 
 /// The Git↔CI check-seam CARRIAGE (contract 5.9 the Bus's narrow half + 9.4 consumed, EB-24 /
 /// P-144). The Bus owns ONLY: envelope conformance ([`check_seam::check_updated_draft`] — the
-/// `ci.check.updated` subject `repo#commit-<oid>/check-<context>` + the `(repo, commit_oid)`
+/// `ci.check.updated` canonical commit subject plus `#check-<context>` + the commit aggregate
 /// aggregate, the CI-owned `CheckStatus` carried OPAQUE), per-aggregate ordering on
 /// `(repo, commit_oid)` ([`check_seam::CheckSeamOrder`] — interleaved/late arrivals stay
 /// per-aggregate ordered, the D-11 substrate Git's `run_attempt` supersession rests on), and the
@@ -373,8 +373,8 @@ pub mod upcast;
 /// P-FLOW-04 (this is its in-cell signal substrate, unchanged in shape when the engine lands).
 pub use check_seam::{
     check_aggregate, check_subject, check_updated_draft, ci_result_draft, ci_result_subject,
-    rollup_ci_result, CheckSeamError, CheckSeamOrder, CiOverall, CiResult, CiResultWaitSubstrate,
-    OrderedCheck, WakeOutcome,
+    rollup_ci_result, CheckCommit, CheckSeamError, CheckSeamOrder, CiOverall, CiResult,
+    CiResultWaitSubstrate, OrderedCheck, WakeOutcome,
 };
 pub use consumer::{
     consume, Consumer, ConsumerName, ConsumerSpec, DeadLetter, Delivered, Message,
@@ -444,8 +444,8 @@ pub use outbox::{
     OUTBOX_QUARANTINE_MIGRATION,
 };
 pub use partition::{
-    stream_name_for, PartitionKey, StreamSubject, SubjectError, MAX_STREAM_SUBJECT_BYTES,
-    MAX_SUBJECT_TOKEN_BYTES, SUBJECT_ROOT,
+    stream_name_for, PartitionKey, StreamSubject, SubjectComponent, SubjectComponentError,
+    SubjectError, MAX_STREAM_SUBJECT_BYTES, MAX_SUBJECT_TOKEN_BYTES, SUBJECT_ROOT,
 };
 pub use relay::{
     dlq_subject, BrokerDelivery, BrokerDeliveryBody, BrokerDeliveryRef, BusTransport,

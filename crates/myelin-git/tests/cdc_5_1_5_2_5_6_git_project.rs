@@ -52,7 +52,7 @@ fn provider_canonical_keys() -> Vec<(ArtifactRef, &'static str)> {
         ),
         (
             git_commit_ref("acme", "payments", "blake3:deadbeefcafe"),
-            "myelin://acme/git/commit/payments:blake3:deadbeefcafe",
+            "myelin://acme/git/commit/payments:blake3%3Adeadbeefcafe",
         ),
     ]
 }

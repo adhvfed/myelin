@@ -59,6 +59,7 @@ myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
 myelin-query = { path = "../myelin-query" }
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
 myelin-git = { path = "../myelin-git" }
+myelin-refs = { path = "../myelin-refs" }
 myelin-events = { path = "../myelin-events", features = ["nats"] }
 myelin-identity = { path = "../myelin-identity" }
 myelin-tenancy = { path = "../myelin-tenancy" }
