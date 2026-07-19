@@ -128,6 +128,11 @@ case "${cmd}" in
     ;;
   web)
     export MYELIN_EDGE_URL="http://127.0.0.1:8080"
+    # The web create action injects this one server-side target. Export only these non-secret
+    # canonical identifiers here (not the wider edge env / seal key).
+    export MYELIN_DOGFOOD_ISSUES_PROJECT="${MYELIN_DOGFOOD_ISSUES_PROJECT:-${DOGFOOD_ISSUES_PROJECT}}"
+    export MYELIN_DOGFOOD_ISSUES_TYPE="${MYELIN_DOGFOOD_ISSUES_TYPE:-${DOGFOOD_ISSUES_TYPE}}"
+    export MYELIN_DOGFOOD_ISSUES_PREFIX="${MYELIN_DOGFOOD_ISSUES_PREFIX:-${DOGFOOD_ISSUES_PREFIX}}"
     if [[ "${EXEC:-0}" == "1" ]]; then
       echo "dogfood: starting the frontend (MYELIN_EDGE_URL=${MYELIN_EDGE_URL})" >&2
       cd "${REPO_ROOT}/frontend/apps/web"
@@ -136,6 +141,9 @@ case "${cmd}" in
     cat <<EOF
 # The web operator UI is served by pnpm/vinxi in frontend/apps/web. Point it at the edge:
 export MYELIN_EDGE_URL="http://127.0.0.1:8080"
+export MYELIN_DOGFOOD_ISSUES_PROJECT="${MYELIN_DOGFOOD_ISSUES_PROJECT}"
+export MYELIN_DOGFOOD_ISSUES_TYPE="${MYELIN_DOGFOOD_ISSUES_TYPE}"
+export MYELIN_DOGFOOD_ISSUES_PREFIX="${MYELIN_DOGFOOD_ISSUES_PREFIX}"
 cd frontend/apps/web && pnpm install && pnpm dev
 # The operator-token login surface is gated by MYELIN_TOKEN_LOGIN=1 on the edge (see \`dogfood.sh env\`);
 # the web login form that consumes it landed in R4.0 (paste the \`edge bootstrap\` token on /login). The

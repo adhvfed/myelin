@@ -12,6 +12,8 @@ export {
   type StatusPillProps,
   type PrStateValue,
   type CheckVerdict,
+  type IssueStateCategory,
+  type IssueStatePillProps,
 } from "./StatusPill";
 // The inline reference chip (<ReferenceChip>) + the labelled context-pane slot (R3.3, contributed
 // DOWN). Chip owns the reference-chip §5 state renders (no_access withholds its title — non-leak);
