@@ -554,6 +554,23 @@ pub struct IncrementalIndexer {
     embedder: Arc<dyn EmbeddingAdapter>,
     /// The live `search.index_lag` measurement (contract 1.8): events delivered but not yet projected.
     index_lag: Arc<AtomicU64>,
+    /// **The index-rebuild gate** ([`crate::rebuild::RebuildReadGate`]).
+    ///
+    /// Fences BOTH directions for a tenant mid-rebuild:
+    /// - **intake** at [`EventHandler::handle`] — the bus consumer entry. The coordinator owns the
+    ///   index across the wipe→replay→catch-up window; a concurrent live apply would either be
+    ///   erased by the wipe (a lost update) or land on a partially-replayed corpus and then be
+    ///   counted by parity as a document the replay did not index.
+    /// - **reads** at [`Self::search_ft`] / [`Self::search_structured`] / [`Self::search_semantic`]
+    ///   — these sit BELOW the query pipeline, so the pipeline's fence does not cover them. They are
+    ///   public and production-reachable (the freshness probe, the restore-verify gate, the wedge
+    ///   drills), which makes them a genuine bypass of the fail-empty contract, not a test-only
+    ///   detail.
+    ///
+    /// Deliberately NOT applied to [`Self::index`]: that is the factored-out apply step the rebuild
+    /// coordinator itself drives during replay and catch-up. Fencing it would deadlock the rebuild
+    /// against its own gate. The bus entry is `handle`, and that is where intake is fenced.
+    rebuild_gate: Option<crate::rebuild::RebuildReadGate>,
 }
 
 impl IncrementalIndexer {
@@ -592,6 +609,22 @@ impl IncrementalIndexer {
             fetcher,
             embedder,
             index_lag: Arc::new(AtomicU64::new(0)),
+            rebuild_gate: None,
+        }
+    }
+
+    /// **Wire the index-rebuild gate** so intake and the low-level read entries honour a fence.
+    /// Without it both proceed unfenced — see [`Self::rebuild_gate`].
+    pub fn with_rebuild_gate(mut self, gate: crate::rebuild::RebuildReadGate) -> IncrementalIndexer {
+        self.rebuild_gate = Some(gate);
+        self
+    }
+
+    /// Whether `(tenant, region)` is currently fenced by a rebuild. `false` when no gate is wired.
+    fn fenced(&self, tenant: &TenantId, region: &Region) -> bool {
+        match &self.rebuild_gate {
+            None => false,
+            Some(gate) => !gate.admits_intake(tenant, region),
         }
     }
 
@@ -622,6 +655,11 @@ impl IncrementalIndexer {
         text_query: &str,
         limit: usize,
     ) -> Result<Vec<crate::engine::Hit>, crate::engine::IndexError> {
+        // Fail-empty while this tenant's index is rebuilding: it holds a prefix of the corpus, so
+        // any answer from it is confidently partial.
+        if self.fenced(tenant, region) {
+            return Ok(Vec::new());
+        }
         self.registry.with_backend(tenant, region, |be| {
             be.search(acl_filter, text_query, limit)
         })
@@ -646,6 +684,9 @@ impl IncrementalIndexer {
         limit: usize,
     ) -> Result<Vec<crate::engine::Hit>, crate::engine::IndexError> {
         use crate::engine::IndexBackend;
+        if self.fenced(tenant, region) {
+            return Ok(Vec::new());
+        }
         self.registry.with_backend(tenant, region, |be| {
             be.search_structured(acl_filter, field, value, limit)
         })
@@ -662,6 +703,9 @@ impl IncrementalIndexer {
         k: usize,
     ) -> Result<Vec<crate::vector::VectorHit>, crate::engine::IndexError> {
         use crate::engine::IndexBackend;
+        if self.fenced(tenant, region) {
+            return Ok(Vec::new());
+        }
         self.registry
             .with_backend(tenant, region, |be| be.semantic(acl_filter, query, k))
     }
@@ -1013,6 +1057,14 @@ impl EventHandler for IncrementalIndexer {
     /// belt and braces. A malformed event is a non-retryable poison; a transient owner hiccup is a
     /// Retry (0 lost — the runtime redelivers, the dedup mark is reverted so it re-runs).
     fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
+        // **The intake fence.** While this tenant is rebuilding, the coordinator owns the index —
+        // a concurrent live apply is either erased by the wipe or lands on a half-replayed corpus.
+        // RETRY rather than Done or NonRetryable: the event is redelivered once the rebuild
+        // reopens, so nothing is dropped and nothing is dead-lettered for an operational state that
+        // is expected and temporary.
+        if self.fenced(&ev.tenant, &ev.region) {
+            return HandleOutcome::Retry(myelin_events::Backoff { seconds: 30 });
+        }
         match self.index(ev) {
             Ok(()) => HandleOutcome::Done,
             Err(IndexEventError::Malformed(why)) => HandleOutcome::NonRetryable(Reason(why)),

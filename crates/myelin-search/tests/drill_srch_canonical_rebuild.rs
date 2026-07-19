@@ -1429,3 +1429,124 @@ fn catch_up_is_correct_under_the_durable_stores_row_ordering() {
         "a post-fence event must NOT be pulled in early — it is ordinary intake's business"
     );
 }
+
+/// **The fence bites on the REAL entry points, not just on a bare `RebuildReadGate`.**
+///
+/// The regression this pins: the earlier fence tests all asked `gate.read_mode(..)` directly, which
+/// proves the gate computes the right answer and proves nothing about whether anything consults it.
+/// `IncrementalIndexer::search_ft` / `search_structured` / `search_semantic` sit BELOW the query
+/// pipeline — they are public, production-reachable (the freshness probe, the restore-verify gate),
+/// and were entirely unfenced. So was the bus consumer entry `EventHandler::handle`.
+///
+/// This drives the actual methods on a gated indexer and asserts the fence is observable through
+/// them: reads fail empty, and live intake is REDELIVERED rather than applied or dead-lettered.
+#[test]
+fn the_fence_bites_on_the_real_read_and_intake_entries() {
+    use myelin_events::{EventHandler, HandleOutcome};
+
+    let fetcher = Arc::new(OwnerProjection::default());
+    let journal = Arc::new(MemoryRebuildJournal::new());
+    let gate = RebuildReadGate::new(journal.clone());
+    let indexer = Arc::new(
+        IncrementalIndexer::new(
+            all_specs(),
+            fetcher.clone(),
+            Arc::new(MockEmbeddingAdapter::new(8)),
+        )
+        .with_rebuild_gate(gate.clone()),
+    );
+    let reindexer = SearchReindexer::new(indexer.clone(), region());
+    let coordinator = RebuildCoordinator::new(journal.clone(), reindexer);
+    let key = RebuildKey::new(&tenant(), &region());
+
+    // Seed a document through the ordinary path while NOT fenced.
+    let doc = kn_id("visible");
+    fetcher.put(&doc, "a page about paxos consensus");
+    indexer.index(&created_event(&doc)).unwrap();
+    assert_eq!(
+        indexer
+            .search_ft(&tenant(), &region(), &AclFilter::All, "paxos", 10)
+            .unwrap()
+            .len(),
+        1,
+        "precondition: the document is searchable before the fence"
+    );
+
+    // ── Fence the tenant. ──
+    coordinator.claim(&key, HOLDER, 100).unwrap();
+    assert_eq!(gate.read_mode(&tenant(), &region()), ReadMode::FailEmptyRebuilding);
+
+    // READS through the real low-level entries now fail EMPTY, even though the document is still
+    // physically present (the wipe has not run yet) — proving the fence, not an empty index.
+    assert!(
+        indexer
+            .search_ft(&tenant(), &region(), &AclFilter::All, "paxos", 10)
+            .unwrap()
+            .is_empty(),
+        "search_ft must fail empty while the tenant is rebuilding"
+    );
+    assert!(
+        indexer
+            .search_semantic(
+                &tenant(),
+                &region(),
+                &AclFilter::All,
+                &myelin_search::vector::Embedding::new(vec![0.0; 8]),
+                10
+            )
+            .unwrap()
+            .is_empty(),
+        "search_semantic must fail empty while the tenant is rebuilding"
+    );
+    // The document really is still there — the empty answers above are the FENCE.
+    assert_eq!(
+        indexer.inventory(&tenant(), &region()).unwrap().doc_ids.len(),
+        1,
+        "the fence returned empty while the document was still present"
+    );
+
+    // INTAKE through the bus consumer entry is REDELIVERED, not applied and not dead-lettered.
+    let newcomer = kn_id("arrived-mid-rebuild");
+    fetcher.put(&newcomer, "a page that arrived mid-rebuild");
+    let outcome = {
+        let mut htx = myelin_events::HandlerTx::none();
+        indexer.handle(&created_event(&newcomer), &mut htx)
+    };
+    assert!(
+        matches!(outcome, HandleOutcome::Retry(_)),
+        "live intake during a rebuild must RETRY (redelivered after the rebuild), never be applied \
+         or dead-lettered: {outcome:?}"
+    );
+    assert!(
+        !indexer
+            .inventory(&tenant(), &region())
+            .unwrap()
+            .doc_ids
+            .contains(&newcomer),
+        "the fenced event must NOT have been applied"
+    );
+
+    // An UNRELATED tenant is unaffected on both paths — a fence is per (tenant, region).
+    let other_doc = "myelin://t/knowledge/page/other";
+    fetcher.put(other_doc, "another tenant's page about paxos");
+    let other_ev = EventEnvelope {
+        tenant: other_tenant(),
+        ..created_event(other_doc)
+    };
+    let outcome = {
+        let mut htx = myelin_events::HandlerTx::none();
+        indexer.handle(&other_ev, &mut htx)
+    };
+    assert!(
+        matches!(outcome, HandleOutcome::Done),
+        "an unrelated tenant's intake keeps flowing: {outcome:?}"
+    );
+    assert_eq!(
+        indexer
+            .search_ft(&other_tenant(), &region(), &AclFilter::All, "paxos", 10)
+            .unwrap()
+            .len(),
+        1,
+        "and an unrelated tenant keeps reading"
+    );
+}
