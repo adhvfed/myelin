@@ -218,6 +218,10 @@ pub struct EffectAuthority {
     pub principal_id: myelin_identity::PrincipalId,
     /// The exact registered tool selected by the router.
     pub tool: String,
+    /// Caller-minted, retry-stable invocation identity. This is authorization-adjacent request
+    /// metadata, not token material: adapters may hash it into their durable operation identity but
+    /// must never persist or log it verbatim.
+    pub idempotency_key: String,
 }
 
 impl core::fmt::Debug for EffectAuthority {
@@ -226,6 +230,7 @@ impl core::fmt::Debug for EffectAuthority {
             .field("jti", &self.run_token.jti)
             .field("principal_id", &self.principal_id)
             .field("tool", &self.tool)
+            .field("idempotency_key", &"<redacted>")
             .finish_non_exhaustive()
     }
 }

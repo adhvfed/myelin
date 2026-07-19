@@ -279,7 +279,13 @@ fn declared_caps_fail_closed_for_missing_and_attenuated_delegation() {
         tenant_policy: Authority::of(["pull_request.review"]),
         trigger_actor_held: Authority::of(["pull_request.review"]),
     });
-    let outcome = no_grant.call(open_pr, &serde_json::json!({"repo": "alpha"}), &now(), None);
+    let outcome = no_grant.call(
+        open_pr,
+        &serde_json::json!({"repo": "alpha"}),
+        "no-grant-open",
+        &now(),
+        None,
+    );
     match outcome {
         CallOutcome::Denied { reason, .. } => assert!(reason.contains("repo.push")),
         other => panic!("missing declared capability must deny before EffectApi: {other:?}"),
@@ -293,7 +299,13 @@ fn declared_caps_fail_closed_for_missing_and_attenuated_delegation() {
         tenant_policy: Authority::of(["repo.push", "pull_request.review"]),
         trigger_actor_held: Authority::of(["repo.push", "pull_request.review"]),
     });
-    let outcome = attenuated.call(open_pr, &serde_json::json!({"repo": "alpha"}), &now(), None);
+    let outcome = attenuated.call(
+        open_pr,
+        &serde_json::json!({"repo": "alpha"}),
+        "attenuated-open",
+        &now(),
+        None,
+    );
     match outcome {
         CallOutcome::Denied { reason, .. } => assert!(reason.contains("repo.push")),
         other => panic!("attenuated-away capability must deny: {other:?}"),
@@ -344,7 +356,7 @@ fn non_gated_tool_mints_a_run_token_and_routes_through_effect_api() {
     let resps = drive(
         &server,
         &[
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":7}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":7},"_meta":{"com.myelin/idempotencyKey":"review-7"}}}"#,
         ],
     );
     let r = &resps[0];
@@ -389,7 +401,7 @@ fn requires_approval_tool_is_hitl_gated_before_apply() {
     let resps = drive(
         &server,
         &[
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7},"_meta":{"com.myelin/idempotencyKey":"merge-7"}}}"#,
         ],
     );
     let r = &resps[0];
@@ -418,7 +430,7 @@ fn a_caller_supplied_granted_boolean_never_applies() {
     let resps = drive(
         &server,
         &[
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7},"approval":{"granted":true}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7},"approval":{"granted":true},"_meta":{"com.myelin/idempotencyKey":"merge-7"}}}"#,
         ],
     );
     let r = &resps[0];
@@ -442,7 +454,7 @@ fn a_caller_supplied_granted_boolean_never_applies() {
 /// on the SAME server re-surfaces the SAME pending gate (no duplicate spawn).
 #[test]
 fn a_gated_tool_returns_an_opaque_unguessable_gate_id() {
-    let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7}}}"#;
+    let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7},"_meta":{"com.myelin/idempotencyKey":"merge-7"}}}"#;
 
     let server = governed_server();
     let resps = drive(&server, &[call]);
@@ -491,7 +503,7 @@ fn a_gated_tool_returns_an_opaque_unguessable_gate_id() {
 #[test]
 fn approval_is_a_server_side_verdict_by_a_distinct_human_principal() {
     let server = governed_server();
-    let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7}}}"#;
+    let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7},"_meta":{"com.myelin/idempotencyKey":"merge-7"}}}"#;
 
     // (1) WITHHELD → an opaque gate id, a `waiting` row server-side, 0 mutation.
     let gated = drive(&server, &[call]);
@@ -535,7 +547,7 @@ fn approval_is_a_server_side_verdict_by_a_distinct_human_principal() {
 
     // (3) Re-driving WITH the gate id while the gate is still waiting → still withheld, 0 apply.
     let redrive = format!(
-        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"git.merge","arguments":{{"repo":"acme/web","number":7}},"approval":{{"gateId":"{gate_id}"}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"git.merge","arguments":{{"repo":"acme/web","number":7}},"approval":{{"gateId":"{gate_id}"}},"_meta":{{"com.myelin/idempotencyKey":"merge-7"}}}}}}"#
     );
     let pending = drive(&server, &[redrive.as_str()]);
     assert!(
@@ -575,7 +587,7 @@ fn a_made_up_gate_id_is_denied() {
     let resps = drive(
         &server,
         &[
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7},"approval":{"gateId":"gate:0123456789abcdef0123456789abcdef"}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7},"approval":{"gateId":"gate:0123456789abcdef0123456789abcdef"},"_meta":{"com.myelin/idempotencyKey":"merge-7"}}}"#,
         ],
     );
     let r = &resps[0];
@@ -597,7 +609,7 @@ fn a_made_up_gate_id_is_denied() {
 #[test]
 fn an_approval_never_transfers_to_a_sibling_effect_and_a_reject_is_final() {
     let server = governed_server();
-    let call7 = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7}}}"#;
+    let call7 = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":7},"_meta":{"com.myelin/idempotencyKey":"merge-7"}}}"#;
     let gated = drive(&server, &[call7]);
     let gate7 = gated[0]["result"]["_meta"]["gateId"]
         .as_str()
@@ -610,7 +622,7 @@ fn an_approval_never_transfers_to_a_sibling_effect_and_a_reject_is_final() {
 
     // The approved gate for PR 7 does NOT clear a re-drive of PR 8 (same tool, different effect).
     let cross = format!(
-        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"git.merge","arguments":{{"repo":"acme/web","number":8}},"approval":{{"gateId":"{gate7}"}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"git.merge","arguments":{{"repo":"acme/web","number":8}},"approval":{{"gateId":"{gate7}"}},"_meta":{{"com.myelin/idempotencyKey":"merge-8"}}}}}}"#
     );
     let denied = drive(&server, &[cross.as_str()]);
     assert_eq!(
@@ -620,7 +632,7 @@ fn an_approval_never_transfers_to_a_sibling_effect_and_a_reject_is_final() {
     assert!(denied[0]["result"]["_meta"]["eventId"].is_null());
 
     // A REJECTED gate is final: re-driving with it is denied (never re-approvable).
-    let call9 = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":9}}}"#;
+    let call9 = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/web","number":9},"_meta":{"com.myelin/idempotencyKey":"merge-9"}}}"#;
     let gated9 = drive(&server, &[call9]);
     let gate9 = gated9[0]["result"]["_meta"]["gateId"]
         .as_str()
@@ -636,7 +648,7 @@ fn an_approval_never_transfers_to_a_sibling_effect_and_a_reject_is_final() {
         "a rejected gate never re-transitions"
     );
     let redrive9 = format!(
-        r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"git.merge","arguments":{{"repo":"acme/web","number":9}},"approval":{{"gateId":"{gate9}"}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"git.merge","arguments":{{"repo":"acme/web","number":9}},"approval":{{"gateId":"{gate9}"}},"_meta":{{"com.myelin/idempotencyKey":"merge-9"}}}}}}"#
     );
     let d9 = drive(&server, &[redrive9.as_str()]);
     assert_eq!(
@@ -651,7 +663,7 @@ fn a_revoked_run_token_is_denied_never_routed() {
     let server = governed_server();
     // First call mints + applies (under a live token).
     let first = server
-        .handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":1}}}"#)
+        .handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":1},"_meta":{"com.myelin/idempotencyKey":"review-1"}}}"#)
         .unwrap();
     let first: serde_json::Value = serde_json::from_str(&first).unwrap();
     assert_eq!(first["result"]["isError"], false);
@@ -665,7 +677,7 @@ fn a_revoked_run_token_is_denied_never_routed() {
 
     // A subsequent tools/call under the REVOKED run token is DENIED — never routed to EffectApi.
     let second = server
-        .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":2}}}"#)
+        .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":2},"_meta":{"com.myelin/idempotencyKey":"review-2"}}}"#)
         .unwrap();
     let second: serde_json::Value = serde_json::from_str(&second).unwrap();
     assert_eq!(
@@ -697,7 +709,7 @@ fn lazy_mint_refuses_expired_or_revoked_trigger_and_clamps_run_life() {
 
     let expired = governed_router_with_trigger(input(), "expired-trigger", at_unix);
     assert!(matches!(
-        expired.call(tool, &args, &at, None),
+        expired.call(tool, &args, "expired-trigger", &at, None),
         CallOutcome::Denied { reason, .. } if reason.contains("trigger credential is expired")
     ));
     assert!(expired.current_token().is_none());
@@ -709,14 +721,14 @@ fn lazy_mint_refuses_expired_or_revoked_trigger_and_clamps_run_life() {
         at.clone(),
     );
     assert!(matches!(
-        revoked.call(tool, &args, &at, None),
+        revoked.call(tool, &args, "revoked-trigger", &at, None),
         CallOutcome::Denied { reason, .. } if reason.contains("trigger credential is revoked")
     ));
     assert!(revoked.current_token().is_none());
 
     let clamped = governed_router_with_trigger(input(), "short-trigger", at_unix + 2);
     assert!(matches!(
-        clamped.call(tool, &args, &at, None),
+        clamped.call(tool, &args, "clamped-trigger", &at, None),
         CallOutcome::Applied { .. }
     ));
     let token = clamped.current_token().unwrap();
@@ -726,7 +738,13 @@ fn lazy_mint_refuses_expired_or_revoked_trigger_and_clamps_run_life() {
         at.clone(),
     );
     assert!(matches!(
-        clamped.call(tool, &args, &Timestamp("2026-06-26T00:00:01Z".into()), None),
+        clamped.call(
+            tool,
+            &args,
+            "clamped-trigger",
+            &Timestamp("2026-06-26T00:00:01Z".into()),
+            None,
+        ),
         CallOutcome::Applied { .. }
     ));
     let after_trigger = Timestamp("2026-06-26T00:00:03Z".into());
@@ -751,7 +769,7 @@ fn malformed_request_is_a_jsonrpc_error_no_panic() {
 #[test]
 fn stdio_eof_tears_down_the_minted_run_token() {
     let server = governed_server();
-    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":1}}}"#;
+    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":1},"_meta":{"com.myelin/idempotencyKey":"review-1"}}}"#;
     let mut output = Vec::new();
 
     server
@@ -775,7 +793,7 @@ fn stdio_eof_tears_down_the_minted_run_token() {
 #[test]
 fn stdio_output_error_still_tears_down_the_minted_run_token() {
     let server = governed_server();
-    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":1}}}"#;
+    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":1},"_meta":{"com.myelin/idempotencyKey":"review-1"}}}"#;
     let error = server
         .run(request.as_bytes(), FailingWriter)
         .expect_err("broken stdout must surface");
@@ -807,7 +825,7 @@ fn post_mutation_audit_failure_is_indeterminate_terminal_and_tears_down() {
         Arc::new(FailOutcomeAudit),
     );
     let server = McpServer::with_router_and_clock(ToolRegistry::with_git(), router, Arc::new(now));
-    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.open_pr","arguments":{"repo":"alpha"}}}"#;
+    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.open_pr","arguments":{"repo":"alpha"},"_meta":{"com.myelin/idempotencyKey":"open-alpha"}}}"#;
     let mut output = Vec::new();
     let error = server
         .run(request.as_bytes(), &mut output)
@@ -845,6 +863,7 @@ fn post_gate_open_audit_failure_is_also_indeterminate_and_terminal() {
     let outcome = router.call(
         registry.resolve("git.merge").unwrap(),
         &serde_json::json!({"repo":"alpha","number":1}),
+        "post-gate-audit-1",
         &now(),
         None,
     );
@@ -873,6 +892,7 @@ fn expiry_audit_failure_is_fail_loud_after_state_commit_and_terminates_session()
     let gate_id = match router.call(
         merge,
         &serde_json::json!({"repo":"alpha","number":1}),
+        "expiry-audit-1",
         &opened_at,
         None,
     ) {
@@ -885,6 +905,7 @@ fn expiry_audit_failure_is_fail_loud_after_state_commit_and_terminates_session()
         router.call(
             merge,
             &serde_json::json!({"repo":"alpha","number":1}),
+            "expiry-audit-1",
             &expired_at,
             Some(&gate_id),
         ),
@@ -959,7 +980,13 @@ fn mcp_expiry_leaves_unrelated_shared_gate_untouched_and_audits_exact_gate() {
     );
     let registry = ToolRegistry::with_git();
     assert!(matches!(
-        router.call(registry.resolve("git.merge").unwrap(), &args, &now(), None),
+        router.call(
+            registry.resolve("git.merge").unwrap(),
+            &args,
+            "scope-expiry-1",
+            &now(),
+            None,
+        ),
         CallOutcome::Gated { .. }
     ));
     assert_eq!(
@@ -991,7 +1018,7 @@ fn governed_calls_read_the_clock_afresh() {
         McpServer::with_router_and_clock(ToolRegistry::with_git(), governed_router(), clock);
     let call = |id| {
         format!(
-            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"git.submit_review","arguments":{{"number":{id}}}}}}}"#
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"git.submit_review","arguments":{{"number":{id}}},"_meta":{{"com.myelin/idempotencyKey":"review-{id}"}}}}}}"#
         )
     };
 

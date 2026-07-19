@@ -453,6 +453,7 @@ impl GovernedRouter {
         &self,
         tool: &RegisteredTool,
         args: &serde_json::Value,
+        idempotency_key: &str,
         now: &Timestamp,
         presented_gate_id: Option<&str>,
     ) -> CallOutcome {
@@ -665,6 +666,7 @@ impl GovernedRouter {
             run_token: token,
             principal_id: self.principal.agent_id.clone(),
             tool: tool.name().to_string(),
+            idempotency_key: idempotency_key.to_string(),
         };
         let effect = proposed_effect_for(tool.name(), args);
         if self
