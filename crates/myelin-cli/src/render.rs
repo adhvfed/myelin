@@ -4,10 +4,36 @@
 //! parallel one). The CLI renders it two ways:
 //! - **`--json`** — the raw JSON, pretty-printed, for scripting / an agent consumer (machine-readable);
 //! - **default** — a compact human-readable form: the uniform `{items,page}` list as one line per
-//!   item, the `whoami` principal as a single line, and an unknown shape falls back to pretty JSON
-//!   (total — it never panics on an unexpected shape).
+//!   item, the `whoami` principal as a single line, and an unknown shape falls back to terminal-safe
+//!   JSON (total — it never panics on an unexpected shape).
 
 use serde_json::Value;
+use std::fmt::Write as _;
+
+/// Make an untrusted server string safe to place on one terminal line. Printable Unicode is kept
+/// intact; line separators and terminal-control bytes become visible ASCII escape sequences.
+fn terminal_safe_single_line(value: &str) -> String {
+    let mut safe = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\n' => safe.push_str("\\n"),
+            '\r' => safe.push_str("\\r"),
+            '\t' => safe.push_str("\\t"),
+            '\u{2028}' => safe.push_str("\\u{2028}"),
+            '\u{2029}' => safe.push_str("\\u{2029}"),
+            character if character.is_control() => {
+                let codepoint = character as u32;
+                if codepoint <= 0xff {
+                    let _ = write!(safe, "\\x{codepoint:02x}");
+                } else {
+                    let _ = write!(safe, "\\u{{{codepoint:x}}}");
+                }
+            }
+            character => safe.push(character),
+        }
+    }
+    safe
+}
 
 /// Render an edge response value. In `json_mode` the raw JSON is pretty-printed; otherwise a compact
 /// human form is produced (the `{items,page}` list, the whoami line, or a JSON fallback).
@@ -40,6 +66,10 @@ pub fn render(value: &Value, json_mode: bool) -> String {
         let kind = value.get("kind").and_then(Value::as_str).unwrap_or("?");
         let tenant = value.get("tenant").and_then(Value::as_str).unwrap_or("?");
         let region = value.get("region").and_then(Value::as_str).unwrap_or("?");
+        let pid = terminal_safe_single_line(pid);
+        let kind = terminal_safe_single_line(kind);
+        let tenant = terminal_safe_single_line(tenant);
+        let region = terminal_safe_single_line(region);
         return format!("{pid} ({kind})  tenant={tenant}  region={region}\n");
     }
     // Issues create is asynchronous. Render the durable receipt honestly and pair it with the exact
@@ -53,6 +83,9 @@ pub fn render(value: &Value, json_mode: bool) -> String {
                 .get("status")
                 .and_then(Value::as_str)
                 .unwrap_or("pending");
+            let id = terminal_safe_single_line(id);
+            let key = terminal_safe_single_line(key);
+            let status = terminal_safe_single_line(status);
             return format!(
                 "{key} staged ({id}); authorization={status}\nnot visible yet; after reconciliation: myelin issues view {id}\n"
             );
@@ -62,8 +95,10 @@ pub fn render(value: &Value, json_mode: bool) -> String {
     if is_issue(value) {
         return format!("{}\n", render_issue(value));
     }
-    // An unknown shape: pretty JSON (total — never a panic).
-    format!("{}\n", serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()))
+    // An unknown shape: terminal-safe JSON (total — never a panic). Sanitize the serialized form too:
+    // JSON permits DEL/C1 bytes unescaped, and those are still terminal controls in human mode.
+    let serialized = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
+    format!("{}\n", terminal_safe_single_line(&serialized))
 }
 
 /// Render one list item to a line. Known shapes: a RepoHome (`slug`/`state`) and a code-search hit
@@ -74,6 +109,8 @@ fn render_item(item: &Value) -> String {
     }
     if let Some(slug) = item.get("slug").and_then(Value::as_str) {
         let state = item.get("state").and_then(Value::as_str).unwrap_or("?");
+        let slug = terminal_safe_single_line(slug);
+        let state = terminal_safe_single_line(state);
         return format!("{slug}  [{state}]");
     }
     if let (Some(repo), Some(path)) = (
@@ -82,9 +119,12 @@ fn render_item(item: &Value) -> String {
     ) {
         let line = item.get("line").and_then(Value::as_i64).unwrap_or(0);
         let excerpt = item.get("excerpt").and_then(Value::as_str).unwrap_or("");
+        let repo = terminal_safe_single_line(repo);
+        let path = terminal_safe_single_line(path);
+        let excerpt = terminal_safe_single_line(excerpt);
         return format!("{repo}:{path}:{line}  {excerpt}");
     }
-    item.to_string()
+    terminal_safe_single_line(&item.to_string())
 }
 
 fn is_issue(value: &Value) -> bool {
@@ -94,10 +134,11 @@ fn is_issue(value: &Value) -> bool {
 }
 
 fn render_issue(value: &Value) -> String {
-    let key = value.get("key").and_then(Value::as_str).unwrap_or("?");
-    let title = value.get("title").and_then(Value::as_str).unwrap_or("");
-    let state = value.get("state").and_then(Value::as_str).unwrap_or("?");
-    let id = value.get("id").and_then(Value::as_str).unwrap_or("?");
+    let key = terminal_safe_single_line(value.get("key").and_then(Value::as_str).unwrap_or("?"));
+    let title = terminal_safe_single_line(value.get("title").and_then(Value::as_str).unwrap_or(""));
+    let state =
+        terminal_safe_single_line(value.get("state").and_then(Value::as_str).unwrap_or("?"));
+    let id = terminal_safe_single_line(value.get("id").and_then(Value::as_str).unwrap_or("?"));
     format!("{key}  [{state}]  {title}  ({id})")
 }
 
@@ -184,5 +225,63 @@ mod tests {
         assert!(row.contains("ENG-1  [open]  Founder issue"));
         let list = render(&json!({"items":[issue],"page":{"next_cursor":null}}), false);
         assert!(list.contains("ENG-1  [open]  Founder issue"));
+    }
+
+    #[test]
+    fn human_issue_fields_escape_terminal_controls_but_preserve_printable_unicode() {
+        let issue = json!({
+            "id":"id\u{7f}tail",
+            "key":"ENG\t1",
+            "title":"Grüße 🚀\nsecond row\u{1b}[31mred\u{85}next",
+            "state":"open\rclosed"
+        });
+
+        let out = render(&issue, false);
+        assert_eq!(
+            out.lines().count(),
+            1,
+            "untrusted fields cannot inject rows"
+        );
+        assert!(!out.contains('\u{1b}'));
+        assert!(!out.contains('\r'));
+        assert!(!out.contains('\t'));
+        assert!(!out.contains('\u{7f}'));
+        assert!(!out.contains('\u{85}'));
+        assert!(out.contains("Grüße 🚀"), "printable Unicode survives");
+        assert!(out.contains("\\nsecond row\\x1b[31mred\\x85next"));
+        assert!(out.contains("ENG\\t1  [open\\rclosed]"));
+        assert!(out.contains("id\\x7ftail"));
+
+        let json = render(&issue, true);
+        assert!(json.contains("Grüße 🚀"));
+        assert!(json.contains("\\nsecond row"), "JSON keeps JSON escaping");
+    }
+
+    #[test]
+    fn all_other_human_server_fields_are_terminal_safe() {
+        let receipt = json!({
+            "issue": {"id": "id\n2", "key": "ENG\u{1b}[2J"},
+            "authorization": {"status": "pending\tunsafe"}
+        });
+        let receipt_out = render(&receipt, false);
+        assert!(!receipt_out.contains('\u{1b}'));
+        assert!(receipt_out.contains("id\\n2"));
+        assert!(receipt_out.contains("ENG\\x1b[2J"));
+        assert!(receipt_out.contains("pending\\tunsafe"));
+
+        let page = json!({
+            "items": [{"repo": "repo\nrow", "path": "p\u{1b}[A", "line": 1,
+                       "excerpt": "Grüße\tthere"}],
+            "page": {"next_cursor": null}
+        });
+        let page_out = render(&page, false);
+        assert_eq!(page_out.lines().count(), 1);
+        assert!(!page_out.contains('\u{1b}'));
+        assert!(page_out.contains("repo\\nrow:p\\x1b[A:1  Grüße\\tthere"));
+
+        let fallback_out = render(&json!({"unknown": "safe 🚀\u{7f}\u{85}"}), false);
+        assert!(fallback_out.contains("safe 🚀\\x7f\\x85"));
+        assert!(!fallback_out.contains('\u{7f}'));
+        assert!(!fallback_out.contains('\u{85}'));
     }
 }
