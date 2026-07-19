@@ -439,16 +439,81 @@ pub trait TokenSigner: Send + Sync {
     /// minted token authenticates as the principal it was minted
     /// for. `grants` is the ALREADY-ATTENUATED effective authority (the mint applied the
     /// intersection) — the signer never widens it.
-    fn sign(
-        &self,
-        tenant: &str,
-        region: &str,
-        subject_key: &str,
-        jti: &str,
-        purpose: &crate::machine_auth::CredentialPurpose,
-        expires_at: &Timestamp,
-        grants: &[&str],
-    ) -> String;
+    fn sign(&self, request: &TokenSignRequest) -> String;
+}
+
+/// Trust-rooted, already-attenuated facts presented to a [`TokenSigner`].
+///
+/// Tenant and region travel together as a verified [`TenantScope`], while the subject and purpose
+/// retain their domain types. Raw subject keys, revocation handles, and grant names are deliberately
+/// omitted from `Debug` because signer requests routinely cross logging/error boundaries.
+#[derive(Clone)]
+pub struct TokenSignRequest {
+    scope: TenantScope,
+    subject: PrincipalId,
+    jti: String,
+    purpose: CredentialPurpose,
+    expires_at: Timestamp,
+    grants: Vec<String>,
+}
+
+impl TokenSignRequest {
+    /// Capture the verified scope and the mint's already-attenuated authority without widening it.
+    pub fn new(
+        scope: &TenantScope,
+        subject: PrincipalId,
+        jti: impl Into<String>,
+        purpose: CredentialPurpose,
+        expires_at: Timestamp,
+        grants: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            scope: scope.clone(),
+            subject,
+            jti: jti.into(),
+            purpose,
+            expires_at,
+            grants: grants.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn scope(&self) -> &TenantScope {
+        &self.scope
+    }
+
+    pub fn subject(&self) -> &PrincipalId {
+        &self.subject
+    }
+
+    pub fn jti(&self) -> &str {
+        &self.jti
+    }
+
+    pub fn purpose(&self) -> &CredentialPurpose {
+        &self.purpose
+    }
+
+    pub fn expires_at(&self) -> &Timestamp {
+        &self.expires_at
+    }
+
+    pub fn grants(&self) -> &[String] {
+        &self.grants
+    }
+}
+
+impl core::fmt::Debug for TokenSignRequest {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TokenSignRequest")
+            .field("tenant", self.scope.tenant())
+            .field("region", self.scope.region())
+            .field("subject", &"<redacted>")
+            .field("jti", &"<redacted>")
+            .field("purpose", &self.purpose.claim())
+            .field("expires_at", &self.expires_at)
+            .field("grant_count", &self.grants.len())
+            .finish()
+    }
 }
 
 /// **The floor token signer (the EI-01 §1 documented deviation).** Emits the SAME structural
@@ -469,21 +534,17 @@ impl StructuralTokenSigner {
 }
 
 impl TokenSigner for StructuralTokenSigner {
-    fn sign(
-        &self,
-        tenant: &str,
-        region: &str,
-        subject_key: &str,
-        jti: &str,
-        purpose: &crate::machine_auth::CredentialPurpose,
-        _expires_at: &Timestamp,
-        grants: &[&str],
-    ) -> String {
+    fn sign(&self, request: &TokenSignRequest) -> String {
+        let tenant = &request.scope().tenant().0;
+        let region = &request.scope().region().0;
+        let subject_key = &request.subject().0;
+        let jti = request.jti();
+        let purpose = request.purpose();
         // A per-run token is TTL-constrained, not DPoP-bound (§4) → dpop = 0. The grant list is the
         // already-attenuated effective authority (comma-separated; empty ⇒ no grants).
         format!(
             "{tenant}|{region}|{subject_key}|{jti}|0|{}|{}|edge|{}|{}",
-            grants.join(","),
+            request.grants().join(","),
             purpose.claim(),
             purpose.run_id().unwrap_or_default(),
             match purpose {
@@ -814,16 +875,15 @@ impl RunTokenMinter {
         // (4) Sign the (already-attenuated) effective authority into the bearer material (the floor
         //     structural envelope → the real crypto signer behind the seam). The signer NEVER widens
         //     the authority — it carries exactly the effective set the intersection produced.
-        let grants: Vec<&str> = effective.grants().collect();
-        let material = self.signer.sign(
-            &scope.tenant().0,
-            &scope.region().0,
-            &agent_id.0,
+        let request = TokenSignRequest::new(
+            scope,
+            agent_id.clone(),
             &jti,
-            &purpose,
-            &expires_at,
-            &grants,
+            purpose,
+            expires_at.clone(),
+            effective.grants(),
         );
+        let material = self.signer.sign(&request);
 
         // (5) Register the `expires_at == run-life` TTL in S7 (the revoke-on-crash defence-in-depth,
         //     §11). The token is denylisted UNTIL `expires_at` — wait, no: the S7 TTL models the
@@ -1118,6 +1178,28 @@ mod tests {
 
     fn auth(grants: &[&str]) -> Authority {
         Authority::of(grants.iter().copied())
+    }
+
+    #[test]
+    fn token_sign_request_debug_redacts_bearer_identifiers_and_authority() {
+        let request = TokenSignRequest::new(
+            &scope("acme"),
+            PrincipalId("svc:secret-agent".into()),
+            "runtok:secret-jti",
+            CredentialPurpose::AgentRun {
+                run_id: "run:secret".into(),
+                delegation_snapshot: Some(42),
+            },
+            Timestamp("2030-01-01T00:00:00Z".into()),
+            ["repo:secret:admin"],
+        );
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("svc:secret-agent"));
+        assert!(!debug.contains("runtok:secret-jti"));
+        assert!(!debug.contains("run:secret"));
+        assert!(!debug.contains("repo:secret:admin"));
+        assert!(debug.contains("agent_run"));
+        assert!(debug.contains("grant_count: 1"));
     }
 
     fn input(agent: &[&str], deleg: &[&str], tenant: &[&str], held: &[&str]) -> DelegationInput {
