@@ -134,11 +134,64 @@ impl GitReindexSource {
         );
     }
 
+    /// **Load the CURRENT canonical blob truth for an indexed ref (the reindex source of record).**
+    ///
+    /// This is what makes a Git blob replay real rather than a replay of whatever happened to be in
+    /// memory. `truth` comes from
+    /// [`CodeProjectionEmitter::enumerate_canonical_truth`](crate::code_projection::CodeProjectionEmitter::enumerate_canonical_truth),
+    /// which walks the indexed ref's tip tree and by construction omits blobs that were DELETED
+    /// (absent from the tree) and blobs that are RESTRICTED (skipped, not body-suppressed).
+    ///
+    /// It REPLACES the blob truth for the `(repo, ref)` it describes rather than merging into it.
+    /// Merging would be the bug: a blob deleted or restricted since the last load would survive in
+    /// the map and be replayed back into the index — precisely the resurrection this is here to
+    /// prevent. Blobs of OTHER repos/refs are untouched.
+    ///
+    /// `version` is the aggregate version the snapshots carry (the ref's tip generation).
+    pub fn load_canonical_blob_truth(
+        &mut self,
+        repo: &str,
+        ref_name: &str,
+        truth: &[crate::code_projection::CanonicalBlobTruth],
+        version: u64,
+    ) {
+        // Drop every existing blob row for this (repo, ref) first — absence in `truth` MEANS deleted
+        // or restricted, and that has to be reflected as removal, not as a stale survivor.
+        let prefix = blob_aggregate_prefix(repo, ref_name);
+        self.truth
+            .retain(|agg, row| row.kind != GitReplayKind::Blob || !agg.starts_with(&prefix));
+
+        for blob in truth {
+            let aggregate = format!("{prefix}{}", blob.path);
+            self.upsert(
+                GitReplayKind::Blob,
+                &aggregate,
+                version,
+                &blob.artifact_ref.0,
+                serde_json::json!({
+                    "op": "upsert",
+                    "artifact_ref": blob.artifact_ref.0,
+                    "path": blob.path,
+                    "blob_oid": blob.blob_oid.0,
+                }),
+            );
+        }
+    }
+
     /// Mark an aggregate erased (a tombstone) — it is REMOVED from the truth, so a subsequent replay
     /// SKIPS it (the erasure stays erased across a reindex, X-7). Returns `true` if it was present.
     pub fn erase(&mut self, aggregate: &str) -> bool {
         self.truth.remove(aggregate).is_some()
     }
+}
+
+/// The aggregate-key prefix every blob of one `(repo, ref)` shares.
+///
+/// Blob aggregates are `blob:<repo>/<ref>/` + path, so a `(repo, ref)` reload can drop exactly its
+/// own rows. The trailing `/` is load-bearing: without it, repo `core` would prefix-match `core2`
+/// and a reload of one repo would wipe another's blob truth.
+fn blob_aggregate_prefix(repo: &str, ref_name: &str) -> String {
+    format!("blob:{repo}/{ref_name}/")
 }
 
 /// **Does aggregate `agg` match a specific (non-`all`) selector `target`?** A match is EITHER an EXACT

@@ -157,6 +157,14 @@ impl Tree {
         self
     }
 
+    /// Every `(path, blob)` in the tree, in deterministic path order.
+    ///
+    /// The enumeration [`CodeProjectionEmitter::enumerate_canonical_truth`] walks to build the
+    /// current canonical blob set for a reindex.
+    pub fn entries(&self) -> impl Iterator<Item = (&String, &Blob)> {
+        self.entries.iter()
+    }
+
     /// The number of entries (files) in the tree.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -572,6 +580,21 @@ impl BlobRemovalReason {
     }
 }
 
+/// **One blob in the CURRENT canonical truth of an indexed ref** — the unit a reindex replays.
+///
+/// Produced by [`CodeProjectionEmitter::enumerate_canonical_truth`]. Its `artifact_ref` is the
+/// canonical percent-encoded identity, so a rebuild driven from these rows cannot reintroduce a
+/// legacy id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalBlobTruth {
+    /// The canonical `myelin://<tenant>/git/blob/<repo>:<ref>:<path>` identity.
+    pub artifact_ref: ArtifactRef,
+    /// The blob's path within the repo.
+    pub path: String,
+    /// The content-addressed blob object id.
+    pub blob_oid: BlobOid,
+}
+
 // ───────────────────────────── the emitter (the receive-pack post-commit hook) ───────────────────
 
 /// The outcome of an [`CodeProjectionEmitter::emit_for_push`]: the projection docs emitted (the
@@ -689,6 +712,47 @@ impl<'a, R: RestrictionPolicy> CodeProjectionEmitter<'a, R> {
             },
             blob_oid: blob.oid.clone(),
         }
+    }
+
+    /// **Enumerate the CURRENT canonical blob truth of an indexed ref (the reindex source).**
+    ///
+    /// A rebuild replays owner truth, so the owner has to be able to state what that truth IS. The
+    /// emitter's other entry point is incremental — it reports what CHANGED on a push — which is the
+    /// wrong shape for a cold rebuild: a rebuild needs the full current set, not a diff.
+    ///
+    /// This walks the indexed ref's tip tree and returns one [`CanonicalBlobTruth`] per blob that
+    /// should be in the index right now, which by construction:
+    ///
+    /// - **omits DELETED blobs** — a deleted blob is simply absent from the tip tree. Enumeration
+    ///   states what exists, so there is nothing to filter: a rebuild driven from this set cannot
+    ///   resurrect a blob that was removed from the ref.
+    /// - **omits RESTRICTED blobs** — a path under an active `restrict` (`03 §6`) is skipped
+    ///   entirely rather than emitted with a suppressed body. A body-suppressed row would still
+    ///   produce a document queryable by its `path`/`blob_oid` facets, which is the reachability the
+    ///   restriction exists to remove. Its absence here is what makes the rebuild resolve it `Gone`.
+    ///
+    /// A ref that is not an indexed ref yields an empty set (it was never projected, so it has no
+    /// truth to replay).
+    pub fn enumerate_canonical_truth(
+        &self,
+        ref_name: &str,
+        tip_tree: &Tree,
+    ) -> Result<Vec<CanonicalBlobTruth>, OutboxError> {
+        if !is_indexed_ref(ref_name, &self.default_branch) {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for (path, blob) in tip_tree.entries() {
+            if self.restriction.is_restricted(&self.repo, path) {
+                continue;
+            }
+            out.push(CanonicalBlobTruth {
+                artifact_ref: self.blob_ref(ref_name, path)?,
+                path: path.clone(),
+                blob_oid: blob.oid.clone(),
+            });
+        }
+        Ok(out)
     }
 
     /// **Emit the code projection for a push to an indexed ref (the §9 algorithm, the GATE).** Diffs
