@@ -3,7 +3,8 @@
 
 use myelin_config::MyelinConfig;
 use myelin_events::nats::{
-    JetStreamConsumerConfig, JetStreamPublisherConfig, NatsJetStreamBus, NatsJetStreamPublisher,
+    JetStreamConsumerConfig, JetStreamProvisioner, JetStreamPublisherConfig, NatsJetStreamBus,
+    NatsJetStreamPublisher,
 };
 use myelin_events::relay::{EventConsumer, EventPublisher};
 use myelin_events::{
@@ -62,9 +63,13 @@ async fn publisher_provisions_bounded_stream_without_consumer_or_purge_capabilit
         max_messages: 10_000,
         replicas: 1,
         duplicate_window: std::time::Duration::from_secs(120),
+        publish_ack_timeout: std::time::Duration::from_secs(2),
     };
-    let publisher = NatsJetStreamPublisher::connect(config, tokio::runtime::Handle::current())
+    JetStreamProvisioner::ensure(config.clone(), tokio::runtime::Handle::current())
         .expect("provision publisher-only stream");
+    let publisher = NatsJetStreamPublisher::connect_existing(
+        config, tokio::runtime::Handle::current(),
+    ).expect("connect runtime publisher to existing stream");
     let event = envelope(&format!("01JNP{suffix:021}"));
     publisher
         .publish(&event.subject, &event, &event.event_id)
@@ -90,6 +95,74 @@ async fn publisher_provisions_bounded_stream_without_consumer_or_purge_capabilit
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_publisher_never_provisions_a_missing_stream() {
+    let dev = MyelinConfig::dev();
+    let suffix = format!("{}_runtime_only", std::process::id());
+    let stream_name = format!("MYELIN_PUBLISHER_{suffix}");
+    let config = JetStreamPublisherConfig {
+        nats_url: dev.nats_url.clone(),
+        stream_name: stream_name.clone(),
+        subject_root: format!("myelin.publisher_{suffix}"),
+        max_age: std::time::Duration::from_secs(3600),
+        max_bytes: 4 * 1024 * 1024,
+        max_messages: 1000,
+        replicas: 1,
+        duplicate_window: std::time::Duration::from_secs(60),
+        publish_ack_timeout: std::time::Duration::from_millis(250),
+    };
+    let publisher = NatsJetStreamPublisher::connect_existing(
+        config, tokio::runtime::Handle::current(),
+    ).expect("runtime connection requires no admin request");
+    let event = envelope(&format!("runtime-only-{suffix}"));
+    publisher.publish(&event.subject, &event, &event.event_id)
+        .expect_err("a missing stream cannot acknowledge publication");
+
+    let client = async_nats::connect(&dev.nats_url).await.expect("inspect NATS");
+    let js = async_nats::jetstream::new(client);
+    assert!(js.get_stream(&stream_name).await.is_err(),
+        "runtime publish authority must not create the absent stream");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provisioner_refuses_existing_stream_policy_drift() {
+    let dev = MyelinConfig::dev();
+    let suffix = format!("{}_stream_drift", std::process::id());
+    let stream_name = format!("MYELIN_PUBLISHER_{suffix}");
+    let subject_root = format!("myelin.publisher_{suffix}");
+    let client = async_nats::connect(&dev.nats_url).await.expect("connect NATS admin");
+    let js = async_nats::jetstream::new(client);
+    js.create_stream(async_nats::jetstream::stream::Config {
+        name: stream_name.clone(),
+        subjects: vec![format!("{subject_root}.>")],
+        max_age: std::time::Duration::from_secs(3600),
+        max_bytes: 1024,
+        max_messages: 1000,
+        num_replicas: 1,
+        duplicate_window: std::time::Duration::from_secs(60),
+        storage: async_nats::jetstream::stream::StorageType::File,
+        retention: async_nats::jetstream::stream::RetentionPolicy::Limits,
+        discard: async_nats::jetstream::stream::DiscardPolicy::Old,
+        ..Default::default()
+    }).await.expect("create drifted stream");
+    let error = JetStreamProvisioner::ensure(
+        JetStreamPublisherConfig {
+            nats_url: dev.nats_url.clone(),
+            stream_name: stream_name.clone(),
+            subject_root,
+            max_age: std::time::Duration::from_secs(3600),
+            max_bytes: 4 * 1024 * 1024,
+            max_messages: 1000,
+            replicas: 1,
+            duplicate_window: std::time::Duration::from_secs(60),
+            publish_ack_timeout: std::time::Duration::from_secs(2),
+        },
+        tokio::runtime::Handle::current(),
+    ).expect_err("drifted stream must be refused");
+    assert_eq!(error.0, "existing JetStream stream configuration is incompatible");
+    js.delete_stream(&stream_name).await.expect("delete drift test stream");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_pull_rebind_redelivers_unacked_git_event_then_persists_ack() {
     let dev = MyelinConfig::dev();
     let nonce = std::time::SystemTime::now()
@@ -110,6 +183,7 @@ async fn durable_pull_rebind_redelivers_unacked_git_event_then_persists_ack() {
             max_messages: 10_000,
             replicas: 1,
             duplicate_window: std::time::Duration::from_secs(120),
+            publish_ack_timeout: std::time::Duration::from_secs(2),
         },
         tokio::runtime::Handle::current(),
     )
@@ -192,6 +266,7 @@ async fn existing_durable_consumer_with_semantic_drift_refuses_boot() {
             max_messages: 10_000,
             replicas: 1,
             duplicate_window: std::time::Duration::from_secs(120),
+            publish_ack_timeout: std::time::Duration::from_secs(2),
         },
         tokio::runtime::Handle::current(),
     ).expect("provision publisher-only stream");
@@ -257,6 +332,7 @@ async fn nak_increments_attempt_then_term_makes_durable_rebind_empty() {
             max_messages: 1000,
             replicas: 1,
             duplicate_window: std::time::Duration::from_secs(60),
+            publish_ack_timeout: std::time::Duration::from_secs(2),
         },
         tokio::runtime::Handle::current(),
     ).expect("create nonce-scoped settle stream");
@@ -321,6 +397,7 @@ async fn jetstream_file_storage_survives_server_restart() {
                 max_messages: 10_000,
                 replicas: 1,
                 duplicate_window: std::time::Duration::from_secs(120),
+                publish_ack_timeout: std::time::Duration::from_secs(2),
             },
             tokio::runtime::Handle::current(),
         )
