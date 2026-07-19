@@ -232,6 +232,9 @@ pub enum BlobError {
         /// The address the stored bytes actually hash to (the mismatch evidence).
         actual: ContentHash,
     },
+    /// A backing service could not perform the requested operation. The class is payload-free:
+    /// SDK details, credentials, endpoints, buckets, and keys never cross this seam.
+    Backend(BlobDependencyError),
     /// A content-address string was not `<algo>:<hex>`.
     MalformedAddress(String),
     /// A content-address string carried an algorithm tag this store does not know.
@@ -243,6 +246,26 @@ pub enum BlobError {
     /// bypassed by an un-verifiable tag).
     AlgoNotVerifiable(HashAlgo),
 }
+
+/// Redacted operational classification for a durable blob backing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobDependencyError {
+    PermanentConfig,
+    PermanentAuth,
+    Transient,
+}
+
+impl std::fmt::Display for BlobDependencyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::PermanentConfig => "object-store dependency has invalid configuration",
+            Self::PermanentAuth => "object-store dependency refused authorization",
+            Self::Transient => "object-store dependency is temporarily unavailable",
+        })
+    }
+}
+
+impl std::error::Error for BlobDependencyError {}
 
 impl std::fmt::Display for BlobError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -259,6 +282,7 @@ impl std::fmt::Display for BlobError {
                 requested.to_multihash_string(),
                 actual.to_multihash_string()
             ),
+            BlobError::Backend(kind) => kind.fmt(f),
             BlobError::MalformedAddress(s) => write!(f, "malformed content address: {s}"),
             BlobError::UnknownAlgo(t) => write!(f, "unknown hash algorithm tag: {t}"),
             BlobError::AlgoNotVerifiable(a) => {
