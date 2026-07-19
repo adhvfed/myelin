@@ -7,8 +7,8 @@ use myelin_events::nats::{
 };
 use myelin_events::relay::{EventConsumer, EventPublisher};
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, DataRole, EventEnvelope, EventId,
-    EventType, Timestamp, Visibility,
+    Actor, AggregateKey, ArtifactRef, BrokerDelivery, BrokerDeliveryBody, CausedBy, CorrelationId,
+    DataRole, EventEnvelope, EventId, EventType, Timestamp, Visibility,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{Region, TenantId};
@@ -38,6 +38,13 @@ fn envelope(id: &str) -> EventEnvelope {
         occurred_at: Timestamp("2026-07-18T00:00:00Z".into()),
         recorded_at: Timestamp("2026-07-18T00:00:00Z".into()),
         payload: serde_json::json!({ "issue": "ONE" }),
+    }
+}
+
+fn delivered_event(delivery: &BrokerDelivery) -> &EventEnvelope {
+    match &delivery.body {
+        BrokerDeliveryBody::Event(event) => event,
+        other => panic!("expected event delivery, got {other:?}"),
     }
 }
 
@@ -131,7 +138,7 @@ async fn durable_pull_rebind_redelivers_unacked_git_event_then_persists_ack() {
     .expect("bind durable pull consumer");
     let initial = first.consume("").expect("initial durable pull");
     assert_eq!(initial.len(), 1);
-    assert_eq!(initial[0].envelope.event_id, event.event_id);
+    assert_eq!(delivered_event(&initial[0]).event_id, event.event_id);
     drop(first);
     tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
 
@@ -142,10 +149,10 @@ async fn durable_pull_rebind_redelivers_unacked_git_event_then_persists_ack() {
     .expect("rebind exact durable name after restart");
     let redelivered = rebound.consume("").expect("redelivery after restart");
     assert_eq!(redelivered.len(), 1, "unacked event survives consumer restart");
-    assert_eq!(redelivered[0].envelope.event_id, event.event_id);
-    assert!(redelivered[0].delivery_attempt >= 2);
+    assert_eq!(delivered_event(&redelivered[0]).event_id, event.event_id);
+    assert!(redelivered[0].delivery_attempt >= Some(2));
     rebound
-        .ack(&durable_name, &event.event_id)
+        .ack(redelivered[0].token)
         .expect("persist explicit ack");
     drop(rebound);
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -229,6 +236,65 @@ async fn existing_durable_consumer_with_semantic_drift_refuses_boot() {
     js.delete_stream(&stream_name).await.expect("delete drift test stream");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nak_increments_attempt_then_term_makes_durable_rebind_empty() {
+    let dev = MyelinConfig::dev();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let suffix = format!("{}_settle_{nonce}", std::process::id());
+    let stream_name = format!("MYELIN_SETTLE_{suffix}");
+    let subject_root = format!("myelin.settle_{suffix}");
+    let durable_name = format!("settle-{suffix}");
+    let publisher = NatsJetStreamPublisher::connect(
+        JetStreamPublisherConfig {
+            nats_url: dev.nats_url.clone(),
+            stream_name: stream_name.clone(),
+            subject_root: subject_root.clone(),
+            max_age: std::time::Duration::from_secs(3600),
+            max_bytes: 4 * 1024 * 1024,
+            max_messages: 1000,
+            replicas: 1,
+            duplicate_window: std::time::Duration::from_secs(60),
+        },
+        tokio::runtime::Handle::current(),
+    ).expect("create nonce-scoped settle stream");
+    let event = envelope(&format!("settle-event-{nonce}"));
+    publisher.publish(&event.subject, &event, &event.event_id).unwrap();
+    let config = JetStreamConsumerConfig::bounded(
+        &dev.nats_url, &stream_name, &subject_root, format!("{subject_root}.>"), &durable_name,
+    );
+    let consumer = NatsJetStreamBus::connect_consumer(
+        config.clone(), tokio::runtime::Handle::current(),
+    ).unwrap();
+    let first = consumer.consume("").unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].delivery_attempt, Some(1));
+    consumer.retry(first[0].token, 1).unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let second = loop {
+        let batch = consumer.consume("").unwrap();
+        if !batch.is_empty() {
+            break batch;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "NAK redelivery deadline exceeded");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    assert_eq!(second.len(), 1);
+    assert!(second[0].delivery_attempt >= Some(2));
+    consumer.terminate(second[0].token).unwrap();
+    drop(consumer);
+
+    let rebound = NatsJetStreamBus::connect_consumer(
+        config, tokio::runtime::Handle::current(),
+    ).unwrap();
+    assert!(rebound.consume("").unwrap().is_empty(), "TERM survives durable rebind");
+    drop(rebound);
+    let client = async_nats::connect(&dev.nats_url).await.unwrap();
+    async_nats::jetstream::new(client).delete_stream(&stream_name).await.unwrap();
+}
+
 /// Two-phase operator proof for the server/volume boundary. Run once with phase `seed`, restart the
 /// NATS service, then run with phase `verify`. It is ignored in ordinary suites because a test
 /// process must not restart shared infrastructure behind other concurrent tests.
@@ -282,9 +348,9 @@ async fn jetstream_file_storage_survives_server_restart() {
     .expect("stream survived server restart");
     let delivery = consumer.consume("").expect("pull persisted event");
     assert_eq!(delivery.len(), 1);
-    assert_eq!(delivery[0].envelope.event_id.0, "server-restart-event");
+    assert_eq!(delivered_event(&delivery[0]).event_id.0, "server-restart-event");
     consumer
-        .ack(durable_name, &delivery[0].envelope.event_id)
+        .ack(delivery[0].token)
         .expect("ack persisted event");
 
     let client = async_nats::connect(&dev.nats_url).await.expect("connect cleanup");
