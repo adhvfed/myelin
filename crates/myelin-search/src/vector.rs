@@ -250,6 +250,25 @@ impl HnswVectorIndex {
         self.nodes.len()
     }
 
+    /// **Every `doc_id` carrying a LIVE (non-tombstoned) vector**, `doc_id`-sorted.
+    ///
+    /// The rebuild's verification gate ([`crate::rebuild`]) sweeps this id space for surviving
+    /// legacy identities. A vector is its own id space: a doc removed under the canonical identity
+    /// while its embedding survives under the legacy one is invisible to a doc-count parity check
+    /// and would keep answering semantic queries. Tombstoned nodes are excluded — they never
+    /// surface in a search, and `compact` will drop their bytes.
+    pub fn live_doc_ids(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|n| !n.tombstoned)
+            .map(|n| n.record.doc_id.clone())
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Whether a **live** vector exists for `doc_id` (a tombstoned doc is absent).
     pub fn contains(&self, doc_id: &str) -> bool {
         self.doc_index

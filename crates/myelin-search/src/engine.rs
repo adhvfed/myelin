@@ -650,6 +650,51 @@ impl TantivyBackend {
         Ok(self.index.searchable_segment_ids()?.len())
     }
 
+    /// **Every `doc_id` physically present in the INVERTED index (a full scan, not the side map).**
+    ///
+    /// The rebuild's verification gate ([`crate::rebuild`]) reads this to prove that no document
+    /// under a legacy identity survived. It deliberately scans the Tantivy index itself rather than
+    /// [`Self::meta_doc_ids`], so the two id spaces are checked INDEPENDENTLY — a bug that drops a
+    /// doc from the side map while leaving it searchable (or the reverse) is exactly the corruption
+    /// the gate exists to catch, and reading one map twice would hide it.
+    ///
+    /// This is a maintenance scan over the whole per-tenant index, NOT a query: there is no scoring
+    /// and no ACL filter, and it returns bare ids to a caller that only ever counts and classifies
+    /// them (`crate::canonical`). It must never back a user-facing search path — the
+    /// `search-requires-acl-filter` ratchet governs those, and this is not one.
+    ///
+    /// Deterministic order (`doc_id`-sorted) so a parity receipt over the set is stable.
+    pub fn indexed_doc_ids(&self) -> Result<Vec<String>, IndexError> {
+        use tantivy::collector::DocSetCollector;
+        use tantivy::query::AllQuery;
+
+        let reader = self.index.reader()?;
+        let searcher = reader.searcher();
+        let addrs = searcher.search(&AllQuery, &DocSetCollector)?;
+        let mut out = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            out.push(self.doc_id_of(&searcher, addr)?);
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Every `doc_id` carrying a per-doc metadata side-record (the staleness-anchor map).
+    ///
+    /// The second of the three id spaces the verification gate sweeps. Sorted.
+    pub fn meta_doc_ids(&self) -> Vec<String> {
+        self.doc_meta.keys().cloned().collect()
+    }
+
+    /// Every `doc_id` carrying a LIVE (non-tombstoned) embedding in the co-located vector shape.
+    ///
+    /// The third id space. A vector whose doc was removed under one identity but which survives
+    /// under another is a legacy vector — invisible to a doc-count parity check, visible here.
+    pub fn vector_doc_ids(&self) -> Vec<String> {
+        self.vectors.live_doc_ids()
+    }
+
     /// Read the stored `doc_id` of a Tantivy doc address.
     fn doc_id_of(
         &self,

@@ -462,6 +462,69 @@ impl IndexRegistry {
             None => 0,
         }
     }
+
+    /// The three id spaces of the `(tenant, region)` index (the rebuild verification gate's input).
+    /// An absent partition yields an empty inventory — the correct answer for a wiped index.
+    fn inventory(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+    ) -> Result<IndexInventory, crate::engine::IndexError> {
+        let pk = PartKey {
+            tenant: tenant.clone(),
+            region: region.clone(),
+        };
+        let guard = self.indices.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.get(&pk) {
+            Some(be) => Ok(IndexInventory {
+                doc_ids: be.indexed_doc_ids()?,
+                vector_doc_ids: be.vector_doc_ids(),
+                meta_doc_ids: be.meta_doc_ids(),
+            }),
+            None => Ok(IndexInventory::default()),
+        }
+    }
+}
+
+/// **The three independently-maintained id spaces of one `(tenant, region)` index.**
+///
+/// The rebuild's verification gate ([`crate::rebuild`]) sweeps all three, because a stale legacy
+/// identity can survive in any one of them alone:
+/// - a **document** that answers keyword queries;
+/// - a **vector** that answers semantic queries after its document is gone;
+/// - a **metadata** side-record that keeps a permission re-stamp addressing a doc that no longer
+///   exists.
+///
+/// Checking only the document space — the intuitive check — would miss the other two.
+///
+/// PII posture: this type is constructed inside Search and consumed by the gate, which reduces it to
+/// COUNTS. It deliberately does not implement `Debug`: a git blob id embeds the raw repository name
+/// and file path, so a stray `{:?}` on an inventory would dump exactly what the migration's
+/// disclosure rule forbids.
+#[derive(Clone, Default)]
+pub struct IndexInventory {
+    /// Every `doc_id` physically present in the inverted index (a full scan).
+    pub doc_ids: Vec<String>,
+    /// Every `doc_id` carrying a live (non-tombstoned) embedding.
+    pub vector_doc_ids: Vec<String>,
+    /// Every `doc_id` carrying a per-doc metadata side-record.
+    pub meta_doc_ids: Vec<String>,
+}
+
+impl IndexInventory {
+    /// Every id across all three spaces (deduped), for a sweep that must not miss a space.
+    pub fn all_ids(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self
+            .doc_ids
+            .iter()
+            .chain(self.vector_doc_ids.iter())
+            .chain(self.meta_doc_ids.iter())
+            .map(String::as_str)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
 }
 
 /// Why the indexer could not project an event into the index. A `Malformed` event (a missing
@@ -656,6 +719,18 @@ impl IncrementalIndexer {
     /// Tenant-first.
     pub fn live_vector_count(&self, tenant: &TenantId, region: &Region) -> usize {
         self.registry.live_vector_count(tenant, region)
+    }
+
+    /// **The three id spaces of the `(tenant, region)` index** ([`IndexInventory`]) — the input to
+    /// the rebuild's zero-legacy-identity verification ([`crate::rebuild`]). Tenant-first: an
+    /// inventory is always scoped to one `(tenant, region)` partition, so a verification for one
+    /// tenant can never read — or pass on the strength of — another's index.
+    pub fn inventory(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+    ) -> Result<IndexInventory, crate::engine::IndexError> {
+        self.registry.inventory(tenant, region)
     }
 
     /// **Wipe the `(tenant, region)` index (the cold-rebuild precondition — §4.9 / SRCH-D5).** Destroys
