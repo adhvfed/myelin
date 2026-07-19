@@ -8,8 +8,8 @@
 //! ## Endpoints (the git smart-HTTP grammar)
 //! - `GET  /<tenant>/<region>/<repo>.git/info/refs?service=git-upload-pack`
 //!   → [`GitCore::advertise_refs`]`(UploadPack)`, wrapped in the smart-HTTP service framing
-//!     (`001e# service=git-upload-pack\n` + `0000` + the advertisement),
-//!     `Content-Type: application/x-git-upload-pack-advertisement`.
+//!   (`001e# service=git-upload-pack\n` + `0000` + the advertisement),
+//!   `Content-Type: application/x-git-upload-pack-advertisement`.
 //! - `POST /<tenant>/<region>/<repo>.git/git-upload-pack`
 //!   → [`GitCore::serve`]`(UploadPack, body)`, `Content-Type: application/x-git-upload-pack-result`.
 //! - `POST /<tenant>/<region>/<repo>.git/git-receive-pack` (push) → **LIVE** (CT-006d): the durable
@@ -29,6 +29,7 @@
 //!   - **cross-tenant** (token tenant ≠ URL tenant) → the gateway's audited IDOR **reject** (403),
 //!     fired BEFORE any repo lookup — so repo existence is NEVER leaked across tenants;
 //!   - the per-action **authorize** seam gates the read (`git.wire.upload_pack`) — a denial is a 403.
+//!
 //! The operating `(tenant, region)` for the actual lookup is taken from the VERIFIED token
 //! (`ctx.scope`), NEVER from the URL (the GIT-D8 cardinal rule); the URL `{tenant}` is used only to
 //! detect/reject the IDOR. The repo path is then resolver-validated + symlink-confined inside the
