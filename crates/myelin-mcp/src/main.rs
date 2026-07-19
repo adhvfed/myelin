@@ -11,7 +11,8 @@ use std::sync::Arc;
 use myelin_config::Mode;
 use myelin_edge::repo_authz::RepoPermission;
 use myelin_edge::{
-    CheckBackedRepoAuthorizer, DurableGitBackend, GitEffectApi, RepoAuthorizer, TupleRepoBootstrap,
+    recover_placed_git_at_boot, CheckBackedRepoAuthorizer, DurableGitBackend, GitEffectApi,
+    RepoAuthorizer, TupleRepoBootstrap,
 };
 use myelin_events::{IdMinter, OutboxStore, Timestamp, UlidMinter};
 use myelin_git::core::RepoLoc;
@@ -55,6 +56,7 @@ struct Core {
     provider: SubstrateProvider,
     kms: Arc<KmsEngine>,
     cell: Arc<CellTokenAuthority>,
+    cell_id: String,
     handle: tokio::runtime::Handle,
 }
 
@@ -214,6 +216,21 @@ async fn compose_core() -> Result<Core, String> {
         .migrate(&all_durable_migrations(), &HotTables::none())
         .await
         .map_err(|error| format!("durable migration aggregate failed: {error}"))?;
+    bootstrap
+        .migrate(
+            &myelin_git::pg_pr_store::git_pr_migrations(),
+            &myelin_git::pg_pr_store::git_pr_hot_tables(),
+        )
+        .await
+        .map_err(|error| format!("Git PR lifecycle migration failed: {error}"))?;
+    bootstrap
+        .verify_index_ready("git_pr_head_repo_idx")
+        .await
+        .map_err(|error| format!("Git PR provenance index is not ready: {error}"))?;
+    bootstrap
+        .verify_index_ready("git_pr_command_operation_scope_uidx")
+        .await
+        .map_err(|error| format!("Git PR operation-scope index is not ready: {error}"))?;
     let provider = bootstrap
         .into_runtime()
         .await
@@ -226,7 +243,7 @@ async fn compose_core() -> Result<Core, String> {
             .await
             .map_err(|error| format!("durable KMS refused: {error}"))?,
     );
-    let material = DurableCellRootBacking::new(provider.db_pool().clone(), cell_id)
+    let material = DurableCellRootBacking::new(provider.db_pool().clone(), cell_id.clone())
         .load_or_generate(&seal)
         .await
         .map_err(|error| format!("durable cell token root refused: {error}"))?;
@@ -238,6 +255,7 @@ async fn compose_core() -> Result<Core, String> {
         provider,
         kms,
         cell,
+        cell_id,
         handle: tokio::runtime::Handle::current(),
     })
 }
@@ -450,9 +468,27 @@ async fn serve(core: Core) -> Result<(), String> {
     )));
     let minter: Arc<dyn myelin_events::IdMinter> = Arc::new(UlidMinter::new());
     let backend = Arc::new(
-        DurableGitBackend::rooted(git_root, outbox.clone(), minter.clone())
-            .with_repo_authorizer(repo_authz.clone())
-            .with_repo_bootstrap(Arc::new(TupleRepoBootstrap::new(check.tuples().clone()))),
+        DurableGitBackend::rooted(
+            git_root,
+            core.provider.clone(),
+            core.kms.clone(),
+            core.handle.clone(),
+            outbox.clone(),
+            minter.clone(),
+        )
+        .map_err(|error| format!("PostgreSQL Git PR store refused: {error}"))?
+        .with_repo_authorizer(repo_authz.clone())
+        .with_repo_bootstrap(Arc::new(TupleRepoBootstrap::new(check.tuples().clone()))),
+    );
+    let recovery = recover_placed_git_at_boot(&backend, &core.provider, &core.cell_id)
+        .await
+        .map_err(|error| format!("durable Git boot recovery failed: {error}"))?;
+    eprintln!(
+        "myelin-mcp: Git recovery complete (tenants={}, repos={}, refs={}, merges={})",
+        recovery.tenants_recovered,
+        recovery.repos_reconciled,
+        recovery.refs_reapplied,
+        recovery.merges_recovered
     );
     let boundary = Arc::new(RunTokenAuthorizer::new(
         Arc::new(PasetoCapabilityVerifier::new(core.cell.trust_anchor())),

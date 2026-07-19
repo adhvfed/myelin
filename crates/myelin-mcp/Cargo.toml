@@ -94,6 +94,7 @@ myelin-identity-service = { path = "../myelin-identity-service", features = ["te
 # `agent_hitl_gate` table, migration 0054), injected by the composition root.
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 sqlx = { workspace = true }
+blake3 = { workspace = true }
 
 [features]
 default = []

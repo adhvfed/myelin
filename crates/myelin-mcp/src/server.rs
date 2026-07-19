@@ -219,7 +219,29 @@ impl McpServer {
             .and_then(Value::as_str);
 
         let now = (self.clock)();
-        let outcome = router.call(&tool, &args, &now, presented_gate_id);
+        let idempotency_key = params
+            .get("_meta")
+            .and_then(|meta| meta.get("com.myelin/idempotencyKey"))
+            .and_then(Value::as_str)
+            .filter(|key| {
+                !key.is_empty()
+                    && key.len() <= 256
+                    && key.bytes().all(|byte| byte.is_ascii_graphic())
+            })
+            .ok_or_else(|| {
+                RpcError::new(
+                    INVALID_PARAMS,
+                    "mutating tools/call requires a printable caller-stable `_meta[\"com.myelin/idempotencyKey\"]` of at most 256 bytes",
+                )
+            })?;
+
+        let outcome = router.call(
+            &tool,
+            &args,
+            idempotency_key,
+            &now,
+            presented_gate_id,
+        );
         Ok(call_result_json(name, &outcome))
     }
 

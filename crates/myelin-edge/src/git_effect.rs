@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use myelin_agent::{EffectApi, EffectAuthority, EffectResult, EventId, ProposedEffect, RunCtx};
 use myelin_git::core::RepoLoc;
+use myelin_git::pg_pr_store::PrOperationId;
 use myelin_git::pr_store::MergeAttempt;
 use myelin_identity::Principal;
 use myelin_identity_service::mint::RunTokenAuthorizer;
@@ -114,7 +115,13 @@ impl GitEffectApi {
     }
 
     /// Apply one parsed git tool. Split out so it is unit-testable without the RunCtx wrapper.
-    fn apply_tool(&self, run: &RunCtx, tool: &str, args: &Value) -> EffectResult {
+    fn apply_tool(
+        &self,
+        run: &RunCtx,
+        tool: &str,
+        args: &Value,
+        operation_id: &PrOperationId,
+    ) -> EffectResult {
         let (t, r) = (self.tenant.as_str(), self.region.as_str());
         match tool {
             "git.open_pr" => {
@@ -125,7 +132,14 @@ impl GitEffectApi {
                 if let Err(denied) = self.authorize_repo(repo, RepoPermission::Push) {
                     return denied;
                 }
-                match self.backend.open_pr(t, r, repo, args, &self.principal) {
+                match self.backend.open_pr_with_operation(
+                    t,
+                    r,
+                    repo,
+                    args,
+                    &self.principal,
+                    operation_id,
+                ) {
                     Ok(rec) => applied(run, tool, &format!("git.pr.open:#{}", rec.number)),
                     Err(e) => EffectResult::Denied(e.to_string()),
                 }
@@ -146,7 +160,15 @@ impl GitEffectApi {
                 let verdict = str_arg(args, "verdict").unwrap_or("comment");
                 match self
                     .backend
-                    .submit_review(t, r, repo, number, verdict, &self.principal)
+                    .submit_review_with_operation(
+                        t,
+                        r,
+                        repo,
+                        number,
+                        verdict,
+                        &self.principal,
+                        operation_id,
+                    )
                 {
                     Ok(rec) => applied(
                         run,
@@ -164,7 +186,18 @@ impl GitEffectApi {
                 if let Err(denied) = self.authorize_repo(repo, RepoPermission::ApproveUntrustedCi) {
                     return denied;
                 }
-                match self.backend.endorse_fork_ci(t, r, repo, number, args) {
+                match self
+                    .backend
+                    .endorse_fork_ci_with_operation(
+                        t,
+                        r,
+                        repo,
+                        number,
+                        args,
+                        &self.principal,
+                        operation_id,
+                    )
+                {
                     Ok(rec) => applied(
                         run,
                         tool,
@@ -185,7 +218,14 @@ impl GitEffectApi {
                 if let Err(denied) = self.authorize_repo(repo, RepoPermission::ProtectedPush) {
                     return denied;
                 }
-                match self.backend.merge(t, r, repo, number, &self.principal) {
+                match self.backend.merge_with_operation(
+                    t,
+                    r,
+                    repo,
+                    number,
+                    &self.principal,
+                    operation_id,
+                ) {
                     Ok(MergeAttempt::Merged { base_ref, new_oid, .. }) => {
                         applied(run, tool, &format!("git.pr.merge:#{number}:{base_ref}@{new_oid}"))
                     }
@@ -248,7 +288,14 @@ impl EffectApi for GitEffectApi {
     ) -> EffectResult {
         match parse_proposed(&effect.0) {
             Some((tool, args)) => match self.authorize_effect(authority, &tool) {
-                Ok(()) => self.apply_tool(run, &tool, &args),
+                Ok(()) => match mcp_operation_id(
+                    &self.tenant,
+                    &authority.principal_id.0,
+                    &authority.idempotency_key,
+                ) {
+                    Ok(operation_id) => self.apply_tool(run, &tool, &args, &operation_id),
+                    Err(error) => EffectResult::Denied(error.to_string()),
+                },
                 Err(reason) => EffectResult::Denied(reason),
             },
             None => EffectResult::Denied(format!(
@@ -257,6 +304,21 @@ impl EffectApi for GitEffectApi {
             )),
         }
     }
+}
+
+fn mcp_operation_id(
+    tenant: &str,
+    principal_id: &str,
+    idempotency_key: &str,
+) -> Result<PrOperationId, myelin_git::durable::DurableError> {
+    PrOperationId::derive(
+        "myelin.git.mcp-effect-operation.v1",
+        &[
+            tenant.as_bytes(),
+            principal_id.as_bytes(),
+            idempotency_key.as_bytes(),
+        ],
+    )
 }
 
 /// Parse the MCP opaque-string `ProposedEffect` (`tool:<name>|args:<json>`) into `(tool, args)`. A shape
@@ -314,6 +376,34 @@ mod tests {
     }
 
     #[test]
+    fn mcp_operation_identity_is_stable_bound_and_contains_no_raw_material() {
+        let effect = ProposedEffect(
+            r#"tool:git.open_pr|args:{"repo":"alpha","title":"private"}"#.into(),
+        );
+        let first = mcp_operation_id("acme", "agent:claude", "request-secret").unwrap();
+        let retry = mcp_operation_id("acme", "agent:claude", "request-secret").unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(first.digest().len(), 64);
+        assert!(!first.digest().contains("request-secret"));
+        assert!(!first.digest().contains("private"));
+        assert_ne!(
+            first,
+            mcp_operation_id("acme", "agent:claude", "another-request").unwrap()
+        );
+        assert_ne!(
+            first,
+            mcp_operation_id("other", "agent:claude", "request-secret").unwrap()
+        );
+        let changed_effect = ProposedEffect(r#"tool:git.submit_review|args:{"repo":"alpha"}"#.into());
+        assert_eq!(
+            first,
+            mcp_operation_id("acme", "agent:claude", "request-secret").unwrap(),
+            "the command ledger, not a changed digest, detects key reuse across effects"
+        );
+        assert_ne!(effect, changed_effect);
+    }
+
+    #[test]
     fn direct_and_mismatched_tool_invocations_cannot_reach_the_git_mutation() {
         let mut root = std::env::temp_dir();
         let nonce = SystemTime::now()
@@ -334,6 +424,7 @@ mod tests {
             TenantId("acme".into()),
         );
         principal.region = Region("eu-west".into());
+        let read_principal = principal.clone();
         let authorizer = Arc::new(RunTokenAuthorizer::new(
             Arc::new(StructuralTokenVerifier::new()),
             RevocationStore::new(),
@@ -346,7 +437,7 @@ mod tests {
         let direct = api.apply(&RunCtx("direct".into()), effect.clone());
         assert!(matches!(direct, EffectResult::Denied(reason) if reason.contains("direct")));
         assert!(backend
-            .get_pr("acme", "eu-west", "alpha", 1)
+            .get_pr("acme", "eu-west", "alpha", 1, &read_principal)
             .unwrap()
             .is_none());
 
@@ -359,6 +450,7 @@ mod tests {
                 },
                 principal_id: PrincipalId("agent:claude".into()),
                 tool: "git.submit_review".into(),
+                idempotency_key: "mismatch-1".into(),
             },
             effect,
         );
@@ -375,6 +467,7 @@ mod tests {
                 },
                 principal_id: PrincipalId("agent:other".into()),
                 tool: "git.open_pr".into(),
+                idempotency_key: "principal-mismatch-1".into(),
             },
             ProposedEffect(
                 r#"tool:git.open_pr|args:{"repo":"alpha","title":"blocked","head_oid":"deadbeef","base_ref":"refs/heads/main"}"#.into(),
@@ -385,7 +478,7 @@ mod tests {
             EffectResult::Denied(reason) if reason.contains("adapter principal")
         ));
         assert!(backend
-            .get_pr("acme", "eu-west", "alpha", 1)
+            .get_pr("acme", "eu-west", "alpha", 1, &read_principal)
             .unwrap()
             .is_none());
         let _ = std::fs::remove_dir_all(root);
