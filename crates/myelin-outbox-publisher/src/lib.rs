@@ -22,6 +22,7 @@ pub const EVENT_SUBJECT_ROOT: &str = "myelin.events";
 pub const PUBLISHER_DATABASE_URL_ENV: &str = "MYELIN_OUTBOX_PUBLISHER_DATABASE_URL";
 pub const PROVISION_NATS_URL_ENV: &str = "MYELIN_OUTBOX_PROVISION_NATS_URL";
 pub const PUBLISH_NATS_URL_ENV: &str = "MYELIN_OUTBOX_PUBLISH_NATS_URL";
+pub const PASS_TIMEOUT_ENV: &str = "MYELIN_OUTBOX_PUBLISHER_PASS_TIMEOUT_MS";
 
 const CAPABILITY_ROLE: &str = "myelin_outbox_publisher";
 
@@ -53,6 +54,7 @@ pub struct PublisherConfig {
     poll: Duration,
     backoff: Duration,
     statement_timeout: Duration,
+    pass_timeout: Duration,
     max_envelope_bytes: usize,
     stream_max_age: Duration,
     stream_max_bytes: i64,
@@ -73,6 +75,7 @@ impl core::fmt::Debug for PublisherConfig {
             .field("poll", &self.poll)
             .field("backoff", &self.backoff)
             .field("statement_timeout", &self.statement_timeout)
+            .field("pass_timeout", &self.pass_timeout)
             .field("max_envelope_bytes", &self.max_envelope_bytes)
             .field("stream_max_age", &self.stream_max_age)
             .field("stream_max_bytes", &self.stream_max_bytes)
@@ -96,6 +99,7 @@ pub enum PublisherConfigError {
     InvalidNumber,
     OutOfBounds,
     InvalidStreamPolicy,
+    PassBudgetInfeasible,
 }
 
 impl core::fmt::Display for PublisherConfigError {
@@ -114,6 +118,9 @@ impl core::fmt::Display for PublisherConfigError {
             Self::InvalidNumber => "outbox publisher configuration contains an invalid number",
             Self::OutOfBounds => "outbox publisher configuration exceeds a bounded limit",
             Self::InvalidStreamPolicy => "outbox publisher stream policy is invalid",
+            Self::PassBudgetInfeasible => {
+                "outbox publisher pass budget cannot fit its conservative database and acknowledgement budget"
+            }
         };
         f.write_str(message)
     }
@@ -196,6 +203,23 @@ impl PublisherConfig {
             stream_max_age.as_secs(),
         )?;
         let publish_ack_timeout = millis(&get, "MYELIN_OUTBOX_PUBLISH_ACK_TIMEOUT_MS", 1, 60_000)?;
+        let pass_timeout = millis(&get, PASS_TIMEOUT_ENV, 100, 5 * 60 * 1000)?;
+        let batch_count = u32::try_from(batch).map_err(|_| PublisherConfigError::OutOfBounds)?;
+        let ack_budget = publish_ack_timeout
+            .checked_mul(batch_count)
+            .ok_or(PublisherConfigError::PassBudgetInfeasible)?;
+        // Conservative feasibility model: election + claim + commit, plus one quarantine/update
+        // statement per claimed row, and one full publish-ack timeout per row. The outer runtime
+        // timeout remains the absolute bound even when an operation finishes outside this model.
+        let database_budget = statement_timeout
+            .checked_mul(batch_count.saturating_add(3))
+            .ok_or(PublisherConfigError::PassBudgetInfeasible)?;
+        let required_pass_budget = database_budget
+            .checked_add(ack_budget)
+            .ok_or(PublisherConfigError::PassBudgetInfeasible)?;
+        if required_pass_budget > pass_timeout {
+            return Err(PublisherConfigError::PassBudgetInfeasible);
+        }
 
         let config = Self {
             database: PublisherDatabaseConfig {
@@ -211,6 +235,7 @@ impl PublisherConfig {
             poll,
             backoff,
             statement_timeout,
+            pass_timeout,
             max_envelope_bytes,
             stream_max_age,
             stream_max_bytes,
@@ -262,6 +287,9 @@ impl PublisherConfig {
     }
     pub fn max_envelope_bytes(&self) -> usize {
         self.max_envelope_bytes
+    }
+    pub fn pass_timeout(&self) -> Duration {
+        self.pass_timeout
     }
 }
 
@@ -643,15 +671,22 @@ pub struct PublisherRuntime<D> {
     drain: D,
     poll: Duration,
     backoff: Duration,
+    pass_timeout: Duration,
     snapshot: Arc<Mutex<PublisherSnapshot>>,
 }
 
 impl<D: DrainPass> PublisherRuntime<D> {
-    pub fn new(drain: D, poll: Duration, backoff: Duration) -> Self {
+    pub fn new(
+        drain: D,
+        poll: Duration,
+        backoff: Duration,
+        pass_timeout: Duration,
+    ) -> Self {
         Self {
             drain,
             poll,
             backoff,
+            pass_timeout,
             snapshot: Arc::new(Mutex::new(PublisherSnapshot::default())),
         }
     }
@@ -671,10 +706,10 @@ impl<D: DrainPass> PublisherRuntime<D> {
                 .unwrap_or_else(|error| error.into_inner());
             state.state = PublisherRuntimeState::Publishing;
         }
-        let result = match self.drain.drain_once().await {
-            Ok(ElectedDrainOutcome::Standby) => PassResult::Standby,
-            Ok(ElectedDrainOutcome::Published(count)) => PassResult::Published(count),
-            Err(_) => PassResult::Unavailable,
+        let result = match tokio::time::timeout(self.pass_timeout, self.drain.drain_once()).await {
+            Ok(Ok(ElectedDrainOutcome::Standby)) => PassResult::Standby,
+            Ok(Ok(ElectedDrainOutcome::Published(count))) => PassResult::Published(count),
+            Ok(Err(_)) | Err(_) => PassResult::Unavailable,
         };
         let mut state = self
             .snapshot
@@ -707,7 +742,7 @@ impl<D: DrainPass> PublisherRuntime<D> {
             if stop.load(Ordering::SeqCst) {
                 break;
             }
-            tokio::time::sleep(match result {
+            sleep_until_stop(stop, match result {
                 PassResult::Unavailable => self.backoff,
                 PassResult::Standby | PassResult::Published(_) => self.poll,
             })
@@ -719,6 +754,17 @@ impl<D: DrainPass> PublisherRuntime<D> {
             .unwrap_or_else(|error| error.into_inner());
         state.readiness = PublisherReadiness::NotReady;
         state.state = PublisherRuntimeState::Stopped;
+    }
+}
+
+async fn sleep_until_stop(stop: &AtomicBool, duration: Duration) {
+    let deadline = tokio::time::Instant::now() + duration;
+    while !stop.load(Ordering::SeqCst) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(10))).await;
     }
 }
 
@@ -749,12 +795,12 @@ mod tests {
                 "nats://publisher:NATS_RUNTIME@broker:4222".into(),
             ),
             ("MYELIN_REGION", "fr-par".into()),
-            ("MYELIN_OUTBOX_PUBLISHER_BATCH", "64".into()),
+            ("MYELIN_OUTBOX_PUBLISHER_BATCH", "4".into()),
             ("MYELIN_OUTBOX_PUBLISHER_POLL_MS", "100".into()),
             ("MYELIN_OUTBOX_PUBLISHER_BACKOFF_MS", "500".into()),
             (
                 "MYELIN_OUTBOX_PUBLISHER_STATEMENT_TIMEOUT_MS",
-                "5000".into(),
+                "1000".into(),
             ),
             (
                 "MYELIN_OUTBOX_PUBLISHER_MAX_ENVELOPE_BYTES",
@@ -766,6 +812,7 @@ mod tests {
             ("MYELIN_OUTBOX_STREAM_REPLICAS", "1".into()),
             ("MYELIN_OUTBOX_STREAM_DEDUP_SECONDS", "120".into()),
             ("MYELIN_OUTBOX_PUBLISH_ACK_TIMEOUT_MS", "2000".into()),
+            (PASS_TIMEOUT_ENV, "20000".into()),
         ])
     }
 
@@ -780,10 +827,11 @@ mod tests {
 
     #[test]
     fn config_is_bounded_canonical_and_redacted() {
-        let mut values = values();
-        let cfg = config(&values).unwrap();
+        let mut bounded = values();
+        let cfg = config(&bounded).unwrap();
         assert_eq!(cfg.publish_nats_config().stream_name, EVENT_STREAM_NAME);
         assert_eq!(cfg.publish_nats_config().subject_root, EVENT_SUBJECT_ROOT);
+        assert_eq!(cfg.pass_timeout(), Duration::from_secs(20));
         let debug = format!("{cfg:?}");
         for sentinel in [
             "SECRET",
@@ -796,10 +844,18 @@ mod tests {
             assert!(!debug.contains(sentinel));
         }
 
-        values.insert("MYELIN_OUTBOX_PUBLISHER_BATCH", "0".into());
+        bounded.insert("MYELIN_OUTBOX_PUBLISHER_BATCH", "0".into());
         assert!(matches!(
-            config(&values),
+            config(&bounded),
             Err(PublisherConfigError::OutOfBounds)
+        ));
+
+        let mut impossible = values();
+        impossible.insert("MYELIN_OUTBOX_PUBLISHER_BATCH", "5".into());
+        impossible.insert(PASS_TIMEOUT_ENV, "17000".into());
+        assert!(matches!(
+            config(&impossible),
+            Err(PublisherConfigError::PassBudgetInfeasible)
         ));
     }
 
@@ -843,6 +899,17 @@ mod tests {
         }
     }
 
+    struct UnresponsiveDrain {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DrainPass for UnresponsiveDrain {
+        async fn drain_once(&self) -> Result<ElectedDrainOutcome, ElectedRelayError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+
     fn outage() -> ElectedRelayError {
         ElectedRelayError::Relay(PgError::Publish("RAW_BROKER_SENTINEL".into()))
     }
@@ -861,6 +928,7 @@ mod tests {
             },
             Duration::from_millis(1),
             Duration::from_millis(1),
+            Duration::from_secs(1),
         );
         assert_eq!(runtime.run_pass().await, PassResult::Unavailable);
         assert_eq!(runtime.snapshot().readiness, PublisherReadiness::NotReady);
@@ -881,8 +949,56 @@ mod tests {
             },
             Duration::from_secs(60),
             Duration::from_secs(60),
+            Duration::from_secs(1),
         );
         runtime.serve_until(&stop).await;
+        assert_eq!(runtime.drain.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.snapshot().state, PublisherRuntimeState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn repeated_unresponsive_passes_each_stop_at_the_whole_pass_budget() {
+        let runtime = PublisherRuntime::new(
+            UnresponsiveDrain {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            },
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_millis(10),
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_millis(100), runtime.run_pass())
+                    .await
+                    .expect("whole-pass timeout remains bounded"),
+                PassResult::Unavailable
+            );
+        }
+        assert_eq!(runtime.drain.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(runtime.snapshot().readiness, PublisherReadiness::NotReady);
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_a_long_poll_sleep() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let runtime = PublisherRuntime::new(
+            FakeDrain {
+                outcomes: Mutex::new(VecDeque::from([Ok(ElectedDrainOutcome::Standby)])),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                stop: None,
+            },
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+        );
+        let signal = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            signal.store(true, Ordering::SeqCst);
+        });
+        tokio::time::timeout(Duration::from_millis(200), runtime.serve_until(&stop))
+            .await
+            .expect("poll sleep is shutdown-interruptible");
         assert_eq!(runtime.drain.calls.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.snapshot().state, PublisherRuntimeState::Stopped);
     }
@@ -899,6 +1015,7 @@ mod tests {
             PublisherConfigError::InvalidNumber,
             PublisherConfigError::OutOfBounds,
             PublisherConfigError::InvalidStreamPolicy,
+            PublisherConfigError::PassBudgetInfeasible,
         ];
         let db_errors = [
             PublisherDbError::ConnectionFailed,
