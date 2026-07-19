@@ -750,8 +750,14 @@ impl<'a, R: RestrictionPolicy> CodeProjectionEmitter<'a, R> {
             };
             let (type_, payload) = match (removal_reason, change) {
                 // The removal tombstone. It carries the doc identity (`ref`, the key Search's
-                // `apply_removed` reads) + the reason token, and NO body: a removal never restates
-                // the content it is removing (a restricted blob's text must not ride the bus).
+                // `apply_removed` reads) + the reason token, and NO BODY — no text, no symbols, no
+                // literals, no commit message.
+                //
+                // It does NOT hide the path, and cannot: the doc identity IS the encoded
+                // (repo, ref, path) triple, and Search needs it to address the document it is
+                // removing. So a restricted blob's path still rides the bus in the envelope
+                // `subject`, reversibly encoded. What the tombstone withholds is the CONTENT. That
+                // is the honest boundary of this fix — removing a document requires naming it.
                 (Some(reason), _) => (
                     GIT_BLOB_REMOVED,
                     serde_json::json!({
@@ -1331,8 +1337,9 @@ mod tests {
             sd.payload["ref"], sd.payload["artifact_ref"],
             "the tombstone carries the doc identity under both accepted keys"
         );
-        // The removal restates NOTHING of the content it removes: no body, no symbols, no literals,
-        // and not even the path (the path is a restricted subject's identifying datum).
+        // The removal restates none of the CONTENT it removes. (The path is not hidden — it is the
+        // doc identity, carried in the envelope subject, because a removal must name what it
+        // removes. The payload carries no separate copy of it.)
         for leak in ["text", "symbols", "literals", "path", "commit_message"] {
             assert!(
                 sd.payload.get(leak).is_none(),

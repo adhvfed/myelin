@@ -133,6 +133,7 @@ async fn the_durable_rebuild_journal_is_exclusive_under_real_concurrency() {
                 .bind("") // owners_replayed
                 .bind(Some(format!("worker-{holder}"))) // lease_holder
                 .bind(1_000_i64) // lease_expires_at
+                .bind(Option::<String>::None) // high_water_at
                 .execute(&pool)
                 .await
                 .expect("the claim statement executes")
@@ -177,6 +178,7 @@ async fn the_durable_rebuild_journal_is_exclusive_under_real_concurrency() {
                 .bind(Some("worker".to_string()))
                 .bind(2_000_i64)
                 .bind(expected)
+                .bind(Some("2026-07-19T00:00:02Z".to_string())) // high_water_at
                 .execute(&pool)
                 .await
                 .expect("the update statement executes")
@@ -222,6 +224,7 @@ async fn the_durable_rebuild_journal_is_exclusive_under_real_concurrency() {
             .bind("")
             .bind(Some("neighbour".to_string()))
             .bind(1_000_i64)
+            .bind(Option::<String>::None) // high_water_at
             .execute(&admin)
             .await
             .expect("insert the neighbouring job")

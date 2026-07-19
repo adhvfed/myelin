@@ -49,7 +49,8 @@ const OWNER_DELIMITER: char = '\u{1f}';
 
 /// Read the rebuild row for a `(tenant, region)`.
 pub const SELECT_REBUILD_JOB_QUERY: &str = "\
-SELECT phase, fence_epoch, high_water_mark, owners_replayed, lease_holder, lease_expires_at
+SELECT phase, fence_epoch, high_water_mark, high_water_at, owners_replayed, lease_holder,
+       lease_expires_at
   FROM search_rebuild_job
  WHERE tenant = $1 AND region = $2";
 
@@ -58,8 +59,8 @@ SELECT phase, fence_epoch, high_water_mark, owners_replayed, lease_holder, lease
 pub const INSERT_REBUILD_JOB_QUERY: &str = "\
 INSERT INTO search_rebuild_job
        (tenant, region, phase, fence_epoch, high_water_mark, owners_replayed,
-        lease_holder, lease_expires_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        lease_holder, lease_expires_at, high_water_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
     ON CONFLICT (tenant, region) DO NOTHING";
 
 /// Every subsequent write: conditional on the fence epoch the caller claimed under. A holder whose
@@ -72,6 +73,7 @@ UPDATE search_rebuild_job
        owners_replayed = $6,
        lease_holder = $7,
        lease_expires_at = $8,
+       high_water_at = $10,
        updated_at = now()
  WHERE tenant = $1 AND region = $2 AND fence_epoch = $9";
 
@@ -162,6 +164,7 @@ impl RebuildJournal for PgRebuildJournal {
                 high_water_mark: row
                     .get::<Option<i64>, _>("high_water_mark")
                     .map(|v| v.max(0) as u64),
+                high_water_at: row.get::<Option<String>, _>("high_water_at"),
                 owners_replayed: decode_owners(&row.get::<String, _>("owners_replayed")),
                 lease_holder: row.get::<Option<String>, _>("lease_holder"),
                 lease_expires_at: row.get::<i64, _>("lease_expires_at").max(0) as u64,
@@ -191,6 +194,7 @@ impl RebuildJournal for PgRebuildJournal {
                     .bind(owners.as_str())
                     .bind(next.lease_holder.as_deref())
                     .bind(next.lease_expires_at as i64)
+                    .bind(next.high_water_at.as_deref()) // $9
                     .execute(&self.pool)
                     .await,
                 // Every later write: conditional on the epoch this holder claimed under.
@@ -204,6 +208,7 @@ impl RebuildJournal for PgRebuildJournal {
                     .bind(next.lease_holder.as_deref())
                     .bind(next.lease_expires_at as i64)
                     .bind(expected as i64)
+                    .bind(next.high_water_at.as_deref())
                     .execute(&self.pool)
                     .await,
             }

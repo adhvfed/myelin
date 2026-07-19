@@ -109,6 +109,7 @@ CREATE TABLE IF NOT EXISTS search_rebuild_job (
     phase              TEXT   NOT NULL,
     fence_epoch        BIGINT NOT NULL,
     high_water_mark    BIGINT,
+    high_water_at      TEXT,
     owners_replayed    TEXT   NOT NULL DEFAULT '',
     lease_holder       TEXT,
     lease_expires_at   BIGINT NOT NULL DEFAULT 0,
@@ -244,9 +245,24 @@ pub struct RebuildRecord {
     /// refused — this is the fence that stops a resumed-after-pause process from stomping on the
     /// rebuild that replaced it.
     pub fence_epoch: u64,
-    /// The broker/live-intake high-water mark recorded at fence time; the ceiling catch-up runs to.
-    /// `None` before [`RebuildPhase::Fenced`].
+    /// The broker/live-intake high-water mark recorded at fence time, as a COUNT. Reporting only —
+    /// it is deliberately NOT what bounds catch-up. See [`Self::high_water_at`].
     pub high_water_mark: Option<u64>,
+    /// **The catch-up ceiling: the `recorded_at` instant captured at fence time.**
+    ///
+    /// Catch-up originally bounded itself positionally, taking the first `high_water_mark` rows of
+    /// the committed stream. That is only correct if the stream is a stable commit-ordered prefix,
+    /// and the durable outbox does not promise that: `committed_live_rows` orders by
+    /// `(aggregate, seq)` — aggregate-LEXICOGRAPHIC — while the count is over the whole live set. A
+    /// positional take therefore selected the N lexicographically-smallest-aggregate rows, an
+    /// arbitrary mix, and every pre-fence event on a high-sorting aggregate was never applied by
+    /// catch-up while live intake was fenced. A silent, permanent hole.
+    ///
+    /// A timestamp is position-independent, so it survives any ordering and any interleaved emit.
+    /// The comparison is INCLUSIVE (`<=`): ties at the boundary are re-applied, which is harmless
+    /// because every apply is an idempotent upsert, whereas excluding them would lose events — and
+    /// loss is the direction that cannot be recovered.
+    pub high_water_at: Option<String>,
     /// The owner tokens whose corpora have been replayed (so a resumed replay skips finished
     /// owners rather than redoing them).
     pub owners_replayed: BTreeSet<String>,
@@ -375,6 +391,9 @@ pub enum RebuildError {
     LeaseLost,
     /// No rebuild job exists for this key — an operation was attempted without a claim.
     NoJob,
+    /// Catch-up was reached without a recorded high-water instant. LOUD: there is no safe default
+    /// bound — applying the unbounded tail never converges, applying nothing is a silent hole.
+    MissingHighWaterMark,
     /// The journal row carries a phase token this build does not recognise (a forward-rolled schema
     /// read by an older binary). LOUD: coercing it would risk re-wiping a finished index.
     UnknownPhase,
@@ -409,6 +428,11 @@ impl std::fmt::Display for RebuildError {
                 "rebuild: the exclusive lease is held elsewhere (or expired and was stolen)"
             ),
             RebuildError::NoJob => write!(f, "rebuild: no rebuild job is claimed for this scope"),
+            RebuildError::MissingHighWaterMark => write!(
+                f,
+                "rebuild: catch-up reached without a recorded high-water instant — refusing to \
+                 guess a bound"
+            ),
             RebuildError::UnknownPhase => write!(
                 f,
                 "rebuild: the journal row carries an unrecognised phase — refusing to guess"
@@ -419,7 +443,10 @@ impl std::fmt::Display for RebuildError {
                 attempted.token(),
                 durable.token()
             ),
-            RebuildError::Replay(e) => write!(f, "rebuild: replay failed: {e}"),
+            // Scrubbed to a category — the inner message carries the offending artifact ref.
+            RebuildError::Replay(e) => {
+                write!(f, "rebuild: {}", replay_failure_category(e))
+            }
             RebuildError::Engine(e) => write!(f, "rebuild: index engine failed: {e}"),
             RebuildError::VerificationFailed(v) => {
                 write!(f, "rebuild: verification failed: {v}")
@@ -443,6 +470,20 @@ impl std::error::Error for RebuildError {}
 impl From<ReindexError> for RebuildError {
     fn from(e: ReindexError) -> RebuildError {
         RebuildError::Replay(e)
+    }
+}
+
+/// Reduce a replay error to a fixed category token.
+///
+/// The catch-up leg already scrubs indexer errors; the replay leg reached the SAME messages by a
+/// different route — `ReindexError::Index` is built by flattening `IndexEventError`'s payload, which
+/// interpolates the offending artifact ref, and `RebuildError::Replay` rendered it verbatim. Same
+/// leak, other door.
+fn replay_failure_category(e: &ReindexError) -> &'static str {
+    match e {
+        ReindexError::Bus(_) => "replay: the bus re-emit failed",
+        ReindexError::Index(_) => "replay: the live indexer rejected a snapshot",
+        ReindexError::AtCapacity(_) => "replay: the per-tenant in-flight cap refused this pass",
     }
 }
 
@@ -493,6 +534,14 @@ pub enum VerifyFailure {
         /// How many, across documents, vectors and metadata records.
         count: usize,
     },
+    /// The replay and/or catch-up reported driving documents, but the index is empty — the
+    /// signature of a wipe that landed after the replay.
+    EmptyAfterNonEmptyReplay {
+        /// Documents the replay reported indexing.
+        replayed: usize,
+        /// Documents catch-up reported applying.
+        caught_up: usize,
+    },
     /// The indexer still has unprojected events in flight.
     NonZeroLag {
         /// The outstanding count.
@@ -519,6 +568,14 @@ impl std::fmt::Display for VerifyFailure {
             VerifyFailure::LegacyIdentitiesSurvived { count } => write!(
                 f,
                 "{count} identities under the retired legacy grammar survived the rebuild"
+            ),
+            VerifyFailure::EmptyAfterNonEmptyReplay {
+                replayed,
+                caught_up,
+            } => write!(
+                f,
+                "the index is EMPTY after a replay that reported {replayed} document(s) and a \
+                 catch-up that reported {caught_up} — the rebuild's work was destroyed after it ran"
             ),
             VerifyFailure::NonZeroLag { lag } => {
                 write!(f, "index lag is {lag}, expected 0 before reopening reads")
@@ -707,8 +764,8 @@ impl RebuildCoordinator {
     /// is what makes the migration re-runnable.
     pub fn claim(&self, key: &RebuildKey, holder: &str, now: u64) -> Result<u64, RebuildError> {
         let current = self.journal.load(key)?;
-        let (expected_epoch, next_epoch, phase, hwm, owners) = match &current {
-            None => (None, 1, RebuildPhase::Claimed, None, BTreeSet::new()),
+        let (expected_epoch, next_epoch, phase, hwm, hwm_at, owners) = match &current {
+            None => (None, 1, RebuildPhase::Claimed, None, None, BTreeSet::new()),
             Some(rec) => {
                 let mine = rec.lease_held_by(holder, now);
                 if rec.leased(now) && !mine {
@@ -721,6 +778,7 @@ impl RebuildCoordinator {
                         rec.fence_epoch + 1,
                         RebuildPhase::Claimed,
                         None,
+                        None,
                         BTreeSet::new(),
                     )
                 } else {
@@ -729,6 +787,10 @@ impl RebuildCoordinator {
                         rec.fence_epoch + 1,
                         rec.phase,
                         rec.high_water_mark,
+                        // The recorded ceiling SURVIVES a takeover. Re-taking it on resume would
+                        // move the boundary upward after the wipe — reintroducing the very hole the
+                        // fence-time capture exists to close.
+                        rec.high_water_at.clone(),
                         rec.owners_replayed.clone(),
                     )
                 }
@@ -738,6 +800,7 @@ impl RebuildCoordinator {
             phase,
             fence_epoch: next_epoch,
             high_water_mark: hwm,
+            high_water_at: hwm_at,
             owners_replayed: owners,
             lease_holder: Some(holder.to_string()),
             lease_expires_at: now.saturating_add(self.lease_ticks),
@@ -762,6 +825,34 @@ impl RebuildCoordinator {
             return Err(RebuildError::LeaseLost);
         }
         Ok(rec)
+    }
+
+    /// **Re-assert the lease through the JOURNAL immediately before a destructive action.**
+    ///
+    /// [`Self::checked`] only READS the record, so on its own it leaves the classic
+    /// fence-token-at-the-wrong-boundary hole: a holder can pass the read, stall (a GC pause, a disk
+    /// stall), lose its lease to a takeover that then wipes and replays for an hour, wake up, and
+    /// execute its own destructive action — destroying the replacement's work. The `advance` CAS
+    /// afterwards would return `LeaseLost`, but only after the damage.
+    ///
+    /// This performs a compare-and-set FIRST, so a displaced holder is refused BEFORE it acts. The
+    /// write is a no-op in content (the same phase, a renewed lease); its whole purpose is that it
+    /// goes through the epoch predicate, which a displaced holder cannot satisfy.
+    ///
+    /// **Residual, named:** this narrows the window, it does not close it. The index wipe is an
+    /// in-process operation and the journal is an external store, so there remains a window between
+    /// the CAS returning and the wipe executing. Closing it properly requires the index write path
+    /// itself to carry the fence epoch (an index generation stamped on each write, rejected if
+    /// stale) — a larger change than this migration, and recorded as a follow-on rather than
+    /// papered over.
+    fn reassert_lease(
+        &self,
+        key: &RebuildKey,
+        rec: &RebuildRecord,
+        holder: &str,
+        now: u64,
+    ) -> Result<(), RebuildError> {
+        self.advance(key, rec, holder, now, |_| {})
     }
 
     /// Journal `next` under the holder's current fence epoch, renewing the lease.
@@ -806,14 +897,17 @@ impl RebuildCoordinator {
         holder: &str,
         now: u64,
         high_water_mark: u64,
+        high_water_at: &myelin_events::Timestamp,
     ) -> Result<u64, RebuildError> {
         let rec = self.checked(key, holder, now)?;
         if rec.phase >= RebuildPhase::Fenced {
             return Ok(rec.high_water_mark.unwrap_or(high_water_mark));
         }
+        let at = high_water_at.0.clone();
         self.advance(key, &rec, holder, now, |next| {
             next.phase = RebuildPhase::Fenced;
             next.high_water_mark = Some(high_water_mark);
+            next.high_water_at = Some(at);
         })?;
         Ok(high_water_mark)
     }
@@ -837,6 +931,9 @@ impl RebuildCoordinator {
                 durable: rec.phase,
             });
         }
+        // Re-assert the lease through the journal BEFORE destroying anything — a displaced holder
+        // must be refused before the wipe, not after it.
+        self.reassert_lease(key, &rec, holder, now)?;
         self.reindexer.indexer().wipe(&key.tenant, &key.region);
         self.advance(key, &rec, holder, now, |next| {
             next.phase = RebuildPhase::Wiped;
@@ -866,6 +963,7 @@ impl RebuildCoordinator {
                 durable: rec.phase,
             });
         }
+        self.reassert_lease(key, &rec, holder, now)?;
         let reset = self
             .reindexer
             .cursors()
@@ -917,6 +1015,8 @@ impl RebuildCoordinator {
         // still missing, and every later attempt to finish the job would no-op silently. Topping up
         // the missing scopes here is what makes the phase converge to its own meaning.
 
+        self.reassert_lease(key, &rec, holder, now)?;
+        rec = self.checked(key, holder, now)?;
         let mut indexed = 0usize;
         for scope in scopes {
             let scope_key = scope.as_key();
@@ -973,9 +1073,21 @@ impl RebuildCoordinator {
                 durable: rec.phase,
             });
         }
-        let hwm = rec.high_water_mark.unwrap_or(0) as usize;
+        // The ceiling is the fence-time INSTANT, not a row position — see `high_water_at`. A
+        // missing boundary means the fence never recorded one, which must fail LOUD: bounding by
+        // nothing would either apply the unbounded tail (never converging under load) or apply
+        // nothing (a silent hole), and there is no safe default between them.
+        let Some(boundary) = rec.high_water_at.clone() else {
+            return Err(RebuildError::MissingHighWaterMark);
+        };
+        self.reassert_lease(key, &rec, holder, now)?;
         let mut applied = 0usize;
-        for row in rows.iter().take(hwm) {
+        for row in rows.iter() {
+            // At or below the fence instant. INCLUSIVE: a tie is re-applied (idempotent upsert),
+            // where excluding it would lose the event.
+            if row.envelope.recorded_at.0 > boundary {
+                continue;
+            }
             // Tenant-first: a rebuild applies only ITS partition's events. A row for another tenant
             // or region rides the same shared outbox and must not be projected here.
             if row.envelope.tenant != key.tenant || row.envelope.region != key.region {
@@ -1027,7 +1139,19 @@ impl RebuildCoordinator {
             .inventory(&key.tenant, &key.region)
             .map_err(|_| RebuildError::Engine("index inventory read failed"))?;
 
+        // An INDEPENDENT leg that survives a self-consistency expectation: the replay and catch-up
+        // reported driving documents through the indexer, yet the index is empty. That is the
+        // signature of a wipe that ran after the replay (a displaced holder, a re-entered phase) and
+        // it is invisible to a count/digest comparison built from the index itself.
         let found_docs = inventory.doc_ids.len();
+        if found_docs == 0 && (expected.docs_replayed > 0 || expected.docs_caught_up > 0) {
+            return Err(RebuildError::VerificationFailed(
+                VerifyFailure::EmptyAfterNonEmptyReplay {
+                    replayed: expected.docs_replayed,
+                    caught_up: expected.docs_caught_up,
+                },
+            ));
+        }
         if found_docs != expected.doc_ids.len() {
             return Err(RebuildError::VerificationFailed(
                 VerifyFailure::DocCountMismatch {
@@ -1116,17 +1240,29 @@ pub struct ExpectedCorpus {
 }
 
 impl ExpectedCorpus {
-    /// Build the expectation by reading back what the index holds RIGHT NOW, before verification.
+    /// **A SELF-CONSISTENCY snapshot of the index — NOT an independent expectation.**
     ///
-    /// This is the honest form of the expectation for a rebuild driven entirely through the live
-    /// indexer: the coordinator does not hold a second copy of owner truth (it must not — Search
-    /// never reads an owner database), so what it can assert is that the index it just built is
-    /// internally consistent, free of legacy identities, and drained. The count/digest legs then
-    /// pin that snapshot so any LATER divergence is caught.
+    /// Read this warning before using it. The count, digest and vector legs of
+    /// [`RebuildCoordinator::verify_and_open`] compare the index against this value; building it by
+    /// reading the same index makes those three legs `x == x`. Verification then cannot catch:
+    /// a corpus that never replayed, a replay that indexed nothing, a wipe that ran twice, a
+    /// catch-up that applied nothing, or a concurrent holder that emptied the index. Only the
+    /// zero-legacy-identity and zero-lag legs carry information against this expectation.
     ///
-    /// A caller with an independent expectation (a drill that knows the corpus) should construct
-    /// `ExpectedCorpus` directly instead — that is the stronger check, and the adversarial suite
-    /// uses it.
+    /// It exists because the coordinator genuinely has no second copy of owner truth — Search never
+    /// reads an owner database, so it cannot independently enumerate what SHOULD be there. What it
+    /// can do is pin the built index so later divergence is caught, which is what this provides.
+    ///
+    /// **For a real migration, construct [`ExpectedCorpus`] directly from an independent source**
+    /// (an operator's manifest, or the owner's own count) — that is the only form in which claim
+    /// "count/hash parity verified" is a real check rather than a restatement. The adversarial
+    /// drill's `a_git_only_replay_is_caught_as_lossy` demonstrates the difference: with an
+    /// independent expectation a Git-only replay FAILS verification; with this one it passes.
+    ///
+    /// **Named follow-on:** the sound fix is for the replay to REPORT the document set it drove
+    /// (the drafts it replayed, minus those the owner resolved `Gone`), so the coordinator can build
+    /// an expectation that is independent of the index without reading an owner database. That is a
+    /// change to the [`ReindexSource`] seam, not to this module.
     pub fn from_index(
         reindexer: &SearchReindexer,
         key: &RebuildKey,

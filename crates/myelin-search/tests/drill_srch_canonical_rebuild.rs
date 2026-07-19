@@ -76,6 +76,29 @@ fn principal() -> Principal {
     )
 }
 
+/// The fence-time instant that bounds catch-up. Every drill event is recorded at
+/// `2026-07-19T00:00:01Z`, so a boundary strictly after it admits them all; a drill that needs to
+/// exclude an event stamps that event later.
+fn fence_instant() -> Timestamp {
+    Timestamp("2026-07-19T00:00:02Z".into())
+}
+
+/// The emit context the REPLAY runs under.
+///
+/// Its `recorded_at` is strictly AFTER [`fence_instant`], which is what production does: the replay
+/// emits its `*.snapshot` rows after the fence was taken, so they sit ABOVE the catch-up ceiling and
+/// are catch-up's business only through the replay path that already applied them. A fixed context
+/// shared with pre-fence events would put replay snapshots below the ceiling and have catch-up
+/// re-apply them — harmless (upserts are idempotent) but it would stop the boundary drill from
+/// isolating the one event it is about.
+fn replay_ctx() -> EmitContextBase {
+    EmitContextBase {
+        occurred_at: Timestamp("2026-07-19T00:00:05Z".into()),
+        recorded_at: Timestamp("2026-07-19T00:00:05Z".into()),
+        ..ctx_base()
+    }
+}
+
 fn ctx_base() -> EmitContextBase {
     EmitContextBase {
         tenant: tenant(),
@@ -283,7 +306,7 @@ impl Harness {
         let c = self.coordinator.clone();
         c.claim(&key, HOLDER, now)?;
         let hwm = self.outbox.committed_count() as u64;
-        c.fence(&key, HOLDER, now, hwm)?;
+        c.fence(&key, HOLDER, now, hwm, &fence_instant())?;
         c.wipe(&key, HOLDER, now)?;
         c.reset_cursors(&key, HOLDER, now)?;
         let replayed = c.replay_all(
@@ -293,7 +316,7 @@ impl Harness {
             scopes,
             sources,
             &mut self.outbox,
-            ctx_base(),
+            replay_ctx(),
         )?;
         let rows = self.outbox.committed_rows();
         let caught = c.catch_up(&key, HOLDER, now, &rows)?;
@@ -659,7 +682,7 @@ fn a_git_only_replay_is_caught_as_lossy() {
     let key = h.key();
     let c = h.coordinator.clone();
     c.claim(&key, HOLDER, 100).unwrap();
-    c.fence(&key, HOLDER, 100, 0).unwrap();
+    c.fence(&key, HOLDER, 100, 0, &fence_instant()).unwrap();
     c.wipe(&key, HOLDER, 100).unwrap();
     c.reset_cursors(&key, HOLDER, 100).unwrap();
 
@@ -674,7 +697,7 @@ fn a_git_only_replay_is_caught_as_lossy() {
             &[SnapshotScope::new("git", "blob:all")],
             &sources,
             &mut h.outbox,
-            ctx_base(),
+            replay_ctx(),
         )
         .unwrap();
     let rows = h.outbox.committed_rows();
@@ -721,7 +744,7 @@ fn crash_after_wipe_converges_without_rewiping() {
     let key = h.key();
     let c = h.coordinator.clone();
     c.claim(&key, HOLDER, 100).unwrap();
-    c.fence(&key, HOLDER, 100, 0).unwrap();
+    c.fence(&key, HOLDER, 100, 0, &fence_instant()).unwrap();
     assert!(c.wipe(&key, HOLDER, 100).unwrap(), "the wipe ran");
 
     // ── CRASH. A new process claims the same job. The durable phase survives. ──
@@ -747,7 +770,7 @@ fn crash_after_wipe_converges_without_rewiping() {
     let chat = chat_source();
     let sources: Vec<&dyn ReindexSource> = vec![&git, &iss, &kn, &chat];
     let replayed = c
-        .replay_all(&key, resumed, 500, &all_scopes(), &sources, &mut h.outbox, ctx_base())
+        .replay_all(&key, resumed, 500, &all_scopes(), &sources, &mut h.outbox, replay_ctx())
         .unwrap();
     let rows = h.outbox.committed_rows();
     let caught = c.catch_up(&key, resumed, 500, &rows).unwrap();
@@ -777,7 +800,7 @@ fn crash_during_replay_resumes_without_rewiping_or_losing_work() {
     let key = h.key();
     let c = h.coordinator.clone();
     c.claim(&key, HOLDER, 100).unwrap();
-    c.fence(&key, HOLDER, 100, 0).unwrap();
+    c.fence(&key, HOLDER, 100, 0, &fence_instant()).unwrap();
     c.wipe(&key, HOLDER, 100).unwrap();
     c.reset_cursors(&key, HOLDER, 100).unwrap();
 
@@ -793,7 +816,7 @@ fn crash_during_replay_resumes_without_rewiping_or_losing_work() {
     ];
     // `replay_all` marks the phase Replayed at the end, so drive the partial set as its own call and
     // then verify the journal recorded the finished scopes.
-    c.replay_all(&key, HOLDER, 100, &partial, &sources, &mut h.outbox, ctx_base())
+    c.replay_all(&key, HOLDER, 100, &partial, &sources, &mut h.outbox, replay_ctx())
         .unwrap();
 
     let after_partial = h.doc_ids();
@@ -825,7 +848,7 @@ fn crash_during_replay_resumes_without_rewiping_or_losing_work() {
     );
 
     // Resume with the FULL scope set: the two finished scopes are skipped, the rest replay.
-    c.replay_all(&key, resumed, 900, &all_scopes(), &sources, &mut h.outbox, ctx_base())
+    c.replay_all(&key, resumed, 900, &all_scopes(), &sources, &mut h.outbox, replay_ctx())
         .unwrap();
     let rows = h.outbox.committed_rows();
     let caught = c.catch_up(&key, resumed, 900, &rows).unwrap();
@@ -879,7 +902,7 @@ fn a_concurrent_live_event_at_the_high_water_boundary_is_applied_exactly_once() 
     tx.commit().unwrap();
 
     let hwm = h.outbox.committed_count() as u64;
-    c.fence(&key, HOLDER, 100, hwm).unwrap();
+    c.fence(&key, HOLDER, 100, hwm, &fence_instant()).unwrap();
     assert_eq!(hwm, 1, "the mark sits above the one pre-fence event");
 
     c.wipe(&key, HOLDER, 100).unwrap();
@@ -891,7 +914,7 @@ fn a_concurrent_live_event_at_the_high_water_boundary_is_applied_exactly_once() 
     let chat = chat_source();
     let sources: Vec<&dyn ReindexSource> = vec![&git, &iss, &kn, &chat];
     let replayed = c
-        .replay_all(&key, HOLDER, 100, &all_scopes(), &sources, &mut h.outbox, ctx_base())
+        .replay_all(&key, HOLDER, 100, &all_scopes(), &sources, &mut h.outbox, replay_ctx())
         .unwrap();
 
     // Catch up over the WHOLE committed stream: only the prefix at/below the mark is applied.
@@ -948,7 +971,7 @@ fn a_cross_tenant_rebuild_attempt_is_scoped_out() {
     let key = h.key();
     let c = h.coordinator.clone();
     c.claim(&key, HOLDER, 100).unwrap();
-    c.fence(&key, HOLDER, 100, 0).unwrap();
+    c.fence(&key, HOLDER, 100, 0, &fence_instant()).unwrap();
     c.wipe(&key, HOLDER, 100).unwrap();
 
     assert_eq!(
@@ -996,7 +1019,7 @@ fn a_cross_region_rebuild_attempt_is_scoped_out() {
     let key = h.key();
     let c = h.coordinator.clone();
     c.claim(&key, HOLDER, 100).unwrap();
-    c.fence(&key, HOLDER, 100, 0).unwrap();
+    c.fence(&key, HOLDER, 100, 0, &fence_instant()).unwrap();
     c.wipe(&key, HOLDER, 100).unwrap();
 
     assert_eq!(
@@ -1032,11 +1055,11 @@ fn a_second_holder_cannot_run_a_concurrent_rebuild() {
 
     // ...and the ORIGINAL holder can no longer advance: its fence epoch is stale.
     assert!(
-        matches!(c.fence(&key, HOLDER, 100_001, 7), Err(RebuildError::LeaseLost)),
+        matches!(c.fence(&key, HOLDER, 100_001, 7, &fence_instant()), Err(RebuildError::LeaseLost)),
         "the displaced holder cannot journal a phase transition"
     );
     // The rival can.
-    c.fence(&key, "rival", 100_001, 7).expect("the current holder proceeds");
+    c.fence(&key, "rival", 100_001, 7, &fence_instant()).expect("the current holder proceeds");
 }
 
 // ═══════════════════════════ 11. reads fail-empty until verification ══════════════════════════════
@@ -1077,7 +1100,7 @@ fn reads_remain_fail_empty_until_verification_succeeds() {
     ] {
         match step {
             1 => {
-                c.fence(&key, HOLDER, 100, 0).unwrap();
+                c.fence(&key, HOLDER, 100, 0, &fence_instant()).unwrap();
             }
             2 => {
                 c.wipe(&key, HOLDER, 100).unwrap();
@@ -1091,7 +1114,7 @@ fn reads_remain_fail_empty_until_verification_succeeds() {
                 let iss = issues_source();
                 let chat = chat_source();
                 let sources: Vec<&dyn ReindexSource> = vec![&git, &iss, &kn, &chat];
-                c.replay_all(&key, HOLDER, 100, &all_scopes(), &sources, &mut h.outbox, ctx_base())
+                c.replay_all(&key, HOLDER, 100, &all_scopes(), &sources, &mut h.outbox, replay_ctx())
                     .unwrap();
             }
             _ => {
@@ -1278,4 +1301,131 @@ fn the_full_adversarial_corpus_converges_to_the_required_final_state() {
             "the report disclosed `{secret}`: {rendered}"
         );
     }
+}
+
+/// **Catch-up is correct under the DURABLE store's row ordering, not just the in-memory one.**
+///
+/// The regression this pins: catch-up originally bounded itself positionally, taking the first
+/// `high_water_mark` rows of the committed stream. The in-memory outbox returns rows in insertion
+/// order, so a positional take looked exactly like a commit-order prefix and every in-process test
+/// passed. The durable backing does not promise that — `committed_live_rows` orders by
+/// `(aggregate, seq)`, aggregate-LEXICOGRAPHIC, while the count is over the whole live set. A
+/// positional take therefore selected the N lexicographically-smallest-aggregate rows: an arbitrary
+/// mix, silently dropping every pre-fence event on a high-sorting aggregate while live intake was
+/// fenced.
+///
+/// So this drill hands catch-up the SAME rows in the durable store's ordering — sorted by aggregate,
+/// with post-fence rows deliberately interleaved ahead of pre-fence ones — and asserts the pre-fence
+/// events are still applied and the post-fence ones still are not. A positional bound cannot pass
+/// this; the recorded-instant bound does.
+#[test]
+fn catch_up_is_correct_under_the_durable_stores_row_ordering() {
+    let mut h = Harness::new();
+    seed_owner_bodies(&h);
+
+    // Three pre-fence events whose aggregates sort LAST, so a positional prefix would miss them.
+    let pre: Vec<String> = ["zzz-1", "zzz-2", "zzz-3"]
+        .iter()
+        .map(|n| kn_id(n))
+        .collect();
+    for d in &pre {
+        h.fetcher.put(d, "a page that landed before the fence");
+    }
+    // One post-fence event whose aggregate sorts FIRST — a positional prefix would wrongly take it.
+    let post = kn_id("aaa-late");
+    h.fetcher.put(&post, "a page that landed after the fence");
+
+    // ONE minter across the whole drill: a fresh `MonotonicMinter` restarts its sequence, so a
+    // per-emit minter would mint the same first id twice and the outbox would reject the duplicate.
+    let minter: Arc<dyn myelin_events::IdMinter> =
+        Arc::new(myelin_events::MonotonicMinter::new());
+    let emit = |h: &mut Harness, doc: &str, agg: &str, at: &str| {
+        let ctx = EmitContextBase {
+            occurred_at: Timestamp(at.into()),
+            recorded_at: Timestamp(at.into()),
+            ..ctx_base()
+        };
+        let mut tx = h.outbox.begin(Arc::clone(&minter), ctx);
+        tx.emit(
+            myelin_events::EventDraft {
+                type_: EventType("knowledge.page.created".into()),
+                subject: ArtifactRef(doc.to_string()),
+                aggregate: AggregateKey(agg.to_string()),
+                payload: serde_json::json!({}),
+                data_role: DataRole::Processor,
+                visibility: Visibility::Internal,
+                contains_personal_data: false,
+                pii_key_ref: None,
+            },
+            None,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    };
+
+    let key = h.key();
+    let c = h.coordinator.clone();
+    c.claim(&key, HOLDER, 100).unwrap();
+
+    for (i, d) in pre.iter().enumerate() {
+        let d = d.clone();
+        emit(&mut h, &d, &format!("zzz-agg-{i}"), "2026-07-19T00:00:01Z");
+    }
+    let hwm = h.outbox.committed_count() as u64;
+    c.fence(&key, HOLDER, 100, hwm, &fence_instant()).unwrap();
+
+    // The post-fence write lands AFTER the ceiling.
+    emit(&mut h, &post, "aaa-agg", "2026-07-19T00:00:09Z");
+
+    c.wipe(&key, HOLDER, 100).unwrap();
+    c.reset_cursors(&key, HOLDER, 100).unwrap();
+    let git = git_source();
+    let kn = kn_source();
+    let iss = issues_source();
+    let chat = chat_source();
+    let sources: Vec<&dyn ReindexSource> = vec![&git, &iss, &kn, &chat];
+    c.replay_all(
+        &key,
+        HOLDER,
+        100,
+        &all_scopes(),
+        &sources,
+        &mut h.outbox,
+        replay_ctx(),
+    )
+    .unwrap();
+
+    // Re-order the committed stream the way the DURABLE store returns it: by aggregate, ascending.
+    // `aaa-agg` (post-fence) now sorts to the FRONT, ahead of every pre-fence `zzz-agg-*`.
+    let mut rows = h.outbox.committed_rows();
+    rows.sort_by(|a, b| a.aggregate.0.cmp(&b.aggregate.0));
+    assert!(
+        rows.iter()
+            .position(|r| r.aggregate.0 == "aaa-agg")
+            .unwrap()
+            < rows
+                .iter()
+                .position(|r| r.aggregate.0.starts_with("zzz-agg"))
+                .unwrap(),
+        "precondition: the post-fence row sorts AHEAD of the pre-fence rows, so a positional \
+         bound would take the wrong ones"
+    );
+
+    let caught = c.catch_up(&key, HOLDER, 100, &rows).unwrap();
+    assert_eq!(
+        caught, 3,
+        "exactly the three pre-fence events are applied, regardless of row order"
+    );
+
+    let ids = h.doc_ids();
+    for d in &pre {
+        assert!(
+            ids.contains(d),
+            "a pre-fence event on a high-sorting aggregate must NOT be dropped: {d}"
+        );
+    }
+    assert!(
+        !ids.contains(&post),
+        "a post-fence event must NOT be pulled in early — it is ordinary intake's business"
+    );
 }
