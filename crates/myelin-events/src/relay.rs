@@ -197,7 +197,7 @@ impl DeliveryPoisonKind {
 /// One independently-classified item from a bounded broker pull.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerDeliveryBody {
-    Event(EventEnvelope),
+    Event(Box<EventEnvelope>),
     Poison(DeliveryPoisonKind),
     /// JetStream reply metadata could not be parsed or did not contain a positive attempt/ref.
     /// There is no stable quarantine identity, so this item is NAK-only.

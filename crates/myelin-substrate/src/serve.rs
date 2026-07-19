@@ -753,7 +753,7 @@ impl ServeHandle {
                 .map(|envelope| myelin_events::BrokerDelivery {
                     token: DeliveryToken(0),
                     broker_ref: None,
-                    body: BrokerDeliveryBody::Event(envelope),
+                    body: BrokerDeliveryBody::Event(Box::new(envelope)),
                     delivery_attempt: Some(1),
                 })
                 .collect()
@@ -791,7 +791,7 @@ impl ServeHandle {
                     }
                     continue;
                 }
-                BrokerDeliveryBody::Event(envelope) => envelope,
+                BrokerDeliveryBody::Event(envelope) => *envelope,
             };
             if self.consumer_transport.is_some()
                 && (delivery_attempt.is_none() || broker_ref.is_none())
@@ -1285,7 +1285,7 @@ mod tests {
                                         stream: "TEST".into(),
                                         stream_sequence: next_token,
                                     }),
-                                    body: BrokerDeliveryBody::Event(envelope),
+                                    body: BrokerDeliveryBody::Event(Box::new(envelope)),
                                     delivery_attempt: Some(1),
                                 }
                                 })
@@ -1310,7 +1310,7 @@ mod tests {
                             stream: "TEST".into(),
                             stream_sequence: 1,
                         }),
-                        body: BrokerDeliveryBody::Event(envelope),
+                        body: BrokerDeliveryBody::Event(Box::new(envelope)),
                         delivery_attempt: Some(delivery_attempt),
                     }]]
                     .into_iter()
@@ -1750,7 +1750,7 @@ mod tests {
                 broker_ref: Some(myelin_events::BrokerDeliveryRef {
                     stream: "TEST".into(), stream_sequence: 2,
                 }),
-                body: BrokerDeliveryBody::Event(event),
+                body: BrokerDeliveryBody::Event(Box::new(event)),
                 delivery_attempt: Some(1),
             },
         ]);
@@ -1788,7 +1788,7 @@ mod tests {
                 broker_ref: Some(myelin_events::BrokerDeliveryRef {
                     stream: "TEST".into(), stream_sequence: 2,
                 }),
-                body: BrokerDeliveryBody::Event(event),
+                body: BrokerDeliveryBody::Event(Box::new(event)),
                 delivery_attempt: Some(1),
             },
         ]);
@@ -1943,7 +1943,7 @@ mod tests {
                     stream: "TEST".into(),
                     stream_sequence: 2,
                 }),
-                body: BrokerDeliveryBody::Event(event),
+                body: BrokerDeliveryBody::Event(Box::new(event)),
                 delivery_attempt: Some(MAX_CONSUMER_DELIVERIES + 1),
             }]);
         let dlq = DlqProbe::default();

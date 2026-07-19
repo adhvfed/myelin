@@ -374,7 +374,9 @@ fn classify_delivery_body(
     match serde_json::from_slice::<EventEnvelope>(payload) {
         Err(_) => BrokerDeliveryBody::Poison(DeliveryPoisonKind::MalformedEnvelope),
         Ok(envelope) => match event_subject(subject_root, &envelope) {
-            Ok(expected) if actual_subject == expected => BrokerDeliveryBody::Event(envelope),
+            Ok(expected) if actual_subject == expected => {
+                BrokerDeliveryBody::Event(Box::new(envelope))
+            }
             _ => BrokerDeliveryBody::Poison(DeliveryPoisonKind::SubjectMismatch),
         },
     }
@@ -1012,7 +1014,7 @@ impl BusTransport for NatsJetStreamBus {
                         .entry(envelope.event_id.0.clone())
                         .or_default()
                         .push_back(delivery.token);
-                    Some(envelope)
+                    Some(*envelope)
                 }
                 BrokerDeliveryBody::Poison(_) | BrokerDeliveryBody::TransientMetadataFault => {
                     // Legacy consumers have no quarantine seam. NAK independently instead of
