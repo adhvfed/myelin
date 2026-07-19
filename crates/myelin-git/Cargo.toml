@@ -90,8 +90,8 @@ serde.workspace = true
 serde_json.workspace = true
 
 # DEV-REAL data layer (GIT-P20 / P-281, M3) — the store-backed `check_status` projection. The Postgres
-# driver + async runtime + dev config are OPTIONAL and pulled ONLY by `--features integration`, so
-# `cargo build --workspace` stays DB-free (the binding data-layer policy). The live `check_status`
+# driver + async runtime are production dependencies; only the dev config helper is pulled by
+# `--features integration`. The live `check_status`
 # table + the same-tx idempotent-on-`event_id` + monotonic supersession apply (contract 5.9 / X-1 §6.1)
 # is proven against the dev Postgres stack by `tests/integration_git_d10_check_status_projection.rs`.
 sqlx.workspace = true
@@ -191,4 +191,5 @@ toml.workspace = true
 # stays DB-free; proven green against the docker-compose dev Postgres stack.
 # `myelin-storage/integration` pulls in the REAL `ValkeyCache` (the `fork:<pr_id>` cache-confinement
 # integration test, GIT-P22 / P-284, `tests/integration_git_p22_fork_cache_confinement.rs`).
-integration = ["dep:myelin-config", "myelin-storage/integration"]
+test-support = []
+integration = ["test-support", "dep:myelin-config", "myelin-storage/integration"]

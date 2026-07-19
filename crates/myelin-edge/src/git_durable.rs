@@ -33,7 +33,7 @@ use crate::repo_authz::{DenyAllRepos, RepoAuthorizer, RepoPermission};
 #[cfg(any(test, feature = "test-support"))]
 use crate::repo_authz::AllowAllRepos;
 use crate::repo_authz_live::{NoRepoBootstrap, RepoBootstrapGrants};
-use crate::request::EdgeResponse;
+use crate::request::{EdgeRequest, EdgeResponse};
 use myelin_events::{Actor, EmitContextBase, IdMinter, OutboxStore, Region, TenantId, Timestamp};
 // Used only by the `test-support`-gated `rooted_inmem_for_test` helper (MR-009b W3b.6).
 #[cfg(any(test, feature = "test-support"))]
@@ -43,9 +43,11 @@ use myelin_git::check_status::GitOid;
 use myelin_git::core::{Oid as CoreOid, RepoLoc};
 use myelin_git::durable::{BlobPathLookup, CommitDetail, CommitMeta, PrDiff, TreePathLookup};
 use myelin_git::durable::{DurableError, DurableGitRepo, DurableGitStore};
+use myelin_git::events::pseudonymized_event_principal;
 use myelin_git::lifecycle::{
     BranchProtectionRuleset, PrState, PullRequest, ReviewState, ReviewVerdict,
 };
+use myelin_git::pg_pr_store::{PgPrStore, PrMutation, PrOperationId};
 use myelin_git::pr_store::{
     effective_ruleset, evaluate_merge, merge_pr, BranchProtectionConfig, ChecksSummary,
     DurablePrStore, MergeAttempt, PrRecord, ReviewRecord,
@@ -62,7 +64,8 @@ use myelin_git::web::{
     CommitDiff, CommitRow, DiffFile, DiffLineView, PrDiffFile, PrDiffHunk, PrDiffLine, PrDiffVM,
     RepoHome, WebEditOutcome,
 };
-use myelin_identity::{Principal, PrincipalKind};
+use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
+use myelin_storage::{DurablePlacementBacking, KmsEngine, SubstrateProvider, TenantScope};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -73,7 +76,12 @@ use std::sync::Arc;
 /// region)` is taken from `ctx.scope` per request — never from the URL/body (the GIT-D8 invariant).
 pub struct DurableGitBackend {
     store: DurableGitStore,
+    /// Filesystem authority retained for repository-owned branch-protection policy and explicit
+    /// legacy/test PR fixtures only. Production PR lifecycle records never read or write here.
     prs: DurablePrStore,
+    /// Production PR lifecycle authority. `None` exists only in the test-support constructor so the
+    /// long-standing filesystem fixtures remain hermetic.
+    pg_prs: Option<PgPrStore>,
     /// **R3.3 / R3.2 — the durable PR review-thread / comment / review-batch store.** Keyed by the
     /// canonical `object_key` (`pr:<slug>:<n>`); rooted at the SAME on-disk root as `store`/`prs`.
     threads: DurablePrThreadStore,
@@ -108,6 +116,85 @@ pub struct DurableGitBackend {
     bootstrap: Arc<dyn RepoBootstrapGrants>,
 }
 
+/// Loud summary of one placement-derived tenant recovery pass performed before serving starts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitBootRecoveryReport {
+    pub repos_reconciled: usize,
+    pub refs_reapplied: usize,
+    pub merges_recovered: usize,
+}
+
+/// Cell-wide aggregate for the placement-derived boot pass.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitCellBootRecoveryReport {
+    pub tenants_recovered: usize,
+    pub repos_reconciled: usize,
+    pub refs_reapplied: usize,
+    pub merges_recovered: usize,
+}
+
+/// Derive recovery scopes only from the durable local-tenant directory plus its canonical placement
+/// row, then recover each active tenant. This is shared by Edge and MCP boot so neither process mints
+/// tenant authority from Git filesystem paths or an incoming request.
+pub async fn recover_placed_git_at_boot(
+    backend: &DurableGitBackend,
+    provider: &SubstrateProvider,
+    cell_id: &str,
+) -> Result<GitCellBootRecoveryReport, DurableError> {
+    if cell_id.trim().is_empty() {
+        return Err(DurableError::Io("Git recovery cell id is empty".into()));
+    }
+    let placements = DurablePlacementBacking::new(provider.db_pool().clone());
+    let local = placements
+        .local_tenants(cell_id)
+        .await
+        .map_err(|_| DurableError::Io("read local tenant recovery directory".into()))?;
+    let mut report = GitCellBootRecoveryReport::default();
+    for entry in local.into_iter().filter(|entry| entry.active) {
+        if entry.cell_id != cell_id {
+            return Err(DurableError::Io(
+                "local tenant recovery directory returned a foreign cell".into(),
+            ));
+        }
+        let placement = placements
+            .get_placement(&entry.tenant_id)
+            .await
+            .map_err(|_| DurableError::Io("read tenant recovery placement".into()))?
+            .ok_or_else(|| {
+                DurableError::Io("active local tenant has no canonical placement".into())
+            })?;
+        if placement.status != "Active" {
+            return Err(DurableError::Io(
+                "active local tenant has a non-active canonical placement".into(),
+            ));
+        }
+        if placement.tenant_id != entry.tenant_id
+            || placement.region != provider.config().region
+            || (placement.home_cell != cell_id
+                && !placement.member_cells.iter().any(|member| member == cell_id))
+        {
+            return Err(DurableError::Io(
+                "active local tenant recovery placement does not match this cell/region".into(),
+            ));
+        }
+        let principal = Principal::new(
+            TenantId(entry.tenant_id),
+            Region(placement.region),
+            PrincipalId(format!("git-recovery:{cell_id}")),
+            PrincipalKind::Service,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        );
+        let scope = TenantScope::from_verified_token(&principal, principal.region.clone());
+        let tenant_report = backend.recover_tenant_at_boot(&scope, &principal)?;
+        report.tenants_recovered += 1;
+        report.repos_reconciled += tenant_report.repos_reconciled;
+        report.refs_reapplied += tenant_report.refs_reapplied;
+        report.merges_recovered += tenant_report.merges_recovered;
+    }
+    Ok(report)
+}
+
 /// One PR enriched for a list row (R3.1): the durable record + the rolled-up checks summary (Q4 —
 /// rolled up in ONE pass, no N+1) + whether the viewer is a requested reviewer + the repo slug
 /// (cross-repo rows only). The `summary` FAILS STATIC (`Unavailable`) if the repo's branch-protection
@@ -133,13 +220,17 @@ impl DurableGitBackend {
     /// test passes the in-memory `OutboxStore::new()` double + a seeded deterministic minter.
     pub fn rooted(
         root: impl Into<PathBuf>,
+        provider: SubstrateProvider,
+        kms: Arc<KmsEngine>,
+        runtime: tokio::runtime::Handle,
         outbox: OutboxStore,
         minter: Arc<dyn IdMinter>,
-    ) -> DurableGitBackend {
+    ) -> Result<DurableGitBackend, DurableError> {
         let root = root.into();
-        DurableGitBackend {
+        Ok(DurableGitBackend {
             store: DurableGitStore::rooted(root.clone()),
             prs: DurablePrStore::rooted(root.clone()),
+            pg_prs: Some(PgPrStore::new(provider, kms, runtime)?),
             threads: DurablePrThreadStore::rooted(root.clone()),
             outbox,
             minter,
@@ -152,7 +243,7 @@ impl DurableGitBackend {
             // `AllowAllRepos` fixture now lives ONLY in the test-support `rooted_inmem_for_test` below.
             repo_authz: Arc::new(DenyAllRepos),
             bootstrap: Arc::new(NoRepoBootstrap),
-        }
+        })
     }
 
     /// The in-memory-floor constructor for tests/drills: `rooted` over the in-memory outbox double
@@ -169,8 +260,19 @@ impl DurableGitBackend {
         // `with_repo_authorizer`). This is the ONLY `AllowAllRepos` construction left, and it is
         // inside this `test-support`-gated helper — never a production path (R2.6: prod `rooted`
         // fails closed with `DenyAllRepos`).
-        DurableGitBackend::rooted(root, OutboxStore::new(), Arc::new(MonotonicMinter::new()))
-            .with_repo_authorizer(Arc::new(AllowAllRepos))
+        let root = root.into();
+        DurableGitBackend {
+            store: DurableGitStore::rooted(root.clone()),
+            prs: DurablePrStore::rooted(root.clone()),
+            pg_prs: None,
+            threads: DurablePrThreadStore::rooted(root.clone()),
+            outbox: OutboxStore::new(),
+            minter: Arc::new(MonotonicMinter::new()),
+            clone_base: public_clone_base(),
+            root,
+            repo_authz: Arc::new(AllowAllRepos),
+            bootstrap: Arc::new(NoRepoBootstrap),
+        }
     }
 
     /// **Inject the R0.3 per-repo object authorizer** (the wire object-authz seam) — the analogue of
@@ -237,26 +339,226 @@ impl DurableGitBackend {
     ) -> Result<myelin_git::reconcile::ReconcileReport, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc)?;
-        let records = myelin_git::reconcile::refs_from_outbox(&self.outbox, Some(slug));
+        let records = myelin_git::reconcile::refs_from_outbox_scoped(
+            &self.outbox,
+            tenant,
+            region,
+            slug,
+        )?;
         myelin_git::reconcile::reconcile_refs(&repo, &records)
+    }
+
+    /// Recover every durable Git write known for a placement-validated tenant before serving. The
+    /// repository discovery set is exclusively durable authority: scoped committed ref witnesses
+    /// union scoped pending merge intents. Filesystem directory names never mint recovery scope.
+    /// Every target repository is opened and its ref witnesses reconciled before any pending merge
+    /// intent is drained; an absent/corrupt target fails boot loud.
+    pub fn recover_tenant_at_boot(
+        &self,
+        scope: &TenantScope,
+        recovery_principal: &Principal,
+    ) -> Result<GitBootRecoveryReport, DurableError> {
+        if recovery_principal.tenant != *scope.tenant()
+            || recovery_principal.region != *scope.region()
+        {
+            return Err(DurableError::NotFound("repository partition".into()));
+        }
+        let tenant = scope.tenant().0.as_str();
+        let region = scope.region().0.as_str();
+        let pending = match &self.pg_prs {
+            Some(store) => store.list_pending_merges(scope)?,
+            None => Vec::new(),
+        };
+        let mut repos = myelin_git::reconcile::repo_slugs_from_outbox_scoped(
+            &self.outbox,
+            tenant,
+            region,
+        )?;
+        repos.extend(pending.iter().map(|item| item.repo_slug.clone()));
+
+        let mut report = GitBootRecoveryReport::default();
+        for slug in &repos {
+            let reconciled = self.reconcile_repo(tenant, region, slug)?;
+            report.repos_reconciled += 1;
+            report.refs_reapplied += reconciled.reapplied.len();
+        }
+
+        if let Some(store) = &self.pg_prs {
+            for item in pending {
+                let loc = Self::loc(tenant, region, &item.repo_slug);
+                let repo = Arc::new(self.store.open_repo(&loc)?);
+                let ref_store = self.open_durable_refstore(
+                    repo.clone(),
+                    &item.repo_slug,
+                    tenant,
+                    region,
+                    recovery_principal,
+                );
+                if store
+                    .recover_pending_merge_target(
+                        scope,
+                        &item.repo_slug,
+                        item.number,
+                        recovery_principal,
+                        &loc,
+                        &repo,
+                        &ref_store,
+                    )?
+                    .is_some()
+                {
+                    report.merges_recovered += 1;
+                }
+            }
+        }
+        Ok(report)
     }
 
     fn loc(tenant: &str, region: &str, slug: &str) -> RepoLoc {
         RepoLoc::new(tenant, region, slug)
     }
 
+    /// Mint the database scope only from the verified principal, then require the route-derived
+    /// locator to agree. A forged tenant/region argument is indistinguishable from an absent
+    /// partition and never becomes query authority.
+    fn verified_pr_scope(
+        principal: &Principal,
+        loc: &RepoLoc,
+    ) -> Result<TenantScope, DurableError> {
+        if principal.tenant.0 != loc.tenant || principal.region.0 != loc.region {
+            return Err(DurableError::NotFound("repository partition".into()));
+        }
+        Ok(TenantScope::from_verified_token(
+            principal,
+            principal.region.clone(),
+        ))
+    }
+
+    fn pr_get(
+        &self,
+        loc: &RepoLoc,
+        number: u64,
+        principal: &Principal,
+    ) -> Result<Option<PrRecord>, DurableError> {
+        match &self.pg_prs {
+            Some(store) => store.get(&Self::verified_pr_scope(principal, loc)?, &loc.repo, number),
+            None => self.prs.get(loc, number),
+        }
+    }
+
+    fn pr_list(&self, loc: &RepoLoc, principal: &Principal) -> Result<Vec<PrRecord>, DurableError> {
+        match &self.pg_prs {
+            Some(store) => store.list(&Self::verified_pr_scope(principal, loc)?, &loc.repo),
+            None => self.prs.list(loc),
+        }
+    }
+
+    fn pr_open(
+        &self,
+        loc: &RepoLoc,
+        record: PrRecord,
+        operation_id: &PrOperationId,
+        principal: &Principal,
+    ) -> Result<PrRecord, DurableError> {
+        match &self.pg_prs {
+            Some(store) => store.open(
+                &Self::verified_pr_scope(principal, loc)?,
+                &loc.repo,
+                record,
+                operation_id,
+                principal,
+            ),
+            None => {
+                self.prs.open_pr(loc, &record)?;
+                Ok(record)
+            }
+        }
+    }
+
+    fn pr_mutate(
+        &self,
+        loc: &RepoLoc,
+        number: u64,
+        mutation: PrMutation,
+        operation_id: &PrOperationId,
+        principal: &Principal,
+    ) -> Result<PrRecord, DurableError> {
+        if let Some(store) = &self.pg_prs {
+            return store.apply_mutation(
+                &Self::verified_pr_scope(principal, loc)?,
+                &loc.repo,
+                number,
+                mutation,
+                operation_id,
+                principal,
+            );
+        }
+        let mut record = self
+            .prs
+            .get(loc, number)?
+            .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
+        match mutation {
+            PrMutation::ReportChecks {
+                green_contexts,
+                fork_unendorsed_contexts,
+                codeowner_review_satisfied,
+                outstanding_conversations,
+            } => {
+                if let Some(value) = green_contexts {
+                    record.green_contexts = value;
+                }
+                if let Some(value) = fork_unendorsed_contexts {
+                    record.fork_unendorsed_contexts = value;
+                }
+                if let Some(value) = codeowner_review_satisfied {
+                    record.codeowner_review_satisfied = value;
+                }
+                if let Some(value) = outstanding_conversations {
+                    record.outstanding_conversations = value;
+                }
+            }
+            PrMutation::SubmitReview(review) => record.reviews.push(review),
+            PrMutation::EndorseContexts(contexts) => {
+                for context in contexts {
+                    if !record.endorsed_contexts.contains(&context) {
+                        record.endorsed_contexts.push(context);
+                    }
+                }
+            }
+            PrMutation::Touch => {}
+        }
+        record.updated_at = Some(now_unix());
+        self.prs.put(loc, &record)?;
+        Ok(record)
+    }
+
     fn emit_ctx(tenant: &str, region: &str, principal: &Principal) -> EmitContextBase {
+        let now = chrono::DateTime::from_timestamp(now_unix(), 0).unwrap_or_default();
+        let now = Timestamp(now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        let event_principal = pseudonymized_event_principal(tenant, principal);
         EmitContextBase {
             tenant: TenantId(tenant.into()),
             region: Region(region.into()),
-            actor: Actor(principal.clone()),
+            actor: Actor(event_principal),
             schema_ver: 1,
-            // The substrate clock injection is the production composition-root's job; a fixed RFC-3339
-            // stamp is sufficient here (the edge does not drain the outbox — the relay does).
-            occurred_at: Timestamp("2026-06-29T00:00:00Z".into()),
-            recorded_at: Timestamp("2026-06-29T00:00:01Z".into()),
+            occurred_at: now.clone(),
+            recorded_at: now,
             caused_by: None,
         }
+    }
+
+    fn fresh_operation_id(&self) -> Result<PrOperationId, DurableError> {
+        PrOperationId::parse(&format!("internal-{}", self.minter.mint().0))
+    }
+
+    fn request_operation_id(&self, request: &EdgeRequest) -> Result<PrOperationId, EdgeError> {
+        if self.pg_prs.is_none() {
+            return self.fresh_operation_id().map_err(map_durable_err);
+        }
+        let value = request.header("idempotency-key").ok_or_else(|| {
+            EdgeError::BadRequest("production PR writes require an `Idempotency-Key` header".into())
+        })?;
+        PrOperationId::parse(value)
+            .map_err(|_| EdgeError::BadRequest("invalid `Idempotency-Key` header".into()))
     }
 
     /// The GIT-1 tenant pseudonym for a principal (`<principal>@<tenant>.noreply`) — never a raw identity.
@@ -505,11 +807,12 @@ impl DurableGitBackend {
         region: &str,
         slug: &str,
         number: u64,
+        principal: &Principal,
         offset: usize,
         limit: usize,
     ) -> Result<Option<PrDiffVM>, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        let Some(rec) = self.prs.get(&loc, number)? else {
+        let Some(rec) = self.pr_get(&loc, number, principal)? else {
             return Ok(None);
         };
         let repo = self.store.open_repo(&loc)?;
@@ -894,8 +1197,9 @@ impl DurableGitBackend {
         region: &str,
         slug: &str,
         number: u64,
+        principal: &Principal,
     ) -> Result<Option<PrRecord>, DurableError> {
-        self.prs.get(&Self::loc(tenant, region, slug), number)
+        self.pr_get(&Self::loc(tenant, region, slug), number, principal)
     }
 
     fn next_pr_number(&self, loc: &RepoLoc) -> u64 {
@@ -916,13 +1220,26 @@ impl DurableGitBackend {
         body: &Value,
         principal: &Principal,
     ) -> Result<PrRecord, DurableError> {
+        let operation_id = self.fresh_operation_id()?;
+        self.open_pr_with_operation(tenant, region, slug, body, principal, &operation_id)
+    }
+
+    pub fn open_pr_with_operation(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        body: &Value,
+        principal: &Principal,
+        operation_id: &PrOperationId,
+    ) -> Result<PrRecord, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        let repo = self.store.open_repo(&loc)?; // 404 if the repo is absent
-                                                // The PR-open body carries ONLY the proposal (base/head/head_oid/draft) — NEVER branch-protection
-                                                // POLICY (required set / approval threshold) or check FACTS (greens). Policy is repo-owned (set
-                                                // via the repo-admin branch-protection op); facts are set by authorized producers (the CI
-                                                // check-report op, the review op, the endorse op). This is the GT-003 bypass fix: a PR author
-                                                // cannot weaken the gate by supplying loose policy or self-claimed greens at open.
+        self.store.open_repo(&loc)?; // 404 if the target repo is absent
+                                     // The PR-open body carries ONLY the proposal (base/head/head_oid/draft) — NEVER branch-protection
+                                     // POLICY (required set / approval threshold) or check FACTS (greens). Policy is repo-owned (set
+                                     // via the repo-admin branch-protection op); facts are set by authorized producers (the CI
+                                     // check-report op, the review op, the endorse op). This is the GT-003 bypass fix: a PR author
+                                     // cannot weaken the gate by supplying loose policy or self-claimed greens at open.
         let base_ref = body
             .get("base_ref")
             .and_then(Value::as_str)
@@ -933,6 +1250,27 @@ impl DurableGitBackend {
             .and_then(Value::as_str)
             .unwrap_or("refs/heads/feature")
             .to_string();
+        let head_repo_slug = body
+            .get("head_repo")
+            .or_else(|| body.get("head_repo_slug"))
+            .and_then(Value::as_str)
+            .unwrap_or(slug);
+        if head_repo_slug.is_empty() {
+            return Err(DurableError::Git(
+                "open-PR head repository slug must be non-empty".into(),
+            ));
+        }
+        // Source authority is derived from the verified principal's partition, never from the body.
+        // Pull authorization is checked on the exact source repo before its ref/OID is resolved; a
+        // denial is 0-leak and indistinguishable from an absent source.
+        let head_loc = Self::loc(&principal.tenant.0, &principal.region.0, head_repo_slug);
+        if !self
+            .repo_authz
+            .authorize_repo_permission(principal, &head_loc, RepoPermission::Pull)
+        {
+            return Err(DurableError::NotFound("repository not found".into()));
+        }
+        let head_repo = self.store.open_repo(&head_loc)?;
         let head_oid = body
             .get("head_oid")
             .and_then(Value::as_str)
@@ -945,22 +1283,31 @@ impl DurableGitBackend {
         // (the stored head_oid is the branch tip) and (b) turns a non-existent head_ref into a CLEAR
         // 400 the moment the PR is proposed, not a mystifying failure at merge. The explicit-head_oid
         // path is UNCHANGED — an author who pins a specific oid keeps exactly that oid.
+        let qualified_head_ref = if head_ref.starts_with("refs/") {
+            head_ref.clone()
+        } else {
+            format!("refs/heads/{head_ref}")
+        };
+        let source_tip = head_repo.read_ref(&qualified_head_ref)?;
         let head_oid = if head_oid.is_empty() {
             // Qualify a bare branch name to `refs/heads/<name>`; a fully-qualified `refs/…` is used as-is.
-            let qualified = if head_ref.starts_with("refs/") {
-                head_ref.clone()
-            } else {
-                format!("refs/heads/{head_ref}")
-            };
-            match repo.read_ref(&qualified)? {
+            match source_tip {
                 Some(tip) => tip.0,
                 // 400 at OPEN (map_durable_err routes a "missing" `Git` error to BadRequest) — never a
                 // stored empty head that wedges the merge dialog with a confusing error later.
-                None => return Err(DurableError::Git(format!(
+                None => {
+                    return Err(DurableError::Git(format!(
                     "open-PR head_ref `{head_ref}` does not exist in the repo — no branch tip to \
                          open against (missing head)"
-                ))),
+                )))
+                }
             }
+        } else if self.pg_prs.is_some()
+            && source_tip.as_ref().map(|tip| tip.0.as_str()) != Some(head_oid.as_str())
+        {
+            return Err(DurableError::Git(format!(
+                "open-PR head_oid does not match the current `{head_repo_slug}` source ref tip"
+            )));
         } else {
             head_oid
         };
@@ -986,7 +1333,13 @@ impl DurableGitBackend {
             .or_else(|| body.get("body"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        let number = self.next_pr_number(&loc);
+        // PostgreSQL owns allocation atomically; production never consults stale/corrupt legacy
+        // filesystem PR files. The legacy/test authority still allocates from its filenames.
+        let number = if self.pg_prs.is_some() {
+            0
+        } else {
+            self.next_pr_number(&loc)
+        };
         let pr = PullRequest::open(
             number,
             base_ref,
@@ -995,14 +1348,14 @@ impl DurableGitBackend {
             body.get("draft").and_then(Value::as_bool).unwrap_or(false),
         );
         let mut rec = PrRecord::open(&pr, head_oid);
+        rec.head_repo_slug = head_repo_slug.to_string();
         rec.title = title;
         rec.body_md = body_md;
         rec.author_is_agent = Self::is_agent(principal);
         let now = now_unix();
         rec.created_at = Some(now); // R3.3 N1 — the header's "opened …" date, stamped once at open.
         rec.updated_at = Some(now);
-        self.prs.open_pr(&loc, &rec)?;
-        Ok(rec)
+        self.pr_open(&loc, rec, operation_id, principal)
     }
 
     // ── R3.1 — the leak-free PR LIST (per-repo + cross-repo front door) ──────────────────────────
@@ -1033,10 +1386,11 @@ impl DurableGitBackend {
     fn enrich_prs(
         &self,
         loc: &RepoLoc,
+        principal: &Principal,
         viewer_pseudonym: &str,
         repo_slug: Option<&str>,
     ) -> Result<Vec<EnrichedPr>, DurableError> {
-        let records = self.prs.list(loc)?;
+        let records = self.pr_list(loc, principal)?;
         // ONE config read for the whole repo (fail static on error — see above).
         let config = match self.prs.get_protection(loc) {
             Ok(cfg) => Some(cfg),
@@ -1077,7 +1431,7 @@ impl DurableGitBackend {
     ) -> Result<Vec<EnrichedPr>, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         self.store.open_repo(&loc)?; // 404 if the repo is absent (never a phantom empty list).
-        self.enrich_prs(&loc, &Self::pseudonym(tenant, principal), None)
+        self.enrich_prs(&loc, principal, &Self::pseudonym(tenant, principal), None)
     }
 
     /// **The cross-repo PR front door (R3.1, single-cell for R3 — Q5).** Prefilter the on-disk repo
@@ -1102,7 +1456,7 @@ impl DurableGitBackend {
             if self.store.open_repo(&loc).is_err() {
                 continue; // a slug that lost its repo dir — skip, never error the whole front door.
             }
-            out.extend(self.enrich_prs(&loc, &viewer, Some(&slug))?);
+            out.extend(self.enrich_prs(&loc, principal, &viewer, Some(&slug))?);
         }
         Ok(out)
     }
@@ -1228,6 +1582,29 @@ impl DurableGitBackend {
         principal: &Principal,
         body: &Value,
     ) -> Result<PrRecord, DurableError> {
+        let operation_id = self.fresh_operation_id()?;
+        self.report_checks_with_operation(
+            tenant,
+            region,
+            slug,
+            number,
+            principal,
+            body,
+            &operation_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn report_checks_with_operation(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        number: u64,
+        principal: &Principal,
+        body: &Value,
+        operation_id: &PrOperationId,
+    ) -> Result<PrRecord, DurableError> {
         // The producer floor: only a SERVICE principal (a CI run token) may attest CI check facts. A
         // human writer / an agent is refused (fail-closed) — it cannot self-certify its own PR.
         if !matches!(principal.kind, PrincipalKind::Service) {
@@ -1238,40 +1615,42 @@ impl DurableGitBackend {
             )));
         }
         let loc = Self::loc(tenant, region, slug);
-        let mut rec = self
-            .prs
-            .get(&loc, number)?
-            .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
-        if let Some(g) = body.get("green_contexts").and_then(Value::as_array) {
-            rec.green_contexts = g
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-        }
-        if let Some(g) = body
+        let green_contexts = body
+            .get("green_contexts")
+            .and_then(Value::as_array)
+            .map(|g| {
+                g.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            });
+        let fork_unendorsed_contexts = body
             .get("fork_unendorsed_contexts")
             .and_then(Value::as_array)
-        {
-            rec.fork_unendorsed_contexts = g
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-        }
-        if let Some(b) = body
-            .get("codeowner_review_satisfied")
-            .and_then(Value::as_bool)
-        {
-            rec.codeowner_review_satisfied = b;
-        }
-        if let Some(n) = body
+            .map(|g| {
+                g.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            });
+        let outstanding_conversations = body
             .get("outstanding_conversations")
             .and_then(Value::as_u64)
-        {
-            rec.outstanding_conversations = n as u32;
-        }
-        rec.updated_at = Some(now_unix());
-        self.prs.put(&loc, &rec)?;
-        Ok(rec)
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| DurableError::Git("outstanding conversation count exceeds u32".into()))?;
+        self.pr_mutate(
+            &loc,
+            number,
+            PrMutation::ReportChecks {
+                green_contexts,
+                fork_unendorsed_contexts,
+                codeowner_review_satisfied: body
+                    .get("codeowner_review_satisfied")
+                    .and_then(Value::as_bool),
+                outstanding_conversations,
+            },
+            operation_id,
+            principal,
+        )
     }
 
     pub fn submit_review(
@@ -1283,11 +1662,30 @@ impl DurableGitBackend {
         verdict: &str,
         principal: &Principal,
     ) -> Result<PrRecord, DurableError> {
+        let operation_id = self.fresh_operation_id()?;
+        self.submit_review_with_operation(
+            tenant,
+            region,
+            slug,
+            number,
+            verdict,
+            principal,
+            &operation_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_review_with_operation(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        number: u64,
+        verdict: &str,
+        principal: &Principal,
+        operation_id: &PrOperationId,
+    ) -> Result<PrRecord, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        let mut rec = self
-            .prs
-            .get(&loc, number)?
-            .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
         let v = match verdict {
             "approve" => ReviewVerdict::Approve,
             "request-changes" | "request_changes" => ReviewVerdict::RequestChanges,
@@ -1298,14 +1696,17 @@ impl DurableGitBackend {
                 )))
             }
         };
-        rec.reviews.push(ReviewRecord {
-            reviewer_pseudonym: Self::pseudonym(tenant, principal),
-            state: ReviewState::Submitted(v),
-            is_agent: Self::is_agent(principal),
-        });
-        rec.updated_at = Some(now_unix());
-        self.prs.put(&loc, &rec)?;
-        Ok(rec)
+        self.pr_mutate(
+            &loc,
+            number,
+            PrMutation::SubmitReview(ReviewRecord {
+                reviewer_pseudonym: Self::pseudonym(tenant, principal),
+                state: ReviewState::Submitted(v),
+                is_agent: Self::is_agent(principal),
+            }),
+            operation_id,
+            principal,
+        )
     }
 
     pub fn endorse_fork_ci(
@@ -1315,11 +1716,34 @@ impl DurableGitBackend {
         slug: &str,
         number: u64,
         body: &Value,
+        principal: &Principal,
+    ) -> Result<PrRecord, DurableError> {
+        let operation_id = self.fresh_operation_id()?;
+        self.endorse_fork_ci_with_operation(
+            tenant,
+            region,
+            slug,
+            number,
+            body,
+            principal,
+            &operation_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn endorse_fork_ci_with_operation(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        number: u64,
+        body: &Value,
+        principal: &Principal,
+        operation_id: &PrOperationId,
     ) -> Result<PrRecord, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        let mut rec = self
-            .prs
-            .get(&loc, number)?
+        let rec = self
+            .pr_get(&loc, number, principal)?
             .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
         // Endorse the named contexts (or all currently-un-endorsed fork contexts). The maintainer's
         // `approve_untrusted_ci` capability is the gateway's authz gate; the durable record records the
@@ -1331,14 +1755,13 @@ impl DurableGitBackend {
                 .collect(),
             None => rec.fork_unendorsed_contexts.clone(),
         };
-        for c in to_endorse {
-            if !rec.endorsed_contexts.contains(&c) {
-                rec.endorsed_contexts.push(c);
-            }
-        }
-        rec.updated_at = Some(now_unix());
-        self.prs.put(&loc, &rec)?;
-        Ok(rec)
+        self.pr_mutate(
+            &loc,
+            number,
+            PrMutation::EndorseContexts(to_endorse),
+            operation_id,
+            principal,
+        )
     }
 
     pub fn merge(
@@ -1349,12 +1772,86 @@ impl DurableGitBackend {
         number: u64,
         principal: &Principal,
     ) -> Result<MergeAttempt, DurableError> {
+        let operation_id = self.fresh_operation_id()?;
+        self.merge_with_operation(tenant, region, slug, number, principal, &operation_id)
+    }
+
+    pub fn merge_with_operation(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        number: u64,
+        principal: &Principal,
+        operation_id: &PrOperationId,
+    ) -> Result<MergeAttempt, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         let repo = Arc::new(self.store.open_repo(&loc)?);
         let ref_store = self.open_durable_refstore(repo.clone(), slug, tenant, region, principal);
-        // merge_pr sources the required set + thresholds from the REPO-OWNED ruleset (never author
-        // input), validates head_oid against the on-disk repo, and advances the ref via the durable CAS
-        // only on a fully-admitted gate.
+        if let Some(store) = &self.pg_prs {
+            let scope = Self::verified_pr_scope(principal, &loc)?;
+            // Re-enter an already-admitted operation from the durable target-side intent before
+            // touching the source repository. A source grant can be revoked or the fork deleted
+            // after the ref CAS; neither may strand finalization of an operation that already moved
+            // the target ref. Request retries still have to match the original actor + operation.
+            if let Some(intent) = store.pending_merge_intent(&scope, slug, number)? {
+                if intent.operation_id != operation_id.digest()
+                    || intent.actor_subject_id != principal.principal_id.0.trim()
+                {
+                    return Err(DurableError::Git(
+                        "a different merge operation is already pending".into(),
+                    ));
+                }
+                return store
+                    .recover_pending_merge_target(
+                        &scope,
+                        slug,
+                        number,
+                        principal,
+                        &loc,
+                        &repo,
+                        &ref_store,
+                    )?
+                    .ok_or_else(|| {
+                        DurableError::Io("pending merge disappeared during recovery".into())
+                    });
+            }
+            let rec = self
+                .pr_get(&loc, number, principal)?
+                .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
+            let source_loc = Self::loc(
+                &principal.tenant.0,
+                &principal.region.0,
+                &rec.head_repo_slug,
+            );
+            if !self.repo_authz.authorize_repo_permission(
+                principal,
+                &source_loc,
+                RepoPermission::Pull,
+            ) {
+                return Err(DurableError::NotFound("repository not found".into()));
+            }
+            let source_repo = self.store.open_repo(&source_loc)?;
+            // A fork PR's locked commit may live only in the source repository. Install its complete
+            // verified object closure in the target ODB before the durable merge protocol is allowed
+            // to advance the target ref. The import copies no source refs; the PG protocol below still
+            // revalidates that the authoritative source ref equals this locked OID.
+            repo.import_commit_closure_from(&source_repo, &CoreOid::new(rec.head_oid.clone()))
+                .map_err(sanitize_fork_import_error)?;
+            return store.merge_pr_durable(
+                &scope,
+                slug,
+                number,
+                operation_id,
+                principal,
+                &self.prs,
+                &loc,
+                &repo,
+                &source_repo,
+                &ref_store,
+                &Self::pseudonym(tenant, principal),
+            );
+        }
         merge_pr(
             &self.prs,
             &loc,
@@ -1393,9 +1890,13 @@ impl DurableGitBackend {
     }
 
     /// Verify the PR exists (a thread op on an absent PR is a 404, exactly like the overview).
-    fn require_pr(&self, loc: &RepoLoc, number: u64) -> Result<PrRecord, DurableError> {
-        self.prs
-            .get(loc, number)?
+    fn require_pr(
+        &self,
+        loc: &RepoLoc,
+        number: u64,
+        principal: &Principal,
+    ) -> Result<PrRecord, DurableError> {
+        self.pr_get(loc, number, principal)?
             .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))
     }
 
@@ -1411,7 +1912,7 @@ impl DurableGitBackend {
         principal: &Principal,
     ) -> Result<Value, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        self.require_pr(&loc, number)?;
+        self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
         let doc = self.threads.load(&loc, &key)?;
         let viewer = Self::pseudonym(tenant, principal);
@@ -1430,7 +1931,7 @@ impl DurableGitBackend {
         principal: &Principal,
     ) -> Result<Value, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        self.require_pr(&loc, number)?;
+        self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
         let body_md = require_body_md(body)?;
         let anchor = parse_anchor(body);
@@ -1438,7 +1939,7 @@ impl DurableGitBackend {
         let thread = self
             .threads
             .create_thread(&loc, &key, anchor, author, body_md, now_unix())?;
-        self.bump_pr_updated(&loc, number);
+        self.bump_pr_updated(&loc, number, principal);
         Ok(thread_json(&thread))
     }
 
@@ -1454,14 +1955,14 @@ impl DurableGitBackend {
         principal: &Principal,
     ) -> Result<Value, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        self.require_pr(&loc, number)?;
+        self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
         let body_md = require_body_md(body)?;
         let author = Self::thread_principal(tenant, principal);
         let comment =
             self.threads
                 .add_comment(&loc, &key, thread_id, author, body_md, now_unix())?;
-        self.bump_pr_updated(&loc, number);
+        self.bump_pr_updated(&loc, number, principal);
         Ok(comment_json(&comment))
     }
 
@@ -1474,9 +1975,10 @@ impl DurableGitBackend {
         number: u64,
         thread_id: &str,
         body: &Value,
+        principal: &Principal,
     ) -> Result<Value, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        self.require_pr(&loc, number)?;
+        self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
         let resolved = body
             .get("resolved")
@@ -1499,7 +2001,7 @@ impl DurableGitBackend {
         principal: &Principal,
     ) -> Result<Value, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        self.require_pr(&loc, number)?;
+        self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
         let reviewer = Self::thread_principal(tenant, principal);
         let batch = self.threads.start_review(&loc, &key, reviewer)?;
@@ -1519,7 +2021,7 @@ impl DurableGitBackend {
         principal: &Principal,
     ) -> Result<Value, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        self.require_pr(&loc, number)?;
+        self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
         let body_md = require_body_md(body)?;
         let anchor = parse_anchor(body);
@@ -1551,7 +2053,7 @@ impl DurableGitBackend {
         principal: &Principal,
     ) -> Result<Value, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        self.require_pr(&loc, number)?;
+        self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
         let verdict = match body.get("verdict").and_then(Value::as_str) {
             Some("approved") | Some("approve") => BatchVerdict::Approved,
@@ -1596,7 +2098,7 @@ impl DurableGitBackend {
                 }
             }
         }
-        self.bump_pr_updated(&loc, number);
+        self.bump_pr_updated(&loc, number, principal);
         Ok(json!({
             // The ONE batch event's payload (server-side R-BATCH-1). `emitted` is true exactly once
             // (the first submit); a re-submit is idempotent → `emitted: false`, no double event.
@@ -1621,7 +2123,7 @@ impl DurableGitBackend {
         principal: &Principal,
     ) -> Result<Value, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        self.require_pr(&loc, number)?;
+        self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
         let actor = Self::thread_principal(tenant, principal);
         self.threads.discard_review(&loc, &key, review_id, &actor)?;
@@ -1630,10 +2132,9 @@ impl DurableGitBackend {
 
     /// Bump the PR's `updated_at` after an authored conversation mutation (best-effort — a failure to
     /// re-stamp the record never fails the comment that already persisted).
-    fn bump_pr_updated(&self, loc: &RepoLoc, number: u64) {
-        if let Ok(Some(mut rec)) = self.prs.get(loc, number) {
-            rec.updated_at = Some(now_unix());
-            let _ = self.prs.put(loc, &rec);
+    fn bump_pr_updated(&self, loc: &RepoLoc, number: u64, principal: &Principal) {
+        if let Ok(operation_id) = self.fresh_operation_id() {
+            let _ = self.pr_mutate(loc, number, PrMutation::Touch, &operation_id, principal);
         }
     }
 
@@ -1650,11 +2151,12 @@ impl DurableGitBackend {
         &self,
         loc: &RepoLoc,
         head_oid: &str,
+        principal: &Principal,
     ) -> (Vec<String>, Vec<String>, Vec<String>) {
         let mut green = Vec::new();
         let mut fork_unendorsed = Vec::new();
         let mut endorsed = Vec::new();
-        if let Ok(prs) = self.prs.list(loc) {
+        if let Ok(prs) = self.pr_list(loc, principal) {
             for rec in prs.into_iter().filter(|r| r.head_oid == head_oid) {
                 green.extend(rec.green_contexts);
                 fork_unendorsed.extend(rec.fork_unendorsed_contexts);
@@ -1892,7 +2394,7 @@ impl DurableGitBackend {
             let ruleset = effective_ruleset(protection.as_ref(), ref_str);
             let is_delete = u.new_oid.is_zero();
             let (green, fork_unendorsed, endorsed) =
-                self.check_facts_for_head(&loc, u.new_oid.0.as_str());
+                self.check_facts_for_head(&loc, u.new_oid.0.as_str(), principal);
             let head = GitOid(u.new_oid.0.clone());
             if let Err(reason) = evaluate_protected_ref_push(
                 &u.ref_name,
@@ -2220,6 +2722,13 @@ const BLOB_INLINE_CAP: usize = 512 * 1024;
 /// The short oid (first 12 chars) — the browse log/tree short form.
 fn short_oid12(oid: &str) -> String {
     oid.chars().take(12).collect()
+}
+
+/// Fork import failures can contain repository paths or low-level libgit2 diagnostics. Those are
+/// useful only inside the storage boundary and must never be reflected through HTTP/MCP denial
+/// text. The public mutation boundary exposes one stable, non-oracular failure.
+fn sanitize_fork_import_error(_error: DurableError) -> DurableError {
+    DurableError::Git("fork commit import could not be completed".into())
 }
 
 /// A compact latest-commit projection for a tree row / the repo-home latest-commit bar (R3.4).
@@ -2677,14 +3186,16 @@ impl Handler for DOpenPr {
         } else {
             ctx.request.json_body()?
         };
+        let operation_id = self.be.request_operation_id(ctx.request)?;
         let rec = self
             .be
-            .open_pr(
+            .open_pr_with_operation(
                 tenant_of(ctx),
                 region_of(ctx),
                 param(ctx, "repo")?,
                 &body,
                 ctx.principal,
+                &operation_id,
             )
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(
@@ -2702,8 +3213,7 @@ impl Handler for DPrOverview {
         let loc = DurableGitBackend::loc(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?);
         let rec = self
             .be
-            .prs
-            .get(&loc, num_param(ctx, "n")?)
+            .pr_get(&loc, num_param(ctx, "n")?, ctx.principal)
             .map_err(map_durable_err)?
             .ok_or_else(|| EdgeError::NotFound("no such pull request".into()))?;
         let mut vm = DurableGitBackend::pr_json(&rec);
@@ -2734,8 +3244,7 @@ impl Handler for DPrCommits {
         let loc = DurableGitBackend::loc(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?);
         let rec = self
             .be
-            .prs
-            .get(&loc, num_param(ctx, "n")?)
+            .pr_get(&loc, num_param(ctx, "n")?, ctx.principal)
             .map_err(map_durable_err)?
             .ok_or_else(|| EdgeError::NotFound("no such pull request".into()))?;
         let repo = self.be.store.open_repo(&loc).map_err(map_durable_err)?;
@@ -2777,6 +3286,7 @@ impl Handler for DPrDiff {
                 region_of(ctx),
                 param(ctx, "repo")?,
                 num_param(ctx, "n")?,
+                ctx.principal,
                 offset,
                 limit,
             )
@@ -2914,6 +3424,7 @@ impl Handler for DPrThreadResolve {
                 num_param(ctx, "n")?,
                 param(ctx, "tid")?,
                 &body,
+                ctx.principal,
             )
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(
@@ -3034,8 +3545,7 @@ impl Handler for DPrChecks {
         let loc = DurableGitBackend::loc(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?);
         let rec = self
             .be
-            .prs
-            .get(&loc, num_param(ctx, "n")?)
+            .pr_get(&loc, num_param(ctx, "n")?, ctx.principal)
             .map_err(map_durable_err)?
             .ok_or_else(|| EdgeError::NotFound("no such pull request".into()))?;
         let vm = self
@@ -3192,15 +3702,17 @@ impl Handler for DPrReview {
             .get("verdict")
             .and_then(Value::as_str)
             .ok_or_else(|| EdgeError::BadRequest("review body missing `verdict`".into()))?;
+        let operation_id = self.be.request_operation_id(ctx.request)?;
         let rec = self
             .be
-            .submit_review(
+            .submit_review_with_operation(
                 tenant_of(ctx),
                 region_of(ctx),
                 param(ctx, "repo")?,
                 num_param(ctx, "n")?,
                 verdict,
                 ctx.principal,
+                &operation_id,
             )
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(
@@ -3220,14 +3732,17 @@ impl Handler for DEndorse {
         } else {
             ctx.request.json_body()?
         };
+        let operation_id = self.be.request_operation_id(ctx.request)?;
         let rec = self
             .be
-            .endorse_fork_ci(
+            .endorse_fork_ci_with_operation(
                 tenant_of(ctx),
                 region_of(ctx),
                 param(ctx, "repo")?,
                 num_param(ctx, "n")?,
                 &body,
+                ctx.principal,
+                &operation_id,
             )
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(
@@ -3242,14 +3757,16 @@ struct DMerge {
 }
 impl Handler for DMerge {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let operation_id = self.be.request_operation_id(ctx.request)?;
         let attempt = self
             .be
-            .merge(
+            .merge_with_operation(
                 tenant_of(ctx),
                 region_of(ctx),
                 param(ctx, "repo")?,
                 num_param(ctx, "n")?,
                 ctx.principal,
+                &operation_id,
             )
             .map_err(map_durable_err)?;
         match attempt {
@@ -3274,8 +3791,7 @@ impl Handler for DMerge {
                     DurableGitBackend::loc(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?);
                 let checks = self
                     .be
-                    .prs
-                    .get(&loc, num_param(ctx, "n")?)
+                    .pr_get(&loc, num_param(ctx, "n")?, ctx.principal)
                     .ok()
                     .flatten()
                     .and_then(|rec| self.be.pr_checks_json(&loc, &rec).ok());
@@ -3330,15 +3846,17 @@ struct DReportChecks {
 impl Handler for DReportChecks {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let body = ctx.request.json_body()?;
+        let operation_id = self.be.request_operation_id(ctx.request)?;
         let rec = self
             .be
-            .report_checks(
+            .report_checks_with_operation(
                 tenant_of(ctx),
                 region_of(ctx),
                 param(ctx, "repo")?,
                 num_param(ctx, "n")?,
                 ctx.principal,
                 &body,
+                &operation_id,
             )
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(
@@ -3714,6 +4232,54 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
 }
 
 #[cfg(test)]
+mod event_privacy_tests {
+    use super::*;
+    use myelin_identity::{DataRole, PrincipalStatus, RuntimeRef};
+    use myelin_tenancy::Region as IdRegion;
+
+    #[test]
+    fn production_refstore_context_scrubs_all_raw_agent_identifiers() {
+        let principal = Principal::new(
+            myelin_tenancy::TenantId("acme".into()),
+            IdRegion("fr-par".into()),
+            PrincipalId("agent:raw@example.test".into()),
+            PrincipalKind::Agent {
+                runtime_ref: RuntimeRef("runtime://raw-machine/session".into()),
+                on_behalf_of: Some(PrincipalId("person@example.test".into())),
+            },
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        );
+        let first = DurableGitBackend::emit_ctx("acme", "fr-par", &principal);
+        let second = DurableGitBackend::emit_ctx("acme", "fr-par", &principal);
+        assert_eq!(first.actor, second.actor, "the tenant pseudonym is stable");
+        assert_ne!(first.actor.0.principal_id, principal.principal_id);
+        let serialized = serde_json::to_string(&first.actor).unwrap();
+        for raw in [
+            "agent:raw@example.test",
+            "runtime://raw-machine/session",
+            "person@example.test",
+        ] {
+            assert!(!serialized.contains(raw), "raw Agent identifier leaked: {raw}");
+        }
+    }
+
+    #[test]
+    fn fork_import_diagnostics_are_sanitized_before_public_boundaries() {
+        let raw = DurableError::Git(
+            "failed to index /srv/tenants/acme/private-fork.git: object secretdeadbeef".into(),
+        );
+        let public = sanitize_fork_import_error(raw).to_string();
+        assert_eq!(
+            public,
+            "durable git op failed: fork commit import could not be completed"
+        );
+        assert!(!public.contains("/srv/tenants"));
+        assert!(!public.contains("secretdeadbeef"));
+    }
+}
+
+#[cfg(test)]
 mod create_compensation_tests {
     //! **R2.1a-followup, defect #7 — the create-fail compensation path.** `create_repo_as` writes
     //! the creator→admin grant BEFORE the on-disk `git init`; if the on-disk create then fails, the
@@ -4045,13 +4611,15 @@ mod pr_list_tests {
         let root = temp_root("cross-leak");
         // Viewer is granted `read` on `alpha` only; `beta` is invisible to them.
         let authz = GrantBackedRepos::new().grant_read("u:viewer", TENANT, "alpha");
-        let be =
-            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
+        let be = DurableGitBackend::rooted_inmem_for_test(&root);
         let viewer = human("u:viewer");
         // The viewer AUTHORS a PR in BOTH repos (so the bucket predicate `yours` WOULD match beta if
         // the prefilter leaked).
         open_pr(&be, "alpha", "Alpha change", &viewer);
         open_pr(&be, "beta", "Beta change (forbidden repo)", &viewer);
+        // Install the visibility boundary after seeding: production open checks Pull on the exact
+        // source repo, while this test is specifically about the subsequent cross-repo read filter.
+        let be = be.with_repo_authorizer(Arc::new(authz));
 
         let handler = DMyPrs { be: Arc::new(be) };
         let body = serve(&handler, &viewer, None, "bucket=yours");

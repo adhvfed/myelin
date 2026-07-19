@@ -26,10 +26,10 @@
 use myelin_config::Mode;
 use myelin_edge::{
     bootstrap_principal_and_mint, register_git_durable, register_git_wire, register_issues,
-    serve_edge, spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig,
-    AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer, DurableGitBackend,
-    Gateway, IssueReconciliationConfig, Method, StoreBackedIssueAuthorizer, TupleRepoBootstrap,
-    WhoamiHandler,
+    recover_placed_git_at_boot, serve_edge, spawn_issue_authorization_reconciler, AuthProvider,
+    AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
+    DurableGitBackend, Gateway, IssueReconciliationConfig, Method, StoreBackedIssueAuthorizer,
+    TupleRepoBootstrap, WhoamiHandler,
 };
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{FragmentAdmit, Principal, PrincipalId, PrincipalKind, RevokeTarget};
@@ -65,6 +65,7 @@ struct ComposedCore {
     provider: SubstrateProvider,
     kms: Arc<KmsEngine>,
     cell: Arc<CellTokenAuthority>,
+    cell_id: String,
     handle: tokio::runtime::Handle,
 }
 
@@ -114,6 +115,27 @@ async fn compose_core() -> ComposedCore {
         eprintln!("edge: cannot apply the Issues authorization-saga migrations: {e}");
         std::process::exit(1);
     }
+    if let Err(e) = bootstrap
+        .migrate(
+            &myelin_git::pg_pr_store::git_pr_migrations(),
+            &myelin_git::pg_pr_store::git_pr_hot_tables(),
+        )
+        .await
+    {
+        eprintln!("edge: cannot apply the Git PR lifecycle migrations: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = bootstrap.verify_index_ready("git_pr_head_repo_idx").await {
+        eprintln!("edge: Git PR provenance index is not ready: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = bootstrap
+        .verify_index_ready("git_pr_command_operation_scope_uidx")
+        .await
+    {
+        eprintln!("edge: Git PR operation-scope index is not ready: {e}");
+        std::process::exit(1);
+    }
     // Re-probe the constrained role, close the migration pool, and erase the migration DSN before
     // constructing the KMS, token authority, outbox, identity, or ReBAC runtime stores.
     let provider = match bootstrap.into_runtime().await {
@@ -153,7 +175,7 @@ async fn compose_core() -> ComposedCore {
     // `CellTokenAuthority::generate()` — a token minted before a restart now verifies after it. A wrong/
     // absent seal key (a sealed root that does not unseal) is fail-closed and NEVER a fresh root (that
     // would orphan every token ever minted under the old root).
-    let cell_backing = DurableCellRootBacking::new(provider.db_pool().clone(), cell_id);
+    let cell_backing = DurableCellRootBacking::new(provider.db_pool().clone(), cell_id.clone());
     let cell_material = match cell_backing.load_or_generate(&seal_key).await {
         Ok(m) => m,
         Err(e) => {
@@ -174,6 +196,7 @@ async fn compose_core() -> ComposedCore {
         provider,
         kms,
         cell,
+        cell_id,
         handle,
     }
 }
@@ -207,6 +230,7 @@ async fn serve(core: ComposedCore) {
         provider,
         kms,
         cell,
+        cell_id,
         handle,
     } = core;
 
@@ -357,9 +381,33 @@ async fn serve(core: ComposedCore) {
             .into()
     });
     let git_backend = Arc::new(
-        DurableGitBackend::rooted(git_root, git_outbox, git_minter)
-            .with_repo_authorizer(repo_authz)
-            .with_repo_bootstrap(repo_bootstrap),
+        DurableGitBackend::rooted(
+            git_root,
+            provider.clone(),
+            kms.clone(),
+            handle.clone(),
+            git_outbox,
+            git_minter,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("edge: PostgreSQL Git PR store refused to construct: {error}");
+            std::process::exit(1);
+        })
+        .with_repo_authorizer(repo_authz)
+        .with_repo_bootstrap(repo_bootstrap),
+    );
+    let recovery = recover_placed_git_at_boot(&git_backend, &provider, &cell_id)
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("edge: durable Git boot recovery failed: {error}");
+            std::process::exit(1);
+        });
+    eprintln!(
+        "edge: Git recovery complete (tenants={}, repos={}, refs={}, merges={})",
+        recovery.tenants_recovered,
+        recovery.repos_reconciled,
+        recovery.refs_reapplied,
+        recovery.merges_recovered
     );
 
     // R2.6 — the action-level allowlist gate + the DEFAULT operator-token scheme (R4.0: `agent`).
@@ -429,6 +477,7 @@ async fn operator_bootstrap(core: ComposedCore, args: &[String]) {
         kms,
         cell,
         handle,
+        ..
     } = core;
 
     let tenant = required_flag(args, "--tenant");

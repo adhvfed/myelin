@@ -17,6 +17,12 @@ fn production_main_destroys_the_privileged_pool_before_runtime_stores_and_bind()
     let issues = source
         .find("&myelin_issues::issues_migrations()")
         .expect("Issues saga schema must run through PgBootstrap");
+    let head_index = source
+        .find("verify_index_ready(\"git_pr_head_repo_idx\")")
+        .expect("Git PR provenance index must be ready before serving");
+    let operation_index = source
+        .find("verify_index_ready(\"git_pr_command_operation_scope_uidx\")")
+        .expect("Git PR operation namespace index must be ready before serving");
     let handoff = source
         .find("bootstrap.into_runtime()")
         .expect("bootstrap must be consumed by the runtime handoff");
@@ -29,7 +35,9 @@ fn production_main_destroys_the_privileged_pool_before_runtime_stores_and_bind()
 
     assert!(foundation < durable);
     assert!(durable < issues);
-    assert!(issues < handoff);
+    assert!(issues < head_index);
+    assert!(head_index < operation_index);
+    assert!(operation_index < handoff);
     assert!(handoff < first_runtime_store);
     assert!(handoff < bind);
 }

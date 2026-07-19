@@ -158,6 +158,24 @@ impl myelin_events::DurableOutboxBacking for PgOutboxBacking {
         self.block(async { self.relay().committed_live_rows().await.unwrap_or_default() })
     }
 
+    fn try_committed_rows(&self) -> Result<Vec<OutboxRow>> {
+        self.block(async {
+            self.relay()
+                .committed_live_rows()
+                .await
+                .map_err(|e| OutboxError(e.to_string()))
+        })
+    }
+
+    fn try_retained_rows(&self) -> Result<Vec<OutboxRow>> {
+        self.block(async {
+            self.relay()
+                .retained_rows()
+                .await
+                .map_err(|e| OutboxError(e.to_string()))
+        })
+    }
+
     fn dead_letters(&self) -> Vec<OutboxRow> {
         self.block(async { self.relay().dead_rows().await.unwrap_or_default() })
     }

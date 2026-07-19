@@ -1155,6 +1155,19 @@ impl PgRelay {
         rows.iter().map(row_from_pg).collect()
     }
 
+    /// Snapshot every retained outbox witness, including terminal dead letters. This query is the
+    /// load-bearing recovery view; unlike `committed_live_rows` it deliberately has no live-set
+    /// predicate, while preserving the same per-aggregate commit ordering.
+    pub async fn retained_rows(&self) -> Result<Vec<OutboxRow>, PgError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {ROW_PROJECTION} FROM outbox ORDER BY aggregate ASC, seq ASC"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        rows.iter().map(row_from_pg).collect()
+    }
+
     /// Snapshot the dead-lettered rows (retained, not deleted — parity with the in-memory
     /// `dead_letters()` snapshot).
     pub async fn dead_rows(&self) -> Result<Vec<OutboxRow>, PgError> {

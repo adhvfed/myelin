@@ -38,6 +38,7 @@
 //! The smart-transport WIRE (`clone`/`push` over the network) is **GT-006** (sandbox-gated) — NOT
 //! this module. This is the durable STORAGE the wire (and the API/UI/CLI) will sit on.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::core::{Oid, RepoLoc};
@@ -433,6 +434,58 @@ impl DurableGitRepo {
         let repo = self.open_git()?;
         let oid = repo.blob(bytes).map_err(|e| git_err("write blob", e))?;
         Ok(Oid::new(oid.to_string()))
+    }
+
+    /// Import the complete object closure reachable from `locked_head` out of another durable
+    /// repository into this repository's ODB.
+    ///
+    /// This is the fork-merge object boundary: PR metadata may lock a head that lives in a distinct
+    /// source repository, while the eventual target ref may only name objects present in the target
+    /// ODB.  Libgit2 builds a self-contained pack from the exact locked commit (no source refs are
+    /// copied), then its verified indexer installs that pack in the target. Passing no target ODB to
+    /// the indexer deliberately rejects thin packs whose delta bases are absent from the pack.
+    pub fn import_commit_closure_from(
+        &self,
+        source: &DurableGitRepo,
+        locked_head: &Oid,
+    ) -> Result<(), DurableError> {
+        let source_git = source.open_git()?;
+        let head = Self::parse_oid(locked_head)?;
+        source_git
+            .find_commit(head)
+            .map_err(|e| git_err("locked fork head is not a source commit", e))?;
+
+        let mut pack = source_git
+            .packbuilder()
+            .map_err(|e| git_err("create fork import pack", e))?;
+        let mut walk = source_git
+            .revwalk()
+            .map_err(|e| git_err("create locked fork ancestry walk", e))?;
+        walk.push(head)
+            .map_err(|e| git_err("start locked fork ancestry walk", e))?;
+        pack.insert_walk(&mut walk)
+            .map_err(|e| git_err("pack locked fork commit closure", e))?;
+        let mut bytes = git2::Buf::new();
+        pack.write_buf(&mut bytes)
+            .map_err(|e| git_err("write fork import pack", e))?;
+
+        let pack_dir = self.path.join("objects").join("pack");
+        std::fs::create_dir_all(&pack_dir)
+            .map_err(|e| DurableError::Io(format!("mkdir {}: {e}", pack_dir.display())))?;
+        let mut indexer = git2::Indexer::new(None, &pack_dir, 0, true)
+            .map_err(|e| git_err("create verified non-thin fork pack indexer", e))?;
+        indexer
+            .write_all(bytes.as_ref())
+            .map_err(|e| DurableError::Io(format!("install fork import pack: {e}")))?;
+        indexer
+            .commit()
+            .map_err(|e| git_err("verify and commit fork import pack", e))?;
+
+        // Reopen after installation so verification cannot be satisfied by a stale ODB cache.
+        self.open_git()?
+            .find_commit(head)
+            .map_err(|e| git_err("verify imported fork head in target ODB", e))?;
+        Ok(())
     }
 
     /// Write a tree from `(name, blob_oid)` entries (regular-file mode `0o100644`) into the odb,
@@ -2030,6 +2083,63 @@ mod tests {
             repo2.list_refs().expect("list"),
             vec![("refs/heads/main".to_string(), commit)]
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A fork PR's locked head can live in a physically distinct bare repository. Importing it
+    /// installs the full commit/tree/blob ancestry in the target ODB without copying any source ref.
+    #[test]
+    fn fork_import_moves_verified_commit_closure_without_source_refs() {
+        let root = temp_root("fork-import");
+        let store = DurableGitStore::rooted(&root);
+        let source_loc = RepoLoc::new("acme", "fr-par", "contributor-fork");
+        let target_loc = RepoLoc::new("acme", "fr-par", "core");
+        let source = store.create_repo(&source_loc).expect("create source");
+        let target = store.create_repo(&target_loc).expect("create target");
+        assert_ne!(source.path(), target.path(), "the proof must use distinct ODBs");
+
+        let parent = seed_commit(&source, b"parent from fork\n");
+        let child_blob = source.write_blob(b"locked fork head\n").expect("child blob");
+        let child_tree = source
+            .write_tree(&[("file.txt", &child_blob)])
+            .expect("child tree");
+        let child = source
+            .write_commit(
+                &child_tree,
+                &[&parent],
+                "feat: fork head",
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
+            .expect("child commit");
+        source
+            .update_ref_cas(
+                "refs/heads/contributor/change",
+                None,
+                Some(&child),
+                "seed source branch",
+                "psn@acme.noreply",
+            )
+            .expect("source ref");
+
+        assert!(!target.has_object(&child));
+        assert!(!target.has_object(&parent));
+        target
+            .import_commit_closure_from(&source, &child)
+            .expect("verified non-thin import");
+
+        assert!(target.object_is_commit(&child), "locked head imported");
+        assert!(target.object_is_commit(&parent), "parent ancestry imported");
+        assert!(target.has_object(&child_blob), "referenced tree/blob closure imported");
+        assert_eq!(
+            target
+                .read_ref("refs/heads/contributor/change")
+                .expect("target ref read"),
+            None,
+            "object import must not copy or create source refs"
+        );
+        assert!(target.commit_tree_complete(&child).expect("target connectivity"));
 
         std::fs::remove_dir_all(&root).ok();
     }

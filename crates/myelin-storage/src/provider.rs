@@ -104,6 +104,9 @@ pub enum BootstrapError {
     RuntimeConnect,
     /// PostgreSQL role/server metadata could not be inspected.
     ValidationProbe,
+    /// A store requiring the constrained serving capability received a provider that did not pass
+    /// the split-role runtime handoff.
+    RuntimeCapabilityUnvalidated,
     /// Runtime and migration credentials did not reach the same database/server/schema identity.
     DatabaseIdentityMismatch,
     /// Both credentials authenticate as the same PostgreSQL role.
@@ -141,6 +144,9 @@ impl core::fmt::Display for BootstrapError {
             BootstrapError::MigrationConnect => "migration database connection failed",
             BootstrapError::RuntimeConnect => "runtime database connection failed",
             BootstrapError::ValidationProbe => "database role validation probe failed",
+            BootstrapError::RuntimeCapabilityUnvalidated => {
+                "database provider lacks validated constrained-runtime capability"
+            }
             BootstrapError::DatabaseIdentityMismatch => {
                 "runtime and migration connections target different database identities"
             }
@@ -538,6 +544,28 @@ impl PgBootstrap {
         .await
     }
 
+    /// Verify a concurrently-created index reached PostgreSQL's usable state before privileged
+    /// bootstrap is destroyed. An interrupted concurrent build can leave an index relation present
+    /// but `indisvalid=false`/`indisready=false`; `IF NOT EXISTS` alone would silently accept it.
+    pub async fn verify_index_ready(&self, index_name: &str) -> Result<(), ProviderError> {
+        let ready: Option<bool> = sqlx::query_scalar(
+            "SELECT i.indisvalid AND i.indisready
+               FROM pg_index i
+               JOIN pg_class c ON c.oid = i.indexrelid
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = current_schema() AND c.relname = $1",
+        )
+        .bind(index_name)
+        .fetch_optional(&self.migration_pool)
+        .await
+        .map_err(|_| BootstrapError::ValidationProbe)?;
+        if ready == Some(true) {
+            Ok(())
+        } else {
+            Err(BootstrapError::ValidationProbe.into())
+        }
+    }
+
     /// Consume bootstrap state and return the constrained serving provider. The privileged pool is
     /// closed before this function returns, and its credential is erased from the retained config.
     pub async fn into_runtime(self) -> Result<SubstrateProvider, ProviderError> {
@@ -567,6 +595,7 @@ impl PgBootstrap {
         Ok(SubstrateProvider {
             pool: runtime_pool,
             config: runtime_config,
+            runtime_role_validated: true,
         })
     }
 }
@@ -577,6 +606,7 @@ impl PgBootstrap {
 pub struct SubstrateProvider {
     pool: PgPool,
     config: MyelinConfig,
+    runtime_role_validated: bool,
 }
 
 impl SubstrateProvider {
@@ -593,7 +623,11 @@ impl SubstrateProvider {
             DEFAULT_MAX_CONNECTIONS,
         )
         .await?;
-        Ok(SubstrateProvider { pool, config })
+        Ok(SubstrateProvider {
+            pool,
+            config,
+            runtime_role_validated: false,
+        })
     }
 
     /// Build the provider over an EXPLICIT config + pool size (the test seam — e.g. the admin role
@@ -605,7 +639,11 @@ impl SubstrateProvider {
     ) -> Result<SubstrateProvider, ProviderError> {
         let pool =
             connect_pool_with_reset(&config.database_url, &config.region, max_connections).await?;
-        Ok(SubstrateProvider { pool, config })
+        Ok(SubstrateProvider {
+            pool,
+            config,
+            runtime_role_validated: false,
+        })
     }
 
     /// **Run migrations at startup (deliverable A — the SI-010 fix wired into the boot path).**
@@ -643,6 +681,17 @@ impl SubstrateProvider {
     /// The env-driven config (so a store can read the `region` pin / S3 / Redis endpoints).
     pub fn config(&self) -> &MyelinConfig {
         &self.config
+    }
+
+    /// Prove this provider was minted by the split-role handoff after the runtime role passed the
+    /// NOSUPERUSER/NOBYPASSRLS/no-admin capability probes. Direct `connect`/`from_env` providers are
+    /// deliberately rejected by stores whose RLS boundary is security-critical.
+    pub fn require_validated_runtime(&self) -> Result<(), ProviderError> {
+        if self.runtime_role_validated {
+            Ok(())
+        } else {
+            Err(BootstrapError::RuntimeCapabilityUnvalidated.into())
+        }
     }
 
     /// **The tenant-scoped-transaction convention (deliverable C), bound to this provider's pool.**

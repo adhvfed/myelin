@@ -48,7 +48,7 @@ pub struct PullRequest {
         basis = Contract,
         retention = TenantPolicy,
         erasure = CryptoShred(subject_dek),
-        subject_locator = "author_pseudonym",
+        subject_locator = "author_subject_id",
     )]
     pub pr_title: String,
     /// PR body markdown — ENCRYPTED under the per-subject DEK (contract 11.4). Tagged Content /
@@ -59,7 +59,7 @@ pub struct PullRequest {
         basis = Contract,
         retention = TenantPolicy,
         erasure = CryptoShred(subject_dek),
-        subject_locator = "author_pseudonym",
+        subject_locator = "author_subject_id",
     )]
     pub pr_body: Vec<u8>,
     /// the PR author's OPAQUE pseudonym (GIT-1, contract 4.8) — never a raw name/email. Tagged
@@ -74,6 +74,16 @@ pub struct PullRequest {
         subject_locator = "author_pseudonym",
     )]
     pub author_pseudonym: String,
+    /// Canonical opaque stable principal id used by DSR location and per-subject DEK selection.
+    #[personal_data(
+        category = Identifier,
+        role = TenantContent,
+        basis = Contract,
+        retention = UntilContractEnd,
+        erasure = Pseudonymise,
+        subject_locator = "author_subject_id",
+    )]
+    pub author_subject_id: String,
 }
 
 /// The `review` row (architecture §4.3). Skeletal tag-carrier.
@@ -176,6 +186,7 @@ mod tests {
             pr_title: "fix the bug".into(),
             pr_body: b"please review".to_vec(),
             author_pseudonym: "psn:abc".into(),
+            author_subject_id: "principal-abc".into(),
         };
         assert_eq!(pr.pr_number, 42);
         assert_eq!(pr.author_pseudonym, "psn:abc");
