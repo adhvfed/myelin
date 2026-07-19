@@ -263,6 +263,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent_spend;
+pub mod api;
 pub mod app;
 pub mod board_sync;
 pub mod ci_guard;
