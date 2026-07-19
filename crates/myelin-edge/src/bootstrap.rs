@@ -151,14 +151,19 @@ pub fn bootstrap_principal_and_mint(
 
     // The verified `(tenant, region)` write scope. The only TenantScope constructor is
     // `from_verified_token`, so a scope from a path is structurally impossible — we mint a minimal
-    // verified admin principal carrying the operator-supplied tenant (this is the operator plane; the
-    // trust boundary is the seal key + DB creds, stated in the module docs).
-    let operator = Principal::stub(
+    // verified operator principal carrying the exact operator-supplied tenant AND region (this is
+    // the operator plane; the trust boundary is the seal key + DB creds, stated in the module docs).
+    // Do not use the stub constructor: its default region would make durable event attribution
+    // disagree with the scope and token whenever bootstrap targets a non-default region.
+    let operator = Principal::new(
+        TenantId(params.tenant.to_string()),
+        Region(params.region.to_string()),
         PrincipalId("bootstrap-operator".into()),
         PrincipalKind::Human,
-        TenantId(params.tenant.to_string()),
+        DataRole::Controller,
+        PrincipalStatus::Active,
     );
-    let scope = TenantScope::from_verified_token(&operator, Region(params.region.to_string()));
+    let scope = TenantScope::from_verified_token(&operator, operator.region.clone());
     let pid = PrincipalId(params.principal.to_string());
 
     // (1) Idempotent upsert of the Human principal. A display name (optional) is sealed under the
@@ -287,10 +292,13 @@ mod tests {
 
     fn scope() -> TenantScope {
         TenantScope::from_verified_token(
-            &Principal::stub(
+            &Principal::new(
+                TenantId("acme".into()),
+                Region("fr-par".into()),
                 PrincipalId("bootstrap-test".into()),
                 PrincipalKind::Human,
-                TenantId("acme".into()),
+                DataRole::Controller,
+                PrincipalStatus::Active,
             ),
             Region("fr-par".into()),
         )
@@ -344,6 +352,10 @@ mod tests {
         );
         assert!(events.iter().all(|row| {
             row.envelope.actor.0.principal_id.0 == "bootstrap-operator"
+                && row.envelope.actor.0.tenant.as_str() == "acme"
+                && row.envelope.actor.0.region.as_str() == "fr-par"
+                && row.envelope.tenant.as_str() == "acme"
+                && row.envelope.region.as_str() == "fr-par"
                 && row.envelope.actor.0.principal_id.0 != edges[0].tuple.subject.0
         }));
     }

@@ -9,13 +9,12 @@ use hyper_util::rt::TokioIo;
 use myelin_config::{Mode, MyelinConfig};
 use myelin_edge::issue_authz::reconcile_pending_issue_authorizations;
 use myelin_edge::{
-    register_issues, serve_edge, AuthenticatedActionPolicy, Gateway, StoreBackedIssueAuthorizer,
-    MAX_ISSUE_JSON_BYTES,
+    bootstrap_principal_and_mint, register_issues, serve_edge, AuthenticatedActionPolicy,
+    BootstrapParams, Gateway, StoreBackedIssueAuthorizer, MAX_ISSUE_JSON_BYTES,
 };
-use myelin_events::Timestamp;
+use myelin_events::EventEnvelope;
 use myelin_identity::{
-    DataRole, FragmentAdmit, ObjectId, Principal, PrincipalId, PrincipalKind, PrincipalStatus,
-    RelName, RelationTuple, TupleDelta,
+    DataRole, FragmentAdmit, Principal, PrincipalId, PrincipalKind, PrincipalStatus,
 };
 use myelin_identity_service::{
     CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
@@ -215,29 +214,38 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     for verdict in check.admit_issue_fragment() {
         assert!(matches!(verdict, FragmentAdmit::Admitted { .. }));
     }
-    let creator_scope = TenantScope::from_verified_token(&creator, creator.region.clone());
-    let tuples_for_seed = tuples.clone();
-    let creator_for_seed = creator.clone();
-    tokio::task::spawn_blocking(move || {
-        tuples_for_seed.write_tuples(
-            &creator_scope,
-            &creator_for_seed,
-            &[TupleDelta::Add(RelationTuple {
-                object: ObjectId(format!("project:{PROJECT_ID}")),
-                relation: RelName("reader".into()),
-                subject: creator_for_seed.principal_id.clone(),
-                caveat: None,
-            })],
-            None,
-            None,
-            Timestamp("2026-07-18T00:00:00Z".into()),
+    let kms = Arc::new(KmsEngine::new());
+    let cell = Arc::new(CellTokenAuthority::from_seed(&[7u8; 32], &[9u8; 32]).unwrap());
+    let directory = PrincipalStore::new(kms.clone());
+
+    // Drive the production bootstrap body instead of manually seeding the project tuple. This one
+    // call provisions the login, writes the exact durable project reader edge, and mints the token
+    // that drives the complete authenticated founder lifecycle below.
+    let bootstrap_directory = directory.clone();
+    let bootstrap_tuples = tuples.clone();
+    let bootstrap_cell = cell.clone();
+    let bootstrap_tenant = tenant.clone();
+    let bootstrap_principal = creator.principal_id.0.clone();
+    let bootstrap_outcome = tokio::task::spawn_blocking(move || {
+        bootstrap_principal_and_mint(
+            &bootstrap_directory,
+            &bootstrap_tuples,
+            &bootstrap_cell,
+            &BootstrapParams {
+                tenant: &bootstrap_tenant,
+                region: REGION,
+                principal: &bootstrap_principal,
+                issues_project: PROJECT_ID,
+                display: None,
+                ttl_days: 1,
+            },
+            now(),
         )
     })
     .await
     .unwrap()
-    .unwrap();
+    .expect("production bootstrap grants project reader and mints creator token");
 
-    let kms = Arc::new(KmsEngine::new());
     let issue_authorizer = StoreBackedIssueAuthorizer::new(check.clone());
     let issue_store = Arc::new(PgIssueStore::new(
         provider.clone(),
@@ -245,9 +253,6 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
         issue_authorizer.clone(),
     ));
 
-    let cell = CellTokenAuthority::from_seed(&[7u8; 32], &[9u8; 32]).unwrap();
-    let directory = PrincipalStore::new(kms.clone());
-    seed_login(&directory, &creator, "creator-subject");
     seed_login(&directory, &intruder, "intruder-subject");
     seed_login(&directory, &foreign, "foreign-subject");
     let authn = Arc::new(CapabilityAuthenticator::with_verifier(
@@ -270,7 +275,7 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     let gateway = Arc::new(builder.build());
     let address = spawn(gateway).await;
 
-    let creator_token = mint(&cell, &creator, "creator-subject", "issues-creator");
+    let creator_token = bootstrap_outcome.token;
     let intruder_token = mint(&cell, &intruder, "intruder-subject", "issues-intruder");
     let foreign_token = mint(&cell, &foreign, "foreign-subject", "issues-foreign");
 
@@ -352,6 +357,20 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
         .connect(&admin_url())
         .await
         .unwrap();
+    let bootstrap_event_json: serde_json::Value = sqlx::query_scalar(
+        "SELECT envelope FROM outbox WHERE aggregate = $1 AND envelope->>'type_' = $2",
+    )
+    .bind(format!("iam:tuple:{tenant}:project:{PROJECT_ID}"))
+    .bind(myelin_identity::IAM_TUPLE_WRITTEN)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    let bootstrap_event: EventEnvelope = serde_json::from_value(bootstrap_event_json).unwrap();
+    assert_eq!(bootstrap_event.actor.0.principal_id.0, "bootstrap-operator");
+    assert_eq!(bootstrap_event.actor.0.tenant.as_str(), tenant);
+    assert_eq!(bootstrap_event.actor.0.region.as_str(), REGION);
+    assert_eq!(bootstrap_event.tenant.as_str(), tenant);
+    assert_eq!(bootstrap_event.region.as_str(), REGION);
     sqlx::query("DELETE FROM authz_projection_state WHERE tenant_id = $1 AND region = $2")
         .bind(&tenant)
         .bind(REGION)
