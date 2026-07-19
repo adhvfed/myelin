@@ -382,18 +382,71 @@ fn classify_delivery_body(
     }
 }
 
-fn allocate_delivery_token(sequence: &AtomicU64) -> DeliveryToken {
-    DeliveryToken(sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1))
+fn allocate_delivery_token(sequence: &AtomicU64) -> Result<DeliveryToken, TransportError> {
+    let previous = sequence
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+        .map_err(|_| TransportError("delivery token space exhausted".into()))?;
+    DeliveryToken::new(previous + 1)
+        .ok_or_else(|| TransportError("delivery token allocation failed".into()))
 }
 
-fn retain_on_settlement_failure<T>(
-    pending: &Mutex<HashMap<DeliveryToken, T>>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettlementIntent {
+    Ack,
+    Retry(u64),
+    Terminate,
+}
+
+struct QueuedSettlement<T> {
+    handle: T,
+    intent: SettlementIntent,
+}
+
+fn queue_on_settlement_failure<T>(
+    retries: &Mutex<HashMap<DeliveryToken, QueuedSettlement<T>>>,
     token: DeliveryToken,
     retained: T,
+    intent: SettlementIntent,
     result: &Result<(), TransportError>,
 ) {
     if result.is_err() {
-        pending.lock().unwrap_or_else(|e| e.into_inner()).insert(token, retained);
+        retries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                token,
+                QueuedSettlement {
+                    handle: retained,
+                    intent,
+                },
+            );
+    }
+}
+
+fn drain_queued_settlements<T: Clone>(
+    retries: &Mutex<HashMap<DeliveryToken, QueuedSettlement<T>>>,
+    mut settle: impl FnMut(T, SettlementIntent) -> Result<(), TransportError>,
+) -> Result<(), TransportError> {
+    loop {
+        let next = {
+            let retries = retries.lock().unwrap_or_else(|e| e.into_inner());
+            retries
+                .iter()
+                .next()
+                .map(|(token, queued)| (*token, queued.handle.clone(), queued.intent))
+        };
+        let Some((token, handle, intent)) = next else {
+            return Ok(());
+        };
+        if settle(handle, intent).is_err() {
+            return Err(TransportError(
+                "broker settlement retry remains unresolved".into(),
+            ));
+        }
+        retries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&token);
     }
 }
 
@@ -556,20 +609,69 @@ mod routing_tests {
     #[test]
     fn duplicate_event_ids_still_receive_distinct_opaque_settlement_tokens() {
         let sequence = AtomicU64::new(0);
-        let first = allocate_delivery_token(&sequence);
-        let second = allocate_delivery_token(&sequence);
+        let first = allocate_delivery_token(&sequence).unwrap();
+        let second = allocate_delivery_token(&sequence).unwrap();
         assert_ne!(first, second);
         let pending = HashMap::from([(first, "handle-a"), (second, "handle-b")]);
         assert_eq!(pending.len(), 2, "duplicate payload identity cannot collide handles");
     }
 
     #[test]
-    fn settlement_failure_reinserts_the_exact_token_handle() {
-        let token = DeliveryToken(7);
-        let pending = Mutex::new(HashMap::new());
+    fn delivery_token_exhaustion_fails_closed_instead_of_wrapping() {
+        let sequence = AtomicU64::new(u64::MAX - 1);
+        assert!(allocate_delivery_token(&sequence).is_ok());
+        assert_eq!(
+            allocate_delivery_token(&sequence),
+            Err(TransportError("delivery token space exhausted".into()))
+        );
+    }
+
+    #[test]
+    fn failed_settlement_is_retained_exactly_and_gates_until_retry_succeeds() {
+        let token = DeliveryToken::new(7).unwrap();
+        let retries = Mutex::new(HashMap::new());
         let failure = Err(TransportError("fixed settlement failure".into()));
-        retain_on_settlement_failure(&pending, token, "raw-handle", &failure);
-        assert_eq!(pending.lock().unwrap().get(&token), Some(&"raw-handle"));
+        queue_on_settlement_failure(
+            &retries,
+            token,
+            "raw-handle",
+            SettlementIntent::Retry(9),
+            &failure,
+        );
+
+        let first = drain_queued_settlements(&retries, |handle, intent| {
+            assert_eq!(handle, "raw-handle");
+            assert_eq!(intent, SettlementIntent::Retry(9));
+            Err(TransportError("still down".into()))
+        });
+        assert_eq!(
+            first,
+            Err(TransportError(
+                "broker settlement retry remains unresolved".into()
+            ))
+        );
+        assert_eq!(retries.lock().unwrap().len(), 1, "failed retry remains gated");
+
+        drain_queued_settlements(&retries, |handle, intent| {
+            assert_eq!(handle, "raw-handle");
+            assert_eq!(intent, SettlementIntent::Retry(9));
+            Ok(())
+        })
+        .unwrap();
+        assert!(retries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn successful_settlement_never_enters_the_retry_queue() {
+        let retries = Mutex::new(HashMap::new());
+        queue_on_settlement_failure(
+            &retries,
+            DeliveryToken::new(3).unwrap(),
+            "settled-handle",
+            SettlementIntent::Ack,
+            &Ok(()),
+        );
+        assert!(retries.lock().unwrap().is_empty());
     }
 }
 
@@ -585,6 +687,12 @@ pub struct NatsJetStreamBus {
     /// Raw handles are keyed only by opaque process-local delivery token. Event ids are payload
     /// data and cannot identify malformed messages or distinguish duplicate-id deliveries.
     pending: Mutex<HashMap<DeliveryToken, jetstream::Message>>,
+    /// Exact failed settlement handles plus their intended ACK/NAK/TERM operation. This queue is
+    /// drained before another pull, so its size is bounded by the broker's admitted pending window.
+    settlement_retries: Mutex<HashMap<DeliveryToken, QueuedSettlement<jetstream::Message>>>,
+    /// Serializes pulls and settlement transitions. In production the pump is single-threaded;
+    /// this also prevents accidental concurrent callers from racing the retry-before-pull gate.
+    intake_gate: Mutex<()>,
     next_delivery_token: AtomicU64,
     /// Compatibility lookup for the legacy `BusTransport` surface. The production
     /// [`crate::relay::EventConsumer`] path settles directly by token.
@@ -686,6 +794,8 @@ impl NatsJetStreamBus {
             max_expires: config.max_expires,
             rt,
             pending: Mutex::new(HashMap::new()),
+            settlement_retries: Mutex::new(HashMap::new()),
+            intake_gate: Mutex::new(()),
             next_delivery_token: AtomicU64::new(0),
             legacy_tokens: Mutex::new(HashMap::new()),
         })
@@ -712,6 +822,8 @@ impl NatsJetStreamBus {
     }
 
     fn try_consume(&self) -> Result<Vec<BrokerDelivery>, TransportError> {
+        let _intake = self.intake_gate.lock().unwrap_or_else(|e| e.into_inner());
+        self.drain_settlement_retries()?;
         let consumer_name = self.consumer_name.clone();
         let stream_name = self.stream_name.clone();
         let msgs: Vec<jetstream::Message> = self.block(async {
@@ -740,7 +852,7 @@ impl NatsJetStreamBus {
 
         let mut decoded = Vec::with_capacity(msgs.len());
         for msg in msgs {
-            let token = allocate_delivery_token(&self.next_delivery_token);
+            let token = allocate_delivery_token(&self.next_delivery_token)?;
             let classify = msg.clone();
             // Insert the raw handle before any fallible metadata/decode/routing operation.
             self.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(token, msg);
@@ -782,43 +894,74 @@ impl NatsJetStreamBus {
     }
 
     fn take_pending(&self, token: DeliveryToken) -> Result<jetstream::Message, TransportError> {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&token)
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&token)
             .ok_or_else(|| TransportError("no pending JetStream delivery for token".into()))
     }
 
-    fn try_ack(&self, token: DeliveryToken) -> Result<(), TransportError> {
-        let msg = self.take_pending(token)?;
-        let retained = msg.clone();
-        let result = self.block(async {
-            // Wait for the JetStream acknowledgement-of-ack before reporting success. A plain
-            // publish-only ack can be lost if the process exits immediately after this method.
-            msg.double_ack().await.map_err(|_| TransportError("broker ACK failed".into()))
-        });
-        retain_on_settlement_failure(&self.pending, token, retained, &result);
+    fn settle_message(
+        &self,
+        message: jetstream::Message,
+        intent: SettlementIntent,
+    ) -> Result<(), TransportError> {
+        match intent {
+            SettlementIntent::Ack => self.block(async {
+                // Wait for the server's acknowledgement-of-ack. If that response is uncertain,
+                // the exact handle and ACK intent remain queued for retry before new intake.
+                message
+                    .double_ack()
+                    .await
+                    .map_err(|_| TransportError("broker ACK failed".into()))
+            }),
+            SettlementIntent::Retry(delay_secs) => {
+                let delay = std::time::Duration::from_secs(delay_secs.clamp(1, 300));
+                self.block(async {
+                    message
+                        .ack_with(AckKind::Nak(Some(delay)))
+                        .await
+                        .map_err(|_| TransportError("broker NAK failed".into()))
+                })
+            }
+            SettlementIntent::Terminate => self.block(async {
+                message
+                    .ack_with(AckKind::Term)
+                    .await
+                    .map_err(|_| TransportError("broker TERM failed".into()))
+            }),
+        }
+    }
+
+    fn drain_settlement_retries(&self) -> Result<(), TransportError> {
+        drain_queued_settlements(&self.settlement_retries, |message, intent| {
+            self.settle_message(message, intent)
+        })
+    }
+
+    fn try_settle(
+        &self,
+        token: DeliveryToken,
+        intent: SettlementIntent,
+    ) -> Result<(), TransportError> {
+        let _intake = self.intake_gate.lock().unwrap_or_else(|e| e.into_inner());
+        let message = self.take_pending(token)?;
+        let retained = message.clone();
+        let result = self.settle_message(message, intent);
+        queue_on_settlement_failure(&self.settlement_retries, token, retained, intent, &result);
         result
+    }
+
+    fn try_ack(&self, token: DeliveryToken) -> Result<(), TransportError> {
+        self.try_settle(token, SettlementIntent::Ack)
     }
 
     fn try_retry(&self, token: DeliveryToken, delay_secs: u64) -> Result<(), TransportError> {
-        let msg = self.take_pending(token)?;
-        let retained = msg.clone();
-        let delay = std::time::Duration::from_secs(delay_secs.clamp(1, 300));
-        let result = self.block(async {
-            msg.ack_with(AckKind::Nak(Some(delay))).await
-                .map_err(|_| TransportError("broker NAK failed".into()))
-        });
-        retain_on_settlement_failure(&self.pending, token, retained, &result);
-        result
+        self.try_settle(token, SettlementIntent::Retry(delay_secs.clamp(1, 300)))
     }
 
     fn try_terminate(&self, token: DeliveryToken) -> Result<(), TransportError> {
-        let msg = self.take_pending(token)?;
-        let retained = msg.clone();
-        let result = self.block(async {
-            msg.ack_with(AckKind::Term).await
-                .map_err(|_| TransportError("broker TERM failed".into()))
-        });
-        retain_on_settlement_failure(&self.pending, token, retained, &result);
-        result
+        self.try_settle(token, SettlementIntent::Terminate)
     }
 
     fn legacy_token(&self, event_id: &EventId) -> Result<DeliveryToken, TransportError> {
@@ -1030,14 +1173,7 @@ impl BusTransport for NatsJetStreamBus {
         // Explicit ack of the delivered message stashed by `consume` (at-least-once → the ack is
         // what makes it not redeliver). Acking an un-consumed / already-acked id is a no-op.
         if let Ok(token) = self.legacy_token(event_id) {
-            if self.try_ack(token).is_err() {
-                self.legacy_tokens
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .entry(event_id.0.clone())
-                    .or_default()
-                    .push_front(token);
-            }
+            let _ = self.try_ack(token);
         }
     }
 
@@ -1052,6 +1188,10 @@ impl BusTransport for NatsJetStreamBus {
             }
         });
         self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.settlement_retries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();

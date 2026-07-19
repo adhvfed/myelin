@@ -751,7 +751,9 @@ impl ServeHandle {
                 .consume("")
                 .into_iter()
                 .map(|envelope| myelin_events::BrokerDelivery {
-                    token: DeliveryToken(0),
+                    // Embedded delivery never crosses the external settlement seam, but the
+                    // shared shape still requires a well-formed opaque token.
+                    token: DeliveryToken::new(1).expect("one is a valid delivery token"),
                     broker_ref: None,
                     body: BrokerDeliveryBody::Event(Box::new(envelope)),
                     delivery_attempt: Some(1),
@@ -1252,6 +1254,10 @@ mod tests {
         bus.consume("").into_iter().next().unwrap()
     }
 
+    fn token(value: u64) -> DeliveryToken {
+        DeliveryToken::new(value).expect("test delivery token is non-zero")
+    }
+
     #[derive(Clone, Default)]
     struct PullProbe {
         state: Arc<Mutex<PullProbeState>>,
@@ -1280,7 +1286,7 @@ mod tests {
                                 .map(|envelope| {
                                     next_token += 1;
                                     myelin_events::BrokerDelivery {
-                                    token: DeliveryToken(next_token),
+                                    token: token(next_token),
                                     broker_ref: Some(myelin_events::BrokerDeliveryRef {
                                         stream: "TEST".into(),
                                         stream_sequence: next_token,
@@ -1305,7 +1311,7 @@ mod tests {
             Self {
                 state: Arc::new(Mutex::new(PullProbeState {
                     batches: [vec![myelin_events::BrokerDelivery {
-                        token: DeliveryToken(1),
+                        token: token(1),
                         broker_ref: Some(myelin_events::BrokerDeliveryRef {
                             stream: "TEST".into(),
                             stream_sequence: 1,
@@ -1722,7 +1728,7 @@ mod tests {
         handle.tick();
 
         assert!(probe.state().acks.is_empty());
-        assert_eq!(probe.state().terms, vec![DeliveryToken(1)]);
+        assert_eq!(probe.state().terms, vec![token(1)]);
         assert_eq!(
             quarantine.records.lock().unwrap()[0].1,
             DeliveryQuarantineReason::NoRegisteredConsumer
@@ -1736,7 +1742,7 @@ mod tests {
         let probe = PullProbe::default();
         probe.state().batches.push_back(vec![
             myelin_events::BrokerDelivery {
-                token: DeliveryToken(1),
+                token: token(1),
                 broker_ref: Some(myelin_events::BrokerDeliveryRef {
                     stream: "TEST".into(), stream_sequence: 1,
                 }),
@@ -1746,7 +1752,7 @@ mod tests {
                 delivery_attempt: Some(1),
             },
             myelin_events::BrokerDelivery {
-                token: DeliveryToken(2),
+                token: token(2),
                 broker_ref: Some(myelin_events::BrokerDeliveryRef {
                     stream: "TEST".into(), stream_sequence: 2,
                 }),
@@ -1763,8 +1769,8 @@ mod tests {
         handle.tick();
 
         assert_eq!(runs.load(Ordering::SeqCst), 1);
-        assert_eq!(probe.state().terms, vec![DeliveryToken(1)]);
-        assert_eq!(probe.state().acks, vec![DeliveryToken(2)]);
+        assert_eq!(probe.state().terms, vec![token(1)]);
+        assert_eq!(probe.state().acks, vec![token(2)]);
         assert_eq!(quarantine.records.lock().unwrap().len(), 1);
     }
 
@@ -1774,7 +1780,7 @@ mod tests {
         let probe = PullProbe::default();
         probe.state().batches.push_back(vec![
             myelin_events::BrokerDelivery {
-                token: DeliveryToken(1),
+                token: token(1),
                 broker_ref: Some(myelin_events::BrokerDeliveryRef {
                     stream: "TEST".into(), stream_sequence: 1,
                 }),
@@ -1784,7 +1790,7 @@ mod tests {
                 delivery_attempt: Some(1),
             },
             myelin_events::BrokerDelivery {
-                token: DeliveryToken(2),
+                token: token(2),
                 broker_ref: Some(myelin_events::BrokerDeliveryRef {
                     stream: "TEST".into(), stream_sequence: 2,
                 }),
@@ -1802,8 +1808,8 @@ mod tests {
         handle.tick();
 
         assert_eq!(runs.load(Ordering::SeqCst), 1);
-        assert_eq!(probe.state().retries, vec![DeliveryToken(1)]);
-        assert_eq!(probe.state().acks, vec![DeliveryToken(2)]);
+        assert_eq!(probe.state().retries, vec![token(1)]);
+        assert_eq!(probe.state().acks, vec![token(2)]);
         assert!(probe.state().terms.is_empty());
         assert!(!handle.metrics_health().readiness().is_ready(), "OLTP failure is unhealthy");
     }
@@ -1812,7 +1818,7 @@ mod tests {
     fn transient_metadata_fault_is_nak_only_and_never_quarantined() {
         let probe = PullProbe::default();
         probe.state().batches.push_back(vec![myelin_events::BrokerDelivery {
-            token: DeliveryToken(9),
+            token: token(9),
             broker_ref: None,
             body: BrokerDeliveryBody::TransientMetadataFault,
             delivery_attempt: None,
@@ -1824,7 +1830,7 @@ mod tests {
 
         handle.tick();
 
-        assert_eq!(probe.state().retries, vec![DeliveryToken(9)]);
+        assert_eq!(probe.state().retries, vec![token(9)]);
         assert!(probe.state().terms.is_empty());
         assert!(quarantine.records.lock().unwrap().is_empty());
     }
@@ -1847,10 +1853,10 @@ mod tests {
             probe.state().acks.is_empty(),
             "one Retry gates the broker ack"
         );
-        assert_eq!(probe.state().retries, vec![DeliveryToken(1)]);
+        assert_eq!(probe.state().retries, vec![token(1)]);
 
         handle.tick();
-        assert_eq!(probe.state().acks, vec![DeliveryToken(2)]);
+        assert_eq!(probe.state().acks, vec![token(2)]);
     }
 
     #[test]
@@ -1891,7 +1897,7 @@ mod tests {
             .clone();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].event_id, event_id);
-        assert_eq!(probe.state().terms, vec![DeliveryToken(1)]);
+        assert_eq!(probe.state().terms, vec![token(1)]);
         assert!(probe.state().acks.is_empty());
         assert_eq!(dedup.len(), 0, "retry exhaustion writes no dedup tombstone");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1938,7 +1944,7 @@ mod tests {
             .state()
             .batches
             .push_back(vec![myelin_events::BrokerDelivery {
-                token: DeliveryToken(2),
+                token: token(2),
                 broker_ref: Some(myelin_events::BrokerDeliveryRef {
                     stream: "TEST".into(),
                     stream_sequence: 2,
@@ -1958,12 +1964,12 @@ mod tests {
         handle.tick();
 
         assert!(probe.state().terms.is_empty());
-        assert_eq!(probe.state().retries, vec![DeliveryToken(1)]);
+        assert_eq!(probe.state().retries, vec![token(1)]);
         assert_eq!(handle.telemetry().consumer_lag("retrying"), Some(1));
 
         handle.tick();
 
-        assert_eq!(probe.state().terms, vec![DeliveryToken(2)]);
+        assert_eq!(probe.state().terms, vec![token(2)]);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
