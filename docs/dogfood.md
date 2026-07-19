@@ -43,14 +43,20 @@ supplies `DATABASE_MIGRATION_URL` as `myelin_admin`; the edge closes the latter 
 ## 3. Mint an operator token (`edge bootstrap`)
 
 ```sh
-./scripts/dogfood.sh bootstrap -- --tenant acme --principal founder
+PROJECT_UUID=20aee030-c7fa-4757-8243-700faf528690
+./scripts/dogfood.sh bootstrap -- \
+  --tenant acme --principal founder --issues-project "$PROJECT_UUID"
 # → the capability token is printed to STDOUT (and NOTHING else — never logged / written to a file):
 #   v4.public.<...>|<...>|<...>
 ```
 
-Flags: `--tenant <slug>` (required), `--principal <id>` (required), `--display-name <s>` (optional),
-`--ttl-days <n>` (default 30), `--region <r>` (default `MYELIN_REGION`). Running it again for the same
-principal mints a **new** token (a new revocation id) without disturbing the principal.
+Flags: `--tenant <slug>` (required), `--principal <id>` (required), `--issues-project <canonical UUID>`
+(required), `--display-name <s>` (optional), `--ttl-days <n>` (default 30), `--region <r>` (default
+`MYELIN_REGION`). Before printing a token, bootstrap idempotently writes exactly
+`project:<uuid>#reader@<principal>` through the durable Identity tuple store. It does not grant project
+writer/admin or tenant-wide authority, and Issues creation still passes the ordinary server-side
+`may_create` project-view check. Running bootstrap again mints a **new** token while converging on the
+same one reader tuple.
 
 The edge's issue-authorization restart scanner is deliberately partitioned. Dogfood defaults
 `MYELIN_ISSUES_RECONCILE_TENANTS` to this runbook's `acme` tenant. If you bootstrap a different or
@@ -60,12 +66,16 @@ otherwise new issues in that tenant remain safely pending and invisible rather t
 Capture the token in a shell var for the next steps:
 
 ```sh
-TOKEN="$(./scripts/dogfood.sh bootstrap -- --tenant acme --principal founder 2>/dev/null)"
+PROJECT_UUID=20aee030-c7fa-4757-8243-700faf528690
+TOKEN="$(./scripts/dogfood.sh bootstrap -- \
+  --tenant acme --principal founder --issues-project "$PROJECT_UUID" 2>/dev/null)"
 ```
 
-The token is a **machine `agent` capability token** (no DPoP, no scope ceiling) with the `agent:run`
-grant — sufficient for the full product surface (repo create, git pull/push, PR open/review/merge,
-whoami, events). The edge default token scheme is `agent`, so clients need **no** extra scheme header.
+The token is a **machine `agent` capability token** (no DPoP, no scope ceiling) whose signed purpose
+is `OperatorBootstrap` and whose exact authority is `edge.operator`. That operator authority satisfies
+the action-policy conjunct for the product surface, while every object-scoped action must still pass
+its independent per-object ReBAC conjunct. The edge default token scheme is `agent`, so clients need
+**no** extra scheme header.
 
 ### The operator trust boundary
 
@@ -82,6 +92,45 @@ myelin whoami
 ```
 
 Or per-invocation: `myelin --token "$TOKEN" --scheme agent whoami`, or `export MYELIN_TOKEN="$TOKEN"`.
+
+### Founder Issues loop
+
+The canonical dogfood values are explicit because the current Issues spine has no type catalogue/FK:
+
+```sh
+PROJECT_UUID=20aee030-c7fa-4757-8243-700faf528690
+TYPE_UUID=7d457754-f6a1-4cd8-8738-21751570b627
+PREFIX=MYL
+```
+
+They are also exported by `./scripts/dogfood.sh env` as `MYELIN_DOGFOOD_ISSUES_PROJECT`,
+`MYELIN_DOGFOOD_ISSUES_TYPE`, and `MYELIN_DOGFOOD_ISSUES_PREFIX`. The bootstrap command above grants
+the founder reader access to this exact project. Start the edge with the default
+`MYELIN_ISSUES_RECONCILE_TENANTS=acme`; it is the explicit FORCE-RLS partition list the restart-safe
+Issues authorization worker scans.
+
+Run the founder commands:
+
+```sh
+# The quoted title is one CLI argument. The create body is exactly project_id/type_id/prefix/title.
+myelin issues create \
+  --project "$PROJECT_UUID" --type "$TYPE_UUID" --prefix "$PREFIX" \
+  --title "Ship the founder Issues floor"
+
+# create returns a 202 receipt with authorization=pending and an Issue UUID. Copy that UUID here.
+ISSUE_ID=<uuid-from-the-receipt>
+
+# Pending rows are deliberately invisible. Retry view after the reconciler activates the tuple.
+myelin issues view "$ISSUE_ID"
+myelin issues list --limit 25
+myelin issues close "$ISSUE_ID"
+myelin issues view "$ISSUE_ID"
+```
+
+The CLI never claims a 202 receipt is immediately visible; it prints the matching `myelin issues view
+<uuid>` command. A very early `view` can return the same leak-free 404 as an unauthorized/absent issue;
+retry after the worker's default five-second sweep. The worker scans durable pending bindings directly.
+The separate outbox relay is not required to activate the issue and is not started implicitly here.
 
 ## 5. Use the token — `git`
 

@@ -23,9 +23,13 @@
 //! `edge.operator` authority as an override across mapped Edge actions. Per-object ReBAC remains a
 //! required second conjunct. Re-bootstrap is required for legacy tokens without a signed purpose.
 
-use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
+use myelin_events::Timestamp;
+use myelin_identity::{
+    DataRole, ObjectId, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RelName,
+    RelationTuple, TupleDelta,
+};
 use myelin_identity_service::{
-    CapabilityMintSpec, CellTokenAuthority, PrincipalProfile, PrincipalStore,
+    CapabilityMintSpec, CellTokenAuthority, PrincipalProfile, PrincipalStore, TupleStore,
 };
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
@@ -48,6 +52,9 @@ pub struct BootstrapParams<'a> {
     /// The principal id — ALSO used as the credential `subject_key` (one stable handle the token
     /// carries and the S1 credential link resolves under [`BOOTSTRAP_SCHEME`]).
     pub principal: &'a str,
+    /// The canonical Issues project UUID to grant this founder principal as a direct reader. This is
+    /// required and explicit: bootstrap never invents a project and never grants tenant-wide access.
+    pub issues_project: &'a str,
     /// An optional human display label (the `--display-name` flag) stored in the
     /// (per-subject-DEK-encrypted) profile. Purely cosmetic — no auth/whoami path reads it; `None`
     /// provisions no profile (and no DEK). (Named `display` — not the PII-fingerprinted `display_name`
@@ -114,6 +121,7 @@ impl std::error::Error for BootstrapError {}
 /// is absent from the S7 denylist, so the token is live until revoked or expired.
 pub fn bootstrap_principal_and_mint(
     store: &PrincipalStore,
+    tuples: &TupleStore,
     cell: &CellTokenAuthority,
     params: &BootstrapParams<'_>,
     now_unix: i64,
@@ -133,19 +141,24 @@ pub fn bootstrap_principal_and_mint(
             "--principal must be non-empty".into(),
         ));
     }
+    // This check MUST precede every durable principal/credential write. A malformed project must not
+    // leave a half-bootstrapped founder identity behind, and bootstrap never coerces a loose UUID.
+    if !myelin_issues::api::is_canonical_uuid(params.issues_project) {
+        return Err(BootstrapError::BadParam(
+            "--issues-project must be a canonical lowercase UUID".into(),
+        ));
+    }
 
     // The verified `(tenant, region)` write scope. The only TenantScope constructor is
     // `from_verified_token`, so a scope from a path is structurally impossible — we mint a minimal
     // verified admin principal carrying the operator-supplied tenant (this is the operator plane; the
     // trust boundary is the seal key + DB creds, stated in the module docs).
-    let scope = TenantScope::from_verified_token(
-        &Principal::stub(
-            PrincipalId("bootstrap-operator".into()),
-            PrincipalKind::Human,
-            TenantId(params.tenant.to_string()),
-        ),
-        Region(params.region.to_string()),
+    let operator = Principal::stub(
+        PrincipalId("bootstrap-operator".into()),
+        PrincipalKind::Human,
+        TenantId(params.tenant.to_string()),
     );
+    let scope = TenantScope::from_verified_token(&operator, Region(params.region.to_string()));
     let pid = PrincipalId(params.principal.to_string());
 
     // (1) Idempotent upsert of the Human principal. A display name (optional) is sealed under the
@@ -181,7 +194,32 @@ pub fn bootstrap_principal_and_mint(
         .link_credential(&scope, BOOTSTRAP_SCHEME, &subject_key, &pid)
         .map_err(|e| BootstrapError::Store(e.to_string()))?;
 
-    // (3) Mint a fresh token. A unique `jti` (principal + a high-resolution timestamp) guarantees a
+    // (3) Idempotently grant ONLY the requested project reader edge. This is an operator-plane write
+    //     attributed to `bootstrap-operator`; the founder is the tuple SUBJECT, never falsely
+    //     recorded as self-granting authority. This is the ordinary durable
+    //     TupleStore path (not raw SQL and not a may_create bypass): Issues' production may_create
+    //     still evaluates `view` on this exact project for every create. Re-running Add converges on
+    //     the rebac_tuple primary key and never widens the relation.
+    let grant = TupleDelta::Add(RelationTuple {
+        object: ObjectId(format!("project:{}", params.issues_project)),
+        relation: RelName("reader".into()),
+        subject: pid,
+        caveat: None,
+    });
+    tuples
+        .write_tuples(
+            &scope,
+            &operator,
+            &[grant],
+            None,
+            None,
+            timestamp_from_unix(now_unix),
+        )
+        .map_err(|e| BootstrapError::Store(format!("Issues project reader grant failed: {e}")))?;
+
+    // (4) Mint a fresh token ONLY after the durable reader grant exists. A reported-success token is
+    //     therefore immediately authorized to stage an Issue in the explicit project. A unique `jti`
+    //     (principal + a high-resolution timestamp) guarantees a
     //     re-run mints a DISTINCT token (distinct revocation handle) for the same principal. `exp` is
     //     `now + ttl_days`. The macaroon caveat chain is empty at mint (unattenuated root authority).
     let jti = fresh_jti(params.principal);
@@ -209,6 +247,13 @@ pub fn bootstrap_principal_and_mint(
     })
 }
 
+fn timestamp_from_unix(unix: i64) -> Timestamp {
+    let value = chrono::DateTime::from_timestamp(unix, 0)
+        .unwrap_or_default()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    Timestamp(value)
+}
+
 /// A unique revocation id for a freshly-minted operator token: `bootstrap-<principal>-<unix_nanos>`.
 /// The nanosecond clock makes two sequential bootstraps of the SAME principal mint distinct `jti`s
 /// (each is a separately-revocable token). NOT a secret — it is the public revocation handle.
@@ -218,4 +263,88 @@ fn fresh_jti(principal: &str) -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("bootstrap-{principal}-{nanos}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use myelin_events::OutboxStore;
+    use myelin_storage::KmsEngine;
+    use std::sync::Arc;
+
+    const PROJECT: &str = "11111111-1111-1111-1111-111111111111";
+
+    fn params<'a>(project: &'a str) -> BootstrapParams<'a> {
+        BootstrapParams {
+            tenant: "acme",
+            region: "fr-par",
+            principal: "founder",
+            issues_project: project,
+            display: None,
+            ttl_days: 30,
+        }
+    }
+
+    fn scope() -> TenantScope {
+        TenantScope::from_verified_token(
+            &Principal::stub(
+                PrincipalId("bootstrap-test".into()),
+                PrincipalKind::Human,
+                TenantId("acme".into()),
+            ),
+            Region("fr-par".into()),
+        )
+    }
+
+    #[test]
+    fn malformed_project_is_rejected_before_any_durable_shape_changes() {
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        let tuples = TupleStore::new(OutboxStore::new());
+        let cell = CellTokenAuthority::from_seed(&[7; 32], &[9; 32]).unwrap();
+
+        let result = bootstrap_principal_and_mint(
+            &store,
+            &tuples,
+            &cell,
+            &params("NOT-A-UUID"),
+            1_700_000_000,
+        );
+        assert!(matches!(result, Err(BootstrapError::BadParam(_))));
+        assert!(store
+            .get_principal(&scope(), &PrincipalId("founder".into()))
+            .is_none());
+        assert!(tuples.tuples_in(&scope()).is_empty());
+    }
+
+    #[test]
+    fn rebootstrap_converges_on_one_narrow_project_reader_edge() {
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        let outbox = OutboxStore::new();
+        let tuples = TupleStore::new(outbox.clone());
+        let cell = CellTokenAuthority::from_seed(&[7; 32], &[9; 32]).unwrap();
+
+        let first =
+            bootstrap_principal_and_mint(&store, &tuples, &cell, &params(PROJECT), 1_700_000_000)
+                .unwrap();
+        let second =
+            bootstrap_principal_and_mint(&store, &tuples, &cell, &params(PROJECT), 1_700_000_001)
+                .unwrap();
+        assert_ne!(first.jti, second.jti);
+        let edges = tuples.tuples_in(&scope());
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].tuple.object.0, format!("project:{PROJECT}"));
+        assert_eq!(edges[0].tuple.relation.0, "reader");
+        assert_eq!(edges[0].tuple.subject.0, "founder");
+        assert!(edges[0].tuple.caveat.is_none());
+        let events = outbox.committed_rows();
+        assert_eq!(
+            events.len(),
+            2,
+            "each explicit operator retry remains auditable"
+        );
+        assert!(events.iter().all(|row| {
+            row.envelope.actor.0.principal_id.0 == "bootstrap-operator"
+                && row.envelope.actor.0.principal_id.0 != edges[0].tuple.subject.0
+        }));
+    }
 }
