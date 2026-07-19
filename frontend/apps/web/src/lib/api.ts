@@ -2,7 +2,7 @@
 // `"use server"` directive keeps the gateway + token strictly server-side. On `Unauthorized` (a 401
 // that survived the single refresh + retry) the query throws a `/login` redirect — the canon's
 // 401→/login behaviour, applied centrally.
-import { action, query, redirect } from "@solidjs/router";
+import { action, json, query, redirect } from "@solidjs/router";
 import { edgeGet, edgePost, GatewayError, Unauthorized } from "../server/gateway";
 
 /** A brief commit projection for the latest-commit bar / per-entry activity (R3.4). */
@@ -718,19 +718,20 @@ function dogfoodIssueTarget(): { project_id: string; type_id: string; prefix: st
 }
 
 /** One Issues mutation action: browser inputs can carry a title or an issue UUID, never scope IDs. */
-export const issuesMutate = action(async (mutation: IssueMutation): Promise<IssueMutationResult> => {
+export const issuesMutate = action(async (mutation: IssueMutation) => {
   "use server";
+  const result = (value: IssueMutationResult) => json(value, { revalidate: [] });
   try {
     if (mutation.op === "create") {
       const title = mutation.title.trim();
       if (!title || new TextEncoder().encode(title).byteLength > 512) {
-        return { ok: false, error: "bad-input" };
+        return result({ ok: false, error: "bad-input" });
       }
       const target = dogfoodIssueTarget();
       const receipt = await issueAuthed(() =>
         edgePost<IssueCreateReceipt>("/v1/issues", { ...target, title }),
       );
-      return { ok: true, op: "create", receipt };
+      return result({ ok: true, op: "create", receipt });
     }
     if (mutation.op === "activation") {
       const status = await issueAuthed(() =>
@@ -739,14 +740,14 @@ export const issuesMutate = action(async (mutation: IssueMutation): Promise<Issu
           { timeoutMs: ISSUE_ACTIVATION_STATUS_TIMEOUT_MS },
         ),
       );
-      return { ok: true, op: "activation", status };
+      return result({ ok: true, op: "activation", status });
     }
     const issue = await issueAuthed(() =>
       edgePost<IssueVM>(`/v1/issues/${seg(mutation.issueId)}/close`, {}),
     );
-    return { ok: true, op: "close", issue };
+    return result({ ok: true, op: "close", issue });
   } catch (e) {
-    if (e instanceof IssueRouteError) return { ok: false, error: e.kind };
+    if (e instanceof IssueRouteError) return result({ ok: false, error: e.kind });
     throw e;
   }
 }, "issues-mutate");

@@ -13,6 +13,9 @@ async function setEdgeConfig(cfg: {
   issueActivationUnavailable?: boolean;
   issueCreateUnavailable?: boolean;
   issueCloseUnavailable?: boolean;
+  issueListFirstPageHolds?: number;
+  releaseIssueListFirstPages?: boolean;
+  issueListFirstPageDelaysMs?: number[];
   issueListCursorDelaysMs?: number[];
 }) {
   const context = await pwRequest.newContext();
@@ -24,6 +27,9 @@ async function setEdgeConfig(cfg: {
 async function edgeIssueState(): Promise<{
   issueListCursorRequests: number;
   issueListCursorResponses: number;
+  issueListFirstPageDelayedRequests: number;
+  issueListFirstPageDelayedResponses: number;
+  issueListCursorRequestsByState: { open: number; closed: number; all: number };
 }> {
   const context = await pwRequest.newContext();
   const response = await context.post(`${EDGE}/__test/config`, { data: {} });
@@ -100,12 +106,13 @@ test.describe("R4.4 founder Issues web floor", () => {
   });
 
   test("a delayed old cursor page cannot mix into a new filter generation", async ({ page }) => {
-    await setEdgeConfig({ issueListCursorDelaysMs: [250, 1_500] });
+    await setEdgeConfig({ issueListCursorDelaysMs: [750, 2_000] });
     await devLogin(page);
     await page.goto("/issues");
     await expect(page.getByTestId("issue-row")).toHaveCount(50);
 
     await page.getByRole("button", { name: "Load more" }).click();
+    await expect.poll(async () => (await edgeIssueState()).issueListCursorRequestsByState.open).toBe(1);
     await page.getByRole("tab", { name: "Closed" }).click();
     await page.waitForURL("**/issues?state=closed");
     await expect(page.getByTestId("issue-row")).toHaveCount(50);
@@ -147,11 +154,13 @@ test.describe("R4.4 founder Issues web floor", () => {
   });
 
   test("202 create remains visibly pending until fresh polling observes active", async ({ page }) => {
-    await setEdgeConfig({ issueActivationPolls: 2 });
+    await setEdgeConfig({ issueActivationPolls: 3 });
     await devLogin(page);
     await page.goto("/issues");
+    await page.waitForLoadState("networkidle");
     await page.getByRole("button", { name: "Load more" }).click();
     await expect(page.getByTestId("issue-row")).toHaveCount(51);
+    await setEdgeConfig({ issueListFirstPageHolds: 1 });
     await page.getByRole("button", { name: "New issue" }).click();
     await page.getByLabel("Title").fill("Capture the browser rough edge");
     await page.getByRole("button", { name: "Create issue" }).click();
@@ -161,9 +170,15 @@ test.describe("R4.4 founder Issues web floor", () => {
     await expect(pending).not.toContainText("Capture the browser rough edge");
     await expect(page.getByText(/accepted — activating access/)).toBeVisible();
 
+    await expect(page.getByText(/is ready/)).toBeVisible();
+    await expect.poll(async () => (await edgeIssueState()).issueListFirstPageDelayedRequests).toBe(1);
+    await expect(page.getByRole("button", { name: "Load more" })).toHaveCount(0);
+    await expect(page.getByTestId("issue-row")).toHaveCount(50);
+
+    await setEdgeConfig({ releaseIssueListFirstPages: true });
+    await expect.poll(async () => (await edgeIssueState()).issueListFirstPageDelayedResponses).toBe(1);
     await expect(page.getByText("Capture the browser rough edge")).toBeVisible();
     await expect(pending).toHaveCount(0);
-    await expect(page.getByText(/is ready/)).toBeVisible();
     await expect(page.getByTestId("issue-row")).toHaveCount(50);
     await page.getByRole("button", { name: "Load more" }).click();
     await expect(page.getByTestId("issue-row")).toHaveCount(52);

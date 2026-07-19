@@ -66,17 +66,43 @@ const state = {
   issueActivationUnavailable: false,
   issueCreateUnavailable: false,
   issueCloseUnavailable: false,
+  issueListFirstPageHolds: 0,
+  issueListFirstPageDelaysMs: [],
   issueListCursorDelaysMs: [],
+  issueListFirstPageDelayedRequests: 0,
+  issueListFirstPageDelayedResponses: 0,
   issueListCursorRequests: 0,
   issueListCursorResponses: 0,
+  issueListCursorRequestsByState: { open: 0, closed: 0, all: 0 },
 };
 
 let issueRows = freshIssueFixtures();
 const issueReceipts = new Map();
+const issueListDelayTimers = new Map();
+const heldIssueListResponses = new Set();
+let issueListDelayGeneration = 0;
 let issueSequence = 200;
 const ISSUE_BASE_TIME_FOR_CREATE = Date.parse("2026-07-20T00:00:00.000Z");
 
+function cancelIssueListDelays() {
+  issueListDelayGeneration += 1;
+  for (const [timer, res] of issueListDelayTimers) {
+    clearTimeout(timer);
+    if (!res.writableEnded) {
+      send(res, 409, { error: { message: "test fixture generation reset", code: "conflict" } });
+    }
+  }
+  issueListDelayTimers.clear();
+  for (const held of heldIssueListResponses) {
+    if (!held.res.writableEnded) {
+      send(held.res, 409, { error: { message: "test fixture generation reset", code: "conflict" } });
+    }
+  }
+  heldIssueListResponses.clear();
+}
+
 function resetIssues() {
+  cancelIssueListDelays();
   issueRows = freshIssueFixtures();
   issueReceipts.clear();
   issueSequence = 200;
@@ -87,15 +113,61 @@ function resetIssues() {
   state.issueActivationUnavailable = false;
   state.issueCreateUnavailable = false;
   state.issueCloseUnavailable = false;
+  state.issueListFirstPageHolds = 0;
+  state.issueListFirstPageDelaysMs = [];
   state.issueListCursorDelaysMs = [];
+  state.issueListFirstPageDelayedRequests = 0;
+  state.issueListFirstPageDelayedResponses = 0;
   state.issueListCursorRequests = 0;
   state.issueListCursorResponses = 0;
+  state.issueListCursorRequestsByState = { open: 0, closed: 0, all: 0 };
 }
 
 function send(res, status, json, headers = {}) {
   const body = json === null ? "" : JSON.stringify(json);
   res.writeHead(status, { "content-type": "application/json", ...headers });
   res.end(body);
+}
+
+function delayedIssueListResponse(res, envelope, delay, responseCounter) {
+  const generation = issueListDelayGeneration;
+  const timer = setTimeout(() => {
+    issueListDelayTimers.delete(timer);
+    if (generation !== issueListDelayGeneration) {
+      if (!res.writableEnded) {
+        send(res, 409, { error: { message: "test fixture generation changed", code: "conflict" } });
+      }
+      return;
+    }
+    state[responseCounter] += 1;
+    send(res, 200, envelope);
+  }, delay);
+  issueListDelayTimers.set(timer, res);
+  res.on("close", () => {
+    if (!res.writableEnded && issueListDelayTimers.delete(timer)) clearTimeout(timer);
+  });
+  return timer;
+}
+
+function holdIssueListResponse(res, envelope, responseCounter) {
+  const held = { res, envelope, responseCounter, generation: issueListDelayGeneration };
+  heldIssueListResponses.add(held);
+  res.on("close", () => {
+    if (!res.writableEnded) heldIssueListResponses.delete(held);
+  });
+}
+
+function releaseHeldIssueListResponses() {
+  for (const held of heldIssueListResponses) {
+    heldIssueListResponses.delete(held);
+    if (held.res.writableEnded) continue;
+    if (held.generation !== issueListDelayGeneration) {
+      send(held.res, 409, { error: { message: "test fixture generation changed", code: "conflict" } });
+      continue;
+    }
+    state[held.responseCounter] += 1;
+    send(held.res, 200, held.envelope);
+  }
 }
 
 function bearer(req) {
@@ -142,10 +214,18 @@ const server = createServer((req, res) => {
         if (typeof body.issueActivationUnavailable === "boolean") state.issueActivationUnavailable = body.issueActivationUnavailable;
         if (typeof body.issueCreateUnavailable === "boolean") state.issueCreateUnavailable = body.issueCreateUnavailable;
         if (typeof body.issueCloseUnavailable === "boolean") state.issueCloseUnavailable = body.issueCloseUnavailable;
+        if (Number.isInteger(body.issueListFirstPageHolds) && body.issueListFirstPageHolds >= 0) {
+          state.issueListFirstPageHolds = body.issueListFirstPageHolds;
+        }
+        if (
+          Array.isArray(body.issueListFirstPageDelaysMs) &&
+          body.issueListFirstPageDelaysMs.every((delay) => Number.isInteger(delay) && delay >= 0 && delay <= 5_000)
+        ) state.issueListFirstPageDelaysMs = [...body.issueListFirstPageDelaysMs];
         if (
           Array.isArray(body.issueListCursorDelaysMs) &&
           body.issueListCursorDelaysMs.every((delay) => Number.isInteger(delay) && delay >= 0 && delay <= 5_000)
         ) state.issueListCursorDelaysMs = [...body.issueListCursorDelaysMs];
+        if (body.releaseIssueListFirstPages === true) releaseHeldIssueListResponses();
       } catch {
         /* ignore malformed control body */
       }
@@ -284,13 +364,30 @@ const server = createServer((req, res) => {
         ? issueRows.filter((issue) => issue.state_category === "completed" || issue.state_category === "cancelled")
         : issueRows;
     const envelope = issuesEnvelope(rows, listState, key, limit, cursor);
-    const delay = cursor ? state.issueListCursorDelaysMs.shift() ?? 0 : 0;
-    if (cursor) state.issueListCursorRequests += 1;
+    const delay = cursor
+      ? state.issueListCursorDelaysMs.shift() ?? 0
+      : state.issueListFirstPageDelaysMs.shift() ?? 0;
+    if (cursor) {
+      state.issueListCursorRequests += 1;
+      if (Object.hasOwn(state.issueListCursorRequestsByState, listState)) {
+        state.issueListCursorRequestsByState[listState] += 1;
+      }
+    } else if (delay > 0) {
+      state.issueListFirstPageDelayedRequests += 1;
+    }
+    if (!cursor && state.issueListFirstPageHolds > 0) {
+      state.issueListFirstPageHolds -= 1;
+      state.issueListFirstPageDelayedRequests += 1;
+      holdIssueListResponse(res, envelope, "issueListFirstPageDelayedResponses");
+      return;
+    }
     if (delay > 0) {
-      return setTimeout(() => {
-        state.issueListCursorResponses += 1;
-        send(res, 200, envelope);
-      }, delay);
+      return delayedIssueListResponse(
+        res,
+        envelope,
+        delay,
+        cursor ? "issueListCursorResponses" : "issueListFirstPageDelayedResponses",
+      );
     }
     if (cursor) state.issueListCursorResponses += 1;
     return send(res, 200, envelope);
