@@ -303,7 +303,14 @@ enum CostBackend {
     #[cfg(any(test, feature = "test-support"))]
     Memory(MemoryCostLedger),
     /// The durable production backing over the `cost_reservation`/`cost_event` tables.
-    Durable(crate::reserve_settle_durable::DurableCostLedger),
+    Durable(Box<crate::reserve_settle_durable::DurableCostLedger>),
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Default for CostLedger {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CostLedger {
@@ -321,8 +328,8 @@ impl CostLedger {
     /// backing captures `Handle::current()` for its sync→async bridge).
     pub fn with_pg(provider: crate::provider::SubstrateProvider) -> CostLedger {
         CostLedger {
-            backend: CostBackend::Durable(crate::reserve_settle_durable::DurableCostLedger::new(
-                provider,
+            backend: CostBackend::Durable(Box::new(
+                crate::reserve_settle_durable::DurableCostLedger::new(provider),
             )),
         }
     }

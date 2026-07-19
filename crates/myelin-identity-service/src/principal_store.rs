@@ -195,6 +195,8 @@ struct EncryptedProfile {
 /// — never a silent partial write or a plaintext-without-key fall-through.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrincipalError {
+    /// Principal/credential bootstrap input was empty or could not form an unambiguous link key.
+    InvalidProvisioning,
     /// A row targeted a different tenant than the verified write scope — rejected (there is no
     /// cross-tenant principal). Defence in depth: the API never accepts a tenant from the row.
     CrossTenant {
@@ -223,6 +225,9 @@ pub enum PrincipalError {
 impl core::fmt::Display for PrincipalError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            PrincipalError::InvalidProvisioning => f.write_str(
+                "principal credential provisioning requires non-empty opaque identifiers and a valid scheme",
+            ),
             PrincipalError::CrossTenant { detail } => write!(
                 f,
                 "principal write rejected a cross-tenant row: {detail} (there is no cross-tenant \
@@ -249,6 +254,63 @@ impl core::fmt::Display for PrincipalError {
                  silent partial write): {why}"
             ),
         }
+    }
+}
+
+/// One atomic principal-plus-credential bootstrap request.
+///
+/// The credential subject is intentionally redacted from `Debug`; it may contain an external
+/// identity-provider subject even though principal IDs themselves are opaque platform identifiers.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PrincipalCredentialProvision {
+    principal_id: PrincipalId,
+    kind: PrincipalKind,
+    data_role: myelin_identity::DataRole,
+    status: PrincipalStatus,
+    scheme: String,
+    subject_key: String,
+}
+
+impl PrincipalCredentialProvision {
+    pub fn new(
+        principal_id: PrincipalId,
+        kind: PrincipalKind,
+        data_role: myelin_identity::DataRole,
+        status: PrincipalStatus,
+        scheme: impl Into<String>,
+        subject_key: impl Into<String>,
+    ) -> Result<Self, PrincipalError> {
+        let scheme = scheme.into();
+        let subject_key = subject_key.into();
+        if principal_id.0.trim().is_empty()
+            || scheme.trim().is_empty()
+            || subject_key.trim().is_empty()
+            || scheme.contains('\x1f')
+            || subject_key.contains('\x1f')
+        {
+            return Err(PrincipalError::InvalidProvisioning);
+        }
+        Ok(Self {
+            principal_id,
+            kind,
+            data_role,
+            status,
+            scheme,
+            subject_key,
+        })
+    }
+}
+
+impl core::fmt::Debug for PrincipalCredentialProvision {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PrincipalCredentialProvision")
+            .field("principal_id", &self.principal_id)
+            .field("kind", &self.kind)
+            .field("data_role", &self.data_role)
+            .field("status", &self.status)
+            .field("scheme", &self.scheme)
+            .field("subject_key", &"<redacted>")
+            .finish()
     }
 }
 
@@ -359,8 +421,8 @@ impl PrincipalStore {
         }
     }
 
-    /// **Build the S1 store over the REAL durable PG backing (MR-007 / SI-018).** The principal rows
-    /// + KMS-sealed profile ciphertext + credential links persist through the MR-022
+    /// **Build the S1 store over the REAL durable PG backing (MR-007 / SI-018).** The principal rows,
+    /// KMS-sealed profile ciphertext, and credential links persist through the MR-022
     /// [`myelin_storage::SubstrateProvider`] pool + `with_tenant_tx` convention (RLS-scoped, no GUC
     /// bleed). `rt` is the tokio runtime handle the sync API drives the async backing on. The KMS
     /// engine is reused as-is (the profile-encryption boundary is unchanged); decrypt-across-restart
@@ -525,13 +587,16 @@ impl PrincipalStore {
     pub fn provision_principal_credential(
         &self,
         scope: &TenantScope,
-        principal_id: PrincipalId,
-        kind: PrincipalKind,
-        data_role: myelin_identity::DataRole,
-        status: PrincipalStatus,
-        scheme: &str,
-        subject_key: &str,
+        provision: PrincipalCredentialProvision,
     ) -> Result<PrincipalRow, PrincipalError> {
+        let PrincipalCredentialProvision {
+            principal_id,
+            kind,
+            data_role,
+            status,
+            scheme,
+            subject_key,
+        } = provision;
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
         let row = PrincipalRow {
             tenant: scope.tenant().clone(),
@@ -542,7 +607,7 @@ impl PrincipalStore {
             data_role,
             status,
         };
-        let link_key = Self::link_key(scheme, subject_key);
+        let link_key = Self::link_key(&scheme, &subject_key);
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             PrincipalBackend::Memory(inner_arc) => {
@@ -1463,16 +1528,17 @@ mod tests {
         let store = PrincipalStore::new(kms());
         let scope = scope("acme");
         let principal_id = PrincipalId("human:mcp-operator".into());
+        let provision = PrincipalCredentialProvision::new(
+            principal_id.clone(),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+            "agent",
+            "human:mcp-operator",
+        )
+        .unwrap();
         store
-            .provision_principal_credential(
-                &scope,
-                principal_id.clone(),
-                PrincipalKind::Human,
-                DataRole::Controller,
-                PrincipalStatus::Active,
-                "agent",
-                "human:mcp-operator",
-            )
+            .provision_principal_credential(&scope, provision)
             .unwrap();
         assert_eq!(
             store
@@ -1480,6 +1546,45 @@ mod tests {
                 .unwrap()
                 .principal_id,
             principal_id
+        );
+    }
+
+    #[test]
+    fn provisioning_request_validates_link_components_and_redacts_subject() {
+        let provision = PrincipalCredentialProvision::new(
+            PrincipalId("human:operator".into()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+            "oidc",
+            "external|sensitive-subject",
+        )
+        .unwrap();
+        let debug = format!("{provision:?}");
+        assert!(!debug.contains("external|sensitive-subject"));
+        assert!(debug.contains("subject_key: \"<redacted>\""));
+
+        assert_eq!(
+            PrincipalCredentialProvision::new(
+                PrincipalId("human:operator".into()),
+                PrincipalKind::Human,
+                DataRole::Controller,
+                PrincipalStatus::Active,
+                "oidc\x1fconfused",
+                "subject",
+            ),
+            Err(PrincipalError::InvalidProvisioning)
+        );
+        assert_eq!(
+            PrincipalCredentialProvision::new(
+                PrincipalId("human:operator".into()),
+                PrincipalKind::Human,
+                DataRole::Controller,
+                PrincipalStatus::Active,
+                "oidc",
+                " ",
+            ),
+            Err(PrincipalError::InvalidProvisioning)
         );
     }
 }

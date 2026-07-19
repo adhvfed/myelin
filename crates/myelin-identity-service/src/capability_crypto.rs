@@ -251,13 +251,11 @@ impl CellTokenAuthority {
             claims.insert("run_id".into(), run_id.into());
         }
         if let CredentialPurpose::AgentRun {
-            delegation_snapshot,
+            delegation_snapshot: Some(snapshot),
             ..
         } = &spec.purpose
         {
-            if let Some(snapshot) = delegation_snapshot {
-                claims.insert("delegation_snapshot".into(), (*snapshot).into());
-            }
+            claims.insert("delegation_snapshot".into(), (*snapshot).into());
         }
         let auth: Vec<serde_json::Value> = spec
             .authority
@@ -1005,31 +1003,22 @@ impl PasetoCapabilitySigner {
 }
 
 impl crate::mint::TokenSigner for PasetoCapabilitySigner {
-    fn sign(
-        &self,
-        tenant: &str,
-        region: &str,
-        subject_key: &str,
-        jti: &str,
-        purpose: &CredentialPurpose,
-        expires_at: &myelin_events::Timestamp,
-        grants: &[&str],
-    ) -> String {
+    fn sign(&self, request: &crate::mint::TokenSignRequest) -> String {
         // The mint's durable S7 deadline is authoritative. Canonical production timestamps parse to
         // the exact same Unix instant; malformed lifecycle data fails closed by producing an already-
         // expired outer token rather than falling back to the historical wider fixed ceiling.
-        let exp = chrono::DateTime::parse_from_rfc3339(&expires_at.0)
+        let exp = chrono::DateTime::parse_from_rfc3339(&request.expires_at().0)
             .map(|instant| instant.timestamp())
             .unwrap_or_else(|_| (self.now)());
         self.authority.mint(&CapabilityMintSpec {
-            tenant: tenant.to_string(),
-            region: region.to_string(),
-            subject_key: subject_key.to_string(),
-            jti: jti.to_string(),
+            tenant: request.scope().tenant().0.clone(),
+            region: request.scope().region().0.clone(),
+            subject_key: request.subject().0.clone(),
+            jti: request.jti().to_string(),
             exp_unix: exp,
-            authority: grants.iter().map(|g| g.to_string()).collect(),
+            authority: request.grants().to_vec(),
             dpop_jkt: None, // a per-run token is TTL-constrained, not DPoP-bound (§4).
-            purpose: purpose.clone(),
+            purpose: request.purpose().clone(),
             audience: CredentialAudience::Edge,
         })
     }

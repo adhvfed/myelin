@@ -1110,12 +1110,10 @@ impl DurableGitRepo {
         walk.set_sorting(git2::Sort::TIME).map_err(|e| git_err("revwalk sort", e))?;
         walk.push(tip).map_err(|e| git_err("revwalk push", e))?;
         let mut out: std::collections::BTreeMap<String, CommitMeta> = Default::default();
-        let mut seen = 0usize;
-        for oid_res in walk {
+        for (seen, oid_res) in walk.enumerate() {
             if seen >= cap {
                 break;
             }
-            seen += 1;
             let oid = oid_res.map_err(|e| git_err("revwalk next", e))?;
             let commit = repo.find_commit(oid).map_err(|e| git_err("find_commit", e))?;
             let tree = commit.tree().map_err(|e| git_err("commit tree", e))?;
@@ -2590,9 +2588,8 @@ mod tests {
             "the tip-only check ACCEPTS — the tip's tree is complete (this is the hole)"
         );
         // The FIX: full connectivity REJECTS (missing ancestor → a branch a clone cannot walk).
-        assert_eq!(
-            dst.history_connectivity_complete(&c3, &[]).unwrap(),
-            false,
+        assert!(
+            !dst.history_connectivity_complete(&c3, &[]).unwrap(),
             "R0.7-D: a missing ANCESTOR commit rejects the push (fail-closed) — the ref must not move"
         );
 
@@ -2640,7 +2637,8 @@ mod tests {
         let c3 = chain[2].2.clone();
 
         assert!(
-            dst.history_connectivity_complete(&c3, &[c2.clone()]).unwrap(),
+            dst.history_connectivity_complete(&c3, std::slice::from_ref(&c2))
+                .unwrap(),
             "a thin push onto a present base tip is accepted (only the delta is walked)"
         );
         // A bogus / non-existent existing tip is hidden gracefully — the push is still correctly judged.
@@ -2675,15 +2673,14 @@ mod tests {
 
         // existing_tips names c2, but c2 is NOT in the odb → hidden gracefully (skipped), so the walk
         // still visits c3 and finds its parent c2 missing → REJECT (fail-closed).
-        assert_eq!(
-            dst.history_connectivity_complete(&c3, &[c2]).unwrap(),
-            false,
+        assert!(
+            !dst.history_connectivity_complete(&c3, &[c2]).unwrap(),
             "a new commit whose parent is genuinely absent is rejected regardless of existing_tips"
         );
         // A missing NEW tip is itself a reject (never a swallowed error).
-        assert_eq!(
-            dst.history_connectivity_complete(&Oid::new("0".repeat(39) + "1"), &[]).unwrap(),
-            false,
+        assert!(
+            !dst.history_connectivity_complete(&Oid::new("0".repeat(39) + "1"), &[])
+                .unwrap(),
             "a new_tip that is not a present commit is rejected (fail-closed)"
         );
         std::fs::remove_dir_all(&src_root).ok();

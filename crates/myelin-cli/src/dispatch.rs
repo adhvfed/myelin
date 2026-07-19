@@ -16,6 +16,7 @@
 //!      the parsed command lowers to (reusing the subsystem's edge routes, registered MR-015+).
 //!   3. **Dispatch** — the CLI shell (`main`) resolves the token, presents the Bearer, runs the call,
 //!      and renders the `{items,page}` / view-model JSON (human or `--json`).
+//!
 //! Adding a subsystem to the CLI is steps 1+2 only — the auth, the Bearer presentation, the envelope
 //! parsing, the rendering, and the exit codes are owned ONCE by the shell (this crate), for everyone.
 

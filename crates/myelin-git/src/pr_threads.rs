@@ -41,6 +41,129 @@ use crate::core::RepoLoc;
 use crate::durable::DurableError;
 use crate::gix_backend::{RepoPathResolver, RootedResolver};
 
+/// A validated request to append one private draft comment to a review batch.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PendingCommentRequest {
+    repo: RepoLoc,
+    object_key: String,
+    review_id: String,
+    anchor: Option<ThreadAnchor>,
+    author: ThreadPrincipal,
+    body_md: String,
+    now: i64,
+}
+
+impl PendingCommentRequest {
+    pub fn new(
+        repo: RepoLoc,
+        object_key: impl Into<String>,
+        review_id: impl Into<String>,
+        anchor: Option<ThreadAnchor>,
+        author: ThreadPrincipal,
+        body_md: impl Into<String>,
+        now: i64,
+    ) -> Result<Self, DurableError> {
+        let object_key = object_key.into();
+        let review_id = review_id.into();
+        validate_review_target(&repo, &object_key, &review_id)?;
+        Ok(Self {
+            repo,
+            object_key,
+            review_id,
+            anchor,
+            author,
+            body_md: body_md.into(),
+            now,
+        })
+    }
+}
+
+impl core::fmt::Debug for PendingCommentRequest {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PendingCommentRequest")
+            .field("repo", &self.repo)
+            .field("object_key", &self.object_key)
+            .field("review_id", &self.review_id)
+            .field("anchor", &self.anchor)
+            .field("author", &"<redacted>")
+            .field("body_md", &"<redacted>")
+            .field("now", &self.now)
+            .finish()
+    }
+}
+
+/// A validated request to atomically publish a review batch and its pending comments.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SubmitReviewRequest {
+    repo: RepoLoc,
+    object_key: String,
+    review_id: String,
+    actor: ThreadPrincipal,
+    verdict: BatchVerdict,
+    summary_md: Option<String>,
+    now: i64,
+}
+
+impl SubmitReviewRequest {
+    pub fn new(
+        repo: RepoLoc,
+        object_key: impl Into<String>,
+        review_id: impl Into<String>,
+        actor: ThreadPrincipal,
+        verdict: BatchVerdict,
+        summary_md: Option<String>,
+        now: i64,
+    ) -> Result<Self, DurableError> {
+        let object_key = object_key.into();
+        let review_id = review_id.into();
+        validate_review_target(&repo, &object_key, &review_id)?;
+        Ok(Self {
+            repo,
+            object_key,
+            review_id,
+            actor,
+            verdict,
+            summary_md,
+            now,
+        })
+    }
+}
+
+impl core::fmt::Debug for SubmitReviewRequest {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SubmitReviewRequest")
+            .field("repo", &self.repo)
+            .field("object_key", &self.object_key)
+            .field("review_id", &self.review_id)
+            .field("actor", &"<redacted>")
+            .field("verdict", &self.verdict)
+            .field(
+                "summary_md",
+                &self.summary_md.as_ref().map(|_| "<redacted>"),
+            )
+            .field("now", &self.now)
+            .finish()
+    }
+}
+
+fn validate_review_target(
+    repo: &RepoLoc,
+    object_key: &str,
+    review_id: &str,
+) -> Result<(), DurableError> {
+    if repo.tenant.trim().is_empty()
+        || repo.region.trim().is_empty()
+        || repo.repo.trim().is_empty()
+        || object_key.trim().is_empty()
+        || review_id.trim().is_empty()
+    {
+        return Err(DurableError::Git(
+            "review operation requires a complete repository, object key, and review id".into(),
+        ));
+    }
+    Ok(())
+}
+
 // ───────────────────────────── the shared atoms (VM shapes) ────────────────────────────────────────
 
 /// The identity/agent badge atom (the `PrincipalVM` shape). `display` arrives pre-collapsed —
@@ -494,16 +617,19 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
     /// is absent; a `Forbidden` if the batch is already submitted (no appending to a closed batch).
     pub fn add_pending_comment(
         &self,
-        repo: &RepoLoc,
-        object_key: &str,
-        review_id: &str,
-        anchor: Option<ThreadAnchor>,
-        author: ThreadPrincipal,
-        body_md: impl Into<String>,
-        now: i64,
+        request: PendingCommentRequest,
     ) -> Result<CommentRecord, DurableError> {
-        let mut doc = self.load(repo, object_key)?;
-        match doc.review(review_id) {
+        let PendingCommentRequest {
+            repo,
+            object_key,
+            review_id,
+            anchor,
+            author,
+            body_md,
+            now,
+        } = request;
+        let mut doc = self.load(&repo, &object_key)?;
+        match doc.review(&review_id) {
             None => return Err(DurableError::NotFound(format!("review {review_id}"))),
             Some(r) if !r.is_draft() => {
                 return Err(DurableError::Forbidden(format!(
@@ -525,11 +651,11 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         let comment = CommentRecord {
             id: cid,
             author,
-            body_md: body_md.into(),
+            body_md,
             created_at: now,
             edited_at: None,
             state: CommentState::Visible,
-            review_id: Some(review_id.to_string()),
+            review_id: Some(review_id),
             pending: true,
         };
         doc.threads.push(ThreadRecord {
@@ -538,7 +664,7 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             resolved: false,
             comments: vec![comment.clone()],
         });
-        self.save(repo, &doc)?;
+        self.save(&repo, &doc)?;
         Ok(comment)
     }
 
@@ -549,16 +675,19 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
     /// no verdict flip). `NotFound` if the batch is absent.
     pub fn submit_review(
         &self,
-        repo: &RepoLoc,
-        object_key: &str,
-        review_id: &str,
-        actor: &ThreadPrincipal,
-        verdict: BatchVerdict,
-        summary_md: Option<String>,
-        now: i64,
+        request: SubmitReviewRequest,
     ) -> Result<Option<SubmittedBatch>, DurableError> {
-        let mut doc = self.load(repo, object_key)?;
-        let (owner_display, already) = match doc.review(review_id) {
+        let SubmitReviewRequest {
+            repo,
+            object_key,
+            review_id,
+            actor,
+            verdict,
+            summary_md,
+            now,
+        } = request;
+        let mut doc = self.load(&repo, &object_key)?;
+        let (owner_display, already) = match doc.review(&review_id) {
             None => return Err(DurableError::NotFound(format!("review {review_id}"))),
             Some(r) => (r.reviewer.display.clone(), !r.is_draft()),
         };
@@ -578,7 +707,7 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         let mut comment_ids = Vec::new();
         for t in &mut doc.threads {
             for c in &mut t.comments {
-                if c.review_id.as_deref() == Some(review_id) && c.pending {
+                if c.review_id.as_deref() == Some(review_id.as_str()) && c.pending {
                     c.pending = false;
                     comment_ids.push(c.id.clone());
                 }
@@ -596,7 +725,7 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             r.submitted_at = Some(now);
             r.clone()
         };
-        self.save(repo, &doc)?;
+        self.save(&repo, &doc)?;
         Ok(Some(SubmittedBatch {
             review,
             comment_ids,
@@ -666,6 +795,77 @@ mod tests {
         ThreadPrincipal::plain(PrincipalRole::Human, name)
     }
 
+    fn pending_comment(
+        review_id: &str,
+        author: ThreadPrincipal,
+        body_md: impl Into<String>,
+        now: i64,
+    ) -> PendingCommentRequest {
+        PendingCommentRequest::new(loc(), KEY, review_id, None, author, body_md, now).unwrap()
+    }
+
+    fn submitted_review(
+        review_id: &str,
+        actor: ThreadPrincipal,
+        verdict: BatchVerdict,
+        summary_md: Option<String>,
+        now: i64,
+    ) -> SubmitReviewRequest {
+        SubmitReviewRequest::new(loc(), KEY, review_id, actor, verdict, summary_md, now).unwrap()
+    }
+
+    #[test]
+    fn review_requests_validate_targets_and_redact_authors_and_content() {
+        let pending = PendingCommentRequest::new(
+            loc(),
+            KEY,
+            "r-secret",
+            None,
+            human("psn:secret-author@acme"),
+            "sensitive draft body",
+            1,
+        )
+        .unwrap();
+        let pending_debug = format!("{pending:?}");
+        assert!(!pending_debug.contains("psn:secret-author@acme"));
+        assert!(!pending_debug.contains("sensitive draft body"));
+
+        let submit = SubmitReviewRequest::new(
+            loc(),
+            KEY,
+            "r-secret",
+            human("psn:secret-reviewer@acme"),
+            BatchVerdict::Approved,
+            Some("sensitive summary".into()),
+            2,
+        )
+        .unwrap();
+        let submit_debug = format!("{submit:?}");
+        assert!(!submit_debug.contains("psn:secret-reviewer@acme"));
+        assert!(!submit_debug.contains("sensitive summary"));
+
+        assert!(PendingCommentRequest::new(
+            RepoLoc::new("acme", "fr-par", ""),
+            KEY,
+            "r-1",
+            None,
+            human("psn:r@acme"),
+            "draft",
+            3,
+        )
+        .is_err());
+        assert!(SubmitReviewRequest::new(
+            loc(),
+            " ",
+            "r-1",
+            human("psn:r@acme"),
+            BatchVerdict::Commented,
+            None,
+            4,
+        )
+        .is_err());
+    }
+
     /// A discussion thread (anchor null) round-trips durably; a fresh store over the same root reads it.
     #[test]
     fn a_discussion_thread_round_trips_durably() {
@@ -694,11 +894,11 @@ mod tests {
                   "body_md": "hi", "created_at": 1 } ] } ] });
         let doc: SubjectThreads = serde_json::from_value(legacy).expect("legacy doc deserializes");
         assert_eq!(doc.reviews.len(), 0);
-        assert_eq!(doc.threads[0].resolved, false);
+        assert!(!doc.threads[0].resolved);
         assert_eq!(doc.threads[0].anchor, None);
         let c = &doc.threads[0].comments[0];
         assert_eq!(c.state, CommentState::Visible);
-        assert_eq!(c.pending, false);
+        assert!(!c.pending);
         assert_eq!(c.review_id, None);
     }
 
@@ -712,15 +912,12 @@ mod tests {
             .start_review(&loc(), KEY, human("psn:reviewer@acme"))
             .unwrap();
         store
-            .add_pending_comment(
-                &loc(),
-                KEY,
+            .add_pending_comment(pending_comment(
                 &batch.id,
-                None,
                 human("psn:reviewer@acme"),
                 "draft note",
                 200,
-            )
+            ))
             .unwrap();
 
         let doc = store.load(&loc(), KEY).unwrap();
@@ -735,15 +932,13 @@ mod tests {
 
         // After submit, the comment is visible to everyone.
         store
-            .submit_review(
-                &loc(),
-                KEY,
+            .submit_review(submitted_review(
                 &batch.id,
-                &human("psn:reviewer@acme"),
+                human("psn:reviewer@acme"),
                 BatchVerdict::ChangesRequested,
                 None,
                 300,
-            )
+            ))
             .unwrap();
         let doc = store.load(&loc(), KEY).unwrap();
         let other = doc.view_for("psn:other@acme");
@@ -764,28 +959,23 @@ mod tests {
             .unwrap();
         for i in 0..3 {
             store
-                .add_pending_comment(
-                    &loc(),
-                    KEY,
+                .add_pending_comment(pending_comment(
                     &batch.id,
-                    None,
                     human("psn:reviewer@acme"),
                     format!("note {i}"),
                     200 + i,
-                )
+                ))
                 .unwrap();
         }
         // First submit → ONE event carrying all three comments.
         let first = store
-            .submit_review(
-                &loc(),
-                KEY,
+            .submit_review(submitted_review(
                 &batch.id,
-                &human("psn:reviewer@acme"),
+                human("psn:reviewer@acme"),
                 BatchVerdict::Approved,
                 Some("LGTM".into()),
                 400,
-            )
+            ))
             .unwrap();
         let ev = first.expect("first submit yields exactly one batch event");
         assert_eq!(ev.comment_ids.len(), 3, "the ONE event carries the whole batch");
@@ -793,15 +983,13 @@ mod tests {
         assert_eq!(ev.review.summary_md.as_deref(), Some("LGTM"));
         // Re-submit → idempotent None (no second event, no verdict change).
         let second = store
-            .submit_review(
-                &loc(),
-                KEY,
+            .submit_review(submitted_review(
                 &batch.id,
-                &human("psn:reviewer@acme"),
+                human("psn:reviewer@acme"),
                 BatchVerdict::Commented,
                 None,
                 500,
-            )
+            ))
             .unwrap();
         assert!(second.is_none(), "a re-submit must NOT emit a second event");
         std::fs::remove_dir_all(&root).ok();
@@ -830,7 +1018,12 @@ mod tests {
         let store = DurablePrThreadStore::rooted(&root);
         let batch = store.start_review(&loc(), KEY, human("psn:r@acme")).unwrap();
         store
-            .add_pending_comment(&loc(), KEY, &batch.id, None, human("psn:r@acme"), "draft", 1)
+            .add_pending_comment(pending_comment(
+                &batch.id,
+                human("psn:r@acme"),
+                "draft",
+                1,
+            ))
             .unwrap();
         store
             .discard_review(&loc(), KEY, &batch.id, &human("psn:r@acme"))
@@ -842,15 +1035,13 @@ mod tests {
         // A submitted batch cannot be discarded.
         let b2 = store.start_review(&loc(), KEY, human("psn:r@acme")).unwrap();
         store
-            .submit_review(
-                &loc(),
-                KEY,
+            .submit_review(submitted_review(
                 &b2.id,
-                &human("psn:r@acme"),
+                human("psn:r@acme"),
                 BatchVerdict::Commented,
                 None,
                 2,
-            )
+            ))
             .unwrap();
         assert!(matches!(
             store.discard_review(&loc(), KEY, &b2.id, &human("psn:r@acme")),
@@ -870,12 +1061,23 @@ mod tests {
         let attacker = human("psn:attacker@acme");
         let batch = store.start_review(&loc(), KEY, author.clone()).unwrap();
         store
-            .add_pending_comment(&loc(), KEY, &batch.id, None, author.clone(), "secret draft", 1)
+            .add_pending_comment(pending_comment(
+                &batch.id,
+                author.clone(),
+                "secret draft",
+                1,
+            ))
             .unwrap();
 
         // H-1: the attacker cannot force-submit the author's private draft.
         assert!(matches!(
-            store.submit_review(&loc(), KEY, &batch.id, &attacker, BatchVerdict::Approved, Some("forged".into()), 2),
+            store.submit_review(submitted_review(
+                &batch.id,
+                attacker.clone(),
+                BatchVerdict::Approved,
+                Some("forged".into()),
+                2,
+            )),
             Err(DurableError::Forbidden(_))
         ));
         // H-2: nor discard it.
@@ -885,7 +1087,12 @@ mod tests {
         ));
         // Nor inject a comment into it.
         assert!(matches!(
-            store.add_pending_comment(&loc(), KEY, &batch.id, None, attacker.clone(), "injected", 3),
+            store.add_pending_comment(pending_comment(
+                &batch.id,
+                attacker.clone(),
+                "injected",
+                3,
+            )),
             Err(DurableError::Forbidden(_))
         ));
 
@@ -894,7 +1101,13 @@ mod tests {
         assert_eq!(doc.view_for("psn:attacker@acme").reviews.len(), 0, "still hidden from the attacker");
         assert_eq!(doc.view_for("psn:author@acme").reviews.len(), 1, "author still owns their draft");
         let submitted = store
-            .submit_review(&loc(), KEY, &batch.id, &author, BatchVerdict::Approved, None, 4)
+            .submit_review(submitted_review(
+                &batch.id,
+                author,
+                BatchVerdict::Approved,
+                None,
+                4,
+            ))
             .unwrap();
         assert!(submitted.is_some(), "the real author can still submit their own batch");
         std::fs::remove_dir_all(&root).ok();

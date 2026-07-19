@@ -23,7 +23,7 @@ use myelin_identity_service::{
 use myelin_storage::{KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,6 +60,18 @@ fn admin_scope(tenant: &str) -> TenantScope {
     )
 }
 
+/// The exact active service identity seeded for `subj-1`; it carries no synthetic admin identity.
+fn authenticated_agent(tenant: &str) -> Principal {
+    Principal::new(
+        TenantId(tenant.into()),
+        Region(REGION.into()),
+        PrincipalId("svc:agent".into()),
+        PrincipalKind::Service,
+        DataRole::Controller,
+        PrincipalStatus::Active,
+    )
+}
+
 fn seed_tenant(store: &PrincipalStore, tenant: &str) {
     let scope = admin_scope(tenant);
     store
@@ -79,7 +91,7 @@ fn seed_tenant(store: &PrincipalStore, tenant: &str) {
 
 /// Build the real gateway over a known cell seed with Git registered over the DURABLE backend. Returns
 /// the gateway, the cell authority (to mint tokens), and the shared backend (to set repo-owned policy).
-fn build(root: &PathBuf) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBackend>) {
+fn build(root: &Path) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBackend>) {
     let cell = CellTokenAuthority::from_seed(&[7u8; 32], &[9u8; 32]).expect("cell authority");
     let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
     seed_tenant(&store, "acme");
@@ -93,7 +105,7 @@ fn build(root: &PathBuf) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBac
         Arc::new(KmsEngine::new()),
     )));
 
-    let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(root.clone()));
+    let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(root.to_path_buf()));
     let mut builder = Gateway::builder(authn, human_login, Arc::new(AllowAll)).route(
         Method::Get,
         "/v1/whoami",
@@ -272,7 +284,10 @@ async fn merge_blocked_by_gate_is_a_clean_cli_error() {
     assert!(stdout.is_empty(), "no view-model on a blocked merge");
 
     // The gate was NOT bypassed: the PR is still open on disk.
-    let rec = be.get_pr("acme", REGION, "alpha", 1).unwrap().unwrap();
+    let rec = be
+        .get_pr("acme", REGION, "alpha", 1, &authenticated_agent("acme"))
+        .unwrap()
+        .unwrap();
     assert_ne!(
         format!("{:?}", rec.state),
         "Merged",

@@ -798,7 +798,7 @@ impl OutboxTransaction {
                 inner.order.push(row.event_id.clone());
                 inner.rows.insert(row.event_id.clone(), row);
             }
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(any(test, feature = "test-support")))]
         unreachable!(

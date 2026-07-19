@@ -53,8 +53,9 @@ use myelin_git::pr_store::{
     DurablePrStore, MergeAttempt, PrRecord, ReviewRecord,
 };
 use myelin_git::pr_threads::{
-    AnchorState, BatchVerdict, CommentRecord, CommentState, DurablePrThreadStore, PrincipalRole,
-    ReviewBatch, ThreadAnchor, ThreadPrincipal, ThreadRecord, ViewedThreads,
+    AnchorState, BatchVerdict, CommentRecord, CommentState, DurablePrThreadStore,
+    PendingCommentRequest, PrincipalRole, ReviewBatch, SubmitReviewRequest, ThreadAnchor,
+    ThreadPrincipal, ThreadRecord, ViewedThreads,
 };
 use myelin_git::receive_pack::{
     evaluate_protected_ref_push, CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate,
@@ -69,6 +70,64 @@ use myelin_storage::{DurablePlacementBacking, KmsEngine, SubstrateProvider, Tena
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Verified request identity and repository route coordinates for a Git edge operation.
+#[derive(Clone, Copy)]
+pub struct RepoActorContext<'a> {
+    tenant: &'a str,
+    region: &'a str,
+    slug: &'a str,
+    principal: &'a Principal,
+}
+
+impl<'a> RepoActorContext<'a> {
+    /// Bind route coordinates to the already-authenticated principal.
+    pub fn new(
+        tenant: &'a str,
+        region: &'a str,
+        slug: &'a str,
+        principal: &'a Principal,
+    ) -> Self {
+        Self {
+            tenant,
+            region,
+            slug,
+            principal,
+        }
+    }
+
+    /// Add the pull-request number required by PR-scoped operations.
+    pub fn for_pr(self, number: u64) -> PrActorContext<'a> {
+        PrActorContext { repo: self, number }
+    }
+}
+
+impl core::fmt::Debug for RepoActorContext<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RepoActorContext")
+            .field("tenant", &self.tenant)
+            .field("region", &self.region)
+            .field("slug", &self.slug)
+            .field("principal", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Authenticated repository context plus a pull-request number.
+#[derive(Clone, Copy)]
+pub struct PrActorContext<'a> {
+    repo: RepoActorContext<'a>,
+    number: u64,
+}
+
+impl core::fmt::Debug for PrActorContext<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PrActorContext")
+            .field("repo", &self.repo)
+            .field("number", &self.number)
+            .finish()
+    }
+}
 
 /// **The durable on-disk git backend the edge writes/reads through (GT-003).** Holds the durable git
 /// store + the durable PR store rooted at one on-disk root, plus the shared outbox + id minter the ref
@@ -803,14 +862,17 @@ impl DurableGitBackend {
     /// named follow-on; the field is wired non-leaking so a future ACL feeds a count, never paths).
     fn pr_diff(
         &self,
-        tenant: &str,
-        region: &str,
-        slug: &str,
-        number: u64,
-        principal: &Principal,
+        target: PrActorContext<'_>,
         offset: usize,
         limit: usize,
     ) -> Result<Option<PrDiffVM>, DurableError> {
+        let PrActorContext { repo, number } = target;
+        let RepoActorContext {
+            tenant,
+            region,
+            slug,
+            principal,
+        } = repo;
         let loc = Self::loc(tenant, region, slug);
         let Some(rec) = self.pr_get(&loc, number, principal)? else {
             return Ok(None);
@@ -1120,15 +1182,18 @@ impl DurableGitBackend {
     /// raced ref tip is the honest `409`; a clean base persists (`durable: true`).
     fn web_edit_commit(
         &self,
-        tenant: &str,
-        region: &str,
-        slug: &str,
+        target: RepoActorContext<'_>,
         gitref: &str,
         path: &str,
         expected_base: &str,
         contents: &str,
-        principal: &Principal,
     ) -> Result<WebEditOutcome, DurableError> {
+        let RepoActorContext {
+            tenant,
+            region,
+            slug,
+            principal,
+        } = target;
         let loc = Self::loc(tenant, region, slug);
         let repo = Arc::new(self.store.open_repo(&loc)?);
         let full = format!("refs/heads/{gitref}");
@@ -1392,10 +1457,8 @@ impl DurableGitBackend {
     ) -> Result<Vec<EnrichedPr>, DurableError> {
         let records = self.pr_list(loc, principal)?;
         // ONE config read for the whole repo (fail static on error — see above).
-        let config = match self.prs.get_protection(loc) {
-            Ok(cfg) => Some(cfg),
-            Err(_) => None, // read failed → every row's summary degrades to Unavailable below.
-        };
+        // A read failure degrades every row's summary to Unavailable below.
+        let config = self.prs.get_protection(loc).ok();
         let config_readable = config.is_some();
         let config = config.flatten();
         Ok(records
@@ -1946,14 +2009,17 @@ impl DurableGitBackend {
     /// POST …/prs/{n}/threads/{tid}/comments — reply to a thread. Write = `Push`.
     pub fn add_thread_comment(
         &self,
-        tenant: &str,
-        region: &str,
-        slug: &str,
-        number: u64,
+        target: PrActorContext<'_>,
         thread_id: &str,
         body: &Value,
-        principal: &Principal,
     ) -> Result<Value, DurableError> {
+        let PrActorContext { repo, number } = target;
+        let RepoActorContext {
+            tenant,
+            region,
+            slug,
+            principal,
+        } = repo;
         let loc = Self::loc(tenant, region, slug);
         self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
@@ -1969,14 +2035,17 @@ impl DurableGitBackend {
     /// POST …/prs/{n}/threads/{tid}/resolve — resolve/unresolve a thread. Write = `Push`.
     pub fn resolve_thread(
         &self,
-        tenant: &str,
-        region: &str,
-        slug: &str,
-        number: u64,
+        target: PrActorContext<'_>,
         thread_id: &str,
         body: &Value,
-        principal: &Principal,
     ) -> Result<Value, DurableError> {
+        let PrActorContext { repo, number } = target;
+        let RepoActorContext {
+            tenant,
+            region,
+            slug,
+            principal,
+        } = repo;
         let loc = Self::loc(tenant, region, slug);
         self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
@@ -2012,29 +2081,26 @@ impl DurableGitBackend {
     /// its author until submit). Write = `Push`.
     pub fn add_pending_comment(
         &self,
-        tenant: &str,
-        region: &str,
-        slug: &str,
-        number: u64,
+        target: PrActorContext<'_>,
         review_id: &str,
         body: &Value,
-        principal: &Principal,
     ) -> Result<Value, DurableError> {
+        let PrActorContext { repo, number } = target;
+        let RepoActorContext {
+            tenant,
+            region,
+            slug,
+            principal,
+        } = repo;
         let loc = Self::loc(tenant, region, slug);
         self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
         let body_md = require_body_md(body)?;
         let anchor = parse_anchor(body);
         let author = Self::thread_principal(tenant, principal);
-        let comment = self.threads.add_pending_comment(
-            &loc,
-            &key,
-            review_id,
-            anchor,
-            author,
-            body_md,
-            now_unix(),
-        )?;
+        let request =
+            PendingCommentRequest::new(loc, key, review_id, anchor, author, body_md, now_unix())?;
+        let comment = self.threads.add_pending_comment(request)?;
         Ok(comment_json(&comment))
     }
 
@@ -2044,14 +2110,17 @@ impl DurableGitBackend {
     /// batch stays advisory — it never gates). Write = `Push`.
     pub fn submit_review_batch(
         &self,
-        tenant: &str,
-        region: &str,
-        slug: &str,
-        number: u64,
+        target: PrActorContext<'_>,
         review_id: &str,
         body: &Value,
-        principal: &Principal,
     ) -> Result<Value, DurableError> {
+        let PrActorContext { repo, number } = target;
+        let RepoActorContext {
+            tenant,
+            region,
+            slug,
+            principal,
+        } = repo;
         let loc = Self::loc(tenant, region, slug);
         self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
@@ -2072,15 +2141,16 @@ impl DurableGitBackend {
             .and_then(Value::as_str)
             .map(str::to_string);
         let actor = Self::thread_principal(tenant, principal);
-        let submitted = self.threads.submit_review(
-            &loc,
-            &key,
+        let request = SubmitReviewRequest::new(
+            loc.clone(),
+            key,
             review_id,
-            &actor,
+            actor,
             verdict,
             summary_md,
             now_unix(),
         )?;
+        let submitted = self.threads.submit_review(request)?;
         // Feed the merge gate: a NON-advisory approved/changes_requested verdict pushes a durable
         // review record (the gate reads `counting_approvals` + `has_blocking_review`). An agent batch
         // is advisory and a comment-only verdict adds no gate signal. Only the FIRST submit (Some)
@@ -2484,7 +2554,7 @@ impl DurableGitBackend {
     /// R2 ruleset actually ingests, so the copy never implies a gate input that isn't real.
     fn pr_checks_json(&self, loc: &RepoLoc, rec: &PrRecord) -> Result<Value, DurableError> {
         let ruleset = self.prs.effective_ruleset_for(loc, &rec.base_ref)?;
-        let eval = evaluate_merge(&ruleset, &rec).map_err(|e| DurableError::Git(e.to_string()))?;
+        let eval = evaluate_merge(&ruleset, rec).map_err(|e| DurableError::Git(e.to_string()))?;
         let has_blocking_review = rec.reviews.iter().any(|r| {
             matches!(
                 r.state,
@@ -3151,14 +3221,16 @@ impl Handler for DWebEditCommit {
         let outcome = self
             .be
             .web_edit_commit(
-                tenant_of(ctx),
-                region_of(ctx),
-                param(ctx, "repo")?,
+                RepoActorContext::new(
+                    tenant_of(ctx),
+                    region_of(ctx),
+                    param(ctx, "repo")?,
+                    ctx.principal,
+                ),
                 param(ctx, "ref")?,
                 param(ctx, "path")?,
                 expected_base,
                 contents,
-                ctx.principal,
             )
             .map_err(map_durable_err)?;
         match outcome {
@@ -3282,11 +3354,13 @@ impl Handler for DPrDiff {
         let vm = self
             .be
             .pr_diff(
-                tenant_of(ctx),
-                region_of(ctx),
-                param(ctx, "repo")?,
-                num_param(ctx, "n")?,
-                ctx.principal,
+                RepoActorContext::new(
+                    tenant_of(ctx),
+                    region_of(ctx),
+                    param(ctx, "repo")?,
+                    ctx.principal,
+                )
+                .for_pr(num_param(ctx, "n")?),
                 offset,
                 limit,
             )
@@ -3388,13 +3462,15 @@ impl Handler for DPrThreadComment {
         let vm = self
             .be
             .add_thread_comment(
-                tenant_of(ctx),
-                region_of(ctx),
-                param(ctx, "repo")?,
-                num_param(ctx, "n")?,
+                RepoActorContext::new(
+                    tenant_of(ctx),
+                    region_of(ctx),
+                    param(ctx, "repo")?,
+                    ctx.principal,
+                )
+                .for_pr(num_param(ctx, "n")?),
                 param(ctx, "tid")?,
                 &body,
-                ctx.principal,
             )
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(
@@ -3418,13 +3494,15 @@ impl Handler for DPrThreadResolve {
         let vm = self
             .be
             .resolve_thread(
-                tenant_of(ctx),
-                region_of(ctx),
-                param(ctx, "repo")?,
-                num_param(ctx, "n")?,
+                RepoActorContext::new(
+                    tenant_of(ctx),
+                    region_of(ctx),
+                    param(ctx, "repo")?,
+                    ctx.principal,
+                )
+                .for_pr(num_param(ctx, "n")?),
                 param(ctx, "tid")?,
                 &body,
-                ctx.principal,
             )
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(
@@ -3467,13 +3545,15 @@ impl Handler for DPrReviewComment {
         let vm = self
             .be
             .add_pending_comment(
-                tenant_of(ctx),
-                region_of(ctx),
-                param(ctx, "repo")?,
-                num_param(ctx, "n")?,
+                RepoActorContext::new(
+                    tenant_of(ctx),
+                    region_of(ctx),
+                    param(ctx, "repo")?,
+                    ctx.principal,
+                )
+                .for_pr(num_param(ctx, "n")?),
                 param(ctx, "rid")?,
                 &body,
-                ctx.principal,
             )
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(
@@ -3497,13 +3577,15 @@ impl Handler for DPrReviewSubmit {
         let vm = self
             .be
             .submit_review_batch(
-                tenant_of(ctx),
-                region_of(ctx),
-                param(ctx, "repo")?,
-                num_param(ctx, "n")?,
+                RepoActorContext::new(
+                    tenant_of(ctx),
+                    region_of(ctx),
+                    param(ctx, "repo")?,
+                    ctx.principal,
+                )
+                .for_pr(num_param(ctx, "n")?),
                 param(ctx, "rid")?,
                 &body,
-                ctx.principal,
             )
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(
@@ -3566,7 +3648,7 @@ fn pr_list_envelope(mut enriched: Vec<EnrichedPr>, ctx: &HandlerCtx<'_>, counts:
     // record has no created_at); the default `sort=updated` orders by the durable updated stamp,
     // tie-broken by number so the order is total + stable (cursor stability).
     match sort.as_deref() {
-        Some("created") => enriched.sort_by(|a, b| b.rec.number.cmp(&a.rec.number)),
+        Some("created") => enriched.sort_by_key(|item| std::cmp::Reverse(item.rec.number)),
         _ => enriched.sort_by(|a, b| {
             b.rec
                 .updated_at
@@ -4262,6 +4344,11 @@ mod event_privacy_tests {
         ] {
             assert!(!serialized.contains(raw), "raw Agent identifier leaked: {raw}");
         }
+
+        let request = RepoActorContext::new("acme", "fr-par", "core", &principal).for_pr(42);
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("agent:raw@example.test"));
+        assert!(debug.contains("principal: \"<redacted>\""));
     }
 
     #[test]

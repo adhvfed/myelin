@@ -581,6 +581,7 @@ mod tests {
             payload: result,
             payload_key_ref: None,
             consumed_seq: None,
+            received_unix_ms: 0,
         });
     }
 

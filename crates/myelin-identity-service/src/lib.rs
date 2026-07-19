@@ -162,7 +162,7 @@ pub use machine_auth::{
 };
 pub use mint::{
     expires_at_of, run_token_jti, CiJobAuthorizationError, MintError, RevocationProof,
-    RunTokenMinter, StructuralTokenSigner, TokenSigner, RUN_GRANT_RELATION,
+    RunTokenMinter, StructuralTokenSigner, TokenSignRequest, TokenSigner, RUN_GRANT_RELATION,
     SELFHOSTED_GRANT_PREFIX,
 };
 pub use multi_cell::{
@@ -171,7 +171,8 @@ pub use multi_cell::{
 };
 pub use oidc::{JwkKey, JwkSet, OidcConfig, OidcVerifier, ReplayGuard, SchemeDispatchVerifier};
 pub use principal_store::{
-    PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore, ProfileRef, S1_HOLDER, S1_TABLE,
+    PrincipalCredentialProvision, PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore,
+    ProfileRef, S1_HOLDER, S1_TABLE,
 };
 pub use pseudonym_erase::{
     ErasureLedgerEntry, ErasureReceipt, PseudonymEraseError, PseudonymErasureLedger,

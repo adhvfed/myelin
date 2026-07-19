@@ -583,7 +583,7 @@ impl SandboxBackend for GvisorBackend {
 ///    egress is default-deny, pids ceiling, NON-ROOT user, an advisory `memory.limit`, and a
 ///    size-bounded writable `/tmp` tmpfs from `spec.limits.disk_bytes` — CT-003a: a disk fill hits
 ///    ENOSPC at the quota, never an unbounded host-RAM-backed tmpfs).
-/// 1b. CT-003b (SI-017): establish an OUT-OF-BAND [`MemoryCgroup`] capped at `spec.limits.mem_bytes`
+///    1b. CT-003b (SI-017): establish an OUT-OF-BAND [`MemoryCgroup`] capped at `spec.limits.mem_bytes`
 ///    and place the `runsc` process tree (frontend + the sentry/gofer it forks) into it. This is the
 ///    REAL memory bound — rootless runsc ignores the OCI `memory.limit`, so without this an untrusted
 ///    job's anonymous memory was UNBOUNDED (a host-DoS escape). FAIL-CLOSED: if the cgroup cannot be

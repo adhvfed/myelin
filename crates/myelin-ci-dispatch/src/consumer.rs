@@ -1211,6 +1211,69 @@ impl ReserveStore for RecordingReserveStore {
     }
 }
 
+/// **The production [`GitConfigReader`] adapter over the myelin-git durable read backend.** Wraps a
+/// `myelin_git::durable::DurableStore` (the on-disk repo store): `read_repo_file` opens the repo at
+/// `(tenant, region, repo)` and reads the blob at `oid`:`path` via `read_blob_at_path` (the SAME
+/// nested tree/blob navigation the repo-browser uses — never a reimplemented walk). A missing path /
+/// a path that resolves to a directory reads as `Ok(None)` (a clean skip); a backend error is
+/// `Err(GitReadError)` (fail-closed).
+///
+/// **Named cross-service floor:** in a split deployment the git repos live in the GIT service's
+/// storage, not the dispatch service's — reading blobs cross-service is a git-service read API
+/// (in-process `ReadBackend` or an RPC). This adapter is the in-cell/shared-storage form; the
+/// cross-cell git-read hop is the deploy follow-on.
+pub struct DurableGitConfigReader<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> {
+    store: myelin_git::durable::DurableGitStore<P>,
+}
+
+impl<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> DurableGitConfigReader<P> {
+    /// Build the adapter over a durable repo store.
+    pub fn new(store: myelin_git::durable::DurableGitStore<P>) -> DurableGitConfigReader<P> {
+        DurableGitConfigReader { store }
+    }
+}
+
+impl<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> GitConfigReader
+    for DurableGitConfigReader<P>
+{
+    fn read_repo_file(
+        &self,
+        tenant: &str,
+        region: &str,
+        repo: &str,
+        oid: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, GitReadError> {
+        self.read_repo_file_bounded(tenant, region, repo, oid, path, usize::MAX)
+    }
+
+    fn read_repo_file_bounded(
+        &self, tenant: &str, region: &str, repo: &str, oid: &str, path: &str, maximum_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, GitReadError> {
+        let loc = myelin_git::core::RepoLoc::new(tenant, region, repo);
+        if !self.store.repo_exists(&loc) {
+            return Err(GitReadError::Unavailable(format!(
+                "repository {repo} is unavailable for tenant={tenant} region={region}"
+            )));
+        }
+        let git = self
+            .store
+            .open_repo(&loc)
+            .map_err(|e| GitReadError::Unavailable(format!("open {repo}: {e}")))?;
+        let oid = myelin_git::core::Oid::new(oid);
+        match git
+            .read_blob_at_commit_oid_bounded(&oid, path, maximum_bytes)
+            .map_err(|e| GitReadError::Unavailable(format!("read {path}@{}: {e}", oid.as_str())))?
+        {
+            myelin_git::durable::BlobPathLookup::Found { bytes, .. } => Ok(Some(bytes)),
+            myelin_git::durable::BlobPathLookup::TooLarge { size, maximum } => Err(GitReadError::Invalid(format!("{path}@{} is {size} bytes, above the {maximum}-byte config limit", oid.as_str()))),
+            // Absent or a directory at that name → no config file (a clean skip).
+            myelin_git::durable::BlobPathLookup::Missing
+            | myelin_git::durable::BlobPathLookup::IsDir => Ok(None),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2003,68 +2066,5 @@ mod tests {
         assert_eq!(a.len(), 36, "canonical uuid length");
         assert_eq!(a.matches('-').count(), 4, "canonical uuid dashes");
         assert!(a.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
-    }
-}
-
-/// **The production [`GitConfigReader`] adapter over the myelin-git durable read backend.** Wraps a
-/// `myelin_git::durable::DurableStore` (the on-disk repo store): `read_repo_file` opens the repo at
-/// `(tenant, region, repo)` and reads the blob at `oid`:`path` via `read_blob_at_path` (the SAME
-/// nested tree/blob navigation the repo-browser uses — never a reimplemented walk). A missing path /
-/// a path that resolves to a directory reads as `Ok(None)` (a clean skip); a backend error is
-/// `Err(GitReadError)` (fail-closed).
-///
-/// **Named cross-service floor:** in a split deployment the git repos live in the GIT service's
-/// storage, not the dispatch service's — reading blobs cross-service is a git-service read API
-/// (in-process `ReadBackend` or an RPC). This adapter is the in-cell/shared-storage form; the
-/// cross-cell git-read hop is the deploy follow-on.
-pub struct DurableGitConfigReader<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> {
-    store: myelin_git::durable::DurableGitStore<P>,
-}
-
-impl<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> DurableGitConfigReader<P> {
-    /// Build the adapter over a durable repo store.
-    pub fn new(store: myelin_git::durable::DurableGitStore<P>) -> DurableGitConfigReader<P> {
-        DurableGitConfigReader { store }
-    }
-}
-
-impl<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> GitConfigReader
-    for DurableGitConfigReader<P>
-{
-    fn read_repo_file(
-        &self,
-        tenant: &str,
-        region: &str,
-        repo: &str,
-        oid: &str,
-        path: &str,
-    ) -> Result<Option<Vec<u8>>, GitReadError> {
-        self.read_repo_file_bounded(tenant, region, repo, oid, path, usize::MAX)
-    }
-
-    fn read_repo_file_bounded(
-        &self, tenant: &str, region: &str, repo: &str, oid: &str, path: &str, maximum_bytes: usize,
-    ) -> Result<Option<Vec<u8>>, GitReadError> {
-        let loc = myelin_git::core::RepoLoc::new(tenant, region, repo);
-        if !self.store.repo_exists(&loc) {
-            return Err(GitReadError::Unavailable(format!(
-                "repository {repo} is unavailable for tenant={tenant} region={region}"
-            )));
-        }
-        let git = self
-            .store
-            .open_repo(&loc)
-            .map_err(|e| GitReadError::Unavailable(format!("open {repo}: {e}")))?;
-        let oid = myelin_git::core::Oid::new(oid);
-        match git
-            .read_blob_at_commit_oid_bounded(&oid, path, maximum_bytes)
-            .map_err(|e| GitReadError::Unavailable(format!("read {path}@{}: {e}", oid.as_str())))?
-        {
-            myelin_git::durable::BlobPathLookup::Found { bytes, .. } => Ok(Some(bytes)),
-            myelin_git::durable::BlobPathLookup::TooLarge { size, maximum } => Err(GitReadError::Invalid(format!("{path}@{} is {size} bytes, above the {maximum}-byte config limit", oid.as_str()))),
-            // Absent or a directory at that name → no config file (a clean skip).
-            myelin_git::durable::BlobPathLookup::Missing
-            | myelin_git::durable::BlobPathLookup::IsDir => Ok(None),
-        }
     }
 }

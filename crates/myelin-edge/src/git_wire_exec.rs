@@ -12,6 +12,7 @@
 //! [`myelin_ci_sandbox::gvisor::GvisorBackend::launch_git_wire`] — canonical `git <argv> /repo` inside
 //! the PROVEN hardened gVisor sandbox (CT-002/003/006a: egress default-deny + no-netns, read-only root
 //! + tmpfs scratch, all caps dropped, no-new-privileges, seccomp, non-root uid, mem/pids/disk bounded,
+//!
 //! whole-container kill + cleanup, bounded capture). The bare repo is bound **READ-ONLY** at `/repo`;
 //! the locator is resolver-validated (the GT-001 cross-tenant boundary, replicated + drift-pinned) and
 //! symlink-confined before any mount. **No host-exec fingerprint here** — the edge NEVER calls

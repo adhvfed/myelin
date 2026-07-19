@@ -208,11 +208,11 @@
 //!   backend is `Pg(..)` over the MR-024 `DurableMisrouteAuditBacking` (`MisrouteAudit::with_pg`,
 //!   `misroute_audit` table, migration 0034 — the durable backing FULLY EXISTED; W6d added the enum
 //!   + wired `CellGateway` to the durable sink via `with_audit`, landing TOGETHER with the Registry
-//!   flip because they share the `DegenerateControlPlane` self-host boot). A durable audit-write
-//!   fault fails static LOUD (an unrecorded misroute is silently-lost layer-4 evidence — the W6a
-//!   ledger lesson). The scanner strips the gated `Memory` arm → the entry is REMOVED. Proven live
-//!   (`integration_mr009b_w6d_registry_durable`: a gateway-rejected misroute lands in the durable
-//!   sink and survives a fresh pool) + `integration_mr024_placement_durable` stays green.
+//!     flip because they share the `DegenerateControlPlane` self-host boot). A durable audit-write
+//!     fault fails static LOUD (an unrecorded misroute is silently-lost layer-4 evidence — the W6a
+//!     ledger lesson). The scanner strips the gated `Memory` arm → the entry is REMOVED. Proven live
+//!     (`integration_mr009b_w6d_registry_durable`: a gateway-rejected misroute lands in the durable
+//!     sink and survives a fresh pool) + `integration_mr024_placement_durable` stays green.
 //! - **MR-009b Wave 5 FLIPPED the `KmsEngine` (SI-006) GREEN (12→11):** `kms.rs` `KmsEngine` is now
 //!   durable-by-default — a role struct over a `KmsBackend` enum (the Wave-2/DedupLedger pattern).
 //!   The in-memory `Memory(KmsCore)` arm + `KmsEngine::new()`/`Default`/`from_root` are
@@ -294,6 +294,7 @@
 //!   - `Consumer` (SI-024, events cursor/lag) · (S7Denylist SI-020 was here — DISCHARGED by MR-011)
 //!   - `Firehose` (SI-037, live transport) · `InMemoryShredder` (SI-038, GDPR shred) ·
 //!     `OltpPool` (SI-021, OLTP permit pool) · `PlacementService` stickiness (SI-026, control-plane)
+//!
 //! A future "we made the bus / control-plane durable" claim is therefore only PARTIALLY gated until
 //! that MR extends the scanner — this note exists so that gap is not silently relied upon.
 //!

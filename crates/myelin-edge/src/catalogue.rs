@@ -29,6 +29,7 @@
 //!   3. a [`Handler`] whose `handle(ctx)` runs the already-built subsystem handler over `ctx.scope`
 //!      (its writes go through `with_tenant_tx` / `OutboxTx::emit`; its reads project the ViewModel
 //!      DATA into a JSON [`EdgeResponse`](crate::EdgeResponse)).
+//!
 //! The gateway owns authentication, tenant-from-token, the IDOR reject, authorization, the error
 //! envelope, versioning, pagination parsing, and SSE — so a subsystem adds ONLY its routes + handlers.
 

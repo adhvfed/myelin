@@ -811,12 +811,17 @@ async fn bootstrap(core: Core, parsed: BootstrapArgs) -> Result<(), String> {
     store
         .provision_principal_credential(
             &scope,
-            PrincipalId(principal_id.to_string()),
-            PrincipalKind::Human,
-            DataRole::Controller,
-            PrincipalStatus::Active,
-            &scheme,
-            principal_id,
+            myelin_identity_service::PrincipalCredentialProvision::new(
+                PrincipalId(principal_id.to_string()),
+                PrincipalKind::Human,
+                DataRole::Controller,
+                PrincipalStatus::Active,
+                &scheme,
+                principal_id,
+            )
+            .map_err(|error| {
+                format!("invalid principal/credential provisioning request: {error}")
+            })?,
         )
         .map_err(|error| format!("atomic principal/credential provisioning failed: {error}"))?;
     let now = unix_now()?;

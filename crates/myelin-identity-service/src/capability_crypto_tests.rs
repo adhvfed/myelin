@@ -5,7 +5,11 @@
 
 use super::*;
 use crate::machine_auth::MachineKind;
-use myelin_identity::AuthzError;
+use myelin_identity::{
+    AuthzError, DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus,
+};
+use myelin_storage::TenantScope;
+use myelin_tenancy::{Region, TenantId};
 
 const NOW: i64 = 1_700_000_000;
 
@@ -17,6 +21,30 @@ fn cell() -> CellTokenAuthority {
 /// A verifier over a cell's trust anchor, clock pinned to `NOW`.
 fn verifier(anchor: CellTrustAnchor) -> PasetoCapabilityVerifier {
     PasetoCapabilityVerifier::new(anchor).with_clock(|| NOW)
+}
+
+fn sign_request(
+    jti: &str,
+    purpose: CredentialPurpose,
+    expires_at: &str,
+    grants: &[&str],
+) -> crate::mint::TokenSignRequest {
+    let principal = Principal::new(
+        TenantId("acme".into()),
+        Region("eu-west".into()),
+        PrincipalId("svc:agent".into()),
+        PrincipalKind::Service,
+        DataRole::Controller,
+        PrincipalStatus::Active,
+    );
+    crate::mint::TokenSignRequest::new(
+        &TenantScope::from_verified_token(&principal, principal.region.clone()),
+        principal.principal_id,
+        jti,
+        purpose,
+        myelin_events::Timestamp(expires_at.into()),
+        grants.iter().copied(),
+    )
 }
 
 fn spec(tenant: &str, grants: &[&str], jkt: Option<String>) -> CapabilityMintSpec {
@@ -492,18 +520,15 @@ fn signer_verifier_seam_round_trip() {
     use crate::mint::TokenSigner;
     let c = std::sync::Arc::new(cell());
     let signer = PasetoCapabilitySigner::new(c.clone()).with_clock(|| NOW);
-    let material = signer.sign(
-        "acme",
-        "eu-west",
-        "svc:agent",
+    let material = signer.sign(&sign_request(
         "runtok:1",
-        &CredentialPurpose::AgentRun {
+        CredentialPurpose::AgentRun {
             run_id: "run:1".into(),
             delegation_snapshot: Some(42),
         },
-        &myelin_events::Timestamp("2023-11-14T22:18:20Z".into()),
+        "2023-11-14T22:18:20Z",
         &["agent:run"],
-    );
+    ));
     let v = verifier(c.trust_anchor());
     let cred = myelin_identity::Credential {
         scheme: "agent".into(),
@@ -537,18 +562,15 @@ fn signer_malformed_run_deadline_produces_unusable_token() {
 
     let c = std::sync::Arc::new(cell());
     let signer = PasetoCapabilitySigner::new(c.clone()).with_clock(|| NOW);
-    let material = signer.sign(
-        "acme",
-        "eu-west",
-        "svc:agent",
+    let material = signer.sign(&sign_request(
         "runtok:bad-exp",
-        &CredentialPurpose::AgentRun {
+        CredentialPurpose::AgentRun {
             run_id: "run:bad-exp".into(),
             delegation_snapshot: Some(42),
         },
-        &myelin_events::Timestamp("not-a-deadline".into()),
+        "not-a-deadline",
         &["repo.pull"],
-    );
+    ));
     let error = verifier(c.trust_anchor())
         .verify(&myelin_identity::Credential {
             scheme: "agent".into(),
