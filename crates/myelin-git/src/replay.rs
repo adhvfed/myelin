@@ -18,8 +18,14 @@
 //! store will hold) and replays it **sub-artifact-granular**:
 //!
 //! - **`repo:<id>`** — a whole repo (the `git.repo.snapshot` re-emit);
-//! - **`blob:<repo>/<oid>`** — a single indexed blob / code-projection unit (the `git.blob.snapshot`
-//!   re-emit — Search's code index re-derives at blob granularity, GIT-P25/P31);
+//! - **`blob:<encoded-repo>:<encoded-ref>:<path>`** — a single indexed blob / code-projection unit
+//!   (the `git.blob.snapshot` re-emit — Search's code index re-derives at blob granularity,
+//!   GIT-P25/P31). Keyed by PATH, matching the code projection, which holds one document per path on
+//!   an indexed ref; the repo and ref components are `SubjectComponent`-encoded so the key is
+//!   unambiguous even though ref names contain `/`. Populated by
+//!   [`GitReindexSource::load_canonical_blob_truth`] from the current canonical truth. Note the
+//!   selector grammar reaches these through `blob:all`; a per-blob selector matches on the
+//!   segment-anchored trailing suffix ([`matches_aggregate`]), i.e. the encoded path.
 //! - **`pr:<repo>/<num>`** — a single PR (the `git.pr.snapshot` re-emit).
 //!
 //! The deterministic snapshot `event_id` (from `(aggregate, version)`, `myelin_events::snapshot_event_id`)
@@ -187,11 +193,24 @@ impl GitReindexSource {
 
 /// The aggregate-key prefix every blob of one `(repo, ref)` shares.
 ///
-/// Blob aggregates are `blob:<repo>/<ref>/` + path, so a `(repo, ref)` reload can drop exactly its
-/// own rows. The trailing `/` is load-bearing: without it, repo `core` would prefix-match `core2`
-/// and a reload of one repo would wipe another's blob truth.
+/// The components are `SubjectComponent`-ENCODED, which is what makes the prefix unambiguous. A raw
+/// `blob:<repo>/<ref>/` join collides: `(repo = "a", ref = "b/c")` and `(repo = "a/b", ref = "c")`
+/// produce the identical prefix, because ref names contain `/`. A reload of one would then drop the
+/// other's blob truth — silently deleting a ref's entire indexed corpus from the replay source. The
+/// encoding escapes `/` (and every other non-alphanumeric), so each component is a single opaque
+/// token and the boundary is exact.
+///
+/// The trailing delimiter is load-bearing for the same reason at the tail: without it, repo `core`
+/// would prefix-match `core2`.
 fn blob_aggregate_prefix(repo: &str, ref_name: &str) -> String {
-    format!("blob:{repo}/{ref_name}/")
+    let enc = |raw: &str| {
+        myelin_events::SubjectComponent::encode(raw)
+            .map(|c| c.as_str().to_string())
+            // An unencodable component cannot collide with a real one either — it is only ever
+            // compared against prefixes built by this same function.
+            .unwrap_or_else(|_| raw.replace('/', "%2F"))
+    };
+    format!("blob:{}:{}:", enc(repo), enc(ref_name))
 }
 
 /// **Does aggregate `agg` match a specific (non-`all`) selector `target`?** A match is EITHER an EXACT

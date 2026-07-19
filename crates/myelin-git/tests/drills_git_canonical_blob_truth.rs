@@ -223,3 +223,61 @@ fn reloading_replaces_the_refs_blob_truth_rather_than_merging() {
     let drafts = source.replay(&scope, None);
     assert_eq!(drafts.len(), 2, "both repos' blob truth coexists");
 }
+
+/// **A `(repo, ref)` reload cannot drop a different `(repo, ref)`'s blob truth, even when the raw
+/// components would collide.**
+///
+/// Ref names contain `/`, so a raw `blob:<repo>/<ref>/` join makes `(repo = "a", ref = "b/c")` and
+/// `(repo = "a/b", ref = "c")` produce the identical prefix — and reloading one would silently
+/// delete the other ref's entire indexed corpus from the replay source. The components are
+/// percent-encoded for exactly this reason.
+#[test]
+fn a_reload_cannot_drop_a_colliding_repo_refs_truth() {
+    let outbox = OutboxStore::new();
+    let cursor = CodeProjectionCursor::new();
+    let r = NoRestrictions;
+    let mut source = GitReindexSource::new();
+
+    let load = |source: &mut GitReindexSource, repo: &str, ref_name: &str, path: &'static str| {
+        let e = CodeProjectionEmitter::new(
+            repo,
+            // The indexed-ref policy keys on the default branch; name it so the ref is indexed.
+            ref_name.trim_start_matches("refs/heads/"),
+            ctx(),
+            &outbox,
+            Arc::new(MonotonicMinter::new()),
+            &cursor,
+            &r,
+        );
+        let tree = Tree::empty().with(path, Blob::new("o", b"x".to_vec()));
+        let truth = e.enumerate_canonical_truth(ref_name, &tree).unwrap();
+        assert_eq!(truth.len(), 1, "{repo}/{ref_name} enumerated");
+        source.load_canonical_blob_truth(repo, ref_name, &truth, 1);
+    };
+
+    // The two colliding shapes: repo "a" + ref "b/c", and repo "a/b" + ref "c".
+    load(&mut source, "a", "refs/heads/b/c", "first.rs");
+    load(&mut source, "a/b", "refs/heads/c", "second.rs");
+
+    let scope = SnapshotScope::new("git", "blob:all");
+    let drafts = source.replay(&scope, None);
+    assert_eq!(
+        drafts.len(),
+        2,
+        "both colliding (repo, ref) pairs keep their own truth: {:?}",
+        drafts.iter().map(|d| &d.subject.0).collect::<Vec<_>>()
+    );
+
+    // Reloading ONE of them must not disturb the other.
+    load(&mut source, "a", "refs/heads/b/c", "first-renamed.rs");
+    let drafts = source.replay(&scope, None);
+    assert_eq!(drafts.len(), 2, "the sibling's truth survived the reload");
+    assert!(
+        drafts.iter().any(|d| d.subject.0.contains("second")),
+        "the other (repo, ref)'s blob is still present"
+    );
+    assert!(
+        drafts.iter().any(|d| d.subject.0.contains("renamed")),
+        "and the reloaded one was replaced, not merged"
+    );
+}
