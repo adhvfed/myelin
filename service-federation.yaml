@@ -99,6 +99,22 @@ services:
 entrypoints: [postgres, rustfs-bucket, valkey, nats]
 
 scripts:
+  test:ci-dispatch-transport:
+    depends_on: [postgres, rustfs-bucket, nats]
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_REGION: fr-par
+    script: >-
+      cargo test -p myelin-ci-dispatch --features integration
+      --test integration_ci_dispatch_production_transport -- --nocapture
+
   test:integration:
     depends_on: [postgres, rustfs-bucket, valkey, nats]
     environment:
