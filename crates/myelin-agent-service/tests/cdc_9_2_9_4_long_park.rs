@@ -263,6 +263,7 @@ fn a_doubly_delivered_job_done_wakes_the_long_parked_run_exactly_once() {
             payload: result.clone(),
             payload_key_ref: None,
             consumed_seq: None,
+            received_unix_ms: 0,
         });
     }
     assert_eq!(
