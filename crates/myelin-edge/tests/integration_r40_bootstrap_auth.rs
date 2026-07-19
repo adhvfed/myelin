@@ -9,6 +9,7 @@
 //!   2. `POST /v1/git/repos` (create) → 201;
 //!   3. `POST .../blob/...` (web-edit commit) → 200 → a head oid;
 //!   4. `POST .../prs` (open) → 201, `POST .../prs/1/reviews` (review) → 200, `POST .../prs/1/merge` → 200.
+//!
 //! Plus: **bootstrap is idempotent** — a second run for the SAME principal mints a NEW token (distinct
 //! jti) without corrupting the principal, and BOTH tokens authenticate.
 //!
