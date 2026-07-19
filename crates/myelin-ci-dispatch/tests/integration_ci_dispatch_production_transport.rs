@@ -14,9 +14,11 @@ use myelin_events::nats::{
 };
 use myelin_events::relay::{EventConsumer, EventPublisher};
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, DedupLedger, DurableDedup,
-    EventEnvelope, EventId, EventType, OutboxStore, Timestamp, UlidMinter, Visibility,
-    CONSUMER_DEAD_LETTER_MIGRATION, CONSUMER_DEDUP_MIGRATION, OUTBOX_MIGRATION,
+    Actor, AggregateKey, ArtifactRef, BrokerDeliveryRef, CorrelationId, DataRole, DedupLedger,
+    DeliveryQuarantineReason, DurableDedup, DurableDeliveryQuarantine, EventEnvelope, EventId,
+    EventType, OutboxStore, Timestamp, UlidMinter, Visibility,
+    CONSUMER_DEAD_LETTER_MIGRATION, CONSUMER_DEDUP_MIGRATION,
+    CONSUMER_DELIVERY_QUARANTINE_MIGRATION, OUTBOX_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::events_durable::{DurableDeadLetterBacking, DurableDedupBacking};
@@ -70,6 +72,7 @@ async fn isolated_pool(schema: &str) -> PgPool {
         OUTBOX_MIGRATION,
         CONSUMER_DEDUP_MIGRATION,
         CONSUMER_DEAD_LETTER_MIGRATION,
+        CONSUMER_DELIVERY_QUARANTINE_MIGRATION,
     ] {
         pool.execute(ddl).await.unwrap();
     }
@@ -145,6 +148,7 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
     let schema = format!("ci_dispatch_transport_{nonce}");
     let tenant = format!("transport-{nonce}");
     let event_id = format!("transport-event-{nonce}");
+    let second_event_id = format!("transport-event-second-{nonce}");
     let stream_name = format!("MYELIN_CI_DISPATCH_PROOF_{nonce}");
     let subject_root = format!("myelin.ci_dispatch_proof_{nonce}");
     let durable_name = format!("ci-dispatch-proof-{nonce}");
@@ -183,6 +187,7 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
     .unwrap();
 
     let envelope = push_event(&tenant, &commit, &event_id);
+    let second_envelope = push_event(&tenant, &commit, &second_event_id);
     sqlx::query(
         "INSERT INTO outbox(event_id, aggregate, seq, subject, envelope) VALUES ($1,$2,$3,$4,$5)",
     )
@@ -217,21 +222,51 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
         &durable_name,
     );
     let intake = NatsJetStreamBus::connect_consumer(intake_config.clone(), rt.clone()).unwrap();
-    let spec =
-        dispatch_app_spec_with_intake(Config::default(), outbox, consumers, Box::new(intake));
+    let quarantine = Arc::new(
+        myelin_storage::events_durable::DurableDeliveryQuarantineBacking::new(
+            pool.clone(),
+            rt.clone(),
+        ),
+    );
+    let spec = dispatch_app_spec_with_intake(
+        Config::default(), outbox, consumers, Box::new(intake), quarantine.clone(),
+    );
     let handle = boot(spec).unwrap();
+    let raw_client = async_nats::connect(&cfg.nats_url).await.unwrap();
+    let raw_js = async_nats::jetstream::new(raw_client);
+    raw_js
+        .publish(
+            format!("{subject_root}.evt.{tenant}.git.poison.malformed"),
+            Vec::from(&b"ATTACKER_PII_SENTINEL malformed envelope"[..]).into(),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    publisher.publish(&envelope.subject, &envelope, &envelope.event_id).unwrap();
+    raw_js
+        .publish(
+            format!("{subject_root}.evt.{tenant}.git.poison.route_mismatch"),
+            serde_json::to_vec(&envelope).unwrap().into(),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
     publisher
-        .publish(&envelope.subject, &envelope, &envelope.event_id)
+        .publish(&second_envelope.subject, &second_envelope, &second_envelope.event_id)
         .unwrap();
     handle.tick();
 
-    let run_count: i64 =
-        sqlx::query_scalar("SELECT count(*)::bigint FROM ci_run WHERE cause_event_id=$1")
+    let run_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM ci_run WHERE cause_event_id IN ($1, $2)",
+    )
             .bind(&event_id)
+            .bind(&second_event_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(run_count, 1, "one broker event creates exactly one ci_run");
+    assert_eq!(run_count, 2, "both valid siblings create their independent ci_run");
     let row = sqlx::query("SELECT definition_snapshot FROM ci_run WHERE cause_event_id=$1")
         .bind(&event_id)
         .fetch_one(&pool)
@@ -244,24 +279,77 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
         tokio::task::block_in_place(|| s3.get(&TenantId(tenant.clone()), &address)).unwrap();
     assert_eq!(ContentHash::blake3(&bytes), address);
     let dedup_count: i64 = sqlx::query_scalar(
-        "SELECT count(*)::bigint FROM consumer_dedup WHERE consumer=$1 AND event_id=$2",
+        "SELECT count(*)::bigint FROM consumer_dedup \
+         WHERE consumer=$1 AND event_id IN ($2, $3)",
     )
     .bind(myelin_ci_dispatch::TRIGGER_CONSUMER)
     .bind(&event_id)
+    .bind(&second_event_id)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(dedup_count, 1);
+    assert_eq!(dedup_count, 2);
+    let quarantine_reasons: Vec<String> = sqlx::query_scalar(
+        "SELECT reason_code FROM consumer_delivery_quarantine \
+         WHERE consumer=$1 ORDER BY stream_sequence",
+    )
+    .bind(&durable_name)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        quarantine_reasons,
+        vec!["malformed_envelope".to_string(), "subject_mismatch".to_string()]
+    );
+    let quarantine_json: Vec<String> = sqlx::query_scalar(
+        "SELECT row_to_json(q)::text FROM consumer_delivery_quarantine q WHERE consumer=$1",
+    )
+    .bind(&durable_name)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(quarantine_json.iter().all(|row| !row.contains("ATTACKER_PII_SENTINEL")));
+    let (quarantine_stream, quarantine_sequence, quarantine_attempt): (String, i64, i64) =
+        sqlx::query_as(
+            "SELECT stream, stream_sequence, delivery_attempt \
+             FROM consumer_delivery_quarantine WHERE consumer=$1 \
+             ORDER BY stream_sequence LIMIT 1",
+        )
+        .bind(&durable_name)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    quarantine
+        .record(
+            &durable_name,
+            &BrokerDeliveryRef {
+                stream: quarantine_stream,
+                stream_sequence: u64::try_from(quarantine_sequence).unwrap(),
+            },
+            DeliveryQuarantineReason::MalformedEnvelope,
+            u64::try_from(quarantine_attempt).unwrap(),
+        )
+        .unwrap();
+    let quarantine_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM consumer_delivery_quarantine WHERE consumer=$1",
+    )
+    .bind(&durable_name)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(quarantine_count, 2, "re-record is idempotent on broker reference");
     handle.tick();
-    let after_redelivery: i64 =
-        sqlx::query_scalar("SELECT count(*)::bigint FROM ci_run WHERE cause_event_id=$1")
+    let after_redelivery: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM ci_run WHERE cause_event_id IN ($1, $2)",
+    )
             .bind(&event_id)
+            .bind(&second_event_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
-        after_redelivery, 1,
-        "a second tick cannot duplicate the run"
+        after_redelivery, 2,
+        "a second tick cannot duplicate either valid run"
     );
     let foreign_untouched: bool = sqlx::query_scalar(
         "SELECT published_at IS NULL AND attempts=0 FROM outbox WHERE event_id='foreign-outbox-row'",
