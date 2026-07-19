@@ -598,6 +598,7 @@ mod tests {
     struct IntakeCounts {
         connects: std::sync::atomic::AtomicUsize,
         pulls: std::sync::atomic::AtomicUsize,
+        flushes: std::sync::atomic::AtomicUsize,
     }
     struct ProbeIntakeFactory(Arc<IntakeCounts>);
     impl IntakeFactory for ProbeIntakeFactory {
@@ -613,7 +614,10 @@ mod tests {
             self.0.pulls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Vec::new())
         }
-        fn flush_settlements(&self) -> Result<(), myelin_events::TransportError> { Ok(()) }
+        fn flush_settlements(&self) -> Result<(), myelin_events::TransportError> {
+            self.0.flushes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
         fn ack(&self, _: myelin_events::DeliveryToken) -> Result<(), myelin_events::TransportError> { Ok(()) }
         fn retry(&self, _: myelin_events::DeliveryToken, _: u64) -> Result<(), myelin_events::TransportError> { Ok(()) }
         fn terminate(&self, _: myelin_events::DeliveryToken) -> Result<(), myelin_events::TransportError> { Ok(()) }
@@ -661,5 +665,25 @@ mod tests {
         handle.drain_checked().unwrap();
         assert_eq!(counts.connects.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(counts.pulls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn active_blob_outage_shutdown_flushes_without_reconnect_or_pull() {
+        let blob = Arc::new(ToggleBlobReadiness(std::sync::atomic::AtomicBool::new(true)));
+        let counts = Arc::new(IntakeCounts::default());
+        let handle = boot(dispatch_app_spec_with_intake(
+            Config::default(), myelin_events::OutboxStore::new(), Vec::new(),
+            Box::new(recovering_probe(blob.clone(), counts.clone())), Arc::new(QuarantineNoop),
+        )).unwrap();
+        handle.tick();
+        assert_eq!(counts.connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(counts.pulls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        blob.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        handle.drain_checked().unwrap();
+
+        assert_eq!(counts.flushes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(counts.connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(counts.pulls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
