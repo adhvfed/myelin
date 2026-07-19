@@ -785,6 +785,95 @@ export function myPrsEnvelope(bucket = "needs-review", limit = 50) {
   };
 }
 
+// ── R4.4 founder Issues fixtures ────────────────────────────────────────────────────────────────
+// Deterministic durable ViewModel shapes. Titles are display fixtures only; `key` is the one
+// authoritative search field. Extra open rows make the web's real 50-row load-more path exercisable.
+export const DEV_ISSUE_TARGET = {
+  project_id: "20aee030-c7fa-4757-8243-700faf528690",
+  type_id: "7d457754-f6a1-4cd8-8738-21751570b627",
+  prefix: "MYL",
+};
+const ISSUE_BASE_TIME = Date.parse("2026-07-19T12:00:00.000Z");
+
+const headlineIssues = [
+  {
+    id: "00000000-0000-4000-8000-000000000102",
+    key: "MYL-102",
+    project_id: DEV_ISSUE_TARGET.project_id,
+    state: "Todo",
+    state_category: "unstarted",
+    title: "Close the founder feedback loop",
+    version: 1,
+    created_at: "2026-07-19T11:00:00.000Z",
+    updated_at: "2026-07-19T12:00:00.000Z",
+  },
+  {
+    id: "00000000-0000-4000-8000-000000000101",
+    key: "MYL-101",
+    project_id: DEV_ISSUE_TARGET.project_id,
+    state: "In progress",
+    state_category: "started",
+    title: "Verify encrypted issue titles",
+    version: 3,
+    created_at: "2026-07-18T09:00:00.000Z",
+    updated_at: "2026-07-19T11:00:00.000Z",
+  },
+  {
+    id: "00000000-0000-4000-8000-000000000100",
+    key: "MYL-100",
+    project_id: DEV_ISSUE_TARGET.project_id,
+    state: "Done",
+    state_category: "completed",
+    title: "Retire the ledger workaround",
+    version: 2,
+    created_at: "2026-07-17T08:00:00.000Z",
+    updated_at: "2026-07-18T10:00:00.000Z",
+  },
+];
+
+const pagedOpenIssues = Array.from({ length: 49 }, (_, index) => {
+  const number = 99 - index;
+  const instant = new Date(ISSUE_BASE_TIME - (index + 2) * 60_000).toISOString();
+  return {
+    id: `00000000-0000-4000-8000-${String(number).padStart(12, "0")}`,
+    key: `MYL-${number}`,
+    project_id: DEV_ISSUE_TARGET.project_id,
+    state: "Todo",
+    state_category: "unstarted",
+    title: `Dogfood finding ${number}`,
+    version: 1,
+    created_at: instant,
+    updated_at: instant,
+  };
+});
+
+export const SEED_ISSUES = [...headlineIssues, ...pagedOpenIssues];
+
+export function freshIssueFixtures() {
+  return SEED_ISSUES.map((issue) => ({ ...issue }));
+}
+
+export function issuesEnvelope(rows, state = "open", key, limit = 50, cursor) {
+  const wanted = rows
+    .filter((issue) =>
+      state === "all"
+        ? true
+        : state === "closed"
+          ? issue.state_category === "completed" || issue.state_category === "cancelled"
+          : issue.state_category === "unstarted" || issue.state_category === "started",
+    )
+    .filter((issue) => !key || issue.key.startsWith(key.toUpperCase()))
+    .sort((a, b) => b.updated_at.localeCompare(a.updated_at) || b.id.localeCompare(a.id));
+  const offset = cursor?.startsWith("ic_dev_") ? Number(cursor.slice("ic_dev_".length)) || 0 : 0;
+  const items = wanted.slice(offset, offset + limit);
+  const next = offset + items.length < wanted.length ? `ic_dev_${offset + items.length}` : null;
+  return { items, page: { next_cursor: next, limit } };
+}
+
+export function issueJson(rows, id) {
+  return rows.find((issue) => issue.id === id) ?? null;
+}
+
 /** The edge's `{error:{message, code}}` envelope (error.rs) — a uniform 404. */
 export function notFoundEnvelope(what) {
   return { error: { message: `${what} not found`, code: "not_found" } };
