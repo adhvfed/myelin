@@ -212,9 +212,8 @@ impl BlobStore for S3BlobStore {
                     .send(),
             )
             .map_err(|e| {
-                // A NoSuchKey from the store is a NotFound; any other error is surfaced as a
-                // NotFound too (the trait's narrow error set has no transport variant — the
-                // smoke test only asserts the happy round-trip + the post-delete miss).
+                // A NoSuchKey from the store is a NotFound; every other failure is classified as
+                // a redacted dependency error and updates the shared readiness state.
                 if is_no_such_key(&e) {
                     BlobError::NotFound {
                         tenant: tenant.clone(),
