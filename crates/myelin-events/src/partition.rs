@@ -48,6 +48,11 @@ pub const SUBJECT_ROOT: &str = "evt";
 /// The maximum wire-subject size produced by the event bus, including the `evt.` root.
 pub const MAX_STREAM_SUBJECT_BYTES: usize = 1024;
 
+/// Defensive allocation bound for one reversibly encoded component. This is deliberately aligned
+/// with, but distinct from, the complete wire-subject bound: components over 255 bytes are valid,
+/// while no single wire-oriented component can grow beyond the largest possible subject.
+pub const MAX_ENCODED_COMPONENT_BYTES: usize = MAX_STREAM_SUBJECT_BYTES;
+
 /// A reversible, canonical encoding for one logical identifier carried inside a NATS subject
 /// token. Only ASCII alphanumerics, `-`, and `_` remain literal; every other UTF-8 byte is encoded
 /// as strict uppercase `%XX`. In particular `.`, `/`, `:`, `#`, and `%` can never be mistaken for
@@ -55,7 +60,7 @@ pub const MAX_STREAM_SUBJECT_BYTES: usize = 1024;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SubjectComponent(String);
 
-/// A component was empty, malformed, or non-canonical.
+/// A component was empty, malformed, non-canonical, or exceeded the defensive codec bound.
 /// Variants deliberately carry no attacker-controlled input so trust-boundary errors are safe to
 /// log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +70,8 @@ pub enum SubjectComponentError {
     /// A `%` escape was malformed/lowercase, decoded UTF-8 was invalid, or literals were not the
     /// canonical minimal representation.
     NonCanonical,
+    /// The encoded component exceeds the finite allocation bound.
+    TooLong,
 }
 
 impl std::fmt::Display for SubjectComponentError {
@@ -72,6 +79,7 @@ impl std::fmt::Display for SubjectComponentError {
         match self {
             Self::Empty => write!(f, "subject component is empty"),
             Self::NonCanonical => write!(f, "subject component encoding is non-canonical"),
+            Self::TooLong => write!(f, "subject component exceeds its bounded size"),
         }
     }
 }
@@ -94,6 +102,9 @@ impl SubjectComponent {
                 encoded.push(HEX[(byte >> 4) as usize] as char);
                 encoded.push(HEX[(byte & 0x0f) as usize] as char);
             }
+            if encoded.len() > MAX_ENCODED_COMPONENT_BYTES {
+                return Err(SubjectComponentError::TooLong);
+            }
         }
         Ok(Self(encoded))
     }
@@ -103,6 +114,9 @@ impl SubjectComponent {
     pub fn parse(encoded: &str) -> Result<Self, SubjectComponentError> {
         if encoded.is_empty() {
             return Err(SubjectComponentError::Empty);
+        }
+        if encoded.len() > MAX_ENCODED_COMPONENT_BYTES {
+            return Err(SubjectComponentError::TooLong);
         }
         let bytes = encoded.as_bytes();
         let mut decoded = Vec::with_capacity(bytes.len());
@@ -525,6 +539,18 @@ mod tests {
         assert!(encoded.as_str().len() > 255);
         assert_eq!(encoded.decode(), raw);
         assert_eq!(SubjectComponent::parse(encoded.as_str()).unwrap(), encoded);
+    }
+
+    #[test]
+    fn subject_component_rejects_pathological_input_at_the_codec_bound() {
+        assert_eq!(
+            SubjectComponent::encode(&"/".repeat(MAX_ENCODED_COMPONENT_BYTES)),
+            Err(SubjectComponentError::TooLong)
+        );
+        assert_eq!(
+            SubjectComponent::parse(&"a".repeat(MAX_ENCODED_COMPONENT_BYTES + 1)),
+            Err(SubjectComponentError::TooLong)
+        );
     }
 
     /// **The EB-12 GATE (subject round-trip).** The subject grammar round-trips the
