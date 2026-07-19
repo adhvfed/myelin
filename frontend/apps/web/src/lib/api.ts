@@ -323,6 +323,61 @@ export interface PrListPage {
   counts: Record<string, number>;
 }
 
+// ── Founder Issues floor (R4.4). The v1 surface intentionally exposes only one canonical
+// dogfood target for creation; project/type/prefix are injected by the server action and never
+// accepted from browser code. Lists are authoritative key-prefix searches, not title search. ──
+
+export type IssueListState = "open" | "closed" | "all";
+export type IssueStateCategory = "unstarted" | "started" | "completed" | "cancelled";
+
+export interface IssueVM {
+  id: string;
+  key: string;
+  project_id: string;
+  state: string;
+  state_category: IssueStateCategory;
+  title: string;
+  version: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface IssuesPage {
+  items: IssueVM[];
+  page: { next_cursor: string | null; limit: number };
+}
+
+export interface IssueCreateReceipt {
+  issue: { id: string; key: string; project_id: string };
+  authorization: { status: "pending"; request_event_id: string };
+}
+
+export type IssueAuthorizationStatus =
+  | {
+      status: "pending";
+      issue: IssueCreateReceipt["issue"];
+      retry_after_ms: number;
+    }
+  | { status: "active"; issue: IssueVM };
+
+export type IssueErrorKind =
+  | "bad-input"
+  | "not-found"
+  | "unavailable"
+  | "configuration"
+  | "error";
+
+export const ISSUE_ERR_PREFIX = "ISSUE_ERR:";
+
+export class IssueRouteError extends Error {
+  readonly kind: IssueErrorKind;
+  constructor(kind: IssueErrorKind) {
+    super(`${ISSUE_ERR_PREFIX}${kind}`);
+    this.name = "IssueRouteError";
+    this.kind = kind;
+  }
+}
+
 /** The dignified error trio (R-21). `no-access` and `not-found` are calm notes; `error` is a
  *  retryable failure. The route maps this to `<RepoErrorState kind>`. */
 export type RepoErrorKind = "no-access" | "not-found" | "error";
@@ -362,6 +417,22 @@ async function authed<T>(fetcher: () => Promise<T>): Promise<T> {
     if (e instanceof GatewayError) throw new RepoRouteError(mapStatusToKind(e.status));
     // A transport/parse failure with no HTTP status is the retryable error kind.
     throw new RepoRouteError("error");
+  }
+}
+
+/** Issues keeps 404 leak-free while distinguishing the retryable projection-unavailable state. */
+async function issueAuthed<T>(fetcher: () => Promise<T>): Promise<T> {
+  try {
+    return await fetcher();
+  } catch (e) {
+    if (e instanceof Unauthorized) throw redirect("/login");
+    if (e instanceof GatewayError) {
+      if (e.status === 400) throw new IssueRouteError("bad-input");
+      if (e.status === 404) throw new IssueRouteError("not-found");
+      if (e.status === 503) throw new IssueRouteError("unavailable");
+    }
+    if (e instanceof IssueRouteError) throw e;
+    throw new IssueRouteError("error");
   }
 }
 
@@ -584,6 +655,98 @@ export const getFileLines = query(
   },
   "git-file-lines",
 );
+
+/** Authoritative Issues list. `key` is an ASCII issue-key prefix, never title/free-text search. */
+export const getIssues = query(
+  async (input: {
+    state: IssueListState;
+    key?: string;
+    cursor?: string;
+    limit?: number;
+  }): Promise<IssuesPage> => {
+    "use server";
+    const p = new URLSearchParams({ state: input.state });
+    if (input.key) p.set("key", input.key);
+    if (input.cursor) p.set("cursor", input.cursor);
+    if (input.limit) p.set("limit", String(input.limit));
+    return issueAuthed(() => edgeGet<IssuesPage>(`/v1/issues?${p.toString()}`));
+  },
+  "issues-list",
+);
+
+export const getIssue = query(async (id: string): Promise<IssueVM> => {
+  "use server";
+  return issueAuthed(() => edgeGet<IssueVM>(`/v1/issues/${seg(id)}`));
+}, "issue-detail");
+
+export type IssueMutation =
+  | { op: "create"; title: string }
+  | { op: "close"; issueId: string }
+  // Activation polling deliberately goes through the uncached action. A cached query could pin the
+  // first 202 response and leave an activated issue looking pending forever.
+  | { op: "activation"; requestEventId: string };
+
+export type IssueMutationResult =
+  | { ok: true; op: "create"; receipt: IssueCreateReceipt }
+  | { ok: true; op: "close"; issue: IssueVM }
+  | { ok: true; op: "activation"; status: IssueAuthorizationStatus }
+  | { ok: false; error: IssueErrorKind };
+
+function isCanonicalUuid(value: string | undefined): value is string {
+  return Boolean(
+    value &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value),
+  );
+}
+
+/** Read and validate the one founder target. Invalid deployment config stays opaque to the client. */
+function dogfoodIssueTarget(): { project_id: string; type_id: string; prefix: string } {
+  const project = process.env.MYELIN_DOGFOOD_ISSUES_PROJECT;
+  const type = process.env.MYELIN_DOGFOOD_ISSUES_TYPE;
+  const prefix = process.env.MYELIN_DOGFOOD_ISSUES_PREFIX;
+  if (
+    !isCanonicalUuid(project) ||
+    !isCanonicalUuid(type) ||
+    !prefix ||
+    !/^[A-Z0-9]{2,10}$/.test(prefix)
+  ) {
+    throw new IssueRouteError("configuration");
+  }
+  return { project_id: project, type_id: type, prefix };
+}
+
+/** One Issues mutation action: browser inputs can carry a title or an issue UUID, never scope IDs. */
+export const issuesMutate = action(async (mutation: IssueMutation): Promise<IssueMutationResult> => {
+  "use server";
+  try {
+    if (mutation.op === "create") {
+      const title = mutation.title.trim();
+      if (!title || new TextEncoder().encode(title).byteLength > 512) {
+        return { ok: false, error: "bad-input" };
+      }
+      const target = dogfoodIssueTarget();
+      const receipt = await issueAuthed(() =>
+        edgePost<IssueCreateReceipt>("/v1/issues", { ...target, title }),
+      );
+      return { ok: true, op: "create", receipt };
+    }
+    if (mutation.op === "activation") {
+      const status = await issueAuthed(() =>
+        edgeGet<IssueAuthorizationStatus>(
+          `/v1/issues/authorization-requests/${seg(mutation.requestEventId)}`,
+        ),
+      );
+      return { ok: true, op: "activation", status };
+    }
+    const issue = await issueAuthed(() =>
+      edgePost<IssueVM>(`/v1/issues/${seg(mutation.issueId)}/close`, {}),
+    );
+    return { ok: true, op: "close", issue };
+  } catch (e) {
+    if (e instanceof IssueRouteError) return { ok: false, error: e.kind };
+    throw e;
+  }
+}, "issues-mutate");
 
 // ── PR write paths (R3.3 G-8): threads, comments, review batches, merge. Server-only functions;
 //    the overview route calls them then revalidates the thread/checks queries. A 409 merge surfaces

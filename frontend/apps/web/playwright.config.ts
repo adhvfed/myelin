@@ -50,6 +50,9 @@ export default defineConfig({
       env: {
         PORT: String(PORT),
         MYELIN_EDGE_URL: `http://127.0.0.1:${EDGE_PORT}`,
+        MYELIN_DOGFOOD_ISSUES_PROJECT: "20aee030-c7fa-4757-8243-700faf528690",
+        MYELIN_DOGFOOD_ISSUES_TYPE: "7d457754-f6a1-4cd8-8738-21751570b627",
+        MYELIN_DOGFOOD_ISSUES_PREFIX: "MYL",
         // R0.6: the e2e harness drives the real dev-login seam, so it must explicitly opt in
         // (the seam refuses without this flag). vinxi dev keeps NODE_ENV !== "production".
         MYELIN_DEV_LOGIN: "1",

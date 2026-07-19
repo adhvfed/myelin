@@ -1,6 +1,6 @@
 // StatusPill — the shared glyph+label status primitive (R3.1, contributed DOWN into the design
 // system per gate Q6). ONE pill that every status cell reaches for: the PR state (open/draft/merged/
-// closed) and the checks-summary verdict (pass/fail/running/none/unavailable). Two hard rules from
+// closed), Issue state, and the checks-summary verdict (pass/fail/running/none/unavailable). Two hard rules from
 // DESIGN-MANUAL §3.1 / WCAG 1.4.1, enforced by construction here so no surface re-invents them:
 //   • **Status is TEXT, never colour alone** — every pill renders a visible label AND a `title`, and
 //     colour only ever tints the GLYPH (never the label, so a colour-blind or greyscale reader still
@@ -10,7 +10,7 @@
 //     the ring keeps meaning "a CI verdict", never a PR lifecycle state.
 //
 // Semantic tokens only; the accent is never used as text (a §3.1 hard rail).
-import { Show, mergeProps, type JSX } from "solid-js";
+import { Match, Switch, mergeProps, type JSX } from "solid-js";
 import { Icon } from "./Icon";
 import { type IconName } from "./icon-names";
 
@@ -18,6 +18,8 @@ import { type IconName } from "./icon-names";
 export type PrStateValue = "open" | "draft" | "merged" | "closed";
 /** The checks-summary verdict the `check-verdict` variant renders (mirrors the edge `verdict` token). */
 export type CheckVerdict = "pass" | "fail" | "running" | "none" | "unavailable";
+/** Frozen cross-project Issues workflow categories. The visible label remains the project's state. */
+export type IssueStateCategory = "unstarted" | "started" | "completed" | "cancelled";
 
 export interface PrStatePillProps {
   kind: "pr-state";
@@ -40,7 +42,14 @@ export interface CheckVerdictPillProps {
   style?: JSX.CSSProperties;
 }
 
-export type StatusPillProps = PrStatePillProps | CheckVerdictPillProps;
+export interface IssueStatePillProps {
+  kind: "issue-state";
+  category: IssueStateCategory;
+  label: string;
+  style?: JSX.CSSProperties;
+}
+
+export type StatusPillProps = PrStatePillProps | CheckVerdictPillProps | IssueStatePillProps;
 
 // ── pr-state: glyph tint per state; the label is always readable text ──
 const PR_STATE: Record<PrStateValue, { icon: IconName; label: string; glyph: string; labelColor: string }> = {
@@ -48,6 +57,13 @@ const PR_STATE: Record<PrStateValue, { icon: IconName; label: string; glyph: str
   draft:  { icon: "edit",         label: "Draft",  glyph: "var(--text-subtle)", labelColor: "var(--text-muted)" },
   merged: { icon: "merge",        label: "Merged", glyph: "var(--agent)",       labelColor: "var(--text-primary)" },
   closed: { icon: "close",        label: "Closed", glyph: "var(--danger)",      labelColor: "var(--text-primary)" },
+};
+
+const ISSUE_STATE: Record<IssueStateCategory, { icon: IconName; glyph: string }> = {
+  unstarted: { icon: "issue", glyph: "var(--text-subtle)" },
+  started: { icon: "cycle", glyph: "var(--warning)" },
+  completed: { icon: "issue", glyph: "var(--success)" },
+  cancelled: { icon: "close", glyph: "var(--danger)" },
 };
 
 /** The verdict label — TEXT, derived from the counts so a reader never depends on colour. */
@@ -87,12 +103,14 @@ const VERDICT_GLYPH: Record<CheckVerdict, { icon: IconName; glyph: string }> = {
  */
 export function StatusPill(props: StatusPillProps): JSX.Element {
   return (
-    <Show
-      when={props.kind === "pr-state"}
-      fallback={<CheckVerdictCell {...(props as CheckVerdictPillProps)} />}
-    >
-      <PrStateChip {...(props as PrStatePillProps)} />
-    </Show>
+    <Switch fallback={<CheckVerdictCell {...(props as CheckVerdictPillProps)} />}>
+      <Match when={props.kind === "pr-state"}>
+        <PrStateChip {...(props as PrStatePillProps)} />
+      </Match>
+      <Match when={props.kind === "issue-state"}>
+        <IssueStateChip {...(props as IssueStatePillProps)} />
+      </Match>
+    </Switch>
   );
 }
 
@@ -119,6 +137,33 @@ function PrStateChip(props: PrStatePillProps): JSX.Element {
         <Icon name={spec().icon} size={12} />
       </span>
       {spec().label}
+    </span>
+  );
+}
+
+function IssueStateChip(props: IssueStatePillProps): JSX.Element {
+  const spec = () => ISSUE_STATE[props.category];
+  return (
+    <span
+      title={`State: ${props.label}`}
+      style={{
+        display: "inline-flex",
+        "align-items": "center",
+        gap: "var(--space-1)",
+        "font-size": "var(--fs-caption)",
+        "font-weight": "var(--weight-medium)",
+        border: "var(--hairline) solid var(--border)",
+        "border-radius": "var(--radius-pill)",
+        padding: "0 var(--space-2)",
+        color: "var(--text-primary)",
+        "white-space": "nowrap",
+        ...props.style,
+      }}
+    >
+      <span style={{ color: spec().glyph, display: "inline-flex" }}>
+        <Icon name={spec().icon} size={12} />
+      </span>
+      {props.label}
     </span>
   );
 }

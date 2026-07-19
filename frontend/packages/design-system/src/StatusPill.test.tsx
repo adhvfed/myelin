@@ -39,3 +39,21 @@ describe("StatusPill — check-verdict", () => {
     expect(el.getAttribute("title")).toBe("Checks: 1 running");
   });
 });
+
+describe("StatusPill — issue-state", () => {
+  it("renders each workflow category with the project's visible state label", () => {
+    for (const [category, label] of [
+      ["unstarted", "Todo"],
+      ["started", "In progress"],
+      ["completed", "Done"],
+      ["cancelled", "Cancelled"],
+    ] as const) {
+      const { unmount } = render(() => (
+        <StatusPill kind="issue-state" category={category} label={label} />
+      ));
+      const el = screen.getByTitle(`State: ${label}`);
+      expect(el.textContent).toContain(label);
+      unmount();
+    }
+  });
+});
