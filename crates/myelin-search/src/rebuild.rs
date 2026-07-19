@@ -420,9 +420,6 @@ pub enum RebuildError {
     LeaseLost,
     /// No rebuild job exists for this key — an operation was attempted without a claim.
     NoJob,
-    /// Catch-up was reached without a recorded high-water instant. LOUD: there is no safe default
-    /// bound — applying the unbounded tail never converges, applying nothing is a silent hole.
-    MissingHighWaterMark,
     /// The journal row carries a phase token this build does not recognise (a forward-rolled schema
     /// read by an older binary). LOUD: coercing it would risk re-wiping a finished index.
     UnknownPhase,
@@ -457,11 +454,6 @@ impl std::fmt::Display for RebuildError {
                 "rebuild: the exclusive lease is held elsewhere (or expired and was stolen)"
             ),
             RebuildError::NoJob => write!(f, "rebuild: no rebuild job is claimed for this scope"),
-            RebuildError::MissingHighWaterMark => write!(
-                f,
-                "rebuild: catch-up reached without a recorded high-water instant — refusing to \
-                 guess a bound"
-            ),
             RebuildError::UnknownPhase => write!(
                 f,
                 "rebuild: the journal row carries an unrecognised phase — refusing to guess"
@@ -581,6 +573,19 @@ pub enum VerifyFailure {
         /// How many, across documents, vectors and metadata records.
         count: usize,
     },
+    /// The rebuild lost more documents than the operator said it would — the signature of a corpus
+    /// whose owner never replayed.
+    UnexpectedShrink {
+        /// Documents the index held at fence time.
+        before: u64,
+        /// Documents it holds now.
+        after: usize,
+        /// The reduction the operator acknowledged.
+        acknowledged: usize,
+    },
+    /// The job reached verification with no recorded pre-wipe corpus size, so the one check that can
+    /// see a missing owner source cannot run.
+    MissingPreWipeCorpusSize,
     /// The index held documents before the wipe and holds none after the rebuild — or the rebuild's
     /// expectation is empty, which would make every parity leg a vacuous `0 == 0`.
     CorpusDestroyed {
@@ -630,6 +635,21 @@ impl std::fmt::Display for VerifyFailure {
             VerifyFailure::LegacyIdentitiesSurvived { count } => write!(
                 f,
                 "{count} identities under the retired legacy grammar survived the rebuild"
+            ),
+            VerifyFailure::UnexpectedShrink {
+                before,
+                after,
+                acknowledged,
+            } => write!(
+                f,
+                "the rebuild reduced the corpus from {before} to {after} document(s), but only \
+                 {acknowledged} removal(s) were acknowledged — an unstated loss of this size is what \
+                 a corpus whose owner never replayed looks like"
+            ),
+            VerifyFailure::MissingPreWipeCorpusSize => write!(
+                f,
+                "the job has no recorded pre-wipe corpus size, so the missing-owner check cannot \
+                 run — refusing to verify without it"
             ),
             VerifyFailure::CorpusDestroyed {
                 before,
@@ -1208,9 +1228,8 @@ impl RebuildCoordinator {
         // The fence records a watermark on every rebuild, so an empty map is only reachable when the
         // outbox held nothing at fence time. That is legitimate (a fresh cell), and it correctly
         // means "apply nothing" — every aggregate is absent, so every row is post-fence.
-        if rec.phase < RebuildPhase::Fenced {
-            return Err(RebuildError::MissingHighWaterMark);
-        }
+        // (No `phase < Fenced` guard here: the `phase < Replayed` check above already covers it —
+        // `Fenced` ranks below `Replayed`, so reaching this line implies the fence ran.)
         let watermark = rec.high_water_seqs.clone();
         self.reassert_lease(key, &rec, holder, now)?;
         let mut outcome = CatchUpOutcome::default();
@@ -1285,16 +1304,36 @@ impl RebuildCoordinator {
         // or unregistered owner source produces: the wipe runs, the replay finds no truth, and
         // without this check verification passes and reads reopen over nothing.
         let found_docs = inventory.doc_ids.len();
-        if let Some(before) = rec.pre_wipe_docs {
-            if before > 0 && (found_docs == 0 || expected.doc_ids.is_empty()) {
-                return Err(RebuildError::VerificationFailed(
-                    VerifyFailure::CorpusDestroyed {
-                        before,
-                        after: found_docs,
-                        expected: expected.doc_ids.len(),
-                    },
-                ));
-            }
+        // The pre-wipe corpus size is the ONE fact that does not shrink alongside the expectation,
+        // which is what makes it the only check that can see a missing owner source. Absent past the
+        // fence it is a corruption or a rolling-deploy artefact, and skipping the check silently
+        // would restore exactly the hole it exists to close — so refuse instead.
+        let Some(before) = rec.pre_wipe_docs else {
+            return Err(RebuildError::VerificationFailed(
+                VerifyFailure::MissingPreWipeCorpusSize,
+            ));
+        };
+        if before > 0 && (found_docs == 0 || expected.doc_ids.is_empty()) {
+            return Err(RebuildError::VerificationFailed(
+                VerifyFailure::CorpusDestroyed {
+                    before,
+                    after: found_docs,
+                    expected: expected.doc_ids.len(),
+                },
+            ));
+        }
+        // PARTIAL loss — the general case the total-wipeout check above cannot see. A shrink beyond
+        // what the operator stated is the signature of a corpus whose owner never replayed: its
+        // documents left the index and the expectation together, so every other leg balanced.
+        let shrink = (before as usize).saturating_sub(found_docs);
+        if shrink > expected.acknowledged_shrink {
+            return Err(RebuildError::VerificationFailed(
+                VerifyFailure::UnexpectedShrink {
+                    before,
+                    after: found_docs,
+                    acknowledged: expected.acknowledged_shrink,
+                },
+            ));
         }
         if found_docs == 0 && (expected.docs_replayed > 0 || expected.docs_caught_up > 0) {
             return Err(RebuildError::VerificationFailed(
@@ -1446,6 +1485,23 @@ pub struct ExpectedCorpus {
     pub docs_replayed: usize,
     /// Documents applied during catch-up (reporting only).
     pub docs_caught_up: usize,
+    /// **How many documents the operator EXPECTS this rebuild to remove.**
+    ///
+    /// A rebuild legitimately shrinks the corpus — that is much of the point of this one: legacy and
+    /// canonical duplicates collapse into a single document, and blobs that were deleted or
+    /// restricted stop being indexed at all. So a smaller index is not by itself evidence of
+    /// failure.
+    ///
+    /// But an UNBOUNDED shrink is exactly what a missing owner source looks like. When a scope's
+    /// owner has no truth loaded, its documents vanish from the index AND from the expectation, so
+    /// every parity leg stays balanced and the loss is invisible — a four-corpus rebuild with only
+    /// Git's truth loaded verifies green having silently dropped issues, knowledge and chat.
+    ///
+    /// The pre-wipe corpus size is the only fact that does not shrink with the expectation, so the
+    /// reduction has to be stated rather than inferred. Anything beyond this budget fails
+    /// [`VerifyFailure::UnexpectedShrink`]. Zero — the default — means "this rebuild should not lose
+    /// documents", which is the right default for a rebuild that is not deliberately removing any.
+    pub acknowledged_shrink: usize,
 }
 
 impl ExpectedCorpus {
@@ -1482,7 +1538,15 @@ impl ExpectedCorpus {
             doc_ids,
             docs_replayed: replay.docs_indexed,
             docs_caught_up: catch_up.applied,
+            acknowledged_shrink: 0,
         }
+    }
+
+    /// State how many documents this rebuild is EXPECTED to remove (legacy duplicates it collapses,
+    /// deleted and restricted content it drops). See [`Self::acknowledged_shrink`].
+    pub fn expecting_to_remove(mut self, documents: usize) -> ExpectedCorpus {
+        self.acknowledged_shrink = documents;
+        self
     }
 
     /// **A SELF-CONSISTENCY snapshot of the index — NOT an independent expectation.**
@@ -1523,6 +1587,7 @@ impl ExpectedCorpus {
             vector_doc_ids: inv.vector_doc_ids.iter().cloned().collect(),
             docs_replayed,
             docs_caught_up,
+            acknowledged_shrink: 0,
         })
     }
 }

@@ -46,6 +46,7 @@ use myelin_search::indexer::{
     SearchProjection,
 };
 use myelin_search::rebuild::{
+    RebuildJournal,
     ExpectedCorpus, MemoryRebuildJournal, RebuildCoordinator, RebuildError, RebuildKey,
     RebuildPhase, RebuildReadGate, ReadMode, ReplayOutcome, VerifyFailure,
 };
@@ -289,11 +290,16 @@ impl Harness {
     }
 
     /// Drive the whole rebuild, phase by phase, from a claim through to reopened reads.
+    /// `expected_removals` is the NET reduction this rebuild should produce — legacy duplicates it
+    /// collapses plus deleted/restricted content it drops, less anything it adds. Verification
+    /// refuses an unstated loss, because an unbounded shrink is what a corpus whose owner never
+    /// replayed looks like.
     fn run_full_rebuild(
         &mut self,
         now: u64,
         scopes: &[SnapshotScope],
         sources: &[&dyn ReindexSource],
+        expected_removals: usize,
     ) -> Result<myelin_search::rebuild::RebuildReport, RebuildError> {
         let key = self.key();
         let c = self.coordinator.clone();
@@ -322,7 +328,8 @@ impl Harness {
             .filter(|s| s.contains("/git/blob/") || s.contains("/knowledge/page/"))
             .cloned()
             .collect();
-        let expected = ExpectedCorpus::from_replay(&replay, &caught, &semantic);
+        let expected = ExpectedCorpus::from_replay(&replay, &caught, &semantic)
+            .expecting_to_remove(expected_removals);
         c.verify_and_open(&key, HOLDER, now, &expected)
     }
 }
@@ -420,14 +427,18 @@ fn seed_owner_bodies(h: &Harness) {
 }
 
 /// The full rebuild every drill runs, with all four owners registered.
-fn run_rebuild(h: &mut Harness, now: u64) -> Result<myelin_search::rebuild::RebuildReport, RebuildError> {
+fn run_rebuild(
+    h: &mut Harness,
+    now: u64,
+    expected_removals: usize,
+) -> Result<myelin_search::rebuild::RebuildReport, RebuildError> {
     let git = git_source();
     let kn = kn_source();
     let iss = issues_source();
     let chat = chat_source();
     let sources: Vec<&dyn ReindexSource> = vec![&git, &iss, &kn, &chat];
     let scopes = all_scopes();
-    h.run_full_rebuild(now, &scopes, &sources)
+    h.run_full_rebuild(now, &scopes, &sources, expected_removals)
 }
 
 // ═══════════════════════════ 1. legacy live document ══════════════════════════════════════════════
@@ -450,7 +461,8 @@ fn legacy_live_document_is_rekeyed_to_canonical() {
     );
     assert_eq!(h.ft("settle_payment"), vec![legacy.clone()]);
 
-    let report = run_rebuild(&mut h, 100).expect("the rebuild completes");
+    // Expected reduction: the legacy doc is re-keyed to canonical and `refund` is added: net 0.
+    let report = run_rebuild(&mut h, 100, 0).expect("the rebuild completes");
 
     let canonical = canonical_id("core", "refs/heads/main", "src/charge.rs");
     assert!(
@@ -491,7 +503,8 @@ fn legacy_and_canonical_duplicate_collapses_to_one_document() {
         "precondition: ONE blob answers a query TWICE (the duplicate)"
     );
 
-    run_rebuild(&mut h, 100).expect("the rebuild completes");
+    // Expected reduction: the legacy/canonical duplicate collapses into one document.
+    run_rebuild(&mut h, 100, 1).expect("the rebuild completes");
 
     assert_eq!(
         h.ft("settle_payment"),
@@ -526,7 +539,8 @@ fn deleted_legacy_only_document_becomes_unqueryable() {
         "precondition: DELETED content is still queryable under the legacy id"
     );
 
-    run_rebuild(&mut h, 100).expect("the rebuild completes");
+    // Expected reduction: the deleted legacy doc goes, the canonical `refund` arrives: net 0.
+    run_rebuild(&mut h, 100, 0).expect("the rebuild completes");
 
     assert!(
         h.ft("OBSOLETE_TOKEN").is_empty(),
@@ -563,7 +577,8 @@ fn restricted_legacy_only_document_becomes_unqueryable_and_undisclosed() {
         "precondition: RESTRICTED content is still queryable under the legacy id"
     );
 
-    let report = run_rebuild(&mut h, 100).expect("the rebuild completes");
+    // Expected reduction: the restricted legacy doc goes, the canonical `refund` arrives: net 0.
+    let report = run_rebuild(&mut h, 100, 0).expect("the rebuild completes");
 
     assert!(
         h.ft("restricted-subject-data").is_empty(),
@@ -609,7 +624,8 @@ fn legacy_vector_and_metadata_entries_are_swept() {
     );
     assert!(h.meta_ids().contains(&legacy), "metadata space");
 
-    run_rebuild(&mut h, 100).expect("the rebuild completes");
+    // Expected reduction: the legacy doc is re-keyed; `refund` is added: net 0.
+    run_rebuild(&mut h, 100, 0).expect("the rebuild completes");
 
     for (space, ids) in [
         ("document", h.doc_ids()),
@@ -649,7 +665,8 @@ fn unrelated_corpora_are_restored_by_the_rebuild() {
     h.live_index(&issue_id("1421"), "an issue about raft elections");
     h.live_index(&chat_id("m-7"), "a chat message about deployments");
 
-    run_rebuild(&mut h, 100).expect("the rebuild completes");
+    // Expected reduction: nothing is removed — every corpus is restored.
+    run_rebuild(&mut h, 100, 0).expect("the rebuild completes");
 
     let ids = h.doc_ids();
     for (corpus, id) in [
@@ -1267,7 +1284,8 @@ fn the_full_adversarial_corpus_converges_to_the_required_final_state() {
     h.fetcher.remove(&deleted_legacy);
     h.fetcher.remove(&restricted_legacy);
 
-    let report = run_rebuild(&mut h, 100).expect("the rebuild completes");
+    // Expected reduction: legacy dup collapses + deleted + restricted go, `refund` arrives: net 2.
+    let report = run_rebuild(&mut h, 100, 2).expect("the rebuild completes");
 
     // ── one canonical document per live blob ──
     let ids = h.doc_ids();
@@ -1914,7 +1932,7 @@ fn a_rebuild_with_empty_owner_truth_refuses_to_verify() {
     let sources: Vec<&dyn ReindexSource> = vec![&git, &iss, &kn, &chat];
 
     let err = h
-        .run_full_rebuild(100, &all_scopes(), &sources)
+        .run_full_rebuild(100, &all_scopes(), &sources, 0)
         .expect_err("a rebuild that emptied the index must NOT verify");
     assert!(
         matches!(
@@ -1972,12 +1990,134 @@ fn a_rebuild_of_a_genuinely_empty_tenant_still_completes() {
     let sources: Vec<&dyn ReindexSource> = vec![&git, &iss, &kn, &chat];
 
     let report = h
-        .run_full_rebuild(100, &all_scopes(), &sources)
+        .run_full_rebuild(100, &all_scopes(), &sources, 0)
         .expect("an empty tenant rebuilds cleanly — zero before and zero after is not destruction");
     assert_eq!(report.docs_indexed, 0);
     assert_eq!(
         h.gate().read_mode(&tenant(), &region()),
         ReadMode::Open,
         "reads reopen for a legitimately empty tenant"
+    );
+}
+
+/// **A rebuild that loses SOME corpora — not all — is caught too.**
+///
+/// The general case of the empty-truth hole, and the one a total-wipeout check cannot see. All four
+/// owners are REGISTERED, but only Git has its truth loaded — exactly what happens when
+/// `load_canonical_blob_truth` runs for Git and the other three owners were never populated. The
+/// missing corpora then leave the index AND the expectation together, so count, digest, vector,
+/// zero-legacy and zero-lag all balance, and verification passes having silently dropped issues,
+/// knowledge and chat.
+///
+/// The pre-wipe corpus size is the only fact that does not shrink with the expectation, which is why
+/// an unstated reduction has to fail.
+#[test]
+fn a_rebuild_that_loses_some_corpora_is_caught() {
+    struct EmptySource(&'static str);
+    impl ReindexSource for EmptySource {
+        fn owner_token(&self) -> &str {
+            self.0
+        }
+        fn replay(
+            &self,
+            _scope: &SnapshotScope,
+            _since: Option<u64>,
+        ) -> Vec<myelin_events::SnapshotDraft> {
+            Vec::new()
+        }
+    }
+
+    let mut h = Harness::new();
+    seed_owner_bodies(&h);
+    h.live_index(
+        &canonical_id("core", "refs/heads/main", "src/charge.rs"),
+        "fn charge() {}",
+    );
+    h.live_index(&kn_id("runbook"), "the oncall runbook for paxos");
+    h.live_index(&issue_id("1421"), "an issue about raft elections");
+    h.live_index(&chat_id("m-7"), "a chat message about deployments");
+    assert_eq!(h.doc_ids().len(), 4, "precondition: four corpora indexed");
+
+    // Git's truth IS loaded; the other three owners are registered but replay nothing.
+    let git = git_source();
+    let iss = EmptySource("issues");
+    let kn = EmptySource("knowledge");
+    let chat = EmptySource("chat");
+    let sources: Vec<&dyn ReindexSource> = vec![&git, &iss, &kn, &chat];
+
+    let err = h
+        .run_full_rebuild(100, &all_scopes(), &sources, 0)
+        .expect_err("a rebuild that silently dropped three corpora must NOT verify");
+    assert!(
+        matches!(
+            err,
+            RebuildError::VerificationFailed(VerifyFailure::UnexpectedShrink { .. })
+        ),
+        "the partial loss is caught: {err}"
+    );
+    assert_eq!(
+        h.gate().read_mode(&tenant(), &region()),
+        ReadMode::FailEmptyRebuilding,
+        "and reads stay fenced"
+    );
+
+    // The refusal reports counts, never the corpora it lost.
+    let msg = err.to_string();
+    for secret in ["acme", REGION, "runbook", "paxos", "charge"] {
+        assert!(!msg.contains(secret), "disclosed `{secret}`: {msg}");
+    }
+}
+
+/// **A rebuild reaching verification with no recorded pre-wipe size REFUSES.**
+///
+/// `pre_wipe_docs` is the only asymmetric fact verification has — the one measurement that does not
+/// shrink alongside the expectation. A job missing it (a corrupt row, or one fenced by a build
+/// before the field existed) would verify with the missing-owner check silently absent, restoring
+/// exactly the hole it exists to close. Refusing is the safe direction.
+#[test]
+fn a_job_without_a_recorded_pre_wipe_size_refuses_to_verify() {
+    let h = Harness::new();
+    let key = h.key();
+    let c = h.coordinator.clone();
+
+    // Drive the job to CaughtUp, then blank the recorded size the way a corrupt row would.
+    c.claim(&key, HOLDER, 100).unwrap();
+    c.fence(&key, HOLDER, 100, &[]).unwrap();
+    c.wipe(&key, HOLDER, 100).unwrap();
+    c.reset_cursors(&key, HOLDER, 100).unwrap();
+    let git = git_source();
+    let sources: Vec<&dyn ReindexSource> = vec![&git];
+    let mut outbox = OutboxStore::new();
+    c.replay_all(
+        &key,
+        HOLDER,
+        100,
+        &[SnapshotScope::new("git", "blob:all")],
+        &sources,
+        &mut outbox,
+        replay_ctx(),
+    )
+    .unwrap();
+    c.catch_up(&key, HOLDER, 100, &[]).unwrap();
+
+    let mut record = c.record(&key).unwrap().unwrap();
+    record.pre_wipe_docs = None;
+    h.journal
+        .compare_and_store(&key, Some(record.fence_epoch), &record)
+        .unwrap();
+
+    let err = c
+        .verify_and_open(&key, HOLDER, 100, &ExpectedCorpus::default())
+        .expect_err("verification without the pre-wipe size must refuse");
+    assert!(
+        matches!(
+            err,
+            RebuildError::VerificationFailed(VerifyFailure::MissingPreWipeCorpusSize)
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        h.gate().read_mode(&tenant(), &region()),
+        ReadMode::FailEmptyRebuilding
     );
 }
