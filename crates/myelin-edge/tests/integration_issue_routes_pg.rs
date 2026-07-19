@@ -615,6 +615,22 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
         .unwrap();
     assert_eq!(outcomes.len(), 1);
     assert!(outcomes[0].1.as_ref().unwrap().newly_activated);
+    let activated_zookie = outcomes[0].1.as_ref().unwrap().zookie.clone();
+    sqlx::query("DELETE FROM outbox WHERE event_id = $1")
+        .bind(&request_event_id)
+        .execute(&admin)
+        .await
+        .unwrap();
+    let active_retry_writer = CountingTupleWriter::default();
+    let active_retry = issue_store
+        .reconcile_authorization(&worker, &issue_id, &active_retry_writer)
+        .await
+        .expect("active reconciliation survives request-outbox reaping");
+    assert!(!active_retry.newly_activated);
+    assert_eq!(active_retry.issue.id, issue_id);
+    assert_eq!(active_retry.issue.title, title);
+    assert_eq!(active_retry.zookie, activated_zookie);
+    assert_eq!(active_retry_writer.calls.load(Ordering::SeqCst), 0);
     issue_store
         .rebuild_effective_issue_view(&worker)
         .await
@@ -1039,6 +1055,56 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
             .any(|line| line.contains("Index Cond") && line.contains("key")),
         "served prefix query has no bounded key range: {served_explain:?}"
     );
+
+    let (status, missing_outbox_receipt) = http(
+        address,
+        "POST",
+        "/v1/issues",
+        Some(&creator_token),
+        create_body("pending request outbox reaped"),
+    )
+    .await;
+    assert_eq!(status, 202);
+    let missing_outbox_issue = missing_outbox_receipt["issue"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let missing_outbox_request = missing_outbox_receipt["authorization"]["request_event_id"]
+        .as_str()
+        .unwrap();
+    sqlx::query("DELETE FROM outbox WHERE event_id = $1")
+        .bind(missing_outbox_request)
+        .execute(&admin)
+        .await
+        .unwrap();
+    let pending_retry_writer = CountingTupleWriter::default();
+    assert!(issue_store
+        .reconcile_authorization(&worker, &missing_outbox_issue, &pending_retry_writer)
+        .await
+        .is_err());
+    assert_eq!(pending_retry_writer.calls.load(Ordering::SeqCst), 0);
+    let pending_state: String = sqlx::query_scalar(
+        "SELECT state FROM issue_authz_binding WHERE tenant_id = $1 AND region = $2 \
+         AND issue_id = $3::uuid",
+    )
+    .bind(&tenant)
+    .bind(REGION)
+    .bind(&missing_outbox_issue)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(pending_state, "pending");
+    let missing_outbox_tuple_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM rebac_tuple WHERE tenant_id = $1 AND region = $2 \
+         AND object_id = $3 AND relation = 'parent_project'",
+    )
+    .bind(&tenant)
+    .bind(REGION)
+    .bind(format!("issue:{missing_outbox_issue}"))
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(missing_outbox_tuple_count, 0);
 
     let closed_rows = sqlx::query(
         "SELECT event_id, envelope FROM outbox WHERE envelope->>'tenant' = $1 \
