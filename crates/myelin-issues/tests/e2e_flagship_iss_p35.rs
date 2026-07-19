@@ -87,6 +87,7 @@ fn deliver_approval(signals: &SignalStore, run_id: &str, effect_ref: &str) -> bo
         payload: vec![ArtifactRef(effect_ref.to_string())],
         payload_key_ref: None,
         consumed_seq: None,
+        received_unix_ms: 0,
     })
 }
 
@@ -297,6 +298,7 @@ fn a_declined_governed_transition_is_withheld_zero_mutation() {
         payload: vec![],
         payload_key_ref: Some(myelin_flow::DECLINE_MARKER.to_string()),
         consumed_seq: None,
+        received_unix_ms: 0,
     });
     let card = ApprovalCard {
         run_id: run_id.to_string(),
