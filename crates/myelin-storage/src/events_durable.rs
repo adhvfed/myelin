@@ -43,8 +43,9 @@
 use sqlx::postgres::PgPool;
 
 use myelin_events::{
-    CoCommitError, CoCommitTx, ConsumerName, DeadLetterRecord, DurableBusErasure, DurableDeadLetter,
-    DurableDedup, ErasedSubject, EventId, PiiKeyRef, Region, TenantId, Timestamp,
+    BrokerDeliveryRef, CoCommitError, CoCommitTx, ConsumerName, DeadLetterRecord,
+    DeliveryQuarantineReason, DurableBusErasure, DurableDeadLetter, DurableDedup,
+    DurableDeliveryQuarantine, ErasedSubject, EventId, PiiKeyRef, Region, TenantId, Timestamp,
 };
 
 use crate::migration::{Migration, Migrations};
@@ -398,6 +399,68 @@ impl DurableDeadLetter for DurableDeadLetterBacking {
                     reason,
                 })
                 .collect()
+        })
+    }
+}
+
+// =================================================================================================
+// Payload-free durable quarantine for broker deliveries that cannot enter a registered handler.
+// =================================================================================================
+
+pub fn consumer_delivery_quarantine_migrations() -> Migrations {
+    Migrations::of([Migration::plain(
+        "0004_consumer_delivery_quarantine",
+        myelin_events::CONSUMER_DELIVERY_QUARANTINE_MIGRATION,
+    )])
+}
+
+#[derive(Clone)]
+pub struct DurableDeliveryQuarantineBacking {
+    pool: PgPool,
+    rt: tokio::runtime::Handle,
+}
+
+impl DurableDeliveryQuarantineBacking {
+    pub fn new(pool: PgPool, rt: tokio::runtime::Handle) -> Self {
+        Self { pool, rt }
+    }
+
+    fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
+        tokio::task::block_in_place(|| self.rt.block_on(fut))
+    }
+}
+
+impl DurableDeliveryQuarantine for DurableDeliveryQuarantineBacking {
+    fn record(
+        &self,
+        consumer: &str,
+        broker_ref: &BrokerDeliveryRef,
+        reason: DeliveryQuarantineReason,
+        delivery_attempt: u64,
+    ) -> Result<(), String> {
+        let stream_sequence = i64::try_from(broker_ref.stream_sequence)
+            .map_err(|_| "stream sequence exceeds durable range".to_string())?;
+        let delivery_attempt = i64::try_from(delivery_attempt)
+            .map_err(|_| "delivery attempt exceeds durable range".to_string())?;
+        if consumer.is_empty() || broker_ref.stream.is_empty() || stream_sequence <= 0 || delivery_attempt <= 0 {
+            return Err("invalid delivery quarantine reference".into());
+        }
+        self.block(async {
+            sqlx::query(
+                "INSERT INTO consumer_delivery_quarantine \
+                 (consumer, stream, stream_sequence, reason_code, delivery_attempt) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (consumer, stream, stream_sequence) DO NOTHING",
+            )
+            .bind(consumer)
+            .bind(&broker_ref.stream)
+            .bind(stream_sequence)
+            .bind(reason.code())
+            .bind(delivery_attempt)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|_| "delivery quarantine write failed".to_string())
         })
     }
 }

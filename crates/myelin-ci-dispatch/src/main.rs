@@ -221,6 +221,12 @@ async fn main() {
         );
         std::process::exit(1);
     });
+    let delivery_quarantine: Arc<dyn myelin_events::DurableDeliveryQuarantine> = Arc::new(
+        myelin_storage::events_durable::DurableDeliveryQuarantineBacking::new(
+            provider.db_pool().clone(),
+            tokio::runtime::Handle::current(),
+        ),
+    );
 
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).
@@ -229,6 +235,7 @@ async fn main() {
         outbox,
         consumers,
         Box::new(intake),
+        delivery_quarantine,
         shutdown_signal(),
     )
     .await
