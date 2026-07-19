@@ -684,6 +684,11 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                         })?;
                         return Ok((locked, committed, false));
                     }
+                    let request = request.ok_or_else(|| {
+                        myelin_storage::PgError::Query(
+                            "pending authorization binding lost its request provenance".into(),
+                        )
+                    })?;
                     let created = issue_created_envelope(
                         EventId(binding.created_event_id.clone()),
                         id,
@@ -751,7 +756,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                          FROM issue_authz_binding b \
                          JOIN issue i ON i.tenant_id = b.tenant_id AND i.region = b.region \
                                           AND i.id = b.issue_id \
-                         JOIN outbox o ON o.event_id = b.request_event_id \
+                         LEFT JOIN outbox o ON o.event_id = b.request_event_id \
                          WHERE b.tenant_id = $1 AND b.region = $2 AND b.issue_id = $3 \
                            AND i.tenant_id = $1 AND i.region = $2",
                     )
@@ -1524,7 +1529,7 @@ fn validated_binding_from_row(
     tenant: &str,
     region: &str,
     issue_id: Uuid,
-) -> Result<(IssueAuthorizationBinding, EventEnvelope), String> {
+) -> Result<(IssueAuthorizationBinding, Option<EventEnvelope>), String> {
     if row.get::<Uuid, _>("issue_id") != issue_id {
         return Err("authorization binding issue id does not match the requested issue".into());
     }
@@ -1547,26 +1552,12 @@ fn validated_binding_from_row(
     {
         return Err("authorization binding carries a malformed durable event id".into());
     }
-    let request_value: serde_json::Value = row
-        .try_get("request_envelope")
-        .map_err(|error| error.to_string())?;
-    let request: EventEnvelope = serde_json::from_value(request_value)
-        .map_err(|error| format!("decode authorization request envelope: {error}"))?;
     let created_by: String = row
         .try_get("created_by_principal")
         .map_err(|_| "issue creator is absent from authorization binding preflight".to_string())?;
-    validate_authorization_request(
-        &request,
-        tenant,
-        region,
-        issue_id,
-        project_id,
-        &canonical_issue_object,
-        &canonical_project_userset,
-        "parent_project",
-        &request_event_id,
-        &created_by,
-    )?;
+    if created_by.trim().is_empty() {
+        return Err("issue creator is empty in authorization binding preflight".into());
+    }
 
     let state = match row.get::<String, _>("authz_state").as_str() {
         "pending" => IssueAuthorizationState::Pending,
@@ -1576,6 +1567,36 @@ fn validated_binding_from_row(
     let attempts: i32 = row.get("attempts");
     let attempts = u32::try_from(attempts)
         .map_err(|_| "authorization binding has a negative attempt count".to_string())?;
+    let zookie = row.get::<Option<String>, _>("authz_zookie").map(Zookie);
+    if state == IssueAuthorizationState::Active
+        && zookie
+            .as_ref()
+            .is_none_or(|value| value.0.trim().is_empty())
+    {
+        return Err("active authorization binding has no nonempty zookie".into());
+    }
+    let request = if state == IssueAuthorizationState::Pending {
+        let request_value: serde_json::Value = row.try_get("request_envelope").map_err(|_| {
+            "pending authorization binding has no request outbox envelope".to_string()
+        })?;
+        let request: EventEnvelope = serde_json::from_value(request_value)
+            .map_err(|error| format!("decode authorization request envelope: {error}"))?;
+        validate_authorization_request(
+            &request,
+            tenant,
+            region,
+            issue_id,
+            project_id,
+            &canonical_issue_object,
+            &canonical_project_userset,
+            "parent_project",
+            &request_event_id,
+            &created_by,
+        )?;
+        Some(request)
+    } else {
+        None
+    };
     Ok((
         IssueAuthorizationBinding {
             issue_id: issue_id.to_string(),
@@ -1586,7 +1607,7 @@ fn validated_binding_from_row(
             request_event_id,
             created_event_id,
             state,
-            zookie: row.get::<Option<String>, _>("authz_zookie").map(Zookie),
+            zookie,
             attempts,
         },
         request,
