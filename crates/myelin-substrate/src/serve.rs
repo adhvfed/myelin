@@ -1014,6 +1014,10 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
             "0004_consumer_delivery_quarantine",
             myelin_events::CONSUMER_DELIVERY_QUARANTINE_MIGRATION,
         ),
+        Migration::plain(
+            "0005_outbox_publisher_grants",
+            myelin_events::OUTBOX_PUBLISHER_GRANTS_MIGRATION,
+        ),
     ]);
     full_migrations.0.extend(migrations.0);
     runner.run(&full_migrations, &hot_tables)?;

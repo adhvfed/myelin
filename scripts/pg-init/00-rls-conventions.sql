@@ -56,6 +56,33 @@ REVOKE myelin_ci_region_scheduler FROM myelin_app;
 GRANT CONNECT ON DATABASE myelin TO myelin_ci_scheduler_fr_par;
 GRANT USAGE ON SCHEMA public TO myelin_ci_region_scheduler;
 
+-- The elected outbox publisher is a distinct cross-tenant capability. The NOLOGIN role is the
+-- fixed migration grant target; the constrained regional dev login inherits it but cannot SET
+-- ROLE, preserving the authenticated session identity for provider verification.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'myelin_outbox_publisher') THEN
+    CREATE ROLE myelin_outbox_publisher NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'myelin_outbox_publisher_fr_par') THEN
+    CREATE ROLE myelin_outbox_publisher_fr_par LOGIN PASSWORD 'myelin_outbox_publisher_dev_pw'
+      NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE INHERIT;
+  END IF;
+END
+$$;
+
+ALTER ROLE myelin_outbox_publisher
+  NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT;
+ALTER ROLE myelin_outbox_publisher_fr_par
+  LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE INHERIT;
+GRANT myelin_outbox_publisher TO myelin_outbox_publisher_fr_par
+  WITH INHERIT TRUE, SET FALSE;
+REVOKE myelin_outbox_publisher FROM myelin_app;
+REVOKE myelin_outbox_publisher FROM myelin_ci_region_scheduler;
+REVOKE myelin_outbox_publisher FROM myelin_ci_scheduler_fr_par;
+GRANT CONNECT ON DATABASE myelin TO myelin_outbox_publisher_fr_par;
+GRANT USAGE ON SCHEMA public TO myelin_outbox_publisher;
+
 -- Future tables/sequences created by the owner (myelin_admin) are usable by the app role.
 ALTER DEFAULT PRIVILEGES FOR ROLE myelin_admin IN SCHEMA public
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO myelin_app;
