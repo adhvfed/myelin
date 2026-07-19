@@ -28,7 +28,7 @@ use myelin_events::{
     StreamSubject, Timestamp,
 };
 use sqlx::postgres::PgPool;
-use sqlx::Row;
+use sqlx::{Postgres, Row, Transaction};
 use std::collections::HashSet;
 
 use crate::kms::PiiKeyRef as KmsPiiKeyRef;
@@ -616,6 +616,29 @@ impl PgRelay {
             .await
             .map_err(|e| PgError::Query(e.to_string()))?;
 
+        let published = self
+            .relay_once_scoped_in_tx(&mut tx, publisher, batch, config)
+            .await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(published)
+    }
+
+    /// Execute a strict drain inside a caller-owned transaction.
+    ///
+    /// The elected wrapper uses this seam so its transaction-scoped advisory lock, row claims,
+    /// broker publishes, quarantine writes, sent marks, and commit all share one PostgreSQL
+    /// transaction and one connection.
+    pub(crate) async fn relay_once_scoped_in_tx<P: EventPublisher + ?Sized>(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        publisher: &P,
+        batch: i64,
+        config: &RelayValidationConfig,
+    ) -> Result<usize, PgError> {
+
         let rows = sqlx::query(
             "SELECT o.event_id, o.aggregate, o.seq, o.subject, o.envelope FROM outbox o \
              WHERE o.published_at IS NULL \
@@ -630,7 +653,7 @@ impl PgRelay {
              FOR UPDATE OF o SKIP LOCKED LIMIT $1",
         )
         .bind(batch)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await
         .map_err(|e| PgError::Query(e.to_string()))?;
 
@@ -661,7 +684,7 @@ impl PgRelay {
                     .bind(claimed.seq)
                     .bind(reason.code)
                     .bind(reason.detail)
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await
                     .map_err(|e| PgError::Query(e.to_string()))?;
                     blocked_aggregates.insert(claimed.aggregate);
@@ -675,15 +698,12 @@ impl PgRelay {
             }
             sqlx::query("UPDATE outbox SET published_at = now() WHERE event_id = $1")
                 .bind(&claimed.event_id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .map_err(|e| PgError::Query(e.to_string()))?;
             published += 1;
         }
 
-        tx.commit()
-            .await
-            .map_err(|e| PgError::Query(e.to_string()))?;
         Ok(published)
     }
 
