@@ -148,6 +148,10 @@ pub trait EventConsumer: Send + Sync {
         subject_prefix: &str,
     ) -> std::result::Result<Vec<BrokerDelivery>, TransportError>;
 
+    /// Retry retained ACK/NAK/TERM intents without pulling fresh work. Graceful shutdown invokes
+    /// this only after intake has stopped and treats an unresolved settlement as an unclean drain.
+    fn flush_settlements(&self) -> std::result::Result<(), TransportError>;
+
     /// Explicitly acknowledge one terminal delivery.
     fn ack(&self, token: DeliveryToken) -> std::result::Result<(), TransportError>;
 

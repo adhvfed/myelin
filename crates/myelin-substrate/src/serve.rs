@@ -927,18 +927,34 @@ impl ServeHandle {
         self.draining.load(Ordering::SeqCst)
     }
 
-    /// **Graceful drain (architecture §3.1):** stop intake (already signalled), finish in-flight
-    /// — drain the relay to outbox-depth 0 and deliver the last published events to the
-    /// consumers so nothing committed is left unprocessed — then ack-then-exit. Returns the
-    /// final producer telemetry snapshot (so the drain artifact records `outbox_depth == 0`).
-    pub fn drain(self) -> Telemetry {
+    /// Checked graceful drain used by production serve loops. After intake is stopped it retries
+    /// locally retained broker settlements without pulling new work; an unresolved ACK/NAK/TERM
+    /// makes shutdown fail rather than reporting a clean ack-then-exit boundary.
+    pub fn drain_checked(self) -> Result<Telemetry, ServeError> {
         // stop intake.
         self.draining.store(true, Ordering::SeqCst);
+        if let Some(transport) = &self.consumer_transport {
+            if transport.flush_settlements().is_err() {
+                self.health_probe().mark_down("broker");
+                return Err(ServeError(
+                    "graceful drain has unresolved broker settlements".into(),
+                ));
+            }
+            self.health_probe().mark_up("broker");
+        }
         // finish in-flight: one more tick drains the relay + delivers to the consumers.
         self.tick();
         // ack-then-exit: re-observe so the final snapshot reflects depth 0 / lag 0.
         self.telemetry.observe(&self.outbox, &self.consumers);
-        self.telemetry
+        Ok(self.telemetry)
+    }
+
+    /// **Graceful drain (architecture §3.1):** deterministic convenience wrapper used by tests
+    /// and embedded callers that expect a clean drain. Production loops use [`Self::drain_checked`]
+    /// so an unresolved broker settlement becomes a typed non-zero exit.
+    pub fn drain(self) -> Telemetry {
+        self.drain_checked()
+            .expect("graceful drain must reconcile broker settlements")
     }
 
     fn owns_relay(&self) -> bool {
@@ -1116,7 +1132,7 @@ pub fn serve(spec: AppSpec) -> Result<(), ServeError> {
     handle.signal_drain();
     // graceful drain — stop intake, finish in-flight, ack-then-exit. A clean drain leaves
     // outbox_depth == 0 (nothing committed is left unpublished/unprocessed).
-    let final_telemetry = handle.drain();
+    let final_telemetry = handle.drain_checked()?;
     if owns_relay && final_telemetry.outbox_depth() != 0 {
         return Err(ServeError(format!(
             "graceful drain incomplete: outbox_depth = {} (expected 0)",
@@ -1151,7 +1167,7 @@ where
     }
 
     handle.signal_drain();
-    let final_telemetry = handle.drain();
+    let final_telemetry = handle.drain_checked()?;
     if owns_relay && final_telemetry.outbox_depth() != 0 {
         return Err(ServeError(format!(
             "graceful drain incomplete: outbox_depth = {} (expected 0)",
@@ -1271,6 +1287,8 @@ mod tests {
         retries: Vec<DeliveryToken>,
         terms: Vec<DeliveryToken>,
         fail_ack: bool,
+        flushes: usize,
+        fail_flush: bool,
     }
 
     impl PullProbe {
@@ -1339,6 +1357,18 @@ mod tests {
             let mut state = self.state();
             state.pulls += 1;
             Ok(state.batches.pop_front().unwrap_or_default())
+        }
+
+        fn flush_settlements(&self) -> Result<(), myelin_events::TransportError> {
+            let mut state = self.state();
+            state.flushes += 1;
+            if state.fail_flush {
+                Err(myelin_events::TransportError(
+                    "settlement flush unavailable".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
 
         fn ack(
@@ -1542,6 +1572,25 @@ mod tests {
             0,
             "a ready shutdown future prevents fresh intake"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_fails_loudly_when_broker_settlements_cannot_flush_without_pulling() {
+        let probe = PullProbe::default();
+        probe.state().fail_flush = true;
+        let observed = probe.clone();
+
+        let error = serve_until_shutdown(external_consumer_spec(probe, Vec::new()), async {})
+            .await
+            .expect_err("unresolved settlement makes the drain unclean");
+
+        assert_eq!(
+            error.0,
+            "graceful drain has unresolved broker settlements"
+        );
+        let state = observed.state();
+        assert_eq!(state.pulls, 0, "shutdown settlement flush never pulls work");
+        assert_eq!(state.flushes, 1, "shutdown attempts the retained intents once");
     }
 
     #[tokio::test]

@@ -1211,6 +1211,11 @@ impl crate::relay::EventConsumer for NatsJetStreamBus {
         self.try_consume()
     }
 
+    fn flush_settlements(&self) -> Result<(), TransportError> {
+        let _intake = self.intake_gate.lock().unwrap_or_else(|e| e.into_inner());
+        self.drain_settlement_retries()
+    }
+
     fn ack(&self, token: DeliveryToken) -> Result<(), TransportError> {
         self.try_ack(token)
     }
