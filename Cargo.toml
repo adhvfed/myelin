@@ -179,6 +179,8 @@ members = [
     # is preserved. cargo build --workspace stays DB-free (the live-stack schema apply is behind the
     # `integration` feature). See crates/myelin-ci-dispatch/src/lib.rs.
     "crates/myelin-ci-dispatch",
+    # Shared-outbox publisher SERVICE. A terminal leaf: nothing in the workspace depends on it.
+    "crates/myelin-outbox-publisher",
     # The CI Control Plane SERVICE shell (CI-P6 → P-349, M4): a serve(AppSpec) shell (contract 1.1)
     # carrying the COMPLETE forward-only data-model migrations for every CI Control-Plane table
     # (ci_run … cost_event, arch 01 §3) + the #[personal_data(...)]-tagged row mirrors that keep the
