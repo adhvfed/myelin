@@ -8,10 +8,17 @@ use myelin_events::{
     EventType, Timestamp, Visibility,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_outbox_publisher::{PublisherConfig, PublisherDbProvider};
-use myelin_storage::elected_relay::ElectedDrainOutcome;
+use myelin_outbox_publisher::{
+    DrainPass, PassResult, PublisherConfig, PublisherDbProvider, PublisherRuntime,
+};
+use myelin_storage::elected_relay::{
+    ElectedDrainOutcome, ElectedRelayError, SHARED_OUTBOX_PUBLISHER_LOCK_ID,
+};
+use myelin_storage::pg::PgError;
 use myelin_tenancy::{Region, TenantId};
 use sqlx::Row;
+
+static DB_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn envelope(event_id: &str, aggregate: &str) -> EventEnvelope {
     let tenant = TenantId("publisher-live".into());
@@ -57,8 +64,118 @@ impl EventPublisher for RecordingPublisher {
     }
 }
 
+struct UnresponsiveDbPass {
+    pool: sqlx::PgPool,
+    event_id: String,
+}
+
+impl DrainPass for UnresponsiveDbPass {
+    async fn drain_once(&self) -> Result<ElectedDrainOutcome, ElectedRelayError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| ElectedRelayError::Election(PgError::Query(error.to_string())))?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(SHARED_OUTBOX_PUBLISHER_LOCK_ID)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| ElectedRelayError::Election(PgError::Query(error.to_string())))?;
+        sqlx::query("SELECT event_id FROM outbox WHERE event_id=$1 FOR UPDATE")
+            .bind(&self.event_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| ElectedRelayError::Relay(PgError::Query(error.to_string())))?;
+        std::future::pending::<()>().await;
+        drop(tx);
+        unreachable!("an unresponsive pass never completes without its whole-pass timeout")
+    }
+}
+
+#[tokio::test]
+async fn repeated_unresponsive_passes_time_out_with_rows_unsent_and_locks_released() {
+    let _serial = DB_TEST.lock().await;
+    let admin_url = std::env::var("DATABASE_MIGRATION_URL").expect("migration authority");
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&admin_url)
+        .await
+        .expect("admin pool");
+    sqlx::raw_sql(myelin_events::OUTBOX_MIGRATION)
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::raw_sql(myelin_events::OUTBOX_PUBLISHER_GRANTS_MIGRATION)
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    let event_id = format!("publisher-timeout-{}", std::process::id());
+    sqlx::query("DELETE FROM outbox WHERE event_id=$1")
+        .bind(&event_id)
+        .execute(&admin)
+        .await
+        .unwrap();
+    let event = envelope(&event_id, &format!("issue:timeout:{}", std::process::id()));
+    sqlx::query(
+        "INSERT INTO outbox (event_id, aggregate, seq, subject, envelope) VALUES ($1, $2, 0, $3, $4)",
+    )
+    .bind(&event_id)
+    .bind(&event.aggregate.0)
+    .bind(&event.subject.0)
+    .bind(serde_json::to_value(&event).unwrap())
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    let publisher_url = std::env::var("MYELIN_OUTBOX_PUBLISHER_DATABASE_URL").unwrap();
+    let publisher_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&publisher_url)
+        .await
+        .unwrap();
+    let contender_pool = publisher_pool.clone();
+    let runtime = PublisherRuntime::new(
+        UnresponsiveDbPass {
+            pool: publisher_pool,
+            event_id: event_id.clone(),
+        },
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_millis(25),
+    );
+
+    for _ in 0..3 {
+        assert_eq!(runtime.run_pass().await, PassResult::Unavailable);
+        let published: bool = sqlx::query_scalar(
+            "SELECT published_at IS NOT NULL FROM outbox WHERE event_id=$1",
+        )
+        .bind(&event_id)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert!(!published, "a timed-out pass rolls its row state back");
+
+        let mut probe = contender_pool.begin().await.unwrap();
+        let elected: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+            .bind(SHARED_OUTBOX_PUBLISHER_LOCK_ID)
+            .fetch_one(&mut *probe)
+            .await
+            .unwrap();
+        assert!(elected, "publisher contender B acquires the released election lock");
+        probe.rollback().await.unwrap();
+    }
+
+    sqlx::query("DELETE FROM outbox WHERE event_id=$1")
+        .bind(&event_id)
+        .execute(&admin)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn dedicated_capability_publishes_and_quarantines_but_cannot_mutate_outbox_shape() {
+    let _serial = DB_TEST.lock().await;
     let admin_url = std::env::var("DATABASE_MIGRATION_URL").expect("migration authority");
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)

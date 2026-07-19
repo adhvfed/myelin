@@ -63,6 +63,7 @@ async fn main() {
         ElectedPublisher::new(relay, publisher, config.batch()),
         config.poll(),
         config.backoff(),
+        config.pass_timeout(),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let signal_stop = stop.clone();
