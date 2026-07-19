@@ -21,7 +21,10 @@ use myelin_identity_service::{
     PasetoCapabilityVerifier, PrincipalStore, RevocationStore, StoreBackedCheck, TupleStore,
 };
 use myelin_issues::events::ISSUE_CLOSED;
-use myelin_issues::{issues_hot_tables, issues_migrations, PgIssueStore};
+use myelin_issues::{
+    issues_hot_tables, issues_migrations, IssueAuthorizationStatus, PgIssueStore,
+    ISSUE_RECENT_LIST_INDEX,
+};
 use myelin_storage::{
     all_durable_migrations, DurableTupleBacking, KmsEngine, PgBootstrap, TenantScope,
 };
@@ -148,17 +151,37 @@ async fn http(
     token: Option<&str>,
     body: Vec<u8>,
 ) -> (u16, serde_json::Value) {
+    let (status, _, body) = http_with_headers(address, method, path, token, body).await;
+    (status, body)
+}
+
+async fn http_with_headers(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Vec<u8>,
+) -> (u16, hyper::HeaderMap, serde_json::Value) {
     let response = open(address, method, path, token, body).await;
     let status = response.status().as_u16();
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap())
+    let (parts, body) = response.into_parts();
+    let bytes = body.collect().await.unwrap().to_bytes();
+    (
+        status,
+        parts.headers,
+        serde_json::from_slice(&bytes).unwrap(),
+    )
 }
 
 fn create_body(title: &str) -> Vec<u8> {
+    create_body_with_prefix("ENG", title)
+}
+
+fn create_body_with_prefix(prefix: &str, title: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "project_id": PROJECT_ID,
         "type_id": TYPE_ID,
-        "prefix": "ENG",
+        "prefix": prefix,
         "title": title,
     }))
     .unwrap()
@@ -195,6 +218,11 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
         &format!("human:intruder:{unique}"),
         PrincipalKind::Human,
     );
+    let peer = principal(
+        &tenant,
+        &format!("human:peer:{unique}"),
+        PrincipalKind::Human,
+    );
     let foreign = principal(
         &foreign_tenant,
         &format!("human:foreign:{unique}"),
@@ -202,6 +230,11 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     );
     let worker = principal(
         &tenant,
+        &format!("service:issues-reconciler:{unique}"),
+        PrincipalKind::Service,
+    );
+    let foreign_worker = principal(
+        &foreign_tenant,
         &format!("service:issues-reconciler:{unique}"),
         PrincipalKind::Service,
     );
@@ -246,6 +279,33 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     .unwrap()
     .expect("production bootstrap grants project reader and mints creator token");
 
+    // A second project reader proves that request ownership is the exact authenticated creator,
+    // not merely project membership and never an agent's optional on_behalf_of attribution.
+    let peer_directory = directory.clone();
+    let peer_tuples = tuples.clone();
+    let peer_cell = cell.clone();
+    let peer_tenant = tenant.clone();
+    let peer_principal = peer.principal_id.0.clone();
+    let peer_bootstrap_outcome = tokio::task::spawn_blocking(move || {
+        bootstrap_principal_and_mint(
+            &peer_directory,
+            &peer_tuples,
+            &peer_cell,
+            &BootstrapParams {
+                tenant: &peer_tenant,
+                region: REGION,
+                principal: &peer_principal,
+                issues_project: PROJECT_ID,
+                display: None,
+                ttl_days: 1,
+            },
+            now(),
+        )
+    })
+    .await
+    .unwrap()
+    .expect("production bootstrap grants the peer project reader access");
+
     let issue_authorizer = StoreBackedIssueAuthorizer::new(check.clone());
     let issue_store = Arc::new(PgIssueStore::new(
         provider.clone(),
@@ -260,7 +320,9 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
         Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
         RevocationStore::new(),
     ));
-    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(kms)));
+    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
+        kms.clone(),
+    )));
     let builder = register_issues(
         Gateway::builder(
             authn,
@@ -276,6 +338,7 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     let address = spawn(gateway).await;
 
     let creator_token = bootstrap_outcome.token;
+    let peer_token = peer_bootstrap_outcome.token;
     let intruder_token = mint(&cell, &intruder, "intruder-subject", "issues-intruder");
     let foreign_token = mint(&cell, &foreign, "foreign-subject", "issues-foreign");
 
@@ -317,7 +380,7 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     assert_eq!(status, 400);
 
     let title = "private production route title";
-    let (status, receipt) = http(
+    let (status, create_headers, receipt) = http_with_headers(
         address,
         "POST",
         "/v1/issues",
@@ -328,8 +391,89 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     assert_eq!(status, 202, "create returns a staged receipt: {receipt}");
     assert_eq!(receipt["authorization"]["status"], "pending");
     let issue_id = receipt["issue"]["id"].as_str().unwrap().to_string();
+    let request_event_id = receipt["authorization"]["request_event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let authorization_path = format!("/v1/issues/authorization-requests/{request_event_id}");
+    assert_eq!(
+        create_headers
+            .get("location")
+            .and_then(|value| value.to_str().ok()),
+        Some(authorization_path.as_str())
+    );
     let issue_path = format!("/v1/issues/{issue_id}");
     let close_path = format!("{issue_path}/close");
+
+    let (status, pending_headers, pending_status) = http_with_headers(
+        address,
+        "GET",
+        &authorization_path,
+        Some(&creator_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 202);
+    assert_eq!(pending_status["status"], "pending");
+    assert_eq!(pending_status["issue"]["id"], issue_id);
+    assert!(pending_status["retry_after_ms"].as_u64().unwrap() <= 10_000);
+    assert_eq!(
+        pending_headers
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    for forbidden in ["attempts", "last_error", title] {
+        assert!(!pending_status.to_string().contains(forbidden));
+    }
+    let peer_denied = http(
+        address,
+        "GET",
+        &authorization_path,
+        Some(&peer_token),
+        Vec::new(),
+    )
+    .await;
+    let intruder_denied = http(
+        address,
+        "GET",
+        &authorization_path,
+        Some(&intruder_token),
+        Vec::new(),
+    )
+    .await;
+    let foreign_denied = http(
+        address,
+        "GET",
+        &authorization_path,
+        Some(&foreign_token),
+        Vec::new(),
+    )
+    .await;
+    let absent_status = http(
+        address,
+        "GET",
+        "/v1/issues/authorization-requests/01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        Some(&creator_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(peer_denied, intruder_denied);
+    assert_eq!(peer_denied, foreign_denied);
+    assert_eq!(peer_denied, absent_status);
+    assert_eq!(peer_denied.0, 404);
+    assert_eq!(
+        http(
+            address,
+            "GET",
+            "/v1/issues/authorization-requests/not-a-ulid",
+            Some(&creator_token),
+            Vec::new(),
+        )
+        .await
+        .0,
+        400
+    );
 
     let pending_view = http(
         address,
@@ -357,6 +501,72 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
         .connect(&admin_url())
         .await
         .unwrap();
+    let (index_ready, index_valid): (bool, bool) = sqlx::query_as(
+        "SELECT ix.indisready, ix.indisvalid FROM pg_index ix \
+         JOIN pg_class c ON c.oid = ix.indexrelid WHERE c.relname = $1",
+    )
+    .bind(ISSUE_RECENT_LIST_INDEX)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert!(
+        index_ready && index_valid,
+        "recent-list index is live-ready"
+    );
+    let mut explain_conn = admin.acquire().await.unwrap();
+    sqlx::query("SET enable_seqscan = off")
+        .execute(&mut *explain_conn)
+        .await
+        .unwrap();
+    let explain: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN (COSTS OFF) SELECT id FROM issue \
+         WHERE tenant_id = $1 AND region = $2 AND deleted_at IS NULL AND NOT archived \
+         ORDER BY updated_at DESC, id DESC LIMIT 10",
+    )
+    .bind(&tenant)
+    .bind(REGION)
+    .fetch_all(&mut *explain_conn)
+    .await
+    .unwrap();
+    assert!(
+        explain
+            .iter()
+            .any(|line| line.contains(ISSUE_RECENT_LIST_INDEX)),
+        "recent-list plan did not use {ISSUE_RECENT_LIST_INDEX}: {explain:?}"
+    );
+    sqlx::query("RESET enable_seqscan")
+        .execute(&mut *explain_conn)
+        .await
+        .unwrap();
+    drop(explain_conn);
+
+    sqlx::query(
+        "UPDATE issue_authz_binding SET issue_object = 'issue:00000000-0000-0000-0000-000000000000' \
+         WHERE tenant_id = $1 AND request_event_id = $2",
+    )
+    .bind(&tenant)
+    .bind(&request_event_id)
+    .execute(&admin)
+    .await
+    .unwrap();
+    let tampered_status = http(
+        address,
+        "GET",
+        &authorization_path,
+        Some(&creator_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(tampered_status, absent_status);
+    sqlx::query(
+        "UPDATE issue_authz_binding SET issue_object = 'issue:' || issue_id::text \
+         WHERE tenant_id = $1 AND request_event_id = $2",
+    )
+    .bind(&tenant)
+    .bind(&request_event_id)
+    .execute(&admin)
+    .await
+    .unwrap();
     let bootstrap_event_json: serde_json::Value = sqlx::query_scalar(
         "SELECT envelope FROM outbox WHERE aggregate = $1 AND envelope->>'type_' = $2",
     )
@@ -397,6 +607,41 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
         .rebuild_effective_issue_view(&worker)
         .await
         .unwrap();
+    issue_store
+        .rebuild_effective_issue_view(&foreign_worker)
+        .await
+        .unwrap();
+
+    let (status, active_headers, active_status) = http_with_headers(
+        address,
+        "GET",
+        &authorization_path,
+        Some(&creator_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(active_status["status"], "active");
+    assert_eq!(active_status["issue"]["id"], issue_id);
+    assert_eq!(active_status["issue"]["title"], title);
+    assert_eq!(
+        active_headers
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let restarted_store = PgIssueStore::new(
+        provider.clone(),
+        kms.clone(),
+        StoreBackedIssueAuthorizer::new(check.clone()),
+    );
+    assert!(matches!(
+        restarted_store
+            .authorization_status(&creator, &request_event_id)
+            .await
+            .unwrap(),
+        IssueAuthorizationStatus::Active(issue) if issue.id == issue_id && issue.title == title
+    ));
 
     let (status, issue) = http(
         address,
@@ -497,6 +742,198 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     .await;
     assert_eq!(status, 200);
     assert_eq!(second_close["version"], version);
+
+    let mut additional = Vec::new();
+    for (prefix, extra_title) in [
+        ("ENG", "recent engineering issue"),
+        ("OPS", "older operations issue"),
+        ("ENG", "tampered binding must stay hidden"),
+        ("OPS", "archived issue must stay hidden"),
+    ] {
+        let (status, receipt) = http(
+            address,
+            "POST",
+            "/v1/issues",
+            Some(&creator_token),
+            create_body_with_prefix(prefix, extra_title),
+        )
+        .await;
+        assert_eq!(status, 202, "stages `{extra_title}`: {receipt}");
+        additional.push(receipt["issue"]["id"].as_str().unwrap().to_string());
+    }
+    let outcomes = reconcile_pending_issue_authorizations(&issue_store, &check, &worker, 100)
+        .await
+        .unwrap();
+    assert_eq!(outcomes.len(), 4);
+    assert!(outcomes
+        .iter()
+        .all(|(_, outcome)| outcome.as_ref().unwrap().newly_activated));
+    issue_store
+        .rebuild_effective_issue_view(&worker)
+        .await
+        .unwrap();
+
+    for (id, timestamp) in [
+        (&issue_id, "2026-07-19 10:00:00+00"),
+        (&additional[0], "2026-07-19 12:00:00+00"),
+        (&additional[1], "2026-07-19 11:00:00+00"),
+        (&additional[2], "2026-07-19 13:00:00+00"),
+        (&additional[3], "2026-07-19 14:00:00+00"),
+    ] {
+        sqlx::query(
+            "UPDATE issue SET updated_at = $3::timestamptz WHERE tenant_id = $1 AND id = $2::uuid",
+        )
+        .bind(&tenant)
+        .bind(id)
+        .bind(timestamp)
+        .execute(&admin)
+        .await
+        .unwrap();
+    }
+    sqlx::query("UPDATE issue SET archived = true WHERE tenant_id = $1 AND id = $2::uuid")
+        .bind(&tenant)
+        .bind(&additional[3])
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE issue_authz_binding SET project_userset = \
+         'project:00000000-0000-0000-0000-000000000000#view' \
+         WHERE tenant_id = $1 AND issue_id = $2::uuid",
+    )
+    .bind(&tenant)
+    .bind(&additional[2])
+    .execute(&admin)
+    .await
+    .unwrap();
+    issue_store
+        .rebuild_effective_issue_view(&worker)
+        .await
+        .unwrap();
+
+    let (status, default_open) = http(
+        address,
+        "GET",
+        "/v1/issues",
+        Some(&creator_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let open_ids: Vec<_> = default_open["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(open_ids, [additional[0].as_str(), additional[1].as_str()]);
+    assert!(!default_open.to_string().contains(&additional[2]));
+    assert!(!default_open.to_string().contains(&additional[3]));
+
+    let (status, closed_page) = http(
+        address,
+        "GET",
+        "/v1/issues?state=closed",
+        Some(&creator_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(closed_page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(closed_page["items"][0]["id"], issue_id);
+
+    let (status, eng_page) = http(
+        address,
+        "GET",
+        "/v1/issues?state=all&key=eng-",
+        Some(&creator_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let eng_ids: Vec<_> = eng_page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(eng_ids, [additional[0].as_str(), issue_id.as_str()]);
+
+    let (status, first_page) = http(
+        address,
+        "GET",
+        "/v1/issues?state=all&limit=2",
+        Some(&creator_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let cursor = first_page["page"]["next_cursor"]
+        .as_str()
+        .expect("a third authorized row requires a cursor");
+    let first_ids: Vec<_> = first_page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(first_ids, [additional[0].as_str(), additional[1].as_str()]);
+    let (status, second_page) = http(
+        address,
+        "GET",
+        &format!("/v1/issues?state=all&limit=2&cursor={cursor}"),
+        Some(&creator_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(second_page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(second_page["items"][0]["id"], issue_id);
+    assert!(!first_ids.contains(&second_page["items"][0]["id"].as_str().unwrap()));
+    assert_eq!(
+        http(
+            address,
+            "GET",
+            &format!("/v1/issues?state=open&limit=2&cursor={cursor}"),
+            Some(&creator_token),
+            Vec::new(),
+        )
+        .await
+        .0,
+        400,
+        "cursor is bound to its normalized state filter"
+    );
+
+    let peer_page = http(
+        address,
+        "GET",
+        "/v1/issues?state=all",
+        Some(&peer_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(peer_page.0, 200);
+    assert_eq!(peer_page.1["items"].as_array().unwrap().len(), 3);
+    let intruder_page = http(
+        address,
+        "GET",
+        "/v1/issues?state=all&key=ENG-",
+        Some(&intruder_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(intruder_page.0, 200);
+    assert!(intruder_page.1["items"].as_array().unwrap().is_empty());
+    let foreign_page = http(
+        address,
+        "GET",
+        "/v1/issues?state=all",
+        Some(&foreign_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(foreign_page.0, 200);
+    assert!(foreign_page.1["items"].as_array().unwrap().is_empty());
 
     let closed_rows = sqlx::query(
         "SELECT event_id, envelope FROM outbox WHERE envelope->>'tenant' = $1 \
