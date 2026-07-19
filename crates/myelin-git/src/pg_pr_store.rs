@@ -331,6 +331,43 @@ struct SealedPrRecord {
     body: Option<EncryptedColumn>,
 }
 
+/// Verified tenant, residency, and repository authority for one PR-store operation.
+#[derive(Clone, PartialEq, Eq)]
+struct VerifiedRepoScope {
+    tenant_id: TenantId,
+    region: Region,
+    loc: RepoLoc,
+}
+
+impl VerifiedRepoScope {
+    fn new(scope: &TenantScope, repo: &str, provider_region: &str) -> Result<Self, DurableError> {
+        if scope.region().0 != provider_region {
+            return Err(DurableError::NotFound("repository partition".into()));
+        }
+        if scope.tenant().0.is_empty() || repo.is_empty() {
+            return Err(DurableError::Git("empty PR repository scope".into()));
+        }
+        let tenant_id = scope.tenant().clone();
+        let region = scope.region().clone();
+        let loc = RepoLoc::new(tenant_id.0.clone(), region.0.clone(), repo);
+        Ok(Self {
+            tenant_id,
+            region,
+            loc,
+        })
+    }
+}
+
+impl core::fmt::Debug for VerifiedRepoScope {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VerifiedRepoScope")
+            .field("tenant_id", &"<redacted>")
+            .field("region", &"<redacted>")
+            .field("repo", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Provider-only PostgreSQL PR authority. It exposes no raw pool constructor.
 #[derive(Clone)]
 pub struct PgPrStore {
@@ -382,17 +419,15 @@ impl PgPrStore {
     }
 
     fn scoped_loc(&self, scope: &TenantScope, repo: &str) -> Result<RepoLoc, DurableError> {
-        if scope.region().0 != self.provider.config().region {
-            return Err(DurableError::NotFound("repository partition".into()));
-        }
-        if scope.tenant().0.is_empty() || repo.is_empty() {
-            return Err(DurableError::Git("empty PR repository scope".into()));
-        }
-        Ok(RepoLoc::new(
-            scope.tenant().0.clone(),
-            scope.region().0.clone(),
-            repo,
-        ))
+        self.scoped_target(scope, repo).map(|target| target.loc)
+    }
+
+    fn scoped_target(
+        &self,
+        scope: &TenantScope,
+        repo: &str,
+    ) -> Result<VerifiedRepoScope, DurableError> {
+        VerifiedRepoScope::new(scope, repo, &self.provider.config().region)
     }
 
     fn emit_context(
@@ -426,64 +461,74 @@ impl PgPrStore {
         repo: &str,
         number: u64,
     ) -> Result<Option<PrRecord>, DurableError> {
-        let loc = self.scoped_loc(scope, repo)?;
+        let target = self.scoped_target(scope, repo)?;
         let number = db_number(number)?;
         let provider = self.provider.clone();
         let kms = self.kms.clone();
-        let region = Region(loc.region.clone());
-        let expected_tenant = loc.tenant.clone();
+        let tenant_id = target.tenant_id;
+        let region = target.region;
+        let loc = target.loc;
+        let transaction_tenant = tenant_id.0.clone();
+        let crypto_region = region.clone();
+        let expected_tenant = tenant_id.0.clone();
         self.block_on(async move {
             provider
-                .with_tenant_tx(&loc.tenant.clone(), move |conn| {
+                .with_tenant_tx(&transaction_tenant.clone(), move |conn| {
                     Box::pin(async move {
-                        sqlx::query(&format!(
+                        let read_sql = format!(
                             "SELECT {PR_RECORD_COLUMNS} FROM git_pr \
                              WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=$4"
-                        ))
-                        .bind(&loc.tenant)
-                        .bind(&loc.region)
-                        .bind(&loc.repo)
-                        .bind(number)
-                        .fetch_optional(&mut *conn)
-                        .await
-                        .map_err(|_| pg_query("read PR"))
+                        );
+                        sqlx::query(&read_sql)
+                            .bind(&tenant_id.0)
+                            .bind(&region.0)
+                            .bind(&loc.repo)
+                            .bind(number)
+                            .fetch_optional(&mut *conn)
+                            .await
+                            .map_err(|_| pg_query("read PR"))
                     })
                 })
                 .await
         })
         .map_err(pg_error)?
-        .map(|row| decode_record(&kms, &region, &expected_tenant, row))
+        .map(|row| decode_record(&kms, &crypto_region, &expected_tenant, row))
         .transpose()
     }
 
     pub fn list(&self, scope: &TenantScope, repo: &str) -> Result<Vec<PrRecord>, DurableError> {
-        let loc = self.scoped_loc(scope, repo)?;
+        let target = self.scoped_target(scope, repo)?;
         let provider = self.provider.clone();
         let kms = self.kms.clone();
-        let region = Region(loc.region.clone());
-        let expected_tenant = loc.tenant.clone();
+        let tenant_id = target.tenant_id;
+        let region = target.region;
+        let loc = target.loc;
+        let transaction_tenant = tenant_id.0.clone();
+        let crypto_region = region.clone();
+        let expected_tenant = tenant_id.0.clone();
         let rows = self
             .block_on(async move {
                 provider
-                    .with_tenant_tx(&loc.tenant.clone(), move |conn| {
+                    .with_tenant_tx(&transaction_tenant.clone(), move |conn| {
                         Box::pin(async move {
-                            sqlx::query(&format!(
+                            let list_sql = format!(
                                 "SELECT {PR_RECORD_COLUMNS} FROM git_pr \
                                  WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 ORDER BY number"
-                            ))
-                            .bind(&loc.tenant)
-                            .bind(&loc.region)
-                            .bind(&loc.repo)
-                            .fetch_all(&mut *conn)
-                            .await
-                            .map_err(|_| pg_query("list PRs"))
+                            );
+                            sqlx::query(&list_sql)
+                                .bind(&tenant_id.0)
+                                .bind(&region.0)
+                                .bind(&loc.repo)
+                                .fetch_all(&mut *conn)
+                                .await
+                                .map_err(|_| pg_query("list PRs"))
                         })
                     })
                     .await
             })
             .map_err(pg_error)?;
         rows.into_iter()
-            .map(|row| decode_record(&kms, &region, &expected_tenant, row))
+            .map(|row| decode_record(&kms, &crypto_region, &expected_tenant, row))
             .collect()
     }
 
@@ -2446,6 +2491,45 @@ mod tests {
             merge_payload_hash(41, &intent).expect("divergent command hash"),
             "locked PR provenance remains bound"
         );
+    }
+
+    #[test]
+    fn verified_repo_scope_retains_types_without_disclosing_partition_authority() {
+        use myelin_identity::{PrincipalId, PrincipalKind};
+
+        let mut principal = Principal::stub(
+            PrincipalId("subject-under-test".into()),
+            PrincipalKind::Human,
+            TenantId("tenant-secret".into()),
+        );
+        principal.region = Region("region-secret".into());
+        let scope = TenantScope::from_verified_token(&principal, principal.region.clone());
+
+        let target = VerifiedRepoScope::new(&scope, "repo-secret", "region-secret")
+            .expect("matching verified scope");
+        assert_eq!(target.tenant_id, TenantId("tenant-secret".into()));
+        assert_eq!(target.region, Region("region-secret".into()));
+
+        let debug = format!("{target:?}");
+        for secret in ["tenant-secret", "region-secret", "repo-secret"] {
+            assert!(!debug.contains(secret), "debug disclosed {secret}");
+        }
+
+        let mismatch = VerifiedRepoScope::new(&scope, "repo-secret", "provider-secret")
+            .expect_err("cross-region scope must be rejected");
+        assert!(matches!(mismatch, DurableError::NotFound(_)));
+        let public_error = mismatch.to_string();
+        for secret in [
+            "tenant-secret",
+            "region-secret",
+            "repo-secret",
+            "provider-secret",
+        ] {
+            assert!(
+                !public_error.contains(secret),
+                "scope error disclosed {secret}"
+            );
+        }
     }
 
     #[cfg(feature = "integration")]
