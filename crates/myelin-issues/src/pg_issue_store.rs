@@ -24,6 +24,9 @@
 //! never expose an issue without its authorization tuple; retry converges without duplicate visible
 //! creation. This is the honest outbox/Saga equivalent of atomicity at a cross-service boundary.
 
+use crate::api::{
+    decode_issue_page_cursor, encode_issue_page_cursor, normalize_issue_key_prefix, IssueListState,
+};
 use crate::dek::{decrypt_free_text, encrypt_free_text, IssueFreeText};
 use crate::events::{ISSUE_AUTHORIZATION_REQUESTED, ISSUE_CLOSED, ISSUE_CREATED};
 use myelin_events::{
@@ -103,6 +106,10 @@ pub struct IssueViewProjectionRevision {
 pub trait IssueAuthorizer: Send + Sync {
     /// Authorize creation under the addressed project object before encryption/counter/row mutation.
     fn may_create(&self, principal: &Principal, project_id: &str) -> bool;
+    /// Strong project-view check before disclosing a creator-scoped authorization receipt.
+    fn may_view_project(&self, principal: &Principal, project_id: &str) -> bool {
+        self.may_create(principal, project_id)
+    }
     /// Authorize one issue object before its row is read or mutated.
     fn may_access(
         &self,
@@ -137,6 +144,14 @@ pub struct IssueCreationReceipt {
     pub key: String,
     pub project_id: String,
     pub authorization_request_event_id: String,
+}
+
+/// Creator-scoped status of the durable authorization saga. Failure internals are deliberately
+/// absent; retryable failures remain represented as `Pending`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IssueAuthorizationStatus {
+    Pending(IssueCreationReceipt),
+    Active(StoredIssue),
 }
 
 /// The exact Identity relationship intent committed with the pending issue row.
@@ -201,27 +216,53 @@ impl BootstrapFailure {
     }
 }
 
-/// Bounded keyset page request. The cursor is an issue UUID from a prior page, never SQL text.
+/// Bounded, filter-bound keyset page request. Product UX defaults to open work.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssuePageRequest {
+    pub state: IssueListState,
+    /// Normalized uppercase issue-key prefix only; titles remain encrypted and are never searched.
+    pub key: Option<String>,
     /// Requested rows, `1..=100`.
     pub limit: u32,
-    /// Exclusive UUID cursor.
+    /// Exclusive opaque compound cursor (`updated_at DESC, id DESC`) bound to state/key.
     pub cursor: Option<String>,
 }
 
 impl IssuePageRequest {
-    /// Validate a bounded page request. Invalid/oversized limits and malformed cursors fail loudly.
+    /// Validate the default open-work page request.
     pub fn new(limit: u32, cursor: Option<String>) -> Result<Self, IssueStoreError> {
+        Self::filtered(IssueListState::Open, None, limit, cursor)
+    }
+
+    /// Validate a bounded authoritative list request, normalizing the key filter and strictly
+    /// decoding a filter-bound cursor before any database operation.
+    pub fn filtered(
+        state: IssueListState,
+        key: Option<String>,
+        limit: u32,
+        cursor: Option<String>,
+    ) -> Result<Self, IssueStoreError> {
         if limit == 0 || limit > MAX_PAGE_SIZE {
             return Err(IssueStoreError::BadInput(format!(
                 "page limit must be between 1 and {MAX_PAGE_SIZE}"
             )));
         }
+        let key = match key {
+            Some(value) => Some(normalize_issue_key_prefix(&value).ok_or_else(|| {
+                IssueStoreError::BadInput("key must be a bounded ASCII issue-key prefix".into())
+            })?),
+            None => None,
+        };
         if let Some(value) = cursor.as_deref() {
-            parse_uuid("cursor", value)?;
+            decode_issue_page_cursor(value, state, key.as_deref())
+                .map_err(|reason| IssueStoreError::BadInput(reason.into()))?;
         }
-        Ok(Self { limit, cursor })
+        Ok(Self {
+            state,
+            key,
+            limit,
+            cursor,
+        })
     }
 }
 
@@ -820,6 +861,68 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         decode_row(&self.kms, &principal.region, row)
     }
 
+    /// Resolve a creator-scoped asynchronous authorization request. Tenant, region, and exact
+    /// creator are applied in SQL before a row is returned; strong project view gates both states,
+    /// and an active response additionally passes the ordinary strong issue-view authorization.
+    pub async fn authorization_status(
+        &self,
+        principal: &Principal,
+        request_event_id: &str,
+    ) -> Result<IssueAuthorizationStatus, IssueStoreError> {
+        let scope = self.scope(principal)?;
+        if !is_canonical_request_event_id(request_event_id) {
+            return Err(IssueStoreError::BadInput(
+                "authorization request id must be a canonical ULID".into(),
+            ));
+        }
+        let tenant_id = scope.tenant().0.clone();
+        let region = scope.region().0.clone();
+        let creator = principal.principal_id.0.clone();
+        let request_id = request_event_id.to_string();
+        let row = self
+            .provider
+            .with_tenant_tx(&tenant_id.clone(), move |conn| {
+                Box::pin(async move {
+                    sqlx::query(AUTHORIZATION_STATUS_SQL)
+                        .bind(&tenant_id)
+                        .bind(&region)
+                        .bind(&request_id)
+                        .bind(&creator)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
+                })
+            })
+            .await
+            .map_err(|error| IssueStoreError::Storage(error.to_string()))?
+            .ok_or(IssueStoreError::NotFound)?;
+        let issue_id = row.get::<Uuid, _>("id").to_string();
+        let project_id = row.get::<Uuid, _>("project_id").to_string();
+        if !self.authorizer.may_view_project(principal, &project_id) {
+            return Err(IssueStoreError::NotFound);
+        }
+        match row.get::<String, _>("authorization_state").as_str() {
+            "pending" => Ok(IssueAuthorizationStatus::Pending(IssueCreationReceipt {
+                id: issue_id,
+                key: row.get("key"),
+                project_id,
+                authorization_request_event_id: request_event_id.to_string(),
+            })),
+            "active" => {
+                if !self
+                    .authorizer
+                    .may_access(principal, &issue_id, IssuePermission::View)
+                {
+                    return Err(IssueStoreError::NotFound);
+                }
+                decode_row(&self.kms, &principal.region, row).map(IssueAuthorizationStatus::Active)
+            }
+            _ => Err(IssueStoreError::Storage(
+                "authorization binding carried an unsupported state".into(),
+            )),
+        }
+    }
+
     /// Leak-free list over the durable effective-permission projection.
     ///
     /// The one SQL statement returns a projection-status sentinel plus only rows joined to the
@@ -840,12 +943,22 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         let cursor = page
             .cursor
             .as_deref()
-            .map(|v| parse_uuid("cursor", v))
+            .map(|value| {
+                decode_issue_page_cursor(value, page.state, page.key.as_deref())
+                    .map_err(|reason| IssueStoreError::BadInput(reason.into()))
+            })
+            .transpose()?;
+        let cursor_micros = cursor.as_ref().map(|value| value.updated_at_micros);
+        let cursor_id = cursor
+            .as_ref()
+            .map(|value| parse_uuid("cursor issue id", &value.issue_id))
             .transpose()?;
         let fetch_limit = i64::from(page.limit) + 1;
         let tenant_id = scope.tenant().0.clone();
         let region = scope.region().0.clone();
         let principal_id = principal.principal_id.0.clone();
+        let state = page.state.as_str().to_string();
+        let key = page.key.clone();
         let rows = self
             .provider
             .with_tenant_tx(&tenant_id.clone(), move |conn| {
@@ -854,7 +967,10 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                         .bind(&tenant_id)
                         .bind(&region)
                         .bind(&principal_id)
-                        .bind(cursor)
+                        .bind(cursor_micros)
+                        .bind(cursor_id)
+                        .bind(&state)
+                        .bind(&key)
                         .bind(fetch_limit)
                         .fetch_all(&mut *conn)
                         .await
@@ -877,12 +993,29 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         let rows: Vec<_> = rows.collect();
         let has_more = rows.len() > page.limit as usize;
         let mut items = Vec::with_capacity(rows.len().min(page.limit as usize));
+        let mut next_position = None;
         for row in rows.into_iter().take(page.limit as usize) {
+            next_position = Some((
+                row.get::<i64, _>("updated_at_micros"),
+                row.get::<Uuid, _>("id").to_string(),
+            ));
             items.push(decode_row(&self.kms, &principal.region, row)?);
         }
-        let next_cursor = has_more
-            .then(|| items.last().map(|item| item.id.clone()))
-            .flatten();
+        let next_cursor = if has_more {
+            next_position
+                .map(|(updated_at_micros, issue_id)| {
+                    encode_issue_page_cursor(
+                        page.state,
+                        page.key.as_deref(),
+                        updated_at_micros,
+                        &issue_id,
+                    )
+                    .map_err(|reason| IssueStoreError::Storage(reason.into()))
+                })
+                .transpose()?
+        } else {
+            None
+        };
         Ok(IssuePage {
             items,
             next_cursor,
@@ -1153,6 +1286,21 @@ const SELECT_COLUMNS: &str = "id, key, project_id, state, state_category, title_
 title_ciphertext, pii_key_ref, version, created_at::text, updated_at::text";
 const SELECT_COLUMNS_QUALIFIED: &str = "i.id, i.key, i.project_id, i.state, i.state_category, \
 i.title_nonce, i.title_ciphertext, i.pii_key_ref, i.version, i.created_at::text, i.updated_at::text";
+const AUTHORIZATION_STATUS_SQL: &str = r#"
+SELECT i.id, i.key, i.project_id, i.state, i.state_category,
+       i.title_nonce, i.title_ciphertext, i.pii_key_ref, i.version,
+       i.created_at::text AS created_at, i.updated_at::text AS updated_at,
+       b.state AS authorization_state
+FROM issue_authz_binding b
+JOIN issue i
+  ON i.tenant_id = b.tenant_id AND i.region = b.region AND i.id = b.issue_id
+ AND b.project_id = i.project_id
+ AND b.issue_object = 'issue:' || i.id::text
+ AND b.project_userset = 'project:' || i.project_id::text || '#view'
+ AND b.relation = 'parent_project'
+WHERE b.tenant_id = $1 AND b.region = $2 AND b.request_event_id = $3
+  AND i.created_by_principal = $4 AND i.deleted_at IS NULL AND NOT i.archived
+"#;
 const LIST_EFFECTIVE_ISSUE_VIEW_SQL: &str = r#"
 WITH projection AS MATERIALIZED (
   SELECT source_revision, applied_revision, status
@@ -1167,7 +1315,8 @@ gate AS MATERIALIZED (
 authorized AS (
   SELECT i.id, i.key, i.project_id, i.state, i.state_category,
          i.title_nonce, i.title_ciphertext, i.pii_key_ref, i.version,
-         i.created_at::text AS created_at, i.updated_at::text AS updated_at
+         i.created_at::text AS created_at, i.updated_at::text AS updated_at,
+         floor(extract(epoch from i.updated_at) * 1000000)::bigint AS updated_at_micros
   FROM gate g
   JOIN issue_authz_visible av
     ON av.tenant_id = $1 AND av.region = $2
@@ -1180,10 +1329,20 @@ authorized AS (
   JOIN issue_authz_binding b
     ON b.tenant_id = i.tenant_id AND b.region = i.region
    AND b.issue_id = i.id AND b.state = 'active'
+   AND b.project_id = i.project_id
+   AND b.issue_object = 'issue:' || i.id::text
+   AND b.project_userset = 'project:' || i.project_id::text || '#view'
+   AND b.relation = 'parent_project'
   WHERE i.tenant_id = $1 AND i.region = $2
-    AND i.deleted_at IS NULL AND ($4::uuid IS NULL OR i.id > $4)
-  ORDER BY i.id ASC
-  LIMIT $5
+    AND i.deleted_at IS NULL AND NOT i.archived
+    AND ($4::bigint IS NULL OR
+         (i.updated_at, i.id) < (to_timestamp($4::double precision / 1000000.0), $5))
+    AND ($6 = 'all'
+         OR ($6 = 'open' AND i.state_category IN ('unstarted', 'started'))
+         OR ($6 = 'closed' AND i.state_category IN ('completed', 'cancelled')))
+    AND ($7::text IS NULL OR i.key LIKE $7 || '%')
+  ORDER BY i.updated_at DESC, i.id DESC
+  LIMIT $8
 )
 SELECT 0::int AS sort_key,
        CASE
@@ -1196,12 +1355,14 @@ SELECT 0::int AS sort_key,
        NULL::text AS state, NULL::text AS state_category,
        NULL::bytea AS title_nonce, NULL::bytea AS title_ciphertext,
        NULL::text AS pii_key_ref, NULL::bigint AS version,
-       NULL::text AS created_at, NULL::text AS updated_at
+       NULL::text AS created_at, NULL::text AS updated_at,
+       NULL::bigint AS updated_at_micros
 UNION ALL
 SELECT 1, 'ready', id, key, project_id, state, state_category,
-       title_nonce, title_ciphertext, pii_key_ref, version, created_at, updated_at
+       title_nonce, title_ciphertext, pii_key_ref, version, created_at, updated_at,
+       updated_at_micros
 FROM authorized
-ORDER BY sort_key ASC, id ASC NULLS FIRST
+ORDER BY sort_key ASC, updated_at_micros DESC NULLS FIRST, id DESC NULLS FIRST
 "#;
 
 /// Resolve the fixed core org→team→project hierarchy plus direct-relation usersets. A userset that
@@ -1685,6 +1846,19 @@ fn parse_uuid(field: &str, value: &str) -> Result<Uuid, IssueStoreError> {
     Uuid::parse_str(value).map_err(|_| IssueStoreError::BadInput(format!("{field} must be a UUID")))
 }
 
+/// Canonical uppercase Crockford ULID shape used by durable event ids.
+pub fn is_canonical_request_event_id(value: &str) -> bool {
+    value.len() == 26
+        && value.as_bytes()[0] <= b'7'
+        && value.bytes().all(|byte| {
+            byte.is_ascii_digit()
+                || matches!(
+                    byte,
+                    b'A'..=b'H' | b'J'..=b'K' | b'M'..=b'N' | b'P'..=b'T' | b'V'..=b'Z'
+                )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1698,6 +1872,70 @@ mod tests {
         assert!(IssuePageRequest::new(0, None).is_err());
         assert!(IssuePageRequest::new(MAX_PAGE_SIZE + 1, None).is_err());
         assert!(IssuePageRequest::new(10, Some("not-a-uuid".into())).is_err());
+        let cursor = encode_issue_page_cursor(
+            IssueListState::Closed,
+            Some("eng-"),
+            1_700_000_000_123_456,
+            "11111111-1111-1111-1111-111111111111",
+        )
+        .unwrap();
+        let request = IssuePageRequest::filtered(
+            IssueListState::Closed,
+            Some("eng-".into()),
+            10,
+            Some(cursor.clone()),
+        )
+        .unwrap();
+        assert_eq!(request.key.as_deref(), Some("ENG-"));
+        assert!(IssuePageRequest::filtered(
+            IssueListState::Open,
+            Some("ENG-".into()),
+            10,
+            Some(cursor),
+        )
+        .is_err());
+        assert!(LIST_EFFECTIVE_ISSUE_VIEW_SQL.contains("ORDER BY i.updated_at DESC, i.id DESC"));
+        assert!(LIST_EFFECTIVE_ISSUE_VIEW_SQL.contains("(i.updated_at, i.id) <"));
+        assert!(LIST_EFFECTIVE_ISSUE_VIEW_SQL.contains("AND NOT i.archived"));
+        assert!(LIST_EFFECTIVE_ISSUE_VIEW_SQL.contains("b.issue_object = 'issue:' || i.id::text"));
+        assert!(!LIST_EFFECTIVE_ISSUE_VIEW_SQL.contains("title LIKE"));
+    }
+
+    #[test]
+    fn authorization_status_id_and_binding_lookup_are_strict() {
+        assert!(is_canonical_request_event_id("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        for invalid in [
+            "01arz3ndektsv4rrffq69g5fav",
+            "81ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAI",
+            "01ARZ3NDEKTSV4RRFFQ69G5FA",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV/",
+        ] {
+            assert!(
+                !is_canonical_request_event_id(invalid),
+                "accepted `{invalid}`"
+            );
+        }
+        for required in [
+            "b.request_event_id = $3",
+            "i.created_by_principal = $4",
+            "b.project_id = i.project_id",
+            "b.issue_object = 'issue:' || i.id::text",
+            "b.project_userset = 'project:' || i.project_id::text || '#view'",
+            "b.relation = 'parent_project'",
+            "AND NOT i.archived",
+        ] {
+            assert!(
+                AUTHORIZATION_STATUS_SQL.contains(required),
+                "status lookup omitted `{required}`"
+            );
+        }
+        for forbidden in ["outbox", "attempts", "last_error", "on_behalf_of"] {
+            assert!(
+                !AUTHORIZATION_STATUS_SQL.contains(forbidden),
+                "status lookup exposed `{forbidden}`"
+            );
+        }
     }
 
     #[test]

@@ -7,12 +7,185 @@
 /// The default and maximum page sizes exposed by the founder CLI floor.
 pub const DEFAULT_CLI_PAGE_LIMIT: u32 = 50;
 pub const MAX_CLI_PAGE_LIMIT: u32 = 100;
+pub const MAX_ISSUE_KEY_PREFIX_BYTES: usize = 32;
+pub const MAX_ISSUE_CURSOR_BYTES: usize = 192;
 const MAX_TITLE_BYTES: usize = 512;
+const CURSOR_VERSION: u8 = 1;
+const CURSOR_PREFIX: &str = "ic_";
+
+/// Authoritative product list state. The product UX defaults to open work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IssueListState {
+    Open,
+    Closed,
+    All,
+}
+
+impl IssueListState {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "open" => Some(Self::Open),
+            "closed" => Some(Self::Closed),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::All => "all",
+        }
+    }
+
+    fn wire(self) -> u8 {
+        match self {
+            Self::Open => 0,
+            Self::Closed => 1,
+            Self::All => 2,
+        }
+    }
+
+    fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Open),
+            1 => Some(Self::Closed),
+            2 => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+/// Normalize an issue-key prefix search. It is deliberately not a title-search grammar.
+pub fn normalize_issue_key_prefix(value: &str) -> Option<String> {
+    if value.is_empty()
+        || value.len() > MAX_ISSUE_KEY_PREFIX_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return None;
+    }
+    Some(value.to_ascii_uppercase())
+}
+
+/// Decoded keyset position. Scope, principal, and encrypted fields never enter this payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssuePageCursor {
+    pub updated_at_micros: i64,
+    pub issue_id: String,
+}
+
+/// Mint a versioned, URL-safe opaque cursor bound to the normalized list filters.
+pub fn encode_issue_page_cursor(
+    state: IssueListState,
+    key: Option<&str>,
+    updated_at_micros: i64,
+    issue_id: &str,
+) -> Result<String, &'static str> {
+    if updated_at_micros <= 0 || !is_canonical_uuid(issue_id) {
+        return Err("invalid cursor position");
+    }
+    let key = match key {
+        Some(value) => Some(normalize_issue_key_prefix(value).ok_or("invalid key prefix")?),
+        None => None,
+    };
+    let key = key.as_deref().unwrap_or("");
+    let mut payload = Vec::with_capacity(3 + key.len() + 8 + issue_id.len());
+    payload.push(CURSOR_VERSION);
+    payload.push(state.wire());
+    payload.push(key.len() as u8);
+    payload.extend_from_slice(key.as_bytes());
+    payload.extend_from_slice(&updated_at_micros.to_be_bytes());
+    payload.extend_from_slice(issue_id.as_bytes());
+    let mut encoded = String::with_capacity(CURSOR_PREFIX.len() + payload.len() * 2);
+    encoded.push_str(CURSOR_PREFIX);
+    for byte in payload {
+        encoded.push(hex_digit(byte >> 4));
+        encoded.push(hex_digit(byte & 0x0f));
+    }
+    Ok(encoded)
+}
+
+/// Strictly decode a cursor and reject reuse under a different normalized state/key filter.
+pub fn decode_issue_page_cursor(
+    cursor: &str,
+    expected_state: IssueListState,
+    expected_key: Option<&str>,
+) -> Result<IssuePageCursor, &'static str> {
+    if cursor.len() > MAX_ISSUE_CURSOR_BYTES || !cursor.starts_with(CURSOR_PREFIX) {
+        return Err("malformed or unsupported cursor");
+    }
+    let hex = &cursor[CURSOR_PREFIX.len()..];
+    if hex.len() % 2 != 0 {
+        return Err("malformed or unsupported cursor");
+    }
+    let mut payload = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.as_bytes().chunks_exact(2) {
+        payload.push((decode_hex(pair[0])? << 4) | decode_hex(pair[1])?);
+    }
+    if payload.len() < 3 + 8 + 36 || payload[0] != CURSOR_VERSION {
+        return Err("malformed or unsupported cursor");
+    }
+    let state = IssueListState::from_wire(payload[1]).ok_or("malformed or unsupported cursor")?;
+    let key_len = payload[2] as usize;
+    if key_len > MAX_ISSUE_KEY_PREFIX_BYTES || payload.len() != 3 + key_len + 8 + 36 {
+        return Err("malformed or unsupported cursor");
+    }
+    let key_bytes = &payload[3..3 + key_len];
+    let key = core::str::from_utf8(key_bytes).map_err(|_| "malformed or unsupported cursor")?;
+    let decoded_key = if key.is_empty() {
+        None
+    } else {
+        Some(normalize_issue_key_prefix(key).ok_or("malformed or unsupported cursor")?)
+    };
+    let expected_key = match expected_key {
+        Some(value) => Some(normalize_issue_key_prefix(value).ok_or("invalid key prefix")?),
+        None => None,
+    };
+    if state != expected_state || decoded_key != expected_key {
+        return Err("cursor does not match list filters");
+    }
+    let timestamp_start = 3 + key_len;
+    let updated_at_micros = i64::from_be_bytes(
+        payload[timestamp_start..timestamp_start + 8]
+            .try_into()
+            .map_err(|_| "malformed or unsupported cursor")?,
+    );
+    let issue_id = core::str::from_utf8(&payload[timestamp_start + 8..])
+        .map_err(|_| "malformed or unsupported cursor")?
+        .to_string();
+    if updated_at_micros <= 0 || !is_canonical_uuid(&issue_id) {
+        return Err("malformed or unsupported cursor");
+    }
+    Ok(IssuePageCursor {
+        updated_at_micros,
+        issue_id,
+    })
+}
+
+fn hex_digit(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        _ => (b'a' + value - 10) as char,
+    }
+}
+
+fn decode_hex(value: u8) -> Result<u8, &'static str> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err("malformed or unsupported cursor"),
+    }
+}
 
 /// A fully parsed Issues command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliCommand {
     List {
+        state: IssueListState,
+        key: Option<String>,
         limit: u32,
         cursor: Option<String>,
     },
@@ -77,11 +250,38 @@ pub fn parse_cli(args: &[&str]) -> Result<CliCommand, CliParseError> {
 }
 
 fn parse_list(args: &[&str]) -> Result<CliCommand, CliParseError> {
+    let mut state = None;
+    let mut key = None;
     let mut limit = None;
     let mut cursor = None;
     let mut index = 0;
     while index < args.len() {
         match args[index] {
+            "--state" => {
+                if state.is_some() {
+                    return Err(CliParseError::DuplicateFlag { flag: "--state" });
+                }
+                let value = flag_value(args, &mut index, "--state")?;
+                state =
+                    Some(
+                        IssueListState::parse(value).ok_or_else(|| CliParseError::BadValue {
+                            field: "state (expected open|closed|all)",
+                            value: value.to_string(),
+                        })?,
+                    );
+            }
+            "--key" => {
+                if key.is_some() {
+                    return Err(CliParseError::DuplicateFlag { flag: "--key" });
+                }
+                let value = flag_value(args, &mut index, "--key")?;
+                key = Some(normalize_issue_key_prefix(value).ok_or_else(|| {
+                    CliParseError::BadValue {
+                        field: "key prefix (expected 1..=32 ASCII letters/digits/hyphen)",
+                        value: value.to_string(),
+                    }
+                })?);
+            }
             "--limit" => {
                 if limit.is_some() {
                     return Err(CliParseError::DuplicateFlag { flag: "--limit" });
@@ -98,7 +298,6 @@ fn parse_list(args: &[&str]) -> Result<CliCommand, CliParseError> {
                     return Err(CliParseError::DuplicateFlag { flag: "--cursor" });
                 }
                 let value = flag_value(args, &mut index, "--cursor")?;
-                require_uuid("cursor UUID", value)?;
                 cursor = Some(value.to_string());
             }
             other => {
@@ -109,7 +308,18 @@ fn parse_list(args: &[&str]) -> Result<CliCommand, CliParseError> {
         }
         index += 1;
     }
+    let state = state.unwrap_or(IssueListState::Open);
+    if let Some(value) = cursor.as_deref() {
+        decode_issue_page_cursor(value, state, key.as_deref()).map_err(|_| {
+            CliParseError::BadValue {
+                field: "opaque cursor",
+                value: value.to_string(),
+            }
+        })?;
+    }
     Ok(CliCommand::List {
+        state,
+        key,
         limit: limit.unwrap_or(DEFAULT_CLI_PAGE_LIMIT),
         cursor,
     })
@@ -232,15 +442,29 @@ mod tests {
         assert_eq!(
             parse_cli(&["list"]).unwrap(),
             CliCommand::List {
+                state: IssueListState::Open,
+                key: None,
                 limit: 50,
                 cursor: None
             }
         );
+        let cursor = encode_issue_page_cursor(
+            IssueListState::Closed,
+            Some("eng-"),
+            1_700_000_000_123_456,
+            PROJECT,
+        )
+        .unwrap();
         assert_eq!(
-            parse_cli(&["list", "--limit", "1", "--cursor", PROJECT]).unwrap(),
+            parse_cli(&[
+                "list", "--state", "closed", "--key", "eng-", "--limit", "1", "--cursor", &cursor,
+            ])
+            .unwrap(),
             CliCommand::List {
+                state: IssueListState::Closed,
+                key: Some("ENG-".into()),
                 limit: 1,
-                cursor: Some(PROJECT.into())
+                cursor: Some(cursor)
             }
         );
         assert_eq!(
@@ -311,6 +535,8 @@ mod tests {
             ));
         }
         assert!(parse_cli(&["list", "--cursor", "not-a-uuid"]).is_err());
+        assert!(parse_cli(&["list", "--state", "OPEN"]).is_err());
+        assert!(parse_cli(&["list", "--key", "title search"]).is_err());
         assert!(parse_cli(&["view", "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"]).is_err());
         for prefix in ["E", "engineering", "ENG_TOO_LONG", "ENG-"] {
             assert!(parse_cli(&[
@@ -346,5 +572,51 @@ mod tests {
         assert_eq!(error, CliParseError::BadTitle);
         assert!(!error.to_string().contains("customer-secret"));
         assert!(!format!("{error:?}").contains("customer-secret"));
+    }
+
+    #[test]
+    fn cursor_roundtrips_compound_position_and_is_filter_bound() {
+        let cursor = encode_issue_page_cursor(
+            IssueListState::Open,
+            Some("eng-1"),
+            1_700_000_000_123_456,
+            PROJECT,
+        )
+        .unwrap();
+        assert!(cursor.len() <= MAX_ISSUE_CURSOR_BYTES);
+        assert!(cursor
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'));
+        assert!(!cursor.contains("acme"));
+        assert!(!cursor.contains("founder"));
+        assert!(!cursor.contains("secret title"));
+        assert_eq!(
+            decode_issue_page_cursor(&cursor, IssueListState::Open, Some("ENG-1")).unwrap(),
+            IssuePageCursor {
+                updated_at_micros: 1_700_000_000_123_456,
+                issue_id: PROJECT.into(),
+            }
+        );
+        assert!(decode_issue_page_cursor(&cursor, IssueListState::Closed, Some("ENG-1")).is_err());
+        assert!(decode_issue_page_cursor(&cursor, IssueListState::Open, Some("OPS")).is_err());
+    }
+
+    #[test]
+    fn cursor_rejects_malformed_foreign_version_and_oversize_inputs() {
+        let cursor =
+            encode_issue_page_cursor(IssueListState::All, None, 1_700_000_000_123_456, PROJECT)
+                .unwrap();
+        for malformed in ["", "ic_0", "ic_zz", "IC_0100"] {
+            assert!(decode_issue_page_cursor(malformed, IssueListState::All, None).is_err());
+        }
+        let mut foreign = cursor.clone();
+        foreign.replace_range(3..5, "02");
+        assert!(decode_issue_page_cursor(&foreign, IssueListState::All, None).is_err());
+        assert!(decode_issue_page_cursor(
+            &format!("ic_{}", "00".repeat(MAX_ISSUE_CURSOR_BYTES)),
+            IssueListState::All,
+            None,
+        )
+        .is_err());
     }
 }
