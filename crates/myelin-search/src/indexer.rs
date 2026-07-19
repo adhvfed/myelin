@@ -620,6 +620,29 @@ impl IncrementalIndexer {
         self
     }
 
+    /// **The SANCTIONED constructor for a SERVING indexer — the gate is not optional here.**
+    ///
+    /// [`Self::new`] leaves the rebuild gate unset, which is right for the two things that build a
+    /// throwaway indexer and never serve from it: the per-corpus `register_*_index_specs` admission
+    /// gates (they construct one only to prove Search accepts a spec) and tests. It is WRONG for a
+    /// production indexer, and a `with_rebuild_gate` that a composition root can simply forget is
+    /// how the fence ends up shipped as a capability nobody calls.
+    ///
+    /// So the serving path takes the gate as a required argument. A composition root cannot build a
+    /// serving indexer without deciding about the fence, because there is no signature that lets it.
+    ///
+    /// **Named floor:** registering this indexer as the service's `evt.*` consumer is SRCH-P06 —
+    /// `search_app_spec` still ships `consumers: Vec::new()`, so no production consumer exists to
+    /// attach yet. This constructor is what that wiring must use when it lands.
+    pub fn for_service(
+        specs: Vec<IndexSpec>,
+        fetcher: Arc<dyn ProjectFetcher>,
+        embedder: Arc<dyn EmbeddingAdapter>,
+        rebuild_gate: crate::rebuild::RebuildReadGate,
+    ) -> IncrementalIndexer {
+        IncrementalIndexer::new(specs, fetcher, embedder).with_rebuild_gate(rebuild_gate)
+    }
+
     /// Whether `(tenant, region)` is currently fenced by a rebuild. `false` when no gate is wired.
     fn fenced(&self, tenant: &TenantId, region: &Region) -> bool {
         match &self.rebuild_gate {

@@ -47,7 +47,7 @@ use myelin_search::indexer::{
 };
 use myelin_search::rebuild::{
     ExpectedCorpus, MemoryRebuildJournal, RebuildCoordinator, RebuildError, RebuildKey,
-    RebuildPhase, RebuildReadGate, ReadMode, VerifyFailure,
+    RebuildPhase, RebuildReadGate, ReadMode, ReplayOutcome, VerifyFailure,
 };
 use myelin_search::reindex::SearchReindexer;
 use myelin_tenancy::{Region, TenantId};
@@ -302,7 +302,7 @@ impl Harness {
         c.fence(&key, HOLDER, now, &committed)?;
         c.wipe(&key, HOLDER, now)?;
         c.reset_cursors(&key, HOLDER, now)?;
-        let replayed = c.replay_all(
+        let replay = c.replay_all(
             &key,
             HOLDER,
             now,
@@ -313,7 +313,16 @@ impl Harness {
         )?;
         let rows = self.outbox.committed_rows();
         let caught = c.catch_up(&key, HOLDER, now, &rows)?;
-        let expected = ExpectedCorpus::from_index(&self.reindexer, &key, replayed, caught)?;
+        // The OWNER-TRUTH expectation — the form in which parity is a real check. The semantic
+        // subset is the corpora whose spec is semantic in this drill (git blobs + knowledge pages).
+        let semantic: BTreeSet<String> = replay
+            .replayed_subjects
+            .iter()
+            .chain(caught.applied_subjects.iter())
+            .filter(|s| s.contains("/git/blob/") || s.contains("/knowledge/page/"))
+            .cloned()
+            .collect();
+        let expected = ExpectedCorpus::from_replay(&replay, &caught, &semantic);
         c.verify_and_open(&key, HOLDER, now, &expected)
     }
 }
@@ -682,7 +691,7 @@ fn a_git_only_replay_is_caught_as_lossy() {
     // Replay ONLY the Git scope — the tempting mistake.
     let git = git_source();
     let sources: Vec<&dyn ReindexSource> = vec![&git];
-    let replayed = c
+    let replay = c
         .replay_all(
             &key,
             HOLDER,
@@ -696,10 +705,29 @@ fn a_git_only_replay_is_caught_as_lossy() {
     let rows = h.outbox.committed_rows();
     c.catch_up(&key, HOLDER, 100, &rows).unwrap();
 
-    // An operator asserting against a corpus they know SHOULD be there catches the loss.
-    let mut expected = ExpectedCorpus::from_index(&h.reindexer, &key, replayed, 0).unwrap();
-    expected.doc_ids.insert(kn_id("runbook"));
-    expected.doc_ids.insert(issue_id("1421"));
+    // The DEFAULT expectation — no hand-inserted ids. Owner truth for the FULL registered scope set
+    // is what should be there; a Git-only replay produced a fraction of it, and that has to fail.
+    // (With an index-derived expectation this passed green and reopened reads over a corpus missing
+    // three subsystems — the whole reason `from_replay` exists.)
+    let git_all = git_source();
+    let kn_all = kn_source();
+    let iss_all = issues_source();
+    let chat_all = chat_source();
+    let all_sources: Vec<&dyn ReindexSource> = vec![&git_all, &iss_all, &kn_all, &chat_all];
+    let mut owner_truth = ReplayOutcome {
+        docs_indexed: replay.docs_indexed,
+        ..Default::default()
+    };
+    for scope in all_scopes() {
+        for src in &all_sources {
+            if src.owner_token() == scope.owner {
+                for d in src.replay(&scope, None) {
+                    owner_truth.replayed_subjects.insert(d.subject.0.clone());
+                }
+            }
+        }
+    }
+    let expected = ExpectedCorpus::from_replay(&owner_truth, &Default::default(), &BTreeSet::new());
 
     let err = c
         .verify_and_open(&key, HOLDER, 100, &expected)
@@ -767,7 +795,14 @@ fn crash_after_wipe_converges_without_rewiping() {
         .unwrap();
     let rows = h.outbox.committed_rows();
     let caught = c.catch_up(&key, resumed, 500, &rows).unwrap();
-    let expected = ExpectedCorpus::from_index(&h.reindexer, &key, replayed, caught).unwrap();
+    let semantic: BTreeSet<String> = replayed
+        .replayed_subjects
+        .iter()
+        .chain(caught.applied_subjects.iter())
+        .filter(|s| s.contains("/git/blob/") || s.contains("/knowledge/page/"))
+        .cloned()
+        .collect();
+    let expected = ExpectedCorpus::from_replay(&replayed, &caught, &semantic);
     let report = c.verify_and_open(&key, resumed, 500, &expected).unwrap();
 
     assert_eq!(report.legacy_identities, 0);
@@ -841,11 +876,19 @@ fn crash_during_replay_resumes_without_rewiping_or_losing_work() {
     );
 
     // Resume with the FULL scope set: the two finished scopes are skipped, the rest replay.
-    c.replay_all(&key, resumed, 900, &all_scopes(), &sources, &mut h.outbox, replay_ctx())
+    let replay_outcome = c
+        .replay_all(&key, resumed, 900, &all_scopes(), &sources, &mut h.outbox, replay_ctx())
         .unwrap();
     let rows = h.outbox.committed_rows();
     let caught = c.catch_up(&key, resumed, 900, &rows).unwrap();
-    let expected = ExpectedCorpus::from_index(&h.reindexer, &key, 0, caught).unwrap();
+    let semantic: BTreeSet<String> = replay_outcome
+        .replayed_subjects
+        .iter()
+        .chain(caught.applied_subjects.iter())
+        .filter(|s| s.contains("/git/blob/") || s.contains("/knowledge/page/"))
+        .cloned()
+        .collect();
+    let expected = ExpectedCorpus::from_replay(&replay_outcome, &caught, &semantic);
     c.verify_and_open(&key, resumed, 900, &expected).unwrap();
 
     let ids = h.doc_ids();
@@ -920,7 +963,7 @@ fn a_concurrent_live_event_at_the_high_water_boundary_is_applied_exactly_once() 
         "the replay pushed more rows above the mark — the bound must still hold"
     );
     let caught = c.catch_up(&key, HOLDER, 100, &rows).unwrap();
-    assert_eq!(caught, 1, "exactly the one pre-fence event was caught up");
+    assert_eq!(caught.applied, 1, "exactly the one pre-fence event was caught up");
 
     assert!(
         h.doc_ids().contains(&late_doc),
@@ -934,12 +977,19 @@ fn a_concurrent_live_event_at_the_high_water_boundary_is_applied_exactly_once() 
 
     // Re-running catch-up is a no-op — the phase gate holds, so a retry cannot double-apply.
     assert_eq!(
-        c.catch_up(&key, HOLDER, 100, &rows).unwrap(),
+        c.catch_up(&key, HOLDER, 100, &rows).unwrap().applied,
         0,
         "catch-up is idempotent across a retry"
     );
 
-    let expected = ExpectedCorpus::from_index(&h.reindexer, &key, replayed, caught).unwrap();
+    let semantic: BTreeSet<String> = replayed
+        .replayed_subjects
+        .iter()
+        .chain(caught.applied_subjects.iter())
+        .filter(|s| s.contains("/git/blob/") || s.contains("/knowledge/page/"))
+        .cloned()
+        .collect();
+    let expected = ExpectedCorpus::from_replay(&replayed, &caught, &semantic);
     c.verify_and_open(&key, HOLDER, 100, &expected).unwrap();
 }
 
@@ -1408,7 +1458,7 @@ fn catch_up_is_correct_under_the_durable_stores_row_ordering() {
 
     let caught = c.catch_up(&key, HOLDER, 100, &rows).unwrap();
     assert_eq!(
-        caught, 3,
+        caught.applied, 3,
         "exactly the three pre-fence events are applied, regardless of row order"
     );
 
@@ -1761,5 +1811,52 @@ fn an_erasure_during_a_rebuild_is_refused_loudly() {
     assert!(
         holder.erase_subject(&subject, &tenant()).is_ok(),
         "erasure resumes once reads reopen"
+    );
+}
+
+/// **The serving constructor cannot be called without deciding about the fence.**
+///
+/// `with_rebuild_gate` is a builder a composition root can forget, and forgetting it is exactly how
+/// the fence shipped as a capability nobody called. `for_service` takes the gate as a required
+/// argument, so a serving indexer cannot be constructed unfenced. Asserts the gate is live on the
+/// result — the constructor threads it, rather than merely accepting it.
+#[test]
+fn the_serving_constructor_requires_the_fence() {
+    let fetcher = Arc::new(OwnerProjection::default());
+    let journal = Arc::new(MemoryRebuildJournal::new());
+    let gate = RebuildReadGate::new(journal.clone());
+    let indexer = Arc::new(IncrementalIndexer::for_service(
+        all_specs(),
+        fetcher.clone(),
+        Arc::new(MockEmbeddingAdapter::new(8)),
+        gate.clone(),
+    ));
+
+    let doc = kn_id("served");
+    fetcher.put(&doc, "a page about paxos");
+    indexer.index(&created_event(&doc)).unwrap();
+    assert_eq!(
+        indexer
+            .search_ft(&tenant(), &region(), &AclFilter::All, "paxos", 10)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Fencing the tenant is immediately observable through the constructed indexer — proof the gate
+    // was threaded, not just accepted and dropped.
+    let coordinator = RebuildCoordinator::new(
+        journal.clone(),
+        SearchReindexer::new(indexer.clone(), region()),
+    );
+    coordinator
+        .claim(&RebuildKey::new(&tenant(), &region()), HOLDER, 100)
+        .unwrap();
+    assert!(
+        indexer
+            .search_ft(&tenant(), &region(), &AclFilter::All, "paxos", 10)
+            .unwrap()
+            .is_empty(),
+        "a `for_service` indexer honours the fence"
     );
 }

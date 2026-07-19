@@ -1035,13 +1035,13 @@ impl RebuildCoordinator {
         sources: &[&dyn ReindexSource],
         outbox: &mut OutboxStore,
         ctx_base: EmitContextBase,
-    ) -> Result<usize, RebuildError> {
+    ) -> Result<ReplayOutcome, RebuildError> {
         let mut rec = self.checked(key, holder, now)?;
         // Past `Replayed` the corpus is frozen: catch-up has begun applying live events on top of
         // it, and replaying a scope now would re-drive snapshots BEHIND events that already
         // superseded them. Stop.
         if rec.phase > RebuildPhase::Replayed {
-            return Ok(0);
+            return Ok(ReplayOutcome::default());
         }
         if rec.phase < RebuildPhase::CursorsReset {
             return Err(RebuildError::PhaseOutOfOrder {
@@ -1058,11 +1058,27 @@ impl RebuildCoordinator {
 
         self.reassert_lease(key, &rec, holder, now)?;
         rec = self.checked(key, holder, now)?;
-        let mut indexed = 0usize;
+        let mut outcome = ReplayOutcome::default();
         for scope in scopes {
             let scope_key = scope.as_key();
+            // Ask the owner what this scope's truth IS — for EVERY scope in the set, including ones
+            // an earlier pass already replayed. These subjects are the independent expectation: they
+            // come from OWNER TRUTH, not from the index, so comparing the rebuilt index against them
+            // is a real check rather than a restatement. It is the same deterministic
+            // `replay(scope, None)` the driver below re-drives, so the two agree by construction.
+            //
+            // Collected BEFORE the already-replayed skip, deliberately: on a resumed rebuild the
+            // index legitimately holds the corpora an earlier pass replayed, so an expectation
+            // covering only THIS pass's scopes would fail a correct resume.
+            for source in sources {
+                if source.owner_token() == scope.owner {
+                    for draft in source.replay(scope, None) {
+                        outcome.replayed_subjects.insert(draft.subject.0.clone());
+                    }
+                }
+            }
             if rec.owners_replayed.contains(&scope_key) {
-                continue; // already done in an earlier attempt.
+                continue; // already driven in an earlier attempt.
             }
             let job = self.reindexer.replay_scope_without_wipe(
                 &key.tenant,
@@ -1071,7 +1087,7 @@ impl RebuildCoordinator {
                 outbox,
                 ctx_base.clone(),
             )?;
-            indexed += job.progress().docs_indexed;
+            outcome.docs_indexed += job.progress().docs_indexed;
             // Journal the scope as done BEFORE moving on, so a crash resumes after it.
             let done = scope_key.clone();
             self.advance(key, &rec, holder, now, |next| {
@@ -1085,7 +1101,7 @@ impl RebuildCoordinator {
                 next.phase = RebuildPhase::Replayed;
             })?;
         }
-        Ok(indexed)
+        Ok(outcome)
     }
 
     /// **Phase 5 — apply live events up to the recorded high-water mark.**
@@ -1103,10 +1119,10 @@ impl RebuildCoordinator {
         holder: &str,
         now: u64,
         rows: &[myelin_events::OutboxRow],
-    ) -> Result<usize, RebuildError> {
+    ) -> Result<CatchUpOutcome, RebuildError> {
         let rec = self.checked(key, holder, now)?;
         if rec.phase >= RebuildPhase::CaughtUp {
-            return Ok(0);
+            return Ok(CatchUpOutcome::default());
         }
         if rec.phase < RebuildPhase::Replayed {
             return Err(RebuildError::PhaseOutOfOrder {
@@ -1125,7 +1141,7 @@ impl RebuildCoordinator {
         }
         let watermark = rec.high_water_seqs.clone();
         self.reassert_lease(key, &rec, holder, now)?;
-        let mut applied = 0usize;
+        let mut outcome = CatchUpOutcome::default();
         for row in rows.iter() {
             // At or below this aggregate's fence-time mark. An ABSENT aggregate had no committed
             // rows at fence time, so everything it holds now is post-fence: skip. Explicit `Option`
@@ -1144,12 +1160,13 @@ impl RebuildCoordinator {
                 .indexer()
                 .index(&row.envelope)
                 .map_err(|e| RebuildError::Engine(catch_up_failure_category(&e)))?;
-            applied += 1;
+            outcome.applied += 1;
+            outcome.applied_subjects.insert(row.envelope.subject.0.clone());
         }
         self.advance(key, &rec, holder, now, |next| {
             next.phase = RebuildPhase::CaughtUp;
         })?;
-        Ok(applied)
+        Ok(outcome)
     }
 
     /// **Phase 6 — verify, then reopen reads.**
@@ -1269,6 +1286,51 @@ impl RebuildCoordinator {
     }
 }
 
+/// What a [`RebuildCoordinator::replay_all`] pass drove, INDEPENDENT of the index it drove it into.
+///
+/// `replayed_subjects` is read from the owners' `replay` drafts — owner truth — which is what makes
+/// it usable as a verification expectation. Building the expectation from the index instead makes
+/// count, digest and vector parity `x == x`; see [`ExpectedCorpus::from_index`].
+#[derive(Clone, Default)]
+pub struct ReplayOutcome {
+    /// Snapshots driven through the live indexer this pass.
+    pub docs_indexed: usize,
+    /// Every subject the owners replayed — the document set owner truth says should exist.
+    pub replayed_subjects: BTreeSet<String>,
+}
+
+impl std::fmt::Debug for ReplayOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Subjects are artifact refs (a blob ref embeds repo + path) — counts only.
+        f.debug_struct("ReplayOutcome")
+            .field("docs_indexed", &self.docs_indexed)
+            .field("replayed_subjects", &self.replayed_subjects.len())
+            .finish()
+    }
+}
+
+/// What a [`RebuildCoordinator::catch_up`] pass applied, INDEPENDENT of the index.
+///
+/// The pre-fence live events belong in the verification expectation alongside owner truth: they
+/// were applied to the generation the wipe destroyed and re-applied here, so the rebuilt index
+/// legitimately holds documents the owners' `replay` did not name.
+#[derive(Clone, Default)]
+pub struct CatchUpOutcome {
+    /// Live events applied.
+    pub applied: usize,
+    /// The subjects those events addressed.
+    pub applied_subjects: BTreeSet<String>,
+}
+
+impl std::fmt::Debug for CatchUpOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatchUpOutcome")
+            .field("applied", &self.applied)
+            .field("applied_subjects", &self.applied_subjects.len())
+            .finish()
+    }
+}
+
 /// **What the rebuild believes it produced** — the expectation side of parity verification.
 ///
 /// Built by the caller from what the replay and catch-up actually indexed. Comparing the index
@@ -1287,6 +1349,42 @@ pub struct ExpectedCorpus {
 }
 
 impl ExpectedCorpus {
+    /// **Build the expectation from OWNER TRUTH — the form in which verification is a real check.**
+    ///
+    /// `replay` carries the subjects the owners said should exist; `caught_up` is the number of
+    /// live events catch-up applied. Comparing the rebuilt index against this catches what
+    /// [`Self::from_index`] structurally cannot: a corpus that never replayed, a replay that indexed
+    /// nothing, a wipe that landed after the replay, and a Git-only replay that lost three
+    /// subsystems.
+    ///
+    /// `semantic_subjects` names the subset expected to carry a live embedding (a corpus whose spec
+    /// is semantic). Pass an empty set when no corpus is semantic.
+    ///
+    /// Note the deliberate strictness: a subject the owner replayed but whose projection resolved
+    /// `Gone` will be missing from the index and FAIL this check. That is correct — the owner's
+    /// truth and its projection disagreeing is a real inconsistency, and failing loud beats
+    /// reopening reads over a corpus nobody can account for.
+    pub fn from_replay(
+        replay: &ReplayOutcome,
+        catch_up: &CatchUpOutcome,
+        semantic_subjects: &BTreeSet<String>,
+    ) -> ExpectedCorpus {
+        // Owner truth PLUS the pre-fence live events catch-up re-applied. Those were applied to the
+        // generation the wipe destroyed, so the rebuilt index legitimately holds documents the
+        // owners' `replay` did not name; omitting them would fail a correct rebuild.
+        let doc_ids: BTreeSet<String> = replay
+            .replayed_subjects
+            .union(&catch_up.applied_subjects)
+            .cloned()
+            .collect();
+        ExpectedCorpus {
+            vector_doc_ids: doc_ids.intersection(semantic_subjects).cloned().collect(),
+            doc_ids,
+            docs_replayed: replay.docs_indexed,
+            docs_caught_up: catch_up.applied,
+        }
+    }
+
     /// **A SELF-CONSISTENCY snapshot of the index — NOT an independent expectation.**
     ///
     /// Read this warning before using it. The count, digest and vector legs of
