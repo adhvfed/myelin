@@ -60,6 +60,18 @@ fn admin_scope(tenant: &str) -> TenantScope {
     )
 }
 
+/// The exact active service identity seeded for `subj-1`; it carries no synthetic admin identity.
+fn authenticated_agent(tenant: &str) -> Principal {
+    Principal::new(
+        TenantId(tenant.into()),
+        Region(REGION.into()),
+        PrincipalId("svc:agent".into()),
+        PrincipalKind::Service,
+        DataRole::Controller,
+        PrincipalStatus::Active,
+    )
+}
+
 fn seed_tenant(store: &PrincipalStore, tenant: &str) {
     let scope = admin_scope(tenant);
     store
@@ -272,7 +284,10 @@ async fn merge_blocked_by_gate_is_a_clean_cli_error() {
     assert!(stdout.is_empty(), "no view-model on a blocked merge");
 
     // The gate was NOT bypassed: the PR is still open on disk.
-    let rec = be.get_pr("acme", REGION, "alpha", 1).unwrap().unwrap();
+    let rec = be
+        .get_pr("acme", REGION, "alpha", 1, &authenticated_agent("acme"))
+        .unwrap()
+        .unwrap();
     assert_ne!(
         format!("{:?}", rec.state),
         "Merged",
