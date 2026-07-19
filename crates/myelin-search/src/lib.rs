@@ -113,6 +113,8 @@
 pub mod analysis;
 pub mod cache;
 pub mod canonical;
+pub mod rebuild;
+pub mod rebuild_durable;
 pub mod chat_projection;
 pub mod ci_log_projection;
 pub mod compiler;

@@ -119,7 +119,14 @@ myelin-refs = { path = "../myelin-refs" }
 # DB-free. EXTERNAL crates only; no new myelin edge — Search stays a terminal leaf consumer. The
 # test reads DATABASE_URL inline (no myelin-config edge — same posture as refs-service/identity).
 # ------------------------------------------------------------------------------------------
-sqlx = { workspace = true, optional = true }
+# The DURABLE rebuild journal (`rebuild_durable::PgRebuildJournal`) is a PRODUCTION store, not a
+# test fixture: the legacy→canonical identity migration's safety argument rests on its phase
+# surviving a crash (an in-memory phase would re-wipe an index it had already replayed, and would
+# consider reads open because it holds no record saying otherwise). So sqlx is a NON-OPTIONAL
+# dependency here, the same posture CT-004a took for myelin-ci-controlplane: `integration` stays a
+# TEST-SELECTOR feature, not the thing that makes durability compile. The build stays DB-free —
+# connecting happens at RUNTIME.
+sqlx = { workspace = true }
 # MR-009b W3b.4 — the DURABLE composition root in `src/main.rs` (SubstrateProvider from env →
 # foundation migrations → `OutboxStore::durable(PgOutboxBacking)`) is the ALWAYS-COMPILED default
 # (the Wave-2 identity-service posture), so `tokio` (the multi-thread runtime the sync→async
@@ -149,7 +156,6 @@ memory = ["test-support"]
 # (tokio + myelin-config are regular deps since W3b.4 — the durable main.rs needs them; the
 # feature now pulls the raw-sqlx test harness + the live storage backends.)
 integration = [
-    "dep:sqlx",
     "myelin-storage/integration",
 ]
 

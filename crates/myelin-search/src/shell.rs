@@ -73,10 +73,20 @@ CREATE TABLE IF NOT EXISTS search_index_directory (
 /// filter cache (S5) tables are the later slices' migrations (SRCH-P06/P16/P13 — named floors, not
 /// shipped here).
 pub fn search_service_migrations() -> Migrations {
-    Migrations::of([Migration::plain(
-        "0010_search_index_directory",
-        SEARCH_INDEX_DIR_MIGRATION,
-    )])
+    Migrations::of([
+        Migration::plain("0010_search_index_directory", SEARCH_INDEX_DIR_MIGRATION),
+        // The legacy→canonical identity rebuild's durable job + exclusive lease (one row per
+        // `(tenant, region)`), and the partial index the per-query read gate reads. Both additive
+        // CREATEs — forward-only, never a DROP.
+        Migration::plain(
+            "0011_search_rebuild_job",
+            crate::rebuild::SEARCH_REBUILD_JOB_MIGRATION,
+        ),
+        Migration::plain(
+            "0012_search_rebuild_active_index",
+            crate::rebuild::SEARCH_REBUILD_ACTIVE_INDEX_MIGRATION,
+        ),
+    ])
 }
 
 /// The store manifest the harness auto-registers as `PersonalDataHolder`s (§3.4, GD-3). Beyond the
@@ -284,6 +294,48 @@ mod tests {
                 .any(|m| m.id == "0010_search_index_directory"),
             "the index-directory migration is in the Search AppSpec's forward-only set"
         );
+    }
+
+    /// **The rebuild job + lease migrations are additive, forward-only, and boot-applied.**
+    ///
+    /// The identity-rebuild coordinator's durability rests entirely on this table existing before
+    /// the first claim: a coordinator whose journal table is missing cannot fence reads, so a
+    /// rebuild would wipe an index that is still being served. Pins that the migrations are in the
+    /// AppSpec's set (boot applies them) and that neither is destructive.
+    #[test]
+    fn the_rebuild_job_migrations_are_forward_only_and_boot_applied() {
+        for ddl in [
+            crate::rebuild::SEARCH_REBUILD_JOB_MIGRATION,
+            crate::rebuild::SEARCH_REBUILD_ACTIVE_INDEX_MIGRATION,
+        ] {
+            assert!(
+                !myelin_substrate::is_destructive(ddl),
+                "the rebuild-job migrations are additive CREATEs, never DROPs"
+            );
+        }
+        assert!(
+            crate::rebuild::SEARCH_REBUILD_JOB_MIGRATION.contains("search_rebuild_job"),
+            "the job/lease table is created"
+        );
+        // The lease and the phase live in ONE row so claiming and reading are one atomic read.
+        for column in ["phase", "fence_epoch", "high_water_mark", "lease_holder"] {
+            assert!(
+                crate::rebuild::SEARCH_REBUILD_JOB_MIGRATION.contains(column),
+                "the job row carries `{column}`"
+            );
+        }
+        assert!(
+            crate::rebuild::SEARCH_REBUILD_JOB_MIGRATION.contains("PRIMARY KEY (tenant, region)"),
+            "the job is keyed per (tenant, region) — a rebuild is never cell-wide"
+        );
+
+        let spec = search_app_spec(Config::default(), OutboxStore::new());
+        for id in ["0011_search_rebuild_job", "0012_search_rebuild_active_index"] {
+            assert!(
+                spec.migrations.0.iter().any(|m| m.id == id),
+                "`{id}` is in the Search AppSpec's forward-only set"
+            );
+        }
     }
 
     /// **The shell declares the per-tenant search-index store + `identity` critical, and NO

@@ -238,6 +238,35 @@ impl ReindexCursorStore {
         g.applied.remove(&key);
     }
 
+    /// **Reset EVERY scope's cursor + applied-set for `(tenant, region)` (the whole-index rebuild's
+    /// precondition).**
+    ///
+    /// [`Self::reset_scope`] clears one scope; a whole-index rebuild wipes every corpus at once, so
+    /// every scope's cursor is stale simultaneously. Resetting them one-at-a-time as each owner
+    /// replays would leave the not-yet-replayed owners' cursors pointing into the WIPED generation —
+    /// and a crash in that window would resume them from a high-water mark whose documents no longer
+    /// exist, silently skipping the corpus. Returns the number of scopes reset (an observability
+    /// count; never the scope selectors, which name owner artifacts).
+    ///
+    /// The per-tenant in-flight count is untouched (it is per-tenant, not per-scope).
+    pub fn reset_all_scopes(&self, tenant: &TenantId, region: &Region) -> usize {
+        let mut g = self.lock();
+        let doomed: Vec<CursorKey> = g
+            .cursors
+            .keys()
+            .chain(g.applied.keys())
+            .filter(|k| k.tenant == tenant.0 && k.region == region.0)
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for key in &doomed {
+            g.cursors.remove(key);
+            g.applied.remove(key);
+        }
+        doomed.len()
+    }
+
     /// Record that `event_id` (at `version`) was applied for `(tenant, region, scope)` — advances the
     /// resume cursor to the max version seen + marks the id applied (the idempotency guard). Returns
     /// `false` iff the id was ALREADY applied (the caller skips it — no double effect).
@@ -396,6 +425,13 @@ impl SearchReindexer {
         &self.cursors
     }
 
+    /// The live indexer this driver rebuilds (the coordinator drives its `index()`/`wipe()` steps
+    /// directly across the rebuild's phases). The SAME indexer the bus feeds — there is no second
+    /// index and no Postgres backdoor.
+    pub fn indexer(&self) -> &Arc<IncrementalIndexer> {
+        &self.indexer
+    }
+
     /// The live doc count in the `(tenant, region)` index the reindexer rebuilds (the restore-verify
     /// gate's row↔doc↔vector parity leg reads this — SRCH-P28). Delegates to the SAME live indexer the
     /// reindex re-drives; there is no second index.
@@ -446,23 +482,57 @@ impl SearchReindexer {
         // The per-tenant in-flight cap (§4.9): refuse an over-cap reindex so a storm cannot starve the
         // tenant's live indexing lane. Acquire-then-release around the whole pass.
         if !self.cursors.try_acquire(tenant) {
+            // PII posture: the refusal names the CAP, never the tenant. A tenant id is a
+            // customer-identifying token and this error is logged on a hot shed path.
             return Err(ReindexError::AtCapacity(format!(
-                "tenant `{}` already has {} reindex job(s) in flight (cap {})",
-                tenant.0,
+                "a tenant already has {} reindex job(s) in flight (cap {})",
                 self.cursors.in_flight(tenant),
                 self.cursors.max_in_flight_per_tenant()
             )));
         }
-        let result = self.reindex_inner(tenant, scope, since, sources, outbox, ctx_base);
+        let result = self.reindex_inner(tenant, scope, since, true, sources, outbox, ctx_base);
         self.cursors.release(tenant);
         result
     }
 
+    /// **A FULL replay of one scope that does NOT wipe (the multi-owner rebuild's per-scope step).**
+    ///
+    /// [`Self::reindex`] wipes on every full rebuild, which is correct for a single scope and WRONG
+    /// for a whole-index rebuild: replaying `git`, then `issues`, then `knowledge`, then `chat`
+    /// through it would wipe away each corpus as the next one starts, leaving only the last. The
+    /// coordinator ([`crate::rebuild`]) therefore wipes the `(tenant, region)` index EXACTLY ONCE
+    /// and drives each registered owner's corpus through this non-wiping replay.
+    ///
+    /// Identical to `reindex(since = None)` in every other respect — the same bus re-emit, the same
+    /// live `index()` step, the same deterministic-id idempotency, the same throttle. The cursor
+    /// reset is likewise the coordinator's (once, at its own phase), not this call's.
+    pub fn replay_scope_without_wipe(
+        &self,
+        tenant: &TenantId,
+        scope: &SnapshotScope,
+        sources: &[&dyn ReindexSource],
+        outbox: &mut OutboxStore,
+        ctx_base: EmitContextBase,
+    ) -> Result<ReindexJob, ReindexError> {
+        if !self.cursors.try_acquire(tenant) {
+            return Err(ReindexError::AtCapacity(format!(
+                "a tenant already has {} reindex job(s) in flight (cap {})",
+                self.cursors.in_flight(tenant),
+                self.cursors.max_in_flight_per_tenant()
+            )));
+        }
+        let result = self.reindex_inner(tenant, scope, None, false, sources, outbox, ctx_base);
+        self.cursors.release(tenant);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn reindex_inner(
         &self,
         tenant: &TenantId,
         scope: &SnapshotScope,
         since: Option<u64>,
+        wipe: bool,
         sources: &[&dyn ReindexSource],
         outbox: &mut OutboxStore,
         ctx_base: EmitContextBase,
@@ -471,8 +541,10 @@ impl SearchReindexer {
 
         // A FULL rebuild (`since = None`) WIPES the index first — the cold-rebuild precondition (derived
         // state only; Search holds no system-of-record, §1). An INCREMENTAL backfill (`since = Some`)
-        // appends to the live index (the new-sub-index / upcaster / resume path), so NO wipe.
-        if since.is_none() {
+        // appends to the live index (the new-sub-index / upcaster / resume path), so NO wipe. A
+        // coordinator-driven multi-owner rebuild passes `wipe = false` because it already wiped once
+        // for the whole index (see `replay_scope_without_wipe`).
+        if since.is_none() && wipe {
             self.indexer.wipe(tenant, &region);
             // The prior applied-set/cursor guarded the WIPED generation's docs — reset them so the cold
             // rebuild re-applies every snapshot (the index is empty; the applied-set then guards only
