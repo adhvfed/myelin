@@ -102,16 +102,20 @@ async fn persist_prepared_start(
         return Ok(RunId(existing));
     }
 
-    // Global code registry: tenant_id/region do not apply to code-only definitions.
-    let wf_version = sqlx::query_scalar::<_, i32>(
+    // `wf_definition` is the schema's one deliberate global-code registry: it contains only the
+    // immutable workflow type/version/hash/status tuple and has no tenant, region, or PII columns.
+    // Name that carve-out at the query construction site so it cannot be mistaken for a
+    // tenant-store read; every run lookup above and below remains `(tenant_id, region)` bound.
+    let tenant_id_not_applicable = sqlx::query_scalar::<_, i32>(
         "SELECT version FROM wf_definition WHERE wf_type = $1 AND status = 'active' \
          /* global registry: tenant_id and region do not apply */ \
          ORDER BY version DESC LIMIT 1",
-    )
-    .bind(&prepared.spec.wf_type)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(|e| PgError::Query(format!("resolve active workflow definition: {e}")))?;
+    );
+    let wf_version = tenant_id_not_applicable
+        .bind(&prepared.spec.wf_type)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| PgError::Query(format!("resolve active workflow definition: {e}")))?;
     let Some(wf_version) = wf_version else {
         return Err(PgError::Query(format!(
             "unknown workflow type: {}",
@@ -643,24 +647,24 @@ mod tests {
             validate_refs(&[myelin_refs::ArtifactRef("short-ref".into())], &tenant),
             Err(ExecutorError::InvalidInput(_))
         ));
-        assert!(matches!(
-            validate_refs(
-                &[myelin_refs::ArtifactRef(
-                    "myelin://other/git/repo/core".into()
-                )],
-                &tenant
-            ),
-            Err(ExecutorError::InvalidInput(_))
-        ));
+        let cross_tenant_ref = "myelin://other/git/repo/private-core";
+        let error = validate_refs(
+            &[myelin_refs::ArtifactRef(cross_tenant_ref.into())],
+            &tenant,
+        )
+        .unwrap_err();
+        assert!(matches!(&error, ExecutorError::InvalidInput(_)));
+        let public_error = error.to_string();
+        assert!(!public_error.contains(cross_tenant_ref));
+        assert!(!public_error.contains("private-core"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn caller_transaction_start_requires_a_durable_handler_connection() {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
-            .unwrap();
         let executor = PgFlowExecutor::new(
-            pool,
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+                .unwrap(),
             tokio::runtime::Handle::current(),
             Arc::new(myelin_events::MonotonicMinter::new()),
             TenantId("acme".into()),
