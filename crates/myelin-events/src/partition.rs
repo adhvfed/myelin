@@ -45,11 +45,6 @@ use myelin_tenancy::{Region, TenantId};
 /// grammar has one authority and a typo cannot fork the routing namespace.
 pub const SUBJECT_ROOT: &str = "evt";
 
-/// A deliberately finite bound for one routing token. NATS permits large subjects, but accepting
-/// unbounded tenant or aggregate identifiers lets one corrupt outbox row create an oversized
-/// protocol line. Existing canonical identifiers are far below this limit.
-pub const MAX_SUBJECT_TOKEN_BYTES: usize = 255;
-
 /// The maximum wire-subject size produced by the event bus, including the `evt.` root.
 pub const MAX_STREAM_SUBJECT_BYTES: usize = 1024;
 
@@ -60,7 +55,7 @@ pub const MAX_STREAM_SUBJECT_BYTES: usize = 1024;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SubjectComponent(String);
 
-/// A component was empty, malformed, non-canonical, or too large for one bounded subject token.
+/// A component was empty, malformed, or non-canonical.
 /// Variants deliberately carry no attacker-controlled input so trust-boundary errors are safe to
 /// log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,8 +65,6 @@ pub enum SubjectComponentError {
     /// A `%` escape was malformed/lowercase, decoded UTF-8 was invalid, or literals were not the
     /// canonical minimal representation.
     NonCanonical,
-    /// The encoded component exceeds the finite subject-token bound.
-    TooLong,
 }
 
 impl std::fmt::Display for SubjectComponentError {
@@ -79,7 +72,6 @@ impl std::fmt::Display for SubjectComponentError {
         match self {
             Self::Empty => write!(f, "subject component is empty"),
             Self::NonCanonical => write!(f, "subject component encoding is non-canonical"),
-            Self::TooLong => write!(f, "subject component exceeds its bounded size"),
         }
     }
 }
@@ -103,9 +95,6 @@ impl SubjectComponent {
                 encoded.push(HEX[(byte & 0x0f) as usize] as char);
             }
         }
-        if encoded.len() > MAX_SUBJECT_TOKEN_BYTES {
-            return Err(SubjectComponentError::TooLong);
-        }
         Ok(Self(encoded))
     }
 
@@ -114,9 +103,6 @@ impl SubjectComponent {
     pub fn parse(encoded: &str) -> Result<Self, SubjectComponentError> {
         if encoded.is_empty() {
             return Err(SubjectComponentError::Empty);
-        }
-        if encoded.len() > MAX_SUBJECT_TOKEN_BYTES {
-            return Err(SubjectComponentError::TooLong);
         }
         let bytes = encoded.as_bytes();
         let mut decoded = Vec::with_capacity(bytes.len());
@@ -293,13 +279,6 @@ fn validate_subject_token(field: &'static str, token: &str) -> Result<(), Subjec
         return Err(SubjectError::BadSubjectToken {
             field,
             token: token.to_string(),
-        });
-    }
-    if token.len() > MAX_SUBJECT_TOKEN_BYTES {
-        return Err(SubjectError::SubjectTooLong {
-            field,
-            bytes: token.len(),
-            max_bytes: MAX_SUBJECT_TOKEN_BYTES,
         });
     }
     Ok(())
@@ -539,6 +518,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn subject_component_over_255_bytes_round_trips_until_the_wire_bound() {
+        let raw = format!("refs/heads/{}", "feature".repeat(40));
+        let encoded = SubjectComponent::encode(&raw).unwrap();
+        assert!(encoded.as_str().len() > 255);
+        assert_eq!(encoded.decode(), raw);
+        assert_eq!(SubjectComponent::parse(encoded.as_str()).unwrap(), encoded);
+    }
+
     /// **The EB-12 GATE (subject round-trip).** The subject grammar round-trips the
     /// `(tenant, subsystem, aggregate_type, aggregate_id, event_name)` routing + ordering key:
     /// `parse(to_subject(s)) == s` for a representative event, and the wire form is exactly the
@@ -700,12 +688,19 @@ mod tests {
             ));
         }
 
+        let mut formerly_oversized_token = sample_envelope();
+        formerly_oversized_token.aggregate = AggregateKey(format!("issue:{}", "x".repeat(256)));
+        assert!(
+            StreamSubject::of(&formerly_oversized_token).is_ok(),
+            "NATS has no 255-byte per-token limit; the complete wire bound is authoritative"
+        );
+
         let mut oversized = sample_envelope();
-        oversized.aggregate = AggregateKey(format!("issue:{}", "x".repeat(256)));
+        oversized.aggregate = AggregateKey(format!("issue:{}", "x".repeat(1024)));
         assert!(matches!(
             StreamSubject::of(&oversized),
             Err(SubjectError::SubjectTooLong {
-                field: "aggregate_id",
+                field: "subject",
                 ..
             })
         ));

@@ -445,7 +445,7 @@ pub use outbox::{
 };
 pub use partition::{
     stream_name_for, PartitionKey, StreamSubject, SubjectComponent, SubjectComponentError,
-    SubjectError, MAX_STREAM_SUBJECT_BYTES, MAX_SUBJECT_TOKEN_BYTES, SUBJECT_ROOT,
+    SubjectError, MAX_STREAM_SUBJECT_BYTES, SUBJECT_ROOT,
 };
 pub use relay::{
     dlq_subject, BrokerDelivery, BrokerDeliveryBody, BrokerDeliveryRef, BusTransport,

@@ -1805,6 +1805,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn git_ref_event_key_supports_valid_refs_beyond_the_old_255_byte_token_limit() {
+        let long_ref = RefName::new(format!("refs/heads/{}", "feature".repeat(40)));
+        let key = GitRefEventKey::new("core", &long_ref).expect("valid long Git ref");
+        assert!(key.id().len() > 255);
+        assert_eq!(GitRefEventKey::parse_id(&key.id()).unwrap().1, long_ref);
+
+        let wire = format!("evt.acme.git.ref.{}.updated", key.id());
+        assert!(wire.len() < myelin_events::MAX_STREAM_SUBJECT_BYTES);
+        assert_eq!(
+            myelin_events::StreamSubject::parse(&wire)
+                .expect("long ref fits the complete wire bound")
+                .aggregate_id,
+            key.id()
+        );
+    }
+
     /// **emit-iff-committed: crash AFTER policy (before commit) emits NOTHING (0 ghost).** The ref
     /// never moves, the outbox is empty, the quarantine is NOT promoted.
     #[test]
