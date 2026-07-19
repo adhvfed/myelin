@@ -92,7 +92,7 @@ impl SubjectComponent {
         if raw.is_empty() {
             return Err(SubjectComponentError::Empty);
         }
-        let mut encoded = String::with_capacity(raw.len());
+        let mut encoded = String::with_capacity(raw.len().min(MAX_ENCODED_COMPONENT_BYTES + 1));
         for byte in raw.as_bytes() {
             if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
                 encoded.push(*byte as char);
@@ -550,6 +550,11 @@ mod tests {
         assert_eq!(
             SubjectComponent::parse(&"a".repeat(MAX_ENCODED_COMPONENT_BYTES + 1)),
             Err(SubjectComponentError::TooLong)
+        );
+        assert_eq!(
+            SubjectComponent::encode(&"/".repeat(1_000_000)),
+            Err(SubjectComponentError::TooLong),
+            "attacker-sized input is rejected without attacker-sized output allocation"
         );
     }
 
