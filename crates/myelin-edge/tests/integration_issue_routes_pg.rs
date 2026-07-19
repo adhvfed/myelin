@@ -14,7 +14,7 @@ use myelin_edge::{
 };
 use myelin_events::EventEnvelope;
 use myelin_identity::{
-    DataRole, FragmentAdmit, Principal, PrincipalId, PrincipalKind, PrincipalStatus,
+    DataRole, FragmentAdmit, Principal, PrincipalId, PrincipalKind, PrincipalStatus, Zookie,
 };
 use myelin_identity_service::{
     CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
@@ -22,8 +22,8 @@ use myelin_identity_service::{
 };
 use myelin_issues::events::ISSUE_CLOSED;
 use myelin_issues::{
-    issues_hot_tables, issues_migrations, IssueAuthorizationStatus, PgIssueStore,
-    ISSUE_RECENT_LIST_INDEX,
+    issues_hot_tables, issues_migrations, IssueAuthorizationBinding, IssueAuthorizationStatus,
+    IssueTupleWriter, PgIssueStore, ISSUE_KEY_PREFIX_LIST_INDEX, ISSUE_RECENT_LIST_INDEX,
 };
 use myelin_storage::{
     all_durable_migrations, DurableTupleBacking, KmsEngine, PgBootstrap, TenantScope,
@@ -31,7 +31,10 @@ use myelin_storage::{
 use myelin_substrate::HotTables;
 use myelin_tenancy::{Region, TenantId};
 use sqlx::Row;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
@@ -40,6 +43,23 @@ const REGION: &str = "fr-par";
 const PROJECT_ID: &str = "11111111-1111-1111-1111-111111111111";
 const TYPE_ID: &str = "22222222-2222-2222-2222-222222222222";
 const SCHEME: &str = "agent";
+
+#[derive(Default)]
+struct CountingTupleWriter {
+    calls: AtomicUsize,
+}
+
+impl IssueTupleWriter for CountingTupleWriter {
+    fn ensure_parent_project<'a>(
+        &'a self,
+        _scope: &'a TenantScope,
+        _actor: &'a Principal,
+        _binding: &'a IssueAuthorizationBinding,
+    ) -> Pin<Box<dyn Future<Output = Result<Zookie, String>> + Send + 'a>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(Zookie("must-not-be-used".into())) })
+    }
+}
 
 fn admin_url() -> String {
     std::env::var("DATABASE_MIGRATION_URL")
@@ -396,11 +416,9 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
         .unwrap()
         .to_string();
     let authorization_path = format!("/v1/issues/authorization-requests/{request_event_id}");
-    assert_eq!(
-        create_headers
-            .get("location")
-            .and_then(|value| value.to_str().ok()),
-        Some(authorization_path.as_str())
+    assert!(
+        create_headers.get("location").is_none(),
+        "a create-only credential must not receive a Location that requires issue.view"
     );
     let issue_path = format!("/v1/issues/{issue_id}");
     let close_path = format!("{issue_path}/close");
@@ -413,7 +431,7 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
         Vec::new(),
     )
     .await;
-    assert_eq!(status, 202);
+    assert_eq!(status, 202, "create returns a staged receipt: {receipt}");
     assert_eq!(pending_status["status"], "pending");
     assert_eq!(pending_status["issue"]["id"], issue_id);
     assert!(pending_status["retry_after_ms"].as_u64().unwrap() <= 10_000);
@@ -501,45 +519,17 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
         .connect(&admin_url())
         .await
         .unwrap();
-    let (index_ready, index_valid): (bool, bool) = sqlx::query_as(
-        "SELECT ix.indisready, ix.indisvalid FROM pg_index ix \
-         JOIN pg_class c ON c.oid = ix.indexrelid WHERE c.relname = $1",
-    )
-    .bind(ISSUE_RECENT_LIST_INDEX)
-    .fetch_one(&admin)
-    .await
-    .unwrap();
-    assert!(
-        index_ready && index_valid,
-        "recent-list index is live-ready"
-    );
-    let mut explain_conn = admin.acquire().await.unwrap();
-    sqlx::query("SET enable_seqscan = off")
-        .execute(&mut *explain_conn)
+    for index in [ISSUE_RECENT_LIST_INDEX, ISSUE_KEY_PREFIX_LIST_INDEX] {
+        let (index_ready, index_valid): (bool, bool) = sqlx::query_as(
+            "SELECT ix.indisready, ix.indisvalid FROM pg_index ix \
+             JOIN pg_class c ON c.oid = ix.indexrelid WHERE c.relname = $1",
+        )
+        .bind(index)
+        .fetch_one(&admin)
         .await
         .unwrap();
-    let explain: Vec<String> = sqlx::query_scalar(
-        "EXPLAIN (COSTS OFF) SELECT id FROM issue \
-         WHERE tenant_id = $1 AND region = $2 AND deleted_at IS NULL AND NOT archived \
-         ORDER BY updated_at DESC, id DESC LIMIT 10",
-    )
-    .bind(&tenant)
-    .bind(REGION)
-    .fetch_all(&mut *explain_conn)
-    .await
-    .unwrap();
-    assert!(
-        explain
-            .iter()
-            .any(|line| line.contains(ISSUE_RECENT_LIST_INDEX)),
-        "recent-list plan did not use {ISSUE_RECENT_LIST_INDEX}: {explain:?}"
-    );
-    sqlx::query("RESET enable_seqscan")
-        .execute(&mut *explain_conn)
-        .await
-        .unwrap();
-    drop(explain_conn);
-
+        assert!(index_ready && index_valid, "{index} is live-ready");
+    }
     sqlx::query(
         "UPDATE issue_authz_binding SET issue_object = 'issue:00000000-0000-0000-0000-000000000000' \
          WHERE tenant_id = $1 AND request_event_id = $2",
@@ -549,6 +539,28 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     .execute(&admin)
     .await
     .unwrap();
+    let counting_writer = CountingTupleWriter::default();
+    assert!(issue_store
+        .reconcile_authorization(&worker, &issue_id, &counting_writer)
+        .await
+        .is_err());
+    assert_eq!(
+        counting_writer.calls.load(Ordering::SeqCst),
+        0,
+        "canonical preflight rejects a mutable binding copy before Identity"
+    );
+    let unintended_tuple_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM rebac_tuple WHERE tenant_id = $1 AND region = $2 \
+         AND object_id IN ($3, $4) AND relation = 'parent_project'",
+    )
+    .bind(&tenant)
+    .bind(REGION)
+    .bind(format!("issue:{issue_id}"))
+    .bind("issue:00000000-0000-0000-0000-000000000000")
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(unintended_tuple_count, 0);
     let tampered_status = http(
         address,
         "GET",
@@ -934,6 +946,99 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     .await;
     assert_eq!(foreign_page.0, 200);
     assert!(foreign_page.1["items"].as_array().unwrap().is_empty());
+
+    // Realistic skew proof for the exact served authorization/state/prefix CTE. Every synthetic
+    // issue is visible to this subject, while the requested prefix is absent, so a scan of the
+    // entire authorization partition would be both tempting and pathological without the prefix
+    // range index.
+    sqlx::query(
+        "INSERT INTO issue (tenant_id, region, id, key, prefix, type_id, type_rank, state, \
+                            state_category, project_id, rank, title, title_nonce, title_ciphertext, \
+                            created_by_principal, pii_key_ref, contains_personal_data, version) \
+         SELECT $1, $2, md5($1 || ':skew:' || g::text)::uuid, \
+                'SKW-' || lpad(g::text, 6, '0'), 'SKW', source.type_id, 0, 'Todo', \
+                'unstarted', source.project_id, 'skew|' || lpad(g::text, 6, '0'), \
+                '<encrypted>', source.title_nonce, source.title_ciphertext, \
+                source.created_by_principal, source.pii_key_ref, true, 1 \
+         FROM issue source CROSS JOIN generate_series(1, 2000) AS g \
+         WHERE source.tenant_id = $1 AND source.region = $2 AND source.id = $3::uuid",
+    )
+    .bind(&tenant)
+    .bind(REGION)
+    .bind(&additional[0])
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO issue_authz_binding (tenant_id, region, issue_id, project_id, issue_object, \
+                                           project_userset, relation, request_event_id, \
+                                           created_event_id, state, zookie, activated_at) \
+         SELECT tenant_id, region, id, project_id, 'issue:' || id::text, \
+                'project:' || project_id::text || '#view', 'parent_project', \
+                'skew-request:' || tenant_id || ':' || id::text, \
+                'skew-created:' || tenant_id || ':' || id::text, 'active', 'skew-zookie', now() \
+         FROM issue WHERE tenant_id = $1 AND region = $2 AND key LIKE 'SKW-%'",
+    )
+    .bind(&tenant)
+    .bind(REGION)
+    .execute(&admin)
+    .await
+    .unwrap();
+    let skew_revision: i64 = sqlx::query_scalar(
+        "SELECT source_revision FROM authz_projection_state \
+         WHERE tenant_id = $1 AND region = $2 AND projection = 'issue:view'",
+    )
+    .bind(&tenant)
+    .bind(REGION)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO issue_authz_visible (tenant_id, region, projection, subject, permission, \
+                                           object_type, object_id, revision) \
+         SELECT tenant_id, region, 'issue:view', $3, 'view', 'issue', id::text, $4 \
+         FROM issue WHERE tenant_id = $1 AND region = $2 AND key LIKE 'SKW-%'",
+    )
+    .bind(&tenant)
+    .bind(REGION)
+    .bind(&creator.principal_id.0)
+    .bind(skew_revision)
+    .execute(&admin)
+    .await
+    .unwrap();
+    for table in ["issue", "issue_authz_binding", "issue_authz_visible"] {
+        sqlx::query(&format!("ANALYZE {table}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+    let served_explain: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN (COSTS OFF) {}",
+        myelin_issues::pg_issue_store::authoritative_issue_list_sql()
+    ))
+    .bind(&tenant)
+    .bind(REGION)
+    .bind(&creator.principal_id.0)
+    .bind(Option::<i64>::None)
+    .bind(Option::<sqlx::types::Uuid>::None)
+    .bind("open")
+    .bind(Some("ZZZ-".to_string()))
+    .bind(51_i64)
+    .fetch_all(&admin)
+    .await
+    .unwrap();
+    assert!(
+        served_explain
+            .iter()
+            .any(|line| line.contains(ISSUE_KEY_PREFIX_LIST_INDEX)),
+        "served prefix query missed {ISSUE_KEY_PREFIX_LIST_INDEX}: {served_explain:?}"
+    );
+    assert!(
+        served_explain
+            .iter()
+            .any(|line| line.contains("Index Cond") && line.contains("key")),
+        "served prefix query has no bounded key range: {served_explain:?}"
+    );
 
     let closed_rows = sqlx::query(
         "SELECT event_id, envelope FROM outbox WHERE envelope->>'tenant' = $1 \

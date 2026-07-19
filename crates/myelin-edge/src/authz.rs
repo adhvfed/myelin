@@ -572,6 +572,11 @@ mod tests {
             &["issue.create"],
         );
         assert!(authorize_edge_action(&AllowAll, &create, "issues.create"));
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &create,
+            "issues.authorization_status"
+        ));
         assert!(!authorize_edge_action(&AllowAll, &create, "issues.close"));
     }
 }
