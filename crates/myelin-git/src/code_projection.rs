@@ -85,7 +85,7 @@ use myelin_events::{
 use myelin_query::FieldValue;
 use myelin_search::SearchProjection;
 
-use crate::events::GIT_BLOB_SNAPSHOT;
+use crate::events::{GIT_BLOB_REMOVED, GIT_BLOB_SNAPSHOT};
 use crate::receive_pack::{GitRefEventKey, RefName};
 use crate::search_projection::{FACET_BLOB_OID, FACET_LANGUAGE, FACET_PATH};
 
@@ -548,6 +548,30 @@ impl RestrictionPolicy for NoRestrictions {
     }
 }
 
+/// **Why a blob left the search index (the removal tombstone's `reason` token).** Carried on
+/// [`crate::events::GIT_BLOB_REMOVED`] so an operator can tell an ordinary delete from a
+/// `restrict`-driven suppression WITHOUT the payload naming the path or the body. The token is a
+/// fixed vocabulary — never free text, never the subject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobRemovalReason {
+    /// The blob no longer exists at that path on the indexed ref (an ordinary delete/rename-away).
+    Deleted,
+    /// The blob's subject is under an active GDPR `restrict` (`03 §6`) — the content must not remain
+    /// queryable, so the doc is removed rather than downgraded to a body-suppressed (but still
+    /// path/oid-queryable) document.
+    Restricted,
+}
+
+impl BlobRemovalReason {
+    /// The stable wire token (the payload `reason` value).
+    pub fn token(self) -> &'static str {
+        match self {
+            BlobRemovalReason::Deleted => "deleted",
+            BlobRemovalReason::Restricted => "restricted",
+        }
+    }
+}
+
 // ───────────────────────────── the emitter (the receive-pack post-commit hook) ───────────────────
 
 /// The outcome of an [`CodeProjectionEmitter::emit_for_push`]: the projection docs emitted (the
@@ -710,38 +734,61 @@ impl<'a, R: RestrictionPolicy> CodeProjectionEmitter<'a, R> {
         let mut emitted = Vec::new();
         for change in &changes {
             let subject = self.blob_ref(ref_name, change.path())?;
-            let payload = match change {
-                BlobChange::Upserted { path, blob } => {
+            // A blob leaves the index for TWO reasons, and both must reach Search as a genuine
+            // removal VERB, never as a `*.snapshot` carrying a payload `op` Search does not read:
+            //   - the blob was deleted from the indexed ref (`BlobChange::Deleted`);
+            //   - the blob's subject is `restrict`ed (`03 §6`) — a body-suppressed upsert would leave
+            //     a doc that is still queryable by its `path`/`blob_oid` facets, so the restricted
+            //     content stays reachable. The correct projection of a restricted blob is its ABSENCE.
+            // Everything else is an ordinary upsert snapshot.
+            let removal_reason = match change {
+                BlobChange::Deleted { .. } => Some(BlobRemovalReason::Deleted),
+                BlobChange::Upserted { path, .. } if self.restriction.is_restricted(&self.repo, path) => {
+                    Some(BlobRemovalReason::Restricted)
+                }
+                BlobChange::Upserted { .. } => None,
+            };
+            let (type_, payload) = match (removal_reason, change) {
+                // The removal tombstone. It carries the doc identity (`ref`, the key Search's
+                // `apply_removed` reads) + the reason token, and NO body: a removal never restates
+                // the content it is removing (a restricted blob's text must not ride the bus).
+                (Some(reason), _) => (
+                    GIT_BLOB_REMOVED,
+                    serde_json::json!({
+                        "ref": subject.0,
+                        "artifact_ref": subject.0,
+                        "reason": reason.token(),
+                        "acl_object_type": crate::search_projection::GIT_BLOB_ACL_OBJECT_TYPE,
+                    }),
+                ),
+                (None, BlobChange::Upserted { path, blob }) => {
                     let proj = self.project_upsert(subject.clone(), path, blob, commit_message);
                     // references-not-payloads: the doc carries the blob ref + path + facets + the
-                    // (restriction-suppressed) text. The body text is repo content under the processor
-                    // posture, NOT inline subject PII — it is the indexable code (§9).
-                    serde_json::json!({
-                        "op": "upsert",
-                        "artifact_ref": proj.artifact_ref.0,
-                        "path": proj.path,
-                        "language": proj.language,
-                        "symbols": proj.symbols,
-                        "literals": proj.literals,
-                        "text": proj.text,
-                        "commit_message": proj.commit_message,
-                        "blob_oid": proj.blob_oid.0,
-                        "acl_object_type": crate::search_projection::GIT_BLOB_ACL_OBJECT_TYPE,
-                    })
+                    // text. The body text is repo content under the processor posture, NOT inline
+                    // subject PII — it is the indexable code (§9).
+                    (
+                        GIT_BLOB_SNAPSHOT,
+                        serde_json::json!({
+                            "op": "upsert",
+                            "artifact_ref": proj.artifact_ref.0,
+                            "path": proj.path,
+                            "language": proj.language,
+                            "symbols": proj.symbols,
+                            "literals": proj.literals,
+                            "text": proj.text,
+                            "commit_message": proj.commit_message,
+                            "blob_oid": proj.blob_oid.0,
+                            "acl_object_type": crate::search_projection::GIT_BLOB_ACL_OBJECT_TYPE,
+                        }),
+                    )
                 }
-                BlobChange::Deleted { path, oid } => {
-                    // A delete tombstone: Search removes the stale doc (Gone is never silently dropped).
-                    serde_json::json!({
-                        "op": "delete",
-                        "artifact_ref": subject.0,
-                        "path": path,
-                        "blob_oid": oid.0,
-                        "acl_object_type": crate::search_projection::GIT_BLOB_ACL_OBJECT_TYPE,
-                    })
+                // Unreachable: `removal_reason` is `None` only on the `Upserted` arm above.
+                (None, BlobChange::Deleted { .. }) => {
+                    return Err(OutboxError("unreachable blob change classification".into()))
                 }
             };
             let draft = EventDraft {
-                type_: EventType(GIT_BLOB_SNAPSHOT.into()),
+                type_: EventType(type_.into()),
                 subject,
                 aggregate: aggregate.clone(),
                 payload,
@@ -1255,41 +1302,64 @@ mod tests {
             .emit_for_push("refs/heads/main", "tip", &Tree::empty(), &t, "msg")
             .unwrap()
             .unwrap();
-        // Both blobs still emit a doc (the path/oid identity is indexed), but the restricted one
-        // carries NO body — the secret text never enters the index.
+        // Both blobs emit an event, but the restricted one emits a REMOVAL — not a body-suppressed
+        // upsert. A suppressed upsert would leave a doc that is still queryable by its `path`/
+        // `blob_oid` facets, so the restricted subject stays reachable; the correct projection of a
+        // restricted blob is its ABSENCE from the index.
         assert_eq!(p.emitted.len(), 2);
-        let mut secret_doc = None;
+        let mut restricted = None;
+        let mut ordinary = None;
         for id in &p.emitted {
             let row = outbox.row(id).unwrap();
-            if row.envelope.payload["path"] == serde_json::json!("secret.rs") {
-                secret_doc = Some(row.envelope.payload.clone());
+            if row.envelope.subject.0.contains("secret") {
+                restricted = Some(row.envelope.clone());
+            } else {
+                ordinary = Some(row.envelope.clone());
             }
         }
-        let sd = secret_doc.expect("the restricted doc was emitted");
+        let sd = restricted.expect("the restricted blob emitted an event");
         assert_eq!(
-            sd["text"],
-            serde_json::json!(""),
-            "the restricted body is suppressed"
+            sd.type_.0, GIT_BLOB_REMOVED,
+            "a restricted blob is REMOVED from the index — the verb Search's indexer honours"
         );
         assert_eq!(
-            sd["symbols"],
-            serde_json::json!([]),
-            "no symbols leak from a restricted blob"
+            sd.payload["reason"],
+            serde_json::json!("restricted"),
+            "the tombstone names WHY without naming the path or the body"
         );
         assert_eq!(
-            sd["literals"],
-            serde_json::json!([]),
-            "the secret literal never enters the index"
+            sd.payload["ref"], sd.payload["artifact_ref"],
+            "the tombstone carries the doc identity under both accepted keys"
         );
-        // But the path/language/oid (the non-content facets) are still present (the doc identity).
-        assert_eq!(sd["path"], serde_json::json!("secret.rs"));
-        assert_eq!(sd["blob_oid"], serde_json::json!("os"));
+        // The removal restates NOTHING of the content it removes: no body, no symbols, no literals,
+        // and not even the path (the path is a restricted subject's identifying datum).
+        for leak in ["text", "symbols", "literals", "path", "commit_message"] {
+            assert!(
+                sd.payload.get(leak).is_none(),
+                "a removal tombstone must not carry `{leak}`: {:?}",
+                sd.payload
+            );
+        }
+        let text = serde_json::to_string(&sd.payload).expect("payload serializes");
+        assert!(
+            !text.contains("top-secret-value") && !text.contains("KEY"),
+            "the secret body never rides the bus"
+        );
+        // The unrestricted sibling is still an ordinary upsert snapshot (the restriction is scoped).
+        let od = ordinary.expect("the unrestricted blob emitted an event");
+        assert_eq!(od.type_.0, GIT_BLOB_SNAPSHOT);
+        assert_eq!(od.payload["op"], serde_json::json!("upsert"));
     }
 
     // ── the deleted-blob tombstone ──
 
+    /// **A deleted blob emits a REAL Search removal (the tombstone defect).** The old emitter sent a
+    /// `git.blob.snapshot` carrying `op = "delete"`. Search drives removal off the event TYPE's
+    /// trailing verb (`deleted`/`removed`/`erased`) or an owner `Gone`, and never reads a payload
+    /// `op` — so that "tombstone" fell through to the UPSERT path and the stale doc survived the
+    /// delete. The removal must therefore BE a removal verb.
     #[test]
-    fn a_deleted_blob_emits_a_delete_tombstone() {
+    fn a_deleted_blob_emits_a_real_removal_tombstone() {
         let outbox = OutboxStore::new();
         let cursor = CodeProjectionCursor::new();
         let r = NoRestrictions;
@@ -1305,11 +1375,22 @@ mod tests {
         assert_eq!(p.emitted.len(), 1);
         let row = outbox.row(&p.emitted[0]).unwrap();
         assert_eq!(
-            row.envelope.payload["op"],
-            serde_json::json!("delete"),
-            "Gone is a tombstone, not a silent drop"
+            row.envelope.type_.0, GIT_BLOB_REMOVED,
+            "a delete is a removal VERB, not a snapshot carrying an `op` field Search never reads"
         );
-        assert_eq!(row.envelope.payload["path"], serde_json::json!("gone.rs"));
-        assert_eq!(row.envelope.payload["blob_oid"], serde_json::json!("g1"));
+        // The verb is one Search's indexer actually dispatches on (its REMOVED_SUFFIXES set).
+        let verb = row.envelope.type_.0.rsplit('.').next().unwrap();
+        assert!(
+            myelin_search::IncrementalIndexer::REMOVED_SUFFIXES.contains(&verb),
+            "`{verb}` must be a suffix Search's indexer removes on"
+        );
+        assert_eq!(
+            row.envelope.payload["reason"],
+            serde_json::json!("deleted"),
+            "an ordinary delete is distinguishable from a restrict-suppression"
+        );
+        // The tombstone names the doc to remove — under both keys `apply_removed` accepts.
+        assert_eq!(row.envelope.payload["ref"], row.envelope.subject.0);
+        assert_eq!(row.envelope.payload["artifact_ref"], row.envelope.subject.0);
     }
 }

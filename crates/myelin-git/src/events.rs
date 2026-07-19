@@ -248,6 +248,18 @@ pub const GIT_PR_ERASED: &str = "git.pr.erased";
 /// The `*.erased` tombstone for a comment (contract 2.7).
 pub const GIT_COMMENT_ERASED: &str = "git.comment.erased";
 
+/// **The blob-removal tombstone — the REAL Search removal operation for a code-projection doc.**
+///
+/// A `git.blob.snapshot` whose payload carries `op = "delete"` is NOT a Search tombstone: Search
+/// drives removal off the event TYPE's trailing verb (`deleted`/`removed`/`erased`) or an owner
+/// `project` resolving `Gone` — it never reads a payload `op` field. A delete emitted as a
+/// `*.snapshot` therefore fell through to Search's UPSERT path and the stale doc survived. This
+/// token is the removal verb the indexer actually honours, so a blob that leaves the indexed ref —
+/// or whose subject is `restrict`ed (`03 §6`: the restricted body must not remain queryable, and a
+/// body-suppressed upsert still leaves a path/oid-queryable doc) — is genuinely removed from the
+/// index rather than downgraded to an empty document.
+pub const GIT_BLOB_REMOVED: &str = "git.blob.removed";
+
 // --- cross-cutting *.snapshot reindex-from-source events (contract 2.6) ----
 
 /// The `*.snapshot` reindex-from-source event for a repo (contract 2.6 — `replay`). Cold == live.
@@ -334,6 +346,8 @@ pub const GIT_EVENT_TOKENS: &[&str] = &[
     GIT_REPO_ERASED,
     GIT_PR_ERASED,
     GIT_COMMENT_ERASED,
+    // the code-projection removal tombstone (the verb Search's indexer honours)
+    GIT_BLOB_REMOVED,
     // cross-cutting *.snapshot reindex events (contract 2.6)
     GIT_REPO_SNAPSHOT,
     GIT_PR_SNAPSHOT,

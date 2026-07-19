@@ -834,9 +834,13 @@ impl IncrementalIndexer {
     }
 
     fn apply_removed(&self, ev: &EventEnvelope) -> Result<(), IndexEventError> {
-        // The removed/erased ref may be the subject, or named in the payload (`ref`). Default to the
-        // subject (the artifact this event is about).
-        let doc_id = Self::str_field(&ev.payload, "ref").unwrap_or_else(|| ev.subject.0.clone());
+        // The removed/erased ref may be the subject, or named in the payload. Producers name it as
+        // `ref` (the cross-cutting tombstone key) or `artifact_ref` (the code-projection payload key,
+        // contract 6.5) — accept BOTH so a removal is never silently applied to the wrong doc id.
+        // Default to the subject (the artifact this event is about).
+        let doc_id = Self::str_field(&ev.payload, "ref")
+            .or_else(|| Self::str_field(&ev.payload, "artifact_ref"))
+            .unwrap_or_else(|| ev.subject.0.clone());
         self.remove_doc(&ev.tenant, &ev.region, &doc_id)
     }
 

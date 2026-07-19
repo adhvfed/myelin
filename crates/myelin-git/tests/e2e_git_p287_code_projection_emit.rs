@@ -23,7 +23,7 @@ use myelin_events::{
 use myelin_git::code_projection::{
     Blob, CodeProjectionCursor, CodeProjectionEmitter, NoRestrictions, Tree,
 };
-use myelin_git::events::{GIT_BLOB_SNAPSHOT, GIT_REF_UPDATED};
+use myelin_git::events::{GIT_BLOB_REMOVED, GIT_BLOB_SNAPSHOT, GIT_REF_UPDATED};
 use myelin_git::receive_pack::{
     CrashPoint, InMemoryObjectDb, Oid, ProposedRefUpdate, PushOutcome, PushSession, Pusher,
     QuarantineObject, RefName, RefStore,
@@ -187,27 +187,40 @@ fn push_code_then_projection_emits_per_changed_blob_incrementally() {
         Some("commit-2")
     );
 
-    // Classify the three: one delete tombstone (README), two upserts (main, net).
+    // Classify the three by EVENT TYPE — which is the only signal Search dispatches on. A delete
+    // is a `git.blob.removed` removal verb; an upsert is a `git.blob.snapshot`. (A snapshot carrying
+    // a payload `op = "delete"` is NOT a tombstone: Search never reads that field, so such an event
+    // falls through to the upsert path and the stale doc survives.)
     let mut deletes = 0;
     let mut upserts = 0;
     for id in &emit2.emitted {
-        let pl = outbox.row(id).unwrap().envelope.payload;
-        match pl["op"].as_str().unwrap() {
-            "delete" => {
+        let env = outbox.row(id).unwrap().envelope;
+        match env.type_.0.as_str() {
+            GIT_BLOB_REMOVED => {
                 deletes += 1;
+                // The subject is the CANONICAL percent-encoded ArtifactRef (`.` → `%2E`, `/` → `%2F`
+                // inside a component), not the legacy raw slash-delimited id.
+                assert!(
+                    env.subject.0.ends_with("README%2Emd"),
+                    "the deleted file is the tombstone: {}",
+                    env.subject.0
+                );
+                assert_eq!(env.payload["reason"], serde_json::json!("deleted"));
                 assert_eq!(
-                    pl["path"],
-                    serde_json::json!("README.md"),
-                    "the deleted file is the tombstone"
+                    env.payload["ref"], env.subject.0,
+                    "the tombstone names the doc id Search removes"
                 );
             }
-            "upsert" => upserts += 1,
-            other => panic!("unexpected op {other}"),
+            GIT_BLOB_SNAPSHOT => {
+                upserts += 1;
+                assert_eq!(env.payload["op"], serde_json::json!("upsert"));
+            }
+            other => panic!("unexpected projection event type {other}"),
         }
     }
     assert_eq!(
         deletes, 1,
-        "the deleted blob is a tombstone (Gone is never silently dropped)"
+        "the deleted blob is a REAL removal tombstone (Gone is never silently dropped)"
     );
     assert_eq!(upserts, 2, "the modified + added blobs are upserts");
 
@@ -229,20 +242,30 @@ fn push_code_then_projection_emits_per_changed_blob_incrementally() {
         Some("commit-3")
     );
 
-    // The total outbox: 3 git.ref.updated (one per push) + (3 + 3 + 0) git.blob.snapshot = 9.
+    // The total outbox: 3 git.ref.updated (one per push) + (3 + 3 + 0) projection events = 9.
     assert_eq!(
         outbox.committed_count(),
         9,
-        "3 ref events + 6 blob snapshots"
+        "3 ref events + 6 projection events"
     );
-    // Every projection emit over pushes 1+2 is the NAMED git.blob.snapshot token (6 in total).
-    let blob_count = emit1
+    // Every projection emit over pushes 1+2 is one of the two NAMED projection tokens: 5 upsert
+    // snapshots (3 first-index + 2 changed) and 1 removal tombstone (the deleted README).
+    let all: Vec<String> = emit1
         .emitted
         .iter()
         .chain(emit2.emitted.iter())
-        .filter(|id| outbox.row(id).unwrap().envelope.type_.0 == GIT_BLOB_SNAPSHOT)
-        .count();
-    assert_eq!(blob_count, 6, "6 blob snapshots over pushes 1+2");
+        .map(|id| outbox.row(id).unwrap().envelope.type_.0)
+        .collect();
+    assert_eq!(
+        all.iter().filter(|t| *t == GIT_BLOB_SNAPSHOT).count(),
+        5,
+        "5 upsert snapshots over pushes 1+2"
+    );
+    assert_eq!(
+        all.iter().filter(|t| *t == GIT_BLOB_REMOVED).count(),
+        1,
+        "1 removal tombstone (the deleted README)"
+    );
     // The receive-pack ref-event token is the NAMED constant (the receive-pack suite asserts its emit).
     assert_eq!(GIT_REF_UPDATED, "git.ref.updated");
 }
