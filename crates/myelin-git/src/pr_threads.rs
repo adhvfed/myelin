@@ -894,11 +894,11 @@ mod tests {
                   "body_md": "hi", "created_at": 1 } ] } ] });
         let doc: SubjectThreads = serde_json::from_value(legacy).expect("legacy doc deserializes");
         assert_eq!(doc.reviews.len(), 0);
-        assert_eq!(doc.threads[0].resolved, false);
+        assert!(!doc.threads[0].resolved);
         assert_eq!(doc.threads[0].anchor, None);
         let c = &doc.threads[0].comments[0];
         assert_eq!(c.state, CommentState::Visible);
-        assert_eq!(c.pending, false);
+        assert!(!c.pending);
         assert_eq!(c.review_id, None);
     }
 

@@ -4,11 +4,11 @@
 //! backend ([`myelin_edge::register_git_durable`]), and drives REAL HTTP round-trips with real minted
 //! capability tokens. Proves:
 //!  - (A) **writes PERSIST** — create-repo + a web-edit commit through the edge are read back from disk;
-//!        a FRESH backend instance over the SAME root (a simulated restart) still serves them.
+//!    a FRESH backend instance over the SAME root (a simulated restart) still serves them.
 //!  - (B) **merge-gate ENFORCED + durable ref-advance** — a merge with unmet required checks is REFUSED
-//!        (no ref advance); with checks green + an approval the merge advances the base ref durably.
+//!    (no ref advance); with checks green + an approval the merge advances the base ref durably.
 //!  - (C) **tenant isolation + traversal-safety** — an acme repo is invisible to globex; a `../`-laden
-//!        repo slug is refused (the validated resolver), never escaping the tenant root.
+//!    repo slug is refused (the validated resolver), never escaping the tenant root.
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};

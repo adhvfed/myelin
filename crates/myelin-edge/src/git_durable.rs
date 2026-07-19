@@ -1457,10 +1457,8 @@ impl DurableGitBackend {
     ) -> Result<Vec<EnrichedPr>, DurableError> {
         let records = self.pr_list(loc, principal)?;
         // ONE config read for the whole repo (fail static on error — see above).
-        let config = match self.prs.get_protection(loc) {
-            Ok(cfg) => Some(cfg),
-            Err(_) => None, // read failed → every row's summary degrades to Unavailable below.
-        };
+        // A read failure degrades every row's summary to Unavailable below.
+        let config = self.prs.get_protection(loc).ok();
         let config_readable = config.is_some();
         let config = config.flatten();
         Ok(records
@@ -2556,7 +2554,7 @@ impl DurableGitBackend {
     /// R2 ruleset actually ingests, so the copy never implies a gate input that isn't real.
     fn pr_checks_json(&self, loc: &RepoLoc, rec: &PrRecord) -> Result<Value, DurableError> {
         let ruleset = self.prs.effective_ruleset_for(loc, &rec.base_ref)?;
-        let eval = evaluate_merge(&ruleset, &rec).map_err(|e| DurableError::Git(e.to_string()))?;
+        let eval = evaluate_merge(&ruleset, rec).map_err(|e| DurableError::Git(e.to_string()))?;
         let has_blocking_review = rec.reviews.iter().any(|r| {
             matches!(
                 r.state,
@@ -3650,7 +3648,7 @@ fn pr_list_envelope(mut enriched: Vec<EnrichedPr>, ctx: &HandlerCtx<'_>, counts:
     // record has no created_at); the default `sort=updated` orders by the durable updated stamp,
     // tie-broken by number so the order is total + stable (cursor stability).
     match sort.as_deref() {
-        Some("created") => enriched.sort_by(|a, b| b.rec.number.cmp(&a.rec.number)),
+        Some("created") => enriched.sort_by_key(|item| std::cmp::Reverse(item.rec.number)),
         _ => enriched.sort_by(|a, b| {
             b.rec
                 .updated_at
