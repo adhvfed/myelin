@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS search_rebuild_job (
     phase              TEXT   NOT NULL,
     fence_epoch        BIGINT NOT NULL,
     high_water_mark    BIGINT,
-    high_water_at      TEXT,
+    high_water_seqs    TEXT,
     owners_replayed    TEXT   NOT NULL DEFAULT '',
     lease_holder       TEXT,
     lease_expires_at   BIGINT NOT NULL DEFAULT 0,
@@ -248,21 +248,37 @@ pub struct RebuildRecord {
     /// The broker/live-intake high-water mark recorded at fence time, as a COUNT. Reporting only —
     /// it is deliberately NOT what bounds catch-up. See [`Self::high_water_at`].
     pub high_water_mark: Option<u64>,
-    /// **The catch-up ceiling: the `recorded_at` instant captured at fence time.**
+    /// **The catch-up ceiling: the per-aggregate `seq` watermark captured at fence time.**
     ///
-    /// Catch-up originally bounded itself positionally, taking the first `high_water_mark` rows of
-    /// the committed stream. That is only correct if the stream is a stable commit-ordered prefix,
-    /// and the durable outbox does not promise that: `committed_live_rows` orders by
-    /// `(aggregate, seq)` — aggregate-LEXICOGRAPHIC — while the count is over the whole live set. A
-    /// positional take therefore selected the N lexicographically-smallest-aggregate rows, an
-    /// arbitrary mix, and every pre-fence event on a high-sorting aggregate was never applied by
-    /// catch-up while live intake was fenced. A silent, permanent hole.
+    /// This bound went through two wrong shapes before this one, and both failure modes are worth
+    /// keeping written down because they are the shapes a reviewer will reach for again.
     ///
-    /// A timestamp is position-independent, so it survives any ordering and any interleaved emit.
-    /// The comparison is INCLUSIVE (`<=`): ties at the boundary are re-applied, which is harmless
-    /// because every apply is an idempotent upsert, whereas excluding them would lose events — and
-    /// loss is the direction that cannot be recovered.
-    pub high_water_at: Option<String>,
+    /// It was first POSITIONAL — take the first `high_water_mark` rows. That is correct only if the
+    /// committed stream is a stable commit-ordered prefix, and the durable outbox does not promise
+    /// that: `committed_live_rows` orders by `(aggregate, seq)`, aggregate-LEXICOGRAPHIC, while the
+    /// count is over the whole live set. A positional take selected the N lexicographically-smallest
+    /// -aggregate rows — an arbitrary mix — silently dropping every pre-fence event on a
+    /// high-sorting aggregate while live intake was fenced.
+    ///
+    /// It was then a `recorded_at` TIMESTAMP. Also wrong, for two independent reasons. The field is
+    /// an unvalidated `String` compared lexicographically, so mixed precision breaks ordering
+    /// outright (`"…T10:00:00Z" > "…T10:00:00.500Z"` is `true`, skipping an event that is
+    /// chronologically earlier), as do offsets and any non-RFC-3339 producer. And `recorded_at` is
+    /// stamped from the PRODUCER's clock when its transaction opens, not assigned by the store at
+    /// commit — so a fast producer clock puts a genuinely pre-fence event above the boundary, where
+    /// catch-up skips it and redelivery never comes because it was already dedup-marked.
+    ///
+    /// `seq` has neither problem: it is assigned by the STORE inside the commit transaction
+    /// (`COALESCE(MAX(seq) + 1, 0)` per aggregate), it is an integer, and it is monotone per
+    /// aggregate — the true per-aggregate commit sequence. The watermark is the highest `seq` each
+    /// aggregate had reached at fence time; catch-up applies a row iff its aggregate is in the map
+    /// AND its `seq` is at or below that aggregate's mark.
+    ///
+    /// An aggregate ABSENT from the map had no committed rows at fence time, so every row it has now
+    /// is post-fence. Absence must therefore mean "skip everything", which is why this is read
+    /// through an explicit `Option` and never `unwrap_or(0)` — `seq` is 0-BASED, so a default of 0
+    /// would admit each such aggregate's first event.
+    pub high_water_seqs: std::collections::BTreeMap<String, u64>,
     /// The owner tokens whose corpora have been replayed (so a resumed replay skips finished
     /// owners rather than redoing them).
     pub owners_replayed: BTreeSet<String>,
@@ -471,6 +487,21 @@ impl From<ReindexError> for RebuildError {
     fn from(e: ReindexError) -> RebuildError {
         RebuildError::Replay(e)
     }
+}
+
+/// The per-aggregate `seq` watermark of a committed-row snapshot: the highest `seq` each aggregate
+/// has reached. This is the fence-time ceiling catch-up runs to — see
+/// [`RebuildRecord::high_water_seqs`] for why it is a store-assigned sequence rather than a row
+/// position or a producer timestamp.
+pub fn high_water_seqs(
+    committed: &[myelin_events::OutboxRow],
+) -> std::collections::BTreeMap<String, u64> {
+    let mut out: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for row in committed {
+        let mark = out.entry(row.aggregate.0.clone()).or_insert(row.seq);
+        *mark = (*mark).max(row.seq);
+    }
+    out
 }
 
 /// Reduce a replay error to a fixed category token.
@@ -764,8 +795,15 @@ impl RebuildCoordinator {
     /// is what makes the migration re-runnable.
     pub fn claim(&self, key: &RebuildKey, holder: &str, now: u64) -> Result<u64, RebuildError> {
         let current = self.journal.load(key)?;
-        let (expected_epoch, next_epoch, phase, hwm, hwm_at, owners) = match &current {
-            None => (None, 1, RebuildPhase::Claimed, None, None, BTreeSet::new()),
+        let (expected_epoch, next_epoch, phase, hwm, hwm_seqs, owners) = match &current {
+            None => (
+                None,
+                1,
+                RebuildPhase::Claimed,
+                None,
+                std::collections::BTreeMap::new(),
+                BTreeSet::new(),
+            ),
             Some(rec) => {
                 let mine = rec.lease_held_by(holder, now);
                 if rec.leased(now) && !mine {
@@ -778,7 +816,7 @@ impl RebuildCoordinator {
                         rec.fence_epoch + 1,
                         RebuildPhase::Claimed,
                         None,
-                        None,
+                        std::collections::BTreeMap::new(),
                         BTreeSet::new(),
                     )
                 } else {
@@ -790,7 +828,7 @@ impl RebuildCoordinator {
                         // The recorded ceiling SURVIVES a takeover. Re-taking it on resume would
                         // move the boundary upward after the wipe — reintroducing the very hole the
                         // fence-time capture exists to close.
-                        rec.high_water_at.clone(),
+                        rec.high_water_seqs.clone(),
                         rec.owners_replayed.clone(),
                     )
                 }
@@ -800,7 +838,7 @@ impl RebuildCoordinator {
             phase,
             fence_epoch: next_epoch,
             high_water_mark: hwm,
-            high_water_at: hwm_at,
+            high_water_seqs: hwm_seqs,
             owners_replayed: owners,
             lease_holder: Some(holder.to_string()),
             lease_expires_at: now.saturating_add(self.lease_ticks),
@@ -896,20 +934,23 @@ impl RebuildCoordinator {
         key: &RebuildKey,
         holder: &str,
         now: u64,
-        high_water_mark: u64,
-        high_water_at: &myelin_events::Timestamp,
+        committed: &[myelin_events::OutboxRow],
     ) -> Result<u64, RebuildError> {
         let rec = self.checked(key, holder, now)?;
         if rec.phase >= RebuildPhase::Fenced {
-            return Ok(rec.high_water_mark.unwrap_or(high_water_mark));
+            // Already fenced: re-affirm the RECORDED mark. Re-deriving it from the current stream
+            // would move the ceiling upward after the wipe — reintroducing the hole the fence-time
+            // capture exists to close.
+            return Ok(rec.high_water_mark.unwrap_or(0));
         }
-        let at = high_water_at.0.clone();
+        let seqs = high_water_seqs(committed);
+        let count = committed.len() as u64;
         self.advance(key, &rec, holder, now, |next| {
             next.phase = RebuildPhase::Fenced;
-            next.high_water_mark = Some(high_water_mark);
-            next.high_water_at = Some(at);
+            next.high_water_mark = Some(count);
+            next.high_water_seqs = seqs;
         })?;
-        Ok(high_water_mark)
+        Ok(count)
     }
 
     /// **Phase 2 — wipe the `(tenant, region)` index, exactly once.**
@@ -1073,20 +1114,26 @@ impl RebuildCoordinator {
                 durable: rec.phase,
             });
         }
-        // The ceiling is the fence-time INSTANT, not a row position — see `high_water_at`. A
-        // missing boundary means the fence never recorded one, which must fail LOUD: bounding by
-        // nothing would either apply the unbounded tail (never converging under load) or apply
-        // nothing (a silent hole), and there is no safe default between them.
-        let Some(boundary) = rec.high_water_at.clone() else {
+        // The ceiling is the fence-time per-aggregate `seq` watermark — a STORE-assigned position,
+        // not a row position and not a producer clock. See `high_water_seqs`.
+        //
+        // The fence records a watermark on every rebuild, so an empty map is only reachable when the
+        // outbox held nothing at fence time. That is legitimate (a fresh cell), and it correctly
+        // means "apply nothing" — every aggregate is absent, so every row is post-fence.
+        if rec.phase < RebuildPhase::Fenced {
             return Err(RebuildError::MissingHighWaterMark);
-        };
+        }
+        let watermark = rec.high_water_seqs.clone();
         self.reassert_lease(key, &rec, holder, now)?;
         let mut applied = 0usize;
         for row in rows.iter() {
-            // At or below the fence instant. INCLUSIVE: a tie is re-applied (idempotent upsert),
-            // where excluding it would lose the event.
-            if row.envelope.recorded_at.0 > boundary {
-                continue;
+            // At or below this aggregate's fence-time mark. An ABSENT aggregate had no committed
+            // rows at fence time, so everything it holds now is post-fence: skip. Explicit `Option`
+            // rather than `unwrap_or(0)` — `seq` is 0-based, so a 0 default would admit each such
+            // aggregate's first event.
+            match watermark.get(&row.aggregate.0) {
+                Some(mark) if row.seq <= *mark => {}
+                _ => continue,
             }
             // Tenant-first: a rebuild applies only ITS partition's events. A row for another tenant
             // or region rides the same shared outbox and must not be projected here.

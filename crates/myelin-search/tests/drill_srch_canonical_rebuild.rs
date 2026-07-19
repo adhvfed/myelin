@@ -76,13 +76,6 @@ fn principal() -> Principal {
     )
 }
 
-/// The fence-time instant that bounds catch-up. Every drill event is recorded at
-/// `2026-07-19T00:00:01Z`, so a boundary strictly after it admits them all; a drill that needs to
-/// exclude an event stamps that event later.
-fn fence_instant() -> Timestamp {
-    Timestamp("2026-07-19T00:00:02Z".into())
-}
-
 /// The emit context the REPLAY runs under.
 ///
 /// Its `recorded_at` is strictly AFTER [`fence_instant`], which is what production does: the replay
@@ -305,8 +298,8 @@ impl Harness {
         let key = self.key();
         let c = self.coordinator.clone();
         c.claim(&key, HOLDER, now)?;
-        let hwm = self.outbox.committed_count() as u64;
-        c.fence(&key, HOLDER, now, hwm, &fence_instant())?;
+        let committed = self.outbox.committed_rows();
+        c.fence(&key, HOLDER, now, &committed)?;
         c.wipe(&key, HOLDER, now)?;
         c.reset_cursors(&key, HOLDER, now)?;
         let replayed = c.replay_all(
@@ -682,7 +675,7 @@ fn a_git_only_replay_is_caught_as_lossy() {
     let key = h.key();
     let c = h.coordinator.clone();
     c.claim(&key, HOLDER, 100).unwrap();
-    c.fence(&key, HOLDER, 100, 0, &fence_instant()).unwrap();
+    c.fence(&key, HOLDER, 100, &[]).unwrap();
     c.wipe(&key, HOLDER, 100).unwrap();
     c.reset_cursors(&key, HOLDER, 100).unwrap();
 
@@ -744,7 +737,7 @@ fn crash_after_wipe_converges_without_rewiping() {
     let key = h.key();
     let c = h.coordinator.clone();
     c.claim(&key, HOLDER, 100).unwrap();
-    c.fence(&key, HOLDER, 100, 0, &fence_instant()).unwrap();
+    c.fence(&key, HOLDER, 100, &[]).unwrap();
     assert!(c.wipe(&key, HOLDER, 100).unwrap(), "the wipe ran");
 
     // ── CRASH. A new process claims the same job. The durable phase survives. ──
@@ -800,7 +793,7 @@ fn crash_during_replay_resumes_without_rewiping_or_losing_work() {
     let key = h.key();
     let c = h.coordinator.clone();
     c.claim(&key, HOLDER, 100).unwrap();
-    c.fence(&key, HOLDER, 100, 0, &fence_instant()).unwrap();
+    c.fence(&key, HOLDER, 100, &[]).unwrap();
     c.wipe(&key, HOLDER, 100).unwrap();
     c.reset_cursors(&key, HOLDER, 100).unwrap();
 
@@ -901,9 +894,12 @@ fn a_concurrent_live_event_at_the_high_water_boundary_is_applied_exactly_once() 
     .unwrap();
     tx.commit().unwrap();
 
-    let hwm = h.outbox.committed_count() as u64;
-    c.fence(&key, HOLDER, 100, hwm, &fence_instant()).unwrap();
-    assert_eq!(hwm, 1, "the mark sits above the one pre-fence event");
+    c.fence(&key, HOLDER, 100, &h.outbox.committed_rows()).unwrap();
+    assert_eq!(
+        myelin_search::rebuild::high_water_seqs(&h.outbox.committed_rows()).len(),
+        1,
+        "the watermark covers the one pre-fence aggregate"
+    );
 
     c.wipe(&key, HOLDER, 100).unwrap();
     c.reset_cursors(&key, HOLDER, 100).unwrap();
@@ -920,7 +916,7 @@ fn a_concurrent_live_event_at_the_high_water_boundary_is_applied_exactly_once() 
     // Catch up over the WHOLE committed stream: only the prefix at/below the mark is applied.
     let rows = h.outbox.committed_rows();
     assert!(
-        rows.len() > hwm as usize,
+        rows.len() > 1,
         "the replay pushed more rows above the mark — the bound must still hold"
     );
     let caught = c.catch_up(&key, HOLDER, 100, &rows).unwrap();
@@ -971,7 +967,7 @@ fn a_cross_tenant_rebuild_attempt_is_scoped_out() {
     let key = h.key();
     let c = h.coordinator.clone();
     c.claim(&key, HOLDER, 100).unwrap();
-    c.fence(&key, HOLDER, 100, 0, &fence_instant()).unwrap();
+    c.fence(&key, HOLDER, 100, &[]).unwrap();
     c.wipe(&key, HOLDER, 100).unwrap();
 
     assert_eq!(
@@ -1019,7 +1015,7 @@ fn a_cross_region_rebuild_attempt_is_scoped_out() {
     let key = h.key();
     let c = h.coordinator.clone();
     c.claim(&key, HOLDER, 100).unwrap();
-    c.fence(&key, HOLDER, 100, 0, &fence_instant()).unwrap();
+    c.fence(&key, HOLDER, 100, &[]).unwrap();
     c.wipe(&key, HOLDER, 100).unwrap();
 
     assert_eq!(
@@ -1055,11 +1051,11 @@ fn a_second_holder_cannot_run_a_concurrent_rebuild() {
 
     // ...and the ORIGINAL holder can no longer advance: its fence epoch is stale.
     assert!(
-        matches!(c.fence(&key, HOLDER, 100_001, 7, &fence_instant()), Err(RebuildError::LeaseLost)),
+        matches!(c.fence(&key, HOLDER, 100_001, &[]), Err(RebuildError::LeaseLost)),
         "the displaced holder cannot journal a phase transition"
     );
     // The rival can.
-    c.fence(&key, "rival", 100_001, 7, &fence_instant()).expect("the current holder proceeds");
+    c.fence(&key, "rival", 100_001, &[]).expect("the current holder proceeds");
 }
 
 // ═══════════════════════════ 11. reads fail-empty until verification ══════════════════════════════
@@ -1100,7 +1096,7 @@ fn reads_remain_fail_empty_until_verification_succeeds() {
     ] {
         match step {
             1 => {
-                c.fence(&key, HOLDER, 100, 0, &fence_instant()).unwrap();
+                c.fence(&key, HOLDER, 100, &[]).unwrap();
             }
             2 => {
                 c.wipe(&key, HOLDER, 100).unwrap();
@@ -1371,8 +1367,7 @@ fn catch_up_is_correct_under_the_durable_stores_row_ordering() {
         let d = d.clone();
         emit(&mut h, &d, &format!("zzz-agg-{i}"), "2026-07-19T00:00:01Z");
     }
-    let hwm = h.outbox.committed_count() as u64;
-    c.fence(&key, HOLDER, 100, hwm, &fence_instant()).unwrap();
+    c.fence(&key, HOLDER, 100, &h.outbox.committed_rows()).unwrap();
 
     // The post-fence write lands AFTER the ceiling.
     emit(&mut h, &post, "aaa-agg", "2026-07-19T00:00:09Z");
@@ -1548,5 +1543,223 @@ fn the_fence_bites_on_the_real_read_and_intake_entries() {
             .len(),
         1,
         "and an unrelated tenant keeps reading"
+    );
+}
+
+/// **The catch-up boundary is EXACT at the mark, and an aggregate with no pre-fence rows is skipped
+/// entirely.**
+///
+/// The two arms a `<` / `<=` slip and an `unwrap_or(0)` default would each break, neither of which
+/// the other boundary drills cover:
+///
+/// - **`seq == mark` must be APPLIED.** That row is the last event committed before the fence.
+///   Excluding it loses an event permanently — it was applied to the index the wipe then destroyed,
+///   and it will never be redelivered because it is already dedup-marked.
+/// - **An aggregate ABSENT from the watermark must be skipped WHOLLY.** `seq` is 0-based
+///   (`COALESCE(MAX(seq) + 1, 0)`), so reading the mark with a `0` default would admit the first
+///   event of every aggregate that did not exist at fence time — the exact events that belong to
+///   ordinary intake after reads reopen.
+#[test]
+fn the_catch_up_boundary_is_exact_and_absent_aggregates_are_skipped() {
+    let mut h = Harness::new();
+    seed_owner_bodies(&h);
+
+    let minter: Arc<dyn myelin_events::IdMinter> =
+        Arc::new(myelin_events::MonotonicMinter::new());
+    let emit = |h: &mut Harness, doc: &str, agg: &str| {
+        h.fetcher.put(doc, "a page");
+        let mut tx = h.outbox.begin(Arc::clone(&minter), ctx_base());
+        tx.emit(
+            myelin_events::EventDraft {
+                type_: EventType("knowledge.page.created".into()),
+                subject: ArtifactRef(doc.to_string()),
+                aggregate: AggregateKey(agg.to_string()),
+                payload: serde_json::json!({}),
+                data_role: DataRole::Processor,
+                visibility: Visibility::Internal,
+                contains_personal_data: false,
+                pii_key_ref: None,
+            },
+            None,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    };
+
+    let key = h.key();
+    let c = h.coordinator.clone();
+    c.claim(&key, HOLDER, 100).unwrap();
+
+    // Aggregate `shared` gets two pre-fence rows (seq 0, 1). The mark will be 1.
+    let at_mark = kn_id("at-mark");
+    emit(&mut h, &kn_id("below-mark"), "shared");
+    emit(&mut h, &at_mark, "shared");
+
+    let committed = h.outbox.committed_rows();
+    let marks = myelin_search::rebuild::high_water_seqs(&committed);
+    assert_eq!(
+        marks.get("shared"),
+        Some(&1),
+        "the watermark is the HIGHEST seq the aggregate reached"
+    );
+    c.fence(&key, HOLDER, 100, &committed).unwrap();
+
+    // After the fence: another row on the SAME aggregate (seq 2, above the mark), and a row on a
+    // BRAND-NEW aggregate (seq 0 — the value an `unwrap_or(0)` default would wrongly admit).
+    let above_mark = kn_id("above-mark");
+    let fresh_aggregate = kn_id("fresh-aggregate");
+    emit(&mut h, &above_mark, "shared");
+    emit(&mut h, &fresh_aggregate, "brand-new-agg");
+
+    c.wipe(&key, HOLDER, 100).unwrap();
+    c.reset_cursors(&key, HOLDER, 100).unwrap();
+    let git = git_source();
+    let kn = kn_source();
+    let iss = issues_source();
+    let chat = chat_source();
+    let sources: Vec<&dyn ReindexSource> = vec![&git, &iss, &kn, &chat];
+    c.replay_all(
+        &key,
+        HOLDER,
+        100,
+        &all_scopes(),
+        &sources,
+        &mut h.outbox,
+        replay_ctx(),
+    )
+    .unwrap();
+
+    let rows = h.outbox.committed_rows();
+    c.catch_up(&key, HOLDER, 100, &rows).unwrap();
+
+    let ids = h.doc_ids();
+    assert!(
+        ids.contains(&at_mark),
+        "the row AT the mark is the last pre-fence event — it must be applied, not skipped"
+    );
+    assert!(
+        !ids.contains(&above_mark),
+        "a row ABOVE the mark on the same aggregate is post-fence — ordinary intake's business"
+    );
+    assert!(
+        !ids.contains(&fresh_aggregate),
+        "an aggregate absent from the watermark had NO pre-fence rows, so its seq-0 event must be \
+         skipped — a 0 default would wrongly admit it"
+    );
+}
+
+/// **An erasure during a rebuild FAILS LOUD rather than reporting success for erasing nothing.**
+///
+/// The sharpest bypass found by adversarial review. Erase does not go through the bus consumer
+/// entry — it drives `IncrementalIndexer::index` directly — so the intake fence never covered it.
+/// Mid-rebuild the index is wiped, so `locate_subject` finds 0 documents, the purge loop runs 0
+/// times, and `erase_subject` returns `docs_purged: 0, zero_orphan_embedding: true`: a SUCCESS
+/// receipt for a GDPR erasure that erased nothing. The replay then re-indexes the subject from owner
+/// snapshots, resurrecting the erased data behind a receipt claiming it was removed.
+///
+/// Note this is the one place where fail-EMPTY would be the wrong remedy — silently returning "0
+/// docs" is precisely the bug. It has to refuse.
+#[test]
+fn an_erasure_during_a_rebuild_is_refused_loudly() {
+    use myelin_gdpr::SubjectRef;
+    use myelin_search::dek::SearchDekPin;
+    use myelin_search::erase::SearchEraseHolder;
+    use myelin_storage::KmsEngine;
+
+    let fetcher = Arc::new(OwnerProjection::default());
+    let journal = Arc::new(MemoryRebuildJournal::new());
+    let gate = RebuildReadGate::new(journal.clone());
+    let indexer = Arc::new(
+        IncrementalIndexer::new(
+            all_specs(),
+            fetcher.clone(),
+            Arc::new(MockEmbeddingAdapter::new(8)),
+        )
+        .with_rebuild_gate(gate.clone()),
+    );
+    let reindexer = SearchReindexer::new(indexer.clone(), region());
+    let coordinator = RebuildCoordinator::new(journal.clone(), reindexer);
+    let key = RebuildKey::new(&tenant(), &region());
+
+    let subject = SubjectRef::new(Principal::stub(
+        PrincipalId("u-42".into()),
+        PrincipalKind::Human,
+        tenant(),
+    ));
+    let pseudonym = myelin_identity::PseudonymHandle::new("u-42", &tenant().0)
+        .expect("pseudonym renders")
+        .render();
+    let doc = kn_id("mentions-subject");
+    fetcher.put(&doc, &format!("a page mentioning {pseudonym}"));
+    indexer.index(&created_event(&doc)).unwrap();
+
+    let kms = Arc::new(KmsEngine::new());
+    let pin = SearchDekPin::new(kms);
+    pin.reserve(&tenant(), &region()).expect("reserve the DEK");
+    let holder =
+        SearchEraseHolder::new(indexer.clone(), pin, region()).with_rebuild_gate(gate.clone());
+
+    // Un-fenced, the erase works and purges the subject's document.
+    let outcome = holder.erase_subject(&subject, &tenant()).expect("erase");
+    assert_eq!(outcome.docs_purged, 1, "precondition: the erase purges");
+
+    // Re-index the subject, then start a rebuild.
+    indexer.index(&created_event(&doc)).unwrap();
+    coordinator.claim(&key, HOLDER, 100).unwrap();
+    coordinator
+        .fence(&key, HOLDER, 100, &[])
+        .unwrap();
+    coordinator.wipe(&key, HOLDER, 100).unwrap();
+
+    // NOW the erase must REFUSE — not return a 0-purged success receipt.
+    let err = holder
+        .erase_subject(&subject, &tenant())
+        .expect_err("an erasure during a rebuild must be refused, never silently satisfied");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("rebuilding"),
+        "the refusal names the reason so the caller retries: {msg}"
+    );
+    // And it does not disclose the tenant or the subject while refusing.
+    for secret in ["acme", "u-42", REGION] {
+        assert!(
+            !msg.contains(secret),
+            "the refusal must not disclose `{secret}`: {msg}"
+        );
+    }
+
+    // Once the rebuild completes, erasure works again.
+    coordinator.reset_cursors(&key, HOLDER, 100).unwrap();
+    let kn = kn_source();
+    let git = git_source();
+    let iss = issues_source();
+    let chat = chat_source();
+    let sources: Vec<&dyn ReindexSource> = vec![&git, &iss, &kn, &chat];
+    let mut outbox = OutboxStore::new();
+    coordinator
+        .replay_all(
+            &key,
+            HOLDER,
+            100,
+            &all_scopes(),
+            &sources,
+            &mut outbox,
+            replay_ctx(),
+        )
+        .unwrap();
+    coordinator.catch_up(&key, HOLDER, 100, &[]).unwrap();
+    let expected = ExpectedCorpus::from_index(
+        &SearchReindexer::new(indexer.clone(), region()),
+        &key,
+        0,
+        0,
+    )
+    .unwrap();
+    coordinator
+        .verify_and_open(&key, HOLDER, 100, &expected)
+        .unwrap();
+    assert!(
+        holder.erase_subject(&subject, &tenant()).is_ok(),
+        "erasure resumes once reads reopen"
     );
 }

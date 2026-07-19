@@ -49,7 +49,7 @@ const OWNER_DELIMITER: char = '\u{1f}';
 
 /// Read the rebuild row for a `(tenant, region)`.
 pub const SELECT_REBUILD_JOB_QUERY: &str = "\
-SELECT phase, fence_epoch, high_water_mark, high_water_at, owners_replayed, lease_holder,
+SELECT phase, fence_epoch, high_water_mark, high_water_seqs, owners_replayed, lease_holder,
        lease_expires_at
   FROM search_rebuild_job
  WHERE tenant = $1 AND region = $2";
@@ -59,7 +59,7 @@ SELECT phase, fence_epoch, high_water_mark, high_water_at, owners_replayed, leas
 pub const INSERT_REBUILD_JOB_QUERY: &str = "\
 INSERT INTO search_rebuild_job
        (tenant, region, phase, fence_epoch, high_water_mark, owners_replayed,
-        lease_holder, lease_expires_at, high_water_at)
+        lease_holder, lease_expires_at, high_water_seqs)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
     ON CONFLICT (tenant, region) DO NOTHING";
 
@@ -73,7 +73,7 @@ UPDATE search_rebuild_job
        owners_replayed = $6,
        lease_holder = $7,
        lease_expires_at = $8,
-       high_water_at = $10,
+       high_water_seqs = $10,
        updated_at = now()
  WHERE tenant = $1 AND region = $2 AND fence_epoch = $9";
 
@@ -127,6 +127,29 @@ fn encode_owners(owners: &std::collections::BTreeSet<String>) -> Result<String, 
         .join(&OWNER_DELIMITER.to_string()))
 }
 
+/// Serialize the per-aggregate `seq` watermark for the `high_water_seqs` column.
+///
+/// JSON, because the map is `aggregate -> seq` and an aggregate key is arbitrary producer text —
+/// a delimiter-joined encoding would need the same escaping argument the owner column makes, and
+/// here the values are structured rather than a flat set. A serialization failure is LOUD: a
+/// silently-empty watermark would make catch-up skip every event.
+fn encode_seqs(seqs: &std::collections::BTreeMap<String, u64>) -> Result<String, RebuildError> {
+    serde_json::to_string(seqs)
+        .map_err(|_| RebuildError::Journal("the high-water watermark did not serialize".into()))
+}
+
+/// Parse the `high_water_seqs` column back into the watermark.
+///
+/// A NULL / absent column decodes to an EMPTY map, which correctly means "no aggregate had
+/// committed rows at fence time, so apply nothing". A MALFORMED column also decodes to empty rather
+/// than panicking — and empty is the conservative direction here: catch-up applies nothing and the
+/// zero-lag / parity legs of verification then refuse to reopen reads, rather than the alternative
+/// of admitting an unbounded tail.
+fn decode_seqs(raw: Option<&str>) -> std::collections::BTreeMap<String, u64> {
+    raw.and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default()
+}
+
 /// Split the `owners_replayed` column back into scope keys. Empty segments are dropped (an empty
 /// column is "no owners replayed", not "one owner with an empty name").
 fn decode_owners(raw: &str) -> std::collections::BTreeSet<String> {
@@ -164,7 +187,9 @@ impl RebuildJournal for PgRebuildJournal {
                 high_water_mark: row
                     .get::<Option<i64>, _>("high_water_mark")
                     .map(|v| v.max(0) as u64),
-                high_water_at: row.get::<Option<String>, _>("high_water_at"),
+                high_water_seqs: decode_seqs(
+                    row.get::<Option<String>, _>("high_water_seqs").as_deref(),
+                ),
                 owners_replayed: decode_owners(&row.get::<String, _>("owners_replayed")),
                 lease_holder: row.get::<Option<String>, _>("lease_holder"),
                 lease_expires_at: row.get::<i64, _>("lease_expires_at").max(0) as u64,
@@ -179,6 +204,7 @@ impl RebuildJournal for PgRebuildJournal {
         next: &RebuildRecord,
     ) -> Result<bool, RebuildError> {
         let owners = encode_owners(&next.owners_replayed)?;
+        let seqs = encode_seqs(&next.high_water_seqs)?;
         // The tenant predicate, threaded explicitly on both write statements (see `load`).
         let tenant_id = key.tenant.0.as_str();
         self.block(async {
@@ -194,7 +220,7 @@ impl RebuildJournal for PgRebuildJournal {
                     .bind(owners.as_str())
                     .bind(next.lease_holder.as_deref())
                     .bind(next.lease_expires_at as i64)
-                    .bind(next.high_water_at.as_deref()) // $9
+                    .bind(seqs.as_str()) // $9
                     .execute(&self.pool)
                     .await,
                 // Every later write: conditional on the epoch this holder claimed under.
@@ -208,7 +234,7 @@ impl RebuildJournal for PgRebuildJournal {
                     .bind(next.lease_holder.as_deref())
                     .bind(next.lease_expires_at as i64)
                     .bind(expected as i64)
-                    .bind(next.high_water_at.as_deref())
+                    .bind(seqs.as_str())
                     .execute(&self.pool)
                     .await,
             }

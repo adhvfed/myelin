@@ -108,6 +108,18 @@ pub struct SearchEraseHolder {
     /// [`Self::suppress_hits`] so a restricted subject is not surfaced in results or RAG. Keyed by the
     /// `(tenant, subject_id)` opaque ids — never a name (EI-04 §1).
     restricted: Arc<Mutex<BTreeSet<(String, String)>>>,
+    /// **The index-rebuild gate** ([`crate::rebuild::RebuildReadGate`]).
+    ///
+    /// An erase during a rebuild must FAIL LOUD, and this is the one place where fail-empty would be
+    /// actively dangerous rather than merely unhelpful. Mid-rebuild the index is wiped or partial,
+    /// so `locate_subject` finds 0 documents, the purge loop runs 0 times, and `erase_subject`
+    /// returns `docs_purged: 0, zero_orphan_embedding: true` — a SUCCESS receipt for a GDPR erasure
+    /// that erased nothing. The replay then re-indexes the subject from owner snapshots, so the
+    /// erased personal data is resurrected behind a receipt claiming it was removed.
+    ///
+    /// Erase also bypasses the intake fence entirely: it drives `IncrementalIndexer::index` directly
+    /// rather than going through the bus consumer's `handle`, so the fence there does not cover it.
+    rebuild_gate: Option<crate::rebuild::RebuildReadGate>,
 }
 
 /// The outcome of a real `erase(subject)` over a live index — what was purged (the SRCH-D4 receipt
@@ -138,7 +150,32 @@ impl SearchEraseHolder {
             dek,
             region,
             restricted: Arc::new(Mutex::new(BTreeSet::new())),
+            rebuild_gate: None,
         }
+    }
+
+    /// **Wire the index-rebuild gate** so an erase during a rebuild fails loud instead of returning
+    /// a success receipt for an erasure that erased nothing. See [`Self::rebuild_gate`].
+    pub fn with_rebuild_gate(mut self, gate: crate::rebuild::RebuildReadGate) -> SearchEraseHolder {
+        self.rebuild_gate = Some(gate);
+        self
+    }
+
+    /// Refuse an erasure while `(tenant, region)` is mid-rebuild.
+    ///
+    /// LOUD, not empty: the caller must retry after the rebuild rather than record a completed DSAR.
+    fn refuse_if_rebuilding(&self, tenant: &TenantId) -> Result<(), crate::engine::IndexError> {
+        if let Some(gate) = &self.rebuild_gate {
+            if !gate.admits_intake(tenant, &self.region) {
+                return Err(crate::engine::IndexError::Engine(
+                    "erasure refused: this tenant's search index is rebuilding, so a purge would \
+                     report success while erasing nothing and the replay would resurrect the \
+                     subject — retry after the rebuild completes"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The cell's resident region (§3.4).
@@ -230,6 +267,7 @@ impl SearchEraseHolder {
         subject: &SubjectRef,
         tenant: &TenantId,
     ) -> Result<EraseOutcome, crate::engine::IndexError> {
+        self.refuse_if_rebuilding(tenant)?;
         let region = self.region.clone();
         let matcher = Self::matcher(subject, tenant);
         let located = self.indexer.locate_subject(tenant, &region, &matcher);

@@ -712,12 +712,17 @@ impl IncrementalIndexer {
 
     /// Read the stored `indexed_zookie` of a doc (the ACL-state-indexed assertion reads it — a
     /// permission change advances it). Returns `None` if the doc is absent. Tenant-first.
+    /// Fenced during a rebuild: a per-doc zookie lookup is an EXISTENCE ORACLE, and mid-rebuild the
+    /// answer describes a wiped or partially-replayed index rather than the corpus.
     pub fn indexed_zookie_of(
         &self,
         tenant: &TenantId,
         region: &Region,
         doc_id: &str,
     ) -> Option<String> {
+        if self.fenced(tenant, region) {
+            return None;
+        }
         self.registry
             .with_backend(tenant, region, |be| Ok(be.indexed_zookie_of(doc_id)))
             .ok()
