@@ -220,6 +220,7 @@ impl ConsumerSpec {
             per_tenant_inflight: PerTenantInflight::DEFAULT,
         }
     }
+
 }
 
 /// **The one sanctioned consumer entry-point (EB-05).** Validates the `ConsumerSpec` (rule 3:
@@ -416,6 +417,12 @@ impl<H: EventHandler> Consumer<H> {
             per_tenant_cap: PerTenantInflight::DEFAULT,
             tenant_inflight: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether this consumer's frozen whitelist accepts the concrete event subject.
+    /// Broker pumps use this before delivery so an event is never sent to an unrelated consumer.
+    pub fn accepts(&self, subject: &str) -> bool {
+        self.subscription.matches(subject)
     }
 
     /// Set the per-tenant in-flight fairness cap (rule 6, EB-05). [`consume`] wires this from the
@@ -823,7 +830,6 @@ impl<H: EventHandler> Consumer<H> {
             }
         }
     }
-
 }
 
 #[cfg(test)]

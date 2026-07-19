@@ -70,7 +70,7 @@ use crate::metrics_health::{CriticalDependencies, HealthTable, MetricsHealthSurf
 use crate::migrations::{HotTables, Migration, MigrationRunner, Migrations};
 use crate::topology::PublicSurface;
 use crate::{Config, ServeError};
-use myelin_events::relay::BusTransport;
+use myelin_events::relay::{BusTransport, EventConsumer};
 // Used only by the `test-support`-gated in-process floor (`OutboxSpec::default_inproc`).
 #[cfg(any(test, feature = "test-support"))]
 use myelin_events::relay::InProcessBus;
@@ -91,6 +91,7 @@ use std::sync::{Arc, Mutex};
 pub struct OutboxSpec {
     store: OutboxStore,
     transport: Option<Box<dyn BusTransport>>,
+    consumer_transport: Option<Box<dyn EventConsumer>>,
 }
 
 impl OutboxSpec {
@@ -106,6 +107,7 @@ impl OutboxSpec {
         OutboxSpec {
             store: OutboxStore::new(),
             transport: Some(Box::new(InProcessBus::new())),
+            consumer_transport: None,
         }
     }
 
@@ -114,6 +116,7 @@ impl OutboxSpec {
         OutboxSpec {
             store,
             transport: Some(Box::new(transport)),
+            consumer_transport: None,
         }
     }
 
@@ -131,6 +134,7 @@ impl OutboxSpec {
         OutboxSpec {
             store,
             transport: Some(transport),
+            consumer_transport: None,
         }
     }
 
@@ -144,6 +148,21 @@ impl OutboxSpec {
         OutboxSpec {
             store,
             transport: None,
+            consumer_transport: None,
+        }
+    }
+
+    /// Bind a production service to an externally elected outbox relay and a separate durable
+    /// pull consumer. This process can receive and explicitly acknowledge events, but it owns no
+    /// relay and therefore cannot claim or mark any row in the shared outbox table.
+    pub fn external_relay_with_consumer(
+        store: OutboxStore,
+        consumer_transport: Box<dyn EventConsumer>,
+    ) -> OutboxSpec {
+        OutboxSpec {
+            store,
+            transport: None,
+            consumer_transport: Some(consumer_transport),
         }
     }
 
@@ -169,6 +188,7 @@ impl Default for OutboxSpec {
 /// reports the consumer's name + lag (the contract-1.8 `consumer_lag` signal, rule 7).
 trait RunnableConsumer: Send + Sync {
     fn name(&self) -> ConsumerName;
+    fn accepts(&self, subject: &str) -> bool;
     fn deliver(&self, msg: &Message) -> Delivered;
     fn lag(&self) -> u64;
 }
@@ -176,6 +196,9 @@ trait RunnableConsumer: Send + Sync {
 impl<H: EventHandler + Send + Sync> RunnableConsumer for Consumer<H> {
     fn name(&self) -> ConsumerName {
         Consumer::name(self).clone()
+    }
+    fn accepts(&self, subject: &str) -> bool {
+        Consumer::accepts(self, subject)
     }
     fn deliver(&self, msg: &Message) -> Delivered {
         Consumer::deliver(self, msg)
@@ -206,6 +229,10 @@ impl ConsumerReg {
 
     fn deliver(&self, msg: &Message) -> Delivered {
         self.inner.deliver(msg)
+    }
+
+    fn accepts(&self, subject: &str) -> bool {
+        self.inner.accepts(subject)
     }
 
     fn lag(&self) -> u64 {
@@ -512,6 +539,7 @@ pub struct ServeHandle {
     pool: OltpPool,
     outbox: OutboxStore,
     relay: Option<Relay<RelayTransport>>,
+    consumer_transport: Option<Box<dyn EventConsumer>>,
     consumers: Vec<ConsumerReg>,
     holders: HolderRegistry,
     /// The full store manifest (implicit OLTP + the service's declared stores) the
@@ -614,34 +642,112 @@ impl ServeHandle {
     /// An external-relay producer only refreshes telemetry; the elected cell publisher owns its
     /// rows and this process must not claim them.
     pub fn tick(&self) -> Vec<(ConsumerName, usize)> {
-        let Some(relay) = &self.relay else {
+        if let Some(relay) = &self.relay {
+            // Publish every committed-but-unsent outbox row only when this process explicitly owns
+            // the embedded relay. External-relay consumers never enter this branch.
+            relay.drain_to_empty();
+        }
+
+        // Once draining is signalled, never make a fresh broker pull. Delivery is synchronous, so
+        // there is no untracked in-flight batch to finish after `tick` returns.
+        if self.is_draining() && self.consumer_transport.is_some() {
+            self.telemetry.observe(&self.outbox, &self.consumers);
+            return Vec::new();
+        }
+
+        let batch = if let Some(transport) = &self.consumer_transport {
+            match transport.consume("") {
+                Ok(batch) => {
+                    self.health_probe().mark_up("broker");
+                    batch
+                }
+                Err(error) => {
+                    eprintln!("[{}] broker pull failed: {}", self.name, error.0);
+                    self.health_probe().mark_down("broker");
+                    self.telemetry.observe(&self.outbox, &self.consumers);
+                    return Vec::new();
+                }
+            }
+        } else if let Some(relay) = &self.relay {
+            relay.transport().consume("")
+        } else {
             self.telemetry.observe(&self.outbox, &self.consumers);
             return Vec::new();
         };
-        // 1. Relay: publish every committed-but-unsent outbox row (BUS-2; emit-iff-committed,
-        //    so only committed events are ever published).
-        relay.drain_to_empty();
-        // 2. Deliver the published events to each consumer (the bus → consumer leg). Each
-        //    consumer reads only its whitelisted subjects (rule 3) and dedups (rule 1).
-        let mut delivered = Vec::new();
-        for c in &self.consumers {
-            let mut count = 0usize;
-            for env in relay.transport().consume("") {
+
+        let mut delivered: Vec<(ConsumerName, usize)> = self
+            .consumers
+            .iter()
+            .map(|consumer| (consumer.name(), 0))
+            .collect();
+        for env in batch {
+            let matching: Vec<usize> = self
+                .consumers
+                .iter()
+                .enumerate()
+                .filter_map(|(index, consumer)| consumer.accepts(&env.subject.0).then_some(index))
+                .collect();
+            if matching.is_empty() {
+                eprintln!(
+                    "[{}] broker delivered event {} with no registered subject match",
+                    self.name, env.event_id.0
+                );
+                self.health_probe().mark_down("broker");
+                continue;
+            }
+
+            let consumer_name = self.consumers[matching[0]].name();
+            let mut terminal = true;
+            let mut retry_after_secs = None;
+            for index in matching {
                 let msg = Message {
                     subject: env.subject.0.clone(),
                     envelope: env.clone(),
                 };
-                match c.deliver(&msg) {
-                    Delivered::Acked | Delivered::Deduplicated => count += 1,
-                    // Retried / DeadLettered / Throttled (per-tenant fairness, EB-05) are NOT a
-                    // completed terminal handle — they stay pending (lag, not loss) or were
-                    // surfaced; the next drain re-offers a Retried/Throttled message.
-                    Delivered::DeadLettered(_)
-                    | Delivered::Retried(_)
-                    | Delivered::Throttled(_) => {}
+                match self.consumers[index].deliver(&msg) {
+                    Delivered::Acked | Delivered::Deduplicated => delivered[index].1 += 1,
+                    Delivered::DeadLettered(_) => {}
+                    Delivered::Retried(delay_secs) => {
+                        terminal = false;
+                        retry_after_secs = Some(
+                            retry_after_secs
+                                .map_or(delay_secs, |current: u64| current.max(delay_secs)),
+                        );
+                    }
+                    Delivered::Throttled(_) => {
+                        terminal = false;
+                        retry_after_secs = Some(retry_after_secs.unwrap_or(1).max(1));
+                    }
                 }
             }
-            delivered.push((c.name(), count));
+
+            if terminal {
+                if let Some(transport) = &self.consumer_transport {
+                    if let Err(error) = transport.ack(&consumer_name.0, &env.event_id) {
+                        eprintln!(
+                            "[{}] broker ack failed for event {}: {}",
+                            self.name, env.event_id.0, error.0
+                        );
+                        self.health_probe().mark_down("broker");
+                    } else {
+                        self.health_probe().mark_up("broker");
+                    }
+                } else if let Some(relay) = &self.relay {
+                    relay.transport().ack(&consumer_name.0, &env.event_id);
+                }
+            } else if let (Some(transport), Some(delay_secs)) =
+                (&self.consumer_transport, retry_after_secs)
+            {
+                if let Err(error) =
+                    transport.retry(&consumer_name.0, &env.event_id, delay_secs.min(300))
+                {
+                    eprintln!(
+                        "[{}] broker retry NAK failed for event {}: {}",
+                        self.name, env.event_id.0, error.0
+                    );
+                    self.health_probe().mark_down("broker");
+                }
+            }
         }
         self.telemetry.observe(&self.outbox, &self.consumers);
         delivered
@@ -769,8 +875,9 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
     let OutboxSpec {
         store: outbox_store,
         transport,
+        consumer_transport,
     } = outbox;
-    if transport.is_none() && !consumers.is_empty() {
+    if transport.is_none() && consumer_transport.is_none() && !consumers.is_empty() {
         return Err(ServeError(format!(
             "service {name} registered consumers without a consumer transport; external-relay \
              producer mode cannot consume"
@@ -808,6 +915,7 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
         pool,
         outbox: outbox_store,
         relay,
+        consumer_transport,
         consumers,
         holders: holder_registry,
         manifest: full_manifest,
@@ -849,13 +957,14 @@ pub fn serve(spec: AppSpec) -> Result<(), ServeError> {
 mod tests {
     use super::*;
     use myelin_events::{
-        Actor, AggregateKey, ArtifactRef, DataRole, DedupLedger, EmitContextBase, EventDraft,
-        EventEnvelope, EventType, IdMinter, MonotonicMinter, OutboxTx, PrefetchBound, Reason,
-        Subscription, Visibility,
+        Actor, AggregateKey, ArtifactRef, Backoff, DataRole, DedupLedger, EmitContextBase,
+        EventDraft, EventEnvelope, EventId, EventType, IdMinter, MonotonicMinter, OutboxTx,
+        PrefetchBound, Reason, Subscription, Visibility,
     };
     use myelin_events::{HandleOutcome, SubjectPattern};
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
     use myelin_tenancy::{Region, TenantId};
+    use std::collections::VecDeque;
     use std::sync::atomic::AtomicU32;
 
     fn principal() -> Principal {
@@ -921,6 +1030,126 @@ mod tests {
         .unwrap();
         let consumer = Consumer::new(H { runs: runs.clone() }, sub, dedup);
         (ConsumerReg::new(consumer), runs)
+    }
+
+    fn event_for_transport() -> EventEnvelope {
+        let outbox = OutboxStore::new();
+        let bus = InProcessBus::new();
+        let mut tx = outbox.begin(Arc::new(MonotonicMinter::new()), ctx_base());
+        tx.stage_state_change("transport fixture");
+        tx.emit(draft("issues.issue.created"), None).unwrap();
+        tx.commit().unwrap();
+        Relay::new(outbox, bus.clone(), || {
+            Timestamp("2026-06-19T00:00:02Z".into())
+        })
+        .drain_to_empty();
+        bus.consume("").into_iter().next().unwrap()
+    }
+
+    #[derive(Clone, Default)]
+    struct PullProbe {
+        state: Arc<Mutex<PullProbeState>>,
+    }
+
+    #[derive(Default)]
+    struct PullProbeState {
+        batches: VecDeque<Vec<EventEnvelope>>,
+        pulls: usize,
+        acks: Vec<EventId>,
+        retries: Vec<EventId>,
+        fail_ack: bool,
+    }
+
+    impl PullProbe {
+        fn with_batches(batches: impl IntoIterator<Item = Vec<EventEnvelope>>) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(PullProbeState {
+                    batches: batches.into_iter().collect(),
+                    ..Default::default()
+                })),
+            }
+        }
+
+        fn state(&self) -> std::sync::MutexGuard<'_, PullProbeState> {
+            self.state.lock().unwrap_or_else(|error| error.into_inner())
+        }
+    }
+
+    impl EventConsumer for PullProbe {
+        fn consume(
+            &self,
+            _subject_prefix: &str,
+        ) -> Result<Vec<EventEnvelope>, myelin_events::TransportError> {
+            let mut state = self.state();
+            state.pulls += 1;
+            Ok(state.batches.pop_front().unwrap_or_default())
+        }
+
+        fn ack(
+            &self,
+            _consumer: &str,
+            event_id: &EventId,
+        ) -> Result<(), myelin_events::TransportError> {
+            let mut state = self.state();
+            if state.fail_ack {
+                return Err(myelin_events::TransportError("ack unavailable".into()));
+            }
+            state.acks.push(event_id.clone());
+            Ok(())
+        }
+
+        fn retry(
+            &self,
+            _consumer: &str,
+            event_id: &EventId,
+            _delay_secs: u64,
+        ) -> Result<(), myelin_events::TransportError> {
+            self.state().retries.push(event_id.clone());
+            Ok(())
+        }
+    }
+
+    fn consumer_named(name: &str, prefix: &'static str, retry_first: bool) -> ConsumerReg {
+        struct H {
+            retry_first: bool,
+            calls: AtomicU32,
+        }
+        impl EventHandler for H {
+            fn subjects(&self) -> &'static [SubjectPattern] {
+                SUBJECTS
+            }
+            fn handle(
+                &self,
+                _event: &EventEnvelope,
+                _tx: &mut myelin_events::HandlerTx<'_>,
+            ) -> HandleOutcome {
+                if self.retry_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    HandleOutcome::Retry(Backoff { seconds: 2 })
+                } else {
+                    HandleOutcome::Done
+                }
+            }
+        }
+        ConsumerReg::new(Consumer::new(
+            H {
+                retry_first,
+                calls: AtomicU32::new(0),
+            },
+            Subscription::bind(ConsumerName(name.into()), &[prefix], PrefetchBound::DEFAULT)
+                .unwrap(),
+            DedupLedger::new(),
+        ))
+    }
+
+    fn external_consumer_spec(probe: PullProbe, consumers: Vec<ConsumerReg>) -> AppSpec {
+        let mut spec = AppSpec::minimal(
+            "external-consumer",
+            Config::default(),
+            OutboxSpec::external_relay_with_consumer(OutboxStore::new(), Box::new(probe)),
+        );
+        spec.consumers = consumers;
+        spec.critical = CriticalDependencies::new(["broker"]);
+        spec
     }
 
     /// **THE hello-world boot test (the M0 "first runnable", contract 1.1).** A service boots
@@ -1066,6 +1295,78 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.0.contains("without a consumer transport"));
+    }
+
+    #[test]
+    fn external_intake_leaves_unmatched_delivery_unacked_and_not_ready() {
+        let event = event_for_transport();
+        let probe = PullProbe::with_batches([vec![event]]);
+        let handle = boot(external_consumer_spec(
+            probe.clone(),
+            vec![consumer_named("other", "myelin://acme/chat/", false)],
+        ))
+        .unwrap();
+
+        handle.tick();
+
+        assert!(probe.state().acks.is_empty());
+        assert!(!handle.metrics_health().readiness().is_ready());
+    }
+
+    #[test]
+    fn external_intake_acks_only_after_every_matching_consumer_is_terminal() {
+        let event = event_for_transport();
+        let event_id = event.event_id.clone();
+        let probe = PullProbe::with_batches([vec![event.clone()], vec![event]]);
+        let handle = boot(external_consumer_spec(
+            probe.clone(),
+            vec![
+                consumer_named("first", "myelin://acme/issues/", false),
+                consumer_named("second", "myelin://acme/issues/", true),
+            ],
+        ))
+        .unwrap();
+
+        handle.tick();
+        assert!(
+            probe.state().acks.is_empty(),
+            "one Retry gates the broker ack"
+        );
+        assert_eq!(probe.state().retries, vec![event_id.clone()]);
+
+        handle.tick();
+        assert_eq!(probe.state().acks, vec![event_id]);
+    }
+
+    #[test]
+    fn external_ack_failure_flips_broker_readiness_down() {
+        let probe = PullProbe::with_batches([vec![event_for_transport()]]);
+        probe.state().fail_ack = true;
+        let handle = boot(external_consumer_spec(
+            probe,
+            vec![consumer_named("indexer", "myelin://acme/issues/", false)],
+        ))
+        .unwrap();
+
+        handle.tick();
+
+        assert!(!handle.metrics_health().readiness().is_ready());
+    }
+
+    #[test]
+    fn signalled_external_drain_never_makes_a_fresh_pull() {
+        let probe = PullProbe::with_batches([vec![event_for_transport()]]);
+        let handle = boot(external_consumer_spec(
+            probe.clone(),
+            vec![consumer_named("indexer", "myelin://acme/issues/", false)],
+        ))
+        .unwrap();
+
+        handle.signal_drain();
+        handle.drain();
+
+        assert_eq!(probe.state().pulls, 0);
+        assert!(probe.state().acks.is_empty());
     }
 
     /// **A failed boot returns non-zero (an `Err`), never a silent success (§3.1).** A config

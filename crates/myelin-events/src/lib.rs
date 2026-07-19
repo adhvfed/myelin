@@ -447,8 +447,8 @@ pub use partition::{
     MAX_SUBJECT_TOKEN_BYTES, SUBJECT_ROOT,
 };
 pub use relay::{
-    dlq_subject, BusTransport, DeadLetterAlert, Delivery, DrainReport, InProcessBus, Relay,
-    TransportError, MAX_PUBLISH_ATTEMPTS,
+    dlq_subject, BusTransport, DeadLetterAlert, Delivery, DrainReport, EventConsumer, InProcessBus,
+    Relay, TransportError, MAX_PUBLISH_ATTEMPTS,
 };
 pub use residency::{BusRegionReport, BusResidencySignal, BusStreamResidency, ResidencyError};
 /// The firehose retention-window TUNING per stream class (EB-30 / P-439, M5 — the named M2 floor

@@ -30,7 +30,7 @@ use async_nats::jetstream::consumer::PullConsumer;
 use async_nats::jetstream::stream::{
     Config as StreamConfig, DiscardPolicy, RetentionPolicy, StorageType,
 };
-use async_nats::jetstream::{self, Context};
+use async_nats::jetstream::{self, AckKind, Context};
 use futures::StreamExt;
 
 use crate::relay::{BusTransport, Delivery, EventPublisher, TransportError};
@@ -51,6 +51,102 @@ pub struct JetStreamPublisherConfig {
     pub max_messages: i64,
     pub replicas: usize,
     pub duplicate_window: std::time::Duration,
+}
+
+/// Explicit bounded-capacity policy for a durable JetStream pull consumer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JetStreamConsumerConfig {
+    pub nats_url: String,
+    pub stream_name: String,
+    pub subject_root: String,
+    pub filter_subject: String,
+    pub consumer_name: String,
+    pub ack_wait: std::time::Duration,
+    pub max_deliver: i64,
+    pub max_ack_pending: i64,
+    pub max_batch: usize,
+    pub max_expires: std::time::Duration,
+}
+
+impl JetStreamConsumerConfig {
+    /// The bounded production defaults. A caller still supplies the exact server-side filter.
+    pub fn bounded(
+        nats_url: impl Into<String>,
+        stream_name: impl Into<String>,
+        subject_root: impl Into<String>,
+        filter_subject: impl Into<String>,
+        consumer_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            nats_url: nats_url.into(),
+            stream_name: stream_name.into(),
+            subject_root: subject_root.into(),
+            filter_subject: filter_subject.into(),
+            consumer_name: consumer_name.into(),
+            ack_wait: std::time::Duration::from_secs(30),
+            // Unlimited redelivery is intentional until broker delivery-attempt metadata is
+            // carried into the durable application DLQ transaction. A finite broker-only cap
+            // would strand the final unacked Retry with only a JetStream advisory.
+            max_deliver: -1,
+            max_ack_pending: 256,
+            max_batch: 256,
+            max_expires: std::time::Duration::from_secs(1),
+        }
+    }
+
+    fn validate(&self) -> Result<(), TransportError> {
+        if self.nats_url.trim().is_empty()
+            || self.stream_name.trim().is_empty()
+            || self.subject_root.trim().is_empty()
+            || self.consumer_name.trim().is_empty()
+        {
+            return Err(TransportError(
+                "JetStream consumer endpoint, stream, root, and durable name are required".into(),
+            ));
+        }
+        if self.filter_subject != self.subject_root
+            && !self
+                .filter_subject
+                .starts_with(&format!("{}.", self.subject_root))
+        {
+            return Err(TransportError(format!(
+                "consumer filter {} escapes subject root {}",
+                self.filter_subject, self.subject_root
+            )));
+        }
+        if self.ack_wait.is_zero()
+            || (self.max_deliver != -1 && self.max_deliver <= 0)
+            || self.max_ack_pending <= 0
+            || self.max_batch == 0
+            || self.max_batch > self.max_ack_pending as usize
+            || self.max_expires.is_zero()
+        {
+            return Err(TransportError(
+                "JetStream consumer bounds must be finite and positive (batch <= ack pending)"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn pull_config(&self) -> jetstream::consumer::pull::Config {
+        jetstream::consumer::pull::Config {
+            durable_name: Some(self.consumer_name.clone()),
+            name: Some(self.consumer_name.clone()),
+            deliver_policy: jetstream::consumer::DeliverPolicy::All,
+            ack_policy: jetstream::consumer::AckPolicy::Explicit,
+            ack_wait: self.ack_wait,
+            max_deliver: self.max_deliver,
+            filter_subject: self.filter_subject.clone(),
+            replay_policy: jetstream::consumer::ReplayPolicy::Instant,
+            max_waiting: 8,
+            max_ack_pending: self.max_ack_pending,
+            max_batch: self.max_batch as i64,
+            max_bytes: 4 * 1024 * 1024,
+            max_expires: self.max_expires,
+            ..Default::default()
+        }
+    }
 }
 
 impl JetStreamPublisherConfig {
@@ -341,6 +437,9 @@ pub struct NatsJetStreamBus {
     js: Context,
     stream_name: String,
     subject_root: String,
+    consumer_name: String,
+    max_batch: usize,
+    max_expires: std::time::Duration,
     rt: tokio::runtime::Handle,
     /// Ack handles for messages delivered by [`BusTransport::consume`] but not yet acked, keyed
     /// by `event_id` so [`BusTransport::ack`] acks EXACTLY the delivered message. Behind a Mutex
@@ -360,63 +459,101 @@ impl NatsJetStreamBus {
         consumer_name: &str,
         rt: tokio::runtime::Handle,
     ) -> Result<NatsJetStreamBus, TransportError> {
-        let subject_root = subject_root.to_string();
-        let stream_name = stream_name.to_string();
-        let consumer_name = consumer_name.to_string();
         let filter = format!("{subject_root}.>");
-
-        let js = tokio::task::block_in_place(|| {
+        tokio::task::block_in_place(|| {
             rt.block_on(async {
                 let client = async_nats::connect(nats_url)
                     .await
                     .map_err(|e| TransportError(format!("nats connect: {e}")))?;
                 let js = jetstream::new(client);
-
-                // The durable stream with MsgId dedup (the Nats-Msg-Id = event_id 0-ghost
-                // property). A 2-minute dedup window is ample for a relay re-claim after a crash.
                 js.get_or_create_stream(jetstream::stream::Config {
-                    name: stream_name.clone(),
+                    name: stream_name.to_string(),
                     subjects: vec![filter.clone()],
+                    retention: RetentionPolicy::Limits,
+                    storage: StorageType::File,
+                    max_age: std::time::Duration::from_secs(90 * 24 * 60 * 60),
+                    max_bytes: 64 * 1024 * 1024,
+                    max_messages: 100_000,
+                    num_replicas: 1,
                     duplicate_window: std::time::Duration::from_secs(120),
                     ..Default::default()
                 })
                 .await
                 .map_err(|e| TransportError(format!("create stream: {e}")))?;
+                Ok::<(), TransportError>(())
+            })
+        })?;
 
-                // The durable PULL consumer with explicit ack (so consume+ack is real, not
-                // auto-ack). AckExplicit is the default; pinning it is loud + intentional.
-                let stream = js
-                    .get_stream(&stream_name)
-                    .await
-                    .map_err(|e| TransportError(format!("get stream: {e}")))?;
-                stream
-                    .get_or_create_consumer(
-                        &consumer_name,
-                        jetstream::consumer::pull::Config {
-                            durable_name: Some(consumer_name.clone()),
-                            ack_policy: jetstream::consumer::AckPolicy::Explicit,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(|e| TransportError(format!("create consumer: {e}")))?;
+        Self::connect_consumer(
+            JetStreamConsumerConfig::bounded(
+                nats_url,
+                stream_name,
+                subject_root,
+                filter,
+                consumer_name,
+            ),
+            rt,
+        )
+    }
 
+    /// Connect only the bounded durable pull consumer to an already elected/shared stream.
+    /// Production consumer services use this constructor so they never create or mutate stream
+    /// publisher state. Existing consumer configuration is validated and drift fails boot.
+    pub fn connect_consumer(
+        config: JetStreamConsumerConfig,
+        rt: tokio::runtime::Handle,
+    ) -> Result<NatsJetStreamBus, TransportError> {
+        config.validate()?;
+        let expected = config.pull_config();
+        let nats_url = config.nats_url.clone();
+        let stream_name = config.stream_name.clone();
+        let consumer_name = config.consumer_name.clone();
+        let js = tokio::task::block_in_place(|| {
+            rt.block_on(async {
+                let client = async_nats::connect(&nats_url)
+                    .await
+                    .map_err(|e| TransportError(format!("nats connect: {e}")))?;
+                let js = jetstream::new(client);
+                let stream = js.get_stream(&stream_name).await.map_err(|e| {
+                    TransportError(format!("get elected stream {stream_name}: {e}"))
+                })?;
+                let mut consumer = stream
+                    .get_or_create_consumer(&consumer_name, expected.clone())
+                    .await
+                    .map_err(|e| TransportError(format!("create consumer {consumer_name}: {e}")))?;
+                let actual = &consumer
+                    .info()
+                    .await
+                    .map_err(|e| TransportError(format!("inspect consumer {consumer_name}: {e}")))?
+                    .config;
+                if actual.durable_name.as_deref() != Some(consumer_name.as_str())
+                    || actual.deliver_policy != jetstream::consumer::DeliverPolicy::All
+                    || actual.ack_policy != jetstream::consumer::AckPolicy::Explicit
+                    || actual.ack_wait != config.ack_wait
+                    || actual.max_deliver != config.max_deliver
+                    || actual.filter_subject != config.filter_subject
+                    || actual.max_ack_pending != config.max_ack_pending
+                    || actual.max_batch != config.max_batch as i64
+                    || actual.max_expires != config.max_expires
+                {
+                    return Err(TransportError(format!(
+                        "durable consumer {consumer_name} configuration drifted from bounded policy"
+                    )));
+                }
                 Ok::<Context, TransportError>(js)
             })
         })?;
 
         Ok(NatsJetStreamBus {
             js,
-            stream_name,
-            subject_root,
+            stream_name: config.stream_name,
+            subject_root: config.subject_root,
+            consumer_name: config.consumer_name,
+            max_batch: config.max_batch,
+            max_expires: config.max_expires,
             rt,
             pending: Mutex::new(HashMap::new()),
         })
-    }
-
-    /// The durable consumer this bus reads through (named after the stream + `_pull`).
-    fn consumer_name(&self) -> String {
-        format!("{}_pull", self.stream_name)
     }
 
     /// Map an event onto a concrete JetStream subject under the stream's root. EB-12: the routing +
@@ -437,6 +574,88 @@ impl NatsJetStreamBus {
 
     fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
         tokio::task::block_in_place(|| self.rt.block_on(fut))
+    }
+
+    fn try_consume(&self) -> Result<Vec<EventEnvelope>, TransportError> {
+        let consumer_name = self.consumer_name.clone();
+        let stream_name = self.stream_name.clone();
+        let msgs: Vec<jetstream::Message> = self.block(async {
+            let stream = self
+                .js
+                .get_stream(&stream_name)
+                .await
+                .map_err(|e| TransportError(format!("get stream: {e}")))?;
+            let consumer: PullConsumer = stream
+                .get_consumer(&consumer_name)
+                .await
+                .map_err(|e| TransportError(format!("get consumer {consumer_name}: {e}")))?;
+            let mut batch = consumer
+                .batch()
+                .max_messages(self.max_batch)
+                .expires(self.max_expires)
+                .messages()
+                .await
+                .map_err(|e| TransportError(format!("pull batch: {e}")))?;
+            let mut out = Vec::new();
+            while let Some(next) = batch.next().await {
+                out.push(next.map_err(|e| TransportError(format!("pull message: {e}")))?);
+            }
+            Ok::<_, TransportError>(out)
+        })?;
+
+        let mut decoded = Vec::with_capacity(msgs.len());
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        for msg in msgs {
+            let envelope = serde_json::from_slice::<EventEnvelope>(&msg.payload)
+                .map_err(|e| TransportError(format!("decode event envelope: {e}")))?;
+            let expected_subject = self.subject_for(&envelope)?;
+            if msg.subject.as_str() != expected_subject {
+                return Err(TransportError(format!(
+                    "broker subject {} disagrees with envelope route {}",
+                    msg.subject, expected_subject
+                )));
+            }
+            pending.insert(envelope.event_id.0.clone(), msg);
+            decoded.push(envelope);
+        }
+        Ok(decoded)
+    }
+
+    fn try_ack(&self, event_id: &EventId) -> Result<(), TransportError> {
+        let msg = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.remove(&event_id.0)
+        }
+        .ok_or_else(|| {
+            TransportError(format!(
+                "no pending JetStream delivery for event {}",
+                event_id.0
+            ))
+        })?;
+        self.block(async {
+            msg.ack()
+                .await
+                .map_err(|e| TransportError(format!("ack event {}: {e}", event_id.0)))
+        })
+    }
+
+    fn try_retry(&self, event_id: &EventId, delay_secs: u64) -> Result<(), TransportError> {
+        let msg = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.remove(&event_id.0)
+        }
+        .ok_or_else(|| {
+            TransportError(format!(
+                "no pending JetStream delivery for event {}",
+                event_id.0
+            ))
+        })?;
+        let delay = std::time::Duration::from_secs(delay_secs.clamp(1, 300));
+        self.block(async {
+            msg.ack_with(AckKind::Nak(Some(delay)))
+                .await
+                .map_err(|e| TransportError(format!("NAK event {}: {e}", event_id.0)))
+        })
     }
 }
 
@@ -490,6 +709,32 @@ mod publisher_tests {
         let err = validate_stream_config(&actual, &expected).expect_err("discard drift");
         assert!(err.0.contains("discard=New"));
     }
+
+    #[test]
+    fn pull_consumer_policy_is_explicit_bounded_and_root_scoped() {
+        let config = JetStreamConsumerConfig::bounded(
+            "nats://127.0.0.1:4222",
+            "MYELIN_EVENTS",
+            "myelin.events",
+            "myelin.events.evt.*.git.>",
+            "ci-dispatch-trigger",
+        );
+        config.validate().unwrap();
+        let pull = config.pull_config();
+        assert_eq!(pull.durable_name.as_deref(), Some("ci-dispatch-trigger"));
+        assert_eq!(pull.ack_policy, jetstream::consumer::AckPolicy::Explicit);
+        assert_eq!(pull.deliver_policy, jetstream::consumer::DeliverPolicy::All);
+        assert_eq!(pull.filter_subject, "myelin.events.evt.*.git.>");
+        assert!(pull.ack_wait > std::time::Duration::ZERO);
+        assert_eq!(pull.max_deliver, -1, "never strand a final unacked retry");
+        assert!(pull.max_ack_pending > 0);
+        assert!(pull.max_batch > 0);
+        assert!(pull.max_expires > std::time::Duration::ZERO);
+
+        let mut escaped = config;
+        escaped.filter_subject = "other.events.>".into();
+        assert!(escaped.validate().is_err());
+    }
 }
 
 impl BusTransport for NatsJetStreamBus {
@@ -530,54 +775,13 @@ impl BusTransport for NatsJetStreamBus {
         // stashed keyed by event_id so `ack` can ack exactly the delivered message (explicit
         // ack). Returns the decoded envelopes in delivery order. A pull with no messages within
         // the short expiry returns empty (a clean "nothing to consume right now").
-        let consumer_name = self.consumer_name();
-        let stream_name = self.stream_name.clone();
-        let msgs: Vec<jetstream::Message> = self.block(async {
-            let consumer: PullConsumer = match self.js.get_stream(&stream_name).await {
-                Ok(s) => match s.get_consumer(&consumer_name).await {
-                    Ok(c) => c,
-                    Err(_) => return Vec::new(),
-                },
-                Err(_) => return Vec::new(),
-            };
-            let mut batch = match consumer
-                .batch()
-                .max_messages(256)
-                .expires(std::time::Duration::from_millis(500))
-                .messages()
-                .await
-            {
-                Ok(b) => b,
-                Err(_) => return Vec::new(),
-            };
-            let mut out = Vec::new();
-            while let Some(Ok(msg)) = batch.next().await {
-                out.push(msg);
-            }
-            out
-        });
-
-        let mut envelopes = Vec::with_capacity(msgs.len());
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        for msg in msgs {
-            if let Ok(env) = serde_json::from_slice::<EventEnvelope>(&msg.payload) {
-                pending.insert(env.event_id.0.clone(), msg);
-                envelopes.push(env);
-            }
-        }
-        envelopes
+        self.try_consume().unwrap_or_default()
     }
 
     fn ack(&self, _consumer: &str, event_id: &EventId) {
         // Explicit ack of the delivered message stashed by `consume` (at-least-once → the ack is
         // what makes it not redeliver). Acking an un-consumed / already-acked id is a no-op.
-        let msg = {
-            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.remove(&event_id.0)
-        };
-        if let Some(msg) = msg {
-            let _ = self.block(async { msg.ack().await });
-        }
+        let _ = self.try_ack(event_id);
     }
 
     fn purge(&self) {
@@ -594,5 +798,24 @@ impl BusTransport for NatsJetStreamBus {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+}
+
+impl crate::relay::EventConsumer for NatsJetStreamBus {
+    fn consume(&self, _subject_prefix: &str) -> Result<Vec<EventEnvelope>, TransportError> {
+        self.try_consume()
+    }
+
+    fn ack(&self, _consumer: &str, event_id: &EventId) -> Result<(), TransportError> {
+        self.try_ack(event_id)
+    }
+
+    fn retry(
+        &self,
+        _consumer: &str,
+        event_id: &EventId,
+        delay_secs: u64,
+    ) -> Result<(), TransportError> {
+        self.try_retry(event_id, delay_secs)
     }
 }
