@@ -245,6 +245,33 @@ async fn elected_relay_serializes_contenders_preserves_order_and_retains_outage_
         "outage retains row without spending DLQ attempts"
     );
 
+    let one_connection_pool = {
+        let schema = schema.clone();
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(move |connection, _| {
+                let schema = schema.clone();
+                Box::pin(async move {
+                    sqlx::Executor::execute(
+                        connection,
+                        format!("SET search_path TO {schema}, public").as_str(),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .connect(&admin_url(&cfg))
+            .await
+            .expect("connect one-session pool")
+    };
+    let recovered = ElectedPgRelay::new(one_connection_pool.clone(), validation())
+        .expect("one connection is sufficient")
+        .drain_once(publisher.as_ref(), 32)
+        .await
+        .expect("one-connection elected pass");
+    assert_eq!(recovered, ElectedDrainOutcome::Published(1));
+    one_connection_pool.close().await;
+
     pool.close().await;
     let cleanup = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
