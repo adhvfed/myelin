@@ -898,7 +898,10 @@ impl RebuildCoordinator {
         ctx_base: EmitContextBase,
     ) -> Result<usize, RebuildError> {
         let mut rec = self.checked(key, holder, now)?;
-        if rec.phase >= RebuildPhase::Replayed {
+        // Past `Replayed` the corpus is frozen: catch-up has begun applying live events on top of
+        // it, and replaying a scope now would re-drive snapshots BEHIND events that already
+        // superseded them. Stop.
+        if rec.phase > RebuildPhase::Replayed {
             return Ok(0);
         }
         if rec.phase < RebuildPhase::CursorsReset {
@@ -907,6 +910,12 @@ impl RebuildCoordinator {
                 durable: rec.phase,
             });
         }
+        // At EXACTLY `Replayed` we do not early-return. The phase is a floor, not the truth about
+        // which corpora are done — that is `owners_replayed`. A caller that previously passed an
+        // incomplete scope set (a partial replay, or a resume that hadn't yet loaded the full
+        // registry) would otherwise have permanently pinned the phase to `Replayed` with corpora
+        // still missing, and every later attempt to finish the job would no-op silently. Topping up
+        // the missing scopes here is what makes the phase converge to its own meaning.
 
         let mut indexed = 0usize;
         for scope in scopes {
@@ -930,9 +939,11 @@ impl RebuildCoordinator {
             rec = self.checked(key, holder, now)?;
         }
 
-        self.advance(key, &rec, holder, now, |next| {
-            next.phase = RebuildPhase::Replayed;
-        })?;
+        if rec.phase < RebuildPhase::Replayed {
+            self.advance(key, &rec, holder, now, |next| {
+                next.phase = RebuildPhase::Replayed;
+            })?;
+        }
         Ok(indexed)
     }
 
