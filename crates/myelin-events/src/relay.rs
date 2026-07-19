@@ -142,6 +142,14 @@ pub trait EventConsumer: Send + Sync {
     /// Server-side durable consumer name used as the quarantine owner key.
     fn durable_name(&self) -> &str;
 
+    /// Check a non-broker critical dependency before admitting a fresh pull. Composition wrappers
+    /// return a typed dependency so lifecycle health does not mislabel it as broker failure.
+    fn pre_intake_readiness(
+        &self,
+    ) -> std::result::Result<Option<IntakeDependency>, IntakeDependency> {
+        Ok(None)
+    }
+
     /// Pull one bounded batch from the durable consumer.
     fn consume(
         &self,
@@ -167,6 +175,16 @@ pub trait EventConsumer: Send + Sync {
         &self,
         token: DeliveryToken,
     ) -> std::result::Result<(), TransportError>;
+}
+
+/// Fixed critical dependencies that can gate intake before a broker pull.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum IntakeDependency { Blob }
+
+impl IntakeDependency {
+    pub const fn name(self) -> &'static str {
+        match self { Self::Blob => "blob" }
+    }
 }
 
 /// Opaque process-local identity for one raw broker delivery handle. It is deliberately unrelated

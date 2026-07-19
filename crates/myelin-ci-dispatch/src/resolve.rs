@@ -263,7 +263,7 @@ pub enum ResolveError {
     Cyclic,
     /// The CAS blob write failed (the snapshot could not be content-addressed) — surfaced, never
     /// swallowed (the snapshot is the run's definition; no snapshot ⇒ no start).
-    BlobWrite(String),
+    BlobWrite(myelin_storage::BlobError),
     /// **The matrix cross-product exceeds [`MAX_TOTAL_MATRIX_INSTANCES`] (peer-review finding
     /// 2026-07-16 #10 — resource-limit fail-closed).** `expand_matrix` materializes the full axis
     /// cross-product; an unbounded config (e.g. ~8 axes × ~10 values) would OOM the dispatch consumer
@@ -554,7 +554,7 @@ pub fn resolve_versioned_snapshot(
     let bytes = snapshot.canonical_bytes().map_err(|error| ResolveError::InvalidPlan(error.to_string()))?;
     let address = blobs
         .put(tenant, &bytes)
-        .map_err(|e| ResolveError::BlobWrite(e.to_string()))?;
+        .map_err(ResolveError::BlobWrite)?;
     Ok((snapshot, address))
 }
 

@@ -691,7 +691,7 @@ async fn finding6_build_dispatch_consumers_registers_the_live_trigger_consumer()
 
     let consumers = build_dispatch_consumers(
         git_root,
-        &s3,
+        Arc::new(myelin_storage::s3blob::S3BlobStore::connect(&s3, rt.clone())),
         ci_run_store_factory(p.clone()),
         outbox,
         dedup,

@@ -197,7 +197,6 @@ impl Default for OutboxSpec {
 trait RunnableConsumer: Send + Sync {
     fn name(&self) -> ConsumerName;
     fn accepts(&self, subject: &str) -> bool;
-    fn is_handled(&self, event_id: &myelin_events::EventId) -> bool;
     fn deliver(&self, msg: &Message) -> Delivered;
     fn dead_letter_exhausted_retry(&self, msg: &Message, delivery_attempt: u64) -> Delivered;
     fn lag(&self) -> u64;
@@ -209,9 +208,6 @@ impl<H: EventHandler + Send + Sync> RunnableConsumer for Consumer<H> {
     }
     fn accepts(&self, subject: &str) -> bool {
         Consumer::accepts(self, subject)
-    }
-    fn is_handled(&self, event_id: &myelin_events::EventId) -> bool {
-        Consumer::is_handled(self, event_id)
     }
     fn deliver(&self, msg: &Message) -> Delivered {
         Consumer::deliver(self, msg)
@@ -254,10 +250,6 @@ impl ConsumerReg {
 
     fn accepts(&self, subject: &str) -> bool {
         self.inner.accepts(subject)
-    }
-
-    fn is_handled(&self, event_id: &myelin_events::EventId) -> bool {
-        self.inner.is_handled(event_id)
     }
 
     fn lag(&self) -> u64 {
@@ -733,6 +725,15 @@ impl ServeHandle {
         }
 
         let batch = if let Some(transport) = &self.consumer_transport {
+            match transport.pre_intake_readiness() {
+                Ok(Some(dependency)) => self.health_probe().mark_up(dependency.name()),
+                Ok(None) => {}
+                Err(dependency) => {
+                    self.health_probe().mark_down(dependency.name());
+                    self.telemetry.observe(&self.outbox, &self.consumers);
+                    return Vec::new();
+                }
+            }
             match transport.consume("") {
                 Ok(batch) => {
                     self.health_probe().mark_up("broker");
@@ -831,24 +832,14 @@ impl ServeHandle {
                     subject: env.subject.0.clone(),
                     envelope: env.clone(),
                 };
-                let retry_budget_already_exhausted = delivery_attempt
-                    > MAX_CONSUMER_DELIVERIES
-                    && !self.consumers[index].is_handled(&env.event_id);
-                let outcome = if retry_budget_already_exhausted {
-                    // A prior attempt already ran the handler and exhausted its budget. Retry only
-                    // the durable quarantine write; never execute the failing handler again.
-                    self.consumers[index]
-                        .dead_letter_exhausted_retry(&msg, delivery_attempt)
-                } else {
-                    self.consumers[index].deliver(&msg)
-                };
+                // Always run an undeduplicated handler beyond the ordinary ceiling: a dependency
+                // outage may have crossed it, and recovery must get a chance to complete valid work.
+                // Ordinary Retry below still enters durable DLQ. A failed DLQ write reruns the
+                // rolled-back handler on redelivery, favoring zero loss over speculative discard.
+                let outcome = self.consumers[index].deliver(&msg);
                 match outcome {
                     Delivered::Acked | Delivered::Deduplicated => delivered[index].1 += 1,
-                    Delivered::DeadLettered(_) => {
-                        if retry_budget_already_exhausted {
-                            exhausted = true;
-                        }
-                    }
+                    Delivered::DeadLettered(_) => {}
                     Delivered::Retried(delay_secs) => {
                         if delivery_attempt >= MAX_CONSUMER_DELIVERIES {
                             match self.consumers[index]
@@ -871,6 +862,13 @@ impl ServeHandle {
                                     .map_or(delay_secs, |current: u64| current.max(delay_secs)),
                             );
                         }
+                    }
+                    Delivered::DependencyUnavailable(dependency, delay_secs) => {
+                        self.health_probe().mark_down(dependency.name());
+                        terminal = false;
+                        retry_after_secs = Some(
+                            retry_after_secs.map_or(delay_secs, |current: u64| current.max(delay_secs)),
+                        );
                     }
                     Delivered::Throttled(_) => {
                         terminal = false;
@@ -1086,6 +1084,16 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
     full_critical.extend(critical.deps().iter().map(|d| d.0.clone()));
     let mut ports = PortOpener::default();
     ports.open_all(CriticalDependencies::new(full_critical));
+
+    // Seed dependency state while startup is still closed: no false-ready interval and no broker
+    // construction/pull when a pre-intake dependency is transiently unavailable.
+    if let Some(consumer_transport) = consumer_transport.as_ref() {
+        match consumer_transport.pre_intake_readiness() {
+            Ok(Some(dependency)) => ports.health_probe().mark_up(dependency.name()),
+            Ok(None) => {}
+            Err(dependency) => ports.health_probe().mark_down(dependency.name()),
+        }
+    }
 
     // (3.5) telemetry — install the producer side of the contract-1.8 signal set on the
     //       metrics-health surface; observe the initial (zero) state.
@@ -1537,6 +1545,34 @@ mod tests {
         (consumer, calls)
     }
 
+    fn dependency_unavailable_consumer(dedup: DedupLedger, dlq: DlqProbe) -> ConsumerReg {
+        struct H;
+        impl EventHandler for H {
+            fn subjects(&self) -> &'static [SubjectPattern] { SUBJECTS }
+            fn handle(
+                &self,
+                _event: &EventEnvelope,
+                _tx: &mut myelin_events::HandlerTx<'_>,
+            ) -> HandleOutcome {
+                HandleOutcome::DependencyUnavailable {
+                    dependency: myelin_events::relay::IntakeDependency::Blob,
+                    backoff: Backoff { seconds: 2 },
+                }
+            }
+        }
+        ConsumerReg::new(
+            Consumer::new(
+                H,
+                Subscription::bind(
+                    ConsumerName("blob-dependent".into()),
+                    &["myelin://acme/issues/"],
+                    PrefetchBound::DEFAULT,
+                ).unwrap(),
+                dedup,
+            ).with_dead_letter_sink(myelin_events::DeadLetterSink::durable(Arc::new(dlq))),
+        )
+    }
+
     fn external_consumer_spec(probe: PullProbe, consumers: Vec<ConsumerReg>) -> AppSpec {
         external_consumer_spec_with_quarantine(probe, consumers, Arc::new(QuarantineProbe::default()))
     }
@@ -1986,6 +2022,23 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_dependency_bypasses_retry_exhaustion_and_never_dlqs_or_terms() {
+        let probe = PullProbe::with_delivery(event_for_transport(), MAX_CONSUMER_DELIVERIES + 1);
+        let dlq = DlqProbe::default();
+        let dedup = DedupLedger::new();
+        let consumer = dependency_unavailable_consumer(dedup.clone(), dlq.clone());
+        let handle = boot(external_consumer_spec(probe.clone(), vec![consumer])).unwrap();
+
+        handle.tick();
+
+        assert_eq!(probe.state().retries, vec![token(1)]);
+        assert!(probe.state().terms.is_empty());
+        assert!(probe.state().acks.is_empty());
+        assert!(dlq.records.lock().unwrap_or_else(|error| error.into_inner()).is_empty());
+        assert!(dedup.is_empty(), "dependency failure commits no dedup effect");
+    }
+
+    #[test]
     fn exhausted_retry_naks_when_durable_dlq_write_fails() {
         let event = event_for_transport();
         let probe = PullProbe::with_delivery(event.clone(), MAX_CONSUMER_DELIVERIES);
@@ -2021,8 +2074,8 @@ mod tests {
         assert_eq!(probe.state().terms, vec![token(2)]);
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            1,
-            "attempts beyond the ceiling retry only the quarantine write"
+            2,
+            "failed quarantine reruns rolled-back work rather than discarding dependency-deferred work"
         );
         assert_eq!(
             handle.telemetry().consumer_lag("retrying"),

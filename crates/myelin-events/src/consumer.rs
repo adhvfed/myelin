@@ -338,6 +338,8 @@ pub enum Delivered {
     /// The handler returned `Retry`: the message was NOT acked (rule 2) — it stays pending and
     /// redelivers. Carries the backoff seconds the handler asked for.
     Retried(u64),
+    /// A critical backing is unavailable; pending work does not consume the app/DLQ budget.
+    DependencyUnavailable(crate::relay::IntakeDependency, u64),
     /// The message's tenant is already at its per-tenant in-flight cap (rule 6, fairness): the
     /// message was DEFERRED, not handled and not dropped — it stays pending (lag, not loss) and is
     /// re-offered on the next drain once the tenant drains. Carries the tenant that was throttled
@@ -788,6 +790,11 @@ impl<H: EventHandler> Consumer<H> {
                 cotx.rollback();
                 self.bump_pending(&msg.subject, &event_id);
                 Delivered::Retried(backoff.seconds)
+            }
+            HandleOutcome::DependencyUnavailable { dependency, backoff } => {
+                cotx.rollback();
+                self.bump_pending(&msg.subject, &event_id);
+                Delivered::DependencyUnavailable(dependency, backoff.seconds)
             }
         }
     }

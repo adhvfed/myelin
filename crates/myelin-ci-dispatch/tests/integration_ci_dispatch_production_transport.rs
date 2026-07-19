@@ -6,7 +6,7 @@ use std::sync::Arc;
 use myelin_ci_controlplane::{ci_durable_migrations, ci_run_store_factory};
 use myelin_ci_dispatch::{
     build_dispatch_consumers, dispatch_app_spec_with_intake, git_intake_filter,
-    AuthoritativeGitRoot, EVENT_SUBJECT_ROOT,
+    AuthoritativeGitRoot, RecoveringIntake, EVENT_SUBJECT_ROOT,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::nats::{
@@ -173,9 +173,11 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
     );
     let dead_letters: Arc<dyn myelin_events::DurableDeadLetter> =
         Arc::new(DurableDeadLetterBacking::new(pool.clone(), rt.clone()));
+    let s3 = Arc::new(S3BlobStore::connect(&cfg.s3, rt.clone()));
+    s3.preflight().expect("S3 read/write authority preflight");
     let consumers = build_dispatch_consumers(
         git_root,
-        &cfg.s3,
+        s3.clone(),
         ci_run_store_factory(pool.clone()),
         reserve_outbox,
         dedup,
@@ -221,7 +223,7 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
         format!("{subject_root}.evt.*.git.>"),
         &durable_name,
     );
-    let intake = NatsJetStreamBus::connect_consumer(intake_config.clone(), rt.clone()).unwrap();
+    let intake = RecoveringIntake::new(intake_config.clone(), s3.clone(), rt.clone());
     let quarantine = Arc::new(
         myelin_storage::events_durable::DurableDeliveryQuarantineBacking::new(
             pool.clone(),
@@ -274,7 +276,6 @@ async fn production_transport_runs_once_and_never_claims_foreign_outbox_rows() {
         .expect("one durable ci_run");
     let snapshot_ref: String = row.get("definition_snapshot");
     let address = ContentHash::parse(snapshot_ref.rsplit('/').next().unwrap()).unwrap();
-    let s3 = S3BlobStore::connect(&cfg.s3, rt.clone());
     let bytes =
         tokio::task::block_in_place(|| s3.get(&TenantId(tenant.clone()), &address)).unwrap();
     assert_eq!(ContentHash::blake3(&bytes), address);

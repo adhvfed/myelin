@@ -580,6 +580,11 @@ pub enum HandleOutcome {
     Done,
     NonRetryable(Reason),
     Retry(Backoff),
+    /// Infrastructure required for valid work is unavailable. This has no delivery/DLQ ceiling.
+    DependencyUnavailable {
+        dependency: relay::IntakeDependency,
+        backoff: Backoff,
+    },
 }
 
 /// **The same-transaction co-commit handle threaded into a handler (peer-review #7 / MR-023b —

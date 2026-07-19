@@ -31,11 +31,11 @@
 //! matcher, trust stamp, definition resolution, and reserve/start handoff.
 
 use myelin_ci_dispatch::{
-    git_intake_filter, run_dispatch_until_shutdown, AuthoritativeGitRoot, EVENT_DURABLE_CONSUMER,
-    EVENT_STREAM_NAME, EVENT_SUBJECT_ROOT,
+    git_intake_filter, run_dispatch_until_shutdown, AuthoritativeGitRoot, RecoveringIntake,
+    EVENT_DURABLE_CONSUMER, EVENT_STREAM_NAME, EVENT_SUBJECT_ROOT,
 };
 use myelin_config::Mode;
-use myelin_events::nats::{JetStreamConsumerConfig, NatsJetStreamBus};
+use myelin_events::nats::JetStreamConsumerConfig;
 use myelin_events::OutboxStore;
 use myelin_storage::{all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking};
 use myelin_substrate::Config;
@@ -181,10 +181,24 @@ async fn main() {
         provider.db_pool().clone(),
         tokio::runtime::Handle::current(),
     )));
-    let s3 = provider.config().s3.clone();
+    let blobs = Arc::new(myelin_storage::s3blob::S3BlobStore::connect(
+        &provider.config().s3,
+        tokio::runtime::Handle::current(),
+    ));
+    match blobs.preflight() {
+        Ok(()) => {}
+        Err(error @ (myelin_storage::blob::BlobDependencyError::PermanentConfig
+            | myelin_storage::blob::BlobDependencyError::PermanentAuth)) => {
+            eprintln!("ci-dispatch: {error}; refusing broker intake");
+            std::process::exit(1);
+        }
+        Err(myelin_storage::blob::BlobDependencyError::Transient) => {
+            eprintln!("ci-dispatch: object-store dependency is temporarily unavailable; starting not-ready");
+        }
+    }
     let consumers = myelin_ci_dispatch::build_dispatch_consumers(
         git_root,
-        &s3,
+        blobs.clone(),
         ci_run,
         reserve_outbox,
         dedup,
@@ -204,7 +218,7 @@ async fn main() {
     // this process cannot claim or mark any outbox row. The server-side filter admits every tenant
     // in this cell but only the git subsystem. Region is a cell property and is checked again by the
     // handler before Git, S3, or PG effects.
-    let intake = NatsJetStreamBus::connect_consumer(
+    let intake = RecoveringIntake::new(
         JetStreamConsumerConfig::bounded(
             &provider.config().nats_url,
             EVENT_STREAM_NAME,
@@ -212,15 +226,9 @@ async fn main() {
             git_intake_filter(),
             EVENT_DURABLE_CONSUMER,
         ),
+        blobs,
         tokio::runtime::Handle::current(),
-    )
-    .unwrap_or_else(|error| {
-        eprintln!(
-            "ci-dispatch: durable JetStream intake refused to start: {}",
-            error.0
-        );
-        std::process::exit(1);
-    });
+    );
     let delivery_quarantine: Arc<dyn myelin_events::DurableDeliveryQuarantine> = Arc::new(
         myelin_storage::events_durable::DurableDeliveryQuarantineBacking::new(
             provider.db_pool().clone(),
