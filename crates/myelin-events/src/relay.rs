@@ -139,6 +139,9 @@ pub trait EventPublisher: Send + Sync {
 /// Unlike the legacy consumer methods on [`BusTransport`], failures are explicit so a production
 /// lifecycle can make readiness reflect whether it can currently receive and acknowledge work.
 pub trait EventConsumer: Send + Sync {
+    /// Server-side durable consumer name used as the quarantine owner key.
+    fn durable_name(&self) -> &str;
+
     /// Pull one bounded batch from the durable consumer.
     fn consume(
         &self,
@@ -146,32 +149,127 @@ pub trait EventConsumer: Send + Sync {
     ) -> std::result::Result<Vec<BrokerDelivery>, TransportError>;
 
     /// Explicitly acknowledge one terminal delivery.
-    fn ack(&self, consumer: &str, event_id: &EventId) -> std::result::Result<(), TransportError>;
+    fn ack(&self, token: DeliveryToken) -> std::result::Result<(), TransportError>;
 
     /// Negatively acknowledge a retryable delivery with a bounded server-side delay.
     fn retry(
         &self,
-        consumer: &str,
-        event_id: &EventId,
+        token: DeliveryToken,
         delay_secs: u64,
     ) -> std::result::Result<(), TransportError>;
 
     /// Stop broker redelivery after the application durably quarantined an exhausted retry.
     fn terminate(
         &self,
-        consumer: &str,
-        event_id: &EventId,
+        token: DeliveryToken,
     ) -> std::result::Result<(), TransportError>;
 }
 
-/// One durable broker delivery plus the server-observed delivery attempt count.
+/// Opaque process-local identity for one raw broker delivery handle. It is deliberately unrelated
+/// to `event_id`: duplicate ids and undecodable payloads must still settle independently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeliveryToken(pub u64);
+
+/// Stable, payload-free JetStream identity suitable for durable quarantine idempotency.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrokerDeliveryRef {
+    pub stream: String,
+    pub stream_sequence: u64,
+}
+
+/// Fixed transport poison classifications. Never carries raw bytes, subjects, tenant data, serde
+/// detail, or hashes derived from attacker-controlled input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryPoisonKind {
+    MalformedEnvelope,
+    SubjectMismatch,
+}
+
+impl DeliveryPoisonKind {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::MalformedEnvelope => "malformed_envelope",
+            Self::SubjectMismatch => "subject_mismatch",
+        }
+    }
+}
+
+/// One independently-classified item from a bounded broker pull.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrokerDeliveryBody {
+    Event(EventEnvelope),
+    Poison(DeliveryPoisonKind),
+    /// JetStream reply metadata could not be parsed or did not contain a positive attempt/ref.
+    /// There is no stable quarantine identity, so this item is NAK-only.
+    TransientMetadataFault,
+}
+
+/// One durable broker delivery plus its opaque settlement handle and stable metadata, when known.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrokerDelivery {
-    pub envelope: EventEnvelope,
+    pub token: DeliveryToken,
+    pub broker_ref: Option<BrokerDeliveryRef>,
+    pub body: BrokerDeliveryBody,
     /// One-based JetStream delivery count. The application retry ceiling uses this metadata;
     /// it is never inferred from volatile process state, so restarts do not reset the budget.
-    pub delivery_attempt: u64,
+    pub delivery_attempt: Option<u64>,
 }
+
+/// Fixed reason codes accepted by the durable delivery quarantine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryQuarantineReason {
+    MalformedEnvelope,
+    SubjectMismatch,
+    NoRegisteredConsumer,
+}
+
+impl DeliveryQuarantineReason {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::MalformedEnvelope => "malformed_envelope",
+            Self::SubjectMismatch => "subject_mismatch",
+            Self::NoRegisteredConsumer => "no_registered_consumer",
+        }
+    }
+}
+
+impl From<DeliveryPoisonKind> for DeliveryQuarantineReason {
+    fn from(value: DeliveryPoisonKind) -> Self {
+        match value {
+            DeliveryPoisonKind::MalformedEnvelope => Self::MalformedEnvelope,
+            DeliveryPoisonKind::SubjectMismatch => Self::SubjectMismatch,
+        }
+    }
+}
+
+/// Durable, idempotent, payload-free quarantine seam for terminal broker deliveries.
+pub trait DurableDeliveryQuarantine: Send + Sync {
+    fn record(
+        &self,
+        consumer: &str,
+        broker_ref: &BrokerDeliveryRef,
+        reason: DeliveryQuarantineReason,
+        delivery_attempt: u64,
+    ) -> Result<(), String>;
+}
+
+/// Foundation migration for payload-free consumer delivery quarantine. `0003` is already the
+/// outbox quarantine; this is the next forward-only foundation id.
+pub const CONSUMER_DELIVERY_QUARANTINE_MIGRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS consumer_delivery_quarantine (
+    consumer        TEXT NOT NULL,
+    stream          TEXT NOT NULL,
+    stream_sequence BIGINT NOT NULL,
+    reason_code     TEXT NOT NULL,
+    delivery_attempt BIGINT NOT NULL,
+    quarantined_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (consumer, stream, stream_sequence),
+    CONSTRAINT consumer_delivery_quarantine_sequence_positive CHECK (stream_sequence > 0),
+    CONSTRAINT consumer_delivery_quarantine_attempt_positive CHECK (delivery_attempt > 0),
+    CONSTRAINT consumer_delivery_quarantine_reason_fixed CHECK (
+        reason_code IN ('malformed_envelope', 'subject_mismatch', 'no_registered_consumer')
+    )
+);"#;
 
 impl<T: BusTransport + ?Sized> EventPublisher for T {
     fn publish(
@@ -736,6 +834,18 @@ impl OutboxStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumer_delivery_quarantine_migration_is_fixed_code_and_payload_free() {
+        let ddl = CONSUMER_DELIVERY_QUARANTINE_MIGRATION;
+        assert!(ddl.contains("PRIMARY KEY (consumer, stream, stream_sequence)"));
+        for code in ["malformed_envelope", "subject_mismatch", "no_registered_consumer"] {
+            assert!(ddl.contains(code));
+        }
+        for forbidden in ["payload ", "raw_payload", "raw_subject", "tenant ", "payload_hash"] {
+            assert!(!ddl.contains(forbidden), "forbidden quarantine column {forbidden}");
+        }
+    }
     use crate::outbox::{EmitContextBase, IdMinter, MonotonicMinter};
     use crate::{
         Actor, AggregateKey, CausedBy, DataRole, EventDraft, EventType, OutboxTx, Region, TenantId,

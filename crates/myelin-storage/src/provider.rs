@@ -213,6 +213,10 @@ pub fn foundation_migrations() -> Migrations {
             "0003_outbox_quarantine",
             myelin_events::OUTBOX_QUARANTINE_MIGRATION,
         ),
+        Migration::plain(
+            "0004_consumer_delivery_quarantine",
+            myelin_events::CONSUMER_DELIVERY_QUARANTINE_MIGRATION,
+        ),
     ])
 }
 

@@ -23,7 +23,8 @@
 //! `NatsJetStreamBus` holds a `tokio::runtime::Handle` and drives each op with `block_in_place`
 //! + `block_on` — the same bridge the storage S3/Valkey backings use.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use async_nats::jetstream::consumer::PullConsumer;
@@ -33,7 +34,10 @@ use async_nats::jetstream::stream::{
 use async_nats::jetstream::{self, AckKind, Context};
 use futures::StreamExt;
 
-use crate::relay::{BrokerDelivery, BusTransport, Delivery, EventPublisher, TransportError};
+use crate::relay::{
+    BrokerDelivery, BrokerDeliveryBody, BrokerDeliveryRef, BusTransport, Delivery,
+    DeliveryPoisonKind, DeliveryToken, EventPublisher, TransportError,
+};
 use crate::{ArtifactRef, EventEnvelope, EventId};
 
 /// Explicit capacity and durability policy for the shared production event stream.
@@ -362,6 +366,35 @@ fn event_subject(subject_root: &str, envelope: &EventEnvelope) -> Result<String,
     Ok(subject)
 }
 
+fn classify_delivery_body(
+    subject_root: &str,
+    actual_subject: &str,
+    payload: &[u8],
+) -> BrokerDeliveryBody {
+    match serde_json::from_slice::<EventEnvelope>(payload) {
+        Err(_) => BrokerDeliveryBody::Poison(DeliveryPoisonKind::MalformedEnvelope),
+        Ok(envelope) => match event_subject(subject_root, &envelope) {
+            Ok(expected) if actual_subject == expected => BrokerDeliveryBody::Event(envelope),
+            _ => BrokerDeliveryBody::Poison(DeliveryPoisonKind::SubjectMismatch),
+        },
+    }
+}
+
+fn allocate_delivery_token(sequence: &AtomicU64) -> DeliveryToken {
+    DeliveryToken(sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1))
+}
+
+fn retain_on_settlement_failure<T>(
+    pending: &Mutex<HashMap<DeliveryToken, T>>,
+    token: DeliveryToken,
+    retained: T,
+    result: &Result<(), TransportError>,
+) {
+    if result.is_err() {
+        pending.lock().unwrap_or_else(|e| e.into_inner()).insert(token, retained);
+    }
+}
+
 /// A capability-minimal production adapter for the elected shared-outbox relay.
 ///
 /// Construction provisions or validates the shared stream and creates no consumer. Its public
@@ -493,6 +526,49 @@ mod routing_tests {
             TransportError("event routing subject exceeds byte limit".into())
         );
     }
+
+    #[test]
+    fn mixed_malformed_valid_route_mismatch_valid_items_classify_independently() {
+        let first = envelope();
+        let mut second = envelope();
+        second.event_id = EventId("01JROUTINGTEST2".into());
+        let valid_subject = event_subject("root", &first).unwrap();
+        let bodies = [
+            classify_delivery_body("root", &valid_subject, b"ATTACKER_SENTINEL not json"),
+            classify_delivery_body(
+                "root", &valid_subject, &serde_json::to_vec(&first).unwrap(),
+            ),
+            classify_delivery_body(
+                "root", "root.evt.other.route", &serde_json::to_vec(&first).unwrap(),
+            ),
+            classify_delivery_body(
+                "root", &valid_subject, &serde_json::to_vec(&second).unwrap(),
+            ),
+        ];
+        assert!(matches!(bodies[0], BrokerDeliveryBody::Poison(DeliveryPoisonKind::MalformedEnvelope)));
+        assert!(matches!(bodies[1], BrokerDeliveryBody::Event(_)));
+        assert!(matches!(bodies[2], BrokerDeliveryBody::Poison(DeliveryPoisonKind::SubjectMismatch)));
+        assert!(matches!(bodies[3], BrokerDeliveryBody::Event(_)));
+    }
+
+    #[test]
+    fn duplicate_event_ids_still_receive_distinct_opaque_settlement_tokens() {
+        let sequence = AtomicU64::new(0);
+        let first = allocate_delivery_token(&sequence);
+        let second = allocate_delivery_token(&sequence);
+        assert_ne!(first, second);
+        let pending = HashMap::from([(first, "handle-a"), (second, "handle-b")]);
+        assert_eq!(pending.len(), 2, "duplicate payload identity cannot collide handles");
+    }
+
+    #[test]
+    fn settlement_failure_reinserts_the_exact_token_handle() {
+        let token = DeliveryToken(7);
+        let pending = Mutex::new(HashMap::new());
+        let failure = Err(TransportError("fixed settlement failure".into()));
+        retain_on_settlement_failure(&pending, token, "raw-handle", &failure);
+        assert_eq!(pending.lock().unwrap().get(&token), Some(&"raw-handle"));
+    }
 }
 
 /// The [`BusTransport`] backed by a real NATS JetStream stream + durable PULL consumer.
@@ -504,10 +580,13 @@ pub struct NatsJetStreamBus {
     max_batch: usize,
     max_expires: std::time::Duration,
     rt: tokio::runtime::Handle,
-    /// Ack handles for messages delivered by [`BusTransport::consume`] but not yet acked, keyed
-    /// by `event_id` so [`BusTransport::ack`] acks EXACTLY the delivered message. Behind a Mutex
-    /// because the sync trait has `&self`.
-    pending: Mutex<HashMap<String, jetstream::Message>>,
+    /// Raw handles are keyed only by opaque process-local delivery token. Event ids are payload
+    /// data and cannot identify malformed messages or distinguish duplicate-id deliveries.
+    pending: Mutex<HashMap<DeliveryToken, jetstream::Message>>,
+    next_delivery_token: AtomicU64,
+    /// Compatibility lookup for the legacy `BusTransport` surface. The production
+    /// [`crate::relay::EventConsumer`] path settles directly by token.
+    legacy_tokens: Mutex<HashMap<String, VecDeque<DeliveryToken>>>,
 }
 
 impl NatsJetStreamBus {
@@ -605,6 +684,8 @@ impl NatsJetStreamBus {
             max_expires: config.max_expires,
             rt,
             pending: Mutex::new(HashMap::new()),
+            next_delivery_token: AtomicU64::new(0),
+            legacy_tokens: Mutex::new(HashMap::new()),
         })
     }
 
@@ -656,90 +737,94 @@ impl NatsJetStreamBus {
         })?;
 
         let mut decoded = Vec::with_capacity(msgs.len());
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         for msg in msgs {
-            let envelope = serde_json::from_slice::<EventEnvelope>(&msg.payload)
-                .map_err(|e| TransportError(format!("decode event envelope: {e}")))?;
-            let expected_subject = self.subject_for(&envelope)?;
-            if msg.subject.as_str() != expected_subject {
-                return Err(TransportError(format!(
-                    "broker subject {} disagrees with envelope route {}",
-                    msg.subject, expected_subject
-                )));
-            }
-            let delivery_attempt = msg
-                .info()
-                .map_err(|e| TransportError(format!("read JetStream delivery metadata: {e}")))?
-                .delivered;
-            let delivery_attempt = u64::try_from(delivery_attempt)
-                .ok()
-                .filter(|attempt| *attempt > 0)
-                .ok_or_else(|| TransportError("invalid JetStream delivery attempt count".into()))?;
-            pending.insert(envelope.event_id.0.clone(), msg);
+            let token = allocate_delivery_token(&self.next_delivery_token);
+            let classify = msg.clone();
+            // Insert the raw handle before any fallible metadata/decode/routing operation.
+            self.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(token, msg);
+
+            let metadata = classify.info().ok().and_then(|info| {
+                let delivery_attempt = u64::try_from(info.delivered).ok().filter(|n| *n > 0)?;
+                (info.stream_sequence > 0).then(|| {
+                    (
+                        BrokerDeliveryRef {
+                            stream: info.stream.to_string(),
+                            stream_sequence: info.stream_sequence,
+                        },
+                        delivery_attempt,
+                    )
+                })
+            });
+            let Some((broker_ref, delivery_attempt)) = metadata else {
+                decoded.push(BrokerDelivery {
+                    token,
+                    broker_ref: None,
+                    body: BrokerDeliveryBody::TransientMetadataFault,
+                    delivery_attempt: None,
+                });
+                continue;
+            };
+            let body = classify_delivery_body(
+                &self.subject_root,
+                classify.subject.as_str(),
+                &classify.payload,
+            );
             decoded.push(BrokerDelivery {
-                envelope,
-                delivery_attempt,
+                token,
+                broker_ref: Some(broker_ref),
+                body,
+                delivery_attempt: Some(delivery_attempt),
             });
         }
         Ok(decoded)
     }
 
-    fn try_ack(&self, event_id: &EventId) -> Result<(), TransportError> {
-        let msg = {
-            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.remove(&event_id.0)
-        }
-        .ok_or_else(|| {
-            TransportError(format!(
-                "no pending JetStream delivery for event {}",
-                event_id.0
-            ))
-        })?;
-        self.block(async {
+    fn take_pending(&self, token: DeliveryToken) -> Result<jetstream::Message, TransportError> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&token)
+            .ok_or_else(|| TransportError("no pending JetStream delivery for token".into()))
+    }
+
+    fn try_ack(&self, token: DeliveryToken) -> Result<(), TransportError> {
+        let msg = self.take_pending(token)?;
+        let retained = msg.clone();
+        let result = self.block(async {
             // Wait for the JetStream acknowledgement-of-ack before reporting success. A plain
-            // publish-only ack can be lost if the process exits immediately after this method,
-            // causing an already-completed business effect to be redelivered after restart.
-            msg.double_ack()
-                .await
-                .map_err(|e| TransportError(format!("ack event {}: {e}", event_id.0)))
-        })
+            // publish-only ack can be lost if the process exits immediately after this method.
+            msg.double_ack().await.map_err(|_| TransportError("broker ACK failed".into()))
+        });
+        retain_on_settlement_failure(&self.pending, token, retained, &result);
+        result
     }
 
-    fn try_retry(&self, event_id: &EventId, delay_secs: u64) -> Result<(), TransportError> {
-        let msg = {
-            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.remove(&event_id.0)
-        }
-        .ok_or_else(|| {
-            TransportError(format!(
-                "no pending JetStream delivery for event {}",
-                event_id.0
-            ))
-        })?;
+    fn try_retry(&self, token: DeliveryToken, delay_secs: u64) -> Result<(), TransportError> {
+        let msg = self.take_pending(token)?;
+        let retained = msg.clone();
         let delay = std::time::Duration::from_secs(delay_secs.clamp(1, 300));
-        self.block(async {
-            msg.ack_with(AckKind::Nak(Some(delay)))
-                .await
-                .map_err(|e| TransportError(format!("NAK event {}: {e}", event_id.0)))
-        })
+        let result = self.block(async {
+            msg.ack_with(AckKind::Nak(Some(delay))).await
+                .map_err(|_| TransportError("broker NAK failed".into()))
+        });
+        retain_on_settlement_failure(&self.pending, token, retained, &result);
+        result
     }
 
-    fn try_terminate(&self, event_id: &EventId) -> Result<(), TransportError> {
+    fn try_terminate(&self, token: DeliveryToken) -> Result<(), TransportError> {
+        let msg = self.take_pending(token)?;
+        let retained = msg.clone();
+        let result = self.block(async {
+            msg.ack_with(AckKind::Term).await
+                .map_err(|_| TransportError("broker TERM failed".into()))
+        });
+        retain_on_settlement_failure(&self.pending, token, retained, &result);
+        result
+    }
+
+    fn legacy_token(&self, event_id: &EventId) -> Result<DeliveryToken, TransportError> {
         let msg = {
-            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.remove(&event_id.0)
-        }
-        .ok_or_else(|| {
-            TransportError(format!(
-                "no pending JetStream delivery for event {}",
-                event_id.0
-            ))
-        })?;
-        self.block(async {
-            msg.ack_with(AckKind::Term)
-                .await
-                .map_err(|e| TransportError(format!("TERM event {}: {e}", event_id.0)))
-        })
+            let mut legacy = self.legacy_tokens.lock().unwrap_or_else(|e| e.into_inner());
+            legacy.get_mut(&event_id.0).and_then(VecDeque::pop_front)
+        };
+        msg.ok_or_else(|| TransportError("no legacy delivery token for event".into()))
     }
 }
 
@@ -919,14 +1004,39 @@ impl BusTransport for NatsJetStreamBus {
         self.try_consume()
             .unwrap_or_default()
             .into_iter()
-            .map(|delivery| delivery.envelope)
+            .filter_map(|delivery| match delivery.body {
+                BrokerDeliveryBody::Event(envelope) => {
+                    self.legacy_tokens
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .entry(envelope.event_id.0.clone())
+                        .or_default()
+                        .push_back(delivery.token);
+                    Some(envelope)
+                }
+                BrokerDeliveryBody::Poison(_) | BrokerDeliveryBody::TransientMetadataFault => {
+                    // Legacy consumers have no quarantine seam. NAK independently instead of
+                    // silently leaking the raw handle or discarding valid siblings.
+                    let _ = self.try_retry(delivery.token, 1);
+                    None
+                }
+            })
             .collect()
     }
 
     fn ack(&self, _consumer: &str, event_id: &EventId) {
         // Explicit ack of the delivered message stashed by `consume` (at-least-once → the ack is
         // what makes it not redeliver). Acking an un-consumed / already-acked id is a no-op.
-        let _ = self.try_ack(event_id);
+        if let Ok(token) = self.legacy_token(event_id) {
+            if self.try_ack(token).is_err() {
+                self.legacy_tokens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(event_id.0.clone())
+                    .or_default()
+                    .push_front(token);
+            }
+        }
     }
 
     fn purge(&self) {
@@ -943,28 +1053,35 @@ impl BusTransport for NatsJetStreamBus {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.legacy_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
 impl crate::relay::EventConsumer for NatsJetStreamBus {
+    fn durable_name(&self) -> &str {
+        &self.consumer_name
+    }
+
     fn consume(&self, _subject_prefix: &str) -> Result<Vec<BrokerDelivery>, TransportError> {
         self.try_consume()
     }
 
-    fn ack(&self, _consumer: &str, event_id: &EventId) -> Result<(), TransportError> {
-        self.try_ack(event_id)
+    fn ack(&self, token: DeliveryToken) -> Result<(), TransportError> {
+        self.try_ack(token)
     }
 
     fn retry(
         &self,
-        _consumer: &str,
-        event_id: &EventId,
+        token: DeliveryToken,
         delay_secs: u64,
     ) -> Result<(), TransportError> {
-        self.try_retry(event_id, delay_secs)
+        self.try_retry(token, delay_secs)
     }
 
-    fn terminate(&self, _consumer: &str, event_id: &EventId) -> Result<(), TransportError> {
-        self.try_terminate(event_id)
+    fn terminate(&self, token: DeliveryToken) -> Result<(), TransportError> {
+        self.try_terminate(token)
     }
 }

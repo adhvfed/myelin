@@ -101,6 +101,7 @@ use myelin_substrate::{
     boot, serve, AppSpec, Config, ConsumerReg, CriticalDependencies, InternalRpc, OutboxSpec,
     PublicRoutes, ServeError, ServeHandle, StoreManifest,
 };
+use std::sync::Arc;
 
 pub use migrations::{dispatch_migrations, CONSUMER_DEDUP_TABLE, CREATE_CONSUMER_DEDUP_DDL};
 
@@ -237,9 +238,11 @@ pub fn dispatch_app_spec_with_intake(
     outbox: myelin_events::OutboxStore,
     consumers: Vec<ConsumerReg>,
     intake: Box<dyn myelin_events::EventConsumer>,
+    delivery_quarantine: Arc<dyn myelin_events::DurableDeliveryQuarantine>,
 ) -> AppSpec {
     let mut spec = dispatch_app_spec(config, outbox.clone(), consumers);
-    spec.outbox = OutboxSpec::external_relay_with_consumer(outbox, intake);
+    spec.outbox =
+        OutboxSpec::external_relay_with_consumer(outbox, intake, delivery_quarantine);
     spec
 }
 
@@ -273,13 +276,20 @@ pub async fn run_dispatch_until_shutdown<F>(
     outbox: myelin_events::OutboxStore,
     consumers: Vec<ConsumerReg>,
     intake: Box<dyn myelin_events::EventConsumer>,
+    delivery_quarantine: Arc<dyn myelin_events::DurableDeliveryQuarantine>,
     shutdown: F,
 ) -> Result<(), ServeError>
 where
     F: std::future::Future<Output = ()>,
 {
     myelin_substrate::serve_until_shutdown(
-        dispatch_app_spec_with_intake(config, outbox, consumers, intake),
+        dispatch_app_spec_with_intake(
+            config,
+            outbox,
+            consumers,
+            intake,
+            delivery_quarantine,
+        ),
         shutdown,
     )
     .await

@@ -75,7 +75,8 @@ use myelin_events::relay::{BusTransport, EventConsumer};
 #[cfg(any(test, feature = "test-support"))]
 use myelin_events::relay::InProcessBus;
 use myelin_events::{
-    Consumer, ConsumerName, Delivered, EventHandler, Message, OutboxStore, Relay, Timestamp,
+    BrokerDeliveryBody, Consumer, ConsumerName, Delivered, DeliveryQuarantineReason,
+    DeliveryToken, DurableDeliveryQuarantine, EventHandler, Message, OutboxStore, Relay, Timestamp,
 };
 use myelin_storage::{OltpConfig, OltpPool, OltpStoreHolder};
 use std::collections::BTreeMap;
@@ -92,6 +93,7 @@ pub struct OutboxSpec {
     store: OutboxStore,
     transport: Option<Box<dyn BusTransport>>,
     consumer_transport: Option<Box<dyn EventConsumer>>,
+    delivery_quarantine: Option<Arc<dyn DurableDeliveryQuarantine>>,
 }
 
 impl OutboxSpec {
@@ -108,6 +110,7 @@ impl OutboxSpec {
             store: OutboxStore::new(),
             transport: Some(Box::new(InProcessBus::new())),
             consumer_transport: None,
+            delivery_quarantine: None,
         }
     }
 
@@ -117,6 +120,7 @@ impl OutboxSpec {
             store,
             transport: Some(Box::new(transport)),
             consumer_transport: None,
+            delivery_quarantine: None,
         }
     }
 
@@ -135,6 +139,7 @@ impl OutboxSpec {
             store,
             transport: Some(transport),
             consumer_transport: None,
+            delivery_quarantine: None,
         }
     }
 
@@ -149,6 +154,7 @@ impl OutboxSpec {
             store,
             transport: None,
             consumer_transport: None,
+            delivery_quarantine: None,
         }
     }
 
@@ -158,11 +164,13 @@ impl OutboxSpec {
     pub fn external_relay_with_consumer(
         store: OutboxStore,
         consumer_transport: Box<dyn EventConsumer>,
+        delivery_quarantine: Arc<dyn DurableDeliveryQuarantine>,
     ) -> OutboxSpec {
         OutboxSpec {
             store,
             transport: None,
             consumer_transport: Some(consumer_transport),
+            delivery_quarantine: Some(delivery_quarantine),
         }
     }
 
@@ -557,6 +565,7 @@ pub struct ServeHandle {
     outbox: OutboxStore,
     relay: Option<Relay<RelayTransport>>,
     consumer_transport: Option<Box<dyn EventConsumer>>,
+    delivery_quarantine: Option<Arc<dyn DurableDeliveryQuarantine>>,
     consumers: Vec<ConsumerReg>,
     holders: HolderRegistry,
     /// The full store manifest (implicit OLTP + the service's declared stores) the
@@ -579,6 +588,52 @@ type RelayTransport = Box<dyn BusTransport>;
 pub const MAX_CONSUMER_DELIVERIES: u64 = 20;
 
 impl ServeHandle {
+    fn settle_retry(&self, token: DeliveryToken, delay_secs: u64) {
+        if let Some(transport) = &self.consumer_transport {
+            if transport.retry(token, delay_secs.min(300)).is_err() {
+                self.health_probe().mark_down("broker");
+            } else {
+                self.health_probe().mark_up("broker");
+            }
+        }
+    }
+
+    /// Persist a fixed-code, payload-free quarantine reference before TERM. On OLTP failure only
+    /// this delivery is NAKed; the caller continues processing valid siblings in the same batch.
+    fn quarantine_then_terminate(
+        &self,
+        token: DeliveryToken,
+        broker_ref: &myelin_events::BrokerDeliveryRef,
+        delivery_attempt: u64,
+        reason: DeliveryQuarantineReason,
+    ) {
+        let Some(transport) = &self.consumer_transport else { return };
+        let Some(quarantine) = &self.delivery_quarantine else {
+            self.health_probe().mark_down("oltp");
+            self.settle_retry(token, 1);
+            return;
+        };
+        if quarantine
+            .record(
+                transport.durable_name(),
+                broker_ref,
+                reason,
+                delivery_attempt,
+            )
+            .is_err()
+        {
+            self.health_probe().mark_down("oltp");
+            self.settle_retry(token, 1);
+            return;
+        }
+        self.health_probe().mark_up("oltp");
+        if transport.terminate(token).is_err() {
+            self.health_probe().mark_down("broker");
+        } else {
+            self.health_probe().mark_up("broker");
+        }
+    }
+
     /// The booted service name.
     pub fn name(&self) -> &'static str {
         self.name
@@ -696,8 +751,10 @@ impl ServeHandle {
                 .consume("")
                 .into_iter()
                 .map(|envelope| myelin_events::BrokerDelivery {
-                    envelope,
-                    delivery_attempt: 1,
+                    token: DeliveryToken(0),
+                    broker_ref: None,
+                    body: BrokerDeliveryBody::Event(envelope),
+                    delivery_attempt: Some(1),
                 })
                 .collect()
         } else {
@@ -711,7 +768,38 @@ impl ServeHandle {
             .map(|consumer| (consumer.name(), 0))
             .collect();
         for delivery in batch {
-            let env = delivery.envelope;
+            let token = delivery.token;
+            let delivery_attempt = delivery.delivery_attempt;
+            let broker_ref = delivery.broker_ref;
+            let env = match delivery.body {
+                BrokerDeliveryBody::TransientMetadataFault => {
+                    self.settle_retry(token, 1);
+                    continue;
+                }
+                BrokerDeliveryBody::Poison(kind) => {
+                    if let (Some(broker_ref), Some(delivery_attempt)) =
+                        (broker_ref.as_ref(), delivery_attempt)
+                    {
+                        self.quarantine_then_terminate(
+                            token,
+                            broker_ref,
+                            delivery_attempt,
+                            kind.into(),
+                        );
+                    } else {
+                        self.settle_retry(token, 1);
+                    }
+                    continue;
+                }
+                BrokerDeliveryBody::Event(envelope) => envelope,
+            };
+            if self.consumer_transport.is_some()
+                && (delivery_attempt.is_none() || broker_ref.is_none())
+            {
+                self.settle_retry(token, 1);
+                continue;
+            }
+            let delivery_attempt = delivery_attempt.unwrap_or(1);
             let matching: Vec<usize> = self
                 .consumers
                 .iter()
@@ -719,11 +807,16 @@ impl ServeHandle {
                 .filter_map(|(index, consumer)| consumer.accepts(&env.subject.0).then_some(index))
                 .collect();
             if matching.is_empty() {
-                eprintln!(
-                    "[{}] broker delivered event {} with no registered subject match",
-                    self.name, env.event_id.0
-                );
-                self.health_probe().mark_down("broker");
+                if let Some(broker_ref) = broker_ref.as_ref() {
+                    self.quarantine_then_terminate(
+                        token,
+                        broker_ref,
+                        delivery_attempt,
+                        DeliveryQuarantineReason::NoRegisteredConsumer,
+                    );
+                } else if self.consumer_transport.is_some() {
+                    self.settle_retry(token, 1);
+                }
                 continue;
             }
 
@@ -736,14 +829,14 @@ impl ServeHandle {
                     subject: env.subject.0.clone(),
                     envelope: env.clone(),
                 };
-                let retry_budget_already_exhausted = delivery.delivery_attempt
+                let retry_budget_already_exhausted = delivery_attempt
                     > MAX_CONSUMER_DELIVERIES
                     && !self.consumers[index].is_handled(&env.event_id);
                 let outcome = if retry_budget_already_exhausted {
                     // A prior attempt already ran the handler and exhausted its budget. Retry only
                     // the durable quarantine write; never execute the failing handler again.
                     self.consumers[index]
-                        .dead_letter_exhausted_retry(&msg, delivery.delivery_attempt)
+                        .dead_letter_exhausted_retry(&msg, delivery_attempt)
                 } else {
                     self.consumers[index].deliver(&msg)
                 };
@@ -755,9 +848,9 @@ impl ServeHandle {
                         }
                     }
                     Delivered::Retried(delay_secs) => {
-                        if delivery.delivery_attempt >= MAX_CONSUMER_DELIVERIES {
+                        if delivery_attempt >= MAX_CONSUMER_DELIVERIES {
                             match self.consumers[index]
-                                .dead_letter_exhausted_retry(&msg, delivery.delivery_attempt)
+                                .dead_letter_exhausted_retry(&msg, delivery_attempt)
                             {
                                 Delivered::DeadLettered(_) => exhausted = true,
                                 Delivered::Retried(dlq_retry_secs) => {
@@ -787,9 +880,9 @@ impl ServeHandle {
             if terminal {
                 if let Some(transport) = &self.consumer_transport {
                     let result = if exhausted {
-                        transport.terminate(&consumer_name.0, &env.event_id)
+                        transport.terminate(token)
                     } else {
-                        transport.ack(&consumer_name.0, &env.event_id)
+                        transport.ack(token)
                     };
                     if let Err(error) = result {
                         eprintln!(
@@ -806,8 +899,7 @@ impl ServeHandle {
             } else if let (Some(transport), Some(delay_secs)) =
                 (&self.consumer_transport, retry_after_secs)
             {
-                if let Err(error) =
-                    transport.retry(&consumer_name.0, &env.event_id, delay_secs.min(300))
+                if let Err(error) = transport.retry(token, delay_secs.min(300))
                 {
                     eprintln!(
                         "[{}] broker retry NAK failed for event {}: {}",
@@ -902,6 +994,10 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
             "0003_outbox_quarantine",
             myelin_events::OUTBOX_QUARANTINE_MIGRATION,
         ),
+        Migration::plain(
+            "0004_consumer_delivery_quarantine",
+            myelin_events::CONSUMER_DELIVERY_QUARANTINE_MIGRATION,
+        ),
     ]);
     full_migrations.0.extend(migrations.0);
     runner.run(&full_migrations, &hot_tables)?;
@@ -944,11 +1040,17 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
         store: outbox_store,
         transport,
         consumer_transport,
+        delivery_quarantine,
     } = outbox;
     if transport.is_none() && consumer_transport.is_none() && !consumers.is_empty() {
         return Err(ServeError(format!(
             "service {name} registered consumers without a consumer transport; external-relay \
              producer mode cannot consume"
+        )));
+    }
+    if consumer_transport.is_some() && delivery_quarantine.is_none() {
+        return Err(ServeError(format!(
+            "service {name} configured external consumer transport without durable delivery quarantine"
         )));
     }
     let relay = transport.map(|transport| {
@@ -984,6 +1086,7 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
         outbox: outbox_store,
         relay,
         consumer_transport,
+        delivery_quarantine,
         consumers,
         holders: holder_registry,
         manifest: full_manifest,
@@ -1158,14 +1261,15 @@ mod tests {
     struct PullProbeState {
         batches: VecDeque<Vec<myelin_events::BrokerDelivery>>,
         pulls: usize,
-        acks: Vec<EventId>,
-        retries: Vec<EventId>,
-        terms: Vec<EventId>,
+        acks: Vec<DeliveryToken>,
+        retries: Vec<DeliveryToken>,
+        terms: Vec<DeliveryToken>,
         fail_ack: bool,
     }
 
     impl PullProbe {
         fn with_batches(batches: impl IntoIterator<Item = Vec<EventEnvelope>>) -> Self {
+            let mut next_token = 0_u64;
             Self {
                 state: Arc::new(Mutex::new(PullProbeState {
                     batches: batches
@@ -1173,9 +1277,17 @@ mod tests {
                         .map(|batch| {
                             batch
                                 .into_iter()
-                                .map(|envelope| myelin_events::BrokerDelivery {
-                                    envelope,
-                                    delivery_attempt: 1,
+                                .map(|envelope| {
+                                    next_token += 1;
+                                    myelin_events::BrokerDelivery {
+                                    token: DeliveryToken(next_token),
+                                    broker_ref: Some(myelin_events::BrokerDeliveryRef {
+                                        stream: "TEST".into(),
+                                        stream_sequence: next_token,
+                                    }),
+                                    body: BrokerDeliveryBody::Event(envelope),
+                                    delivery_attempt: Some(1),
+                                }
                                 })
                                 .collect()
                         })
@@ -1193,8 +1305,13 @@ mod tests {
             Self {
                 state: Arc::new(Mutex::new(PullProbeState {
                     batches: [vec![myelin_events::BrokerDelivery {
-                        envelope,
-                        delivery_attempt,
+                        token: DeliveryToken(1),
+                        broker_ref: Some(myelin_events::BrokerDeliveryRef {
+                            stream: "TEST".into(),
+                            stream_sequence: 1,
+                        }),
+                        body: BrokerDeliveryBody::Event(envelope),
+                        delivery_attempt: Some(delivery_attempt),
                     }]]
                     .into_iter()
                     .collect(),
@@ -1205,6 +1322,10 @@ mod tests {
     }
 
     impl EventConsumer for PullProbe {
+        fn durable_name(&self) -> &str {
+            "test-durable"
+        }
+
         fn consume(
             &self,
             _subject_prefix: &str,
@@ -1216,33 +1337,55 @@ mod tests {
 
         fn ack(
             &self,
-            _consumer: &str,
-            event_id: &EventId,
+            token: DeliveryToken,
         ) -> Result<(), myelin_events::TransportError> {
             let mut state = self.state();
             if state.fail_ack {
                 return Err(myelin_events::TransportError("ack unavailable".into()));
             }
-            state.acks.push(event_id.clone());
+            state.acks.push(token);
             Ok(())
         }
 
         fn retry(
             &self,
-            _consumer: &str,
-            event_id: &EventId,
+            token: DeliveryToken,
             _delay_secs: u64,
         ) -> Result<(), myelin_events::TransportError> {
-            self.state().retries.push(event_id.clone());
+            self.state().retries.push(token);
             Ok(())
         }
 
         fn terminate(
             &self,
-            _consumer: &str,
-            event_id: &EventId,
+            token: DeliveryToken,
         ) -> Result<(), myelin_events::TransportError> {
-            self.state().terms.push(event_id.clone());
+            self.state().terms.push(token);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct QuarantineProbe {
+        records: Arc<Mutex<Vec<(myelin_events::BrokerDeliveryRef, DeliveryQuarantineReason)>>>,
+        fail_next: Arc<AtomicBool>,
+    }
+
+    impl DurableDeliveryQuarantine for QuarantineProbe {
+        fn record(
+            &self,
+            _consumer: &str,
+            broker_ref: &myelin_events::BrokerDeliveryRef,
+            reason: DeliveryQuarantineReason,
+            _delivery_attempt: u64,
+        ) -> Result<(), String> {
+            if self.fail_next.swap(false, Ordering::SeqCst) {
+                return Err("injected quarantine failure".into());
+            }
+            self.records
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push((broker_ref.clone(), reason));
             Ok(())
         }
     }
@@ -1359,10 +1502,20 @@ mod tests {
     }
 
     fn external_consumer_spec(probe: PullProbe, consumers: Vec<ConsumerReg>) -> AppSpec {
+        external_consumer_spec_with_quarantine(probe, consumers, Arc::new(QuarantineProbe::default()))
+    }
+
+    fn external_consumer_spec_with_quarantine(
+        probe: PullProbe,
+        consumers: Vec<ConsumerReg>,
+        quarantine: Arc<dyn DurableDeliveryQuarantine>,
+    ) -> AppSpec {
         let mut spec = AppSpec::minimal(
             "external-consumer",
             Config::default(),
-            OutboxSpec::external_relay_with_consumer(OutboxStore::new(), Box::new(probe)),
+            OutboxSpec::external_relay_with_consumer(
+                OutboxStore::new(), Box::new(probe), quarantine,
+            ),
         );
         spec.consumers = consumers;
         spec.critical = CriticalDependencies::new(["broker"]);
@@ -1555,25 +1708,130 @@ mod tests {
     }
 
     #[test]
-    fn external_intake_leaves_unmatched_delivery_unacked_and_not_ready() {
+    fn external_intake_quarantines_and_terms_unmatched_delivery() {
         let event = event_for_transport();
         let probe = PullProbe::with_batches([vec![event]]);
-        let handle = boot(external_consumer_spec(
+        let quarantine = Arc::new(QuarantineProbe::default());
+        let handle = boot(external_consumer_spec_with_quarantine(
             probe.clone(),
             vec![consumer_named("other", "myelin://acme/chat/", false)],
+            quarantine.clone(),
         ))
         .unwrap();
 
         handle.tick();
 
         assert!(probe.state().acks.is_empty());
-        assert!(!handle.metrics_health().readiness().is_ready());
+        assert_eq!(probe.state().terms, vec![DeliveryToken(1)]);
+        assert_eq!(
+            quarantine.records.lock().unwrap()[0].1,
+            DeliveryQuarantineReason::NoRegisteredConsumer
+        );
+        assert!(handle.metrics_health().readiness().is_ready());
+    }
+
+    #[test]
+    fn transport_poison_does_not_discard_a_valid_sibling() {
+        let event = event_for_transport();
+        let probe = PullProbe::default();
+        probe.state().batches.push_back(vec![
+            myelin_events::BrokerDelivery {
+                token: DeliveryToken(1),
+                broker_ref: Some(myelin_events::BrokerDeliveryRef {
+                    stream: "TEST".into(), stream_sequence: 1,
+                }),
+                body: BrokerDeliveryBody::Poison(
+                    myelin_events::DeliveryPoisonKind::MalformedEnvelope,
+                ),
+                delivery_attempt: Some(1),
+            },
+            myelin_events::BrokerDelivery {
+                token: DeliveryToken(2),
+                broker_ref: Some(myelin_events::BrokerDeliveryRef {
+                    stream: "TEST".into(), stream_sequence: 2,
+                }),
+                body: BrokerDeliveryBody::Event(event),
+                delivery_attempt: Some(1),
+            },
+        ]);
+        let quarantine = Arc::new(QuarantineProbe::default());
+        let (consumer, runs) = hello_consumer(DedupLedger::new());
+        let handle = boot(external_consumer_spec_with_quarantine(
+            probe.clone(), vec![consumer], quarantine.clone(),
+        )).unwrap();
+
+        handle.tick();
+
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.state().terms, vec![DeliveryToken(1)]);
+        assert_eq!(probe.state().acks, vec![DeliveryToken(2)]);
+        assert_eq!(quarantine.records.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn quarantine_failure_naks_only_poison_while_valid_sibling_acks() {
+        let event = event_for_transport();
+        let probe = PullProbe::default();
+        probe.state().batches.push_back(vec![
+            myelin_events::BrokerDelivery {
+                token: DeliveryToken(1),
+                broker_ref: Some(myelin_events::BrokerDeliveryRef {
+                    stream: "TEST".into(), stream_sequence: 1,
+                }),
+                body: BrokerDeliveryBody::Poison(
+                    myelin_events::DeliveryPoisonKind::SubjectMismatch,
+                ),
+                delivery_attempt: Some(1),
+            },
+            myelin_events::BrokerDelivery {
+                token: DeliveryToken(2),
+                broker_ref: Some(myelin_events::BrokerDeliveryRef {
+                    stream: "TEST".into(), stream_sequence: 2,
+                }),
+                body: BrokerDeliveryBody::Event(event),
+                delivery_attempt: Some(1),
+            },
+        ]);
+        let quarantine = Arc::new(QuarantineProbe::default());
+        quarantine.fail_next.store(true, Ordering::SeqCst);
+        let (consumer, runs) = hello_consumer(DedupLedger::new());
+        let handle = boot(external_consumer_spec_with_quarantine(
+            probe.clone(), vec![consumer], quarantine,
+        )).unwrap();
+
+        handle.tick();
+
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.state().retries, vec![DeliveryToken(1)]);
+        assert_eq!(probe.state().acks, vec![DeliveryToken(2)]);
+        assert!(probe.state().terms.is_empty());
+        assert!(!handle.metrics_health().readiness().is_ready(), "OLTP failure is unhealthy");
+    }
+
+    #[test]
+    fn transient_metadata_fault_is_nak_only_and_never_quarantined() {
+        let probe = PullProbe::default();
+        probe.state().batches.push_back(vec![myelin_events::BrokerDelivery {
+            token: DeliveryToken(9),
+            broker_ref: None,
+            body: BrokerDeliveryBody::TransientMetadataFault,
+            delivery_attempt: None,
+        }]);
+        let quarantine = Arc::new(QuarantineProbe::default());
+        let handle = boot(external_consumer_spec_with_quarantine(
+            probe.clone(), Vec::new(), quarantine.clone(),
+        )).unwrap();
+
+        handle.tick();
+
+        assert_eq!(probe.state().retries, vec![DeliveryToken(9)]);
+        assert!(probe.state().terms.is_empty());
+        assert!(quarantine.records.lock().unwrap().is_empty());
     }
 
     #[test]
     fn external_intake_acks_only_after_every_matching_consumer_is_terminal() {
         let event = event_for_transport();
-        let event_id = event.event_id.clone();
         let probe = PullProbe::with_batches([vec![event.clone()], vec![event]]);
         let handle = boot(external_consumer_spec(
             probe.clone(),
@@ -1589,10 +1847,10 @@ mod tests {
             probe.state().acks.is_empty(),
             "one Retry gates the broker ack"
         );
-        assert_eq!(probe.state().retries, vec![event_id.clone()]);
+        assert_eq!(probe.state().retries, vec![DeliveryToken(1)]);
 
         handle.tick();
-        assert_eq!(probe.state().acks, vec![event_id]);
+        assert_eq!(probe.state().acks, vec![DeliveryToken(2)]);
     }
 
     #[test]
@@ -1633,7 +1891,7 @@ mod tests {
             .clone();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].event_id, event_id);
-        assert_eq!(probe.state().terms, vec![event_id.clone()]);
+        assert_eq!(probe.state().terms, vec![DeliveryToken(1)]);
         assert!(probe.state().acks.is_empty());
         assert_eq!(dedup.len(), 0, "retry exhaustion writes no dedup tombstone");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1675,14 +1933,18 @@ mod tests {
     #[test]
     fn exhausted_retry_naks_when_durable_dlq_write_fails() {
         let event = event_for_transport();
-        let event_id = event.event_id.clone();
         let probe = PullProbe::with_delivery(event.clone(), MAX_CONSUMER_DELIVERIES);
         probe
             .state()
             .batches
             .push_back(vec![myelin_events::BrokerDelivery {
-                envelope: event,
-                delivery_attempt: MAX_CONSUMER_DELIVERIES + 1,
+                token: DeliveryToken(2),
+                broker_ref: Some(myelin_events::BrokerDeliveryRef {
+                    stream: "TEST".into(),
+                    stream_sequence: 2,
+                }),
+                body: BrokerDeliveryBody::Event(event),
+                delivery_attempt: Some(MAX_CONSUMER_DELIVERIES + 1),
             }]);
         let dlq = DlqProbe::default();
         dlq.fail_next.store(1, Ordering::SeqCst);
@@ -1696,12 +1958,12 @@ mod tests {
         handle.tick();
 
         assert!(probe.state().terms.is_empty());
-        assert_eq!(probe.state().retries, vec![event_id.clone()]);
+        assert_eq!(probe.state().retries, vec![DeliveryToken(1)]);
         assert_eq!(handle.telemetry().consumer_lag("retrying"), Some(1));
 
         handle.tick();
 
-        assert_eq!(probe.state().terms, vec![event_id]);
+        assert_eq!(probe.state().terms, vec![DeliveryToken(2)]);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
