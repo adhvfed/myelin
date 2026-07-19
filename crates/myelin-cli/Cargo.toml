@@ -9,7 +9,8 @@ publish = false
 # product through. It is an edge CLIENT — it presents a REAL capability token as `Authorization:
 # Bearer <paseto>` and calls the MR-014 gateway's `/v1/...` endpoints, under the SAME auth + audit a
 # browser session is (agent governance from day one). A LEAF BINARY: it depends on the subsystem
-# command grammars (myelin-git `api::parse_cli`, myelin-notif `cli`) + a tiny HTTP client, and NOTHING
+# command grammars (myelin-git / myelin-issues `api::parse_cli`, myelin-notif `cli`) + a tiny HTTP
+# client, and NOTHING
 # in the production crate DAG depends back on it. Like myelin-edge it is NOT a node in the eleven-crate
 # library DAG modelled by myelin-substrate::crate_graph (substrate_is_root()/identity_is_sink()
 # unaffected). See src/lib.rs.
@@ -24,13 +25,16 @@ path = "src/main.rs"
 [dependencies]
 # clap — the arg-parsing framework the ledger names ("clap binary"). It owns ONLY the top-level shell
 # (`myelin <subsystem> ...` + the global flags + `login`/`whoami`); the per-subsystem command SET is
-# REUSED from the subsystem crates (anti-duplication), so a new git command in api.rs flows to the CLI
-# without re-declaring it here.
+# REUSED from the subsystem crates (anti-duplication), so new git/Issues commands in api.rs flow to
+# the CLI without re-declaring them here.
 clap = { version = "4", features = ["derive"] }
 
 # REUSE the git CLI command grammar (api::parse_cli / CliCommand) — the CLI does NOT re-derive git's
 # commands; it parses with git's own total parser and maps the parsed command to the edge route.
 myelin-git = { path = "../myelin-git" }
+# REUSE the Issues-owned total command grammar (`myelin_issues::api`) and map it to the existing
+# durable Edge routes. The CLI never re-declares Issue verbs or accepts tenant/region selectors.
+myelin-issues = { path = "../myelin-issues" }
 # REUSE the notif CLI grammar (cli::CliView — the named scoped views + verb set).
 myelin-notif = { path = "../myelin-notif" }
 

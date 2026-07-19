@@ -21,6 +21,7 @@
 
 use crate::error::CliError;
 use myelin_git::api::{parse_cli, CliCommand, CliParseError};
+use myelin_issues::api::{parse_cli as parse_issues_cli, CliCommand as IssuesCliCommand};
 use serde_json::json;
 
 /// The HTTP method an [`EdgeCall`] uses (the CLI only issues reads + simple writes today).
@@ -183,6 +184,51 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
     }
 }
 
+/// Parse an Issues invocation with the subsystem-owned grammar and map it to the existing durable
+/// Edge routes. A create intentionally returns the Edge's `202` pending receipt; dispatch never
+/// rewrites that asynchronous contract into a claim of immediate visibility.
+pub fn issues_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let command = parse_issues_cli(args).map_err(|error| CliError::Usage(error.to_string()))?;
+    Ok(issues_command_to_call(&command))
+}
+
+/// Map a validated Issues command to its tenant-less Edge call.
+pub fn issues_command_to_call(command: &IssuesCliCommand) -> EdgeCall {
+    match command {
+        IssuesCliCommand::List { limit, cursor } => {
+            let mut query = format!("limit={limit}");
+            if let Some(cursor) = cursor {
+                query.push_str("&cursor=");
+                query.push_str(cursor);
+            }
+            EdgeCall {
+                method: HttpMethod::Get,
+                path: "/v1/issues".into(),
+                query: Some(query),
+                payload: None,
+            }
+        }
+        IssuesCliCommand::Create {
+            project_id,
+            type_id,
+            prefix,
+            title,
+        } => EdgeCall::post_json(
+            "/v1/issues",
+            json!({
+                "project_id": project_id,
+                "type_id": type_id,
+                "prefix": prefix,
+                "title": title,
+            }),
+        ),
+        IssuesCliCommand::View { issue_id } => EdgeCall::get(format!("/v1/issues/{issue_id}")),
+        IssuesCliCommand::Close { issue_id } => {
+            EdgeCall::post_json(format!("/v1/issues/{issue_id}/close"), json!({}))
+        }
+    }
+}
+
 /// **Parse + map a `myelin notif …` invocation** (the args AFTER `notif`/`inbox`). REUSES notif's own
 /// grammar ([`myelin_notif::cli::CliView`] for the `--view` flag + its verb set). Notif is NOT yet
 /// wired through the edge (MR-015 plugged Git first; `/v1/notif/...` routes are a follow-on), so this
@@ -301,5 +347,80 @@ mod tests {
         assert_eq!(notif_dispatch(&["list", "--view", "everything"]).unwrap_err().code(), 2);
         // a bad notif verb is Usage.
         assert_eq!(notif_dispatch(&["nope"]).unwrap_err().code(), 2);
+    }
+
+    #[test]
+    fn issues_commands_reuse_the_total_grammar_and_map_exact_route_bodies() {
+        let project = "11111111-1111-1111-1111-111111111111";
+        let type_id = "22222222-2222-2222-2222-222222222222";
+        let issue = "33333333-3333-3333-3333-333333333333";
+
+        let list = issues_dispatch(&["list", "--limit", "10", "--cursor", issue]).unwrap();
+        assert_eq!(list.method, HttpMethod::Get);
+        assert_eq!(list.path, "/v1/issues");
+        assert_eq!(
+            list.query.as_deref(),
+            Some("limit=10&cursor=33333333-3333-3333-3333-333333333333")
+        );
+
+        let create = issues_dispatch(&[
+            "create",
+            "--project",
+            project,
+            "--type",
+            type_id,
+            "--prefix",
+            "ENG",
+            "--title",
+            "Founder issue",
+        ])
+        .unwrap();
+        assert_eq!(create.method, HttpMethod::Post);
+        assert_eq!(create.path, "/v1/issues");
+        let body: serde_json::Value = serde_json::from_slice(&create.payload.unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "project_id": project,
+                "type_id": type_id,
+                "prefix": "ENG",
+                "title": "Founder issue"
+            })
+        );
+        assert!(body.get("tenant").is_none() && body.get("region").is_none());
+
+        let view = issues_dispatch(&["view", issue]).unwrap();
+        assert_eq!(view.method, HttpMethod::Get);
+        assert_eq!(view.path, format!("/v1/issues/{issue}"));
+        let close = issues_dispatch(&["close", issue]).unwrap();
+        assert_eq!(close.method, HttpMethod::Post);
+        assert_eq!(close.path, format!("/v1/issues/{issue}/close"));
+        assert_eq!(close.payload, Some(b"{}".to_vec()));
+    }
+
+    #[test]
+    fn issues_bad_input_is_local_usage_failure() {
+        assert_eq!(
+            issues_dispatch(&["list", "--limit", "0"])
+                .unwrap_err()
+                .code(),
+            2
+        );
+        assert_eq!(
+            issues_dispatch(&["view", "not-a-uuid"]).unwrap_err().code(),
+            2
+        );
+        assert_eq!(
+            issues_dispatch(&["list", "--limit", "2", "--limit", "3"])
+                .unwrap_err()
+                .code(),
+            2
+        );
+        assert_eq!(
+            issues_dispatch(&["create", "--tenant", "acme"])
+                .unwrap_err()
+                .code(),
+            2
+        );
     }
 }

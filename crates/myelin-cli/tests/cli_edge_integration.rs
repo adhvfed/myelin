@@ -226,3 +226,20 @@ async fn the_token_is_never_echoed_to_stdout_or_stderr() {
     let (_c2, out2, err2) = run_cli(&edge, Some(&token), &["git", "frobnicate"]);
     assert!(!out2.contains(&token) && !err2.contains(&token), "token never appears on an error");
 }
+
+/// The compiled binary delegates Issues parsing to the subsystem grammar before auth or transport.
+#[test]
+fn issues_malformed_input_is_a_local_usage_exit() {
+    let token = "NOT_USED_SENSITIVE_TOKEN";
+    let (code, stdout, stderr) = run_cli(
+        "http://127.0.0.1:1",
+        Some(token),
+        &["issues", "list", "--limit", "0"],
+    );
+
+    assert_eq!(code, 2);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("malformed limit"), "stderr={stderr}");
+    assert!(!stderr.contains(token));
+    assert!(!stderr.contains("could not reach"), "parsing precedes transport");
+}
