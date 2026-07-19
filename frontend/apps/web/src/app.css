@@ -484,6 +484,44 @@ a.issue-row:hover {
 }
 
 @media (max-width: 640px) {
+  .app-shell-header {
+    gap: var(--space-1) !important;
+    padding: var(--space-1) var(--space-2) !important;
+  }
+
+  .app-shell-header .cmdk-trigger {
+    flex: 0 0 auto !important;
+    padding: var(--space-2) !important;
+  }
+
+  .cmdk-trigger-label,
+  .app-shell-account-name {
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+    padding: 0 !important;
+    margin: -1px !important;
+    overflow: hidden !important;
+    clip: rect(0, 0, 0, 0) !important;
+    white-space: nowrap !important;
+    border: 0 !important;
+  }
+
+  .cmdk-trigger-shortcut,
+  .residency-cue-label,
+  .app-shell-account-chevron {
+    display: none !important;
+  }
+
+  .residency-cue {
+    gap: var(--space-1) !important;
+    padding: var(--space-1) !important;
+  }
+
+  .app-shell-header-spacer {
+    min-width: 0;
+  }
+
   .issues-screen,
   .issue-detail {
     gap: var(--space-3);
