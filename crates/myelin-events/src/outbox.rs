@@ -152,6 +152,24 @@ CREATE TABLE IF NOT EXISTS outbox_quarantine (
 CREATE INDEX IF NOT EXISTS outbox_quarantine_aggregate_seq_idx
     ON outbox_quarantine (aggregate, seq);";
 
+/// Fixed least-privilege grants for the elected shared-outbox publisher capability.
+///
+/// The role is deployment-owned, so databases without that optional capability remain migratable.
+/// When present, the role can read the two relay tables, mark only `published_at`, and insert only
+/// payload-free quarantine records. It cannot insert/delete outbox rows or update `attempts`.
+pub const OUTBOX_PUBLISHER_GRANTS_MIGRATION: &str = "\
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'myelin_outbox_publisher') THEN
+    REVOKE ALL ON TABLE outbox FROM myelin_outbox_publisher;
+    REVOKE ALL ON TABLE outbox_quarantine FROM myelin_outbox_publisher;
+    GRANT SELECT ON TABLE outbox TO myelin_outbox_publisher;
+    GRANT UPDATE (published_at) ON TABLE outbox TO myelin_outbox_publisher;
+    GRANT SELECT, INSERT ON TABLE outbox_quarantine TO myelin_outbox_publisher;
+  END IF;
+END
+$$;";
+
 /// A stable ULID — the `event_id` (the idempotency / broker-side-dedup key, ADR-04.1). A
 /// distinct newtype from [`EventId`] at the minting boundary; `From<Ulid> for EventId` carries
 /// it onto the envelope. "Stable" = the SAME row always carries the SAME id across every
@@ -1153,6 +1171,16 @@ mod tests {
         assert!(!OUTBOX_QUARANTINE_MIGRATION.contains("payload"));
         assert!(!OUTBOX_QUARANTINE_MIGRATION.contains("subject"));
         assert!(!OUTBOX_QUARANTINE_MIGRATION.contains("DROP TABLE"));
+    }
+
+    #[test]
+    fn publisher_grants_are_column_scoped_and_forbid_outbox_mutation() {
+        assert!(OUTBOX_PUBLISHER_GRANTS_MIGRATION.contains("GRANT SELECT ON TABLE outbox"));
+        assert!(OUTBOX_PUBLISHER_GRANTS_MIGRATION.contains("UPDATE (published_at)"));
+        assert!(OUTBOX_PUBLISHER_GRANTS_MIGRATION.contains("SELECT, INSERT ON TABLE outbox_quarantine"));
+        assert!(!OUTBOX_PUBLISHER_GRANTS_MIGRATION.contains("GRANT INSERT ON TABLE outbox "));
+        assert!(!OUTBOX_PUBLISHER_GRANTS_MIGRATION.contains("GRANT DELETE"));
+        assert!(!OUTBOX_PUBLISHER_GRANTS_MIGRATION.contains("UPDATE (attempts)"));
     }
 
     /// A committed transaction makes its staged event + state change durable together — the
