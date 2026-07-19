@@ -103,6 +103,43 @@ use crate::resolve::{
     RunFacts, StartHandoff, VersionedCiDefinition,
 };
 
+/// A canonical, readable git storage root validated before broker intake is constructed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthoritativeGitRoot(std::path::PathBuf);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitRootError(pub String);
+
+impl std::fmt::Display for GitRootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "authoritative git root is unavailable: {}", self.0)
+    }
+}
+
+impl std::error::Error for GitRootError {}
+
+impl AuthoritativeGitRoot {
+    pub fn validate(path: impl AsRef<std::path::Path>) -> Result<Self, GitRootError> {
+        let path = path.as_ref();
+        if !path.is_absolute() {
+            return Err(GitRootError(format!("{} is not an absolute path", path.display())));
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| GitRootError(format!("{}: {error}", path.display())))?;
+        if !canonical.is_dir() {
+            return Err(GitRootError(format!("{} is not a directory", canonical.display())));
+        }
+        std::fs::read_dir(&canonical)
+            .map_err(|error| GitRootError(format!("{} is not readable: {error}", canonical.display())))?;
+        Ok(Self(canonical))
+    }
+
+    pub fn as_path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
 // =================================================================================================
 // 1. The consumer subject whitelist (rule 3: a WHITELIST, never `*`).
 // =================================================================================================
@@ -153,11 +190,25 @@ pub const CI_TRIGGER_SUBJECT_STRS: &[&str] = &["myelin://"];
 /// "the file is simply absent", which is `Ok(None)`, a clean skip). A read error is fail-closed:
 /// the consumer does NOT start a run it cannot prove the definition of.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GitReadError(pub String);
+pub enum GitReadError {
+    /// Backend, repository, or exact commit is temporarily unavailable. Redeliver.
+    Unavailable(String),
+    /// The request/config object is permanently invalid (for example over the byte limit). DLQ.
+    Invalid(String),
+}
+
+impl GitReadError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, GitReadError::Unavailable(_))
+    }
+}
 
 impl std::fmt::Display for GitReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "git config read failed: {}", self.0)
+        match self {
+            GitReadError::Unavailable(message) => write!(f, "git config backing unavailable: {message}"),
+            GitReadError::Invalid(message) => write!(f, "invalid git config read: {message}"),
+        }
     }
 }
 
@@ -184,7 +235,7 @@ pub trait GitConfigReader: Send + Sync {
     ) -> Result<Option<Vec<u8>>, GitReadError> {
         let bytes = self.read_repo_file(tenant, region, repo, oid, path)?;
         if bytes.as_ref().is_some_and(|bytes| bytes.len() > maximum_bytes) {
-            return Err(GitReadError(format!("{path}@{oid} exceeds the {maximum_bytes}-byte config limit")));
+            return Err(GitReadError::Invalid(format!("{path}@{oid} exceeds the {maximum_bytes}-byte config limit")));
         }
         Ok(bytes)
     }
@@ -506,8 +557,8 @@ impl ReserveStore for CoCommitReserveStore {
 // =================================================================================================
 
 /// Why a triggering event did NOT arm a run — every skip is a distinct, SURFACED reason (fail-closed,
-/// never a silent swallow). All skips ACK the message ([`HandleOutcome::Done`]): a skip is not poison
-/// to retry, and never a crash.
+/// never a silent swallow). Clean/structural skips ACK; unavailable backing retries; permanently
+/// invalid Git reads dead-letter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SkipReason {
     /// The event is not a CI trigger type (a non-git / non-armed event routed by the coarse prefix).
@@ -814,7 +865,8 @@ pub fn plan_dispatch(
 
 /// **The live `ci-dispatch.trigger` bus consumer (the CT-004b deliverable).** On a matching
 /// `git.ref.updated` / PR event it drives [`plan_dispatch`] and, on an `Arm`, persists the atomic
-/// reserve bundle through the [`ReserveStore`]; a `Skip` is surfaced (logged) and ACKed. The
+/// reserve bundle through the [`ReserveStore`]; every `Skip` is surfaced, then classified as a
+/// clean/structural ACK, transient retry, or permanent dead-letter. The
 /// `Consumer` runtime wraps this with the seven rules (rule-1 dedup on `event_id` via the durable
 /// `consumer_dedup` ledger, ack-after-enqueue, bounded prefetch, the lag metric) — this body is the
 /// trigger LOGIC only. Idempotent on `event_id` twice over: the runtime's dedup AND the deterministic
@@ -823,6 +875,7 @@ pub struct CiTriggerHandler {
     reader: Arc<dyn GitConfigReader>,
     blobs: Arc<dyn BlobStore + Send + Sync>,
     reserve: Arc<dyn ReserveStore>,
+    expected_region: Option<String>,
     /// The last outcomes (surfaced skips + armed runs), bounded — the observability the drill reads
     /// (a skip is NOT silent). Bounded so it cannot grow unboundedly under a busy consumer.
     trace: Mutex<Vec<String>>,
@@ -840,6 +893,23 @@ impl CiTriggerHandler {
             reader,
             blobs,
             reserve,
+            expected_region: None,
+            trace: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Bind production intake to the configured cell region.
+    pub fn for_region(
+        reader: Arc<dyn GitConfigReader>,
+        blobs: Arc<dyn BlobStore + Send + Sync>,
+        reserve: Arc<dyn ReserveStore>,
+        expected_region: impl Into<String>,
+    ) -> CiTriggerHandler {
+        CiTriggerHandler {
+            reader,
+            blobs,
+            reserve,
+            expected_region: Some(expected_region.into()),
             trace: Mutex::new(Vec::new()),
         }
     }
@@ -879,15 +949,18 @@ pub fn build_trigger_consumer(
     blobs: Arc<dyn BlobStore + Send + Sync>,
     reserve: Arc<dyn ReserveStore>,
     dedup: myelin_events::DedupLedger,
+    expected_region: impl Into<String>,
+    dead_letters: Arc<dyn myelin_events::DurableDeadLetter>,
 ) -> Result<myelin_substrate::ConsumerReg, myelin_events::SubscribeError> {
-    let handler = CiTriggerHandler::new(reader, blobs, reserve);
+    let handler = CiTriggerHandler::for_region(reader, blobs, reserve, expected_region);
     let subscription = myelin_events::consumer::Subscription::bind(
         myelin_events::ConsumerName(TRIGGER_CONSUMER.into()),
         CI_TRIGGER_SUBJECT_STRS,
         myelin_events::PrefetchBound::DEFAULT,
     )?;
     Ok(myelin_substrate::ConsumerReg::new(
-        myelin_events::Consumer::new(handler, subscription, dedup),
+        myelin_events::Consumer::new(handler, subscription, dedup)
+            .with_dead_letter_sink(myelin_events::DeadLetterSink::durable(dead_letters)),
     ))
 }
 
@@ -897,6 +970,18 @@ impl EventHandler for CiTriggerHandler {
     }
 
     fn handle(&self, ev: &EventEnvelope, tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
+        if let Some(expected) = &self.expected_region {
+            if ev.region.0 != *expected {
+                self.record(format!(
+                    "region mismatch: envelope={} configured_cell={expected}",
+                    ev.region.0
+                ));
+                return HandleOutcome::NonRetryable(myelin_events::Reason(format!(
+                    "event region {} does not match configured cell region {expected}",
+                    ev.region.0
+                )));
+            }
+        }
         match plan_dispatch(ev, self.reader.as_ref(), self.blobs.as_ref()) {
             // Thread the consumer-runtime co-commit handle (`tx`) into the reserve store: the true
             // co-commit impl writes the bundle on the SAME tx as the dedup mark (#7); the production
@@ -920,14 +1005,22 @@ impl EventHandler for CiTriggerHandler {
                 }
             },
             DispatchOutcome::Skip(reason) => {
-                // Every skip is SURFACED (the trace) and ACKed. A NotATrigger skip (the coarse-prefix
-                // firehose discarding a non-git event) is not even recorded past a bounded window —
-                // but a config/resolve error IS surfaced loudly (fail-closed, never silent).
+                // Every skip is SURFACED. A NotATrigger/NoConfig clean skip is not recorded; backing
+                // unavailability retries without committing dedup, permanent Git invalidity poisons,
+                // and structural config/resolve skips are terminal ACKs.
                 match &reason {
                     SkipReason::NotATrigger(_) | SkipReason::NoConfig => {}
                     other => self.record(format!("skip: {other}")),
                 }
-                HandleOutcome::Done
+                if matches!(&reason, SkipReason::ReadFailed(error) if error.is_retryable()) {
+                    HandleOutcome::Retry(myelin_events::Backoff { seconds: 5 })
+                } else if let SkipReason::ReadFailed(error) = reason {
+                    HandleOutcome::NonRetryable(myelin_events::Reason(error.to_string()))
+                } else if matches!(reason, SkipReason::ResolveError(ResolveError::BlobWrite(_))) {
+                    HandleOutcome::Retry(myelin_events::Backoff { seconds: 5 })
+                } else {
+                    HandleOutcome::Done
+                }
             }
         }
     }
@@ -986,7 +1079,7 @@ impl GitConfigReader for MapGitConfigReader {
     ) -> Result<Option<Vec<u8>>, GitReadError> {
         let key = (repo.to_string(), oid.to_string(), path.to_string());
         if self.fail.contains(&key) {
-            return Err(GitReadError(format!("injected read failure at {path}")));
+            return Err(GitReadError::Unavailable(format!("injected read failure at {path}")));
         }
         Ok(self.files.get(&key).cloned())
     }
@@ -1038,8 +1131,9 @@ mod tests {
     use super::*;
     use crate::dispatch::TrustTier;
     use myelin_events::{
-        Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventId, EventType, Timestamp,
-        Visibility,
+        consumer::{Consumer, ConsumerName, Delivered, Message, PrefetchBound, Subscription},
+        Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, DedupLedger, EventId, EventType,
+        Timestamp, Visibility,
     };
     use myelin_git::events::{GIT_PR_OPENED, GIT_PR_SYNCHRONIZED, GIT_REF_UPDATED};
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -1165,6 +1259,184 @@ mod tests {
     fn arm(ev: &EventEnvelope, reader: &dyn GitConfigReader) -> DispatchOutcome {
         let blobs = FsBlobStore::new();
         plan_dispatch(ev, reader, &blobs)
+    }
+
+    fn runtime(handler: CiTriggerHandler, ledger: DedupLedger) -> Consumer<CiTriggerHandler> {
+        let subscription = Subscription::bind(
+            ConsumerName(TRIGGER_CONSUMER.into()),
+            CI_TRIGGER_SUBJECT_STRS,
+            PrefetchBound::DEFAULT,
+        )
+        .expect("CI trigger subscription");
+        Consumer::new(handler, subscription, ledger)
+    }
+
+    fn message(envelope: EventEnvelope) -> Message {
+        Message { subject: envelope.subject.0.clone(), envelope }
+    }
+
+    fn temp_git_root(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "myelin-ci-dispatch-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temporary git root");
+        root
+    }
+
+    #[test]
+    fn authoritative_git_root_requires_an_existing_absolute_directory() {
+        assert!(matches!(
+            AuthoritativeGitRoot::validate("relative/git-root"),
+            Err(GitRootError(message)) if message.contains("absolute")
+        ));
+        let missing = std::env::temp_dir().join(format!("myelin-ci-dispatch-missing-root-{}", std::process::id()));
+        assert!(AuthoritativeGitRoot::validate(missing).is_err());
+
+        let root = temp_git_root("validated-root");
+        let validated = AuthoritativeGitRoot::validate(&root).expect("valid root");
+        assert_eq!(validated.as_path(), root.canonicalize().unwrap());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn region_mismatch_dlqs_before_git_cas_or_reserve_then_records_terminal_tombstone() {
+        let reserve = Arc::new(RecordingReserveStore::new());
+        let handler = CiTriggerHandler::for_region(
+            Arc::new(NoConfigRead), Arc::new(NoCasAccess), reserve.clone(), "us-east",
+        );
+        let ledger = DedupLedger::new();
+        let consumer = runtime(handler, ledger.clone());
+
+        assert!(matches!(
+            consumer.deliver(&message(push_envelope("web", "deadbeef"))),
+            Delivered::DeadLettered(_)
+        ));
+        assert!(reserve.persisted().is_empty(), "region mismatch has zero reserve effects");
+        assert_eq!(ledger.len(), 1, "DLQ persistence precedes the terminal tombstone");
+    }
+
+    #[test]
+    fn missing_repository_or_exact_commit_retries_with_zero_dedup_or_effect() {
+        let root = temp_git_root("unavailable-git");
+        let store = myelin_git::durable::DurableGitStore::rooted(&root);
+        let loc = myelin_git::core::RepoLoc::new("acme", "fr-par", "web");
+
+        for (event_id, setup_repo) in [("missing-repo", false), ("missing-commit", true)] {
+            if setup_repo {
+                store.create_repo(&loc).expect("create bare repo");
+            }
+            let reader: Arc<dyn GitConfigReader> = Arc::new(DurableGitConfigReader::new(
+                myelin_git::durable::DurableGitStore::rooted(&root),
+            ));
+            let reserve = Arc::new(RecordingReserveStore::new());
+            let handler = CiTriggerHandler::for_region(
+                reader, Arc::new(FsBlobStore::new()), reserve.clone(), "fr-par",
+            );
+            let ledger = DedupLedger::new();
+            let consumer = runtime(handler, ledger.clone());
+            let mut event = push_envelope("web", "1111111111111111111111111111111111111111");
+            event.event_id = EventId(event_id.into());
+
+            assert_eq!(consumer.deliver(&message(event)), Delivered::Retried(5));
+            assert!(reserve.persisted().is_empty());
+            assert!(ledger.is_empty(), "Git retry rolls back the dedup mark");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn existing_commit_without_ci_config_is_a_genuine_acked_no_config() {
+        let root = temp_git_root("no-config");
+        let store = myelin_git::durable::DurableGitStore::rooted(&root);
+        let repo = store
+            .create_repo(&myelin_git::core::RepoLoc::new("acme", "fr-par", "web"))
+            .expect("create bare repo");
+        let (commit, _, _) = repo
+            .build_file_commit(
+                "refs/heads/main", "README.md", b"no CI definition\n", "seed", "ci", "ci@invalid",
+            )
+            .expect("seed commit");
+        let reserve = Arc::new(RecordingReserveStore::new());
+        let handler = CiTriggerHandler::for_region(
+            Arc::new(DurableGitConfigReader::new(store)),
+            Arc::new(FsBlobStore::new()),
+            reserve.clone(),
+            "fr-par",
+        );
+        let ledger = DedupLedger::new();
+        let consumer = runtime(handler, ledger.clone());
+
+        assert_eq!(
+            consumer.deliver(&message(push_envelope("web", commit.as_str()))),
+            Delivered::Acked
+        );
+        assert!(reserve.persisted().is_empty());
+        assert_eq!(ledger.len(), 1, "genuine NoConfig is terminally acknowledged");
+        drop(consumer);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn oversized_config_is_terminal_poison_without_business_effect() {
+        let reader: Arc<dyn GitConfigReader> = Arc::new(MapGitConfigReader::new().with_file(
+            "web", "deadbeef", ".myelin/ci.toml",
+            vec![b' '; crate::config::MAX_CI_CONFIG_BYTES + 1],
+        ));
+        let reserve = Arc::new(RecordingReserveStore::new());
+        let handler = CiTriggerHandler::for_region(
+            reader, Arc::new(NoCasAccess), reserve.clone(), "fr-par",
+        );
+        let ledger = DedupLedger::new();
+        let consumer = runtime(handler, ledger.clone());
+
+        assert!(matches!(
+            consumer.deliver(&message(push_envelope("web", "deadbeef"))),
+            Delivered::DeadLettered(_)
+        ));
+        assert!(reserve.persisted().is_empty());
+        assert_eq!(ledger.len(), 1, "DLQ persistence precedes the terminal tombstone");
+    }
+
+    struct FailingBlobStore;
+
+    impl BlobStore for FailingBlobStore {
+        fn put(&self, _tenant: &TenantId, _bytes: &[u8]) -> myelin_storage::blob::Result<ContentHash> {
+            Err(myelin_storage::blob::BlobError::MalformedAddress("injected S3 outage".into()))
+        }
+        fn get(&self, _: &TenantId, _: &ContentHash) -> myelin_storage::blob::Result<Vec<u8>> {
+            panic!("CAS read reached during write-failure test")
+        }
+        fn head(&self, _: &TenantId, _: &ContentHash) -> myelin_storage::blob::Result<myelin_storage::blob::BlobMeta> {
+            panic!("CAS head reached during write-failure test")
+        }
+        fn delete(&self, _: &TenantId, _: &ContentHash) -> myelin_storage::blob::Result<()> {
+            panic!("CAS delete reached during write-failure test")
+        }
+    }
+
+    #[test]
+    fn cas_snapshot_write_failure_retries_without_dedup_or_reserve_effect() {
+        let reader: Arc<dyn GitConfigReader> = Arc::new(
+            MapGitConfigReader::new().with_file("web", "deadbeef", ".myelin/ci.toml", valid_toml()),
+        );
+        let reserve = Arc::new(RecordingReserveStore::new());
+        let handler = CiTriggerHandler::for_region(
+            reader, Arc::new(FailingBlobStore), reserve.clone(), "fr-par",
+        );
+        let ledger = DedupLedger::new();
+        let consumer = runtime(handler, ledger.clone());
+
+        assert_eq!(
+            consumer.deliver(&message(push_envelope("web", "deadbeef"))),
+            Delivered::Retried(5)
+        );
+        assert!(reserve.persisted().is_empty());
+        assert!(ledger.is_empty(), "S3 retry rolls back the dedup mark");
     }
 
     /// **subjects() is a whitelist, NEVER `*` (BUS-3).** The coarse prefix is bounded (non-`*`), so
@@ -1547,20 +1819,28 @@ impl<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> GitConfigReader
     ) -> Result<Option<Vec<u8>>, GitReadError> {
         let loc = myelin_git::core::RepoLoc::new(tenant, region, repo_name(repo));
         if !self.store.repo_exists(&loc) {
-            // An unknown repo reads as "no config" (a clean skip) — a push for a repo whose object
-            // store this cell does not hold is the cross-service git-read floor, not a crash.
-            return Ok(None);
+            return Err(GitReadError::Unavailable(format!(
+                "repository {repo} is unavailable for tenant={tenant} region={region}"
+            )));
         }
         let git = self
             .store
             .open_repo(&loc)
-            .map_err(|e| GitReadError(format!("open {repo}: {e}")))?;
+            .map_err(|e| GitReadError::Unavailable(format!("open {repo}: {e}")))?;
+        if !git
+            .commit_exists(oid)
+            .map_err(|e| GitReadError::Unavailable(format!("validate commit {oid}: {e}")))?
+        {
+            return Err(GitReadError::Unavailable(format!(
+                "commit {oid} is unavailable in repository {repo}"
+            )));
+        }
         match git
             .read_blob_at_path_bounded(oid, path, maximum_bytes)
-            .map_err(|e| GitReadError(format!("read {path}@{oid}: {e}")))?
+            .map_err(|e| GitReadError::Unavailable(format!("read {path}@{oid}: {e}")))?
         {
             myelin_git::durable::BlobPathLookup::Found { bytes, .. } => Ok(Some(bytes)),
-            myelin_git::durable::BlobPathLookup::TooLarge { size, maximum } => Err(GitReadError(format!("{path}@{oid} is {size} bytes, above the {maximum}-byte config limit"))),
+            myelin_git::durable::BlobPathLookup::TooLarge { size, maximum } => Err(GitReadError::Invalid(format!("{path}@{oid} is {size} bytes, above the {maximum}-byte config limit"))),
             // Absent or a directory at that name → no config file (a clean skip).
             myelin_git::durable::BlobPathLookup::Missing
             | myelin_git::durable::BlobPathLookup::IsDir => Ok(None),
