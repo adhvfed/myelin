@@ -44,7 +44,8 @@ use myelin_ci_controlplane::{
 };
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
-    BudgetGate, CiStage, JobKind, JobRunner, JobSpec, MinorUnits, Wallet, WfCtx, WfJournal,
+    BudgetGate, CiStage, JobKind, JobRunner, JobSpec, MinorUnits, TimerStore, Wallet, WfCtx,
+    WfJournal,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::reserve_settle::RunId as LedgerRunId;
@@ -264,6 +265,7 @@ fn ci_d5_funded_ci_stage_starts_and_settles_into_the_shared_wallet() {
         42,
     )
     .with_signals(signals)
+    .with_timers(TimerStore::new(), 0, 1_000)
     .with_budget(gate.clone());
 
     // Drive a single metered CI stage directly over the body's engine bookend: reserve 300, bill the
