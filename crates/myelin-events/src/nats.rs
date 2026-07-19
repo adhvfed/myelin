@@ -644,7 +644,10 @@ impl NatsJetStreamBus {
             ))
         })?;
         self.block(async {
-            msg.ack()
+            // Wait for the JetStream acknowledgement-of-ack before reporting success. A plain
+            // publish-only ack can be lost if the process exits immediately after this method,
+            // causing an already-completed business effect to be redelivered after restart.
+            msg.double_ack()
                 .await
                 .map_err(|e| TransportError(format!("ack event {}: {e}", event_id.0)))
         })
