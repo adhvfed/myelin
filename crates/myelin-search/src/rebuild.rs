@@ -110,6 +110,7 @@ CREATE TABLE IF NOT EXISTS search_rebuild_job (
     fence_epoch        BIGINT NOT NULL,
     high_water_mark    BIGINT,
     high_water_seqs    TEXT,
+    pre_wipe_docs      BIGINT,
     owners_replayed    TEXT   NOT NULL DEFAULT '',
     lease_holder       TEXT,
     lease_expires_at   BIGINT NOT NULL DEFAULT 0,
@@ -279,6 +280,18 @@ pub struct RebuildRecord {
     /// through an explicit `Option` and never `unwrap_or(0)` — `seq` is 0-BASED, so a default of 0
     /// would admit each such aggregate's first event.
     pub high_water_seqs: std::collections::BTreeMap<String, u64>,
+    /// **How many documents the index held at fence time, BEFORE the wipe.**
+    ///
+    /// The anchor that stops verification passing over a destroyed corpus. Every other leg compares
+    /// the rebuilt index against what the replay produced, so when owner truth comes back EMPTY —
+    /// an unregistered source, an owner whose truth was never loaded, a mis-scoped selector — the
+    /// comparison is `0 == 0` and every leg passes over an index that has just been wiped clean.
+    /// Reads then reopen on nothing.
+    ///
+    /// This is the one fact that cannot be derived from the rebuild's own output, so it has to be
+    /// captured before the destruction: an index that HELD documents must not verify as rebuilt
+    /// while holding none.
+    pub pre_wipe_docs: Option<u64>,
     /// The owner tokens whose corpora have been replayed (so a resumed replay skips finished
     /// owners rather than redoing them).
     pub owners_replayed: BTreeSet<String>,
@@ -553,6 +566,9 @@ pub enum VerifyFailure {
     /// The rebuilt document SET disagrees with what the replay indexed (same count, different
     /// members — the failure a count-only check would pass).
     DocDigestMismatch,
+    /// The right NUMBER of embeddings exists, but on the wrong subjects (the failure a count-only
+    /// vector check passes).
+    VectorDigestMismatch,
     /// A document carries a live embedding it should not, or is missing one it should have.
     VectorParityMismatch {
         /// Documents expected to carry a live vector.
@@ -564,6 +580,16 @@ pub enum VerifyFailure {
     LegacyIdentitiesSurvived {
         /// How many, across documents, vectors and metadata records.
         count: usize,
+    },
+    /// The index held documents before the wipe and holds none after the rebuild — or the rebuild's
+    /// expectation is empty, which would make every parity leg a vacuous `0 == 0`.
+    CorpusDestroyed {
+        /// Documents the index held at fence time.
+        before: u64,
+        /// Documents it holds now.
+        after: usize,
+        /// Documents the rebuild expected to produce.
+        expected: usize,
     },
     /// The replay and/or catch-up reported driving documents, but the index is empty — the
     /// signature of a wipe that landed after the replay.
@@ -592,6 +618,11 @@ impl std::fmt::Display for VerifyFailure {
                 "document set parity: the index holds the right NUMBER of documents but not the \
                  right ones"
             ),
+            VerifyFailure::VectorDigestMismatch => write!(
+                f,
+                "vector set parity: the index holds the right NUMBER of embeddings but not on the \
+                 right documents"
+            ),
             VerifyFailure::VectorParityMismatch { expected, found } => write!(
                 f,
                 "vector parity: {expected} documents should carry a live embedding, {found} do"
@@ -599,6 +630,16 @@ impl std::fmt::Display for VerifyFailure {
             VerifyFailure::LegacyIdentitiesSurvived { count } => write!(
                 f,
                 "{count} identities under the retired legacy grammar survived the rebuild"
+            ),
+            VerifyFailure::CorpusDestroyed {
+                before,
+                after,
+                expected,
+            } => write!(
+                f,
+                "the index held {before} document(s) before the wipe and holds {after} now, with an \
+                 expectation of {expected} — owner truth came back empty, so the rebuild destroyed \
+                 the corpus instead of rebuilding it"
             ),
             VerifyFailure::EmptyAfterNonEmptyReplay {
                 replayed,
@@ -795,13 +836,14 @@ impl RebuildCoordinator {
     /// is what makes the migration re-runnable.
     pub fn claim(&self, key: &RebuildKey, holder: &str, now: u64) -> Result<u64, RebuildError> {
         let current = self.journal.load(key)?;
-        let (expected_epoch, next_epoch, phase, hwm, hwm_seqs, owners) = match &current {
+        let (expected_epoch, next_epoch, phase, hwm, hwm_seqs, pre_wipe, owners) = match &current {
             None => (
                 None,
                 1,
                 RebuildPhase::Claimed,
                 None,
                 std::collections::BTreeMap::new(),
+                None,
                 BTreeSet::new(),
             ),
             Some(rec) => {
@@ -817,6 +859,7 @@ impl RebuildCoordinator {
                         RebuildPhase::Claimed,
                         None,
                         std::collections::BTreeMap::new(),
+                        None,
                         BTreeSet::new(),
                     )
                 } else {
@@ -829,6 +872,7 @@ impl RebuildCoordinator {
                         // move the boundary upward after the wipe — reintroducing the very hole the
                         // fence-time capture exists to close.
                         rec.high_water_seqs.clone(),
+                        rec.pre_wipe_docs,
                         rec.owners_replayed.clone(),
                     )
                 }
@@ -839,6 +883,7 @@ impl RebuildCoordinator {
             fence_epoch: next_epoch,
             high_water_mark: hwm,
             high_water_seqs: hwm_seqs,
+            pre_wipe_docs: pre_wipe,
             owners_replayed: owners,
             lease_holder: Some(holder.to_string()),
             lease_expires_at: now.saturating_add(self.lease_ticks),
@@ -919,6 +964,24 @@ impl RebuildCoordinator {
         }
     }
 
+    /// **Abandon a rebuild, lifting the fence.**
+    ///
+    /// The remedy an operator needs when a rebuild is blocking something that must proceed — chiefly
+    /// a tenant decommission, which `SearchEraseHolder::erase_tenant` refuses mid-rebuild because
+    /// the in-flight replay would re-index the corpus after the shred.
+    ///
+    /// This does NOT repair the index: it marks the job `Complete`, so reads reopen over whatever
+    /// the abandoned rebuild left behind — which after a wipe is a partial corpus. That is only
+    /// acceptable when the index is about to be destroyed anyway, or when the operator intends to
+    /// immediately re-run the rebuild. It is deliberately not called "cancel": nothing is rolled
+    /// back.
+    pub fn abandon(&self, key: &RebuildKey, holder: &str, now: u64) -> Result<(), RebuildError> {
+        let rec = self.checked(key, holder, now)?;
+        self.advance(key, &rec, holder, now, |next| {
+            next.phase = RebuildPhase::Complete;
+        })
+    }
+
     /// **Phase 1 — fence: record the high-water mark and close reads.**
     ///
     /// `high_water_mark` is the broker/live-intake position at this instant (the committed outbox
@@ -945,10 +1008,19 @@ impl RebuildCoordinator {
         }
         let seqs = high_water_seqs(committed);
         let count = committed.len() as u64;
+        // Capture the corpus size BEFORE the wipe destroys it — see `pre_wipe_docs`.
+        let pre_wipe = self
+            .reindexer
+            .indexer()
+            .inventory(&key.tenant, &key.region)
+            .map_err(|_| RebuildError::Engine("index inventory read failed"))?
+            .doc_ids
+            .len() as u64;
         self.advance(key, &rec, holder, now, |next| {
             next.phase = RebuildPhase::Fenced;
             next.high_water_mark = Some(count);
             next.high_water_seqs = seqs;
+            next.pre_wipe_docs = Some(pre_wipe);
         })?;
         Ok(count)
     }
@@ -1207,7 +1279,23 @@ impl RebuildCoordinator {
         // reported driving documents through the indexer, yet the index is empty. That is the
         // signature of a wipe that ran after the replay (a displaced holder, a re-entered phase) and
         // it is invisible to a count/digest comparison built from the index itself.
+        // **The corpus-destroyed leg.** An index that HELD documents at fence time must not verify
+        // as rebuilt while holding none — and must not verify against an EMPTY expectation either,
+        // because an empty expectation makes every other leg `0 == 0`. This is the shape a missing
+        // or unregistered owner source produces: the wipe runs, the replay finds no truth, and
+        // without this check verification passes and reads reopen over nothing.
         let found_docs = inventory.doc_ids.len();
+        if let Some(before) = rec.pre_wipe_docs {
+            if before > 0 && (found_docs == 0 || expected.doc_ids.is_empty()) {
+                return Err(RebuildError::VerificationFailed(
+                    VerifyFailure::CorpusDestroyed {
+                        before,
+                        after: found_docs,
+                        expected: expected.doc_ids.len(),
+                    },
+                ));
+            }
+        }
         if found_docs == 0 && (expected.docs_replayed > 0 || expected.docs_caught_up > 0) {
             return Err(RebuildError::VerificationFailed(
                 VerifyFailure::EmptyAfterNonEmptyReplay {
@@ -1233,6 +1321,10 @@ impl RebuildCoordinator {
             ));
         }
 
+        // Vector parity by COUNT and by SET. A count-only check passes when the right NUMBER of
+        // embeddings exists on the wrong subjects — the same failure the document digest exists to
+        // catch, and the vector space deserves the same treatment because it answers queries
+        // independently of the document space.
         let found_vectors = inventory.vector_doc_ids.len();
         if found_vectors != expected.vector_doc_ids.len() {
             return Err(RebuildError::VerificationFailed(
@@ -1240,6 +1332,14 @@ impl RebuildCoordinator {
                     expected: expected.vector_doc_ids.len(),
                     found: found_vectors,
                 },
+            ));
+        }
+        let vector_digest = doc_set_digest(inventory.vector_doc_ids.iter().map(String::as_str));
+        let expected_vector_digest =
+            doc_set_digest(expected.vector_doc_ids.iter().map(String::as_str));
+        if vector_digest != expected_vector_digest {
+            return Err(RebuildError::VerificationFailed(
+                VerifyFailure::VectorDigestMismatch,
             ));
         }
 

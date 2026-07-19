@@ -134,6 +134,8 @@ async fn the_durable_rebuild_journal_is_exclusive_under_real_concurrency() {
                 .bind(Some(format!("worker-{holder}"))) // lease_holder
                 .bind(1_000_i64) // lease_expires_at
                 .bind("{}") // high_water_seqs
+                .bind(Option::<i64>::None) // $10 unused on the insert arm
+                .bind(Option::<i64>::None) // pre_wipe_docs
                 .execute(&pool)
                 .await
                 .expect("the claim statement executes")
@@ -179,6 +181,7 @@ async fn the_durable_rebuild_journal_is_exclusive_under_real_concurrency() {
                 .bind(2_000_i64)
                 .bind(expected)
                 .bind("{\"agg\":3}") // high_water_seqs
+                .bind(Some(7_i64)) // pre_wipe_docs
                 .execute(&pool)
                 .await
                 .expect("the update statement executes")
@@ -225,6 +228,8 @@ async fn the_durable_rebuild_journal_is_exclusive_under_real_concurrency() {
             .bind(Some("neighbour".to_string()))
             .bind(1_000_i64)
             .bind("{}") // high_water_seqs
+                .bind(Option::<i64>::None) // $10 unused on the insert arm
+                .bind(Option::<i64>::None) // pre_wipe_docs
             .execute(&admin)
             .await
             .expect("insert the neighbouring job")

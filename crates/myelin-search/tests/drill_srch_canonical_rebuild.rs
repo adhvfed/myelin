@@ -1742,6 +1742,19 @@ fn an_erasure_during_a_rebuild_is_refused_loudly() {
     let doc = kn_id("mentions-subject");
     fetcher.put(&doc, &format!("a page mentioning {pseudonym}"));
     indexer.index(&created_event(&doc)).unwrap();
+    // Owner bodies for every corpus the rebuild below replays — without them the replay resolves
+    // `Gone` for everything and the rebuild legitimately fails the corpus-destroyed check.
+    fetcher.put(
+        &canonical_id("core", "refs/heads/main", "src/charge.rs"),
+        "fn charge() {}",
+    );
+    fetcher.put(
+        &canonical_id("core", "refs/heads/main", "src/refund.rs"),
+        "fn refund() {}",
+    );
+    fetcher.put(&kn_id("runbook"), "the oncall runbook");
+    fetcher.put(&issue_id("1421"), "an issue");
+    fetcher.put(&chat_id("m-7"), "a message");
 
     let kms = Arc::new(KmsEngine::new());
     let pin = SearchDekPin::new(kms);
@@ -1786,7 +1799,7 @@ fn an_erasure_during_a_rebuild_is_refused_loudly() {
     let chat = chat_source();
     let sources: Vec<&dyn ReindexSource> = vec![&git, &iss, &kn, &chat];
     let mut outbox = OutboxStore::new();
-    coordinator
+    let replay = coordinator
         .replay_all(
             &key,
             HOLDER,
@@ -1797,14 +1810,14 @@ fn an_erasure_during_a_rebuild_is_refused_loudly() {
             replay_ctx(),
         )
         .unwrap();
-    coordinator.catch_up(&key, HOLDER, 100, &[]).unwrap();
-    let expected = ExpectedCorpus::from_index(
-        &SearchReindexer::new(indexer.clone(), region()),
-        &key,
-        0,
-        0,
-    )
-    .unwrap();
+    let caught = coordinator.catch_up(&key, HOLDER, 100, &[]).unwrap();
+    let semantic: BTreeSet<String> = replay
+        .replayed_subjects
+        .iter()
+        .filter(|s| s.contains("/git/blob/") || s.contains("/knowledge/page/"))
+        .cloned()
+        .collect();
+    let expected = ExpectedCorpus::from_replay(&replay, &caught, &semantic);
     coordinator
         .verify_and_open(&key, HOLDER, 100, &expected)
         .unwrap();
@@ -1858,5 +1871,113 @@ fn the_serving_constructor_requires_the_fence() {
             .unwrap()
             .is_empty(),
         "a `for_service` indexer honours the fence"
+    );
+}
+
+/// **A rebuild whose owner truth comes back EMPTY must NOT verify — it destroyed the corpus.**
+///
+/// The hole an independent probe demonstrated, and the one that mattered most because it is the
+/// DEFAULT production shape: if no owner has loaded its truth (Git's blob truth is empty in any
+/// process that never called `load_canonical_blob_truth`), then the wipe runs, the replay finds
+/// nothing, and every parity leg compares `0 == 0`. Count, digest, vector, zero-legacy and zero-lag
+/// all pass over an index that was just emptied, and reads reopen on nothing.
+///
+/// The fix is the one fact the rebuild cannot derive from its own output: how many documents the
+/// index held BEFORE the wipe. An index that held documents must not verify as rebuilt holding none.
+#[test]
+fn a_rebuild_with_empty_owner_truth_refuses_to_verify() {
+    /// An owner that registers for a scope but replays nothing — an unloaded or mis-scoped source.
+    struct EmptySource(&'static str);
+    impl ReindexSource for EmptySource {
+        fn owner_token(&self) -> &str {
+            self.0
+        }
+        fn replay(
+            &self,
+            _scope: &SnapshotScope,
+            _since: Option<u64>,
+        ) -> Vec<myelin_events::SnapshotDraft> {
+            Vec::new()
+        }
+    }
+
+    let mut h = Harness::new();
+    // A real corpus exists before the rebuild.
+    h.live_index(&kn_id("runbook"), "the oncall runbook for paxos");
+    h.live_index(&issue_id("1421"), "an issue about raft elections");
+    assert_eq!(h.doc_ids().len(), 2, "precondition: the index holds a corpus");
+
+    let git = EmptySource("git");
+    let iss = EmptySource("issues");
+    let kn = EmptySource("knowledge");
+    let chat = EmptySource("chat");
+    let sources: Vec<&dyn ReindexSource> = vec![&git, &iss, &kn, &chat];
+
+    let err = h
+        .run_full_rebuild(100, &all_scopes(), &sources)
+        .expect_err("a rebuild that emptied the index must NOT verify");
+    assert!(
+        matches!(
+            err,
+            RebuildError::VerificationFailed(VerifyFailure::CorpusDestroyed { .. })
+        ),
+        "the destroyed corpus is caught: {err}"
+    );
+
+    // And reads stay FENCED — the half-destroyed index is never served.
+    assert_eq!(
+        h.gate().read_mode(&tenant(), &region()),
+        ReadMode::FailEmptyRebuilding,
+        "a rebuild that destroyed the corpus must not reopen reads"
+    );
+
+    // The refusal discloses nothing beyond counts.
+    let msg = err.to_string();
+    for secret in ["acme", REGION, "runbook", "paxos", "raft"] {
+        assert!(
+            !msg.contains(secret),
+            "the refusal must not disclose `{secret}`: {msg}"
+        );
+    }
+}
+
+/// **A tenant that genuinely had NO corpus still rebuilds cleanly.**
+///
+/// The counterpart to the drill above: the corpus-destroyed check keys on the PRE-WIPE size, so a
+/// legitimately-empty tenant (a fresh cell, a tenant with no indexed content) must not be blocked
+/// from completing a rebuild. Zero before and zero after is not destruction.
+#[test]
+fn a_rebuild_of_a_genuinely_empty_tenant_still_completes() {
+    struct EmptySource(&'static str);
+    impl ReindexSource for EmptySource {
+        fn owner_token(&self) -> &str {
+            self.0
+        }
+        fn replay(
+            &self,
+            _scope: &SnapshotScope,
+            _since: Option<u64>,
+        ) -> Vec<myelin_events::SnapshotDraft> {
+            Vec::new()
+        }
+    }
+
+    let mut h = Harness::new();
+    assert_eq!(h.doc_ids().len(), 0, "precondition: nothing indexed");
+
+    let git = EmptySource("git");
+    let iss = EmptySource("issues");
+    let kn = EmptySource("knowledge");
+    let chat = EmptySource("chat");
+    let sources: Vec<&dyn ReindexSource> = vec![&git, &iss, &kn, &chat];
+
+    let report = h
+        .run_full_rebuild(100, &all_scopes(), &sources)
+        .expect("an empty tenant rebuilds cleanly — zero before and zero after is not destruction");
+    assert_eq!(report.docs_indexed, 0);
+    assert_eq!(
+        h.gate().read_mode(&tenant(), &region()),
+        ReadMode::Open,
+        "reads reopen for a legitimately empty tenant"
     );
 }

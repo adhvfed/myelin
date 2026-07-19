@@ -49,8 +49,8 @@ const OWNER_DELIMITER: char = '\u{1f}';
 
 /// Read the rebuild row for a `(tenant, region)`.
 pub const SELECT_REBUILD_JOB_QUERY: &str = "\
-SELECT phase, fence_epoch, high_water_mark, high_water_seqs, owners_replayed, lease_holder,
-       lease_expires_at
+SELECT phase, fence_epoch, high_water_mark, high_water_seqs, pre_wipe_docs, owners_replayed,
+       lease_holder, lease_expires_at
   FROM search_rebuild_job
  WHERE tenant = $1 AND region = $2";
 
@@ -59,8 +59,8 @@ SELECT phase, fence_epoch, high_water_mark, high_water_seqs, owners_replayed, le
 pub const INSERT_REBUILD_JOB_QUERY: &str = "\
 INSERT INTO search_rebuild_job
        (tenant, region, phase, fence_epoch, high_water_mark, owners_replayed,
-        lease_holder, lease_expires_at, high_water_seqs)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        lease_holder, lease_expires_at, high_water_seqs, pre_wipe_docs)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $11)
     ON CONFLICT (tenant, region) DO NOTHING";
 
 /// Every subsequent write: conditional on the fence epoch the caller claimed under. A holder whose
@@ -74,6 +74,7 @@ UPDATE search_rebuild_job
        lease_holder = $7,
        lease_expires_at = $8,
        high_water_seqs = $10,
+       pre_wipe_docs = $11,
        updated_at = now()
  WHERE tenant = $1 AND region = $2 AND fence_epoch = $9";
 
@@ -140,14 +141,26 @@ fn encode_seqs(seqs: &std::collections::BTreeMap<String, u64>) -> Result<String,
 
 /// Parse the `high_water_seqs` column back into the watermark.
 ///
-/// A NULL / absent column decodes to an EMPTY map, which correctly means "no aggregate had
-/// committed rows at fence time, so apply nothing". A MALFORMED column also decodes to empty rather
-/// than panicking — and empty is the conservative direction here: catch-up applies nothing and the
-/// zero-lag / parity legs of verification then refuse to reopen reads, rather than the alternative
-/// of admitting an unbounded tail.
-fn decode_seqs(raw: Option<&str>) -> std::collections::BTreeMap<String, u64> {
-    raw.and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default()
+/// A NULL / absent column is an EMPTY map, which legitimately means "no aggregate had committed rows
+/// at fence time, so apply nothing" — the shape a fresh cell produces.
+///
+/// A MALFORMED column is an ERROR, not an empty map. Degrading it to empty would make catch-up
+/// silently apply zero pre-fence events, and — because an empty expectation makes the parity legs
+/// compare `0 == 0` — that can pass verification. A corrupted journal row must stop the rebuild, not
+/// quietly narrow it.
+fn decode_seqs(
+    raw: Option<&str>,
+) -> Result<std::collections::BTreeMap<String, u64>, RebuildError> {
+    match raw {
+        None => Ok(std::collections::BTreeMap::new()),
+        Some(s) => serde_json::from_str(s).map_err(|_| {
+            RebuildError::Journal(
+                "the stored high-water watermark is malformed — refusing to treat a corrupt bound \
+                 as an empty one"
+                    .into(),
+            )
+        }),
+    }
 }
 
 /// Split the `owners_replayed` column back into scope keys. Empty segments are dropped (an empty
@@ -187,9 +200,12 @@ impl RebuildJournal for PgRebuildJournal {
                 high_water_mark: row
                     .get::<Option<i64>, _>("high_water_mark")
                     .map(|v| v.max(0) as u64),
+                pre_wipe_docs: row
+                    .get::<Option<i64>, _>("pre_wipe_docs")
+                    .map(|v| v.max(0) as u64),
                 high_water_seqs: decode_seqs(
                     row.get::<Option<String>, _>("high_water_seqs").as_deref(),
-                ),
+                )?,
                 owners_replayed: decode_owners(&row.get::<String, _>("owners_replayed")),
                 lease_holder: row.get::<Option<String>, _>("lease_holder"),
                 lease_expires_at: row.get::<i64, _>("lease_expires_at").max(0) as u64,
@@ -221,6 +237,8 @@ impl RebuildJournal for PgRebuildJournal {
                     .bind(next.lease_holder.as_deref())
                     .bind(next.lease_expires_at as i64)
                     .bind(seqs.as_str()) // $9
+                    .bind(Option::<i64>::None) // $10 unused on the insert arm
+                    .bind(next.pre_wipe_docs.map(|v| v as i64)) // $11
                     .execute(&self.pool)
                     .await,
                 // Every later write: conditional on the epoch this holder claimed under.
@@ -235,6 +253,7 @@ impl RebuildJournal for PgRebuildJournal {
                     .bind(next.lease_expires_at as i64)
                     .bind(expected as i64)
                     .bind(seqs.as_str())
+                    .bind(next.pre_wipe_docs.map(|v| v as i64))
                     .execute(&self.pool)
                     .await,
             }
@@ -260,6 +279,22 @@ mod tests {
             .collect();
         let encoded = encode_owners(&owners).expect("encodes");
         assert_eq!(decode_owners(&encoded), owners);
+    }
+
+    /// **A malformed watermark column is an ERROR, not a silent empty bound.** Degrading it to
+    /// empty makes catch-up apply nothing and — because an empty expectation makes parity compare
+    /// `0 == 0` — that can pass verification over a wiped index.
+    #[test]
+    fn a_malformed_watermark_is_refused_not_silently_emptied() {
+        assert!(
+            matches!(decode_seqs(Some("{not json")), Err(RebuildError::Journal(_))),
+            "a corrupt bound must stop the rebuild"
+        );
+        // A genuinely absent column is the legitimate empty case (a fresh cell).
+        assert_eq!(decode_seqs(None).unwrap().len(), 0);
+        assert_eq!(decode_seqs(Some("{}")).unwrap().len(), 0);
+        let parsed = decode_seqs(Some(r#"{"agg-a":3,"agg-b":7}"#)).unwrap();
+        assert_eq!(parsed.get("agg-b"), Some(&7));
     }
 
     /// An empty owner set encodes to an empty column and decodes back to empty — NOT to a set

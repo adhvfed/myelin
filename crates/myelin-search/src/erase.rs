@@ -299,15 +299,26 @@ impl SearchEraseHolder {
     /// per-tenant index DEK (the tenant KEK) so the WHOLE tenant index becomes plaintext-unrecoverable,
     /// live AND across backups (the backup-backstop half). Returns the destroyed key epoch (0 = the
     /// initial epoch) iff a key was present. This is the DEK lever — distinct from the per-subject purge.
-    pub fn erase_tenant(&self, tenant: &TenantId) -> EraseOutcome {
+    pub fn erase_tenant(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<EraseOutcome, crate::engine::IndexError> {
+        // A tenant decommission during a rebuild is the most destructive interleaving there is: the
+        // shred destroys the per-tenant index DEK, and the IN-FLIGHT replay then re-indexes the
+        // tenant's whole corpus afterwards under a freshly-minted key. The decommission reports
+        // success and the data comes back. Refuse, and name the remedy — the operator abandons the
+        // rebuild ([`crate::rebuild::RebuildCoordinator::abandon`]) and re-runs the offboard.
+        //
+        // This returns `Result` for exactly this reason: the previous signature could not refuse.
+        self.refuse_if_rebuilding(tenant)?;
         let shredded = self.dek.destroy_tenant_index_dek(tenant, &self.region);
-        EraseOutcome {
+        Ok(EraseOutcome {
             docs_purged: 0,
             // After a tenant-decommission shred there is no index to hold an orphan embedding (the whole
             // tenant index is crypto-shred unrecoverable) — the 0-orphan property holds by construction.
             zero_orphan_embedding: true,
             key_epoch_destroyed: shredded.then_some(0),
-        }
+        })
     }
 
     /// Build a synthetic `*.erased` tombstone for `doc_id` — the SAME envelope shape a real owner emits,
@@ -439,7 +450,11 @@ impl PersonalDataHolder for SearchEraseHolder {
                 (Self::subject_id(subject), tenant.0.clone(), outcome)
             }
             EraseScope::Tenant(tenant) => {
-                let outcome = self.erase_tenant(tenant);
+                // A refusal (the tenant is mid-rebuild) surfaces as a DSR error rather than a
+                // receipt — a decommission that did not happen must not mint one.
+                let outcome = self
+                    .erase_tenant(tenant)
+                    .map_err(|e| DsrError(format!("Search tenant erase failed: {e}")))?;
                 (String::new(), tenant.0.clone(), outcome)
             }
         };
