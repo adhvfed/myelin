@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS tenant_placement (
 ///      (multi-cell is single-region by construction).
 ///   3. **Region immutable on UPDATE → REJECT (§5.3 layer 1).** A region change is a
 ///      new-tenant-+-DSR, never an UPDATE; an UPDATE that changes `region` is refused.
+///
 /// Each rejection RAISEs with SQLSTATE `check_violation` (23514) + a loud, named reason (EI-01 §3).
 /// `CREATE OR REPLACE FUNCTION` is idempotent + forward-only-legal (no DROP).
 pub const PLACEMENT_INVARIANT_FN: &str = "\

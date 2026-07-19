@@ -23,7 +23,7 @@ use myelin_identity_service::{
 use myelin_storage::{KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -91,7 +91,7 @@ fn seed_tenant(store: &PrincipalStore, tenant: &str) {
 
 /// Build the real gateway over a known cell seed with Git registered over the DURABLE backend. Returns
 /// the gateway, the cell authority (to mint tokens), and the shared backend (to set repo-owned policy).
-fn build(root: &PathBuf) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBackend>) {
+fn build(root: &Path) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBackend>) {
     let cell = CellTokenAuthority::from_seed(&[7u8; 32], &[9u8; 32]).expect("cell authority");
     let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
     seed_tenant(&store, "acme");
@@ -105,7 +105,7 @@ fn build(root: &PathBuf) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBac
         Arc::new(KmsEngine::new()),
     )));
 
-    let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(root.clone()));
+    let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(root.to_path_buf()));
     let mut builder = Gateway::builder(authn, human_login, Arc::new(AllowAll)).route(
         Method::Get,
         "/v1/whoami",

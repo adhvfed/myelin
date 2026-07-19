@@ -359,8 +359,8 @@ impl PrincipalStore {
         }
     }
 
-    /// **Build the S1 store over the REAL durable PG backing (MR-007 / SI-018).** The principal rows
-    /// + KMS-sealed profile ciphertext + credential links persist through the MR-022
+    /// **Build the S1 store over the REAL durable PG backing (MR-007 / SI-018).** The principal rows,
+    /// KMS-sealed profile ciphertext, and credential links persist through the MR-022
     /// [`myelin_storage::SubstrateProvider`] pool + `with_tenant_tx` convention (RLS-scoped, no GUC
     /// bleed). `rt` is the tokio runtime handle the sync API drives the async backing on. The KMS
     /// engine is reused as-is (the profile-encryption boundary is unchanged); decrypt-across-restart

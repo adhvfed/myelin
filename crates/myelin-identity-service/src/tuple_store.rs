@@ -300,13 +300,15 @@ struct PgTupleBacking {
 /// consults for precondition/watermark reads, not the tuple store's data of record.
 #[derive(Clone, Default)]
 struct PgZookieWatermark {
-    inner: Arc<Mutex<HashMap<(String, String, String), Zookie>>>,
+    inner: Arc<Mutex<ZookieWatermarks>>,
 }
+
+type ZookieWatermarks = HashMap<(String, String, String), Zookie>;
 
 impl PgZookieWatermark {
     /// Lock the watermark index (poison-tolerant — a poisoned lock is a same-process panic-during-hold,
     /// which the consistency cache recovers from; the durable edges are unaffected).
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String, String), Zookie>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ZookieWatermarks> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }

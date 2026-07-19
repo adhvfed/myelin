@@ -1110,12 +1110,10 @@ impl DurableGitRepo {
         walk.set_sorting(git2::Sort::TIME).map_err(|e| git_err("revwalk sort", e))?;
         walk.push(tip).map_err(|e| git_err("revwalk push", e))?;
         let mut out: std::collections::BTreeMap<String, CommitMeta> = Default::default();
-        let mut seen = 0usize;
-        for oid_res in walk {
+        for (seen, oid_res) in walk.enumerate() {
             if seen >= cap {
                 break;
             }
-            seen += 1;
             let oid = oid_res.map_err(|e| git_err("revwalk next", e))?;
             let commit = repo.find_commit(oid).map_err(|e| git_err("find_commit", e))?;
             let tree = commit.tree().map_err(|e| git_err("commit tree", e))?;

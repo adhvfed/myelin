@@ -194,7 +194,14 @@ enum ErasureLedgerBackend {
     #[cfg(any(test, feature = "test-support"))]
     Memory(std::sync::Arc<std::sync::Mutex<BTreeMap<TenantId, WalOffset>>>),
     /// The durable production backing over the `restore_erasure_ledger` table.
-    Pg(crate::restore_verify_durable::DurableRestoreErasureLedger),
+    Pg(Box<crate::restore_verify_durable::DurableRestoreErasureLedger>),
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Default for ErasureLedger {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ErasureLedger {
@@ -213,7 +220,7 @@ impl ErasureLedger {
     /// `restore_erasure_ledger` table).
     pub fn with_pg(backing: crate::restore_verify_durable::DurableRestoreErasureLedger) -> ErasureLedger {
         ErasureLedger {
-            backend: ErasureLedgerBackend::Pg(backing),
+            backend: ErasureLedgerBackend::Pg(Box::new(backing)),
         }
     }
 

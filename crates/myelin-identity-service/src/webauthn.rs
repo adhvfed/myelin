@@ -167,7 +167,7 @@ impl CoseKey {
 
 /// Read a CBOR map value by **integer** label (COSE keys are integer-labelled). Total — a non-map or a
 /// missing label is `None`, never a panic.
-fn cbor_map_int<'a>(map: &'a [(Cbor, Cbor)], label: i128) -> Option<&'a Cbor> {
+fn cbor_map_int(map: &[(Cbor, Cbor)], label: i128) -> Option<&Cbor> {
     map.iter().find_map(|(k, v)| match k {
         Cbor::Integer(i) if i128::from(*i) == label => Some(v),
         _ => None,
