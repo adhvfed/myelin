@@ -550,6 +550,9 @@ fn payload_too_large(cap: usize) -> Response<EdgeBody> {
 fn to_hyper(resp: EdgeResponse) -> Response<EdgeBody> {
     match resp {
         EdgeResponse::Bytes { status, content_type, headers, body } => {
+            if !handler_response_headers_are_safe(&headers) {
+                return response_render_failure();
+            }
             let mut builder = Response::builder()
                 .status(status)
                 .header("content-type", content_type);
@@ -561,6 +564,9 @@ fn to_hyper(resp: EdgeResponse) -> Response<EdgeBody> {
                 .unwrap_or_else(|_| response_render_failure())
         }
         EdgeResponse::Sse { headers, sub } => {
+            if !handler_response_headers_are_safe(&headers) {
+                return response_render_failure();
+            }
             let mut builder = Response::builder()
                 .status(200)
                 .header("content-type", "text/event-stream")
@@ -574,6 +580,30 @@ fn to_hyper(resp: EdgeResponse) -> Response<EdgeBody> {
                 .unwrap_or_else(|_| response_render_failure())
         }
     }
+}
+
+fn handler_response_headers_are_safe(headers: &[(String, String)]) -> bool {
+    headers.iter().all(|(name, value)| {
+        let Ok(name) = hyper::header::HeaderName::from_bytes(name.as_bytes()) else {
+            return false;
+        };
+        if hyper::header::HeaderValue::from_str(value).is_err() {
+            return false;
+        }
+        !matches!(
+            name.as_str(),
+            "connection"
+                | "content-length"
+                | "content-type"
+                | "keep-alive"
+                | "proxy-connection"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+                | "x-request-id"
+        )
+    })
 }
 
 fn response_render_failure() -> Response<EdgeBody> {
@@ -797,6 +827,32 @@ mod tests {
         );
         assert_eq!(response.status(), 500);
         assert_eq!(response.headers()[hyper::header::CONTENT_TYPE], "application/json");
+    }
+
+    #[test]
+    fn handler_cannot_control_transport_owned_response_headers() {
+        for name in [
+            "connection",
+            "content-length",
+            "content-type",
+            "keep-alive",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "x-request-id",
+        ] {
+            assert!(
+                !handler_response_headers_are_safe(&[(name.into(), "value".into())]),
+                "{name} must remain transport-owned"
+            );
+        }
+        assert!(handler_response_headers_are_safe(&[
+            ("cache-control".into(), "no-store".into()),
+            ("set-cookie".into(), "session=opaque; HttpOnly".into()),
+            ("www-authenticate".into(), "Basic realm=\"Myelin\"".into()),
+        ]));
     }
 
     #[test]

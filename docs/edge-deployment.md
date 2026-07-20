@@ -90,3 +90,5 @@ Every response disables content-type sniffing. API responses, errors, and health
 HTTP's revalidation policy and SSE's `no-cache` stream policy.
 If handler response metadata cannot be rendered as valid HTTP, the adapter fails closed with the
 generic canonical 500 envelope; invalid metadata can never degrade into a successful empty response.
+Handlers also cannot supply framing or hop-by-hop headers, `Content-Type`, or `X-Request-Id`; those
+remain transport-owned so an application response cannot create ambiguous framing or spoof identity.
