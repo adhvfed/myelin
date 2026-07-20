@@ -35,6 +35,39 @@ fn run_gate_over(path: &Path) -> i32 {
         .expect("lint-gate exits with a code, not a signal")
 }
 
+/// Run the gate over `--no-exclude PATH` and capture `(exit_code, stderr)` — so a test can assert
+/// WHICH lint fired (violations print to stderr), not merely that the gate failed.
+fn run_gate_capture(path: &Path) -> (i32, String) {
+    let bin = env!("CARGO_BIN_EXE_lint-gate");
+    let out = Command::new(bin)
+        .arg("--no-exclude")
+        .arg(path)
+        .output()
+        .expect("the lint-gate binary must run");
+    let code = out.status.code().expect("lint-gate exits with a code");
+    (code, String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+#[test]
+fn per_lint_exclusion_suppresses_only_its_lint_and_the_file_still_trips_others() {
+    // The per-lint-exclusion probe fixture lives at a PATH matching the `no-raw-ci-verdict` per-lint
+    // exclusion (`myelin-flow/src/pg_executor.rs`), and carries BOTH a `signal_typed` token (which
+    // no-raw-ci-verdict would flag) AND a `std::process::Command::new` (a no-host-exec violation). The
+    // per-lint exclusion must suppress ONLY no-raw-ci-verdict here while EVERY OTHER lint still scans
+    // the file — proving the exclusion is NOT the whole-file bypass the earlier global-list version was.
+    let probe = fixtures_dir().join("perlint/myelin-flow/src/pg_executor.rs.txt");
+    let (code, stderr) = run_gate_capture(&probe);
+    assert_ne!(code, 0, "the file is still scanned by other lints, so it must fail loudly");
+    assert!(
+        stderr.contains("no-host-exec"),
+        "the per-lint-excluded file MUST still trip a DIFFERENT lint (no-host-exec), got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no-raw-ci-verdict"),
+        "no-raw-ci-verdict MUST be suppressed for its own excluded seam file, got: {stderr}"
+    );
+}
+
 #[test]
 fn ci_gate_fails_loudly_on_the_no_raw_publish_red_fixture() {
     // The EB-07 red fixture (a write-path `publish_now` + a direct `transport.put`): the gate MUST
@@ -140,6 +173,31 @@ fn ci_gate_passes_on_the_flow_determinism_green_fixture() {
     assert_eq!(
         code, 0,
         "lint-gate MUST exit zero on the flow-determinism green fixture"
+    );
+}
+
+#[test]
+fn ci_gate_fails_loudly_on_the_no_raw_ci_verdict_red_fixture() {
+    // The CI verdict-forging red fixture (a non-reporter handler constructing `SignalPayload::
+    // CiJobDone { passed: true }` + calling `.signal_typed(`): the gate MUST exit non-zero. A forged
+    // stage verdict bypasses the merge gate for a stage that never ran.
+    let red = fixtures_dir().join("no_raw_ci_verdict.red.rs.txt");
+    let code = run_gate_over(&red);
+    assert_ne!(
+        code, 0,
+        "lint-gate MUST exit non-zero on the no-raw-ci-verdict red fixture"
+    );
+}
+
+#[test]
+fn ci_gate_passes_on_the_no_raw_ci_verdict_green_fixture() {
+    // The green fixture (completion routed through the sanctioned reporter abstraction, no raw
+    // verdict): the gate MUST exit zero — proving the lint does not over-reject.
+    let green = fixtures_dir().join("no_raw_ci_verdict.green.rs.txt");
+    let code = run_gate_over(&green);
+    assert_eq!(
+        code, 0,
+        "lint-gate MUST exit zero on the no-raw-ci-verdict green fixture"
     );
 }
 

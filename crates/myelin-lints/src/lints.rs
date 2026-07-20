@@ -406,6 +406,93 @@ pub fn no_raw_publish() -> Lint {
     }
 }
 
+/// `no-raw-ci-verdict` (the CI stage-verdict forging surface — P-FLOW CI durability).
+///
+/// **Rule.** No code constructs a typed CI stage verdict (`SignalPayload::CiJobDone`) or calls the
+/// typed-signal delivery seam (`.signal_typed(`) outside the sanctioned sites. The durable
+/// `job.done` completion carries a stage PASS/FAIL verdict that the pipeline body trusts as the
+/// runner's real result; ANY in-process holder of a tenant executor could otherwise FORGE a passing
+/// verdict for a stage that never ran (a supply-chain / merge-gate bypass). The verdict must originate
+/// ONLY where the runner's real exit code is verified — modeled EXACTLY on `no-raw-publish` (a typed
+/// seam whose one legitimate caller is named, not hidden): the flow executors OWN the encoding
+/// (`myelin-flow/src/executor.rs`, `myelin-flow/src/pg_executor.rs`) and the sanctioned CI reporter
+/// (`myelin-ci-controlplane/src/ci_pipeline_driver.rs`) is the ONE production delivery site (the
+/// durable claimed-job verification lands there in the follow-on). Those three files are NAMED, LOUD
+/// exclusions in `lint-gate.rs` (like `myelin-events/src/relay.rs` for `no-raw-publish`); every other
+/// file is fully scanned, so a new forging call anywhere else is rejected.
+pub const NO_RAW_CI_VERDICT: LintId = LintId("no-raw-ci-verdict");
+
+/// Whether `haystack` contains `token` as a WHOLE identifier word — the char before and after the
+/// match are not identifier chars (`[A-Za-z0-9_]`). This flags `SignalPayload::CiJobDone`, a
+/// `use … CiJobDone as Done` alias line, a UFCS `DurableExecutor::signal_typed(…)`, and a
+/// `.signal_typed`-then-newline line-split (the token sits fully on the line), while NOT flagging a
+/// longer identifier that merely CONTAINS the token — e.g. the internal `signal_typed_async` bridge
+/// (the following `_` keeps it one word).
+fn contains_ci_verdict_token(haystack: &str, token: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(token) {
+        let start = from + rel;
+        let end = start + token.len();
+        let before_ok = start == 0 || !is_ident(bytes[start - 1]);
+        let after_ok = end == bytes.len() || !is_ident(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+fn scan_no_raw_ci_verdict(src: &str) -> Vec<Violation> {
+    // The CI verdict-forging fingerprints, matched as WHOLE-WORD TOKENS on each code line (comments +
+    // string literals stripped by `code_lines`): the typed-verdict TYPE `CiJobDone` (its construction
+    // OR any `use … as` alias naming it) and the typed-delivery METHOD `signal_typed` (a `.method`
+    // call, a UFCS `Trait::signal_typed(` call, or a `.signal_typed`-then-newline line-split). Bare
+    // whole-word matching (not a dotted/pathed literal) closes the alias/UFCS/line-split dodges; the
+    // internal `signal_typed_async` bridge is NOT flagged (the trailing `_` keeps it one word), and the
+    // seam files that define/implement the type live behind the per-lint exclusion in `lint-gate.rs`.
+    //
+    // HEURISTIC LIMIT (consistent with every other lint): macro-assembled or string-concatenated
+    // spellings that never write the literal token on a code line are out of scope — the lint is a
+    // pattern gate, not a type system.
+    const CI_VERDICT_TOKENS: &[&str] = &["CiJobDone", "signal_typed"];
+    let mut out = Vec::new();
+    for (line, code) in code_lines(src) {
+        for token in CI_VERDICT_TOKENS {
+            if contains_ci_verdict_token(&code, token) {
+                out.push(Violation {
+                    lint: NO_RAW_CI_VERDICT,
+                    line,
+                    reason: format!(
+                        "raw CI verdict token `{token}` forges a stage PASS/FAIL that the pipeline \
+                         body trusts as the runner's verified result — a typed `job.done` verdict \
+                         must originate ONLY where the runner's real guest exit code is verified (the \
+                         CI reporter seam). Do not name/construct `SignalPayload::CiJobDone` or call \
+                         `signal_typed` from arbitrary code; route completion through the sanctioned \
+                         reporter."
+                    ),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The [`Lint`] value for [`NO_RAW_CI_VERDICT`]. Enforced over the real workspace by the `lint-gate`
+/// binary (with the three seam files NAMED-excluded there), NOT part of the frozen `all_twelve`
+/// architecture ratchet — a seam-specific lint modeled on `no-raw-publish`, with its own red/green
+/// fixtures and self-tests.
+pub fn no_raw_ci_verdict() -> Lint {
+    Lint {
+        id: NO_RAW_CI_VERDICT,
+        rule: "no CI stage verdict (SignalPayload::CiJobDone / signal_typed) outside the sanctioned \
+               reporter + flow-executor seam",
+        scan: scan_no_raw_ci_verdict,
+    }
+}
+
 /// `no-host-exec` (§2.11; AG-2; X-6).
 ///
 /// **Rule.** No host-execution path bypassing `ToolHands::exec` (= the unified sandbox). A raw
@@ -1773,6 +1860,73 @@ mod tests {
         assert!(
             !no_raw_publish().run(red_broker).is_empty(),
             "broker.put( must be rejected"
+        );
+    }
+
+    #[test]
+    fn no_raw_ci_verdict_rejects_forged_verdict_admits_reporter_path() {
+        // The forge fingerprints: constructing the typed verdict OR calling the delivery seam.
+        let red_construct =
+            "let p = SignalPayload::CiJobDone { stage, passed: true, result_refs };";
+        let red_deliver = "executor.signal_typed(spec)?;";
+        assert!(
+            !no_raw_ci_verdict().run(red_construct).is_empty(),
+            "constructing SignalPayload::CiJobDone must be rejected"
+        );
+        assert!(
+            !no_raw_ci_verdict().run(red_deliver).is_empty(),
+            "calling .signal_typed( must be rejected"
+        );
+        // The sanctioned path: report completion through the reporter abstraction, no raw verdict.
+        let green = "reporter.report_done(&run, idem_token, &report)?;";
+        assert!(
+            no_raw_ci_verdict().run(green).is_empty(),
+            "the reporter path must be admitted"
+        );
+    }
+
+    #[test]
+    fn no_raw_ci_verdict_catches_alias_ufcs_and_line_split_dodges() {
+        // Bare whole-word token matching closes the alias / UFCS / line-split evasions a dotted/pathed
+        // literal would miss.
+        let alias = "use myelin_flow::SignalPayload::CiJobDone as Done;";
+        let ufcs = "DurableExecutor::signal_typed(&executor, spec)?;";
+        let line_split = "    executor\n        .signal_typed"; // the token sits on the split line
+        assert!(
+            !no_raw_ci_verdict().run(alias).is_empty(),
+            "a `use … CiJobDone as Done` alias must be caught"
+        );
+        assert!(
+            !no_raw_ci_verdict().run(ufcs).is_empty(),
+            "a UFCS `Trait::signal_typed(` call must be caught"
+        );
+        assert!(
+            !no_raw_ci_verdict().run(line_split).is_empty(),
+            "a `.signal_typed`-then-newline line-split must be caught"
+        );
+    }
+
+    #[test]
+    fn no_raw_ci_verdict_word_boundary_admits_longer_identifiers() {
+        // Whole-word matching does NOT flag a longer identifier that merely CONTAINS a token — the
+        // internal `signal_typed_async` bridge (trailing `_`) and a `_`-prefixed identifier are admitted.
+        let bridge = "bridge(&self.rt, self.signal_typed_async(spec))";
+        let prefixed = "let ci_job_done_count = jobs.len();";
+        assert!(
+            no_raw_ci_verdict().run(bridge).is_empty(),
+            "the internal signal_typed_async bridge must be admitted (word boundary)"
+        );
+        assert!(
+            no_raw_ci_verdict().run(prefixed).is_empty(),
+            "a longer identifier containing the token as a fragment must be admitted"
+        );
+        // The trait/impl DEFINITION `fn signal_typed(` IS a whole-word token and IS flagged by the
+        // scan — it is protected only by the per-lint exclusion of the seam files in `lint-gate.rs`,
+        // never by the scan pretending not to see it.
+        let def = "fn signal_typed(&self, spec: TypedSignalSpec) -> Result<SignalOutcome, E> {";
+        assert!(
+            !no_raw_ci_verdict().run(def).is_empty(),
+            "the definition is flagged by the scan; only the per-lint exclusion admits the seam file"
         );
     }
 

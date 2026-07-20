@@ -1,0 +1,14 @@
+// GREEN fixture for `no-raw-ci-verdict` — the lint MUST admit this.
+// Completion is reported through the SANCTIONED reporter abstraction: the reporter (the one site that
+// verifies the runner's real guest exit code) owns the verdict encoding + the typed delivery. This
+// caller hands the reporter the runner's report and never constructs `SignalPayload::CiJobDone` or
+// calls `signal_typed` itself — so no forged verdict can originate here.
+pub fn report_completion(
+    reporter: &dyn TerminalReporter,
+    run: &RunId,
+    idem_token: &str,
+    report: &TerminalReport,
+) -> Result<SignalOutcome, ExecutorError> {
+    // The reporter derives `passed` from the verified guest exit code and mints the verdict itself.
+    reporter.report_done(run, idem_token, report)
+}
