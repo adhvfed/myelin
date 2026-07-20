@@ -30,7 +30,9 @@ relative, root-level, temporary, or nonexistent path instead of silently placing
 `/tmp`. `scripts/dogfood.sh` creates its persistent XDG data directory and exports both values.
 Serving also requires explicit absolute `MYELIN_RUNSC_BIN` and `MYELIN_GVISOR_GIT_ROOTFS` paths. The
 rootfs must contain an executable `usr/bin/git`; a missing gVisor runtime or guest Git now fails
-startup instead of deferring a broken clone/push path until the first request.
+startup instead of deferring a broken clone/push path until the first request. The host must use
+cgroup v2 and delegate the `memory` controller: serving startup creates and removes a real bounded
+probe cgroup before touching PostgreSQL, then refuses if Git wire workloads could not be memory-capped.
 
 ## 1. Bring the data stack up
 
