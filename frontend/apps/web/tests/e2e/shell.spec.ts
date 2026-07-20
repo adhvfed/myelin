@@ -19,6 +19,32 @@ async function devLogin(page: Page) {
 }
 
 test.describe("MR-019 app shell — real browser", () => {
+  test("unsafe requests fail closed unless their full origin matches", async ({ page }) => {
+    const missing = await page.request.post("/login");
+    expect(missing.status()).toBe(403);
+    expect(missing.headers()["x-content-type-options"]).toBe("nosniff");
+
+    const crossOrigin = await page.request.post("/login", {
+      headers: { Origin: "https://evil.example" },
+    });
+    expect(crossOrigin.status()).toBe(403);
+
+    const schemeDowngrade = await page.request.put("/login", {
+      headers: { Origin: APP.replace("http://", "https://") },
+    });
+    expect(schemeDowngrade.status()).toBe(403);
+
+    const sameOrigin = await page.request.post("/login", {
+      headers: { Origin: APP },
+    });
+    expect(sameOrigin.status()).not.toBe(403);
+
+    const sameOriginReferer = await page.request.post("/login", {
+      headers: { Referer: `${APP}/login` },
+    });
+    expect(sameOriginReferer.status()).not.toBe(403);
+  });
+
   test("liveness and session-backed readiness are explicit and non-cacheable", async ({ page }) => {
     const health = await page.request.get("/healthz");
     expect(health.status()).toBe(200);
