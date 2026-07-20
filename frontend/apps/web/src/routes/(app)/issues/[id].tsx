@@ -8,7 +8,7 @@ import {
   StatusPill,
   useToast,
 } from "@myelin/design-system";
-import { ErrorBoundary, Show, Suspense, createMemo, createSignal } from "solid-js";
+import { ErrorBoundary, Show, Suspense, createMemo, createSignal, onMount } from "solid-js";
 import { getIssue, issuesMutate, type IssueErrorKind, type IssueVM } from "~/lib/api";
 import { isClosedCategory, issueErrorKind, issueTimestamp } from "~/lib/issue-view";
 
@@ -20,6 +20,10 @@ export default function IssueDetail() {
   const [confirming, setConfirming] = createSignal(false);
   const [closing, setClosing] = createSignal(false);
   const [closeError, setCloseError] = createSignal<IssueErrorKind | null>(null);
+  // SSR can paint before the lazily loaded route chunk hydrates. Keep the destructive control
+  // disabled until its click handler exists so an early user click is never silently discarded.
+  const [interactive, setInteractive] = createSignal(false);
+  onMount(() => setInteractive(true));
   const issue = createAsync(async (): Promise<{
     issue: IssueVM | null;
     error: IssueErrorKind | null;
@@ -92,7 +96,12 @@ export default function IssueDetail() {
 
               <Show when={!isClosedCategory(row().state_category)}>
                 <div class="issue-detail-actions">
-                  <button type="button" class="issues-button issues-button-danger" onClick={() => setConfirming(true)}>
+                  <button
+                    type="button"
+                    class="issues-button issues-button-danger"
+                    disabled={!interactive()}
+                    onClick={() => setConfirming(true)}
+                  >
                     <Icon name="close" /> Close issue
                   </button>
                   <Show when={closeError()}>

@@ -26,6 +26,58 @@ env:
   RUSTDOCFLAGS: "-C debuginfo=0"
 
 jobs:
+  frontend:
+    # The browser product is a production surface, not an optional build artifact. Run the complete
+    # frontend workspace gate plus the real-browser suite against a real Valkey session backend.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    services:
+      valkey:
+        image: valkey/valkey:8
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: frontend/package.json
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Install the locked frontend workspace
+        run: pnpm install --frozen-lockfile
+      - name: Lint every frontend package
+        run: pnpm lint
+      - name: Run component, server, and Valkey integration tests
+        run: pnpm test
+      - name: Build every frontend package for production
+        run: pnpm build
+      - name: Install the pinned Chromium browser and system dependencies
+        run: pnpm --filter @myelin/web exec playwright install --with-deps chromium
+      - name: Run the real-browser product suite
+        run: pnpm --filter @myelin/web test:e2e
+      - name: Upload Playwright traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-playwright-results
+          path: frontend/apps/web/test-results
+          if-no-files-found: ignore
+          retention-days: 7
+
   architecture-lints:
     # The committed-lint ratchet (contract 1.6). LOUD: the gate is the binary exit code + the
     # myelin-lints tests; there is deliberately NO `|| true` / `continue-on-error` anywhere.

@@ -6,6 +6,13 @@ import { defineConfig, devices } from "@playwright/test";
 // the rendered chrome + overlays, and ⌘K/keyboard reachability.
 const PORT = Number(process.env.PORT ?? 3000);
 const EDGE_PORT = Number(process.env.DEV_EDGE_PORT ?? 8787);
+// CI installs the exact Playwright-pinned browser and should let Playwright resolve it. Local
+// development keeps using the already-cached full Chromium binary unless explicitly overridden.
+const CHROMIUM_PATH =
+  process.env.CHROMIUM_PATH ??
+  (process.env.CI
+    ? undefined
+    : `${process.env.HOME}/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome`);
 
 export default defineConfig({
   testDir: "./tests/e2e",
@@ -27,11 +34,7 @@ export default defineConfig({
         // Use the CACHED chromium (no download): point at the full chrome binary so Playwright does
         // not reach for the version-pinned chrome-headless-shell it would otherwise fetch. Override
         // with CHROMIUM_PATH if the cache layout differs.
-        launchOptions: {
-          executablePath:
-            process.env.CHROMIUM_PATH ??
-            `${process.env.HOME}/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome`,
-        },
+        launchOptions: CHROMIUM_PATH ? { executablePath: CHROMIUM_PATH } : {},
       },
     },
   ],
