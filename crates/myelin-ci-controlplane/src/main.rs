@@ -94,6 +94,11 @@ async fn main() {
     // hooks, placeholder tenancy, and an unresolved stage-spec builder. Keep the flag reserved,
     // but refuse it before PostgreSQL bootstrap until all launch authorities are real and durable.
     let runner_setting = std::env::var("MYELIN_CI_RUNNER");
+    // Whether this boot requested runner-host activation (`MYELIN_CI_RUNNER=1`). Read by borrow BEFORE
+    // the setting is moved into the refusal check, so the ci_run starter lane below composes behind the
+    // SAME activation seam. It is `true` for `1` today, but the refusal exits first — so the starter
+    // composition stays DORMANT until the later activation flip removes that refusal.
+    let runner_host_requested = matches!(&runner_setting, Ok(value) if value == "1");
     if let Err(e) = verify_startup_activation(runner_setting) {
         eprintln!("ci-controlplane: startup refused: {e}");
         std::process::exit(1);
@@ -222,6 +227,30 @@ async fn main() {
         std::time::Duration::from_secs(15),
     );
     tokio::spawn(reaper.run());
+    // CT-004 — compose the per-tenant `ci_run`-poll STARTER lane behind the SAME `MYELIN_CI_RUNNER`
+    // activation seam the runner uses. `ci_run_starter_factory` builds the REAL, production-callable
+    // `PgCiRunStarterFactory` from the runtime pool + cell region + blob CAS: it mints an exact-cell
+    // `PgCiPipelineStarter` for a queued run's AUTHORITATIVE tenant (read from `ci_run.tenant_id`), so a
+    // region-wide poller can never stamp one tenant's authority onto another's run. Constructing it wraps
+    // the pool + blob client only — NO query runs at boot, and NO fixed service identity is ever bound.
+    //
+    // DORMANT until the activation flip: `runner_host_requested` is `true` only for `MYELIN_CI_RUNNER=1`,
+    // which the refusal above already exited before this line — so this block does not run today. The
+    // later flip removes that refusal and this composition activates with NO further wiring here. NAMED
+    // FLOORS the flip still closes: the region-wide queued-run poller that drives
+    // `starter_factory.starter_for(tenant, pin)` per discovered tenant, and the myelin-flow M2 durable
+    // `RunStore`.
+    if runner_host_requested {
+        let _starter_factory = myelin_ci_controlplane::ci_run_starter_factory(
+            provider.db_pool().clone(),
+            myelin_tenancy::Region(provider.config().region.clone()),
+            Arc::new(myelin_storage::s3blob::S3BlobStore::connect(
+                &provider.config().s3,
+                tokio::runtime::Handle::current(),
+            )),
+            tokio::runtime::Handle::current(),
+        );
+    }
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).
     match run_controlplane(Config::default(), outbox) {
@@ -250,6 +279,34 @@ mod tests {
         assert_eq!(
             verify_startup_activation(Ok("true".to_owned())),
             Err(StartupRefusal::InvalidRunnerSetting("true".to_owned()))
+        );
+    }
+
+    /// The `MYELIN_CI_RUNNER=1` request that gates the (dormant) ci_run starter-lane composition is the
+    /// SAME setting the refusal fires on: `runner_host_requested` is true ONLY for `1`, and for that
+    /// exact value `verify_startup_activation` still refuses — so the starter composition never runs
+    /// while the refusal stands (it activates only when the flip removes the refusal). Unset / `0` /
+    /// invalid never request runner-host activation.
+    #[test]
+    fn runner_host_request_is_the_refused_setting_so_the_starter_lane_stays_dormant() {
+        let requested = |setting: Result<String, VarError>| {
+            let host_requested = matches!(&setting, Ok(value) if value == "1");
+            (host_requested, verify_startup_activation(setting))
+        };
+        assert_eq!(
+            requested(Ok("1".to_owned())),
+            (true, Err(StartupRefusal::IncompleteProductionRunner)),
+            "MYELIN_CI_RUNNER=1 both requests the runner host AND is refused — the lane is dormant"
+        );
+        assert_eq!(requested(Err(VarError::NotPresent)), (false, Ok(())));
+        assert_eq!(requested(Ok("0".to_owned())), (false, Ok(())));
+        assert_eq!(
+            requested(Ok("true".to_owned())),
+            (
+                false,
+                Err(StartupRefusal::InvalidRunnerSetting("true".to_owned()))
+            ),
+            "an invalid setting neither requests the runner host nor boots"
         );
     }
 

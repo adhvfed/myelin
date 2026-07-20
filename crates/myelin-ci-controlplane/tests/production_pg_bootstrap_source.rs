@@ -39,6 +39,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let reaper = source
         .find("JobQueueReaper::new")
         .expect("production reaper must remain wired");
+    let starter_lane = source
+        .find("ci_run_starter_factory(")
+        .expect("the per-tenant ci_run starter lane must be composed at the root");
     let runner_gate = source
         .find("verify_startup_activation(runner_setting)")
         .expect("production runner activation must be refused explicitly");
@@ -54,6 +57,13 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(!source.contains("unresolved_stage_spec_builder"));
     assert!(!source.contains("TenantId(\"ci-controlplane\""));
     assert!(!source.contains("synthetic tenant"));
+    // The starter lane composes behind the SAME MYELIN_CI_RUNNER seam the runner uses, and stays DORMANT
+    // while the refusal stands: it is gated on the runner-host request, not spawned unconditionally.
+    assert!(source.contains("if runner_host_requested {"));
+    assert!(source.contains("let runner_host_requested = matches!(&runner_setting"));
+    // It routes an AUTHORITATIVE tenant, never a synthetic one — no starter is constructed for a fixed
+    // service tenant at the root (the factory mints per discovered ci_run.tenant_id).
+    assert!(!source.contains("PgCiPipelineStarter::new"));
     assert!(source.contains("InvalidRunnerSetting(String)"));
     assert!(source.contains("NonUnicodeRunnerSetting(OsString)"));
     assert!(!source.contains("std::env::var(\"MYELIN_CI_RUNNER\").ok()"));
@@ -71,7 +81,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(scheduler_handoff < shape_check);
     assert!(shape_check < first_store);
     assert!(first_store < reaper);
-    assert!(reaper < service);
+    assert!(reaper < starter_lane);
+    assert!(starter_lane < service);
 }
 
 #[test]

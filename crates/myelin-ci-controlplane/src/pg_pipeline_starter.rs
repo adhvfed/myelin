@@ -5,12 +5,16 @@
 //! pre-minted `workflow_run`, and the `queued -> running` transition are committed on one caller-owned
 //! PostgreSQL transaction.
 //!
-//! This module is deliberately not composed by the service main yet. The v1 plan and current CI
-//! schemas do not durably provide the runner lane/labels, timeout and resource authority, egress and
-//! workspace grants, per-run token, metering reservation, or check-attempt/context facts required to
-//! execute/report a job. This starter now freezes restart-safe version-1 stage/DAG identity only;
-//! registering a production body or enabling runner dispatch remains gated on the other authoritative
-//! fields and on replacing the main's no-op runner hooks.
+//! The service main composes this starter through [`PgCiRunStarterFactory`] (built at the composition
+//! root by [`crate::ci_run_starter_factory`]), behind the SAME `MYELIN_CI_RUNNER` activation seam the
+//! runner lane uses. That composition is REAL but DORMANT: while the startup refusal keeps
+//! `MYELIN_CI_RUNNER=1` fail-closed, the factory is constructed but no minted starter is driven, so no
+//! queued run is started yet. The v1 plan and current CI schemas still do not durably provide the
+//! runner lane/labels, timeout and resource authority, egress and workspace grants, per-run token,
+//! metering reservation, or check-attempt/context facts required to execute/report a job; this starter
+//! freezes restart-safe version-1 stage/DAG identity only. The remaining wires the later activation
+//! flip closes are the region-wide queued-run poller that routes each discovered run's authoritative
+//! tenant into [`PgCiRunStarterFactory::starter_for`] and the myelin-flow M2 durable `RunStore`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -434,6 +438,72 @@ impl PgCiPipelineStarter {
             PgCiStarterError::Database(format!("commit preflight selection: {error}"))
         })?;
         row.as_ref().map(decode_candidate).transpose()
+    }
+}
+
+/// **The per-(tenant, region) starter composition seam (the region-wide poller's router).** A
+/// [`PgCiPipelineStarter`] is bound to ONE explicit `(tenant, region)` cell and deliberately exposes no
+/// tenant enumeration. A control-plane node, however, serves a whole region: the runner lane claims
+/// across every tenant in its region, so the ci_run-poll autonomy wire must DISCOVER a queued run's
+/// authoritative tenant and route it to a starter composed for exactly that tenant — it may never reuse
+/// a synthetic service identity. This factory is that router: it captures the shared runtime
+/// dependencies (the runtime pool, the id minter, the blob CAS, the cell region) ONCE at the
+/// composition root and mints a fresh exact-cell starter for an explicit authoritative [`TenantId`] on
+/// demand. It never enumerates tenants itself. Constructing the factory wraps the pool + blob client
+/// only; no query runs until a minted starter's [`PgCiPipelineStarter::run_once`] is driven.
+#[derive(Clone)]
+pub struct PgCiRunStarterFactory {
+    pool: PgPool,
+    rt: tokio::runtime::Handle,
+    minter: Arc<dyn IdMinter>,
+    region: Region,
+    blobs: Arc<dyn BlobStore + Send + Sync>,
+}
+
+impl PgCiRunStarterFactory {
+    /// Bind the shared runtime dependencies for one cell region. The `region` is the residency boundary
+    /// every minted starter polls (and never crosses); `blobs` is the plan CAS the resolved run plan is
+    /// loaded from; `minter` mints the durable workflow's ids.
+    pub fn new(
+        pool: PgPool,
+        rt: tokio::runtime::Handle,
+        minter: Arc<dyn IdMinter>,
+        region: Region,
+        blobs: Arc<dyn BlobStore + Send + Sync>,
+    ) -> PgCiRunStarterFactory {
+        PgCiRunStarterFactory {
+            pool,
+            rt,
+            minter,
+            region,
+            blobs,
+        }
+    }
+
+    /// The cell region every minted starter is bound to (never crossed).
+    pub fn region(&self) -> &Region {
+        &self.region
+    }
+
+    /// **Mint the exact-cell starter for one authoritative tenant.** `tenant` MUST be read from the
+    /// queued `ci_run.tenant_id` the poller discovered (never a synthetic/service identity), so the
+    /// minted starter only ever polls and starts THAT tenant's queued runs in this factory's region;
+    /// `definition` pins the immutable deployed body version + code hash the start is allowed to bind.
+    /// Fails closed on an invalid tenant/region scope — never a widened cell.
+    pub fn starter_for(
+        &self,
+        tenant: TenantId,
+        definition: CiWorkflowDefinitionPin,
+    ) -> Result<PgCiPipelineStarter, PgCiStarterError> {
+        PgCiPipelineStarter::new(
+            self.pool.clone(),
+            self.rt.clone(),
+            self.minter.clone(),
+            tenant,
+            self.region.clone(),
+            self.blobs.clone(),
+            definition,
+        )
     }
 }
 
