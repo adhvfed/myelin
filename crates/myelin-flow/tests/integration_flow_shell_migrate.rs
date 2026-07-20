@@ -25,6 +25,55 @@ use myelin_events::OutboxStore;
 use myelin_flow::{flow_app_spec, SERVICE_NAME};
 use myelin_substrate::Config;
 
+/// Split a migration's DDL into top-level statements on `;`, but NOT on a `;` that sits inside a
+/// PostgreSQL dollar-quoted body (`$tag$ … $tag$`). The concurrent-index VALIDATION migration is a
+/// lone `DO $myelin$ … $myelin$` block whose body contains semicolons; a naive `split(';')` would
+/// shred it into unterminated fragments. (Production `PgMigrator` already parses dollar-quoting; this
+/// mirrors it for the test's per-statement executor, which the extended protocol requires so a lone
+/// `CREATE INDEX CONCURRENTLY` runs on its own.)
+fn split_sql_statements(ddl: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut rest = ddl;
+    let mut in_tag: Option<String> = None;
+    while let Some(ch) = rest.chars().next() {
+        if let Some(tag) = &in_tag {
+            if rest.starts_with(tag.as_str()) {
+                current.push_str(tag);
+                rest = &rest[tag.len()..];
+                in_tag = None;
+                continue;
+            }
+            current.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        } else if ch == '$' {
+            // A dollar tag is `$` + [A-Za-z0-9_]* + `$`.
+            if let Some(close) = rest[1..].find('$') {
+                let body = &rest[1..1 + close];
+                if body.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    let tag = format!("${body}$");
+                    current.push_str(&tag);
+                    rest = &rest[tag.len()..];
+                    in_tag = Some(tag);
+                    continue;
+                }
+            }
+            current.push('$');
+            rest = &rest[1..];
+        } else if ch == ';' {
+            out.push(std::mem::take(&mut current));
+            rest = &rest[1..];
+        } else {
+            current.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    if !current.trim().is_empty() {
+        out.push(current);
+    }
+    out
+}
+
 /// **The shell's migrate phase is REAL DDL Postgres accepts.** Take the migration set the
 /// `flow_app_spec` AppSpec carries (the six P-FLOW-01 tables), apply every statement against live
 /// Postgres as the admin/migration role into a per-process schema, and assert all six tables
@@ -48,8 +97,8 @@ async fn flow_shell_migration_set_applies_against_live_postgres() {
     assert_eq!(spec.name, SERVICE_NAME);
     assert_eq!(
         spec.migrations.0.len(),
-        10,
-        "six table creates plus four online workflow control/drive expands"
+        12,
+        "six table creates plus six online workflow control/drive/repair expands (incl. the concurrent-index validation)"
     );
 
     // A per-process schema so concurrent test runs isolate + cleanup is a single DROP SCHEMA. All
@@ -72,9 +121,11 @@ async fn flow_shell_migration_set_applies_against_live_postgres() {
         .unwrap();
 
     // Apply each migration's DDL (it is one-or-more `;`-separated statements: CREATE TABLE [+ index]
-    // [+ RLS-scope call]) against live Postgres — exactly what boot's migrate phase runs.
+    // [+ RLS-scope call], or a lone `DO $tag$…$tag$` catalog check) against live Postgres — exactly
+    // what boot's migrate phase runs. The split is DOLLAR-QUOTE-AWARE so a `;` INSIDE a `$tag$…$tag$`
+    // body (the concurrent-index validation DO block) is not a statement boundary.
     for migration in &spec.migrations.0 {
-        for stmt in migration.ddl.split(';') {
+        for stmt in split_sql_statements(migration.ddl) {
             let stmt = stmt.trim();
             if stmt.is_empty() {
                 continue;

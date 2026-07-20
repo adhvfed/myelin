@@ -305,7 +305,7 @@ pub use engine::{
 pub use executor::partition_for_run_id;
 pub use executor::{
     DurableExecutor, ExecutorError, FlowExecutor, RunBudget, RunId, RunStatus, SignalOutcome,
-    SignalSpec, StartSpec, PARTITION_COUNT,
+    SignalPayload, SignalSpec, StartSpec, TypedSignalSpec, PARTITION_COUNT,
 };
 pub use holder::{
     flow_history_holder, flow_store_classifier, register_flow_holder, FlowBacking,
@@ -356,6 +356,6 @@ pub use timer::{
     TimerWheel, SECS_PER_MINUTE,
 };
 pub use wfctx::{
-    attempt_state, history_kind, ActivityError, ConsumedSignalCommand, RetryPolicy, StagedWfDrive,
-    WaitOutcome, WfCtx, WfError, WfJournal, WfResult,
+    attempt_state, history_kind, ActivityError, ConsumedSignalCommand, ParkCondition, RetryPolicy,
+    StagedWfDrive, WaitOutcome, WfCtx, WfError, WfJournal, WfResult,
 };

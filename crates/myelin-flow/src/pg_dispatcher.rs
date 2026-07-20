@@ -293,12 +293,23 @@ pub struct PgDriveBatch {
     pub saturated: bool,
 }
 
+/// How often a `run_once` FORCES a stranded-run repair sweep regardless of backlog (the every-Nth
+/// cadence). Repair otherwise runs only when a normal claim finds nothing, so a CONTINUOUS backlog of
+/// runnable work would starve stranded `waiting` rows indefinitely. 64 bounds the extra cost to one
+/// indexed `SKIP LOCKED` scan per 64 drives (~1.5% overhead) while guaranteeing a stranded row is
+/// swept within at most 64 drives even under saturation. The scan is backed by a partial index on
+/// `state='waiting'` (migration `flow_0011`), so the forced probe is cheap even on a large partition.
+const REPAIR_PROBE_CADENCE: u64 = 64;
+
 /// Production adapter joining the durable control surface to the fenced drive store.
 pub struct PgFlowWorker {
     store: PgFlowDriveStore,
     executor: PgFlowExecutor,
     scope: PgWorkerScope,
     bodies: HashMap<(String, i32), RegisteredBody>,
+    /// Monotone `run_once` counter driving the [`REPAIR_PROBE_CADENCE`] forced-repair sweep — so
+    /// stranded `waiting` rows are recovered on a bounded cadence even under a continuous backlog.
+    repair_probe: AtomicU64,
 }
 
 impl PgFlowWorker {
@@ -321,6 +332,7 @@ impl PgFlowWorker {
             executor,
             scope,
             bodies: HashMap::new(),
+            repair_probe: AtomicU64::new(0),
         }
     }
 
@@ -378,19 +390,67 @@ impl PgFlowWorker {
         let mut definitions: Vec<_> = self.bodies.keys().cloned().collect();
         definitions.sort();
         let mut claimed = None;
-        for (wf_type, version) in definitions {
-            claimed = self
-                .store
-                .claim_runnable_definition(
-                    self.scope.partition,
-                    &wf_type,
-                    version,
-                    &self.scope.worker,
-                    self.scope.lease_ttl_secs,
-                )
-                .await?;
-            if claimed.is_some() {
-                break;
+
+        // FORCED-REPAIR CADENCE: on every `REPAIR_PROBE_CADENCE`-th `run_once`, sweep for a stranded
+        // `waiting`-with-pending-signal run FIRST — so repair never starves behind a continuous
+        // backlog of runnable work (a normal claim would otherwise always win and the fallback sweep
+        // below would never run). Cheap (one indexed `SKIP LOCKED` scan) and bounded (at most one
+        // stranded row recovered per probe).
+        let probe = self.repair_probe.fetch_add(1, Ordering::Relaxed) + 1;
+        if probe.is_multiple_of(REPAIR_PROBE_CADENCE) {
+            for (wf_type, version) in &definitions {
+                claimed = self
+                    .store
+                    .claim_stranded_signal_wait(
+                        self.scope.partition,
+                        wf_type,
+                        *version,
+                        &self.scope.worker,
+                        self.scope.lease_ttl_secs,
+                    )
+                    .await?;
+                if claimed.is_some() {
+                    break;
+                }
+            }
+        }
+
+        if claimed.is_none() {
+            for (wf_type, version) in &definitions {
+                claimed = self
+                    .store
+                    .claim_runnable_definition(
+                        self.scope.partition,
+                        wf_type,
+                        *version,
+                        &self.scope.worker,
+                        self.scope.lease_ttl_secs,
+                    )
+                    .await?;
+                if claimed.is_some() {
+                    break;
+                }
+            }
+        }
+        // Belt-and-braces: if nothing was runnable, try to REPAIR a run stranded `waiting` with a
+        // matching unconsumed signal (recovers rows stranded by older code / manual repair — the
+        // commit-side race fix prevents new strandings). A repaired run is claimed `running` + leased,
+        // then driven exactly like a normal claim (replay re-issues the wait + consumes the signal).
+        if claimed.is_none() {
+            for (wf_type, version) in &definitions {
+                claimed = self
+                    .store
+                    .claim_stranded_signal_wait(
+                        self.scope.partition,
+                        wf_type,
+                        *version,
+                        &self.scope.worker,
+                        self.scope.lease_ttl_secs,
+                    )
+                    .await?;
+                if claimed.is_some() {
+                    break;
+                }
             }
         }
         let Some(lease) = claimed else {
@@ -624,6 +684,7 @@ fn build_commit(
         outbox: Vec::new(),
         consumed_signals: Vec::new(),
         disarmed_timer_ids: Vec::new(),
+        park: None,
     });
     let signal_keys: HashMap<_, _> = staged
         .consumed_signals
@@ -667,6 +728,13 @@ fn build_commit(
         DriveOutcome::Waiting => run_state::WAITING,
         DriveOutcome::Nondeterministic(_) => run_state::NONDETERMINISTIC,
     };
+    // The park descriptor rides the commit ONLY for a waiting settlement — it is what closes the
+    // signal/park race (a matching signal that landed mid-drive settles the run runnable). A
+    // non-waiting settlement discards it (a completed/failed run is not parked on anything).
+    let park = match outcome {
+        DriveOutcome::Waiting => staged.park,
+        _ => None,
+    };
     Ok(DriveCommit {
         drive_id: format!(
             "{}/cursor-{}/epoch-{}",
@@ -679,6 +747,7 @@ fn build_commit(
         timers,
         timer_disarms: staged.disarmed_timer_ids,
         outbox: staged.outbox,
+        park,
     })
 }
 
