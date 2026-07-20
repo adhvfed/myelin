@@ -129,6 +129,6 @@ pub use repo_authz_live::{
     RepoBootstrapGrants, TupleRepoBootstrap, REPO_ADMIN_RELATION,
 };
 pub use request::{EdgeRequest, EdgeResponse};
-pub use server::serve_edge;
+pub use server::{serve_edge, serve_edge_until_shutdown, ShutdownOutcome};
 pub use session::{SessionRecord, SessionStore, SESSION_COOKIE};
 pub use sse::{SseEvent, SseHub, SseSubscription};
