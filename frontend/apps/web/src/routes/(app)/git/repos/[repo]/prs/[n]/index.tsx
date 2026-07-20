@@ -18,6 +18,7 @@ import {
   createSignal,
   createEffect,
   onCleanup,
+  untrack,
 } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, revalidate, useAction, useParams } from "@solidjs/router";
@@ -242,7 +243,7 @@ function ChecksUnavailable(props: { onRetry: () => void }) {
     <section aria-labelledby="checks-heading" data-testid="checks-unavailable" style={{ ...card }}>
       <h2 id="checks-heading" style={{ "font-size": "var(--fs-h3)", margin: "0" }}>Checks</h2>
       <p role="note" style={{ margin: "0", color: "var(--text-muted)" }}>Checks unavailable — the checks service didn't respond. The rest of the pull request is unaffected.</p>
-      <button type="button" onClick={props.onRetry} style={{ ...barBtn, "align-self": "flex-start" }}>
+      <button type="button" onClick={() => props.onRetry()} style={{ ...barBtn, "align-self": "flex-start" }}>
         Retry
       </button>
     </section>
@@ -612,7 +613,7 @@ function MergeCard(props: {
 }) {
   const doMutate = useAction(prMutate);
   const [confirm, setConfirm] = createSignal(false);
-  const [live, setLive] = createSignal<PrChecksVM>(props.checks);
+  const [live, setLive] = createSignal<PrChecksVM>(untrack(() => props.checks));
   createEffect(() => setLive(props.checks));
 
   const blockedReasons = createMemo(() => {

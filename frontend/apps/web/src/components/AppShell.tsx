@@ -11,6 +11,7 @@ import {
   createContext,
   createEffect,
   createSignal,
+  on,
   onCleanup,
   onMount,
   useContext,
@@ -124,10 +125,7 @@ export function AppShell(props: AppShellProps) {
     onCleanup(() => mq.removeEventListener("change", sync));
   });
   // Route change auto-closes the drawer (NOTES §1b).
-  createEffect(() => {
-    location.pathname;
-    setPaneDrawerOpen(false);
-  });
+  createEffect(on(() => location.pathname, () => setPaneDrawerOpen(false), { defer: true }));
   // The pane content a nested route supplies via `useContextPane()` (or the direct prop). The prop
   // wins when present; otherwise the context signal drives the region.
   const [ctxPaneThunk, setCtxPaneThunk] = createSignal<(() => JSX.Element) | null>(null);

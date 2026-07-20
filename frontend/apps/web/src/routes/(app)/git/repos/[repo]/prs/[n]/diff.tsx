@@ -102,7 +102,8 @@ export default function PrDiffScreen() {
     const d = diff();
     if (!d || typeof localStorage === "undefined") return;
     const s = readViewed(d);
-    s.has(path) ? s.delete(path) : s.add(path);
+    if (s.has(path)) s.delete(path);
+    else s.add(path);
     localStorage.setItem(viewedKey(d), JSON.stringify([...s]));
     setViewedTick((t) => t + 1);
     setLive(`${path} marked ${s.has(path) ? "viewed, collapsed" : "not viewed"}`);
@@ -232,13 +233,13 @@ export default function PrDiffScreen() {
                       deepLink={deepLinkExists() ? deepLink() : null}
                       renderThread={(path, _side, line) => {
                         const ts = liveThreadsFor(path, line);
-                        return ts.length ? <div data-diff-widget>{ts.map((t) => <ThreadCard thread={t} />)}</div> : undefined;
+                        return ts.length ? <div data-diff-widget><For each={ts}>{(t) => <ThreadCard thread={t} />}</For></div> : undefined;
                       }}
                       renderFileThreads={(path) => {
                         const ts = detachedThreadsFor(path);
                         return ts.length ? (
                           <div data-diff-widget data-testid="detached-threads" style={{ padding: "var(--space-2) var(--space-3)", "border-block-end": "var(--hairline) solid var(--border)" }}>
-                            {ts.map((t) => <ThreadCard thread={t} outdated />)}
+                            <For each={ts}>{(t) => <ThreadCard thread={t} outdated />}</For>
                           </div>
                         ) : undefined;
                       }}
