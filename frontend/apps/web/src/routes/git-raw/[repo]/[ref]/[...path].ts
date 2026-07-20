@@ -1,10 +1,11 @@
 // The raw/download BROWSER PROXY (R3.4) — a same-origin server route the browser can hit for a file's
 // bytes. It runs server-side, reads the httpOnly session token, and streams the edge's gateway-proxied
-// raw/download endpoint back to the browser WITH the edge's `Content-Disposition` (attachment for a
-// download). This keeps bytes IN-REGION behind the auth gate — no public signed URL, no CDN of private
-// bytes (the sovereignty rail, BINDING). `?d=attachment` selects the download (attachment) variant;
-// anything else is the inline `raw` variant.
+// raw/download endpoint back with a proxy-owned disposition. This keeps bytes IN-REGION behind the
+// auth gate — no public signed URL, no CDN of private bytes (the sovereignty rail, BINDING) — while
+// ensuring repo-controlled HTML/SVG cannot become active content on the authenticated app origin.
+// `?d=attachment` selects a forced download; anything else is the inert inline `raw` variant.
 import type { APIEvent } from "@solidjs/start/server";
+import { rawResponseHeaders } from "~/lib/raw-response";
 import { edgeGetRaw } from "~/server/gateway";
 import { Unauthorized } from "~/server/gateway";
 
@@ -23,12 +24,7 @@ export async function GET(event: APIEvent) {
 
   try {
     const res = await edgeGetRaw(edgePath);
-    const headers = new Headers({
-      "content-type": res.contentType,
-      // Never let the browser sniff a repo blob into an executable type.
-      "x-content-type-options": "nosniff",
-    });
-    if (res.contentDisposition) headers.set("content-disposition", res.contentDisposition);
+    const headers = rawResponseHeaders({ attachment, contentType: res.contentType, path });
     return new Response(res.body, { status: res.status, headers });
   } catch (e) {
     if (e instanceof Unauthorized) {

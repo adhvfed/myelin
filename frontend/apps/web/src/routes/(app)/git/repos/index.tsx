@@ -13,7 +13,7 @@ import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 import { ReposEmptyState } from "~/components/ReposEmptyState";
 
 export default function ReposScreen() {
-  const repos = createAsync(() => getRepos());
+  const repos = createAsync(() => getRepos(), { deferStream: true });
   const viewer = createAsync(() => getViewer());
 
   return (

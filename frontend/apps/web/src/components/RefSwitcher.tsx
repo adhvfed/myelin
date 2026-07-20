@@ -16,7 +16,7 @@ export interface RefSwitcherProps {
 }
 
 export function RefSwitcher(props: RefSwitcherProps) {
-  const refs = createAsync(async () => getRefs(props.repo));
+  const refs = createAsync(async () => getRefs(props.repo), { deferStream: true });
   const [filter, setFilter] = createSignal("");
 
   const match = (rows: RefRow[] | undefined): RefRow[] => {

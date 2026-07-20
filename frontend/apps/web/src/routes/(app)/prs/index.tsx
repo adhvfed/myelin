@@ -11,8 +11,14 @@ import { getMyPrs, type PrListRowVM, type PrListPage } from "~/lib/api";
 import { prTitleText, isTitleFallback, updatedLabel, reviewMarker, bucketPageSummary } from "~/lib/pr-view";
 
 export default function CrossRepoPrsScreen() {
-  const needsReview = createAsync(() => getMyPrs({ bucket: "needs-review" }));
-  const yours = createAsync(() => getMyPrs({ bucket: "yours" }));
+  const needsReview = createAsync(
+    () => getMyPrs({ bucket: "needs-review" }),
+    { deferStream: true },
+  );
+  const yours = createAsync(
+    () => getMyPrs({ bucket: "yours" }),
+    { deferStream: true },
+  );
 
   return (
     <section aria-labelledby="myprs-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-4)" }}>

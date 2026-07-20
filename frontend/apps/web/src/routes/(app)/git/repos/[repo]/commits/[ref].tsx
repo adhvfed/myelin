@@ -17,8 +17,10 @@ export default function CommitLogScreen() {
   const [search] = useSearchParams();
   const cursor = () => (typeof search.cursor === "string" ? search.cursor : undefined);
   const ready = () => Boolean(params.repo && params.ref);
-  const commits = createAsync(async () =>
-    ready() ? getCommits({ repo: params.repo!, ref: params.ref!, cursor: cursor() }) : undefined,
+  const commits = createAsync(
+    async () =>
+      ready() ? getCommits({ repo: params.repo!, ref: params.ref!, cursor: cursor() }) : undefined,
+    { deferStream: true },
   );
 
   const linkTo = (c?: string | null) => {

@@ -23,8 +23,10 @@ export default function BlobScreen() {
   const params = useParams();
   const path = () => params.path ?? "";
   const ready = () => Boolean(params.repo && params.ref && path());
-  const blob = createAsync(async () =>
-    ready() ? getBlob({ repo: params.repo!, ref: params.ref!, path: path() }) : undefined,
+  const blob = createAsync(
+    async () =>
+      ready() ? getBlob({ repo: params.repo!, ref: params.ref!, path: path() }) : undefined,
+    { deferStream: true },
   );
 
   const encPath = () => path().split("/").map(encodeURIComponent).join("/");

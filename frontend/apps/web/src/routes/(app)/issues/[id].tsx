@@ -28,9 +28,10 @@ export default function IssueDetail() {
     try {
       return { issue: await getIssue(params.id), error: null };
     } catch (error) {
+      if (error instanceof Response) throw error;
       return { issue: null, error: issueErrorKind(error) };
     }
-  });
+  }, { deferStream: true });
   const current = createMemo(() => replacement() ?? issue()?.issue);
 
   const close = async () => {

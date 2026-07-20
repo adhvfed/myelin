@@ -150,12 +150,11 @@ async function edgeRequest<T>(
 
 /** The RAW byte-fetch (R3.4 raw/download proxy). Streams an edge blob through the SAME server-side
  *  auth (Bearer from the session cookie; never a public signed URL — the sovereignty rail), with ONE
- *  refresh retry on 401. Returns the status, the edge's content-type + content-disposition (so the
- *  proxy route forwards `attachment`), and the raw bytes. Binary-safe (never text-decodes the body). */
+ *  refresh retry on 401. Returns the status, the edge's content-type, and raw bytes. The browser
+ *  proxy owns a safe Content-Disposition rather than trusting blob metadata. Binary-safe. */
 export interface RawEdgeResponse {
   status: number;
   contentType: string;
-  contentDisposition: string | null;
   body: ArrayBuffer;
 }
 
@@ -194,7 +193,6 @@ export async function edgeGetRaw(path: string): Promise<RawEdgeResponse> {
   return {
     status: res.status,
     contentType: res.headers.get("content-type") ?? "application/octet-stream",
-    contentDisposition: res.headers.get("content-disposition"),
     body: await res.arrayBuffer(),
   };
 }
