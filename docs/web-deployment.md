@@ -44,5 +44,5 @@ operations and must gate traffic; a Valkey outage returns 503. Send probes throu
 include its trusted `X-Forwarded-Proto: https` assertion on the private hop. The image declares a
 liveness `HEALTHCHECK` and uses `SIGTERM` as its stop signal.
 
-This artifact contains only the web gateway. The Rust edge, persistent Git storage, and gVisor guest
-rootfs require their own deployment artifact and are not bundled into this image.
+This artifact contains only the web gateway. Deploy the Rust edge, persistent Git storage, and gVisor
+guest rootfs through the separate host-native contract in [`edge-deployment.md`](edge-deployment.md).

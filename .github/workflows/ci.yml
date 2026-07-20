@@ -29,6 +29,28 @@ env:
   RUSTDOCFLAGS: "-C debuginfo=0"
 
 jobs:
+  edge-release-bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main 2026-07-20
+        with:
+          tool-cache: false
+          large-packages: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-20
+        with:
+          toolchain: stable
+      - name: Build the locked, stripped, checksummed edge release bundle
+        run: scripts/build-edge-release.sh
+      - name: Upload the edge release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: edge-release-${{ runner.arch }}
+          path: target/release-bundles/*.tar.gz*
+          if-no-files-found: error
+
   frontend:
     # The browser product is a production surface, not an optional build artifact. Run the complete
     # frontend workspace gate plus the real-browser suite against a real Valkey session backend.
