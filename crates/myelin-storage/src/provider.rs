@@ -688,6 +688,16 @@ impl SubstrateProvider {
         &self.pool
     }
 
+    /// Execute a real, tenant-neutral PostgreSQL round trip for orchestration readiness. This never
+    /// exposes the driver error or DSN; callers need only the verdict and must keep liveness separate.
+    pub async fn database_is_ready(&self) -> bool {
+        // @tenant-cross-scope: a constant readiness query reads no tenant data.
+        sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(&self.pool)
+            .await
+            .is_ok_and(|value| value == 1)
+    }
+
     /// The env-driven config (so a store can read the `region` pin / S3 / Redis endpoints).
     pub fn config(&self) -> &MyelinConfig {
         &self.config

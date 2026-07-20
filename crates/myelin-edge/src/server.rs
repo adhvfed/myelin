@@ -21,6 +21,7 @@ use hyper_util::rt::TokioIo;
 use hyper_util::server::graceful::GracefulShutdown;
 use std::convert::Infallible;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -55,6 +56,24 @@ const MAX_REQUEST_BODY_BYTES: usize = 100 * 1024 * 1024;
 pub enum ShutdownOutcome {
     Graceful { connections: usize },
     Forced { connections: usize },
+}
+
+/// Boxed asynchronous readiness check. The probe reports only a verdict; transport responses never
+/// expose connection strings, filesystem paths, or dependency error details.
+pub type ReadinessCheck<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+
+/// Critical-dependency readiness seam used by the unauthenticated orchestration probe.
+pub trait ReadinessProbe: Send + Sync {
+    fn check(&self) -> ReadinessCheck<'_>;
+}
+
+#[derive(Debug)]
+struct AlwaysReady;
+
+impl ReadinessProbe for AlwaysReady {
+    fn check(&self) -> ReadinessCheck<'_> {
+        Box::pin(std::future::ready(true))
+    }
 }
 
 /// Why a bounded collect stopped short of returning the full body.
@@ -120,6 +139,27 @@ pub async fn serve_edge_until_shutdown<F, T>(
 where
     F: Future<Output = T>,
 {
+    serve_edge_until_shutdown_with_probe(
+        listener,
+        gateway,
+        Arc::new(AlwaysReady),
+        shutdown,
+        grace,
+    )
+    .await
+}
+
+/// Production variant of [`serve_edge_until_shutdown`] with an explicit dependency-readiness probe.
+pub async fn serve_edge_until_shutdown_with_probe<F, T>(
+    listener: TcpListener,
+    gateway: Arc<Gateway>,
+    readiness: Arc<dyn ReadinessProbe>,
+    shutdown: F,
+    grace: Duration,
+) -> std::io::Result<(ShutdownOutcome, T)>
+where
+    F: Future<Output = T>,
+{
     tokio::pin!(shutdown);
     let graceful = GracefulShutdown::new();
     let mut connections = JoinSet::new();
@@ -139,11 +179,15 @@ where
                 };
                 let io = TokioIo::new(stream);
                 let gw = gateway.clone();
+                let readiness = readiness.clone();
                 let watcher = graceful.watcher();
                 connections.spawn(async move {
                     let service = service_fn(move |req: Request<Incoming>| {
                         let gw = gw.clone();
-                        async move { Ok::<_, Infallible>(handle_connection(gw, req).await) }
+                        let readiness = readiness.clone();
+                        async move {
+                            Ok::<_, Infallible>(handle_connection(gw, readiness, req).await)
+                        }
                     });
                     let connection = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, service);
@@ -184,10 +228,32 @@ where
 }
 
 /// Convert one hyper request → [`EdgeRequest`], run the gateway, convert the response back.
-async fn handle_connection(gw: Arc<Gateway>, req: Request<Incoming>) -> Response<EdgeBody> {
+async fn handle_connection(
+    gw: Arc<Gateway>,
+    readiness: Arc<dyn ReadinessProbe>,
+    req: Request<Incoming>,
+) -> Response<EdgeBody> {
     let (parts, body) = req.into_parts();
     let method = parts.method.as_str().to_string();
     let path = parts.uri.path().to_string();
+    if matches!(path.as_str(), "/livez" | "/readyz") {
+        let status = match method.as_str() {
+            "GET" | "HEAD" if path == "/livez" => 200,
+            "GET" | "HEAD" if readiness.check().await => 200,
+            "GET" | "HEAD" => 503,
+            _ => 405,
+        };
+        let body = if method == "HEAD" {
+            Vec::new()
+        } else if status == 200 {
+            br#"{"status":"ok"}"#.to_vec()
+        } else if status == 503 {
+            br#"{"status":"not_ready"}"#.to_vec()
+        } else {
+            br#"{"status":"method_not_allowed"}"#.to_vec()
+        };
+        return probe_response(status, body);
+    }
     let query = parts.uri.query().unwrap_or("").to_string();
     let headers = parts
         .headers
@@ -209,6 +275,19 @@ async fn handle_connection(gw: Arc<Gateway>, req: Request<Incoming>) -> Response
     };
     let edge_req = EdgeRequest::new(method, path, query, headers, bytes);
     to_hyper(gw.handle(edge_req))
+}
+
+fn probe_response(status: u16, body: Vec<u8>) -> Response<EdgeBody> {
+    let mut response = Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .header("cache-control", "no-store");
+    if status == 405 {
+        response = response.header("allow", "GET, HEAD");
+    }
+    response
+        .body(full_body(body))
+        .unwrap_or_else(|_| Response::new(full_body(b"{}".to_vec())))
 }
 
 /// True iff a `Content-Length` header is present, parseable, and DECLARES more than `cap` bytes — the
