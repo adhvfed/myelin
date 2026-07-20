@@ -191,8 +191,18 @@ async fn b_provider_builds_real_pool_from_env_and_migrates_foundation() {
         .await
         .expect("the env-built pool reaches the live DB");
     assert_eq!(one, 1);
+    assert!(
+        provider.database_is_ready().await,
+        "readiness executes a real PostgreSQL round trip"
+    );
     // The env config is threaded through the provider (the residency region pin).
     assert!(!provider.config().region.is_empty(), "the provider carries the region pin");
+
+    provider.db_pool().close().await;
+    assert!(
+        !provider.database_is_ready().await,
+        "a closed production pool must report not-ready"
+    );
 
     // The substrate's co-located FOUNDATION migrations (outbox + consumer_dedup) run at startup
     // against the live DB (DDL → admin role). After migrate_foundation the substrate tables exist.
