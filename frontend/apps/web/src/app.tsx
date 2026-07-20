@@ -1,4 +1,4 @@
-import { MetaProvider, Title } from "@solidjs/meta";
+import { MetaProvider } from "@solidjs/meta";
 import { Router } from "@solidjs/router";
 import { FileRoutes } from "@solidjs/start/router";
 import { Suspense } from "solid-js";
@@ -13,7 +13,6 @@ export default function App() {
     <Router
       root={(props) => (
         <MetaProvider>
-          <Title>Myelin</Title>
           <ToastProvider>
             <Suspense>{props.children}</Suspense>
           </ToastProvider>
