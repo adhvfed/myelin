@@ -44,7 +44,11 @@ use myelin_storage::{
     PgBootstrap, PgOutboxBacking, SubstrateProvider, TenantScope,
 };
 use myelin_tenancy::{Region, TenantId};
-use std::sync::Arc;
+use std::{
+    env::VarError,
+    path::{Component, PathBuf},
+    sync::Arc,
+};
 
 /// The default operator-token scheme the edge resolves a bearer/basic credential under when the client
 /// sends no `X-Myelin-Token-Scheme` header. R4.0 sets this to `agent` (the scheme `edge bootstrap`
@@ -70,12 +74,94 @@ struct ComposedCore {
     handle: tokio::runtime::Handle,
 }
 
+/// Deployment identity and persistence paths that must be explicit before this production binary
+/// touches PostgreSQL or starts migrations. Operator subcommands share the cell identity but do not
+/// open Git storage, so only the serving path requires `git_root`.
+#[derive(Debug, PartialEq, Eq)]
+struct EdgeRuntimeConfig {
+    cell_id: String,
+    git_root: Option<PathBuf>,
+}
+
+impl EdgeRuntimeConfig {
+    fn from_env(serving: bool) -> Result<Self, String> {
+        Self::from_reader(serving, std::env::var)
+    }
+
+    fn from_reader(
+        serving: bool,
+        mut read: impl FnMut(&'static str) -> Result<String, VarError>,
+    ) -> Result<Self, String> {
+        let cell_id = required_runtime_value("MYELIN_CELL_ID", read("MYELIN_CELL_ID"))?;
+        let git_root = if serving {
+            let raw = required_runtime_value("MYELIN_GIT_ROOT", read("MYELIN_GIT_ROOT"))?;
+            let path = PathBuf::from(raw);
+            if !path.is_absolute() {
+                return Err("MYELIN_GIT_ROOT must be an absolute persistent path".into());
+            }
+            if path
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+            {
+                return Err("MYELIN_GIT_ROOT must not contain `.` or `..` components".into());
+            }
+            if path.parent().is_none() {
+                return Err("MYELIN_GIT_ROOT must not be the filesystem root".into());
+            }
+            let path = path.canonicalize().map_err(|error| {
+                format!("MYELIN_GIT_ROOT must name an existing persistent directory: {error}")
+            })?;
+            if path.parent().is_none() {
+                return Err("MYELIN_GIT_ROOT must not resolve to the filesystem root".into());
+            }
+            if !path.is_dir() {
+                return Err("MYELIN_GIT_ROOT must name a directory".into());
+            }
+            let temp_dir = std::env::temp_dir()
+                .canonicalize()
+                .unwrap_or_else(|_| std::env::temp_dir());
+            if path.starts_with(temp_dir) {
+                return Err(
+                    "MYELIN_GIT_ROOT must not live under the operating-system temp directory"
+                        .into(),
+                );
+            }
+            Some(path)
+        } else {
+            None
+        };
+        Ok(Self { cell_id, git_root })
+    }
+}
+
+fn required_runtime_value(
+    name: &'static str,
+    value: Result<String, VarError>,
+) -> Result<String, String> {
+    let value = value.map_err(|error| match error {
+        VarError::NotPresent => format!("required env var {name} is not set"),
+        VarError::NotUnicode(_) => format!("env var {name} is not valid UTF-8"),
+    })?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("env var {name} must not be empty"));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn runtime_config_or_exit(serving: bool) -> EdgeRuntimeConfig {
+    EdgeRuntimeConfig::from_env(serving).unwrap_or_else(|error| {
+        eprintln!("edge: production runtime configuration refused to start: {error}");
+        std::process::exit(1);
+    })
+}
+
 /// Build the shared durable core (the DURABLE-BY-DEFAULT composition root, MR-009b + R4.0). Validates
 /// separate migration/runtime roles, applies the substrate foundation + the full durable migration
 /// aggregate (now including `0060_cell_token_root`), then destroys the privileged pool before any
 /// runtime store is built. The KMS root and CELL TOKEN AUTHORITY ROOT are sealed under
 /// `MYELIN_KMS_SEAL_KEY` and fail closed on a wrong/absent key (NEVER a fresh root).
-async fn compose_core() -> ComposedCore {
+async fn compose_core(cell_id: String) -> ComposedCore {
     // This is a production binary: every endpoint and both PostgreSQL credentials must be explicit.
     // Pair validation runs before DDL and before the edge can bind its serving port.
     let bootstrap = match PgBootstrap::from_env(Mode::RequireEnv).await {
@@ -169,9 +255,8 @@ async fn compose_core() -> ComposedCore {
             std::process::exit(1);
         }
     };
-    // The cell whose sealed roots this edge serves (a namespace, not a secret — dev default). The KMS
-    // root AND the cell token-authority root are both scoped to this cell id.
-    let cell_id = std::env::var("MYELIN_CELL_ID").unwrap_or_else(|_| "cell-dev".to_string());
+    // The explicitly configured cell whose sealed roots this edge serves. The KMS root AND the cell
+    // token-authority root are both scoped to this cell id; there is no shared development fallback.
     // The shared cell KMS (crypto-shred substrate) — DURABLE-BY-DEFAULT. A missing/malformed seal
     // key, an unreachable store, or a root that does not unseal (WrongSealKey — fail-closed, NEVER a
     // fresh root that would orphan every ciphertext) each exit non-zero.
@@ -224,9 +309,22 @@ async fn compose_core() -> ComposedCore {
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        None => serve(compose_core().await).await,
-        Some("bootstrap") => operator_bootstrap(compose_core().await, &args[1..]).await,
-        Some("revoke") => operator_revoke(compose_core().await, &args[1..]).await,
+        None => {
+            let runtime = runtime_config_or_exit(true);
+            serve(
+                compose_core(runtime.cell_id).await,
+                runtime.git_root.expect("serving config carries a Git root"),
+            )
+            .await;
+        }
+        Some("bootstrap") => {
+            let runtime = runtime_config_or_exit(false);
+            operator_bootstrap(compose_core(runtime.cell_id).await, &args[1..]).await;
+        }
+        Some("revoke") => {
+            let runtime = runtime_config_or_exit(false);
+            operator_revoke(compose_core(runtime.cell_id).await, &args[1..]).await;
+        }
         Some(other) => {
             eprintln!(
                 "edge: unknown subcommand `{other}` (expected: <none> = serve | bootstrap | revoke)"
@@ -240,7 +338,7 @@ async fn main() {
 // serve — the request-lifecycle gateway (unchanged behaviour; now over the DURABLE cell authority).
 // =================================================================================================
 
-async fn serve(core: ComposedCore) {
+async fn serve(core: ComposedCore, git_root: PathBuf) {
     let ComposedCore {
         provider,
         kms,
@@ -388,13 +486,8 @@ async fn serve(core: ComposedCore) {
     };
     let repo_bootstrap = Arc::new(TupleRepoBootstrap::new(check.tuples().clone()));
 
-    // The Git subsystem over the DURABLE on-disk backend (GT-003), rooted at `MYELIN_GIT_ROOT`.
-    let git_root = std::env::var("MYELIN_GIT_ROOT").unwrap_or_else(|_| {
-        std::env::temp_dir()
-            .join("myelin-git-data")
-            .to_string_lossy()
-            .into()
-    });
+    // The Git subsystem over the DURABLE on-disk backend (GT-003), rooted at the validated absolute
+    // `MYELIN_GIT_ROOT`. Startup rejected missing, relative, root, and OS-temp paths before migrations.
     let git_backend = Arc::new(
         DurableGitBackend::rooted(
             git_root,
@@ -637,4 +730,103 @@ fn now_unix() -> i64 {
 fn now_rfc3339() -> Timestamp {
     let dt = chrono::DateTime::from_timestamp(now_unix(), 0).unwrap_or_default();
     Timestamp(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+#[cfg(test)]
+mod runtime_config_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn parse(
+        serving: bool,
+        values: &[(&'static str, String)],
+    ) -> Result<EdgeRuntimeConfig, String> {
+        let values = values.iter().cloned().collect::<HashMap<_, _>>();
+        EdgeRuntimeConfig::from_reader(serving, |name| {
+            values.get(name).cloned().ok_or(VarError::NotPresent)
+        })
+    }
+
+    #[test]
+    fn serving_requires_explicit_cell_and_persistent_git_root() {
+        assert_eq!(
+            parse(true, &[]).unwrap_err(),
+            "required env var MYELIN_CELL_ID is not set"
+        );
+        assert_eq!(
+            parse(true, &[("MYELIN_CELL_ID", "cell-eu-1".into())]).unwrap_err(),
+            "required env var MYELIN_GIT_ROOT is not set"
+        );
+
+        let root = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let config = parse(
+            true,
+            &[
+                ("MYELIN_CELL_ID", " cell-eu-1 ".into()),
+                ("MYELIN_GIT_ROOT", root.display().to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(config.cell_id, "cell-eu-1");
+        assert_eq!(config.git_root.as_deref(), Some(root.as_path()));
+    }
+
+    #[test]
+    fn operator_commands_require_cell_identity_but_do_not_open_git_storage() {
+        let config = parse(false, &[("MYELIN_CELL_ID", "cell-eu-1".into())]).unwrap();
+        assert_eq!(config.cell_id, "cell-eu-1");
+        assert_eq!(config.git_root, None);
+    }
+
+    #[test]
+    fn serving_rejects_ephemeral_or_ambiguous_git_roots() {
+        let current = std::env::current_dir().unwrap();
+        let cases = [
+            ("relative/git".to_string(), "absolute persistent path"),
+            ("/".to_string(), "filesystem root"),
+            (
+                std::env::temp_dir().display().to_string(),
+                "operating-system temp directory",
+            ),
+            (
+                current.join("state/../git").display().to_string(),
+                "must not contain `.` or `..`",
+            ),
+            (
+                current
+                    .join("definitely-does-not-exist")
+                    .display()
+                    .to_string(),
+                "existing persistent directory",
+            ),
+        ];
+
+        for (root, expected) in cases {
+            let error = parse(
+                true,
+                &[
+                    ("MYELIN_CELL_ID", "cell-eu-1".into()),
+                    ("MYELIN_GIT_ROOT", root),
+                ],
+            )
+            .unwrap_err();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn runtime_identity_rejects_empty_and_non_utf8_values() {
+        assert_eq!(
+            required_runtime_value("MYELIN_CELL_ID", Ok(" \t".into())).unwrap_err(),
+            "env var MYELIN_CELL_ID must not be empty"
+        );
+        assert_eq!(
+            required_runtime_value(
+                "MYELIN_CELL_ID",
+                Err(VarError::NotUnicode(std::ffi::OsString::from("invalid")))
+            )
+            .unwrap_err(),
+            "env var MYELIN_CELL_ID is not valid UTF-8"
+        );
+    }
 }

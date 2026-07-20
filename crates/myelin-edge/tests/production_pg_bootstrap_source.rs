@@ -51,6 +51,35 @@ fn production_main_destroys_the_privileged_pool_before_runtime_stores_and_bind()
 }
 
 #[test]
+fn production_runtime_identity_and_git_storage_are_explicit_before_database_bootstrap() {
+    let source = include_str!("../src/main.rs");
+    let main = source
+        .split_once("async fn main()")
+        .expect("production entry point must remain wired")
+        .1;
+    let serving = main
+        .split_once("None =>")
+        .expect("no-argument serving path must remain wired")
+        .1;
+
+    let runtime_config = serving
+        .find("runtime_config_or_exit(true)")
+        .expect("serving must validate runtime identity and storage");
+    let durable_core = serving
+        .find("compose_core(runtime.cell_id).await")
+        .expect("validated cell identity must feed durable composition");
+    let git_root = serving
+        .find("runtime.git_root")
+        .expect("validated Git storage must feed serving");
+
+    assert!(runtime_config < durable_core);
+    assert!(runtime_config < git_root);
+    assert!(source.contains("PgBootstrap::from_env(Mode::RequireEnv)"));
+    assert!(!source.contains("\"cell-dev\".to_string()"));
+    assert!(!source.contains(".join(\"myelin-git-data\")"));
+}
+
+#[test]
 fn production_edge_owns_the_durable_issue_saga_worker_without_an_in_memory_fallback() {
     let main = include_str!("../src/main.rs");
     let adapter = include_str!("../src/issue_authz.rs");
@@ -155,7 +184,10 @@ fn operator_bootstrap_validates_and_grants_the_explicit_issues_project_before_mi
 
 #[test]
 fn missing_migration_credential_exits_before_bind() {
+    let git_root = std::env::current_dir().expect("test working directory must exist");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_edge"))
+        .env("MYELIN_CELL_ID", "cell-test")
+        .env("MYELIN_GIT_ROOT", git_root)
         .env("DATABASE_URL", "postgres://runtime.invalid/myelin")
         .env_remove("DATABASE_MIGRATION_URL")
         .env("S3_ENDPOINT", "http://storage.invalid")
