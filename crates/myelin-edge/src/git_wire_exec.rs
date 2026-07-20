@@ -38,7 +38,8 @@ use myelin_ci_sandbox::{
 use myelin_git::core::{GitCoreError, RoutedGitCore, WireExecutor, WireInvocation, WireOutput};
 use myelin_git::gix_backend::{GixCore, RootedResolver};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// The production [`WireExecutor`]: every canonical-`git` wire invocation runs SANDBOXED through the
 /// gVisor backend's [`GvisorBackend::launch_git_wire`]. Rooted at the on-disk dir holding
@@ -51,6 +52,7 @@ pub struct GitWireExecutor {
     root: PathBuf,
     limits: ResourceLimits,
     hooks: RunnerHooks,
+    shutdown: Arc<AtomicBool>,
     /// Monotone per-invocation sequence → a unique idempotency token per sandboxed launch (the runner
     /// dedups on it; one sandbox per wire op, never reused).
     seq: AtomicU64,
@@ -66,8 +68,16 @@ impl GitWireExecutor {
             root: root.into(),
             limits,
             hooks,
+            shutdown: Arc::new(AtomicBool::new(false)),
             seq: AtomicU64::new(0),
         }
+    }
+
+    /// Bind the process-level shutdown signal used to cancel an active `runsc` wire container. The
+    /// default stays never-cancelled for isolated tests and non-serving callers.
+    pub fn with_shutdown_signal(mut self, shutdown: Arc<AtomicBool>) -> Self {
+        self.shutdown = shutdown;
+        self
     }
 
     /// Serving-tier default: sane resource bounds + the four-guarantee hooks wired to pass-through
@@ -168,10 +178,15 @@ impl GitWireExecutor {
 
         let SandboxLaunch { handle, result } = self
             .backend
-            .launch_git_receive_pack(&spec, &self.hooks)
+            .launch_git_receive_pack_until_cancelled(&spec, &self.hooks, &self.shutdown)
             .map_err(|e| GitCoreError::Wire(e.to_string()))?;
         let _ = self.backend.kill(&handle);
 
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(GitCoreError::Wire(
+                "sandboxed receive-pack ingest cancelled by process shutdown".into(),
+            ));
+        }
         if result.timed_out {
             return Err(GitCoreError::Wire(format!(
                 "sandboxed receive-pack ingest timed out ({}s ceiling)",
@@ -212,7 +227,7 @@ impl WireExecutor for GitWireExecutor {
 
         let SandboxLaunch { handle, result } = self
             .backend
-            .launch_git_wire(&spec, &self.hooks)
+            .launch_git_wire_until_cancelled(&spec, &self.hooks, &self.shutdown)
             .map_err(|e| GitCoreError::Wire(e.to_string()))?;
 
         // One sandbox per wire op — tear it down (idempotent; the guest has already exited).
@@ -220,6 +235,12 @@ impl WireExecutor for GitWireExecutor {
 
         // Honor the exit/timeout: a timeout or a non-zero `git` exit is a HARD error, never a silent
         // empty stdout. stderr is folded into the error message (capped capture; never the payload).
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(GitCoreError::Wire(format!(
+                "sandboxed `git {}` cancelled by process shutdown",
+                inv.argv.join(" ")
+            )));
+        }
         if result.timed_out {
             return Err(GitCoreError::Wire(format!(
                 "sandboxed `git {}` timed out (wall-clock {}s ceiling) — refused",
@@ -259,6 +280,19 @@ pub fn production_git_core(
     RoutedGitCore::new(exec, read)
 }
 
+/// Production core with a process-level cancellation flag shared by every per-request executor.
+pub fn production_git_core_with_shutdown(
+    root: impl Into<PathBuf>,
+    limits: ResourceLimits,
+    hooks: RunnerHooks,
+    shutdown: Arc<AtomicBool>,
+) -> RoutedGitCore<GitWireExecutor, GixCore<RootedResolver>> {
+    let root = root.into();
+    let exec = GitWireExecutor::new(root.clone(), limits, hooks).with_shutdown_signal(shutdown);
+    let read = GixCore::new(RootedResolver::new(root));
+    RoutedGitCore::new(exec, read)
+}
+
 /// Serving-tier default composition (default limits + pass-through guarantee hooks; the live
 /// wallet/token/KMS bodies are bound by the composition root). The on-disk `root` is the SAME root the
 /// durable git backend ([`crate::DurableGitBackend`]) writes/reads through.
@@ -270,4 +304,38 @@ pub fn production_git_core_default(
         GitWireExecutor::default_limits(),
         GitWireExecutor::serving_hooks(),
     )
+}
+
+/// Serving defaults plus cooperative process-shutdown cancellation.
+pub fn production_git_core_default_with_shutdown(
+    root: impl Into<PathBuf>,
+    shutdown: Arc<AtomicBool>,
+) -> RoutedGitCore<GitWireExecutor, GixCore<RootedResolver>> {
+    production_git_core_with_shutdown(
+        root,
+        GitWireExecutor::default_limits(),
+        GitWireExecutor::serving_hooks(),
+        shutdown,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use myelin_git::core::RepoLoc;
+
+    #[test]
+    fn pre_cancelled_executor_never_reaches_runsc() {
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let executor = GitWireExecutor::serving_default("/absent/git-root")
+            .with_shutdown_signal(shutdown);
+        let error = executor
+            .run(&WireInvocation {
+                repo: RepoLoc::new("acme", "eu-west", "widgets"),
+                argv: vec!["upload-pack".into(), "--stateless-rpc".into()],
+                stdin: Vec::new(),
+            })
+            .expect_err("shutdown must refuse before filesystem or runsc access");
+        assert!(error.to_string().contains("cancelled by process shutdown"));
+    }
 }

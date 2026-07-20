@@ -69,6 +69,7 @@ use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, Principal
 use myelin_storage::{DurablePlacementBacking, KmsEngine, SubstrateProvider, TenantScope};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 /// Verified request identity and repository route coordinates for a Git edge operation.
@@ -158,6 +159,9 @@ pub struct DurableGitBackend {
     /// The on-disk root holding `<tenant>/<region>/<repo>.git` bare repos — retained so the wire-serving
     /// tier (CT-006b) composes its sandboxed `GitCore` over the SAME root the durable store reads/writes.
     root: PathBuf,
+    /// Process shutdown propagated into every per-request gVisor executor so `runsc` is killed and
+    /// reaped before the HTTP drain deadline instead of outliving an aborted async task.
+    git_shutdown: Arc<AtomicBool>,
     /// **R0.3 / DELTA N2 — the per-repo object-authorization seam for the git wire.** The wire handlers
     /// consult this AFTER `repo_loc` resolves the repo and BEFORE serving any bytes, so an in-tenant
     /// principal with no grant on a repo cannot clone/fetch/push it (the un-granted-repo-reach hole,
@@ -296,6 +300,7 @@ impl DurableGitBackend {
             // F3: the public HTTP base for clone URLs — env-driven, honest empty default (relative path).
             clone_base: public_clone_base(),
             root,
+            git_shutdown: Arc::new(AtomicBool::new(false)),
             // R2.6: the prod constructor default is FAIL-CLOSED (`DenyAllRepos`) — a composition root
             // that forgets `with_repo_authorizer` denies every repo rather than serving all of them.
             // Production `main.rs` ALWAYS injects the real `CheckBackedRepoAuthorizer`; the permissive
@@ -329,6 +334,7 @@ impl DurableGitBackend {
             minter: Arc::new(MonotonicMinter::new()),
             clone_base: public_clone_base(),
             root,
+            git_shutdown: Arc::new(AtomicBool::new(false)),
             repo_authz: Arc::new(AllowAllRepos),
             bootstrap: Arc::new(NoRepoBootstrap),
         }
@@ -364,6 +370,12 @@ impl DurableGitBackend {
         self
     }
 
+    /// Bind the production process shutdown flag shared by upload-pack and receive-pack executors.
+    pub fn with_git_shutdown_signal(mut self, shutdown: Arc<AtomicBool>) -> DurableGitBackend {
+        self.git_shutdown = shutdown;
+        self
+    }
+
     /// **The wire-serving `GitCore` over the SAME on-disk root (CT-006b / GT-006).** Composes the
     /// production sandboxed [`crate::git_wire_exec::GitWireExecutor`] (wire ops → canonical `git` in the
     /// hardened gVisor sandbox, no-host-exec) with the in-process [`myelin_git::gix_backend::GixCore`]
@@ -376,7 +388,10 @@ impl DurableGitBackend {
         crate::git_wire_exec::GitWireExecutor,
         myelin_git::gix_backend::GixCore<myelin_git::gix_backend::RootedResolver>,
     > {
-        crate::git_wire_exec::production_git_core_default(self.root.clone())
+        crate::git_wire_exec::production_git_core_default_with_shutdown(
+            self.root.clone(),
+            self.git_shutdown.clone(),
+        )
     }
 
     /// The shared outbox (so the reconciler / a relay can read the committed `git.ref.updated` rows).
@@ -2293,7 +2308,8 @@ impl DurableGitBackend {
         let objects: Vec<(String, String, Vec<u8>)> = if pack.is_empty() {
             Vec::new()
         } else {
-            let exec = crate::git_wire_exec::GitWireExecutor::serving_default(self.root.clone());
+            let exec = crate::git_wire_exec::GitWireExecutor::serving_default(self.root.clone())
+                .with_shutdown_signal(self.git_shutdown.clone());
             match exec.ingest_pack(&loc, pack) {
                 Ok(stream) => match parse_cat_file_batch(&stream) {
                     Ok(o) => o,

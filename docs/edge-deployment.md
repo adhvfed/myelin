@@ -70,3 +70,5 @@ operations (advertise, fetch, or push) run concurrently; they use the runtime's 
 sandboxed Git process cannot stall health probes or ordinary API traffic. Excess wire work returns 503.
 Ordinary request bodies must finish within 30 seconds; Git push bodies receive a five-minute absolute
 deadline. These are total body-read deadlines, so periodic trickle bytes do not retain intake slots.
+SIGINT or SIGTERM also propagates into active Git wire sandboxes: while HTTP connections drain, the
+edge kills and reaps `runsc` containers instead of waiting for their two-minute operation limit.
