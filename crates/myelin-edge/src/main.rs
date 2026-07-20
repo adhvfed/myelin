@@ -281,14 +281,15 @@ fn validated_executable(
 
 fn validated_runsc(value: Result<String, VarError>) -> Result<PathBuf, String> {
     let path = validated_executable("MYELIN_RUNSC_BIN", value)?;
-    let output = std::process::Command::new(&path)
-        .arg("--version")
-        .output()
-        .map_err(|_| "MYELIN_RUNSC_BIN could not execute its version probe".to_string())?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() || !stdout.starts_with("runsc version ") {
-        return Err("MYELIN_RUNSC_BIN did not identify itself as runsc".into());
-    }
+    // The probe lives behind the sandbox seam (no-host-exec): the sandbox crate is the one
+    // sanctioned host-exec site, so edge asks it to verify the binary instead of spawning here.
+    use myelin_ci_sandbox::gvisor::RunscProbeError;
+    myelin_ci_sandbox::gvisor::probe_runsc_version(&path).map_err(|error| match error {
+        RunscProbeError::CouldNotExecute => {
+            "MYELIN_RUNSC_BIN could not execute its version probe".to_string()
+        }
+        RunscProbeError::NotRunsc => "MYELIN_RUNSC_BIN did not identify itself as runsc".to_string(),
+    })?;
     Ok(path)
 }
 

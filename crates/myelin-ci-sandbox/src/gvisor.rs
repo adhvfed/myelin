@@ -55,6 +55,31 @@ fn runsc_bin() -> String {
     std::env::var(ENV_RUNSC_BIN).unwrap_or_else(|_| "runsc".to_string())
 }
 
+/// How a [`probe_runsc_version`] boot preflight failed; the caller owns the operator-facing wording.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RunscProbeError {
+    /// The binary could not be spawned for its `--version` probe.
+    CouldNotExecute,
+    /// The binary ran but did not identify itself as `runsc`.
+    NotRunsc,
+}
+
+/// Boot-preflight probe: verify `path` identifies itself as `runsc` (via `--version`). Lives in
+/// this crate — not the caller's — because the sandbox seam is the one sanctioned host-exec site
+/// (no-host-exec, X-6/AG-2); serving binaries that require the sandbox at boot call this instead
+/// of spawning the probe themselves.
+pub fn probe_runsc_version(path: &Path) -> Result<(), RunscProbeError> {
+    let output = Command::new(path)
+        .arg("--version")
+        .output()
+        .map_err(|_| RunscProbeError::CouldNotExecute)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() || !stdout.starts_with("runsc version ") {
+        return Err(RunscProbeError::NotRunsc);
+    }
+    Ok(())
+}
+
 /// The unprivileged uid/gid the untrusted `spec.command` runs as INSIDE the gVisor sandbox. Untrusted
 /// code must NEVER be uid 0 even within the userspace-kernel boundary (defense in depth + hygiene);
 /// 65534 = nobody/nogroup (numeric ⇒ no `/etc/passwd` lookup). Unlike Firecracker, gVisor's exit
