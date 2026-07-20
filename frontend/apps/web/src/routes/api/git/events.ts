@@ -8,10 +8,7 @@
 // FLOOR: the dev-edge holds this stream open but emits no frames, so against the harness the live
 // flip is inert (the manual Refresh is the fallback); against the real edge the typed frames arrive.
 import { getSessionRecord } from "~/server/session";
-
-function edgeUrl(): string {
-  return process.env.MYELIN_EDGE_URL ?? "http://127.0.0.1:8787";
-}
+import { edgeOrigin } from "~/server/edge-origin";
 
 export async function GET() {
   const rec = await getSessionRecord();
@@ -20,7 +17,7 @@ export async function GET() {
   }
   let upstream: Response;
   try {
-    upstream = await fetch(`${edgeUrl()}/v1/t/${encodeURIComponent(rec.tenant)}/events`, {
+    upstream = await fetch(`${edgeOrigin()}/v1/t/${encodeURIComponent(rec.tenant)}/events`, {
       headers: {
         authorization: `Bearer ${rec.token}`,
         "x-myelin-token-scheme": rec.scheme,

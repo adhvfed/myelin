@@ -8,7 +8,12 @@ const session = vi.hoisted(() => ({
 
 vi.mock("./session", () => session);
 
-import { edgeGet, edgeGetRaw, gatewayRequestSignal } from "./gateway";
+import {
+  DEFAULT_EDGE_REQUEST_TIMEOUT_MS,
+  edgeGet,
+  edgeGetRaw,
+  gatewayRequestSignal,
+} from "./gateway";
 
 const unauthorized = () => new Response(
   JSON.stringify({ error: { message: "authentication required", code: "unauthorized" } }),
@@ -40,6 +45,25 @@ afterEach(() => {
 });
 
 describe("gateway request deadlines", () => {
+  it("applies the bounded default when a caller does not supply a timeout", () => {
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+
+    const signal = gatewayRequestSignal();
+
+    expect(timeout).toHaveBeenCalledWith(DEFAULT_EDGE_REQUEST_TIMEOUT_MS);
+    expect(signal).toBeInstanceOf(AbortSignal);
+    timeout.mockRestore();
+  });
+
+  it.each([0, -1, Number.POSITIVE_INFINITY, Number.NaN])(
+    "rejects an invalid timeout: %s",
+    (timeoutMs) => {
+      expect(() => gatewayRequestSignal({ timeoutMs })).toThrow(
+        "edge request timeout must be a positive finite number",
+      );
+    },
+  );
+
   it("aborts a request signal at its bounded timeout", async () => {
     const signal = gatewayRequestSignal({ timeoutMs: 5 });
 

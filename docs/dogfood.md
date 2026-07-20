@@ -199,8 +199,11 @@ one-year HSTS policy. Leave it unset for local HTTP and initial TLS canaries. Pr
 checked against the deployment's exact scheme, host, and port. It must be HTTPS and contain no path.
 Production also requires a `rediss://` `REDIS_URL`: browser sessions—including bearer credentials—
 are stored in the region-local Valkey service, so plaintext `redis://` is accepted only by local
-development and tests. Startup fails before accepting traffic when either required setting is missing
-or insecure. Use `/healthz` for process liveness and `/readyz` for traffic readiness; the latter
+development and tests. `MYELIN_EDGE_URL` is also mandatory in production and must be an absolute
+HTTP(S) origin with no credentials, path, query, or fragment. Keep that edge origin on the private
+service network; the loopback development edge is never a production fallback. Startup fails before
+accepting traffic when any required setting is missing or invalid. Use `/healthz` for process
+liveness and `/readyz` for traffic readiness; the latter
 performs a short-lived namespaced write/read/script/delete probe and returns 503 whenever the session
 backend is unavailable or its production ACL cannot perform real session operations.
 
