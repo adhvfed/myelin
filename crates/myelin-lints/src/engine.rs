@@ -76,15 +76,62 @@ pub fn run(lints: &[Lint], src: &str) -> Result<(), Vec<Violation>> {
 
 /// Strip a Rust line-comment (`// ...`) from a line so the lints scan CODE, not prose that
 /// happens to mention a forbidden token (e.g. a doc-comment saying "no `publish_now`"). This is
-/// a deliberately small, conservative tokeniser: it does not handle `//` inside a string
-/// literal, which is acceptable for an architecture lint over our own conventionally-formatted
-/// source (the workspace scan proves it on real code; a false-positive would fail loudly and be
-/// fixed, never silently). Block comments (`/* */`) are handled by [`strip_block_comments`].
+/// a deliberately small tokeniser that preserves `//` inside ordinary and raw string literals,
+/// including URL/artifact-ref data. Block comments (`/* */`) are handled by
+/// [`strip_block_comments`].
 pub fn strip_line_comment(line: &str) -> &str {
-    match line.find("//") {
-        Some(idx) => &line[..idx],
-        None => line,
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+    let mut in_standard = false;
+    let mut escaped = false;
+    let mut raw_hashes = None;
+    while index < bytes.len() {
+        if let Some(hashes) = raw_hashes {
+            if bytes[index] == b'"'
+                && bytes
+                    .get(index + 1..index + 1 + hashes)
+                    .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#'))
+            {
+                raw_hashes = None;
+                index += hashes + 1;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if in_standard {
+            if escaped {
+                escaped = false;
+            } else if bytes[index] == b'\\' {
+                escaped = true;
+            } else if bytes[index] == b'"' {
+                in_standard = false;
+            }
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'r' {
+            let mut cursor = index + 1;
+            while bytes.get(cursor) == Some(&b'#') {
+                cursor += 1;
+            }
+            if bytes.get(cursor) == Some(&b'"') {
+                raw_hashes = Some(cursor - index - 1);
+                index = cursor + 1;
+                continue;
+            }
+        }
+        if bytes[index] == b'"' {
+            in_standard = true;
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            return &line[..index];
+        }
+        index += 1;
     }
+    line
 }
 
 /// Remove `/* ... */` block comments (including doc block comments and multi-line spans) from a
@@ -163,9 +210,68 @@ pub fn code_lines(src: &str) -> Vec<(usize, String)> {
 /// (`sqlx::query(..)\n  .with_tenant(t)\n  .fetch_all(p);`) as ONE unit, so a tenant binder on a
 /// later line of the same statement is seen. Comments are already stripped by [`code_lines`].
 pub fn code_statements(src: &str) -> Vec<(usize, String)> {
+    #[derive(Default)]
+    struct StringState {
+        standard: bool,
+        escaped: bool,
+        raw_hashes: Option<usize>,
+    }
+
+    fn has_boundary_outside_string(code: &str, state: &mut StringState) -> bool {
+        let bytes = code.as_bytes();
+        let mut index = 0usize;
+        let mut boundary = false;
+        while index < bytes.len() {
+            if let Some(hashes) = state.raw_hashes {
+                if bytes[index] == b'"'
+                    && bytes
+                        .get(index + 1..index + 1 + hashes)
+                        .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#'))
+                {
+                    state.raw_hashes = None;
+                    index += hashes + 1;
+                } else {
+                    index += 1;
+                }
+                continue;
+            }
+            if state.standard {
+                if state.escaped {
+                    state.escaped = false;
+                } else if bytes[index] == b'\\' {
+                    state.escaped = true;
+                } else if bytes[index] == b'"' {
+                    state.standard = false;
+                }
+                index += 1;
+                continue;
+            }
+
+            if bytes[index] == b'r' {
+                let mut cursor = index + 1;
+                while bytes.get(cursor) == Some(&b'#') {
+                    cursor += 1;
+                }
+                if bytes.get(cursor) == Some(&b'"') {
+                    state.raw_hashes = Some(cursor - index - 1);
+                    index = cursor + 1;
+                    continue;
+                }
+            }
+            match bytes[index] {
+                b'"' => state.standard = true,
+                b';' | b'{' | b'}' => boundary = true,
+                _ => {}
+            }
+            index += 1;
+        }
+        boundary
+    }
+
     let mut out = Vec::new();
     let mut current = String::new();
     let mut start_line = 0usize;
+    let mut string_state = StringState::default();
     for (line_no, code) in code_lines(src) {
         let trimmed = code.trim();
         if trimmed.is_empty() {
@@ -177,10 +283,10 @@ pub fn code_statements(src: &str) -> Vec<(usize, String)> {
             current.push(' ');
         }
         current.push_str(trimmed);
-        // A statement boundary: the line ends a statement/block. We split greedily on the
-        // presence of a terminator anywhere on the line — conservative but sufficient for our
-        // conventionally-formatted source (one statement per logical chain).
-        if code.contains(';') || code.contains('{') || code.contains('}') {
+        // String DATA can contain SQL semicolons, interpolation braces, or JSON bodies; none are
+        // Rust statement boundaries. Track ordinary and raw strings across lines so a multiline
+        // query remains joined through its later tenant binder.
+        if has_boundary_outside_string(&code, &mut string_state) {
             out.push((start_line, std::mem::take(&mut current)));
         }
     }
@@ -241,6 +347,20 @@ mod tests {
     }
 
     #[test]
+    fn line_comment_markers_inside_strings_are_preserved() {
+        let artifact = r#"let subject = "myelin://tenant/git/pr/1"; // trailing prose"#;
+        assert_eq!(
+            strip_line_comment(artifact).trim(),
+            r#"let subject = "myelin://tenant/git/pr/1";"#
+        );
+        let raw = r##"let subject = r#"runtime://worker/session"#; // trailing prose"##;
+        assert_eq!(
+            strip_line_comment(raw).trim(),
+            r##"let subject = r#"runtime://worker/session"#;"##
+        );
+    }
+
+    #[test]
     fn string_literal_contents_are_blanked_but_quotes_and_length_survive() {
         // a forbidden token held as DATA (a guard checking for the pattern) is blanked out, so a
         // lint targeting the real construct does not trip on the check that forbids it.
@@ -269,5 +389,31 @@ mod tests {
         let viol: Vec<_> = lines.iter().filter(|(_, l)| l.contains("foo")).collect();
         assert_eq!(viol.len(), 1);
         assert_eq!(viol[0].0, 4, "line numbers must survive comment stripping");
+    }
+
+    #[test]
+    fn statement_boundaries_ignore_braces_and_semicolons_inside_multiline_strings() {
+        let src = r####"
+            let row = sqlx::query(&format!(
+                "SELECT {COLUMNS} FROM principals; WHERE tenant_id=$1"
+            ))
+            .bind(tenant_id)
+            .fetch_one(&pool);
+            let raw = sqlx::query(r#"SELECT {payload}; WHERE tenant_id=$1"#)
+                .bind(tenant_id)
+                .fetch_one(&pool);
+        "####;
+        let statements = code_statements(src);
+        let query_statements: Vec<_> = statements
+            .iter()
+            .filter(|(_, statement)| statement.contains("sqlx::query"))
+            .collect();
+        assert_eq!(query_statements.len(), 2);
+        assert!(
+            query_statements
+                .iter()
+                .all(|(_, statement)| statement.contains(".bind(tenant_id)")),
+            "string punctuation must not split a query from its tenant binder"
+        );
     }
 }

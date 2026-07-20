@@ -256,7 +256,18 @@ fn scan_tenant_predicate(src: &str) -> Vec<Violation> {
         "scoped_to_tenant",
         "RlsGuard",
         "set_tenant",
+        "loc.tenant",
+        "envelope->>'tenant'",
     ];
+    // A narrow, call-site waiver for queries over PostgreSQL catalog/lock state or other
+    // deliberately cross-scope infrastructure that has no tenant column to bind. The marker must
+    // be in the contiguous comment block immediately above the query (or on its starting line),
+    // and its trailing `:` requires reviewers to record why the query is not a tenant-store read.
+    // This is safer than excluding a mixed production module: every ordinary query in that module
+    // remains linted, and an unrelated earlier marker cannot leak across intervening code.
+    const CROSS_SCOPE_MARKER: &str = "@tenant-cross-scope:";
+    const MARKER_LOOKBACK: usize = 8;
+    let raw_lines: Vec<&str> = src.lines().collect();
     let mut out = Vec::new();
     // Scan at STATEMENT granularity so a tenant binder on a later line of the same fluent
     // query-builder chain (`sqlx::query(..)\n  .with_tenant(t)\n  .fetch_all(p);`) is seen.
@@ -266,7 +277,30 @@ fn scan_tenant_predicate(src: &str) -> Vec<Violation> {
             continue;
         }
         let is_tenant_bound = TENANT_BINDERS.iter().any(|b| code.contains(b));
-        if !is_tenant_bound {
+        let idx = line.saturating_sub(1);
+        let marker_here = raw_lines
+            .get(idx)
+            .is_some_and(|raw| raw.contains(CROSS_SCOPE_MARKER));
+        let mut marker_above = false;
+        let mut cursor = idx;
+        for _ in 0..MARKER_LOOKBACK {
+            let Some(previous) = cursor.checked_sub(1) else {
+                break;
+            };
+            cursor = previous;
+            let Some(raw) = raw_lines.get(cursor) else {
+                break;
+            };
+            let trimmed = raw.trim();
+            if trimmed.contains(CROSS_SCOPE_MARKER) {
+                marker_above = true;
+                break;
+            }
+            if !trimmed.is_empty() && !trimmed.starts_with("//") {
+                break;
+            }
+        }
+        if !is_tenant_bound && !marker_here && !marker_above {
             out.push(Violation {
                 lint: TENANT_PREDICATE,
                 line,
@@ -1696,6 +1730,21 @@ mod tests {
         let green = "let rows = sqlx::query(\"SELECT * FROM principals\").with_tenant(tenant_id);";
         assert!(!tenant_predicate().run(red).is_empty());
         assert!(tenant_predicate().run(green).is_empty());
+    }
+
+    #[test]
+    fn tenant_predicate_admits_only_an_adjacent_explained_cross_scope_query() {
+        let green = r#"
+            // @tenant-cross-scope: PostgreSQL role catalog has no tenant rows.
+            let row = sqlx::query("SELECT current_user FROM pg_roles").fetch_one(&pool);
+        "#;
+        let red = r#"
+            // @tenant-cross-scope: applies only to the catalog query below.
+            let catalog_name = "pg_roles";
+            let rows = sqlx::query("SELECT * FROM principals").fetch_all(&pool);
+        "#;
+        assert!(tenant_predicate().run(green).is_empty());
+        assert!(!tenant_predicate().run(red).is_empty());
     }
 
     #[test]

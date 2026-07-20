@@ -108,6 +108,7 @@ impl ElectedPgRelay {
         // closes the server session instead of returning a poisoned locked session to the pool.
         election.close_on_drop();
 
+        // @tenant-cross-scope: the cell-local publisher election lock protects the shared outbox.
         let elected: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
             .bind(SHARED_OUTBOX_PUBLISHER_LOCK_ID)
             .fetch_one(&mut *election)
@@ -121,6 +122,7 @@ impl ElectedPgRelay {
             .relay
             .relay_once_scoped(publisher, batch, &self.validation)
             .await;
+        // @tenant-cross-scope: releases the same cell-local shared-outbox election lock.
         let unlock_result = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
             .bind(SHARED_OUTBOX_PUBLISHER_LOCK_ID)
             .fetch_one(&mut *election)
@@ -153,6 +155,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_pool_that_cannot_hold_election_and_relay_connections() {
+        // @residency-cell-pinned: lazy invalid test pool; the relay scope below pins its region.
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect_lazy("postgres://myelin:myelin@127.0.0.1/myelin")

@@ -321,6 +321,7 @@ struct SchemaAccess {
 }
 
 async fn connection_identity(pool: &PgPool) -> Result<ConnectionIdentity, BootstrapError> {
+    // @tenant-cross-scope: validates PostgreSQL connection and role catalogs before tenant access.
     let row: ConnectionIdentityRow = sqlx::query_as(
         "SELECT current_database() AS database,
                 (SELECT oid::bigint FROM pg_database WHERE datname = current_database())
@@ -357,6 +358,7 @@ async fn connection_identity(pool: &PgPool) -> Result<ConnectionIdentity, Bootst
 }
 
 async fn schema_access(pool: &PgPool) -> Result<SchemaAccess, BootstrapError> {
+    // @tenant-cross-scope: validates current-role schema grants, not application tenant rows.
     let row: (bool, bool, bool) = sqlx::query_as(
         "SELECT pg_has_role(current_user, n.nspowner, 'MEMBER'),
                 has_schema_privilege(current_user, n.oid, 'CREATE'),
@@ -413,6 +415,7 @@ async fn validate_bootstrap_pair(
     {
         return Err(BootstrapError::MigrationCannotManageSchema);
     }
+    // @tenant-cross-scope: validates a PostgreSQL catalog grant for the migration role.
     let can_lock: bool = sqlx::query_scalar(
         "SELECT has_function_privilege(
              current_user,
@@ -438,6 +441,7 @@ async fn validate_bootstrap_pair(
         return Err(BootstrapError::RuntimeCannotUseSchema);
     }
 
+    // @tenant-cross-scope: rejects runtime membership in the privileged migration role.
     let member_of_migration: bool =
         sqlx::query_scalar("SELECT pg_has_role(current_user, $1, 'MEMBER')")
             .bind(&migration.user)
@@ -448,6 +452,7 @@ async fn validate_bootstrap_pair(
         return Err(BootstrapError::RuntimeMemberOfMigrationRole);
     }
 
+    // @tenant-cross-scope: rejects any elevated PostgreSQL role membership before serving.
     let elevated_membership: bool = sqlx::query_scalar(
         "SELECT EXISTS (
              SELECT 1
@@ -552,6 +557,7 @@ impl PgBootstrap {
     /// bootstrap is destroyed. An interrupted concurrent build can leave an index relation present
     /// but `indisvalid=false`/`indisready=false`; `IF NOT EXISTS` alone would silently accept it.
     pub async fn verify_index_ready(&self, index_name: &str) -> Result<(), ProviderError> {
+        // @tenant-cross-scope: verifies a migration-owned PostgreSQL index catalog entry.
         let ready: Option<bool> = sqlx::query_scalar(
             "SELECT i.indisvalid AND i.indisready
                FROM pg_index i

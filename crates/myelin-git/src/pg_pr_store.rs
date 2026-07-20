@@ -2658,6 +2658,7 @@ mod tests {
             handle,
             Arc::new(UlidMinter::new()),
         );
+        // @residency-cell-pinned: integration admin pool uses the validated region-specific DSN.
         let admin = sqlx::postgres::PgPoolOptions::new()
             .max_connections(4)
             .connect(&cfg.database_migration_url)
@@ -3135,10 +3136,11 @@ mod tests {
             let aggregate = format!("git/pr/{slug}:{}", opened.number);
             let event_rows: Vec<(String, i64)> = sqlx::query_as(
                 "SELECT envelope->>'type_',count(*)
-                   FROM outbox WHERE aggregate=$1
+                   FROM outbox WHERE aggregate=$1 AND envelope->>'tenant'=$2
                   GROUP BY envelope->>'type_' ORDER BY envelope->>'type_'",
             )
             .bind(&aggregate)
+            .bind(&tenant_a)
             .fetch_all(&admin)
             .await
             .unwrap();
