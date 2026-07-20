@@ -88,3 +88,5 @@ remain visible without enabling log amplification during a socket flood.
 Every response disables content-type sniffing. API responses, errors, and health probes default to
 `Cache-Control: no-store`; explicit protocol policies remain authoritative, including Git smart
 HTTP's revalidation policy and SSE's `no-cache` stream policy.
+If handler response metadata cannot be rendered as valid HTTP, the adapter fails closed with the
+generic canonical 500 envelope; invalid metadata can never degrade into a successful empty response.

@@ -522,7 +522,7 @@ fn probe_response(status: u16, body: Vec<u8>) -> Response<EdgeBody> {
     }
     response
         .body(full_body(body))
-        .unwrap_or_else(|_| Response::new(full_body(b"{}".to_vec())))
+        .unwrap_or_else(|_| response_render_failure())
 }
 
 /// True iff a `Content-Length` header is present, parseable, and DECLARES more than `cap` bytes — the
@@ -558,7 +558,7 @@ fn to_hyper(resp: EdgeResponse) -> Response<EdgeBody> {
             }
             builder
                 .body(full_body(body))
-                .unwrap_or_else(|_| Response::new(full_body(b"{}".to_vec())))
+                .unwrap_or_else(|_| response_render_failure())
         }
         EdgeResponse::Sse { headers, sub } => {
             let mut builder = Response::builder()
@@ -571,9 +571,21 @@ fn to_hyper(resp: EdgeResponse) -> Response<EdgeBody> {
             }
             builder
                 .body(sse_body(sub.into_receiver()))
-                .unwrap_or_else(|_| Response::new(full_body(b"{}".to_vec())))
+                .unwrap_or_else(|_| response_render_failure())
         }
     }
+}
+
+fn response_render_failure() -> Response<EdgeBody> {
+    let mut response = Response::new(full_body(
+        br#"{"error":{"message":"internal error","code":"internal"}}"#.to_vec(),
+    ));
+    *response.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+    response.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 /// A finished body of `Bytes` (the JSON view-model / error envelope).
@@ -775,6 +787,16 @@ mod tests {
         let resp = request_body_read_error();
         assert_eq!(resp.status(), 400);
         assert_eq!(resp.headers()[hyper::header::CONNECTION], "close");
+    }
+
+    #[test]
+    fn invalid_response_metadata_fails_closed_as_a_canonical_500() {
+        let response = to_hyper(
+            EdgeResponse::json(200, &serde_json::json!({ "false": "success" }))
+                .with_header("x-invalid", "line\nbreak"),
+        );
+        assert_eq!(response.status(), 500);
+        assert_eq!(response.headers()[hyper::header::CONTENT_TYPE], "application/json");
     }
 
     #[test]
