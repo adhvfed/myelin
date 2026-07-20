@@ -22,6 +22,7 @@ describe.runIf(Boolean(redisUrl))("ValkeySessionStore integration", () => {
     const firstReplica = store();
     const secondReplica = store();
     const id = `integration_${randomBytes(12).toString("hex")}`;
+    const replacementId = `integration_${randomBytes(12).toString("hex")}`;
     const record: SessionRecord = {
       token: "access-one",
       refreshToken: "refresh-one",
@@ -39,10 +40,16 @@ describe.runIf(Boolean(redisUrl))("ValkeySessionStore integration", () => {
       expect(await secondReplica.updateToken(id, "access-two")).toBe(true);
       expect(await firstReplica.get(id)).toEqual({ ...record, token: "access-two" });
 
-      expect(await firstReplica.delete(id)).toBe(true);
+      const replacement = { ...record, token: "access-three" };
+      await firstReplica.rotate(id, replacementId, replacement);
       expect(await secondReplica.get(id)).toBeNull();
+      expect(await secondReplica.get(replacementId)).toEqual(replacement);
+
+      expect(await firstReplica.delete(replacementId)).toBe(true);
+      expect(await secondReplica.get(replacementId)).toBeNull();
     } finally {
       await firstReplica.delete(id);
+      await firstReplica.delete(replacementId);
     }
   });
 });

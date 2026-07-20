@@ -57,13 +57,12 @@ export async function updateSessionToken(token: string): Promise<boolean> {
 
 /** Issue a session: store the record server-side, set the httpOnly cookie carrying ONLY the opaque id. */
 export async function issueSession(rec: SessionRecord): Promise<string> {
-  // Re-authentication rotates the browser session and revokes the prior id immediately. A copied old
-  // cookie cannot remain live until its TTL merely because the same browser signed in again.
   const priorId = getCookie(SESSION_COOKIE);
-  if (priorId && validSessionId(priorId)) await store.delete(priorId);
-
   const id = freshId();
-  await store.issue(id, rec);
+  // Re-authentication issues the replacement and revokes the prior id atomically. An outage cannot
+  // delete the working session first and then fail before creating its replacement.
+  if (priorId && validSessionId(priorId)) await store.rotate(priorId, id, rec);
+  else await store.issue(id, rec);
   setCookie(SESSION_COOKIE, id, {
     httpOnly: true,
     // `lax` (not `strict`): the session cookie MUST ride a top-level deep-link/full-reload navigation
@@ -82,11 +81,16 @@ export async function issueSession(rec: SessionRecord): Promise<string> {
 /** Clear the current session (logout / dead session): drop the record AND the cookie. Idempotent. */
 export async function clearCurrentSession(): Promise<void> {
   const id = getCookie(SESSION_COOKIE);
-  if (id && validSessionId(id)) await store.delete(id);
-  deleteCookie(SESSION_COOKIE, {
-    httpOnly: true,
-    sameSite: "lax",
-    path: "/",
-    secure: cookie.secure,
-  });
+  try {
+    if (id && validSessionId(id)) await store.delete(id);
+  } finally {
+    // Local cookie removal must not depend on Valkey availability. The deletion error still
+    // propagates so operators can observe failed server-side revocation.
+    deleteCookie(SESSION_COOKIE, {
+      httpOnly: true,
+      sameSite: "lax",
+      path: "/",
+      secure: cookie.secure,
+    });
+  }
 }

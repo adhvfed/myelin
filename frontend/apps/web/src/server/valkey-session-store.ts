@@ -22,6 +22,21 @@ redis.call("SET", KEYS[1], cjson.encode(session), "PX", ARGV[3])
 return 1
 `;
 
+const ROTATE_SCRIPT = `
+local clock = redis.call("TIME")
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local session = {
+  record = cjson.decode(ARGV[1]),
+  createdAtMs = now,
+  lastSeenAtMs = now,
+  expiresAtMs = now + tonumber(ARGV[2])
+}
+local encoded = cjson.encode(session)
+redis.call("SET", KEYS[1], encoded, "PX", ARGV[3])
+redis.call("DEL", KEYS[2])
+return 1
+`;
+
 const GET_SCRIPT = `
 local raw = redis.call("GET", KEYS[1])
 if not raw then return nil end
@@ -90,6 +105,18 @@ export class ValkeySessionStore implements SessionStore {
       ISSUE_SCRIPT,
       1,
       this.#key(id),
+      JSON.stringify(record),
+      SESSION_ABSOLUTE_TTL_MS,
+      Math.min(SESSION_IDLE_TTL_MS, SESSION_ABSOLUTE_TTL_MS),
+    );
+  }
+
+  async rotate(priorId: string, id: string, record: SessionRecord): Promise<void> {
+    await this.#redis.eval(
+      ROTATE_SCRIPT,
+      2,
+      this.#key(id),
+      this.#key(priorId),
       JSON.stringify(record),
       SESSION_ABSOLUTE_TTL_MS,
       Math.min(SESSION_IDLE_TTL_MS, SESSION_ABSOLUTE_TTL_MS),

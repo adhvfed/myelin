@@ -53,4 +53,15 @@ describe("MemorySessionStore", () => {
     expect(store.get("session-one", 21_001)).toEqual({ ...record, token: "access-two" });
     expect(store.updateToken("missing", "access-two", 21_000)).toBe(false);
   });
+
+  it("atomically replaces a prior browser session", () => {
+    const store = new MemorySessionStore();
+    store.issue("session-one", record, 20_000);
+
+    store.rotate("session-one", "session-two", { ...record, token: "access-two" }, 21_000);
+
+    expect(store.get("session-one", 21_001)).toBeNull();
+    expect(store.get("session-two", 21_001)).toEqual({ ...record, token: "access-two" });
+    expect(store.size()).toBe(1);
+  });
 });
