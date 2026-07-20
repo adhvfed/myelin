@@ -23,6 +23,7 @@ import {
   createMemo,
   createSignal,
   onCleanup,
+  onMount,
 } from "solid-js";
 import { IssueCreateDialog } from "~/components/issues/IssueCreateDialog";
 import {
@@ -71,6 +72,10 @@ export default function IssuesIndex() {
   const [pending, setPending] = createSignal<PendingIssue[]>([]);
   const [activeRow, setActiveRow] = createSignal(0);
   const [activationRefreshing, setActivationRefreshing] = createSignal(false);
+  // The lazy route chunk may hydrate after SSR paints. Keep client-only controls disabled until
+  // their handlers exist so early input cannot disappear.
+  const [interactive, setInteractive] = createSignal(false);
+  onMount(() => setInteractive(true));
   const pollControllers = new Set<AbortController>();
   let filterGeneration = 0;
   let loadMoreRequest = 0;
@@ -295,7 +300,12 @@ export default function IssuesIndex() {
           <p class="issues-eyebrow">Myelin dogfood</p>
           <h1 id="issues-heading"><Icon name="issue" /> Issues</h1>
         </div>
-        <button type="button" class="issues-button issues-button-primary" onClick={openCreate}>
+        <button
+          type="button"
+          class="issues-button issues-button-primary"
+          disabled={!interactive()}
+          onClick={openCreate}
+        >
           <Icon name="issue" /> New issue
         </button>
       </header>
