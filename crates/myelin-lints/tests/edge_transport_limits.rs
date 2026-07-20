@@ -16,14 +16,14 @@ fn edge_transport_keeps_slowloris_connection_and_body_memory_bounds() {
 
     for required in [
         "const MAX_CONNECTIONS: usize",
-        "const MAX_CONCURRENT_GIT_PUSHES: usize",
+        "const MAX_CONCURRENT_GIT_WIRE_OPERATIONS: usize",
         "const MAX_REQUEST_HEADERS: usize",
         "const MAX_HTTP_BUFFER_BYTES: usize",
         "const HEADER_READ_TIMEOUT: Duration",
         "const API_BODY_READ_TIMEOUT: Duration",
         "const GIT_PUSH_BODY_READ_TIMEOUT: Duration",
         "Semaphore::new(MAX_CONNECTIONS)",
-        "Semaphore::new(MAX_CONCURRENT_GIT_PUSHES)",
+        "Semaphore::new(MAX_CONCURRENT_GIT_WIRE_OPERATIONS)",
         ".header_read_timeout(HEADER_READ_TIMEOUT)",
         ".max_headers(MAX_REQUEST_HEADERS)",
         ".max_buf_size(MAX_HTTP_BUFFER_BYTES)",
@@ -31,6 +31,9 @@ fn edge_transport_keeps_slowloris_connection_and_body_memory_bounds() {
         "MAX_JSON_REQUEST_BODY_BYTES",
         "tokio::time::timeout(deadline",
         "BoundedCollectError::TimedOut",
+        "tokio::task::spawn_blocking(move || gw.handle(edge_req))",
+        "path.ends_with(\"/git-upload-pack\")",
+        "path.ends_with(\"/info/refs\")",
     ] {
         assert!(
             server.contains(required),
