@@ -23,6 +23,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # The dev env-var contract the myelin-config layer points at (the docker-compose dev defaults).
@@ -42,13 +45,15 @@ jobs:
     # stack up `--wait`, runs `cargo test --features integration`, then the infra scorecard binary.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-20
+        with:
+          toolchain: stable
       - name: The integration gate — up --wait → cargo test --features integration → infra scorecard (loud, non-zero on any red row)
         run: scripts/integration-test.sh --down
       - name: Upload the dated infra scorecard artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: infra-scorecard
           path: testing/scorecards/infra.md

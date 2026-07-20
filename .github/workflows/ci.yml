@@ -13,6 +13,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Infra levers (NOT a code change): as the workspace grew (sandbox/aws-lc-sys/ring/sqlx + all the
@@ -46,13 +49,13 @@ jobs:
     env:
       REDIS_URL: redis://127.0.0.1:6379
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           package_json_file: frontend/package.json
       - name: Install Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: pnpm
@@ -71,7 +74,7 @@ jobs:
         run: pnpm --filter @myelin/web test:e2e
       - name: Upload Playwright traces on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: frontend-playwright-results
           path: frontend/apps/web/test-results
@@ -83,15 +86,17 @@ jobs:
     # myelin-lints tests; there is deliberately NO `|| true` / `continue-on-error` anywhere.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
       # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main 2026-07-20
         with:
           tool-cache: false
           large-packages: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-20
+        with:
+          toolchain: stable
       - name: The twelve architecture lints over the workspace source (loud, non-zero on any violation)
         run: cargo run -p myelin-lints --bin lint-gate
       - name: The lint fixture matrix + the CI-gate self-test (red-fixture ⇒ non-zero exit)
@@ -106,15 +111,17 @@ jobs:
     # leans on (the contract-coverage scanner passes).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
       # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main 2026-07-20
         with:
           tool-cache: false
           large-packages: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-20
+        with:
+          toolchain: stable
       - name: The contract-coverage scanner over the contract-index + manifest (loud, non-zero on any falsely-claimed row)
         run: cargo run -p myelin-lints --bin contract-coverage
       - name: The scanner self-test (red manifest fixture ⇒ non-zero exit; green ⇒ zero)
@@ -132,15 +139,17 @@ jobs:
     # scorecard_ratchet test proves dropping a row OR flipping it green-without-proof reds the gate.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
       # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main 2026-07-20
         with:
           tool-cache: false
           large-packages: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-20
+        with:
+          toolchain: stable
       - name: The SUB-M0 exit-gate scorecard (runs every required drill; non-zero on any red/missing row)
         run: cargo run -p myelin-harness --bin sub-m0-scorecard
       - name: The scorecard ratchet meta-test (dropping a row OR green-without-proof reds the gate)
@@ -161,15 +170,17 @@ jobs:
     # proves dropping a drill OR flipping it green-without-proof reds the gate.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
       # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main 2026-07-20
         with:
           tool-cache: false
           large-packages: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-20
+        with:
+          toolchain: stable
       - name: The Id M1→M2 exit-gate scorecard (re-runs every M1 Id drill; non-zero on any red/missing row)
         run: cargo run -p myelin-harness --bin id-m1-scorecard
       - name: The Id-M1 scorecard ratchet meta-test (dropping a drill OR green-without-proof reds the gate)
@@ -189,17 +200,19 @@ jobs:
     # reds the gate.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
       # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main 2026-07-20
         with:
           tool-cache: false
           large-packages: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-20
+        with:
+          toolchain: stable
       - name: Install cargo-mutants (the mandatory-core mutation gate tool)
-        run: cargo install cargo-mutants --locked
+        run: cargo install cargo-mutants --version 27.1.0 --locked
       - name: The dogfood meta-test (the graph carries the ratchet; a violating commit reds the gate)
         run: cargo test -p myelin-harness --test self_hosting_ci_dogfood
       - name: The self-hosting CI graph on Myelin's own commit (lints + scanner + mutation gate + SUB-D3/D6/D10; non-zero on any red)
@@ -208,16 +221,17 @@ jobs:
   build-test-clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       # Reclaim ~25GB on the runner (dotnet/android/ghc) so the workspace link does not run out of
       # disk — see the env: note above. Loud-but-non-fatal so a tooling hiccup never fails the gate.
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main 2026-07-20
         with:
           tool-cache: false
           large-packages: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-20
         with:
+          toolchain: stable
           components: clippy
       - name: build
         run: cargo build --workspace --locked
