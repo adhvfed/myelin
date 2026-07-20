@@ -21,6 +21,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use std::convert::Infallible;
 use std::future::Future;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -322,16 +323,22 @@ async fn handle_connection(
     };
     let edge_req = EdgeRequest::new(method, path, query, headers, bytes);
     let edge_response = if is_git_wire {
-        match tokio::task::spawn_blocking(move || gw.handle(edge_req)).await {
+        match tokio::task::spawn_blocking(move || handle_gateway_safely(&gw, edge_req)).await {
             Ok(response) => response,
             Err(_) => EdgeResponse::error(&EdgeError::Internal(
                 "Git wire dispatch task did not complete".into(),
             )),
         }
     } else {
-        gw.handle(edge_req)
+        handle_gateway_safely(&gw, edge_req)
     };
     to_hyper(edge_response)
+}
+
+fn handle_gateway_safely(gw: &Gateway, request: EdgeRequest) -> EdgeResponse {
+    catch_unwind(AssertUnwindSafe(|| gw.handle(request))).unwrap_or_else(|_| {
+        EdgeResponse::error(&EdgeError::Internal("gateway handler panicked".into()))
+    })
 }
 
 fn is_git_wire_path(path: &str) -> bool {

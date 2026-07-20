@@ -59,6 +59,14 @@ impl Handler for SlowGitWireHandler {
     }
 }
 
+struct PanicHandler;
+
+impl Handler for PanicHandler {
+    fn handle(&self, _ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        panic!("intentional handler panic for transport containment proof")
+    }
+}
+
 struct ToggleReadiness(AtomicBool);
 
 impl ReadinessProbe for ToggleReadiness {
@@ -128,6 +136,12 @@ fn build_gateway() -> (Arc<Gateway>, CellTokenAuthority, RevocationStore) {
                 "/v1/t/{tenant}/whoami",
                 "edge.whoami",
                 Arc::new(WhoamiHandler),
+            )
+            .route(
+                Method::Get,
+                "/v1/panic",
+                "edge.whoami",
+                Arc::new(PanicHandler),
             )
             .route(
                 Method::Get,
@@ -374,6 +388,24 @@ async fn malformed_requests_are_clean_errors_no_panic() {
     )
     .await;
     assert_eq!(login, 503, "human login refuses-not-mocks until configured");
+}
+
+#[tokio::test]
+async fn handler_panic_is_a_generic_500_and_the_listener_survives() {
+    let (gateway, cell, _revocations) = build_gateway();
+    let token = mint(&cell, TENANT, "jti-panic", now() + 3600);
+    let headers = bearer(&token);
+    let addr = spawn(gateway).await;
+
+    let (status, body) = http(addr, "GET", "/v1/panic", &hdr(&headers), vec![]).await;
+    assert_eq!(status, 500);
+    let envelope: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(envelope["error"]["code"], "internal");
+    assert_eq!(envelope["error"]["message"], "internal error");
+    assert!(!body.contains("intentional handler panic"));
+
+    let (live, _) = http(addr, "GET", "/livez", &[], vec![]).await;
+    assert_eq!(live, 200, "a contained handler panic must not kill the listener");
 }
 
 /// (f) The SSE endpoint streams (a smoke): subscribe over real HTTP, publish a frame to the verified

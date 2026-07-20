@@ -72,3 +72,6 @@ Ordinary request bodies must finish within 30 seconds; Git push bodies receive a
 deadline. These are total body-read deadlines, so periodic trickle bytes do not retain intake slots.
 SIGINT or SIGTERM also propagates into active Git wire sandboxes: while HTTP connections drain, the
 edge kills and reaps `runsc` containers instead of waiting for their two-minute operation limit.
+
+Handler panics are isolated to the request and return the generic canonical 500 envelope. Production
+logs suppress panic payloads so request-derived secrets cannot leak through Rust's default panic hook.
