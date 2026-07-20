@@ -172,7 +172,9 @@ export const getAuthConfig = query(async (): Promise<AuthConfig> => {
  * submitted form value → this server function → the edge; it is never logged, never returned to the
  * client, never placed in a URL. On any failure (invalid/expired token, edge unreachable) the founder
  * is bounced to `/login?error=token_invalid` with NO session and NO leaked edge detail. The decision
- * lives in the pure {@link runTokenLogin} core; this wires the real whoami-verify + session-issue deps.
+ * lives in the pure {@link runTokenLogin} core; this wires the real auth-mode check + whoami-verify +
+ * session-issue deps. The mode is re-read here, not trusted from the page render: a caller may invoke
+ * a registered server action directly even when its form is hidden.
  */
 export const loginWithToken = action(async (formData: FormData) => {
   "use server";
@@ -183,6 +185,10 @@ export const loginWithToken = action(async (formData: FormData) => {
     token,
     schemeRaw != null ? String(schemeRaw) : undefined,
     {
+      isEnabled: async () => {
+        const config = await edgeGetPublic<EdgeAuthConfig>("/v1/auth/config");
+        return config.token_login_enabled === true;
+      },
       verify: (t, s) => edgeWhoamiWithToken(t, s),
       issue: (rec) => issueSession(rec),
     },
