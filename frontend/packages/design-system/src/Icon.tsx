@@ -11,13 +11,11 @@
 
 import { splitProps, mergeProps, type JSX } from "solid-js";
 import type { IconName } from "./icon-names";
+import spriteHref from "../generated/assets/sprite.svg?url";
 
 // Where the sprite is served from. Overridable per app shell (Tauri vs web base path) without
 // editing call sites. Default points at the package's generated asset.
-export const SPRITE_HREF_DEFAULT = new URL(
-  "../generated/assets/sprite.svg",
-  import.meta.url,
-).href;
+export const SPRITE_HREF_DEFAULT = spriteHref;
 
 export interface IconProps extends JSX.SvgSVGAttributes<SVGSVGElement> {
   /** Sprite symbol id (typed against the 42-icon set). */

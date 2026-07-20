@@ -1,7 +1,7 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "types": ["vitest/globals", "@testing-library/jest-dom"],
+    "types": ["vite/client", "vitest/globals", "@testing-library/jest-dom"],
     "noEmit": true
   },
   "include": ["src", "styleguide", "build-tokens.mjs", "scripts", "vitest.config.ts", "vitest.setup.ts"],
