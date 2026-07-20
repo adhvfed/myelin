@@ -24,6 +24,7 @@ use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -57,6 +58,8 @@ const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const API_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_PUSH_BODY_READ_TIMEOUT: Duration = Duration::from_secs(300);
+static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static CONNECTIONS_SHED: AtomicU64 = AtomicU64::new(0);
 
 /// Result of a requested listener shutdown. A forced result means the grace deadline expired and
 /// the remaining connection tasks were aborted; the count is the number active when draining began.
@@ -200,6 +203,7 @@ where
                     }
                 };
                 let Ok(connection_permit) = connection_slots.clone().try_acquire_owned() else {
+                    log_connection_shed();
                     drop(stream);
                     continue;
                 };
@@ -269,6 +273,34 @@ async fn handle_connection(
     git_wire_slots: Arc<Semaphore>,
     req: Request<Incoming>,
 ) -> Response<EdgeBody> {
+    let request_id = next_request_id();
+    let method = observable_method(req.method());
+    let route_class = route_class(req.uri().path());
+    let started = std::time::Instant::now();
+    let mut response = handle_connection_inner(gw, readiness, git_wire_slots, req).await;
+    response.headers_mut().insert(
+        hyper::header::HeaderName::from_static("x-request-id"),
+        hyper::header::HeaderValue::from_str(&request_id).expect("generated request id is ASCII"),
+    );
+    eprintln!(
+        "{}",
+        access_log_record(
+            &request_id,
+            method,
+            route_class,
+            response.status().as_u16(),
+            started.elapsed(),
+        )
+    );
+    response
+}
+
+async fn handle_connection_inner(
+    gw: Arc<Gateway>,
+    readiness: Arc<dyn ReadinessProbe>,
+    git_wire_slots: Arc<Semaphore>,
+    req: Request<Incoming>,
+) -> Response<EdgeBody> {
     let (parts, body) = req.into_parts();
     let method = parts.method.as_str().to_string();
     let path = parts.uri.path().to_string();
@@ -333,6 +365,73 @@ async fn handle_connection(
         handle_gateway_safely(&gw, edge_req)
     };
     to_hyper(edge_response)
+}
+
+fn next_request_id() -> String {
+    let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    format!("{:08x}{nanos:016x}{sequence:016x}", std::process::id())
+}
+
+fn observable_method(method: &hyper::Method) -> &'static str {
+    match *method {
+        hyper::Method::GET => "GET",
+        hyper::Method::HEAD => "HEAD",
+        hyper::Method::POST => "POST",
+        hyper::Method::PUT => "PUT",
+        hyper::Method::PATCH => "PATCH",
+        hyper::Method::DELETE => "DELETE",
+        hyper::Method::OPTIONS => "OPTIONS",
+        _ => "OTHER",
+    }
+}
+
+fn route_class(path: &str) -> &'static str {
+    if matches!(path, "/livez" | "/readyz") {
+        "health"
+    } else if is_git_wire_path(path) {
+        "git_wire"
+    } else if path.starts_with("/v1/auth/") {
+        "auth"
+    } else if path.starts_with("/v1/") {
+        "api"
+    } else {
+        "unknown"
+    }
+}
+
+fn access_log_record(
+    request_id: &str,
+    method: &str,
+    route_class: &str,
+    status: u16,
+    elapsed: Duration,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event": "edge.http.request",
+        "request_id": request_id,
+        "method": method,
+        "route_class": route_class,
+        "status": status,
+        "duration_us": elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
+    })
+}
+
+fn log_connection_shed() {
+    let count = CONNECTIONS_SHED.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "edge.connection.shed",
+                "shed_total": count,
+                "reason": "connection_limit",
+            })
+        );
+    }
 }
 
 fn handle_gateway_safely(gw: &Gateway, request: EdgeRequest) -> EdgeResponse {
@@ -636,5 +735,41 @@ mod tests {
         assert_eq!(resp.headers()[hyper::header::CONNECTION], "close");
         let err = EdgeError::RequestTimeout("x".into());
         assert_eq!(err.code(), "request_timeout");
+    }
+
+    #[test]
+    fn request_ids_are_server_generated_ascii_and_unique() {
+        let first = next_request_id();
+        let second = next_request_id();
+        assert_ne!(first, second);
+        for id in [first, second] {
+            assert_eq!(id.len(), 40);
+            assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn access_records_use_bounded_classes_never_raw_paths() {
+        assert_eq!(route_class("/livez"), "health");
+        assert_eq!(
+            route_class("/secret-tenant/eu-west/private.git/git-upload-pack"),
+            "git_wire"
+        );
+        assert_eq!(route_class("/v1/auth/refresh"), "auth");
+        assert_eq!(route_class("/v1/issues/secret-title"), "api");
+        assert_eq!(route_class("/attacker-controlled"), "unknown");
+
+        let record = access_log_record(
+            "request-id",
+            "GET",
+            "git_wire",
+            503,
+            Duration::from_micros(42),
+        );
+        let encoded = record.to_string();
+        assert_eq!(record["duration_us"], 42);
+        assert!(!encoded.contains("secret-tenant"));
+        assert!(!encoded.contains("private.git"));
+        assert!(!encoded.contains("authorization"));
     }
 }

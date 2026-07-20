@@ -582,6 +582,23 @@ async fn health_endpoints_split_dependency_free_liveness_from_readiness() {
     assert!(matches!(outcome, ShutdownOutcome::Graceful { .. }));
 }
 
+#[tokio::test]
+async fn every_response_carries_a_fresh_server_request_id() {
+    let (gateway, _cell, _revocations) = build_gateway();
+    let addr = spawn(gateway).await;
+
+    let first = open(addr, "GET", "/livez", &[("x-request-id", "attacker-value")], vec![]).await;
+    let second = open(addr, "GET", "/does-not-exist", &[], vec![]).await;
+    let first_id = first.headers()["x-request-id"].to_str().unwrap();
+    let second_id = second.headers()["x-request-id"].to_str().unwrap();
+    assert_ne!(first_id, "attacker-value", "client request IDs are never trusted");
+    assert_ne!(first_id, second_id);
+    for id in [first_id, second_id] {
+        assert_eq!(id.len(), 40);
+        assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn blocking_git_wire_dispatch_does_not_stall_liveness() {
     SLOW_GIT_STARTED.store(false, Ordering::SeqCst);
