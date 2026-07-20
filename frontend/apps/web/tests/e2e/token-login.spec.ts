@@ -107,6 +107,27 @@ test.describe("R4.0 operator-token login", () => {
     await expect(page).toHaveURL(/\/git\/repos/);
   });
 
+  test("a direct token action fails closed when the edge disables the mode after render", async ({ page }) => {
+    // Render the real action-backed form while enabled, then disable the edge flag before submit.
+    // This models both a stale open login tab and a caller invoking the registered action directly:
+    // security must live in the action, not in the conditional that painted the form.
+    await setEdgeConfig({ tokenLoginEnabled: true });
+    await page.goto("/login");
+    await page.waitForLoadState("networkidle");
+    await expect(page.getByTestId("token-login-form")).toBeVisible();
+
+    await setEdgeConfig({ tokenLoginEnabled: false });
+    await page.getByTestId("token-input").fill(DEV_ACCESS_TOKEN);
+    await page.getByTestId("token-login").click();
+
+    // The action re-reads auth/config, refuses before whoami/session issuance, and redirects to the
+    // logged-out chooser. A protected navigation remains logged out (no latent Set-Cookie/session).
+    await expect(page).toHaveURL(/\/login$/);
+    await expect(page.getByTestId("token-login-form")).toHaveCount(0);
+    await page.goto("/git/repos");
+    await expect(page).toHaveURL(/\/login$/);
+  });
+
   test("the token card is HIDDEN when the edge flag is off", async ({ page }) => {
     await setEdgeConfig({ tokenLoginEnabled: false });
     await page.goto("/login");

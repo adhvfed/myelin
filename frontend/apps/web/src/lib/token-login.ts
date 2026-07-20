@@ -28,6 +28,9 @@ export interface TokenSessionInput {
 
 /** The injectable dependencies (the real ones live in `auth.ts`; tests fake them). */
 export interface TokenLoginDeps {
+  /** Re-read the edge's authoritative auth posture immediately before verification. Only an
+   *  explicit `true` admits token login; false/missing config and transport errors fail closed. */
+  isEnabled: () => Promise<boolean>;
   /** Verify a CALLER-SUPPLIED token against the real edge whoami. Resolves with the viewer facts on a
    *  200; REJECTS on any non-200 / network error (invalid or expired token). Never leaks the raw error. */
   verify: (token: string, scheme: string) => Promise<TokenWhoami>;
@@ -43,6 +46,8 @@ export interface TokenLoginResult {
 /** On any failure the founder is bounced back with a DISTINCT, honest error param (blames the token /
  *  the bootstrap step, never the user) — never the raw edge error, never the token. */
 export const TOKEN_LOGIN_ERROR = "/login?error=token_invalid";
+/** A disabled or unavailable auth mode returns to the login chooser without exposing edge detail. */
+export const TOKEN_LOGIN_DISABLED = "/login";
 /** On success, land in the app exactly where the dev seam lands. */
 export const TOKEN_LOGIN_SUCCESS = "/git/repos";
 /** The edge's default capability-token scheme; the paste form defaults here but may override. */
@@ -58,10 +63,12 @@ export function deriveDisplayName(principalId: string): string {
  * Run the operator-token login decision.
  *
  * 1. Empty token → the honest error (nothing to verify).
- * 2. `verify` REJECTS (invalid/expired token or edge unreachable) → the honest error; NO session. The
+ * 2. Re-read the authoritative edge config. Anything except explicit enabled (including a config
+ *    fetch error) → the login chooser; `verify` and `issue` are NEVER called.
+ * 3. `verify` REJECTS (invalid/expired token or edge unreachable) → the honest error; NO session. The
  *    raw edge error is swallowed here so it can never leak to the client.
- * 3. `verify` resolves but the whoami shape is missing a principal id → the honest error; NO session.
- * 4. Otherwise mint the session (with an EMPTY refresh token — a pasted bootstrap token has none; it
+ * 4. `verify` resolves but the whoami shape is missing a principal id → the honest error; NO session.
+ * 5. Otherwise mint the session (with an EMPTY refresh token — a pasted bootstrap token has none; it
  *    simply expires and the founder re-pastes, see `auth.ts`) and land in the app.
  */
 export async function runTokenLogin(
@@ -73,6 +80,16 @@ export async function runTokenLogin(
   const scheme = (rawScheme ?? "").trim() || DEFAULT_TOKEN_SCHEME;
 
   if (!token) return { redirectTo: TOKEN_LOGIN_ERROR };
+
+  try {
+    if ((await deps.isEnabled()) !== true) {
+      return { redirectTo: TOKEN_LOGIN_DISABLED };
+    }
+  } catch {
+    // The public edge config is the auth-mode authority. An unavailable or malformed response must
+    // never degrade into accepting a token through this public web bridge.
+    return { redirectTo: TOKEN_LOGIN_DISABLED };
+  }
 
   let who: TokenWhoami;
   try {
