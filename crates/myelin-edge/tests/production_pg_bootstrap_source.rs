@@ -89,6 +89,8 @@ fn production_edge_owns_the_durable_issue_saga_worker_without_an_in_memory_fallb
     assert!(main.contains("myelin_issues::PgIssueStore::new("));
     assert!(main.contains("register_issues("));
     assert!(main.contains("spawn_issue_authorization_reconciler("));
+    assert!(main.contains("signal = shutdown_signal()"));
+    assert!(main.contains("SignalKind::terminate()"));
     assert!(main.contains("tokio::signal::ctrl_c()"));
     assert!(main.contains("issue_reconciler.shutdown().await"));
     assert!(!main.contains("KmsEngine::new()"));
