@@ -10,39 +10,30 @@
 
 import { getCookie, setCookie, deleteCookie } from "vinxi/http";
 import { randomBytes } from "node:crypto";
+import {
+  MemorySessionStore,
+  type SessionRecord,
+} from "./session-store";
+import { sessionCookieSettings } from "./session-cookie";
 
-/** The session cookie name (httpOnly; carries ONLY the opaque id, never the token). */
-export const SESSION_COOKIE = "myelin_session";
+export type { SessionRecord } from "./session-store";
 
-/** The server-side session record (NEVER exposed to client JS). */
-export interface SessionRecord {
-  /** The server-side access token (Bearer material) — server-only. */
-  token: string;
-  /** The refresh credential used for the single-refresh round-trip — server-only. */
-  refreshToken: string;
-  /** The credential scheme the token authenticates under (sent as `x-myelin-token-scheme`). */
-  scheme: string;
-  /** The verified principal id (PII-free id, for the identity menu). */
-  principalId: string;
-  /** A display label for the identity menu. */
-  displayName: string;
-  /** The data-residency region (drives the residency cue in the chrome). */
-  region: string;
-  /** The operating tenant. */
-  tenant: string;
-}
+/** Production uses the cookie-prefix contract: Secure, host-only, and Path=/. Local HTTP uses the
+ * unprefixed name because browsers correctly reject a `__Host-` cookie without Secure. */
+const cookie = sessionCookieSettings(import.meta.env.PROD);
+export const SESSION_COOKIE = cookie.name;
 
 /** The in-memory session store (the model; durable backing is the named floor).
  *
  * Backed on `globalThis` so the SSR bundle and the server-functions bundle — which vinxi/Nitro loads
- * as SEPARATE module graphs in the SAME process — share ONE Map. Without this, a session written by a
+ * as SEPARATE module graphs in the SAME process — share ONE store. Without this, a session written by a
  * server action (server-fns bundle) is invisible to the SSR `requireViewer` on a full-reload/deep-link
  * navigation, so every app route would bounce to `/login` on refresh. (A durable backing — Valkey/PG —
  * is the named follow-on; this keeps the in-memory model honest while making deep-links/refresh work.) */
 const globalStore = globalThis as unknown as {
-  __myelinSessionStore?: Map<string, SessionRecord>;
+  __myelinSessionStore?: MemorySessionStore;
 };
-const store: Map<string, SessionRecord> = (globalStore.__myelinSessionStore ??= new Map());
+const store = (globalStore.__myelinSessionStore ??= new MemorySessionStore());
 
 /** Generate an opaque, unguessable session id (CSPRNG — the production-grade id the Rust model flagged). */
 function freshId(): string {
@@ -53,21 +44,25 @@ function freshId(): string {
 export function getSessionRecord(): SessionRecord | null {
   const id = getCookie(SESSION_COOKIE);
   if (!id) return null;
-  return store.get(id) ?? null;
+  return store.get(id);
 }
 
 /** Persist a (possibly rotated) token onto the current session, if one exists. Server-only. */
 export function updateSessionToken(token: string): void {
   const id = getCookie(SESSION_COOKIE);
   if (!id) return;
-  const rec = store.get(id);
-  if (rec) store.set(id, { ...rec, token });
+  store.updateToken(id, token);
 }
 
 /** Issue a session: store the record server-side, set the httpOnly cookie carrying ONLY the opaque id. */
 export function issueSession(rec: SessionRecord): string {
+  // Re-authentication rotates the browser session and revokes the prior id immediately. A copied old
+  // cookie cannot remain live until its TTL merely because the same browser signed in again.
+  const priorId = getCookie(SESSION_COOKIE);
+  if (priorId) store.delete(priorId);
+
   const id = freshId();
-  store.set(id, rec);
+  store.issue(id, rec);
   setCookie(SESSION_COOKIE, id, {
     httpOnly: true,
     // `lax` (not `strict`): the session cookie MUST ride a top-level deep-link/full-reload navigation
@@ -77,8 +72,8 @@ export function issueSession(rec: SessionRecord): string {
     sameSite: "lax",
     path: "/",
     // Secure in production; relaxed for the http dev/test harness so the cookie is actually set.
-    secure: process.env.NODE_ENV === "production",
-    maxAge: 60 * 60 * 8,
+    secure: cookie.secure,
+    maxAge: cookie.maxAgeSeconds,
   });
   return id;
 }
@@ -87,5 +82,10 @@ export function issueSession(rec: SessionRecord): string {
 export function clearCurrentSession(): void {
   const id = getCookie(SESSION_COOKIE);
   if (id) store.delete(id);
-  deleteCookie(SESSION_COOKIE, { path: "/" });
+  deleteCookie(SESSION_COOKIE, {
+    httpOnly: true,
+    sameSite: "lax",
+    path: "/",
+    secure: cookie.secure,
+  });
 }

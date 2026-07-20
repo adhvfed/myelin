@@ -1,6 +1,8 @@
 import { test, expect, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 
+const APP = `http://localhost:${process.env.PORT ?? 3000}`;
+
 // A real-browser axe assertion on the live DOM (the thing jsdom couldn't do for the overlays). We scan
 // the rendered page against WCAG 2.0/2.1 A+AA tags; a violation fails the gate loudly.
 async function expectNoAxeViolations(page: Page, context?: string) {
@@ -61,6 +63,35 @@ test.describe("MR-019 app shell — real browser", () => {
     await expect(page.getByRole("button", { name: /Inbox/ })).toBeVisible();
 
     await expectNoAxeViolations(page, "the authenticated shell + repos screen");
+  });
+
+  test("the session cookie is opaque and re-authentication revokes the prior id", async ({ page }) => {
+    await devLogin(page);
+    const first = (await page.context().cookies()).find((cookie) => cookie.name === "myelin_session");
+    expect(first).toMatchObject({
+      httpOnly: true,
+      sameSite: "Lax",
+      secure: false,
+      path: "/",
+    });
+    expect(first?.value).toMatch(/^sess_[A-Za-z0-9_-]{32}$/);
+    expect(first!.expires - Date.now() / 1_000).toBeGreaterThan(7 * 60 * 60);
+
+    await page.goto("/login");
+    await page.getByTestId("dev-login").click();
+    await page.waitForURL("**/git/repos");
+    const second = (await page.context().cookies()).find((cookie) => cookie.name === "myelin_session");
+    expect(second?.value).not.toBe(first?.value);
+
+    const staleContext = await page.context().browser()!.newContext();
+    try {
+      await staleContext.addCookies([{ ...first!, expires: -1 }]);
+      const stalePage = await staleContext.newPage();
+      await stalePage.goto(`${APP}/git/repos`);
+      await stalePage.waitForURL("**/login");
+    } finally {
+      await staleContext.close();
+    }
   });
 
   test("⌘K opens the command palette (focus in the search), Escape closes it", async ({ page }) => {

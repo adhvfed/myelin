@@ -1,0 +1,66 @@
+export const SESSION_ABSOLUTE_TTL_MS = 8 * 60 * 60 * 1_000;
+export const SESSION_IDLE_TTL_MS = 30 * 60 * 1_000;
+
+export interface SessionRecord {
+  token: string;
+  refreshToken: string;
+  scheme: string;
+  principalId: string;
+  displayName: string;
+  region: string;
+  tenant: string;
+}
+
+interface StoredSession {
+  record: SessionRecord;
+  createdAtMs: number;
+  lastSeenAtMs: number;
+  expiresAtMs: number;
+}
+
+/** In-process implementation of the session lifecycle contract. The production transport can swap
+ * this for Valkey while retaining identical absolute/idle expiry and token-rotation semantics. */
+export class MemorySessionStore {
+  readonly #sessions = new Map<string, StoredSession>();
+
+  issue(id: string, record: SessionRecord, nowMs = Date.now()): void {
+    this.#sessions.set(id, {
+      record: { ...record },
+      createdAtMs: nowMs,
+      lastSeenAtMs: nowMs,
+      expiresAtMs: nowMs + SESSION_ABSOLUTE_TTL_MS,
+    });
+  }
+
+  get(id: string, nowMs = Date.now()): SessionRecord | null {
+    const session = this.#sessions.get(id);
+    if (!session) return null;
+
+    if (
+      nowMs >= session.expiresAtMs ||
+      nowMs - session.lastSeenAtMs >= SESSION_IDLE_TTL_MS
+    ) {
+      this.#sessions.delete(id);
+      return null;
+    }
+
+    session.lastSeenAtMs = nowMs;
+    return { ...session.record };
+  }
+
+  updateToken(id: string, token: string, nowMs = Date.now()): boolean {
+    const record = this.get(id, nowMs);
+    const session = this.#sessions.get(id);
+    if (!record || !session) return false;
+    session.record = { ...record, token };
+    return true;
+  }
+
+  delete(id: string): boolean {
+    return this.#sessions.delete(id);
+  }
+
+  size(): number {
+    return this.#sessions.size;
+  }
+}
