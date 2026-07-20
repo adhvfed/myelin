@@ -17,7 +17,7 @@ use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::{Body, Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use std::convert::Infallible;
 use std::future::Future;
@@ -25,6 +25,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
@@ -45,10 +46,14 @@ type EdgeBody = BoxBody<Bytes, std::io::Error>;
 /// **Tradeoff / choice of 100 MiB:** git pushes ship packfiles that can be large, so the ceiling must
 /// be generous enough for a legitimate `git-receive-pack` — but finite, so the front door has a hard
 /// DoS ceiling. 100 MiB is that compromise: comfortably above ordinary pushes, far below "exhaust the
-/// host". FOLLOW-UP (not built here): a per-route cap could differentiate the small JSON routes (a few
-/// KiB is plenty) from the large git wire routes, tightening the ceiling on everything that is not a
-/// packfile push. Until then this single front-door ceiling is the floor.
+/// host". Only `git-receive-pack` receives that budget; every other route has a 1 MiB ceiling.
 const MAX_REQUEST_BODY_BYTES: usize = 100 * 1024 * 1024;
+const MAX_JSON_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+const MAX_CONNECTIONS: usize = 1024;
+const MAX_CONCURRENT_GIT_PUSHES: usize = 8;
+const MAX_REQUEST_HEADERS: usize = 64;
+const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Result of a requested listener shutdown. A forced result means the grace deadline expired and
 /// the remaining connection tasks were aborted; the count is the number active when draining began.
@@ -163,6 +168,8 @@ where
     tokio::pin!(shutdown);
     let graceful = GracefulShutdown::new();
     let mut connections = JoinSet::new();
+    let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let git_push_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_PUSHES));
     let mut accept_error = None;
 
     let shutdown_output = loop {
@@ -177,20 +184,33 @@ where
                         break None;
                     }
                 };
+                let Ok(connection_permit) = connection_slots.clone().try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
                 let io = TokioIo::new(stream);
                 let gw = gateway.clone();
                 let readiness = readiness.clone();
+                let git_push_slots = git_push_slots.clone();
                 let watcher = graceful.watcher();
                 connections.spawn(async move {
+                    let _connection_permit = connection_permit;
                     let service = service_fn(move |req: Request<Incoming>| {
                         let gw = gw.clone();
                         let readiness = readiness.clone();
+                        let git_push_slots = git_push_slots.clone();
                         async move {
-                            Ok::<_, Infallible>(handle_connection(gw, readiness, req).await)
+                            Ok::<_, Infallible>(
+                                handle_connection(gw, readiness, git_push_slots, req).await,
+                            )
                         }
                     });
-                    let connection = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, service);
+                    let mut http = hyper::server::conn::http1::Builder::new();
+                    http.timer(TokioTimer::new())
+                        .header_read_timeout(HEADER_READ_TIMEOUT)
+                        .max_headers(MAX_REQUEST_HEADERS)
+                        .max_buf_size(MAX_HTTP_BUFFER_BYTES);
+                    let connection = http.serve_connection(io, service);
                     let _ = watcher.watch(connection).await;
                 });
             }
@@ -231,6 +251,7 @@ where
 async fn handle_connection(
     gw: Arc<Gateway>,
     readiness: Arc<dyn ReadinessProbe>,
+    git_push_slots: Arc<Semaphore>,
     req: Request<Incoming>,
 ) -> Response<EdgeBody> {
     let (parts, body) = req.into_parts();
@@ -254,6 +275,15 @@ async fn handle_connection(
         };
         return probe_response(status, body);
     }
+    let body_cap = request_body_cap(&path);
+    let _git_push_permit = if body_cap == MAX_REQUEST_BODY_BYTES {
+        match git_push_slots.try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => return overloaded(),
+        }
+    } else {
+        None
+    };
     let query = parts.uri.query().unwrap_or("").to_string();
     let headers = parts
         .headers
@@ -262,19 +292,32 @@ async fn handle_connection(
         .collect();
     // Front-door body bound (R0.5 / DELTA N3): fast-path reject on a Content-Length header that
     // already declares more than the cap — refuse before reading a single body byte.
-    if content_length_over_cap(&parts.headers, MAX_REQUEST_BODY_BYTES) {
-        return payload_too_large();
+    if content_length_over_cap(&parts.headers, body_cap) {
+        return payload_too_large(body_cap);
     }
     // Collect the body bounded by MAX_REQUEST_BODY_BYTES, streaming frame-by-frame. Oversize → a 413
     // WITHOUT buffering past the cap; a read error → empty body (the gateway then produces a clean 400
     // if a body was required) — never a panic.
-    let bytes = match collect_bounded(body, MAX_REQUEST_BODY_BYTES).await {
+    let bytes = match collect_bounded(body, body_cap).await {
         Ok(b) => b,
-        Err(BoundedCollectError::TooLarge) => return payload_too_large(),
+        Err(BoundedCollectError::TooLarge) => return payload_too_large(body_cap),
         Err(BoundedCollectError::Read) => Vec::new(),
     };
     let edge_req = EdgeRequest::new(method, path, query, headers, bytes);
     to_hyper(gw.handle(edge_req))
+}
+
+fn request_body_cap(path: &str) -> usize {
+    if path.ends_with("/git-receive-pack") {
+        MAX_REQUEST_BODY_BYTES
+    } else {
+        MAX_JSON_REQUEST_BODY_BYTES
+    }
+}
+
+fn overloaded() -> Response<EdgeBody> {
+    let err = EdgeError::Unavailable("the Git push intake is at capacity; retry later".into());
+    to_hyper(EdgeResponse::error(&err))
 }
 
 fn probe_response(status: u16, body: Vec<u8>) -> Response<EdgeBody> {
@@ -304,9 +347,9 @@ fn content_length_over_cap(headers: &hyper::HeaderMap, cap: usize) -> bool {
 
 /// Render the `413 Payload Too Large` response through the existing error-envelope path, so its
 /// `{error:{message,code}}` shape matches every other edge error (R0.5 / DELTA N3).
-fn payload_too_large() -> Response<EdgeBody> {
+fn payload_too_large(cap: usize) -> Response<EdgeBody> {
     let err = EdgeError::PayloadTooLarge(format!(
-        "request body exceeds the {MAX_REQUEST_BODY_BYTES}-byte front-door limit"
+        "request body exceeds the {cap}-byte route limit"
     ));
     to_hyper(EdgeResponse::error(&err))
 }
@@ -466,10 +509,26 @@ mod tests {
     /// `payload_too_large` and HTTP status 413.
     #[test]
     fn payload_too_large_uses_the_canonical_413_envelope() {
-        let resp = payload_too_large();
+        let resp = payload_too_large(MAX_REQUEST_BODY_BYTES);
         assert_eq!(resp.status(), 413);
         let err = EdgeError::PayloadTooLarge("x".into());
         assert_eq!(err.status(), 413);
         assert_eq!(err.code(), "payload_too_large");
+    }
+
+    #[test]
+    fn only_git_receive_pack_gets_the_large_body_budget() {
+        assert_eq!(
+            request_body_cap("/acme/eu-west/widgets.git/git-receive-pack"),
+            MAX_REQUEST_BODY_BYTES
+        );
+        for path in [
+            "/v1/issues",
+            "/v1/git/repos/widgets",
+            "/acme/eu-west/widgets.git/git-upload-pack",
+            "/livez",
+        ] {
+            assert_eq!(request_body_cap(path), MAX_JSON_REQUEST_BODY_BYTES, "{path}");
+        }
     }
 }
