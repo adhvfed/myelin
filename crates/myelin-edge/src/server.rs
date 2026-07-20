@@ -95,8 +95,8 @@ enum BoundedCollectError {
     /// The accumulated data frames exceeded [`MAX_REQUEST_BODY_BYTES`]; reading stopped at the cap
     /// (the oversize buffer is never allocated) — maps to a `413` at the edge.
     TooLarge,
-    /// The transport yielded a read error mid-body — the caller falls back to an empty body (the
-    /// gateway then produces a clean `400` if a body was required), preserving prior behavior.
+    /// The transport yielded a read error mid-body. The caller returns a canonical `400` and closes
+    /// the HTTP/1 connection; a partial or broken body is never reinterpreted as an empty request.
     Read,
     /// The route's absolute body-read deadline expired. An absolute deadline, rather than an idle
     /// timeout, prevents a client from retaining capacity forever by trickling occasional bytes.
@@ -362,12 +362,12 @@ async fn handle_connection_inner(
         return payload_too_large(body_cap);
     }
     // Collect the body bounded by MAX_REQUEST_BODY_BYTES, streaming frame-by-frame. Oversize → a 413
-    // WITHOUT buffering past the cap; a read error → empty body (the gateway then produces a clean 400
-    // if a body was required) — never a panic.
+    // WITHOUT buffering past the cap; a read error → a clean 400 + connection close — never a
+    // partial body and never a panic.
     let bytes = match collect_bounded(body, body_cap, body_deadline).await {
         Ok(b) => b,
         Err(BoundedCollectError::TooLarge) => return payload_too_large(body_cap),
-        Err(BoundedCollectError::Read) => Vec::new(),
+        Err(BoundedCollectError::Read) => return request_body_read_error(),
         Err(BoundedCollectError::TimedOut) => return request_timeout(body_deadline),
     };
     let edge_req = EdgeRequest::new(method, path, query, headers, bytes);
@@ -494,6 +494,15 @@ fn request_timeout(deadline: Duration) -> Response<EdgeBody> {
         "request body was not received within {} seconds",
         deadline.as_secs()
     ));
+    let mut response = to_hyper(EdgeResponse::error(&err));
+    response
+        .headers_mut()
+        .insert(hyper::header::CONNECTION, hyper::header::HeaderValue::from_static("close"));
+    response
+}
+
+fn request_body_read_error() -> Response<EdgeBody> {
+    let err = EdgeError::BadRequest("request body could not be read".into());
     let mut response = to_hyper(EdgeResponse::error(&err));
     response
         .headers_mut()
@@ -662,7 +671,7 @@ mod tests {
         assert_eq!(out, b"hello", "only the data frame contributes to the body");
     }
 
-    /// A transport read error surfaces as `Read` (the caller falls back to an empty body → clean 400).
+    /// A transport read error surfaces as `Read`, never as a partial or empty successful body.
     #[tokio::test]
     async fn read_error_surfaces_as_read_not_too_large() {
         let frames: Vec<Result<Frame<Bytes>, std::io::Error>> = vec![
@@ -759,6 +768,13 @@ mod tests {
         assert_eq!(resp.headers()[hyper::header::CONNECTION], "close");
         let err = EdgeError::RequestTimeout("x".into());
         assert_eq!(err.code(), "request_timeout");
+    }
+
+    #[test]
+    fn body_read_error_uses_a_canonical_400_and_closes_the_connection() {
+        let resp = request_body_read_error();
+        assert_eq!(resp.status(), 400);
+        assert_eq!(resp.headers()[hyper::header::CONNECTION], "close");
     }
 
     #[test]
