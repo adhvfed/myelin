@@ -14,6 +14,7 @@ export interface SessionRecord {
 export interface SessionStore {
   ready(): void | Promise<void>;
   issue(id: string, record: SessionRecord): void | Promise<void>;
+  rotate(priorId: string, id: string, record: SessionRecord): void | Promise<void>;
   get(id: string): SessionRecord | null | Promise<SessionRecord | null>;
   updateToken(id: string, token: string): boolean | Promise<boolean>;
   delete(id: string): boolean | Promise<boolean>;
@@ -40,6 +41,13 @@ export class MemorySessionStore {
       lastSeenAtMs: nowMs,
       expiresAtMs: nowMs + SESSION_ABSOLUTE_TTL_MS,
     });
+  }
+
+  rotate(priorId: string, id: string, record: SessionRecord, nowMs = Date.now()): void {
+    // This implementation is synchronous: no observer can interleave between replacement issue and
+    // prior revocation. Production provides the equivalent atomicity in one Valkey Lua script.
+    this.issue(id, record, nowMs);
+    if (priorId !== id) this.#sessions.delete(priorId);
   }
 
   get(id: string, nowMs = Date.now()): SessionRecord | null {
