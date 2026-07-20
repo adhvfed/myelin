@@ -67,6 +67,18 @@ impl Handler for PanicHandler {
     }
 }
 
+struct InvalidResponseHandler;
+
+impl Handler for InvalidResponseHandler {
+    fn handle(&self, _ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        Ok(EdgeResponse::json(
+            200,
+            &serde_json::json!({ "false": "success" }),
+        )
+        .with_header("x-invalid", "line\nbreak"))
+    }
+}
+
 struct ToggleReadiness(AtomicBool);
 
 impl ReadinessProbe for ToggleReadiness {
@@ -142,6 +154,12 @@ fn build_gateway() -> (Arc<Gateway>, CellTokenAuthority, RevocationStore) {
                 "/v1/panic",
                 "edge.whoami",
                 Arc::new(PanicHandler),
+            )
+            .route(
+                Method::Get,
+                "/v1/invalid-response",
+                "edge.whoami",
+                Arc::new(InvalidResponseHandler),
             )
             .route(
                 Method::Get,
@@ -406,6 +424,32 @@ async fn handler_panic_is_a_generic_500_and_the_listener_survives() {
 
     let (live, _) = http(addr, "GET", "/livez", &[], vec![]).await;
     assert_eq!(live, 200, "a contained handler panic must not kill the listener");
+}
+
+#[tokio::test]
+async fn invalid_handler_response_metadata_fails_closed_without_false_success() {
+    let (gateway, cell, _revocations) = build_gateway();
+    let token = mint(&cell, TENANT, "jti-invalid-response", now() + 3600);
+    let headers = bearer(&token);
+    let addr = spawn(gateway).await;
+
+    let response = open(
+        addr,
+        "GET",
+        "/v1/invalid-response",
+        &hdr(&headers),
+        vec![],
+    )
+    .await;
+    assert_eq!(response.status(), 500);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(envelope["error"]["code"], "internal");
+    assert_eq!(envelope["error"]["message"], "internal error");
+    assert!(!body.windows(b"false".len()).any(|window| window == b"false"));
 }
 
 /// (f) The SSE endpoint streams (a smoke): subscribe over real HTTP, publish a frame to the verified
