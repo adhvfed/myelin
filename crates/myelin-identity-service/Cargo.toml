@@ -125,7 +125,7 @@ base64 = "0.22"
 # (transitive); this edge only PROMOTES it to a direct dep — no new crate enters the tree. The
 # Ed25519 sign/verify reuses `ring` (the SAME primitive the OIDC EdDSA + SSH paths already pull);
 # base64url is `base64`; the claims body is `serde_json`. NO hand-rolled signature/MAC math.
-hmac = "0.12"
+hmac = "0.13"
 # ------------------------------------------------------------------------------------------
 # MR-010b (SI-001/004, the SAML slice of P-526): REAL SAML 2.0 XML-DSig signature verification.
 # `xmlparser` is a NON-EXPANDING, non-validating XML TOKENIZER — it emits DTD/entity tokens rather
@@ -167,7 +167,7 @@ sqlx = { workspace = true }
 # MR-010a: the OIDC negative/positive corpus MINTS real RSA keys to sign genuine test tokens (the
 # verifier only ever sees the PUBLIC half via the injected JWKS). `rand` 0.8 (rand_core 0.6,
 # compatible with rsa 0.9's keygen) is already in Cargo.lock — DEV-only, never in the prod graph.
-rand = "0.8"
+rand = "0.10"
 # P-ID-10 (P-068) ID-D3 drill: the failure-injection harness's telemetry-assertion library
 # (the contract-1.8 survival-signal set, incl. CrossTenantCount) the cross-tenant drill emits its
 # dated green artifact through. DEV-only — myelin-harness never enters the service production DAG.
