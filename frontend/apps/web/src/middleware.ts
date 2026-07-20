@@ -4,6 +4,7 @@ import { createMiddleware } from "@solidjs/start/middleware";
 
 import { requestMethodPolicy, sameOriginVerdict } from "~/lib/csrf";
 import { securityHeaders } from "~/lib/security-headers";
+import { transportVerdict } from "~/lib/transport-security";
 import { canonicalPublicOrigin } from "~/server/public-origin";
 
 const production = process.env.NODE_ENV === "production";
@@ -32,12 +33,35 @@ export default createMiddleware({
         headers: event.response.headers,
       });
     }
-    if (methodPolicy === "verify-origin") {
-      const expectedOrigin = canonicalPublicOrigin({
-        production,
-        configured: process.env.MYELIN_PUBLIC_ORIGIN,
-        requestUrl: event.request.url,
+    const expectedOrigin = canonicalPublicOrigin({
+      production,
+      configured: process.env.MYELIN_PUBLIC_ORIGIN,
+      requestUrl: event.request.url,
+    });
+    const transport = transportVerdict(
+      production,
+      event.request.method,
+      event.request.headers.get("x-forwarded-proto"),
+    );
+    if (transport === "redirect") {
+      const incoming = new URL(event.request.url);
+      const destination = new URL(expectedOrigin);
+      destination.pathname = incoming.pathname;
+      destination.search = incoming.search;
+      event.response.headers.set("Location", destination.toString());
+      return new Response(null, {
+        status: 308,
+        headers: event.response.headers,
       });
+    }
+    if (transport === "reject") {
+      event.response.headers.set("Content-Type", "text/plain; charset=utf-8");
+      return new Response("HTTPS required", {
+        status: 403,
+        headers: event.response.headers,
+      });
+    }
+    if (methodPolicy === "verify-origin") {
       const verdict = sameOriginVerdict({
         origin: event.request.headers.get("origin"),
         referer: event.request.headers.get("referer"),

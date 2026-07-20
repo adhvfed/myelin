@@ -204,6 +204,14 @@ or insecure. Use `/healthz` for process liveness and `/readyz` for traffic readi
 performs a short-lived namespaced write/read/script/delete probe and returns 503 whenever the session
 backend is unavailable or its production ACL cannot perform real session operations.
 
+The Node listener is an internal HTTP hop and must not be exposed publicly. Put it behind the TLS
+ingress, keep the listener reachable only on the private service network, and configure the ingress
+to **strip and replace** any client-supplied `X-Forwarded-Proto` header with the actual public scheme.
+Production accepts only the exact value `https`: insecure GET/HEAD requests receive a 308 to
+`MYELIN_PUBLIC_ORIGIN`, while insecure writes are rejected without replaying their bodies. Point
+external health checks through that ingress (or include its trusted HTTPS assertion on private
+probes); direct requests without the assertion intentionally do not reach application routes.
+
 ## 6a. Solo-operator merges (branch protection)
 
 A fresh repo's default ruleset requires **1 approval**, and Myelin does **not** count an author's approval
