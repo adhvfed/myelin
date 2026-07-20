@@ -310,6 +310,15 @@ pub struct MemoryCgroup {
     dir: PathBuf,
 }
 
+/// Classify every memory-cgroup setup failure with the security consequence. These errors reach the
+/// production runner/operator, so a host permission error must say that execution was refused rather
+/// than looking like an ambiguous best-effort warning.
+fn memory_cgroup_refusal(reason: impl core::fmt::Display) -> String {
+    format!(
+        "{reason} — refusing to run the gVisor workload unbounded (SI-017 fail-closed)"
+    )
+}
+
 impl MemoryCgroup {
     /// Establish a memory cgroup capped at `mem_bytes` (swap disabled). FAIL-CLOSED: returns `Err`
     /// when cgroup v2 is absent or the `memory` controller is not delegated to this process — the
@@ -321,29 +330,30 @@ impl MemoryCgroup {
         const ROOT: &str = "/sys/fs/cgroup";
         // cgroup v2 unified hierarchy ⇒ /proc/self/cgroup has exactly one `0::<path>` line.
         let content = std::fs::read_to_string("/proc/self/cgroup")
-            .map_err(|e| format!("read /proc/self/cgroup: {e}"))?;
+            .map_err(|e| memory_cgroup_refusal(format!("read /proc/self/cgroup: {e}")))?;
         let rel = content
             .lines()
             .find_map(|l| l.strip_prefix("0::"))
             .map(str::trim)
             .ok_or_else(|| {
-                "no cgroup v2 unified hierarchy (`0::` line absent) — cannot establish a memory \
-                 cgroup; refusing to run the gVisor workload unbounded (SI-017 fail-closed)"
-                    .to_string()
+                memory_cgroup_refusal(
+                    "no cgroup v2 unified hierarchy (`0::` line absent); cannot establish a memory cgroup",
+                )
             })?;
         let our_dir = PathBuf::from(ROOT).join(rel.trim_start_matches('/'));
         // The `memory` controller must be delegated to our own cgroup (⇒ available to siblings).
         let controllers =
             std::fs::read_to_string(our_dir.join("cgroup.controllers")).unwrap_or_default();
         if !controllers.split_whitespace().any(|c| c == "memory") {
-            return Err(format!(
-                "the `memory` cgroup controller is NOT delegated to {our_dir:?} (controllers: \
-                 {controllers:?}) — cannot bound gVisor memory; refusing to run the workload \
-                 unbounded (SI-017 fail-closed)"
-            ));
+            return Err(memory_cgroup_refusal(format!(
+                "the `memory` cgroup controller is NOT delegated to {our_dir:?} \
+                 (controllers: {controllers:?}); cannot bound gVisor memory"
+            )));
         }
         let parent = our_dir.parent().ok_or_else(|| {
-            "this process's cgroup has no parent — cannot create a sibling memory cgroup".to_string()
+            memory_cgroup_refusal(
+                "this process's cgroup has no parent; cannot create a sibling memory cgroup",
+            )
         })?;
         let dir = parent.join(format!(
             "myelin-mem-{}-{}",
@@ -351,22 +361,25 @@ impl MemoryCgroup {
             unique_suffix()
         ));
         let _ = std::fs::remove_dir(&dir);
-        std::fs::create_dir(&dir).map_err(|e| format!("create memory cgroup {dir:?}: {e}"))?;
+        std::fs::create_dir(&dir).map_err(|e| {
+            memory_cgroup_refusal(format!("create memory cgroup {dir:?}: {e}"))
+        })?;
         // The sibling must actually have the `memory` controller (the parent delegated it). If not,
         // tear down and fail closed rather than run a workload an empty cgroup would not bound.
         let cg_controllers =
             std::fs::read_to_string(dir.join("cgroup.controllers")).unwrap_or_default();
         if !cg_controllers.split_whitespace().any(|c| c == "memory") {
             let _ = std::fs::remove_dir(&dir);
-            return Err(format!(
-                "the created cgroup {dir:?} has no `memory` controller (parent did not delegate it) \
-                 — refusing to run the gVisor workload unbounded (SI-017 fail-closed)"
-            ));
+            return Err(memory_cgroup_refusal(format!(
+                "the created cgroup {dir:?} has no `memory` controller (parent did not delegate it)"
+            )));
         }
         // The HARD host-RAM bound + close the swap escape hatch (so a hog OOMs rather than swaps).
         if let Err(e) = std::fs::write(dir.join("memory.max"), mem_bytes.to_string()) {
             let _ = std::fs::remove_dir(&dir);
-            return Err(format!("write memory.max={mem_bytes} to {dir:?}: {e}"));
+            return Err(memory_cgroup_refusal(format!(
+                "write memory.max={mem_bytes} to {dir:?}: {e}"
+            )));
         }
         // Best-effort: a host without a swap controller has nothing to cap (swap.max absent ⇒ no
         // swap to escape into). Where present, 0 forces an OOM-kill instead of swapping the hog out.
