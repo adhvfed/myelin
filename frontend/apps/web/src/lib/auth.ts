@@ -61,7 +61,7 @@ function assertSameOrigin(): void {
 /** Read the current viewer from the httpOnly-cookie session (server-only). */
 export const getViewer = query(async (): Promise<Viewer | null> => {
   "use server";
-  const rec = getSessionRecord();
+  const rec = await getSessionRecord();
   if (!rec) return null;
   return {
     principalId: rec.principalId,
@@ -75,7 +75,7 @@ export const getViewer = query(async (): Promise<Viewer | null> => {
  *  redirect (the auth guard the whole app shell sits behind). */
 export const requireViewer = query(async (): Promise<Viewer> => {
   "use server";
-  const rec = getSessionRecord();
+  const rec = await getSessionRecord();
   if (!rec) throw redirect("/login");
   return {
     principalId: rec.principalId,
@@ -130,7 +130,7 @@ export const loginDev = action(async () => {
     throw redirect("/login");
   }
   assertDevLoginAllowed();
-  issueSession({
+  await issueSession({
     token: DEV_ACCESS_TOKEN,
     refreshToken: DEV_REFRESH_TOKEN,
     scheme: DEV_SCHEME,
@@ -190,7 +190,7 @@ export const loginWithToken = action(async (formData: FormData) => {
         return config.token_login_enabled === true;
       },
       verify: (t, s) => edgeWhoamiWithToken(t, s),
-      issue: (rec) => issueSession(rec),
+      issue: async (rec) => { await issueSession(rec); },
     },
   );
   throw redirect(result.redirectTo);
@@ -217,6 +217,6 @@ export const startSso = action(async () => {
 export const logout = action(async () => {
   "use server";
   assertSameOrigin();
-  clearCurrentSession();
+  await clearCurrentSession();
   throw redirect("/login");
 }, "logout");

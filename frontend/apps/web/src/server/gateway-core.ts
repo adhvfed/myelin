@@ -41,13 +41,13 @@ export interface GwResponse {
 /** The injectable dependencies the core needs (the real ones live in `gateway.ts`; tests fake them). */
 export interface GatewayDeps {
   /** The server-side access token for this request (from the httpOnly-cookie session), or null. */
-  getToken: () => string | null;
+  getToken: () => string | null | Promise<string | null>;
   /** Perform the edge call with the given Bearer token. */
   doFetch: (token: string) => Promise<GwResponse>;
   /** The single refresh round-trip: return a fresh access token, or null if the session is dead. */
   refresh: () => Promise<string | null>;
   /** Drop the now-invalid session (so the next request starts clean). */
-  clearSession: () => void;
+  clearSession: () => void | Promise<void>;
 }
 
 /**
@@ -59,7 +59,7 @@ export interface GatewayDeps {
  * 4. 2xx → the parsed JSON body.
  */
 export async function runGateway<T = unknown>(deps: GatewayDeps): Promise<T> {
-  const token = deps.getToken();
+  const token = await deps.getToken();
   if (!token) throw new Unauthorized("no session token (not authenticated)");
 
   let res = await deps.doFetch(token);
@@ -67,12 +67,12 @@ export async function runGateway<T = unknown>(deps: GatewayDeps): Promise<T> {
   if (res.status === 401) {
     const fresh = await deps.refresh();
     if (!fresh) {
-      deps.clearSession();
+      await deps.clearSession();
       throw new Unauthorized("session refresh failed");
     }
     res = await deps.doFetch(fresh);
     if (res.status === 401) {
-      deps.clearSession();
+      await deps.clearSession();
       throw new Unauthorized("still unauthorized after one refresh");
     }
   }

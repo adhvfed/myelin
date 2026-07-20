@@ -19,6 +19,18 @@ async function devLogin(page: Page) {
 }
 
 test.describe("MR-019 app shell — real browser", () => {
+  test("liveness and session-backed readiness are explicit and non-cacheable", async ({ page }) => {
+    const health = await page.request.get("/healthz");
+    expect(health.status()).toBe(200);
+    expect(await health.json()).toEqual({ status: "ok" });
+
+    const readiness = await page.request.get("/readyz");
+    expect(readiness.status()).toBe(200);
+    expect(await readiness.json()).toEqual({ status: "ready" });
+    expect(readiness.headers()["cache-control"]).toBe("no-store");
+    expect(readiness.headers()["x-content-type-options"]).toBe("nosniff");
+  });
+
   test("SSR scripts carry a fresh CSP nonce on every response", async ({ page }) => {
     const observedNonces: string[] = [];
     for (let requestIndex = 0; requestIndex < 2; requestIndex++) {

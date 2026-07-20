@@ -11,6 +11,7 @@ export default defineConfig({
   serialization: { mode: "json" },
   server: {
     preset: "node-server",
+    plugins: ["./src/server/runtime-config.ts"],
     routeRules: {
       // Hashed production assets already receive Nitro's immutable one-year cache policy. Add the
       // browser boundary headers here because SolidStart middleware does not run on the static router.
