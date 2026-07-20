@@ -101,8 +101,9 @@ pub fn git_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
 /// the DURABLE GT-003 edge: repo create/list/view, PR open/view/checks/review/merge/endorse, blob, and
 /// code-search all hit a real `/v1/git/...` route under the Bearer capability token (the tenant is the
 /// token's — no path-tenant). A server-side gate (the merge gate) surfaces as a clean edge error
-/// through the client, never a CLI bypass. `pr list` stays an honest deferral (the edge exposes a
-/// single-PR view, not a list).
+/// through the client, never a CLI bypass. PR lists use the edge's leak-free list handlers: an
+/// optional `--repo` selects the object-guarded repository list, while the unscoped command selects
+/// the cross-repository "needs your review" front door.
 pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
     match command {
         // ── Reads ──
@@ -118,6 +119,12 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
         CliCommand::PrChecks { repo, number } => {
             Ok(EdgeCall::get(format!("/v1/git/repos/{repo}/prs/{number}/checks")))
         }
+        // GET /v1/git/repos/<repo>/prs → every visible PR in one object-guarded repository.
+        // GET /v1/git/prs → the cross-repository, leak-free attention list (needs-review by default).
+        CliCommand::PrList { repo } => Ok(match repo {
+            Some(repo) => EdgeCall::get(format!("/v1/git/repos/{repo}/prs")),
+            None => EdgeCall::get("/v1/git/prs"),
+        }),
         // GET /v1/git/search/code?q=… → the ACL-pre-filtered code-search hits.
         CliCommand::SearchCode { query, .. } => {
             if query.split_whitespace().count() != 1 {
@@ -175,12 +182,6 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
         CliCommand::PrEndorseForkCi { repo, number } => Ok(EdgeCall::post_json(
             format!("/v1/git/repos/{repo}/prs/{number}/endorse-fork-ci"),
             json!({}),
-        )),
-
-        // Honest deferral — the edge exposes a single-PR view, not a list endpoint.
-        CliCommand::PrList { .. } => Err(CliError::Unsupported(
-            "`git pr list` has no edge endpoint yet (the edge exposes a single PR view at \
-             /v1/git/repos/<repo>/prs/<n>, not a list) — deferred".into(),
         )),
     }
 }
@@ -310,12 +311,19 @@ mod tests {
         assert_eq!(git_dispatch(&["pr", "view", "abc"]).unwrap_err().code(), 2);
     }
 
-    /// A parsed-but-unmapped git command is an HONEST Unsupported (exit 4), not a faked success.
-    /// `pr list` parses via git's grammar but the edge exposes no list route — deferred, not faked.
+    /// The PR-list grammar selects the matching leak-free edge endpoint. An unscoped list is the
+    /// cross-repository attention inbox; `--repo` selects the object-guarded repository list.
     #[test]
-    fn git_unmapped_command_is_honest_unsupported() {
-        let err = git_dispatch(&["pr", "list"]).unwrap_err();
-        assert_eq!(err.code(), 4);
+    fn git_pr_list_maps_to_cross_repo_or_repo_scoped_route() {
+        let cross_repo = git_dispatch(&["pr", "list"]).unwrap();
+        assert_eq!(cross_repo.method, HttpMethod::Get);
+        assert_eq!(cross_repo.path, "/v1/git/prs");
+        assert!(cross_repo.query.is_none() && cross_repo.payload.is_none());
+
+        let repo = git_dispatch(&["pr", "list", "--repo", "platform/api"]).unwrap();
+        assert_eq!(repo.method, HttpMethod::Get);
+        assert_eq!(repo.path, "/v1/git/repos/platform/api/prs");
+        assert!(repo.query.is_none() && repo.payload.is_none());
     }
 
     /// GT-005: the durable write commands now map to a real `/v1/git/...` route (POST with a JSON
