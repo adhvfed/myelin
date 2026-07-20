@@ -10,7 +10,7 @@
 //     the ring keeps meaning "a CI verdict", never a PR lifecycle state.
 //
 // Semantic tokens only; the accent is never used as text (a §3.1 hard rail).
-import { Match, Switch, mergeProps, type JSX } from "solid-js";
+import { Match, Switch, type JSX } from "solid-js";
 import { Icon } from "./Icon";
 import { type IconName } from "./icon-names";
 
@@ -67,13 +67,13 @@ const ISSUE_STATE: Record<IssueStateCategory, { icon: IconName; glyph: string }>
 };
 
 /** The verdict label — TEXT, derived from the counts so a reader never depends on colour. */
-export function checkVerdictLabel(props: CheckVerdictPillProps): string {
-  const passing = props.passing ?? 0;
-  const failing = props.failing ?? 0;
-  const total = props.total ?? 0;
-  switch (props.verdict) {
+export function checkVerdictLabel(value: CheckVerdictPillProps): string {
+  const passing = value.passing ?? 0;
+  const failing = value.failing ?? 0;
+  const total = value.total ?? 0;
+  switch (value.verdict) {
     case "pass":
-      return props.merged ? "merged green" : total > 0 ? "all passing" : "passing";
+      return value.merged ? "merged green" : total > 0 ? "all passing" : "passing";
     case "fail":
       return failing > 0 ? `${failing} failing` : "failing";
     case "running": {
@@ -169,9 +169,8 @@ function IssueStateChip(props: IssueStatePillProps): JSX.Element {
 }
 
 function CheckVerdictCell(props: CheckVerdictPillProps): JSX.Element {
-  const merged = mergeProps({ passing: 0, failing: 0, total: 0 }, props);
   const spec = () => VERDICT_GLYPH[props.verdict];
-  const label = () => checkVerdictLabel(merged);
+  const label = () => checkVerdictLabel(props);
   return (
     <span
       title={`Checks: ${label()}`}
