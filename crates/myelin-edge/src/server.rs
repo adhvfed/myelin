@@ -54,6 +54,8 @@ const MAX_CONCURRENT_GIT_PUSHES: usize = 8;
 const MAX_REQUEST_HEADERS: usize = 64;
 const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const API_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_PUSH_BODY_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Result of a requested listener shutdown. A forced result means the grace deadline expired and
 /// the remaining connection tasks were aborted; the count is the number active when draining began.
@@ -90,6 +92,9 @@ enum BoundedCollectError {
     /// The transport yielded a read error mid-body — the caller falls back to an empty body (the
     /// gateway then produces a clean `400` if a body was required), preserving prior behavior.
     Read,
+    /// The route's absolute body-read deadline expired. An absolute deadline, rather than an idle
+    /// timeout, prevents a client from retaining capacity forever by trickling occasional bytes.
+    TimedOut,
 }
 
 /// **Collect a request body frame-by-frame, bounded by `cap` (R0.5 / DELTA N3).**
@@ -97,26 +102,35 @@ enum BoundedCollectError {
 /// Iterates the body one [`Frame`] at a time via [`BodyExt::frame`], accumulating ONLY data frames
 /// (trailers do not count toward the body) into a `Vec`. The moment the running total would exceed
 /// `cap`, it STOPS reading and returns [`BoundedCollectError::TooLarge`] — it does NOT keep buffering,
-/// so an oversize body never grows host memory past ~`cap`. A transport read error returns
-/// [`BoundedCollectError::Read`]. Generic over any `Body<Data = Bytes>` so it is unit-testable with an
-/// in-memory body (no socket needed).
-async fn collect_bounded<B>(mut body: B, cap: usize) -> Result<Vec<u8>, BoundedCollectError>
+/// so an oversize body never grows host memory past ~`cap`. The absolute `deadline` wraps the entire
+/// read, so periodic trickle bytes cannot keep the future alive forever. A transport read error
+/// returns [`BoundedCollectError::Read`]. Generic over any `Body<Data = Bytes>` so it is unit-testable
+/// with an in-memory body (no socket needed).
+async fn collect_bounded<B>(
+    mut body: B,
+    cap: usize,
+    deadline: Duration,
+) -> Result<Vec<u8>, BoundedCollectError>
 where
     B: Body<Data = Bytes> + Unpin,
 {
-    let mut acc: Vec<u8> = Vec::new();
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|_| BoundedCollectError::Read)?;
-        // Only DATA frames count toward the body; a trailers frame is skipped.
-        if let Ok(data) = frame.into_data() {
-            // Reject BEFORE extending past the cap — never allocate the full oversize buffer.
-            if acc.len() + data.len() > cap {
-                return Err(BoundedCollectError::TooLarge);
+    tokio::time::timeout(deadline, async {
+        let mut acc: Vec<u8> = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|_| BoundedCollectError::Read)?;
+            // Only DATA frames count toward the body; a trailers frame is skipped.
+            if let Ok(data) = frame.into_data() {
+                // Reject BEFORE extending past the cap — never allocate the full oversize buffer.
+                if acc.len() + data.len() > cap {
+                    return Err(BoundedCollectError::TooLarge);
+                }
+                acc.extend_from_slice(&data);
             }
-            acc.extend_from_slice(&data);
         }
-    }
-    Ok(acc)
+        Ok(acc)
+    })
+    .await
+    .map_err(|_| BoundedCollectError::TimedOut)?
 }
 
 /// **Serve the edge over a bound TCP listener.** Accepts connections forever, serving each over
@@ -276,6 +290,7 @@ async fn handle_connection(
         return probe_response(status, body);
     }
     let body_cap = request_body_cap(&path);
+    let body_deadline = request_body_deadline(&path);
     let _git_push_permit = if body_cap == MAX_REQUEST_BODY_BYTES {
         match git_push_slots.try_acquire_owned() {
             Ok(permit) => Some(permit),
@@ -298,10 +313,11 @@ async fn handle_connection(
     // Collect the body bounded by MAX_REQUEST_BODY_BYTES, streaming frame-by-frame. Oversize → a 413
     // WITHOUT buffering past the cap; a read error → empty body (the gateway then produces a clean 400
     // if a body was required) — never a panic.
-    let bytes = match collect_bounded(body, body_cap).await {
+    let bytes = match collect_bounded(body, body_cap, body_deadline).await {
         Ok(b) => b,
         Err(BoundedCollectError::TooLarge) => return payload_too_large(body_cap),
         Err(BoundedCollectError::Read) => Vec::new(),
+        Err(BoundedCollectError::TimedOut) => return request_timeout(body_deadline),
     };
     let edge_req = EdgeRequest::new(method, path, query, headers, bytes);
     to_hyper(gw.handle(edge_req))
@@ -315,9 +331,29 @@ fn request_body_cap(path: &str) -> usize {
     }
 }
 
+fn request_body_deadline(path: &str) -> Duration {
+    if path.ends_with("/git-receive-pack") {
+        GIT_PUSH_BODY_READ_TIMEOUT
+    } else {
+        API_BODY_READ_TIMEOUT
+    }
+}
+
 fn overloaded() -> Response<EdgeBody> {
     let err = EdgeError::Unavailable("the Git push intake is at capacity; retry later".into());
     to_hyper(EdgeResponse::error(&err))
+}
+
+fn request_timeout(deadline: Duration) -> Response<EdgeBody> {
+    let err = EdgeError::RequestTimeout(format!(
+        "request body was not received within {} seconds",
+        deadline.as_secs()
+    ));
+    let mut response = to_hyper(EdgeResponse::error(&err));
+    response
+        .headers_mut()
+        .insert(hyper::header::CONNECTION, hyper::header::HeaderValue::from_static("close"));
+    response
 }
 
 fn probe_response(status: u16, body: Vec<u8>) -> Response<EdgeBody> {
@@ -417,7 +453,9 @@ mod tests {
     async fn under_cap_collects_full_body() {
         let payload = b"the quick brown fox jumps over the lazy dog".to_vec();
         let body = Full::new(Bytes::from(payload.clone()));
-        let out = collect_bounded(body, MAX_REQUEST_BODY_BYTES).await.expect("under cap");
+        let out = collect_bounded(body, MAX_REQUEST_BODY_BYTES, Duration::from_secs(1))
+            .await
+            .expect("under cap");
         assert_eq!(out, payload, "an under-cap body is returned exactly");
     }
 
@@ -426,7 +464,9 @@ mod tests {
     async fn exactly_at_cap_is_accepted() {
         let cap = 4096;
         let body = Full::new(Bytes::from(vec![7u8; cap]));
-        let out = collect_bounded(body, cap).await.expect("at cap is accepted");
+        let out = collect_bounded(body, cap, Duration::from_secs(1))
+            .await
+            .expect("at cap is accepted");
         assert_eq!(out.len(), cap);
     }
 
@@ -447,7 +487,7 @@ mod tests {
         });
         let body = StreamBody::new(stream);
 
-        let res = collect_bounded(body, cap).await;
+        let res = collect_bounded(body, cap, Duration::from_secs(1)).await;
         assert_eq!(res, Err(BoundedCollectError::TooLarge), "over-cap body is rejected");
 
         let consumed = pulled.load(Ordering::SeqCst);
@@ -469,7 +509,9 @@ mod tests {
             Ok(Frame::trailers(trailers)),
         ];
         let body = StreamBody::new(tokio_stream::iter(frames));
-        let out = collect_bounded(body, 1024).await.expect("data under cap");
+        let out = collect_bounded(body, 1024, Duration::from_secs(1))
+            .await
+            .expect("data under cap");
         assert_eq!(out, b"hello", "only the data frame contributes to the body");
     }
 
@@ -481,8 +523,17 @@ mod tests {
             Err(std::io::Error::other("connection reset")),
         ];
         let body = StreamBody::new(tokio_stream::iter(frames));
-        let res = collect_bounded(body, 1024).await;
+        let res = collect_bounded(body, 1024, Duration::from_secs(1)).await;
         assert_eq!(res, Err(BoundedCollectError::Read), "a mid-body read error is Read, not TooLarge");
+    }
+
+    /// A body that never finishes cannot retain a connection or Git push slot indefinitely. The
+    /// absolute deadline fires even though the stream itself never produces an error or EOF.
+    #[tokio::test]
+    async fn stalled_body_hits_the_absolute_read_deadline() {
+        let body = StreamBody::new(tokio_stream::pending::<Result<Frame<Bytes>, std::io::Error>>());
+        let res = collect_bounded(body, 1024, Duration::from_millis(10)).await;
+        assert_eq!(res, Err(BoundedCollectError::TimedOut));
     }
 
     /// (c) A Content-Length header declaring more than the cap fast-rejects; at/under the cap, or
@@ -530,5 +581,22 @@ mod tests {
         ] {
             assert_eq!(request_body_cap(path), MAX_JSON_REQUEST_BODY_BYTES, "{path}");
         }
+    }
+
+    #[test]
+    fn git_receive_pack_gets_a_longer_but_finite_body_deadline() {
+        let push = "/acme/eu-west/widgets.git/git-receive-pack";
+        assert_eq!(request_body_deadline(push), GIT_PUSH_BODY_READ_TIMEOUT);
+        assert_eq!(request_body_deadline("/v1/issues"), API_BODY_READ_TIMEOUT);
+        assert!(GIT_PUSH_BODY_READ_TIMEOUT > API_BODY_READ_TIMEOUT);
+    }
+
+    #[test]
+    fn request_timeout_uses_the_canonical_408_envelope() {
+        let resp = request_timeout(API_BODY_READ_TIMEOUT);
+        assert_eq!(resp.status(), 408);
+        assert_eq!(resp.headers()[hyper::header::CONNECTION], "close");
+        let err = EdgeError::RequestTimeout("x".into());
+        assert_eq!(err.code(), "request_timeout");
     }
 }

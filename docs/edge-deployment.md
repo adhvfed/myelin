@@ -67,3 +67,5 @@ The listener admits at most 1,024 sockets, allows 10 seconds to finish request h
 most 64 headers with a 64 KiB HTTP buffer, and rejects excess sockets immediately. Ordinary API bodies
 are capped at 1 MiB. Only `git-receive-pack` receives the 100 MiB body budget, with at most eight Git
 pushes admitted concurrently; excess push intake returns 503 so memory use remains bounded.
+Ordinary request bodies must finish within 30 seconds; Git push bodies receive a five-minute absolute
+deadline. These are total body-read deadlines, so periodic trickle bytes do not retain intake slots.
