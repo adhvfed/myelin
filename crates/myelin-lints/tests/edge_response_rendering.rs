@@ -23,4 +23,13 @@ fn edge_response_render_failures_never_become_false_successes() {
         !server.contains("Response::new(full_body(b\"{}\".to_vec()))"),
         "a render failure must never fall back to a bare 200"
     );
+    for required in [
+        "handler_response_headers_are_safe(&headers)",
+        "\"content-length\"",
+        "\"transfer-encoding\"",
+        "\"connection\"",
+        "\"x-request-id\"",
+    ] {
+        assert!(server.contains(required), "response framing guard drift: {required}");
+    }
 }

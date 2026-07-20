@@ -75,7 +75,7 @@ impl Handler for InvalidResponseHandler {
             200,
             &serde_json::json!({ "false": "success" }),
         )
-        .with_header("x-invalid", "line\nbreak"))
+        .with_header("content-length", "0"))
     }
 }
 
