@@ -108,6 +108,10 @@ optional = true
 
 [dev-dependencies]
 serde_json.workspace = true
+# The replay unit test drives the owner reindex seam through the in-memory outbox double. Keep that
+# constructor test-only: standalone `cargo test -p myelin-ci-sandbox` must compile without relying on
+# workspace-wide feature unification from another crate.
+myelin-events = { path = "../myelin-events", features = ["test-support"] }
 # Dev-dep ONLY: the reindex/replay unit tests (EB-27 / P-327) build an `Actor(Principal::stub(..))`
 # to drive `events::reindex` through the outbox. Production `replay.rs` takes refs only — it never
 # names `Principal` outside `#[cfg(test)]`. NO production DAG edge (test-only).
