@@ -399,11 +399,27 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
     assert_eq!(status.state, "terminated");
     tokio::task::block_in_place(|| after_second_restart.cancel(&run, "duplicate"))
         .expect("terminal cancellation is idempotent");
-    assert!(matches!(
-        tokio::task::block_in_place(|| after_second_restart.signal(signal())),
-        Err(ExecutorError::InvalidInput(message))
-            if message.contains("terminal workflow run")
-    ));
+    // A VERIFIED same-tenant delivery to a terminal run is now a typed no-op (P-FLOW late-completion,
+    // Change 3): the caller acknowledges the late signal WITHOUT it being an error, and NO terminal
+    // history/signal row is mutated. This IDENTICAL redelivery (same idem_key + same payload as the
+    // row already consumed above) is the acknowledged no-op. (A late CI `job.done` reporter settles its
+    // lease on this instead of retrying a rejection forever.)
+    assert_eq!(
+        tokio::task::block_in_place(|| after_second_restart.signal(signal()))
+            .expect("a verified terminal delivery is an acknowledged no-op, not an error"),
+        SignalOutcome::TerminalNoOp
+    );
+    // The divergent-redelivery guard is NOT bypassed by terminality: the SAME idem_key with a
+    // DIFFERENT payload is producer CORRUPTION (two distinct completions under one key) and MUST still
+    // be surfaced as InvalidInput even on a terminal run — the terminal no-op is only for an
+    // absent-or-identical delivery.
+    let divergent = SignalSpec {
+        payload: vec![ArtifactRef("myelin://acme/ci/artifact/divergent".into())],
+        ..signal()
+    };
+    let divergent_err = tokio::task::block_in_place(|| after_second_restart.signal(divergent))
+        .expect_err("a divergent-payload redelivery to a terminal run is surfaced, not a no-op");
+    assert!(matches!(divergent_err, ExecutorError::InvalidInput(m) if m.contains("divergent")));
     let signal_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM wf_signal WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
     )

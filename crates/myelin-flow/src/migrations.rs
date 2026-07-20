@@ -249,6 +249,51 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS wf_runnable_scoped \
 ON workflow_run (tenant_id, region, partition, lease_expires, updated_at, run_id) \
 WHERE state = 'running'";
 
+/// Tenant-/residency-leading WAITING-scan index (the claim-side stranded-run repair, P-FLOW signal/
+/// park race fix). The existing runnable indexes are partial on `state='running'` and do NOT support
+/// the repair sweep, which scans `state='waiting'` runs (a run stranded `waiting` with a matching
+/// pending signal). This additive online partial index keeps that sweep — run on a bounded cadence
+/// even under backlog — from scanning a cell-wide partition. Additive and `IF NOT EXISTS`: existing
+/// deployments are unaffected and re-apply is a no-op.
+pub const WORKFLOW_RUN_WAITING_REPAIR_INDEX_DDL: &str = "\
+CREATE INDEX CONCURRENTLY IF NOT EXISTS wf_waiting_repair \
+ON workflow_run (tenant_id, region, partition, lease_expires, updated_at, run_id) \
+WHERE state = 'waiting'";
+
+/// Fail startup when the preceding `CREATE INDEX CONCURRENTLY IF NOT EXISTS wf_waiting_repair`
+/// encountered a same-named index left INVALID or NOT READY by an interrupted prior build — a crash
+/// mid-`CONCURRENTLY` leaves an `indisvalid = false` index that `IF NOT EXISTS` then silently accepts,
+/// recording the migration as applied while the index is permanently unusable. This SEPARATE post-index
+/// migration (the repo's own pattern — `myelin-ci-controlplane`'s `VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL`)
+/// asserts `indisvalid AND indisready` for the EXACT index+table in the active migration schema, and
+/// `RAISE`s (repair with `REINDEX INDEX CONCURRENTLY`) otherwise. It stays its own migration so the
+/// `CONCURRENTLY` command above remains a lone top-level statement.
+pub const VALIDATE_WORKFLOW_RUN_WAITING_REPAIR_INDEX_DDL: &str = "\
+DO $myelin$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_index AS index_state
+      JOIN pg_catalog.pg_class AS index_relation
+        ON index_relation.oid = index_state.indexrelid
+      JOIN pg_catalog.pg_class AS table_relation
+        ON table_relation.oid = index_state.indrelid
+      JOIN pg_catalog.pg_namespace AS relation_namespace
+        ON relation_namespace.oid = table_relation.relnamespace
+     WHERE relation_namespace.nspname = current_schema()
+       AND table_relation.relname = 'workflow_run'
+       AND table_relation.relkind = 'r'
+       AND index_relation.relnamespace = relation_namespace.oid
+       AND index_relation.relname = 'wf_waiting_repair'
+       AND index_relation.relkind = 'i'
+       AND index_state.indisvalid
+       AND index_state.indisready
+  ) THEN
+    RAISE EXCEPTION 'wf_waiting_repair on %.workflow_run is missing, invalid, or not ready; verify the index exists, then repair it with REINDEX INDEX CONCURRENTLY %.wf_waiting_repair before restarting', current_schema(), current_schema();
+  END IF;
+END
+$myelin$";
+
 /// The six `(table_id, ddl, table_name, rls_scoped)` tuples in migration order — the data-model
 /// slice. Each `ddl` is the fresh `CREATE TABLE` above (plus its hot dispatch index where §3 names
 /// one). `rls_scoped = true` rides a `myelin_make_tenant_scoped('<table>')` RLS-scope call on the
@@ -359,6 +404,18 @@ pub fn migrations() -> Migrations {
         MigrationPhase::Expand,
         "workflow_run",
     ));
+    items.push(Migration::phased(
+        "flow_0011_workflow_run_waiting_repair_index",
+        WORKFLOW_RUN_WAITING_REPAIR_INDEX_DDL,
+        MigrationPhase::Expand,
+        "workflow_run",
+    ));
+    items.push(Migration::phased(
+        "flow_0012_validate_workflow_run_waiting_repair_index",
+        VALIDATE_WORKFLOW_RUN_WAITING_REPAIR_INDEX_DDL,
+        MigrationPhase::Expand,
+        "workflow_run",
+    ));
     Migrations::of(items)
 }
 
@@ -383,8 +440,9 @@ mod tests {
         let migrations = migrations();
         assert_eq!(
             migrations.0.len(),
-            10,
-            "six-table data model plus four online control/drive expansions"
+            12,
+            "six-table data model plus six online control/drive/repair expansions (incl. the \
+             concurrent-index validation)"
         );
         let mut runner = MigrationRunner::new();
         // workflow_run becomes hot after creation; its two follow-ons use the online expand path.
@@ -404,6 +462,8 @@ mod tests {
                 "flow_0008_workflow_run_idem_index",
                 "flow_0009_workflow_run_drive_expand",
                 "flow_0010_workflow_run_scoped_runnable_index",
+                "flow_0011_workflow_run_waiting_repair_index",
+                "flow_0012_validate_workflow_run_waiting_repair_index",
             ],
             "tables then online control expands, in order — 0 backward migration"
         );

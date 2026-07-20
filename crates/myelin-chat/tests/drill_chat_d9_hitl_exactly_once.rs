@@ -62,6 +62,9 @@ impl SignalPort for FlowSignalPort {
         Ok(match outcome {
             SignalOutcome::Buffered => SignalDelivery::Buffered,
             SignalOutcome::Duplicate => SignalDelivery::Duplicate,
+            SignalOutcome::TerminalNoOp => {
+                unreachable!("the in-memory FlowExecutor buffers signals to terminal runs")
+            }
         })
     }
 }

@@ -9,8 +9,8 @@
 
 use crate::engine::run_state;
 use crate::executor::{
-    partition_for_run_id, DurableExecutor, ExecutorError, RunId, RunStatus, SignalOutcome,
-    SignalSpec, StartSpec,
+    canonicalize_signal_payload, partition_for_run_id, DurableExecutor, ExecutorError, RunId,
+    RunStatus, SignalOutcome, SignalPayload, SignalSpec, StartSpec, TypedSignalSpec,
 };
 use myelin_events::{HandlerTx, IdMinter};
 use myelin_storage::{with_tenant_tx, with_tenant_tx_error, PgError};
@@ -35,7 +35,6 @@ fn store_error(operation: &str, error: impl std::fmt::Display) -> ExecutorError 
 
 enum SignalStoreError {
     UnknownRun,
-    TerminalRun,
     DivergentReplay,
     Storage(PgError),
 }
@@ -384,17 +383,59 @@ impl PgFlowExecutor {
         bounded("run_id", &spec.run.0, 256)?;
         bounded("signal_name", &spec.signal_name, 128)?;
         bounded("idem_key", &spec.idem_key, 512)?;
-        validate_refs(&spec.payload, &self.tenant)?;
+        // A scoped-refs signal canonicalises to itself (validate_refs unchanged). The typed CI
+        // completion path (`signal_typed_async`) shares the same idempotent insert core below.
+        let payload = canonicalize_signal_payload(
+            &spec.signal_name,
+            SignalPayload::ScopedRefs(spec.payload),
+            &self.tenant,
+        )?;
+        self.deliver_signal_async(spec.run, spec.signal_name, spec.idem_key, payload, spec.payload_key_ref)
+            .await
+    }
+
+    async fn signal_typed_async(
+        &self,
+        spec: TypedSignalSpec,
+    ) -> Result<SignalOutcome, ExecutorError> {
+        bounded("run_id", &spec.run.0, 256)?;
+        bounded("signal_name", &spec.signal_name, 128)?;
+        bounded("idem_key", &spec.idem_key, 512)?;
+        // Canonicalise the typed payload (validating the CiJobDone grammar / result refs) to the
+        // durable string-array shape BEFORE the transaction, then buffer it through the same insert
+        // core — the stored `wf_signal.payload` row is byte-identical to a hand-encoded ScopedRefs
+        // delivery, so every downstream decode/projection/journal path stays shape-compatible.
+        let payload =
+            canonicalize_signal_payload(&spec.signal_name, spec.payload, &self.tenant)?;
+        self.deliver_signal_async(spec.run, spec.signal_name, spec.idem_key, payload, spec.payload_key_ref)
+            .await
+    }
+
+    /// The idempotent `wf_signal` insert core shared by [`Self::signal_async`] and
+    /// [`Self::signal_typed_async`]. `payload_refs` is already canonicalised + validated. A verified
+    /// same-tenant delivery to a TERMINAL run is an acknowledged no-op ([`SignalOutcome::TerminalNoOp`])
+    /// — nothing is buffered and NO terminal history is mutated — so a late producer can settle its own
+    /// lease instead of retrying a rejection forever. An unknown run (outside this tenant/region scope)
+    /// is still surfaced as an error.
+    async fn deliver_signal_async(
+        &self,
+        run: RunId,
+        signal_name: String,
+        idem_key: String,
+        payload_refs: Vec<myelin_refs::ArtifactRef>,
+        payload_key_ref: Option<String>,
+    ) -> Result<SignalOutcome, ExecutorError> {
         let scope_tenant = self.tenant.0.clone();
         let scope_region = self.region.0.clone();
         let tenant = scope_tenant.clone();
         let region = scope_region.clone();
-        let run_id = spec.run.0.clone();
+        let run_id = run.0.clone();
         let error_run_id = run_id.clone();
-        let payload = serde_json::to_string(&spec.payload)
+        let payload = serde_json::to_string(&payload_refs)
             .map_err(|e| store_error("encode signal payload refs", e))?;
-        let expected_payload = serde_json::to_value(&spec.payload)
+        let expected_payload = serde_json::to_value(&payload_refs)
             .map_err(|e| store_error("encode signal payload refs", e))?;
+        let spec_payload_key_ref = payload_key_ref;
         with_tenant_tx_error(&self.pool, &scope_tenant, &scope_region, move |conn| {
             Box::pin(async move {
                 // Serialise signal delivery against drive commits/cancellation and pin the lifecycle
@@ -414,7 +455,49 @@ impl PgFlowExecutor {
                     return Err(SignalStoreError::UnknownRun);
                 };
                 if run_state::is_terminal(&state) {
-                    return Err(SignalStoreError::TerminalRun);
+                    // A VERIFIED same-tenant terminal run: acknowledge the late completion WITHOUT
+                    // buffering (no row inserted) and WITHOUT mutating the immutable terminal history.
+                    // The caller (e.g. the CI runner reporting `job.done` after a workflow timeout /
+                    // termination) settles its own queue lease on this no-op rather than retrying a
+                    // rejected delivery forever.
+                    //
+                    // BUT the divergent-redelivery guard still fires: a re-used idem_key carrying a
+                    // DIFFERENT payload/key-ref is producer CORRUPTION (two distinct completions under
+                    // one key), and terminality must not become a bypass for that check. If a row
+                    // already exists under this exact key, compare it: identical → the acknowledged
+                    // no-op; divergent → surfaced as InvalidInput exactly as for a live run. (A row can
+                    // exist because the run buffered/consumed this signal BEFORE it went terminal.)
+                    let existing = sqlx::query(
+                        "SELECT payload, payload_key_ref FROM wf_signal \
+                         WHERE tenant_id = $1 AND region = $2 AND run_id = $3 \
+                         AND signal_name = $4 AND idem_key = $5",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(&run_id)
+                    .bind(&signal_name)
+                    .bind(&idem_key)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        PgError::Query(format!("verify late terminal signal: {e}"))
+                    })?;
+                    if let Some(existing) = existing {
+                        let stored_payload: serde_json::Value =
+                            existing.try_get("payload").map_err(|e| {
+                                PgError::Query(format!("decode terminal signal payload: {e}"))
+                            })?;
+                        let stored_key_ref: Option<String> =
+                            existing.try_get("payload_key_ref").map_err(|e| {
+                                PgError::Query(format!("decode terminal signal key ref: {e}"))
+                            })?;
+                        if stored_payload != expected_payload
+                            || stored_key_ref != spec_payload_key_ref
+                        {
+                            return Err(SignalStoreError::DivergentReplay);
+                        }
+                    }
+                    return Ok(SignalOutcome::TerminalNoOp);
                 }
 
                 let inserted = sqlx::query(
@@ -425,10 +508,10 @@ impl PgFlowExecutor {
                 .bind(&tenant)
                 .bind(&region)
                 .bind(&run_id)
-                .bind(&spec.signal_name)
-                .bind(&spec.idem_key)
+                .bind(&signal_name)
+                .bind(&idem_key)
                 .bind(&payload)
-                .bind(&spec.payload_key_ref)
+                .bind(&spec_payload_key_ref)
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| PgError::Query(format!("buffer durable workflow signal: {e}")))?;
@@ -445,8 +528,8 @@ impl PgFlowExecutor {
                     .bind(&tenant)
                     .bind(&region)
                     .bind(&run_id)
-                    .bind(&spec.signal_name)
-                    .bind(&spec.idem_key)
+                    .bind(&signal_name)
+                    .bind(&idem_key)
                     .fetch_one(&mut *conn)
                     .await
                     .map_err(|e| {
@@ -461,7 +544,7 @@ impl PgFlowExecutor {
                     let consumed_seq: Option<i64> = existing
                         .try_get("consumed_seq")
                         .map_err(|e| PgError::Query(format!("decode duplicate signal state: {e}")))?;
-                    if stored_payload != expected_payload || stored_key_ref != spec.payload_key_ref {
+                    if stored_payload != expected_payload || stored_key_ref != spec_payload_key_ref {
                         return Err(SignalStoreError::DivergentReplay);
                     }
                     consumed_seq.is_none()
@@ -492,9 +575,6 @@ impl PgFlowExecutor {
         .await
         .map_err(|error| match error {
             SignalStoreError::UnknownRun => ExecutorError::UnknownRun(error_run_id),
-            SignalStoreError::TerminalRun => ExecutorError::InvalidInput(
-                "signals cannot target a terminal workflow run".into(),
-            ),
             SignalStoreError::DivergentReplay => ExecutorError::InvalidInput(
                 "signal idempotency key was reused with a divergent payload or payload key reference"
                     .into(),
@@ -607,6 +687,10 @@ impl DurableExecutor for PgFlowExecutor {
 
     fn signal(&self, spec: SignalSpec) -> Result<SignalOutcome, ExecutorError> {
         bridge(&self.rt, self.signal_async(spec))
+    }
+
+    fn signal_typed(&self, spec: TypedSignalSpec) -> Result<SignalOutcome, ExecutorError> {
+        bridge(&self.rt, self.signal_typed_async(spec))
     }
 
     fn describe(&self, run: &RunId) -> Result<RunStatus, ExecutorError> {

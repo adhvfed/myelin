@@ -137,6 +137,154 @@ pub enum SignalOutcome {
     /// a RE-delivery under an already-buffered key — a no-op (the ON CONFLICT DO NOTHING fired). The
     /// at-least-once bus redelivering "done" twice (§4.9) lands here: the workflow wakes once.
     Duplicate,
+    /// **A VERIFIED same-tenant delivery to an already-TERMINAL run — an acknowledged no-op (P-FLOW
+    /// late-completion, §4.9).** The target run exists in the caller's tenant/region scope but has
+    /// already settled `completed`/`failed`/`terminated`/`nondeterministic`, so nothing is buffered
+    /// and NO terminal workflow history is mutated. This is an `Ok` (not an error): a producer whose
+    /// job finished AFTER the workflow timed out / was cancelled (e.g. the CI runner reporting
+    /// `job.done` past a workflow termination — myelin-ci-sandbox `runner.rs`) can settle its own
+    /// queue lease on this outcome INSTEAD of retrying a rejected delivery forever. A genuinely
+    /// invalid target (unknown run, wrong tenant) is still surfaced as an error — only a verified
+    /// terminal run yields this no-op.
+    TerminalNoOp,
+}
+
+/// **The whole-message signal PAYLOAD at the `DurableExecutor::signal_typed` API boundary (P-FLOW CI
+/// completion).** A signal is delivered EITHER as opaque scoped references (the historical shape) OR
+/// as a TYPED CI job-completion message the flow crate canonicalises itself. The enum lets a typed CI
+/// verdict be delivered WITHOUT the caller hand-encoding the `ci.stage.verdict:*` marker string (which
+/// would fail `validate_refs`, since it is not a scoped `ArtifactRef`), while keeping the durable
+/// storage shape byte-identical to the historical `Vec<ArtifactRef>`-of-strings encoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignalPayload {
+    /// **Opaque references-not-payloads body (the historical shape).** Delivered verbatim after
+    /// `validate_refs` — EXACTLY today's `SignalSpec.payload` behavior (every ref must parse as a
+    /// scoped `ArtifactRef` in the verified executor tenant). This is the ONLY variant a generic
+    /// signal (`approval` / `cancel` / `ci.result`) uses.
+    ScopedRefs(Vec<ArtifactRef>),
+    /// **A TYPED CI stage completion (`job.done` ONLY).** Bound to `signal_name == "job.done"`
+    /// (rejected on any other name). `stage` names the completed pipeline stage (a bounded machine
+    /// token, the run-plan grammar); `passed` is its verdict; `result_refs` are the runner's
+    /// references-not-payloads result (each `validate_refs`-checked as usual). The flow crate
+    /// canonicalises this to the EXISTING verdict-marker encoding
+    /// (`[ci.stage.verdict:<pass|fail>:<stage>] ++ result_refs`) before storage, so `wf_signal.payload`
+    /// stays the current string array — the verdict marker itself is NOT `validate_refs`-checked
+    /// (it is a machine token, not a scoped ref).
+    CiJobDone {
+        /// the completed stage's name — a bounded machine token (the run-plan `valid_machine_token`
+        /// grammar: ASCII-alphanumeric-led, `[A-Za-z0-9_.-]`, ≤128 bytes).
+        stage: String,
+        /// the stage verdict the runner derived from the guest exit code.
+        passed: bool,
+        /// the runner's references-not-payloads result refs (each `validate_refs`-checked).
+        result_refs: Vec<ArtifactRef>,
+    },
+}
+
+/// **The typed-signal delivery spec** (the [`DurableExecutor::signal_typed`] boundary). A superset of
+/// [`SignalSpec`] whose whole `payload` is a [`SignalPayload`]. `ScopedRefs` reproduces
+/// [`SignalSpec`] exactly; `CiJobDone` carries a typed CI verdict the flow crate canonicalises.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypedSignalSpec {
+    /// the run to deliver the signal to (the handle `start` returned).
+    pub run: RunId,
+    /// the FROZEN signal name (§4.3). A [`SignalPayload::CiJobDone`] REQUIRES `"job.done"`.
+    pub signal_name: String,
+    /// the per-effect idempotency key (FROZEN, contract 9.1 / §6.4).
+    pub idem_key: String,
+    /// the whole-message payload (opaque scoped refs OR a typed CI completion).
+    pub payload: SignalPayload,
+    /// the crypto-shred key id IF the payload carries inline PII (the RARE case, §3.4).
+    pub payload_key_ref: Option<String>,
+}
+
+/// The bounded machine-token ceiling a CI stage name is held to — the run-plan grammar's
+/// `MAX_JOB_NAME_BYTES` (128), replicated here so myelin-flow does NOT depend on the CI crate.
+pub(crate) const MAX_CI_STAGE_TOKEN_BYTES: usize = 128;
+
+/// **Replicate the CI run-plan machine-token grammar** (`myelin-ci-controlplane` `run_plan.rs`
+/// `valid_machine_token`) WITHOUT a dependency on the CI crate: a non-empty ≤`maximum`-byte value
+/// whose first byte is ASCII alphanumeric and whose remaining bytes are ASCII alphanumeric or one of
+/// `_ - .`. Bounding the stage token keeps the canonical verdict marker a well-formed machine token.
+pub(crate) fn valid_ci_stage_token(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    value.len() <= MAX_CI_STAGE_TOKEN_BYTES
+        && first.is_ascii_alphanumeric()
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+/// **Validate a signal payload's references** — every ref must parse as a scoped [`ArtifactRef`] in
+/// the verified executor `tenant` (a cross-tenant or malformed ref fails closed). This is the shared
+/// `validate_refs` the typed-signal canonicalisation applies to `ScopedRefs` (unchanged behavior) and
+/// to a `CiJobDone`'s `result_refs`. PII-free error messages (never echoes the offending ref).
+pub(crate) fn validate_signal_refs(
+    refs: &[ArtifactRef],
+    tenant: &TenantId,
+) -> Result<(), ExecutorError> {
+    for artifact in refs {
+        let parsed = myelin_refs::parse_scoped(&artifact.0).map_err(|error| {
+            ExecutorError::InvalidInput(format!("malformed ArtifactRef: {error}"))
+        })?;
+        if parsed.tenant != *tenant {
+            return Err(ExecutorError::InvalidInput(
+                "ArtifactRef tenant does not match the verified executor tenant".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// **Canonicalise a [`SignalPayload`] into the durable `Vec<ArtifactRef>` storage shape** (with
+/// validation). This is the ONE place the typed boundary maps onto the historical string-array
+/// encoding, so `wf_signal.payload` stays byte-identical whichever variant the caller used:
+/// - `ScopedRefs(refs)` → `validate_signal_refs(refs)`, stored verbatim (today's behavior).
+/// - `CiJobDone{stage, passed, result_refs}` → REQUIRES `signal_name == "job.done"` (rejected on any
+///   other name), a valid machine-token `stage`, and `validate_signal_refs(result_refs)`; canonical =
+///   `[stage_verdict_marker(stage, passed)] ++ result_refs` (the verdict marker is a machine token,
+///   NOT `validate_refs`-checked).
+pub(crate) fn canonicalize_signal_payload(
+    signal_name: &str,
+    payload: SignalPayload,
+    tenant: &TenantId,
+) -> Result<Vec<ArtifactRef>, ExecutorError> {
+    match payload {
+        SignalPayload::ScopedRefs(refs) => {
+            validate_signal_refs(&refs, tenant)?;
+            Ok(refs)
+        }
+        SignalPayload::CiJobDone {
+            stage,
+            passed,
+            result_refs,
+        } => {
+            // A typed CI completion is bound to the FROZEN `job.done` signal name ONLY — a verdict
+            // marker on any other signal is a caller error (never silently accepted onto `approval`
+            // or `ci.result`).
+            if signal_name != crate::job::JOB_DONE_SIGNAL {
+                return Err(ExecutorError::InvalidInput(format!(
+                    "a CiJobDone payload requires signal_name `{}`, not `{signal_name}`",
+                    crate::job::JOB_DONE_SIGNAL
+                )));
+            }
+            if !valid_ci_stage_token(&stage) {
+                return Err(ExecutorError::InvalidInput(
+                    "CiJobDone stage is not a bounded machine token ([A-Za-z0-9_.-], ≤128 bytes)"
+                        .into(),
+                ));
+            }
+            // The result refs are validated exactly as `ScopedRefs` are; the verdict marker is a
+            // machine token canonicalised in front of them (the existing `stage_verdict_marker`
+            // encoding), so the stored payload row is byte-identical to the hand-encoded shape.
+            validate_signal_refs(&result_refs, tenant)?;
+            let mut canonical = Vec::with_capacity(result_refs.len() + 1);
+            canonical.push(crate::ci_pipeline::stage_verdict_marker(&stage, passed));
+            canonical.extend(result_refs);
+            Ok(canonical)
+        }
+    }
 }
 
 /// **The run status `describe` returns** (contract 9.1 — `describe(RunId) → RunStatus`). The run's
@@ -264,6 +412,32 @@ pub trait DurableExecutor {
     /// P-FLOW-10. Returns [`ExecutorError::UnknownRun`] for an unknown run handle (surfaced, never a
     /// silently dropped signal to a phantom run).
     fn signal(&self, spec: SignalSpec) -> Result<SignalOutcome, ExecutorError>;
+
+    /// **Deliver a signal whose whole payload is a typed [`SignalPayload`] (the CI-completion
+    /// boundary).** [`SignalPayload::ScopedRefs`] is EXACTLY [`signal`](DurableExecutor::signal) —
+    /// same `validate_refs`, same idempotency. [`SignalPayload::CiJobDone`] delivers a TYPED CI stage
+    /// verdict the executor canonicalises to the existing verdict-marker encoding before storage (so
+    /// the durable `wf_signal.payload` row stays byte-identical), letting the `ci.stage.verdict:*`
+    /// marker be delivered WITHOUT the caller hand-encoding a string that `validate_refs` would reject.
+    ///
+    /// The DEFAULT implementation supports `ScopedRefs` by delegating to
+    /// [`signal`](DurableExecutor::signal) and rejects `CiJobDone` (an executor that does not own the
+    /// durable CI verdict encoding). The two production executors ([`FlowExecutor`],
+    /// [`crate::PgFlowExecutor`]) OVERRIDE this to canonicalise + deliver the typed verdict.
+    fn signal_typed(&self, spec: TypedSignalSpec) -> Result<SignalOutcome, ExecutorError> {
+        match spec.payload {
+            SignalPayload::ScopedRefs(payload) => self.signal(SignalSpec {
+                run: spec.run,
+                signal_name: spec.signal_name,
+                idem_key: spec.idem_key,
+                payload,
+                payload_key_ref: spec.payload_key_ref,
+            }),
+            SignalPayload::CiJobDone { .. } => Err(ExecutorError::InvalidInput(
+                "this executor does not support typed CiJobDone delivery".into(),
+            )),
+        }
+    }
 
     /// **Describe a run** — its lifecycle `state` + `cursor` + pinned `wf_version` + terminality
     /// (contract 9.1). Returns [`ExecutorError::UnknownRun`] for an unknown handle.
@@ -405,6 +579,58 @@ impl FlowExecutor {
         partition_for_run_id(run_id)
     }
 
+    /// Idempotently buffer one already-canonicalised signal into the run's `wf_signal` store. The
+    /// shared core of [`DurableExecutor::signal`] and [`DurableExecutor::signal_typed`] — a run must
+    /// exist (an unknown run is surfaced, never a silently dropped signal, EI-02 §4), and delivery is
+    /// idempotent on `(tenant, run_id, signal_name, idem_key)` (a re-delivery buffers ONCE, §4.9).
+    ///
+    /// A signal to a TERMINAL run still buffers here (the in-memory model's historical behavior — a
+    /// late `job.done` to a cancelled run is a harmless buffered row the GDPR holder erases; the
+    /// consuming wait, P-FLOW-11, decides whether a terminal run drains it). The durable executor
+    /// ([`crate::PgFlowExecutor`]) instead returns [`SignalOutcome::TerminalNoOp`] for a verified
+    /// terminal run.
+    fn deliver(
+        &self,
+        run: &RunId,
+        signal_name: String,
+        idem_key: String,
+        payload: Vec<ArtifactRef>,
+        payload_key_ref: Option<String>,
+    ) -> Result<SignalOutcome, ExecutorError> {
+        {
+            let started = self.started.lock().unwrap();
+            if !started.run_to_idem.contains_key(&run.0) {
+                return Err(ExecutorError::UnknownRun(run.0.clone()));
+            }
+        }
+
+        // Deliver idempotently: INSERT … ON CONFLICT (tenant, run_id, signal_name, idem_key) DO
+        // NOTHING. The FIRST delivery buffers (Buffered); a re-delivery under the same per-effect key
+        // is a no-op (Duplicate) — at-least-once bus delivery wakes the workflow ONCE (§4.9). The PK
+        // IS the dedup; there is no application-level read-then-write race.
+        let buffered = self.signals.deliver(SignalRow {
+            tenant: self.tenant.clone(),
+            region: self.region.clone(),
+            run_id: run.0.clone(),
+            signal_name,
+            idem_key,
+            payload,
+            payload_key_ref,
+            received_unix_ms: 0,
+            consumed_seq: None,
+        });
+
+        // Refresh the signal-buffer-depth gauge (§1.8 / §5.4): a double-delivery leaves it UNCHANGED
+        // (the buffered row is one, not two — the gauge stays truthful).
+        self.refresh_signal_buffer_depth();
+
+        Ok(if buffered {
+            SignalOutcome::Buffered
+        } else {
+            SignalOutcome::Duplicate
+        })
+    }
+
     /// Refresh the runnable-run-lag gauge across all partitions (the §1.8 signal) — called after a
     /// start/cancel so the metrics-health port reads a current lag. `i64::MAX` reads the lag
     /// ignoring lease expiry (every unleased runnable run counts).
@@ -534,43 +760,27 @@ impl DurableExecutor for FlowExecutor {
     }
 
     fn signal(&self, spec: SignalSpec) -> Result<SignalOutcome, ExecutorError> {
-        // The run must exist — a signal to a phantom run is surfaced, never silently dropped (EI-02
-        // §4). (A signal to a TERMINAL run still buffers: a late `job.done` to a cancelled run is a
-        // harmless buffered row the GDPR holder erases; the consuming wait, P-FLOW-11, decides
-        // whether a terminal run drains it. Buffering-not-rejecting keeps delivery decoupled from the
-        // run's lifecycle race, §4.9.)
-        {
-            let started = self.started.lock().unwrap();
-            if !started.run_to_idem.contains_key(&spec.run.0) {
-                return Err(ExecutorError::UnknownRun(spec.run.0.clone()));
-            }
-        }
+        self.deliver(
+            &spec.run,
+            spec.signal_name,
+            spec.idem_key,
+            spec.payload,
+            spec.payload_key_ref,
+        )
+    }
 
-        // Deliver idempotently: INSERT … ON CONFLICT (tenant, run_id, signal_name, idem_key) DO
-        // NOTHING. The FIRST delivery buffers (Buffered); a re-delivery under the same per-effect key
-        // is a no-op (Duplicate) — at-least-once bus delivery wakes the workflow ONCE (§4.9). The PK
-        // IS the dedup; there is no application-level read-then-write race.
-        let buffered = self.signals.deliver(SignalRow {
-            tenant: self.tenant.clone(),
-            region: self.region.clone(),
-            run_id: spec.run.0.clone(),
-            signal_name: spec.signal_name.clone(),
-            idem_key: spec.idem_key.clone(),
-            payload: spec.payload.clone(),
-            payload_key_ref: spec.payload_key_ref.clone(),
-            received_unix_ms: 0,
-            consumed_seq: None,
-        });
-
-        // Refresh the signal-buffer-depth gauge (§1.8 / §5.4): a double-delivery leaves it UNCHANGED
-        // (the buffered row is one, not two — the gauge stays truthful).
-        self.refresh_signal_buffer_depth();
-
-        Ok(if buffered {
-            SignalOutcome::Buffered
-        } else {
-            SignalOutcome::Duplicate
-        })
+    fn signal_typed(&self, spec: TypedSignalSpec) -> Result<SignalOutcome, ExecutorError> {
+        // Canonicalise the typed payload to the durable `Vec<ArtifactRef>` storage shape (validating
+        // the CiJobDone grammar / result refs), then buffer it through the SAME idempotent path as a
+        // ScopedRefs delivery — the stored `wf_signal.payload` row is byte-identical either way.
+        let payload = canonicalize_signal_payload(&spec.signal_name, spec.payload, &self.tenant)?;
+        self.deliver(
+            &spec.run,
+            spec.signal_name,
+            spec.idem_key,
+            payload,
+            spec.payload_key_ref,
+        )
     }
 
     fn describe(&self, run: &RunId) -> Result<RunStatus, ExecutorError> {

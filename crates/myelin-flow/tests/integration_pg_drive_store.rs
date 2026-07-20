@@ -306,6 +306,7 @@ async fn drive_commit_is_atomic_idempotent_consumes_signal_once_and_stages_outbo
             timers: vec![],
             timer_disarms: Vec::new(),
             outbox: vec![],
+            park: None,
         };
         assert!(matches!(
             drive_store.commit_drive(&lease, wrong_seq).await,
@@ -362,6 +363,7 @@ async fn drive_commit_is_atomic_idempotent_consumes_signal_once_and_stages_outbo
         }],
         timer_disarms: Vec::new(),
         outbox: vec![event_row("01JFLOWDRIVECOMMIT00000001", "R-signal")],
+        park: None,
     };
     assert_eq!(
         drive_store
@@ -478,6 +480,7 @@ async fn journal_and_outbox_roll_back_together_and_stale_owner_cannot_commit() {
         timers: vec![],
         timer_disarms: Vec::new(),
         outbox: vec![],
+        park: None,
     };
     assert_eq!(
         drive_store.commit_drive(&stale, divergent_attempt).await,
@@ -502,6 +505,7 @@ async fn journal_and_outbox_roll_back_together_and_stale_owner_cannot_commit() {
         timers: vec![],
         timer_disarms: Vec::new(),
         outbox: vec![event_row("01JFLOWGAPROLLBACK000000001", "R-rollback")],
+        park: None,
     };
     assert!(matches!(
         drive_store.commit_drive(&stale, gap).await,
@@ -538,6 +542,7 @@ async fn journal_and_outbox_roll_back_together_and_stale_owner_cannot_commit() {
         }],
         timer_disarms: Vec::new(),
         outbox: vec![event_row("01JFLOWROLLBACK000000000001", "R-rollback")],
+        park: None,
     };
     assert!(matches!(
         drive_store.commit_drive(&stale, failed).await,
@@ -592,6 +597,7 @@ async fn journal_and_outbox_roll_back_together_and_stale_owner_cannot_commit() {
         timers: vec![],
         timer_disarms: Vec::new(),
         outbox: vec![],
+        park: None,
     };
     assert_eq!(
         drive_store.commit_drive(&stale, stale_commit).await,
@@ -769,6 +775,7 @@ async fn timer_fire_wakes_and_journals_once_without_crossing_tenant_or_region() 
         }],
         timer_disarms: Vec::new(),
         outbox: vec![],
+        park: None,
     };
     assert!(matches!(
         drive_store.commit_drive(&live_lease, terminal_arm).await,

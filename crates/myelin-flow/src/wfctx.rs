@@ -178,6 +178,34 @@ pub enum WaitOutcome {
     TimedOut,
 }
 
+/// **The condition a parked drive is AWAITING (the park descriptor, P-FLOW signal/park race).** When a
+/// drive settles the run `waiting`, this names WHAT the run is parked on so the durable commit can
+/// close the signal/park race: a [`ParkCondition::Signal`] that ALREADY has a matching buffered signal
+/// (one that landed while the drive was mid-flight) settles the run RUNNABLE instead of stranding it
+/// `waiting` behind an unobserved signal. A [`ParkCondition::Timer`] is woken by the timer wheel, so the
+/// commit does not re-check signals for it. Derived from the wait/sleep site (never from stored rows),
+/// so a wait's exact `(signal_name, idem_key)` is threaded through the drive instead of discarded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParkCondition {
+    /// **Parked on a `wait_for_signal` (§4.3).** `name` is the awaited signal name; `idem_key` is the
+    /// EXACT per-effect key IFF the wait was keyed (`wait_for_signal_exact`, e.g. a CI stage's
+    /// `job.done` keyed on the dispatch `idem_token`), or `None` for a name-only wait (the first
+    /// unconsumed signal of that name resumes it). The durable commit re-checks the buffer under the
+    /// run-row lock for a PENDING signal matching this exact descriptor.
+    Signal {
+        /// the awaited signal name.
+        name: String,
+        /// the exact awaited per-effect key (a keyed wait), or `None` for a name-only wait.
+        idem_key: Option<String>,
+    },
+    /// **Parked on a durable timer (a `sleep` into the future, §4.2).** Woken by the timer wheel
+    /// (`fire_due_timer`), never by a signal — the commit does not re-check the signal buffer for it.
+    Timer {
+        /// the deterministic `wf_timer.timer_id` the run parked on (`<run_id>/<command_id>`).
+        timer_id: String,
+    },
+}
+
 /// The marker prefix the `signal_waited`/`signal_received` rows encode the consumed signal's `idem_key`
 /// under (so replay reconstructs the [`WaitOutcome::Signalled`] idem_key) — a machine token, no PII.
 pub(crate) const WAIT_IDEM_PREFIX: &str = "myelin://flow/signal-idem/";
@@ -191,8 +219,8 @@ const LEGACY_WAIT_KEYREF_PREFIX: &str = "wait:keyref:";
 const WAIT_DEADLINE_PREFIX: &str = "wait:deadline:";
 /// The exact idempotency key a keyed wait expects. New exact waits journal this alongside their
 /// deadline so changing a DAG join key between drives is a replay divergence, not a chance match.
-const WAIT_EXPECTED_IDEM_PREFIX: &str = "myelin://flow/wait-idem/";
-const WAIT_EXPECTED_NAME_PREFIX: &str = "myelin://flow/wait-name/";
+pub(crate) const WAIT_EXPECTED_IDEM_PREFIX: &str = "myelin://flow/wait-idem/";
+pub(crate) const WAIT_EXPECTED_NAME_PREFIX: &str = "myelin://flow/wait-name/";
 pub(crate) const WAIT_SIGNAL_NAME_PREFIX: &str = "myelin://flow/signal-name/";
 /// The marker a TIMED-OUT wait journals as its `signal_received` idem_key + key_ref (so replay returns
 /// [`WaitOutcome::TimedOut`] deterministically) — a machine token, no PII.
@@ -536,6 +564,13 @@ pub struct WfCtx {
     /// buffered signal (or that issued no wait). This is the multi-day-HITL state=waiting holds no
     /// runtime property (FLOW-D4).
     parked_on_signal: bool,
+    /// **The park descriptor — WHAT this drive parked on (the signal/park race fix).** `Some` iff this
+    /// drive settled `waiting`: a [`ParkCondition::Signal`] naming the awaited signal (+ exact
+    /// `idem_key` for a keyed wait) OR a [`ParkCondition::Timer`] naming the awaited timer. Threaded
+    /// into the durable [`crate::DriveCommit`] so the commit can settle a run RUNNABLE (instead of
+    /// stranded `waiting`) when a matching signal already landed mid-drive. Last-park-wins (a drive
+    /// returns promptly after the park that leaves the run waiting).
+    park_condition: Option<ParkCondition>,
     /// **The per-effect `idem_key`s a `wait_for_signal` CONSUMED on this drive (P-FLOW-11, §4.3).** Each
     /// entry is `(signal_name, idem_key)` — the buffered `wf_signal` row a wait consumed (stamped
     /// `consumed_seq`). The engine reads it to refresh the signal-buffer-depth telemetry after a drive
@@ -608,6 +643,10 @@ pub struct StagedWfDrive {
     pub outbox: Vec<myelin_events::OutboxRow>,
     pub consumed_signals: Vec<ConsumedSignalCommand>,
     pub disarmed_timer_ids: Vec<String>,
+    /// **The park descriptor this drive settled on (the signal/park race fix).** `Some` iff the drive
+    /// parked (`waiting`); threaded into the durable [`crate::DriveCommit`] so the commit can settle a
+    /// run runnable when a matching signal already landed mid-drive. `None` on a non-parking drive.
+    pub park: Option<ParkCondition>,
 }
 
 impl WfCtx {
@@ -668,6 +707,7 @@ impl WfCtx {
             parked_on_timer: false,
             signals: None,
             parked_on_signal: false,
+            park_condition: None,
             consumed_signals: Vec::new(),
             consumed_signal_commands: Vec::new(),
             budget: None,
@@ -1289,7 +1329,7 @@ impl WfCtx {
         timers.arm(crate::timer::TimerRow {
             tenant: self.tenant.clone(),
             region: self.region.clone(),
-            timer_id,
+            timer_id: timer_id.clone(),
             run_id: Some(self.run_id.clone()),
             command_id: command_id.clone(),
             fire_at: fire_at_secs,
@@ -1305,6 +1345,9 @@ impl WfCtx {
         // the next wheel tick fires it (a sleep into the past is a no-wait continuation, §4.2).
         if fire_at_secs > now_secs {
             self.parked_on_timer = true;
+            // Record the timer park descriptor (the wheel wakes it — the commit does not re-check the
+            // signal buffer for a timer park).
+            self.park_condition = Some(ParkCondition::Timer { timer_id });
         }
         Ok(())
     }
@@ -1654,6 +1697,14 @@ impl WfCtx {
             );
         }
         self.parked_on_signal = true;
+        // Record the park descriptor: WHAT this run is awaiting. The exact `(name, idem_key)` the wait
+        // knows here is threaded into the durable commit so a signal that landed mid-drive settles the
+        // run runnable instead of stranding it behind the buffer. A keyed wait carries its exact
+        // idem_key; a name-only wait carries `None` (any first unconsumed signal of that name resumes).
+        self.park_condition = Some(ParkCondition::Signal {
+            name: name.to_string(),
+            idem_key: expected_idem_key.map(str::to_string),
+        });
         Ok(WaitOutcome::Parked)
     }
 
@@ -1845,6 +1896,15 @@ impl WfCtx {
         self.parked_on_timer || self.parked_on_signal
     }
 
+    /// **The park descriptor — WHAT this drive parked on (the signal/park race fix).** `Some` iff this
+    /// drive parked (settled `waiting`). The durable commit reads it to close the signal/park race: a
+    /// [`ParkCondition::Signal`] whose exact `(name, idem_key)` already has a buffered signal (one that
+    /// landed while the drive was mid-flight) settles the run RUNNABLE instead of stranding it. `None`
+    /// on a drive that ran to completion / failure / a non-parking continuation.
+    pub fn park_condition(&self) -> Option<&ParkCondition> {
+        self.park_condition.as_ref()
+    }
+
     /// **The `(signal_name, idem_key)` pairs a `wait_for_signal` CONSUMED on this drive (P-FLOW-11).**
     /// The engine reads it after a drive to refresh the signal-buffer-depth telemetry (a consumed
     /// signal drops the buffered depth). Exactly one entry per signal a wait woke on; the FLOW-D4 drill
@@ -1890,6 +1950,7 @@ impl WfCtx {
             staged_attempts,
             consumed_signal_commands,
             disarmed_timer_ids,
+            park_condition,
             ..
         } = self;
         let outbox = tx
@@ -1902,6 +1963,7 @@ impl WfCtx {
             outbox,
             consumed_signals: consumed_signal_commands,
             disarmed_timer_ids,
+            park: park_condition,
         })
     }
 
