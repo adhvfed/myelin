@@ -80,3 +80,7 @@ Every parsed request receives a fresh server-generated `X-Request-Id`. The edge 
 completion record containing only that ID, a bounded method and route class, status, and duration; it
 never records raw paths or credentials. Connection-limit shedding is logged at power-of-two totals to
 remain visible without enabling log amplification during a socket flood.
+
+Every response disables content-type sniffing. API responses, errors, and health probes default to
+`Cache-Control: no-store`; explicit protocol policies remain authoritative, including Git smart
+HTTP's revalidation policy and SSE's `no-cache` stream policy.
