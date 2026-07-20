@@ -75,3 +75,8 @@ edge kills and reaps `runsc` containers instead of waiting for their two-minute 
 
 Handler panics are isolated to the request and return the generic canonical 500 envelope. Production
 logs suppress panic payloads so request-derived secrets cannot leak through Rust's default panic hook.
+
+Every parsed request receives a fresh server-generated `X-Request-Id`. The edge writes one JSON
+completion record containing only that ID, a bounded method and route class, status, and duration; it
+never records raw paths or credentials. Connection-limit shedding is logged at power-of-two totals to
+remain visible without enabling log amplification during a socket flood.
