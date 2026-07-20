@@ -8,7 +8,7 @@ const session = vi.hoisted(() => ({
 
 vi.mock("./session", () => session);
 
-import { edgeGet, gatewayRequestSignal } from "./gateway";
+import { edgeGet, edgeGetRaw, gatewayRequestSignal } from "./gateway";
 
 const unauthorized = () => new Response(
   JSON.stringify({ error: { message: "authentication required", code: "unauthorized" } }),
@@ -30,6 +30,8 @@ beforeEach(() => {
     refreshToken: "refresh-token",
     scheme: "pat",
   });
+  session.updateSessionToken.mockResolvedValue(true);
+  session.clearCurrentSession.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -103,5 +105,43 @@ describe("gateway request deadlines", () => {
     expect(retrySignal).toBe(initialSignal);
     expect(initialSignal?.aborted).toBe(true);
     expect(session.updateSessionToken).toHaveBeenCalledWith("fresh-token");
+  });
+});
+
+describe("gateway refresh revocation races", () => {
+  it("does not retry a JSON request when the session vanished during refresh", async () => {
+    const refresh = new Response(JSON.stringify({ access_token: "fresh-token" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(unauthorized())
+      .mockResolvedValueOnce(refresh);
+    session.updateSessionToken.mockResolvedValueOnce(false);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(edgeGet("/v1/issues")).rejects.toMatchObject({ name: "Unauthorized" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(session.updateSessionToken).toHaveBeenCalledWith("fresh-token");
+    expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry a raw request when the session vanished during refresh", async () => {
+    const refresh = new Response(JSON.stringify({ access_token: "fresh-token" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(unauthorized())
+      .mockResolvedValueOnce(refresh);
+    session.updateSessionToken.mockResolvedValueOnce(false);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(edgeGetRaw("/v1/git/raw")).rejects.toMatchObject({ name: "Unauthorized" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(session.updateSessionToken).toHaveBeenCalledWith("fresh-token");
+    expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
   });
 });

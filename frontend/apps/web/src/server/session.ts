@@ -49,10 +49,10 @@ export async function getSessionRecord(): Promise<SessionRecord | null> {
 }
 
 /** Persist a (possibly rotated) token onto the current session, if one exists. Server-only. */
-export async function updateSessionToken(token: string): Promise<void> {
+export async function updateSessionToken(token: string): Promise<boolean> {
   const id = getCookie(SESSION_COOKIE);
-  if (!id || !validSessionId(id)) return;
-  await store.updateToken(id, token);
+  if (!id || !validSessionId(id)) return false;
+  return await store.updateToken(id, token);
 }
 
 /** Issue a session: store the record server-side, set the httpOnly cookie carrying ONLY the opaque id. */

@@ -142,8 +142,9 @@ async function edgeRequest<T>(
       // The refresh response may rotate the access token; persist it server-side and use it for the retry.
       const json = (await res.json().catch(() => null)) as { access_token?: string } | null;
       const fresh = json?.access_token ?? rec.token;
-      await updateSessionToken(fresh);
-      return fresh;
+      // Revocation/expiry may delete the session while refresh is in flight. Never authorize the
+      // retry unless the fresh credential was persisted onto that still-live session.
+      return (await updateSessionToken(fresh)) ? fresh : null;
     },
     clearSession: () => clearCurrentSession(),
   });
@@ -182,8 +183,8 @@ export async function edgeGetRaw(path: string): Promise<RawEdgeResponse> {
       });
       if (rr.status === 200) {
         const json = (await rr.json().catch(() => null)) as { access_token?: string } | null;
-        fresh = json?.access_token ?? rec.token;
-        await updateSessionToken(fresh);
+        const candidate = json?.access_token ?? rec.token;
+        if (await updateSessionToken(candidate)) fresh = candidate;
       }
     }
     if (!fresh) {
