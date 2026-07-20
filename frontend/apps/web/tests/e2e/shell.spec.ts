@@ -20,6 +20,7 @@ test.describe("MR-019 app shell — real browser", () => {
   test("unauthenticated /git/repos redirects to /login (the 401→/login floor)", async ({ page }) => {
     await page.goto("/git/repos");
     await page.waitForURL("**/login");
+    await expect(page).toHaveTitle("Sign in · Myelin");
     await expect(page.getByTestId("dev-login")).toBeVisible();
     await expectNoAxeViolations(page, "/login");
   });
@@ -28,6 +29,7 @@ test.describe("MR-019 app shell — real browser", () => {
     await devLogin(page);
 
     // The repos list is the real edge RepoHome ViewModel projection.
+    await expect(page).toHaveTitle("Code · Myelin");
     await expect(page.getByTestId("repos-list")).toBeVisible();
     await expect(page.getByText("acme/myelin", { exact: true })).toBeVisible();
     await expect(page.getByText("The make-it-real spine.")).toBeVisible(); // the README excerpt field
