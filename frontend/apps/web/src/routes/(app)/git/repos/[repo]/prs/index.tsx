@@ -28,10 +28,13 @@ export default function RepoPrListScreen() {
   const cursor = () => (typeof search.cursor === "string" ? search.cursor : undefined);
   const ready = () => Boolean(params.repo);
 
-  const data = createAsync(async () => {
-    const repo = params.repo;
-    return repo ? getRepoPrs({ repo, state: state(), sort: sort(), cursor: cursor() }) : undefined;
-  });
+  const data = createAsync(
+    async () => {
+      const repo = params.repo;
+      return repo ? getRepoPrs({ repo, state: state(), sort: sort(), cursor: cursor() }) : undefined;
+    },
+    { deferStream: true },
+  );
 
   const href = (patch: { state?: string; sort?: string; cursor?: string }) => {
     const nextState = patch.state ?? state();

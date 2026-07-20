@@ -42,11 +42,14 @@ export default function CommitDiffScreen() {
   // The commit diff KEEPS the arrival ref (finding 6: never reset the breadcrumb to a hardcoded 'main').
   const arrivalRef = () => (typeof search.ref === "string" && search.ref ? search.ref : "main");
   const ready = () => Boolean(params.repo && params.oid);
-  const commit = createAsync(async () => {
-    const repo = params.repo;
-    const oid = params.oid;
-    return repo && oid ? getCommit({ repo, oid }) : undefined;
-  });
+  const commit = createAsync(
+    async () => {
+      const repo = params.repo;
+      const oid = params.oid;
+      return repo && oid ? getCommit({ repo, oid }) : undefined;
+    },
+    { deferStream: true },
+  );
 
   return (
     <section aria-labelledby="diff-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-3)" }}>

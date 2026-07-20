@@ -57,6 +57,9 @@ const state = {
   // whoami route below already verifies a pasted token (Bearer === DEV_ACCESS_TOKEN), so with this on
   // the paste→verify→session flow runs end-to-end against this double.
   tokenLoginEnabled: false,
+  // Test-only token-expiry switch: reject both access and refresh credentials so the browser harness
+  // can verify the full expired-session redirect under streaming SSR and a strict CSP.
+  forceUnauthorized: false,
   // Issues test controls: empty/projection-unavailable states and how many status reads precede
   // activation. Two proves the UI renders a genuine pending interval before active.
   emptyIssues: false,
@@ -206,6 +209,7 @@ const server = createServer((req, res) => {
         if (typeof body.emptyRepos === "boolean") state.emptyRepos = body.emptyRepos;
         if (typeof body.devLoginEnabled === "boolean") state.devLoginEnabled = body.devLoginEnabled;
         if (typeof body.tokenLoginEnabled === "boolean") state.tokenLoginEnabled = body.tokenLoginEnabled;
+        if (typeof body.forceUnauthorized === "boolean") state.forceUnauthorized = body.forceUnauthorized;
         if (body.resetIssues === true) resetIssues();
         if (typeof body.emptyIssues === "boolean") state.emptyIssues = body.emptyIssues;
         if (typeof body.onlyClosedIssues === "boolean") state.onlyClosedIssues = body.onlyClosedIssues;
@@ -237,14 +241,14 @@ const server = createServer((req, res) => {
   // The refresh round-trip: a valid refresh token mints a fresh access token (here, the same dev
   // token — the dev seam's token is long-lived); anything else is a uniform 401.
   if (method === "POST" && path === "/v1/auth/refresh") {
-    if (bearer(req) === DEV_REFRESH_TOKEN) {
+    if (!state.forceUnauthorized && bearer(req) === DEV_REFRESH_TOKEN) {
       return send(res, 200, { access_token: DEV_ACCESS_TOKEN });
     }
     return send(res, 401, unauthorizedEnvelope());
   }
 
   // Every data route requires a valid Bearer (the auth floor). A missing/forged token → uniform 401.
-  const authed = bearer(req) === DEV_ACCESS_TOKEN;
+  const authed = !state.forceUnauthorized && bearer(req) === DEV_ACCESS_TOKEN;
 
   // R4.4 Issues writes. The create body is contract-checked against the one server-injected dogfood
   // target; the dev edge never accepts browser-selected scope IDs either.

@@ -17,6 +17,23 @@ async function devLogin(page: Page) {
 }
 
 test.describe("MR-019 app shell — real browser", () => {
+  test("SSR scripts carry a fresh CSP nonce on every response", async ({ page }) => {
+    const observedNonces: string[] = [];
+    for (let requestIndex = 0; requestIndex < 2; requestIndex++) {
+      const response = await page.request.get("/login");
+      const html = await response.text();
+      const policy = response.headers()["content-security-policy"];
+      const nonce = policy?.match(/'nonce-([^']+)'/)?.[1];
+      const scriptTags = [...html.matchAll(/<script\b[^>]*>/g)].map((match) => match[0]);
+
+      expect(nonce).toBeTruthy();
+      expect(scriptTags.length).toBeGreaterThan(0);
+      expect(scriptTags.every((tag) => tag.includes(`nonce="${nonce}"`))).toBe(true);
+      observedNonces.push(nonce!);
+    }
+    expect(observedNonces[0]).not.toBe(observedNonces[1]);
+  });
+
   test("unauthenticated /git/repos redirects to /login (the 401→/login floor)", async ({ page }) => {
     await page.goto("/git/repos");
     await page.waitForURL("**/login");

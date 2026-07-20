@@ -87,24 +87,32 @@ export default function PrOverviewScreen() {
   const repo = () => params.repo ?? "";
   const n = () => Number(params.n);
 
-  const pr = createAsync(async () => (ready() ? getPr({ repo: repo(), n: n() }) : undefined));
+  const pr = createAsync(
+    async () => (ready() ? getPr({ repo: repo(), n: n() }) : undefined),
+    { deferStream: true },
+  );
   // The checks resource degrades LOCALLY (ux-git finding 5): a projection failure resolves to an
   // `{ unavailable }` sentinel — NEVER a throw that would fail the whole PR page. The 401→/login
   // redirect (a thrown Response) still propagates; only a mapped edge failure becomes the sentinel.
-  const checks = createAsync(async (): Promise<ChecksState> => {
-    if (!ready()) return undefined;
-    try {
-      return await getPrChecks({ repo: repo(), n: n() });
-    } catch (e) {
-      if (e instanceof RepoRouteError) return { unavailable: true };
-      throw e;
-    }
-  });
-  const threads = createAsync(async () =>
-    ready() ? getPrThreads({ repo: repo(), n: n() }) : undefined,
+  const checks = createAsync(
+    async (): Promise<ChecksState> => {
+      if (!ready()) return undefined;
+      try {
+        return await getPrChecks({ repo: repo(), n: n() });
+      } catch (e) {
+        if (e instanceof RepoRouteError) return { unavailable: true };
+        throw e;
+      }
+    },
+    { deferStream: true },
   );
-  const commits = createAsync(async () =>
-    ready() ? getPrCommits({ repo: repo(), n: n() }) : undefined,
+  const threads = createAsync(
+    async () => (ready() ? getPrThreads({ repo: repo(), n: n() }) : undefined),
+    { deferStream: true },
+  );
+  const commits = createAsync(
+    async () => (ready() ? getPrCommits({ repo: repo(), n: n() }) : undefined),
+    { deferStream: true },
   );
 
   const reload = async () => {

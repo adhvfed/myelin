@@ -113,9 +113,10 @@ export default function IssuesIndex() {
         error: null,
       };
     } catch (error) {
+      if (error instanceof Response) throw error;
       return { page: null, error: issueErrorKind(error) };
     }
-  });
+  }, { deferStream: true });
   const rows = createMemo(() => mergeIssuePages(firstPage()?.page ?? undefined, extraPages()));
   const nextCursor = () => {
     if (activationRefreshing()) return null;

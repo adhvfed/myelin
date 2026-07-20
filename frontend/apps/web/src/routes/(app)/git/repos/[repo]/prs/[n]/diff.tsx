@@ -57,15 +57,21 @@ export default function PrDiffScreen() {
   // it (mirrors the PR-list route) or a >50-file PR can never page. `getPrDiff` accepts it.
   const cursor = () => (typeof search.cursor === "string" ? search.cursor : undefined);
 
-  const pr = createAsync(async () => (ready() ? getPr({ repo: repo(), n: n() }) : undefined));
+  const pr = createAsync(
+    async () => (ready() ? getPr({ repo: repo(), n: n() }) : undefined),
+    { deferStream: true },
+  );
   // NB: the diff query does NOT depend on `view` — layout (split/unified) is a CLIENT concern; the
   // server is layout-agnostic, so toggling the view never refetches (and never remounts the grid). It
   // DOES depend on `cursor` — a new page is a real refetch keyed by the file cursor.
-  const diff = createAsync(async () =>
-    ready() ? getPrDiff({ repo: repo(), n: n(), cursor: cursor() }) : undefined,
+  const diff = createAsync(
+    async () =>
+      ready() ? getPrDiff({ repo: repo(), n: n(), cursor: cursor() }) : undefined,
+    { deferStream: true },
   );
-  const threads = createAsync(async () =>
-    ready() ? getPrThreads({ repo: repo(), n: n() }) : undefined,
+  const threads = createAsync(
+    async () => (ready() ? getPrThreads({ repo: repo(), n: n() }) : undefined),
+    { deferStream: true },
   );
 
   // View is a stable LOCAL signal (source of truth for rendering — decoupled from navigation so a

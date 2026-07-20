@@ -6,6 +6,7 @@ import AxeBuilder from "@axe-core/playwright";
 // keyboard-navigable; a blocked merge shows WHY; the 401→/login floor still holds on a deep screen.
 
 const C2 = "b2c3d4e5f60718293a4b5c6d7e8f900112233445";
+const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
 
 async function expectNoAxeViolations(page: Page, context: string) {
   const results = await new AxeBuilder({ page })
@@ -56,6 +57,24 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await expect(page.getByTestId("blob-contents")).toContainText("The make-it-real spine.");
     await expect(page.getByText(/blake3:readmecontentaddress/)).toBeVisible(); // the content-address
     await expectNoAxeViolations(page, "blob view");
+  });
+
+  test("raw previews are inert and downloads use a proxy-owned attachment", async ({ page }) => {
+    await devLogin(page);
+
+    const raw = await page.request.get("/git-raw/myelin/main/README.md?d=inline");
+    expect(raw.status()).toBe(200);
+    expect(raw.headers()["content-type"]).toMatch(/^text\/plain\b/);
+    expect(raw.headers()["content-disposition"]).toBe("inline");
+    expect(raw.headers()["x-content-type-options"]).toBe("nosniff");
+    expect(await raw.text()).toContain("The make-it-real spine.");
+
+    const download = await page.request.get("/git-raw/myelin/main/README.md?d=attachment");
+    expect(download.status()).toBe(200);
+    expect(download.headers()["content-type"]).toMatch(/^application\/octet-stream\b/);
+    expect(download.headers()["content-disposition"]).toBe(
+      "attachment; filename*=UTF-8''README.md",
+    );
   });
 
   test("commit log renders the revwalk page; a row links to the diff", async ({ page }) => {
@@ -174,5 +193,26 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await page.goto("/this/path/does/not/exist");
     await expect(page.getByTestId("not-available")).toBeVisible();
     await expect(page.getByRole("navigation", { name: "Primary" })).toBeVisible();
+  });
+
+  test("an expired access and refresh credential redirects before CSP-protected streaming", async ({ page }) => {
+    await devLogin(page);
+    const consoleErrors: string[] = [];
+    page.on("console", (message) => {
+      if (message.type() === "error") consoleErrors.push(message.text());
+    });
+
+    await page.request.post(`${EDGE}/__test/config`, {
+      data: { forceUnauthorized: true },
+    });
+    try {
+      await page.goto("/git/repos/myelin");
+      await page.waitForURL("**/login");
+      expect(consoleErrors.filter((message) => message.includes("Content Security Policy"))).toEqual([]);
+    } finally {
+      await page.request.post(`${EDGE}/__test/config`, {
+        data: { forceUnauthorized: false },
+      });
+    }
   });
 });

@@ -22,7 +22,10 @@ const card = {
 
 export default function RepoHomeScreen() {
   const params = useParams();
-  const repo = createAsync(async () => (params.repo ? getRepo(params.repo) : undefined));
+  const repo = createAsync(
+    async () => (params.repo ? getRepo(params.repo) : undefined),
+    { deferStream: true },
+  );
   const toast = useToast();
   const defaultBranch = () => repo()?.default_branch ?? "main";
 

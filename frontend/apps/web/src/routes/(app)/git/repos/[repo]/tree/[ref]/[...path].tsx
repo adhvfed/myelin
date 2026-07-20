@@ -18,8 +18,10 @@ export default function TreeScreen() {
   const params = useParams();
   const path = () => params.path ?? "";
   const ready = () => Boolean(params.repo && params.ref);
-  const tree = createAsync(async () =>
-    ready() ? getTree({ repo: params.repo!, ref: params.ref!, path: path() }) : undefined,
+  const tree = createAsync(
+    async () =>
+      ready() ? getTree({ repo: params.repo!, ref: params.ref!, path: path() }) : undefined,
+    { deferStream: true },
   );
 
   const parentHref = () => {

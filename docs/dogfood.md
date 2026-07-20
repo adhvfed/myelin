@@ -192,6 +192,10 @@ web app at the edge:
 ./scripts/dogfood.sh web       # prints the env + instructions (EXEC=1 to actually start pnpm/vinxi)
 ```
 
+The production web server emits its CSP and browser-security headers automatically. Set
+`MYELIN_HSTS=1` only after the public hostname is permanently HTTPS; this opts that hostname into a
+one-year HSTS policy. Leave it unset for local HTTP and initial TLS canaries.
+
 ## 6a. Solo-operator merges (branch protection)
 
 A fresh repo's default ruleset requires **1 approval**, and Myelin does **not** count an author's approval
