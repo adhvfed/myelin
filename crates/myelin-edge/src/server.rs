@@ -550,7 +550,9 @@ fn payload_too_large(cap: usize) -> Response<EdgeBody> {
 fn to_hyper(resp: EdgeResponse) -> Response<EdgeBody> {
     match resp {
         EdgeResponse::Bytes { status, content_type, headers, body } => {
-            if !handler_response_headers_are_safe(&headers) {
+            if !response_content_type_is_safe(&content_type)
+                || !handler_response_headers_are_safe(&headers)
+            {
                 return response_render_failure();
             }
             let mut builder = Response::builder()
@@ -580,6 +582,19 @@ fn to_hyper(resp: EdgeResponse) -> Response<EdgeBody> {
                 .unwrap_or_else(|_| response_render_failure())
         }
     }
+}
+
+fn response_content_type_is_safe(content_type: &str) -> bool {
+    matches!(
+        content_type,
+        "application/json"
+            | "application/octet-stream"
+            | "text/plain; charset=utf-8"
+            | "application/x-git-upload-pack-advertisement"
+            | "application/x-git-upload-pack-result"
+            | "application/x-git-receive-pack-advertisement"
+            | "application/x-git-receive-pack-result"
+    )
 }
 
 fn handler_response_headers_are_safe(headers: &[(String, String)]) -> bool {
@@ -853,6 +868,24 @@ mod tests {
             ("set-cookie".into(), "session=opaque; HttpOnly".into()),
             ("www-authenticate".into(), "Basic realm=\"Myelin\"".into()),
         ]));
+    }
+
+    #[test]
+    fn response_content_types_are_a_closed_non_active_set() {
+        for content_type in [
+            "application/json",
+            "application/octet-stream",
+            "text/plain; charset=utf-8",
+            "application/x-git-upload-pack-advertisement",
+            "application/x-git-upload-pack-result",
+            "application/x-git-receive-pack-advertisement",
+            "application/x-git-receive-pack-result",
+        ] {
+            assert!(response_content_type_is_safe(content_type), "{content_type}");
+        }
+        for content_type in ["text/html", "image/svg+xml", "text/javascript"] {
+            assert!(!response_content_type_is_safe(content_type), "{content_type}");
+        }
     }
 
     #[test]
