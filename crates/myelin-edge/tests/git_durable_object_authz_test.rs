@@ -682,7 +682,17 @@ use serde_json::json;
 
 /// A bare principal of an arbitrary KIND (the producer floor gates on the kind, not on any grant).
 fn principal_of_kind(id: &str, kind: PrincipalKind) -> Principal {
-    Principal::stub(PrincipalId(id.into()), kind, TenantId(TENANT.into()))
+    // PR source authority is derived from the VERIFIED principal partition. Keep this fixture in the
+    // same explicit region as the repo; `Principal::stub` carries a generic default region and would
+    // correctly make the head lookup a cross-region 404 before the producer-kind gate is exercised.
+    Principal::new(
+        TenantId(TENANT.into()),
+        Region(REGION.into()),
+        PrincipalId(id.into()),
+        kind,
+        DataRole::Controller,
+        PrincipalStatus::Active,
+    )
 }
 
 /// Stand up a durable backend, create the repo, and open one PR (head = an arbitrary oid — the
