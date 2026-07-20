@@ -31,6 +31,8 @@ fn edge_transport_keeps_slowloris_connection_and_body_memory_bounds() {
         "MAX_JSON_REQUEST_BODY_BYTES",
         "tokio::time::timeout(deadline",
         "BoundedCollectError::TimedOut",
+        "Err(BoundedCollectError::Read) => return request_body_read_error()",
+        "fn request_body_read_error()",
         "tokio::task::spawn_blocking(move || handle_gateway_safely(&gw, edge_req))",
         "path.ends_with(\"/git-upload-pack\")",
         "path.ends_with(\"/info/refs\")",

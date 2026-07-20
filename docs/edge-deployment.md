@@ -72,6 +72,8 @@ Capacity responses carry `Retry-After: 1`; failed readiness carries `Retry-After
 bounded retry guidance instead of encouraging immediate retry storms.
 Ordinary request bodies must finish within 30 seconds; Git push bodies receive a five-minute absolute
 deadline. These are total body-read deadlines, so periodic trickle bytes do not retain intake slots.
+An interrupted or malformed body stream returns a canonical 400 and closes the connection; partial
+bytes are never reinterpreted as an empty request.
 SIGINT or SIGTERM also propagates into active Git wire sandboxes: while HTTP connections drain, the
 edge kills and reaps `runsc` containers instead of waiting for their two-minute operation limit.
 
