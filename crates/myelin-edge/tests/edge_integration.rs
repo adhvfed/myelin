@@ -599,6 +599,33 @@ async fn every_response_carries_a_fresh_server_request_id() {
     }
 }
 
+#[tokio::test]
+async fn responses_are_non_cacheable_and_disable_content_sniffing() {
+    let (gateway, cell, _revocations) = build_gateway();
+    let token = mint(&cell, TENANT, "jti-response-headers", now() + 3600);
+    let headers = bearer(&token);
+    let addr = spawn(gateway).await;
+
+    let api = open(addr, "GET", "/v1/whoami", &hdr(&headers), vec![]).await;
+    assert_eq!(api.headers()["cache-control"], "no-store");
+    assert_eq!(api.headers()["x-content-type-options"], "nosniff");
+
+    let error = open(addr, "GET", "/does-not-exist", &[], vec![]).await;
+    assert_eq!(error.headers()["cache-control"], "no-store");
+    assert_eq!(error.headers()["x-content-type-options"], "nosniff");
+
+    let sse = open(
+        addr,
+        "GET",
+        &format!("/v1/t/{TENANT}/events"),
+        &hdr(&headers),
+        vec![],
+    )
+    .await;
+    assert_eq!(sse.headers()["cache-control"], "no-cache");
+    assert_eq!(sse.headers()["x-content-type-options"], "nosniff");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn blocking_git_wire_dispatch_does_not_stall_liveness() {
     SLOW_GIT_STARTED.store(false, Ordering::SeqCst);

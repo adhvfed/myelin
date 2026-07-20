@@ -278,6 +278,7 @@ async fn handle_connection(
     let route_class = route_class(req.uri().path());
     let started = std::time::Instant::now();
     let mut response = handle_connection_inner(gw, readiness, git_wire_slots, req).await;
+    harden_response_headers(&mut response);
     response.headers_mut().insert(
         hyper::header::HeaderName::from_static("x-request-id"),
         hyper::header::HeaderValue::from_str(&request_id).expect("generated request id is ASCII"),
@@ -293,6 +294,20 @@ async fn handle_connection(
         )
     );
     response
+}
+
+fn harden_response_headers(response: &mut Response<EdgeBody>) {
+    let headers = response.headers_mut();
+    if !headers.contains_key(hyper::header::CACHE_CONTROL) {
+        headers.insert(
+            hyper::header::CACHE_CONTROL,
+            hyper::header::HeaderValue::from_static("no-store"),
+        );
+    }
+    headers.insert(
+        hyper::header::HeaderName::from_static("x-content-type-options"),
+        hyper::header::HeaderValue::from_static("nosniff"),
+    );
 }
 
 async fn handle_connection_inner(
