@@ -168,7 +168,11 @@ struct GitWireRuntime {
 
 impl EdgeRuntimeConfig {
     fn from_env(serving: bool) -> Result<Self, String> {
-        Self::from_reader(serving, std::env::var)
+        let config = Self::from_reader(serving, std::env::var)?;
+        if serving {
+            validate_git_wire_host()?;
+        }
+        Ok(config)
     }
 
     fn from_reader(
@@ -226,6 +230,13 @@ impl EdgeRuntimeConfig {
             git_wire,
         })
     }
+}
+
+fn validate_git_wire_host() -> Result<(), String> {
+    let cgroup = myelin_ci_sandbox::MemoryCgroup::create(1024 * 1024)
+        .map_err(|error| format!("Git wire sandbox host preflight failed: {error}"))?;
+    drop(cgroup);
+    Ok(())
 }
 
 fn validated_git_wire_rootfs(value: Result<String, VarError>) -> Result<PathBuf, String> {

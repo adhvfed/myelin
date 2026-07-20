@@ -111,8 +111,9 @@ pub use gvisor::{
 // before any mount. Exercised by tests/git_wire_prod_exec_test.rs against a real `runsc` sandbox.
 pub use gvisor::{
     assert_repo_under_root, resolve_bare_repo_path, resolved_gvisor_git_rootfs,
-    validate_wire_repo_slug, validate_wire_segment, GitWireSpec, WireError, WireMount,
-    ENV_GVISOR_GIT_ROOTFS, WIRE_QUARANTINE_MOUNT, WIRE_REPO_MOUNT, WIRE_STDIN_BOUND,
+    validate_wire_repo_slug, validate_wire_segment, GitWireSpec, MemoryCgroup, WireError, WireMount,
+    ENV_GVISOR_GIT_ROOTFS, ENV_RUNSC_BIN, WIRE_QUARANTINE_MOUNT, WIRE_REPO_MOUNT,
+    WIRE_STDIN_BOUND,
 };
 
 pub use runner::{
