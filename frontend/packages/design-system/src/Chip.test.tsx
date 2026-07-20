@@ -1,8 +1,8 @@
 // Chip gate (R3.3 / reference-chip §5): a no-access reference withholds its title + renders as a
 // non-link span (non-leak by construction); a live reference with an href is a real link; the state
 // word is TEXT, never colour alone.
-import { render, screen } from "@solidjs/testing-library";
-import { describe, it, expect } from "vitest";
+import { fireEvent, render, screen } from "@solidjs/testing-library";
+import { describe, it, expect, vi } from "vitest";
 import { Chip } from "./Chip";
 
 describe("Chip — reference states", () => {
@@ -13,11 +13,20 @@ describe("Chip — reference states", () => {
   });
 
   it("a no-access reference is a non-link span (nothing to leak) even if an href was passed", () => {
-    render(() => <Chip type="run" label="Restricted" state="no_access" href="/ci/runs/4117" />);
+    render(() => <Chip type="run" label="Restricted" state="no_access" href="/ci/runs/4117" onActivate={vi.fn()} />);
     // No link role — a withheld reference is never navigable.
     expect(screen.queryByRole("link")).toBeNull();
+    expect(screen.queryByRole("button")).toBeNull();
     const el = screen.getByLabelText(/run, Restricted, restricted/);
     expect(el.tagName.toLowerCase()).toBe("span");
+  });
+
+  it("a no-href action is a keyboard-native button", () => {
+    const onActivate = vi.fn();
+    render(() => <Chip type="agent" label="Open agent" onActivate={onActivate} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /agent, Open agent/ }));
+    expect(onActivate).toHaveBeenCalledOnce();
   });
 
   it("renders the state word as TEXT for a non-live reference", () => {

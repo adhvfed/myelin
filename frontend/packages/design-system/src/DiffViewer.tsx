@@ -12,7 +12,7 @@
 // The table body is ONE flat `<For>` of precomputed single/fixed-arity rows (no conditional <tr>
 // siblings, no Show-branch swaps under <For>) so a dynamic re-render never trips the table reconciler.
 // Semantic tokens only (no hex); logical properties; the +/− colour only ever tints the glyph channel.
-import { For, Show, Switch, Match, createMemo, createSignal, onMount, mergeProps, type JSX } from "solid-js";
+import { For, Show, Switch, Match, createMemo, createSignal, onCleanup, onMount, mergeProps, type JSX } from "solid-js";
 import { Icon } from "./Icon";
 
 /** One diff line with both line numbers (null on the absent side). */
@@ -200,7 +200,6 @@ export function DiffViewer(rawProps: DiffViewerProps) {
   // pass (server has it, client's first paint doesn't → a hydration-key mismatch that crashes the
   // grid). It flips true after mount, so threads appear client-side without a mismatch.
   const [mounted, setMounted] = createSignal(false);
-  onMount(() => setMounted(true));
 
   let rootEl: HTMLDivElement | undefined;
   const cells = (): HTMLElement[] => Array.from(rootEl?.querySelectorAll<HTMLElement>("[data-rowkey]") ?? []);
@@ -229,7 +228,10 @@ export function DiffViewer(rawProps: DiffViewerProps) {
   const focusFile = (dir: 1 | -1) => {
     const headers = Array.from(rootEl?.querySelectorAll<HTMLElement>("[data-fileheader]") ?? []);
     const list = cells();
-    const curFile = list[curIndex(list)]?.dataset.fileidx;
+    const active = document.activeElement as HTMLElement | null;
+    const curFile = active?.hasAttribute("data-fileheader")
+      ? active.dataset.fileidx
+      : list[curIndex(list)]?.dataset.fileidx;
     let idx = headers.findIndex((h) => h.dataset.fileidx === curFile);
     if (idx < 0) idx = dir === 1 ? -1 : headers.length;
     const target = headers[idx + dir];
@@ -264,8 +266,16 @@ export function DiffViewer(rawProps: DiffViewerProps) {
     }
   };
 
+  onMount(() => {
+    setMounted(true);
+    const first = cells()[0];
+    if (first) setFocusKey(first.dataset.rowkey ?? "");
+    rootEl?.addEventListener("keydown", onKeyDown);
+  });
+  onCleanup(() => rootEl?.removeEventListener("keydown", onKeyDown));
+
   return (
-    <div ref={rootEl} onKeyDown={onKeyDown} style={{ display: "flex", "flex-direction": "column", gap: "var(--space-3)" }}>
+    <div ref={rootEl} style={{ display: "flex", "flex-direction": "column", gap: "var(--space-3)" }}>
       <DiffToolbar
         view={view()}
         forceUnified={props.forceUnified}
@@ -422,25 +432,25 @@ function CodeCell(props: {
   section: SectionProps;
   side: "old" | "new";
 }) {
-  const s = props.section;
+  const section = () => props.section;
   const lineNo = () => (props.side === "new" ? props.line.new_no : props.line.old_no) ?? props.line.new_no ?? props.line.old_no ?? 0;
-  const rowKey = () => `${s.fileIdx}:${props.side}:${lineNo()}:${props.line.origin}`;
+  const rowKey = () => `${section().fileIdx}:${props.side}:${lineNo()}:${props.line.origin}`;
   const isChange = () => props.line.origin !== " ";
   // Gated on `mounted`: the thread flag comes from an async resource — rendering it during SSR/first
   // hydration would mismatch the client's first paint (see DiffViewer `mounted`).
-  const threaded = () => s.mounted && (s.hasThread?.(s.file.path, props.side, lineNo()) ?? false);
-  const isDeepLink = () => s.deepLink?.path === s.file.path && s.deepLink?.side === props.side && s.deepLink?.line === lineNo();
+  const threaded = () => section().mounted && (section().hasThread?.(section().file.path, props.side, lineNo()) ?? false);
+  const isDeepLink = () => section().deepLink?.path === section().file.path && section().deepLink?.side === props.side && section().deepLink?.line === lineNo();
   return (
     <td
-      tabindex={s.focusKey === rowKey() ? "0" : "-1"}
+      tabindex={section().focusKey === rowKey() ? "0" : "-1"}
       data-rowkey={rowKey()}
       data-change={isChange() ? "1" : "0"}
-      data-fileidx={s.fileIdx}
-      data-path={s.file.path}
+      data-fileidx={section().fileIdx}
+      data-path={section().file.path}
       data-side={props.side}
       data-line={lineNo()}
-      onFocus={() => s.setFocusKey(rowKey())}
-      onClick={() => s.onRequestComment?.(s.file.path, props.side, lineNo())}
+      onFocus={() => section().setFocusKey(rowKey())}
+      onClick={() => section().onRequestComment?.(section().file.path, props.side, lineNo())}
       style={{ "padding-inline": "var(--space-2)", "white-space": "pre-wrap", "word-break": "break-word", color: lineColor(props.line.origin), background: isDeepLink() ? "var(--info-subtle)" : threaded() ? "var(--surface-hover)" : "transparent", outline: "none", cursor: "text", "vertical-align": "top" }}
     >
       <span class="sr-only">{srPrefix(props.line)}{threaded() ? "has 1 comment thread. " : ""}{isDeepLink() ? "deep-link target from failing check. " : ""}</span>
@@ -458,7 +468,7 @@ function CodeCell(props: {
  *  rows carry BOTH the old (left) and new (right) sides so a comment on a DELETED (old-side) line
  *  opens its composer under the clicked side — never silently anchored to the new side only. */
 function WidgetRow(props: { cols: number; section: SectionProps; targets: { side: "old" | "new"; line: number }[] }) {
-  const s = props.section;
+  const section = () => props.section;
   // A row carries an optional OLD (left/deleted) and NEW (right/added) target. Two keying rules:
   //   • THREADS are anchored by (path, line), side-agnostic — render per DISTINCT line, so a modified
   //     row with old_no === new_no shows its thread ONCE, but old_no !== new_no shows both lines.
@@ -468,8 +478,8 @@ function WidgetRow(props: { cols: number; section: SectionProps; targets: { side
   // consumer's open-composer / thread signals change (a <For> callback is memoised and would not).
   const oldT = () => props.targets.find((t) => t.side === "old");
   const newT = () => props.targets.find((t) => t.side === "new");
-  const threadAt = (t?: { side: "old" | "new"; line: number }) => (t ? s.renderThread?.(s.file.path, t.side, t.line) : undefined);
-  const composerAt = (t?: { side: "old" | "new"; line: number }) => (t ? s.renderComposer?.(s.file.path, t.side, t.line) : undefined);
+  const threadAt = (t?: { side: "old" | "new"; line: number }) => (t ? section().renderThread?.(section().file.path, t.side, t.line) : undefined);
+  const composerAt = (t?: { side: "old" | "new"; line: number }) => (t ? section().renderComposer?.(section().file.path, t.side, t.line) : undefined);
   const oldThread = () => threadAt(oldT());
   const newThread = () => {
     const nt = newT();
@@ -481,7 +491,7 @@ function WidgetRow(props: { cols: number; section: SectionProps; targets: { side
   return (
     <tr data-diff-widget>
       <td colSpan={props.cols} style={{ padding: "0", background: "var(--surface-raised)" }}>
-        <Show when={s.mounted}>
+        <Show when={section().mounted}>
           {oldThread()}
           {newThread()}
           {composerAt(oldT())}

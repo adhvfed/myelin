@@ -1,8 +1,8 @@
 // DiffViewer gate (R3.2 · G-7 · R-17 §5.1, WCAG 1.4.1): change kind is announced as TEXT with the
 // line number in the SR prefix (never colour alone); binary files never dump text; split + unified
 // both render; the line grid is one tab stop (roving tabindex).
-import { render, screen } from "@solidjs/testing-library";
-import { describe, it, expect } from "vitest";
+import { fireEvent, render, screen } from "@solidjs/testing-library";
+import { describe, it, expect, vi } from "vitest";
 import { DiffViewer, type DiffViewerFile } from "./DiffViewer";
 
 const modified: DiffViewerFile = {
@@ -47,13 +47,52 @@ describe("DiffViewer — SR contract", () => {
     expect(screen.getByText("src/list_filter.rs")).toBeTruthy();
   });
 
-  it("marks each code cell as one tab stop (roving tabindex, none is a positive tabindex)", () => {
+  it("exposes exactly one initial code-cell tab stop", () => {
     const { container } = render(() => <DiffViewer files={[modified]} view="unified" />);
     const cells = container.querySelectorAll("[data-rowkey]");
     expect(cells.length).toBeGreaterThan(0);
-    for (const c of cells) {
-      const ti = c.getAttribute("tabindex");
-      expect(ti === "0" || ti === "-1").toBe(true);
+    expect(Array.from(cells).filter((cell) => cell.getAttribute("tabindex") === "0")).toHaveLength(1);
+    expect(Array.from(cells).filter((cell) => cell.getAttribute("tabindex") === "-1")).toHaveLength(cells.length - 1);
+  });
+
+  it("handles line navigation on the focused cell", () => {
+    const scrollIntoView = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+    try {
+      const { container } = render(() => <DiffViewer files={[modified]} view="unified" />);
+      const cells = container.querySelectorAll<HTMLElement>("[data-rowkey]");
+      cells[0]!.focus();
+
+      fireEvent.keyDown(cells[0]!, { key: "j" });
+
+      expect(document.activeElement).toBe(cells[1]);
+    } finally {
+      HTMLElement.prototype.scrollIntoView = scrollIntoView;
+    }
+  });
+
+  it("keeps file navigation working after focus moves onto file headers", () => {
+    const scrollIntoView = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+    try {
+      const files = [
+        modified,
+        { ...modified, path: "src/second.rs" },
+        { ...modified, path: "src/third.rs" },
+      ];
+      const { container } = render(() => <DiffViewer files={files} view="unified" />);
+      const cells = container.querySelectorAll<HTMLElement>("[data-rowkey]");
+      const headers = container.querySelectorAll<HTMLElement>("[data-fileheader]");
+      cells[0]!.focus();
+
+      fireEvent.keyDown(cells[0]!, { key: "n" });
+      expect(document.activeElement).toBe(headers[1]);
+      fireEvent.keyDown(headers[1]!, { key: "n" });
+      expect(document.activeElement).toBe(headers[2]);
+      fireEvent.keyDown(headers[2]!, { key: "p" });
+      expect(document.activeElement).toBe(headers[1]);
+    } finally {
+      HTMLElement.prototype.scrollIntoView = scrollIntoView;
     }
   });
 });

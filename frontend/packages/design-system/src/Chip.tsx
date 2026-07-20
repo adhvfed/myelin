@@ -117,7 +117,7 @@ export function Chip(rawProps: ChipProps): JSX.Element {
     </>
   );
 
-  const chipStyle: JSX.CSSProperties = {
+  const chipStyle = (): JSX.CSSProperties => ({
     display: "inline-flex",
     "align-items": "center",
     gap: "var(--space-1)",
@@ -129,24 +129,34 @@ export function Chip(rawProps: ChipProps): JSX.Element {
     "text-decoration": "none",
     color: withheld() ? "var(--text-muted)" : "var(--text-primary)",
     ...props.style,
-  };
+  });
 
   return (
     <Show
       when={props.href && !withheld()}
       fallback={
-        <span
-          class="chip"
-          data-chip-state={props.state}
-          aria-label={ariaLabel()}
-          style={chipStyle}
-          onClick={props.onActivate ? () => props.onActivate?.() : undefined}
+        <Show
+          when={props.onActivate && !withheld()}
+          fallback={
+            <span class="chip" data-chip-state={props.state} aria-label={ariaLabel()} style={chipStyle()}>
+              {inner}
+            </span>
+          }
         >
-          {inner}
-        </span>
+          <button
+            type="button"
+            class="chip"
+            data-chip-state={props.state}
+            aria-label={ariaLabel()}
+            style={{ ...chipStyle(), appearance: "none", cursor: "pointer", font: "inherit" }}
+            onClick={() => props.onActivate?.()}
+          >
+            {inner}
+          </button>
+        </Show>
       }
     >
-      <a class="chip" data-chip-state={props.state} href={props.href} aria-label={ariaLabel()} style={chipStyle}>
+      <a class="chip" data-chip-state={props.state} href={props.href} aria-label={ariaLabel()} style={chipStyle()}>
         {inner}
       </a>
     </Show>
