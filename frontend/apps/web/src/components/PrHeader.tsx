@@ -46,41 +46,17 @@ export function PrHeader(props: {
         <Show when={props.pr.author_is_agent}><span> · <Icon name="agent" /> agent</span></Show>
         <Show when={props.pr.created_at}>{" · opened "}{fmtDate(props.pr.created_at as number)}</Show>
       </p>
-      <nav aria-label="Pull request sections" role="tablist" style={{ display: "flex", gap: "var(--space-1)", "border-block-end": "var(--hairline) solid var(--border)" }}>
-        <Show when={props.active === "overview"} fallback={<A role="tab" href={base()} style={tabStyle(false)}>Overview</A>}>
-          <span role="tab" aria-selected="true" style={tabStyle(true)}>Overview</span>
-        </Show>
-        <Show
-          when={props.active === "diff"}
-          fallback={
-            <A role="tab" href={`${base()}/diff`} style={tabStyle(false)}>
-              Files changed
-              <Show when={props.filesCount != null}>{" "}<span aria-label={`${props.filesCount} files changed`}>({props.filesCount})</span></Show>
-            </A>
-          }
-        >
-          <span role="tab" aria-selected="true" style={tabStyle(true)}>
-            Files changed
-            <Show when={props.filesCount != null}>{" "}<span aria-label={`${props.filesCount} files changed`}>({props.filesCount})</span></Show>
-          </span>
-        </Show>
-        <Show when={props.active === "checks"} fallback={<A role="tab" href={`${base()}/checks`} style={tabStyle(false)}>Checks</A>}>
-          <span role="tab" aria-selected="true" style={tabStyle(true)}>Checks</span>
-        </Show>
-        <Show
-          when={props.active === "commits"}
-          fallback={
-            <A role="tab" href={`${base()}/commits`} style={tabStyle(false)}>
-              Commits
-              <Show when={props.commitsCount != null}>{" "}<span aria-label={`${props.commitsCount} commits`}>({props.commitsCount}{props.pr.commits_count_capped ? "+" : ""})</span></Show>
-            </A>
-          }
-        >
-          <span role="tab" aria-selected="true" style={tabStyle(true)}>
-            Commits
-            <Show when={props.commitsCount != null}>{" "}<span aria-label={`${props.commitsCount} commits`}>({props.commitsCount}{props.pr.commits_count_capped ? "+" : ""})</span></Show>
-          </span>
-        </Show>
+      <nav aria-label="Pull request sections" style={{ display: "flex", gap: "var(--space-1)", "border-block-end": "var(--hairline) solid var(--border)" }}>
+        <A aria-current={props.active === "overview" ? "page" : undefined} href={base()} style={tabStyle(props.active === "overview")}>Overview</A>
+        <A aria-current={props.active === "diff" ? "page" : undefined} href={`${base()}/diff`} style={tabStyle(props.active === "diff")}>
+          Files changed
+          <Show when={props.filesCount != null}>{" "}<span aria-label={`${props.filesCount} files changed`}>({props.filesCount})</span></Show>
+        </A>
+        <A aria-current={props.active === "checks" ? "page" : undefined} href={`${base()}/checks`} style={tabStyle(props.active === "checks")}>Checks</A>
+        <A aria-current={props.active === "commits" ? "page" : undefined} href={`${base()}/commits`} style={tabStyle(props.active === "commits")}>
+          Commits
+          <Show when={props.commitsCount != null}>{" "}<span aria-label={`${props.commitsCount} commits`}>({props.commitsCount}{props.pr.commits_count_capped ? "+" : ""})</span></Show>
+        </A>
       </nav>
     </header>
   );

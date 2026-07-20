@@ -30,10 +30,11 @@ test.describe("R3.2 PR diff / files-changed — real browser", () => {
     await devLogin(page);
     await page.goto("/git/repos/myelin/prs/1/diff");
 
-    // The PR header + tabs (Files changed active with the count badge).
+    // The PR section navigation (Files changed is current and carries the count badge).
     await expect(page.getByRole("heading", { level: 1, name: /R3.3 PR overview/ })).toBeVisible();
-    await expect(page.getByRole("tab", { name: /Files changed/ })).toBeVisible();
-    await expect(page.getByRole("tab", { name: /Files changed/ })).toContainText("(2)");
+    const filesChanged = page.getByRole("link", { name: /Files changed/ });
+    await expect(filesChanged).toHaveAttribute("aria-current", "page");
+    await expect(filesChanged).toContainText("(2)");
 
     // The modified file renders with the added clamp line; the binary file is a no-text-diff row.
     await expect(page.getByText("src/list_filter.rs").first()).toBeVisible();

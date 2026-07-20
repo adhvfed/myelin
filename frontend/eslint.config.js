@@ -46,6 +46,9 @@ export default tseslint.config(
     plugins: { "jsx-a11y": jsxA11y },
     rules: {
       ...jsxA11y.flatConfigs.recommended.rules,
+      // `list-style: none` can erase native list semantics in Safari/VoiceOver. Explicit
+      // `role="list"` restores that contract and is intentionally not redundant there.
+      "jsx-a11y/no-redundant-roles": ["error", { nav: ["navigation"], ul: ["list"] }],
     },
   },
   {
