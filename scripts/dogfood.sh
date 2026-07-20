@@ -58,10 +58,11 @@ ensure_seal_key() {
 # Print the eval-able env contract: the dev-stack data-layer env + the edge-only env.
 print_env() {
   ensure_seal_key
-  local seal git_root git_rootfs region
+  local seal git_root git_rootfs region runsc_bin
   seal="$(cat "${SEAL_KEY_FILE}")"
   git_root="${MYELIN_GIT_ROOT:-${GIT_ROOT_DEFAULT}}"
   git_rootfs="${MYELIN_GVISOR_GIT_ROOTFS:-${GIT_ROOTFS_DEFAULT}}"
+  runsc_bin="${MYELIN_RUNSC_BIN:-$(command -v runsc || true)}"
   region="${MYELIN_REGION:-fr-par}"
   # The data-layer contract (DATABASE_URL / S3_* / REDIS_URL / NATS_URL / MYELIN_REGION).
   "${REPO_ROOT}/scripts/dev-stack.sh" env
@@ -81,6 +82,7 @@ export MYELIN_DOGFOOD_ISSUES_PREFIX="\${MYELIN_DOGFOOD_ISSUES_PREFIX:-${DOGFOOD_
 export MYELIN_EDGE_ADDR="\${MYELIN_EDGE_ADDR:-127.0.0.1:8080}"
 export MYELIN_TOKEN_LOGIN="\${MYELIN_TOKEN_LOGIN:-1}"  # surface the operator-token web login in /v1/auth/config
 export MYELIN_GVISOR_GIT_ROOTFS="\${MYELIN_GVISOR_GIT_ROOTFS:-${git_rootfs}}"  # the sandboxed git-wire rootfs (stage-git-rootfs.sh)
+export MYELIN_RUNSC_BIN="\${MYELIN_RUNSC_BIN:-${runsc_bin}}"  # absolute gVisor runtime path; edge startup validates it
 export MYELIN_PUBLIC_BASE_URL="\${MYELIN_PUBLIC_BASE_URL:-http://\${MYELIN_EDGE_ADDR:-127.0.0.1:8080}}"  # advertised clone-URL base (F3)
 EOF
 }
@@ -104,7 +106,7 @@ case "${cmd}" in
     # Stage the sandboxed git-wire rootfs once (idempotent) so clone/fetch/push work out of the box.
     if [[ ! -x "${MYELIN_GVISOR_GIT_ROOTFS}/usr/bin/git" ]]; then
       echo "dogfood: staging the git-wire rootfs (${MYELIN_GVISOR_GIT_ROOTFS}) …" >&2
-      "${REPO_ROOT}/scripts/stage-git-rootfs.sh" >/dev/null || echo "dogfood: WARN git-rootfs staging failed — the git WIRE (clone/push) will not work until it is staged" >&2
+      "${REPO_ROOT}/scripts/stage-git-rootfs.sh" >/dev/null
     fi
     echo "dogfood: building + serving the edge on ${MYELIN_EDGE_ADDR} (git root ${MYELIN_GIT_ROOT})" >&2
     exec cargo run --quiet -p myelin-edge --bin edge
