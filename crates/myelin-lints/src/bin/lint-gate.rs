@@ -18,8 +18,8 @@
 //! swallowed by a shell `||`; the `ci_gate_fails_loudly` test (`tests/ci_gate.rs`) proves the
 //! red-fixture run exits non-zero and the clean tree exits zero.
 
-use myelin_lints::engine::run;
-use myelin_lints::lints::all_twelve;
+use myelin_lints::lints::{all_twelve, no_raw_ci_verdict, NO_RAW_CI_VERDICT};
+use myelin_lints::LintId;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -260,6 +260,43 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     "/fixtures/",
 ];
 
+/// **PER-LINT exclusions — a file skipped ONLY for the named lint, still fully scanned by every
+/// OTHER lint.** Unlike [`EXCLUDED_SUBSTRINGS`] (which skips a file before the WHOLE lint vector runs),
+/// each entry here suppresses exactly ONE lint on exactly the named seam files, so those files keep
+/// being held to tenant-predicate / no-host-exec / no-raw-publish / every other rule. Same NAMED,
+/// LOUD, self-justifying discipline as the global list.
+const PER_LINT_EXCLUSIONS: &[(LintId, &[&str])] = &[
+    // The CI stage-verdict seam (`no-raw-ci-verdict`, P-FLOW CI durability). The typed `job.done`
+    // verdict (`SignalPayload::CiJobDone` / `signal_typed`) is trusted by the pipeline body as the
+    // runner's verified result, so naming/constructing/delivering it is forbidden everywhere EXCEPT the
+    // three sites that legitimately OWN it — analogous to `myelin-events/src/relay.rs` being the one
+    // legitimate broker-publish site for `no-raw-publish`. These three are excluded ONLY from
+    // `no-raw-ci-verdict`; they remain FULLY scanned by all twelve architecture lints.
+    (
+        NO_RAW_CI_VERDICT,
+        &[
+            // (1) the flow executor that DEFINES the typed enum + the in-memory canonicalisation seam:
+            "myelin-flow/src/executor.rs",
+            // (2) the durable flow executor that IMPLEMENTS `signal_typed` (canonicalise + insert):
+            "myelin-flow/src/pg_executor.rs",
+            // (3) the sanctioned CI reporter — the ONE production delivery site, where the runner's
+            //     real guest exit code is verified before the verdict is minted (the durable
+            //     claimed-job verification lands here in the follow-on). Every other caller is rejected.
+            "myelin-ci-controlplane/src/ci_pipeline_driver.rs",
+        ],
+    ),
+];
+
+/// Whether `lint` is per-lint-excluded on `path` (skipped for THIS lint only, still scanned by every
+/// other lint). Always honoured — a semantic seam exclusion, not a fixture-scanning artifact — so even
+/// a `--no-exclude` fixture run respects it.
+fn is_excluded_for_lint(lint: LintId, path: &Path) -> bool {
+    let s = path.to_string_lossy().replace('\\', "/");
+    PER_LINT_EXCLUSIONS
+        .iter()
+        .any(|(id, subs)| *id == lint && subs.iter().any(|ex| s.contains(ex)))
+}
+
 fn is_excluded(path: &Path) -> bool {
     let s = path.to_string_lossy().replace('\\', "/");
     EXCLUDED_SUBSTRINGS.iter().any(|ex| s.contains(ex))
@@ -319,7 +356,12 @@ fn main() -> ExitCode {
         roots
     };
 
-    let lints = all_twelve();
+    // The twelve architecture lints PLUS the seam-specific `no-raw-ci-verdict` (the CI stage-verdict
+    // forging guard). The latter is NOT part of the frozen `all_twelve` architecture ratchet — it is a
+    // seam lint modeled on `no-raw-publish`, enforced over the real workspace by THIS gate with its
+    // three owning-site files NAMED-excluded above.
+    let mut lints = all_twelve();
+    lints.push(no_raw_ci_verdict());
     let mut violations = Vec::new();
     let mut scanned = 0usize;
 
@@ -331,8 +373,14 @@ fn main() -> ExitCode {
             let Ok(src) = std::fs::read_to_string(&file) else {
                 continue;
             };
-            if let Err(found) = run(&lints, &src) {
-                for v in found {
+            // Run each lint INDIVIDUALLY so a PER-LINT exclusion suppresses only that one lint on the
+            // file — every OTHER lint still scans it. (A global `is_excluded` skip above removes the
+            // file from ALL lints; that is reserved for the whole-file exclusions like the relay.)
+            for lint in &lints {
+                if is_excluded_for_lint(lint.id, &file) {
+                    continue;
+                }
+                for v in lint.run(&src) {
                     violations.push(format!("{}: {v}", file.display()));
                 }
             }
