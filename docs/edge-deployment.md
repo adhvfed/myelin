@@ -68,6 +68,8 @@ most 64 headers with a 64 KiB HTTP buffer, and rejects excess sockets immediatel
 are capped at 1 MiB. Only `git-receive-pack` receives the 100 MiB body budget. At most four Git wire
 operations (advertise, fetch, or push) run concurrently; they use the runtime's blocking pool so a
 sandboxed Git process cannot stall health probes or ordinary API traffic. Excess wire work returns 503.
+Capacity responses carry `Retry-After: 1`; failed readiness carries `Retry-After: 5`, giving callers
+bounded retry guidance instead of encouraging immediate retry storms.
 Ordinary request bodies must finish within 30 seconds; Git push bodies receive a five-minute absolute
 deadline. These are total body-read deadlines, so periodic trickle bytes do not retain intake slots.
 SIGINT or SIGTERM also propagates into active Git wire sandboxes: while HTTP connections drain, the

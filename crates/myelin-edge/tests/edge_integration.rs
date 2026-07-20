@@ -38,7 +38,7 @@ use myelin_identity_service::{
 use myelin_storage::{KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
@@ -47,13 +47,13 @@ const TENANT: &str = "acme";
 const REGION: &str = "eu-west";
 const OTHER_TENANT: &str = "globex";
 const SCHEME: &str = "agent"; // a TTL-constrained token (no DPoP) — simplest real proof.
-static SLOW_GIT_STARTED: AtomicBool = AtomicBool::new(false);
+static SLOW_GIT_STARTED: AtomicUsize = AtomicUsize::new(0);
 
 struct SlowGitWireHandler;
 
 impl Handler for SlowGitWireHandler {
     fn handle(&self, _ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        SLOW_GIT_STARTED.store(true, Ordering::SeqCst);
+        SLOW_GIT_STARTED.fetch_add(1, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(500));
         Ok(EdgeResponse::json(200, &serde_json::json!({ "status": "ok" })))
     }
@@ -564,7 +564,13 @@ async fn health_endpoints_split_dependency_free_liveness_from_readiness() {
     });
 
     let (live, live_body) = http(addr, "GET", "/livez", &[], vec![]).await;
-    let (not_ready, not_ready_body) = http(addr, "GET", "/readyz", &[], vec![]).await;
+    let not_ready_response = open(addr, "GET", "/readyz", &[], vec![]).await;
+    let not_ready = not_ready_response.status().as_u16();
+    assert_eq!(not_ready_response.headers()["retry-after"], "5");
+    let not_ready_body = String::from_utf8_lossy(
+        &not_ready_response.into_body().collect().await.unwrap().to_bytes(),
+    )
+    .to_string();
     assert_eq!((live, live_body.as_str()), (200, "{\"status\":\"ok\"}"));
     assert_eq!(
         (not_ready, not_ready_body.as_str()),
@@ -628,7 +634,7 @@ async fn responses_are_non_cacheable_and_disable_content_sniffing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn blocking_git_wire_dispatch_does_not_stall_liveness() {
-    SLOW_GIT_STARTED.store(false, Ordering::SeqCst);
+    SLOW_GIT_STARTED.store(0, Ordering::SeqCst);
     let (gateway, cell, _revocations) = build_gateway();
     let token = mint_with_authority(
         &cell,
@@ -657,7 +663,7 @@ async fn blocking_git_wire_dispatch_does_not_stall_liveness() {
         .await
     });
     let handler_started = tokio::time::timeout(Duration::from_secs(1), async {
-        while !SLOW_GIT_STARTED.load(Ordering::SeqCst) {
+        while SLOW_GIT_STARTED.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -678,6 +684,57 @@ async fn blocking_git_wire_dispatch_does_not_stall_liveness() {
     );
     let (slow_status, _) = slow.await.unwrap();
     assert_eq!(slow_status, 200);
+}
+
+#[tokio::test]
+async fn saturated_git_wire_pool_returns_bounded_retry_guidance() {
+    SLOW_GIT_STARTED.store(0, Ordering::SeqCst);
+    let (gateway, cell, _revocations) = build_gateway();
+    let token = mint_with_authority(
+        &cell,
+        TENANT,
+        "jti-git-overload",
+        now() + 3600,
+        vec!["edge.operator".into(), "git.wire.upload_pack".into()],
+    );
+    let headers = bearer(&token);
+    let addr = spawn(gateway).await;
+    let mut active = Vec::new();
+    for _ in 0..4 {
+        let request_headers = headers.clone();
+        active.push(tokio::spawn(async move {
+            open(
+                addr,
+                "GET",
+                "/acme/eu-west/widgets.git/info/refs",
+                &hdr(&request_headers),
+                vec![],
+            )
+            .await
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while SLOW_GIT_STARTED.load(Ordering::SeqCst) < 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all four bounded Git wire slots must be occupied");
+
+    let shed = open(
+        addr,
+        "GET",
+        "/acme/eu-west/widgets.git/info/refs",
+        &hdr(&headers),
+        vec![],
+    )
+    .await;
+    assert_eq!(shed.status(), 503);
+    assert_eq!(shed.headers()["retry-after"], "1");
+
+    for request in active {
+        assert_eq!(request.await.unwrap().status(), 200);
+    }
 }
 
 #[tokio::test]
