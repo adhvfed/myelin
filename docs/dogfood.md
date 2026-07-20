@@ -197,10 +197,11 @@ The production web server emits its CSP and browser-security headers automatical
 one-year HSTS policy. Leave it unset for local HTTP and initial TLS canaries. Production also requires
 `MYELIN_PUBLIC_ORIGIN` (for example `https://myelin.example`) so every unsafe browser request can be
 checked against the deployment's exact scheme, host, and port. It must be HTTPS and contain no path.
-Production also requires `REDIS_URL`: browser sessions are stored in the region-local Valkey service
-and startup fails before accepting traffic when either required setting is missing. Use `/healthz`
-for process liveness and `/readyz` for traffic readiness; the latter returns 503 whenever the session
-backend is unavailable.
+Production also requires a `rediss://` `REDIS_URL`: browser sessions—including bearer credentials—
+are stored in the region-local Valkey service, so plaintext `redis://` is accepted only by local
+development and tests. Startup fails before accepting traffic when either required setting is missing
+or insecure. Use `/healthz` for process liveness and `/readyz` for traffic readiness; the latter
+returns 503 whenever the session backend is unavailable.
 
 ## 6a. Solo-operator merges (branch protection)
 
