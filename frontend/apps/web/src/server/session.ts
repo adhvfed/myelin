@@ -3,18 +3,16 @@
 // principal facts live in a SERVER-SIDE store keyed by that id. So **tokens never reach client JS** —
 // `document.cookie` holds only the opaque, httpOnly id, and the token is never serialised to the page.
 //
-// FLOORS NAMED (honest): (1) the store is an in-memory Map — the model, exactly like the Rust
-// SessionStore; a durable backing (Valkey/PG) is the named follow-on, the cookie/lookup SEMANTICS are
-// complete now. (2) the dev session is MINTED by the dev-login seam (`createDevSession`) — the
-// clearly-marked stand-in the deferred real OIDC login replaces; it is NOT production auth.
+// Production records live in region-local Valkey so every web replica sees the same revocation and
+// rotation state. The in-memory implementation is retained only for hermetic local development.
+// The dev session is MINTED by the explicitly gated dev-login seam; it is NOT production auth.
 
 import { getCookie, setCookie, deleteCookie } from "vinxi/http";
 import { randomBytes } from "node:crypto";
-import {
-  MemorySessionStore,
-  type SessionRecord,
-} from "./session-store";
+import type { SessionRecord, SessionStore } from "./session-store";
 import { sessionCookieSettings } from "./session-cookie";
+import { createSessionStore, sessionBackend } from "./session-backend";
+import { validSessionId } from "./session-id";
 
 export type { SessionRecord } from "./session-store";
 
@@ -23,46 +21,49 @@ export type { SessionRecord } from "./session-store";
 const cookie = sessionCookieSettings(import.meta.env.PROD);
 export const SESSION_COOKIE = cookie.name;
 
-/** The in-memory session store (the model; durable backing is the named floor).
- *
- * Backed on `globalThis` so the SSR bundle and the server-functions bundle — which vinxi/Nitro loads
+/** Backed on `globalThis` so the SSR bundle and the server-functions bundle — which vinxi/Nitro loads
  * as SEPARATE module graphs in the SAME process — share ONE store. Without this, a session written by a
  * server action (server-fns bundle) is invisible to the SSR `requireViewer` on a full-reload/deep-link
- * navigation, so every app route would bounce to `/login` on refresh. (A durable backing — Valkey/PG —
- * is the named follow-on; this keeps the in-memory model honest while making deep-links/refresh work.) */
+ * navigation. In production that process-local reference points to the shared Valkey transport. */
 const globalStore = globalThis as unknown as {
-  __myelinSessionStore?: MemorySessionStore;
+  __myelinSessionStore?: SessionStore;
 };
-const store = (globalStore.__myelinSessionStore ??= new MemorySessionStore());
+const store = (globalStore.__myelinSessionStore ??= createSessionStore(
+  sessionBackend(import.meta.env.PROD, process.env.REDIS_URL),
+));
 
 /** Generate an opaque, unguessable session id (CSPRNG — the production-grade id the Rust model flagged). */
 function freshId(): string {
   return `sess_${randomBytes(24).toString("base64url")}`;
 }
 
+export async function sessionStoreReady(): Promise<void> {
+  await store.ready();
+}
+
 /** Read the current request's session record (via the httpOnly cookie), or null. Server-only. */
-export function getSessionRecord(): SessionRecord | null {
+export async function getSessionRecord(): Promise<SessionRecord | null> {
   const id = getCookie(SESSION_COOKIE);
-  if (!id) return null;
-  return store.get(id);
+  if (!id || !validSessionId(id)) return null;
+  return await store.get(id);
 }
 
 /** Persist a (possibly rotated) token onto the current session, if one exists. Server-only. */
-export function updateSessionToken(token: string): void {
+export async function updateSessionToken(token: string): Promise<void> {
   const id = getCookie(SESSION_COOKIE);
-  if (!id) return;
-  store.updateToken(id, token);
+  if (!id || !validSessionId(id)) return;
+  await store.updateToken(id, token);
 }
 
 /** Issue a session: store the record server-side, set the httpOnly cookie carrying ONLY the opaque id. */
-export function issueSession(rec: SessionRecord): string {
+export async function issueSession(rec: SessionRecord): Promise<string> {
   // Re-authentication rotates the browser session and revokes the prior id immediately. A copied old
   // cookie cannot remain live until its TTL merely because the same browser signed in again.
   const priorId = getCookie(SESSION_COOKIE);
-  if (priorId) store.delete(priorId);
+  if (priorId && validSessionId(priorId)) await store.delete(priorId);
 
   const id = freshId();
-  store.issue(id, rec);
+  await store.issue(id, rec);
   setCookie(SESSION_COOKIE, id, {
     httpOnly: true,
     // `lax` (not `strict`): the session cookie MUST ride a top-level deep-link/full-reload navigation
@@ -79,9 +80,9 @@ export function issueSession(rec: SessionRecord): string {
 }
 
 /** Clear the current session (logout / dead session): drop the record AND the cookie. Idempotent. */
-export function clearCurrentSession(): void {
+export async function clearCurrentSession(): Promise<void> {
   const id = getCookie(SESSION_COOKIE);
-  if (id) store.delete(id);
+  if (id && validSessionId(id)) await store.delete(id);
   deleteCookie(SESSION_COOKIE, {
     httpOnly: true,
     sameSite: "lax",

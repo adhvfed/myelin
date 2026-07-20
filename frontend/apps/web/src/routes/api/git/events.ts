@@ -14,7 +14,7 @@ function edgeUrl(): string {
 }
 
 export async function GET() {
-  const rec = getSessionRecord();
+  const rec = await getSessionRecord();
   if (!rec) {
     return new Response("unauthorized", { status: 401 });
   }

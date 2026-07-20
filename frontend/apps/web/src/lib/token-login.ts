@@ -35,7 +35,7 @@ export interface TokenLoginDeps {
    *  200; REJECTS on any non-200 / network error (invalid or expired token). Never leaks the raw error. */
   verify: (token: string, scheme: string) => Promise<TokenWhoami>;
   /** Issue the session server-side (store record + set the httpOnly cookie). */
-  issue: (rec: TokenSessionInput) => void;
+  issue: (rec: TokenSessionInput) => void | Promise<void>;
 }
 
 /** Where the login sends the browser next. Success → the repos home; failure → the honest error state. */
@@ -103,7 +103,7 @@ export async function runTokenLogin(
     return { redirectTo: TOKEN_LOGIN_ERROR };
   }
 
-  deps.issue({
+  await deps.issue({
     token,
     // A pasted operator/bootstrap token has NO refresh credential. Empty is correct + tolerated: on a
     // future 401 the refresh round-trip Bearers this empty string, the edge answers 401, and the

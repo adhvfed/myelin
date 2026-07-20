@@ -109,10 +109,11 @@ async function edgeRequest<T>(
   body?: unknown,
   options?: GatewayRequestOptions,
 ): Promise<T> {
-  const scheme = getSessionRecord()?.scheme ?? "pat";
+  const initialSession = await getSessionRecord();
+  const scheme = initialSession?.scheme ?? "pat";
   const signal = gatewayRequestSignal(options);
   return runGateway<T>({
-    getToken: () => getSessionRecord()?.token ?? null,
+    getToken: () => initialSession?.token ?? null,
     doFetch: async (token) => {
       const res = await fetch(`${edgeUrl()}${path}`, {
         method,
@@ -127,7 +128,7 @@ async function edgeRequest<T>(
       return { status: res.status, bodyText: await res.text() };
     },
     refresh: async () => {
-      const rec = getSessionRecord();
+      const rec = await getSessionRecord();
       if (!rec) return null;
       const res = await fetch(`${edgeUrl()}/v1/auth/refresh`, {
         method: "POST",
@@ -141,7 +142,7 @@ async function edgeRequest<T>(
       // The refresh response may rotate the access token; persist it server-side and use it for the retry.
       const json = (await res.json().catch(() => null)) as { access_token?: string } | null;
       const fresh = json?.access_token ?? rec.token;
-      updateSessionToken(fresh);
+      await updateSessionToken(fresh);
       return fresh;
     },
     clearSession: () => clearCurrentSession(),
@@ -159,19 +160,20 @@ export interface RawEdgeResponse {
 }
 
 export async function edgeGetRaw(path: string): Promise<RawEdgeResponse> {
-  const scheme = getSessionRecord()?.scheme ?? "pat";
+  const initialSession = await getSessionRecord();
+  const scheme = initialSession?.scheme ?? "pat";
   const doFetch = (token: string) =>
     fetch(`${edgeUrl()}${path}`, {
       method: "GET",
       headers: { authorization: `Bearer ${token}`, "x-myelin-token-scheme": scheme },
     });
 
-  const token = getSessionRecord()?.token;
+  const token = initialSession?.token;
   if (!token) throw new Unauthorized("no session token (not authenticated)");
   let res = await doFetch(token);
   if (res.status === 401) {
     // ONE refresh round-trip + retry (mirrors runGateway), then give up.
-    const rec = getSessionRecord();
+    const rec = await getSessionRecord();
     let fresh: string | null = null;
     if (rec) {
       const rr = await fetch(`${edgeUrl()}/v1/auth/refresh`, {
@@ -181,11 +183,11 @@ export async function edgeGetRaw(path: string): Promise<RawEdgeResponse> {
       if (rr.status === 200) {
         const json = (await rr.json().catch(() => null)) as { access_token?: string } | null;
         fresh = json?.access_token ?? rec.token;
-        updateSessionToken(fresh);
+        await updateSessionToken(fresh);
       }
     }
     if (!fresh) {
-      clearCurrentSession();
+      await clearCurrentSession();
       throw new Unauthorized("still unauthorized after one refresh");
     }
     res = await doFetch(fresh);

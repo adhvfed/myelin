@@ -11,6 +11,14 @@ export interface SessionRecord {
   tenant: string;
 }
 
+export interface SessionStore {
+  ready(): void | Promise<void>;
+  issue(id: string, record: SessionRecord): void | Promise<void>;
+  get(id: string): SessionRecord | null | Promise<SessionRecord | null>;
+  updateToken(id: string, token: string): boolean | Promise<boolean>;
+  delete(id: string): boolean | Promise<boolean>;
+}
+
 interface StoredSession {
   record: SessionRecord;
   createdAtMs: number;
@@ -22,6 +30,8 @@ interface StoredSession {
  * this for Valkey while retaining identical absolute/idle expiry and token-rotation semantics. */
 export class MemorySessionStore {
   readonly #sessions = new Map<string, StoredSession>();
+
+  ready(): void {}
 
   issue(id: string, record: SessionRecord, nowMs = Date.now()): void {
     this.#sessions.set(id, {
