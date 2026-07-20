@@ -34,6 +34,12 @@ test.describe("MR-019 app shell — real browser", () => {
     });
     expect(schemeDowngrade.status()).toBe(403);
 
+    const customUnsafeMethod = await page.request.fetch("/login", {
+      method: "PURGE",
+      headers: { Origin: "https://evil.example" },
+    });
+    expect(customUnsafeMethod.status()).toBe(403);
+
     const sameOrigin = await page.request.post("/login", {
       headers: { Origin: APP },
     });

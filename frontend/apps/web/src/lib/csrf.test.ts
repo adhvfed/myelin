@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { sameOriginVerdict } from "./csrf";
+import { requestMethodPolicy, sameOriginVerdict } from "./csrf";
 
 const HOST = "app.myelin.dev";
 const ORIGIN = `https://${HOST}`;
@@ -71,5 +71,22 @@ describe("sameOriginVerdict (peer-review #21c — login-CSRF origin check)", () 
     expect(
       sameOriginVerdict({ origin: "not a url", referer: null, expectedOrigin: ORIGIN }),
     ).toBe("reject");
+  });
+});
+
+describe("requestMethodPolicy", () => {
+  it.each(["GET", "head", "Options"])("allows the safe method %s", (method) => {
+    expect(requestMethodPolicy(method)).toBe("safe");
+  });
+
+  it.each(["POST", "PUT", "PATCH", "DELETE", "PURGE", "PROPFIND", "CONNECT"])(
+    "origin-checks the unsafe method %s",
+    (method) => {
+      expect(requestMethodPolicy(method)).toBe("verify-origin");
+    },
+  );
+
+  it("rejects TRACE regardless of origin", () => {
+    expect(requestMethodPolicy("TRACE")).toBe("reject");
   });
 });

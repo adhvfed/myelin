@@ -2,13 +2,12 @@ import { randomBytes } from "node:crypto";
 
 import { createMiddleware } from "@solidjs/start/middleware";
 
-import { sameOriginVerdict } from "~/lib/csrf";
+import { requestMethodPolicy, sameOriginVerdict } from "~/lib/csrf";
 import { securityHeaders } from "~/lib/security-headers";
 import { canonicalPublicOrigin } from "~/server/public-origin";
 
 const production = process.env.NODE_ENV === "production";
 const hsts = process.env.MYELIN_HSTS === "1";
-const unsafeMethods = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 function applySecurityHeaders(headers: Headers, nonce: string): void {
   for (const [name, value] of Object.entries(securityHeaders({ hsts, nonce, production }))) {
@@ -24,7 +23,16 @@ export default createMiddleware({
     event.locals.cspNonce = nonce;
     applySecurityHeaders(event.response.headers, nonce);
 
-    if (unsafeMethods.has(event.request.method.toUpperCase())) {
+    const methodPolicy = requestMethodPolicy(event.request.method);
+    if (methodPolicy === "reject") {
+      event.response.headers.set("Content-Type", "text/plain; charset=utf-8");
+      event.response.headers.set("Allow", "GET, HEAD, OPTIONS");
+      return new Response("method not allowed", {
+        status: 405,
+        headers: event.response.headers,
+      });
+    }
+    if (methodPolicy === "verify-origin") {
       const expectedOrigin = canonicalPublicOrigin({
         production,
         configured: process.env.MYELIN_PUBLIC_ORIGIN,
