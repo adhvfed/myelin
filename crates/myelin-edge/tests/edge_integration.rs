@@ -22,8 +22,8 @@ use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use myelin_edge::{
-    serve_edge, sse_scope_for_resource, sse_scope_for_tenant, AllowAll, Gateway, Method, SseEvent,
-    WhoamiHandler,
+    serve_edge, serve_edge_until_shutdown, sse_scope_for_resource, sse_scope_for_tenant, AllowAll,
+    Gateway, Method, ShutdownOutcome, SseEvent, WhoamiHandler,
 };
 use myelin_events::Timestamp;
 use myelin_identity::{
@@ -452,5 +452,64 @@ async fn scoped_sse_route_isolates_per_object() {
     assert!(
         !frame.contains("coarse") && !frame.contains("other"),
         "no tenant-coarse / foreign-object frame leaked into the per-object stream: {frame}"
+    );
+}
+
+#[tokio::test]
+async fn requested_shutdown_closes_the_listener_without_active_connections() {
+    let (gateway, _cell, _revocations) = build_gateway();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (outcome, ()) = serve_edge_until_shutdown(
+        listener,
+        gateway,
+        std::future::ready(()),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome, ShutdownOutcome::Graceful { connections: 0 });
+}
+
+#[tokio::test]
+async fn shutdown_deadline_forces_an_open_sse_connection_closed() {
+    let (gateway, cell, _revocations) = build_gateway();
+    let token = mint(&cell, TENANT, "jti-sse-shutdown", now() + 3600);
+    let headers = bearer(&token);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_edge_until_shutdown(
+            listener,
+            gateway,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap()
+    });
+
+    let response = open(
+        addr,
+        "GET",
+        &format!("/v1/t/{TENANT}/events"),
+        &hdr(&headers),
+        vec![],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let _open_stream = response.into_body();
+    shutdown_tx.send(()).unwrap();
+
+    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .expect("bounded shutdown must return")
+        .expect("server task must not panic");
+    assert!(
+        matches!(outcome, ShutdownOutcome::Forced { connections } if connections >= 1),
+        "an open SSE stream must be forcibly closed at the deadline: {outcome:?}"
     );
 }

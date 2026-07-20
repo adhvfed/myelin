@@ -27,10 +27,11 @@
 use myelin_config::Mode;
 use myelin_edge::{
     bootstrap_principal_and_mint, recover_placed_git_at_boot, register_git_durable,
-    register_git_wire, register_issues, serve_edge, spawn_issue_authorization_reconciler,
-    AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
-    CheckBackedRepoAuthorizer, DurableGitBackend, Gateway, IssueReconciliationConfig, Method,
-    StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
+    register_git_wire, register_issues, serve_edge_until_shutdown,
+    spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig,
+    AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer, DurableGitBackend,
+    Gateway, IssueReconciliationConfig, Method, ShutdownOutcome, StoreBackedIssueAuthorizer,
+    TupleRepoBootstrap, WhoamiHandler,
 };
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{FragmentAdmit, Principal, PrincipalId, PrincipalKind, RevokeTarget};
@@ -48,6 +49,7 @@ use std::{
     env::VarError,
     path::{Component, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 /// The default operator-token scheme the edge resolves a bearer/basic credential under when the client
@@ -57,6 +59,7 @@ use std::{
 /// curl with ZERO extra headers. Every edge test already sets its own scheme explicitly, so this is a
 /// no-op for them; a real `pat` presented WITH an explicit `pat` scheme header is still DPoP-enforced.
 const EDGE_DEFAULT_TOKEN_SCHEME: &str = "agent";
+const EDGE_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 
 // =================================================================================================
 // Shared composition — the config/provider/migrations/KMS/cell-root core BOTH serve and the operator
@@ -560,10 +563,23 @@ async fn serve(core: ComposedCore, git_root: PathBuf) {
     let issue_reconciler =
         spawn_issue_authorization_reconciler(issue_store, check, issue_reconciliation_config);
     eprintln!("edge: listening on {addr}");
-    let server_result = tokio::select! {
-        result = serve_edge(listener, gateway) => result.map_err(|error| format!("serve error: {error}")),
-        signal = shutdown_signal() => signal,
-    };
+    let server_result = serve_edge_until_shutdown(
+        listener,
+        gateway,
+        shutdown_signal(),
+        EDGE_SHUTDOWN_GRACE,
+    )
+    .await
+    .map_err(|error| format!("serve error: {error}"))
+    .and_then(|(outcome, signal_result)| {
+        if let ShutdownOutcome::Forced { connections } = outcome {
+            eprintln!(
+                "edge: forced {connections} active HTTP connection(s) closed after the {}s shutdown grace",
+                EDGE_SHUTDOWN_GRACE.as_secs()
+            );
+        }
+        signal_result
+    });
     let reconciliation_result = issue_reconciler.shutdown().await;
     if let Err(e) = reconciliation_result {
         eprintln!("edge: Issues authorization reconciler did not drain cleanly: {e}");

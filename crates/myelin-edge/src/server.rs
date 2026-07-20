@@ -18,9 +18,13 @@ use hyper::body::{Body, Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
+use hyper_util::server::graceful::GracefulShutdown;
 use std::convert::Infallible;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
@@ -44,6 +48,14 @@ type EdgeBody = BoxBody<Bytes, std::io::Error>;
 /// KiB is plenty) from the large git wire routes, tightening the ceiling on everything that is not a
 /// packfile push. Until then this single front-door ceiling is the floor.
 const MAX_REQUEST_BODY_BYTES: usize = 100 * 1024 * 1024;
+
+/// Result of a requested listener shutdown. A forced result means the grace deadline expired and
+/// the remaining connection tasks were aborted; the count is the number active when draining began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    Graceful { connections: usize },
+    Forced { connections: usize },
+}
 
 /// Why a bounded collect stopped short of returning the full body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,21 +98,89 @@ where
 /// **Serve the edge over a bound TCP listener.** Accepts connections forever, serving each over
 /// HTTP/1.1 with the gateway. Returns only on an accept error.
 pub async fn serve_edge(listener: TcpListener, gateway: Arc<Gateway>) -> std::io::Result<()> {
-    loop {
-        let (stream, _peer) = listener.accept().await?;
-        let io = TokioIo::new(stream);
-        let gw = gateway.clone();
-        tokio::spawn(async move {
-            let service = service_fn(move |req: Request<Incoming>| {
-                let gw = gw.clone();
-                async move { Ok::<_, Infallible>(handle_connection(gw, req).await) }
-            });
-            // serve_connection drives request/response (incl. streaming the SSE body) on this conn.
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await;
-        });
+    serve_edge_until_shutdown(
+        listener,
+        gateway,
+        std::future::pending::<()>(),
+        Duration::from_secs(20),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Serve until `shutdown` resolves, then close the listener, gracefully finish active HTTP/1
+/// connections, and abort only those still open after `grace`. The shutdown future's output is
+/// returned to the owner so signal-handler failures remain distinguishable from transport failures.
+pub async fn serve_edge_until_shutdown<F, T>(
+    listener: TcpListener,
+    gateway: Arc<Gateway>,
+    shutdown: F,
+    grace: Duration,
+) -> std::io::Result<(ShutdownOutcome, T)>
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(shutdown);
+    let graceful = GracefulShutdown::new();
+    let mut connections = JoinSet::new();
+    let mut accept_error = None;
+
+    let shutdown_output = loop {
+        tokio::select! {
+            biased;
+            output = &mut shutdown => break Some(output),
+            accepted = listener.accept() => {
+                let (stream, _peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        accept_error = Some(error);
+                        break None;
+                    }
+                };
+                let io = TokioIo::new(stream);
+                let gw = gateway.clone();
+                let watcher = graceful.watcher();
+                connections.spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let gw = gw.clone();
+                        async move { Ok::<_, Infallible>(handle_connection(gw, req).await) }
+                    });
+                    let connection = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service);
+                    let _ = watcher.watch(connection).await;
+                });
+            }
+            completed = connections.join_next(), if !connections.is_empty() => {
+                let _ = completed;
+            }
+        }
+    };
+
+    // Dropping the listener happens here, before any drain wait, so no new socket can enter.
+    drop(listener);
+    let active = graceful.count();
+    let outcome = if tokio::time::timeout(grace, graceful.shutdown())
+        .await
+        .is_ok()
+    {
+        ShutdownOutcome::Graceful {
+            connections: active,
+        }
+    } else {
+        connections.abort_all();
+        ShutdownOutcome::Forced {
+            connections: active,
+        }
+    };
+    while connections.join_next().await.is_some() {}
+
+    if let Some(error) = accept_error {
+        return Err(error);
     }
+    Ok((
+        outcome,
+        shutdown_output.expect("shutdown output exists when the accept loop did not fail"),
+    ))
 }
 
 /// Convert one hyper request → [`EdgeRequest`], run the gateway, convert the response back.
