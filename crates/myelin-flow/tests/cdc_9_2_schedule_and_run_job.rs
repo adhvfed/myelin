@@ -33,8 +33,8 @@ use myelin_events::{
 };
 use myelin_flow::engine::{SignalRow, SignalStore};
 use myelin_flow::{
-    job_idem_token, ActivityError, JobKind, JobOutcome, JobRunner, JobSpec, WfCtx, WfJournal,
-    JOB_DONE_SIGNAL,
+    job_idem_token, ActivityError, JobKind, JobOutcome, JobRunner, JobSpec, TimerStore, WfCtx,
+    WfJournal, JOB_DONE_SIGNAL,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
@@ -150,9 +150,10 @@ fn provider_dispatches_into_the_runner_and_parks_consumer_sees_the_token() {
     let outbox = OutboxStore::new();
     let journal = WfJournal::new();
     let signals = SignalStore::new();
+    let timers = TimerStore::new();
     let runner = UnifiedRunner::new(SimHands);
 
-    let mut ctx = begin(&outbox, journal, signals);
+    let mut ctx = begin(&outbox, journal, signals).with_timers(timers.clone(), 0, 1_000);
     let out = ctx
         .schedule_and_run_job(
             JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"),
@@ -163,6 +164,11 @@ fn provider_dispatches_into_the_runner_and_parks_consumer_sees_the_token() {
 
     // PROVIDER promise: the long-park parks (the runner is running the job; the run holds no runtime).
     assert_eq!(out, JobOutcome::Parked, "dispatched, parked on job.done");
+    assert_eq!(
+        timers.armed_count(),
+        1,
+        "the timed dispatch arms its durable SLA timer"
+    );
 
     // CONSUMER (runner) saw the engine's DETERMINISTIC token (the agreement, §4.9).
     let consumer_token = job_idem_token("R1", "merge.queue:0");
