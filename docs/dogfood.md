@@ -201,7 +201,8 @@ Production also requires a `rediss://` `REDIS_URL`: browser sessions—including
 are stored in the region-local Valkey service, so plaintext `redis://` is accepted only by local
 development and tests. Startup fails before accepting traffic when either required setting is missing
 or insecure. Use `/healthz` for process liveness and `/readyz` for traffic readiness; the latter
-returns 503 whenever the session backend is unavailable.
+performs a short-lived namespaced write/read/script/delete probe and returns 503 whenever the session
+backend is unavailable or its production ACL cannot perform real session operations.
 
 ## 6a. Solo-operator merges (branch protection)
 
