@@ -81,6 +81,78 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  web-container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IMAGE: myelin-web:ci
+      SMOKE_CONTAINER: myelin-web-smoke
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Build the digest-pinned production web image
+        run: docker build --file frontend/apps/web/Dockerfile --tag "$IMAGE" .
+      - name: Reject a production container without an explicit edge upstream
+        run: |
+          if docker run --rm \
+            --env REDIS_URL=rediss://127.0.0.1:1 \
+            --env MYELIN_PUBLIC_ORIGIN=https://myelin.example \
+            "$IMAGE"; then
+            echo "production image started without MYELIN_EDGE_URL" >&2
+            exit 1
+          fi
+      - name: Start the hardened production container
+        run: |
+          test "$(docker image inspect --format '{{.Config.User}}' "$IMAGE")" = node
+          docker run --detach --name "$SMOKE_CONTAINER" \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --publish 127.0.0.1:3000:3000 \
+            --env REDIS_URL=rediss://127.0.0.1:1 \
+            --env MYELIN_PUBLIC_ORIGIN=https://myelin.example \
+            --env MYELIN_EDGE_URL=http://edge.internal:8080 \
+            --env MYELIN_HSTS=1 \
+            "$IMAGE"
+      - name: Smoke liveness, readiness, ingress, assets, and SIGTERM
+        run: |
+          live=0
+          for attempt in $(seq 1 40); do
+            if curl --silent --fail \
+              --header 'x-forwarded-proto: https' \
+              http://127.0.0.1:3000/healthz >/dev/null; then
+              live=1
+              break
+            fi
+            sleep 0.25
+          done
+          if [ "$live" -ne 1 ]; then
+            docker logs "$SMOKE_CONTAINER"
+            exit 1
+          fi
+
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --header 'x-forwarded-proto: https' http://127.0.0.1:3000/healthz)" = 200
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --header 'x-forwarded-proto: https' http://127.0.0.1:3000/readyz)" = 503
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            http://127.0.0.1:3000/healthz)" = 308
+
+          asset_path=$(docker exec "$SMOKE_CONTAINER" node -e \
+            "const fs=require('node:fs');const f=fs.readdirSync('/app/public/_build/assets').find(n=>n.endsWith('.js'));if(!f)process.exit(1);console.log('/_build/assets/'+f)")
+          asset_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --header 'x-forwarded-proto: https' "http://127.0.0.1:3000${asset_path}")
+          test "$asset_status" = 200
+
+          docker stop --timeout 10 "$SMOKE_CONTAINER"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$SMOKE_CONTAINER")" = 0
+      - name: Remove the smoke container
+        if: always()
+        run: |
+          if docker inspect "$SMOKE_CONTAINER" >/dev/null 2>&1; then
+            docker rm --force "$SMOKE_CONTAINER"
+          fi
+
   architecture-lints:
     # The committed-lint ratchet (contract 1.6). LOUD: the gate is the binary exit code + the
     # myelin-lints tests; there is deliberately NO `|| true` / `continue-on-error` anywhere.

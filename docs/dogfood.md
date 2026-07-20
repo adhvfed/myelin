@@ -214,6 +214,8 @@ Production accepts only the exact value `https`: insecure GET/HEAD requests rece
 `MYELIN_PUBLIC_ORIGIN`, while insecure writes are rejected without replaying their bodies. Point
 external health checks through that ingress (or include its trusted HTTPS assertion on private
 probes); direct requests without the assertion intentionally do not reach application routes.
+See [`web-deployment.md`](web-deployment.md) for the reproducible OCI build and hardened runtime
+contract.
 
 ## 6a. Solo-operator merges (branch protection)
 
