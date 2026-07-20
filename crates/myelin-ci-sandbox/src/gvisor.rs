@@ -44,6 +44,7 @@ use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -62,6 +63,7 @@ fn runsc_bin() -> String {
 /// still dropped to this non-root uid/gid in the OCI config so it never runs as root in the sandbox.
 const UNTRUSTED_UID: u32 = 65534;
 const UNTRUSTED_GID: u32 = 65534;
+static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 /// The OCI runtime config (`config.json`) the gVisor `runsc` path consumes, built from a [`JobSpec`]
 /// and the mandatory [`HardeningProfile`]. Every hardening field maps to a real OCI posture: the
@@ -626,8 +628,11 @@ fn run_production_container(spec: &JobSpec, cfg: &OciConfig) -> Result<Container
         &container_id,
         timeout,
         spec.limits.mem_bytes,
-        None, // CI/agent jobs receive no stdin (the git-wire path supplies the request body).
-        StdoutMode::CappedHead, // CI/agent logs: the byte-unchanged 256 KiB head capture.
+        RunCaptureOptions {
+            stdin: None, // CI/agent jobs receive no stdin (the git-wire path supplies the body).
+            stdout_mode: StdoutMode::CappedHead,
+            cancellation: &NEVER_CANCELLED,
+        },
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -750,9 +755,13 @@ fn run_and_capture(
     container_id: &str,
     timeout: Duration,
     mem_bytes: u64,
-    stdin: Option<Vec<u8>>,
-    stdout_mode: StdoutMode,
+    options: RunCaptureOptions<'_>,
 ) -> Result<RunscOutcome, String> {
+    let RunCaptureOptions {
+        stdin,
+        stdout_mode,
+        cancellation,
+    } = options;
     // CT-003b (SI-017): establish the OUT-OF-BAND memory cgroup BEFORE spawning runsc and FAIL
     // CLOSED if it cannot be established (rootless runsc would otherwise run the workload's anonymous
     // memory UNBOUNDED — a host-DoS escape). The cgroup is torn down on every path (its `Drop`).
@@ -821,7 +830,8 @@ fn run_and_capture(
         if let Some(c) = read_proc_cpu_seconds(pid) {
             last_cpu = Some(c);
         }
-        if start.elapsed() >= timeout {
+        let cancelled = cancellation.load(Ordering::Acquire);
+        if cancelled || start.elapsed() >= timeout {
             // Wall-clock ceiling hit: whole-CONTAINER kill (SIGKILL the container's PID1 via the
             // runtime), then reap the `runsc` child process so the pipes hit EOF.
             let _ = Command::new(bin)
@@ -832,7 +842,7 @@ fn run_and_capture(
                 .output();
             let _ = child.kill();
             let _ = child.wait();
-            timed_out = true;
+            timed_out = !cancelled;
             break None;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -873,6 +883,12 @@ enum StdoutMode {
     /// chunk regardless of pack size), then materialize back. Over `bound` ⇒ the returned `truncated`
     /// flag is set and the wire seam refuses loudly.
     StreamToFile { bound: usize },
+}
+
+struct RunCaptureOptions<'a> {
+    stdin: Option<Vec<u8>>,
+    stdout_mode: StdoutMode,
+    cancellation: &'a AtomicBool,
 }
 
 /// **Drain a child stream straight to a host TEMP FILE under a generous byte cap (the git-wire path,
@@ -1580,7 +1596,23 @@ impl GvisorBackend {
         command.push("git".to_string());
         command.extend(spec.git_argv.iter().cloned());
         command.push(WIRE_REPO_MOUNT.to_string());
-        self.launch_git_command(spec, hooks, command)
+        self.launch_git_command(spec, hooks, command, &NEVER_CANCELLED)
+    }
+
+    /// Git-wire launch with cooperative process-shutdown cancellation. Once `cancellation` becomes
+    /// true, the wait loop kills container PID 1 and reaps `runsc` exactly like a wall timeout, but
+    /// does not misreport the operator-requested cancellation as a timeout.
+    pub fn launch_git_wire_until_cancelled(
+        &self,
+        spec: &GitWireSpec,
+        hooks: &RunnerHooks,
+        cancellation: &AtomicBool,
+    ) -> Result<SandboxLaunch, WireError> {
+        let mut command = Vec::with_capacity(spec.git_argv.len() + 2);
+        command.push("git".to_string());
+        command.extend(spec.git_argv.iter().cloned());
+        command.push(WIRE_REPO_MOUNT.to_string());
+        self.launch_git_command(spec, hooks, command, cancellation)
     }
 
     /// **Ingest a pushed packfile in the hardened sandbox (CT-006d — the push write path's untrusted-pack
@@ -1603,7 +1635,22 @@ impl GvisorBackend {
             "-c".to_string(),
             RECEIVE_PACK_INGEST_SCRIPT.to_string(),
         ];
-        self.launch_git_command(spec, hooks, command)
+        self.launch_git_command(spec, hooks, command, &NEVER_CANCELLED)
+    }
+
+    /// Receive-pack ingest with the same cooperative shutdown cancellation as wire serving.
+    pub fn launch_git_receive_pack_until_cancelled(
+        &self,
+        spec: &GitWireSpec,
+        hooks: &RunnerHooks,
+        cancellation: &AtomicBool,
+    ) -> Result<SandboxLaunch, WireError> {
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            RECEIVE_PACK_INGEST_SCRIPT.to_string(),
+        ];
+        self.launch_git_command(spec, hooks, command, cancellation)
     }
 
     /// The shared git-wire launch body (CT-006a/d): bound stdin, symlink-confine the repo, build the
@@ -1616,7 +1663,13 @@ impl GvisorBackend {
         spec: &GitWireSpec,
         hooks: &RunnerHooks,
         command: Vec<String>,
+        cancellation: &AtomicBool,
     ) -> Result<SandboxLaunch, WireError> {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(WireError::Runtime(
+                "Git wire launch cancelled by process shutdown".into(),
+            ));
+        }
         // Bound the request body BEFORE anything spawns (a client cannot force unbounded host buffering).
         if spec.stdin.len() > WIRE_STDIN_BOUND {
             return Err(WireError::StdinTooLarge {
@@ -1687,7 +1740,7 @@ impl GvisorBackend {
                 result,
             },
             stdout_truncated,
-        ) = run_git_wire_container(&job, &cfg, spec.stdin.clone(), &rootfs)
+        ) = run_git_wire_container(&job, &cfg, spec.stdin.clone(), &rootfs, cancellation)
             .map_err(WireError::Runtime)?;
 
         // FAIL LOUD at the seam (CT-006c FU-1): if the response overflowed the generous wire cap, the
@@ -1726,6 +1779,7 @@ fn run_git_wire_container(
     cfg: &OciConfig,
     stdin: Vec<u8>,
     rootfs: &Path,
+    cancellation: &AtomicBool,
 ) -> Result<(ContainerRun, bool), String> {
     let bin = runsc_bin();
     if !rootfs.exists() {
@@ -1755,8 +1809,11 @@ fn run_git_wire_container(
         &container_id,
         timeout,
         job.limits.mem_bytes,
-        Some(stdin),
-        StdoutMode::StreamToFile { bound: wire_cap },
+        RunCaptureOptions {
+            stdin: Some(stdin),
+            stdout_mode: StdoutMode::StreamToFile { bound: wire_cap },
+            cancellation,
+        },
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -2081,6 +2138,37 @@ mod tests {
         };
         let r = backend.launch_with(&spec(vec![]), &hooks, |_spec, _cfg| Ok(fake_run()));
         assert!(matches!(r, Err(GvisorError::Hook(_))));
+    }
+
+    #[test]
+    fn cancelled_git_wire_refuses_before_reserve_or_spawn() {
+        let cancelled = AtomicBool::new(true);
+        let spec = GitWireSpec {
+            repo_host_path: PathBuf::from("/absent/repo.git"),
+            root: PathBuf::from("/absent"),
+            git_argv: vec!["upload-pack".into()],
+            stdin: Vec::new(),
+            env: Vec::new(),
+            quarantine_host_path: None,
+            limits: ResourceLimits {
+                cpu_millis: 1,
+                mem_bytes: 1,
+                disk_bytes: 1,
+                pids_max: 1,
+                timeout_secs: 1,
+            },
+            run_token: RunTokenRef { jti: "cancel".into() },
+            meter_to: MeterTarget { reserve_id: "cancel".into() },
+            idem_token: IdemToken("cancel".into()),
+        };
+        let result = GvisorBackend::new().launch_git_wire_until_cancelled(
+            &spec,
+            &ok_hooks(),
+            &cancelled,
+        );
+        assert!(
+            matches!(result, Err(WireError::Runtime(message)) if message.contains("cancelled by process shutdown"))
+        );
     }
 
     /// **CT-006b 4a — symlink-path defence in depth (no runsc needed).** A textually-clean repo

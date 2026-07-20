@@ -51,7 +51,7 @@ use std::{
     io::Write,
     path::{Component, Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -678,6 +678,7 @@ async fn serve(core: ComposedCore, git_root: PathBuf, git_wire: GitWireRuntime) 
 
     // The Git subsystem over the DURABLE on-disk backend (GT-003), rooted at the validated absolute
     // `MYELIN_GIT_ROOT`. Startup rejected missing, relative, root, and OS-temp paths before migrations.
+    let git_shutdown = Arc::new(AtomicBool::new(false));
     let git_backend = Arc::new(
         DurableGitBackend::rooted(
             git_root,
@@ -692,7 +693,8 @@ async fn serve(core: ComposedCore, git_root: PathBuf, git_wire: GitWireRuntime) 
             std::process::exit(1);
         })
         .with_repo_authorizer(repo_authz)
-        .with_repo_bootstrap(repo_bootstrap),
+        .with_repo_bootstrap(repo_bootstrap)
+        .with_git_shutdown_signal(git_shutdown.clone()),
     );
     let recovery = recover_placed_git_at_boot(&git_backend, &provider, &cell_id)
         .await
@@ -750,11 +752,16 @@ async fn serve(core: ComposedCore, git_root: PathBuf, git_wire: GitWireRuntime) 
     let issue_reconciler =
         spawn_issue_authorization_reconciler(issue_store, check, issue_reconciliation_config);
     eprintln!("edge: listening on {addr}");
+    let git_shutdown_for_signal = git_shutdown.clone();
     let server_result = serve_edge_until_shutdown_with_probe(
         listener,
         gateway,
         readiness,
-        shutdown_signal(),
+        async move {
+            let result = shutdown_signal().await;
+            git_shutdown_for_signal.store(true, Ordering::Release);
+            result
+        },
         EDGE_SHUTDOWN_GRACE,
     )
     .await

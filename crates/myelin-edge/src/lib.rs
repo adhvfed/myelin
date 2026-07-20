@@ -115,7 +115,10 @@ pub use git_durable::{
 };
 pub use git_edge::{register_git, GitEdgeState};
 pub use git_effect::GitEffectApi;
-pub use git_wire_exec::{production_git_core, production_git_core_default, GitWireExecutor};
+pub use git_wire_exec::{
+    production_git_core, production_git_core_default, production_git_core_default_with_shutdown,
+    production_git_core_with_shutdown, GitWireExecutor,
+};
 pub use git_wire_http::register_git_wire;
 pub use issue_authz::{
     spawn_issue_authorization_reconciler, IdentityIssueTupleWriter, IssueReconciliationConfig,

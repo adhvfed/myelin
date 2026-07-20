@@ -92,7 +92,8 @@ fn production_edge_owns_the_durable_issue_saga_worker_without_an_in_memory_fallb
     assert!(main.contains("myelin_issues::PgIssueStore::new("));
     assert!(main.contains("register_issues("));
     assert!(main.contains("spawn_issue_authorization_reconciler("));
-    assert!(main.contains("shutdown_signal(),"));
+    assert!(main.contains("let result = shutdown_signal().await;"));
+    assert!(main.contains("git_shutdown_for_signal.store(true, Ordering::Release)"));
     assert!(main.contains("EDGE_SHUTDOWN_GRACE"));
     assert!(main.contains("ShutdownOutcome::Forced"));
     assert!(main.contains("serve_edge_until_shutdown_with_probe("));
