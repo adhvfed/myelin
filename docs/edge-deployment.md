@@ -92,3 +92,5 @@ If handler response metadata cannot be rendered as valid HTTP, the adapter fails
 generic canonical 500 envelope; invalid metadata can never degrade into a successful empty response.
 Handlers also cannot supply framing or hop-by-hop headers, `Content-Type`, or `X-Request-Id`; those
 remain transport-owned so an application response cannot create ambiguous framing or spoof identity.
+Byte responses are restricted to JSON, plain text, opaque downloads, and the four Git smart-HTTP
+media types; active browser content such as HTML, SVG, or JavaScript fails closed as an internal error.

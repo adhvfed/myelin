@@ -29,6 +29,11 @@ fn edge_response_render_failures_never_become_false_successes() {
         "\"transfer-encoding\"",
         "\"connection\"",
         "\"x-request-id\"",
+        "fn response_content_type_is_safe(content_type: &str)",
+        "\"application/octet-stream\"",
+        "\"text/plain; charset=utf-8\"",
+        "\"application/x-git-upload-pack-result\"",
+        "\"application/x-git-receive-pack-result\"",
     ] {
         assert!(server.contains(required), "response framing guard drift: {required}");
     }
