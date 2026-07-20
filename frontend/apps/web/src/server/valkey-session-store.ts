@@ -1,3 +1,5 @@
+import { randomBytes } from "node:crypto";
+
 import Redis from "ioredis";
 
 import {
@@ -7,7 +9,27 @@ import {
   type SessionStore,
 } from "./session-store";
 
-const KEY_PREFIX = "myelin:web-session:v1:";
+export const SESSION_KEY_PREFIX = "myelin:web-session:v1:";
+
+const VALID_SESSION_LUA = `
+local function valid_record(record)
+  return type(record) == "table"
+    and type(record.token) == "string"
+    and type(record.refreshToken) == "string"
+    and type(record.scheme) == "string"
+    and type(record.principalId) == "string"
+    and type(record.displayName) == "string"
+    and type(record.region) == "string"
+    and type(record.tenant) == "string"
+end
+local function valid_session(session)
+  return type(session) == "table"
+    and valid_record(session.record)
+    and type(session.createdAtMs) == "number"
+    and type(session.lastSeenAtMs) == "number"
+    and type(session.expiresAtMs) == "number"
+end
+`;
 
 const ISSUE_SCRIPT = `
 local clock = redis.call("TIME")
@@ -37,10 +59,14 @@ redis.call("DEL", KEYS[2])
 return 1
 `;
 
-const GET_SCRIPT = `
+const GET_SCRIPT = `${VALID_SESSION_LUA}
 local raw = redis.call("GET", KEYS[1])
 if not raw then return nil end
-local session = cjson.decode(raw)
+local decoded, session = pcall(cjson.decode, raw)
+if not decoded or not valid_session(session) then
+  redis.call("DEL", KEYS[1])
+  return nil
+end
 local clock = redis.call("TIME")
 local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
 local idle = tonumber(ARGV[1])
@@ -54,10 +80,14 @@ redis.call("SET", KEYS[1], cjson.encode(session), "PX", ttl)
 return cjson.encode(session.record)
 `;
 
-const UPDATE_TOKEN_SCRIPT = `
+const UPDATE_TOKEN_SCRIPT = `${VALID_SESSION_LUA}
 local raw = redis.call("GET", KEYS[1])
 if not raw then return 0 end
-local session = cjson.decode(raw)
+local decoded, session = pcall(cjson.decode, raw)
+if not decoded or not valid_session(session) then
+  redis.call("DEL", KEYS[1])
+  return 0
+end
 local clock = redis.call("TIME")
 local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
 local idle = tonumber(ARGV[2])
@@ -69,6 +99,17 @@ session.record.token = ARGV[1]
 session.lastSeenAtMs = now
 local ttl = math.floor(math.min(idle, session.expiresAtMs - now))
 redis.call("SET", KEYS[1], cjson.encode(session), "PX", ttl)
+return 1
+`;
+
+const READY_SCRIPT = `
+local clock = redis.call("TIME")
+local encoded = cjson.encode({ checkedAt = clock[1] })
+redis.call("SET", KEYS[1], encoded, "PX", 5000)
+local raw = redis.call("GET", KEYS[1])
+local decoded, value = pcall(cjson.decode, raw)
+redis.call("DEL", KEYS[1])
+if not decoded or type(value) ~= "table" or value.checkedAt ~= clock[1] then return 0 end
 return 1
 `;
 
@@ -88,6 +129,7 @@ function validRecord(value: unknown): value is SessionRecord {
 
 export class ValkeySessionStore implements SessionStore {
   readonly #redis: Redis;
+  #outageReported = false;
 
   constructor(url: string) {
     this.#redis = new Redis(url, {
@@ -95,9 +137,16 @@ export class ValkeySessionStore implements SessionStore {
       maxRetriesPerRequest: 1,
       retryStrategy: (attempt) => Math.min(attempt * 100, 2_000),
     });
-    // Connection errors surface to the operation that is already failing closed. Registering a
-    // listener prevents ioredis from treating background reconnect errors as unhandled events.
-    this.#redis.on("error", () => {});
+    // Report once per outage without logging the URL or credentials; the operation itself still
+    // fails closed, and a successful reconnect resets the report latch.
+    this.#redis.on("error", () => {
+      if (this.#outageReported) return;
+      this.#outageReported = true;
+      console.error("[web-session] Valkey connection failed; session readiness is unavailable");
+    });
+    this.#redis.on("ready", () => {
+      this.#outageReported = false;
+    });
   }
 
   async issue(id: string, record: SessionRecord): Promise<void> {
@@ -161,11 +210,12 @@ export class ValkeySessionStore implements SessionStore {
   }
 
   async ready(): Promise<void> {
-    const response = await this.#redis.ping();
-    if (response !== "PONG") throw new Error("Valkey session backend did not answer PING");
+    const probeId = `ready:${randomBytes(12).toString("hex")}`;
+    const response = await this.#redis.eval(READY_SCRIPT, 1, this.#key(probeId));
+    if (response !== 1) throw new Error("Valkey session backend failed its read/write/script probe");
   }
 
   #key(id: string): string {
-    return `${KEY_PREFIX}${id}`;
+    return `${SESSION_KEY_PREFIX}${id}`;
   }
 }

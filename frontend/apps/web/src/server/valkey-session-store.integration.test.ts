@@ -1,8 +1,9 @@
 import { randomBytes } from "node:crypto";
 import { afterAll, describe, expect, it } from "vitest";
+import Redis from "ioredis";
 
 import type { SessionRecord } from "./session-store";
-import { ValkeySessionStore } from "./valkey-session-store";
+import { SESSION_KEY_PREFIX, ValkeySessionStore } from "./valkey-session-store";
 
 const redisUrl = process.env.REDIS_URL;
 const stores: ValkeySessionStore[] = [];
@@ -50,6 +51,65 @@ describe.runIf(Boolean(redisUrl))("ValkeySessionStore integration", () => {
     } finally {
       await firstReplica.delete(id);
       await firstReplica.delete(replacementId);
+    }
+  });
+
+  it("deletes corrupt records instead of raising an authentication-path error", async () => {
+    const sessionStore = store();
+    const admin = new Redis(redisUrl!);
+    const corruptRecords = ["{", "{}", JSON.stringify({ record: "bad" })];
+
+    try {
+      for (const [index, value] of corruptRecords.entries()) {
+        const readId = `corrupt_read_${randomBytes(8).toString("hex")}_${index}`;
+        const readKey = `${SESSION_KEY_PREFIX}${readId}`;
+        await admin.set(readKey, value);
+        expect(await sessionStore.get(readId)).toBeNull();
+        expect(await admin.exists(readKey)).toBe(0);
+
+        const updateId = `corrupt_update_${randomBytes(8).toString("hex")}_${index}`;
+        const updateKey = `${SESSION_KEY_PREFIX}${updateId}`;
+        await admin.set(updateKey, value);
+        expect(await sessionStore.updateToken(updateId, "replacement")).toBe(false);
+        expect(await admin.exists(updateKey)).toBe(0);
+      }
+    } finally {
+      admin.disconnect(false);
+    }
+  });
+
+  it("fails readiness when an ACL permits PING/EVAL but denies session primitives", async () => {
+    const admin = new Redis(redisUrl!);
+    const username = `ready_${randomBytes(8).toString("hex")}`;
+    const password = randomBytes(18).toString("base64url");
+    const restrictedUrl = new URL(redisUrl!);
+    restrictedUrl.username = username;
+    restrictedUrl.password = password;
+    let restricted: Redis | undefined;
+    let restrictedStore: ValkeySessionStore | undefined;
+
+    try {
+      await admin.call(
+        "ACL",
+        "SETUSER",
+        username,
+        "reset",
+        "on",
+        `>${password}`,
+        `~${SESSION_KEY_PREFIX}*`,
+        "+ping",
+        "+info",
+        "+eval",
+      );
+      restricted = new Redis(restrictedUrl.toString());
+      restrictedStore = new ValkeySessionStore(restrictedUrl.toString());
+      expect(await restricted.ping()).toBe("PONG");
+      await expect(restrictedStore.ready()).rejects.toThrow();
+    } finally {
+      restricted?.disconnect(false);
+      restrictedStore?.close();
+      await admin.call("ACL", "DELUSER", username);
+      admin.disconnect(false);
     }
   });
 });
