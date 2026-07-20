@@ -195,9 +195,12 @@ web app at the edge:
 The production web server emits its CSP and browser-security headers automatically. Set
 `MYELIN_HSTS=1` only after the public hostname is permanently HTTPS; this opts that hostname into a
 one-year HSTS policy. Leave it unset for local HTTP and initial TLS canaries. Production also requires
-`REDIS_URL`: browser sessions are stored in the region-local Valkey service and startup fails before
-accepting traffic when that durable backend is missing. Use `/healthz` for process liveness and
-`/readyz` for traffic readiness; the latter returns 503 whenever the session backend is unavailable.
+`MYELIN_PUBLIC_ORIGIN` (for example `https://myelin.example`) so every unsafe browser request can be
+checked against the deployment's exact scheme, host, and port. It must be HTTPS and contain no path.
+Production also requires `REDIS_URL`: browser sessions are stored in the region-local Valkey service
+and startup fails before accepting traffic when either required setting is missing. Use `/healthz`
+for process liveness and `/readyz` for traffic readiness; the latter returns 503 whenever the session
+backend is unavailable.
 
 ## 6a. Solo-operator merges (branch protection)
 

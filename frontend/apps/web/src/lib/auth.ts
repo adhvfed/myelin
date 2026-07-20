@@ -1,6 +1,7 @@
 // The session lifecycle as SolidStart server functions (`"use server"` → server-only RPC). The
 // dev-login seam mints a real session; the gateway client + session machinery underneath are REAL —
-// only the token ISSUANCE is the clearly-marked dev stand-in the deferred OIDC login replaces.
+// only the token ISSUANCE is the clearly-marked dev stand-in the deferred OIDC login replaces. The
+// global middleware verifies the full Origin of every unsafe browser request before any action runs.
 import { action, query, redirect } from "@solidjs/router";
 import {
   clearCurrentSession,
@@ -16,8 +17,6 @@ import {
 } from "../../dev-edge/dev-contract.mjs";
 import { devLoginAllowed, type DevLoginEnv } from "./dev-login-guard";
 import { runTokenLogin } from "./token-login";
-import { sameOriginVerdict } from "./csrf";
-import { getRequestEvent } from "solid-js/web";
 import {
   toAuthConfig,
   type AuthConfig,
@@ -34,28 +33,6 @@ export interface Viewer {
   displayName: string;
   tenant: string;
   region: string;
-}
-
-/**
- * CSRF guard for the state-CHANGING login actions (peer-review #21c). `SameSite=Lax` still sends the
- * session cookie on a top-level cross-site form POST, so it does NOT stop a malicious page from
- * submitting our login/logout forms (login-CSRF / session-fixation). We VERIFY THE ORIGIN: read the
- * request's `Origin`/`Referer`/`Host` and reject anything not provably same-origin. Pure decision in
- * {@link sameOriginVerdict}; this wires the real request headers. Read-only actions (`getViewer`,
- * `getAuthConfig`) and the inert `startSso` (a bare redirect, no state change) do not need it.
- */
-function assertSameOrigin(): void {
-  "use server";
-  const req = getRequestEvent()?.request;
-  const headers = req?.headers;
-  const verdict = sameOriginVerdict({
-    origin: headers?.get("origin") ?? null,
-    referer: headers?.get("referer") ?? null,
-    host: headers?.get("host") ?? null,
-  });
-  if (verdict !== "ok") {
-    throw redirect("/login?error=csrf");
-  }
 }
 
 /** Read the current viewer from the httpOnly-cookie session (server-only). */
@@ -118,7 +95,6 @@ function assertDevLoginAllowed(): void {
  */
 export const loginDev = action(async () => {
   "use server";
-  assertSameOrigin();
   // R2.5 — BUILD-TIME kill switch (defense-in-depth ON TOP of the R0.6 runtime guard below). In a
   // production BUILD Vite replaces `import.meta.env.PROD` with the literal `true`, so everything
   // after this `throw` is statically UNREACHABLE — the bundler dead-code-eliminates the dev-token
@@ -178,7 +154,6 @@ export const getAuthConfig = query(async (): Promise<AuthConfig> => {
  */
 export const loginWithToken = action(async (formData: FormData) => {
   "use server";
-  assertSameOrigin();
   const token = String(formData.get("token") ?? "");
   const schemeRaw = formData.get("scheme");
   const result = await runTokenLogin(
@@ -216,7 +191,6 @@ export const startSso = action(async () => {
 /** Log out: clear the server-side session + the cookie, return to /login. */
 export const logout = action(async () => {
   "use server";
-  assertSameOrigin();
   await clearCurrentSession();
   throw redirect("/login");
 }, "logout");
