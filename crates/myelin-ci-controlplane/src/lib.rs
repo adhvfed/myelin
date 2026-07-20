@@ -154,8 +154,8 @@ pub use run_plan::{
 pub mod pg_pipeline_starter;
 pub use pg_pipeline_starter::{
     ci_job_id_v1, decode_ci_claimed_input, CiWorkflowDefinitionPin, ClaimedCiInput,
-    ClaimedCiInputError, PgCiPipelineStarter, PgCiStarterError, StartQueuedOutcome,
-    CI_JOB_ID_V1_DOMAIN,
+    ClaimedCiInputError, PgCiPipelineStarter, PgCiRunStarterFactory, PgCiStarterError,
+    StartQueuedOutcome, CI_JOB_ID_V1_DOMAIN,
 };
 /// CT-004d.2 CULMINATION (chunks 2/3/5): the CI pipeline DRIVER — a pushed CI trigger runs a REAL
 /// pipeline end-to-end. [`ci_pipeline_driver::DurableJobRunner`] (chunk 5) dispatches each stage into
@@ -739,6 +739,36 @@ pub fn ci_job_spec_store(pool: sqlx::PgPool) -> CiJobSpecStore {
 /// exists regardless of which CI service booted first.
 pub fn ci_run_store_factory(pool: sqlx::PgPool) -> CiRunStore {
     CiRunStore::with_pg(pool)
+}
+
+/// **Construct the per-tenant ci_run starter factory at the composition root (CT-004 — the ci_run-poll
+/// STARTER floor).** The service `main` builds this from the MR-022 `SubstrateProvider` pool (after the
+/// migrations have run) + the cell region + the blob CAS, so the runner-lane autonomy wire has a real,
+/// production-callable [`PgCiRunStarterFactory`] that mints an exact-cell [`PgCiPipelineStarter`] for a
+/// discovered run's authoritative tenant. A thin composition seam (over [`PgCiRunStarterFactory::new`])
+/// so the wiring point is named in ONE place. The `ci_run` / `ci_job` / `workflow_run` / `wf_definition`
+/// tables a minted starter reads are created by the migrations both the durable aggregate and the full
+/// [`ci_controlplane_migrations`] apply at boot.
+///
+/// **DORMANT + activation-gated.** `main` composes this behind the SAME `MYELIN_CI_RUNNER` seam the
+/// runner lane uses: while the startup refusal keeps `MYELIN_CI_RUNNER=1` fail-closed, the factory is
+/// constructed but no minted starter is driven (constructing it wraps the pool + blob client only — no
+/// query runs), so no queued run is started yet. The remaining wires the later activation flip closes
+/// are the region-wide queued-run poller that routes each discovered authoritative tenant into
+/// [`PgCiRunStarterFactory::starter_for`] and the myelin-flow M2 durable `RunStore`.
+pub fn ci_run_starter_factory(
+    pool: sqlx::PgPool,
+    region: myelin_tenancy::Region,
+    blobs: std::sync::Arc<dyn myelin_storage::BlobStore + Send + Sync>,
+    rt: tokio::runtime::Handle,
+) -> PgCiRunStarterFactory {
+    PgCiRunStarterFactory::new(
+        pool,
+        rt,
+        std::sync::Arc::new(myelin_events::MonotonicMinter::new()),
+        region,
+        blobs,
+    )
 }
 
 #[cfg(test)]

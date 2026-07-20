@@ -7,9 +7,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use myelin_ci_controlplane::{
-    ci_artifact_ref, ci_job_id_v1, ci_run_ref, CiWorkflowDefinitionPin, PgCiPipelineStarter,
-    ResolvedJobV1, ResolvedRunPlanV1, StartQueuedOutcome, CI_JOB_RUN_LEDGER_INDEX,
-    CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_RUN_DDL,
+    ci_artifact_ref, ci_job_id_v1, ci_run_ref, ci_run_starter_factory, CiWorkflowDefinitionPin,
+    PgCiPipelineStarter, PgCiRunStarterFactory, ResolvedJobV1, ResolvedRunPlanV1, StartQueuedOutcome,
+    CI_JOB_RUN_LEDGER_INDEX, CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_RUN_DDL,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::MonotonicMinter;
@@ -150,6 +150,18 @@ fn starter_with(
         definition,
     )
     .expect("valid exact-cell starter")
+}
+
+// The production composition-root seam (`ci_run_starter_factory`) over the app-role pool + cell region
+// + blob CAS — the exact router the service main composes behind the runner activation gate. It mints a
+// per-tenant `PgCiPipelineStarter` for an explicit authoritative tenant, never enumerating tenants.
+fn factory(pool: &PgPool, blobs: Arc<FsBlobStore>) -> PgCiRunStarterFactory {
+    ci_run_starter_factory(
+        pool.clone(),
+        Region("fr-par".into()),
+        blobs,
+        tokio::runtime::Handle::current(),
+    )
 }
 
 fn flow_executor(pool: &PgPool, tenant: &str) -> PgFlowExecutor {
@@ -473,6 +485,57 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     assert_eq!(visible_job_count(&app, "tenant_a", "fr-par").await, 3);
     assert_eq!(visible_job_count(&app, "tenant_empty", "fr-par").await, 0);
     assert_eq!(visible_job_count(&app, "tenant_a", "de-fra").await, 0);
+
+    // ── CT-004: the per-tenant starter COMPOSITION SEAM (`PgCiRunStarterFactory`) against the real
+    // migrated schema — the exact router the service main composes at the root (dormant behind the
+    // runner activation gate). (a) A factory-minted starter CONSTRUCTS against the live schema and starts
+    // its own tenant's queued run atomically. (b) Per-tenant scoping SURVIVES the seam: a starter minted
+    // for tenant A never discovers or starts tenant B's queued run; a starter minted for B starts B's.
+    // Exercised here while v1 is still the sole active definition (before the fresh-old-pin scenario
+    // registers v2 below).
+    let starters = factory(&app, blobs.clone());
+    assert_eq!(starters.region(), &Region("fr-par".into()));
+
+    let run_fa = "10000000-0000-0000-0000-0000000000fa";
+    let wf_fa = "20000000-0000-0000-0000-0000000000fa";
+    insert_run(&admin, blobs.as_ref(), "tenant_factory_a", run_fa, wf_fa).await;
+    let a_started = starters
+        .starter_for(
+            TenantId("tenant_factory_a".into()),
+            CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
+        )
+        .expect("factory mints an exact-cell starter against the migrated schema")
+        .run_once()
+        .await
+        .expect("factory-minted starter drives run_once");
+    assert!(matches!(a_started, StartQueuedOutcome::Started { .. }));
+    assert_atomic_started(&admin, "tenant_factory_a", run_fa, true, true).await;
+
+    // (b) tenant B has a queued run; the A-minted starter must never see or start it.
+    let run_fb = "10000000-0000-0000-0000-0000000000fb";
+    let wf_fb = "20000000-0000-0000-0000-0000000000fb";
+    insert_run(&admin, blobs.as_ref(), "tenant_factory_b", run_fb, wf_fb).await;
+    let a_starter = starters
+        .starter_for(
+            TenantId("tenant_factory_a".into()),
+            CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
+        )
+        .expect("mint the tenant A starter");
+    assert_eq!(a_starter.run_once().await.unwrap(), StartQueuedOutcome::Idle);
+    assert_atomic_started(&admin, "tenant_factory_b", run_fb, false, false).await;
+
+    // The B-minted starter starts B's run — proving the router binds each record to its own cell.
+    let b_started = starters
+        .starter_for(
+            TenantId("tenant_factory_b".into()),
+            CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
+        )
+        .expect("mint the tenant B starter")
+        .run_once()
+        .await
+        .expect("tenant B starter drives run_once");
+    assert!(matches!(b_started, StartQueuedOutcome::Started { .. }));
+    assert_atomic_started(&admin, "tenant_factory_b", run_fb, true, true).await;
 
     // Exact legacy replay is a byte-for-byte no-op on the complete DAG ledger. Re-open only the
     // lifecycle split that this starter repairs; the existing workflow and all three jobs remain.
