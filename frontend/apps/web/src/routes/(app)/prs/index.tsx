@@ -109,11 +109,11 @@ function Bucket(props: {
             when={items().length > 0}
             fallback={<p data-testid={`${props.testid}-empty`} style={{ margin: "0", color: "var(--text-muted)" }}>{props.emptyText}</p>}
           >
-            <ul role="list" aria-label={`${props.heading}, ${items().length} items`} onKeyDown={onKeyDown} style={{ "list-style": "none", margin: "0", padding: "0", border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)", overflow: "hidden" }}>
+            <ul role="list" aria-label={`${props.heading}, ${items().length} items`} style={{ "list-style": "none", margin: "0", padding: "0", border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)", overflow: "hidden" }}>
               <For each={items()}>
                 {(row, i) => (
-                  <li role="listitem">
-                    <CrossRow row={row} active={active() === i()} setRef={(el) => (rowEls[i()] = el)} onFocus={() => setActive(i())} />
+                  <li>
+                    <CrossRow row={row} active={active() === i()} setRef={(el) => (rowEls[i()] = el)} onFocus={() => setActive(i())} onKeyDown={onKeyDown} />
                   </li>
                 )}
               </For>
@@ -137,7 +137,7 @@ function Bucket(props: {
   );
 }
 
-function CrossRow(props: { row: PrListRowVM; active: boolean; setRef: (el: HTMLAnchorElement) => void; onFocus: () => void }) {
+function CrossRow(props: { row: PrListRowVM; active: boolean; setRef: (el: HTMLAnchorElement) => void; onFocus: () => void; onKeyDown: (event: KeyboardEvent) => void }) {
   const row = () => props.row;
   const repo = () => row().repo ?? "";
   const marker = () => reviewMarker(row());
@@ -147,6 +147,7 @@ function CrossRow(props: { row: PrListRowVM; active: boolean; setRef: (el: HTMLA
       href={`/git/repos/${encodeURIComponent(repo())}/prs/${row().number}`}
       tabindex={props.active ? 0 : -1}
       onFocus={props.onFocus}
+      onKeyDown={props.onKeyDown}
       data-testid="pr-row"
       style={{ display: "grid", "grid-template-columns": "auto 1fr auto", "align-items": "start", gap: "var(--space-3)", padding: "var(--space-3)", "text-decoration": "none", color: "inherit", "border-block-end": "var(--hairline) solid var(--border)" }}
     >

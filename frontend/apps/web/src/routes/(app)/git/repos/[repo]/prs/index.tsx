@@ -274,12 +274,11 @@ function PopulatedOrEmpty(props: {
         <ul
           role="list"
           aria-label={`Pull requests, ${items().length} items`}
-          onKeyDown={onListKeyDown}
           style={{ "list-style": "none", margin: "0", padding: "0" }}
         >
           <For each={items()}>
             {(row, i) => (
-              <li role="listitem">
+              <li>
                 <PrRow
                   row={row}
                   repo={props.repo}
@@ -287,6 +286,7 @@ function PopulatedOrEmpty(props: {
                   active={active() === i()}
                   setRef={(el) => (rowEls[i()] = el)}
                   onFocus={() => setActive(i())}
+                  onKeyDown={onListKeyDown}
                 />
               </li>
             )}
@@ -320,6 +320,7 @@ function PrRow(props: {
   active: boolean;
   setRef: (el: HTMLAnchorElement) => void;
   onFocus: () => void;
+  onKeyDown: (event: KeyboardEvent) => void;
 }) {
   const row = () => props.row;
   const marker = () => reviewMarker(row());
@@ -329,6 +330,7 @@ function PrRow(props: {
       href={`/git/repos/${props.repo}/prs/${row().number}`}
       tabindex={props.active ? 0 : -1}
       onFocus={props.onFocus}
+      onKeyDown={props.onKeyDown}
       data-testid="pr-row"
       style={{
         display: "grid", "grid-template-columns": "auto 1fr auto", "align-items": "start",
