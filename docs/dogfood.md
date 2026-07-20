@@ -28,6 +28,9 @@ database. The Git root must already exist as an absolute directory outside the o
 directory; mount it on durable storage and include it in the backup plan. Startup refuses a missing,
 relative, root-level, temporary, or nonexistent path instead of silently placing repositories under
 `/tmp`. `scripts/dogfood.sh` creates its persistent XDG data directory and exports both values.
+Serving also requires explicit absolute `MYELIN_RUNSC_BIN` and `MYELIN_GVISOR_GIT_ROOTFS` paths. The
+rootfs must contain an executable `usr/bin/git`; a missing gVisor runtime or guest Git now fails
+startup instead of deferring a broken clone/push path until the first request.
 
 ## 1. Bring the data stack up
 

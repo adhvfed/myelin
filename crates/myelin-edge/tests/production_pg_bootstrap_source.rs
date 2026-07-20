@@ -1,5 +1,27 @@
 //! Deployment guards for the Edge binary and founder-dogfood split-credential handoff.
 
+fn git_wire_fixture() -> (std::path::PathBuf, std::path::PathBuf) {
+    let rootfs = std::env::current_dir()
+        .expect("test working directory must exist")
+        .join("target/edge-production-source-rootfs");
+    let guest_git = rootfs.join("usr/bin/git");
+    std::fs::create_dir_all(guest_git.parent().unwrap()).expect("create guest bin directory");
+    std::fs::copy("/bin/true", guest_git).expect("stage executable guest git fixture");
+    let runsc = rootfs.join("runsc-fixture");
+    std::fs::write(&runsc, "#!/bin/sh\necho 'runsc version test-fixture'\n")
+        .expect("write runsc fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runsc, std::fs::Permissions::from_mode(0o755))
+            .expect("make runsc fixture executable");
+    }
+    (
+        rootfs.canonicalize().expect("canonical rootfs fixture"),
+        runsc.canonicalize().expect("canonical runsc fixture"),
+    )
+}
+
 #[test]
 fn production_main_destroys_the_privileged_pool_before_runtime_stores_and_bind() {
     let source = include_str!("../src/main.rs");
@@ -77,6 +99,8 @@ fn production_runtime_identity_and_git_storage_are_explicit_before_database_boot
     assert!(source.contains("PgBootstrap::from_env(Mode::RequireEnv)"));
     assert!(!source.contains("\"cell-dev\".to_string()"));
     assert!(!source.contains(".join(\"myelin-git-data\")"));
+    assert!(source.contains("MYELIN_GVISOR_GIT_ROOTFS"));
+    assert!(source.contains("MYELIN_RUNSC_BIN"));
 }
 
 #[test]
@@ -193,9 +217,12 @@ fn operator_bootstrap_validates_and_grants_the_explicit_issues_project_before_mi
 #[test]
 fn missing_migration_credential_exits_before_bind() {
     let git_root = std::env::current_dir().expect("test working directory must exist");
+    let (git_wire_rootfs, runsc) = git_wire_fixture();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_edge"))
         .env("MYELIN_CELL_ID", "cell-test")
         .env("MYELIN_GIT_ROOT", git_root)
+        .env("MYELIN_GVISOR_GIT_ROOTFS", git_wire_rootfs)
+        .env("MYELIN_RUNSC_BIN", runsc)
         .env("DATABASE_URL", "postgres://runtime.invalid/myelin")
         .env_remove("DATABASE_MIGRATION_URL")
         .env("S3_ENDPOINT", "http://storage.invalid")

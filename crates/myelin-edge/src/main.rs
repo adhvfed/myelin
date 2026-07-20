@@ -157,6 +157,13 @@ struct ComposedCore {
 struct EdgeRuntimeConfig {
     cell_id: String,
     git_root: Option<PathBuf>,
+    git_wire: Option<GitWireRuntime>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GitWireRuntime {
+    rootfs: PathBuf,
+    runsc: PathBuf,
 }
 
 impl EdgeRuntimeConfig {
@@ -206,7 +213,89 @@ impl EdgeRuntimeConfig {
         } else {
             None
         };
-        Ok(Self { cell_id, git_root })
+        let git_wire = if serving {
+            let rootfs = validated_git_wire_rootfs(read("MYELIN_GVISOR_GIT_ROOTFS"))?;
+            let runsc = validated_runsc(read("MYELIN_RUNSC_BIN"))?;
+            Some(GitWireRuntime { rootfs, runsc })
+        } else {
+            None
+        };
+        Ok(Self {
+            cell_id,
+            git_root,
+            git_wire,
+        })
+    }
+}
+
+fn validated_git_wire_rootfs(value: Result<String, VarError>) -> Result<PathBuf, String> {
+    let raw = required_runtime_value("MYELIN_GVISOR_GIT_ROOTFS", value)?;
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err("MYELIN_GVISOR_GIT_ROOTFS must be an absolute path".into());
+    }
+    let path = path.canonicalize().map_err(|error| {
+        format!("MYELIN_GVISOR_GIT_ROOTFS must name an existing directory: {error}")
+    })?;
+    if path.parent().is_none() || !path.is_dir() {
+        return Err("MYELIN_GVISOR_GIT_ROOTFS must resolve to a non-root directory".into());
+    }
+    let git = path.join("usr/bin/git");
+    if !is_executable_file(&git) {
+        return Err(format!(
+            "MYELIN_GVISOR_GIT_ROOTFS must contain executable {}",
+            git.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn validated_executable(
+    name: &'static str,
+    value: Result<String, VarError>,
+) -> Result<PathBuf, String> {
+    let raw = required_runtime_value(name, value)?;
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err(format!("{name} must be an absolute path"));
+    }
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("{name} must name an existing executable: {error}"))?;
+    if !is_executable_file(&path) {
+        return Err(format!("{name} must name an executable file"));
+    }
+    Ok(path)
+}
+
+fn validated_runsc(value: Result<String, VarError>) -> Result<PathBuf, String> {
+    let path = validated_executable("MYELIN_RUNSC_BIN", value)?;
+    let output = std::process::Command::new(&path)
+        .arg("--version")
+        .output()
+        .map_err(|_| "MYELIN_RUNSC_BIN could not execute its version probe".to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() || !stdout.starts_with("runsc version ") {
+        return Err("MYELIN_RUNSC_BIN did not identify itself as runsc".into());
+    }
+    Ok(path)
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
@@ -390,6 +479,7 @@ async fn main() {
             serve(
                 compose_core(runtime.cell_id).await,
                 runtime.git_root.expect("serving config carries a Git root"),
+                runtime.git_wire.expect("serving config carries a Git wire runtime"),
             )
             .await;
         }
@@ -414,7 +504,7 @@ async fn main() {
 // serve — the request-lifecycle gateway (unchanged behaviour; now over the DURABLE cell authority).
 // =================================================================================================
 
-async fn serve(core: ComposedCore, git_root: PathBuf) {
+async fn serve(core: ComposedCore, git_root: PathBuf, git_wire: GitWireRuntime) {
     let ComposedCore {
         provider,
         kms,
@@ -430,6 +520,11 @@ async fn serve(core: ComposedCore, git_root: PathBuf) {
             ready: false,
         }),
     });
+    eprintln!(
+        "edge: validated Git wire sandbox runtime (runsc={}, rootfs={})",
+        git_wire.runsc.display(),
+        git_wire.rootfs.display()
+    );
 
     // The DURABLE transactional outbox (SI-007) for the git backend's ref-CAS co-commit.
     let git_outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
@@ -873,6 +968,27 @@ mod runtime_config_tests {
         })
     }
 
+    fn git_wire_fixture() -> (String, String) {
+        let fixture_id = READINESS_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let rootfs = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/edge-runtime-config-rootfs-{fixture_id}"));
+        let guest_git = rootfs.join("usr/bin/git");
+        std::fs::create_dir_all(guest_git.parent().unwrap()).unwrap();
+        std::fs::copy("/bin/true", &guest_git).unwrap();
+        let runsc = rootfs.join("runsc-fixture");
+        std::fs::write(&runsc, "#!/bin/sh\necho 'runsc version test-fixture'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&runsc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (
+            rootfs.canonicalize().unwrap().display().to_string(),
+            runsc.canonicalize().unwrap().display().to_string(),
+        )
+    }
+
     #[test]
     fn serving_requires_explicit_cell_and_persistent_git_root() {
         assert_eq!(
@@ -885,16 +1001,20 @@ mod runtime_config_tests {
         );
 
         let root = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let (rootfs, runsc) = git_wire_fixture();
         let config = parse(
             true,
             &[
                 ("MYELIN_CELL_ID", " cell-eu-1 ".into()),
                 ("MYELIN_GIT_ROOT", root.display().to_string()),
+                ("MYELIN_GVISOR_GIT_ROOTFS", rootfs),
+                ("MYELIN_RUNSC_BIN", runsc),
             ],
         )
         .unwrap();
         assert_eq!(config.cell_id, "cell-eu-1");
         assert_eq!(config.git_root.as_deref(), Some(root.as_path()));
+        assert!(config.git_wire.is_some());
     }
 
     #[test]
@@ -902,6 +1022,50 @@ mod runtime_config_tests {
         let config = parse(false, &[("MYELIN_CELL_ID", "cell-eu-1".into())]).unwrap();
         assert_eq!(config.cell_id, "cell-eu-1");
         assert_eq!(config.git_root, None);
+        assert_eq!(config.git_wire, None);
+    }
+
+    #[test]
+    fn serving_requires_an_explicit_usable_git_wire_sandbox() {
+        let root = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let base = [
+            ("MYELIN_CELL_ID", "cell-eu-1".into()),
+            ("MYELIN_GIT_ROOT", root.display().to_string()),
+        ];
+        assert_eq!(
+            parse(true, &base).unwrap_err(),
+            "required env var MYELIN_GVISOR_GIT_ROOTFS is not set"
+        );
+
+        let (rootfs, _) = git_wire_fixture();
+        let error = parse(
+            true,
+            &[
+                base[0].clone(),
+                base[1].clone(),
+                ("MYELIN_GVISOR_GIT_ROOTFS", rootfs),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error, "required env var MYELIN_RUNSC_BIN is not set");
+
+        let error = parse(
+            true,
+            &[
+                base[0].clone(),
+                base[1].clone(),
+                ("MYELIN_GVISOR_GIT_ROOTFS", git_wire_fixture().0),
+                (
+                    "MYELIN_RUNSC_BIN",
+                    std::fs::canonicalize("/bin/true")
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                ),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error, "MYELIN_RUNSC_BIN did not identify itself as runsc");
     }
 
     #[test]
