@@ -459,7 +459,7 @@ protection-without-required-checks or manual check-report); (7) wire push path n
 | R4.1 | Cutover acceptance: mirror this repo into Myelin over the real wire; founder PR flow (push→PR→review→merge) against the production edge in a real browser | **DONE + PROVEN** (`82b8fe6` flow, `0325a22` F1/F3/F8/F9 fixes) — wire+API+browser all exercised on the real edge |
 | R4.2 | CT-004 → CT-005 → CT-007 (CI backend, CI surfaces, GitHub-Actions cutover) per ledger 12 | **IN PROGRESS — readable logs proven; execution-plan boundary built but production start remains disabled** |
 | R4.3 | Backup/restore drill (repeating) on real dogfood data | **DONE + PASSING** (`scripts/backup-drill.sh`) |
-| R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **IN PROGRESS — durable store floor only** (`18362f1`, `7a3068b`); production edge/CLI remain intentionally unmounted pending atomic ReBAC tuple bootstrap |
+| R4.4 | Finding-burndown in Myelin's own tracker (minimal issues subsystem) | **ENGINEERING COMPLETE (2026-07-19)** — atomic ReBAC bootstrap landed as an outbox/saga seam; `/v1/issues` mounted in the production edge main + CLI + web; **remaining: live founder dogfood pass (move the burndown out of this ledger)** |
 
 R4 exit gate: 4 consecutive weeks where the founder never needed GitHub for daily work.
 
@@ -474,16 +474,28 @@ The formerly model-only migrations are now production-applicable: concurrent ind
 steps, the invalid expression primary key is a generated-column key, the shared `consumer_dedup` DDL is
 byte-identical to the foundation table, and the Issues main invokes the real provider migrator.
 
-**Honest R4.4 stop:** no `/v1/issues` route or CLI command is registered yet. A create must co-commit (or
+**Honest R4.4 stop (2026-07-18, since RESOLVED — see next paragraph):** no `/v1/issues` route or CLI command was registered yet. A create must co-commit (or
 compensate with a proven transaction seam) the new issue row and its `issue#parent_project` ReBAC tuple;
 Identity currently owns that tuple transaction and exposes no connection-bound atomic bootstrap. Mounting
 the route now would create either an orphan row or an authorization bypass, so the surface stays closed.
 The platform-wide migrate-as-owner/serve-as-app gap now has a shared guarded bootstrap and is live in
 Issues + Edge: production boot requires distinct credentials, performs DDL through the migration-only
 pool, re-validates the NOBYPASSRLS runtime role, closes the privileged pool, and erases its DSN before
-constructing stores or listeners. The remaining production roots still need that rollout. R4.4 remains
-open until the atomic ReBAC seam lands and authenticated create/list/view/close are exercised through
-the real edge + CLI.
+constructing stores or listeners. The remaining production roots still need that rollout.
+
+**R4.4 surface increment (2026-07-19, recorded 2026-07-20 by code-wins reconciliation — the atomic-ReBAC
+blocker above is CLOSED).** The bootstrap seam landed NOT as a connection-bound Identity tx but as an
+honest outbox/saga: one Issues transaction inserts an INVISIBLE issue row + an `issue_authz_binding`
+intent + an `issue.issue.authorization_requested` event (`pg_issue_store.rs`); an async reconciler
+(`spawn_issue_authorization_reconciler`, wired in the production edge main to the real Identity
+`TupleStore::write_tuples` via `issue_authz.rs`) idempotently writes the `issue#parent_project` tuple and
+only then activates visibility — no orphan-row and no authz-bypass window (invisible until the tuple
+exists). `/v1/issues` create/list/view/close are registered unconditionally in the production `run_edge`
+(`issues_http.rs`, `main.rs`), the CLI ships `myelin issues list/create/view/close` (`dispatch.rs`), and
+the web app has a founder issues surface (`routes/(app)/issues/`). Proofs at every layer:
+`integration_issue_routes_pg.rs`, `integration_issue_authorization_reconciler.rs`, CLI grammar tests,
+`tests/e2e/issues.spec.ts`. Remaining for R4.4 EXIT: a live founder dogfood pass — create the open
+burndown items in Myelin's own tracker and stop hosting the burndown in this ledger.
 
 **Production-hardening increment (2026-07-18; foundations are not activation).** The shared PostgreSQL
 outbox now has a capability-minimal JetStream publisher adapter and an advisory-lock-elected drain pass.
@@ -676,6 +688,16 @@ seam gap); required-contexts config alignment is operational. **CT-004f** [log p
 exist, needs live firehose/BlobStore binding], then **CT-005** (surfaces) → **CT-007** (GitHub Actions cutover — the reward). ·
 **CT-004e** check/result producers live → closes the X-1 seam to the merge gate (d) · **CT-004f** log
 pipeline live substrate (a; SSE tail is CT-005) · **CT-004g** fleet/residency (c, optional split).
+
+**CI launch-wire V2 increment (2026-07-18 late, `435bf7c` + `5cb3124`; recorded 2026-07-20 by code-wins
+reconciliation — this landed AFTER the last ledger edit).** A staged V1→V2 migration of the CI plan
+contract: `.myelin/ci.*` now parses to `CiPlanContract::V1` or `::V2` (`ci-dispatch/config.rs`,
+`resolve.rs` — V2 = a resolved request that preserves authored stages and NAMES an execution profile,
+e.g. `execution: { profile: linux-small-v1 }`, without granting runtime authority), resolving to
+`VersionedResolvedSnapshot::V1|V2`. Execution stays fail-closed on V1 only: `run_plan.rs
+load_resolved_run_plan` REFUSES V2 with `RunPlanError::LaunchAuthorityRequired` until durable launch
+authority is materialized; legacy V1 call sites are byte-identical-preserved. Honest state: V2 is an
+authored forward contract, NOT an active execution path; no V1-removal is scheduled.
 
 ## R5–R6
 
