@@ -22,8 +22,9 @@ use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use myelin_edge::{
-    serve_edge, serve_edge_until_shutdown, sse_scope_for_resource, sse_scope_for_tenant, AllowAll,
-    Gateway, Method, ShutdownOutcome, SseEvent, WhoamiHandler,
+    serve_edge, serve_edge_until_shutdown, serve_edge_until_shutdown_with_probe,
+    sse_scope_for_resource, sse_scope_for_tenant, AllowAll, Gateway, Method, ReadinessCheck,
+    ReadinessProbe, ShutdownOutcome, SseEvent, WhoamiHandler,
 };
 use myelin_events::Timestamp;
 use myelin_identity::{
@@ -36,6 +37,7 @@ use myelin_identity_service::{
 use myelin_storage::{KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
@@ -44,6 +46,14 @@ const TENANT: &str = "acme";
 const REGION: &str = "eu-west";
 const OTHER_TENANT: &str = "globex";
 const SCHEME: &str = "agent"; // a TTL-constrained token (no DPoP) — simplest real proof.
+
+struct ToggleReadiness(AtomicBool);
+
+impl ReadinessProbe for ToggleReadiness {
+    fn check(&self) -> ReadinessCheck<'_> {
+        Box::pin(std::future::ready(self.0.load(Ordering::SeqCst)))
+    }
+}
 
 fn now() -> i64 {
     SystemTime::now()
@@ -469,6 +479,47 @@ async fn requested_shutdown_closes_the_listener_without_active_connections() {
     .unwrap();
 
     assert_eq!(outcome, ShutdownOutcome::Graceful { connections: 0 });
+}
+
+#[tokio::test]
+async fn health_endpoints_split_dependency_free_liveness_from_readiness() {
+    let (gateway, _cell, _revocations) = build_gateway();
+    let readiness = Arc::new(ToggleReadiness(AtomicBool::new(false)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let readiness_for_server = readiness.clone();
+    let server = tokio::spawn(async move {
+        serve_edge_until_shutdown_with_probe(
+            listener,
+            gateway,
+            readiness_for_server,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+    });
+
+    let (live, live_body) = http(addr, "GET", "/livez", &[], vec![]).await;
+    let (not_ready, not_ready_body) = http(addr, "GET", "/readyz", &[], vec![]).await;
+    assert_eq!((live, live_body.as_str()), (200, "{\"status\":\"ok\"}"));
+    assert_eq!(
+        (not_ready, not_ready_body.as_str()),
+        (503, "{\"status\":\"not_ready\"}")
+    );
+
+    readiness.0.store(true, Ordering::SeqCst);
+    let (ready, ready_body) = http(addr, "GET", "/readyz", &[], vec![]).await;
+    let (wrong_method, _) = http(addr, "POST", "/readyz", &[], vec![]).await;
+    assert_eq!((ready, ready_body.as_str()), (200, "{\"status\":\"ok\"}"));
+    assert_eq!(wrong_method, 405);
+
+    shutdown_tx.send(()).unwrap();
+    let (outcome, ()) = server.await.unwrap();
+    assert!(matches!(outcome, ShutdownOutcome::Graceful { .. }));
 }
 
 #[tokio::test]

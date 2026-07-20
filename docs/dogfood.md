@@ -46,6 +46,12 @@ durable cell token authority, and serves. It stays in the foreground; run the ne
 terminal. `scripts/dogfood.sh env` keeps `DATABASE_URL` on the constrained `myelin_app` role and
 supplies `DATABASE_MIGRATION_URL` as `myelin_admin`; the edge closes the latter before binding.
 
+Orchestrators may probe `GET /livez` and `GET /readyz` without credentials. Liveness reports only
+whether the HTTP process can respond; it deliberately ignores downstream outages. Readiness performs
+bounded checks against PostgreSQL and the writable durable Git root, returning `503` with no internal
+error details when either critical dependency cannot serve. During termination the edge stops
+accepting sockets, drains HTTP connections for up to 20 seconds, then closes any remaining streams.
+
 ## 3. Mint an operator token (`edge bootstrap`)
 
 ```sh

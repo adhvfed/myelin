@@ -27,11 +27,11 @@
 use myelin_config::Mode;
 use myelin_edge::{
     bootstrap_principal_and_mint, recover_placed_git_at_boot, register_git_durable,
-    register_git_wire, register_issues, serve_edge_until_shutdown,
+    register_git_wire, register_issues, serve_edge_until_shutdown_with_probe,
     spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig,
     AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer, DurableGitBackend,
-    Gateway, IssueReconciliationConfig, Method, ShutdownOutcome, StoreBackedIssueAuthorizer,
-    TupleRepoBootstrap, WhoamiHandler,
+    Gateway, IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, ShutdownOutcome,
+    StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
 };
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{FragmentAdmit, Principal, PrincipalId, PrincipalKind, RevokeTarget};
@@ -47,8 +47,13 @@ use myelin_storage::{
 use myelin_tenancy::{Region, TenantId};
 use std::{
     env::VarError,
-    path::{Component, PathBuf},
-    sync::Arc,
+    fs::OpenOptions,
+    io::Write,
+    path::{Component, Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -60,6 +65,74 @@ use std::{
 /// no-op for them; a real `pat` presented WITH an explicit `pat` scheme header is still DPoP-enforced.
 const EDGE_DEFAULT_TOKEN_SCHEME: &str = "agent";
 const EDGE_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
+const EDGE_READINESS_DEADLINE: Duration = Duration::from_secs(2);
+const EDGE_READINESS_CACHE_TTL: Duration = Duration::from_secs(1);
+static READINESS_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct EdgeReadiness {
+    provider: SubstrateProvider,
+    git_root: PathBuf,
+    state: tokio::sync::Mutex<EdgeReadinessState>,
+}
+
+struct EdgeReadinessState {
+    checked_at: Option<tokio::time::Instant>,
+    ready: bool,
+}
+
+impl ReadinessProbe for EdgeReadiness {
+    fn check(&self) -> ReadinessCheck<'_> {
+        Box::pin(async move {
+            let mut state = self.state.lock().await;
+            if state
+                .checked_at
+                .is_some_and(|checked| checked.elapsed() < EDGE_READINESS_CACHE_TTL)
+            {
+                return state.ready;
+            }
+            let provider = self.provider.clone();
+            let git_root = self.git_root.clone();
+            let database = tokio::time::timeout(
+                EDGE_READINESS_DEADLINE,
+                provider.database_is_ready(),
+            );
+            let filesystem = tokio::time::timeout(
+                EDGE_READINESS_DEADLINE,
+                tokio::task::spawn_blocking(move || git_root_is_writable(&git_root)),
+            );
+            let (database, filesystem) = tokio::join!(database, filesystem);
+            state.ready = matches!(database, Ok(true)) && matches!(filesystem, Ok(Ok(true)));
+            state.checked_at = Some(tokio::time::Instant::now());
+            state.ready
+        })
+    }
+}
+
+fn git_root_is_writable(root: &Path) -> bool {
+    let sequence = READINESS_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let probe = root.join(format!(
+        ".myelin-readiness-{}-{started}-{sequence}",
+        std::process::id(),
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)?;
+        file.write_all(b"ready")?;
+        file.sync_data()?;
+        std::fs::remove_file(&probe)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(probe);
+    }
+    result.is_ok()
+}
 
 // =================================================================================================
 // Shared composition — the config/provider/migrations/KMS/cell-root core BOTH serve and the operator
@@ -349,6 +422,14 @@ async fn serve(core: ComposedCore, git_root: PathBuf) {
         cell_id,
         handle,
     } = core;
+    let readiness = Arc::new(EdgeReadiness {
+        provider: provider.clone(),
+        git_root: git_root.clone(),
+        state: tokio::sync::Mutex::new(EdgeReadinessState {
+            checked_at: None,
+            ready: false,
+        }),
+    });
 
     // The DURABLE transactional outbox (SI-007) for the git backend's ref-CAS co-commit.
     let git_outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
@@ -563,9 +644,10 @@ async fn serve(core: ComposedCore, git_root: PathBuf) {
     let issue_reconciler =
         spawn_issue_authorization_reconciler(issue_store, check, issue_reconciliation_config);
     eprintln!("edge: listening on {addr}");
-    let server_result = serve_edge_until_shutdown(
+    let server_result = serve_edge_until_shutdown_with_probe(
         listener,
         gateway,
+        readiness,
         shutdown_signal(),
         EDGE_SHUTDOWN_GRACE,
     )
@@ -872,5 +954,13 @@ mod runtime_config_tests {
             .unwrap_err(),
             "env var MYELIN_CELL_ID is not valid UTF-8"
         );
+    }
+
+    #[test]
+    fn git_readiness_proves_a_directory_is_durably_writable() {
+        let root = std::env::current_dir().unwrap();
+        assert!(git_root_is_writable(&root));
+        assert!(!git_root_is_writable(&root.join("Cargo.toml")));
+        assert!(!git_root_is_writable(&root.join("definitely-does-not-exist")));
     }
 }
