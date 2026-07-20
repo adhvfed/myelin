@@ -58,6 +58,8 @@ const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const API_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_PUSH_BODY_READ_TIMEOUT: Duration = Duration::from_secs(300);
+const GIT_WIRE_RETRY_AFTER_SECONDS: &str = "1";
+const READINESS_RETRY_AFTER_SECONDS: &str = "5";
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static CONNECTIONS_SHED: AtomicU64 = AtomicU64::new(0);
 
@@ -479,7 +481,12 @@ fn request_body_deadline(path: &str) -> Duration {
 
 fn overloaded() -> Response<EdgeBody> {
     let err = EdgeError::Unavailable("the Git wire service is at capacity; retry later".into());
-    to_hyper(EdgeResponse::error(&err))
+    let mut response = to_hyper(EdgeResponse::error(&err));
+    response.headers_mut().insert(
+        hyper::header::RETRY_AFTER,
+        hyper::header::HeaderValue::from_static(GIT_WIRE_RETRY_AFTER_SECONDS),
+    );
+    response
 }
 
 fn request_timeout(deadline: Duration) -> Response<EdgeBody> {
@@ -501,6 +508,8 @@ fn probe_response(status: u16, body: Vec<u8>) -> Response<EdgeBody> {
         .header("cache-control", "no-store");
     if status == 405 {
         response = response.header("allow", "GET, HEAD");
+    } else if status == 503 {
+        response = response.header("retry-after", READINESS_RETRY_AFTER_SECONDS);
     }
     response
         .body(full_body(body))
