@@ -23,6 +23,12 @@ existing one. **Back it up** somewhere safe and out of the repo (e.g. a password
 cat "${XDG_STATE_HOME:-$HOME/.local/state}/myelin/seal.key"   # copy this to a safe place
 ```
 
+The edge also requires an explicit `MYELIN_CELL_ID` and `MYELIN_GIT_ROOT` before it touches the
+database. The Git root must already exist as an absolute directory outside the operating-system temp
+directory; mount it on durable storage and include it in the backup plan. Startup refuses a missing,
+relative, root-level, temporary, or nonexistent path instead of silently placing repositories under
+`/tmp`. `scripts/dogfood.sh` creates its persistent XDG data directory and exports both values.
+
 ## 1. Bring the data stack up
 
 ```sh
