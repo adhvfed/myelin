@@ -65,7 +65,8 @@ TLS-terminating ingress; do not expose the raw edge port directly to the interne
 
 The listener admits at most 1,024 sockets, allows 10 seconds to finish request headers, accepts at
 most 64 headers with a 64 KiB HTTP buffer, and rejects excess sockets immediately. Ordinary API bodies
-are capped at 1 MiB. Only `git-receive-pack` receives the 100 MiB body budget, with at most eight Git
-pushes admitted concurrently; excess push intake returns 503 so memory use remains bounded.
+are capped at 1 MiB. Only `git-receive-pack` receives the 100 MiB body budget. At most four Git wire
+operations (advertise, fetch, or push) run concurrently; they use the runtime's blocking pool so a
+sandboxed Git process cannot stall health probes or ordinary API traffic. Excess wire work returns 503.
 Ordinary request bodies must finish within 30 seconds; Git push bodies receive a five-minute absolute
 deadline. These are total body-read deadlines, so periodic trickle bytes do not retain intake slots.

@@ -50,7 +50,7 @@ type EdgeBody = BoxBody<Bytes, std::io::Error>;
 const MAX_REQUEST_BODY_BYTES: usize = 100 * 1024 * 1024;
 const MAX_JSON_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 1024;
-const MAX_CONCURRENT_GIT_PUSHES: usize = 8;
+const MAX_CONCURRENT_GIT_WIRE_OPERATIONS: usize = 4;
 const MAX_REQUEST_HEADERS: usize = 64;
 const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -183,7 +183,7 @@ where
     let graceful = GracefulShutdown::new();
     let mut connections = JoinSet::new();
     let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    let git_push_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_PUSHES));
+    let git_wire_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_WIRE_OPERATIONS));
     let mut accept_error = None;
 
     let shutdown_output = loop {
@@ -205,17 +205,17 @@ where
                 let io = TokioIo::new(stream);
                 let gw = gateway.clone();
                 let readiness = readiness.clone();
-                let git_push_slots = git_push_slots.clone();
+                let git_wire_slots = git_wire_slots.clone();
                 let watcher = graceful.watcher();
                 connections.spawn(async move {
                     let _connection_permit = connection_permit;
                     let service = service_fn(move |req: Request<Incoming>| {
                         let gw = gw.clone();
                         let readiness = readiness.clone();
-                        let git_push_slots = git_push_slots.clone();
+                        let git_wire_slots = git_wire_slots.clone();
                         async move {
                             Ok::<_, Infallible>(
-                                handle_connection(gw, readiness, git_push_slots, req).await,
+                                handle_connection(gw, readiness, git_wire_slots, req).await,
                             )
                         }
                     });
@@ -265,7 +265,7 @@ where
 async fn handle_connection(
     gw: Arc<Gateway>,
     readiness: Arc<dyn ReadinessProbe>,
-    git_push_slots: Arc<Semaphore>,
+    git_wire_slots: Arc<Semaphore>,
     req: Request<Incoming>,
 ) -> Response<EdgeBody> {
     let (parts, body) = req.into_parts();
@@ -289,16 +289,17 @@ async fn handle_connection(
         };
         return probe_response(status, body);
     }
-    let body_cap = request_body_cap(&path);
-    let body_deadline = request_body_deadline(&path);
-    let _git_push_permit = if body_cap == MAX_REQUEST_BODY_BYTES {
-        match git_push_slots.try_acquire_owned() {
+    let is_git_wire = is_git_wire_path(&path);
+    let _git_wire_permit = if is_git_wire {
+        match git_wire_slots.try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => return overloaded(),
         }
     } else {
         None
     };
+    let body_cap = request_body_cap(&path);
+    let body_deadline = request_body_deadline(&path);
     let query = parts.uri.query().unwrap_or("").to_string();
     let headers = parts
         .headers
@@ -320,7 +321,23 @@ async fn handle_connection(
         Err(BoundedCollectError::TimedOut) => return request_timeout(body_deadline),
     };
     let edge_req = EdgeRequest::new(method, path, query, headers, bytes);
-    to_hyper(gw.handle(edge_req))
+    let edge_response = if is_git_wire {
+        match tokio::task::spawn_blocking(move || gw.handle(edge_req)).await {
+            Ok(response) => response,
+            Err(_) => EdgeResponse::error(&EdgeError::Internal(
+                "Git wire dispatch task did not complete".into(),
+            )),
+        }
+    } else {
+        gw.handle(edge_req)
+    };
+    to_hyper(edge_response)
+}
+
+fn is_git_wire_path(path: &str) -> bool {
+    path.ends_with("/git-upload-pack")
+        || path.ends_with("/git-receive-pack")
+        || path.ends_with("/info/refs")
 }
 
 fn request_body_cap(path: &str) -> usize {
@@ -340,7 +357,7 @@ fn request_body_deadline(path: &str) -> Duration {
 }
 
 fn overloaded() -> Response<EdgeBody> {
-    let err = EdgeError::Unavailable("the Git push intake is at capacity; retry later".into());
+    let err = EdgeError::Unavailable("the Git wire service is at capacity; retry later".into());
     to_hyper(EdgeResponse::error(&err))
 }
 
@@ -580,6 +597,20 @@ mod tests {
             "/livez",
         ] {
             assert_eq!(request_body_cap(path), MAX_JSON_REQUEST_BODY_BYTES, "{path}");
+        }
+    }
+
+    #[test]
+    fn every_git_wire_endpoint_uses_the_bounded_blocking_pool() {
+        for path in [
+            "/acme/eu-west/widgets.git/info/refs",
+            "/acme/eu-west/widgets.git/git-upload-pack",
+            "/acme/eu-west/widgets.git/git-receive-pack",
+        ] {
+            assert!(is_git_wire_path(path), "{path}");
+        }
+        for path in ["/v1/git/repos", "/v1/issues", "/livez"] {
+            assert!(!is_git_wire_path(path), "{path}");
         }
     }
 

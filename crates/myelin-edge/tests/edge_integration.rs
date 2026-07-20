@@ -23,8 +23,9 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use myelin_edge::{
     serve_edge, serve_edge_until_shutdown, serve_edge_until_shutdown_with_probe,
-    sse_scope_for_resource, sse_scope_for_tenant, AllowAll, Gateway, Method, ReadinessCheck,
-    ReadinessProbe, ShutdownOutcome, SseEvent, WhoamiHandler,
+    sse_scope_for_resource, sse_scope_for_tenant, AllowAll, EdgeError, EdgeResponse, Gateway,
+    Handler, HandlerCtx, Method, ReadinessCheck, ReadinessProbe, ShutdownOutcome, SseEvent,
+    WhoamiHandler,
 };
 use myelin_events::Timestamp;
 use myelin_identity::{
@@ -46,6 +47,17 @@ const TENANT: &str = "acme";
 const REGION: &str = "eu-west";
 const OTHER_TENANT: &str = "globex";
 const SCHEME: &str = "agent"; // a TTL-constrained token (no DPoP) — simplest real proof.
+static SLOW_GIT_STARTED: AtomicBool = AtomicBool::new(false);
+
+struct SlowGitWireHandler;
+
+impl Handler for SlowGitWireHandler {
+    fn handle(&self, _ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        SLOW_GIT_STARTED.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(500));
+        Ok(EdgeResponse::json(200, &serde_json::json!({ "status": "ok" })))
+    }
+}
 
 struct ToggleReadiness(AtomicBool);
 
@@ -117,6 +129,12 @@ fn build_gateway() -> (Arc<Gateway>, CellTokenAuthority, RevocationStore) {
                 "edge.whoami",
                 Arc::new(WhoamiHandler),
             )
+            .route(
+                Method::Get,
+                "/acme/eu-west/widgets.git/info/refs",
+                "git.wire.upload_pack",
+                Arc::new(SlowGitWireHandler),
+            )
             .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge")
             // R2.2: an OBJECT-ADDRESSED stream registers through the scoped path (the tenant-coarse
             // sse_route refuses an object-addressing pattern at composition time).
@@ -133,13 +151,23 @@ fn build_gateway() -> (Arc<Gateway>, CellTokenAuthority, RevocationStore) {
 
 /// Mint a real capability token for `(tenant, subj-1, jti)` expiring at `exp_unix`.
 fn mint(cell: &CellTokenAuthority, tenant: &str, jti: &str, exp_unix: i64) -> String {
+    mint_with_authority(cell, tenant, jti, exp_unix, vec!["edge.operator".into()])
+}
+
+fn mint_with_authority(
+    cell: &CellTokenAuthority,
+    tenant: &str,
+    jti: &str,
+    exp_unix: i64,
+    authority: Vec<String>,
+) -> String {
     cell.mint(&CapabilityMintSpec {
         tenant: tenant.into(),
         region: REGION.into(),
         subject_key: "subj-1".into(),
         jti: jti.into(),
         exp_unix,
-        authority: vec!["edge.operator".into()],
+        authority,
         dpop_jkt: None,
         purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
         audience: myelin_identity_service::CredentialAudience::Edge,
@@ -520,6 +548,60 @@ async fn health_endpoints_split_dependency_free_liveness_from_readiness() {
     shutdown_tx.send(()).unwrap();
     let (outcome, ()) = server.await.unwrap();
     assert!(matches!(outcome, ShutdownOutcome::Graceful { .. }));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_git_wire_dispatch_does_not_stall_liveness() {
+    SLOW_GIT_STARTED.store(false, Ordering::SeqCst);
+    let (gateway, cell, _revocations) = build_gateway();
+    let token = mint_with_authority(
+        &cell,
+        TENANT,
+        "jti-slow-git",
+        now() + 3600,
+        vec!["edge.operator".into(), "git.wire.upload_pack".into()],
+    );
+    let headers = bearer(&token);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_edge(listener, gateway).await;
+    });
+
+    let slow_headers = headers.clone();
+    let started = std::time::Instant::now();
+    let slow = tokio::spawn(async move {
+        http(
+            addr,
+            "GET",
+            "/acme/eu-west/widgets.git/info/refs",
+            &hdr(&slow_headers),
+            vec![],
+        )
+        .await
+    });
+    let handler_started = tokio::time::timeout(Duration::from_secs(1), async {
+        while !SLOW_GIT_STARTED.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if handler_started.is_err() {
+        if slow.is_finished() {
+            let outcome = slow.await.expect("slow request task");
+            panic!("Git handler was bypassed; response was {outcome:?}");
+        }
+        panic!("the blocking Git handler did not start within one second");
+    }
+
+    let (status, body) = http(addr, "GET", "/livez", &[], vec![]).await;
+    assert_eq!((status, body.as_str()), (200, "{\"status\":\"ok\"}"));
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "liveness must not wait for the 500 ms blocking Git operation"
+    );
+    let (slow_status, _) = slow.await.unwrap();
+    assert_eq!(slow_status, 200);
 }
 
 #[tokio::test]
