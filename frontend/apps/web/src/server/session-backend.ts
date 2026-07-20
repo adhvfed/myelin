@@ -8,11 +8,24 @@ export type SessionBackend =
 
 export function sessionBackend(production: boolean, redisUrl: string | undefined): SessionBackend {
   const url = redisUrl?.trim();
-  if (url) return { kind: "valkey", url };
-  if (production) {
+  if (!url) {
+    if (!production) return { kind: "memory" };
     throw new Error("REDIS_URL is required for durable production web sessions");
   }
-  return { kind: "memory" };
+
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error("REDIS_URL must be an absolute redis:// or rediss:// URL");
+  }
+  if ((parsed.protocol !== "redis:" && parsed.protocol !== "rediss:") || !parsed.hostname) {
+    throw new Error("REDIS_URL must be an absolute redis:// or rediss:// URL");
+  }
+  if (production && parsed.protocol !== "rediss:") {
+    throw new Error("REDIS_URL must use rediss:// TLS in production");
+  }
+  return { kind: "valkey", url };
 }
 
 export function createSessionStore(backend: SessionBackend): SessionStore {

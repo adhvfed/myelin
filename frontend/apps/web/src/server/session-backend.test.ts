@@ -19,6 +19,22 @@ describe("sessionBackend", () => {
     });
   });
 
+  it("requires TLS for production session credentials", () => {
+    expect(() => sessionBackend(true, "redis://cache.example:6379/0")).toThrow(
+      "REDIS_URL must use rediss:// TLS in production",
+    );
+  });
+
+  it.each([
+    "not a URL",
+    "https://cache.example",
+    "redis://",
+  ])("rejects an invalid Valkey URL: %s", (url) => {
+    expect(() => sessionBackend(false, url)).toThrow(
+      "REDIS_URL must be an absolute redis:// or rediss:// URL",
+    );
+  });
+
   it("keeps the hermetic memory backend for local development", () => {
     expect(sessionBackend(false, undefined)).toEqual({ kind: "memory" });
   });
