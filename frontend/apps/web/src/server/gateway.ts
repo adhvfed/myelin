@@ -16,27 +16,25 @@ import {
   getSessionRecord,
   updateSessionToken,
 } from "./session";
+import { edgeOrigin } from "./edge-origin";
 
 export { GatewayError, Unauthorized } from "./gateway-core";
 
-function edgeUrl(): string {
-  return process.env.MYELIN_EDGE_URL ?? "http://127.0.0.1:8787";
-}
+export const DEFAULT_EDGE_REQUEST_TIMEOUT_MS = 15_000;
 
 export interface GatewayRequestOptions {
-  /** One deadline signal spans the edge attempt, token refresh, and single retry. */
+  /** One deadline spans the edge attempt, token refresh, and single retry. Defaults to 15 seconds. */
   signal?: AbortSignal;
   timeoutMs?: number;
 }
 
-export function gatewayRequestSignal(options: GatewayRequestOptions = {}): AbortSignal | undefined {
-  const signals: AbortSignal[] = [];
-  if (options.signal) signals.push(options.signal);
-  if (options.timeoutMs !== undefined && options.timeoutMs > 0) {
-    signals.push(AbortSignal.timeout(options.timeoutMs));
+export function gatewayRequestSignal(options: GatewayRequestOptions = {}): AbortSignal {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_EDGE_REQUEST_TIMEOUT_MS;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new RangeError("edge request timeout must be a positive finite number");
   }
-  if (signals.length === 0) return undefined;
-  return signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+  const deadline = AbortSignal.timeout(timeoutMs);
+  return options.signal ? AbortSignal.any([deadline, options.signal]) : deadline;
 }
 
 /** GET a JSON view-model from the edge through the full auth lifecycle. */
@@ -45,8 +43,12 @@ export async function edgeGet<T = unknown>(path: string, options?: GatewayReques
 }
 
 /** POST to the edge (write verbs) through the full auth lifecycle. */
-export async function edgePost<T = unknown>(path: string, body?: unknown): Promise<T> {
-  return edgeRequest<T>("POST", path, body);
+export async function edgePost<T = unknown>(
+  path: string,
+  body?: unknown,
+  options?: GatewayRequestOptions,
+): Promise<T> {
+  return edgeRequest<T>("POST", path, body, options);
 }
 
 /**
@@ -57,9 +59,10 @@ export async function edgePost<T = unknown>(path: string, body?: unknown): Promi
  * never reach client JS.
  */
 export async function edgeGetPublic<T = unknown>(path: string): Promise<T> {
-  const res = await fetch(`${edgeUrl()}${path}`, {
+  const res = await fetch(`${edgeOrigin()}${path}`, {
     method: "GET",
     headers: { accept: "application/json" },
+    signal: gatewayRequestSignal(),
   });
   const bodyText = await res.text();
   if (res.status < 200 || res.status >= 300) {
@@ -84,13 +87,14 @@ export interface EdgeWhoami {
  * non-200 throws a token-FREE `Unauthorized` (the raw edge body is NEVER attached, so it can't leak).
  */
 export async function edgeWhoamiWithToken(token: string, scheme = "agent"): Promise<EdgeWhoami> {
-  const res = await fetch(`${edgeUrl()}/v1/whoami`, {
+  const res = await fetch(`${edgeOrigin()}/v1/whoami`, {
     method: "GET",
     headers: {
       accept: "application/json",
       authorization: `Bearer ${token}`,
       "x-myelin-token-scheme": scheme,
     },
+    signal: gatewayRequestSignal(),
   });
   if (res.status !== 200) {
     // Do NOT attach the response body — it could echo the token or an internal error. Honest, opaque.
@@ -115,7 +119,7 @@ async function edgeRequest<T>(
   return runGateway<T>({
     getToken: () => initialSession?.token ?? null,
     doFetch: async (token) => {
-      const res = await fetch(`${edgeUrl()}${path}`, {
+      const res = await fetch(`${edgeOrigin()}${path}`, {
         method,
         headers: {
           authorization: `Bearer ${token}`,
@@ -130,7 +134,7 @@ async function edgeRequest<T>(
     refresh: async () => {
       const rec = await getSessionRecord();
       if (!rec) return null;
-      const res = await fetch(`${edgeUrl()}/v1/auth/refresh`, {
+      const res = await fetch(`${edgeOrigin()}/v1/auth/refresh`, {
         method: "POST",
         headers: {
           authorization: `Bearer ${rec.refreshToken}`,
@@ -160,13 +164,18 @@ export interface RawEdgeResponse {
   body: ArrayBuffer;
 }
 
-export async function edgeGetRaw(path: string): Promise<RawEdgeResponse> {
+export async function edgeGetRaw(
+  path: string,
+  options?: GatewayRequestOptions,
+): Promise<RawEdgeResponse> {
   const initialSession = await getSessionRecord();
   const scheme = initialSession?.scheme ?? "pat";
+  const signal = gatewayRequestSignal(options);
   const doFetch = (token: string) =>
-    fetch(`${edgeUrl()}${path}`, {
+    fetch(`${edgeOrigin()}${path}`, {
       method: "GET",
       headers: { authorization: `Bearer ${token}`, "x-myelin-token-scheme": scheme },
+      signal,
     });
 
   const token = initialSession?.token;
@@ -177,9 +186,10 @@ export async function edgeGetRaw(path: string): Promise<RawEdgeResponse> {
     const rec = await getSessionRecord();
     let fresh: string | null = null;
     if (rec) {
-      const rr = await fetch(`${edgeUrl()}/v1/auth/refresh`, {
+      const rr = await fetch(`${edgeOrigin()}/v1/auth/refresh`, {
         method: "POST",
         headers: { authorization: `Bearer ${rec.refreshToken}`, "x-myelin-token-scheme": "refresh" },
+        signal,
       });
       if (rr.status === 200) {
         const json = (await rr.json().catch(() => null)) as { access_token?: string } | null;
