@@ -1,0 +1,7 @@
+[advisories]
+# RUSTSEC-2023-0071 concerns network-observable timing of RSA private-key operations. Myelin's
+# production identity paths only construct public keys and verify RS256/RSA-SHA2 signatures; every
+# RsaPrivateKey, signing, and key-generation use is inside a #[cfg(test)] module. The upstream crate
+# has no patched release. Keep the exception explicit so every other RustSec vulnerability remains
+# fatal, and remove it as soon as RustCrypto publishes a constant-time replacement.
+ignore = ["RUSTSEC-2023-0071"]

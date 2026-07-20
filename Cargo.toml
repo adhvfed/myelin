@@ -375,7 +375,7 @@ aws-credential-types = "1"
 fred = { version = "10", default-features = false, features = ["i-std"] }
 
 # Durable bus: NATS JetStream via async-nats.
-async-nats = "0.38"
+async-nats = "0.47"
 # Stream combinators (StreamExt) for draining the NATS JetStream pull-consumer batch. A tiny,
 # default-feature `futures` — pulled ONLY behind the events `integration` feature (the NATS bus).
 futures = "0.3"
