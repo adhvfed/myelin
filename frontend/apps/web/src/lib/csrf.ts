@@ -16,6 +16,15 @@ export interface OriginSignals {
 
 /** `"ok"` = same-origin (or provably not a cross-site forgery); `"reject"` = cross-site / indeterminate. */
 export type OriginVerdict = "ok" | "reject";
+export type RequestMethodPolicy = "safe" | "verify-origin" | "reject";
+
+/** Safe methods bypass CSRF verification; every other method is unsafe by default. */
+export function requestMethodPolicy(method: string): RequestMethodPolicy {
+  const normalized = method.toUpperCase();
+  if (normalized === "GET" || normalized === "HEAD" || normalized === "OPTIONS") return "safe";
+  if (normalized === "TRACE") return "reject";
+  return "verify-origin";
+}
 
 /** Parse the serialized origin out of an absolute URL; `null` for opaque or invalid origins. */
 function originOf(url: string): string | null {
