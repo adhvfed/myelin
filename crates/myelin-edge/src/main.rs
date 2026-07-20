@@ -561,8 +561,8 @@ async fn serve(core: ComposedCore, git_root: PathBuf) {
         spawn_issue_authorization_reconciler(issue_store, check, issue_reconciliation_config);
     eprintln!("edge: listening on {addr}");
     let server_result = tokio::select! {
-        result = serve_edge(listener, gateway) => result,
-        signal = tokio::signal::ctrl_c() => signal,
+        result = serve_edge(listener, gateway) => result.map_err(|error| format!("serve error: {error}")),
+        signal = shutdown_signal() => signal,
     };
     let reconciliation_result = issue_reconciler.shutdown().await;
     if let Err(e) = reconciliation_result {
@@ -570,8 +570,36 @@ async fn serve(core: ComposedCore, git_root: PathBuf) {
         std::process::exit(1);
     }
     if let Err(e) = server_result {
-        eprintln!("edge: serve error: {e}");
+        eprintln!("edge: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Wait for the process-manager shutdown contract. Containers and service managers send SIGTERM;
+/// terminals send SIGINT. Both enter the same reconciler-drain path above. Installing or reading a
+/// signal stream is itself fail-loud rather than leaving the process unable to terminate cleanly.
+async fn shutdown_signal() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|error| format!("failed to install SIGTERM handler: {error}"))?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.map_err(|error| format!("failed while waiting for SIGINT: {error}"))
+            }
+            signal = terminate.recv() => {
+                signal
+                    .map(|_| ())
+                    .ok_or_else(|| "SIGTERM stream closed unexpectedly".to_string())
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|error| format!("failed while waiting for shutdown signal: {error}"))
     }
 }
 
