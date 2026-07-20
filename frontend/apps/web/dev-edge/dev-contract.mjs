@@ -296,8 +296,6 @@ export function commitDiffJson(repo, oid) {
 }
 
 // ── R3.2 · G-7 — the PR three-dot diff + expand-context fixtures ──────────────────────────────────
-const B_OLD = "0000000000000000000000000000000000000001";
-const B_NEW = "0000000000000000000000000000000000000002";
 const SEED_PR_DIFFS = {
   1: {
     number: 1,
