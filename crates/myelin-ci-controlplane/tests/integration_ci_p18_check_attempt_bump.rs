@@ -11,8 +11,9 @@
 //! This is the REAL data-layer proof the binding policy requires (CI-P18 touches the `check_attempt`
 //! OLTP table, arch 01 §3.2): the production [`BUMP_CHECK_ATTEMPT_SQL`] UPSERT, run against real
 //! Postgres, is MONOTONIC — the FIRST dispatch of `(commit_oid, context)` returns `run_attempt = 1`,
-//! each re-dispatch bumps strictly (2, 3, …), and the returned attempt is the value CI stamps into
-//! `CheckStatus.run_attempt`. The supersession key is the counter, never wall-clock (X-1). The drill
+//! each distinct re-dispatch bumps strictly (2, 3, …), an exact same-run retry reuses its issued
+//! value, and the returned attempt is the value CI stamps into `CheckStatus.run_attempt`. The
+//! supersession key is the counter, never wall-clock (X-1). The drill
 //! is registered red-until-proven and flips green ONLY here, against the live stack — never mocked.
 //!
 //! The test applies the REAL `check_attempt` DDL onto a uniquely-suffixed throwaway table so
@@ -56,7 +57,8 @@ async fn check_attempt_bump_is_monotonic_on_live_postgres() {
     // both the INSERT target AND the ON-CONFLICT `check_attempt.next_attempt` self-reference).
     let bump = BUMP_CHECK_ATTEMPT_SQL
         .replace("INTO check_attempt (", &format!("INTO {tbl} ("))
-        .replace("check_attempt.next_attempt", &format!("{tbl}.next_attempt"));
+        .replace("check_attempt.next_attempt", &format!("{tbl}.next_attempt"))
+        .replace("check_attempt.current_run", &format!("{tbl}.current_run"));
 
     let run_a = "11111111-1111-1111-1111-111111111111";
     let run_b = "22222222-2222-2222-2222-222222222222";
@@ -85,8 +87,10 @@ async fn check_attempt_bump_is_monotonic_on_live_postgres() {
         1,
         "first dispatch stamps run_attempt 1"
     );
-    // ── 3. Each RE-dispatch bumps strictly (2, 3, 4) — monotonic, never wall-clock. ─────────────
+    assert_eq!(do_bump(run_a).await, 1, "same-run retry reuses attempt 1");
+    // ── 3. Each DISTINCT re-dispatch bumps strictly (2, 3, 4) — never wall-clock. ───────────────
     assert_eq!(do_bump(run_b).await, 2, "a re-run bumps to 2");
+    assert_eq!(do_bump(run_b).await, 2, "same-run retry reuses attempt 2");
     assert_eq!(do_bump(run_a).await, 3, "and again to 3");
     assert_eq!(do_bump(run_b).await, 4, "strictly increasing");
 
@@ -119,7 +123,7 @@ async fn check_attempt_bump_is_monotonic_on_live_postgres() {
     assert_eq!(
         stored.get::<i32, _>("next_attempt"),
         5,
-        "after 4 build dispatches (returning 1,2,3,4) next_attempt = 5 (the NEXT bump returns 4)"
+        "after four distinct build runs (returning 1,2,3,4) next_attempt = 5; exact retries consume no attempts"
     );
     // The current_run is the run that most recently produced this context's status — the LAST build
     // bump was run_b (do_bump order: run_a, run_b, run_a, run_b → the 4th, returning attempt 4).
