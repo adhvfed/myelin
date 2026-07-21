@@ -690,6 +690,8 @@ async fn emit_initial_checks(
     // this transaction's actual state transition / durable acceptance, so take one PostgreSQL
     // wall-clock timestamp for the whole context set rather than pretending the run was accepted
     // when its queued row was originally created.
+    // @tenant-cross-scope: PostgreSQL's clock is cell infrastructure with no tenant-owned rows;
+    // the caller-owned transaction is already tenant-scoped before this read.
     let emitted_at: String = sqlx::query_scalar(
         "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', \
                         'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",

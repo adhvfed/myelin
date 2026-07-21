@@ -167,9 +167,10 @@ impl CiJobAccountingStore {
         let mem_byte_seconds = fit_bigint("memory usage", record.usage.mem_byte_seconds)?;
         let billed = fit_bigint("billed amount", record.billed.0)?;
         let refunded = fit_bigint("refunded amount", record.refunded.0)?;
+        let tenant_id = record.tenant.as_str();
 
         let inserted = sqlx::query(INSERT_CI_JOB_ACCOUNTING_QUERY)
-            .bind(record.tenant.as_str())
+            .bind(tenant_id)
             .bind(self.region.as_str())
             .bind(job_id)
             .bind(wf_run_id)
@@ -192,7 +193,7 @@ impl CiJobAccountingStore {
         }
 
         let existing = sqlx::query(SELECT_CI_JOB_ACCOUNTING_QUERY)
-            .bind(record.tenant.as_str())
+            .bind(tenant_id)
             .bind(job_id)
             .fetch_one(&mut *conn)
             .await
