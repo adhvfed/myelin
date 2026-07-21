@@ -515,8 +515,9 @@ use serde::{Deserialize, Serialize};
 /// unchanged — every emitter, consumer, and the outbox/relay/consumer modules below keep
 /// resolving `crate::EventEnvelope` &c. through this re-export.
 pub use envelope::{
-    derive_envelope, Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, DataRole,
-    EmitContext, EventDraft, EventEnvelope, EventId, EventType, PiiKeyRef, Timestamp, Visibility,
+    derive_envelope, derive_envelope_from_persisted_cause, Actor, AggregateKey, ArtifactRef,
+    CausedBy, CorrelationId, DataRole, EmitContext, EventDraft, EventEnvelope, EventId, EventType,
+    PersistedEventCause, PiiKeyRef, Timestamp, Visibility,
 };
 
 /// Re-export the `(tenant, region)` partition-key types so `crate::TenantId` / `crate::Region`

@@ -13,25 +13,31 @@
 //! policy-aware [`CiLaunchAuthorityMaterializer`]; the production default refuses every fresh launch.
 //! The starter co-commits the immutable runtime grants, check attempts, canonical job ledger, workflow,
 //! and lifecycle transition, while an exact retry validates and reuses the frozen manifest without
-//! consulting mutable current policy. Remaining activation work includes the region-wide queued-run
-//! poller, initial check emission, and the myelin-flow M2 durable `RunStore`.
+//! consulting mutable current policy. A fresh start also co-emits one manifest-bound in-progress
+//! check fact per authored context through the durable outbox. Remaining activation work includes
+//! the region-wide queued-run poller and the myelin-flow M2 durable `RunStore`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use myelin_events::{HandlerTx, IdMinter};
+use myelin_events::{
+    derive_envelope_from_persisted_cause, Actor, CausedBy, CorrelationId, EmitContext, EventId,
+    HandlerTx, IdMinter, PersistedEventCause, Timestamp,
+};
 use myelin_flow::{partition_for_run_id, PgFlowExecutor, RunId, StartSpec, CI_PIPELINE_WF_TYPE};
+use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
+use myelin_storage::pgrelay::PgRelay;
 use myelin_storage::{BlobStore, ContentHash};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{PgPool, Row};
 
 use crate::check_emitter::BUMP_CHECK_ATTEMPT_SQL;
 use crate::ci_drive_manifest::{
-    CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1, CiLaunchAuthorityV1,
-    CiManifestTrustTierV1, CiManifestWorkspaceV1, GrantedCiJobV1,
+    ci_check_context_v1, CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1,
+    CiLaunchAuthorityV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, GrantedCiJobV1,
 };
 use crate::ci_run_store::CiRunRecord;
 use crate::run_plan::{
@@ -42,7 +48,7 @@ use crate::surfacing::{ci_artifact_ref, ci_run_ref};
 const SELECT_QUEUED_RUN: &str = "\
 SELECT tenant_id, run_id::text AS run_id, region, project_id::text AS project_id,
        pipeline_id::text AS pipeline_id, wf_run_id::text AS wf_run_id, repo_ref, commit_oid,
-       cause_event_id, definition_snapshot, trigger_kind, triggered_by, trust_tier, state,
+       cause_event_id, cause_depth, caused_by, definition_snapshot, trigger_kind, triggered_by, trust_tier, state,
        cost_settled, correlation_id,
        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at,
        finished_at::text AS finished_at
@@ -54,7 +60,7 @@ LIMIT 1";
 const LOCK_EXACT_QUEUED_RUN: &str = "\
 SELECT tenant_id, run_id::text AS run_id, region, project_id::text AS project_id,
        pipeline_id::text AS pipeline_id, wf_run_id::text AS wf_run_id, repo_ref, commit_oid,
-       cause_event_id, definition_snapshot, trigger_kind, triggered_by, trust_tier, state,
+       cause_event_id, cause_depth, caused_by, definition_snapshot, trigger_kind, triggered_by, trust_tier, state,
        cost_settled, correlation_id,
        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at,
        finished_at::text AS finished_at
@@ -79,6 +85,8 @@ FOR UPDATE";
 pub const CI_JOB_ID_V1_DOMAIN: &str = "myelin.ci.job-id.v1";
 /// V2 identity also binds the authored stage separately from the concrete matrix-expanded name.
 pub const CI_JOB_ID_V2_DOMAIN: &str = "myelin.ci.job-id.v2";
+/// Frozen deterministic event-id domain for a manifest-bound initial check fact.
+pub const CI_INITIAL_CHECK_EVENT_V1_DOMAIN: &str = "myelin.ci.initial-check-event.v1";
 
 /// Derive the canonical durable `ci_job.job_id` for one resolved version-1 DAG node.
 ///
@@ -578,6 +586,9 @@ impl PgCiPipelineStarter {
             replay,
         )
         .await?;
+        if !replay {
+            emit_initial_checks(&mut transaction, &record, &manifest, &manifest_digest).await?;
+        }
         let started = {
             let mut handler_tx = HandlerTx::with_connection(&mut *transaction);
             self.executor
@@ -652,6 +663,119 @@ impl PgCiPipelineStarter {
         })?;
         row.as_ref().map(decode_candidate).transpose()
     }
+}
+
+async fn emit_initial_checks(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    record: &CiRunRecord,
+    manifest: &CiDriveManifestV1,
+    manifest_digest: &str,
+) -> Result<(), PgCiStarterError> {
+    let tenant = TenantId(manifest.tenant_id.clone());
+    let cause_event_id = record.cause_event_id.clone().ok_or_else(|| {
+        PgCiStarterError::CorruptRun("queued run lacks durable triggering-event provenance".into())
+    })?;
+    let cause_depth = u32::try_from(record.cause_depth).map_err(|_| {
+        PgCiStarterError::CorruptRun(
+            "queued run carries causal depth outside the canonical u32 range".into(),
+        )
+    })?;
+    let cause = PersistedEventCause {
+        event_id: EventId(cause_event_id),
+        correlation_id: CorrelationId(record.correlation_id.clone()),
+        caused_by: record.caused_by.clone().map(CausedBy),
+        depth: cause_depth,
+    };
+    // `started_at` is immutable run provenance carried by the payload. Envelope clocks describe
+    // this transaction's actual state transition / durable acceptance, so take one PostgreSQL
+    // wall-clock timestamp for the whole context set rather than pretending the run was accepted
+    // when its queued row was originally created.
+    let emitted_at: String = sqlx::query_scalar(
+        "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|error| {
+        PgCiStarterError::Database(format!("read initial check emission timestamp: {error}"))
+    })?;
+    let trust_tier = manifest_check_trust_tier(manifest.trust_tier);
+    for (context, attempt) in &manifest.check_attempts {
+        let emit_context = crate::check_emitter::CheckEmitContext {
+            tenant: manifest.tenant_id.clone(),
+            repo: manifest.repo_ref.clone(),
+            commit_oid: manifest.commit_oid.clone(),
+            run_ref: manifest.run_ref.clone(),
+            run_attempt: *attempt,
+            trust_tier,
+            started_at: manifest.started_at.clone(),
+            completed_at: None,
+        };
+        let draft = crate::check_emitter::assemble_check_status(
+            &emit_context,
+            crate::check_emitter::CheckProvider::Ci,
+            context,
+            crate::check_emitter::CheckState::InProgress,
+            true,
+            crate::check_emitter::CostPosture::Unsettled,
+            None,
+        );
+        let timestamp = Timestamp(emitted_at.clone());
+        let envelope = derive_envelope_from_persisted_cause(
+            draft,
+            EmitContext {
+                event_id: initial_check_event_id(manifest, manifest_digest, context, *attempt),
+                tenant: tenant.clone(),
+                region: Region(manifest.region.clone()),
+                actor: Actor(Principal::stub(
+                    PrincipalId("ci-controlplane".into()),
+                    PrincipalKind::Service,
+                    tenant.clone(),
+                )),
+                schema_ver: 1,
+                occurred_at: timestamp.clone(),
+                recorded_at: timestamp,
+                caused_by: None,
+            },
+            Some(&cause),
+        );
+        let aggregate = envelope.aggregate.0.clone();
+        PgRelay::co_commit_in_tx(transaction, &aggregate, &envelope)
+            .await
+            .map_err(|error| {
+                PgCiStarterError::Database(format!("emit initial check fact: {error}"))
+            })?;
+    }
+    Ok(())
+}
+
+fn manifest_check_trust_tier(tier: CiManifestTrustTierV1) -> crate::check_emitter::TrustTier {
+    match tier {
+        CiManifestTrustTierV1::Trusted | CiManifestTrustTierV1::SelfHosted => {
+            crate::check_emitter::TrustTier::Trusted
+        }
+        CiManifestTrustTierV1::UntrustedFork => crate::check_emitter::TrustTier::UntrustedFork,
+    }
+}
+
+fn initial_check_event_id(
+    manifest: &CiDriveManifestV1,
+    manifest_digest: &str,
+    context: &str,
+    attempt: u32,
+) -> EventId {
+    let mut hasher = blake3::Hasher::new_derive_key(CI_INITIAL_CHECK_EVENT_V1_DOMAIN);
+    for frame in [
+        manifest.tenant_id.as_bytes(),
+        manifest.ci_run_id.as_bytes(),
+        manifest_digest.as_bytes(),
+        context.as_bytes(),
+        &attempt.to_be_bytes(),
+    ] {
+        hasher.update(&(frame.len() as u64).to_be_bytes());
+        hasher.update(frame);
+    }
+    EventId(format!("ci-check-start-{}", hasher.finalize().to_hex()))
 }
 
 /// **The per-(tenant, region) starter composition seam (the region-wide poller's router).** A
@@ -837,6 +961,8 @@ fn decode_candidate(row: &sqlx::postgres::PgRow) -> Result<StarterCandidate, PgC
             repo_ref: field!("repo_ref"),
             commit_oid: field!("commit_oid"),
             cause_event_id: field!("cause_event_id"),
+            cause_depth: field!("cause_depth"),
+            caused_by: field!("caused_by"),
             definition_snapshot: field!("definition_snapshot"),
             trigger_kind: field!("trigger_kind"),
             trust_tier: field!("trust_tier"),
@@ -1195,7 +1321,7 @@ fn granted_jobs_v2(
                 job_id: expected.job_id.to_string(),
                 stage: job.stage.clone(),
                 name: job.name.clone(),
-                check_context: format!("ci:{}", job.stage),
+                check_context: ci_check_context_v1(&job.stage),
                 needs,
                 matrix_key: job.matrix_key.clone(),
                 image: job.image.clone(),
@@ -1751,6 +1877,8 @@ mod tests {
             repo_ref: Some("repo-1".into()),
             commit_oid: Some("deadbeef".into()),
             cause_event_id: None,
+            cause_depth: 0,
+            caused_by: None,
             definition_snapshot: format!(
                 "myelin://{tenant_id}/ci/snapshot/{}",
                 hash.to_multihash_string()
@@ -1822,6 +1950,8 @@ mod tests {
             repo_ref: Some("myelin://acme/git/repo/core".into()),
             commit_oid: Some("deadbeef".into()),
             cause_event_id: None,
+            cause_depth: 0,
+            caused_by: None,
             definition_snapshot: format!(
                 "myelin://acme/ci/snapshot/{}",
                 hash.to_multihash_string()
@@ -2058,5 +2188,65 @@ mod tests {
             .expect_err("reordered authority jobs must fail closed")
             .to_string()
             .contains("strictly plan-ordered"));
+    }
+
+    #[test]
+    fn initial_check_event_identity_is_stable_and_binds_manifest_context_and_attempt() {
+        let (record, prepared) = prepared_plan_v2();
+        let expected = expected_ci_jobs_v2(&record, &prepared).unwrap();
+        let authority = CiLaunchAuthorityV1 {
+            policy_revision: "policy-v1".into(),
+            jobs: vec![launch_grant("build"), launch_grant("test")],
+            merge_waiter: None,
+        };
+        let jobs = granted_jobs_v2(&record, &prepared, &expected, &authority).unwrap();
+        let manifest = build_drive_manifest_v1(
+            &record,
+            &prepared,
+            &CiWorkflowDefinitionPin::new(1, "blake3:ci-body-v1").unwrap(),
+            &authority,
+            jobs,
+            BTreeMap::from([("build".into(), 1), ("test".into(), 1)]),
+            "2026-07-21T12:34:56.000000Z",
+        )
+        .unwrap();
+        let digest = manifest.digest().unwrap();
+        let base = initial_check_event_id(&manifest, &digest, "build", 1);
+        assert_eq!(
+            initial_check_event_id(&manifest, &digest, "build", 1),
+            base,
+            "the same committed manifest fact derives the same outbox identity"
+        );
+
+        let mut other_tenant = manifest.clone();
+        other_tenant.tenant_id = "other".into();
+        let mut other_run = manifest.clone();
+        other_run.ci_run_id = "10000000-0000-0000-0000-000000000002".into();
+        let variants = [
+            initial_check_event_id(&other_tenant, &digest, "build", 1),
+            initial_check_event_id(&other_run, &digest, "build", 1),
+            initial_check_event_id(&manifest, &format!("blake3:{}", "a".repeat(64)), "build", 1),
+            initial_check_event_id(&manifest, &digest, "test", 1),
+            initial_check_event_id(&manifest, &digest, "build", 2),
+        ];
+        assert!(variants.into_iter().all(|candidate| candidate != base));
+        assert!(base.0.starts_with("ci-check-start-"));
+    }
+
+    #[test]
+    fn manifest_execution_trust_projects_to_the_same_two_way_git_tier_as_dispatch() {
+        assert_eq!(
+            manifest_check_trust_tier(CiManifestTrustTierV1::Trusted),
+            crate::check_emitter::TrustTier::Trusted
+        );
+        assert_eq!(
+            manifest_check_trust_tier(CiManifestTrustTierV1::SelfHosted),
+            crate::check_emitter::TrustTier::Trusted,
+            "a self-hosted member run is trusted code for Git's two-way check gate"
+        );
+        assert_eq!(
+            manifest_check_trust_tier(CiManifestTrustTierV1::UntrustedFork),
+            crate::check_emitter::TrustTier::UntrustedFork
+        );
     }
 }

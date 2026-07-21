@@ -142,6 +142,8 @@ fn run_for(hash: &ContentHash) -> CiRunRecord {
         repo_ref: Some("repo_01".into()),
         commit_oid: Some("abc123".into()),
         cause_event_id: Some("event_01".into()),
+        cause_depth: 0,
+        caused_by: None,
         definition_snapshot: format!(
             "myelin://tenant_01/ci/snapshot/{}",
             hash.to_multihash_string()

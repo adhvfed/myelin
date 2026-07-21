@@ -142,6 +142,15 @@ pub struct GrantedCiJobV1 {
     pub continue_on_error: bool,
 }
 
+/// Frozen V1 mapping from an authored stage to the Git check-context name.
+///
+/// Provider is already a distinct key dimension, so V1 preserves the authored stage verbatim. Both
+/// dispatch's queued fact and the manifest-backed starter call this helper; a future namespace change
+/// therefore requires a new version here instead of silently splitting one check lifecycle in two.
+pub fn ci_check_context_v1(authored_stage: &str) -> String {
+    authored_stage.to_owned()
+}
+
 /// Optional Git-owned merge-attempt waiter. Ordinary push/manual/schedule runs carry `None` and do
 /// not fabricate a merge idempotency token or signal target.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,7 +263,7 @@ impl CiDriveManifestV1 {
             validate_machine_token("stage", &job.stage)?;
             validate_machine_token("job name", &job.name)?;
             validate_bounded("check context", &job.check_context)?;
-            if job.check_context != format!("ci:{}", job.stage) {
+            if job.check_context != ci_check_context_v1(&job.stage) {
                 return invalid("job check context must be derived from its authored stage");
             }
             if !ids.insert(job.job_id.clone()) || !names.insert(job.name.clone()) {
@@ -852,7 +861,7 @@ mod tests {
             job_id: id.into(),
             stage: name.into(),
             name: name.into(),
-            check_context: format!("ci:{name}"),
+            check_context: name.into(),
             needs,
             matrix_key: BTreeMap::new(),
             image: format!("registry.example/{name}@sha256:{}", "a".repeat(64)),
@@ -906,7 +915,7 @@ mod tests {
             run_ref: "myelin://acme/ci/run/44444444-4444-8444-8444-444444444444".into(),
             started_at: "2026-07-21T12:34:56.000000Z".into(),
             trust_tier: CiManifestTrustTierV1::Trusted,
-            check_attempts: BTreeMap::from([("ci:build".into(), 7), ("ci:test".into(), 4)]),
+            check_attempts: BTreeMap::from([("build".into(), 7), ("test".into(), 4)]),
             merge_waiter: None,
             jobs: vec![
                 job(build, "build", vec![]),
@@ -952,7 +961,7 @@ mod tests {
             .contains("digest-pinned"));
 
         let mut drifted = manifest();
-        drifted.check_attempts.remove("ci:test");
+        drifted.check_attempts.remove("test");
         assert!(drifted
             .validate()
             .unwrap_err()
@@ -1006,7 +1015,7 @@ mod tests {
 
         let mut forged_context = manifest();
         forged_context.jobs[0].check_context = "ci:other".into();
-        forged_context.check_attempts.remove("ci:build");
+        forged_context.check_attempts.remove("build");
         forged_context.check_attempts.insert("ci:other".into(), 7);
         assert!(forged_context
             .validate()

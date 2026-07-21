@@ -60,10 +60,11 @@ pub mod ci_drive_manifest;
 pub mod ci_pipeline;
 pub mod ci_result_signal;
 pub use ci_drive_manifest::{
-    CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1, CiJobLaunchGrantV1,
-    CiLaunchAuthorityV1, CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1,
-    CiManifestTrustTierV1, CiManifestWorkspaceV1, CiMergeWaiterV1, GrantedCiJobV1,
-    CI_DRIVE_MANIFEST_DIGEST_V1_DOMAIN, CI_DRIVE_MANIFEST_SCHEMA_V1, MAX_CI_DRIVE_MANIFEST_BYTES,
+    ci_check_context_v1, CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1,
+    CiJobLaunchGrantV1, CiLaunchAuthorityV1, CiManifestLaneV1, CiManifestLimitsV1,
+    CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, CiMergeWaiterV1,
+    GrantedCiJobV1, CI_DRIVE_MANIFEST_DIGEST_V1_DOMAIN, CI_DRIVE_MANIFEST_SCHEMA_V1,
+    MAX_CI_DRIVE_MANIFEST_BYTES,
 };
 /// CT-004d.2 chunk 4 — the durable `ci_run` writer ([`ci_run_store::CiRunStore`]): the CI
 /// run-of-record. The `ci-dispatch.trigger` consumer's reserve bundle must persist a durable `ci_run`
@@ -167,7 +168,7 @@ pub use pg_pipeline_starter::{
     ci_job_id_v1, ci_job_id_v2, decode_ci_claimed_input, CiLaunchAuthorityError,
     CiLaunchAuthorityMaterializer, CiWorkflowDefinitionPin, ClaimedCiInput, ClaimedCiInputError,
     PgCiPipelineStarter, PgCiRunStarterFactory, PgCiStarterError, StartQueuedOutcome,
-    CI_JOB_ID_V1_DOMAIN, CI_JOB_ID_V2_DOMAIN,
+    CI_INITIAL_CHECK_EVENT_V1_DOMAIN, CI_JOB_ID_V1_DOMAIN, CI_JOB_ID_V2_DOMAIN,
 };
 /// Durable CI dispatch and claim-bound completion components. [`ci_pipeline_driver::DurableJobRunner`]
 /// dispatches each stage into
@@ -545,13 +546,14 @@ pub use fairness::{
 pub use migrations::{
     ci_controlplane_hot_tables, ci_controlplane_migrations, ci_durable_hot_tables,
     ci_durable_migrations, make_tenant_scoped_ddl, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
+    ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ARTIFACT_TABLE,
     CACHE_ENTRY_TABLE, CHECK_ATTEMPT_TABLE, CI_COST_EVENT_TABLE, CI_DRIVE_MANIFEST_TABLE,
     CI_DURABLE_WRITER_IDS, CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID,
     CI_JOB_QUEUE_COMPLETION_MIGRATION_ID, CI_JOB_RUN_LEDGER_INDEX,
     CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID, CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID,
     CI_JOB_SPEC_STAGE_MIGRATION_ID, CI_JOB_SPEC_TABLE, CI_JOB_TABLE,
-    CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_TABLE,
+    CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID, CI_RUN_TABLE,
     CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID, CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID,
     CREATE_ARTIFACT_DDL, CREATE_CACHE_ENTRY_DDL, CREATE_CHECK_ATTEMPT_DDL,
     CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_DDL,
@@ -895,8 +897,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            27,
-            "all 16 tables, 4 concurrent indexes, the ledger validator, 2 job_queue ALTERs, the ci_job_spec-stage ALTER, scheduler RLS boundary, and 2 claim-column grants are present"
+            28,
+            "all 16 tables, ci_run causal provenance, 4 concurrent indexes, the ledger validator, 2 job_queue ALTERs, the ci_job_spec-stage ALTER, scheduler RLS boundary, and 2 claim-column grants are present"
         );
         assert!(
             spec.consumers.is_empty(),

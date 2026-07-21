@@ -18,7 +18,8 @@
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
-    ci_run_store_factory, CiRunInsert, CiRunStoreError, CREATE_CI_RUN_DDL, ERASED_PSEUDONYM,
+    ci_run_store_factory, CiRunInsert, CiRunStoreError, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
+    CREATE_CI_RUN_DDL, ERASED_PSEUDONYM,
 };
 use myelin_events::{HandlerTx, CONSUMER_DEDUP_MIGRATION};
 use sqlx::{Executor, PgPool};
@@ -70,6 +71,8 @@ fn row(tenant: &str, run_id: &str) -> CiRunInsert {
         state: "queued".into(),
         correlation_id: "corr-1".into(),
         cause_event_id: Some("ev-push-1".into()),
+        cause_depth: 0,
+        caused_by: None,
         repo_ref: Some("web".into()),
         commit_oid: Some("deadbeefcafe".into()),
         triggered_by: Some("psn:actor-8a2f".into()),
@@ -99,6 +102,10 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         .execute(CREATE_CI_RUN_DDL)
         .await
         .expect("create ci_run");
+    admin
+        .execute(ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL)
+        .await
+        .expect("add ci_run causal provenance");
     admin
         .execute(CONSUMER_DEDUP_MIGRATION)
         .await

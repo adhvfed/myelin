@@ -37,6 +37,8 @@ fn ci_run_record(tenant_id: &str) -> CiRunRecord {
         repo_ref: Some("repo".into()),
         commit_oid: Some("deadbeef".into()),
         cause_event_id: Some("event-1".into()),
+        cause_depth: 0,
+        caused_by: None,
         definition_snapshot: "blake3:abcd".into(),
         trigger_kind: "push".into(),
         trust_tier: "trusted".into(),
