@@ -13,7 +13,8 @@ use myelin_ci_controlplane::{
     CiExecutionRequestV1, CiJobLaunchGrantV1, CiJobSpecStore, CiJobTokenIssueError,
     CiJobTokenIssuer, CiJobTokenRequest, CiLaunchAuthorityError, CiLaunchAuthorityMaterializer,
     CiLaunchAuthorityV1, CiManifestDurableJobRunner, CiManifestInputResolver, CiManifestLaneV1,
-    CiManifestLimitsV1, CiManifestSchedulingV1, CiWorkflowDefinitionPin, PgCiPipelineStarter,
+    CiManifestLimitsV1, CiManifestSchedulingV1, CiRunFinalization, CiRunFinalizationWrite,
+    CiRunFinalizer, CiRunStoreError, CiWorkflowDefinitionPin, PgCiPipelineStarter,
     PreparedRunPlanV2, ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
 };
 use myelin_ci_sandbox::{RunTokenRef, TrustTier};
@@ -138,7 +139,7 @@ impl CiLaunchAuthorityMaterializer for TestAuthority {
                             concurrency_group: None,
                             fair_key: format!("project:{}", record.project_id),
                         },
-                        reserve_handle: format!("reserve:{}", record.run_id),
+                        reserve_handle: format!("reserve:{}:{}", record.run_id, job.name),
                         token_authority_handle: format!("mint:{}", record.run_id),
                     })
                     .collect(),
@@ -166,6 +167,17 @@ impl CiJobTokenIssuer for TestTokenIssuer {
                 jti: format!("test-jti:{}", request.job_id),
             })
         })
+    }
+}
+
+struct AcceptFinalizer;
+
+impl CiRunFinalizer for AcceptFinalizer {
+    fn finalize(
+        &self,
+        _finalization: &CiRunFinalization,
+    ) -> Result<CiRunFinalizationWrite, CiRunStoreError> {
+        Ok(CiRunFinalizationWrite::Finalized)
     }
 }
 
@@ -355,6 +367,7 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
 
     let durable_store = CiJobSpecStore::with_pg(pool.clone());
     let token_issuer: Arc<dyn CiJobTokenIssuer> = Arc::new(TestTokenIssuer);
+    let finalizer: Arc<dyn CiRunFinalizer> = Arc::new(AcceptFinalizer);
     let mut first = worker(&pool, "worker-retry");
     let flaky = RetryOnceResolver {
         inner: resolver(&pool),
@@ -362,6 +375,7 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
     };
     let retry_store = durable_store.clone();
     let retry_issuer = Arc::clone(&token_issuer);
+    let retry_finalizer = Arc::clone(&finalizer);
     let retry_rt = tokio::runtime::Handle::current();
     first
         .register_definition_with_input_resolver(
@@ -377,7 +391,7 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
                     Arc::clone(&retry_issuer),
                     retry_rt.clone(),
                 )?;
-                run_ci_manifest_pipeline(ctx, &manifest, &runner)
+                run_ci_manifest_pipeline(ctx, &manifest, &runner, retry_finalizer.as_ref())
                     .map_err(|error| format!("manifest CI workflow failed: {error:?}"))?;
                 Ok(vec![myelin_refs::ArtifactRef(manifest.run_ref)])
             },
@@ -409,6 +423,7 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
         resolver(&pool),
         durable_store.clone(),
         Arc::clone(&token_issuer),
+        Arc::clone(&finalizer),
         tokio::runtime::Handle::current(),
     )
     .unwrap();
@@ -470,7 +485,10 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
         assert_eq!(spec.trust_tier, TrustTier::Trusted);
         assert_eq!(spec.run_token.jti, format!("test-jti:{job_id}"));
         assert_ne!(spec.run_token.jti, format!("mint:{CI_RUN_ID}"));
-        assert_eq!(spec.meter_to.reserve_id, format!("reserve:{CI_RUN_ID}"));
+        assert_eq!(
+            spec.meter_to.reserve_id,
+            format!("reserve:{CI_RUN_ID}:{stage}")
+        );
         assert_eq!(
             spec.workspace.repo_ref.as_deref(),
             Some("myelin://manifest_dag/git/repo/core")
@@ -495,6 +513,7 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
         resolver(&pool),
         durable_store.clone(),
         Arc::clone(&token_issuer),
+        Arc::clone(&finalizer),
         tokio::runtime::Handle::current(),
     )
     .unwrap();
@@ -530,6 +549,7 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
         resolver(&pool),
         durable_store.clone(),
         Arc::clone(&token_issuer),
+        Arc::clone(&finalizer),
         tokio::runtime::Handle::current(),
     )
     .unwrap();
@@ -557,10 +577,11 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
     .await
     .unwrap();
     assert_eq!(workflow_state, "completed");
-    let terminal_checks: Vec<(String, i64, String)> = sqlx::query_as(
+    let terminal_checks: Vec<(String, i64, String, bool)> = sqlx::query_as(
         "SELECT envelope->'payload'->'context'->>'name', \
                 (envelope->'payload'->>'run_attempt')::bigint, \
-                envelope->'payload'->>'state' \
+                envelope->'payload'->>'state', \
+                (envelope->'payload'->>'cost_settled')::boolean \
          FROM outbox WHERE envelope->>'type_'='ci.check.updated' \
            AND envelope->'payload'->>'run'=$1 \
            AND envelope->'payload'->>'state'='success' \
@@ -573,9 +594,9 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
     assert_eq!(
         terminal_checks,
         vec![
-            ("build".into(), 1, "success".into()),
-            ("package".into(), 1, "success".into()),
-            ("test".into(), 1, "success".into()),
+            ("build".into(), 1, "success".into(), true),
+            ("package".into(), 1, "success".into(), true),
+            ("test".into(), 1, "success".into(), true),
         ]
     );
 

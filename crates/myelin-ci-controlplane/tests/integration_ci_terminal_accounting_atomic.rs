@@ -397,6 +397,8 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
         result_refs: Vec::new(),
     };
     let finalization = CiRunFinalization {
+        tenant_id: tenant.0.clone(),
+        region: region.0.clone(),
         run_id: ci_run.into(),
         wf_run_id: wf_run.into(),
         terminal_state: CiRunTerminalState::Succeeded,
@@ -406,6 +408,16 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
             reserve_handle: "reserve:accounting-live".into(),
         }],
     };
+
+    let mut cross_tenant_finalization = finalization.clone();
+    cross_tenant_finalization.tenant_id = "different-tenant".into();
+    assert_eq!(
+        ci_runs
+            .finalize_ci_run(&scope, &cross_tenant_finalization)
+            .await
+            .unwrap_err(),
+        CiRunStoreError::InvalidFinalization("tenant or region scope")
+    );
 
     assert_eq!(
         ci_runs

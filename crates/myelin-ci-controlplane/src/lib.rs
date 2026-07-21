@@ -516,10 +516,10 @@ pub use job_spec_store::{
 // locking query verifies every immutable field; divergent/invisible conflicts fail typed and loud.
 // The co-emitted events stay absorb-mode through the outbox (the honest #7 H1 split).
 pub use ci_run_store::{
-    CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationWrite, CiRunInsert, CiRunRecord,
-    CiRunStore, CiRunStoreError, CiRunTerminalState, FINALIZE_CI_RUN_QUERY, INSERT_CI_RUN_QUERY,
-    LOCK_CI_RUN_FOR_FINALIZE_QUERY, SELECT_CI_RUN_ACCOUNTING_QUERY, SELECT_CI_RUN_QUERY,
-    VERIFY_CI_RUN_REPLAY_QUERY,
+    CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationWrite, CiRunFinalizer, CiRunInsert,
+    CiRunRecord, CiRunStore, CiRunStoreError, CiRunTerminalState, DurableCiRunFinalizer,
+    FINALIZE_CI_RUN_QUERY, INSERT_CI_RUN_QUERY, LOCK_CI_RUN_FOR_FINALIZE_QUERY,
+    SELECT_CI_RUN_ACCOUNTING_QUERY, SELECT_CI_RUN_QUERY, VERIFY_CI_RUN_REPLAY_QUERY,
 };
 pub use ci_scheduler_db::{
     CiSchedulerDbConfig, CiSchedulerDbError, CiSchedulerDbProvider, CI_SCHEDULER_DATABASE_URL_ENV,
