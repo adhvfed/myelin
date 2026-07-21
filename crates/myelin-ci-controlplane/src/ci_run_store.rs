@@ -259,7 +259,7 @@ pub enum CiRunTerminalState {
 }
 
 impl CiRunTerminalState {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
@@ -272,6 +272,10 @@ impl CiRunTerminalState {
 /// journaled clock value, never a fresh database/application clock read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiRunFinalization {
+    /// Manifest tenant identity, re-bound to the finalizer's verified scope.
+    pub tenant_id: String,
+    /// Manifest residency cell, re-bound to the finalizer's verified scope.
+    pub region: String,
     /// CI run-of-record UUID.
     pub run_id: String,
     /// Flow workflow-run UUID bound by the immutable manifest.
@@ -289,6 +293,16 @@ pub struct CiRunFinalization {
 pub enum CiRunFinalizationWrite {
     Finalized,
     ExactReplay,
+}
+
+/// Synchronous effect boundary used by the deterministic Flow body. Implementations must be
+/// exact-replay safe because an effect can commit before its Flow history row does.
+pub trait CiRunFinalizer: Send + Sync {
+    /// Verify complete terminal accounting and apply (or exactly replay) the run transition.
+    fn finalize(
+        &self,
+        finalization: &CiRunFinalization,
+    ) -> Result<CiRunFinalizationWrite, CiRunStoreError>;
 }
 
 /// A durable `ci_run`-store failure. Loud + typed — a write/read NEVER silently drops or coerces. Safe
@@ -417,6 +431,35 @@ pub struct CiRunStore {
     pool: PgPool,
 }
 
+/// Production bridge from the synchronous workflow activity to [`CiRunStore::finalize_ci_run`].
+/// It carries a verified tenant scope; the workflow manifest cannot choose or widen database scope.
+#[derive(Clone)]
+pub struct DurableCiRunFinalizer {
+    store: CiRunStore,
+    scope: TenantScope,
+    rt: tokio::runtime::Handle,
+}
+
+impl DurableCiRunFinalizer {
+    /// Bind the durable store to a verified tenant scope and the service runtime.
+    pub fn new(store: CiRunStore, scope: TenantScope, rt: tokio::runtime::Handle) -> Self {
+        Self { store, scope, rt }
+    }
+}
+
+impl CiRunFinalizer for DurableCiRunFinalizer {
+    fn finalize(
+        &self,
+        finalization: &CiRunFinalization,
+    ) -> Result<CiRunFinalizationWrite, CiRunStoreError> {
+        let future = self.store.finalize_ci_run(&self.scope, finalization);
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => tokio::task::block_in_place(|| self.rt.block_on(future)),
+            Err(_) => self.rt.block_on(future),
+        }
+    }
+}
+
 impl CiRunStore {
     /// Wrap the OLTP pool as the durable `ci_run` store (mirror [`crate::job_spec_store::CiJobSpecStore::with_pg`]).
     /// The production composition root constructs this from the MR-022 `SubstrateProvider` pool
@@ -532,6 +575,13 @@ impl CiRunStore {
         finalization: &CiRunFinalization,
     ) -> Result<CiRunFinalizationWrite, CiRunStoreError> {
         validate_finalization(finalization)?;
+        if scope.tenant().as_str() != finalization.tenant_id
+            || scope.region().as_str() != finalization.region
+        {
+            return Err(CiRunStoreError::InvalidFinalization(
+                "tenant or region scope",
+            ));
+        }
         let tenant = scope.tenant().as_str().to_owned();
         let region = scope.region().as_str().to_owned();
         let scope = scope.clone();
@@ -625,6 +675,15 @@ async fn finalize_on_conn(
 }
 
 fn validate_finalization(finalization: &CiRunFinalization) -> Result<(), CiRunStoreError> {
+    if finalization.tenant_id.is_empty()
+        || finalization.tenant_id.len() > 512
+        || finalization.region.is_empty()
+        || finalization.region.len() > 512
+    {
+        return Err(CiRunStoreError::InvalidFinalization(
+            "tenant or region scope",
+        ));
+    }
     Uuid::parse_str(&finalization.run_id)
         .map_err(|_| CiRunStoreError::InvalidFinalization("CI run id"))?;
     Uuid::parse_str(&finalization.wf_run_id)
@@ -796,6 +855,8 @@ mod tests {
 
     fn sample_finalization() -> CiRunFinalization {
         CiRunFinalization {
+            tenant_id: "acme".into(),
+            region: "fr-par".into(),
             run_id: "11111111-1111-1111-1111-111111111111".into(),
             wf_run_id: "44444444-4444-4444-4444-444444444444".into(),
             terminal_state: CiRunTerminalState::Succeeded,

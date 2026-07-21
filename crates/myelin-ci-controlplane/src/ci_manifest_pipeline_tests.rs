@@ -10,6 +10,7 @@ use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
 use crate::{
     CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1, CiManifestWorkspaceV1,
+    CiRunFinalizationWrite, CiRunStoreError,
 };
 
 const RUN_ID: &str = "33333333-3333-8333-8333-333333333333";
@@ -143,6 +144,44 @@ impl RecordingRunner {
     }
 }
 
+#[derive(Default)]
+struct RecordingFinalizer {
+    finalizations: Mutex<Vec<CiRunFinalization>>,
+}
+
+impl CiRunFinalizer for RecordingFinalizer {
+    fn finalize(
+        &self,
+        finalization: &CiRunFinalization,
+    ) -> Result<CiRunFinalizationWrite, CiRunStoreError> {
+        self.finalizations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(finalization.clone());
+        Ok(CiRunFinalizationWrite::Finalized)
+    }
+}
+
+impl RecordingFinalizer {
+    fn finalizations(&self) -> Vec<CiRunFinalization> {
+        self.finalizations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
+struct RefusingFinalizer;
+
+impl CiRunFinalizer for RefusingFinalizer {
+    fn finalize(
+        &self,
+        _finalization: &CiRunFinalization,
+    ) -> Result<CiRunFinalizationWrite, CiRunStoreError> {
+        Err(CiRunStoreError::IncompleteTerminalAccounting)
+    }
+}
+
 fn begin(
     outbox: &OutboxStore,
     journal: WfJournal,
@@ -212,11 +251,12 @@ fn dag_dispatches_roots_together_replays_out_of_order_completions_then_launches_
     let signals = SignalStore::new();
     let timers = TimerStore::new();
     let runner = RecordingRunner::default();
+    let finalizer = RecordingFinalizer::default();
     let manifest = manifest();
 
     let mut first = begin(&outbox, journal.clone(), signals.clone(), timers.clone());
     assert_eq!(
-        run_ci_manifest_pipeline(&mut first, &manifest, &runner).unwrap(),
+        run_ci_manifest_pipeline(&mut first, &manifest, &runner, &finalizer).unwrap(),
         CiManifestPipelineOutcome::Parked
     );
     first.commit().unwrap();
@@ -226,7 +266,7 @@ fn dag_dispatches_roots_together_replays_out_of_order_completions_then_launches_
     deliver(&signals, &dispatch_token(0), "build-a", true, 3);
     let mut second = resume(&outbox, journal.clone(), signals.clone(), timers.clone());
     assert_eq!(
-        run_ci_manifest_pipeline(&mut second, &manifest, &runner).unwrap(),
+        run_ci_manifest_pipeline(&mut second, &manifest, &runner, &finalizer).unwrap(),
         CiManifestPipelineOutcome::Parked
     );
     second.commit().unwrap();
@@ -238,11 +278,16 @@ fn dag_dispatches_roots_together_replays_out_of_order_completions_then_launches_
     deliver(&signals, &dispatch_token(4), "package", true, 4);
     let mut third = resume(&outbox, journal.clone(), signals, timers);
     assert_eq!(
-        run_ci_manifest_pipeline(&mut third, &manifest, &runner).unwrap(),
+        run_ci_manifest_pipeline(&mut third, &manifest, &runner, &finalizer).unwrap(),
         CiManifestPipelineOutcome::Succeeded { jobs_completed: 3 }
     );
     third.commit().unwrap();
     assert_eq!(runner.targets().len(), 3, "replay never redispatched a job");
+    assert_eq!(finalizer.finalizations().len(), 1);
+    assert_eq!(
+        finalizer.finalizations()[0].terminal_state,
+        CiRunTerminalState::Succeeded
+    );
 
     let check_attempts: BTreeMap<String, u64> = outbox
         .committed_rows()
@@ -258,9 +303,18 @@ fn dag_dispatches_roots_together_replays_out_of_order_completions_then_launches_
             )
         })
         .collect();
+    assert!(outbox
+        .committed_rows()
+        .iter()
+        .filter(|row| row.envelope.type_.0 == myelin_ci_sandbox::events::CI_CHECK_UPDATED)
+        .all(|row| row.envelope.payload["cost_settled"] == true));
     assert_eq!(
         check_attempts,
-        BTreeMap::from([("build-a".into(), 7), ("build-b".into(), 4), ("package".into(), 9)])
+        BTreeMap::from([
+            ("build-a".into(), 7),
+            ("build-b".into(), 4),
+            ("package".into(), 9)
+        ])
     );
 }
 
@@ -271,17 +325,50 @@ fn failed_frontier_drains_dispatched_sibling_and_never_dispatches_descendant() {
     let signals = SignalStore::new();
     let timers = TimerStore::new();
     let runner = RecordingRunner::default();
+    let finalizer = RecordingFinalizer::default();
     deliver(&signals, &dispatch_token(1), "build-b", true, 2);
     deliver(&signals, &dispatch_token(0), "build-a", false, 3);
 
     let mut ctx = begin(&outbox, journal, signals, timers);
     assert_eq!(
-        run_ci_manifest_pipeline(&mut ctx, &manifest(), &runner).unwrap(),
+        run_ci_manifest_pipeline(&mut ctx, &manifest(), &runner, &finalizer).unwrap(),
         CiManifestPipelineOutcome::Failed {
             job: "build-a".into(),
             timed_out: false,
         }
     );
     assert_eq!(runner.targets(), vec![JOB_A.to_string(), JOB_B.to_string()]);
-    assert_eq!(ctx.staged_history_len(), 5, "two dispatches, two joins, one terminal clock");
+    assert_eq!(
+        ctx.staged_history_len(),
+        6,
+        "two dispatches, two joins, terminal clock, and finalization activity"
+    );
+    assert_eq!(
+        finalizer.finalizations()[0].terminal_state,
+        CiRunTerminalState::Failed
+    );
+}
+
+#[test]
+fn accounting_refusal_prevents_every_terminal_outward_fact() {
+    let outbox = OutboxStore::new();
+    let journal = WfJournal::new();
+    let signals = SignalStore::new();
+    let timers = TimerStore::new();
+    let runner = RecordingRunner::default();
+    let manifest = manifest();
+    deliver(&signals, &dispatch_token(1), "build-b", true, 2);
+    deliver(&signals, &dispatch_token(0), "build-a", true, 3);
+    deliver(&signals, &dispatch_token(4), "package", true, 4);
+
+    let mut ctx = begin(&outbox, journal, signals, timers);
+    assert!(matches!(
+        run_ci_manifest_pipeline(&mut ctx, &manifest, &runner, &RefusingFinalizer),
+        Err(WfError::ActivityExhausted(_))
+    ));
+    ctx.commit().unwrap();
+    assert!(
+        outbox.committed_rows().is_empty(),
+        "checks, run terminal events, and merge results all follow durable finalization"
+    );
 }

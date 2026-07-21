@@ -1985,7 +1985,7 @@ mod tests {
                 concurrency_group: None,
                 fair_key: "project:22222222-2222-2222-2222-222222222222".into(),
             },
-            reserve_handle: "reserve:run".into(),
+            reserve_handle: format!("reserve:run:{name}"),
             token_authority_handle: "mint:run".into(),
         }
     }

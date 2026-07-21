@@ -13,9 +13,9 @@ use std::sync::Arc;
 use myelin_events::check_seam::{check_updated_draft, ci_result_draft, rollup_ci_result};
 use myelin_events::{AggregateKey, ArtifactRef, DataRole, EventDraft, EventType, Visibility};
 use myelin_flow::{
-    read_stage_verdict, DispatchedJob, JobKind, JobOutcome, JobRunner, JobSpec,
+    read_stage_verdict, ActivityError, DispatchedJob, JobKind, JobOutcome, JobRunner, JobSpec,
     PgClaimedDriveInput, PgFlowWorker, PgInputResolveError, PgResolvedDriveInput, PgWorkerError,
-    PgWorkflowInputResolver, WfCtx, WfError, WfResult,
+    PgWorkflowInputResolver, RetryPolicy, WfCtx, WfError, WfResult,
 };
 use myelin_tenancy::{Region, TenantId};
 use sqlx::PgPool;
@@ -26,6 +26,9 @@ use crate::check_emitter::{
 use crate::ci_drive_manifest::{
     CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1, CiManifestTrustTierV1,
     GrantedCiJobV1,
+};
+use crate::ci_run_store::{
+    CiRunFinalization, CiRunFinalizationJob, CiRunFinalizer, CiRunTerminalState,
 };
 use crate::pg_pipeline_starter::{decode_ci_claimed_input, CiWorkflowDefinitionPin};
 use crate::CI_PIPELINE_WF_TYPE;
@@ -118,6 +121,7 @@ pub fn register_ci_manifest_pipeline<R>(
     worker: &mut PgFlowWorker,
     resolver: CiManifestInputResolver,
     runner: Arc<R>,
+    finalizer: Arc<dyn CiRunFinalizer>,
 ) -> Result<(), PgWorkerError>
 where
     R: JobRunner + Send + Sync + 'static,
@@ -129,7 +133,9 @@ where
         version,
         &code_hash,
         resolver,
-        move |input, ctx| drive_resolved_ci_manifest_pipeline(input, ctx, runner.as_ref()),
+        move |input, ctx| {
+            drive_resolved_ci_manifest_pipeline(input, ctx, runner.as_ref(), finalizer.as_ref())
+        },
     )
 }
 
@@ -156,12 +162,13 @@ pub fn drive_resolved_ci_manifest_pipeline<R>(
     input: &PgResolvedDriveInput,
     ctx: &mut WfCtx,
     runner: &R,
+    finalizer: &dyn CiRunFinalizer,
 ) -> Result<Vec<ArtifactRef>, String>
 where
     R: JobRunner,
 {
     let manifest = decode_resolved_ci_manifest(input)?;
-    run_ci_manifest_pipeline(ctx, &manifest, runner)
+    run_ci_manifest_pipeline(ctx, &manifest, runner, finalizer)
         .map_err(|error| format!("manifest CI workflow failed: {error:?}"))?;
     Ok(vec![ArtifactRef(manifest.run_ref)])
 }
@@ -193,6 +200,7 @@ pub fn run_ci_manifest_pipeline<R>(
     ctx: &mut WfCtx,
     manifest: &CiDriveManifestV1,
     runner: &R,
+    finalizer: &dyn CiRunFinalizer,
 ) -> WfResult<CiManifestPipelineOutcome>
 where
     R: JobRunner,
@@ -207,7 +215,10 @@ where
             .iter()
             .filter(|job| {
                 !completed.contains(&job.job_id)
-                    && job.needs.iter().all(|dependency| completed.contains(dependency))
+                    && job
+                        .needs
+                        .iter()
+                        .all(|dependency| completed.contains(dependency))
             })
             .collect();
         if frontier.is_empty() {
@@ -256,12 +267,31 @@ where
         }
 
         if let Some((job, timed_out)) = failed {
-            emit_terminal_facts(ctx, manifest, false, Some(&job))?;
+            let terminal_state = if timed_out {
+                CiRunTerminalState::TimedOut
+            } else {
+                CiRunTerminalState::Failed
+            };
+            finalize_and_emit_terminal_facts(
+                ctx,
+                manifest,
+                terminal_state,
+                false,
+                Some(&job),
+                finalizer,
+            )?;
             return Ok(CiManifestPipelineOutcome::Failed { job, timed_out });
         }
     }
 
-    emit_terminal_facts(ctx, manifest, true, None)?;
+    finalize_and_emit_terminal_facts(
+        ctx,
+        manifest,
+        CiRunTerminalState::Succeeded,
+        true,
+        None,
+        finalizer,
+    )?;
     Ok(CiManifestPipelineOutcome::Succeeded {
         jobs_completed: completed.len(),
     })
@@ -274,13 +304,58 @@ fn join_key(job: &DispatchedJob) -> (i64, &str) {
     )
 }
 
+fn finalize_and_emit_terminal_facts(
+    ctx: &mut WfCtx,
+    manifest: &CiDriveManifestV1,
+    terminal_state: CiRunTerminalState,
+    success: bool,
+    failed_job: Option<&str>,
+    finalizer: &dyn CiRunFinalizer,
+) -> WfResult<()> {
+    let completed_at = ctx.now();
+    let finalization = CiRunFinalization {
+        tenant_id: manifest.tenant_id.clone(),
+        region: manifest.region.clone(),
+        run_id: manifest.ci_run_id.clone(),
+        wf_run_id: manifest.wf_run_id.clone(),
+        terminal_state,
+        completed_at: completed_at.clone(),
+        jobs: manifest
+            .jobs
+            .iter()
+            .map(|job| CiRunFinalizationJob {
+                job_id: job.job_id.clone(),
+                reserve_handle: job.reserve_handle.clone(),
+            })
+            .collect(),
+    };
+    let finalization_marker = ArtifactRef(format!(
+        "ci.run.finalized:{}:{}",
+        terminal_state.as_str(),
+        manifest.ci_run_id
+    ));
+    let expected_marker = finalization_marker.clone();
+    let result = ctx.activity(RetryPolicy::default_policy(), move |_idem, _attempt| {
+        finalizer
+            .finalize(&finalization)
+            .map_err(|error| ActivityError(error.to_string()))?;
+        Ok(vec![finalization_marker.clone()])
+    })?;
+    if result != vec![expected_marker] {
+        return Err(WfError::Nondeterministic(
+            "CI run finalization journal changed terminal identity".into(),
+        ));
+    }
+    emit_terminal_facts(ctx, manifest, &completed_at, success, failed_job)
+}
+
 fn emit_terminal_facts(
     ctx: &mut WfCtx,
     manifest: &CiDriveManifestV1,
+    completed_at: &str,
     success: bool,
     failed_job: Option<&str>,
 ) -> WfResult<()> {
-    let completed_at = ctx.now();
     let state = if success {
         CheckState::Success
     } else {
@@ -295,7 +370,7 @@ fn emit_terminal_facts(
             run_attempt: *attempt,
             trust_tier: manifest_check_trust_tier(manifest.trust_tier),
             started_at: manifest.started_at.clone(),
-            completed_at: Some(completed_at.clone()),
+            completed_at: Some(completed_at.to_owned()),
         };
         let payload = check_status_payload(
             &emit_context,
@@ -303,7 +378,7 @@ fn emit_terminal_facts(
             context,
             state,
             true,
-            CostPosture::Unsettled,
+            CostPosture::Settled,
             None,
         );
         ctx.emit(

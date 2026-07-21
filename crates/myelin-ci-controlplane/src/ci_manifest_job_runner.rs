@@ -24,6 +24,7 @@ use crate::ci_drive_manifest::{
 use crate::ci_manifest_pipeline::{
     decode_resolved_ci_manifest, run_ci_manifest_pipeline, CiManifestInputResolver,
 };
+use crate::ci_run_store::CiRunFinalizer;
 use crate::job_queue_store::DurableEnqueue;
 use crate::job_spec_store::CiJobSpecStore;
 use crate::scheduler::Lane;
@@ -150,6 +151,7 @@ pub fn register_durable_ci_manifest_pipeline(
     resolver: CiManifestInputResolver,
     store: CiJobSpecStore,
     token_issuer: Arc<dyn CiJobTokenIssuer>,
+    finalizer: Arc<dyn CiRunFinalizer>,
     rt: tokio::runtime::Handle,
 ) -> Result<(), PgWorkerError> {
     let version = resolver.definition().version();
@@ -167,7 +169,7 @@ pub fn register_durable_ci_manifest_pipeline(
                 Arc::clone(&token_issuer),
                 rt.clone(),
             )?;
-            run_ci_manifest_pipeline(ctx, &manifest, &runner)
+            run_ci_manifest_pipeline(ctx, &manifest, &runner, finalizer.as_ref())
                 .map_err(|error| format!("manifest CI workflow failed: {error:?}"))?;
             Ok(vec![myelin_refs::ArtifactRef(manifest.run_ref)])
         },
