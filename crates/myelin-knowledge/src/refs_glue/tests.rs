@@ -581,6 +581,25 @@ fn the_sub_anchor_ladder_lives_moves_outdates_and_gones() {
     }
 }
 
+/// CI's nested commit/check subjects retain their full canonical identity when Knowledge projects
+/// them as generic check-family anchors; neither the commit nor the check context may be dropped.
+#[test]
+fn ci_subject_sub_ids_preserve_commit_and_context() {
+    assert_eq!(
+        sub_opaque_id(&myelin_refs::Sub::CommitCheck {
+            commit_oid: "abc123".into(),
+            context: "ci-test".into(),
+        }),
+        "commit-abc123/check-ci-test"
+    );
+    assert_eq!(
+        sub_opaque_id(&myelin_refs::Sub::CommitCiResult {
+            commit_oid: "abc123".into(),
+        }),
+        "commit-abc123/ci-result"
+    );
+}
+
 /// **A `#sub` block of a CONFIDENTIAL page is tombstoned (Denied) — the sub inherits the parent
 /// permission; the excerpt/title never leaks.** (A sub is never more visible than its root, §2.1.)
 #[test]
