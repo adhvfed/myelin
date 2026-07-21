@@ -212,6 +212,12 @@ pub enum Sub {
     },
     /// `check-<context>` — a check status on a commit (CI, X-1). First-class `#sub` kind (C-6).
     Check(String),
+    /// `commit-<oid>/check-<context>` — the frozen event-bus X-1 subject for one check context.
+    /// This is one CI-owned check-family anchor even though its canonical spelling carries the
+    /// commit discriminator before the context.
+    CommitCheck { commit_oid: String, context: String },
+    /// `commit-<oid>/ci-result` — the frozen event-bus X-1 rollup subject for one commit.
+    CommitCiResult { commit_oid: String },
     /// `step-<n>` — a CI run step (jump-to-failure). First-class `#sub` kind (C-6); `<n>` is numeric.
     Step(u64),
 }
@@ -279,6 +285,7 @@ impl Sub {
             Sub::Field(_) => SubKind::Field,
             Sub::LineRange { .. } => SubKind::LineRange,
             Sub::Check(_) => SubKind::Check,
+            Sub::CommitCheck { .. } | Sub::CommitCiResult { .. } => SubKind::Check,
             Sub::Step(_) => SubKind::Step,
         }
     }
@@ -294,6 +301,33 @@ impl Sub {
 fn parse_sub(sub: &str) -> Result<Sub, ParseError> {
     if sub.is_empty() {
         return Err(ParseError::EmptySub);
+    }
+
+    // Event Bus X-1's frozen commit/check subjects are nested spellings within one `#sub`. Parse
+    // them before the flat prefix table and retain their two semantic components so formatting is
+    // canonical and consumers never need a second ad-hoc parser.
+    if let Some(commit_tail) = sub.strip_prefix("commit-") {
+        if let Some((commit_oid, context)) = commit_tail.split_once("/check-") {
+            if !commit_oid.is_empty()
+                && !context.is_empty()
+                && !commit_oid.contains('/')
+                && !context.contains('/')
+            {
+                return Ok(Sub::CommitCheck {
+                    commit_oid: commit_oid.to_string(),
+                    context: context.to_string(),
+                });
+            }
+            return Err(ParseError::UnknownSubKind { sub: sub.into() });
+        }
+        if let Some(commit_oid) = commit_tail.strip_suffix("/ci-result") {
+            if !commit_oid.is_empty() && !commit_oid.contains('/') {
+                return Ok(Sub::CommitCiResult {
+                    commit_oid: commit_oid.to_string(),
+                });
+            }
+            return Err(ParseError::UnknownSubKind { sub: sub.into() });
+        }
     }
 
     // The hyphen-terminated, multi-letter kinds first (each carries a non-empty opaque body).
@@ -362,6 +396,11 @@ fn format_sub(sub: &Sub) -> String {
         Sub::Field(id) => format!("field-{id}"),
         Sub::LineRange { start, end } => format!("L{start}-L{end}"),
         Sub::Check(ctx) => format!("check-{ctx}"),
+        Sub::CommitCheck {
+            commit_oid,
+            context,
+        } => format!("commit-{commit_oid}/check-{context}"),
+        Sub::CommitCiResult { commit_oid } => format!("commit-{commit_oid}/ci-result"),
         Sub::Step(n) => format!("step-{n}"),
     }
 }
@@ -562,6 +601,19 @@ mod tests {
             (
                 "myelin://acme/ci/check/x#check-build",
                 Sub::Check("build".into()),
+            ),
+            (
+                "myelin://acme/git/repo/core#commit-deadbeef/check-build",
+                Sub::CommitCheck {
+                    commit_oid: "deadbeef".into(),
+                    context: "build".into(),
+                },
+            ),
+            (
+                "myelin://acme/git/repo/core#commit-deadbeef/ci-result",
+                Sub::CommitCiResult {
+                    commit_oid: "deadbeef".into(),
+                },
             ),
             ("myelin://acme/ci/run/01J#step-3", Sub::Step(3)),
         ];
@@ -840,6 +892,21 @@ mod tests {
     fn sub_kind_discriminator_and_label_are_frozen() {
         assert_eq!(Sub::Comment("x".into()).kind(), SubKind::Comment);
         assert_eq!(Sub::Thread("x".into()).kind(), SubKind::Thread);
+        assert_eq!(
+            Sub::CommitCheck {
+                commit_oid: "abc".into(),
+                context: "build".into(),
+            }
+            .kind(),
+            SubKind::Check
+        );
+        assert_eq!(
+            Sub::CommitCiResult {
+                commit_oid: "abc".into(),
+            }
+            .kind(),
+            SubKind::Check
+        );
         assert_eq!(
             Sub::LineRange { start: 1, end: 2 }.kind(),
             SubKind::LineRange

@@ -572,7 +572,10 @@ enum GateOutcome {
 /// Controller-classed (the FACT that a run reached a verdict is platform metadata), Internal-visible
 /// (it drives the repo's members' run view), PII-free (references-not-payloads).
 fn run_aggregate_draft(type_: &str, run_ref: &str, payload: serde_json::Value) -> EventDraft {
-    let subject = ArtifactRef(format!("ci/run/{run_ref}"));
+    // `run_ref` is already the canonical tenant-scoped ArtifactRef carried by CheckFacts. Wrapping
+    // it in a second `ci/run/` prefix produced `ci/run/myelin://...`, which the durable outbox
+    // correctly rejects as a non-canonical subject.
+    let subject = ArtifactRef(run_ref.to_string());
     let aggregate = myelin_events::AggregateKey(format!("ci/run/{run_ref}"));
     EventDraft {
         type_: EventType(type_.to_string()),
