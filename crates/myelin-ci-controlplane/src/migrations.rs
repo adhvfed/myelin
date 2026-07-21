@@ -130,6 +130,9 @@ pub const CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID: &str = "ci_0001b_ci_run_causal_
 /// already-applied `ci_0015_ci_job_spec` table (the `ci_0002a` convention), applied immediately after
 /// it so its checksum is never rewritten and the `ci_0015` create stays byte-frozen.
 pub const CI_JOB_SPEC_STAGE_MIGRATION_ID: &str = "ci_0015a_ci_job_spec_stage";
+/// Forward-only disposition column for dependency-skipped job accounting receipts.
+pub const CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID: &str =
+    "ci_0017a_ci_job_accounting_skipped";
 /// Forward-only migration id for [`ALTER_JOB_QUEUE_ADD_COMPLETION_DDL`]. A sub-migration of the
 /// already-applied `ci_0004_job_queue` table, applied immediately after it (the `ci_0002a` convention)
 /// so the `ci_0004` create stays byte-frozen. Its ADD COLUMNs are non-blocking (a constant-default
@@ -561,6 +564,14 @@ FOR EACH ROW EXECUTE FUNCTION myelin_reject_ci_job_accounting_mutation()";
 pub const ALTER_CI_JOB_SPEC_ADD_STAGE_DDL: &str =
     "ALTER TABLE ci_job_spec ADD COLUMN IF NOT EXISTS stage text";
 
+/// Add an explicit skipped disposition without rewriting the shipped accounting-table migration.
+/// Existing completion receipts backfill to `false`; a skipped receipt can never simultaneously be
+/// passed or timed out.
+pub const ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL: &str = "ALTER TABLE ci_job_accounting \
+ADD COLUMN IF NOT EXISTS skipped boolean NOT NULL DEFAULT false, \
+ADD CONSTRAINT ci_job_accounting_skipped_verdict \
+CHECK (NOT skipped OR (NOT passed AND NOT timed_out))";
+
 /// **The immutable forward-only ALTER adding the original completion columns to `job_queue`
 /// (CT-004d.2 claim-bound completion).** `lease_epoch` is the monotone claim generation the
 /// [`crate::scheduler::CLAIM_QUERY`] bumps on every claim, so a stale worker whose lease was reaped and
@@ -860,6 +871,13 @@ pub fn ci_controlplane_migrations() -> Migrations {
                 CI_JOB_SPEC_TABLE,
             ));
         }
+        if table == CI_JOB_ACCOUNTING_TABLE {
+            migrations.push(Migration::plain_on(
+                CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID,
+                ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL,
+                CI_JOB_ACCOUNTING_TABLE,
+            ));
+        }
     }
     migrations.push(Migration::plain_on(
         CI_REGION_SCHEDULER_RLS_MIGRATION_ID,
@@ -1053,8 +1071,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            29,
-            "17 table/RLS + 1 ci_run causal ALTER + 4 concurrent-index + 1 index-validation + 2 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 scheduler-boundary + 2 scheduler claim grants"
+            30,
+            "17 table/RLS + 1 ci_run causal ALTER + 4 concurrent-index + 1 index-validation + 2 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 ci_job_accounting-skipped ALTER + 1 scheduler-boundary + 2 scheduler claim grants"
         );
         for m in &migrations.0 {
             assert!(
@@ -1080,6 +1098,8 @@ mod tests {
                 assert_eq!(m.ddl, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL);
             } else if m.id == CI_JOB_SPEC_STAGE_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL);
+            } else if m.id == CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID {
+                assert_eq!(m.ddl, ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL);
             } else if m.id == CI_JOB_QUEUE_COMPLETION_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL);
             } else if m.id == CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID {
@@ -1120,8 +1140,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            29,
-            "the runner applied all 17 table/RLS, 1 ci_run causal ALTER, 4 concurrent-index, 1 index-validation, 2 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 scheduler-boundary, and 2 scheduler claim grants"
+            30,
+            "the runner applied all 17 table/RLS, 1 ci_run causal ALTER, 4 concurrent-index, 1 index-validation, 2 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 ci_job_accounting-skipped ALTER, 1 scheduler-boundary, and 2 scheduler claim grants"
         );
         assert_eq!(
             runner.applied()[0],
