@@ -123,6 +123,8 @@ pub const CI_JOB_RUN_LEDGER_INDEX: &str = "ci_job_run_ledger";
 pub const CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID: &str = "ci_0002a_ci_job_run_ledger";
 /// Forward-only postcondition check for [`CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID`].
 pub const CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID: &str = "ci_0002b_validate_ci_job_run_ledger";
+/// Forward-only causal provenance columns for delayed CI lifecycle emission.
+pub const CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID: &str = "ci_0001b_ci_run_causal_provenance";
 /// Forward-only migration id for [`ALTER_CI_JOB_SPEC_ADD_STAGE_DDL`]. A sub-migration of the
 /// already-applied `ci_0015_ci_job_spec` table (the `ci_0002a` convention), applied immediately after
 /// it so its checksum is never rewritten and the `ci_0015` create stays byte-frozen.
@@ -181,6 +183,13 @@ CREATE TABLE IF NOT EXISTS ci_run (
   finished_at         timestamptz,
   PRIMARY KEY (tenant_id, run_id)
 )";
+
+/// Preserve the triggering envelope fields required to derive later children after outbox retention
+/// has expired. The shipped `ci_0001_ci_run` create remains byte-identical.
+pub const ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL: &str = "ALTER TABLE ci_run \
+ADD COLUMN IF NOT EXISTS cause_depth bigint NOT NULL DEFAULT 0 \
+CHECK (cause_depth BETWEEN 0 AND 4294967295), \
+ADD COLUMN IF NOT EXISTS caused_by text";
 
 /// `ci_drive_manifest` — the immutable, canonical launch authority for one CI workflow run.
 ///
@@ -759,6 +768,13 @@ pub fn ci_controlplane_migrations() -> Migrations {
     let mut migrations = Vec::new();
     for (id, table, create) in create_statements() {
         migrations.push(assemble_ci_migration(id, table, create));
+        if table == CI_RUN_TABLE {
+            migrations.push(Migration::plain_on(
+                CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID,
+                ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
+                CI_RUN_TABLE,
+            ));
+        }
         if table == CI_JOB_TABLE {
             migrations.push(Migration::plain_on(
                 CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID,
@@ -834,13 +850,20 @@ pub fn ci_controlplane_migrations() -> Migrations {
 /// forward-only), so the writer tables are present regardless of which service boots first. It shares
 /// migration ids with the full set, so a ci-controlplane boot that applies both no-ops the overlap.
 pub fn ci_durable_migrations() -> Migrations {
-    Migrations::of(
-        create_statements()
-            .into_iter()
-            .filter(|(id, _table, _create)| CI_DURABLE_WRITER_IDS.contains(id))
-            .map(|(id, table, create)| assemble_ci_migration(id, table, create))
-            .collect::<Vec<_>>(),
-    )
+    let mut migrations = create_statements()
+        .into_iter()
+        .filter(|(id, _table, _create)| CI_DURABLE_WRITER_IDS.contains(id))
+        .map(|(id, table, create)| assemble_ci_migration(id, table, create))
+        .collect::<Vec<_>>();
+    migrations.insert(
+        1,
+        Migration::plain_on(
+            CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID,
+            ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
+            CI_RUN_TABLE,
+        ),
+    );
+    Migrations::of(migrations)
 }
 
 /// The hot-table declaration for the [`ci_durable_migrations`] subset — the write-QPS tables in it
@@ -966,8 +989,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            27,
-            "16 table/RLS + 4 concurrent-index + 1 index-validation + 2 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 scheduler-boundary + 2 scheduler claim grants"
+            28,
+            "16 table/RLS + 1 ci_run causal ALTER + 4 concurrent-index + 1 index-validation + 2 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 scheduler-boundary + 2 scheduler claim grants"
         );
         for m in &migrations.0 {
             assert!(
@@ -989,6 +1012,8 @@ mod tests {
                 );
             } else if m.id == CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID {
                 assert_eq!(m.ddl, VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL);
+            } else if m.id == CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID {
+                assert_eq!(m.ddl, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL);
             } else if m.id == CI_JOB_SPEC_STAGE_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL);
             } else if m.id == CI_JOB_QUEUE_COMPLETION_MIGRATION_ID {
@@ -1031,8 +1056,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            27,
-            "the runner applied all 16 table/RLS, 4 concurrent-index, 1 index-validation, 2 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 scheduler-boundary, and 2 scheduler claim grants"
+            28,
+            "the runner applied all 16 table/RLS, 1 ci_run causal ALTER, 4 concurrent-index, 1 index-validation, 2 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 scheduler-boundary, and 2 scheduler claim grants"
         );
         assert_eq!(
             runner.applied()[0],
@@ -1339,8 +1364,14 @@ mod tests {
         let subset = ci_durable_migrations();
         let subset_ids: Vec<&str> = subset.0.iter().map(|m| m.id).collect();
         assert_eq!(
-            subset_ids, CI_DURABLE_WRITER_IDS,
-            "the subset is exactly the writer-critical ids, in create order"
+            subset_ids,
+            [
+                "ci_0001_ci_run",
+                CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID,
+                "ci_0003_check_attempt",
+                "ci_0014_ci_cost_event",
+            ],
+            "the subset is exactly the writer-critical creates plus ci_run's forward ALTER"
         );
         for m in &subset.0 {
             let full_m = full
@@ -1368,23 +1399,31 @@ mod tests {
     fn the_ci_durable_subset_applies_forward_only() {
         use myelin_substrate::MigrationRunner;
         let subset = ci_durable_migrations();
-        assert_eq!(subset.0.len(), 3, "three writer-critical CI tables");
+        assert_eq!(
+            subset.0.len(),
+            4,
+            "three writer-critical CI tables plus one forward causal ALTER"
+        );
         for m in &subset.0 {
             assert!(
                 !myelin_substrate::is_destructive(m.ddl),
                 "subset migration {} is forward-only",
                 m.id
             );
-            assert!(
-                m.ddl.contains("myelin_make_tenant_scoped"),
-                "subset migration {} installs the platform RLS policy",
-                m.id
-            );
+            if m.id == CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID {
+                assert_eq!(m.ddl, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL);
+            } else {
+                assert!(
+                    m.ddl.contains("myelin_make_tenant_scoped"),
+                    "subset migration {} installs the platform RLS policy",
+                    m.id
+                );
+            }
         }
         let mut runner = MigrationRunner::new();
         runner
             .run(&subset, &ci_durable_hot_tables())
             .expect("the CI durable writer subset applies forward-only");
-        assert_eq!(runner.applied().len(), 3);
+        assert_eq!(runner.applied().len(), 4);
     }
 }

@@ -232,6 +232,29 @@ pub struct EmitContext {
     pub caused_by: Option<CausedBy>,
 }
 
+/// The minimal causal parent snapshot retained by durable domain state across asynchronous
+/// boundaries. This carries exactly the provenance fields child derivation reads, never the parent
+/// payload. Use [`PersistedEventCause::from_envelope`] while handling the parent, then
+/// [`derive_envelope_from_persisted_cause`] when a later transaction emits the child.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedEventCause {
+    pub event_id: EventId,
+    pub correlation_id: CorrelationId,
+    pub caused_by: Option<CausedBy>,
+    pub depth: u32,
+}
+
+impl PersistedEventCause {
+    pub fn from_envelope(envelope: &EventEnvelope) -> PersistedEventCause {
+        PersistedEventCause {
+            event_id: envelope.event_id.clone(),
+            correlation_id: envelope.correlation_id.clone(),
+            caused_by: envelope.caused_by.clone(),
+            depth: envelope.depth,
+        }
+    }
+}
+
 /// **The causality derivation — correct-by-construction (P-S06; BUS-5; EI-02 §6).**
 ///
 /// This is the single function every emit path routes through, so the causal triple is
@@ -257,6 +280,18 @@ pub fn derive_envelope(
     draft: EventDraft,
     ctx: EmitContext,
     cause: Option<&EventEnvelope>,
+) -> EventEnvelope {
+    let cause = cause.map(PersistedEventCause::from_envelope);
+    derive_envelope_from_persisted_cause(draft, ctx, cause.as_ref())
+}
+
+/// Derive a child from durable causal provenance without retaining or reloading the parent payload.
+/// This is the asynchronous equivalent of [`derive_envelope`]: the immediate parent, causal root,
+/// originating human action, and saturating depth use the same rules.
+pub fn derive_envelope_from_persisted_cause(
+    draft: EventDraft,
+    ctx: EmitContext,
+    cause: Option<&PersistedEventCause>,
 ) -> EventEnvelope {
     let (causation_id, correlation_id, depth, caused_by) = match cause {
         // Root: carries its own correlation; depth 0; no parent.
@@ -521,6 +556,22 @@ mod tests {
             Some(CausedBy("session:abc".into())),
             "the originating human action is INHERITED from the parent, not re-seeded \
              from the child's own context (a deep chain still attributes to the human)"
+        );
+    }
+
+    #[test]
+    fn persisted_cause_derivation_is_identical_to_full_parent_derivation() {
+        let parent = anchor_envelope();
+        let persisted = PersistedEventCause::from_envelope(&parent);
+        let draft = draft_for("ci.check.updated");
+        let ctx = ctx_for(EventId("01J-child-from-state".into()), None);
+
+        let from_envelope = derive_envelope(draft.clone(), ctx.clone(), Some(&parent));
+        let from_persisted = derive_envelope_from_persisted_cause(draft, ctx, Some(&persisted));
+
+        assert_eq!(
+            from_persisted, from_envelope,
+            "durable causal provenance must derive the byte-identical child envelope"
         );
     }
 

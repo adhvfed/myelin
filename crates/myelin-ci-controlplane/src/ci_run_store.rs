@@ -87,6 +87,10 @@ pub struct CiRunInsert {
     pub correlation_id: String,
     /// `ci_run.cause_event_id` (nullable) — the triggering `event_id` (the cause provenance).
     pub cause_event_id: Option<String>,
+    /// Depth of the triggering envelope retained for saturating child derivation.
+    pub cause_depth: i64,
+    /// Originating human/session action inherited by later lifecycle facts.
+    pub caused_by: Option<String>,
     /// `ci_run.repo_ref` (nullable) — the repo the run ran against (the check-seam / run-view key half).
     pub repo_ref: Option<String>,
     /// `ci_run.commit_oid` (nullable) — the commit the run ran against (the CheckStatus key half).
@@ -121,6 +125,10 @@ pub struct CiRunRecord {
     pub commit_oid: Option<String>,
     /// `ci_run.cause_event_id` (nullable).
     pub cause_event_id: Option<String>,
+    /// `ci_run.cause_depth`.
+    pub cause_depth: i64,
+    /// `ci_run.caused_by` (nullable).
+    pub caused_by: Option<String>,
     /// `ci_run.definition_snapshot`.
     pub definition_snapshot: String,
     /// `ci_run.trigger_kind`.
@@ -142,11 +150,11 @@ pub struct CiRunRecord {
 pub const INSERT_CI_RUN_QUERY: &str = "\
 INSERT INTO ci_run (
   tenant_id, region, run_id, project_id, pipeline_id, wf_run_id,
-  repo_ref, commit_oid, cause_event_id, definition_snapshot,
+  repo_ref, commit_oid, cause_event_id, cause_depth, caused_by, definition_snapshot,
   trigger_kind, triggered_by, trust_tier, state, correlation_id
 ) VALUES (
   $1, $2, $3::uuid, $4::uuid, $5::uuid, $6::uuid,
-  $7, $8, $9, $10, $11, $12, $13, $14, $15
+  $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
 )
 ON CONFLICT (tenant_id, run_id) DO NOTHING
 RETURNING run_id";
@@ -168,12 +176,14 @@ SELECT
   repo_ref IS NOT DISTINCT FROM $7::text           AS repo_ref_matches,
   commit_oid IS NOT DISTINCT FROM $8::text         AS commit_oid_matches,
   cause_event_id IS NOT DISTINCT FROM $9::text     AS cause_event_id_matches,
-  definition_snapshot = $10                        AS definition_snapshot_matches,
-  trigger_kind = $11                               AS trigger_kind_matches,
-  trust_tier = $12                                 AS trust_tier_matches,
-  correlation_id = $13                             AS correlation_id_matches,
-  (triggered_by IS NOT DISTINCT FROM $14::text
-    OR triggered_by = $15::text)                   AS triggered_by_matches
+  cause_depth = $10                                 AS cause_depth_matches,
+  caused_by IS NOT DISTINCT FROM $11::text          AS caused_by_matches,
+  definition_snapshot = $12                        AS definition_snapshot_matches,
+  trigger_kind = $13                               AS trigger_kind_matches,
+  trust_tier = $14                                 AS trust_tier_matches,
+  correlation_id = $15                             AS correlation_id_matches,
+  (triggered_by IS NOT DISTINCT FROM $16::text
+    OR triggered_by = $17::text)                   AS triggered_by_matches
 FROM ci_run
 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid
 FOR KEY SHARE";
@@ -192,6 +202,8 @@ SELECT
   repo_ref                AS repo_ref,
   commit_oid              AS commit_oid,
   cause_event_id          AS cause_event_id,
+  cause_depth             AS cause_depth,
+  caused_by               AS caused_by,
   definition_snapshot     AS definition_snapshot,
   trigger_kind            AS trigger_kind,
   trust_tier              AS trust_tier,
@@ -212,6 +224,9 @@ pub enum CiRunStoreError {
     /// Reserve/start may create a run only in the canonical initial state (`queued`). Checked before
     /// opening a transaction or executing SQL.
     InvalidInitialState,
+    /// The retained triggering-envelope depth cannot be represented by the canonical `u32`
+    /// envelope depth. Checked before opening a transaction or executing SQL.
+    InvalidCausalDepth,
     /// The primary key already exists, but its immutable run identity differs from this replay.
     /// Field names only: submitted and stored values are deliberately never exposed in the error.
     ReplayCollision {
@@ -235,6 +250,10 @@ impl core::fmt::Display for CiRunStoreError {
             CiRunStoreError::InvalidInitialState => {
                 write!(f, "durable ci_run insert requires the queued initial state")
             }
+            CiRunStoreError::InvalidCausalDepth => write!(
+                f,
+                "durable ci_run insert requires cause_depth in the canonical u32 range"
+            ),
             CiRunStoreError::ReplayCollision { differing_fields } => write!(
                 f,
                 "durable ci_run replay collided on immutable fields: {}",
@@ -379,6 +398,8 @@ impl CiRunStore {
             repo_ref: r.get("repo_ref"),
             commit_oid: r.get("commit_oid"),
             cause_event_id: r.get("cause_event_id"),
+            cause_depth: r.get("cause_depth"),
+            caused_by: r.get("caused_by"),
             definition_snapshot: r.get("definition_snapshot"),
             trigger_kind: r.get("trigger_kind"),
             trust_tier: r.get("trust_tier"),
@@ -407,12 +428,14 @@ async fn insert_on_conn(
         .bind(&row.repo_ref) // $7 repo_ref (nullable)
         .bind(&row.commit_oid) // $8 commit_oid (nullable)
         .bind(&row.cause_event_id) // $9 cause_event_id (nullable)
-        .bind(&row.definition_snapshot) // $10 definition_snapshot
-        .bind(&row.trigger_kind) // $11 trigger_kind
-        .bind(&row.triggered_by) // $12 triggered_by (nullable pseudonym)
-        .bind(&row.trust_tier) // $13 trust_tier
-        .bind(&row.state) // $14 state
-        .bind(&row.correlation_id) // $15 correlation_id
+        .bind(row.cause_depth) // $10 cause_depth
+        .bind(&row.caused_by) // $11 caused_by (nullable)
+        .bind(&row.definition_snapshot) // $12 definition_snapshot
+        .bind(&row.trigger_kind) // $13 trigger_kind
+        .bind(&row.triggered_by) // $14 triggered_by (nullable pseudonym)
+        .bind(&row.trust_tier) // $15 trust_tier
+        .bind(&row.state) // $16 state
+        .bind(&row.correlation_id) // $17 correlation_id
         .fetch_optional(&mut *conn)
         .await
         .map_err(|e| CiRunStoreError::Db(e.to_string()))?;
@@ -432,6 +455,8 @@ async fn insert_on_conn(
         .bind(&row.repo_ref)
         .bind(&row.commit_oid)
         .bind(&row.cause_event_id)
+        .bind(row.cause_depth)
+        .bind(&row.caused_by)
         .bind(&row.definition_snapshot)
         .bind(&row.trigger_kind)
         .bind(&row.trust_tier)
@@ -455,6 +480,8 @@ async fn insert_on_conn(
             "cause_event_id",
             stored.get::<bool, _>("cause_event_id_matches"),
         ),
+        ("cause_depth", stored.get::<bool, _>("cause_depth_matches")),
+        ("caused_by", stored.get::<bool, _>("caused_by_matches")),
         (
             "definition_snapshot",
             stored.get::<bool, _>("definition_snapshot_matches"),
@@ -486,11 +513,12 @@ async fn insert_on_conn(
 }
 
 fn validate_initial_state(row: &CiRunInsert) -> Result<(), CiRunStoreError> {
-    if row.state == "queued" {
-        Ok(())
-    } else {
-        Err(CiRunStoreError::InvalidInitialState)
+    if row.state != "queued" {
+        return Err(CiRunStoreError::InvalidInitialState);
     }
+    u32::try_from(row.cause_depth)
+        .map(|_| ())
+        .map_err(|_| CiRunStoreError::InvalidCausalDepth)
 }
 
 #[cfg(test)]
@@ -511,13 +539,15 @@ mod tests {
             state: "queued".into(),
             correlation_id: "corr-1".into(),
             cause_event_id: Some("ev-push-1".into()),
+            cause_depth: 0,
+            caused_by: None,
             repo_ref: Some("web".into()),
             commit_oid: Some("deadbeef".into()),
             triggered_by: None,
         }
     }
 
-    /// The INSERT binds all 15 columns + is idempotent on the `(tenant_id, run_id)` PK (the DB-free
+    /// The INSERT binds all 17 columns + is idempotent on the `(tenant_id, run_id)` PK (the DB-free
     /// shape assertions; the live round-trip + co-commit atomicity are the integration proofs).
     #[test]
     fn insert_query_is_idempotent_on_the_pk_and_binds_every_column() {
@@ -525,13 +555,13 @@ mod tests {
             INSERT_CI_RUN_QUERY.contains("ON CONFLICT (tenant_id, run_id) DO NOTHING"),
             "idempotent on the run-of-record PK"
         );
-        // 15 bind placeholders ($1..$15) for the 15 writer-set columns.
-        for n in 1..=15 {
+        // 17 bind placeholders ($1..$17) for the 17 writer-set columns.
+        for n in 1..=17 {
             assert!(INSERT_CI_RUN_QUERY.contains(&format!("${n}")), "binds ${n}");
         }
         assert!(
-            !INSERT_CI_RUN_QUERY.contains("$16"),
-            "no over-bind past $15"
+            !INSERT_CI_RUN_QUERY.contains("$18"),
+            "no over-bind past $17"
         );
         // The uuid columns are cast from text (the CT-004b proven posture).
         assert!(INSERT_CI_RUN_QUERY.contains("$3::uuid"));
@@ -559,6 +589,8 @@ mod tests {
             "repo_ref",
             "commit_oid",
             "cause_event_id",
+            "cause_depth",
+            "caused_by",
             "definition_snapshot",
             "trigger_kind",
             "trust_tier",
@@ -585,6 +617,22 @@ mod tests {
         assert_eq!(
             validate_initial_state(&r),
             Err(CiRunStoreError::InvalidInitialState)
+        );
+    }
+
+    #[test]
+    fn non_canonical_causal_depth_is_rejected_before_sql() {
+        let mut r = sample_row();
+        r.cause_depth = -1;
+        assert_eq!(
+            validate_initial_state(&r),
+            Err(CiRunStoreError::InvalidCausalDepth)
+        );
+
+        r.cause_depth = i64::from(u32::MAX) + 1;
+        assert_eq!(
+            validate_initial_state(&r),
+            Err(CiRunStoreError::InvalidCausalDepth)
         );
     }
 }

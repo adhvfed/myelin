@@ -313,6 +313,8 @@ pub struct ArmedRun {
     /// The triggering envelope's ambient emit context (tenant/region/actor/clock) the co-committed
     /// events derive their causality + partition from.
     pub emit_ctx: EmitContextBase,
+    /// The triggering event retained as the immediate causal parent of every reserve/start event.
+    pub cause: EventEnvelope,
 }
 
 /// Why persisting the reserve bundle failed (fail-closed — surfaced, never swallowed).
@@ -434,11 +436,15 @@ fn emit_reserve_events(
         "evt:{}",
         armed.handoff.run_started.subject.0
     )));
-    tx.emit_with_id(started_id, armed.handoff.run_started.clone(), None)
-        .map_err(|e| ReserveError(format!("ci.run.started emit: {e:?}")))?;
+    tx.emit_with_id(
+        started_id,
+        armed.handoff.run_started.clone(),
+        Some(&armed.cause),
+    )
+    .map_err(|e| ReserveError(format!("ci.run.started emit: {e:?}")))?;
     for check in &armed.handoff.queued_checks {
         let check_id = check_event_id(&armed.handoff.run_write.run_id, &check.subject.0);
-        tx.emit_with_id(check_id, check.clone(), None)
+        tx.emit_with_id(check_id, check.clone(), Some(&armed.cause))
             .map_err(|e| ReserveError(format!("queued ci.check.updated emit: {e:?}")))?;
     }
     Ok(())
@@ -464,6 +470,8 @@ pub fn ci_run_insert_from_armed(armed: &ArmedRun) -> myelin_ci_controlplane::CiR
         state: rw.state.clone(),
         correlation_id: armed.reserve.correlation_id.clone(),
         cause_event_id: Some(rw.cause_event_id.clone()),
+        cause_depth: i64::from(armed.cause.depth),
+        caused_by: armed.cause.caused_by.as_ref().map(|value| value.0.clone()),
         repo_ref: Some(armed.reserve.repo_ref.clone()),
         commit_oid: Some(armed.reserve.commit_oid.clone()),
         triggered_by: Some(armed.actor.0.principal_id.0.clone()),
@@ -898,7 +906,7 @@ pub fn plan_dispatch(
     let contexts: Vec<CheckContext> = def
         .jobs
         .iter()
-        .map(|j| CheckContext::ci(j.name.clone()))
+        .map(|j| CheckContext::ci(myelin_ci_controlplane::ci_check_context_v1(&j.name)))
         .collect();
     let run_facts = RunFacts {
         run_id: run_id.clone(),
@@ -934,6 +942,7 @@ pub fn plan_dispatch(
         tenant,
         actor: ev.actor.clone(),
         emit_ctx,
+        cause: ev.clone(),
     }))
 }
 

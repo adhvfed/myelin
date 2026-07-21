@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 use myelin_ci_controlplane::{
     CiDriveManifestStore, CiDriveManifestV1, CiManifestLaneV1, CiManifestLimitsV1,
     CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, GrantedCiJobV1,
-    CI_PIPELINE_WF_TYPE, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_RUN_DDL,
+    ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, CI_PIPELINE_WF_TYPE, CREATE_CI_DRIVE_MANIFEST_DDL,
+    CREATE_CI_RUN_DDL,
 };
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool};
@@ -76,13 +77,13 @@ fn manifest() -> CiDriveManifestV1 {
         run_ref: "myelin://manifest-live/ci/run/22222222-2222-8222-8222-222222222222".into(),
         started_at: "2026-07-21T12:34:56.000000Z".into(),
         trust_tier: CiManifestTrustTierV1::Trusted,
-        check_attempts: BTreeMap::from([("ci:build".into(), 9)]),
+        check_attempts: BTreeMap::from([("build".into(), 9)]),
         merge_waiter: None,
         jobs: vec![GrantedCiJobV1 {
             job_id: "33333333-3333-8333-8333-333333333333".into(),
             stage: "build".into(),
             name: "build".into(),
-            check_context: "ci:build".into(),
+            check_context: "build".into(),
             needs: Vec::new(),
             matrix_key: BTreeMap::new(),
             image: format!("registry.example/build@sha256:{}", "d".repeat(64)),
@@ -138,6 +139,7 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     let app = pinned_pool(&app_url(), &schema).await;
     sqlx::raw_sql(&format!(
         "{CREATE_CI_RUN_DDL};
+         {ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL};
          SELECT myelin_make_tenant_scoped('ci_run');
          {CREATE_CI_DRIVE_MANIFEST_DDL};
          SELECT myelin_make_tenant_scoped('ci_drive_manifest');"

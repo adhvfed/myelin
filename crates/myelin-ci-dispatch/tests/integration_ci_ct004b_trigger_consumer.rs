@@ -486,6 +486,19 @@ async fn h1_production_outbox_absorb_closes_the_livelock() {
         .await
         .unwrap();
     assert_eq!(total, 3, "exactly 3 outbox rows (1 started + 2 checks) — the absorb added no duplicates");
+    let envelopes: Vec<serde_json::Value> =
+        sqlx::query_scalar("SELECT envelope FROM outbox ORDER BY aggregate, seq")
+            .fetch_all(&p)
+            .await
+            .unwrap();
+    assert!(
+        envelopes.iter().all(|envelope| {
+            envelope["causation_id"] == ev.event_id.0
+                && envelope["correlation_id"] == ev.correlation_id.0
+                && envelope["depth"] == ev.depth + 1
+        }),
+        "every reserve/start fact preserves the trigger's immediate parent, root, and depth"
+    );
 
     p.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str()).await.ok();
     println!("[H1/3] PASS livelock closed: the production OutboxReserveStore ABSORBS the deterministic re-emit (2× persist → Ok, 3 rows exactly once), no Err-retry livelock.");

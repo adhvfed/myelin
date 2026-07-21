@@ -11,9 +11,9 @@ use myelin_ci_controlplane::{
     CiJobLaunchGrantV1, CiLaunchAuthorityError, CiLaunchAuthorityMaterializer, CiLaunchAuthorityV1,
     CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1, CiWorkflowDefinitionPin,
     PgCiPipelineStarter, PgCiRunStarterFactory, PreparedRunPlanV2, ResolvedJobV2,
-    ResolvedRunPlanV2, StartQueuedOutcome, CI_JOB_RUN_LEDGER_INDEX, CREATE_CHECK_ATTEMPT_DDL,
-    CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
-    CREATE_CI_RUN_DDL,
+    ResolvedRunPlanV2, StartQueuedOutcome, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
+    CI_JOB_RUN_LEDGER_INDEX, CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL,
+    CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_RUN_DDL,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::MonotonicMinter;
@@ -290,11 +290,11 @@ async fn insert_run(
     );
     sqlx::query(
         "INSERT INTO ci_run (tenant_id, region, run_id, project_id, pipeline_id, wf_run_id, \
-         repo_ref, commit_oid, definition_snapshot, trigger_kind, trust_tier, state, correlation_id) \
+         repo_ref, commit_oid, cause_event_id, cause_depth, caused_by, definition_snapshot, trigger_kind, trust_tier, state, correlation_id) \
          VALUES ($1, 'fr-par', $2::uuid, '22222222-2222-2222-2222-222222222222'::uuid, \
          '33333333-3333-3333-3333-333333333333'::uuid, $3::uuid, \
-         'myelin://' || $1 || '/git/repo/core', 'deadbeef', $4, \
-         'push', 'trusted', 'queued', $2)",
+         'myelin://' || $1 || '/git/repo/core', 'deadbeef', 'trigger-' || $2, 1, 'session:test', $4, \
+         'push', 'trusted', 'queued', 'corr-' || $2)",
     )
     .bind(tenant)
     .bind(run_id)
@@ -359,6 +359,86 @@ async fn attempt_rows(
     .fetch_all(admin)
     .await
     .expect("read exact check-attempt ledger")
+}
+
+async fn initial_check_envelopes(
+    admin: &PgPool,
+    tenant: &str,
+    run_id: &str,
+) -> Vec<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT envelope FROM outbox \
+         WHERE envelope->>'type_' = 'ci.check.updated' \
+           AND envelope->>'tenant' = $1 \
+           AND envelope->'payload'->>'run' = $2 \
+           AND envelope->'payload'->>'state' = 'in_progress' \
+         ORDER BY envelope->'payload'->'context'->>'name'",
+    )
+    .bind(tenant)
+    .bind(ci_run_ref(tenant, run_id).0)
+    .fetch_all(admin)
+    .await
+    .expect("read initial check outbox facts")
+}
+
+async fn assert_initial_checks(admin: &PgPool, tenant: &str, run_id: &str, attempt: u32) {
+    let started_at: String = sqlx::query_scalar(
+        "SELECT to_char(created_at AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
+         FROM ci_run WHERE tenant_id=$1 AND run_id=$2::uuid",
+    )
+    .bind(tenant)
+    .bind(run_id)
+    .fetch_one(admin)
+    .await
+    .expect("read immutable CI start timestamp");
+    let run_ref = ci_run_ref(tenant, run_id).0;
+    let rows = initial_check_envelopes(admin, tenant, run_id).await;
+    assert_eq!(rows.len(), 3, "one initial fact per authored context");
+    let expected_contexts = ["build", "package", "test"];
+    for (envelope, context) in rows.iter().zip(expected_contexts) {
+        let payload = &envelope["payload"];
+        assert_eq!(envelope["tenant"], tenant);
+        assert_eq!(envelope["region"], "fr-par");
+        assert_eq!(envelope["causation_id"], format!("trigger-{run_id}"));
+        assert_eq!(envelope["correlation_id"], format!("corr-{run_id}"));
+        assert_eq!(envelope["caused_by"], "session:test");
+        assert_eq!(envelope["depth"], 2);
+        let occurred_at = envelope["occurred_at"]
+            .as_str()
+            .expect("check occurrence timestamp is a string");
+        let recorded_at = envelope["recorded_at"]
+            .as_str()
+            .expect("check recording timestamp is a string");
+        assert!(occurred_at.contains('T') && occurred_at.ends_with('Z'));
+        assert_eq!(recorded_at, occurred_at);
+        assert!(
+            occurred_at >= started_at.as_str(),
+            "the actual emission clock cannot predate the immutable run start"
+        );
+        assert_eq!(payload["tenant"], tenant);
+        assert_eq!(payload["repo"], format!("myelin://{tenant}/git/repo/core"));
+        assert_eq!(payload["commit_oid"], "deadbeef");
+        assert_eq!(
+            payload["context"],
+            serde_json::json!({
+                "provider": "ci",
+                "name": context,
+            })
+        );
+        assert_eq!(payload["state"], "in_progress");
+        assert_eq!(payload["required"], true);
+        assert_eq!(payload["run"], run_ref);
+        assert_eq!(payload["run_attempt"], attempt);
+        assert_eq!(payload["trust_tier"], "trusted");
+        assert_eq!(payload["details_ref"], format!("{run_ref}#summary"));
+        assert_eq!(payload["started_at"], started_at);
+        assert!(payload["completed_at"].is_null());
+        assert_eq!(payload["cost_settled"], false);
+        assert!(envelope["event_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("ci-check-start-")));
+    }
 }
 
 type CiJobLedgerRow = (
@@ -564,6 +644,10 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .await
     .expect("flow migrations");
     admin.execute(CREATE_CI_RUN_DDL).await.expect("ci_run DDL");
+    admin
+        .execute(ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL)
+        .await
+        .expect("ci_run causal provenance migration");
     sqlx::raw_sql(CREATE_CI_DRIVE_MANIFEST_DDL)
         .execute(&admin)
         .await
@@ -644,6 +728,11 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .await
     .unwrap();
     assert_eq!(denied_side_effects, (0, 0));
+    assert!(
+        initial_check_envelopes(&admin, "tenant_no_authority", denied_run)
+            .await
+            .is_empty()
+    );
 
     // Two concurrent starters see one row. SKIP LOCKED lets one win and the other return idle;
     // there is exactly one workflow and the state transition cannot split from it.
@@ -680,17 +769,17 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         first_attempt_rows,
         vec![
             (
-                "ci:build".into(),
+                "build".into(),
                 2,
                 Some(sqlx::types::Uuid::parse_str(run1).unwrap()),
             ),
             (
-                "ci:package".into(),
+                "package".into(),
                 2,
                 Some(sqlx::types::Uuid::parse_str(run1).unwrap()),
             ),
             (
-                "ci:test".into(),
+                "test".into(),
                 2,
                 Some(sqlx::types::Uuid::parse_str(run1).unwrap()),
             ),
@@ -705,6 +794,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .await
     .unwrap();
     assert_eq!(run1_manifest_count, 1);
+    assert_initial_checks(&admin, "tenant_a", run1, 1).await;
     assert_eq!(
         AUTHORITY_CALLS.load(Ordering::SeqCst),
         1,
@@ -781,6 +871,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     ));
     assert_atomic_started(&admin, "tenant_a", run1, true, true).await;
     assert_exact_jobs(&admin, "tenant_a", run1).await;
+    assert_initial_checks(&admin, "tenant_a", run1, 1).await;
 
     // A divergent immutable field is refused before the queued split can commit. Restore the
     // adversarial edit after the probe, never through the starter.
@@ -970,6 +1061,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .run_once()
         .await
         .expect("create the complete manifest-backed start");
+    assert_initial_checks(&admin, "tenant_a", run2, 2).await;
     sqlx::query("UPDATE ci_run SET state='queued' WHERE tenant_id='tenant_a' AND run_id=$1::uuid")
         .bind(run2)
         .execute(&admin)
@@ -1056,6 +1148,9 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         (0, 0),
         "manifest and attempt allocation roll back with workflow, jobs, and state"
     );
+    assert!(initial_check_envelopes(&admin, "tenant_rollback", run3)
+        .await
+        .is_empty());
 
     // A manifest and workflow are an atomic replay pair. An orphan manifest is corruption and must
     // not invoke current authority or synthesize a replacement workflow.
@@ -1122,7 +1217,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .await
     .unwrap();
     sqlx::query(
-        "DELETE FROM check_attempt WHERE tenant_id='tenant_attempt_tamper' AND context='ci:test'",
+        "DELETE FROM check_attempt WHERE tenant_id='tenant_attempt_tamper' AND context='test'",
     )
     .execute(&admin)
     .await
