@@ -1,4 +1,8 @@
-//! # `ci_pipeline` — the `ci.pipeline` DURABLE WORKFLOW BODY + the X-1 producer side (CI-P15 → P-358, M4)
+//! # `ci_pipeline` — legacy sequential `ci.pipeline` compatibility body + X-1 fixtures
+//!
+//! Production manifest-backed launches use [`crate::ci_manifest_pipeline`], which preserves the
+//! immutable V2 DAG and per-context attempts. This module remains for pinned legacy definitions and
+//! its contract/drill fixtures; it must not be registered for a manifest-backed run.
 //!
 //! **Owning architecture doc (byte-authoritative):**
 //! `planning/04-subsystem-architectures/continuous-integration/architecture/02-internals-and-algorithms.md`
