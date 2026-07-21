@@ -759,6 +759,34 @@ manifest + start the manifest-referenced workflow in one transaction. Its curren
 is therefore not promoted, and production activation remains refused until that authority adapter and
 the DAG-native body consume path land.
 
+**CI manifest-backed V2 queued launch (2026-07-21, `226a1a9` + `7738b7d`).** The exact-cell starter
+now accepts only canonical V2 launch requests and has an explicit asynchronous launch-authority
+boundary. There is no permissive production adapter: the composition-root default refuses a fresh run
+before allocating attempts or writing durable state. The authority can grant only runtime terms; job
+identity, authored stage, matrix, dependencies, image, command, workspace, trust, check context, and
+attempt are derived from the locked `ci_run` plus validated V2 plan. Failure semantics remain fixed at
+`continue_on_error=false` until the authored contract can request them. The exact queued-row lock winner
+alone invokes authority, whose external reserve/token implementation is contractually retry-safe by
+run id. In one scoped PostgreSQL transaction the starter allocates distinct authored-context attempts,
+builds/inserts the canonical immutable manifest, materializes the exact job ledger, starts/verifies the
+workflow with `[drive-manifest digest ref, ci_run ref]`, and advances `queued -> running`; any later
+failure rolls the whole set back. Replay is genuinely manifest-backed: it reads neither the source CAS
+nor current policy/current composition pin, requires manifest+workflow as an atomic pair, validates the
+frozen definition pin and attempt-ledger consistency, reconstructs immutable job facts directly from
+the manifest, refuses missing rows, and preserves advanced lifecycle fields. Validation now pins the
+V2 snapshot class, derived check contexts, bounded collections/resource ceilings, exact run-plan image
+and argv semantics, and observable database causes. Live proof covers winner-only authority under two
+concurrent starters, one manifest/workflow and one attempt allocation per context, unavailable-authority
+zero-side-effect refusal, replay after source-CAS deletion and a bogus current pin, older-run replay
+after check supersession without reallocating, orphan manifest/missing attempt/missing job refusal,
+advanced job-state preservation, cross-cell RLS, and rollback of manifest/jobs/workflow/attempts/state.
+Proof: 370/370 control-plane unit tests, all-target/all-feature clippy with warnings denied, the expanded
+live PostgreSQL starter proof 1/1, and an independent focused audit with no remaining blocker from its
+five findings. **Honest remaining activation floors:** compose a real policy-aware authority adapter,
+emit the initial queued/in-progress check facts, make the durable workflow body consume this manifest as
+a DAG, add exact-tenant poller/worker fan-out, and close the myelin-flow M2 durable `RunStore` floor.
+`MYELIN_CI_RUNNER=1` remains startup-refused; this increment does not activate production execution.
+
 ## R5–R6
 
 | Phase | Status |
