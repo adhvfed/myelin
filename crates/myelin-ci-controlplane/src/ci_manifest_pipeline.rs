@@ -255,10 +255,18 @@ where
                     job_verdicts.insert(job.job_id.clone(), false);
                 }
                 JobOutcome::Completed { result, .. } => {
-                    let passed = matches!(
-                        read_stage_verdict(&result),
-                        Some((ref concrete_name, true)) if concrete_name == &job.name
-                    );
+                    let (verdict_job, passed) = read_stage_verdict(&result).ok_or_else(|| {
+                        WfError::CoCommit(format!(
+                            "manifest CI job `{}` completed without a terminal verdict marker",
+                            job.name
+                        ))
+                    })?;
+                    if verdict_job != job.name {
+                        return Err(WfError::CoCommit(format!(
+                            "manifest CI job `{}` received a verdict attributed to `{verdict_job}`",
+                            job.name
+                        )));
+                    }
                     if !passed {
                         failed.get_or_insert_with(|| (job.name.clone(), false));
                     }
