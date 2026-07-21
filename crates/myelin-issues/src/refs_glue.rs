@@ -964,6 +964,11 @@ fn sub_opaque_id(sub: &myelin_refs::Sub) -> String {
         | Sub::Thread(id)
         | Sub::Message(id)
         | Sub::Check(id) => id.clone(),
+        Sub::CommitCheck {
+            commit_oid,
+            context,
+        } => format!("commit-{commit_oid}/check-{context}"),
+        Sub::CommitCiResult { commit_oid } => format!("commit-{commit_oid}/ci-result"),
         Sub::Step(n) => n.to_string(),
         Sub::LineRange { start, end } => format!("L{start}-L{end}"),
     }

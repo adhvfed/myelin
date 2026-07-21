@@ -43,6 +43,20 @@ fn issue(key: &str) -> ArtifactRef {
     issue_root_ref("acme", key)
 }
 
+#[test]
+fn foreign_commit_check_subanchors_preserve_their_canonical_opaque_body() {
+    let check = myelin_refs::sub_kind(&ArtifactRef(
+        "myelin://acme/issue/issue/ENG-1#commit-deadbeef/check-build".into(),
+    ))
+    .expect("commit check sub");
+    let result = myelin_refs::sub_kind(&ArtifactRef(
+        "myelin://acme/issue/issue/ENG-1#commit-deadbeef/ci-result".into(),
+    ))
+    .expect("commit result sub");
+    assert_eq!(sub_opaque_id(&check), "commit-deadbeef/check-build");
+    assert_eq!(sub_opaque_id(&result), "commit-deadbeef/ci-result");
+}
+
 fn z() -> Zookie {
     Zookie("z0".into())
 }
