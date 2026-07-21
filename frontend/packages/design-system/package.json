@@ -23,6 +23,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint src styleguide build-tokens.mjs scripts",
     "lint:prove": "eslint fixtures/red",
+    "pretest": "pnpm build:tokens && pnpm build:assets && pnpm build:verify",
     "test": "vitest run"
   },
   "dependencies": {
