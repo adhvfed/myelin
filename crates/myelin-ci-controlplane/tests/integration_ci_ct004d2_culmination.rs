@@ -40,8 +40,8 @@ use myelin_ci_controlplane::{
 };
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
-    resolved_gvisor_rootfs, CompletionClaim, FirehoseSink, ReserveHandle, RunnerAgent, RunnerHooks,
-    TerminalReport, TerminalReporter, TrustTier,
+    resolved_gvisor_rootfs, CompletionClaim, FirehoseSink, ReserveHandle, ResourceUsage,
+    RunnerAgent, RunnerHooks, TerminalReport, TerminalReporter, TrustTier,
 };
 use myelin_events::{Actor, IdMinter, MonotonicMinter, OutboxStore};
 use myelin_flow::{
@@ -788,8 +788,14 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         OutboxStore::new(),
     );
     let tid = TenantId(tenant.into());
+    let usage = || ResourceUsage {
+        cpu_seconds: 17,
+        mem_byte_seconds: 4_096,
+    };
     let pass = || TerminalReport {
         passed: true,
+        timed_out: false,
+        usage: usage(),
         result_refs: vec![],
     };
 
@@ -838,8 +844,24 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         "the unguessable claim nonce is required"
     );
 
+    let contradictory = reporter.report_done(
+        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &nonce),
+        &TerminalReport {
+            passed: true,
+            timed_out: true,
+            usage: usage(),
+            result_refs: vec![],
+        },
+    );
+    assert!(
+        matches!(contradictory, Err(ExecutorError::InvalidInput(_))),
+        "a timed-out job cannot forge a passing verdict"
+    );
+
     let invalid_ref = TerminalReport {
         passed: true,
+        timed_out: false,
+        usage: usage(),
         result_refs: vec![ArtifactRef("myelin://acme/ci/run/deep/not-scoped".into())],
     };
     let invalid = reporter.report_done(
@@ -925,6 +947,8 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &nonce),
         &TerminalReport {
             passed: false,
+            timed_out: false,
+            usage: usage(),
             result_refs: vec![],
         },
     );
@@ -936,12 +960,30 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &nonce),
         &TerminalReport {
             passed: true,
+            timed_out: false,
+            usage: usage(),
             result_refs: vec![ArtifactRef("myelin://acme/ci/artifact/build-output".into())],
         },
     );
     assert!(
         matches!(divergent_refs, Err(ExecutorError::InvalidInput(_))),
         "an ordered result-ref divergence changes the receipt and is refused"
+    );
+    let divergent_usage = reporter.report_done(
+        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &nonce),
+        &TerminalReport {
+            passed: true,
+            timed_out: false,
+            usage: ResourceUsage {
+                cpu_seconds: usage().cpu_seconds + 1,
+                ..usage()
+            },
+            result_refs: vec![],
+        },
+    );
+    assert!(
+        matches!(divergent_usage, Err(ExecutorError::InvalidInput(_))),
+        "an actual-usage divergence changes the receipt and is refused"
     );
 
     // ── FAIL-CLOSED run: a dispatched stage whose durable spec stage is NULL. ──

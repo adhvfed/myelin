@@ -220,6 +220,11 @@ fn the_provider_keys_job_done_on_the_frozen_consumer_tuple() {
             },
             &TerminalReport {
                 passed: true,
+                timed_out: false,
+                usage: ResourceUsage {
+                    cpu_seconds: 0,
+                    mem_byte_seconds: 0,
+                },
                 result_refs: vec![],
             },
         )

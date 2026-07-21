@@ -49,7 +49,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use myelin_ci_sandbox::{
-    CompletionClaim, IdemToken, JobSpec as SandboxJobSpec, TerminalReport, TerminalReporter,
+    CompletionClaim, IdemToken, JobSpec as SandboxJobSpec, ResourceUsage, TerminalReport,
+    TerminalReporter,
 };
 #[cfg(any(test, feature = "test-support"))]
 use myelin_ci_sandbox::{
@@ -376,10 +377,10 @@ fn verify_claimed_identity(
 }
 
 /// **The deterministic, nonce-keyed completion receipt the CAS records.** It length-frames tenant,
-/// region, run, job, idem token, durable stage, verdict, ordered result refs, owner, epoch, and the
-/// fresh claim nonce. Exact at-least-once redelivery recomputes the same receipt; any authority or
-/// payload divergence is refused. The row CAS still proves live ownership; the keyed receipt is its
-/// tamper-evident idempotency evidence.
+/// region, run, job, idem token, durable stage, verdict, timeout status, actual usage, ordered result
+/// refs, owner, epoch, and the fresh claim nonce. Exact at-least-once redelivery recomputes the same
+/// receipt; any authority, verdict, accounting, or payload divergence is refused. The row CAS still
+/// proves live ownership; the keyed receipt is its tamper-evident idempotency evidence.
 struct CompletionReceiptInput<'a> {
     tenant: &'a TenantId,
     region: &'a str,
@@ -388,6 +389,8 @@ struct CompletionReceiptInput<'a> {
     idem_token: &'a str,
     stage: &'a str,
     passed: bool,
+    timed_out: bool,
+    usage: ResourceUsage,
     result_refs: &'a [ArtifactRef],
     lease_owner: &'a str,
     lease_epoch: i64,
@@ -396,7 +399,7 @@ struct CompletionReceiptInput<'a> {
 
 fn completion_receipt(input: CompletionReceiptInput<'_>) -> String {
     let key = blake3::derive_key(
-        "myelin.ci.completion-receipt.v2",
+        "myelin.ci.completion-receipt.v3",
         input.claim_nonce.as_bytes(),
     );
     let mut hasher = blake3::Hasher::new_keyed(&key);
@@ -408,6 +411,9 @@ fn completion_receipt(input: CompletionReceiptInput<'_>) -> String {
         input.idem_token.as_bytes(),
         input.stage.as_bytes(),
         &[input.passed as u8],
+        &[input.timed_out as u8],
+        &input.usage.cpu_seconds.to_be_bytes(),
+        &input.usage.mem_byte_seconds.to_be_bytes(),
         input.lease_owner.as_bytes(),
         &input.lease_epoch.to_be_bytes(),
         input.claim_nonce.as_bytes(),
@@ -420,7 +426,7 @@ fn completion_receipt(input: CompletionReceiptInput<'_>) -> String {
         hasher.update(&(result_ref.0.len() as u64).to_be_bytes());
         hasher.update(result_ref.0.as_bytes());
     }
-    format!("v2:{}", hasher.finalize().to_hex())
+    format!("v3:{}", hasher.finalize().to_hex())
 }
 
 #[derive(Debug)]
@@ -531,6 +537,11 @@ impl TerminalReporter for CiPipelineReporter {
                 }
             )));
         }
+        if report.passed && report.timed_out {
+            return Err(ExecutorError::InvalidInput(
+                "ci.pipeline job.done refused: a timed-out job cannot pass".into(),
+            ));
+        }
 
         let job_uuid = Uuid::parse_str(job_id)
             .map_err(|_| ExecutorError::InvalidInput(format!("invalid job_id UUID `{job_id}`")))?;
@@ -582,6 +593,8 @@ impl TerminalReporter for CiPipelineReporter {
                             idem_token: &idem_owned,
                             stage: &stage,
                             passed: report_owned.passed,
+                            timed_out: report_owned.timed_out,
+                            usage: report_owned.usage,
                             result_refs: &report_owned.result_refs,
                             lease_owner: &owner_owned,
                             lease_epoch,
