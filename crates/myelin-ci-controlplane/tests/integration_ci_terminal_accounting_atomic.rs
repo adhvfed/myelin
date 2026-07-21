@@ -406,6 +406,7 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
         jobs: vec![CiRunFinalizationJob {
             job_id: job.into(),
             reserve_handle: "reserve:accounting-live".into(),
+            flow_timed_out: false,
         }],
     };
 

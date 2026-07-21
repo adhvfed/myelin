@@ -15,7 +15,7 @@ use myelin_events::{AggregateKey, ArtifactRef, DataRole, EventDraft, EventType, 
 use myelin_flow::{
     read_stage_verdict, ActivityError, DispatchedJob, JobKind, JobOutcome, JobRunner, JobSpec,
     PgClaimedDriveInput, PgFlowWorker, PgInputResolveError, PgResolvedDriveInput, PgWorkerError,
-    PgWorkflowInputResolver, RetryPolicy, WfCtx, WfError, WfResult,
+    PgWorkflowInputResolver, RetryPolicy, WaitOutcome, WfCtx, WfError, WfResult, JOB_DONE_SIGNAL,
 };
 use myelin_tenancy::{Region, TenantId};
 use sqlx::PgPool;
@@ -209,6 +209,7 @@ where
         .validate()
         .map_err(|error| WfError::Nondeterministic(error.to_string()))?;
     let mut completed = BTreeSet::new();
+    let mut flow_timed_out_jobs = BTreeSet::new();
     while completed.len() < manifest.jobs.len() {
         let frontier: Vec<&GrantedCiJobV1> = manifest
             .jobs
@@ -239,11 +240,14 @@ where
         dispatched.sort_by(|left, right| join_key(&left.1).cmp(&join_key(&right.1)));
 
         let mut failed: Option<(String, bool)> = None;
+        let mut late_accounting = Vec::new();
         for (job, handle) in dispatched {
             match ctx.join_dispatched_job(&handle)? {
                 JobOutcome::Parked => return Ok(CiManifestPipelineOutcome::Parked),
                 JobOutcome::TimedOut => {
                     failed.get_or_insert_with(|| (job.name.clone(), true));
+                    flow_timed_out_jobs.insert(job.job_id.clone());
+                    late_accounting.push((job.name.as_str(), handle.idem_token().to_owned()));
                     completed.insert(job.job_id.clone());
                 }
                 JobOutcome::Completed { result, .. } => {
@@ -266,6 +270,30 @@ where
             }
         }
 
+        // A Flow dispatch deadline is a terminal workflow verdict, not permission to abandon money
+        // truth. The sandbox job is never interrupted by this timer. Park on the same exact signal
+        // without a second deadline until the runner co-commits measured usage and `job.done`.
+        for (job_name, idem_token) in late_accounting {
+            match ctx.wait_for_signal_exact(JOB_DONE_SIGNAL, &idem_token, None)? {
+                WaitOutcome::Parked => return Ok(CiManifestPipelineOutcome::Parked),
+                WaitOutcome::Signalled { payload, .. } => {
+                    if !matches!(
+                        read_stage_verdict(&payload),
+                        Some((ref concrete_name, _)) if concrete_name == job_name
+                    ) {
+                        return Err(WfError::Nondeterministic(
+                            "late CI accounting signal changed the timed-out job identity".into(),
+                        ));
+                    }
+                }
+                WaitOutcome::TimedOut => {
+                    return Err(WfError::Nondeterministic(
+                        "an unbounded late-accounting wait unexpectedly timed out".into(),
+                    ));
+                }
+            }
+        }
+
         if let Some((job, timed_out)) = failed {
             let terminal_state = if timed_out {
                 CiRunTerminalState::TimedOut
@@ -278,6 +306,7 @@ where
                 terminal_state,
                 false,
                 Some(&job),
+                &flow_timed_out_jobs,
                 finalizer,
             )?;
             return Ok(CiManifestPipelineOutcome::Failed { job, timed_out });
@@ -290,6 +319,7 @@ where
         CiRunTerminalState::Succeeded,
         true,
         None,
+        &flow_timed_out_jobs,
         finalizer,
     )?;
     Ok(CiManifestPipelineOutcome::Succeeded {
@@ -310,6 +340,7 @@ fn finalize_and_emit_terminal_facts(
     terminal_state: CiRunTerminalState,
     success: bool,
     failed_job: Option<&str>,
+    flow_timed_out_jobs: &BTreeSet<String>,
     finalizer: &dyn CiRunFinalizer,
 ) -> WfResult<()> {
     let completed_at = ctx.now();
@@ -326,6 +357,7 @@ fn finalize_and_emit_terminal_facts(
             .map(|job| CiRunFinalizationJob {
                 job_id: job.job_id.clone(),
                 reserve_handle: job.reserve_handle.clone(),
+                flow_timed_out: flow_timed_out_jobs.contains(&job.job_id),
             })
             .collect(),
     };
@@ -346,13 +378,21 @@ fn finalize_and_emit_terminal_facts(
             "CI run finalization journal changed terminal identity".into(),
         ));
     }
-    emit_terminal_facts(ctx, manifest, &completed_at, success, failed_job)
+    emit_terminal_facts(
+        ctx,
+        manifest,
+        &completed_at,
+        terminal_state,
+        success,
+        failed_job,
+    )
 }
 
 fn emit_terminal_facts(
     ctx: &mut WfCtx,
     manifest: &CiDriveManifestV1,
     completed_at: &str,
+    terminal_state: CiRunTerminalState,
     success: bool,
     failed_job: Option<&str>,
 ) -> WfResult<()> {
@@ -387,10 +427,10 @@ fn emit_terminal_facts(
         )?;
     }
 
-    let event_type = if success {
-        myelin_ci_sandbox::events::CI_RUN_SUCCEEDED
-    } else {
-        myelin_ci_sandbox::events::CI_RUN_FAILED
+    let event_type = match terminal_state {
+        CiRunTerminalState::Succeeded => myelin_ci_sandbox::events::CI_RUN_SUCCEEDED,
+        CiRunTerminalState::Failed => myelin_ci_sandbox::events::CI_RUN_FAILED,
+        CiRunTerminalState::TimedOut => myelin_ci_sandbox::events::CI_RUN_TIMED_OUT,
     };
     let mut payload = serde_json::json!({
         "run": manifest.run_ref,

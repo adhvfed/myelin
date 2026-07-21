@@ -248,6 +248,8 @@ pub struct CiRunFinalizationJob {
     pub job_id: String,
     /// Exact Storage reservation authority granted to this job.
     pub reserve_handle: String,
+    /// Whether Flow's dispatch-relative deadline won before this job's accounting signal arrived.
+    pub flow_timed_out: bool,
 }
 
 /// The terminal lifecycle state derived from the complete immutable receipt set.
@@ -621,21 +623,24 @@ async fn finalize_on_conn(
         return Err(CiRunStoreError::IncompleteTerminalAccounting);
     }
 
-    let expected: BTreeMap<&str, &str> = finalization
+    let expected: BTreeMap<&str, &CiRunFinalizationJob> = finalization
         .jobs
         .iter()
-        .map(|job| (job.job_id.as_str(), job.reserve_handle.as_str()))
+        .map(|job| (job.job_id.as_str(), job))
         .collect();
     let mut all_passed = true;
     let mut any_timed_out = false;
     for row in &rows {
         let job_id: String = row.get("job_id");
         let reserve_handle: String = row.get("reserve_handle");
-        if expected.get(job_id.as_str()).copied() != Some(reserve_handle.as_str()) {
+        let Some(job) = expected.get(job_id.as_str()).copied() else {
+            return Err(CiRunStoreError::TerminalAccountingDivergence);
+        };
+        if job.reserve_handle != reserve_handle {
             return Err(CiRunStoreError::TerminalAccountingDivergence);
         }
         all_passed &= row.get::<bool, _>("passed");
-        any_timed_out |= row.get::<bool, _>("timed_out");
+        any_timed_out |= job.flow_timed_out || row.get::<bool, _>("timed_out");
     }
     let derived = if any_timed_out {
         CiRunTerminalState::TimedOut
@@ -864,6 +869,7 @@ mod tests {
             jobs: vec![CiRunFinalizationJob {
                 job_id: "55555555-5555-5555-5555-555555555555".into(),
                 reserve_handle: "reserve:job-1".into(),
+                flow_timed_out: false,
             }],
         }
     }
@@ -999,6 +1005,7 @@ mod tests {
         duplicate_reserve.jobs.push(CiRunFinalizationJob {
             job_id: "66666666-6666-6666-6666-666666666666".into(),
             reserve_handle: duplicate_reserve.jobs[0].reserve_handle.clone(),
+            flow_timed_out: false,
         });
         assert_eq!(
             validate_finalization(&duplicate_reserve),
