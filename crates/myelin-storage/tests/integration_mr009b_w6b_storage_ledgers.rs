@@ -11,7 +11,8 @@
 //! NOT count):
 //!   A. **`DurableCostLedger` (SI-021) — durability + the four invariants on Pg:** a reserve→begin→
 //!      settle cycle survives reconstruction from a FRESH pool (kill-9 equivalent); the idempotent
-//!      double-settle (the `recorded_outcome` SQL RE-READ) records NO further events; settle-capped;
+//!      exact double-settle records NO further events while divergent units are refused; a
+//!      caller-owned transaction can roll settlement back atomically; settle-capped;
 //!      never-interrupt-in-flight (cancel of an in-flight run refuses; interrupt count 0). The
 //!      `cost_reservation`/`cost_event` tables are FORCE-RLS (tenant-owned billing data) — the app
 //!      role drives them through the MR-022 `with_tenant_tx` convention.
@@ -33,7 +34,9 @@ use myelin_storage::reerase_durable::{post_pit_durable_migrations, DurablePostPi
 use myelin_storage::reserve_settle::{
     MeteredUnit, MinorUnits, ReservationState, RunId, SettleError,
 };
-use myelin_storage::reserve_settle_durable::{reserve_settle_durable_migrations, DurableCostLedger};
+use myelin_storage::reserve_settle_durable::{
+    reserve_settle_durable_migrations, DurableCostLedger,
+};
 use myelin_storage::restore_verify::{ErasureLedger, GateFailure, GateInputs, RestoreVerifyGate};
 use myelin_storage::restore_verify_durable::{
     restore_verify_durable_migrations, DurableRestoreErasureLedger,
@@ -139,7 +142,12 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     let run = RunId::new(format!("run-{suffix}"));
     let cost1 = DurableCostLedger::new(app.clone());
     cost1
-        .reserve(tenant.clone(), run.clone(), MinorUnits(1_000), MinorUnits(5_000))
+        .reserve(
+            tenant.clone(),
+            run.clone(),
+            MinorUnits(1_000),
+            MinorUnits(5_000),
+        )
         .expect("a funded reserve admits on Pg");
     cost1.begin(&tenant, &run).expect("begin on Pg");
     let units = vec![
@@ -155,7 +163,11 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         },
     ];
     let outcome = cost1.settle(&tenant, &run, &units).expect("settle on Pg");
-    assert_eq!(outcome.cost_events.len(), 2, "one cost event per metered unit");
+    assert_eq!(
+        outcome.cost_events.len(),
+        2,
+        "one cost event per metered unit"
+    );
     assert_eq!(outcome.billed_total, MinorUnits(400));
     assert_eq!(outcome.refunded, MinorUnits(600));
 
@@ -174,7 +186,9 @@ async fn mr009b_w6b_storage_ledgers_durable() {
 
     // Invariant 4 — idempotent double-settle (the recorded_outcome SQL RE-READ): SAME outcome, NO
     // further events (never a double-charge), on the fresh instance.
-    let again = cost2.settle(&tenant, &run, &units).expect("re-settle on Pg");
+    let again = cost2
+        .settle(&tenant, &run, &units)
+        .expect("re-settle on Pg");
     assert_eq!(again.billed_total, MinorUnits(400));
     assert_eq!(again.refunded, MinorUnits(600));
     assert_eq!(
@@ -182,11 +196,89 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         2,
         "a double-settle records NO further cost events on Pg (no double-charge)"
     );
+    let mut divergent_units = units.clone();
+    divergent_units[0].wholesale = MinorUnits(121);
+    assert_eq!(
+        cost2.settle(&tenant, &run, &divergent_units),
+        Err(SettleError::UsageDivergence),
+        "an acknowledgement-loss retry cannot alter durable metered units"
+    );
+    assert_eq!(cost2.cost_events_for(&tenant, &run).len(), 2);
+
+    // Caller-transaction API: a rollback leaves both the reservation and event log untouched; the
+    // same exact operation can then commit in a later scoped transaction.
+    let run_tx = RunId::new(format!("run-tx-{suffix}"));
+    cost2
+        .reserve(
+            tenant.clone(),
+            run_tx.clone(),
+            MinorUnits(1_000),
+            MinorUnits(9_000),
+        )
+        .expect("reserve run_tx");
+    cost2.begin(&tenant, &run_tx).expect("begin run_tx");
+    let tx_units = vec![MeteredUnit {
+        unit: "ci.minute",
+        wholesale: MinorUnits(200),
+        markup: MinorUnits(50),
+    }];
+    let mut tx = app
+        .db_pool()
+        .begin()
+        .await
+        .expect("begin rollback proof tx");
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), \
+                set_config('myelin.region', $2, true)",
+    )
+    .bind(&tenant.0)
+    .bind(&region)
+    .execute(&mut *tx)
+    .await
+    .expect("scope rollback proof tx");
+    cost2
+        .settle_in_tx(&mut tx, &tenant, &run_tx, &tx_units)
+        .await
+        .expect("settle inside caller tx");
+    tx.rollback().await.expect("roll back settlement");
+    assert_eq!(
+        cost2.state_of(&tenant, &run_tx),
+        Some(ReservationState::InFlight),
+        "caller rollback preserves the in-flight reservation"
+    );
+    assert!(cost2.cost_events_for(&tenant, &run_tx).is_empty());
+
+    let mut tx = app.db_pool().begin().await.expect("begin commit proof tx");
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), \
+                set_config('myelin.region', $2, true)",
+    )
+    .bind(&tenant.0)
+    .bind(&region)
+    .execute(&mut *tx)
+    .await
+    .expect("scope commit proof tx");
+    let committed = cost2
+        .settle_in_tx(&mut tx, &tenant, &run_tx, &tx_units)
+        .await
+        .expect("settle inside committed caller tx");
+    tx.commit().await.expect("commit settlement");
+    assert_eq!(committed.billed_total, MinorUnits(250));
+    assert_eq!(
+        cost2.state_of(&tenant, &run_tx),
+        Some(ReservationState::Settled)
+    );
+    assert_eq!(cost2.cost_events_for(&tenant, &run_tx).len(), 1);
 
     // Invariant 3 — settle-capped-at-reserved on Pg: an over-run is clamped to the reservation.
     let run_over = RunId::new(format!("run-over-{suffix}"));
     cost2
-        .reserve(tenant.clone(), run_over.clone(), MinorUnits(100), MinorUnits(9_000))
+        .reserve(
+            tenant.clone(),
+            run_over.clone(),
+            MinorUnits(100),
+            MinorUnits(9_000),
+        )
         .expect("reserve run_over");
     cost2.begin(&tenant, &run_over).expect("begin run_over");
     let over = cost2
@@ -210,7 +302,12 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     // Invariant 1 — never-interrupt-in-flight on Pg: cancel of an in-flight run REFUSES; count 0.
     let run_live = RunId::new(format!("run-live-{suffix}"));
     cost2
-        .reserve(tenant.clone(), run_live.clone(), MinorUnits(500), MinorUnits(9_000))
+        .reserve(
+            tenant.clone(),
+            run_live.clone(),
+            MinorUnits(500),
+            MinorUnits(9_000),
+        )
         .expect("reserve run_live");
     cost2.begin(&tenant, &run_live).expect("begin run_live");
     assert_eq!(
@@ -223,7 +320,11 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         Some(ReservationState::InFlight),
         "the in-flight run is untouched"
     );
-    assert_eq!(cost2.inflight_interrupt_count(), 0, "0 interrupts (structural)");
+    assert_eq!(
+        cost2.inflight_interrupt_count(),
+        0,
+        "0 interrupts (structural)"
+    );
 
     // =============================================================================================
     // B — DurablePostPitLedger: durability + the post-PIT `completed_after` selection on live Pg.

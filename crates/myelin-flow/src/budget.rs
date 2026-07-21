@@ -135,6 +135,8 @@ pub enum BudgetError {
     /// No reservation exists for this `(tenant, run)` — a settle/begin against an un-reserved dispatch
     /// (a settle never invents a charge).
     NoSuchReservation,
+    /// A settle retry supplied units that differ from the already-recorded settlement.
+    UsageDivergence,
     /// Integer minor-units arithmetic overflowed `u64` — loud, never a silent wrap.
     AmountOverflow,
 }
@@ -157,6 +159,10 @@ impl core::fmt::Display for BudgetError {
             BudgetError::NoSuchReservation => write!(
                 f,
                 "settle/begin refused: no reservation for this (tenant, run) — never invent a charge"
+            ),
+            BudgetError::UsageDivergence => write!(
+                f,
+                "settle refused: metered units diverge from the recorded settlement"
             ),
             BudgetError::AmountOverflow => {
                 write!(f, "budget arithmetic overflowed u64 (loud, never a silent wrap)")
@@ -187,6 +193,7 @@ impl From<SettleError> for BudgetError {
     fn from(e: SettleError) -> Self {
         match e {
             SettleError::NoSuchReservation => BudgetError::NoSuchReservation,
+            SettleError::UsageDivergence => BudgetError::UsageDivergence,
             SettleError::AmountOverflow => BudgetError::AmountOverflow,
         }
     }

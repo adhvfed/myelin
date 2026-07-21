@@ -25,7 +25,8 @@
 //! 2. **Settle-on-completion.** [`CostLedger::settle`] closes a reservation with the
 //!    actual metered cost, recording exactly **one cost event per metered unit** and
 //!    releasing any over-reservation. The settle is idempotent on its `RunId` (a
-//!    double-settle is a no-op success, never a double-charge).
+//!    byte-equivalent double-settle is a no-op success, never a double-charge; divergent units are
+//!    refused).
 //! 3. **NEVER interrupt in-flight.** There is *no* API that tears down an `InFlight`
 //!    reservation. A reservation moves `Reserved → InFlight → Settled` monotonically;
 //!    [`CostLedger::cancel_unstarted`] only refunds a reservation that has NOT begun
@@ -245,6 +246,9 @@ pub enum SettleError {
     /// No reservation exists for this `(tenant, run)` — you cannot settle what was never
     /// reserved (a settle never invents a charge).
     NoSuchReservation,
+    /// A retry for an already-settled reservation supplied different ordered metered units. Exact
+    /// replay is required; accepting drift would make an acknowledgement-loss retry ambiguous.
+    UsageDivergence,
     /// An integer-minor-units arithmetic operation overflowed `u64`.
     AmountOverflow,
 }
@@ -256,6 +260,10 @@ impl core::fmt::Display for SettleError {
                 f,
                 "settle refused: no reservation exists for this (tenant, run) — \
                  a settle never invents a charge"
+            ),
+            SettleError::UsageDivergence => write!(
+                f,
+                "settle refused: metered units diverge from the already-recorded settlement"
             ),
             SettleError::AmountOverflow => write!(
                 f,
@@ -504,8 +512,8 @@ impl MemoryCostLedger {
     /// **Settle-on-completion.** Close the reservation for `(tenant, run)` with the actual
     /// metered `units`, recording **exactly one [`CostEvent`] per [`MeteredUnit`]** and
     /// releasing any over-reservation. Idempotent on `(tenant, run)`: settling an
-    /// already-settled run returns the SAME outcome and records NO further cost events (a
-    /// double-settle never double-charges).
+    /// already-settled run returns the SAME outcome and records NO further cost events when its
+    /// ordered units match exactly. Divergent units are refused as an ambiguous replay.
     ///
     /// The billed total is capped at the reserved amount (the reserve is the upper bound —
     /// a settle never bills more than was reserved; the gate's whole point). The refund is
@@ -526,7 +534,14 @@ impl MemoryCostLedger {
         // Idempotency: an already-settled run returns its recorded outcome, records nothing
         // new (no double-charge on a double-click / retry).
         if reservation.state == ReservationState::Settled {
-            return self.recorded_outcome(tenant, run, reservation.reserved);
+            let outcome = self.recorded_outcome(tenant, run, reservation.reserved)?;
+            if !metered_units_match(&outcome.cost_events, units) {
+                return Err(SettleError::UsageDivergence);
+            }
+            return Ok(outcome);
+        }
+        if reservation.state == ReservationState::Cancelled {
+            return Err(SettleError::NoSuchReservation);
         }
 
         // One cost event per metered unit (the `cost_events_per_unit == 1` invariant).
@@ -657,6 +672,16 @@ impl MemoryCostLedger {
     pub fn inflight_interrupt_count(&self) -> u64 {
         self.inflight_interrupt_count
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn metered_units_match(events: &[CostEvent], units: &[MeteredUnit]) -> bool {
+    events.len() == units.len()
+        && events.iter().zip(units).all(|(event, unit)| {
+            event.unit == unit.unit
+                && event.wholesale == unit.wholesale
+                && event.markup == unit.markup
+        })
 }
 
 /// **The reserve/settle drill artifact (storage.md §9; the P-ST-16 GATE).** The PII-free
@@ -846,6 +871,21 @@ mod tests {
             1,
             "no further cost events on re-settle — no double-charge"
         );
+        let divergent = ledger.settle(
+            &tenant(),
+            &run(),
+            &[MeteredUnit {
+                unit: "llm.tokens",
+                wholesale: MinorUnits(121),
+                markup: MinorUnits(30),
+            }],
+        );
+        assert_eq!(
+            divergent,
+            Err(SettleError::UsageDivergence),
+            "ack-loss replay cannot change the recorded units"
+        );
+        assert_eq!(ledger.cost_events_for(&tenant(), &run()).len(), 1);
     }
 
     /// **NEVER interrupt in-flight.** Once a run is in-flight, `cancel_unstarted` REFUSES to

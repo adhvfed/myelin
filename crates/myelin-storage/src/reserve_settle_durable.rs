@@ -13,9 +13,9 @@
 //! 2. **One-cost-event-per-unit** — [`Self::settle`] inserts exactly one `cost_event` row per
 //!    [`MeteredUnit`] supplied.
 //! 3. **Settle-capped-at-reserved** — the billed total is clamped to the reservation's `reserved`.
-//! 4. **Idempotent double-settle** — the `recorded_outcome` rebuild is a **SQL re-read**: a settle on
-//!    an already-`Settled` row re-reads its `cost_event` rows and returns the SAME outcome, inserting
-//!    NOTHING (never a double-charge).
+//! 4. **Exact-idempotent double-settle** — a settle on an already-`Settled` row re-reads its ordered
+//!    `cost_event` rows and accepts only byte-equivalent units, inserting NOTHING. Divergent replay
+//!    is refused instead of being mistaken for an acknowledgement-loss retry.
 //!
 //! ## RLS posture — cost rows ARE tenant-owned billing data (FORCE RLS, `with_tenant_tx`)
 //! Unlike the erasure-record ledgers (non-shred-erasable, NO RLS), the cost reservation/event rows are
@@ -41,6 +41,7 @@ use sqlx::Row;
 use myelin_tenancy::TenantId;
 
 use crate::migration::{Migration, Migrations};
+use crate::pg::PgError;
 use crate::provider::{ProviderError, SubstrateProvider};
 use crate::reserve_settle::{
     CostEvent, MeteredUnit, MinorUnits, Reservation, ReservationState, ReserveError, RunId,
@@ -118,7 +119,9 @@ fn parse_state(s: &str) -> ReservationState {
         "inflight" => ReservationState::InFlight,
         "settled" => ReservationState::Settled,
         "cancelled" => ReservationState::Cancelled,
-        other => panic!("FAIL-STATIC: unknown cost_reservation.state `{other}` (durable corruption)"),
+        other => {
+            panic!("FAIL-STATIC: unknown cost_reservation.state `{other}` (durable corruption)")
+        }
     }
 }
 
@@ -134,6 +137,27 @@ pub struct DurableCostLedger {
     provider: SubstrateProvider,
     rt: tokio::runtime::Handle,
 }
+
+/// A caller-transaction durable-settle failure. Domain refusals remain typed; storage failures are
+/// deliberately redacted because billing rows and connection details are not safe error payloads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurableSettleError {
+    /// The ledger rejected the requested state transition or exact replay.
+    Ledger(SettleError),
+    /// PostgreSQL did not complete the settlement statement sequence.
+    Store,
+}
+
+impl std::fmt::Display for DurableSettleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ledger(error) => write!(f, "{error}"),
+            Self::Store => write!(f, "durable cost settlement did not commit"),
+        }
+    }
+}
+
+impl std::error::Error for DurableSettleError {}
 
 impl DurableCostLedger {
     /// Build the durable ledger over the MR-022 provider. **Must be called inside a tokio runtime**
@@ -154,7 +178,9 @@ impl DurableCostLedger {
     /// not infra faults, so an infra fault must never be silently coerced into a settle/reserve outcome.
     fn block<T>(&self, fut: impl std::future::Future<Output = Result<T, ProviderError>>) -> T {
         tokio::task::block_in_place(|| self.rt.block_on(fut)).unwrap_or_else(|e| {
-            panic!("FAIL-STATIC: durable cost ledger store fault (the cost row did not commit): {e}")
+            panic!(
+                "FAIL-STATIC: durable cost ledger store fault (the cost row did not commit): {e}"
+            )
         })
     }
 
@@ -264,10 +290,9 @@ impl DurableCostLedger {
         }))
     }
 
-    /// **Settle-on-completion** (invariants 2/3/4). Idempotent: a settle on an already-`Settled` run
-    /// re-reads its `cost_event` rows (the `recorded_outcome` SQL re-read) and returns the SAME
-    /// outcome, inserting nothing. Otherwise records one `cost_event` per unit, caps the billed total
-    /// at the reservation, and moves the row to `Settled`.
+    /// **Settle-on-completion** (invariants 2/3/4). Exact-idempotent: a settle on an already-`Settled`
+    /// run re-reads its `cost_event` rows and accepts only the same ordered units. Otherwise it records
+    /// one event per unit, caps the billed total at the reservation, and moves the row to `Settled`.
     pub fn settle(
         &self,
         tenant: &TenantId,
@@ -279,97 +304,24 @@ impl DurableCostLedger {
         let run_s = run.0.clone();
         let units: Vec<MeteredUnit> = units.to_vec();
         self.block(self.provider.with_tenant_tx(&tenant.0, move |conn| {
-            Box::pin(async move {
-                let row = sqlx::query(
-                    "SELECT reserved, state FROM cost_reservation \
-                     WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
-                )
-                .bind(&tenant_s)
-                .bind(&region)
-                .bind(&run_s)
-                .fetch_optional(&mut *conn)
-                .await
-                .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                let Some(row) = row else {
-                    return Ok(Err(SettleError::NoSuchReservation));
-                };
-                let reserved = MinorUnits((row.get::<i64, _>("reserved")) as u64);
-                let state = parse_state(&row.get::<String, _>("state"));
-
-                // Idempotent double-settle: rebuild the outcome from the durable cost_event log
-                // (the SQL re-read), record NOTHING new.
-                if state == ReservationState::Settled {
-                    let outcome =
-                        recorded_outcome(&mut *conn, &tenant_s, &region, &run_s, reserved).await;
-                    return Ok(outcome);
-                }
-
-                // One cost event per metered unit; billed = Σ(wholesale+markup), checked.
-                let mut events = Vec::with_capacity(units.len());
-                let mut billed = MinorUnits::ZERO;
-                for u in &units {
-                    let event = CostEvent {
-                        tenant: TenantId(tenant_s.clone()),
-                        run: RunId(run_s.clone()),
-                        unit: u.unit.to_string(),
-                        wholesale: u.wholesale,
-                        markup: u.markup,
-                    };
-                    let unit_total = match event.billed() {
-                        Some(t) => t,
-                        None => return Ok(Err(SettleError::AmountOverflow)),
-                    };
-                    billed = match billed.checked_add(unit_total) {
-                        Some(b) => b,
-                        None => return Ok(Err(SettleError::AmountOverflow)),
-                    };
-                    events.push(event);
-                }
-
-                // The reserve is the cap: a settle never bills more than was reserved.
-                let billed_capped = if billed > reserved { reserved } else { billed };
-                let refunded = match reserved.checked_sub(billed_capped) {
-                    Some(r) => r,
-                    None => return Ok(Err(SettleError::AmountOverflow)),
-                };
-
-                // Commit: append the cost events + move the reservation to Settled.
-                for (ord, e) in events.iter().enumerate() {
-                    sqlx::query(
-                        "INSERT INTO cost_event \
-                           (tenant_id, region, run_id, ord, unit, wholesale, markup) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                    )
-                    .bind(&tenant_s)
-                    .bind(&region)
-                    .bind(&run_s)
-                    .bind(ord as i32)
-                    .bind(e.unit.as_str())
-                    .bind(e.wholesale.0 as i64)
-                    .bind(e.markup.0 as i64)
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                }
-                sqlx::query(
-                    "UPDATE cost_reservation SET state = $4 \
-                     WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
-                )
-                .bind(&tenant_s)
-                .bind(&region)
-                .bind(&run_s)
-                .bind(state_token(ReservationState::Settled))
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-
-                Ok(Ok(SettleOutcome {
-                    cost_events: events,
-                    billed_total: billed_capped,
-                    refunded,
-                }))
-            })
+            Box::pin(async move { settle_on_conn(conn, &tenant_s, &region, &run_s, &units).await })
         }))
+    }
+
+    /// Settle using a transaction the caller already scoped to this tenant and region. Money truth,
+    /// CI attribution, claim consumption, and workflow signalling can therefore share one commit.
+    /// The reservation row is locked, and a retry must reproduce the exact ordered units.
+    pub async fn settle_in_tx(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant: &TenantId,
+        run: &RunId,
+        units: &[MeteredUnit],
+    ) -> Result<SettleOutcome, DurableSettleError> {
+        settle_on_conn(conn, &tenant.0, &self.region(), &run.0, units)
+            .await
+            .map_err(|_| DurableSettleError::Store)?
+            .map_err(DurableSettleError::Ledger)
     }
 
     /// **Refund an UNSTARTED run** (the ONLY teardown — never touches an `InFlight`/`Settled` row: the
@@ -474,17 +426,98 @@ impl DurableCostLedger {
     }
 }
 
-/// Rebuild the [`SettleOutcome`] for an already-settled run from the durable `cost_event` log — the
-/// idempotent-settle SQL RE-READ (invariant 4). Sums the billed (checked), caps at `reserved`. A store
-/// fault here is a hard `PgError` (bubbles to FAIL-STATIC); a `u64` overflow on the sum is the domain
-/// [`SettleError::AmountOverflow`].
-async fn recorded_outcome(
+async fn settle_on_conn(
     conn: &mut sqlx::PgConnection,
     tenant_s: &str,
     region: &str,
     run_s: &str,
-    reserved: MinorUnits,
-) -> Result<SettleOutcome, SettleError> {
+    units: &[MeteredUnit],
+) -> Result<Result<SettleOutcome, SettleError>, PgError> {
+    let row = sqlx::query(
+        "SELECT reserved, state FROM cost_reservation \
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3 FOR UPDATE",
+    )
+    .bind(tenant_s)
+    .bind(region)
+    .bind(run_s)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|error| PgError::Query(error.to_string()))?;
+    let Some(row) = row else {
+        return Ok(Err(SettleError::NoSuchReservation));
+    };
+    let reserved = MinorUnits((row.get::<i64, _>("reserved")) as u64);
+    let state = parse_state(&row.get::<String, _>("state"));
+
+    if state == ReservationState::Settled {
+        let events = recorded_events(conn, tenant_s, region, run_s).await?;
+        if !durable_units_match(&events, units) {
+            return Ok(Err(SettleError::UsageDivergence));
+        }
+        return Ok(outcome_for(events, reserved));
+    }
+    if state == ReservationState::Cancelled {
+        return Ok(Err(SettleError::NoSuchReservation));
+    }
+
+    let events = units
+        .iter()
+        .map(|unit| CostEvent {
+            tenant: TenantId(tenant_s.to_string()),
+            run: RunId(run_s.to_string()),
+            unit: unit.unit.to_string(),
+            wholesale: unit.wholesale,
+            markup: unit.markup,
+        })
+        .collect::<Vec<_>>();
+    let outcome = match outcome_for(events.clone(), reserved) {
+        Ok(outcome) => outcome,
+        Err(error) => return Ok(Err(error)),
+    };
+
+    for (ord, event) in events.iter().enumerate() {
+        let ord = match i32::try_from(ord) {
+            Ok(ord) => ord,
+            Err(_) => return Ok(Err(SettleError::AmountOverflow)),
+        };
+        sqlx::query(
+            "INSERT INTO cost_event \
+               (tenant_id, region, run_id, ord, unit, wholesale, markup) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(tenant_s)
+        .bind(region)
+        .bind(run_s)
+        .bind(ord)
+        .bind(event.unit.as_str())
+        .bind(event.wholesale.0 as i64)
+        .bind(event.markup.0 as i64)
+        .execute(&mut *conn)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+    }
+    sqlx::query(
+        "UPDATE cost_reservation SET state = $4 \
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+    )
+    .bind(tenant_s)
+    .bind(region)
+    .bind(run_s)
+    .bind(state_token(ReservationState::Settled))
+    .execute(&mut *conn)
+    .await
+    .map_err(|error| PgError::Query(error.to_string()))?;
+
+    Ok(Ok(outcome))
+}
+
+/// Re-read one already-settled run's ordered durable unit log.
+async fn recorded_events(
+    conn: &mut sqlx::PgConnection,
+    tenant_s: &str,
+    region: &str,
+    run_s: &str,
+) -> Result<Vec<CostEvent>, PgError> {
     let rows = sqlx::query(
         "SELECT unit, wholesale, markup FROM cost_event \
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 ORDER BY ord",
@@ -494,9 +527,11 @@ async fn recorded_outcome(
     .bind(run_s)
     .fetch_all(conn)
     .await
-    // A re-read fault is a hard store fault (surfaces as FAIL-STATIC via the caller's `block`).
-    .expect("FAIL-STATIC: durable cost ledger re-read (idempotent settle) failed");
-    let events = rows_to_events(tenant_s, run_s, &rows);
+    .map_err(|error| PgError::Query(error.to_string()))?;
+    Ok(rows_to_events(tenant_s, run_s, &rows))
+}
+
+fn outcome_for(events: Vec<CostEvent>, reserved: MinorUnits) -> Result<SettleOutcome, SettleError> {
     let mut billed = MinorUnits::ZERO;
     for e in &events {
         let t = match e.billed() {
@@ -518,6 +553,15 @@ async fn recorded_outcome(
         billed_total: billed_capped,
         refunded,
     })
+}
+
+fn durable_units_match(events: &[CostEvent], units: &[MeteredUnit]) -> bool {
+    events.len() == units.len()
+        && events.iter().zip(units).all(|(event, unit)| {
+            event.unit == unit.unit
+                && event.wholesale == unit.wholesale
+                && event.markup == unit.markup
+        })
 }
 
 fn rows_to_events(tenant_s: &str, run_s: &str, rows: &[sqlx::postgres::PgRow]) -> Vec<CostEvent> {
