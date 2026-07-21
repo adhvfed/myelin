@@ -80,6 +80,14 @@ struct PreparedStart {
     requested_id: bool,
 }
 
+type PreparedSignal = (
+    RunId,
+    String,
+    String,
+    Vec<myelin_refs::ArtifactRef>,
+    Option<String>,
+);
+
 async fn persist_prepared_start(
     conn: &mut sqlx::PgConnection,
     tenant: &str,
@@ -390,14 +398,49 @@ impl PgFlowExecutor {
             SignalPayload::ScopedRefs(spec.payload),
             &self.tenant,
         )?;
-        self.deliver_signal_async(spec.run, spec.signal_name, spec.idem_key, payload, spec.payload_key_ref)
-            .await
+        self.deliver_signal_async(
+            spec.run,
+            spec.signal_name,
+            spec.idem_key,
+            payload,
+            spec.payload_key_ref,
+        )
+        .await
     }
 
     async fn signal_typed_async(
         &self,
         spec: TypedSignalSpec,
     ) -> Result<SignalOutcome, ExecutorError> {
+        let (run, signal_name, idem_key, payload, payload_key_ref) =
+            self.prepare_typed_signal(spec)?;
+        self.deliver_signal_async(run, signal_name, idem_key, payload, payload_key_ref)
+            .await
+    }
+
+    /// Buffer a typed signal on the caller's already-open PostgreSQL transaction.
+    ///
+    /// This is the completion-side counterpart to [`Self::start_with_id_on_conn`]: a caller that
+    /// owns another durable state transition (for example, consuming a CI runner's leased job)
+    /// can make that transition and the workflow signal one atomic commit. The connection MUST be
+    /// transaction-scoped to this executor's exact tenant and region. The method verifies both GUCs
+    /// before touching workflow state, so an unscoped/admin connection cannot accidentally turn the
+    /// explicit predicates into an authorization bypass.
+    pub async fn signal_typed_on_conn(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        spec: TypedSignalSpec,
+    ) -> Result<SignalOutcome, ExecutorError> {
+        self.verify_connection_scope(conn).await?;
+        let (run, signal_name, idem_key, payload, payload_key_ref) =
+            self.prepare_typed_signal(spec)?;
+        let error_run_id = run.0.clone();
+        self.deliver_signal_on_conn(conn, run, signal_name, idem_key, payload, payload_key_ref)
+            .await
+            .map_err(|error| Self::map_signal_store_error(error, error_run_id))
+    }
+
+    fn prepare_typed_signal(&self, spec: TypedSignalSpec) -> Result<PreparedSignal, ExecutorError> {
         bounded("run_id", &spec.run.0, 256)?;
         bounded("signal_name", &spec.signal_name, 128)?;
         bounded("idem_key", &spec.idem_key, 512)?;
@@ -405,10 +448,14 @@ impl PgFlowExecutor {
         // durable string-array shape BEFORE the transaction, then buffer it through the same insert
         // core — the stored `wf_signal.payload` row is byte-identical to a hand-encoded ScopedRefs
         // delivery, so every downstream decode/projection/journal path stays shape-compatible.
-        let payload =
-            canonicalize_signal_payload(&spec.signal_name, spec.payload, &self.tenant)?;
-        self.deliver_signal_async(spec.run, spec.signal_name, spec.idem_key, payload, spec.payload_key_ref)
-            .await
+        let payload = canonicalize_signal_payload(&spec.signal_name, spec.payload, &self.tenant)?;
+        Ok((
+            spec.run,
+            spec.signal_name,
+            spec.idem_key,
+            payload,
+            spec.payload_key_ref,
+        ))
     }
 
     /// The idempotent `wf_signal` insert core shared by [`Self::signal_async`] and
@@ -427,20 +474,49 @@ impl PgFlowExecutor {
     ) -> Result<SignalOutcome, ExecutorError> {
         let scope_tenant = self.tenant.0.clone();
         let scope_region = self.region.0.clone();
-        let tenant = scope_tenant.clone();
-        let region = scope_region.clone();
-        let run_id = run.0.clone();
-        let error_run_id = run_id.clone();
-        let payload = serde_json::to_string(&payload_refs)
-            .map_err(|e| store_error("encode signal payload refs", e))?;
-        let expected_payload = serde_json::to_value(&payload_refs)
-            .map_err(|e| store_error("encode signal payload refs", e))?;
+        let error_run_id = run.0.clone();
         let spec_payload_key_ref = payload_key_ref;
+        let executor = self.clone();
         with_tenant_tx_error(&self.pool, &scope_tenant, &scope_region, move |conn| {
             Box::pin(async move {
-                // Serialise signal delivery against drive commits/cancellation and pin the lifecycle
-                // decision in the same transaction as insertion. Terminal history is immutable.
-                let state = sqlx::query_scalar::<_, String>(
+                executor
+                    .deliver_signal_on_conn(
+                        conn,
+                        run,
+                        signal_name,
+                        idem_key,
+                        payload_refs,
+                        spec_payload_key_ref,
+                    )
+                    .await
+            })
+        })
+        .await
+        .map_err(|error| Self::map_signal_store_error(error, error_run_id))
+    }
+
+    async fn deliver_signal_on_conn(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        run: RunId,
+        signal_name: String,
+        idem_key: String,
+        payload_refs: Vec<myelin_refs::ArtifactRef>,
+        payload_key_ref: Option<String>,
+    ) -> Result<SignalOutcome, SignalStoreError> {
+        let tenant = self.tenant.0.clone();
+        let region = self.region.0.clone();
+        let run_id = run.0;
+        let payload = serde_json::to_string(&payload_refs).map_err(|e| {
+            SignalStoreError::Storage(PgError::Query(format!("encode signal payload refs: {e}")))
+        })?;
+        let expected_payload = serde_json::to_value(&payload_refs).map_err(|e| {
+            SignalStoreError::Storage(PgError::Query(format!("encode signal payload refs: {e}")))
+        })?;
+        let spec_payload_key_ref = payload_key_ref;
+        // Serialise signal delivery against drive commits/cancellation and pin the lifecycle
+        // decision in the same transaction as insertion. Terminal history is immutable.
+        let state = sqlx::query_scalar::<_, String>(
                     "SELECT state FROM workflow_run WHERE tenant_id = $1 AND region = $2 AND run_id = $3 FOR UPDATE",
                 )
                 .bind(&tenant)
@@ -451,110 +527,104 @@ impl PgFlowExecutor {
                 .map_err(|e| {
                     PgError::Query(format!("lock signal target run: {e}"))
                 })?;
-                let Some(state) = state else {
-                    return Err(SignalStoreError::UnknownRun);
-                };
-                if run_state::is_terminal(&state) {
-                    // A VERIFIED same-tenant terminal run: acknowledge the late completion WITHOUT
-                    // buffering (no row inserted) and WITHOUT mutating the immutable terminal history.
-                    // The caller (e.g. the CI runner reporting `job.done` after a workflow timeout /
-                    // termination) settles its own queue lease on this no-op rather than retrying a
-                    // rejected delivery forever.
-                    //
-                    // BUT the divergent-redelivery guard still fires: a re-used idem_key carrying a
-                    // DIFFERENT payload/key-ref is producer CORRUPTION (two distinct completions under
-                    // one key), and terminality must not become a bypass for that check. If a row
-                    // already exists under this exact key, compare it: identical → the acknowledged
-                    // no-op; divergent → surfaced as InvalidInput exactly as for a live run. (A row can
-                    // exist because the run buffered/consumed this signal BEFORE it went terminal.)
-                    let existing = sqlx::query(
-                        "SELECT payload, payload_key_ref FROM wf_signal \
+        let Some(state) = state else {
+            return Err(SignalStoreError::UnknownRun);
+        };
+        if run_state::is_terminal(&state) {
+            // A VERIFIED same-tenant terminal run: acknowledge the late completion WITHOUT
+            // buffering (no row inserted) and WITHOUT mutating the immutable terminal history.
+            // The caller (e.g. the CI runner reporting `job.done` after a workflow timeout /
+            // termination) settles its own queue lease on this no-op rather than retrying a
+            // rejected delivery forever.
+            //
+            // BUT the divergent-redelivery guard still fires: a re-used idem_key carrying a
+            // DIFFERENT payload/key-ref is producer CORRUPTION (two distinct completions under
+            // one key), and terminality must not become a bypass for that check. If a row
+            // already exists under this exact key, compare it: identical → the acknowledged
+            // no-op; divergent → surfaced as InvalidInput exactly as for a live run. (A row can
+            // exist because the run buffered/consumed this signal BEFORE it went terminal.)
+            let existing = sqlx::query(
+                "SELECT payload, payload_key_ref FROM wf_signal \
                          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 \
                          AND signal_name = $4 AND idem_key = $5",
-                    )
-                    .bind(&tenant)
-                    .bind(&region)
-                    .bind(&run_id)
-                    .bind(&signal_name)
-                    .bind(&idem_key)
-                    .fetch_optional(&mut *conn)
-                    .await
-                    .map_err(|e| {
-                        PgError::Query(format!("verify late terminal signal: {e}"))
-                    })?;
-                    if let Some(existing) = existing {
-                        let stored_payload: serde_json::Value =
-                            existing.try_get("payload").map_err(|e| {
-                                PgError::Query(format!("decode terminal signal payload: {e}"))
-                            })?;
-                        let stored_key_ref: Option<String> =
-                            existing.try_get("payload_key_ref").map_err(|e| {
-                                PgError::Query(format!("decode terminal signal key ref: {e}"))
-                            })?;
-                        if stored_payload != expected_payload
-                            || stored_key_ref != spec_payload_key_ref
-                        {
-                            return Err(SignalStoreError::DivergentReplay);
-                        }
-                    }
-                    return Ok(SignalOutcome::TerminalNoOp);
+            )
+            .bind(&tenant)
+            .bind(&region)
+            .bind(&run_id)
+            .bind(&signal_name)
+            .bind(&idem_key)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| PgError::Query(format!("verify late terminal signal: {e}")))?;
+            if let Some(existing) = existing {
+                let stored_payload: serde_json::Value = existing
+                    .try_get("payload")
+                    .map_err(|e| PgError::Query(format!("decode terminal signal payload: {e}")))?;
+                let stored_key_ref: Option<String> = existing
+                    .try_get("payload_key_ref")
+                    .map_err(|e| PgError::Query(format!("decode terminal signal key ref: {e}")))?;
+                if stored_payload != expected_payload || stored_key_ref != spec_payload_key_ref {
+                    return Err(SignalStoreError::DivergentReplay);
                 }
+            }
+            return Ok(SignalOutcome::TerminalNoOp);
+        }
 
-                let inserted = sqlx::query(
-                    "INSERT INTO wf_signal (tenant_id, region, run_id, signal_name, idem_key, \
+        let inserted = sqlx::query(
+            "INSERT INTO wf_signal (tenant_id, region, run_id, signal_name, idem_key, \
                      payload, payload_key_ref) VALUES ($1, $2, $3, $4, $5, CAST($6 AS jsonb), $7) \
                      ON CONFLICT (tenant_id, run_id, signal_name, idem_key) DO NOTHING",
-                )
-                .bind(&tenant)
-                .bind(&region)
-                .bind(&run_id)
-                .bind(&signal_name)
-                .bind(&idem_key)
-                .bind(&payload)
-                .bind(&spec_payload_key_ref)
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| PgError::Query(format!("buffer durable workflow signal: {e}")))?;
+        )
+        .bind(&tenant)
+        .bind(&region)
+        .bind(&run_id)
+        .bind(&signal_name)
+        .bind(&idem_key)
+        .bind(&payload)
+        .bind(&spec_payload_key_ref)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| PgError::Query(format!("buffer durable workflow signal: {e}")))?;
 
-                let first_delivery = inserted.rows_affected() == 1;
-                let should_wake = if first_delivery {
-                    true
-                } else {
-                    let existing = sqlx::query(
-                        "SELECT payload, payload_key_ref, consumed_seq FROM wf_signal \
+        let first_delivery = inserted.rows_affected() == 1;
+        let should_wake = if first_delivery {
+            true
+        } else {
+            let existing = sqlx::query(
+                "SELECT payload, payload_key_ref, consumed_seq FROM wf_signal \
                          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 \
                          AND signal_name = $4 AND idem_key = $5",
-                    )
-                    .bind(&tenant)
-                    .bind(&region)
-                    .bind(&run_id)
-                    .bind(&signal_name)
-                    .bind(&idem_key)
-                    .fetch_one(&mut *conn)
-                    .await
-                    .map_err(|e| {
-                        PgError::Query(format!("verify duplicate durable workflow signal: {e}"))
-                    })?;
-                    let stored_payload: serde_json::Value = existing.try_get("payload").map_err(|e| {
-                        PgError::Query(format!("decode duplicate signal payload: {e}"))
-                    })?;
-                    let stored_key_ref: Option<String> = existing
-                        .try_get("payload_key_ref")
-                        .map_err(|e| PgError::Query(format!("decode duplicate signal key ref: {e}")))?;
-                    let consumed_seq: Option<i64> = existing
-                        .try_get("consumed_seq")
-                        .map_err(|e| PgError::Query(format!("decode duplicate signal state: {e}")))?;
-                    if stored_payload != expected_payload || stored_key_ref != spec_payload_key_ref {
-                        return Err(SignalStoreError::DivergentReplay);
-                    }
-                    consumed_seq.is_none()
-                };
+            )
+            .bind(&tenant)
+            .bind(&region)
+            .bind(&run_id)
+            .bind(&signal_name)
+            .bind(&idem_key)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| {
+                PgError::Query(format!("verify duplicate durable workflow signal: {e}"))
+            })?;
+            let stored_payload: serde_json::Value = existing
+                .try_get("payload")
+                .map_err(|e| PgError::Query(format!("decode duplicate signal payload: {e}")))?;
+            let stored_key_ref: Option<String> = existing
+                .try_get("payload_key_ref")
+                .map_err(|e| PgError::Query(format!("decode duplicate signal key ref: {e}")))?;
+            let consumed_seq: Option<i64> = existing
+                .try_get("consumed_seq")
+                .map_err(|e| PgError::Query(format!("decode duplicate signal state: {e}")))?;
+            if stored_payload != expected_payload || stored_key_ref != spec_payload_key_ref {
+                return Err(SignalStoreError::DivergentReplay);
+            }
+            consumed_seq.is_none()
+        };
 
-                // Signal insertion and waiting→running wake are one transaction: a crash cannot
-                // leave a new/pending durable signal parked behind a sleeping run. A duplicate
-                // already consumed by history is observational only and must never resurrect it.
-                if should_wake {
-                    sqlx::query(
+        // Signal insertion and waiting→running wake are one transaction: a crash cannot
+        // leave a new/pending durable signal parked behind a sleeping run. A duplicate
+        // already consumed by history is observational only and must never resurrect it.
+        if should_wake {
+            sqlx::query(
                         "UPDATE workflow_run SET state = 'running', updated_at = now() \
                          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND state = 'waiting'",
                     )
@@ -564,23 +634,51 @@ impl PgFlowExecutor {
                     .execute(&mut *conn)
                     .await
                     .map_err(|e| PgError::Query(format!("wake signalled workflow run: {e}")))?;
-                }
-                Ok(if first_delivery {
-                    SignalOutcome::Buffered
-                } else {
-                    SignalOutcome::Duplicate
-                })
-            })
+        }
+        Ok(if first_delivery {
+            SignalOutcome::Buffered
+        } else {
+            SignalOutcome::Duplicate
         })
+    }
+
+    async fn verify_connection_scope(
+        &self,
+        conn: &mut sqlx::PgConnection,
+    ) -> Result<(), ExecutorError> {
+        let row = sqlx::query(
+            "SELECT current_setting('myelin.tenant_id', true) AS tenant_id, \
+                    current_setting('myelin.region', true) AS region",
+        )
+        .fetch_one(&mut *conn)
         .await
-        .map_err(|error| match error {
-            SignalStoreError::UnknownRun => ExecutorError::UnknownRun(error_run_id),
+        .map_err(|error| store_error("verify caller transaction scope", error))?;
+        let tenant: Option<String> = row
+            .try_get("tenant_id")
+            .map_err(|error| store_error("decode caller tenant scope", error))?;
+        let region: Option<String> = row
+            .try_get("region")
+            .map_err(|error| store_error("decode caller region scope", error))?;
+        if tenant.as_deref() != Some(self.tenant.0.as_str())
+            || region.as_deref() != Some(self.region.0.as_str())
+        {
+            return Err(ExecutorError::Storage(
+                "typed signal caller transaction is not scoped to the executor tenant and region"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn map_signal_store_error(error: SignalStoreError, run_id: String) -> ExecutorError {
+        match error {
+            SignalStoreError::UnknownRun => ExecutorError::UnknownRun(run_id),
             SignalStoreError::DivergentReplay => ExecutorError::InvalidInput(
                 "signal idempotency key was reused with a divergent payload or payload key reference"
                     .into(),
             ),
             SignalStoreError::Storage(error) => store_error("signal workflow", error),
-        })
+        }
     }
 
     async fn describe_async(&self, run: &RunId) -> Result<RunStatus, ExecutorError> {
