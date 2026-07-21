@@ -132,10 +132,7 @@ pub enum VersionedResolvedRunPlan {
 /// Derive the exact concrete DAG-node name from an authored stage and its sorted matrix identity.
 /// Empty matrix identities retain the stage byte-for-byte; matrix identities are length-framed and
 /// BLAKE3-bound so distinct assignments cannot alias.
-pub fn derive_concrete_job_name(
-    stage: &str,
-    matrix_key: &BTreeMap<String, String>,
-) -> String {
+pub fn derive_concrete_job_name(stage: &str, matrix_key: &BTreeMap<String, String>) -> String {
     if matrix_key.is_empty() {
         return stage.to_string();
     }
@@ -164,6 +161,21 @@ impl ResolvedJobV1 {
     ///
     /// Each string is length-prefixed, so assignments such as `a=bc` and `ab=c` cannot collide.
     /// The map's `BTreeMap` order makes the encoding stable across processes.
+    pub fn matrix_identity(&self) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&(self.matrix_key.len() as u64).to_be_bytes());
+        for (key, value) in &self.matrix_key {
+            encoded.extend_from_slice(&(key.len() as u64).to_be_bytes());
+            encoded.extend_from_slice(key.as_bytes());
+            encoded.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            encoded.extend_from_slice(value.as_bytes());
+        }
+        encoded
+    }
+}
+
+impl ResolvedJobV2 {
+    /// Collision-safe deterministic identity bytes for this resolved matrix assignment.
     pub fn matrix_identity(&self) -> Vec<u8> {
         let mut encoded = Vec::new();
         encoded.extend_from_slice(&(self.matrix_key.len() as u64).to_be_bytes());
@@ -279,6 +291,29 @@ pub struct PreparedRunPlan {
     plan: ResolvedRunPlanV1,
 }
 
+/// Validated version-2 launch request. This is still customer input, not authority: callers must
+/// combine it with a policy-produced launch grant before any job can be materialized.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedRunPlanV2 {
+    tenant: TenantId,
+    content_hash: ContentHash,
+    plan: ResolvedRunPlanV2,
+}
+
+impl PreparedRunPlanV2 {
+    pub fn tenant(&self) -> &TenantId {
+        &self.tenant
+    }
+
+    pub fn content_hash(&self) -> &ContentHash {
+        &self.content_hash
+    }
+
+    pub fn plan(&self) -> &ResolvedRunPlanV2 {
+        &self.plan
+    }
+}
+
 impl PreparedRunPlan {
     /// Authoritative tenant derived from [`CiRunRecord`], never from caller input.
     pub fn tenant(&self) -> &TenantId {
@@ -392,6 +427,53 @@ pub fn load_resolved_run_plan<B: BlobStore + ?Sized>(
     blobs: &B,
     run: &CiRunRecord,
 ) -> Result<PreparedRunPlan, RunPlanError> {
+    let (tenant, content_hash, versioned) = load_versioned_run_plan(blobs, run)?;
+    let plan = match versioned {
+        VersionedResolvedRunPlan::V1(plan) => plan,
+        VersionedResolvedRunPlan::V2(plan) => {
+            return Err(RunPlanError::LaunchAuthorityRequired {
+                version: plan.schema_version,
+            })
+        }
+    };
+
+    Ok(PreparedRunPlan {
+        tenant,
+        content_hash,
+        plan,
+    })
+}
+
+/// Load the exact canonical V2 request for the launch-authority boundary. V1 remains a compatibility
+/// wire but cannot enter the manifest-backed production path because it lacks authored stage and
+/// execution-profile semantics.
+pub fn load_launch_run_plan_v2<B: BlobStore + ?Sized>(
+    blobs: &B,
+    run: &CiRunRecord,
+) -> Result<PreparedRunPlanV2, RunPlanError> {
+    let (tenant, content_hash, versioned) = load_versioned_run_plan(blobs, run)?;
+    let plan = match versioned {
+        VersionedResolvedRunPlan::V2(plan) => plan,
+        VersionedResolvedRunPlan::V1(plan) => {
+            return Err(RunPlanError::InvalidPlan {
+                detail: format!(
+                    "manifest-backed launch requires run-plan schema V2; received V{}",
+                    plan.schema_version
+                ),
+            })
+        }
+    };
+    Ok(PreparedRunPlanV2 {
+        tenant,
+        content_hash,
+        plan,
+    })
+}
+
+fn load_versioned_run_plan<B: BlobStore + ?Sized>(
+    blobs: &B,
+    run: &CiRunRecord,
+) -> Result<(TenantId, ContentHash, VersionedResolvedRunPlan), RunPlanError> {
     let (tenant, content_hash) = parse_snapshot_ref(run)?;
 
     let metadata = blobs.head(&tenant, &content_hash)?;
@@ -412,20 +494,8 @@ pub fn load_resolved_run_plan<B: BlobStore + ?Sized>(
             maximum: MAX_RUN_PLAN_BYTES,
         });
     }
-    let plan = match decode_resolved_run_plan(&bytes)? {
-        VersionedResolvedRunPlan::V1(plan) => plan,
-        VersionedResolvedRunPlan::V2(plan) => {
-            return Err(RunPlanError::LaunchAuthorityRequired {
-                version: plan.schema_version,
-            })
-        }
-    };
-
-    Ok(PreparedRunPlan {
-        tenant,
-        content_hash,
-        plan,
-    })
+    let plan = decode_resolved_run_plan(&bytes)?;
+    Ok((tenant, content_hash, plan))
 }
 
 fn parse_snapshot_ref(run: &CiRunRecord) -> Result<(TenantId, ContentHash), RunPlanError> {

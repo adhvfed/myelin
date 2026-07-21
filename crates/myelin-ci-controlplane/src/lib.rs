@@ -60,10 +60,10 @@ pub mod ci_drive_manifest;
 pub mod ci_pipeline;
 pub mod ci_result_signal;
 pub use ci_drive_manifest::{
-    CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1, CiManifestLaneV1,
-    CiManifestLimitsV1, CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1,
-    CiMergeWaiterV1, GrantedCiJobV1, CI_DRIVE_MANIFEST_DIGEST_V1_DOMAIN,
-    CI_DRIVE_MANIFEST_SCHEMA_V1, MAX_CI_DRIVE_MANIFEST_BYTES,
+    CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1, CiJobLaunchGrantV1,
+    CiLaunchAuthorityV1, CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1,
+    CiManifestTrustTierV1, CiManifestWorkspaceV1, CiMergeWaiterV1, GrantedCiJobV1,
+    CI_DRIVE_MANIFEST_DIGEST_V1_DOMAIN, CI_DRIVE_MANIFEST_SCHEMA_V1, MAX_CI_DRIVE_MANIFEST_BYTES,
 };
 /// CT-004d.2 chunk 4 — the durable `ci_run` writer ([`ci_run_store::CiRunStore`]): the CI
 /// run-of-record. The `ci-dispatch.trigger` consumer's reserve bundle must persist a durable `ci_run`
@@ -154,19 +154,20 @@ pub mod job_spec_store;
 /// jobs or flatten the dependency DAG into a sequential workflow.
 pub mod run_plan;
 pub use run_plan::{
-    decode_resolved_run_plan, derive_concrete_job_name, load_resolved_run_plan,
-    CiExecutionProfileV1, CiExecutionRequestV1, PreparedRunPlan, RedispatchReason, ResolvedJobV1,
-    ResolvedJobV2, ResolvedRunPlanV1, ResolvedRunPlanV2, RunPlanError, VersionedResolvedRunPlan,
-    EXECUTION_REQUEST_SCHEMA_V1, LAUNCH_REQUEST_DIGEST_V1_DOMAIN, RUN_PLAN_SCHEMA_V1,
-    RUN_PLAN_SCHEMA_V2,
+    decode_resolved_run_plan, derive_concrete_job_name, load_launch_run_plan_v2,
+    load_resolved_run_plan, CiExecutionProfileV1, CiExecutionRequestV1, PreparedRunPlan,
+    PreparedRunPlanV2, RedispatchReason, ResolvedJobV1, ResolvedJobV2, ResolvedRunPlanV1,
+    ResolvedRunPlanV2, RunPlanError, VersionedResolvedRunPlan, EXECUTION_REQUEST_SCHEMA_V1,
+    LAUNCH_REQUEST_DIGEST_V1_DOMAIN, RUN_PLAN_SCHEMA_V1, RUN_PLAN_SCHEMA_V2,
 };
 /// Exact `(tenant, region)` PostgreSQL starter that co-commits the canonical `ci_job` DAG ledger and
 /// pre-minted workflow start with the durable CI run's `queued -> running` transition.
 pub mod pg_pipeline_starter;
 pub use pg_pipeline_starter::{
-    ci_job_id_v1, decode_ci_claimed_input, CiWorkflowDefinitionPin, ClaimedCiInput,
-    ClaimedCiInputError, PgCiPipelineStarter, PgCiRunStarterFactory, PgCiStarterError,
-    StartQueuedOutcome, CI_JOB_ID_V1_DOMAIN,
+    ci_job_id_v1, ci_job_id_v2, decode_ci_claimed_input, CiLaunchAuthorityError,
+    CiLaunchAuthorityMaterializer, CiWorkflowDefinitionPin, ClaimedCiInput, ClaimedCiInputError,
+    PgCiPipelineStarter, PgCiRunStarterFactory, PgCiStarterError, StartQueuedOutcome,
+    CI_JOB_ID_V1_DOMAIN, CI_JOB_ID_V2_DOMAIN,
 };
 /// Durable CI dispatch and claim-bound completion components. [`ci_pipeline_driver::DurableJobRunner`]
 /// dispatches each stage into
@@ -768,9 +769,11 @@ pub fn ci_run_store_factory(pool: sqlx::PgPool) -> CiRunStore {
 /// **DORMANT + activation-gated.** `main` composes this behind the SAME `MYELIN_CI_RUNNER` seam the
 /// runner lane uses: while the startup refusal keeps `MYELIN_CI_RUNNER=1` fail-closed, the factory is
 /// constructed but no minted starter is driven (constructing it wraps the pool + blob client only — no
-/// query runs), so no queued run is started yet. The remaining wires the later activation flip closes
-/// are the region-wide queued-run poller that routes each discovered authoritative tenant into
-/// [`PgCiRunStarterFactory::starter_for`] and the myelin-flow M2 durable `RunStore`.
+/// query runs), so no queued run is started yet. This composition deliberately carries the starter's
+/// unavailable-authority adapter: even if it were accidentally driven, every fresh V2 launch would
+/// fail before allocating attempts or writing a manifest. The later activation flip must explicitly
+/// replace that adapter, add the region-wide queued-run poller, emit initial checks, compose the
+/// DAG-native body consumer, and close the myelin-flow M2 durable `RunStore` floor.
 pub fn ci_run_starter_factory(
     pool: sqlx::PgPool,
     region: myelin_tenancy::Region,

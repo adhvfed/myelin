@@ -21,6 +21,12 @@ pub const CI_DRIVE_MANIFEST_DIGEST_V1_DOMAIN: &str = "myelin.ci.drive-manifest.v
 pub const MAX_CI_DRIVE_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MANIFEST_JOBS: usize = 1_024;
 const MAX_TOKEN_BYTES: usize = 512;
+const MAX_MANIFEST_COLLECTION_ITEMS: usize = 1_024;
+const MAX_CPU_MILLIS: u32 = 64_000;
+const MAX_MEMORY_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+const MAX_DISK_BYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024;
+const MAX_PIDS: u32 = 32_768;
+const MAX_TIMEOUT_SECS: u32 = 24 * 60 * 60;
 
 const INSERT_MANIFEST: &str = "\
 INSERT INTO ci_drive_manifest (
@@ -84,6 +90,32 @@ pub struct CiManifestSchedulingV1 {
     pub labels: Vec<String>,
     pub concurrency_group: Option<String>,
     pub fair_key: String,
+}
+
+/// Policy-granted runtime terms for one concrete resolved job. Customer-authored DAG/image/command
+/// facts are deliberately absent: the starter copies those from the verified plan and combines them
+/// with this grant, so an authority adapter cannot rewrite the requested program while approving it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CiJobLaunchGrantV1 {
+    pub concrete_name: String,
+    pub env: BTreeMap<String, String>,
+    pub secret_handles: BTreeMap<String, String>,
+    pub egress_allow: Vec<String>,
+    pub limits: CiManifestLimitsV1,
+    pub scheduling: CiManifestSchedulingV1,
+    pub reserve_handle: String,
+    pub token_authority_handle: String,
+}
+
+/// Complete server-side authority decision for a prepared run. There is intentionally no default
+/// constructor that grants work: a policy-aware adapter must return every concrete job grant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CiLaunchAuthorityV1 {
+    pub policy_revision: String,
+    pub jobs: Vec<CiJobLaunchGrantV1>,
+    pub merge_waiter: Option<CiMergeWaiterV1>,
 }
 
 /// Server-granted, replayable job template. `token_authority_handle` is a stable minting authority;
@@ -161,6 +193,19 @@ impl CiDriveManifestV1 {
             "ci",
             "artifact",
         )?;
+        let snapshot = myelin_refs::parse_scoped(&self.source_snapshot_ref).map_err(|error| {
+            CiDriveManifestError::Invalid(format!("source_snapshot_ref: {error}"))
+        })?;
+        let Some(snapshot_digest) = snapshot.id.strip_prefix("snapshot-blake3:") else {
+            return invalid("source_snapshot_ref is not a snapshot BLAKE3 artifact");
+        };
+        if snapshot_digest.len() != 64
+            || !snapshot_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return invalid("source_snapshot_ref has a noncanonical BLAKE3 digest");
+        }
         validate_canonical_ref("repo_ref", &self.repo_ref, &self.tenant_id, "git", "repo")?;
         validate_canonical_ref("run_ref", &self.run_ref, &self.tenant_id, "ci", "run")?;
         let run = myelin_refs::parse_scoped(&self.run_ref)
@@ -168,8 +213,8 @@ impl CiDriveManifestV1 {
         if run.id != self.ci_run_id {
             return invalid("run_ref does not name ci_run_id");
         }
-        if self.source_plan_schema_version == 0 {
-            return invalid("source plan schema version must be positive");
+        if self.source_plan_schema_version != crate::RUN_PLAN_SCHEMA_V2 {
+            return invalid("drive manifests require run-plan schema V2");
         }
         validate_digest("launch_request_digest", &self.launch_request_digest)?;
         if self.workflow_type != CI_PIPELINE_WF_TYPE {
@@ -207,11 +252,15 @@ impl CiDriveManifestV1 {
             validate_machine_token("stage", &job.stage)?;
             validate_machine_token("job name", &job.name)?;
             validate_bounded("check context", &job.check_context)?;
+            if job.check_context != format!("ci:{}", job.stage) {
+                return invalid("job check context must be derived from its authored stage");
+            }
             if !ids.insert(job.job_id.clone()) || !names.insert(job.name.clone()) {
                 return invalid("manifest job ids and names must be unique");
             }
             job_contexts.insert(job.check_context.clone());
             validate_strictly_sorted("needs", &job.needs)?;
+            validate_collection_len("needs", job.needs.len())?;
             for dependency in &job.needs {
                 validate_uuid("dependency job id", dependency)?;
                 if dependency == &job.job_id {
@@ -222,19 +271,34 @@ impl CiDriveManifestV1 {
                 validate_machine_token("matrix axis", axis)?;
                 validate_bounded("matrix value", value)?;
             }
+            validate_collection_len("matrix axes", job.matrix_key.len())?;
+            if job.image.is_empty() || job.image.len() > crate::run_plan::MAX_IMAGE_BYTES {
+                return invalid("job image is empty or overlong");
+            }
             ImageRef::pinned(job.image.clone()).map_err(|_| {
                 CiDriveManifestError::Invalid("job image is not digest-pinned".into())
             })?;
-            if job.command.is_empty() || job.command.len() > 64 {
+            if job.command.is_empty() || job.command.len() > crate::run_plan::MAX_COMMAND_ARGS {
                 return invalid("job command length is outside 1..=64");
             }
-            for argument in &job.command {
-                validate_bounded("command argument", argument)?;
+            if job.command[0].is_empty() {
+                return invalid("job command executable is empty");
+            }
+            let command_bytes = job.command.iter().try_fold(0usize, |total, argument| {
+                if argument.contains('\0') {
+                    None
+                } else {
+                    total.checked_add(argument.len())
+                }
+            });
+            if command_bytes.is_none_or(|bytes| bytes > crate::run_plan::MAX_COMMAND_BYTES) {
+                return invalid("job command contains NUL, overflows, or exceeds 32 KiB");
             }
             for (name, value) in &job.env {
                 validate_machine_token("environment name", name)?;
                 validate_bounded("environment value", value)?;
             }
+            validate_collection_len("environment", job.env.len())?;
             for (name, handle) in &job.secret_handles {
                 validate_machine_token("secret environment name", name)?;
                 validate_bounded("secret handle", handle)?;
@@ -242,8 +306,11 @@ impl CiDriveManifestV1 {
                     return invalid("a secret name cannot also carry a literal environment value");
                 }
             }
+            validate_collection_len("secret handles", job.secret_handles.len())?;
             validate_strictly_sorted("egress allowlist", &job.egress_allow)?;
             validate_strictly_sorted("runner labels", &job.scheduling.labels)?;
+            validate_collection_len("egress allowlist", job.egress_allow.len())?;
+            validate_collection_len("runner labels", job.scheduling.labels.len())?;
             validate_limits(&job.limits)?;
             validate_workspace(self, &job.workspace)?;
             validate_bounded("fair key", &job.scheduling.fair_key)?;
@@ -252,6 +319,11 @@ impl CiDriveManifestV1 {
             }
             validate_bounded("reserve handle", &job.reserve_handle)?;
             validate_bounded("token authority handle", &job.token_authority_handle)?;
+            if job.continue_on_error {
+                return invalid(
+                    "continue_on_error is unavailable until authored by the V2 plan contract",
+                );
+            }
         }
         if job_contexts != self.check_attempts.keys().cloned().collect() {
             return invalid("check_attempts must exactly cover the distinct job contexts");
@@ -345,7 +417,7 @@ impl CiDriveManifestStore {
             .await
             .map_err(|error| database("begin insert", error))?;
         scope_connection(&mut transaction, &self.tenant, &self.region).await?;
-        let digest = Self::insert_on_conn(&mut transaction, manifest).await?;
+        let digest = self.insert_on_conn(&mut transaction, manifest).await?;
         transaction
             .commit()
             .await
@@ -353,13 +425,38 @@ impl CiDriveManifestStore {
         Ok(digest)
     }
 
+    /// Scope-bound preflight lookup used to avoid invoking mutable policy for an already-authorized
+    /// immutable run. The starter repeats this lookup after locking the queued row.
+    pub async fn load_by_identity(
+        &self,
+        wf_run_id: &str,
+        ci_run_id: &str,
+    ) -> Result<Option<(CiDriveManifestV1, String)>, CiDriveManifestError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| database("begin identity load", error))?;
+        scope_connection(&mut transaction, &self.tenant, &self.region).await?;
+        let loaded = self
+            .load_by_identity_on_conn(&mut transaction, wf_run_id, ci_run_id)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| database("commit identity load", error))?;
+        Ok(loaded)
+    }
+
     /// Insert and exact-replay verify on a caller-owned transaction. This is the starter's co-commit
     /// seam: attempt allocation, DAG ledger, manifest, workflow start, and run transition can share
     /// one PostgreSQL commit.
     pub async fn insert_on_conn(
+        &self,
         connection: &mut PgConnection,
         manifest: &CiDriveManifestV1,
     ) -> Result<String, CiDriveManifestError> {
+        self.require_scope(manifest)?;
         let bytes = manifest.canonical_bytes()?;
         let digest = manifest.digest()?;
         sqlx::query(INSERT_MANIFEST)
@@ -387,6 +484,47 @@ impl CiDriveManifestStore {
         }
         verify_row(&rows[0], manifest, &bytes, &digest)?;
         Ok(digest)
+    }
+
+    /// Read and cryptographically verify an existing immutable manifest on a caller-owned
+    /// transaction. The exact queued-run starter uses this before allocating attempts, so repairing
+    /// a lifecycle split reuses the original per-context values even if a newer run has since
+    /// advanced the shared check counters.
+    pub async fn load_by_identity_on_conn(
+        &self,
+        connection: &mut PgConnection,
+        wf_run_id: &str,
+        ci_run_id: &str,
+    ) -> Result<Option<(CiDriveManifestV1, String)>, CiDriveManifestError> {
+        validate_uuid("wf_run_id", wf_run_id)?;
+        validate_uuid("ci_run_id", ci_run_id)?;
+        let rows = sqlx::query(SELECT_COLLIDING_MANIFESTS)
+            .bind(&self.tenant.0)
+            .bind(&self.region.0)
+            .bind(wf_run_id)
+            .bind(ci_run_id)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|error| database("load identity", error))?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        if rows.len() != 1 {
+            return Err(CiDriveManifestError::Conflict);
+        }
+        let row = &rows[0];
+        let bytes: Vec<u8> = row.get("manifest_bytes");
+        let digest: String = row.get("manifest_digest");
+        let manifest = CiDriveManifestV1::decode_canonical(&bytes)?;
+        verify_row(row, &manifest, &bytes, &digest)?;
+        if manifest.tenant_id != self.tenant.0
+            || manifest.region != self.region.0
+            || manifest.wf_run_id != wf_run_id
+            || manifest.ci_run_id != ci_run_id
+        {
+            return Err(CiDriveManifestError::IdentityMismatch);
+        }
+        Ok(Some((manifest, digest)))
     }
 
     pub async fn load_expected(
@@ -437,7 +575,10 @@ impl CiDriveManifestStore {
 pub enum CiDriveManifestError {
     Invalid(String),
     Wire(String),
-    Database(&'static str),
+    Database {
+        operation: &'static str,
+        detail: String,
+    },
     ScopeMismatch,
     IdentityMismatch,
     DigestMismatch,
@@ -450,8 +591,11 @@ impl std::fmt::Display for CiDriveManifestError {
         match self {
             Self::Invalid(detail) => write!(f, "invalid CI drive manifest: {detail}"),
             Self::Wire(detail) => write!(f, "malformed CI drive manifest wire: {detail}"),
-            Self::Database(operation) => {
-                write!(f, "CI drive manifest database error during {operation}")
+            Self::Database { operation, detail } => {
+                write!(
+                    f,
+                    "CI drive manifest database error during {operation}: {detail}"
+                )
             }
             Self::ScopeMismatch => write!(f, "CI drive manifest scope mismatch"),
             Self::IdentityMismatch => write!(f, "CI drive manifest identity mismatch"),
@@ -561,6 +705,21 @@ fn validate_limits(limits: &CiManifestLimitsV1) -> Result<(), CiDriveManifestErr
     {
         return invalid("all job resource limits must be positive");
     }
+    if limits.cpu_millis > MAX_CPU_MILLIS
+        || limits.mem_bytes > MAX_MEMORY_BYTES
+        || limits.disk_bytes > MAX_DISK_BYTES
+        || limits.pids_max > MAX_PIDS
+        || limits.timeout_secs > MAX_TIMEOUT_SECS
+    {
+        return invalid("job resource grant exceeds the platform hard ceiling");
+    }
+    Ok(())
+}
+
+fn validate_collection_len(label: &str, len: usize) -> Result<(), CiDriveManifestError> {
+    if len > MAX_MANIFEST_COLLECTION_ITEMS {
+        return invalid(format!("{label} exceeds the 1024-item ceiling"));
+    }
     Ok(())
 }
 
@@ -576,9 +735,10 @@ fn validate_strictly_sorted(label: &str, values: &[String]) -> Result<(), CiDriv
 
 fn validate_machine_token(label: &str, value: &str) -> Result<(), CiDriveManifestError> {
     validate_bounded(label, value)?;
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    if !value.as_bytes()[0].is_ascii_alphanumeric()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
         return invalid(format!("{label} is not a machine token"));
     }
@@ -654,8 +814,11 @@ fn invalid<T>(detail: impl Into<String>) -> Result<T, CiDriveManifestError> {
     Err(CiDriveManifestError::Invalid(detail.into()))
 }
 
-fn database(operation: &'static str, _error: sqlx::Error) -> CiDriveManifestError {
-    CiDriveManifestError::Database(operation)
+fn database(operation: &'static str, error: sqlx::Error) -> CiDriveManifestError {
+    CiDriveManifestError::Database {
+        operation,
+        detail: error.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -791,5 +954,70 @@ mod tests {
         let mut value = serde_json::to_value(manifest).unwrap();
         value["token_jti"] = serde_json::Value::String("must-not-land".into());
         assert!(CiDriveManifestV1::decode_canonical(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn authority_limits_provenance_and_collection_ceilings_are_fail_closed() {
+        let mut wrong_snapshot_class = manifest();
+        wrong_snapshot_class.source_snapshot_ref =
+            format!("myelin://acme/ci/artifact/plan-{}", digest('a'));
+        assert!(wrong_snapshot_class.validate().is_err());
+
+        let mut wrong_plan_version = manifest();
+        wrong_plan_version.source_plan_schema_version = 1;
+        assert!(wrong_plan_version.validate().is_err());
+
+        let mut excessive = manifest();
+        excessive.jobs[0].limits.cpu_millis = MAX_CPU_MILLIS + 1;
+        assert!(excessive
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("hard ceiling"));
+
+        let mut too_many_env = manifest();
+        too_many_env.jobs[0].env = (0..=MAX_MANIFEST_COLLECTION_ITEMS)
+            .map(|index| (format!("V{index}"), "value".into()))
+            .collect();
+        assert!(too_many_env
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("1024-item ceiling"));
+
+        let mut forged_context = manifest();
+        forged_context.jobs[0].check_context = "ci:other".into();
+        forged_context.check_attempts.remove("ci:build");
+        forged_context.check_attempts.insert("ci:other".into(), 7);
+        assert!(forged_context
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("authored stage"));
+
+        let mut prefixed_token = manifest();
+        prefixed_token.jobs[0].stage = "_build".into();
+        assert!(prefixed_token
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("machine token"));
+
+        let mut exact_argv = manifest();
+        exact_argv.jobs[0].image = format!(
+            "registry.example/{}@sha256:{}",
+            "a".repeat(500),
+            "b".repeat(64)
+        );
+        exact_argv.jobs[0].command = vec!["/bin/tool".into(), "".into(), "  exact  ".into()];
+        assert!(exact_argv.validate().is_ok());
+
+        let mut rewritten_failure_semantics = manifest();
+        rewritten_failure_semantics.jobs[0].continue_on_error = true;
+        assert!(rewritten_failure_semantics
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("until authored"));
     }
 }
