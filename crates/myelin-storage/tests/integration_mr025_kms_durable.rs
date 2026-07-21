@@ -84,14 +84,12 @@ async fn admin_provider() -> Option<SubstrateProvider> {
     Some(provider)
 }
 
-fn fresh_pool() -> impl std::future::Future<Output = sqlx::postgres::PgPool> {
-    async {
-        SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 2)
-            .await
-            .expect("fresh pool")
-            .db_pool()
-            .clone()
-    }
+async fn fresh_pool() -> sqlx::postgres::PgPool {
+    SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 2)
+        .await
+        .expect("fresh pool")
+        .db_pool()
+        .clone()
 }
 
 // =================================================================================================
