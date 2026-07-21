@@ -787,6 +787,26 @@ emit the initial queued/in-progress check facts, make the durable workflow body 
 a DAG, add exact-tenant poller/worker fan-out, and close the myelin-flow M2 durable `RunStore` floor.
 `MYELIN_CI_RUNNER=1` remains startup-refused; this increment does not activate production execution.
 
+**CI causal initial manifest checks (2026-07-21, `a43a36f`).** A fresh manifest-backed start now
+co-emits one deterministic `ci.check.updated{in_progress}` fact per frozen authored context in the
+same PostgreSQL transaction as the manifest, job ledger, workflow start, and `queued -> running`
+transition; rollback leaves none and manifest replay emits none again. Dispatch and launch share the
+versioned check-context mapping, so the earlier queued facts and these in-progress facts advance one
+Git check lifecycle rather than creating `build`/`ci:build` siblings. Git's two-way trust projection
+also maps member self-hosted execution to `trusted`, while forks remain `untrusted_fork`. Envelope
+timestamps use the actual database wall clock; the immutable run start stays in the payload.
+Asynchronous causality no longer relies on retaining the triggering outbox row: dispatch persists the
+trigger event id, correlation root, canonical depth, and originating `caused_by` on `ci_run` through a
+forward-only migration, and the starter derives byte-identical child provenance from that durable
+snapshot. The store rejects depths outside the canonical `u32` range before SQL, and PostgreSQL pins
+the same range. Proof: 653 event/control-plane/dispatch unit tests, warnings-denied all-feature clippy,
+live migration/bootstrap, exact replay/RLS store, immutable manifest store, atomic starter rollback/
+replay, and all six dispatch crash/replay cases; the independent re-audit confirmed the prior
+causality blocker closed. **Honest remaining activation floors:** compose a real policy-aware launch
+authority, make the durable workflow body consume the manifest as a DAG, add exact-tenant poller/
+worker fan-out, and close the myelin-flow M2 durable `RunStore` floor. Production execution remains
+startup-refused.
+
 ## R5–R6
 
 | Phase | Status |
