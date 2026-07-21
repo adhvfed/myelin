@@ -516,10 +516,11 @@ pub use job_spec_store::{
 // locking query verifies every immutable field; divergent/invisible conflicts fail typed and loud.
 // The co-emitted events stay absorb-mode through the outbox (the honest #7 H1 split).
 pub use ci_run_store::{
-    CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationWrite, CiRunFinalizer, CiRunInsert,
-    CiRunRecord, CiRunStore, CiRunStoreError, CiRunTerminalState, DurableCiRunFinalizer,
-    FINALIZE_CI_RUN_QUERY, INSERT_CI_RUN_QUERY, LOCK_CI_RUN_FOR_FINALIZE_QUERY,
-    SELECT_CI_RUN_ACCOUNTING_QUERY, SELECT_CI_RUN_QUERY, VERIFY_CI_RUN_REPLAY_QUERY,
+    CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationOutcome, CiRunFinalizationWrite,
+    CiRunFinalizer, CiRunInsert, CiRunRecord, CiRunStore, CiRunStoreError, CiRunTerminalState,
+    DurableCiRunFinalizer, FINALIZE_CI_RUN_QUERY, INSERT_CI_RUN_QUERY,
+    LOCK_CI_RUN_FOR_FINALIZE_QUERY, SELECT_CI_RUN_ACCOUNTING_QUERY, SELECT_CI_RUN_QUERY,
+    VERIFY_CI_RUN_REPLAY_QUERY,
 };
 pub use ci_scheduler_db::{
     CiSchedulerDbConfig, CiSchedulerDbError, CiSchedulerDbProvider, CI_SCHEDULER_DATABASE_URL_ENV,
@@ -934,8 +935,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            29,
-            "all 17 tables, ci_run causal provenance, 4 concurrent indexes, the ledger validator, 2 job_queue ALTERs, the ci_job_spec-stage ALTER, scheduler RLS boundary, and 2 claim-column grants are present"
+            30,
+            "all 17 tables, ci_run causal provenance, 4 concurrent indexes, the ledger validator, 2 job_queue ALTERs, the ci_job_spec-stage and accounting-skipped ALTERs, scheduler RLS boundary, and 2 claim-column grants are present"
         );
         assert!(
             spec.consumers.is_empty(),

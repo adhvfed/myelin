@@ -303,10 +303,13 @@ where
             finalize_and_emit_terminal_facts(
                 ctx,
                 manifest,
-                terminal_state,
-                false,
-                Some(&job),
-                &flow_timed_out_jobs,
+                CiTerminalDecision {
+                    terminal_state,
+                    success: false,
+                    failed_job: Some(&job),
+                    flow_timed_out_jobs: &flow_timed_out_jobs,
+                    dispatched_job_ids: &completed,
+                },
                 finalizer,
             )?;
             return Ok(CiManifestPipelineOutcome::Failed { job, timed_out });
@@ -316,10 +319,13 @@ where
     finalize_and_emit_terminal_facts(
         ctx,
         manifest,
-        CiRunTerminalState::Succeeded,
-        true,
-        None,
-        &flow_timed_out_jobs,
+        CiTerminalDecision {
+            terminal_state: CiRunTerminalState::Succeeded,
+            success: true,
+            failed_job: None,
+            flow_timed_out_jobs: &flow_timed_out_jobs,
+            dispatched_job_ids: &completed,
+        },
         finalizer,
     )?;
     Ok(CiManifestPipelineOutcome::Succeeded {
@@ -334,57 +340,78 @@ fn join_key(job: &DispatchedJob) -> (i64, &str) {
     )
 }
 
+struct CiTerminalDecision<'a> {
+    terminal_state: CiRunTerminalState,
+    success: bool,
+    failed_job: Option<&'a str>,
+    flow_timed_out_jobs: &'a BTreeSet<String>,
+    dispatched_job_ids: &'a BTreeSet<String>,
+}
+
 fn finalize_and_emit_terminal_facts(
     ctx: &mut WfCtx,
     manifest: &CiDriveManifestV1,
-    terminal_state: CiRunTerminalState,
-    success: bool,
-    failed_job: Option<&str>,
-    flow_timed_out_jobs: &BTreeSet<String>,
+    decision: CiTerminalDecision<'_>,
     finalizer: &dyn CiRunFinalizer,
 ) -> WfResult<()> {
-    let completed_at = ctx.now();
+    let proposed_completed_at = ctx.now();
     let finalization = CiRunFinalization {
         tenant_id: manifest.tenant_id.clone(),
         region: manifest.region.clone(),
         run_id: manifest.ci_run_id.clone(),
         wf_run_id: manifest.wf_run_id.clone(),
-        terminal_state,
-        completed_at: completed_at.clone(),
+        terminal_state: decision.terminal_state,
+        completed_at: proposed_completed_at,
         jobs: manifest
             .jobs
             .iter()
             .map(|job| CiRunFinalizationJob {
                 job_id: job.job_id.clone(),
                 reserve_handle: job.reserve_handle.clone(),
-                flow_timed_out: flow_timed_out_jobs.contains(&job.job_id),
+                flow_timed_out: decision.flow_timed_out_jobs.contains(&job.job_id),
+                dispatched: decision.dispatched_job_ids.contains(&job.job_id),
             })
             .collect(),
     };
-    let finalization_marker = ArtifactRef(format!(
-        "ci.run.finalized:{}:{}",
-        terminal_state.as_str(),
+    let marker_prefix = format!(
+        "ci.run.finalized:{}:{}:",
+        decision.terminal_state.as_str(),
         manifest.ci_run_id
-    ));
-    let expected_marker = finalization_marker.clone();
+    );
+    let closure_prefix = marker_prefix.clone();
     let result = ctx.activity(RetryPolicy::default_policy(), move |_idem, _attempt| {
-        finalizer
+        let outcome = finalizer
             .finalize(&finalization)
             .map_err(|error| ActivityError(error.to_string()))?;
-        Ok(vec![finalization_marker.clone()])
+        Ok(vec![ArtifactRef(format!(
+            "{closure_prefix}{}",
+            outcome.completed_at
+        ))])
     })?;
-    if result != vec![expected_marker] {
+    let completed_at = match result.as_slice() {
+        [marker] => marker
+            .0
+            .strip_prefix(&marker_prefix)
+            .filter(|time| !time.is_empty()),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        WfError::Nondeterministic(
+            "CI run finalization journal changed terminal identity or completion time".into(),
+        )
+    })?;
+    if completed_at.len() > 64 {
         return Err(WfError::Nondeterministic(
-            "CI run finalization journal changed terminal identity".into(),
+            "CI run finalization journal contains an invalid completion time".into(),
         ));
     }
     emit_terminal_facts(
         ctx,
         manifest,
-        &completed_at,
-        terminal_state,
-        success,
-        failed_job,
+        completed_at,
+        decision.terminal_state,
+        decision.success,
+        decision.failed_job,
     )
 }
 

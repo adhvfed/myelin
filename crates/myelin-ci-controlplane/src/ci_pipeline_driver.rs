@@ -671,6 +671,7 @@ async fn co_commit_terminal_accounting(
                 reserve_handle: input.reserve_handle.to_owned(),
                 passed: input.report.passed,
                 timed_out: input.report.timed_out,
+                skipped: false,
                 usage: input.report.usage,
                 pricing_revision: priced.pricing_revision,
                 billed: settled.billed_total,

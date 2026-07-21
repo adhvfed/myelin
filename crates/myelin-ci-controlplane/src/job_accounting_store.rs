@@ -16,16 +16,16 @@ use sqlx::Row;
 /// Insert one immutable accounting receipt. Bind order is documented by [`CiJobAccountingStore`].
 pub const INSERT_CI_JOB_ACCOUNTING_QUERY: &str = "\
 INSERT INTO ci_job_accounting
-  (tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle, passed, timed_out,
+  (tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle, passed, timed_out, skipped,
    cpu_seconds, mem_byte_seconds, pricing_revision, billed_minor_units, refunded_minor_units,
    completion_receipt)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 ON CONFLICT (tenant_id, job_id) DO NOTHING
 RETURNING job_id";
 
 /// Read all immutable fields after a conflict so an idempotent replay cannot hide divergence.
 pub const SELECT_CI_JOB_ACCOUNTING_QUERY: &str = "\
-SELECT region, wf_run_id, ci_run_id, reserve_handle, passed, timed_out, cpu_seconds,
+SELECT region, wf_run_id, ci_run_id, reserve_handle, passed, timed_out, skipped, cpu_seconds,
        mem_byte_seconds, pricing_revision, billed_minor_units, refunded_minor_units,
        completion_receipt
 FROM ci_job_accounting
@@ -41,6 +41,8 @@ pub struct CiJobAccountingRecord {
     pub reserve_handle: String,
     pub passed: bool,
     pub timed_out: bool,
+    /// True only for a manifest job that was never dispatched because a dependency failed.
+    pub skipped: bool,
     pub usage: ResourceUsage,
     pub pricing_revision: String,
     pub billed: MinorUnits,
@@ -58,6 +60,7 @@ impl core::fmt::Debug for CiJobAccountingRecord {
             .field("reserve_handle", &"<redacted>")
             .field("passed", &self.passed)
             .field("timed_out", &self.timed_out)
+            .field("skipped", &self.skipped)
             .field("usage", &"<redacted>")
             .field("pricing_revision", &"<redacted>")
             .field("billed", &"<redacted>")
@@ -174,6 +177,7 @@ impl CiJobAccountingStore {
             .bind(&record.reserve_handle)
             .bind(record.passed)
             .bind(record.timed_out)
+            .bind(record.skipped)
             .bind(cpu_seconds)
             .bind(mem_byte_seconds)
             .bind(&record.pricing_revision)
@@ -200,6 +204,7 @@ impl CiJobAccountingStore {
             && existing.get::<String, _>("reserve_handle") == record.reserve_handle
             && existing.get::<bool, _>("passed") == record.passed
             && existing.get::<bool, _>("timed_out") == record.timed_out
+            && existing.get::<bool, _>("skipped") == record.skipped
             && existing.get::<i64, _>("cpu_seconds") == cpu_seconds
             && existing.get::<i64, _>("mem_byte_seconds") == mem_byte_seconds
             && existing.get::<String, _>("pricing_revision") == record.pricing_revision
@@ -252,6 +257,7 @@ impl CiJobAccountingStore {
             reserve_handle: row.get("reserve_handle"),
             passed: row.get("passed"),
             timed_out: row.get("timed_out"),
+            skipped: row.get("skipped"),
             usage: ResourceUsage {
                 cpu_seconds: nonnegative("cpu_seconds")?,
                 mem_byte_seconds: nonnegative("mem_byte_seconds")?,
@@ -282,7 +288,9 @@ impl CiJobAccountingStore {
 }
 
 fn validate_record(record: &CiJobAccountingRecord) -> Result<(), CiJobAccountingError> {
-    if record.passed && record.timed_out {
+    if (record.passed && (record.timed_out || record.skipped))
+        || (record.timed_out && record.skipped)
+    {
         return Err(CiJobAccountingError::InvalidField("terminal verdict"));
     }
     for (name, value) in [
@@ -328,6 +336,7 @@ mod tests {
             reserve_handle: "reserve:1".into(),
             passed: true,
             timed_out: false,
+            skipped: false,
             usage: ResourceUsage {
                 cpu_seconds: 7,
                 mem_byte_seconds: 11,
@@ -367,6 +376,13 @@ mod tests {
             validate_record(&candidate),
             Err(CiJobAccountingError::InvalidField("terminal verdict"))
         );
+
+        candidate.passed = false;
+        candidate.skipped = true;
+        assert_eq!(
+            validate_record(&candidate),
+            Err(CiJobAccountingError::InvalidField("terminal verdict"))
+        );
     }
 
     #[test]
@@ -381,6 +397,7 @@ mod tests {
             "reserve_handle",
             "passed",
             "timed_out",
+            "skipped",
             "cpu_seconds",
             "mem_byte_seconds",
             "pricing_revision",

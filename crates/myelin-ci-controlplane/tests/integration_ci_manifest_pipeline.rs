@@ -13,9 +13,9 @@ use myelin_ci_controlplane::{
     CiExecutionRequestV1, CiJobLaunchGrantV1, CiJobSpecStore, CiJobTokenIssueError,
     CiJobTokenIssuer, CiJobTokenRequest, CiLaunchAuthorityError, CiLaunchAuthorityMaterializer,
     CiLaunchAuthorityV1, CiManifestDurableJobRunner, CiManifestInputResolver, CiManifestLaneV1,
-    CiManifestLimitsV1, CiManifestSchedulingV1, CiRunFinalization, CiRunFinalizationWrite,
-    CiRunFinalizer, CiRunStoreError, CiWorkflowDefinitionPin, PgCiPipelineStarter,
-    PreparedRunPlanV2, ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
+    CiManifestLimitsV1, CiManifestSchedulingV1, CiRunFinalization, CiRunFinalizationOutcome,
+    CiRunFinalizationWrite, CiRunFinalizer, CiRunStoreError, CiWorkflowDefinitionPin,
+    PgCiPipelineStarter, PreparedRunPlanV2, ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
 };
 use myelin_ci_sandbox::{RunTokenRef, TrustTier};
 use myelin_config::MyelinConfig;
@@ -175,9 +175,12 @@ struct AcceptFinalizer;
 impl CiRunFinalizer for AcceptFinalizer {
     fn finalize(
         &self,
-        _finalization: &CiRunFinalization,
-    ) -> Result<CiRunFinalizationWrite, CiRunStoreError> {
-        Ok(CiRunFinalizationWrite::Finalized)
+        finalization: &CiRunFinalization,
+    ) -> Result<CiRunFinalizationOutcome, CiRunStoreError> {
+        Ok(CiRunFinalizationOutcome {
+            write: CiRunFinalizationWrite::Finalized,
+            completed_at: finalization.completed_at.clone(),
+        })
     }
 }
 

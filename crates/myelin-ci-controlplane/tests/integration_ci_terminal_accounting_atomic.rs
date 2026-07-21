@@ -8,8 +8,9 @@ use myelin_ci_controlplane::{
     ci_run_store_factory, CiDriveManifestStore, CiDriveManifestV1, CiJobAccountingPricer,
     CiJobAccountingStore, CiJobPricingError, CiManifestLaneV1, CiManifestLimitsV1,
     CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, CiPipelineReporter,
-    CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationWrite, CiRunInsert, CiRunStoreError,
-    CiRunTerminalState, DurableCiJobAccounting, GrantedCiJobV1, PricedCiJobUsage,
+    CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationWrite, CiRunFinalizer, CiRunInsert,
+    CiRunStoreError, CiRunTerminalState, DurableCiJobAccounting, DurableCiRunFinalizer,
+    GrantedCiJobV1, PricedCiJobUsage,
 };
 use myelin_ci_sandbox::{
     CompletionClaim, EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
@@ -85,6 +86,7 @@ fn manifest(
     wf_run: &str,
     ci_run: &str,
     job: &str,
+    skipped_job: &str,
 ) -> CiDriveManifestV1 {
     let digest = |byte: char| format!("blake3:{}", byte.to_string().repeat(64));
     CiDriveManifestV1 {
@@ -105,43 +107,80 @@ fn manifest(
         run_ref: format!("myelin://{tenant}/ci/run/{ci_run}"),
         started_at: "2026-07-21T12:34:56.000000Z".into(),
         trust_tier: CiManifestTrustTierV1::Trusted,
-        check_attempts: BTreeMap::from([("build".into(), 1)]),
+        check_attempts: BTreeMap::from([("build".into(), 1), ("package".into(), 1)]),
         merge_waiter: None,
-        jobs: vec![GrantedCiJobV1 {
-            job_id: job.into(),
-            stage: "build".into(),
-            name: "build".into(),
-            check_context: "build".into(),
-            needs: Vec::new(),
-            matrix_key: BTreeMap::new(),
-            image: format!("registry.example/build@sha256:{}", "d".repeat(64)),
-            command: vec!["/bin/true".into()],
-            env: BTreeMap::new(),
-            secret_handles: BTreeMap::new(),
-            egress_allow: Vec::new(),
-            limits: CiManifestLimitsV1 {
-                cpu_millis: 1_000,
-                mem_bytes: 1_073_741_824,
-                disk_bytes: 1_073_741_824,
-                pids_max: 64,
-                timeout_secs: 60,
+        jobs: vec![
+            GrantedCiJobV1 {
+                job_id: job.into(),
+                stage: "build".into(),
+                name: "build".into(),
+                check_context: "build".into(),
+                needs: Vec::new(),
+                matrix_key: BTreeMap::new(),
+                image: format!("registry.example/build@sha256:{}", "d".repeat(64)),
+                command: vec!["/bin/true".into()],
+                env: BTreeMap::new(),
+                secret_handles: BTreeMap::new(),
+                egress_allow: Vec::new(),
+                limits: CiManifestLimitsV1 {
+                    cpu_millis: 1_000,
+                    mem_bytes: 1_073_741_824,
+                    disk_bytes: 1_073_741_824,
+                    pids_max: 64,
+                    timeout_secs: 60,
+                },
+                workspace: CiManifestWorkspaceV1 {
+                    repo_ref: format!("myelin://{tenant}/git/repo/core"),
+                    commit_oid: "deadbeef".into(),
+                    read_only_root: true,
+                    tmpfs_scratch: true,
+                },
+                scheduling: CiManifestSchedulingV1 {
+                    lane: CiManifestLaneV1::Interactive,
+                    labels: vec!["linux".into()],
+                    concurrency_group: None,
+                    fair_key: tenant.into(),
+                },
+                reserve_handle: "reserve:accounting-live".into(),
+                token_authority_handle: "token-authority:live".into(),
+                continue_on_error: false,
             },
-            workspace: CiManifestWorkspaceV1 {
-                repo_ref: format!("myelin://{tenant}/git/repo/core"),
-                commit_oid: "deadbeef".into(),
-                read_only_root: true,
-                tmpfs_scratch: true,
+            GrantedCiJobV1 {
+                job_id: skipped_job.into(),
+                stage: "package".into(),
+                name: "package".into(),
+                check_context: "package".into(),
+                needs: vec![job.into()],
+                matrix_key: BTreeMap::new(),
+                image: format!("registry.example/package@sha256:{}", "e".repeat(64)),
+                command: vec!["/bin/package".into()],
+                env: BTreeMap::new(),
+                secret_handles: BTreeMap::new(),
+                egress_allow: Vec::new(),
+                limits: CiManifestLimitsV1 {
+                    cpu_millis: 1_000,
+                    mem_bytes: 1_073_741_824,
+                    disk_bytes: 1_073_741_824,
+                    pids_max: 64,
+                    timeout_secs: 60,
+                },
+                workspace: CiManifestWorkspaceV1 {
+                    repo_ref: format!("myelin://{tenant}/git/repo/core"),
+                    commit_oid: "deadbeef".into(),
+                    read_only_root: true,
+                    tmpfs_scratch: true,
+                },
+                scheduling: CiManifestSchedulingV1 {
+                    lane: CiManifestLaneV1::Interactive,
+                    labels: vec!["linux".into()],
+                    concurrency_group: None,
+                    fair_key: tenant.into(),
+                },
+                reserve_handle: "reserve:skipped-live".into(),
+                token_authority_handle: "token-authority:skipped".into(),
+                continue_on_error: false,
             },
-            scheduling: CiManifestSchedulingV1 {
-                lane: CiManifestLaneV1::Interactive,
-                labels: vec!["linux".into()],
-                concurrency_group: None,
-                fair_key: tenant.into(),
-            },
-            reserve_handle: "reserve:accounting-live".into(),
-            token_authority_handle: "token-authority:live".into(),
-            continue_on_error: false,
-        }],
+        ],
     }
 }
 
@@ -242,6 +281,7 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     let wf_run = "11111111-1111-8111-8111-111111111111";
     let ci_run = "22222222-2222-8222-8222-222222222222";
     let job = "33333333-3333-8333-8333-333333333333";
+    let skipped_job = "77777777-7777-8777-8777-777777777777";
     let nonce = "44444444-4444-8444-8444-444444444444";
     let idem = "terminal-accounting-live";
     let owner = "runner-live";
@@ -278,7 +318,14 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     let manifest_store =
         CiDriveManifestStore::new(pool.clone(), tenant.clone(), region.clone()).unwrap();
     manifest_store
-        .insert(&manifest(&tenant.0, &region.0, wf_run, ci_run, job))
+        .insert(&manifest(
+            &tenant.0,
+            &region.0,
+            wf_run,
+            ci_run,
+            job,
+            skipped_job,
+        ))
         .await
         .unwrap();
 
@@ -315,7 +362,8 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     .unwrap();
     sqlx::query(
         "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state)
-         VALUES ($1, $2, 'reserve:accounting-live', 100, 'inflight')",
+         VALUES ($1, $2, 'reserve:accounting-live', 100, 'inflight'),
+                ($1, $2, 'reserve:skipped-live', 40, 'reserved')",
     )
     .bind(&tenant.0)
     .bind(&region.0)
@@ -388,7 +436,7 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
         claim_nonce: nonce.into(),
     };
     let report = TerminalReport {
-        passed: true,
+        passed: false,
         timed_out: false,
         usage: ResourceUsage {
             cpu_seconds: 7,
@@ -401,13 +449,22 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
         region: region.0.clone(),
         run_id: ci_run.into(),
         wf_run_id: wf_run.into(),
-        terminal_state: CiRunTerminalState::Succeeded,
+        terminal_state: CiRunTerminalState::Failed,
         completed_at: "2026-07-21T13:00:00Z".into(),
-        jobs: vec![CiRunFinalizationJob {
-            job_id: job.into(),
-            reserve_handle: "reserve:accounting-live".into(),
-            flow_timed_out: false,
-        }],
+        jobs: vec![
+            CiRunFinalizationJob {
+                job_id: job.into(),
+                reserve_handle: "reserve:accounting-live".into(),
+                flow_timed_out: false,
+                dispatched: true,
+            },
+            CiRunFinalizationJob {
+                job_id: skipped_job.into(),
+                reserve_handle: "reserve:skipped-live".into(),
+                flow_timed_out: false,
+                dispatched: false,
+            },
+        ],
     };
 
     let mut cross_tenant_finalization = finalization.clone();
@@ -482,13 +539,33 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     .unwrap();
     assert_eq!(storage_events, 2);
 
-    assert_eq!(
-        ci_runs
-            .finalize_ci_run(&scope, &finalization)
-            .await
-            .unwrap(),
-        CiRunFinalizationWrite::Finalized
+    let durable_finalizer = DurableCiRunFinalizer::new(
+        ci_runs.clone(),
+        ledger.clone(),
+        CiJobAccountingStore::with_pg(pool.clone(), region.clone()),
+        manifest_store.clone(),
+        scope.clone(),
+        tokio::runtime::Handle::current(),
     );
+    let mut wrong_terminal = finalization.clone();
+    wrong_terminal.terminal_state = CiRunTerminalState::Succeeded;
+    assert_eq!(
+        durable_finalizer.finalize(&wrong_terminal).unwrap_err(),
+        CiRunStoreError::TerminalVerdictDivergence
+    );
+    let skipped_after_rollback: (i64, String) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM ci_job_accounting WHERE job_id=$1::uuid), state
+         FROM cost_reservation WHERE run_id='reserve:skipped-live'",
+    )
+    .bind(skipped_job)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(skipped_after_rollback, (0, "reserved".into()));
+
+    let finalized = durable_finalizer.finalize(&finalization).unwrap();
+    assert_eq!(finalized.write, CiRunFinalizationWrite::Finalized);
+    assert_eq!(finalized.completed_at, "2026-07-21T13:00:00.000000Z");
     let run_terminal: (String, bool, bool) = sqlx::query_as(
         "SELECT state, cost_settled, finished_at = $2::timestamptz
          FROM ci_run WHERE run_id = $1::uuid",
@@ -498,22 +575,41 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(run_terminal, ("succeeded".into(), true, true));
+    assert_eq!(run_terminal, ("failed".into(), true, true));
+    let skipped_accounting: (bool, bool, bool, i64, i64, String) = sqlx::query_as(
+        "SELECT passed, timed_out, skipped, billed_minor_units, refunded_minor_units,
+                pricing_revision
+         FROM ci_job_accounting WHERE job_id=$1::uuid",
+    )
+    .bind(skipped_job)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
-        ci_runs
-            .finalize_ci_run(&scope, &finalization)
-            .await
-            .unwrap(),
-        CiRunFinalizationWrite::ExactReplay
+        skipped_accounting,
+        (false, false, true, 0, 40, "ci-skipped:v1".into())
     );
+    let skipped_state: String = sqlx::query_scalar(
+        "SELECT state FROM cost_reservation WHERE run_id='reserve:skipped-live'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(skipped_state, "cancelled");
+
+    let replay = durable_finalizer.finalize(&finalization).unwrap();
+    assert_eq!(replay.write, CiRunFinalizationWrite::ExactReplay);
+    assert_eq!(replay.completed_at, finalized.completed_at);
     let mut divergent_finalization = finalization.clone();
     divergent_finalization.completed_at = "2026-07-21T13:00:01Z".into();
+    let acknowledgement_loss_replay = durable_finalizer.finalize(&divergent_finalization).unwrap();
     assert_eq!(
-        ci_runs
-            .finalize_ci_run(&scope, &divergent_finalization)
-            .await
-            .unwrap_err(),
-        CiRunStoreError::FinalizationStateDivergence
+        acknowledgement_loss_replay.write,
+        CiRunFinalizationWrite::ExactReplay
+    );
+    assert_eq!(
+        acknowledgement_loss_replay.completed_at,
+        finalized.completed_at
     );
 
     assert!(

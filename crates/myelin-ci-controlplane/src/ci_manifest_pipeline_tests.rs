@@ -10,7 +10,7 @@ use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
 use crate::{
     CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1, CiManifestWorkspaceV1,
-    CiRunFinalizationWrite, CiRunStoreError,
+    CiRunFinalizationOutcome, CiRunFinalizationWrite, CiRunStoreError,
 };
 
 const RUN_ID: &str = "33333333-3333-8333-8333-333333333333";
@@ -153,12 +153,15 @@ impl CiRunFinalizer for RecordingFinalizer {
     fn finalize(
         &self,
         finalization: &CiRunFinalization,
-    ) -> Result<CiRunFinalizationWrite, CiRunStoreError> {
+    ) -> Result<CiRunFinalizationOutcome, CiRunStoreError> {
         self.finalizations
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .push(finalization.clone());
-        Ok(CiRunFinalizationWrite::Finalized)
+        Ok(CiRunFinalizationOutcome {
+            write: CiRunFinalizationWrite::Finalized,
+            completed_at: "2026-07-21T12:59:59.000000Z".into(),
+        })
     }
 }
 
@@ -177,7 +180,7 @@ impl CiRunFinalizer for RefusingFinalizer {
     fn finalize(
         &self,
         _finalization: &CiRunFinalization,
-    ) -> Result<CiRunFinalizationWrite, CiRunStoreError> {
+    ) -> Result<CiRunFinalizationOutcome, CiRunStoreError> {
         Err(CiRunStoreError::IncompleteTerminalAccounting)
     }
 }
@@ -307,7 +310,10 @@ fn dag_dispatches_roots_together_replays_out_of_order_completions_then_launches_
         .committed_rows()
         .iter()
         .filter(|row| row.envelope.type_.0 == myelin_ci_sandbox::events::CI_CHECK_UPDATED)
-        .all(|row| row.envelope.payload["cost_settled"] == true));
+        .all(|row| {
+            row.envelope.payload["cost_settled"] == true
+                && row.envelope.payload["completed_at"] == "2026-07-21T12:59:59.000000Z"
+        }));
     assert_eq!(
         check_attempts,
         BTreeMap::from([
@@ -346,6 +352,14 @@ fn failed_frontier_drains_dispatched_sibling_and_never_dispatches_descendant() {
     assert_eq!(
         finalizer.finalizations()[0].terminal_state,
         CiRunTerminalState::Failed
+    );
+    assert_eq!(
+        finalizer.finalizations()[0]
+            .jobs
+            .iter()
+            .map(|job| (job.job_id.as_str(), job.dispatched))
+            .collect::<BTreeMap<_, _>>(),
+        BTreeMap::from([(JOB_A, true), (JOB_B, true), (JOB_C, false)])
     );
 }
 
