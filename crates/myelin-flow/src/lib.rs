@@ -336,7 +336,9 @@ pub use pg_drive_store::{
 };
 pub use pg_dispatcher::{
     configured_production_definitions, PgClaimedDriveInput, PgDriveBatch, PgFlowWorker,
-    PgRunOnceOutcome, PgWorkerError, PgWorkerScope, PgWorkflowBody, OPERATIONAL_PROBE_WF_TYPE,
+    PgInputResolveError, PgResolvedDriveInput, PgResolvedWorkflowBody, PgRunOnceOutcome,
+    PgWorkerError, PgWorkerScope, PgWorkflowBody, PgWorkflowInputResolver,
+    MAX_PG_RESOLVED_INPUT_BYTES, OPERATIONAL_PROBE_WF_TYPE,
 };
 pub use pg_executor::PgFlowExecutor;
 pub use remint::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenLease, RunTokenMinter};
