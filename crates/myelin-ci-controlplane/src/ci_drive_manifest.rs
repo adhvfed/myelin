@@ -253,6 +253,7 @@ impl CiDriveManifestV1 {
         let mut prior_name: Option<&str> = None;
         let mut ids = BTreeSet::new();
         let mut names = BTreeSet::new();
+        let mut reserve_handles = BTreeSet::new();
         let mut job_contexts = BTreeSet::new();
         for job in &self.jobs {
             if prior_name.is_some_and(|prior| prior >= job.name.as_str()) {
@@ -329,6 +330,9 @@ impl CiDriveManifestV1 {
                 validate_bounded("concurrency group", group)?;
             }
             validate_bounded("reserve handle", &job.reserve_handle)?;
+            if !reserve_handles.insert(job.reserve_handle.clone()) {
+                return invalid("manifest reserve handles must be unique per job");
+            }
             validate_bounded("token authority handle", &job.token_authority_handle)?;
             if job.continue_on_error {
                 return invalid(
@@ -920,8 +924,8 @@ mod tests {
                 concurrency_group: None,
                 fair_key: "project:core".into(),
             },
-            reserve_handle: "reserve:run-1".into(),
-            token_authority_handle: "mint:run-1".into(),
+            reserve_handle: format!("reserve:{id}"),
+            token_authority_handle: format!("mint:{id}"),
             continue_on_error: false,
         }
     }
@@ -999,6 +1003,17 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exactly cover"));
+    }
+
+    #[test]
+    fn rejects_one_budget_reservation_reused_by_multiple_jobs() {
+        let mut reused = manifest();
+        reused.jobs[1].reserve_handle = reused.jobs[0].reserve_handle.clone();
+        assert!(reused
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("reserve handles must be unique"));
     }
 
     #[test]
