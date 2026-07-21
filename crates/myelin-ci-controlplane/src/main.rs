@@ -226,6 +226,10 @@ async fn main() {
         provider.db_pool().clone(),
         myelin_tenancy::Region(provider.config().region.clone()),
     );
+    let _ci_job_accounting = myelin_ci_controlplane::ci_job_accounting_store(
+        provider.db_pool().clone(),
+        myelin_tenancy::Region(provider.config().region.clone()),
+    );
     // CT-004c.1: construct the REAL durable `job_queue` store + spawn the dead-runner reaper loop onto
     // the serve runtime (minimal-impact wiring — a bounded background task hung off the existing
     // lifecycle, NOT a new AppSpec schema field). The `job_queue` table the reaper sweeps is created

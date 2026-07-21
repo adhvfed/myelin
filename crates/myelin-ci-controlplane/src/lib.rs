@@ -541,8 +541,8 @@ pub use runner_bind::{
 #[cfg(any(test, feature = "test-support"))]
 pub use ci_pipeline_driver::{fixed_command_spec_builder, CiPipelineDriver, StartRunError};
 pub use ci_pipeline_driver::{
-    unresolved_stage_spec_builder, CiPipelineReporter, ClaimRefusal, DurableJobRunner,
-    StageSpecBuilder,
+    unresolved_stage_spec_builder, CiJobAccountingPricer, CiJobPricingError, CiPipelineReporter,
+    ClaimRefusal, DurableCiJobAccounting, DurableJobRunner, PricedCiJobUsage, StageSpecBuilder,
 };
 
 // CI-P14 (P-357): the EU fleet autoscaler — the FleetProvider impl + autoscale-on-queue-depth +
@@ -727,6 +727,16 @@ pub fn run_controlplane(
 /// `ci_cost_event` table) — the SCHEMA it writes to is now sound.
 pub fn ci_cost_event_store(pool: sqlx::PgPool, region: myelin_tenancy::Region) -> CiCostEventStore {
     CiCostEventStore::with_pg(pool, region)
+}
+
+/// Construct the immutable per-job accounting receipt store at the control-plane composition root.
+/// The production terminal reporter requires this store explicitly; there is no unaccounted
+/// production constructor or default pricing adapter.
+pub fn ci_job_accounting_store(
+    pool: sqlx::PgPool,
+    region: myelin_tenancy::Region,
+) -> CiJobAccountingStore {
+    CiJobAccountingStore::with_pg(pool, region)
 }
 
 /// **Construct the durable CI `job_queue` store at the composition root (CT-004c.1).** The service

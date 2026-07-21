@@ -92,14 +92,15 @@ RETURNING job_id";
 pub const SELECT_JOB_SPEC_QUERY: &str = "\
 SELECT spec FROM ci_job_spec WHERE tenant_id = $1 AND job_id = $2";
 
-/// **Read a dispatched job's durable claimed-identity (run_id, idem_token, stage) for `(tenant, job_id)`
+/// **Read a dispatched job's durable claimed-identity (run_id, idem_token, stage, spec) for `(tenant, job_id)`
 /// — the terminal reporter's fail-closed verification anchor (CT-004d.2 rewire).** The reporter derives
 /// the completed job's `job_id` and reads this back to prove the presented `(run_id, idem_token)` match
 /// the durable dispatch record BEFORE it signals a verdict — a forged/mis-keyed completion resolves no
 /// row (or a divergent one) and is refused. `stage` is the durable verdict-attribution name (the
 /// restart-safe replacement for the in-memory stage bridge). Binds `$1 tenant_id`, `$2 job_id` (uuid).
 pub const SELECT_JOB_SPEC_IDENTITY_QUERY: &str = "\
-SELECT run_id::text AS run_id, idem_token, stage FROM ci_job_spec WHERE tenant_id = $1 AND job_id = $2";
+SELECT run_id::text AS run_id, idem_token, stage, spec
+FROM ci_job_spec WHERE tenant_id = $1 AND job_id = $2";
 
 /// Exact replay readback for both halves of one durable dispatch. `ON CONFLICT DO NOTHING` is safe
 /// only when the existing queue/spec pair is byte-equivalent to the requested dispatch; this query
@@ -504,10 +505,15 @@ impl CiJobSpecStore {
         let stage = stage.ok_or_else(|| CiJobSpecStoreError::MissingStage {
             job_id: job_id_text.to_string(),
         })?;
+        let spec_json: serde_json::Value = row
+            .try_get("spec")
+            .map_err(|e| CiJobSpecStoreError::Db(e.to_string()))?;
+        let spec = decode_spec(job_id_text, spec_json)?;
         Ok(Some(ClaimedDispatchIdentity {
             run_id,
             idem_token,
             stage,
+            reserve_handle: spec.meter_to.reserve_id,
         }))
     }
 }
@@ -563,6 +569,8 @@ pub struct ClaimedDispatchIdentity {
     pub idem_token: String,
     /// The pipeline stage name the verdict is attributed to (the restart-safe stage resolution).
     pub stage: String,
+    /// The exact reservation handle embedded in the sandbox spec that executed.
+    pub reserve_handle: String,
 }
 
 /// **The two fail-closed dispatch invariants (pure, so the unit suite proves them DB-free).**

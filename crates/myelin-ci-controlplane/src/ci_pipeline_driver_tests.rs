@@ -191,6 +191,7 @@ fn durable_identity(run_id: &str, idem_token: &str, stage: &str) -> ClaimedDispa
         run_id: run_id.into(),
         idem_token: idem_token.into(),
         stage: stage.into(),
+        reserve_handle: "reserve:test".into(),
     }
 }
 
@@ -388,4 +389,45 @@ fn completion_receipt_binds_claim_authority_stage_accounting_and_ordered_refs() 
         claim_nonce: nonce,
     });
     assert_ne!(receipt, changed_usage, "actual usage is receipt authority");
+}
+
+#[test]
+fn immutable_pricing_projects_exact_raw_cpu_and_split_memory_costs() {
+    let tenant = TenantId::from_token("acme");
+    let usage = ResourceUsage {
+        cpu_seconds: 17,
+        mem_byte_seconds: 3 * 1_073_741_824,
+    };
+    let priced = PricedCiJobUsage {
+        pricing_revision: "commercial:2026-07-21".into(),
+        memory_gb_seconds: 3,
+        cpu_wholesale: MinorUnits(11),
+        cpu_markup: MinorUnits(2),
+        memory_wholesale: MinorUnits(7),
+        memory_markup: MinorUnits(1),
+    };
+    let rows = priced_cost_rows(
+        &tenant,
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222",
+        usage,
+        &priced,
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].meter, Meter::CpuSeconds);
+    assert_eq!(rows[0].amount, usage.cpu_seconds);
+    assert_eq!(rows[0].wholesale, MinorUnits(11));
+    assert_eq!(rows[0].markup, MinorUnits(2));
+    assert_eq!(rows[1].meter, Meter::MemGbSeconds);
+    assert_eq!(rows[1].amount, 3);
+    assert_eq!(rows[1].wholesale, MinorUnits(7));
+    assert_eq!(rows[1].markup, MinorUnits(1));
+
+    let mut invalid = priced;
+    invalid.pricing_revision.clear();
+    assert_eq!(
+        priced_cost_rows(&tenant, "run", "job", usage, &invalid),
+        Err(CiJobPricingError::InvalidOutput)
+    );
 }

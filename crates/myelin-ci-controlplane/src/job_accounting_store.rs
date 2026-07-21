@@ -80,6 +80,7 @@ pub enum CiJobAccountingError {
     InvalidField(&'static str),
     ValueOverflow(&'static str),
     Db(&'static str),
+    CorruptRow,
     ReplayDivergence,
 }
 
@@ -97,6 +98,7 @@ impl core::fmt::Display for CiJobAccountingError {
                 )
             }
             Self::Db(operation) => write!(f, "durable CI job accounting failed during {operation}"),
+            Self::CorruptRow => f.write_str("durable CI job accounting row is corrupt"),
             Self::ReplayDivergence => {
                 f.write_str("CI job accounting replay diverged from the immutable receipt")
             }
@@ -209,6 +211,56 @@ impl CiJobAccountingStore {
         } else {
             Err(CiJobAccountingError::ReplayDivergence)
         }
+    }
+
+    /// Read the immutable receipt on the caller's scoped transaction. This is the terminal
+    /// redelivery path: an already-consumed claim reuses historical pricing instead of consulting
+    /// the current price table and accidentally repricing old work.
+    pub async fn load_in_tx(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        scope: &TenantScope,
+        job_id: &str,
+    ) -> Result<Option<CiJobAccountingRecord>, CiJobAccountingError> {
+        if scope.tenant().as_str().is_empty()
+            || scope.region() != &self.region
+            || scope.region().as_str().is_empty()
+        {
+            return Err(CiJobAccountingError::ScopeMismatch);
+        }
+        let job_uuid = parse_uuid("job id", job_id)?;
+        let row = sqlx::query(SELECT_CI_JOB_ACCOUNTING_QUERY)
+            .bind(scope.tenant().as_str())
+            .bind(job_uuid)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|_| CiJobAccountingError::Db("receipt load"))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        if row.get::<String, _>("region") != self.region.as_str() {
+            return Err(CiJobAccountingError::ScopeMismatch);
+        }
+        let nonnegative = |column: &'static str| -> Result<u64, CiJobAccountingError> {
+            u64::try_from(row.get::<i64, _>(column)).map_err(|_| CiJobAccountingError::CorruptRow)
+        };
+        Ok(Some(CiJobAccountingRecord {
+            tenant: scope.tenant().clone(),
+            job_id: job_id.to_owned(),
+            wf_run_id: row.get::<Uuid, _>("wf_run_id").to_string(),
+            ci_run_id: row.get::<Uuid, _>("ci_run_id").to_string(),
+            reserve_handle: row.get("reserve_handle"),
+            passed: row.get("passed"),
+            timed_out: row.get("timed_out"),
+            usage: ResourceUsage {
+                cpu_seconds: nonnegative("cpu_seconds")?,
+                mem_byte_seconds: nonnegative("mem_byte_seconds")?,
+            },
+            pricing_revision: row.get("pricing_revision"),
+            billed: MinorUnits(nonnegative("billed_minor_units")?),
+            refunded: MinorUnits(nonnegative("refunded_minor_units")?),
+            completion_receipt: row.get("completion_receipt"),
+        }))
     }
 
     /// Convenience path for callers that need only the accounting receipt, not a larger co-commit.
