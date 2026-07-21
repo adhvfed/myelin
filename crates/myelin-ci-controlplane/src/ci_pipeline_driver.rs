@@ -99,7 +99,8 @@ use crate::job_queue_store::{
     CiJobQueueStore, ClaimConsumeOutcome, ClaimConsumeSpec, DurableEnqueue,
 };
 use crate::job_spec_store::{
-    CiJobSpecStore, CiJobSpecStoreError, ClaimedDispatchIdentity, MAX_JOB_TIMEOUT_SECS,
+    CiJobSpecStore, CiJobSpecStoreError, ClaimedDispatchIdentity, DurableCiJobLaunchTemplate,
+    MAX_JOB_TIMEOUT_SECS,
 };
 use crate::metering::{CostEventRow, CostKind, Meter};
 use crate::schedule_and_run_job::JobScheduleTerms;
@@ -287,13 +288,20 @@ impl JobRunner for DurableJobRunner {
                 ))
             })?;
         enq.stage = stage.clone();
+        let authority = format!("legacy-test-authority:{}", spec.run_token.jti);
+        let (spec, _previous_token) = spec.into_template();
+        let launch = DurableCiJobLaunchTemplate {
+            ci_run_id: enq.run_id.clone(),
+            spec,
+            token_authority_handle: authority,
+        };
 
         // Co-persist the job_queue row + the ci_job_spec row (carrying the durable stage) in ONE
         // tenant-scoped tx (bridged onto the runtime). A dispatch failure surfaces as an ActivityError
         // the engine retries (reusing the SAME idem_token — the durable ON CONFLICT dedups the re-dispatch).
         bridge(
             &self.rt,
-            self.store.co_persist_dispatch(&enq, &spec, &stage),
+            self.store.co_persist_dispatch(&enq, &launch, &stage),
         )
         .map_err(|e| ActivityError(format!("durable co_persist_dispatch refused: {e}")))?;
         Ok(())

@@ -56,6 +56,7 @@ use myelin_ci_sandbox::{JobSpec, LeaseStore, QueuedJob, RunnerError, RunnerHooks
 use myelin_storage::s3blob::S3BlobStore;
 use myelin_tenancy::{Region, TenantId};
 
+use crate::ci_manifest_job_runner::{validate_run_token, CiJobTokenIssuer, CiJobTokenRequest};
 use crate::ci_pipeline_driver::CiPipelineReporter;
 use crate::job_spec_store::MAX_JOB_TIMEOUT_SECS;
 use crate::{
@@ -455,8 +456,10 @@ pub fn spec_store_unavailable_resolver() -> JobSpecResolver {
 }
 
 /// **The REAL production spec-resolver over the durable `ci_job_spec` store (CT-004d.1).** Replaces
-/// [`spec_store_unavailable_resolver`]: resolves a leased `job_queue` row to the exact [`JobSpec`] the
-/// dispatch co-persisted, via [`CiJobSpecStore::get_spec`] keyed on `(leased.tenant_id, leased.job_id)`.
+/// [`spec_store_unavailable_resolver`]: resolves a leased `job_queue` row to the exact durable launch
+/// template, mints under the live claim generation, and only then constructs the [`JobSpec`] the
+/// sandbox may execute. The template is read via [`CiJobSpecStore::get_launch_template`] keyed on
+/// `(leased.tenant_id, leased.job_id)`.
 /// `region` is the runner's residency region (the tenant-scoped-tx scope the read runs under); `rt` is
 /// the runtime handle the sync resolver bridges its async DB read onto (the SAME off-runtime
 /// `block_on` convention the lease adapter uses — the resolver is called INSIDE
@@ -470,13 +473,32 @@ pub fn durable_spec_resolver(
     store: CiJobSpecStore,
     region: impl Into<String>,
     rt: tokio::runtime::Handle,
+    token_issuer: Arc<dyn CiJobTokenIssuer>,
 ) -> JobSpecResolver {
     let region = region.into();
     Arc::new(move |leased: &LeasedJob| {
-        bridge(
+        let launch = bridge(
             &rt,
-            store.get_spec(&leased.tenant_id, &region, &leased.job_id.to_string()),
+            store.get_launch_template(&leased.tenant_id, &region, &leased.job_id.to_string()),
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        if launch.spec.trust_tier != leased.trust_tier {
+            return Err("claimed trust tier differs from the durable launch template".into());
+        }
+        let request = CiJobTokenRequest {
+            tenant_id: leased.tenant_id.clone(),
+            region: region.clone(),
+            wf_run_id: leased.run_id.to_string(),
+            ci_run_id: launch.ci_run_id,
+            job_id: leased.job_id.to_string(),
+            token_authority_handle: launch.token_authority_handle.clone(),
+            idem_token: launch.spec.idem_token.0.clone(),
+            lease_owner: leased.lease_owner.clone(),
+            lease_epoch: leased.lease_epoch,
+            claim_nonce: leased.claim_nonce.clone(),
+        };
+        let run_token = bridge(&rt, token_issuer.mint(request)).map_err(|e| e.to_string())?;
+        validate_run_token(&run_token, &launch.token_authority_handle).map_err(|e| e.0)?;
+        Ok(launch.spec.resolve(run_token))
     })
 }

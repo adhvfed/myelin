@@ -26,14 +26,17 @@
 //!     --test integration_ci_ct004d2_culmination -- --nocapture
 #![cfg(feature = "integration")]
 
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use myelin_ci_controlplane::{
     ci_job_queue_store, ci_job_spec_store, ci_region_queue_store_test_support,
     ci_run_store_factory, durable_spec_resolver, fixed_command_spec_builder, CheckFacts,
-    CiPipelineDriver, CiPipelineReporter, CiRunInsert, DurableJobRunner, DurableLeaseAdapter,
-    JobScheduleTerms, Lane, PipelineRun, PipelineStage, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
+    CiJobTokenIssueError, CiJobTokenIssuer, CiJobTokenRequest, CiPipelineDriver,
+    CiPipelineReporter, CiRunInsert, DurableJobRunner, DurableLeaseAdapter, JobScheduleTerms, Lane,
+    PipelineRun, PipelineStage, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
     ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
     ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL,
     CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
@@ -41,7 +44,7 @@ use myelin_ci_controlplane::{
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, CompletionClaim, FirehoseSink, ReserveHandle, ResourceUsage,
-    RunnerAgent, RunnerHooks, TerminalReport, TerminalReporter, TrustTier,
+    RunTokenRef, RunnerAgent, RunnerHooks, TerminalReport, TerminalReporter, TrustTier,
 };
 use myelin_events::{Actor, IdMinter, MonotonicMinter, OutboxStore};
 use myelin_flow::{
@@ -58,6 +61,21 @@ use sqlx::{Executor, PgPool};
 use tokio::sync::Mutex as AsyncMutex;
 
 static TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+struct ClaimTokenIssuer;
+
+impl CiJobTokenIssuer for ClaimTokenIssuer {
+    fn mint(
+        &self,
+        request: CiJobTokenRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<RunTokenRef, CiJobTokenIssueError>> + Send + '_>> {
+        Box::pin(async move {
+            Ok(RunTokenRef {
+                jti: format!("culmination:{}:{}", request.job_id, request.claim_nonce),
+            })
+        })
+    }
+}
 
 // ─────────────────────────────── PG / schema plumbing (mirrors CT-004c.2) ─────────────────────────
 
@@ -488,7 +506,7 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
     );
     // its ci_job_spec is resolvable (the spec that EXECUTES) + carries the SAME tier.
     let spec_trust: String =
-        sqlx::query_scalar("SELECT spec->>'trust_tier' FROM ci_job_spec WHERE run_id = $1")
+        sqlx::query_scalar("SELECT spec->'spec'->>'trust_tier' FROM ci_job_spec WHERE run_id = $1")
             .bind(uid("d2-wf-run"))
             .fetch_one(&admin)
             .await
@@ -504,6 +522,7 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         ci_job_spec_store(admin.clone()),
         region,
         tokio::runtime::Handle::current(),
+        Arc::new(ClaimTokenIssuer),
     );
     let adapter = DurableLeaseAdapter::new(
         ci_region_queue_store_test_support(admin.clone()),

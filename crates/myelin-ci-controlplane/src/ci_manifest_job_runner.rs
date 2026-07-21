@@ -1,8 +1,8 @@
 //! Exact manifest-job translation into the durable scheduler and sandbox.
 //!
 //! The workflow dispatch target is the manifest's immutable job UUID. This adapter preserves that
-//! UUID through `job_queue` and `ci_job_spec`, mints a short-lived run token through an explicit
-//! authority adapter, and translates every executable/scheduling field from the validated manifest.
+//! UUID through `job_queue` and `ci_job_spec`, persists the stable token-authority handle without an
+//! expiring token, and translates every executable/scheduling field from the validated manifest.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use myelin_ci_sandbox::{
     EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind as SandboxJobKind,
-    JobSpec as SandboxJobSpec, MeterTarget, ResourceLimits, RunTokenRef, SecretRef,
+    JobSpecTemplate as SandboxJobSpecTemplate, MeterTarget, ResourceLimits, RunTokenRef, SecretRef,
     TrustTier as SandboxTrustTier, WorkspaceSpec,
 };
 use myelin_flow::{
@@ -26,11 +26,13 @@ use crate::ci_manifest_pipeline::{
 };
 use crate::ci_run_store::CiRunFinalizer;
 use crate::job_queue_store::DurableEnqueue;
-use crate::job_spec_store::CiJobSpecStore;
+use crate::job_spec_store::{CiJobSpecStore, DurableCiJobLaunchTemplate};
 use crate::scheduler::Lane;
 use crate::CI_PIPELINE_WF_TYPE;
 
-/// Owned, retry-stable authority request for one exact manifest job dispatch.
+/// Owned, retry-stable authority request for one exact live scheduler claim. The epoch + nonce are
+/// the activity generation: acknowledgement-loss retries reuse it, while a reaper/new claim changes
+/// it and may legitimately remint after expiry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiJobTokenRequest {
     pub tenant_id: String,
@@ -40,6 +42,9 @@ pub struct CiJobTokenRequest {
     pub job_id: String,
     pub token_authority_handle: String,
     pub idem_token: String,
+    pub lease_owner: String,
+    pub lease_epoch: i64,
+    pub claim_nonce: String,
 }
 
 /// A token authority refusal. The detail must be structural and safe to journal as an activity
@@ -56,8 +61,9 @@ impl std::fmt::Display for CiJobTokenIssueError {
 impl std::error::Error for CiJobTokenIssueError {}
 
 /// Explicit short-lived token mint. Implementations must be retry-safe for the complete request:
-/// repeated calls after an uncertain dispatch must resolve the same active JTI, because the durable
-/// replay check rejects any spec drift. There is no permissive default.
+/// repeated calls for the same live claim generation must resolve the same active JTI. A reaped and
+/// newly claimed job carries a new epoch/nonce and may receive a fresh token. There is no permissive
+/// default.
 pub trait CiJobTokenIssuer: Send + Sync {
     fn mint(
         &self,
@@ -71,7 +77,6 @@ pub trait CiJobTokenIssuer: Send + Sync {
 pub struct CiManifestDurableJobRunner {
     manifest: Arc<CiDriveManifestV1>,
     store: CiJobSpecStore,
-    token_issuer: Arc<dyn CiJobTokenIssuer>,
     rt: tokio::runtime::Handle,
 }
 
@@ -79,14 +84,12 @@ impl CiManifestDurableJobRunner {
     pub fn new(
         manifest: Arc<CiDriveManifestV1>,
         store: CiJobSpecStore,
-        token_issuer: Arc<dyn CiJobTokenIssuer>,
         rt: tokio::runtime::Handle,
     ) -> Result<Self, String> {
         manifest.validate().map_err(|error| error.to_string())?;
         Ok(Self {
             manifest,
             store,
-            token_issuer,
             rt,
         })
     }
@@ -122,19 +125,7 @@ impl CiManifestDurableJobRunner {
 impl JobRunner for CiManifestDurableJobRunner {
     fn dispatch(&self, flow: &FlowJobSpec) -> Result<(), ActivityError> {
         let job = self.manifest_job(flow)?;
-        let request = CiJobTokenRequest {
-            tenant_id: self.manifest.tenant_id.clone(),
-            region: self.manifest.region.clone(),
-            wf_run_id: self.manifest.wf_run_id.clone(),
-            ci_run_id: self.manifest.ci_run_id.clone(),
-            job_id: job.job_id.clone(),
-            token_authority_handle: job.token_authority_handle.clone(),
-            idem_token: flow.idem_token.clone(),
-        };
-        let run_token = bridge(&self.rt, self.token_issuer.mint(request))
-            .map_err(|error| ActivityError(error.to_string()))?;
-        validate_run_token(&run_token, &job.token_authority_handle)?;
-        let (enqueue, spec) = manifest_dispatch_parts(&self.manifest, job, flow, run_token)?;
+        let (enqueue, spec) = manifest_dispatch_parts(&self.manifest, job, flow)?;
         bridge(
             &self.rt,
             self.store.co_persist_dispatch(&enqueue, &spec, &job.name),
@@ -144,13 +135,12 @@ impl JobRunner for CiManifestDurableJobRunner {
     }
 }
 
-/// Register the strict resolver, manifest-native DAG, exact durable runner, and explicit token
-/// authority as one production definition.
+/// Register the strict resolver, manifest-native DAG, and exact durable queue-template writer as one
+/// production definition. Token minting belongs to the later live claim/launch boundary.
 pub fn register_durable_ci_manifest_pipeline(
     worker: &mut PgFlowWorker,
     resolver: CiManifestInputResolver,
     store: CiJobSpecStore,
-    token_issuer: Arc<dyn CiJobTokenIssuer>,
     finalizer: Arc<dyn CiRunFinalizer>,
     rt: tokio::runtime::Handle,
 ) -> Result<(), PgWorkerError> {
@@ -166,7 +156,6 @@ pub fn register_durable_ci_manifest_pipeline(
             let runner = CiManifestDurableJobRunner::new(
                 Arc::new(manifest.clone()),
                 store.clone(),
-                Arc::clone(&token_issuer),
                 rt.clone(),
             )?;
             run_ci_manifest_pipeline(ctx, &manifest, &runner, finalizer.as_ref())
@@ -187,10 +176,9 @@ fn manifest_dispatch_parts(
     manifest: &CiDriveManifestV1,
     job: &GrantedCiJobV1,
     flow: &FlowJobSpec,
-    run_token: RunTokenRef,
-) -> Result<(DurableEnqueue, SandboxJobSpec), ActivityError> {
+) -> Result<(DurableEnqueue, DurableCiJobLaunchTemplate), ActivityError> {
     let trust_tier = sandbox_trust(manifest.trust_tier);
-    let spec = SandboxJobSpec::new(
+    let spec = SandboxJobSpecTemplate::new(
         SandboxJobKind::Ci,
         ImageRef::pinned(job.image.clone()).map_err(|error| ActivityError(error.to_string()))?,
         job.command.clone(),
@@ -223,7 +211,6 @@ fn manifest_dispatch_parts(
             commit: Some(job.workspace.commit_oid.clone()),
         },
         trust_tier,
-        run_token,
         MeterTarget {
             reserve_id: job.reserve_handle.clone(),
         },
@@ -243,7 +230,14 @@ fn manifest_dispatch_parts(
         idem_token: flow.idem_token.clone(),
         stage: job.name.clone(),
     };
-    Ok((enqueue, spec))
+    Ok((
+        enqueue,
+        DurableCiJobLaunchTemplate {
+            spec,
+            ci_run_id: manifest.ci_run_id.clone(),
+            token_authority_handle: job.token_authority_handle.clone(),
+        },
+    ))
 }
 
 fn sandbox_trust(trust: CiManifestTrustTierV1) -> SandboxTrustTier {
@@ -262,7 +256,7 @@ fn manifest_lane(lane: CiManifestLaneV1) -> Lane {
     }
 }
 
-fn validate_run_token(
+pub(crate) fn validate_run_token(
     token: &RunTokenRef,
     token_authority_handle: &str,
 ) -> Result<(), ActivityError> {
