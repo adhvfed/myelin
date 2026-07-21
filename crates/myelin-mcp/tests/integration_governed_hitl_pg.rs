@@ -266,7 +266,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
             applies.clone(),
             expiry_audit.clone(),
         )
-        .call(merge, &expiry_args, &now, None),
+        .call(merge, &expiry_args, "expiry-proof-merge-99", &now, None,),
         CallOutcome::Gated { .. }
     ));
     assert_eq!(
@@ -304,6 +304,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
     let gate = match first.call(
         merge,
         &serde_json::json!({"repo":"alpha","number":1}),
+        "restart-proof-merge-1",
         &now,
         None,
     ) {
@@ -341,6 +342,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
             .call(
                 merge,
                 &serde_json::json!({"repo":"alpha","number":1}),
+                "restart-proof-merge-1",
                 &now,
                 Some(&gate),
             ),
@@ -360,6 +362,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
         restarted.call(
             merge,
             &serde_json::json!({"repo":"alpha","number":1}),
+            "restart-proof-merge-1",
             &now,
             Some(&gate)
         ),
@@ -378,6 +381,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
         .call(
             merge,
             &serde_json::json!({"repo":"alpha","number":1}),
+            "restart-proof-merge-1",
             &now,
             Some(&gate),
         ),
@@ -418,6 +422,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
     let concurrent_gate = match first.call(
         merge,
         &serde_json::json!({"repo":"alpha","number":3}),
+        "restart-proof-merge-3",
         &now,
         None,
     ) {
@@ -455,6 +460,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
             racer.call(
                 merge,
                 &serde_json::json!({"repo":"alpha","number":3}),
+                "restart-proof-merge-3",
                 &now,
                 Some(&gate_id),
             )
@@ -475,6 +481,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
     let rejected_gate = match first.call(
         merge,
         &serde_json::json!({"repo":"alpha","number":2}),
+        "restart-proof-merge-2",
         &now,
         None,
     ) {
@@ -524,6 +531,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
         .call(
             merge,
             &serde_json::json!({"repo":"alpha","number":2}),
+            "restart-proof-merge-2",
             &now,
             Some(&rejected_gate)
         ),
@@ -542,6 +550,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
         .call(
             merge,
             &serde_json::json!({"repo":"alpha","number":1}),
+            "restart-proof-merge-1",
             &now,
             Some(&gate)
         ),
