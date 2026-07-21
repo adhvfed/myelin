@@ -372,3 +372,65 @@ fn accounting_refusal_prevents_every_terminal_outward_fact() {
         "checks, run terminal events, and merge results all follow durable finalization"
     );
 }
+
+#[test]
+fn flow_timeout_parks_until_late_accounting_then_emits_timed_out_once() {
+    let outbox = OutboxStore::new();
+    let journal = WfJournal::new();
+    let signals = SignalStore::new();
+    let timers = TimerStore::new();
+    let runner = RecordingRunner::default();
+    let finalizer = RecordingFinalizer::default();
+    let mut manifest = manifest();
+    manifest.jobs.truncate(1);
+    manifest.jobs[0].limits.timeout_secs = 1;
+    manifest
+        .check_attempts
+        .retain(|context, _| context == "build-a");
+
+    let mut first = begin(&outbox, journal.clone(), signals.clone(), timers.clone());
+    assert_eq!(
+        run_ci_manifest_pipeline(&mut first, &manifest, &runner, &finalizer).unwrap(),
+        CiManifestPipelineOutcome::Parked
+    );
+    first.commit().unwrap();
+
+    let mut deadline = resume(&outbox, journal.clone(), signals.clone(), timers.clone());
+    assert_eq!(
+        run_ci_manifest_pipeline(&mut deadline, &manifest, &runner, &finalizer).unwrap(),
+        CiManifestPipelineOutcome::Parked,
+        "the workflow verdict times out but money truth still waits for the runner receipt"
+    );
+    deadline.commit().unwrap();
+    assert!(outbox.committed_rows().is_empty());
+    assert!(finalizer.finalizations().is_empty());
+
+    deliver(&signals, &dispatch_token(0), "build-a", false, 2);
+    let mut accounted = resume(&outbox, journal, signals, timers);
+    assert_eq!(
+        run_ci_manifest_pipeline(&mut accounted, &manifest, &runner, &finalizer).unwrap(),
+        CiManifestPipelineOutcome::Failed {
+            job: "build-a".into(),
+            timed_out: true,
+        }
+    );
+    accounted.commit().unwrap();
+
+    let finalizations = finalizer.finalizations();
+    assert_eq!(finalizations.len(), 1);
+    assert_eq!(
+        finalizations[0].terminal_state,
+        CiRunTerminalState::TimedOut
+    );
+    assert!(finalizations[0].jobs[0].flow_timed_out);
+    let rows = outbox.committed_rows();
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.envelope.type_.0 == myelin_ci_sandbox::events::CI_RUN_TIMED_OUT)
+            .count(),
+        1
+    );
+    assert!(!rows
+        .iter()
+        .any(|row| row.envelope.type_.0 == myelin_ci_sandbox::events::CI_RUN_FAILED));
+}
