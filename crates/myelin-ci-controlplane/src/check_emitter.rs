@@ -82,8 +82,10 @@ use std::collections::BTreeMap;
 /// `(tenant, repo, commit_oid, context)`: UPSERT the row, bump `next_attempt`, and RETURN the attempt
 /// to STAMP into the emitted `CheckStatus.run_attempt`. The returned `run_attempt` is
 /// `next_attempt - 1` AFTER the bump — i.e. the FIRST dispatch returns `1` (the row inserts with
-/// `next_attempt = 2` and returns `2 - 1 = 1`), the first RE-dispatch returns `2`, and so on. CI is
-/// the SOURCE of `run_attempt`: monotonic, never wall-clock.
+/// `next_attempt = 2` and returns `2 - 1 = 1`), the first distinct RE-dispatch returns `2`, and so
+/// on. An exact retry for the same `current_run` returns its already-issued attempt without
+/// incrementing, so a starter transaction can be retried without superseding itself. CI is the
+/// SOURCE of `run_attempt`: monotonic, never wall-clock.
 ///
 /// The `current_run` is set to the run that most recently produced this context's status (the
 /// supersession provenance). The bump is one atomic statement so two concurrent re-dispatches of the
@@ -93,13 +95,20 @@ pub const BUMP_CHECK_ATTEMPT_SQL: &str = "\
 INSERT INTO check_attempt (tenant_id, region, repo_ref, commit_oid, context, next_attempt, current_run)
 VALUES ($1, $2, $3, $4, $5, 2, $6)
 ON CONFLICT (tenant_id, repo_ref, commit_oid, context)
-DO UPDATE SET next_attempt = check_attempt.next_attempt + 1, current_run = EXCLUDED.current_run
+DO UPDATE SET
+  next_attempt = CASE
+    WHEN check_attempt.current_run IS NOT DISTINCT FROM EXCLUDED.current_run
+      THEN check_attempt.next_attempt
+    ELSE check_attempt.next_attempt + 1
+  END,
+  current_run = EXCLUDED.current_run
 RETURNING next_attempt - 1 AS run_attempt";
 
 /// **The in-memory `check_attempt` monotonic counter model (arch 01 §3.2).** CI's deterministic
-/// SOURCE of `run_attempt` per `(commit_oid, context)` — the model the unit tests prove monotonicity
-/// on, mirroring [`BUMP_CHECK_ATTEMPT_SQL`] exactly: a new context's FIRST dispatch returns attempt
-/// `1`; each subsequent re-dispatch returns the next integer; the sequence is strictly increasing and
+/// SOURCE of `run_attempt` per `(commit_oid, context)` — the model the unit tests use to prove the
+/// cross-run monotonicity of [`BUMP_CHECK_ATTEMPT_SQL`]: a new context's FIRST dispatch returns
+/// attempt `1` and each subsequent run returns the next integer. The SQL layer additionally makes
+/// an exact retry of one durable run idempotent. The sequence is strictly increasing across runs and
 /// NEVER reads a clock.
 ///
 /// This is NOT the live table (that is [`crate::migrations::CREATE_CHECK_ATTEMPT_DDL`], bumped via the
@@ -121,9 +130,11 @@ impl CheckAttemptCounter {
     }
 
     /// **Bump the attempt for `(commit_oid, context)` and RETURN the stamped `run_attempt`** — the
-    /// in-memory mirror of [`BUMP_CHECK_ATTEMPT_SQL`]. The FIRST dispatch of a context returns `1`;
-    /// each re-dispatch returns the next integer (strictly increasing). The returned value is the
-    /// `CheckStatus.run_attempt` the producer stamps — the ONLY supersession key (never wall-clock).
+    /// in-memory model of [`BUMP_CHECK_ATTEMPT_SQL`]'s cross-run behavior. The FIRST dispatch of a
+    /// context returns `1`; each re-dispatch returns the next integer (strictly increasing). The SQL
+    /// layer binds an attempt to `current_run` to make an exact transaction retry idempotent. The
+    /// returned value is the `CheckStatus.run_attempt` the producer stamps — the ONLY supersession
+    /// key (never wall-clock).
     pub fn bump(&mut self, commit_oid: &str, context: &str) -> u32 {
         let key = (commit_oid.to_string(), context.to_string());
         let slot = self.issued.entry(key).or_insert(0);

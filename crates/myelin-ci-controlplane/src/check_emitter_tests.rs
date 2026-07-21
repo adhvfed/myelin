@@ -83,8 +83,8 @@ fn a_lower_attempt_is_stale_the_higher_supersedes() {
 }
 
 /// **The live bump SQL is the monotonic UPSERT (arch 01 §3.2).** The `RETURNING next_attempt - 1`
-/// stamps the attempt; the `ON CONFLICT … next_attempt + 1` makes the re-dispatch monotonic. Pin the
-/// shape so a later edit that drops the monotonic increment or the RETURNING is loud.
+/// stamps the attempt; the `ON CONFLICT` branch makes a distinct run monotonic while an exact retry
+/// reuses its issued value. Pin the shape so either guarantee cannot disappear silently.
 #[test]
 fn bump_check_attempt_sql_is_the_monotonic_upsert() {
     let sql = BUMP_CHECK_ATTEMPT_SQL;
@@ -93,8 +93,12 @@ fn bump_check_attempt_sql_is_the_monotonic_upsert() {
         "upserts the attempt counter table"
     );
     assert!(
-        sql.contains("next_attempt = check_attempt.next_attempt + 1"),
+        sql.contains("ELSE check_attempt.next_attempt + 1"),
         "a re-dispatch bumps monotonically (+1) — never wall-clock"
+    );
+    assert!(
+        sql.contains("check_attempt.current_run IS NOT DISTINCT FROM EXCLUDED.current_run"),
+        "an exact retry of one durable run must not supersede itself"
     );
     assert!(
         sql.contains("RETURNING next_attempt - 1"),

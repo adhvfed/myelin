@@ -519,7 +519,8 @@ async fn check_attempt_is_monotonic_across_kill9() {
 
     let bump = BUMP_CHECK_ATTEMPT_SQL
         .replace("INTO check_attempt (", &format!("INTO {tbl} ("))
-        .replace("check_attempt.next_attempt", &format!("{tbl}.next_attempt"));
+        .replace("check_attempt.next_attempt", &format!("{tbl}.next_attempt"))
+        .replace("check_attempt.current_run", &format!("{tbl}.current_run"));
 
     let run_a = "11111111-1111-1111-1111-111111111111";
     let run_b = "22222222-2222-2222-2222-222222222222";
