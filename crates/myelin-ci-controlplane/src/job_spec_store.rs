@@ -101,6 +101,19 @@ SELECT spec FROM ci_job_spec WHERE tenant_id = $1 AND job_id = $2";
 pub const SELECT_JOB_SPEC_IDENTITY_QUERY: &str = "\
 SELECT run_id::text AS run_id, idem_token, stage FROM ci_job_spec WHERE tenant_id = $1 AND job_id = $2";
 
+/// Exact replay readback for both halves of one durable dispatch. `ON CONFLICT DO NOTHING` is safe
+/// only when the existing queue/spec pair is byte-equivalent to the requested dispatch; this query
+/// makes that equivalence a checked invariant inside the same transaction.
+const SELECT_EXACT_DISPATCH_QUERY: &str = "\
+SELECT q.region, q.job_id::text AS queue_job_id, q.run_id::text AS queue_run_id,
+       q.lane, q.labels, q.trust_tier, q.concurrency_group, q.fair_key,
+       q.idem_token AS queue_idem_token, q.stage AS queue_stage,
+       s.region AS spec_region, s.run_id::text AS spec_run_id,
+       s.idem_token AS spec_idem_token, s.spec, s.stage AS spec_stage
+FROM job_queue q
+JOIN ci_job_spec s ON s.tenant_id = q.tenant_id AND s.job_id = q.job_id
+WHERE q.tenant_id = $1 AND q.idem_token = $2";
+
 /// **The runner-lane pre-activation guard's probe (CT-004d.2 — the ROLLING-UPGRADE FLOOR).** Counts, in
 /// a region, `job_queue` rows that are still NON-terminal but whose queue-authority `stage` is NULL
 /// (a pre-rewire historical dispatch a rolling upgrade left un-back-filled). The ACTIVATION guard
@@ -355,6 +368,32 @@ impl CiJobSpecStore {
                         .fetch_optional(&mut *conn)
                         .await
                         .map_err(|e| PgError::Query(e.to_string()))?;
+                    let exact = sqlx::query(SELECT_EXACT_DISPATCH_QUERY)
+                        .bind(&tenant_id)
+                        .bind(&idem)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|e| PgError::Query(e.to_string()))?
+                        .ok_or_else(|| {
+                            PgError::Query(
+                                "durable dispatch replay readback found no joined queue/spec row"
+                                    .into(),
+                            )
+                        })?;
+                    verify_exact_dispatch(
+                        &exact,
+                        &region,
+                        job_uuid,
+                        run_uuid,
+                        lane,
+                        &labels,
+                        trust,
+                        group.as_deref(),
+                        &fair_key,
+                        &idem,
+                        &stage,
+                        &spec_json,
+                    )?;
                     Ok((jq_row.is_some(), spec_row.is_some()))
                 })
             })
@@ -470,6 +509,45 @@ impl CiJobSpecStore {
             idem_token,
             stage,
         }))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_exact_dispatch(
+    row: &sqlx::postgres::PgRow,
+    region: &str,
+    job_id: Uuid,
+    run_id: Uuid,
+    lane: &str,
+    labels: &[String],
+    trust: &str,
+    concurrency_group: Option<&str>,
+    fair_key: &str,
+    idem_token: &str,
+    stage: &str,
+    spec: &serde_json::Value,
+) -> Result<(), PgError> {
+    let exact = row.get::<String, _>("region") == region
+        && row.get::<String, _>("queue_job_id") == job_id.to_string()
+        && row.get::<String, _>("queue_run_id") == run_id.to_string()
+        && row.get::<String, _>("lane") == lane
+        && row.get::<Vec<String>, _>("labels") == labels
+        && row.get::<String, _>("trust_tier") == trust
+        && row.get::<Option<String>, _>("concurrency_group").as_deref() == concurrency_group
+        && row.get::<String, _>("fair_key") == fair_key
+        && row.get::<String, _>("queue_idem_token") == idem_token
+        && row.get::<Option<String>, _>("queue_stage").as_deref() == Some(stage)
+        && row.get::<String, _>("spec_region") == region
+        && row.get::<String, _>("spec_run_id") == run_id.to_string()
+        && row.get::<String, _>("spec_idem_token") == idem_token
+        && row.get::<serde_json::Value, _>("spec") == *spec
+        && row.get::<Option<String>, _>("spec_stage").as_deref() == Some(stage);
+    if exact {
+        Ok(())
+    } else {
+        Err(PgError::Query(
+            "durable dispatch replay conflicts with the existing queue/spec identity".into(),
+        ))
     }
 }
 

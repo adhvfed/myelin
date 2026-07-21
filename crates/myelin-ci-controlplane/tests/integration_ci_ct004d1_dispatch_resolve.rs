@@ -551,6 +551,74 @@ async fn dispatch_feeds_trust_and_region_from_the_spec_never_widened() {
     println!("[CT-004d.1] PASS: the job_queue trust_tier/region are FED from the spec; a widened gate is refused");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispatch_replay_requires_exact_queue_and_spec_identity() {
+    let schema = schema_name("exact_replay");
+    let admin = admin_pool("exact_replay").await;
+    create_schema(&admin, &schema).await;
+    let store = ci_job_spec_store(admin.clone());
+    let idem = "exact-replay-idem";
+    let original = enq(
+        "tenantA",
+        "fr-par",
+        "exact-job",
+        "exact-run",
+        TrustTier::Trusted,
+        &["linux"],
+        idem,
+    );
+    let spec = compute_spec(vec!["true".into()], TrustTier::Trusted, idem);
+    store
+        .co_persist_dispatch(&original, &spec, "build")
+        .await
+        .expect("persist original dispatch");
+
+    let colliding_job = enq(
+        "tenantA",
+        "fr-par",
+        "forged-job",
+        "exact-run",
+        TrustTier::Trusted,
+        &["linux"],
+        idem,
+    );
+    let collision = store
+        .co_persist_dispatch(&colliding_job, &spec, "build")
+        .await
+        .expect_err("one idem token cannot be rebound to another job UUID");
+    assert!(collision
+        .to_string()
+        .contains("replay conflicts with the existing queue/spec identity"));
+
+    let mut drifted = original.clone();
+    drifted.fair_key = "forged-fair-key".into();
+    let drift = store
+        .co_persist_dispatch(&drifted, &spec, "build")
+        .await
+        .expect_err("an exact job replay cannot change scheduling authority");
+    assert!(drift
+        .to_string()
+        .contains("replay conflicts with the existing queue/spec identity"));
+
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM job_queue), (SELECT count(*) FROM ci_job_spec)",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(counts, (1, 1), "both divergent transactions rolled back");
+    assert_eq!(
+        store
+            .get_spec("tenantA", "fr-par", &original.job_id)
+            .await
+            .unwrap(),
+        spec,
+        "the original executable spec remains authoritative"
+    );
+
+    drop_schema(&admin, &schema).await;
+}
+
 // ═══════════════ 3. SECURITY REGRESSION: the tier gate survives the real dispatch+resolve path ════
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
