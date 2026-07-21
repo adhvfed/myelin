@@ -101,6 +101,7 @@ pub const SECRET_BINDING_TABLE: &str = "secret_binding";
 /// markup_minor_units, kind`). Before the rename `CREATE TABLE IF NOT EXISTS cost_event` would no-op
 /// against whichever applied first, silently leaving the other's INSERT to fail on missing columns.
 pub const CI_COST_EVENT_TABLE: &str = "ci_cost_event";
+pub const CI_JOB_ACCOUNTING_TABLE: &str = "ci_job_accounting";
 /// CT-004d.1 — the durable `JobSpec` store table. One row per DISPATCHED stage job: the
 /// digest-pinned [`myelin_ci_sandbox::JobSpec`] (image/command/egress/limits/trust/workspace/run-token/
 /// meter/idem) the runner resolves + EXECUTES, keyed by the `(tenant_id, job_id)` the leased
@@ -510,6 +511,44 @@ CREATE TABLE IF NOT EXISTS ci_job_spec (
   PRIMARY KEY (tenant_id, job_id)
 )";
 
+/// Immutable terminal-accounting receipt for one dispatched CI job. Raw sandbox usage and the
+/// immutable pricing revision are retained beside the monetary outcome and claim-bound completion
+/// receipt, so terminal replay can be verified without repricing historical work.
+pub const CREATE_CI_JOB_ACCOUNTING_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS ci_job_accounting (
+  tenant_id             text NOT NULL,
+  region                text NOT NULL,
+  job_id                uuid NOT NULL,
+  wf_run_id             uuid NOT NULL,
+  ci_run_id             uuid NOT NULL,
+  reserve_handle        text NOT NULL,
+  passed                boolean NOT NULL,
+  timed_out             boolean NOT NULL,
+  cpu_seconds           bigint NOT NULL CHECK (cpu_seconds >= 0),
+  mem_byte_seconds      bigint NOT NULL CHECK (mem_byte_seconds >= 0),
+  pricing_revision      text NOT NULL,
+  billed_minor_units    bigint NOT NULL CHECK (billed_minor_units >= 0),
+  refunded_minor_units  bigint NOT NULL CHECK (refunded_minor_units >= 0),
+  completion_receipt    text NOT NULL CHECK (completion_receipt ~ '^v3:[0-9a-f]{64}$'),
+  accounted_at          timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, job_id),
+  UNIQUE (tenant_id, completion_receipt),
+  FOREIGN KEY (tenant_id, ci_run_id) REFERENCES ci_run(tenant_id, run_id),
+  CHECK (NOT (passed AND timed_out))
+);
+REVOKE UPDATE, DELETE ON ci_job_accounting FROM myelin_app;
+CREATE OR REPLACE FUNCTION myelin_reject_ci_job_accounting_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $myelin$
+BEGIN
+  RAISE EXCEPTION 'ci_job_accounting is immutable';
+END
+$myelin$;
+CREATE TRIGGER ci_job_accounting_reject_mutation
+BEFORE UPDATE OR DELETE ON ci_job_accounting
+FOR EACH ROW EXECUTE FUNCTION myelin_reject_ci_job_accounting_mutation()";
+
 /// **The forward-only ALTER that adds the durable `stage` column to `ci_job_spec` (CT-004d.2 rewire).**
 /// The dispatched stage NAME is the durable-by-contract fact the terminal reporter reads back at
 /// `job.done` verification (a restart must not lose the job→stage mapping — the exact failure the
@@ -642,6 +681,11 @@ fn create_statements() -> Vec<(&'static str, &'static str, String)> {
             "ci_0015_ci_job_spec",
             CI_JOB_SPEC_TABLE,
             CREATE_CI_JOB_SPEC_DDL.to_string(),
+        ),
+        (
+            "ci_0017_ci_job_accounting",
+            CI_JOB_ACCOUNTING_TABLE,
+            CREATE_CI_JOB_ACCOUNTING_DDL.to_string(),
         ),
     ]
 }
@@ -893,12 +937,12 @@ pub fn ci_controlplane_hot_tables() -> HotTables {
 mod tests {
     use super::*;
 
-    /// **All sixteen CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
+    /// **All seventeen CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
     /// The complete arch 01 §3 control-plane schema (+ CT-004d.1's `ci_job_spec`) lands here; `ci_run`
     /// precedes `ci_job` (the FK dependency). This is the prompt's "the complete forward-only
     /// data-model migrations" gate.
     #[test]
-    fn all_sixteen_controlplane_tables_are_present_fk_ordered() {
+    fn all_seventeen_controlplane_tables_are_present_fk_ordered() {
         let migrations = ci_controlplane_migrations();
         let tables: Vec<&str> = migrations
             .0
@@ -925,8 +969,9 @@ mod tests {
                 SECRET_BINDING_TABLE,
                 CI_COST_EVENT_TABLE,
                 CI_JOB_SPEC_TABLE,
+                CI_JOB_ACCOUNTING_TABLE,
             ],
-            "all 16 control-plane tables, FK-dependency ordered (ci_run before its dependants)"
+            "all 17 control-plane tables, FK-dependency ordered (ci_run before its dependants)"
         );
         // ci_run precedes ci_job (the FK target before the FK source).
         let run_pos = tables.iter().position(|t| *t == CI_RUN_TABLE).unwrap();
@@ -981,6 +1026,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn job_accounting_is_complete_unique_and_structurally_insert_only() {
+        let ddl = CREATE_CI_JOB_ACCOUNTING_DDL;
+        for required in [
+            "cpu_seconds",
+            "mem_byte_seconds",
+            "pricing_revision",
+            "billed_minor_units",
+            "refunded_minor_units",
+            "UNIQUE (tenant_id, completion_receipt)",
+            "REFERENCES ci_run(tenant_id, run_id)",
+            "REVOKE UPDATE, DELETE ON ci_job_accounting FROM myelin_app",
+            "BEFORE UPDATE OR DELETE ON ci_job_accounting",
+            "RAISE EXCEPTION 'ci_job_accounting is immutable'",
+        ] {
+            assert!(ddl.contains(required), "accounting DDL pins `{required}`");
+        }
+    }
+
     /// **The migration set applies forward-only (no DROP, no down) — the contract-1.5 floor.** Every
     /// assembled DDL is forward-only-legal (`is_destructive` is false) and carries the platform RLS
     /// scoping. The runner / lint enforce this at boot / source-scan; this is the in-module proof.
@@ -989,8 +1053,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            28,
-            "16 table/RLS + 1 ci_run causal ALTER + 4 concurrent-index + 1 index-validation + 2 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 scheduler-boundary + 2 scheduler claim grants"
+            29,
+            "17 table/RLS + 1 ci_run causal ALTER + 4 concurrent-index + 1 index-validation + 2 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 scheduler-boundary + 2 scheduler claim grants"
         );
         for m in &migrations.0 {
             assert!(
@@ -1056,8 +1120,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            28,
-            "the runner applied all 16 table/RLS, 1 ci_run causal ALTER, 4 concurrent-index, 1 index-validation, 2 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 scheduler-boundary, and 2 scheduler claim grants"
+            29,
+            "the runner applied all 17 table/RLS, 1 ci_run causal ALTER, 4 concurrent-index, 1 index-validation, 2 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 scheduler-boundary, and 2 scheduler claim grants"
         );
         assert_eq!(
             runner.applied()[0],
