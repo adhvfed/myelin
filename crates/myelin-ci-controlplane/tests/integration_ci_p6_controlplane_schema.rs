@@ -23,7 +23,8 @@
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
-    CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, JQ_CLAIMABLE_INDEX,
+    CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL,
+    CREATE_JOB_QUEUE_INDEXES_DDL, JQ_CLAIMABLE_INDEX,
 };
 
 fn app_url() -> String {
@@ -164,6 +165,149 @@ async fn ci_run_schema_applies_forward_only_with_rls() {
     );
 
     sqlx::query(&format!("DROP TABLE {tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn ci_drive_manifest_is_live_insert_only_replay_authority() {
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&admin_url())
+        .await
+        .expect("connect to dev Postgres as admin");
+    let app = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&app_url())
+        .await
+        .expect("connect to dev Postgres as the app role");
+
+    let suffix = std::process::id();
+    let run_tbl = format!("ci_run_manifest_p349_{suffix}");
+    let manifest_tbl = format!("ci_drive_manifest_p349_{suffix}");
+    sqlx::query(&rename(CREATE_CI_RUN_DDL, "ci_run", &run_tbl))
+        .execute(&admin)
+        .await
+        .expect("create manifest parent run table");
+    sqlx::query(&format!("SELECT myelin_make_tenant_scoped('{run_tbl}')"))
+        .execute(&admin)
+        .await
+        .expect("scope parent run table");
+
+    let create_manifest = CREATE_CI_DRIVE_MANIFEST_DDL
+        .replace(
+            "EXISTS ci_drive_manifest (",
+            &format!("EXISTS {manifest_tbl} ("),
+        )
+        .replace("REFERENCES ci_run(", &format!("REFERENCES {run_tbl}("))
+        .replace(
+            "ON ci_drive_manifest FROM myelin_app",
+            &format!("ON {manifest_tbl} FROM myelin_app"),
+        )
+        .replace(
+            "BEFORE UPDATE OR DELETE ON ci_drive_manifest",
+            &format!("BEFORE UPDATE OR DELETE ON {manifest_tbl}"),
+        );
+    sqlx::raw_sql(&create_manifest)
+        .execute(&admin)
+        .await
+        .expect("create immutable manifest table and trigger");
+    sqlx::query(&format!(
+        "SELECT myelin_make_tenant_scoped('{manifest_tbl}')"
+    ))
+    .execute(&admin)
+    .await
+    .expect("scope manifest table");
+
+    let tenant = "manifest-tenant";
+    let region = "fr-par";
+    let ci_run_id = "11111111-1111-1111-1111-111111111111";
+    let wf_run_id = "22222222-2222-2222-2222-222222222222";
+    let mut admin_conn = admin.acquire().await.unwrap();
+    sqlx::query("SELECT set_config('myelin.tenant_id', $1, false)")
+        .bind(tenant)
+        .execute(&mut *admin_conn)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('myelin.region', $1, false)")
+        .bind(region)
+        .execute(&mut *admin_conn)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {run_tbl} (tenant_id, region, run_id, project_id, pipeline_id, wf_run_id, \
+         definition_snapshot, trigger_kind, trust_tier, state, correlation_id) VALUES \
+         ($1, $2, $3::uuid, gen_random_uuid(), gen_random_uuid(), $4::uuid, \
+         'myelin://manifest-tenant/ci/artifact/snapshot-blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
+         'push', 'trusted', 'queued', 'manifest-proof')"
+    ))
+    .bind(tenant)
+    .bind(region)
+    .bind(ci_run_id)
+    .bind(wf_run_id)
+    .execute(&mut *admin_conn)
+    .await
+    .expect("seed parent CI run");
+    drop(admin_conn);
+
+    let mut app_conn = app.acquire().await.unwrap();
+    sqlx::query("SELECT set_config('myelin.tenant_id', $1, false)")
+        .bind(tenant)
+        .execute(&mut *app_conn)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('myelin.region', $1, false)")
+        .bind(region)
+        .execute(&mut *app_conn)
+        .await
+        .unwrap();
+    let digest = format!("blake3:{}", "b".repeat(64));
+    sqlx::query(&format!(
+        "INSERT INTO {manifest_tbl} (tenant_id, region, wf_run_id, ci_run_id, schema_version, \
+         source_snapshot_ref, manifest_digest, manifest_bytes) \
+         VALUES ($1, $2, $3::uuid, $4::uuid, 1, 'snapshot-ref', $5, $6)"
+    ))
+    .bind(tenant)
+    .bind(region)
+    .bind(wf_run_id)
+    .bind(ci_run_id)
+    .bind(&digest)
+    .bind(br#"{"schema_version":1}"#.as_slice())
+    .execute(&mut *app_conn)
+    .await
+    .expect("the app role may insert immutable replay authority");
+
+    let app_update = sqlx::query(&format!(
+        "UPDATE {manifest_tbl} SET manifest_digest = $1 WHERE tenant_id = $2"
+    ))
+    .bind(&digest)
+    .bind(tenant)
+    .execute(&mut *app_conn)
+    .await;
+    assert!(
+        app_update.is_err(),
+        "the runtime app role has no manifest UPDATE capability"
+    );
+    drop(app_conn);
+
+    let admin_update = sqlx::query(&format!(
+        "UPDATE {manifest_tbl} SET manifest_digest = $1 WHERE tenant_id = $2"
+    ))
+    .bind(&digest)
+    .bind(tenant)
+    .execute(&admin)
+    .await;
+    assert!(admin_update
+        .expect_err("the defensive trigger rejects even an owner mutation")
+        .to_string()
+        .contains("ci_drive_manifest is immutable"));
+
+    sqlx::query(&format!("DROP TABLE {manifest_tbl}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP TABLE {run_tbl}"))
         .execute(&admin)
         .await
         .unwrap();

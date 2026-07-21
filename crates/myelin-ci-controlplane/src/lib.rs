@@ -21,7 +21,8 @@
 //!     liveness must not check deps; readiness gates on the DB pool + the declared critical deps
 //!     (arch 00 §4: DB + broker + authz + at-least-one-healthy-runner-pool);
 //!   - runs the **complete forward-only data-model migrations** ([`migrations::ci_controlplane_migrations`]):
-//!     all fifteen CI Control-Plane tables (`ci_run`, `ci_job`, `check_attempt`, `job_queue` +
+//!     all sixteen CI Control-Plane tables (`ci_run`, immutable `ci_drive_manifest`, `ci_job`,
+//!     `check_attempt`, `job_queue` +
 //!     its three claim indexes, `fair_deficit`, `runner`, `log_segment`, `log_anchor`, `artifact`,
 //!     `cache_entry`, `environment`, `deployment`, `secret_binding`, `cost_event`), each
 //!     `(tenant_id, region)`-first + RLS-on (contract 11.1/12.1/1.5);
@@ -534,21 +535,23 @@ pub use migrations::{
     ci_controlplane_hot_tables, ci_controlplane_migrations, ci_durable_hot_tables,
     ci_durable_migrations, make_tenant_scoped_ddl, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ARTIFACT_TABLE,
-    CACHE_ENTRY_TABLE, CHECK_ATTEMPT_TABLE, CI_COST_EVENT_TABLE, CI_DURABLE_WRITER_IDS,
-    CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID, CI_JOB_QUEUE_COMPLETION_MIGRATION_ID,
-    CI_JOB_RUN_LEDGER_INDEX, CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID,
-    CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID, CI_JOB_SPEC_STAGE_MIGRATION_ID, CI_JOB_SPEC_TABLE,
-    CI_JOB_TABLE, CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_TABLE,
+    CACHE_ENTRY_TABLE, CHECK_ATTEMPT_TABLE, CI_COST_EVENT_TABLE, CI_DRIVE_MANIFEST_TABLE,
+    CI_DURABLE_WRITER_IDS, CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID,
+    CI_JOB_QUEUE_COMPLETION_MIGRATION_ID, CI_JOB_RUN_LEDGER_INDEX,
+    CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID, CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID,
+    CI_JOB_SPEC_STAGE_MIGRATION_ID, CI_JOB_SPEC_TABLE, CI_JOB_TABLE,
+    CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_TABLE,
     CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID, CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID,
     CREATE_ARTIFACT_DDL, CREATE_CACHE_ENTRY_DDL, CREATE_CHECK_ATTEMPT_DDL,
-    CREATE_CI_COST_EVENT_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
-    CREATE_CI_JOB_SPEC_DDL, CREATE_CI_REGION_SCHEDULER_RLS_DDL, CREATE_CI_RUN_DDL,
-    CREATE_DEPLOYMENT_DDL, CREATE_ENVIRONMENT_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
-    CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL, CREATE_RUNNER_DDL,
-    CREATE_SECRET_BINDING_DDL, DEPLOYMENT_TABLE, ENVIRONMENT_TABLE, FAIR_DEFICIT_TABLE,
-    GRANT_SCHEDULER_CLAIM_NONCE_DDL, GRANT_SCHEDULER_LEASE_EPOCH_DDL, JOB_QUEUE_TABLE,
-    JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX, JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE,
-    RUNNER_TABLE, SECRET_BINDING_TABLE, VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
+    CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_DDL,
+    CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_REGION_SCHEDULER_RLS_DDL,
+    CREATE_CI_RUN_DDL, CREATE_DEPLOYMENT_DDL, CREATE_ENVIRONMENT_DDL, CREATE_FAIR_DEFICIT_DDL,
+    CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL,
+    CREATE_LOG_SEGMENT_DDL, CREATE_RUNNER_DDL, CREATE_SECRET_BINDING_DDL, DEPLOYMENT_TABLE,
+    ENVIRONMENT_TABLE, FAIR_DEFICIT_TABLE, GRANT_SCHEDULER_CLAIM_NONCE_DDL,
+    GRANT_SCHEDULER_LEASE_EPOCH_DDL, JOB_QUEUE_TABLE, JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX,
+    JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE, RUNNER_TABLE, SECRET_BINDING_TABLE,
+    VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
 };
 
 pub use permanent_gates::{
@@ -606,7 +609,7 @@ fn controlplane_critical() -> CriticalDependencies {
 ///
 /// `config` is the validated, env-first config (§3.2; `Config::from_env()` lands with the driver,
 /// P-S15 — the shell boots over the validated default today). The complete forward-only data-model
-/// migrations create all fifteen control-plane tables `(tenant, region)`-first + RLS-on; the four
+/// migrations create all sixteen control-plane tables `(tenant, region)`-first + RLS-on; the four
 /// hot tables are declared; `broker` / `authz` / `runner_pool` are declared critical. No consumers
 /// are registered here — the scheduler/check-emitter behaviour is the per-table follow-ons (named in
 /// [`migrations`]); the dedup consumer is the Trigger & Dispatch shell.
@@ -879,8 +882,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            26,
-            "all 15 tables, 4 concurrent indexes, the ledger validator, 2 job_queue ALTERs, the ci_job_spec-stage ALTER, scheduler RLS boundary, and 2 claim-column grants are present"
+            27,
+            "all 16 tables, 4 concurrent indexes, the ledger validator, 2 job_queue ALTERs, the ci_job_spec-stage ALTER, scheduler RLS boundary, and 2 claim-column grants are present"
         );
         assert!(
             spec.consumers.is_empty(),

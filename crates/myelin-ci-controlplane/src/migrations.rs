@@ -78,6 +78,8 @@ use myelin_substrate::{HotTables, Migration, Migrations};
 /// The CI Control-Plane table names (arch 01 §3). PII-free opaque identifiers. The order is the
 /// foreign-key dependency order the runner applies in (`ci_run` before `ci_job`, etc.).
 pub const CI_RUN_TABLE: &str = "ci_run";
+/// Insert-only replay authority consumed by the durable `ci.pipeline` workflow.
+pub const CI_DRIVE_MANIFEST_TABLE: &str = "ci_drive_manifest";
 pub const CI_JOB_TABLE: &str = "ci_job";
 pub const CHECK_ATTEMPT_TABLE: &str = "check_attempt";
 pub const JOB_QUEUE_TABLE: &str = "job_queue";
@@ -179,6 +181,40 @@ CREATE TABLE IF NOT EXISTS ci_run (
   finished_at         timestamptz,
   PRIMARY KEY (tenant_id, run_id)
 )";
+
+/// `ci_drive_manifest` — the immutable, canonical launch authority for one CI workflow run.
+///
+/// The canonical bytes are retained alongside their domain-separated digest so a replay never
+/// reconstructs execution authority from mutable configuration. Runtime roles may insert/read but
+/// cannot update or delete a manifest; the trigger is a second line of defence for any future role
+/// whose grants accidentally widen. Secrets and ephemeral token JTIs never belong in these bytes.
+pub const CREATE_CI_DRIVE_MANIFEST_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS ci_drive_manifest (
+  tenant_id          text NOT NULL,
+  region             text NOT NULL,
+  wf_run_id          uuid NOT NULL,
+  ci_run_id          uuid NOT NULL,
+  schema_version     integer NOT NULL CHECK (schema_version = 1),
+  source_snapshot_ref text NOT NULL,
+  manifest_digest    text NOT NULL CHECK (manifest_digest ~ '^blake3:[0-9a-f]{64}$'),
+  manifest_bytes     bytea NOT NULL,
+  created_at         timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, wf_run_id),
+  UNIQUE (tenant_id, ci_run_id),
+  FOREIGN KEY (tenant_id, ci_run_id) REFERENCES ci_run(tenant_id, run_id)
+);
+REVOKE UPDATE, DELETE ON ci_drive_manifest FROM myelin_app;
+CREATE OR REPLACE FUNCTION myelin_reject_ci_drive_manifest_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $myelin$
+BEGIN
+  RAISE EXCEPTION 'ci_drive_manifest is immutable';
+END
+$myelin$;
+CREATE TRIGGER ci_drive_manifest_reject_mutation
+BEFORE UPDATE OR DELETE ON ci_drive_manifest
+FOR EACH ROW EXECUTE FUNCTION myelin_reject_ci_drive_manifest_mutation()";
 
 /// `ci_job` (arch 01 §3.1) — one row per DAG node of a run. FK to `ci_run` (tenant-first).
 pub const CREATE_CI_JOB_DDL: &str = "\
@@ -524,6 +560,11 @@ fn create_statements() -> Vec<(&'static str, &'static str, String)> {
             CREATE_CI_RUN_DDL.to_string(),
         ),
         (
+            "ci_0001a_ci_drive_manifest",
+            CI_DRIVE_MANIFEST_TABLE,
+            CREATE_CI_DRIVE_MANIFEST_DDL.to_string(),
+        ),
+        (
             "ci_0002_ci_job",
             CI_JOB_TABLE,
             CREATE_CI_JOB_DDL.to_string(),
@@ -829,12 +870,12 @@ pub fn ci_controlplane_hot_tables() -> HotTables {
 mod tests {
     use super::*;
 
-    /// **All fifteen CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
+    /// **All sixteen CI Control-Plane tables are in the forward-only migration set, FK-ordered.**
     /// The complete arch 01 §3 control-plane schema (+ CT-004d.1's `ci_job_spec`) lands here; `ci_run`
     /// precedes `ci_job` (the FK dependency). This is the prompt's "the complete forward-only
     /// data-model migrations" gate.
     #[test]
-    fn all_fifteen_controlplane_tables_are_present_fk_ordered() {
+    fn all_sixteen_controlplane_tables_are_present_fk_ordered() {
         let migrations = ci_controlplane_migrations();
         let tables: Vec<&str> = migrations
             .0
@@ -846,6 +887,7 @@ mod tests {
             tables,
             vec![
                 CI_RUN_TABLE,
+                CI_DRIVE_MANIFEST_TABLE,
                 CI_JOB_TABLE,
                 CHECK_ATTEMPT_TABLE,
                 JOB_QUEUE_TABLE,
@@ -861,14 +903,18 @@ mod tests {
                 CI_COST_EVENT_TABLE,
                 CI_JOB_SPEC_TABLE,
             ],
-            "all 15 control-plane tables, FK-dependency ordered (ci_run before ci_job)"
+            "all 16 control-plane tables, FK-dependency ordered (ci_run before its dependants)"
         );
         // ci_run precedes ci_job (the FK target before the FK source).
         let run_pos = tables.iter().position(|t| *t == CI_RUN_TABLE).unwrap();
+        let manifest_pos = tables
+            .iter()
+            .position(|t| *t == CI_DRIVE_MANIFEST_TABLE)
+            .unwrap();
         let job_pos = tables.iter().position(|t| *t == CI_JOB_TABLE).unwrap();
         assert!(
-            run_pos < job_pos,
-            "ci_run is created before ci_job (the FK)"
+            run_pos < manifest_pos && run_pos < job_pos,
+            "ci_run is created before both FK dependants"
         );
     }
 
@@ -892,6 +938,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn drive_manifest_is_digest_checked_and_structurally_insert_only() {
+        let ddl = CREATE_CI_DRIVE_MANIFEST_DDL;
+        for required in [
+            "CHECK (schema_version = 1)",
+            "CHECK (manifest_digest ~ '^blake3:[0-9a-f]{64}$')",
+            "UNIQUE (tenant_id, ci_run_id)",
+            "REFERENCES ci_run(tenant_id, run_id)",
+            "REVOKE UPDATE, DELETE ON ci_drive_manifest FROM myelin_app",
+            "BEFORE UPDATE OR DELETE ON ci_drive_manifest",
+            "RAISE EXCEPTION 'ci_drive_manifest is immutable'",
+        ] {
+            assert!(ddl.contains(required), "manifest DDL pins `{required}`");
+        }
+        assert!(
+            !ddl.contains("secret_value") && !ddl.contains("token_jti"),
+            "the immutable replay authority never stores secret values or minted token JTIs"
+        );
+    }
+
     /// **The migration set applies forward-only (no DROP, no down) — the contract-1.5 floor.** Every
     /// assembled DDL is forward-only-legal (`is_destructive` is false) and carries the platform RLS
     /// scoping. The runner / lint enforce this at boot / source-scan; this is the in-module proof.
@@ -900,8 +966,8 @@ mod tests {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            26,
-            "15 table/RLS + 4 concurrent-index + 1 index-validation + 2 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 scheduler-boundary + 2 scheduler claim grants"
+            27,
+            "16 table/RLS + 4 concurrent-index + 1 index-validation + 2 job_queue ALTERs + 1 ci_job_spec-stage ALTER + 1 scheduler-boundary + 2 scheduler claim grants"
         );
         for m in &migrations.0 {
             assert!(
@@ -965,8 +1031,8 @@ mod tests {
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            26,
-            "the runner applied all 15 table/RLS, 4 concurrent-index, 1 index-validation, 2 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 scheduler-boundary, and 2 scheduler claim grants"
+            27,
+            "the runner applied all 16 table/RLS, 4 concurrent-index, 1 index-validation, 2 job_queue ALTERs, 1 ci_job_spec-stage ALTER, 1 scheduler-boundary, and 2 scheduler claim grants"
         );
         assert_eq!(
             runner.applied()[0],
