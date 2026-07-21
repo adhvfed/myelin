@@ -89,6 +89,7 @@ async fn exercise(
     for table in [
         "outbox",
         "ci_run",
+        "ci_drive_manifest",
         "ci_job",
         "job_queue",
         "ci_job_spec",
