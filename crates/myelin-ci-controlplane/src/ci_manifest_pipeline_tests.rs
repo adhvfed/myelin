@@ -10,7 +10,7 @@ use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
 use crate::{
     CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1, CiManifestWorkspaceV1,
-    CiRunFinalizationOutcome, CiRunFinalizationWrite, CiRunStoreError,
+    CiMergeWaiterV1, CiRunFinalizationOutcome, CiRunFinalizationWrite, CiRunStoreError,
 };
 
 const RUN_ID: &str = "33333333-3333-8333-8333-333333333333";
@@ -332,12 +332,18 @@ fn failed_frontier_drains_dispatched_sibling_and_never_dispatches_descendant() {
     let timers = TimerStore::new();
     let runner = RecordingRunner::default();
     let finalizer = RecordingFinalizer::default();
+    let mut failed_manifest = manifest();
+    failed_manifest.merge_waiter = Some(CiMergeWaiterV1 {
+        workflow_run_id: RUN_ID.into(),
+        idem_token: "merge-required-sibling".into(),
+        required_contexts: vec!["build-b".into()],
+    });
     deliver(&signals, &dispatch_token(1), "build-b", true, 2);
     deliver(&signals, &dispatch_token(0), "build-a", false, 3);
 
     let mut ctx = begin(&outbox, journal, signals, timers);
     assert_eq!(
-        run_ci_manifest_pipeline(&mut ctx, &manifest(), &runner, &finalizer).unwrap(),
+        run_ci_manifest_pipeline(&mut ctx, &failed_manifest, &runner, &finalizer).unwrap(),
         CiManifestPipelineOutcome::Failed {
             job: "build-a".into(),
             timed_out: false,
@@ -360,6 +366,42 @@ fn failed_frontier_drains_dispatched_sibling_and_never_dispatches_descendant() {
             .map(|job| (job.job_id.as_str(), job.dispatched))
             .collect::<BTreeMap<_, _>>(),
         BTreeMap::from([(JOB_A, true), (JOB_B, true), (JOB_C, false)])
+    );
+    ctx.commit().unwrap();
+    let check_states: BTreeMap<String, (String, bool)> = outbox
+        .committed_rows()
+        .into_iter()
+        .filter(|row| row.envelope.type_.0 == myelin_ci_sandbox::events::CI_CHECK_UPDATED)
+        .map(|row| {
+            (
+                row.envelope.payload["context"]["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                (
+                    row.envelope.payload["state"].as_str().unwrap().to_owned(),
+                    row.envelope.payload["required"].as_bool().unwrap(),
+                ),
+            )
+        })
+        .collect();
+    assert_eq!(
+        check_states,
+        BTreeMap::from([
+            ("build-a".into(), ("failure".into(), false)),
+            ("build-b".into(), ("success".into(), true)),
+            ("package".into(), ("cancelled".into(), false)),
+        ])
+    );
+    let rollup = outbox
+        .committed_rows()
+        .into_iter()
+        .find(|row| row.envelope.type_.0 == myelin_events::taxonomy::new_tokens::CI_RESULT)
+        .expect("merge attempt receives one rollup");
+    assert_eq!(rollup.envelope.payload["overall"], "success");
+    assert_eq!(
+        rollup.envelope.payload["contexts"],
+        serde_json::json!(["build-b"])
     );
 }
 

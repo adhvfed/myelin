@@ -5,7 +5,7 @@
 //! and then drives only the manifest DAG. The synchronous body performs no database or clock reads
 //! outside `WfCtx`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -209,6 +209,7 @@ where
         .validate()
         .map_err(|error| WfError::Nondeterministic(error.to_string()))?;
     let mut completed = BTreeSet::new();
+    let mut job_verdicts = BTreeMap::new();
     let mut flow_timed_out_jobs = BTreeSet::new();
     while completed.len() < manifest.jobs.len() {
         let frontier: Vec<&GrantedCiJobV1> = manifest
@@ -249,23 +250,18 @@ where
                     flow_timed_out_jobs.insert(job.job_id.clone());
                     late_accounting.push((job.name.as_str(), handle.idem_token().to_owned()));
                     completed.insert(job.job_id.clone());
+                    job_verdicts.insert(job.job_id.clone(), false);
                 }
                 JobOutcome::Completed { result, .. } => {
-                    let valid_pass = matches!(
+                    let passed = matches!(
                         read_stage_verdict(&result),
                         Some((ref concrete_name, true)) if concrete_name == &job.name
                     );
-                    let exact_verdict = matches!(
-                        read_stage_verdict(&result),
-                        Some((ref concrete_name, _)) if concrete_name == &job.name
-                    );
-                    if !valid_pass {
-                        failed.get_or_insert_with(|| (job.name.clone(), false));
-                    }
-                    if !exact_verdict {
+                    if !passed {
                         failed.get_or_insert_with(|| (job.name.clone(), false));
                     }
                     completed.insert(job.job_id.clone());
+                    job_verdicts.insert(job.job_id.clone(), passed);
                 }
             }
         }
@@ -305,10 +301,10 @@ where
                 manifest,
                 CiTerminalDecision {
                     terminal_state,
-                    success: false,
                     failed_job: Some(&job),
                     flow_timed_out_jobs: &flow_timed_out_jobs,
                     dispatched_job_ids: &completed,
+                    job_verdicts: &job_verdicts,
                 },
                 finalizer,
             )?;
@@ -321,10 +317,10 @@ where
         manifest,
         CiTerminalDecision {
             terminal_state: CiRunTerminalState::Succeeded,
-            success: true,
             failed_job: None,
             flow_timed_out_jobs: &flow_timed_out_jobs,
             dispatched_job_ids: &completed,
+            job_verdicts: &job_verdicts,
         },
         finalizer,
     )?;
@@ -342,10 +338,10 @@ fn join_key(job: &DispatchedJob) -> (i64, &str) {
 
 struct CiTerminalDecision<'a> {
     terminal_state: CiRunTerminalState,
-    success: bool,
     failed_job: Option<&'a str>,
     flow_timed_out_jobs: &'a BTreeSet<String>,
     dispatched_job_ids: &'a BTreeSet<String>,
+    job_verdicts: &'a BTreeMap<String, bool>,
 }
 
 fn finalize_and_emit_terminal_facts(
@@ -410,8 +406,8 @@ fn finalize_and_emit_terminal_facts(
         manifest,
         completed_at,
         decision.terminal_state,
-        decision.success,
         decision.failed_job,
+        decision.job_verdicts,
     )
 }
 
@@ -420,15 +416,16 @@ fn emit_terminal_facts(
     manifest: &CiDriveManifestV1,
     completed_at: &str,
     terminal_state: CiRunTerminalState,
-    success: bool,
     failed_job: Option<&str>,
+    job_verdicts: &BTreeMap<String, bool>,
 ) -> WfResult<()> {
-    let state = if success {
-        CheckState::Success
-    } else {
-        CheckState::Failure
-    };
+    let check_states = terminal_check_states(manifest, job_verdicts);
     for (context, attempt) in &manifest.check_attempts {
+        let state = check_states[context];
+        let required = manifest
+            .merge_waiter
+            .as_ref()
+            .is_none_or(|waiter| waiter.required_contexts.binary_search(context).is_ok());
         let emit_context = CheckEmitContext {
             tenant: manifest.tenant_id.clone(),
             repo: manifest.repo_ref.clone(),
@@ -444,7 +441,7 @@ fn emit_terminal_facts(
             CheckProvider::Ci,
             context,
             state,
-            true,
+            required,
             CostPosture::Settled,
             None,
         );
@@ -469,10 +466,9 @@ fn emit_terminal_facts(
     ctx.emit(run_event(manifest, event_type, payload), None)?;
 
     if let Some(waiter) = &manifest.merge_waiter {
-        let current = manifest
-            .check_attempts
-            .keys()
-            .map(|context| (context.clone(), success))
+        let current = check_states
+            .iter()
+            .map(|(context, state)| (context.clone(), *state == CheckState::Success))
             .collect();
         let result = rollup_ci_result(
             &manifest.commit_oid,
@@ -483,6 +479,39 @@ fn emit_terminal_facts(
         ctx.emit(ci_result_draft(&manifest.repo_ref, &result), None)?;
     }
     Ok(())
+}
+
+fn terminal_check_states(
+    manifest: &CiDriveManifestV1,
+    job_verdicts: &BTreeMap<String, bool>,
+) -> BTreeMap<String, CheckState> {
+    manifest
+        .check_attempts
+        .keys()
+        .map(|context| {
+            let mut failed = false;
+            let mut skipped = false;
+            for job in manifest
+                .jobs
+                .iter()
+                .filter(|job| &job.check_context == context)
+            {
+                match job_verdicts.get(&job.job_id) {
+                    Some(true) => {}
+                    Some(false) => failed = true,
+                    None => skipped = true,
+                }
+            }
+            let state = if failed {
+                CheckState::Failure
+            } else if skipped {
+                CheckState::Cancelled
+            } else {
+                CheckState::Success
+            };
+            (context.clone(), state)
+        })
+        .collect()
 }
 
 fn manifest_check_trust_tier(tier: CiManifestTrustTierV1) -> TrustTier {
