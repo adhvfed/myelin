@@ -794,6 +794,107 @@ mod tests {
         assert_eq!(gate.inflight_interrupt_count(), 0, "0 interrupts");
     }
 
+    /// A real long-park completes on a later drive, not the dispatching drive. The duplicate reserve
+    /// on resume must retain the in-flight reservation and the consumed `job.done` must settle it;
+    /// another full replay is an idempotent no-op for money and dispatch.
+    #[test]
+    fn resumed_long_park_settles_once_after_job_done_and_replay() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let signals = SignalStore::new();
+        let runner = RecordingRunner::default();
+        let gate = BudgetGate::new(Wallet::new(MinorUnits(500)));
+        let spec = || JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-8");
+        let units = || vec![unit("ci.minute", 100, 50)];
+
+        let mut first = WfCtx::begin(
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "merge.queue",
+            "2026-06-21T00:00:00Z",
+            42,
+        )
+        .with_signals(signals.clone())
+        .with_budget(gate.clone());
+        assert_eq!(
+            first
+                .metered_schedule_and_run_job(spec(), &runner, None, MinorUnits(200), units(),)
+                .unwrap(),
+            JobOutcome::Parked
+        );
+        first.commit().unwrap();
+        assert_eq!(
+            gate.balance(),
+            MinorUnits(300),
+            "the dispatch reserve is held"
+        );
+
+        let token = job_idem_token("R1", "merge.queue:0");
+        deliver_job_done(
+            &signals,
+            &token,
+            vec![ArtifactRef("myelin://acme/ci/green".into())],
+        );
+        let mut resumed = WfCtx::resume(
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "merge.queue",
+            "2026-06-21T00:00:01Z",
+            42,
+            journal.history_for(&tenant(), "R1"),
+        )
+        .with_signals(signals.clone())
+        .with_budget(gate.clone());
+        assert!(matches!(
+            resumed
+                .metered_schedule_and_run_job(spec(), &runner, None, MinorUnits(200), units(),)
+                .unwrap(),
+            JobOutcome::Completed { .. }
+        ));
+        resumed.commit().unwrap();
+        assert_eq!(
+            gate.balance(),
+            MinorUnits(350),
+            "the unused 50 is refunded once"
+        );
+
+        let mut replay = WfCtx::resume(
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "merge.queue",
+            "2026-06-21T00:00:02Z",
+            42,
+            journal.history_for(&tenant(), "R1"),
+        )
+        .with_signals(signals)
+        .with_budget(gate.clone());
+        assert!(matches!(
+            replay
+                .metered_schedule_and_run_job(spec(), &runner, None, MinorUnits(200), units(),)
+                .unwrap(),
+            JobOutcome::Completed { .. }
+        ));
+        assert_eq!(
+            gate.balance(),
+            MinorUnits(350),
+            "replay cannot double-refund"
+        );
+        assert_eq!(
+            runner.calls.load(Ordering::SeqCst),
+            1,
+            "replay cannot redispatch"
+        );
+    }
+
     /// **A long-park dispatch against an EXHAUSTED wallet is REFUSED — the job is never handed to the
     /// runner (§4.9, the F-6 extended assertion).** The reserve fronts the dispatch: no balance → the
     /// runner is never called.
@@ -1019,7 +1120,11 @@ mod tests {
         );
         // A settle event was recorded (the reconciliation is observable). A failed activity bills ZERO
         // metered units, so no per-unit CostEvent row is written — the recorded event IS the settle.
-        assert_eq!(telemetry.settled(), 1, "the settle-on-exhaustion is recorded");
+        assert_eq!(
+            telemetry.settled(),
+            1,
+            "the settle-on-exhaustion is recorded"
+        );
         // A settle-on-exhaustion is a COMPLETION, not an interrupt — the headline zero still holds.
         assert_eq!(gate.inflight_interrupt_count(), 0, "0 in-flight interrupts");
     }

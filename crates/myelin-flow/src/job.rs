@@ -556,18 +556,17 @@ impl WfCtx {
         let tenant = self.tenant_id().clone();
 
         // ── RESERVE-AT-DISPATCH (§4.9 step 1). No balance → no dispatch: the runner is never called.
-        // `fresh` is false on a re-drive (the duplicate guard caught an already-reserved dispatch):
-        // its begin already ran on the first drive, so we do NOT re-progress the ledger.
-        let fresh = match gate.reserve(&tenant, &ledger_run, cost) {
+        // A duplicate is the normal re-drive after a durable park: the first drive already moved the
+        // reservation in-flight, so this drive must preserve it and continue to the exact join.
+        match gate.reserve(&tenant, &ledger_run, cost) {
             Ok(()) => {
                 // The reservation is in-flight from here — the job, once dispatched, is never
                 // interrupted; it settles on completion.
                 gate.begin(&tenant, &ledger_run).map_err(|e| {
                     WfError::CoCommit(format!("schedule_and_run_job begin failed: {e}"))
                 })?;
-                true
             }
-            Err(crate::budget::BudgetError::DuplicateReservation) => false,
+            Err(crate::budget::BudgetError::DuplicateReservation) => {}
             Err(crate::budget::BudgetError::Refused {
                 requested,
                 available,
@@ -584,21 +583,19 @@ impl WfCtx {
                     "schedule_and_run_job reserve failed: {other}"
                 )));
             }
-        };
+        }
 
         // ── DISPATCH + PARK (the existing §4.9 idiom — composes activity/signal/timer primitives).
         let outcome = self.schedule_and_run_job(spec, runner, timeout_secs)?;
 
-        // ── SETTLE-ON-COMPLETION (§4.9 step 4) — ONLY on a fresh-drive consumed job.done. A Parked /
-        // TimedOut leaves the reservation IN-FLIGHT (never interrupted): a re-drive that consumes
-        // job.done settles it; a TimedOut runs the body's error branch. A re-drive (`!fresh`) whose
-        // settle already ran does NOT re-settle (the replay is a pure short-circuit).
-        if fresh {
-            if let JobOutcome::Completed { .. } = &outcome {
-                gate.settle(&tenant, &ledger_run, &units).map_err(|e| {
-                    WfError::CoCommit(format!("schedule_and_run_job settle failed: {e}"))
-                })?;
-            }
+        // ── SETTLE-ON-COMPLETION (§4.9 step 4). A Parked / TimedOut reservation stays IN-FLIGHT;
+        // the later drive that consumes job.done must settle even though reserve() returned the
+        // expected DuplicateReservation above. A still-later replay may reach this branch again, so
+        // settlement itself is deliberately idempotent (zero double-charge and zero double-refund).
+        if let JobOutcome::Completed { .. } = &outcome {
+            gate.settle(&tenant, &ledger_run, &units).map_err(|e| {
+                WfError::CoCommit(format!("schedule_and_run_job settle failed: {e}"))
+            })?;
         }
         Ok(outcome)
     }
