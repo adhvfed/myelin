@@ -113,6 +113,7 @@ export function AppShell(props: AppShellProps) {
 
   const [paletteOpen, setPaletteOpen] = createSignal(false);
   const [inboxOpen, setInboxOpen] = createSignal(false);
+  const [shortcutsReady, setShortcutsReady] = createSignal(false);
   // MOB-2: wide (> 1280px) renders the pane as a 4th column; narrow renders it in a drawer. Default
   // wide so SSR renders the column; onMount installs the real matchMedia listener.
   const [paneWide, setPaneWide] = createSignal(true);
@@ -178,6 +179,7 @@ export function AppShell(props: AppShellProps) {
       }
     };
     document.addEventListener("keydown", onKey);
+    setShortcutsReady(true);
     onCleanup(() => document.removeEventListener("keydown", onKey));
   });
 
@@ -220,6 +222,7 @@ export function AppShell(props: AppShellProps) {
       <a class="skip-link" href="#main">Skip to content</a>
       <div
         class="app-shell"
+        data-shortcuts-ready={shortcutsReady() ? "true" : undefined}
         style={{
           display: "grid",
           "grid-template-columns": "auto 1fr",

@@ -16,6 +16,9 @@ async function devLogin(page: Page) {
   await page.goto("/login");
   await page.getByTestId("dev-login").click();
   await page.waitForURL("**/git/repos");
+  // URL commit and SSR visibility can precede Solid's client mount. This marker flips only after
+  // the document shortcut listener is installed, so keyboard assertions cannot race hydration.
+  await expect(page.locator('.app-shell[data-shortcuts-ready="true"]')).toBeVisible();
 }
 
 test.describe("MR-019 app shell — real browser", () => {
@@ -141,7 +144,7 @@ test.describe("MR-019 app shell — real browser", () => {
   test("⌘K opens the command palette (focus in the search), Escape closes it", async ({ page }) => {
     await devLogin(page);
 
-    await page.keyboard.press("Meta+k");
+    await page.keyboard.press("ControlOrMeta+k");
     const dialog = page.getByRole("dialog", { name: "Command palette" });
     await expect(dialog).toBeVisible();
 
@@ -175,7 +178,7 @@ test.describe("MR-019 app shell — real browser", () => {
 
   test("the autofocused palette input keeps the shared focus ring (no inline outline:none)", async ({ page }) => {
     await devLogin(page);
-    await page.keyboard.press("Meta+k");
+    await page.keyboard.press("ControlOrMeta+k");
     const search = page.getByRole("combobox", { name: /Search or run a command/ });
     await expect(search).toBeFocused();
     // Manual must-ship #5: the palette input must NOT zero its outline inline — the shared
@@ -205,7 +208,7 @@ test.describe("MR-019 app shell — real browser", () => {
 
   test("a command runs in-place: type 'inbox' + Enter opens the inbox overlay", async ({ page }) => {
     await devLogin(page);
-    await page.keyboard.press("Meta+k");
+    await page.keyboard.press("ControlOrMeta+k");
     const search = page.getByRole("combobox", { name: /Search or run a command/ });
     await search.fill("inbox");
     await page.keyboard.press("Enter");
