@@ -490,3 +490,65 @@ fn flow_timeout_parks_until_late_accounting_then_emits_timed_out_once() {
         .iter()
         .any(|row| row.envelope.type_.0 == myelin_ci_sandbox::events::CI_RUN_FAILED));
 }
+
+#[test]
+fn frontier_timeout_dominates_an_earlier_failure_and_matches_accounting() {
+    let outbox = OutboxStore::new();
+    let journal = WfJournal::new();
+    let signals = SignalStore::new();
+    let timers = TimerStore::new();
+    let runner = RecordingRunner::default();
+    let finalizer = RecordingFinalizer::default();
+    let mut mixed = manifest();
+    mixed.jobs.truncate(2);
+    for job in &mut mixed.jobs {
+        job.limits.timeout_secs = 1;
+    }
+    mixed
+        .check_attempts
+        .retain(|context, _| context != "package");
+
+    let mut first = begin(&outbox, journal.clone(), signals.clone(), timers.clone());
+    assert_eq!(
+        run_ci_manifest_pipeline(&mut first, &mixed, &runner, &finalizer).unwrap(),
+        CiManifestPipelineOutcome::Parked
+    );
+    first.commit().unwrap();
+
+    deliver(&signals, &dispatch_token(0), "build-a", false, 2);
+    let mut deadline = resume(&outbox, journal.clone(), signals.clone(), timers.clone());
+    assert_eq!(
+        run_ci_manifest_pipeline(&mut deadline, &mixed, &runner, &finalizer).unwrap(),
+        CiManifestPipelineOutcome::Parked,
+        "the timed-out sibling still waits for its accounting receipt"
+    );
+    deadline.commit().unwrap();
+
+    deliver(&signals, &dispatch_token(1), "build-b", false, 3);
+    let mut accounted = resume(&outbox, journal, signals, timers);
+    assert_eq!(
+        run_ci_manifest_pipeline(&mut accounted, &mixed, &runner, &finalizer).unwrap(),
+        CiManifestPipelineOutcome::Failed {
+            job: "build-b".into(),
+            timed_out: true,
+        }
+    );
+    accounted.commit().unwrap();
+
+    let finalizations = finalizer.finalizations();
+    assert_eq!(finalizations.len(), 1);
+    assert_eq!(
+        finalizations[0].terminal_state,
+        CiRunTerminalState::TimedOut
+    );
+    assert_eq!(
+        finalizations[0]
+            .jobs
+            .iter()
+            .filter(|job| job.flow_timed_out)
+            .map(|job| job.job_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![JOB_B]
+    );
+    assert_eq!(runner.targets(), vec![JOB_A.to_string(), JOB_B.to_string()]);
+}
