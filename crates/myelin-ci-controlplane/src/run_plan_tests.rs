@@ -254,10 +254,7 @@ fn concrete_job_name_derivation_is_pinned_and_binds_stage_and_matrix() {
     );
     assert_ne!(
         derive_concrete_job_name("test", &matrix),
-        derive_concrete_job_name(
-            "test",
-            &BTreeMap::from([("os".into(), "macos".into())])
-        )
+        derive_concrete_job_name("test", &BTreeMap::from([("os".into(), "macos".into())]))
     );
 }
 
@@ -503,6 +500,25 @@ fn current_v1_starter_loader_explicitly_refuses_v2_without_launch_authority() {
             version: RUN_PLAN_SCHEMA_V2,
         })
     );
+}
+
+#[test]
+fn manifest_launch_loader_accepts_only_canonical_v2() {
+    let v2 = valid_plan_v2();
+    let bytes = v2.canonical_bytes().unwrap();
+    let (store, run) = store_and_run(bytes.clone());
+    let prepared = load_launch_run_plan_v2(&store, &run).expect("prepare canonical V2 launch");
+    assert_eq!(prepared.plan(), &v2);
+    assert_eq!(prepared.content_hash(), &ContentHash::blake3(&bytes));
+    assert_eq!(prepared.tenant().as_str(), "tenant_01");
+
+    let bytes = valid_plan().canonical_bytes().unwrap();
+    let (store, run) = store_and_run(bytes);
+    assert!(matches!(
+        load_launch_run_plan_v2(&store, &run),
+        Err(RunPlanError::InvalidPlan { detail })
+            if detail.contains("requires run-plan schema V2; received V1")
+    ));
 }
 
 #[test]

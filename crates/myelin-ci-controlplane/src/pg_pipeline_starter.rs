@@ -9,25 +9,34 @@
 //! root by [`crate::ci_run_starter_factory`]), behind the SAME `MYELIN_CI_RUNNER` activation seam the
 //! runner lane uses. That composition is REAL but DORMANT: while the startup refusal keeps
 //! `MYELIN_CI_RUNNER=1` fail-closed, the factory is constructed but no minted starter is driven, so no
-//! queued run is started yet. The v1 plan and current CI schemas still do not durably provide the
-//! runner lane/labels, timeout and resource authority, egress and workspace grants, per-run token,
-//! metering reservation, or check-attempt/context facts required to execute/report a job; this starter
-//! freezes restart-safe version-1 stage/DAG identity only. The remaining wires the later activation
-//! flip closes are the region-wide queued-run poller that routes each discovered run's authoritative
-//! tenant into [`PgCiRunStarterFactory::starter_for`] and the myelin-flow M2 durable `RunStore`.
+//! queued run is started yet. A fresh start accepts only a canonical V2 plan and requires an explicit
+//! policy-aware [`CiLaunchAuthorityMaterializer`]; the production default refuses every fresh launch.
+//! The starter co-commits the immutable runtime grants, check attempts, canonical job ledger, workflow,
+//! and lifecycle transition, while an exact retry validates and reuses the frozen manifest without
+//! consulting mutable current policy. Remaining activation work includes the region-wide queued-run
+//! poller, initial check emission, and the myelin-flow M2 durable `RunStore`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use myelin_events::{HandlerTx, IdMinter};
 use myelin_flow::{partition_for_run_id, PgFlowExecutor, RunId, StartSpec, CI_PIPELINE_WF_TYPE};
 use myelin_refs::ArtifactRef;
-use myelin_storage::{BlobStore, ContentHash, HashAlgo};
+use myelin_storage::{BlobStore, ContentHash};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{PgPool, Row};
 
+use crate::check_emitter::BUMP_CHECK_ATTEMPT_SQL;
+use crate::ci_drive_manifest::{
+    CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1, CiLaunchAuthorityV1,
+    CiManifestTrustTierV1, CiManifestWorkspaceV1, GrantedCiJobV1,
+};
 use crate::ci_run_store::CiRunRecord;
-use crate::run_plan::{load_resolved_run_plan, PreparedRunPlan, RunPlanError};
+use crate::run_plan::{
+    load_launch_run_plan_v2, PreparedRunPlanV2, RunPlanError, RUN_PLAN_SCHEMA_V2,
+};
 use crate::surfacing::{ci_artifact_ref, ci_run_ref};
 
 const SELECT_QUEUED_RUN: &str = "\
@@ -66,6 +75,8 @@ FOR UPDATE";
 /// [`crate::ResolvedJobV1::matrix_identity`]. The first 16 digest bytes become an RFC 9562 UUIDv8 by setting
 /// the version and variant bits. Changing any byte of this contract requires a new versioned helper.
 pub const CI_JOB_ID_V1_DOMAIN: &str = "myelin.ci.job-id.v1";
+/// V2 identity also binds the authored stage separately from the concrete matrix-expanded name.
+pub const CI_JOB_ID_V2_DOMAIN: &str = "myelin.ci.job-id.v2";
 
 /// Derive the canonical durable `ci_job.job_id` for one resolved version-1 DAG node.
 ///
@@ -91,6 +102,32 @@ pub fn ci_job_id_v1(
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest.as_bytes()[..16]);
     // RFC 9562: custom UUID version 8 and the RFC 4122/9562 variant (`10xx`).
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    sqlx::types::Uuid::from_bytes(bytes)
+}
+
+pub fn ci_job_id_v2(
+    tenant: &TenantId,
+    run_id: sqlx::types::Uuid,
+    stage: &str,
+    concrete_name: &str,
+    matrix_identity: &[u8],
+) -> sqlx::types::Uuid {
+    let mut hasher = blake3::Hasher::new_derive_key(CI_JOB_ID_V2_DOMAIN);
+    for frame in [
+        tenant.0.as_bytes(),
+        run_id.as_bytes().as_slice(),
+        stage.as_bytes(),
+        concrete_name.as_bytes(),
+        matrix_identity,
+    ] {
+        hasher.update(&(frame.len() as u64).to_be_bytes());
+        hasher.update(frame);
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
     bytes[6] = (bytes[6] & 0x0f) | 0x80;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     sqlx::types::Uuid::from_bytes(bytes)
@@ -145,12 +182,59 @@ impl CiWorkflowDefinitionPin {
     }
 }
 
+/// A policy-aware server adapter that converts one verified customer plan into explicit runtime
+/// grants. The adapter is invoked only after the starter locks the exact queued run. Implementations
+/// must be deterministic and retry-safe for `record.run_id`: external reservation/token services
+/// cannot join the PostgreSQL transaction, so a rolled-back retry must resolve the same stable handles
+/// and must not create an irreversible duplicate. There is no permissive implementation.
+pub trait CiLaunchAuthorityMaterializer: Send + Sync {
+    fn materialize<'a>(
+        &'a self,
+        record: &'a CiRunRecord,
+        prepared: &'a PreparedRunPlanV2,
+        definition: &'a CiWorkflowDefinitionPin,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<CiLaunchAuthorityV1, CiLaunchAuthorityError>> + Send + 'a>,
+    >;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiLaunchAuthorityError(pub String);
+
+impl std::fmt::Display for CiLaunchAuthorityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CI launch authority refused: {}", self.0)
+    }
+}
+
+impl std::error::Error for CiLaunchAuthorityError {}
+
+#[derive(Clone, Debug, Default)]
+struct UnavailableCiLaunchAuthority;
+
+impl CiLaunchAuthorityMaterializer for UnavailableCiLaunchAuthority {
+    fn materialize<'a>(
+        &'a self,
+        _record: &'a CiRunRecord,
+        _prepared: &'a PreparedRunPlanV2,
+        _definition: &'a CiWorkflowDefinitionPin,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<CiLaunchAuthorityV1, CiLaunchAuthorityError>> + Send + 'a>,
+    > {
+        Box::pin(async {
+            Err(CiLaunchAuthorityError(
+                "no policy-aware launch-authority adapter is configured".into(),
+            ))
+        })
+    }
+}
+
 /// Strict, Flow-safe decoding of the two references persisted as a CI workflow's claimed input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimedCiInput {
     tenant: TenantId,
-    snapshot: ContentHash,
-    run_id: String,
+    manifest_digest: String,
+    ci_run_id: String,
 }
 
 impl ClaimedCiInput {
@@ -158,12 +242,12 @@ impl ClaimedCiInput {
         &self.tenant
     }
 
-    pub fn snapshot(&self) -> &ContentHash {
-        &self.snapshot
+    pub fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
     }
 
-    pub fn run_id(&self) -> &str {
-        &self.run_id
+    pub fn ci_run_id(&self) -> &str {
+        &self.ci_run_id
     }
 }
 
@@ -178,27 +262,27 @@ impl std::fmt::Display for ClaimedCiInputError {
 
 impl std::error::Error for ClaimedCiInputError {}
 
-/// Decode exactly `[ci/artifact/snapshot-<full-multihash>, ci/run/<uuid>]`. No extra reference,
-/// suffix, foreign tenant, abbreviated digest, or different canonical artifact type is accepted.
+/// Decode exactly `[ci/artifact/drive-manifest-blake3:<64-lower-hex>, ci/run/<uuid>]`. No extra
+/// reference, suffix, foreign tenant, abbreviated digest, or different artifact class is accepted.
 pub fn decode_ci_claimed_input(
     expected_tenant: &TenantId,
     input: &[ArtifactRef],
 ) -> Result<ClaimedCiInput, ClaimedCiInputError> {
     if input.len() != 2 {
         return Err(ClaimedCiInputError(
-            "expected exactly snapshot artifact then CI run reference".into(),
+            "expected exactly drive-manifest artifact then CI run reference".into(),
         ));
     }
-    let snapshot_ref = myelin_refs::parse_scoped(&input[0].0)
-        .map_err(|error| ClaimedCiInputError(format!("snapshot reference: {error}")))?;
+    let manifest_ref = myelin_refs::parse_scoped(&input[0].0)
+        .map_err(|error| ClaimedCiInputError(format!("manifest reference: {error}")))?;
     let run_ref = myelin_refs::parse_scoped(&input[1].0)
         .map_err(|error| ClaimedCiInputError(format!("run reference: {error}")))?;
-    if snapshot_ref.tenant != *expected_tenant
+    if manifest_ref.tenant != *expected_tenant
         || run_ref.tenant != *expected_tenant
-        || snapshot_ref.sub.is_some()
+        || manifest_ref.sub.is_some()
         || run_ref.sub.is_some()
-        || snapshot_ref.subsystem != "ci"
-        || snapshot_ref.type_ != "artifact"
+        || manifest_ref.subsystem != "ci"
+        || manifest_ref.type_ != "artifact"
         || run_ref.subsystem != "ci"
         || run_ref.type_ != "run"
     {
@@ -207,39 +291,43 @@ pub fn decode_ci_claimed_input(
                 .into(),
         ));
     }
-    let multihash = snapshot_ref.id.strip_prefix("snapshot-").ok_or_else(|| {
-        ClaimedCiInputError("snapshot artifact id lacks `snapshot-` class".into())
-    })?;
-    let snapshot = ContentHash::parse(multihash)
-        .map_err(|error| ClaimedCiInputError(format!("snapshot multihash: {error}")))?;
-    if snapshot.algo != HashAlgo::Blake3
-        || snapshot.digest_hex.len() != 64
-        || !snapshot
-            .digest_hex
+    let manifest_digest = manifest_ref
+        .id
+        .strip_prefix("drive-manifest-")
+        .ok_or_else(|| {
+            ClaimedCiInputError("manifest artifact id lacks `drive-manifest-` class".into())
+        })?;
+    let Some(digest_hex) = manifest_digest.strip_prefix("blake3:") else {
+        return Err(ClaimedCiInputError(
+            "manifest must use a BLAKE3 digest".into(),
+        ));
+    };
+    if digest_hex.len() != 64
+        || !digest_hex
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(ClaimedCiInputError(
-            "snapshot must be a canonical lowercase 32-byte BLAKE3 address".into(),
+            "manifest must be a canonical lowercase 32-byte BLAKE3 digest".into(),
         ));
     }
-    let run_id = sqlx::types::Uuid::parse_str(&run_ref.id)
+    let ci_run_id = sqlx::types::Uuid::parse_str(&run_ref.id)
         .map_err(|error| ClaimedCiInputError(format!("run id is not a UUID: {error}")))?
         .to_string();
-    let canonical_snapshot = ci_artifact_ref(
+    let canonical_manifest = ci_artifact_ref(
         &expected_tenant.0,
-        &format!("snapshot-{}", snapshot.to_multihash_string()),
+        &format!("drive-manifest-{manifest_digest}"),
     );
-    let canonical_run = ci_run_ref(&expected_tenant.0, &run_id);
-    if input[0] != canonical_snapshot || input[1] != canonical_run {
+    let canonical_run = ci_run_ref(&expected_tenant.0, &ci_run_id);
+    if input[0] != canonical_manifest || input[1] != canonical_run {
         return Err(ClaimedCiInputError(
             "claimed references are parseable but not byte-canonical".into(),
         ));
     }
     Ok(ClaimedCiInput {
         tenant: expected_tenant.clone(),
-        snapshot,
-        run_id,
+        manifest_digest: manifest_digest.into(),
+        ci_run_id,
     })
 }
 
@@ -269,6 +357,8 @@ pub enum PgCiStarterError {
     CorruptRun(String),
     Workflow(myelin_flow::ExecutorError),
     Plan(RunPlanError),
+    LaunchAuthority(CiLaunchAuthorityError),
+    Manifest(CiDriveManifestError),
     WorkflowIdentityMismatch { expected: String, actual: String },
 }
 
@@ -280,6 +370,8 @@ impl std::fmt::Display for PgCiStarterError {
             Self::CorruptRun(message) => write!(f, "queued CI run refused: {message}"),
             Self::Workflow(error) => write!(f, "durable workflow start refused: {error}"),
             Self::Plan(error) => write!(f, "queued CI run plan refused: {error}"),
+            Self::LaunchAuthority(error) => write!(f, "{error}"),
+            Self::Manifest(error) => write!(f, "CI drive manifest refused: {error}"),
             Self::WorkflowIdentityMismatch { expected, actual } => write!(
                 f,
                 "durable workflow idempotency collision: queued run requires `{expected}` but key resolved to `{actual}`"
@@ -300,6 +392,7 @@ pub struct PgCiPipelineStarter {
     executor: PgFlowExecutor,
     blobs: Arc<dyn BlobStore + Send + Sync>,
     definition: CiWorkflowDefinitionPin,
+    launch_authority: Arc<dyn CiLaunchAuthorityMaterializer>,
 }
 
 impl PgCiPipelineStarter {
@@ -312,6 +405,32 @@ impl PgCiPipelineStarter {
         blobs: Arc<dyn BlobStore + Send + Sync>,
         definition: CiWorkflowDefinitionPin,
     ) -> Result<Self, PgCiStarterError> {
+        Self::new_with_authority(
+            pool,
+            rt,
+            minter,
+            tenant,
+            region,
+            blobs,
+            definition,
+            Arc::new(UnavailableCiLaunchAuthority),
+        )
+    }
+
+    /// Construct a starter with an explicit policy-aware authority adapter. Production composition
+    /// intentionally uses [`Self::new`] until such an adapter is wired; tests and future composition
+    /// must opt in here rather than receiving a synthetic default grant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_authority(
+        pool: PgPool,
+        rt: tokio::runtime::Handle,
+        minter: Arc<dyn IdMinter>,
+        tenant: TenantId,
+        region: Region,
+        blobs: Arc<dyn BlobStore + Send + Sync>,
+        definition: CiWorkflowDefinitionPin,
+        launch_authority: Arc<dyn CiLaunchAuthorityMaterializer>,
+    ) -> Result<Self, PgCiStarterError> {
         validate_scope("tenant", &tenant.0)?;
         validate_scope("region", &region.0)?;
         let executor =
@@ -323,6 +442,7 @@ impl PgCiPipelineStarter {
             executor,
             blobs,
             definition,
+            launch_authority,
         })
     }
 
@@ -334,9 +454,23 @@ impl PgCiPipelineStarter {
             return Ok(StartQueuedOutcome::Idle);
         };
         validate_candidate(&self.tenant, &self.region, &candidate)?;
-        let prepared = load_resolved_run_plan(self.blobs.as_ref(), &candidate.record)
-            .map_err(PgCiStarterError::Plan)?;
-        let workflow_input = workflow_input(&candidate.record)?;
+        let manifest_store =
+            CiDriveManifestStore::new(self.pool.clone(), self.tenant.clone(), self.region.clone())
+                .map_err(PgCiStarterError::Manifest)?;
+        let manifest_preflight = manifest_store
+            .load_by_identity(&candidate.record.wf_run_id, &candidate.record.run_id)
+            .await
+            .map_err(PgCiStarterError::Manifest)?;
+        // A frozen manifest is the complete replay authority. Only a genuinely fresh launch reads
+        // the source CAS; exact repair must survive source retention and current-policy changes.
+        let prepared = if manifest_preflight.is_some() {
+            None
+        } else {
+            Some(
+                load_launch_run_plan_v2(self.blobs.as_ref(), &candidate.record)
+                    .map_err(PgCiStarterError::Plan)?,
+            )
+        };
 
         let mut transaction = self
             .pool
@@ -366,9 +500,80 @@ impl PgCiPipelineStarter {
         }
         validate_candidate(&self.tenant, &self.region, &locked)?;
         let record = locked.record;
-        materialize_ci_jobs_v1(&mut transaction, &record, &prepared).await?;
         let replay = lock_existing_exact_workflow(&mut transaction, &record).await?;
-        validate_definition_pin(&mut transaction, &self.definition, replay).await?;
+        let existing = manifest_store
+            .load_by_identity_on_conn(&mut transaction, &record.wf_run_id, &record.run_id)
+            .await
+            .map_err(PgCiStarterError::Manifest)?;
+        let (manifest, manifest_digest, mut expected_jobs, definition) =
+            if let Some((existing, digest)) = existing {
+                if !replay {
+                    return Err(PgCiStarterError::CorruptRun(
+                        "drive manifest exists without its atomically-started workflow".into(),
+                    ));
+                }
+                validate_replay_manifest(&record, &existing)?;
+                verify_replay_attempts(&mut transaction, &record, &existing).await?;
+                let definition = CiWorkflowDefinitionPin::new(
+                    existing.workflow_definition_version,
+                    existing.workflow_code_hash.clone(),
+                )?;
+                validate_definition_pin(&mut transaction, &definition, true).await?;
+                let expected_jobs = expected_ci_jobs_from_manifest(&record, &existing)?;
+                (existing, digest, expected_jobs, definition)
+            } else {
+                if replay {
+                    return Err(PgCiStarterError::CorruptRun(
+                        "existing CI workflow has no immutable drive manifest".into(),
+                    ));
+                }
+                let prepared = prepared.as_ref().ok_or_else(|| {
+                    PgCiStarterError::CorruptRun(
+                        "drive manifest disappeared after immutable preflight".into(),
+                    )
+                })?;
+                validate_definition_pin(&mut transaction, &self.definition, false).await?;
+                // The exact queued row is locked before consulting policy. Implementations must be
+                // retry-safe by run identity because external reservations cannot join this SQL tx.
+                let authority = self
+                    .launch_authority
+                    .materialize(&record, prepared, &self.definition)
+                    .await
+                    .map_err(PgCiStarterError::LaunchAuthority)?;
+                let expected_jobs = expected_ci_jobs_v2(&record, prepared)?;
+                let granted_jobs = granted_jobs_v2(&record, prepared, &expected_jobs, &authority)?;
+                let contexts = granted_jobs
+                    .iter()
+                    .map(|job| job.check_context.clone())
+                    .collect::<BTreeSet<_>>();
+                let attempts =
+                    allocate_check_attempts(&mut transaction, &record, &contexts).await?;
+                let manifest = build_drive_manifest_v1(
+                    &record,
+                    prepared,
+                    &self.definition,
+                    &authority,
+                    granted_jobs,
+                    attempts,
+                )?;
+                let digest = manifest_store
+                    .insert_on_conn(&mut transaction, &manifest)
+                    .await
+                    .map_err(PgCiStarterError::Manifest)?;
+                (manifest, digest, expected_jobs, self.definition.clone())
+            };
+        let workflow_input = workflow_input(&record, &manifest_digest)?;
+        for job in &mut expected_jobs {
+            job.spec_ref = workflow_input[0].0.clone();
+        }
+        materialize_ci_jobs(
+            &mut transaction,
+            &record,
+            &expected_jobs,
+            &workflow_input[0].0,
+            replay,
+        )
+        .await?;
         let started = {
             let mut handler_tx = HandlerTx::with_connection(&mut *transaction);
             self.executor
@@ -390,8 +595,12 @@ impl PgCiPipelineStarter {
                 actual: started.0,
             });
         }
-        verify_started_workflow(&mut transaction, &record, &workflow_input, &self.definition)
-            .await?;
+        verify_started_workflow(&mut transaction, &record, &workflow_input, &definition).await?;
+        if manifest.digest().map_err(PgCiStarterError::Manifest)? != manifest_digest {
+            return Err(PgCiStarterError::CorruptRun(
+                "co-committed manifest digest changed before workflow verification".into(),
+            ));
+        }
 
         let updated = sqlx::query(
             "UPDATE ci_run SET state = 'running' \
@@ -458,6 +667,7 @@ pub struct PgCiRunStarterFactory {
     minter: Arc<dyn IdMinter>,
     region: Region,
     blobs: Arc<dyn BlobStore + Send + Sync>,
+    launch_authority: Arc<dyn CiLaunchAuthorityMaterializer>,
 }
 
 impl PgCiRunStarterFactory {
@@ -471,12 +681,31 @@ impl PgCiRunStarterFactory {
         region: Region,
         blobs: Arc<dyn BlobStore + Send + Sync>,
     ) -> PgCiRunStarterFactory {
+        Self::new_with_authority(
+            pool,
+            rt,
+            minter,
+            region,
+            blobs,
+            Arc::new(UnavailableCiLaunchAuthority),
+        )
+    }
+
+    pub fn new_with_authority(
+        pool: PgPool,
+        rt: tokio::runtime::Handle,
+        minter: Arc<dyn IdMinter>,
+        region: Region,
+        blobs: Arc<dyn BlobStore + Send + Sync>,
+        launch_authority: Arc<dyn CiLaunchAuthorityMaterializer>,
+    ) -> PgCiRunStarterFactory {
         PgCiRunStarterFactory {
             pool,
             rt,
             minter,
             region,
             blobs,
+            launch_authority,
         }
     }
 
@@ -495,7 +724,7 @@ impl PgCiRunStarterFactory {
         tenant: TenantId,
         definition: CiWorkflowDefinitionPin,
     ) -> Result<PgCiPipelineStarter, PgCiStarterError> {
-        PgCiPipelineStarter::new(
+        PgCiPipelineStarter::new_with_authority(
             self.pool.clone(),
             self.rt.clone(),
             self.minter.clone(),
@@ -503,6 +732,7 @@ impl PgCiRunStarterFactory {
             self.region.clone(),
             self.blobs.clone(),
             definition,
+            self.launch_authority.clone(),
         )
     }
 }
@@ -616,43 +846,475 @@ fn decode_candidate(row: &sqlx::postgres::PgRow) -> Result<StarterCandidate, PgC
     })
 }
 
-fn workflow_input(record: &CiRunRecord) -> Result<Vec<ArtifactRef>, PgCiStarterError> {
-    let prefix = format!("myelin://{}/ci/snapshot/", record.tenant_id);
-    let address = record
-        .definition_snapshot
-        .strip_prefix(&prefix)
-        .ok_or_else(|| {
-            PgCiStarterError::CorruptRun(
-                "validated snapshot reference no longer matches the authoritative tenant".into(),
-            )
-        })?;
+fn workflow_input(
+    record: &CiRunRecord,
+    manifest_digest: &str,
+) -> Result<Vec<ArtifactRef>, PgCiStarterError> {
     let input = vec![
-        // `snapshot` is not a frozen Bus artifact type. The injective, reversible id keeps the full
-        // multihash (`snapshot-<algorithm>:<digest>`) under canonical `ci/artifact`; ci_run's
-        // definition_snapshot remains the authoritative classed URI.
-        ci_artifact_ref(&record.tenant_id, &format!("snapshot-{address}")),
+        ci_artifact_ref(
+            &record.tenant_id,
+            &format!("drive-manifest-{manifest_digest}"),
+        ),
         ci_run_ref(&record.tenant_id, &record.run_id),
     ];
     let decoded = decode_ci_claimed_input(&TenantId(record.tenant_id.clone()), &input)
         .map_err(|error| PgCiStarterError::CorruptRun(error.to_string()))?;
-    if decoded.snapshot.to_multihash_string() != address || decoded.run_id != record.run_id {
+    if decoded.manifest_digest != manifest_digest || decoded.ci_run_id != record.run_id {
         return Err(PgCiStarterError::CorruptRun(
-            "claimed-input encoding did not round-trip the authoritative snapshot and run".into(),
+            "claimed-input encoding did not round-trip the authoritative manifest and run".into(),
         ));
     }
     Ok(input)
 }
 
+#[cfg(test)]
 fn expected_ci_jobs_v1(
     record: &CiRunRecord,
-    prepared: &PreparedRunPlan,
+    prepared: &crate::PreparedRunPlan,
 ) -> Result<Vec<ExpectedCiJobV1>, PgCiStarterError> {
     expected_ci_jobs_v1_with(record, prepared, ci_job_id_v1)
 }
 
+fn expected_ci_jobs_v2(
+    record: &CiRunRecord,
+    prepared: &PreparedRunPlanV2,
+) -> Result<Vec<ExpectedCiJobV1>, PgCiStarterError> {
+    let tenant = TenantId(record.tenant_id.clone());
+    let expected_snapshot = format!(
+        "myelin://{}/ci/snapshot/{}",
+        tenant.0,
+        prepared.content_hash().to_multihash_string()
+    );
+    if prepared.tenant() != &tenant || record.definition_snapshot != expected_snapshot {
+        return Err(PgCiStarterError::CorruptRun(
+            "prepared V2 plan provenance diverges from the locked ci_run".into(),
+        ));
+    }
+    let run_id = sqlx::types::Uuid::parse_str(&record.run_id).map_err(|error| {
+        PgCiStarterError::CorruptRun(format!("locked ci_run.run_id is not a UUID: {error}"))
+    })?;
+    let mut ids_by_name = BTreeMap::new();
+    let mut unique_ids = BTreeSet::new();
+    for job in &prepared.plan().jobs {
+        let job_id = ci_job_id_v2(
+            &tenant,
+            run_id,
+            &job.stage,
+            &job.name,
+            &job.matrix_identity(),
+        );
+        if !unique_ids.insert(job_id) || ids_by_name.insert(job.name.clone(), job_id).is_some() {
+            return Err(PgCiStarterError::CorruptRun(format!(
+                "deterministic version-2 ci_job identity collision at `{}`",
+                job.name
+            )));
+        }
+    }
+    prepared
+        .plan()
+        .jobs
+        .iter()
+        .map(|job| {
+            let needs = job
+                .needs
+                .iter()
+                .map(|need| {
+                    ids_by_name.get(need).copied().ok_or_else(|| {
+                        PgCiStarterError::CorruptRun(format!(
+                            "validated V2 node `{}` needs unmapped node `{need}`",
+                            job.name
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let matrix_key = if job.matrix_key.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_value(&job.matrix_key).map_err(|error| {
+                    PgCiStarterError::CorruptRun(format!(
+                        "encode V2 matrix identity for `{}`: {error}",
+                        job.name
+                    ))
+                })?)
+            };
+            Ok(ExpectedCiJobV1 {
+                tenant_id: record.tenant_id.clone(),
+                region: record.region.clone(),
+                job_id: ids_by_name[&job.name],
+                run_id,
+                stage: job.stage.clone(),
+                name: job.name.clone(),
+                needs,
+                matrix_key,
+                spec_ref: record.definition_snapshot.clone(),
+                state: "queued".into(),
+                attempt: 1,
+                result_summary: None,
+            })
+        })
+        .collect()
+}
+
+fn validate_replay_manifest(
+    record: &CiRunRecord,
+    manifest: &CiDriveManifestV1,
+) -> Result<(), PgCiStarterError> {
+    manifest.validate().map_err(PgCiStarterError::Manifest)?;
+    let snapshot_prefix = format!("myelin://{}/ci/snapshot/", record.tenant_id);
+    let snapshot_digest = record
+        .definition_snapshot
+        .strip_prefix(&snapshot_prefix)
+        .ok_or_else(|| {
+            PgCiStarterError::CorruptRun(
+                "locked definition snapshot is outside the tenant CI snapshot class".into(),
+            )
+        })?;
+    let content_hash = ContentHash::parse(snapshot_digest).map_err(|error| {
+        PgCiStarterError::CorruptRun(format!("locked snapshot digest is invalid: {error}"))
+    })?;
+    if !snapshot_digest.starts_with("blake3:")
+        || record.definition_snapshot != format!("{snapshot_prefix}{snapshot_digest}")
+    {
+        return Err(PgCiStarterError::CorruptRun(
+            "locked definition snapshot is not the canonical tenant V2 source".into(),
+        ));
+    }
+    let trust_tier = match record.trust_tier.as_str() {
+        "trusted" => CiManifestTrustTierV1::Trusted,
+        "untrusted_fork" => CiManifestTrustTierV1::UntrustedFork,
+        "self_hosted" => CiManifestTrustTierV1::SelfHosted,
+        token => {
+            return Err(PgCiStarterError::CorruptRun(format!(
+                "locked run carries unknown trust tier `{token}`"
+            )))
+        }
+    };
+    let expected_source = ci_artifact_ref(
+        &record.tenant_id,
+        &format!("snapshot-{}", content_hash.to_multihash_string()),
+    )
+    .0;
+    if manifest.tenant_id != record.tenant_id
+        || manifest.region != record.region
+        || manifest.wf_run_id != record.wf_run_id
+        || manifest.ci_run_id != record.run_id
+        || manifest.source_snapshot_ref != expected_source
+        || manifest.repo_ref != record.repo_ref.as_deref().unwrap_or_default()
+        || manifest.commit_oid != record.commit_oid.as_deref().unwrap_or_default()
+        || manifest.run_ref != ci_run_ref(&record.tenant_id, &record.run_id).0
+        || manifest.trust_tier != trust_tier
+    {
+        return Err(PgCiStarterError::CorruptRun(
+            "immutable drive manifest diverges from the locked ci_run".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn matrix_identity(matrix_key: &BTreeMap<String, String>) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&(matrix_key.len() as u64).to_be_bytes());
+    for (key, value) in matrix_key {
+        encoded.extend_from_slice(&(key.len() as u64).to_be_bytes());
+        encoded.extend_from_slice(key.as_bytes());
+        encoded.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        encoded.extend_from_slice(value.as_bytes());
+    }
+    encoded
+}
+
+fn expected_ci_jobs_from_manifest(
+    record: &CiRunRecord,
+    manifest: &CiDriveManifestV1,
+) -> Result<Vec<ExpectedCiJobV1>, PgCiStarterError> {
+    let tenant = TenantId(record.tenant_id.clone());
+    let run_id = sqlx::types::Uuid::parse_str(&record.run_id).map_err(|error| {
+        PgCiStarterError::CorruptRun(format!("locked ci_run.run_id is not a UUID: {error}"))
+    })?;
+    let mut names_by_id = BTreeMap::new();
+    for job in &manifest.jobs {
+        let job_id = sqlx::types::Uuid::parse_str(&job.job_id).map_err(|error| {
+            PgCiStarterError::CorruptRun(format!("manifest job id is not a UUID: {error}"))
+        })?;
+        let derived = ci_job_id_v2(
+            &tenant,
+            run_id,
+            &job.stage,
+            &job.name,
+            &matrix_identity(&job.matrix_key),
+        );
+        if job_id != derived {
+            return Err(PgCiStarterError::CorruptRun(format!(
+                "manifest job `{}` has a noncanonical V2 identity",
+                job.name
+            )));
+        }
+        names_by_id.insert(job_id, job.name.as_str());
+    }
+    manifest
+        .jobs
+        .iter()
+        .map(|job| {
+            let job_id = sqlx::types::Uuid::parse_str(&job.job_id).map_err(|error| {
+                PgCiStarterError::CorruptRun(format!("manifest job id is not a UUID: {error}"))
+            })?;
+            let mut needs = job
+                .needs
+                .iter()
+                .map(|dependency| {
+                    sqlx::types::Uuid::parse_str(dependency).map_err(|error| {
+                        PgCiStarterError::CorruptRun(format!(
+                            "manifest dependency id is not a UUID: {error}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            needs.sort_by_key(|dependency| names_by_id.get(dependency).copied());
+            let matrix_key = (!job.matrix_key.is_empty())
+                .then(|| serde_json::to_value(&job.matrix_key))
+                .transpose()
+                .map_err(|error| {
+                    PgCiStarterError::CorruptRun(format!(
+                        "encode manifest matrix identity for `{}`: {error}",
+                        job.name
+                    ))
+                })?;
+            Ok(ExpectedCiJobV1 {
+                tenant_id: record.tenant_id.clone(),
+                region: record.region.clone(),
+                job_id,
+                run_id,
+                stage: job.stage.clone(),
+                name: job.name.clone(),
+                needs,
+                matrix_key,
+                spec_ref: String::new(),
+                state: "queued".into(),
+                attempt: 1,
+                result_summary: None,
+            })
+        })
+        .collect()
+}
+
+async fn verify_replay_attempts(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    record: &CiRunRecord,
+    manifest: &CiDriveManifestV1,
+) -> Result<(), PgCiStarterError> {
+    let run_id = sqlx::types::Uuid::parse_str(&record.run_id).map_err(|error| {
+        PgCiStarterError::CorruptRun(format!("locked ci_run.run_id is not a UUID: {error}"))
+    })?;
+    for (context, issued) in &manifest.check_attempts {
+        let row: Option<(i32, Option<sqlx::types::Uuid>)> = sqlx::query_as(
+            "SELECT next_attempt, current_run FROM check_attempt \
+             WHERE tenant_id=$1 AND region=$2 AND repo_ref=$3 AND commit_oid=$4 AND context=$5 \
+             FOR SHARE",
+        )
+        .bind(&record.tenant_id)
+        .bind(&record.region)
+        .bind(&manifest.repo_ref)
+        .bind(&manifest.commit_oid)
+        .bind(context)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|error| {
+            PgCiStarterError::Database(format!("verify replay check attempt: {error}"))
+        })?;
+        let (next, current) = row.ok_or_else(|| {
+            PgCiStarterError::CorruptRun(format!(
+                "manifest check context `{context}` has no allocation ledger"
+            ))
+        })?;
+        let issued = i32::try_from(*issued).map_err(|_| {
+            PgCiStarterError::CorruptRun("manifest check attempt exceeds PostgreSQL i32".into())
+        })?;
+        let minimum_next = issued.checked_add(1).ok_or_else(|| {
+            PgCiStarterError::CorruptRun("manifest check attempt overflows PostgreSQL i32".into())
+        })?;
+        let valid = if current == Some(run_id) {
+            next == minimum_next
+        } else {
+            current.is_some() && next > minimum_next
+        };
+        if !valid {
+            return Err(PgCiStarterError::CorruptRun(format!(
+                "manifest check attempt for `{context}` diverges from the allocation ledger"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn granted_jobs_v2(
+    record: &CiRunRecord,
+    prepared: &PreparedRunPlanV2,
+    expected: &[ExpectedCiJobV1],
+    authority: &CiLaunchAuthorityV1,
+) -> Result<Vec<GrantedCiJobV1>, PgCiStarterError> {
+    if authority.jobs.len() != prepared.plan().jobs.len()
+        || expected.len() != prepared.plan().jobs.len()
+    {
+        return Err(PgCiStarterError::LaunchAuthority(CiLaunchAuthorityError(
+            "authority must grant every concrete V2 job exactly once".into(),
+        )));
+    }
+    let repo_ref = record.repo_ref.clone().ok_or_else(|| {
+        PgCiStarterError::CorruptRun("locked run lacks repository provenance".into())
+    })?;
+    let commit_oid = record
+        .commit_oid
+        .clone()
+        .ok_or_else(|| PgCiStarterError::CorruptRun("locked run lacks commit provenance".into()))?;
+    prepared
+        .plan()
+        .jobs
+        .iter()
+        .zip(expected)
+        .zip(&authority.jobs)
+        .map(|((job, expected), grant)| {
+            if grant.concrete_name != job.name || expected.name != job.name {
+                return Err(PgCiStarterError::LaunchAuthority(CiLaunchAuthorityError(
+                    "authority jobs must be strictly plan-ordered with no missing or extra name"
+                        .into(),
+                )));
+            }
+            let mut needs = expected
+                .needs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            needs.sort();
+            Ok(GrantedCiJobV1 {
+                job_id: expected.job_id.to_string(),
+                stage: job.stage.clone(),
+                name: job.name.clone(),
+                check_context: format!("ci:{}", job.stage),
+                needs,
+                matrix_key: job.matrix_key.clone(),
+                image: job.image.clone(),
+                command: job.command.clone(),
+                env: grant.env.clone(),
+                secret_handles: grant.secret_handles.clone(),
+                egress_allow: grant.egress_allow.clone(),
+                limits: grant.limits.clone(),
+                workspace: CiManifestWorkspaceV1 {
+                    repo_ref: repo_ref.clone(),
+                    commit_oid: commit_oid.clone(),
+                    read_only_root: true,
+                    tmpfs_scratch: true,
+                },
+                scheduling: grant.scheduling.clone(),
+                reserve_handle: grant.reserve_handle.clone(),
+                token_authority_handle: grant.token_authority_handle.clone(),
+                continue_on_error: false,
+            })
+        })
+        .collect()
+}
+
+fn build_drive_manifest_v1(
+    record: &CiRunRecord,
+    prepared: &PreparedRunPlanV2,
+    definition: &CiWorkflowDefinitionPin,
+    authority: &CiLaunchAuthorityV1,
+    jobs: Vec<GrantedCiJobV1>,
+    check_attempts: BTreeMap<String, u32>,
+) -> Result<CiDriveManifestV1, PgCiStarterError> {
+    let trust_tier = match record.trust_tier.as_str() {
+        "trusted" => CiManifestTrustTierV1::Trusted,
+        "untrusted_fork" => CiManifestTrustTierV1::UntrustedFork,
+        "self_hosted" => CiManifestTrustTierV1::SelfHosted,
+        token => {
+            return Err(PgCiStarterError::CorruptRun(format!(
+                "locked run carries unknown trust tier `{token}`"
+            )))
+        }
+    };
+    let repo_ref = record.repo_ref.clone().ok_or_else(|| {
+        PgCiStarterError::CorruptRun("locked run lacks repository provenance".into())
+    })?;
+    let commit_oid = record
+        .commit_oid
+        .clone()
+        .ok_or_else(|| PgCiStarterError::CorruptRun("locked run lacks commit provenance".into()))?;
+    let manifest = CiDriveManifestV1 {
+        schema_version: 1,
+        tenant_id: record.tenant_id.clone(),
+        region: record.region.clone(),
+        wf_run_id: record.wf_run_id.clone(),
+        ci_run_id: record.run_id.clone(),
+        source_snapshot_ref: ci_artifact_ref(
+            &record.tenant_id,
+            &format!("snapshot-{}", prepared.content_hash().to_multihash_string()),
+        )
+        .0,
+        source_plan_schema_version: RUN_PLAN_SCHEMA_V2,
+        launch_request_digest: prepared
+            .plan()
+            .launch_request_digest_v1()
+            .map_err(PgCiStarterError::Plan)?,
+        workflow_type: CI_PIPELINE_WF_TYPE.into(),
+        workflow_definition_version: definition.version(),
+        workflow_code_hash: definition.code_hash().into(),
+        authority_policy_revision: authority.policy_revision.clone(),
+        repo_ref,
+        commit_oid,
+        run_ref: ci_run_ref(&record.tenant_id, &record.run_id).0,
+        trust_tier,
+        check_attempts,
+        merge_waiter: authority.merge_waiter.clone(),
+        jobs,
+    };
+    manifest.validate().map_err(PgCiStarterError::Manifest)?;
+    Ok(manifest)
+}
+
+async fn allocate_check_attempts(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    record: &CiRunRecord,
+    contexts: &BTreeSet<String>,
+) -> Result<BTreeMap<String, u32>, PgCiStarterError> {
+    let repo_ref = record.repo_ref.as_deref().ok_or_else(|| {
+        PgCiStarterError::CorruptRun("locked run lacks repository provenance".into())
+    })?;
+    let commit_oid = record
+        .commit_oid
+        .as_deref()
+        .ok_or_else(|| PgCiStarterError::CorruptRun("locked run lacks commit provenance".into()))?;
+    let run_id = sqlx::types::Uuid::parse_str(&record.run_id).map_err(|error| {
+        PgCiStarterError::CorruptRun(format!("locked run id is not a UUID: {error}"))
+    })?;
+    let mut attempts = BTreeMap::new();
+    for context in contexts {
+        let attempt: i32 = sqlx::query_scalar(BUMP_CHECK_ATTEMPT_SQL)
+            .bind(&record.tenant_id)
+            .bind(&record.region)
+            .bind(repo_ref)
+            .bind(commit_oid)
+            .bind(context)
+            .bind(run_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(|error| {
+                PgCiStarterError::Database(format!("allocate check attempt: {error}"))
+            })?;
+        let attempt = u32::try_from(attempt).map_err(|_| {
+            PgCiStarterError::CorruptRun("check attempt is not a positive u32".into())
+        })?;
+        if attempt == 0 || attempts.insert(context.clone(), attempt).is_some() {
+            return Err(PgCiStarterError::CorruptRun(
+                "check attempt allocation returned zero or a duplicate context".into(),
+            ));
+        }
+    }
+    Ok(attempts)
+}
+
+#[cfg(test)]
 fn expected_ci_jobs_v1_with<F>(
     record: &CiRunRecord,
-    prepared: &PreparedRunPlan,
+    prepared: &crate::PreparedRunPlan,
     mut derive_id: F,
 ) -> Result<Vec<ExpectedCiJobV1>, PgCiStarterError>
 where
@@ -743,31 +1405,34 @@ where
     Ok(expected)
 }
 
-async fn materialize_ci_jobs_v1(
+async fn materialize_ci_jobs(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     record: &CiRunRecord,
-    prepared: &PreparedRunPlan,
+    expected: &[ExpectedCiJobV1],
+    manifest_ref: &str,
+    replay: bool,
 ) -> Result<(), PgCiStarterError> {
-    let expected = expected_ci_jobs_v1(record, prepared)?;
-    for job in &expected {
-        sqlx::query(
-            "INSERT INTO ci_job (tenant_id, region, job_id, run_id, stage, name, needs, \
-                                matrix_key, spec_ref, state, attempt, result_summary) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', 1, NULL) \
-             ON CONFLICT (tenant_id, job_id) DO NOTHING",
-        )
-        .bind(&job.tenant_id)
-        .bind(&job.region)
-        .bind(job.job_id)
-        .bind(job.run_id)
-        .bind(&job.stage)
-        .bind(&job.name)
-        .bind(&job.needs)
-        .bind(&job.matrix_key)
-        .bind(&job.spec_ref)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| PgCiStarterError::Database(format!("materialize ci_job: {error}")))?;
+    if !replay {
+        for job in expected {
+            sqlx::query(
+                "INSERT INTO ci_job (tenant_id, region, job_id, run_id, stage, name, needs, \
+                                    matrix_key, spec_ref, state, attempt, result_summary) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', 1, NULL) \
+                 ON CONFLICT (tenant_id, job_id) DO NOTHING",
+            )
+            .bind(&job.tenant_id)
+            .bind(&job.region)
+            .bind(job.job_id)
+            .bind(job.run_id)
+            .bind(&job.stage)
+            .bind(&job.name)
+            .bind(&job.needs)
+            .bind(&job.matrix_key)
+            .bind(manifest_ref)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|error| PgCiStarterError::Database(format!("materialize ci_job: {error}")))?;
+        }
     }
 
     let expected_ids = expected.iter().map(|job| job.job_id).collect::<Vec<_>>();
@@ -804,10 +1469,26 @@ async fn materialize_ci_jobs_v1(
     }
     for job in expected {
         match actual_by_id.get(&job.job_id) {
-            Some(actual) if actual == &job => {}
+            Some(actual)
+                if actual.tenant_id == job.tenant_id
+                    && actual.region == job.region
+                    && actual.job_id == job.job_id
+                    && actual.run_id == job.run_id
+                    && actual.stage == job.stage
+                    && actual.name == job.name
+                    && actual.needs == job.needs
+                    && actual.matrix_key == job.matrix_key
+                    && actual.spec_ref == job.spec_ref
+                    && if replay {
+                        actual.attempt > 0
+                    } else {
+                        actual.state == job.state
+                            && actual.attempt == job.attempt
+                            && actual.result_summary == job.result_summary
+                    } => {}
             Some(_) => {
                 return Err(PgCiStarterError::CorruptRun(format!(
-                    "durable ci_job `{}` diverges from locked version-1 run-plan authority",
+                    "durable ci_job `{}` diverges from immutable manifest authority",
                     job.job_id
                 )))
             }
@@ -1019,7 +1700,11 @@ async fn verify_started_workflow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ResolvedJobV1;
+    use crate::{
+        CiExecutionProfileV1, CiExecutionRequestV1, CiJobLaunchGrantV1, CiManifestLaneV1,
+        CiManifestLimitsV1, CiManifestSchedulingV1, ResolvedJobV1, ResolvedJobV2,
+        ResolvedRunPlanV2,
+    };
 
     const PINNED_IMAGE: &str =
         "registry.example/build@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1030,7 +1715,7 @@ mod tests {
 
     fn canonical_input() -> Vec<ArtifactRef> {
         vec![
-            ci_artifact_ref("acme", &format!("snapshot-blake3:{}", "a".repeat(64))),
+            ci_artifact_ref("acme", &format!("drive-manifest-blake3:{}", "a".repeat(64))),
             ci_run_ref("acme", "10000000-0000-0000-0000-000000000001"),
         ]
     }
@@ -1039,7 +1724,7 @@ mod tests {
         tenant_id: &str,
         run_id: &str,
         jobs: Vec<ResolvedJobV1>,
-    ) -> (CiRunRecord, PreparedRunPlan) {
+    ) -> (CiRunRecord, crate::PreparedRunPlan) {
         let tenant = TenantId(tenant_id.into());
         let plan = crate::ResolvedRunPlanV1 {
             schema_version: 1,
@@ -1067,7 +1752,8 @@ mod tests {
             state: "queued".into(),
             correlation_id: run_id.into(),
         };
-        let prepared = load_resolved_run_plan(&blobs, &record).expect("load prepared test plan");
+        let prepared =
+            crate::load_resolved_run_plan(&blobs, &record).expect("load prepared test plan");
         (record, prepared)
     }
 
@@ -1086,24 +1772,104 @@ mod tests {
         }
     }
 
+    fn prepared_plan_v2() -> (CiRunRecord, PreparedRunPlanV2) {
+        let tenant = tenant();
+        let plan = ResolvedRunPlanV2 {
+            schema_version: RUN_PLAN_SCHEMA_V2,
+            execution: CiExecutionRequestV1 {
+                schema_version: 1,
+                profile: CiExecutionProfileV1::LinuxSmallV1,
+            },
+            jobs: vec![
+                ResolvedJobV2 {
+                    stage: "build".into(),
+                    name: "build".into(),
+                    image: PINNED_IMAGE.into(),
+                    command: vec!["/bin/build".into()],
+                    needs: Vec::new(),
+                    is_generator: false,
+                    matrix_key: BTreeMap::new(),
+                },
+                ResolvedJobV2 {
+                    stage: "test".into(),
+                    name: "test".into(),
+                    image: PINNED_IMAGE.into(),
+                    command: vec!["/bin/test".into()],
+                    needs: vec!["build".into()],
+                    is_generator: false,
+                    matrix_key: BTreeMap::new(),
+                },
+            ],
+        };
+        let bytes = plan.canonical_bytes().expect("canonical V2 test plan");
+        let blobs = myelin_storage::FsBlobStore::new();
+        let hash = blobs.put(&tenant, &bytes).expect("store V2 test plan");
+        let record = CiRunRecord {
+            tenant_id: tenant.0,
+            run_id: "10000000-0000-0000-0000-000000000001".into(),
+            region: "fr-par".into(),
+            project_id: "22222222-2222-2222-2222-222222222222".into(),
+            pipeline_id: "33333333-3333-3333-3333-333333333333".into(),
+            wf_run_id: "20000000-0000-0000-0000-000000000001".into(),
+            repo_ref: Some("myelin://acme/git/repo/core".into()),
+            commit_oid: Some("deadbeef".into()),
+            cause_event_id: None,
+            definition_snapshot: format!(
+                "myelin://acme/ci/snapshot/{}",
+                hash.to_multihash_string()
+            ),
+            trigger_kind: "push".into(),
+            trust_tier: "trusted".into(),
+            state: "queued".into(),
+            correlation_id: "10000000-0000-0000-0000-000000000001".into(),
+        };
+        let prepared =
+            load_launch_run_plan_v2(&blobs, &record).expect("load prepared V2 test plan");
+        (record, prepared)
+    }
+
+    fn launch_grant(name: &str) -> CiJobLaunchGrantV1 {
+        CiJobLaunchGrantV1 {
+            concrete_name: name.into(),
+            env: BTreeMap::new(),
+            secret_handles: BTreeMap::new(),
+            egress_allow: Vec::new(),
+            limits: CiManifestLimitsV1 {
+                cpu_millis: 1_000,
+                mem_bytes: 1_073_741_824,
+                disk_bytes: 2_147_483_648,
+                pids_max: 128,
+                timeout_secs: 600,
+            },
+            scheduling: CiManifestSchedulingV1 {
+                lane: CiManifestLaneV1::Batch,
+                labels: vec!["linux".into()],
+                concurrency_group: None,
+                fair_key: "project:22222222-2222-2222-2222-222222222222".into(),
+            },
+            reserve_handle: "reserve:run".into(),
+            token_authority_handle: "mint:run".into(),
+        }
+    }
+
     #[test]
-    fn claimed_input_round_trips_exact_snapshot_tenant_and_run() {
+    fn claimed_input_round_trips_exact_manifest_tenant_and_run() {
         let input = canonical_input();
         let decoded = decode_ci_claimed_input(&tenant(), &input).expect("canonical claimed input");
         assert_eq!(decoded.tenant(), &tenant());
         assert_eq!(
-            decoded.snapshot().to_multihash_string(),
+            decoded.manifest_digest(),
             format!("blake3:{}", "a".repeat(64))
         );
-        assert_eq!(decoded.run_id(), "10000000-0000-0000-0000-000000000001");
+        assert_eq!(decoded.ci_run_id(), "10000000-0000-0000-0000-000000000001");
         assert_eq!(
             input,
             vec![
                 ci_artifact_ref(
                     "acme",
-                    &format!("snapshot-{}", decoded.snapshot().to_multihash_string())
+                    &format!("drive-manifest-{}", decoded.manifest_digest())
                 ),
-                ci_run_ref("acme", decoded.run_id())
+                ci_run_ref("acme", decoded.ci_run_id())
             ]
         );
     }
@@ -1115,11 +1881,14 @@ mod tests {
             vec![base[0].clone()],
             vec![base[1].clone(), base[0].clone()],
             vec![
-                ci_artifact_ref("acme", &format!("snapshot-sha256:{}", "a".repeat(64))),
+                ci_artifact_ref("acme", &format!("drive-manifest-sha256:{}", "a".repeat(64))),
                 base[1].clone(),
             ],
             vec![
-                ci_artifact_ref("other", &format!("snapshot-blake3:{}", "a".repeat(64))),
+                ci_artifact_ref(
+                    "other",
+                    &format!("drive-manifest-blake3:{}", "a".repeat(64)),
+                ),
                 base[1].clone(),
             ],
             vec![
@@ -1247,5 +2016,39 @@ mod tests {
             expected_ci_jobs_v1_with(&record, &prepared, |_, _, _, _| sqlx::types::Uuid::nil())
                 .expect_err("two nodes may not collapse to one truncated digest");
         assert!(error.to_string().contains("id collision"));
+    }
+
+    #[test]
+    fn v2_launch_authority_requires_exact_plan_order_and_cardinality() {
+        let (record, prepared) = prepared_plan_v2();
+        let expected = expected_ci_jobs_v2(&record, &prepared).unwrap();
+        for grants in [
+            vec![launch_grant("build")],
+            vec![
+                launch_grant("build"),
+                launch_grant("test"),
+                launch_grant("extra"),
+            ],
+        ] {
+            let authority = CiLaunchAuthorityV1 {
+                policy_revision: "policy-v1".into(),
+                jobs: grants,
+                merge_waiter: None,
+            };
+            assert!(granted_jobs_v2(&record, &prepared, &expected, &authority)
+                .expect_err("missing or extra authority job must fail closed")
+                .to_string()
+                .contains("exactly once"));
+        }
+
+        let reversed = CiLaunchAuthorityV1 {
+            policy_revision: "policy-v1".into(),
+            jobs: vec![launch_grant("test"), launch_grant("build")],
+            merge_waiter: None,
+        };
+        assert!(granted_jobs_v2(&record, &prepared, &expected, &reversed)
+            .expect_err("reordered authority jobs must fail closed")
+            .to_string()
+            .contains("strictly plan-ordered"));
     }
 }
