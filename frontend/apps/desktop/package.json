@@ -18,15 +18,15 @@
   "dependencies": {
     "@myelin/design-system": "workspace:*",
     "@tauri-apps/api": "^2",
-    "solid-js": "^1.9.4"
+    "solid-js": "^1.9.14"
   },
   "devDependencies": {
     "@solidjs/testing-library": "^0.8.10",
     "@tauri-apps/cli": "^2",
-    "@testing-library/jest-dom": "^6.6.3",
-    "jsdom": "^25.0.1",
-    "vite": "^6.4.3",
-    "vite-plugin-solid": "^2.11.0",
-    "vitest": "^3.2.6"
+    "@testing-library/jest-dom": "^7.0.0",
+    "jsdom": "^29.1.1",
+    "vite": "^8.1.5",
+    "vite-plugin-solid": "^2.11.13",
+    "vitest": "^4.1.10"
   }
 }
