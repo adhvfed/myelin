@@ -23,6 +23,7 @@ import {
   prJson,
   prChecksJson,
   prThreadsJson,
+  resetPrFixtures,
   prDiffJson,
   fileLinesJson,
   prCommitsEnvelope,
@@ -210,6 +211,7 @@ const server = createServer((req, res) => {
         if (typeof body.devLoginEnabled === "boolean") state.devLoginEnabled = body.devLoginEnabled;
         if (typeof body.tokenLoginEnabled === "boolean") state.tokenLoginEnabled = body.tokenLoginEnabled;
         if (typeof body.forceUnauthorized === "boolean") state.forceUnauthorized = body.forceUnauthorized;
+        if (body.resetPrFixtures === true) resetPrFixtures();
         if (body.resetIssues === true) resetIssues();
         if (typeof body.emptyIssues === "boolean") state.emptyIssues = body.emptyIssues;
         if (typeof body.onlyClosedIssues === "boolean") state.onlyClosedIssues = body.onlyClosedIssues;

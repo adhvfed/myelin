@@ -1,5 +1,16 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, request as pwRequest, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
+
+const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
+
+async function resetPrFixtures() {
+  const context = await pwRequest.newContext();
+  const response = await context.post(`${EDGE}/__test/config`, {
+    data: { resetPrFixtures: true },
+  });
+  expect(response.ok(), "dev-edge PR fixture reset must be accepted").toBeTruthy();
+  await context.dispose();
+}
 
 // R3.3 — the PR overview + context pane (G-6) + review verdicts (G-8) + checks panel (G-9), driven in
 // a real chromium against the dev-edge contract. Proves: the overview renders the pane + checks +
@@ -24,6 +35,8 @@ async function devLogin(page: Page) {
 
 test.describe("R3.3 PR overview + context pane — real browser", () => {
   test.use({ viewport: { width: 1440, height: 900 } });
+  test.beforeEach(resetPrFixtures);
+  test.afterEach(resetPrFixtures);
 
   test("the overview renders header, checks panel, blocked merge card, and the shell context pane", async ({ page }) => {
     await devLogin(page);
@@ -117,15 +130,19 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
     await page.waitForLoadState("networkidle");
 
     const box = page.getByLabel("New comment");
+    const matchingComments = page.getByTestId("discussion").getByText("One-shot comment.");
+    const baseline = await matchingComments.count();
     await box.fill("One-shot comment.");
-    await page.getByTestId("post-thread").click();
-    await expect(page.getByTestId("discussion").getByText("One-shot comment.")).toBeVisible();
+    const submit = page.getByTestId("post-thread");
+    await submit.click();
+    await expect(matchingComments).toHaveCount(baseline + 1);
 
     // The controlled composer is now empty (the signal cleared AND the DOM followed) — a stale DOM value
     // was the finding: a second click would duplicate-post. Empty field ⇒ the second post is a no-op.
     await expect(box).toHaveValue("");
-    await page.getByTestId("post-thread").click();
-    await expect(page.getByTestId("discussion").getByText("One-shot comment.")).toHaveCount(1);
+    await expect(submit).toBeDisabled();
+    await submit.evaluate((button) => button.click());
+    await expect(matchingComments).toHaveCount(baseline + 1);
   });
 
   test("a mergeable PR opens the merge ConfirmDialog (alertdialog, safe-action focus)", async ({ page }) => {

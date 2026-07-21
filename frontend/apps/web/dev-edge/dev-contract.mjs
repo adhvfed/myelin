@@ -565,6 +565,12 @@ function pagedDiff(cursor) {
 //    Keyed by `${repo}:${n}`; a fresh process starts empty (an honest "No discussion yet"). ──
 const THREADS = new Map();
 let threadSeq = 0;
+/** Reset only the mutable PR discussion/review fixtures. The dev edge exposes this through its
+ *  test-control route so Playwright retries and repeated local suites start from the same state. */
+export function resetPrFixtures() {
+  THREADS.clear();
+  threadSeq = 0;
+}
 function subjectKey(repo, n) {
   return `${repo}:${n}`;
 }
