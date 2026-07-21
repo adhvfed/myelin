@@ -513,8 +513,9 @@ impl CiDriveManifestStore {
     ) -> Result<Option<(CiDriveManifestV1, String)>, CiDriveManifestError> {
         validate_uuid("wf_run_id", wf_run_id)?;
         validate_uuid("ci_run_id", ci_run_id)?;
+        let tenant_id = self.tenant.0.as_str();
         let rows = sqlx::query(SELECT_COLLIDING_MANIFESTS)
-            .bind(&self.tenant.0)
+            .bind(tenant_id)
             .bind(&self.region.0)
             .bind(wf_run_id)
             .bind(ci_run_id)
@@ -551,8 +552,9 @@ impl CiDriveManifestStore {
         wf_run_id: &str,
     ) -> Result<Option<(CiDriveManifestV1, String)>, CiDriveManifestError> {
         validate_uuid("wf_run_id", wf_run_id)?;
+        let tenant_id = self.tenant.0.as_str();
         let row = sqlx::query(SELECT_EXPECTED_MANIFEST)
-            .bind(&self.tenant.0)
+            .bind(tenant_id)
             .bind(&self.region.0)
             .bind(wf_run_id)
             .fetch_optional(&mut *connection)
@@ -583,6 +585,7 @@ impl CiDriveManifestStore {
         validate_uuid("wf_run_id", wf_run_id)?;
         validate_uuid("ci_run_id", ci_run_id)?;
         validate_digest("manifest digest", expected_digest)?;
+        let tenant_id = self.tenant.0.as_str();
         let mut transaction = self
             .pool
             .begin()
@@ -590,7 +593,7 @@ impl CiDriveManifestStore {
             .map_err(|error| database("begin load", error))?;
         scope_connection(&mut transaction, &self.tenant, &self.region).await?;
         let row = sqlx::query(SELECT_EXPECTED_MANIFEST)
-            .bind(&self.tenant.0)
+            .bind(tenant_id)
             .bind(&self.region.0)
             .bind(wf_run_id)
             .fetch_optional(&mut *transaction)
@@ -690,6 +693,8 @@ async fn scope_connection(
         .execute(&mut *connection)
         .await
         .map_err(|error| database("scope tenant", error))?;
+    // @tenant-cross-scope: this sets the second half of the already tenant-scoped session context;
+    // PostgreSQL's region setting has no tenant column or second value to bind.
     sqlx::query("SELECT set_config('myelin.region', $1, true)")
         .bind(&region.0)
         .execute(&mut *connection)
