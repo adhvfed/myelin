@@ -53,8 +53,18 @@
 
 pub mod artifact_cache;
 pub mod check_emitter;
+/// Canonical, insert-only replay authority for a durable CI workflow. The manifest binds the exact
+/// DAG, per-context check attempts, workflow code identity, and server-granted launch templates;
+/// secret values and minted token JTIs are structurally absent.
+pub mod ci_drive_manifest;
 pub mod ci_pipeline;
 pub mod ci_result_signal;
+pub use ci_drive_manifest::{
+    CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1, CiManifestLaneV1,
+    CiManifestLimitsV1, CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1,
+    CiMergeWaiterV1, GrantedCiJobV1, CI_DRIVE_MANIFEST_DIGEST_V1_DOMAIN,
+    CI_DRIVE_MANIFEST_SCHEMA_V1, MAX_CI_DRIVE_MANIFEST_BYTES,
+};
 /// CT-004d.2 chunk 4 — the durable `ci_run` writer ([`ci_run_store::CiRunStore`]): the CI
 /// run-of-record. The `ci-dispatch.trigger` consumer's reserve bundle must persist a durable `ci_run`
 /// row (`state = queued`), but the production reserve store only staged a NOTE — the row was written
