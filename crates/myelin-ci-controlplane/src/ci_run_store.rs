@@ -46,8 +46,11 @@
 //! scheduler/runner (chunk 5). The `ci_run` row it writes carries the PRE-MINTED `wf_run_id` those
 //! chunks start the workflow with.
 
-use myelin_storage::{with_tenant_tx, with_tenant_tx_error, PgError};
+use std::collections::{BTreeMap, BTreeSet};
+
+use myelin_storage::{with_tenant_tx, with_tenant_tx_error, PgError, TenantScope};
 use sqlx::postgres::PgPool;
+use sqlx::types::Uuid;
 use sqlx::Row;
 
 /// **The `ci_run` row a reserve/start bundle persists (all the `CREATE_CI_RUN_DDL` columns the writer
@@ -211,6 +214,83 @@ SELECT
   correlation_id          AS correlation_id
 FROM ci_run WHERE tenant_id = $1 AND run_id = $2::uuid";
 
+/// Lock the run-of-record before its one-way terminal transition. The completion timestamp is
+/// compared in PostgreSQL's timestamp domain so an exact replay is independent of text rendering.
+pub const LOCK_CI_RUN_FOR_FINALIZE_QUERY: &str = "\
+SELECT state, cost_settled,
+       finished_at IS NOT DISTINCT FROM $5::timestamptz AS finished_at_matches
+FROM ci_run
+WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND wf_run_id = $4::uuid
+FOR UPDATE";
+
+/// Read every immutable accounting receipt bound to the exact CI/workflow run pair. The finalizer
+/// compares this set with the manifest's complete job set before certifying `cost_settled=true`.
+pub const SELECT_CI_RUN_ACCOUNTING_QUERY: &str = "\
+SELECT job_id::text AS job_id, reserve_handle, passed, timed_out
+FROM ci_job_accounting
+WHERE tenant_id = $1 AND region = $2 AND ci_run_id = $3::uuid AND wf_run_id = $4::uuid
+ORDER BY job_id
+FOR SHARE";
+
+/// The sole live terminal transition. It is intentionally a compare-and-set from the fully started
+/// shape; queued, already-mutated, and partially-terminal rows are refused rather than repaired.
+pub const FINALIZE_CI_RUN_QUERY: &str = "\
+UPDATE ci_run
+SET state = $5, cost_settled = true, finished_at = $6::timestamptz
+WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND wf_run_id = $4::uuid
+  AND state = 'running' AND cost_settled = false AND finished_at IS NULL
+RETURNING run_id";
+
+/// One manifest job whose exact reservation must have an immutable terminal-accounting receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiRunFinalizationJob {
+    /// Manifest job UUID.
+    pub job_id: String,
+    /// Exact Storage reservation authority granted to this job.
+    pub reserve_handle: String,
+}
+
+/// The terminal lifecycle state derived from the complete immutable receipt set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiRunTerminalState {
+    Succeeded,
+    Failed,
+    TimedOut,
+}
+
+impl CiRunTerminalState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// Exact inputs to the one-way `ci_run` finalization gate. `completed_at` must be the workflow's
+/// journaled clock value, never a fresh database/application clock read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiRunFinalization {
+    /// CI run-of-record UUID.
+    pub run_id: String,
+    /// Flow workflow-run UUID bound by the immutable manifest.
+    pub wf_run_id: String,
+    /// State expected from the complete immutable verdict set.
+    pub terminal_state: CiRunTerminalState,
+    /// Journaled `WfCtx::now()` value used for the durable completion timestamp.
+    pub completed_at: String,
+    /// Complete manifest job/reservation set.
+    pub jobs: Vec<CiRunFinalizationJob>,
+}
+
+/// Whether the durable terminal transition was newly applied or exactly replayed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiRunFinalizationWrite {
+    Finalized,
+    ExactReplay,
+}
+
 /// A durable `ci_run`-store failure. Loud + typed — a write/read NEVER silently drops or coerces. Safe
 /// to log: carries only structural faults and immutable field names, never replay values.
 ///
@@ -241,6 +321,18 @@ pub enum CiRunStoreError {
     /// that re-opens the at-most-once #7 bug), so the handler returns `Retry` and the redelivery
     /// re-runs on a real co-commit tx.
     NoCoCommitTx,
+    /// Finalization input is structurally invalid (UUID, timestamp, empty/duplicate job authority).
+    InvalidFinalization(&'static str),
+    /// No run exists under the exact verified tenant/region/CI-run/workflow-run identity.
+    FinalizationRunNotFound,
+    /// The manifest job set and immutable accounting receipt set are not an exact match.
+    IncompleteTerminalAccounting,
+    /// A receipt exists for every job, but a job/reservation binding differs from the manifest.
+    TerminalAccountingDivergence,
+    /// The requested terminal state disagrees with the verdicts in the complete receipt set.
+    TerminalVerdictDivergence,
+    /// The run exists but is neither the canonical running shape nor an exact terminal replay.
+    FinalizationStateDivergence,
 }
 
 impl core::fmt::Display for CiRunStoreError {
@@ -268,6 +360,29 @@ impl core::fmt::Display for CiRunStoreError {
                 "durable ci_run co-commit refused: the HandlerTx carried no co-commit connection \
                  (a durable handler fails closed rather than write the run-of-record outside the \
                  dedup mark's transaction — the #7 at-most-once floor)"
+            ),
+            CiRunStoreError::InvalidFinalization(field) => {
+                write!(f, "durable ci_run finalization refused an invalid {field}")
+            }
+            CiRunStoreError::FinalizationRunNotFound => write!(
+                f,
+                "durable ci_run finalization could not find the exact scoped run identity"
+            ),
+            CiRunStoreError::IncompleteTerminalAccounting => write!(
+                f,
+                "durable ci_run finalization requires one accounting receipt per manifest job"
+            ),
+            CiRunStoreError::TerminalAccountingDivergence => write!(
+                f,
+                "durable ci_run finalization found divergent job accounting authority"
+            ),
+            CiRunStoreError::TerminalVerdictDivergence => write!(
+                f,
+                "durable ci_run terminal state disagrees with immutable job verdicts"
+            ),
+            CiRunStoreError::FinalizationStateDivergence => write!(
+                f,
+                "durable ci_run finalization collided with the stored lifecycle state"
             ),
         }
     }
@@ -407,6 +522,138 @@ impl CiRunStore {
             correlation_id: r.get("correlation_id"),
         }))
     }
+
+    /// Finalize one run only after the manifest's complete job set has exact immutable accounting.
+    /// The receipt verification and lifecycle compare-and-set share one tenant-scoped transaction.
+    /// Exact replay is accepted only when state, settlement bit, and journaled completion time match.
+    pub async fn finalize_ci_run(
+        &self,
+        scope: &TenantScope,
+        finalization: &CiRunFinalization,
+    ) -> Result<CiRunFinalizationWrite, CiRunStoreError> {
+        validate_finalization(finalization)?;
+        let tenant = scope.tenant().as_str().to_owned();
+        let region = scope.region().as_str().to_owned();
+        let scope = scope.clone();
+        let finalization = finalization.clone();
+        with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
+            Box::pin(async move { finalize_on_conn(conn, &scope, &finalization).await })
+        })
+        .await
+    }
+}
+
+async fn finalize_on_conn(
+    conn: &mut sqlx::PgConnection,
+    scope: &TenantScope,
+    finalization: &CiRunFinalization,
+) -> Result<CiRunFinalizationWrite, CiRunStoreError> {
+    let locked = sqlx::query(LOCK_CI_RUN_FOR_FINALIZE_QUERY)
+        .bind(scope.tenant().as_str())
+        .bind(scope.region().as_str())
+        .bind(&finalization.run_id)
+        .bind(&finalization.wf_run_id)
+        .bind(&finalization.completed_at)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|_| CiRunStoreError::Db("ci_run finalization lock".into()))?
+        .ok_or(CiRunStoreError::FinalizationRunNotFound)?;
+
+    let rows = sqlx::query(SELECT_CI_RUN_ACCOUNTING_QUERY)
+        .bind(scope.tenant().as_str())
+        .bind(scope.region().as_str())
+        .bind(&finalization.run_id)
+        .bind(&finalization.wf_run_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|_| CiRunStoreError::Db("ci_run accounting verification".into()))?;
+    if rows.len() != finalization.jobs.len() {
+        return Err(CiRunStoreError::IncompleteTerminalAccounting);
+    }
+
+    let expected: BTreeMap<&str, &str> = finalization
+        .jobs
+        .iter()
+        .map(|job| (job.job_id.as_str(), job.reserve_handle.as_str()))
+        .collect();
+    let mut all_passed = true;
+    let mut any_timed_out = false;
+    for row in &rows {
+        let job_id: String = row.get("job_id");
+        let reserve_handle: String = row.get("reserve_handle");
+        if expected.get(job_id.as_str()).copied() != Some(reserve_handle.as_str()) {
+            return Err(CiRunStoreError::TerminalAccountingDivergence);
+        }
+        all_passed &= row.get::<bool, _>("passed");
+        any_timed_out |= row.get::<bool, _>("timed_out");
+    }
+    let derived = if any_timed_out {
+        CiRunTerminalState::TimedOut
+    } else if all_passed {
+        CiRunTerminalState::Succeeded
+    } else {
+        CiRunTerminalState::Failed
+    };
+    if derived != finalization.terminal_state {
+        return Err(CiRunStoreError::TerminalVerdictDivergence);
+    }
+
+    let state: String = locked.get("state");
+    let cost_settled: bool = locked.get("cost_settled");
+    let finished_at_matches: bool = locked.get("finished_at_matches");
+    if state == finalization.terminal_state.as_str() && cost_settled && finished_at_matches {
+        return Ok(CiRunFinalizationWrite::ExactReplay);
+    }
+    if state != "running" || cost_settled || finished_at_matches {
+        return Err(CiRunStoreError::FinalizationStateDivergence);
+    }
+
+    let updated = sqlx::query(FINALIZE_CI_RUN_QUERY)
+        .bind(scope.tenant().as_str())
+        .bind(scope.region().as_str())
+        .bind(&finalization.run_id)
+        .bind(&finalization.wf_run_id)
+        .bind(finalization.terminal_state.as_str())
+        .bind(&finalization.completed_at)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|_| CiRunStoreError::Db("ci_run terminal transition".into()))?;
+    if updated.is_none() {
+        return Err(CiRunStoreError::FinalizationStateDivergence);
+    }
+    Ok(CiRunFinalizationWrite::Finalized)
+}
+
+fn validate_finalization(finalization: &CiRunFinalization) -> Result<(), CiRunStoreError> {
+    Uuid::parse_str(&finalization.run_id)
+        .map_err(|_| CiRunStoreError::InvalidFinalization("CI run id"))?;
+    Uuid::parse_str(&finalization.wf_run_id)
+        .map_err(|_| CiRunStoreError::InvalidFinalization("workflow run id"))?;
+    if finalization.completed_at.is_empty() || finalization.completed_at.len() > 64 {
+        return Err(CiRunStoreError::InvalidFinalization(
+            "journaled completion timestamp",
+        ));
+    }
+    if finalization.jobs.is_empty() || finalization.jobs.len() > 1_024 {
+        return Err(CiRunStoreError::InvalidFinalization("manifest job set"));
+    }
+    let mut job_ids = BTreeSet::new();
+    let mut reserve_handles = BTreeSet::new();
+    for job in &finalization.jobs {
+        Uuid::parse_str(&job.job_id).map_err(|_| CiRunStoreError::InvalidFinalization("job id"))?;
+        if job.reserve_handle.is_empty() || job.reserve_handle.len() > 512 {
+            return Err(CiRunStoreError::InvalidFinalization("reserve handle"));
+        }
+        if !job_ids.insert(job.job_id.as_str()) {
+            return Err(CiRunStoreError::InvalidFinalization("duplicate job id"));
+        }
+        if !reserve_handles.insert(job.reserve_handle.as_str()) {
+            return Err(CiRunStoreError::InvalidFinalization(
+                "duplicate reserve handle",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The ONE `ci_run` INSERT execution — bound identically whether it runs on the co-commit connection or
@@ -547,6 +794,19 @@ mod tests {
         }
     }
 
+    fn sample_finalization() -> CiRunFinalization {
+        CiRunFinalization {
+            run_id: "11111111-1111-1111-1111-111111111111".into(),
+            wf_run_id: "44444444-4444-4444-4444-444444444444".into(),
+            terminal_state: CiRunTerminalState::Succeeded,
+            completed_at: "2026-07-21T13:00:00Z".into(),
+            jobs: vec![CiRunFinalizationJob {
+                job_id: "55555555-5555-5555-5555-555555555555".into(),
+                reserve_handle: "reserve:job-1".into(),
+            }],
+        }
+    }
+
     /// The INSERT binds all 17 columns + is idempotent on the `(tenant_id, run_id)` PK (the DB-free
     /// shape assertions; the live round-trip + co-commit atomicity are the integration proofs).
     #[test]
@@ -633,6 +893,57 @@ mod tests {
         assert_eq!(
             validate_initial_state(&r),
             Err(CiRunStoreError::InvalidCausalDepth)
+        );
+    }
+
+    #[test]
+    fn finalization_queries_lock_identity_verify_complete_receipts_and_cas_running() {
+        for query in [
+            LOCK_CI_RUN_FOR_FINALIZE_QUERY,
+            SELECT_CI_RUN_ACCOUNTING_QUERY,
+            FINALIZE_CI_RUN_QUERY,
+        ] {
+            for predicate in [
+                "tenant_id = $1",
+                "region = $2",
+                "run_id = $3::uuid",
+                "wf_run_id = $4::uuid",
+            ] {
+                assert!(query.contains(predicate), "query must bind {predicate}");
+            }
+        }
+        assert!(LOCK_CI_RUN_FOR_FINALIZE_QUERY.contains("FOR UPDATE"));
+        assert!(SELECT_CI_RUN_ACCOUNTING_QUERY.contains("FOR SHARE"));
+        for guard in [
+            "state = 'running'",
+            "cost_settled = false",
+            "finished_at IS NULL",
+        ] {
+            assert!(FINALIZE_CI_RUN_QUERY.contains(guard));
+        }
+        assert!(FINALIZE_CI_RUN_QUERY.contains("cost_settled = true"));
+        assert!(FINALIZE_CI_RUN_QUERY.contains("finished_at = $6::timestamptz"));
+    }
+
+    #[test]
+    fn finalization_rejects_duplicate_job_or_reservation_authority_before_sql() {
+        let mut duplicate_job = sample_finalization();
+        duplicate_job.jobs.push(duplicate_job.jobs[0].clone());
+        assert_eq!(
+            validate_finalization(&duplicate_job),
+            Err(CiRunStoreError::InvalidFinalization("duplicate job id"))
+        );
+
+        let mut duplicate_reserve = sample_finalization();
+        duplicate_reserve.jobs.push(CiRunFinalizationJob {
+            job_id: "66666666-6666-6666-6666-666666666666".into(),
+            reserve_handle: duplicate_reserve.jobs[0].reserve_handle.clone(),
+        });
+        assert_eq!(
+            validate_finalization(&duplicate_reserve),
+            Err(CiRunStoreError::InvalidFinalization(
+                "duplicate reserve handle"
+            ))
         );
     }
 }

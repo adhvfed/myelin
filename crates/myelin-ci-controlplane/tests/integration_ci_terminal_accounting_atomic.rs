@@ -8,7 +8,8 @@ use myelin_ci_controlplane::{
     ci_run_store_factory, CiDriveManifestStore, CiDriveManifestV1, CiJobAccountingPricer,
     CiJobAccountingStore, CiJobPricingError, CiManifestLaneV1, CiManifestLimitsV1,
     CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, CiPipelineReporter,
-    CiRunInsert, DurableCiJobAccounting, GrantedCiJobV1, PricedCiJobUsage,
+    CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationWrite, CiRunInsert, CiRunStoreError,
+    CiRunTerminalState, DurableCiJobAccounting, GrantedCiJobV1, PricedCiJobUsage,
 };
 use myelin_ci_sandbox::{
     CompletionClaim, EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
@@ -245,7 +246,8 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     let idem = "terminal-accounting-live";
     let owner = "runner-live";
 
-    ci_run_store_factory(pool.clone())
+    let ci_runs = ci_run_store_factory(pool.clone());
+    ci_runs
         .insert_ci_run(&CiRunInsert {
             tenant_id: tenant.0.clone(),
             region: region.0.clone(),
@@ -265,6 +267,12 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
             commit_oid: Some("deadbeef".into()),
             triggered_by: None,
         })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ci_run SET state = 'running' WHERE tenant_id = $1 AND run_id = $2::uuid")
+        .bind(&tenant.0)
+        .bind(ci_run)
+        .execute(&pool)
         .await
         .unwrap();
     let manifest_store =
@@ -388,6 +396,25 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
         },
         result_refs: Vec::new(),
     };
+    let finalization = CiRunFinalization {
+        run_id: ci_run.into(),
+        wf_run_id: wf_run.into(),
+        terminal_state: CiRunTerminalState::Succeeded,
+        completed_at: "2026-07-21T13:00:00Z".into(),
+        jobs: vec![CiRunFinalizationJob {
+            job_id: job.into(),
+            reserve_handle: "reserve:accounting-live".into(),
+        }],
+    };
+
+    assert_eq!(
+        ci_runs
+            .finalize_ci_run(&scope, &finalization)
+            .await
+            .unwrap_err(),
+        CiRunStoreError::IncompleteTerminalAccounting,
+        "the run cannot become terminal before its immutable accounting receipt exists"
+    );
 
     assert!(reporter(false).report_done(&claim, &report).is_err());
     assert_eq!(
@@ -441,6 +468,40 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
     .await
     .unwrap();
     assert_eq!(storage_events, 2);
+
+    assert_eq!(
+        ci_runs
+            .finalize_ci_run(&scope, &finalization)
+            .await
+            .unwrap(),
+        CiRunFinalizationWrite::Finalized
+    );
+    let run_terminal: (String, bool, bool) = sqlx::query_as(
+        "SELECT state, cost_settled, finished_at = $2::timestamptz
+         FROM ci_run WHERE run_id = $1::uuid",
+    )
+    .bind(ci_run)
+    .bind(&finalization.completed_at)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(run_terminal, ("succeeded".into(), true, true));
+    assert_eq!(
+        ci_runs
+            .finalize_ci_run(&scope, &finalization)
+            .await
+            .unwrap(),
+        CiRunFinalizationWrite::ExactReplay
+    );
+    let mut divergent_finalization = finalization.clone();
+    divergent_finalization.completed_at = "2026-07-21T13:00:01Z".into();
+    assert_eq!(
+        ci_runs
+            .finalize_ci_run(&scope, &divergent_finalization)
+            .await
+            .unwrap_err(),
+        CiRunStoreError::FinalizationStateDivergence
+    );
 
     assert!(
         matches!(
