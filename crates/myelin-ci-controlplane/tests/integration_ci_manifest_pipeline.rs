@@ -5,23 +5,25 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use myelin_ci_controlplane::{
-    ci_controlplane_hot_tables, ci_controlplane_migrations, drive_resolved_ci_manifest_pipeline,
-    register_ci_manifest_pipeline, CiExecutionProfileV1, CiExecutionRequestV1,
-    CiJobLaunchGrantV1, CiLaunchAuthorityError, CiLaunchAuthorityMaterializer,
-    CiLaunchAuthorityV1, CiManifestInputResolver, CiManifestLaneV1, CiManifestLimitsV1,
-    CiManifestSchedulingV1, CiWorkflowDefinitionPin, PgCiPipelineStarter, PreparedRunPlanV2,
-    ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
+    ci_controlplane_hot_tables, ci_controlplane_migrations, decode_resolved_ci_manifest,
+    register_durable_ci_manifest_pipeline, run_ci_manifest_pipeline, CiExecutionProfileV1,
+    CiExecutionRequestV1, CiJobLaunchGrantV1, CiJobSpecStore, CiJobTokenIssueError,
+    CiJobTokenIssuer, CiJobTokenRequest, CiLaunchAuthorityError, CiLaunchAuthorityMaterializer,
+    CiLaunchAuthorityV1, CiManifestDurableJobRunner, CiManifestInputResolver, CiManifestLaneV1,
+    CiManifestLimitsV1, CiManifestSchedulingV1, CiWorkflowDefinitionPin, PgCiPipelineStarter,
+    PreparedRunPlanV2, ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
 };
+use myelin_ci_sandbox::{RunTokenRef, TrustTier};
 use myelin_config::MyelinConfig;
 use myelin_events::{Actor, IdMinter, MonotonicMinter};
 use myelin_flow::{
-    migrations::migrations as flow_migrations, partition_for_run_id, DurableExecutor, JobRunner,
-    JobSpec, PgClaimedDriveInput, PgFlowExecutor, PgFlowWorker,
-    PgInputResolveError, PgResolvedDriveInput, PgRunOnceOutcome, PgWorkerError, PgWorkerScope,
-    PgWorkflowInputResolver, RunId, SignalPayload, TypedSignalSpec, CI_PIPELINE_WF_TYPE,
+    migrations::migrations as flow_migrations, partition_for_run_id, DurableExecutor,
+    PgClaimedDriveInput, PgFlowExecutor, PgFlowWorker, PgInputResolveError, PgResolvedDriveInput,
+    PgRunOnceOutcome, PgWorkerError, PgWorkerScope, PgWorkflowInputResolver, RunId, SignalPayload,
+    TypedSignalSpec, CI_PIPELINE_WF_TYPE,
 };
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_storage::{
@@ -109,9 +111,7 @@ impl CiLaunchAuthorityMaterializer for TestAuthority {
         prepared: &'a PreparedRunPlanV2,
         _definition: &'a CiWorkflowDefinitionPin,
     ) -> Pin<
-        Box<
-            dyn Future<Output = Result<CiLaunchAuthorityV1, CiLaunchAuthorityError>> + Send + 'a,
-        >,
+        Box<dyn Future<Output = Result<CiLaunchAuthorityV1, CiLaunchAuthorityError>> + Send + 'a>,
     > {
         Box::pin(async move {
             Ok(CiLaunchAuthorityV1 {
@@ -148,27 +148,24 @@ impl CiLaunchAuthorityMaterializer for TestAuthority {
     }
 }
 
-#[derive(Default)]
-struct RecordingRunner {
-    specs: Mutex<Vec<JobSpec>>,
-}
+struct TestTokenIssuer;
 
-impl JobRunner for RecordingRunner {
-    fn dispatch(&self, spec: &JobSpec) -> Result<(), myelin_flow::ActivityError> {
-        self.specs
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(spec.clone());
-        Ok(())
-    }
-}
-
-impl RecordingRunner {
-    fn specs(&self) -> Vec<JobSpec> {
-        self.specs
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
+impl CiJobTokenIssuer for TestTokenIssuer {
+    fn mint(
+        &self,
+        request: CiJobTokenRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<RunTokenRef, CiJobTokenIssueError>> + Send + '_>> {
+        Box::pin(async move {
+            assert_eq!(request.tenant_id, TENANT);
+            assert_eq!(request.region, REGION);
+            assert_eq!(request.wf_run_id, WF_RUN_ID);
+            assert_eq!(request.ci_run_id, CI_RUN_ID);
+            assert_eq!(request.token_authority_handle, format!("mint:{CI_RUN_ID}"));
+            assert!(request.idem_token.starts_with(&format!("{WF_RUN_ID}/")));
+            Ok(RunTokenRef {
+                jti: format!("test-jti:{}", request.job_id),
+            })
+        })
     }
 }
 
@@ -260,6 +257,17 @@ fn signal(pool: &PgPool, token: &str, name: &str, received_order: usize) {
     .unwrap_or_else(|error| panic!("deliver completion {received_order}: {error:?}"));
 }
 
+async fn future_drive_clock(pool: &PgPool) -> (i64, String) {
+    sqlx::query_as(
+        "SELECT extract(epoch FROM instant)::bigint, \
+                to_char(instant AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+         FROM (SELECT clock_timestamp() + interval '60 seconds' AS instant) clock",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
     let schema = format!("ci_manifest_dag_{}", std::process::id());
@@ -308,9 +316,7 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
 
     let blobs = Arc::new(FsBlobStore::new());
     let plan_bytes = plan().canonical_bytes().unwrap();
-    let snapshot = blobs
-        .put(&TenantId(TENANT.into()), &plan_bytes)
-        .unwrap();
+    let snapshot = blobs.put(&TenantId(TENANT.into()), &plan_bytes).unwrap();
     sqlx::query(
         "INSERT INTO ci_run (tenant_id, region, run_id, project_id, pipeline_id, wf_run_id, \
          repo_ref, commit_oid, cause_event_id, cause_depth, caused_by, definition_snapshot, \
@@ -347,13 +353,16 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
         StartQueuedOutcome::Started { .. }
     ));
 
-    let runner = Arc::new(RecordingRunner::default());
+    let durable_store = CiJobSpecStore::with_pg(pool.clone());
+    let token_issuer: Arc<dyn CiJobTokenIssuer> = Arc::new(TestTokenIssuer);
     let mut first = worker(&pool, "worker-retry");
     let flaky = RetryOnceResolver {
         inner: resolver(&pool),
         attempts: Arc::new(AtomicUsize::new(0)),
     };
-    let body_runner = Arc::clone(&runner);
+    let retry_store = durable_store.clone();
+    let retry_issuer = Arc::clone(&token_issuer);
+    let retry_rt = tokio::runtime::Handle::current();
     first
         .register_definition_with_input_resolver(
             CI_PIPELINE_WF_TYPE,
@@ -361,14 +370,22 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
             BODY_HASH,
             flaky,
             move |input: &PgResolvedDriveInput, ctx| {
-                drive_resolved_ci_manifest_pipeline(input, ctx, body_runner.as_ref())
+                let manifest = decode_resolved_ci_manifest(input)?;
+                let runner = CiManifestDurableJobRunner::new(
+                    Arc::new(manifest.clone()),
+                    retry_store.clone(),
+                    Arc::clone(&retry_issuer),
+                    retry_rt.clone(),
+                )?;
+                run_ci_manifest_pipeline(ctx, &manifest, &runner)
+                    .map_err(|error| format!("manifest CI workflow failed: {error:?}"))?;
+                Ok(vec![myelin_refs::ArtifactRef(manifest.run_ref)])
             },
         )
         .unwrap();
+    let (first_now, first_iso) = future_drive_clock(&pool).await;
     assert!(matches!(
-        first
-            .run_once(1_784_667_600, "2026-07-21T21:00:00Z")
-            .await,
+        first.run_once(first_now, &first_iso).await,
         Err(PgWorkerError::InputUnavailable(ref detail))
             if detail == "injected manifest-store outage"
     ));
@@ -387,12 +404,17 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
     drop(first);
 
     let mut roots_worker = worker(&pool, "worker-roots");
-    register_ci_manifest_pipeline(&mut roots_worker, resolver(&pool), Arc::clone(&runner)).unwrap();
+    register_durable_ci_manifest_pipeline(
+        &mut roots_worker,
+        resolver(&pool),
+        durable_store.clone(),
+        Arc::clone(&token_issuer),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let (roots_now, roots_iso) = future_drive_clock(&pool).await;
     assert!(matches!(
-        roots_worker
-            .run_once(1_784_667_601, "2026-07-21T21:00:01Z")
-            .await
-            .unwrap(),
+        roots_worker.run_once(roots_now, &roots_iso).await.unwrap(),
         PgRunOnceOutcome::Driven { .. }
     ));
     let ids: BTreeMap<String, String> = sqlx::query_as::<_, (String, String)>(
@@ -405,57 +427,125 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
     .unwrap()
     .into_iter()
     .collect();
-    let root_specs = runner.specs();
-    assert_eq!(root_specs.len(), 2);
+    let root_dispatches =
+        sqlx::query_as::<_, (String, String, String, String, Vec<String>, String, String)>(
+            "SELECT stage, job_id::text, idem_token, lane, labels, trust_tier, fair_key \
+         FROM job_queue \
+         WHERE tenant_id=$1 AND region=$2 ORDER BY stage",
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(root_dispatches.len(), 2);
     assert_eq!(
-        root_specs
+        root_dispatches
             .iter()
-            .map(|spec| spec.target.clone())
+            .map(|(_, job_id, ..)| job_id.clone())
             .collect::<std::collections::BTreeSet<_>>(),
         [ids["build"].clone(), ids["test"].clone()]
             .into_iter()
             .collect()
     );
-    let by_target = root_specs
+    for (_, _, _, lane, labels, trust_tier, fair_key) in &root_dispatches {
+        assert_eq!(lane, "batch");
+        assert_eq!(labels, &["linux"]);
+        assert_eq!(trust_tier, "trusted");
+        assert_eq!(fair_key, "project:43000000-0000-8000-8000-000000000001");
+    }
+    let by_stage = root_dispatches
         .into_iter()
-        .map(|spec| (spec.target.clone(), spec))
+        .map(|(stage, job_id, idem_token, ..)| (stage, (job_id, idem_token)))
         .collect::<BTreeMap<_, _>>();
-    signal(&pool, &by_target[&ids["test"]].idem_token, "test", 1);
-    signal(&pool, &by_target[&ids["build"]].idem_token, "build", 2);
+    assert_eq!(by_stage["build"].0, ids["build"]);
+    assert_eq!(by_stage["test"].0, ids["test"]);
+    for stage in ["build", "test"] {
+        let (job_id, idem_token) = &by_stage[stage];
+        let spec = durable_store
+            .get_spec(TENANT, REGION, job_id)
+            .await
+            .unwrap();
+        assert_eq!(spec.idem_token.0, *idem_token);
+        assert_eq!(spec.trust_tier, TrustTier::Trusted);
+        assert_eq!(spec.run_token.jti, format!("test-jti:{job_id}"));
+        assert_ne!(spec.run_token.jti, format!("mint:{CI_RUN_ID}"));
+        assert_eq!(spec.meter_to.reserve_id, format!("reserve:{CI_RUN_ID}"));
+        assert_eq!(
+            spec.workspace.repo_ref.as_deref(),
+            Some("myelin://manifest_dag/git/repo/core")
+        );
+        assert_eq!(spec.workspace.commit.as_deref(), Some("deadbeef"));
+        assert!(spec.env.is_empty());
+        assert!(spec.secret_refs.is_empty());
+        assert!(spec.egress.allow.is_empty());
+        assert_eq!(spec.limits.cpu_millis, 1_000);
+        assert_eq!(spec.limits.mem_bytes, 1_073_741_824);
+        assert_eq!(spec.limits.disk_bytes, 2_147_483_648);
+        assert_eq!(spec.limits.pids_max, 128);
+        assert_eq!(spec.limits.timeout_secs, 600);
+    }
+    signal(&pool, &by_stage["test"].1, "test", 1);
+    signal(&pool, &by_stage["build"].1, "build", 2);
     drop(roots_worker);
 
     let mut dependent_worker = worker(&pool, "worker-dependent");
-    register_ci_manifest_pipeline(
+    register_durable_ci_manifest_pipeline(
         &mut dependent_worker,
         resolver(&pool),
-        Arc::clone(&runner),
+        durable_store.clone(),
+        Arc::clone(&token_issuer),
+        tokio::runtime::Handle::current(),
     )
     .unwrap();
+    let (dependent_now, dependent_iso) = future_drive_clock(&pool).await;
     dependent_worker
-        .run_once(1_784_667_602, "2026-07-21T21:00:02Z")
+        .run_once(dependent_now, &dependent_iso)
         .await
         .unwrap();
-    let all_specs = runner.specs();
-    assert_eq!(all_specs.len(), 3);
-    let package = all_specs
-        .iter()
-        .find(|spec| spec.target == ids["package"])
-        .unwrap();
-    signal(&pool, &package.idem_token, "package", 3);
+    let package: (String, String) = sqlx::query_as(
+        "SELECT job_id::text, idem_token FROM job_queue \
+         WHERE tenant_id=$1 AND region=$2 AND stage='package'",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(package.0, ids["package"]);
+    assert_eq!(
+        durable_store
+            .get_spec(TENANT, REGION, &package.0)
+            .await
+            .unwrap()
+            .command,
+        vec!["/bin/package"]
+    );
+    signal(&pool, &package.1, "package", 3);
     drop(dependent_worker);
 
     let mut terminal_worker = worker(&pool, "worker-terminal");
-    register_ci_manifest_pipeline(
+    register_durable_ci_manifest_pipeline(
         &mut terminal_worker,
         resolver(&pool),
-        Arc::clone(&runner),
+        durable_store.clone(),
+        Arc::clone(&token_issuer),
+        tokio::runtime::Handle::current(),
     )
     .unwrap();
+    let (terminal_now, terminal_iso) = future_drive_clock(&pool).await;
     terminal_worker
-        .run_once(1_784_667_603, "2026-07-21T21:00:03Z")
+        .run_once(terminal_now, &terminal_iso)
         .await
         .unwrap();
-    assert_eq!(runner.specs().len(), 3, "reconstruction never redispatches");
+    let dispatch_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM job_queue WHERE tenant_id=$1 AND region=$2")
+            .bind(TENANT)
+            .bind(REGION)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(dispatch_count, 3, "reconstruction never redispatches");
 
     let workflow_state: String = sqlx::query_scalar(
         "SELECT state FROM workflow_run WHERE tenant_id=$1 AND region=$2 AND run_id=$3",

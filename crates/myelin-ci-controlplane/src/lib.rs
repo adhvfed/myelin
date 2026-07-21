@@ -59,6 +59,8 @@ pub mod check_emitter;
 pub mod ci_drive_manifest;
 /// Production manifest resolver and DAG-native durable `ci.pipeline` body.
 pub mod ci_manifest_pipeline;
+/// Exact manifest job identity, sandbox translation, and explicit token authority.
+pub mod ci_manifest_job_runner;
 pub mod ci_pipeline;
 pub mod ci_result_signal;
 pub use ci_drive_manifest::{
@@ -69,8 +71,12 @@ pub use ci_drive_manifest::{
     MAX_CI_DRIVE_MANIFEST_BYTES,
 };
 pub use ci_manifest_pipeline::{
-    drive_resolved_ci_manifest_pipeline, register_ci_manifest_pipeline, run_ci_manifest_pipeline,
-    CiManifestInputResolver, CiManifestPipelineOutcome,
+    decode_resolved_ci_manifest, drive_resolved_ci_manifest_pipeline, register_ci_manifest_pipeline,
+    run_ci_manifest_pipeline, CiManifestInputResolver, CiManifestPipelineOutcome,
+};
+pub use ci_manifest_job_runner::{
+    register_durable_ci_manifest_pipeline, CiJobTokenIssueError, CiJobTokenIssuer,
+    CiJobTokenRequest, CiManifestDurableJobRunner,
 };
 /// CT-004d.2 chunk 4 — the durable `ci_run` writer ([`ci_run_store::CiRunStore`]): the CI
 /// run-of-record. The `ci-dispatch.trigger` consumer's reserve bundle must persist a durable `ci_run`
@@ -81,8 +87,8 @@ pub use ci_manifest_pipeline::{
 /// through the outbox (the honest #7 H1 split). Constructed at the composition root by
 /// [`ci_run_store_factory`]; the `ci_run` table it writes is created by the shared
 /// [`ci_durable_migrations`] both CI mains apply at boot. Manifest-backed registration now lives in
-/// [`register_ci_manifest_pipeline`]; production activation remains gated on its authority/runner
-/// adapters and poller.
+/// [`register_durable_ci_manifest_pipeline`]; production activation remains gated on its real policy
+/// and token-authority adapters, settle bookend, and poller.
 pub mod ci_run_store;
 pub mod ci_scheduler_db;
 /// CT-004a (CI backend reconcile-and-harden — the FOUNDATION chunk): the REAL durable `cost_event`
@@ -155,7 +161,8 @@ pub mod job_queue_store;
 /// tenant-scoped tx on the shared `idem_token`, feeding the claim-gating `trust_tier` FROM the spec
 /// (never widened). Constructed at the composition root by [`ci_job_spec_store`]; the real resolver is
 /// [`runner_bind::durable_spec_resolver`]. The manifest-native body is registered separately through
-/// [`register_ci_manifest_pipeline`]; the exact-job manifest runner and live settle bookend remain
+/// [`register_durable_ci_manifest_pipeline`]; it preserves the manifest job UUID and exact sandbox /
+/// scheduling terms. The live settle bookend and production token-authority composition remain
 /// activation floors.
 pub mod job_spec_store;
 /// Versioned, tenant-bound loader for the immutable CI execution plan stored in the definition

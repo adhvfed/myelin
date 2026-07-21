@@ -1,0 +1,319 @@
+//! Exact manifest-job translation into the durable scheduler and sandbox.
+//!
+//! The workflow dispatch target is the manifest's immutable job UUID. This adapter preserves that
+//! UUID through `job_queue` and `ci_job_spec`, mints a short-lived run token through an explicit
+//! authority adapter, and translates every executable/scheduling field from the validated manifest.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use myelin_ci_sandbox::{
+    EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind as SandboxJobKind,
+    JobSpec as SandboxJobSpec, MeterTarget, ResourceLimits, RunTokenRef, SecretRef,
+    TrustTier as SandboxTrustTier, WorkspaceSpec,
+};
+use myelin_flow::{
+    ActivityError, JobKind, JobRunner, JobSpec as FlowJobSpec, PgFlowWorker, PgResolvedDriveInput,
+    PgWorkerError,
+};
+
+use crate::ci_drive_manifest::{
+    CiDriveManifestV1, CiManifestLaneV1, CiManifestTrustTierV1, GrantedCiJobV1,
+};
+use crate::ci_manifest_pipeline::{
+    decode_resolved_ci_manifest, run_ci_manifest_pipeline, CiManifestInputResolver,
+};
+use crate::job_queue_store::DurableEnqueue;
+use crate::job_spec_store::CiJobSpecStore;
+use crate::scheduler::Lane;
+use crate::CI_PIPELINE_WF_TYPE;
+
+/// Owned, retry-stable authority request for one exact manifest job dispatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiJobTokenRequest {
+    pub tenant_id: String,
+    pub region: String,
+    pub wf_run_id: String,
+    pub ci_run_id: String,
+    pub job_id: String,
+    pub token_authority_handle: String,
+    pub idem_token: String,
+}
+
+/// A token authority refusal. The detail must be structural and safe to journal as an activity
+/// failure; token material is never returned through this error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiJobTokenIssueError(pub String);
+
+impl std::fmt::Display for CiJobTokenIssueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CI job token mint refused: {}", self.0)
+    }
+}
+
+impl std::error::Error for CiJobTokenIssueError {}
+
+/// Explicit short-lived token mint. Implementations must be retry-safe for the complete request:
+/// repeated calls after an uncertain dispatch must resolve the same active JTI, because the durable
+/// replay check rejects any spec drift. There is no permissive default.
+pub trait CiJobTokenIssuer: Send + Sync {
+    fn mint(
+        &self,
+        request: CiJobTokenRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<RunTokenRef, CiJobTokenIssueError>> + Send + '_>>;
+}
+
+/// Per-run durable adapter. The validated manifest is the sole source of executable and scheduling
+/// authority; the Flow spec contributes only the engine-minted idempotency token and exact job UUID
+/// target.
+pub struct CiManifestDurableJobRunner {
+    manifest: Arc<CiDriveManifestV1>,
+    store: CiJobSpecStore,
+    token_issuer: Arc<dyn CiJobTokenIssuer>,
+    rt: tokio::runtime::Handle,
+}
+
+impl CiManifestDurableJobRunner {
+    pub fn new(
+        manifest: Arc<CiDriveManifestV1>,
+        store: CiJobSpecStore,
+        token_issuer: Arc<dyn CiJobTokenIssuer>,
+        rt: tokio::runtime::Handle,
+    ) -> Result<Self, String> {
+        manifest.validate().map_err(|error| error.to_string())?;
+        Ok(Self {
+            manifest,
+            store,
+            token_issuer,
+            rt,
+        })
+    }
+
+    fn manifest_job<'a>(&'a self, flow: &FlowJobSpec) -> Result<&'a GrantedCiJobV1, ActivityError> {
+        if flow.kind != JobKind::Ci {
+            return Err(ActivityError(
+                "manifest CI runner refused a non-CI job".into(),
+            ));
+        }
+        if !flow
+            .idem_token
+            .strip_prefix(&self.manifest.wf_run_id)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return Err(ActivityError(
+                "manifest CI runner refused an idempotency token from another workflow run".into(),
+            ));
+        }
+        self.manifest
+            .jobs
+            .iter()
+            .find(|job| job.job_id == flow.target)
+            .ok_or_else(|| {
+                ActivityError(
+                    "manifest CI runner refused a dispatch target absent from the immutable manifest"
+                        .into(),
+                )
+            })
+    }
+}
+
+impl JobRunner for CiManifestDurableJobRunner {
+    fn dispatch(&self, flow: &FlowJobSpec) -> Result<(), ActivityError> {
+        let job = self.manifest_job(flow)?;
+        let request = CiJobTokenRequest {
+            tenant_id: self.manifest.tenant_id.clone(),
+            region: self.manifest.region.clone(),
+            wf_run_id: self.manifest.wf_run_id.clone(),
+            ci_run_id: self.manifest.ci_run_id.clone(),
+            job_id: job.job_id.clone(),
+            token_authority_handle: job.token_authority_handle.clone(),
+            idem_token: flow.idem_token.clone(),
+        };
+        let run_token = bridge(&self.rt, self.token_issuer.mint(request))
+            .map_err(|error| ActivityError(error.to_string()))?;
+        validate_run_token(&run_token, &job.token_authority_handle)?;
+        let (enqueue, spec) = manifest_dispatch_parts(&self.manifest, job, flow, run_token)?;
+        bridge(
+            &self.rt,
+            self.store.co_persist_dispatch(&enqueue, &spec, &job.name),
+        )
+        .map_err(|error| ActivityError(format!("durable manifest dispatch refused: {error}")))?;
+        Ok(())
+    }
+}
+
+/// Register the strict resolver, manifest-native DAG, exact durable runner, and explicit token
+/// authority as one production definition.
+pub fn register_durable_ci_manifest_pipeline(
+    worker: &mut PgFlowWorker,
+    resolver: CiManifestInputResolver,
+    store: CiJobSpecStore,
+    token_issuer: Arc<dyn CiJobTokenIssuer>,
+    rt: tokio::runtime::Handle,
+) -> Result<(), PgWorkerError> {
+    let version = resolver.definition().version();
+    let code_hash = resolver.definition().code_hash().to_owned();
+    worker.register_definition_with_input_resolver(
+        CI_PIPELINE_WF_TYPE,
+        version,
+        &code_hash,
+        resolver,
+        move |input: &PgResolvedDriveInput, ctx| {
+            let manifest = decode_resolved_ci_manifest(input)?;
+            let runner = CiManifestDurableJobRunner::new(
+                Arc::new(manifest.clone()),
+                store.clone(),
+                Arc::clone(&token_issuer),
+                rt.clone(),
+            )?;
+            run_ci_manifest_pipeline(ctx, &manifest, &runner)
+                .map_err(|error| format!("manifest CI workflow failed: {error:?}"))?;
+            Ok(vec![myelin_refs::ArtifactRef(manifest.run_ref)])
+        },
+    )
+}
+
+fn bridge<F: Future>(rt: &tokio::runtime::Handle, future: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tokio::task::block_in_place(|| rt.block_on(future)),
+        Err(_) => rt.block_on(future),
+    }
+}
+
+fn manifest_dispatch_parts(
+    manifest: &CiDriveManifestV1,
+    job: &GrantedCiJobV1,
+    flow: &FlowJobSpec,
+    run_token: RunTokenRef,
+) -> Result<(DurableEnqueue, SandboxJobSpec), ActivityError> {
+    let trust_tier = sandbox_trust(manifest.trust_tier);
+    let spec = SandboxJobSpec::new(
+        SandboxJobKind::Ci,
+        ImageRef::pinned(job.image.clone()).map_err(|error| ActivityError(error.to_string()))?,
+        job.command.clone(),
+        job.env
+            .iter()
+            .map(|(name, value)| EnvVar {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+        job.secret_handles
+            .iter()
+            .map(|(name, handle)| SecretRef {
+                name: name.clone(),
+                handle: handle.clone(),
+            })
+            .collect(),
+        EgressPolicy {
+            allow: job.egress_allow.clone(),
+        },
+        ResourceLimits {
+            cpu_millis: job.limits.cpu_millis,
+            mem_bytes: job.limits.mem_bytes,
+            disk_bytes: job.limits.disk_bytes,
+            pids_max: job.limits.pids_max,
+            timeout_secs: job.limits.timeout_secs,
+        },
+        WorkspaceSpec {
+            repo_ref: Some(job.workspace.repo_ref.clone()),
+            commit: Some(job.workspace.commit_oid.clone()),
+        },
+        trust_tier,
+        run_token,
+        MeterTarget {
+            reserve_id: job.reserve_handle.clone(),
+        },
+        IdemToken(flow.idem_token.clone()),
+    )
+    .map_err(|error| ActivityError(error.to_string()))?;
+    let enqueue = DurableEnqueue {
+        tenant_id: manifest.tenant_id.clone(),
+        region: manifest.region.clone(),
+        job_id: job.job_id.clone(),
+        run_id: manifest.wf_run_id.clone(),
+        lane: manifest_lane(job.scheduling.lane),
+        labels: job.scheduling.labels.clone(),
+        trust_tier,
+        concurrency_group: job.scheduling.concurrency_group.clone(),
+        fair_key: job.scheduling.fair_key.clone(),
+        idem_token: flow.idem_token.clone(),
+        stage: job.name.clone(),
+    };
+    Ok((enqueue, spec))
+}
+
+fn sandbox_trust(trust: CiManifestTrustTierV1) -> SandboxTrustTier {
+    match trust {
+        CiManifestTrustTierV1::Trusted => SandboxTrustTier::Trusted,
+        CiManifestTrustTierV1::UntrustedFork => SandboxTrustTier::UntrustedFork,
+        CiManifestTrustTierV1::SelfHosted => SandboxTrustTier::SelfHosted,
+    }
+}
+
+fn manifest_lane(lane: CiManifestLaneV1) -> Lane {
+    match lane {
+        CiManifestLaneV1::Interactive => Lane::Interactive,
+        CiManifestLaneV1::Batch => Lane::Batch,
+        CiManifestLaneV1::Deploy => Lane::Deploy,
+    }
+}
+
+fn validate_run_token(
+    token: &RunTokenRef,
+    token_authority_handle: &str,
+) -> Result<(), ActivityError> {
+    if token.jti.trim().is_empty() || token.jti.len() > 512 || token.jti == token_authority_handle {
+        return Err(ActivityError(
+            "CI token issuer returned an invalid JTI or copied the authority handle".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_every_manifest_lane_and_trust_tier_exactly() {
+        assert_eq!(
+            manifest_lane(CiManifestLaneV1::Interactive),
+            Lane::Interactive
+        );
+        assert_eq!(manifest_lane(CiManifestLaneV1::Batch), Lane::Batch);
+        assert_eq!(manifest_lane(CiManifestLaneV1::Deploy), Lane::Deploy);
+        assert_eq!(
+            sandbox_trust(CiManifestTrustTierV1::Trusted),
+            SandboxTrustTier::Trusted
+        );
+        assert_eq!(
+            sandbox_trust(CiManifestTrustTierV1::UntrustedFork),
+            SandboxTrustTier::UntrustedFork
+        );
+        assert_eq!(
+            sandbox_trust(CiManifestTrustTierV1::SelfHosted),
+            SandboxTrustTier::SelfHosted
+        );
+    }
+
+    #[test]
+    fn token_jti_must_be_bounded_nonempty_and_distinct_from_authority_handle() {
+        assert!(validate_run_token(
+            &RunTokenRef {
+                jti: "jti:1".into()
+            },
+            "mint:1"
+        )
+        .is_ok());
+        for jti in [
+            String::new(),
+            "   ".into(),
+            "mint:1".into(),
+            "x".repeat(513),
+        ] {
+            assert!(validate_run_token(&RunTokenRef { jti }, "mint:1").is_err());
+        }
+    }
+}
