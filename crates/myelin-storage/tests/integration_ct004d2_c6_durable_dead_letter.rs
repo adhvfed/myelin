@@ -381,7 +381,15 @@ async fn db_unreachable_record_falls_back_never_silently_drops() {
         envelope: envelope_with_pii(&id),
     };
     let out = tokio::task::block_in_place(|| consumer.deliver(&msg));
-    assert!(matches!(out, Delivered::DeadLettered(_)), "still dead-lettered");
+    assert!(
+        matches!(out, Delivered::Retried(_)),
+        "a poison is non-terminal until its durable quarantine row commits"
+    );
+    assert_eq!(
+        consumer.lag(),
+        1,
+        "the broker-visible work remains pending while durable quarantine is unavailable"
+    );
 
     // The poison is NOT silently dropped — it fell back to the in-process surface (loud log emitted).
     let surfaced = consumer.dead_letters();
