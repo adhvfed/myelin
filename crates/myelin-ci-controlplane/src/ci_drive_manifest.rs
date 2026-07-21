@@ -538,6 +538,38 @@ impl CiDriveManifestStore {
         Ok(Some((manifest, digest)))
     }
 
+    /// Resolve the immutable launch authority from the workflow-run id on a caller-owned
+    /// transaction. Terminal accounting uses this to bind the Flow run to its CI run-of-record and
+    /// to verify the dispatched job's reservation handle against the original server grant.
+    pub async fn load_by_wf_run_on_conn(
+        &self,
+        connection: &mut PgConnection,
+        wf_run_id: &str,
+    ) -> Result<Option<(CiDriveManifestV1, String)>, CiDriveManifestError> {
+        validate_uuid("wf_run_id", wf_run_id)?;
+        let row = sqlx::query(SELECT_EXPECTED_MANIFEST)
+            .bind(&self.tenant.0)
+            .bind(&self.region.0)
+            .bind(wf_run_id)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(|error| database("load workflow authority", error))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let bytes: Vec<u8> = row.get("manifest_bytes");
+        let digest: String = row.get("manifest_digest");
+        let manifest = CiDriveManifestV1::decode_canonical(&bytes)?;
+        verify_row(&row, &manifest, &bytes, &digest)?;
+        if manifest.tenant_id != self.tenant.0
+            || manifest.region != self.region.0
+            || manifest.wf_run_id != wf_run_id
+        {
+            return Err(CiDriveManifestError::IdentityMismatch);
+        }
+        Ok(Some((manifest, digest)))
+    }
+
     pub async fn load_expected(
         &self,
         wf_run_id: &str,

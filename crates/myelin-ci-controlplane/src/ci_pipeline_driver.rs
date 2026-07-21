@@ -20,8 +20,10 @@
 //!   sandbox spec — so `co_persist_dispatch`'s `enq.trust_tier == spec.trust_tier` gate holds by
 //!   construction and an `untrusted_fork` stage can NEVER be enqueued behind a widened `trusted` gate.
 //! - **Claim-bound completion — [`CiPipelineReporter`]:** verifies and consumes the exact live queue
-//!   claim and inserts the typed `job.done` signal in one PostgreSQL transaction. A production
-//!   [`myelin_flow::PgFlowWorker`] wakes from and consumes that durable signal directly.
+//!   claim, settles Storage money truth, writes CI's cost projection and immutable accounting
+//!   receipt, and inserts the typed `job.done` signal in one PostgreSQL transaction. A production
+//!   [`myelin_flow::PgFlowWorker`] wakes from and consumes that durable signal directly. Exact
+//!   redelivery reads the stored pricing outcome; historical work is never repriced.
 //!
 //! ## The verdict-vocabulary bridge (why a bespoke reporter, not `EngineTerminalReporter`)
 //! The real sandbox runner ([`myelin_ci_sandbox::RunnerAgent::run_one`]) DERIVES `passed` from the guest
@@ -62,7 +64,10 @@ use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxSto
 #[cfg(any(test, feature = "test-support"))]
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
-use myelin_storage::{with_tenant_tx_error, PgError};
+use myelin_storage::{
+    with_tenant_tx_error, DurableCostLedger, DurableSettleError, MeteredUnit, MinorUnits, PgError,
+    RunId as CostRunId, TenantScope,
+};
 #[cfg(any(test, feature = "test-support"))]
 use myelin_tenancy::Region;
 use myelin_tenancy::TenantId;
@@ -78,11 +83,16 @@ use myelin_flow::{
     TimerStore, WfCtx, WfJournal, WorkflowBody, CI_PIPELINE_WF_TYPE, PARTITION_COUNT,
 };
 
+use crate::ci_drive_manifest::CiDriveManifestStore;
 use crate::ci_pipeline::PipelineStage;
 #[cfg(any(test, feature = "test-support"))]
 use crate::ci_pipeline::{run_ci_pipeline_body, PipelineRun, RunVerdict};
 #[cfg(any(test, feature = "test-support"))]
 use crate::ci_run_store::CiRunRecord;
+use crate::cost_store::{CiCostEventStore, CiCostStoreError};
+use crate::job_accounting_store::{
+    CiJobAccountingError, CiJobAccountingRecord, CiJobAccountingStore,
+};
 #[cfg(any(test, feature = "test-support"))]
 use crate::job_queue_store::{trust_from_token, JobQueueStoreError};
 use crate::job_queue_store::{
@@ -91,6 +101,7 @@ use crate::job_queue_store::{
 use crate::job_spec_store::{
     CiJobSpecStore, CiJobSpecStoreError, ClaimedDispatchIdentity, MAX_JOB_TIMEOUT_SECS,
 };
+use crate::metering::{CostEventRow, CostKind, Meter};
 use crate::schedule_and_run_job::JobScheduleTerms;
 #[cfg(any(test, feature = "test-support"))]
 use crate::scheduler::Lane;
@@ -429,10 +440,136 @@ fn completion_receipt(input: CompletionReceiptInput<'_>) -> String {
     format!("v3:{}", hasher.finalize().to_hex())
 }
 
+/// Immutable-pricing output for the two raw resource dimensions a sandbox reports. There is no
+/// built-in or permissive production price: an adapter must name the pricing revision and provide
+/// the wholesale/markup split for both CPU and memory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PricedCiJobUsage {
+    pub pricing_revision: String,
+    pub memory_gb_seconds: u64,
+    pub cpu_wholesale: MinorUnits,
+    pub cpu_markup: MinorUnits,
+    pub memory_wholesale: MinorUnits,
+    pub memory_markup: MinorUnits,
+}
+
+/// A fail-closed pricing refusal. Values and authority handles are deliberately absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiJobPricingError {
+    Unavailable,
+    InvalidOutput,
+}
+
+impl core::fmt::Display for CiJobPricingError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("CI job pricing authority is unavailable"),
+            Self::InvalidOutput => f.write_str("CI job pricing authority returned invalid output"),
+        }
+    }
+}
+
+impl std::error::Error for CiJobPricingError {}
+
+/// Commercial-owned immutable pricing lookup. Implementations must resolve the revision current at
+/// completion; the resulting revision and split amounts are persisted so replay never reprices.
+pub trait CiJobAccountingPricer: Send + Sync {
+    fn price(&self, usage: ResourceUsage) -> Result<PricedCiJobUsage, CiJobPricingError>;
+}
+
+/// All durable authorities required by the production terminal reporter. Constructing an accounted
+/// reporter is impossible without the money ledger, CI projection, immutable receipt store,
+/// canonical manifest authority, verified tenant scope, and an explicit pricing adapter.
+#[derive(Clone)]
+pub struct DurableCiJobAccounting {
+    scope: TenantScope,
+    manifest_store: CiDriveManifestStore,
+    money_ledger: DurableCostLedger,
+    cost_store: CiCostEventStore,
+    receipt_store: CiJobAccountingStore,
+    pricer: Arc<dyn CiJobAccountingPricer>,
+}
+
+impl DurableCiJobAccounting {
+    pub fn new(
+        scope: TenantScope,
+        manifest_store: CiDriveManifestStore,
+        money_ledger: DurableCostLedger,
+        cost_store: CiCostEventStore,
+        receipt_store: CiJobAccountingStore,
+        pricer: Arc<dyn CiJobAccountingPricer>,
+    ) -> Self {
+        Self {
+            scope,
+            manifest_store,
+            money_ledger,
+            cost_store,
+            receipt_store,
+            pricer,
+        }
+    }
+}
+
+fn priced_cost_rows(
+    tenant: &TenantId,
+    ci_run_id: &str,
+    job_id: &str,
+    usage: ResourceUsage,
+    priced: &PricedCiJobUsage,
+) -> Result<Vec<CostEventRow>, CiJobPricingError> {
+    if priced.pricing_revision.is_empty() || priced.pricing_revision.len() > 512 {
+        return Err(CiJobPricingError::InvalidOutput);
+    }
+    Ok(vec![
+        CostEventRow {
+            tenant: tenant.clone(),
+            run_id: ci_run_id.to_owned(),
+            job_id: job_id.to_owned(),
+            meter: Meter::CpuSeconds,
+            amount: usage.cpu_seconds,
+            wholesale: priced.cpu_wholesale,
+            markup: priced.cpu_markup,
+            kind: CostKind::Ci,
+        },
+        CostEventRow {
+            tenant: tenant.clone(),
+            run_id: ci_run_id.to_owned(),
+            job_id: job_id.to_owned(),
+            meter: Meter::MemGbSeconds,
+            amount: priced.memory_gb_seconds,
+            wholesale: priced.memory_wholesale,
+            markup: priced.memory_markup,
+            kind: CostKind::Ci,
+        },
+    ])
+}
+
+#[derive(Clone)]
+enum ReporterAccounting {
+    Durable(Arc<DurableCiJobAccounting>),
+    #[cfg(any(test, feature = "test-support"))]
+    TestBypass,
+}
+
+struct TerminalAccountingInput<'a> {
+    tenant: &'a TenantId,
+    wf_run: &'a RunId,
+    job_id: &'a str,
+    reserve_handle: &'a str,
+    report: &'a TerminalReport,
+    receipt: &'a str,
+    replay: bool,
+}
+
 #[derive(Debug)]
 enum CompletionTxError {
     Scope(PgError),
     Spec(CiJobSpecStoreError),
+    Manifest,
+    Pricing(CiJobPricingError),
+    Money(DurableSettleError),
+    Projection(CiCostStoreError),
+    Accounting(CiJobAccountingError),
     Signal(ExecutorError),
     Refused,
 }
@@ -441,6 +578,109 @@ impl From<PgError> for CompletionTxError {
     fn from(error: PgError) -> Self {
         Self::Scope(error)
     }
+}
+
+async fn co_commit_terminal_accounting(
+    conn: &mut sqlx::PgConnection,
+    accounting: &DurableCiJobAccounting,
+    input: TerminalAccountingInput<'_>,
+) -> Result<(), CompletionTxError> {
+    let (manifest, _) = accounting
+        .manifest_store
+        .load_by_wf_run_on_conn(conn, &input.wf_run.0)
+        .await
+        .map_err(|_| CompletionTxError::Manifest)?
+        .ok_or(CompletionTxError::Refused)?;
+    let granted_job = manifest
+        .jobs
+        .iter()
+        .find(|job| job.job_id == input.job_id)
+        .ok_or(CompletionTxError::Refused)?;
+    if granted_job.reserve_handle != input.reserve_handle {
+        return Err(CompletionTxError::Refused);
+    }
+
+    if input.replay {
+        let existing = accounting
+            .receipt_store
+            .load_in_tx(conn, &accounting.scope, input.job_id)
+            .await
+            .map_err(CompletionTxError::Accounting)?
+            .ok_or(CompletionTxError::Refused)?;
+        let exact = existing.tenant == *input.tenant
+            && existing.job_id == input.job_id
+            && existing.wf_run_id == input.wf_run.0
+            && existing.ci_run_id == manifest.ci_run_id
+            && existing.reserve_handle == input.reserve_handle
+            && existing.passed == input.report.passed
+            && existing.timed_out == input.report.timed_out
+            && existing.usage == input.report.usage
+            && existing.completion_receipt == input.receipt;
+        return if exact {
+            Ok(())
+        } else {
+            Err(CompletionTxError::Refused)
+        };
+    }
+
+    let priced = accounting
+        .pricer
+        .price(input.report.usage)
+        .map_err(CompletionTxError::Pricing)?;
+    let rows = priced_cost_rows(
+        input.tenant,
+        &manifest.ci_run_id,
+        input.job_id,
+        input.report.usage,
+        &priced,
+    )
+    .map_err(CompletionTxError::Pricing)?;
+    let units: Vec<MeteredUnit> = rows
+        .iter()
+        .map(|row| MeteredUnit {
+            unit: row.meter.token(),
+            wholesale: row.wholesale,
+            markup: row.markup,
+        })
+        .collect();
+    let settled = accounting
+        .money_ledger
+        .settle_in_tx(
+            conn,
+            input.tenant,
+            &CostRunId(input.reserve_handle.to_owned()),
+            &units,
+        )
+        .await
+        .map_err(CompletionTxError::Money)?;
+    accounting
+        .cost_store
+        .settle_in_tx(conn, &accounting.scope, &rows)
+        .await
+        .map_err(CompletionTxError::Projection)?;
+    accounting
+        .receipt_store
+        .record_in_tx(
+            conn,
+            &accounting.scope,
+            &CiJobAccountingRecord {
+                tenant: input.tenant.clone(),
+                job_id: input.job_id.to_owned(),
+                wf_run_id: input.wf_run.0.clone(),
+                ci_run_id: manifest.ci_run_id,
+                reserve_handle: input.reserve_handle.to_owned(),
+                passed: input.report.passed,
+                timed_out: input.report.timed_out,
+                usage: input.report.usage,
+                pricing_revision: priced.pricing_revision,
+                billed: settled.billed_total,
+                refunded: settled.refunded,
+                completion_receipt: input.receipt.to_owned(),
+            },
+        )
+        .await
+        .map_err(CompletionTxError::Accounting)?;
+    Ok(())
 }
 
 /// **The [`TerminalReporter`] that VERIFIES durable claimed-job identity before signalling a verdict
@@ -456,9 +696,11 @@ impl From<PgError> for CompletionTxError {
 /// 2. **Resolves the stage DURABLY.** The verdict-attribution stage name comes from the `ci_job_spec.stage`
 ///    column (persisted at dispatch) — a restart-safe read, never an in-memory map. So a fresh reporter
 ///    over the same PG resolves the verdict exactly.
-/// 3. **Consumes + signals in one transaction.** The queue CAS binds the fresh nonce, durable stage,
-///    and a receipt over every canonical completion field; [`PgFlowExecutor::signal_typed_on_conn`]
-///    buffers the typed `job.done` before that same transaction commits. A late completion returns
+/// 3. **Accounts, consumes, and signals in one transaction.** The queue CAS binds the fresh nonce,
+///    durable stage, and a receipt over every canonical completion field. The same transaction
+///    settles Storage's reservation, writes CI's per-meter projection and immutable receipt, and then
+///    [`PgFlowExecutor::signal_typed_on_conn`] buffers `job.done`. Exact replay reuses the persisted
+///    pricing revision instead of repricing. A late completion returns
 ///    [`SignalOutcome::TerminalNoOp`] (an acknowledged no-op), so the runner settles its lease instead
 ///    of retrying forever.
 #[derive(Clone)]
@@ -469,6 +711,7 @@ pub struct CiPipelineReporter {
     rt: tokio::runtime::Handle,
     tenant: TenantId,
     region: String,
+    accounting: ReporterAccounting,
     /// Compatibility-only mirror for the historical in-memory culmination harness. This field and
     /// all code that touches it are absent from normal production builds.
     #[cfg(any(test, feature = "test-support"))]
@@ -476,10 +719,33 @@ pub struct CiPipelineReporter {
 }
 
 impl CiPipelineReporter {
-    /// Build the PostgreSQL-only reporter. The durable [`CiJobSpecStore`] verifies claimed-job
-    /// identity and resolves the stage, while the
-    /// [`CiJobQueueStore`] the completion claim is atomically consumed against, the runtime handle the
-    /// async durable reads bridge onto, and the cell `(tenant, region)` scope.
+    /// Build the production reporter with all terminal-accounting authorities present. There is no
+    /// default pricer and no production constructor that bypasses the atomic accounting co-commit.
+    pub fn new_accounted(
+        pg_executor: PgFlowExecutor,
+        spec_store: CiJobSpecStore,
+        queue_store: CiJobQueueStore,
+        rt: tokio::runtime::Handle,
+        accounting: DurableCiJobAccounting,
+    ) -> CiPipelineReporter {
+        let tenant = accounting.scope.tenant().clone();
+        let region = accounting.scope.region().as_str().to_owned();
+        CiPipelineReporter {
+            pg_executor,
+            spec_store,
+            queue_store,
+            rt,
+            tenant,
+            region,
+            accounting: ReporterAccounting::Durable(Arc::new(accounting)),
+            #[cfg(any(test, feature = "test-support"))]
+            test_executor: None,
+        }
+    }
+
+    /// Compatibility constructor for historical test fixtures. It does not exist in a production
+    /// build, so a composition root cannot accidentally activate a reporter without accounting.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(
         pg_executor: PgFlowExecutor,
         spec_store: CiJobSpecStore,
@@ -495,6 +761,7 @@ impl CiPipelineReporter {
             rt,
             tenant,
             region: region.into(),
+            accounting: ReporterAccounting::TestBypass,
             #[cfg(any(test, feature = "test-support"))]
             test_executor: None,
         }
@@ -558,6 +825,7 @@ impl TerminalReporter for CiPipelineReporter {
         let report_owned = report.clone();
         let spec_store = self.spec_store.clone();
         let pg_executor = self.pg_executor.clone();
+        let accounting = self.accounting.clone();
 
         let durable = bridge(
             &self.rt,
@@ -576,6 +844,10 @@ impl TerminalReporter for CiPipelineReporter {
                             )
                             .await
                             .map_err(CompletionTxError::Spec)?;
+                        let reserve_handle = identity
+                            .as_ref()
+                            .map(|identity| identity.reserve_handle.clone())
+                            .ok_or(CompletionTxError::Refused)?;
                         let stage = verify_claimed_identity(
                             &TenantId(tenant_owned.clone()),
                             &TenantId(tenant_owned.clone()),
@@ -616,6 +888,26 @@ impl TerminalReporter for CiPipelineReporter {
                         if claim == ClaimConsumeOutcome::Refused {
                             return Err(CompletionTxError::Refused);
                         }
+                        match &accounting {
+                            ReporterAccounting::Durable(accounting) => {
+                                co_commit_terminal_accounting(
+                                    conn,
+                                    accounting,
+                                    TerminalAccountingInput {
+                                        tenant: &TenantId(tenant_owned.clone()),
+                                        wf_run: &run_owned,
+                                        job_id: &job_owned,
+                                        reserve_handle: &reserve_handle,
+                                        report: &report_owned,
+                                        receipt: &receipt,
+                                        replay: claim == ClaimConsumeOutcome::AlreadyConsumed,
+                                    },
+                                )
+                                .await?;
+                            }
+                            #[cfg(any(test, feature = "test-support"))]
+                            ReporterAccounting::TestBypass => {}
+                        }
                         let signal = TypedSignalSpec {
                             run: run_owned.clone(),
                             signal_name: JOB_DONE_SIGNAL.to_string(),
@@ -647,6 +939,31 @@ impl TerminalReporter for CiPipelineReporter {
             Err(CompletionTxError::Spec(error)) => {
                 return Err(ExecutorError::Storage(format!(
                     "durable claimed-job read refused: {error}"
+                )))
+            }
+            Err(CompletionTxError::Manifest) => {
+                return Err(ExecutorError::Storage(
+                    "durable CI launch authority could not be verified".into(),
+                ))
+            }
+            Err(CompletionTxError::Pricing(error)) => {
+                return Err(ExecutorError::Storage(format!(
+                    "terminal CI accounting refused: {error}"
+                )))
+            }
+            Err(CompletionTxError::Money(error)) => {
+                return Err(ExecutorError::Storage(format!(
+                    "terminal CI money settlement refused: {error}"
+                )))
+            }
+            Err(CompletionTxError::Projection(error)) => {
+                return Err(ExecutorError::Storage(format!(
+                    "terminal CI cost projection refused: {error}"
+                )))
+            }
+            Err(CompletionTxError::Accounting(error)) => {
+                return Err(ExecutorError::Storage(format!(
+                    "terminal CI accounting receipt refused: {error}"
                 )))
             }
             Err(CompletionTxError::Signal(error)) => return Err(error),
