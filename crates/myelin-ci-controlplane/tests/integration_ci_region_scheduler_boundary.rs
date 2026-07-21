@@ -42,6 +42,7 @@ fn job(tenant: &str, region: &str, label: &str, ordinal: u16) -> DurableEnqueue 
         concurrency_group: None,
         fair_key: tenant.to_owned(),
         idem_token: format!("scheduler-boundary-{ordinal}"),
+        stage: "build".into(),
     }
 }
 
@@ -131,6 +132,36 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         .expect("validate the dedicated scheduler role");
     let region_store = scheduler.region_queue_store();
     let labels = vec![proof_label.clone()];
+
+    let baseline_null_stage = region_store
+        .count_non_terminal_null_stage_jobs(FR_PAR)
+        .await
+        .expect("region-authorized activation guard");
+    sqlx::query("UPDATE job_queue SET stage = NULL WHERE tenant_id = $1")
+        .bind(&tenant_b)
+        .execute(&admin)
+        .await
+        .expect("simulate one historical pre-stage row");
+    assert_eq!(
+        region_store
+            .count_non_terminal_null_stage_jobs(FR_PAR)
+            .await
+            .expect("guard reads job_queue through scheduler capability"),
+        baseline_null_stage + 1,
+        "the guard observes this fixture in addition to any historical dev-stack backlog"
+    );
+    sqlx::query("UPDATE job_queue SET stage = 'build' WHERE tenant_id = $1")
+        .bind(&tenant_b)
+        .execute(&admin)
+        .await
+        .expect("repair the historical fixture before claim");
+    assert_eq!(
+        region_store
+            .count_non_terminal_null_stage_jobs(FR_PAR)
+            .await
+            .expect("guard after fixture repair"),
+        baseline_null_stage
+    );
 
     let first = region_store
         .claim(FR_PAR, &labels, &[TrustTier::Trusted], "worker-one", 30)

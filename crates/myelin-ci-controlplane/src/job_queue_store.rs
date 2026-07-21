@@ -67,8 +67,8 @@ use sqlx::types::Uuid;
 use sqlx::Row;
 
 use crate::scheduler::{
-    EnqueueOutcome, Lane, CANCEL_SUPERSEDED_QUERY, COMPLETE_JOB_QUERY, HEARTBEAT_QUERY,
-    INSERT_JOB_QUEUE_QUERY,
+    EnqueueOutcome, Lane, CANCEL_SUPERSEDED_QUERY, COMPLETE_JOB_QUERY, CONSUME_CLAIM_QUERY,
+    HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY, READ_COMPLETION_DISPOSITION_QUERY,
 };
 
 // =================================================================================================
@@ -155,6 +155,9 @@ pub struct DurableEnqueue {
     /// The idempotency token — the `jq_idem` unique `(tenant_id, idem_token)` makes a re-enqueue a
     /// no-op (a reaper re-queue + a redundant re-dispatch = ONE row).
     pub idem_token: String,
+    /// Durable pipeline stage attribution. Every new dispatch supplies it; NULL is reserved for
+    /// historical pre-expand rows and blocks runner-lane activation.
+    pub stage: String,
 }
 
 /// A leased `job_queue` row (the `CLAIM_QUERY` `RETURNING` shape) — the claimed job's identity + the
@@ -177,6 +180,38 @@ pub struct LeasedJob {
     pub fair_key: String,
     /// The trust tier of the leased job (the security-load-bearing fact).
     pub trust_tier: TrustTier,
+    /// **The claim generation** — the monotone `lease_epoch` the claim bumped (CT-004d.2 claim-bound
+    /// completion). The runner carries this to `report_done`; the completion CAS refuses a stale claim
+    /// (a lower epoch than the row's) so a reaped-and-re-claimed worker cannot win first delivery.
+    pub lease_epoch: i64,
+    /// Fresh unguessable authority minted for this exact claim generation.
+    pub claim_nonce: String,
+}
+
+/// **The outcome of the claim CAS joined to durable signal delivery by the completion reporter.**
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClaimConsumeOutcome {
+    /// THIS call won the claim — the row moved to `terminal` and the receipt was recorded. Proceed to
+    /// signal the verdict.
+    Consumed,
+    /// The row is already `terminal` with the SAME receipt — an idempotent redelivery of the identical
+    /// completion. Re-signalling is a harmless engine no-op (the `wf_signal` PK dedups).
+    AlreadyConsumed,
+    /// No live claim matched the presented generation — a missing row, a stale/other `(lease_owner,
+    /// lease_epoch)`, or a divergent receipt (e.g. a flipped-verdict replay). Fail-closed: nothing
+    /// changed, and the caller signals NO verdict.
+    Refused,
+}
+
+/// Borrowed inputs for the caller-transaction completion CAS.
+pub(crate) struct ClaimConsumeSpec<'a> {
+    pub tenant_id: &'a str,
+    pub job_id: Uuid,
+    pub lease_owner: &'a str,
+    pub lease_epoch: i64,
+    pub claim_nonce: Uuid,
+    pub stage: &'a str,
+    pub completion_receipt: &'a str,
 }
 
 // =================================================================================================
@@ -227,6 +262,7 @@ impl CiJobQueueStore {
         let region = job.region.clone();
         let fair_key = job.fair_key.clone();
         let idem = job.idem_token.clone();
+        let stage = job.stage.clone();
         let inserted = with_tenant_tx(&self.pool, &job.tenant_id, &job.region, move |conn| {
             Box::pin(async move {
                 let row = sqlx::query(INSERT_JOB_QUEUE_QUERY)
@@ -240,6 +276,7 @@ impl CiJobQueueStore {
                     .bind(group.as_deref()) // $8 concurrency_group (nullable)
                     .bind(&fair_key) // $9 fair_key
                     .bind(&idem) // $10 idem_token
+                    .bind(&stage) // $11 durable pipeline stage
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(|e| PgError::Query(e.to_string()))?;
@@ -316,6 +353,45 @@ impl CiJobQueueStore {
         .await
         .map_err(JobQueueStoreError::from_pg)?;
         Ok(moved)
+    }
+
+    /// Claim CAS for the durable completion reporter. This is intentionally caller-transaction-only:
+    /// the claim transition and `PgFlowExecutor::signal_typed_on_conn` must share this exact connection
+    /// and commit boundary, so no public helper can accidentally reintroduce a crash gap.
+    pub(crate) async fn consume_claim_on_conn(
+        conn: &mut sqlx::PgConnection,
+        spec: ClaimConsumeSpec<'_>,
+    ) -> Result<ClaimConsumeOutcome, PgError> {
+        let consumed = sqlx::query(CONSUME_CLAIM_QUERY)
+            .bind(spec.tenant_id) // $1 tenant_id
+            .bind(spec.job_id) // $2 job_id
+            .bind(spec.lease_owner) // $3 lease_owner
+            .bind(spec.lease_epoch) // $4 lease_epoch
+            .bind(spec.claim_nonce) // $5 unguessable claim nonce
+            .bind(spec.completion_receipt) // $6 canonical completion receipt
+            .bind(spec.stage) // $7 durable queue/spec stage authority
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        if consumed.is_some() {
+            return Ok(ClaimConsumeOutcome::Consumed);
+        }
+        let disposition = sqlx::query(READ_COMPLETION_DISPOSITION_QUERY)
+            .bind(spec.tenant_id)
+            .bind(spec.job_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
+        let Some(row) = disposition else {
+            return Ok(ClaimConsumeOutcome::Refused);
+        };
+        let state: String = row.get("state");
+        let stored_receipt: Option<String> = row.get("completion_receipt");
+        if state == "terminal" && stored_receipt.as_deref() == Some(spec.completion_receipt) {
+            Ok(ClaimConsumeOutcome::AlreadyConsumed)
+        } else {
+            Ok(ClaimConsumeOutcome::Refused)
+        }
     }
 
     /// **Heartbeat — a live runner extends its lease ([`HEARTBEAT_QUERY`]).** Tenant-scoped. Only the
@@ -477,8 +553,8 @@ pub(crate) fn trust_from_token(token: &str) -> Result<TrustTier, JobQueueStoreEr
 mod tests {
     use super::*;
     use crate::scheduler::{
-        CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, COMPLETE_JOB_QUERY, HEARTBEAT_QUERY,
-        INSERT_JOB_QUEUE_QUERY, REAP_QUERY,
+        CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, COMPLETE_JOB_QUERY, CONSUME_CLAIM_QUERY,
+        HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY, REAP_QUERY,
     };
 
     /// **The store's SQL constants are well-formed against the real DDL (bind arity + column names).**
@@ -487,8 +563,8 @@ mod tests {
     /// column, a changed bind order) is loud here, before the live integration test.
     #[test]
     fn the_bound_sql_matches_the_store_binds() {
-        // INSERT: ten binds ($1..$10), idempotent on the jq_idem unique, RETURNING job_id.
-        assert!(INSERT_JOB_QUEUE_QUERY.contains("$10") && !INSERT_JOB_QUEUE_QUERY.contains("$11"));
+        // INSERT: eleven binds ($1..$11), including queue-authority stage.
+        assert!(INSERT_JOB_QUEUE_QUERY.contains("$11") && !INSERT_JOB_QUEUE_QUERY.contains("$12"));
         assert!(INSERT_JOB_QUEUE_QUERY.contains("ON CONFLICT (tenant_id, idem_token) DO NOTHING"));
         assert!(INSERT_JOB_QUEUE_QUERY.contains("RETURNING job_id"));
         // CLAIM: five binds ($1..$5), RETURNING every column leased_from_row reads.
@@ -501,12 +577,21 @@ mod tests {
             "j.concurrency_group",
             "j.fair_key",
             "j.trust_tier",
+            "j.lease_epoch",
+            "j.claim_nonce",
         ] {
             assert!(
                 CLAIM_QUERY.contains(col),
                 "the claim RETURNING carries `{col}` (leased_from_row reads it)"
             );
         }
+        // The claim BUMPS the monotone claim generation so a stale re-claim is a higher epoch.
+        assert!(CLAIM_QUERY.contains("lease_epoch = j.lease_epoch + 1"));
+        assert!(CLAIM_QUERY.contains("claim_nonce = gen_random_uuid()"));
+        // Completion binds nonce + stage and records the receipt only for that exact claim.
+        assert!(CONSUME_CLAIM_QUERY.contains("$7") && !CONSUME_CLAIM_QUERY.contains("$8"));
+        assert!(CONSUME_CLAIM_QUERY.contains("claim_nonce = $5::uuid"));
+        assert!(CONSUME_CLAIM_QUERY.contains("stage = $7"));
         // REAP: one bind ($1 region), an in-place UPDATE (no INSERT → 0 duplicate enqueues).
         assert!(REAP_QUERY.contains("$1") && !REAP_QUERY.contains("$2"));
         assert!(REAP_QUERY.trim_start().starts_with("UPDATE"));

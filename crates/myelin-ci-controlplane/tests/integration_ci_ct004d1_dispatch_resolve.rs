@@ -35,10 +35,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use myelin_ci_controlplane::{
-    ci_job_queue_store, ci_job_spec_store, ci_region_queue_store_test_support, durable_spec_resolver, CiJobSpecStoreError,
-    DurableEnqueue, DurableLeaseAdapter, EnqueueOutcome, Lane, CI_RUNNER_LEASE_TTL_SECS,
-    CREATE_CI_JOB_SPEC_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
-    CREATE_JOB_QUEUE_INDEXES_DDL, MAX_JOB_TIMEOUT_SECS,
+    ci_job_queue_store, ci_job_spec_store, ci_region_queue_store_test_support,
+    durable_spec_resolver, CiJobSpecStoreError, DurableEnqueue, DurableLeaseAdapter,
+    EnqueueOutcome, Lane, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CI_RUNNER_LEASE_TTL_SECS, CREATE_CI_JOB_SPEC_DDL,
+    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
+    MAX_JOB_TIMEOUT_SECS,
 };
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
@@ -97,6 +99,14 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(CREATE_JOB_QUEUE_DDL)
         .await
         .expect("create job_queue");
+    admin
+        .execute(ALTER_JOB_QUEUE_ADD_COMPLETION_DDL)
+        .await
+        .expect("add job_queue lease_epoch + completion_receipt");
+    admin
+        .execute(ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL)
+        .await
+        .expect("add job_queue claim nonce + stage authority");
     for (_name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
         let idx = idx.replace("CONCURRENTLY ", "");
         admin.execute(idx.as_str()).await.expect("index");
@@ -105,11 +115,15 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(CREATE_FAIR_DEFICIT_DDL)
         .await
         .expect("create fair_deficit");
-    // CT-004d.1: the durable JobSpec store table.
+    // CT-004d.1: the durable JobSpec store table + the CT-004d.2 durable stage column.
     admin
         .execute(CREATE_CI_JOB_SPEC_DDL)
         .await
         .expect("create ci_job_spec");
+    admin
+        .execute(ALTER_CI_JOB_SPEC_ADD_STAGE_DDL)
+        .await
+        .expect("add ci_job_spec.stage");
 }
 
 async fn drop_schema(admin: &PgPool, schema: &str) {
@@ -160,6 +174,7 @@ fn enq(
         concurrency_group: None,
         fair_key: tenant.into(),
         idem_token: idem.into(),
+        stage: "build".into(),
     }
 }
 
@@ -274,16 +289,32 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
 
     // ── THE REAL DISPATCH: co-persist the durable job_queue row + the JobSpec in ONE tx. ──
     let spec = compute_spec(
-        vec!["sh".into(), "-c".into(), "echo hello-ct004d1; exit 0".into()],
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "echo hello-ct004d1; exit 0".into(),
+        ],
         TrustTier::Trusted,
         &idem,
     );
-    let terms = enq(tenant, region, "e2e-job", "e2e-run", TrustTier::Trusted, &["linux"], &idem);
+    let terms = enq(
+        tenant,
+        region,
+        "e2e-job",
+        "e2e-run",
+        TrustTier::Trusted,
+        &["linux"],
+        &idem,
+    );
     let outcome = specs
-        .co_persist_dispatch(&terms, &spec)
+        .co_persist_dispatch(&terms, &spec, "build")
         .await
         .expect("the dispatch co-persists the job_queue row + the JobSpec");
-    assert_eq!(outcome.enqueue, EnqueueOutcome::Inserted, "a fresh job_queue row");
+    assert_eq!(
+        outcome.enqueue,
+        EnqueueOutcome::Inserted,
+        "a fresh job_queue row"
+    );
     assert!(outcome.spec_inserted, "a fresh ci_job_spec row");
 
     // ── the durable job_queue row carries the SPEC's trust_tier + the run's region (fed, not defaulted). ──
@@ -294,8 +325,14 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
             .await
             .map(|r| (r.get(0), r.get(1), r.get(2)))
             .expect("the job_queue row");
-    assert_eq!(jq_trust, "trusted", "the row's trust_tier is the SPEC's tier (not widened/defaulted)");
-    assert_eq!(jq_region, region, "the row's region is the run's residency (not defaulted)");
+    assert_eq!(
+        jq_trust, "trusted",
+        "the row's trust_tier is the SPEC's tier (not widened/defaulted)"
+    );
+    assert_eq!(
+        jq_region, region,
+        "the row's region is the run's residency (not defaulted)"
+    );
     assert_eq!(jq_state, "queued", "the dispatched job is claimable");
 
     // ── the ci_job_spec row exists and round-trips the exact spec. ──
@@ -303,7 +340,10 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
         .get_spec(tenant, region, &uid("e2e-job").to_string())
         .await
         .expect("the persisted spec resolves back");
-    assert_eq!(resolved_back, spec, "the persisted spec round-trips faithfully (every field)");
+    assert_eq!(
+        resolved_back, spec,
+        "the persisted spec round-trips faithfully (every field)"
+    );
 
     // ── the engine executor the job.done wakes (the ONE signal path). Run id == the durable run_id. ──
     let executor = FlowExecutor::new(
@@ -320,7 +360,10 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
             idem_key: "ci:e2e-run".into(),
         })
         .expect("start the run");
-    assert_eq!(started.0, run_uuid, "the started run id == the durable run_id");
+    assert_eq!(
+        started.0, run_uuid,
+        "the started run id == the durable run_id"
+    );
 
     // ── the durable adapter + the REAL durable resolver (over ci_job_spec) — NOT an injected closure. ──
     let resolver = durable_spec_resolver(specs.clone(), region, tokio::runtime::Handle::current());
@@ -353,14 +396,17 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let ran = agent
-        .run_one(now)
-        .expect("the runner claims + resolves the REAL spec + runs it in gVisor + reports terminal");
+    let ran = agent.run_one(now).expect(
+        "the runner claims + resolves the REAL spec + runs it in gVisor + reports terminal",
+    );
 
     let captured = firehose.captured();
     let guest = String::from_utf8_lossy(&captured);
     println!("=== CT-004d.1 REAL end-to-end (dispatch co-persist → durable resolve → runsc → job.done) ===");
-    println!("job_id={} run_id={} passed={}", ran.job_id, ran.run_id, ran.report.passed);
+    println!(
+        "job_id={} run_id={} passed={}",
+        ran.job_id, ran.run_id, ran.report.passed
+    );
     println!("REAL guest stdout (via firehose) = {guest:?}");
     println!("job.done delivery = {:?}", ran.signal_outcome);
 
@@ -371,9 +417,15 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
         guest.contains("hello-ct004d1"),
         "the REAL runsc guest ran the RESOLVED spec's command. got: {guest:?}"
     );
-    assert_eq!(ran.signal_outcome, SignalOutcome::Buffered, "the first job.done wakes the parked run");
     assert_eq!(
-        executor.signals().count_for_run(&TenantId(tenant.into()), &run_uuid),
+        ran.signal_outcome,
+        SignalOutcome::Buffered,
+        "the first job.done wakes the parked run"
+    );
+    assert_eq!(
+        executor
+            .signals()
+            .count_for_run(&TenantId(tenant.into()), &run_uuid),
         1,
         "exactly one job.done buffered"
     );
@@ -400,11 +452,18 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
 
     // ── IDEMPOTENT re-dispatch: same idem_token/job_id → no second job_queue row + no second spec. ──
     let again = specs
-        .co_persist_dispatch(&terms, &spec)
+        .co_persist_dispatch(&terms, &spec, "build")
         .await
         .expect("re-dispatch is a clean no-op");
-    assert_eq!(again.enqueue, EnqueueOutcome::DuplicateIdem, "the job_queue jq_idem collapses the re-enqueue");
-    assert!(!again.spec_inserted, "the (tenant, job_id) PK collapses the re-persist");
+    assert_eq!(
+        again.enqueue,
+        EnqueueOutcome::DuplicateIdem,
+        "the job_queue jq_idem collapses the re-enqueue"
+    );
+    assert!(
+        !again.spec_inserted,
+        "the (tenant, job_id) PK collapses the re-persist"
+    );
 
     drop_schema(&admin, &schema).await;
     println!(
@@ -425,16 +484,23 @@ async fn dispatch_feeds_trust_and_region_from_the_spec_never_widened() {
     let specs = ci_job_spec_store(admin.clone());
 
     // Every honest tier round-trips onto the job_queue row from the SPEC's tier.
-    for (i, tier) in [TrustTier::Trusted, TrustTier::UntrustedFork, TrustTier::SelfHosted]
-        .into_iter()
-        .enumerate()
+    for (i, tier) in [
+        TrustTier::Trusted,
+        TrustTier::UntrustedFork,
+        TrustTier::SelfHosted,
+    ]
+    .into_iter()
+    .enumerate()
     {
         let id = format!("feed-job-{i}");
         let run = format!("feed-run-{i}");
         let idem = format!("feed-idem-{i}");
         let spec = compute_spec(vec!["true".into()], tier, &idem);
         let terms = enq(tenant, region, &id, &run, tier, &["linux"], &idem);
-        specs.co_persist_dispatch(&terms, &spec).await.expect("dispatch");
+        specs
+            .co_persist_dispatch(&terms, &spec, "build")
+            .await
+            .expect("dispatch");
         let (jq_trust, jq_region): (String, String) =
             sqlx::query("SELECT trust_tier, region FROM job_queue WHERE job_id = $1")
                 .bind(uid(&id))
@@ -454,9 +520,17 @@ async fn dispatch_feeds_trust_and_region_from_the_spec_never_widened() {
     // THE WIDENING ATTEMPT: gate a fork spec behind a `trusted` enqueue tier → REFUSED fail-closed,
     // and NO row is written (the gate can never carry a wider tier than the spec that executes).
     let fork_spec = compute_spec(vec!["true".into()], TrustTier::UntrustedFork, "widen-idem");
-    let widened = enq(tenant, region, "widen-job", "widen-run", TrustTier::Trusted, &["linux"], "widen-idem");
+    let widened = enq(
+        tenant,
+        region,
+        "widen-job",
+        "widen-run",
+        TrustTier::Trusted,
+        &["linux"],
+        "widen-idem",
+    );
     let err = specs
-        .co_persist_dispatch(&widened, &fork_spec)
+        .co_persist_dispatch(&widened, &fork_spec, "build")
         .await
         .expect_err("a widened gate tier is refused");
     assert!(
@@ -468,7 +542,10 @@ async fn dispatch_feeds_trust_and_region_from_the_spec_never_widened() {
         .fetch_one(&admin)
         .await
         .unwrap();
-    assert_eq!(count, 0, "the refused dispatch wrote NO job_queue row (fail-closed before any write)");
+    assert_eq!(
+        count, 0,
+        "the refused dispatch wrote NO job_queue row (fail-closed before any write)"
+    );
 
     drop_schema(&admin, &schema).await;
     println!("[CT-004d.1] PASS: the job_queue trust_tier/region are FED from the spec; a widened gate is refused");
@@ -488,12 +565,29 @@ async fn trusted_runner_never_executes_a_dispatched_untrusted_fork() {
 
     // A REAL dispatch of an untrusted_fork stage (spec + row both fork) into the queue.
     let fork_spec = compute_spec(vec!["true".into()], TrustTier::UntrustedFork, "fork-idem");
-    let terms = enq(tenant, region, "fork-job", "fork-run", TrustTier::UntrustedFork, &["linux"], "fork-idem");
-    specs.co_persist_dispatch(&terms, &fork_spec).await.expect("dispatch the fork stage");
+    let terms = enq(
+        tenant,
+        region,
+        "fork-job",
+        "fork-run",
+        TrustTier::UntrustedFork,
+        &["linux"],
+        "fork-idem",
+    );
+    specs
+        .co_persist_dispatch(&terms, &fork_spec, "build")
+        .await
+        .expect("dispatch the fork stage");
 
     // A trusted-only runner, using the REAL durable resolver, drives the exact run_one claim seam.
     let resolver = durable_spec_resolver(specs.clone(), region, tokio::runtime::Handle::current());
-    let adapter = DurableLeaseAdapter::new(ci_region_queue_store_test_support(admin.clone()), queue.clone(), region, tokio::runtime::Handle::current(), resolver);
+    let adapter = DurableLeaseAdapter::new(
+        ci_region_queue_store_test_support(admin.clone()),
+        queue.clone(),
+        region,
+        tokio::runtime::Handle::current(),
+        resolver,
+    );
     let claimed = adapter.claim_for_labels(
         "trusted-worker",
         &["linux".to_string()],
@@ -512,10 +606,15 @@ async fn trusted_runner_never_executes_a_dispatched_untrusted_fork() {
         .fetch_one(&admin)
         .await
         .unwrap();
-    assert_eq!(state, "queued", "the untrusted_fork stage stays queued (unclaimed by the trusted-only runner)");
+    assert_eq!(
+        state, "queued",
+        "the untrusted_fork stage stays queued (unclaimed by the trusted-only runner)"
+    );
 
     drop_schema(&admin, &schema).await;
-    println!("[CT-004d.1] PASS: the trust-tier gate survives the real dispatch + real resolver path");
+    println!(
+        "[CT-004d.1] PASS: the trust-tier gate survives the real dispatch + real resolver path"
+    );
 }
 
 // ═══════════════ 4. FAIL-CLOSED RESOLVE: a leased row with no spec never launches ════════════════
@@ -531,11 +630,21 @@ async fn a_leased_row_without_a_spec_resolves_fail_closed() {
     let specs = ci_job_spec_store(admin.clone());
 
     // A bare job_queue row (via the queue store directly) — NO ci_job_spec row co-persisted.
-    let bare = enq(tenant, region, "nospec-job", "nospec-run", TrustTier::Trusted, &["linux"], "nospec-idem");
+    let bare = enq(
+        tenant,
+        region,
+        "nospec-job",
+        "nospec-run",
+        TrustTier::Trusted,
+        &["linux"],
+        "nospec-idem",
+    );
     queue.enqueue(&bare).await.expect("enqueue a bare row");
 
     // The real resolver over the (empty) spec store must FAIL CLOSED for this leased row.
-    let missing = specs.get_spec(tenant, region, &uid("nospec-job").to_string()).await;
+    let missing = specs
+        .get_spec(tenant, region, &uid("nospec-job").to_string())
+        .await;
     assert!(
         matches!(missing, Err(CiJobSpecStoreError::SpecNotFound { .. })),
         "an absent spec is SpecNotFound (fail-closed), got {missing:?}"
@@ -543,7 +652,13 @@ async fn a_leased_row_without_a_spec_resolves_fail_closed() {
 
     // Through the runner seam: claim resolves fail-closed → no launch → the row stays leased for the reaper.
     let resolver = durable_spec_resolver(specs.clone(), region, tokio::runtime::Handle::current());
-    let adapter = DurableLeaseAdapter::new(ci_region_queue_store_test_support(admin.clone()), queue.clone(), region, tokio::runtime::Handle::current(), resolver);
+    let adapter = DurableLeaseAdapter::new(
+        ci_region_queue_store_test_support(admin.clone()),
+        queue.clone(),
+        region,
+        tokio::runtime::Handle::current(),
+        resolver,
+    );
     let claimed = adapter.claim_for_labels(
         "worker",
         &["linux".to_string()],
@@ -562,7 +677,10 @@ async fn a_leased_row_without_a_spec_resolves_fail_closed() {
         .fetch_one(&admin)
         .await
         .unwrap();
-    assert_eq!(state, "leased", "the unresolved row stays leased (the reaper re-queues it; never launched)");
+    assert_eq!(
+        state, "leased",
+        "the unresolved row stays leased (the reaper re-queues it; never launched)"
+    );
 
     drop_schema(&admin, &schema).await;
     println!("[CT-004d.1] PASS: a leased row with no durable spec resolves fail-closed — no launch, reaped");

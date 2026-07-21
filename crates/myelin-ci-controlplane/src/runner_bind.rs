@@ -191,6 +191,10 @@ impl LeaseStore for DurableLeaseAdapter {
             spec,
             lease_owner: Some(worker.to_string()),
             lease_expires: Some(now + lease_ttl_secs),
+            // The claim generation the durable CLAIM bumped — carried to the completion CAS so a stale
+            // reaped worker (lower epoch) is refused.
+            lease_epoch: leased.lease_epoch,
+            claim_nonce: leased.claim_nonce,
         })
     }
 

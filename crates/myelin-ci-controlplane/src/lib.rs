@@ -53,6 +53,18 @@
 pub mod artifact_cache;
 pub mod check_emitter;
 pub mod ci_pipeline;
+pub mod ci_result_signal;
+/// CT-004d.2 chunk 4 — the durable `ci_run` writer ([`ci_run_store::CiRunStore`]): the CI
+/// run-of-record. The `ci-dispatch.trigger` consumer's reserve bundle must persist a durable `ci_run`
+/// row (`state = queued`), but the production reserve store only staged a NOTE — the row was written
+/// durably ONLY in the CT-004b integration test's `CoCommitReserveStore`. This is the production writer
+/// that test proved: it co-commits the run-of-record ROW on the consumer's co-commit `HandlerTx`
+/// connection (the SAME tx as the dedup mark — atomic), while the co-emitted events stay absorb-mode
+/// through the outbox (the honest #7 H1 split). Constructed at the composition root by
+/// [`ci_run_store_factory`]; the `ci_run` table it writes is created by the shared
+/// [`ci_durable_migrations`] both CI mains apply at boot. Registering/starting the `ci.pipeline` body is
+/// CT-004d.2 chunk 2/3 (NOT this chunk).
+pub mod ci_run_store;
 pub mod ci_scheduler_db;
 /// CT-004a (CI backend reconcile-and-harden — the FOUNDATION chunk): the REAL durable `cost_event`
 /// projection store ([`cost_store::CiCostEventStore`]). Turns the previously model-only CI metering
@@ -65,7 +77,6 @@ pub mod ci_scheduler_db;
 /// at the composition root by [`ci_cost_event_store`]; the live consumer that drives a real settle
 /// through it (co-committing the run-state transition) is CT-004d.
 pub mod cost_store;
-pub mod ci_result_signal;
 pub mod crypto_shred_erase;
 pub mod deployment;
 /// The CI dogfood done-bar (CI-P35 / P-509, M6): the CI **switch test** ([`dogfood::CiSwitchTest`] —
@@ -127,17 +138,6 @@ pub mod job_queue_store;
 /// [`runner_bind::durable_spec_resolver`]. Registering/starting the `ci.pipeline` body on the executor +
 /// the live settle bookend are CT-004d.2/.3 (NOT this chunk).
 pub mod job_spec_store;
-/// CT-004d.2 chunk 4 — the durable `ci_run` writer ([`ci_run_store::CiRunStore`]): the CI
-/// run-of-record. The `ci-dispatch.trigger` consumer's reserve bundle must persist a durable `ci_run`
-/// row (`state = queued`), but the production reserve store only staged a NOTE — the row was written
-/// durably ONLY in the CT-004b integration test's `CoCommitReserveStore`. This is the production writer
-/// that test proved: it co-commits the run-of-record ROW on the consumer's co-commit `HandlerTx`
-/// connection (the SAME tx as the dedup mark — atomic), while the co-emitted events stay absorb-mode
-/// through the outbox (the honest #7 H1 split). Constructed at the composition root by
-/// [`ci_run_store_factory`]; the `ci_run` table it writes is created by the shared
-/// [`ci_durable_migrations`] both CI mains apply at boot. Registering/starting the `ci.pipeline` body is
-/// CT-004d.2 chunk 2/3 (NOT this chunk).
-pub mod ci_run_store;
 /// Versioned, tenant-bound loader for the immutable CI execution plan stored in the definition
 /// snapshot CAS object. This module prepares and validates a plan; it deliberately does not start
 /// jobs or flatten the dependency DAG into a sequential workflow.
@@ -167,6 +167,8 @@ pub use pg_pipeline_starter::{
 /// codec + wakes the parked run (so the CT-004c.2 runner's `job.done` from a real `runsc` guest
 /// advances the pipeline to completion).
 pub mod ci_pipeline_driver;
+pub mod floor_followons;
+pub mod holder;
 /// CT-004c.1: the REGION-scoped, CROSS-TENANT half of the durable scheduler — the raw `CLAIM_QUERY` /
 /// `REAP_QUERY` executions (a hosted runner claims across ALL tenants in its region; the DRR fairness
 /// spans tenants). Isolated here so it is a NAMED, LOUD `tenant-predicate` exclusion (the
@@ -174,15 +176,6 @@ pub mod ci_pipeline_driver;
 /// enqueue/cancel/complete/heartbeat queries in [`job_queue_store`] stay FULLY linted. Not part of
 /// the public surface — [`job_queue_store::CiJobQueueStore::claim`] / `reap` delegate to it.
 pub mod job_queue_region;
-/// CT-004c.2 — the runner exec binding: the durable `job_queue` store adapted to the sandbox
-/// [`myelin_ci_sandbox::LeaseStore`] port ([`runner_bind::DurableLeaseAdapter`]) + the bounded runner
-/// loop the service `main` spawns ([`runner_bind::CiRunnerLoop`]). Binds
-/// [`RunnerAgent`](myelin_ci_sandbox::RunnerAgent) to CT-004c.1's [`job_queue_store::CiJobQueueStore`]
-/// and executes the leased job in a real gVisor (`runsc`) guest — the tier/region claim predicate
-/// forwarded UNCHANGED (the adversarial-verifier surface).
-pub mod runner_bind;
-pub mod floor_followons;
-pub mod holder;
 pub mod live_tail;
 pub mod log_pipeline;
 pub mod log_sink;
@@ -192,6 +185,13 @@ pub mod migrations;
 pub mod permanent_gates;
 pub mod rebac_fragment;
 pub mod residency_drill;
+/// CT-004c.2 — the runner exec binding: the durable `job_queue` store adapted to the sandbox
+/// [`myelin_ci_sandbox::LeaseStore`] port ([`runner_bind::DurableLeaseAdapter`]) + the bounded runner
+/// loop the service `main` spawns ([`runner_bind::CiRunnerLoop`]). Binds
+/// [`RunnerAgent`](myelin_ci_sandbox::RunnerAgent) to CT-004c.1's [`job_queue_store::CiJobQueueStore`]
+/// and executes the leased job in a real gVisor (`runsc`) guest — the tier/region claim predicate
+/// forwarded UNCHANGED (the adversarial-verifier surface).
+pub mod runner_bind;
 pub mod schedule_and_run_job;
 pub mod scheduler;
 pub mod schema;
@@ -327,9 +327,7 @@ pub use metering::reserve_settle_parity_drill;
 // path is no longer model-only — `CiCostEventStore::settle_in_tx` co-commits the CI projection rows a
 // settle produces, and `cost_events_for_run` reads them back (wholesale ≠ markup intact). The
 // storage-`CostLedger`-vs-CI-projection split + the CT-004d live-wiring follow-on are in the module docs.
-pub use cost_store::{
-    cost_id_for, verify_ci_cost_event_shape, CiCostEventStore, CiCostStoreError,
-};
+pub use cost_store::{cost_id_for, verify_ci_cost_event_shape, CiCostEventStore, CiCostStoreError};
 
 pub use holder::{
     ci_store_classifier, register_ci_holders, CiHolder, CiHolderRegistration, CiStoreClass,
@@ -461,10 +459,10 @@ pub use scheduler::{
 // periodic lease-driven driver the service `main` spawns onto the serve runtime. The runner-binds-to-
 // this-store + starts-the-body handoff is CT-004c.2 (adversarially verified — the trust-tier claim
 // predicate + the sandbox exec path).
+pub use job_queue_region::CiRegionQueueStore;
 pub use job_queue_store::{
     CiJobQueueStore, DurableEnqueue, JobQueueReaper, JobQueueStoreError, LeasedJob,
 };
-pub use job_queue_region::CiRegionQueueStore;
 
 // CT-004d.1: the durable `JobSpec` store + the dispatch→durable co-persist + the fail-closed
 // resolve. `CiJobSpecStore::co_persist_dispatch` writes the `job_queue` row AND the digest-pinned
@@ -473,8 +471,9 @@ pub use job_queue_region::CiRegionQueueStore;
 // leased row back to its exact spec (corrupt/missing → fail-closed, never a default). `MAX_JOB_TIMEOUT_SECS`
 // is the wall-clock ceiling below the runner's lease TTL (the CT-004c.2 double-run fix).
 pub use job_spec_store::{
-    CiJobSpecStore, CiJobSpecStoreError, DispatchOutcome, INSERT_JOB_SPEC_QUERY,
-    MAX_JOB_TIMEOUT_SECS, SELECT_JOB_SPEC_QUERY,
+    CiJobSpecStore, CiJobSpecStoreError, ClaimedDispatchIdentity, DispatchOutcome,
+    INSERT_JOB_SPEC_QUERY, MAX_JOB_TIMEOUT_SECS, NON_TERMINAL_NULL_STAGE_JOBS_QUERY,
+    SELECT_JOB_SPEC_IDENTITY_QUERY, SELECT_JOB_SPEC_QUERY,
 };
 
 // CT-004d.2 chunk 4: the durable `ci_run` writer (the CI run-of-record). `CiRunStore::co_commit_insert`
@@ -484,12 +483,11 @@ pub use job_spec_store::{
 // locking query verifies every immutable field; divergent/invisible conflicts fail typed and loud.
 // The co-emitted events stay absorb-mode through the outbox (the honest #7 H1 split).
 pub use ci_run_store::{
-    CiRunInsert, CiRunRecord, CiRunStore, CiRunStoreError, INSERT_CI_RUN_QUERY, SELECT_CI_RUN_QUERY,
-    VERIFY_CI_RUN_REPLAY_QUERY,
+    CiRunInsert, CiRunRecord, CiRunStore, CiRunStoreError, INSERT_CI_RUN_QUERY,
+    SELECT_CI_RUN_QUERY, VERIFY_CI_RUN_REPLAY_QUERY,
 };
 pub use ci_scheduler_db::{
-    CiSchedulerDbConfig, CiSchedulerDbError, CiSchedulerDbProvider,
-    CI_SCHEDULER_DATABASE_URL_ENV,
+    CiSchedulerDbConfig, CiSchedulerDbError, CiSchedulerDbProvider, CI_SCHEDULER_DATABASE_URL_ENV,
 };
 
 // CT-004c.2: the runner exec binding — the durable-store lease adapter + the bounded runner loop the
@@ -508,8 +506,8 @@ pub use runner_bind::{
 // digest-pinned compute-spec seam the integration test injects (a real `runsc` guest); the real
 // pinned-snapshot→JobSpec resolver is the named `unresolved_stage_spec_builder` follow-on.
 pub use ci_pipeline_driver::{
-    fixed_command_spec_builder, unresolved_stage_spec_builder, CiPipelineDriver, CiPipelineReporter,
-    DurableJobRunner, StageSpecBuilder, StageVerdictBridge, StartRunError,
+    fixed_command_spec_builder, unresolved_stage_spec_builder, CiPipelineDriver,
+    CiPipelineReporter, ClaimRefusal, DurableJobRunner, StageSpecBuilder, StartRunError,
 };
 
 // CI-P14 (P-357): the EU fleet autoscaler — the FleetProvider impl + autoscale-on-queue-depth +
@@ -534,19 +532,23 @@ pub use fairness::{
 
 pub use migrations::{
     ci_controlplane_hot_tables, ci_controlplane_migrations, ci_durable_hot_tables,
-    ci_durable_migrations, make_tenant_scoped_ddl, ARTIFACT_TABLE, CACHE_ENTRY_TABLE,
-    CHECK_ATTEMPT_TABLE, CI_COST_EVENT_TABLE, CI_DURABLE_WRITER_IDS, CI_JOB_RUN_LEDGER_INDEX,
-    CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID, CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID, CI_JOB_TABLE,
-    CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_TABLE, CREATE_ARTIFACT_DDL, CREATE_CACHE_ENTRY_DDL,
-    CREATE_CHECK_ATTEMPT_DDL,
+    ci_durable_migrations, make_tenant_scoped_ddl, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ARTIFACT_TABLE,
+    CACHE_ENTRY_TABLE, CHECK_ATTEMPT_TABLE, CI_COST_EVENT_TABLE, CI_DURABLE_WRITER_IDS,
+    CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID, CI_JOB_QUEUE_COMPLETION_MIGRATION_ID,
+    CI_JOB_RUN_LEDGER_INDEX, CI_JOB_RUN_LEDGER_INDEX_MIGRATION_ID,
+    CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID, CI_JOB_SPEC_STAGE_MIGRATION_ID, CI_JOB_SPEC_TABLE,
+    CI_JOB_TABLE, CI_REGION_SCHEDULER_RLS_MIGRATION_ID, CI_RUN_TABLE,
+    CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID, CI_SCHEDULER_LEASE_EPOCH_GRANT_MIGRATION_ID,
+    CREATE_ARTIFACT_DDL, CREATE_CACHE_ENTRY_DDL, CREATE_CHECK_ATTEMPT_DDL,
     CREATE_CI_COST_EVENT_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
     CREATE_CI_JOB_SPEC_DDL, CREATE_CI_REGION_SCHEDULER_RLS_DDL, CREATE_CI_RUN_DDL,
     CREATE_DEPLOYMENT_DDL, CREATE_ENVIRONMENT_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
     CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL, CREATE_RUNNER_DDL,
-    CREATE_SECRET_BINDING_DDL, CI_JOB_SPEC_TABLE, DEPLOYMENT_TABLE, ENVIRONMENT_TABLE,
-    FAIR_DEFICIT_TABLE, JOB_QUEUE_TABLE, JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX, JQ_SERIALIZE_INDEX,
-    LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE, RUNNER_TABLE, SECRET_BINDING_TABLE,
-    VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
+    CREATE_SECRET_BINDING_DDL, DEPLOYMENT_TABLE, ENVIRONMENT_TABLE, FAIR_DEFICIT_TABLE,
+    GRANT_SCHEDULER_CLAIM_NONCE_DDL, GRANT_SCHEDULER_LEASE_EPOCH_DDL, JOB_QUEUE_TABLE,
+    JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX, JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE,
+    RUNNER_TABLE, SECRET_BINDING_TABLE, VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
 };
 
 pub use permanent_gates::{
@@ -877,8 +879,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            21,
-            "all 15 control-plane tables, 4 top-level concurrent indexes, the ledger validator, and the additive scheduler RLS boundary are in the migration set"
+            26,
+            "all 15 tables, 4 concurrent indexes, the ledger validator, 2 job_queue ALTERs, the ci_job_spec-stage ALTER, scheduler RLS boundary, and 2 claim-column grants are present"
         );
         assert!(
             spec.consumers.is_empty(),

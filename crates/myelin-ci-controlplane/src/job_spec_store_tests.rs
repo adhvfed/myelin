@@ -62,18 +62,39 @@ fn a_full_jobspec_round_trips_through_jsonb_faithfully() {
     let json = serde_json::to_value(&spec).expect("JobSpec serializes to jsonb");
     // decode exactly as `get_spec` does.
     let back = decode_spec(&uid_job(), json).expect("the stored jsonb decodes back to a JobSpec");
-    assert_eq!(back, spec, "the decoded spec equals the original — no field lost/defaulted");
+    assert_eq!(
+        back, spec,
+        "the decoded spec equals the original — no field lost/defaulted"
+    );
 
     // Spot-check the load-bearing fields explicitly (a defence against a PartialEq that ever loosened).
-    assert_eq!(back.image.reference, spec.image.reference, "the digest-pinned image survives");
+    assert_eq!(
+        back.image.reference, spec.image.reference,
+        "the digest-pinned image survives"
+    );
     assert_eq!(back.command, spec.command, "the command line survives");
     assert_eq!(back.env, spec.env, "the env vars survive");
-    assert_eq!(back.secret_refs, spec.secret_refs, "the secret NAME refs survive");
-    assert_eq!(back.egress.allow, spec.egress.allow, "the egress allowlist survives");
-    assert_eq!(back.limits, spec.limits, "all resource limits survive (incl. timeout, pids_max)");
-    assert_eq!(back.workspace, spec.workspace, "the workspace repo+commit survives");
+    assert_eq!(
+        back.secret_refs, spec.secret_refs,
+        "the secret NAME refs survive"
+    );
+    assert_eq!(
+        back.egress.allow, spec.egress.allow,
+        "the egress allowlist survives"
+    );
+    assert_eq!(
+        back.limits, spec.limits,
+        "all resource limits survive (incl. timeout, pids_max)"
+    );
+    assert_eq!(
+        back.workspace, spec.workspace,
+        "the workspace repo+commit survives"
+    );
     assert_eq!(back.trust_tier, spec.trust_tier, "the trust tier survives");
-    assert_eq!(back.run_token, spec.run_token, "the per-run token ref survives");
+    assert_eq!(
+        back.run_token, spec.run_token,
+        "the per-run token ref survives"
+    );
     assert_eq!(back.meter_to, spec.meter_to, "the meter target survives");
     assert_eq!(back.idem_token, spec.idem_token, "the idem token survives");
 }
@@ -119,7 +140,11 @@ fn a_trust_tier_mismatch_is_refused_before_any_write() {
     // The matching case (the honest dispatch) passes.
     assert!(validate_dispatch(TrustTier::UntrustedFork, &fork_spec).is_ok());
     // Every tier agreeing with itself is admitted.
-    for t in [TrustTier::Trusted, TrustTier::UntrustedFork, TrustTier::SelfHosted] {
+    for t in [
+        TrustTier::Trusted,
+        TrustTier::UntrustedFork,
+        TrustTier::SelfHosted,
+    ] {
         assert!(validate_dispatch(t, &full_spec(t, 60)).is_ok());
     }
 }
@@ -130,7 +155,10 @@ fn a_trust_tier_mismatch_is_refused_before_any_write() {
 #[test]
 fn a_timeout_over_the_ceiling_is_refused() {
     let at = full_spec(TrustTier::Trusted, MAX_JOB_TIMEOUT_SECS);
-    assert!(validate_dispatch(TrustTier::Trusted, &at).is_ok(), "at the ceiling is admitted");
+    assert!(
+        validate_dispatch(TrustTier::Trusted, &at).is_ok(),
+        "at the ceiling is admitted"
+    );
 
     let over = full_spec(TrustTier::Trusted, MAX_JOB_TIMEOUT_SECS + 1);
     let e = validate_dispatch(TrustTier::Trusted, &over).expect_err("over the ceiling is refused");
@@ -161,7 +189,13 @@ fn the_wired_lease_ttl_exceeds_the_max_job_timeout() {
 #[test]
 fn a_non_uuid_id_is_a_loud_refusal() {
     let e = parse_id_local("job_id", "not-a-uuid").unwrap_err();
-    assert!(matches!(e, CiJobSpecStoreError::BadId { field: "job_id", .. }));
+    assert!(matches!(
+        e,
+        CiJobSpecStoreError::BadId {
+            field: "job_id",
+            ..
+        }
+    ));
     assert!(parse_id_local("run_id", "00000000-0000-0000-0000-000000000001").is_ok());
 }
 
@@ -169,15 +203,41 @@ fn a_non_uuid_id_is_a_loud_refusal() {
 /// renamed column / changed bind order is loud here, before the live integration test.
 #[test]
 fn the_bound_sql_matches_the_store_binds() {
-    // INSERT ci_job_spec: six binds ($1..$6), idempotent on the (tenant, job_id) PK, RETURNING job_id.
-    assert!(INSERT_JOB_SPEC_QUERY.contains("$6") && !INSERT_JOB_SPEC_QUERY.contains("$7"));
+    // INSERT ci_job_spec: seven binds ($1..$7, the $7 durable stage), idempotent on the (tenant,
+    // job_id) PK, RETURNING job_id.
+    assert!(INSERT_JOB_SPEC_QUERY.contains("$7") && !INSERT_JOB_SPEC_QUERY.contains("$8"));
+    assert!(INSERT_JOB_SPEC_QUERY.contains("stage"));
     assert!(INSERT_JOB_SPEC_QUERY.contains("ON CONFLICT (tenant_id, job_id) DO NOTHING"));
     assert!(INSERT_JOB_SPEC_QUERY.contains("RETURNING job_id"));
     assert!(INSERT_JOB_SPEC_QUERY.contains("ci_job_spec"));
-    // SELECT: two binds ($1 tenant, $2 job_id), reads the spec column.
+    // SELECT spec: two binds ($1 tenant, $2 job_id), reads the spec column.
     assert!(SELECT_JOB_SPEC_QUERY.contains("$2") && !SELECT_JOB_SPEC_QUERY.contains("$3"));
     assert!(SELECT_JOB_SPEC_QUERY.contains("SELECT spec FROM ci_job_spec"));
-    assert!(SELECT_JOB_SPEC_QUERY.contains("tenant_id = $1") && SELECT_JOB_SPEC_QUERY.contains("job_id = $2"));
+    assert!(
+        SELECT_JOB_SPEC_QUERY.contains("tenant_id = $1")
+            && SELECT_JOB_SPEC_QUERY.contains("job_id = $2")
+    );
+    // SELECT dispatch identity: two binds, reads (run_id, idem_token, stage) for the reporter's verify.
+    assert!(
+        SELECT_JOB_SPEC_IDENTITY_QUERY.contains("$2")
+            && !SELECT_JOB_SPEC_IDENTITY_QUERY.contains("$3")
+    );
+    assert!(
+        SELECT_JOB_SPEC_IDENTITY_QUERY.contains("run_id")
+            && SELECT_JOB_SPEC_IDENTITY_QUERY.contains("idem_token")
+            && SELECT_JOB_SPEC_IDENTITY_QUERY.contains("stage")
+    );
+    assert!(
+        SELECT_JOB_SPEC_IDENTITY_QUERY.contains("tenant_id = $1")
+            && SELECT_JOB_SPEC_IDENTITY_QUERY.contains("job_id = $2")
+    );
+    // The null-stage activation guard: region-scoped, counts NON-terminal jobs whose stage IS NULL,
+    // joined job_queue↔ci_job_spec on (tenant_id, job_id).
+    assert!(NON_TERMINAL_NULL_STAGE_JOBS_QUERY.contains("count(*)"));
+    assert!(NON_TERMINAL_NULL_STAGE_JOBS_QUERY.contains("q.region = $1"));
+    assert!(NON_TERMINAL_NULL_STAGE_JOBS_QUERY.contains("q.state <> 'terminal'"));
+    assert!(NON_TERMINAL_NULL_STAGE_JOBS_QUERY.contains("q.stage IS NULL"));
+    assert!(!NON_TERMINAL_NULL_STAGE_JOBS_QUERY.contains("ci_job_spec"));
 }
 
 /// A stable uuid string for the round-trip test's job id argument (only used for the error label).
