@@ -717,6 +717,26 @@ guest pipeline) green. **Honest remaining floor:** start/signal are PG-durable, 
 mirrors through the in-memory dispatcher; V2 launch and `MYELIN_CI_RUNNER=1` remain fail-closed until
 `PgFlowDriveStore` lease/replay and the existing launch-authority floors are composed end to end.
 
+**CI durable-drive boundary correction (2026-07-21, `ddcc006` + `63c2049`).** The default production
+build no longer contains the process-local completion mirror or exports the restart-unsafe
+`CiPipelineDriver`; that compatibility harness and its fixed-command builder are confined to the
+`test-support` feature. `CiPipelineReporter` is PostgreSQL-only in production: its successful return
+means the exact claim transition and typed `job.done` signal committed atomically, and a
+tenant/region/partition-scoped `PgFlowWorker` is the only durable consumer path. The live culmination
+now starts the pinned test body on PostgreSQL, drives it to a durable wait, destroys the worker,
+reconstructs a fresh worker with the same definition identity, executes the claimed stage in a real
+`runsc` guest, then consumes the durable signal and commits terminal workflow history plus the X-1
+outbox events. That proof exposed and closed two masked outbox-conformance defects: run lifecycle
+events now use their already-canonical run ref as subject, and the Refs parser recognizes the frozen
+Event Bus `repo#commit-<oid>/check-<context>` and `repo#commit-<oid>/ci-result` spellings as canonical
+CI check-family anchors. Proof: default control-plane tests 362/362, Refs tests 28/28, all-target/
+all-feature clippy for both crates, and the two-case live culmination (adversarial claim authority +
+real `runsc` restart/replay) green. **Honest remaining activation floor:** production still has no
+restart-safe immutable CI body-input manifest carrying ordered/DAG semantics and `CheckFacts`; V1's
+prepared plan is explicitly a DAG, not the legacy sequential `PipelineRun`, and V2 still lacks launch
+authority. Do not compose the production worker fan-out or enable `MYELIN_CI_RUNNER=1` until those
+contracts are durable and replay-deterministic.
+
 ## R5–R6
 
 | Phase | Status |
