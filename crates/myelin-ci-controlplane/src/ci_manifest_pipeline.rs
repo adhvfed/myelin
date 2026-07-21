@@ -246,7 +246,9 @@ where
             match ctx.join_dispatched_job(&handle)? {
                 JobOutcome::Parked => return Ok(CiManifestPipelineOutcome::Parked),
                 JobOutcome::TimedOut => {
-                    failed.get_or_insert_with(|| (job.name.clone(), true));
+                    if failed.as_ref().is_none_or(|(_, timed_out)| !timed_out) {
+                        failed = Some((job.name.clone(), true));
+                    }
                     flow_timed_out_jobs.insert(job.job_id.clone());
                     late_accounting.push((job.name.as_str(), handle.idem_token().to_owned()));
                     completed.insert(job.job_id.clone());
