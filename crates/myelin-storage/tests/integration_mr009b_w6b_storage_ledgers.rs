@@ -270,6 +270,65 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     );
     assert_eq!(cost2.cost_events_for(&tenant, &run_tx).len(), 1);
 
+    // Caller-transaction cancellation: skipped work refunds only with its companion accounting
+    // transaction, rolls back cleanly, and exactly replays after commit.
+    let run_skip = RunId::new(format!("run-skip-{suffix}"));
+    cost2
+        .reserve(
+            tenant.clone(),
+            run_skip.clone(),
+            MinorUnits(700),
+            MinorUnits(9_000),
+        )
+        .expect("reserve skipped run");
+    let mut tx = app.db_pool().begin().await.expect("begin skip rollback tx");
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), \
+                set_config('myelin.region', $2, true)",
+    )
+    .bind(&tenant.0)
+    .bind(&region)
+    .execute(&mut *tx)
+    .await
+    .expect("scope skip rollback tx");
+    assert_eq!(
+        cost2
+            .cancel_unstarted_in_tx(&mut tx, &tenant, &run_skip)
+            .await
+            .expect("cancel skipped run in caller tx"),
+        MinorUnits(700)
+    );
+    tx.rollback().await.expect("roll back skip cancellation");
+    assert_eq!(
+        cost2.state_of(&tenant, &run_skip),
+        Some(ReservationState::Reserved)
+    );
+
+    let mut tx = app.db_pool().begin().await.expect("begin skip commit tx");
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), \
+                set_config('myelin.region', $2, true)",
+    )
+    .bind(&tenant.0)
+    .bind(&region)
+    .execute(&mut *tx)
+    .await
+    .expect("scope skip commit tx");
+    for _ in 0..2 {
+        assert_eq!(
+            cost2
+                .cancel_unstarted_in_tx(&mut tx, &tenant, &run_skip)
+                .await
+                .expect("exact cancellation replay"),
+            MinorUnits(700)
+        );
+    }
+    tx.commit().await.expect("commit skip cancellation");
+    assert_eq!(
+        cost2.state_of(&tenant, &run_skip),
+        Some(ReservationState::Cancelled)
+    );
+
     // Invariant 3 — settle-capped-at-reserved on Pg: an over-run is clamped to the reservation.
     let run_over = RunId::new(format!("run-over-{suffix}"));
     cost2

@@ -324,6 +324,51 @@ impl DurableCostLedger {
             .map_err(DurableSettleError::Ledger)
     }
 
+    /// Cancel an unstarted reservation inside a caller-owned tenant-scoped transaction. A replay of
+    /// the same already-cancelled reservation returns the original refund; in-flight or settled work
+    /// is never interrupted. This lets a workflow co-commit skip accounting with the refund state.
+    pub async fn cancel_unstarted_in_tx(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant: &TenantId,
+        run: &RunId,
+    ) -> Result<MinorUnits, DurableSettleError> {
+        let tenant_s = tenant.0.as_str();
+        let region = self.region();
+        let row = sqlx::query(
+            "SELECT reserved, state FROM cost_reservation \
+             WHERE tenant_id = $1 AND region = $2 AND run_id = $3 FOR UPDATE",
+        )
+        .bind(tenant_s)
+        .bind(&region)
+        .bind(&run.0)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|_| DurableSettleError::Store)?
+        .ok_or(DurableSettleError::Ledger(SettleError::NoSuchReservation))?;
+        let reserved = MinorUnits((row.get::<i64, _>("reserved")) as u64);
+        match parse_state(&row.get::<String, _>("state")) {
+            ReservationState::Reserved => {
+                sqlx::query(
+                    "UPDATE cost_reservation SET state = $4 \
+                     WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+                )
+                .bind(tenant_s)
+                .bind(&region)
+                .bind(&run.0)
+                .bind(state_token(ReservationState::Cancelled))
+                .execute(&mut *conn)
+                .await
+                .map_err(|_| DurableSettleError::Store)?;
+                Ok(reserved)
+            }
+            ReservationState::Cancelled => Ok(reserved),
+            ReservationState::InFlight | ReservationState::Settled => {
+                Err(DurableSettleError::Ledger(SettleError::NoSuchReservation))
+            }
+        }
+    }
+
     /// **Refund an UNSTARTED run** (the ONLY teardown — never touches an `InFlight`/`Settled` row: the
     /// never-interrupt-in-flight invariant). Refunds the reserved amount.
     pub fn cancel_unstarted(
