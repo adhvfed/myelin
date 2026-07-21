@@ -111,8 +111,8 @@ pub use gvisor::{
 // before any mount. Exercised by tests/git_wire_prod_exec_test.rs against a real `runsc` sandbox.
 pub use gvisor::{
     assert_repo_under_root, resolve_bare_repo_path, resolved_gvisor_git_rootfs,
-    validate_wire_repo_slug, validate_wire_segment, GitWireSpec, MemoryCgroup, WireError, WireMount,
-    ENV_GVISOR_GIT_ROOTFS, ENV_RUNSC_BIN, WIRE_QUARANTINE_MOUNT, WIRE_REPO_MOUNT,
+    validate_wire_repo_slug, validate_wire_segment, GitWireSpec, MemoryCgroup, WireError,
+    WireMount, ENV_GVISOR_GIT_ROOTFS, ENV_RUNSC_BIN, WIRE_QUARANTINE_MOUNT, WIRE_REPO_MOUNT,
     WIRE_STDIN_BOUND,
 };
 
@@ -175,6 +175,28 @@ pub struct JobSpec {
     pub meter_to: MeterTarget,
     /// Minted by the workflow at `SCHEDULE_AND_RUN_JOB` dispatch (OQ-F); the runner stamps it on
     /// the `job.done` signal — producer/consumer agree, no round-trip.
+    pub idem_token: IdemToken,
+}
+
+/// Immutable, non-launchable job template persisted while work waits in the durable queue.
+///
+/// It intentionally omits [`RunTokenRef`]: per-job credentials are short-lived and must be minted
+/// only after the scheduler has issued an exact live claim. A template becomes executable solely
+/// through [`JobSpecTemplate::resolve`], which attaches that claim-generation token immediately
+/// before launch. This keeps bearer/token lifetime equal to activity lifetime without persisting an
+/// expiring JTI in queued work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobSpecTemplate {
+    pub kind: JobKind,
+    pub image: ImageRef,
+    pub command: Vec<String>,
+    pub env: Vec<EnvVar>,
+    pub secret_refs: Vec<SecretRef>,
+    pub egress: EgressPolicy,
+    pub limits: ResourceLimits,
+    pub workspace: WorkspaceSpec,
+    pub trust_tier: TrustTier,
+    pub meter_to: MeterTarget,
     pub idem_token: IdemToken,
 }
 
@@ -416,17 +438,7 @@ impl JobSpec {
         meter_to: MeterTarget,
         idem_token: IdemToken,
     ) -> Result<JobSpec, SpecError> {
-        if !image.digest_pinned() {
-            return Err(SpecError::UndigestedImage {
-                reference: image.reference,
-            });
-        }
-        if limits.pids_max == 0 {
-            return Err(SpecError::NoPidsMax);
-        }
-        if limits.timeout_secs == 0 {
-            return Err(SpecError::NoTimeout);
-        }
+        validate_job_shape(&image, &limits)?;
         Ok(JobSpec {
             kind,
             image,
@@ -442,6 +454,74 @@ impl JobSpec {
             idem_token,
         })
     }
+}
+
+impl JobSpecTemplate {
+    /// Construct a durable launch template under the same fail-closed image/resource invariants as
+    /// [`JobSpec::new`], but without minting or accepting a run token before the job is claimed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        kind: JobKind,
+        image: ImageRef,
+        command: Vec<String>,
+        env: Vec<EnvVar>,
+        secret_refs: Vec<SecretRef>,
+        egress: EgressPolicy,
+        limits: ResourceLimits,
+        workspace: WorkspaceSpec,
+        trust_tier: TrustTier,
+        meter_to: MeterTarget,
+        idem_token: IdemToken,
+    ) -> Result<Self, SpecError> {
+        validate_job_shape(&image, &limits)?;
+        Ok(Self {
+            kind,
+            image,
+            command,
+            env,
+            secret_refs,
+            egress,
+            limits,
+            workspace,
+            trust_tier,
+            meter_to,
+            idem_token,
+        })
+    }
+
+    /// Attach the freshly minted claim-generation token and produce the only type a sandbox can
+    /// launch. The template itself has no launch method and contains no token reference.
+    pub fn resolve(self, run_token: RunTokenRef) -> JobSpec {
+        JobSpec {
+            kind: self.kind,
+            image: self.image,
+            command: self.command,
+            env: self.env,
+            secret_refs: self.secret_refs,
+            egress: self.egress,
+            limits: self.limits,
+            workspace: self.workspace,
+            trust_tier: self.trust_tier,
+            run_token,
+            meter_to: self.meter_to,
+            idem_token: self.idem_token,
+        }
+    }
+}
+
+fn validate_job_shape(image: &ImageRef, limits: &ResourceLimits) -> Result<(), SpecError> {
+    if !image.digest_pinned() {
+        return Err(SpecError::UndigestedImage {
+            reference: image.reference.clone(),
+        });
+    }
+    if limits.pids_max == 0 {
+        return Err(SpecError::NoPidsMax);
+    }
+    if limits.timeout_secs == 0 {
+        return Err(SpecError::NoTimeout);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -831,6 +911,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn queued_template_contains_no_token_and_resolves_only_at_claim() {
+        let template = JobSpecTemplate::new(
+            JobKind::Ci,
+            digest(),
+            vec!["test".into()],
+            Vec::new(),
+            Vec::new(),
+            EgressPolicy::default(),
+            limits(),
+            WorkspaceSpec::default(),
+            TrustTier::Trusted,
+            MeterTarget {
+                reserve_id: "reserve:job".into(),
+            },
+            IdemToken("wf/job".into()),
+        )
+        .expect("valid template");
+        let wire = serde_json::to_value(&template).expect("serialize template");
+        assert!(wire.get("run_token").is_none());
+        assert!(!wire.to_string().contains("jti"));
+
+        let spec = template.resolve(RunTokenRef {
+            jti: "claim-jti".into(),
+        });
+        assert_eq!(spec.run_token.jti, "claim-jti");
+    }
+
     fn ci_spec() -> JobSpec {
         JobSpec::new(
             JobKind::Ci,
@@ -1069,8 +1177,8 @@ mod tests {
             (hooks.attribute)(&spec.run_token)?; // #2 attribution
             let res = (hooks.reserve)(&spec.meter_to)?; // #1a cost gate (reserve)
                                                         // ... the guest would run here (a real backend launches the hardened VM) ...
-            // CT-001: the seam now carries the command result; the metering settle (guarantee #1)
-            // settles against `result.usage`.
+                                                        // CT-001: the seam now carries the command result; the metering settle (guarantee #1)
+                                                        // settles against `result.usage`.
             let result = SandboxResult::stub_ok(ResourceUsage {
                 cpu_seconds: 1,
                 mem_byte_seconds: 1,
