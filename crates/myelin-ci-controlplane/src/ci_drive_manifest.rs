@@ -171,6 +171,7 @@ pub struct CiDriveManifestV1 {
     pub repo_ref: String,
     pub commit_oid: String,
     pub run_ref: String,
+    pub started_at: String,
     pub trust_tier: CiManifestTrustTierV1,
     pub check_attempts: BTreeMap<String, u32>,
     pub merge_waiter: Option<CiMergeWaiterV1>,
@@ -226,6 +227,7 @@ impl CiDriveManifestV1 {
         validate_bounded("workflow_code_hash", &self.workflow_code_hash)?;
         validate_bounded("authority_policy_revision", &self.authority_policy_revision)?;
         validate_bounded("commit_oid", &self.commit_oid)?;
+        validate_rfc3339_utc("started_at", &self.started_at)?;
         if self.jobs.is_empty() || self.jobs.len() > MAX_MANIFEST_JOBS {
             return invalid("manifest job count is outside 1..=1024");
         }
@@ -754,6 +756,22 @@ fn validate_bounded(label: &str, value: &str) -> Result<(), CiDriveManifestError
     Ok(())
 }
 
+fn validate_rfc3339_utc(label: &str, value: &str) -> Result<(), CiDriveManifestError> {
+    validate_bounded(label, value)?;
+    if !value.ends_with('Z')
+        || value.len() < 20
+        || value.as_bytes().get(4) != Some(&b'-')
+        || value.as_bytes().get(7) != Some(&b'-')
+        || value.as_bytes().get(10) != Some(&b'T')
+        || value.as_bytes().get(13) != Some(&b':')
+        || value.as_bytes().get(16) != Some(&b':')
+        || value.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return invalid(format!("{label} is not a canonical UTC RFC3339 timestamp"));
+    }
+    Ok(())
+}
+
 fn validate_scope(label: &str, value: &str) -> Result<(), CiDriveManifestError> {
     validate_bounded(label, value)?;
     if !value
@@ -886,6 +904,7 @@ mod tests {
             repo_ref: "myelin://acme/git/repo/core".into(),
             commit_oid: "deadbeef".into(),
             run_ref: "myelin://acme/ci/run/44444444-4444-8444-8444-444444444444".into(),
+            started_at: "2026-07-21T12:34:56.000000Z".into(),
             trust_tier: CiManifestTrustTierV1::Trusted,
             check_attempts: BTreeMap::from([("ci:build".into(), 7), ("ci:test".into(), 4)]),
             merge_waiter: None,

@@ -74,6 +74,7 @@ fn manifest() -> CiDriveManifestV1 {
         repo_ref: repo_ref.clone(),
         commit_oid: "deadbeef".into(),
         run_ref: "myelin://manifest-live/ci/run/22222222-2222-8222-8222-222222222222".into(),
+        started_at: "2026-07-21T12:34:56.000000Z".into(),
         trust_tier: CiManifestTrustTierV1::Trusted,
         check_attempts: BTreeMap::from([("ci:build".into(), 9)]),
         merge_waiter: None,
