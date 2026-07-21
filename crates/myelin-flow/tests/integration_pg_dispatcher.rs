@@ -5,8 +5,8 @@ use myelin_config::MyelinConfig;
 use myelin_events::{Actor, IdMinter, MonotonicMinter, OutboxStore};
 use myelin_flow::{
     boot_flow, job_idem_token, migrations::migrations, ActivityError, DurableExecutor, JobKind,
-    JobOutcome, JobRunner, JobSpec, PgFlowDriveStore, PgFlowWorker, PgRunOnceOutcome,
-    PgWorkerScope, RetryPolicy, SignalSpec,
+    JobOutcome, JobRunner, JobSpec, PgClaimedDriveInput, PgFlowDriveStore, PgFlowWorker,
+    PgInputResolveError, PgRunOnceOutcome, PgWorkerError, PgWorkerScope, RetryPolicy, SignalSpec,
 };
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_refs::ArtifactRef;
@@ -302,6 +302,136 @@ async fn two_workers_skip_locked_drive_once_and_never_cross_tenant_or_region() {
         .unwrap();
         assert_eq!(state, "running", "neighbour scope was not observed");
     }
+    cleanup(bare, pool, schema).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn immutable_input_resolution_retries_without_commit_and_permanent_refusal_fail_stops() {
+    let _guard = TEST_LOCK.lock().await;
+    let (bare, pool, schema) = setup("input_resolution").await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let body_calls = Arc::new(AtomicUsize::new(0));
+    let mut flow = worker(&pool, "acme", "no-osl", 5, "worker-resolver");
+    let resolver_attempts = Arc::clone(&attempts);
+    let successful_body_calls = Arc::clone(&body_calls);
+    flow.register_definition_with_input_resolver(
+        "wf.resolved",
+        1,
+        "resolved-v1",
+        move |input: PgClaimedDriveInput| {
+            let resolver_attempts = Arc::clone(&resolver_attempts);
+            async move {
+                assert_eq!(input.tenant, TenantId("acme".into()));
+                assert_eq!(input.region, Region("no-osl".into()));
+                assert_eq!(input.run_id, "R-resolved");
+                if resolver_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(PgInputResolveError::Retry("manifest store unavailable".into()))
+                } else {
+                    Ok(b"pinned-manifest".to_vec())
+                }
+            }
+        },
+        move |input, ctx| {
+            assert_eq!(input.material, b"pinned-manifest");
+            successful_body_calls.fetch_add(1, Ordering::SeqCst);
+            ctx.now();
+            Ok(Vec::new())
+        },
+    )
+    .unwrap();
+
+    let refused_body_calls = Arc::clone(&body_calls);
+    flow.register_definition_with_input_resolver(
+        "wf.refused",
+        1,
+        "refused-v1",
+        |_input: PgClaimedDriveInput| async {
+            Err(PgInputResolveError::Permanent(
+                "manifest digest mismatch".into(),
+            ))
+        },
+        move |_input, _ctx| {
+            refused_body_calls.fetch_add(100, Ordering::SeqCst);
+            Ok(Vec::new())
+        },
+    )
+    .unwrap();
+
+    seed_run(
+        &pool,
+        "acme",
+        "no-osl",
+        "R-resolved",
+        "wf.resolved",
+        0,
+        5,
+    )
+    .await;
+    assert!(matches!(
+        flow.run_once(1_752_796_800, "2026-07-18T00:00:00Z")
+            .await,
+        Err(PgWorkerError::InputUnavailable(ref detail))
+            if detail == "manifest store unavailable"
+    ));
+    let retry_state: (String, i64, Option<String>, i64, i64) = sqlx::query_as(
+        "SELECT state, cursor, lease_owner, \
+           (SELECT count(*) FROM wf_history WHERE tenant_id='acme' AND region='no-osl' \
+             AND run_id='R-resolved'), \
+           (SELECT count(*) FROM outbox) \
+         FROM workflow_run WHERE tenant_id='acme' AND region='no-osl' AND run_id='R-resolved'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retry_state, ("running".into(), 0, None, 0, 0));
+    assert_eq!(body_calls.load(Ordering::SeqCst), 0);
+
+    assert!(matches!(
+        flow.run_once(1_752_796_801, "2026-07-18T00:00:01Z")
+            .await
+            .unwrap(),
+        PgRunOnceOutcome::Driven { .. }
+    ));
+    let completed: (String, i64, i64) = sqlx::query_as(
+        "SELECT state, cursor, \
+           (SELECT count(*) FROM wf_history WHERE tenant_id='acme' AND region='no-osl' \
+             AND run_id='R-resolved') \
+         FROM workflow_run WHERE tenant_id='acme' AND region='no-osl' AND run_id='R-resolved'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(completed, ("completed".into(), 1, 1));
+    assert_eq!(body_calls.load(Ordering::SeqCst), 1);
+
+    seed_run(
+        &pool,
+        "acme",
+        "no-osl",
+        "R-refused",
+        "wf.refused",
+        0,
+        5,
+    )
+    .await;
+    assert!(matches!(
+        flow.run_once(1_752_796_802, "2026-07-18T00:00:02Z")
+            .await
+            .unwrap(),
+        PgRunOnceOutcome::Driven { .. }
+    ));
+    let refused: (String, i64, Option<String>, i64) = sqlx::query_as(
+        "SELECT state, cursor, lease_owner, \
+           (SELECT count(*) FROM wf_history WHERE tenant_id='acme' AND region='no-osl' \
+             AND run_id='R-refused') \
+         FROM workflow_run WHERE tenant_id='acme' AND region='no-osl' AND run_id='R-refused'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(refused, ("nondeterministic".into(), 0, None, 0));
+    assert_eq!(body_calls.load(Ordering::SeqCst), 1, "refused body never ran");
+
     cleanup(bare, pool, schema).await;
 }
 

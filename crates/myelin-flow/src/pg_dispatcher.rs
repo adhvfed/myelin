@@ -18,12 +18,16 @@ use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 const MAX_TOKEN_BYTES: usize = 512;
 const MAX_BATCH: usize = 1024;
+/// Hard memory bound for immutable product input material resolved before a durable body runs.
+pub const MAX_PG_RESOLVED_INPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const OPERATIONAL_PROBE_WF_TYPE: &str = "myelin.flow.operational-probe";
 
 /// Immutable run data supplied to a PostgreSQL workflow body from the claimed drive. Product
@@ -45,6 +49,45 @@ pub struct PgClaimedDriveInput {
     pub partition: i16,
 }
 
+/// Claimed run identity plus immutable, scope-verified product input loaded before the synchronous
+/// deterministic body starts. The material is bounded by [`MAX_PG_RESOLVED_INPUT_BYTES`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PgResolvedDriveInput {
+    pub claimed: PgClaimedDriveInput,
+    pub material: Vec<u8>,
+}
+
+/// Input resolution distinguishes infrastructure that must release/retry from immutable corruption
+/// that must halt the run as nondeterministic. Neither case is silently coerced to empty input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PgInputResolveError {
+    Retry(String),
+    Permanent(String),
+}
+
+/// Asynchronous immutable-input resolver executed under the exact workflow drive lease. Product
+/// adapters use this for digest/scope-verified reads that cannot safely happen inside a synchronous
+/// workflow body.
+pub trait PgWorkflowInputResolver: Send + Sync {
+    fn resolve(
+        &self,
+        input: PgClaimedDriveInput,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, PgInputResolveError>> + Send + '_>>;
+}
+
+impl<F, Fut> PgWorkflowInputResolver for F
+where
+    F: Fn(PgClaimedDriveInput) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<Vec<u8>, PgInputResolveError>> + Send + 'static,
+{
+    fn resolve(
+        &self,
+        input: PgClaimedDriveInput,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, PgInputResolveError>> + Send + '_>> {
+        Box::pin((self)(input))
+    }
+}
+
 impl From<&DriveLease> for PgClaimedDriveInput {
     fn from(lease: &DriveLease) -> Self {
         Self {
@@ -64,7 +107,7 @@ impl From<&DriveLease> for PgClaimedDriveInput {
     }
 }
 
-/// A deterministic production workflow definition.
+/// A deterministic production workflow definition without an external input resolver.
 ///
 /// `Fn` prevents ordinary mutable captures, but Rust cannot exclude interior mutability such as an
 /// `Arc<Mutex<_>>`. A production body must derive every effect-selecting fact from its immutable
@@ -76,9 +119,17 @@ pub type PgWorkflowBody = dyn Fn(&PgClaimedDriveInput, &mut WfCtx) -> Result<Vec
     + Sync
     + 'static;
 
+/// Product body paired with a typed immutable-input resolver.
+pub type PgResolvedWorkflowBody =
+    dyn Fn(&PgResolvedDriveInput, &mut WfCtx) -> Result<Vec<ArtifactRef>, String>
+        + Send
+        + Sync
+        + 'static;
+
 #[derive(Clone)]
 struct RegisteredBody {
-    body: Arc<PgWorkflowBody>,
+    body: Arc<PgResolvedWorkflowBody>,
+    resolver: Option<Arc<dyn PgWorkflowInputResolver>>,
 }
 
 /// One immutable production worker scope. There is deliberately no tenant discovery API.
@@ -252,6 +303,7 @@ pub enum PgWorkerError {
     InvalidConfig(String),
     Definition(ExecutorError),
     Store(DriveStoreError),
+    InputUnavailable(String),
     MissingDefinition { wf_type: String, version: i32 },
     Staging(String),
 }
@@ -350,7 +402,7 @@ impl PgFlowWorker {
         wf_type: &str,
         version: i32,
         code_hash: &str,
-        body: F,
+        legacy_body: F,
     ) -> Result<(), PgWorkerError>
     where
         F: Fn(&PgClaimedDriveInput, &mut WfCtx) -> Result<Vec<ArtifactRef>, String>
@@ -358,8 +410,54 @@ impl PgFlowWorker {
             + Sync
             + 'static,
     {
-        self.executor
-            .register_definition(wf_type, version, code_hash)?;
+        let body = move |input: &PgResolvedDriveInput, ctx: &mut WfCtx| {
+            legacy_body(&input.claimed, ctx)
+        };
+        self.register_body(wf_type, version, code_hash, None, body)
+    }
+
+    /// Register a definition whose per-run immutable product input is resolved asynchronously under
+    /// the claimed lease before the synchronous body is invoked. Retryable resolver failures release
+    /// the lease without committing; permanent failures settle the run `nondeterministic`.
+    pub fn register_definition_with_input_resolver<R, F>(
+        &mut self,
+        wf_type: &str,
+        version: i32,
+        code_hash: &str,
+        resolver: R,
+        body: F,
+    ) -> Result<(), PgWorkerError>
+    where
+        R: PgWorkflowInputResolver + 'static,
+        F: Fn(&PgResolvedDriveInput, &mut WfCtx) -> Result<Vec<ArtifactRef>, String>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.register_body(
+            wf_type,
+            version,
+            code_hash,
+            Some(Arc::new(resolver)),
+            body,
+        )
+    }
+
+    fn register_body<F>(
+        &mut self,
+        wf_type: &str,
+        version: i32,
+        code_hash: &str,
+        resolver: Option<Arc<dyn PgWorkflowInputResolver>>,
+        body: F,
+    ) -> Result<(), PgWorkerError>
+    where
+        F: Fn(&PgResolvedDriveInput, &mut WfCtx) -> Result<Vec<ArtifactRef>, String>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.executor.register_definition(wf_type, version, code_hash)?;
         let key = (wf_type.to_owned(), version);
         if self.bodies.contains_key(&key) {
             return Err(PgWorkerError::InvalidConfig(format!(
@@ -370,6 +468,7 @@ impl PgFlowWorker {
             key,
             RegisteredBody {
                 body: Arc::new(body),
+                resolver,
             },
         );
         Ok(())
@@ -472,14 +571,13 @@ impl PgFlowWorker {
         now_unix_secs: i64,
         now_rfc3339: &str,
     ) -> Result<PgRunOnceOutcome, PgWorkerError> {
-        let body = self
+        let registered = self
             .bodies
             .get(&(lease.wf_type.clone(), lease.wf_version))
             .ok_or_else(|| PgWorkerError::MissingDefinition {
                 wf_type: lease.wf_type.clone(),
                 version: lease.wf_version,
             })?
-            .body
             .clone();
 
         self.store
@@ -529,6 +627,41 @@ impl PgFlowWorker {
         };
         let timers = TimerStore::new();
         let drive_input = PgClaimedDriveInput::from(&claimed_run);
+        let resolved_material = if let Some(resolver) = registered.resolver {
+            match self
+                .resolve_input_under_lease(lease, resolver, drive_input.clone())
+                .await?
+            {
+                Ok(material) => Ok(material),
+                Err(PgInputResolveError::Permanent(detail)) => Err(detail),
+                Err(PgInputResolveError::Retry(detail)) => {
+                    return Err(PgWorkerError::InputUnavailable(detail));
+                }
+            }
+        } else {
+            Ok(Vec::new())
+        };
+
+        if let Err(reason) = &resolved_material {
+            let outcome = DriveOutcome::Nondeterministic(format!(
+                "immutable workflow input permanently refused: {reason}"
+            ));
+            self.store
+                .renew_lease(lease, self.scope.lease_ttl_secs)
+                .await?;
+            let commit = build_commit(lease, &outcome, None)?;
+            let commit_outcome = self.store.commit_drive(lease, commit).await?;
+            return Ok(PgRunOnceOutcome::Driven {
+                run_id: lease.run_id.clone(),
+                outcome,
+                commit: commit_outcome,
+            });
+        }
+        let resolved_input = PgResolvedDriveInput {
+            claimed: drive_input,
+            material: resolved_material
+                .expect("permanent resolution failure returned above"),
+        };
         let mut ctx = WfCtx::resume_staged_versioned(
             Arc::new(DriveIdMinter::new(&lease.run_id)),
             ctx_base,
@@ -546,8 +679,9 @@ impl PgFlowWorker {
         // The body is synchronous by contract, so run it off the async executor while this task
         // heartbeats the exact owner+epoch lease. A body that outlives one TTL cannot commit under
         // stale authority; a failed renewal aborts the drive and the guarded release path runs.
+        let body = registered.body;
         let mut body_task = tokio::task::spawn_blocking(move || {
-            let result = body(&drive_input, &mut ctx);
+            let result = body(&resolved_input, &mut ctx);
             (ctx, result)
         });
         let renew_every = Duration::from_secs((self.scope.lease_ttl_secs as u64 / 3).max(1));
@@ -608,6 +742,40 @@ impl PgFlowWorker {
             outcome,
             commit: commit_outcome,
         })
+    }
+
+    async fn resolve_input_under_lease(
+        &self,
+        lease: &DriveLease,
+        resolver: Arc<dyn PgWorkflowInputResolver>,
+        input: PgClaimedDriveInput,
+    ) -> Result<Result<Vec<u8>, PgInputResolveError>, PgWorkerError> {
+        let resolution = resolver.resolve(input);
+        tokio::pin!(resolution);
+        let renew_every = Duration::from_secs((self.scope.lease_ttl_secs as u64 / 3).max(1));
+        let mut heartbeat =
+            tokio::time::interval_at(tokio::time::Instant::now() + renew_every, renew_every);
+        loop {
+            tokio::select! {
+                result = &mut resolution => {
+                    return Ok(result.and_then(|material| {
+                        if material.len() > MAX_PG_RESOLVED_INPUT_BYTES {
+                            Err(PgInputResolveError::Permanent(format!(
+                                "resolved input is {} bytes; maximum is {MAX_PG_RESOLVED_INPUT_BYTES}",
+                                material.len()
+                            )))
+                        } else {
+                            Ok(material)
+                        }
+                    }));
+                }
+                _ = heartbeat.tick() => {
+                    self.store
+                        .renew_lease(lease, self.scope.lease_ttl_secs)
+                        .await?;
+                }
+            }
+        }
     }
 
     /// Drive until idle or until the explicit bound is reached.
