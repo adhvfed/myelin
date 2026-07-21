@@ -43,7 +43,8 @@ const SELECT_QUEUED_RUN: &str = "\
 SELECT tenant_id, run_id::text AS run_id, region, project_id::text AS project_id,
        pipeline_id::text AS pipeline_id, wf_run_id::text AS wf_run_id, repo_ref, commit_oid,
        cause_event_id, definition_snapshot, trigger_kind, triggered_by, trust_tier, state,
-       cost_settled, correlation_id, created_at::text AS created_at,
+       cost_settled, correlation_id,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at,
        finished_at::text AS finished_at
 FROM ci_run
 WHERE tenant_id = $1 AND region = $2 AND state = 'queued'
@@ -54,7 +55,8 @@ const LOCK_EXACT_QUEUED_RUN: &str = "\
 SELECT tenant_id, run_id::text AS run_id, region, project_id::text AS project_id,
        pipeline_id::text AS pipeline_id, wf_run_id::text AS wf_run_id, repo_ref, commit_oid,
        cause_event_id, definition_snapshot, trigger_kind, triggered_by, trust_tier, state,
-       cost_settled, correlation_id, created_at::text AS created_at,
+       cost_settled, correlation_id,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at,
        finished_at::text AS finished_at
 FROM ci_run
 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND state = 'queued'
@@ -499,6 +501,7 @@ impl PgCiPipelineStarter {
             ));
         }
         validate_candidate(&self.tenant, &self.region, &locked)?;
+        let started_at = locked.created_at.clone();
         let record = locked.record;
         let replay = lock_existing_exact_workflow(&mut transaction, &record).await?;
         let existing = manifest_store
@@ -512,7 +515,7 @@ impl PgCiPipelineStarter {
                         "drive manifest exists without its atomically-started workflow".into(),
                     ));
                 }
-                validate_replay_manifest(&record, &existing)?;
+                validate_replay_manifest(&record, &started_at, &existing)?;
                 verify_replay_attempts(&mut transaction, &record, &existing).await?;
                 let definition = CiWorkflowDefinitionPin::new(
                     existing.workflow_definition_version,
@@ -555,6 +558,7 @@ impl PgCiPipelineStarter {
                     &authority,
                     granted_jobs,
                     attempts,
+                    &started_at,
                 )?;
                 let digest = manifest_store
                     .insert_on_conn(&mut transaction, &manifest)
@@ -957,6 +961,7 @@ fn expected_ci_jobs_v2(
 
 fn validate_replay_manifest(
     record: &CiRunRecord,
+    started_at: &str,
     manifest: &CiDriveManifestV1,
 ) -> Result<(), PgCiStarterError> {
     manifest.validate().map_err(PgCiStarterError::Manifest)?;
@@ -1002,6 +1007,7 @@ fn validate_replay_manifest(
         || manifest.repo_ref != record.repo_ref.as_deref().unwrap_or_default()
         || manifest.commit_oid != record.commit_oid.as_deref().unwrap_or_default()
         || manifest.run_ref != ci_run_ref(&record.tenant_id, &record.run_id).0
+        || manifest.started_at != started_at
         || manifest.trust_tier != trust_tier
     {
         return Err(PgCiStarterError::CorruptRun(
@@ -1220,6 +1226,7 @@ fn build_drive_manifest_v1(
     authority: &CiLaunchAuthorityV1,
     jobs: Vec<GrantedCiJobV1>,
     check_attempts: BTreeMap<String, u32>,
+    started_at: &str,
 ) -> Result<CiDriveManifestV1, PgCiStarterError> {
     let trust_tier = match record.trust_tier.as_str() {
         "trusted" => CiManifestTrustTierV1::Trusted,
@@ -1261,6 +1268,7 @@ fn build_drive_manifest_v1(
         repo_ref,
         commit_oid,
         run_ref: ci_run_ref(&record.tenant_id, &record.run_id).0,
+        started_at: started_at.into(),
         trust_tier,
         check_attempts,
         merge_waiter: authority.merge_waiter.clone(),
