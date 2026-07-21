@@ -301,10 +301,6 @@ pub enum ClaimRefusal {
     /// region runner claims cross-tenant; a reporter is tenant-bound, so a mis-routed completion is
     /// refused rather than signalled against the wrong tenant's run.
     TenantMismatch { reporter: String, claimed: String },
-    /// The claimed `job_id` is not the deterministic dispatch id for the echoed `idem_token`. The
-    /// dispatch derives `job_id = stage_job_id(idem_token)`; a completion whose `(job_id, idem_token)`
-    /// do not agree is forged, not a real claim.
-    JobIdMismatch { claimed: String, expected: String },
     /// No durable `ci_job_spec` dispatch record exists for `(tenant, job_id)` — the job was never
     /// dispatched/claimed under this identity (a fabricated completion), so it is refused.
     NoDispatchRecord { job_id: String },
@@ -322,10 +318,6 @@ impl std::fmt::Display for ClaimRefusal {
             ClaimRefusal::TenantMismatch { reporter, claimed } => write!(
                 f,
                 "claimed tenant `{claimed}` is not this reporter's tenant `{reporter}`"
-            ),
-            ClaimRefusal::JobIdMismatch { claimed, expected } => write!(
-                f,
-                "claimed job_id `{claimed}` is not the deterministic dispatch id `{expected}` for the echoed idem_token"
             ),
             ClaimRefusal::NoDispatchRecord { job_id } => write!(
                 f,
@@ -345,8 +337,7 @@ impl std::fmt::Display for ClaimRefusal {
 
 /// **The PURE (DB-free) claimed-job verification — the security core, unit-testable with NO pool.**
 /// Given the completion's claimed authority `(claimed_tenant, presented_run, presented_job_id,
-/// presented_idem_token)`, the reporter's bound `reporter_tenant`, the `expected_job_id` the dispatch
-/// deterministically derives from the idem_token, and the durable dispatch record read for
+/// presented_idem_token)`, the reporter's bound `reporter_tenant`, and the durable dispatch record read for
 /// `(tenant, job_id)`, returns the durable stage the verdict attributes to — or a [`ClaimRefusal`]
 /// (fail-closed, nothing signalled). Every field of the durable claimed-job identity must match; a
 /// forged / mis-keyed / unclaimed completion resolves no matching record and is refused.
@@ -356,19 +347,12 @@ fn verify_claimed_identity(
     presented_run: &str,
     presented_job_id: &str,
     presented_idem_token: &str,
-    expected_job_id: &str,
     durable: Option<ClaimedDispatchIdentity>,
 ) -> Result<String, ClaimRefusal> {
     if claimed_tenant != reporter_tenant {
         return Err(ClaimRefusal::TenantMismatch {
             reporter: reporter_tenant.0.clone(),
             claimed: claimed_tenant.0.clone(),
-        });
-    }
-    if presented_job_id != expected_job_id {
-        return Err(ClaimRefusal::JobIdMismatch {
-            claimed: presented_job_id.to_string(),
-            expected: expected_job_id.to_string(),
         });
     }
     let Some(identity) = durable else {
@@ -460,7 +444,7 @@ impl From<PgError> for CompletionTxError {
 ///
 /// 1. **Verifies the claim.** It reads the durable `ci_job_spec` dispatch record for `(tenant, job_id)`
 ///    and refuses fail-closed ([`ClaimRefusal`]) unless the claimed `tenant`, `job_id`
-///    (== `stage_job_id(idem_token)`), `run_id`, and `idem_token` ALL match the durable record — so a
+///    `run_id`, and `idem_token` ALL match the durable record — so a
 ///    caller cannot forge a completion for a job it does not own, and the idem token is no longer a
 ///    predictable `(run_id, command_id)` free pass (it must match a real claimed row).
 /// 2. **Resolves the stage DURABLY.** The verdict-attribution stage name comes from the `ci_job_spec.stage`
@@ -548,7 +532,6 @@ impl TerminalReporter for CiPipelineReporter {
             )));
         }
 
-        let expected_job_id = DurableJobRunner::stage_job_id(idem_token);
         let job_uuid = Uuid::parse_str(job_id)
             .map_err(|_| ExecutorError::InvalidInput(format!("invalid job_id UUID `{job_id}`")))?;
         let nonce_uuid = Uuid::parse_str(claim_nonce).map_err(|_| {
@@ -562,7 +545,6 @@ impl TerminalReporter for CiPipelineReporter {
         let owner_owned = lease_owner.to_string();
         let nonce_owned = claim_nonce.to_string();
         let report_owned = report.clone();
-        let expected_owned = expected_job_id;
         let spec_store = self.spec_store.clone();
         let pg_executor = self.pg_executor.clone();
 
@@ -589,7 +571,6 @@ impl TerminalReporter for CiPipelineReporter {
                             &run_owned.0,
                             &job_owned,
                             &idem_owned,
-                            &expected_owned,
                             identity,
                         )
                         .map_err(|_| CompletionTxError::Refused)?;

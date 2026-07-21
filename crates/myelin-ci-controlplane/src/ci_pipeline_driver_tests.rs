@@ -207,7 +207,6 @@ fn verify_admits_a_fully_matching_claim_and_returns_the_durable_stage() {
         "44444444-4444-4444-4444-444444444444",
         &job_id,
         idem,
-        &job_id,
         Some(durable_identity(
             "44444444-4444-4444-4444-444444444444",
             idem,
@@ -233,31 +232,28 @@ fn verify_refuses_a_cross_tenant_claim() {
         "R",
         &job_id,
         idem,
-        &job_id,
         Some(durable_identity("R", idem, "build")),
     )
     .expect_err("a cross-tenant completion is refused");
     assert!(matches!(err, ClaimRefusal::TenantMismatch { .. }));
 }
 
-/// **A completion whose claimed `job_id` is not the deterministic dispatch id for its `idem_token` is
-/// refused** — the predictable idem token is no longer a free pass; it must agree with the claimed row.
+/// Manifest job UUIDs are independent of Flow's idempotency token. The durable row, not a second
+/// derivation scheme, binds the two identities.
 #[test]
-fn verify_refuses_a_job_id_that_is_not_the_dispatch_id_for_the_idem_token() {
+fn verify_admits_an_exact_manifest_job_id_bound_by_the_durable_record() {
     let idem = "R/ci.pipeline:0/job";
-    let expected = DurableJobRunner::stage_job_id(idem);
-    let forged_job_id = DurableJobRunner::stage_job_id("R/ci.pipeline:9/job");
-    let err = verify_claimed_identity(
+    let manifest_job_id = "aaaaaaaa-aaaa-8aaa-8aaa-aaaaaaaaaaaa";
+    let stage = verify_claimed_identity(
         &TenantId("acme".into()),
         &TenantId("acme".into()),
         "R",
-        &forged_job_id,
+        manifest_job_id,
         idem,
-        &expected,
         Some(durable_identity("R", idem, "build")),
     )
-    .expect_err("a job_id that is not stage_job_id(idem_token) is refused");
-    assert!(matches!(err, ClaimRefusal::JobIdMismatch { .. }));
+    .expect("the durable dispatch record binds an exact manifest job UUID");
+    assert_eq!(stage, "build");
 }
 
 /// **A completion with NO durable dispatch record is refused** — a fabricated `job.done` for a job that
@@ -272,7 +268,6 @@ fn verify_refuses_a_completion_with_no_durable_dispatch_record() {
         "R",
         &job_id,
         idem,
-        &job_id,
         None,
     )
     .expect_err("no durable record → refused");
@@ -292,7 +287,6 @@ fn verify_refuses_a_run_or_idem_that_diverges_from_the_durable_record() {
         "R",
         &job_id,
         idem,
-        &job_id,
         Some(durable_identity("OTHER-RUN", idem, "build")),
     )
     .expect_err("a divergent durable run_id is refused");
@@ -304,7 +298,6 @@ fn verify_refuses_a_run_or_idem_that_diverges_from_the_durable_record() {
         "R",
         &job_id,
         idem,
-        &job_id,
         Some(durable_identity("R", "R/ci.pipeline:7/job", "build")),
     )
     .expect_err("a divergent durable idem_token is refused");

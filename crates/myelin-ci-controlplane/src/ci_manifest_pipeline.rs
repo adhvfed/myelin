@@ -55,6 +55,10 @@ impl CiManifestInputResolver {
         })
     }
 
+    pub fn definition(&self) -> &CiWorkflowDefinitionPin {
+        &self.definition
+    }
+
     async fn resolve_manifest(
         &self,
         input: PgClaimedDriveInput,
@@ -156,6 +160,16 @@ pub fn drive_resolved_ci_manifest_pipeline<R>(
 where
     R: JobRunner,
 {
+    let manifest = decode_resolved_ci_manifest(input)?;
+    run_ci_manifest_pipeline(ctx, &manifest, runner)
+        .map_err(|error| format!("manifest CI workflow failed: {error:?}"))?;
+    Ok(vec![ArtifactRef(manifest.run_ref)])
+}
+
+/// Decode canonical resolver output and bind it again to the claimed workflow identity.
+pub fn decode_resolved_ci_manifest(
+    input: &PgResolvedDriveInput,
+) -> Result<CiDriveManifestV1, String> {
     let manifest = CiDriveManifestV1::decode_canonical(&input.material)
         .map_err(|error| format!("resolved CI manifest refused: {error}"))?;
     if manifest.tenant_id != input.claimed.tenant.0
@@ -166,9 +180,7 @@ where
     {
         return Err("resolved CI manifest changed claimed workflow identity".into());
     }
-    run_ci_manifest_pipeline(ctx, &manifest, runner)
-        .map_err(|error| format!("manifest CI workflow failed: {error:?}"))?;
-    Ok(vec![ArtifactRef(manifest.run_ref)])
+    Ok(manifest)
 }
 
 /// Execute the validated manifest DAG through Flow's split dispatch/join surface.
