@@ -48,10 +48,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use myelin_storage::{with_tenant_tx, with_tenant_tx_error, PgError, TenantScope};
+use myelin_ci_sandbox::ResourceUsage;
+use myelin_storage::{
+    with_tenant_tx, with_tenant_tx_error, DurableCostLedger, MinorUnits, PgError,
+    RunId as CostRunId, TenantScope,
+};
 use sqlx::postgres::PgPool;
 use sqlx::types::Uuid;
 use sqlx::Row;
+
+use crate::ci_drive_manifest::CiDriveManifestStore;
+use crate::job_accounting_store::{CiJobAccountingRecord, CiJobAccountingStore};
 
 /// **The `ci_run` row a reserve/start bundle persists (all the `CREATE_CI_RUN_DDL` columns the writer
 /// binds).** Owned `String`s so the durable store binds them directly (the `uuid` columns are bound as
@@ -214,11 +221,12 @@ SELECT
   correlation_id          AS correlation_id
 FROM ci_run WHERE tenant_id = $1 AND run_id = $2::uuid";
 
-/// Lock the run-of-record before its one-way terminal transition. The completion timestamp is
-/// compared in PostgreSQL's timestamp domain so an exact replay is independent of text rendering.
+/// Lock the run-of-record before its one-way terminal transition. Any persisted completion timestamp
+/// is rendered canonically so an acknowledgement-loss replay can reuse it byte-for-byte.
 pub const LOCK_CI_RUN_FOR_FINALIZE_QUERY: &str = "\
 SELECT state, cost_settled,
-       finished_at IS NOT DISTINCT FROM $5::timestamptz AS finished_at_matches
+       to_char(finished_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+         AS completed_at
 FROM ci_run
 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND wf_run_id = $4::uuid
 FOR UPDATE";
@@ -226,7 +234,7 @@ FOR UPDATE";
 /// Read every immutable accounting receipt bound to the exact CI/workflow run pair. The finalizer
 /// compares this set with the manifest's complete job set before certifying `cost_settled=true`.
 pub const SELECT_CI_RUN_ACCOUNTING_QUERY: &str = "\
-SELECT job_id::text AS job_id, reserve_handle, passed, timed_out
+SELECT job_id::text AS job_id, reserve_handle, passed, timed_out, skipped
 FROM ci_job_accounting
 WHERE tenant_id = $1 AND region = $2 AND ci_run_id = $3::uuid AND wf_run_id = $4::uuid
 ORDER BY job_id
@@ -239,7 +247,8 @@ UPDATE ci_run
 SET state = $5, cost_settled = true, finished_at = $6::timestamptz
 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND wf_run_id = $4::uuid
   AND state = 'running' AND cost_settled = false AND finished_at IS NULL
-RETURNING run_id";
+RETURNING to_char(finished_at AT TIME ZONE 'UTC',
+                  'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS completed_at";
 
 /// One manifest job whose exact reservation must have an immutable terminal-accounting receipt.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,6 +259,9 @@ pub struct CiRunFinalizationJob {
     pub reserve_handle: String,
     /// Whether Flow's dispatch-relative deadline won before this job's accounting signal arrived.
     pub flow_timed_out: bool,
+    /// Whether the workflow dispatched this job. False means dependency-skipped and requires a
+    /// co-committed cancellation receipt rather than runner accounting.
+    pub dispatched: bool,
 }
 
 /// The terminal lifecycle state derived from the complete immutable receipt set.
@@ -297,6 +309,17 @@ pub enum CiRunFinalizationWrite {
     ExactReplay,
 }
 
+/// Durable finalization result. The completion time is always read back from PostgreSQL in canonical
+/// UTC form, so an activity retry after an acknowledgement-loss crash reuses the first committed
+/// time instead of depending on a not-yet-committed `WfCtx::now()` marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiRunFinalizationOutcome {
+    /// Whether this call applied the transition or observed its exact replay.
+    pub write: CiRunFinalizationWrite,
+    /// Canonical persisted UTC completion time.
+    pub completed_at: String,
+}
+
 /// Synchronous effect boundary used by the deterministic Flow body. Implementations must be
 /// exact-replay safe because an effect can commit before its Flow history row does.
 pub trait CiRunFinalizer: Send + Sync {
@@ -304,7 +327,7 @@ pub trait CiRunFinalizer: Send + Sync {
     fn finalize(
         &self,
         finalization: &CiRunFinalization,
-    ) -> Result<CiRunFinalizationWrite, CiRunStoreError>;
+    ) -> Result<CiRunFinalizationOutcome, CiRunStoreError>;
 }
 
 /// A durable `ci_run`-store failure. Loud + typed — a write/read NEVER silently drops or coerces. Safe
@@ -349,6 +372,10 @@ pub enum CiRunStoreError {
     TerminalVerdictDivergence,
     /// The run exists but is neither the canonical running shape nor an exact terminal replay.
     FinalizationStateDivergence,
+    /// Dependency-skipped reservation cancellation or immutable receipt recording was refused.
+    SkippedJobAccounting,
+    /// The requested terminal job/reservation set differs from immutable launch authority.
+    FinalizationManifestDivergence,
 }
 
 impl core::fmt::Display for CiRunStoreError {
@@ -400,6 +427,14 @@ impl core::fmt::Display for CiRunStoreError {
                 f,
                 "durable ci_run finalization collided with the stored lifecycle state"
             ),
+            CiRunStoreError::SkippedJobAccounting => write!(
+                f,
+                "durable ci_run finalization could not close skipped-job accounting"
+            ),
+            CiRunStoreError::FinalizationManifestDivergence => write!(
+                f,
+                "durable ci_run finalization differs from immutable manifest authority"
+            ),
         }
     }
 }
@@ -438,14 +473,31 @@ pub struct CiRunStore {
 #[derive(Clone)]
 pub struct DurableCiRunFinalizer {
     store: CiRunStore,
+    ledger: DurableCostLedger,
+    accounting: CiJobAccountingStore,
+    manifest: CiDriveManifestStore,
     scope: TenantScope,
     rt: tokio::runtime::Handle,
 }
 
 impl DurableCiRunFinalizer {
     /// Bind the durable store to a verified tenant scope and the service runtime.
-    pub fn new(store: CiRunStore, scope: TenantScope, rt: tokio::runtime::Handle) -> Self {
-        Self { store, scope, rt }
+    pub fn new(
+        store: CiRunStore,
+        ledger: DurableCostLedger,
+        accounting: CiJobAccountingStore,
+        manifest: CiDriveManifestStore,
+        scope: TenantScope,
+        rt: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            store,
+            ledger,
+            accounting,
+            manifest,
+            scope,
+            rt,
+        }
     }
 }
 
@@ -453,8 +505,84 @@ impl CiRunFinalizer for DurableCiRunFinalizer {
     fn finalize(
         &self,
         finalization: &CiRunFinalization,
-    ) -> Result<CiRunFinalizationWrite, CiRunStoreError> {
-        let future = self.store.finalize_ci_run(&self.scope, finalization);
+    ) -> Result<CiRunFinalizationOutcome, CiRunStoreError> {
+        let tenant = self.scope.tenant().as_str().to_owned();
+        let region = self.scope.region().as_str().to_owned();
+        let store = self.store.clone();
+        let ledger = self.ledger.clone();
+        let accounting = self.accounting.clone();
+        let manifest_store = self.manifest.clone();
+        let scope = self.scope.clone();
+        let finalization = finalization.clone();
+        let pool = store.pool().clone();
+        let future = with_tenant_tx_error(&pool, &tenant, &region, move |conn| {
+            Box::pin(async move {
+                let (manifest, _) = manifest_store
+                    .load_by_wf_run_on_conn(conn, &finalization.wf_run_id)
+                    .await
+                    .map_err(|_| CiRunStoreError::FinalizationManifestDivergence)?
+                    .ok_or(CiRunStoreError::FinalizationManifestDivergence)?;
+                let expected: BTreeMap<&str, &str> = manifest
+                    .jobs
+                    .iter()
+                    .map(|job| (job.job_id.as_str(), job.reserve_handle.as_str()))
+                    .collect();
+                if manifest.ci_run_id != finalization.run_id
+                    || expected.len() != finalization.jobs.len()
+                    || finalization.jobs.iter().any(|job| {
+                        expected.get(job.job_id.as_str()).copied()
+                            != Some(job.reserve_handle.as_str())
+                    })
+                {
+                    return Err(CiRunStoreError::FinalizationManifestDivergence);
+                }
+                for job in finalization.jobs.iter().filter(|job| !job.dispatched) {
+                    let refunded = ledger
+                        .cancel_unstarted_in_tx(
+                            conn,
+                            scope.tenant(),
+                            &CostRunId(job.reserve_handle.clone()),
+                        )
+                        .await
+                        .map_err(|_| CiRunStoreError::SkippedJobAccounting)?;
+                    let existing = accounting
+                        .load_in_tx(conn, &scope, &job.job_id)
+                        .await
+                        .map_err(|_| CiRunStoreError::SkippedJobAccounting)?;
+                    if let Some(existing) = existing {
+                        let expected_receipt =
+                            skipped_completion_receipt(&scope, &finalization, job);
+                        if !existing.skipped
+                            || existing.wf_run_id != finalization.wf_run_id
+                            || existing.ci_run_id != finalization.run_id
+                            || existing.reserve_handle != job.reserve_handle
+                            || existing.passed
+                            || existing.timed_out
+                            || existing.usage.cpu_seconds != 0
+                            || existing.usage.mem_byte_seconds != 0
+                            || existing.pricing_revision != "ci-skipped:v1"
+                            || existing.billed != MinorUnits::ZERO
+                            || existing.refunded != refunded
+                            || existing.completion_receipt != expected_receipt
+                        {
+                            return Err(CiRunStoreError::SkippedJobAccounting);
+                        }
+                        continue;
+                    }
+                    accounting
+                        .record_in_tx(
+                            conn,
+                            &scope,
+                            &skipped_accounting_record(&scope, &finalization, job, refunded),
+                        )
+                        .await
+                        .map_err(|_| CiRunStoreError::SkippedJobAccounting)?;
+                }
+                store
+                    .finalize_ci_run_in_tx(conn, &scope, &finalization)
+                    .await
+            })
+        });
         match tokio::runtime::Handle::try_current() {
             Ok(_) => tokio::task::block_in_place(|| self.rt.block_on(future)),
             Err(_) => self.rt.block_on(future),
@@ -570,28 +698,37 @@ impl CiRunStore {
 
     /// Finalize one run only after the manifest's complete job set has exact immutable accounting.
     /// The receipt verification and lifecycle compare-and-set share one tenant-scoped transaction.
-    /// Exact replay is accepted only when state, settlement bit, and journaled completion time match.
+    /// Exact replay returns the first persisted completion time so an acknowledgement-loss retry
+    /// cannot rewrite it or fail merely because the new drive proposed a later clock value.
     pub async fn finalize_ci_run(
         &self,
         scope: &TenantScope,
         finalization: &CiRunFinalization,
-    ) -> Result<CiRunFinalizationWrite, CiRunStoreError> {
-        validate_finalization(finalization)?;
-        if scope.tenant().as_str() != finalization.tenant_id
-            || scope.region().as_str() != finalization.region
-        {
-            return Err(CiRunStoreError::InvalidFinalization(
-                "tenant or region scope",
-            ));
-        }
+    ) -> Result<CiRunFinalizationOutcome, CiRunStoreError> {
+        validate_finalization_scope(scope, finalization)?;
         let tenant = scope.tenant().as_str().to_owned();
         let region = scope.region().as_str().to_owned();
+        let store = self.clone();
         let scope = scope.clone();
         let finalization = finalization.clone();
         with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
-            Box::pin(async move { finalize_on_conn(conn, &scope, &finalization).await })
+            Box::pin(async move {
+                store
+                    .finalize_ci_run_in_tx(conn, &scope, &finalization)
+                    .await
+            })
         })
         .await
+    }
+
+    async fn finalize_ci_run_in_tx(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        scope: &TenantScope,
+        finalization: &CiRunFinalization,
+    ) -> Result<CiRunFinalizationOutcome, CiRunStoreError> {
+        validate_finalization_scope(scope, finalization)?;
+        finalize_on_conn(conn, scope, finalization).await
     }
 }
 
@@ -599,13 +736,12 @@ async fn finalize_on_conn(
     conn: &mut sqlx::PgConnection,
     scope: &TenantScope,
     finalization: &CiRunFinalization,
-) -> Result<CiRunFinalizationWrite, CiRunStoreError> {
+) -> Result<CiRunFinalizationOutcome, CiRunStoreError> {
     let locked = sqlx::query(LOCK_CI_RUN_FOR_FINALIZE_QUERY)
         .bind(scope.tenant().as_str())
         .bind(scope.region().as_str())
         .bind(&finalization.run_id)
         .bind(&finalization.wf_run_id)
-        .bind(&finalization.completed_at)
         .fetch_optional(&mut *conn)
         .await
         .map_err(|_| CiRunStoreError::Db("ci_run finalization lock".into()))?
@@ -639,6 +775,9 @@ async fn finalize_on_conn(
         if job.reserve_handle != reserve_handle {
             return Err(CiRunStoreError::TerminalAccountingDivergence);
         }
+        if row.get::<bool, _>("skipped") == job.dispatched {
+            return Err(CiRunStoreError::TerminalAccountingDivergence);
+        }
         all_passed &= row.get::<bool, _>("passed");
         any_timed_out |= job.flow_timed_out || row.get::<bool, _>("timed_out");
     }
@@ -655,11 +794,15 @@ async fn finalize_on_conn(
 
     let state: String = locked.get("state");
     let cost_settled: bool = locked.get("cost_settled");
-    let finished_at_matches: bool = locked.get("finished_at_matches");
-    if state == finalization.terminal_state.as_str() && cost_settled && finished_at_matches {
-        return Ok(CiRunFinalizationWrite::ExactReplay);
+    let stored_completed_at: Option<String> = locked.get("completed_at");
+    if state == finalization.terminal_state.as_str() && cost_settled {
+        return Ok(CiRunFinalizationOutcome {
+            write: CiRunFinalizationWrite::ExactReplay,
+            completed_at: stored_completed_at
+                .ok_or(CiRunStoreError::FinalizationStateDivergence)?,
+        });
     }
-    if state != "running" || cost_settled || finished_at_matches {
+    if state != "running" || cost_settled || stored_completed_at.is_some() {
         return Err(CiRunStoreError::FinalizationStateDivergence);
     }
 
@@ -673,10 +816,58 @@ async fn finalize_on_conn(
         .fetch_optional(&mut *conn)
         .await
         .map_err(|_| CiRunStoreError::Db("ci_run terminal transition".into()))?;
-    if updated.is_none() {
-        return Err(CiRunStoreError::FinalizationStateDivergence);
+    let updated = updated.ok_or(CiRunStoreError::FinalizationStateDivergence)?;
+    Ok(CiRunFinalizationOutcome {
+        write: CiRunFinalizationWrite::Finalized,
+        completed_at: updated.get("completed_at"),
+    })
+}
+
+fn skipped_accounting_record(
+    scope: &TenantScope,
+    finalization: &CiRunFinalization,
+    job: &CiRunFinalizationJob,
+    refunded: MinorUnits,
+) -> CiJobAccountingRecord {
+    CiJobAccountingRecord {
+        tenant: scope.tenant().clone(),
+        job_id: job.job_id.clone(),
+        wf_run_id: finalization.wf_run_id.clone(),
+        ci_run_id: finalization.run_id.clone(),
+        reserve_handle: job.reserve_handle.clone(),
+        passed: false,
+        timed_out: false,
+        skipped: true,
+        usage: ResourceUsage {
+            cpu_seconds: 0,
+            mem_byte_seconds: 0,
+        },
+        pricing_revision: "ci-skipped:v1".into(),
+        billed: MinorUnits::ZERO,
+        refunded,
+        completion_receipt: skipped_completion_receipt(scope, finalization, job),
     }
-    Ok(CiRunFinalizationWrite::Finalized)
+}
+
+fn skipped_completion_receipt(
+    scope: &TenantScope,
+    finalization: &CiRunFinalization,
+    job: &CiRunFinalizationJob,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"myelin.ci.skipped-accounting.v1\0");
+    for field in [
+        scope.tenant().as_str(),
+        scope.region().as_str(),
+        finalization.run_id.as_str(),
+        finalization.wf_run_id.as_str(),
+        job.job_id.as_str(),
+        job.reserve_handle.as_str(),
+    ] {
+        hasher.update(&(field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    format!("v3:{}", hasher.finalize().to_hex())
 }
 
 fn validate_finalization(finalization: &CiRunFinalization) -> Result<(), CiRunStoreError> {
@@ -716,6 +907,26 @@ fn validate_finalization(finalization: &CiRunFinalization) -> Result<(), CiRunSt
                 "duplicate reserve handle",
             ));
         }
+        if job.flow_timed_out && !job.dispatched {
+            return Err(CiRunStoreError::InvalidFinalization(
+                "timed-out undispatched job",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_finalization_scope(
+    scope: &TenantScope,
+    finalization: &CiRunFinalization,
+) -> Result<(), CiRunStoreError> {
+    validate_finalization(finalization)?;
+    if scope.tenant().as_str() != finalization.tenant_id
+        || scope.region().as_str() != finalization.region
+    {
+        return Err(CiRunStoreError::InvalidFinalization(
+            "tenant or region scope",
+        ));
     }
     Ok(())
 }
@@ -835,6 +1046,17 @@ fn validate_initial_state(row: &CiRunInsert) -> Result<(), CiRunStoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+    use myelin_tenancy::{Region, TenantId};
+
+    fn scope() -> TenantScope {
+        let principal = Principal::stub(
+            PrincipalId("ci-finalizer-test".into()),
+            PrincipalKind::Service,
+            TenantId("acme".into()),
+        );
+        TenantScope::from_verified_token(&principal, Region("fr-par".into()))
+    }
 
     fn sample_row() -> CiRunInsert {
         CiRunInsert {
@@ -870,6 +1092,7 @@ mod tests {
                 job_id: "55555555-5555-5555-5555-555555555555".into(),
                 reserve_handle: "reserve:job-1".into(),
                 flow_timed_out: false,
+                dispatched: true,
             }],
         }
     }
@@ -981,6 +1204,7 @@ mod tests {
         }
         assert!(LOCK_CI_RUN_FOR_FINALIZE_QUERY.contains("FOR UPDATE"));
         assert!(SELECT_CI_RUN_ACCOUNTING_QUERY.contains("FOR SHARE"));
+        assert!(SELECT_CI_RUN_ACCOUNTING_QUERY.contains("skipped"));
         for guard in [
             "state = 'running'",
             "cost_settled = false",
@@ -1006,12 +1230,27 @@ mod tests {
             job_id: "66666666-6666-6666-6666-666666666666".into(),
             reserve_handle: duplicate_reserve.jobs[0].reserve_handle.clone(),
             flow_timed_out: false,
+            dispatched: true,
         });
         assert_eq!(
             validate_finalization(&duplicate_reserve),
             Err(CiRunStoreError::InvalidFinalization(
                 "duplicate reserve handle"
             ))
+        );
+    }
+
+    #[test]
+    fn skipped_receipt_is_stable_across_acknowledgement_loss_retries() {
+        let first = sample_finalization();
+        let first_receipt = skipped_completion_receipt(&scope(), &first, &first.jobs[0]);
+        let mut retry = first.clone();
+        retry.completed_at = "2026-07-21T13:00:01Z".into();
+        retry.terminal_state = CiRunTerminalState::Failed;
+
+        assert_eq!(
+            skipped_completion_receipt(&scope(), &retry, &retry.jobs[0]),
+            first_receipt
         );
     }
 }

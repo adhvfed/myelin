@@ -131,8 +131,7 @@ pub const CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID: &str = "ci_0001b_ci_run_causal_
 /// it so its checksum is never rewritten and the `ci_0015` create stays byte-frozen.
 pub const CI_JOB_SPEC_STAGE_MIGRATION_ID: &str = "ci_0015a_ci_job_spec_stage";
 /// Forward-only disposition column for dependency-skipped job accounting receipts.
-pub const CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID: &str =
-    "ci_0017a_ci_job_accounting_skipped";
+pub const CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID: &str = "ci_0017a_ci_job_accounting_skipped";
 /// Forward-only migration id for [`ALTER_JOB_QUEUE_ADD_COMPLETION_DDL`]. A sub-migration of the
 /// already-applied `ci_0004_job_queue` table, applied immediately after it (the `ci_0002a` convention)
 /// so the `ci_0004` create stays byte-frozen. Its ADD COLUMNs are non-blocking (a constant-default
@@ -1060,6 +1059,15 @@ mod tests {
             "RAISE EXCEPTION 'ci_job_accounting is immutable'",
         ] {
             assert!(ddl.contains(required), "accounting DDL pins `{required}`");
+        }
+        for required in [
+            "skipped boolean NOT NULL DEFAULT false",
+            "NOT skipped OR (NOT passed AND NOT timed_out)",
+        ] {
+            assert!(
+                ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL.contains(required),
+                "skipped-accounting ALTER pins `{required}`"
+            );
         }
     }
 
