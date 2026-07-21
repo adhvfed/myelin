@@ -830,6 +830,30 @@ manifest authority handle is not a token JTI), exact replay readback, reserve/se
 reporter identity; settle `ci_run` and terminal cost posture; attach Flow budget/remint hooks; and run
 the exact-tenant region poller/worker composition. `MYELIN_CI_RUNNER=1` remains startup-refused.
 
+**CI exact manifest dispatch and claimed completion identity (2026-07-21, `c932fe4` +
+`fd88acc`).** Durable queue/spec replay now reads both rows back inside the insert transaction and
+requires the complete requested tuple to match; an idempotency collision, job UUID collision, or
+scheduling/spec drift rolls the transaction back instead of silently accepting `ON CONFLICT DO
+NOTHING`. The manifest-native production adapter preserves each immutable `ci_job.job_id` through
+`job_queue` and `ci_job_spec`, translates the exact image, command, environment, secret handles,
+egress, resources, workspace provenance, trust tier, reserve, lane, labels, concurrency group, and
+fair key, and accepts Flow only as the source of the engine-minted idempotency token. Per-job token
+minting is an explicit adapter with no permissive default; its complete request is retry-stable and
+the returned bounded JTI must differ from the manifest's authority handle. The completion reporter
+now authenticates arbitrary manifest job UUIDs through the durable spec identity plus the live
+queue claim CAS, rather than requiring the unrelated legacy `stage_job_id(idem_token)` derivation;
+missing, cross-tenant, stale-lease, wrong-run, wrong-token, flipped-verdict, and replay forgeries stay
+fail-closed. The live PostgreSQL proof starts from the real manifest starter, survives resolver
+retry and worker reconstruction, verifies exact immutable root/dependent UUIDs in the durable queue,
+reads every executable and scheduling field back from the persisted sandbox specs, and completes the
+out-of-order DAG exactly once. Its drive clock is derived from PostgreSQL, removing a hard-coded
+wall-clock deadline flake. The full control-plane all-target/all-feature suite, real-runsc
+culmination/adversarial completion proof, and warnings-denied clippy are green. **Honest remaining
+activation floors:** compose real policy-aware launch and token-authority adapters; attach Flow's
+budget/remint hooks and the live reserve/settle bookend; atomically settle `ci_run` plus terminal cost
+posture; run the exact-tenant region poller/worker composition; and close the myelin-flow M2 durable
+`RunStore` floor. Production execution remains startup-refused.
+
 ## R5–R6
 
 | Phase | Status |
