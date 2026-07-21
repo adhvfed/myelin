@@ -80,8 +80,9 @@ pub use ci_manifest_pipeline::{
 /// connection (the SAME tx as the dedup mark — atomic), while the co-emitted events stay absorb-mode
 /// through the outbox (the honest #7 H1 split). Constructed at the composition root by
 /// [`ci_run_store_factory`]; the `ci_run` table it writes is created by the shared
-/// [`ci_durable_migrations`] both CI mains apply at boot. Registering/starting the `ci.pipeline` body is
-/// CT-004d.2 chunk 2/3 (NOT this chunk).
+/// [`ci_durable_migrations`] both CI mains apply at boot. Manifest-backed registration now lives in
+/// [`register_ci_manifest_pipeline`]; production activation remains gated on its authority/runner
+/// adapters and poller.
 pub mod ci_run_store;
 pub mod ci_scheduler_db;
 /// CT-004a (CI backend reconcile-and-harden — the FOUNDATION chunk): the REAL durable `cost_event`
@@ -153,8 +154,9 @@ pub mod job_queue_store;
 /// as one `spec jsonb` column keyed `(tenant, job_id)`, co-committed with the `job_queue` row in one
 /// tenant-scoped tx on the shared `idem_token`, feeding the claim-gating `trust_tier` FROM the spec
 /// (never widened). Constructed at the composition root by [`ci_job_spec_store`]; the real resolver is
-/// [`runner_bind::durable_spec_resolver`]. Registering/starting the `ci.pipeline` body on the executor +
-/// the live settle bookend are CT-004d.2/.3 (NOT this chunk).
+/// [`runner_bind::durable_spec_resolver`]. The manifest-native body is registered separately through
+/// [`register_ci_manifest_pipeline`]; the exact-job manifest runner and live settle bookend remain
+/// activation floors.
 pub mod job_spec_store;
 /// Versioned, tenant-bound loader for the immutable CI execution plan stored in the definition
 /// snapshot CAS object. This module prepares and validates a plan; it deliberately does not start
@@ -219,8 +221,9 @@ pub mod surfacing_index;
 pub mod surfacing_tools;
 pub mod surge;
 
-// CI-P15 (P-358): the `ci.pipeline` DURABLE WORKFLOW BODY + the X-1 producer side. The deterministic
-// Rust body registered under `CI_PIPELINE_WF_TYPE` at serve (guarded by the flow-determinism lint):
+// CI-P15 (P-358): the legacy sequential compatibility body + X-1 producer fixtures. Fresh V2
+// manifest-backed runs use `ci_manifest_pipeline`, whose deterministic body preserves the DAG and
+// exact per-context attempts. This older body remains for its pinned definitions and drills:
 // the protected-env / manual gates (9.4), the runner stages over the FROZEN `SCHEDULE_AND_RUN_JOB`
 // long-park substrate (9.4/11.7/9.3), and CI's X-1 producer emits — the per-context terminal
 // `ci.check.updated` facts + `ci.run.failed`/`ci.run.succeeded` + the `ci.result` rollup signal
@@ -780,8 +783,9 @@ pub fn ci_run_store_factory(pool: sqlx::PgPool) -> CiRunStore {
 /// query runs), so no queued run is started yet. This composition deliberately carries the starter's
 /// unavailable-authority adapter: even if it were accidentally driven, every fresh V2 launch would
 /// fail before allocating attempts or writing a manifest. The later activation flip must explicitly
-/// replace that adapter, add the region-wide queued-run poller, emit initial checks, compose the
-/// DAG-native body consumer, and close the myelin-flow M2 durable `RunStore` floor.
+/// replace that adapter, add the region-wide queued-run poller, compose the exact manifest-to-sandbox
+/// runner/token authority and terminal settlement path, and close the remaining worker budget/remint
+/// floors.
 pub fn ci_run_starter_factory(
     pool: sqlx::PgPool,
     region: myelin_tenancy::Region,

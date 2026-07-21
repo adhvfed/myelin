@@ -807,6 +807,29 @@ authority, make the durable workflow body consume the manifest as a DAG, add exa
 worker fan-out, and close the myelin-flow M2 durable `RunStore` floor. Production execution remains
 startup-refused.
 
+**CI immutable-input resolver and manifest-native DAG body (2026-07-21, `fd5e2b8` + `182bf3e`).**
+`PgFlowWorker` now supports a bounded asynchronous immutable-input resolver under the exact fenced
+drive lease. Retryable infrastructure failure releases the lease with no history, outbox, signal,
+or run settlement; permanent identity/digest/schema refusal halts the run nondeterministically
+without invoking the synchronous body. The production CI resolver strictly decodes the starter's
+two canonical references, loads the tenant/region-scoped insert-only manifest by workflow/run/digest,
+and reasserts the deployed workflow version and code hash. Registration pairs that resolver with the
+new manifest-native body so a fresh V2 launch cannot accidentally use the legacy sequential fixture.
+The body dispatches every ready DAG frontier, joins by Flow's deterministic deadline/token order,
+drains already-dispatched siblings after a failure, suppresses descendants of a failed frontier, and
+emits terminal checks using each manifest-frozen context attempt and a journaled completion clock.
+The strongest live proof starts through the real PostgreSQL starter, injects a resolver outage with
+zero commit, dispatches two roots, destroys the worker, delivers their completions out of order,
+reconstructs a worker to launch the dependent, reconstructs again to terminalize, and observes exact
+manifest job UUID targets plus per-context success facts. Full `myelin-flow` and
+`myelin-ci-controlplane` all-target/all-feature suites and warnings-denied clippy are green. The full
+gate also exposed and fixed a pre-existing parallel integration-test schema collision (`3ce4808`).
+**Honest remaining activation floors:** supply a real policy-aware launch authority; translate each
+exact manifest job into the durable queue/sandbox spec with an explicit retry-safe token mint (the
+manifest authority handle is not a token JTI), exact replay readback, reserve/settle, and claim-bound
+reporter identity; settle `ci_run` and terminal cost posture; attach Flow budget/remint hooks; and run
+the exact-tenant region poller/worker composition. `MYELIN_CI_RUNNER=1` remains startup-refused.
+
 ## R5–R6
 
 | Phase | Status |
