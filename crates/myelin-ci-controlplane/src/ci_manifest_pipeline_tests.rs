@@ -430,6 +430,41 @@ fn accounting_refusal_prevents_every_terminal_outward_fact() {
 }
 
 #[test]
+fn malformed_job_verdict_is_a_protocol_error_never_a_user_failure() {
+    for payload in [
+        vec![stage_verdict_marker("another-job", true)],
+        vec![ArtifactRef("ci.artifact:without-verdict".into())],
+    ] {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let signals = SignalStore::new();
+        let timers = TimerStore::new();
+        let runner = RecordingRunner::default();
+        let finalizer = RecordingFinalizer::default();
+        signals.deliver(SignalRow {
+            tenant: tenant(),
+            region: region(),
+            run_id: RUN_ID.into(),
+            signal_name: JOB_DONE_SIGNAL.into(),
+            idem_key: dispatch_token(0),
+            payload,
+            payload_key_ref: None,
+            received_unix_ms: 2,
+            consumed_seq: None,
+        });
+
+        let mut ctx = begin(&outbox, journal, signals, timers);
+        assert!(matches!(
+            run_ci_manifest_pipeline(&mut ctx, &manifest(), &runner, &finalizer),
+            Err(WfError::CoCommit(_))
+        ));
+        ctx.commit().unwrap();
+        assert!(outbox.committed_rows().is_empty());
+        assert!(finalizer.finalizations().is_empty());
+    }
+}
+
+#[test]
 fn flow_timeout_parks_until_late_accounting_then_emits_timed_out_once() {
     let outbox = OutboxStore::new();
     let journal = WfJournal::new();
