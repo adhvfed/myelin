@@ -305,7 +305,7 @@ fn verify_refuses_a_run_or_idem_that_diverges_from_the_durable_record() {
 }
 
 #[test]
-fn completion_receipt_binds_claim_authority_stage_and_ordered_refs() {
+fn completion_receipt_binds_claim_authority_stage_accounting_and_ordered_refs() {
     let tenant = TenantId("acme".into());
     let run = RunId("11111111-1111-1111-1111-111111111111".into());
     let nonce = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -313,6 +313,10 @@ fn completion_receipt_binds_claim_authority_stage_and_ordered_refs() {
         ArtifactRef("myelin://acme/ci/artifact/first".into()),
         ArtifactRef("myelin://acme/ci/artifact/second".into()),
     ];
+    let usage = ResourceUsage {
+        cpu_seconds: 17,
+        mem_byte_seconds: 4_096,
+    };
     let receipt = completion_receipt(CompletionReceiptInput {
         tenant: &tenant,
         region: "fr-par",
@@ -321,6 +325,8 @@ fn completion_receipt_binds_claim_authority_stage_and_ordered_refs() {
         idem_token: "idem-1",
         stage: "build",
         passed: true,
+        timed_out: false,
+        usage,
         result_refs: &refs,
         lease_owner: "worker-1",
         lease_epoch: 7,
@@ -336,11 +342,50 @@ fn completion_receipt_binds_claim_authority_stage_and_ordered_refs() {
         idem_token: "idem-1",
         stage: "build",
         passed: true,
+        timed_out: false,
+        usage,
         result_refs: &reversed,
         lease_owner: "worker-1",
         lease_epoch: 7,
         claim_nonce: nonce,
     });
-    assert!(receipt.starts_with("v2:"));
+    assert!(receipt.starts_with("v3:"));
     assert_ne!(receipt, changed, "result-ref order is receipt authority");
+
+    let timed_out = completion_receipt(CompletionReceiptInput {
+        tenant: &tenant,
+        region: "fr-par",
+        run: &run,
+        job_id: "22222222-2222-2222-2222-222222222222",
+        idem_token: "idem-1",
+        stage: "build",
+        passed: false,
+        timed_out: true,
+        usage,
+        result_refs: &refs,
+        lease_owner: "worker-1",
+        lease_epoch: 7,
+        claim_nonce: nonce,
+    });
+    assert_ne!(receipt, timed_out, "timeout status is receipt authority");
+
+    let changed_usage = completion_receipt(CompletionReceiptInput {
+        tenant: &tenant,
+        region: "fr-par",
+        run: &run,
+        job_id: "22222222-2222-2222-2222-222222222222",
+        idem_token: "idem-1",
+        stage: "build",
+        passed: true,
+        timed_out: false,
+        usage: ResourceUsage {
+            cpu_seconds: usage.cpu_seconds + 1,
+            ..usage
+        },
+        result_refs: &refs,
+        lease_owner: "worker-1",
+        lease_epoch: 7,
+        claim_nonce: nonce,
+    });
+    assert_ne!(receipt, changed_usage, "actual usage is receipt authority");
 }

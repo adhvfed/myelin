@@ -85,7 +85,7 @@
 //! report run against LIVE Postgres ONLY in `tests/integration_runner_lease.rs` (the `integration`
 //! feature). `cargo build --workspace` + the default `cargo test` stay DB-free AND VM-free.
 
-use crate::{JobSpec, RunnerHooks, SandboxBackend, SandboxLaunch};
+use crate::{JobSpec, ResourceUsage, RunnerHooks, SandboxBackend, SandboxLaunch};
 use myelin_flow::{
     DurableExecutor, ExecutorError, RunId, SignalOutcome, SignalSpec, JOB_DONE_SIGNAL,
 };
@@ -481,11 +481,16 @@ impl FirehoseSink for CountingFirehose {
 
 /// **A job's terminal outcome (the `job.done` payload, arch 03 §1.1 / §2).** References-not-payloads:
 /// `result_refs` are canonical scoped `ArtifactRef`s from result publishers, never log bytes
-/// or a PII body. `passed` is the pass/fail the parked workflow's DAG proceeds on.
+/// or a PII body. `passed` is the pass/fail the parked workflow's DAG proceeds on. `usage` and
+/// `timed_out` are bounded accounting/verdict metadata derived by the sandbox, not caller input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalReport {
     /// Whether the job passed (the DAG-walk decision the workflow resumes on).
     pub passed: bool,
+    /// Whether the sandbox deadline terminated the job. A timed-out job can never pass.
+    pub timed_out: bool,
+    /// Actual resource usage measured by the sandbox backend for terminal accounting.
+    pub usage: ResourceUsage,
     /// The job's canonical scoped result refs (references-not-payloads, §3.4). The CI-P20 firehose
     /// owns its deeper log pointer; this field never contains log bytes.
     pub result_refs: Vec<ArtifactRef>,
@@ -827,6 +832,8 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
         // smuggled through the typed verdict. Concrete artifact publishers can add scoped refs later.
         let report = TerminalReport {
             passed,
+            timed_out: result.timed_out,
+            usage: result.usage,
             result_refs: vec![],
         };
 
@@ -1479,7 +1486,7 @@ mod tests {
     /// command's outcome back, the defect RESHAPE-001 fixes.
     #[test]
     fn runner_derives_terminal_report_from_the_sandbox_result() {
-        fn run_with(result: SandboxResult) -> bool {
+        fn run_with(result: SandboxResult) -> TerminalReport {
             let (ex, run) = started_run();
             let idem = job_idem_token(&run.0, "ci.pipeline:0");
             let q = JobLeaseStore::new();
@@ -1509,7 +1516,7 @@ mod tests {
                 &reporter,
                 test_hooks(),
             );
-            agent.run_one(1000).expect("run").report.passed
+            agent.run_one(1000).expect("run").report
         }
 
         fn usage() -> ResourceUsage {
@@ -1520,36 +1527,48 @@ mod tests {
         }
 
         // exit 0, not timed out ⇒ PASS.
-        assert!(run_with(SandboxResult {
+        let passed = run_with(SandboxResult {
             exit_code: Some(0),
             timed_out: false,
             usage: usage(),
             stdout: Vec::new(),
             stderr: Vec::new(),
-        }));
+        });
+        assert!(passed.passed);
+        assert!(!passed.timed_out);
+        assert_eq!(passed.usage, usage());
         // exit 1 ⇒ FAIL.
-        assert!(!run_with(SandboxResult {
-            exit_code: Some(1),
-            timed_out: false,
-            usage: usage(),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        }));
+        assert!(
+            !run_with(SandboxResult {
+                exit_code: Some(1),
+                timed_out: false,
+                usage: usage(),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+            .passed
+        );
         // timed out ⇒ FAIL even though no exit code (killed by the timeout).
-        assert!(!run_with(SandboxResult {
+        let timed_out = run_with(SandboxResult {
             exit_code: None,
             timed_out: true,
             usage: usage(),
             stdout: Vec::new(),
             stderr: Vec::new(),
-        }));
+        });
+        assert!(!timed_out.passed);
+        assert!(timed_out.timed_out);
+        assert_eq!(timed_out.usage, usage());
         // timed out with a stale 0 exit ⇒ still FAIL (timeout dominates).
-        assert!(!run_with(SandboxResult {
-            exit_code: Some(0),
-            timed_out: true,
-            usage: usage(),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        }));
+        assert!(
+            !run_with(SandboxResult {
+                exit_code: Some(0),
+                timed_out: true,
+                usage: usage(),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+            .passed
+        );
     }
 }
