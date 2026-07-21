@@ -619,6 +619,11 @@ fn sub_opaque(reference: &ArtifactRef) -> Option<String> {
         | Sub::Row(id)
         | Sub::Field(id)
         | Sub::Check(id) => Some(id),
+        Sub::CommitCheck {
+            commit_oid,
+            context,
+        } => Some(format!("commit-{commit_oid}/check-{context}")),
+        Sub::CommitCiResult { commit_oid } => Some(format!("commit-{commit_oid}/ci-result")),
         Sub::Step(n) => Some(n.to_string()),
         Sub::LineRange { start, end } => Some(format!("L{start}-L{end}")),
     }

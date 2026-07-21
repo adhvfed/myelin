@@ -43,6 +43,23 @@ fn thread_ref() -> ArtifactRef {
     crate::subs::mint_thread("acme", "01J0THR").unwrap()
 }
 
+#[test]
+fn foreign_commit_check_subanchors_preserve_their_canonical_opaque_body() {
+    let check = ArtifactRef(
+        "myelin://acme/chat/channel/C-board#commit-deadbeef/check-build".into(),
+    );
+    let result =
+        ArtifactRef("myelin://acme/chat/channel/C-board#commit-deadbeef/ci-result".into());
+    assert_eq!(
+        sub_opaque(&check).as_deref(),
+        Some("commit-deadbeef/check-build")
+    );
+    assert_eq!(
+        sub_opaque(&result).as_deref(),
+        Some("commit-deadbeef/ci-result")
+    );
+}
+
 /// A synthetic `IdentityService` whose `check` returns Allow only for an allow-listed `(subject,
 /// object)`. All other methods are the names-only fail-closed defaults (project only consumes `check`).
 #[derive(Default)]
