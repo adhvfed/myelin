@@ -45,6 +45,15 @@ async function devLogin(page: Page) {
   await page.waitForURL("**/git/repos");
 }
 
+async function waitForInteractiveShell(page: Page) {
+  await expect(page.locator('.app-shell[data-shortcuts-ready="true"]')).toBeVisible();
+}
+
+async function gotoInteractive(page: Page, path: string) {
+  await page.goto(path);
+  await waitForInteractiveShell(page);
+}
+
 async function expectNoAxeViolations(page: Page, context: string) {
   const result = await new AxeBuilder({ page })
     .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
@@ -67,7 +76,7 @@ test.describe("R4.4 founder Issues web floor", () => {
 
   test("list, key search, state tabs, and roving rows stay authoritative and keyboard-operable", async ({ page }) => {
     await devLogin(page);
-    await page.goto("/issues");
+    await gotoInteractive(page, "/issues");
     await expect(page.getByRole("heading", { level: 1, name: "Issues" })).toBeVisible();
     await expect(page.getByText("Close the founder feedback loop")).toBeVisible();
     await expect(page.getByTitle("State: Todo").first()).toBeVisible();
@@ -98,7 +107,7 @@ test.describe("R4.4 founder Issues web floor", () => {
 
   test("opaque load-more appends the final authorized row without totals", async ({ page }) => {
     await devLogin(page);
-    await page.goto("/issues");
+    await gotoInteractive(page, "/issues");
     await expect(page.getByTestId("issue-row")).toHaveCount(50);
     await page.getByRole("button", { name: "Load more" }).click();
     await expect(page.getByTestId("issue-row")).toHaveCount(51);
@@ -108,7 +117,7 @@ test.describe("R4.4 founder Issues web floor", () => {
   test("a delayed old cursor page cannot mix into a new filter generation", async ({ page }) => {
     await setEdgeConfig({ issueListCursorDelaysMs: [750, 2_000] });
     await devLogin(page);
-    await page.goto("/issues");
+    await gotoInteractive(page, "/issues");
     await expect(page.getByTestId("issue-row")).toHaveCount(50);
 
     await page.getByRole("button", { name: "Load more" }).click();
@@ -131,7 +140,7 @@ test.describe("R4.4 founder Issues web floor", () => {
 
   test("quick capture is focus-safe from both the button and command palette", async ({ page }) => {
     await devLogin(page);
-    await page.goto("/issues");
+    await gotoInteractive(page, "/issues");
     await page.waitForLoadState("networkidle");
     const trigger = page.getByRole("button", { name: "New issue" });
     await trigger.focus();
@@ -144,7 +153,7 @@ test.describe("R4.4 founder Issues web floor", () => {
     await expect(dialog).toBeHidden();
     await expect(trigger).toBeFocused();
 
-    await page.keyboard.press("Meta+k");
+    await page.keyboard.press("ControlOrMeta+k");
     const command = page.getByRole("combobox", { name: /Search or run a command/ });
     await command.fill("Create issue");
     await command.press("Enter");
@@ -156,7 +165,7 @@ test.describe("R4.4 founder Issues web floor", () => {
   test("202 create remains visibly pending until fresh polling observes active", async ({ page }) => {
     await setEdgeConfig({ issueActivationPolls: 3 });
     await devLogin(page);
-    await page.goto("/issues");
+    await gotoInteractive(page, "/issues");
     await page.waitForLoadState("networkidle");
     await page.getByRole("button", { name: "Load more" }).click();
     await expect(page.getByTestId("issue-row")).toHaveCount(51);
@@ -188,6 +197,7 @@ test.describe("R4.4 founder Issues web floor", () => {
     expect(new Set(ids).size).toBe(52);
 
     await page.reload();
+    await waitForInteractiveShell(page);
     await expect(page.getByTestId("issue-row")).toHaveCount(50);
     await page.getByRole("button", { name: "Load more" }).click();
     await expect(page.getByTestId("issue-row")).toHaveCount(52);
@@ -201,7 +211,7 @@ test.describe("R4.4 founder Issues web floor", () => {
   test("an unavailable activation confirmation is announced without inferring failure", async ({ page }) => {
     await setEdgeConfig({ issueActivationUnavailable: true });
     await devLogin(page);
-    await page.goto("/issues");
+    await gotoInteractive(page, "/issues");
     await page.getByRole("button", { name: "New issue" }).click();
     await page.getByLabel("Title").fill("Keep an honest activation status");
     await page.getByRole("button", { name: "Create issue" }).click();
@@ -215,7 +225,7 @@ test.describe("R4.4 founder Issues web floor", () => {
   test("ambiguous create and close failures tell the founder to check before retrying", async ({ page }) => {
     await setEdgeConfig({ issueCreateUnavailable: true });
     await devLogin(page);
-    await page.goto("/issues");
+    await gotoInteractive(page, "/issues");
     await page.getByRole("button", { name: "New issue" }).click();
     await page.getByLabel("Title").fill("Do not overclaim a failed create");
     await page.getByRole("button", { name: "Create issue" }).click();
@@ -225,7 +235,7 @@ test.describe("R4.4 founder Issues web floor", () => {
     await expect(page.getByRole("alert")).not.toContainText("Nothing was submitted twice");
 
     await setEdgeConfig({ issueCreateUnavailable: false, issueCloseUnavailable: true });
-    await page.goto(`/issues/${OPEN_ID}`);
+    await gotoInteractive(page, `/issues/${OPEN_ID}`);
     await page.getByRole("button", { name: "Close issue" }).click();
     await page.getByRole("alertdialog").getByRole("button", { name: "Close issue" }).click();
     await expect(page.getByRole("alert")).toContainText(
@@ -236,7 +246,7 @@ test.describe("R4.4 founder Issues web floor", () => {
 
   test("detail closes only after a safe-focus confirmation", async ({ page }) => {
     await devLogin(page);
-    await page.goto(`/issues/${OPEN_ID}`);
+    await gotoInteractive(page, `/issues/${OPEN_ID}`);
     await expect(page.getByRole("heading", { name: "Close the founder feedback loop" })).toBeVisible();
     await expectNoAxeViolations(page, "Issue detail");
     await page.getByRole("button", { name: "Close issue" }).click();
@@ -251,7 +261,7 @@ test.describe("R4.4 founder Issues web floor", () => {
   test("empty, projection-unavailable, and leak-free not-available states stay distinct", async ({ page }) => {
     await setEdgeConfig({ emptyIssues: true });
     await devLogin(page);
-    await page.goto("/issues?state=all");
+    await gotoInteractive(page, "/issues?state=all");
     await expect(page.getByTestId("issues-empty")).toContainText("No issues yet");
 
     await setEdgeConfig({ issuesUnavailable: true });
@@ -259,14 +269,14 @@ test.describe("R4.4 founder Issues web floor", () => {
     await expect(page.getByTestId("issues-error")).toContainText("authorization is catching up");
 
     await setEdgeConfig({ issuesUnavailable: false });
-    await page.goto("/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    await gotoInteractive(page, "/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
     await expect(page.getByTestId("issue-detail-error")).toContainText("not available to you");
   });
 
   test("an open-empty view never claims the tenant has no issues when closed work exists", async ({ page }) => {
     await setEdgeConfig({ onlyClosedIssues: true });
     await devLogin(page);
-    await page.goto("/issues");
+    await gotoInteractive(page, "/issues");
     await expect(page.getByTestId("issues-state-empty")).toContainText("No open issues");
     await expect(page.getByText("No issues yet")).toHaveCount(0);
 
@@ -277,7 +287,7 @@ test.describe("R4.4 founder Issues web floor", () => {
   test("375px layout retains key, title, state, and actions without horizontal overflow", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 });
     await devLogin(page);
-    await page.goto("/issues");
+    await gotoInteractive(page, "/issues");
     await expect(page.getByText("MYL-102", { exact: true })).toBeVisible();
     await expect(page.getByText("Close the founder feedback loop")).toBeVisible();
     await expect(page.getByTitle("State: Todo").first()).toBeVisible();
