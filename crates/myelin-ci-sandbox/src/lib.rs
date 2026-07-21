@@ -454,6 +454,25 @@ impl JobSpec {
             idem_token,
         })
     }
+
+    /// Split a resolved launch spec into its persistable template and ephemeral token reference.
+    /// Callers must not serialize the returned token alongside the template.
+    pub fn into_template(self) -> (JobSpecTemplate, RunTokenRef) {
+        let template = JobSpecTemplate {
+            kind: self.kind,
+            image: self.image,
+            command: self.command,
+            env: self.env,
+            secret_refs: self.secret_refs,
+            egress: self.egress,
+            limits: self.limits,
+            workspace: self.workspace,
+            trust_tier: self.trust_tier,
+            meter_to: self.meter_to,
+            idem_token: self.idem_token,
+        };
+        (template, self.run_token)
+    }
 }
 
 impl JobSpecTemplate {

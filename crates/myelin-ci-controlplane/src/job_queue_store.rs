@@ -180,6 +180,8 @@ pub struct LeasedJob {
     pub fair_key: String,
     /// The trust tier of the leased job (the security-load-bearing fact).
     pub trust_tier: TrustTier,
+    /// The runner identity that owns this exact live claim.
+    pub lease_owner: String,
     /// **The claim generation** — the monotone `lease_epoch` the claim bumped (CT-004d.2 claim-bound
     /// completion). The runner carries this to `report_done`; the completion CAS refuses a stale claim
     /// (a lower epoch than the row's) so a reaped-and-re-claimed worker cannot win first delivery.

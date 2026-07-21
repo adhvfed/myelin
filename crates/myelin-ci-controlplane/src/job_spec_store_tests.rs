@@ -10,10 +10,10 @@ use myelin_ci_sandbox::{
     SecretRef, TrustTier, WorkspaceSpec,
 };
 
-/// A fully-populated `JobSpec` — EVERY field set to a non-default, distinguishable value, so the
+/// A fully-populated durable launch template — EVERY field set to a non-default, distinguishable value, so the
 /// round-trip test proves no field is dropped/defaulted by the jsonb serialization.
-fn full_spec(trust: TrustTier, timeout_secs: u32) -> JobSpec {
-    JobSpec::new(
+fn full_spec(trust: TrustTier, timeout_secs: u32) -> DurableCiJobLaunchTemplate {
+    let resolved = myelin_ci_sandbox::JobSpec::new(
         JobKind::Ci,
         ImageRef::pinned(
             "registry.example/runner@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -47,7 +47,13 @@ fn full_spec(trust: TrustTier, timeout_secs: u32) -> JobSpec {
         MeterTarget { reserve_id: "reserve-9910".into() },
         IdemToken("idem-ci.pipeline:stage-3".into()),
     )
-    .unwrap()
+    .unwrap();
+    let (spec, _token) = resolved.into_template();
+    DurableCiJobLaunchTemplate {
+        spec,
+        ci_run_id: "22222222-2222-2222-2222-222222222222".into(),
+        token_authority_handle: "identity-authority:job-1".into(),
+    }
 }
 
 /// **The whole `JobSpec` round-trips through the `spec jsonb` column FAITHFULLY (every field).** The
@@ -61,7 +67,8 @@ fn a_full_jobspec_round_trips_through_jsonb_faithfully() {
     // serialize exactly as `co_persist_dispatch` does (serde_json::to_value → the jsonb column).
     let json = serde_json::to_value(&spec).expect("JobSpec serializes to jsonb");
     // decode exactly as `get_spec` does.
-    let back = decode_spec(&uid_job(), json).expect("the stored jsonb decodes back to a JobSpec");
+    let back = decode_launch_template(&uid_job(), json)
+        .expect("the stored jsonb decodes back to a launch template");
     assert_eq!(
         back, spec,
         "the decoded spec equals the original — no field lost/defaulted"
@@ -69,34 +76,44 @@ fn a_full_jobspec_round_trips_through_jsonb_faithfully() {
 
     // Spot-check the load-bearing fields explicitly (a defence against a PartialEq that ever loosened).
     assert_eq!(
-        back.image.reference, spec.image.reference,
+        back.spec.image.reference, spec.spec.image.reference,
         "the digest-pinned image survives"
     );
-    assert_eq!(back.command, spec.command, "the command line survives");
-    assert_eq!(back.env, spec.env, "the env vars survive");
     assert_eq!(
-        back.secret_refs, spec.secret_refs,
+        back.spec.command, spec.spec.command,
+        "the command line survives"
+    );
+    assert_eq!(back.spec.env, spec.spec.env, "the env vars survive");
+    assert_eq!(
+        back.spec.secret_refs, spec.spec.secret_refs,
         "the secret NAME refs survive"
     );
     assert_eq!(
-        back.egress.allow, spec.egress.allow,
+        back.spec.egress.allow, spec.spec.egress.allow,
         "the egress allowlist survives"
     );
     assert_eq!(
-        back.limits, spec.limits,
+        back.spec.limits, spec.spec.limits,
         "all resource limits survive (incl. timeout, pids_max)"
     );
     assert_eq!(
-        back.workspace, spec.workspace,
+        back.spec.workspace, spec.spec.workspace,
         "the workspace repo+commit survives"
     );
-    assert_eq!(back.trust_tier, spec.trust_tier, "the trust tier survives");
     assert_eq!(
-        back.run_token, spec.run_token,
-        "the per-run token ref survives"
+        back.spec.trust_tier, spec.spec.trust_tier,
+        "the trust tier survives"
     );
-    assert_eq!(back.meter_to, spec.meter_to, "the meter target survives");
-    assert_eq!(back.idem_token, spec.idem_token, "the idem token survives");
+    assert_eq!(
+        back.spec.meter_to, spec.spec.meter_to,
+        "the meter target survives"
+    );
+    assert_eq!(
+        back.spec.idem_token, spec.spec.idem_token,
+        "the idem token survives"
+    );
+    assert_eq!(back.token_authority_handle, spec.token_authority_handle);
+    assert!(!serde_json::to_string(&back).unwrap().contains("run_token"));
 }
 
 /// **A corrupt stored spec is a fail-closed [`CiJobSpecStoreError::CorruptSpec`], NEVER a default.**
@@ -106,7 +123,7 @@ fn a_full_jobspec_round_trips_through_jsonb_faithfully() {
 fn a_corrupt_spec_jsonb_is_a_fail_closed_resolve_error() {
     // A syntactically-fine json that is NOT a JobSpec shape.
     let corrupt = serde_json::json!({ "not": "a jobspec", "kind": "Nonsense" });
-    let e = decode_spec("11111111-1111-1111-1111-111111111111", corrupt)
+    let e = decode_launch_template("11111111-1111-1111-1111-111111111111", corrupt)
         .expect_err("a non-JobSpec jsonb fails the resolve closed");
     assert!(
         matches!(e, CiJobSpecStoreError::CorruptSpec { .. }),
@@ -115,7 +132,7 @@ fn a_corrupt_spec_jsonb_is_a_fail_closed_resolve_error() {
     // A partial spec (missing required fields) also fails closed — no field is defaulted in.
     let partial = serde_json::json!({ "kind": "Ci" });
     assert!(matches!(
-        decode_spec("job", partial).unwrap_err(),
+        decode_launch_template("job", partial).unwrap_err(),
         CiJobSpecStoreError::CorruptSpec { .. }
     ));
 }

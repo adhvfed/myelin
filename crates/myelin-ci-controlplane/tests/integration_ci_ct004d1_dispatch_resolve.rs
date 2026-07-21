@@ -31,12 +31,15 @@
 //!     --test integration_ci_ct004d1_dispatch_resolve -- --nocapture
 #![cfg(feature = "integration")]
 
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use myelin_ci_controlplane::{
     ci_job_queue_store, ci_job_spec_store, ci_region_queue_store_test_support,
-    durable_spec_resolver, CiJobSpecStoreError, DurableEnqueue, DurableLeaseAdapter,
+    durable_spec_resolver, CiJobSpecStoreError, CiJobTokenIssueError, CiJobTokenIssuer,
+    CiJobTokenRequest, DurableCiJobLaunchTemplate, DurableEnqueue, DurableLeaseAdapter,
     EnqueueOutcome, Lane, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
     ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CI_RUNNER_LEASE_TTL_SECS, CREATE_CI_JOB_SPEC_DDL,
     CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
@@ -244,8 +247,8 @@ fn ok_hooks() -> RunnerHooks {
 
 /// A real compute `JobSpec` running `command` at `trust`. The spec's `trust_tier` is the truth the
 /// dispatch feeds onto the `job_queue` gate.
-fn compute_spec(command: Vec<String>, trust: TrustTier, idem: &str) -> JobSpec {
-    JobSpec::new(
+fn compute_spec(command: Vec<String>, trust: TrustTier, idem: &str) -> DurableCiJobLaunchTemplate {
+    let resolved = JobSpec::new(
         JobKind::Ci,
         ImageRef::pinned("registry.example/runner@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap(),
         command,
@@ -265,7 +268,35 @@ fn compute_spec(command: Vec<String>, trust: TrustTier, idem: &str) -> JobSpec {
         MeterTarget { reserve_id: "ct004d1-reserve".into() },
         IdemToken(idem.into()),
     )
-    .unwrap()
+    .unwrap();
+    let (spec, _token) = resolved.into_template();
+    DurableCiJobLaunchTemplate {
+        spec,
+        ci_run_id: uid(&format!("ci-run:{idem}")).to_string(),
+        token_authority_handle: format!("identity-authority:{idem}"),
+    }
+}
+
+struct ClaimTokenIssuer;
+
+impl CiJobTokenIssuer for ClaimTokenIssuer {
+    fn mint(
+        &self,
+        request: CiJobTokenRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<RunTokenRef, CiJobTokenIssueError>> + Send + '_>> {
+        Box::pin(async move {
+            Ok(RunTokenRef {
+                jti: format!(
+                    "claim-jti:{}:{}:{}",
+                    request.job_id, request.lease_epoch, request.claim_nonce
+                ),
+            })
+        })
+    }
+}
+
+fn claim_token_issuer() -> Arc<dyn CiJobTokenIssuer> {
+    Arc::new(ClaimTokenIssuer)
 }
 
 // ═══════════════ 1. END-TO-END: real dispatch → durable job+spec → real resolve → runsc ═══════════
@@ -337,7 +368,7 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
 
     // ── the ci_job_spec row exists and round-trips the exact spec. ──
     let resolved_back = specs
-        .get_spec(tenant, region, &uid("e2e-job").to_string())
+        .get_launch_template(tenant, region, &uid("e2e-job").to_string())
         .await
         .expect("the persisted spec resolves back");
     assert_eq!(
@@ -366,7 +397,12 @@ async fn real_dispatch_co_persists_then_durable_resolver_executes_in_runsc() {
     );
 
     // ── the durable adapter + the REAL durable resolver (over ci_job_spec) — NOT an injected closure. ──
-    let resolver = durable_spec_resolver(specs.clone(), region, tokio::runtime::Handle::current());
+    let resolver = durable_spec_resolver(
+        specs.clone(),
+        region,
+        tokio::runtime::Handle::current(),
+        claim_token_issuer(),
+    );
     let adapter = DurableLeaseAdapter::new(
         ci_region_queue_store_test_support(admin.clone()),
         queue.clone(),
@@ -609,7 +645,7 @@ async fn dispatch_replay_requires_exact_queue_and_spec_identity() {
     assert_eq!(counts, (1, 1), "both divergent transactions rolled back");
     assert_eq!(
         store
-            .get_spec("tenantA", "fr-par", &original.job_id)
+            .get_launch_template("tenantA", "fr-par", &original.job_id)
             .await
             .unwrap(),
         spec,
@@ -648,7 +684,12 @@ async fn trusted_runner_never_executes_a_dispatched_untrusted_fork() {
         .expect("dispatch the fork stage");
 
     // A trusted-only runner, using the REAL durable resolver, drives the exact run_one claim seam.
-    let resolver = durable_spec_resolver(specs.clone(), region, tokio::runtime::Handle::current());
+    let resolver = durable_spec_resolver(
+        specs.clone(),
+        region,
+        tokio::runtime::Handle::current(),
+        claim_token_issuer(),
+    );
     let adapter = DurableLeaseAdapter::new(
         ci_region_queue_store_test_support(admin.clone()),
         queue.clone(),
@@ -711,7 +752,7 @@ async fn a_leased_row_without_a_spec_resolves_fail_closed() {
 
     // The real resolver over the (empty) spec store must FAIL CLOSED for this leased row.
     let missing = specs
-        .get_spec(tenant, region, &uid("nospec-job").to_string())
+        .get_launch_template(tenant, region, &uid("nospec-job").to_string())
         .await;
     assert!(
         matches!(missing, Err(CiJobSpecStoreError::SpecNotFound { .. })),
@@ -719,7 +760,12 @@ async fn a_leased_row_without_a_spec_resolves_fail_closed() {
     );
 
     // Through the runner seam: claim resolves fail-closed → no launch → the row stays leased for the reaper.
-    let resolver = durable_spec_resolver(specs.clone(), region, tokio::runtime::Handle::current());
+    let resolver = durable_spec_resolver(
+        specs.clone(),
+        region,
+        tokio::runtime::Handle::current(),
+        claim_token_issuer(),
+    );
     let adapter = DurableLeaseAdapter::new(
         ci_region_queue_store_test_support(admin.clone()),
         queue.clone(),

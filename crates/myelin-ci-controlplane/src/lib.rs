@@ -499,14 +499,15 @@ pub use job_queue_store::{
 
 // CT-004d.1: the durable `JobSpec` store + the dispatch→durable co-persist + the fail-closed
 // resolve. `CiJobSpecStore::co_persist_dispatch` writes the `job_queue` row AND the digest-pinned
-// `JobSpec` (as one `spec jsonb`) in ONE tenant-scoped tx on the shared `idem_token`, feeding the
-// claim-gating `trust_tier` FROM the spec (a mismatch is refused fail-closed). `get_spec` resolves a
-// leased row back to its exact spec (corrupt/missing → fail-closed, never a default). `MAX_JOB_TIMEOUT_SECS`
+// non-launchable template (as one `spec jsonb`) in ONE tenant-scoped tx on the shared `idem_token`,
+// feeding the claim-gating `trust_tier` FROM the template (a mismatch is refused fail-closed).
+// `get_launch_template` resolves a leased row before claim-generation token mint (corrupt/missing →
+// fail-closed, never a default). `MAX_JOB_TIMEOUT_SECS`
 // is the wall-clock ceiling below the runner's lease TTL (the CT-004c.2 double-run fix).
 pub use job_spec_store::{
     CiJobSpecStore, CiJobSpecStoreError, ClaimedDispatchIdentity, DispatchOutcome,
-    INSERT_JOB_SPEC_QUERY, MAX_JOB_TIMEOUT_SECS, NON_TERMINAL_NULL_STAGE_JOBS_QUERY,
-    SELECT_JOB_SPEC_IDENTITY_QUERY, SELECT_JOB_SPEC_QUERY,
+    DurableCiJobLaunchTemplate, INSERT_JOB_SPEC_QUERY, MAX_JOB_TIMEOUT_SECS,
+    NON_TERMINAL_NULL_STAGE_JOBS_QUERY, SELECT_JOB_SPEC_IDENTITY_QUERY, SELECT_JOB_SPEC_QUERY,
 };
 
 // CT-004d.2 chunk 4: the durable `ci_run` writer (the CI run-of-record). `CiRunStore::co_commit_insert`

@@ -127,7 +127,7 @@ pub(crate) async fn claim_region_scoped(
     .await?;
     match row {
         None => Ok(None),
-        Some(r) => Ok(Some(leased_from_row(&r)?)),
+        Some(r) => Ok(Some(leased_from_row(&r, lease_owner)?)),
     }
 }
 
@@ -212,7 +212,10 @@ where
 /// Rebuild a [`LeasedJob`] from a claim `RETURNING` row (`tenant_id, job_id, run_id, lane,
 /// concurrency_group, fair_key, trust_tier`). A `lane`/`trust_tier` token outside the frozen set is a
 /// loud [`JobQueueStoreError::CorruptRow`].
-fn leased_from_row(r: &sqlx::postgres::PgRow) -> Result<LeasedJob, JobQueueStoreError> {
+fn leased_from_row(
+    r: &sqlx::postgres::PgRow,
+    lease_owner: &str,
+) -> Result<LeasedJob, JobQueueStoreError> {
     let tenant_id: String = r.get("tenant_id");
     let job_id: Uuid = r.get("job_id");
     let run_id: Uuid = r.get("run_id");
@@ -234,6 +237,7 @@ fn leased_from_row(r: &sqlx::postgres::PgRow) -> Result<LeasedJob, JobQueueStore
         concurrency_group,
         fair_key,
         trust_tier,
+        lease_owner: lease_owner.to_string(),
         lease_epoch,
         claim_nonce,
     })

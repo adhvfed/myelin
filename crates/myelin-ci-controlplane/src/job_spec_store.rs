@@ -10,20 +10,21 @@
 //! ## What CT-004d.1 ships — the missing half of the dispatch→durable→resolve bridge
 //! CT-004c.1 landed the durable [`CiJobQueueStore`](crate::CiJobQueueStore) (enqueue/claim/reap) —
 //! but the `job_queue` row is **scheduling metadata only** (job_id / run_id / lane / labels /
-//! trust_tier / fair_key / idem_token); it carries NO digest-pinned [`JobSpec`] (image / command /
-//! egress / limits / trust / workspace / run-token / meter). CT-004c.2 wired the runner to claim from
+//! trust_tier / fair_key / idem_token); it carries NO digest-pinned launch template (image / command /
+//! egress / limits / trust / workspace / authority / meter). CT-004c.2 wired the runner to claim from
 //! the durable queue but resolved the spec through an INJECTED [`JobSpecResolver`](crate::JobSpecResolver)
 //! that the production path left as a fail-closed no-op ([`crate::spec_store_unavailable_resolver`]).
 //!
 //! [`CiJobSpecStore`] is the real backing that resolver reads: it persists a dispatched stage's
-//! [`JobSpec`] keyed by `(tenant_id, job_id)` — the SAME identity the leased `job_queue` row carries —
-//! so the runner can resolve a claimed row → its exact spec → execute it. It is the durable
+//! non-launchable [`DurableCiJobLaunchTemplate`] keyed by `(tenant_id, job_id)` — the SAME identity
+//! the leased `job_queue` row carries — so the runner can resolve a claimed row, mint under that
+//! claim generation, attach the short-lived token, and execute it. It is the durable
 //! system-of-record for "what a leased job runs".
 //!
-//! ## The spec is a SINGLE `jsonb` column — a faithful round-trip
-//! [`JobSpec`] (and every field type it composes) derives `serde::{Serialize, Deserialize}`, so the
-//! whole value round-trips through ONE `spec jsonb` column with NO lossy per-column projection. The
-//! stored spec is what EXECUTES, so fidelity is load-bearing: a corrupt / missing / mistyped spec is a
+//! ## The template is a SINGLE `jsonb` column — a faithful round-trip
+//! [`DurableCiJobLaunchTemplate`] derives `serde::{Serialize, Deserialize}`, so the whole value
+//! round-trips through ONE `spec jsonb` column with NO lossy per-column projection and no token JTI.
+//! The resolved template is what EXECUTES, so fidelity is load-bearing: a corrupt / missing template is a
 //! **fail-closed** [`CiJobSpecStoreError`] (the runner then does NOT launch — the leased row is left for
 //! the reaper), NEVER a fabricated default spec.
 //!
@@ -55,7 +56,7 @@
 //! `> MAX_JOB_TIMEOUT_SECS`, so a leased job provably cannot outlive its lease. (The mid-launch
 //! heartbeat is the tighter fix — named as the follow-on that would let the lease TTL shrink again.)
 
-use myelin_ci_sandbox::{JobSpec, TrustTier};
+use myelin_ci_sandbox::{JobSpecTemplate, TrustTier};
 use myelin_storage::{with_tenant_tx, with_tenant_tx_error, PgError};
 use sqlx::postgres::PgPool;
 use sqlx::types::Uuid;
@@ -126,6 +127,17 @@ WHERE q.tenant_id = $1 AND q.idem_token = $2";
 pub const NON_TERMINAL_NULL_STAGE_JOBS_QUERY: &str = "\
 SELECT count(*) FROM job_queue q \
 WHERE q.region = $1 AND q.state <> 'terminal' AND q.stage IS NULL";
+
+/// Durable, non-launchable job input. The scheduler may persist this for an arbitrary queue wait:
+/// it contains the immutable sandbox template plus the stable Identity authority handle, but no JTI
+/// or bearer material. The exact live claim resolver mints and attaches a short-lived token later.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableCiJobLaunchTemplate {
+    pub spec: JobSpecTemplate,
+    pub ci_run_id: String,
+    pub token_authority_handle: String,
+}
 
 // =================================================================================================
 // Typed, fail-loud error (no silent drop / coerce / fabricated-default spec).
@@ -312,15 +324,15 @@ impl CiJobSpecStore {
     pub async fn co_persist_dispatch(
         &self,
         enq: &DurableEnqueue,
-        spec: &JobSpec,
+        launch: &DurableCiJobLaunchTemplate,
         stage: &str,
     ) -> Result<DispatchOutcome, CiJobSpecStoreError> {
         // ── the two fail-closed dispatch invariants (SECURITY trust-tier + the lease-TTL floor). ──
-        validate_dispatch(enq.trust_tier, spec)?;
+        validate_dispatch(enq.trust_tier, launch)?;
 
         let job_uuid = parse_id_local("job_id", &enq.job_id)?;
         let run_uuid = parse_id_local("run_id", &enq.run_id)?;
-        let spec_json = serde_json::to_value(spec)
+        let spec_json = serde_json::to_value(launch)
             .map_err(|e| CiJobSpecStoreError::SpecEncode(e.to_string()))?;
         let stage = stage.to_string();
 
@@ -411,18 +423,18 @@ impl CiJobSpecStore {
         })
     }
 
-    /// **Resolve a leased job's persisted [`JobSpec`] (the runner's resolve path — arch §5.3).** Reads
-    /// the `spec jsonb` for `(tenant, job_id)` under the tenant-scoped tx and deserializes it back to a
-    /// [`JobSpec`] — the WHOLE value, every field, no lossy projection. Fail-closed: no row →
+    /// **Resolve a leased job's persisted launch template (the runner's resolve path — arch §5.3).**
+    /// Reads the `spec jsonb` for `(tenant, job_id)` under the tenant-scoped tx and deserializes the
+    /// whole non-launchable template with no lossy projection. Fail-closed: no row →
     /// [`CiJobSpecStoreError::SpecNotFound`]; an un-decodable jsonb → [`CiJobSpecStoreError::CorruptSpec`].
-    /// NEVER a fabricated default spec (the stored spec is what executes). `region` is the runner's
+    /// NEVER a fabricated default. `region` is the runner's
     /// residency region (the RLS/tenant-tx scope).
-    pub async fn get_spec(
+    pub async fn get_launch_template(
         &self,
         tenant_id: &str,
         region: &str,
         job_id: &str,
-    ) -> Result<JobSpec, CiJobSpecStoreError> {
+    ) -> Result<DurableCiJobLaunchTemplate, CiJobSpecStoreError> {
         let job_uuid = parse_id_local("job_id", job_id)?;
         let tenant_id_owned = tenant_id.to_string();
         let row = with_tenant_tx(&self.pool, tenant_id, region, move |conn| {
@@ -445,7 +457,7 @@ impl CiJobSpecStore {
         let spec_json: serde_json::Value = row
             .try_get("spec")
             .map_err(|e| CiJobSpecStoreError::Db(e.to_string()))?;
-        decode_spec(job_id, spec_json)
+        decode_launch_template(job_id, spec_json)
     }
 
     /// **Read a dispatched job's durable claimed-identity for `(tenant, job_id)` — the reporter's
@@ -508,12 +520,12 @@ impl CiJobSpecStore {
         let spec_json: serde_json::Value = row
             .try_get("spec")
             .map_err(|e| CiJobSpecStoreError::Db(e.to_string()))?;
-        let spec = decode_spec(job_id_text, spec_json)?;
+        let launch = decode_launch_template(job_id_text, spec_json)?;
         Ok(Some(ClaimedDispatchIdentity {
             run_id,
             idem_token,
             stage,
-            reserve_handle: spec.meter_to.reserve_id,
+            reserve_handle: launch.spec.meter_to.reserve_id,
         }))
     }
 }
@@ -578,16 +590,25 @@ pub struct ClaimedDispatchIdentity {
 /// claim-gating tier always equals the tier of the spec that executes (no widen/default). (2) the
 /// lease-TTL floor — `spec.limits.timeout_secs` may not exceed [`MAX_JOB_TIMEOUT_SECS`], so a leased
 /// job can never outlive the runner's lease. A violation is a typed fail-closed error, NEVER coerced.
-fn validate_dispatch(enq_trust: TrustTier, spec: &JobSpec) -> Result<(), CiJobSpecStoreError> {
-    if enq_trust != spec.trust_tier {
+fn validate_dispatch(
+    enq_trust: TrustTier,
+    launch: &DurableCiJobLaunchTemplate,
+) -> Result<(), CiJobSpecStoreError> {
+    if launch.token_authority_handle.trim().is_empty() || launch.token_authority_handle.len() > 512
+    {
+        return Err(CiJobSpecStoreError::SpecEncode(
+            "token authority handle is empty or overlong".into(),
+        ));
+    }
+    if enq_trust != launch.spec.trust_tier {
         return Err(CiJobSpecStoreError::TrustTierMismatch {
             enqueue: trust_token(enq_trust),
-            spec: trust_token(spec.trust_tier),
+            spec: trust_token(launch.spec.trust_tier),
         });
     }
-    if spec.limits.timeout_secs > MAX_JOB_TIMEOUT_SECS {
+    if launch.spec.limits.timeout_secs > MAX_JOB_TIMEOUT_SECS {
         return Err(CiJobSpecStoreError::TimeoutTooLong {
-            requested: spec.limits.timeout_secs,
+            requested: launch.spec.limits.timeout_secs,
             ceiling: MAX_JOB_TIMEOUT_SECS,
         });
     }
@@ -598,11 +619,18 @@ fn validate_dispatch(enq_trust: TrustTier, spec: &JobSpec) -> Result<(), CiJobSp
 /// Pure over the jsonb value so the unit suite proves both the faithful round-trip AND the corrupt →
 /// fail-closed behaviour DB-free. An un-decodable value is [`CiJobSpecStoreError::CorruptSpec`] (the
 /// stored spec is what executes, so a corrupt one fails the resolve closed) — NEVER a default spec.
-fn decode_spec(job_id: &str, spec_json: serde_json::Value) -> Result<JobSpec, CiJobSpecStoreError> {
-    serde_json::from_value::<JobSpec>(spec_json).map_err(|e| CiJobSpecStoreError::CorruptSpec {
-        job_id: job_id.to_string(),
-        detail: e.to_string(),
-    })
+fn decode_launch_template(
+    job_id: &str,
+    spec_json: serde_json::Value,
+) -> Result<DurableCiJobLaunchTemplate, CiJobSpecStoreError> {
+    let launch = serde_json::from_value::<DurableCiJobLaunchTemplate>(spec_json).map_err(|e| {
+        CiJobSpecStoreError::CorruptSpec {
+            job_id: job_id.to_string(),
+            detail: e.to_string(),
+        }
+    })?;
+    validate_dispatch(launch.spec.trust_tier, &launch)?;
+    Ok(launch)
 }
 
 /// Parse a `job_id`/`run_id` token into the durable `uuid` column type — a non-uuid is a loud refusal.

@@ -10,14 +10,14 @@ use std::sync::Arc;
 use myelin_ci_controlplane::{
     ci_controlplane_hot_tables, ci_controlplane_migrations, decode_resolved_ci_manifest,
     register_durable_ci_manifest_pipeline, run_ci_manifest_pipeline, CiExecutionProfileV1,
-    CiExecutionRequestV1, CiJobLaunchGrantV1, CiJobSpecStore, CiJobTokenIssueError,
-    CiJobTokenIssuer, CiJobTokenRequest, CiLaunchAuthorityError, CiLaunchAuthorityMaterializer,
-    CiLaunchAuthorityV1, CiManifestDurableJobRunner, CiManifestInputResolver, CiManifestLaneV1,
-    CiManifestLimitsV1, CiManifestSchedulingV1, CiRunFinalization, CiRunFinalizationOutcome,
-    CiRunFinalizationWrite, CiRunFinalizer, CiRunStoreError, CiWorkflowDefinitionPin,
-    PgCiPipelineStarter, PreparedRunPlanV2, ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
+    CiExecutionRequestV1, CiJobLaunchGrantV1, CiJobSpecStore, CiLaunchAuthorityError,
+    CiLaunchAuthorityMaterializer, CiLaunchAuthorityV1, CiManifestDurableJobRunner,
+    CiManifestInputResolver, CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1,
+    CiRunFinalization, CiRunFinalizationOutcome, CiRunFinalizationWrite, CiRunFinalizer,
+    CiRunStoreError, CiWorkflowDefinitionPin, PgCiPipelineStarter, PreparedRunPlanV2,
+    ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
 };
-use myelin_ci_sandbox::{RunTokenRef, TrustTier};
+use myelin_ci_sandbox::TrustTier;
 use myelin_config::MyelinConfig;
 use myelin_events::{Actor, IdMinter, MonotonicMinter};
 use myelin_flow::{
@@ -144,27 +144,6 @@ impl CiLaunchAuthorityMaterializer for TestAuthority {
                     })
                     .collect(),
                 merge_waiter: None,
-            })
-        })
-    }
-}
-
-struct TestTokenIssuer;
-
-impl CiJobTokenIssuer for TestTokenIssuer {
-    fn mint(
-        &self,
-        request: CiJobTokenRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<RunTokenRef, CiJobTokenIssueError>> + Send + '_>> {
-        Box::pin(async move {
-            assert_eq!(request.tenant_id, TENANT);
-            assert_eq!(request.region, REGION);
-            assert_eq!(request.wf_run_id, WF_RUN_ID);
-            assert_eq!(request.ci_run_id, CI_RUN_ID);
-            assert_eq!(request.token_authority_handle, format!("mint:{CI_RUN_ID}"));
-            assert!(request.idem_token.starts_with(&format!("{WF_RUN_ID}/")));
-            Ok(RunTokenRef {
-                jti: format!("test-jti:{}", request.job_id),
             })
         })
     }
@@ -369,7 +348,6 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
     ));
 
     let durable_store = CiJobSpecStore::with_pg(pool.clone());
-    let token_issuer: Arc<dyn CiJobTokenIssuer> = Arc::new(TestTokenIssuer);
     let finalizer: Arc<dyn CiRunFinalizer> = Arc::new(AcceptFinalizer);
     let mut first = worker(&pool, "worker-retry");
     let flaky = RetryOnceResolver {
@@ -377,7 +355,6 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
         attempts: Arc::new(AtomicUsize::new(0)),
     };
     let retry_store = durable_store.clone();
-    let retry_issuer = Arc::clone(&token_issuer);
     let retry_finalizer = Arc::clone(&finalizer);
     let retry_rt = tokio::runtime::Handle::current();
     first
@@ -391,7 +368,6 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
                 let runner = CiManifestDurableJobRunner::new(
                     Arc::new(manifest.clone()),
                     retry_store.clone(),
-                    Arc::clone(&retry_issuer),
                     retry_rt.clone(),
                 )?;
                 run_ci_manifest_pipeline(ctx, &manifest, &runner, retry_finalizer.as_ref())
@@ -425,7 +401,6 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
         &mut roots_worker,
         resolver(&pool),
         durable_store.clone(),
-        Arc::clone(&token_issuer),
         Arc::clone(&finalizer),
         tokio::runtime::Handle::current(),
     )
@@ -480,14 +455,14 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
     assert_eq!(by_stage["test"].0, ids["test"]);
     for stage in ["build", "test"] {
         let (job_id, idem_token) = &by_stage[stage];
-        let spec = durable_store
-            .get_spec(TENANT, REGION, job_id)
+        let launch = durable_store
+            .get_launch_template(TENANT, REGION, job_id)
             .await
             .unwrap();
+        let spec = &launch.spec;
         assert_eq!(spec.idem_token.0, *idem_token);
         assert_eq!(spec.trust_tier, TrustTier::Trusted);
-        assert_eq!(spec.run_token.jti, format!("test-jti:{job_id}"));
-        assert_ne!(spec.run_token.jti, format!("mint:{CI_RUN_ID}"));
+        assert_eq!(launch.token_authority_handle, format!("mint:{CI_RUN_ID}"));
         assert_eq!(
             spec.meter_to.reserve_id,
             format!("reserve:{CI_RUN_ID}:{stage}")
@@ -515,7 +490,6 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
         &mut dependent_worker,
         resolver(&pool),
         durable_store.clone(),
-        Arc::clone(&token_issuer),
         Arc::clone(&finalizer),
         tokio::runtime::Handle::current(),
     )
@@ -537,9 +511,10 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
     assert_eq!(package.0, ids["package"]);
     assert_eq!(
         durable_store
-            .get_spec(TENANT, REGION, &package.0)
+            .get_launch_template(TENANT, REGION, &package.0)
             .await
             .unwrap()
+            .spec
             .command,
         vec!["/bin/package"]
     );
@@ -551,7 +526,6 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
         &mut terminal_worker,
         resolver(&pool),
         durable_store.clone(),
-        Arc::clone(&token_issuer),
         Arc::clone(&finalizer),
         tokio::runtime::Handle::current(),
     )
