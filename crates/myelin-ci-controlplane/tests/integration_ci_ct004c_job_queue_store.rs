@@ -36,9 +36,10 @@
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
-    ci_job_queue_store, ci_region_queue_store_test_support, CiJobQueueStore, DurableEnqueue, EnqueueOutcome, Lane,
-    CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_FAIR_DEFICIT_DDL, INSERT_JOB_QUEUE_QUERY,
-    make_tenant_scoped_ddl,
+    ci_job_queue_store, ci_region_queue_store_test_support, make_tenant_scoped_ddl,
+    CiJobQueueStore, DurableEnqueue, EnqueueOutcome, Lane, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
+    CREATE_JOB_QUEUE_INDEXES_DDL, INSERT_JOB_QUEUE_QUERY,
 };
 use myelin_ci_sandbox::TrustTier;
 use sqlx::types::Uuid;
@@ -138,6 +139,7 @@ fn job(
         concurrency_group: group.map(|g| g.into()),
         fair_key: tenant.into(),
         idem_token: idem.into(),
+        stage: "build".into(),
     }
 }
 
@@ -157,6 +159,14 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(CREATE_JOB_QUEUE_DDL)
         .await
         .expect("create job_queue");
+    admin
+        .execute(ALTER_JOB_QUEUE_ADD_COMPLETION_DDL)
+        .await
+        .expect("add job_queue lease_epoch + completion_receipt");
+    admin
+        .execute(ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL)
+        .await
+        .expect("add job_queue claim nonce + stage authority");
     for (_name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
         let idx = idx.replace("CONCURRENTLY ", "");
         admin
@@ -204,12 +214,66 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
     // interactive (newer) + batch (older) in-region trusted; out-of-region; wrong-label; and the two
     // UNTRUSTED tiers a trusted-only claim must never lease.
     for j in [
-        job("tenantA", region, "jbatch", Lane::Batch, &["linux"], TrustTier::Trusted, None, "idem-b"),
-        job("tenantA", region, "jint", Lane::Interactive, &["linux"], TrustTier::Trusted, None, "idem-i"),
-        job("tenantA", "us-east", "joutreg", Lane::Interactive, &["linux"], TrustTier::Trusted, None, "idem-o"),
-        job("tenantA", region, "jwinlabel", Lane::Interactive, &["windows"], TrustTier::Trusted, None, "idem-w"),
-        job("tenantA", region, "jfork", Lane::Interactive, &["linux"], TrustTier::UntrustedFork, None, "idem-f"),
-        job("tenantA", region, "jself", Lane::Interactive, &["linux"], TrustTier::SelfHosted, None, "idem-s"),
+        job(
+            "tenantA",
+            region,
+            "jbatch",
+            Lane::Batch,
+            &["linux"],
+            TrustTier::Trusted,
+            None,
+            "idem-b",
+        ),
+        job(
+            "tenantA",
+            region,
+            "jint",
+            Lane::Interactive,
+            &["linux"],
+            TrustTier::Trusted,
+            None,
+            "idem-i",
+        ),
+        job(
+            "tenantA",
+            "us-east",
+            "joutreg",
+            Lane::Interactive,
+            &["linux"],
+            TrustTier::Trusted,
+            None,
+            "idem-o",
+        ),
+        job(
+            "tenantA",
+            region,
+            "jwinlabel",
+            Lane::Interactive,
+            &["windows"],
+            TrustTier::Trusted,
+            None,
+            "idem-w",
+        ),
+        job(
+            "tenantA",
+            region,
+            "jfork",
+            Lane::Interactive,
+            &["linux"],
+            TrustTier::UntrustedFork,
+            None,
+            "idem-f",
+        ),
+        job(
+            "tenantA",
+            region,
+            "jself",
+            Lane::Interactive,
+            &["linux"],
+            TrustTier::SelfHosted,
+            None,
+            "idem-s",
+        ),
     ] {
         assert_eq!(
             store.enqueue(&j).await.expect("enqueue"),
@@ -218,7 +282,16 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         );
     }
     // Idempotent enqueue: a duplicate idem is a no-op (jq_idem unique).
-    let dup = job("tenantA", region, "jint", Lane::Interactive, &["linux"], TrustTier::Trusted, None, "idem-i");
+    let dup = job(
+        "tenantA",
+        region,
+        "jint",
+        Lane::Interactive,
+        &["linux"],
+        TrustTier::Trusted,
+        None,
+        "idem-i",
+    );
     assert_eq!(
         store.enqueue(&dup).await.expect("dup enqueue"),
         EnqueueOutcome::DuplicateIdem,
@@ -240,7 +313,11 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
          out-of-region / wrong-label / untrusted jobs are NOT"
     );
     assert_eq!(leased.lane, Lane::Interactive);
-    assert_eq!(leased.trust_tier, TrustTier::Trusted, "a trusted-only claim leases a trusted job");
+    assert_eq!(
+        leased.trust_tier,
+        TrustTier::Trusted,
+        "a trusted-only claim leases a trusted job"
+    );
 
     // ── 3. SECURITY: a trusted-only claim NEVER leases the untrusted_fork / self_hosted jobs. ──
     // Claim repeatedly with only trusted tiers; assert the fork + self-hosted job ids never appear.
@@ -270,7 +347,13 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
     );
     // A claim that DOES list untrusted_fork leases the fork job (the tier gate is exact, not a blanket).
     let fork_claim = region_store
-        .claim(region, &runner_labels, &[TrustTier::UntrustedFork], "fork-runner", 30)
+        .claim(
+            region,
+            &runner_labels,
+            &[TrustTier::UntrustedFork],
+            "fork-runner",
+            30,
+        )
         .await
         .expect("claim")
         .expect("the fork-allowed runner leases the fork job");
@@ -280,8 +363,26 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
     // ── 4. SKIP LOCKED: two CONCURRENT claims take DIFFERENT rows (0 double-lease). ──
     // Seed two fresh eligible trusted jobs; fire two claims concurrently.
     for j in [
-        job("tenantA", region, "cc1", Lane::Batch, &["linux"], TrustTier::Trusted, None, "idem-cc1"),
-        job("tenantA", region, "cc2", Lane::Batch, &["linux"], TrustTier::Trusted, None, "idem-cc2"),
+        job(
+            "tenantA",
+            region,
+            "cc1",
+            Lane::Batch,
+            &["linux"],
+            TrustTier::Trusted,
+            None,
+            "idem-cc1",
+        ),
+        job(
+            "tenantA",
+            region,
+            "cc2",
+            Lane::Batch,
+            &["linux"],
+            TrustTier::Trusted,
+            None,
+            "idem-cc2",
+        ),
     ] {
         store.enqueue(&j).await.expect("enqueue cc");
     }
@@ -290,8 +391,14 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
     let labels_a = runner_labels.clone();
     let labels_b = runner_labels.clone();
     let (ra, rb) = tokio::join!(
-        async move { s_a.claim(region, &labels_a, &[TrustTier::Trusted], "conc-a", 30).await },
-        async move { s_b.claim(region, &labels_b, &[TrustTier::Trusted], "conc-b", 30).await },
+        async move {
+            s_a.claim(region, &labels_a, &[TrustTier::Trusted], "conc-a", 30)
+                .await
+        },
+        async move {
+            s_b.claim(region, &labels_b, &[TrustTier::Trusted], "conc-b", 30)
+                .await
+        },
     );
     let ja = ra.expect("claim a");
     let jb = rb.expect("claim b");
@@ -319,16 +426,31 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         .unwrap()
         .get("n");
     let reaped = region_store.reap(region).await.expect("reap");
-    assert!(reaped >= 1, "the dead lease is re-queued by the reaper (0 orphans): {reaped} swept");
+    assert!(
+        reaped >= 1,
+        "the dead lease is re-queued by the reaper (0 orphans): {reaped} swept"
+    );
     let state: String = sqlx::query("SELECT state FROM job_queue WHERE job_id = $1")
         .bind(uid("jint"))
         .fetch_one(&admin)
         .await
         .unwrap()
         .get("state");
-    assert_eq!(state, "queued", "the reaped job is re-queued (claimable again)");
+    assert_eq!(
+        state, "queued",
+        "the reaped job is re-queued (claimable again)"
+    );
     // 0 duplicate enqueues: a redundant re-dispatch (same idem) is a no-op; count unchanged.
-    let retry = job("tenantA", region, "jint", Lane::Interactive, &["linux"], TrustTier::Trusted, None, "idem-i");
+    let retry = job(
+        "tenantA",
+        region,
+        "jint",
+        Lane::Interactive,
+        &["linux"],
+        TrustTier::Trusted,
+        None,
+        "idem-i",
+    );
     assert_eq!(
         store.enqueue(&retry).await.expect("retry enqueue"),
         EnqueueOutcome::DuplicateIdem,
@@ -339,47 +461,87 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         .await
         .unwrap()
         .get("n");
-    assert_eq!(before_count, after_count, "0 duplicate enqueues after the reaper re-queue");
+    assert_eq!(
+        before_count, after_count,
+        "0 duplicate enqueues after the reaper re-queue"
+    );
     // A fresh runner re-claims the recovered job.
     let reclaim = region_store
         .claim(region, &runner_labels, &trusted_only, "live-runner", 30)
         .await
         .expect("re-claim")
         .expect("the recovered job re-claims");
-    assert_eq!(reclaim.job_id, uid("jint"), "a live runner picks up the reaped job");
+    assert_eq!(
+        reclaim.job_id,
+        uid("jint"),
+        "a live runner picks up the reaped job"
+    );
 
     // A HEART-BEATING lease is NOT reaped: extend jint's lease, expire nothing, reap finds it live.
     assert!(
         store
-            .heartbeat("tenantA", region, &uid("jint").to_string(), "live-runner", 60)
+            .heartbeat(
+                "tenantA",
+                region,
+                &uid("jint").to_string(),
+                "live-runner",
+                60
+            )
             .await
             .expect("heartbeat"),
         "the lease owner extends its lease"
     );
-    let swept = region_store.reap(region).await.expect("reap after heartbeat");
+    let swept = region_store
+        .reap(region)
+        .await
+        .expect("reap after heartbeat");
     let jint_state: String = sqlx::query("SELECT state FROM job_queue WHERE job_id = $1")
         .bind(uid("jint"))
         .fetch_one(&admin)
         .await
         .unwrap()
         .get("state");
-    assert_eq!(jint_state, "leased", "a heart-beating lease is NOT reaped (stays leased)");
+    assert_eq!(
+        jint_state, "leased",
+        "a heart-beating lease is NOT reaped (stays leased)"
+    );
     let _ = swept;
 
     // ── 6. CANCEL-SUPERSEDED: a new PR head terminalises the prior head. ──
     store
-        .enqueue(&job("tenantA", region, "h1", Lane::Interactive, &["linux"], TrustTier::Trusted, Some("pr:web:42"), "idem-h1"))
+        .enqueue(&job(
+            "tenantA",
+            region,
+            "h1",
+            Lane::Interactive,
+            &["linux"],
+            TrustTier::Trusted,
+            Some("pr:web:42"),
+            "idem-h1",
+        ))
         .await
         .expect("enqueue h1");
     store
-        .enqueue(&job("tenantA", region, "h2", Lane::Interactive, &["linux"], TrustTier::Trusted, Some("pr:web:42"), "idem-h2"))
+        .enqueue(&job(
+            "tenantA",
+            region,
+            "h2",
+            Lane::Interactive,
+            &["linux"],
+            TrustTier::Trusted,
+            Some("pr:web:42"),
+            "idem-h2",
+        ))
         .await
         .expect("enqueue h2");
     let cancelled = store
         .cancel_superseded("tenantA", region, "pr:web:42", &uid("h2").to_string())
         .await
         .expect("cancel_superseded");
-    assert!(cancelled.contains(&uid("h1")), "the prior PR head h1 is cancelled");
+    assert!(
+        cancelled.contains(&uid("h1")),
+        "the prior PR head h1 is cancelled"
+    );
     let h1_state: String = sqlx::query("SELECT state FROM job_queue WHERE job_id = $1")
         .bind(uid("h1"))
         .fetch_one(&admin)
@@ -410,6 +572,7 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
             .bind(Option::<String>::None)
             .bind("tenantA")
             .bind("idem-ghost")
+            .bind("build")
             .execute(&mut *tx)
             .await
             .expect("the in-tx enqueue writes (uncommitted)");
@@ -426,19 +589,34 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         .await
         .unwrap()
         .get("state");
-    assert_eq!(leased_after, "leased", "the leased row survives kill-9/reopen (durable, not in-memory)");
+    assert_eq!(
+        leased_after, "leased",
+        "the leased row survives kill-9/reopen (durable, not in-memory)"
+    );
     let ghost: Option<Uuid> = sqlx::query("SELECT job_id FROM job_queue WHERE job_id = $1")
         .bind(uid("ghost"))
         .fetch_optional(&admin2)
         .await
         .unwrap()
         .map(|r| r.get("job_id"));
-    assert!(ghost.is_none(), "the uncommitted enqueue left NO ghost row (all-or-nothing)");
+    assert!(
+        ghost.is_none(),
+        "the uncommitted enqueue left NO ghost row (all-or-nothing)"
+    );
 
     // ── 8. TENANT-SCOPED RLS under the APP role (NOBYPASSRLS): enqueue works; a wrong-tenant read sees 0. ──
     let app = app_pool().await;
     let app_store: CiJobQueueStore = ci_job_queue_store(app.clone());
-    let rls_job = job("tenantRLS", region, "rls1", Lane::Batch, &["linux"], TrustTier::Trusted, None, "idem-rls1");
+    let rls_job = job(
+        "tenantRLS",
+        region,
+        "rls1",
+        Lane::Batch,
+        &["linux"],
+        TrustTier::Trusted,
+        None,
+        "idem-rls1",
+    );
     assert_eq!(
         app_store.enqueue(&rls_job).await.expect("app-role enqueue under RLS"),
         EnqueueOutcome::Inserted,

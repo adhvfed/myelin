@@ -56,8 +56,9 @@
 //! heartbeat is the tighter fix — named as the follow-on that would let the lease TTL shrink again.)
 
 use myelin_ci_sandbox::{JobSpec, TrustTier};
-use myelin_storage::{with_tenant_tx, PgError};
+use myelin_storage::{with_tenant_tx, with_tenant_tx_error, PgError};
 use sqlx::postgres::PgPool;
+use sqlx::types::Uuid;
 use sqlx::Row;
 
 use crate::job_queue_store::{parse_id, trust_token};
@@ -79,8 +80,8 @@ pub const MAX_JOB_TIMEOUT_SECS: u32 = 6 * 60 * 60;
 /// stored spec is deterministic on the dispatch position, so a re-write would be identical anyway.
 /// `RETURNING job_id` is present iff a fresh row was inserted (absent on the idempotent conflict).
 pub const INSERT_JOB_SPEC_QUERY: &str = "\
-INSERT INTO ci_job_spec (tenant_id, region, job_id, run_id, idem_token, spec)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO ci_job_spec (tenant_id, region, job_id, run_id, idem_token, spec, stage)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (tenant_id, job_id) DO NOTHING
 RETURNING job_id";
 
@@ -90,6 +91,27 @@ RETURNING job_id";
 /// (fail-closed — the runner does not launch an unresolved job).
 pub const SELECT_JOB_SPEC_QUERY: &str = "\
 SELECT spec FROM ci_job_spec WHERE tenant_id = $1 AND job_id = $2";
+
+/// **Read a dispatched job's durable claimed-identity (run_id, idem_token, stage) for `(tenant, job_id)`
+/// — the terminal reporter's fail-closed verification anchor (CT-004d.2 rewire).** The reporter derives
+/// the completed job's `job_id` and reads this back to prove the presented `(run_id, idem_token)` match
+/// the durable dispatch record BEFORE it signals a verdict — a forged/mis-keyed completion resolves no
+/// row (or a divergent one) and is refused. `stage` is the durable verdict-attribution name (the
+/// restart-safe replacement for the in-memory stage bridge). Binds `$1 tenant_id`, `$2 job_id` (uuid).
+pub const SELECT_JOB_SPEC_IDENTITY_QUERY: &str = "\
+SELECT run_id::text AS run_id, idem_token, stage FROM ci_job_spec WHERE tenant_id = $1 AND job_id = $2";
+
+/// **The runner-lane pre-activation guard's probe (CT-004d.2 — the ROLLING-UPGRADE FLOOR).** Counts, in
+/// a region, `job_queue` rows that are still NON-terminal but whose queue-authority `stage` is NULL
+/// (a pre-rewire historical dispatch a rolling upgrade left un-back-filled). The ACTIVATION guard
+/// refuses to start the (dormant) runner lane
+/// while any such row is still live — so the invariant "no non-terminal NULL-stage job exists at
+/// activation" is CHECKED, not assumed (CI has never been production-activated, so a healthy deploy
+/// returns 0). Cross-tenant within a region (the runner lane claims cross-tenant), so it is NOT
+/// tenant-scoped — it runs on the region-scheduler / admin path. Bind: `$1 region`.
+pub const NON_TERMINAL_NULL_STAGE_JOBS_QUERY: &str = "\
+SELECT count(*) FROM job_queue q \
+WHERE q.region = $1 AND q.state <> 'terminal' AND q.stage IS NULL";
 
 // =================================================================================================
 // Typed, fail-loud error (no silent drop / coerce / fabricated-default spec).
@@ -148,6 +170,13 @@ pub enum CiJobSpecStoreError {
         /// The enforced ceiling.
         ceiling: u32,
     },
+    /// A dispatch identity row exists but its `stage` column is NULL (a pre-rewire historical row the
+    /// `ci_0015a` ALTER could not back-fill). The reporter fails closed rather than attribute a verdict
+    /// to an unknown stage — a NULL stage can never be a fabricated pass.
+    MissingStage {
+        /// The job id whose durable stage is absent.
+        job_id: String,
+    },
 }
 
 impl core::fmt::Display for CiJobSpecStoreError {
@@ -184,11 +213,22 @@ impl core::fmt::Display for CiJobSpecStoreError {
                 "durable dispatch refused: spec timeout_secs {requested} exceeds the {ceiling}s \
                  ceiling — a job may not outlive the runner's lease (double-run guard, fail-closed)"
             ),
+            CiJobSpecStoreError::MissingStage { job_id } => write!(
+                f,
+                "durable ci_job_spec for job `{job_id}` has a NULL stage (a pre-rewire historical row) \
+                 — the reporter fails closed rather than attribute a verdict to an unknown stage"
+            ),
         }
     }
 }
 
 impl std::error::Error for CiJobSpecStoreError {}
+
+impl From<PgError> for CiJobSpecStoreError {
+    fn from(error: PgError) -> Self {
+        Self::from_pg(error)
+    }
+}
 
 impl CiJobSpecStoreError {
     /// Map a storage-layer [`PgError`] into the store's typed error (fail-loud, no swallow).
@@ -259,6 +299,7 @@ impl CiJobSpecStore {
         &self,
         enq: &DurableEnqueue,
         spec: &JobSpec,
+        stage: &str,
     ) -> Result<DispatchOutcome, CiJobSpecStoreError> {
         // ── the two fail-closed dispatch invariants (SECURITY trust-tier + the lease-TTL floor). ──
         validate_dispatch(enq.trust_tier, spec)?;
@@ -267,6 +308,7 @@ impl CiJobSpecStore {
         let run_uuid = parse_id_local("run_id", &enq.run_id)?;
         let spec_json = serde_json::to_value(spec)
             .map_err(|e| CiJobSpecStoreError::SpecEncode(e.to_string()))?;
+        let stage = stage.to_string();
 
         let labels = enq.labels.clone();
         let group = enq.concurrency_group.clone();
@@ -276,6 +318,11 @@ impl CiJobSpecStore {
         let region = enq.region.clone();
         let fair_key = enq.fair_key.clone();
         let idem = enq.idem_token.clone();
+        if enq.stage != stage {
+            return Err(CiJobSpecStoreError::Db(
+                "durable dispatch stage differs between queue authority and spec identity".into(),
+            ));
+        }
 
         let (enqueued, spec_inserted) =
             with_tenant_tx(&self.pool, &enq.tenant_id, &enq.region, move |conn| {
@@ -292,6 +339,7 @@ impl CiJobSpecStore {
                         .bind(group.as_deref()) // $8 concurrency_group (nullable)
                         .bind(&fair_key) // $9 fair_key
                         .bind(&idem) // $10 idem_token
+                        .bind(&stage) // $11 stage (regional guard + completion authority)
                         .fetch_optional(&mut *conn)
                         .await
                         .map_err(|e| PgError::Query(e.to_string()))?;
@@ -303,6 +351,7 @@ impl CiJobSpecStore {
                         .bind(run_uuid) // $4 run_id
                         .bind(&idem) // $5 idem_token (co-key with the queue row)
                         .bind(&spec_json) // $6 spec jsonb (the whole value — faithful round-trip)
+                        .bind(&stage) // $7 stage (the durable verdict-attribution name)
                         .fetch_optional(&mut *conn)
                         .await
                         .map_err(|e| PgError::Query(e.to_string()))?;
@@ -358,6 +407,84 @@ impl CiJobSpecStore {
             .map_err(|e| CiJobSpecStoreError::Db(e.to_string()))?;
         decode_spec(job_id, spec_json)
     }
+
+    /// **Read a dispatched job's durable claimed-identity for `(tenant, job_id)` — the reporter's
+    /// fail-closed verification anchor (CT-004d.2 rewire).** Returns the `(run_id, idem_token, stage)`
+    /// the dispatch persisted, or `None` if no row exists (a forged/mis-keyed completion). The reporter
+    /// derives the completed job's `job_id`, reads this, and refuses unless the presented `(run_id,
+    /// idem_token)` match the durable record — proving the caller owns a real dispatched job before any
+    /// verdict is signalled. `stage` is the durable verdict-attribution name (a fresh reporter after a
+    /// restart reads it here — never an in-memory map). A row with a NULL `stage` (a pre-rewire
+    /// historical dispatch) surfaces as [`CiJobSpecStoreError::MissingStage`], never a fabricated verdict.
+    pub async fn get_dispatch_identity(
+        &self,
+        tenant_id: &str,
+        region: &str,
+        job_id: &str,
+    ) -> Result<Option<ClaimedDispatchIdentity>, CiJobSpecStoreError> {
+        let job_uuid = parse_id_local("job_id", job_id)?;
+        let tenant_id_owned = tenant_id.to_string();
+        let job_id_owned = job_id.to_string();
+        let store = self.clone();
+        let row = with_tenant_tx_error(&self.pool, tenant_id, region, move |conn| {
+            Box::pin(async move {
+                store
+                    .get_dispatch_identity_on_conn(conn, &tenant_id_owned, job_uuid, &job_id_owned)
+                    .await
+            })
+        })
+        .await?;
+        Ok(row)
+    }
+
+    pub(crate) async fn get_dispatch_identity_on_conn(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant_id: &str,
+        job_id: Uuid,
+        job_id_text: &str,
+    ) -> Result<Option<ClaimedDispatchIdentity>, CiJobSpecStoreError> {
+        let row = sqlx::query(SELECT_JOB_SPEC_IDENTITY_QUERY)
+            .bind(tenant_id)
+            .bind(job_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| CiJobSpecStoreError::Db(e.to_string()))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let run_id: String = row
+            .try_get("run_id")
+            .map_err(|e| CiJobSpecStoreError::Db(e.to_string()))?;
+        let idem_token: String = row
+            .try_get("idem_token")
+            .map_err(|e| CiJobSpecStoreError::Db(e.to_string()))?;
+        let stage: Option<String> = row
+            .try_get("stage")
+            .map_err(|e| CiJobSpecStoreError::Db(e.to_string()))?;
+        let stage = stage.ok_or_else(|| CiJobSpecStoreError::MissingStage {
+            job_id: job_id_text.to_string(),
+        })?;
+        Ok(Some(ClaimedDispatchIdentity {
+            run_id,
+            idem_token,
+            stage,
+        }))
+    }
+}
+
+/// **The durable claimed-identity a dispatch persisted (CT-004d.2 rewire) — the reporter's fail-closed
+/// verification record.** Read by `(tenant, job_id)`; the reporter refuses a completion whose presented
+/// `(run_id, idem_token)` do not equal these, and attributes the verdict to `stage` (a durable read, not
+/// an in-memory map — restart-safe).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimedDispatchIdentity {
+    /// The run the dispatched job belongs to (the workflow the verdict wakes).
+    pub run_id: String,
+    /// The engine dispatch `idem_token` (the `job.done` idempotency key the runner echoes).
+    pub idem_token: String,
+    /// The pipeline stage name the verdict is attributed to (the restart-safe stage resolution).
+    pub stage: String,
 }
 
 /// **The two fail-closed dispatch invariants (pure, so the unit suite proves them DB-free).**
@@ -395,7 +522,10 @@ fn decode_spec(job_id: &str, spec_json: serde_json::Value) -> Result<JobSpec, Ci
 /// Parse a `job_id`/`run_id` token into the durable `uuid` column type — a non-uuid is a loud refusal.
 /// (Delegates to the `job_queue` store's `parse_id`, re-mapping the error into this store's type so the
 /// UUID-column rule is authored ONCE.)
-fn parse_id_local(field: &'static str, value: &str) -> Result<sqlx::types::Uuid, CiJobSpecStoreError> {
+fn parse_id_local(
+    field: &'static str,
+    value: &str,
+) -> Result<sqlx::types::Uuid, CiJobSpecStoreError> {
     parse_id(field, value).map_err(|_| CiJobSpecStoreError::BadId {
         field,
         value: value.to_string(),

@@ -49,6 +49,13 @@ enum StartupRefusal {
     IncompleteProductionRunner,
     InvalidRunnerSetting(String),
     NonUnicodeRunnerSetting(OsString),
+    /// **The rolling-upgrade floor (CT-004d.2 claim-bound completion).** The runner lane refuses to
+    /// activate while any non-terminal job's dispatched stage is NULL (a pre-rewire historical dispatch
+    /// the reporter must refuse without consuming). A checked invariant, not an assumption — a
+    /// healthy deploy (CI has never been production-activated) has zero such rows.
+    NonTerminalNullStageBacklog {
+        count: i64,
+    },
 }
 
 impl fmt::Display for StartupRefusal {
@@ -67,6 +74,12 @@ impl fmt::Display for StartupRefusal {
                 f,
                 "invalid MYELIN_CI_RUNNER value {value:?} contains non-UTF-8 bytes; allowed values \
                  are `0`, `1`, or unset"
+            ),
+            Self::NonTerminalNullStageBacklog { count } => write!(
+                f,
+                "runner-lane activation refused: {count} non-terminal job(s) have a NULL dispatched \
+                 stage (a pre-rewire rolling-upgrade backlog completion cannot safely attribute); the \
+                 activation guard requires zero such rows"
             ),
         }
     }
@@ -221,8 +234,9 @@ async fn main() {
     // only re-queues expired leases (`leased`→`queued`); it launches NO untrusted code (binding the
     // runner + starting the pipeline body on the sandbox executor is CT-004c.2). The claim path is
     // dormant at the shell (production runner activation is refused above).
+    let region_queue_store = scheduler_provider.region_queue_store();
     let reaper = myelin_ci_controlplane::JobQueueReaper::new(
-        scheduler_provider.region_queue_store(),
+        region_queue_store.clone(),
         provider.config().region.clone(),
         std::time::Duration::from_secs(15),
     );
@@ -241,6 +255,27 @@ async fn main() {
     // `starter_factory.starter_for(tenant, pin)` per discovered tenant, and the myelin-flow M2 durable
     // `RunStore`.
     if runner_host_requested {
+        // ROLLING-UPGRADE FLOOR (CT-004d.2): refuse activation while any non-terminal NULL-stage
+        // dispatch is still live — completion refuses such a job without consuming its claim, so the
+        // lane must not start until the backlog is repaired. A CHECKED invariant (a healthy never-activated
+        // deploy has zero). Dormant with the refusal above; the activation flip runs it for real.
+        match region_queue_store
+            .count_non_terminal_null_stage_jobs(&provider.config().region)
+            .await
+        {
+            Ok(0) => {}
+            Ok(count) => {
+                eprintln!(
+                    "ci-controlplane: startup refused: {}",
+                    StartupRefusal::NonTerminalNullStageBacklog { count }
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("ci-controlplane: null-stage activation guard query failed: {e}");
+                std::process::exit(1);
+            }
+        }
         let _starter_factory = myelin_ci_controlplane::ci_run_starter_factory(
             provider.db_pool().clone(),
             myelin_tenancy::Region(provider.config().region.clone()),

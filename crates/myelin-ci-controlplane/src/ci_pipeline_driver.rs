@@ -40,43 +40,47 @@
 //! is touched (the sandbox `run_one` security body, the engine fixture). The bridge is the
 //! [`myelin_ci_sandbox::TerminalReporter`] seam — a legitimate injection point the runner already
 //! depends on abstractly: [`CiPipelineReporter`] re-encodes the runner's derived `passed` into the
-//! stage-verdict marker the body decodes (the stage NAME comes from the [`StageVerdictBridge`] the
-//! [`DurableJobRunner`] populated at dispatch, keyed on the deterministic `idem_token`), then WAKES the
-//! parked run so the dispatcher re-drives + consumes the signal. A stage the bridge has no mapping for
-//! falls back to the raw `passed` marker (behaviourally identical to [`myelin_ci_sandbox::EngineTerminalReporter`])
-//! — never a fabricated pass.
+//! stage-verdict marker the body decodes. The stage name is co-persisted on `job_queue` and
+//! `ci_job_spec`; completion reads that durable identity in the same transaction that consumes the
+//! claim and buffers the typed PostgreSQL workflow signal.
 //!
 //! ## The durable-RunStore FLOOR (named, not silently skipped)
-//! [`CiPipelineDriver`] drives the engine over the IN-MEMORY [`myelin_flow::RunStore`] (the M2 engine's
-//! named floor — a restart loses in-flight runs). The durable recovery record is the `ci_run` row
-//! (chunk 4) carrying the pre-minted `wf_run_id`: after a restart, the starter re-reads the queued
-//! `ci_run` and re-`start_with_id`s the SAME id (idempotent). A durable `RunStore` (a live-PG
-//! `workflow_run` lease/replay binding) is NOT built here — it is the myelin-flow M2 named floor.
+//! [`CiPipelineDriver`] starts the run and buffers completion signals durably through
+//! [`PgFlowExecutor`], while its body dispatcher still mirrors through the in-memory executor. The
+//! remaining activation floor is replacing that mirror with `PgFlowDriveStore` lease/replay; V2
+//! production launch remains refused until that authority is complete.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use myelin_ci_sandbox::{
-    EgressPolicy, IdemToken, ImageRef, JobKind as SandboxJobKind, JobSpec as SandboxJobSpec,
-    MeterTarget, ResourceLimits, RunTokenRef, TerminalReport, TerminalReporter, TrustTier,
-    WorkspaceSpec,
+    CompletionClaim, EgressPolicy, IdemToken, ImageRef, JobKind as SandboxJobKind,
+    JobSpec as SandboxJobSpec, MeterTarget, ResourceLimits, RunTokenRef, TerminalReport,
+    TerminalReporter, TrustTier, WorkspaceSpec,
 };
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
+use myelin_storage::{with_tenant_tx_error, PgError};
 use myelin_tenancy::{Region, TenantId};
+use sqlx::types::Uuid;
 
 use myelin_flow::{
-    stage_verdict_marker, ActivityError, DriveOutcome, DurableExecutor, ExecutorError,
-    FlowDispatcher, FlowExecutor, FlowTelemetry, JobRunner, JobSpec as FlowJobSpec, RunId,
-    SignalOutcome, SignalSpec, StartSpec, TimerStore, WfCtx, WfJournal, WorkflowBody,
+    ActivityError, DriveOutcome, DurableExecutor, ExecutorError, FlowDispatcher, FlowExecutor,
+    FlowTelemetry, JobRunner, JobSpec as FlowJobSpec, PgFlowExecutor, RunId, SignalOutcome,
+    SignalPayload, StartSpec, TimerStore, TypedSignalSpec, WfCtx, WfJournal, WorkflowBody,
     CI_PIPELINE_WF_TYPE, JOB_DONE_SIGNAL, PARTITION_COUNT,
 };
 
 use crate::ci_pipeline::{run_ci_pipeline_body, PipelineRun, PipelineStage, RunVerdict};
 use crate::ci_run_store::CiRunRecord;
-use crate::job_queue_store::{trust_from_token, DurableEnqueue, JobQueueStoreError};
-use crate::job_spec_store::{CiJobSpecStore, MAX_JOB_TIMEOUT_SECS};
+use crate::job_queue_store::{
+    trust_from_token, CiJobQueueStore, ClaimConsumeOutcome, ClaimConsumeSpec, DurableEnqueue,
+    JobQueueStoreError,
+};
+use crate::job_spec_store::{
+    CiJobSpecStore, CiJobSpecStoreError, ClaimedDispatchIdentity, MAX_JOB_TIMEOUT_SECS,
+};
 use crate::schedule_and_run_job::JobScheduleTerms;
 use crate::scheduler::Lane;
 
@@ -119,42 +123,6 @@ pub fn unresolved_stage_spec_builder() -> StageSpecBuilder {
     })
 }
 
-/// **The in-process idem_token → stage-name bridge (the verdict-vocabulary translation seam).** The
-/// [`DurableJobRunner`] records `(idem_token, stage_name)` at dispatch; the [`CiPipelineReporter`] reads
-/// it back to re-encode the runner's derived `passed` into the [`stage_verdict_marker`] the pipeline
-/// body decodes. Cloneable (shared `Arc<Mutex<…>>`) so the runner + the reporter (same process) share
-/// ONE map. Named `…Bridge` (NOT `…Registry`/`…Store`) — it is an in-memory translation cache, not a
-/// durable-by-contract store (the durable dispatch record is the `job_queue` + `ci_job_spec` rows).
-#[derive(Clone, Default)]
-pub struct StageVerdictBridge {
-    by_token: Arc<Mutex<HashMap<String, String>>>,
-}
-
-impl StageVerdictBridge {
-    /// A fresh, empty bridge.
-    pub fn new() -> StageVerdictBridge {
-        StageVerdictBridge::default()
-    }
-
-    /// Record the stage name a dispatched `idem_token` belongs to (the runner echoes `idem_token` on
-    /// `job.done`; the reporter maps it back to the stage the body attributes the verdict to).
-    fn record(&self, idem_token: &str, stage: &str) {
-        self.by_token
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(idem_token.to_string(), stage.to_string());
-    }
-
-    /// The stage name for a dispatched `idem_token`, if the runner recorded one.
-    fn stage_for(&self, idem_token: &str) -> Option<String> {
-        self.by_token
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(idem_token)
-            .cloned()
-    }
-}
-
 // =================================================================================================
 // Chunk 5 — the DURABLE JobRunner.
 // =================================================================================================
@@ -182,24 +150,23 @@ pub struct DurableJobRunner {
     /// function of the resolved snapshot (the trust tier stamped at trigger time). Forwarded UNCHANGED.
     terms: JobScheduleTerms,
     build_spec: StageSpecBuilder,
-    verdicts: StageVerdictBridge,
     /// `(stage target → stage name)` for THIS run's pipeline — so a dispatched flow `JobSpec` (which
-    /// carries the opaque `target`, not the stage name) maps back to the stage name the verdict codec
-    /// needs. Built from the [`PipelineRun`]'s stages at construction.
+    /// carries the opaque `target`, not the stage name) maps back to the stage name persisted DURABLY
+    /// onto the `ci_job_spec` row (the reporter reads it back at `job.done`, restart-safe). Built from
+    /// the [`PipelineRun`]'s stages at construction. A dispatch whose target is not a known stage fails
+    /// closed (never a durable row the reporter cannot attribute a verdict to).
     targets: Vec<(String, String)>,
 }
 
 impl DurableJobRunner {
     /// Build the durable runner for one run: the durable `ci_job_spec` store, the runtime handle the
     /// async co-persist bridges onto, the run's [`JobScheduleTerms`] (the security-load-bearing tier +
-    /// region), the [`StageSpecBuilder`], the shared [`StageVerdictBridge`], and the run's pipeline
-    /// stages (for the target → name map).
+    /// region), the [`StageSpecBuilder`], and the run's pipeline stages (for the target → name map).
     pub fn new(
         store: CiJobSpecStore,
         rt: tokio::runtime::Handle,
         terms: JobScheduleTerms,
         build_spec: StageSpecBuilder,
-        verdicts: StageVerdictBridge,
         stages: &[PipelineStage],
     ) -> DurableJobRunner {
         let targets = stages
@@ -211,7 +178,6 @@ impl DurableJobRunner {
             rt,
             terms,
             build_spec,
-            verdicts,
             targets,
         }
     }
@@ -273,63 +239,261 @@ fn build_dispatch_parts(
         concurrency_group: terms.concurrency_group.clone(),
         fair_key: terms.fair_key.clone(),
         idem_token: flow_spec.idem_token.clone(),
+        stage: flow_spec.target.clone(),
     };
     Ok((enq, spec))
 }
 
 impl JobRunner for DurableJobRunner {
     fn dispatch(&self, flow_spec: &FlowJobSpec) -> Result<(), ActivityError> {
-        let (enq, spec) = self.build_dispatch(flow_spec)?;
+        let (mut enq, spec) = self.build_dispatch(flow_spec)?;
 
-        // Record the stage name so the reporter re-encodes the verdict codec the body decodes.
-        if let Some((_, name)) = self.targets.iter().find(|(t, _)| t == &flow_spec.target) {
-            self.verdicts.record(&flow_spec.idem_token, name);
-        }
+        // Resolve the dispatched stage's NAME (the reporter attributes the verdict to it). It is
+        // persisted DURABLY onto the ci_job_spec row (not an in-memory map), so a fresh reporter after
+        // a restart reads it back. A target that is not a known pipeline stage FAILS CLOSED — a durable
+        // job the reporter could never attribute a verdict to must never be enqueued.
+        let stage = self
+            .targets
+            .iter()
+            .find(|(t, _)| t == &flow_spec.target)
+            .map(|(_, name)| name.clone())
+            .ok_or_else(|| {
+                ActivityError(format!(
+                    "ci.pipeline dispatch refused: target `{}` is not a known pipeline stage — the \
+                     verdict could not be durably attributed (fail-closed)",
+                    flow_spec.target
+                ))
+            })?;
+        enq.stage = stage.clone();
 
-        // Co-persist the job_queue row + the ci_job_spec row in ONE tenant-scoped tx (bridged onto the
-        // runtime). A dispatch failure surfaces as an ActivityError the engine retries (reusing the
-        // SAME idem_token — the durable ON CONFLICT dedups the re-dispatch).
-        bridge(&self.rt, self.store.co_persist_dispatch(&enq, &spec))
-            .map_err(|e| ActivityError(format!("durable co_persist_dispatch refused: {e}")))?;
+        // Co-persist the job_queue row + the ci_job_spec row (carrying the durable stage) in ONE
+        // tenant-scoped tx (bridged onto the runtime). A dispatch failure surfaces as an ActivityError
+        // the engine retries (reusing the SAME idem_token — the durable ON CONFLICT dedups the re-dispatch).
+        bridge(
+            &self.rt,
+            self.store.co_persist_dispatch(&enq, &spec, &stage),
+        )
+        .map_err(|e| ActivityError(format!("durable co_persist_dispatch refused: {e}")))?;
         Ok(())
     }
 }
 
 // =================================================================================================
-// The verdict-vocabulary bridge reporter.
+// The durable-completion-authority reporter (the external-reviewer blocker: verify the claim first).
 // =================================================================================================
 
-/// **The [`TerminalReporter`] that bridges the runner's `passed` marker to the pipeline body's stage
-/// verdict codec (and WAKES the parked run).** The runner ([`myelin_ci_sandbox::RunnerAgent`]) derives
-/// `passed` from the real guest exit code and calls `report_done`; this re-encodes it as the
-/// [`stage_verdict_marker`] the body's [`myelin_flow::WfCtx::run_ci_pipeline`] decodes (stage name from
-/// the [`StageVerdictBridge`] keyed on the echoed `idem_token`), delivers it through the ONE engine
-/// signal path ([`DurableExecutor::signal`] — exactly-once on the `wf_signal` PK), and WAKES the parked
-/// run (`waiting → running`) so the dispatcher re-drives + consumes it.
+/// **Why a refused completion is fail-closed** — the reasons [`CiPipelineReporter::report_done`] rejects
+/// a `job.done` BEFORE any verdict is signalled (nothing durable changes on a refusal). Each is a
+/// forged / mis-keyed / unclaimed completion: the caller does not own the durable job it claims.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ClaimRefusal {
+    /// The completion's claimed `tenant` is not the tenant this reporter's executor is bound to. A
+    /// region runner claims cross-tenant; a reporter is tenant-bound, so a mis-routed completion is
+    /// refused rather than signalled against the wrong tenant's run.
+    TenantMismatch { reporter: String, claimed: String },
+    /// The claimed `job_id` is not the deterministic dispatch id for the echoed `idem_token`. The
+    /// dispatch derives `job_id = stage_job_id(idem_token)`; a completion whose `(job_id, idem_token)`
+    /// do not agree is forged, not a real claim.
+    JobIdMismatch { claimed: String, expected: String },
+    /// No durable `ci_job_spec` dispatch record exists for `(tenant, job_id)` — the job was never
+    /// dispatched/claimed under this identity (a fabricated completion), so it is refused.
+    NoDispatchRecord { job_id: String },
+    /// The durable dispatch record's `run_id` does not match the completion's `run` — the claim names a
+    /// different run than the one it was dispatched for.
+    RunMismatch { durable: String, claimed: String },
+    /// The durable dispatch record's `idem_token` does not match the echoed one — the claim was keyed
+    /// to a different dispatch.
+    IdemMismatch { durable: String, claimed: String },
+}
+
+impl std::fmt::Display for ClaimRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClaimRefusal::TenantMismatch { reporter, claimed } => write!(
+                f,
+                "claimed tenant `{claimed}` is not this reporter's tenant `{reporter}`"
+            ),
+            ClaimRefusal::JobIdMismatch { claimed, expected } => write!(
+                f,
+                "claimed job_id `{claimed}` is not the deterministic dispatch id `{expected}` for the echoed idem_token"
+            ),
+            ClaimRefusal::NoDispatchRecord { job_id } => write!(
+                f,
+                "no durable ci_job_spec dispatch record for job `{job_id}` (unclaimed/forged completion)"
+            ),
+            ClaimRefusal::RunMismatch { durable, claimed } => write!(
+                f,
+                "durable dispatch run_id `{durable}` does not match the claimed run `{claimed}`"
+            ),
+            ClaimRefusal::IdemMismatch { durable, claimed } => write!(
+                f,
+                "durable dispatch idem_token `{durable}` does not match the claimed `{claimed}`"
+            ),
+        }
+    }
+}
+
+/// **The PURE (DB-free) claimed-job verification — the security core, unit-testable with NO pool.**
+/// Given the completion's claimed authority `(claimed_tenant, presented_run, presented_job_id,
+/// presented_idem_token)`, the reporter's bound `reporter_tenant`, the `expected_job_id` the dispatch
+/// deterministically derives from the idem_token, and the durable dispatch record read for
+/// `(tenant, job_id)`, returns the durable stage the verdict attributes to — or a [`ClaimRefusal`]
+/// (fail-closed, nothing signalled). Every field of the durable claimed-job identity must match; a
+/// forged / mis-keyed / unclaimed completion resolves no matching record and is refused.
+fn verify_claimed_identity(
+    reporter_tenant: &TenantId,
+    claimed_tenant: &TenantId,
+    presented_run: &str,
+    presented_job_id: &str,
+    presented_idem_token: &str,
+    expected_job_id: &str,
+    durable: Option<ClaimedDispatchIdentity>,
+) -> Result<String, ClaimRefusal> {
+    if claimed_tenant != reporter_tenant {
+        return Err(ClaimRefusal::TenantMismatch {
+            reporter: reporter_tenant.0.clone(),
+            claimed: claimed_tenant.0.clone(),
+        });
+    }
+    if presented_job_id != expected_job_id {
+        return Err(ClaimRefusal::JobIdMismatch {
+            claimed: presented_job_id.to_string(),
+            expected: expected_job_id.to_string(),
+        });
+    }
+    let Some(identity) = durable else {
+        return Err(ClaimRefusal::NoDispatchRecord {
+            job_id: presented_job_id.to_string(),
+        });
+    };
+    if identity.run_id != presented_run {
+        return Err(ClaimRefusal::RunMismatch {
+            durable: identity.run_id,
+            claimed: presented_run.to_string(),
+        });
+    }
+    if identity.idem_token != presented_idem_token {
+        return Err(ClaimRefusal::IdemMismatch {
+            durable: identity.idem_token,
+            claimed: presented_idem_token.to_string(),
+        });
+    }
+    Ok(identity.stage)
+}
+
+/// **The deterministic, nonce-keyed completion receipt the CAS records.** It length-frames tenant,
+/// region, run, job, idem token, durable stage, verdict, ordered result refs, owner, epoch, and the
+/// fresh claim nonce. Exact at-least-once redelivery recomputes the same receipt; any authority or
+/// payload divergence is refused. The row CAS still proves live ownership; the keyed receipt is its
+/// tamper-evident idempotency evidence.
+struct CompletionReceiptInput<'a> {
+    tenant: &'a TenantId,
+    region: &'a str,
+    run: &'a RunId,
+    job_id: &'a str,
+    idem_token: &'a str,
+    stage: &'a str,
+    passed: bool,
+    result_refs: &'a [ArtifactRef],
+    lease_owner: &'a str,
+    lease_epoch: i64,
+    claim_nonce: &'a str,
+}
+
+fn completion_receipt(input: CompletionReceiptInput<'_>) -> String {
+    let key = blake3::derive_key(
+        "myelin.ci.completion-receipt.v2",
+        input.claim_nonce.as_bytes(),
+    );
+    let mut hasher = blake3::Hasher::new_keyed(&key);
+    for frame in [
+        input.tenant.0.as_bytes(),
+        input.region.as_bytes(),
+        input.run.0.as_bytes(),
+        input.job_id.as_bytes(),
+        input.idem_token.as_bytes(),
+        input.stage.as_bytes(),
+        &[input.passed as u8],
+        input.lease_owner.as_bytes(),
+        &input.lease_epoch.to_be_bytes(),
+        input.claim_nonce.as_bytes(),
+    ] {
+        hasher.update(&(frame.len() as u64).to_be_bytes());
+        hasher.update(frame);
+    }
+    hasher.update(&(input.result_refs.len() as u64).to_be_bytes());
+    for result_ref in input.result_refs {
+        hasher.update(&(result_ref.0.len() as u64).to_be_bytes());
+        hasher.update(result_ref.0.as_bytes());
+    }
+    format!("v2:{}", hasher.finalize().to_hex())
+}
+
+#[derive(Debug)]
+enum CompletionTxError {
+    Scope(PgError),
+    Spec(CiJobSpecStoreError),
+    Signal(ExecutorError),
+    Refused,
+}
+
+impl From<PgError> for CompletionTxError {
+    fn from(error: PgError) -> Self {
+        Self::Scope(error)
+    }
+}
+
+/// **The [`TerminalReporter`] that VERIFIES durable claimed-job identity before signalling a verdict
+/// (the external reviewer's blocker).** The runner ([`myelin_ci_sandbox::RunnerAgent`]) derives `passed`
+/// from the real guest exit code and calls `report_done` carrying the CLAIMED row's authority
+/// `(tenant, run, job_id, idem_token, owner, epoch, nonce)`. This reporter:
 ///
-/// A `job.done` for a stage the bridge has no mapping for (a non-pipeline compute job, or a lost map
-/// after a restart) falls back to the raw `myelin://job-done/passed-<bool>` marker (identical to
-/// [`myelin_ci_sandbox::EngineTerminalReporter`]) — the body then surfaces "no verdict marker" LOUDLY,
-/// never a fabricated pass.
+/// 1. **Verifies the claim.** It reads the durable `ci_job_spec` dispatch record for `(tenant, job_id)`
+///    and refuses fail-closed ([`ClaimRefusal`]) unless the claimed `tenant`, `job_id`
+///    (== `stage_job_id(idem_token)`), `run_id`, and `idem_token` ALL match the durable record — so a
+///    caller cannot forge a completion for a job it does not own, and the idem token is no longer a
+///    predictable `(run_id, command_id)` free pass (it must match a real claimed row).
+/// 2. **Resolves the stage DURABLY.** The verdict-attribution stage name comes from the `ci_job_spec.stage`
+///    column (persisted at dispatch) — a restart-safe read, never an in-memory map. So a fresh reporter
+///    over the same PG resolves the verdict exactly.
+/// 3. **Consumes + signals in one transaction.** The queue CAS binds the fresh nonce, durable stage,
+///    and a receipt over every canonical completion field; [`PgFlowExecutor::signal_typed_on_conn`]
+///    buffers the typed `job.done` before that same transaction commits. A late completion returns
+///    [`SignalOutcome::TerminalNoOp`] (an acknowledged no-op), so the runner settles its lease instead
+///    of retrying forever.
 #[derive(Clone)]
 pub struct CiPipelineReporter {
     executor: FlowExecutor,
+    pg_executor: PgFlowExecutor,
+    spec_store: CiJobSpecStore,
+    queue_store: CiJobQueueStore,
+    rt: tokio::runtime::Handle,
     tenant: TenantId,
-    verdicts: StageVerdictBridge,
+    region: String,
 }
 
 impl CiPipelineReporter {
-    /// Build the reporter over the SHARED [`FlowExecutor`] the parked pipeline run runs on, the cell
-    /// tenant (the run + signal partition key), and the shared [`StageVerdictBridge`].
+    /// Build the reporter over the SHARED [`FlowExecutor`] the parked pipeline run runs on, the durable
+    /// [`CiJobSpecStore`] the claimed-job identity is verified + the stage is resolved against, the
+    /// [`CiJobQueueStore`] the completion claim is atomically consumed against, the runtime handle the
+    /// async durable reads bridge onto, and the cell `(tenant, region)` scope.
     pub fn new(
         executor: FlowExecutor,
+        pg_executor: PgFlowExecutor,
+        spec_store: CiJobSpecStore,
+        queue_store: CiJobQueueStore,
+        rt: tokio::runtime::Handle,
         tenant: TenantId,
-        verdicts: StageVerdictBridge,
+        region: impl Into<String>,
     ) -> CiPipelineReporter {
         CiPipelineReporter {
             executor,
+            pg_executor,
+            spec_store,
+            queue_store,
+            rt,
             tenant,
-            verdicts,
+            region: region.into(),
         }
     }
 }
@@ -337,35 +501,156 @@ impl CiPipelineReporter {
 impl TerminalReporter for CiPipelineReporter {
     fn report_done(
         &self,
-        run: &RunId,
-        idem_token: &str,
+        claim: &CompletionClaim,
         report: &TerminalReport,
     ) -> Result<SignalOutcome, ExecutorError> {
-        // Re-encode the derived `passed` into the stage-verdict marker the pipeline body decodes. The
-        // stage name is the one the DurableJobRunner recorded for this dispatch's idem_token.
-        let mut payload = Vec::with_capacity(report.result_refs.len() + 1);
-        match self.verdicts.stage_for(idem_token) {
-            Some(stage) => payload.push(stage_verdict_marker(&stage, report.passed)),
-            // Fail-loud fallback (never a fabricated pass): the raw marker the body rejects loudly.
-            None => payload.push(ArtifactRef(format!(
-                "myelin://job-done/passed-{}",
-                report.passed
-            ))),
+        let CompletionClaim {
+            tenant,
+            run,
+            job_id,
+            idem_token,
+            lease_owner,
+            lease_epoch,
+            claim_nonce,
+        } = claim;
+        let lease_epoch = *lease_epoch;
+        // ── BLOCKER 2: the tenant check is FIRST, before ANY database access. The reporter is
+        // tenant-bound; a cross-tenant completion is refused BEFORE the caller-supplied tenant can reach
+        // the RLS GUC. Every durable query below uses self.tenant (the verified value), never the caller's.
+        if tenant != &self.tenant {
+            return Err(ExecutorError::InvalidInput(format!(
+                "ci.pipeline job.done refused (unverified claim, fail-closed): {}",
+                ClaimRefusal::TenantMismatch {
+                    reporter: self.tenant.0.clone(),
+                    claimed: tenant.0.clone(),
+                }
+            )));
         }
-        // references-not-payloads: the guest bytes rode the firehose; only the result refs travel here.
-        payload.extend(report.result_refs.iter().cloned());
 
-        let outcome = self.executor.signal(SignalSpec {
-            run: run.clone(),
-            signal_name: JOB_DONE_SIGNAL.to_string(),
-            idem_key: idem_token.to_string(),
-            payload,
-            payload_key_ref: None,
+        let expected_job_id = DurableJobRunner::stage_job_id(idem_token);
+        let job_uuid = Uuid::parse_str(job_id)
+            .map_err(|_| ExecutorError::InvalidInput(format!("invalid job_id UUID `{job_id}`")))?;
+        let nonce_uuid = Uuid::parse_str(claim_nonce).map_err(|_| {
+            ExecutorError::InvalidInput("invalid claim_nonce UUID (completion refused)".into())
         })?;
+        let tenant_owned = self.tenant.0.clone();
+        let region_owned = self.region.clone();
+        let run_owned = run.clone();
+        let job_owned = job_id.to_string();
+        let idem_owned = idem_token.to_string();
+        let owner_owned = lease_owner.to_string();
+        let nonce_owned = claim_nonce.to_string();
+        let report_owned = report.clone();
+        let expected_owned = expected_job_id;
+        let spec_store = self.spec_store.clone();
+        let pg_executor = self.pg_executor.clone();
 
-        // WAKE the parked run (waiting → running) so the dispatcher re-leases + replays it and consumes
-        // the job.done we just buffered. wake is idempotent (a running/terminal run is untouched); a
-        // double delivery buffers once (the PK) and wakes a still-running run harmlessly.
+        let durable = bridge(
+            &self.rt,
+            with_tenant_tx_error(
+                self.queue_store.pool(),
+                &self.tenant.0,
+                &self.region,
+                move |conn| {
+                    Box::pin(async move {
+                        let identity = spec_store
+                            .get_dispatch_identity_on_conn(
+                                conn,
+                                &tenant_owned,
+                                job_uuid,
+                                &job_owned,
+                            )
+                            .await
+                            .map_err(CompletionTxError::Spec)?;
+                        let stage = verify_claimed_identity(
+                            &TenantId(tenant_owned.clone()),
+                            &TenantId(tenant_owned.clone()),
+                            &run_owned.0,
+                            &job_owned,
+                            &idem_owned,
+                            &expected_owned,
+                            identity,
+                        )
+                        .map_err(|_| CompletionTxError::Refused)?;
+                        let receipt = completion_receipt(CompletionReceiptInput {
+                            tenant: &TenantId(tenant_owned.clone()),
+                            region: &region_owned,
+                            run: &run_owned,
+                            job_id: &job_owned,
+                            idem_token: &idem_owned,
+                            stage: &stage,
+                            passed: report_owned.passed,
+                            result_refs: &report_owned.result_refs,
+                            lease_owner: &owner_owned,
+                            lease_epoch,
+                            claim_nonce: &nonce_owned,
+                        });
+                        let claim = CiJobQueueStore::consume_claim_on_conn(
+                            conn,
+                            ClaimConsumeSpec {
+                                tenant_id: &tenant_owned,
+                                job_id: job_uuid,
+                                lease_owner: &owner_owned,
+                                lease_epoch,
+                                claim_nonce: nonce_uuid,
+                                stage: &stage,
+                                completion_receipt: &receipt,
+                            },
+                        )
+                        .await?;
+                        if claim == ClaimConsumeOutcome::Refused {
+                            return Err(CompletionTxError::Refused);
+                        }
+                        let signal = TypedSignalSpec {
+                            run: run_owned.clone(),
+                            signal_name: JOB_DONE_SIGNAL.to_string(),
+                            idem_key: idem_owned.clone(),
+                            payload: SignalPayload::CiJobDone {
+                                stage,
+                                passed: report_owned.passed,
+                                result_refs: report_owned.result_refs.clone(),
+                            },
+                            payload_key_ref: None,
+                        };
+                        let outcome = pg_executor
+                            .signal_typed_on_conn(conn, signal.clone())
+                            .await
+                            .map_err(CompletionTxError::Signal)?;
+                        Ok((outcome, signal))
+                    })
+                },
+            ),
+        );
+        let (outcome, signal) = match durable {
+            Ok(value) => value,
+            Err(CompletionTxError::Refused) => {
+                return Err(ExecutorError::InvalidInput(format!(
+                    "ci.pipeline job.done refused (unverified, stale, or divergent claim): job \
+                     `{job_id}` owner `{lease_owner}` epoch `{lease_epoch}`"
+                )))
+            }
+            Err(CompletionTxError::Spec(error)) => {
+                return Err(ExecutorError::Storage(format!(
+                    "durable claimed-job read refused: {error}"
+                )))
+            }
+            Err(CompletionTxError::Signal(error)) => return Err(error),
+            Err(CompletionTxError::Scope(error)) => {
+                return Err(ExecutorError::Storage(format!(
+                    "atomic completion transaction failed: {error}"
+                )))
+            }
+        };
+
+        // The PostgreSQL run/signal is authoritative. Mirror into the current in-process driver until
+        // its dispatcher is backed directly by PgDriveStore; a retry is safe because the durable
+        // receipt and signal insertion are both idempotent.
+        self.executor.signal_typed(signal)?;
+
+        // WAKE the parked run (waiting → running) so the in-process dispatcher re-leases + replays it and
+        // consumes the job.done we just buffered. Idempotent (a running/terminal run is untouched). The
+        // durable PgFlowExecutor closes the signal/park race engine-side; this wake serves the in-memory
+        // driver the same one signal path drives today.
         self.executor.runs().wake(&self.tenant, &run.0);
         Ok(outcome)
     }
@@ -391,12 +676,12 @@ struct RunPlan {
 /// `ci_run` (queued) row and starts the parked run under the pre-minted `wf_run_id` — so the parked
 /// run's id EQUALS the `job_queue` row's `run_id` the runner reports to.
 ///
-/// **Durable-RunStore FLOOR (named):** the engine runs over the IN-MEMORY [`myelin_flow::RunStore`] (the
-/// M2 named floor); the durable recovery record is the `ci_run` row (chunk 4). A restart re-reads the
-/// queued `ci_run` and re-`start_with_id`s the SAME id (idempotent). A durable `RunStore` is NOT built
-/// here.
+/// **Durable-drive FLOOR (named):** start and typed completion signal are PostgreSQL-durable, but body
+/// dispatch still mirrors through the in-memory executor. Production activation remains refused until
+/// `PgFlowDriveStore` owns lease/replay end to end.
 pub struct CiPipelineDriver {
     executor: FlowExecutor,
+    pg_executor: PgFlowExecutor,
     tenant: TenantId,
     region: String,
     // the shared durable-workflow substrate the dispatcher drives over (RunStore/SignalStore come from
@@ -411,7 +696,6 @@ pub struct CiPipelineDriver {
     spec_store: CiJobSpecStore,
     rt: tokio::runtime::Handle,
     build_spec: StageSpecBuilder,
-    verdicts: StageVerdictBridge,
     // run_id → RunPlan (the per-run pipeline + terms the registered body resolves).
     plans: Arc<Mutex<HashMap<String, RunPlan>>>,
     // the run ids this driver started (so drive_once can wake any parked run robustly).
@@ -432,7 +716,10 @@ impl CiPipelineDriver {
     ) -> CiPipelineDriver {
         let region = region.into();
         let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
-        let executor = FlowExecutor::new(
+        let executor = FlowExecutor::new(minter.clone(), tenant.clone(), Region(region.clone()));
+        let pg_executor = PgFlowExecutor::new(
+            spec_store.pool().clone(),
+            rt.clone(),
             minter.clone(),
             tenant.clone(),
             Region(region.clone()),
@@ -440,6 +727,7 @@ impl CiPipelineDriver {
         executor.register_definition(CI_PIPELINE_WF_TYPE);
         CiPipelineDriver {
             executor,
+            pg_executor,
             tenant: tenant.clone(),
             region: region.clone(),
             journal: WfJournal::new(),
@@ -451,7 +739,6 @@ impl CiPipelineDriver {
             spec_store,
             rt,
             build_spec,
-            verdicts: StageVerdictBridge::new(),
             plans: Arc::new(Mutex::new(HashMap::new())),
             started: Arc::new(Mutex::new(Vec::new())),
         }
@@ -463,18 +750,19 @@ impl CiPipelineDriver {
         self.executor.clone()
     }
 
-    /// The shared [`StageVerdictBridge`] the runner's reporter reads (the durable runner writes it).
-    pub fn verdict_bridge(&self) -> StageVerdictBridge {
-        self.verdicts.clone()
-    }
-
     /// Build the [`CiPipelineReporter`] the runner loop drives (over this driver's shared executor +
-    /// verdict bridge). The runner's `job.done` re-encodes to the stage verdict + wakes the parked run.
+    /// durable spec store). The runner's `job.done` is VERIFIED against the durable claimed-job identity
+    /// (tenant/run/job_id/idem_token), the stage is resolved from the durable `ci_job_spec.stage`
+    /// column, and the typed verdict wakes the parked run.
     pub fn reporter(&self) -> CiPipelineReporter {
         CiPipelineReporter::new(
             self.executor.clone(),
+            self.pg_executor.clone(),
+            self.spec_store.clone(),
+            CiJobQueueStore::with_pg(self.spec_store.pool().clone()),
+            self.rt.clone(),
             self.tenant.clone(),
-            self.verdicts.clone(),
+            self.region.clone(),
         )
     }
 
@@ -514,20 +802,21 @@ impl CiPipelineDriver {
             concurrency_group: None,
             fair_key: record.tenant_id.clone(),
         };
-        self.plans.lock().unwrap_or_else(|e| e.into_inner()).insert(
-            record.wf_run_id.clone(),
-            RunPlan {
-                pipeline,
-                terms,
-            },
-        );
+        self.plans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(record.wf_run_id.clone(), RunPlan { pipeline, terms });
         {
             let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
             if !started.contains(&record.wf_run_id) {
                 started.push(record.wf_run_id.clone());
             }
         }
-        self.executor
+        self.pg_executor
+            .register_definition(CI_PIPELINE_WF_TYPE, 1, "blake3:ci-pipeline-driver-v1")
+            .map_err(StartRunError::Start)?;
+        let durable = self
+            .pg_executor
             .start_with_id(
                 StartSpec {
                     wf_type: CI_PIPELINE_WF_TYPE.into(),
@@ -537,7 +826,25 @@ impl CiPipelineDriver {
                 },
                 Some(RunId(record.wf_run_id.clone())),
             )
-            .map_err(StartRunError::Start)
+            .map_err(StartRunError::Start)?;
+        let memory = self
+            .executor
+            .start_with_id(
+                StartSpec {
+                    wf_type: CI_PIPELINE_WF_TYPE.into(),
+                    input: vec![],
+                    budget: None,
+                    idem_key: format!("ci:{}", record.run_id),
+                },
+                Some(RunId(record.wf_run_id.clone())),
+            )
+            .map_err(StartRunError::Start)?;
+        if durable != memory {
+            return Err(StartRunError::Start(ExecutorError::RunIdConflict(
+                record.wf_run_id.clone(),
+            )));
+        }
+        Ok(durable)
     }
 
     /// The registered `ci.pipeline` body: resolve the run's [`RunPlan`] by `run_id`, build a per-run
@@ -550,7 +857,6 @@ impl CiPipelineDriver {
         let spec_store = self.spec_store.clone();
         let rt = self.rt.clone();
         let build_spec = self.build_spec.clone();
-        let verdicts = self.verdicts.clone();
         Box::new(move |ctx: &mut WfCtx| {
             let run_id = ctx.run_id().to_string();
             let plan = plans
@@ -569,7 +875,6 @@ impl CiPipelineDriver {
                 rt.clone(),
                 plan.terms.clone(),
                 build_spec.clone(),
-                verdicts.clone(),
                 &plan.pipeline.stages,
             );
             let verdict =
@@ -578,7 +883,9 @@ impl CiPipelineDriver {
                 RunVerdict::Succeeded { stages_completed } => {
                     vec![ArtifactRef(format!("outcome:succeeded:{stages_completed}"))]
                 }
-                RunVerdict::Failed { stage } => vec![ArtifactRef(format!("outcome:failed:{stage}"))],
+                RunVerdict::Failed { stage } => {
+                    vec![ArtifactRef(format!("outcome:failed:{stage}"))]
+                }
                 RunVerdict::Rejected { stage } => {
                     vec![ArtifactRef(format!("outcome:rejected:{stage}"))]
                 }

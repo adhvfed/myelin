@@ -24,6 +24,7 @@
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
+    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
     CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
     REAP_QUERY,
 };
@@ -179,6 +180,18 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
         .execute(&admin)
         .await
         .expect("apply the job_queue CREATE TABLE forward-only");
+    // The CT-004d.2 claim-generation + completion-receipt columns (the `ci_0004a` sub-migration),
+    // rewritten to the suffixed table.
+    let alter = ALTER_JOB_QUEUE_ADD_COMPLETION_DDL.replace("job_queue", &tbl);
+    sqlx::query(&alter)
+        .execute(&admin)
+        .await
+        .expect("apply the job_queue completion-columns ALTER");
+    let alter = ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL.replace("job_queue", &tbl);
+    sqlx::query(&alter)
+        .execute(&admin)
+        .await
+        .expect("apply the job_queue claim-authority ALTER");
     // The indexes (rewritten to the suffixed table; CONCURRENTLY needs its own tx outside a pool tx —
     // a fresh empty table makes a plain index create lock-free, so drop CONCURRENTLY for the test DDL).
     for (name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {

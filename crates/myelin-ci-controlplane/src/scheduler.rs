@@ -117,10 +117,13 @@ WITH eligible AS (
 UPDATE job_queue j
 SET state = 'leased',
     lease_owner = $4,
-    lease_expires = now() + ($5 || ' seconds')::interval
+    lease_expires = now() + ($5 || ' seconds')::interval,
+    lease_epoch = j.lease_epoch + 1,
+    claim_nonce = gen_random_uuid()
 FROM eligible e
 WHERE j.tenant_id = e.tenant_id AND j.job_id = e.job_id
-RETURNING j.tenant_id, j.job_id, j.run_id, j.lane, j.concurrency_group, j.fair_key, j.trust_tier";
+RETURNING j.tenant_id, j.job_id, j.run_id, j.lane, j.concurrency_group, j.fair_key, j.trust_tier,
+          j.lease_epoch, j.claim_nonce::text AS claim_nonce";
 
 /// **Cancel-superseded (arch 02 §2.3) — a new push to a PR cancels the in-flight run for that group.**
 /// On a new enqueue for a `pr:%` concurrency group, the prior `queued`/`leased` rows for that group
@@ -143,7 +146,7 @@ RETURNING job_id";
 /// `jq_idem` unique on `(tenant_id, idem_token)` rejects a duplicate enqueue). Bind: `$1 region`.
 pub const REAP_QUERY: &str = "\
 UPDATE job_queue
-SET state = 'queued', lease_owner = NULL, lease_expires = NULL
+SET state = 'queued', lease_owner = NULL, lease_expires = NULL, claim_nonce = NULL
 WHERE region = $1
   AND state = 'leased'
   AND lease_expires < now()
@@ -157,12 +160,12 @@ RETURNING tenant_id, job_id";
 /// enqueues — the CI-D1 effectively-once floor). `enqueued_at` defaults to `now()` (the claim's
 /// oldest-first tie-break). Bind: `$1 tenant_id`, `$2 region`, `$3 job_id` (uuid), `$4 run_id`
 /// (uuid), `$5 lane`, `$6 labels text[]`, `$7 trust_tier`, `$8 concurrency_group` (nullable),
-/// `$9 fair_key`, `$10 idem_token`. `RETURNING job_id` is present iff the row was inserted (absent on
+/// `$9 fair_key`, `$10 idem_token`, `$11 stage`. `RETURNING job_id` is present iff the row was inserted (absent on
 /// the idempotent conflict) — so the store reads INSERTED vs DUPLICATE from the returned-row count.
 pub const INSERT_JOB_QUEUE_QUERY: &str = "\
 INSERT INTO job_queue
-  (tenant_id, region, job_id, run_id, lane, labels, trust_tier, concurrency_group, fair_key, idem_token, state)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued')
+  (tenant_id, region, job_id, run_id, lane, labels, trust_tier, concurrency_group, fair_key, idem_token, stage, state)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'queued')
 ON CONFLICT (tenant_id, idem_token) DO NOTHING
 RETURNING job_id";
 
@@ -195,6 +198,36 @@ WHERE tenant_id = $1
   AND state = 'leased'
   AND lease_owner = $3
 RETURNING job_id";
+
+/// **The atomic prove-and-consume completion CAS (CT-004d.2 claim-bound completion).** Before any
+/// verdict is signalled, the terminal reporter consumes the CLAIM: it moves the row to `terminal` and
+/// records the deterministic `completion_receipt` ONLY IF the presented claim generation matches the
+/// row's — `lease_owner = $3 AND lease_epoch = $4` AND the row is still a live claim
+/// (`state IN ('leased','running')` and not already consumed). A stale worker (reaped + re-claimed →
+/// higher epoch, or a different owner) matches 0 rows and is refused; a forger with a valid token but
+/// no claim matches 0 rows. Bind: `$1 tenant_id`, `$2 job_id`, `$3 lease_owner`, `$4 lease_epoch`,
+/// `$5 claim_nonce`, `$6 completion_receipt`, `$7 stage`. `RETURNING job_id` iff THIS call consumed
+/// the claim. The receipt is idempotent evidence an exact redelivery reads.
+pub const CONSUME_CLAIM_QUERY: &str = "\
+UPDATE job_queue
+SET state = 'terminal', completion_receipt = $6, lease_owner = NULL, lease_expires = NULL
+WHERE tenant_id = $1
+  AND job_id = $2
+  AND lease_owner = $3
+  AND lease_epoch = $4
+  AND claim_nonce = $5::uuid
+  AND stage = $7
+  AND state IN ('leased','running')
+  AND completion_receipt IS NULL
+RETURNING job_id";
+
+/// **Read a job's terminal disposition for the completion CAS's 0-row branch.** When
+/// [`CONSUME_CLAIM_QUERY`] consumes nothing, this distinguishes an IDEMPOTENT redelivery (the row is
+/// already `terminal` with the SAME `completion_receipt`) from a fail-closed REFUSAL (missing row,
+/// stale claim generation, or a divergent receipt — e.g. a flipped-verdict replay). Bind:
+/// `$1 tenant_id`, `$2 job_id`.
+pub const READ_COMPLETION_DISPOSITION_QUERY: &str = "\
+SELECT state, completion_receipt FROM job_queue WHERE tenant_id = $1 AND job_id = $2";
 
 // =================================================================================================
 // 2. The deterministic in-memory model — the IDENTICAL claim/reaper semantics, DB-free, so the unit

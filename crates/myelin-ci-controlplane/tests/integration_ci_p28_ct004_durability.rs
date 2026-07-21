@@ -27,8 +27,9 @@
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
-    BUMP_CHECK_ATTEMPT_SQL, CLAIM_QUERY, CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_JOB_DDL,
-    CREATE_CI_COST_EVENT_DDL, CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL, CREATE_LOG_ANCHOR_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
+    BUMP_CHECK_ATTEMPT_SQL, CLAIM_QUERY, CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_COST_EVENT_DDL,
+    CREATE_CI_JOB_DDL, CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL, CREATE_LOG_ANCHOR_DDL,
     INSERT_COST_EVENT_QUERY, REAP_QUERY, SELECT_COST_EVENTS_FOR_RUN_QUERY, UPSERT_LOG_ANCHOR_QUERY,
 };
 use sqlx::types::Uuid;
@@ -109,7 +110,21 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
         .await
         .ok();
     let create = CREATE_JOB_QUEUE_DDL.replace("EXISTS job_queue (", &format!("EXISTS {tbl} ("));
-    sqlx::query(&create).execute(&p1).await.expect("apply job_queue DDL");
+    sqlx::query(&create)
+        .execute(&p1)
+        .await
+        .expect("apply job_queue DDL");
+    // The CT-004d.2 claim-generation + completion-receipt columns (`ci_0004a`), on the suffixed table.
+    let alter = ALTER_JOB_QUEUE_ADD_COMPLETION_DDL.replace("job_queue", &tbl);
+    sqlx::query(&alter)
+        .execute(&p1)
+        .await
+        .expect("apply job_queue completion columns");
+    let alter = ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL.replace("job_queue", &tbl);
+    sqlx::query(&alter)
+        .execute(&p1)
+        .await
+        .expect("apply job_queue claim-authority columns");
     sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS {fair} (tenant_id text NOT NULL, region text NOT NULL, \
          fair_key text NOT NULL, deficit bigint NOT NULL DEFAULT 0, \
@@ -139,7 +154,9 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
         .await
         .unwrap();
 
-    let claim_sql = CLAIM_QUERY.replace("job_queue", &tbl).replace("fair_deficit", &fair);
+    let claim_sql = CLAIM_QUERY
+        .replace("job_queue", &tbl)
+        .replace("fair_deficit", &fair);
     let bind_claim = |owner: &str| {
         claim_sql
             .replacen("$1", "'fr-par'", 1)
@@ -225,10 +242,14 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
     .execute(&p2)
     .await
     .unwrap();
-    let reaped = sqlx::query(&REAP_QUERY.replace("job_queue", &tbl).replacen("$1", "'fr-par'", 1))
-        .fetch_all(&p2)
-        .await
-        .expect("the reaper sweeps expired leases on the reopened store");
+    let reaped = sqlx::query(
+        &REAP_QUERY
+            .replace("job_queue", &tbl)
+            .replacen("$1", "'fr-par'", 1),
+    )
+    .fetch_all(&p2)
+    .await
+    .expect("the reaper sweeps expired leases on the reopened store");
     assert!(
         reaped
             .iter()
@@ -242,10 +263,20 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
     .fetch_one(&p2)
     .await
     .unwrap();
-    assert_eq!(after.get::<String, _>("state"), "queued", "reclaimed → queued");
+    assert_eq!(
+        after.get::<String, _>("state"),
+        "queued",
+        "reclaimed → queued"
+    );
 
-    sqlx::query(&format!("DROP TABLE {tbl}")).execute(&p2).await.ok();
-    sqlx::query(&format!("DROP TABLE {fair}")).execute(&p2).await.ok();
+    sqlx::query(&format!("DROP TABLE {tbl}"))
+        .execute(&p2)
+        .await
+        .ok();
+    sqlx::query(&format!("DROP TABLE {fair}"))
+        .execute(&p2)
+        .await
+        .ok();
     println!(
         "[CT-004] PASS scheduler: committed lease survives kill-9/reopen (leased,worker-kept); \
          uncommitted claim → 0 ghost (ghost stays queued); reaper reclaims expired lease after reopen → queued"
@@ -266,7 +297,10 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
 
     let p1 = reopen().await;
     for t in [&ce_tbl, &job_tbl, &run_tbl] {
-        sqlx::query(&format!("DROP TABLE IF EXISTS {t}")).execute(&p1).await.ok();
+        sqlx::query(&format!("DROP TABLE IF EXISTS {t}"))
+            .execute(&p1)
+            .await
+            .ok();
     }
     sqlx::query(&CREATE_CI_RUN_DDL.replace("EXISTS ci_run (", &format!("EXISTS {run_tbl} (")))
         .execute(&p1)
@@ -408,8 +442,16 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
         .fetch_all(&p2)
         .await
         .unwrap();
-    assert_eq!(costs.len(), 1, "exactly one metered unit (cost_events_per_unit == 1)");
-    assert_eq!(costs[0].get::<Uuid, _>("job_id"), uid("job-ok"), "attributed to its job");
+    assert_eq!(
+        costs.len(),
+        1,
+        "exactly one metered unit (cost_events_per_unit == 1)"
+    );
+    assert_eq!(
+        costs[0].get::<Uuid, _>("job_id"),
+        uid("job-ok"),
+        "attributed to its job"
+    );
     assert_eq!(costs[0].get::<i64, _>("wholesale_minor_units"), 100);
     assert_eq!(costs[0].get::<i64, _>("markup_minor_units"), 20);
     assert_ne!(
@@ -427,7 +469,10 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
     .await
     .unwrap()
     .get("n");
-    assert_eq!(ghost_run, 0, "the uncommitted run-state left no ghost run (all-or-nothing co-commit)");
+    assert_eq!(
+        ghost_run, 0,
+        "the uncommitted run-state left no ghost run (all-or-nothing co-commit)"
+    );
     let ghost_cost: i64 = sqlx::query(&format!(
         "SELECT count(*)::bigint AS n FROM {ce_tbl} WHERE run_id='{}'",
         uid("run-crash")
@@ -439,7 +484,10 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
     assert_eq!(ghost_cost, 0, "no half-billed cost for the crashed run");
 
     for t in [&ce_tbl, &job_tbl, &run_tbl] {
-        sqlx::query(&format!("DROP TABLE {t}")).execute(&p2).await.ok();
+        sqlx::query(&format!("DROP TABLE {t}"))
+            .execute(&p2)
+            .await
+            .ok();
     }
     println!(
         "[CT-004] PASS run/metering co-commit: run+job+cost commit in ONE tx survive kill-9 \
@@ -458,11 +506,16 @@ async fn check_attempt_is_monotonic_across_kill9() {
     let tbl = format!("check_attempt_ct004_{suffix}");
 
     let p1 = reopen().await;
-    sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}")).execute(&p1).await.ok();
-    sqlx::query(&CREATE_CHECK_ATTEMPT_DDL.replace("EXISTS check_attempt (", &format!("EXISTS {tbl} (")))
+    sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
         .execute(&p1)
         .await
-        .expect("apply check_attempt DDL");
+        .ok();
+    sqlx::query(
+        &CREATE_CHECK_ATTEMPT_DDL.replace("EXISTS check_attempt (", &format!("EXISTS {tbl} (")),
+    )
+    .execute(&p1)
+    .await
+    .expect("apply check_attempt DDL");
 
     let bump = BUMP_CHECK_ATTEMPT_SQL
         .replace("INTO check_attempt (", &format!("INTO {tbl} ("))
@@ -481,14 +534,22 @@ async fn check_attempt_is_monotonic_across_kill9() {
         3,
         "the reopened store continues the sequence → 3 (monotonic across the process boundary, never reset)"
     );
-    let stored: i32 = sqlx::query(&format!("SELECT next_attempt FROM {tbl} WHERE context='ci:build'"))
-        .fetch_one(&p2)
-        .await
-        .unwrap()
-        .get("next_attempt");
-    assert_eq!(stored, 4, "next_attempt persisted as 4 after three issued attempts");
+    let stored: i32 = sqlx::query(&format!(
+        "SELECT next_attempt FROM {tbl} WHERE context='ci:build'"
+    ))
+    .fetch_one(&p2)
+    .await
+    .unwrap()
+    .get("next_attempt");
+    assert_eq!(
+        stored, 4,
+        "next_attempt persisted as 4 after three issued attempts"
+    );
 
-    sqlx::query(&format!("DROP TABLE {tbl}")).execute(&p2).await.ok();
+    sqlx::query(&format!("DROP TABLE {tbl}"))
+        .execute(&p2)
+        .await
+        .ok();
     println!("[CT-004] PASS check_attempt: 1,2 then kill-9 → reopen → 3 (monotonic across processes, no reset)");
 }
 
@@ -502,7 +563,10 @@ async fn log_anchor_persists_across_kill9() {
     let tbl = format!("log_anchor_ct004_{suffix}");
 
     let p1 = reopen().await;
-    sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}")).execute(&p1).await.ok();
+    sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
+        .execute(&p1)
+        .await
+        .ok();
     sqlx::query(&CREATE_LOG_ANCHOR_DDL.replace("EXISTS log_anchor (", &format!("EXISTS {tbl} (")))
         .execute(&p1)
         .await
@@ -533,7 +597,11 @@ async fn log_anchor_persists_across_kill9() {
     .fetch_one(&p2)
     .await
     .unwrap();
-    assert_eq!(a.get::<String, _>("status"), "running", "the anchor survived kill-9/reopen");
+    assert_eq!(
+        a.get::<String, _>("status"),
+        "running",
+        "the anchor survived kill-9/reopen"
+    );
     assert_eq!(a.get::<i64, _>("byte_start"), 0);
 
     // The idempotent in-place transition (running → failed, byte_end set) applies on the reopened store.
@@ -556,9 +624,16 @@ async fn log_anchor_persists_across_kill9() {
     .fetch_one(&p2)
     .await
     .unwrap();
-    assert_eq!(a2.get::<String, _>("status"), "failed", "in-place status transition after reopen");
+    assert_eq!(
+        a2.get::<String, _>("status"),
+        "failed",
+        "in-place status transition after reopen"
+    );
     assert_eq!(a2.get::<i64, _>("byte_end"), 4096);
 
-    sqlx::query(&format!("DROP TABLE {tbl}")).execute(&p2).await.ok();
+    sqlx::query(&format!("DROP TABLE {tbl}"))
+        .execute(&p2)
+        .await
+        .ok();
     println!("[CT-004] PASS log_anchor: anchor (running) survives kill-9/reopen; idempotent in-place → failed after reopen");
 }

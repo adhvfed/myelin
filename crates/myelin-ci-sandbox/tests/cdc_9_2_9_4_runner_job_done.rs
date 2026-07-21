@@ -21,10 +21,10 @@
 //! and the engine's PK dedup makes the wake exactly-once. The runner REUSES this; it never forks it.
 
 use myelin_ci_sandbox::{
-    CountingFirehose, EgressPolicy, EngineTerminalReporter, IdemToken, ImageRef, JobKind,
-    JobLeaseStore, JobSpec, MeterTarget, QueuedJob, ReserveHandle, ResourceLimits, ResourceUsage,
-    RunnerAgent, RunnerHooks, SandboxBackend, SandboxHandle, SandboxLaunch, SandboxResult,
-    TerminalReport, TerminalReporter, TrustTier, WorkspaceSpec,
+    CompletionClaim, CountingFirehose, EgressPolicy, EngineTerminalReporter, IdemToken, ImageRef,
+    JobKind, JobLeaseStore, JobSpec, MeterTarget, QueuedJob, ReserveHandle, ResourceLimits,
+    ResourceUsage, RunnerAgent, RunnerHooks, SandboxBackend, SandboxHandle, SandboxLaunch,
+    SandboxResult, TerminalReport, TerminalReporter, TrustTier, WorkspaceSpec,
 };
 use myelin_events::MonotonicMinter;
 use myelin_flow::{
@@ -166,7 +166,18 @@ fn runner_echoes_idem_token_engine_wakes_exactly_once() {
     // the runner RE-delivers (at-least-once) — the engine's ON CONFLICT DO NOTHING makes it a no-op.
     // The re-delivery passes the derived report directly (the job row is already settled).
     let again = agent
-        .report_done_again(&run.0, &idem, &out.report)
+        .report_done_again(
+            &CompletionClaim {
+                tenant: tenant(),
+                run: run.clone(),
+                job_id: "job-1".into(),
+                idem_token: idem.clone(),
+                lease_owner: "worker-1".into(),
+                lease_epoch: out.lease_epoch,
+                claim_nonce: out.claim_nonce.clone(),
+            },
+            &out.report,
+        )
         .expect("re-delivery is the idempotency working");
     assert_eq!(
         again,
@@ -198,8 +209,15 @@ fn the_provider_keys_job_done_on_the_frozen_consumer_tuple() {
     let reporter = EngineTerminalReporter::new(ex.clone());
     let outcome = reporter
         .report_done(
-            &run,
-            &idem,
+            &CompletionClaim {
+                tenant: tenant(),
+                run: run.clone(),
+                job_id: "job-1".into(),
+                idem_token: idem.clone(),
+                lease_owner: "worker-1".into(),
+                lease_epoch: 1,
+                claim_nonce: "ignored-by-generic-reporter".into(),
+            },
             &TerminalReport {
                 passed: true,
                 result_refs: vec![],

@@ -61,8 +61,8 @@
 //!   minted token; it does not mint or attest.
 //! - **The firehose log pipeline** (the full `(job, step, byte-range)` index + the resume-cursor
 //!   protocol + the `ci.log.available` coalesced pointer) → **CI-P20**. Here [`FirehoseSink`] is a
-//!   STUB seam that counts frames; the terminal report carries the `ci.log.available` *pointer ref*
-//!   the full pipeline will publish.
+//!   STUB seam that counts frames; its durable implementation publishes the deeper
+//!   `ci.log.available` pointer.
 //! - **The reaper / dead-lease reclaim** (sweep expired leases → re-queue → fresh lease) → **CI-P12**.
 //!   Here the claim SKIPS live leases and claims expired ones (so an expired lease is reclaimable);
 //!   the active sweeper that re-queues a dead runner's job is CI-P12.
@@ -129,6 +129,14 @@ pub struct QueuedJob {
     /// SKIPS a row whose lease is LIVE (`lease_expires > now`) and may claim one whose lease has
     /// EXPIRED (`lease_expires <= now`) — the crash-recovery / reclaim seam the CI-P12 reaper drives.
     pub lease_expires: Option<i64>,
+    /// **The claim generation** — the monotone epoch the claim bumped (CT-004d.2 claim-bound
+    /// completion). Carried to `report_done` so the durable completion CAS refuses a stale claim: a
+    /// worker whose lease was reaped and re-claimed holds a LOWER epoch than the row and cannot win
+    /// first delivery. `0` for a fresh, unclaimed row.
+    pub lease_epoch: i64,
+    /// Opaque authority for this exact claim generation. Production mints an unguessable UUID in
+    /// the claim statement; the in-memory model uses a deterministic non-authoritative token.
+    pub claim_nonce: String,
 }
 
 impl QueuedJob {
@@ -151,6 +159,8 @@ impl QueuedJob {
             spec,
             lease_owner: None,
             lease_expires: None,
+            lease_epoch: 0,
+            claim_nonce: String::new(),
         }
     }
 }
@@ -247,6 +257,11 @@ impl JobLeaseStore {
             if lease_free {
                 job.lease_owner = Some(worker.to_string());
                 job.lease_expires = Some(now + lease_ttl_secs);
+                // Bump the claim generation (models the durable `lease_epoch = lease_epoch + 1`) so a
+                // reaped-then-re-claimed job carries a higher epoch and a stale worker's completion is
+                // refused by the CAS.
+                job.lease_epoch += 1;
+                job.claim_nonce = format!("memory:{worker}:{}", job.lease_epoch);
                 return Some(job.clone());
             }
             // else: a LIVE lease another runner holds — SKIP it (skip-locked; no double-run).
@@ -366,7 +381,14 @@ impl LeaseStore for JobLeaseStore {
         lease_ttl_secs: i64,
     ) -> Option<QueuedJob> {
         // Inherent `JobLeaseStore::claim_for_labels` (method-call → inherent, not this trait method).
-        self.claim_for_labels(worker, runner_labels, allowed_tiers, region, now, lease_ttl_secs)
+        self.claim_for_labels(
+            worker,
+            runner_labels,
+            allowed_tiers,
+            region,
+            now,
+            lease_ttl_secs,
+        )
     }
 
     fn heartbeat(
@@ -458,15 +480,28 @@ impl FirehoseSink for CountingFirehose {
 // =================================================================================================
 
 /// **A job's terminal outcome (the `job.done` payload, arch 03 §1.1 / §2).** References-not-payloads:
-/// `result_refs` are `ArtifactRef`s (the `ci.log.available` pointer + artifact refs), never log bytes
+/// `result_refs` are canonical scoped `ArtifactRef`s from result publishers, never log bytes
 /// or a PII body. `passed` is the pass/fail the parked workflow's DAG proceeds on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalReport {
     /// Whether the job passed (the DAG-walk decision the workflow resumes on).
     pub passed: bool,
-    /// The job's result refs (references-not-payloads, §3.4): the `ci.log.available` pointer the
-    /// CI-P20 pipeline publishes + any artifact refs. NEVER log bytes.
+    /// The job's canonical scoped result refs (references-not-payloads, §3.4). The CI-P20 firehose
+    /// owns its deeper log pointer; this field never contains log bytes.
     pub result_refs: Vec<ArtifactRef>,
+}
+
+/// Claimed authority for one terminal delivery. Keeping these fields together prevents callers from
+/// omitting or reordering an owner/epoch/nonce component at the reporting boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionClaim {
+    pub tenant: TenantId,
+    pub run: RunId,
+    pub job_id: String,
+    pub idem_token: String,
+    pub lease_owner: String,
+    pub lease_epoch: i64,
+    pub claim_nonce: String,
 }
 
 /// **The terminal-report sink — the runner ECHOES `job.done` through it (the ONE signal path).** A
@@ -475,14 +510,20 @@ pub struct TerminalReport {
 /// second signal mechanism. The runner delivers `signal_name = JOB_DONE_SIGNAL`, `idem_key =
 /// idem_token`; the engine's `INSERT … ON CONFLICT DO NOTHING` makes a double-delivery wake once.
 pub trait TerminalReporter {
-    /// Report `job.done` for `run`, ECHOING `idem_token` (the workflow-minted dispatch token) as the
-    /// `idem_key`. Returns whether THIS delivery was the FIRST ([`SignalOutcome::Buffered`]) or a
-    /// DUPLICATE ([`SignalOutcome::Duplicate`]) — both `Ok` (a redelivery is the idempotency working,
-    /// not an error). [`ExecutorError`] surfaces a delivery to a phantom run (never silently dropped).
+    /// Report `job.done`, carrying the CLAIMED job's durable identity — `tenant` + `job_id` (the leased
+    /// `job_queue` row's authority) alongside `run` + `idem_token` (the workflow-minted dispatch token
+    /// the `idem_key` echoes). A verifying reporter (the CI pipeline reporter) checks
+    /// `(tenant, run, job_id, idem_token)` against the durable dispatch record BEFORE it signals a
+    /// verdict, so a caller cannot forge a completion for a job it does not own; a generic reporter
+    /// ([`EngineTerminalReporter`]) delivers straight through. The runner passes the CLAIMED row's
+    /// `tenant`/`job_id` — never a value derived from the result refs. Returns whether THIS delivery was
+    /// the FIRST ([`SignalOutcome::Buffered`]), a DUPLICATE ([`SignalOutcome::Duplicate`]), or an
+    /// acknowledged late-completion to an already-terminal run ([`SignalOutcome::TerminalNoOp`]) — all
+    /// `Ok`, so the runner settles its lease on any of them. [`ExecutorError`] surfaces a delivery to a
+    /// phantom run or a refused forgery (never silently dropped).
     fn report_done(
         &self,
-        run: &RunId,
-        idem_token: &str,
+        claim: &CompletionClaim,
         report: &TerminalReport,
     ) -> Result<SignalOutcome, ExecutorError>;
 }
@@ -507,10 +548,13 @@ impl<E: DurableExecutor> EngineTerminalReporter<E> {
 impl<E: DurableExecutor> TerminalReporter for EngineTerminalReporter<E> {
     fn report_done(
         &self,
-        run: &RunId,
-        idem_token: &str,
+        claim: &CompletionClaim,
         report: &TerminalReport,
     ) -> Result<SignalOutcome, ExecutorError> {
+        // The generic reporter is already bound to one tenant's executor and performs no
+        // claimed-job verification or claim consumption (that is the CI pipeline reporter's job);
+        // `tenant`/`job_id`/`lease_owner`/`lease_epoch` are the claim authority a VERIFYING reporter
+        // consumes, ignored here.
         // The ONE signal path: deliver `job.done` keyed (run, JOB_DONE_SIGNAL, idem_token) — the
         // engine's INSERT … ON CONFLICT (tenant, run_id, signal_name, idem_key) DO NOTHING IS the
         // exactly-once wake. The runner can deliver this TWICE (at-least-once); the engine buffers
@@ -524,9 +568,9 @@ impl<E: DurableExecutor> TerminalReporter for EngineTerminalReporter<E> {
         )));
         payload.extend(report.result_refs.iter().cloned());
         self.executor.signal(SignalSpec {
-            run: run.clone(),
+            run: claim.run.clone(),
             signal_name: JOB_DONE_SIGNAL.to_string(),
-            idem_key: idem_token.to_string(),
+            idem_key: claim.idem_token.clone(),
             payload,
             payload_key_ref: None,
         })
@@ -551,6 +595,12 @@ pub struct RunOutcome {
     /// Whether the terminal report's `job.done` delivery was the FIRST wake (`Buffered`) or a
     /// DUPLICATE (`Duplicate`) — a re-report wakes the workflow ONCE (the engine dedup).
     pub signal_outcome: SignalOutcome,
+    /// The claim generation (`lease_epoch`) this cycle completed under — carried so an at-least-once
+    /// re-delivery ([`RunnerAgent::report_done_again`]) presents the SAME claim the CAS already
+    /// consumed (its receipt is idempotent evidence), never a fresh/forged generation.
+    pub lease_epoch: i64,
+    /// Opaque claim nonce echoed on an exact terminal-report retry.
+    pub claim_nonce: String,
 }
 
 /// An error a runner cycle can surface — loud, never swallowed (EI-02 §4). A backend launch failure
@@ -598,8 +648,13 @@ impl std::error::Error for RunnerError {}
 ///
 /// **Same binary hosted + self-hosted.** The self-hosted attestation gate + the tenant-scoped token
 /// mint is CI-P4 (→ P-240); here the runner CONSUMES the minted token off `JobSpec.run_token` (4.7).
-pub struct RunnerAgent<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore = JobLeaseStore>
-{
+pub struct RunnerAgent<
+    'a,
+    B: SandboxBackend,
+    F: FirehoseSink,
+    T: TerminalReporter,
+    L: LeaseStore = JobLeaseStore,
+> {
     /// the runner's worker id (the lease owner + the heartbeat principal).
     worker_id: String,
     /// the runner's labels — a job is claimable iff its labels ⊆ these (affinity).
@@ -681,9 +736,9 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
     ///    teardown (one-job-per-sandbox, ephemeral). A launch failure is `Err(LaunchFailed)`
     ///    fail-closed (no terminal report — the dispatch activity retries the job, §OQ-F).
     /// 4. **DERIVE + report terminal.** The runner DERIVES the [`TerminalReport`] from the result
-    ///    (`passed = result.exit_code == Some(0) && !result.timed_out`; `result_refs` carry the
-    ///    `ci.log.available` pointer the firehose pipeline publishes — references-not-payloads, NEVER
-    ///    the captured bytes) and delivers `job.done` ECHOING the spec's `idem_token` through the
+    ///    (`passed = result.exit_code == Some(0) && !result.timed_out`; result refs are canonical
+    ///    references-not-payloads, NEVER the captured bytes) and delivers `job.done` ECHOING the spec's
+    ///    `idem_token` through the
     ///    engine signal path (the exactly-once wake), then **settles** the lease. The [`RunOutcome`]
     ///    carries the derived report + the delivery's idempotency outcome.
     ///
@@ -767,24 +822,33 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
             .map_err(|e| RunnerError::LaunchFailed(e.to_string()))?;
 
         // ── Step 4: DERIVE the terminal report from the command result, then REPORT TERMINAL.
-        // `passed` is derived (NOT an input): a clean exit that did not time out. The result_refs
-        // carry the `ci.log.available` pointer (references-not-payloads) the firehose pipeline
-        // publishes for the captured streams — never the bytes themselves.
+        // `passed` is derived (NOT an input): a clean exit that did not time out. The firehose owns
+        // the durable deep log pointer; it is not a canonical scoped ArtifactRef and therefore is not
+        // smuggled through the typed verdict. Concrete artifact publishers can add scoped refs later.
         let report = TerminalReport {
             passed,
-            result_refs: vec![ArtifactRef(format!(
-                "myelin://{}/ci/run/{}/job/{}/log.available",
-                job.tenant.0, job.run_id, job.job_id
-            ))],
+            result_refs: vec![],
         };
 
         // `job.done` ECHOING the spec's idem_token through the ENGINE signal path (the exactly-once
         // wake). The runner can deliver this twice (at-least-once); the engine buffers once; the
         // workflow wakes once. NO second signal path.
         let run = RunId(job.run_id.clone());
+        // The runner carries the CLAIMED row's generation (this worker as lease owner + the epoch the
+        // claim bumped) so the reporter's completion CAS proves ownership — a stale reaped worker holds
+        // a lower epoch and is refused. Never derived from the result refs.
+        let claim = CompletionClaim {
+            tenant: job.tenant.clone(),
+            run,
+            job_id: job.job_id.clone(),
+            idem_token: job.spec.idem_token.0.clone(),
+            lease_owner: self.worker_id.clone(),
+            lease_epoch: job.lease_epoch,
+            claim_nonce: job.claim_nonce.clone(),
+        };
         let outcome = self
             .reporter
-            .report_done(&run, &job.spec.idem_token.0, &report)
+            .report_done(&claim, &report)
             .map_err(RunnerError::ReportFailed)?;
 
         // Settle the lease (remove the claimed row). The engine signal idempotency — not this delete
@@ -796,23 +860,24 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
             run_id: job.run_id,
             report,
             signal_outcome: outcome,
+            lease_epoch: job.lease_epoch,
+            claim_nonce: job.claim_nonce,
         })
     }
 
     /// **Report the SAME terminal `job.done` AGAIN (the at-least-once re-delivery, §OQ-F).** A runner
     /// can deliver "done" twice (a retry after an ack it never saw). This re-echoes the SAME
     /// `idem_token`; the engine's ON CONFLICT DO NOTHING makes it a [`SignalOutcome::Duplicate`] — the
-    /// workflow wakes ONCE. Used to PROVE double-effect = 0 (the gate). Takes the run + idem_token +
-    /// report directly (the job row is already settled after `run_one`).
+    /// workflow wakes ONCE. Used to PROVE double-effect = 0 (the gate). Presents the SAME claim
+    /// generation (`lease_owner`/`lease_epoch`) `run_one` completed under — a verifying reporter reads
+    /// its recorded completion receipt (idempotent evidence) rather than re-consuming the claim.
     pub fn report_done_again(
         &self,
-        run_id: &str,
-        idem_token: &str,
+        claim: &CompletionClaim,
         report: &TerminalReport,
     ) -> Result<SignalOutcome, RunnerError> {
-        let run = RunId(run_id.to_string());
         self.reporter
-            .report_done(&run, idem_token, report)
+            .report_done(claim, report)
             .map_err(RunnerError::ReportFailed)
     }
 }
@@ -1127,14 +1192,7 @@ mod tests {
             outcome.report.passed,
             "a clean exit (0, not timed out) derives passed=true"
         );
-        // result_refs carry the derived `ci.log.available` pointer (references-not-payloads).
-        assert_eq!(
-            outcome.report.result_refs,
-            vec![ArtifactRef(format!(
-                "myelin://acme/ci/run/{}/job/job-1/log.available",
-                run.0
-            ))]
-        );
+        assert!(outcome.report.result_refs.is_empty());
         assert_eq!(
             outcome.signal_outcome,
             SignalOutcome::Buffered,
@@ -1197,7 +1255,18 @@ mod tests {
         // the runner RE-delivers the SAME job.done (at-least-once) — keyed on the SAME idem_token,
         // passing the derived report directly (the job row is already settled after run_one).
         let again = agent
-            .report_done_again(&run.0, &idem, &first.report)
+            .report_done_again(
+                &CompletionClaim {
+                    tenant: tenant(),
+                    run: run.clone(),
+                    job_id: "job-1".into(),
+                    idem_token: idem.clone(),
+                    lease_owner: "worker-1".into(),
+                    lease_epoch: first.lease_epoch,
+                    claim_nonce: first.claim_nonce.clone(),
+                },
+                &first.report,
+            )
             .expect("re-delivery is the idempotency working, not an error");
         assert_eq!(
             again,
@@ -1387,19 +1456,13 @@ mod tests {
             .signals()
             .get(&tenant(), &run.0, JOB_DONE_SIGNAL, &idem)
             .expect("the job.done buffered under the echoed idem_token");
-        // references-not-payloads: the DERIVED passed marker + the `ci.log.available` ref, never the
-        // captured stderr bytes (those went to the firehose).
+        // The DERIVED passed marker is present; captured stderr and the firehose-owned deep log pointer
+        // never enter the typed signal payload.
         assert_eq!(
             row.payload[0],
             ArtifactRef("myelin://job-done/passed-false".into())
         );
-        assert_eq!(
-            row.payload[1],
-            ArtifactRef(format!(
-                "myelin://acme/ci/run/{}/job/job-1/log.available",
-                run.0
-            ))
-        );
+        assert_eq!(row.payload.len(), 1);
         assert_eq!(row.payload_key_ref, None, "no inline PII payload");
         // the raw stderr bytes never appear in the signal payload (references-not-payloads).
         for r in &row.payload {

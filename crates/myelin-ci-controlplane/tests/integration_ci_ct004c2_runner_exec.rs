@@ -32,24 +32,26 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use myelin_ci_controlplane::{
-    ci_job_queue_store, ci_region_queue_store_test_support, DurableEnqueue, DurableLeaseAdapter, DurableLogPersist, EnqueueOutcome,
-    JobSpecResolver, Lane, LeasedJob, LogPipelineSink, CREATE_FAIR_DEFICIT_DDL,
-    CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL,
+    ci_job_queue_store, ci_region_queue_store_test_support, DurableEnqueue, DurableLeaseAdapter,
+    DurableLogPersist, EnqueueOutcome, JobSpecResolver, Lane, LeasedJob, LogPipelineSink,
+    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
+    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
+    CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL,
 };
-use myelin_config::MyelinConfig;
-use myelin_events::OUTBOX_MIGRATION;
-use myelin_storage::s3blob::S3BlobStore;
-use myelin_storage::{BlobStore, ContentHash};
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, EgressPolicy, FirehoseSink, IdemToken, ImageRef, JobKind, JobSpec,
     LeaseStore, MeterTarget, ReserveHandle, ResourceLimits, RunTokenRef, RunnerAgent, RunnerError,
     RunnerHooks, TrustTier, WorkspaceSpec,
 };
+use myelin_config::MyelinConfig;
+use myelin_events::OUTBOX_MIGRATION;
 use myelin_events::{IdMinter, Ulid};
 use myelin_flow::{
     job_idem_token, DurableExecutor, FlowExecutor, SignalOutcome, StartSpec, JOB_DONE_SIGNAL,
 };
+use myelin_storage::s3blob::S3BlobStore;
+use myelin_storage::{BlobStore, ContentHash};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::types::Uuid;
 use sqlx::{Executor, PgPool};
@@ -99,6 +101,14 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(CREATE_JOB_QUEUE_DDL)
         .await
         .expect("create job_queue");
+    admin
+        .execute(ALTER_JOB_QUEUE_ADD_COMPLETION_DDL)
+        .await
+        .expect("add job_queue lease_epoch + completion_receipt");
+    admin
+        .execute(ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL)
+        .await
+        .expect("add job_queue claim nonce + stage authority");
     for (_name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
         let idx = idx.replace("CONCURRENTLY ", "");
         admin.execute(idx.as_str()).await.expect("index");
@@ -178,6 +188,7 @@ fn enq(
         concurrency_group: None,
         fair_key: tenant.into(),
         idem_token: idem.into(),
+        stage: "build".into(),
     }
 }
 
@@ -295,7 +306,15 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
     let idem = job_idem_token(&run_uuid, "ci.pipeline:0");
 
     // ── enqueue a real compute job into the DURABLE queue (trusted, linux). ──
-    let job = enq(tenant, region, "e2e-job", "e2e-run", TrustTier::Trusted, &["linux"], &idem);
+    let job = enq(
+        tenant,
+        region,
+        "e2e-job",
+        "e2e-run",
+        TrustTier::Trusted,
+        &["linux"],
+        &idem,
+    );
     assert_eq!(
         store.enqueue(&job).await.expect("enqueue"),
         EnqueueOutcome::Inserted
@@ -316,13 +335,20 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
             idem_key: "ci:e2e-run".into(),
         })
         .expect("start the run");
-    assert_eq!(started.0, run_uuid, "the started run id == the durable run_id");
+    assert_eq!(
+        started.0, run_uuid,
+        "the started run id == the durable run_id"
+    );
 
     // ── the durable-store lease adapter (the security pass-through) + a REAL resolver → compute spec. ──
     let idem_for_resolver = idem.clone();
     let resolve: JobSpecResolver = Arc::new(move |_l: &LeasedJob| {
         Ok(compute_spec(
-            vec!["sh".into(), "-c".into(), "echo hello-ct004c2; exit 0".into()],
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "echo hello-ct004c2; exit 0".into(),
+            ],
             &idem_for_resolver,
         ))
     });
@@ -362,7 +388,10 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
     println!("=== CT-004c.2 REAL end-to-end (durable claim → runsc → job.done) ===");
     let captured = firehose.captured();
     let guest = String::from_utf8_lossy(&captured);
-    println!("job_id={} run_id={} passed={}", outcome.job_id, outcome.run_id, outcome.report.passed);
+    println!(
+        "job_id={} run_id={} passed={}",
+        outcome.job_id, outcome.run_id, outcome.report.passed
+    );
     println!("REAL guest stdout (via firehose) = {guest:?}");
     println!("job.done delivery = {:?}", outcome.signal_outcome);
 
@@ -382,7 +411,9 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
         "the FIRST job.done delivery wakes the parked workflow"
     );
     assert_eq!(
-        executor.signals().count_for_run(&TenantId(tenant.into()), &run_uuid),
+        executor
+            .signals()
+            .count_for_run(&TenantId(tenant.into()), &run_uuid),
         1,
         "the engine buffered EXACTLY ONE job.done"
     );
@@ -411,7 +442,10 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
         .fetch_one(&admin)
         .await
         .expect("read job state");
-    assert_eq!(state, "terminal", "the lease is completed on terminal (settle)");
+    assert_eq!(
+        state, "terminal",
+        "the lease is completed on terminal (settle)"
+    );
 
     drop_schema(&admin, &schema).await;
     println!(
@@ -446,8 +480,19 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
 
     let run_uuid = uid("capstone-run").to_string();
     let idem = job_idem_token(&run_uuid, "ci.pipeline:0");
-    let job = enq(tenant, region, "capstone-job", "capstone-run", TrustTier::Trusted, &["linux"], &idem);
-    assert_eq!(store.enqueue(&job).await.expect("enqueue"), EnqueueOutcome::Inserted);
+    let job = enq(
+        tenant,
+        region,
+        "capstone-job",
+        "capstone-run",
+        TrustTier::Trusted,
+        &["linux"],
+        &idem,
+    );
+    assert_eq!(
+        store.enqueue(&job).await.expect("enqueue"),
+        EnqueueOutcome::Inserted
+    );
 
     let executor = FlowExecutor::new(
         Arc::new(FixedMinter(run_uuid.clone())),
@@ -471,7 +516,13 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
             &idem_for_resolver,
         ))
     });
-    let adapter = DurableLeaseAdapter::new(region_store, store.clone(), region, tokio::runtime::Handle::current(), resolve);
+    let adapter = DurableLeaseAdapter::new(
+        region_store,
+        store.clone(),
+        region,
+        tokio::runtime::Handle::current(),
+        resolve,
+    );
     let backend = GvisorBackend::new();
 
     // THE PRODUCTION FIREHOSE — the exact sink `CiRunnerLoop` now wires (sub-step 5): the per-job
@@ -501,7 +552,9 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let outcome = agent.run_one(now).expect("claim + REAL runsc + seal logs + job.done");
+    let outcome = agent
+        .run_one(now)
+        .expect("claim + REAL runsc + seal logs + job.done");
     assert!(outcome.report.passed, "the runsc guest exited 0");
 
     // ── the index landed: a sealed segment (with a CAS blob_ref) + the step anchor closed `passed`. ──
@@ -514,16 +567,21 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
             .fetch_all(&admin)
             .await
             .expect("read log_segment rows");
-    assert!(!seg_rows.is_empty(), "the guest's output sealed to at least one log_segment");
-    let anchor_status: String = sqlx::query_scalar(
-        "SELECT status FROM log_anchor WHERE run_id = $1 AND job_id = $2",
-    )
-    .bind(run_id)
-    .bind(job_id)
-    .fetch_one(&admin)
-    .await
-    .expect("the step anchor landed");
-    assert_eq!(anchor_status, "passed", "the anchor closed with the job verdict");
+    assert!(
+        !seg_rows.is_empty(),
+        "the guest's output sealed to at least one log_segment"
+    );
+    let anchor_status: String =
+        sqlx::query_scalar("SELECT status FROM log_anchor WHERE run_id = $1 AND job_id = $2")
+            .bind(run_id)
+            .bind(job_id)
+            .fetch_one(&admin)
+            .await
+            .expect("the step anchor landed");
+    assert_eq!(
+        anchor_status, "passed",
+        "the anchor closed with the job verdict"
+    );
 
     // ── the ci.log.available pointer co-committed to the outbox. ──
     let aggregate = format!("ci/run/{run_uuid}/job/{}", job_id);
@@ -534,7 +592,10 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
     .fetch_one(&admin)
     .await
     .expect("count ci.log.available");
-    assert!(pointer_count >= 1, "a ci.log.available pointer rode the outbox");
+    assert!(
+        pointer_count >= 1,
+        "a ci.log.available pointer rode the outbox"
+    );
 
     // ── THE PAYOFF: the guest's stdout is READABLE BACK from the real S3 CAS via the index. ──
     let cas = S3BlobStore::connect(&cfg.s3, handle);
@@ -572,16 +633,33 @@ async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
     let region_store = ci_region_queue_store_test_support(admin.clone());
 
     // ONLY an untrusted_fork job is queued (linux, in-region).
-    let fork = enq(tenant, region, "fork-job", "fork-run", TrustTier::UntrustedFork, &["linux"], "idem-fork");
+    let fork = enq(
+        tenant,
+        region,
+        "fork-job",
+        "fork-run",
+        TrustTier::UntrustedFork,
+        &["linux"],
+        "idem-fork",
+    );
     store.enqueue(&fork).await.expect("enqueue fork");
 
     // A trusted-only adapter claim (the exact seam run_one drives) must return None — the fork job is
     // NEVER claimable by a trusted-only runner (the durable predicate, forwarded UNCHANGED).
     let resolve: JobSpecResolver = Arc::new(|l: &LeasedJob| {
         // If we ever reach here the tier filter was breached — force a loud failure.
-        panic!("SECURITY BREACH: the resolver was called for a leased fork job {}!", l.job_id)
+        panic!(
+            "SECURITY BREACH: the resolver was called for a leased fork job {}!",
+            l.job_id
+        )
     });
-    let adapter = DurableLeaseAdapter::new(region_store.clone(), store.clone(), region, tokio::runtime::Handle::current(), resolve);
+    let adapter = DurableLeaseAdapter::new(
+        region_store.clone(),
+        store.clone(),
+        region,
+        tokio::runtime::Handle::current(),
+        resolve,
+    );
     let claimed = adapter.claim_for_labels(
         "trusted-worker",
         &["linux".to_string()],
@@ -600,12 +678,21 @@ async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
         .fetch_one(&admin)
         .await
         .unwrap();
-    assert_eq!(state, "queued", "the untrusted_fork job stays queued (unclaimed by the trusted-only runner)");
+    assert_eq!(
+        state, "queued",
+        "the untrusted_fork job stays queued (unclaimed by the trusted-only runner)"
+    );
 
     // Control: a fork-admitting adapter DOES claim it (the gate is exact, not a blanket deny).
     let resolve_ok: JobSpecResolver =
         Arc::new(|_l: &LeasedJob| Ok(compute_spec(vec!["true".into()], "idem-fork")));
-    let fork_adapter = DurableLeaseAdapter::new(region_store, store.clone(), region, tokio::runtime::Handle::current(), resolve_ok);
+    let fork_adapter = DurableLeaseAdapter::new(
+        region_store,
+        store.clone(),
+        region,
+        tokio::runtime::Handle::current(),
+        resolve_ok,
+    );
     let ok = fork_adapter.claim_for_labels(
         "fork-worker",
         &["linux".to_string()],
@@ -614,11 +701,16 @@ async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
         1000,
         30,
     );
-    assert!(ok.is_some(), "a fork-admitting runner DOES claim the fork job (exact tier gate)");
+    assert!(
+        ok.is_some(),
+        "a fork-admitting runner DOES claim the fork job (exact tier gate)"
+    );
     assert_eq!(ok.unwrap().job_id, uid("fork-job").to_string());
 
     drop_schema(&admin, &schema).await;
-    println!("[CT-004c.2] PASS SECURITY(a): the trust-tier claim predicate survives the durable adapter");
+    println!(
+        "[CT-004c.2] PASS SECURITY(a): the trust-tier claim predicate survives the durable adapter"
+    );
 }
 
 // ═════════════════════════════ 3. SECURITY (b): region isolation ═════════════════════════════════
@@ -633,13 +725,30 @@ async fn region_a_runner_never_claims_region_b_job() {
     let region_store = ci_region_queue_store_test_support(admin.clone());
 
     // A trusted linux job in region B only.
-    let jb = enq(tenant, "de-fra", "rb-job", "rb-run", TrustTier::Trusted, &["linux"], "idem-rb");
+    let jb = enq(
+        tenant,
+        "de-fra",
+        "rb-job",
+        "rb-run",
+        TrustTier::Trusted,
+        &["linux"],
+        "idem-rb",
+    );
     store.enqueue(&jb).await.expect("enqueue region-B job");
 
     let resolve: JobSpecResolver = Arc::new(|l: &LeasedJob| {
-        panic!("SECURITY BREACH: a region-A runner leased a region-B job {}!", l.job_id)
+        panic!(
+            "SECURITY BREACH: a region-A runner leased a region-B job {}!",
+            l.job_id
+        )
     });
-    let adapter = DurableLeaseAdapter::new(region_store, store.clone(), "fr-par", tokio::runtime::Handle::current(), resolve);
+    let adapter = DurableLeaseAdapter::new(
+        region_store,
+        store.clone(),
+        "fr-par",
+        tokio::runtime::Handle::current(),
+        resolve,
+    );
     let claimed = adapter.claim_for_labels(
         "fr-par-worker",
         &["linux".to_string()],
@@ -675,17 +784,37 @@ async fn stolen_lease_fails_heartbeat_no_double_run() {
     let store = ci_job_queue_store(admin.clone());
     let region_store = ci_region_queue_store_test_support(admin.clone());
 
-    let job = enq(tenant, region, "steal-job", "steal-run", TrustTier::Trusted, &["linux"], "idem-steal");
+    let job = enq(
+        tenant,
+        region,
+        "steal-job",
+        "steal-run",
+        TrustTier::Trusted,
+        &["linux"],
+        "idem-steal",
+    );
     store.enqueue(&job).await.expect("enqueue");
 
     let resolve: JobSpecResolver =
         Arc::new(|_l: &LeasedJob| Ok(compute_spec(vec!["true".into()], "idem-steal")));
-    let adapter_a =
-        DurableLeaseAdapter::new(region_store.clone(), store.clone(), region, tokio::runtime::Handle::current(), resolve);
+    let adapter_a = DurableLeaseAdapter::new(
+        region_store.clone(),
+        store.clone(),
+        region,
+        tokio::runtime::Handle::current(),
+        resolve,
+    );
 
     // worker-A claims the job (through the adapter — the exact run_one Step-1 path).
     let claimed = adapter_a
-        .claim_for_labels("worker-A", &["linux".into()], &[TrustTier::Trusted], &Region(region.into()), 1000, 30)
+        .claim_for_labels(
+            "worker-A",
+            &["linux".into()],
+            &[TrustTier::Trusted],
+            &Region(region.into()),
+            1000,
+            30,
+        )
         .expect("worker-A claims the job");
     assert_eq!(claimed.job_id, uid("steal-job").to_string());
 
@@ -700,9 +829,18 @@ async fn stolen_lease_fails_heartbeat_no_double_run() {
         )
         .await
         .unwrap();
-    assert!(region_store.reap(region).await.expect("reap") >= 1, "the dead lease is re-queued");
+    assert!(
+        region_store.reap(region).await.expect("reap") >= 1,
+        "the dead lease is re-queued"
+    );
     let stolen = region_store
-        .claim(region, &["linux".to_string()], &[TrustTier::Trusted], "worker-B", 30)
+        .claim(
+            region,
+            &["linux".to_string()],
+            &[TrustTier::Trusted],
+            "worker-B",
+            30,
+        )
         .await
         .expect("claim")
         .expect("worker-B steals the re-queued lease");
@@ -732,7 +870,9 @@ async fn stolen_lease_fails_heartbeat_no_double_run() {
     assert!(b_held, "the true owner (worker-B) heartbeats its own lease");
 
     drop_schema(&admin, &schema).await;
-    println!("[CT-004c.2] PASS SECURITY(c): a stolen lease fails the heartbeat guard — no double-run");
+    println!(
+        "[CT-004c.2] PASS SECURITY(c): a stolen lease fails the heartbeat guard — no double-run"
+    );
 }
 
 // A tiny compile/behaviour anchor so the RunnerError variants the loop matches stay in view.

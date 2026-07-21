@@ -81,6 +81,14 @@ impl CiRegionQueueStore {
     pub async fn reap(&self, region: &str) -> Result<u64, JobQueueStoreError> {
         reap_region_scoped(&self.pool, region).await
     }
+
+    /// Refuse runner activation while an old non-terminal row lacks completion stage authority.
+    pub async fn count_non_terminal_null_stage_jobs(
+        &self,
+        region: &str,
+    ) -> Result<i64, JobQueueStoreError> {
+        count_non_terminal_null_stage_jobs_region_scoped(&self.pool, region).await
+    }
 }
 
 /// **The pull-lease claim raw execution (arch 02 §2.1; [`CLAIM_QUERY`]) — region-scoped, cross-tenant.**
@@ -144,6 +152,31 @@ pub(crate) async fn reap_region_scoped(
     Ok(rows.len() as u64)
 }
 
+/// **The runner-lane pre-activation guard (CT-004d.2 — the ROLLING-UPGRADE FLOOR), region-scoped +
+/// cross-tenant.** Counts, across every tenant in `region`, `job_queue` rows that are still non-terminal
+/// but whose queue-authority `stage` is NULL (a pre-rewire historical dispatch a rolling upgrade left).
+/// The runner-lane activation path refuses to start while this is non-zero — a CHECKED invariant that
+/// the reporter is never asked to complete an unattributable live job. A healthy deploy
+/// (CI has never been production-activated) returns 0. Runs under [`with_region_tx`] (the cross-tenant
+/// service read the region scheduler already uses), NOT a per-tenant scope — so it lives in this NAMED
+/// `tenant-predicate`-excluded module, never a per-tenant store.
+pub(crate) async fn count_non_terminal_null_stage_jobs_region_scoped(
+    pool: &PgPool,
+    region: &str,
+) -> Result<i64, JobQueueStoreError> {
+    let region_owned = region.to_string();
+    with_region_tx(pool, region, move |conn| {
+        Box::pin(async move {
+            sqlx::query_scalar::<_, i64>(crate::job_spec_store::NON_TERMINAL_NULL_STAGE_JOBS_QUERY)
+                .bind(&region_owned) // $1 region (RESIDENCY, not a tenant predicate — cross-tenant read)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| PgError::Query(e.to_string()))
+        })
+    })
+    .await
+}
+
 /// **The REGION-scoped transaction seam (the cross-tenant claim/reap path).** Acquire → BEGIN → set
 /// the `region` GUC transaction-scoped (residency pin, in-band) + clear the tenant GUC → run `op` →
 /// COMMIT (the GUC discarded on commit — no bleed). Mirrors `myelin_storage::with_tenant_tx`'s
@@ -187,6 +220,8 @@ fn leased_from_row(r: &sqlx::postgres::PgRow) -> Result<LeasedJob, JobQueueStore
     let concurrency_group: Option<String> = r.get("concurrency_group");
     let fair_key: String = r.get("fair_key");
     let trust_token_str: String = r.get("trust_tier");
+    let lease_epoch: i64 = r.get("lease_epoch");
+    let claim_nonce: String = r.get("claim_nonce");
     let lane = Lane::from_token(&lane_token).ok_or_else(|| {
         JobQueueStoreError::CorruptRow(format!("unknown lane token `{lane_token}`"))
     })?;
@@ -199,5 +234,7 @@ fn leased_from_row(r: &sqlx::postgres::PgRow) -> Result<LeasedJob, JobQueueStore
         concurrency_group,
         fair_key,
         trust_tier,
+        lease_epoch,
+        claim_nonce,
     })
 }
