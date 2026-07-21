@@ -1,4 +1,4 @@
-//! # `ci_pipeline_driver` — CT-004d.2 CULMINATION (chunks 2 + 3 + 5): a pushed CI trigger runs a REAL pipeline end-to-end
+//! # Durable CI dispatch and claim-bound completion
 //!
 //! **Owning architecture doc (byte-authoritative):**
 //! `planning/04-subsystem-architectures/continuous-integration/architecture/02-internals-and-algorithms.md`
@@ -6,14 +6,9 @@
 //! `SCHEDULE_AND_RUN_JOB` dispatch handshake → the durable `job_queue` row), §2.1 (the pull-lease claim
 //! the CT-004c.2 runner drives) + arch 01 §3.1 (`ci_run` is the thin index over the myelin-flow run).
 //!
-//! ## What this closes — the LAST wire: a `job.done` from a real `runsc` guest WAKES a parked pipeline
-//! CT-004b armed a durable `ci_run` (queued) + pre-minted `wf_run_id`; CT-004c.1/c.2 made the runner
-//! CLAIM a durable `job_queue` row + EXECUTE it in gVisor + report `job.done`; CT-004d.1 made the
-//! dispatch co-persist `job_queue` + `ci_job_spec`; CT-004d.2 chunk 4 co-committed the durable `ci_run`.
-//! **NOTHING started the parked `ci.pipeline` run, dispatched its stages through the DURABLE queue, or
-//! drove the engine `tick` that consumes the runner's `job.done`.** This module is those three coupled
-//! chunks, in ONE process (the SAME process as [`crate::CiRunnerLoop`], so the runner's
-//! `job.done` signal lands on the executor that owns the parked run):
+//! CT-004b armed a durable `ci_run` and pre-minted `wf_run_id`; CT-004c made the runner claim a
+//! durable `job_queue` row and execute it in gVisor; CT-004d.1 co-persisted `job_queue` and
+//! `ci_job_spec`. This module owns the remaining production-safe components at that boundary:
 //!
 //! - **Chunk 5 — [`DurableJobRunner`]:** the [`myelin_flow::JobRunner`] the pipeline body dispatches
 //!   each stage through. Instead of [`crate::SchedulerJobRunner`]'s in-memory `SchedulerState`, it
@@ -24,13 +19,9 @@
 //!   `ci_run.region` at trigger time), forwarded UNCHANGED, and the SAME tier is stamped onto the
 //!   sandbox spec — so `co_persist_dispatch`'s `enq.trust_tier == spec.trust_tier` gate holds by
 //!   construction and an `untrusted_fork` stage can NEVER be enqueued behind a widened `trusted` gate.
-//! - **Chunk 2 — [`CiPipelineDriver`]:** constructs a [`FlowExecutor`] + drives a [`FlowDispatcher`]
-//!   over a SHARED `RunStore`/`SignalStore`, registers `run_ci_pipeline_body` under [`CI_PIPELINE_WF_TYPE`]
-//!   (with the chunk-5 durable runner injected per run), and `tick`s a background driver. The runner
-//!   loop's terminal reporter signals THIS executor, so `job.done` wakes the parked run.
-//! - **Chunk 3 — [`CiPipelineDriver::start_run`]:** reads a durable `ci_run` (queued) row and calls
-//!   [`DurableExecutor::start_with_id`] with the pre-minted `wf_run_id` as `Some(RunId(wf_run_id))` — so
-//!   the parked run's id EQUALS the `job_queue` row's `run_id` the runner reports `job.done` to.
+//! - **Claim-bound completion — [`CiPipelineReporter`]:** verifies and consumes the exact live queue
+//!   claim and inserts the typed `job.done` signal in one PostgreSQL transaction. A production
+//!   [`myelin_flow::PgFlowWorker`] wakes from and consumes that durable signal directly.
 //!
 //! ## The verdict-vocabulary bridge (why a bespoke reporter, not `EngineTerminalReporter`)
 //! The real sandbox runner ([`myelin_ci_sandbox::RunnerAgent::run_one`]) DERIVES `passed` from the guest
@@ -45,43 +36,62 @@
 //! claim and buffers the typed PostgreSQL workflow signal.
 //!
 //! ## The durable-RunStore FLOOR (named, not silently skipped)
-//! [`CiPipelineDriver`] starts the run and buffers completion signals durably through
-//! [`PgFlowExecutor`], while its body dispatcher still mirrors through the in-memory executor. The
-//! remaining activation floor is replacing that mirror with `PgFlowDriveStore` lease/replay; V2
-//! production launch remains refused until that authority is complete.
+//! The former same-process `CiPipelineDriver` is compiled only with `test-support`. It remains a
+//! compatibility harness for historical tests and is absent from the default production build. The
+//! production activation floor is now explicit: define a restart-safe CI body-input manifest and
+//! DAG-aware execution semantics before composing `PgFlowWorker`; V2 launch authority remains
+//! refused until its resource, egress, workspace, token, metering, and check capabilities exist.
 
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Mutex;
 
 use myelin_ci_sandbox::{
-    CompletionClaim, EgressPolicy, IdemToken, ImageRef, JobKind as SandboxJobKind,
-    JobSpec as SandboxJobSpec, MeterTarget, ResourceLimits, RunTokenRef, TerminalReport,
-    TerminalReporter, TrustTier, WorkspaceSpec,
+    CompletionClaim, IdemToken, JobSpec as SandboxJobSpec, TerminalReport, TerminalReporter,
 };
+#[cfg(any(test, feature = "test-support"))]
+use myelin_ci_sandbox::{
+    EgressPolicy, ImageRef, JobKind as SandboxJobKind, MeterTarget, ResourceLimits, RunTokenRef,
+    TrustTier, WorkspaceSpec,
+};
+#[cfg(any(test, feature = "test-support"))]
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
+#[cfg(any(test, feature = "test-support"))]
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
 use myelin_storage::{with_tenant_tx_error, PgError};
-use myelin_tenancy::{Region, TenantId};
+#[cfg(any(test, feature = "test-support"))]
+use myelin_tenancy::Region;
+use myelin_tenancy::TenantId;
 use sqlx::types::Uuid;
 
 use myelin_flow::{
-    ActivityError, DriveOutcome, DurableExecutor, ExecutorError, FlowDispatcher, FlowExecutor,
-    FlowTelemetry, JobRunner, JobSpec as FlowJobSpec, PgFlowExecutor, RunId, SignalOutcome,
-    SignalPayload, StartSpec, TimerStore, TypedSignalSpec, WfCtx, WfJournal, WorkflowBody,
-    CI_PIPELINE_WF_TYPE, JOB_DONE_SIGNAL, PARTITION_COUNT,
+    ActivityError, ExecutorError, JobRunner, JobSpec as FlowJobSpec, PgFlowExecutor, RunId,
+    SignalOutcome, SignalPayload, TypedSignalSpec, JOB_DONE_SIGNAL,
+};
+#[cfg(any(test, feature = "test-support"))]
+use myelin_flow::{
+    DriveOutcome, DurableExecutor, FlowDispatcher, FlowExecutor, FlowTelemetry, StartSpec,
+    TimerStore, WfCtx, WfJournal, WorkflowBody, CI_PIPELINE_WF_TYPE, PARTITION_COUNT,
 };
 
-use crate::ci_pipeline::{run_ci_pipeline_body, PipelineRun, PipelineStage, RunVerdict};
+use crate::ci_pipeline::PipelineStage;
+#[cfg(any(test, feature = "test-support"))]
+use crate::ci_pipeline::{run_ci_pipeline_body, PipelineRun, RunVerdict};
+#[cfg(any(test, feature = "test-support"))]
 use crate::ci_run_store::CiRunRecord;
+#[cfg(any(test, feature = "test-support"))]
+use crate::job_queue_store::{trust_from_token, JobQueueStoreError};
 use crate::job_queue_store::{
-    trust_from_token, CiJobQueueStore, ClaimConsumeOutcome, ClaimConsumeSpec, DurableEnqueue,
-    JobQueueStoreError,
+    CiJobQueueStore, ClaimConsumeOutcome, ClaimConsumeSpec, DurableEnqueue,
 };
 use crate::job_spec_store::{
     CiJobSpecStore, CiJobSpecStoreError, ClaimedDispatchIdentity, MAX_JOB_TIMEOUT_SECS,
 };
 use crate::schedule_and_run_job::JobScheduleTerms;
+#[cfg(any(test, feature = "test-support"))]
 use crate::scheduler::Lane;
 
 /// Bridge one async durable-store call to a sync body on a dedicated OFF-runtime thread (the SAME
@@ -463,22 +473,24 @@ impl From<PgError> for CompletionTxError {
 ///    of retrying forever.
 #[derive(Clone)]
 pub struct CiPipelineReporter {
-    executor: FlowExecutor,
     pg_executor: PgFlowExecutor,
     spec_store: CiJobSpecStore,
     queue_store: CiJobQueueStore,
     rt: tokio::runtime::Handle,
     tenant: TenantId,
     region: String,
+    /// Compatibility-only mirror for the historical in-memory culmination harness. This field and
+    /// all code that touches it are absent from normal production builds.
+    #[cfg(any(test, feature = "test-support"))]
+    test_executor: Option<FlowExecutor>,
 }
 
 impl CiPipelineReporter {
-    /// Build the reporter over the SHARED [`FlowExecutor`] the parked pipeline run runs on, the durable
-    /// [`CiJobSpecStore`] the claimed-job identity is verified + the stage is resolved against, the
+    /// Build the PostgreSQL-only reporter. The durable [`CiJobSpecStore`] verifies claimed-job
+    /// identity and resolves the stage, while the
     /// [`CiJobQueueStore`] the completion claim is atomically consumed against, the runtime handle the
     /// async durable reads bridge onto, and the cell `(tenant, region)` scope.
     pub fn new(
-        executor: FlowExecutor,
         pg_executor: PgFlowExecutor,
         spec_store: CiJobSpecStore,
         queue_store: CiJobQueueStore,
@@ -487,14 +499,23 @@ impl CiPipelineReporter {
         region: impl Into<String>,
     ) -> CiPipelineReporter {
         CiPipelineReporter {
-            executor,
             pg_executor,
             spec_store,
             queue_store,
             rt,
             tenant,
             region: region.into(),
+            #[cfg(any(test, feature = "test-support"))]
+            test_executor: None,
         }
+    }
+
+    /// Attach the legacy in-memory executor only for the test-support culmination harness. The
+    /// production reporter has no such field or method in a default build.
+    #[cfg(any(test, feature = "test-support"))]
+    fn with_test_executor(mut self, executor: FlowExecutor) -> Self {
+        self.test_executor = Some(executor);
+        self
     }
 }
 
@@ -642,16 +663,15 @@ impl TerminalReporter for CiPipelineReporter {
             }
         };
 
-        // The PostgreSQL run/signal is authoritative. Mirror into the current in-process driver until
-        // its dispatcher is backed directly by PgDriveStore; a retry is safe because the durable
-        // receipt and signal insertion are both idempotent.
-        self.executor.signal_typed(signal)?;
-
-        // WAKE the parked run (waiting → running) so the in-process dispatcher re-leases + replays it and
-        // consumes the job.done we just buffered. Idempotent (a running/terminal run is untouched). The
-        // durable PgFlowExecutor closes the signal/park race engine-side; this wake serves the in-memory
-        // driver the same one signal path drives today.
-        self.executor.runs().wake(&self.tenant, &run.0);
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(executor) = &self.test_executor {
+            // Compatibility for the historical test harness only. Production builds contain no
+            // process-local mirror: PgFlowWorker consumes the PostgreSQL signal directly.
+            executor.signal_typed(signal)?;
+            executor.runs().wake(&self.tenant, &run.0);
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = signal;
         Ok(outcome)
     }
 }
@@ -664,6 +684,7 @@ impl TerminalReporter for CiPipelineReporter {
 /// the X-1 producer facts) + its [`JobScheduleTerms`] (the security-load-bearing tier/region the
 /// durable runner forwards). Populated by [`CiPipelineDriver::start_run`] BEFORE the run is started.
 #[derive(Clone)]
+#[cfg(any(test, feature = "test-support"))]
 struct RunPlan {
     pipeline: PipelineRun,
     terms: JobScheduleTerms,
@@ -679,6 +700,7 @@ struct RunPlan {
 /// **Durable-drive FLOOR (named):** start and typed completion signal are PostgreSQL-durable, but body
 /// dispatch still mirrors through the in-memory executor. Production activation remains refused until
 /// `PgFlowDriveStore` owns lease/replay end to end.
+#[cfg(any(test, feature = "test-support"))]
 pub struct CiPipelineDriver {
     executor: FlowExecutor,
     pg_executor: PgFlowExecutor,
@@ -702,6 +724,7 @@ pub struct CiPipelineDriver {
     started: Arc<Mutex<Vec<String>>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl CiPipelineDriver {
     /// Build the driver for a cell `(tenant, region)`. Constructs the shared [`FlowExecutor`] +
     /// registers [`CI_PIPELINE_WF_TYPE`]; the `spec_store` + `rt` + `build_spec` are the chunk-5 durable
@@ -756,7 +779,6 @@ impl CiPipelineDriver {
     /// column, and the typed verdict wakes the parked run.
     pub fn reporter(&self) -> CiPipelineReporter {
         CiPipelineReporter::new(
-            self.executor.clone(),
             self.pg_executor.clone(),
             self.spec_store.clone(),
             CiJobQueueStore::with_pg(self.spec_store.pool().clone()),
@@ -764,6 +786,7 @@ impl CiPipelineDriver {
             self.tenant.clone(),
             self.region.clone(),
         )
+        .with_test_executor(self.executor.clone())
     }
 
     /// The outbox the pipeline body's X-1 producer emits (`ci.run.succeeded` / `ci.check.updated` /
@@ -966,6 +989,7 @@ impl CiPipelineDriver {
 /// Why [`CiPipelineDriver::start_run`] refused — a corrupt stamped trust token, or an executor start
 /// failure (unknown workflow / a pre-minted-id collision with a DIFFERENT run). Surfaced, never swallowed.
 #[derive(Debug)]
+#[cfg(any(test, feature = "test-support"))]
 pub enum StartRunError {
     /// The durable run belongs to a different tenant than this per-tenant driver. Refused before a
     /// plan is registered or an engine run/job is created, so a region-wide starter cannot stamp
@@ -984,6 +1008,7 @@ pub enum StartRunError {
     Start(ExecutorError),
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl std::fmt::Display for StartRunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1002,11 +1027,13 @@ impl std::fmt::Display for StartRunError {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl std::error::Error for StartRunError {}
 
 /// Enforce the per-tenant driver boundary before any mutable in-memory/durable orchestration state
 /// is touched. A future region-wide queued-run poller must route each record to a driver composed for
 /// exactly this authoritative tenant; it may never reuse a synthetic service tenant.
+#[cfg(any(test, feature = "test-support"))]
 fn validate_driver_tenant(
     driver_tenant: &TenantId,
     record: &CiRunRecord,
@@ -1029,6 +1056,7 @@ fn validate_driver_tenant(
 /// (`ci.run.succeeded` / `ci.check.updated` / `ci.result`). A platform-service principal (no PII), the
 /// cell `(tenant, region)`. The deterministic timestamps keep the body replay-stable (the body reads no
 /// clock outside `WfCtx`).
+#[cfg(any(test, feature = "test-support"))]
 fn service_ctx_base(tenant: &TenantId, region: &str) -> EmitContextBase {
     EmitContextBase {
         tenant: tenant.clone(),
@@ -1069,11 +1097,12 @@ fn deterministic_uuid(seed: &str) -> String {
     )
 }
 
-/// **A digest-pinned compute [`SandboxJobSpec`] builder for a fixed `command` (the CT-004d.2 test
-/// seam and minimal production default).** Produces a `kind=ci` spec running `command` in a `runsc` guest,
+/// **A digest-pinned compute [`SandboxJobSpec`] builder for a fixed test command.** Produces a
+/// `kind=ci` spec running `command` in a `runsc` guest,
 /// default-deny egress, a read-only workspace. The `trust_tier` + `idem_token` are placeholders the
 /// [`DurableJobRunner`] OVERWRITES from the run's terms + the dispatch (so this builder can never widen
 /// the tier). `image` MUST be digest-pinned (fail-closed via [`ImageRef::pinned`]).
+#[cfg(any(test, feature = "test-support"))]
 pub fn fixed_command_spec_builder(
     image: &str,
     command: Vec<String>,
