@@ -796,14 +796,18 @@ export const prMutate = action(async (m: PrMutation): Promise<PrMutationResult> 
   return authed(async () => {
     switch (m.op) {
       case "thread": {
+        const body = m.body_md.trim();
+        if (!body) throw new Error("thread body must not be empty");
         const r = await edgePost<{ applied: { thread: PrThreadVM } }>(`${base}/threads`, {
-          body_md: m.body_md,
+          body_md: body,
           ...(m.anchor ? { anchor: m.anchor } : {}),
         });
         return { thread: r.applied.thread };
       }
       case "comment": {
-        const r = await edgePost<{ applied: { comment: PrCommentVM } }>(`${base}/threads/${seg(m.threadId)}/comments`, { body_md: m.body_md });
+        const body = m.body_md.trim();
+        if (!body) throw new Error("comment body must not be empty");
+        const r = await edgePost<{ applied: { comment: PrCommentVM } }>(`${base}/threads/${seg(m.threadId)}/comments`, { body_md: body });
         return { comment: r.applied.comment };
       }
       case "review-start": {
@@ -811,7 +815,9 @@ export const prMutate = action(async (m: PrMutation): Promise<PrMutationResult> 
         return { review: r.applied.review };
       }
       case "review-comment": {
-        const r = await edgePost<{ applied: { comment: PrCommentVM } }>(`${base}/reviews/${seg(m.reviewId)}/comments`, { body_md: m.body_md });
+        const body = m.body_md.trim();
+        if (!body) throw new Error("review comment body must not be empty");
+        const r = await edgePost<{ applied: { comment: PrCommentVM } }>(`${base}/reviews/${seg(m.reviewId)}/comments`, { body_md: body });
         return { comment: r.applied.comment };
       }
       case "review-submit": {

@@ -1,5 +1,16 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, request as pwRequest, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
+
+const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
+
+async function resetPrFixtures() {
+  const context = await pwRequest.newContext();
+  const response = await context.post(`${EDGE}/__test/config`, {
+    data: { resetPrFixtures: true },
+  });
+  expect(response.ok(), "dev-edge PR fixture reset must be accepted").toBeTruthy();
+  await context.dispose();
+}
 
 // R3.2 · G-7 — the PR diff / files-changed surface, driven in a real chromium against the dev-edge
 // contract. Proves: the three-dot diff renders (split + unified); a line comment posts to the R3.3
@@ -25,6 +36,8 @@ async function devLogin(page: Page) {
 
 test.describe("R3.2 PR diff / files-changed — real browser", () => {
   test.use({ viewport: { width: 1440, height: 900 } });
+  test.beforeEach(resetPrFixtures);
+  test.afterEach(resetPrFixtures);
 
   test("renders the three-dot diff (split), the binary row, and the tab strip", async ({ page }) => {
     await devLogin(page);

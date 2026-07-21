@@ -564,7 +564,7 @@ function DiscussionSection(props: {
       {/* The composer (a read-only viewer's write is server-rejected → the toast; the field never lies). */}
       <div style={{ display: "flex", "flex-direction": "column", gap: "var(--space-1)" }}>
         <textarea aria-label="New comment" value={composer()} onInput={(e) => setComposer(e.currentTarget.value)} rows={2} placeholder="Start a discussion…" style={textareaStyle} />
-        <button type="button" data-testid="post-thread" onClick={() => void post()} class="btn-primary" style={{ ...barBtnPrimary, "align-self": "flex-start" }}>Comment</button>
+        <button type="button" data-testid="post-thread" disabled={!composer().trim()} onClick={() => void post()} class="btn-primary" style={{ ...barBtnPrimary, "align-self": "flex-start" }}>Comment</button>
       </div>
     </section>
   );
