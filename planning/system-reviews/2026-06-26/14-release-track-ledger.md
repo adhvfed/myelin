@@ -737,6 +737,28 @@ prepared plan is explicitly a DAG, not the legacy sequential `PipelineRun`, and 
 authority. Do not compose the production worker fan-out or enable `MYELIN_CI_RUNNER=1` until those
 contracts are durable and replay-deterministic.
 
+**CI immutable drive-manifest foundation (2026-07-21, `d8b0925` + `42ad3a1` + `3c891b0`).** The
+first activation prerequisite is now durable without pretending launch authority exists. PostgreSQL
+attempt allocation is retry-safe: an exact retry for the same `current_run` reuses its issued
+per-context attempt, while distinct runs remain strictly monotonic (including across process restart).
+The new `ci_drive_manifest` table is tenant/region scoped, one-to-one with both `ci_run` and the
+pre-minted workflow run, retains canonical bytes beside a domain-separated BLAKE3 digest, and is
+structurally insert-only: the runtime role has no UPDATE/DELETE grant and a defensive trigger refuses
+even owner mutations. `CiDriveManifestV1` is a strict server-authored contract for the exact DAG,
+matrix identity, per-context attempts, workflow definition pin, provenance, resource/scheduling
+grants, reserve handle, and stable token-mint authority; secret values and minted token JTIs are
+absent. Validation rejects unknown/noncanonical wire fields, DAG cycles or missing dependencies,
+unpinned images, unsafe workspace posture, and check-context drift. Merge waiter authority is
+optional, so ordinary runs no longer need to fabricate a merge token/target. The PostgreSQL store
+supports caller-transaction insertion for the future starter co-commit and exact replay verification;
+a divergent uniqueness collision is loud. Proof: 367/367 control-plane unit tests, all-target/
+all-feature clippy, live insert-only/RLS schema proof, live exact replay/divergence store proof, and
+the constrained split-role full bootstrap. **Honest remaining activation floor:** the queued-run
+starter does not yet allocate attempts + materialize policy-granted job templates + insert this
+manifest + start the manifest-referenced workflow in one transaction. Its current snapshot-only input
+is therefore not promoted, and production activation remains refused until that authority adapter and
+the DAG-native body consume path land.
+
 ## R5–R6
 
 | Phase | Status |
