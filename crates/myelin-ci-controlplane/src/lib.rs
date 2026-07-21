@@ -157,15 +157,13 @@ pub use pg_pipeline_starter::{
     ClaimedCiInputError, PgCiPipelineStarter, PgCiRunStarterFactory, PgCiStarterError,
     StartQueuedOutcome, CI_JOB_ID_V1_DOMAIN,
 };
-/// CT-004d.2 CULMINATION (chunks 2/3/5): the CI pipeline DRIVER — a pushed CI trigger runs a REAL
-/// pipeline end-to-end. [`ci_pipeline_driver::DurableJobRunner`] (chunk 5) dispatches each stage into
+/// Durable CI dispatch and claim-bound completion components. [`ci_pipeline_driver::DurableJobRunner`]
+/// dispatches each stage into
 /// the DURABLE `job_queue` + `ci_job_spec` via [`job_spec_store::CiJobSpecStore::co_persist_dispatch`]
 /// (the run's `trust_tier`/`region` forwarded UNCHANGED — the security invariant);
-/// [`ci_pipeline_driver::CiPipelineDriver`] (chunks 2+3) registers + drives the `ci.pipeline` body over
-/// a shared [`myelin_flow::FlowExecutor`] and starts the parked run under the pre-minted `wf_run_id`;
-/// [`ci_pipeline_driver::CiPipelineReporter`] bridges the runner's `passed` marker to the stage-verdict
-/// codec + wakes the parked run (so the CT-004c.2 runner's `job.done` from a real `runsc` guest
-/// advances the pipeline to completion).
+/// [`ci_pipeline_driver::CiPipelineReporter`] atomically consumes the exact live claim and buffers a
+/// typed verdict for [`myelin_flow::PgFlowWorker`]. The former in-memory driver exists only under the
+/// `test-support` feature and is not part of the default production build.
 pub mod ci_pipeline_driver;
 pub mod floor_followons;
 pub mod holder;
@@ -505,9 +503,11 @@ pub use runner_bind::{
 // `passed` marker to the stage-verdict codec + wakes the parked run. `fixed_command_spec_builder` is the
 // digest-pinned compute-spec seam the integration test injects (a real `runsc` guest); the real
 // pinned-snapshot→JobSpec resolver is the named `unresolved_stage_spec_builder` follow-on.
+#[cfg(any(test, feature = "test-support"))]
+pub use ci_pipeline_driver::{fixed_command_spec_builder, CiPipelineDriver, StartRunError};
 pub use ci_pipeline_driver::{
-    fixed_command_spec_builder, unresolved_stage_spec_builder, CiPipelineDriver,
-    CiPipelineReporter, ClaimRefusal, DurableJobRunner, StageSpecBuilder, StartRunError,
+    unresolved_stage_spec_builder, CiPipelineReporter, ClaimRefusal, DurableJobRunner,
+    StageSpecBuilder,
 };
 
 // CI-P14 (P-357): the EU fleet autoscaler — the FleetProvider impl + autoscale-on-queue-depth +

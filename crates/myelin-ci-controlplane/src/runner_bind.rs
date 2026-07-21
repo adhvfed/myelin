@@ -249,20 +249,15 @@ impl LeaseStore for DurableLeaseAdapter {
 
 /// **The bounded CI runner loop (CT-004c.2) — the service `main` spawns it (arch 00 §4).** Owns the
 /// durable lease adapter's inputs, a REAL [`GvisorBackend`] (untrusted code runs in a `runsc` guest —
-/// the AG-D4 gate), the firehose stub, the `job.done` reporter over the composition's [`FlowExecutor`],
+/// the AG-D4 gate), the firehose stub, the PostgreSQL-only `job.done` reporter,
 /// and the four-guarantee hooks. [`run`](Self::run) constructs the [`RunnerAgent`] on its own thread
 /// and loops `run_one` with backoff. Mirrors [`JobQueueReaper`](crate::JobQueueReaper): a bounded
 /// background driver, no new `AppSpec` field, LOUD on failure and resilient (a launch failure logs and
 /// continues; the §OQ-F dispatch retry re-runs the job).
 ///
-/// **Reporter note (CT-004d.2 CULMINATION — the handoff is now WIRED):** the terminal `job.done` is
-/// delivered through a [`CiPipelineReporter`] over the SAME shared [`myelin_flow::FlowExecutor`] the
-/// `ci.pipeline` body parks on ([`crate::CiPipelineDriver`] chunks 2/3 register + drive that body). The
-/// reporter re-encodes the runner's derived `passed` into the stage-verdict codec the body decodes
-/// (CT-004d.2 chunk 5's [`crate::StageVerdictBridge`]) and WAKES the parked run — so a real `runsc`
-/// guest's `job.done` advances the pipeline. It remains the ONE signal path (→ `DurableExecutor::signal`,
-/// exactly-once on `idem_token`); a job with no stage mapping falls back to the raw `passed` marker
-/// (identical to the CT-004c.2 `EngineTerminalReporter` behaviour).
+/// The reporter re-encodes the runner-derived verdict and atomically buffers it in PostgreSQL. A
+/// tenant/region/partition-scoped [`myelin_flow::PgFlowWorker`] wakes and consumes that one durable
+/// signal path; no process-local executor mirror participates in a production build.
 pub struct CiRunnerLoop {
     worker_id: String,
     labels: Vec<String>,
@@ -289,9 +284,8 @@ impl CiRunnerLoop {
     /// Construct the runner loop. `worker_id`/`labels`/`allowed_tiers`/`region`/`lease_ttl_secs` are
     /// the claim predicates + lease TTL; `store` is the durable `job_queue` store; `rt` bridges the
     /// sync runner onto the async pool; `resolve` provides the `JobSpec` for a leased row (CT-004d
-    /// seam); `reporter` is the [`CiPipelineReporter`] over the shared executor the parked `ci.pipeline`
-    /// body runs on (CT-004d.2 — it re-encodes the verdict + wakes the parked run); `hooks` are the
-    /// four-guarantee wiring. Build the reporter from [`crate::CiPipelineDriver::reporter`]. `pool` +
+    /// seam); `reporter` is the PostgreSQL-only [`CiPipelineReporter`] that atomically consumes the
+    /// claim and buffers the typed verdict; `hooks` are the four-guarantee wiring. `pool` +
     /// `s3` back the live log sink (CT-004f sub-step 5): the OLTP pool writes the `log_segment`/
     /// `log_anchor` index + the `ci.log.available` outbox pointer; `s3` is the CAS the sealed log
     /// segments flush to (the same shared pool + object store the rest of the control plane uses).
