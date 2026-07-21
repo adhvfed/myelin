@@ -400,6 +400,33 @@ fn a_terminal_check_fact_decodes_to_the_frozen_git_checkstatus_shape() {
     );
 }
 
+/// Durable outbox validation requires the event subject itself to be one canonical ArtifactRef. The
+/// run reference must not be wrapped in a second legacy `ci/run/` prefix.
+#[test]
+fn terminal_run_event_uses_the_canonical_run_ref_as_its_subject() {
+    let outbox = OutboxStore::new();
+    let signals = SignalStore::new();
+    let timers = TimerStore::new();
+    let runner = RecordingRunner::default();
+
+    deliver_done(&signals, &stage_token(0), "build", true);
+    deliver_done(&signals, &stage_token(1), "test", true);
+
+    let mut ctx = begin(&outbox, signals, timers, 1000);
+    run_ci_pipeline_body(&mut ctx, &job_run(), &runner).expect("green run");
+    ctx.commit().expect("co-commit");
+
+    let row = outbox
+        .committed_rows()
+        .into_iter()
+        .find(|row| row.envelope.type_.0 == CI_RUN_SUCCEEDED)
+        .expect("a ci.run.succeeded fact was emitted");
+    assert_eq!(
+        row.envelope.subject,
+        ArtifactRef("myelin://acme/ci/run/run-7".into())
+    );
+}
+
 /// **A protected-env GATE is APPROVED → the runner stages run + the run succeeds.** A leading gate
 /// stage parks on `approval:<stage>`; with the approval buffered it proceeds to the runner stages.
 #[test]

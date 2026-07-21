@@ -3,15 +3,17 @@
 //! is started as a parked `ci.pipeline` run (chunk 3), its stage is dispatched through the DURABLE
 //! `job_queue`+`ci_job_spec` (chunk 5's `DurableJobRunner` — trust_tier/region forwarded UNCHANGED),
 //! the CT-004c.2 runner CLAIMS it + EXECUTES it in a REAL gVisor (`runsc`) guest + reports `job.done`,
-//! and the parked run WAKES (chunk 2's driver + the `CiPipelineReporter` verdict bridge), advances, and
-//! COMPLETES — the X-1 producer emits the green check/result reflecting the real guest outcome.
+//! and the parked run WAKES through PostgreSQL (`CiPipelineReporter` + reconstructed `PgFlowWorker`),
+//! advances, and COMPLETES — the X-1 producer emits the green check/result durably.
 //!
 //! What it proves:
-//!   1. **END TO END (requires real `runsc`):** a queued `ci_run` → `start_run` → tick dispatches the
+//!   1. **END TO END (requires real `runsc`):** a queued `ci_run` → durable workflow start → drive
+//!      dispatches the
 //!      stage into the DURABLE queue → a `job_queue` row + its `ci_job_spec` appear → the durable-backed
 //!      runner claims it → a REAL `runsc` guest runs the stage command → `job.done` (re-encoded to the
-//!      stage-verdict codec) wakes the parked run → the run COMPLETES → `ci.run.succeeded` +
-//!      `ci.check.updated{success}` emitted. SKIPS green if `runsc`/rootfs absent; HARD-FAILS under
+//!      stage-verdict codec) wakes a newly reconstructed PostgreSQL worker → the run COMPLETES →
+//!      `ci.run.succeeded` + `ci.check.updated{success}` commit to the durable outbox. SKIPS green if
+//!      `runsc`/rootfs absent; HARD-FAILS under
 //!      `MYELIN_REQUIRE_RUNSC=1`.
 //!   2. **SECURITY — the trust tier is forwarded UNCHANGED into the durable dispatch:** the `job_queue`
 //!      row + the `ci_job_spec` carry the run's stamped `trust_tier` (`trusted`), never widened.
@@ -26,26 +28,28 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use myelin_ci_controlplane::{
     ci_job_queue_store, ci_job_spec_store, ci_region_queue_store_test_support,
     ci_run_store_factory, durable_spec_resolver, fixed_command_spec_builder, CheckFacts,
-    CiPipelineDriver, CiRunInsert, DurableLeaseAdapter, PipelineRun, PipelineStage,
-    ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
-    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL,
-    CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
+    CiPipelineDriver, CiPipelineReporter, CiRunInsert, DurableJobRunner, DurableLeaseAdapter,
+    JobScheduleTerms, Lane, PipelineRun, PipelineStage, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
+    CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
+    CREATE_JOB_QUEUE_INDEXES_DDL,
 };
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, CompletionClaim, FirehoseSink, ReserveHandle, RunnerAgent, RunnerHooks,
     TerminalReport, TerminalReporter, TrustTier,
 };
-use myelin_events::OutboxStore;
+use myelin_events::{Actor, IdMinter, MonotonicMinter, OutboxStore};
 use myelin_flow::{
-    migrations::migrations as flow_migrations, CiStage, DriveOutcome, ExecutorError, MinorUnits,
-    RunId, SignalOutcome, JOB_DONE_SIGNAL,
+    migrations::migrations as flow_migrations, partition_for_run_id, CiStage, DriveOutcome,
+    DurableExecutor, ExecutorError, MinorUnits, PgFlowExecutor, PgFlowWorker, PgRunOnceOutcome,
+    PgWorkerScope, RunId, SignalOutcome, StartSpec, CI_PIPELINE_WF_TYPE, JOB_DONE_SIGNAL,
 };
+use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_refs::ArtifactRef;
 use myelin_storage::{provider::foundation_migrations, HotTables, PgMigrator};
 use myelin_tenancy::{Region, TenantId};
@@ -232,6 +236,91 @@ fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
+const TEST_CI_BODY_HASH: &str = "blake3:test-only-pinned-ci-pipeline-v1";
+
+/// Build the restartable PostgreSQL worker used by this culmination proof. The captured plan is
+/// deliberately test-only: production must derive this data from the future immutable drive-input
+/// manifest, never from process memory.
+fn pg_ci_test_worker(
+    admin: &PgPool,
+    tenant: &str,
+    region: &str,
+    run_id: &str,
+    pipeline: PipelineRun,
+    build_spec: myelin_ci_controlplane::StageSpecBuilder,
+    worker_name: &str,
+) -> PgFlowWorker {
+    let tenant_id = TenantId(tenant.into());
+    let region_id = Region(region.into());
+    let actor = Actor(Principal::new(
+        tenant_id.clone(),
+        region_id.clone(),
+        PrincipalId("ci-pg-worker-test".into()),
+        PrincipalKind::Service,
+        DataRole::Processor,
+        PrincipalStatus::Active,
+    ));
+    let scope = PgWorkerScope::new(
+        tenant_id.clone(),
+        region_id,
+        partition_for_run_id(run_id),
+        worker_name,
+        30,
+        actor,
+        1,
+    )
+    .expect("valid exact-cell worker scope");
+    let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+    let mut worker = PgFlowWorker::new(
+        admin.clone(),
+        tokio::runtime::Handle::current(),
+        minter,
+        scope,
+    );
+    let mut terms = JobScheduleTerms::new(
+        tenant,
+        region,
+        run_id,
+        Lane::Interactive,
+        TrustTier::Trusted,
+        tenant,
+    );
+    terms.labels = vec!["linux".into()];
+    let runner = DurableJobRunner::new(
+        ci_job_spec_store(admin.clone()),
+        tokio::runtime::Handle::current(),
+        terms,
+        build_spec,
+        &pipeline.stages,
+    );
+    worker
+        .register_definition(
+            CI_PIPELINE_WF_TYPE,
+            1,
+            TEST_CI_BODY_HASH,
+            move |_claimed, ctx| {
+                let verdict = myelin_ci_controlplane::ci_pipeline::run_ci_pipeline_body(
+                    ctx, &pipeline, &runner,
+                )
+                .map_err(|error| format!("{error:?}"))?;
+                Ok(match verdict {
+                    myelin_ci_controlplane::RunVerdict::Succeeded { stages_completed } => {
+                        vec![ArtifactRef(format!("outcome:succeeded:{stages_completed}"))]
+                    }
+                    myelin_ci_controlplane::RunVerdict::Failed { stage } => {
+                        vec![ArtifactRef(format!("outcome:failed:{stage}"))]
+                    }
+                    myelin_ci_controlplane::RunVerdict::Rejected { stage } => {
+                        vec![ArtifactRef(format!("outcome:rejected:{stage}"))]
+                    }
+                    myelin_ci_controlplane::RunVerdict::Parked => vec![],
+                })
+            },
+        )
+        .expect("register the pinned test-only CI body");
+    worker
+}
+
 // ═══════════════════════════════ THE END-TO-END PROOF ════════════════════════════════════════════
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -242,7 +331,7 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
     }
     let schema = schema_name("e2e");
     let region = "fr-par";
-    let tenant = "tenantA";
+    let tenant = "tenant-a";
     let admin = admin_pool(&schema).await;
     create_schema(&admin, &schema).await;
 
@@ -264,7 +353,7 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
             state: "queued".into(),
             correlation_id: "corr-d2".into(),
             cause_event_id: Some("evt-push-d2".into()),
-            repo_ref: Some("myelin/self".into()),
+            repo_ref: Some(format!("myelin://{tenant}/git/repo/myelin-self")),
             commit_oid: Some("deadbeefcafe".into()),
             triggered_by: None,
         })
@@ -278,7 +367,7 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
     assert_eq!(record.state, "queued");
     assert_eq!(record.wf_run_id, wf_run_uuid);
 
-    // ── (chunk 2) the pipeline DRIVER over the shared executor; the stage runs `echo` in gVisor. ──
+    // ── Test-only pinned body input; the stage runs `echo` in gVisor. ──
     let stage_target = "pipeline://myelin/self#build";
     let build_spec = fixed_command_spec_builder(
         PINNED_IMAGE,
@@ -290,17 +379,6 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         60,
     )
     .expect("pinned image");
-    let outbox = OutboxStore::new(); // in-memory (test-support) — reads the body's X-1 producer emits
-    let driver = CiPipelineDriver::new(
-        TenantId(tenant.into()),
-        region,
-        ci_job_spec_store(admin.clone()),
-        tokio::runtime::Handle::current(),
-        build_spec,
-        outbox,
-    );
-
-    // ── (chunk 3) start the parked ci.pipeline run under the pre-minted wf_run_id. ──
     let pipeline = PipelineRun {
         stages: vec![PipelineStage::job(CiStage::new(
             "build",
@@ -318,22 +396,68 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
             merge_idem_token: format!("merge:{run_uuid}"),
         },
     };
-    let run = driver
-        .start_run(&record, pipeline, vec!["linux".into()])
-        .expect("start the parked ci.pipeline run under the pre-minted wf_run_id");
+    let worker = pg_ci_test_worker(
+        &admin,
+        tenant,
+        region,
+        &wf_run_uuid,
+        pipeline.clone(),
+        build_spec.clone(),
+        "d2-flow-worker-before-restart",
+    );
+    let run = tokio::task::block_in_place(|| {
+        worker.executor().start_with_id(
+            StartSpec {
+                wf_type: CI_PIPELINE_WF_TYPE.into(),
+                input: vec![],
+                budget: None,
+                idem_key: format!("ci:{run_uuid}"),
+            },
+            Some(RunId(wf_run_uuid.clone())),
+        )
+    })
+    .expect("start the PostgreSQL ci.pipeline run under the pre-minted wf_run_id");
     assert_eq!(
         run,
         RunId(wf_run_uuid.clone()),
         "the run's id == the pre-minted wf_run_id"
     );
 
-    // ── DRIVE tick #1: the body dispatches the stage into the DURABLE queue + parks. ──
+    // ── DRIVE #1: PgFlowWorker dispatches the stage durably and parks. ──
     let now = now_secs();
-    let _ = driver.drive_once(now, "2026-07-17T00:00:00Z");
+    let first = worker
+        .run_once(now, "2026-07-17T00:00:00Z")
+        .await
+        .expect("first PostgreSQL drive");
+    assert!(matches!(
+        first,
+        PgRunOnceOutcome::Driven {
+            outcome: DriveOutcome::Waiting,
+            ..
+        }
+    ));
+    let durable_state: String =
+        sqlx::query_scalar("SELECT state FROM workflow_run WHERE run_id = $1")
+            .bind(&wf_run_uuid)
+            .fetch_one(&admin)
+            .await
+            .expect("read parked workflow state");
     assert_eq!(
-        driver.run_state(&run).as_deref(),
-        Some("waiting"),
+        durable_state, "waiting",
         "the pipeline dispatched the stage + parked on job.done"
+    );
+
+    // Destroy every process-local drive object, then rebuild from PostgreSQL with the same immutable
+    // definition identity. The second drive below therefore proves journal/signal restart recovery.
+    drop(worker);
+    let worker = pg_ci_test_worker(
+        &admin,
+        tenant,
+        region,
+        &wf_run_uuid,
+        pipeline,
+        build_spec,
+        "d2-flow-worker-after-restart",
     );
 
     // a DURABLE job_queue row appeared (queued), carrying the run's stamped trust_tier UNCHANGED.
@@ -368,8 +492,8 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         "the executing spec's tier == the gate tier (no widening)"
     );
 
-    // ── (CT-004c.2) the durable-backed runner CLAIMS the row + EXECUTES it in a REAL runsc guest, and
-    //    reports job.done through the driver's CiPipelineReporter (verdict re-encode + wake). ──
+    // ── The durable-backed runner claims + executes in real runsc. The PostgreSQL-only reporter
+    //    consumes the exact claim and inserts job.done atomically; it has no FlowExecutor mirror. ──
     let resolver = durable_spec_resolver(
         ci_job_spec_store(admin.clone()),
         region,
@@ -384,7 +508,21 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
     );
     let backend = GvisorBackend::new();
     let firehose = CapturingFirehose::default();
-    let reporter = driver.reporter(); // the CiPipelineReporter over the SHARED executor + verdict bridge
+    let reporter_minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+    let reporter = CiPipelineReporter::new(
+        PgFlowExecutor::new(
+            admin.clone(),
+            tokio::runtime::Handle::current(),
+            reporter_minter,
+            TenantId(tenant.into()),
+            Region(region.into()),
+        ),
+        ci_job_spec_store(admin.clone()),
+        ci_job_queue_store(admin.clone()),
+        tokio::runtime::Handle::current(),
+        TenantId(tenant.into()),
+        region,
+    );
     let agent = RunnerAgent::new(
         "d2-worker",
         vec!["linux".into()],
@@ -421,41 +559,37 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         "the REAL runsc guest ran the stage command (proves real exec). got: {guest:?}"
     );
 
-    // ── DRIVE tick #2..N: the parked run WAKES, consumes the job.done (verdict pass:build), advances,
-    //    and COMPLETES. ──
-    let mut completed: Option<Vec<myelin_refs::ArtifactRef>> = None;
-    for _ in 0..20 {
-        for o in driver.drive_once(now_secs(), "2026-07-17T01:00:00Z") {
-            if let DriveOutcome::Completed(refs) = o {
-                completed = Some(refs);
-            }
-        }
-        if driver.run_state(&run).as_deref() == Some("completed") {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-
-    assert_eq!(
-        driver.run_state(&run).as_deref(),
-        Some("completed"),
-        "the parked ci.pipeline run WOKE on the real guest's job.done and COMPLETED"
-    );
+    // ── DRIVE #2 after reconstruction: consume durable job.done and complete. ──
+    let second = worker
+        .run_once(now_secs(), "2026-07-17T01:00:00Z")
+        .await
+        .expect("restart drive consumes durable job.done");
+    let completed = match second {
+        PgRunOnceOutcome::Driven {
+            outcome: DriveOutcome::Completed(refs),
+            ..
+        } => Some(refs),
+        other => panic!("expected completed PostgreSQL drive, got {other:?}"),
+    };
+    let durable_state: String =
+        sqlx::query_scalar("SELECT state FROM workflow_run WHERE run_id = $1")
+            .bind(&wf_run_uuid)
+            .fetch_one(&admin)
+            .await
+            .expect("read terminal workflow state");
+    assert_eq!(durable_state, "completed");
     assert_eq!(
         completed.as_deref(),
         Some(&[myelin_refs::ArtifactRef("outcome:succeeded:1".into())][..]),
         "the pipeline verdict reflects the real green guest (1 stage succeeded)"
     );
 
-    // job.done buffered EXACTLY ONCE (the exactly-once wake).
-    assert_eq!(
-        driver
-            .executor()
-            .signals()
-            .count_for_run(&TenantId(tenant.into()), &wf_run_uuid),
-        1,
-        "the engine buffered EXACTLY ONE job.done (exactly-once wake)"
-    );
+    let signal_count: i64 = sqlx::query_scalar("SELECT count(*) FROM wf_signal WHERE run_id = $1")
+        .bind(&wf_run_uuid)
+        .fetch_one(&admin)
+        .await
+        .expect("count durable signals");
+    assert_eq!(signal_count, 1, "exactly one durable job.done was buffered");
 
     // the durable lease was SETTLED (the job_queue row moved to terminal).
     let jq_final: String = sqlx::query_scalar("SELECT state FROM job_queue WHERE run_id = $1")
@@ -465,9 +599,13 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         .expect("read the settled job state");
     assert_eq!(jq_final, "terminal", "the runner settled the durable lease");
 
-    // the X-1 PRODUCER emitted the green check/result reflecting the real guest outcome.
-    let rows = driver.outbox().committed_rows();
-    let types: Vec<String> = rows.iter().map(|r| r.envelope.type_.0.clone()).collect();
+    // The X-1 producer events co-committed through PgFlowDriveStore's durable outbox.
+    let types: Vec<String> = sqlx::query_scalar(
+        "SELECT envelope->>'type_' FROM outbox WHERE envelope->>'type_' LIKE 'ci.%' ORDER BY seq",
+    )
+    .fetch_all(&admin)
+    .await
+    .expect("read durable CI outbox events");
     assert!(
         types.iter().any(|t| t == "ci.run.succeeded"),
         "the pipeline emitted ci.run.succeeded (the run reflects the green guest). emitted: {types:?}"
@@ -479,19 +617,18 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
 
     // sanity: the job.done payload carried the STAGE VERDICT codec (the bridge translated the runner's
     // derived pass), NOT the raw passed marker — this is what let run_ci_pipeline decode the verdict.
-    let jd = driver
-        .executor()
-        .signals()
-        .get(
-            &TenantId(tenant.into()),
-            &wf_run_uuid,
-            JOB_DONE_SIGNAL,
-            &outcome_idem(&wf_run_uuid),
-        )
-        .expect("the buffered job.done");
+    let jd: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM wf_signal WHERE run_id = $1 AND signal_name = $2 AND idem_key = $3",
+    )
+    .bind(&wf_run_uuid)
+    .bind(JOB_DONE_SIGNAL)
+    .bind(outcome_idem(&wf_run_uuid))
+    .fetch_one(&admin)
+    .await
+    .expect("read the durable job.done");
     assert_eq!(
-        jd.payload[0],
-        myelin_flow::stage_verdict_marker("build", true),
+        jd[0],
+        serde_json::Value::String(myelin_flow::stage_verdict_marker("build", true).0),
         "the reporter re-encoded the real guest's pass into the stage-verdict codec the body decodes"
     );
 
