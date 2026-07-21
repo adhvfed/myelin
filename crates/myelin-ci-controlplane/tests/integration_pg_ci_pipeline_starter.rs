@@ -2,14 +2,18 @@
 #![cfg(feature = "integration")]
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use myelin_ci_controlplane::{
-    ci_artifact_ref, ci_job_id_v1, ci_run_ref, ci_run_starter_factory, CiWorkflowDefinitionPin,
-    PgCiPipelineStarter, PgCiRunStarterFactory, ResolvedJobV1, ResolvedRunPlanV1, StartQueuedOutcome,
-    CI_JOB_RUN_LEDGER_INDEX, CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_RUN_DDL,
+    ci_artifact_ref, ci_job_id_v2, ci_run_ref, CiExecutionProfileV1, CiExecutionRequestV1,
+    CiJobLaunchGrantV1, CiLaunchAuthorityError, CiLaunchAuthorityMaterializer, CiLaunchAuthorityV1,
+    CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1, CiWorkflowDefinitionPin,
+    PgCiPipelineStarter, PgCiRunStarterFactory, PreparedRunPlanV2, ResolvedJobV2,
+    ResolvedRunPlanV2, StartQueuedOutcome, CI_JOB_RUN_LEDGER_INDEX, CREATE_CHECK_ATTEMPT_DDL,
+    CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
+    CREATE_CI_RUN_DDL,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::MonotonicMinter;
@@ -27,6 +31,7 @@ use sqlx::{Executor, PgPool};
 
 const BODY_HASH: &str = "blake3:ci-pg-body-v1";
 const BODY_HASH_V2: &str = "blake3:ci-pg-body-v2";
+static AUTHORITY_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 struct PausingBlobStore {
     inner: Arc<FsBlobStore>,
@@ -91,13 +96,19 @@ async fn pool_on(url: &str, schema: &str) -> PgPool {
         .expect("connect to the development PostgreSQL stack")
 }
 
-fn plan() -> ResolvedRunPlanV1 {
+fn plan() -> ResolvedRunPlanV2 {
     let mut matrix = BTreeMap::new();
     matrix.insert("os".into(), "linux".into());
-    ResolvedRunPlanV1 {
-        schema_version: 1,
+    let test_name = myelin_ci_controlplane::derive_concrete_job_name("test", &matrix);
+    ResolvedRunPlanV2 {
+        schema_version: 2,
+        execution: CiExecutionRequestV1 {
+            schema_version: 1,
+            profile: CiExecutionProfileV1::LinuxSmallV1,
+        },
         jobs: vec![
-            ResolvedJobV1 {
+            ResolvedJobV2 {
+                stage: "build".into(),
                 name: "build".into(),
                 image: format!("registry.example/build@sha256:{}", "a".repeat(64)),
                 command: vec!["/bin/build".into(), "--locked".into()],
@@ -105,16 +116,18 @@ fn plan() -> ResolvedRunPlanV1 {
                 is_generator: false,
                 matrix_key: BTreeMap::new(),
             },
-            ResolvedJobV1 {
+            ResolvedJobV2 {
+                stage: "package".into(),
                 name: "package".into(),
                 image: format!("registry.example/package@sha256:{}", "b".repeat(64)),
                 command: vec!["/bin/package".into()],
-                needs: vec!["build".into(), "test-linux".into()],
+                needs: vec!["build".into(), test_name.clone()],
                 is_generator: false,
                 matrix_key: BTreeMap::new(),
             },
-            ResolvedJobV1 {
-                name: "test-linux".into(),
+            ResolvedJobV2 {
+                stage: "test".into(),
+                name: test_name,
                 image: format!("registry.example/test@sha256:{}", "c".repeat(64)),
                 command: vec!["/bin/test".into()],
                 needs: vec!["build".into()],
@@ -122,6 +135,58 @@ fn plan() -> ResolvedRunPlanV1 {
                 matrix_key: matrix,
             },
         ],
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TestLaunchAuthority;
+
+impl CiLaunchAuthorityMaterializer for TestLaunchAuthority {
+    fn materialize<'a>(
+        &'a self,
+        record: &'a myelin_ci_controlplane::ci_run_store::CiRunRecord,
+        prepared: &'a PreparedRunPlanV2,
+        _definition: &'a CiWorkflowDefinitionPin,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<CiLaunchAuthorityV1, CiLaunchAuthorityError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            AUTHORITY_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(CiLaunchAuthorityV1 {
+                policy_revision: "test-policy-v1".into(),
+                jobs: prepared
+                    .plan()
+                    .jobs
+                    .iter()
+                    .map(|job| CiJobLaunchGrantV1 {
+                        concrete_name: job.name.clone(),
+                        env: BTreeMap::new(),
+                        secret_handles: BTreeMap::new(),
+                        egress_allow: Vec::new(),
+                        limits: CiManifestLimitsV1 {
+                            cpu_millis: 1_000,
+                            mem_bytes: 1_073_741_824,
+                            disk_bytes: 2_147_483_648,
+                            pids_max: 128,
+                            timeout_secs: 600,
+                        },
+                        scheduling: CiManifestSchedulingV1 {
+                            lane: CiManifestLaneV1::Batch,
+                            labels: vec!["linux".into()],
+                            concurrency_group: None,
+                            fair_key: format!("project:{}", record.project_id),
+                        },
+                        reserve_handle: format!("reserve:{}", record.run_id),
+                        token_authority_handle: format!("mint:{}", record.run_id),
+                    })
+                    .collect(),
+                merge_waiter: None,
+            })
+        })
     }
 }
 
@@ -140,6 +205,38 @@ fn starter_with(
     blobs: Arc<dyn BlobStore + Send + Sync>,
     definition: CiWorkflowDefinitionPin,
 ) -> PgCiPipelineStarter {
+    PgCiPipelineStarter::new_with_authority(
+        pool.clone(),
+        tokio::runtime::Handle::current(),
+        Arc::new(MonotonicMinter::new()),
+        TenantId(tenant.into()),
+        Region("fr-par".into()),
+        blobs,
+        definition,
+        Arc::new(TestLaunchAuthority),
+    )
+    .expect("valid exact-cell starter")
+}
+
+fn starter_without_authority(
+    pool: &PgPool,
+    tenant: &str,
+    blobs: Arc<dyn BlobStore + Send + Sync>,
+) -> PgCiPipelineStarter {
+    starter_without_authority_with(
+        pool,
+        tenant,
+        blobs,
+        CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
+    )
+}
+
+fn starter_without_authority_with(
+    pool: &PgPool,
+    tenant: &str,
+    blobs: Arc<dyn BlobStore + Send + Sync>,
+    definition: CiWorkflowDefinitionPin,
+) -> PgCiPipelineStarter {
     PgCiPipelineStarter::new(
         pool.clone(),
         tokio::runtime::Handle::current(),
@@ -149,18 +246,20 @@ fn starter_with(
         blobs,
         definition,
     )
-    .expect("valid exact-cell starter")
+    .expect("valid fail-closed production starter")
 }
 
 // The production composition-root seam (`ci_run_starter_factory`) over the app-role pool + cell region
 // + blob CAS — the exact router the service main composes behind the runner activation gate. It mints a
 // per-tenant `PgCiPipelineStarter` for an explicit authoritative tenant, never enumerating tenants.
 fn factory(pool: &PgPool, blobs: Arc<FsBlobStore>) -> PgCiRunStarterFactory {
-    ci_run_starter_factory(
+    PgCiRunStarterFactory::new_with_authority(
         pool.clone(),
+        tokio::runtime::Handle::current(),
+        Arc::new(MonotonicMinter::new()),
         Region("fr-par".into()),
         blobs,
-        tokio::runtime::Handle::current(),
+        Arc::new(TestLaunchAuthority),
     )
 }
 
@@ -193,7 +292,8 @@ async fn insert_run(
         "INSERT INTO ci_run (tenant_id, region, run_id, project_id, pipeline_id, wf_run_id, \
          repo_ref, commit_oid, definition_snapshot, trigger_kind, trust_tier, state, correlation_id) \
          VALUES ($1, 'fr-par', $2::uuid, '22222222-2222-2222-2222-222222222222'::uuid, \
-         '33333333-3333-3333-3333-333333333333'::uuid, $3::uuid, 'repo-1', 'deadbeef', $4, \
+         '33333333-3333-3333-3333-333333333333'::uuid, $3::uuid, \
+         'myelin://' || $1 || '/git/repo/core', 'deadbeef', $4, \
          'push', 'trusted', 'queued', $2)",
     )
     .bind(tenant)
@@ -229,6 +329,38 @@ async fn assert_atomic_started(
     );
 }
 
+async fn assert_manifest_backed_queued(admin: &PgPool, tenant: &str, run_id: &str) {
+    let pair: (bool, bool, bool, i64) = sqlx::query_as(
+        "SELECT state = 'queued',
+                EXISTS (SELECT 1 FROM workflow_run w WHERE w.tenant_id=c.tenant_id
+                        AND w.region=c.region AND w.run_id=c.wf_run_id::text),
+                EXISTS (SELECT 1 FROM ci_drive_manifest m WHERE m.tenant_id=c.tenant_id
+                        AND m.region=c.region AND m.ci_run_id=c.run_id),
+                (SELECT count(*) FROM ci_job j WHERE j.tenant_id=c.tenant_id AND j.run_id=c.run_id)
+           FROM ci_run c WHERE tenant_id=$1 AND run_id=$2::uuid",
+    )
+    .bind(tenant)
+    .bind(run_id)
+    .fetch_one(admin)
+    .await
+    .unwrap();
+    assert_eq!(pair, (true, true, true, 3));
+}
+
+async fn attempt_rows(
+    admin: &PgPool,
+    tenant: &str,
+) -> Vec<(String, i32, Option<sqlx::types::Uuid>)> {
+    sqlx::query_as(
+        "SELECT context, next_attempt, current_run FROM check_attempt \
+         WHERE tenant_id=$1 ORDER BY context",
+    )
+    .bind(tenant)
+    .fetch_all(admin)
+    .await
+    .expect("read exact check-attempt ledger")
+}
+
 type CiJobLedgerRow = (
     sqlx::types::Uuid,
     String,
@@ -242,8 +374,8 @@ type CiJobLedgerRow = (
 );
 
 async fn assert_exact_jobs(admin: &PgPool, tenant: &str, run_id: &str) {
-    let snapshot: String = sqlx::query_scalar(
-        "SELECT definition_snapshot FROM ci_run WHERE tenant_id=$1 AND run_id=$2::uuid",
+    let manifest_digest: String = sqlx::query_scalar(
+        "SELECT manifest_digest FROM ci_drive_manifest WHERE tenant_id=$1 AND ci_run_id=$2::uuid",
     )
     .bind(tenant)
     .bind(run_id)
@@ -258,9 +390,10 @@ async fn assert_exact_jobs(admin: &PgPool, tenant: &str, run_id: &str) {
         .map(|job| {
             (
                 job.name.clone(),
-                ci_job_id_v1(
+                ci_job_id_v2(
                     &TenantId(tenant.into()),
                     run_uuid,
+                    &job.stage,
                     &job.name,
                     &job.matrix_identity(),
                 ),
@@ -279,7 +412,7 @@ async fn assert_exact_jobs(admin: &PgPool, tenant: &str, run_id: &str) {
     assert_eq!(rows.len(), expected_plan.jobs.len());
     for (row, job) in rows.iter().zip(&expected_plan.jobs) {
         assert_eq!(row.0, ids[&job.name]);
-        assert_eq!(row.1, job.name, "v1 stage == concrete resolved name");
+        assert_eq!(row.1, job.stage, "V2 preserves authored stage identity");
         assert_eq!(row.2, job.name);
         assert_eq!(
             row.3,
@@ -288,7 +421,11 @@ async fn assert_exact_jobs(admin: &PgPool, tenant: &str, run_id: &str) {
         let expected_matrix =
             (!job.matrix_key.is_empty()).then(|| serde_json::to_value(&job.matrix_key).unwrap());
         assert_eq!(row.4, expected_matrix);
-        assert_eq!(row.5, snapshot, "v1 spec_ref is the whole plan CAS ref");
+        assert_eq!(
+            row.5,
+            ci_artifact_ref(tenant, &format!("drive-manifest-{manifest_digest}")).0,
+            "spec_ref binds the immutable drive manifest, not customer plan input"
+        );
         assert_eq!(row.6, "queued");
         assert_eq!(row.7, 1);
         assert_eq!(row.8, None);
@@ -358,19 +495,16 @@ async fn assert_run_ledger_index_is_used(admin: &PgPool, tenant: &str, run_id: &
 }
 
 async fn expected_input(admin: &PgPool, tenant: &str, run_id: &str) -> Vec<ArtifactRef> {
-    let snapshot: String = sqlx::query_scalar(
-        "SELECT definition_snapshot FROM ci_run WHERE tenant_id=$1 AND run_id=$2::uuid",
+    let digest: String = sqlx::query_scalar(
+        "SELECT manifest_digest FROM ci_drive_manifest WHERE tenant_id=$1 AND ci_run_id=$2::uuid",
     )
     .bind(tenant)
     .bind(run_id)
     .fetch_one(admin)
     .await
     .unwrap();
-    let address = snapshot
-        .strip_prefix(&format!("myelin://{tenant}/ci/snapshot/"))
-        .unwrap();
     vec![
-        ci_artifact_ref(tenant, &format!("snapshot-{address}")),
+        ci_artifact_ref(tenant, &format!("drive-manifest-{digest}")),
         ci_run_ref(tenant, run_id),
     ]
 }
@@ -378,25 +512,30 @@ async fn expected_input(admin: &PgPool, tenant: &str, run_id: &str) -> Vec<Artif
 async fn seed_exact_workflow(
     app: &PgPool,
     admin: &PgPool,
+    blobs: Arc<FsBlobStore>,
     tenant: &str,
     run_id: &str,
     wf_run_id: &str,
 ) {
+    starter(app, tenant, blobs)
+        .run_once()
+        .await
+        .expect("seed complete manifest-backed workflow through the real starter");
     let input = expected_input(admin, tenant, run_id).await;
-    let executor = flow_executor(app, tenant);
-    tokio::task::block_in_place(|| {
-        executor
-            .start_with_id(
-                StartSpec {
-                    wf_type: CI_PIPELINE_WF_TYPE.into(),
-                    input,
-                    budget: None,
-                    idem_key: format!("ci:{run_id}"),
-                },
-                Some(RunId(wf_run_id.into())),
-            )
-            .expect("seed exact workflow identity");
-    });
+    let actual: serde_json::Value =
+        sqlx::query_scalar("SELECT input FROM workflow_run WHERE tenant_id=$1 AND run_id=$2")
+            .bind(tenant)
+            .bind(wf_run_id)
+            .fetch_one(admin)
+            .await
+            .unwrap();
+    assert_eq!(actual, serde_json::to_value(input).unwrap());
+    sqlx::query("UPDATE ci_run SET state='queued' WHERE tenant_id=$1 AND run_id=$2::uuid")
+        .bind(tenant)
+        .bind(run_id)
+        .execute(admin)
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -425,7 +564,15 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .await
     .expect("flow migrations");
     admin.execute(CREATE_CI_RUN_DDL).await.expect("ci_run DDL");
+    sqlx::raw_sql(CREATE_CI_DRIVE_MANIFEST_DDL)
+        .execute(&admin)
+        .await
+        .expect("ci_drive_manifest DDL");
     admin.execute(CREATE_CI_JOB_DDL).await.expect("ci_job DDL");
+    admin
+        .execute(CREATE_CHECK_ATTEMPT_DDL)
+        .await
+        .expect("check_attempt DDL");
     admin
         .execute(CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL)
         .await
@@ -435,9 +582,17 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .await
         .expect("force RLS on ci_run");
     admin
+        .execute("SELECT myelin_make_tenant_scoped('ci_drive_manifest')")
+        .await
+        .expect("force RLS on ci_drive_manifest");
+    admin
         .execute("SELECT myelin_make_tenant_scoped('ci_job')")
         .await
         .expect("force RLS on ci_job");
+    admin
+        .execute("SELECT myelin_make_tenant_scoped('check_attempt')")
+        .await
+        .expect("force RLS on check_attempt");
     admin
         .execute(format!("GRANT USAGE ON SCHEMA {schema} TO myelin_app").as_str())
         .await
@@ -446,6 +601,10 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .execute(format!("GRANT ALL ON ALL TABLES IN SCHEMA {schema} TO myelin_app").as_str())
         .await
         .expect("grant tables");
+    admin
+        .execute("REVOKE UPDATE, DELETE ON ci_drive_manifest FROM myelin_app")
+        .await
+        .expect("manifest remains insert-only after broad test setup grant");
     let app = pool_on(&app_url(), &schema).await;
     let blobs = Arc::new(FsBlobStore::new());
 
@@ -456,11 +615,42 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
             .expect("register immutable workflow definition");
     });
 
+    // Production composition has no implicit runtime policy. A fresh V2 run is refused before any
+    // attempt, manifest, job, workflow, or lifecycle mutation when no authority adapter is wired.
+    let denied_run = "10000000-0000-0000-0000-0000000000d0";
+    let denied_wf = "20000000-0000-0000-0000-0000000000d0";
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        "tenant_no_authority",
+        denied_run,
+        denied_wf,
+    )
+    .await;
+    let denied = starter_without_authority(&app, "tenant_no_authority", blobs.clone())
+        .run_once()
+        .await
+        .expect_err("fresh V2 launch without explicit authority must fail closed");
+    assert!(denied
+        .to_string()
+        .contains("no policy-aware launch-authority"));
+    assert_atomic_started(&admin, "tenant_no_authority", denied_run, false, false).await;
+    let denied_side_effects: (i64, i64) = sqlx::query_as(
+        "SELECT
+           (SELECT count(*) FROM ci_drive_manifest WHERE tenant_id='tenant_no_authority'),
+           (SELECT count(*) FROM check_attempt WHERE tenant_id='tenant_no_authority')",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(denied_side_effects, (0, 0));
+
     // Two concurrent starters see one row. SKIP LOCKED lets one win and the other return idle;
     // there is exactly one workflow and the state transition cannot split from it.
     let run1 = "10000000-0000-0000-0000-000000000001";
     let wf1 = "20000000-0000-0000-0000-000000000001";
     insert_run(&admin, blobs.as_ref(), "tenant_a", run1, wf1).await;
+    AUTHORITY_CALLS.store(0, Ordering::SeqCst);
     let first = starter(&app, "tenant_a", blobs.clone());
     let second = starter(&app, "tenant_a", blobs.clone());
     let (a, b) = tokio::join!(first.run_once(), second.run_once());
@@ -485,6 +675,41 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     assert_eq!(visible_job_count(&app, "tenant_a", "fr-par").await, 3);
     assert_eq!(visible_job_count(&app, "tenant_empty", "fr-par").await, 0);
     assert_eq!(visible_job_count(&app, "tenant_a", "de-fra").await, 0);
+    let first_attempt_rows = attempt_rows(&admin, "tenant_a").await;
+    assert_eq!(
+        first_attempt_rows,
+        vec![
+            (
+                "ci:build".into(),
+                2,
+                Some(sqlx::types::Uuid::parse_str(run1).unwrap()),
+            ),
+            (
+                "ci:package".into(),
+                2,
+                Some(sqlx::types::Uuid::parse_str(run1).unwrap()),
+            ),
+            (
+                "ci:test".into(),
+                2,
+                Some(sqlx::types::Uuid::parse_str(run1).unwrap()),
+            ),
+        ],
+        "concurrent first launch allocates each authored context exactly once"
+    );
+    let run1_manifest_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ci_drive_manifest WHERE tenant_id='tenant_a' AND ci_run_id=$1::uuid",
+    )
+    .bind(run1)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(run1_manifest_count, 1);
+    assert_eq!(
+        AUTHORITY_CALLS.load(Ordering::SeqCst),
+        1,
+        "only the exact queued-row lock winner may invoke launch authority"
+    );
 
     // ── CT-004: the per-tenant starter COMPOSITION SEAM (`PgCiRunStarterFactory`) against the real
     // migrated schema — the exact router the service main composes at the root (dormant behind the
@@ -521,7 +746,10 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
             CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
         )
         .expect("mint the tenant A starter");
-    assert_eq!(a_starter.run_once().await.unwrap(), StartQueuedOutcome::Idle);
+    assert_eq!(
+        a_starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Idle
+    );
     assert_atomic_started(&admin, "tenant_factory_b", run_fb, false, false).await;
 
     // The B-minted starter starts B's run — proving the router binds each record to its own cell.
@@ -554,23 +782,16 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     assert_atomic_started(&admin, "tenant_a", run1, true, true).await;
     assert_exact_jobs(&admin, "tenant_a", run1).await;
 
-    // A divergent immutable field and a non-pristine lifecycle field are each refused before the
-    // queued split can commit. Restore the adversarial edit between probes, never through starter.
-    for (mutation, restore) in [
-        (
-            "UPDATE ci_job SET spec_ref='myelin://tenant_a/ci/snapshot/blake3:forged' \
+    // A divergent immutable field is refused before the queued split can commit. Restore the
+    // adversarial edit after the probe, never through the starter.
+    for (mutation, restore) in [(
+        "UPDATE ci_job SET spec_ref='myelin://tenant_a/ci/snapshot/blake3:forged' \
              WHERE tenant_id='tenant_a' AND run_id=$1::uuid AND name='package'",
-            "UPDATE ci_job SET spec_ref=(SELECT definition_snapshot FROM ci_run \
-             WHERE tenant_id='tenant_a' AND run_id=$1::uuid) \
+        "UPDATE ci_job SET spec_ref='myelin://tenant_a/ci/artifact/drive-manifest-' || \
+             (SELECT manifest_digest FROM ci_drive_manifest \
+              WHERE tenant_id='tenant_a' AND ci_run_id=$1::uuid) \
              WHERE tenant_id='tenant_a' AND run_id=$1::uuid AND name='package'",
-        ),
-        (
-            "UPDATE ci_job SET state='running' \
-             WHERE tenant_id='tenant_a' AND run_id=$1::uuid AND name='package'",
-            "UPDATE ci_job SET state='queued' \
-             WHERE tenant_id='tenant_a' AND run_id=$1::uuid AND name='package'",
-        ),
-    ] {
+    )] {
         sqlx::query(
             "UPDATE ci_run SET state='queued' WHERE tenant_id='tenant_a' AND run_id=$1::uuid",
         )
@@ -602,6 +823,50 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
             .await
             .unwrap();
     }
+
+    // Replay verifies immutable job authority but never rewinds legitimate lifecycle progress.
+    sqlx::query("UPDATE ci_run SET state='queued' WHERE tenant_id='tenant_a' AND run_id=$1::uuid")
+        .bind(run1)
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE ci_job SET state='running', attempt=2 \
+         WHERE tenant_id='tenant_a' AND run_id=$1::uuid AND name='package'",
+    )
+    .bind(run1)
+    .execute(&admin)
+    .await
+    .unwrap();
+    assert!(matches!(
+        starter_without_authority(&app, "tenant_a", blobs.clone())
+            .run_once()
+            .await
+            .expect("replay preserves advanced job lifecycle"),
+        StartQueuedOutcome::Started { .. }
+    ));
+    let advanced: (String, i32) = sqlx::query_as(
+        "SELECT state, attempt FROM ci_job \
+         WHERE tenant_id='tenant_a' AND run_id=$1::uuid AND name='package'",
+    )
+    .bind(run1)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(advanced, ("running".into(), 2));
+    sqlx::query(
+        "UPDATE ci_job SET state='queued', attempt=1 \
+         WHERE tenant_id='tenant_a' AND run_id=$1::uuid AND name='package'",
+    )
+    .bind(run1)
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE ci_run SET state='queued' WHERE tenant_id='tenant_a' AND run_id=$1::uuid")
+        .bind(run1)
+        .execute(&admin)
+        .await
+        .unwrap();
 
     // The run-id half of the exact SELECT catches an unexpected extra ledger row even though its
     // job id is not one of the derived ids.
@@ -659,9 +924,10 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     )
     .await;
     let build = &plan().jobs[0];
-    let colliding_id = ci_job_id_v1(
+    let colliding_id = ci_job_id_v2(
         &TenantId("tenant_job_collision".into()),
         sqlx::types::Uuid::parse_str(collision_run).unwrap(),
+        &build.stage,
         &build.name,
         &build.matrix_identity(),
     );
@@ -695,33 +961,65 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         "foreign owner survives the rolled-back victim start"
     );
 
-    // A new process can recover a legacy split where the workflow exists but ci_run remains queued:
-    // the idempotency winner is the pre-minted id and the restart only advances the durable row.
+    // A reconstructed starter repairs a manifest-backed lifecycle split without reallocating
+    // attempts or reconstructing authority from mutable inputs.
     let run2 = "10000000-0000-0000-0000-000000000002";
     let wf2 = "20000000-0000-0000-0000-000000000002";
     insert_run(&admin, blobs.as_ref(), "tenant_a", run2, wf2).await;
-    let restart_seed = flow_executor(&app, "tenant_a");
-    let restart_input = expected_input(&admin, "tenant_a", run2).await;
-    tokio::task::block_in_place(|| {
-        restart_seed
-            .start_with_id(
-                StartSpec {
-                    wf_type: CI_PIPELINE_WF_TYPE.into(),
-                    input: restart_input,
-                    budget: None,
-                    idem_key: format!("ci:{run2}"),
-                },
-                Some(RunId(wf2.into())),
-            )
-            .expect("seed pre-existing durable workflow");
-    });
-    let restarted = starter(&app, "tenant_a", blobs.clone());
+    starter(&app, "tenant_a", blobs.clone())
+        .run_once()
+        .await
+        .expect("create the complete manifest-backed start");
+    sqlx::query("UPDATE ci_run SET state='queued' WHERE tenant_id='tenant_a' AND run_id=$1::uuid")
+        .bind(run2)
+        .execute(&admin)
+        .await
+        .unwrap();
+    let attempts_after_run2 = attempt_rows(&admin, "tenant_a").await;
+    assert!(attempts_after_run2.iter().all(|(_, next, current)| {
+        *next == 3 && *current == Some(sqlx::types::Uuid::parse_str(run2).unwrap())
+    }));
+    let source_hash = ContentHash::blake3(&plan().canonical_bytes().unwrap());
+    blobs
+        .delete(&TenantId("tenant_a".into()), &source_hash)
+        .expect("remove source CAS after manifest commit");
+    let restarted = starter_without_authority_with(
+        &app,
+        "tenant_a",
+        blobs.clone(),
+        CiWorkflowDefinitionPin::new(99, "blake3:not-the-frozen-pin").unwrap(),
+    );
     assert!(matches!(
-        restarted.run_once().await.expect("restart pass"),
+        restarted
+            .run_once()
+            .await
+            .expect("manifest replay ignores unavailable CAS and mutable composition pin"),
         StartQueuedOutcome::Started { ref wf_run_id, .. } if wf_run_id == wf2
     ));
     assert_atomic_started(&admin, "tenant_a", run2, true, true).await;
     assert_exact_jobs(&admin, "tenant_a", run2).await;
+
+    // Retry an older frozen manifest after a newer run has superseded all three contexts. Replay
+    // neither consults today's unavailable authority nor moves the monotonic attempt ledger back to
+    // the old run (or forward again).
+    sqlx::query("UPDATE ci_run SET state='queued' WHERE tenant_id='tenant_a' AND run_id=$1::uuid")
+        .bind(run1)
+        .execute(&admin)
+        .await
+        .unwrap();
+    assert!(matches!(
+        starter_without_authority(&app, "tenant_a", blobs.clone())
+            .run_once()
+            .await
+            .expect("old immutable manifest replays without current policy"),
+        StartQueuedOutcome::Started { ref wf_run_id, .. } if wf_run_id == wf1
+    ));
+    assert_eq!(
+        attempt_rows(&admin, "tenant_a").await,
+        attempts_after_run2,
+        "exact replay never reallocates or supersedes check attempts"
+    );
+    assert_exact_jobs(&admin, "tenant_a", run1).await;
 
     // A failure after workflow insertion (the trigger rejects the lifecycle CAS) rolls the workflow
     // back too. No queued->running row can exist without its workflow.
@@ -745,6 +1043,146 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .await
         .is_err());
     assert_atomic_started(&admin, "tenant_rollback", run3, false, false).await;
+    let rolled_back_side_effects: (i64, i64) = sqlx::query_as(
+        "SELECT
+           (SELECT count(*) FROM ci_drive_manifest WHERE tenant_id='tenant_rollback'),
+           (SELECT count(*) FROM check_attempt WHERE tenant_id='tenant_rollback')",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        rolled_back_side_effects,
+        (0, 0),
+        "manifest and attempt allocation roll back with workflow, jobs, and state"
+    );
+
+    // A manifest and workflow are an atomic replay pair. An orphan manifest is corruption and must
+    // not invoke current authority or synthesize a replacement workflow.
+    let orphan_run = "10000000-0000-0000-0000-0000000000a1";
+    let orphan_wf = "20000000-0000-0000-0000-0000000000a1";
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        "tenant_orphan_manifest",
+        orphan_run,
+        orphan_wf,
+    )
+    .await;
+    starter(&app, "tenant_orphan_manifest", blobs.clone())
+        .run_once()
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM workflow_run WHERE tenant_id='tenant_orphan_manifest' AND run_id=$1")
+        .bind(orphan_wf)
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE ci_run SET state='queued' \
+         WHERE tenant_id='tenant_orphan_manifest' AND run_id=$1::uuid",
+    )
+    .bind(orphan_run)
+    .execute(&admin)
+    .await
+    .unwrap();
+    let calls_before_orphan = AUTHORITY_CALLS.load(Ordering::SeqCst);
+    assert!(
+        starter_without_authority(&app, "tenant_orphan_manifest", blobs.clone())
+            .run_once()
+            .await
+            .expect_err("manifest without workflow must fail closed")
+            .to_string()
+            .contains("without its atomically-started workflow")
+    );
+    assert_eq!(AUTHORITY_CALLS.load(Ordering::SeqCst), calls_before_orphan);
+
+    // Frozen attempts are checked against the live monotonic ledger. Removing one context makes
+    // replay fail before any workflow/job/lifecycle mutation.
+    let attempt_run = "10000000-0000-0000-0000-0000000000a2";
+    let attempt_wf = "20000000-0000-0000-0000-0000000000a2";
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        "tenant_attempt_tamper",
+        attempt_run,
+        attempt_wf,
+    )
+    .await;
+    starter(&app, "tenant_attempt_tamper", blobs.clone())
+        .run_once()
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE ci_run SET state='queued' \
+         WHERE tenant_id='tenant_attempt_tamper' AND run_id=$1::uuid",
+    )
+    .bind(attempt_run)
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "DELETE FROM check_attempt WHERE tenant_id='tenant_attempt_tamper' AND context='ci:test'",
+    )
+    .execute(&admin)
+    .await
+    .unwrap();
+    assert!(
+        starter_without_authority(&app, "tenant_attempt_tamper", blobs.clone())
+            .run_once()
+            .await
+            .expect_err("missing attempt allocation must fail closed")
+            .to_string()
+            .contains("has no allocation ledger")
+    );
+    assert_manifest_backed_queued(&admin, "tenant_attempt_tamper", attempt_run).await;
+
+    // Replay requires the complete immutable ci_job ledger and never repairs a missing row.
+    let missing_job_run = "10000000-0000-0000-0000-0000000000a3";
+    let missing_job_wf = "20000000-0000-0000-0000-0000000000a3";
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        "tenant_missing_job",
+        missing_job_run,
+        missing_job_wf,
+    )
+    .await;
+    starter(&app, "tenant_missing_job", blobs.clone())
+        .run_once()
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE ci_run SET state='queued' \
+         WHERE tenant_id='tenant_missing_job' AND run_id=$1::uuid",
+    )
+    .bind(missing_job_run)
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(
+        "DELETE FROM ci_job WHERE tenant_id='tenant_missing_job' AND run_id=$1::uuid AND name='package'",
+    )
+    .bind(missing_job_run)
+    .execute(&admin)
+    .await
+    .unwrap();
+    assert!(
+        starter_without_authority(&app, "tenant_missing_job", blobs.clone())
+            .run_once()
+            .await
+            .expect_err("missing replay job must not be repaired")
+            .to_string()
+            .contains("has 2 rows")
+    );
+    let still_missing: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ci_job WHERE tenant_id='tenant_missing_job' AND run_id=$1::uuid",
+    )
+    .bind(missing_job_run)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(still_missing, 2);
 
     // A pre-minted run-id collision cannot clobber the foreign workflow and leaves ci_run queued.
     let run4 = "10000000-0000-0000-0000-000000000004";
@@ -825,21 +1263,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     let run8 = "10000000-0000-0000-0000-000000000008";
     let wf8 = "20000000-0000-0000-0000-000000000008";
     insert_run(&admin, blobs.as_ref(), "tenant_terminal", run8, wf8).await;
-    let terminal_input = expected_input(&admin, "tenant_terminal", run8).await;
-    let terminal = flow_executor(&app, "tenant_terminal");
-    tokio::task::block_in_place(|| {
-        terminal
-            .start_with_id(
-                StartSpec {
-                    wf_type: CI_PIPELINE_WF_TYPE.into(),
-                    input: terminal_input,
-                    budget: None,
-                    idem_key: format!("ci:{run8}"),
-                },
-                Some(RunId(wf8.into())),
-            )
-            .expect("seed exact workflow before terminalization");
-    });
+    seed_exact_workflow(&app, &admin, blobs.clone(), "tenant_terminal", run8, wf8).await;
     sqlx::query(
         "UPDATE workflow_run SET state='completed' \
          WHERE tenant_id='tenant_terminal' AND region='fr-par' AND run_id=$1",
@@ -852,7 +1276,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .run_once()
         .await
         .is_err());
-    assert_atomic_started(&admin, "tenant_terminal", run8, false, true).await;
+    assert_manifest_backed_queued(&admin, "tenant_terminal", run8).await;
 
     // Hold ID/key/input fixed and mutate every other starter-owned immutable workflow column in an
     // isolated tenant. Each row is genuinely claimed and rejected by the post-start identity proof.
@@ -902,7 +1326,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     ];
     for (tenant, run_id, wf_run_id, mutation) in immutable_mutations {
         insert_run(&admin, blobs.as_ref(), tenant, run_id, wf_run_id).await;
-        seed_exact_workflow(&app, &admin, tenant, run_id, wf_run_id).await;
+        seed_exact_workflow(&app, &admin, blobs.clone(), tenant, run_id, wf_run_id).await;
         sqlx::query(mutation)
             .bind(tenant)
             .bind(wf_run_id)
@@ -914,7 +1338,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
             .await
             .expect_err("divergent immutable workflow identity must be refused");
         assert!(error.to_string().contains("diverges"));
-        assert_atomic_started(&admin, tenant, run_id, false, true).await;
+        assert_manifest_backed_queued(&admin, tenant, run_id).await;
     }
 
     // The typed code pin is load-bearing even when the version number matches.
@@ -1078,6 +1502,7 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     seed_exact_workflow(
         &app,
         &admin,
+        blobs.clone(),
         "tenant_draining_replay",
         run_draining,
         wf_draining,
