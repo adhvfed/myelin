@@ -22,6 +22,7 @@
 //!     --test integration_ci_ct004f_durable_log_persist -- --nocapture
 #![cfg(feature = "integration")]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use myelin_ci_controlplane::{
@@ -43,14 +44,19 @@ fn app_url() -> String {
 fn admin_url() -> String {
     app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
+static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
 fn schema_name() -> String {
-    format!("ci_ct004f_{}", std::process::id())
+    format!(
+        "ci_ct004f_{}_{}",
+        std::process::id(),
+        SCHEMA_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// A pool whose connections pin `search_path` to the per-pid schema (so the store's UNQUALIFIED
 /// `log_segment`/`log_anchor` resolve to the isolated tables; `public` follows for the RLS helper).
-async fn pool(url: &str) -> sqlx::PgPool {
-    let schema = schema_name();
+async fn pool(url: &str, schema: &str) -> sqlx::PgPool {
+    let schema = schema.to_owned();
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
         .after_connect(move |conn, _meta| {
@@ -86,8 +92,7 @@ fn uid(name: &str) -> String {
 
 /// Fresh per-pid schema + the REAL CI durable migrations (log_segment/log_anchor with FORCE-RLS) +
 /// grants so the RLS-enforced app role can exercise the tenant-scoped write.
-async fn setup_schema(admin: &sqlx::PgPool) {
-    let schema = schema_name();
+async fn setup_schema(admin: &sqlx::PgPool, schema: &str) {
     admin
         .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
         .await
@@ -126,6 +131,15 @@ async fn setup_schema(admin: &sqlx::PgPool) {
         )
         .await
         .expect("grant table access to app");
+}
+
+async fn cleanup_schema(admin: sqlx::PgPool, app: sqlx::PgPool, schema: &str) {
+    app.close().await;
+    admin
+        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .expect("drop isolated log-persist schema");
+    admin.close().await;
 }
 
 /// Read back the `(segment_count, anchor_status, anchor_byte_end, dangling)` for a run/job, as the
@@ -192,9 +206,10 @@ async fn outbox_count(app: &sqlx::PgPool, run: &str, job: &str) -> i64 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn live_log_path_writes_the_index_through_the_tenant_scoped_store() {
-    let admin = pool(&admin_url()).await;
-    setup_schema(&admin).await;
-    let app = pool(&app_url()).await;
+    let schema = schema_name();
+    let admin = pool(&admin_url(), &schema).await;
+    setup_schema(&admin, &schema).await;
+    let app = pool(&app_url(), &schema).await;
 
     let tenant = TenantId::from_token("acme-ct004f");
     let region = Region::new("fr-par");
@@ -231,13 +246,15 @@ async fn live_log_path_writes_the_index_through_the_tenant_scoped_store() {
         outbox_count(&app, &run, &job).await >= 1,
         "a ci.log.available pointer landed in the outbox (co-committed with the index)"
     );
+    cleanup_schema(admin, app, &schema).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
-    let admin = pool(&admin_url()).await;
-    setup_schema(&admin).await;
-    let app = pool(&app_url()).await;
+    let schema = schema_name();
+    let admin = pool(&admin_url(), &schema).await;
+    setup_schema(&admin, &schema).await;
+    let app = pool(&app_url(), &schema).await;
 
     let tenant = TenantId::from_token("acme-ct004f-idem");
     let region = Region::new("fr-par");
@@ -300,6 +317,7 @@ async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
         "re-delivery did NOT duplicate ci.log.available outbox rows"
     );
     assert!(!flushed.pointers.is_empty(), "the flush produced at least one pointer");
+    cleanup_schema(admin, app, &schema).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -308,9 +326,10 @@ async fn byte_budget_coalesce_pointer_without_a_seal_persists() {
     // before a segment seals, so the drained set at finish carries a pointer that names a byte range
     // with NO sealed-segment ref. This path is reachable via the real sink (drain_pointers returns
     // ALL buffered pointers at finish) but was previously unexercised end-to-end (verifier gap).
-    let admin = pool(&admin_url()).await;
-    setup_schema(&admin).await;
-    let app = pool(&app_url()).await;
+    let schema = schema_name();
+    let admin = pool(&admin_url(), &schema).await;
+    setup_schema(&admin, &schema).await;
+    let app = pool(&app_url(), &schema).await;
 
     let tenant = TenantId::from_token("acme-ct004f-coalesce");
     let region = Region::new("fr-par");
@@ -371,4 +390,5 @@ async fn byte_budget_coalesce_pointer_without_a_seal_persists() {
         read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
     assert_eq!(status, "passed", "the anchor closed even with no sealed segment");
     assert!(byte_end.is_some());
+    cleanup_schema(admin, app, &schema).await;
 }
