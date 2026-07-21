@@ -699,6 +699,24 @@ load_resolved_run_plan` REFUSES V2 with `RunPlanError::LaunchAuthorityRequired` 
 authority is materialized; legacy V1 call sites are byte-identical-preserved. Honest state: V2 is an
 authored forward contract, NOT an active execution path; no V1-removal is scheduled.
 
+**CI claim-bound completion authority (2026-07-21, `e594d34` + `00f9bf0`).** The three completion
+blockers from the dormant CT-004d driver are closed without activating V2. `PgFlowExecutor` now exposes
+a scope-verifying caller-transaction typed-signal seam; `CiPipelineReporter` uses it to verify the
+co-persisted dispatch identity, consume the exact `(owner, epoch, fresh UUID nonce, durable stage)`
+claim, and buffer canonical `CiJobDone` in one tenant-scoped PostgreSQL commit. The v2 receipt binds
+tenant/region/run/job/idem/stage/verdict/ordered result refs/owner/epoch/nonce; invalid refs are refused
+and roll the claim transition back (none are silently filtered). Runner authority travels as one typed
+`CompletionClaim`. Historical NULL-stage rows are never silently quarantined: the least-privilege
+region-scheduler capability counts `job_queue.stage IS NULL`, and the production activation seam refuses
+while any non-terminal backlog remains. Migration immutability is probe-pinned: shipped `ci_0004a` and
+`ci_0016a` DDL remain byte-identical; new nonce/stage and nonce-grant work is forward-only under
+`ci_0004b`/`ci_0016b`. Proof: 361 control-plane unit tests; 121 sandbox unit tests; all-feature clippy;
+732-file CI lint scan at zero; live migration-upgrade + constrained scheduler-boundary + claim/reap/
+kill-9 suites; and the full live-PG culmination (both adversarial completion cases and a real `runsc`
+guest pipeline) green. **Honest remaining floor:** start/signal are PG-durable, but body drive still
+mirrors through the in-memory dispatcher; V2 launch and `MYELIN_CI_RUNNER=1` remain fail-closed until
+`PgFlowDriveStore` lease/replay and the existing launch-authority floors are composed end to end.
+
 ## R5–R6
 
 | Phase | Status |
