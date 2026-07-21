@@ -9,12 +9,6 @@
     "node": ">=22",
     "pnpm": ">=10"
   },
-  "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"],
-    "overrides": {
-      "h3": "1.15.11"
-    }
-  },
   "scripts": {
     "build": "pnpm -r build",
     "lint": "pnpm -r lint",
