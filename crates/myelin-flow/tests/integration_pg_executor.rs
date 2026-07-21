@@ -5,7 +5,7 @@ use myelin_config::MyelinConfig;
 use myelin_events::{ConsumerName, DedupLedger, DurableDedup, EventId, HandlerTx, MonotonicMinter};
 use myelin_flow::{
     migrations::migrations, DurableExecutor, ExecutorError, PgFlowExecutor, RunId, SignalOutcome,
-    SignalSpec, StartSpec,
+    SignalPayload, SignalSpec, StartSpec, TypedSignalSpec,
 };
 use myelin_refs::ArtifactRef;
 use myelin_storage::{
@@ -61,6 +61,35 @@ fn start_spec(idem_key: &str) -> StartSpec {
     }
 }
 
+fn typed_job_done(run: &RunId, idem_key: &str, passed: bool) -> TypedSignalSpec {
+    TypedSignalSpec {
+        run: run.clone(),
+        signal_name: "job.done".into(),
+        idem_key: idem_key.into(),
+        payload: SignalPayload::CiJobDone {
+            stage: "build".into(),
+            passed,
+            result_refs: vec![ArtifactRef("myelin://acme/ci/artifact/result-build".into())],
+        },
+        payload_key_ref: None,
+    }
+}
+
+async fn scope_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: &str,
+    region: &str,
+) {
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .execute(&mut **transaction)
+    .await
+    .expect("scope caller transaction");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_tenant_reads() {
     let bare = sqlx::postgres::PgPoolOptions::new()
@@ -85,6 +114,12 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
     PgMigrator::apply_validated(&pool, &migrations(), &HotTables::declare(["workflow_run"]))
         .await
         .expect("apply the real flow migrations");
+    sqlx::query(
+        "CREATE TABLE completion_claim_probe (claim_id text PRIMARY KEY, disposition text NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("create caller-transaction proof table");
 
     let first_process = executor(&pool, "acme");
     tokio::task::block_in_place(|| {
@@ -305,6 +340,138 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
     .expect("count idempotent starts");
     assert_eq!(count, 1, "restart/re-delivery creates exactly one run");
 
+    // The typed completion seam can join a caller-owned state transition on the exact same
+    // transaction. An unscoped connection is refused even through the admin pool; rollback removes
+    // BOTH the caller's claim disposition and the workflow signal/wake; commit makes BOTH visible.
+    let mut unscoped = pool.begin().await.expect("begin unscoped caller tx");
+    let unscoped_error = restarted
+        .signal_typed_on_conn(
+            &mut unscoped,
+            typed_job_done(&run, "typed-job-unscoped", true),
+        )
+        .await
+        .expect_err("an unscoped caller transaction must fail closed");
+    assert!(matches!(
+        unscoped_error,
+        ExecutorError::Storage(message) if message.contains("not scoped")
+    ));
+    unscoped.rollback().await.expect("rollback unscoped probe");
+
+    sqlx::query(
+        "UPDATE workflow_run SET state = 'waiting' WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+    )
+    .bind("acme")
+    .bind("fr-par")
+    .bind(&run.0)
+    .execute(&pool)
+    .await
+    .expect("park the run for caller-tx rollback proof");
+    let mut rolled_back = pool.begin().await.expect("begin completion rollback tx");
+    scope_transaction(&mut rolled_back, "acme", "fr-par").await;
+    sqlx::query(
+        "INSERT INTO completion_claim_probe (claim_id, disposition) VALUES ('claim-rollback', 'terminal')",
+    )
+    .execute(&mut *rolled_back)
+    .await
+    .expect("stage caller-owned claim disposition");
+    assert_eq!(
+        restarted
+            .signal_typed_on_conn(
+                &mut rolled_back,
+                typed_job_done(&run, "typed-job-rollback", true),
+            )
+            .await
+            .expect("stage typed signal on caller tx"),
+        SignalOutcome::Buffered
+    );
+    rolled_back
+        .rollback()
+        .await
+        .expect("roll back claim and signal together");
+    let rollback_counts: (i64, i64) = (
+        sqlx::query_scalar(
+            "SELECT count(*) FROM completion_claim_probe WHERE claim_id = 'claim-rollback'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        sqlx::query_scalar(
+            "SELECT count(*) FROM wf_signal WHERE tenant_id = 'acme' AND region = 'fr-par' \
+             AND run_id = $1 AND idem_key = 'typed-job-rollback'",
+        )
+        .bind(&run.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        rollback_counts,
+        (0, 0),
+        "caller rollback persists neither side"
+    );
+    let rolled_back_state: String = sqlx::query_scalar(
+        "SELECT state FROM workflow_run WHERE tenant_id = 'acme' AND region = 'fr-par' AND run_id = $1",
+    )
+    .bind(&run.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rolled_back_state, "waiting",
+        "the rolled-back signal did not wake the run"
+    );
+
+    let mut committed = pool.begin().await.expect("begin completion commit tx");
+    scope_transaction(&mut committed, "acme", "fr-par").await;
+    sqlx::query(
+        "INSERT INTO completion_claim_probe (claim_id, disposition) VALUES ('claim-commit', 'terminal')",
+    )
+    .execute(&mut *committed)
+    .await
+    .expect("stage committed claim disposition");
+    assert_eq!(
+        restarted
+            .signal_typed_on_conn(
+                &mut committed,
+                typed_job_done(&run, "typed-job-commit", true),
+            )
+            .await
+            .expect("stage committed typed signal"),
+        SignalOutcome::Buffered
+    );
+    committed
+        .commit()
+        .await
+        .expect("commit claim and signal together");
+    let commit_counts: (i64, i64) = (
+        sqlx::query_scalar(
+            "SELECT count(*) FROM completion_claim_probe WHERE claim_id = 'claim-commit'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        sqlx::query_scalar(
+            "SELECT count(*) FROM wf_signal WHERE tenant_id = 'acme' AND region = 'fr-par' \
+             AND run_id = $1 AND idem_key = 'typed-job-commit'",
+        )
+        .bind(&run.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+    );
+    assert_eq!(commit_counts, (1, 1), "caller commit persists both sides");
+    let committed_state: String = sqlx::query_scalar(
+        "SELECT state FROM workflow_run WHERE tenant_id = 'acme' AND region = 'fr-par' AND run_id = $1",
+    )
+    .bind(&run.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        committed_state, "running",
+        "the committed signal woke the run"
+    );
+
     sqlx::query(
         "UPDATE workflow_run SET state = 'waiting' WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
     )
@@ -421,7 +588,8 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
         .expect_err("a divergent-payload redelivery to a terminal run is surfaced, not a no-op");
     assert!(matches!(divergent_err, ExecutorError::InvalidInput(m) if m.contains("divergent")));
     let signal_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wf_signal WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+        "SELECT count(*) FROM wf_signal WHERE tenant_id = $1 AND region = $2 AND run_id = $3 \
+         AND signal_name = 'job.done' AND idem_key = 'job-token-1'",
     )
     .bind("acme")
     .bind("fr-par")
