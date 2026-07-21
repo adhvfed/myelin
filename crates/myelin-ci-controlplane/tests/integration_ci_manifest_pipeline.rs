@@ -1,0 +1,496 @@
+//! Live PostgreSQL proof for immutable-manifest resolution and DAG replay.
+#![cfg(feature = "integration")]
+
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use myelin_ci_controlplane::{
+    ci_controlplane_hot_tables, ci_controlplane_migrations, drive_resolved_ci_manifest_pipeline,
+    register_ci_manifest_pipeline, CiExecutionProfileV1, CiExecutionRequestV1,
+    CiJobLaunchGrantV1, CiLaunchAuthorityError, CiLaunchAuthorityMaterializer,
+    CiLaunchAuthorityV1, CiManifestInputResolver, CiManifestLaneV1, CiManifestLimitsV1,
+    CiManifestSchedulingV1, CiWorkflowDefinitionPin, PgCiPipelineStarter, PreparedRunPlanV2,
+    ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
+};
+use myelin_config::MyelinConfig;
+use myelin_events::{Actor, IdMinter, MonotonicMinter};
+use myelin_flow::{
+    migrations::migrations as flow_migrations, partition_for_run_id, DurableExecutor, JobRunner,
+    JobSpec, PgClaimedDriveInput, PgFlowExecutor, PgFlowWorker,
+    PgInputResolveError, PgResolvedDriveInput, PgRunOnceOutcome, PgWorkerError, PgWorkerScope,
+    PgWorkflowInputResolver, RunId, SignalPayload, TypedSignalSpec, CI_PIPELINE_WF_TYPE,
+};
+use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
+use myelin_storage::{
+    provider::foundation_migrations, BlobStore, FsBlobStore, HotTables, PgMigrator,
+};
+use myelin_tenancy::{Region, TenantId};
+use sqlx::{Executor, PgPool};
+
+const TENANT: &str = "manifest_dag";
+const REGION: &str = "fr-par";
+const CI_RUN_ID: &str = "41000000-0000-8000-8000-000000000001";
+const WF_RUN_ID: &str = "42000000-0000-8000-8000-000000000001";
+const BODY_HASH: &str = "blake3:ci-manifest-dag-body-v1";
+
+fn admin_url() -> String {
+    std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| MyelinConfig::dev().database_url)
+        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
+}
+
+async fn pool_on(schema: &str) -> PgPool {
+    let schema = schema.to_owned();
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(16)
+        .after_connect(move |connection, _| {
+            let schema = schema.clone();
+            Box::pin(async move {
+                connection
+                    .execute(format!("SET search_path TO {schema}, public").as_str())
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&admin_url())
+        .await
+        .expect("connect live PostgreSQL")
+}
+
+fn plan() -> ResolvedRunPlanV2 {
+    ResolvedRunPlanV2 {
+        schema_version: 2,
+        execution: CiExecutionRequestV1 {
+            schema_version: 1,
+            profile: CiExecutionProfileV1::LinuxSmallV1,
+        },
+        jobs: vec![
+            ResolvedJobV2 {
+                stage: "build".into(),
+                name: "build".into(),
+                image: format!("registry.example/build@sha256:{}", "a".repeat(64)),
+                command: vec!["/bin/build".into()],
+                needs: Vec::new(),
+                is_generator: false,
+                matrix_key: BTreeMap::new(),
+            },
+            ResolvedJobV2 {
+                stage: "package".into(),
+                name: "package".into(),
+                image: format!("registry.example/package@sha256:{}", "b".repeat(64)),
+                command: vec!["/bin/package".into()],
+                needs: vec!["build".into(), "test".into()],
+                is_generator: false,
+                matrix_key: BTreeMap::new(),
+            },
+            ResolvedJobV2 {
+                stage: "test".into(),
+                name: "test".into(),
+                image: format!("registry.example/test@sha256:{}", "c".repeat(64)),
+                command: vec!["/bin/test".into()],
+                needs: Vec::new(),
+                is_generator: false,
+                matrix_key: BTreeMap::new(),
+            },
+        ],
+    }
+}
+
+#[derive(Clone)]
+struct TestAuthority;
+
+impl CiLaunchAuthorityMaterializer for TestAuthority {
+    fn materialize<'a>(
+        &'a self,
+        record: &'a myelin_ci_controlplane::ci_run_store::CiRunRecord,
+        prepared: &'a PreparedRunPlanV2,
+        _definition: &'a CiWorkflowDefinitionPin,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<CiLaunchAuthorityV1, CiLaunchAuthorityError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Ok(CiLaunchAuthorityV1 {
+                policy_revision: "test-policy-v1".into(),
+                jobs: prepared
+                    .plan()
+                    .jobs
+                    .iter()
+                    .map(|job| CiJobLaunchGrantV1 {
+                        concrete_name: job.name.clone(),
+                        env: BTreeMap::new(),
+                        secret_handles: BTreeMap::new(),
+                        egress_allow: Vec::new(),
+                        limits: CiManifestLimitsV1 {
+                            cpu_millis: 1_000,
+                            mem_bytes: 1_073_741_824,
+                            disk_bytes: 2_147_483_648,
+                            pids_max: 128,
+                            timeout_secs: 600,
+                        },
+                        scheduling: CiManifestSchedulingV1 {
+                            lane: CiManifestLaneV1::Batch,
+                            labels: vec!["linux".into()],
+                            concurrency_group: None,
+                            fair_key: format!("project:{}", record.project_id),
+                        },
+                        reserve_handle: format!("reserve:{}", record.run_id),
+                        token_authority_handle: format!("mint:{}", record.run_id),
+                    })
+                    .collect(),
+                merge_waiter: None,
+            })
+        })
+    }
+}
+
+#[derive(Default)]
+struct RecordingRunner {
+    specs: Mutex<Vec<JobSpec>>,
+}
+
+impl JobRunner for RecordingRunner {
+    fn dispatch(&self, spec: &JobSpec) -> Result<(), myelin_flow::ActivityError> {
+        self.specs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(spec.clone());
+        Ok(())
+    }
+}
+
+impl RecordingRunner {
+    fn specs(&self) -> Vec<JobSpec> {
+        self.specs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
+#[derive(Clone)]
+struct RetryOnceResolver {
+    inner: CiManifestInputResolver,
+    attempts: Arc<AtomicUsize>,
+}
+
+impl PgWorkflowInputResolver for RetryOnceResolver {
+    fn resolve(
+        &self,
+        input: PgClaimedDriveInput,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, PgInputResolveError>> + Send + '_>> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            Box::pin(async {
+                Err(PgInputResolveError::Retry(
+                    "injected manifest-store outage".into(),
+                ))
+            })
+        } else {
+            self.inner.resolve(input)
+        }
+    }
+}
+
+fn definition() -> CiWorkflowDefinitionPin {
+    CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap()
+}
+
+fn worker(pool: &PgPool, name: &str) -> PgFlowWorker {
+    let scope = PgWorkerScope::new(
+        TenantId(TENANT.into()),
+        Region(REGION.into()),
+        partition_for_run_id(WF_RUN_ID),
+        name,
+        60,
+        Actor(Principal::new(
+            TenantId(TENANT.into()),
+            Region(REGION.into()),
+            PrincipalId("ci-controlplane".into()),
+            PrincipalKind::Service,
+            DataRole::Processor,
+            PrincipalStatus::Active,
+        )),
+        1,
+    )
+    .unwrap();
+    let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+    PgFlowWorker::new(
+        pool.clone(),
+        tokio::runtime::Handle::current(),
+        minter,
+        scope,
+    )
+}
+
+fn resolver(pool: &PgPool) -> CiManifestInputResolver {
+    CiManifestInputResolver::new(
+        pool.clone(),
+        TenantId(TENANT.into()),
+        Region(REGION.into()),
+        definition(),
+    )
+    .unwrap()
+}
+
+fn signal(pool: &PgPool, token: &str, name: &str, received_order: usize) {
+    let executor = PgFlowExecutor::new(
+        pool.clone(),
+        tokio::runtime::Handle::current(),
+        Arc::new(MonotonicMinter::new()),
+        TenantId(TENANT.into()),
+        Region(REGION.into()),
+    );
+    tokio::task::block_in_place(|| {
+        executor.signal_typed(TypedSignalSpec {
+            run: RunId(WF_RUN_ID.into()),
+            signal_name: myelin_flow::JOB_DONE_SIGNAL.into(),
+            idem_key: token.into(),
+            payload: SignalPayload::CiJobDone {
+                stage: name.into(),
+                passed: true,
+                result_refs: Vec::new(),
+            },
+            payload_key_ref: None,
+        })
+    })
+    .unwrap_or_else(|error| panic!("deliver completion {received_order}: {error:?}"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
+    let schema = format!("ci_manifest_dag_{}", std::process::id());
+    let bare = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url())
+        .await
+        .unwrap();
+    bare.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .unwrap();
+    bare.execute(format!("CREATE SCHEMA {schema}").as_str())
+        .await
+        .unwrap();
+    let pool = pool_on(&schema).await;
+    PgMigrator::apply(&pool, &foundation_migrations())
+        .await
+        .unwrap();
+    PgMigrator::apply_validated(
+        &pool,
+        &flow_migrations(),
+        &HotTables::declare(["workflow_run"]),
+    )
+    .await
+    .unwrap();
+    PgMigrator::apply_validated(
+        &pool,
+        &ci_controlplane_migrations(),
+        &ci_controlplane_hot_tables(),
+    )
+    .await
+    .unwrap();
+
+    let register = PgFlowExecutor::new(
+        pool.clone(),
+        tokio::runtime::Handle::current(),
+        Arc::new(MonotonicMinter::new()),
+        TenantId(TENANT.into()),
+        Region(REGION.into()),
+    );
+    tokio::task::block_in_place(|| {
+        register
+            .register_definition(CI_PIPELINE_WF_TYPE, 1, BODY_HASH)
+            .unwrap()
+    });
+
+    let blobs = Arc::new(FsBlobStore::new());
+    let plan_bytes = plan().canonical_bytes().unwrap();
+    let snapshot = blobs
+        .put(&TenantId(TENANT.into()), &plan_bytes)
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO ci_run (tenant_id, region, run_id, project_id, pipeline_id, wf_run_id, \
+         repo_ref, commit_oid, cause_event_id, cause_depth, caused_by, definition_snapshot, \
+         trigger_kind, trust_tier, state, correlation_id) \
+         VALUES ($1,$2,$3::uuid,'43000000-0000-8000-8000-000000000001'::uuid, \
+         '44000000-0000-8000-8000-000000000001'::uuid,$4::uuid, \
+         'myelin://manifest_dag/git/repo/core','deadbeef','trigger-manifest-dag',1, \
+         'session:test',$5,'push','trusted','queued','corr-manifest-dag')",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(CI_RUN_ID)
+    .bind(WF_RUN_ID)
+    .bind(format!(
+        "myelin://{TENANT}/ci/snapshot/{}",
+        snapshot.to_multihash_string()
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let starter = PgCiPipelineStarter::new_with_authority(
+        pool.clone(),
+        tokio::runtime::Handle::current(),
+        Arc::new(MonotonicMinter::new()),
+        TenantId(TENANT.into()),
+        Region(REGION.into()),
+        blobs,
+        definition(),
+        Arc::new(TestAuthority),
+    )
+    .unwrap();
+    assert!(matches!(
+        starter.run_once().await.unwrap(),
+        StartQueuedOutcome::Started { .. }
+    ));
+
+    let runner = Arc::new(RecordingRunner::default());
+    let mut first = worker(&pool, "worker-retry");
+    let flaky = RetryOnceResolver {
+        inner: resolver(&pool),
+        attempts: Arc::new(AtomicUsize::new(0)),
+    };
+    let body_runner = Arc::clone(&runner);
+    first
+        .register_definition_with_input_resolver(
+            CI_PIPELINE_WF_TYPE,
+            1,
+            BODY_HASH,
+            flaky,
+            move |input: &PgResolvedDriveInput, ctx| {
+                drive_resolved_ci_manifest_pipeline(input, ctx, body_runner.as_ref())
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        first
+            .run_once(1_784_667_600, "2026-07-21T21:00:00Z")
+            .await,
+        Err(PgWorkerError::InputUnavailable(ref detail))
+            if detail == "injected manifest-store outage"
+    ));
+    let unchanged: (String, i64, Option<String>, i64) = sqlx::query_as(
+        "SELECT state, cursor, lease_owner, \
+         (SELECT count(*) FROM wf_history WHERE tenant_id=$1 AND region=$2 AND run_id=$3) \
+         FROM workflow_run WHERE tenant_id=$1 AND region=$2 AND run_id=$3",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(WF_RUN_ID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unchanged, ("running".into(), 0, None, 0));
+    drop(first);
+
+    let mut roots_worker = worker(&pool, "worker-roots");
+    register_ci_manifest_pipeline(&mut roots_worker, resolver(&pool), Arc::clone(&runner)).unwrap();
+    assert!(matches!(
+        roots_worker
+            .run_once(1_784_667_601, "2026-07-21T21:00:01Z")
+            .await
+            .unwrap(),
+        PgRunOnceOutcome::Driven { .. }
+    ));
+    let ids: BTreeMap<String, String> = sqlx::query_as::<_, (String, String)>(
+        "SELECT name, job_id::text FROM ci_job WHERE tenant_id=$1 AND run_id=$2::uuid",
+    )
+    .bind(TENANT)
+    .bind(CI_RUN_ID)
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .collect();
+    let root_specs = runner.specs();
+    assert_eq!(root_specs.len(), 2);
+    assert_eq!(
+        root_specs
+            .iter()
+            .map(|spec| spec.target.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        [ids["build"].clone(), ids["test"].clone()]
+            .into_iter()
+            .collect()
+    );
+    let by_target = root_specs
+        .into_iter()
+        .map(|spec| (spec.target.clone(), spec))
+        .collect::<BTreeMap<_, _>>();
+    signal(&pool, &by_target[&ids["test"]].idem_token, "test", 1);
+    signal(&pool, &by_target[&ids["build"]].idem_token, "build", 2);
+    drop(roots_worker);
+
+    let mut dependent_worker = worker(&pool, "worker-dependent");
+    register_ci_manifest_pipeline(
+        &mut dependent_worker,
+        resolver(&pool),
+        Arc::clone(&runner),
+    )
+    .unwrap();
+    dependent_worker
+        .run_once(1_784_667_602, "2026-07-21T21:00:02Z")
+        .await
+        .unwrap();
+    let all_specs = runner.specs();
+    assert_eq!(all_specs.len(), 3);
+    let package = all_specs
+        .iter()
+        .find(|spec| spec.target == ids["package"])
+        .unwrap();
+    signal(&pool, &package.idem_token, "package", 3);
+    drop(dependent_worker);
+
+    let mut terminal_worker = worker(&pool, "worker-terminal");
+    register_ci_manifest_pipeline(
+        &mut terminal_worker,
+        resolver(&pool),
+        Arc::clone(&runner),
+    )
+    .unwrap();
+    terminal_worker
+        .run_once(1_784_667_603, "2026-07-21T21:00:03Z")
+        .await
+        .unwrap();
+    assert_eq!(runner.specs().len(), 3, "reconstruction never redispatches");
+
+    let workflow_state: String = sqlx::query_scalar(
+        "SELECT state FROM workflow_run WHERE tenant_id=$1 AND region=$2 AND run_id=$3",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(WF_RUN_ID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(workflow_state, "completed");
+    let terminal_checks: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT envelope->'payload'->'context'->>'name', \
+                (envelope->'payload'->>'run_attempt')::bigint, \
+                envelope->'payload'->>'state' \
+         FROM outbox WHERE envelope->>'type_'='ci.check.updated' \
+           AND envelope->'payload'->>'run'=$1 \
+           AND envelope->'payload'->>'state'='success' \
+         ORDER BY 1",
+    )
+    .bind(format!("myelin://{TENANT}/ci/run/{CI_RUN_ID}"))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal_checks,
+        vec![
+            ("build".into(), 1, "success".into()),
+            ("package".into(), 1, "success".into()),
+            ("test".into(), 1, "success".into()),
+        ]
+    );
+
+    pool.close().await;
+    bare.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .unwrap();
+}

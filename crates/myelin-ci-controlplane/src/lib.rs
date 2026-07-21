@@ -57,6 +57,8 @@ pub mod check_emitter;
 /// DAG, per-context check attempts, workflow code identity, and server-granted launch templates;
 /// secret values and minted token JTIs are structurally absent.
 pub mod ci_drive_manifest;
+/// Production manifest resolver and DAG-native durable `ci.pipeline` body.
+pub mod ci_manifest_pipeline;
 pub mod ci_pipeline;
 pub mod ci_result_signal;
 pub use ci_drive_manifest::{
@@ -65,6 +67,10 @@ pub use ci_drive_manifest::{
     CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, CiMergeWaiterV1,
     GrantedCiJobV1, CI_DRIVE_MANIFEST_DIGEST_V1_DOMAIN, CI_DRIVE_MANIFEST_SCHEMA_V1,
     MAX_CI_DRIVE_MANIFEST_BYTES,
+};
+pub use ci_manifest_pipeline::{
+    drive_resolved_ci_manifest_pipeline, register_ci_manifest_pipeline, run_ci_manifest_pipeline,
+    CiManifestInputResolver, CiManifestPipelineOutcome,
 };
 /// CT-004d.2 chunk 4 — the durable `ci_run` writer ([`ci_run_store::CiRunStore`]): the CI
 /// run-of-record. The `ci-dispatch.trigger` consumer's reserve bundle must persist a durable `ci_run`
