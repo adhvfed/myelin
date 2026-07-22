@@ -879,10 +879,18 @@ impl DurableGitBackend {
                 clone_url,
             })
         } else {
-            let readme = repo
-                .read_file_at_ref("refs/heads/main", "README.md")?
-                .map(|(b, _)| String::from_utf8_lossy(&b).chars().take(400).collect())
-                .unwrap_or_default();
+            let readme = match repo.read_blob_at_path_bounded(
+                "refs/heads/main",
+                "README.md",
+                64 * 1024,
+            )? {
+                BlobPathLookup::Found { bytes, .. } => {
+                    String::from_utf8_lossy(&bytes).chars().take(400).collect()
+                }
+                BlobPathLookup::TooLarge { .. }
+                | BlobPathLookup::IsDir
+                | BlobPathLookup::Missing => String::new(),
+            };
             Ok(RepoHome::Populated {
                 slug: full_slug,
                 readme_excerpt: readme,

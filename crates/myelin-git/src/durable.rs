@@ -1012,12 +1012,25 @@ impl DurableGitRepo {
     /// List a ref's TOP-LEVEL tree entries `(name, is_dir)` (empty if the ref does not exist). The repo
     /// home ViewModel's file tree (durable — read from the real on-disk tree, never a seeded list).
     pub fn tree_entries_at_ref(&self, ref_name: &str) -> Result<Vec<(String, bool)>, DurableError> {
+        self.tree_entries_at_ref_bounded(ref_name, BROWSE_MAX_TREE_ENTRIES)
+    }
+
+    fn tree_entries_at_ref_bounded(
+        &self,
+        ref_name: &str,
+        maximum: usize,
+    ) -> Result<Vec<(String, bool)>, DurableError> {
         let repo = self.open_git()?;
         let Some(tip) = self.tip_commit(&repo, ref_name)? else {
             return Ok(Vec::new());
         };
         let commit = repo.find_commit(tip).map_err(|e| git_err("find commit", e))?;
         let tree = commit.tree().map_err(|e| git_err("commit tree", e))?;
+        if tree.len() > maximum {
+            return Err(DurableError::Git(format!(
+                "browse response limit exceeded: tree contains more than {maximum} entries"
+            )));
+        }
         let mut out = Vec::new();
         for entry in tree.iter() {
             let is_dir = matches!(entry.kind(), Some(git2::ObjectType::Tree));
@@ -3437,6 +3450,10 @@ mod tests {
         ));
         assert!(matches!(
             repo.tree_at_path_bounded("main", "", 2),
+            Err(DurableError::Git(message)) if message.starts_with("browse response limit exceeded:")
+        ));
+        assert!(matches!(
+            repo.tree_entries_at_ref_bounded("refs/heads/main", 2),
             Err(DurableError::Git(message)) if message.starts_with("browse response limit exceeded:")
         ));
         std::fs::remove_dir_all(&root).ok();
