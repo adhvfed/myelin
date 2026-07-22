@@ -24,6 +24,7 @@ import {
   parsePrThreads,
 } from "./mutation-response";
 import { parseFileLinesInput, parseFileLinesResponse } from "./file-lines";
+import { parseRepoHome, parseReposPage } from "./repo-read-response";
 
 export type { IssueMutation, PrMutation } from "./mutation-input";
 
@@ -469,13 +470,21 @@ function seg(s: string): string {
 /** The repos screen's data: GET /v1/git/repos through the gateway → the edge ViewModel JSON. */
 export const getRepos = query(async (): Promise<ReposPage> => {
   "use server";
-  return authed(() => edgeGet<ReposPage>("/v1/git/repos"));
+  return authed(async () => {
+    const page = parseReposPage(await edgeGet("/v1/git/repos"));
+    if (!page) throw new RepoRouteError("error");
+    return page;
+  });
 }, "git-repos");
 
 /** A single repo's home (GET /v1/git/repos/{repo}) → the RepoHome ViewModel. */
 export const getRepo = query(async (repo: string): Promise<RepoHomeVM> => {
   "use server";
-  return authed(() => edgeGet<RepoHomeVM>(`/v1/git/repos/${seg(repo)}`));
+  return authed(async () => {
+    const home = parseRepoHome(await edgeGet(`/v1/git/repos/${seg(repo)}`));
+    if (!home) throw new RepoRouteError("error");
+    return home;
+  });
 }, "git-repo");
 
 /** Encode a NESTED path for a `{...path}` catch-all: encode each segment, keep the `/` separators
