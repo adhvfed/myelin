@@ -310,6 +310,8 @@ pub enum FirehoseError {
         /// `window_floor - 1`, so `(last_seq, now]` is not fully replayable from the window.
         window_floor: u64,
     },
+    /// A tail read would exceed its caller's frame-count or aggregate payload-byte ceiling.
+    TailLimitExceeded,
 }
 
 impl FirehoseError {
@@ -336,6 +338,9 @@ impl core::fmt::Display for FirehoseError {
                 "resync_required: last_seq={last_seq} is older than the retention window (floor={window_floor}) \
                  → fall back to a *.snapshot replay (EB-22)"
             ),
+            FirehoseError::TailLimitExceeded => {
+                f.write_str("firehose tail read limit exceeded")
+            }
         }
     }
 }
@@ -449,6 +454,34 @@ impl RetentionWindow {
             .filter(|f| f.seq >= lo && f.seq <= hi)
             .cloned()
             .collect()
+    }
+
+    fn tail_bounded(
+        &self,
+        lo: u64,
+        hi: u64,
+        maximum_frames: usize,
+        maximum_payload_bytes: usize,
+    ) -> Result<Vec<Frame>, FirehoseError> {
+        let mut frames = Vec::new();
+        let mut payload_bytes = 0usize;
+        for frame in self
+            .frames
+            .iter()
+            .filter(|frame| frame.seq >= lo && frame.seq <= hi)
+        {
+            if frames.len() >= maximum_frames {
+                return Err(FirehoseError::TailLimitExceeded);
+            }
+            payload_bytes = payload_bytes
+                .checked_add(frame.payload.0.len())
+                .ok_or(FirehoseError::TailLimitExceeded)?;
+            if payload_bytes > maximum_payload_bytes {
+                return Err(FirehoseError::TailLimitExceeded);
+            }
+            frames.push(frame.clone());
+        }
+        Ok(frames)
     }
 
     /// The number of frames the window currently holds (bounded by `capacity`).
@@ -737,6 +770,26 @@ impl Firehose {
             .get(&key)
             .map(|w| w.tail(lo, hi))
             .unwrap_or_default()
+    }
+
+    /// Tail under explicit frame-count and aggregate payload-byte ceilings. The limits are checked
+    /// before each frame clone, so an oversized live window cannot amplify into an archive request.
+    pub fn tail_bounded(
+        &self,
+        stream: &str,
+        scope: &FirehoseScope,
+        lo: u64,
+        hi: u64,
+        maximum_frames: usize,
+        maximum_payload_bytes: usize,
+    ) -> Result<Vec<Frame>, FirehoseError> {
+        let key = (stream.to_string(), scope.clone());
+        self.windows
+            .get(&key)
+            .map(|window| {
+                window.tail_bounded(lo, hi, maximum_frames, maximum_payload_bytes)
+            })
+            .unwrap_or_else(|| Ok(Vec::new()))
     }
 
     /// **`subscribe(stream, scope, cursor?)` → `SubStream` (§5.5, NEW).** Open a per-view subscription
@@ -1291,6 +1344,30 @@ mod tests {
             .map(|f| f.seq)
             .collect();
         assert_eq!(tail, vec![8, 9, 10], "tail clamps to the held frames");
+    }
+
+    #[test]
+    fn bounded_tail_checks_count_and_payload_bytes_before_cloning() {
+        let mut fh = Firehose::new();
+        let s = scope("board:bounded-tail");
+        for _ in 0..3 {
+            fh.publish("ci-logs", &s, draft("line"));
+        }
+
+        assert_eq!(
+            fh.tail_bounded("ci-logs", &s, 1, 3, 3, 12)
+                .expect("exact limits accepted")
+                .len(),
+            3
+        );
+        assert_eq!(
+            fh.tail_bounded("ci-logs", &s, 1, 3, 2, 12),
+            Err(FirehoseError::TailLimitExceeded)
+        );
+        assert_eq!(
+            fh.tail_bounded("ci-logs", &s, 1, 3, 3, 11),
+            Err(FirehoseError::TailLimitExceeded)
+        );
     }
 
     /// A fan-out publish reaches EVERY open subscription on the `(stream, scope)` (two viewers on the
