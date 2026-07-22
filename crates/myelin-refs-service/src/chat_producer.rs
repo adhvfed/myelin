@@ -85,7 +85,7 @@ use myelin_chat::subs::{mint_message, mint_thread, CHAT_SUBSYSTEM};
 use myelin_content::InlineNode;
 use myelin_events::{ArtifactRef, EventEnvelope, EventId, OutboxTx, Result as BusResult};
 use myelin_identity::{Decision, Permission, Principal};
-use myelin_refs::{sub_kind, Sub};
+use myelin_refs::{sub_kind, ParseError, Sub};
 use myelin_tenancy::{Region, TenantId};
 
 use crate::emit::{emit_edges, EdgeDraft};
@@ -125,23 +125,25 @@ impl ChatEdgeProducer {
     /// codec ([`myelin_chat::subs::mint_message`]) so the root is grammatical BY CONSTRUCTION and Refs
     /// names the SAME root Chat mints (one mint, never a parallel literal). The `message_id` is the
     /// immutable ULID (a stable opaque id, §2 — never a positional index).
-    pub fn message_root(tenant: &str, message_id: &str) -> ArtifactRef {
+    ///
+    /// # Errors
+    ///
+    /// Returns a grammar error when the tenant or message id cannot form a canonical reference.
+    pub fn message_root(tenant: &str, message_id: &str) -> Result<ArtifactRef, ParseError> {
         // mint_message attaches a `message-<id>` #sub; the EDGE SOURCE is the #sub-stripped root (the
         // message artifact itself), so we strip back to the canonical root Refs stores edges against.
-        myelin_refs::strip_sub(&mint_message(tenant, message_id).unwrap_or_else(|e| {
-            // A real message_id is a ULID and always grammatical; a malformed id is a producer bug,
-            // surfaced LOUDLY (REF-3 — never an edge off a guessed/silently-coerced root).
-            panic!("chat message_id `{message_id}` is not a grammatical mint: {e:?}")
-        }))
+        mint_message(tenant, message_id).map(|minted| myelin_refs::strip_sub(&minted))
     }
 
     /// The canonical Chat **thread root** `myelin://<tenant>/chat/thread/<thread_root_id>` — the source
     /// of an unfurl edge produced within a thread. Built through Chat's OWN mint codec
     /// ([`myelin_chat::subs::mint_thread`]); the `thread_root_id` is the immutable ULID root.
-    pub fn thread_root(tenant: &str, thread_root_id: &str) -> ArtifactRef {
-        myelin_refs::strip_sub(&mint_thread(tenant, thread_root_id).unwrap_or_else(|e| {
-            panic!("chat thread_root_id `{thread_root_id}` is not a grammatical mint: {e:?}")
-        }))
+    ///
+    /// # Errors
+    ///
+    /// Returns a grammar error when the tenant or thread id cannot form a canonical reference.
+    pub fn thread_root(tenant: &str, thread_root_id: &str) -> Result<ArtifactRef, ParseError> {
+        mint_thread(tenant, thread_root_id).map(|minted| myelin_refs::strip_sub(&minted))
     }
 
     /// **Emit the reference (unfurl) edges of a real Chat message body, in the SAME outbox transaction

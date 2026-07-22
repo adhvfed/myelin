@@ -99,7 +99,8 @@ fn thread_ref(thread_root_id: &str) -> ArtifactRef {
 #[test]
 fn chat_message_produces_one_edge_per_structured_node_over_every_artifact_class() {
     let producer = ChatEdgeProducer;
-    let source = ChatEdgeProducer::message_root("acme", "01HMSGAAAAAAAAAAAAAAAAAAAA");
+    let source = ChatEdgeProducer::message_root("acme", "01HMSGAAAAAAAAAAAAAAAAAAAA")
+        .expect("canonical chat root");
     let mentionee = viewer("reviewer", &tenant());
     let body = vec![
         InlineNode::Mention(mentionee.clone()),
@@ -138,11 +139,13 @@ fn chat_message_produces_one_edge_per_structured_node_over_every_artifact_class(
 /// against.
 #[test]
 fn chat_roots_are_chat_canonical_mints() {
-    let msg = ChatEdgeProducer::message_root("acme", "01HMSG");
+    let msg = ChatEdgeProducer::message_root("acme", "01HMSG").expect("canonical message root");
     assert_eq!(msg.0, "myelin://acme/chat/message/01HMSG");
-    let thread = ChatEdgeProducer::thread_root("acme", "01HTHREAD");
+    let thread = ChatEdgeProducer::thread_root("acme", "01HTHREAD").expect("canonical thread root");
     assert_eq!(thread.0, "myelin://acme/chat/thread/01HTHREAD");
     assert_eq!(CHAT_OWNER_TOKEN, "chat");
+    assert!(ChatEdgeProducer::message_root("", "01HMSG").is_err());
+    assert!(ChatEdgeProducer::thread_root("acme", "").is_err());
     assert_eq!(CHAT_CHANNEL_TYPE, "channel");
 }
 
@@ -251,7 +254,7 @@ fn unscripted_chat_message_anchor_is_gone_not_a_leak() {
 #[test]
 fn a_bare_chat_root_is_live() {
     let owner = ChatOwner::new();
-    let root = ChatEdgeProducer::message_root("acme", "01HMSGROOT");
+    let root = ChatEdgeProducer::message_root("acme", "01HMSGROOT").expect("canonical chat root");
     assert!(matches!(
         resolve_sub_outcome(&owner, &root),
         ProjectOutcome::Live(_)
@@ -282,7 +285,7 @@ fn chat_message_ref_classifies_through_the_one_grammar() {
 #[test]
 fn ref_d1_denied_viewer_of_a_private_channel_message_is_tombstoned() {
     let owner = ChatOwner::new();
-    let msg = ChatEdgeProducer::message_root("acme", "01HMSGSECRET");
+    let msg = ChatEdgeProducer::message_root("acme", "01HMSGSECRET").expect("canonical chat root");
     let outsider = viewer("non-member", &tenant());
     // NO grant_view for the outsider (default-deny) — the private-channel leak invariant.
     let svc = chat_resolve_service(&owner);
@@ -535,7 +538,8 @@ fn chat_nonmember_with_no_membership_sees_zero_backlinks() {
 #[test]
 fn chat_terminal_node_unfurls_every_prior_producer_class() {
     let producer = ChatEdgeProducer;
-    let source = ChatEdgeProducer::message_root("acme", "01HMSGDECIDE");
+    let source =
+        ChatEdgeProducer::message_root("acme", "01HMSGDECIDE").expect("canonical chat root");
     // The chat decision unfurls: an Issue (Issues), a commit (Git), a CI run (CI), a doc (Knowledge),
     // and another chat message (Chat itself) — all five producer classes in one message.
     let body = vec![
@@ -565,7 +569,8 @@ fn chat_terminal_node_unfurls_every_prior_producer_class() {
 #[test]
 fn chat_thread_edge_source_is_the_stripped_thread_root() {
     let producer = ChatEdgeProducer;
-    let source = ChatEdgeProducer::thread_root("acme", "01HTHREDGE");
+    let source =
+        ChatEdgeProducer::thread_root("acme", "01HTHREDGE").expect("canonical thread root");
     let body = vec![InlineNode::ArtifactRefNode(ArtifactRef(
         "myelin://acme/issue/issue/ENG-7".into(),
     ))];
@@ -581,7 +586,7 @@ fn chat_thread_edge_source_is_the_stripped_thread_root() {
 /// the codec re-parses to the SAME Message sub.
 #[test]
 fn chat_mint_is_grammatical_by_construction() {
-    let root = ChatEdgeProducer::message_root("acme", "01HMSGMINT");
+    let root = ChatEdgeProducer::message_root("acme", "01HMSGMINT").expect("canonical chat root");
     let minted = mint(&root, Sub::Message("01HMSGMINT2".into())).expect("grammatical mint");
     assert_eq!(sub_kind(&minted), Some(Sub::Message("01HMSGMINT2".into())));
 }

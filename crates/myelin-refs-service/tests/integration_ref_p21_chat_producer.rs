@@ -76,7 +76,8 @@ struct Row {
 /// Chat) — five structured ref nodes → five reference edges, sourced from the Chat message root.
 fn chat_unfurl_rows(message_id: &str) -> Vec<Row> {
     let producer = ChatEdgeProducer;
-    let source = ChatEdgeProducer::message_root("tenantA", message_id);
+    let source =
+        ChatEdgeProducer::message_root("tenantA", message_id).expect("canonical chat root");
     let mentionee = Principal::stub(PrincipalId("reviewer".into()), PrincipalKind::Human, t());
     let body = vec![
         InlineNode::Mention(mentionee),
