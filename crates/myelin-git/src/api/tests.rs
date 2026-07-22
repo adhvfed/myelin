@@ -167,6 +167,81 @@ fn cli_parses_the_arch_section_3_2_verbs() {
 }
 
 #[test]
+fn code_search_cli_accepts_one_bounded_query_and_an_order_independent_repo_filter() {
+    for args in [
+        vec![
+            "search",
+            "code",
+            "deadlock detector",
+            "--repo",
+            "platform/core",
+        ],
+        vec![
+            "search",
+            "code",
+            "--repo",
+            "platform/core",
+            "deadlock detector",
+        ],
+    ] {
+        assert_eq!(
+            parse_cli(&args).unwrap(),
+            CliCommand::SearchCode {
+                query: "deadlock detector".into(),
+                repo: Some("platform/core".into()),
+            }
+        );
+    }
+    assert_eq!(
+        parse_cli(&["search", "code", "résumé = 100%"]),
+        Ok(CliCommand::SearchCode {
+            query: "résumé = 100%".into(),
+            repo: None,
+        })
+    );
+    assert!(valid_code_search_query(
+        &"x".repeat(CODE_SEARCH_QUERY_MAX_BYTES)
+    ));
+    assert!(valid_code_search_repo(
+        &"r".repeat(CODE_SEARCH_REPO_MAX_BYTES)
+    ));
+}
+
+#[test]
+fn code_search_cli_rejects_ambiguous_unbounded_or_unsafe_input() {
+    let oversized_query = "x".repeat(CODE_SEARCH_QUERY_MAX_BYTES + 1);
+    let oversized_repo = "r".repeat(CODE_SEARCH_REPO_MAX_BYTES + 1);
+    for args in [
+        vec!["search", "code"],
+        vec!["search", "code", ""],
+        vec!["search", "code", "   "],
+        vec!["search", "code", "line\nbreak"],
+        vec!["search", "code", &oversized_query],
+        vec!["search", "code", "one", "two"],
+        vec!["search", "code", "one", "--unknown", "value"],
+        vec!["search", "code", "one", "--repo"],
+        vec!["search", "code", "one", "--repo", "--other"],
+        vec!["search", "code", "one", "--repo", "core", "--repo", "other"],
+        vec!["search", "code", "one", "--repo", "../secret"],
+        vec!["search", "code", "one", "--repo", "team//core"],
+        vec!["search", "code", "one", "--repo", &oversized_repo],
+    ] {
+        assert!(
+            parse_cli(&args).is_err(),
+            "code-search arguments should be rejected: {args:?}"
+        );
+    }
+    assert!(matches!(
+        parse_cli(&["search", "code", "one", "--repo", "core", "--repo", "other"]),
+        Err(CliParseError::DuplicateFlag { flag: "--repo" })
+    ));
+    assert!(matches!(
+        parse_cli(&["search", "code", "one", "--repo"]),
+        Err(CliParseError::MissingValue { flag: "--repo" })
+    ));
+}
+
+#[test]
 fn repo_list_cli_parses_strict_order_independent_pagination_flags() {
     let cursor = crate::web::RepoListCursor::new([9; 32], "alpha")
         .unwrap()

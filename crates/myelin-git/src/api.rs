@@ -375,6 +375,25 @@ pub enum CliParseError {
 
 /// Maximum page size accepted by `myelin git repo list`.
 pub const REPO_LIST_CLI_MAX_LIMIT: usize = 100;
+/// Maximum UTF-8 bytes accepted for one code-search query at every public boundary.
+pub const CODE_SEARCH_QUERY_MAX_BYTES: usize = 4 * 1024;
+/// Maximum UTF-8 bytes accepted for an optional code-search repository filter.
+pub const CODE_SEARCH_REPO_MAX_BYTES: usize = crate::web::REPO_LIST_ROW_MAX_SLUG_BYTES;
+
+/// Validate the shared CLI/Edge code-search query contract. Spaces and other non-control Unicode
+/// whitespace are valid inside a meaningful query, while empty/whitespace-only, control-bearing,
+/// and oversized inputs fail closed.
+pub fn valid_code_search_query(query: &str) -> bool {
+    !query.trim().is_empty()
+        && query.len() <= CODE_SEARCH_QUERY_MAX_BYTES
+        && !query.chars().any(char::is_control)
+}
+
+/// Validate the shared CLI/Edge optional repository filter. This reuses the durable resolver's
+/// namespaced slug grammar and adds the public 255-byte projection bound.
+pub fn valid_code_search_repo(repo: &str) -> bool {
+    repo.len() <= CODE_SEARCH_REPO_MAX_BYTES && crate::gix_backend::validate_repo_slug(repo).is_ok()
+}
 
 /// Parse a `myelin …` git CLI invocation (the args AFTER `myelin`, arch §3.2). A thin, total parser
 /// over the frozen verb grammar — the noun alias `repo` is accepted (render-time alias for `git`). The
@@ -561,13 +580,42 @@ fn parse_search(rest: &[&str]) -> Result<CliCommand, CliParseError> {
     })?;
     match *verb {
         "code" => {
-            let query = args
-                .iter()
-                .find(|a| !a.starts_with("--"))
-                .ok_or(CliParseError::MissingArg { what: "query" })?;
-            let repo = flag_value(args, "--repo");
+            let mut query = None;
+            let mut repo = None;
+            let mut index = 0;
+            while index < args.len() {
+                match args[index] {
+                    "--repo" => {
+                        if repo.is_some() {
+                            return Err(CliParseError::DuplicateFlag { flag: "--repo" });
+                        }
+                        let value = required_flag_value(args, index, "--repo")?;
+                        if !valid_code_search_repo(value) {
+                            return Err(CliParseError::BadArg {
+                                value: value.to_string(),
+                            });
+                        }
+                        repo = Some(value.to_string());
+                        index += 2;
+                    }
+                    other if other.starts_with("--") => {
+                        return Err(CliParseError::Unknown {
+                            token: other.to_string(),
+                        });
+                    }
+                    value => {
+                        if query.is_some() || !valid_code_search_query(value) {
+                            return Err(CliParseError::BadArg {
+                                value: value.to_string(),
+                            });
+                        }
+                        query = Some(value.to_string());
+                        index += 1;
+                    }
+                }
+            }
             Ok(CliCommand::SearchCode {
-                query: query.to_string(),
+                query: query.ok_or(CliParseError::MissingArg { what: "query" })?,
                 repo,
             })
         }
