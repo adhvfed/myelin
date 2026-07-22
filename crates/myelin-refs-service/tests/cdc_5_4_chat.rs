@@ -54,7 +54,7 @@ fn content_event(depth: u32) -> EventEnvelope {
         tenant: tenant(),
         region: region(),
         actor: Actor(principal()),
-        subject: ChatEdgeProducer::message_root("acme", "01HMSGCDC"),
+        subject: ChatEdgeProducer::message_root("acme", "01HMSGCDC").expect("canonical chat root"),
         aggregate: AggregateKey("chat:message:01HMSGCDC".into()),
         causation_id: None,
         correlation_id: CorrelationId("01J-root-corr".into()),
@@ -107,7 +107,7 @@ fn maximal_chat_body() -> Vec<InlineNode> {
 fn chat_unfurls_emit_commit_and_ingest_as_reference_edges() {
     let (store, minter) = store_and_minter();
     let producer = ChatEdgeProducer;
-    let source = ChatEdgeProducer::message_root("acme", "01HMSGCDC");
+    let source = ChatEdgeProducer::message_root("acme", "01HMSGCDC").expect("canonical chat root");
     let content = content_event(2);
     let body = maximal_chat_body();
 
@@ -215,7 +215,7 @@ fn chat_unfurls_emit_commit_and_ingest_as_reference_edges() {
 fn aborted_chat_message_emits_zero_unfurl_edges() {
     let (store, minter) = store_and_minter();
     let producer = ChatEdgeProducer;
-    let source = ChatEdgeProducer::message_root("acme", "01HMSGCDC");
+    let source = ChatEdgeProducer::message_root("acme", "01HMSGCDC").expect("canonical chat root");
     let content = content_event(0);
     let body = maximal_chat_body();
     {
