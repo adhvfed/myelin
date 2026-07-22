@@ -797,10 +797,13 @@ impl DurableRevocationBacking {
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                    Ok(row.map(|r| DurableRevocationRow {
-                        revoked_at: r.get("revoked_at"),
-                        expires_at: r.get("expires_at"),
-                    }))
+                    row.map(|row| {
+                        Ok(DurableRevocationRow {
+                            revoked_at: row.try_get("revoked_at").map_err(revocation_row_decode)?,
+                            expires_at: row.try_get("expires_at").map_err(revocation_row_decode)?,
+                        })
+                    })
+                    .transpose()
                 })
             })
             .await
@@ -851,4 +854,8 @@ impl DurableRevocationBacking {
             })
             .await
     }
+}
+
+fn revocation_row_decode(error: sqlx::Error) -> crate::pg::PgError {
+    crate::pg::PgError::Query(format!("revocation row decode failed: {error}"))
 }
