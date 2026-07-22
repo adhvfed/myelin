@@ -169,7 +169,10 @@ pub use multi_cell::{
     CellPartition, CrossCellAudit, CrossCellGrant, CrossCellResolution, MigrationReceipt,
     MultiCellAuthority, MultiCellDsrReceiptSet,
 };
-pub use oidc::{JwkKey, JwkSet, OidcConfig, OidcVerifier, ReplayGuard, SchemeDispatchVerifier};
+pub use oidc::{
+    oidc_login_material, JwkKey, JwkSet, OidcConfig, OidcVerifier, ReplayGuard,
+    SchemeDispatchVerifier,
+};
 pub use principal_store::{
     PrincipalCredentialProvision, PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore,
     ProfileRef, S1_HOLDER, S1_TABLE,

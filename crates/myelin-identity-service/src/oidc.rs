@@ -47,10 +47,66 @@
 use crate::authenticate::{scheme, CredentialVerifier, VerifiedAssertion};
 use myelin_identity::{AuthzError, Credential};
 use myelin_tenancy::{Region, TenantId};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
+
+const OIDC_LOGIN_MATERIAL_PREFIX: &str = "oidc-login.v1.";
+
+/// Bind an ID token to the browser transaction nonce that initiated its authorization-code flow.
+/// The returned opaque material is accepted only by [`OidcVerifier`]. Direct verifier callers may
+/// still pass a compact JWT for non-browser protocol tests, while the public Edge login route always
+/// uses this bound form.
+pub fn oidc_login_material(id_token: &str, expected_nonce: &str) -> Result<String, AuthzError> {
+    if !valid_transaction_nonce(expected_nonce) {
+        return Err(AuthzError::BadRequest(
+            "OIDC login nonce must be 32 random bytes encoded as base64url".into(),
+        ));
+    }
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&serde_json::json!({
+            "id_token": id_token,
+            "expected_nonce": expected_nonce,
+        }))
+        .map_err(|_| AuthzError::BadRequest("cannot encode OIDC login material".into()))?,
+    );
+    Ok(format!("{OIDC_LOGIN_MATERIAL_PREFIX}{encoded}"))
+}
+
+fn valid_transaction_nonce(nonce: &str) -> bool {
+    nonce.len() == 43
+        && nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn unwrap_login_material(material: &str) -> Result<(Cow<'_, str>, Option<String>), AuthzError> {
+    let Some(encoded) = material.strip_prefix(OIDC_LOGIN_MATERIAL_PREFIX) else {
+        return Ok((Cow::Borrowed(material), None));
+    };
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| AuthzError::BadRequest("malformed bound OIDC login material".into()))?;
+    let envelope: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| AuthzError::BadRequest("malformed bound OIDC login material".into()))?;
+    let id_token = envelope
+        .get("id_token")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AuthzError::BadRequest("malformed bound OIDC login material".into()))?;
+    let expected_nonce = envelope
+        .get("expected_nonce")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| AuthzError::BadRequest("malformed bound OIDC login material".into()))?;
+    if !valid_transaction_nonce(expected_nonce) {
+        return Err(AuthzError::BadRequest(
+            "OIDC login nonce must be 32 random bytes encoded as base64url".into(),
+        ));
+    }
+    Ok((Cow::Owned(id_token.to_string()), Some(expected_nonce.to_string())))
+}
 
 /// Decode one base64url (no-padding) JWS/JWT segment (RFC 7515 §2). A malformed segment is a loud
 /// structural error (never coerced).
@@ -494,7 +550,8 @@ impl CredentialVerifier for OidcVerifier {
         }
 
         // (1) Structural shape: a JWS compact serialization is exactly three dot-separated segments.
-        let token = credential.material.trim();
+        let material = credential.material.trim();
+        let (token, expected_nonce) = unwrap_login_material(material)?;
         let parts: Vec<&str> = token.split('.').collect();
         if parts.len() != 3 {
             return Err(AuthzError::BadRequest(
@@ -649,6 +706,21 @@ impl CredentialVerifier for OidcVerifier {
                     self.config.region_claim
                 ))
             })?;
+
+        // Interactive authorization-code login binds the signed ID-token nonce to the exact
+        // short-lived browser transaction. Check it only after signature/issuer/audience validation,
+        // and before consuming replay state or resolving a principal.
+        if let Some(expected_nonce) = expected_nonce.as_deref() {
+            let signed_nonce = claims
+                .get("nonce")
+                .and_then(|nonce| nonce.as_str())
+                .ok_or_else(|| refuse("ID token missing the browser transaction `nonce`"))?;
+            if signed_nonce != expected_nonce {
+                return Err(refuse(
+                    "ID token nonce does not match the browser transaction nonce",
+                ));
+            }
+        }
 
         // (5g) REPLAY DEFENCE — atomically consume `jti` (else `nonce`) through a namespace scoped
         // by issuer, audience, and verified region. The row lives only through the token's accepted
@@ -917,6 +989,47 @@ mod tests {
         assert_eq!(a.region, Region("eu-west".into()));
         assert_eq!(a.scheme, scheme::OIDC);
         assert_eq!(a.subject_key, "oidc-sub-1");
+    }
+
+    #[test]
+    fn browser_login_requires_the_signed_transaction_nonce_to_match() {
+        const NONCE: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let key = RsaKey::generate();
+        let jwks = JwkSet::new().with_key("rsa-1", key.jwk());
+        let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1", "typ": "JWT"});
+        let mut cl = claims("jti-browser-nonce");
+        cl["nonce"] = NONCE.into();
+        let sig = key.sign(signing_input(&header, &cl).as_bytes());
+        let token = jwt(&header, &cl, &sig);
+
+        let bound = oidc_login_material(&token, NONCE).expect("valid transaction nonce");
+        verifier(jwks.clone())
+            .verify(&cred(bound))
+            .expect("matching signed nonce must verify");
+
+        let wrong = oidc_login_material(
+            &token,
+            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        )
+        .expect("well-shaped alternate nonce");
+        let error = verifier(jwks).verify(&cred(wrong)).unwrap_err();
+        assert!(format!("{error:?}").contains("nonce does not match"));
+    }
+
+    #[test]
+    fn browser_login_rejects_missing_or_malformed_transaction_nonce() {
+        const NONCE: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let key = RsaKey::generate();
+        let jwks = JwkSet::new().with_key("rsa-1", key.jwk());
+        let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1", "typ": "JWT"});
+        let cl = claims("jti-browser-missing-nonce");
+        let sig = key.sign(signing_input(&header, &cl).as_bytes());
+        let token = jwt(&header, &cl, &sig);
+        let bound = oidc_login_material(&token, NONCE).expect("valid transaction nonce");
+
+        let error = verifier(jwks).verify(&cred(bound)).unwrap_err();
+        assert!(format!("{error:?}").contains("missing the browser transaction `nonce`"));
+        assert!(oidc_login_material(&token, "short").is_err());
     }
 
     #[test]
