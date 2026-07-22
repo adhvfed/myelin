@@ -101,11 +101,17 @@ use myelin_tenancy::{Region, TenantId};
 
 use crate::blob::ContentHash;
 use crate::encryption::SubjectId;
-use crate::firehose_archive::{ArchiveError, FirehoseArchiver, SealedSegment};
+use crate::firehose_archive::{
+    ArchiveError, FirehoseArchiver, SealedSegment, FIREHOSE_MAX_SEGMENT_BYTES,
+};
 use crate::kms::KmsEngine;
 
 const CI_LOG_MAX_SPANS_PER_STEP: usize = 10_000;
 const CI_LOG_MAX_RESOLVED_STEP_BYTES: usize = 64 * 1024 * 1024;
+const CI_LOG_MAX_BATCH_FRAMES: usize = 10_000;
+const CI_LOG_MAX_JOB_ID_BYTES: usize = 1024;
+const CI_LOG_MAX_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const CI_LOG_MAX_FRAME_PAYLOAD_BYTES: usize = 2 * CI_LOG_MAX_CHUNK_BYTES + 2048;
 use crate::residency::StoreResidencyReport;
 
 /// The firehose stream CI logs ride (the `(stream, scope)` half the archiver seals under). CI logs
@@ -144,22 +150,35 @@ impl CiLogFrame {
     /// `<job_id-utf8><raw-bytes>`. The [`FramePayload`] inner is a `String`, so the raw bytes are
     /// carried as a base16 (hex) tail — lossless for any byte content. The structure is fixed-shape so
     /// [`Self::from_payload`] is total + LOUD on any malformation.
-    pub fn to_payload(&self) -> FramePayload {
+    pub fn to_payload(&self) -> Result<FramePayload, CiLogError> {
+        let payload_len = self.encoded_payload_len_bounded()?;
         // `step_no` and `job_id` are ASCII-safe metadata; the log chunk is hex-encoded so ANY bytes
         // survive the `String`-typed FramePayload (the transport carries opaque text).
-        let hex: String = self.bytes.iter().map(|b| format!("{b:02x}")).collect();
-        FramePayload(format!("{}\u{1}{}\u{1}{}", self.step_no, self.job_id, hex))
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut payload = format!("{}\u{1}{}\u{1}", self.step_no, self.job_id);
+        payload.reserve(payload_len.saturating_sub(payload.len()));
+        for byte in &self.bytes {
+            payload.push(HEX[(byte >> 4) as usize] as char);
+            payload.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        Ok(FramePayload(payload))
     }
 
     /// Parse a [`FramePayload`] back into a [`CiLogFrame`] — the inverse of [`Self::to_payload`].
     /// `None` on ANY malformation (a garbled CI log frame is a LOUD failure, never a partial decode):
     /// a missing field, a non-numeric `step_no`, or odd/invalid hex.
     pub fn from_payload(payload: &FramePayload) -> Option<CiLogFrame> {
+        if payload.0.len() > CI_LOG_MAX_FRAME_PAYLOAD_BYTES {
+            return None;
+        }
         let mut parts = payload.0.splitn(3, '\u{1}');
         let step_no: u32 = parts.next()?.parse().ok()?;
         let job_id = parts.next()?.to_string();
         let hex = parts.next()?;
-        if hex.len() % 2 != 0 {
+        if job_id.len() > CI_LOG_MAX_JOB_ID_BYTES
+            || hex.len() % 2 != 0
+            || hex.len() / 2 > CI_LOG_MAX_CHUNK_BYTES
+        {
             return None;
         }
         let mut bytes = Vec::with_capacity(hex.len() / 2);
@@ -180,6 +199,40 @@ impl CiLogFrame {
             step_no,
             bytes,
         })
+    }
+
+    fn encoded_payload_len_bounded(&self) -> Result<usize, CiLogError> {
+        self.encoded_payload_len_with_limits(
+            CI_LOG_MAX_JOB_ID_BYTES,
+            CI_LOG_MAX_CHUNK_BYTES,
+            CI_LOG_MAX_FRAME_PAYLOAD_BYTES,
+        )
+    }
+
+    fn encoded_payload_len_with_limits(
+        &self,
+        maximum_job_id_bytes: usize,
+        maximum_chunk_bytes: usize,
+        maximum_payload_bytes: usize,
+    ) -> Result<usize, CiLogError> {
+        if self.job_id.len() > maximum_job_id_bytes {
+            return Err(CiLogError::LimitExceeded("CI log job id bytes"));
+        }
+        if self.bytes.len() > maximum_chunk_bytes {
+            return Err(CiLogError::LimitExceeded("CI log chunk bytes"));
+        }
+        let payload_len = self
+            .bytes
+            .len()
+            .checked_mul(2)
+            .and_then(|len| len.checked_add(self.job_id.len()))
+            .and_then(|len| len.checked_add(self.step_no.to_string().len()))
+            .and_then(|len| len.checked_add(2))
+            .ok_or(CiLogError::LimitExceeded("CI log frame payload bytes"))?;
+        if payload_len > maximum_payload_bytes {
+            return Err(CiLogError::LimitExceeded("CI log frame payload bytes"));
+        }
+        Ok(payload_len)
     }
 }
 
@@ -516,15 +569,29 @@ impl CiLogTier {
         keying: SegmentKeying,
         frames: &[(u64, CiLogFrame)],
     ) -> Result<SealedSegment, CiLogError> {
+        if frames.len() > CI_LOG_MAX_BATCH_FRAMES {
+            return Err(CiLogError::LimitExceeded("CI log batch frame count"));
+        }
+        let mut encoded_segment_bytes = 8usize;
+        for (_, frame) in frames {
+            let frame_payload_bytes = frame.encoded_payload_len_bounded()?;
+            encoded_segment_bytes = encoded_segment_bytes
+                .checked_add(16)
+                .and_then(|total| total.checked_add(frame_payload_bytes))
+                .ok_or(CiLogError::LimitExceeded("CI log segment bytes"))?;
+            if encoded_segment_bytes > FIREHOSE_MAX_SEGMENT_BYTES {
+                return Err(CiLogError::LimitExceeded("CI log segment bytes"));
+            }
+        }
         // Lower each CI log frame to a transport `Frame` (opaque payload), then seal the batch.
         let scope_selector = format!("run:{}", self.run_id); // the `(stream, scope)` selector
-        let transport: Vec<Frame> = frames
-            .iter()
-            .map(|(seq, clf)| Frame {
+        let mut transport = Vec::with_capacity(frames.len());
+        for (seq, frame) in frames {
+            transport.push(Frame {
                 seq: *seq,
-                payload: clf.to_payload(),
-            })
-            .collect();
+                payload: frame.to_payload()?,
+            });
+        }
         let segment = archiver.seal(CI_LOG_STREAM, &scope_selector, &transport)?;
 
         // Build the index: per `(job, step)`, record this chunk's byte-range in the step log + the
@@ -751,7 +818,7 @@ mod tests {
     #[test]
     fn ci_log_frame_payload_round_trips_exactly_including_binary() {
         let clf = CiLogFrame::new("build", 3, vec![0x00, 0xff, b'l', b'o', b'g', 0x01]);
-        let payload = clf.to_payload();
+        let payload = clf.to_payload().expect("small payload");
         let back = CiLogFrame::from_payload(&payload).expect("round-trip");
         assert_eq!(
             back, clf,
@@ -762,20 +829,46 @@ mod tests {
     #[test]
     fn ci_log_frame_payload_is_deterministic() {
         let clf = CiLogFrame::new("test", 2, b"hello".to_vec());
-        assert_eq!(clf.to_payload(), clf.to_payload());
+        assert_eq!(clf.to_payload().unwrap(), clf.to_payload().unwrap());
         // A different step / job / bytes encodes differently.
         assert_ne!(
-            clf.to_payload(),
-            CiLogFrame::new("test", 3, b"hello".to_vec()).to_payload()
+            clf.to_payload().unwrap(),
+            CiLogFrame::new("test", 3, b"hello".to_vec())
+                .to_payload()
+                .unwrap()
         );
         assert_ne!(
-            clf.to_payload(),
-            CiLogFrame::new("lint", 2, b"hello".to_vec()).to_payload()
+            clf.to_payload().unwrap(),
+            CiLogFrame::new("lint", 2, b"hello".to_vec())
+                .to_payload()
+                .unwrap()
         );
         assert_ne!(
-            clf.to_payload(),
-            CiLogFrame::new("test", 2, b"hellp".to_vec()).to_payload()
+            clf.to_payload().unwrap(),
+            CiLogFrame::new("test", 2, b"hellp".to_vec())
+                .to_payload()
+                .unwrap()
         );
+    }
+
+    #[test]
+    fn ci_log_frame_encoding_enforces_every_materialization_limit() {
+        let frame = CiLogFrame::new("job", 1, b"ok".to_vec());
+        assert_eq!(
+            frame
+                .encoded_payload_len_with_limits(3, 2, 10)
+                .expect("exact limits accepted"),
+            10
+        );
+        assert!(frame
+            .encoded_payload_len_with_limits(2, 2, 10)
+            .is_err());
+        assert!(frame
+            .encoded_payload_len_with_limits(3, 1, 10)
+            .is_err());
+        assert!(frame
+            .encoded_payload_len_with_limits(3, 2, 9)
+            .is_err());
     }
 
     #[test]
@@ -821,8 +914,12 @@ mod tests {
         // And a full round-trip of EVERY byte value through encode→decode (0..=255) — the index's
         // step bytes survive byte-for-byte, the load-bearing "exact failing step bytes" property.
         let all: Vec<u8> = (0..=255u16).map(|b| b as u8).collect();
-        let rt = CiLogFrame::from_payload(&CiLogFrame::new("j", 1, all.clone()).to_payload())
-            .expect("all-bytes round-trip");
+        let rt = CiLogFrame::from_payload(
+            &CiLogFrame::new("j", 1, all.clone())
+                .to_payload()
+                .expect("small payload"),
+        )
+        .expect("all-bytes round-trip");
         assert_eq!(rt.bytes, all);
     }
 
