@@ -413,13 +413,13 @@ async fn malformed_requests_are_clean_errors_no_panic() {
     // Malformed login body → 400 (clean, no panic).
     let (bad_login, _) = http(addr, "POST", "/v1/auth/login", &[], b"{not json".to_vec()).await;
     assert_eq!(bad_login, 400);
-    // Login with a well-formed body still REFUSES-not-mocks (503) — the human verifier is deferred.
+    // Login with a well-formed body still REFUSES-not-mocks (503) when no verifier is configured.
     let (login, _) = http(
         addr,
         "POST",
         "/v1/auth/login",
         &[],
-        br#"{"scheme":"oidc","material":"acme|eu-west|subj-1"}"#.to_vec(),
+        br#"{"scheme":"oidc","material":"acme|eu-west|subj-1","nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#.to_vec(),
     )
     .await;
     assert_eq!(login, 503, "human login refuses-not-mocks until configured");

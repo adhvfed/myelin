@@ -1,11 +1,10 @@
 // THE DEV-SEAM CONTRACT (shared by the dev edge + the dev-login seam) — clearly marked, NOT production.
 //
-// Why this exists: the real `myelin-edge` binary authenticates with REAL PASETO capability tokens and
-// a seeded S1 principal directory; a HUMAN cannot yet be issued such a token (the human/OIDC login is
-// MR-012-deferred — `POST /v1/auth/login` REFUSES, refuse-not-mock). So to run the shell + Playwright
-// authenticated END-TO-END now, the dev edge accepts ONE well-known dev token and the dev-login seam
-// mints a session carrying it. The gateway client + the session machinery are REAL and contract-
-// faithful; only the *token issuance* is the dev stand-in the real login replaces. NEVER ship this.
+// Why this exists: the real `myelin-edge` binary authenticates with signed capabilities and a seeded
+// S1 principal directory, while hermetic UI tests intentionally run without an external IdP. The dev
+// edge therefore accepts ONE well-known dev token and the explicitly guarded dev-login seam mints a
+// session carrying it. The gateway client + session machinery remain contract-faithful; only this
+// local authentication fixture is a stand-in. NEVER ship it.
 //
 // The data the dev edge serves is the REAL Git ViewModel JSON shape (RepoHome::to_json,
 // crates/myelin-git/src/web.rs) re-rooted under the MR-015 `/v1/git/...` edge contract — so the screen

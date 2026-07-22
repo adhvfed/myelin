@@ -6,9 +6,8 @@
 //
 // The edge it calls is the MR-014/015 contract (`/v1/...`, Bearer/cookie auth, `{error:{message}}`,
 // pagination). `MYELIN_EDGE_URL` points at it: in the harness that is the clearly-marked DEV EDGE
-// (`dev-edge/server.mjs`, which serves the real contract over the real Git ViewModel JSON because the
-// real `myelin-edge` binary can't yet issue a human a capability token — MR-012 deferred). Pointing
-// this at the real `edge` binary is a one-line env change, not new plumbing.
+// (`dev-edge/server.mjs`, which serves the real contract over the real Git ViewModel JSON). Pointing
+// this at the real `edge` binary is an environment change, not a second data path.
 
 import { runGateway, GatewayError, Unauthorized } from "./gateway-core";
 import {
@@ -79,6 +78,51 @@ export interface EdgeWhoami {
   kind: string;
 }
 
+export interface EdgeOidcLogin {
+  accessToken: string;
+  scheme: "session";
+  expiresAt: number;
+}
+
+/** Exchange a verified OIDC ID token + browser nonce for the edge's bounded human capability. */
+export async function edgeLoginWithOidc(
+  idToken: string,
+  nonce: string,
+): Promise<EdgeOidcLogin> {
+  const res = await fetch(`${edgeOrigin()}/v1/auth/login`, {
+    method: "POST",
+    headers: { accept: "application/json", "content-type": "application/json" },
+    body: JSON.stringify({ scheme: "oidc", material: idToken, nonce }),
+    signal: gatewayRequestSignal(),
+  });
+  const text = await res.text();
+  if (res.status !== 200 || text.length > 64 * 1024) {
+    throw new Unauthorized(`OIDC login failed (HTTP ${res.status})`);
+  }
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    throw new Unauthorized("OIDC login returned an unexpected shape");
+  }
+  const login = body as Record<string, unknown>;
+  if (
+    typeof login.access_token !== "string" ||
+    !login.access_token ||
+    login.scheme !== "session" ||
+    login.token_type !== "Bearer" ||
+    typeof login.expires_at !== "number" ||
+    !Number.isSafeInteger(login.expires_at)
+  ) {
+    throw new Unauthorized("OIDC login returned an unexpected shape");
+  }
+  return {
+    accessToken: login.access_token,
+    scheme: "session",
+    expiresAt: login.expires_at,
+  };
+}
+
 /**
  * VERIFY a CALLER-SUPPLIED capability token (R4.0 operator-token login). Calls the edge's
  * authenticated `GET /v1/whoami` with the PASTED token (NOT the session's) + the token scheme header,
@@ -133,7 +177,7 @@ async function edgeRequest<T>(
     },
     refresh: async () => {
       const rec = await getSessionRecord();
-      if (!rec) return null;
+      if (!rec || !rec.refreshToken) return null;
       const res = await fetch(`${edgeOrigin()}/v1/auth/refresh`, {
         method: "POST",
         headers: {
@@ -185,7 +229,7 @@ export async function edgeGetRaw(
     // ONE refresh round-trip + retry (mirrors runGateway), then give up.
     const rec = await getSessionRecord();
     let fresh: string | null = null;
-    if (rec) {
+    if (rec?.refreshToken) {
       const rr = await fetch(`${edgeOrigin()}/v1/auth/refresh`, {
         method: "POST",
         headers: { authorization: `Bearer ${rec.refreshToken}`, "x-myelin-token-scheme": "refresh" },

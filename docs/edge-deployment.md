@@ -54,6 +54,21 @@ REDIS_URL=rediss://valkey.internal:6380
 NATS_URL=tls://nats.internal:4222
 ```
 
+To enable human browser login, configure the verifier as an all-or-nothing group. The audience must
+match the web OIDC client ID, and exactly one JWKS source may be set:
+
+```dotenv
+MYELIN_OIDC_ISSUER=https://identity.example
+MYELIN_OIDC_AUDIENCE=myelin-web
+MYELIN_OIDC_JWKS_FILE=/run/secrets/identity-jwks.json
+```
+
+The edge validates ID-token signature, issuer, audience, expiry, replay, and the browser transaction
+nonce before minting an eight-hour-maximum human capability. The capability never outlives the ID
+token and the principal directory is re-read on every request, so suspension takes effect without
+waiting for browser-session expiry. Configure the authorization and token endpoints only on the web
+server; they are not exposed by the edge public-auth response.
+
 Terminate with `SIGTERM`. The listener stops accepting sockets, gracefully drains active HTTP
 connections for 20 seconds, forcibly closes any remaining streams, drains the Issues reconciler, and
 exits zero. Configure the supervisor termination deadline above 20 seconds.

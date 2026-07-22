@@ -1,6 +1,6 @@
 // The session lifecycle as SolidStart server functions (`"use server"` → server-only RPC). The
-// dev-login seam mints a real session; the gateway client + session machinery underneath are REAL —
-// only the token ISSUANCE is the clearly-marked dev stand-in the deferred OIDC login replaces. The
+// dev-login seam mints a real local session; production uses the OIDC authorization-code flow below.
+// The gateway client + session machinery underneath are shared by both paths. The
 // global middleware verifies the full Origin of every unsafe browser request before any action runs.
 import { action, query, redirect } from "@solidjs/router";
 import {
@@ -9,6 +9,7 @@ import {
   issueSession,
 } from "../server/session";
 import { edgeGetPublic, edgeWhoamiWithToken } from "../server/gateway";
+import { beginOidcLogin, interactiveOidcConfigured } from "../server/oidc";
 import {
   DEV_ACCESS_TOKEN,
   DEV_PRINCIPAL,
@@ -136,7 +137,12 @@ export const getAuthConfig = query(async (): Promise<AuthConfig> => {
     edge = { sso_configured: false, providers: [], dev_login_enabled: false };
   }
   // The mapping (dev-seam composition + the token-login edge flag) is the pure {@link toAuthConfig}.
-  return toAuthConfig(edge, process.env as DevLoginEnv, import.meta.env.PROD);
+  return toAuthConfig(
+    edge,
+    process.env as DevLoginEnv,
+    import.meta.env.PROD,
+    interactiveOidcConfigured(),
+  );
 }, "auth-config");
 
 /**
@@ -172,20 +178,24 @@ export const loginWithToken = action(async (formData: FormData) => {
 }, "login-with-token");
 
 /**
- * **Begin SSO login (R3.5).** The primary button posts here when SSO is configured. VERIFIED FLOOR:
- * R2.5 landed only the OIDC VERIFICATION half at the edge (`POST /v1/auth/login` validates an ID
- * token the caller already holds) — there is NO browser authorization-code INITIATION route
- * (`/v1/auth/oidc/start` → 302 to the IdP does not exist; the edge config carries issuer/audience/
- * JWKS for verification only, no authorization_endpoint/client_id/redirect_uri). So this action
- * surfaces the honest login-error state (system-blaming, never the user) rather than fabricating a
- * redirect that cannot complete. When the interactive initiation half lands, THIS is the seam it
- * wires into — the button + copy do not change. See `design-planning/09-r3-sketches/05-first-run`.
+ * Begin a one-time OIDC Authorization Code + S256 PKCE transaction. The mode is re-read from both
+ * the edge and local server configuration so invoking the action directly cannot bypass the render
+ * gate. State, nonce, and verifier remain server-side; only the opaque state cookie reaches the
+ * browser.
  */
 export const startSso = action(async () => {
   "use server";
-  // The interactive OIDC start is not wired at the edge yet (verify-only, R2.5). Blame the
-  // deployment's missing initiation surface, not the user — same posture as the CI floor.
-  throw redirect("/login?error=sso_start_unavailable");
+  let destination: string;
+  try {
+    const edge = await edgeGetPublic<EdgeAuthConfig>("/v1/auth/config");
+    if (edge.sso_configured !== true || !interactiveOidcConfigured()) {
+      throw new Error("SSO is unavailable");
+    }
+    destination = await beginOidcLogin();
+  } catch {
+    destination = "/login?error=sso_start_unavailable";
+  }
+  throw redirect(destination);
 }, "start-sso");
 
 /** Log out: clear the server-side session + the cookie, return to /login. */

@@ -12,6 +12,7 @@ import {
   DEFAULT_EDGE_REQUEST_TIMEOUT_MS,
   edgeGet,
   edgeGetRaw,
+  edgeLoginWithOidc,
   gatewayRequestSignal,
 } from "./gateway";
 
@@ -133,6 +134,21 @@ describe("gateway request deadlines", () => {
 });
 
 describe("gateway refresh revocation races", () => {
+  it("does not send a refresh request for a non-refreshable SSO session", async () => {
+    session.getSessionRecord.mockReturnValue({
+      token: "human-session",
+      refreshToken: "",
+      scheme: "session",
+    });
+    const fetchMock = vi.fn().mockResolvedValueOnce(unauthorized());
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(edgeGet("/v1/issues")).rejects.toMatchObject({ name: "Unauthorized" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
+  });
+
   it("does not retry a JSON request when the session vanished during refresh", async () => {
     const refresh = new Response(JSON.stringify({ access_token: "fresh-token" }), {
       status: 200,
@@ -167,5 +183,41 @@ describe("gateway refresh revocation races", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(session.updateSessionToken).toHaveBeenCalledWith("fresh-token");
     expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("edgeLoginWithOidc", () => {
+  it("accepts only the bounded human-session response shape", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({
+      access_token: "signed-session",
+      token_type: "Bearer",
+      scheme: "session",
+      expires_at: 1_800_000_000,
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(edgeLoginWithOidc("id-token", "nonce")).resolves.toEqual({
+      accessToken: "signed-session",
+      scheme: "session",
+      expiresAt: 1_800_000_000,
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      scheme: "oidc",
+      material: "id-token",
+      nonce: "nonce",
+    });
+  });
+
+  it("rejects a superficially successful response with the wrong signed-token scheme", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({
+      access_token: "wrong-purpose",
+      token_type: "Bearer",
+      scheme: "agent",
+      expires_at: 1_800_000_000,
+    }), { status: 200 })));
+
+    await expect(edgeLoginWithOidc("id-token", "nonce")).rejects.toMatchObject({
+      name: "Unauthorized",
+    });
   });
 });

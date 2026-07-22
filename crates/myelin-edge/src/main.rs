@@ -28,7 +28,7 @@ use myelin_config::Mode;
 use myelin_edge::{
     bootstrap_principal_and_mint, recover_placed_git_at_boot, register_git_durable,
     register_git_wire, register_issues, serve_edge_until_shutdown_with_probe,
-    spawn_issue_authorization_reconciler, AuthPublicConfig, AuthenticatedActionPolicy,
+    spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy,
     BootstrapParams, CheckBackedRepoAuthorizer, DurableGitBackend,
     Gateway, IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, ShutdownOutcome,
     StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
@@ -82,17 +82,20 @@ struct EdgeReadinessState {
 }
 
 fn public_auth_config(
+    sso_configured: bool,
     dev_login_enabled: bool,
     token_login_enabled: bool,
 ) -> AuthPublicConfig {
-    // Static issuer/audience/JWKS settings make ID-token verification real, but they do not provide
-    // the authorization endpoint, client identity, redirect URI, callback/state store, or human
-    // capability mint needed for an interactive browser login. Advertise SSO only when that complete
-    // flow exists; otherwise the login page must keep the button disabled and present the working
-    // operator-token path.
     AuthPublicConfig {
-        sso_configured: false,
-        providers: Vec::new(),
+        sso_configured,
+        providers: if sso_configured {
+            vec![AuthProvider {
+                id: "oidc".into(),
+                label: "Single sign-on".into(),
+            }]
+        } else {
+            Vec::new()
+        },
         dev_login_enabled,
         token_login_enabled,
     }
@@ -639,7 +642,11 @@ async fn serve(
     let token_login_enabled = std::env::var("MYELIN_TOKEN_LOGIN")
         .map(|v| v == "1")
         .unwrap_or(false);
-    let auth_config = public_auth_config(dev_login_enabled, token_login_enabled);
+    let auth_config = public_auth_config(
+        oidc_settings.is_some(),
+        dev_login_enabled,
+        token_login_enabled,
+    );
     let human_login = Arc::new(match oidc_settings {
         Some(oidc) => {
             let jwks = JwkSet::from_jwks_json(&oidc.jwks_json).unwrap_or_else(|e| {
@@ -1125,10 +1132,11 @@ mod runtime_config_tests {
     }
 
     #[test]
-    fn verify_only_oidc_does_not_advertise_an_interactive_sso_flow() {
-        let config = public_auth_config(false, true);
-        assert!(!config.sso_configured);
-        assert!(config.providers.is_empty());
+    fn configured_oidc_verifier_is_advertised_to_interactive_web_clients() {
+        let config = public_auth_config(true, false, true);
+        assert!(config.sso_configured);
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.providers[0].id, "oidc");
         assert!(!config.dev_login_enabled);
         assert!(config.token_login_enabled);
     }

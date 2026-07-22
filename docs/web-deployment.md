@@ -18,6 +18,11 @@ REDIS_URL=rediss://user:password@valkey.internal:6380/0
 MYELIN_WEB_SESSION_KEY=<32-random-bytes-as-base64url>
 MYELIN_PUBLIC_ORIGIN=https://myelin.example
 MYELIN_EDGE_URL=http://edge.internal:8080
+MYELIN_OIDC_AUTHORIZATION_ENDPOINT=https://identity.example/oauth2/authorize
+MYELIN_OIDC_TOKEN_ENDPOINT=https://identity.example/oauth2/token
+MYELIN_OIDC_CLIENT_ID=myelin-web
+MYELIN_OIDC_CLIENT_SECRET=<secret-manager-value>
+MYELIN_OIDC_SCOPES="openid profile email"
 MYELIN_HSTS=1
 ```
 
@@ -28,6 +33,18 @@ session record at rest with AES-256-GCM; changing it intentionally invalidates a
 sessions. The public origin must be HTTPS; the Valkey connection must use TLS; and the edge value must
 be a credential-free HTTP(S) origin on the private service network. Enable HSTS only after the public
 hostname is permanently HTTPS.
+
+The five `MYELIN_OIDC_*` settings are optional as a group; setting any of the four endpoint/client
+fields requires all four. Production endpoints must use HTTPS and contain no credentials, query, or
+fragment. Register exactly `${MYELIN_PUBLIC_ORIGIN}/auth/oidc/callback` at the provider and configure
+the provider for `client_secret_basic`. `MYELIN_OIDC_SCOPES` defaults to `openid profile email` and
+must include `openid`. The edge must independently have its matching issuer, audience, and JWKS
+verification settings; the login page advertises SSO only when both halves report ready.
+
+The web server uses Authorization Code with S256 PKCE, a per-login nonce, and a ten-minute one-time
+state transaction. Those transactions are encrypted in the same region-local Valkey backend and
+atomically deleted before code exchange. `/readyz` probes both the session and OIDC transaction
+namespaces when interactive SSO is enabled.
 
 Run the listener on a private host binding behind the TLS ingress:
 
