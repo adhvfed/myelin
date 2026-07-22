@@ -240,6 +240,9 @@ pub mod durable;
 /// consistency fences scoped to one verified repository and normalized query; they never grant
 /// object access.
 pub mod refs_pagination;
+/// Bounded, snapshot-stable keyset pagination over one durable Git tree directory. Cursor object
+/// ids are consistency fences only; every request resolves its ref and path normally first.
+pub mod tree_pagination;
 /// **GT-003 (E1.2) — the cross-system recovery reconciler.** [`reconcile::reconcile_refs`] replays the
 /// committed `git.ref.updated` outbox rows against the durable on-disk repo, re-applying any whose
 /// on-disk `update_seq` is behind the durable reflog (the apply-after-outbox-commit crash window —

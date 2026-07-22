@@ -48,6 +48,12 @@ pub use crate::refs_pagination::{
     RefKind, RefPageItem, RefsPage, RefsPageError, RefsPageRequest, RefsSummary,
     REFS_PAGE_DEFAULT_LIMIT, REFS_PAGE_MAX_LIMIT, REFS_PAGE_MAX_QUERY_BYTES,
 };
+pub use crate::tree_pagination::{
+    TreePage, TreePageError, TreePageLookup, TreePageRequest, TREE_PAGE_DEFAULT_LIMIT,
+    TREE_PAGE_LATEST_COMMIT_WALK_MAX, TREE_PAGE_MAX_LIMIT, TREE_PAGE_MAX_QUERY_BYTES,
+    TREE_PAGE_SCAN_MAX_ENTRIES, TREE_PAGE_SCAN_MAX_NAME_BYTES,
+    TREE_PAGE_SCAN_MAX_TOTAL_NAME_BYTES,
+};
 
 // ───────────────────────────── errors ────────────────────────────────────────────────────────────
 
@@ -1103,7 +1109,7 @@ impl DurableGitRepo {
     /// — `None` if it does not resolve (an absent ref/oid is an empty browse, not an error). Uses
     /// libgit2's `revparse_single` (the same resolution `git show <rev>` uses) so branches, tags, and
     /// oids all work through the one browse path (R3.4).
-    fn resolve_commit<'r>(
+    pub(crate) fn resolve_commit<'r>(
         &self,
         repo: &'r git2::Repository,
         revspec: &str,
@@ -1566,7 +1572,67 @@ impl DurableGitRepo {
         let Some(tip_commit) = self.resolve_commit(&repo, ref_name)? else {
             return Ok(Default::default());
         };
-        let tip = tip_commit.id();
+        self.latest_commits_for_entries_from_tip(
+            &repo,
+            tip_commit.id(),
+            dir_path,
+            entries,
+            cap,
+        )
+    }
+
+    /// Resolve latest-commit metadata for one already-selected tree page against its immutable
+    /// commit snapshot. Unlike [`Self::latest_commits_for_entries`], this never re-resolves a mutable
+    /// branch between page selection and metadata projection. Tree pages contain at most 100 rows and
+    /// this snapshot walk is capped at 500 commits.
+    pub fn latest_commits_for_entries_at_snapshot(
+        &self,
+        snapshot_oid: &Oid,
+        dir_path: &str,
+        entries: &[TreeEntryInfo],
+        cap: usize,
+    ) -> Result<std::collections::BTreeMap<String, CommitMeta>, DurableError> {
+        if entries.len() > TREE_PAGE_MAX_LIMIT {
+            return Err(DurableError::Git(
+                "tree page metadata limit exceeded: entry count".into(),
+            ));
+        }
+        if cap > TREE_PAGE_LATEST_COMMIT_WALK_MAX {
+            return Err(DurableError::Git(
+                "tree page metadata limit exceeded: commit walk".into(),
+            ));
+        }
+        let clean_path = dir_path.trim_matches('/');
+        if dir_path.starts_with('/')
+            || !is_safe_tree_path(clean_path)
+            || entries.iter().any(|entry| {
+                entry.name.is_empty()
+                    || entry.name.len() > BROWSE_MAX_TREE_ENTRY_NAME_BYTES
+                    || entry.name.contains(['\0', '/'])
+            })
+        {
+            return Err(DurableError::Git(
+                "tree page metadata contains an unsafe path".into(),
+            ));
+        }
+        if entries.is_empty() || cap == 0 {
+            return Ok(Default::default());
+        }
+        let repo = self.open_git()?;
+        let tip = Self::parse_oid(snapshot_oid)?;
+        repo.find_commit(tip)
+            .map_err(|error| git_err("find snapshot commit", error))?;
+        self.latest_commits_for_entries_from_tip(&repo, tip, clean_path, entries, cap)
+    }
+
+    fn latest_commits_for_entries_from_tip(
+        &self,
+        repo: &git2::Repository,
+        tip: git2::Oid,
+        dir_path: &str,
+        entries: &[TreeEntryInfo],
+        cap: usize,
+    ) -> Result<std::collections::BTreeMap<String, CommitMeta>, DurableError> {
         let prefix = {
             let c = dir_path.trim_matches('/');
             if c.is_empty() {
