@@ -403,6 +403,18 @@ impl SearchReindexer {
         self.indexer.live_count(tenant, region)
     }
 
+    /// Fallibly read the live doc count for restore verification. Engine snapshot faults stay loud and
+    /// typed; they are never converted into the same zero used for a genuinely absent partition.
+    pub fn try_indexer_live_count(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+    ) -> Result<u64, ReindexError> {
+        self.indexer
+            .try_live_count(tenant, region)
+            .map_err(|e| ReindexError::Index(format!("live-count snapshot failed: {e:?}")))
+    }
+
     /// The live (non-tombstoned) vector count in the `(tenant, region)` index (the restore-verify gate's
     /// doc↔vector parity leg reads this — SRCH-P28).
     pub fn indexer_live_vector_count(&self, tenant: &TenantId, region: &Region) -> usize {
