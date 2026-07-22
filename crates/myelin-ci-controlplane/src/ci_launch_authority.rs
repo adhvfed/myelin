@@ -58,6 +58,28 @@ pub trait CiJobRuntimeAuthorityProvider: Send + Sync {
     >;
 }
 
+/// Explicit fail-closed placeholder used only by the dormant production composition. Keeping this
+/// one layer below the real policy adapter means the composed starter exercises the fixed policy
+/// mapping, while the missing durable money/token provider remains the exact visible activation
+/// blocker. It never fabricates handles.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct UnavailableCiJobRuntimeAuthority;
+
+impl CiJobRuntimeAuthorityProvider for UnavailableCiJobRuntimeAuthority {
+    fn materialize<'a>(
+        &'a self,
+        _request: CiJobRuntimeAuthorityRequest,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<CiJobRuntimeAuthority, CiLaunchAuthorityError>> + Send + 'a>,
+    > {
+        Box::pin(async {
+            Err(refused(
+                "durable CI budget reservation and token authority are not composed",
+            ))
+        })
+    }
+}
+
 /// Server policy for the only V2 execution profile currently accepted. Resource limits, default
 /// deny egress, batch scheduling, and fair-share identity are constants owned here—not plan fields.
 #[derive(Clone)]
@@ -448,5 +470,18 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.0, "budget unavailable");
         assert_eq!(runtime.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dormant_runtime_provider_never_fabricates_authority_handles() {
+        let (record, prepared) = fixture();
+        let policy = LinuxSmallV1LaunchAuthority::new(Arc::new(UnavailableCiJobRuntimeAuthority));
+        let pin = CiWorkflowDefinitionPin::new(1, "ci-body-v1").unwrap();
+
+        let error = policy
+            .materialize(&record, &prepared, &pin)
+            .await
+            .unwrap_err();
+        assert!(error.0.contains("not composed"));
     }
 }

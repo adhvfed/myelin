@@ -801,9 +801,11 @@ pub struct PgCiRunStarterFactory {
 }
 
 impl PgCiRunStarterFactory {
-    /// Bind the shared runtime dependencies for one cell region. The `region` is the residency boundary
-    /// every minted starter polls (and never crosses); `blobs` is the plan CAS the resolved run plan is
-    /// loaded from; `minter` mints the durable workflow's ids.
+    /// Test-support constructor with the explicit fail-closed authority. Production callers must use
+    /// [`Self::new_with_authority`], so an executable composition cannot silently inherit a placeholder.
+    /// The `region` is the residency boundary every minted starter polls (and never crosses); `blobs`
+    /// is the plan CAS the resolved run plan is loaded from; `minter` mints durable workflow ids.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(
         pool: PgPool,
         rt: tokio::runtime::Handle,
