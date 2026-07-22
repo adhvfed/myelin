@@ -206,6 +206,7 @@ describe("edgeLoginWithOidc", () => {
       material: "id-token",
       nonce: "nonce",
     });
+    expect(fetchMock.mock.calls[0]?.[1]?.redirect).toBe("error");
   });
 
   it("rejects a superficially successful response with the wrong signed-token scheme", async () => {

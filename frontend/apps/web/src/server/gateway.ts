@@ -61,6 +61,7 @@ export async function edgeGetPublic<T = unknown>(path: string): Promise<T> {
   const res = await fetch(`${edgeOrigin()}${path}`, {
     method: "GET",
     headers: { accept: "application/json" },
+    redirect: "error",
     signal: gatewayRequestSignal(),
   });
   const bodyText = await res.text();
@@ -93,6 +94,7 @@ export async function edgeLoginWithOidc(
     method: "POST",
     headers: { accept: "application/json", "content-type": "application/json" },
     body: JSON.stringify({ scheme: "oidc", material: idToken, nonce }),
+    redirect: "error",
     signal: gatewayRequestSignal(),
   });
   const text = await res.text();
@@ -138,6 +140,7 @@ export async function edgeWhoamiWithToken(token: string, scheme = "agent"): Prom
       authorization: `Bearer ${token}`,
       "x-myelin-token-scheme": scheme,
     },
+    redirect: "error",
     signal: gatewayRequestSignal(),
   });
   if (res.status !== 200) {
@@ -171,6 +174,7 @@ async function edgeRequest<T>(
           ...(body !== undefined ? { "content-type": "application/json" } : {}),
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,
+        redirect: "error",
         signal,
       });
       return { status: res.status, bodyText: await res.text() };
@@ -184,6 +188,7 @@ async function edgeRequest<T>(
           authorization: `Bearer ${rec.refreshToken}`,
           "x-myelin-token-scheme": "refresh",
         },
+        redirect: "error",
         signal,
       });
       if (res.status !== 200) return null;
@@ -219,6 +224,7 @@ export async function edgeGetRaw(
     fetch(`${edgeOrigin()}${path}`, {
       method: "GET",
       headers: { authorization: `Bearer ${token}`, "x-myelin-token-scheme": scheme },
+      redirect: "error",
       signal,
     });
 
@@ -233,6 +239,7 @@ export async function edgeGetRaw(
       const rr = await fetch(`${edgeOrigin()}/v1/auth/refresh`, {
         method: "POST",
         headers: { authorization: `Bearer ${rec.refreshToken}`, "x-myelin-token-scheme": "refresh" },
+        redirect: "error",
         signal,
       });
       if (rr.status === 200) {
