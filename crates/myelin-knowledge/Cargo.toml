@@ -132,7 +132,7 @@ sqlx = { workspace = true, optional = true }
 # (the Wave-2 identity-service posture), so `tokio` (the multi-thread runtime the sync→async
 # bridge requires) + `myelin-config` (the env-first durable config, fail-loud) are now regular
 # deps. Build stays DB-free: connecting happens at RUNTIME, never at build.
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 myelin-config = { path = "../myelin-config" }
 
 [features]

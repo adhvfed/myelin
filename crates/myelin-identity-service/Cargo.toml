@@ -156,7 +156,7 @@ ciborium = "0.2"
 # ValkeyCache/S3BlobStore use). These deps are NON-OPTIONAL (mirror W1): the durable `with_pg` path
 # is the always-compiled default, so `tokio`/`myelin-config` must be present in the DEFAULT build. The
 # in-memory doubles move behind `test-support` (below). `integration` is now a TEST-SELECTOR only.
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 myelin-config = { workspace = true }
 # The MR-007/008 integration tests reach the live pool directly for migration setup + the GUC-bleed
 # probe + RLS-bypassing admin cleanup (the same posture as myelin-storage's integration tests).

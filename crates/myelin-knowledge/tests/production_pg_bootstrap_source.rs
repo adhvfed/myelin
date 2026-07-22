@@ -7,7 +7,7 @@ fn production_knowledge_uses_split_role_bootstrap() {
     support::assert_split_role_source(
         source,
         "knowledge_service_migrations()",
-        "serve(knowledge_app_spec",
+        "serve_until_shutdown(\n        knowledge_app_spec",
     );
     assert!(source.contains("HotTables::declare(HOT_TABLES)"));
     support::assert_missing_migration_credential_fails_before_serve(
@@ -15,4 +15,5 @@ fn production_knowledge_uses_split_role_bootstrap() {
         "knowledge",
         "knowledge service failed",
     );
+    assert!(source.contains("SignalKind::terminate()"));
 }

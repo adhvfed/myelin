@@ -3,9 +3,10 @@
 //! The "every service `main.rs`" the contract-index row 1.1 names: it composes the DURABLE
 //! composition root (MR-009b W3b.4) and hands the Identity
 //! [`AppSpec`](myelin_identity_service::identity_app_spec) to the harness's one call,
-//! [`serve`](myelin_substrate::serve). The harness owns the whole lifecycle (boot → migrate →
-//! relay → consumers → three ports → graceful drain, with liveness ≠ readiness); this `main`
-//! composes and hands off — no hand-rolled lifecycle logic (architecture 00 §3.1 / §3.6).
+//! [`serve_until_shutdown`](myelin_substrate::serve_until_shutdown). The harness owns the whole
+//! lifecycle (boot → migrate → relay → consumers → three ports → graceful drain, with liveness ≠
+//! readiness); this `main` composes and hands off — no hand-rolled lifecycle logic (architecture 00
+//! §3.1 / §3.6).
 //!
 //! **DURABLE-BY-DEFAULT (MR-009b W3b.4 / SI-007):** the outbox the relay drains is the PG-backed
 //! `outbox` table (`OutboxStore::durable(PgOutboxBacking)`) over the MR-022 `SubstrateProvider`
@@ -24,7 +25,7 @@ use myelin_config::Mode;
 use myelin_events::OutboxStore;
 use myelin_identity_service::{identity_app_spec, identity_service_migrations};
 use myelin_storage::{all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking};
-use myelin_substrate::{serve, Config};
+use myelin_substrate::{serve_until_shutdown, Config};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -78,11 +79,49 @@ async fn main() {
     )));
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).
-    match serve(identity_app_spec(Config::default(), outbox)) {
+    match serve_until_shutdown(
+        identity_app_spec(Config::default(), outbox),
+        shutdown_signal(),
+    )
+    .await
+    {
         Ok(()) => {}
         Err(e) => {
             // A failed boot / incomplete drain returns non-zero (§3.1) — loud, never swallowed.
             eprintln!("identity service failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .unwrap_or_else(|error| {
+                    eprintln!("identity: failed to install SIGTERM handler: {error}");
+                    std::process::exit(1);
+                });
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result {
+                    eprintln!("identity: failed while waiting for SIGINT: {error}");
+                    std::process::exit(1);
+                }
+            }
+            signal = terminate.recv() => {
+                if signal.is_none() {
+                    eprintln!("identity: SIGTERM stream closed unexpectedly");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            eprintln!("identity: failed while waiting for shutdown signal: {error}");
             std::process::exit(1);
         }
     }
