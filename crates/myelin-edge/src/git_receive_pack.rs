@@ -75,12 +75,28 @@ pub(crate) fn parse_push_request(body: &[u8]) -> Result<(Vec<RefCommand>, Vec<u8
         let Some(p) = payload else { break }; // the flush-pkt ends the command list
         // The FIRST command carries the client capability list after a NUL — drop it (we ignore caps;
         // the response framing is fixed by our restricted advertisement).
-        let line = p.split(|&b| b == 0).next().unwrap_or(p);
+        let mut line_and_caps = p.splitn(2, |&byte| byte == 0);
+        let line = line_and_caps.next().unwrap_or(p);
+        let capabilities = line_and_caps.next();
+        if !cmds.is_empty() && capabilities.is_some() {
+            return Err("capability list is only valid on the first ref-update command".into());
+        }
+        if capabilities.is_some_and(|caps| caps.contains(&0)) {
+            return Err("ref-update command carries multiple NUL separators".into());
+        }
         let s = std::str::from_utf8(line)
             .map_err(|_| "non-utf8 ref-update command".to_string())?
-            .trim_end_matches(['\n', ' ']);
+            .trim_end_matches('\n');
         let parts: Vec<&str> = s.splitn(3, ' ').collect();
-        if parts.len() != 3 || parts[0].len() != 40 || parts[1].len() != 40 {
+        let valid_oid = |oid: &str| {
+            oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+        };
+        if parts.len() != 3
+            || !valid_oid(parts[0])
+            || !valid_oid(parts[1])
+            || !parts[2].starts_with("refs/")
+            || parts[2].bytes().any(|byte| byte.is_ascii_control() || byte == b' ')
+        {
             return Err(format!("malformed ref-update command {s:?}"));
         }
         let ref_name = parts[2].to_string();
@@ -219,6 +235,30 @@ mod tests {
         assert!(
             error.contains("duplicate ref-update command for \"refs/heads/topic\""),
             "the parser names the conflicting ref: {error}"
+        );
+    }
+
+    #[test]
+    fn malformed_oids_and_late_capability_lists_are_rejected() {
+        let z = "0".repeat(40);
+        let non_hex = "g".repeat(40);
+        let malformed = format!("{z} {non_hex} refs/heads/topic\n");
+        let mut body = format!("{:04x}{malformed}", malformed.len() + 4).into_bytes();
+        body.extend_from_slice(b"0000PACKmust-not-be-ingested");
+        assert!(
+            parse_push_request(&body)
+                .expect_err("non-hex object id must fail at the protocol boundary")
+                .contains("malformed ref-update command")
+        );
+
+        let first = format!("{z} {} refs/heads/one\n", "1".repeat(40));
+        let second = format!("{z} {} refs/heads/two\0report-status\n", "2".repeat(40));
+        let mut body = format!("{:04x}{first}", first.len() + 4).into_bytes();
+        body.extend_from_slice(format!("{:04x}{second}", second.len() + 4).as_bytes());
+        body.extend_from_slice(b"0000");
+        assert_eq!(
+            parse_push_request(&body).unwrap_err(),
+            "capability list is only valid on the first ref-update command"
         );
     }
 
