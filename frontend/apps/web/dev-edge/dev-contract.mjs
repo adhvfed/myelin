@@ -6,9 +6,9 @@
 // session carrying it. The gateway client + session machinery remain contract-faithful; only this
 // local authentication fixture is a stand-in. NEVER ship it.
 //
-// The data the dev edge serves is the REAL Git ViewModel JSON shape (RepoHome::to_json,
-// crates/myelin-git/src/web.rs) re-rooted under the MR-015 `/v1/git/...` edge contract — so the screen
-// renders the genuine edge ViewModel, not an invented shape.
+// The data the dev edge serves mirrors both REAL Git contracts: summary-only catalogue rows and the
+// enriched object-addressed RepoHome. Keeping those fixtures distinct prevents either shape from
+// accidentally satisfying the other's decoder.
 
 export const DEV_ACCESS_TOKEN = "dev.access.myelin-shell-e2e";
 export const DEV_REFRESH_TOKEN = "dev.refresh.myelin-shell-e2e";
@@ -63,17 +63,16 @@ const MYELIN_TREE = {
   },
 };
 
-// Two repos in the verified tenant — a POPULATED one (enriched: default_branch, full README, latest
-// commit, counts, name+activity entries) and an EMPTY one — so the screen exercises both the data row
-// AND an unglamorous (empty/onboarding) state. Shapes match the R3.4 edge RepoHome VM.
-export const SEED_REPOS = [
+// Full RepoHome fixtures belong only to the object-addressed home endpoint. Catalogue fixtures below
+// are intentionally separate so an enriched home cannot mask a summary-contract regression.
+export const SEED_REPO_HOMES = [
   {
     state: "populated",
     slug: "acme/myelin",
     default_branch: "main",
     readme: MYELIN_TREE["README.md"].file,
     readme_excerpt: "# acme/myelin\n\nThe make-it-real spine.",
-    clone_url: "ssh://git@myelin/acme/myelin.git",
+    clone_url: "/acme/eu-west/myelin.git",
     latest_commit: LATEST,
     counts: { branches: 2, tags: 1 },
     entries: [
@@ -93,14 +92,87 @@ export const SEED_REPOS = [
     state: "empty",
     slug: "acme/sandbox",
     default_branch: "main",
-    clone_url: "ssh://git@myelin/acme/sandbox.git",
+    clone_url: "/acme/eu-west/sandbox.git",
     counts: { branches: 0, tags: 0 },
   },
 ];
 
-// The MR-014 uniform list envelope `{ items, page: { next_cursor, limit } }` (catalogue.rs).
+export const SEED_REPO_SUMMARIES = [
+  {
+    state: "populated",
+    slug: "acme/myelin",
+    clone_url: "/acme/eu-west/myelin.git",
+  },
+  {
+    state: "empty",
+    slug: "acme/sandbox",
+  },
+];
+
+// Legacy no-view catalogue fixture retained while old clients migrate to the summary projection.
 export function reposEnvelope(limit = 50) {
-  return { items: SEED_REPOS, page: { next_cursor: null, limit } };
+  return { items: SEED_REPO_HOMES, page: { next_cursor: null, limit } };
+}
+
+const REPO_LIST_QUERY_MAX_BYTES = 16 * 1024;
+const REPO_LIST_CURSOR_MAX_BYTES = 512;
+
+function repoListCursor(slug) {
+  return `rl1_${Buffer.from(slug, "utf8").toString("base64url")}`;
+}
+
+function decodeRepoListCursor(cursor) {
+  if (typeof cursor !== "string" || textEncoder.encode(cursor).byteLength > REPO_LIST_CURSOR_MAX_BYTES ||
+      !/^rl1_[A-Za-z0-9_-]+$/.test(cursor)) return null;
+  try {
+    const encoded = cursor.slice("rl1_".length);
+    const bytes = Buffer.from(encoded, "base64url");
+    if (bytes.toString("base64url") !== encoded) return null;
+    const slug = bytes.toString("utf8");
+    if (!slug || Buffer.from(slug, "utf8").compare(bytes) !== 0 ||
+        !slug.split("/").every((part) => part && part !== "." && part !== ".." &&
+          /^[A-Za-z0-9._-]+$/.test(part))) return null;
+    return slug;
+  } catch {
+    return null;
+  }
+}
+
+/** Strict summary-list query grammar: exact view, canonical decimal limit, canonical rl1 cursor. */
+export function parseRepoSummaryQuery(rawQuery) {
+  if (typeof rawQuery !== "string" ||
+      textEncoder.encode(rawQuery).byteLength > REPO_LIST_QUERY_MAX_BYTES) return null;
+  const parsed = {};
+  for (const pair of rawQuery.split("&")) {
+    const equals = pair.indexOf("=");
+    if (equals <= 0) return null;
+    const name = decodeQueryComponent(pair.slice(0, equals));
+    const value = decodeQueryComponent(pair.slice(equals + 1));
+    if (name === null || value === null || !["view", "limit", "cursor"].includes(name) ||
+        Object.hasOwn(parsed, name)) return null;
+    parsed[name] = value;
+  }
+  if (parsed.view !== "summary") return null;
+  const limit = parsed.limit === undefined ? 50 : Number(parsed.limit);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 ||
+      (parsed.limit !== undefined && String(limit) !== parsed.limit)) return null;
+  if (parsed.cursor !== undefined && decodeRepoListCursor(parsed.cursor) === null) return null;
+  return { limit, ...(parsed.cursor === undefined ? {} : { cursor: parsed.cursor }) };
+}
+
+export function repoSummaryEnvelope(options = {}) {
+  const limit = options.limit ?? 50;
+  const after = options.cursor === undefined ? null : decodeRepoListCursor(options.cursor);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 ||
+      (options.cursor !== undefined && after === null)) return null;
+  const sorted = [...SEED_REPO_SUMMARIES].sort((left, right) =>
+    left.slug < right.slug ? -1 : left.slug > right.slug ? 1 : 0);
+  const remaining = after === null ? sorted : sorted.filter((row) => row.slug > after);
+  const items = remaining.slice(0, limit);
+  const next = remaining.length > items.length && items.length > 0
+    ? repoListCursor(items.at(-1).slug)
+    : null;
+  return { items, page: { next_cursor: next, limit } };
 }
 
 // The bare repo name (the edge route param) for a tenant-qualified slug (`acme/myelin` → `myelin`).
@@ -118,7 +190,7 @@ function bareName(slug) {
 
 /** GET /v1/git/repos/{repo} → the RepoHome ViewModel (null = 404). */
 export function repoHomeJson(repo) {
-  return SEED_REPOS.find((r) => bareName(r.slug) === repo) ?? null;
+  return SEED_REPO_HOMES.find((r) => bareName(r.slug) === repo) ?? null;
 }
 
 // ── R3.4: the ref switcher + nested tree + enriched blob (all keyed off MYELIN_TREE) ──

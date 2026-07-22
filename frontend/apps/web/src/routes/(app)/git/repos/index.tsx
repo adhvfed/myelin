@@ -1,19 +1,25 @@
 // The Git repos list (GT-004), rendered from the edge's RepoHome ViewModel JSON. Proves the full path:
-// shell → server-side gateway client → edge `/v1/git/repos` → the `{items,page}` envelope of RepoHome
-// ViewModels → this Solid render. Each repo links to its home screen. Unglamorous states are
+// shell → server-side gateway client → edge `/v1/git/repos?view=summary` → the bounded catalogue
+// envelope → this Solid render. Each repo links to its separately fetched home screen. Unglamorous states are
 // first-class (loading / error / empty-list / per-repo empty). Semantic tokens only.
-import { ErrorBoundary, For, Show, Suspense } from "solid-js";
+import { ErrorBoundary, For, Match, Show, Suspense, Switch } from "solid-js";
 import { Title } from "@solidjs/meta";
-import { A, createAsync } from "@solidjs/router";
+import { A, createAsync, useSearchParams } from "@solidjs/router";
 import { Icon, Skeleton } from "@myelin/design-system";
-import { getRepos, type RepoHomeVM } from "~/lib/api";
+import { getRepos, RepoRouteError, type RepoListRowVM } from "~/lib/api";
 import { getViewer } from "~/lib/auth";
 import { bareRepo } from "~/lib/format";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 import { ReposEmptyState } from "~/components/ReposEmptyState";
+import { repoListHref, repoListInputFromSearch } from "~/lib/repo-list-state";
 
 export default function ReposScreen() {
-  const repos = createAsync(() => getRepos(), { deferStream: true });
+  const [search] = useSearchParams();
+  const repos = createAsync(async () => {
+    const input = repoListInputFromSearch(search.limit, search.cursor);
+    if (!input) throw new RepoRouteError("error");
+    return getRepos(input);
+  }, { deferStream: true });
   const viewer = createAsync(() => getViewer());
 
   return (
@@ -44,6 +50,19 @@ export default function ReposScreen() {
                 >
                   <For each={page.items}>{(repo) => <RepoRow repo={repo} />}</For>
                 </ul>
+                <Show when={page.page.next_cursor}>
+                  {(next) => (
+                    <nav aria-label="Repository pages">
+                      <A
+                        data-testid="repos-next"
+                        href={repoListHref({ limit: page.page.limit, cursor: next() })}
+                        style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-primary)", padding: "var(--space-2) var(--space-3)", border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)" }}
+                      >
+                        Next <Icon name="chevron" />
+                      </A>
+                    </nav>
+                  )}
+                </Show>
               </Show>
             )}
           </Show>
@@ -53,7 +72,9 @@ export default function ReposScreen() {
   );
 }
 
-function RepoRow(props: { repo: RepoHomeVM }) {
+function RepoRow(props: { repo: RepoListRowVM }) {
+  const populated = () => props.repo.state === "populated" ? props.repo : undefined;
+  const empty = () => props.repo.state === "empty" ? props.repo : undefined;
   return (
     <li
       style={{
@@ -66,43 +87,36 @@ function RepoRow(props: { repo: RepoHomeVM }) {
         gap: "var(--space-1)",
       }}
     >
-      <Show
-        when={props.repo.state === "populated"}
-        fallback={
-          <Show
-            when={props.repo.state === "empty"}
-            fallback={<span style={{ color: "var(--text-subtle)" }}>Restricted repository</span>}
-          >
+      <Switch fallback={<span style={{ color: "var(--text-subtle)" }}>Restricted repository</span>}>
+        <Match when={empty()} keyed>
+          {(repo) => (
             <A
-              href={`/git/repos/${bareRepo(props.repo.slug)}`}
+              href={`/git/repos/${bareRepo(repo.slug)}`}
               style={{ display: "flex", "align-items": "center", gap: "var(--space-2)", color: "var(--text-primary)" }}
             >
               <Icon name="repo" />
-              <strong>{props.repo.slug}</strong>
+              <strong>{repo.slug}</strong>
               <span style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>empty · push to get started</span>
             </A>
-          </Show>
-        }
-      >
-        <A
-          href={`/git/repos/${bareRepo(props.repo.slug)}`}
-          style={{ display: "flex", "align-items": "center", gap: "var(--space-2)", color: "var(--text-primary)" }}
-        >
-          <Icon name="repo" />
-          <strong>{props.repo.slug}</strong>
-        </A>
-        <Show when={props.repo.readme_excerpt}>
-          {(excerpt) => (
-            <span style={{ color: "var(--text-muted)", "font-size": "var(--fs-body-sm)" }}>{excerpt()}</span>
           )}
-        </Show>
-        <span style={{ display: "flex", gap: "var(--space-3)", color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>
-          <span>
-            <Icon name="file" /> {props.repo.entries?.length ?? 0} entries
-          </span>
-          <code style={{ "font-family": "var(--font-mono)" }}>{props.repo.clone_url}</code>
-        </span>
-      </Show>
+        </Match>
+        <Match when={populated()} keyed>
+          {(repo) => (
+            <>
+              <A
+                href={`/git/repos/${bareRepo(repo.slug)}`}
+                style={{ display: "flex", "align-items": "center", gap: "var(--space-2)", color: "var(--text-primary)" }}
+              >
+                <Icon name="repo" />
+                <strong>{repo.slug}</strong>
+              </A>
+              <code style={{ "font-family": "var(--font-mono)", color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>
+                {repo.clone_url}
+              </code>
+            </>
+          )}
+        </Match>
+      </Switch>
     </li>
   );
 }

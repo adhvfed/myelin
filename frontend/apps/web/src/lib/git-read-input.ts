@@ -2,6 +2,10 @@ const utf8 = new TextEncoder();
 type WireRecord = Record<string, unknown>;
 
 export interface GitRepoInput { repo: string }
+export interface GitRepoListInput {
+  limit?: number;
+  cursor?: string;
+}
 export interface GitRefsInput extends GitRepoInput {
   limit?: number;
   cursor?: string;
@@ -81,6 +85,22 @@ function treeCursor(value: unknown): value is string {
   return bounded(value, 8 * 1024) && /^gt1_[A-Za-z0-9_-]+$/.test(value) && !hasControl(value);
 }
 
+/** A canonical repository-list cursor (`rl1_` + unpadded canonical base64url, Edge max 512 B). */
+export function isRepoListCursor(value: unknown): value is string {
+  if (!bounded(value, 512) || !/^rl1_[A-Za-z0-9_-]+$/.test(value)) return false;
+  const encoded = value.slice("rl1_".length);
+  if (encoded.length % 4 === 1) return false;
+  try {
+    const padded = encoded.replace(/-/g, "+").replace(/_/g, "/") +
+      "=".repeat((4 - (encoded.length % 4)) % 4);
+    const decoded = atob(padded);
+    const canonical = btoa(decoded).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    return canonical === encoded;
+  } catch {
+    return false;
+  }
+}
+
 export function isFullGitRef(value: unknown): value is string {
   if (!bounded(value, 4 * 1024) || hasControl(value)) return false;
   const name = value.startsWith("refs/heads/")
@@ -103,6 +123,25 @@ export function parseGitRepoInput(value: unknown): GitRepoInput | null {
   if (typeof value === "string") return repo(value) ? { repo: value } : null;
   const input = record(value);
   return input && exact(input, ["repo"]) && repo(input.repo) ? { repo: input.repo } : null;
+}
+
+export function parseGitRepoListInput(value: unknown): GitRepoListInput | null {
+  const input = record(value);
+  if (!input || !exact(input, ["limit", "cursor"]) ||
+      (input.limit !== undefined && (!Number.isSafeInteger(input.limit) ||
+        (input.limit as number) < 1 || (input.limit as number) > 100)) ||
+      (input.cursor !== undefined && !isRepoListCursor(input.cursor))) return null;
+  return {
+    ...(input.limit === undefined ? {} : { limit: input.limit as number }),
+    ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+  };
+}
+
+export function gitRepoListSearchParams(input: GitRepoListInput): URLSearchParams {
+  const params = new URLSearchParams({ view: "summary" });
+  if (input.limit !== undefined) params.set("limit", String(input.limit));
+  if (input.cursor !== undefined) params.set("cursor", input.cursor);
+  return params;
 }
 
 export function parseGitRefsInput(value: unknown): GitRefsInput | null {

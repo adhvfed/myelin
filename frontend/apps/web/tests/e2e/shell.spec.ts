@@ -97,22 +97,40 @@ test.describe("MR-019 app shell — real browser", () => {
   test("dev login → the repos screen renders the edge ViewModel JSON (shell→gateway→edge→ViewModel)", async ({ page }) => {
     await devLogin(page);
 
-    // The repos list is the real edge RepoHome ViewModel projection.
+    // The repos list is the lightweight catalogue projection, distinct from RepoHome.
     await expect(page).toHaveTitle("Code · Myelin");
     await expect(page.getByTestId("repos-list")).toBeVisible();
     await expect(page.getByText("acme/myelin", { exact: true })).toBeVisible();
-    await expect(page.getByText("The make-it-real spine.")).toBeVisible(); // the README excerpt field
-    await expect(page.getByText("ssh://git@myelin/acme/myelin.git")).toBeVisible();
+    await expect(page.getByText("The make-it-real spine.")).toHaveCount(0);
+    await expect(page.getByText("/acme/eu-west/myelin.git")).toBeVisible();
     // The empty-state repo (an unglamorous state served by the same envelope).
     await expect(page.getByText("acme/sandbox", { exact: true })).toBeVisible();
     await expect(page.getByText("empty · push to get started")).toBeVisible();
 
     // The chrome is present: residency cue (data region from whoami/session), identity, inbox.
     await expect(page.getByText("Data region:")).toBeVisible();
-    await expect(page.getByText("eu-west")).toBeVisible();
+    await expect(page.getByText("eu-west", { exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: /Inbox/ })).toBeVisible();
 
     await expectNoAxeViolations(page, "the authenticated shell + repos screen");
+  });
+
+  test("repository summary pages replace rows and browser Back restores the prior page", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos?limit=1");
+
+    await expect(page.getByText("acme/myelin", { exact: true })).toBeVisible();
+    await expect(page.getByText("acme/sandbox", { exact: true })).toHaveCount(0);
+    await page.getByTestId("repos-next").click();
+    await expect(page).toHaveURL(/\/git\/repos\?limit=1&cursor=rl1_/);
+    await expect(page.getByText("acme/sandbox", { exact: true })).toBeVisible();
+    await expect(page.getByText("acme/myelin", { exact: true })).toHaveCount(0);
+
+    await page.goBack();
+    await expect(page).toHaveURL(/\/git\/repos\?limit=1$/);
+    await expect(page.getByText("acme/myelin", { exact: true })).toBeVisible();
+    await expect(page.getByText("acme/sandbox", { exact: true })).toHaveCount(0);
+    await expectNoAxeViolations(page, "repository summary page restored by browser back");
   });
 
   test("the session cookie is opaque and re-authentication revokes the prior id", async ({ page }) => {

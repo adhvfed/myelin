@@ -1,7 +1,7 @@
 // THE DEV EDGE — a clearly-marked stand-in for the real `myelin-edge` binary (see dev-contract.mjs).
 //
 // It implements the SUBSET of the MR-014/015 edge HTTP contract the app shell exercises:
-//   GET  /v1/git/repos      → the Git RepoHome ViewModel list in the `{items,page}` envelope (Bearer-auth)
+//   GET  /v1/git/repos      → summary catalogue (view=summary) or legacy RepoHome list (Bearer-auth)
 //   GET  /v1/whoami         → the verified principal + scope (Bearer-auth)
 //   POST /v1/auth/refresh   → the single-refresh round-trip (returns a fresh access token, or 401)
 //   GET  /healthz           → liveness for the Playwright webServer
@@ -16,6 +16,8 @@ import {
   DEV_REFRESH_TOKEN,
   whoamiJson,
   reposEnvelope,
+  repoSummaryEnvelope,
+  parseRepoSummaryQuery,
   repoHomeJson,
   blobJson,
   commitsEnvelope,
@@ -359,6 +361,16 @@ const server = createServer((req, res) => {
 
   if (method === "GET" && path === "/v1/git/repos") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (url.searchParams.has("view")) {
+      const input = parseRepoSummaryQuery(url.search.slice(1));
+      if (!input) {
+        return send(res, 400, { error: { message: "invalid repository list request", code: "bad_request" } });
+      }
+      if (state.emptyRepos) {
+        return send(res, 200, { items: [], page: { next_cursor: null, limit: input.limit } });
+      }
+      return send(res, 200, repoSummaryEnvelope(input));
+    }
     const limit = Number(url.searchParams.get("limit") ?? 50);
     // A fresh tenant (test-controlled) serves the empty envelope → the onboarding empty state.
     if (state.emptyRepos) return send(res, 200, { items: [], page: { next_cursor: null, limit } });

@@ -21,18 +21,25 @@ function fmtBytes(n?: number): string {
 
 export default function BlobScreen() {
   const params = useParams();
+  const ref = () => {
+    try {
+      return decodeURIComponent(params.ref ?? "");
+    } catch {
+      return "";
+    }
+  };
   const path = () => params.path ?? "";
-  const ready = () => Boolean(params.repo && params.ref && path());
+  const ready = () => Boolean(params.repo && ref() && path());
   const blob = createAsync(
     async () =>
-      ready() ? getBlob({ repo: params.repo!, ref: params.ref!, path: path() }) : undefined,
+      ready() ? getBlob({ repo: params.repo!, ref: ref(), path: path() }) : undefined,
     { deferStream: true },
   );
 
   const encPath = () => path().split("/").map(encodeURIComponent).join("/");
-  const rawHref = () => `/git-raw/${params.repo}/${encodeURIComponent(params.ref!)}/${encPath()}?d=inline`;
-  const downloadHref = () => `/git-raw/${params.repo}/${encodeURIComponent(params.ref!)}/${encPath()}?d=attachment`;
-  const treeHref = () => `/git/repos/${params.repo}/tree/${encodeURIComponent(params.ref!)}/${encPath()}`;
+  const rawHref = () => `/git-raw/${params.repo}/${encodeURIComponent(ref())}/${encPath()}?d=inline`;
+  const downloadHref = () => `/git-raw/${params.repo}/${encodeURIComponent(ref())}/${encPath()}?d=attachment`;
+  const treeHref = () => `/git/repos/${params.repo}/tree/${encodeURIComponent(ref())}/${encPath()}`;
 
   const toolbarBtn = {
     display: "inline-flex", "align-items": "center", gap: "var(--space-1)",
@@ -43,7 +50,7 @@ export default function BlobScreen() {
   return (
     <section aria-labelledby="blob-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-3)" }}>
       <Title>{path()} · {params.repo} · Myelin</Title>
-      <RepoBreadcrumb repo={params.repo!} refName={params.ref!} path={path()} kind="blob" />
+      <RepoBreadcrumb repo={params.repo!} refName={ref()} path={path()} kind="blob" />
 
       <ErrorBoundary fallback={(err, reset) => <RepoErrorState kind={errKind(err)} repo={params.repo} onRetry={reset} />}>
         <Suspense

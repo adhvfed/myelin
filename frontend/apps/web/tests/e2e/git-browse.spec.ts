@@ -40,7 +40,7 @@ test.describe("GT-004 Git web UI — real browser", () => {
 
     await expect(page.getByRole("heading", { name: "acme/myelin", level: 1 })).toBeVisible();
     // Clone URL (with the GT-006 honesty note) + the top-level tree from the ViewModel.
-    await expect(page.getByTestId("clone-url")).toContainText("ssh://git@myelin/acme/myelin.git");
+    await expect(page.getByTestId("clone-url")).toContainText("/acme/eu-west/myelin.git");
     await expect(page.getByText("clone over the wire is GT-006")).toBeVisible();
     const tree = page.getByTestId("repo-tree");
     await expect(tree.getByText("README.md", { exact: true })).toBeVisible();
@@ -53,7 +53,7 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await devLogin(page);
     await page.goto("/git/repos/myelin");
     await page.getByTestId("repo-tree").getByRole("link", { name: "README.md" }).click();
-    await page.waitForURL("**/git/repos/myelin/blob/main/README.md");
+    await page.waitForURL("**/git/repos/myelin/blob/refs%2Fheads%2Fmain/README.md");
 
     await expect(page.getByTestId("blob-contents")).toContainText("The make-it-real spine.");
     await expect(page.getByText(/blake3:readmecontentaddress/)).toBeVisible(); // the content-address
@@ -144,7 +144,7 @@ test.describe("GT-004 Git web UI — real browser", () => {
     // Press through the locator so a deferred hydration replacement cannot move the global keyboard
     // target in the gap after the focus assertion. This is still a real Enter key activation.
     await fileLink.press("Enter");
-    await page.waitForURL("**/git/repos/myelin/blob/main/README.md");
+    await page.waitForURL("**/git/repos/myelin/blob/refs%2Fheads%2Fmain/README.md");
     await expect(page.getByTestId("blob-contents")).toBeVisible();
   });
 
@@ -156,16 +156,16 @@ test.describe("GT-004 Git web UI — real browser", () => {
 
     // Into crates/ (a directory row → the tree route).
     await page.getByTestId("repo-tree").getByRole("link", { name: "crates" }).click();
-    await page.waitForURL("**/git/repos/myelin/tree/main/crates");
+    await page.waitForURL("**/git/repos/myelin/tree/refs%2Fheads%2Fmain/crates");
     await expectNoAxeViolations(page, "tree-at-path (crates)");
 
     // Into crates/myelin-edge/ (deeper).
     await page.getByTestId("repo-tree").getByRole("link", { name: "myelin-edge" }).click();
-    await page.waitForURL("**/git/repos/myelin/tree/main/crates/myelin-edge");
+    await page.waitForURL("**/git/repos/myelin/tree/refs%2Fheads%2Fmain/crates/myelin-edge");
 
     // Open lib.rs (a file → the nested blob route; contents are readable, not garbled).
     await page.getByTestId("repo-tree").getByRole("link", { name: "lib.rs" }).click();
-    await page.waitForURL("**/git/repos/myelin/blob/main/crates/myelin-edge/lib.rs");
+    await page.waitForURL("**/git/repos/myelin/blob/refs%2Fheads%2Fmain/crates/myelin-edge/lib.rs");
     await expect(page.getByTestId("blob-contents")).toContainText("the product edge");
     // The Download affordance is present (gateway-proxied attachment).
     await expect(page.getByTestId("blob-download")).toBeVisible();
