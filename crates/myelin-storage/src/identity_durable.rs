@@ -485,7 +485,7 @@ impl DurablePrincipalBacking {
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                    Ok(row.map(|r| row_to_principal(&r)))
+                    row.map(|row| row_to_principal(&row)).transpose()
                 })
             })
             .await
@@ -512,7 +512,7 @@ impl DurablePrincipalBacking {
                     .fetch_all(&mut *conn)
                     .await
                     .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                    Ok(rows.iter().map(row_to_principal).collect::<Vec<_>>())
+                    rows.iter().map(row_to_principal).collect()
                 })
             })
             .await
@@ -593,7 +593,7 @@ impl DurablePrincipalBacking {
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                    Ok(row.map(|r| row_to_principal(&r)))
+                    row.map(|row| row_to_principal(&row)).transpose()
                 })
             })
             .await
@@ -602,23 +602,77 @@ impl DurablePrincipalBacking {
 
 /// Map a `principal`-shaped row to a [`DurablePrincipalRow`] (the profile is `Some` iff a key_ref is
 /// present — the §X-7 split: the row's attribution columns are always there, the profile is separable).
-fn row_to_principal(r: &sqlx::postgres::PgRow) -> DurablePrincipalRow {
-    let key_ref: Option<String> = r.get("profile_key_ref");
-    let profile = key_ref.map(|key_ref| DurableProfileBlob {
-        key_ref,
-        nonce: r
-            .get::<Option<Vec<u8>>, _>("profile_nonce")
-            .unwrap_or_default(),
-        ciphertext: r
-            .get::<Option<Vec<u8>>, _>("profile_ciphertext")
-            .unwrap_or_default(),
-    });
-    DurablePrincipalRow {
-        principal_id: r.get("principal_id"),
-        kind: r.get("kind"),
-        data_role: r.get("data_role"),
-        status: r.get("status"),
+fn row_to_principal(r: &sqlx::postgres::PgRow) -> Result<DurablePrincipalRow, crate::pg::PgError> {
+    let key_ref = r
+        .try_get::<Option<String>, _>("profile_key_ref")
+        .map_err(principal_row_decode)?;
+    let nonce = r
+        .try_get::<Option<Vec<u8>>, _>("profile_nonce")
+        .map_err(principal_row_decode)?;
+    let ciphertext = r
+        .try_get::<Option<Vec<u8>>, _>("profile_ciphertext")
+        .map_err(principal_row_decode)?;
+    let profile = decode_profile(key_ref, nonce, ciphertext)?;
+    Ok(DurablePrincipalRow {
+        principal_id: r.try_get("principal_id").map_err(principal_row_decode)?,
+        kind: r.try_get("kind").map_err(principal_row_decode)?,
+        data_role: r.try_get("data_role").map_err(principal_row_decode)?,
+        status: r.try_get("status").map_err(principal_row_decode)?,
         profile,
+    })
+}
+
+fn decode_profile(
+    key_ref: Option<String>,
+    nonce: Option<Vec<u8>>,
+    ciphertext: Option<Vec<u8>>,
+) -> Result<Option<DurableProfileBlob>, crate::pg::PgError> {
+    match (key_ref, nonce, ciphertext) {
+        (None, None, None) => Ok(None),
+        (Some(key_ref), Some(nonce), Some(ciphertext)) => Ok(Some(DurableProfileBlob {
+            key_ref,
+            nonce,
+            ciphertext,
+        })),
+        _ => Err(crate::pg::PgError::Query(
+            "principal row has an incomplete encrypted profile".to_string(),
+        )),
+    }
+}
+
+fn principal_row_decode(error: sqlx::Error) -> crate::pg::PgError {
+    crate::pg::PgError::Query(format!("principal row decode failed: {error}"))
+}
+
+#[cfg(test)]
+mod principal_decode_tests {
+    use super::decode_profile;
+
+    #[test]
+    fn encrypted_profile_columns_are_all_or_nothing() {
+        assert_eq!(decode_profile(None, None, None).unwrap(), None);
+        let profile = decode_profile(
+            Some("kms://tenant/profile".to_string()),
+            Some(vec![1, 2]),
+            Some(vec![3, 4]),
+        )
+        .expect("a complete encrypted profile decodes")
+        .expect("profile is present");
+        assert_eq!(profile.nonce, vec![1, 2]);
+        assert_eq!(profile.ciphertext, vec![3, 4]);
+
+        for partial in [
+            (Some("secret-key-ref".to_string()), None, None),
+            (None, Some(vec![1]), Some(vec![2])),
+            (Some("secret-key-ref".to_string()), Some(vec![1]), None),
+        ] {
+            let error = decode_profile(partial.0, partial.1, partial.2)
+                .expect_err("a partial encrypted profile must fail closed");
+            assert!(error
+                .to_string()
+                .contains("principal row has an incomplete encrypted profile"));
+            assert!(!error.to_string().contains("secret-key-ref"));
+        }
     }
 }
 
