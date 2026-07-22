@@ -124,6 +124,19 @@ fn production_edge_owns_the_durable_issue_saga_worker_without_an_in_memory_fallb
 }
 
 #[test]
+fn production_git_wire_binds_the_verified_principal_to_the_live_identity_minter() {
+    let main = include_str!("../src/main.rs");
+    let durable = include_str!("../src/git_durable.rs");
+    let http = include_str!("../src/git_wire_http.rs");
+    let compact_main: String = main.split_whitespace().collect::<String>().replace(",)", ")");
+
+    assert!(compact_main.contains("IdentityGitWireCredentialIssuerFactory::new(check.clone())"));
+    assert!(main.contains(".with_git_wire_credential_issuer(git_wire_credentials)"));
+    assert!(durable.contains("self.git_wire_credentials.bind(principal)"));
+    assert!(http.contains(".wire_serving(ctx.principal)"));
+}
+
+#[test]
 fn dogfood_exports_distinct_runtime_and_migration_credentials() {
     let dev_stack = include_str!("../../../scripts/dev-stack.sh");
     let dogfood = include_str!("../../../scripts/dogfood.sh");

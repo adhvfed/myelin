@@ -160,7 +160,7 @@ pub struct DurableGitBackend {
     /// Per-wire short-lived credential authority. Production defaults unavailable/fail-closed until
     /// the composition root injects the live Identity adapter; test support injects an explicit
     /// deterministic issuer.
-    git_wire_credentials: Arc<dyn crate::git_wire_exec::GitWireCredentialIssuer>,
+    git_wire_credentials: Arc<dyn crate::git_wire_exec::GitWireCredentialIssuerFactory>,
     /// **R0.3 / DELTA N2 — the per-repo object-authorization seam for the git wire.** The wire handlers
     /// consult this AFTER `repo_loc` resolves the repo and BEFORE serving any bytes, so an in-tenant
     /// principal with no grant on a repo cannot clone/fetch/push it (the un-granted-repo-reach hole,
@@ -303,7 +303,8 @@ impl DurableGitBackend {
             clone_base: public_clone_base(),
             root,
             git_shutdown: Arc::new(AtomicBool::new(false)),
-            git_wire_credentials: crate::git_wire_exec::unavailable_git_wire_credential_issuer(),
+            git_wire_credentials:
+                crate::git_wire_exec::unavailable_git_wire_credential_issuer_factory(),
             // R2.6: the prod constructor default is FAIL-CLOSED (`DenyAllRepos`) — a composition root
             // that forgets `with_repo_authorizer` denies every repo rather than serving all of them.
             // Production `main.rs` ALWAYS injects the real `CheckBackedRepoAuthorizer`; the permissive
@@ -338,7 +339,7 @@ impl DurableGitBackend {
             clone_base: public_clone_base(),
             root,
             git_shutdown: Arc::new(AtomicBool::new(false)),
-            git_wire_credentials: crate::git_wire_exec::test_git_wire_credential_issuer(),
+            git_wire_credentials: crate::git_wire_exec::test_git_wire_credential_issuer_factory(),
             repo_authz: Arc::new(AllowAllRepos),
             bootstrap: Arc::new(NoRepoBootstrap),
         }
@@ -384,7 +385,7 @@ impl DurableGitBackend {
     /// launch. Without this injection the production default refuses every wire invocation.
     pub fn with_git_wire_credential_issuer(
         mut self,
-        issuer: Arc<dyn crate::git_wire_exec::GitWireCredentialIssuer>,
+        issuer: Arc<dyn crate::git_wire_exec::GitWireCredentialIssuerFactory>,
     ) -> DurableGitBackend {
         self.git_wire_credentials = issuer;
         self
@@ -398,6 +399,7 @@ impl DurableGitBackend {
     /// this over the wire (+ the receive-pack/PUSH path) is CT-006c.
     pub fn wire_serving(
         &self,
+        principal: &Principal,
     ) -> myelin_git::core::RoutedGitCore<
         crate::git_wire_exec::GitWireExecutor,
         myelin_git::gix_backend::GixCore<myelin_git::gix_backend::RootedResolver>,
@@ -407,7 +409,7 @@ impl DurableGitBackend {
             crate::git_wire_exec::GitWireExecutor::default_limits(),
             crate::git_wire_exec::GitWireExecutor::serving_hooks(),
             self.git_shutdown.clone(),
-            self.git_wire_credentials.clone(),
+            self.git_wire_credentials.bind(principal),
         )
     }
 
@@ -2316,7 +2318,7 @@ impl DurableGitBackend {
                 self.root.clone(),
                 crate::git_wire_exec::GitWireExecutor::default_limits(),
                 crate::git_wire_exec::GitWireExecutor::serving_hooks(),
-                self.git_wire_credentials.clone(),
+                self.git_wire_credentials.bind(principal),
             )
             .with_shutdown_signal(self.git_shutdown.clone());
             match exec.ingest_pack(&loc, pack) {

@@ -37,6 +37,17 @@ use myelin_ci_sandbox::{
 };
 use myelin_git::core::{GitCoreError, RoutedGitCore, WireExecutor, WireInvocation, WireOutput};
 use myelin_git::gix_backend::{GixCore, RootedResolver};
+use myelin_git::live_check::{perm, strong_at};
+use myelin_identity::{
+    DataRole, Decision, DelegationCaveats, FailStaticBound, IdentityService, Permission, Principal,
+    PrincipalId, PrincipalKind, PrincipalStatus, RunId, RunToken, Zookie,
+};
+use myelin_identity_service::delegation::DelegationInput;
+use myelin_identity_service::machine_auth::{
+    scheme, Authority, CredentialAudience, CredentialPurpose, MachineKind,
+};
+use myelin_identity_service::StoreBackedCheck;
+use myelin_storage::TenantScope;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -57,6 +68,16 @@ pub struct GitWireCredentialRequest<'a> {
 /// Identity token authority; the executor has no fallback that fabricates credentials.
 pub trait GitWireCredentialIssuer: Send + Sync {
     fn mint(&self, request: &GitWireCredentialRequest<'_>) -> Result<RunTokenCredential, String>;
+
+    /// Verify signature, purpose, and live run lifecycle immediately before the launch hook admits
+    /// the sandbox. Implementations must return only bounded, credential-free errors.
+    fn verify(&self, credential: &RunTokenCredential) -> Result<(), String>;
+}
+
+/// Request-binds a credential issuer to the already verified edge principal. This prevents a
+/// process-global issuer from minting against caller-selected identity data.
+pub trait GitWireCredentialIssuerFactory: Send + Sync {
+    fn bind(&self, principal: &Principal) -> Arc<dyn GitWireCredentialIssuer>;
 }
 
 #[derive(Debug)]
@@ -66,10 +87,28 @@ impl GitWireCredentialIssuer for UnavailableGitWireCredentialIssuer {
     fn mint(&self, _request: &GitWireCredentialRequest<'_>) -> Result<RunTokenCredential, String> {
         Err("no live Identity Git-wire credential issuer is configured".into())
     }
+
+    fn verify(&self, _credential: &RunTokenCredential) -> Result<(), String> {
+        Err("no live Identity Git-wire credential verifier is configured".into())
+    }
 }
 
-pub(crate) fn unavailable_git_wire_credential_issuer() -> Arc<dyn GitWireCredentialIssuer> {
+fn unavailable_git_wire_credential_issuer() -> Arc<dyn GitWireCredentialIssuer> {
     Arc::new(UnavailableGitWireCredentialIssuer)
+}
+
+#[derive(Debug)]
+struct UnavailableGitWireCredentialIssuerFactory;
+
+impl GitWireCredentialIssuerFactory for UnavailableGitWireCredentialIssuerFactory {
+    fn bind(&self, _principal: &Principal) -> Arc<dyn GitWireCredentialIssuer> {
+        Arc::new(UnavailableGitWireCredentialIssuer)
+    }
+}
+
+pub(crate) fn unavailable_git_wire_credential_issuer_factory(
+) -> Arc<dyn GitWireCredentialIssuerFactory> {
+    Arc::new(UnavailableGitWireCredentialIssuerFactory)
 }
 
 /// Explicit deterministic issuer for tests/drills. It is absent from the default production graph;
@@ -88,11 +127,190 @@ impl GitWireCredentialIssuer for TestGitWireCredentialIssuer {
         )
         .map_err(|error| error.to_string())
     }
+
+    fn verify(&self, credential: &RunTokenCredential) -> Result<(), String> {
+        if credential
+            .expose_bearer()
+            .starts_with("test-git-wire-bearer:")
+            && credential.jti.starts_with("test-git-wire-jti:")
+        {
+            Ok(())
+        } else {
+            Err("test Git-wire credential verification refused".into())
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_git_wire_credential_issuer() -> Arc<dyn GitWireCredentialIssuer> {
     Arc::new(TestGitWireCredentialIssuer)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub struct TestGitWireCredentialIssuerFactory;
+
+#[cfg(any(test, feature = "test-support"))]
+impl GitWireCredentialIssuerFactory for TestGitWireCredentialIssuerFactory {
+    fn bind(&self, _principal: &Principal) -> Arc<dyn GitWireCredentialIssuer> {
+        test_git_wire_credential_issuer()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_git_wire_credential_issuer_factory() -> Arc<dyn GitWireCredentialIssuerFactory> {
+    Arc::new(TestGitWireCredentialIssuerFactory)
+}
+
+/// Production Identity adapter. Each bound issuer owns the verified trigger principal, rechecks
+/// its exact repo permission strongly at mint time, and emits a zero-authority per-job credential:
+/// the outer edge authorization permits the Git operation; the sandbox credential supplies only
+/// short-lived, signed attribution and cannot be replayed as repo authority.
+#[derive(Clone)]
+pub struct IdentityGitWireCredentialIssuerFactory {
+    identity: StoreBackedCheck,
+}
+
+impl IdentityGitWireCredentialIssuerFactory {
+    pub fn new(identity: StoreBackedCheck) -> Self {
+        Self { identity }
+    }
+}
+
+impl GitWireCredentialIssuerFactory for IdentityGitWireCredentialIssuerFactory {
+    fn bind(&self, principal: &Principal) -> Arc<dyn GitWireCredentialIssuer> {
+        Arc::new(IdentityGitWireCredentialIssuer {
+            identity: self.identity.clone(),
+            principal: principal.clone(),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct IdentityGitWireCredentialIssuer {
+    identity: StoreBackedCheck,
+    principal: Principal,
+}
+
+impl GitWireCredentialIssuer for IdentityGitWireCredentialIssuer {
+    fn mint(&self, request: &GitWireCredentialRequest<'_>) -> Result<RunTokenCredential, String> {
+        if self.principal.status != PrincipalStatus::Active
+            || self.principal.tenant.0 != request.tenant
+            || self.principal.region.0 != request.region
+        {
+            return Err("verified principal does not match the Git-wire scope".into());
+        }
+        let required = match request.operation {
+            "upload-pack" => perm::PULL,
+            "receive-pack-ingest" => perm::PUSH,
+            _ => return Err("unsupported Git-wire credential operation".into()),
+        };
+        if !matches!(
+            self.identity.check(
+                &self.principal,
+                &Permission(required.into()),
+                &crate::repo_authz_live::repo_object_ref(request.repo),
+                &strong_at(Zookie(String::new())),
+                None,
+            ),
+            Ok(Decision::Allow)
+        ) {
+            return Err("Identity refused the Git-wire repo permission".into());
+        }
+
+        let scope =
+            TenantScope::from_verified_token(&self.principal, self.principal.region.clone());
+        let service_id = PrincipalId(format!("git-wire:{}", request.invocation_id));
+        let service = Principal::new(
+            self.principal.tenant.clone(),
+            self.principal.region.clone(),
+            service_id.clone(),
+            PrincipalKind::Service,
+            DataRole::Processor,
+            PrincipalStatus::Active,
+        );
+        let empty = Authority::default();
+        let input = DelegationInput {
+            agent_policy: empty.clone(),
+            delegation: empty.clone(),
+            tenant_policy: empty.clone(),
+            trigger_actor_held: empty,
+        };
+        let minted = self
+            .identity
+            .mint_run_token_in(
+                &scope,
+                &service_id,
+                &RunId(format!("git-wire:{}", request.invocation_id)),
+                &service,
+                &self.principal,
+                &input,
+                &DelegationCaveats(Vec::new()),
+                MachineKind::PerJob,
+                &FailStaticBound {
+                    static_max_secs: request.ttl_secs,
+                },
+                &system_now_timestamp(),
+            )
+            .map_err(|_| "Identity refused the Git-wire run-token mint".to_string())?;
+        RunTokenCredential::new(minted.token, minted.jti, request.ttl_secs)
+            .map_err(|_| "Identity returned an invalid Git-wire credential".to_string())
+    }
+
+    fn verify(&self, credential: &RunTokenCredential) -> Result<(), String> {
+        let token = RunToken {
+            token: credential.expose_bearer().to_owned(),
+            jti: credential.jti.clone(),
+        };
+        let verified = self
+            .identity
+            .introspect_run_token(scheme::PER_JOB, &token)
+            .map_err(|_| "Identity rejected the Git-wire credential signature".to_string())?;
+        let expected_prefix = "git-wire:";
+        let purpose_matches_subject = matches!(
+            &verified.purpose,
+            CredentialPurpose::PerJob { run_id } if run_id == &verified.subject_key
+        );
+        if verified.jti != credential.jti
+            || verified.tenant != self.principal.tenant
+            || verified.region != self.principal.region
+            || !verified.subject_key.starts_with(expected_prefix)
+            || !purpose_matches_subject
+            || verified.audience != CredentialAudience::Edge
+            || !verified.authority.is_empty()
+        {
+            return Err("Identity rejected the Git-wire credential binding".into());
+        }
+        let verified_principal = Principal::new(
+            verified.tenant,
+            verified.region,
+            PrincipalId(verified.subject_key),
+            PrincipalKind::Service,
+            DataRole::Processor,
+            PrincipalStatus::Active,
+        );
+        let scope = TenantScope::from_verified_token(
+            &verified_principal,
+            verified_principal.region.clone(),
+        );
+        if !self
+            .identity
+            .run_token_minter()
+            .is_live(&scope, &token, &system_now_timestamp())
+        {
+            return Err("Identity rejected the Git-wire credential lifecycle".into());
+        }
+        Ok(())
+    }
+}
+
+fn system_now_timestamp() -> myelin_events::Timestamp {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let instant = chrono::DateTime::from_timestamp(seconds, 0).unwrap_or_default();
+    myelin_events::Timestamp(instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
 /// The production [`WireExecutor`]: every canonical-`git` wire invocation runs SANDBOXED through the
@@ -123,6 +341,24 @@ impl GitWireExecutor {
         hooks: RunnerHooks,
         credential_issuer: Arc<dyn GitWireCredentialIssuer>,
     ) -> Self {
+        let RunnerHooks {
+            reserve,
+            settle,
+            attribute,
+            isolation_floor,
+        } = hooks;
+        let verifier = credential_issuer.clone();
+        let hooks = RunnerHooks {
+            reserve,
+            settle,
+            attribute: Box::new(move |credential| {
+                verifier
+                    .verify(credential)
+                    .map_err(myelin_ci_sandbox::HookError)?;
+                attribute(credential)
+            }),
+            isolation_floor,
+        };
         Self {
             backend: GvisorBackend::new(),
             root: root.into(),
@@ -454,7 +690,51 @@ pub fn production_git_core_default_with_shutdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use myelin_events::{OutboxStore, Timestamp};
     use myelin_git::core::RepoLoc;
+    use myelin_identity::{ObjectId, RelName, RelationTuple, TupleDelta};
+    use myelin_identity_service::TupleStore;
+    use myelin_tenancy::{Region, TenantId};
+
+    fn wire_principal() -> Principal {
+        Principal::new(
+            TenantId("acme".into()),
+            Region("eu-west".into()),
+            PrincipalId("p:wire-user".into()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        )
+    }
+
+    fn identity_wire_factory() -> IdentityGitWireCredentialIssuerFactory {
+        let tuples = TupleStore::new(OutboxStore::new());
+        let identity = StoreBackedCheck::new(tuples.clone());
+        for result in identity.admit_git_fragment() {
+            assert!(matches!(
+                result,
+                myelin_identity::FragmentAdmit::Admitted { .. }
+            ));
+        }
+        let principal = wire_principal();
+        let scope = TenantScope::from_verified_token(&principal, principal.region.clone());
+        tuples
+            .write_tuples(
+                &scope,
+                &principal,
+                &[TupleDelta::Add(RelationTuple {
+                    object: ObjectId("repo:widgets".into()),
+                    relation: RelName("reader".into()),
+                    subject: principal.principal_id.clone(),
+                    caveat: None,
+                })],
+                None,
+                None,
+                Timestamp("2026-07-22T00:00:00Z".into()),
+            )
+            .unwrap();
+        IdentityGitWireCredentialIssuerFactory::new(identity)
+    }
 
     #[test]
     fn pre_cancelled_executor_never_reaches_runsc() {
@@ -486,5 +766,76 @@ mod tests {
         assert!(error
             .to_string()
             .contains("no live Identity Git-wire credential issuer is configured"));
+    }
+
+    #[test]
+    fn identity_issuer_mints_and_final_boundary_verifies_a_zero_authority_token() {
+        let factory = identity_wire_factory();
+        let principal = wire_principal();
+        let issuer = factory.bind(&principal);
+        let credential = issuer
+            .mint(&GitWireCredentialRequest {
+                tenant: "acme",
+                region: "eu-west",
+                repo: "widgets",
+                operation: "upload-pack",
+                invocation_id: "invocation-1",
+                ttl_secs: 120,
+            })
+            .expect("the strongly authorized repo read mints");
+        issuer
+            .verify(&credential)
+            .expect("the signed token is live at the final boundary");
+
+        let forged = RunTokenCredential::new(
+            "forged-bearer",
+            credential.jti.clone(),
+            credential.ttl_secs(),
+        )
+        .unwrap();
+        assert!(issuer.verify(&forged).is_err());
+    }
+
+    #[test]
+    fn identity_issuer_refuses_scope_permission_and_operation_drift() {
+        let factory = identity_wire_factory();
+        let principal = wire_principal();
+        let issuer = factory.bind(&principal);
+        for (tenant, repo, operation) in [
+            ("other", "widgets", "upload-pack"),
+            ("acme", "ungranted", "upload-pack"),
+            ("acme", "widgets", "maintenance"),
+        ] {
+            assert!(issuer
+                .mint(&GitWireCredentialRequest {
+                    tenant,
+                    region: "eu-west",
+                    repo,
+                    operation,
+                    invocation_id: "denied",
+                    ttl_secs: 120,
+                })
+                .is_err());
+        }
+
+        let ungranted_principal = Principal::new(
+            TenantId("acme".into()),
+            Region("eu-west".into()),
+            PrincipalId("p:ungranted".into()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        );
+        assert!(factory
+            .bind(&ungranted_principal)
+            .mint(&GitWireCredentialRequest {
+                tenant: "acme",
+                region: "eu-west",
+                repo: "widgets",
+                operation: "upload-pack",
+                invocation_id: "denied-principal",
+                ttl_secs: 120,
+            })
+            .is_err());
     }
 }

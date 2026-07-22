@@ -182,7 +182,7 @@ impl Handler for WireInfoRefs {
         }
         let adv = self
             .be
-            .wire_serving()
+            .wire_serving(ctx.principal)
             .advertise_refs(&loc, Service::UploadPack)
             .map_err(|e| map_wire_err(&e))?;
         if adv.status != 0 {
@@ -220,7 +220,7 @@ impl Handler for WireUploadPack {
         let body = ctx.request.body.clone();
         let served = self
             .be
-            .wire_serving()
+            .wire_serving(ctx.principal)
             .serve(&loc, Service::UploadPack, body)
             .map_err(|e| map_wire_err(&e))?;
         if served.status != 0 {
