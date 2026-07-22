@@ -47,7 +47,7 @@
 use crate::authenticate::{scheme, CredentialVerifier, VerifiedAssertion};
 use myelin_identity::{AuthzError, Credential};
 use myelin_tenancy::{Region, TenantId};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
@@ -213,31 +213,112 @@ impl JwkSet {
 // Replay defence — the seen `jti`/`nonce` set.
 // ================================================================================================
 
-/// **The replay defence — a set of already-consumed `jti`/`nonce` values.** A presented OIDC ID
-/// token's replay identifier (`jti`, falling back to `nonce`) is consumed once; a second
-/// presentation of the SAME identifier is rejected (a replayed token does not authenticate). Shared
-/// (cloneable) so every verifier handle consults one set. (A real deployment bounds this set by the
-/// token TTL / a Redis-class store; here it is the in-process defence the corpus proves.)
-#[derive(Clone, Default)]
+/// **The replay defence — an atomic, TTL-bounded set of consumed `jti`/`nonce` values.** Production
+/// uses the shared PG backing so every replica elects one winner; unit tests use the in-memory
+/// backend with identical expiry semantics.
+#[derive(Clone)]
 pub struct ReplayGuard {
-    seen: Arc<Mutex<BTreeSet<String>>>,
+    backend: ReplayBackend,
+}
+
+type ReplayKey = (String, String, String);
+type MemoryReplayState = Arc<Mutex<BTreeMap<ReplayKey, i64>>>;
+
+fn replay_digest(domain: &[u8], value: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update([0]);
+    digest.update(value.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finalize())
+}
+
+#[derive(Clone)]
+enum ReplayBackend {
+    Memory(MemoryReplayState),
+    Pg(PgReplayBacking),
+}
+
+#[derive(Clone)]
+struct PgReplayBacking {
+    backing: Arc<myelin_storage::DurableReplayBacking>,
+    rt: tokio::runtime::Handle,
+}
+
+impl Default for ReplayGuard {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReplayGuard {
-    /// A fresh, empty replay guard.
+    /// A fresh, empty, TTL-bounded in-memory replay guard for tests and explicit local use.
     pub fn new() -> ReplayGuard {
         ReplayGuard {
-            seen: Arc::new(Mutex::new(BTreeSet::new())),
+            backend: ReplayBackend::Memory(Arc::new(Mutex::new(BTreeMap::new()))),
+        }
+    }
+
+    /// Build the production replay guard over the cell's shared durable substrate.
+    pub fn with_pg(
+        backing: myelin_storage::DurableReplayBacking,
+        rt: tokio::runtime::Handle,
+    ) -> ReplayGuard {
+        ReplayGuard {
+            backend: ReplayBackend::Pg(PgReplayBacking {
+                backing: Arc::new(backing),
+                rt,
+            }),
         }
     }
 
     /// Consume `id`. Returns `true` if it was FRESH (newly recorded), `false` if it was ALREADY seen
-    /// (a replay — the caller rejects).
+    /// (a replay — the caller rejects). This compatibility helper is for the local test/SAML seam;
+    /// OIDC uses the scoped, expiring path below.
     pub fn consume(&self, id: &str) -> bool {
-        self.seen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.to_string())
+        self.consume_scoped("", "legacy", id, i64::MAX, 0)
+            .unwrap_or(false)
+    }
+
+    fn consume_scoped(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        id: &str,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<bool, AuthzError> {
+        // Fixed-size, domain-separated keys keep opaque replay material out of the database and
+        // prevent an oversized signed claim from exceeding Postgres btree index-entry limits.
+        let namespace = replay_digest(b"myelin-auth-replay-namespace-v1", namespace);
+        let id = replay_digest(b"myelin-auth-replay-id-v1", id);
+        match &self.backend {
+            ReplayBackend::Memory(seen) => {
+                let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+                seen.retain(|_, expiry| *expiry >= now);
+                let key = (tenant.to_string(), namespace, id);
+                match seen.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(expires_at);
+                        Ok(true)
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => Ok(false),
+                }
+            }
+            ReplayBackend::Pg(pg) => pg
+                .block(
+                    pg.backing
+                        .consume(tenant, &namespace, &id, expires_at, now),
+                )
+                .map_err(|e| refuse(format!("replay store unavailable: {e}"))),
+        }
+    }
+}
+
+impl PgReplayBacking {
+    fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
+        tokio::task::block_in_place(|| self.rt.block_on(fut))
     }
 }
 
@@ -547,29 +628,9 @@ impl CredentialVerifier for OidcVerifier {
             }
         }
 
-        // (5f) REPLAY DEFENCE — consume the `jti` (else `nonce`); a replayed identifier is rejected.
-        let replay_id = claims
-            .get("jti")
-            .and_then(|j| j.as_str())
-            .or_else(|| claims.get("nonce").and_then(|n| n.as_str()));
-        match replay_id {
-            Some(id) => {
-                if !self.replay.consume(id) {
-                    return Err(refuse(format!(
-                        "replayed token: `jti`/`nonce` `{id}` was already presented (replay defence)"
-                    )));
-                }
-            }
-            None => {
-                if self.config.require_replay_defence {
-                    return Err(refuse(
-                        "token carries neither `jti` nor `nonce` — no replay-defence material",
-                    ));
-                }
-            }
-        }
-
-        // (6) THE TRUST-ROOTED ASSERTION — tenant/region/subject from the VERIFIED claims only.
+        // (5f) THE TRUST-ROOTED ASSERTION FIELDS — validate every required claim before mutating the
+        // replay store. A signed but incomplete token must not be able to poison a future valid
+        // token's replay identifier.
         let sub = claims
             .get("sub")
             .and_then(|s| s.as_str())
@@ -596,6 +657,49 @@ impl CredentialVerifier for OidcVerifier {
                     self.config.region_claim
                 ))
             })?;
+
+        // (5g) REPLAY DEFENCE — atomically consume `jti` (else `nonce`) through a namespace scoped
+        // by issuer, audience, and verified region. The row lives only through the token's accepted
+        // expiry boundary, including configured leeway.
+        let replay_id = claims
+            .get("jti")
+            .and_then(|j| j.as_str())
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                claims
+                    .get("nonce")
+                    .and_then(|n| n.as_str())
+                    .filter(|id| !id.is_empty())
+            });
+        match replay_id {
+            Some(id) => {
+                let namespace = serde_json::json!([
+                    "oidc",
+                    self.config.issuer,
+                    self.config.audience,
+                    region
+                ])
+                .to_string();
+                if !self.replay.consume_scoped(
+                    tenant,
+                    &namespace,
+                    id,
+                    exp.saturating_add(leeway),
+                    now,
+                )? {
+                    return Err(refuse(
+                        "replayed token: its `jti`/`nonce` was already presented (replay defence)",
+                    ));
+                }
+            }
+            None => {
+                if self.config.require_replay_defence {
+                    return Err(refuse(
+                        "token carries neither a non-empty `jti` nor `nonce` — no replay-defence material",
+                    ));
+                }
+            }
+        }
 
         Ok(VerifiedAssertion {
             tenant: TenantId(tenant.to_string()),
@@ -1005,6 +1109,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn in_memory_replay_entries_expire_and_remain_scoped() {
+        let replay = ReplayGuard::new();
+        assert!(replay
+            .consume_scoped("acme", "issuer-a", "same-id", 200, 100)
+            .unwrap());
+        assert!(!replay
+            .consume_scoped("acme", "issuer-a", "same-id", 300, 150)
+            .unwrap());
+        assert!(replay
+            .consume_scoped("acme", "issuer-b", "same-id", 300, 150)
+            .unwrap());
+        assert!(replay
+            .consume_scoped("globex", "issuer-a", "same-id", 300, 150)
+            .unwrap());
+        assert!(replay
+            .consume_scoped("acme", "issuer-a", "same-id", 400, 201)
+            .unwrap());
+    }
+
     /// (f) WRONG AUD — the token's audience is some other RP. Reject.
     #[test]
     fn negative_wrong_audience_is_rejected() {
@@ -1164,6 +1288,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn incomplete_signed_token_does_not_poison_replay_identifier() {
+        let key = RsaKey::generate();
+        let jwks = JwkSet::new().with_key("rsa-1", key.jwk());
+        let verifier = verifier(jwks);
+        let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
+
+        let mut incomplete = claims("jti-reused-after-invalid");
+        incomplete.as_object_mut().unwrap().remove("tenant");
+        let signature = key.sign(signing_input(&header, &incomplete).as_bytes());
+        verifier
+            .verify(&cred(jwt(&header, &incomplete, &signature)))
+            .expect_err("the incomplete signed token must fail");
+
+        let complete = claims("jti-reused-after-invalid");
+        let signature = key.sign(signing_input(&header, &complete).as_bytes());
+        verifier
+            .verify(&cred(jwt(&header, &complete, &signature)))
+            .expect("claim validation must happen before replay consumption");
+    }
+
     // ── The dispatch seam ────────────────────────────────────────────────────────────────────────
 
     /// The dispatcher routes the OIDC scheme to the REAL [`OidcVerifier`] and everything else to the
@@ -1249,7 +1394,11 @@ mod tests {
         let key = RsaKey::generate();
         let jwks = JwkSet::new().with_key("rsa-1", key.jwk());
         let cfg = OidcConfig::new("https://idp.example.com", "myelin-rp");
-        let auth = HumanSsoAuthenticator::production_with_oidc(store, Some((cfg, jwks)));
+        let auth = HumanSsoAuthenticator::production_with_oidc(
+            store,
+            (cfg, jwks),
+            ReplayGuard::new(),
+        );
         (auth, key)
     }
 
@@ -1340,7 +1489,7 @@ mod tests {
         }
     }
 
-    /// **`production_with_oidc(store, None)` keeps refuse-not-mock for OIDC** — with no IdP
+    /// **`production(store)` keeps refuse-not-mock for OIDC** — with no IdP
     /// configured, even a structurally-valid OIDC token is refused (`NotYetImplemented` from the
     /// refuse-unsupported fallback), never resolved. This is the opt-in / boot-succeeds semantics.
     #[test]
@@ -1351,7 +1500,7 @@ mod tests {
         use myelin_storage::KmsEngine;
 
         let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
-        let auth = HumanSsoAuthenticator::production_with_oidc(store, None);
+        let auth = HumanSsoAuthenticator::production(store);
         let key = RsaKey::generate();
         let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
         let cl = live_claims("no-oidc-configured");

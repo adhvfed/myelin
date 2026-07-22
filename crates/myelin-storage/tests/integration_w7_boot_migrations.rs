@@ -13,7 +13,7 @@
 //!      the `principal` table (identity `0012`, the table `PrincipalStore::with_pg` binds to) is
 //!      ABSENT — this is the defect. Then apply the boot sequence's second half
 //!      (`all_durable_migrations`) into the SAME fresh schema → the `principal` table (and the whole
-//!      `0010`–`0054` durable set) now EXISTS. A re-apply is idempotent.
+//!      complete durable set) now EXISTS. A re-apply is idempotent.
 //!   2. **The previously-broken store write path now succeeds:** after the full boot sequence
 //!      (`migrate_foundation` + `all_durable_migrations`), a `DurablePrincipalBacking::put_principal`
 //!      write (the storage-level backing behind `PrincipalStore::with_pg`) COMMITS and reads back —
@@ -28,7 +28,7 @@ use myelin_config::MyelinConfig;
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
     all_durable_migrations, foundation_migrations, DurablePrincipalBacking, DurablePrincipalRow,
-    PgMigrator, SubstrateProvider,
+    DurableReplayBacking, PgMigrator, SubstrateProvider,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
@@ -123,11 +123,11 @@ async fn fresh_schema_principal_table_absent_after_foundation_then_present_after
          principal write here would fail at runtime"
     );
 
-    // (b) Apply the durable AGGREGATE (0010–0054) — the second half of the fixed boot sequence.
+    // (b) Apply the durable AGGREGATE — the second half of the fixed boot sequence.
     PgMigrator::apply(&pool, &all_durable_migrations())
         .await
         .expect("the durable aggregate applies into the fresh schema");
-    // GREEN — the whole durable set now exists; spot-check one table per group (0010→0054).
+    // GREEN — the whole durable set now exists; spot-check one table per group.
     for (table, group) in [
         ("rebac_tuple", "identity 0010"),
         ("principal", "identity 0012"),
@@ -139,6 +139,7 @@ async fn fresh_schema_principal_table_absent_after_foundation_then_present_after
         ("post_pit_erasure_ledger", "post-pit 0052"),
         ("bus_erasure_ledger", "bus-erasure 0053"),
         ("agent_hitl_gate", "hitl-gate 0054 (R2.4)"),
+        ("auth_replay", "authentication replay 0070"),
     ] {
         assert!(
             table_exists_in(&pool, &schema, table).await,
@@ -220,8 +221,34 @@ async fn durable_principal_write_succeeds_after_the_boot_sequence() {
     assert_eq!(read.principal_id, "p:alice");
     assert_eq!(read.kind, "\"Human\"");
 
+    // Two independent replica handles race to consume one replay id. The database PK + transaction
+    // must elect exactly one winner; after expiry the same identifier is reusable.
+    let replay_a = DurableReplayBacking::new(app.clone());
+    let replay_b = DurableReplayBacking::new(app.clone());
+    let (a, b) = tokio::join!(
+        replay_a.consume(&tenant, "oidc:test", "shared-jti", 200, 100),
+        replay_b.consume(&tenant, "oidc:test", "shared-jti", 200, 100),
+    );
+    let winners = [a.unwrap(), b.unwrap()]
+        .into_iter()
+        .filter(|won| *won)
+        .count();
+    assert_eq!(winners, 1, "exactly one replica consumes a replay id");
+    assert!(
+        replay_a
+            .consume(&tenant, "oidc:test", "shared-jti", 400, 201)
+            .await
+            .unwrap(),
+        "the replay id is reusable only after its prior token expired"
+    );
+
     // Cleanup (admin role — RLS-bypassing owner).
     let _ = sqlx::query("DELETE FROM principal WHERE tenant_id = $1 AND region = $2")
+        .bind(&tenant)
+        .bind(&region)
+        .execute(admin.db_pool())
+        .await;
+    let _ = sqlx::query("DELETE FROM auth_replay WHERE tenant_id = $1 AND region = $2")
         .bind(&tenant)
         .bind(&region)
         .execute(admin.db_pool())

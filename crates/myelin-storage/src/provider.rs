@@ -242,6 +242,7 @@ pub fn foundation_migrations() -> Migrations {
 /// | `cell_root_durable_migrations`     | `0060`        |
 /// | `delegation_policy_durable_migrations` | `0061`–`0066` |
 /// | `authz_projection_durable_migrations` | `0067`–`0069` |
+/// | `auth_replay_durable_migrations`  | `0070`–`0071` |
 ///
 /// The substrate FOUNDATION (`0000`–`0001`, outbox + consumer_dedup) is deliberately NOT in this list:
 /// it stays the separate [`foundation_migrations`] / [`SubstrateProvider::migrate_foundation`] call
@@ -262,6 +263,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::cell_root_durable::cell_root_durable_migrations(),
         crate::delegation_policy_durable::delegation_policy_durable_migrations(),
         crate::authz_projection_durable::authz_projection_durable_migrations(),
+        crate::identity_durable::auth_replay_durable_migrations(),
     ]
 }
 
@@ -768,9 +770,9 @@ mod boot_migrations_tests {
                 w[1]
             );
         }
-        // Non-vacuity: the full set is present (identity 0010 … authz projection 0069).
+        // Non-vacuity: the full set is present (identity 0010 … auth replay 0071).
         assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
-        assert_eq!(*ids.last().unwrap(), "0069_authz_projection_invalidator");
+        assert_eq!(*ids.last().unwrap(), "0071_auth_replay_rls");
     }
 
     /// STRUCTURAL anti-drift: the aggregate is EXACTLY the flattened concatenation of every group in
