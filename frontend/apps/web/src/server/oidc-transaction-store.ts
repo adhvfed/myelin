@@ -6,6 +6,10 @@ import { SessionCipher } from "./session-cipher";
 
 export const OIDC_TRANSACTION_TTL_MS = 10 * 60 * 1_000;
 export const OIDC_TRANSACTION_KEY_PREFIX = "myelin:web-oidc:v1:";
+export const MAX_STORED_OIDC_TRANSACTION_BYTES = 16 * 1024;
+
+const SECRET_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const MAX_REDIRECT_URI_BYTES = 2048;
 
 export interface OidcTransaction {
   codeVerifier: string;
@@ -24,30 +28,62 @@ interface StoredTransaction {
   expiresAtMs: number;
 }
 
-function validTransaction(value: unknown): value is OidcTransaction {
-  if (!value || typeof value !== "object") return false;
+function validatedTransaction(value: unknown): OidcTransaction {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("OIDC transaction is invalid");
+  }
   const transaction = value as Record<string, unknown>;
-  return (
-    typeof transaction.codeVerifier === "string" &&
-    typeof transaction.nonce === "string" &&
-    typeof transaction.redirectUri === "string"
-  );
+  if (
+    typeof transaction.codeVerifier !== "string" ||
+    !SECRET_PATTERN.test(transaction.codeVerifier) ||
+    typeof transaction.nonce !== "string" ||
+    !SECRET_PATTERN.test(transaction.nonce) ||
+    !validRedirectUri(transaction.redirectUri)
+  ) throw new Error("OIDC transaction is invalid");
+  return {
+    codeVerifier: transaction.codeVerifier,
+    nonce: transaction.nonce,
+    redirectUri: transaction.redirectUri,
+  };
+}
+
+function validRedirectUri(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > MAX_REDIRECT_URI_BYTES ||
+    new TextEncoder().encode(value).byteLength > MAX_REDIRECT_URI_BYTES
+  ) return false;
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:") &&
+      !url.username && !url.password && !url.search && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
+function validState(state: string): boolean {
+  return SECRET_PATTERN.test(state);
 }
 
 export class MemoryOidcTransactionStore implements OidcTransactionStore {
   readonly #transactions = new Map<string, StoredTransaction>();
 
   async issue(state: string, transaction: OidcTransaction): Promise<boolean> {
+    if (!validState(state)) throw new Error("OIDC state is invalid");
+    const validated = validatedTransaction(transaction);
     this.#purge();
     if (this.#transactions.has(state)) return false;
     this.#transactions.set(state, {
-      transaction: { ...transaction },
+      transaction: validated,
       expiresAtMs: Date.now() + OIDC_TRANSACTION_TTL_MS,
     });
     return true;
   }
 
   async consume(state: string): Promise<OidcTransaction | null> {
+    if (!validState(state)) return null;
     const stored = this.#transactions.get(state);
     this.#transactions.delete(state);
     if (!stored || Date.now() >= stored.expiresAtMs) return null;
@@ -68,6 +104,7 @@ const CONSUME_SCRIPT = `
 local value = redis.call("GET", KEYS[1])
 if not value then return nil end
 redis.call("DEL", KEYS[1])
+if string.len(value) > tonumber(ARGV[1]) then return nil end
 return value
 `;
 
@@ -101,10 +138,12 @@ export class ValkeyOidcTransactionStore implements OidcTransactionStore {
   }
 
   async issue(state: string, transaction: OidcTransaction): Promise<boolean> {
+    if (!validState(state)) throw new Error("OIDC state is invalid");
+    const validated = validatedTransaction(transaction);
     const sealed = this.#cipher.encrypt(
       state,
       "oidc_transaction",
-      JSON.stringify(transaction),
+      JSON.stringify(validated),
     );
     return (await this.#redis.set(
       this.#key(state),
@@ -116,11 +155,17 @@ export class ValkeyOidcTransactionStore implements OidcTransactionStore {
   }
 
   async consume(state: string): Promise<OidcTransaction | null> {
-    const sealed = await this.#redis.eval(CONSUME_SCRIPT, 1, this.#key(state));
+    if (!validState(state)) return null;
+    const sealed = await this.#redis.eval(
+      CONSUME_SCRIPT,
+      1,
+      this.#key(state),
+      MAX_STORED_OIDC_TRANSACTION_BYTES,
+    );
     if (typeof sealed !== "string") return null;
     try {
       const value: unknown = JSON.parse(this.#cipher.decrypt(state, "oidc_transaction", sealed));
-      return validTransaction(value) ? value : null;
+      return validatedTransaction(value);
     } catch {
       return null;
     }
