@@ -578,43 +578,40 @@ impl DurableGitBackend {
                 principal,
             );
         }
-        let mut record = self
-            .prs
-            .get(loc, number)?
-            .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
-        match mutation {
-            PrMutation::ReportChecks {
-                green_contexts,
-                fork_unendorsed_contexts,
-                codeowner_review_satisfied,
-                outstanding_conversations,
-            } => {
-                if let Some(value) = green_contexts {
-                    record.green_contexts = value;
-                }
-                if let Some(value) = fork_unendorsed_contexts {
-                    record.fork_unendorsed_contexts = value;
-                }
-                if let Some(value) = codeowner_review_satisfied {
-                    record.codeowner_review_satisfied = value;
-                }
-                if let Some(value) = outstanding_conversations {
-                    record.outstanding_conversations = value;
-                }
-            }
-            PrMutation::SubmitReview(review) => record.reviews.push(review),
-            PrMutation::EndorseContexts(contexts) => {
-                for context in contexts {
-                    if !record.endorsed_contexts.contains(&context) {
-                        record.endorsed_contexts.push(context);
+        self.prs.update(loc, number, |record| {
+            match mutation {
+                PrMutation::ReportChecks {
+                    green_contexts,
+                    fork_unendorsed_contexts,
+                    codeowner_review_satisfied,
+                    outstanding_conversations,
+                } => {
+                    if let Some(value) = green_contexts {
+                        record.green_contexts = value;
+                    }
+                    if let Some(value) = fork_unendorsed_contexts {
+                        record.fork_unendorsed_contexts = value;
+                    }
+                    if let Some(value) = codeowner_review_satisfied {
+                        record.codeowner_review_satisfied = value;
+                    }
+                    if let Some(value) = outstanding_conversations {
+                        record.outstanding_conversations = value;
                     }
                 }
+                PrMutation::SubmitReview(review) => record.reviews.push(review),
+                PrMutation::EndorseContexts(contexts) => {
+                    for context in contexts {
+                        if !record.endorsed_contexts.contains(&context) {
+                            record.endorsed_contexts.push(context);
+                        }
+                    }
+                }
+                PrMutation::Touch => {}
             }
-            PrMutation::Touch => {}
-        }
-        record.updated_at = Some(now_unix());
-        self.prs.put(loc, &record)?;
-        Ok(record)
+            record.updated_at = Some(now_unix());
+            Ok(record.clone())
+        })
     }
 
     fn emit_ctx(tenant: &str, region: &str, principal: &Principal) -> EmitContextBase {
