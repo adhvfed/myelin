@@ -459,7 +459,11 @@ impl DurableGitBackend {
         let tenant = scope.tenant().0.as_str();
         let region = scope.region().0.as_str();
         let pending = match &self.pg_prs {
-            Some(store) => store.list_pending_merges(scope)?,
+            Some(store) => store.list_pending_merges_bounded(
+                scope,
+                BOOT_RECOVERY_MAX_PENDING_MERGES,
+                BOOT_RECOVERY_MAX_PENDING_MERGE_BYTES,
+            )?,
             None => Vec::new(),
         };
         let mut repos =
@@ -3031,6 +3035,11 @@ const REPO_SCAN_MAX_CANDIDATES: usize = 10_000;
 /// query itself so exact list semantics cannot turn into an unbounded filesystem/SQL materialization.
 const PR_LIST_MAX_RECORDS: usize = 10_000;
 const PR_LIST_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Boot recovery fails loud above this finite pending-command envelope so tenant backlog cannot
+/// become an unbounded startup allocation.
+const BOOT_RECOVERY_MAX_PENDING_MERGES: usize = 10_000;
+const BOOT_RECOVERY_MAX_PENDING_MERGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// The inline-text cap for a blob view (R3.4). The ODB header is checked first: a larger object gets
 /// a metadata-only download fallback and is never inflated merely to build the interactive page.
