@@ -17,7 +17,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use myelin_git::backup::{restore_repo, GitBackupError, GitRepoBackup};
+use myelin_git::backup::{
+    restore_repo, restore_repo_from_file, GitBackupError, GitRepoBackup, VerifiedGitRepoBackupFile,
+};
 use myelin_git::core::{Oid, RepoLoc};
 use myelin_git::durable::{DurableGitRepo, DurableGitStore};
 
@@ -41,12 +43,20 @@ fn seed_history(repo: &DurableGitRepo, tenant: &str) -> Vec<(String, Oid)> {
     let c1 = repo.write_commit(&t1, &[], "c1: seed", &psn, &psn).unwrap();
     let b2 = repo.write_blob(b"line one\nline two\n").unwrap();
     let t2 = repo.write_tree(&[("file.txt", &b2)]).unwrap();
-    let c2 = repo.write_commit(&t2, &[&c1], "c2: extend", &psn, &psn).unwrap();
+    let c2 = repo
+        .write_commit(&t2, &[&c1], "c2: extend", &psn, &psn)
+        .unwrap();
 
     repo.update_ref_cas("refs/heads/main", None, Some(&c2), "create main", &psn)
         .unwrap();
-    repo.update_ref_cas("refs/heads/feature", None, Some(&c1), "create feature", &psn)
-        .unwrap();
+    repo.update_ref_cas(
+        "refs/heads/feature",
+        None,
+        Some(&c1),
+        "create feature",
+        &psn,
+    )
+    .unwrap();
 
     // An ANNOTATED tag (a real git tag OBJECT, not a lightweight ref) pointing at c1. This proves the
     // pack captures non-commit tip objects (insert_recursive), which a history-only revwalk peels off.
@@ -127,25 +137,36 @@ fn destructive_round_trip_into_a_clean_target_is_git_fsck_clean() {
     );
 
     // ── back up to an off-host artifact file ──
-    let backup = GitRepoBackup::create(&src_repo).expect("backup");
-    assert_eq!(backup.refs(), want.as_slice());
-    assert!(backup.pack_len() > 0, "a REAL packfile (repo bytes), not a modeled offset");
     let artifact_dir = temp_root("artifact");
     std::fs::create_dir_all(&artifact_dir).unwrap();
     let artifact_file = artifact_dir.join("acme-core.gitbackup");
-    backup.write_to_file(&artifact_file).expect("write artifact");
+    let backup = GitRepoBackup::create_to_file(&src_repo, &artifact_file).expect("backup to file");
+    assert_eq!(backup.refs(), want.as_slice());
+    assert!(
+        backup.pack_len() > 0,
+        "a REAL packfile (repo bytes), not a modeled offset"
+    );
+    drop(backup);
 
     // ── the source is GONE (unavailable — genuine disaster recovery) ──
     std::fs::remove_dir_all(&src_root).expect("delete the source store");
-    assert!(!src_root.exists(), "the original repo is unavailable for the restore");
+    assert!(
+        !src_root.exists(),
+        "the original repo is unavailable for the restore"
+    );
 
     // ── restore into a brand-new, genuinely EMPTY target root, from the artifact ALONE ──
     let dst_root = temp_root("dst");
     let dst_store = DurableGitStore::rooted(&dst_root);
-    assert!(!dst_store.repo_exists(&loc), "the target starts clean/empty");
+    assert!(
+        !dst_store.repo_exists(&loc),
+        "the target starts clean/empty"
+    );
 
-    let reloaded = GitRepoBackup::read_from_file(&artifact_file).expect("read artifact alone");
-    let restored = restore_repo(&dst_store, &loc, &reloaded).expect("restore onto clean target");
+    let mut reloaded =
+        VerifiedGitRepoBackupFile::open(&artifact_file).expect("verify artifact alone");
+    let restored = restore_repo_from_file(&dst_store, &loc, &mut reloaded)
+        .expect("stream restore onto clean target");
 
     // Every ref reads back identical (same name → same oid).
     assert_eq!(
@@ -194,7 +215,10 @@ fn restore_refuses_to_clobber_a_live_repo() {
     // The repo is still present → restore must refuse (not a clean target).
     let err = restore_repo(&store, &loc, &backup)
         .expect_err("restoring over a live repo must be refused");
-    assert!(matches!(err, GitBackupError::TargetNotClean(_)), "got {err:?}");
+    assert!(
+        matches!(err, GitBackupError::TargetNotClean(_)),
+        "got {err:?}"
+    );
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -211,17 +235,23 @@ fn a_failed_restore_does_not_poison_the_target() {
     let src_store = DurableGitStore::rooted(&src_root);
     let src_repo = src_store.create_repo(&loc).unwrap();
     let want = seed_history(&src_repo, "acme");
-    let good = GitRepoBackup::create(&src_repo).unwrap();
+    let artifact_root = temp_root("retry-artifacts");
+    std::fs::create_dir_all(&artifact_root).unwrap();
+    let good_file = artifact_root.join("good.gitbackup");
+    GitRepoBackup::create_to_file(&src_repo, &good_file).unwrap();
 
     // A CORRUPT artifact: flip the pack's trailing SHA byte, then recompute the outer v2 artifact
-    // checksum. The frame remains valid (deserialize succeeds), while libgit2's pack indexer rejects
-    // the corrupted pack at ingest (a real hard-verify, not a guess).
-    let mut bytes = good.serialize();
+    // checksum. The outer frame remains valid (verified open succeeds), while libgit2's pack indexer
+    // rejects the corrupted pack at ingest (a real hard-verify, not a guess).
+    let mut bytes = std::fs::read(&good_file).unwrap();
     let frame_len = bytes.len() - blake3::OUT_LEN;
     bytes[frame_len - 1] ^= 0xFF;
     let checksum = blake3::hash(&bytes[..frame_len]);
     bytes[frame_len..].copy_from_slice(checksum.as_bytes());
-    let corrupt = GitRepoBackup::deserialize(&bytes).expect("frame valid; pack corrupt");
+    let corrupt_file = artifact_root.join("corrupt.gitbackup");
+    std::fs::write(&corrupt_file, bytes).unwrap();
+    let mut corrupt =
+        VerifiedGitRepoBackupFile::open(&corrupt_file).expect("outer frame valid; pack corrupt");
 
     let dst_root = temp_root("retry-dst");
     let dst_store = DurableGitStore::rooted(&dst_root);
@@ -229,9 +259,12 @@ fn a_failed_restore_does_not_poison_the_target() {
     assert!(!dst_store.repo_exists(&loc), "target starts clean");
 
     // (1) Restore the CORRUPT artifact → must FAIL.
-    let err = restore_repo(&dst_store, &loc, &corrupt)
+    let err = restore_repo_from_file(&dst_store, &loc, &mut corrupt)
         .expect_err("a corrupt pack must fail the restore");
-    assert!(!matches!(err, GitBackupError::TargetNotClean(_)), "should fail at ingest, got {err:?}");
+    assert!(
+        !matches!(err, GitBackupError::TargetNotClean(_)),
+        "should fail at ingest, got {err:?}"
+    );
 
     // The target was NOT poisoned: no repo at the final path; the location is reusable.
     assert!(
@@ -257,7 +290,8 @@ fn a_failed_restore_does_not_poison_the_target() {
     }
 
     // (2) Retry with the GOOD artifact into the SAME target → succeeds (no TargetNotClean block).
-    let restored = restore_repo(&dst_store, &loc, &good)
+    let mut good = VerifiedGitRepoBackupFile::open(&good_file).unwrap();
+    let restored = restore_repo_from_file(&dst_store, &loc, &mut good)
         .expect("retry with a good artifact must succeed on the un-poisoned target");
     assert_eq!(
         restored.list_refs_bounded(1_000_000).unwrap(),
@@ -268,6 +302,37 @@ fn a_failed_restore_does_not_poison_the_target() {
 
     std::fs::remove_dir_all(&src_root).ok();
     std::fs::remove_dir_all(&dst_root).ok();
+    std::fs::remove_dir_all(&artifact_root).ok();
+}
+
+/// A verified artifact pins an open inode. Replacing its pathname after verification cannot swap
+/// the bytes consumed by restore.
+#[test]
+fn path_replacement_after_verified_open_cannot_swap_the_artifact() {
+    let loc = RepoLoc::new("acme", "fr-par", "core");
+    let src_root = temp_root("held-handle-src");
+    let src_store = DurableGitStore::rooted(&src_root);
+    let src_repo = src_store.create_repo(&loc).unwrap();
+    let want = seed_history(&src_repo, "acme");
+
+    let artifact_root = temp_root("held-handle-artifacts");
+    std::fs::create_dir_all(&artifact_root).unwrap();
+    let artifact_file = artifact_root.join("backup.gitbackup");
+    let mut verified = GitRepoBackup::create_to_file(&src_repo, &artifact_file).unwrap();
+    let replacement = artifact_root.join("replacement");
+    std::fs::write(&replacement, b"not a backup").unwrap();
+    std::fs::rename(&replacement, &artifact_file).unwrap();
+
+    let dst_root = temp_root("held-handle-dst");
+    let dst_store = DurableGitStore::rooted(&dst_root);
+    let restored = restore_repo_from_file(&dst_store, &loc, &mut verified)
+        .expect("restore reads the verified open handle, not the replaced path");
+    assert_eq!(restored.list_refs_bounded(1_000_000).unwrap(), want);
+    assert_git_fsck_clean(restored.path());
+
+    std::fs::remove_dir_all(&src_root).ok();
+    std::fs::remove_dir_all(&dst_root).ok();
+    std::fs::remove_dir_all(&artifact_root).ok();
 }
 
 /// **Multiple repos / tenant-scoping — each repo backs up + restores INDEPENDENTLY under its own

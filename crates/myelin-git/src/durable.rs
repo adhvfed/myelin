@@ -133,6 +133,7 @@ pub(crate) fn write_file_atomic_with(
     let result = (|| {
         let mut handle = std::fs::OpenOptions::new()
             .create_new(true)
+            .read(true)
             .write(true)
             .open(&tmp)
             .map_err(|e| DurableError::Io(format!("create {}: {e}", tmp.display())))?;
