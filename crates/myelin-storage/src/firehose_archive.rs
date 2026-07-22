@@ -94,6 +94,15 @@ use crate::encryption::DekContentWrap;
 use crate::kms::KmsEngine;
 use crate::residency::{ResidencyStoreClass, StoreResidencyReport};
 
+/// Maximum plaintext bytes in one sealed firehose segment.
+pub const FIREHOSE_MAX_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum stored bytes admitted before a segment blob read (allows encryption framing overhead).
+pub const FIREHOSE_MAX_STORED_SEGMENT_BYTES: usize = FIREHOSE_MAX_SEGMENT_BYTES + 1024 * 1024;
+/// Maximum frames represented by one segment.
+pub const FIREHOSE_MAX_SEGMENT_FRAMES: usize = 100_000;
+const FIREHOSE_MAX_STREAM_BYTES: usize = 256;
+const FIREHOSE_MAX_SCOPE_BYTES: usize = 4 * 1024;
+
 /// **A deterministic, self-describing serialisation of a batch of firehose frames into one segment's
 /// byte-record (the bytes that get content-addressed + DEK-sealed).** The encoding is length-framed
 /// so the exact `(seq, payload)` frame sequence round-trips: `[u64 frame_count][per frame: u64 seq,
@@ -128,8 +137,27 @@ impl SegmentBytes {
     /// `None` on ANY malformation (a truncated/garbled segment is a LOUD failure, never a partial /
     /// wrong replay). The decode is what a tail/range-read uses to resolve a `seq` back to its frame.
     pub fn decode(bytes: &[u8]) -> Option<Vec<Frame>> {
+        Self::decode_bounded(
+            bytes,
+            FIREHOSE_MAX_SEGMENT_BYTES,
+            FIREHOSE_MAX_SEGMENT_FRAMES,
+        )
+    }
+
+    /// Decode only when both the encoded byte length and declared frame count fit explicit limits.
+    pub fn decode_bounded(
+        bytes: &[u8],
+        maximum_bytes: usize,
+        maximum_frames: usize,
+    ) -> Option<Vec<Frame>> {
+        if bytes.len() > maximum_bytes {
+            return None;
+        }
         let mut cur = 0usize;
-        let count = read_u64(bytes, &mut cur)? as usize;
+        let count = usize::try_from(read_u64(bytes, &mut cur)?).ok()?;
+        if count > maximum_frames {
+            return None;
+        }
         let mut frames = Vec::with_capacity(count.min(1 << 16));
         for _ in 0..count {
             let seq = read_u64(bytes, &mut cur)?;
@@ -163,6 +191,25 @@ fn read_u64(bytes: &[u8], cur: &mut usize) -> Option<u64> {
     buf.copy_from_slice(&bytes[*cur..end]);
     *cur = end;
     Some(u64::from_le_bytes(buf))
+}
+
+fn encoded_segment_len_bounded(
+    frames: &[Frame],
+    maximum_frames: usize,
+    maximum_bytes: usize,
+) -> Result<usize, ArchiveError> {
+    if frames.len() > maximum_frames {
+        return Err(ArchiveError::LimitExceeded("frame count"));
+    }
+    let encoded_bytes = frames.iter().try_fold(8usize, |total, frame| {
+        total
+            .checked_add(16)
+            .and_then(|total| total.checked_add(frame.payload.0.len()))
+    });
+    match encoded_bytes {
+        Some(encoded_bytes) if encoded_bytes <= maximum_bytes => Ok(encoded_bytes),
+        _ => Err(ArchiveError::LimitExceeded("segment bytes")),
+    }
 }
 
 /// **A sealed firehose segment — the archive's PII-free pointer record (references-not-payloads).**
@@ -224,6 +271,8 @@ pub enum ArchiveError {
     /// A read of a sealed segment returned bytes that did not decode to a frame batch — a corrupt /
     /// truncated segment. LOUD: a tail never serves a partial/garbled replay.
     CorruptSegment(ContentHash),
+    /// A segment would exceed a bounded frame, byte, stream, or scope materialization ceiling.
+    LimitExceeded(&'static str),
 }
 
 impl core::fmt::Display for ArchiveError {
@@ -242,6 +291,9 @@ impl core::fmt::Display for ArchiveError {
                  serve refused",
                 h.to_multihash_string()
             ),
+            ArchiveError::LimitExceeded(kind) => {
+                write!(f, "firehose archive: {kind} limit exceeded")
+            }
         }
     }
 }
@@ -400,6 +452,17 @@ impl FirehoseArchiver {
         if frames.is_empty() {
             return Err(ArchiveError::EmptySegment);
         }
+        if stream.len() > FIREHOSE_MAX_STREAM_BYTES {
+            return Err(ArchiveError::LimitExceeded("stream"));
+        }
+        if scope.len() > FIREHOSE_MAX_SCOPE_BYTES {
+            return Err(ArchiveError::LimitExceeded("scope"));
+        }
+        encoded_segment_len_bounded(
+            frames,
+            FIREHOSE_MAX_SEGMENT_FRAMES,
+            FIREHOSE_MAX_SEGMENT_BYTES,
+        )?;
         let bytes = SegmentBytes::encode(frames);
         // Content-addressed + DEK-sealed in one put: the address is the plaintext hash, the stored
         // bytes are the ciphertext envelope (the DekContentWrap). 0 unencrypted segments — there is
@@ -452,8 +515,16 @@ impl FirehoseArchiver {
     /// does not decode is [`ArchiveError::CorruptSegment`]. This is how the archive resolves a
     /// pointer back to the exact frames the live firehose carried (cold == live).
     pub fn read_segment(&self, content_hash: &ContentHash) -> Result<Vec<Frame>, ArchiveError> {
+        let metadata = self.store.head(&self.tenant, content_hash)?;
+        if metadata.stored_len > FIREHOSE_MAX_STORED_SEGMENT_BYTES {
+            return Err(ArchiveError::LimitExceeded("stored segment bytes"));
+        }
         let bytes = self.store.get(&self.tenant, content_hash)?;
-        SegmentBytes::decode(&bytes)
+        SegmentBytes::decode_bounded(
+            &bytes,
+            FIREHOSE_MAX_SEGMENT_BYTES,
+            FIREHOSE_MAX_SEGMENT_FRAMES,
+        )
             .ok_or_else(|| ArchiveError::CorruptSegment(content_hash.clone()))
     }
 
@@ -543,6 +614,25 @@ mod tests {
         let bytes = SegmentBytes::encode(&fs);
         let back = SegmentBytes::decode(&bytes.0).expect("round-trip decode");
         assert_eq!(back, fs, "the exact (seq, payload) frame batch round-trips");
+    }
+
+    #[test]
+    fn segment_encode_and_decode_enforce_count_and_byte_limits() {
+        let fs = frames(&[3, 4]);
+        let bytes = SegmentBytes::encode(&fs).0;
+
+        assert_eq!(
+            encoded_segment_len_bounded(&fs, 2, bytes.len()).expect("exact limits accepted"),
+            bytes.len()
+        );
+        assert!(encoded_segment_len_bounded(&fs, 1, bytes.len()).is_err());
+        assert!(encoded_segment_len_bounded(&fs, 2, bytes.len() - 1).is_err());
+        assert_eq!(
+            SegmentBytes::decode_bounded(&bytes, bytes.len(), 2).expect("exact decode limits"),
+            fs
+        );
+        assert!(SegmentBytes::decode_bounded(&bytes, bytes.len() - 1, 2).is_none());
+        assert!(SegmentBytes::decode_bounded(&bytes, bytes.len(), 1).is_none());
     }
 
     #[test]
