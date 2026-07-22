@@ -408,6 +408,161 @@ impl ChecksSummary {
     }
 }
 
+// ───────────────────────────── bounded PR-list read contract ─────────────────────────────────────
+
+/// Maximum page size accepted by the storage-neutral PR-list contract. This matches the Edge's
+/// uniform list ceiling; callers cannot turn a page read into an unbounded materialisation.
+pub const PR_LIST_PAGE_MAX: usize = 100;
+
+/// Maximum transitional numeric cursor coordinate accepted by every storage backend. This keeps
+/// direct store callers from issuing attacker-sized offset work while the wire contract migrates
+/// to opaque keyset cursors.
+pub const PR_LIST_OFFSET_MAX: usize = 10_000;
+
+/// The per-repository state tab selected by a PR-list request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrListState {
+    Open,
+    Merged,
+    Closed,
+    All,
+}
+
+impl PrListState {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "open" => Some(Self::Open),
+            "merged" => Some(Self::Merged),
+            "closed" => Some(Self::Closed),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    fn matches(self, state: PrState) -> bool {
+        match self {
+            Self::Open => matches!(state, PrState::Open | PrState::Draft),
+            Self::Merged => state == PrState::Merged,
+            Self::Closed => state == PrState::Closed,
+            Self::All => true,
+        }
+    }
+}
+
+/// Stable per-repository PR-list ordering. `Created` deliberately preserves the existing contract:
+/// per-repository PR number is the create-order authority. `Updated` uses the persisted optional
+/// unix-second stamp, with unstamped legacy rows last and PR number as the total-order tie breaker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrListSort {
+    Updated,
+    Created,
+}
+
+impl PrListSort {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "updated" => Some(Self::Updated),
+            "created" => Some(Self::Created),
+            _ => None,
+        }
+    }
+}
+
+/// Storage-neutral, already-authorized per-repository PR-list request. `offset` is the bounded
+/// transitional v1 cursor coordinate; storage owns filtering/sorting before applying it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrListQuery {
+    pub state: PrListState,
+    pub sort: PrListSort,
+    pub offset: usize,
+    pub limit: usize,
+    pub viewer_pseudonym: String,
+}
+
+impl PrListQuery {
+    pub fn new(
+        state: PrListState,
+        sort: PrListSort,
+        offset: usize,
+        limit: usize,
+        viewer_pseudonym: impl Into<String>,
+    ) -> Result<Self, DurableError> {
+        let query = Self {
+            state,
+            sort,
+            offset,
+            limit,
+            viewer_pseudonym: viewer_pseudonym.into(),
+        };
+        query.validate()?;
+        Ok(query)
+    }
+
+    /// Recheck bounds at a storage entry point. This also protects a backend from callers that
+    /// construct this public transport struct directly instead of using [`Self::new`].
+    pub fn validate(&self) -> Result<(), DurableError> {
+        if self.offset > PR_LIST_OFFSET_MAX {
+            return Err(DurableError::Git(format!(
+                "pull request page offset must be at most {PR_LIST_OFFSET_MAX}"
+            )));
+        }
+        if !(1..=PR_LIST_PAGE_MAX).contains(&self.limit) {
+            return Err(DurableError::Git(
+                "pull request page limit must be between 1 and 100".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Exact tab/sidebar counts over the full already-authorized repository relation. State filtering
+/// narrows page rows only and never changes these counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrListCounts {
+    pub open: usize,
+    pub merged: usize,
+    pub closed: usize,
+    pub all: usize,
+    pub yours: usize,
+    pub needs_review: usize,
+}
+
+impl PrListCounts {
+    fn from_records(records: &[PrRecord], viewer_pseudonym: &str) -> Self {
+        let count = |predicate: &dyn Fn(&PrRecord) -> bool| {
+            records.iter().filter(|record| predicate(record)).count()
+        };
+        Self {
+            open: count(&|record| matches!(record.state, PrState::Open | PrState::Draft)),
+            merged: count(&|record| record.state == PrState::Merged),
+            closed: count(&|record| record.state == PrState::Closed),
+            all: records.len(),
+            yours: count(&|record| record.author_pseudonym == viewer_pseudonym),
+            needs_review: count(&|record| record.is_review_requested_of(viewer_pseudonym)),
+        }
+    }
+
+    pub fn filtered_total(self, state: PrListState) -> usize {
+        match state {
+            PrListState::Open => self.open,
+            PrListState::Merged => self.merged,
+            PrListState::Closed => self.closed,
+            PrListState::All => self.all,
+        }
+    }
+}
+
+/// One bounded storage page plus exact counts. `records` never exceeds the requested limit;
+/// `has_more` is detected by fetching/selecting at most one surplus row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrListSlice {
+    pub records: Vec<PrRecord>,
+    pub counts: PrListCounts,
+    pub total: usize,
+    pub offset: usize,
+    pub has_more: bool,
+}
+
 // ───────────────────────────── the merge-gate evaluation (reused logic) ───────────────────────────
 
 /// The combined merge-gate decision over the repo-owned ruleset and durable PR facts. It combines
@@ -801,6 +956,51 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         }
         out.sort_by_key(|r| r.number);
         Ok(out)
+    }
+
+    /// Serve the storage-neutral per-repository list contract from the legacy filesystem authority.
+    ///
+    /// This is an explicitly bounded degradation, not true storage pagination: exact counts and
+    /// updated-time ordering cannot be derived from filenames, so the fallback first reuses
+    /// [`Self::list_bounded`] (at the caller's finite record/byte ceilings), then filters, sorts and
+    /// selects `limit + 1` in memory. Production PostgreSQL pushes the same operations into SQL;
+    /// a filesystem manifest/index is a separate migration and is never silently assumed here.
+    pub fn list_page_bounded(
+        &self,
+        repo: &RepoLoc,
+        query: &PrListQuery,
+        maximum_records: usize,
+        maximum_bytes: usize,
+    ) -> Result<PrListSlice, DurableError> {
+        query.validate()?;
+        let mut records = self.list_bounded(repo, maximum_records, maximum_bytes)?;
+        let counts = PrListCounts::from_records(&records, &query.viewer_pseudonym);
+        records.retain(|record| query.state.matches(record.state));
+        match query.sort {
+            PrListSort::Created => {
+                records.sort_by_key(|record| std::cmp::Reverse(record.number));
+            }
+            PrListSort::Updated => records.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then(b.number.cmp(&a.number))
+            }),
+        }
+        let total = records.len();
+        let mut page: Vec<PrRecord> = records
+            .into_iter()
+            .skip(query.offset)
+            .take(query.limit.saturating_add(1))
+            .collect();
+        let has_more = page.len() > query.limit;
+        page.truncate(query.limit);
+        Ok(PrListSlice {
+            records: page,
+            counts,
+            total,
+            offset: query.offset,
+            has_more,
+        })
     }
 
     /// **The highest PR number present on disk, from the FILENAMES (`<n>.json`) — never the parsed
@@ -1256,6 +1456,117 @@ mod tests {
             store.list_bounded(&loc(), 2, 1),
             Err(DurableError::Git(message))
                 if message == "pull request list limit exceeded: serialized bytes"
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn filesystem_list_page_preserves_exact_counts_filters_order_and_limit_plus_one() {
+        let root = temp_root("bounded-page");
+        let gitstore = DurableGitStore::rooted(&root);
+        gitstore.create_repo(&loc()).unwrap();
+        let store = DurablePrStore::rooted(&root);
+        let viewer = "psn:viewer@acme";
+        let fixtures = [
+            (1, PrState::Open, viewer, Some(10)),
+            (2, PrState::Draft, "psn:other@acme", Some(30)),
+            (3, PrState::Merged, "psn:other@acme", Some(40)),
+            (4, PrState::Closed, viewer, Some(50)),
+            (5, PrState::Open, "psn:other@acme", None),
+        ];
+        for (number, state, author, updated_at) in fixtures {
+            let mut record =
+                open_record(number, "refs/heads/main", &format!("{number:040}"), author);
+            record.state = state;
+            record.updated_at = updated_at;
+            if number == 2 {
+                record.reviews.push(ReviewRecord {
+                    reviewer_pseudonym: viewer.into(),
+                    state: ReviewState::Requested,
+                    is_agent: false,
+                });
+            }
+            store.open_pr(&loc(), &record).unwrap();
+        }
+
+        let query = PrListQuery::new(PrListState::Open, PrListSort::Updated, 0, 2, viewer).unwrap();
+        let first = store
+            .list_page_bounded(&loc(), &query, 10, 10 * PR_RECORD_MAX_BYTES)
+            .unwrap();
+        assert_eq!(
+            first.records.iter().map(|r| r.number).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert!(first.has_more, "the third open row is the limit+1 probe");
+        assert_eq!(first.total, 3);
+        assert_eq!(
+            first.counts,
+            PrListCounts {
+                open: 3,
+                merged: 1,
+                closed: 1,
+                all: 5,
+                yours: 2,
+                needs_review: 1,
+            }
+        );
+
+        let tail_query =
+            PrListQuery::new(PrListState::Open, PrListSort::Updated, 2, 2, viewer).unwrap();
+        let tail = store
+            .list_page_bounded(&loc(), &tail_query, 10, 10 * PR_RECORD_MAX_BYTES)
+            .unwrap();
+        assert_eq!(
+            tail.records.iter().map(|r| r.number).collect::<Vec<_>>(),
+            [5]
+        );
+        assert!(!tail.has_more);
+        assert_eq!(
+            tail.counts, first.counts,
+            "counts never narrow with the page"
+        );
+
+        let created =
+            PrListQuery::new(PrListState::All, PrListSort::Created, 0, 2, viewer).unwrap();
+        let created = store
+            .list_page_bounded(&loc(), &created, 10, 10 * PR_RECORD_MAX_BYTES)
+            .unwrap();
+        assert_eq!(
+            created.records.iter().map(|r| r.number).collect::<Vec<_>>(),
+            [5, 4]
+        );
+
+        let beyond =
+            PrListQuery::new(PrListState::Merged, PrListSort::Created, 9, 2, viewer).unwrap();
+        let beyond = store
+            .list_page_bounded(&loc(), &beyond, 10, 10 * PR_RECORD_MAX_BYTES)
+            .unwrap();
+        assert!(beyond.records.is_empty());
+        assert_eq!(beyond.total, 1);
+        assert_eq!(beyond.counts, first.counts);
+
+        assert!(PrListQuery::new(PrListState::All, PrListSort::Created, 0, 0, viewer).is_err());
+        assert!(PrListQuery::new(PrListState::All, PrListSort::Created, 0, 101, viewer).is_err());
+        assert!(PrListQuery::new(
+            PrListState::All,
+            PrListSort::Created,
+            PR_LIST_OFFSET_MAX,
+            1,
+            viewer,
+        )
+        .is_ok());
+        assert!(PrListQuery::new(
+            PrListState::All,
+            PrListSort::Created,
+            PR_LIST_OFFSET_MAX + 1,
+            1,
+            viewer,
+        )
+        .is_err());
+        assert!(matches!(
+            store.list_page_bounded(&loc(), &query, 4, usize::MAX),
+            Err(DurableError::Git(message))
+                if message == "pull request list limit exceeded: record count"
         ));
         std::fs::remove_dir_all(&root).ok();
     }

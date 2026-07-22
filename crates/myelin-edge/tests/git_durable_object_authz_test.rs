@@ -384,6 +384,17 @@ fn ungranted_in_tenant_principal_is_denied_on_every_object_route() {
     let (status, body) = h.call_query(
         "subj-mallory",
         "GET",
+        "/v1/git/repos/alpha/prs",
+        "state=open&state=all&limit=01&unknown=value",
+    );
+    assert_eq!(
+        status, 404,
+        "Pull deny must precede strict PR-list parsing: {body}"
+    );
+    assert_eq!(body["error"]["message"], "repository not found");
+    let (status, body) = h.call_query(
+        "subj-mallory",
+        "GET",
         "/v1/git/repos/alpha/prs/1/commits",
         "cursor=malformed&limit=01",
     );

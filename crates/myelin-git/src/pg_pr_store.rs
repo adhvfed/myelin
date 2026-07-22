@@ -32,7 +32,8 @@ use crate::events::{
 };
 use crate::lifecycle::PrState;
 use crate::pr_store::{
-    ensure_pr_record_size, evaluate_merge, DurablePrStore, MergeAttempt, MergeEval, PrRecord,
+    ensure_pr_record_size, evaluate_merge, DurablePrStore, MergeAttempt, MergeEval, PrListCounts,
+    PrListQuery, PrListSlice, PrListSort, PrListState, PrRecord,
 };
 use crate::receive_pack::{
     CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome, PushSession,
@@ -44,6 +45,56 @@ pub const GIT_PR_COUNTER_TABLE: &str = "git_pr_counter";
 pub const GIT_PR_COMMAND_TABLE: &str = "git_pr_command";
 const PR_RECORD_COLUMNS: &str = "record, head_repo_slug, title_nonce, title_ciphertext, \
 title_pii_key_ref, body_nonce, body_ciphertext, body_pii_key_ref, author_subject_id";
+
+fn pr_list_state_predicate(state: PrListState) -> &'static str {
+    match state {
+        PrListState::Open => "g.record->>'state' IN ('Open','Draft')",
+        PrListState::Merged => "g.record->>'state' = 'Merged'",
+        PrListState::Closed => "g.record->>'state' = 'Closed'",
+        PrListState::All => "TRUE",
+    }
+}
+
+fn pr_list_page_sql(query: &PrListQuery) -> String {
+    let page_order = match query.sort {
+        PrListSort::Created => "g.number DESC",
+        PrListSort::Updated => "((g.record->>'updated_at')::bigint) DESC NULLS LAST, g.number DESC",
+    };
+    let output_order = match query.sort {
+        PrListSort::Created => "p.page_number DESC NULLS LAST",
+        PrListSort::Updated => "p.page_updated_at DESC NULLS LAST, p.page_number DESC NULLS LAST",
+    };
+    format!(
+        "WITH counts AS (\
+           SELECT count(*) FILTER (WHERE g.record->>'state' IN ('Open','Draft'))::bigint AS open_count, \
+                  count(*) FILTER (WHERE g.record->>'state' = 'Merged')::bigint AS merged_count, \
+                  count(*) FILTER (WHERE g.record->>'state' = 'Closed')::bigint AS closed_count, \
+                  count(*)::bigint AS all_count, \
+                  count(*) FILTER (WHERE g.record->>'author_pseudonym' = $4)::bigint AS yours_count, \
+                  count(*) FILTER (WHERE EXISTS (\
+                    SELECT 1 FROM jsonb_array_elements(COALESCE(g.record->'reviews','[]'::jsonb)) review \
+                     WHERE review->>'reviewer_pseudonym' = $4 \
+                       AND review->>'state' = 'Requested'\
+                  ))::bigint AS needs_review_count \
+             FROM git_pr g \
+            WHERE g.tenant_id=$1 AND g.region=$2 AND g.repo_slug=$3\
+         ), page_rows AS (\
+           SELECT g.{columns}, g.number AS page_number, \
+                  (g.record->>'updated_at')::bigint AS page_updated_at \
+             FROM git_pr g \
+            WHERE g.tenant_id=$1 AND g.region=$2 AND g.repo_slug=$3 \
+              AND ({state}) \
+            ORDER BY {page_order} LIMIT $6 OFFSET $5\
+         ) \
+         SELECT c.open_count,c.merged_count,c.closed_count,c.all_count,c.yours_count,\
+                c.needs_review_count,p.page_number,p.page_updated_at,\
+                p.record,p.head_repo_slug,p.title_nonce,p.title_ciphertext,p.title_pii_key_ref,\
+                p.body_nonce,p.body_ciphertext,p.body_pii_key_ref,p.author_subject_id \
+           FROM counts c LEFT JOIN page_rows p ON TRUE ORDER BY {output_order}",
+        columns = PR_RECORD_COLUMNS,
+        state = pr_list_state_predicate(query.state),
+    )
+}
 
 pub const CREATE_GIT_PR_COUNTER_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS git_pr_counter (
@@ -103,6 +154,34 @@ SELECT myelin_make_tenant_scoped('git_pr');
 pub const CREATE_GIT_PR_HEAD_REPO_INDEX_DDL: &str = r#"
 CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_head_repo_idx
   ON git_pr (tenant_id, region, head_repo_slug, repo_slug, number)
+"#;
+
+/// Default `sort=updated` page index. `NULLS LAST` matches the Rust `Option<i64>` ordering used by
+/// the filesystem fallback; number is the stable total-order tie breaker.
+pub const CREATE_GIT_PR_REPO_UPDATED_LIST_INDEX_DDL: &str = r#"
+CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_repo_updated_list_idx
+  ON git_pr (
+    tenant_id, region, repo_slug,
+    ((record->>'updated_at')::bigint) DESC NULLS LAST,
+    number DESC
+  )
+"#;
+
+/// State-filtered updated pages retain index order without materializing the repository relation.
+pub const CREATE_GIT_PR_REPO_STATE_UPDATED_LIST_INDEX_DDL: &str = r#"
+CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_repo_state_updated_list_idx
+  ON git_pr (
+    tenant_id, region, repo_slug, (record->>'state'),
+    ((record->>'updated_at')::bigint) DESC NULLS LAST,
+    number DESC
+  )
+"#;
+
+/// `sort=created` is PR-number order; this companion serves state-filtered tabs while the primary
+/// key already serves the unfiltered backwards scan.
+pub const CREATE_GIT_PR_REPO_STATE_CREATED_LIST_INDEX_DDL: &str = r#"
+CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_repo_state_created_list_idx
+  ON git_pr (tenant_id, region, repo_slug, (record->>'state'), number DESC)
 "#;
 
 pub const CREATE_GIT_PR_COMMAND_DDL: &str = r#"
@@ -170,6 +249,24 @@ pub fn git_pr_migrations() -> Migrations {
             CREATE_GIT_PR_COMMAND_OPERATION_SCOPE_INDEX_DDL,
             MigrationPhase::Expand,
             GIT_PR_COMMAND_TABLE,
+        ),
+        Migration::phased(
+            "git_0007_pr_repo_updated_list_index",
+            CREATE_GIT_PR_REPO_UPDATED_LIST_INDEX_DDL,
+            MigrationPhase::Expand,
+            GIT_PR_TABLE,
+        ),
+        Migration::phased(
+            "git_0008_pr_repo_state_updated_list_index",
+            CREATE_GIT_PR_REPO_STATE_UPDATED_LIST_INDEX_DDL,
+            MigrationPhase::Expand,
+            GIT_PR_TABLE,
+        ),
+        Migration::phased(
+            "git_0009_pr_repo_state_created_list_index",
+            CREATE_GIT_PR_REPO_STATE_CREATED_LIST_INDEX_DDL,
+            MigrationPhase::Expand,
+            GIT_PR_TABLE,
         ),
     ])
 }
@@ -577,6 +674,95 @@ impl PgPrStore {
         rows.into_iter()
             .map(|row| decode_record(&kms, &crypto_region, &expected_tenant, row))
             .collect()
+    }
+
+    /// Exact-count, bounded-return per-repository list read. One PostgreSQL statement computes all
+    /// tab/sidebar aggregates over the verified repository relation and selects only `limit + 1`
+    /// state-filtered rows in the requested order. The extra row detects continuation and is never
+    /// decrypted or returned. Unlike the legacy filesystem fallback, PostgreSQL does not reject a
+    /// large relation merely to preserve process bounds: aggregate work stays in SQL and only the
+    /// bounded page crosses into the process.
+    pub fn list_page(
+        &self,
+        scope: &TenantScope,
+        repo: &str,
+        query: &PrListQuery,
+    ) -> Result<PrListSlice, DurableError> {
+        query.validate()?;
+        let target = self.scoped_target(scope, repo)?;
+        let provider = self.provider.clone();
+        let kms = self.kms.clone();
+        let tenant_id = target.tenant_id;
+        let region = target.region;
+        let loc = target.loc;
+        let transaction_tenant = tenant_id.0.clone();
+        let crypto_region = region.clone();
+        let expected_tenant = tenant_id.0.clone();
+        let offset = i64::try_from(query.offset)
+            .map_err(|_| DurableError::Git("pull request page offset is too large".into()))?;
+        let fetch_limit = i64::try_from(query.limit.saturating_add(1))
+            .map_err(|_| DurableError::Git("pull request page limit is too large".into()))?;
+        let sql = pr_list_page_sql(query);
+        let viewer = query.viewer_pseudonym.clone();
+        let rows = self
+            .block_on(async move {
+                provider
+                    .with_tenant_tx(&transaction_tenant.clone(), move |conn| {
+                        Box::pin(async move {
+                            sqlx::query(&sql)
+                                .bind(&tenant_id.0)
+                                .bind(&region.0)
+                                .bind(&loc.repo)
+                                .bind(viewer)
+                                .bind(offset)
+                                .bind(fetch_limit)
+                                .fetch_all(&mut *conn)
+                                .await
+                                .map_err(|_| pg_query("page PR list"))
+                        })
+                    })
+                    .await
+            })
+            .map_err(pg_error)?;
+        let summary = rows
+            .first()
+            .ok_or_else(|| DurableError::Io("PR list summary is missing".into()))?;
+        let count = |column: &'static str| -> Result<usize, DurableError> {
+            let value: i64 = summary
+                .try_get(column)
+                .map_err(|_| DurableError::Io("PR list count is malformed".into()))?;
+            usize::try_from(value)
+                .map_err(|_| DurableError::Io("PR list count is malformed".into()))
+        };
+        let counts = PrListCounts {
+            open: count("open_count")?,
+            merged: count("merged_count")?,
+            closed: count("closed_count")?,
+            all: count("all_count")?,
+            yours: count("yours_count")?,
+            needs_review: count("needs_review_count")?,
+        };
+        let mut records = Vec::with_capacity(query.limit);
+        let mut has_more = false;
+        for row in rows {
+            let page_number: Option<i64> = row
+                .try_get("page_number")
+                .map_err(|_| DurableError::Io("PR list page row is malformed".into()))?;
+            if page_number.is_some() {
+                if records.len() == query.limit {
+                    has_more = true;
+                    continue;
+                }
+                records.push(decode_record(&kms, &crypto_region, &expected_tenant, row)?);
+            }
+        }
+        Ok(PrListSlice {
+            records,
+            counts,
+            total: counts.filtered_total(query.state),
+            offset: query.offset,
+            has_more,
+        })
     }
 
     /// Allocate the number, insert the row and stage `git.pr.opened` in one transaction.
@@ -2522,14 +2708,60 @@ mod tests {
             .contains("CREATE UNIQUE INDEX CONCURRENTLY"));
         assert!(CREATE_GIT_PR_COMMAND_OPERATION_SCOPE_INDEX_DDL
             .contains("(tenant_id, region, operation_id)"));
+        assert!(CREATE_GIT_PR_REPO_UPDATED_LIST_INDEX_DDL.contains("DESC NULLS LAST"));
+        assert!(CREATE_GIT_PR_REPO_UPDATED_LIST_INDEX_DDL.contains("tenant_id, region, repo_slug"));
+        assert!(CREATE_GIT_PR_REPO_STATE_UPDATED_LIST_INDEX_DDL.contains("(record->>'state')"));
+        assert!(CREATE_GIT_PR_REPO_STATE_CREATED_LIST_INDEX_DDL.contains("number DESC"));
         assert!(!CREATE_GIT_PR_DDL.contains("title text"));
         assert!(CREATE_GIT_PR_COUNTER_DDL.contains("PRIMARY KEY (tenant_id, region, repo_slug)"));
     }
 
     #[test]
+    fn page_query_is_one_statement_with_exact_counts_empty_page_sentinel_and_no_relation_cap() {
+        let updated = PrListQuery::new(
+            PrListState::Open,
+            PrListSort::Updated,
+            50,
+            25,
+            "psn:viewer@tenant",
+        )
+        .unwrap();
+        let sql = pr_list_page_sql(&updated);
+        assert_eq!(
+            sql.split(';')
+                .filter(|part| !part.trim().is_empty())
+                .count(),
+            1,
+            "the page and all aggregates share one statement snapshot"
+        );
+        assert!(sql.contains("count(*) FILTER"));
+        assert!(sql.contains("jsonb_array_elements"));
+        assert!(sql.contains("LEFT JOIN page_rows p ON TRUE"));
+        assert!(sql.contains("LIMIT $6 OFFSET $5"));
+        assert!(sql.contains("g.record->>'state' IN ('Open','Draft')"));
+        assert!(sql.contains("DESC NULLS LAST, g.number DESC"));
+        assert!(
+            !sql.contains("pg_column_size") && !sql.contains("total_bytes"),
+            "large PG relations keep exact badges and bounded pages instead of inheriting the filesystem cliff"
+        );
+
+        let created = PrListQuery::new(
+            PrListState::Merged,
+            PrListSort::Created,
+            0,
+            100,
+            "psn:viewer@tenant",
+        )
+        .unwrap();
+        let sql = pr_list_page_sql(&created);
+        assert!(sql.contains("g.record->>'state' = 'Merged'"));
+        assert!(sql.contains("ORDER BY g.number DESC LIMIT $6 OFFSET $5"));
+    }
+
+    #[test]
     fn migration_set_is_forward_only_and_declares_mutated_tables_hot() {
         let migrations = git_pr_migrations();
-        assert_eq!(migrations.0.len(), 6);
+        assert_eq!(migrations.0.len(), 9);
         for migration in &migrations.0 {
             let upper = migration.ddl.to_ascii_uppercase();
             assert!(!upper.contains("DROP TABLE"));
@@ -2917,6 +3149,43 @@ mod tests {
         }
         numbers.sort_unstable();
         assert_eq!(numbers, (2..=9).collect::<Vec<_>>());
+
+        // The storage-paginated read returns only the bounded page while exact counts survive an
+        // empty/out-of-range page from the same statement.
+        let page_query = PrListQuery::new(
+            PrListState::All,
+            PrListSort::Created,
+            0,
+            3,
+            "author@tenant.noreply",
+        )
+        .unwrap();
+        let page = store.list_page(&scope_a, repo, &page_query).unwrap();
+        assert_eq!(
+            page.records
+                .iter()
+                .map(|record| record.number)
+                .collect::<Vec<_>>(),
+            [9, 8, 7]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.total, 9);
+        assert_eq!(page.counts.all, 9);
+        assert_eq!(page.counts.open, 9);
+        assert_eq!(page.counts.yours, 9);
+
+        let empty_query = PrListQuery::new(
+            PrListState::Merged,
+            PrListSort::Created,
+            999,
+            3,
+            "author@tenant.noreply",
+        )
+        .unwrap();
+        let empty = store.list_page(&scope_a, repo, &empty_query).unwrap();
+        assert!(empty.records.is_empty());
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.counts.all, 9, "empty pages retain exact full badges");
 
         // Concurrent read/modify/write mutations retain both reviews; exact retry emits no duplicate.
         let mut mutation_joins = Vec::new();

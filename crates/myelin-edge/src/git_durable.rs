@@ -60,7 +60,8 @@ use myelin_git::lifecycle::{
 use myelin_git::pg_pr_store::{PgPrStore, PrMutation, PrOperationId};
 use myelin_git::pr_store::{
     effective_ruleset, evaluate_merge, merge_pr, BranchProtectionConfig, ChecksSummary,
-    DurablePrStore, MergeAttempt, PrRecord, ReviewRecord,
+    DurablePrStore, MergeAttempt, PrListCounts, PrListQuery, PrListSlice, PrListSort, PrListState,
+    PrRecord, ReviewRecord, PR_LIST_OFFSET_MAX,
 };
 use myelin_git::pr_threads::{
     AnchorSide, AnchorState, BatchVerdict, CommentRecord, CommentState, DurablePrThreadStore,
@@ -281,6 +282,15 @@ struct EnrichedPr {
     summary: ChecksSummary,
     you_requested: bool,
     repo_slug: Option<String>,
+}
+
+struct EnrichedPrSlice {
+    rows: Vec<EnrichedPr>,
+    counts: PrListCounts,
+    total: usize,
+    offset: usize,
+    limit: usize,
+    has_more: bool,
 }
 
 impl DurableGitBackend {
@@ -605,12 +615,28 @@ impl DurableGitBackend {
             Some(store) => store.list_bounded(
                 &Self::verified_pr_scope(principal, loc)?,
                 &loc.repo,
-                PR_LIST_MAX_RECORDS,
+                PR_LIST_OFFSET_MAX,
                 PR_LIST_MAX_BYTES,
             ),
             None => self
                 .prs
-                .list_bounded(loc, PR_LIST_MAX_RECORDS, PR_LIST_MAX_BYTES),
+                .list_bounded(loc, PR_LIST_OFFSET_MAX, PR_LIST_MAX_BYTES),
+        }
+    }
+
+    fn pr_list_page(
+        &self,
+        loc: &RepoLoc,
+        principal: &Principal,
+        query: &PrListQuery,
+    ) -> Result<PrListSlice, DurableError> {
+        match &self.pg_prs {
+            Some(store) => {
+                store.list_page(&Self::verified_pr_scope(principal, loc)?, &loc.repo, query)
+            }
+            None => self
+                .prs
+                .list_page_bounded(loc, query, PR_LIST_OFFSET_MAX, PR_LIST_MAX_BYTES),
         }
     }
 
@@ -1747,30 +1773,28 @@ impl DurableGitBackend {
     //     [`RepoAuthorizer::visible_repos`] (the `list_objects(viewer, pull, repo)` seam) FIRST, then
     //     lists PRs only within the visible repos — a forbidden repo's PRs never enter any bucket,
     //     count, or cursor.
-    // This realises `compose_pr_list_query` / `PR_LIST_PERMISSION`'s leak-free *semantics* over the
-    // on-disk JSON PR store. The SQL composer in `list_filter.rs` targets a `pr` table (the PG home,
-    // GT-003b) that this store does not yet materialise, so it is not the literal execution path here
-    // — the reduction to the repo `pull` prefilter is (named floor; identical leak-free guarantee).
+    // This realises `compose_pr_list_query` / `PR_LIST_PERMISSION`'s leak-free *semantics* over both
+    // storage authorities. The SQL composer in `list_filter.rs` targets an abstract authorization
+    // projection rather than this literal query; the repo `pull` prefilter is the equivalent gate.
 
     /// Enrich every PR under one repo for the list: read the repo-owned branch-protection config
     /// ONCE (no N+1 — the effective ruleset per PR is a pure function of that config + the PR's
     /// base_ref), roll up each PR's checks summary against its effective required set, and mark the
     /// viewer's requested-reviewer status. On a config-READ error the whole repo's rows fail static
     /// (`Unavailable`) rather than dropping PRs (a checks-projection hiccup must not hide PRs).
-    fn enrich_prs(
+    fn enrich_pr_records(
         &self,
         loc: &RepoLoc,
-        principal: &Principal,
         viewer_pseudonym: &str,
         repo_slug: Option<&str>,
-    ) -> Result<Vec<EnrichedPr>, DurableError> {
-        let records = self.pr_list(loc, principal)?;
+        records: Vec<PrRecord>,
+    ) -> Vec<EnrichedPr> {
         // ONE config read for the whole repo (fail static on error — see above).
         // A read failure degrades every row's summary to Unavailable below.
         let config = self.prs.get_protection(loc).ok();
         let config_readable = config.is_some();
         let config = config.flatten();
-        Ok(records
+        records
             .into_iter()
             .map(|rec| {
                 let summary = if config_readable {
@@ -1787,23 +1811,43 @@ impl DurableGitBackend {
                     repo_slug: repo_slug.map(str::to_string),
                 }
             })
-            .collect())
+            .collect()
+    }
+
+    fn enrich_prs(
+        &self,
+        loc: &RepoLoc,
+        principal: &Principal,
+        viewer_pseudonym: &str,
+        repo_slug: Option<&str>,
+    ) -> Result<Vec<EnrichedPr>, DurableError> {
+        let records = self.pr_list(loc, principal)?;
+        Ok(self.enrich_pr_records(loc, viewer_pseudonym, repo_slug, records))
     }
 
     /// **The per-repo PR list (R3.1).** Every PR in the repo (the caller has already cleared the
     /// `Pull` object guard, so all are `view`-able), enriched with the checks rollup + the viewer's
-    /// review status. The handler applies the `state`/`sort`/cursor + computes tab/sidebar counts
-    /// over THIS (already leak-free) set.
+    /// review status. Storage applies state/sort/cursor and computes exact tab/sidebar counts over
+    /// the already leak-free repository relation before only the bounded page is enriched.
     fn list_prs_for_repo(
         &self,
         tenant: &str,
         region: &str,
         slug: &str,
         principal: &Principal,
-    ) -> Result<Vec<EnrichedPr>, DurableError> {
+        query: &PrListQuery,
+    ) -> Result<EnrichedPrSlice, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         self.store.open_repo(&loc)?; // 404 if the repo is absent (never a phantom empty list).
-        self.enrich_prs(&loc, principal, &Self::pseudonym(tenant, principal), None)
+        let page = self.pr_list_page(&loc, principal, query)?;
+        Ok(EnrichedPrSlice {
+            rows: self.enrich_pr_records(&loc, &query.viewer_pseudonym, None, page.records),
+            counts: page.counts,
+            total: page.total,
+            offset: page.offset,
+            limit: query.limit,
+            has_more: page.has_more,
+        })
     }
 
     /// **The cross-repo PR front door (R3.1, single-cell for R3 — Q5).** Prefilter the on-disk repo
@@ -3149,17 +3193,124 @@ fn viewed_threads_json(v: &ViewedThreads) -> Value {
     })
 }
 
-/// Parse the `?state=` tab filter to the set of PR-state tokens it selects. `open` (the default)
-/// covers both `open` and `draft` (a draft is an open-in-progress PR — the sketch lists it under
-/// Open); `merged`/`closed` are exact; `all` selects everything. An unknown value falls back to
-/// `open` (never an empty list on a typo).
-fn state_filter(state: Option<&str>) -> &'static [&'static str] {
-    match state.unwrap_or("open") {
-        "merged" => &["merged"],
-        "closed" => &["closed"],
-        "all" => &["draft", "open", "merged", "closed"],
-        _ => &["draft", "open"],
+const PR_LIST_QUERY_MAX_BYTES: usize = 16 * 1024;
+
+fn decode_pr_list_query_component(raw: &str) -> Result<String, EdgeError> {
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return Err(EdgeError::BadRequest(
+                    "pull request list query contains malformed percent encoding".into(),
+                ));
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
     }
+    let form_value = raw.replace('+', " ");
+    let decoded = percent_encoding::percent_decode_str(&form_value)
+        .decode_utf8()
+        .map_err(|_| EdgeError::BadRequest("pull request list query is not valid UTF-8".into()))?
+        .into_owned();
+    if decoded.chars().any(char::is_control) {
+        return Err(EdgeError::BadRequest(
+            "pull request list query contains a control character".into(),
+        ));
+    }
+    Ok(decoded)
+}
+
+/// Strictly parse the per-repository PR-list query. PostgreSQL relations may be larger than the
+/// transitional numeric cursor coordinate ceiling: their first pages and exact badges remain
+/// available, while this v1 cursor never discloses an unusable continuation beyond the cap.
+fn repo_pr_list_query(
+    ctx: &HandlerCtx<'_>,
+    viewer_pseudonym: String,
+) -> Result<PrListQuery, EdgeError> {
+    if ctx.request.query.len() > PR_LIST_QUERY_MAX_BYTES {
+        return Err(EdgeError::BadRequest(
+            "pull request list query is too large".into(),
+        ));
+    }
+    let mut state = None;
+    let mut sort = None;
+    let mut cursor = None;
+    let mut limit = None;
+    if !ctx.request.query.is_empty() {
+        for pair in ctx.request.query.split('&') {
+            let (raw_name, raw_value) = pair.split_once('=').ok_or_else(|| {
+                EdgeError::BadRequest("pull request list query is malformed".into())
+            })?;
+            let name = decode_pr_list_query_component(raw_name)?;
+            let value = decode_pr_list_query_component(raw_value)?;
+            let duplicate = |field: &str| {
+                EdgeError::BadRequest(format!(
+                    "duplicate pull request list query parameter `{field}`"
+                ))
+            };
+            match name.as_str() {
+                "state" => {
+                    if state.is_some() {
+                        return Err(duplicate("state"));
+                    }
+                    state = Some(PrListState::parse(&value).ok_or_else(|| {
+                        EdgeError::BadRequest("invalid pull request state filter".into())
+                    })?);
+                }
+                "sort" => {
+                    if sort.is_some() {
+                        return Err(duplicate("sort"));
+                    }
+                    sort = Some(PrListSort::parse(&value).ok_or_else(|| {
+                        EdgeError::BadRequest("invalid pull request sort".into())
+                    })?);
+                }
+                "cursor" => {
+                    if cursor.is_some() {
+                        return Err(duplicate("cursor"));
+                    }
+                    let parsed = value.parse::<usize>().ok().filter(|parsed| {
+                        value == parsed.to_string() && *parsed <= PR_LIST_OFFSET_MAX
+                    });
+                    cursor = Some(parsed.ok_or_else(|| {
+                        EdgeError::BadRequest("invalid pull request cursor".into())
+                    })?);
+                }
+                "limit" => {
+                    if limit.is_some() {
+                        return Err(duplicate("limit"));
+                    }
+                    let parsed = value.parse::<usize>().ok().filter(|parsed| {
+                        value == parsed.to_string() && (1..=MAX_PAGE_LIMIT).contains(parsed)
+                    });
+                    limit = Some(parsed.ok_or_else(|| {
+                        EdgeError::BadRequest(format!(
+                            "pull request list limit must be canonical and within 1..={MAX_PAGE_LIMIT}"
+                        ))
+                    })?);
+                }
+                _ => {
+                    return Err(EdgeError::BadRequest(format!(
+                        "unknown pull request list query parameter `{name}`"
+                    )))
+                }
+            }
+        }
+    }
+    PrListQuery::new(
+        state.unwrap_or(PrListState::Open),
+        sort.unwrap_or(PrListSort::Updated),
+        cursor.unwrap_or(0),
+        limit.unwrap_or(DEFAULT_PAGE_LIMIT),
+        viewer_pseudonym,
+    )
+    .map_err(|_| EdgeError::BadRequest("invalid pull request page".into()))
 }
 
 /// Qualify a bare ref (`main`) to `refs/heads/main`; a fully-qualified `refs/…` passes through.
@@ -3180,9 +3331,8 @@ const LATEST_COMMIT_WALK_CAP: usize = 500;
 /// without limit; normal response pagination happens after this leak-free authorization prefilter.
 const REPO_SCAN_MAX_CANDIDATES: usize = 10_000;
 
-/// Counts and bucket badges require the full already-authorized PR set. Cap that set at the storage
-/// query itself so exact list semantics cannot turn into an unbounded filesystem/SQL materialization.
-const PR_LIST_MAX_RECORDS: usize = 10_000;
+/// Legacy filesystem and cross-repository reads still require the full already-authorized PR set.
+/// Cap their serialized bytes; the shared record/offset ceiling is [`PR_LIST_OFFSET_MAX`].
 const PR_LIST_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Boot recovery fails loud above this finite pending-command envelope so tenant backlog cannot
@@ -6123,6 +6273,35 @@ fn pr_list_envelope(mut enriched: Vec<EnrichedPr>, ctx: &HandlerCtx<'_>, counts:
     })
 }
 
+/// Build the unchanged R3.1 wire envelope from a storage-paginated per-repository slice. Exact
+/// counts and filtered total came from the same authorized storage read as the bounded page.
+fn repo_pr_list_envelope(page: EnrichedPrSlice) -> Value {
+    let next_offset = page.offset.checked_add(page.limit);
+    let next_cursor = next_offset
+        .filter(|offset| page.has_more && *offset <= PR_LIST_OFFSET_MAX)
+        .map(|offset| offset.to_string());
+    let prev_cursor = (page.offset > 0).then(|| page.offset.saturating_sub(page.limit).to_string());
+    let counts = json!({
+        "open": page.counts.open,
+        "merged": page.counts.merged,
+        "closed": page.counts.closed,
+        "all": page.counts.all,
+        "yours": page.counts.yours,
+        "needs_review": page.counts.needs_review,
+    });
+    json!({
+        "items": page.rows.iter().map(DurableGitBackend::pr_list_row_json).collect::<Vec<_>>(),
+        "page": {
+            "next_cursor": next_cursor,
+            "prev_cursor": prev_cursor,
+            "limit": page.limit,
+            "offset": page.offset,
+            "total": page.total,
+        },
+        "counts": counts,
+    })
+}
+
 /// **`GET /v1/git/repos/{repo}/prs` — the per-repo PR list (R3.1).** Registered through the
 /// [`RepoObjectGuard`] `Pull` check (the leak-free prefilter: `pull_request.view = parent_repo->pull`
 /// — a viewer who cannot pull gets the 0-leak 404 "no access" state; once past it every PR is
@@ -6133,36 +6312,19 @@ struct DRepoPrList {
 }
 impl Handler for DRepoPrList {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let all = self
+        let viewer = DurableGitBackend::pseudonym(tenant_of(ctx), ctx.principal);
+        let query = repo_pr_list_query(ctx, viewer)?;
+        let page = self
             .be
             .list_prs_for_repo(
                 tenant_of(ctx),
                 region_of(ctx),
                 param(ctx, "repo")?,
                 ctx.principal,
+                &query,
             )
             .map_err(map_durable_err)?;
-        let viewer = DurableGitBackend::pseudonym(tenant_of(ctx), ctx.principal);
-        // Counts over the FULL (already leak-free) set — never a post-filtered subset.
-        let count = |pred: &dyn Fn(&EnrichedPr) -> bool| all.iter().filter(|e| pred(e)).count();
-        let counts = json!({
-            "open": count(&|e| matches!(e.rec.state, PrState::Open | PrState::Draft)),
-            "merged": count(&|e| matches!(e.rec.state, PrState::Merged)),
-            "closed": count(&|e| matches!(e.rec.state, PrState::Closed)),
-            "all": all.len(),
-            "yours": count(&|e| e.rec.author_pseudonym == viewer),
-            "needs_review": count(&|e| e.you_requested),
-        });
-        // The `?state=` tab filter (leak-free: it narrows an already-authorised set).
-        let wanted = state_filter(ctx.request.query_param("state").as_deref());
-        let filtered: Vec<EnrichedPr> = all
-            .into_iter()
-            .filter(|e| wanted.contains(&DurableGitBackend::pr_state_token(e.rec.state)))
-            .collect();
-        Ok(EdgeResponse::json(
-            200,
-            &pr_list_envelope(filtered, ctx, counts),
-        ))
+        Ok(EdgeResponse::json(200, &repo_pr_list_envelope(page)))
     }
 }
 
@@ -7573,6 +7735,16 @@ mod pr_list_tests {
 
     /// Drive a list handler with a viewer + query string, returning the parsed JSON body.
     fn serve(handler: &dyn Handler, viewer: &Principal, repo: Option<&str>, query: &str) -> Value {
+        serve_result(handler, viewer, repo, query)
+            .unwrap_or_else(|e| panic!("handler errored: {e:?}"))
+    }
+
+    fn serve_result(
+        handler: &dyn Handler,
+        viewer: &Principal,
+        repo: Option<&str>,
+        query: &str,
+    ) -> Result<Value, EdgeError> {
         let scope = TenantScope::from_verified_token(viewer, viewer.region.clone());
         let mut params = BTreeMap::new();
         if let Some(r) = repo {
@@ -7589,17 +7761,14 @@ mod pr_list_tests {
             page: &page,
             request: &req,
         };
-        match handler.handle(&ctx) {
-            Ok(resp) => resp.json_body().expect("json body"),
-            Err(e) => panic!("handler errored: {e:?}"),
-        }
+        handler
+            .handle(&ctx)
+            .map(|response| response.json_body().expect("json body"))
     }
 
-    /// **A forged cursor never panics (verifier finding, R3.1): `?cursor=usize::MAX` must yield a
-    /// clean empty page** — the offset+limit arithmetic saturates instead of overflowing (which
-    /// panicked under overflow-checks, i.e. every debug/CI profile → a 500 on a crafted query).
+    /// Transitional numeric cursors are canonical and capped at the finite legacy coordinate.
     #[test]
-    fn forged_max_cursor_yields_empty_page_never_panics() {
+    fn forged_or_over_cap_pr_list_cursor_is_a_clean_bad_request() {
         let root = temp_root("forged-cursor");
         let authz = GrantBackedRepos::new().grant_read("u:viewer", TENANT, "core");
         let be =
@@ -7607,20 +7776,74 @@ mod pr_list_tests {
         let viewer = human("u:viewer");
         open_pr(&be, "core", "Only PR", &viewer);
         let handler = DRepoPrList { be: Arc::new(be) };
-        let body = serve(
-            &handler,
-            &viewer,
-            Some("core"),
-            &format!("state=all&cursor={}", usize::MAX),
-        );
+        for cursor in [
+            usize::MAX.to_string(),
+            "10001".into(),
+            "01".into(),
+            "+1".into(),
+        ] {
+            let error = serve_result(
+                &handler,
+                &viewer,
+                Some("core"),
+                &format!("state=all&cursor={cursor}"),
+            )
+            .expect_err("a noncanonical or over-cap cursor must be rejected");
+            assert_eq!(
+                error,
+                EdgeError::BadRequest("invalid pull request cursor".into())
+            );
+        }
+        for query in [
+            "state=unknown",
+            "sort=oldest",
+            "state=open&state=all",
+            "sort=updated&sort=created",
+            "cursor=1&cursor=2",
+            "limit=1&limit=2",
+            "unknown=value",
+            "limit",
+            "=value",
+            "limit=01",
+            "limit=0",
+            "limit=101",
+            "limit=%ZZ",
+            "cursor=",
+        ] {
+            assert!(matches!(
+                serve_result(&handler, &viewer, Some("core"), query),
+                Err(EdgeError::BadRequest(_))
+            ));
+        }
+        let oversized = format!("state=open&x={}", "a".repeat(PR_LIST_QUERY_MAX_BYTES));
+        assert!(matches!(
+            serve_result(&handler, &viewer, Some("core"), &oversized),
+            Err(EdgeError::BadRequest(_))
+        ));
+        let body = serve(&handler, &viewer, Some("core"), "state=all&cursor=10000");
         assert_eq!(
             body["items"].as_array().unwrap().len(),
             0,
-            "past-the-end page is empty"
+            "the capped out-of-range coordinate is an empty page"
         );
+        assert_eq!(body["counts"]["all"], 1, "empty pages retain exact badges");
+        assert_eq!(body["page"]["total"], 1);
         assert!(
             body["page"]["next_cursor"].is_null(),
             "no next past the end"
+        );
+
+        let capped = repo_pr_list_envelope(EnrichedPrSlice {
+            rows: Vec::new(),
+            counts: PrListCounts::default(),
+            total: PR_LIST_OFFSET_MAX + 1,
+            offset: PR_LIST_OFFSET_MAX,
+            limit: 100,
+            has_more: true,
+        });
+        assert!(
+            capped["page"]["next_cursor"].is_null(),
+            "the transitional ceiling never emits a cursor its strict parser will reject"
         );
         std::fs::remove_dir_all(&root).ok();
     }
