@@ -886,30 +886,27 @@ impl RefStore {
 
     /// The reflog (append-only; the per-ref history — used by the holder + the audit walk). On the
     /// durable path this reads the real on-disk git reflog of every ref (loaded from disk).
-    pub fn reflog(&self) -> Vec<ReflogEntry> {
+    pub fn reflog(&self) -> Result<Vec<ReflogEntry>, crate::durable::DurableError> {
         match &self.backing {
-            RefBacking::Memory { reflog, .. } => {
+            RefBacking::Memory { reflog, .. } => Ok(
                 reflog.lock().unwrap_or_else(|e| e.into_inner()).clone()
-            }
+            ),
             RefBacking::Disk { repo } => {
                 // Assemble the per-ref durable reflogs into the RefStore view, oldest-first per ref,
                 // with the monotonic `update_seq` = the entry's 1-based position in that ref's reflog.
                 let mut out = Vec::new();
-                if let Ok(refs) = repo.list_refs() {
-                    for (name, _tip) in refs {
-                        let entries = repo.reflog_entries(&name).unwrap_or_default();
-                        for (i, e) in entries.into_iter().enumerate() {
-                            out.push(ReflogEntry {
-                                ref_name: RefName::new(name.clone()),
-                                old_oid: e.old_oid.map(|o| Oid::new(o.0)),
-                                new_oid: Oid::new(e.new_oid.0),
-                                update_seq: (i as u64) + 1,
-                                pusher_pseudonym: e.committer,
-                            });
-                        }
+                for (name, _tip) in repo.list_refs()? {
+                    for (i, e) in repo.reflog_entries(&name)?.into_iter().enumerate() {
+                        out.push(ReflogEntry {
+                            ref_name: RefName::new(name.clone()),
+                            old_oid: e.old_oid.map(|o| Oid::new(o.0)),
+                            new_oid: Oid::new(e.new_oid.0),
+                            update_seq: (i as u64) + 1,
+                            pusher_pseudonym: e.committer,
+                        });
                     }
                 }
-                out
+                Ok(out)
             }
         }
     }
@@ -2196,7 +2193,7 @@ mod tests {
             store.tip(&RefName::new("refs/heads/feature")),
             Some(Oid::new("v3"))
         );
-        let log = store.reflog();
+        let log = store.reflog().expect("reflog");
         let seqs: Vec<u64> = log
             .iter()
             .filter(|e| e.ref_name == RefName::new("refs/heads/feature"))
@@ -2285,6 +2282,7 @@ mod tests {
         assert_eq!(
             store
                 .reflog()
+                .expect("reflog")
                 .iter()
                 .filter(|e| e.ref_name == RefName::new("refs/heads/hot"))
                 .count(),
@@ -2508,6 +2506,7 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("inject repository disappearance");
 
         assert!(store.try_tip(&RefName::new("refs/heads/feature")).is_err());
+        assert!(store.reflog().is_err(), "audit history faults must not become an empty log");
         let result = store.receive(
             &human_push("refs/heads/feature", Oid::zero(), Oid::new("new")),
             &InMemoryObjectDb::new(),

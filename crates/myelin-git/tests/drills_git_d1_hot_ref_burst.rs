@@ -280,7 +280,7 @@ fn git_d1_hot_ref_burst_per_ref_order_zero_lost_zero_ghost() {
         let tip = store
             .tip(&RefName::new(HOT_REF))
             .expect("the hot ref exists");
-        let log = store.reflog();
+        let log = store.reflog().expect("read reflog");
         let gens: Vec<u64> = log
             .iter()
             .filter(|e| e.ref_name == RefName::new(HOT_REF))

@@ -138,7 +138,7 @@ fn git_d2_git1_half_zero_cleartext_pii_admitted_at_receive_pack() {
     // commit's author/committer lines) carries ONLY the `<pseudonym>@<tenant>.noreply` form, never a
     // cleartext-PII token. (The rejected push left nothing stored.)
     let mut stored_identity_corpus = String::new();
-    for entry in store.reflog() {
+    for entry in store.reflog().expect("read reflog") {
         stored_identity_corpus.push_str(&entry.pusher_pseudonym);
         stored_identity_corpus.push('\n');
     }
