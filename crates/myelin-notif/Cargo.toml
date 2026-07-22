@@ -43,7 +43,7 @@ path = "src/lib.rs"
 myelin-tenancy = { path = "../myelin-tenancy" }
 # The EventEnvelope tier (re-exports ArtifactRef); the router (NOTIF-P3) consumes curated
 # Signals over the EventHandler template and emits notif.* via the outbox — the ONLY emit path.
-myelin-events = { path = "../myelin-events" }
+myelin-events = { path = "../myelin-events", features = ["nats"] }
 # Principal — the InboxItem recipient + the humanise `viewer` + the DeliveryAdapter target are
 # verified subjects (an agent is a Principal too, §1.4).
 myelin-identity = { path = "../myelin-identity" }

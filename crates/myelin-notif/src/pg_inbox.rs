@@ -168,7 +168,7 @@ impl PgInboxStore {
     /// Standalone write under the platform tenant-scoped transaction convention.
     pub async fn upsert(&self, input: &InboxUpsert) -> Result<InboxUpsertOutcome, PgInboxError> {
         let prepared = PreparedUpsert::try_from(input)?;
-        let tenant = prepared.tenant.clone();
+        let tenant = prepared.tenant_id.0.clone();
         let region = prepared.region.clone();
         with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
             Box::pin(async move { upsert_on_conn(conn, &prepared).await })
@@ -191,6 +191,48 @@ impl PgInboxStore {
         tokio::task::block_in_place(|| runtime.block_on(upsert_on_conn(conn, &prepared)))
     }
 
+    /// Check the collapse key on the consumer runtime's exact co-commit connection. This is the
+    /// durable storm-control lookup immediately before [`Self::co_commit_upsert`]; it never falls
+    /// back to the pool or observes another tenant/recipient's rows.
+    pub(crate) fn co_commit_contains(
+        &self,
+        tx: &mut myelin_events::HandlerTx<'_>,
+        item: &RoutedInboxItem,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<bool, PgInboxError> {
+        for field in [
+            item.tenant.0.as_str(),
+            item.region.0.as_str(),
+            item.recipient.as_str(),
+            item.dedup_key.as_str(),
+        ] {
+            if field.is_empty()
+                || field.len() > MAX_KEY_BYTES
+                || field.chars().any(char::is_control)
+            {
+                return Err(PgInboxError::InvalidInput);
+            }
+        }
+        let conn = tx
+            .connection::<sqlx::PgConnection>()
+            .ok_or(PgInboxError::NoCoCommitTx)?;
+        tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM notif_inbox_item \
+                     WHERE tenant_id = $1 AND region = $2 AND recipient = $3 AND dedup_key = $4)",
+                )
+                .bind(&item.tenant.0)
+                .bind(&item.region.0)
+                .bind(&item.recipient)
+                .bind(&item.dedup_key)
+                .fetch_one(conn)
+                .await
+                .map_err(|_| PgInboxError::Database)
+            })
+        })
+    }
+
     /// Read one recipient-scoped keyset page. Every filter is lowered into SQL before `LIMIT + 1`.
     pub async fn list(&self, request: &InboxReadRequest) -> Result<DurableInboxPage, PgInboxError> {
         validate_request(request)?;
@@ -211,7 +253,7 @@ impl PgInboxStore {
 
 #[derive(Clone)]
 struct PreparedUpsert {
-    tenant: String,
+    tenant_id: TenantId,
     region: String,
     item_id: String,
     recipient: String,
@@ -281,7 +323,7 @@ impl TryFrom<&InboxUpsert> for PreparedUpsert {
             return Err(PgInboxError::InvalidInput);
         }
         Ok(Self {
-            tenant: item.tenant.0.clone(),
+            tenant_id: item.tenant.clone(),
             region: item.region.0.clone(),
             item_id: item.item_id.clone(),
             recipient: item.recipient.clone(),
@@ -304,7 +346,7 @@ async fn upsert_on_conn(
     row: &PreparedUpsert,
 ) -> Result<InboxUpsertOutcome, PgInboxError> {
     let count = sqlx::query_scalar::<_, i32>(UPSERT_SQL)
-        .bind(&row.tenant)
+        .bind(&row.tenant_id.0)
         .bind(&row.region)
         .bind(&row.item_id)
         .bind(&row.recipient)

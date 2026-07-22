@@ -30,21 +30,18 @@
 //!    write-time UPSERT is the inner idempotency (§3.2).
 //! 3. **ack-after-enqueue, bounded prefetch, the consumer-lag metric** — all provided by the
 //!    [`Consumer`](myelin_events::Consumer) runtime [`build_router`] wraps the handler in.
-//! 4. **The emit path is `OutboxTx::emit` ONLY** — [`SignalRouter::handle`] opens an
-//!    [`OutboxTransaction`](myelin_events::OutboxTransaction) on the shared
-//!    [`OutboxStore`](myelin_events::OutboxStore), stages the inbox UPSERT, **emits
-//!    `notif.item.created` via [`OutboxTx::emit`]`(draft, cause = Some(signal_event))`** (the
-//!    causality root carries; `depth+1`), and commits — the inbox row + the emit **co-commit**
-//!    (BUS-D4 emit-iff-committed). There is **no `publish_now`** in this crate; the
-//!    `no-raw-publish` lint (P-019) is structurally satisfied (the router never calls a broker
-//!    `publish`).
+//! 4. **The emit path is `OutboxTx::emit` ONLY.** The production router derives the canonical row
+//!    in a detached [`OutboxTransaction`](myelin_events::OutboxTransaction), then absorbs it with
+//!    the inbox UPSERT on the exact [`HandlerTx`](myelin_events::HandlerTx) connection that already
+//!    contains the consumer-dedup mark. All three commit or roll back together. The in-memory test
+//!    router retains the ordinary [`OutboxStore`](myelin_events::OutboxStore) transaction model.
+//!    There is no direct broker publish site in this crate.
 //!
-//! ### The skeleton body (NOT the working router)
-//! At N-M2.0 [`SignalRouter::handle`] does exactly one thing per Signal: it derives a skeleton
-//! [`InboxItem`](crate::InboxItem)-shaped row from the Signal and **UPSERTs** it into the in-memory
-//! inbox projection (modelling the `INSERT … ON CONFLICT (tenant, recipient, dedup_key) DO UPDATE`
-//! write-time collapse the `notif_inbox_item` table, NOTIF-P2, declares). It does NOT rank,
-//! storm-control, fan-out, or humanise — those are the named follow-ons below.
+//! ### Durable production body
+//! [`build_durable_router`] binds one exact homed tenant and expected cell region. Its handler
+//! writes `notif_inbox_item`, the durable dedup mark, and a fresh `notif.item.created` outbox row in
+//! one PostgreSQL transaction; a collapse increments the existing row without re-pushing. Missing
+//! transaction authority or any database failure returns `Retry`, never a pool fallback.
 //!
 //! ## Head-of-line isolation (NOTIF-D10 — the gate this prompt greens)
 //! A **poison** Signal type (a Signal whose payload cannot be parsed into a [`Signal`]) is
@@ -64,11 +61,10 @@
 //! - **write-fanout** (the bounded `mention` set) → **NOTIF-P12**; **read-fanout** (the unbounded
 //!   ambient watcher set) → **NOTIF-P13**.
 //! - **humanise** (the ONE per-viewer templating surface) → **NOTIF-P9**.
-//! - **the durable persistence of the inbox store** behind the in-memory projection (the
-//!   `notif_inbox_item` UPSERT against the OLTP pool) lands with the OLTP client wiring into
-//!   `serve` — the in-memory projection here models that write byte-for-byte (the
-//!   `(tenant, recipient, dedup_key)` collapse), the named substrate floor (P-007 / P-S12). The
-//!   SEAM shape (the `EventHandler`, the UPSERT key, the outbox emit) does NOT change.
+//! - **durable preference/rate/coalescer state** remains a follow-on. Production deliberately uses
+//!   only the side-effect-free self guard plus the database-backed dedup collapse until those
+//!   mechanisms can share rollback semantics; process-local state may never turn a failed retry
+//!   into a false successful suppression.
 //!
 //! ## Mutation floor (the router decision module — mandatory-core)
 //! The router is mandatory-core (the platform's reactive seam). The mutation-tested core is the
@@ -89,16 +85,19 @@ use myelin_content::InlineNode;
 use myelin_events::{
     consume, AggregateKey, ArtifactRef, Consumer, ConsumerName, ConsumerSpec, DataRole,
     DedupLedger, EmitContextBase, EventDraft, EventEnvelope, EventHandler, EventType,
-    HandleOutcome, IdMinter, MonotonicMinter, OutboxStore, OutboxTx, Reason as BusReason,
-    SubjectPattern, SubscribeError, Visibility,
+    HandleOutcome, IdMinter, MonotonicMinter, OutboxStore, OutboxTransaction, OutboxTx,
+    Reason as BusReason, SubjectPattern, SubscribeError, Visibility,
 };
 use myelin_identity::Principal;
 use myelin_query::signals::{Severity, Signal};
 use myelin_tenancy::{Region, TenantId};
 
+use crate::humanise::reason_template_key;
+use crate::pg_inbox::{InboxUpsert, InboxUpsertOutcome, PgInboxStore};
 use crate::prefs::QuietHours;
 use crate::storm_control::{
-    subject_root_of, RateConfig, StormContext, StormControl, StormDecision,
+    is_self_notification, subject_root_of, RateConfig, StormContext, StormControl, StormDecision,
+    SuppressReason,
 };
 use crate::write_fanout::{extract_mentions, CapVerdict, HotSubjectCap};
 use crate::{Class, Reason};
@@ -422,9 +421,12 @@ impl RoutedInboxItem {
 /// - the [`IdMinter`] the outbox transaction mints event ids from;
 /// - the static `sig.<tenant>.>` whitelist the trait's `subjects()` returns (rule 3).
 pub struct SignalRouter {
+    bound_tenant: TenantId,
+    expected_region: Option<String>,
     inbox: InboxProjection,
     outbox: OutboxStore,
     minter: Arc<dyn IdMinter>,
+    durable: Option<DurableRouting>,
     /// **The five write-time storm-control mechanisms (NOTIF-P11 / §3.2).** Run between classify
     /// ([`SignalRouter::derive_item`]) and UPSERT: self-suppression, dedup-key collapse,
     /// thread/subject coalescing, per-`(recipient, subject_root)` rate damping, and mute/DND honoring.
@@ -450,9 +452,15 @@ pub struct SignalRouter {
     subjects: &'static [SubjectPattern],
 }
 
+#[derive(Clone)]
+struct DurableRouting {
+    inbox: PgInboxStore,
+    runtime: tokio::runtime::Handle,
+}
+
 /// Why the router did not complete routing a Signal envelope. A [`RouteError::MalformedSignal`] is
 /// a POISON (→ [`HandleOutcome::NonRetryable`], dead-lettered immediately, rule 5); a
-/// [`RouteError::EmitFailed`] is a TRANSIENT outbox hiccup (→ [`HandleOutcome::Retry`], 0 lost —
+/// [`RouteError::Transient`] is a transient persistence hiccup (→ [`HandleOutcome::Retry`], 0 lost —
 /// the runtime redelivers, the dedup mark is reverted so the handler re-runs). The distinction is
 /// load-bearing: a transient infra failure must NOT be dead-lettered as if the Signal were poison
 /// (that would silently drop a good notification — silent data loss).
@@ -461,9 +469,9 @@ pub enum RouteError {
     /// The Signal envelope payload could not be parsed into a [`Signal`] (a malformed / unknown
     /// shape on a `sig.*` subject — a poison Signal). Carries the parse detail. → NonRetryable.
     MalformedSignal(String),
-    /// The outbox emit / commit failed transiently (an infra hiccup, not a bad Signal). → Retry
-    /// (0 lost — the runtime redelivers; never a dead-letter of a good Signal). Carries the detail.
-    EmitFailed(String),
+    /// A durable lookup/write/outbox co-commit failed transiently (an infra hiccup, not poison).
+    /// → Retry (0 lost — the runtime redelivers; never a dead-letter of a good Signal).
+    Transient(String),
 }
 
 impl SignalRouter {
@@ -471,20 +479,45 @@ impl SignalRouter {
     /// whitelist (rule 3). Used by [`build_router`]; a test can construct one directly to exercise
     /// [`SignalRouter::handle`] in isolation.
     fn new(
+        bound_tenant: TenantId,
         inbox: InboxProjection,
         outbox: OutboxStore,
         minter: Arc<dyn IdMinter>,
         subjects: &'static [SubjectPattern],
     ) -> SignalRouter {
         SignalRouter {
+            bound_tenant,
+            expected_region: None,
             inbox,
             outbox,
             minter,
+            durable: None,
             storm: StormControl::new(),
             hot_cap: HotSubjectCap::new(),
             ambient: crate::read_fanout::AmbientMarkerStore::new(),
             subjects,
         }
+    }
+
+    fn new_durable(
+        bound_tenant: TenantId,
+        expected_region: String,
+        inbox: PgInboxStore,
+        outbox: OutboxStore,
+        minter: Arc<dyn IdMinter>,
+        runtime: tokio::runtime::Handle,
+        subjects: &'static [SubjectPattern],
+    ) -> SignalRouter {
+        let mut router = SignalRouter::new(
+            bound_tenant,
+            InboxProjection::new(),
+            outbox,
+            minter,
+            subjects,
+        );
+        router.expected_region = Some(expected_region);
+        router.durable = Some(DurableRouting { inbox, runtime });
+        router
     }
 
     /// The inbox projection this router UPSERTs into (so a drill can read the result).
@@ -534,10 +567,19 @@ impl SignalRouter {
     /// candidate WRITES the row (the ONE inbox always receives) but does not push (the emit is the
     /// create-side projection event, so a suppressed-delivery candidate writes the row WITHOUT the
     /// emit); a deliver/collapse/coalesce candidate co-commits the row + the emit.
-    fn route(&self, signal_event: &EventEnvelope) -> Result<StormDecision, RouteError> {
+    fn route(
+        &self,
+        signal_event: &EventEnvelope,
+        handler_tx: &mut myelin_events::HandlerTx<'_>,
+    ) -> Result<StormDecision, RouteError> {
         // (1) Parse the curated Signal from the envelope payload (poison → NonRetryable).
         let signal: Signal = serde_json::from_value(signal_event.payload.clone())
             .map_err(|e| RouteError::MalformedSignal(e.to_string()))?;
+        if signal.tenant != signal_event.tenant {
+            return Err(RouteError::MalformedSignal(
+                "signal tenant does not match its envelope".into(),
+            ));
+        }
 
         // (1b) WRITE-FANOUT for the bounded high-signal set (NOTIF-P12, §3.5 step-1 DIRECT). If the
         // Signal carries `mention(Principal)` STRUCTURED nodes (the recipient was directly addressed),
@@ -546,7 +588,7 @@ impl SignalRouter {
         // `mentions_of` returns `Vec<Principal>` from `&[InlineNode]`, a free-text parse is
         // unconstructable. The ambient skeleton candidate (below) is the §3.5 read-fanout *floor*
         // (the unbounded watcher set is NOTIF-P13); the mention set is the bounded write-fanout leg.
-        self.write_fanout(signal_event, &signal)?;
+        self.write_fanout(signal_event, &signal, handler_tx)?;
 
         // (1c) READ-FANOUT for the UNBOUNDED ambient set (NOTIF-P13, §3.5 step-1 AMBIENT). The
         // watcher set (every watcher of a hot PR, every member of a 50k channel) is NOT exploded into
@@ -573,7 +615,7 @@ impl SignalRouter {
         // is the per-rule `psn:watcher:<rule>` digest candidate, kept for the storm-control contract).
         let item = self.derive_item(signal_event, &signal);
         let subject_root = subject_root_of(&item.subject.0);
-        self.route_one_candidate(signal_event, item, &subject_root)
+        self.route_one_candidate(signal_event, item, &subject_root, handler_tx)
     }
 
     /// **Write-fanout the bounded high-signal mention set (NOTIF-P12, §3.5/§3.2.4).** Reads the
@@ -593,25 +635,38 @@ impl SignalRouter {
         &self,
         signal_event: &EventEnvelope,
         signal: &Signal,
+        handler_tx: &mut myelin_events::HandlerTx<'_>,
     ) -> Result<(), RouteError> {
         let mentions = mentions_of(signal_event);
         if mentions.is_empty() {
             return Ok(());
         }
         let subject_root = subject_root_of(&signal.subject.0);
-        for principal in &mentions {
+        for (index, principal) in mentions.iter().enumerate() {
             let item = self.derive_mention_item(signal_event, signal, principal);
             // The hot-subject cap decision FIRST (§3.2.4): a NEW distinct recipient past the cap
             // OVERFLOWS into the coalesced marker (no new row, no write-amplification). An admitted
             // recipient (within the cap, or a repeat) proceeds to the storm-control collapse + UPSERT.
-            match self.hot_cap.admit(&item.recipient, &subject_root) {
+            let cap_verdict = if self.durable.is_some() {
+                // Production retries must make the same admission decision even when the outer
+                // database transaction rolls back. Bound the already-deduplicated structured
+                // mention list by stable payload order instead of mutating process-local cap state.
+                if index < self.hot_cap.cap() as usize {
+                    CapVerdict::Admit
+                } else {
+                    CapVerdict::Overflow
+                }
+            } else {
+                self.hot_cap.admit(&item.recipient, &subject_root)
+            };
+            match cap_verdict {
                 CapVerdict::Overflow => {
                     // Bounded: the storm is coalesced into the marker, NOT materialised as a new row.
                     // The count is preserved (`overflow_count`) — bounded, never silently lost.
                     continue;
                 }
                 CapVerdict::Admit => {
-                    self.route_one_candidate(signal_event, item, &subject_root)?;
+                    self.route_one_candidate(signal_event, item, &subject_root, handler_tx)?;
                 }
             }
         }
@@ -628,6 +683,7 @@ impl SignalRouter {
         signal_event: &EventEnvelope,
         item: RoutedInboxItem,
         subject_root: &str,
+        handler_tx: &mut myelin_events::HandlerTx<'_>,
     ) -> Result<StormDecision, RouteError> {
         let recipient = item.recipient.clone();
         let dedup_key = item.dedup_key.clone();
@@ -638,25 +694,84 @@ impl SignalRouter {
         // the per-pool default (never-quiet + critical-pierce, the §3.2.4 default rate) until the live
         // per-recipient PrefStore (NOTIF-P10) wires in here — a NAMED floor; the mechanisms that need
         // no prefs (self-suppression, dedup-collapse, coalescing, rate-damping) are fully live now.
-        let row_exists = self.inbox.contains(&item.tenant, &recipient, &dedup_key);
-        let quiet = QuietHours::default();
-        let storm_ctx = StormContext {
-            // The logical clock the token bucket is damped on: the skeleton uses tick 0 (a single
-            // pool tick); the live wiring advances it from the Signal clock (the named floor).
-            tick: 0,
-            utc_minute_of_day: 0,
-            utc_weekday: 0,
-            quiet: &quiet,
-            rate: RateConfig::default(),
+        let row_exists = match &self.durable {
+            Some(durable) => durable
+                .inbox
+                .co_commit_contains(handler_tx, &item, &durable.runtime)
+                .map_err(|_| RouteError::Transient("durable inbox lookup failed".into()))?,
+            None => self.inbox.contains(&item.tenant, &recipient, &dedup_key),
         };
-        let decision = self
-            .storm
-            .decide(signal_event, &item, subject_root, row_exists, &storm_ctx);
+        let decision = if self.durable.is_some() {
+            // Process-local token buckets/coalescers cannot participate in the outer PostgreSQL
+            // rollback. Mutating them before a failed write could turn a retry into a false
+            // rate-damped success (lost notification). Until their durable implementations land,
+            // production applies only the side-effect-free self guard plus the database-backed
+            // collapse check; the in-memory test model continues exercising all five mechanisms.
+            if is_self_notification(signal_event, &item.recipient) {
+                StormDecision::Suppress(SuppressReason::SelfAction)
+            } else if row_exists {
+                StormDecision::Collapse
+            } else {
+                StormDecision::Deliver
+            }
+        } else {
+            let quiet = QuietHours::default();
+            let storm_ctx = StormContext {
+                // The logical clock the token bucket is damped on: the skeleton uses tick 0 (a single
+                // pool tick); the live wiring advances it from the Signal clock (the named floor).
+                tick: 0,
+                utc_minute_of_day: 0,
+                utc_weekday: 0,
+                quiet: &quiet,
+                rate: RateConfig::default(),
+            };
+            self.storm
+                .decide(signal_event, &item, subject_root, row_exists, &storm_ctx)
+        };
 
         // A storm-control verdict NEVER touches the audit (EI-04 §5.3): the underlying Signal is on
         // the bus regardless. A self-action / rate-damped candidate writes no row and emits nothing.
         if !decision.writes_row() {
             return Ok(decision);
+        }
+
+        if let Some(durable) = &self.durable {
+            let input = InboxUpsert {
+                item: item.clone(),
+                subject_root: ArtifactRef(subject_root.to_string()),
+                template_key: reason_template_key(item.reason).to_string(),
+                template_args: vec![item.subject.clone()],
+                occurred_at: signal_event.occurred_at.0.clone(),
+                dek_ref: format!("kms://{}/notif/inbox", item.tenant.0),
+            };
+            let outcome = durable
+                .inbox
+                .co_commit_upsert(handler_tx, &input, &durable.runtime)
+                .map_err(|_| RouteError::Transient("durable inbox write failed".into()))?;
+            let committed_decision = match outcome {
+                InboxUpsertOutcome::Inserted => decision,
+                InboxUpsertOutcome::Collapsed { .. } => StormDecision::Collapse,
+            };
+            if committed_decision.delivers() {
+                let mut detached =
+                    OutboxTransaction::detached(self.minter.clone(), emit_base_from(signal_event));
+                detached
+                    .emit(self.item_created_draft(&item), Some(signal_event))
+                    .map_err(|_| RouteError::Transient("outbox event derivation failed".into()))?;
+                let rows = detached
+                    .into_staged_rows()
+                    .map_err(|_| RouteError::Transient("outbox event staging failed".into()))?;
+                let conn = handler_tx
+                    .connection::<sqlx::PgConnection>()
+                    .ok_or_else(|| RouteError::Transient("durable co-commit tx missing".into()))?;
+                tokio::task::block_in_place(|| {
+                    durable.runtime.block_on(
+                        myelin_storage::pgrelay::PgRelay::co_commit_rows_in_tx(conn, &rows),
+                    )
+                })
+                .map_err(|_| RouteError::Transient("durable outbox co-commit failed".into()))?;
+            }
+            return Ok(committed_decision);
         }
 
         // (3) Co-commit: open a tx, UPSERT the inbox row, emit notif.item.created, COMMIT. The
@@ -689,14 +804,14 @@ impl SignalRouter {
             // A `notif.item.created` is references-not-payloads: it carries the item_id + subject ref,
             // never a rendered string (humanise is per-viewer at read time, NOTIF-P9).
             tx.emit(self.item_created_draft(&item), Some(signal_event))
-                .map_err(|e| RouteError::EmitFailed(format!("outbox emit failed: {e:?}")))?;
+                .map_err(|e| RouteError::Transient(format!("outbox emit failed: {e:?}")))?;
         }
 
         // Commit: the inbox row (+ the notif.item.created emit, when delivered) become durable
         // atomically. A commit failure is a TRANSIENT outbox hiccup → Retry (never a silent
         // half-write, never a dead-letter of a good Signal).
         tx.commit()
-            .map_err(|e| RouteError::EmitFailed(format!("outbox commit failed: {e:?}")))?;
+            .map_err(|e| RouteError::Transient(format!("outbox commit failed: {e:?}")))?;
 
         Ok(decision)
     }
@@ -829,15 +944,25 @@ impl EventHandler for SignalRouter {
     /// **non-retryable poison** ([`HandleOutcome::NonRetryable`]) — terminated immediately (rule 5),
     /// so it does NOT block the subject behind it (NOTIF-D10 head-of-line isolation). The emit rides
     /// the outbox (the co-commit happens inside [`SignalRouter::route`]).
-    fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
-        match self.route(ev) {
+    fn handle(&self, ev: &EventEnvelope, tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
+        if ev.tenant != self.bound_tenant
+            || self
+                .expected_region
+                .as_ref()
+                .is_some_and(|region| ev.region.0 != *region)
+        {
+            return HandleOutcome::NonRetryable(BusReason(
+                "signal envelope is outside the router's tenant/region binding".into(),
+            ));
+        }
+        match self.route(ev, tx) {
             Ok(_) => HandleOutcome::Done,
             // A poison Signal terminates immediately (dead-letter, rule 5) — never a silent drop,
             // never a head-of-line stall on the subject behind it (NOTIF-D10).
             Err(RouteError::MalformedSignal(why)) => HandleOutcome::NonRetryable(BusReason(why)),
             // A TRANSIENT outbox hiccup retries (0 lost — the runtime redelivers, reverts the dedup
             // mark, re-runs). A good Signal is NEVER dead-lettered on an infra failure.
-            Err(RouteError::EmitFailed(_why)) => {
+            Err(RouteError::Transient(_why)) => {
                 HandleOutcome::Retry(myelin_events::Backoff { seconds: 2 })
             }
         }
@@ -867,7 +992,13 @@ pub fn build_router(
     // (the binding set is fixed for the life of the consumer pool — bounded, never per-event).
     let subjects: &'static [SubjectPattern] =
         Box::leak(vec![SubjectPattern(prefix.clone())].into_boxed_slice());
-    let router = SignalRouter::new(inbox, outbox, Arc::new(MonotonicMinter::new()), subjects);
+    let router = SignalRouter::new(
+        tenant.clone(),
+        inbox,
+        outbox,
+        Arc::new(MonotonicMinter::new()),
+        subjects,
+    );
     // The ONE sanctioned consumer entry-point — `consume` validates the spec (rule 3: rejects a
     // `*`/empty subject LOUDLY) and constructs the [`Consumer`] with all seven rules wired.
     consume(
@@ -878,6 +1009,47 @@ pub fn build_router(
         router,
         dedup,
     )
+}
+
+/// Build the production router for one homed tenant. Inbox writes and derived outbox rows use the
+/// exact [`myelin_events::HandlerTx`] connection that already contains the uncommitted consumer
+/// dedup mark; missing transaction authority fails closed and returns a retry. The durable
+/// dead-letter sink keeps poison signals inspectable across restarts.
+#[allow(clippy::too_many_arguments)]
+pub fn build_durable_router(
+    tenant: &TenantId,
+    expected_region: impl Into<String>,
+    inbox: PgInboxStore,
+    outbox: OutboxStore,
+    dedup: DedupLedger,
+    dead_letters: Arc<dyn myelin_events::DurableDeadLetter>,
+    minter: Arc<dyn IdMinter>,
+    runtime: tokio::runtime::Handle,
+) -> Result<Consumer<SignalRouter>, SubscribeError> {
+    let prefix = signal_subject_prefix(tenant)
+        .ok_or_else(|| SubscribeError::WildcardSubject(format!("sig.{}.", tenant.0)))?;
+    let subjects: &'static [SubjectPattern] =
+        Box::leak(vec![SubjectPattern(prefix.clone())].into_boxed_slice());
+    let router = SignalRouter::new_durable(
+        tenant.clone(),
+        expected_region.into(),
+        inbox,
+        outbox,
+        minter,
+        runtime,
+        subjects,
+    );
+    consume(
+        ConsumerSpec::new(
+            ConsumerName(ROUTER_CONSUMER_NAME.into()),
+            &[prefix.as_str()],
+        ),
+        router,
+        dedup,
+    )
+    .map(|consumer| {
+        consumer.with_dead_letter_sink(myelin_events::DeadLetterSink::durable(dead_letters))
+    })
 }
 
 /// Map a Signal [`Severity`] to the inbox routing [`Class`] (the skeleton mapping; the prefs-aware
@@ -1149,6 +1321,42 @@ mod tests {
         );
         // refs-not-payloads: the subject is a ref, never a rendered string.
         assert_eq!(row.subject.0, "myelin://acme/ci/run/42");
+    }
+
+    #[test]
+    fn router_rejects_payload_or_envelope_tenant_outside_its_binding() {
+        let outbox = OutboxStore::new();
+        let (consumer, inbox) = router_over(&outbox);
+        let signal = signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/42",
+            "run-42",
+        );
+
+        let mut payload_mismatch = signal_envelope("evt-tenant-payload", &signal);
+        let mut wrong_signal = signal.clone();
+        wrong_signal.tenant = TenantId("other".into());
+        payload_mismatch.payload = serde_json::to_value(wrong_signal).unwrap();
+        assert!(matches!(
+            consumer.deliver(&Message {
+                subject: payload_mismatch.subject.0.clone(),
+                envelope: payload_mismatch,
+            }),
+            Delivered::DeadLettered(_)
+        ));
+
+        let mut envelope_mismatch = signal_envelope("evt-tenant-envelope", &signal);
+        envelope_mismatch.tenant = TenantId("other".into());
+        assert!(matches!(
+            consumer.deliver(&Message {
+                subject: envelope_mismatch.subject.0.clone(),
+                envelope: envelope_mismatch,
+            }),
+            Delivered::DeadLettered(_)
+        ));
+        assert!(inbox.is_empty());
+        assert_eq!(outbox.committed_count(), 0);
     }
 
     /// **The emitted event is `notif.item.created`, references-not-payloads, caused by the Signal.**
@@ -1660,6 +1868,7 @@ mod tests {
         // A SMALL cap so the test exercises the overflow without thousands of rows. Build the router
         // and replace its hot_cap with a cap-5 one (the SAME bound, smaller for the test).
         let mut router = SignalRouter::new(
+            tenant(),
             inbox.clone(),
             outbox.clone(),
             Arc::new(MonotonicMinter::new()),
@@ -1675,7 +1884,10 @@ mod tests {
             "spray",
         );
         let storm: Vec<Principal> = (0..50).map(|i| mentioned(&format!("p-{i}"))).collect();
-        let _ = router.route(&signal_envelope("evt-storm", &sig));
+        let _ = router.route(
+            &signal_envelope("evt-storm", &sig),
+            &mut myelin_events::HandlerTx::none(),
+        );
 
         let subject_root = "myelin://acme/chat/thread/hot";
         // Drive the storm through write_fanout directly (one Signal envelope carrying 50 mentions).
@@ -1690,7 +1902,9 @@ mod tests {
             }
             e
         };
-        router.write_fanout(&env, &sig).unwrap();
+        router
+            .write_fanout(&env, &sig, &mut myelin_events::HandlerTx::none())
+            .unwrap();
 
         // BOUNDED: at most `cap` (5) distinct mention rows materialised on the hot subject_root; the
         // other 45 overflowed into the coalesced marker (counted, never lost — bounded, not 50 rows).
