@@ -485,6 +485,8 @@ export function rawBytes(repo, _ref, path, attachment) {
 // A real two-commit history for acme/myelin (CommitRow::to_json).
 const C1 = "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334";
 const C2 = "b2c3d4e5f60718293a4b5c6d7e8f900112233445";
+const BLOB_LIST_FILTER = "c3d4e5f60718293a4b5c6d7e8f90011223344556";
+const BLOB_BINARY = "d4e5f60718293a4b5c6d7e8f9001122334455667";
 const SEED_COMMITS = {
   myelin: [
     {
@@ -588,6 +590,7 @@ const SEED_PR_DIFFS = {
       {
         path: "src/list_filter.rs",
         old_path: null,
+        new_blob_oid: BLOB_LIST_FILTER,
         status: "M",
         kind: "text",
         additions: 2,
@@ -608,6 +611,17 @@ const SEED_PR_DIFFS = {
               { origin: "+", content: "    debug_assert!(cap > 0);", old_no: null, new_no: 4 },
             ],
           },
+          {
+            header: "@@ -20,2 +20,2 @@ impl CursorWindow {",
+            old_start: 20,
+            old_lines: 2,
+            new_start: 20,
+            new_lines: 2,
+            lines: [
+              { origin: " ", content: "impl CursorWindow {", old_no: 20, new_no: 20 },
+              { origin: " ", content: "    // bounded continuation", old_no: 21, new_no: 21 },
+            ],
+          },
         ],
         deleted_body_available: false,
         truncated: false,
@@ -615,6 +629,7 @@ const SEED_PR_DIFFS = {
       {
         path: "assets/logo.png",
         old_path: null,
+        new_blob_oid: BLOB_BINARY,
         status: "A",
         kind: "binary",
         additions: 0,
@@ -674,7 +689,7 @@ export function prDiffJson(repo, n, cursor) {
 
 /** GET /v1/git/repos/{repo}/file-lines/{oid} → expand-context lines (context, origin " "). */
 export function fileLinesJson(repo, oid, start, end) {
-  if (repo !== "myelin") return null;
+  if (repo !== "myelin" || oid !== BLOB_LIST_FILTER) return null;
   const lines = [];
   for (let i = start; i <= (end || start + 10); i++) {
     lines.push({ origin: " ", content: `    // context line ${i}`, old_no: null, new_no: i });
@@ -799,6 +814,7 @@ function pagedFile(i) {
   return {
     path: `src/paged/file_${idx}.txt`,
     old_path: null,
+    new_blob_oid: BLOB_LIST_FILTER,
     status: "A",
     kind: "text",
     additions: 1,

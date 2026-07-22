@@ -89,6 +89,7 @@ describe("PR read response projection", () => {
       files: [{
         path: "src/read.ts",
         old_path: null,
+        new_blob_oid: HEAD,
         status: "M",
         kind: "text",
         additions: 1,
@@ -121,6 +122,7 @@ describe("PR read response projection", () => {
       { origin: " ", content: "before", old_no: 1, new_no: 1 },
       { origin: "+", content: "after", old_no: null, new_no: 2 },
     ]);
+    expect(projected?.files[0]?.new_blob_oid).toBe(HEAD);
     expect(projected?.page).toEqual({ next_cursor: null, limit: 50 });
   });
 
@@ -142,10 +144,21 @@ describe("PR read response projection", () => {
       number: 1, base_ref: "refs/heads/main", base_oid: BASE, short_base_oid: BASE.slice(0, 7),
       head_oid: HEAD, short_head_oid: HEAD.slice(0, 7), three_dot: true,
       files: [{
-        path: "../secret", old_path: null, status: "M", kind: "text", additions: 0,
+        path: "../secret", old_path: null, new_blob_oid: HEAD, status: "M", kind: "text", additions: 0,
         deletions: 0, size_bytes: null, hunks: [], deleted_body_available: false, truncated: false,
       }],
       restricted_files: 0, total_files: 1, total_additions: 0, total_deletions: 0,
+      page: { next_cursor: null, limit: 50 },
+    }),
+    () => parsePrDiff({
+      number: 1, base_ref: "refs/heads/main", base_oid: BASE, short_base_oid: BASE.slice(0, 7),
+      head_oid: HEAD, short_head_oid: HEAD.slice(0, 7), three_dot: true,
+      files: [{
+        path: "deleted.rs", old_path: null, new_blob_oid: HEAD, status: "D", kind: "text",
+        additions: 0, deletions: 1, size_bytes: null, hunks: [],
+        deleted_body_available: true, truncated: false,
+      }],
+      restricted_files: 0, total_files: 1, total_additions: 0, total_deletions: 1,
       page: { next_cursor: null, limit: 50 },
     }),
   ])("rejects malformed or inconsistent PR payloads", (parse) => {

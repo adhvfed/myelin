@@ -8,16 +8,25 @@
 import { ErrorBoundary, For, Show, Suspense, createMemo, createSignal } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, revalidate, useAction, useParams, useSearchParams } from "@solidjs/router";
-import { Skeleton, SkeletonBlock, DiffViewer, type DiffViewerFile } from "@myelin/design-system";
 import {
+  Skeleton,
+  SkeletonBlock,
+  DiffViewer,
+  type DiffViewerFile,
+  type ExpandedContext,
+} from "@myelin/design-system";
+import {
+  getFileLines,
   getPr,
   getPrDiff,
   getPrThreads,
   prMutate,
+  type DiffLineVM,
   type PrDiffVM,
   type PrThreadVM,
   type PrThreadsVM,
 } from "~/lib/api";
+import { mapPrDiffContextLines, prDiffContextRange } from "~/lib/pr-diff-context";
 import { PrHeader } from "~/components/PrHeader";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 import { Markdown } from "~/components/Markdown";
@@ -130,6 +139,63 @@ export default function PrDiffScreen() {
   const [commentAt, setCommentAt] = createSignal<CommentAt | null>(null);
   const [draft, setDraft] = createSignal("");
   const [live, setLive] = createSignal("");
+  // Expanded context is namespaced by immutable diff identity rather than page-local file indexes.
+  // That keeps a late response from one cursor page or pre-rebase head out of another file's rows.
+  const [expandedByIdentity, setExpandedByIdentity] = createSignal<Record<string, DiffLineVM[]>>({});
+  const pendingContext = new Set<string>();
+  const contextIdentity = (headOid: string, path: string, blobOid: string, gapKey: string) =>
+    JSON.stringify([headOid, path, blobOid, gapKey]);
+  const expandedContext = createMemo<ExpandedContext>(() => {
+    const d = diff();
+    if (!d) return {};
+    const stored = expandedByIdentity();
+    const visible: ExpandedContext = {};
+    d.files.forEach((file, fileIdx) => {
+      const blobOid = file.new_blob_oid;
+      if (!blobOid) return;
+      file.hunks.forEach((_hunk, hunkIdx) => {
+        const lines = stored[contextIdentity(d.head_oid, file.path, blobOid, `${hunkIdx}`)];
+        if (lines) visible[`${fileIdx}:${hunkIdx}`] = lines;
+      });
+    });
+    return visible;
+  });
+  const expandContext = async (fileIdx: number, gapKey: string) => {
+    const d = diff();
+    const file = d?.files[fileIdx];
+    if (!d || !file?.new_blob_oid) return;
+    const range = prDiffContextRange(file, gapKey);
+    if (!range) {
+      setLive(`Unchanged context for ${file.path} is outside the bounded expansion range.`);
+      return;
+    }
+    const identity = contextIdentity(d.head_oid, file.path, file.new_blob_oid, gapKey);
+    if (pendingContext.has(identity) || expandedByIdentity()[identity]) return;
+    pendingContext.add(identity);
+    const { head_oid: headOid } = d;
+    const { path, new_blob_oid: blobOid } = file;
+    try {
+      const response = await getFileLines({
+        repo: repo(),
+        oid: blobOid,
+        path,
+        start: range.start,
+        end: range.end,
+      });
+      const lines = mapPrDiffContextLines(response.lines, range);
+      if (!lines) throw new Error("invalid context response");
+      const current = diff();
+      const currentFile = current?.files[fileIdx];
+      if (current?.head_oid !== headOid || currentFile?.path !== path ||
+          currentFile.new_blob_oid !== blobOid) return;
+      setExpandedByIdentity((value) => ({ ...value, [identity]: lines }));
+      setLive(`Expanded ${lines.length} unchanged ${lines.length === 1 ? "line" : "lines"} in ${path}.`);
+    } catch {
+      setLive(`Couldn't expand unchanged lines in ${path}.`);
+    } finally {
+      pendingContext.delete(identity);
+    }
+  };
   const mutate = useAction(prMutate);
   const reload = () => revalidate("git-pr-threads");
 
@@ -234,6 +300,8 @@ export default function PrDiffScreen() {
                       liveMessage={live()}
                       isViewed={isViewed}
                       onToggleViewed={toggleViewed}
+                      onExpandContext={(fileIdx, gapKey) => void expandContext(fileIdx, gapKey)}
+                      expandedContext={expandedContext()}
                       hasThread={hasThread}
                       onRequestComment={(path, side, line) => { setCommentAt({ path, side, line }); setDraft(""); }}
                       deepLink={deepLinkExists() ? deepLink() : null}

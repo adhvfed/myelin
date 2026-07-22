@@ -39,6 +39,8 @@ export interface DiffViewerFile {
   old_path?: string | null;
   status: string; // A/M/D/R/C
   kind?: "text" | "binary" | "lfs" | "submodule";
+  /** Immutable new-side blob. Its presence makes bounded context expansion mechanically possible. */
+  new_blob_oid?: string | null;
   additions?: number;
   deletions?: number;
   size_bytes?: number | null;
@@ -174,12 +176,35 @@ type DiffRow =
   | { t: "uline"; key: string; line: DiffViewerLine }
   | { t: "sline"; key: string; left?: DiffViewerLine; right?: DiffViewerLine };
 
-function buildRows(file: DiffViewerFile, view: "split" | "unified", expandable: boolean): DiffRow[] {
+function buildRows(
+  file: DiffViewerFile,
+  view: "split" | "unified",
+  expandable: boolean,
+  expandedContext: ExpandedContext | undefined,
+  fileIdx: number,
+): DiffRow[] {
   const rows: DiffRow[] = [];
   file.hunks.forEach((hunk, hi) => {
+    const gapKey = `${hi}`;
+    const expanded = expandedContext?.[`${fileIdx}:${gapKey}`];
     // Only surface the collapsed-context affordance when the consumer wired an expand handler (else it
     // would be a dead button — expand-context needs the N2 endpoint + per-file blob oids to inject).
-    if (expandable && (hi > 0 || hunk.new_start > 1)) rows.push({ t: "expand", key: `x${hi}`, gapKey: `${hi}` });
+    if (expanded) {
+      if (view === "unified") {
+        expanded.forEach((line, li) => rows.push({ t: "uline", key: `cu${hi}.${li}`, line }));
+      } else {
+        splitRows(expanded).forEach((r, li) => rows.push({ t: "sline", key: `cs${hi}.${li}`, left: r.left, right: r.right }));
+      }
+    } else if (expandable && (hi > 0 || hunk.new_start > 1)) {
+      const previous = hi > 0 ? file.hunks[hi - 1] : undefined;
+      const start = previous ? previous.new_start + previous.new_lines : 1;
+      const count = hunk.new_start - start;
+      // The backing contract deliberately caps one expansion at 1,000 lines. Do not render a control
+      // whose advertised "all" action the consumer cannot fulfil in one bounded request.
+      if (Number.isSafeInteger(count) && count > 0 && count <= 1_000) {
+        rows.push({ t: "expand", key: `x${hi}`, gapKey });
+      }
+    }
     rows.push({ t: "hunk", key: `h${hi}`, header: hunk.header });
     if (view === "unified") {
       hunk.lines.forEach((line, li) => rows.push({ t: "uline", key: `u${hi}.${li}`, line }));
@@ -303,6 +328,7 @@ export function DiffViewer(rawProps: DiffViewerProps) {
             renderComposer={props.renderComposer}
             renderFileThreads={props.renderFileThreads}
             onExpandContext={props.onExpandContext}
+            expandedContext={props.expandedContext}
             deepLink={props.deepLink}
           />
         )}
@@ -327,6 +353,7 @@ interface SectionProps {
   renderComposer?: (path: string, side: "old" | "new", line: number) => JSX.Element | undefined;
   renderFileThreads?: (path: string) => JSX.Element | undefined;
   onExpandContext?: (fileIdx: number, gapKey: string, dir: "up" | "down" | "all") => void;
+  expandedContext?: ExpandedContext;
   deepLink?: { path: string; side: "old" | "new"; line: number } | null;
 }
 
@@ -336,7 +363,13 @@ function DiffFileSection(props: SectionProps) {
   const isText = () => (props.file.kind ?? "text") === "text";
   const isDeleted = () => props.file.status === "D";
   const collapsed = () => folded() || props.viewed;
-  const rows = createMemo(() => buildRows(props.file, props.view, Boolean(props.onExpandContext)));
+  const rows = createMemo(() => buildRows(
+    props.file,
+    props.view,
+    Boolean(props.onExpandContext && props.file.new_blob_oid),
+    props.expandedContext,
+    props.fileIdx,
+  ));
 
   return (
     <section aria-label={`Diff for ${props.file.path}`} data-fileidx={props.fileIdx} style={{ border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)", overflow: "hidden" }}>

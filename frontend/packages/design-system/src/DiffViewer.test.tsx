@@ -118,3 +118,53 @@ describe("DiffViewer — R-21 rows", () => {
     expect(screen.getByTestId("show-deleted")).toBeTruthy();
   });
 });
+
+describe("DiffViewer — bounded context expansion", () => {
+  const withGap: DiffViewerFile = {
+    ...modified,
+    new_blob_oid: "c3d4e5f60718293a4b5c6d7e8f90011223344556",
+    hunks: [
+      modified.hunks[0]!,
+      {
+        header: "@@ -20,1 +20,1 @@",
+        old_start: 20,
+        old_lines: 1,
+        new_start: 20,
+        new_lines: 1,
+        lines: [{ origin: " ", content: "later", old_no: 20, new_no: 20 }],
+      },
+    ],
+  };
+
+  it("only exposes a live control backed by a new-side blob", () => {
+    const onExpand = vi.fn();
+    const { unmount } = render(() => (
+      <DiffViewer files={[withGap]} view="unified" onExpandContext={onExpand} />
+    ));
+    fireEvent.click(screen.getByTestId("expand-all"));
+    expect(onExpand).toHaveBeenCalledWith(0, "1", "all");
+    unmount();
+
+    render(() => (
+      <DiffViewer files={[{ ...withGap, new_blob_oid: null }]} view="unified" onExpandContext={onExpand} />
+    ));
+    expect(screen.queryByTestId("expand-all")).toBeNull();
+  });
+
+  it("injects expanded lines through the unified and split flat-row paths", () => {
+    const expanded = {
+      "0:1": [{ origin: " ", content: "expanded context", old_no: 5, new_no: 5 }],
+    };
+    const { unmount } = render(() => (
+      <DiffViewer files={[withGap]} view="unified" onExpandContext={() => undefined} expandedContext={expanded} />
+    ));
+    expect(screen.getByText("expanded context")).toBeTruthy();
+    expect(screen.queryByTestId("expand-all")).toBeNull();
+    unmount();
+
+    render(() => (
+      <DiffViewer files={[withGap]} view="split" onExpandContext={() => undefined} expandedContext={expanded} />
+    ));
+    expect(screen.getAllByText("expanded context")).toHaveLength(2);
+  });
+});

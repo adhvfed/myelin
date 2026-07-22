@@ -70,6 +70,18 @@ test.describe("R3.2 PR diff / files-changed — real browser", () => {
     await expect(page.getByText(/let cap = self.limit.min\(100\)/)).toBeVisible();
   });
 
+  test("expands a collapsed gap from the immutable new-side blob", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/1/diff");
+    const expand = page.getByTestId("expand-all");
+    await expect(expand).toBeVisible();
+    await expand.click();
+    await expect(page.getByText("// context line 5").first()).toBeVisible();
+    await expect(expand).toHaveCount(0);
+    await expect(page.getByTestId("diff-live")).toContainText("Expanded 15 unchanged lines");
+    await expectNoAxeViolations(page, "PR diff with expanded context");
+  });
+
   test("a rebase-orphan thread shows the honest 'outdated' pill (never a wrong line)", async ({ page }) => {
     await devLogin(page);
     await page.goto("/git/repos/myelin/prs/1/diff");
