@@ -57,7 +57,7 @@ use myelin_storage::s3blob::S3BlobStore;
 use myelin_tenancy::{Region, TenantId};
 
 use crate::ci_manifest_job_runner::{validate_run_token, CiJobTokenIssuer, CiJobTokenRequest};
-use crate::ci_pipeline_driver::CiPipelineReporter;
+use crate::ci_pipeline_reporter_router::CiPipelineReporterRouter;
 use crate::job_spec_store::MAX_JOB_TIMEOUT_SECS;
 use crate::{
     CiJobQueueStore, CiJobSpecStore, CiRegionQueueStore, DurableLogPersist, LeasedJob,
@@ -269,7 +269,7 @@ pub struct CiRunnerLoop {
     tenant_store: CiJobQueueStore,
     rt: tokio::runtime::Handle,
     resolve: JobSpecResolver,
-    reporter: CiPipelineReporter,
+    reporter: CiPipelineReporterRouter,
     hooks: RunnerHooks,
     idle_backoff: Duration,
     error_backoff: Duration,
@@ -285,7 +285,8 @@ impl CiRunnerLoop {
     /// Construct the runner loop. `worker_id`/`labels`/`allowed_tiers`/`region`/`lease_ttl_secs` are
     /// the claim predicates + lease TTL; `store` is the durable `job_queue` store; `rt` bridges the
     /// sync runner onto the async pool; `resolve` provides the `JobSpec` for a leased row (CT-004d
-    /// seam); `reporter` is the PostgreSQL-only [`CiPipelineReporter`] that atomically consumes the
+    /// seam); `reporter` is the region router that constructs an exact-tenant, PostgreSQL-only
+    /// [`crate::CiPipelineReporter`] which atomically consumes the
     /// claim and buffers the typed verdict; `hooks` are the four-guarantee wiring. `pool` +
     /// `s3` back the live log sink (CT-004f sub-step 5): the OLTP pool writes the `log_segment`/
     /// `log_anchor` index + the `ci.log.available` outbox pointer; `s3` is the CAS the sealed log
@@ -301,7 +302,7 @@ impl CiRunnerLoop {
         tenant_store: CiJobQueueStore,
         rt: tokio::runtime::Handle,
         resolve: JobSpecResolver,
-        reporter: CiPipelineReporter,
+        reporter: CiPipelineReporterRouter,
         hooks: RunnerHooks,
         pool: sqlx::postgres::PgPool,
         s3: myelin_config::S3Config,

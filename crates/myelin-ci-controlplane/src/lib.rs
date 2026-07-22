@@ -197,6 +197,7 @@ pub use pg_pipeline_starter::{
 /// typed verdict for [`myelin_flow::PgFlowWorker`]. The former in-memory driver exists only under the
 /// `test-support` feature and is not part of the default production build.
 pub mod ci_pipeline_driver;
+pub mod ci_pipeline_reporter_router;
 pub mod floor_followons;
 pub mod holder;
 /// CT-004c.1: the REGION-scoped, CROSS-TENANT half of the durable scheduler — the raw `CLAIM_QUERY` /
@@ -553,6 +554,10 @@ pub use ci_pipeline_driver::{fixed_command_spec_builder, CiPipelineDriver, Start
 pub use ci_pipeline_driver::{
     unresolved_stage_spec_builder, CiJobAccountingPricer, CiJobPricingError, CiPipelineReporter,
     ClaimRefusal, DurableCiJobAccounting, DurableJobRunner, PricedCiJobUsage, StageSpecBuilder,
+};
+pub use ci_pipeline_reporter_router::{
+    CiPipelineReporterFactory, CiPipelineReporterFactoryError, CiPipelineReporterRouter,
+    CiPipelineReporterRouterError,
 };
 
 // CI-P14 (P-357): the EU fleet autoscaler — the FleetProvider impl + autoscale-on-queue-depth +
