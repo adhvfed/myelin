@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { parseRepoHome, parseReposPage } from "./repo-read-response";
+import { parseBlob, parseRefs, parseRepoHome, parseReposPage, parseTree } from "./repo-read-response";
 
 const OID = "0123456789abcdef0123456789abcdef01234567";
 
@@ -39,6 +39,24 @@ describe("repository read response projection", () => {
     });
   });
 
+  it("projects refs, trees, blobs, and kind-mismatch redirects", () => {
+    expect(parseRefs({
+      branches: [{ name: "main", oid: OID, is_default: true, secret: "drop" }],
+      tags: [], default_branch: "main", secret: "drop",
+    })).toEqual({ branches: [{ name: "main", oid: OID, is_default: true }], tags: [], default_branch: "main" });
+    expect(parseTree({ ref: "main", path: "", entries: [{ path: "x", is_dir: false }], readme: null, secret: "drop" }))
+      .toEqual({ ref: "main", path: "", entries: [{ path: "x", is_dir: false }] });
+    expect(parseBlob({
+      path: "x", contents: "hello", base_oid: "blake3:value", viewer_may_edit: false,
+      raw_url: "/raw/x", secret: "drop",
+    })).toEqual({
+      path: "x", contents: "hello", base_oid: "blake3:value", viewer_may_edit: false,
+      raw_url: "/raw/x",
+    });
+    expect(parseBlob({ path: "dir", ref: "main", redirect_to_tree: true, secret: "drop" }))
+      .toEqual({ path: "dir", contents: "", base_oid: "", viewer_may_edit: false, redirect_to_tree: true });
+  });
+
   it.each([
     { state: "populated", slug: "../core", default_branch: "main" },
     { state: "populated", slug: "core", default_branch: "main", entries: [{ path: "../x", is_dir: false }] },
@@ -46,5 +64,11 @@ describe("repository read response projection", () => {
     { state: "populated", slug: "core", default_branch: "main", latest_commit: { short_oid: "short", summary: "x", committed_at: 1 } },
   ])("rejects malformed or unbounded home payload %#", (value) => {
     expect(parseRepoHome(value)).toBeNull();
+  });
+
+  it("rejects unsafe browse projections", () => {
+    expect(parseRefs({ branches: [{ name: "main", oid: "short" }], tags: [], default_branch: "main" })).toBeNull();
+    expect(parseTree({ path: "../secret", entries: [] })).toBeNull();
+    expect(parseBlob({ path: "x", contents: "x", base_oid: "x", viewer_may_edit: false, raw_url: "https://evil.test/x" })).toBeNull();
   });
 });
