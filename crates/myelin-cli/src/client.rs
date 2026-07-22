@@ -15,12 +15,16 @@ use crate::config::EdgeConfig;
 use crate::dispatch::EdgeCall;
 use crate::error::CliError;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Request, Uri};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde_json::Value;
+use std::time::Duration;
+
+const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 struct Target {
@@ -35,6 +39,27 @@ fn target(config: &EdgeConfig, call: &EdgeCall) -> Result<Target, CliError> {
     if !(base.starts_with("https://") || base.starts_with("http://")) {
         return Err(CliError::Transport(
             "edge URL must start with https:// (or loopback http:// for development)".into(),
+        ));
+    }
+    if base.contains('#') {
+        return Err(CliError::Transport(
+            "edge URL must not contain a fragment".into(),
+        ));
+    }
+    let base_uri: Uri = base
+        .parse()
+        .map_err(|e| CliError::Transport(format!("invalid edge URL: {e}")))?;
+    let base_authority = base_uri
+        .authority()
+        .ok_or_else(|| CliError::Transport("edge URL has no host".into()))?;
+    if base_authority.as_str().contains('@') {
+        return Err(CliError::Transport(
+            "edge URL must not contain user information".into(),
+        ));
+    }
+    if base_uri.path_and_query().is_some_and(|value| value.query().is_some()) {
+        return Err(CliError::Transport(
+            "edge URL must not contain a query string".into(),
         ));
     }
 
@@ -79,6 +104,23 @@ fn is_loopback_host(host: &str) -> bool {
 /// [`CliError::Unauthorized`]; any other non-2xx with the `{error:{message}}` envelope is
 /// [`CliError::Edge`]. No panic, ever.
 pub async fn execute(config: &EdgeConfig, token: &str, call: &EdgeCall) -> Result<Value, CliError> {
+    execute_with_limits(
+        config,
+        token,
+        call,
+        REQUEST_DEADLINE,
+        MAX_RESPONSE_BYTES,
+    )
+    .await
+}
+
+async fn execute_with_limits(
+    config: &EdgeConfig,
+    token: &str,
+    call: &EdgeCall,
+    deadline: Duration,
+    max_response_bytes: usize,
+) -> Result<Value, CliError> {
     let target = target(config, call)?;
     let connector = HttpsConnectorBuilder::new()
         // The workspace also carries ring through unrelated consumers. Select this client's
@@ -108,17 +150,30 @@ pub async fn execute(config: &EdgeConfig, token: &str, call: &EdgeCall) -> Resul
         .body(Full::new(Bytes::from(payload)))
         .map_err(|e| CliError::Transport(format!("build request: {e}")))?;
 
-    let response = client
-        .request(request)
-        .await
-        .map_err(|e| CliError::Transport(format!("edge request failed: {e}")))?;
-    let status = response.status().as_u16();
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| CliError::Transport(format!("read response body: {e}")))?
-        .to_bytes();
+    let (status, bytes) = tokio::time::timeout(deadline, async {
+        let response = client
+            .request(request)
+            .await
+            .map_err(|e| CliError::Transport(format!("edge request failed: {e}")))?;
+        let status = response.status().as_u16();
+        let bytes = Limited::new(response.into_body(), max_response_bytes)
+            .collect()
+            .await
+            .map_err(|_| {
+                CliError::Transport(format!(
+                    "edge response exceeded the {max_response_bytes}-byte limit or could not be read"
+                ))
+            })?
+            .to_bytes();
+        Ok::<_, CliError>((status, bytes))
+    })
+    .await
+    .map_err(|_| {
+        CliError::Transport(format!(
+            "edge request exceeded the {}-second deadline",
+            deadline.as_secs()
+        ))
+    })??;
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
 
     interpret(status, body)
@@ -199,6 +254,66 @@ mod tests {
         }
         assert!(target(&cfg("http://edge.example.com"), &get("/v1/whoami", None)).is_err());
         assert!(target(&cfg("ftp://edge.example.com"), &get("/v1/whoami", None)).is_err());
+        assert!(target(&cfg("https://user@edge.example.com"), &get("/v1/whoami", None)).is_err());
+        assert!(target(&cfg("https://edge.example.com?route=other"), &get("/v1/whoami", None)).is_err());
+        assert!(target(&cfg("https://edge.example.com/#fragment"), &get("/v1/whoami", None)).is_err());
+    }
+
+    #[tokio::test]
+    async fn response_body_is_bounded_before_json_parsing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\n{\"items\":[1,2]}")
+                .await
+                .unwrap();
+        });
+
+        let error = execute_with_limits(
+            &cfg(&format!("http://{address}")),
+            "sensitive-token",
+            &get("/v1/whoami", None),
+            Duration::from_secs(1),
+            8,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("8-byte limit"));
+        assert!(!error.to_string().contains("sensitive-token"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_deadline_bounds_connect_headers_and_body() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).await;
+            std::future::pending::<()>().await;
+        });
+
+        let error = execute_with_limits(
+            &cfg(&format!("http://{address}")),
+            "sensitive-token",
+            &get("/v1/whoami", None),
+            Duration::from_millis(20),
+            1024,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        assert!(!error.to_string().contains("sensitive-token"));
+        server.abort();
     }
 
     #[test]
