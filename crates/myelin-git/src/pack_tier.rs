@@ -65,9 +65,13 @@ use std::sync::Mutex;
 
 use myelin_storage::{
     BlobStore, ContentHash, GitObjectKind, GitPackError, GitPackTier, RepoGitPlacement, RepoId,
+    GIT_PACK_OBJECT_MAX_STORED_BYTES,
 };
 
 use crate::receive_pack::{Oid, QuarantineMigration, QuarantineObject};
+
+const CLONE_MAX_TIPS: usize = 100_000;
+const CLONE_MAX_TOTAL_STORED_BYTES: usize = 1024 * 1024 * 1024;
 
 // ───────────────────────────── the acceleration structures (arch 01 §4.1 / 02 §8) ───────────────
 
@@ -202,12 +206,22 @@ impl<B: BlobStore> PackObjectDb<B> {
     /// object is REFUSED, 0 silent serve — STOR-D7 inherited). The handle is the git oid the ref
     /// graph carries; this resolves it to the stored content address.
     pub fn read_object(&self, oid: &Oid) -> Result<Vec<u8>, GitPackError> {
+        self.read_object_bounded(oid, GIT_PACK_OBJECT_MAX_STORED_BYTES)
+    }
+
+    /// Read an object under a caller-selected stored-byte ceiling.
+    pub fn read_object_bounded(
+        &self,
+        oid: &Oid,
+        maximum_stored_bytes: usize,
+    ) -> Result<Vec<u8>, GitPackError> {
         let address = self
             .address_of(oid)
             .ok_or_else(|| GitPackError::RepoNotPlaced {
                 repo: self.repo.clone(),
             })?;
-        self.tier.get_object(&self.repo, &address)
+        self.tier
+            .get_object_bounded(&self.repo, &address, maximum_stored_bytes)
     }
 
     /// The storage content address a git oid resolves to (relocation-stable; `None` if not stored).
@@ -282,9 +296,60 @@ impl<B: BlobStore> PackObjectDb<B> {
     /// round-trips **byte-identical** to the receive-pack input (0 corruption). A corrupt object is
     /// REFUSED here (never a silent wrong-bytes clone). `tips` are the ref oids to serve.
     pub fn serve_clone(&self, tips: &[Oid]) -> Result<Vec<(Oid, Vec<u8>)>, GitPackError> {
+        self.serve_clone_bounded(
+            tips,
+            CLONE_MAX_TIPS,
+            GIT_PACK_OBJECT_MAX_STORED_BYTES,
+            CLONE_MAX_TOTAL_STORED_BYTES,
+        )
+    }
+
+    /// Serve clone objects under explicit tip-count, per-object stored-byte, and aggregate
+    /// stored-byte ceilings. Metadata for the whole request is checked before the first backing
+    /// read; aggregate accounting uses checked arithmetic.
+    pub fn serve_clone_bounded(
+        &self,
+        tips: &[Oid],
+        maximum_tips: usize,
+        maximum_stored_bytes_per_object: usize,
+        maximum_total_stored_bytes: usize,
+    ) -> Result<Vec<(Oid, Vec<u8>)>, GitPackError> {
+        if tips.len() > maximum_tips {
+            return Err(GitPackError::ReadLimitExceeded {
+                actual: tips.len(),
+                maximum: maximum_tips,
+            });
+        }
+        let mut total_stored_bytes = 0usize;
+        for oid in tips {
+            let address = self
+                .address_of(oid)
+                .ok_or_else(|| GitPackError::RepoNotPlaced {
+                    repo: self.repo.clone(),
+                })?;
+            let stored_bytes = self.tier.object_stored_len(&self.repo, &address)?;
+            if stored_bytes > maximum_stored_bytes_per_object {
+                return Err(GitPackError::ReadLimitExceeded {
+                    actual: stored_bytes,
+                    maximum: maximum_stored_bytes_per_object,
+                });
+            }
+            total_stored_bytes = total_stored_bytes
+                .checked_add(stored_bytes)
+                .ok_or(GitPackError::ReadLimitExceeded {
+                    actual: usize::MAX,
+                    maximum: maximum_total_stored_bytes,
+                })?;
+            if total_stored_bytes > maximum_total_stored_bytes {
+                return Err(GitPackError::ReadLimitExceeded {
+                    actual: total_stored_bytes,
+                    maximum: maximum_total_stored_bytes,
+                });
+            }
+        }
         let mut out = Vec::with_capacity(tips.len());
         for oid in tips {
-            let bytes = self.read_object(oid)?;
+            let bytes = self.read_object_bounded(oid, maximum_stored_bytes_per_object)?;
             out.push((oid.clone(), bytes));
         }
         Ok(out)
@@ -460,6 +525,44 @@ mod tests {
                 "byte-identical clone round-trip (0 corruption)"
             );
         }
+    }
+
+    #[test]
+    fn bounded_clone_enforces_count_per_object_and_aggregate_limits() {
+        let db = placed_db();
+        let first = Oid::new("first");
+        let second = Oid::new("second");
+        let first_address = db
+            .put_object(GitObjectKind::Blob, &first, b"1234")
+            .expect("put first");
+        let second_address = db
+            .put_object(GitObjectKind::Blob, &second, b"5678")
+            .expect("put second");
+        let tips = [first, second];
+        let stored_total = db
+            .tier()
+            .object_stored_len(db.repo(), &first_address)
+            .expect("first metadata")
+            + db
+                .tier()
+                .object_stored_len(db.repo(), &second_address)
+                .expect("second metadata");
+
+        assert_eq!(
+            db.serve_clone_bounded(&tips, 2, 64, stored_total)
+                .expect("exact limits accepted")
+                .len(),
+            2
+        );
+        assert!(db
+            .serve_clone_bounded(&tips, 1, 64, stored_total)
+            .is_err());
+        assert!(db
+            .serve_clone_bounded(&tips, 2, 1, stored_total)
+            .is_err());
+        assert!(db
+            .serve_clone_bounded(&tips, 2, 64, stored_total - 1)
+            .is_err());
     }
 
     /// **A backing failure during migration aborts the push** (the ref never moves over un-durable

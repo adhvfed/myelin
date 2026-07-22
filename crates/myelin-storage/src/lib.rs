@@ -819,6 +819,7 @@ pub use git_shred::{GitCryptoShredReach, GitResidual, GitShredReceipt, GitShredd
 pub use gitpack::{
     git_object_address, GitObjectKind, GitPackError, GitPackTier, PackManifest, PlacementError,
     RepoGitPlacement, RepoId, RepoPlacementStatus, StorageGroup,
+    GIT_PACKFILE_MAX_STORED_BYTES, GIT_PACK_OBJECT_MAX_STORED_BYTES,
 };
 pub use holder::{register_holder, BlobStoreHolder, OltpHolderRegistration, OltpStoreHolder};
 pub use holder_fanout::{
