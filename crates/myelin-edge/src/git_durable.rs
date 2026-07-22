@@ -3018,7 +3018,8 @@ fn map_durable_err(e: DurableError) -> EdgeError {
             if m.contains("traversal")
                 || m.contains("segment")
                 || m.contains("slug")
-                || m.contains("missing") =>
+                || m.contains("missing")
+                || m.contains("exceeds") =>
         {
             EdgeError::BadRequest(m)
         }
@@ -5213,6 +5214,31 @@ mod pr_thread_tests {
             json!({ "body_md": "requested-reviewer comment" }),
         )
         .expect("a directly requested reviewer may review without repo Push");
+    }
+
+    #[test]
+    fn oversized_comment_is_rejected_before_conversation_storage() {
+        let (be, writer, _reader) = setup("body-limit", &"0".repeat(40));
+        let create = pr_review_guarded(&be, Arc::new(DPrThreadCreate { be: be.clone() }));
+
+        let error = serve(
+            &*create,
+            "POST",
+            &writer,
+            &[("repo", SLUG), ("n", "1")],
+            json!({
+                "body_md": "x".repeat(myelin_git::pr_threads::MAX_COMMENT_BODY_BYTES + 1),
+            }),
+        )
+        .expect_err("oversized comment must fail before persistence");
+
+        assert!(matches!(error, EdgeError::BadRequest(_)), "got {error:?}");
+        assert!(be
+            .threads
+            .load(&DurableGitBackend::loc(TENANT, REGION, SLUG), "pr:core:1")
+            .unwrap()
+            .threads
+            .is_empty());
     }
 
     /// A pending review comment is invisible to a second viewer until submit; submit emits ONE event.

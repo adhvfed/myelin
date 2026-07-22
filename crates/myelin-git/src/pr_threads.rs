@@ -29,11 +29,12 @@
 //!
 //! ## Authz (enforced at the edge, named here)
 //! Thread READ = the PR's own view permission (the `Pull` object guard — a viewer who may view the PR
-//! may read its threads). Comment / review WRITE = a real write permission (the `Push` object guard,
-//! backed in production by the deny-by-default `CheckBackedRepoAuthorizer`, never a permissive
-//! authorizer). This store holds no authorizer — it is the durable medium; the edge is the chokepoint.
+//! may read its threads). Comment / review WRITE = `pull_request.review` (requested reviewer or
+//! parent-repo Push), never a permissive authorizer. This store holds no authorizer — it is the
+//! durable medium; the edge is the chokepoint.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -42,6 +43,15 @@ use serde::{Deserialize, Serialize};
 use crate::core::RepoLoc;
 use crate::durable::DurableError;
 use crate::gix_backend::{RepoPathResolver, RootedResolver};
+
+/// Hard ceilings for the temporary monolithic JSON store. These bound authorized-user resource
+/// consumption until conversation rows move to their PostgreSQL home.
+pub const MAX_COMMENT_BODY_BYTES: usize = 64 * 1024;
+pub const MAX_REVIEW_SUMMARY_BYTES: usize = 64 * 1024;
+pub const MAX_THREAD_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_THREADS_PER_SUBJECT: usize = 4_096;
+pub const MAX_COMMENTS_PER_SUBJECT: usize = 8_192;
+pub const MAX_REVIEWS_PER_SUBJECT: usize = 1_024;
 
 /// A validated request to append one private draft comment to a review batch.
 #[derive(Clone, PartialEq, Eq)]
@@ -67,6 +77,7 @@ impl PendingCommentRequest {
     ) -> Result<Self, DurableError> {
         let object_key = object_key.into();
         let review_id = review_id.into();
+        let body_md = validate_markdown(body_md.into(), MAX_COMMENT_BODY_BYTES, "comment body")?;
         validate_review_target(&repo, &object_key, &review_id)?;
         Ok(Self {
             repo,
@@ -74,7 +85,7 @@ impl PendingCommentRequest {
             review_id,
             anchor,
             author,
-            body_md: body_md.into(),
+            body_md,
             now,
         })
     }
@@ -118,6 +129,10 @@ impl SubmitReviewRequest {
     ) -> Result<Self, DurableError> {
         let object_key = object_key.into();
         let review_id = review_id.into();
+        let summary_md = summary_md
+            .filter(|summary| !summary.trim().is_empty())
+            .map(|summary| validate_markdown(summary, MAX_REVIEW_SUMMARY_BYTES, "review summary"))
+            .transpose()?;
         validate_review_target(&repo, &object_key, &review_id)?;
         Ok(Self {
             repo,
@@ -129,6 +144,18 @@ impl SubmitReviewRequest {
             now,
         })
     }
+}
+
+fn validate_markdown(value: String, max_bytes: usize, field: &str) -> Result<String, DurableError> {
+    if value.trim().is_empty() {
+        return Err(DurableError::Git(format!("{field} is missing or blank")));
+    }
+    if value.len() > max_bytes {
+        return Err(DurableError::Git(format!(
+            "{field} exceeds the {max_bytes}-byte limit"
+        )));
+    }
+    Ok(value)
 }
 
 impl core::fmt::Debug for SubmitReviewRequest {
@@ -357,6 +384,25 @@ impl SubjectThreads {
         self.reviews.iter().find(|r| r.id == review_id)
     }
 
+    fn comment_count(&self) -> usize {
+        self.threads
+            .iter()
+            .map(|thread| thread.comments.len())
+            .sum()
+    }
+
+    fn validate_cardinality(&self) -> Result<(), DurableError> {
+        if self.threads.len() > MAX_THREADS_PER_SUBJECT
+            || self.comment_count() > MAX_COMMENTS_PER_SUBJECT
+            || self.reviews.len() > MAX_REVIEWS_PER_SUBJECT
+        {
+            return Err(DurableError::Git(
+                "PR conversation exceeds its cardinality limit".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// **The viewer-scoped projection (BINDING non-leak rule).** Returns the threads + reviews a
     /// `viewer` (by pseudonym `display`) may see: every PENDING comment authored by ANOTHER principal
     /// is dropped, a thread left with no visible comments is dropped, and a DRAFT (un-submitted) review
@@ -489,8 +535,17 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
     /// Load the subject document (an empty, `object_key`-stamped default if none persisted yet).
     pub fn load(&self, repo: &RepoLoc, object_key: &str) -> Result<SubjectThreads, DurableError> {
         let path = self.subject_path(repo, object_key)?;
-        match std::fs::read(&path) {
-            Ok(bytes) => {
+        match std::fs::File::open(&path) {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take((MAX_THREAD_DOCUMENT_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| DurableError::Io(format!("read {}: {e}", path.display())))?;
+                if bytes.len() > MAX_THREAD_DOCUMENT_BYTES {
+                    return Err(DurableError::Io(
+                        "stored PR conversation exceeds its document limit".into(),
+                    ));
+                }
                 let mut doc: SubjectThreads = serde_json::from_slice(&bytes)
                     .map_err(|e| DurableError::Io(format!("parse {}: {e}", path.display())))?;
                 if doc.object_key.is_empty() {
@@ -501,6 +556,9 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
                         doc.object_key
                     )));
                 }
+                doc.validate_cardinality().map_err(|_| {
+                    DurableError::Io("stored PR conversation exceeds its cardinality limit".into())
+                })?;
                 Ok(doc)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SubjectThreads {
@@ -512,10 +570,16 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
     }
 
     fn save(&self, repo: &RepoLoc, doc: &SubjectThreads) -> Result<(), DurableError> {
+        doc.validate_cardinality()?;
         let dir = self.threads_dir(repo)?;
         let file = self.subject_path(repo, &doc.object_key)?;
         let bytes = serde_json::to_vec_pretty(doc)
             .map_err(|e| DurableError::Io(format!("serialize threads {}: {e}", doc.object_key)))?;
+        if bytes.len() > MAX_THREAD_DOCUMENT_BYTES {
+            return Err(DurableError::Git(format!(
+                "PR conversation exceeds the {MAX_THREAD_DOCUMENT_BYTES}-byte document limit"
+            )));
+        }
         crate::durable::write_file_atomic(&dir, &file, &bytes)
     }
 
@@ -532,9 +596,17 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         body_md: impl Into<String>,
         now: i64,
     ) -> Result<ThreadRecord, DurableError> {
+        let body_md = validate_markdown(body_md.into(), MAX_COMMENT_BODY_BYTES, "comment body")?;
         let lock = self.subject_lock(repo, object_key)?;
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(repo, object_key)?;
+        if doc.threads.len() >= MAX_THREADS_PER_SUBJECT
+            || doc.comment_count() >= MAX_COMMENTS_PER_SUBJECT
+        {
+            return Err(DurableError::Git(
+                "PR conversation exceeds its thread or comment limit".into(),
+            ));
+        }
         let tid = doc.next_id("t")?;
         let cid = doc.next_id("c")?;
         let thread = ThreadRecord {
@@ -544,7 +616,7 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             comments: vec![CommentRecord {
                 id: cid,
                 author,
-                body_md: body_md.into(),
+                body_md,
                 created_at: now,
                 edited_at: None,
                 state: CommentState::Visible,
@@ -567,9 +639,15 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         body_md: impl Into<String>,
         now: i64,
     ) -> Result<CommentRecord, DurableError> {
+        let body_md = validate_markdown(body_md.into(), MAX_COMMENT_BODY_BYTES, "comment body")?;
         let lock = self.subject_lock(repo, object_key)?;
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(repo, object_key)?;
+        if doc.comment_count() >= MAX_COMMENTS_PER_SUBJECT {
+            return Err(DurableError::Git(
+                "PR conversation exceeds its comment limit".into(),
+            ));
+        }
         let cid = doc.next_id("c")?;
         let thread = doc
             .threads
@@ -579,7 +657,7 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         let comment = CommentRecord {
             id: cid,
             author,
-            body_md: body_md.into(),
+            body_md,
             created_at: now,
             edited_at: None,
             state: CommentState::Visible,
@@ -625,6 +703,18 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         let lock = self.subject_lock(repo, object_key)?;
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(repo, object_key)?;
+        if let Some(existing) = doc
+            .reviews
+            .iter()
+            .find(|review| review.is_draft() && review.reviewer.display == reviewer.display)
+        {
+            return Ok(existing.clone());
+        }
+        if doc.reviews.len() >= MAX_REVIEWS_PER_SUBJECT {
+            return Err(DurableError::Git(
+                "PR conversation exceeds its review limit".into(),
+            ));
+        }
         let rid = doc.next_id("r")?;
         let batch = ReviewBatch {
             id: rid,
@@ -658,6 +748,13 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         let lock = self.subject_lock(&repo, &object_key)?;
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(&repo, &object_key)?;
+        if doc.threads.len() >= MAX_THREADS_PER_SUBJECT
+            || doc.comment_count() >= MAX_COMMENTS_PER_SUBJECT
+        {
+            return Err(DurableError::Git(
+                "PR conversation exceeds its thread or comment limit".into(),
+            ));
+        }
         match doc.review(&review_id) {
             None => return Err(DurableError::NotFound(format!("review {review_id}"))),
             Some(r) if !r.is_draft() => {
@@ -897,6 +994,55 @@ mod tests {
             4,
         )
         .is_err());
+        assert!(PendingCommentRequest::new(
+            loc(),
+            KEY,
+            "r-1",
+            None,
+            human("psn:r@acme"),
+            "x".repeat(MAX_COMMENT_BODY_BYTES + 1),
+            5,
+        )
+        .is_err());
+        assert!(SubmitReviewRequest::new(
+            loc(),
+            KEY,
+            "r-1",
+            human("psn:r@acme"),
+            BatchVerdict::Commented,
+            Some("x".repeat(MAX_REVIEW_SUMMARY_BYTES + 1)),
+            6,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn repeated_review_start_reuses_the_reviewers_active_draft() {
+        let root = temp_root("one-active-draft");
+        let store = DurablePrThreadStore::rooted(&root);
+        let reviewer = human("psn:reviewer@acme");
+
+        let first = store.start_review(&loc(), KEY, reviewer.clone()).unwrap();
+        let retry = store.start_review(&loc(), KEY, reviewer).unwrap();
+
+        assert_eq!(retry.id, first.id);
+        assert_eq!(store.load(&loc(), KEY).unwrap().reviews.len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn oversized_stored_document_is_rejected_without_unbounded_reading() {
+        let root = temp_root("oversized-doc");
+        let store = DurablePrThreadStore::rooted(&root);
+        let path = store.subject_path(&loc(), KEY).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![b' '; MAX_THREAD_DOCUMENT_BYTES + 1]).unwrap();
+
+        let error = store
+            .load(&loc(), KEY)
+            .expect_err("oversized document must fail closed");
+        assert!(error.to_string().contains("document limit"));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A discussion thread (anchor null) round-trips durably; a fresh store over the same root reads it.
