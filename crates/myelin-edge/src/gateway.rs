@@ -637,7 +637,7 @@ impl Gateway {
                 material: material.to_string(),
             };
             return authenticate(&cred)
-                .map_err(|e| EdgeError::Unauthorized(format!("bearer auth failed: {e:?}")));
+                .map_err(|_| EdgeError::Unauthorized("authentication failed".into()));
         }
         // R4.0 item C — git smart-HTTP WIRE ONLY: accept HTTP Basic where the PASSWORD is the
         // capability-token material (the username is ignored). SAME verify path as Bearer (same scheme
@@ -652,7 +652,7 @@ impl Gateway {
                     material,
                 };
                 return authenticate(&cred)
-                    .map_err(|e| EdgeError::Unauthorized(format!("basic auth failed: {e:?}")));
+                    .map_err(|_| EdgeError::Unauthorized("authentication failed".into()));
             }
         }
         if let Some(sid) = req.cookie(SESSION_COOKIE) {
@@ -663,7 +663,7 @@ impl Gateway {
                     material: rec.material,
                 };
                 return authenticate(&cred)
-                    .map_err(|e| EdgeError::Unauthorized(format!("session auth failed: {e:?}")));
+                    .map_err(|_| EdgeError::Unauthorized("authentication failed".into()));
             }
             return Err(EdgeError::Unauthorized(
                 "session cookie does not resolve a live session".into(),
@@ -786,7 +786,7 @@ impl Gateway {
                         .into(),
                 ))
             }
-            Err(e) => Err(EdgeError::Unauthorized(format!("login failed: {e:?}"))),
+            Err(_) => Err(EdgeError::Unauthorized("login failed".into())),
         }
     }
 
@@ -813,9 +813,9 @@ impl Gateway {
             scheme: rec.scheme,
             material: rec.material,
         };
-        self.authn.authenticate_identity(&cred, None).map_err(|e| {
-            EdgeError::Unauthorized(format!("stale session (re-auth failed): {e:?}"))
-        })?;
+        self.authn
+            .authenticate_identity(&cred, None)
+            .map_err(|_| EdgeError::Unauthorized("session refresh failed".into()))?;
         Ok(EdgeResponse::json(200, &json!({ "refreshed": true })))
     }
 
@@ -1018,6 +1018,76 @@ mod tests {
                 exp_unix: i64::MAX,
             })
         }
+    }
+
+    #[derive(Clone, Copy)]
+    struct DistinctFailureVerifier;
+
+    impl myelin_identity_service::TokenVerifier for DistinctFailureVerifier {
+        fn verify(
+            &self,
+            credential: &Credential,
+        ) -> myelin_identity::Result<myelin_identity_service::CapabilityToken> {
+            if credential.material == "revoked" {
+                Err(AuthzError::FailClosed(
+                    "secret-jti was revoked in tenant acme".into(),
+                ))
+            } else {
+                Err(AuthzError::Unavailable(
+                    "postgres auth_replay connection refused".into(),
+                ))
+            }
+        }
+
+        fn verify_for_request(
+            &self,
+            credential: &Credential,
+            _binding: &DpopBinding,
+        ) -> myelin_identity::Result<myelin_identity_service::CapabilityToken> {
+            self.verify(credential)
+        }
+    }
+
+    #[test]
+    fn bearer_failures_do_not_expose_verifier_or_storage_details() {
+        let authn = Arc::new(CapabilityAuthenticator::with_verifier(
+            PrincipalStore::new(Arc::new(KmsEngine::new())),
+            Arc::new(DistinctFailureVerifier),
+            RevocationStore::new(),
+        ));
+        let gateway = Gateway::builder(authn, human_login(), Arc::new(AllowAll))
+            .route(
+                Method::Get,
+                "/v1/whoami",
+                "edge.whoami",
+                Arc::new(WhoamiHandler),
+            )
+            .build();
+        let request = |material: &str| {
+            EdgeRequest::new(
+                "GET",
+                "/v1/whoami",
+                "",
+                vec![(
+                    "Authorization".into(),
+                    format!("Bearer {material}"),
+                )],
+                vec![],
+            )
+        };
+
+        let revoked = gateway.handle(request("revoked"));
+        let unavailable = gateway.handle(request("store-down"));
+        assert_eq!(revoked.status(), 401);
+        assert_eq!(unavailable.status(), 401);
+        assert_eq!(revoked.json_body(), unavailable.json_body());
+        let body = revoked.json_body().unwrap().to_string();
+        assert!(!body.contains("secret-jti"));
+        assert!(!body.contains("postgres"));
+        assert_eq!(
+            revoked.json_body().unwrap()["error"]["message"],
+            "authentication required"
+        );
     }
 
     #[test]
