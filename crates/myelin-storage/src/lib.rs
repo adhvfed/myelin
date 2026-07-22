@@ -913,8 +913,9 @@ pub use delegation_policy_durable::{
     DurableDelegationPolicyVersions,
 };
 pub use identity_durable::{
-    identity_durable_migrations, DurablePrincipalBacking, DurablePrincipalRow, DurableProfileBlob,
-    DurableRevocationBacking, DurableRevocationRow, DurableTupleBacking, TupleEdgeOp,
+    auth_replay_durable_migrations, identity_durable_migrations, DurablePrincipalBacking,
+    DurablePrincipalRow, DurableProfileBlob, DurableReplayBacking, DurableRevocationBacking,
+    DurableRevocationRow, DurableTupleBacking, TupleEdgeOp,
 };
 pub use provider::{
     all_durable_migrations, durable_migration_groups, foundation_migrations, BootstrapError,

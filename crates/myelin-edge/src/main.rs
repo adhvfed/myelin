@@ -37,12 +37,13 @@ use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{FragmentAdmit, Principal, PrincipalId, PrincipalKind, RevokeTarget};
 use myelin_identity_service::{
     CapabilityAuthenticator, CellTokenAuthority, HumanSsoAuthenticator, JwkSet, OidcConfig,
-    PasetoCapabilityVerifier, PrincipalStore, RevocationStore, StoreBackedCheck, TupleStore,
+    PasetoCapabilityVerifier, PrincipalStore, ReplayGuard, RevocationStore, StoreBackedCheck,
+    TupleStore,
 };
 use myelin_storage::{
     all_durable_migrations, seal_key_from_env, DurableCellRootBacking, DurableKmsBacking,
-    DurablePrincipalBacking, DurableRevocationBacking, DurableTupleBacking, HotTables, KmsEngine,
-    PgBootstrap, PgOutboxBacking, SubstrateProvider, TenantScope,
+    DurablePrincipalBacking, DurableReplayBacking, DurableRevocationBacking, DurableTupleBacking,
+    HotTables, KmsEngine, PgBootstrap, PgOutboxBacking, SubstrateProvider, TenantScope,
 };
 use myelin_tenancy::{Region, TenantId};
 use std::{
@@ -618,12 +619,16 @@ async fn serve(core: ComposedCore, git_root: PathBuf, git_wire: GitWireRuntime) 
             );
             HumanSsoAuthenticator::production_with_oidc(
                 human_store,
-                Some((OidcConfig::new(oidc.issuer, oidc.audience), jwks)),
+                (OidcConfig::new(oidc.issuer, oidc.audience), jwks),
+                ReplayGuard::with_pg(
+                    DurableReplayBacking::new(provider.clone()),
+                    handle.clone(),
+                ),
             )
         }
         None => {
             eprintln!("edge: OIDC not configured — human login refuses (refuse-not-mock)");
-            HumanSsoAuthenticator::production_with_oidc(human_store, None)
+            HumanSsoAuthenticator::production(human_store)
         }
     });
 

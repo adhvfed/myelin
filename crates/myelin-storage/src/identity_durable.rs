@@ -129,6 +129,32 @@ CREATE POLICY myelin_tenant_isolation ON run_token_teardown \
   WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
               AND region = current_setting('myelin.region', true));";
 
+/// Atomic, TTL-bounded replay claims shared by every identity/edge replica. `namespace` separates
+/// issuers and audiences; `replay_id` is the verified token's `jti` (or nonce). Expired rows are
+/// deleted opportunistically before consumption, so the defence cannot grow without bound.
+pub const AUTH_REPLAY_MIGRATION: &str = "\
+CREATE TABLE IF NOT EXISTS auth_replay (
+    tenant_id text   NOT NULL,
+    region    text   NOT NULL,
+    namespace text   NOT NULL,
+    replay_id text   NOT NULL,
+    expires_at bigint NOT NULL,
+    PRIMARY KEY (tenant_id, region, namespace, replay_id)
+);
+CREATE INDEX IF NOT EXISTS auth_replay_expiry_idx
+    ON auth_replay (tenant_id, region, expires_at);";
+
+/// The `(tenant, region)` FORCE-RLS policy on the shared replay table.
+pub const AUTH_REPLAY_RLS_POLICY: &str = "\
+ALTER TABLE auth_replay ENABLE ROW LEVEL SECURITY;
+ALTER TABLE auth_replay FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON auth_replay;
+CREATE POLICY myelin_tenant_isolation ON auth_replay \
+  USING (tenant_id = current_setting('myelin.tenant_id', true) \
+         AND region = current_setting('myelin.region', true)) \
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
+              AND region = current_setting('myelin.region', true));";
+
 /// The S1 `credential_link` table — the verified-credential `(scheme, subject_key)` → `principal_id`
 /// index `authenticate` keys on (identity §2 "SSO/SCIM links"). `(tenant, region)`-scoped + RLS so a
 /// credential verified for tenant A can never resolve a principal in tenant B. `link_key` is the
@@ -182,6 +208,16 @@ pub fn identity_durable_migrations() -> Migrations {
         Migration::plain("0017_revocation_rls", REVOCATION_RLS_POLICY),
         Migration::plain("0018_run_token_teardown", RUN_TOKEN_TEARDOWN_MIGRATION),
         Migration::plain("0019_run_token_teardown_rls", RUN_TOKEN_TEARDOWN_RLS_POLICY),
+    ])
+}
+
+/// Forward-only replay-store migrations. These use the next globally available ids because
+/// `0010`-`0069` are already deployed; inserting a migration into an older range would violate the
+/// append-only migration contract.
+pub fn auth_replay_durable_migrations() -> Migrations {
+    Migrations::of([
+        Migration::plain("0070_auth_replay", AUTH_REPLAY_MIGRATION),
+        Migration::plain("0071_auth_replay_rls", AUTH_REPLAY_RLS_POLICY),
     ])
 }
 
@@ -858,4 +894,74 @@ impl DurableRevocationBacking {
 
 fn revocation_row_decode(error: sqlx::Error) -> crate::pg::PgError {
     crate::pg::PgError::Query(format!("revocation row decode failed: {error}"))
+}
+
+// =================================================================================================
+// DurableReplayBacking — atomic, cross-replica authentication replay defence.
+// =================================================================================================
+
+/// The durable authentication replay set. A consume is a single tenant-scoped transaction: expired
+/// rows are pruned, then `INSERT .. ON CONFLICT DO NOTHING` elects exactly one winner across every
+/// process connected to the cell database.
+#[derive(Clone)]
+pub struct DurableReplayBacking {
+    provider: SubstrateProvider,
+}
+
+impl DurableReplayBacking {
+    /// Build the replay backing over the shared production substrate.
+    pub fn new(provider: SubstrateProvider) -> DurableReplayBacking {
+        DurableReplayBacking { provider }
+    }
+
+    fn region(&self) -> String {
+        self.provider.config().region.clone()
+    }
+
+    /// Consume one verified replay identifier until `expires_at` (Unix seconds). Returns `true` for
+    /// the transaction that inserted it and `false` for every concurrent or later replay.
+    pub async fn consume(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        replay_id: &str,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<bool, ProviderError> {
+        let tenant_owned = tenant.to_string();
+        let region = self.region();
+        let namespace = namespace.to_string();
+        let replay_id = replay_id.to_string();
+        self.provider
+            .with_tenant_tx(tenant, move |conn| {
+                Box::pin(async move {
+                    sqlx::query(
+                        "DELETE FROM auth_replay \
+                         WHERE tenant_id = $1 AND region = $2 AND expires_at < $3",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region)
+                    .bind(now)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+
+                    let result = sqlx::query(
+                        "INSERT INTO auth_replay \
+                           (tenant_id, region, namespace, replay_id, expires_at) \
+                         VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region)
+                    .bind(&namespace)
+                    .bind(&replay_id)
+                    .bind(expires_at)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                    Ok(result.rows_affected() == 1)
+                })
+            })
+            .await
+    }
 }
