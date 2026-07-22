@@ -235,8 +235,8 @@ pub enum BlobError {
     /// A backing service could not perform the requested operation. The class is payload-free:
     /// SDK details, credentials, endpoints, buckets, and keys never cross this seam.
     Backend(BlobDependencyError),
-    /// A read was refused because its stored or plaintext byte length exceeded a caller ceiling.
-    ReadLimitExceeded {
+    /// A read or write was refused because its byte length exceeded a caller ceiling.
+    SizeLimitExceeded {
         /// The observed byte length.
         actual: usize,
         /// The caller's maximum byte allowance.
@@ -290,9 +290,9 @@ impl std::fmt::Display for BlobError {
                 actual.to_multihash_string()
             ),
             BlobError::Backend(kind) => kind.fmt(f),
-            BlobError::ReadLimitExceeded { actual, maximum } => write!(
+            BlobError::SizeLimitExceeded { actual, maximum } => write!(
                 f,
-                "blob read refused: {actual} bytes exceeds the {maximum}-byte limit"
+                "blob operation refused: {actual} bytes exceeds the {maximum}-byte limit"
             ),
             BlobError::MalformedAddress(s) => write!(f, "malformed content address: {s}"),
             BlobError::UnknownAlgo(t) => write!(f, "unknown hash algorithm tag: {t}"),
@@ -343,14 +343,14 @@ pub trait BlobStore {
     ) -> Result<Vec<u8>> {
         let metadata = self.head(tenant, hash)?;
         if metadata.stored_len > maximum_bytes {
-            return Err(BlobError::ReadLimitExceeded {
+            return Err(BlobError::SizeLimitExceeded {
                 actual: metadata.stored_len,
                 maximum: maximum_bytes,
             });
         }
         let bytes = self.get(tenant, hash)?;
         if bytes.len() > maximum_bytes {
-            return Err(BlobError::ReadLimitExceeded {
+            return Err(BlobError::SizeLimitExceeded {
                 actual: bytes.len(),
                 maximum: maximum_bytes,
             });
@@ -663,7 +663,7 @@ mod tests {
         );
         assert_eq!(
             store.get_bounded(&acme, &hash, bytes.len() - 1),
-            Err(BlobError::ReadLimitExceeded {
+            Err(BlobError::SizeLimitExceeded {
                 actual: bytes.len(),
                 maximum: bytes.len() - 1,
             })
