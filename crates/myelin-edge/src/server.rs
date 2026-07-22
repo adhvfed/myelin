@@ -45,14 +45,17 @@ type EdgeBody = BoxBody<Bytes, std::io::Error>;
 /// never protects the edge process. We therefore bound the body AS IT STREAMS and reject oversize
 /// with a `413 Payload Too Large` without buffering past the cap.
 ///
-/// **Tradeoff / choice of 100 MiB:** git pushes ship packfiles that can be large, so the ceiling must
+/// **Tradeoff / choice of 64 MiB:** git pushes ship packfiles that can be large, so the ceiling must
 /// be generous enough for a legitimate `git-receive-pack` — but finite, so the front door has a hard
-/// DoS ceiling. 100 MiB is that compromise: comfortably above ordinary pushes, far below "exhaust the
-/// host". Only `git-receive-pack` receives that budget; every other route has a 1 MiB ceiling.
-const MAX_REQUEST_BODY_BYTES: usize = 100 * 1024 * 1024;
+/// DoS ceiling. The transport cap is exactly the sandbox's stdin cap: accepting more here would only
+/// buffer bytes that the executor must later reject. Only `git-receive-pack` receives that budget;
+/// every other route has a 1 MiB ceiling.
+const MAX_REQUEST_BODY_BYTES: usize = myelin_ci_sandbox::gvisor::WIRE_STDIN_BOUND;
 const MAX_JSON_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_CONCURRENT_GIT_WIRE_OPERATIONS: usize = 4;
+const MAX_CONCURRENT_REQUEST_BODIES: usize = 64;
+const MAX_CONCURRENT_GIT_PUSH_BODIES: usize = 2;
 const MAX_CONCURRENT_GATEWAY_DISPATCHES: usize = 64;
 const MAX_REQUEST_HEADERS: usize = 64;
 const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
@@ -191,6 +194,8 @@ where
     let mut connections = JoinSet::new();
     let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let git_wire_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_WIRE_OPERATIONS));
+    let request_body_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUEST_BODIES));
+    let git_push_body_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_PUSH_BODIES));
     let gateway_dispatch_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_GATEWAY_DISPATCHES));
     let mut accept_error = None;
 
@@ -215,6 +220,8 @@ where
                 let gw = gateway.clone();
                 let readiness = readiness.clone();
                 let git_wire_slots = git_wire_slots.clone();
+                let request_body_slots = request_body_slots.clone();
+                let git_push_body_slots = git_push_body_slots.clone();
                 let gateway_dispatch_slots = gateway_dispatch_slots.clone();
                 let watcher = graceful.watcher();
                 connections.spawn(async move {
@@ -223,6 +230,8 @@ where
                         let gw = gw.clone();
                         let readiness = readiness.clone();
                         let git_wire_slots = git_wire_slots.clone();
+                        let request_body_slots = request_body_slots.clone();
+                        let git_push_body_slots = git_push_body_slots.clone();
                         let gateway_dispatch_slots = gateway_dispatch_slots.clone();
                         async move {
                             Ok::<_, Infallible>(
@@ -230,6 +239,8 @@ where
                                     gw,
                                     readiness,
                                     git_wire_slots,
+                                    request_body_slots,
+                                    git_push_body_slots,
                                     gateway_dispatch_slots,
                                     req,
                                 )
@@ -284,6 +295,8 @@ async fn handle_connection(
     gw: Arc<Gateway>,
     readiness: Arc<dyn ReadinessProbe>,
     git_wire_slots: Arc<Semaphore>,
+    request_body_slots: Arc<Semaphore>,
+    git_push_body_slots: Arc<Semaphore>,
     gateway_dispatch_slots: Arc<Semaphore>,
     req: Request<Incoming>,
 ) -> Response<EdgeBody> {
@@ -295,6 +308,8 @@ async fn handle_connection(
         gw,
         readiness,
         git_wire_slots,
+        request_body_slots,
+        git_push_body_slots,
         gateway_dispatch_slots,
         req,
     )
@@ -335,6 +350,8 @@ async fn handle_connection_inner(
     gw: Arc<Gateway>,
     readiness: Arc<dyn ReadinessProbe>,
     git_wire_slots: Arc<Semaphore>,
+    request_body_slots: Arc<Semaphore>,
+    git_push_body_slots: Arc<Semaphore>,
     gateway_dispatch_slots: Arc<Semaphore>,
     req: Request<Incoming>,
 ) -> Response<EdgeBody> {
@@ -360,6 +377,7 @@ async fn handle_connection_inner(
         return probe_response(status, body);
     }
     let is_git_wire = is_git_wire_path(&path);
+    let is_git_push = path.ends_with("/git-receive-pack");
     let body_cap = request_body_cap(&path);
     let body_deadline = request_body_deadline(&path);
     let query = parts.uri.query().unwrap_or("").to_string();
@@ -373,6 +391,35 @@ async fn handle_connection_inner(
     if content_length_over_cap(&parts.headers, body_cap) {
         return payload_too_large(body_cap);
     }
+    // Bound aggregate memory, not just each request. Only framed, non-empty bodies consume this
+    // capacity, so GET/read traffic remains independent. The permit is acquired before reading and
+    // remains owned by blocking dispatch, preventing completed bodies from piling up in a queue.
+    let request_body_permit = if request_has_body(&parts.headers) {
+        match request_body_slots.try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return unread_body_overloaded(
+                    "the edge request-body service is at capacity; retry later",
+                )
+            }
+        }
+    } else {
+        None
+    };
+    // At most two 64 MiB pushes may coexist within the general 64-body budget. A dedicated
+    // semaphore keeps slow uploads from consuming clone/read execution capacity.
+    let git_push_body_permit = if is_git_push {
+        match git_push_body_slots.try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return unread_body_overloaded(
+                    "the Git push upload service is at capacity; retry later",
+                )
+            }
+        }
+    } else {
+        None
+    };
     // Collect the body bounded by MAX_REQUEST_BODY_BYTES, streaming frame-by-frame. Oversize → a 413
     // WITHOUT buffering past the cap; a read error → a clean 400 + connection close — never a
     // partial body and never a panic.
@@ -388,14 +435,14 @@ async fn handle_connection_inner(
     let git_wire_permit = if is_git_wire {
         match git_wire_slots.try_acquire_owned() {
             Ok(permit) => Some(permit),
-            Err(_) => return overloaded(),
+            Err(_) => return overloaded("the Git wire service is at capacity; retry later"),
         }
     } else {
         None
     };
     let gateway_permit = match gateway_dispatch_slots.try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => return overloaded(),
+        Err(_) => return overloaded("the edge request service is at capacity; retry later"),
     };
 
     // Every gateway handler is synchronous and may reach blocking filesystem/Git/database adapters.
@@ -404,6 +451,8 @@ async fn handle_connection_inner(
     let edge_response = match tokio::task::spawn_blocking(move || {
         let _gateway_permit = gateway_permit;
         let _git_wire_permit = git_wire_permit;
+        let _request_body_permit = request_body_permit;
+        let _git_push_body_permit = git_push_body_permit;
         handle_gateway_safely(&gw, edge_req)
     })
     .await
@@ -511,13 +560,23 @@ fn request_body_deadline(path: &str) -> Duration {
     }
 }
 
-fn overloaded() -> Response<EdgeBody> {
-    let err = EdgeError::Unavailable("the Git wire service is at capacity; retry later".into());
+fn overloaded(message: &str) -> Response<EdgeBody> {
+    let err = EdgeError::Unavailable(message.into());
     let mut response = to_hyper(EdgeResponse::error(&err));
     response.headers_mut().insert(
         hyper::header::RETRY_AFTER,
         hyper::header::HeaderValue::from_static(GIT_WIRE_RETRY_AFTER_SECONDS),
     );
+    response
+}
+
+fn unread_body_overloaded(message: &str) -> Response<EdgeBody> {
+    let mut response = overloaded(message);
+    // The request body has deliberately not been read. Closing prevents unread upload bytes from
+    // being mistaken for a subsequent HTTP/1 request on the same connection.
+    response
+        .headers_mut()
+        .insert(hyper::header::CONNECTION, hyper::header::HeaderValue::from_static("close"));
     response
 }
 
@@ -569,13 +628,28 @@ fn content_length_over_cap(headers: &hyper::HeaderMap, cap: usize) -> bool {
         .is_some_and(|declared| declared > cap as u64)
 }
 
+fn request_has_body(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .is_some_and(|length| length > 0)
+        || headers.contains_key(hyper::header::TRANSFER_ENCODING)
+}
+
 /// Render the `413 Payload Too Large` response through the existing error-envelope path, so its
 /// `{error:{message,code}}` shape matches every other edge error (R0.5 / DELTA N3).
 fn payload_too_large(cap: usize) -> Response<EdgeBody> {
     let err = EdgeError::PayloadTooLarge(format!(
         "request body exceeds the {cap}-byte route limit"
     ));
-    to_hyper(EdgeResponse::error(&err))
+    let mut response = to_hyper(EdgeResponse::error(&err));
+    // Both the declared-length fast path and the streaming overflow path leave request bytes
+    // unread. Never reuse that HTTP/1 connection for a subsequent request.
+    response
+        .headers_mut()
+        .insert(hyper::header::CONNECTION, hyper::header::HeaderValue::from_static("close"));
+    response
 }
 
 /// Render an [`EdgeResponse`] as a hyper response (finished body or streamed SSE).
@@ -895,6 +969,7 @@ mod tests {
     fn payload_too_large_uses_the_canonical_413_envelope() {
         let resp = payload_too_large(MAX_REQUEST_BODY_BYTES);
         assert_eq!(resp.status(), 413);
+        assert_eq!(resp.headers()[hyper::header::CONNECTION], "close");
         let err = EdgeError::PayloadTooLarge("x".into());
         assert_eq!(err.status(), 413);
         assert_eq!(err.code(), "payload_too_large");
@@ -902,6 +977,11 @@ mod tests {
 
     #[test]
     fn only_git_receive_pack_gets_the_large_body_budget() {
+        assert_eq!(
+            MAX_REQUEST_BODY_BYTES,
+            myelin_ci_sandbox::gvisor::WIRE_STDIN_BOUND,
+            "the edge must never buffer bytes the sandbox will unconditionally reject"
+        );
         assert_eq!(
             request_body_cap("/acme/eu-west/widgets.git/git-receive-pack"),
             MAX_REQUEST_BODY_BYTES
@@ -945,6 +1025,38 @@ mod tests {
         assert_eq!(resp.headers()[hyper::header::CONNECTION], "close");
         let err = EdgeError::RequestTimeout("x".into());
         assert_eq!(err.code(), "request_timeout");
+    }
+
+    #[test]
+    fn pre_read_body_overload_closes_the_connection() {
+        let response = unread_body_overloaded(
+            "the Git push upload service is at capacity; retry later",
+        );
+        assert_eq!(response.status(), 503);
+        assert_eq!(response.headers()[hyper::header::RETRY_AFTER], "1");
+        assert_eq!(response.headers()[hyper::header::CONNECTION], "close");
+    }
+
+    #[test]
+    fn request_body_admission_recognizes_fixed_and_chunked_framing() {
+        let mut headers = hyper::HeaderMap::new();
+        assert!(!request_has_body(&headers));
+        headers.insert(
+            hyper::header::CONTENT_LENGTH,
+            hyper::header::HeaderValue::from_static("0"),
+        );
+        assert!(!request_has_body(&headers));
+        headers.insert(
+            hyper::header::CONTENT_LENGTH,
+            hyper::header::HeaderValue::from_static("1"),
+        );
+        assert!(request_has_body(&headers));
+        headers.remove(hyper::header::CONTENT_LENGTH);
+        headers.insert(
+            hyper::header::TRANSFER_ENCODING,
+            hyper::header::HeaderValue::from_static("chunked"),
+        );
+        assert!(request_has_body(&headers));
     }
 
     #[test]
