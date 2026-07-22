@@ -28,6 +28,9 @@ export function whoamiJson() {
     tenant: DEV_PRINCIPAL.tenant,
     region: DEV_PRINCIPAL.region,
     kind: "human",
+    // Mirror the production whoami contract: the web session must be bounded by the presented
+    // capability's expiry. This dev-only token is treated as a fresh one-hour capability per call.
+    expires_at: Math.floor(Date.now() / 1_000) + 60 * 60,
   };
 }
 
