@@ -429,3 +429,32 @@ fn withhold_reason_tokens_are_stable() {
     assert_eq!(WithholdReason::UntrustedFork.as_token(), "untrusted_fork");
     assert_eq!(WithholdReason::NotGranted.as_token(), "not_granted");
 }
+
+#[test]
+fn debug_output_redacts_secret_and_oidc_material_recursively() {
+    let material = "unique-static-secret-material";
+    let token = "unique-short-lived-oidc-token";
+    let resolved = ResolvedSecret {
+        name: "DEPLOY_KEY".into(),
+        value: material.into(),
+    };
+    let resolution = SecretResolution {
+        outcomes: vec![SecretOutcome::Resolved(resolved.clone())],
+    };
+    let credential = OidcCredential {
+        audience: "registry.fr-par".into(),
+        token: token.into(),
+        ttl_secs: 900,
+    };
+
+    for rendered in [
+        format!("{resolved:?}"),
+        format!("{:?}", resolution.outcomes[0]),
+        format!("{resolution:?}"),
+        format!("{credential:?}"),
+    ] {
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains(material));
+        assert!(!rendered.contains(token));
+    }
+}

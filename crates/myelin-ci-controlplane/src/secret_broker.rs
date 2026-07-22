@@ -50,6 +50,7 @@ use myelin_identity::{
     Consistency, Decision, IdentityService, Permission, Principal, Result as IdResult,
 };
 use myelin_tenancy::ArtifactRef;
+use std::fmt;
 
 /// **The READ permission on a `ci_secret` (the FROZEN `secret.read` gate, contract 4.9).** The ONLY
 /// path to a secret is a DIRECT `secret#direct_reader@subject` grant resolving `read` (CI-1 §1 — NOT
@@ -60,13 +61,23 @@ pub const SECRET_READ_PERMISSION: &str = "read";
 /// is the ONLY place a secret value materialises, and it lives only inside the boundary (this struct is
 /// never serialised onto a `JobSpec`, an event, or a log — references-not-payloads, §3.4). The `value`
 /// is the resolved material; the broker mints it from the shared secret capability scoped to this job.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedSecret {
     /// The env var name the resolved secret binds to inside the boundary (mirrors `SecretRef::name`).
     pub name: String,
     /// The resolved secret material (the clear value). NEVER leaves the boundary — not onto a spec,
     /// an event, or a log. The broker scopes it to THIS job only.
     pub value: String,
+}
+
+impl fmt::Debug for ResolvedSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedSecret")
+            .field("name", &self.name)
+            .field("value", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// **Why a referenced secret was NOT resolved (the withhold reason — observable, never silent).** A
@@ -174,7 +185,7 @@ pub trait SecretCapability {
 /// these OVER static keys for talking to a registry / cloud target — a strong EU-sovereign
 /// least-privilege fit (the credential's life == the job's life, scoped to ONE audience). The token
 /// material is opaque; it never leaves the boundary.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OidcCredential {
     /// The audience the credential is scoped to (a registry / cloud target — least-privilege, 4.7).
     pub audience: String,
@@ -182,6 +193,17 @@ pub struct OidcCredential {
     pub token: String,
     /// The credential's lifetime in seconds (short-lived == the job's life, NOT a long-lived key).
     pub ttl_secs: u32,
+}
+
+impl fmt::Debug for OidcCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OidcCredential")
+            .field("audience", &self.audience)
+            .field("token", &"[REDACTED]")
+            .field("ttl_secs", &self.ttl_secs)
+            .finish()
+    }
 }
 
 /// **The in-boundary secret broker (CI-1; arch §7.3).** Resolves a job's referenced secrets AFTER the
