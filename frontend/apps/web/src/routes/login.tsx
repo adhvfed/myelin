@@ -120,9 +120,8 @@ export default function Login() {
               when={isTokenError()}
               fallback={
                 <span>
-                  Sign-in couldn't be completed. Single sign-on isn't fully wired on this deployment yet
-                  — an administrator needs to finish connecting the identity provider. You can try again,
-                  or contact your Myelin administrator.
+                  Sign-in couldn't be completed. You can try again, or contact your Myelin
+                  administrator if the problem continues. Nothing's wrong on your end.
                 </span>
               }
             >

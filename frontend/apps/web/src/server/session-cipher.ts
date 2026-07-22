@@ -7,7 +7,7 @@ const KEY_BYTES = 32;
 const BASE64URL_KEY = /^[A-Za-z0-9_-]{43}$/;
 const BASE64_KEY = /^[A-Za-z0-9+/]{43}=$/;
 
-export type SessionSecretField = "token" | "record";
+export type SessionSecretField = "token" | "record" | "oidc_transaction";
 
 /** Decode the deployment key without accepting Node's permissive, partially decoded base64 input. */
 export function decodeSessionKey(encoded: string | undefined): Buffer {

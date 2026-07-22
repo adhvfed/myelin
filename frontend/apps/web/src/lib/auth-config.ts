@@ -44,10 +44,12 @@ export function toAuthConfig(
   edge: EdgeAuthConfig,
   env: DevLoginEnv,
   isProdBuild: boolean,
+  interactiveSsoConfigured = false,
 ): AuthConfig {
+  const ssoConfigured = edge.sso_configured === true && interactiveSsoConfigured;
   return {
-    sso_configured: edge.sso_configured ?? false,
-    providers: edge.providers ?? [],
+    sso_configured: ssoConfigured,
+    providers: ssoConfigured ? (edge.providers ?? []) : [],
     dev_login_enabled: devSeamAllowed(edge.dev_login_enabled ?? false, env, isProdBuild),
     token_login_enabled: edge.token_login_enabled ?? false,
   };

@@ -227,6 +227,11 @@ liveness and `/readyz` for traffic readiness; the latter
 performs a short-lived namespaced write/read/script/delete probe and returns 503 whenever the session
 backend is unavailable or its production ACL cannot perform real session operations.
 
+Interactive SSO additionally requires the web client settings documented in
+[`web-deployment.md`](web-deployment.md) and the edge verifier settings documented in
+[`edge-deployment.md`](edge-deployment.md). The registered redirect URI is the exact public origin
+plus `/auth/oidc/callback`; Myelin uses a confidential authorization-code client with S256 PKCE.
+
 The Node listener is an internal HTTP hop and must not be exposed publicly. Put it behind the TLS
 ingress, keep the listener reachable only on the private service network, and configure the ingress
 to **strip and replace** any client-supplied `X-Forwarded-Proto` header with the actual public scheme.

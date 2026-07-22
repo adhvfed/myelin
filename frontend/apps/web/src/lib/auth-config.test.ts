@@ -7,6 +7,21 @@ import { toAuthConfig } from "./auth-config";
 const devEnv = { NODE_ENV: "development", MYELIN_DEV_LOGIN: "1" };
 
 describe("toAuthConfig — carries token_login_enabled (R4.0)", () => {
+  it("advertises SSO only when both the edge verifier and web code flow are configured", () => {
+    const edge = {
+      sso_configured: true,
+      providers: [{ id: "oidc", label: "Single sign-on" }],
+    };
+    expect(toAuthConfig(edge, {}, true, false)).toMatchObject({
+      sso_configured: false,
+      providers: [],
+    });
+    expect(toAuthConfig(edge, {}, true, true)).toMatchObject({
+      sso_configured: true,
+      providers: edge.providers,
+    });
+  });
+
   it("passes the edge's token_login_enabled=true through", () => {
     const cfg = toAuthConfig(
       { sso_configured: false, providers: [], dev_login_enabled: false, token_login_enabled: true },
