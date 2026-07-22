@@ -720,12 +720,31 @@ impl PseudonymStore {
             }
             PseudonymBackend::Pg(pg) => {
                 // The DURABLE crypto-shred: DELETE the row (row + sealed link + reverse-lookup path) in
-                // one tenant-scoped tx. A storage fault is swallowed to `false` (the shred did NOT
-                // land) — the erase engine's LOUD signal is the KMS destroy_dek half it pairs with.
-                pg.block(pg.backing.shred(&scope.tenant().0, &subject.0))
-                    .unwrap_or(false)
+                // one tenant-scoped tx. This infallible erase API must never turn a storage fault
+                // into `false`, because `false` is the legitimate idempotent "already absent"
+                // result and would allow the caller to mint a misleading success receipt.
+                Self::require_durable_shred(
+                    pg.block(pg.backing.shred(&scope.tenant().0, &subject.0)),
+                    scope,
+                    subject,
+                )
             }
         }
+    }
+
+    fn require_durable_shred<E: core::fmt::Display>(
+        result: Result<bool, E>,
+        scope: &TenantScope,
+        subject: &PrincipalId,
+    ) -> bool {
+        result.unwrap_or_else(|error| {
+            panic!(
+                "PSEUDONYM-SHRED DURABILITY FAILURE (fail-static): subject={} tenant={} row delete \
+                 failed; refusing to report an idempotent erase or mint a receipt: {error}",
+                subject.0,
+                scope.tenant().0
+            )
+        })
     }
 
     /// List the mapping rows in a `(tenant, region)` partition (for the directory / tests). There is
@@ -859,6 +878,27 @@ mod tests {
             Err(PseudonymError::CorruptMapping),
             "corruption must invalidate an erasure proof instead of looking erased"
         );
+    }
+
+    #[test]
+    fn durable_shred_fault_cannot_masquerade_as_idempotent_absence() {
+        let s = scope("acme");
+        let subject = PrincipalId("p:alice".into());
+        assert!(PseudonymStore::require_durable_shred(
+            Ok::<bool, &str>(true),
+            &s,
+            &subject
+        ));
+        assert!(!PseudonymStore::require_durable_shred(
+            Ok::<bool, &str>(false),
+            &s,
+            &subject
+        ));
+
+        let panic = std::panic::catch_unwind(|| {
+            PseudonymStore::require_durable_shred(Err("database unavailable"), &s, &subject)
+        });
+        assert!(panic.is_err(), "a storage fault must refuse the erase receipt");
     }
 
     /// **A cross-tenant read returns nothing (the tightest-RLS floor — mutation-tested
