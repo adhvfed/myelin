@@ -5,13 +5,15 @@ import Redis from "ioredis";
 import {
   SESSION_ABSOLUTE_TTL_MS,
   SESSION_IDLE_TTL_MS,
-  assertUsableCredentialExpiry,
+  assertValidSessionToken,
   type SessionRecord,
   type SessionStore,
+  validatedSessionRecord,
 } from "./session-store";
 import { SessionCipher } from "./session-cipher";
 
 export const SESSION_KEY_PREFIX = "myelin:web-session:v1:";
+export const MAX_STORED_SESSION_BYTES = 256 * 1024;
 
 const VALID_SESSION_LUA = `
 local function valid_record(record)
@@ -65,6 +67,10 @@ return 1
 const GET_SCRIPT = `${VALID_SESSION_LUA}
 local raw = redis.call("GET", KEYS[1])
 if not raw then return nil end
+if string.len(raw) > tonumber(ARGV[2]) then
+  redis.call("DEL", KEYS[1])
+  return nil
+end
 local decoded, session = pcall(cjson.decode, raw)
 if not decoded or not valid_session(session) then
   redis.call("DEL", KEYS[1])
@@ -86,6 +92,10 @@ return cjson.encode(session.record)
 const UPDATE_TOKEN_SCRIPT = `${VALID_SESSION_LUA}
 local raw = redis.call("GET", KEYS[1])
 if not raw then return 0 end
+if string.len(raw) > tonumber(ARGV[3]) then
+  redis.call("DEL", KEYS[1])
+  return 0
+end
 local decoded, session = pcall(cjson.decode, raw)
 if not decoded or not valid_session(session) then
   redis.call("DEL", KEYS[1])
@@ -124,16 +134,6 @@ function validStoredRecord(value: unknown): value is StoredRecord {
   return typeof record.token === "string" && typeof record.sealed === "string";
 }
 
-function validRecord(value: unknown): value is SessionRecord {
-  if (!value || typeof value !== "object") return false;
-  const record = value as Record<string, unknown>;
-  return (
-    ["token", "refreshToken", "scheme", "principalId", "displayName", "region", "tenant"].every(
-      (field) => typeof record[field] === "string",
-    ) && Number.isSafeInteger(record.credentialExpiresAtMs)
-  );
-}
-
 export class ValkeySessionStore implements SessionStore {
   readonly #redis: Redis;
   readonly #cipher: SessionCipher;
@@ -159,29 +159,29 @@ export class ValkeySessionStore implements SessionStore {
   }
 
   async issue(id: string, record: SessionRecord): Promise<void> {
-    assertUsableCredentialExpiry(record.credentialExpiresAtMs);
+    const validated = validatedSessionRecord(record);
     const issued = await this.#redis.eval(
       ISSUE_SCRIPT,
       1,
       this.#key(id),
-      JSON.stringify(this.#seal(id, record)),
+      JSON.stringify(this.#seal(id, validated)),
       SESSION_ABSOLUTE_TTL_MS,
-      record.credentialExpiresAtMs,
+      validated.credentialExpiresAtMs,
       SESSION_IDLE_TTL_MS,
     );
     if (issued !== 1) throw new Error("session credential expired during issuance");
   }
 
   async rotate(priorId: string, id: string, record: SessionRecord): Promise<void> {
-    assertUsableCredentialExpiry(record.credentialExpiresAtMs);
+    const validated = validatedSessionRecord(record);
     const rotated = await this.#redis.eval(
       ROTATE_SCRIPT,
       2,
       this.#key(id),
       this.#key(priorId),
-      JSON.stringify(this.#seal(id, record)),
+      JSON.stringify(this.#seal(id, validated)),
       SESSION_ABSOLUTE_TTL_MS,
-      record.credentialExpiresAtMs,
+      validated.credentialExpiresAtMs,
       SESSION_IDLE_TTL_MS,
     );
     if (rotated !== 1) throw new Error("session credential expired during rotation");
@@ -193,6 +193,7 @@ export class ValkeySessionStore implements SessionStore {
       1,
       this.#key(id),
       SESSION_IDLE_TTL_MS,
+      MAX_STORED_SESSION_BYTES,
     );
     if (typeof raw !== "string") return null;
     try {
@@ -206,12 +207,14 @@ export class ValkeySessionStore implements SessionStore {
   }
 
   async updateToken(id: string, token: string): Promise<boolean> {
+    assertValidSessionToken(token);
     const updated = await this.#redis.eval(
       UPDATE_TOKEN_SCRIPT,
       1,
       this.#key(id),
       this.#cipher.encrypt(id, "token", token),
       SESSION_IDLE_TTL_MS,
+      MAX_STORED_SESSION_BYTES,
     );
     return updated === 1;
   }
@@ -248,18 +251,6 @@ export class ValkeySessionStore implements SessionStore {
       ...(rest as Omit<SessionRecord, "token">),
       token: this.#cipher.decrypt(id, "token", record.token),
     };
-    if (!validRecord(opened)) throw new Error("stored session record has an invalid shape");
-    // Project only the declared fields even after authenticated decryption; future schema fields or
-    // a mistakenly sealed extra property must not flow into request-local identity objects.
-    return {
-      token: opened.token,
-      refreshToken: opened.refreshToken,
-      scheme: opened.scheme,
-      credentialExpiresAtMs: opened.credentialExpiresAtMs,
-      principalId: opened.principalId,
-      displayName: opened.displayName,
-      region: opened.region,
-      tenant: opened.tenant,
-    };
+    return validatedSessionRecord(opened);
   }
 }

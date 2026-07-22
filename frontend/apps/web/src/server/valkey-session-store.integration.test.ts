@@ -3,7 +3,11 @@ import { afterAll, describe, expect, it } from "vitest";
 import Redis from "ioredis";
 
 import type { SessionRecord } from "./session-store";
-import { SESSION_KEY_PREFIX, ValkeySessionStore } from "./valkey-session-store";
+import {
+  MAX_STORED_SESSION_BYTES,
+  SESSION_KEY_PREFIX,
+  ValkeySessionStore,
+} from "./valkey-session-store";
 
 const redisUrl = process.env.REDIS_URL;
 const sessionKey = Buffer.alloc(32, 7).toString("base64url");
@@ -83,6 +87,22 @@ describe.runIf(Boolean(redisUrl))("ValkeySessionStore integration", () => {
         expect(await admin.exists(updateKey)).toBe(0);
       }
     } finally {
+      admin.disconnect(false);
+    }
+  });
+
+  it("deletes an oversized stored record before JSON or decryption work", async () => {
+    const sessionStore = store();
+    const admin = new Redis(redisUrl!);
+    const id = `oversized_read_${randomBytes(8).toString("hex")}`;
+    const key = `${SESSION_KEY_PREFIX}${id}`;
+
+    try {
+      await admin.set(key, "x".repeat(MAX_STORED_SESSION_BYTES + 1));
+      expect(await sessionStore.get(id)).toBeNull();
+      expect(await admin.exists(key)).toBe(0);
+    } finally {
+      await sessionStore.delete(id);
       admin.disconnect(false);
     }
   });

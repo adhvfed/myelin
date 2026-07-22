@@ -75,4 +75,31 @@ describe("MemorySessionStore", () => {
     expect(store.get("session-two", 21_001)).toEqual({ ...record, token: "access-two" });
     expect(store.size()).toBe(1);
   });
+
+  it("rejects malformed auth facts before persisting them", () => {
+    const invalid = [
+      { ...record, token: "x".repeat(32 * 1024 + 1) },
+      { ...record, refreshToken: "refresh\nsmuggled" },
+      { ...record, scheme: "Agent" },
+      { ...record, principalId: "principal\0smuggled" },
+      { ...record, displayName: "x".repeat(513) },
+      { ...record, tenant: "x".repeat(129) },
+    ];
+
+    for (const candidate of invalid) {
+      const store = new MemorySessionStore();
+      expect(() => store.issue("session-invalid", candidate, 1_000)).toThrow(/invalid/);
+      expect(store.size()).toBe(0);
+    }
+  });
+
+  it("projects admitted records and refuses malformed token rotation", () => {
+    const store = new MemorySessionStore();
+    const withExtra = { ...record, untrusted: "must-not-survive" };
+    store.issue("session-one", withExtra, 1_000);
+
+    expect(store.get("session-one", 1_001)).toEqual(record);
+    expect(() => store.updateToken("session-one", "rotated\ntoken", 1_002)).toThrow(/invalid/);
+    expect(store.get("session-one", 1_003)).toEqual(record);
+  });
 });
