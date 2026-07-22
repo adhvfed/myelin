@@ -325,7 +325,9 @@ pub use surge::{
 // ISS-P05 (P-371, M4): the bootable service shell + the complete issue-spine data model + the H3
 // holder. The `serve(AppSpec)` shell (contract 1.1), the forward-only migrations (1.5/11.1/12.1), and
 // the auto-registered PersonalDataHolder (10.1/1.4).
-pub use app::{boot_issues, issues_app_spec, run_issues, SERVICE_NAME};
+pub use app::{
+    boot_issues, issues_app_spec, run_issues, run_issues_until_shutdown, SERVICE_NAME,
+};
 pub use holder::{
     issue_store_classifier, register_issue_holders, IssueHolder, IssueHolderRegistration,
     IssueStoreClass, RestrictionFlag, ISSUE_OLTP_STORE, ISSUE_RESIDUAL_POSTURE_REF,

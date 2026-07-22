@@ -124,7 +124,7 @@ sqlx = { workspace = true, optional = true }
 # foundation migrations → `OutboxStore::durable(PgOutboxBacking)`) is the ALWAYS-COMPILED default
 # (the Wave-2 identity-service posture), so `tokio` (the multi-thread runtime the sync→async
 # bridge requires) is now a regular dep. Build stays DB-free: connecting happens at RUNTIME.
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 
 # SRCH-P30 (P-463, M5): the object-store index backstop swap (the fs-backed BlobStore ->
 # object-store swap, contract 11.2) gets PROVEN against the LIVE dev-stack object store (RustFS /

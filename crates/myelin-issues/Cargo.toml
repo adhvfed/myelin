@@ -140,7 +140,7 @@ sqlx = { workspace = true }
 # (the Wave-2 identity-service posture), so `tokio` (the multi-thread runtime the sync→async
 # bridge requires) + `myelin-config` (the env-first durable config, fail-loud) are now regular
 # deps. Build stays DB-free: connecting happens at RUNTIME, never at build.
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 myelin-config = { path = "../myelin-config" }
 
 # DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the

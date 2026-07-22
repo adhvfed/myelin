@@ -28,6 +28,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_store_construct
     assert!(durable < issues);
     assert!(issues < handoff);
     assert!(handoff < runtime_store);
+    assert!(source.contains("run_issues_until_shutdown(Config::default()"));
+    assert!(source.contains("SignalKind::terminate()"));
 }
 
 #[test]

@@ -117,6 +117,19 @@ pub fn run_issues(config: Config, outbox: OutboxStore) -> Result<(), ServeError>
     serve(issues_app_spec(config, outbox))
 }
 
+/// Keep the production service live until explicit shutdown, then stop intake and drain through the
+/// shared harness. [`run_issues`] remains the deterministic one-tick shell-test entry.
+pub async fn run_issues_until_shutdown<F>(
+    config: Config,
+    outbox: OutboxStore,
+    shutdown: F,
+) -> Result<(), ServeError>
+where
+    F: std::future::Future<Output = ()>,
+{
+    myelin_substrate::serve_until_shutdown(issues_app_spec(config, outbox), shutdown).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +197,14 @@ mod tests {
             run_issues(Config::default(), OutboxStore::new()),
             Ok(()),
             "the Issue Tracker shell boots → … → drains cleanly"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_issues_waits_for_shutdown_then_drains() {
+        assert_eq!(
+            run_issues_until_shutdown(Config::default(), OutboxStore::new(), async {}).await,
+            Ok(())
         );
     }
 

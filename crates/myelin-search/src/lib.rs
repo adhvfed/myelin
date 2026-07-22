@@ -263,7 +263,7 @@ pub use restore_verify::{
     SearchRestoreInputs, SearchRestoreVerdict, SearchRestoreVerifyGate,
 };
 pub use shell::{
-    boot_search, run_search, search_app_spec, search_service_migrations,
+    boot_search, run_search, run_search_until_shutdown, search_app_spec, search_service_migrations,
     SEARCH_INDEX_DIR_MIGRATION, SERVICE_NAME,
 };
 pub use subartifact::{
