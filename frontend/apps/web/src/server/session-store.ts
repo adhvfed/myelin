@@ -50,6 +50,10 @@ function validToken(value: unknown, allowEmpty: boolean): value is string {
       (value.length <= MAX_SESSION_TOKEN_BYTES && /^[\x21-\x7e]+$/.test(value)));
 }
 
+export function validSessionToken(value: unknown): value is string {
+  return validToken(value, false);
+}
+
 /** Validate and project every runtime-created or decrypted session before it enters auth state. */
 export function validatedSessionRecord(value: unknown, nowMs = Date.now()): SessionRecord {
   if (!value || typeof value !== "object") throw new Error("session record is invalid");
@@ -80,7 +84,7 @@ export function validatedSessionRecord(value: unknown, nowMs = Date.now()): Sess
 }
 
 export function assertValidSessionToken(token: unknown): asserts token is string {
-  if (!validToken(token, false)) throw new Error("session access token is invalid");
+  if (!validSessionToken(token)) throw new Error("session access token is invalid");
 }
 
 /** In-process implementation of the session lifecycle contract. The production transport can swap
