@@ -26,6 +26,12 @@ import {
 import { parseFileLinesInput, parseFileLinesResponse } from "./file-lines";
 import { parseBlob, parseRefs, parseRepoHome, parseReposPage, parseTree } from "./repo-read-response";
 import { parseCommitDiff, parseCommitsPage } from "./commit-read-response";
+import {
+  parseGitBrowseInput,
+  parseGitCommitInput,
+  parseGitCommitsInput,
+  parseGitRepoInput,
+} from "./git-read-input";
 
 export type { IssueMutation, PrMutation } from "./mutation-input";
 
@@ -481,8 +487,10 @@ export const getRepos = query(async (): Promise<ReposPage> => {
 /** A single repo's home (GET /v1/git/repos/{repo}) → the RepoHome ViewModel. */
 export const getRepo = query(async (repo: string): Promise<RepoHomeVM> => {
   "use server";
+  const input = parseGitRepoInput(repo);
+  if (!input) throw new RepoRouteError("error");
   return authed(async () => {
-    const home = parseRepoHome(await edgeGet(`/v1/git/repos/${seg(repo)}`));
+    const home = parseRepoHome(await edgeGet(`/v1/git/repos/${seg(input.repo)}`));
     if (!home) throw new RepoRouteError("error");
     return home;
   });
@@ -501,8 +509,10 @@ function nestedPath(path: string): string {
 /** The ref switcher source (GET /v1/git/repos/{repo}/refs). */
 export const getRefs = query(async (repo: string): Promise<RefsVM> => {
   "use server";
+  const input = parseGitRepoInput(repo);
+  if (!input) throw new RepoRouteError("error");
   return authed(async () => {
-    const refs = parseRefs(await edgeGet(`/v1/git/repos/${seg(repo)}/refs`));
+    const refs = parseRefs(await edgeGet(`/v1/git/repos/${seg(input.repo)}/refs`));
     if (!refs) throw new RepoRouteError("error");
     return refs;
   });
@@ -512,10 +522,12 @@ export const getRefs = query(async (repo: string): Promise<RefsVM> => {
 export const getTree = query(
   async (input: { repo: string; ref: string; path: string }): Promise<TreeVM> => {
     "use server";
-    const tail = input.path ? `/${nestedPath(input.path)}` : "";
+    const parsed = parseGitBrowseInput(input, true);
+    if (!parsed) throw new RepoRouteError("error");
+    const tail = parsed.path ? `/${nestedPath(parsed.path)}` : "";
     return authed(async () => {
       const tree = parseTree(await edgeGet(
-        `/v1/git/repos/${seg(input.repo)}/tree/${seg(input.ref)}${tail}`,
+        `/v1/git/repos/${seg(parsed.repo)}/tree/${seg(parsed.ref)}${tail}`,
       ));
       if (!tree) throw new RepoRouteError("error");
       return tree;
@@ -528,9 +540,11 @@ export const getTree = query(
 export const getBlob = query(
   async (input: { repo: string; ref: string; path: string }): Promise<BlobVM> => {
     "use server";
+    const parsed = parseGitBrowseInput(input, false);
+    if (!parsed) throw new RepoRouteError("error");
     return authed(async () => {
       const blob = parseBlob(await edgeGet(
-        `/v1/git/repos/${seg(input.repo)}/blob/${seg(input.ref)}/${nestedPath(input.path)}`,
+        `/v1/git/repos/${seg(parsed.repo)}/blob/${seg(parsed.ref)}/${nestedPath(parsed.path)}`,
       ));
       if (!blob) throw new RepoRouteError("error");
       return blob;
@@ -543,10 +557,12 @@ export const getBlob = query(
 export const getCommits = query(
   async (input: { repo: string; ref: string; cursor?: string }): Promise<CommitsPage> => {
     "use server";
-    const q = input.cursor ? `?cursor=${seg(input.cursor)}` : "";
+    const parsed = parseGitCommitsInput(input);
+    if (!parsed) throw new RepoRouteError("error");
+    const q = parsed.cursor ? `?cursor=${seg(parsed.cursor)}` : "";
     return authed(async () => {
       const page = parseCommitsPage(await edgeGet(
-        `/v1/git/repos/${seg(input.repo)}/commits/${seg(input.ref)}${q}`,
+        `/v1/git/repos/${seg(parsed.repo)}/commits/${seg(parsed.ref)}${q}`,
       ));
       if (!page) throw new RepoRouteError("error");
       return page;
@@ -559,9 +575,11 @@ export const getCommits = query(
 export const getCommit = query(
   async (input: { repo: string; oid: string }): Promise<CommitDiffVM> => {
     "use server";
+    const parsed = parseGitCommitInput(input);
+    if (!parsed) throw new RepoRouteError("error");
     return authed(async () => {
       const commit = parseCommitDiff(await edgeGet(
-        `/v1/git/repos/${seg(input.repo)}/commit/${seg(input.oid)}`,
+        `/v1/git/repos/${seg(parsed.repo)}/commit/${seg(parsed.oid)}`,
       ));
       if (!commit) throw new RepoRouteError("error");
       return commit;
