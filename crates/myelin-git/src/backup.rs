@@ -61,6 +61,7 @@ pub use myelin_storage::backup::StoreTier;
 /// The artifact magic + version. Bumping the version is a format break (the deserializer refuses an
 /// unknown magic loudly — never a silent mis-parse).
 const MAGIC: &[u8] = b"MYELIN-GIT-BACKUP-v1\0";
+const MAX_BACKUP_REFS: usize = 1_000_000;
 
 // ───────────────────────────── errors ────────────────────────────────────────────────────────────
 
@@ -142,6 +143,11 @@ impl GitRepoBackup {
         // (1) Ref-snapshot point FIRST. Objects are immutable/append-only, so the closure reachable
         // from these exact tips is frozen — the backed-up refs will only point at backed-up objects.
         let refs = repo.list_refs()?;
+        if refs.len() > MAX_BACKUP_REFS {
+            return Err(GitBackupError::BadArtifact(format!(
+                "ref snapshot exceeds the {MAX_BACKUP_REFS} ref artifact limit"
+            )));
+        }
 
         // (2) Pack the full closure with libgit2. Open the same on-disk bare repo GT-001 manages.
         let git = git2::Repository::open(repo.path())
@@ -220,27 +226,60 @@ impl GitRepoBackup {
             )));
         }
         let ref_count = cur.take_u32()? as usize;
-        let mut refs = Vec::with_capacity(ref_count);
+        let minimum_ref_bytes = ref_count.checked_mul(8).ok_or_else(|| {
+            GitBackupError::BadArtifact("ref-count size overflow in artifact frame".into())
+        })?;
+        if ref_count > MAX_BACKUP_REFS
+            || minimum_ref_bytes.saturating_add(8) > cur.remaining()
+        {
+            return Err(GitBackupError::BadArtifact(format!(
+                "impossible or excessive ref count {ref_count}"
+            )));
+        }
+        let mut refs = Vec::new();
+        refs.try_reserve(ref_count.min(1024)).map_err(|_| {
+            GitBackupError::BadArtifact("cannot allocate backup ref parser state".into())
+        })?;
         for _ in 0..ref_count {
             let nlen = cur.take_u32()? as usize;
             let name = std::str::from_utf8(cur.take(nlen)?)
                 .map_err(|e| GitBackupError::BadArtifact(format!("ref name not utf8: {e}")))?
                 .to_string();
+            if !git2::Reference::is_valid_name(&name) {
+                return Err(GitBackupError::BadArtifact(format!(
+                    "invalid fully-qualified ref name `{name}`"
+                )));
+            }
             let olen = cur.take_u32()? as usize;
             let oid = std::str::from_utf8(cur.take(olen)?)
                 .map_err(|e| GitBackupError::BadArtifact(format!("ref oid not utf8: {e}")))?
                 .to_string();
+            git2::Oid::from_str(&oid).map_err(|e| {
+                GitBackupError::BadArtifact(format!("invalid oid for ref `{name}`: {e}"))
+            })?;
             refs.push((name, Oid::new(oid)));
         }
-        let pack_len = cur.take_u64()? as usize;
+        let pack_len = usize::try_from(cur.take_u64()?).map_err(|_| {
+            GitBackupError::BadArtifact("pack length exceeds this host's address space".into())
+        })?;
         let pack = cur.take(pack_len)?.to_vec();
+        if cur.remaining() != 0 {
+            return Err(GitBackupError::BadArtifact(format!(
+                "{} trailing bytes after backup frame",
+                cur.remaining()
+            )));
+        }
         Ok(GitRepoBackup { refs, pack })
     }
 
     /// Write the artifact to an off-host file (the real backup blob on disk).
     pub fn write_to_file(&self, path: &Path) -> Result<(), GitBackupError> {
-        std::fs::write(path, self.serialize())
-            .map_err(|e| GitBackupError::Io(format!("write artifact {}: {e}", path.display())))
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        crate::durable::write_file_atomic(parent, path, &self.serialize())
+            .map_err(GitBackupError::Durable)
     }
 
     /// Read + reconstruct the artifact from an off-host file.
@@ -279,6 +318,10 @@ impl<'a> Cursor<'a> {
         let slice = &self.bytes[self.pos..end];
         self.pos = end;
         Ok(slice)
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
     }
 
     fn take_u32(&mut self) -> Result<u32, GitBackupError> {
@@ -489,6 +532,24 @@ mod tests {
         t.extend_from_slice(&5u32.to_be_bytes()); // claims 5 refs, then nothing
         assert!(matches!(
             GitRepoBackup::deserialize(&t),
+            Err(GitBackupError::BadArtifact(_))
+        ));
+
+        let mut count_bomb = MAGIC.to_vec();
+        count_bomb.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            GitRepoBackup::deserialize(&count_bomb),
+            Err(GitBackupError::BadArtifact(_))
+        ));
+
+        let empty = GitRepoBackup {
+            refs: Vec::new(),
+            pack: Vec::new(),
+        };
+        let mut trailing = empty.serialize();
+        trailing.extend_from_slice(b"garbage");
+        assert!(matches!(
+            GitRepoBackup::deserialize(&trailing),
             Err(GitBackupError::BadArtifact(_))
         ));
     }
