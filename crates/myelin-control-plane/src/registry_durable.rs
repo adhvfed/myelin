@@ -39,7 +39,10 @@ use myelin_tenancy::{CellId, TenantId};
 use crate::placement_of::{MisrouteAuditRecord, PlacementOf};
 // One converter set for the whole crate (W6d): the opaque-text <-> typed-enum mappers live in
 // `crate::registry` (the role-struct's own Pg arm uses them) and are reused here.
-use crate::registry::{cell_to_durable, durable_to_cell, durable_to_placement, placement_to_durable};
+use crate::registry::{
+    cell_to_durable, corrupt_row_panic, durable_to_cell, durable_to_placement, placement_db_panic,
+    placement_to_durable,
+};
 #[cfg(any(test, feature = "test-support"))]
 use crate::registry::Registry;
 use crate::schema::{Cell, TenantPlacement};
@@ -148,9 +151,10 @@ impl DurablePlacementRegistry {
             PlacementBackend::Memory(reg) => reg.cell(cell_id),
             PlacementBackend::Pg(pg) => pg
                 .block(pg.placement.get_cell(cell_id.as_str()))
-                .ok()
-                .flatten()
-                .and_then(|r| durable_to_cell(&r)),
+                .unwrap_or_else(|e| placement_db_panic("cell read", &e))
+                .map(|r| {
+                    durable_to_cell(&r).unwrap_or_else(|| corrupt_row_panic("cell", &r.cell_id))
+                }),
         }
     }
 
@@ -181,9 +185,11 @@ impl DurablePlacementRegistry {
             PlacementBackend::Memory(reg) => reg.placement(tenant_id),
             PlacementBackend::Pg(pg) => pg
                 .block(pg.placement.get_placement(tenant_id.as_str()))
-                .ok()
-                .flatten()
-                .and_then(|r| durable_to_placement(&r)),
+                .unwrap_or_else(|e| placement_db_panic("placement read", &e))
+                .map(|r| {
+                    durable_to_placement(&r)
+                        .unwrap_or_else(|| corrupt_row_panic("tenant_placement", &r.tenant_id))
+                }),
         }
     }
 
@@ -228,7 +234,9 @@ impl DurablePlacementRegistry {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             PlacementBackend::Memory(_) => 0,
-            PlacementBackend::Pg(pg) => pg.block(pg.audit.count()).unwrap_or(0),
+            PlacementBackend::Pg(pg) => pg
+                .block(pg.audit.count())
+                .unwrap_or_else(|e| placement_db_panic("misroute-audit count", &e)),
         }
     }
 }
