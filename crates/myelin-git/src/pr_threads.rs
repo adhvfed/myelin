@@ -542,6 +542,9 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         if let Some(lock) = locks.get(&path).and_then(Weak::upgrade) {
             return Ok(lock);
         }
+        // A subject's last operation drops its strong Arc. Prune those dead weak entries on each
+        // cache miss so tenant-created PR cardinality cannot become permanent process memory.
+        locks.retain(|_, weak| weak.strong_count() > 0);
         let lock = Arc::new(Mutex::new(()));
         locks.insert(path, Arc::downgrade(&lock));
         Ok(lock)
@@ -1114,6 +1117,34 @@ mod tests {
             .collect();
         assert_eq!(bodies.len(), WRITERS, "every writer remains distinguishable");
         drop(store);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn subject_lock_registry_prunes_inactive_subjects() {
+        let root = temp_root("subject-lock-registry");
+        let store = DurablePrThreadStore::rooted(&root);
+
+        let first = store.subject_lock(&loc(), "pr:core:1").unwrap();
+        let same = store.subject_lock(&loc(), "pr:core:1").unwrap();
+        assert!(Arc::ptr_eq(&first, &same), "overlapping operations share one lock");
+        drop(first);
+        drop(same);
+
+        for number in 2..=2_000 {
+            let lock = store
+                .subject_lock(&loc(), &format!("pr:core:{number}"))
+                .unwrap();
+            drop(lock);
+        }
+
+        let locks = store.subject_locks.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(locks.len(), 1, "dead subject keys must not accumulate");
+        assert_eq!(
+            locks.values().filter(|weak| weak.strong_count() > 0).count(),
+            0,
+            "the final inactive entry is only a weak cache placeholder"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
