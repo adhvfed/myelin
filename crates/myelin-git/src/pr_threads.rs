@@ -244,7 +244,22 @@ pub struct ThreadAnchor {
     pub path: String,
     #[serde(default)]
     pub line: Option<u64>,
+    /// Which side of the reviewed diff the line number names. `None` is legacy-data only.
+    #[serde(default)]
+    pub side: Option<AnchorSide>,
+    /// Immutable diff identity captured when the anchor was admitted. Absent on legacy rows.
+    #[serde(default)]
+    pub base_oid: Option<String>,
+    #[serde(default)]
+    pub head_oid: Option<String>,
     pub anchor_state: AnchorState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorSide {
+    Old,
+    New,
 }
 
 /// The anchor's resolved state (reference-chip §5 vocabulary). Never a silent wrong-line re-anchor.

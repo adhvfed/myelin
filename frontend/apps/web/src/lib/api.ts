@@ -226,6 +226,9 @@ export interface PrincipalVM {
 export interface PrAnchorVM {
   path: string;
   line: number | null;
+  side: "old" | "new" | null;
+  base_oid: string | null;
+  head_oid: string | null;
   anchor_state: "live" | "moved" | "outdated";
 }
 

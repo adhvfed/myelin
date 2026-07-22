@@ -53,7 +53,7 @@ use myelin_git::pr_store::{
     DurablePrStore, MergeAttempt, PrRecord, ReviewRecord,
 };
 use myelin_git::pr_threads::{
-    AnchorState, BatchVerdict, CommentRecord, CommentState, DurablePrThreadStore,
+    AnchorSide, AnchorState, BatchVerdict, CommentRecord, CommentState, DurablePrThreadStore,
     PendingCommentRequest, PrincipalRole, ReviewBatch, SubmitReviewRequest, ThreadAnchor,
     ThreadPrincipal, ThreadRecord, ViewedThreads,
 };
@@ -2022,6 +2022,52 @@ impl DurableGitBackend {
             .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))
     }
 
+    /// Resolve a requested line against the current authoritative PR diff and capture the immutable
+    /// revision pair used for the decision. A stale or fabricated path/side/line never becomes a
+    /// misleading `live` anchor.
+    fn resolve_thread_anchor(
+        &self,
+        loc: &RepoLoc,
+        rec: &PrRecord,
+        mut anchor: ThreadAnchor,
+    ) -> Result<ThreadAnchor, DurableError> {
+        let side = anchor
+            .side
+            .ok_or_else(|| DurableError::Git("anchor side is missing".into()))?;
+        let line = anchor
+            .line
+            .and_then(|line| u32::try_from(line).ok())
+            .filter(|line| *line > 0)
+            .ok_or_else(|| DurableError::Git("anchor line is invalid".into()))?;
+        let repo = self.store.open_repo(loc)?;
+        let diff = repo
+            .pr_diff(&rec.base_ref, &rec.head_oid, PR_DIFF_PER_FILE_LINE_CAP)?
+            .ok_or_else(|| DurableError::Git("anchor diff is unavailable".into()))?;
+        let resolved = diff.files.iter().any(|file| {
+            let side_path = match side {
+                AnchorSide::Old => file.old_path.as_deref().unwrap_or(file.path.as_str()),
+                AnchorSide::New => file.path.as_str(),
+            };
+            let path_matches = side_path == anchor.path;
+            path_matches
+                && file.hunks.iter().any(|hunk| {
+                    hunk.lines.iter().any(|candidate| match side {
+                        AnchorSide::Old => candidate.old_no == Some(line),
+                        AnchorSide::New => candidate.new_no == Some(line),
+                    })
+                })
+        });
+        if !resolved {
+            return Err(DurableError::Git(
+                "anchor path and line are not present in the current pull request diff".into(),
+            ));
+        }
+        anchor.base_oid = Some(diff.base_oid);
+        anchor.head_oid = Some(diff.head_oid);
+        anchor.anchor_state = AnchorState::Live;
+        Ok(anchor)
+    }
+
     /// **GET …/prs/{n}/threads — the viewer-scoped conversation.** Read = PR view (the `Pull` guard).
     /// Pending review-batch comments authored by OTHERS never enter the projection (non-leak by
     /// construction — `SubjectThreads::view_for`).
@@ -2053,10 +2099,12 @@ impl DurableGitBackend {
         principal: &Principal,
     ) -> Result<Value, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        self.require_pr(&loc, number, principal)?;
+        let rec = self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
         let body_md = require_body_md(body)?;
-        let anchor = parse_anchor(body);
+        let anchor = parse_anchor(body)?
+            .map(|anchor| self.resolve_thread_anchor(&loc, &rec, anchor))
+            .transpose()?;
         let author = Self::thread_principal(tenant, principal);
         let thread = self
             .threads
@@ -2152,10 +2200,12 @@ impl DurableGitBackend {
             principal,
         } = repo;
         let loc = Self::loc(tenant, region, slug);
-        self.require_pr(&loc, number, principal)?;
+        let rec = self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
         let body_md = require_body_md(body)?;
-        let anchor = parse_anchor(body);
+        let anchor = parse_anchor(body)?
+            .map(|anchor| self.resolve_thread_anchor(&loc, &rec, anchor))
+            .transpose()?;
         let author = Self::thread_principal(tenant, principal);
         let request =
             PendingCommentRequest::new(loc, key, review_id, anchor, author, body_md, now_unix())?;
@@ -2720,18 +2770,59 @@ fn require_body_md(body: &Value) -> Result<String, DurableError> {
         .ok_or_else(|| DurableError::Git("comment body missing a non-empty `body_md`".into()))
 }
 
-/// Parse an optional diff-line content anchor from a POST body (`{ anchor: { path, line, side? } }`).
-/// A fresh anchor is authored `live`; the store's re-resolution (moved/outdated) is the diff pack's
-/// concern. `None` (absent anchor) = a PR-level discussion thread.
-fn parse_anchor(body: &Value) -> Option<ThreadAnchor> {
-    let a = body.get("anchor")?;
-    let path = a.get("path").and_then(Value::as_str)?.to_string();
-    let line = a.get("line").and_then(Value::as_u64);
-    Some(ThreadAnchor {
-        path,
-        line,
+/// Parse an optional diff-line content anchor from a POST body. A line anchor must fully specify
+/// `{ path, line, side }`; the caller then resolves it against the current authoritative PR diff.
+/// `None` (absent anchor) means a PR-level discussion thread.
+fn parse_anchor(body: &Value) -> Result<Option<ThreadAnchor>, DurableError> {
+    let Some(value) = body.get("anchor") else {
+        return Ok(None);
+    };
+    let anchor = value
+        .as_object()
+        .ok_or_else(|| DurableError::Git("anchor must be an object".into()))?;
+    if anchor.len() != 3
+        || !anchor.contains_key("path")
+        || !anchor.contains_key("line")
+        || !anchor.contains_key("side")
+    {
+        return Err(DurableError::Git(
+            "anchor must contain exactly path, line, and side".into(),
+        ));
+    }
+    let path = anchor
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| valid_anchor_path(path))
+        .ok_or_else(|| DurableError::Git("anchor path is invalid".into()))?;
+    let line = anchor
+        .get("line")
+        .and_then(Value::as_u64)
+        .filter(|line| *line > 0 && *line <= u32::MAX as u64)
+        .ok_or_else(|| DurableError::Git("anchor line is invalid".into()))?;
+    let side = match anchor.get("side").and_then(Value::as_str) {
+        Some("old") => AnchorSide::Old,
+        Some("new") => AnchorSide::New,
+        _ => return Err(DurableError::Git("anchor side is invalid".into())),
+    };
+    Ok(Some(ThreadAnchor {
+        path: path.to_string(),
+        line: Some(line),
+        side: Some(side),
+        base_oid: None,
+        head_oid: None,
         anchor_state: AnchorState::Live,
-    })
+    }))
+}
+
+fn valid_anchor_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 4 * 1024
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.chars().any(char::is_control)
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
 fn principal_role_token(role: PrincipalRole) -> &'static str {
@@ -2779,6 +2870,9 @@ fn thread_json(t: &ThreadRecord) -> Value {
         "anchor": t.anchor.as_ref().map(|a| json!({
             "path": a.path,
             "line": a.line,
+            "side": a.side.map(|side| match side { AnchorSide::Old => "old", AnchorSide::New => "new" }),
+            "base_oid": a.base_oid,
+            "head_oid": a.head_oid,
             "anchor_state": anchor_state_token(a.anchor_state),
         })),
         "resolved": t.resolved,
@@ -3019,7 +3113,8 @@ fn map_durable_err(e: DurableError) -> EdgeError {
                 || m.contains("segment")
                 || m.contains("slug")
                 || m.contains("missing")
-                || m.contains("exceeds") =>
+                || m.contains("exceeds")
+                || m.contains("anchor") =>
         {
             EdgeError::BadRequest(m)
         }
@@ -5469,6 +5564,59 @@ mod pr_thread_tests {
         )
         .unwrap();
         (Arc::new(be), reader, head.0)
+    }
+
+    #[test]
+    fn line_anchors_are_strictly_validated_and_revision_bound() {
+        let (be, reviewer, head) = setup_diff("anchors");
+        let new_side = be
+            .create_thread(
+                TENANT,
+                REGION,
+                SLUG,
+                1,
+                &json!({
+                    "body_md": "new-side note",
+                    "anchor": { "path": "file.txt", "line": 4, "side": "new" },
+                }),
+                &reviewer,
+            )
+            .expect("a displayed new-side line resolves");
+        assert_eq!(new_side["anchor"]["side"], "new");
+        assert_eq!(new_side["anchor"]["head_oid"], head);
+        assert_eq!(new_side["anchor"]["base_oid"].as_str().unwrap().len(), 40);
+
+        let old_side = be
+            .create_thread(
+                TENANT,
+                REGION,
+                SLUG,
+                1,
+                &json!({
+                    "body_md": "old-side note",
+                    "anchor": { "path": "file.txt", "line": 2, "side": "old" },
+                }),
+                &reviewer,
+            )
+            .expect("a displayed old-side line resolves");
+        assert_eq!(old_side["anchor"]["side"], "old");
+
+        for invalid in [
+            json!({ "body_md": "missing side", "anchor": { "path": "file.txt", "line": 2 } }),
+            json!({ "body_md": "stale line", "anchor": { "path": "file.txt", "line": 99, "side": "new" } }),
+            json!({ "body_md": "unsafe path", "anchor": { "path": "../secret", "line": 1, "side": "new" } }),
+        ] {
+            let error = be
+                .create_thread(TENANT, REGION, SLUG, 1, &invalid, &reviewer)
+                .expect_err("malformed or stale anchor must be rejected");
+            assert!(error.to_string().contains("anchor"), "got {error:?}");
+        }
+
+        let stored = be
+            .threads
+            .load(&DurableGitBackend::loc(TENANT, REGION, SLUG), "pr:core:1")
+            .unwrap();
+        assert_eq!(stored.threads.len(), 2, "invalid anchors persisted nothing");
     }
 
     /// **R3.2 · G-7 N1 — the PR diff is `Pull`-guarded, 0-leak, three-dot, count-only restricted.** A
