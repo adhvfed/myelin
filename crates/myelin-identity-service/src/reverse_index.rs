@@ -204,6 +204,12 @@ impl ReverseIndex {
         row: ReverseRow,
         zookie: &Zookie,
     ) {
+        // Keep the primitive fail-closed even when a drill or reindex drives it directly. The live
+        // consumer validates the whole event before calling this method; an unknown operation must
+        // never advance the watermark when this lower-level seam is used on its own.
+        if !matches!(op, "add" | "remove") {
+            return;
+        }
         // The tenant-predicate floor: the apply is built from the verified scope (no cross-tenant
         // write path). The thin `(tenant, region)` predicate is carried on the statement.
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S8_TABLE));
@@ -221,9 +227,7 @@ impl ReverseIndex {
             "remove" => {
                 partition.rows.remove(&row.key());
             }
-            // An unknown op is genuine uncertainty — the projection is NOT mutated (fail-closed:
-            // a malformed delta never silently adds a grant). The consumer surfaces it loudly.
-            _ => {}
+            _ => unreachable!("operation was validated before locking the projection"),
         }
         // Advance the watermark monotonically (the §8.7 revision_watermark). The zookie strings are
         // the zero-padded `zk-<rev>` form (S3 mints them), so lexical order == revision order — a
@@ -437,42 +441,75 @@ impl ReverseIndexConsumer {
             }
         };
 
-        // The deltas (opaque object#relation@subject refs). A missing/empty deltas array is a no-op
-        // write the projection ignores (it still advances the watermark below — an empty write is a
-        // valid revision bump). Each delta is `{op, object, relation, subject}`.
+        // The deltas (opaque object#relation@subject refs). An empty array is a valid no-op revision
+        // bump, but a missing/non-array field is a malformed producer contract. Parse EVERY delta
+        // before applying any of them so one poison cannot partially mutate S8 or advance its
+        // watermark. Each delta is `{op, object, relation, subject}`.
         let deltas = ev
             .payload
             .get("deltas")
             .and_then(|d| d.as_array())
-            .cloned()
-            .unwrap_or_default();
+            .ok_or_else(|| "iam.tuple_written event carries no deltas array".to_string())?;
+
+        struct ValidatedDelta<'a> {
+            op: &'a str,
+            object: &'a str,
+            relation: &'a str,
+            subject: &'a str,
+        }
+
+        fn required_delta_field<'a>(
+            delta: &'a serde_json::Value,
+            index: usize,
+            field: &str,
+        ) -> Result<&'a str, String> {
+            delta
+                .as_object()
+                .and_then(|object| object.get(field))
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    format!("iam.tuple_written delta {index} has no non-empty `{field}` string")
+                })
+        }
+
+        let validated = deltas
+            .iter()
+            .enumerate()
+            .map(|(index, delta)| {
+                let op = required_delta_field(delta, index, "op")?;
+                if !matches!(op, "add" | "remove") {
+                    return Err(format!(
+                        "iam.tuple_written delta {index} has unknown operation `{op}`"
+                    ));
+                }
+                Ok(ValidatedDelta {
+                    op,
+                    object: required_delta_field(delta, index, "object")?,
+                    relation: required_delta_field(delta, index, "relation")?,
+                    subject: required_delta_field(delta, index, "subject")?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
 
         let mut applied_any = false;
-        for d in &deltas {
-            let op = d.get("op").and_then(|v| v.as_str()).unwrap_or("");
-            let object = d.get("object").and_then(|v| v.as_str()).unwrap_or("");
-            let relation = d.get("relation").and_then(|v| v.as_str()).unwrap_or("");
-            let subject = d.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+        for delta in validated {
             // A delta whose subject is a USERSET (`obj#rel`) is an inheritance edge, not a direct
             // `(subject, relation, object)` projection — S8 projects the DIRECT subject grants the
             // JOIN keys on (a principal id, never a `#`-bearing userset). The userset-expansion
             // (list_subjects at density) is P-ID-13; the reverse index of DIRECT grants is here.
-            if subject.is_empty()
-                || object.is_empty()
-                || relation.is_empty()
-                || subject.contains('#')
-            {
+            if delta.subject.contains('#') {
                 continue;
             }
-            let object_type = ObjectType(type_of_object_id(object));
+            let object_type = ObjectType(type_of_object_id(delta.object));
             self.index.apply_delta(
                 &scope,
-                op,
+                delta.op,
                 &object_type,
                 ReverseRow {
-                    subject: PrincipalId(subject.to_string()),
-                    relation: RelName(relation.to_string()),
-                    object_id: ObjectId(object.to_string()),
+                    subject: PrincipalId(delta.subject.to_string()),
+                    relation: RelName(delta.relation.to_string()),
+                    object_id: ObjectId(delta.object.to_string()),
                 },
                 &zookie,
             );
@@ -903,5 +940,100 @@ mod tests {
         );
         // Nothing was projected and the watermark did not advance.
         assert_eq!(index.watermark(&scope("acme")), Zookie(String::new()));
+    }
+
+    /// **A malformed delta cannot leave a revoked grant behind while claiming S8 is current.** The
+    /// consumer validates the complete batch before applying its first delta, returns the poison as
+    /// non-retryable, and leaves both rows and watermark at the last known-good revision.
+    #[test]
+    fn malformed_delta_rejects_the_whole_event_without_advancing_watermark() {
+        use myelin_events::{
+            Actor, AggregateKey, CorrelationId, DataRole, EventId, EventType, Visibility,
+        };
+        let index = ReverseIndex::new();
+        let consumer = ReverseIndexConsumer::new(index.clone());
+        let s = scope("acme");
+        let last_good = Zookie("zk-00000000000000000001".into());
+        index.apply_delta(
+            &s,
+            "add",
+            &ObjectType("repo".into()),
+            ReverseRow {
+                subject: PrincipalId("p:alice".into()),
+                relation: RelName("reader".into()),
+                object_id: ObjectId("repo:core".into()),
+            },
+            &last_good,
+        );
+
+        let ev = EventEnvelope {
+            event_id: EventId("e-malformed-delta".into()),
+            type_: EventType(IAM_TUPLE_WRITTEN.into()),
+            schema_ver: 1,
+            tenant: TenantId("acme".into()),
+            region: Region("eu-west".into()),
+            actor: Actor(actor_in("acme")),
+            subject: myelin_events::ArtifactRef("myelin://acme/iam/tuple/repo:core".into()),
+            aggregate: AggregateKey("iam:tuple:acme:repo:core".into()),
+            causation_id: None,
+            correlation_id: CorrelationId("c-malformed-delta".into()),
+            caused_by: None,
+            depth: 0,
+            contains_personal_data: false,
+            data_role: DataRole::Controller,
+            visibility: Visibility::Internal,
+            pii_key_ref: None,
+            occurred_at: now(),
+            recorded_at: now(),
+            payload: serde_json::json!({
+                "zookie": "zk-00000000000000000002",
+                "deltas": [
+                    {
+                        "op": "add",
+                        "object": "repo:other",
+                        "relation": "reader",
+                        "subject": "p:bob"
+                    },
+                    {
+                        "op": "delete",
+                        "object": "repo:core",
+                        "relation": "reader",
+                        "subject": "p:alice"
+                    }
+                ]
+            }),
+        };
+
+        let outcome = consumer.handle(&ev, &mut myelin_events::HandlerTx::none());
+        assert!(
+            matches!(outcome, HandleOutcome::NonRetryable(_)),
+            "an unknown delta operation is a non-retryable producer poison"
+        );
+        assert_eq!(
+            index.watermark(&s),
+            last_good,
+            "a rejected event cannot claim its newer revision was projected"
+        );
+        assert_eq!(
+            index.objects_for(
+                &s,
+                &ObjectType("repo".into()),
+                &PrincipalId("p:alice".into()),
+                &RelName("reader".into())
+            ),
+            vec![ObjectId("repo:core".into())],
+            "the last known-good projection remains intact"
+        );
+        assert!(
+            index
+                .objects_for(
+                    &s,
+                    &ObjectType("repo".into()),
+                    &PrincipalId("p:bob".into()),
+                    &RelName("reader".into())
+                )
+                .is_empty(),
+            "validation finishes before the first delta mutates the projection"
+        );
     }
 }
