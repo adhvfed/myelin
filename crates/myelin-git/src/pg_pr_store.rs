@@ -32,8 +32,9 @@ use crate::events::{
 };
 use crate::lifecycle::PrState;
 use crate::pr_store::{
-    ensure_pr_record_size, evaluate_merge, DurablePrStore, MergeAttempt, MergeEval, PrListCounts,
-    PrListQuery, PrListSlice, PrListSort, PrListState, PrRecord,
+    ensure_pr_record_size, evaluate_merge, DurablePrStore, MergeAttempt, MergeEval,
+    PrCrossListQuery, PrCrossListRecord, PrCrossListSlice, PrListBucket, PrListCounts, PrListQuery,
+    PrListSlice, PrListSort, PrListState, PrRecord, PR_LIST_OFFSET_MAX,
 };
 use crate::receive_pack::{
     CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome, PushSession,
@@ -94,6 +95,66 @@ fn pr_list_page_sql(query: &PrListQuery) -> String {
         columns = PR_RECORD_COLUMNS,
         state = pr_list_state_predicate(query.state),
     )
+}
+
+fn pr_cross_bucket_predicate(bucket: PrListBucket) -> &'static str {
+    match bucket {
+        PrListBucket::Yours => "g.record->>'author_pseudonym' = $4",
+        PrListBucket::NeedsReview => "g.record->>'author_pseudonym' <> $4 \
+             AND g.record->>'state' IN ('Open','Draft') \
+             AND (g.record->'reviews') @> jsonb_build_array(\
+               jsonb_build_object('reviewer_pseudonym',$4,'state','Requested'))",
+    }
+}
+
+fn pr_cross_list_page_sql(query: &PrCrossListQuery) -> String {
+    let page_order = match query.sort {
+        PrListSort::Created => "g.number DESC, g.repo_slug ASC",
+        PrListSort::Updated => {
+            "((g.record->>'updated_at')::bigint) DESC NULLS LAST, g.number DESC, g.repo_slug ASC"
+        }
+    };
+    let output_order = match query.sort {
+        PrListSort::Created => "p.page_number DESC NULLS LAST, p.page_repo_slug ASC NULLS LAST",
+        PrListSort::Updated => "p.page_updated_at DESC NULLS LAST, p.page_number DESC NULLS LAST, \
+             p.page_repo_slug ASC NULLS LAST",
+    };
+    let predicate = pr_cross_bucket_predicate(query.bucket);
+    format!(
+        "WITH counts AS (\
+           SELECT count(*)::bigint AS bucket_count FROM git_pr g \
+            WHERE g.tenant_id=$1 AND g.region=$2 AND g.repo_slug = ANY($3) AND ({predicate})\
+         ), page_rows AS (\
+           SELECT g.repo_slug AS page_repo_slug, g.{columns}, g.number AS page_number, \
+                  (g.record->>'updated_at')::bigint AS page_updated_at FROM git_pr g \
+            WHERE g.tenant_id=$1 AND g.region=$2 AND g.repo_slug = ANY($3) AND ({predicate}) \
+            ORDER BY {page_order} LIMIT $6 OFFSET $5\
+         ) SELECT c.bucket_count,p.page_repo_slug,p.page_number,p.page_updated_at,\
+                p.record,p.head_repo_slug,p.title_nonce,p.title_ciphertext,p.title_pii_key_ref,\
+                p.body_nonce,p.body_ciphertext,p.body_pii_key_ref,p.author_subject_id \
+           FROM counts c LEFT JOIN page_rows p ON TRUE ORDER BY {output_order}",
+        columns = PR_RECORD_COLUMNS,
+    )
+}
+
+fn validate_cross_visible_slugs(slugs: &[String]) -> Result<(), DurableError> {
+    if slugs.len() > PR_LIST_OFFSET_MAX {
+        return Err(DurableError::Git(
+            "cross-repository PR visible set exceeds 10000 repositories".into(),
+        ));
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    for slug in slugs {
+        crate::gix_backend::validate_repo_slug(slug).map_err(|_| {
+            DurableError::Git("cross-repository PR visible set contains invalid slug".into())
+        })?;
+        if !unique.insert(slug) {
+            return Err(DurableError::Git(
+                "cross-repository PR visible set contains duplicate slug".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub const CREATE_GIT_PR_COUNTER_DDL: &str = r#"
@@ -184,6 +245,34 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_repo_state_created_list_idx
   ON git_pr (tenant_id, region, repo_slug, (record->>'state'), number DESC)
 "#;
 
+pub const CREATE_GIT_PR_CROSS_UPDATED_LIST_INDEX_DDL: &str = r#"
+CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_cross_updated_list_idx
+  ON git_pr (
+    tenant_id, region,
+    ((record->>'updated_at')::bigint) DESC NULLS LAST,
+    number DESC, repo_slug ASC
+  )
+"#;
+
+pub const CREATE_GIT_PR_CROSS_CREATED_LIST_INDEX_DDL: &str = r#"
+CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_cross_created_list_idx
+  ON git_pr (tenant_id, region, number DESC, repo_slug ASC)
+"#;
+
+pub const CREATE_GIT_PR_REVIEWS_GIN_INDEX_DDL: &str = r#"
+CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_reviews_gin_idx
+  ON git_pr USING gin ((record->'reviews') jsonb_path_ops)
+"#;
+
+pub const CREATE_GIT_PR_AUTHOR_UPDATED_LIST_INDEX_DDL: &str = r#"
+CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_author_updated_list_idx
+  ON git_pr (
+    tenant_id, region, (record->>'author_pseudonym'),
+    ((record->>'updated_at')::bigint) DESC NULLS LAST,
+    number DESC, repo_slug ASC
+  )
+"#;
+
 pub const CREATE_GIT_PR_COMMAND_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS git_pr_command (
   tenant_id text NOT NULL CHECK (length(tenant_id) > 0),
@@ -265,6 +354,30 @@ pub fn git_pr_migrations() -> Migrations {
         Migration::phased(
             "git_0009_pr_repo_state_created_list_index",
             CREATE_GIT_PR_REPO_STATE_CREATED_LIST_INDEX_DDL,
+            MigrationPhase::Expand,
+            GIT_PR_TABLE,
+        ),
+        Migration::phased(
+            "git_0010_pr_cross_updated_list_index",
+            CREATE_GIT_PR_CROSS_UPDATED_LIST_INDEX_DDL,
+            MigrationPhase::Expand,
+            GIT_PR_TABLE,
+        ),
+        Migration::phased(
+            "git_0011_pr_cross_created_list_index",
+            CREATE_GIT_PR_CROSS_CREATED_LIST_INDEX_DDL,
+            MigrationPhase::Expand,
+            GIT_PR_TABLE,
+        ),
+        Migration::phased(
+            "git_0012_pr_reviews_gin_index",
+            CREATE_GIT_PR_REVIEWS_GIN_INDEX_DDL,
+            MigrationPhase::Expand,
+            GIT_PR_TABLE,
+        ),
+        Migration::phased(
+            "git_0013_pr_author_updated_list_index",
+            CREATE_GIT_PR_AUTHOR_UPDATED_LIST_INDEX_DDL,
             MigrationPhase::Expand,
             GIT_PR_TABLE,
         ),
@@ -438,6 +551,24 @@ struct VerifiedRepoScope {
     loc: RepoLoc,
 }
 
+#[derive(Clone)]
+struct VerifiedCellScope {
+    tenant_id: TenantId,
+    region: Region,
+}
+
+impl VerifiedCellScope {
+    fn new(scope: &TenantScope, provider_region: &str) -> Result<Self, DurableError> {
+        if scope.region().0 != provider_region || scope.tenant().0.is_empty() {
+            return Err(DurableError::NotFound("repository partition".into()));
+        }
+        Ok(Self {
+            tenant_id: scope.tenant().clone(),
+            region: scope.region().clone(),
+        })
+    }
+}
+
 impl VerifiedRepoScope {
     fn new(scope: &TenantScope, repo: &str, provider_region: &str) -> Result<Self, DurableError> {
         if scope.region().0 != provider_region {
@@ -527,6 +658,10 @@ impl PgPrStore {
         repo: &str,
     ) -> Result<VerifiedRepoScope, DurableError> {
         VerifiedRepoScope::new(scope, repo, &self.provider.config().region)
+    }
+
+    fn scoped_cell(&self, scope: &TenantScope) -> Result<VerifiedCellScope, DurableError> {
+        VerifiedCellScope::new(scope, &self.provider.config().region)
     }
 
     fn emit_context(
@@ -760,6 +895,91 @@ impl PgPrStore {
             records,
             counts,
             total: counts.filtered_total(query.state),
+            offset: query.offset,
+            has_more,
+        })
+    }
+
+    /// One-statement cross-repository bucket page over the already-authorized visible slug set.
+    pub fn list_cross_page(
+        &self,
+        scope: &TenantScope,
+        visible_slugs: &[String],
+        query: &PrCrossListQuery,
+    ) -> Result<PrCrossListSlice, DurableError> {
+        query.validate()?;
+        let cell = self.scoped_cell(scope)?;
+        validate_cross_visible_slugs(visible_slugs)?;
+        if visible_slugs.is_empty() {
+            return Ok(PrCrossListSlice {
+                records: Vec::new(),
+                total: 0,
+                offset: query.offset,
+                has_more: false,
+            });
+        }
+        let provider = self.provider.clone();
+        let kms = self.kms.clone();
+        let tenant_id = cell.tenant_id;
+        let region = cell.region;
+        let transaction_tenant = tenant_id.0.clone();
+        let crypto_region = region.clone();
+        let expected_tenant = tenant_id.0.clone();
+        let slugs = visible_slugs.to_vec();
+        let offset = i64::try_from(query.offset)
+            .map_err(|_| DurableError::Git("pull request page offset is too large".into()))?;
+        let fetch_limit = i64::try_from(query.limit.saturating_add(1))
+            .map_err(|_| DurableError::Git("pull request page limit is too large".into()))?;
+        let sql = pr_cross_list_page_sql(query);
+        let viewer = query.viewer_pseudonym.clone();
+        let rows = self
+            .block_on(async move {
+                provider
+                    .with_tenant_tx(&transaction_tenant.clone(), move |conn| {
+                        Box::pin(async move {
+                            sqlx::query(&sql)
+                                .bind(&tenant_id.0)
+                                .bind(&region.0)
+                                .bind(&slugs)
+                                .bind(viewer)
+                                .bind(offset)
+                                .bind(fetch_limit)
+                                .fetch_all(&mut *conn)
+                                .await
+                                .map_err(|_| pg_query("page cross-repository PR list"))
+                        })
+                    })
+                    .await
+            })
+            .map_err(pg_error)?;
+        let summary = rows
+            .first()
+            .ok_or_else(|| DurableError::Io("cross-repository PR list summary is missing".into()))?;
+        let total: i64 = summary
+            .try_get("bucket_count")
+            .map_err(|_| DurableError::Io("cross-repository PR list count is malformed".into()))?;
+        let total = usize::try_from(total)
+            .map_err(|_| DurableError::Io("cross-repository PR list count is malformed".into()))?;
+        let mut records = Vec::with_capacity(query.limit);
+        let mut has_more = false;
+        for row in rows {
+            let repo_slug: Option<String> = row
+                .try_get("page_repo_slug")
+                .map_err(|_| DurableError::Io("cross-repository PR page row is malformed".into()))?;
+            if let Some(repo_slug) = repo_slug {
+                if records.len() == query.limit {
+                    has_more = true;
+                    continue;
+                }
+                records.push(PrCrossListRecord {
+                    repo_slug,
+                    record: decode_record(&kms, &crypto_region, &expected_tenant, row)?,
+                });
+            }
+        }
+        Ok(PrCrossListSlice {
+            records,
+            total,
             offset: query.offset,
             has_more,
         })
@@ -2712,6 +2932,10 @@ mod tests {
         assert!(CREATE_GIT_PR_REPO_UPDATED_LIST_INDEX_DDL.contains("tenant_id, region, repo_slug"));
         assert!(CREATE_GIT_PR_REPO_STATE_UPDATED_LIST_INDEX_DDL.contains("(record->>'state')"));
         assert!(CREATE_GIT_PR_REPO_STATE_CREATED_LIST_INDEX_DDL.contains("number DESC"));
+        assert!(CREATE_GIT_PR_CROSS_UPDATED_LIST_INDEX_DDL.contains("repo_slug ASC"));
+        assert!(CREATE_GIT_PR_CROSS_CREATED_LIST_INDEX_DDL.contains("number DESC, repo_slug ASC"));
+        assert!(CREATE_GIT_PR_REVIEWS_GIN_INDEX_DDL.contains("jsonb_path_ops"));
+        assert!(CREATE_GIT_PR_AUTHOR_UPDATED_LIST_INDEX_DDL.contains("author_pseudonym"));
         assert!(!CREATE_GIT_PR_DDL.contains("title text"));
         assert!(CREATE_GIT_PR_COUNTER_DDL.contains("PRIMARY KEY (tenant_id, region, repo_slug)"));
     }
@@ -2759,9 +2983,57 @@ mod tests {
     }
 
     #[test]
+    fn cross_page_query_is_visible_exact_bounded_and_backend_native() {
+        assert!(validate_cross_visible_slugs(&[]).is_ok());
+        assert!(validate_cross_visible_slugs(&["team/app".into(), "core".into()]).is_ok());
+        assert!(validate_cross_visible_slugs(&["core".into(), "core".into()]).is_err());
+        assert!(validate_cross_visible_slugs(&["../hidden".into()]).is_err());
+        assert!(validate_cross_visible_slugs(&vec!["core".into(); PR_LIST_OFFSET_MAX + 1]).is_err());
+        let needs_review = PrCrossListQuery::new(
+            PrListBucket::NeedsReview,
+            PrListSort::Updated,
+            25,
+            10,
+            "psn:viewer@tenant",
+        )
+        .unwrap();
+        let sql = pr_cross_list_page_sql(&needs_review);
+        assert_eq!(
+            sql.split(';').filter(|part| !part.trim().is_empty()).count(),
+            1
+        );
+        assert_eq!(
+            sql.matches("g.repo_slug = ANY($3)").count(),
+            2,
+            "the exact aggregate and bounded page share the authorized visible set"
+        );
+        assert_eq!(sql.matches("reviewer_pseudonym").count(), 2);
+        assert_eq!(sql.matches("@> jsonb_build_array").count(), 2);
+        assert!(!sql.contains("jsonb_array_elements"));
+        assert!(sql.contains("author_pseudonym' <> $4"));
+        assert!(sql.contains("state' IN ('Open','Draft')"));
+        assert!(sql.contains("LEFT JOIN page_rows p ON TRUE"));
+        assert!(sql.contains("LIMIT $6 OFFSET $5"));
+        assert!(sql.contains("g.number DESC, g.repo_slug ASC"));
+        assert!(!sql.contains("pg_column_size"));
+
+        let yours = PrCrossListQuery::new(
+            PrListBucket::Yours,
+            PrListSort::Created,
+            0,
+            100,
+            "psn:viewer@tenant",
+        )
+        .unwrap();
+        let sql = pr_cross_list_page_sql(&yours);
+        assert_eq!(sql.matches("author_pseudonym' = $4").count(), 2);
+        assert!(sql.contains("ORDER BY g.number DESC, g.repo_slug ASC LIMIT $6 OFFSET $5"));
+    }
+
+    #[test]
     fn migration_set_is_forward_only_and_declares_mutated_tables_hot() {
         let migrations = git_pr_migrations();
-        assert_eq!(migrations.0.len(), 9);
+        assert_eq!(migrations.0.len(), 13);
         for migration in &migrations.0 {
             let upper = migration.ddl.to_ascii_uppercase();
             assert!(!upper.contains("DROP TABLE"));
