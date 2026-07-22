@@ -38,6 +38,9 @@ import {
   parseGitPrInput,
   parseGitRepoInput,
   parseGitRepoPrsInput,
+  parseGitRefsInput,
+  gitRefsSearchParams,
+  type GitRefsInput,
 } from "./git-read-input";
 
 export type { IssueMutation, PrMutation } from "./mutation-input";
@@ -85,11 +88,19 @@ export interface RefRow {
   is_default?: boolean;
 }
 
+export interface PinnedRefRow extends RefRow {
+  kind: "branch" | "tag";
+  full_name: string;
+  is_default: boolean;
+}
+
 /** The ref switcher source (GET /v1/git/repos/{repo}/refs). */
 export interface RefsVM {
   branches: RefRow[];
   tags: RefRow[];
   default_branch: string;
+  pinned: PinnedRefRow[];
+  page: { next_cursor: string | null; limit: number };
 }
 
 /** The tree-at-path ViewModel (GET /v1/git/repos/{repo}/tree/{ref}/{...path}). `redirect_to_blob`
@@ -516,12 +527,15 @@ function nestedPath(path: string): string {
 }
 
 /** The ref switcher source (GET /v1/git/repos/{repo}/refs). */
-export const getRefs = query(async (repo: string): Promise<RefsVM> => {
+export const getRefs = query(async (request: GitRefsInput): Promise<RefsVM> => {
   "use server";
-  const input = parseGitRepoInput(repo);
+  const input = parseGitRefsInput(request);
   if (!input) throw new RepoRouteError("error");
   return authed(async () => {
-    const refs = parseRefs(await edgeGet(`/v1/git/repos/${seg(input.repo)}/refs`));
+    const search = gitRefsSearchParams(input).toString();
+    const refs = parseRefs(await edgeGet(
+      `/v1/git/repos/${seg(input.repo)}/refs${search ? `?${search}` : ""}`,
+    ));
     if (!refs) throw new RepoRouteError("error");
     return refs;
   });

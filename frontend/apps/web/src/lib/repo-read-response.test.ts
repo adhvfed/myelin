@@ -43,7 +43,10 @@ describe("repository read response projection", () => {
     expect(parseRefs({
       branches: [{ name: "main", oid: OID, is_default: true, secret: "drop" }],
       tags: [], default_branch: "main", secret: "drop",
-    })).toEqual({ branches: [{ name: "main", oid: OID, is_default: true }], tags: [], default_branch: "main" });
+    })).toEqual({
+      branches: [{ name: "main", oid: OID, is_default: true }],
+      tags: [], default_branch: "main", pinned: [], page: { next_cursor: null, limit: 1 },
+    });
     expect(parseTree({ ref: "main", path: "", entries: [{ path: "x", is_dir: false }], readme: null, secret: "drop" }))
       .toEqual({ ref: "main", path: "", entries: [{ path: "x", is_dir: false }] });
     expect(parseBlob({
@@ -78,5 +81,104 @@ describe("repository read response projection", () => {
     expect(parseTree({ path: "../secret", entries: [] })).toBeNull();
     expect(parseBlob({ path: "x", contents: "x", base_oid: "x", viewer_may_edit: false, raw_url: "https://evil.test/x" })).toBeNull();
     expect(parseBlob({ path: "x", contents: "not empty", base_oid: OID, viewer_may_edit: false, preview_unavailable: true })).toBeNull();
+  });
+
+  it("projects the paginated refs contract freshly, including pins outside the page", () => {
+    expect(parseRefs({
+      branches: [{ name: "feature", oid: OID, is_default: false, secret: "drop" }],
+      tags: [],
+      default_branch: "main",
+      pinned: [{
+        kind: "branch", full_name: "refs/heads/main", name: "main", oid: OID,
+        is_default: true, secret: "drop",
+      }],
+      page: { next_cursor: "gr1_abc-DEF_123", limit: 1, total: 500 },
+      secret: "drop",
+    })).toEqual({
+      branches: [{ name: "feature", oid: OID, is_default: false }],
+      tags: [],
+      default_branch: "main",
+      pinned: [{
+        kind: "branch", full_name: "refs/heads/main", name: "main", oid: OID,
+        is_default: true,
+      }],
+      page: { next_cursor: "gr1_abc-DEF_123", limit: 1 },
+    });
+  });
+
+  it.each([101, 1_000])("accepts a terminal legacy refs response with %i rows", (count) => {
+    const parsed = parseRefs({
+      branches: Array.from({ length: count }, (_, index) => ({
+        name: `branch-${index}`, oid: OID,
+      })),
+      tags: [],
+      default_branch: "main",
+    });
+
+    expect(parsed?.branches).toHaveLength(count);
+    expect(parsed?.page).toEqual({ next_cursor: null, limit: count });
+    expect(parsed?.pinned).toEqual([]);
+  });
+
+  it.each([
+    {
+      branches: [{ name: "a", oid: OID, is_default: false }],
+      tags: [{ name: "v1", oid: OID }], default_branch: "main", pinned: [],
+      page: { next_cursor: null, limit: 1 },
+    },
+    { branches: [], tags: [], default_branch: "main", pinned: [], page: { next_cursor: null, limit: 101 } },
+    {
+      branches: [], tags: [], default_branch: "main",
+      pinned: Array(3).fill({ kind: "branch", full_name: "refs/heads/main", name: "main", oid: OID, is_default: true }),
+      page: { next_cursor: null, limit: 1 },
+    },
+    {
+      branches: [{ name: "main", oid: OID }], tags: [], default_branch: "main", pinned: [],
+      page: { next_cursor: null, limit: 1 },
+    },
+    {
+      branches: [{ name: "main", oid: OID, is_default: false }], tags: [],
+      default_branch: "main", pinned: [], page: { next_cursor: null, limit: 1 },
+    },
+    {
+      branches: [], tags: [], default_branch: "main", pinned: [],
+      page: { next_cursor: "not-a-cursor", limit: 1 },
+    },
+    {
+      branches: [], tags: [], default_branch: "main",
+      pinned: [{ kind: "tag", full_name: "refs/heads/main", name: "main", oid: OID, is_default: false }],
+      page: { next_cursor: null, limit: 1 },
+    },
+    {
+      branches: [], tags: [], default_branch: "main",
+      pinned: [{ kind: "branch", full_name: "refs/heads/main", name: "other", oid: OID, is_default: false }],
+      page: { next_cursor: null, limit: 1 },
+    },
+    {
+      branches: [], tags: [], default_branch: "main",
+      pinned: [{ kind: "branch", full_name: "refs/heads/main", name: "main", oid: OID, is_default: false }],
+      page: { next_cursor: null, limit: 1 },
+    },
+    { branches: [], tags: [], default_branch: "main", page: { next_cursor: null, limit: 1 } },
+    { branches: [], tags: [], default_branch: "main", pinned: [] },
+    {
+      branches: [], tags: [], default_branch: "main",
+      pinned: [{ kind: "branch", full_name: "refs/heads/main", name: "main", oid: "A".repeat(40), is_default: true }],
+      page: { next_cursor: null, limit: 1 },
+    },
+    {
+      branches: [{ name: "x".repeat(4 * 1024 + 1), oid: OID, is_default: false }],
+      tags: [], default_branch: "main", pinned: [], page: { next_cursor: null, limit: 1 },
+    },
+    {
+      branches: [], tags: [], default_branch: "main", pinned: [],
+      page: { next_cursor: `gr1_${"x".repeat(8 * 1024)}`, limit: 1 },
+    },
+    {
+      branches: Array(1_001).fill({ name: "main", oid: OID }),
+      tags: [], default_branch: "main",
+    },
+  ])("rejects an invalid refs response %#", (value) => {
+    expect(parseRefs(value)).toBeNull();
   });
 });

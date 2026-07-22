@@ -2,6 +2,12 @@ const utf8 = new TextEncoder();
 type WireRecord = Record<string, unknown>;
 
 export interface GitRepoInput { repo: string }
+export interface GitRefsInput extends GitRepoInput {
+  limit?: number;
+  cursor?: string;
+  q?: string;
+  current?: string;
+}
 export interface GitBrowseInput extends GitRepoInput { ref: string; path: string }
 export interface GitCommitsInput extends GitRepoInput { ref: string; cursor?: string }
 export interface GitCommitInput extends GitRepoInput { oid: string }
@@ -62,6 +68,24 @@ function safeCursor(value: unknown): value is string {
   return bounded(value, 4 * 1024) && !hasControl(value);
 }
 
+function refsCursor(value: unknown): value is string {
+  return bounded(value, 8 * 1024) && /^gr1_[A-Za-z0-9_-]+$/.test(value) && !hasControl(value);
+}
+
+export function isFullGitRef(value: unknown): value is string {
+  if (!bounded(value, 4 * 1024) || hasControl(value)) return false;
+  const name = value.startsWith("refs/heads/")
+    ? value.slice("refs/heads/".length)
+    : value.startsWith("refs/tags/")
+      ? value.slice("refs/tags/".length)
+      : "";
+  const components = name.split("/");
+  return name.length > 0 && name !== "@" && !name.endsWith(".") &&
+    components.every((component) => component.length > 0 && !component.startsWith(".") &&
+      !component.endsWith(".lock")) && !name.includes("..") && !name.includes("@{") &&
+    ![" ", "~", "^", ":", "?", "*", "[", "\\"].some((character) => name.includes(character));
+}
+
 function prNumber(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) > 0;
 }
@@ -70,6 +94,33 @@ export function parseGitRepoInput(value: unknown): GitRepoInput | null {
   if (typeof value === "string") return repo(value) ? { repo: value } : null;
   const input = record(value);
   return input && exact(input, ["repo"]) && repo(input.repo) ? { repo: input.repo } : null;
+}
+
+export function parseGitRefsInput(value: unknown): GitRefsInput | null {
+  const input = record(value);
+  if (!input || !exact(input, ["repo", "limit", "cursor", "q", "current"]) ||
+      !repo(input.repo) || (input.limit !== undefined &&
+        (!Number.isSafeInteger(input.limit) || (input.limit as number) < 1 ||
+          (input.limit as number) > 100)) ||
+      (input.cursor !== undefined && !refsCursor(input.cursor)) ||
+      (input.q !== undefined && (!bounded(input.q, 256) || hasControl(input.q))) ||
+      (input.current !== undefined && !isFullGitRef(input.current))) return null;
+  return {
+    repo: input.repo,
+    ...(input.limit === undefined ? {} : { limit: input.limit as number }),
+    ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+    ...(input.q === undefined ? {} : { q: input.q }),
+    ...(input.current === undefined ? {} : { current: input.current }),
+  };
+}
+
+export function gitRefsSearchParams(input: GitRefsInput): URLSearchParams {
+  const params = new URLSearchParams();
+  if (input.limit !== undefined) params.set("limit", String(input.limit));
+  if (input.cursor !== undefined) params.set("cursor", input.cursor);
+  if (input.q !== undefined) params.set("q", input.q);
+  if (input.current !== undefined) params.set("current", input.current);
+  return params;
 }
 
 export function parseGitBrowseInput(value: unknown, allowEmptyPath: boolean): GitBrowseInput | null {

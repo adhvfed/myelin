@@ -147,16 +147,40 @@ function entriesOf(dirNode, base) {
     .sort((a, b) => (a.is_dir === b.is_dir ? a.name.localeCompare(b.name) : a.is_dir ? -1 : 1));
 }
 
-/** GET /v1/git/repos/{repo}/refs → the RefsVM (null = 404). */
-export function refsJson(repo) {
+/**
+ * GET /v1/git/repos/{repo}/refs → the paginated RefsVM (null = 404).
+ * @param {string} repo
+ * @param {{ limit?: number, cursor?: string, q?: string, current?: string }} [options]
+ */
+export function refsJson(repo, options = {}) {
   if (repo !== "myelin") return null;
+  const { limit = 100, cursor, q = "", current } = options;
+  const refs = [
+    { kind: "branch", full_name: "refs/heads/main", name: "main", oid: LATEST.oid, is_default: true },
+    { kind: "branch", full_name: "refs/heads/feature", name: "feature", oid: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334", is_default: false },
+    { kind: "tag", full_name: "refs/tags/v0.1", name: "v0.1", oid: LATEST.oid, is_default: false },
+  ];
+  const offset = cursor === undefined ? 0 : Number(/^gr1_(\d+)$/.exec(cursor)?.[1]);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100 || !Number.isInteger(offset)) {
+    return { __status: 400 };
+  }
+  const needle = q.trim().toLowerCase();
+  const matches = refs.filter((row) => !needle || row.name.toLowerCase().includes(needle));
+  const selected = matches.slice(offset, offset + limit);
+  const next = offset + selected.length < matches.length ? `gr1_${offset + selected.length}` : null;
+  const currentPin = refs.find((row) => row.full_name === current);
+  const defaultPin = refs[0];
+  const pinned = [currentPin, defaultPin]
+    .filter(Boolean)
+    .filter((row, index, rows) => rows.findIndex((candidate) => candidate.full_name === row.full_name) === index);
   return {
-    branches: [
-      { name: "main", oid: LATEST.oid, is_default: true },
-      { name: "feature", oid: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334" },
-    ],
-    tags: [{ name: "v0.1", oid: LATEST.oid }],
+    branches: selected
+      .filter((row) => row.kind === "branch")
+      .map(({ name, oid, is_default }) => ({ name, oid, is_default })),
+    tags: selected.filter((row) => row.kind === "tag").map(({ name, oid }) => ({ name, oid })),
     default_branch: "main",
+    pinned,
+    page: { next_cursor: next, limit },
   };
 }
 
