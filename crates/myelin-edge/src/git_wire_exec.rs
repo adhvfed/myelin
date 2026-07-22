@@ -253,7 +253,8 @@ impl GitWireCredentialIssuer for IdentityGitWireCredentialIssuer {
                 &system_now_timestamp(),
             )
             .map_err(|_| "Identity refused the Git-wire run-token mint".to_string())?;
-        RunTokenCredential::new(minted.token, minted.jti, request.ttl_secs)
+        let (bearer, jti) = minted.into_parts();
+        RunTokenCredential::new(bearer, jti, request.ttl_secs)
             .map_err(|_| "Identity returned an invalid Git-wire credential".to_string())
     }
 

@@ -217,8 +217,10 @@ impl Principal {
 /// An opaque credential presented to `authenticate` (contract 4.1). Any of the v1
 /// surfaces — SSO/SCIM/passkey/SSH/PAT/CI/agent/deploy-key — resolves to a `Principal`;
 /// **tenant is taken from the verified credential, never the URL path** (ID-3). The
-/// per-surface parsing is Identity M1 (P-ID-06/07); the carrier is frozen here.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// per-surface parsing is Identity M1 (P-ID-06/07); the carrier is frozen here. Bearer-bearing
+/// credentials deliberately have no generic serde implementation: transport adapters must parse
+/// them directly into this ephemeral, zeroizing value rather than persist/log an intermediate.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Credential {
     /// The credential family (oidc / saml / scim / passkey / ssh / pat / ci / agent /
     /// deploy_key) — a string token, not an enum, so a new surface is an additive change.
@@ -226,6 +228,22 @@ pub struct Credential {
     /// The opaque presented material (a token, an assertion ref, a public-key fingerprint).
     /// Never logged in the clear; never a name/email at the contract boundary.
     pub material: String,
+}
+
+impl core::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Credential")
+            .field("scheme", &self.scheme)
+            .field("material", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for Credential {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.material.zeroize();
+    }
 }
 
 // ===========================================================================
@@ -486,8 +504,9 @@ pub struct DelegationCaveats(pub Vec<String>);
 
 /// A per-run attenuated capability token (contract 4.7) — life == run life, self-hosted
 /// scope, re-mintable mid-workflow on resume (C6/C9). The mint (`mint_run_token`) lands in
-/// P-ID-18 (M1); the carrier is frozen here.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// P-ID-18 (M1); the carrier is frozen here. It is ephemeral and deliberately non-serializable;
+/// durable records carry a revocation/authority handle, never this bearer material.
+#[derive(Clone, PartialEq, Eq)]
 pub struct RunToken {
     /// The opaque bearer material.
     pub token: String,
@@ -501,6 +520,25 @@ impl core::fmt::Debug for RunToken {
             .field("token", &"<redacted>")
             .field("jti", &"<redacted>")
             .finish()
+    }
+}
+
+impl RunToken {
+    /// Transfer both allocations without creating additional bearer/JTI copies. The recipient must
+    /// move them into another zeroizing credential carrier.
+    pub fn into_parts(mut self) -> (String, String) {
+        (
+            core::mem::take(&mut self.token),
+            core::mem::take(&mut self.jti),
+        )
+    }
+}
+
+impl Drop for RunToken {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.token.zeroize();
+        self.jti.zeroize();
     }
 }
 
@@ -800,6 +838,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn credential_debug_redacts_material_and_owns_zeroizing_drop() {
+        let credential = Credential {
+            scheme: "pat".into(),
+            material: "secret-material".into(),
+        };
+        let rendered = format!("{credential:?}");
+        assert!(rendered.contains("pat"));
+        assert!(!rendered.contains("secret-material"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(core::mem::needs_drop::<Credential>());
+    }
+
+    #[test]
     fn run_token_debug_redacts_bearer_and_jti() {
         let token = RunToken {
             token: "secret-bearer".into(),
@@ -809,6 +860,7 @@ mod tests {
         assert!(!rendered.contains("secret-bearer"));
         assert!(!rendered.contains("secret-jti"));
         assert!(rendered.contains("<redacted>"));
+        assert!(core::mem::needs_drop::<RunToken>());
     }
 
     /// The frozen `Principal` carries the §11.1 / contract-4.1 shape

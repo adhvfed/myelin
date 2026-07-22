@@ -227,7 +227,7 @@ pub struct EffectAuthority {
 impl core::fmt::Debug for EffectAuthority {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("EffectAuthority")
-            .field("jti", &self.run_token.jti)
+            .field("jti", &"<redacted>")
             .field("principal_id", &self.principal_id)
             .field("tool", &self.tool)
             .field("idempotency_key", &"<redacted>")
@@ -385,6 +385,23 @@ pub trait DryRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effect_authority_debug_redacts_every_credential_and_replay_handle() {
+        let authority = EffectAuthority {
+            run_token: myelin_identity::RunToken {
+                token: "secret-bearer".into(),
+                jti: "secret-jti".into(),
+            },
+            principal_id: myelin_identity::PrincipalId("principal".into()),
+            tool: "issue.close".into(),
+            idempotency_key: "secret-idempotency-key".into(),
+        };
+        let rendered = format!("{authority:?}");
+        for secret in ["secret-bearer", "secret-jti", "secret-idempotency-key"] {
+            assert!(!rendered.contains(secret));
+        }
+    }
 
     /// A deterministic mock impl of every swappable + platform-owned trait — proves all six
     /// (+`DryRun`, 8.7) signatures compile against a real impl on the SAME code path users hit

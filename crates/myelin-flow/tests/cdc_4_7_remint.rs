@@ -197,9 +197,10 @@ impl RunTokenMinter for IdentityRemintAdapter {
                 },
             )
             .map_err(|e| RunTokenError(format!("{e:?}")))?;
+        let (bearer, jti) = token.into_parts();
         Ok(RunTokenHandle {
-            token: token.token,
-            jti: token.jti,
+            token: bearer,
+            jti,
             ttl_secs,
         })
     }

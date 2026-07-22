@@ -252,7 +252,7 @@ pub fn dispatch_explicit<Id: IdentityService, Fx: EffectApi>(
 
     (
         Disposition::Dispatched {
-            run_token_jti: token.jti,
+            run_token_jti: token.jti.clone(),
         },
         Some(applied),
     )
