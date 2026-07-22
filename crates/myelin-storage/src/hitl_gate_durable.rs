@@ -165,16 +165,16 @@ impl GateState {
         }
     }
 
-    /// Parse the frozen wire token. An unknown token is durable corruption → FAIL-STATIC loud.
-    pub fn parse(s: &str) -> GateState {
+    /// Parse the frozen wire token. An unknown token is durable corruption and returns a typed
+    /// refusal so a database-row decoder can route it through the store-fault path without an
+    /// ad-hoc panic.
+    pub fn parse(s: &str) -> Result<GateState, InvalidGateState> {
         match s {
-            "waiting" => GateState::Waiting,
-            "approved" => GateState::Approved,
-            "rejected" => GateState::Rejected,
-            "expired" => GateState::Expired,
-            other => {
-                panic!("FAIL-STATIC: unknown agent_hitl_gate.state `{other}` (durable corruption)")
-            }
+            "waiting" => Ok(GateState::Waiting),
+            "approved" => Ok(GateState::Approved),
+            "rejected" => Ok(GateState::Rejected),
+            "expired" => Ok(GateState::Expired),
+            _ => Err(InvalidGateState),
         }
     }
 
@@ -183,6 +183,19 @@ impl GateState {
         !matches!(self, GateState::Waiting)
     }
 }
+
+/// An unknown durable HITL state token. The value itself is deliberately omitted from error output:
+/// database corruption must be loud, but an arbitrary stored value is not a safe log payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidGateState;
+
+impl std::fmt::Display for InvalidGateState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("agent_hitl_gate row has an invalid state")
+    }
+}
+
+impl std::error::Error for InvalidGateState {}
 
 /// One `agent_hitl_gate` row — the §4.4 fields + the R2.4 enforcement columns. This is the durable
 /// carrier the MCP governance layer and the agent-fabric HITL machinery both persist/consult; the
@@ -947,7 +960,7 @@ impl DurableHitlGates {
                         let Some(row) = row else {
                             return Ok(Err(GateDecideError::NotFound));
                         };
-                        let record = row_to_record(&gate_id, &row);
+                        let record = row_to_record(&gate_id, &row)?;
                         if let Err(e) = decide_rules(
                             &record,
                             to,
@@ -998,7 +1011,7 @@ impl DurableHitlGates {
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                        Ok(row.map(|r| row_to_record(&gate_id, &r)))
+                        row.map(|row| row_to_record(&gate_id, &row)).transpose()
                     })
                 }),
         )
@@ -1035,11 +1048,12 @@ impl DurableHitlGates {
                         .fetch_optional(&mut *conn)
                         .await
                         .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                        Ok(row.map(|r| {
-                            use sqlx::Row as _;
-                            let gid: String = r.get("gate_id");
-                            row_to_record(&gid, &r)
-                        }))
+                        let Some(row) = row else {
+                            return Ok(None);
+                        };
+                        use sqlx::Row as _;
+                        let gate_id: String = row.try_get("gate_id").map_err(hitl_row_decode)?;
+                        row_to_record(&gate_id, &row).map(Some)
                     })
                 }),
         )
@@ -1084,14 +1098,14 @@ impl DurableHitlGates {
                         .fetch_all(&mut *conn)
                         .await
                         .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                        Ok(rows
-                            .iter()
+                        rows.iter()
                             .map(|row| {
                                 use sqlx::Row as _;
-                                let gate_id: String = row.get("gate_id");
+                                let gate_id: String =
+                                    row.try_get("gate_id").map_err(hitl_row_decode)?;
                                 row_to_record(&gate_id, row)
                             })
-                            .collect())
+                            .collect()
                     })
                 }),
         )
@@ -1129,11 +1143,12 @@ impl DurableHitlGates {
                         .fetch_optional(&mut *conn)
                         .await
                         .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                        Ok(row.map(|row| {
-                            use sqlx::Row as _;
-                            let gate_id: String = row.get("gate_id");
-                            row_to_record(&gate_id, &row)
-                        }))
+                        let Some(row) = row else {
+                            return Ok(None);
+                        };
+                        use sqlx::Row as _;
+                        let gate_id: String = row.try_get("gate_id").map_err(hitl_row_decode)?;
+                        row_to_record(&gate_id, &row).map(Some)
                     })
                 }),
         )
@@ -1174,7 +1189,7 @@ impl DurableHitlGates {
                         let Some(row) = row else {
                             return Ok(Err(GateConsumeError::NotFound));
                         };
-                        let record = row_to_record(&gate_id, &row);
+                        let record = row_to_record(&gate_id, &row)?;
                         if let Err(error) =
                             consume_rules(&record, &effect_id, &run_id, &requester, now_unix)
                         {
@@ -1204,33 +1219,47 @@ impl DurableHitlGates {
 
 /// Map an `agent_hitl_gate` row to the [`GateRecord`] carrier (lossless; `cost_estimate` round-trips
 /// the two's-complement `bigint` reinterpret the cost ledger uses).
-fn row_to_record(gate_id: &str, row: &sqlx::postgres::PgRow) -> GateRecord {
+fn row_to_record(
+    gate_id: &str,
+    row: &sqlx::postgres::PgRow,
+) -> Result<GateRecord, crate::pg::PgError> {
     use sqlx::Row as _;
-    GateRecord {
+    let state_token: String = row.try_get("state").map_err(hitl_row_decode)?;
+    let state = GateState::parse(&state_token)
+        .map_err(|error| crate::pg::PgError::Query(error.to_string()))?;
+    Ok(GateRecord {
         gate_id: gate_id.to_string(),
-        run_id: row.get("run_id"),
-        effect_id: row.get("effect_id"),
+        run_id: row.try_get("run_id").map_err(hitl_row_decode)?,
+        effect_id: row.try_get("effect_id").map_err(hitl_row_decode)?,
         risk_summary: row
             .try_get::<Option<Vec<u8>>, _>("risk_summary")
-            .unwrap_or(None)
+            .map_err(hitl_row_decode)?
             .unwrap_or_default(),
-        cost_estimate: row.get::<i64, _>("cost_estimate") as u64,
-        approver_filter: row.get("approver_filter"),
-        state: GateState::parse(row.get::<String, _>("state").as_str()),
-        card_ref: row.try_get::<Option<String>, _>("card_ref").unwrap_or(None),
-        requested_by: row.get("requested_by"),
+        cost_estimate: row
+            .try_get::<i64, _>("cost_estimate")
+            .map_err(hitl_row_decode)? as u64,
+        approver_filter: row.try_get("approver_filter").map_err(hitl_row_decode)?,
+        state,
+        card_ref: row
+            .try_get::<Option<String>, _>("card_ref")
+            .map_err(hitl_row_decode)?,
+        requested_by: row.try_get("requested_by").map_err(hitl_row_decode)?,
         decided_by: row
             .try_get::<Option<String>, _>("decided_by")
-            .unwrap_or(None),
-        opened_at_unix: row.get("opened_at_unix"),
+            .map_err(hitl_row_decode)?,
+        opened_at_unix: row.try_get("opened_at_unix").map_err(hitl_row_decode)?,
         decided_at_unix: row
             .try_get::<Option<i64>, _>("decided_at_unix")
-            .unwrap_or(None),
-        expires_at_unix: row.get("expires_at_unix"),
+            .map_err(hitl_row_decode)?,
+        expires_at_unix: row.try_get("expires_at_unix").map_err(hitl_row_decode)?,
         approval_consumed_at_unix: row
             .try_get::<Option<i64>, _>("approval_consumed_at_unix")
-            .unwrap_or(None),
-    }
+            .map_err(hitl_row_decode)?,
+    })
+}
+
+fn hitl_row_decode(error: sqlx::Error) -> crate::pg::PgError {
+    crate::pg::PgError::Query(format!("agent_hitl_gate row decode failed: {error}"))
 }
 
 // =================================================================================================
@@ -1279,6 +1308,14 @@ mod tests {
             "gate:git.merge:myelin://acme/git/pr/40",
             now_unix,
         )
+    }
+
+    #[test]
+    fn unknown_durable_state_is_a_redacted_error_not_a_panic() {
+        let error = GateState::parse("attacker-controlled-state")
+            .expect_err("an unknown durable state must fail closed");
+        assert_eq!(error.to_string(), "agent_hitl_gate row has an invalid state");
+        assert!(!error.to_string().contains("attacker-controlled-state"));
     }
 
     /// A pending gate INSERTs waiting, is fetchable by its opaque id, and a duplicate open refuses.
