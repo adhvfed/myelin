@@ -3110,6 +3110,9 @@ fn map_durable_err(e: DurableError) -> EdgeError {
         DurableError::Git(m) if m.starts_with("browse response limit exceeded:") => {
             EdgeError::PayloadTooLarge("repository view exceeds the interactive browse limit".into())
         }
+        DurableError::Git(m) if m.starts_with("diff computation limit exceeded:") => {
+            EdgeError::PayloadTooLarge("pull request diff exceeds the interactive file limit".into())
+        }
         // A traversal-rejected slug / malformed body (e.g. R3.1 open-PR with no `title`) surfaces as a
         // clean 400 (never a silent wrong path, never a 500 for a client input error).
         DurableError::Git(m)
@@ -5264,16 +5267,21 @@ mod pr_list_tests {
     }
 
     #[test]
-    fn oversized_browse_views_map_to_a_bounded_public_response() {
-        let error = DurableError::Git(
-            "browse response limit exceeded: private repository detail".into(),
-        );
-        let mapped = map_durable_err(error);
-        assert_eq!(mapped.status(), 413);
-        assert_eq!(
-            mapped.to_string(),
-            "413 (payload_too_large): repository view exceeds the interactive browse limit"
-        );
+    fn oversized_interactive_reads_map_to_bounded_public_responses() {
+        for (private, public) in [
+            (
+                "browse response limit exceeded: private repository detail",
+                "repository view exceeds the interactive browse limit",
+            ),
+            (
+                "diff computation limit exceeded: private repository detail",
+                "pull request diff exceeds the interactive file limit",
+            ),
+        ] {
+            let mapped = map_durable_err(DurableError::Git(private.into()));
+            assert_eq!(mapped.status(), 413);
+            assert_eq!(mapped.to_string(), format!("413 (payload_too_large): {public}"));
+        }
     }
 }
 

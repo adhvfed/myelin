@@ -424,6 +424,8 @@ pub const FILE_LINES_MAX_BLOB_BYTES: usize = 512 * 1024;
 pub const BROWSE_MAX_REFS: usize = 1_000;
 /// Maximum entries materialized from one tree directory for an interactive browse response.
 pub const BROWSE_MAX_TREE_ENTRIES: usize = 1_000;
+/// Maximum changed files computed for one interactive pull-request diff.
+pub const PR_DIFF_MAX_FILES: usize = 1_000;
 
 /// **Nested-path traversal guard (R3.4).** A tree-relative path may never carry a `..` or `.` segment
 /// or be absolute — such a path can only be an attempt to escape the committed tree (or a malformed
@@ -1539,6 +1541,16 @@ impl DurableGitRepo {
         head_oid: &str,
         per_file_line_cap: usize,
     ) -> Result<Option<PrDiff>, DurableError> {
+        self.pr_diff_bounded(base_ref, head_oid, per_file_line_cap, PR_DIFF_MAX_FILES)
+    }
+
+    fn pr_diff_bounded(
+        &self,
+        base_ref: &str,
+        head_oid: &str,
+        per_file_line_cap: usize,
+        maximum_files: usize,
+    ) -> Result<Option<PrDiff>, DurableError> {
         let repo = self.open_git()?;
         let head = match git2::Oid::from_str(head_oid) {
             Ok(o) => o,
@@ -1580,6 +1592,11 @@ impl DurableGitRepo {
         let diff = repo
             .diff_tree_to_tree(base_tree.as_ref(), Some(&head_tree), Some(&mut opts))
             .map_err(|e| git_err("pr diff_tree_to_tree", e))?;
+        if diff.deltas().len() > maximum_files {
+            return Err(DurableError::Git(format!(
+                "diff computation limit exceeded: pull request changes more than {maximum_files} files"
+            )));
+        }
 
         let files: std::cell::RefCell<Vec<PrFileDelta>> = std::cell::RefCell::new(Vec::new());
         // Rendered-line count for the CURRENT file — bounds memory: once a file reaches its cap we
@@ -2561,6 +2578,11 @@ mod tests {
         let ctx_a = hunk.lines.iter().find(|l| l.origin == ' ' && l.content == "a").unwrap();
         assert_eq!(ctx_a.old_no, Some(1));
         assert_eq!(ctx_a.new_no, Some(1));
+
+        assert!(matches!(
+            repo.pr_diff_bounded("refs/heads/main", &head.0, 4000, 0),
+            Err(DurableError::Git(message)) if message.starts_with("diff computation limit exceeded:")
+        ));
 
         // A malformed/absent head → None (the edge renders the empty state, not a 500).
         assert!(repo.pr_diff("refs/heads/main", "not-an-oid", 4000).unwrap().is_none());
