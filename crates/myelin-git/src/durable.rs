@@ -685,13 +685,27 @@ impl DurableGitRepo {
         Ok(Oid::new(oid.to_string()))
     }
 
-    /// Read an object's raw bytes from the on-disk odb by its git oid. `NotFound` if absent — the
-    /// lookup is the real odb, NOT an in-memory index (F-git-2).
-    pub fn read_object(&self, oid: &Oid) -> Result<Vec<u8>, DurableError> {
+    /// Read an object's raw bytes from the on-disk odb by its git oid, rejecting from the object
+    /// header before allocation when it exceeds `maximum_bytes`. `NotFound` if absent — the lookup
+    /// is the real odb, NOT an in-memory index (F-git-2).
+    pub fn read_object_bounded(
+        &self,
+        oid: &Oid,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, DurableError> {
         let repo = self.open_git()?;
         let odb = repo.odb().map_err(|e| git_err("odb", e))?;
+        let git_oid = Self::parse_oid(oid)?;
+        let (size, _) = odb
+            .read_header(git_oid)
+            .map_err(|e| DurableError::NotFound(format!("object {}: {e}", oid.as_str())))?;
+        if size > maximum_bytes {
+            return Err(DurableError::Git(format!(
+                "object read limit exceeded: {size} bytes exceeds {maximum_bytes}"
+            )));
+        }
         let obj = odb
-            .read(Self::parse_oid(oid)?)
+            .read(git_oid)
             .map_err(|e| DurableError::NotFound(format!("object {}: {e}", oid.as_str())))?;
         Ok(obj.data().to_vec())
     }
@@ -2567,11 +2581,23 @@ mod tests {
             "the commit object survived the restart (F-git-2 — on-disk odb)"
         );
         // The object bytes round-trip (it is a real git commit).
-        let bytes = repo2.read_object(&commit).expect("read object");
+        let bytes = repo2
+            .read_object_bounded(&commit, 64 * 1024 * 1024)
+            .expect("read object");
         assert!(
             std::str::from_utf8(&bytes).unwrap().contains("psn-7@acme.noreply"),
             "the durable commit carries the pseudonymous author"
         );
+        assert_eq!(
+            repo2
+                .read_object_bounded(&commit, bytes.len())
+                .expect("exact object read limit"),
+            bytes
+        );
+        assert!(matches!(
+            repo2.read_object_bounded(&commit, bytes.len() - 1),
+            Err(DurableError::Git(message)) if message.starts_with("object read limit exceeded:")
+        ));
         // list_refs loads the entry point from disk (not an empty map).
         assert!(matches!(
             repo2.list_refs_bounded(0),
@@ -3172,7 +3198,9 @@ mod tests {
     /// re-hashes on write, so we assert the oid is identical — a forged copy is impossible). Used to
     /// stage a `dst` odb that is MISSING a chosen ancestor commit while its tip tree is complete.
     fn copy_object(src: &DurableGitRepo, dst: &DurableGitRepo, oid: &Oid, kind: &str) {
-        let bytes = src.read_object(oid).expect("read src object");
+        let bytes = src
+            .read_object_bounded(oid, 64 * 1024 * 1024)
+            .expect("read src object");
         let written = dst.write_raw_object(kind, &bytes).expect("write dst object");
         assert_eq!(written.0, oid.0, "the re-hashed copy keeps the same oid");
     }

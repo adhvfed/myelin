@@ -635,8 +635,8 @@ mod tests {
         assert_eq!(restored.list_refs_bounded(MAX_BACKUP_REFS).unwrap(), want);
         // Every source object exists + reads back byte-identical in the restored odb.
         for (_, tip) in &want {
-            let src_bytes = src_repo.read_object(tip).unwrap();
-            let dst_bytes = restored.read_object(tip).unwrap();
+            let src_bytes = src_repo.read_object_bounded(tip, 64 * 1024 * 1024).unwrap();
+            let dst_bytes = restored.read_object_bounded(tip, 64 * 1024 * 1024).unwrap();
             assert_eq!(src_bytes, dst_bytes, "object {} bytes identical", tip.as_str());
         }
         restored.fsck().expect("in-process fsck clean on the restored repo");
