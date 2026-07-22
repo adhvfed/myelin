@@ -409,22 +409,36 @@ where
                 let backfill = sub.drain_ready();
                 Ok(ResumeOutcome::Live { backfill, sub })
             }
-            Err(FirehoseError::ResyncRequired { .. }) => {
-                // The over-window path: fall back to the durable *.snapshot resync (2.6) — NAMED.
-                let snapshot = self
-                    .store
-                    .resync_from(channel, snapshot_cursor)
-                    .map_err(|e| GatewayError::SnapshotFailed(e.to_string()))?;
-                // Open a fresh LIVE subscription from the firehose head (live continues after the
-                // snapshot; the client de-dupes the overlap on message_id).
-                let sub = self
-                    .firehose
-                    .subscribe(&conn.stream, &scope, None)
-                    .map_err(GatewayError::OverBroadScope)?;
-                Ok(ResumeOutcome::Resync { snapshot, sub })
+            Err(FirehoseError::ResyncRequired { .. } | FirehoseError::TailLimitExceeded) => {
+                self.snapshot_resync(conn, channel, snapshot_cursor, &scope)
             }
-            Err(e @ FirehoseError::OverBroadScope { .. }) => Err(GatewayError::OverBroadScope(e)),
+            Err(
+                e @ (FirehoseError::OverBroadScope { .. }
+                | FirehoseError::ScopeLimitExceeded { .. }),
+            ) => Err(GatewayError::OverBroadScope(e)),
         }
+    }
+
+    /// Fall back to the bounded durable snapshot and reopen at the live head. Both an evicted
+    /// reconnect gap and a gap whose bounded tail is too large take this cold-rebuild path.
+    fn snapshot_resync(
+        &mut self,
+        conn: &Connection,
+        channel: &ConversationId,
+        snapshot_cursor: &MessageId,
+        scope: &FirehoseScope,
+    ) -> Result<ResumeOutcome, GatewayError> {
+        let snapshot = self
+            .store
+            .resync_from(channel, snapshot_cursor)
+            .map_err(|e| GatewayError::SnapshotFailed(e.to_string()))?;
+        // Open a fresh LIVE subscription from the firehose head (live continues after the
+        // snapshot; the client de-dupes the overlap on message_id).
+        let sub = self
+            .firehose
+            .subscribe(&conn.stream, scope, None)
+            .map_err(GatewayError::OverBroadScope)?;
+        Ok(ResumeOutcome::Resync { snapshot, sub })
     }
 
     /// Build the BOUNDED `channel:<id>` firehose scope for a channel — the `*`-rejecting chokepoint

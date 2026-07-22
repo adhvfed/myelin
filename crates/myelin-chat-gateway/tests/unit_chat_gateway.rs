@@ -359,6 +359,24 @@ fn subscribe_scope_is_bounded_never_star() {
     assert_eq!(sub.scope().kind(), myelin_events::ScopeKind::Channel);
 }
 
+/// An allocation-hostile channel id is an over-broad selector at the gateway boundary. The
+/// transport's typed scope-limit refusal is never admitted or downgraded to a generic failure.
+#[test]
+fn subscribe_scope_limit_fails_closed_as_over_broad_scope() {
+    let id = FakeId::new();
+    id.add_member("alice");
+    let mut gw = gateway(id, MemHotTier::new(), 4096);
+    let alice = gw.connect(&cred("alice")).unwrap();
+    let oversized = ConversationId::new(TENANT, REGION, "x".repeat(16 * 1024));
+
+    assert!(matches!(
+        gw.subscribe(&alice, &oversized, None, None),
+        Err(GatewayError::OverBroadScope(
+            myelin_events::FirehoseError::ScopeLimitExceeded { .. }
+        ))
+    ));
+}
+
 /// **A None-cursor subscribe starts live from now; only post-open frames are delivered.**
 #[test]
 fn subscribe_none_cursor_starts_live_from_now() {
