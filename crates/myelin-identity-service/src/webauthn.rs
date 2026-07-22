@@ -677,6 +677,43 @@ impl CredentialBindingIndex {
         self.lock().get(credential_id).map(|c| c.sign_count)
     }
 
+    /// Revalidate the immutable credential binding and atomically compare/advance its signature
+    /// counter after cryptographic verification. Returning the winning binding ensures the caller
+    /// never resolves a principal from a credential that was replaced while crypto ran.
+    fn compare_and_advance(
+        &self,
+        credential_id: &[u8],
+        verified: &StoredCredential,
+        presented: u32,
+    ) -> myelin_identity::Result<StoredCredential> {
+        let mut credentials = self.lock();
+        let current = credentials.get_mut(credential_id).ok_or_else(|| {
+            refuse("passkey credential binding disappeared during assertion verification")
+        })?;
+        if current.cose_key != verified.cose_key
+            || current.tenant != verified.tenant
+            || current.region != verified.region
+            || current.subject_key != verified.subject_key
+        {
+            return Err(refuse(
+                "passkey credential binding changed during assertion verification",
+            ));
+        }
+
+        let stored = current.sign_count;
+        if presented == 0 && stored == 0 {
+            // The authenticator does not implement a counter — no clone signal is available.
+        } else if presented > stored {
+            current.sign_count = presented;
+        } else {
+            return Err(refuse(format!(
+                "signature counter regression: presented {presented} ≤ stored {stored} \
+                 (cloned authenticator / replay — fail-closed)"
+            )));
+        }
+        Ok(current.clone())
+    }
+
     /// Insert/overwrite a binding (used by `register`). The `initial_count` is the registration-time
     /// `signCount`.
     fn put(
@@ -849,6 +886,8 @@ pub struct WebauthnVerifier {
     config: WebauthnConfig,
     registry: CredentialBindingIndex,
     challenges: ChallengeGuard,
+    #[cfg(test)]
+    counter_barrier: Option<Arc<std::sync::Barrier>>,
 }
 
 impl WebauthnVerifier {
@@ -863,7 +902,15 @@ impl WebauthnVerifier {
             config,
             registry,
             challenges,
+            #[cfg(test)]
+            counter_barrier: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_counter_barrier(mut self, barrier: Arc<std::sync::Barrier>) -> Self {
+        self.counter_barrier = Some(barrier);
+        self
     }
 
     /// The shared challenge store (so the issuing side / a caller can issue a fresh challenge).
@@ -1086,33 +1133,27 @@ impl CredentialVerifier for WebauthnVerifier {
         signed.extend_from_slice(&client_data_hash);
         verify_cose_signature(&stored.cose_key, &signed, &signature)?;
 
-        // (6) SIGNATURE COUNTER — clone/replay detection. After a VALID signature, the presented count
-        //     must strictly exceed the stored count, UNLESS the authenticator uses 0 (both 0 ⇒ no counter
-        //     support, accepted). A regression (presented ≤ stored, not both 0) signals a cloned
-        //     authenticator → refuse. Updated only on an otherwise-valid assertion (so a failed sig
-        //     cannot burn the counter).
-        let presented = auth_data.sign_count;
-        let stored_count = stored.sign_count;
-        if presented == 0 && stored_count == 0 {
-            // The authenticator does not implement a counter — no clone signal available; accept.
-        } else if presented > stored_count {
-            // Advance the stored counter.
-            if let Some(entry) = self.registry.lock().get_mut(&credential_id) {
-                entry.sign_count = presented;
-            }
-        } else {
-            return Err(refuse(format!(
-                "signature counter regression: presented {presented} ≤ stored {stored_count} \
-                 (cloned authenticator / replay — fail-closed)"
-            )));
+        #[cfg(test)]
+        if let Some(barrier) = &self.counter_barrier {
+            barrier.wait();
         }
+
+        // (6) SIGNATURE COUNTER — clone/replay detection. After a VALID signature, atomically
+        //     revalidate the immutable credential binding and compare/advance its current count. The
+        //     presented count must strictly exceed the stored count, UNLESS both are 0 (no counter
+        //     support). A failed signature cannot burn the counter, and two concurrent assertions
+        //     presenting the same next count cannot both authenticate.
+        let presented = auth_data.sign_count;
+        let accepted = self
+            .registry
+            .compare_and_advance(&credential_id, &stored, presented)?;
 
         // (7) THE TRUST-ROOTED ASSERTION — tenant/region/subject come ONLY from the registered binding.
         Ok(VerifiedAssertion {
-            tenant: stored.tenant.clone(),
-            region: stored.region.clone(),
+            tenant: accepted.tenant,
+            region: accepted.region,
             scheme: scheme::PASSKEY.to_string(),
-            subject_key: stored.subject_key.clone(),
+            subject_key: accepted.subject_key,
         })
     }
 }
@@ -1645,6 +1686,42 @@ mod tests {
             matches!(&err, AuthzError::FailClosed(m) if m.contains("counter regression")),
             "an equal counter must be refused, got {err:?}"
         );
+    }
+
+    /// Two valid assertions with distinct single-use challenges but the same next signature counter
+    /// race after crypto. Exactly one may atomically advance the binding; the other observes the new
+    /// count and fails closed as a clone/replay signal.
+    #[test]
+    fn concurrent_equal_counters_authenticate_exactly_once() {
+        let key = AuthKey::Es256(EcKey::generate());
+        let cred_id = b"cred-counter-race";
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let verifier = registered_none(&key, cred_id, 7).with_counter_barrier(barrier);
+        let first = signed_assertion(&verifier, &key, cred_id, FLAG_UP, 8);
+        let second = signed_assertion(&verifier, &key, cred_id, FLAG_UP, 8);
+        let verifier = Arc::new(verifier);
+
+        let threads = [first, second].map(|assertion| {
+            let verifier = Arc::clone(&verifier);
+            std::thread::spawn(move || verifier.verify(&assertion))
+        });
+        let outcomes =
+            threads.map(|thread| thread.join().expect("verification thread must not panic"));
+
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+            1,
+            "only one assertion can claim the same counter advance: {outcomes:?}"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Err(AuthzError::FailClosed(message)) if message.contains("counter regression")))
+                .count(),
+            1,
+            "the losing assertion fails closed as a clone/replay signal: {outcomes:?}"
+        );
+        assert_eq!(verifier.registry().sign_count(cred_id), Some(8));
     }
 
     /// (h) SIGNATURE OVER DIFFERENT authData THAN PRESENTED — a VALID signature, but over a DIFFERENT
