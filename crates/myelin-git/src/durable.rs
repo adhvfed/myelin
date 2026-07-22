@@ -135,6 +135,17 @@ fn refgen_key(ref_name: &str) -> String {
     format!("myelin.refgen.{var}")
 }
 
+/// Read one config-backed generation without conflating an absent key with corrupt configuration.
+fn read_ref_generation(cfg: &git2::Config, ref_name: &str) -> Result<u64, DurableError> {
+    match cfg.get_i64(&refgen_key(ref_name)) {
+        Ok(value) => u64::try_from(value).map_err(|_| {
+            DurableError::Git(format!("negative ref generation stored for {ref_name}"))
+        }),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(0),
+        Err(e) => Err(git_err(&format!("read refgen for {ref_name}"), e)),
+    }
+}
+
 // ───────────────────────────── one on-disk reflog entry ──────────────────────────────────────────
 
 /// One durable reflog entry read back from the on-disk git reflog. The reflog is durable (it is the
@@ -688,8 +699,14 @@ impl DurableGitRepo {
     fn bump_generation(&self, repo: &git2::Repository, name: &str) -> Result<(), DurableError> {
         let key = refgen_key(name);
         let mut cfg = repo.config().map_err(|e| git_err("config (refgen)", e))?;
-        let current = cfg.get_i64(&key).unwrap_or(0).max(0);
-        cfg.set_i64(&key, current + 1)
+        let current = read_ref_generation(&cfg, name)?;
+        let next = current.checked_add(1).ok_or_else(|| {
+            DurableError::Git(format!("ref generation exhausted for {name}"))
+        })?;
+        let next = i64::try_from(next).map_err(|_| {
+            DurableError::Git(format!("ref generation exceeds git-config range for {name}"))
+        })?;
+        cfg.set_i64(&key, next)
             .map_err(|e| git_err(&format!("set refgen for {name}"), e))?;
         Ok(())
     }
@@ -700,10 +717,10 @@ impl DurableGitRepo {
     /// deleted and recreated (it is keyed by name in config, not tied to the ref's reflog), and it
     /// survives a process restart (config is on disk). This is the source of truth both the write path
     /// ([`crate::receive_pack`]) and the reconciler ([`crate::reconcile`]) use for `update_seq`.
-    pub fn ref_generation(&self, name: &str) -> u64 {
-        let Ok(repo) = self.open_git() else { return 0 };
-        let Ok(cfg) = repo.config() else { return 0 };
-        cfg.get_i64(&refgen_key(name)).unwrap_or(0).max(0) as u64
+    pub fn ref_generation(&self, name: &str) -> Result<u64, DurableError> {
+        let repo = self.open_git()?;
+        let cfg = repo.config().map_err(|e| git_err("config (refgen)", e))?;
+        read_ref_generation(&cfg, name)
     }
 
     /// The number of entries in a ref's on-disk reflog (0 if the ref / reflog does not exist). This is
@@ -2485,14 +2502,14 @@ mod tests {
         repo.update_ref_cas("refs/heads/tmp", None, Some(&c1), "create", "psn@acme.noreply")
             .unwrap();
         assert_eq!(repo.read_ref("refs/heads/tmp").unwrap(), Some(c1.clone()));
-        assert_eq!(repo.ref_generation("refs/heads/tmp"), 1, "create is generation 1");
+        assert_eq!(repo.ref_generation("refs/heads/tmp"), Ok(1), "create is generation 1");
 
         repo.update_ref_cas("refs/heads/tmp", Some(&c1), None, "delete", "psn@acme.noreply")
             .expect("delete");
         assert_eq!(repo.read_ref("refs/heads/tmp").unwrap(), None, "ref deleted");
         assert_eq!(
             repo.ref_generation("refs/heads/tmp"),
-            2,
+            Ok(2),
             "the delete ADVANCES the durable generation (a delete is a generation-advancing event)"
         );
 
@@ -2507,7 +2524,7 @@ mod tests {
         // The DURABLE generation does NOT reset — it keeps climbing across the delete (the fix).
         assert_eq!(
             repo.ref_generation("refs/heads/tmp"),
-            3,
+            Ok(3),
             "the durable per-ref generation is monotonic across delete+recreate (R0.4 fix)"
         );
 
@@ -2517,8 +2534,33 @@ mod tests {
         let repo2 = store2.open_repo(&loc()).expect("reopen");
         assert_eq!(
             repo2.ref_generation("refs/heads/tmp"),
-            3,
+            Ok(3),
             "the durable generation survives a process restart (config is on disk)"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ref_generation_distinguishes_absent_from_corrupt_config() {
+        let root = temp_root("refgen-corrupt");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let ref_name = "refs/heads/main";
+        assert_eq!(repo.ref_generation(ref_name), Ok(0), "an absent counter starts at zero");
+
+        let raw = repo.open_git().expect("open raw repo");
+        let mut cfg = raw.config().expect("open config");
+        cfg.set_str(&refgen_key(ref_name), "not-an-integer")
+            .expect("write malformed fixture");
+        assert!(
+            matches!(repo.ref_generation(ref_name), Err(DurableError::Git(_))),
+            "a malformed counter must not be treated as generation zero"
+        );
+
+        cfg.set_i64(&refgen_key(ref_name), -1).expect("write negative fixture");
+        assert_eq!(
+            repo.ref_generation(ref_name),
+            Err(DurableError::Git(format!("negative ref generation stored for {ref_name}")))
         );
         std::fs::remove_dir_all(&root).ok();
     }

@@ -198,7 +198,7 @@ pub fn reconcile_refs(
         // reflog length). It survives restart AND is monotonic across a ref's delete+recreate, so the
         // idempotent `<=` comparison below is exact even after a branch was deleted and recreated
         // (reflog length would have RESET on the recreate and mis-compared here).
-        let on_disk_seq = repo.ref_generation(&rec.ref_name);
+        let on_disk_seq = repo.ref_generation(&rec.ref_name)?;
         if rec.update_seq <= on_disk_seq {
             // Already applied — the idempotent skip (the no-crash case + the re-run case).
             report.already_current += 1;
@@ -394,7 +394,7 @@ mod tests {
         assert_eq!(repo.reflog_len("refs/heads/main"), 1, "recreated ref's reflog restarted");
         assert_eq!(
             repo.ref_generation("refs/heads/main"),
-            4,
+            Ok(4),
             "durable generation monotonic across the delete — did NOT reset"
         );
 
@@ -449,7 +449,7 @@ mod tests {
 
         // Only seq 1 (create) applied on disk; the crash left seq 2 (delete) + seq 3 (recreate) pending.
         repo.update_ref_cas("refs/heads/main", None, Some(&c1), "create", "psn@acme.noreply").unwrap();
-        assert_eq!(repo.ref_generation("refs/heads/main"), 1);
+        assert_eq!(repo.ref_generation("refs/heads/main"), Ok(1));
 
         let zero = "0".repeat(40);
         let recs = vec![
@@ -484,7 +484,7 @@ mod tests {
         );
         assert_eq!(
             repo.ref_generation("refs/heads/main"),
-            3,
+            Ok(3),
             "the durable generation advanced monotonically across the replayed delete"
         );
         std::fs::remove_dir_all(&root).ok();

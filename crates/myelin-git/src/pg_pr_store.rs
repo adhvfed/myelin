@@ -1042,7 +1042,7 @@ impl PgPrStore {
             _ => {}
         }
         if record.state == PrState::Merged {
-            let update_seq = target_repo.ref_generation(&record.base_ref);
+            let update_seq = target_repo.ref_generation(&record.base_ref)?;
             return self.record_merge_terminal(
                 scope,
                 repo,
@@ -1221,7 +1221,7 @@ impl PgPrStore {
         let attempt = if actual.as_ref().map(|oid| oid.0.as_str())
             == Some(intent.head_oid.as_str())
         {
-            let update_seq = target_repo.ref_generation(&base.0);
+            let update_seq = target_repo.ref_generation(&base.0)?;
             self.finalize_merge(
                 scope,
                 repo,
@@ -1282,7 +1282,7 @@ impl PgPrStore {
         let base = RefName::new(intent.base_ref.clone());
         let actual = ref_store.tip(&base);
         if actual.as_ref().map(|oid| oid.0.as_str()) == Some(intent.head_oid.as_str()) {
-            let update_seq = target_repo.ref_generation(&base.0);
+            let update_seq = target_repo.ref_generation(&base.0)?;
             return self.finalize_merge(scope, repo, number, intent, command_hash, update_seq, ctx);
         }
         let expected_matches = actual.as_ref().map(|oid| oid.0.as_str())
@@ -1325,7 +1325,7 @@ impl PgPrStore {
             PushOutcome::Rejected(_reason) => {
                 let actual = ref_store.tip(&base);
                 if actual.as_ref().map(|oid| oid.0.as_str()) == Some(intent.head_oid.as_str()) {
-                    let update_seq = target_repo.ref_generation(&base.0);
+                    let update_seq = target_repo.ref_generation(&base.0)?;
                     self.finalize_merge(scope, repo, number, intent, command_hash, update_seq, ctx)
                 } else {
                     self.cancel_merge(scope, repo, number, intent, command_hash, actual, ctx)
