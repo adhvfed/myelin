@@ -99,6 +99,12 @@ pub enum PseudonymEraseError {
         /// the opaque principal id queried.
         subject: String,
     },
+    /// The mapping or erasure ledger could not be read reliably. This is distinct from absence so
+    /// callers never misreport an infrastructure or corruption fault as "never mapped."
+    Infrastructure {
+        /// Operational detail from the typed store error.
+        detail: String,
+    },
 }
 
 impl core::fmt::Display for PseudonymEraseError {
@@ -115,11 +121,24 @@ impl core::fmt::Display for PseudonymEraseError {
                 "subject `{subject}` has no pseudonym mapping in the verified (tenant, region) scope \
                  (never registered, or a different partition) — refused"
             ),
+            PseudonymEraseError::Infrastructure { detail } => write!(
+                f,
+                "pseudonym resolution could not establish mapping or erasure state — refused: \
+                 {detail}"
+            ),
         }
     }
 }
 
 impl std::error::Error for PseudonymEraseError {}
+
+impl From<PseudonymError> for PseudonymEraseError {
+    fn from(error: PseudonymError) -> Self {
+        PseudonymEraseError::Infrastructure {
+            detail: error.to_string(),
+        }
+    }
+}
 
 /// **An [`ErasureReceipt`] — the dated, PII-free proof that an `erase` (DSR step 1) completed.**
 ///
@@ -448,17 +467,27 @@ impl PseudonymErasureLedger {
     /// `true` iff the subject is recorded erased in the verified scope (the ledger remembers an
     /// erasure even after the map row + DEK are gone — the load-bearing 10.8 property).
     pub fn is_erased(&self, scope: &TenantScope, subject: &PrincipalId) -> bool {
+        self.try_is_erased(scope, subject).unwrap_or(false)
+    }
+
+    /// Fallible erasure-state read for service decisions. A backing fault must not look like a
+    /// negative erasure record.
+    pub fn try_is_erased(
+        &self,
+        scope: &TenantScope,
+        subject: &PrincipalId,
+    ) -> Result<bool, PseudonymError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            ErasureLedgerBackend::Memory(inner_arc) => inner_arc
+            ErasureLedgerBackend::Memory(inner_arc) => Ok(inner_arc
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&Self::part_key(scope))
                 .map(|m| m.contains_key(&subject.0))
-                .unwrap_or(false),
+                .unwrap_or(false)),
             ErasureLedgerBackend::Pg(pg) => pg
                 .block(pg.backing.is_erased(&scope.tenant().0, &subject.0))
-                .unwrap_or(false),
+                .map_err(|error| PseudonymError::Storage(error.to_string())),
         }
     }
 
@@ -695,6 +724,11 @@ mod tests {
         assert!(erased.contains("fails CLOSED"), "{erased}");
         assert!(no_map.contains("no pseudonym mapping"), "{no_map}");
         assert_ne!(erased, no_map);
+        let infrastructure = PseudonymEraseError::from(PseudonymError::CorruptMapping).to_string();
+        assert!(
+            infrastructure.contains("could not establish"),
+            "{infrastructure}"
+        );
     }
 
     #[test]

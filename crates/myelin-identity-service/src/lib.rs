@@ -860,18 +860,29 @@ impl StoreBackedCheck {
         scope: &myelin_storage::TenantScope,
         subject: &myelin_identity::PrincipalId,
     ) -> Result<myelin_identity::PseudonymHandle, pseudonym_erase::PseudonymEraseError> {
-        match self.pseudonyms.mapping_of(scope, subject) {
+        match self
+            .pseudonyms
+            .try_mapping_of(scope, subject)
+            .map_err(pseudonym_erase::PseudonymEraseError::from)?
+        {
             Some(row) => Ok(row.pseudonym),
             // No row: distinguish "erased" (the ledger remembers it) from "never mapped" — both fail
             // closed, but the audit distinguishes them.
-            None if self.erasure_ledger.is_erased(scope, subject) => {
-                Err(pseudonym_erase::PseudonymEraseError::Erased {
-                    subject: subject.0.clone(),
-                })
+            None => {
+                if self
+                    .erasure_ledger
+                    .try_is_erased(scope, subject)
+                    .map_err(pseudonym_erase::PseudonymEraseError::from)?
+                {
+                    Err(pseudonym_erase::PseudonymEraseError::Erased {
+                        subject: subject.0.clone(),
+                    })
+                } else {
+                    Err(pseudonym_erase::PseudonymEraseError::NoMapping {
+                        subject: subject.0.clone(),
+                    })
+                }
             }
-            None => Err(pseudonym_erase::PseudonymEraseError::NoMapping {
-                subject: subject.0.clone(),
-            }),
         }
     }
 
