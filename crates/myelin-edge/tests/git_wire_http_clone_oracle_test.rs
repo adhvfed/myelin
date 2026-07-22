@@ -518,7 +518,9 @@ async fn real_git_clone_fetch_over_smart_http_with_auth() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn over_cap_upload_pack_response_errors_cleanly() {
     use myelin_ci_sandbox::ResourceLimits;
-    use myelin_edge::{production_git_core, GitWireExecutor};
+    use myelin_edge::{
+        production_git_core_with_issuer, test_git_wire_credential_issuer, GitWireExecutor,
+    };
     use myelin_git::core::{GitCore, RepoLoc, Service};
 
     if !require_or_skip("ct006c over-cap fail-loud") {
@@ -540,7 +542,12 @@ async fn over_cap_upload_pack_response_errors_cleanly() {
         pids_max: 256,
         timeout_secs: 120,
     };
-    let core = production_git_core(&root, limits, GitWireExecutor::serving_hooks());
+    let core = production_git_core_with_issuer(
+        &root,
+        limits,
+        GitWireExecutor::serving_hooks(),
+        test_git_wire_credential_issuer(),
+    );
     let repo = RepoLoc::new("acme", "eu-west", "huge");
 
     // A v0 stateless-rpc fetch request for HEAD — the serve will try to stream the full (oversize) pack.

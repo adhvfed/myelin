@@ -27,8 +27,8 @@ use myelin_ci_sandbox::firecracker::{
 };
 use myelin_ci_sandbox::hardening::HardeningProfile;
 use myelin_ci_sandbox::{
-    EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget, ResourceLimits, RunTokenRef,
-    TrustTier, WorkspaceSpec,
+    EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget, ResourceLimits,
+    RunTokenCredential, TrustTier, WorkspaceSpec,
 };
 use std::path::PathBuf;
 
@@ -53,9 +53,7 @@ fn trivial_hardened_spec() -> JobSpec {
         },
         WorkspaceSpec::default(),
         TrustTier::Trusted,
-        RunTokenRef {
-            jti: "selftest-jti".into(),
-        },
+        RunTokenCredential::new("test-bearer", "selftest-jti", 300).unwrap(),
         MeterTarget {
             reserve_id: "selftest-reserve".into(),
         },

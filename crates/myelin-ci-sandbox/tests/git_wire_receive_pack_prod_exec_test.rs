@@ -11,7 +11,8 @@
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolve_bare_repo_path, resolved_gvisor_rootfs, GitWireSpec, IdemToken, MeterTarget,
-    ReserveHandle, ResourceLimits, RunTokenRef, RunnerHooks, SandboxBackend, ENV_GVISOR_GIT_ROOTFS,
+    ReserveHandle, ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend,
+    ENV_GVISOR_GIT_ROOTFS,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -109,7 +110,11 @@ fn run_git(args: &[&str], cwd: Option<&Path>) -> std::process::Output {
         c.current_dir(d);
     }
     let out = c.output().expect("run host git");
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     out
 }
 
@@ -149,14 +154,26 @@ fn ok_hooks() -> RunnerHooks {
 
 #[test]
 fn sandboxed_receive_pack_ingests_a_thin_pack_and_streams_a_validated_pack() {
-    let Some(_bin) = require_or_skip("ct006d receive-pack ingest") else { return };
+    let Some(_bin) = require_or_skip("ct006d receive-pack ingest") else {
+        return;
+    };
     let Some(_rootfs) = git_rootfs() else { return };
 
     let root = std::env::temp_dir().join(format!("myelin-ct006d-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let bare = resolve_bare_repo_path(&root, "acme", "fr-par", "widgets").unwrap();
     std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
-    run_git(&["init", "-q", "--bare", "-b", "main", &bare.to_string_lossy()], None);
+    run_git(
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            &bare.to_string_lossy(),
+        ],
+        None,
+    );
 
     // Author commit 1, push it (so the bare repo has a base for a THIN pack), then author commit 2.
     let work = root.join("work");
@@ -166,19 +183,43 @@ fn sandboxed_receive_pack_ingests_a_thin_pack_and_streams_a_validated_pack() {
     run_git(&["config", "user.name", "t"], Some(&work));
     std::fs::write(work.join("a.txt"), b"base content for the delta base\n").unwrap();
     run_git(&["add", "-A"], Some(&work));
-    run_git(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "c1"], Some(&work));
-    run_git(&["push", "-q", &bare.to_string_lossy(), "main"], Some(&work));
-    let base_oid = String::from_utf8_lossy(&run_git(&["rev-parse", "HEAD"], Some(&work)).stdout).trim().to_string();
+    run_git(
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "c1"],
+        Some(&work),
+    );
+    run_git(
+        &["push", "-q", &bare.to_string_lossy(), "main"],
+        Some(&work),
+    );
+    let base_oid = String::from_utf8_lossy(&run_git(&["rev-parse", "HEAD"], Some(&work)).stdout)
+        .trim()
+        .to_string();
 
-    std::fs::write(work.join("a.txt"), b"base content for the delta base\nplus a second line\n").unwrap();
+    std::fs::write(
+        work.join("a.txt"),
+        b"base content for the delta base\nplus a second line\n",
+    )
+    .unwrap();
     run_git(&["add", "-A"], Some(&work));
-    run_git(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "c2"], Some(&work));
-    let new_oid = String::from_utf8_lossy(&run_git(&["rev-parse", "HEAD"], Some(&work)).stdout).trim().to_string();
+    run_git(
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "c2"],
+        Some(&work),
+    );
+    let new_oid = String::from_utf8_lossy(&run_git(&["rev-parse", "HEAD"], Some(&work)).stdout)
+        .trim()
+        .to_string();
 
     // Build the THIN pack a push of c2 (with base c1 already on the server) would send.
     let pack = {
         let out = Command::new("git")
-            .args(["-C", &work.to_string_lossy(), "pack-objects", "--stdout", "--thin", "--revs"])
+            .args([
+                "-C",
+                &work.to_string_lossy(),
+                "pack-objects",
+                "--stdout",
+                "--thin",
+                "--revs",
+            ])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -190,11 +231,21 @@ fn sandboxed_receive_pack_ingests_a_thin_pack_and_streams_a_validated_pack() {
                 ch.wait_with_output().unwrap()
             })
             .unwrap();
-        assert!(out.status.success(), "pack-objects: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "pack-objects: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         out.stdout
     };
-    println!("=== thin pack size = {} bytes (base={base_oid}, new={new_oid}) ===", pack.len());
-    assert!(pack.starts_with(b"PACK"), "the generated pack must start with PACK");
+    println!(
+        "=== thin pack size = {} bytes (base={base_oid}, new={new_oid}) ===",
+        pack.len()
+    );
+    assert!(
+        pack.starts_with(b"PACK"),
+        "the generated pack must start with PACK"
+    );
 
     let spec = GitWireSpec::for_repo(
         &root,
@@ -205,19 +256,31 @@ fn sandboxed_receive_pack_ingests_a_thin_pack_and_streams_a_validated_pack() {
         pack,
         Vec::new(),
         None,
-        ResourceLimits { cpu_millis: 2000, mem_bytes: 512 << 20, disk_bytes: 512 << 20, pids_max: 256, timeout_secs: 120 },
-        RunTokenRef { jti: "rp-jti".into() },
-        MeterTarget { reserve_id: "rp-res".into() },
+        ResourceLimits {
+            cpu_millis: 2000,
+            mem_bytes: 512 << 20,
+            disk_bytes: 512 << 20,
+            pids_max: 256,
+            timeout_secs: 120,
+        },
+        RunTokenCredential::new("test-bearer", "rp-jti", 300).unwrap(),
+        MeterTarget {
+            reserve_id: "rp-res".into(),
+        },
         IdemToken(format!("rp-{}", std::process::id())),
     )
     .expect("locator resolves");
 
     let backend = GvisorBackend::new();
-    let launch = backend.launch_git_receive_pack(&spec, &ok_hooks()).expect("ingest launch runs");
+    let launch = backend
+        .launch_git_receive_pack(&spec, &ok_hooks())
+        .expect("ingest launch runs");
     let result = &launch.result;
     println!(
         "=== sandboxed index-pack: exit={:?} timed_out={} stdout={}B ===\nstderr={}",
-        result.exit_code, result.timed_out, result.stdout.len(),
+        result.exit_code,
+        result.timed_out,
+        result.stdout.len(),
         String::from_utf8_lossy(&result.stderr)
     );
     assert_eq!(result.exit_code, Some(0), "ingest must exit 0");
@@ -229,10 +292,18 @@ fn sandboxed_receive_pack_ingests_a_thin_pack_and_streams_a_validated_pack() {
     for (oid, ty, bytes) in &objs {
         println!("  {oid} {ty} {}B", bytes.len());
     }
-    let commit = objs.iter().find(|(oid, ty, _)| oid == &new_oid && ty == "commit");
-    assert!(commit.is_some(), "the new commit {new_oid} must be in the streamed object set, fully resolved");
+    let commit = objs
+        .iter()
+        .find(|(oid, ty, _)| oid == &new_oid && ty == "commit");
+    assert!(
+        commit.is_some(),
+        "the new commit {new_oid} must be in the streamed object set, fully resolved"
+    );
     // The commit payload is the real, delta-resolved object (starts with `tree `) — a thin delta would be opaque.
-    assert!(commit.unwrap().2.starts_with(b"tree "), "the streamed commit must be a fully-materialised object");
+    assert!(
+        commit.unwrap().2.starts_with(b"tree "),
+        "the streamed commit must be a fully-materialised object"
+    );
 
     backend.kill(&launch.handle).expect("teardown");
     println!("=== CT-006d sandbox ingest PROVEN: thin pack → validated self-contained pack via /tmp quarantine ===");

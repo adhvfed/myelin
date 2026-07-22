@@ -487,12 +487,21 @@ pub struct DelegationCaveats(pub Vec<String>);
 /// A per-run attenuated capability token (contract 4.7) — life == run life, self-hosted
 /// scope, re-mintable mid-workflow on resume (C6/C9). The mint (`mint_run_token`) lands in
 /// P-ID-18 (M1); the carrier is frozen here.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunToken {
     /// The opaque bearer material.
     pub token: String,
     /// The token's revocation id (the `jti` the denylist S7 keys on).
     pub jti: String,
+}
+
+impl core::fmt::Debug for RunToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RunToken")
+            .field("token", &"<redacted>")
+            .field("jti", &"<redacted>")
+            .finish()
+    }
 }
 
 /// A run identifier a per-run token is minted for (contract 4.7).
@@ -789,6 +798,18 @@ impl core::fmt::Display for PseudonymHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_token_debug_redacts_bearer_and_jti() {
+        let token = RunToken {
+            token: "secret-bearer".into(),
+            jti: "secret-jti".into(),
+        };
+        let rendered = format!("{token:?}");
+        assert!(!rendered.contains("secret-bearer"));
+        assert!(!rendered.contains("secret-jti"));
+        assert!(rendered.contains("<redacted>"));
+    }
 
     /// The frozen `Principal` carries the §11.1 / contract-4.1 shape
     /// `{tenant, region, principal_id, kind, data_role, status}`. Drift stops compilation.

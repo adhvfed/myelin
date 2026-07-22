@@ -38,7 +38,7 @@
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolve_bare_repo_path, resolved_gvisor_rootfs, GitWireSpec, IdemToken, MeterTarget,
-    ReserveHandle, ResourceLimits, RunTokenRef, RunnerHooks, SandboxBackend, WireError,
+    ReserveHandle, ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend, WireError,
     ENV_GVISOR_GIT_ROOTFS,
 };
 use std::path::{Path, PathBuf};
@@ -83,7 +83,9 @@ fn require_or_skip(test: &str) -> Option<String> {
             resolved_gvisor_rootfs().display()
         );
     }
-    eprintln!("[{test}] SKIPPED: `runsc` or the base rootfs absent — cannot run a gVisor container.");
+    eprintln!(
+        "[{test}] SKIPPED: `runsc` or the base rootfs absent — cannot run a gVisor container."
+    );
     None
 }
 
@@ -199,7 +201,14 @@ fn make_repo_with_commit(root: &Path, tenant: &str, region: &str, repo: &str) ->
     std::fs::write(work.join("f.txt"), b"hello git wire\n").expect("write file");
     run_git(&["add", "f.txt"], Some(&work));
     run_git(
-        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "first commit"],
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "first commit",
+        ],
         Some(&work),
     );
     run_git(
@@ -249,11 +258,14 @@ fn limits() -> ResourceLimits {
     }
 }
 
-fn tokens(tag: &str) -> (RunTokenRef, MeterTarget, IdemToken) {
+fn tokens(tag: &str) -> (RunTokenCredential, MeterTarget, IdemToken) {
     (
-        RunTokenRef {
-            jti: format!("git-wire-{tag}-jti"),
-        },
+        RunTokenCredential::new(
+            format!("git-wire-{tag}-bearer"),
+            format!("git-wire-{tag}-jti"),
+            300,
+        )
+        .unwrap(),
         MeterTarget {
             reserve_id: format!("git-wire-{tag}-reserve"),
         },
@@ -293,7 +305,7 @@ fn sandboxed_upload_pack_advertise_refs_lists_the_real_repo() {
             "--stateless-rpc".into(),
             "--advertise-refs".into(),
         ],
-        Vec::new(),    // advertise needs no request body
+        Vec::new(),     // advertise needs no request body
         git_env(false), // v0 advertisement (lists refs + oid)
         None,
         limits(),
@@ -311,12 +323,23 @@ fn sandboxed_upload_pack_advertise_refs_lists_the_real_repo() {
     let stdout = String::from_utf8_lossy(&result.stdout);
 
     println!("=== CT-006a REAL sandboxed `git upload-pack --advertise-refs /repo` ===");
-    println!("exit_code = {:?}  timed_out = {}", result.exit_code, result.timed_out);
+    println!(
+        "exit_code = {:?}  timed_out = {}",
+        result.exit_code, result.timed_out
+    );
     println!("HEAD oid (host) = {oid}");
     println!("captured stdout (verbatim) =\n{stdout}");
-    println!("captured stderr = {:?}", String::from_utf8_lossy(&result.stderr));
+    println!(
+        "captured stderr = {:?}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 
-    assert_eq!(result.exit_code, Some(0), "upload-pack must exit 0; stderr: {:?}", String::from_utf8_lossy(&result.stderr));
+    assert_eq!(
+        result.exit_code,
+        Some(0),
+        "upload-pack must exit 0; stderr: {:?}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert!(!result.timed_out);
     assert!(
         stdout.contains(&oid),
@@ -377,7 +400,12 @@ fn sandboxed_upload_pack_v2_ls_refs_round_trip_with_bounded_stdin() {
     println!("exit_code = {:?}", result.exit_code);
     println!("captured stdout (verbatim) =\n{stdout}");
 
-    assert_eq!(result.exit_code, Some(0), "ls-refs must exit 0; stderr: {:?}", String::from_utf8_lossy(&result.stderr));
+    assert_eq!(
+        result.exit_code,
+        Some(0),
+        "ls-refs must exit 0; stderr: {:?}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert!(
         stdout.contains(&oid) && stdout.contains("refs/heads/main"),
         "the v2 ls-refs response must carry the real oid + refs/heads/main (proves bounded-stdin \
@@ -394,19 +422,31 @@ fn cross_tenant_and_traversal_locators_are_refused_before_any_mount() {
 
     // A `..` traversal repo slug collapsing onto another tenant.
     let r = resolve_bare_repo_path(&root, "acme", "fr-par", "../../victim/fr-par/secret");
-    assert!(matches!(r, Err(WireError::Path(_))), "a `..` repo slug must be refused, got {r:?}");
+    assert!(
+        matches!(r, Err(WireError::Path(_))),
+        "a `..` repo slug must be refused, got {r:?}"
+    );
 
     // A traversing tenant segment.
     let r = resolve_bare_repo_path(&root, "..", "fr-par", "widgets");
-    assert!(matches!(r, Err(WireError::Path(_))), "a `..` tenant must be refused, got {r:?}");
+    assert!(
+        matches!(r, Err(WireError::Path(_))),
+        "a `..` tenant must be refused, got {r:?}"
+    );
 
     // An absolute-looking / separator-bearing region.
     let r = resolve_bare_repo_path(&root, "acme", "fr-par/../other", "widgets");
-    assert!(matches!(r, Err(WireError::Path(_))), "a `/`-bearing region must be refused, got {r:?}");
+    assert!(
+        matches!(r, Err(WireError::Path(_))),
+        "a `/`-bearing region must be refused, got {r:?}"
+    );
 
     // A NUL/backslash slug.
     let r = resolve_bare_repo_path(&root, "acme", "fr-par", "wid\\gets");
-    assert!(matches!(r, Err(WireError::Path(_))), "a backslash slug must be refused, got {r:?}");
+    assert!(
+        matches!(r, Err(WireError::Path(_))),
+        "a backslash slug must be refused, got {r:?}"
+    );
 
     // The constructor refuses identically (so a cross-tenant spec can never be BUILT, let alone mounted).
     let (rt, mt, it) = tokens("evil");

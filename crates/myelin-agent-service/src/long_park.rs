@@ -73,8 +73,8 @@ use crate::escape_gate::AgentExecGate;
 use crate::exec::{RoutingError, SandboxJob};
 use myelin_agent::{Command, ToolDef};
 use myelin_ci_sandbox::{
-    EgressPolicy, IdemToken, ImageRef, MeterTarget, ResourceLimits, RunTokenRef, SandboxBackend,
-    SecretRef, TrustTier,
+    EgressPolicy, IdemToken, ImageRef, MeterTarget, ResourceLimits, RunTokenCredential,
+    SandboxBackend, SecretRef, TrustTier,
 };
 use myelin_flow::{JobKind, JobOutcome, JobRunner, JobSpec, WfCtx, WfResult};
 use myelin_refs::ArtifactRef;
@@ -335,7 +335,7 @@ pub struct LongComputeProfile {
     /// The run's trust tier (gates secrets/cache/egress; X-1).
     pub trust_tier: TrustTier,
     /// The per-run attenuated token (guarantee #2; minted at dispatch, re-minted on resume).
-    pub run_token: RunTokenRef,
+    pub run_token: RunTokenCredential,
     /// The reserve this run settles against (guarantee #1; reserved at dispatch).
     pub meter_to: MeterTarget,
     /// The dispatch idempotency token stamped on the hardened job (the backend dedups a re-dispatch
@@ -522,9 +522,7 @@ mod tests {
             egress: EgressPolicy::deny_all(),
             limits: limits(),
             trust_tier: TrustTier::UntrustedFork,
-            run_token: RunTokenRef {
-                jti: "agent-jti".into(),
-            },
+            run_token: RunTokenCredential::new("test-bearer", "agent-jti", 300).unwrap(),
             meter_to: MeterTarget {
                 reserve_id: "agent-res".into(),
             },

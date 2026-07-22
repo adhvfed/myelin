@@ -140,7 +140,7 @@ pub use myelin_tenancy::Region;
 /// **Construction is fail-closed.** Use [`JobSpec::new`] (validates the digest-pin-or-reject rule
 /// — contract CI-1 / arch 01 §2 / arch 02 §5.3) rather than building the struct literally, so an
 /// un-digested image can never reach the runner.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobSpec {
     /// `Ci | Agent` — the UNIFY point (TE-31 = UNIFY; X-6). The ONLY thing that differs between a
     /// CI run and an agent `exec` on this runner.
@@ -169,7 +169,7 @@ pub struct JobSpec {
     pub trust_tier: TrustTier,
     /// The per-job attenuated token (`Id::mint_run_token`, contract 4.7) — guarantee #2,
     /// attribution; life == run life, auto-revoked on teardown.
-    pub run_token: RunTokenRef,
+    pub run_token: RunTokenCredential,
     /// The reserve this job settles against (run-level / agent-run-level) — guarantee #1, the cost
     /// gate (contract 11.7).
     pub meter_to: MeterTarget,
@@ -180,7 +180,7 @@ pub struct JobSpec {
 
 /// Immutable, non-launchable job template persisted while work waits in the durable queue.
 ///
-/// It intentionally omits [`RunTokenRef`]: per-job credentials are short-lived and must be minted
+/// It intentionally omits [`RunTokenCredential`]: per-job credentials are short-lived and must be minted
 /// only after the scheduler has issued an exact live claim. A template becomes executable solely
 /// through [`JobSpecTemplate::resolve`], which attaches that claim-generation token immediately
 /// before launch. This keeps bearer/token lifetime equal to activity lifetime without persisting an
@@ -367,6 +367,104 @@ pub struct RunTokenRef {
     pub jti: String,
 }
 
+/// A freshly minted, executable per-job credential.
+///
+/// Unlike [`RunTokenRef`], this type carries the opaque bearer material needed at the final launch
+/// boundary. It deliberately implements neither `Serialize` nor `Deserialize`, redacts both the
+/// bearer and JTI from `Debug`, and zeroizes the bearer on drop. Durable queue/spec records must use
+/// [`JobSpecTemplate`] plus a stable authority handle and may never contain this value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RunTokenCredential {
+    /// Public revocation/attribution reference. The bearer remains private.
+    pub jti: String,
+    bearer: String,
+    ttl_secs: u64,
+}
+
+impl RunTokenCredential {
+    /// Construct a bounded executable credential. Empty/overlong identifiers, empty bearer
+    /// material, and non-positive TTLs are refused before a sandbox can receive the value.
+    pub fn new(
+        bearer: impl Into<String>,
+        jti: impl Into<String>,
+        ttl_secs: u64,
+    ) -> Result<Self, RunTokenCredentialError> {
+        let bearer = bearer.into();
+        let jti = jti.into();
+        if bearer.trim().is_empty() {
+            return Err(RunTokenCredentialError::EmptyBearer);
+        }
+        if jti.trim().is_empty() || jti.len() > 512 {
+            return Err(RunTokenCredentialError::InvalidJti);
+        }
+        if ttl_secs == 0 {
+            return Err(RunTokenCredentialError::NonPositiveTtl);
+        }
+        Ok(Self {
+            jti,
+            bearer,
+            ttl_secs,
+        })
+    }
+
+    /// Expose the bearer only to the final-boundary verifier/broker that immediately consumes it.
+    pub fn expose_bearer(&self) -> &str {
+        &self.bearer
+    }
+
+    /// The short fail-static lifetime Identity minted this credential under.
+    pub fn ttl_secs(&self) -> u64 {
+        self.ttl_secs
+    }
+
+    /// Project the public attribution/revocation handle without exposing bearer material.
+    pub fn reference(&self) -> RunTokenRef {
+        RunTokenRef {
+            jti: self.jti.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for RunTokenCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunTokenCredential")
+            .field("jti", &"<redacted>")
+            .field("bearer", &"<redacted>")
+            .field("ttl_secs", &self.ttl_secs)
+            .finish()
+    }
+}
+
+impl Drop for RunTokenCredential {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.bearer.zeroize();
+    }
+}
+
+/// Structural refusal constructing an executable run-token credential. No variant carries token
+/// material, so errors are safe to surface across the runner boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunTokenCredentialError {
+    EmptyBearer,
+    InvalidJti,
+    NonPositiveTtl,
+}
+
+impl std::fmt::Display for RunTokenCredentialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyBearer => f.write_str("run-token bearer material must be non-empty"),
+            Self::InvalidJti => {
+                f.write_str("run-token JTI must be non-empty and at most 512 bytes")
+            }
+            Self::NonPositiveTtl => f.write_str("run-token TTL must be positive"),
+        }
+    }
+}
+
+impl std::error::Error for RunTokenCredentialError {}
+
 /// The reserve this job settles against (contract 11.7) — guarantee #1, the cost gate.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeterTarget {
@@ -434,7 +532,7 @@ impl JobSpec {
         limits: ResourceLimits,
         workspace: WorkspaceSpec,
         trust_tier: TrustTier,
-        run_token: RunTokenRef,
+        run_token: RunTokenCredential,
         meter_to: MeterTarget,
         idem_token: IdemToken,
     ) -> Result<JobSpec, SpecError> {
@@ -455,9 +553,9 @@ impl JobSpec {
         })
     }
 
-    /// Split a resolved launch spec into its persistable template and ephemeral token reference.
-    /// Callers must not serialize the returned token alongside the template.
-    pub fn into_template(self) -> (JobSpecTemplate, RunTokenRef) {
+    /// Split a resolved launch spec into its persistable template and ephemeral credential.
+    /// Callers must not serialize or persist the returned credential alongside the template.
+    pub fn into_template(self) -> (JobSpecTemplate, RunTokenCredential) {
         let template = JobSpecTemplate {
             kind: self.kind,
             image: self.image,
@@ -509,8 +607,8 @@ impl JobSpecTemplate {
     }
 
     /// Attach the freshly minted claim-generation token and produce the only type a sandbox can
-    /// launch. The template itself has no launch method and contains no token reference.
-    pub fn resolve(self, run_token: RunTokenRef) -> JobSpec {
+    /// launch. The template itself has no launch method and contains no credential.
+    pub fn resolve(self, run_token: RunTokenCredential) -> JobSpec {
         JobSpec {
             kind: self.kind,
             image: self.image,
@@ -817,7 +915,7 @@ pub type ReserveHook = Box<dyn Fn(&MeterTarget) -> Result<ReserveHandle, HookErr
 pub type SettleHook =
     Box<dyn Fn(&ReserveHandle, ResourceUsage) -> Result<(), HookError> + Send + Sync>;
 /// Guarantee #2 hook type (contract 4.7 mint_run_token): per-run attenuated-token attribution.
-pub type AttributeHook = Box<dyn Fn(&RunTokenRef) -> Result<(), HookError> + Send + Sync>;
+pub type AttributeHook = Box<dyn Fn(&RunTokenCredential) -> Result<(), HookError> + Send + Sync>;
 /// Guarantee #4 hook type (arch 02 §5.3): apply + verify the mandatory hardening profile.
 pub type IsolationFloorHook = Box<dyn Fn(&JobSpec) -> Result<(), HookError> + Send + Sync>;
 
@@ -892,7 +990,7 @@ pub fn agent_job(
     egress: EgressPolicy,
     limits: ResourceLimits,
     trust_tier: TrustTier,
-    run_token: RunTokenRef,
+    run_token: RunTokenCredential,
     meter_to: MeterTarget,
     idem_token: IdemToken,
 ) -> Result<JobSpec, SpecError> {
@@ -930,6 +1028,10 @@ mod tests {
         }
     }
 
+    fn credential(jti: &str) -> RunTokenCredential {
+        RunTokenCredential::new(format!("test-bearer:{jti}"), jti, 300).unwrap()
+    }
+
     #[test]
     fn queued_template_contains_no_token_and_resolves_only_at_claim() {
         let template = JobSpecTemplate::new(
@@ -952,10 +1054,9 @@ mod tests {
         assert!(wire.get("run_token").is_none());
         assert!(!wire.to_string().contains("jti"));
 
-        let spec = template.resolve(RunTokenRef {
-            jti: "claim-jti".into(),
-        });
+        let spec = template.resolve(credential("claim-jti"));
         assert_eq!(spec.run_token.jti, "claim-jti");
+        assert_eq!(spec.run_token.expose_bearer(), "test-bearer:claim-jti");
     }
 
     fn ci_spec() -> JobSpec {
@@ -975,9 +1076,7 @@ mod tests {
             limits(),
             WorkspaceSpec::default(),
             TrustTier::Trusted,
-            RunTokenRef {
-                jti: "jti-1".into(),
-            },
+            credential("jti-1"),
             MeterTarget {
                 reserve_id: "res-1".into(),
             },
@@ -1060,7 +1159,7 @@ mod tests {
             limits(),
             WorkspaceSpec::default(),
             TrustTier::Trusted,
-            RunTokenRef { jti: "j".into() },
+            credential("j"),
             MeterTarget {
                 reserve_id: "r".into(),
             },
@@ -1088,7 +1187,7 @@ mod tests {
             l,
             WorkspaceSpec::default(),
             TrustTier::Trusted,
-            RunTokenRef { jti: "j".into() },
+            credential("j"),
             MeterTarget {
                 reserve_id: "r".into(),
             },
@@ -1108,7 +1207,7 @@ mod tests {
             l,
             WorkspaceSpec::default(),
             TrustTier::Trusted,
-            RunTokenRef { jti: "j".into() },
+            credential("j"),
             MeterTarget {
                 reserve_id: "r".into(),
             },
@@ -1117,14 +1216,27 @@ mod tests {
         assert_eq!(r.unwrap_err(), SpecError::NoTimeout);
     }
 
-    // --- The JobSpec round-trip (serde) ---
-
     #[test]
-    fn jobspec_round_trips_through_json() {
-        let spec = ci_spec();
-        let json = serde_json::to_string(&spec).unwrap();
-        let back: JobSpec = serde_json::from_str(&json).unwrap();
-        assert_eq!(spec, back);
+    fn executable_credential_is_bounded_and_debug_redacted() {
+        let credential = credential("secret-jti");
+        let rendered = format!("{credential:?}");
+        assert!(!rendered.contains("test-bearer"));
+        assert!(!rendered.contains("secret-jti"));
+        assert!(rendered.contains("<redacted>"));
+        assert_eq!(credential.ttl_secs(), 300);
+        assert_eq!(credential.reference().jti, "secret-jti");
+        assert_eq!(
+            RunTokenCredential::new("", "jti", 1).unwrap_err(),
+            RunTokenCredentialError::EmptyBearer
+        );
+        assert_eq!(
+            RunTokenCredential::new("bearer", "", 1).unwrap_err(),
+            RunTokenCredentialError::InvalidJti
+        );
+        assert_eq!(
+            RunTokenCredential::new("bearer", "jti", 0).unwrap_err(),
+            RunTokenCredentialError::NonPositiveTtl
+        );
     }
 
     #[test]
@@ -1145,9 +1257,7 @@ mod tests {
             EgressPolicy::deny_all(),
             limits(),
             TrustTier::UntrustedFork,
-            RunTokenRef {
-                jti: "agent-jti".into(),
-            },
+            credential("agent-jti"),
             MeterTarget {
                 reserve_id: "agent-res".into(),
             },
@@ -1168,7 +1278,7 @@ mod tests {
             EgressPolicy::deny_all(),
             limits(),
             TrustTier::UntrustedFork,
-            RunTokenRef { jti: "j".into() },
+            credential("j"),
             MeterTarget {
                 reserve_id: "r".into(),
             },
@@ -1235,6 +1345,32 @@ mod tests {
         assert!(!launch.result.timed_out);
         assert!(launch.result.passed());
         backend.kill(&launch.handle).unwrap();
+    }
+
+    #[test]
+    fn final_launch_hook_receives_the_ephemeral_bearer_and_ttl() {
+        let backend = NoopBackend;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_at_boundary = seen.clone();
+        let hooks = RunnerHooks {
+            reserve: Box::new(|m| Ok(ReserveHandle(m.reserve_id.clone()))),
+            settle: Box::new(|_h, _u| Ok(())),
+            attribute: Box::new(move |credential| {
+                *seen_at_boundary.lock().unwrap() = Some((
+                    credential.expose_bearer().to_owned(),
+                    credential.jti.clone(),
+                    credential.ttl_secs(),
+                ));
+                Ok(())
+            }),
+            isolation_floor: Box::new(|_s| Ok(())),
+        };
+
+        backend.launch(&ci_spec(), &hooks).unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(("test-bearer:jti-1".into(), "jti-1".into(), 300))
+        );
     }
 
     #[test]

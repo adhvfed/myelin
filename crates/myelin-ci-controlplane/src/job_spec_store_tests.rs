@@ -1,4 +1,4 @@
-//! CT-004d.1 — DB-free unit gates for the durable `JobSpec` store: the jsonb round-trip is FAITHFUL
+//! CT-004d.1 — DB-free unit gates for the durable launch-template store: the jsonb round-trip is FAITHFUL
 //! (every field), a corrupt/missing spec is a fail-closed resolve error (never a fabricated default),
 //! the SECURITY trust-tier + lease-TTL dispatch invariants fail closed, and the SQL constants carry
 //! the exact bind arity the store binds. The live PG co-persist → claim → resolve → runsc exec end to
@@ -6,8 +6,8 @@
 
 use super::*;
 use myelin_ci_sandbox::{
-    EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind, MeterTarget, ResourceLimits, RunTokenRef,
-    SecretRef, TrustTier, WorkspaceSpec,
+    EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind, MeterTarget, ResourceLimits,
+    RunTokenCredential, SecretRef, TrustTier, WorkspaceSpec,
 };
 
 /// A fully-populated durable launch template — EVERY field set to a non-default, distinguishable value, so the
@@ -43,7 +43,7 @@ fn full_spec(trust: TrustTier, timeout_secs: u32) -> DurableCiJobLaunchTemplate 
             commit: Some("deadbeefcafe".into()),
         },
         trust,
-        RunTokenRef { jti: "run-token-jti-xyz".into() },
+        RunTokenCredential::new("test-bearer", "run-token-jti-xyz", 300).unwrap(),
         MeterTarget { reserve_id: "reserve-9910".into() },
         IdemToken("idem-ci.pipeline:stage-3".into()),
     )
@@ -56,16 +56,14 @@ fn full_spec(trust: TrustTier, timeout_secs: u32) -> DurableCiJobLaunchTemplate 
     }
 }
 
-/// **The whole `JobSpec` round-trips through the `spec jsonb` column FAITHFULLY (every field).** The
-/// stored spec is what EXECUTES, so fidelity is load-bearing: serialize → jsonb value → decode back
-/// yields an EQUAL spec, with every field (image digest, command, env, secret refs, egress allowlist,
-/// all five resource limits, workspace repo+commit, trust tier, run token, meter target, idem token)
-/// preserved. This is the guarantee `get_spec` rests on.
+/// **The whole non-secret launch template round-trips through `spec jsonb` FAITHFULLY.** Fidelity is
+/// load-bearing: serialize → jsonb → decode yields an equal template, while the claim-bound bearer
+/// and JTI are structurally absent and can only be attached after a live lease is issued.
 #[test]
-fn a_full_jobspec_round_trips_through_jsonb_faithfully() {
+fn a_full_launch_template_round_trips_without_a_token() {
     let spec = full_spec(TrustTier::UntrustedFork, 1800);
     // serialize exactly as `co_persist_dispatch` does (serde_json::to_value → the jsonb column).
-    let json = serde_json::to_value(&spec).expect("JobSpec serializes to jsonb");
+    let json = serde_json::to_value(&spec).expect("launch template serializes to jsonb");
     // decode exactly as `get_spec` does.
     let back = decode_launch_template(&uid_job(), json)
         .expect("the stored jsonb decodes back to a launch template");
@@ -121,10 +119,10 @@ fn a_full_jobspec_round_trips_through_jsonb_faithfully() {
 /// then does not launch), never coerce to a fabricated default spec.
 #[test]
 fn a_corrupt_spec_jsonb_is_a_fail_closed_resolve_error() {
-    // A syntactically-fine json that is NOT a JobSpec shape.
+    // A syntactically-fine json that is NOT a launch-template shape.
     let corrupt = serde_json::json!({ "not": "a jobspec", "kind": "Nonsense" });
     let e = decode_launch_template("11111111-1111-1111-1111-111111111111", corrupt)
-        .expect_err("a non-JobSpec jsonb fails the resolve closed");
+        .expect_err("a non-template jsonb fails the resolve closed");
     assert!(
         matches!(e, CiJobSpecStoreError::CorruptSpec { .. }),
         "an un-decodable spec is CorruptSpec (fail-closed), got: {e:?}"

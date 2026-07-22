@@ -477,13 +477,16 @@ impl HardeningProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{IdemToken, MeterTarget, RunTokenRef};
+    use crate::{IdemToken, MeterTarget, RunTokenCredential};
     use crate::{ImageRef, JobKind, ResourceLimits, TrustTier, WorkspaceSpec};
 
     fn spec_with_egress(allow: Vec<String>) -> JobSpec {
         JobSpec::new(
             JobKind::Ci,
-            ImageRef::pinned("r/img@sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890").unwrap(),
+            ImageRef::pinned(
+                "r/img@sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890",
+            )
+            .unwrap(),
             vec!["echo".into(), "hi".into()],
             vec![],
             vec![],
@@ -497,7 +500,7 @@ mod tests {
             },
             WorkspaceSpec::default(),
             TrustTier::Trusted,
-            RunTokenRef { jti: "j".into() },
+            RunTokenCredential::new("test-bearer", "j", 300).unwrap(),
             MeterTarget {
                 reserve_id: "r".into(),
             },
@@ -661,7 +664,10 @@ mod tests {
                 "always-blocked prefix {prefix} ({net}) is missing from the firewall CIDR list"
             );
         }
-        assert!(cidrs.contains("172.16.0.0/12"), "the 172.16/12 range must be dropped");
+        assert!(
+            cidrs.contains("172.16.0.0/12"),
+            "the 172.16/12 range must be dropped"
+        );
         assert!(
             cidrs.contains("169.254.169.254/32"),
             "the metadata IP must be dropped as an explicit /32"
@@ -718,7 +724,8 @@ mod tests {
     fn emit_ruleset_never_accepts_an_always_blocked_ip_literal() {
         // An IP literal that is always-blocked (10.0.0.1) is a valid literal but must NOT be accepted.
         let p = HardeningProfile::derive(&spec_with_egress(vec!["10.0.0.1".into()]));
-        let rs = emit_egress_ruleset(&p).expect("an IP literal is enforceable (just not permitted)");
+        let rs =
+            emit_egress_ruleset(&p).expect("an IP literal is enforceable (just not permitted)");
         assert!(!rs.contains("ip daddr 10.0.0.1 accept"));
     }
 
@@ -731,7 +738,9 @@ mod tests {
         fn apply(&self, ruleset: &str) -> Result<EnforcedEgress, EgressEnforceError> {
             *self.seen.lock().unwrap() = Some(ruleset.to_string());
             if self.fail {
-                Err(EgressEnforceError::ApplyFailed("injected nft failure".into()))
+                Err(EgressEnforceError::ApplyFailed(
+                    "injected nft failure".into(),
+                ))
             } else {
                 Ok(EnforcedEgress::new(ruleset.to_string()))
             }
@@ -746,7 +755,10 @@ mod tests {
             seen: std::sync::Mutex::new(None),
         };
         assert_eq!(enforce_egress(&p, &enf).unwrap(), None);
-        assert!(enf.seen.lock().unwrap().is_none(), "no ruleset applied when no NIC is needed");
+        assert!(
+            enf.seen.lock().unwrap().is_none(),
+            "no ruleset applied when no NIC is needed"
+        );
     }
 
     #[test]
@@ -756,7 +768,9 @@ mod tests {
             fail: false,
             seen: std::sync::Mutex::new(None),
         };
-        let rec = enforce_egress(&p, &enf).unwrap().expect("a NIC needs a recorded ruleset");
+        let rec = enforce_egress(&p, &enf)
+            .unwrap()
+            .expect("a NIC needs a recorded ruleset");
         assert!(rec.ruleset().contains("policy drop;"));
         assert_eq!(rec.ruleset(), enf.seen.lock().unwrap().as_deref().unwrap());
     }
@@ -770,7 +784,9 @@ mod tests {
         };
         assert_eq!(
             enforce_egress(&p, &enf),
-            Err(EgressEnforceError::ApplyFailed("injected nft failure".into()))
+            Err(EgressEnforceError::ApplyFailed(
+                "injected nft failure".into()
+            ))
         );
     }
 

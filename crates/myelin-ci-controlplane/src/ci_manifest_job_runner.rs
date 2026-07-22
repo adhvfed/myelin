@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use myelin_ci_sandbox::{
     EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind as SandboxJobKind,
-    JobSpecTemplate as SandboxJobSpecTemplate, MeterTarget, ResourceLimits, RunTokenRef, SecretRef,
-    TrustTier as SandboxTrustTier, WorkspaceSpec,
+    JobSpecTemplate as SandboxJobSpecTemplate, MeterTarget, ResourceLimits, RunTokenCredential,
+    SecretRef, TrustTier as SandboxTrustTier, WorkspaceSpec,
 };
 use myelin_flow::{
     ActivityError, JobKind, JobRunner, JobSpec as FlowJobSpec, PgFlowWorker, PgResolvedDriveInput,
@@ -52,6 +52,9 @@ pub struct CiJobTokenRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiJobTokenIssueError(pub String);
 
+/// Maximum fail-static window accepted from Identity for a claim-bound CI credential.
+pub const MAX_CI_JOB_TOKEN_TTL_SECS: u64 = 300;
+
 impl std::fmt::Display for CiJobTokenIssueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "CI job token mint refused: {}", self.0)
@@ -61,14 +64,14 @@ impl std::fmt::Display for CiJobTokenIssueError {
 impl std::error::Error for CiJobTokenIssueError {}
 
 /// Explicit short-lived token mint. Implementations must be retry-safe for the complete request:
-/// repeated calls for the same live claim generation must resolve the same active JTI. A reaped and
-/// newly claimed job carries a new epoch/nonce and may receive a fresh token. There is no permissive
-/// default.
+/// repeated calls for the same live claim generation must resolve the same active credential. A
+/// reaped and newly claimed job carries a new epoch/nonce and may receive a fresh token. There is no
+/// permissive default.
 pub trait CiJobTokenIssuer: Send + Sync {
     fn mint(
         &self,
         request: CiJobTokenRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<RunTokenRef, CiJobTokenIssueError>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<RunTokenCredential, CiJobTokenIssueError>> + Send + '_>>;
 }
 
 /// Per-run durable adapter. The validated manifest is the sole source of executable and scheduling
@@ -257,12 +260,13 @@ fn manifest_lane(lane: CiManifestLaneV1) -> Lane {
 }
 
 pub(crate) fn validate_run_token(
-    token: &RunTokenRef,
+    token: &RunTokenCredential,
     token_authority_handle: &str,
 ) -> Result<(), ActivityError> {
-    if token.jti.trim().is_empty() || token.jti.len() > 512 || token.jti == token_authority_handle {
+    if token.jti == token_authority_handle || token.ttl_secs() > MAX_CI_JOB_TOKEN_TTL_SECS {
         return Err(ActivityError(
-            "CI token issuer returned an invalid JTI or copied the authority handle".into(),
+            "CI token issuer returned an overlong-lived credential or copied the authority handle"
+                .into(),
         ));
     }
     Ok(())
@@ -295,21 +299,17 @@ mod tests {
     }
 
     #[test]
-    fn token_jti_must_be_bounded_nonempty_and_distinct_from_authority_handle() {
+    fn token_credential_must_be_short_lived_and_distinct_from_authority_handle() {
         assert!(validate_run_token(
-            &RunTokenRef {
-                jti: "jti:1".into()
-            },
+            &RunTokenCredential::new("bearer", "jti:1", MAX_CI_JOB_TOKEN_TTL_SECS).unwrap(),
             "mint:1"
         )
         .is_ok());
-        for jti in [
-            String::new(),
-            "   ".into(),
-            "mint:1".into(),
-            "x".repeat(513),
-        ] {
-            assert!(validate_run_token(&RunTokenRef { jti }, "mint:1").is_err());
-        }
+        let copied = RunTokenCredential::new("bearer", "mint:1", 1).unwrap();
+        assert!(validate_run_token(&copied, "mint:1").is_err());
+        let overlong =
+            RunTokenCredential::new("bearer", "jti:overlong", MAX_CI_JOB_TOKEN_TTL_SECS + 1)
+                .unwrap();
+        assert!(validate_run_token(&overlong, "mint:1").is_err());
     }
 }

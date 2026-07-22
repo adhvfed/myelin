@@ -56,8 +56,8 @@ use myelin_ci_sandbox::{
 };
 #[cfg(any(test, feature = "test-support"))]
 use myelin_ci_sandbox::{
-    EgressPolicy, ImageRef, JobKind as SandboxJobKind, MeterTarget, ResourceLimits, RunTokenRef,
-    TrustTier, WorkspaceSpec,
+    EgressPolicy, ImageRef, JobKind as SandboxJobKind, MeterTarget, ResourceLimits,
+    RunTokenCredential, TrustTier, WorkspaceSpec,
 };
 #[cfg(any(test, feature = "test-support"))]
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
@@ -1447,9 +1447,8 @@ pub fn fixed_command_spec_builder(
             WorkspaceSpec::default(),
             // placeholders — DurableJobRunner::dispatch overwrites both from the run's terms + dispatch.
             TrustTier::Trusted,
-            RunTokenRef {
-                jti: "ci-pipeline-driver-jti".into(),
-            },
+            RunTokenCredential::new("ci-pipeline-driver-bearer", "ci-pipeline-driver-jti", 300)
+                .expect("static driver credential is valid"),
             MeterTarget {
                 reserve_id: "ci-pipeline-driver-reserve".into(),
             },

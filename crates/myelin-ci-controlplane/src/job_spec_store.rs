@@ -1,4 +1,4 @@
-//! # `job_spec_store` — CT-004d.1: the durable `JobSpec` store + the dispatch→durable co-persist
+//! # `job_spec_store` — CT-004d.1: durable launch templates + dispatch co-persistence
 //!
 //! **Owning architecture doc (byte-authoritative):**
 //! `planning/04-subsystem-architectures/continuous-integration/architecture/02-internals-and-algorithms.md`
@@ -66,7 +66,7 @@ use crate::job_queue_store::{parse_id, trust_token};
 use crate::scheduler::{EnqueueOutcome, INSERT_JOB_QUEUE_QUERY};
 use crate::DurableEnqueue;
 
-/// **The wall-clock ceiling a dispatched [`JobSpec`]'s `timeout_secs` may not exceed (CT-004d.1).**
+/// **The wall-clock ceiling a dispatched [`JobSpecTemplate`]'s timeout may not exceed.**
 /// The runner's lease TTL is wired ABOVE this (see [`crate::runner_bind::CI_RUNNER_LEASE_TTL_SECS`]),
 /// so a leased job can never outlive its lease mid-run (the CT-004c.2 double-run guard, closed at the
 /// dispatch). 6 h (GitHub-Actions parity) — comfortably above every real CI job (the workspace's
@@ -74,7 +74,7 @@ use crate::DurableEnqueue;
 /// fail-closed rather than admitted as a lease-outliving double-run hazard.
 pub const MAX_JOB_TIMEOUT_SECS: u32 = 6 * 60 * 60;
 
-/// **Persist a dispatched stage's [`JobSpec`] keyed `(tenant_id, job_id)`, idempotent on the PK
+/// **Persist a dispatched stage's [`JobSpecTemplate`] keyed `(tenant_id, job_id)`, idempotent on the PK
 /// ([`CiJobSpecStore::co_persist_dispatch`] co-writes it with the `job_queue` row).** Binds:
 /// `$1 tenant_id`, `$2 region`, `$3 job_id` (uuid), `$4 run_id` (uuid), `$5 idem_token`,
 /// `$6 spec` (jsonb). `ON CONFLICT (tenant_id, job_id) DO NOTHING` makes a re-dispatch a no-op — the
@@ -86,7 +86,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (tenant_id, job_id) DO NOTHING
 RETURNING job_id";
 
-/// **Read a leased job's persisted [`JobSpec`] back (the runner's resolve path).** Keyed on the
+/// **Read a leased job's persisted [`JobSpecTemplate`] back (the runner's resolve path).** Keyed on the
 /// `(tenant_id, job_id)` the leased `job_queue` row carries. Binds `$1 tenant_id`, `$2 job_id` (uuid).
 /// Returns the `spec jsonb` for deserialization; NO row → the loud [`CiJobSpecStoreError::SpecNotFound`]
 /// (fail-closed — the runner does not launch an unresolved job).
@@ -143,9 +143,8 @@ pub struct DurableCiJobLaunchTemplate {
 // Typed, fail-loud error (no silent drop / coerce / fabricated-default spec).
 // =================================================================================================
 
-/// A durable `JobSpec`-store failure. Loud + typed — a persist/resolve NEVER silently drops, coerces,
-/// or fabricates a default spec (the stored spec is what EXECUTES, so a corrupt/missing spec is a
-/// fail-closed resolve error). Safe to log: carries only the structural fault + the opaque
+/// A durable launch-template-store failure. Loud + typed — persist/resolve never silently drops,
+/// coerces, or fabricates a default template. Safe to log: carries only the structural fault + opaque
 /// tenant/job/idem tokens the CI schema already keys on, never the spec's inner material.
 #[derive(Debug)]
 pub enum CiJobSpecStoreError {
@@ -167,16 +166,14 @@ pub enum CiJobSpecStoreError {
         /// The job id whose spec is absent.
         job_id: String,
     },
-    /// A stored `spec jsonb` did not deserialize back to a [`JobSpec`] (a corrupt durable write) —
-    /// surfaced loudly (never silently coerced to a default). The stored spec is what executes, so an
-    /// un-decodable one MUST fail the resolve closed.
+    /// A stored `spec jsonb` did not deserialize to a launch template (a corrupt durable write).
     CorruptSpec {
         /// The job id whose spec failed to decode.
         job_id: String,
         /// The serde error (structural — not the spec's inner material).
         detail: String,
     },
-    /// A serialize of the [`JobSpec`] to jsonb failed (should not happen for a well-formed spec) —
+    /// Serializing the [`JobSpecTemplate`] to jsonb failed (should not happen for a valid template) —
     /// refused loudly rather than persisting a partial/empty spec.
     SpecEncode(String),
     /// The enqueue's declared `trust_tier` does not equal the dispatched spec's `trust_tier` — the
@@ -216,17 +213,16 @@ impl core::fmt::Display for CiJobSpecStoreError {
             ),
             CiJobSpecStoreError::SpecNotFound { tenant_id, job_id } => write!(
                 f,
-                "no durable JobSpec for tenant `{tenant_id}` job `{job_id}` — the runner cannot \
-                 resolve the leased job to a spec (fail-closed; the row stays leased for the reaper, \
-                 never a fabricated default spec)"
+                "no durable launch template for tenant `{tenant_id}` job `{job_id}` — the runner \
+                 cannot resolve the leased job (fail-closed; the row stays leased for the reaper)"
             ),
             CiJobSpecStoreError::CorruptSpec { job_id, detail } => write!(
                 f,
-                "corrupt durable JobSpec for job `{job_id}` (jsonb did not decode to a JobSpec — the \
-                 stored spec is what executes, so this fails the resolve closed): {detail}"
+                "corrupt durable launch template for job `{job_id}` (jsonb decode failed closed): \
+                 {detail}"
             ),
             CiJobSpecStoreError::SpecEncode(e) => {
-                write!(f, "durable ci_job_spec persist refused: JobSpec did not serialize to jsonb: {e}")
+                write!(f, "durable ci_job_spec persist refused: launch template did not serialize to jsonb: {e}")
             }
             CiJobSpecStoreError::TrustTierMismatch { enqueue, spec } => write!(
                 f,
@@ -615,7 +611,7 @@ fn validate_dispatch(
     Ok(())
 }
 
-/// **Decode a stored `spec jsonb` back to a [`JobSpec`] (the resolve path's fail-closed deserialize).**
+/// **Decode stored `spec jsonb` to a [`DurableCiJobLaunchTemplate`] fail closed.**
 /// Pure over the jsonb value so the unit suite proves both the faithful round-trip AND the corrupt →
 /// fail-closed behaviour DB-free. An un-decodable value is [`CiJobSpecStoreError::CorruptSpec`] (the
 /// stored spec is what executes, so a corrupt one fails the resolve closed) — NEVER a default spec.

@@ -18,7 +18,9 @@
 //! `MYELIN_REQUIRE_RUNSC=1 cargo test -p myelin-edge --test git_wire_clone_fetch_e2e_test -- --nocapture`.
 
 use myelin_ci_sandbox::{resolved_gvisor_rootfs, ENV_GVISOR_GIT_ROOTFS};
-use myelin_edge::production_git_core_default;
+use myelin_edge::{
+    production_git_core_with_issuer, test_git_wire_credential_issuer, GitWireExecutor,
+};
 use myelin_git::core::{GitCore, RepoLoc, Service};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -78,7 +80,8 @@ fn stage_lib(rootfs: &Path, soname: &str, host_path: &str) {
 }
 
 fn stage_git_rootfs(base: &Path) -> PathBuf {
-    let staged = std::env::temp_dir().join(format!("myelin-edge-git-rootfs-{}", std::process::id()));
+    let staged =
+        std::env::temp_dir().join(format!("myelin-edge-git-rootfs-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
     let st = Command::new("cp")
         .arg("-a")
@@ -149,10 +152,20 @@ fn make_repo_with_commit(root: &Path, tenant: &str, region: &str, slug: &str) ->
     std::fs::write(work.join("f.txt"), b"hello git wire clone\n").expect("write file");
     run_git(&["add", "f.txt"], Some(&work));
     run_git(
-        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "first commit"],
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "first commit",
+        ],
         Some(&work),
     );
-    run_git(&["push", "-q", &bare.to_string_lossy(), "main"], Some(&work));
+    run_git(
+        &["push", "-q", &bare.to_string_lossy(), "main"],
+        Some(&work),
+    );
 
     let out = Command::new("git")
         .args(["--git-dir", &bare.to_string_lossy(), "rev-parse", "main"])
@@ -192,7 +205,12 @@ fn production_gitcore_serves_a_real_clone_fetch_end_to_end() {
 
     // The PRODUCTION GitCore: sandboxed GitWireExecutor (wire) + in-process GixCore (read), rooted at
     // the SAME on-disk root. This is exactly what `DurableGitBackend::wire_serving()` composes.
-    let core = production_git_core_default(&root);
+    let core = production_git_core_with_issuer(
+        &root,
+        GitWireExecutor::default_limits(),
+        GitWireExecutor::serving_hooks(),
+        test_git_wire_credential_issuer(),
+    );
     let repo = RepoLoc::new("acme", "fr-par", "widgets");
 
     // ── 1. advertise_refs(UploadPack) — the real refs/HEAD oid through the seam ──
@@ -205,7 +223,10 @@ fn production_gitcore_serves_a_real_clone_fetch_end_to_end() {
     println!("HEAD oid (host) = {oid}");
     println!("advertisement (verbatim) =\n{adv_str}");
     assert_eq!(adv.status, 0, "advertise_refs exits 0");
-    assert!(adv_str.contains(&oid), "advertisement carries the real HEAD oid");
+    assert!(
+        adv_str.contains(&oid),
+        "advertisement carries the real HEAD oid"
+    );
     assert!(
         adv_str.contains("refs/heads/main"),
         "advertisement lists refs/heads/main"
@@ -225,7 +246,10 @@ fn production_gitcore_serves_a_real_clone_fetch_end_to_end() {
         .expect("serve(UploadPack) must run sandboxed and return a packfile");
     assert_eq!(served.status, 0, "serve exits 0");
     let body = served.stdout;
-    println!("=== CT-006b serve(UploadPack) → {} bytes of response ===", body.len());
+    println!(
+        "=== CT-006b serve(UploadPack) → {} bytes of response ===",
+        body.len()
+    );
 
     // The response is `0008NAK\n` then the raw packfile (no side-band). Slice from the PACK signature.
     let pack_at = body
@@ -266,7 +290,10 @@ fn production_gitcore_serves_a_real_clone_fetch_end_to_end() {
         .expect("git verify-pack");
     let listing = String::from_utf8_lossy(&verify.stdout);
     println!("=== git verify-pack -v (object listing) ===\n{listing}");
-    assert!(verify.status.success(), "verify-pack must validate the pack");
+    assert!(
+        verify.status.success(),
+        "verify-pack must validate the pack"
+    );
     assert!(
         listing.contains(&oid),
         "the wanted commit oid {oid} MUST be present in the served pack — a real client completes the fetch"

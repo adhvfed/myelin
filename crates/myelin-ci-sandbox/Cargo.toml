@@ -10,7 +10,8 @@ publish = false
 # carries ONLY the SEAM, frozen byte-authoritative to arch 01 §2:
 #   - the JobSpec struct (kind ∈ {Ci, Agent} — the UNIFY point) + its supporting value types
 #     (ImageRef digest-pin-or-reject, EgressPolicy default-deny, ResourceLimits incl. pids_max +
-#     zero-swap + timeout, TrustTier, RunTokenRef, MeterTarget, IdemToken, …);
+#     zero-swap + timeout, TrustTier, ephemeral RunTokenCredential + durable RunTokenRef,
+#     MeterTarget, IdemToken, …);
 #   - the SandboxBackend trait SHAPE (launch / kill) + the FleetProvider trait SHAPE
 #     (provision / deprovision / capacity) — shapes ONLY (no impl: Firecracker is CI-P2/P-237,
 #     gVisor is CI-P28, the fleet impl is CI-P14);
@@ -70,6 +71,7 @@ serde.workspace = true
 # (P-229) consumes — `EscapeAttestation::to_json` is non-test code, so serde_json is a real dep here
 # (not dev-only). Still DB-free / VM-free: a pure value serializer.
 serde_json.workspace = true
+zeroize = "1"
 
 [features]
 # Two REAL live-stack proofs, both DB/VM-free by default:

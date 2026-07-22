@@ -32,11 +32,15 @@
 
 use myelin_ci_sandbox::{
     agent_job, EgressPolicy, HookError, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
-    ReserveHandle, ResourceLimits, ResourceUsage, RunTokenRef, RunnerHooks, SandboxBackend,
+    ReserveHandle, ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend,
     SandboxHandle, SandboxLaunch, SandboxResult, SpecError, TrustTier, WorkspaceSpec,
 };
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+
+fn credential(jti: &str) -> RunTokenCredential {
+    RunTokenCredential::new(format!("test-bearer:{jti}"), jti, 300).unwrap()
+}
 
 fn limits() -> ResourceLimits {
     ResourceLimits {
@@ -118,9 +122,7 @@ fn consumer_builds_ci_spec() -> JobSpec {
         limits(),
         WorkspaceSpec::default(),
         TrustTier::Trusted,
-        RunTokenRef {
-            jti: "run-token-jti".into(),
-        },
+        credential("run-token-jti"),
         MeterTarget {
             reserve_id: "reserve-1".into(),
         },
@@ -140,9 +142,7 @@ fn consumer_builds_agent_exec_spec() -> JobSpec {
         EgressPolicy::deny_all(),
         limits(),
         TrustTier::UntrustedFork,
-        RunTokenRef {
-            jti: "agent-jti".into(),
-        },
+        credential("agent-jti"),
         MeterTarget {
             reserve_id: "agent-reserve".into(),
         },
@@ -171,7 +171,11 @@ fn provider_launches_consumer_ci_spec_driving_four_guarantees_in_order() {
     let spec = consumer_builds_ci_spec();
     let launch = provider.launch(&spec, &working_hooks()).unwrap();
     assert_eq!(launch.handle.guest_id, "guest-1");
-    assert_eq!(launch.result.exit_code, Some(0), "the seam carries the result");
+    assert_eq!(
+        launch.result.exit_code,
+        Some(0),
+        "the seam carries the result"
+    );
     provider.kill(&launch.handle).unwrap();
     assert_eq!(
         *order.lock().unwrap(),
@@ -245,7 +249,7 @@ fn consumer_cannot_dispatch_an_undigested_image_to_the_provider() {
         limits(),
         WorkspaceSpec::default(),
         TrustTier::Trusted,
-        RunTokenRef { jti: "j".into() },
+        credential("j"),
         MeterTarget {
             reserve_id: "r".into(),
         },
@@ -263,7 +267,7 @@ fn consumer_cannot_dispatch_an_undigested_image_to_the_provider() {
         EgressPolicy::deny_all(),
         limits(),
         TrustTier::UntrustedFork,
-        RunTokenRef { jti: "j".into() },
+        credential("j"),
         MeterTarget {
             reserve_id: "r".into(),
         },

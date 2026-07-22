@@ -30,7 +30,7 @@
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
-    ReserveHandle, ResourceLimits, RunTokenRef, RunnerHooks, SandboxBackend, TrustTier,
+    ReserveHandle, ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend, TrustTier,
     WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
 };
 use std::path::Path;
@@ -100,9 +100,7 @@ fn spec_running(command: Vec<String>, timeout_secs: u32) -> JobSpec {
         },
         WorkspaceSpec::default(),
         TrustTier::Trusted,
-        RunTokenRef {
-            jti: "gvisor-prod-exec-jti".into(),
-        },
+        RunTokenCredential::new("test-bearer", "gvisor-prod-exec-jti", 300).unwrap(),
         MeterTarget {
             reserve_id: "gvisor-prod-exec-reserve".into(),
         },
@@ -204,16 +202,16 @@ fn real_runsc_runs_untrusted_command_non_root() {
     };
     let backend = GvisorBackend::new();
     // The untrusted command reports its own uid; the OCI config drops it to 65534 (defense in depth).
-    let spec = spec_running(
-        vec!["sh".into(), "-c".into(), "id -u; exit 0".into()],
-        60,
-    );
+    let spec = spec_running(vec!["sh".into(), "-c".into(), "id -u; exit 0".into()], 60);
 
     let launch = backend.launch(&spec, &ok_hooks()).expect("run");
     let result = &launch.result;
     let stdout = String::from_utf8_lossy(&result.stdout);
     println!("=== CT-002b REAL gVisor non-root payload ===");
-    println!("exit_code = {:?}  captured stdout = {stdout:?}", result.exit_code);
+    println!(
+        "exit_code = {:?}  captured stdout = {stdout:?}",
+        result.exit_code
+    );
 
     assert_eq!(result.exit_code, Some(0));
     assert!(
@@ -291,7 +289,9 @@ fn real_runsc_runaway_stdout_is_capped_without_deadlock() {
          draining and the container deadlocked on a full stdout pipe"
     );
 
-    backend.kill(&launch.handle).expect("teardown is idempotent");
+    backend
+        .kill(&launch.handle)
+        .expect("teardown is idempotent");
 }
 
 #[test]

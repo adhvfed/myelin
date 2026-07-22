@@ -1103,7 +1103,7 @@ mod tests {
     use crate::hardening::{emit_egress_ruleset, HardeningProfile};
     use crate::{
         EgressPolicy, IdemToken, ImageRef, JobKind, MeterTarget, ReserveHandle, ResourceLimits,
-        RunTokenRef, TrustTier, WorkspaceSpec,
+        RunTokenCredential, TrustTier, WorkspaceSpec,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
@@ -1128,7 +1128,9 @@ mod tests {
         fn apply(&self, ruleset: &str) -> Result<EnforcedEgress, EgressEnforceError> {
             *self.seen.lock().unwrap() = Some(ruleset.to_string());
             if self.fail {
-                Err(EgressEnforceError::ApplyFailed("injected nft failure".into()))
+                Err(EgressEnforceError::ApplyFailed(
+                    "injected nft failure".into(),
+                ))
             } else {
                 Ok(EnforcedEgress::new(ruleset.to_string()))
             }
@@ -1138,7 +1140,10 @@ mod tests {
     fn spec(allow: Vec<String>) -> JobSpec {
         JobSpec::new(
             JobKind::Ci,
-            ImageRef::pinned("r/img@sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890").unwrap(),
+            ImageRef::pinned(
+                "r/img@sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890",
+            )
+            .unwrap(),
             vec!["true".into()],
             vec![],
             vec![],
@@ -1152,7 +1157,7 @@ mod tests {
             },
             WorkspaceSpec::default(),
             TrustTier::Trusted,
-            RunTokenRef { jti: "j".into() },
+            RunTokenCredential::new("test-bearer", "j", 300).unwrap(),
             MeterTarget {
                 reserve_id: "r".into(),
             },
@@ -1223,7 +1228,11 @@ mod tests {
         let cfg = FcMachineConfig::from_spec(&s, &profile, false);
         assert!(cfg.has_network_device());
         assert!(cfg.to_json().contains("network-interfaces"));
-        assert!(cfg.enforced_egress().unwrap().ruleset().contains("policy drop;"));
+        assert!(cfg
+            .enforced_egress()
+            .unwrap()
+            .ruleset()
+            .contains("policy drop;"));
     }
 
     #[test]
@@ -1331,17 +1340,28 @@ mod tests {
         let gp2 = got_profile.clone();
         let killed = Arc::new(AtomicBool::new(false));
         let launch = backend
-            .launch_with(&spec(vec!["93.184.216.34".into()]), &ok_hooks(), move |_s, profile| {
-                *gp2.lock().unwrap() = Some(profile.clone());
-                Ok(fake_run(killed.clone()))
-            })
+            .launch_with(
+                &spec(vec!["93.184.216.34".into()]),
+                &ok_hooks(),
+                move |_s, profile| {
+                    *gp2.lock().unwrap() = Some(profile.clone());
+                    Ok(fake_run(killed.clone()))
+                },
+            )
             .expect("an IP-literal egress allowlist is enforceable");
         assert_eq!(launch.result.exit_code, Some(0));
         // The enforcer was handed a default-dropping ruleset that never permits a blocked class.
         let ruleset = seen.lock().unwrap().clone().expect("a ruleset was applied");
         assert!(ruleset.contains("policy drop;"));
         assert!(ruleset.contains("ip daddr 93.184.216.34 accept"));
-        for blocked in ["169.254.169.254", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "0.0.0.0/8"] {
+        for blocked in [
+            "169.254.169.254",
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "127.0.0.0/8",
+            "0.0.0.0/8",
+        ] {
             assert!(!ruleset.contains(&format!("ip daddr {blocked} accept")));
         }
         // The run closure saw a profile carrying the enforced record → a NIC-bearing config is built.
@@ -1361,12 +1381,22 @@ mod tests {
         }));
         let ran = Arc::new(AtomicBool::new(false));
         let ran2 = ran.clone();
-        let r = backend.launch_with(&spec(vec!["93.184.216.34".into()]), &ok_hooks(), move |_s, _p| {
-            ran2.store(true, Ordering::SeqCst);
-            Ok(fake_run(Arc::new(AtomicBool::new(false))))
-        });
-        assert!(matches!(r, Err(FcError::Egress(EgressEnforceError::ApplyFailed(_)))));
-        assert!(!ran.load(Ordering::SeqCst), "no guest runs when the egress firewall cannot be applied");
+        let r = backend.launch_with(
+            &spec(vec!["93.184.216.34".into()]),
+            &ok_hooks(),
+            move |_s, _p| {
+                ran2.store(true, Ordering::SeqCst);
+                Ok(fake_run(Arc::new(AtomicBool::new(false))))
+            },
+        );
+        assert!(matches!(
+            r,
+            Err(FcError::Egress(EgressEnforceError::ApplyFailed(_)))
+        ));
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "no guest runs when the egress firewall cannot be applied"
+        );
     }
 
     #[test]
@@ -1380,16 +1410,28 @@ mod tests {
         }));
         let ran = Arc::new(AtomicBool::new(false));
         let ran2 = ran.clone();
-        let r = backend.launch_with(&spec(vec!["registry.example.com".into()]), &ok_hooks(), move |_s, _p| {
-            ran2.store(true, Ordering::SeqCst);
-            Ok(fake_run(Arc::new(AtomicBool::new(false))))
-        });
+        let r = backend.launch_with(
+            &spec(vec!["registry.example.com".into()]),
+            &ok_hooks(),
+            move |_s, _p| {
+                ran2.store(true, Ordering::SeqCst);
+                Ok(fake_run(Arc::new(AtomicBool::new(false))))
+            },
+        );
         assert!(matches!(
             r,
-            Err(FcError::Egress(EgressEnforceError::UnenforceableHostname(_)))
+            Err(FcError::Egress(EgressEnforceError::UnenforceableHostname(
+                _
+            )))
         ));
-        assert!(!ran.load(Ordering::SeqCst), "no guest runs for an unenforceable hostname allowlist");
-        assert!(seen.lock().unwrap().is_none(), "a hostname never reaches the apply step");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "no guest runs for an unenforceable hostname allowlist"
+        );
+        assert!(
+            seen.lock().unwrap().is_none(),
+            "a hostname never reaches the apply step"
+        );
     }
 
     // ---- CT-002a: the command-runner config + the forge-resistant capture (pure-fn, VM-free) ----
@@ -1401,13 +1443,19 @@ mod tests {
         let cfg = FcMachineConfig::from_spec(&s, &profile, false);
         let json = cfg.command_runner_json(Path::new("/tmp/runner.sh"));
         assert!(json.contains("init=/bin/bash /dev/vdb"), "PID1 bash runner");
-        assert!(json.contains("\"drive_id\": \"script\""), "2nd virtio drive");
+        assert!(
+            json.contains("\"drive_id\": \"script\""),
+            "2nd virtio drive"
+        );
         assert!(json.contains("\"is_read_only\": true"), "read-only root");
         assert!(
             !json.contains("network-interfaces"),
             "no NIC under default-deny egress"
         );
-        assert!(json.contains("/tmp/runner.sh"), "the staged script drive path");
+        assert!(
+            json.contains("/tmp/runner.sh"),
+            "the staged script drive path"
+        );
     }
 
     #[test]
@@ -1434,21 +1482,28 @@ mod tests {
             value: "bar baz".into(),
         }];
         let script = build_command_runner_script(&s, "NONCE123");
-        assert!(script.contains("export FOO='bar baz'"), "env exported, quoted");
+        assert!(
+            script.contains("export FOO='bar baz'"),
+            "env exported, quoted"
+        );
         assert!(
             script.contains("setpriv --reuid 65534 --regid 65534 --clear-groups"),
             "argv is dropped to a NON-ROOT uid/gid — the structural forge boundary (cannot write the \
              root-only serial console)"
         );
         assert!(
-            script.contains("--no-new-privs --bounding-set -all --inh-caps -all --ambient-caps -all"),
+            script
+                .contains("--no-new-privs --bounding-set -all --inh-caps -all --ambient-caps -all"),
             "argv still runs under caps-dropped + no-new-privs (the §5.3 posture)"
         );
         assert!(script.contains("'sh' '-c' 'echo hi'"), "argv single-quoted");
         // The streams are base64-framed and the exit is nonce-tagged.
         assert!(script.contains("__MYELIN_EXIT__"));
         assert!(script.contains("N='NONCE123'"));
-        assert!(script.contains("kill -KILL -1"), "descendants reaped pre-markers");
+        assert!(
+            script.contains("kill -KILL -1"),
+            "descendants reaped pre-markers"
+        );
     }
 
     #[test]
@@ -1558,10 +1613,7 @@ mod tests {
     #[test]
     fn a_wrong_nonce_marker_is_ignored() {
         // A job that blind-prints a marker with a GUESSED (wrong) nonce is ignored entirely.
-        let console = format!(
-            "{ex}:wrongnonce:0\n{ex}:realnonce:9\n",
-            ex = MARK_EXIT
-        );
+        let console = format!("{ex}:wrongnonce:0\n{ex}:realnonce:9\n", ex = MARK_EXIT);
         assert_eq!(parse_exit(&console, "realnonce"), Some(9));
         assert_eq!(parse_exit(&console, "noncepresent-but-absent"), None);
     }
@@ -1581,7 +1633,10 @@ mod tests {
         let cfg = FcMachineConfig::from_spec(&s, &profile, false);
         let res =
             build_result_from_console(&o, "n", &cfg, &crate::redaction::RedactionPlan::none());
-        assert_eq!(res.exit_code, None, "a killed guest has no trustworthy code");
+        assert_eq!(
+            res.exit_code, None,
+            "a killed guest has no trustworthy code"
+        );
         assert!(res.timed_out);
         assert!(!res.passed());
         assert_eq!(res.usage.cpu_seconds, 1); // measured host CPU preferred

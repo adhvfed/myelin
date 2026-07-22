@@ -87,7 +87,7 @@ pub struct DelegationCaveats(pub Vec<String>);
 /// on resume (§6.2).** Carries the opaque bearer material + its revocation id (`jti`) AND the TTL it
 /// was minted under (the short fail-static window — *token life == activity life*), so a caller /
 /// the gate can assert it is SHORT-LIVED (not the days-long workflow life) and attenuated per-run.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RunTokenHandle {
     /// The opaque bearer material the resumed activity authenticates with.
     pub token: String,
@@ -97,6 +97,16 @@ pub struct RunTokenHandle {
     /// the SHORT activity-life bound — never the days-long workflow life. The §6.2 gate asserts this
     /// is `<=` the lease's bound (a short-lived token) and `> 0`.
     pub ttl_secs: u64,
+}
+
+impl core::fmt::Debug for RunTokenHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RunTokenHandle")
+            .field("token", &"<redacted>")
+            .field("jti", &"<redacted>")
+            .field("ttl_secs", &self.ttl_secs)
+            .finish()
+    }
 }
 
 /// **The engine's view of the contract-4.7 `mint_run_token` surface (CONSUMED, §6.2).** A trait so
@@ -323,6 +333,20 @@ mod tests {
     use myelin_tenancy::{Region, TenantId};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn run_token_handle_debug_redacts_bearer_and_jti() {
+        let handle = RunTokenHandle {
+            token: "secret-bearer".into(),
+            jti: "secret-jti".into(),
+            ttl_secs: 300,
+        };
+        let rendered = format!("{handle:?}");
+        assert!(!rendered.contains("secret-bearer"));
+        assert!(!rendered.contains("secret-jti"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("ttl_secs: 300"));
+    }
 
     fn tenant() -> TenantId {
         TenantId("acme".into())

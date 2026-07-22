@@ -37,7 +37,7 @@ use crate::hardening::HardeningProfile;
 use crate::redaction::RedactionPlan;
 use crate::{
     drain_capped, EgressPolicy, HookError, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
-    ResourceLimits, ResourceUsage, RunTokenRef, RunnerHooks, SandboxBackend, SandboxHandle,
+    ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend, SandboxHandle,
     SandboxLaunch, SandboxResult, TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
 };
 use std::io::{Read, Write};
@@ -341,9 +341,7 @@ pub struct MemoryCgroup {
 /// production runner/operator, so a host permission error must say that execution was refused rather
 /// than looking like an ambiguous best-effort warning.
 fn memory_cgroup_refusal(reason: impl core::fmt::Display) -> String {
-    format!(
-        "{reason} — refusing to run the gVisor workload unbounded (SI-017 fail-closed)"
-    )
+    format!("{reason} — refusing to run the gVisor workload unbounded (SI-017 fail-closed)")
 }
 
 impl MemoryCgroup {
@@ -388,9 +386,8 @@ impl MemoryCgroup {
             unique_suffix()
         ));
         let _ = std::fs::remove_dir(&dir);
-        std::fs::create_dir(&dir).map_err(|e| {
-            memory_cgroup_refusal(format!("create memory cgroup {dir:?}: {e}"))
-        })?;
+        std::fs::create_dir(&dir)
+            .map_err(|e| memory_cgroup_refusal(format!("create memory cgroup {dir:?}: {e}")))?;
         // The sibling must actually have the `memory` controller (the parent delegated it). If not,
         // tear down and fail closed rather than run a workload an empty cgroup would not bound.
         let cg_controllers =
@@ -1555,7 +1552,7 @@ pub struct GitWireSpec {
     env: Vec<String>,
     quarantine_host_path: Option<PathBuf>,
     limits: ResourceLimits,
-    run_token: RunTokenRef,
+    run_token: RunTokenCredential,
     meter_to: MeterTarget,
     idem_token: IdemToken,
 }
@@ -1577,7 +1574,7 @@ impl GitWireSpec {
         env: Vec<String>,
         quarantine_host_path: Option<PathBuf>,
         limits: ResourceLimits,
-        run_token: RunTokenRef,
+        run_token: RunTokenCredential,
         meter_to: MeterTarget,
         idem_token: IdemToken,
     ) -> Result<GitWireSpec, WireError> {
@@ -1886,12 +1883,15 @@ fn stage_git_wire_bundle(cfg: &OciConfig) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ReserveHandle;
+    use crate::{ReserveHandle, RunTokenCredential};
 
     fn spec(allow: Vec<String>) -> JobSpec {
         JobSpec::new(
             JobKind::Agent,
-            ImageRef::pinned("r/img@sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890").unwrap(),
+            ImageRef::pinned(
+                "r/img@sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890",
+            )
+            .unwrap(),
             vec!["python3".into(), "-c".into(), "print(1)".into()],
             vec![],
             vec![],
@@ -1905,7 +1905,7 @@ mod tests {
             },
             WorkspaceSpec::default(),
             TrustTier::UntrustedFork,
-            RunTokenRef { jti: "j".into() },
+            RunTokenCredential::new("test-bearer", "j", 300).unwrap(),
             MeterTarget {
                 reserve_id: "r".into(),
             },
@@ -1942,7 +1942,10 @@ mod tests {
     fn build_result_masks_needles_in_both_streams() {
         let s = spec(vec![]);
         let plan = RedactionPlan::for_needles([b"AKIAsecret".to_vec()]);
-        let o = outcome(b"deploying with AKIAsecret now", b"error: AKIAsecret invalid");
+        let o = outcome(
+            b"deploying with AKIAsecret now",
+            b"error: AKIAsecret invalid",
+        );
         let res = build_result(&s, &o, &plan);
         assert_eq!(res.stdout, b"deploying with *** now".to_vec());
         assert_eq!(res.stderr, b"error: *** invalid".to_vec());
@@ -1991,14 +1994,28 @@ mod tests {
         // A 1 MiB stream (FAR past the 256 KiB SANDBOX_CAPTURE_BOUND) under a 4 MiB cap → WHOLE, untruncated.
         let big = vec![0xABu8; 1024 * 1024];
         let (out, truncated) = drain_to_temp_file(&big[..], 4 * 1024 * 1024);
-        assert_eq!(out.len(), big.len(), "a real-size pack under the cap comes through WHOLE");
-        assert_eq!(out, big, "the bytes are byte-identical (no corruption via the temp file)");
+        assert_eq!(
+            out.len(),
+            big.len(),
+            "a real-size pack under the cap comes through WHOLE"
+        );
+        assert_eq!(
+            out, big,
+            "the bytes are byte-identical (no corruption via the temp file)"
+        );
         assert!(!truncated, "within the cap ⇒ not truncated");
 
         // The SAME stream under a 64 KiB cap → head-bounded to the cap AND flagged truncated (fail-loud).
         let (head, over) = drain_to_temp_file(&big[..], 64 * 1024);
-        assert_eq!(head.len(), 64 * 1024, "over the cap ⇒ exactly the cap bytes are kept");
-        assert!(over, "over the cap ⇒ truncated flag set (the wire seam then refuses loudly)");
+        assert_eq!(
+            head.len(),
+            64 * 1024,
+            "over the cap ⇒ exactly the cap bytes are kept"
+        );
+        assert!(
+            over,
+            "over the cap ⇒ truncated flag set (the wire seam then refuses loudly)"
+        );
     }
 
     #[test]
@@ -2089,7 +2106,10 @@ mod tests {
             .find(&format!("{} ATTEMPT", crate::escape_corpus::MEMHOG_ID))
             .expect("memhog ATTEMPT sentinel in the gVisor corpus");
         let end = script.find(crate::escape_corpus::END_MARKER).unwrap();
-        assert!(attempt < end, "the memhog ATTEMPT sentinel must precede the END marker");
+        assert!(
+            attempt < end,
+            "the memhog ATTEMPT sentinel must precede the END marker"
+        );
         // Pure-shell doubling allocator (holds the anon memory in the sh process itself; ~1 GiB) —
         // the host cgroup OOM-kills the sentry when it breaches memory.max, never a false held=0.
         assert!(script.contains(r#"S="$S$S""#) && script.contains("while [ $n -lt 26 ]"));
@@ -2182,15 +2202,14 @@ mod tests {
                 pids_max: 1,
                 timeout_secs: 1,
             },
-            run_token: RunTokenRef { jti: "cancel".into() },
-            meter_to: MeterTarget { reserve_id: "cancel".into() },
+            run_token: RunTokenCredential::new("test-bearer", "cancel", 300).unwrap(),
+            meter_to: MeterTarget {
+                reserve_id: "cancel".into(),
+            },
             idem_token: IdemToken("cancel".into()),
         };
-        let result = GvisorBackend::new().launch_git_wire_until_cancelled(
-            &spec,
-            &ok_hooks(),
-            &cancelled,
-        );
+        let result =
+            GvisorBackend::new().launch_git_wire_until_cancelled(&spec, &ok_hooks(), &cancelled);
         assert!(
             matches!(result, Err(WireError::Runtime(message)) if message.contains("cancelled by process shutdown"))
         );

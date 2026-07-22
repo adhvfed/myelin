@@ -22,9 +22,8 @@ use myelin_agent_service::{dispatch_long_compute, LongComputeProfile};
 use myelin_ci_sandbox::escape_corpus::{BEGIN_MARKER, END_MARKER};
 use myelin_ci_sandbox::{
     parse_console, Backend, BackendRun, EgressPolicy, EscapeAttestation, IdemToken, ImageRef,
-    MeterTarget, ResourceLimits, ResourceUsage, RunTokenRef, SandboxBackend, SandboxHandle,
-    SandboxLaunch, SandboxResult, SpecError, TrustTier,
-    CORPUS, CORPUS_VERSION,
+    MeterTarget, ResourceLimits, ResourceUsage, RunTokenCredential, SandboxBackend, SandboxHandle,
+    SandboxLaunch, SandboxResult, SpecError, TrustTier, CORPUS, CORPUS_VERSION,
 };
 use myelin_ci_sandbox::{JobSpec as SandboxJobSpec, RunnerHooks};
 use myelin_events::{
@@ -179,9 +178,7 @@ fn profile() -> LongComputeProfile {
             timeout_secs: 7200,
         },
         trust_tier: TrustTier::UntrustedFork,
-        run_token: RunTokenRef {
-            jti: "agent-jti".into(),
-        },
+        run_token: RunTokenCredential::new("test-bearer", "agent-jti", 300).unwrap(),
         meter_to: MeterTarget {
             reserve_id: "agent-res".into(),
         },

@@ -41,8 +41,8 @@ use myelin_ci_controlplane::{
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, EgressPolicy, FirehoseSink, IdemToken, ImageRef, JobKind, JobSpec,
-    LeaseStore, MeterTarget, ReserveHandle, ResourceLimits, RunTokenRef, RunnerAgent, RunnerError,
-    RunnerHooks, TrustTier, WorkspaceSpec,
+    LeaseStore, MeterTarget, ReserveHandle, ResourceLimits, RunTokenCredential, RunnerAgent,
+    RunnerError, RunnerHooks, TrustTier, WorkspaceSpec,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::OUTBOX_MIGRATION;
@@ -279,7 +279,7 @@ fn compute_spec(command: Vec<String>, idem: &str) -> JobSpec {
         },
         WorkspaceSpec::default(),
         TrustTier::Trusted,
-        RunTokenRef { jti: "ct004c2-jti".into() },
+        RunTokenCredential::new("test-bearer", "ct004c2-jti", 300).unwrap(),
         MeterTarget { reserve_id: "ct004c2-reserve".into() },
         IdemToken(idem.into()),
     )
