@@ -4,9 +4,9 @@
 //! attacker bytes (no panic on garbage). See the module docs for the construction.
 
 use super::*;
-use crate::machine_auth::MachineKind;
+use crate::machine_auth::{MachineKind, TokenVerifier};
 use myelin_identity::{
-    AuthzError, DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus,
+    AuthzError, Credential, DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus,
 };
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
@@ -219,6 +219,38 @@ fn positive_dpop_bound_pat_with_valid_proof_verifies() {
     assert_eq!(token.tenant.0, "acme");
 }
 
+#[test]
+fn per_request_token_verification_supplies_dpop_binding() {
+    let c = cell();
+    let client = DpopClientKey::from_seed(&[31u8; 32]).unwrap();
+    let material = c.mint(&spec("acme", &["edge.whoami"], Some(client.jkt())));
+    let proof = client.prove(
+        "GET",
+        "https://myelin.example/v1/whoami",
+        NOW,
+        "dpop-per-request",
+    );
+    let credential = Credential {
+        scheme: "pat".into(),
+        material: with_dpop(&material, &proof),
+    };
+    let verifier = verifier(c.trust_anchor());
+    assert!(
+        verifier.verify(&credential).is_err(),
+        "a DPoP PAT without trusted request context must fail closed"
+    );
+    let token = verifier
+        .verify_for_request(
+            &credential,
+            &DpopBinding {
+                htm: "GET".into(),
+                htu: "https://myelin.example/v1/whoami".into(),
+            },
+        )
+        .expect("the transport-supplied binding reaches the real DPoP verifier");
+    assert!(token.dpop_bound);
+}
+
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 // NEGATIVES — every forgery is a REAL one, and each is REFUSED.
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -382,6 +414,43 @@ fn negative_dpop_replayed_jti_is_refused() {
         matches!(&err, AuthzError::FailClosed(m) if m.contains("replay")),
         "a replayed DPoP jti must be refused, got {err:?}"
     );
+}
+
+#[test]
+fn dpop_replay_entries_expire_with_the_freshness_window() {
+    let c = cell();
+    let client = DpopClientKey::from_seed(&[13u8; 32]).unwrap();
+    let material = c.mint(&spec("acme", &["a"], Some(client.jkt())));
+    let guard = DpopReplayGuard::new();
+    let binding = DpopBinding {
+        htm: "POST".into(),
+        htu: "https://api.myelin/x".into(),
+    };
+    let first = with_dpop(
+        &material,
+        &client.prove("POST", "https://api.myelin/x", NOW, "reusable-after-window"),
+    );
+    verifier(c.trust_anchor())
+        .with_request_binding(binding.clone())
+        .with_replay_guard(guard.clone())
+        .verify_material(&first, MachineKind::Pat)
+        .expect("the first proof is fresh");
+
+    let later = with_dpop(
+        &material,
+        &client.prove(
+            "POST",
+            "https://api.myelin/x",
+            NOW + 61,
+            "reusable-after-window",
+        ),
+    );
+    PasetoCapabilityVerifier::new(c.trust_anchor())
+        .with_clock(|| NOW + 61)
+        .with_request_binding(binding)
+        .with_replay_guard(guard)
+        .verify_material(&later, MachineKind::Pat)
+        .expect("a newly signed proof may reuse the identifier after the old proof window expires");
 }
 
 /// **(f) DPoP: a wrong `htm`/`htu` (a proof minted for another method/URL) is refused.**

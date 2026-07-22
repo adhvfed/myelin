@@ -55,7 +55,7 @@ use myelin_tenancy::{Region, TenantId};
 use ring::signature::{Ed25519KeyPair, UnparsedPublicKey, ED25519};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -536,28 +536,50 @@ pub struct DpopBinding {
     pub htu: String,
 }
 
-/// **The DPoP single-use replay guard** — a proof `jti` is consumed once; a second presentation of the
-/// SAME `jti` is rejected (a captured proof cannot be replayed). Shared (cloneable) so one seen-set
-/// backs every verifier handle. Mirrors [`crate::oidc::ReplayGuard`] (one replay-defence shape).
-#[derive(Clone, Default)]
+/// **The DPoP single-use replay guard** over the shared authentication replay substrate. Production
+/// uses the durable Postgres backend so a captured proof cannot be replayed against another edge
+/// replica; tests and explicit local callers use the TTL-bounded memory backend.
+#[derive(Clone)]
 pub struct DpopReplayGuard {
-    seen: Arc<Mutex<BTreeSet<String>>>,
+    replay: crate::oidc::ReplayGuard,
+}
+
+impl Default for DpopReplayGuard {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DpopReplayGuard {
     /// A fresh, empty replay guard.
     pub fn new() -> DpopReplayGuard {
         DpopReplayGuard {
-            seen: Arc::new(Mutex::new(BTreeSet::new())),
+            replay: crate::oidc::ReplayGuard::new(),
         }
     }
 
-    /// Consume `jti`. `true` if FRESH (newly recorded), `false` if it was ALREADY seen (a replay).
-    fn consume(&self, jti: &str) -> bool {
-        self.seen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(jti.to_string())
+    /// Build the production replay guard over the cell's shared durable substrate.
+    pub fn with_pg(
+        backing: myelin_storage::DurableReplayBacking,
+        rt: tokio::runtime::Handle,
+    ) -> DpopReplayGuard {
+        DpopReplayGuard {
+            replay: crate::oidc::ReplayGuard::with_pg(backing, rt),
+        }
+    }
+
+    fn consume(
+        &self,
+        tenant: &str,
+        region: &str,
+        bound_jkt: &str,
+        jti: &str,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<bool, AuthzError> {
+        let namespace = serde_json::json!(["dpop", region, bound_jkt]).to_string();
+        self.replay
+            .consume_scoped(tenant, &namespace, jti, expires_at, now)
     }
 }
 
@@ -567,11 +589,16 @@ impl DpopReplayGuard {
 fn verify_dpop_proof(
     proof: &str,
     bound_jkt: &str,
+    tenant: &str,
+    region: &str,
     binding: &DpopBinding,
     now: i64,
     window_secs: i64,
     replay: &DpopReplayGuard,
 ) -> Result<(), AuthzError> {
+    if window_secs < 0 {
+        return Err(refuse("DPoP freshness window must not be negative"));
+    }
     let rest = proof
         .strip_prefix(DPOP_HEADER)
         .ok_or_else(|| AuthzError::BadRequest("DPoP proof has a bad header".into()))?;
@@ -649,10 +676,17 @@ fn verify_dpop_proof(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| refuse("DPoP proof missing `jti`"))?;
-    if !replay.consume(jti) {
-        return Err(refuse(format!(
-            "DPoP proof `jti` `{jti}` was already presented (replay defence)"
-        )));
+    if !replay.consume(
+        tenant,
+        region,
+        bound_jkt,
+        jti,
+        iat.saturating_add(window_secs),
+        now,
+    )? {
+        return Err(refuse(
+            "DPoP proof was already presented (durable replay defence)",
+        ));
     }
     Ok(())
 }
@@ -737,6 +771,15 @@ impl PasetoCapabilityVerifier {
         &self,
         material: &str,
         kind: MachineKind,
+    ) -> myelin_identity::Result<CapabilityToken> {
+        self.verify_material_with_binding(material, kind, self.binding.as_ref())
+    }
+
+    fn verify_material_with_binding(
+        &self,
+        material: &str,
+        kind: MachineKind,
+        request_binding: Option<&DpopBinding>,
     ) -> myelin_identity::Result<CapabilityToken> {
         let parsed = ParsedMaterial::parse(material)?;
 
@@ -879,7 +922,7 @@ impl PasetoCapabilityVerifier {
         //     htm/htu, or a stale iat is refused. An unbound token (no cnf) carries no proof.
         let dpop_bound = match (&bound_jkt, &parsed.dpop) {
             (Some(jkt), Some(proof)) => {
-                let binding = self.binding.as_ref().ok_or_else(|| {
+                let binding = request_binding.ok_or_else(|| {
                     refuse(
                         "a DPoP-bound token requires a request binding (htm/htu) to verify the proof \
                          against — none injected — fail-closed",
@@ -888,6 +931,8 @@ impl PasetoCapabilityVerifier {
                 verify_dpop_proof(
                     proof,
                     jkt,
+                    &tenant,
+                    &region,
                     binding,
                     now,
                     self.dpop_window_secs,
@@ -938,6 +983,21 @@ impl crate::machine_auth::TokenVerifier for PasetoCapabilityVerifier {
             ))
         })?;
         self.verify_material(&credential.material, kind)
+    }
+
+    fn verify_for_request(
+        &self,
+        credential: &Credential,
+        binding: &DpopBinding,
+    ) -> myelin_identity::Result<CapabilityToken> {
+        let kind = MachineKind::from_scheme(&credential.scheme).ok_or_else(|| {
+            AuthzError::BadRequest(format!(
+                "scheme `{}` is not a capability-token / machine-identity surface \
+                 (pat/ci/agent/deploy_key/per_job)",
+                credential.scheme
+            ))
+        })?;
+        self.verify_material_with_binding(&credential.material, kind, Some(binding))
     }
 }
 
