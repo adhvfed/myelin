@@ -113,15 +113,15 @@ fn state_token(s: ReservationState) -> &'static str {
     }
 }
 
-fn parse_state(s: &str) -> ReservationState {
+fn parse_state(s: &str) -> Result<ReservationState, PgError> {
     match s {
-        "reserved" => ReservationState::Reserved,
-        "inflight" => ReservationState::InFlight,
-        "settled" => ReservationState::Settled,
-        "cancelled" => ReservationState::Cancelled,
-        other => {
-            panic!("FAIL-STATIC: unknown cost_reservation.state `{other}` (durable corruption)")
-        }
+        "reserved" => Ok(ReservationState::Reserved),
+        "inflight" => Ok(ReservationState::InFlight),
+        "settled" => Ok(ReservationState::Settled),
+        "cancelled" => Ok(ReservationState::Cancelled),
+        _ => Err(PgError::Query(
+            "cost_reservation row has an invalid state".to_string(),
+        )),
     }
 }
 
@@ -267,7 +267,7 @@ impl DurableCostLedger {
                 let Some(state) = state else {
                     return Ok(Err(SettleError::NoSuchReservation));
                 };
-                match parse_state(&state) {
+                match parse_state(&state)? {
                     ReservationState::Reserved | ReservationState::InFlight => {
                         sqlx::query(
                             "UPDATE cost_reservation SET state = $4 \
@@ -346,8 +346,14 @@ impl DurableCostLedger {
         .await
         .map_err(|_| DurableSettleError::Store)?
         .ok_or(DurableSettleError::Ledger(SettleError::NoSuchReservation))?;
-        let reserved = MinorUnits((row.get::<i64, _>("reserved")) as u64);
-        match parse_state(&row.get::<String, _>("state")) {
+        let reserved = MinorUnits(
+            row.try_get::<i64, _>("reserved")
+                .map_err(|_| DurableSettleError::Store)? as u64,
+        );
+        let state = row
+            .try_get::<String, _>("state")
+            .map_err(|_| DurableSettleError::Store)?;
+        match parse_state(&state).map_err(|_| DurableSettleError::Store)? {
             ReservationState::Reserved => {
                 sqlx::query(
                     "UPDATE cost_reservation SET state = $4 \
@@ -394,8 +400,10 @@ impl DurableCostLedger {
                 let Some(row) = row else {
                     return Ok(Err(SettleError::NoSuchReservation));
                 };
-                let reserved = MinorUnits((row.get::<i64, _>("reserved")) as u64);
-                match parse_state(&row.get::<String, _>("state")) {
+                let reserved =
+                    MinorUnits(row.try_get::<i64, _>("reserved").map_err(cost_row_decode)? as u64);
+                let state = row.try_get::<String, _>("state").map_err(cost_row_decode)?;
+                match parse_state(&state)? {
                     ReservationState::Reserved => {
                         sqlx::query(
                             "UPDATE cost_reservation SET state = $4 \
@@ -436,7 +444,7 @@ impl DurableCostLedger {
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                Ok(state.map(|s| parse_state(&s)))
+                state.map(|state| parse_state(&state)).transpose()
             })
         }))
     }
@@ -465,7 +473,7 @@ impl DurableCostLedger {
                 .fetch_all(&mut *conn)
                 .await
                 .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                Ok(rows_to_events(&tenant_s, &run_s, &rows))
+                rows_to_events(&tenant_s, &run_s, &rows)
             })
         }))
     }
@@ -491,8 +499,9 @@ async fn settle_on_conn(
     let Some(row) = row else {
         return Ok(Err(SettleError::NoSuchReservation));
     };
-    let reserved = MinorUnits((row.get::<i64, _>("reserved")) as u64);
-    let state = parse_state(&row.get::<String, _>("state"));
+    let reserved = MinorUnits(row.try_get::<i64, _>("reserved").map_err(cost_row_decode)? as u64);
+    let state = row.try_get::<String, _>("state").map_err(cost_row_decode)?;
+    let state = parse_state(&state)?;
 
     if state == ReservationState::Settled {
         let events = recorded_events(conn, tenant_s, region, run_s).await?;
@@ -573,7 +582,7 @@ async fn recorded_events(
     .fetch_all(conn)
     .await
     .map_err(|error| PgError::Query(error.to_string()))?;
-    Ok(rows_to_events(tenant_s, run_s, &rows))
+    rows_to_events(tenant_s, run_s, &rows)
 }
 
 fn outcome_for(events: Vec<CostEvent>, reserved: MinorUnits) -> Result<SettleOutcome, SettleError> {
@@ -609,20 +618,45 @@ fn durable_units_match(events: &[CostEvent], units: &[MeteredUnit]) -> bool {
         })
 }
 
-fn rows_to_events(tenant_s: &str, run_s: &str, rows: &[sqlx::postgres::PgRow]) -> Vec<CostEvent> {
+fn rows_to_events(
+    tenant_s: &str,
+    run_s: &str,
+    rows: &[sqlx::postgres::PgRow],
+) -> Result<Vec<CostEvent>, PgError> {
     rows.iter()
         .map(|r| {
-            let unit: String = r.get("unit");
-            CostEvent {
+            let unit: String = r.try_get("unit").map_err(cost_row_decode)?;
+            Ok(CostEvent {
                 tenant: TenantId(tenant_s.to_string()),
                 run: RunId(run_s.to_string()),
                 // `CostEvent.unit` is an OWNED `String` (MR-009b W6b2), so the rebuilt event simply
                 // carries the durable label — no `Box::leak` (the pre-W6b2 `&'static str` workaround
                 // is gone).
                 unit,
-                wholesale: MinorUnits((r.get::<i64, _>("wholesale")) as u64),
-                markup: MinorUnits((r.get::<i64, _>("markup")) as u64),
-            }
+                wholesale: MinorUnits(
+                    r.try_get::<i64, _>("wholesale").map_err(cost_row_decode)? as u64
+                ),
+                markup: MinorUnits(r.try_get::<i64, _>("markup").map_err(cost_row_decode)? as u64),
+            })
         })
         .collect()
+}
+
+fn cost_row_decode(error: sqlx::Error) -> PgError {
+    PgError::Query(format!("cost ledger row decode failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_state;
+
+    #[test]
+    fn unknown_durable_state_is_a_redacted_error_not_a_panic() {
+        let error = parse_state("attacker-controlled-state")
+            .expect_err("an unknown durable state must fail closed");
+        assert!(error
+            .to_string()
+            .contains("cost_reservation row has an invalid state"));
+        assert!(!error.to_string().contains("attacker-controlled-state"));
+    }
 }
