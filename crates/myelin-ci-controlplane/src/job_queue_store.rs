@@ -484,11 +484,8 @@ impl JobQueueReaper {
         self.store.reap(&self.region).await
     }
 
-    /// **Run the periodic reaper loop forever (until the process/runtime stops).** Sleeps `interval`,
-    /// then sweeps, logging the count (or LOUDLY logging a reap error and continuing). Spawned as a
-    /// detached background task by `main` alongside `serve`; it exits when the process does after the
-    /// serve lifecycle drains. Minimal-impact: no `AppSpec` schema field, no change to the harness
-    /// lifecycle — a bounded background task hung off the existing serve runtime.
+    /// Legacy forever-loop driver retained for deterministic callers. Production uses
+    /// [`Self::run_until_shutdown`] so the task is joined before process exit.
     pub async fn run(self) {
         loop {
             tokio::time::sleep(self.interval).await;
@@ -509,6 +506,43 @@ impl JobQueueReaper {
                          interval): {e}",
                         self.region
                     );
+                }
+            }
+        }
+    }
+
+    /// Run periodic sweeps until explicit shutdown or sender closure. Shutdown wins over a
+    /// simultaneously-ready timer, so drain never begins a fresh sweep.
+    pub async fn run_until_shutdown(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep(self.interval) => {
+                    match self.reap_once().await {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            eprintln!(
+                                "ci-controlplane reaper: re-queued {n} expired lease(s) in region \
+                                 `{}` (dead-runner recovery)",
+                                self.region
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "ci-controlplane reaper: sweep in region `{}` FAILED (will retry \
+                                 next interval): {e}",
+                                self.region
+                            );
+                        }
+                    }
                 }
             }
         }
