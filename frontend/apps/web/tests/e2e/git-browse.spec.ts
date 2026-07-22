@@ -141,8 +141,10 @@ test.describe("GT-004 Git web UI — real browser", () => {
     const fileLink = page.getByTestId("repo-tree").getByRole("link", { name: "README.md" });
     await fileLink.focus();
     await expect(fileLink).toBeFocused(); // keyboard-reachable (the WCAG 2.1.1 requirement)
-    await fileLink.press("Enter"); // keyboard-operable: Enter on the focused link navigates
-    await page.waitForURL("**/git/repos/myelin/blob/main/README.md");
+    await Promise.all([
+      page.waitForURL("**/git/repos/myelin/blob/main/README.md"),
+      fileLink.press("Enter"), // keyboard-operable: Enter on the focused link navigates
+    ]);
     await expect(page.getByTestId("blob-contents")).toBeVisible();
   });
 
