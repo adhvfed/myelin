@@ -17,7 +17,7 @@ Create a root-readable deployment environment file outside the repository:
 REDIS_URL=rediss://user:password@valkey.internal:6380/0
 MYELIN_WEB_SESSION_KEY=<32-random-bytes-as-base64url>
 MYELIN_PUBLIC_ORIGIN=https://myelin.example
-MYELIN_EDGE_URL=http://edge.internal:8080
+MYELIN_EDGE_URL=https://edge.internal
 MYELIN_OIDC_AUTHORIZATION_ENDPOINT=https://identity.example/oauth2/authorize
 MYELIN_OIDC_TOKEN_ENDPOINT=https://identity.example/oauth2/token
 MYELIN_OIDC_CLIENT_ID=myelin-web
@@ -27,11 +27,14 @@ MYELIN_HSTS=1
 ```
 
 `REDIS_URL`, `MYELIN_WEB_SESSION_KEY`, `MYELIN_PUBLIC_ORIGIN`, and `MYELIN_EDGE_URL` are mandatory.
+The edge URL must use HTTPS, including on an internal network, because the web server sends bearer
+capabilities to this origin. Terminate TLS at the edge or at an authenticated private ingress in
+front of it; production startup rejects a plain-HTTP edge URL.
 Generate the session key once with `node -p "require('crypto').randomBytes(32).toString('base64url')"`
 and inject the same secret into every web replica. It encrypts and authenticates the complete trusted
 session record at rest with AES-256-GCM; changing it intentionally invalidates all existing browser
 sessions. The public origin must be HTTPS; the Valkey connection must use TLS; and the edge value must
-be a credential-free HTTP(S) origin on the private service network. Enable HSTS only after the public
+be a credential-free HTTPS origin on the private service network. Enable HSTS only after the public
 hostname is permanently HTTPS.
 
 The five `MYELIN_OIDC_*` settings are optional as a group; setting any of the four endpoint/client

@@ -26,6 +26,9 @@ export function canonicalEdgeOrigin(options: EdgeOriginOptions): string {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("MYELIN_EDGE_URL must use http:// or https://");
   }
+  if (options.production && url.protocol !== "https:") {
+    throw new Error("MYELIN_EDGE_URL must use https:// in production");
+  }
   if (url.username || url.password) {
     throw new Error("MYELIN_EDGE_URL must not contain credentials");
   }

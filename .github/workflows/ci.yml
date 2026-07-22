@@ -137,7 +137,7 @@ jobs:
             --env REDIS_URL=rediss://127.0.0.1:1 \
             --env MYELIN_WEB_SESSION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \
             --env MYELIN_PUBLIC_ORIGIN=https://myelin.example \
-            --env MYELIN_EDGE_URL=http://edge.internal:8080 \
+            --env MYELIN_EDGE_URL=https://edge.internal \
             --env MYELIN_HSTS=1 \
             "$IMAGE"
       - name: Smoke liveness, readiness, ingress, assets, and SIGTERM

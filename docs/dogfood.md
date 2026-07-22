@@ -219,9 +219,9 @@ are stored in the region-local Valkey service, so plaintext `redis://` is accept
 development and tests. Set `MYELIN_WEB_SESSION_KEY` to the same 32-random-byte base64/base64url secret
 on every web replica; trusted session records are AES-256-GCM encrypted and authenticated in Valkey,
 and a key change logs out existing sessions. `MYELIN_EDGE_URL` is also mandatory in production and
-must be an absolute
-HTTP(S) origin with no credentials, path, query, or fragment. Keep that edge origin on the private
-service network; the loopback development edge is never a production fallback. Startup fails before
+must be an absolute HTTPS origin with no credentials, path, query, or fragment. Keep that edge origin
+on the private service network; the loopback development edge is never a production fallback. Startup
+fails before
 accepting traffic when any required setting is missing or invalid. Use `/healthz` for process
 liveness and `/readyz` for traffic readiness; the latter
 performs a short-lived namespaced write/read/script/delete probe and returns 503 whenever the session
