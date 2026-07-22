@@ -382,6 +382,8 @@ pub struct RunTokenCredential {
 }
 
 impl RunTokenCredential {
+    const MAX_BEARER_BYTES: usize = 64 * 1024;
+
     /// Construct a bounded executable credential. Empty/overlong identifiers, empty bearer
     /// material, and non-positive TTLs are refused before a sandbox can receive the value.
     pub fn new(
@@ -389,16 +391,25 @@ impl RunTokenCredential {
         jti: impl Into<String>,
         ttl_secs: u64,
     ) -> Result<Self, RunTokenCredentialError> {
-        let bearer = bearer.into();
-        let jti = jti.into();
-        if bearer.trim().is_empty() {
-            return Err(RunTokenCredentialError::EmptyBearer);
-        }
-        if jti.trim().is_empty() || jti.len() > 512 {
-            return Err(RunTokenCredentialError::InvalidJti);
-        }
-        if ttl_secs == 0 {
-            return Err(RunTokenCredentialError::NonPositiveTtl);
+        use zeroize::Zeroize;
+
+        let mut bearer = bearer.into();
+        let mut jti = jti.into();
+        let invalid = if bearer.trim().is_empty() {
+            Some(RunTokenCredentialError::EmptyBearer)
+        } else if bearer.len() > Self::MAX_BEARER_BYTES {
+            Some(RunTokenCredentialError::BearerTooLong)
+        } else if jti.trim().is_empty() || jti.len() > 512 {
+            Some(RunTokenCredentialError::InvalidJti)
+        } else if ttl_secs == 0 {
+            Some(RunTokenCredentialError::NonPositiveTtl)
+        } else {
+            None
+        };
+        if let Some(error) = invalid {
+            bearer.zeroize();
+            jti.zeroize();
+            return Err(error);
         }
         Ok(Self {
             jti,
@@ -439,6 +450,7 @@ impl Drop for RunTokenCredential {
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.bearer.zeroize();
+        self.jti.zeroize();
     }
 }
 
@@ -447,6 +459,7 @@ impl Drop for RunTokenCredential {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunTokenCredentialError {
     EmptyBearer,
+    BearerTooLong,
     InvalidJti,
     NonPositiveTtl,
 }
@@ -455,6 +468,9 @@ impl std::fmt::Display for RunTokenCredentialError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyBearer => f.write_str("run-token bearer material must be non-empty"),
+            Self::BearerTooLong => {
+                f.write_str("run-token bearer material must be at most 65536 bytes")
+            }
             Self::InvalidJti => {
                 f.write_str("run-token JTI must be non-empty and at most 512 bytes")
             }
@@ -1228,6 +1244,10 @@ mod tests {
         assert_eq!(
             RunTokenCredential::new("", "jti", 1).unwrap_err(),
             RunTokenCredentialError::EmptyBearer
+        );
+        assert_eq!(
+            RunTokenCredential::new("x".repeat(64 * 1024 + 1), "jti", 1).unwrap_err(),
+            RunTokenCredentialError::BearerTooLong
         );
         assert_eq!(
             RunTokenCredential::new("bearer", "", 1).unwrap_err(),

@@ -815,6 +815,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn git_request_debug_cannot_bypass_credential_redaction() {
+        let request = GitRequest {
+            credential: cred("pat", "secret-bearer"),
+            url_tenant: "acme".into(),
+            url_repo: "widgets".into(),
+            action: GitAction::Fetch,
+            body: Vec::new(),
+        };
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("secret-bearer"));
+        assert!(rendered.contains("<redacted>"));
+    }
+
     fn door(
         id: StubId,
         placement: StubPlacement,

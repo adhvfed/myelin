@@ -109,6 +109,14 @@ impl core::fmt::Debug for RunTokenHandle {
     }
 }
 
+impl Drop for RunTokenHandle {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.token.zeroize();
+        self.jti.zeroize();
+    }
+}
+
 /// **The engine's view of the contract-4.7 `mint_run_token` surface (CONSUMED, §6.2).** A trait so
 /// `myelin-flow` does NOT take a production runtime dependency on `myelin-identity` (the DAG stays
 /// acyclic — the same decoupling [`crate::JobRunner`] / [`crate::EffectApplier`] use). The Identity
@@ -346,6 +354,7 @@ mod tests {
         assert!(!rendered.contains("secret-jti"));
         assert!(rendered.contains("<redacted>"));
         assert!(rendered.contains("ttl_secs: 300"));
+        assert!(core::mem::needs_drop::<RunTokenHandle>());
     }
 
     fn tenant() -> TenantId {

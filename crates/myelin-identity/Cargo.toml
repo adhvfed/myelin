@@ -13,6 +13,7 @@ publish = false
 [dependencies]
 myelin-tenancy = { path = "../myelin-tenancy" }
 serde.workspace = true
+zeroize = "1"
 
 # ------------------------------------------------------------------------------------------
 # REAL ReBAC tuple store behind the `integration` feature (Stage 1 / infra). The relation-tuple
