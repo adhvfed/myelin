@@ -832,18 +832,27 @@ impl DurableGitBackend {
         tenant: &str,
         region: &str,
         principal: &Principal,
-    ) -> Result<Vec<RepoHome>, DurableError> {
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<RepoHome>, bool), DurableError> {
         let candidates = self.scan_repo_slugs(tenant, region)?;
         let visible = self
             .repo_authz
             .visible_repos(principal, tenant, region, &candidates);
+        let mut page: Vec<String> = visible
+            .into_iter()
+            .skip(offset)
+            .take(limit.saturating_add(1))
+            .collect();
+        let has_more = page.len() > limit;
+        page.truncate(limit);
         let mut out = Vec::new();
-        for slug in visible {
+        for slug in page {
             let loc = Self::loc(tenant, region, &slug);
             let repo = self.store.open_repo(&loc)?;
             out.push(self.repo_home(tenant, region, &slug, &repo)?);
         }
-        Ok(out)
+        Ok((out, has_more))
     }
 
     /// **F3 — the HTTP git-wire clone URL for a repo.** The wire path grammar is
@@ -3142,10 +3151,6 @@ impl Handler for DRepoList {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         // R2.1: the LIST endpoint is prefiltered to the principal's `pull`-visible set (the
         // `list_objects` seam) BEFORE pagination — an un-granted repo's existence is never leaked.
-        let all = self
-            .be
-            .list_repos_visible(tenant_of(ctx), region_of(ctx), ctx.principal)
-            .map_err(map_durable_err)?;
         let offset = ctx
             .page
             .cursor
@@ -3153,13 +3158,18 @@ impl Handler for DRepoList {
             .and_then(|c| c.parse::<usize>().ok())
             .unwrap_or(0);
         let limit = ctx.page.limit;
-        let items: Vec<Value> = all
-            .iter()
-            .skip(offset)
-            .take(limit)
-            .map(|r| r.to_json())
-            .collect();
-        let next = if offset.saturating_add(limit) < all.len() {
+        let (page, has_more) = self
+            .be
+            .list_repos_visible(
+                tenant_of(ctx),
+                region_of(ctx),
+                ctx.principal,
+                offset,
+                limit,
+            )
+            .map_err(map_durable_err)?;
+        let items: Vec<Value> = page.iter().map(|repo| repo.to_json()).collect();
+        let next = if has_more {
             Some(offset.saturating_add(limit).to_string())
         } else {
             None
@@ -4965,6 +4975,28 @@ mod pr_list_tests {
             body["page"]["next_cursor"].is_null(),
             "no next past the end"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn repository_list_pages_visible_slugs_before_building_view_models() {
+        let root = temp_root("repo-page");
+        let authz = GrantBackedRepos::new()
+            .grant_read("u:viewer", TENANT, "alpha")
+            .grant_read("u:viewer", TENANT, "beta")
+            .grant_read("u:viewer", TENANT, "gamma");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root)
+            .with_repo_authorizer(Arc::new(authz));
+        let viewer = human("u:viewer");
+        for slug in ["alpha", "beta", "gamma"] {
+            be.create_repo_as(TENANT, REGION, slug, &viewer).unwrap();
+        }
+
+        let handler = DRepoList { be: Arc::new(be) };
+        let body = serve(&handler, &viewer, None, "limit=1&cursor=1");
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(body["items"][0]["slug"], "acme/beta");
+        assert_eq!(body["page"]["next_cursor"], "2");
         std::fs::remove_dir_all(&root).ok();
     }
 
