@@ -415,25 +415,18 @@ impl GatewayBuilder {
 
     /// Bind proof-of-possession credentials to this trusted public edge base URL. Production passes
     /// the validated deployment origin; request headers never select this value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the URL is not absolute HTTP(S), contains credentials or a query, or
+    /// cannot be parsed as an HTTP URI.
     pub fn with_public_base_url(
         mut self,
         public_base_url: impl Into<String>,
-    ) -> GatewayBuilder {
+    ) -> Result<GatewayBuilder, String> {
         let public_base_url = public_base_url.into();
-        let uri = public_base_url
-            .parse::<hyper::Uri>()
-            .expect("public base URL must be an absolute HTTP(S) URL");
-        assert!(
-            matches!(uri.scheme_str(), Some("http" | "https"))
-                && uri.authority().is_some()
-                && !uri
-                    .authority()
-                    .is_some_and(|authority| authority.as_str().contains('@'))
-                && uri.query().is_none(),
-            "public base URL must be an absolute, query-free HTTP(S) URL"
-        );
-        self.public_base_url = Some(public_base_url.trim_end_matches('/').to_string());
-        self
+        self.public_base_url = Some(validate_public_base_url(&public_base_url)?);
+        Ok(self)
     }
 
     /// Finish building the gateway.
@@ -452,6 +445,24 @@ impl GatewayBuilder {
             human_session_issuer: self.human_session_issuer,
         }
     }
+}
+
+fn validate_public_base_url(public_base_url: &str) -> Result<String, String> {
+    let uri = public_base_url
+        .parse::<hyper::Uri>()
+        .map_err(|_| "public base URL must be a valid absolute HTTP(S) URL".to_string())?;
+    if !matches!(uri.scheme_str(), Some("http" | "https"))
+        || uri.authority().is_none()
+        || uri
+            .authority()
+            .is_some_and(|authority| authority.as_str().contains('@'))
+        || uri.query().is_some()
+    {
+        return Err(
+            "public base URL must be an absolute, credential-free, query-free HTTP(S) URL".into(),
+        );
+    }
+    Ok(public_base_url.trim_end_matches('/').to_string())
 }
 
 /// **The edge gateway.** Owns the request lifecycle (authenticate → resolve → scope → authorize →
@@ -1034,6 +1045,26 @@ mod tests {
     };
     use myelin_storage::KmsEngine;
 
+    #[test]
+    fn public_base_url_validation_returns_errors_instead_of_panicking() {
+        for invalid in [
+            "not a URL",
+            "ftp://myelin.example",
+            "https://user:secret@myelin.example",
+            "https://myelin.example?tenant=spoofed",
+        ] {
+            assert!(
+                validate_public_base_url(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+
+        assert_eq!(
+            validate_public_base_url("https://myelin.example/base/").as_deref(),
+            Ok("https://myelin.example/base")
+        );
+    }
+
     fn human_login() -> Arc<HumanSsoAuthenticator> {
         Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
             Arc::new(KmsEngine::new()),
@@ -1200,6 +1231,7 @@ mod tests {
         ));
         let gateway = Gateway::builder(authn, human_login(), Arc::new(AllowAll))
             .with_public_base_url("https://myelin.example/base/")
+            .expect("valid public base URL")
             .route(
                 Method::Get,
                 "/v1/whoami",
