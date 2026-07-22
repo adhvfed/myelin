@@ -23,6 +23,7 @@ export async function GET() {
         "x-myelin-token-scheme": rec.scheme,
         accept: "text/event-stream",
       },
+      redirect: "error",
     });
   } catch {
     return new Response("firehose unavailable", { status: 502 });
