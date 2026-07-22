@@ -392,8 +392,14 @@ pub enum BlobPathLookup {
         /// The blob byte size.
         size: u64,
     },
-    /// The blob exists but exceeds a caller-supplied pre-allocation byte ceiling.
-    TooLarge { size: u64, maximum: usize },
+    /// The blob exists but exceeds a caller-supplied pre-allocation byte ceiling. Its object id is
+    /// still available from the tree entry without inflating the object, so metadata-only callers
+    /// can render an honest download fallback.
+    TooLarge {
+        size: u64,
+        maximum: usize,
+        oid: Oid,
+    },
     /// The path resolves to a directory → the caller redirects to the tree route.
     IsDir,
     /// No such path under the ref.
@@ -1199,7 +1205,11 @@ impl DurableGitRepo {
                     .map_err(|e| git_err("read object header", e))?;
                 if object_kind != git2::ObjectType::Blob { return Ok(BlobPathLookup::Missing); }
                 if object_size > maximum_bytes {
-                    return Ok(BlobPathLookup::TooLarge { size: object_size as u64, maximum: maximum_bytes });
+                    return Ok(BlobPathLookup::TooLarge {
+                        size: object_size as u64,
+                        maximum: maximum_bytes,
+                        oid: Oid::new(entry.id().to_string()),
+                    });
                 }
                 let obj = entry.to_object(repo).map_err(|e| git_err("entry object", e))?;
                 let blob = obj
@@ -3364,7 +3374,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&bytes).contains("deep"));
         assert!(matches!(
             repo.read_blob_at_path_bounded("main", "crates/inner/deep.rs", 1).unwrap(),
-            BlobPathLookup::TooLarge { size, maximum: 1 } if size > 1
+            BlobPathLookup::TooLarge { size, maximum: 1, oid } if size > 1 && oid.as_str().len() == 40
         ));
 
         // A BINARY blob (NUL bytes): flagged binary so the UI never split('\n')s it.

@@ -196,7 +196,10 @@ export function parseBlob(value: unknown): BlobVM | null {
       typeof blob.viewer_may_edit !== "boolean" ||
       (blob.is_binary !== undefined && typeof blob.is_binary !== "boolean") ||
       (blob.size_bytes !== undefined && !uint(blob.size_bytes)) ||
-      (blob.is_truncated !== undefined && typeof blob.is_truncated !== "boolean")) return null;
+      (blob.is_truncated !== undefined && typeof blob.is_truncated !== "boolean") ||
+      (blob.preview_unavailable !== undefined && typeof blob.preview_unavailable !== "boolean") ||
+      (blob.download_available !== undefined && typeof blob.download_available !== "boolean") ||
+      (blob.preview_unavailable === true && blob.contents !== "")) return null;
   const relative = (candidate: unknown) => candidate === undefined ||
     (displayText(candidate, 8 * 1024) && candidate.startsWith("/") && !candidate.startsWith("//"));
   if (!relative(blob.raw_url) || !relative(blob.download_url)) return null;
@@ -208,6 +211,8 @@ export function parseBlob(value: unknown): BlobVM | null {
     ...(blob.is_binary === undefined ? {} : { is_binary: blob.is_binary }),
     ...(blob.size_bytes === undefined ? {} : { size_bytes: blob.size_bytes }),
     ...(blob.is_truncated === undefined ? {} : { is_truncated: blob.is_truncated }),
+    ...(blob.preview_unavailable === undefined ? {} : { preview_unavailable: blob.preview_unavailable }),
+    ...(blob.download_available === undefined ? {} : { download_available: blob.download_available }),
     ...(blob.raw_url === undefined ? {} : { raw_url: blob.raw_url as string }),
     ...(blob.download_url === undefined ? {} : { download_url: blob.download_url as string }),
   };

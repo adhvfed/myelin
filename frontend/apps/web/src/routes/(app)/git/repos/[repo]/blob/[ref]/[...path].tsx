@@ -1,8 +1,8 @@
 // Blob view (R3.4 / G-2) — `/git/repos/{repo}/blob/{ref}/{...path}` (nested path). Full-path
 // breadcrumb; a Raw + Download toolbar (gateway-proxied, in-region — Download forces an attachment via
 // the /git-raw proxy) + a present-disabled Blame slot ("soon"). Body: a BINARY file renders the
-// download fallback (NEVER split('\n') a binary into a garbled dump); a large/truncated text file
-// shows a head + "download full file"; otherwise the line-numbered code view. A directory requested
+// download fallback (NEVER split('\n') a binary into a garbled dump); a large file whose object was
+// not inflated shows an explicit metadata-only fallback; otherwise the line-numbered code view. A directory requested
 // here (the edge's redirect_to_tree hint) client-redirects to the tree route. Semantic tokens only.
 import { ErrorBoundary, For, Show, Suspense } from "solid-js";
 import { Title } from "@solidjs/meta";
@@ -66,12 +66,14 @@ export default function BlobScreen() {
                     <span style={{ color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>{fmtBytes(file.size_bytes)}</span>
                     <div style={{ flex: "1" }} />
                     {/* Raw (open) · Download (attachment, gateway-proxied) · Blame (present-disabled "soon"). */}
-                    <a href={rawHref()} target="_blank" rel="noreferrer" style={toolbarBtn}>
-                      <Icon name="external-link" /> Raw
-                    </a>
-                    <a href={downloadHref()} style={toolbarBtn} data-testid="blob-download">
-                      <Icon name="download" /> Download
-                    </a>
+                    <Show when={file.download_available !== false}>
+                      <a href={rawHref()} target="_blank" rel="noreferrer" style={toolbarBtn}>
+                        <Icon name="external-link" /> Raw
+                      </a>
+                      <a href={downloadHref()} style={toolbarBtn} data-testid="blob-download">
+                        <Icon name="download" /> Download
+                      </a>
+                    </Show>
                     <button type="button" aria-disabled="true" disabled data-testid="blame-soon" title="Blame is coming soon" style={{ ...toolbarBtn, color: "var(--text-subtle)", cursor: "not-allowed" }}>
                       <Icon name="human" /> Blame
                       <span style={{ "font-size": "var(--fs-caption)" }}>soon</span>
@@ -83,41 +85,55 @@ export default function BlobScreen() {
                   </p>
 
                   <Show
-                    when={!file.is_binary}
+                    when={!file.preview_unavailable}
                     fallback={
-                      <div role="note" data-testid="blob-binary" style={{ border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)", padding: "var(--space-4)", background: "var(--surface-raised)", display: "flex", "flex-direction": "column", "align-items": "center", gap: "var(--space-2)" }}>
+                      <div role="note" data-testid="blob-preview-unavailable" style={{ border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)", padding: "var(--space-4)", background: "var(--surface-raised)", display: "flex", "flex-direction": "column", "align-items": "center", gap: "var(--space-2)" }}>
                         <Icon name="file" size={24} />
-                        <p style={{ margin: "0", color: "var(--text-muted)" }}>Preview not available &mdash; binary file ({fmtBytes(file.size_bytes)}).</p>
-                        <a href={downloadHref()} style={{ ...toolbarBtn }}>
-                          <Icon name="download" /> Download file
-                        </a>
+                        <p style={{ margin: "0", color: "var(--text-muted)" }}>
+                          Preview not available for this large file ({fmtBytes(file.size_bytes)}).
+                        </p>
+                        <Show
+                          when={file.download_available !== false}
+                          fallback={<p style={{ margin: "0", color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>This file also exceeds the browser transfer limit. Fetch it through Git instead.</p>}
+                        >
+                          <a href={downloadHref()} style={{ ...toolbarBtn }}>
+                            <Icon name="download" /> Download file
+                          </a>
+                        </Show>
                       </div>
                     }
                   >
-                    <Show when={file.is_truncated}>
-                      <p role="note" data-testid="blob-truncated" style={{ margin: "0", color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>
-                        This file is large ({fmtBytes(file.size_bytes)}) &mdash; showing the first part. {" "}
-                        <a href={downloadHref()} style={{ color: "var(--text-primary)", "text-decoration": "underline" }}>Download the full file</a>.
-                      </p>
-                    </Show>
-                    <pre
-                      data-testid="blob-contents"
-                      aria-label="File contents"
-                      style={{
-                        border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)",
-                        padding: "var(--space-3)", background: "var(--surface-raised)", margin: "0",
-                        "font-family": "var(--font-mono)", "white-space": "pre-wrap", overflow: "auto",
-                      }}
+                    <Show
+                      when={!file.is_binary}
+                      fallback={
+                        <div role="note" data-testid="blob-binary" style={{ border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)", padding: "var(--space-4)", background: "var(--surface-raised)", display: "flex", "flex-direction": "column", "align-items": "center", gap: "var(--space-2)" }}>
+                          <Icon name="file" size={24} />
+                          <p style={{ margin: "0", color: "var(--text-muted)" }}>Preview not available &mdash; binary file ({fmtBytes(file.size_bytes)}).</p>
+                          <a href={downloadHref()} style={{ ...toolbarBtn }}>
+                            <Icon name="download" /> Download file
+                          </a>
+                        </div>
+                      }
                     >
-                      <For each={file.contents.split("\n")}>
-                        {(line, i) => (
-                          <div style={{ display: "flex", gap: "var(--space-2)" }}>
-                            <span aria-hidden="true" style={{ color: "var(--text-subtle)", "min-width": "2.5rem", "text-align": "end", "user-select": "none" }}>{i() + 1}</span>
-                            <span>{line}</span>
-                          </div>
-                        )}
-                      </For>
-                    </pre>
+                      <pre
+                        data-testid="blob-contents"
+                        aria-label="File contents"
+                        style={{
+                          border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)",
+                          padding: "var(--space-3)", background: "var(--surface-raised)", margin: "0",
+                          "font-family": "var(--font-mono)", "white-space": "pre-wrap", overflow: "auto",
+                        }}
+                      >
+                        <For each={file.contents.split("\n")}>
+                          {(line, i) => (
+                            <div style={{ display: "flex", gap: "var(--space-2)" }}>
+                              <span aria-hidden="true" style={{ color: "var(--text-subtle)", "min-width": "2.5rem", "text-align": "end", "user-select": "none" }}>{i() + 1}</span>
+                              <span>{line}</span>
+                            </div>
+                          )}
+                        </For>
+                      </pre>
+                    </Show>
                   </Show>
                 </Show>
               )}
