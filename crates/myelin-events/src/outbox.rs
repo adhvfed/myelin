@@ -1273,6 +1273,101 @@ mod tests {
     }
 
     #[test]
+    fn detached_transaction_rejects_each_routing_mismatch_independently() {
+        for mismatch in ["event_id", "aggregate", "subject"] {
+            let (_, minter) = store_and_minter();
+            let mut tx = OutboxTransaction::detached(minter, ctx_base());
+            tx.emit(draft("issues.issue.created", "issue:DETACHED"), None)
+                .unwrap();
+            match mismatch {
+                "event_id" => tx.staged_rows[0].event_id = EventId("different-id".into()),
+                "aggregate" => {
+                    tx.staged_rows[0].aggregate = AggregateKey("issue:DIFFERENT".into())
+                }
+                "subject" => {
+                    tx.staged_rows[0].subject =
+                        ArtifactRef("myelin://acme/issues/issue/DIFFERENT".into())
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                tx.into_staged_rows().is_err(),
+                "an isolated {mismatch} mismatch must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn detached_transaction_rejects_each_allocated_shape_independently() {
+        for invalid in ["sequence", "published", "attempts"] {
+            let (_, minter) = store_and_minter();
+            let mut tx = OutboxTransaction::detached(minter, ctx_base());
+            tx.emit(draft("issues.issue.created", "issue:DETACHED"), None)
+                .unwrap();
+            match invalid {
+                "sequence" => tx.staged_rows[0].seq = 7,
+                "published" => {
+                    tx.staged_rows[0].published_at = Some(Timestamp("2026-06-19T00:00:02Z".into()))
+                }
+                "attempts" => tx.staged_rows[0].attempts = 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                tx.into_staged_rows().is_err(),
+                "an isolated {invalid} staging violation must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn absorb_commit_is_idempotent_but_rejects_divergent_payloads() {
+        struct ConstantMinter;
+        impl IdMinter for ConstantMinter {
+            fn mint(&self) -> Ulid {
+                Ulid("01ABSORBID0000000000000000".into())
+            }
+        }
+
+        let store = OutboxStore::new();
+        let minter: Arc<dyn IdMinter> = Arc::new(ConstantMinter);
+        for _ in 0..2 {
+            let mut tx = store.begin(Arc::clone(&minter), ctx_base());
+            tx.emit(draft("issues.issue.created", "issue:ABSORB"), None)
+                .unwrap();
+            tx.commit_absorb().unwrap();
+        }
+        assert_eq!(store.committed_count(), 1, "identical replay is absorbed");
+        assert_eq!(store.try_committed_rows().unwrap().len(), 1);
+
+        let mut divergent = store.begin(minter, ctx_base());
+        divergent
+            .emit(draft("issues.issue.deleted", "issue:ABSORB"), None)
+            .unwrap();
+        assert!(
+            divergent.commit_absorb().is_err(),
+            "the same deterministic id with a different envelope is a collision"
+        );
+        assert_eq!(store.committed_count(), 1);
+    }
+
+    #[test]
+    fn absorb_commit_allocates_contiguous_sequence_numbers() {
+        let (store, minter) = store_and_minter();
+        let mut tx = store.begin(minter, ctx_base());
+        let first = tx
+            .emit(draft("issues.issue.created", "issue:ABSORB"), None)
+            .unwrap();
+        let second = tx
+            .emit(draft("issues.issue.updated", "issue:ABSORB"), None)
+            .unwrap();
+        tx.commit_absorb().unwrap();
+
+        assert_eq!(store.row(&first).unwrap().seq, 0);
+        assert_eq!(store.row(&second).unwrap().seq, 1);
+        assert_eq!(store.committed_count(), 2);
+    }
+
+    #[test]
     fn store_backed_transaction_cannot_export_around_its_commit_boundary() {
         let (store, minter) = store_and_minter();
         let mut tx = store.begin(minter, ctx_base());
