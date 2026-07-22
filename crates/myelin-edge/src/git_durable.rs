@@ -1301,14 +1301,22 @@ impl DurableGitBackend {
         self.pr_get(&Self::loc(tenant, region, slug), number, principal)
     }
 
-    fn next_pr_number(&self, loc: &RepoLoc) -> u64 {
+    fn next_pr_number(&self, loc: &RepoLoc) -> Result<u64, DurableError> {
         // Peer-review finding #3: allocate from the FILENAME-authoritative max (not `list()`, which is a
         // tolerant view that skips a corrupt record — deriving the next number from it would REUSE a
         // corrupt highest PR's number and overwrite its file). A corrupt record still counts here.
-        self.prs
-            .max_pr_number(loc)
-            .map(|m| m.unwrap_or(0) + 1)
-            .unwrap_or(1)
+        // The directory read is authoritative too: an I/O fault must abort allocation, never reset it
+        // to #1. Exhausting the u64 namespace is likewise a loud refusal, not a wrap to zero.
+        Self::next_pr_number_after(self.prs.max_pr_number(loc)?)
+    }
+
+    fn next_pr_number_after(max: Option<u64>) -> Result<u64, DurableError> {
+        match max {
+            None => Ok(1),
+            Some(number) => number.checked_add(1).ok_or_else(|| {
+                DurableError::Git("pull-request number space exhausted at u64::MAX".into())
+            }),
+        }
     }
 
     pub fn open_pr(
@@ -1437,7 +1445,7 @@ impl DurableGitBackend {
         let number = if self.pg_prs.is_some() {
             0
         } else {
-            self.next_pr_number(&loc)
+            self.next_pr_number(&loc)?
         };
         let pr = PullRequest::open(
             number,
@@ -4920,6 +4928,15 @@ mod pr_list_tests {
             "no ssh in the projection: {advertised}"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pr_number_allocation_never_resets_or_wraps() {
+        assert_eq!(DurableGitBackend::next_pr_number_after(None).unwrap(), 1);
+        assert_eq!(DurableGitBackend::next_pr_number_after(Some(41)).unwrap(), 42);
+        let err = DurableGitBackend::next_pr_number_after(Some(u64::MAX))
+            .expect_err("an exhausted namespace must fail instead of wrapping");
+        assert!(err.to_string().contains("number space exhausted"));
     }
 
     /// **F8 (R4.1 dogfood) — open a PR with a `head_ref` but NO `head_oid` → the stored PR carries the
