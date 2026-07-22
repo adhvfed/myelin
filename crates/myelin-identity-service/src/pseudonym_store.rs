@@ -493,7 +493,8 @@ impl PseudonymStore {
     /// verified scope. The PUBLIC pseudonym survives a crypto-shred (only the real-identity LINK is
     /// erased), so this read keeps working post-erasure.
     pub fn mapping_of(&self, scope: &TenantScope, subject: &PrincipalId) -> Option<PseudonymRow> {
-        self.try_mapping_of(scope, subject).ok().flatten()
+        self.try_mapping_of(scope, subject)
+            .unwrap_or_else(|e| panic!("pseudonym store: mapping read failed loud: {e}"))
     }
 
     /// Fallible mapping read for service paths that must distinguish absence from storage failure
@@ -610,7 +611,8 @@ impl PseudonymStore {
         scope: &TenantScope,
         subject: &PrincipalId,
     ) -> Option<PrincipalId> {
-        self.try_resolve_subject(scope, subject).ok().flatten()
+        self.try_resolve_subject(scope, subject)
+            .unwrap_or_else(|e| panic!("pseudonym store: subject resolution failed loud: {e}"))
     }
 
     /// Fallible resurrection probe for erasure verification. An absent row or a destroyed key is a
@@ -747,28 +749,39 @@ impl PseudonymStore {
         })
     }
 
-    /// List the mapping rows in a `(tenant, region)` partition (for the directory / tests). There is
-    /// NO accessor that reads across partitions — a read is scoped to one verified `(tenant,
-    /// region)`, so cross-tenant reads are structurally impossible.
-    pub fn mappings_in(&self, scope: &TenantScope) -> Vec<PseudonymRow> {
+    /// Fallibly list mapping rows in a `(tenant, region)` partition. A backing fault or malformed
+    /// durable row remains distinguishable from a genuinely empty directory.
+    pub fn try_mappings_in(
+        &self,
+        scope: &TenantScope,
+    ) -> Result<Vec<PseudonymRow>, PseudonymError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S2_TABLE));
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             PseudonymBackend::Memory(inner_arc) => {
                 let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
-                inner
+                Ok(inner
                     .by_subject
                     .get(&Self::part_key(scope))
                     .map(|p| p.values().cloned().collect())
-                    .unwrap_or_default()
+                    .unwrap_or_default())
             }
             PseudonymBackend::Pg(pg) => pg
                 .block(pg.backing.mappings_in(&scope.tenant().0))
-                .unwrap_or_default()
+                .map_err(|e| PseudonymError::Storage(e.to_string()))?
                 .iter()
-                .filter_map(|drow| Self::durable_to_row(scope, drow).ok())
+                .map(|drow| Self::durable_to_row(scope, drow))
                 .collect(),
         }
+    }
+
+    /// List the mapping rows in a `(tenant, region)` partition (for the directory / tests). There is
+    /// NO accessor that reads across partitions — a read is scoped to one verified `(tenant,
+    /// region)`, so cross-tenant reads are structurally impossible. Durable faults fail loud instead
+    /// of fabricating an empty or partial directory; fallible callers use [`Self::try_mappings_in`].
+    pub fn mappings_in(&self, scope: &TenantScope) -> Vec<PseudonymRow> {
+        self.try_mappings_in(scope)
+            .unwrap_or_else(|e| panic!("pseudonym store: mapping scan failed loud: {e}"))
     }
 
     /// The `(tenant, region)` partition key for a verified scope (the OUTER partition; 12.1). A
@@ -835,11 +848,18 @@ mod tests {
 
         // The forward direction (subject → row) round-trips.
         let read = store
-            .mapping_of(&s, &PrincipalId("p:alice".into()))
+            .try_mapping_of(&s, &PrincipalId("p:alice".into()))
+            .expect("mapping directory read succeeds")
             .expect("the row round-trips under the same scope");
         assert_eq!(
             read, written,
             "the S2 row round-trips byte-for-byte under RLS"
+        );
+        assert_eq!(
+            store
+                .try_mappings_in(&s)
+                .expect("mapping directory scan succeeds"),
+            vec![written]
         );
 
         // The reverse direction (pseudonym → subject) resolves the real-identity link.

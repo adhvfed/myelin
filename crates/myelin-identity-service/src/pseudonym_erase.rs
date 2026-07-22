@@ -422,7 +422,8 @@ impl PseudonymErasureLedger {
     /// Every erasure entry in a `(tenant, region)` partition (the re-erasure pass replays THIS). No
     /// cross-partition accessor exists — a read is scoped to one verified `(tenant, region)`.
     pub fn entries_in(&self, scope: &TenantScope) -> Vec<ErasureLedgerEntry> {
-        self.try_entries_in(scope).unwrap_or_default()
+        self.try_entries_in(scope)
+            .unwrap_or_else(|e| panic!("erasure ledger: replay read failed loud: {e}"))
     }
 
     /// Fallible ledger replay for restore verification. A backing fault or malformed key class
@@ -467,7 +468,8 @@ impl PseudonymErasureLedger {
     /// `true` iff the subject is recorded erased in the verified scope (the ledger remembers an
     /// erasure even after the map row + DEK are gone — the load-bearing 10.8 property).
     pub fn is_erased(&self, scope: &TenantScope, subject: &PrincipalId) -> bool {
-        self.try_is_erased(scope, subject).unwrap_or(false)
+        self.try_is_erased(scope, subject)
+            .unwrap_or_else(|e| panic!("erasure ledger: state read failed loud: {e}"))
     }
 
     /// Fallible erasure-state read for service decisions. A backing fault must not look like a
@@ -572,7 +574,12 @@ mod tests {
         let ledger = PseudonymErasureLedger::new();
         let s = scope("acme", "eu-west");
         let subject = PrincipalId("p:alice".into());
-        assert!(!ledger.is_erased(&s, &subject), "not erased before record");
+        assert!(
+            !ledger
+                .try_is_erased(&s, &subject)
+                .expect("ledger state read succeeds"),
+            "not erased before record"
+        );
         ledger.record(
             &s,
             &subject,
@@ -583,7 +590,9 @@ mod tests {
             ledger.is_erased(&s, &subject),
             "the ledger remembers the erasure"
         );
-        let entries = ledger.entries_in(&s);
+        let entries = ledger
+            .try_entries_in(&s)
+            .expect("ledger replay read succeeds");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].subject, subject);
         assert_eq!(entries[0].dek_class, KeyClass::Subject("p:alice".into()));
