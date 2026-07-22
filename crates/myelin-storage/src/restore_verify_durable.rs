@@ -140,25 +140,33 @@ impl DurableRestoreErasureLedger {
         .fetch_all(self.provider.db_pool())
         .await
         .map_err(|e| ProviderError::from(crate::pg::PgError::Query(e.to_string())))?;
-        Ok(rows
-            .iter()
-            .map(|r| {
-                let tenant: String = r.get("tenant_id");
-                let offset: i64 = r.get("completed_at_offset");
-                (TenantId(tenant), offset as WalOffset)
+        rows.iter()
+            .map(|row| {
+                let tenant: String = row
+                    .try_get("tenant_id")
+                    .map_err(restore_erasure_row_decode)?;
+                let offset: i64 = row
+                    .try_get("completed_at_offset")
+                    .map_err(restore_erasure_row_decode)?;
+                Ok((TenantId(tenant), offset as WalOffset))
             })
-            .collect())
+            .collect()
     }
 
     /// The sync gate read (bridged onto the runtime handle) — every erased tenant + its completion
     /// offset. FAIL-STATIC LOUD on a store fault (a swallowed empty set would green every restore).
     pub(crate) fn records(&self) -> Vec<(TenantId, WalOffset)> {
-        tokio::task::block_in_place(|| self.rt.block_on(self.records_async()))
-            .unwrap_or_else(|e| {
-                panic!(
-                    "FAIL-STATIC: durable restore-verify erasure ledger read failed (an incomplete \
+        tokio::task::block_in_place(|| self.rt.block_on(self.records_async())).unwrap_or_else(|e| {
+            panic!(
+                "FAIL-STATIC: durable restore-verify erasure ledger read failed (an incomplete \
                      erased set would let the gate green a resurrected subject): {e}"
-                )
-            })
+            )
+        })
     }
+}
+
+fn restore_erasure_row_decode(error: sqlx::Error) -> ProviderError {
+    ProviderError::from(crate::pg::PgError::Query(format!(
+        "restore erasure ledger row decode failed: {error}"
+    )))
 }
