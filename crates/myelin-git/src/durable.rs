@@ -456,6 +456,33 @@ impl DurableGitRepo {
             .map_err(|e| git_err(&format!("open bare repo {}", self.path.display()), e))
     }
 
+    /// Acquire the durable cross-process linearisation lock for one ref. The returned file owns the
+    /// exclusive lock until dropped. Lock filenames use the same injective hex encoding as ref
+    /// generations, and callers acquire multiple refs in sorted order to remain deadlock-free.
+    pub(crate) fn lock_ref_exclusive(&self, ref_name: &str) -> Result<std::fs::File, DurableError> {
+        let lock_dir = self.path.join("myelin-ref-locks");
+        std::fs::create_dir_all(&lock_dir).map_err(|e| {
+            DurableError::Io(format!(
+                "create durable ref lock directory {}: {e}",
+                lock_dir.display()
+            ))
+        })?;
+        let lock_path = lock_dir.join(refgen_key(ref_name));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| {
+                DurableError::Io(format!("open durable ref lock {}: {e}", lock_path.display()))
+            })?;
+        fs4::fs_std::FileExt::lock_exclusive(&file).map_err(|e| {
+            DurableError::Io(format!("acquire durable ref lock {}: {e}", lock_path.display()))
+        })?;
+        Ok(file)
+    }
+
     /// **Open a THROWAWAY host-side quarantine bare repo (CT-006d push staging).** `init_bare` at `dir`
     /// with its odb alternating to `alternate_objects` (the REAL repo's `objects/` dir, READ-only) — the
     /// staging area where the sandbox-validated pushed objects are written + inspected (policy +
@@ -2092,6 +2119,41 @@ mod tests {
         let tree = repo.write_tree(&[("file.txt", &blob)]).expect("tree");
         repo.write_commit(&tree, &[], "feat: seed", "psn-7@acme.noreply", "psn-7@acme.noreply")
             .expect("commit")
+    }
+
+    #[test]
+    fn durable_ref_lock_serializes_independent_repo_handles() {
+        let root = temp_root("ref-lock");
+        let store = DurableGitStore::rooted(&root);
+        let first_repo = store.create_repo(&loc()).expect("create");
+        let second_repo = store.open_repo(&loc()).expect("second process-style handle");
+        let first_lock = first_repo
+            .lock_ref_exclusive("refs/heads/main")
+            .expect("first lock");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _second_lock = second_repo
+                .lock_ref_exclusive("refs/heads/main")
+                .expect("second lock after release");
+            acquired_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "a second durable handle cannot enter the same ref window concurrently"
+        );
+
+        drop(first_lock);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("releasing the first lock wakes the second handle");
+        waiter.join().unwrap();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// **Repo lifecycle on disk: create = init_bare; the bare repo is a real on-disk git dir.**

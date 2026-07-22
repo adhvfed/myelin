@@ -115,6 +115,9 @@ hex.workspace = true
 # (self-contained / EU-deployable). Part of the default build (an in-process library like tantivy);
 # does NOT touch a DB/object-store/cache/bus contract, so the build stays DB-free.
 git2.workspace = true
+# Cross-process per-ref linearisation locks for durable receive-pack. Already pinned in Cargo.lock;
+# its safe API preserves this crate's `forbid(unsafe_code)` boundary.
+fs4 = "0.13"
 
 # The content-addressed object backing — the `BlobStore` trait + the local-disk git PACK TIER
 # (`GitPackTier<B: BlobStore>` + `RepoGitPlacement`, contract 11.2 / storage §3.5, shipped by P-252).

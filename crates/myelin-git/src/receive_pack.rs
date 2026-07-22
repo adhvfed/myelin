@@ -1121,6 +1121,19 @@ impl RefStore {
             .iter()
             .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()))
             .collect();
+        // Production opens a fresh RefStore per request, and separate processes share no Rust mutex.
+        // Hold one OS-backed lock file per durable `(repo, ref)` across the same full window. Sorted
+        // `targets` preserve the deadlock-free multi-ref order; dropping these files releases locks.
+        let _durable_guards: Vec<std::fs::File> = match &self.backing {
+            RefBacking::Disk { repo } => targets
+                .iter()
+                .map(|target| repo.lock_ref_exclusive(&target.0))
+                .collect::<Result<_, _>>()
+                .map_err(|error| {
+                    OutboxError(format!("acquire durable ref linearisation lock: {error}"))
+                })?,
+            RefBacking::Memory { .. } => Vec::new(),
+        };
 
         // First pass: CAS-staleness check over EVERY ref (the per-ref linearisation assertion). A
         // single stale ref aborts the WHOLE atomic push (no partial write). Reading the backing under
@@ -1223,6 +1236,7 @@ impl RefStore {
         // The per-ref guards drop HERE — the linearisation window (check → commit → apply) closes,
         // releasing each ref for the next push in the burst.
         drop(_guards);
+        drop(_durable_guards);
 
         // The crash-after-commit point: the transaction committed (the event rows are durable +
         // unsent; the ref moved). A crash HERE loses nothing — the relay publishes the durable rows
@@ -2617,6 +2631,91 @@ mod tests {
         );
         assert!(result.is_err(), "a missing durable repo is not an absent ref");
         assert_eq!(outbox.committed_count(), 0, "no event commits on an invented empty tip");
+    }
+
+    #[test]
+    fn independent_durable_refstores_linearize_one_ref_and_commit_one_witness() {
+        let root = std::env::temp_dir().join(format!(
+            "myelin-ref-cross-store-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let loc = crate::core::RepoLoc::new("acme", "fr-par", "core");
+        let durable = Arc::new(
+            crate::durable::DurableGitStore::rooted(&root)
+                .create_repo(&loc)
+                .expect("create durable repo"),
+        );
+        let make_commit = |content: &[u8]| {
+            let blob = durable.write_blob(content).unwrap();
+            let tree = durable.write_tree(&[("file.txt", &blob)]).unwrap();
+            durable
+                .write_commit(
+                    &tree,
+                    &[],
+                    "create",
+                    "anon-7@acme.noreply",
+                    "anon-7@acme.noreply",
+                )
+                .unwrap()
+        };
+        let heads = [make_commit(b"first\n"), make_commit(b"second\n")];
+        let outbox = OutboxStore::new();
+        let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+        let stores = [
+            RefStore::open_durable(
+                Arc::clone(&durable), "core", ctx_base(), outbox.clone(), Arc::clone(&minter),
+            ),
+            RefStore::open_durable(
+                Arc::clone(&durable), "core", ctx_base(), outbox.clone(), minter,
+            ),
+        ];
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = stores
+            .into_iter()
+            .zip(heads)
+            .map(|(store, head)| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .receive(
+                            &human_push("refs/heads/topic", Oid::zero(), Oid::new(head.0)),
+                            &InMemoryObjectDb::new(),
+                            CrashPoint::None,
+                        )
+                        .unwrap()
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, PushOutcome::Accepted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    PushOutcome::Rejected(RejectReason::NonFastForward { .. })
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(outbox.committed_count(), 1, "only the winning witness commits");
+        assert_eq!(durable.ref_generation("refs/heads/topic"), Ok(1));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// **`is_protected` distinguishes protected from feature refs** (kills the `-> true` mutant):
