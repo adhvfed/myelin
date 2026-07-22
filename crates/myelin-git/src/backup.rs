@@ -145,12 +145,7 @@ impl GitRepoBackup {
     pub fn create(repo: &DurableGitRepo) -> Result<GitRepoBackup, GitBackupError> {
         // (1) Ref-snapshot point FIRST. Objects are immutable/append-only, so the closure reachable
         // from these exact tips is frozen — the backed-up refs will only point at backed-up objects.
-        let refs = repo.list_refs()?;
-        if refs.len() > MAX_BACKUP_REFS {
-            return Err(GitBackupError::BadArtifact(format!(
-                "ref snapshot exceeds the {MAX_BACKUP_REFS} ref artifact limit"
-            )));
-        }
+        let refs = repo.list_refs_bounded(MAX_BACKUP_REFS)?;
 
         // (2) Pack the full closure with libgit2. Open the same on-disk bare repo GT-001 manages.
         let git = git2::Repository::open(repo.path())
@@ -637,7 +632,7 @@ mod tests {
         let restored = restore_repo(&dst_store, &loc(), &reloaded).unwrap();
 
         // Every ref reads back identical.
-        assert_eq!(restored.list_refs().unwrap(), want);
+        assert_eq!(restored.list_refs_bounded(MAX_BACKUP_REFS).unwrap(), want);
         // Every source object exists + reads back byte-identical in the restored odb.
         for (_, tip) in &want {
             let src_bytes = src_repo.read_object(tip).unwrap();
