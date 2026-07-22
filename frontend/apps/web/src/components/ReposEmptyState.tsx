@@ -111,9 +111,12 @@ export function ReposEmptyState(props: { tenant: string }) {
       const onRepo = () => refresh();
       es.addEventListener("repo.created", onRepo);
       es.addEventListener("repo.pushed", onRepo);
-      // A transport hiccup (or the dev-edge that never emits) must not spam reconnects — close and
-      // lean on the manual Refresh fallback.
-      es.onerror = () => es?.close();
+      // A transport failure can mean the bounded edge stream shed us after an event gap. Refresh the
+      // authoritative snapshot once, then close rather than silently staying stale or reconnect-looping.
+      es.onerror = () => {
+        refresh();
+        es?.close();
+      };
       onCleanup(() => es?.close());
     } catch {
       /* EventSource unsupported — manual Refresh remains. */
