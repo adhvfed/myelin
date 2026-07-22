@@ -105,6 +105,11 @@ The reward and the real test. Master-plan Tier 1/3 completion:
 
 Exit gate: 4 consecutive weeks where the founder never needed GitHub for daily work.
 
+> **Amendment 2026-07-22:** everything below this line is re-scoped by
+> [03-personal-production-plan.md](03-personal-production-plan.md) (the P-track). R5.1–R5.3/R5.5 execute
+> inside P0 sized for one tenant; R6.2/R6.6 are promoted into Tier P; the remaining R5/R6 items are
+> deferred behind the Tier B go decision (doc 03 §6). R0–R4 above are unchanged and remain in flight.
+
 ## R5 — Production operations (Tier B enabler) (≈3–4 weeks solo)
 
 What "hosted" means before anyone else's data arrives:
