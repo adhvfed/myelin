@@ -4013,6 +4013,7 @@ fn pr_diff_vm(number: u64, base_ref: &str, diff: PrDiff, offset: usize, limit: u
         .map(|f| PrDiffFile {
             path: f.path,
             old_path: f.old_path,
+            new_blob_oid: f.new_blob_oid,
             status: f.status,
             kind: f.kind.as_str().to_string(),
             additions: f.additions,
@@ -9739,7 +9740,7 @@ mod pr_thread_tests {
     /// distinguishable Forbidden, never a leaked path). `restricted_files` is count-only (0 here).
     #[test]
     fn pr_diff_is_pull_guarded_zero_leak_and_three_dot() {
-        let (be, reader, _head) = setup_diff("diffauthz");
+        let (be, reader, head) = setup_diff("diffauthz");
         let guard = guarded(
             &be,
             RepoPermission::Pull,
@@ -9763,6 +9764,14 @@ mod pr_thread_tests {
         assert_eq!(v["files"][0]["path"], "file.txt");
         assert_eq!(v["files"][0]["status"], "M");
         assert_eq!(v["files"][0]["kind"], "text");
+        let new_blob_oid = v["files"][0]["new_blob_oid"]
+            .as_str()
+            .expect("visible text files carry their immutable new-side blob oid");
+        assert_eq!(new_blob_oid.len(), 40);
+        assert_ne!(
+            new_blob_oid, head,
+            "the blob oid must never be the PR head commit oid"
+        );
         // Line numbers cross the wire additively.
         let lines = v["files"][0]["hunks"][0]["lines"].as_array().unwrap();
         assert!(lines

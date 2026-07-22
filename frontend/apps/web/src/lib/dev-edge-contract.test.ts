@@ -7,6 +7,7 @@ import {
   prCommitCursorExpiredEnvelope,
   prCommitsEnvelope,
   parseTreeQuery,
+  fileLinesJson,
   refsJson,
   repoHomeJson,
   repoSummaryEnvelope,
@@ -14,6 +15,9 @@ import {
   treeJson,
   validPrOperationId,
 } from "../../dev-edge/dev-contract.mjs";
+
+const LIST_FILTER_BLOB = "c3d4e5f60718293a4b5c6d7e8f90011223344556";
+const HEAD_COMMIT = "b2c3d4e5f60718293a4b5c6d7e8f900112233445";
 
 // FRONTEND-CONTRACT: git-read-dev-edge-parity
 // Both this consumer and the Rust provider integration load this exact committed artifact.
@@ -97,6 +101,19 @@ describe("the dev Edge PR commit pagination contract", () => {
     expect(prCommitCursorExpiredEnvelope()).toEqual({
       error: { message: "pull request commit cursor expired", code: "conflict" },
     });
+  });
+});
+
+describe("the dev Edge expand-context object contract", () => {
+  it("serves only the projected blob object, never an arbitrary or head commit oid", () => {
+    expect(fileLinesJson("myelin", LIST_FILTER_BLOB, 5, 6)).toEqual({
+      lines: [
+        { origin: " ", content: "    // context line 5", old_no: null, new_no: 5 },
+        { origin: " ", content: "    // context line 6", old_no: null, new_no: 6 },
+      ],
+    });
+    expect(fileLinesJson("myelin", HEAD_COMMIT, 5, 6)).toBeNull();
+    expect(fileLinesJson("other", LIST_FILTER_BLOB, 5, 6)).toBeNull();
   });
 });
 

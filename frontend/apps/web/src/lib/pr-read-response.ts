@@ -204,18 +204,23 @@ function diffHunk(value: unknown): DiffHunkVM | null {
 function diffFile(value: unknown): PrDiffFileVM | null {
   const input = record(value);
   if (!input || !safePath(input.path) || !(input.old_path === null || safePath(input.old_path)) ||
+      !(input.new_blob_oid === null || oid(input.new_blob_oid)) ||
       typeof input.status !== "string" || !/^[AMDRC]$/.test(input.status) ||
       !["text", "binary", "lfs", "submodule"].includes(input.kind as string) ||
       !uint(input.additions) || !uint(input.deletions) ||
       !(input.size_bytes === null || uint(input.size_bytes)) || !Array.isArray(input.hunks) ||
       input.hunks.length > 4_000 || typeof input.deleted_body_available !== "boolean" ||
       typeof input.truncated !== "boolean") return null;
+  if ((input.status === "D" || input.kind === "submodule") !== (input.new_blob_oid === null)) {
+    return null;
+  }
   const hunks = input.hunks.map(diffHunk);
   if (!hunks.every((hunk): hunk is DiffHunkVM => hunk !== null) ||
       hunks.reduce((total, hunk) => total + hunk.lines.length, 0) > 4_000) return null;
   return {
     path: input.path,
     old_path: input.old_path,
+    new_blob_oid: input.new_blob_oid,
     status: input.status,
     kind: input.kind as PrDiffFileVM["kind"],
     additions: input.additions,

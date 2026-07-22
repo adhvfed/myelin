@@ -23,7 +23,7 @@ import {
   parsePrChecks,
   parsePrThreads,
 } from "./mutation-response";
-import { parseFileLinesInput, parseFileLinesResponse } from "./file-lines";
+import { parseFileLinesInput, parseFileLinesResponse, type FileLine } from "./file-lines";
 import { parseBlob, parseRefs, parseRepoHome, parseTree } from "./repo-read-response";
 import { parseRepoListPage } from "./repo-list-response";
 import { parseCommitDiff, parseCommitsPage, parsePrCommitsPage } from "./commit-read-response";
@@ -226,6 +226,8 @@ export interface DiffHunkVM {
 export interface PrDiffFileVM {
   path: string;
   old_path: string | null;
+  /** Immutable new-side blob used by the bounded expand-context endpoint. */
+  new_blob_oid: string | null;
   status: string;
   kind: "text" | "binary" | "lfs" | "submodule";
   additions: number;
@@ -848,7 +850,7 @@ export const getFileLines = query(
     path: string;
     start: number;
     end: number;
-  }): Promise<{ lines: DiffLineVM[] }> => {
+  }): Promise<{ lines: FileLine[] }> => {
     "use server";
     const parsed = parseFileLinesInput(input);
     if (!parsed) throw new RepoRouteError("error");

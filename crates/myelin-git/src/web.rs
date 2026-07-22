@@ -1681,6 +1681,9 @@ impl PrDiffHunk {
 pub struct PrDiffFile {
     pub path: String,
     pub old_path: Option<String>,
+    /// New-side blob content address for bounded expand-context reads. Absent for deletions and
+    /// submodules; never substitute the enclosing commit oid.
+    pub new_blob_oid: Option<String>,
     pub status: char,
     /// `text` / `binary` / `lfs` / `submodule` — drives the R-21 binary/LFS row (never a garbled dump).
     pub kind: String,
@@ -1697,6 +1700,7 @@ impl PrDiffFile {
         json!({
             "path": self.path,
             "old_path": self.old_path,
+            "new_blob_oid": self.new_blob_oid,
             "status": self.status.to_string(),
             "kind": self.kind,
             "additions": self.additions,

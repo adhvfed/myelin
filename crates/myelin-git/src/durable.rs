@@ -391,6 +391,9 @@ pub struct DiffHunkDelta {
 pub struct PrFileDelta {
     pub path: String,
     pub old_path: Option<String>,
+    /// New-side blob content address. `None` for deletions and submodules (whose new object is a
+    /// commit, not a blob). Expand-context consumers must use this exact immutable object.
+    pub new_blob_oid: Option<String>,
     /// `A`/`M`/`D`/`R`/`C`.
     pub status: char,
     pub kind: FileKind,
@@ -1964,11 +1967,18 @@ impl DurableGitRepo {
             } else {
                 FileKind::Text
             };
+            let new_oid = delta.new_file().id();
+            let new_blob_oid = if status != 'D' && kind != FileKind::Submodule && !new_oid.is_zero() {
+                Some(new_oid.to_string())
+            } else {
+                None
+            };
             let size_bytes = delta.new_file().size();
             let size_bytes = if size_bytes > 0 { Some(size_bytes) } else { None };
             files.borrow_mut().push(PrFileDelta {
                 path,
                 old_path,
+                new_blob_oid,
                 status,
                 kind,
                 additions: 0,
@@ -3272,6 +3282,20 @@ mod tests {
         assert_eq!(diff.files[0].path, "file.txt");
         assert_eq!(diff.files[0].status, 'M');
         assert_eq!(diff.files[0].kind, FileKind::Text);
+        assert_eq!(diff.files[0].new_blob_oid.as_deref(), Some(bh.0.as_str()));
+        let FileLinesLookup::Found(expanded) = repo
+            .file_lines(diff.files[0].new_blob_oid.as_deref().unwrap(), 2, 3)
+            .unwrap()
+        else {
+            panic!("the projected new-side blob oid must feed the bounded context reader")
+        };
+        assert_eq!(
+            expanded
+                .iter()
+                .map(|line| line.content.as_str())
+                .collect::<Vec<_>>(),
+            ["B", "c"]
+        );
         assert_eq!(diff.files[0].additions, 2, "line 2 changed (+B) + line 4 added (+d)");
         assert_eq!(diff.files[0].deletions, 1, "line 2's old (-b)");
         // Line numbers: the added "d" carries new_no == 4 and old_no == None.
@@ -3379,8 +3403,33 @@ mod tests {
         let diff = repo.pr_diff("refs/heads/main", &head.0, 4000).unwrap().unwrap();
         let f = diff.files.iter().find(|f| f.path == "logo.png").unwrap();
         assert_eq!(f.kind, FileKind::Binary);
+        assert_eq!(f.new_blob_oid.as_deref(), Some(bin.0.as_str()));
         assert!(f.hunks.is_empty(), "a binary file carries NO text hunks");
         assert!(f.size_bytes.is_some(), "the size is available for the binary row");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pr_diff_omits_new_blob_oid_for_a_deletion() {
+        let root = temp_root("prdeletedoid");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let base = seed_commit(&repo, b"removed\n");
+        repo.update_ref_cas("refs/heads/main", None, Some(&base), "c", "psn@acme.noreply")
+            .unwrap();
+        let empty = repo.write_tree(&[]).unwrap();
+        let head = repo
+            .write_commit(
+                &empty,
+                &[&base],
+                "delete file",
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
+            .unwrap();
+        let diff = repo.pr_diff("refs/heads/main", &head.0, 4000).unwrap().unwrap();
+        assert_eq!(diff.files[0].status, 'D');
+        assert_eq!(diff.files[0].new_blob_oid, None);
         std::fs::remove_dir_all(&root).ok();
     }
 
