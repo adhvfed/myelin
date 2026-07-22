@@ -55,11 +55,14 @@ NATS_URL=tls://nats.internal:4222
 ```
 
 To enable human browser login, configure the verifier as an all-or-nothing group. The audience must
-match the web OIDC client ID, and exactly one JWKS source may be set:
+match the web OIDC client ID. Production requires the provider's credential-free HTTPS `jwks_uri`;
+an inline or file JWKS is optional bootstrap material (set at most one) that lets the edge start when
+the provider is temporarily unavailable:
 
 ```dotenv
 MYELIN_OIDC_ISSUER=https://identity.example
 MYELIN_OIDC_AUDIENCE=myelin-web
+MYELIN_OIDC_JWKS_URI=https://identity.example/.well-known/jwks.json
 MYELIN_OIDC_JWKS_FILE=/run/secrets/identity-jwks.json
 ```
 
@@ -68,6 +71,13 @@ nonce before minting an eight-hour-maximum human capability. The capability neve
 token and the principal directory is re-read on every request, so suspension takes effect without
 waiting for browser-session expiry. Configure the authorization and token endpoints only on the web
 server; they are not exposed by the edge public-auth response.
+
+The edge caches the last good JWKS, checks for a periodic refresh after 15 minutes of use, and also
+refreshes for an unknown key ID or failed signature. Refresh attempts are serialized and limited to
+one per 30 seconds. A refresh outage keeps already-cached keys usable; an unknown key still fails
+closed. Fetches verify native TLS roots, follow no redirects, accept only JSON/JWK Set responses, and
+have a five-second total deadline and 1 MiB body limit. If no bootstrap JWKS is configured, the first
+fetch must succeed before the edge binds its listener.
 
 Terminate with `SIGTERM`. The listener stops accepting sockets, gracefully drains active HTTP
 connections for 20 seconds, forcibly closes any remaining streams, drains the Issues reconciler, and

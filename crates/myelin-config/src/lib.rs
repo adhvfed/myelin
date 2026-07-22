@@ -113,34 +113,34 @@ pub struct MyelinConfig {
     /// **R2.5 — the OPTIONAL real-OIDC login surface.** `None` means no IdP is configured and the
     /// edge keeps the refuse-not-mock human-login default (a boot with no OIDC configured still
     /// succeeds — OIDC is opt-in, we do NOT force every prod deploy to configure an IdP before this
-    /// lands). `Some` carries the issuer/audience the token is validated against and the STATIC JWKS
-    /// JSON its signatures are checked with (no `jwks_uri` HTTP fetch/discovery — that is a tracked
-    /// follow-up; see [`OidcSettings`]). A PARTIALLY-set OIDC surface is a loud [`ConfigError`]
+    /// lands). `Some` carries the issuer/audience the token is validated against and an optional
+    /// bootstrap JWKS JSON. Production also requires the provider's HTTPS
+    /// `jwks_uri` so signing-key rotation does not require an edge restart. A PARTIALLY-set OIDC
+    /// surface is a loud [`ConfigError`]
     /// (misconfiguration is never coerced into a silent half-config).
     pub oidc: Option<OidcSettings>,
 }
 
 /// **The env-driven OIDC login surface (R2.5).** The issuer + audience an OIDC ID token is validated
-/// against and the STATIC JWKS JSON document (RFC 7517) its signature is verified with. This is the
-/// CONFIG shape only — the edge converts it into the identity-service `OidcConfig` + `JwkSet` (via
-/// `JwkSet::from_jwks_json`) and wires the real `OidcVerifier`. There is intentionally NO `jwks_uri`
-/// HTTP fetch / OIDC discovery here (out of scope, MR-010a docs): the JWKS is injected as a literal
-/// document (an env var carrying the JSON, or a file path). A runtime `jwks_uri` fetch + key rotation
-/// is the tracked follow-up.
+/// against, an optional bootstrap JWKS JSON document (RFC 7517), and the provider's refresh URI.
+/// The config crate remains network-free; the edge fetches and validates refreshed key sets.
 ///
 /// R0.7-C consistency: `Debug` is hand-written. The issuer/audience are NOT secrets (they identify
-/// the IdP + this RP), and a JWKS carries only PUBLIC keys — but the JWKS document can be large, so
-/// its `Debug` prints a byte-length summary rather than dumping the whole document, matching the
-/// crate's terse-Debug convention.
+/// the IdP + this RP), and a JWKS carries only PUBLIC keys — but the document can be large, so its
+/// `Debug` prints a byte-length summary. The URI is shown only as configured/unconfigured because a
+/// malformed value could contain user-info credentials before the edge validates it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct OidcSettings {
     /// The exact `iss` an OIDC ID token must carry (the configured IdP issuer).
     pub issuer: String,
     /// The audience this relying-party IS — the token's `aud` must contain it.
     pub audience: String,
-    /// The STATIC JWKS JSON document (RFC 7517) — the IdP's published public keys, injected as a
-    /// literal (never fetched over the network here). Parsed by `JwkSet::from_jwks_json` at the edge.
-    pub jwks_json: String,
+    /// Optional bootstrap JWKS. Keeping this alongside the URI lets a restart use a known-good set
+    /// when the IdP is temporarily unavailable.
+    pub jwks_json: Option<String>,
+    /// HTTPS URL of the provider's JWK Set document. Required in production; optional for hermetic
+    /// development configurations that inject only a static set.
+    pub jwks_uri: Option<String>,
 }
 
 impl core::fmt::Debug for OidcSettings {
@@ -150,8 +150,12 @@ impl core::fmt::Debug for OidcSettings {
             .field("audience", &self.audience)
             .field(
                 "jwks_json",
-                &format_args!("<{} bytes>", self.jwks_json.len()),
+                &self
+                    .jwks_json
+                    .as_ref()
+                    .map(|json| format!("<{} bytes>", json.len())),
             )
+            .field("jwks_uri", &self.jwks_uri.as_ref().map(|_| "<configured>"))
             .finish()
     }
 }
@@ -305,22 +309,25 @@ fn req(mode: Mode, var: &'static str, dev_default: &str) -> Result<String, Confi
 /// - **absent** (none of the OIDC vars set) → `Ok(None)` — the edge keeps refuse-not-mock human
 ///   login and boot succeeds (we do NOT force every prod deploy to configure an IdP before this
 ///   lands);
-/// - **fully set** (`MYELIN_OIDC_ISSUER`, `MYELIN_OIDC_AUDIENCE`, and exactly ONE of
-///   `MYELIN_OIDC_JWKS` = inline JSON / `MYELIN_OIDC_JWKS_FILE` = a path) → `Ok(Some(..))`;
+/// - **fully set** (`MYELIN_OIDC_ISSUER`, `MYELIN_OIDC_AUDIENCE`, production
+///   `MYELIN_OIDC_JWKS_URI`, and optionally exactly one bootstrap source) → `Ok(Some(..))`;
 /// - **partially set** (any OIDC var present but the set is incomplete, or BOTH JWKS sources set) →
 ///   a loud [`ConfigError`] — a half-configured IdP is a misconfiguration, never silently ignored.
 ///
-/// The JWKS is a STATIC document: no `jwks_uri` HTTP fetch / discovery here (out of scope — the
-/// tracked follow-up). The `MYELIN_OIDC_JWKS_FILE` path is read at boot; an unreadable file is a
-/// loud [`ConfigError::Invalid`].
 fn oidc_from_env(mode: Mode) -> Result<Option<OidcSettings>, ConfigError> {
     let issuer = read(mode, "MYELIN_OIDC_ISSUER");
     let audience = read(mode, "MYELIN_OIDC_AUDIENCE");
     let jwks_inline = read(mode, "MYELIN_OIDC_JWKS");
     let jwks_file = read(mode, "MYELIN_OIDC_JWKS_FILE");
+    let jwks_uri = read(mode, "MYELIN_OIDC_JWKS_URI");
 
     // OIDC is fully absent → not configured.
-    if issuer.is_none() && audience.is_none() && jwks_inline.is_none() && jwks_file.is_none() {
+    if issuer.is_none()
+        && audience.is_none()
+        && jwks_inline.is_none()
+        && jwks_file.is_none()
+        && jwks_uri.is_none()
+    {
         return Ok(None);
     }
 
@@ -336,18 +343,29 @@ fn oidc_from_env(mode: Mode) -> Result<Option<OidcSettings>, ConfigError> {
                     .into(),
             })
         }
-        (Some(json), None) => json,
-        (None, Some(path)) => std::fs::read_to_string(&path).map_err(|e| ConfigError::Invalid {
-            var: "MYELIN_OIDC_JWKS_FILE",
-            reason: format!("cannot read JWKS file `{path}`: {e}"),
-        })?,
-        (None, None) => return Err(ConfigError::Missing("MYELIN_OIDC_JWKS")),
+        (Some(json), None) => Some(json),
+        (None, Some(path)) => {
+            Some(
+                std::fs::read_to_string(&path).map_err(|e| ConfigError::Invalid {
+                    var: "MYELIN_OIDC_JWKS_FILE",
+                    reason: format!("cannot read JWKS file `{path}`: {e}"),
+                })?,
+            )
+        }
+        (None, None) => None,
     };
+    if mode == Mode::RequireEnv && jwks_uri.is_none() {
+        return Err(ConfigError::Missing("MYELIN_OIDC_JWKS_URI"));
+    }
+    if jwks_json.is_none() && jwks_uri.is_none() {
+        return Err(ConfigError::Missing("MYELIN_OIDC_JWKS"));
+    }
 
     Ok(Some(OidcSettings {
         issuer,
         audience,
         jwks_json,
+        jwks_uri,
     }))
 }
 
@@ -377,6 +395,7 @@ mod tests {
             "MYELIN_OIDC_AUDIENCE",
             "MYELIN_OIDC_JWKS",
             "MYELIN_OIDC_JWKS_FILE",
+            "MYELIN_OIDC_JWKS_URI",
         ] {
             env::remove_var(v);
         }
@@ -598,7 +617,8 @@ mod tests {
         let oidc = cfg.oidc.expect("oidc must be Some");
         assert_eq!(oidc.issuer, "https://idp.example.com");
         assert_eq!(oidc.audience, "myelin-rp");
-        assert_eq!(oidc.jwks_json, jwks);
+        assert_eq!(oidc.jwks_json.as_deref(), Some(jwks));
+        assert_eq!(oidc.jwks_uri, None);
         // The JWKS document (public keys) is not dumped in Debug — a byte summary instead.
         let dbg = format!("{oidc:?}");
         assert!(
@@ -610,6 +630,49 @@ mod tests {
             "jwks_json body should not be dumped: {dbg}"
         );
         clear();
+    }
+
+    /// Production OIDC requires a refresh URI even when a bootstrap JWKS is supplied. A URI-only
+    /// configuration is valid and lets the edge fetch its initial key set at boot.
+    #[test]
+    fn production_oidc_requires_refresh_uri() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear();
+        env::set_var("MYELIN_OIDC_ISSUER", "https://idp.example.com");
+        env::set_var("MYELIN_OIDC_AUDIENCE", "myelin-rp");
+        env::set_var("MYELIN_OIDC_JWKS", r#"{"keys":[]}"#);
+        assert_eq!(
+            oidc_from_env(Mode::RequireEnv).unwrap_err(),
+            ConfigError::Missing("MYELIN_OIDC_JWKS_URI")
+        );
+
+        env::remove_var("MYELIN_OIDC_JWKS");
+        env::set_var(
+            "MYELIN_OIDC_JWKS_URI",
+            "https://idp.example.com/.well-known/jwks.json",
+        );
+        let oidc = oidc_from_env(Mode::RequireEnv)
+            .unwrap()
+            .expect("OIDC should be configured");
+        assert_eq!(oidc.jwks_json, None);
+        assert_eq!(
+            oidc.jwks_uri.as_deref(),
+            Some("https://idp.example.com/.well-known/jwks.json")
+        );
+        clear();
+    }
+
+    #[test]
+    fn oidc_debug_redacts_uri_user_info() {
+        let oidc = OidcSettings {
+            issuer: "https://idp.example.com".into(),
+            audience: "myelin-rp".into(),
+            jwks_json: None,
+            jwks_uri: Some("https://user:TOP_SECRET@idp.example.com/jwks".into()),
+        };
+        let dbg = format!("{oidc:?}");
+        assert!(!dbg.contains("TOP_SECRET"), "JWKS URI leaked: {dbg}");
+        assert!(dbg.contains("<configured>"));
     }
 
     /// R2.5: a PARTIAL OIDC surface (issuer set, JWKS + audience missing) fails LOUD — a

@@ -24,17 +24,24 @@
 //! principal. That is ACCEPTED operator-plane infrastructure; there is deliberately NO HTTP endpoint
 //! that mints. The migration credential is destroyed before any serving store or listener exists.
 
+use bytes::Bytes;
+use http_body_util::{BodyExt, Empty, Limited};
+use hyper::{Request, Uri};
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use myelin_config::Mode;
 use myelin_edge::{
     bootstrap_principal_and_mint, recover_placed_git_at_boot, register_git_durable,
     register_git_wire, register_issues, serve_edge_until_shutdown_with_probe,
-    spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy,
-    BootstrapParams, CheckBackedRepoAuthorizer, DurableGitBackend,
+    spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig,
+    AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer, DurableGitBackend,
     Gateway, IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, ShutdownOutcome,
     StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
 };
 use myelin_events::{OutboxStore, Timestamp};
-use myelin_identity::{FragmentAdmit, Principal, PrincipalId, PrincipalKind, RevokeTarget};
+use myelin_identity::{
+    AuthzError, FragmentAdmit, Principal, PrincipalId, PrincipalKind, RevokeTarget,
+};
 use myelin_identity_service::{
     CapabilityAuthenticator, CellTokenAuthority, DpopReplayGuard, HumanSsoAuthenticator, JwkSet,
     OidcConfig, PasetoCapabilityVerifier, PrincipalStore, ReplayGuard, RevocationStore,
@@ -68,6 +75,8 @@ const EDGE_DEFAULT_TOKEN_SCHEME: &str = "agent";
 const EDGE_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 const EDGE_READINESS_DEADLINE: Duration = Duration::from_secs(2);
 const EDGE_READINESS_CACHE_TTL: Duration = Duration::from_secs(1);
+const OIDC_JWKS_DEADLINE: Duration = Duration::from_secs(5);
+const OIDC_JWKS_MAX_BYTES: usize = 1024 * 1024;
 static READINESS_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct EdgeReadiness {
@@ -101,6 +110,118 @@ fn public_auth_config(
     }
 }
 
+/// Validate the operator-configured RFC 8414 `jwks_uri` before any request is sent. Production key
+/// material is fetched only over certificate-verified HTTPS, and URI user-info is rejected so a
+/// malformed value cannot turn credentials into transport metadata or logs.
+fn validated_oidc_jwks_uri(raw: &str) -> Result<Uri, String> {
+    if raw.contains('#') {
+        return Err("MYELIN_OIDC_JWKS_URI must not contain a fragment".into());
+    }
+    let uri: Uri = raw
+        .parse()
+        .map_err(|_| "MYELIN_OIDC_JWKS_URI is not a valid absolute URI".to_string())?;
+    if uri.scheme_str() != Some("https") {
+        return Err("MYELIN_OIDC_JWKS_URI must use https".into());
+    }
+    let authority = uri
+        .authority()
+        .ok_or_else(|| "MYELIN_OIDC_JWKS_URI must include a host".to_string())?;
+    if authority.as_str().contains('@') {
+        return Err("MYELIN_OIDC_JWKS_URI must not contain credentials".into());
+    }
+    Ok(uri)
+}
+
+fn parse_oidc_jwks_response(
+    status: hyper::StatusCode,
+    content_type: Option<&str>,
+    bytes: &[u8],
+) -> Result<JwkSet, String> {
+    if status != hyper::StatusCode::OK {
+        return Err(format!("OIDC JWKS endpoint returned HTTP {status}"));
+    }
+    let media_type = content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !media_type.is_some_and(|value| {
+        value.eq_ignore_ascii_case("application/jwk-set+json")
+            || value.eq_ignore_ascii_case("application/json")
+    }) {
+        return Err("OIDC JWKS endpoint returned an unsupported content type".into());
+    }
+    let document = std::str::from_utf8(bytes)
+        .map_err(|_| "OIDC JWKS endpoint returned non-UTF-8 content".to_string())?;
+    let keys = JwkSet::from_jwks_json(document)
+        .map_err(|_| "OIDC JWKS endpoint returned a malformed key set".to_string())?;
+    if keys.is_empty() {
+        return Err("OIDC JWKS endpoint returned no supported signing keys".into());
+    }
+    Ok(keys)
+}
+
+/// Fetch one JWKS without redirects, credentials, an unbounded body, or a hanging connection. The
+/// returned errors deliberately exclude the URI and response body.
+async fn fetch_oidc_jwks(uri: Uri) -> Result<JwkSet, String> {
+    let connector = HttpsConnectorBuilder::new()
+        .with_provider_and_native_roots(rustls::crypto::aws_lc_rs::default_provider())
+        .map_err(|_| "could not load native TLS trust roots for OIDC JWKS".to_string())?
+        .https_only()
+        .enable_http1()
+        .build();
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build(connector);
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("accept", "application/jwk-set+json, application/json;q=0.9")
+        .body(Empty::new())
+        .map_err(|_| "could not build OIDC JWKS request".to_string())?;
+
+    tokio::time::timeout(OIDC_JWKS_DEADLINE, async {
+        let response = client
+            .request(request)
+            .await
+            .map_err(|_| "OIDC JWKS HTTPS request failed".to_string())?;
+        if response
+            .headers()
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|length| length > OIDC_JWKS_MAX_BYTES)
+        {
+            return Err("OIDC JWKS response exceeded the 1 MiB limit".into());
+        }
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let bytes = Limited::new(response.into_body(), OIDC_JWKS_MAX_BYTES)
+            .collect()
+            .await
+            .map_err(|_| {
+                "OIDC JWKS response exceeded the 1 MiB limit or could not be read".to_string()
+            })?
+            .to_bytes();
+        parse_oidc_jwks_response(status, content_type.as_deref(), &bytes)
+    })
+    .await
+    .map_err(|_| "OIDC JWKS request exceeded the 5-second deadline".to_string())?
+}
+
+fn oidc_jwks_refresh(
+    handle: tokio::runtime::Handle,
+    uri: Uri,
+) -> impl Fn() -> Result<JwkSet, AuthzError> + Send + Sync + 'static {
+    move || {
+        tokio::task::block_in_place(|| handle.block_on(fetch_oidc_jwks(uri.clone()))).map_err(
+            |_| {
+                AuthzError::FailClosed("OIDC signing-key refresh is temporarily unavailable".into())
+            },
+        )
+    }
+}
+
 impl ReadinessProbe for EdgeReadiness {
     fn check(&self) -> ReadinessCheck<'_> {
         Box::pin(async move {
@@ -113,10 +234,8 @@ impl ReadinessProbe for EdgeReadiness {
             }
             let provider = self.provider.clone();
             let git_root = self.git_root.clone();
-            let database = tokio::time::timeout(
-                EDGE_READINESS_DEADLINE,
-                provider.database_is_ready(),
-            );
+            let database =
+                tokio::time::timeout(EDGE_READINESS_DEADLINE, provider.database_is_ready());
             let filesystem = tokio::time::timeout(
                 EDGE_READINESS_DEADLINE,
                 tokio::task::spawn_blocking(move || git_root_is_writable(&git_root)),
@@ -336,7 +455,9 @@ fn validated_runsc(value: Result<String, VarError>) -> Result<PathBuf, String> {
         RunscProbeError::CouldNotExecute => {
             "MYELIN_RUNSC_BIN could not execute its version probe".to_string()
         }
-        RunscProbeError::NotRunsc => "MYELIN_RUNSC_BIN did not identify itself as runsc".to_string(),
+        RunscProbeError::NotRunsc => {
+            "MYELIN_RUNSC_BIN did not identify itself as runsc".to_string()
+        }
     })?;
     Ok(path)
 }
@@ -540,7 +661,9 @@ async fn main() {
             serve(
                 compose_core(runtime.cell_id).await,
                 runtime.git_root.expect("serving config carries a Git root"),
-                runtime.git_wire.expect("serving config carries a Git wire runtime"),
+                runtime
+                    .git_wire
+                    .expect("serving config carries a Git wire runtime"),
                 runtime
                     .public_base_url
                     .expect("serving config carries a public base URL"),
@@ -650,26 +773,63 @@ async fn serve(
     );
     let human_login = Arc::new(match oidc_settings {
         Some(oidc) => {
-            let jwks = JwkSet::from_jwks_json(&oidc.jwks_json).unwrap_or_else(|e| {
-                eprintln!(
-                    "edge: OIDC is configured but the JWKS JSON \
-                     (MYELIN_OIDC_JWKS/MYELIN_OIDC_JWKS_FILE) is malformed: {e:?}"
-                );
-                std::process::exit(1);
-            });
+            let jwks_uri = oidc
+                .jwks_uri
+                .as_deref()
+                .map(validated_oidc_jwks_uri)
+                .transpose()
+                .unwrap_or_else(|error| {
+                    eprintln!("edge: invalid OIDC JWKS configuration: {error}");
+                    std::process::exit(1);
+                });
+            let jwks = match oidc.jwks_json.as_deref() {
+                Some(document) => {
+                    let keys = JwkSet::from_jwks_json(document).unwrap_or_else(|_| {
+                        eprintln!("edge: the configured OIDC bootstrap JWKS is malformed");
+                        std::process::exit(1);
+                    });
+                    if keys.is_empty() {
+                        eprintln!(
+                            "edge: the configured OIDC bootstrap JWKS has no supported signing keys"
+                        );
+                        std::process::exit(1);
+                    }
+                    keys
+                }
+                None => {
+                    let uri = jwks_uri.clone().unwrap_or_else(|| {
+                        eprintln!("edge: OIDC has neither a bootstrap JWKS nor a refresh URI");
+                        std::process::exit(1);
+                    });
+                    fetch_oidc_jwks(uri).await.unwrap_or_else(|error| {
+                        eprintln!("edge: could not fetch the initial OIDC JWKS: {error}");
+                        std::process::exit(1);
+                    })
+                }
+            };
             eprintln!(
-                "edge: OIDC login wired (issuer={}, {} JWKS key(s))",
-                oidc.issuer,
-                jwks.len()
+                "edge: OIDC login wired ({} JWKS key(s), rotation={})",
+                jwks.len(),
+                if jwks_uri.is_some() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
             );
-            HumanSsoAuthenticator::production_with_oidc(
-                human_store,
-                (OidcConfig::new(oidc.issuer, oidc.audience), jwks),
-                ReplayGuard::with_pg(
-                    DurableReplayBacking::new(provider.clone()),
-                    handle.clone(),
+            let config = OidcConfig::new(oidc.issuer, oidc.audience);
+            let replay =
+                ReplayGuard::with_pg(DurableReplayBacking::new(provider.clone()), handle.clone());
+            match jwks_uri {
+                Some(uri) => HumanSsoAuthenticator::production_with_oidc_refresh(
+                    human_store,
+                    (config, jwks),
+                    replay,
+                    oidc_jwks_refresh(handle.clone(), uri),
                 ),
-            )
+                None => {
+                    HumanSsoAuthenticator::production_with_oidc(human_store, (config, jwks), replay)
+                }
+            }
         }
         None => {
             eprintln!("edge: OIDC not configured — human login refuses (refuse-not-mock)");
@@ -1149,6 +1309,79 @@ mod runtime_config_tests {
     }
 
     #[test]
+    fn oidc_jwks_uri_requires_credential_free_https() {
+        let uri =
+            validated_oidc_jwks_uri("https://idp.example.com/.well-known/jwks.json?version=2")
+                .expect("provider HTTPS URI should be accepted");
+        assert_eq!(uri.scheme_str(), Some("https"));
+        assert_eq!(
+            uri.authority().map(|value| value.host()),
+            Some("idp.example.com")
+        );
+
+        for (raw, expected) in [
+            ("http://idp.example.com/jwks", "must use https"),
+            (
+                "https://operator:secret@idp.example.com/jwks",
+                "must not contain credentials",
+            ),
+            (
+                "https://idp.example.com/jwks#old",
+                "must not contain a fragment",
+            ),
+            ("/relative/jwks", "must use https"),
+        ] {
+            let error = validated_oidc_jwks_uri(raw).unwrap_err();
+            assert!(
+                error.contains(expected),
+                "unexpected error for {raw}: {error}"
+            );
+            assert!(!error.contains("secret"), "URI credentials leaked: {error}");
+        }
+    }
+
+    #[test]
+    fn oidc_jwks_response_is_strict_and_body_opaque() {
+        let document = br#"{"keys":[{"kty":"RSA","kid":"rsa-1","n":"AQAB","e":"AQAB"}]}"#;
+        let keys = parse_oidc_jwks_response(
+            hyper::StatusCode::OK,
+            Some("Application/JWK-Set+JSON; charset=utf-8"),
+            document,
+        )
+        .expect("valid RFC 7517 response should parse");
+        assert_eq!(keys.len(), 1);
+
+        for (status, content_type, body) in [
+            (
+                hyper::StatusCode::FOUND,
+                Some("application/jwk-set+json"),
+                document.as_slice(),
+            ),
+            (
+                hyper::StatusCode::OK,
+                Some("text/html"),
+                document.as_slice(),
+            ),
+            (
+                hyper::StatusCode::OK,
+                Some("application/json"),
+                b"TOP_SECRET malformed".as_slice(),
+            ),
+            (
+                hyper::StatusCode::OK,
+                Some("application/json"),
+                br#"{"keys":[]}"#.as_slice(),
+            ),
+        ] {
+            let error = parse_oidc_jwks_response(status, content_type, body).unwrap_err();
+            assert!(
+                !error.contains("TOP_SECRET"),
+                "response body leaked: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn serving_requires_an_explicit_usable_git_wire_sandbox() {
         let root = std::env::current_dir().unwrap().canonicalize().unwrap();
         let base = [
@@ -1248,6 +1481,8 @@ mod runtime_config_tests {
         let root = std::env::current_dir().unwrap();
         assert!(git_root_is_writable(&root));
         assert!(!git_root_is_writable(&root.join("Cargo.toml")));
-        assert!(!git_root_is_writable(&root.join("definitely-does-not-exist")));
+        assert!(!git_root_is_writable(
+            &root.join("definitely-does-not-exist")
+        ));
     }
 }

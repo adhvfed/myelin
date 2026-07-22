@@ -41,8 +41,9 @@ The five `MYELIN_OIDC_*` settings are optional as a group; setting any of the fo
 fields requires all four. Production endpoints must use HTTPS and contain no credentials, query, or
 fragment. Register exactly `${MYELIN_PUBLIC_ORIGIN}/auth/oidc/callback` at the provider and configure
 the provider for `client_secret_basic`. `MYELIN_OIDC_SCOPES` defaults to `openid profile email` and
-must include `openid`. The edge must independently have its matching issuer, audience, and JWKS
-verification settings; the login page advertises SSO only when both halves report ready.
+must include `openid`. The edge must independently have its matching issuer, audience, and HTTPS
+JWKS refresh URI (plus optional bootstrap keys); the login page advertises SSO only when both halves
+report ready.
 
 The web server uses Authorization Code with S256 PKCE, a per-login nonce, and a ten-minute one-time
 state transaction. Those transactions are encrypted in the same region-local Valkey backend and

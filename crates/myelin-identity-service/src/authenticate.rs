@@ -343,8 +343,8 @@ impl HumanSsoAuthenticator {
     /// **The production authenticator with REAL OIDC login wired (R2.5).** Builds the same
     /// refuse-not-mock [`crate::oidc::SchemeDispatchVerifier`] as [`Self::production`], routing the
     /// OIDC scheme to the real
-    /// [`crate::oidc::OidcVerifier`] over the injected static JWKS — so a genuinely IdP-signed OIDC
-    /// ID token authenticates (tenant/region from the VERIFIED claims, never a path), while every
+    /// [`crate::oidc::OidcVerifier`] over the injected JWKS — so a genuinely IdP-signed OIDC ID
+    /// token authenticates (tenant/region from the VERIFIED claims, never a path), while every
     /// OTHER scheme (SAML/SCIM/passkey/SSH) still falls through to [`RefuseUnsupportedVerifier`]
     /// (refuse-not-mock — no forgeable envelope, no mock crypto). The replay guard is mandatory at
     /// this composition boundary: production cannot accidentally configure OIDC with a process-local
@@ -355,10 +355,35 @@ impl HumanSsoAuthenticator {
         replay: crate::oidc::ReplayGuard,
     ) -> HumanSsoAuthenticator {
         let (config, jwks) = oidc;
-        HumanSsoAuthenticator::production_with_oidc_replay(
-            store,
-            Some((config, jwks, replay)),
-        )
+        HumanSsoAuthenticator::production_with_oidc_replay(store, Some((config, jwks, replay)))
+    }
+
+    /// Production OIDC wiring with a refreshable JWKS source. The initial set is always retained as
+    /// an outage fallback; refresh is serialized and rate-limited inside [`crate::OidcVerifier`].
+    pub fn production_with_oidc_refresh(
+        store: PrincipalStore,
+        oidc: (crate::oidc::OidcConfig, crate::oidc::JwkSet),
+        replay: crate::oidc::ReplayGuard,
+        refresh: impl Fn() -> Result<crate::oidc::JwkSet, AuthzError> + Send + Sync + 'static,
+    ) -> HumanSsoAuthenticator {
+        use crate::oidc::OidcVerifier;
+
+        let (config, jwks) = oidc;
+        let verifier = OidcVerifier::new(config, jwks)
+            .with_replay_guard(replay)
+            .with_jwks_refresh(refresh);
+        HumanSsoAuthenticator::production_with_oidc_verifier(store, verifier)
+    }
+
+    fn production_with_oidc_verifier(
+        store: PrincipalStore,
+        verifier: crate::oidc::OidcVerifier,
+    ) -> HumanSsoAuthenticator {
+        use crate::oidc::SchemeDispatchVerifier;
+
+        let dispatch = SchemeDispatchVerifier::new(Arc::new(RefuseUnsupportedVerifier::new()))
+            .route(scheme::OIDC, Arc::new(verifier));
+        HumanSsoAuthenticator::with_verifier(store, Arc::new(dispatch))
     }
 
     fn production_with_oidc_replay(
@@ -370,8 +395,7 @@ impl HumanSsoAuthenticator {
         )>,
     ) -> HumanSsoAuthenticator {
         use crate::oidc::{OidcVerifier, SchemeDispatchVerifier};
-        let mut dispatch =
-            SchemeDispatchVerifier::new(Arc::new(RefuseUnsupportedVerifier::new()));
+        let mut dispatch = SchemeDispatchVerifier::new(Arc::new(RefuseUnsupportedVerifier::new()));
         if let Some((config, jwks, replay)) = oidc {
             // The REAL OIDC verifier (RS256/ES256/EdDSA, alg-confusion + iss/aud/exp + replay
             // defences) plugs into the SAME CredentialVerifier seam — the resolution/telemetry body

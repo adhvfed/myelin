@@ -31,11 +31,12 @@
 //! is rejected). The `tenant`/`region`/`subject_key` are read ONLY from the verified claims — never
 //! caller-supplied (ID-3, the IDOR floor).
 //!
-//! ## What is INJECTED, and what is honestly out of scope
-//! The JWKS is **injected** ([`JwkSet`]) — the crypto path makes NO network call, so unit/integration
-//! tests provide a static JWKS and there is no network in the test. A runtime `jwks_uri` fetch +
-//! OIDC discovery + key rotation is a thin layer to be added later (it would refresh the injected
-//! [`JwkSet`]); it is OUT OF SCOPE here and is NOT claimed.
+//! ## What is INJECTED
+//! The initial JWKS and an optional refresh callback are **injected**. The crypto verifier remains
+//! network-agnostic: production supplies a bounded HTTPS `jwks_uri` fetcher, while tests inject a
+//! deterministic callback. The last good key set is cached, periodically refreshed, and refreshed
+//! early for an unknown `kid` or a signature failure so normal provider key rotation does not need
+//! an edge restart.
 //!
 //! ## Wiring (the dispatch seam — [`SchemeDispatchVerifier`])
 //! [`OidcVerifier`] is wired as the OIDC-scheme verifier via [`SchemeDispatchVerifier`], which routes
@@ -49,11 +50,13 @@ use myelin_identity::{AuthzError, Credential};
 use myelin_tenancy::{Region, TenantId};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, TryLockError};
 
 use base64::Engine as _;
 
 const OIDC_LOGIN_MATERIAL_PREFIX: &str = "oidc-login.v1.";
+const JWKS_REFRESH_INTERVAL_SECS: i64 = 15 * 60;
+const JWKS_REFRESH_COOLDOWN_SECS: i64 = 30;
 
 /// Bind an ID token to the browser transaction nonce that initiated its authorization-code flow.
 /// The returned opaque material is accepted only by [`OidcVerifier`]. Direct verifier callers may
@@ -105,7 +108,10 @@ fn unwrap_login_material(material: &str) -> Result<(Cow<'_, str>, Option<String>
             "OIDC login nonce must be 32 random bytes encoded as base64url".into(),
         ));
     }
-    Ok((Cow::Owned(id_token.to_string()), Some(expected_nonce.to_string())))
+    Ok((
+        Cow::Owned(id_token.to_string()),
+        Some(expected_nonce.to_string()),
+    ))
 }
 
 /// Decode one base64url (no-padding) JWS/JWT segment (RFC 7515 §2). A malformed segment is a loud
@@ -166,10 +172,134 @@ impl JwkKey {
 }
 
 /// **The injected JWKS — the IdP's published public keys, keyed by `kid`.** Provided to the verifier
-/// at construction (a static key set in tests); the crypto path never fetches it over the network.
+/// at construction and atomically replaced by an optional injected refresh callback.
 #[derive(Clone, Debug, Default)]
 pub struct JwkSet {
     by_kid: BTreeMap<String, JwkKey>,
+}
+
+type JwksRefreshFn = Arc<dyn Fn() -> Result<JwkSet, AuthzError> + Send + Sync>;
+
+struct JwksCache {
+    keys: JwkSet,
+    last_success: i64,
+    last_attempt: i64,
+}
+
+#[derive(Clone)]
+struct JwksSource {
+    cache: Arc<RwLock<JwksCache>>,
+    refresh: Option<JwksRefreshFn>,
+    refresh_gate: Arc<Mutex<()>>,
+}
+
+impl JwksSource {
+    fn fixed(keys: JwkSet) -> Self {
+        Self {
+            cache: Arc::new(RwLock::new(JwksCache {
+                keys,
+                last_success: 0,
+                last_attempt: i64::MIN,
+            })),
+            refresh: None,
+            refresh_gate: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn with_refresh(mut self, now: i64, refresh: JwksRefreshFn) -> Self {
+        {
+            let mut cache = self
+                .cache
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            cache.last_success = now;
+        }
+        self.refresh = Some(refresh);
+        self
+    }
+
+    fn refreshable(&self) -> bool {
+        self.refresh.is_some()
+    }
+
+    fn key_for(&self, kid: &str, now: i64, force: bool) -> Result<JwkKey, AuthzError> {
+        let (cached, stale) = {
+            let cache = self.cache.read().unwrap_or_else(|error| error.into_inner());
+            (
+                cache.keys.get(kid).cloned(),
+                now.saturating_sub(cache.last_success) >= JWKS_REFRESH_INTERVAL_SECS,
+            )
+        };
+        if !force && (!stale || self.refresh.is_none()) {
+            if let Some(key) = cached.clone() {
+                return Ok(key);
+            }
+        }
+        let Some(refresh) = &self.refresh else {
+            return cached
+                .ok_or_else(|| refuse(format!("unknown `kid` `{kid}` (not in the JWKS)")));
+        };
+
+        // A stale-but-usable cache never queues behind another network refresh. Unknown keys wait
+        // for the in-flight winner, then re-check the cache before deciding whether to fetch.
+        let _refresh_guard = match self.refresh_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => match cached.clone() {
+                Some(key) => return Ok(key),
+                None => self
+                    .refresh_gate
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()),
+            },
+        };
+
+        let (current, due, cooling_down) = {
+            let cache = self.cache.read().unwrap_or_else(|error| error.into_inner());
+            let current = cache.keys.get(kid).cloned();
+            let stale = now.saturating_sub(cache.last_success) >= JWKS_REFRESH_INTERVAL_SECS;
+            let due = force || current.is_none() || stale;
+            let cooling_down = now.saturating_sub(cache.last_attempt) < JWKS_REFRESH_COOLDOWN_SECS;
+            (current, due, cooling_down)
+        };
+        if !due || cooling_down {
+            return current.ok_or_else(|| {
+                refuse(format!("unknown `kid` `{kid}` (JWKS refresh rate-limited)"))
+            });
+        }
+        {
+            let mut cache = self
+                .cache
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            cache.last_attempt = now;
+        }
+
+        match refresh() {
+            Ok(keys) if !keys.is_empty() => {
+                let mut cache = self
+                    .cache
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner());
+                cache.keys = keys;
+                cache.last_success = now;
+            }
+            Ok(_) | Err(_) => {
+                return current.ok_or_else(|| {
+                    refuse(format!(
+                        "unknown `kid` `{kid}` and no usable refreshed JWKS is available"
+                    ))
+                })
+            }
+        }
+        self.cache
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .keys
+            .get(kid)
+            .cloned()
+            .ok_or_else(|| refuse(format!("unknown `kid` `{kid}` after JWKS refresh")))
+    }
 }
 
 impl JwkSet {
@@ -355,10 +485,7 @@ impl ReplayGuard {
                 }
             }
             ReplayBackend::Pg(pg) => pg
-                .block(
-                    pg.backing
-                        .consume(tenant, &namespace, &id, expires_at, now),
-                )
+                .block(pg.backing.consume(tenant, &namespace, &id, expires_at, now))
                 .map_err(|e| refuse(format!("replay store unavailable: {e}"))),
         }
     }
@@ -442,7 +569,7 @@ fn system_now() -> i64 {
 #[derive(Clone)]
 pub struct OidcVerifier {
     config: OidcConfig,
-    jwks: JwkSet,
+    jwks: JwksSource,
     replay: ReplayGuard,
     now: NowFn,
 }
@@ -453,7 +580,7 @@ impl OidcVerifier {
     pub fn new(config: OidcConfig, jwks: JwkSet) -> OidcVerifier {
         OidcVerifier {
             config,
-            jwks,
+            jwks: JwksSource::fixed(jwks),
             replay: ReplayGuard::new(),
             now: Arc::new(system_now),
         }
@@ -468,6 +595,17 @@ impl OidcVerifier {
     /// Build with an injected clock (Unix seconds) — the deterministic-test / drill seam.
     pub fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> OidcVerifier {
         self.now = Arc::new(now);
+        self
+    }
+
+    /// Add a bounded refresh source around the initial key set. Cached keys remain usable when a
+    /// refresh fails; an unknown `kid` forces one serialized, rate-limited refresh.
+    pub fn with_jwks_refresh(
+        mut self,
+        refresh: impl Fn() -> Result<JwkSet, AuthzError> + Send + Sync + 'static,
+    ) -> OidcVerifier {
+        let now = self.now();
+        self.jwks = self.jwks.with_refresh(now, Arc::new(refresh));
         self
     }
 
@@ -599,16 +737,15 @@ impl CredentialVerifier for OidcVerifier {
             )));
         }
 
-        // (3) KID selection — the key is chosen by the token's `kid` from the INJECTED JWKS. A
-        //     missing/unknown kid is refused (no fallback to a header-chosen alg/key).
+        // (3) KID selection — the key is chosen by the token's `kid` from the cached JWKS. A
+        //     missing/unknown kid triggers one bounded refresh when configured, then is refused (no
+        //     fallback to a header-chosen alg/key).
         let kid = header
             .get("kid")
             .and_then(|k| k.as_str())
             .ok_or_else(|| refuse("JWT header missing `kid` (cannot select a JWKS key)"))?;
-        let key = self
-            .jwks
-            .get(kid)
-            .ok_or_else(|| refuse(format!("unknown `kid` `{kid}` (not in the injected JWKS)")))?;
+        let now = self.now();
+        let mut key = self.jwks.key_for(kid, now, false)?;
 
         // (3a) ALG-CONFUSION DEFENCE — the expected alg is PINNED FROM THE KEY, not the header. The
         //      header `alg` must equal what the selected key supports (e.g. an RSA key only verifies
@@ -626,7 +763,22 @@ impl CredentialVerifier for OidcVerifier {
         //     wrong signing key, or a malformed signature all fail here.
         let signing_input = format!("{header_b64}.{payload_b64}");
         let sig = b64url(sig_b64)?;
-        verify_signature(key, signing_input.as_bytes(), &sig)?;
+        if let Err(initial_error) = verify_signature(&key, signing_input.as_bytes(), &sig) {
+            if !self.jwks.refreshable() {
+                return Err(initial_error);
+            }
+            key = self.jwks.key_for(kid, now, true)?;
+            // A provider may (unusually) reuse a `kid` while changing key family. Re-pin the
+            // algorithm after refresh; the untrusted header must never inherit the old key's pin.
+            let refreshed_expected = key.expected_alg();
+            if alg != refreshed_expected {
+                return Err(refuse(format!(
+                    "alg `{alg}` does not match the refreshed key `{kid}` (expected \
+                     `{refreshed_expected}` — alg-confusion / wrong-alg defence)"
+                )));
+            }
+            verify_signature(&key, signing_input.as_bytes(), &sig)?;
+        }
 
         // (5) CLAIMS — only NOW (signature proven) do we trust the payload. Every fact below comes
         //     from the verified claims; nothing is caller-supplied.
@@ -744,13 +896,9 @@ impl CredentialVerifier for OidcVerifier {
             });
         match replay_id {
             Some(id) => {
-                let namespace = serde_json::json!([
-                    "oidc",
-                    self.config.issuer,
-                    self.config.audience,
-                    region
-                ])
-                .to_string();
+                let namespace =
+                    serde_json::json!(["oidc", self.config.issuer, self.config.audience, region])
+                        .to_string();
                 if !self.replay.consume_scoped(
                     tenant,
                     &namespace,
@@ -1015,11 +1163,8 @@ mod tests {
             .verify(&cred(bound))
             .expect("matching signed nonce must verify");
 
-        let wrong = oidc_login_material(
-            &token,
-            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
-        )
-        .expect("well-shaped alternate nonce");
+        let wrong = oidc_login_material(&token, "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
+            .expect("well-shaped alternate nonce");
         let error = verifier(jwks).verify(&cred(wrong)).unwrap_err();
         assert!(format!("{error:?}").contains("nonce does not match"));
     }
@@ -1181,6 +1326,102 @@ mod tests {
             matches!(&err, AuthzError::FailClosed(m) if m.contains("unknown `kid`")),
             "an unknown kid must be refused, got {err:?}"
         );
+    }
+
+    #[test]
+    fn unknown_kid_refreshes_once_and_accepts_a_rotated_key() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let old = RsaKey::generate();
+        let rotated = RsaKey::generate();
+        let refreshed = JwkSet::new().with_key("rsa-2", rotated.jwk());
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let refresh_count = refreshes.clone();
+        let verifier = OidcVerifier::new(config(), JwkSet::new().with_key("rsa-1", old.jwk()))
+            .with_clock(|| NOW)
+            .with_jwks_refresh(move || {
+                refresh_count.fetch_add(1, Ordering::SeqCst);
+                Ok(refreshed.clone())
+            });
+        let header = serde_json::json!({"alg": "RS256", "kid": "rsa-2"});
+        let cl = claims("jti-rotated-kid");
+        let sig = rotated.sign(signing_input(&header, &cl).as_bytes());
+
+        verifier
+            .verify(&cred(jwt(&header, &cl, &sig)))
+            .expect("an unknown rotated kid must trigger refresh and verify");
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn signature_failure_refreshes_a_reused_kid() {
+        let old = RsaKey::generate();
+        let rotated = RsaKey::generate();
+        let refreshed = JwkSet::new().with_key("rsa-1", rotated.jwk());
+        let verifier = OidcVerifier::new(config(), JwkSet::new().with_key("rsa-1", old.jwk()))
+            .with_clock(|| NOW)
+            .with_jwks_refresh(move || Ok(refreshed.clone()));
+        let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
+        let cl = claims("jti-reused-kid");
+        let sig = rotated.sign(signing_input(&header, &cl).as_bytes());
+
+        verifier
+            .verify(&cred(jwt(&header, &cl, &sig)))
+            .expect("a signing-key change under the same kid must refresh and verify");
+    }
+
+    #[test]
+    fn reused_kid_cannot_carry_an_old_algorithm_pin_across_refresh() {
+        let old = RsaKey::generate();
+        let attacker = RsaKey::generate();
+        let refreshed = JwkSet::new().with_key(
+            "shared-kid",
+            JwkKey::EcP256 {
+                x: vec![0; 32],
+                y: vec![0; 32],
+            },
+        );
+        let verifier = OidcVerifier::new(config(), JwkSet::new().with_key("shared-kid", old.jwk()))
+            .with_clock(|| NOW)
+            .with_jwks_refresh(move || Ok(refreshed.clone()));
+        let header = serde_json::json!({"alg": "RS256", "kid": "shared-kid"});
+        let cl = claims("jti-reused-kid-family-change");
+        let sig = attacker.sign(signing_input(&header, &cl).as_bytes());
+
+        let error = verifier
+            .verify(&cred(jwt(&header, &cl, &sig)))
+            .expect_err("the old RSA alg pin must not survive an RSA-to-EC key refresh");
+        assert!(
+            matches!(&error, AuthzError::FailClosed(message) if message.contains("refreshed key") && message.contains("expected `ES256`")),
+            "unexpected refusal: {error:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_failure_keeps_a_still_valid_cached_key() {
+        use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+
+        let key = RsaKey::generate();
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let verifier_clock = clock.clone();
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let refresh_count = refreshes.clone();
+        let verifier = OidcVerifier::new(config(), JwkSet::new().with_key("rsa-1", key.jwk()))
+            .with_clock(move || verifier_clock.load(Ordering::SeqCst))
+            .with_jwks_refresh(move || {
+                refresh_count.fetch_add(1, Ordering::SeqCst);
+                Err(refuse("IdP unavailable"))
+            });
+        clock.store(NOW + JWKS_REFRESH_INTERVAL_SECS, Ordering::SeqCst);
+        let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
+        let mut cl = claims("jti-cached-during-outage");
+        cl["exp"] = (NOW + 2_000).into();
+        let sig = key.sign(signing_input(&header, &cl).as_bytes());
+
+        verifier
+            .verify(&cred(jwt(&header, &cl, &sig)))
+            .expect("a refresh outage must not discard a still-valid cached signing key");
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
     }
 
     /// (d) EXPIRED — `exp` in the past beyond leeway. Reject.
@@ -1532,17 +1773,19 @@ mod tests {
             )
             .unwrap();
         store
-            .link_credential(&sc, scheme::OIDC, "oidc-sub-1", &PrincipalId("p:alice".into()))
+            .link_credential(
+                &sc,
+                scheme::OIDC,
+                "oidc-sub-1",
+                &PrincipalId("p:alice".into()),
+            )
             .unwrap();
 
         let key = RsaKey::generate();
         let jwks = JwkSet::new().with_key("rsa-1", key.jwk());
         let cfg = OidcConfig::new("https://idp.example.com", "myelin-rp");
-        let auth = HumanSsoAuthenticator::production_with_oidc(
-            store,
-            (cfg, jwks),
-            ReplayGuard::new(),
-        );
+        let auth =
+            HumanSsoAuthenticator::production_with_oidc(store, (cfg, jwks), ReplayGuard::new());
         (auth, key)
     }
 
@@ -1572,12 +1815,18 @@ mod tests {
         let (auth, key) = wired_auth();
         let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
         let cl = live_claims("wired-valid-1");
-        let token = jwt(&header, &cl, &key.sign(signing_input(&header, &cl).as_bytes()));
+        let token = jwt(
+            &header,
+            &cl,
+            &key.sign(signing_input(&header, &cl).as_bytes()),
+        );
 
         // The URL path LIES (globex); the credential is IdP-verified for acme.
         let p = auth
             .authenticate(&cred(token), Some(&TenantId("globex".into())))
-            .expect("a valid OIDC token must authenticate through the wired production authenticator");
+            .expect(
+                "a valid OIDC token must authenticate through the wired production authenticator",
+            );
         assert_eq!(p.principal_id, PrincipalId("p:alice".into()));
         assert_eq!(
             p.tenant,
@@ -1609,15 +1858,24 @@ mod tests {
         // (b) wrong issuer.
         let mut cl_iss = live_claims("wired-iss");
         cl_iss["iss"] = serde_json::json!("https://evil-idp.example.com");
-        let wrong_iss = sign(&serde_json::json!({"alg": "RS256", "kid": "rsa-1"}), &cl_iss);
+        let wrong_iss = sign(
+            &serde_json::json!({"alg": "RS256", "kid": "rsa-1"}),
+            &cl_iss,
+        );
         // (c) wrong audience.
         let mut cl_aud = live_claims("wired-aud");
         cl_aud["aud"] = serde_json::json!("some-other-rp");
-        let wrong_aud = sign(&serde_json::json!({"alg": "RS256", "kid": "rsa-1"}), &cl_aud);
+        let wrong_aud = sign(
+            &serde_json::json!({"alg": "RS256", "kid": "rsa-1"}),
+            &cl_aud,
+        );
         // (d) expired.
         let mut cl_exp = live_claims("wired-exp");
         cl_exp["exp"] = serde_json::json!(real_now() - 10_000);
-        let expired = sign(&serde_json::json!({"alg": "RS256", "kid": "rsa-1"}), &cl_exp);
+        let expired = sign(
+            &serde_json::json!({"alg": "RS256", "kid": "rsa-1"}),
+            &cl_exp,
+        );
 
         for (label, token) in [
             ("alg:none", none),
@@ -1648,7 +1906,11 @@ mod tests {
         let key = RsaKey::generate();
         let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
         let cl = live_claims("no-oidc-configured");
-        let token = jwt(&header, &cl, &key.sign(signing_input(&header, &cl).as_bytes()));
+        let token = jwt(
+            &header,
+            &cl,
+            &key.sign(signing_input(&header, &cl).as_bytes()),
+        );
         let r = auth.authenticate(&cred(token), None);
         assert!(
             matches!(r, Err(AuthzError::NotYetImplemented(_))),
