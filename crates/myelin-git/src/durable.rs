@@ -294,6 +294,17 @@ pub struct DiffLineDelta {
     pub new_no: Option<u32>,
 }
 
+/// A bounded expand-context lookup. The caller can distinguish an absent object, a binary object,
+/// and a text object that was refused by the pre-inflation ODB-size ceiling without materializing
+/// arbitrary repository bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileLinesLookup {
+    Found(Vec<DiffLineDelta>),
+    Binary,
+    TooLarge { size: u64, maximum: usize },
+    Missing,
+}
+
 /// One hunk of a file delta — its `@@` header + boundaries + lines. Boundaries let the client render
 /// collapsed unchanged runs and expand context (a flat `lines[]` can't).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -404,6 +415,11 @@ pub struct RefsView {
 fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8000).any(|b| *b == 0)
 }
+
+/// Maximum inclusive line span accepted by the expand-context API.
+pub const FILE_LINES_MAX_RANGE: usize = 1_000;
+/// Maximum blob size inflated by the expand-context API. Checked through the ODB header first.
+pub const FILE_LINES_MAX_BLOB_BYTES: usize = 512 * 1024;
 
 /// **Nested-path traversal guard (R3.4).** A tree-relative path may never carry a `..` or `.` segment
 /// or be absolute — such a path can only be an attempt to escape the committed tree (or a malformed
@@ -1674,34 +1690,71 @@ impl DurableGitRepo {
     /// **Expand-context (R3.2 · G-7 N2) — the raw lines of a blob at `oid`, `start..=end` (1-based).**
     /// Serves Expand ↑/↓/all and "Show deleted contents" (via the old-side blob oid). Returns context
     /// lines (origin `' '`) carrying their blob line number in `new_no` (the client maps the old-side
-    /// column from the surrounding hunk offset). A malformed/absent oid or a non-blob → `None`. The
-    /// object-check is the caller's (the edge Pull-guards it exactly like the blob route).
+    /// column from the surrounding hunk offset). A malformed/absent oid or a non-blob returns
+    /// [`FileLinesLookup::Missing`]. The object-check is the caller's (the edge Pull-guards it exactly
+    /// like the blob route). The range and ODB byte ceilings are enforced here as defense in depth,
+    /// before blob materialization.
     pub fn file_lines(
         &self,
         oid: &str,
         start: usize,
         end: usize,
-    ) -> Result<Option<Vec<DiffLineDelta>>, DurableError> {
+    ) -> Result<FileLinesLookup, DurableError> {
+        if start == 0
+            || end < start
+            || end > u32::MAX as usize
+            || end - start + 1 > FILE_LINES_MAX_RANGE
+        {
+            return Err(DurableError::Git("invalid file line range".into()));
+        }
+        if oid.len() != 40
+            || !oid
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Ok(FileLinesLookup::Missing);
+        }
         let repo = self.open_git()?;
         let goid = match git2::Oid::from_str(oid) {
             Ok(o) => o,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(FileLinesLookup::Missing),
         };
+        let odb = repo
+            .odb()
+            .map_err(|error| git_err("open object database", error))?;
+        let (object_size, object_kind) = match odb.read_header(goid) {
+            Ok(header) => header,
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                return Ok(FileLinesLookup::Missing)
+            }
+            Err(error) => return Err(git_err("read object header", error)),
+        };
+        if object_kind != git2::ObjectType::Blob {
+            return Ok(FileLinesLookup::Missing);
+        }
+        if object_size > FILE_LINES_MAX_BLOB_BYTES {
+            return Ok(FileLinesLookup::TooLarge {
+                size: object_size as u64,
+                maximum: FILE_LINES_MAX_BLOB_BYTES,
+            });
+        }
         let blob = match repo.find_blob(goid) {
             Ok(b) => b,
-            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                return Ok(FileLinesLookup::Missing)
+            }
             Err(e) => return Err(git_err("find blob", e)),
         };
         if blob.is_binary() {
-            return Ok(Some(Vec::new())); // never expand a binary into a garbled dump.
+            return Ok(FileLinesLookup::Binary); // never expand a binary into a garbled dump.
         }
         let text = String::from_utf8_lossy(blob.content());
-        let (start, end) = (start.max(1), end);
         let out = text
             .split('\n')
             .enumerate()
             .map(|(i, l)| (i + 1, l))
-            .filter(|(n, _)| *n >= start && (end == 0 || *n <= end))
+            .skip(start - 1)
+            .take(end - start + 1)
             .map(|(n, l)| DiffLineDelta {
                 origin: ' ',
                 content: l.trim_end_matches('\r').to_string(),
@@ -1709,7 +1762,7 @@ impl DurableGitRepo {
                 new_no: Some(n as u32),
             })
             .collect();
-        Ok(Some(out))
+        Ok(FileLinesLookup::Found(out))
     }
 
     /// **Build a single-file web-edit commit (GT-003).** Write `contents` as a blob, rebuild the ref's
@@ -2538,16 +2591,34 @@ mod tests {
         let store = DurableGitStore::rooted(&root);
         let repo = store.create_repo(&loc()).expect("create");
         let blob = repo.write_blob(b"one\ntwo\nthree\nfour\nfive\n").unwrap();
-        let lines = repo.file_lines(&blob.0, 2, 4).unwrap().unwrap();
+        let FileLinesLookup::Found(lines) = repo.file_lines(&blob.0, 2, 4).unwrap() else {
+            panic!("text blob must return lines")
+        };
         assert_eq!(lines.len(), 3, "lines 2..=4");
         assert_eq!(lines[0].content, "two");
         assert_eq!(lines[0].new_no, Some(2));
         assert_eq!(lines[2].content, "four");
-        // A malformed oid → None (a stale expand never 500s).
-        assert!(repo.file_lines("not-an-oid", 1, 10).unwrap().is_none());
+        // A malformed oid → Missing (a stale expand never 500s).
+        assert_eq!(
+            repo.file_lines("not-an-oid", 1, 10).unwrap(),
+            FileLinesLookup::Missing,
+        );
         // A binary blob → an empty expansion (never a garbled dump).
         let bin = repo.write_blob(&[0u8, 1, 2, 0]).unwrap();
-        assert!(repo.file_lines(&bin.0, 1, 10).unwrap().unwrap().is_empty());
+        assert_eq!(repo.file_lines(&bin.0, 1, 10).unwrap(), FileLinesLookup::Binary);
+
+        let large = repo
+            .write_blob(&vec![b'x'; FILE_LINES_MAX_BLOB_BYTES + 1])
+            .unwrap();
+        assert!(matches!(
+            repo.file_lines(&large.0, 1, 10).unwrap(),
+            FileLinesLookup::TooLarge { .. }
+        ));
+        assert!(repo.file_lines(&blob.0, 0, 1).is_err());
+        assert!(repo.file_lines(&blob.0, 2, 1).is_err());
+        assert!(repo
+            .file_lines(&blob.0, 1, FILE_LINES_MAX_RANGE + 1)
+            .is_err());
         std::fs::remove_dir_all(&root).ok();
     }
 

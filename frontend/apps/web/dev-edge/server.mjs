@@ -489,9 +489,28 @@ const server = createServer((req, res) => {
     }
     // R3.2 · G-7 N2 — expand-context lines at a blob oid.
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/file-lines\/([^/]+)$/))) {
-      const start = Number(url.searchParams.get("start") ?? 1);
-      const end = Number(url.searchParams.get("end") ?? 0);
-      const v = fileLinesJson(seg(m[1]), seg(m[2]), start, end);
+      const oid = seg(m[2]);
+      const pathValue = url.searchParams.get("path");
+      const start = Number(url.searchParams.get("start"));
+      const end = Number(url.searchParams.get("end"));
+      const exactQuery = [...url.searchParams.keys()].length === 3 &&
+        ["path", "start", "end"].every((key) => url.searchParams.getAll(key).length === 1);
+      const safePath = typeof pathValue === "string" && pathValue.length > 0 &&
+        new TextEncoder().encode(pathValue).byteLength <= 4 * 1024 &&
+        !pathValue.startsWith("/") && !pathValue.includes("\\") &&
+        ![...pathValue].some((character) => {
+          const point = character.codePointAt(0);
+          return point <= 0x1f || point === 0x7f;
+        }) &&
+        pathValue.split("/").every((part) => part !== "" && part !== "." && part !== "..");
+      if (!exactQuery || !safePath || !/^[0-9a-f]{40}$/.test(oid) ||
+          !Number.isSafeInteger(start) || start <= 0 || !Number.isSafeInteger(end) ||
+          end < start || end > 0xffff_ffff || end - start + 1 > 1000) {
+        return send(res, 400, {
+          error: { message: "invalid file-lines request", code: "bad_request" },
+        });
+      }
+      const v = fileLinesJson(seg(m[1]), oid, start, end);
       return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("file"));
     }
     // R3.3 — the PR discussion + review batches.

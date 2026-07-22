@@ -41,7 +41,10 @@ use myelin_events::MonotonicMinter;
 use myelin_git::api::{http_catalogue, Method as GitMethod};
 use myelin_git::check_status::GitOid;
 use myelin_git::core::{Oid as CoreOid, RepoLoc};
-use myelin_git::durable::{BlobPathLookup, CommitDetail, CommitMeta, PrDiff, TreePathLookup};
+use myelin_git::durable::{
+    BlobPathLookup, CommitDetail, CommitMeta, FileLinesLookup, PrDiff, TreePathLookup,
+    FILE_LINES_MAX_RANGE,
+};
 use myelin_git::durable::{DurableError, DurableGitRepo, DurableGitStore};
 use myelin_git::events::pseudonymized_event_principal;
 use myelin_git::lifecycle::{
@@ -973,12 +976,10 @@ impl DurableGitBackend {
         oid: &str,
         start: usize,
         end: usize,
-    ) -> Result<Option<Vec<PrDiffLine>>, DurableError> {
+    ) -> Result<FileLinesLookup, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc)?;
-        Ok(repo
-            .file_lines(oid, start, end)?
-            .map(|lines| lines.into_iter().map(pr_diff_line).collect()))
+        repo.file_lines(oid, start, end)
     }
 
     // ── R3.4 repo-browsing completeness: refs · tree-at-path · nested blob · raw/download ──
@@ -3522,34 +3523,142 @@ impl Handler for DPrDiff {
 
 /// **GET …/file-lines/{oid}?path=&start=&end= — expand-context (R3.2 · G-7 N2).** `Pull`-guarded
 /// (the SAME object check as the blob route). Returns `{ lines: [...] }` (context lines at a blob
-/// oid); an absent/malformed oid → an empty `lines` (never a 500 for a stale expand request).
+/// oid); an absent canonical oid → empty `lines`, while malformed or unbounded input fails with 400.
 struct DFileLines {
     be: Arc<DurableGitBackend>,
 }
+
+struct FileLinesQuery {
+    path: String,
+    start: usize,
+    end: usize,
+}
+
+const FILE_LINES_MAX_QUERY_BYTES: usize = 16 * 1024;
+
+fn decode_form_query_value(raw: &str) -> Result<String, EdgeError> {
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return Err(EdgeError::BadRequest(
+                    "file-lines query contains malformed percent encoding".into(),
+                ));
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    let form_value = raw.replace('+', " ");
+    percent_encoding::percent_decode_str(&form_value)
+        .decode_utf8()
+        .map(|value| value.into_owned())
+        .map_err(|_| EdgeError::BadRequest("file-lines query is not valid UTF-8".into()))
+}
+
+fn parse_file_lines_query(query: &str) -> Result<FileLinesQuery, EdgeError> {
+    if query.len() > FILE_LINES_MAX_QUERY_BYTES {
+        return Err(EdgeError::BadRequest("file-lines query is too large".into()));
+    }
+    let mut path = None;
+    let mut start = None;
+    let mut end = None;
+    for pair in query.split('&') {
+        let (name, value) = pair
+            .split_once('=')
+            .ok_or_else(|| EdgeError::BadRequest("malformed file-lines query parameter".into()))?;
+        let duplicate = |field: &str| {
+            EdgeError::BadRequest(format!("duplicate file-lines query parameter `{field}`"))
+        };
+        match name {
+            "path" => {
+                if path.is_some() {
+                    return Err(duplicate("path"));
+                }
+                let decoded = decode_form_query_value(value)?;
+                if !valid_anchor_path(&decoded) {
+                    return Err(EdgeError::BadRequest("file-lines path is invalid".into()));
+                }
+                path = Some(decoded);
+            }
+            "start" | "end" => {
+                let slot = if name == "start" { &mut start } else { &mut end };
+                if slot.is_some() {
+                    return Err(duplicate(name));
+                }
+                let number = value.parse::<u64>().map_err(|_| {
+                    EdgeError::BadRequest(format!(
+                        "file-lines `{name}` must be a positive line number"
+                    ))
+                })?;
+                if number == 0 || number > u32::MAX as u64 {
+                    return Err(EdgeError::BadRequest(format!(
+                        "file-lines `{name}` must be a positive line number"
+                    )));
+                }
+                *slot = Some(number as usize);
+            }
+            "" => return Err(EdgeError::BadRequest("empty file-lines query parameter".into())),
+            other => {
+                return Err(EdgeError::BadRequest(format!(
+                    "unknown file-lines query parameter `{other}`"
+                )))
+            }
+        }
+    }
+    let path = path.ok_or_else(|| EdgeError::BadRequest("file-lines path is required".into()))?;
+    let start = start.ok_or_else(|| EdgeError::BadRequest("file-lines start is required".into()))?;
+    let end = end.ok_or_else(|| EdgeError::BadRequest("file-lines end is required".into()))?;
+    if end < start || end - start + 1 > FILE_LINES_MAX_RANGE {
+        return Err(EdgeError::BadRequest(format!(
+            "file-lines range must be ordered and no larger than {FILE_LINES_MAX_RANGE} lines"
+        )));
+    }
+    Ok(FileLinesQuery { path, start, end })
+}
+
+fn canonical_blob_oid(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 impl Handler for DFileLines {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let start = ctx
-            .request
-            .query_param("start")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(1);
-        let end = ctx
-            .request
-            .query_param("end")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0); // 0 = to end-of-file
-        let lines = self
+        let FileLinesQuery { path, start, end } = parse_file_lines_query(&ctx.request.query)?;
+        debug_assert!(!path.is_empty());
+        let oid = param(ctx, "oid")?;
+        if !canonical_blob_oid(oid) {
+            return Err(EdgeError::BadRequest(
+                "file-lines oid must be a canonical lowercase object id".into(),
+            ));
+        }
+        let lookup = self
             .be
             .file_lines(
                 tenant_of(ctx),
                 region_of(ctx),
                 param(ctx, "repo")?,
-                param(ctx, "oid")?,
+                oid,
                 start,
                 end,
             )
-            .map_err(map_durable_err)?
-            .unwrap_or_default();
+            .map_err(map_durable_err)?;
+        let lines: Vec<PrDiffLine> = match lookup {
+            FileLinesLookup::Found(lines) => lines.into_iter().map(pr_diff_line).collect(),
+            FileLinesLookup::Binary | FileLinesLookup::Missing => Vec::new(),
+            FileLinesLookup::TooLarge { maximum, .. } => {
+                return Err(EdgeError::PayloadTooLarge(format!(
+                    "file is too large for context expansion (maximum {maximum} bytes)"
+                )))
+            }
+        };
         let items: Vec<Value> = lines.iter().map(PrDiffLine::to_json).collect();
         Ok(EdgeResponse::json(200, &json!({ "lines": items })))
     }
@@ -5149,6 +5258,54 @@ mod pr_list_tests {
             "F8: a non-existent head_ref is a 400 at open, not a merge-time surprise"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod file_lines_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn file_lines_query_is_exact_decoded_and_bounded() {
+        let parsed = parse_file_lines_query("path=src%2Fmain+file.rs&start=2&end=4")
+            .expect("canonical bounded query");
+        assert_eq!(parsed.path, "src/main file.rs");
+        assert_eq!((parsed.start, parsed.end), (2, 4));
+
+        for query in [
+            "",
+            "path=x&start=1",
+            "path=x&start=1&end=1&extra=x",
+            "path=x&path=y&start=1&end=1",
+            "path=..%2Fsecret&start=1&end=1",
+            "path=x&start=0&end=1",
+            "path=x&start=2&end=1",
+            "path=x&start=1&end=1001",
+            "path=x%ZZ&start=1&end=1",
+        ] {
+            assert!(
+                matches!(parse_file_lines_query(query), Err(EdgeError::BadRequest(_))),
+                "query must fail closed: {query}"
+            );
+        }
+        assert!(matches!(
+            parse_file_lines_query(&"x".repeat(FILE_LINES_MAX_QUERY_BYTES + 1)),
+            Err(EdgeError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn file_lines_oid_requires_the_full_lowercase_content_address() {
+        assert!(canonical_blob_oid(
+            "0123456789abcdef0123456789abcdef01234567"
+        ));
+        assert!(!canonical_blob_oid("01234567"));
+        assert!(!canonical_blob_oid(
+            "0123456789ABCDEF0123456789ABCDEF01234567"
+        ));
+        assert!(!canonical_blob_oid(
+            "g123456789abcdef0123456789abcdef01234567"
+        ));
     }
 }
 
