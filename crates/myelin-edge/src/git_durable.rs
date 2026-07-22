@@ -532,6 +532,32 @@ impl DurableGitBackend {
         }
     }
 
+    /// Materialized migration seam for
+    /// `pull_request.review = reviewer ∪ parent_repo->push`. The PR relation tuples are not yet
+    /// projected into Identity, so settle the same union from the durable requested-reviewer fact
+    /// and the live repo permission. Any row lookup failure denies.
+    pub(crate) fn authorize_pr_review(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        number: u64,
+        principal: &Principal,
+    ) -> bool {
+        let loc = Self::loc(tenant, region, slug);
+        if self
+            .repo_authz
+            .authorize_repo_permission(principal, &loc, RepoPermission::Push)
+        {
+            return true;
+        }
+        let viewer = Self::pseudonym(tenant, principal);
+        matches!(
+            self.pr_get(&loc, number, principal),
+            Ok(Some(record)) if record.is_review_requested_of(&viewer)
+        )
+    }
+
     fn pr_list(&self, loc: &RepoLoc, principal: &Principal) -> Result<Vec<PrRecord>, DurableError> {
         match &self.pg_prs {
             Some(store) => store.list(&Self::verified_pr_scope(principal, loc)?, &loc.repo),
@@ -1961,8 +1987,9 @@ impl DurableGitBackend {
     //
     // The canonical model is THREADS (an optional content anchor; comments belong to threads); review
     // batching layers on via `review_id` + the `ReviewBatch` lifecycle. Read = PR view (the `Pull`
-    // object guard at the route); write = a real write grant (the `Push` object guard) — never a
-    // permissive authorizer. Storage keys by the canonical `object_key` (`pr:<slug>:<n>`) so issues/
+    // object guard at the route); write = `pull_request.review` (requested reviewer or parent-repo
+    // Push) — never a permissive authorizer. Storage keys by the canonical `object_key`
+    // (`pr:<slug>:<n>`) so issues/
     // docs mount the SAME store later. Every mutation verifies the PR exists first (a thread on a
     // non-existent PR is a 404, mirroring the overview).
 
@@ -2015,7 +2042,7 @@ impl DurableGitBackend {
     }
 
     /// POST …/prs/{n}/threads — open a new thread with its first comment (`anchor` null = a discussion
-    /// thread; an anchor object = a diff-line thread). Write = `Push`.
+    /// thread; an anchor object = a diff-line thread). Write = `pull_request.review`.
     pub fn create_thread(
         &self,
         tenant: &str,
@@ -2091,7 +2118,7 @@ impl DurableGitBackend {
     }
 
     /// POST …/prs/{n}/reviews/start — start a review batch (draft; verdict `in_progress`). Write =
-    /// `Push`. (`/start` distinguishes this from the existing single-shot `POST …/reviews` verdict op
+    /// `pull_request.review`. (`/start` distinguishes this from the existing single-shot `POST …/reviews` verdict op
     /// that feeds the merge gate — a named deviation from N5's literal path, preserving R2's gate path.)
     pub fn start_review_batch(
         &self,
@@ -2110,7 +2137,7 @@ impl DurableGitBackend {
     }
 
     /// POST …/prs/{n}/reviews/{rid}/comments — add a PENDING comment to a draft batch (visible only to
-    /// its author until submit). Write = `Push`.
+    /// its author until submit). Write = `pull_request.review`.
     pub fn add_pending_comment(
         &self,
         target: PrActorContext<'_>,
@@ -2139,7 +2166,7 @@ impl DurableGitBackend {
     /// POST …/prs/{n}/reviews/{rid}/submit `{ verdict, summary_md }` — submit the batch. Emits ONE
     /// batch event (R-BATCH-1; idempotent on retry). A NON-advisory (human) `approved` /
     /// `changes_requested` verdict ALSO feeds the merge gate via the durable review record (an agent
-    /// batch stays advisory — it never gates). Write = `Push`.
+    /// batch stays advisory — it never gates). Write = `pull_request.review`.
     pub fn submit_review_batch(
         &self,
         target: PrActorContext<'_>,
@@ -3539,7 +3566,7 @@ impl Handler for DPrThreadResolve {
     }
 }
 
-/// POST …/prs/{n}/reviews/start — start a review batch (draft). `Push`-guarded.
+/// POST …/prs/{n}/reviews/start — start a review batch (draft). `pull_request.review`-guarded.
 struct DPrReviewStart {
     be: Arc<DurableGitBackend>,
 }
@@ -3562,7 +3589,8 @@ impl Handler for DPrReviewStart {
     }
 }
 
-/// POST …/prs/{n}/reviews/{rid}/comments — add a pending comment to a draft batch. `Push`-guarded.
+/// POST …/prs/{n}/reviews/{rid}/comments — add a pending comment to a draft batch.
+/// `pull_request.review`-guarded.
 struct DPrReviewComment {
     be: Arc<DurableGitBackend>,
 }
@@ -3590,7 +3618,8 @@ impl Handler for DPrReviewComment {
     }
 }
 
-/// POST …/prs/{n}/reviews/{rid}/submit — submit the batch (ONE event, R-BATCH-1). `Push`-guarded.
+/// POST …/prs/{n}/reviews/{rid}/submit — submit the batch (ONE event, R-BATCH-1).
+/// `pull_request.review`-guarded.
 struct DPrReviewSubmit {
     be: Arc<DurableGitBackend>,
 }
@@ -3622,7 +3651,7 @@ impl Handler for DPrReviewSubmit {
     }
 }
 
-/// DELETE …/prs/{n}/reviews/{rid} — discard a draft batch. `Push`-guarded.
+/// DELETE …/prs/{n}/reviews/{rid} — discard a draft batch. `pull_request.review`-guarded.
 struct DPrReviewDiscard {
     be: Arc<DurableGitBackend>,
 }
@@ -4062,6 +4091,40 @@ fn guarded(
     })
 }
 
+/// Temporary materialized form of the frozen
+/// `pull_request.review = reviewer ∪ parent_repo->push` permission. Production PR rows already
+/// carry requested-reviewer facts, but the matching Identity `pull_request` tuples are not yet
+/// projected. Until they are, evaluate the same union from the two authoritative facts available
+/// here: the live repo `Push` check or a requested-reviewer record on this exact PR. A failed PR
+/// lookup denies without distinguishing absence from an authorization failure.
+struct PrReviewGuard {
+    be: Arc<DurableGitBackend>,
+    inner: Arc<dyn Handler>,
+}
+
+impl Handler for PrReviewGuard {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let slug = param(ctx, "repo")?;
+        let number = num_param(ctx, "n")?;
+        if !self
+            .be
+            .authorize_pr_review(tenant_of(ctx), region_of(ctx), slug, number, ctx.principal)
+        {
+            return Err(EdgeError::Forbidden(
+                "no review grant for this pull request".into(),
+            ));
+        }
+        self.inner.handle(ctx)
+    }
+}
+
+fn pr_review_guarded(be: &Arc<DurableGitBackend>, inner: Arc<dyn Handler>) -> Arc<dyn Handler> {
+    Arc::new(PrReviewGuard {
+        be: be.clone(),
+        inner,
+    })
+}
+
 /// **Register Git through the product edge over the DURABLE backend (GT-003).** Iterates Git's OWN
 /// catalogue (anti-duplication — the route set is Git's, re-rooted under `/v1/git/...`) and binds the
 /// durable handlers. The gateway owns auth/scope/IDOR/error/pagination; every write persists on the real
@@ -4076,7 +4139,8 @@ fn guarded(
 /// | route | permission | deny |
 /// |---|---|---|
 /// | repo home / commit log / commit diff / blob view / PR overview / PR checks | `Pull` | 0-leak 404 |
-/// | web-edit commit / open-PR / PR review / CI check-report | `Push` | 403 |
+/// | web-edit commit / open-PR / CI check-report | `Push` | 403 |
+/// | PR review / discussion writes | `pull_request.review` | 403 |
 /// | endorse fork CI | `ApproveUntrustedCi` | 403 |
 /// | merge (`pull_request.merge = parent_repo->protected_push`) | `ProtectedPush` | 403 |
 /// | set branch protection | `ProtectedPush` | 403 |
@@ -4131,7 +4195,7 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
                 "git.pr.open",
             ),
             (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/reviews") => (
-                guarded(&be, Push, Arc::new(DPrReview { be: be.clone() })),
+                pr_review_guarded(&be, Arc::new(DPrReview { be: be.clone() })),
                 "git.pr.review",
             ),
             // The X-1 endorsement: the DISTINCT approve_untrusted_ci relation (never collapsed to
@@ -4213,8 +4277,8 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         "git.file.lines",
         guarded(&be, Pull, Arc::new(DFileLines { be: be.clone() })),
     );
-    // ── R3.3 / R3.2 — the thread + review-batch surface. READ = `Pull` (thread read = PR view);
-    //    WRITE = `Push` (comment/review write is a real write grant, never a permissive authorizer). ──
+    // ── R3.3 / R3.2 — the thread + review-batch surface. READ = `Pull` (thread read = PR
+    //    view); WRITE = `pull_request.review` (requested reviewer OR parent-repo Push). ──
     b = b.route(
         get,
         &reroot("/api/git/repos/{repo}/prs/{n}/threads"),
@@ -4225,19 +4289,19 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         post,
         &reroot("/api/git/repos/{repo}/prs/{n}/threads"),
         "git.pr.thread.create",
-        guarded(&be, Push, Arc::new(DPrThreadCreate { be: be.clone() })),
+        pr_review_guarded(&be, Arc::new(DPrThreadCreate { be: be.clone() })),
     );
     b = b.route(
         post,
         &reroot("/api/git/repos/{repo}/prs/{n}/threads/{tid}/comments"),
         "git.pr.comment.create",
-        guarded(&be, Push, Arc::new(DPrThreadComment { be: be.clone() })),
+        pr_review_guarded(&be, Arc::new(DPrThreadComment { be: be.clone() })),
     );
     b = b.route(
         post,
         &reroot("/api/git/repos/{repo}/prs/{n}/threads/{tid}/resolve"),
         "git.pr.thread.resolve",
-        guarded(&be, Push, Arc::new(DPrThreadResolve { be: be.clone() })),
+        pr_review_guarded(&be, Arc::new(DPrThreadResolve { be: be.clone() })),
     );
     // The review-batch lifecycle (G-8). `/reviews/start` (not `POST /reviews`) preserves the existing
     // single-shot `POST /reviews` verdict op that feeds the merge gate — a named deviation from N5's
@@ -4246,25 +4310,25 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         post,
         &reroot("/api/git/repos/{repo}/prs/{n}/reviews/start"),
         "git.pr.review.start",
-        guarded(&be, Push, Arc::new(DPrReviewStart { be: be.clone() })),
+        pr_review_guarded(&be, Arc::new(DPrReviewStart { be: be.clone() })),
     );
     b = b.route(
         post,
         &reroot("/api/git/repos/{repo}/prs/{n}/reviews/{rid}/comments"),
         "git.pr.review.comment",
-        guarded(&be, Push, Arc::new(DPrReviewComment { be: be.clone() })),
+        pr_review_guarded(&be, Arc::new(DPrReviewComment { be: be.clone() })),
     );
     b = b.route(
         post,
         &reroot("/api/git/repos/{repo}/prs/{n}/reviews/{rid}/submit"),
         "git.pr.review.submit",
-        guarded(&be, Push, Arc::new(DPrReviewSubmit { be: be.clone() })),
+        pr_review_guarded(&be, Arc::new(DPrReviewSubmit { be: be.clone() })),
     );
     b = b.route(
         post,
         &reroot("/api/git/repos/{repo}/prs/{n}/reviews/{rid}/discard"),
         "git.pr.review.discard",
-        guarded(&be, Push, Arc::new(DPrReviewDiscard { be: be.clone() })),
+        pr_review_guarded(&be, Arc::new(DPrReviewDiscard { be: be.clone() })),
     );
     // R3.1 — the CROSS-REPO PR front door (`/prs`). NOT object-guarded (no `{repo}`): the prefilter is
     // the `visible_repos` `list_objects` seam inside the handler (stronger than a single object check
@@ -4995,8 +5059,8 @@ mod pr_list_tests {
 #[cfg(test)]
 mod pr_thread_tests {
     //! **R3.3 / R3.2 — the PR thread / comment / review-batch surface at the edge.** Drives the
-    //! handlers to prove: (a) thread READ = PR view (the `Pull` guard) but WRITE = a real write grant
-    //! (the `Push` guard — a read-only viewer is 403 on a comment, NOT AllowAll); (b) a pending review
+    //! handlers to prove: (a) thread READ = PR view (the `Pull` guard) while WRITE follows the exact
+    //! review union (requested reviewer or repo pusher; an unrelated reader is denied); (b) a pending review
     //! comment is invisible to a second viewer until submit; (c) submit emits exactly ONE batch event
     //! (idempotent on retry); (d) a submitted human `changes_requested` verdict flips the merge gate to
     //! blocked; (e) a blocked merge returns a 409 carrying the FRESH re-rendered checks (N6).
@@ -5087,11 +5151,12 @@ mod pr_thread_tests {
         (Arc::new(be), writer, reader)
     }
 
-    /// **Write = a REAL permission (Push), not AllowAll.** A read-only viewer may LIST threads (read =
-    /// PR view) but is 403 on creating a comment (the `Push` object guard denies).
+    /// **Write = `pull_request.review`, not `Push` alone.** A requested reviewer may comment without
+    /// repo write, a repo writer remains admitted by the union's inheritance arm, and an unrelated
+    /// read-only viewer is denied.
     #[test]
-    fn thread_read_is_pr_view_but_write_needs_a_real_write_grant() {
-        let (be, _writer, reader) = setup("authz", &"0".repeat(40));
+    fn thread_write_admits_requested_reviewer_or_repo_pusher_only() {
+        let (be, writer, reader) = setup("authz", &"0".repeat(40));
         // The reader may LIST (Pull-guarded read).
         let list = guarded(
             &be,
@@ -5107,12 +5172,7 @@ mod pr_thread_tests {
         )
         .expect("reader may read threads");
         assert!(v["threads"].is_array());
-        // The reader may NOT create a comment (Push-guarded write) — 403, never a silent allow.
-        let create = guarded(
-            &be,
-            RepoPermission::Push,
-            Arc::new(DPrThreadCreate { be: be.clone() }),
-        );
+        let create = pr_review_guarded(&be, Arc::new(DPrThreadCreate { be: be.clone() }));
         let err = serve(
             &*create,
             "POST",
@@ -5120,8 +5180,39 @@ mod pr_thread_tests {
             &[("repo", SLUG), ("n", "1")],
             json!({ "body_md": "hi" }),
         )
-        .expect_err("a read-only viewer must be forbidden from commenting");
+        .expect_err("an unrelated read-only viewer must be forbidden from commenting");
         assert!(matches!(err, EdgeError::Forbidden(_)), "got {err:?}");
+
+        // The repo writer is the `parent_repo->push` union arm.
+        serve(
+            &*create,
+            "POST",
+            &writer,
+            &[("repo", SLUG), ("n", "1")],
+            json!({ "body_md": "writer comment" }),
+        )
+        .expect("a repo pusher may review");
+
+        // Materialize the direct `reviewer` arm on the current PR. The reader still has no Push.
+        let loc = DurableGitBackend::loc(TENANT, REGION, SLUG);
+        be.prs
+            .update(&loc, 1, |record| {
+                record.reviews.push(ReviewRecord {
+                    reviewer_pseudonym: DurableGitBackend::pseudonym(TENANT, &reader),
+                    state: ReviewState::Requested,
+                    is_agent: false,
+                });
+                Ok(())
+            })
+            .expect("request review");
+        serve(
+            &*create,
+            "POST",
+            &reader,
+            &[("repo", SLUG), ("n", "1")],
+            json!({ "body_md": "requested-reviewer comment" }),
+        )
+        .expect("a directly requested reviewer may review without repo Push");
     }
 
     /// A pending review comment is invisible to a second viewer until submit; submit emits ONE event.

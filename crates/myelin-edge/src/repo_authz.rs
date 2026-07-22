@@ -63,8 +63,9 @@ pub enum RepoPermission {
     /// `repo.pull` — every read (repo home / commit log / commit diff / blob view / PR view / PR
     /// checks / clone / fetch). A denial is the 0-leak 404 (repo existence is never leaked).
     Pull,
-    /// `repo.push` — the ordinary writes (web-edit commit / open-PR / PR review / CI check-report /
-    /// wire push). A denial is a fail-closed 403.
+    /// `repo.push` — ordinary repo writes (web-edit commit / open-PR / CI check-report / wire
+    /// push). It is also one union arm of `pull_request.review`; direct requested reviewers are
+    /// settled at the PR guard. A denial is a fail-closed 403.
     Push,
     /// `repo.protected_push` — the admin-only transitions: PR **merge**
     /// (`pull_request.merge = parent_repo->protected_push`, §5-frozen) and **set
