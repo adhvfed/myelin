@@ -273,15 +273,7 @@ impl ReplayGuard {
         }
     }
 
-    /// Consume `id`. Returns `true` if it was FRESH (newly recorded), `false` if it was ALREADY seen
-    /// (a replay — the caller rejects). This compatibility helper is for the local test/SAML seam;
-    /// OIDC uses the scoped, expiring path below.
-    pub fn consume(&self, id: &str) -> bool {
-        self.consume_scoped("", "legacy", id, i64::MAX, 0)
-            .unwrap_or(false)
-    }
-
-    fn consume_scoped(
+    pub(crate) fn consume_scoped(
         &self,
         tenant: &str,
         namespace: &str,
@@ -422,7 +414,7 @@ impl OidcVerifier {
         self
     }
 
-    /// The shared replay guard (so a caller can pre-seed / inspect the seen-set).
+    /// The configured replay guard, which can be cloned into another verifier handle.
     pub fn replay_guard(&self) -> &ReplayGuard {
         &self.replay
     }

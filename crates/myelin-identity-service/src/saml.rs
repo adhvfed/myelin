@@ -69,12 +69,16 @@
 //! (chrono, never a lexical compare — the MR-008 fail-open lesson) and validated with leeway;
 //! `AudienceRestriction/Audience` must contain this SP; and the assertion `ID` is consumed once via
 //! an injected [`crate::oidc::ReplayGuard`] (a replayed assertion is refused).
+//! The HTTP POST response is additionally bound to an injected, server-held
+//! [`SamlRequestBinding`]: outer `Destination`/`InResponseTo` must match, and the same ACS recipient
+//! and AuthnRequest ID must occur in the signed bearer `SubjectConfirmationData`.
 //!
 //! ## What is INJECTED, and what is honestly out of scope
-//! The trust anchor key(s) and the replay guard are INJECTED — the crypto/test path makes NO network
-//! call. SAML metadata refresh / SP-initiated SLO / encrypted assertions (`EncryptedAssertion`) /
-//! full X.509 path-building to a CA root are OUT OF SCOPE here and NOT claimed (we PIN the leaf
-//! signing key, which is stricter than chain-building). These are thin later layers.
+//! The trust anchor key(s), replay guard, and per-login request binding are INJECTED — the crypto/test
+//! path makes NO network call. SAML metadata refresh / SP-initiated SLO / encrypted assertions
+//! (`EncryptedAssertion`) / full X.509 path-building to a CA root are OUT OF SCOPE here and NOT
+//! claimed (we PIN the leaf signing key, which is stricter than chain-building). These are thin later
+//! layers.
 //!
 //! ## Wiring (the dispatch seam — [`crate::oidc::SchemeDispatchVerifier`])
 //! [`SamlVerifier`] is wired as the `saml`-scheme verifier via
@@ -99,6 +103,10 @@ use base64::Engine as _;
 const DS_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 /// The SAML 2.0 assertion namespace (`<saml:Assertion>` lives here).
 const SAML_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
+/// The SAML 2.0 protocol namespace (`<samlp:Response>` lives here).
+const SAML_PROTOCOL_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
+/// The bearer subject-confirmation method required by the HTTP POST SSO profile.
+const SAML_BEARER_METHOD: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
 /// The implicit `xml` prefix namespace (RFC: never re-declared / never c14n-emitted).
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -755,6 +763,30 @@ impl SamlConfig {
     }
 }
 
+/// Per-login SP request context. This must come from the server-side authentication transaction,
+/// never from the SAML response itself: it binds the response to the ACS endpoint and the exact
+/// AuthnRequest that initiated this login.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SamlRequestBinding {
+    /// The assertion consumer service URL this login is returning to.
+    pub acs_url: String,
+    /// The server-generated AuthnRequest ID expected in `InResponseTo`.
+    pub request_id: String,
+}
+
+impl SamlRequestBinding {
+    /// Build one request binding from server-held login transaction state.
+    pub fn new(
+        acs_url: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> SamlRequestBinding {
+        SamlRequestBinding {
+            acs_url: acs_url.into(),
+            request_id: request_id.into(),
+        }
+    }
+}
+
 /// The signature method (pinned to SHA-256; SHA-1 is rejected at parse of the `SignatureMethod`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SigMethod {
@@ -838,24 +870,26 @@ fn b64_decode_ws(s: &str) -> Result<Vec<u8>, AuthzError> {
 pub struct SamlVerifier {
     config: SamlConfig,
     replay: ReplayGuard,
+    request_binding: Option<SamlRequestBinding>,
     now: NowFn,
 }
 
 impl SamlVerifier {
-    /// Build the verifier over an SP config (with the injected trust anchors), a fresh replay guard,
+    /// Build the verifier over an SP config (with injected trust anchors), an explicit replay guard,
     /// and the system clock. Wire it as the `saml`-scheme verifier via
     /// `SchemeDispatchVerifier::route(scheme::SAML, …)`.
-    pub fn new(config: SamlConfig) -> SamlVerifier {
+    pub fn new(config: SamlConfig, replay: ReplayGuard) -> SamlVerifier {
         SamlVerifier {
             config,
-            replay: ReplayGuard::new(),
+            replay,
+            request_binding: None,
             now: Arc::new(system_now),
         }
     }
 
-    /// Build over an EXPLICIT shared [`ReplayGuard`] (so several verifier handles share one seen-set).
-    pub fn with_replay_guard(mut self, replay: ReplayGuard) -> SamlVerifier {
-        self.replay = replay;
+    /// Bind verification to the server-side login transaction that issued the AuthnRequest.
+    pub fn with_request_binding(mut self, binding: SamlRequestBinding) -> SamlVerifier {
+        self.request_binding = Some(binding);
         self
     }
 
@@ -865,7 +899,7 @@ impl SamlVerifier {
         self
     }
 
-    /// The shared replay guard (so a caller can pre-seed / inspect the seen-set).
+    /// The configured replay guard, which can be cloned into another verifier handle.
     pub fn replay_guard(&self) -> &ReplayGuard {
         &self.replay
     }
@@ -893,10 +927,30 @@ impl CredentialVerifier for SamlVerifier {
                 credential.scheme
             )));
         }
+        let request_binding = self.request_binding.as_ref().ok_or_else(|| {
+            refuse(
+                "SAML request binding is absent — verification requires the server-held ACS URL \
+                 and AuthnRequest ID",
+            )
+        })?;
+        if request_binding.acs_url.trim().is_empty() || request_binding.request_id.trim().is_empty() {
+            return Err(refuse(
+                "SAML request binding has an empty ACS URL or AuthnRequest ID",
+            ));
+        }
 
         // (1) PARSE — TOTAL over attacker bytes; DTD/entity/comment/PI refused (XXE / comment-inj).
         let root = parse_xml(credential.material.trim())?;
         let base = base_scope();
+        let mut root_scope = base.clone();
+        for (prefix, uri) in &root.ns_decls {
+            root_scope.insert(prefix.clone(), uri.clone());
+        }
+        if resolve(&root_scope, &root.prefix) != SAML_PROTOCOL_NS || root.local != "Response" {
+            return Err(refuse(
+                "SAML credential root is not a <samlp:Response> protocol element",
+            ));
+        }
 
         // (2) XSW — at most ONE Assertion in the whole document. A forged sibling/wrapped/relocated
         //     assertion (the classic XSW shapes) means >1 here → refuse before any crypto.
@@ -1161,7 +1215,7 @@ impl CredentialVerifier for SamlVerifier {
         //      must list this SP. (Schema position: Conditions is a direct child of the assertion.)
         let now = self.now();
         let leeway = self.config.leeway_secs;
-        if let Some(conditions) =
+        let assertion_expiry = if let Some(conditions) =
             child_named(assertion, &assertion_inherited, SAML_NS, "Conditions")
         {
             let cond_scope = {
@@ -1183,17 +1237,16 @@ impl CredentialVerifier for SamlVerifier {
                     )));
                 }
             }
-            if let Some(na) = conditions
+            let na = conditions
                 .attrs
                 .iter()
                 .find(|a| a.prefix.is_empty() && a.local == "NotOnOrAfter")
-            {
-                let na = SamlVerifier::instant(&na.value)?;
-                if na.saturating_add(leeway) <= now {
-                    return Err(refuse(format!(
-                        "assertion expired: NotOnOrAfter instant {na} (+{leeway}s) <= now {now}"
-                    )));
-                }
+                .ok_or_else(|| refuse("signed assertion Conditions has no NotOnOrAfter"))?;
+            let na = SamlVerifier::instant(&na.value)?;
+            if na.saturating_add(leeway) <= now {
+                return Err(refuse(format!(
+                    "assertion expired: NotOnOrAfter instant {na} (+{leeway}s) <= now {now}"
+                )));
             }
             // AudienceRestriction/Audience — at least one Audience must equal this SP.
             let mut audiences: Vec<String> = Vec::new();
@@ -1221,11 +1274,12 @@ impl CredentialVerifier for SamlVerifier {
                      assertion was issued for this SP)",
                 ));
             }
+            na
         } else {
             return Err(refuse(
                 "signed assertion has no <saml:Conditions> (cannot validate validity window / audience)",
             ));
-        }
+        };
 
         // (11) Subject / NameID — the subject key. Schema position: Subject is a direct child of the
         //      assertion, NameID a direct child of Subject. (No comment can split the NameID text —
@@ -1272,15 +1326,108 @@ impl CredentialVerifier for SamlVerifier {
                 ))
             })?;
 
-        // (13) REPLAY — consume the assertion ID once. A replayed assertion (same ID) is refused. Done
-        //      LAST so a refused (invalid) assertion does not burn the ID.
-        if !self.replay.consume(ref_id) {
-            return Err(refuse(format!(
-                "replayed SAML assertion: ID `{ref_id}` was already presented (replay defence)"
-            )));
+        // (13) REQUEST/ACS BINDING. The outer Response routing fields are checked for protocol
+        // correctness, then the same values are required inside the SIGNED bearer
+        // SubjectConfirmationData. The signed copy is load-bearing: an attacker cannot redirect a
+        // captured assertion to another ACS or attach it to another AuthnRequest.
+        let response_attr = |name: &str| {
+            root.attrs
+                .iter()
+                .find(|attr| attr.prefix.is_empty() && attr.local == name)
+                .map(|attr| attr.value.as_str())
+        };
+        if response_attr("Destination") != Some(request_binding.acs_url.as_str()) {
+            return Err(refuse(
+                "SAML Response Destination does not match this login's ACS URL",
+            ));
+        }
+        if response_attr("InResponseTo") != Some(request_binding.request_id.as_str()) {
+            return Err(refuse(
+                "SAML Response InResponseTo does not match the issued AuthnRequest",
+            ));
         }
 
-        // (14) THE TRUST-ROOTED ASSERTION — tenant/region/subject from the verified SIGNED assertion.
+        let confirmations = children_named(subject, &subject_scope, SAML_NS, "SubjectConfirmation");
+        let bearer_confirmations: Vec<&Element> = confirmations
+            .into_iter()
+            .filter(|confirmation| {
+                confirmation
+                    .attrs
+                    .iter()
+                    .find(|attr| attr.prefix.is_empty() && attr.local == "Method")
+                    .is_some_and(|attr| attr.value == SAML_BEARER_METHOD)
+            })
+            .collect();
+        if bearer_confirmations.len() != 1 {
+            return Err(refuse(format!(
+                "signed assertion must contain exactly one bearer SubjectConfirmation, found {}",
+                bearer_confirmations.len()
+            )));
+        }
+        let confirmation = bearer_confirmations[0];
+        let mut confirmation_scope = subject_scope.clone();
+        for (prefix, uri) in &subject.ns_decls {
+            confirmation_scope.insert(prefix.clone(), uri.clone());
+        }
+        let confirmation_data = child_named(
+            confirmation,
+            &confirmation_scope,
+            SAML_NS,
+            "SubjectConfirmationData",
+        )
+        .ok_or_else(|| refuse("signed bearer SubjectConfirmation has no SubjectConfirmationData"))?;
+        let confirmation_attr = |name: &str| {
+            confirmation_data
+                .attrs
+                .iter()
+                .find(|attr| attr.prefix.is_empty() && attr.local == name)
+                .map(|attr| attr.value.as_str())
+        };
+        if confirmation_attr("Recipient") != Some(request_binding.acs_url.as_str()) {
+            return Err(refuse(
+                "signed SubjectConfirmationData Recipient does not match this login's ACS URL",
+            ));
+        }
+        if confirmation_attr("InResponseTo") != Some(request_binding.request_id.as_str()) {
+            return Err(refuse(
+                "signed SubjectConfirmationData InResponseTo does not match the issued AuthnRequest",
+            ));
+        }
+        let confirmation_expiry = confirmation_attr("NotOnOrAfter")
+            .ok_or_else(|| refuse("signed SubjectConfirmationData has no NotOnOrAfter"))?;
+        let confirmation_expiry = SamlVerifier::instant(confirmation_expiry)?;
+        if confirmation_expiry.saturating_add(leeway) <= now {
+            return Err(refuse(
+                "signed SubjectConfirmationData is expired for this ACS delivery",
+            ));
+        }
+
+        // (14) REPLAY — consume the assertion ID through the tenant-scoped TTL backend. Done LAST so
+        //      a refused assertion does not burn the ID; retention ends with the earlier signed
+        //      assertion or bearer-confirmation window.
+        let replay_namespace = serde_json::json!([
+            "saml",
+            self.config.issuer,
+            self.config.sp_entity_id,
+            region,
+            request_binding.acs_url
+        ])
+        .to_string();
+        if !self.replay.consume_scoped(
+            &tenant,
+            &replay_namespace,
+            ref_id,
+            assertion_expiry
+                .min(confirmation_expiry)
+                .saturating_add(leeway),
+            now,
+        )? {
+            return Err(refuse(
+                "replayed SAML assertion: its signed ID was already presented (replay defence)",
+            ));
+        }
+
+        // (15) THE TRUST-ROOTED ASSERTION — tenant/region/subject from the verified SIGNED assertion.
         Ok(VerifiedAssertion {
             tenant: TenantId(tenant),
             region: Region(region),
@@ -1351,6 +1498,8 @@ mod tests {
     const NA: &str = "2023-11-15T20:00:00Z"; // ≈ NOW + a day
     const ISSUER: &str = "https://idp.example.com/saml";
     const SP: &str = "https://myelin.example.com/sp";
+    const ACS: &str = "https://myelin.example.com/v1/auth/saml/acs";
+    const REQUEST_ID: &str = "_authn_request_1";
 
     // ── Test IdP keypairs (the verifier only ever sees the PUBLIC half via the injected trust anchor) ──
 
@@ -1431,6 +1580,42 @@ mod tests {
         sig_method_uri: &str,
         sign: &dyn Fn(&[u8]) -> Vec<u8>,
     ) -> String {
+        build_doc_for_binding(
+            assertion_id,
+            issuer,
+            nameid,
+            tenant,
+            region,
+            not_before,
+            not_on_or_after,
+            audience,
+            ACS,
+            REQUEST_ID,
+            sig_method_uri,
+            sign,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_doc_for_binding(
+        assertion_id: &str,
+        issuer: &str,
+        nameid: &str,
+        tenant: &str,
+        region: &str,
+        not_before: &str,
+        not_on_or_after: &str,
+        audience: &str,
+        acs_url: &str,
+        request_id_value: &str,
+        sig_method_uri: &str,
+        sign: &dyn Fn(&[u8]) -> Vec<u8>,
+    ) -> String {
+        let not_on_or_after_attr = if not_on_or_after.is_empty() {
+            String::new()
+        } else {
+            format!(" NotOnOrAfter=\"{not_on_or_after}\"")
+        };
         let signed_info = format!(
             "<ds:SignedInfo xmlns:ds=\"{ds}\">\
              <ds:CanonicalizationMethod Algorithm=\"{exc}\"></ds:CanonicalizationMethod>\
@@ -1464,8 +1649,12 @@ mod tests {
             "<saml:Assertion xmlns:saml=\"{s}\" ID=\"{id}\" Version=\"2.0\" IssueInstant=\"{nb}\">\
              <saml:Issuer>{issuer}</saml:Issuer>\
              {sig}\
-             <saml:Subject><saml:NameID>{nameid}</saml:NameID></saml:Subject>\
-             <saml:Conditions NotBefore=\"{nb}\" NotOnOrAfter=\"{na}\">\
+             <saml:Subject><saml:NameID>{nameid}</saml:NameID>\
+             <saml:SubjectConfirmation Method=\"{bearer}\">\
+             <saml:SubjectConfirmationData Recipient=\"{acs}\" InResponseTo=\"{request_id}\"\
+             {na_attr}></saml:SubjectConfirmationData>\
+             </saml:SubjectConfirmation></saml:Subject>\
+             <saml:Conditions NotBefore=\"{nb}\"{na_attr}>\
              <saml:AudienceRestriction><saml:Audience>{aud}</saml:Audience></saml:AudienceRestriction>\
              </saml:Conditions>\
              <saml:AttributeStatement>\
@@ -1479,15 +1668,21 @@ mod tests {
             issuer = issuer,
             sig = signature,
             nameid = nameid,
-            na = not_on_or_after,
+            bearer = SAML_BEARER_METHOD,
+            acs = acs_url,
+            request_id = request_id_value,
+            na_attr = not_on_or_after_attr,
             aud = audience,
             tenant = tenant,
             region = region,
         );
         let doc = format!(
             "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" ID=\"_resp1\" \
-             Version=\"2.0\" IssueInstant=\"{nb}\">{assertion}</samlp:Response>",
+             Version=\"2.0\" IssueInstant=\"{nb}\" Destination=\"{acs}\" \
+             InResponseTo=\"{request_id}\">{assertion}</samlp:Response>",
             nb = not_before,
+            acs = acs_url,
+            request_id = request_id_value,
             assertion = assertion,
         );
         finalize(doc, sign)
@@ -1532,7 +1727,9 @@ mod tests {
     }
 
     fn verifier(anchors: Vec<JwkKey>) -> SamlVerifier {
-        SamlVerifier::new(config(anchors)).with_clock(|| NOW)
+        SamlVerifier::new(config(anchors), ReplayGuard::new())
+            .with_request_binding(SamlRequestBinding::new(ACS, REQUEST_ID))
+            .with_clock(|| NOW)
     }
 
     /// A standard, correctly-signed RSA-SHA256 document for tenant `acme` / region `eu-west` / NameID
@@ -1599,11 +1796,16 @@ mod tests {
     fn positive_region_falls_back_to_configured_idp_binding() {
         // An assertion carrying NO region attribute resolves region from the configured IdP binding.
         let signer = RsaSigner::generate();
-        let v = SamlVerifier::new(config(vec![signer.jwk()]).with_region_default("ap-south"))
+        let v = SamlVerifier::new(
+            config(vec![signer.jwk()]).with_region_default("ap-south"),
+            ReplayGuard::new(),
+        )
+            .with_request_binding(SamlRequestBinding::new(ACS, REQUEST_ID))
             .with_clock(|| NOW);
         let raw = format!(
             "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" ID=\"_resp2\" \
-             Version=\"2.0\" IssueInstant=\"{NB}\">\
+             Version=\"2.0\" IssueInstant=\"{NB}\" Destination=\"{ACS}\" \
+             InResponseTo=\"{REQUEST_ID}\">\
              <saml:Assertion xmlns:saml=\"{SAML_NS}\" ID=\"_rgn_2\" Version=\"2.0\" IssueInstant=\"{NB}\">\
              <saml:Issuer>{ISSUER}</saml:Issuer>\
              <ds:Signature xmlns:ds=\"{DS_NS}\">\
@@ -1616,7 +1818,11 @@ mod tests {
              <ds:DigestMethod Algorithm=\"{SHA256_DIGEST}\"></ds:DigestMethod>\
              <ds:DigestValue>@@DIGEST@@</ds:DigestValue></ds:Reference></ds:SignedInfo>\
              <ds:SignatureValue>@@SIG@@</ds:SignatureValue></ds:Signature>\
-             <saml:Subject><saml:NameID>carol@acme.example</saml:NameID></saml:Subject>\
+             <saml:Subject><saml:NameID>carol@acme.example</saml:NameID>\
+             <saml:SubjectConfirmation Method=\"{SAML_BEARER_METHOD}\">\
+             <saml:SubjectConfirmationData Recipient=\"{ACS}\" InResponseTo=\"{REQUEST_ID}\" \
+             NotOnOrAfter=\"{NA}\"></saml:SubjectConfirmationData>\
+             </saml:SubjectConfirmation></saml:Subject>\
              <saml:Conditions NotBefore=\"{NB}\" NotOnOrAfter=\"{NA}\">\
              <saml:AudienceRestriction><saml:Audience>{SP}</saml:Audience></saml:AudienceRestriction>\
              </saml:Conditions>\
@@ -1634,6 +1840,102 @@ mod tests {
             "region from the configured IdP binding"
         );
         assert_eq!(a.tenant, TenantId("acme".into()));
+    }
+
+    #[test]
+    fn verifier_without_server_request_binding_fails_closed() {
+        let signer = RsaSigner::generate();
+        let verifier = SamlVerifier::new(config(vec![signer.jwk()]), ReplayGuard::new())
+            .with_clock(|| NOW);
+        let doc = build_doc(
+            "_missing_binding",
+            ISSUER,
+            "alice@acme.example",
+            "acme",
+            "eu-west",
+            NB,
+            NA,
+            SP,
+            RSA_SHA256,
+            &|message| signer.sign(message),
+        );
+        let error = verifier.verify(&cred(doc)).unwrap_err();
+        assert!(
+            matches!(&error, AuthzError::FailClosed(message) if message.contains("request binding")),
+            "a verifier without server-held request state must fail closed, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn response_destination_must_match_the_bound_acs() {
+        let (verifier, doc) = rsa_signed("_wrong_destination");
+        let attack = doc.replacen(
+            &format!("Destination=\"{ACS}\""),
+            "Destination=\"https://evil.example/acs\"",
+            1,
+        );
+        let error = verifier.verify(&cred(attack)).unwrap_err();
+        assert!(
+            matches!(&error, AuthzError::FailClosed(message) if message.contains("Destination")),
+            "a response routed to another ACS must be refused, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn signed_recipient_and_request_id_must_match_the_login_transaction() {
+        let signer = RsaSigner::generate();
+        let verifier = verifier(vec![signer.jwk()]);
+        let wrong_acs = "https://evil.example/acs";
+        let wrong_recipient = build_doc_for_binding(
+            "_wrong_recipient",
+            ISSUER,
+            "alice@acme.example",
+            "acme",
+            "eu-west",
+            NB,
+            NA,
+            SP,
+            wrong_acs,
+            REQUEST_ID,
+            RSA_SHA256,
+            &|message| signer.sign(message),
+        )
+        .replacen(
+            &format!("Destination=\"{wrong_acs}\""),
+            &format!("Destination=\"{ACS}\""),
+            1,
+        );
+        let error = verifier.verify(&cred(wrong_recipient)).unwrap_err();
+        assert!(
+            matches!(&error, AuthzError::FailClosed(message) if message.contains("Recipient")),
+            "a signed recipient for another ACS must be refused, got {error:?}"
+        );
+
+        let wrong_request_id = "_other_authn_request";
+        let wrong_response = build_doc_for_binding(
+            "_wrong_request",
+            ISSUER,
+            "alice@acme.example",
+            "acme",
+            "eu-west",
+            NB,
+            NA,
+            SP,
+            ACS,
+            wrong_request_id,
+            RSA_SHA256,
+            &|message| signer.sign(message),
+        )
+        .replacen(
+            &format!("InResponseTo=\"{wrong_request_id}\""),
+            &format!("InResponseTo=\"{REQUEST_ID}\""),
+            1,
+        );
+        let error = verifier.verify(&cred(wrong_response)).unwrap_err();
+        assert!(
+            matches!(&error, AuthzError::FailClosed(message) if message.contains("SubjectConfirmationData InResponseTo")),
+            "a signed response tied to another AuthnRequest must be refused, got {error:?}"
+        );
     }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1887,6 +2189,31 @@ mod tests {
         assert!(
             matches!(&err, AuthzError::FailClosed(m) if m.contains("expired")),
             "an expired assertion must be refused, got {err:?}"
+        );
+    }
+
+    /// UNBOUNDED — a signed assertion without a finite expiry cannot have safely bounded replay
+    /// retention, so it is refused.
+    #[test]
+    fn assertion_without_not_on_or_after_is_rejected() {
+        let signer = RsaSigner::generate();
+        let v = verifier(vec![signer.jwk()]);
+        let doc = build_doc(
+            "_assertion_without_expiry",
+            ISSUER,
+            "alice@acme.example",
+            "acme",
+            "eu-west",
+            NB,
+            "",
+            SP,
+            RSA_SHA256,
+            &|m| signer.sign(m),
+        );
+        let err = v.verify(&cred(doc)).unwrap_err();
+        assert!(
+            matches!(&err, AuthzError::FailClosed(m) if m.contains("Conditions has no NotOnOrAfter")),
+            "an assertion without a finite expiry must be refused, got {err:?}"
         );
     }
 
@@ -2161,12 +2488,12 @@ mod tests {
     fn shared_replay_guard_blocks_cross_handle_replay() {
         let signer = RsaSigner::generate();
         let guard = ReplayGuard::new();
-        let v1 = SamlVerifier::new(config(vec![signer.jwk()]))
-            .with_clock(|| NOW)
-            .with_replay_guard(guard.clone());
-        let v2 = SamlVerifier::new(config(vec![signer.jwk()]))
-            .with_clock(|| NOW)
-            .with_replay_guard(guard);
+        let v1 = SamlVerifier::new(config(vec![signer.jwk()]), guard.clone())
+            .with_request_binding(SamlRequestBinding::new(ACS, REQUEST_ID))
+            .with_clock(|| NOW);
+        let v2 = SamlVerifier::new(config(vec![signer.jwk()]), guard)
+            .with_request_binding(SamlRequestBinding::new(ACS, REQUEST_ID))
+            .with_clock(|| NOW);
         let doc = build_doc(
             "_assertion_shared",
             ISSUER,
