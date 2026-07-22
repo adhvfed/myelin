@@ -782,7 +782,13 @@ impl CapabilityAuthenticator {
         //     only into A's partition.
         let row = self
             .store
-            .resolve_credential(&scope, credential.scheme.as_str(), &token.subject_key)
+            .try_resolve_credential(&scope, credential.scheme.as_str(), &token.subject_key)
+            .map_err(|e| {
+                AuthzError::FailClosed(format!(
+                    "identity directory lookup failed for verified `{}` token — fail-closed: {e}",
+                    credential.scheme
+                ))
+            })?
             .ok_or_else(|| {
                 AuthzError::FailClosed(format!(
                     "no `{}` token record for the verified subject in tenant `{}` (unknown token — \
