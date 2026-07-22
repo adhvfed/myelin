@@ -84,6 +84,9 @@ use myelin_tenancy::TenantId;
 
 use crate::blob::{BlobError, BlobStore, ContentHash};
 
+/// Maximum CI cache artifact materialized by one namespace read.
+pub const CI_CACHE_MAX_ARTIFACT_BYTES: usize = 512 * 1024 * 1024;
+
 /// **The CI-stamped trust tier of a run (the INPUT, never recomputed here).** CI stamps a run's
 /// trust tier from its provenance (a PR from a fork → [`TrustTier::UntrustedFork`]; everything else
 /// → [`TrustTier::Trusted`]); Storage reads it off the fact and ENFORCES the write-scope rule. This
@@ -339,13 +342,25 @@ impl<'b> CiCacheNamespace<'b> {
     /// confinement is on the WRITE side — a fork's write is INVISIBLE in the trusted scope because it
     /// never landed there.
     pub fn get(&self, scope: &CacheScope, name: &str) -> Result<Vec<u8>, CacheScopeError> {
+        self.get_bounded(scope, name, CI_CACHE_MAX_ARTIFACT_BYTES)
+    }
+
+    /// Read a cache entry under a caller-selected byte ceiling, checking blob metadata before fetch.
+    pub fn get_bounded(
+        &self,
+        scope: &CacheScope,
+        name: &str,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, CacheScopeError> {
         let key = self.scope_key(scope, name);
         let hash = {
             let index = self.index.lock().expect("ci cache index mutex");
             index.get(&key).cloned()
         };
         match hash {
-            Some(h) => Ok(self.base.get(&self.tenant, &h)?),
+            Some(h) => Ok(self
+                .base
+                .get_bounded(&self.tenant, &h, maximum_bytes)?),
             None => Err(CacheScopeError::Miss {
                 scope: scope.segment(),
                 name: name.to_string(),
@@ -429,6 +444,16 @@ mod tests {
             .get(&scope, "build-cache")
             .expect("read own fork cache");
         assert_eq!(got, b"fork-bytes");
+        assert_eq!(
+            cache
+                .get_bounded(&scope, "build-cache", b"fork-bytes".len())
+                .expect("exact read limit accepted"),
+            b"fork-bytes"
+        );
+        assert!(matches!(
+            cache.get_bounded(&scope, "build-cache", b"fork-bytes".len() - 1),
+            Err(CacheScopeError::Blob(BlobError::ReadLimitExceeded { .. }))
+        ));
         // Sanity: the stored content-address is the BLAKE3 of the bytes.
         assert_eq!(hash, ContentHash::blake3(b"fork-bytes"));
     }

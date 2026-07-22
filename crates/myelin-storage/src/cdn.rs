@@ -72,6 +72,9 @@ use myelin_tenancy::{Region, TenantId};
 use crate::blob::{BlobStore, ContentHash};
 use crate::residency::{ResidencyStoreClass, StoreResidencyReport};
 
+/// Maximum clone/bundle body materialized by the CDN class in one read.
+pub const CDN_MAX_BUNDLE_BYTES: usize = 512 * 1024 * 1024;
+
 /// **A candidate CDN edge POP (point of presence).** PII-free: an opaque POP id, the POP's region,
 /// and whether that POP is within-EU. Storage does NOT author the geography — `within_eu` is an
 /// INPUT sourced from the control-plane region registry (the same source the tenant's EU status
@@ -198,7 +201,17 @@ impl<'a> CdnCloneClass<'a> {
     /// serve floor) — so a served bundle is provably the exact requested content. An edge cache over
     /// this is a pure content-address cache: a cache entry is valid iff its hash matches.
     pub fn bundle(&self, hash: &ContentHash) -> Result<Vec<u8>, crate::blob::BlobError> {
-        self.base.get(&self.tenant, hash)
+        self.bundle_bounded(hash, CDN_MAX_BUNDLE_BYTES)
+    }
+
+    /// Serve a bundle under a caller-selected byte ceiling, checking metadata before body fetch.
+    pub fn bundle_bounded(
+        &self,
+        hash: &ContentHash,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, crate::blob::BlobError> {
+        self.base
+            .get_bounded(&self.tenant, hash, maximum_bytes)
     }
 
     /// **The eligible within-EU edge set for THIS tenant** over a candidate POP set — for an EU
@@ -263,6 +276,15 @@ mod tests {
             served, bundle_bytes,
             "the served bundle is the exact requested content"
         );
+        assert_eq!(
+            cdn.bundle_bounded(&addr, bundle_bytes.len())
+                .expect("exact read limit accepted"),
+            bundle_bytes
+        );
+        assert!(matches!(
+            cdn.bundle_bounded(&addr, bundle_bytes.len() - 1),
+            Err(crate::blob::BlobError::ReadLimitExceeded { .. })
+        ));
 
         // A tampered bundle is REFUSED (the content-address is the validity check — no staleness).
         assert!(

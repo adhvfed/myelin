@@ -235,6 +235,13 @@ pub enum BlobError {
     /// A backing service could not perform the requested operation. The class is payload-free:
     /// SDK details, credentials, endpoints, buckets, and keys never cross this seam.
     Backend(BlobDependencyError),
+    /// A read was refused because its stored or plaintext byte length exceeded a caller ceiling.
+    ReadLimitExceeded {
+        /// The observed byte length.
+        actual: usize,
+        /// The caller's maximum byte allowance.
+        maximum: usize,
+    },
     /// A content-address string was not `<algo>:<hex>`.
     MalformedAddress(String),
     /// A content-address string carried an algorithm tag this store does not know.
@@ -283,6 +290,10 @@ impl std::fmt::Display for BlobError {
                 actual.to_multihash_string()
             ),
             BlobError::Backend(kind) => kind.fmt(f),
+            BlobError::ReadLimitExceeded { actual, maximum } => write!(
+                f,
+                "blob read refused: {actual} bytes exceeds the {maximum}-byte limit"
+            ),
             BlobError::MalformedAddress(s) => write!(f, "malformed content address: {s}"),
             BlobError::UnknownAlgo(t) => write!(f, "unknown hash algorithm tag: {t}"),
             BlobError::AlgoNotVerifiable(a) => {
@@ -320,6 +331,32 @@ pub trait BlobStore {
     /// and refuse to serve on a content-address mismatch ([`BlobError::IntegrityFail`], 0
     /// silent serve). Returns the exact plaintext bytes on a verified read.
     fn get(&self, tenant: &TenantId, hash: &ContentHash) -> Result<Vec<u8>>;
+
+    /// Read only when both stored metadata and returned plaintext fit `maximum_bytes`. The metadata
+    /// check rejects normal oversized objects before [`Self::get`] can materialize them; the
+    /// post-read check also protects callers from custom wrapping layers whose plaintext expands.
+    fn get_bounded(
+        &self,
+        tenant: &TenantId,
+        hash: &ContentHash,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let metadata = self.head(tenant, hash)?;
+        if metadata.stored_len > maximum_bytes {
+            return Err(BlobError::ReadLimitExceeded {
+                actual: metadata.stored_len,
+                maximum: maximum_bytes,
+            });
+        }
+        let bytes = self.get(tenant, hash)?;
+        if bytes.len() > maximum_bytes {
+            return Err(BlobError::ReadLimitExceeded {
+                actual: bytes.len(),
+                maximum: maximum_bytes,
+            });
+        }
+        Ok(bytes)
+    }
 
     /// Return the [`BlobMeta`] for a stored blob without serving the bytes.
     fn head(&self, tenant: &TenantId, hash: &ContentHash) -> Result<BlobMeta>;
@@ -609,6 +646,28 @@ mod tests {
 
         let got = store.get(&acme, &h).expect("get round-trips");
         assert_eq!(got, bytes, "get must return the exact bytes put");
+    }
+
+    #[test]
+    fn bounded_get_accepts_exact_length_and_rejects_one_over_before_read() {
+        let store = FsBlobStore::new();
+        let acme = tenant("acme");
+        let bytes = b"bounded";
+        let hash = store.put(&acme, bytes).expect("put");
+
+        assert_eq!(
+            store
+                .get_bounded(&acme, &hash, bytes.len())
+                .expect("exact limit accepted"),
+            bytes
+        );
+        assert_eq!(
+            store.get_bounded(&acme, &hash, bytes.len() - 1),
+            Err(BlobError::ReadLimitExceeded {
+                actual: bytes.len(),
+                maximum: bytes.len() - 1,
+            })
+        );
     }
 
     /// The multihash prefix is self-describing and parses round-trip — the property that lets
