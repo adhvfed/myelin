@@ -70,6 +70,8 @@ jobs:
           --health-retries 20
     env:
       REDIS_URL: redis://127.0.0.1:6379
+      # Deterministic test-only key; deployments inject 32 random bytes from their secret manager.
+      MYELIN_WEB_SESSION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install pnpm
@@ -117,6 +119,7 @@ jobs:
         run: |
           if docker run --rm \
             --env REDIS_URL=rediss://127.0.0.1:1 \
+            --env MYELIN_WEB_SESSION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \
             --env MYELIN_PUBLIC_ORIGIN=https://myelin.example \
             "$IMAGE"; then
             echo "production image started without MYELIN_EDGE_URL" >&2
@@ -132,6 +135,7 @@ jobs:
             --security-opt no-new-privileges:true \
             --publish 127.0.0.1:3000:3000 \
             --env REDIS_URL=rediss://127.0.0.1:1 \
+            --env MYELIN_WEB_SESSION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \
             --env MYELIN_PUBLIC_ORIGIN=https://myelin.example \
             --env MYELIN_EDGE_URL=http://edge.internal:8080 \
             --env MYELIN_HSTS=1 \

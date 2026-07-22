@@ -29,7 +29,11 @@ const globalStore = globalThis as unknown as {
   __myelinSessionStore?: SessionStore;
 };
 const store = (globalStore.__myelinSessionStore ??= createSessionStore(
-  sessionBackend(import.meta.env.PROD, process.env.REDIS_URL),
+  sessionBackend(
+    import.meta.env.PROD,
+    process.env.REDIS_URL,
+    process.env.MYELIN_WEB_SESSION_KEY,
+  ),
 ));
 
 /** Generate an opaque, unguessable session id (CSPRNG — the production-grade id the Rust model flagged). */
