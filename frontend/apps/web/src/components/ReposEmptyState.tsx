@@ -84,6 +84,9 @@ export function ReposEmptyState(props: { tenant: string }) {
   const pushCmd = "git push -u myelin main";
 
   const refresh = () => void revalidate(getRepos.key);
+  const [liveStatus, setLiveStatus] = createSignal<"connecting" | "connected" | "unavailable">(
+    "connecting",
+  );
 
   // The checklist is dismissable (OQ-2: KEEP with dismiss); persisted client-side.
   const [dismissed, setDismissed] = createSignal(false);
@@ -108,18 +111,20 @@ export function ReposEmptyState(props: { tenant: string }) {
     let es: EventSource | undefined;
     try {
       es = new EventSource("/api/git/events");
+      es.onopen = () => setLiveStatus("connected");
       const onRepo = () => refresh();
       es.addEventListener("repo.created", onRepo);
       es.addEventListener("repo.pushed", onRepo);
       // A transport failure can mean the bounded edge stream shed us after an event gap. Refresh the
       // authoritative snapshot once, then close rather than silently staying stale or reconnect-looping.
       es.onerror = () => {
+        setLiveStatus("unavailable");
         refresh();
         es?.close();
       };
       onCleanup(() => es?.close());
     } catch {
-      /* EventSource unsupported — manual Refresh remains. */
+      setLiveStatus("unavailable");
     }
   });
 
@@ -169,8 +174,28 @@ export function ReposEmptyState(props: { tenant: string }) {
           role="status"
           style={{ display: "flex", "align-items": "center", gap: "var(--space-2)", "flex-wrap": "wrap", "border-block-start": "var(--hairline) solid var(--border)", "padding-block-start": "var(--space-3)" }}
         >
-          <span aria-hidden="true" style={{ width: "0.5rem", height: "0.5rem", "border-radius": "var(--radius-pill)", background: "var(--accent)", flex: "none" }} />
-          <span style={{ "font-weight": "500" }} lang="de">Warte auf deinen ersten Push …</span>
+          <span
+            aria-hidden="true"
+            style={{
+              width: "0.5rem",
+              height: "0.5rem",
+              "border-radius": "var(--radius-pill)",
+              background:
+                liveStatus() === "connected"
+                  ? "var(--accent)"
+                  : liveStatus() === "unavailable"
+                    ? "var(--warning)"
+                    : "var(--text-subtle)",
+              flex: "none",
+            }}
+          />
+          <span style={{ "font-weight": "500" }}>
+            {liveStatus() === "connected"
+              ? "Waiting for your first push…"
+              : liveStatus() === "unavailable"
+                ? "Live updates are unavailable."
+                : "Connecting to live updates…"}
+          </span>
           <button
             type="button"
             data-testid="repos-refresh"
@@ -180,7 +205,11 @@ export function ReposEmptyState(props: { tenant: string }) {
             <Icon name="search" /> Refresh
           </button>
           <span style={{ flex: "1 1 100%", color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>
-            This list updates on its own the moment your push lands — you don't need to reload.
+            {liveStatus() === "connected"
+              ? "This list will update when your push lands. Refresh remains available at any time."
+              : liveStatus() === "unavailable"
+                ? "Use Refresh to check whether your push has landed."
+                : "Refresh is available while the live connection starts."}
           </span>
         </div>
       </section>
