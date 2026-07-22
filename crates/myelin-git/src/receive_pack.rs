@@ -933,15 +933,17 @@ impl RefStore {
     /// `previous + 1` internally (under the ref's held linearisation lock, so no interleaving move sits
     /// between the read here and the bump). Hence after the apply `ref_generation(ref) == new_seq`, so
     /// the reconciler's `rec.update_seq <= ref_generation` skip is EXACT for an already-applied move.
-    fn seq_of(&self, ref_name: &RefName) -> u64 {
+    fn seq_of(&self, ref_name: &RefName) -> Result<u64, OutboxError> {
         match &self.backing {
-            RefBacking::Memory { rows, .. } => rows
+            RefBacking::Memory { rows, .. } => Ok(rows
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(ref_name)
                 .map(|r| r.update_seq)
-                .unwrap_or(0),
-            RefBacking::Disk { repo } => repo.ref_generation(&ref_name.0),
+                .unwrap_or(0)),
+            RefBacking::Disk { repo } => repo.ref_generation(&ref_name.0).map_err(|e| {
+                OutboxError(format!("read durable ref generation for {}: {e}", ref_name.0))
+            }),
         }
     }
 
@@ -1123,8 +1125,10 @@ impl RefStore {
         let mut planned: Vec<(RefName, Oid, u64, Option<Oid>, myelin_events::EventId)> = Vec::new();
         for u in &push.updates {
             let old = self.tip_of(&u.ref_name);
-            let prev_seq = self.seq_of(&u.ref_name);
-            let new_seq = prev_seq + 1;
+            let prev_seq = self.seq_of(&u.ref_name)?;
+            let new_seq = prev_seq.checked_add(1).ok_or_else(|| {
+                OutboxError(format!("ref generation exhausted for {}", u.ref_name.0))
+            })?;
 
             // The state change (the ref CAS + reflog) — staged into THIS transaction (co-commit).
             tx.stage_state_change(format!(
