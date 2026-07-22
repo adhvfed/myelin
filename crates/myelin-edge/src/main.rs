@@ -32,7 +32,7 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use myelin_config::{Mode, OIDC_JWKS_MAX_BYTES};
 use myelin_edge::{
     bootstrap_principal_and_mint, recover_placed_git_at_boot, register_git_durable,
-    register_git_wire, register_issues, serve_edge_until_shutdown_with_probe,
+    register_git_wire, register_issues, register_notif, serve_edge_until_shutdown_with_probe,
     spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig,
     AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer, DurableGitBackend,
     Gateway, IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, ShutdownOutcome,
@@ -47,6 +47,7 @@ use myelin_identity_service::{
     OidcConfig, PasetoCapabilityVerifier, PrincipalStore, ReplayGuard, RevocationStore,
     StoreBackedCheck, TupleStore,
 };
+use myelin_notif::pg_inbox::PgInboxStore;
 use myelin_storage::{
     all_durable_migrations, seal_key_from_env, DurableCellRootBacking, DurableKmsBacking,
     DurablePrincipalBacking, DurableReplayBacking, DurableRevocationBacking, DurableTupleBacking,
@@ -572,6 +573,23 @@ async fn compose_core(cell_id: String) -> ComposedCore {
         eprintln!("edge: cannot apply the Issues authorization-saga migrations: {e}");
         std::process::exit(1);
     }
+    // The authenticated notification read route is served by Edge over the same OLTP database as
+    // the Notif writer. Apply the subsystem-owned schema here before destroying the privileged pool;
+    // startup must not depend on another deployable having happened to migrate first.
+    if let Err(e) = bootstrap
+        .migrate(&myelin_notif::migrations::migrations(), &HotTables::none())
+        .await
+    {
+        eprintln!("edge: cannot apply the notification inbox migrations: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = bootstrap
+        .verify_index_ready("notif_inbox_recipient_keyset")
+        .await
+    {
+        eprintln!("edge: notification inbox keyset index is not ready: {e}");
+        std::process::exit(1);
+    }
     if let Err(e) = bootstrap
         .verify_index_ready(myelin_issues::ISSUE_RECENT_LIST_INDEX)
         .await
@@ -994,6 +1012,12 @@ async fn serve(
         builder,
         issue_store.clone(),
         issue_authorizer,
+        handle.clone(),
+    );
+    builder = register_notif(
+        builder,
+        Arc::new(PgInboxStore::new(provider.db_pool().clone())),
+        check.clone(),
         handle.clone(),
     );
     let gateway = Arc::new(builder.build());

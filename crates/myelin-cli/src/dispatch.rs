@@ -308,11 +308,8 @@ pub fn issues_command_to_call(command: &IssuesCliCommand) -> EdgeCall {
 }
 
 /// **Parse + map a `myelin notif …` invocation** (the args AFTER `notif`/`inbox`). REUSES notif's own
-/// grammar ([`myelin_notif::cli::CliView`] for the `--view` flag + its verb set). Notif is NOT yet
-/// wired through the edge (MR-015 plugged Git first; `/v1/notif/...` routes are a follow-on), so this
-/// validates the command with notif's grammar and returns a HONEST [`CliError::Unsupported`] naming
-/// the gap — it proves the framework dispatches a SECOND subsystem by its own grammar without faking
-/// a call.
+/// grammar ([`myelin_notif::cli::CliView`] for the `--view` flag + its verb set). The durable list
+/// route is live; item detail/read mutation remain honest unsupported floors.
 pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     use myelin_notif::cli::CliView;
     let (verb, rest) = args
@@ -320,14 +317,62 @@ pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
         .ok_or_else(|| CliError::Usage("no notif command (try: list [--view <v>] | show <id> | read <id>)".into()))?;
     match *verb {
         "list" => {
-            // REUSE notif's CliView grammar to validate the --view flag (a typo is rejected loudly,
-            // never silently the ALL inbox — the same property notif's CLI enforces).
-            let view_arg = flag_value(rest, "--view");
-            let view = CliView::parse(view_arg.as_deref()).map_err(CliError::Usage)?;
-            Err(CliError::Unsupported(format!(
-                "notif is not yet wired through the edge (MR-015 plugged git first; /v1/notif routes \
-                 are a follow-on) — parsed `inbox list --view {view:?}` via notif's grammar, deferred"
-            )))
+            let mut view = None;
+            let mut limit = None;
+            let mut cursor = None;
+            let mut index = 0;
+            while index < rest.len() {
+                let flag = rest[index];
+                let value = rest.get(index + 1).ok_or_else(|| {
+                    CliError::Usage(format!("`notif list {flag}` needs a value"))
+                })?;
+                match flag {
+                    "--view" if view.is_none() => view = Some(*value),
+                    "--limit" if limit.is_none() => limit = Some(*value),
+                    "--cursor" if cursor.is_none() => cursor = Some(*value),
+                    "--view" | "--limit" | "--cursor" => {
+                        return Err(CliError::Usage(format!("duplicate notif list flag `{flag}`")))
+                    }
+                    other => {
+                        return Err(CliError::Usage(format!("unknown notif list flag `{other}`")))
+                    }
+                }
+                index += 2;
+            }
+            let view = CliView::parse(view).map_err(CliError::Usage)?;
+            let view_token = match view {
+                CliView::All => "all",
+                CliView::MyWork => "my-work",
+                CliView::Activity => "activity",
+                CliView::ReviewRequests => "review-requests",
+            };
+            let mut query = FormQuery::default();
+            query.push("view", view_token);
+            if let Some(value) = limit {
+                let parsed = value.parse::<u16>().map_err(|_| {
+                    CliError::Usage("--limit must be an integer between 1 and 100".into())
+                })?;
+                if !(1..=100).contains(&parsed) {
+                    return Err(CliError::Usage(
+                        "--limit must be an integer between 1 and 100".into(),
+                    ));
+                }
+                query.push("limit", value);
+            }
+            if let Some(value) = cursor {
+                if value.is_empty() || value.len() > 1_024 {
+                    return Err(CliError::Usage(
+                        "--cursor must be a non-empty bounded inbox cursor".into(),
+                    ));
+                }
+                query.push("cursor", value);
+            }
+            Ok(EdgeCall {
+                method: HttpMethod::Get,
+                path: "/v1/notif/inbox".into(),
+                query: Some(query.finish()),
+                payload: None,
+            })
         }
         "show" | "read" => {
             let _id = rest
@@ -343,12 +388,6 @@ pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
             "unknown notif command `{other}` (try: list | show <id> | read <id>)"
         ))),
     }
-}
-
-/// The value following a `--flag` in an arg slice (e.g. `--view my-work`), or `None`.
-fn flag_value(args: &[&str], flag: &str) -> Option<String> {
-    let idx = args.iter().position(|a| *a == flag)?;
-    args.get(idx + 1).map(|s| s.to_string())
 }
 
 #[cfg(test)]
@@ -478,16 +517,23 @@ mod tests {
         assert!(String::from_utf8(review.payload.unwrap()).unwrap().contains("approve"));
     }
 
-    /// notif REUSES its own grammar (CliView): a valid `--view` parses, an unknown view is rejected
-    /// loudly (Usage), and the wired-call is honestly deferred (Unsupported).
+    /// notif REUSES its own view grammar and maps only recipient-neutral page coordinates.
     #[test]
-    fn notif_reuses_cliview_grammar_and_defers_the_edge_call() {
-        // a valid view parses (via notif's CliView) → the deferral, exit 4.
-        assert_eq!(notif_dispatch(&["list", "--view", "my-work"]).unwrap_err().code(), 4);
-        // an unknown view is rejected by notif's grammar → a clean Usage, exit 2 (never the ALL inbox).
+    fn notif_list_maps_to_the_authenticated_inbox_route() {
+        let call = notif_dispatch(&[
+            "list", "--view", "my-work", "--limit", "25", "--cursor", "ni1_abc",
+        ])
+        .unwrap();
+        assert_eq!(call.method, HttpMethod::Get);
+        assert_eq!(call.path, "/v1/notif/inbox");
+        assert_eq!(call.query.as_deref(), Some("view=my-work&limit=25&cursor=ni1_abc"));
+        assert!(call.payload.is_none());
+        assert_eq!(notif_dispatch(&["list"]).unwrap().query.as_deref(), Some("view=all"));
         assert_eq!(notif_dispatch(&["list", "--view", "everything"]).unwrap_err().code(), 2);
-        // a bad notif verb is Usage.
+        assert_eq!(notif_dispatch(&["list", "--limit", "0"]).unwrap_err().code(), 2);
+        assert_eq!(notif_dispatch(&["list", "--view"]).unwrap_err().code(), 2);
         assert_eq!(notif_dispatch(&["nope"]).unwrap_err().code(), 2);
+        assert_eq!(notif_dispatch(&["show", "item-1"]).unwrap_err().code(), 4);
     }
 
     #[test]

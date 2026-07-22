@@ -17,6 +17,12 @@ fn production_main_destroys_the_privileged_pool_before_runtime_stores_and_bind()
     let issues = source
         .find("&myelin_issues::issues_migrations()")
         .expect("Issues saga schema must run through PgBootstrap");
+    let notif = source
+        .find("&myelin_notif::migrations::migrations()")
+        .expect("notification schema must run through PgBootstrap");
+    let notif_index = source
+        .find("verify_index_ready(\"notif_inbox_recipient_keyset\")")
+        .expect("notification keyset index must be ready before serving");
     let issues_recent_index = source
         .find("verify_index_ready(myelin_issues::ISSUE_RECENT_LIST_INDEX)")
         .expect("Issues recent-list index must be ready before serving");
@@ -41,6 +47,9 @@ fn production_main_destroys_the_privileged_pool_before_runtime_stores_and_bind()
 
     assert!(foundation < durable);
     assert!(durable < issues);
+    assert!(issues < notif);
+    assert!(notif < notif_index);
+    assert!(notif_index < issues_recent_index);
     assert!(issues < issues_recent_index);
     assert!(issues_recent_index < issues_prefix_index);
     assert!(issues_prefix_index < head_index);
@@ -48,6 +57,23 @@ fn production_main_destroys_the_privileged_pool_before_runtime_stores_and_bind()
     assert!(operation_index < handoff);
     assert!(handoff < first_runtime_store);
     assert!(handoff < bind);
+}
+
+#[test]
+fn production_edge_mounts_the_durable_recipient_scoped_notification_read() {
+    let main = include_str!("../src/main.rs");
+    let route = include_str!("../src/notif_http.rs");
+
+    assert!(main.contains("register_notif("));
+    assert!(main.contains("PgInboxStore::new(provider.db_pool().clone())"));
+    assert!(main.contains("check.clone()"));
+    assert!(route.contains("/v1/notif/inbox"));
+    assert!(route.contains("tenant: ctx.principal.tenant.clone()"));
+    assert!(route.contains("region: ctx.principal.region.clone()"));
+    assert!(route.contains("recipient: ctx.principal.principal_id.0.clone()"));
+    assert!(route.contains("can_read_subject"));
+    assert!(!route.contains("query_param(\"tenant\")"));
+    assert!(!route.contains("query_param(\"recipient\")"));
 }
 
 #[test]

@@ -29,6 +29,7 @@ import { parseRepoListPage } from "./repo-list-response";
 import { parseCommitDiff, parseCommitsPage, parsePrCommitsPage } from "./commit-read-response";
 import { parsePr, parsePrDiff, parsePrListPage } from "./pr-read-response";
 import { parseIssueId, parseIssueListInput } from "./issue-read-input";
+import { parseInboxPage, type InboxPage } from "./inbox-response";
 import {
   parseGitBrowseInput,
   parseGitCommitInput,
@@ -542,6 +543,15 @@ async function issueAuthed<T>(fetcher: () => Promise<T>): Promise<T> {
   }
 }
 
+async function inboxAuthed<T>(fetcher: () => Promise<T>): Promise<T> {
+  try {
+    return await fetcher();
+  } catch (e) {
+    if (e instanceof Unauthorized) throw redirect("/login");
+    throw new Error("INBOX_UNAVAILABLE");
+  }
+}
+
 /** Encode a path segment for the edge URL (the gateway matches one segment per `{param}`). */
 function seg(s: string): string {
   return encodeURIComponent(s);
@@ -559,6 +569,16 @@ export const getRepos = query(async (request: GitRepoListInput = {}): Promise<Re
     return page;
   });
 }, "git-repos");
+
+/** The first bounded page of the authenticated viewer's unified inbox. */
+export const getInbox = query(async (): Promise<InboxPage> => {
+  "use server";
+  return inboxAuthed(async () => {
+    const page = parseInboxPage(await edgeGet("/v1/notif/inbox?view=all&limit=50"));
+    if (!page) throw new Error("INBOX_INVALID_RESPONSE");
+    return page;
+  });
+}, "notif-inbox");
 
 /** A single repo's home (GET /v1/git/repos/{repo}) → the RepoHome ViewModel. */
 export const getRepo = query(async (repo: string): Promise<RepoHomeVM> => {

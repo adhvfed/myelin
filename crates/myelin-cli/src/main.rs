@@ -55,7 +55,7 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Notification/inbox commands — REUSES myelin-notif's grammar: `list [--view <v>]` | `show <id>`.
+    /// Notification/inbox commands: `list [--view <v>] [--limit <n>] [--cursor <c>]` | `show <id>`.
     #[command(alias = "inbox")]
     Notif {
         /// The notif subcommand + args, parsed by notif's own grammar.

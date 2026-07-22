@@ -81,6 +81,7 @@ pub mod git_wire_exec;
 pub mod git_wire_http;
 pub mod issue_authz;
 pub mod issues_http;
+pub mod notif_http;
 pub mod repo_authz;
 pub mod repo_authz_live;
 pub mod request;
@@ -133,6 +134,7 @@ pub use issue_authz::{
     IssueReconciliationReport, StoreBackedIssueAuthorizer, ISSUE_RECONCILE_TENANTS_ENV,
 };
 pub use issues_http::{register_issues, MAX_ISSUE_JSON_BYTES};
+pub use notif_http::register_notif;
 pub use repo_authz::{AllowAllRepos, DenyAllRepos, GrantBackedRepos, RepoAccess, RepoAuthorizer};
 pub use repo_authz_live::{
     repo_object_id, repo_object_ref, CheckBackedRepoAuthorizer, NoRepoBootstrap,

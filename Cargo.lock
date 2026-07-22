@@ -2522,6 +2522,7 @@ dependencies = [
  "myelin-identity",
  "myelin-identity-service",
  "myelin-issues",
+ "myelin-notif",
  "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",

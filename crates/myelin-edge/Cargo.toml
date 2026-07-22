@@ -53,6 +53,10 @@ myelin-git = { path = "../myelin-git" }
 # Issues owns the fail-closed row/binding saga; the edge is the composition layer that may depend on
 # both the subsystem and Identity service, so it supplies the concrete async tuple-writer adapter.
 myelin-issues = { path = "../myelin-issues" }
+# Notification inbox reads are served by the same authenticated product edge. The subsystem owns
+# the durable repository, filter grammar, taxonomy tokens, and migrations; Edge only binds those
+# to the verified principal and projects the structured wire view.
+myelin-notif = { path = "../myelin-notif" }
 # GT-005: the BRAIN-AGNOSTIC PLAN-THEN-APPLY chokepoint (`EffectApi` / `RunCtx` / `ProposedEffect` /
 # `EffectResult`, §8.2). The edge is the composition point that binds a concrete `EffectApi` body to the
 # durable git backend, so a governed MCP `tools/call` (mint_run_token → EffectApi::apply, MR-021) lands
