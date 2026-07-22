@@ -24,7 +24,7 @@ import {
   parsePrThreads,
 } from "./mutation-response";
 import { parseFileLinesInput, parseFileLinesResponse } from "./file-lines";
-import { parseRepoHome, parseReposPage } from "./repo-read-response";
+import { parseBlob, parseRefs, parseRepoHome, parseReposPage, parseTree } from "./repo-read-response";
 import { parseCommitDiff, parseCommitsPage } from "./commit-read-response";
 
 export type { IssueMutation, PrMutation } from "./mutation-input";
@@ -501,7 +501,11 @@ function nestedPath(path: string): string {
 /** The ref switcher source (GET /v1/git/repos/{repo}/refs). */
 export const getRefs = query(async (repo: string): Promise<RefsVM> => {
   "use server";
-  return authed(() => edgeGet<RefsVM>(`/v1/git/repos/${seg(repo)}/refs`));
+  return authed(async () => {
+    const refs = parseRefs(await edgeGet(`/v1/git/repos/${seg(repo)}/refs`));
+    if (!refs) throw new RepoRouteError("error");
+    return refs;
+  });
 }, "git-refs");
 
 /** A tree at a ref + nested path (GET /v1/git/repos/{repo}/tree/{ref}/{...path}). Root = empty path. */
@@ -509,9 +513,13 @@ export const getTree = query(
   async (input: { repo: string; ref: string; path: string }): Promise<TreeVM> => {
     "use server";
     const tail = input.path ? `/${nestedPath(input.path)}` : "";
-    return authed(() =>
-      edgeGet<TreeVM>(`/v1/git/repos/${seg(input.repo)}/tree/${seg(input.ref)}${tail}`),
-    );
+    return authed(async () => {
+      const tree = parseTree(await edgeGet(
+        `/v1/git/repos/${seg(input.repo)}/tree/${seg(input.ref)}${tail}`,
+      ));
+      if (!tree) throw new RepoRouteError("error");
+      return tree;
+    });
   },
   "git-tree",
 );
@@ -520,11 +528,13 @@ export const getTree = query(
 export const getBlob = query(
   async (input: { repo: string; ref: string; path: string }): Promise<BlobVM> => {
     "use server";
-    return authed(() =>
-      edgeGet<BlobVM>(
+    return authed(async () => {
+      const blob = parseBlob(await edgeGet(
         `/v1/git/repos/${seg(input.repo)}/blob/${seg(input.ref)}/${nestedPath(input.path)}`,
-      ),
-    );
+      ));
+      if (!blob) throw new RepoRouteError("error");
+      return blob;
+    });
   },
   "git-blob",
 );
