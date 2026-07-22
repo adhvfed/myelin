@@ -527,7 +527,12 @@ impl SearchRestoreVerifyGate {
         // (4b) ROW↔DOC↔VECTOR PARITY: the restored + re-erased index is at one consistent point — every
         // live semantic doc has exactly one live vector. (The corpus is fully semantic: every live doc
         // carries a vector, so the counts must agree.)
-        let live_docs = inputs.reindexer.indexer_live_count(&tenant, &region);
+        let live_docs = match Self::verification_live_count(
+            inputs.reindexer.try_indexer_live_count(&tenant, &region),
+        ) {
+            Ok(count) => count,
+            Err(failure) => return SearchRestoreVerdict::Red(failure),
+        };
         let live_vectors = inputs.reindexer.indexer_live_vector_count(&tenant, &region);
         if (live_docs as usize) != live_vectors {
             return SearchRestoreVerdict::Red(SearchRestoreFailure::RowDocVectorMismatch {
@@ -583,6 +588,14 @@ impl SearchRestoreVerifyGate {
         tenant: &TenantId,
     ) -> usize {
         holder.locate_doc_count(subject, tenant)
+    }
+
+    /// Preserve the distinction between a genuinely empty index and a failed engine snapshot. The
+    /// latter makes the restore unverifiable and therefore RED, never a fabricated zero-doc pass.
+    fn verification_live_count(
+        count: Result<u64, ReindexError>,
+    ) -> Result<u64, SearchRestoreFailure> {
+        count.map_err(SearchRestoreFailure::RestoreFailed)
     }
 }
 
@@ -965,6 +978,18 @@ mod tests {
             "loud RestoreFailed: {err}"
         );
         assert!(err.to_string().contains("SEARCH RESTORE-VERIFY FAIL"));
+    }
+
+    /// A failed engine snapshot is NOT an empty index. The verification leg preserves the fault and
+    /// turns it into a typed RED result rather than comparing a fabricated zero against vector state.
+    #[test]
+    fn live_count_snapshot_failure_fails_the_gate_loud() {
+        let source = ReindexError::Index("live-count snapshot failed: disk I/O".into());
+        let err = SearchRestoreVerifyGate::verification_live_count(Err(source.clone()))
+            .expect_err("a failed snapshot must make restore verification RED");
+
+        assert_eq!(err, SearchRestoreFailure::RestoreFailed(source));
+        assert!(err.to_string().contains("live-count snapshot failed"));
     }
 
     // ───────── the ledger (PII-free, non-shred-erasable, idempotent) ─────────

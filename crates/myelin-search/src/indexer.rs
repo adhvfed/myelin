@@ -371,17 +371,30 @@ impl IndexRegistry {
         f(be)
     }
 
-    /// The live doc count in the `(tenant, region)` index (the freshness/idempotency check reads this).
-    fn live_count(&self, tenant: &TenantId, region: &Region) -> u64 {
+    /// Fallibly read the live doc count in the `(tenant, region)` index. An absent partition is
+    /// genuinely empty; an engine snapshot failure is not and must remain distinguishable.
+    fn try_live_count(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+    ) -> Result<u64, crate::engine::IndexError> {
         let pk = PartKey {
             tenant: tenant.clone(),
             region: region.clone(),
         };
         let mut guard = self.indices.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get_mut(&pk) {
-            Some(be) => be.snapshot().unwrap_or(0),
-            None => 0,
+            Some(be) => be.snapshot(),
+            None => Ok(0),
         }
+    }
+
+    /// The live doc count in the `(tenant, region)` index (the freshness/idempotency check reads this).
+    /// Diagnostic callers keep the compact infallible surface, but an engine fault fails loudly rather
+    /// than masquerading as an empty index. Correctness gates use [`Self::try_live_count`] directly.
+    fn live_count(&self, tenant: &TenantId, region: &Region) -> u64 {
+        self.try_live_count(tenant, region)
+            .unwrap_or_else(|e| panic!("live index snapshot failed: {e}"))
     }
 
     /// Locate every live doc in the `(tenant, region)` index referencing the subject (§4.8 locate).
@@ -544,6 +557,18 @@ impl IncrementalIndexer {
     /// doc, not two).
     pub fn live_count(&self, tenant: &TenantId, region: &Region) -> u64 {
         self.registry.live_count(tenant, region)
+    }
+
+    /// Fallibly read the live doc count for correctness gates. Unlike [`Self::live_count`], this keeps
+    /// an engine snapshot fault in the result so restore verification can return a typed RED verdict.
+    pub fn try_live_count(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+    ) -> Result<u64, IndexEventError> {
+        self.registry
+            .try_live_count(tenant, region)
+            .map_err(|e| IndexEventError::Engine(e.to_string()))
     }
 
     /// **Search the `(tenant, region)` full-text shape for `text_query` under `acl_filter` (the
