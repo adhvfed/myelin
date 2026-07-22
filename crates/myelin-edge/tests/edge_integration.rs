@@ -796,7 +796,10 @@ async fn saturated_git_wire_pool_returns_bounded_retry_guidance() {
     let headers = bearer(&token);
     let addr = spawn(gateway).await;
     let mut active = Vec::new();
-    for _ in 0..4 {
+    // Git wire execution has four slots, but every Git wire response first consumes one of the two
+    // stricter large-response slots. Saturate the effective front-door capacity; waiting for four
+    // handlers can never succeed because requests three and four are correctly shed earlier.
+    for _ in 0..2 {
         let request_headers = headers.clone();
         active.push(tokio::spawn(async move {
             open(
@@ -810,12 +813,12 @@ async fn saturated_git_wire_pool_returns_bounded_retry_guidance() {
         }));
     }
     tokio::time::timeout(Duration::from_secs(1), async {
-        while SLOW_GIT_STARTED.load(Ordering::SeqCst) < 4 {
+        while SLOW_GIT_STARTED.load(Ordering::SeqCst) < 2 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("all four bounded Git wire slots must be occupied");
+    .expect("both effective Git wire response slots must be occupied");
 
     let shed = open(
         addr,
