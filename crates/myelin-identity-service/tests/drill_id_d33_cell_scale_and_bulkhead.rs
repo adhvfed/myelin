@@ -205,7 +205,9 @@ impl Cell {
         for tenant in &self.tenants {
             let svc = self.services.get(tenant).expect("a seeded tenant");
             let s = scope_of(&principal(tenant, "p-admin"));
-            let receipt = svc.re_erase_after_restore(&s, ran_at.clone());
+            let receipt = svc
+                .re_erase_after_restore(&s, ran_at.clone())
+                .expect("re-erasure verification");
             re_erased += receipt.re_erased;
             resurrected_after += receipt.resurrected;
             all_green &= receipt.is_green();

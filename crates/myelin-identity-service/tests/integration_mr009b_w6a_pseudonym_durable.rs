@@ -321,7 +321,9 @@ async fn full_erase_deletes_durably_and_the_ledger_drives_re_erasure_across_rest
     );
 
     // ---- POST-RESTORE RE-ERASURE: the ledger drives the re-shred back to 0 recoverable ----
-    let receipt = engine2.re_erase_after_restore(&s, at("2026-06-19T11:00:00Z"));
+    let receipt = engine2
+        .re_erase_after_restore(&s, at("2026-06-19T11:00:00Z"))
+        .expect("re-erasure verification");
     assert_eq!(receipt.re_erased, 2, "the ledger drove re-erasure of BOTH subjects");
     assert_eq!(
         receipt.pre_pass_resurrected, 2,
@@ -414,4 +416,3 @@ async fn partition_isolation_and_idempotent_ledger_on_live_pg() {
     cleanup(&tenant_a, &region).await;
     cleanup(&tenant_b, &region).await;
 }
-

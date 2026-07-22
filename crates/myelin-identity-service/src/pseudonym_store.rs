@@ -598,37 +598,60 @@ impl PseudonymStore {
         scope: &TenantScope,
         subject: &PrincipalId,
     ) -> Option<PrincipalId> {
+        self.try_resolve_subject(scope, subject).ok().flatten()
+    }
+
+    /// Fallible resurrection probe for erasure verification. An absent row or a destroyed key is a
+    /// clean `None`; storage faults, malformed durable rows, key unwrap failures, and corrupt
+    /// ciphertext are errors and must not be certified as successful erasure.
+    pub fn try_resolve_subject(
+        &self,
+        scope: &TenantScope,
+        subject: &PrincipalId,
+    ) -> Result<Option<PrincipalId>, PseudonymError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S2_TABLE));
         let (key_ref, sealed) = match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             PseudonymBackend::Memory(inner_arc) => {
                 let part_key = Self::part_key(scope);
                 let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
-                let row = inner
+                let Some(row) = inner
                     .by_subject
                     .get(&part_key)
-                    .and_then(|p| p.get(&subject.0))?;
-                let sealed = inner
+                    .and_then(|p| p.get(&subject.0)) else {
+                        return Ok(None);
+                    };
+                let Some(sealed) = inner
                     .sealed
                     .get(&part_key)
-                    .and_then(|p| p.get(&subject.0))?;
+                    .and_then(|p| p.get(&subject.0)) else {
+                        return Err(PseudonymError::CorruptMapping);
+                    };
                 (row.real_id_key_ref.clone(), sealed.clone())
             }
             PseudonymBackend::Pg(pg) => {
-                let drow = pg
+                let Some(drow) = pg
                     .block(pg.backing.get_by_principal(&scope.tenant().0, &subject.0))
-                    .ok()
-                    .flatten()?;
-                let row = Self::durable_to_row(scope, &drow).ok()?;
-                let sealed = Self::durable_to_sealed(&drow).ok()?;
+                    .map_err(|e| PseudonymError::Storage(e.to_string()))? else {
+                        return Ok(None);
+                    };
+                let row = Self::durable_to_row(scope, &drow)?;
+                let sealed = Self::durable_to_sealed(&drow)?;
                 (row.real_id_key_ref, sealed)
             }
         };
-        // Open under the per-subject DEK. A destroyed DEK (crypto-shred) ⇒ Err ⇒ None (erased): never
-        // a plaintext-without-key fall-through (the 0-fail-open invariant).
-        let dek = self.kms.resolve_dek(&key_ref, scope.region()).ok()?;
-        let plain = dek.open(&sealed.nonce, &sealed.ciphertext)?;
-        String::from_utf8(plain).ok().map(PrincipalId)
+        // A deliberately destroyed subject/tenant key is the crypto-shred success condition. Every
+        // other KMS failure is corruption or infrastructure failure and invalidates the proof.
+        let dek = match self.kms.resolve_dek(&key_ref, scope.region()) {
+            Ok(dek) => dek,
+            Err(KmsError::KekUnavailable(_) | KmsError::DekUnavailable(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let plain = dek
+            .open(&sealed.nonce, &sealed.ciphertext)
+            .ok_or(PseudonymError::CorruptMapping)?;
+        let subject = String::from_utf8(plain).map_err(|_| PseudonymError::CorruptMapping)?;
+        Ok(Some(PrincipalId(subject)))
     }
 
     /// **The subject's per-subject DEK class (the Art. 17 crypto-shred lever).** Destroying THIS key
@@ -797,6 +820,32 @@ mod tests {
             subject,
             PrincipalId("p:alice".into()),
             "the pseudonym resolves back to the real subject (the real-identity link)"
+        );
+    }
+
+    #[test]
+    fn fallible_resurrection_probe_rejects_corrupt_ciphertext() {
+        let store = PseudonymStore::new(kms());
+        let s = scope("acme");
+        let subject = PrincipalId("p:alice".into());
+        store
+            .put_mapping(&s, &subject, handle("anon-7f3a", "acme"))
+            .expect("write mapping");
+
+        let part = (s.tenant().0.clone(), s.region().0.clone());
+        let mut inner = store.lock();
+        let sealed = inner
+            .sealed
+            .get_mut(&part)
+            .and_then(|rows| rows.get_mut(&subject.0))
+            .expect("sealed mapping");
+        sealed.ciphertext[0] ^= 0xff;
+        drop(inner);
+
+        assert_eq!(
+            store.try_resolve_subject(&s, &subject),
+            Err(PseudonymError::CorruptMapping),
+            "corruption must invalidate an erasure proof instead of looking erased"
         );
     }
 
