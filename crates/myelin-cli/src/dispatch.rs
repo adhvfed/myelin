@@ -198,19 +198,19 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
             None => EdgeCall::get("/v1/git/prs"),
         }),
         // GET /v1/git/search/code?q=… → the ACL-pre-filtered code-search hits.
-        CliCommand::SearchCode { query, .. } => {
-            if query.split_whitespace().count() != 1 {
-                // The edge query parser does not percent-decode yet (a named follow-on); a
-                // whitespace query would not round-trip. Honest, total — never a silent mismatch.
-                return Err(CliError::Usage(
-                    "code search currently supports a single whitespace-free term (the edge query \
-                     codec is a named follow-on)".into(),
-                ));
+        CliCommand::SearchCode {
+            query: search,
+            repo,
+        } => {
+            let mut query = FormQuery::default();
+            query.push("q", search);
+            if let Some(repo) = repo {
+                query.push("repo", repo);
             }
             Ok(EdgeCall {
                 method: HttpMethod::Get,
                 path: "/v1/git/search/code".into(),
-                query: Some(format!("q={query}")),
+                query: Some(query.finish()),
                 payload: None,
             })
         }
@@ -401,6 +401,33 @@ mod tests {
         let call = git_dispatch(&["search", "code", "needle"]).unwrap();
         assert_eq!(call.path, "/v1/git/search/code");
         assert_eq!(call.query.as_deref(), Some("q=needle"));
+    }
+
+    #[test]
+    fn git_search_code_form_encodes_every_query_and_the_optional_repo() {
+        for (search, encoded) in [
+            ("two words", "two%20words"),
+            ("x&limit=100", "x%26limit%3D100"),
+            ("100%", "100%25"),
+            ("kind=value", "kind%3Dvalue"),
+            ("naïve café", "na%C3%AFve%20caf%C3%A9"),
+        ] {
+            let call = git_dispatch(&["search", "code", search]).unwrap();
+            assert_eq!(call.query, Some(format!("q={encoded}")));
+        }
+
+        let scoped = git_dispatch(&[
+            "search",
+            "code",
+            "symbol & path=src/lib.rs",
+            "--repo",
+            "platform/core",
+        ])
+        .unwrap();
+        assert_eq!(
+            scoped.query.as_deref(),
+            Some("q=symbol%20%26%20path%3Dsrc%2Flib.rs&repo=platform%2Fcore")
+        );
     }
 
     /// A bad git verb is a clean Usage error (exit 2), never a panic.

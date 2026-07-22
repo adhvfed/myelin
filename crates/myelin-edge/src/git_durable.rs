@@ -38,7 +38,9 @@ use myelin_events::{Actor, EmitContextBase, IdMinter, OutboxStore, Region, Tenan
 // Used only by the `test-support`-gated `rooted_inmem_for_test` helper (MR-009b W3b.6).
 #[cfg(any(test, feature = "test-support"))]
 use myelin_events::MonotonicMinter;
-use myelin_git::api::{http_catalogue, Method as GitMethod};
+use myelin_git::api::{
+    http_catalogue, valid_code_search_query, valid_code_search_repo, Method as GitMethod,
+};
 use myelin_git::check_status::GitOid;
 use myelin_git::core::{Oid as CoreOid, RepoLoc};
 use myelin_git::durable::{
@@ -5700,7 +5702,7 @@ struct FileLinesQuery {
 
 const FILE_LINES_MAX_QUERY_BYTES: usize = 16 * 1024;
 
-fn decode_form_query_value(raw: &str) -> Result<String, EdgeError> {
+fn decode_form_query_component(raw: &str, subject: &str) -> Result<String, EdgeError> {
     let bytes = raw.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
@@ -5709,9 +5711,9 @@ fn decode_form_query_value(raw: &str) -> Result<String, EdgeError> {
                 || !bytes[index + 1].is_ascii_hexdigit()
                 || !bytes[index + 2].is_ascii_hexdigit()
             {
-                return Err(EdgeError::BadRequest(
-                    "file-lines query contains malformed percent encoding".into(),
-                ));
+                return Err(EdgeError::BadRequest(format!(
+                    "{subject} query contains malformed percent encoding"
+                )));
             }
             index += 3;
         } else {
@@ -5722,7 +5724,7 @@ fn decode_form_query_value(raw: &str) -> Result<String, EdgeError> {
     percent_encoding::percent_decode_str(&form_value)
         .decode_utf8()
         .map(|value| value.into_owned())
-        .map_err(|_| EdgeError::BadRequest("file-lines query is not valid UTF-8".into()))
+        .map_err(|_| EdgeError::BadRequest(format!("{subject} query is not valid UTF-8")))
 }
 
 fn parse_file_lines_query(query: &str) -> Result<FileLinesQuery, EdgeError> {
@@ -5744,7 +5746,7 @@ fn parse_file_lines_query(query: &str) -> Result<FileLinesQuery, EdgeError> {
                 if path.is_some() {
                     return Err(duplicate("path"));
                 }
-                let decoded = decode_form_query_value(value)?;
+                let decoded = decode_form_query_component(value, "file-lines")?;
                 if !valid_anchor_path(&decoded) {
                     return Err(EdgeError::BadRequest("file-lines path is invalid".into()));
                 }
@@ -6373,15 +6375,199 @@ impl Handler for DReportChecks {
     }
 }
 
+const CODE_SEARCH_MAX_RAW_QUERY_BYTES: usize = 16 * 1024;
+
+fn parse_code_search_query(query: &str) -> Result<(String, Option<String>), EdgeError> {
+    if query.len() > CODE_SEARCH_MAX_RAW_QUERY_BYTES {
+        return Err(EdgeError::BadRequest(
+            "code search request query is too large".into(),
+        ));
+    }
+
+    let mut search = None;
+    let mut repo = None;
+    for pair in query.split('&') {
+        let (raw_name, raw_value) = pair.split_once('=').ok_or_else(|| {
+            EdgeError::BadRequest("code search query parameter is malformed".into())
+        })?;
+        let name = decode_form_query_component(raw_name, "code search")?;
+        let value = decode_form_query_component(raw_value, "code search")?;
+        match name.as_str() {
+            "q" => {
+                if search.is_some() {
+                    return Err(EdgeError::BadRequest(
+                        "duplicate code search query parameter".into(),
+                    ));
+                }
+                if !valid_code_search_query(&value) {
+                    return Err(EdgeError::BadRequest("code search query is invalid".into()));
+                }
+                search = Some(value);
+            }
+            "repo" => {
+                if repo.is_some() {
+                    return Err(EdgeError::BadRequest(
+                        "duplicate code search repository filter".into(),
+                    ));
+                }
+                if !valid_code_search_repo(&value) {
+                    return Err(EdgeError::BadRequest(
+                        "code search repository filter is invalid".into(),
+                    ));
+                }
+                repo = Some(value);
+            }
+            _ => {
+                return Err(EdgeError::BadRequest(
+                    "unknown code search query parameter".into(),
+                ));
+            }
+        }
+    }
+    Ok((
+        search.ok_or_else(|| EdgeError::BadRequest("code search query is required".into()))?,
+        repo,
+    ))
+}
+
 struct DCodeSearch;
 impl Handler for DCodeSearch {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        // The ranked, ACL-pre-filtered code-search INDEX is the Search track; the durable front door
-        // serves an empty, tenant-scoped page here (honest — never a faked hit).
-        Ok(EdgeResponse::json(
-            200,
-            &page_envelope(json!([]), None, ctx.page.limit),
+        let _validated = parse_code_search_query(&ctx.request.query)?;
+        // The ranked, ACL-pre-filtered index is owned by the Search track. Until that production
+        // dependency is mounted, the durable route refuses honestly instead of fabricating an empty
+        // successful result set. Validation deliberately does not probe an optional repository.
+        Err(EdgeError::Unavailable(
+            "code search index is unavailable".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod code_search_boundary_tests {
+    use super::*;
+    use crate::catalogue::Page;
+    use myelin_storage::TenantScope;
+    use myelin_tenancy::{Region as IdentityRegion, TenantId as IdentityTenantId};
+    use std::collections::BTreeMap;
+
+    fn principal() -> Principal {
+        Principal::new(
+            IdentityTenantId("acme".into()),
+            IdentityRegion("eu-west".into()),
+            PrincipalId("u:searcher".into()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        )
+    }
+
+    fn serve(query: &str) -> Result<EdgeResponse, EdgeError> {
+        let principal = principal();
+        let scope = TenantScope::from_verified_token(&principal, principal.region.clone());
+        let params = BTreeMap::new();
+        let request = EdgeRequest::new("GET", "/v1/git/search/code", query, vec![], vec![]);
+        let page = Page::from_request(&request);
+        let identity = crate::catalogue::test_request_identity(&principal, &scope);
+        DCodeSearch.handle(&HandlerCtx {
+            identity: &identity,
+            principal: &principal,
+            scope: &scope,
+            params: &params,
+            page: &page,
+            request: &request,
+        })
+    }
+
+    #[test]
+    fn code_search_decodes_form_components_without_splitting_encoded_injection() {
+        assert_eq!(
+            parse_code_search_query(
+                "q=two%20words%20%26%20100%25%20%3D%20na%C3%AFve&repo=team%2Fcore"
+            )
+            .unwrap(),
+            ("two words & 100% = naïve".into(), Some("team/core".into()))
+        );
+        assert_eq!(
+            parse_code_search_query("q=x%26limit%3D100").unwrap(),
+            ("x&limit=100".into(), None),
+            "an encoded ampersand stays inside q rather than becoming a limit parameter"
+        );
+        assert!(parse_code_search_query("q=x&limit=100").is_err());
+
+        let maximum = format!(
+            "q={}",
+            "x".repeat(myelin_git::api::CODE_SEARCH_QUERY_MAX_BYTES)
+        );
+        assert!(parse_code_search_query(&maximum).is_ok());
+    }
+
+    #[test]
+    fn code_search_rejects_every_malformed_or_unbounded_coordinate() {
+        for query in [
+            "",
+            "q",
+            "=x",
+            "repo=core",
+            "q=",
+            "q=+++",
+            "q=x&q=y",
+            "q=x&%71=y",
+            "q=x&repo=core&repo=other",
+            "q=x&unknown=value",
+            "q=x&limit=100",
+            "q=x&cursor=opaque",
+            "q=%",
+            "q=%0",
+            "q=%GG",
+            "q=%FF",
+            "q=%00",
+            "q=x&repo=",
+            "q=x&repo=..%2Fsecret",
+            "q=x&repo=team%2F%2Fcore",
+            "q=x&repo=team%5Ccore",
+        ] {
+            assert!(
+                matches!(
+                    parse_code_search_query(query),
+                    Err(EdgeError::BadRequest(_))
+                ),
+                "malformed code-search query should be a 400: {query:?}"
+            );
+        }
+
+        let oversized_search = format!(
+            "q={}",
+            "x".repeat(myelin_git::api::CODE_SEARCH_QUERY_MAX_BYTES + 1)
+        );
+        assert!(parse_code_search_query(&oversized_search).is_err());
+        let oversized_repo = format!(
+            "q=x&repo={}",
+            "r".repeat(myelin_git::api::CODE_SEARCH_REPO_MAX_BYTES + 1)
+        );
+        assert!(parse_code_search_query(&oversized_repo).is_err());
+        let oversized_raw = format!("q=x&{}", "a".repeat(CODE_SEARCH_MAX_RAW_QUERY_BYTES));
+        assert!(parse_code_search_query(&oversized_raw).is_err());
+    }
+
+    #[test]
+    fn valid_code_search_requests_return_the_exact_unavailable_envelope_without_repo_probing() {
+        for query in ["q=two+words", "repo=missing-but-valid&q=symbol"] {
+            let error = match serve(query) {
+                Err(error) => error,
+                Ok(_) => panic!("the production search index is not mounted"),
+            };
+            assert_eq!(error.status(), 503);
+            assert_eq!(
+                error.envelope(),
+                json!({
+                    "error": {
+                        "message": "code search index is unavailable",
+                        "code": "unavailable",
+                    }
+                })
+            );
+        }
     }
 }
 
@@ -6519,8 +6705,8 @@ fn pr_review_guarded(be: &Arc<DurableGitBackend>, inner: Arc<dyn Handler>) -> Ar
 /// `POST /repos` (create — there is no repo OBJECT yet; the gateway's `git.repo.create` ACTION gate
 /// authorizes it and the R2.1a creator→admin bootstrap grant makes the fresh repo owned — a
 /// tenant-level "may create repos" object check needs a tenant/project object the frozen fragment
-/// does not define, named for the fragment's next revision); `GET /search/code` (serves the empty
-/// envelope; the ACL-prefiltered index is the Search track).
+/// does not define, named for the fragment's next revision); `GET /search/code` (strictly validates
+/// its query, then returns 503 until the ACL-prefiltered Search-track index is mounted).
 pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -> GatewayBuilder {
     use RepoPermission::{ApproveUntrustedCi, ProtectedPush, Pull, Push};
     for ep in http_catalogue() {

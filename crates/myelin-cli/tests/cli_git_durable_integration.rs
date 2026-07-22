@@ -7,6 +7,8 @@
 //!  - `myelin git pr open <repo>` opens a durable PR; `myelin git pr view <repo> <n>` reads it back;
 //!  - `myelin git pr merge <repo> <n>` against an UNMET branch-protection gate is a CLEAN CLI error
 //!    carrying the gate reason (exit 1) — the CLI REFLECTS the server gate, never bypasses it;
+//!  - `myelin git search code <query> [--repo <slug>]` preserves form-sensitive query bytes and
+//!    honestly reports that the durable index is unavailable;
 //!  - `--json` emits machine-readable output.
 //!
 //! The forged/missing-token clean auth errors (exit 3) are proven in `cli_edge_integration.rs` (the
@@ -156,6 +158,50 @@ fn run_cli(edge: &str, token: &str, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
     )
+}
+
+/// The shell and durable Edge share one strict code-search boundary. Form-sensitive bytes must stay
+/// inside `q` (not become extra parameters), and a valid repository filter is syntax-only: even an
+/// absent repository reaches the same honest unavailable response without a storage probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_search_preserves_query_bytes_and_reports_unavailable() {
+    let root = temp_root("search");
+    let (gw, cell, _be) = build(&root);
+    let addr = spawn(gw).await;
+    let edge = format!("http://{addr}");
+    let token = mint(&cell, "acme", "jti-search");
+
+    let (code, stdout, stderr) = run_cli(
+        &edge,
+        &token,
+        &[
+            "git",
+            "search",
+            "code",
+            "two words &limit=100% = 世界",
+            "--repo",
+            "missing/repository",
+        ],
+    );
+
+    assert_eq!(
+        code, 1,
+        "a valid unavailable edge response exits 1; stderr={stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "an unavailable search has no success output"
+    );
+    assert!(
+        stderr.contains("edge error (503 unavailable): code search index is unavailable"),
+        "the encoded query reached the handler and returned its honest response; got {stderr}"
+    );
+    assert!(
+        !stderr.contains("bad_request"),
+        "query bytes were not reinterpreted"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// **THE DURABLE WRITE/READ ROUND-TRIP.** `repo create` persists (read back via `repo list`); `pr open`
