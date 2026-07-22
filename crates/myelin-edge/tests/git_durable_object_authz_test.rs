@@ -351,6 +351,7 @@ fn ungranted_in_tenant_principal_is_denied_on_every_object_route() {
         "/v1/git/repos/alpha/commit/0000000000000000000000000000000000000000",
         "/v1/git/repos/alpha/blob/main/README.md",
         "/v1/git/repos/alpha/prs/1",
+        "/v1/git/repos/alpha/prs/1/commits",
         "/v1/git/repos/alpha/prs/1/checks",
         "/v1/git/repos/alpha/refs",
         "/v1/git/repos/alpha/tree/main",
@@ -379,6 +380,17 @@ fn ungranted_in_tenant_principal_is_denied_on_every_object_route() {
         "limit=01&cursor=not-a-cursor",
     );
     assert_eq!(status, 404, "Pull deny must precede refs parsing: {body}");
+    assert_eq!(body["error"]["message"], "repository not found");
+    let (status, body) = h.call_query(
+        "subj-mallory",
+        "GET",
+        "/v1/git/repos/alpha/prs/1/commits",
+        "cursor=malformed&limit=01",
+    );
+    assert_eq!(
+        status, 404,
+        "Pull deny must precede PR commit cursor parsing: {body}"
+    );
     assert_eq!(body["error"]["message"], "repository not found");
 
     // WRITE-class → fail-closed 403 (push permission).

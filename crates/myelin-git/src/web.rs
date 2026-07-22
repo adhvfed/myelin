@@ -687,9 +687,17 @@ pub const REPO_LIST_ROW_MAX_CLONE_URL_BYTES: usize = 4 * 1024;
 pub const REPO_LIST_CURSOR_PREFIX: &str = "rl1_";
 /// Maximum encoded repository-list continuation-token bytes.
 pub const REPO_LIST_CURSOR_MAX_BYTES: usize = 512;
+/// Prefix for the versioned pull-request commit continuation token.
+pub const PR_COMMIT_CURSOR_PREFIX: &str = "pc1_";
+/// Maximum encoded pull-request commit continuation-token bytes.
+pub const PR_COMMIT_CURSOR_MAX_BYTES: usize = 256;
+/// Deepest continuation position accepted by the pull-request commit walker.
+pub const PR_COMMIT_CURSOR_MAX_POSITION: usize = crate::durable::PR_COMMIT_MAX_POSITION;
 
 const REPO_LIST_CURSOR_VERSION: u8 = 1;
 const REPO_LIST_CURSOR_FIXED_BYTES: usize = 1 + 32 + 2;
+const PR_COMMIT_CURSOR_VERSION: u8 = 1;
+const PR_COMMIT_CURSOR_FRAME_BYTES: usize = 1 + 32 + 1 + 20 + 20 + 4;
 
 /// A malformed or non-canonical repository-list continuation token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -783,6 +791,173 @@ fn valid_repo_list_cursor_slug(slug: &str) -> bool {
         && slug
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// A malformed or non-canonical pull-request commit continuation token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrCommitCursorError;
+
+impl std::fmt::Display for PrCommitCursorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("pull-request commit cursor is malformed")
+    }
+}
+
+impl std::error::Error for PrCommitCursorError {}
+
+/// Canonical continuation state for one immutable pull-request commit snapshot. The transport owns
+/// `scope`; Git owns the pinned object ids and bounded revwalk position.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrCommitCursor {
+    scope: [u8; 32],
+    base_oid: Option<String>,
+    head_oid: String,
+    position: usize,
+}
+
+impl PrCommitCursor {
+    /// Construct a continuation token from a transport scope, pinned snapshot, and non-zero bounded
+    /// continuation position.
+    pub fn new(
+        scope: [u8; 32],
+        base_oid: Option<&str>,
+        head_oid: &str,
+        position: usize,
+    ) -> Result<Self, PrCommitCursorError> {
+        let base_oid = base_oid.map(parse_cursor_oid).transpose()?;
+        let head_oid = parse_cursor_oid(head_oid)?;
+        if !(1..=PR_COMMIT_CURSOR_MAX_POSITION).contains(&position) {
+            return Err(PrCommitCursorError);
+        }
+        Ok(Self {
+            scope,
+            base_oid: base_oid.map(|bytes| cursor_oid_string(&bytes)),
+            head_oid: cursor_oid_string(&head_oid),
+            position,
+        })
+    }
+
+    /// Parse the exact fixed-size, versioned, unpadded base64url token representation.
+    pub fn parse(value: &str) -> Result<Self, PrCommitCursorError> {
+        let encoded = value
+            .strip_prefix(PR_COMMIT_CURSOR_PREFIX)
+            .ok_or(PrCommitCursorError)?;
+        if encoded.is_empty() || value.len() > PR_COMMIT_CURSOR_MAX_BYTES {
+            return Err(PrCommitCursorError);
+        }
+        let frame = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| PrCommitCursorError)?;
+        if frame.len() != PR_COMMIT_CURSOR_FRAME_BYTES
+            || frame[0] != PR_COMMIT_CURSOR_VERSION
+            || base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&frame) != encoded
+        {
+            return Err(PrCommitCursorError);
+        }
+
+        let mut scope = [0_u8; 32];
+        scope.copy_from_slice(&frame[1..33]);
+        let mut base_bytes = [0_u8; 20];
+        base_bytes.copy_from_slice(&frame[34..54]);
+        let base_oid = match frame[33] {
+            0 if base_bytes == [0; 20] => None,
+            1 => Some(cursor_oid_string(&base_bytes)),
+            _ => return Err(PrCommitCursorError),
+        };
+        let mut head_bytes = [0_u8; 20];
+        head_bytes.copy_from_slice(&frame[54..74]);
+        let position = usize::try_from(u32::from_be_bytes(
+            frame[74..78].try_into().map_err(|_| PrCommitCursorError)?,
+        ))
+        .map_err(|_| PrCommitCursorError)?;
+        Self::new(
+            scope,
+            base_oid.as_deref(),
+            &cursor_oid_string(&head_bytes),
+            position,
+        )
+    }
+
+    /// Render the canonical fixed-size, versioned, unpadded base64url token.
+    pub fn encode(&self) -> String {
+        let mut frame = Vec::with_capacity(PR_COMMIT_CURSOR_FRAME_BYTES);
+        frame.push(PR_COMMIT_CURSOR_VERSION);
+        frame.extend_from_slice(&self.scope);
+        match self.base_oid.as_deref() {
+            Some(oid) => {
+                frame.push(1);
+                frame.extend_from_slice(&parse_cursor_oid(oid).expect("validated cursor base oid"));
+            }
+            None => {
+                frame.push(0);
+                frame.extend_from_slice(&[0; 20]);
+            }
+        }
+        frame.extend_from_slice(
+            &parse_cursor_oid(&self.head_oid).expect("validated cursor head oid"),
+        );
+        frame.extend_from_slice(&(self.position as u32).to_be_bytes());
+        debug_assert_eq!(frame.len(), PR_COMMIT_CURSOR_FRAME_BYTES);
+        format!(
+            "{PR_COMMIT_CURSOR_PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(frame)
+        )
+    }
+
+    /// Opaque transport-owned scope bytes.
+    pub fn scope(&self) -> [u8; 32] {
+        self.scope
+    }
+
+    /// Pinned base commit, or `None` when the base ref was absent on page one.
+    pub fn base_oid(&self) -> Option<&str> {
+        self.base_oid.as_deref()
+    }
+
+    /// Pinned pull-request head commit.
+    pub fn head_oid(&self) -> &str {
+        &self.head_oid
+    }
+
+    /// Number of snapshot commits already consumed.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+}
+
+fn parse_cursor_oid(value: &str) -> Result<[u8; 20], PrCommitCursorError> {
+    if value.len() != 40
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(PrCommitCursorError);
+    }
+    let mut bytes = [0_u8; 20];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = cursor_hex_nibble(pair[0]).ok_or(PrCommitCursorError)?;
+        let low = cursor_hex_nibble(pair[1]).ok_or(PrCommitCursorError)?;
+        bytes[index] = (high << 4) | low;
+    }
+    Ok(bytes)
+}
+
+fn cursor_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn cursor_oid_string(bytes: &[u8; 20]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(40);
+    for byte in bytes {
+        value.push(char::from(HEX[usize::from(byte >> 4)]));
+        value.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    value
 }
 
 /// Invalid input for the lightweight repository-list row projection.

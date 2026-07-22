@@ -39,6 +39,7 @@
 //! The smart-transport WIRE (`clone`/`push` over the network) is **GT-006** (sandbox-gated) — NOT
 //! this module. This is the durable STORAGE the wire (and the API/UI/CLI) will sit on.
 
+use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -256,6 +257,49 @@ pub struct CommitMeta {
     pub parents: Vec<String>,
 }
 
+/// Immutable object coordinates captured for the first page of a pull-request commit walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrCommitSnapshot {
+    /// Base tip resolved on page one, or `None` when the base ref did not exist.
+    pub base_oid: Option<String>,
+    /// Pull-request head commit resolved on page one.
+    pub head_oid: String,
+}
+
+/// A pull-request commit snapshot page could not be served.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrCommitPageError {
+    /// The requested page size or continuation position exceeds the finite interactive ceilings.
+    InvalidPagination,
+    /// A pinned head or base graph exceeds the finite reachability proof ceiling.
+    CapacityExceeded,
+    /// An object pinned by a previously minted continuation no longer exists.
+    SnapshotExpired,
+    /// Another durable Git operation failed.
+    Durable(DurableError),
+}
+
+impl std::fmt::Display for PrCommitPageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPagination => f.write_str("pull-request commit pagination is invalid"),
+            Self::CapacityExceeded => {
+                f.write_str("pull-request commit snapshot exceeds the reachability limit")
+            }
+            Self::SnapshotExpired => f.write_str("pull-request commit snapshot expired"),
+            Self::Durable(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for PrCommitPageError {}
+
+impl From<DurableError> for PrCommitPageError {
+    fn from(error: DurableError) -> Self {
+        Self::Durable(error)
+    }
+}
+
 /// Raw per-file delta in a commit diff (libgit2 `diff_tree_to_tree`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileDelta {
@@ -453,6 +497,19 @@ pub const COMMIT_META_MAX_IDENTITY_BYTES: usize = 1_024;
 pub const COMMIT_LOG_MAX_OFFSET: usize = 100_000;
 /// Largest commit page materialized by one interactive history read.
 pub const COMMIT_LOG_MAX_PAGE: usize = 500;
+/// Deepest position one pull-request commit snapshot page may scan from its pinned head.
+pub const PR_COMMIT_MAX_POSITION: usize = 100_000;
+/// Maximum unique commit OIDs retained while proving either pinned PR snapshot coordinate.
+pub const PR_COMMIT_MAX_GRAPH_NODES_PER_PIN: usize = 100_000;
+/// Maximum parent edges examined while proving either pinned PR snapshot coordinate.
+pub const PR_COMMIT_MAX_GRAPH_EDGES_PER_PIN: usize = 1_000_000;
+/// Maximum rows yielded by the real page walk, including the one-row `has_more` probe.
+pub const PR_COMMIT_MAX_PAGE_WALK_OBSERVATIONS: usize =
+    PR_COMMIT_MAX_POSITION + COMMIT_LOG_MAX_PAGE + 1;
+/// Maximum libgit2 walk nodes the sorted/hidden walk may preprocess after successful preflights.
+pub const PR_COMMIT_MAX_INTERNAL_WALK_NODES: usize = 2 * PR_COMMIT_MAX_GRAPH_NODES_PER_PIN;
+/// Maximum parent edges the sorted/hidden walk may examine after successful graph preflights.
+pub const PR_COMMIT_MAX_INTERNAL_WALK_EDGES: usize = 2 * PR_COMMIT_MAX_GRAPH_EDGES_PER_PIN;
 /// Maximum files materialized for one interactive commit diff.
 pub const COMMIT_DIFF_MAX_FILES: usize = 1_000;
 /// Maximum rendered lines materialized for one file in an interactive commit diff.
@@ -531,6 +588,55 @@ fn commit_meta(c: &git2::Commit<'_>) -> CommitMeta {
             .map(|p| p.to_string())
             .collect(),
     }
+}
+
+fn pr_commit_walk_error(context: &str, error: git2::Error) -> PrCommitPageError {
+    if error.code() == git2::ErrorCode::NotFound {
+        PrCommitPageError::SnapshotExpired
+    } else {
+        PrCommitPageError::Durable(git_err(context, error))
+    }
+}
+
+/// Prove one pinned coordinate's reachable graph is finite before enabling libgit2's preprocessing
+/// modes. The retained `scheduled` set includes both the frontier and visited OIDs, so its length is
+/// the peak stored unique-OID bound. Every parent relation is counted separately, including edges to
+/// an already-scheduled commit. Capacity takes precedence when discovering a missing parent would
+/// exceed a cap; otherwise that object is classified as expired when it is popped and loaded.
+fn preflight_pr_commit_reachability(
+    repo: &git2::Repository,
+    start: git2::Oid,
+    maximum_nodes: usize,
+    maximum_edges: usize,
+    label: &str,
+) -> Result<(), PrCommitPageError> {
+    if maximum_nodes == 0 {
+        return Err(PrCommitPageError::CapacityExceeded);
+    }
+    let mut scheduled = HashSet::with_capacity(maximum_nodes.min(4_096));
+    let mut frontier = Vec::new();
+    scheduled.insert(start);
+    frontier.push(start);
+    let mut examined_edges = 0usize;
+    while let Some(oid) = frontier.pop() {
+        let commit = repo.find_commit(oid).map_err(|error| {
+            pr_commit_walk_error(&format!("find pinned {label} preflight commit"), error)
+        })?;
+        for parent in commit.parent_ids() {
+            if examined_edges >= maximum_edges {
+                return Err(PrCommitPageError::CapacityExceeded);
+            }
+            examined_edges += 1;
+            if !scheduled.contains(&parent) {
+                if scheduled.len() >= maximum_nodes {
+                    return Err(PrCommitPageError::CapacityExceeded);
+                }
+                scheduled.insert(parent);
+                frontier.push(parent);
+            }
+        }
+    }
+    Ok(())
 }
 
 // ───────────────────────────── the per-repo durable handle ───────────────────────────────────────
@@ -1448,11 +1554,145 @@ impl DurableGitRepo {
         Ok((out, has_more))
     }
 
+    /// Resolve the immutable object coordinates for the first page of a pull-request commit walk.
+    /// An absent/malformed head keeps the historical empty-list behavior; an absent base ref is an
+    /// explicit `None` snapshot coordinate and therefore remains absent on continuation pages.
+    pub fn pr_commit_snapshot(
+        &self,
+        base_ref: &str,
+        head_oid: &str,
+    ) -> Result<Option<PrCommitSnapshot>, DurableError> {
+        let repo = self.open_git()?;
+        let head = match git2::Oid::from_str(head_oid) {
+            Ok(oid) => oid,
+            Err(_) => return Ok(None),
+        };
+        match repo.find_commit(head) {
+            Ok(_) => {}
+            Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
+            Err(error) => return Err(git_err("find pull-request head", error)),
+        }
+        Ok(Some(PrCommitSnapshot {
+            base_oid: self.tip_commit(&repo, base_ref)?.map(|oid| oid.to_string()),
+            head_oid: head.to_string(),
+        }))
+    }
+
+    /// Walk one immutable pull-request commit snapshot page. Explicit stack/`HashSet` preflights
+    /// first prove the pinned head and base graphs each stay within
+    /// [`PR_COMMIT_MAX_GRAPH_NODES_PER_PIN`] retained unique OIDs and
+    /// [`PR_COMMIT_MAX_GRAPH_EDGES_PER_PIN`] examined parent edges. Only then is libgit2's existing
+    /// `TIME` + hide ordering enabled; it may preprocess a union bounded by
+    /// [`PR_COMMIT_MAX_INTERNAL_WALK_NODES`] nodes and [`PR_COMMIT_MAX_INTERNAL_WALK_EDGES`] edges.
+    /// These are graph bookkeeping/work bounds, not a total RSS claim: libgit2 and commit-object
+    /// parsing have their own finite allocations. The page iterator yields at most
+    /// [`PR_COMMIT_MAX_PAGE_WALK_OBSERVATIONS`] rows, while skipped rows and the one-row `has_more`
+    /// probe are never expanded into [`CommitMeta`].
+    pub fn commits_in_pr_snapshot(
+        &self,
+        base_oid: Option<&str>,
+        head_oid: &str,
+        position: usize,
+        limit: usize,
+    ) -> Result<(Vec<CommitMeta>, bool), PrCommitPageError> {
+        self.commits_in_pr_snapshot_with_graph_caps(
+            base_oid,
+            head_oid,
+            position,
+            limit,
+            PR_COMMIT_MAX_GRAPH_NODES_PER_PIN,
+            PR_COMMIT_MAX_GRAPH_EDGES_PER_PIN,
+        )
+    }
+
+    fn commits_in_pr_snapshot_with_graph_caps(
+        &self,
+        base_oid: Option<&str>,
+        head_oid: &str,
+        position: usize,
+        limit: usize,
+        node_cap: usize,
+        edge_cap: usize,
+    ) -> Result<(Vec<CommitMeta>, bool), PrCommitPageError> {
+        if position > PR_COMMIT_MAX_POSITION || limit == 0 || limit > COMMIT_LOG_MAX_PAGE {
+            return Err(PrCommitPageError::InvalidPagination);
+        }
+        let repo = self.open_git()?;
+        let head = git2::Oid::from_str(head_oid).map_err(|_| PrCommitPageError::SnapshotExpired)?;
+        if let Err(error) = repo.find_commit(head) {
+            return if error.code() == git2::ErrorCode::NotFound {
+                Err(PrCommitPageError::SnapshotExpired)
+            } else {
+                Err(PrCommitPageError::Durable(git_err(
+                    "find pinned pull-request head",
+                    error,
+                )))
+            };
+        }
+        let base = base_oid
+            .map(|value| git2::Oid::from_str(value).map_err(|_| PrCommitPageError::SnapshotExpired))
+            .transpose()?;
+        if let Some(base) = base {
+            if let Err(error) = repo.find_commit(base) {
+                return if error.code() == git2::ErrorCode::NotFound {
+                    Err(PrCommitPageError::SnapshotExpired)
+                } else {
+                    Err(PrCommitPageError::Durable(git_err(
+                        "find pinned pull-request base",
+                        error,
+                    )))
+                };
+            }
+        }
+
+        preflight_pr_commit_reachability(&repo, head, node_cap, edge_cap, "head")?;
+        if let Some(base) = base {
+            preflight_pr_commit_reachability(&repo, base, node_cap, edge_cap, "base")?;
+        }
+
+        let mut walk = repo
+            .revwalk()
+            .map_err(|error| PrCommitPageError::Durable(git_err("pull-request revwalk", error)))?;
+        walk.set_sorting(git2::Sort::TIME).map_err(|error| {
+            PrCommitPageError::Durable(git_err("pull-request revwalk sort", error))
+        })?;
+        walk.push(head)
+            .map_err(|error| pr_commit_walk_error("pull-request revwalk push head", error))?;
+        if let Some(base) = base {
+            walk.hide(base)
+                .map_err(|error| pr_commit_walk_error("pull-request revwalk hide base", error))?;
+        }
+
+        let mut seen = 0usize;
+        let mut out = Vec::new();
+        let mut has_more = false;
+        for oid_result in walk {
+            let oid = oid_result
+                .map_err(|error| pr_commit_walk_error("pull-request revwalk next", error))?;
+            if seen < position {
+                seen += 1;
+                continue;
+            }
+            if out.len() == limit {
+                has_more = true;
+                break;
+            }
+            let commit = repo.find_commit(oid).map_err(|error| {
+                if error.code() == git2::ErrorCode::NotFound {
+                    PrCommitPageError::SnapshotExpired
+                } else {
+                    PrCommitPageError::Durable(git_err("find pull-request commit", error))
+                }
+            })?;
+            out.push(commit_meta(&commit));
+            seen += 1;
+        }
+        Ok((out, has_more))
+    }
+
     /// **The commits IN a PR (R3.3 N2) — reachable from `head_oid` but NOT from `base_ref`'s tip.**
-    /// A libgit2 revwalk pushes the head and HIDES the base tip (the reviewer reviews the PR's OWN
-    /// commits, not the base's history). Newest-first, capped at `limit` (a `has_more` flag drives the
-    /// "full commits list" route; **floor:** the overview's `commits_count` is exact up to `limit` and
-    /// reads `limit+` beyond — dogfood-scale PRs are well under the cap). An absent head oid → empty.
+    /// Compatibility wrapper used by the overview's bounded count. Interactive pagination calls
+    /// [`Self::commits_in_pr_snapshot`] directly with cursor-pinned object coordinates.
     pub fn commits_in_pr(
         &self,
         base_ref: &str,
@@ -1464,34 +1704,22 @@ impl DurableGitRepo {
                 "commit log pagination limit exceeded".into(),
             ));
         }
-        let repo = self.open_git()?;
-        let head = match git2::Oid::from_str(head_oid) {
-            Ok(o) => o,
-            Err(_) => return Ok((Vec::new(), false)),
-        };
-        if repo.find_commit(head).is_err() {
+        let Some(snapshot) = self.pr_commit_snapshot(base_ref, head_oid)? else {
             return Ok((Vec::new(), false));
-        }
-        let mut walk = repo.revwalk().map_err(|e| git_err("revwalk", e))?;
-        walk.set_sorting(git2::Sort::TIME).map_err(|e| git_err("revwalk sort", e))?;
-        walk.push(head).map_err(|e| git_err("revwalk push head", e))?;
-        // Hide the base tip so only the PR's own commits remain. A missing base ref hides nothing
-        // (the walk then returns head's bounded history — honest, never an error).
-        if let Some(base_tip) = self.tip_commit(&repo, base_ref)? {
-            let _ = walk.hide(base_tip); // a non-existent/foreign base tip simply hides nothing.
-        }
-        let mut out = Vec::new();
-        let mut has_more = false;
-        for oid_res in walk {
-            let oid = oid_res.map_err(|e| git_err("revwalk next", e))?;
-            if out.len() == limit {
-                has_more = true;
-                break;
-            }
-            let c = repo.find_commit(oid).map_err(|e| git_err("find_commit", e))?;
-            out.push(commit_meta(&c));
-        }
-        Ok((out, has_more))
+        };
+        self.commits_in_pr_snapshot(snapshot.base_oid.as_deref(), &snapshot.head_oid, 0, limit)
+            .map_err(|error| match error {
+                PrCommitPageError::InvalidPagination => {
+                    DurableError::Git("commit log pagination limit exceeded".into())
+                }
+                PrCommitPageError::CapacityExceeded => {
+                    DurableError::Git("pull-request commit history limit exceeded".into())
+                }
+                PrCommitPageError::SnapshotExpired => {
+                    DurableError::NotFound("pull-request commit snapshot expired".into())
+                }
+                PrCommitPageError::Durable(error) => error,
+            })
     }
 
     /// The full detail of one commit (`None` if the oid is malformed or absent): its metadata, full
@@ -2355,6 +2583,35 @@ mod tests {
             .expect("commit")
     }
 
+    fn write_commit_at(
+        repo: &DurableGitRepo,
+        tree: &Oid,
+        parents: &[&Oid],
+        message: &str,
+        seconds: i64,
+    ) -> Oid {
+        let git = repo.open_git().expect("open git");
+        let tree = git
+            .find_tree(DurableGitRepo::parse_oid(tree).expect("tree oid"))
+            .expect("find tree");
+        let parents = parents
+            .iter()
+            .map(|parent| {
+                git.find_commit(DurableGitRepo::parse_oid(parent).expect("parent oid"))
+                    .expect("find parent")
+            })
+            .collect::<Vec<_>>();
+        let parent_refs = parents.iter().collect::<Vec<_>>();
+        let time = git2::Time::new(seconds, 0);
+        let signature =
+            git2::Signature::new("psn@acme.noreply", "psn@acme.noreply", &time).expect("signature");
+        Oid::new(
+            git.commit(None, &signature, &signature, message, &tree, &parent_refs)
+                .expect("commit")
+                .to_string(),
+        )
+    }
+
     #[test]
     fn durable_ref_lock_serializes_independent_repo_handles() {
         let root = temp_root("ref-lock");
@@ -2673,6 +2930,302 @@ mod tests {
 
         // A malformed/absent oid → None (a clean 404 upstream; never a panic).
         assert!(repo.commit_detail("not-a-real-oid").unwrap().is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pr_commit_snapshot_pages_are_bounded_stable_and_expire_loudly() {
+        let root = temp_root("pr-commit-pages");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let blob = repo.write_blob(b"snapshot\n").unwrap();
+        let tree = repo.write_tree(&[("file.txt", &blob)]).unwrap();
+        let base = write_commit_at(&repo, &tree, &[], "base", 1_700_000_000);
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&base),
+            "base",
+            "psn@acme.noreply",
+        )
+        .unwrap();
+        let second = write_commit_at(&repo, &tree, &[&base], "second", 1_700_000_001);
+        let third = write_commit_at(&repo, &tree, &[&second], "third", 1_700_000_002);
+        let head = write_commit_at(&repo, &tree, &[&third], "head", 1_700_000_003);
+
+        let snapshot = repo
+            .pr_commit_snapshot("refs/heads/main", &head.0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.base_oid.as_deref(), Some(base.0.as_str()));
+        assert_eq!(snapshot.head_oid, head.0);
+        let exact_head_cap = repo
+            .commits_in_pr_snapshot_with_graph_caps(
+                snapshot.base_oid.as_deref(),
+                &snapshot.head_oid,
+                0,
+                1,
+                4,
+                3,
+            )
+            .unwrap();
+        assert_eq!(
+            exact_head_cap.0[0].oid, head.0,
+            "a head graph exactly at the preflight cap is admitted"
+        );
+        assert_eq!(
+            repo.commits_in_pr_snapshot_with_graph_caps(
+                snapshot.base_oid.as_deref(),
+                &snapshot.head_oid,
+                0,
+                1,
+                3,
+                100,
+            ),
+            Err(PrCommitPageError::CapacityExceeded),
+            "the cap+1 head row is observed and refused"
+        );
+        let no_base = repo
+            .pr_commit_snapshot("refs/heads/not-created", &head.0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(no_base.base_oid, None);
+        assert_eq!(
+            repo.commits_in_pr_snapshot(None, &no_base.head_oid, 0, COMMIT_LOG_MAX_PAGE)
+                .unwrap()
+                .0
+                .len(),
+            4
+        );
+
+        let expected = [head.0.clone(), third.0.clone(), second.0.clone()];
+        let mut seen = Vec::new();
+        for position in 0..expected.len() {
+            let (rows, has_more) = repo
+                .commits_in_pr_snapshot(
+                    snapshot.base_oid.as_deref(),
+                    &snapshot.head_oid,
+                    position,
+                    1,
+                )
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(has_more, position + 1 < expected.len());
+            seen.push(rows[0].oid.clone());
+        }
+        assert_eq!(seen, expected);
+        let first_walk = repo
+            .commits_in_pr_snapshot(
+                snapshot.base_oid.as_deref(),
+                &snapshot.head_oid,
+                0,
+                COMMIT_LOG_MAX_PAGE,
+            )
+            .unwrap();
+        let repeated_walk = repo
+            .commits_in_pr_snapshot(
+                snapshot.base_oid.as_deref(),
+                &snapshot.head_oid,
+                0,
+                COMMIT_LOG_MAX_PAGE,
+            )
+            .unwrap();
+        assert_eq!(
+            first_walk, repeated_walk,
+            "a fixed snapshot walk is deterministic"
+        );
+
+        // Moving the mutable base ref after page one does not alter the cursor-pinned snapshot.
+        repo.update_ref_cas(
+            "refs/heads/main",
+            Some(&base),
+            Some(&second),
+            "advance base",
+            "psn@acme.noreply",
+        )
+        .unwrap();
+        let (repeat, _) = repo
+            .commits_in_pr_snapshot(snapshot.base_oid.as_deref(), &snapshot.head_oid, 1, 1)
+            .unwrap();
+        assert_eq!(repeat[0].oid, third.0);
+
+        assert_eq!(
+            repo.commits_in_pr_snapshot(
+                snapshot.base_oid.as_deref(),
+                &snapshot.head_oid,
+                PR_COMMIT_MAX_POSITION + 1,
+                1,
+            ),
+            Err(PrCommitPageError::InvalidPagination)
+        );
+        assert_eq!(
+            repo.commits_in_pr_snapshot(
+                snapshot.base_oid.as_deref(),
+                &snapshot.head_oid,
+                0,
+                COMMIT_LOG_MAX_PAGE + 1,
+            ),
+            Err(PrCommitPageError::InvalidPagination)
+        );
+        assert_eq!(
+            repo.commits_in_pr_snapshot(None, &"f".repeat(40), 0, 1),
+            Err(PrCommitPageError::SnapshotExpired)
+        );
+        assert_eq!(
+            repo.commits_in_pr_snapshot(Some(&"e".repeat(40)), &snapshot.head_oid, 0, 1),
+            Err(PrCommitPageError::SnapshotExpired)
+        );
+        assert_eq!(
+            PR_COMMIT_MAX_PAGE_WALK_OBSERVATIONS,
+            PR_COMMIT_MAX_POSITION + COMMIT_LOG_MAX_PAGE + 1
+        );
+        assert_eq!(
+            PR_COMMIT_MAX_INTERNAL_WALK_NODES,
+            2 * PR_COMMIT_MAX_GRAPH_NODES_PER_PIN
+        );
+        assert_eq!(
+            PR_COMMIT_MAX_INTERNAL_WALK_EDGES,
+            2 * PR_COMMIT_MAX_GRAPH_EDGES_PER_PIN
+        );
+        let at_cap = repo
+            .commits_in_pr_snapshot(
+                snapshot.base_oid.as_deref(),
+                &snapshot.head_oid,
+                PR_COMMIT_MAX_POSITION,
+                COMMIT_LOG_MAX_PAGE,
+            )
+            .unwrap();
+        assert!(at_cap.0.is_empty());
+        assert!(!at_cap.1);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pr_commit_snapshot_preflights_a_disjoint_base_at_the_same_hard_cap() {
+        let root = temp_root("pr-commit-disjoint-base-cap");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let blob = repo.write_blob(b"snapshot\n").unwrap();
+        let tree = repo.write_tree(&[("file.txt", &blob)]).unwrap();
+        let head = write_commit_at(&repo, &tree, &[], "head", 1_700_000_010);
+        let base_one = write_commit_at(&repo, &tree, &[], "base one", 1_700_000_000);
+        let base_two = write_commit_at(&repo, &tree, &[&base_one], "base two", 1_700_000_001);
+        let base_three = write_commit_at(&repo, &tree, &[&base_two], "base three", 1_700_000_002);
+
+        let exact_base_cap = repo
+            .commits_in_pr_snapshot_with_graph_caps(Some(&base_three.0), &head.0, 0, 1, 3, 2)
+            .unwrap();
+        assert_eq!(
+            exact_base_cap.0[0].oid, head.0,
+            "a disjoint base graph exactly at the cap is admitted"
+        );
+        let base_four = write_commit_at(&repo, &tree, &[&base_three], "base four", 1_700_000_003);
+        assert_eq!(
+            repo.commits_in_pr_snapshot_with_graph_caps(Some(&base_four.0), &head.0, 0, 1, 3, 100,),
+            Err(PrCommitPageError::CapacityExceeded),
+            "a disjoint base cap+1 row is observed and refused"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pr_commit_snapshot_caps_wide_frontiers_and_repeated_parent_edges() {
+        let root = temp_root("pr-commit-graph-shape-caps");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let blob = repo.write_blob(b"snapshot\n").unwrap();
+        let tree = repo.write_tree(&[("file.txt", &blob)]).unwrap();
+
+        let wide_one = write_commit_at(&repo, &tree, &[], "wide one", 1_700_000_000);
+        let wide_two = write_commit_at(&repo, &tree, &[], "wide two", 1_700_000_001);
+        let wide_three = write_commit_at(&repo, &tree, &[], "wide three", 1_700_000_002);
+        let wide_head = write_commit_at(
+            &repo,
+            &tree,
+            &[&wide_one, &wide_two, &wide_three],
+            "wide head",
+            1_700_000_003,
+        );
+        assert_eq!(
+            repo.commits_in_pr_snapshot_with_graph_caps(None, &wide_head.0, 0, 1, 3, 100),
+            Err(PrCommitPageError::CapacityExceeded),
+            "the fourth unique OID is refused while discovering a wide parent frontier"
+        );
+
+        let root_commit = write_commit_at(&repo, &tree, &[], "root", 1_700_000_010);
+        let left = write_commit_at(&repo, &tree, &[&root_commit], "left", 1_700_000_011);
+        let right = write_commit_at(&repo, &tree, &[&root_commit], "right", 1_700_000_012);
+        let dense_head =
+            write_commit_at(&repo, &tree, &[&left, &right], "dense head", 1_700_000_013);
+        assert!(repo
+            .commits_in_pr_snapshot_with_graph_caps(None, &dense_head.0, 0, 1, 4, 4)
+            .is_ok());
+        assert_eq!(
+            repo.commits_in_pr_snapshot_with_graph_caps(None, &dense_head.0, 0, 1, 4, 3),
+            Err(PrCommitPageError::CapacityExceeded),
+            "the repeated edge to the already-scheduled root counts toward aggregate edge work"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pr_commit_snapshot_sorted_walk_setup_maps_not_found_races_to_expiry() {
+        for context in [
+            "pull-request revwalk push head",
+            "pull-request revwalk hide base",
+        ] {
+            let missing = git2::Error::new(
+                git2::ErrorCode::NotFound,
+                git2::ErrorClass::Object,
+                "object disappeared after preflight",
+            );
+            assert_eq!(
+                pr_commit_walk_error(context, missing),
+                PrCommitPageError::SnapshotExpired
+            );
+        }
+    }
+
+    #[test]
+    fn pr_commit_snapshot_maps_a_missing_interior_object_to_expiry() {
+        let root = temp_root("pr-commit-missing-interior");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let blob = repo.write_blob(b"snapshot\n").unwrap();
+        let tree = repo.write_tree(&[("file.txt", &blob)]).unwrap();
+        let base = repo
+            .write_commit(&tree, &[], "base", "psn@acme.noreply", "psn@acme.noreply")
+            .unwrap();
+        let interior = repo
+            .write_commit(
+                &tree,
+                &[&base],
+                "interior",
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
+            .unwrap();
+        let head = repo
+            .write_commit(
+                &tree,
+                &[&interior],
+                "head",
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
+            .unwrap();
+
+        let (directory, filename) = interior.0.split_at(2);
+        std::fs::remove_file(repo.path().join("objects").join(directory).join(filename))
+            .expect("remove loose interior commit object");
+        assert_eq!(
+            repo.commits_in_pr_snapshot(Some(&base.0), &head.0, 0, COMMIT_LOG_MAX_PAGE),
+            Err(PrCommitPageError::SnapshotExpired)
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

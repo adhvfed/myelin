@@ -941,6 +941,131 @@ async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// PR commit pagination is exercised through the real authenticated gateway/router, including its
+/// object guard. Each continuation is the encoded snapshot cursor returned by the previous page.
+#[tokio::test]
+async fn pr_commit_pages_are_snapshot_pinned_over_the_durable_http_route() {
+    let root = temp_root("pr-commit-pages");
+    let (gw, cell) = build(&root);
+    let addr = spawn(gw).await;
+    let creator = bearer(&mint(&cell, "acme", "jti-pr-pages"));
+
+    let (status, body) = http(
+        addr,
+        "POST",
+        "/v1/git/repos",
+        &hdr(&creator),
+        br#"{"slug":"pr-pages"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 201, "create repo: {body}");
+    let (status, body) = http(
+        addr,
+        "POST",
+        "/v1/git/repos/pr-pages/blob/main/base.txt",
+        &hdr(&creator),
+        br#"{"base_oid":"","contents":"base\n","message":"base"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200, "create base: {body}");
+
+    let store = DurableGitStore::rooted(&root);
+    let repo = store
+        .open_repo(&RepoLoc::new("acme", REGION, "pr-pages"))
+        .unwrap();
+    let base = repo.read_ref("refs/heads/main").unwrap().unwrap();
+    let blob = repo.write_blob(b"pull request\n").unwrap();
+    let tree = repo.write_tree(&[("feature.txt", &blob)]).unwrap();
+    let own_one = repo
+        .write_commit(
+            &tree,
+            &[&base],
+            "own one",
+            "psn@acme.noreply",
+            "psn@acme.noreply",
+        )
+        .unwrap();
+    let own_two = repo
+        .write_commit(
+            &tree,
+            &[&own_one],
+            "own two",
+            "psn@acme.noreply",
+            "psn@acme.noreply",
+        )
+        .unwrap();
+    let head = repo
+        .write_commit(
+            &tree,
+            &[&own_two],
+            "own three",
+            "psn@acme.noreply",
+            "psn@acme.noreply",
+        )
+        .unwrap();
+    repo.update_ref_cas(
+        "refs/heads/feature",
+        None,
+        Some(&head),
+        "create feature",
+        "psn@acme.noreply",
+    )
+    .unwrap();
+
+    let (status, body) = http(
+        addr,
+        "POST",
+        "/v1/git/repos/pr-pages/prs",
+        &hdr(&creator),
+        br#"{"title":"Paged PR","base_ref":"refs/heads/main","head_ref":"refs/heads/feature"}"#
+            .to_vec(),
+    )
+    .await;
+    assert_eq!(status, 201, "open PR: {body}");
+    assert_eq!(body["applied"]["pr"]["number"], 1);
+
+    let expected =
+        std::collections::BTreeSet::from([head.0.clone(), own_two.0.clone(), own_one.0.clone()]);
+    let mut seen = Vec::new();
+    let mut path = "/v1/git/repos/pr-pages/prs/1/commits?limit=1".to_string();
+    for index in 0..expected.len() {
+        let (status, body) = http(addr, "GET", &path, &hdr(&creator), vec![]).await;
+        assert_eq!(status, 200, "PR commit page {}: {body}", index + 1);
+        let envelope = body.as_object().expect("response envelope");
+        assert_eq!(envelope.len(), 2, "only items and page are present: {body}");
+        assert!(envelope.contains_key("items"));
+        assert!(envelope.contains_key("page"));
+        let page = body["page"].as_object().expect("page envelope");
+        assert_eq!(page.len(), 2, "page shape stays unchanged: {body}");
+        assert_eq!(body["page"]["limit"], 1);
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+        seen.push(body["items"][0]["oid"].as_str().unwrap().to_string());
+
+        if index + 1 < expected.len() {
+            let cursor = body["page"]["next_cursor"]
+                .as_str()
+                .expect("non-terminal cursor");
+            assert!(cursor.starts_with("pc1_"));
+            path = format!("/v1/git/repos/pr-pages/prs/1/commits?cursor={cursor}&limit=1");
+        } else {
+            assert!(
+                body["page"]["next_cursor"].is_null(),
+                "terminal page: {body}"
+            );
+        }
+    }
+    assert_eq!(seen.first(), Some(&head.0), "the pinned head is newest");
+    assert_eq!(
+        seen.iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected,
+        "the terminal pages contain each PR-owned commit exactly once"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// Stable ref keyset pagination stays bounded above the old 1,000-row browse ceiling. Pins remain
 /// outside filtering/page windows, and typed cursor failures map to the endpoint's scoped statuses.
 #[tokio::test]
