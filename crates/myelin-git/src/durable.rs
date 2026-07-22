@@ -44,6 +44,10 @@ use std::path::{Path, PathBuf};
 
 use crate::core::{Oid, RepoLoc};
 use crate::gix_backend::{RepoPathResolver, RootedResolver};
+pub use crate::refs_pagination::{
+    RefKind, RefPageItem, RefsPage, RefsPageError, RefsPageRequest, RefsSummary,
+    REFS_PAGE_DEFAULT_LIMIT, REFS_PAGE_MAX_LIMIT, REFS_PAGE_MAX_QUERY_BYTES,
+};
 
 // ───────────────────────────── errors ────────────────────────────────────────────────────────────
 
@@ -570,7 +574,7 @@ impl DurableGitRepo {
         &self.path
     }
 
-    fn open_git(&self) -> Result<git2::Repository, DurableError> {
+    pub(crate) fn open_git(&self) -> Result<git2::Repository, DurableError> {
         git2::Repository::open(&self.path)
             .map_err(|e| git_err(&format!("open bare repo {}", self.path.display()), e))
     }
