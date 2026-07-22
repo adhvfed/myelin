@@ -3107,6 +3107,9 @@ fn pr_diff_vm(number: u64, base_ref: &str, diff: PrDiff, offset: usize, limit: u
 fn map_durable_err(e: DurableError) -> EdgeError {
     match e {
         DurableError::NotFound(m) => EdgeError::NotFound(m),
+        DurableError::Git(m) if m.starts_with("browse response limit exceeded:") => {
+            EdgeError::PayloadTooLarge("repository view exceeds the interactive browse limit".into())
+        }
         // A traversal-rejected slug / malformed body (e.g. R3.1 open-PR with no `title`) surfaces as a
         // clean 400 (never a silent wrong path, never a 500 for a client input error).
         DurableError::Git(m)
@@ -5258,6 +5261,19 @@ mod pr_list_tests {
             "F8: a non-existent head_ref is a 400 at open, not a merge-time surprise"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn oversized_browse_views_map_to_a_bounded_public_response() {
+        let error = DurableError::Git(
+            "browse response limit exceeded: private repository detail".into(),
+        );
+        let mapped = map_durable_err(error);
+        assert_eq!(mapped.status(), 413);
+        assert_eq!(
+            mapped.to_string(),
+            "413 (payload_too_large): repository view exceeds the interactive browse limit"
+        );
     }
 }
 

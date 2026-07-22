@@ -420,6 +420,10 @@ fn looks_binary(bytes: &[u8]) -> bool {
 pub const FILE_LINES_MAX_RANGE: usize = 1_000;
 /// Maximum blob size inflated by the expand-context API. Checked through the ODB header first.
 pub const FILE_LINES_MAX_BLOB_BYTES: usize = 512 * 1024;
+/// Maximum refs materialized for an interactive browse response.
+pub const BROWSE_MAX_REFS: usize = 1_000;
+/// Maximum entries materialized from one tree directory for an interactive browse response.
+pub const BROWSE_MAX_TREE_ENTRIES: usize = 1_000;
 
 /// **Nested-path traversal guard (R3.4).** A tree-relative path may never carry a `..` or `.` segment
 /// or be absolute — such a path can only be an attempt to escape the committed tree (or a malformed
@@ -1010,6 +1014,15 @@ impl DurableGitRepo {
         ref_name: &str,
         path: &str,
     ) -> Result<TreePathLookup, DurableError> {
+        self.tree_at_path_bounded(ref_name, path, BROWSE_MAX_TREE_ENTRIES)
+    }
+
+    fn tree_at_path_bounded(
+        &self,
+        ref_name: &str,
+        path: &str,
+        maximum: usize,
+    ) -> Result<TreePathLookup, DurableError> {
         let repo = self.open_git()?;
         let Some(commit) = self.resolve_commit(&repo, ref_name)? else {
             return Ok(TreePathLookup::Dir(Vec::new()));
@@ -1041,6 +1054,11 @@ impl DurableGitRepo {
                 _ => return Ok(TreePathLookup::Missing),
             }
         };
+        if tree.len() > maximum {
+            return Err(DurableError::Git(format!(
+                "browse response limit exceeded: tree contains more than {maximum} entries"
+            )));
+        }
         let mut out = Vec::new();
         for entry in tree.iter() {
             let is_dir = matches!(entry.kind(), Some(git2::ObjectType::Tree));
@@ -1164,16 +1182,45 @@ impl DurableGitRepo {
     /// tags `refs/tags/*` (both as SHORT names); the default branch is HEAD's symbolic target (falling
     /// back to `main`). Reads the on-disk refdb — never a seeded list.
     pub fn refs_view(&self) -> Result<RefsView, DurableError> {
+        self.refs_view_bounded(BROWSE_MAX_REFS)
+    }
+
+    fn refs_view_bounded(&self, maximum: usize) -> Result<RefsView, DurableError> {
         let repo = self.open_git()?;
         let mut branches = Vec::new();
         let mut tags = Vec::new();
-        for (name, oid) in self.list_refs()? {
-            if let Some(b) = name.strip_prefix("refs/heads/") {
-                branches.push((b.to_string(), oid));
-            } else if let Some(t) = name.strip_prefix("refs/tags/") {
-                tags.push((t.to_string(), oid));
+        let refs = repo.references().map_err(|e| git_err("references", e))?;
+        let mut materialized = 0usize;
+        for reference in refs {
+            let reference = reference.map_err(|e| git_err("reference iter", e))?;
+            let Some(target) = reference.target() else {
+                continue;
+            };
+            let name = reference.name().map_err(|_| {
+                DurableError::Git("reference name is not valid UTF-8".into())
+            })?;
+            let short = name
+                .strip_prefix("refs/heads/")
+                .map(|name| (true, name))
+                .or_else(|| name.strip_prefix("refs/tags/").map(|name| (false, name)));
+            let Some((is_branch, short)) = short else {
+                continue;
+            };
+            if materialized == maximum {
+                return Err(DurableError::Git(format!(
+                    "browse response limit exceeded: repository contains more than {maximum} branches and tags"
+                )));
+            }
+            materialized += 1;
+            let item = (short.to_string(), Oid::new(target.to_string()));
+            if is_branch {
+                branches.push(item);
+            } else {
+                tags.push(item);
             }
         }
+        branches.sort();
+        tags.sort();
         // HEAD's symbolic target names the default branch — but only if that branch actually EXISTS
         // (libgit2 `init.bare` may leave HEAD pointing at `master` while pushes land on `main`). Resolve
         // to: HEAD's target if it exists, else `main` if present, else the first branch, else `main`.
@@ -3228,6 +3275,22 @@ mod tests {
         assert!(!view.branches.iter().any(|(n, _)| n == "v1.0"), "a tag is not a branch");
         // The default branch is HEAD's target (init_bare points HEAD at main).
         assert_eq!(view.default_branch, "main");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn interactive_browse_rejects_oversized_ref_and_tree_views_before_materializing_them() {
+        let root = temp_root("browse-cardinality");
+        let repo = seed_nested_repo(&root);
+
+        assert!(matches!(
+            repo.refs_view_bounded(1),
+            Err(DurableError::Git(message)) if message.starts_with("browse response limit exceeded:")
+        ));
+        assert!(matches!(
+            repo.tree_at_path_bounded("main", "", 2),
+            Err(DurableError::Git(message)) if message.starts_with("browse response limit exceeded:")
+        ));
         std::fs::remove_dir_all(&root).ok();
     }
 
