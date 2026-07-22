@@ -181,7 +181,11 @@ pub(crate) async fn count_non_terminal_null_stage_jobs_region_scoped(
 /// the `region` GUC transaction-scoped (residency pin, in-band) + clear the tenant GUC → run `op` →
 /// COMMIT (the GUC discarded on commit — no bleed). Mirrors `myelin_storage::with_tenant_tx`'s
 /// mechanism but for a region-wide, cross-tenant SERVICE read.
-async fn with_region_tx<R, F>(pool: &PgPool, region: &str, op: F) -> Result<R, JobQueueStoreError>
+pub(crate) async fn with_region_tx<R, F>(
+    pool: &PgPool,
+    region: &str,
+    op: F,
+) -> Result<R, JobQueueStoreError>
 where
     F: for<'c> FnOnce(
             &'c mut sqlx::PgConnection,

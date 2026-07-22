@@ -1,14 +1,15 @@
 //! **The ROLLING-UPGRADE migration proof (CT-004d.2).** The existing migration tests prove a FRESH
 //! bootstrap applies the whole set. This proves the UPGRADE path from the already-shipped completion
 //! WIP: apply the sequence with `ci_0004a`/`ci_0015a`/`ci_0016a`, then apply the full set. Those
-//! shared ids checksum-match and the new `ci_0004b`/`ci_0016b` migrations add nonce authority. This is
-//! the checked
-//! invariant behind editing NO applied migration DDL (the base creates stay byte-frozen).
+//! shared ids checksum-match and the new additive migrations add nonce authority plus queued-run
+//! discovery. This is the checked invariant behind editing NO applied migration DDL (the base
+//! creates stay byte-frozen).
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
     ci_controlplane_hot_tables, ci_controlplane_migrations,
-    CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID, CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID,
+    CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID, CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID,
+    CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID, CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID,
 };
 use myelin_storage::PgMigrator;
 use myelin_substrate::Migrations;
@@ -41,10 +42,12 @@ async fn pinned_pool(schema: &str) -> PgPool {
         .expect("connect schema-pinned admin pool (is the dev stack up?)")
 }
 
-/// The two new follow-ons; every earlier migration id/DDL represents the deployed WIP schema.
+/// The additive follow-ons; every other migration id/DDL represents the deployed WIP schema.
 const NEW_SUB_MIGRATION_IDS: &[&str] = &[
     CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID,
     CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID,
+    CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID,
+    CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID,
 ];
 
 /// The full set with the new sub-migrations filtered OUT — the sequence a pre-CT-004d.2 deploy applied.
@@ -103,7 +106,7 @@ async fn claim_authority_followons_preserve_applied_wip_checksums() {
     assert!(!column_exists(&pool, &schema, "job_queue", "stage").await);
 
     // ── 2. Apply the NEW full set over the old schema — the shared applied ids checksum-match (the base
-    //       a-suffix DDL is byte-frozen), and only the two b-suffix migrations apply. ──
+    //       a-suffix DDL is byte-frozen), and only the additive follow-ons apply. ──
     PgMigrator::apply_validated(
         &pool,
         &ci_controlplane_migrations(),

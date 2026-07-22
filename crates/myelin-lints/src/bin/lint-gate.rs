@@ -158,6 +158,14 @@ const EXCLUDED_SUBSTRINGS: &[&str] = &[
     // LOUD exclusion of a single file (see the module note in job_queue_region.rs), never a silent
     // skip; the lint is NOT weakened.
     "myelin-ci-controlplane/src/job_queue_region.rs",
+    // Queued CI-run TENANT DISCOVERY is the starter-side twin of the region queue claim above. It
+    // intentionally scans `ci_run` across tenants to return only the tenant owning the oldest queued
+    // run in the scheduler's server-mapped region. The dedicated role has SELECT on only five
+    // routing/order columns, paired permissive+restrictive RLS requires empty tenant scope and exact
+    // mapped/client region, and the returned TenantId is handed to the ordinary tenant-scoped
+    // starter. NAMED, LOUD exclusion of this one file (see its module note); all tenant-bound ci_run
+    // reads and mutations remain fully linted in ci_run_store.rs.
+    "myelin-ci-controlplane/src/ci_run_region.rs",
     // The CI scheduler DATABASE AUTHORIZATION PROBE reads only PostgreSQL identity/catalog grants
     // and the private session_user→region authorization function. These are database/cell control-
     // plane facts spanning roles by design, not tenant-store rows, so the tenant-predicate scanner's
