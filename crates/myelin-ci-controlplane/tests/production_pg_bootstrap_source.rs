@@ -61,6 +61,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     // while the refusal stands: it is gated on the runner-host request, not spawned unconditionally.
     assert!(source.contains("if runner_host_requested {"));
     assert!(source.contains("let runner_host_requested = matches!(&runner_setting"));
+    assert!(library_source.contains("LinuxSmallV1LaunchAuthority::new"));
+    assert!(library_source.contains("UnavailableCiJobRuntimeAuthority"));
+    assert!(library_source.contains("PgCiRunStarterFactory::new_with_authority"));
     // It routes an AUTHORITATIVE tenant, never a synthetic one — no starter is constructed for a fixed
     // service tenant at the root (the factory mints per discovered ci_run.tenant_id).
     assert!(!source.contains("PgCiPipelineStarter::new"));

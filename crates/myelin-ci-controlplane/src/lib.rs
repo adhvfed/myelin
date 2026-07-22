@@ -854,24 +854,28 @@ pub fn ci_run_store_factory(pool: sqlx::PgPool) -> CiRunStore {
 /// **DORMANT + activation-gated.** `main` composes this behind the SAME `MYELIN_CI_RUNNER` seam the
 /// runner lane uses: while the startup refusal keeps `MYELIN_CI_RUNNER=1` fail-closed, the factory is
 /// constructed but no minted starter is driven (constructing it wraps the pool + blob client only — no
-/// query runs), so no queued run is started yet. This composition deliberately carries the starter's
-/// unavailable-authority adapter: even if it were accidentally driven, every fresh V2 launch would
-/// fail before allocating attempts or writing a manifest. The later activation flip must explicitly
-/// replace that adapter, attach [`PgCiRunStarterPoller`] to coordinated lifecycle shutdown with the
-/// deployed workflow-definition pin, compose the exact manifest-to-sandbox runner/token authority
-/// and terminal settlement path, and close the remaining worker budget/remint floors.
+/// query runs), so no queued run is started yet. Production construction does bind the real fixed,
+/// default-deny `linux-small-v1` policy; its external durable budget/token provider is explicitly
+/// unavailable and fabricates no handles. Even if accidentally driven, a fresh V2 launch therefore
+/// fails before attempts or manifest state. The activation flip must replace that one provider,
+/// attach [`PgCiRunStarterPoller`] to coordinated lifecycle shutdown with the deployed definition
+/// pin, compose the exact manifest-to-sandbox runner/token authority and terminal settlement path,
+/// and close the remaining worker budget/remint floors.
 pub fn ci_run_starter_factory(
     pool: sqlx::PgPool,
     region: myelin_tenancy::Region,
     blobs: std::sync::Arc<dyn myelin_storage::BlobStore + Send + Sync>,
     rt: tokio::runtime::Handle,
 ) -> PgCiRunStarterFactory {
-    PgCiRunStarterFactory::new(
+    PgCiRunStarterFactory::new_with_authority(
         pool,
         rt,
         std::sync::Arc::new(myelin_events::MonotonicMinter::new()),
         region,
         blobs,
+        std::sync::Arc::new(ci_launch_authority::LinuxSmallV1LaunchAuthority::new(
+            std::sync::Arc::new(ci_launch_authority::UnavailableCiJobRuntimeAuthority),
+        )),
     )
 }
 
