@@ -757,7 +757,7 @@ pub fn merge_pr<P: RepoPathResolver>(
 
     // Validate the head is a REAL fast-forward target of the base (never advance to an arbitrary oid).
     let base = RefName::new(rec.base_ref.clone());
-    let cur_tip: Option<CoreOid> = ref_store.tip(&base).map(|o| CoreOid::new(o.0));
+    let cur_tip: Option<CoreOid> = ref_store.try_tip(&base)?.map(|o| CoreOid::new(o.0));
     let head_core = CoreOid::new(rec.head_oid.clone());
     if !repo.object_is_commit(&head_core) {
         return Ok(MergeAttempt::InvalidHead(format!(

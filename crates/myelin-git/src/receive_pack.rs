@@ -873,6 +873,12 @@ impl RefStore {
     /// so a tip read of ref A never blocks a CAS on ref B). On the durable path this LOADS FROM DISK
     /// — a FRESH `RefStore` over the same on-disk root reads the persisted tip (SI-012 fixed).
     pub fn tip(&self, ref_name: &RefName) -> Option<Oid> {
+        self.try_tip(ref_name).ok().flatten()
+    }
+
+    /// Fallible tip read for production decisions. Unlike [`Self::tip`], a durable repository fault
+    /// is surfaced and cannot be mistaken for an absent branch during a push or merge.
+    pub fn try_tip(&self, ref_name: &RefName) -> Result<Option<Oid>, crate::durable::DurableError> {
         let lock = self.ref_lock(ref_name);
         let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
         self.tip_of(ref_name)
@@ -910,16 +916,16 @@ impl RefStore {
 
     /// Read a ref's current tip from the backing (NO lock taken here — callers hold the per-ref lock).
     /// Memory: the modeled `git_ref` row; Disk: the real on-disk ref.
-    fn tip_of(&self, ref_name: &RefName) -> Option<Oid> {
+    fn tip_of(&self, ref_name: &RefName) -> Result<Option<Oid>, crate::durable::DurableError> {
         match &self.backing {
-            RefBacking::Memory { rows, .. } => rows
+            RefBacking::Memory { rows, .. } => Ok(rows
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(ref_name)
-                .map(|r| r.target_oid.clone()),
-            RefBacking::Disk { repo } => {
-                repo.read_ref(&ref_name.0).ok().flatten().map(|o| Oid::new(o.0))
-            }
+                .map(|r| r.target_oid.clone())),
+            RefBacking::Disk { repo } => repo
+                .read_ref(&ref_name.0)
+                .map(|tip| tip.map(|o| Oid::new(o.0))),
         }
     }
 
@@ -1104,7 +1110,9 @@ impl RefStore {
         // single stale ref aborts the WHOLE atomic push (no partial write). Reading the backing under
         // the held lock is the `SELECT … FOR UPDATE` row read.
         for u in &push.updates {
-            let actual = self.tip_of(&u.ref_name).unwrap_or_else(Oid::zero);
+            let actual = self.tip_of(&u.ref_name).map_err(|e| {
+                OutboxError(format!("read durable ref tip for {}: {e}", u.ref_name.0))
+            })?.unwrap_or_else(Oid::zero);
             if actual != u.expected_old {
                 // Reject BEFORE moving any ref — drop the locks (transaction never opened) → 0 ghost.
                 return Ok(PushOutcome::Rejected(RejectReason::NonFastForward {
@@ -1124,7 +1132,9 @@ impl RefStore {
         // Stage each ref-CAS as the transaction's state change + emit its git.ref.updated together.
         let mut planned: Vec<(RefName, Oid, u64, Option<Oid>, myelin_events::EventId)> = Vec::new();
         for u in &push.updates {
-            let old = self.tip_of(&u.ref_name);
+            let old = self.tip_of(&u.ref_name).map_err(|e| {
+                OutboxError(format!("read durable ref tip for {}: {e}", u.ref_name.0))
+            })?;
             let prev_seq = self.seq_of(&u.ref_name)?;
             let new_seq = prev_seq.checked_add(1).ok_or_else(|| {
                 OutboxError(format!("ref generation exhausted for {}", u.ref_name.0))
@@ -2474,6 +2484,37 @@ mod tests {
             store.holder().registered,
             "the store auto-registered as H1 on open"
         );
+    }
+
+    #[test]
+    fn durable_tip_read_fault_aborts_before_outbox_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "myelin-ref-tip-fault-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let loc = crate::core::RepoLoc::new("acme", "fr-par", "core");
+        let durable = Arc::new(
+            crate::durable::DurableGitStore::rooted(&root)
+                .create_repo(&loc)
+                .expect("create durable repo"),
+        );
+        let outbox = OutboxStore::new();
+        let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+        let store = RefStore::open_durable(durable, "core", ctx_base(), outbox.clone(), minter);
+        std::fs::remove_dir_all(&root).expect("inject repository disappearance");
+
+        assert!(store.try_tip(&RefName::new("refs/heads/feature")).is_err());
+        let result = store.receive(
+            &human_push("refs/heads/feature", Oid::zero(), Oid::new("new")),
+            &InMemoryObjectDb::new(),
+            CrashPoint::None,
+        );
+        assert!(result.is_err(), "a missing durable repo is not an absent ref");
+        assert_eq!(outbox.committed_count(), 0, "no event commits on an invented empty tip");
     }
 
     /// **`is_protected` distinguishes protected from feature refs** (kills the `-> true` mutant):

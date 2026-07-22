@@ -1109,7 +1109,7 @@ impl PgPrStore {
         }
 
         let base = RefName::new(record.base_ref.clone());
-        let actual_before = ref_store.tip(&base);
+        let actual_before = ref_store.try_tip(&base)?;
         if !target_repo.is_fast_forward(
             actual_before
                 .as_ref()
@@ -1217,7 +1217,7 @@ impl PgPrStore {
             intent.operation_id
         )));
         let base = RefName::new(intent.base_ref.clone());
-        let actual = ref_store.tip(&base);
+        let actual = ref_store.try_tip(&base)?;
         let attempt = if actual.as_ref().map(|oid| oid.0.as_str())
             == Some(intent.head_oid.as_str())
         {
@@ -1280,7 +1280,7 @@ impl PgPrStore {
         merger_pseudonym: &str,
     ) -> Result<MergeAttempt, DurableError> {
         let base = RefName::new(intent.base_ref.clone());
-        let actual = ref_store.tip(&base);
+        let actual = ref_store.try_tip(&base)?;
         if actual.as_ref().map(|oid| oid.0.as_str()) == Some(intent.head_oid.as_str()) {
             let update_seq = target_repo.ref_generation(&base.0)?;
             return self.finalize_merge(scope, repo, number, intent, command_hash, update_seq, ctx);
@@ -1312,7 +1312,7 @@ impl PgPrStore {
             .map_err(|_| DurableError::Git("merge ref advance failed".into()))?
         {
             PushOutcome::Accepted { moved, .. } => {
-                if ref_store.tip(&base).as_ref().map(|oid| oid.0.as_str())
+                if ref_store.try_tip(&base)?.as_ref().map(|oid| oid.0.as_str())
                     != Some(intent.head_oid.as_str())
                 {
                     return Err(DurableError::Git(
@@ -1323,7 +1323,7 @@ impl PgPrStore {
                 self.finalize_merge(scope, repo, number, intent, command_hash, update_seq, ctx)
             }
             PushOutcome::Rejected(_reason) => {
-                let actual = ref_store.tip(&base);
+                let actual = ref_store.try_tip(&base)?;
                 if actual.as_ref().map(|oid| oid.0.as_str()) == Some(intent.head_oid.as_str()) {
                     let update_seq = target_repo.ref_generation(&base.0)?;
                     self.finalize_merge(scope, repo, number, intent, command_hash, update_seq, ctx)
