@@ -26,7 +26,7 @@ import {
 import { parseFileLinesInput, parseFileLinesResponse } from "./file-lines";
 import { parseBlob, parseRefs, parseRepoHome, parseTree } from "./repo-read-response";
 import { parseRepoListPage } from "./repo-list-response";
-import { parseCommitDiff, parseCommitsPage } from "./commit-read-response";
+import { parseCommitDiff, parseCommitsPage, parsePrCommitsPage } from "./commit-read-response";
 import { parsePr, parsePrDiff, parsePrListPage } from "./pr-read-response";
 import { parseIssueId, parseIssueListInput } from "./issue-read-input";
 import {
@@ -34,7 +34,7 @@ import {
   parseGitCommitInput,
   parseGitCommitsInput,
   parseGitMyPrsInput,
-  parseGitPrCursorInput,
+  parseGitPrCommitsInput,
   parseGitPrDiffInput,
   parseGitPrInput,
   parseGitRepoListInput,
@@ -45,6 +45,7 @@ import {
   gitRefsSearchParams,
   gitRepoListSearchParams,
   gitTreeSearchParams,
+  gitPrCommitsPath,
   type GitRepoListInput,
   type GitRefsInput,
   type GitTreeInput,
@@ -186,6 +187,17 @@ export interface CommitsPage {
     range?: { from: number; to: number };
   };
 }
+
+export interface PrCommitsPage {
+  items: CommitRowVM[];
+  page: {
+    next_cursor: string | null;
+    limit: number;
+  };
+}
+
+/** A compact overview page that still makes pagination meaningful in ordinary pull requests. */
+export const PR_COMMITS_PAGE_LIMIT = 20;
 
 /** One unified-diff line: `+` add / `-` remove / ` ` context (the three-channel diff signal).
  *  `old_no`/`new_no` are the additive R3.2 line-number fields (null on `+`/`-` respectively; absent
@@ -769,14 +781,13 @@ export const getPrThreads = query(
 
 /** The commits IN a PR (GET /v1/git/repos/{repo}/prs/{n}/commits) — reachable from head but not base. */
 export const getPrCommits = query(
-  async (input: { repo: string; n: number; cursor?: string }): Promise<CommitsPage> => {
+  async (input: { repo: string; n: number; limit?: number; cursor?: string }): Promise<PrCommitsPage> => {
     "use server";
-    const parsed = parseGitPrCursorInput(input);
+    const parsed = parseGitPrCommitsInput(input);
     if (!parsed) throw new RepoRouteError("error");
-    const q = parsed.cursor ? `?cursor=${seg(parsed.cursor)}` : "";
     return authed(async () => {
-      const page = parseCommitsPage(await edgeGet(
-        `/v1/git/repos/${seg(parsed.repo)}/prs/${parsed.n}/commits${q}`,
+      const page = parsePrCommitsPage(await edgeGet(
+        gitPrCommitsPath(parsed),
       ));
       if (!page) throw new RepoRouteError("error");
       return page;

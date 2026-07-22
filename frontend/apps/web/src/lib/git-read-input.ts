@@ -30,8 +30,11 @@ export interface GitMyPrsInput {
   bucket: "needs-review" | "yours";
   cursor?: string;
 }
-export interface GitPrCursorInput extends GitPrInput { cursor?: string }
-export interface GitPrDiffInput extends GitPrCursorInput { view?: "split" | "unified" }
+export interface GitPrCommitsInput extends GitPrInput {
+  limit?: number;
+  cursor?: string;
+}
+export interface GitPrDiffInput extends GitPrInput { cursor?: string; view?: "split" | "unified" }
 
 function record(value: unknown): WireRecord | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -96,6 +99,32 @@ export function isRepoListCursor(value: unknown): value is string {
     const decoded = atob(padded);
     const canonical = btoa(decoded).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
     return canonical === encoded;
+  } catch {
+    return false;
+  }
+}
+
+/** A canonical PR-commit cursor (`pc1_` + the Edge's exact 78-byte v1 frame). */
+export function isPrCommitCursor(value: unknown): value is string {
+  if (!bounded(value, 256) || !/^pc1_[A-Za-z0-9_-]+$/.test(value)) return false;
+  const encoded = value.slice("pc1_".length);
+  if (encoded.length % 4 === 1) return false;
+  try {
+    const padded = encoded.replace(/-/g, "+").replace(/_/g, "/") +
+      "=".repeat((4 - (encoded.length % 4)) % 4);
+    const decoded = atob(padded);
+    const canonical = btoa(decoded).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    if (canonical !== encoded || decoded.length !== 78 || decoded.charCodeAt(0) !== 1) return false;
+
+    const baseKind = decoded.charCodeAt(33);
+    if (baseKind !== 0 && baseKind !== 1) return false;
+    if (baseKind === 0 && [...decoded.slice(34, 54)].some((byte) => byte.charCodeAt(0) !== 0)) {
+      return false;
+    }
+    const position = new DataView(
+      Uint8Array.from(decoded, (byte) => byte.charCodeAt(0)).buffer,
+    ).getUint32(74, false);
+    return position >= 1 && position <= 100_000;
   } catch {
     return false;
   }
@@ -257,15 +286,31 @@ export function parseGitMyPrsInput(value: unknown): GitMyPrsInput | null {
   };
 }
 
-export function parseGitPrCursorInput(value: unknown): GitPrCursorInput | null {
+export function parseGitPrCommitsInput(value: unknown): GitPrCommitsInput | null {
   const input = record(value);
-  if (!input || !exact(input, ["repo", "n", "cursor"]) || !repo(input.repo) ||
-      !prNumber(input.n) || (input.cursor !== undefined && !safeCursor(input.cursor))) return null;
+  if (!input || !exact(input, ["repo", "n", "limit", "cursor"]) || !repo(input.repo) ||
+      !prNumber(input.n) || (input.limit !== undefined && (!Number.isSafeInteger(input.limit) ||
+        (input.limit as number) < 1 || (input.limit as number) > 100)) ||
+      (input.cursor !== undefined && !isPrCommitCursor(input.cursor))) return null;
   return {
     repo: input.repo,
     n: input.n,
+    ...(input.limit === undefined ? {} : { limit: input.limit as number }),
     ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
   };
+}
+
+export function gitPrCommitsSearchParams(input: GitPrCommitsInput): URLSearchParams {
+  const params = new URLSearchParams();
+  if (input.limit !== undefined) params.set("limit", String(input.limit));
+  if (input.cursor !== undefined) params.set("cursor", input.cursor);
+  return params;
+}
+
+export function gitPrCommitsPath(input: GitPrCommitsInput): string {
+  const query = gitPrCommitsSearchParams(input).toString();
+  const path = `/v1/git/repos/${encodeURIComponent(input.repo)}/prs/${input.n}/commits`;
+  return query ? `${path}?${query}` : path;
 }
 
 export function parseGitPrDiffInput(value: unknown): GitPrDiffInput | null {

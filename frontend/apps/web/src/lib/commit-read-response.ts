@@ -1,4 +1,12 @@
-import type { CommitDiffVM, CommitRowVM, CommitsPage, DiffFileVM, DiffLineVM } from "./api";
+import type {
+  CommitDiffVM,
+  CommitRowVM,
+  CommitsPage,
+  DiffFileVM,
+  DiffLineVM,
+  PrCommitsPage,
+} from "./api";
+import { isPrCommitCursor } from "./git-read-input";
 
 const utf8 = new TextEncoder();
 type WireRecord = Record<string, unknown>;
@@ -7,6 +15,11 @@ function record(value: unknown): WireRecord | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as WireRecord
     : null;
+}
+
+function exact(value: WireRecord, keys: readonly string[]): boolean {
+  const actual = Object.keys(value);
+  return actual.length === keys.length && actual.every((key) => keys.includes(key));
 }
 
 function bounded(value: unknown, maximum: number): value is string {
@@ -48,6 +61,15 @@ function commitRow(value: unknown): CommitRowVM | null {
   };
 }
 
+function exactCommitRow(value: unknown): CommitRowVM | null {
+  const row = record(value);
+  if (!row || !exact(row, ["oid", "short_oid", "summary", "author", "committed_at", "parents"])) {
+    return null;
+  }
+  const projected = commitRow(row);
+  return projected && projected.short_oid === projected.oid.slice(0, 12) ? projected : null;
+}
+
 export function parseCommitsPage(value: unknown): CommitsPage | null {
   const envelope = record(value);
   const page = record(envelope?.page);
@@ -74,6 +96,29 @@ export function parseCommitsPage(value: unknown): CommitsPage | null {
       ...(page.offset === undefined ? {} : { offset: page.offset }),
       ...(range ? { range } : {}),
     },
+  };
+}
+
+/** Strict projection for the snapshot-paged PR commit route; branch history keeps its legacy shape. */
+export function parsePrCommitsPage(value: unknown): PrCommitsPage | null {
+  const envelope = record(value);
+  const page = record(envelope?.page);
+  if (!envelope || !exact(envelope, ["items", "page"]) || !Array.isArray(envelope.items) ||
+      !page || !exact(page, ["next_cursor", "limit"]) ||
+      !Number.isSafeInteger(page.limit) || (page.limit as number) < 1 ||
+      (page.limit as number) > 100 || envelope.items.length > (page.limit as number) ||
+      (page.next_cursor !== null && !isPrCommitCursor(page.next_cursor))) return null;
+
+  const items = envelope.items.map(exactCommitRow);
+  if (!items.every((item): item is CommitRowVM => item !== null)) return null;
+  const seen = new Set<string>();
+  for (const item of items) {
+    if (seen.has(item.oid)) return null;
+    seen.add(item.oid);
+  }
+  return {
+    items,
+    page: { next_cursor: page.next_cursor, limit: page.limit as number },
   };
 }
 

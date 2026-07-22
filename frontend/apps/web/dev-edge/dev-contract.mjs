@@ -10,6 +10,8 @@
 // enriched object-addressed RepoHome. Keeping those fixtures distinct prevents either shape from
 // accidentally satisfying the other's decoder.
 
+import { createHash } from "node:crypto";
+
 export const DEV_ACCESS_TOKEN = "dev.access.myelin-shell-e2e";
 export const DEV_REFRESH_TOKEN = "dev.refresh.myelin-shell-e2e";
 export const DEV_SCHEME = "pat";
@@ -625,7 +627,7 @@ const SEED_PRS = {
       reviews: 0,
       created_at: 1719360000,
       updated_at: 1719446400,
-      commits_count: 2,
+      commits_count: 23,
       commits_count_capped: false,
       durable: true,
     },
@@ -807,13 +809,150 @@ export function prThreadsJson(repo, n, viewer = "u_dev_operator@acme.noreply") {
     durable: true,
   };
 }
-/** GET …/prs/{n}/commits → the MR-014 commits envelope. */
-export function prCommitsEnvelope(repo, n, limit = 50) {
+const PR_COMMIT_CURSOR_PREFIX = "pc1_";
+const PR_COMMIT_CURSOR_FRAME_BYTES = 78;
+const PR_COMMIT_CURSOR_MAX_BYTES = 256;
+const PR_COMMIT_CURSOR_MAX_POSITION = 100_000;
+const PR_COMMIT_QUERY_MAX_BYTES = 16 * 1024;
+
+function prCommitScope(repo, n) {
+  return createHash("sha256").update(`myelin-dev-pr-commits\0${repo}\0${n}`).digest();
+}
+
+function oidBytes(oid) {
+  return Buffer.from(oid, "hex");
+}
+
+function mintPrCommitCursor(repo, n, baseOid, headOid, position) {
+  const frame = Buffer.alloc(PR_COMMIT_CURSOR_FRAME_BYTES);
+  frame[0] = 1;
+  prCommitScope(repo, n).copy(frame, 1);
+  if (baseOid) {
+    frame[33] = 1;
+    oidBytes(baseOid).copy(frame, 34);
+  }
+  oidBytes(headOid).copy(frame, 54);
+  frame.writeUInt32BE(position, 74);
+  return `${PR_COMMIT_CURSOR_PREFIX}${frame.toString("base64url")}`;
+}
+
+function parsePrCommitCursor(value, repo, n) {
+  if (typeof value !== "string" || value.length > PR_COMMIT_CURSOR_MAX_BYTES ||
+      !value.startsWith(PR_COMMIT_CURSOR_PREFIX)) return null;
+  const encoded = value.slice(PR_COMMIT_CURSOR_PREFIX.length);
+  if (!encoded || !/^[A-Za-z0-9_-]+$/.test(encoded)) return null;
+  let frame;
+  try {
+    frame = Buffer.from(encoded, "base64url");
+  } catch {
+    return null;
+  }
+  if (frame.length !== PR_COMMIT_CURSOR_FRAME_BYTES || frame[0] !== 1 ||
+      frame.toString("base64url") !== encoded || !frame.subarray(1, 33).equals(prCommitScope(repo, n))) {
+    return null;
+  }
+  const baseDiscriminator = frame[33];
+  const baseBytes = frame.subarray(34, 54);
+  let baseOid;
+  if (baseDiscriminator === 0) {
+    if (!baseBytes.equals(Buffer.alloc(20))) return null;
+    baseOid = null;
+  } else if (baseDiscriminator === 1) {
+    baseOid = baseBytes.toString("hex");
+  } else {
+    return null;
+  }
+  const position = frame.readUInt32BE(74);
+  if (position < 1 || position > PR_COMMIT_CURSOR_MAX_POSITION) return null;
+  return {
+    base_oid: baseOid,
+    head_oid: frame.subarray(54, 74).toString("hex"),
+    position,
+  };
+}
+
+function prCommitRows(n) {
+  if (n !== 1) {
+    const head = SEED_PRS[n]?.pr.head_oid;
+    return head ? [{
+      oid: head,
+      short_oid: head.slice(0, 12),
+      summary: "Wire the context pane region",
+      author: "u_dev_operator@acme.noreply",
+      committed_at: 1719360000,
+      parents: [C1],
+    }] : [];
+  }
+  const olderOids = Array.from({ length: 22 }, (_, index) =>
+    BigInt(0x1000 + index).toString(16).padStart(40, "0"));
+  const oids = [C2, ...olderOids];
+  return oids.map((oid, index) => ({
+    oid,
+    short_oid: oid.slice(0, 12),
+    summary: index === 0 ? "Wire the context pane region" : `PR continuation commit ${23 - index}`,
+    author: "u_dev_operator@acme.noreply",
+    committed_at: 1719360000 - index,
+    parents: [oids[index + 1] ?? C1],
+  }));
+}
+
+/** Strict raw-query parser for the snapshot-paged PR commit route. */
+export function parsePrCommitsQuery(repo, n, rawQuery) {
+  if (typeof rawQuery !== "string" || rawQuery.length > PR_COMMIT_QUERY_MAX_BYTES) return null;
+  let limit = 50;
+  let cursor;
+  let sawLimit = false;
+  let sawCursor = false;
+  if (rawQuery) {
+    for (const pair of rawQuery.split("&")) {
+      const separator = pair.indexOf("=");
+      if (separator < 0) return null;
+      const name = pair.slice(0, separator);
+      const value = pair.slice(separator + 1);
+      if (name === "limit") {
+        if (sawLimit || !/^(?:[1-9]|[1-9][0-9]|100)$/.test(value)) return null;
+        sawLimit = true;
+        limit = Number(value);
+      } else if (name === "cursor") {
+        if (sawCursor) return null;
+        sawCursor = true;
+        cursor = value;
+      } else {
+        return null;
+      }
+    }
+  }
+  if (cursor !== undefined) {
+    const snapshot = parsePrCommitCursor(cursor, repo, n);
+    if (!snapshot) return null;
+    return { limit, position: snapshot.position, snapshot };
+  }
+  return { limit, position: 0 };
+}
+
+/** GET …/prs/{n}/commits → the exact snapshot-paged MR-014 commits envelope. */
+export function prCommitsEnvelope(repo, n, input) {
   if (repo !== "myelin" || !SEED_PRS[n]) return null;
-  const items = [
-    { oid: C2, short_oid: C2.slice(0, 7), summary: "Wire the context pane region", author: "u_dev_operator@acme.noreply", committed_at: 1719360000, parents: [C1] },
-  ];
-  return { items, page: { next_cursor: null, limit, offset: 0 } };
+  if (input.snapshot && (
+    input.snapshot.base_oid !== C1 || input.snapshot.head_oid !== SEED_PRS[n].pr.head_oid
+  )) return { expired: true };
+  const rows = prCommitRows(n);
+  const items = rows.slice(input.position, input.position + input.limit);
+  const nextPosition = input.position + items.length;
+  return {
+    items,
+    page: {
+      next_cursor: nextPosition < rows.length
+        ? mintPrCommitCursor(repo, n, C1, SEED_PRS[n].pr.head_oid, nextPosition)
+        : null,
+      limit: input.limit,
+    },
+  };
+}
+
+/** The production `EdgeError::Conflict` envelope for an unavailable pinned commit snapshot. */
+export function prCommitCursorExpiredEnvelope() {
+  return { error: { message: "pull request commit cursor expired", code: "conflict" } };
 }
 
 /** Mirror `PrOperationId::parse`: production trims one non-empty, bounded ASCII-graphic key. */

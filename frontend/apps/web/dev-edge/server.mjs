@@ -29,6 +29,8 @@ import {
   prDiffJson,
   fileLinesJson,
   prCommitsEnvelope,
+  prCommitCursorExpiredEnvelope,
+  parsePrCommitsQuery,
   validPrOperationId,
   devPost,
   repoPrsEnvelope,
@@ -82,6 +84,9 @@ const state = {
   issueListCursorRequests: 0,
   issueListCursorResponses: 0,
   issueListCursorRequestsByState: { open: 0, closed: 0, all: 0 },
+  prCommitContinuationFailures: 0,
+  prCommitContinuationMalformedPages: 0,
+  prCommitContinuationRequests: 0,
 };
 
 let issueRows = freshIssueFixtures();
@@ -129,6 +134,12 @@ function resetIssues() {
   state.issueListCursorRequests = 0;
   state.issueListCursorResponses = 0;
   state.issueListCursorRequestsByState = { open: 0, closed: 0, all: 0 };
+}
+
+function resetPrCommitPagination() {
+  state.prCommitContinuationFailures = 0;
+  state.prCommitContinuationMalformedPages = 0;
+  state.prCommitContinuationRequests = 0;
 }
 
 function send(res, status, json, headers = {}) {
@@ -215,7 +226,10 @@ const server = createServer((req, res) => {
         if (typeof body.devLoginEnabled === "boolean") state.devLoginEnabled = body.devLoginEnabled;
         if (typeof body.tokenLoginEnabled === "boolean") state.tokenLoginEnabled = body.tokenLoginEnabled;
         if (typeof body.forceUnauthorized === "boolean") state.forceUnauthorized = body.forceUnauthorized;
-        if (body.resetPrFixtures === true) resetPrFixtures();
+        if (body.resetPrFixtures === true) {
+          resetPrFixtures();
+          resetPrCommitPagination();
+        }
         if (body.resetIssues === true) resetIssues();
         if (typeof body.emptyIssues === "boolean") state.emptyIssues = body.emptyIssues;
         if (typeof body.onlyClosedIssues === "boolean") state.onlyClosedIssues = body.onlyClosedIssues;
@@ -224,6 +238,12 @@ const server = createServer((req, res) => {
         if (typeof body.issueActivationUnavailable === "boolean") state.issueActivationUnavailable = body.issueActivationUnavailable;
         if (typeof body.issueCreateUnavailable === "boolean") state.issueCreateUnavailable = body.issueCreateUnavailable;
         if (typeof body.issueCloseUnavailable === "boolean") state.issueCloseUnavailable = body.issueCloseUnavailable;
+        if (Number.isInteger(body.prCommitContinuationFailures) && body.prCommitContinuationFailures >= 0) {
+          state.prCommitContinuationFailures = body.prCommitContinuationFailures;
+        }
+        if (Number.isInteger(body.prCommitContinuationMalformedPages) && body.prCommitContinuationMalformedPages >= 0) {
+          state.prCommitContinuationMalformedPages = body.prCommitContinuationMalformedPages;
+        }
         if (Number.isInteger(body.issueListFirstPageHolds) && body.issueListFirstPageHolds >= 0) {
           state.issueListFirstPageHolds = body.issueListFirstPageHolds;
         }
@@ -533,7 +553,34 @@ const server = createServer((req, res) => {
     }
     // R3.3 — the commits IN a PR.
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/commits$/))) {
-      const v = prCommitsEnvelope(seg(m[1]), Number(m[2]), limit);
+      const repo = seg(m[1]);
+      const number = Number(m[2]);
+      const input = parsePrCommitsQuery(repo, number, url.search.slice(1));
+      if (!input) {
+        return send(res, 400, {
+          error: { message: "invalid pull request commit request", code: "bad_request" },
+        });
+      }
+      const v = prCommitsEnvelope(repo, number, input);
+      if (v?.expired === true) {
+        return send(res, 409, prCommitCursorExpiredEnvelope());
+      }
+      if (input.position > 0 && v) {
+        state.prCommitContinuationRequests += 1;
+        if (state.prCommitContinuationFailures > 0) {
+          state.prCommitContinuationFailures -= 1;
+          return send(res, 503, {
+            error: { message: "pull request commits are temporarily unavailable", code: "unavailable" },
+          });
+        }
+        if (state.prCommitContinuationMalformedPages > 0) {
+          state.prCommitContinuationMalformedPages -= 1;
+          const first = prCommitsEnvelope(repo, number, { limit: 1, position: 0 });
+          if (first && !first.expired && first.items[0] && v.items[0]) {
+            return send(res, 200, { ...v, items: [first.items[0], ...v.items.slice(1)] });
+          }
+        }
+      }
       return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("pull request"));
     }
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)$/))) {
