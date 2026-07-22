@@ -26,11 +26,17 @@ import {
 import { parseFileLinesInput, parseFileLinesResponse } from "./file-lines";
 import { parseBlob, parseRefs, parseRepoHome, parseReposPage, parseTree } from "./repo-read-response";
 import { parseCommitDiff, parseCommitsPage } from "./commit-read-response";
+import { parsePr, parsePrDiff, parsePrListPage } from "./pr-read-response";
 import {
   parseGitBrowseInput,
   parseGitCommitInput,
   parseGitCommitsInput,
+  parseGitMyPrsInput,
+  parseGitPrCursorInput,
+  parseGitPrDiffInput,
+  parseGitPrInput,
   parseGitRepoInput,
+  parseGitRepoPrsInput,
 } from "./git-read-input";
 
 export type { IssueMutation, PrMutation } from "./mutation-input";
@@ -608,16 +614,20 @@ export const getRepoPrs = query(
     cursor?: string;
   }): Promise<PrListResult> => {
     "use server";
+    const parsed = parseGitRepoPrsInput(input);
+    if (!parsed) throw new RepoRouteError("error");
     const p = new URLSearchParams();
-    if (input.state) p.set("state", input.state);
-    if (input.sort) p.set("sort", input.sort);
-    if (input.cursor) p.set("cursor", input.cursor);
+    if (parsed.state) p.set("state", parsed.state);
+    if (parsed.sort) p.set("sort", parsed.sort);
+    if (parsed.cursor) p.set("cursor", parsed.cursor);
     const q = p.toString();
     return authed(async () => {
       try {
-        return await edgeGet<PrListPage>(
-          `/v1/git/repos/${seg(input.repo)}/prs${q ? `?${q}` : ""}`,
-        );
+        const page = parsePrListPage(await edgeGet(
+          `/v1/git/repos/${seg(parsed.repo)}/prs${q ? `?${q}` : ""}`,
+        ), "repo");
+        if (!page) throw new RepoRouteError("error");
+        return page;
       } catch (e) {
         // A 0-leak 404 (no pull grant, or an absent repo) → the dignified no-access state; any other
         // status still throws so the route renders the SCOPED error (never a raw err.message).
@@ -634,9 +644,15 @@ export const getRepoPrs = query(
 export const getMyPrs = query(
   async (input: { bucket: "needs-review" | "yours"; cursor?: string }): Promise<PrListPage> => {
     "use server";
-    const p = new URLSearchParams({ bucket: input.bucket });
-    if (input.cursor) p.set("cursor", input.cursor);
-    return authed(() => edgeGet<PrListPage>(`/v1/git/prs?${p.toString()}`));
+    const parsed = parseGitMyPrsInput(input);
+    if (!parsed) throw new RepoRouteError("error");
+    const p = new URLSearchParams({ bucket: parsed.bucket });
+    if (parsed.cursor) p.set("cursor", parsed.cursor);
+    return authed(async () => {
+      const page = parsePrListPage(await edgeGet(`/v1/git/prs?${p.toString()}`), "cross");
+      if (!page) throw new RepoRouteError("error");
+      return page;
+    });
   },
   "git-prs-cross",
 );
@@ -645,7 +661,13 @@ export const getMyPrs = query(
 export const getPr = query(
   async (input: { repo: string; n: number }): Promise<PrVM> => {
     "use server";
-    return authed(() => edgeGet<PrVM>(`/v1/git/repos/${seg(input.repo)}/prs/${input.n}`));
+    const parsed = parseGitPrInput(input);
+    if (!parsed) throw new RepoRouteError("error");
+    return authed(async () => {
+      const pr = parsePr(await edgeGet(`/v1/git/repos/${seg(parsed.repo)}/prs/${parsed.n}`));
+      if (!pr) throw new RepoRouteError("error");
+      return pr;
+    });
   },
   "git-pr",
 );
@@ -654,8 +676,10 @@ export const getPr = query(
 export const getPrChecks = query(
   async (input: { repo: string; n: number }): Promise<PrChecksVM> => {
     "use server";
+    const parsed = parseGitPrInput(input);
+    if (!parsed) throw new RepoRouteError("error");
     return authed(async () => {
-      const response = await edgeGet(`/v1/git/repos/${seg(input.repo)}/prs/${input.n}/checks`);
+      const response = await edgeGet(`/v1/git/repos/${seg(parsed.repo)}/prs/${parsed.n}/checks`);
       const checks = parsePrChecks(response);
       if (!checks) throw new RepoRouteError("error");
       return checks;
@@ -669,8 +693,10 @@ export const getPrChecks = query(
 export const getPrThreads = query(
   async (input: { repo: string; n: number }): Promise<PrThreadsVM> => {
     "use server";
+    const parsed = parseGitPrInput(input);
+    if (!parsed) throw new RepoRouteError("error");
     return authed(async () => {
-      const response = await edgeGet(`/v1/git/repos/${seg(input.repo)}/prs/${input.n}/threads`);
+      const response = await edgeGet(`/v1/git/repos/${seg(parsed.repo)}/prs/${parsed.n}/threads`);
       const threads = parsePrThreads(response);
       if (!threads) throw new RepoRouteError("error");
       return threads;
@@ -683,10 +709,16 @@ export const getPrThreads = query(
 export const getPrCommits = query(
   async (input: { repo: string; n: number; cursor?: string }): Promise<CommitsPage> => {
     "use server";
-    const q = input.cursor ? `?cursor=${seg(input.cursor)}` : "";
-    return authed(() =>
-      edgeGet<CommitsPage>(`/v1/git/repos/${seg(input.repo)}/prs/${input.n}/commits${q}`),
-    );
+    const parsed = parseGitPrCursorInput(input);
+    if (!parsed) throw new RepoRouteError("error");
+    const q = parsed.cursor ? `?cursor=${seg(parsed.cursor)}` : "";
+    return authed(async () => {
+      const page = parseCommitsPage(await edgeGet(
+        `/v1/git/repos/${seg(parsed.repo)}/prs/${parsed.n}/commits${q}`,
+      ));
+      if (!page) throw new RepoRouteError("error");
+      return page;
+    });
   },
   "git-pr-commits",
 );
@@ -696,13 +728,19 @@ export const getPrCommits = query(
 export const getPrDiff = query(
   async (input: { repo: string; n: number; cursor?: string; view?: string }): Promise<PrDiffVM> => {
     "use server";
+    const parsed = parseGitPrDiffInput(input);
+    if (!parsed) throw new RepoRouteError("error");
     const p = new URLSearchParams();
-    if (input.cursor) p.set("cursor", input.cursor);
-    if (input.view) p.set("view", input.view);
+    if (parsed.cursor) p.set("cursor", parsed.cursor);
+    if (parsed.view) p.set("view", parsed.view);
     const q = p.toString();
-    return authed(() =>
-      edgeGet<PrDiffVM>(`/v1/git/repos/${seg(input.repo)}/prs/${input.n}/diff${q ? `?${q}` : ""}`),
-    );
+    return authed(async () => {
+      const diff = parsePrDiff(await edgeGet(
+        `/v1/git/repos/${seg(parsed.repo)}/prs/${parsed.n}/diff${q ? `?${q}` : ""}`,
+      ));
+      if (!diff) throw new RepoRouteError("error");
+      return diff;
+    });
   },
   "git-pr-diff",
 );
