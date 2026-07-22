@@ -682,6 +682,9 @@ async fn serve(core: ComposedCore, git_root: PathBuf, git_wire: GitWireRuntime) 
         }
     };
     let repo_bootstrap = Arc::new(TupleRepoBootstrap::new(check.tuples().clone()));
+    let git_wire_credentials = Arc::new(myelin_edge::IdentityGitWireCredentialIssuerFactory::new(
+        check.clone(),
+    ));
 
     // The Git subsystem over the DURABLE on-disk backend (GT-003), rooted at the validated absolute
     // `MYELIN_GIT_ROOT`. Startup rejected missing, relative, root, and OS-temp paths before migrations.
@@ -701,6 +704,7 @@ async fn serve(core: ComposedCore, git_root: PathBuf, git_wire: GitWireRuntime) 
         })
         .with_repo_authorizer(repo_authz)
         .with_repo_bootstrap(repo_bootstrap)
+        .with_git_wire_credential_issuer(git_wire_credentials)
         .with_git_shutdown_signal(git_shutdown.clone()),
     );
     let recovery = recover_placed_git_at_boot(&git_backend, &provider, &cell_id)
