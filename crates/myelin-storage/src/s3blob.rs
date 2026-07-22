@@ -32,6 +32,7 @@ use myelin_config::S3Config;
 use myelin_tenancy::TenantId;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 
 use crate::blob::{BlobDependencyError, BlobError, BlobMeta, BlobStore, ContentHash, HashAlgo, Result};
 
@@ -52,6 +53,27 @@ const READINESS_TENANT: &str = ".myelin-readiness";
 const READINESS_MARKER_BYTES: &[u8] = b"myelin-blob-read-write-v1";
 const HEALTHY_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 const UNHEALTHY_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+
+async fn verify_readiness_marker(
+    body: ByteStream,
+    content_length: Option<i64>,
+) -> std::result::Result<(), S3ReadinessError> {
+    if content_length.is_some_and(|length| length != READINESS_MARKER_BYTES.len() as i64) {
+        return Err(S3ReadinessError::Transient);
+    }
+    let mut reader = body
+        .into_async_read()
+        .take((READINESS_MARKER_BYTES.len() + 1) as u64);
+    let mut bytes = Vec::with_capacity(READINESS_MARKER_BYTES.len() + 1);
+    reader
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| S3ReadinessError::Transient)?;
+    if bytes != READINESS_MARKER_BYTES {
+        return Err(S3ReadinessError::Transient);
+    }
+    Ok(())
+}
 
 pub type S3ReadinessError = BlobDependencyError;
 
@@ -119,13 +141,8 @@ impl S3BlobStore {
                 .key(&marker_key)
                 .send().await
                 .map_err(|error| classify_sdk_error(&error, PreflightOperation::Get))?;
-            let bytes = output.body.collect().await
-                .map_err(|_| S3ReadinessError::Transient)?
-                .into_bytes();
-            if bytes.as_ref() != READINESS_MARKER_BYTES {
-                return Err(S3ReadinessError::Transient);
-            }
-            Ok(())
+            let content_length = output.content_length();
+            verify_readiness_marker(output.body, content_length).await
         });
         self.record_preflight(result);
         result
@@ -407,6 +424,43 @@ mod tests {
             &TenantId(READINESS_TENANT.into()),
             &ContentHash::blake3(READINESS_MARKER_BYTES),
         ));
+    }
+
+    #[tokio::test]
+    async fn readiness_marker_body_must_match_exactly_with_or_without_length() {
+        assert_eq!(
+            verify_readiness_marker(
+                ByteStream::from_static(READINESS_MARKER_BYTES),
+                Some(READINESS_MARKER_BYTES.len() as i64),
+            )
+            .await,
+            Ok(()),
+        );
+        assert_eq!(
+            verify_readiness_marker(ByteStream::from_static(READINESS_MARKER_BYTES), None).await,
+            Ok(()),
+        );
+
+        for (body, declared) in [
+            (
+                ByteStream::from_static(b"myelin-blob-read-write-v1-extra"),
+                None,
+            ),
+            (
+                ByteStream::from_static(b"myelin-blob-read-write-v1-extra"),
+                Some(READINESS_MARKER_BYTES.len() as i64),
+            ),
+            (ByteStream::from_static(b"short"), None),
+            (
+                ByteStream::from_static(READINESS_MARKER_BYTES),
+                Some((READINESS_MARKER_BYTES.len() + 1) as i64),
+            ),
+        ] {
+            assert_eq!(
+                verify_readiness_marker(body, declared).await,
+                Err(S3ReadinessError::Transient),
+            );
+        }
     }
 
     #[test]
