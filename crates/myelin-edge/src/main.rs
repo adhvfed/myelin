@@ -961,28 +961,33 @@ async fn serve(
     );
 
     // R2.6 — the action-level allowlist gate + the DEFAULT operator-token scheme (R4.0: `agent`).
-    let mut builder = Gateway::builder(
+    let builder = Gateway::builder(
         authn,
         human_login,
         Arc::new(AuthenticatedActionPolicy::mounted()),
     )
     .default_token_scheme(EDGE_DEFAULT_TOKEN_SCHEME)
-    .with_human_session_issuer(cell.clone())
-    .with_public_base_url(public_base_url)
-    .with_auth_config(auth_config)
-    .route(
-        Method::Get,
-        "/v1/whoami",
-        "edge.whoami",
-        Arc::new(WhoamiHandler),
-    )
-    .route(
-        Method::Get,
-        "/v1/t/{tenant}/whoami",
-        "edge.whoami",
-        Arc::new(WhoamiHandler),
-    )
-    .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge");
+    .with_human_session_issuer(cell.clone());
+    let mut builder = builder
+        .with_public_base_url(public_base_url)
+        .unwrap_or_else(|error| {
+            eprintln!("edge: invalid public base URL at gateway composition: {error}");
+            std::process::exit(1);
+        })
+        .with_auth_config(auth_config)
+        .route(
+            Method::Get,
+            "/v1/whoami",
+            "edge.whoami",
+            Arc::new(WhoamiHandler),
+        )
+        .route(
+            Method::Get,
+            "/v1/t/{tenant}/whoami",
+            "edge.whoami",
+            Arc::new(WhoamiHandler),
+        )
+        .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge");
     builder = register_git_durable(builder, git_backend.clone());
     builder = register_git_wire(builder, git_backend);
     builder = register_issues(
