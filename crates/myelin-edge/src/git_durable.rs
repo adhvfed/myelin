@@ -761,26 +761,37 @@ impl DurableGitBackend {
     /// bare repos; resolve via a representative locator's parent so the scan stays inside the
     /// validated tenant/region path (no traversal). This is the CANDIDATE set the R2.1 list
     /// prefilter intersects with the principal's `pull`-visible set — never served raw.
-    fn scan_repo_slugs(&self, tenant: &str, region: &str) -> Vec<String> {
+    fn scan_repo_slugs(&self, tenant: &str, region: &str) -> Result<Vec<String>, DurableError> {
         let mut slugs: Vec<String> = Vec::new();
         let probe = Self::loc(tenant, region, "_probe");
-        let Ok(probe_path) = self.store.repo_path(&probe) else {
-            return slugs;
+        let probe_path = self.store.repo_path(&probe)?;
+        let dir = probe_path.parent().ok_or_else(|| {
+            DurableError::Git("repository locator has no tenant-region parent".into())
+        })?;
+        let rd = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(slugs),
+            Err(e) => {
+                return Err(DurableError::Git(format!(
+                    "scan repository directory {}: {e}",
+                    dir.display()
+                )))
+            }
         };
-        let Some(dir) = probe_path.parent() else {
-            return slugs;
-        };
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return slugs;
-        };
-        for entry in rd.flatten() {
+        for entry in rd {
+            let entry = entry.map_err(|e| {
+                DurableError::Git(format!(
+                    "read repository directory entry in {}: {e}",
+                    dir.display()
+                ))
+            })?;
             let name = entry.file_name().to_string_lossy().to_string();
             if let Some(slug) = name.strip_suffix(".git") {
                 slugs.push(slug.to_string());
             }
         }
         slugs.sort();
-        slugs
+        Ok(slugs)
     }
 
     /// **List the repos `principal` may `pull` (R2.1 — the leak-free list).** The on-disk listing is
@@ -794,20 +805,18 @@ impl DurableGitBackend {
         tenant: &str,
         region: &str,
         principal: &Principal,
-    ) -> Vec<RepoHome> {
-        let candidates = self.scan_repo_slugs(tenant, region);
+    ) -> Result<Vec<RepoHome>, DurableError> {
+        let candidates = self.scan_repo_slugs(tenant, region)?;
         let visible = self
             .repo_authz
             .visible_repos(principal, tenant, region, &candidates);
         let mut out = Vec::new();
         for slug in visible {
             let loc = Self::loc(tenant, region, &slug);
-            let Ok(repo) = self.store.open_repo(&loc) else {
-                continue;
-            };
-            out.push(self.repo_home(tenant, region, &slug, &repo));
+            let repo = self.store.open_repo(&loc)?;
+            out.push(self.repo_home(tenant, region, &slug, &repo)?);
         }
-        out
+        Ok(out)
     }
 
     /// **F3 — the HTTP git-wire clone URL for a repo.** The wire path grammar is
@@ -818,30 +827,32 @@ impl DurableGitBackend {
         format!("{}/{tenant}/{region}/{slug}.git", self.clone_base)
     }
 
-    fn repo_home(&self, tenant: &str, region: &str, slug: &str, repo: &DurableGitRepo) -> RepoHome {
+    fn repo_home(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        repo: &DurableGitRepo,
+    ) -> Result<RepoHome, DurableError> {
         let full_slug = format!("{tenant}/{slug}");
         let clone_url = self.clone_url(tenant, region, slug);
-        let entries = repo
-            .tree_entries_at_ref("refs/heads/main")
-            .unwrap_or_default();
+        let entries = repo.tree_entries_at_ref("refs/heads/main")?;
         if entries.is_empty() {
-            RepoHome::Empty {
+            Ok(RepoHome::Empty {
                 slug: full_slug,
                 clone_url,
-            }
+            })
         } else {
             let readme = repo
-                .read_file_at_ref("refs/heads/main", "README.md")
-                .ok()
-                .flatten()
+                .read_file_at_ref("refs/heads/main", "README.md")?
                 .map(|(b, _)| String::from_utf8_lossy(&b).chars().take(400).collect())
                 .unwrap_or_default();
-            RepoHome::Populated {
+            Ok(RepoHome::Populated {
                 slug: full_slug,
                 readme_excerpt: readme,
                 entries,
                 clone_url,
-            }
+            })
         }
     }
 
@@ -1001,14 +1012,11 @@ impl DurableGitBackend {
             }));
         }
         let readme = repo
-            .read_file_at_ref(&branch_ref, "README.md")
-            .ok()
-            .flatten()
+            .read_file_at_ref(&branch_ref, "README.md")?
             .map(|(b, _)| String::from_utf8_lossy(&b).to_string());
         let latest = repo.commit_log(&branch_ref, 0, 1)?.0.into_iter().next();
         let per_entry = repo
-            .latest_commits_in_dir(&branch_ref, "", LATEST_COMMIT_WALK_CAP)
-            .unwrap_or_default();
+            .latest_commits_in_dir(&branch_ref, "", LATEST_COMMIT_WALK_CAP)?;
         let entries_json = tree_entries_json(&entries, "", &per_entry);
         Ok(json!({
             "state": "populated",
@@ -1048,8 +1056,7 @@ impl DurableGitBackend {
             TreePathLookup::Dir(entries) => {
                 let base = path.trim_matches('/');
                 let per_entry = repo
-                    .latest_commits_in_dir(gitref, base, LATEST_COMMIT_WALK_CAP)
-                    .unwrap_or_default();
+                    .latest_commits_in_dir(gitref, base, LATEST_COMMIT_WALK_CAP)?;
                 let entries_json = tree_entries_json(&entries, base, &per_entry);
                 // A subtree README renders too (same read-path); binary/absent → no readme.
                 let readme_path = if base.is_empty() {
@@ -1535,7 +1542,7 @@ impl DurableGitBackend {
         region: &str,
         principal: &Principal,
     ) -> Result<Vec<EnrichedPr>, DurableError> {
-        let candidates = self.scan_repo_slugs(tenant, region);
+        let candidates = self.scan_repo_slugs(tenant, region)?;
         let visible = self
             .repo_authz
             .visible_repos(principal, tenant, region, &candidates);
@@ -1543,9 +1550,7 @@ impl DurableGitBackend {
         let mut out = Vec::new();
         for slug in visible {
             let loc = Self::loc(tenant, region, &slug);
-            if self.store.open_repo(&loc).is_err() {
-                continue; // a slug that lost its repo dir — skip, never error the whole front door.
-            }
+            self.store.open_repo(&loc)?;
             out.extend(self.enrich_prs(&loc, principal, &viewer, Some(&slug))?);
         }
         Ok(out)
@@ -3012,7 +3017,8 @@ impl Handler for DRepoList {
         // `list_objects` seam) BEFORE pagination — an un-granted repo's existence is never leaked.
         let all = self
             .be
-            .list_repos_visible(tenant_of(ctx), region_of(ctx), ctx.principal);
+            .list_repos_visible(tenant_of(ctx), region_of(ctx), ctx.principal)
+            .map_err(map_durable_err)?;
         let offset = ctx
             .page
             .cursor
@@ -4898,7 +4904,10 @@ mod pr_list_tests {
             .unwrap();
         let loc = DurableGitBackend::loc(TENANT, REGION, "widgets");
         let repo = be.store.open_repo(&loc).expect("open repo");
-        let advertised = match be.repo_home(TENANT, REGION, "widgets", &repo) {
+        let advertised = match be
+            .repo_home(TENANT, REGION, "widgets", &repo)
+            .expect("repo home reads")
+        {
             RepoHome::Empty { clone_url, .. } | RepoHome::Populated { clone_url, .. } => clone_url,
             other => panic!("a fresh repo projects an Empty/Populated home, got {other:?}"),
         };
