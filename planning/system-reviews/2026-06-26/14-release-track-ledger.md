@@ -855,7 +855,8 @@ budget/remint hooks and the live reserve/settle bookend; atomically settle `ci_r
 posture; run the exact-tenant region poller/worker composition; and close the myelin-flow M2 durable
 `RunStore` floor. Production execution remains startup-refused.
 
-**CI `linux-small-v1` launch-policy boundary (2026-07-22, `fd6f3bc4` + `de581870` + `19ee677b`).** The first real
+**CI `linux-small-v1` launch-policy boundary (2026-07-22, `fd6f3bc4` + `de581870` + `19ee677b` +
+`6d133138`).** The first real
 `CiLaunchAuthorityMaterializer` now converts the customer-authored profile into fixed server-owned,
 default-deny grants: zero egress, environment, or secret handles; 1 vCPU, 256 MiB RAM, 1 GiB disk,
 128 PIDs, and a 600-second timeout; batch scheduling with frozen labels and project fair-share
@@ -863,19 +864,32 @@ identity. The adapter derives every job UUID from the locked run and validated p
 external request to tenant, region, run/workflow/project, stage and concrete name, trigger and trust,
 source snapshot digest, workflow definition pin, policy revision, and exact limits, and refuses
 malformed locked scope, invalid handles, or a reservation reused across jobs. Only retry-stable
-budget-reservation and token-authority handle materialization remain behind an explicit provider;
-there is no permissive implementation. The no-authority starter constructor is now test-support-only:
+operational budget reservation remains behind an explicit provider; token-authority references are
+derived locally and bearer minting stays at the later live-claim boundary. There is no permissive
+budget implementation. The no-authority starter constructor is now test-support-only:
 production must call `new_with_authority`, and the dormant composition binds this real policy to an
-explicit unavailable external provider that fabricates no handles. Queue claims now return their
+explicit unavailable budget provider that fabricates no reservation handle. Queue claims now return
+their
 start and expiry from the same PostgreSQL `statement_timestamp()` used to write the lease. Token
 requests must carry both instants and fail closed unless the identity, scope, ordering, and exact
 runner-lease lifetime are valid before any issuer can mint; the live scheduler proof observes the
-requested 30-second lifetime exactly. Proof: all 407 control-plane
-library tests, warnings-denied all-target/all-feature clippy, six focused policy tests (including
-provider refusal, pre-call scope rejection, and the dormant no-fabrication path), the production
-bootstrap source guard, and the L2 erosion/dependency gate are green. **Honest remaining activation floor:**
-compose the concrete durable money-reservation and Identity token-authority provider, then the
-exact-tenant region poller/worker and terminal bookends. `MYELIN_CI_RUNNER=1` remains startup-refused.
+requested 30-second lifetime exactly. **Tier-P deviation boundary:**
+the existing storage/Flow reserve contract names a future Commercial wallet, while the governing
+P-track explicitly defers billing and Stripe. The code remains fail-closed instead of inventing that
+wallet: launch authority now asks one explicit operational quota/cost provider to reserve the
+complete job set atomically and retry-stably, with cardinality, handle-shape, and uniqueness checks.
+This is a personal-production safety/metering seam, not a billing integration. Separately, each token
+authority reference is a domain-separated, unambiguous BLAKE3 binding over every locked run, job,
+source, workflow, policy, and limit field; it is persisted in the immutable manifest but is neither a
+bearer nor a JTI. Nine focused tests pin exact batch replay, full-field token binding, malformed and
+duplicate provider output, pre-call scope rejection, and dormant no-fabrication; the full
+control-plane all-target/all-feature suite, production source guard, warnings-denied clippy, and L2
+gate are green. An independent adversarial verifier reported CONFIRMED-SOUND with no HIGH/MEDIUM
+findings. **Honest remaining activation floor:** implement and crash-prove the concrete Tier-P
+operational reservation source; make the claim-time Identity issuer reload the immutable manifest
+and locked `ci_run`, recompute this handle, and mint/verify the bounded credential; then compose the
+exact-tenant region poller/worker and terminal bookends. No Commercial wallet, billing, or Stripe
+work is admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
 
 ## R5–R6
 
