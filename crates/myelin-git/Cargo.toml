@@ -106,6 +106,9 @@ myelin-config = { workspace = true, optional = true }
 # content-address itself.
 blake3.workspace = true
 hex.workspace = true
+# Opaque Git-ref pagination cursors use canonical unpadded base64url framing. The decoded frame is
+# strictly bounded and versioned; BLAKE3 supplies its repository/query scope and namespace fence.
+base64 = "0.22"
 
 # git2 (libgit2) — the in-process READ backend of the GitCore layered seam (GIT-P8 / P-269,
 # arch 01 §2.2). The architecture-NAMED fallback (gix-preferred is the OQ-1 floor, GIT-P33), used

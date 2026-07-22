@@ -236,6 +236,10 @@ pub mod gix_backend;
 /// companion to the read backend [`gix_backend::GixCore`] — REUSES the same resolver + `git2`,
 /// never reimplements git. The smart-transport WIRE sits on this (GT-006, sandbox-gated).
 pub mod durable;
+/// Bounded, stable keyset pagination over the durable branch/tag namespace. Cursors are opaque
+/// consistency fences scoped to one verified repository and normalized query; they never grant
+/// object access.
+pub mod refs_pagination;
 /// **GT-003 (E1.2) — the cross-system recovery reconciler.** [`reconcile::reconcile_refs`] replays the
 /// committed `git.ref.updated` outbox rows against the durable on-disk repo, re-applying any whose
 /// on-disk `update_seq` is behind the durable reflog (the apply-after-outbox-commit crash window —

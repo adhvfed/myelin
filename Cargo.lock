@@ -2620,6 +2620,7 @@ dependencies = [
 name = "myelin-git"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "blake3",
  "fs4",
  "git2",
