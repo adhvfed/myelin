@@ -76,7 +76,7 @@
 //! keys ([`crate::search_projection`]'s `FACET_*`) so the emitted doc's structured facets match the
 //! declared schema exactly (a facet drift fails the CDC).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use myelin_events::{
     AggregateKey, ArtifactRef, DataRole, EmitContextBase, EventDraft, EventType, IdMinter,
@@ -371,21 +371,44 @@ fn split_camel(token: &str) -> Vec<String> {
 /// identifier-like runs (`[A-Za-z_][A-Za-z0-9_]*`) and camel/snake-splits each (via [`split_symbol`]),
 /// returning the de-duplicated sorted union — the GF-3 "find this identifier" search terms. Pure +
 /// deterministic (cold == live).
-pub fn extract_symbols(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+pub fn extract_symbols_bounded(
+    text: &str,
+    maximum_input_bytes: usize,
+    maximum_terms: usize,
+    maximum_term_bytes: usize,
+    maximum_total_term_bytes: usize,
+) -> Result<Vec<String>, String> {
+    ensure_projection_text_limit(text, maximum_input_bytes)?;
+    let mut out = BTreeSet::new();
+    let mut total_term_bytes = 0usize;
     for tok in identifier_tokens(text) {
-        out.extend(split_symbol(&tok));
+        for term in split_symbol(&tok) {
+            insert_projection_term(
+                &mut out,
+                &mut total_term_bytes,
+                term,
+                maximum_terms,
+                maximum_term_bytes,
+                maximum_total_term_bytes,
+            )?;
+        }
     }
-    out.sort_unstable();
-    out.dedup();
-    out
+    Ok(out.into_iter().collect())
 }
 
 /// **Extract the string + number literals of a blob's text (the §9 `literals` facet).** A literal is
 /// a `"…"` / `'…'` quoted run (the inner text) or a numeric run (`42`, `3.14`, `0xFF`). De-duplicated
 /// + sorted; the "find this literal across the repo" GF-3 search terms. Pure + deterministic.
-pub fn extract_literals(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+pub fn extract_literals_bounded(
+    text: &str,
+    maximum_input_bytes: usize,
+    maximum_terms: usize,
+    maximum_term_bytes: usize,
+    maximum_total_term_bytes: usize,
+) -> Result<Vec<String>, String> {
+    ensure_projection_text_limit(text, maximum_input_bytes)?;
+    let mut out = BTreeSet::new();
+    let mut total_term_bytes = 0usize;
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0usize;
     while i < chars.len() {
@@ -400,13 +423,21 @@ pub fn extract_literals(text: &str) -> Vec<String> {
                 if chars[j] == '\\' && j + 1 < chars.len() {
                     buf.push(chars[j + 1]);
                     j += 2;
-                    continue;
+                } else {
+                    buf.push(chars[j]);
+                    j += 1;
                 }
-                buf.push(chars[j]);
-                j += 1;
+                ensure_projection_term_length(&buf, maximum_term_bytes)?;
             }
             if !buf.is_empty() {
-                out.push(buf);
+                insert_projection_term(
+                    &mut out,
+                    &mut total_term_bytes,
+                    buf,
+                    maximum_terms,
+                    maximum_term_bytes,
+                    maximum_total_term_bytes,
+                )?;
             }
             i = j + 1;
         } else if c.is_ascii_digit() {
@@ -418,23 +449,69 @@ pub fn extract_literals(text: &str) -> Vec<String> {
             {
                 buf.push(chars[j]);
                 j += 1;
+                ensure_projection_term_length(&buf, maximum_term_bytes)?;
             }
             // Trim a trailing dot (`end.` → `end`) so `1.` does not carry the separator.
             let lit = buf.trim_end_matches('.').to_string();
             if !lit.is_empty() {
-                out.push(lit);
+                insert_projection_term(
+                    &mut out,
+                    &mut total_term_bytes,
+                    lit,
+                    maximum_terms,
+                    maximum_term_bytes,
+                    maximum_total_term_bytes,
+                )?;
             }
             i = j;
         } else {
             i += 1;
         }
     }
-    out.sort_unstable();
-    out.dedup();
-    out
+    Ok(out.into_iter().collect())
 }
 
-/// Tokenize text into identifier-like runs (`[A-Za-z_][A-Za-z0-9_]*`). A helper for [`extract_symbols`].
+fn ensure_projection_text_limit(text: &str, maximum_input_bytes: usize) -> Result<(), String> {
+    if text.len() > maximum_input_bytes {
+        return Err("code projection token input limit exceeded".into());
+    }
+    Ok(())
+}
+
+fn ensure_projection_term_length(term: &str, maximum_term_bytes: usize) -> Result<(), String> {
+    if term.len() > maximum_term_bytes {
+        return Err("code projection term length limit exceeded".into());
+    }
+    Ok(())
+}
+
+fn insert_projection_term(
+    out: &mut BTreeSet<String>,
+    total_term_bytes: &mut usize,
+    term: String,
+    maximum_terms: usize,
+    maximum_term_bytes: usize,
+    maximum_total_term_bytes: usize,
+) -> Result<(), String> {
+    ensure_projection_term_length(&term, maximum_term_bytes)?;
+    if out.contains(&term) {
+        return Ok(());
+    }
+    if out.len() >= maximum_terms {
+        return Err("code projection term count limit exceeded".into());
+    }
+    *total_term_bytes = total_term_bytes
+        .checked_add(term.len())
+        .ok_or_else(|| "code projection term byte count overflowed".to_string())?;
+    if *total_term_bytes > maximum_total_term_bytes {
+        return Err("code projection aggregate term limit exceeded".into());
+    }
+    out.insert(term);
+    Ok(())
+}
+
+/// Tokenize text into identifier-like runs (`[A-Za-z_][A-Za-z0-9_]*`). A helper for
+/// [`extract_symbols_bounded`].
 fn identifier_tokens(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -611,6 +688,9 @@ const PROJECTION_MAX_BLOB_BYTES: usize = 1024 * 1024;
 const PROJECTION_MAX_TOTAL_BLOB_BYTES: usize = 64 * 1024 * 1024;
 const PROJECTION_MAX_PATH_BYTES: usize = 4 * 1024;
 const PROJECTION_MAX_COMMIT_MESSAGE_BYTES: usize = 8 * 1024;
+const PROJECTION_MAX_TERMS_PER_BLOB: usize = 20_000;
+const PROJECTION_MAX_TERM_BYTES: usize = 4 * 1024;
+const PROJECTION_MAX_TOTAL_TERM_BYTES_PER_FACET: usize = 1024 * 1024;
 
 /// **The code-projection emitter (GIT-P25 / P-287, §9).** Hooks the receive-pack post-commit path:
 /// on a `git.ref.updated` to an indexed ref it diffs `new_tip ∖ last_indexed`, builds the per-blob
@@ -673,26 +753,38 @@ impl<'a, R: RestrictionPolicy> CodeProjectionEmitter<'a, R> {
         path: &str,
         blob: &Blob,
         commit_message: &str,
-    ) -> BlobProjection {
+    ) -> Result<BlobProjection, String> {
         let restricted = self.restriction.is_restricted(&self.repo, path);
         let text = if restricted {
             String::new()
         } else {
             String::from_utf8_lossy(&blob.bytes).into_owned()
         };
-        BlobProjection {
+        Ok(BlobProjection {
             artifact_ref: self.blob_ref(ref_name, path),
             path: path.to_string(),
             language: detect_language(path),
             symbols: if restricted {
                 Vec::new()
             } else {
-                extract_symbols(&text)
+                extract_symbols_bounded(
+                    &text,
+                    PROJECTION_MAX_BLOB_BYTES,
+                    PROJECTION_MAX_TERMS_PER_BLOB,
+                    PROJECTION_MAX_TERM_BYTES,
+                    PROJECTION_MAX_TOTAL_TERM_BYTES_PER_FACET,
+                )?
             },
             literals: if restricted {
                 Vec::new()
             } else {
-                extract_literals(&text)
+                extract_literals_bounded(
+                    &text,
+                    PROJECTION_MAX_BLOB_BYTES,
+                    PROJECTION_MAX_TERMS_PER_BLOB,
+                    PROJECTION_MAX_TERM_BYTES,
+                    PROJECTION_MAX_TOTAL_TERM_BYTES_PER_FACET,
+                )?
             },
             text,
             // A restricted blob still carries its path/oid (so the doc identity is stable for removal),
@@ -703,7 +795,7 @@ impl<'a, R: RestrictionPolicy> CodeProjectionEmitter<'a, R> {
                 commit_message.to_string()
             },
             blob_oid: blob.oid.clone(),
-        }
+        })
     }
 
     /// **Emit the code projection for a push to an indexed ref (the §9 algorithm, the GATE).** Diffs
@@ -762,7 +854,9 @@ impl<'a, R: RestrictionPolicy> CodeProjectionEmitter<'a, R> {
         for change in &changes {
             let payload = match change {
                 BlobChange::Upserted { path, blob } => {
-                    let proj = self.project_upsert(ref_name, path, blob, commit_message);
+                    let proj = self
+                        .project_upsert(ref_name, path, blob, commit_message)
+                        .map_err(OutboxError)?;
                     // references-not-payloads: the doc carries the blob ref + path + facets + the
                     // (restriction-suppressed) text. The body text is repo content under the processor
                     // posture, NOT inline subject PII — it is the indexable code (§9).
@@ -860,6 +954,14 @@ mod tests {
         )
     }
 
+    fn symbols(text: &str) -> Vec<String> {
+        extract_symbols_bounded(text, 1024, 100, 256, 4096).expect("small symbol input")
+    }
+
+    fn literals(text: &str) -> Vec<String> {
+        extract_literals_bounded(text, 1024, 100, 256, 4096).expect("small literal input")
+    }
+
     // ── the symbol/literal/language unit tests ──
 
     #[test]
@@ -887,7 +989,7 @@ mod tests {
     #[test]
     fn extract_symbols_splits_identifiers_only_not_numbers() {
         let text = "fn parseHttp() { let maxRetries = 42; }";
-        let syms = extract_symbols(text);
+        let syms = symbols(text);
         assert!(syms.contains(&"parse".to_string()));
         assert!(syms.contains(&"http".to_string()));
         assert!(syms.contains(&"max".to_string()));
@@ -900,7 +1002,7 @@ mod tests {
     #[test]
     fn extract_literals_finds_strings_and_numbers() {
         let text = r#"let url = "https://example.test"; let n = 42; let pi = 3.14;"#;
-        let lits = extract_literals(text);
+        let lits = literals(text);
         assert!(
             lits.contains(&"https://example.test".to_string()),
             "{lits:?}"
@@ -915,23 +1017,23 @@ mod tests {
     #[test]
     fn extract_literals_handles_escapes_hex_and_trailing_dot() {
         // A backslash-escaped quote does NOT terminate the string; the inner char is captured.
-        let escaped = extract_literals(r#""a\"b""#);
+        let escaped = literals(r#""a\"b""#);
         assert!(
             escaped.contains(&"a\"b".to_string()),
             "escape handling: {escaped:?}"
         );
         // Single-quoted string.
-        let sq = extract_literals("x = 'hello'");
+        let sq = literals("x = 'hello'");
         assert!(sq.contains(&"hello".to_string()), "{sq:?}");
         // Hex + underscore-grouped numeric literals.
-        let nums = extract_literals("a = 0xFF; b = 1_000;");
+        let nums = literals("a = 0xFF; b = 1_000;");
         assert!(nums.contains(&"0xFF".to_string()), "hex literal: {nums:?}");
         assert!(
             nums.contains(&"1_000".to_string()),
             "underscore-grouped: {nums:?}"
         );
         // A trailing dot is trimmed (`5.` → `5`, the `.` was a statement separator).
-        let td = extract_literals("n = 5. end");
+        let td = literals("n = 5. end");
         assert!(
             td.contains(&"5".to_string()),
             "trailing dot trimmed: {td:?}"
@@ -942,9 +1044,23 @@ mod tests {
         );
         // An empty string literal `""` emits nothing.
         assert!(
-            extract_literals(r#"x = """#).is_empty(),
+            literals(r#"x = """#).is_empty(),
             "an empty string literal emits no literal"
         );
+    }
+
+    #[test]
+    fn token_extractors_enforce_input_count_term_and_aggregate_byte_limits() {
+        assert_eq!(
+            extract_symbols_bounded("a b", 3, 2, 1, 2)
+                .expect("exact symbol limits accepted"),
+            vec!["a", "b"]
+        );
+        assert!(extract_symbols_bounded("a b", 2, 2, 1, 2).is_err());
+        assert!(extract_symbols_bounded("a b", 3, 1, 1, 2).is_err());
+        assert!(extract_symbols_bounded("ab", 2, 2, 1, 2).is_err());
+        assert!(extract_symbols_bounded("a b", 3, 2, 1, 1).is_err());
+        assert!(extract_literals_bounded("\"abcd\"", 6, 1, 3, 4).is_err());
     }
 
     /// Identifier tokenization: a bare number is NOT a symbol; an identifier may contain digits +
@@ -952,7 +1068,7 @@ mod tests {
     #[test]
     fn identifier_tokens_require_a_leading_letter_or_underscore() {
         // `_private` and `var2` ARE identifiers; `42` is NOT.
-        let syms = extract_symbols("let _private = var2 + 42;");
+        let syms = symbols("let _private = var2 + 42;");
         assert!(
             syms.iter().any(|s| s == "_private" || s == "private"),
             "{syms:?}"
@@ -964,7 +1080,7 @@ mod tests {
             "a bare number is a literal, not a symbol: {syms:?}"
         );
         // A trailing identifier with no following separator is still captured.
-        let trailing = extract_symbols("call doThing");
+        let trailing = symbols("call doThing");
         assert!(
             trailing.contains(&"do".to_string()) && trailing.contains(&"thing".to_string()),
             "{trailing:?}"
@@ -977,14 +1093,14 @@ mod tests {
     #[test]
     fn underscore_is_part_of_the_identifier_token() {
         // `parse_config` is ONE identifier token → its whole-token form is a symbol (plus the split).
-        let syms = extract_symbols("fn parse_config");
+        let syms = symbols("fn parse_config");
         assert!(
             syms.contains(&"parse_config".to_string()),
             "the whole snake token is searchable: {syms:?}"
         );
         assert!(syms.contains(&"parse".to_string()) && syms.contains(&"config".to_string()));
         // A snake identifier at END-OF-TEXT (no trailing separator) still flushes WITH its underscore.
-        let tail = extract_symbols("see also_this");
+        let tail = symbols("see also_this");
         assert!(
             tail.contains(&"also_this".to_string()),
             "the trailing snake token flushes whole: {tail:?}"
@@ -1129,7 +1245,21 @@ mod tests {
             "large.rs",
             Blob::new("large", vec![b'x'; PROJECTION_MAX_BLOB_BYTES + 1]),
         );
+        let oversized_term = Tree::empty().with(
+            "term.rs",
+            Blob::new("term", vec![b'x'; PROJECTION_MAX_TERM_BYTES + 1]),
+        );
 
+        assert!(
+            e.emit_for_push(
+                "refs/heads/main",
+                "term-tip",
+                &Tree::empty(),
+                &oversized_term,
+                "small",
+            )
+            .is_err()
+        );
         assert!(
             e.emit_for_push(
                 "refs/heads/main",
