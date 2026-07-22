@@ -293,6 +293,21 @@ struct EnrichedPrSlice {
     has_more: bool,
 }
 
+#[derive(Clone, Copy)]
+struct CrossPrListLimits {
+    maximum_records: usize,
+    maximum_bytes: usize,
+}
+
+impl CrossPrListLimits {
+    const fn production() -> Self {
+        Self {
+            maximum_records: CROSS_PR_LIST_MAX_RECORDS,
+            maximum_bytes: CROSS_PR_LIST_MAX_BYTES,
+        }
+    }
+}
+
 impl DurableGitBackend {
     /// Root the durable backend at an on-disk directory holding `<tenant>/<region>/<repo>.git` repos —
     /// the same root the durable git store + read backend resolve against. The wire object-authz seam
@@ -615,12 +630,12 @@ impl DurableGitBackend {
             Some(store) => store.list_bounded(
                 &Self::verified_pr_scope(principal, loc)?,
                 &loc.repo,
-                PR_LIST_OFFSET_MAX,
-                PR_LIST_MAX_BYTES,
+                PR_LIST_PER_REPO_MAX_RECORDS,
+                PR_LIST_PER_REPO_MAX_BYTES,
             ),
             None => self
                 .prs
-                .list_bounded(loc, PR_LIST_OFFSET_MAX, PR_LIST_MAX_BYTES),
+                .list_bounded(loc, PR_LIST_PER_REPO_MAX_RECORDS, PR_LIST_PER_REPO_MAX_BYTES),
         }
     }
 
@@ -636,7 +651,12 @@ impl DurableGitBackend {
             }
             None => self
                 .prs
-                .list_page_bounded(loc, query, PR_LIST_OFFSET_MAX, PR_LIST_MAX_BYTES),
+                .list_page_bounded(
+                    loc,
+                    query,
+                    PR_LIST_PER_REPO_MAX_RECORDS,
+                    PR_LIST_PER_REPO_MAX_BYTES,
+                ),
         }
     }
 
@@ -1814,17 +1834,6 @@ impl DurableGitBackend {
             .collect()
     }
 
-    fn enrich_prs(
-        &self,
-        loc: &RepoLoc,
-        principal: &Principal,
-        viewer_pseudonym: &str,
-        repo_slug: Option<&str>,
-    ) -> Result<Vec<EnrichedPr>, DurableError> {
-        let records = self.pr_list(loc, principal)?;
-        Ok(self.enrich_pr_records(loc, viewer_pseudonym, repo_slug, records))
-    }
-
     /// **The per-repo PR list (R3.1).** Every PR in the repo (the caller has already cleared the
     /// `Pull` object guard, so all are `view`-able), enriched with the checks rollup + the viewer's
     /// review status. Storage applies state/sort/cursor and computes exact tab/sidebar counts over
@@ -1854,12 +1863,29 @@ impl DurableGitBackend {
     /// candidates through the `visible_repos` `list_objects` seam FIRST (a forbidden repo never
     /// contributes a PR), then enrich the PRs under each visible repo, tagging each row with its repo
     /// slug. The bucket predicate (`yours` = authored-by-viewer; `needs-review` = viewer is a
-    /// requested reviewer) is applied by the handler over this leak-free set.
+    /// requested reviewer) is applied by the handler over this leak-free set. Per-repository reads
+    /// and the request-wide record/serialized-byte aggregate are independently capped; below those
+    /// ceilings the returned bucket remains exact.
     fn list_prs_cross(
         &self,
         tenant: &str,
         region: &str,
         principal: &Principal,
+    ) -> Result<Vec<EnrichedPr>, DurableError> {
+        self.list_prs_cross_bounded(
+            tenant,
+            region,
+            principal,
+            CrossPrListLimits::production(),
+        )
+    }
+
+    fn list_prs_cross_bounded(
+        &self,
+        tenant: &str,
+        region: &str,
+        principal: &Principal,
+        limits: CrossPrListLimits,
     ) -> Result<Vec<EnrichedPr>, DurableError> {
         let candidates = self.scan_repo_slugs(tenant, region)?;
         let visible = self
@@ -1867,10 +1893,26 @@ impl DurableGitBackend {
             .visible_repos(principal, tenant, region, &candidates);
         let viewer = Self::pseudonym(tenant, principal);
         let mut out = Vec::new();
+        let mut aggregate_records = 0usize;
+        let mut aggregate_bytes = 0usize;
         for slug in visible {
             let loc = Self::loc(tenant, region, &slug);
             self.store.open_repo(&loc)?;
-            out.extend(self.enrich_prs(&loc, principal, &viewer, Some(&slug))?);
+            let records = self.pr_list(&loc, principal)?;
+            aggregate_records = checked_cross_pr_list_total(
+                aggregate_records,
+                records.len(),
+                limits.maximum_records,
+                "cross-repository record count",
+            )?;
+            let repo_bytes = serialized_pr_records_bytes(&records)?;
+            aggregate_bytes = checked_cross_pr_list_total(
+                aggregate_bytes,
+                repo_bytes,
+                limits.maximum_bytes,
+                "cross-repository serialized bytes",
+            )?;
+            out.extend(self.enrich_pr_records(&loc, &viewer, Some(&slug), records));
         }
         Ok(out)
     }
@@ -3331,9 +3373,43 @@ const LATEST_COMMIT_WALK_CAP: usize = 500;
 /// without limit; normal response pagination happens after this leak-free authorization prefilter.
 const REPO_SCAN_MAX_CANDIDATES: usize = 10_000;
 
-/// Legacy filesystem and cross-repository reads still require the full already-authorized PR set.
-/// Cap their serialized bytes; the shared record/offset ceiling is [`PR_LIST_OFFSET_MAX`].
-const PR_LIST_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Each visible repository is bounded independently before cross-repository aggregation begins.
+const PR_LIST_PER_REPO_MAX_RECORDS: usize = PR_LIST_OFFSET_MAX;
+const PR_LIST_PER_REPO_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Request/cell-wide cross-repository aggregation ceilings. They bound the final exact bucket set
+/// even when every individual visible repository remains below its independent limit.
+const CROSS_PR_LIST_MAX_RECORDS: usize = 10_000;
+const CROSS_PR_LIST_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+fn checked_cross_pr_list_total(
+    current: usize,
+    addition: usize,
+    maximum: usize,
+    dimension: &'static str,
+) -> Result<usize, DurableError> {
+    current
+        .checked_add(addition)
+        .filter(|total| *total <= maximum)
+        .ok_or_else(|| {
+            DurableError::Git(format!(
+                "pull request list limit exceeded: {dimension}"
+            ))
+        })
+}
+
+fn serialized_pr_records_bytes(records: &[PrRecord]) -> Result<usize, DurableError> {
+    records.iter().try_fold(0usize, |total, record| {
+        let bytes = serde_json::to_vec(record)
+            .map_err(|error| DurableError::Io(format!("serialize pull request record: {error}")))?;
+        checked_cross_pr_list_total(
+            total,
+            bytes.len(),
+            usize::MAX,
+            "cross-repository serialized bytes",
+        )
+    })
+}
 
 /// Boot recovery fails loud above this finite pending-command envelope so tenant backlog cannot
 /// become an unbounded startup allocation.
@@ -7733,6 +7809,12 @@ mod pr_list_tests {
             .unwrap_or_else(|e| panic!("open PR in {slug}: {e:?}"));
     }
 
+    fn repo_pr_bytes(be: &DurableGitBackend, slug: &str, viewer: &Principal) -> usize {
+        let loc = DurableGitBackend::loc(TENANT, REGION, slug);
+        let records = be.pr_list(&loc, viewer).expect("read seeded PR records");
+        serialized_pr_records_bytes(&records).expect("measure seeded PR records")
+    }
+
     /// Drive a list handler with a viewer + query string, returning the parsed JSON body.
     fn serve(handler: &dyn Handler, viewer: &Principal, repo: Option<&str>, query: &str) -> Value {
         serve_result(handler, viewer, repo, query)
@@ -7952,6 +8034,137 @@ mod pr_list_tests {
         assert_eq!(body["counts"]["bucket"], 1);
         assert_eq!(body["page"]["total"], 1);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cross_repo_record_ceiling_applies_across_visible_repositories() {
+        let root = temp_root("cross-record-cap");
+        let viewer = human("u:viewer");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root);
+        for slug in ["alpha", "beta"] {
+            open_pr(&be, slug, &format!("{slug} one"), &viewer);
+            open_pr(&be, slug, &format!("{slug} two"), &viewer);
+        }
+        let authz = GrantBackedRepos::new()
+            .grant_read("u:viewer", TENANT, "alpha")
+            .grant_read("u:viewer", TENANT, "beta");
+        let be = be.with_repo_authorizer(Arc::new(authz));
+
+        let error = be
+            .list_prs_cross_bounded(
+                TENANT,
+                REGION,
+                &viewer,
+                CrossPrListLimits {
+                    maximum_records: 3,
+                    maximum_bytes: usize::MAX,
+                },
+            )
+            .err()
+            .expect("four collectively visible PRs must exceed a three-record request cap");
+        assert!(matches!(
+            &error,
+            DurableError::Git(message)
+                if message == "pull request list limit exceeded: cross-repository record count"
+        ));
+        assert_eq!(map_durable_err(error).status(), 413);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cross_repo_byte_ceiling_is_exact_and_aggregate() {
+        let root = temp_root("cross-byte-cap");
+        let viewer = human("u:viewer");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root);
+        open_pr(&be, "alpha", "Alpha payload", &viewer);
+        open_pr(&be, "beta", "Beta payload", &viewer);
+        let authz = GrantBackedRepos::new()
+            .grant_read("u:viewer", TENANT, "alpha")
+            .grant_read("u:viewer", TENANT, "beta");
+        let be = be.with_repo_authorizer(Arc::new(authz));
+        let exact_bytes = repo_pr_bytes(&be, "alpha", &viewer)
+            .checked_add(repo_pr_bytes(&be, "beta", &viewer))
+            .unwrap();
+
+        let error = be
+            .list_prs_cross_bounded(
+                TENANT,
+                REGION,
+                &viewer,
+                CrossPrListLimits {
+                    maximum_records: 2,
+                    maximum_bytes: exact_bytes - 1,
+                },
+            )
+            .err()
+            .expect("the aggregate byte limit applies across repositories");
+        assert!(matches!(
+            error,
+            DurableError::Git(message)
+                if message == "pull request list limit exceeded: cross-repository serialized bytes"
+        ));
+
+        let exact = be
+            .list_prs_cross_bounded(
+                TENANT,
+                REGION,
+                &viewer,
+                CrossPrListLimits {
+                    maximum_records: 2,
+                    maximum_bytes: exact_bytes,
+                },
+            )
+            .expect("exactly-at-cap records and bytes remain available");
+        assert_eq!(exact.len(), 2);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn forbidden_oversized_repo_contributes_neither_work_nor_capacity() {
+        let root = temp_root("cross-forbidden-cap");
+        let viewer = human("u:viewer");
+        let be = DurableGitBackend::rooted_inmem_for_test(&root);
+        open_pr(&be, "alpha", "Visible", &viewer);
+        for index in 0..3 {
+            open_pr(&be, "hidden", &format!("Hidden {index}"), &viewer);
+        }
+        let authz = GrantBackedRepos::new().grant_read("u:viewer", TENANT, "alpha");
+        let be = be.with_repo_authorizer(Arc::new(authz));
+        let visible_bytes = repo_pr_bytes(&be, "alpha", &viewer);
+
+        let rows = be
+            .list_prs_cross_bounded(
+                TENANT,
+                REGION,
+                &viewer,
+                CrossPrListLimits {
+                    maximum_records: 1,
+                    maximum_bytes: visible_bytes,
+                },
+            )
+            .expect("an oversized forbidden repository is excluded before PR reads");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].repo_slug.as_deref(), Some("alpha"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cross_repo_capacity_accounting_is_overflow_safe() {
+        assert_eq!(
+            checked_cross_pr_list_total(7, 3, 10, "cross-repository record count").unwrap(),
+            10,
+            "the exact ceiling is admitted"
+        );
+        assert!(matches!(
+            checked_cross_pr_list_total(
+                usize::MAX,
+                1,
+                usize::MAX,
+                "cross-repository record count",
+            ),
+            Err(DurableError::Git(message))
+                if message == "pull request list limit exceeded: cross-repository record count"
+        ));
     }
 
     /// **The per-repo list: rows carry the title, tab/sidebar counts are over the full authorised set,
