@@ -37,8 +37,8 @@ use myelin_ci_sandbox::escape_corpus::{parse_console, Backend, BackendRun, Escap
 use myelin_ci_sandbox::gvisor::MemoryCgroup;
 use myelin_ci_sandbox::{
     build_gvisor_corpus_script, gvisor_drill_config_json, resolved_gvisor_rootfs, EgressPolicy,
-    IdemToken, ImageRef, JobKind, JobSpec, MeterTarget, ResourceLimits, RunTokenRef, TrustTier,
-    WorkspaceSpec, GVISOR_CORPUS_SCRIPT,
+    IdemToken, ImageRef, JobKind, JobSpec, MeterTarget, ResourceLimits, RunTokenCredential,
+    TrustTier, WorkspaceSpec, GVISOR_CORPUS_SCRIPT,
 };
 use std::path::{Path, PathBuf};
 
@@ -74,7 +74,10 @@ fn preconditions() -> Option<String> {
 fn drill_spec() -> JobSpec {
     JobSpec::new(
         JobKind::Agent,
-        ImageRef::pinned("r/agd4@sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890").unwrap(),
+        ImageRef::pinned(
+            "r/agd4@sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890",
+        )
+        .unwrap(),
         vec!["/bin/sh".into(), format!("/{GVISOR_CORPUS_SCRIPT}")],
         vec![],
         vec![],
@@ -88,9 +91,7 @@ fn drill_spec() -> JobSpec {
         },
         WorkspaceSpec::default(),
         TrustTier::UntrustedFork,
-        RunTokenRef {
-            jti: "agd4-gvisor".into(),
-        },
+        RunTokenCredential::new("test-bearer", "agd4-gvisor", 300).unwrap(),
         MeterTarget {
             reserve_id: "agd4-gvisor".into(),
         },
@@ -186,7 +187,9 @@ fn ag_d4_ci_t1_escape_gate_re_runs_green_on_the_gvisor_backend() {
     cgroup
         .place_child(&mut cmd)
         .expect("bind the runsc process tree into the memory cgroup");
-    let out = cmd.output().expect("run the corpus inside a real runsc sandbox");
+    let out = cmd
+        .output()
+        .expect("run the corpus inside a real runsc sandbox");
     cgroup.cleanup();
     // Best-effort teardown (idempotent; the container has exited).
     let _ = std::process::Command::new(&bin)

@@ -61,8 +61,8 @@ use std::collections::BTreeMap;
 
 use myelin_ci_sandbox::hardening::HardeningProfile;
 use myelin_ci_sandbox::{
-    EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget, ResourceLimits, RunTokenRef,
-    TrustTier, WorkspaceSpec,
+    EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget, ResourceLimits,
+    RunTokenCredential, TrustTier, WorkspaceSpec,
 };
 use myelin_flow::SignalStore;
 use myelin_storage::reserve_settle::{CostLedger, MeteredUnit, MinorUnits, RunId as LedgerRunId};
@@ -161,9 +161,8 @@ fn triage_agent_job() -> JobSpec {
         // The agent's compute is a trusted member-driven triage run (a member push triggered the CI
         // fail) — but the hardening posture is IDENTICAL regardless of tier (the profile is fixed).
         TrustTier::Trusted,
-        RunTokenRef {
-            jti: "jti:triage-agent:run-triage".to_string(),
-        },
+        RunTokenCredential::new("triage-agent-bearer", "jti:triage-agent:run-triage", 300)
+            .expect("static flagship credential is valid"),
         MeterTarget {
             reserve_id: "reserve:run-triage".to_string(),
         },

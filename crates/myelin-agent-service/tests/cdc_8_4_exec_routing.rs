@@ -36,7 +36,7 @@ use myelin_ci_sandbox::escape_corpus::{BEGIN_MARKER, END_MARKER};
 use myelin_ci_sandbox::{
     parse_console, Backend, BackendRun, EgressPolicy, EnvVar, EscapeAttestation, HookError,
     IdemToken, ImageRef, JobKind, JobSpec, MeterTarget, ReserveHandle, ResourceLimits,
-    ResourceUsage, RunTokenRef, RunnerHooks, SandboxBackend, SandboxHandle, SandboxLaunch,
+    ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend, SandboxHandle, SandboxLaunch,
     SandboxResult, SecretRef, TrustTier, CORPUS, CORPUS_VERSION,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -68,6 +68,10 @@ fn def(name: &str, kind: EffectKind, side_effecting: bool) -> ToolDef {
         requires_approval: false,
         exposed_over_mcp: false,
     }
+}
+
+fn credential(jti: &str) -> RunTokenCredential {
+    RunTokenCredential::new(format!("test-bearer:{jti}"), jti, 300).unwrap()
 }
 
 /// **PROVIDER side (the unified runner seam).** A backend recording the four-guarantee order +
@@ -173,9 +177,7 @@ fn fabric_hands<'a>(
         backend,
         hooks,
         pinned(),
-        RunTokenRef {
-            jti: "agent-jti".into(),
-        },
+        credential("agent-jti"),
         MeterTarget {
             reserve_id: "agent-reserve".into(),
         },
@@ -249,7 +251,7 @@ fn a_mutate_effect_can_never_reach_the_sandbox() {
         EgressPolicy::deny_all(),
         limits(),
         TrustTier::UntrustedFork,
-        RunTokenRef { jti: "j".into() },
+        credential("j"),
         MeterTarget {
             reserve_id: "r".into(),
         },
@@ -284,9 +286,7 @@ fn the_consumer_feeds_the_full_hardening_profile_and_fails_closed_on_an_undigest
         EgressPolicy::deny_all(),
         limits(),
         TrustTier::UntrustedFork,
-        RunTokenRef {
-            jti: "per-run".into(),
-        },
+        credential("per-run"),
         MeterTarget {
             reserve_id: "res".into(),
         },
@@ -316,7 +316,7 @@ fn the_consumer_feeds_the_full_hardening_profile_and_fails_closed_on_an_undigest
         EgressPolicy::deny_all(),
         limits(),
         TrustTier::UntrustedFork,
-        RunTokenRef { jti: "j".into() },
+        credential("j"),
         MeterTarget {
             reserve_id: "r".into(),
         },

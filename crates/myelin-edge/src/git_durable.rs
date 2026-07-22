@@ -83,12 +83,7 @@ pub struct RepoActorContext<'a> {
 
 impl<'a> RepoActorContext<'a> {
     /// Bind route coordinates to the already-authenticated principal.
-    pub fn new(
-        tenant: &'a str,
-        region: &'a str,
-        slug: &'a str,
-        principal: &'a Principal,
-    ) -> Self {
+    pub fn new(tenant: &'a str, region: &'a str, slug: &'a str, principal: &'a Principal) -> Self {
         Self {
             tenant,
             region,
@@ -162,6 +157,10 @@ pub struct DurableGitBackend {
     /// Process shutdown propagated into every per-request gVisor executor so `runsc` is killed and
     /// reaped before the HTTP drain deadline instead of outliving an aborted async task.
     git_shutdown: Arc<AtomicBool>,
+    /// Per-wire short-lived credential authority. Production defaults unavailable/fail-closed until
+    /// the composition root injects the live Identity adapter; test support injects an explicit
+    /// deterministic issuer.
+    git_wire_credentials: Arc<dyn crate::git_wire_exec::GitWireCredentialIssuer>,
     /// **R0.3 / DELTA N2 — the per-repo object-authorization seam for the git wire.** The wire handlers
     /// consult this AFTER `repo_loc` resolves the repo and BEFORE serving any bytes, so an in-tenant
     /// principal with no grant on a repo cannot clone/fetch/push it (the un-granted-repo-reach hole,
@@ -234,7 +233,10 @@ pub async fn recover_placed_git_at_boot(
         if placement.tenant_id != entry.tenant_id
             || placement.region != provider.config().region
             || (placement.home_cell != cell_id
-                && !placement.member_cells.iter().any(|member| member == cell_id))
+                && !placement
+                    .member_cells
+                    .iter()
+                    .any(|member| member == cell_id))
         {
             return Err(DurableError::Io(
                 "active local tenant recovery placement does not match this cell/region".into(),
@@ -301,6 +303,7 @@ impl DurableGitBackend {
             clone_base: public_clone_base(),
             root,
             git_shutdown: Arc::new(AtomicBool::new(false)),
+            git_wire_credentials: crate::git_wire_exec::unavailable_git_wire_credential_issuer(),
             // R2.6: the prod constructor default is FAIL-CLOSED (`DenyAllRepos`) — a composition root
             // that forgets `with_repo_authorizer` denies every repo rather than serving all of them.
             // Production `main.rs` ALWAYS injects the real `CheckBackedRepoAuthorizer`; the permissive
@@ -335,6 +338,7 @@ impl DurableGitBackend {
             clone_base: public_clone_base(),
             root,
             git_shutdown: Arc::new(AtomicBool::new(false)),
+            git_wire_credentials: crate::git_wire_exec::test_git_wire_credential_issuer(),
             repo_authz: Arc::new(AllowAllRepos),
             bootstrap: Arc::new(NoRepoBootstrap),
         }
@@ -376,6 +380,16 @@ impl DurableGitBackend {
         self
     }
 
+    /// Bind the live Identity credential authority used immediately before each Git wire sandbox
+    /// launch. Without this injection the production default refuses every wire invocation.
+    pub fn with_git_wire_credential_issuer(
+        mut self,
+        issuer: Arc<dyn crate::git_wire_exec::GitWireCredentialIssuer>,
+    ) -> DurableGitBackend {
+        self.git_wire_credentials = issuer;
+        self
+    }
+
     /// **The wire-serving `GitCore` over the SAME on-disk root (CT-006b / GT-006).** Composes the
     /// production sandboxed [`crate::git_wire_exec::GitWireExecutor`] (wire ops → canonical `git` in the
     /// hardened gVisor sandbox, no-host-exec) with the in-process [`myelin_git::gix_backend::GixCore`]
@@ -388,9 +402,12 @@ impl DurableGitBackend {
         crate::git_wire_exec::GitWireExecutor,
         myelin_git::gix_backend::GixCore<myelin_git::gix_backend::RootedResolver>,
     > {
-        crate::git_wire_exec::production_git_core_default_with_shutdown(
+        crate::git_wire_exec::production_git_core_with_shutdown_and_issuer(
             self.root.clone(),
+            crate::git_wire_exec::GitWireExecutor::default_limits(),
+            crate::git_wire_exec::GitWireExecutor::serving_hooks(),
             self.git_shutdown.clone(),
+            self.git_wire_credentials.clone(),
         )
     }
 
@@ -413,12 +430,8 @@ impl DurableGitBackend {
     ) -> Result<myelin_git::reconcile::ReconcileReport, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc)?;
-        let records = myelin_git::reconcile::refs_from_outbox_scoped(
-            &self.outbox,
-            tenant,
-            region,
-            slug,
-        )?;
+        let records =
+            myelin_git::reconcile::refs_from_outbox_scoped(&self.outbox, tenant, region, slug)?;
         myelin_git::reconcile::reconcile_refs(&repo, &records)
     }
 
@@ -443,11 +456,8 @@ impl DurableGitBackend {
             Some(store) => store.list_pending_merges(scope)?,
             None => Vec::new(),
         };
-        let mut repos = myelin_git::reconcile::repo_slugs_from_outbox_scoped(
-            &self.outbox,
-            tenant,
-            region,
-        )?;
+        let mut repos =
+            myelin_git::reconcile::repo_slugs_from_outbox_scoped(&self.outbox, tenant, region)?;
         repos.extend(pending.iter().map(|item| item.repo_slug.clone()));
 
         let mut report = GitBootRecoveryReport::default();
@@ -1882,13 +1892,7 @@ impl DurableGitBackend {
                 }
                 return store
                     .recover_pending_merge_target(
-                        &scope,
-                        slug,
-                        number,
-                        principal,
-                        &loc,
-                        &repo,
-                        &ref_store,
+                        &scope, slug, number, principal, &loc, &repo, &ref_store,
                     )?
                     .ok_or_else(|| {
                         DurableError::Io("pending merge disappeared during recovery".into())
@@ -2308,8 +2312,13 @@ impl DurableGitBackend {
         let objects: Vec<(String, String, Vec<u8>)> = if pack.is_empty() {
             Vec::new()
         } else {
-            let exec = crate::git_wire_exec::GitWireExecutor::serving_default(self.root.clone())
-                .with_shutdown_signal(self.git_shutdown.clone());
+            let exec = crate::git_wire_exec::GitWireExecutor::new(
+                self.root.clone(),
+                crate::git_wire_exec::GitWireExecutor::default_limits(),
+                crate::git_wire_exec::GitWireExecutor::serving_hooks(),
+                self.git_wire_credentials.clone(),
+            )
+            .with_shutdown_signal(self.git_shutdown.clone());
             match exec.ingest_pack(&loc, pack) {
                 Ok(stream) => match parse_cat_file_batch(&stream) {
                     Ok(o) => o,
@@ -4358,7 +4367,10 @@ mod event_privacy_tests {
             "runtime://raw-machine/session",
             "person@example.test",
         ] {
-            assert!(!serialized.contains(raw), "raw Agent identifier leaked: {raw}");
+            assert!(
+                !serialized.contains(raw),
+                "raw Agent identifier leaked: {raw}"
+            );
         }
 
         let request = RepoActorContext::new("acme", "fr-par", "core", &principal).for_pr(42);

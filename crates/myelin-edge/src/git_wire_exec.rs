@@ -32,14 +32,68 @@
 
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
-    GitWireSpec, IdemToken, MeterTarget, ResourceLimits, RunTokenRef, RunnerHooks, SandboxBackend,
-    SandboxLaunch,
+    GitWireSpec, IdemToken, MeterTarget, ResourceLimits, RunTokenCredential, RunnerHooks,
+    SandboxBackend, SandboxLaunch,
 };
 use myelin_git::core::{GitCoreError, RoutedGitCore, WireExecutor, WireInvocation, WireOutput};
 use myelin_git::gix_backend::{GixCore, RootedResolver};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Authenticated facts presented to the serving-tier credential issuer for one sandboxed Git wire
+/// invocation. The issuer itself is expected to be request-bound to the verified principal; no
+/// bearer material or caller-selectable policy enters this carrier.
+pub struct GitWireCredentialRequest<'a> {
+    pub tenant: &'a str,
+    pub region: &'a str,
+    pub repo: &'a str,
+    pub operation: &'a str,
+    pub invocation_id: &'a str,
+    pub ttl_secs: u64,
+}
+
+/// Final-boundary minting port for sandboxed Git wire work. A production implementation calls the
+/// Identity token authority; the executor has no fallback that fabricates credentials.
+pub trait GitWireCredentialIssuer: Send + Sync {
+    fn mint(&self, request: &GitWireCredentialRequest<'_>) -> Result<RunTokenCredential, String>;
+}
+
+#[derive(Debug)]
+struct UnavailableGitWireCredentialIssuer;
+
+impl GitWireCredentialIssuer for UnavailableGitWireCredentialIssuer {
+    fn mint(&self, _request: &GitWireCredentialRequest<'_>) -> Result<RunTokenCredential, String> {
+        Err("no live Identity Git-wire credential issuer is configured".into())
+    }
+}
+
+pub(crate) fn unavailable_git_wire_credential_issuer() -> Arc<dyn GitWireCredentialIssuer> {
+    Arc::new(UnavailableGitWireCredentialIssuer)
+}
+
+/// Explicit deterministic issuer for tests/drills. It is absent from the default production graph;
+/// production composition must bind Identity instead.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub struct TestGitWireCredentialIssuer;
+
+#[cfg(any(test, feature = "test-support"))]
+impl GitWireCredentialIssuer for TestGitWireCredentialIssuer {
+    fn mint(&self, request: &GitWireCredentialRequest<'_>) -> Result<RunTokenCredential, String> {
+        RunTokenCredential::new(
+            format!("test-git-wire-bearer:{}", request.invocation_id),
+            format!("test-git-wire-jti:{}", request.invocation_id),
+            request.ttl_secs,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_git_wire_credential_issuer() -> Arc<dyn GitWireCredentialIssuer> {
+    Arc::new(TestGitWireCredentialIssuer)
+}
 
 /// The production [`WireExecutor`]: every canonical-`git` wire invocation runs SANDBOXED through the
 /// gVisor backend's [`GvisorBackend::launch_git_wire`]. Rooted at the on-disk dir holding
@@ -52,6 +106,7 @@ pub struct GitWireExecutor {
     root: PathBuf,
     limits: ResourceLimits,
     hooks: RunnerHooks,
+    credential_issuer: Arc<dyn GitWireCredentialIssuer>,
     shutdown: Arc<AtomicBool>,
     /// Monotone per-invocation sequence → a unique idempotency token per sandboxed launch (the runner
     /// dedups on it; one sandbox per wire op, never reused).
@@ -62,12 +117,18 @@ impl GitWireExecutor {
     /// Build the production executor over an on-disk git root, resource limits, and the four-guarantee
     /// hooks. The caller (the composition root / CT-006c server) supplies real hooks; nothing here
     /// fabricates a guarantee.
-    pub fn new(root: impl Into<PathBuf>, limits: ResourceLimits, hooks: RunnerHooks) -> Self {
+    pub fn new(
+        root: impl Into<PathBuf>,
+        limits: ResourceLimits,
+        hooks: RunnerHooks,
+        credential_issuer: Arc<dyn GitWireCredentialIssuer>,
+    ) -> Self {
         Self {
             backend: GvisorBackend::new(),
             root: root.into(),
             limits,
             hooks,
+            credential_issuer,
             shutdown: Arc::new(AtomicBool::new(false)),
             seq: AtomicU64::new(0),
         }
@@ -81,11 +142,15 @@ impl GitWireExecutor {
     }
 
     /// Serving-tier default: sane resource bounds + the four-guarantee hooks wired to pass-through
-    /// seams (the real reserve/settle wallet body is Commercial 11.7, attribution is Identity 4.7, and
-    /// the isolation-floor body is the hardening profile the launch ALREADY asserts in force — see
-    /// `launch_git_wire`). The composition root overrides the hooks to bind the live wallet/token/KMS.
+    /// seams. Credential minting deliberately remains unavailable, so a wire operation fails closed
+    /// until the composition root injects a live Identity issuer with [`Self::new`].
     pub fn serving_default(root: impl Into<PathBuf>) -> Self {
-        Self::new(root, Self::default_limits(), Self::serving_hooks())
+        Self::new(
+            root,
+            Self::default_limits(),
+            Self::serving_hooks(),
+            unavailable_git_wire_credential_issuer(),
+        )
     }
 
     /// The serving-tier resource bounds for a wire op (every field non-zero: the `JobSpec` invariants
@@ -129,20 +194,35 @@ impl GitWireExecutor {
         ]
     }
 
-    /// Synthesize the per-invocation four-guarantee tokens (one sandbox per wire op). The serving tier
-    /// derives these from the verified request; here they are unique-per-launch handles.
-    fn next_tokens(&self) -> (RunTokenRef, MeterTarget, IdemToken) {
+    /// Mint the per-invocation credential and derive non-secret accounting/idempotency handles. A
+    /// missing/refusing Identity issuer is a hard wire error before path resolution or sandbox spawn.
+    fn next_tokens(
+        &self,
+        repo: &myelin_git::core::RepoLoc,
+        operation: &str,
+    ) -> Result<(RunTokenCredential, MeterTarget, IdemToken), GitCoreError> {
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
         let tag = format!("git-wire-{}-{n}", std::process::id());
-        (
-            RunTokenRef {
-                jti: format!("{tag}-jti"),
-            },
+        let credential = self
+            .credential_issuer
+            .mint(&GitWireCredentialRequest {
+                tenant: &repo.tenant,
+                region: &repo.region,
+                repo: &repo.repo,
+                operation,
+                invocation_id: &tag,
+                ttl_secs: 120,
+            })
+            .map_err(|error| {
+                GitCoreError::Wire(format!("Git-wire credential mint refused: {error}"))
+            })?;
+        Ok((
+            credential,
             MeterTarget {
                 reserve_id: format!("{tag}-reserve"),
             },
             IdemToken(tag),
-        )
+        ))
     }
 }
 
@@ -159,7 +239,12 @@ impl GitWireExecutor {
         repo: &myelin_git::core::RepoLoc,
         pack: Vec<u8>,
     ) -> Result<Vec<u8>, GitCoreError> {
-        let (rt, mt, it) = self.next_tokens();
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(GitCoreError::Wire(
+                "sandboxed receive-pack ingest cancelled by process shutdown".into(),
+            ));
+        }
+        let (rt, mt, it) = self.next_tokens(repo, "receive-pack-ingest")?;
         let spec = GitWireSpec::for_repo(
             &self.root,
             &repo.tenant,
@@ -205,7 +290,14 @@ impl GitWireExecutor {
 
 impl WireExecutor for GitWireExecutor {
     fn run(&self, inv: &WireInvocation) -> Result<WireOutput, GitCoreError> {
-        let (rt, mt, it) = self.next_tokens();
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(GitCoreError::Wire(format!(
+                "sandboxed `git {}` cancelled by process shutdown",
+                inv.argv.join(" ")
+            )));
+        }
+        let operation = inv.argv.first().map(String::as_str).unwrap_or("git-wire");
+        let (rt, mt, it) = self.next_tokens(&inv.repo, operation)?;
         // Map the WireInvocation locator → a resolver-validated, symlink-confined GitWireSpec. A
         // cross-tenant / `..` / separator locator is REFUSED here (the GT-001 boundary), before mount.
         // NO quarantine for upload-pack (read-only serve); the receive-pack writable quarantine is CT-006c.
@@ -275,7 +367,25 @@ pub fn production_git_core(
     hooks: RunnerHooks,
 ) -> RoutedGitCore<GitWireExecutor, GixCore<RootedResolver>> {
     let root = root.into();
-    let exec = GitWireExecutor::new(root.clone(), limits, hooks);
+    let exec = GitWireExecutor::new(
+        root.clone(),
+        limits,
+        hooks,
+        unavailable_git_wire_credential_issuer(),
+    );
+    let read = GixCore::new(RootedResolver::new(root));
+    RoutedGitCore::new(exec, read)
+}
+
+/// Production Git core with an explicit live Identity credential issuer.
+pub fn production_git_core_with_issuer(
+    root: impl Into<PathBuf>,
+    limits: ResourceLimits,
+    hooks: RunnerHooks,
+    credential_issuer: Arc<dyn GitWireCredentialIssuer>,
+) -> RoutedGitCore<GitWireExecutor, GixCore<RootedResolver>> {
+    let root = root.into();
+    let exec = GitWireExecutor::new(root.clone(), limits, hooks, credential_issuer);
     let read = GixCore::new(RootedResolver::new(root));
     RoutedGitCore::new(exec, read)
 }
@@ -288,14 +398,36 @@ pub fn production_git_core_with_shutdown(
     shutdown: Arc<AtomicBool>,
 ) -> RoutedGitCore<GitWireExecutor, GixCore<RootedResolver>> {
     let root = root.into();
-    let exec = GitWireExecutor::new(root.clone(), limits, hooks).with_shutdown_signal(shutdown);
+    let exec = GitWireExecutor::new(
+        root.clone(),
+        limits,
+        hooks,
+        unavailable_git_wire_credential_issuer(),
+    )
+    .with_shutdown_signal(shutdown);
     let read = GixCore::new(RootedResolver::new(root));
     RoutedGitCore::new(exec, read)
 }
 
-/// Serving-tier default composition (default limits + pass-through guarantee hooks; the live
-/// wallet/token/KMS bodies are bound by the composition root). The on-disk `root` is the SAME root the
-/// durable git backend ([`crate::DurableGitBackend`]) writes/reads through.
+/// Shutdown-aware production Git core with an explicit live Identity credential issuer.
+pub fn production_git_core_with_shutdown_and_issuer(
+    root: impl Into<PathBuf>,
+    limits: ResourceLimits,
+    hooks: RunnerHooks,
+    shutdown: Arc<AtomicBool>,
+    credential_issuer: Arc<dyn GitWireCredentialIssuer>,
+) -> RoutedGitCore<GitWireExecutor, GixCore<RootedResolver>> {
+    let root = root.into();
+    let exec = GitWireExecutor::new(root.clone(), limits, hooks, credential_issuer)
+        .with_shutdown_signal(shutdown);
+    let read = GixCore::new(RootedResolver::new(root));
+    RoutedGitCore::new(exec, read)
+}
+
+/// Serving-tier default composition (default limits + pass-through guarantee hooks). Credential
+/// minting is deliberately unavailable, so wire operations fail closed until the composition root
+/// uses [`production_git_core_with_issuer`]. The on-disk `root` is the SAME root the durable git
+/// backend ([`crate::DurableGitBackend`]) writes/reads through.
 pub fn production_git_core_default(
     root: impl Into<PathBuf>,
 ) -> RoutedGitCore<GitWireExecutor, GixCore<RootedResolver>> {
@@ -327,8 +459,8 @@ mod tests {
     #[test]
     fn pre_cancelled_executor_never_reaches_runsc() {
         let shutdown = Arc::new(AtomicBool::new(true));
-        let executor = GitWireExecutor::serving_default("/absent/git-root")
-            .with_shutdown_signal(shutdown);
+        let executor =
+            GitWireExecutor::serving_default("/absent/git-root").with_shutdown_signal(shutdown);
         let error = executor
             .run(&WireInvocation {
                 repo: RepoLoc::new("acme", "eu-west", "widgets"),
@@ -337,5 +469,22 @@ mod tests {
             })
             .expect_err("shutdown must refuse before filesystem or runsc access");
         assert!(error.to_string().contains("cancelled by process shutdown"));
+    }
+
+    #[test]
+    fn production_default_refuses_without_a_live_credential_issuer() {
+        let executor = GitWireExecutor::serving_default("/absent/git-root");
+        let error = executor
+            .run(&WireInvocation {
+                repo: RepoLoc::new("acme", "eu-west", "widgets"),
+                argv: vec!["upload-pack".into(), "--stateless-rpc".into()],
+                stdin: Vec::new(),
+            })
+            .expect_err(
+                "an unbound production executor must fail before filesystem or runsc access",
+            );
+        assert!(error
+            .to_string()
+            .contains("no live Identity Git-wire credential issuer is configured"));
     }
 }

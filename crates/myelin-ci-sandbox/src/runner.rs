@@ -894,8 +894,8 @@ mod tests {
     use super::*;
     use crate::{
         EgressPolicy, HookError, IdemToken, ImageRef, JobKind, MeterTarget, ReserveHandle,
-        ResourceLimits, ResourceUsage, RunTokenRef, SandboxHandle, SandboxLaunch, SandboxResult,
-        TrustTier, WorkspaceSpec,
+        ResourceLimits, ResourceUsage, RunTokenCredential, SandboxHandle, SandboxLaunch,
+        SandboxResult, TrustTier, WorkspaceSpec,
     };
     use myelin_events::MonotonicMinter;
     use myelin_flow::{job_idem_token, FlowExecutor, StartSpec};
@@ -933,9 +933,7 @@ mod tests {
             limits(),
             WorkspaceSpec::default(),
             TrustTier::Trusted,
-            RunTokenRef {
-                jti: "jti-1".into(),
-            },
+            RunTokenCredential::new("test-bearer", "jti-1", 300).unwrap(),
             MeterTarget {
                 reserve_id: "res-1".into(),
             },

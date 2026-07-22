@@ -48,8 +48,8 @@ use myelin_ci_controlplane::{
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, EgressPolicy, FirehoseSink, IdemToken, ImageRef, JobKind, JobSpec,
-    LeaseStore, MeterTarget, ReserveHandle, ResourceLimits, RunTokenRef, RunnerAgent, RunnerHooks,
-    TrustTier, WorkspaceSpec,
+    LeaseStore, MeterTarget, ReserveHandle, ResourceLimits, RunTokenCredential, RunnerAgent,
+    RunnerHooks, TrustTier, WorkspaceSpec,
 };
 use myelin_events::{IdMinter, Ulid};
 use myelin_flow::{
@@ -264,7 +264,7 @@ fn compute_spec(command: Vec<String>, trust: TrustTier, idem: &str) -> DurableCi
         },
         WorkspaceSpec::default(),
         trust,
-        RunTokenRef { jti: "ct004d1-jti".into() },
+        RunTokenCredential::new("test-bearer", "ct004d1-jti", 300).unwrap(),
         MeterTarget { reserve_id: "ct004d1-reserve".into() },
         IdemToken(idem.into()),
     )
@@ -283,14 +283,18 @@ impl CiJobTokenIssuer for ClaimTokenIssuer {
     fn mint(
         &self,
         request: CiJobTokenRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<RunTokenRef, CiJobTokenIssueError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<RunTokenCredential, CiJobTokenIssueError>> + Send + '_>>
+    {
         Box::pin(async move {
-            Ok(RunTokenRef {
-                jti: format!(
+            RunTokenCredential::new(
+                format!("claim-bearer:{}", request.claim_nonce),
+                format!(
                     "claim-jti:{}:{}:{}",
                     request.job_id, request.lease_epoch, request.claim_nonce
                 ),
-            })
+                300,
+            )
+            .map_err(|error| CiJobTokenIssueError(error.to_string()))
         })
     }
 }

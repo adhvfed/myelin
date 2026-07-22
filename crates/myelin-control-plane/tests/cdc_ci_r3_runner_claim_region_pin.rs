@@ -15,7 +15,7 @@
 
 use myelin_ci_sandbox::{
     EgressPolicy, IdemToken, ImageRef, JobKind, JobLeaseStore, JobSpec, MeterTarget, QueuedJob,
-    ResourceLimits, RunTokenRef, TrustTier, WorkspaceSpec,
+    ResourceLimits, RunTokenCredential, TrustTier, WorkspaceSpec,
 };
 use myelin_control_plane::{OutOfRegionRunnerClaim, RunnerClaimPin};
 use myelin_tenancy::{Region, TenantId};
@@ -37,9 +37,7 @@ fn ci_spec(idem: &str) -> JobSpec {
         },
         WorkspaceSpec::default(),
         TrustTier::Trusted,
-        RunTokenRef {
-            jti: "jti-1".into(),
-        },
+        RunTokenCredential::new("test-run-bearer", "jti-1", 60).unwrap(),
         MeterTarget {
             reserve_id: "res-1".into(),
         },

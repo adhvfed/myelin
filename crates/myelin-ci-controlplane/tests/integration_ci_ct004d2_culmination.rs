@@ -44,7 +44,7 @@ use myelin_ci_controlplane::{
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, CompletionClaim, FirehoseSink, ReserveHandle, ResourceUsage,
-    RunTokenRef, RunnerAgent, RunnerHooks, TerminalReport, TerminalReporter, TrustTier,
+    RunTokenCredential, RunnerAgent, RunnerHooks, TerminalReport, TerminalReporter, TrustTier,
 };
 use myelin_events::{Actor, IdMinter, MonotonicMinter, OutboxStore};
 use myelin_flow::{
@@ -68,11 +68,15 @@ impl CiJobTokenIssuer for ClaimTokenIssuer {
     fn mint(
         &self,
         request: CiJobTokenRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<RunTokenRef, CiJobTokenIssueError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<RunTokenCredential, CiJobTokenIssueError>> + Send + '_>>
+    {
         Box::pin(async move {
-            Ok(RunTokenRef {
-                jti: format!("culmination:{}:{}", request.job_id, request.claim_nonce),
-            })
+            RunTokenCredential::new(
+                format!("culmination-bearer:{}", request.claim_nonce),
+                format!("culmination:{}:{}", request.job_id, request.claim_nonce),
+                300,
+            )
+            .map_err(|error| CiJobTokenIssueError(error.to_string()))
         })
     }
 }

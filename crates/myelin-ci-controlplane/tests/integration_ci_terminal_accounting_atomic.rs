@@ -9,12 +9,12 @@ use myelin_ci_controlplane::{
     CiJobAccountingStore, CiJobPricingError, CiManifestLaneV1, CiManifestLimitsV1,
     CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, CiPipelineReporter,
     CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationWrite, CiRunFinalizer, CiRunInsert,
-    CiRunStoreError, CiRunTerminalState, DurableCiJobAccounting, DurableCiRunFinalizer,
-    GrantedCiJobV1, PricedCiJobUsage,
+    CiRunStoreError, CiRunTerminalState, DurableCiJobAccounting, DurableCiJobLaunchTemplate,
+    DurableCiRunFinalizer, GrantedCiJobV1, PricedCiJobUsage,
 };
 use myelin_ci_sandbox::{
     CompletionClaim, EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
-    ResourceLimits, ResourceUsage, RunTokenRef, TerminalReport, TerminalReporter, TrustTier,
+    ResourceLimits, ResourceUsage, RunTokenCredential, TerminalReport, TerminalReporter, TrustTier,
     WorkspaceSpec,
 };
 use myelin_config::MyelinConfig;
@@ -201,9 +201,7 @@ fn sandbox_spec(idem: &str) -> JobSpec {
         },
         WorkspaceSpec::default(),
         TrustTier::Trusted,
-        RunTokenRef {
-            jti: "test-jti".into(),
-        },
+        RunTokenCredential::new("test-bearer", "test-jti", 300).unwrap(),
         MeterTarget {
             reserve_id: "reserve:accounting-live".into(),
         },
@@ -329,7 +327,13 @@ async fn reporter_co_commits_accounting_claim_and_signal_and_rolls_back_failure(
         .await
         .unwrap();
 
-    let spec = serde_json::to_value(sandbox_spec(idem)).unwrap();
+    let (spec_template, _credential) = sandbox_spec(idem).into_template();
+    let spec = serde_json::to_value(DurableCiJobLaunchTemplate {
+        spec: spec_template,
+        ci_run_id: ci_run.into(),
+        token_authority_handle: "token-authority:live".into(),
+    })
+    .unwrap();
     sqlx::query(
         "INSERT INTO job_queue
          (tenant_id, region, job_id, run_id, lane, labels, trust_tier, fair_key, idem_token,

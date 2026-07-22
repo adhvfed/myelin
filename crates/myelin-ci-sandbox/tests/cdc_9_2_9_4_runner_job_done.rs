@@ -63,7 +63,7 @@ fn ci_spec(idem: &str) -> JobSpec {
         limits(),
         WorkspaceSpec::default(),
         TrustTier::Trusted,
-        myelin_ci_sandbox::RunTokenRef { jti: "jti".into() },
+        myelin_ci_sandbox::RunTokenCredential::new("test-bearer", "jti", 300).unwrap(),
         MeterTarget {
             reserve_id: "res".into(),
         },

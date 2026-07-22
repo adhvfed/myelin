@@ -51,7 +51,7 @@
 //!    reserve at dispatch, refuse-on-exhaustion, settle on completion, never interrupt in-flight
 //!    (contract 11.7; the agent-fabric reserve is [`crate::cost_gate`], AG-P14 → P-227).
 //! 2. **Attribution** ([`RunnerHooks::attribute`]) — the job runs under the per-run attenuated token
-//!    ([`RunTokenRef`], `mint_run_token` 4.7; [`crate::identity`], AG-P13 → P-225); life == run life,
+//!    ([`RunTokenCredential`], `mint_run_token` 4.7; [`crate::identity`], AG-P13 → P-225); life == run life,
 //!    auto-revoked on teardown, re-mintable on resume. The shared platform token is **scrubbed** from
 //!    the child env ([`SandboxJob::scrubbed_env`]) — re-asserted here.
 //! 3. **HITL withhold (plan-then-apply)** — structural: side-effecting mutation NEVER goes through
@@ -95,13 +95,13 @@ use crate::escape_gate::AgentExecGate;
 use myelin_agent::{Command, EffectKind, ToolDef, ToolHands, ToolResult};
 use myelin_ci_sandbox::{
     agent_job, EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
-    ResourceLimits, RunTokenRef, RunnerHooks, SandboxBackend, SecretRef, SpecError, TrustTier,
-    WorkspaceSpec,
+    ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend, SecretRef, SpecError,
+    TrustTier, WorkspaceSpec,
 };
 
 /// The env-var name of the **shared platform token** that MUST be scrubbed from the child env before
 /// any untrusted code runs (§5.7 anti-leak; AG-P13 → P-225). The agent's job runs under the *per-run
-/// attenuated* token ([`RunTokenRef`]), never the broad platform token — so the platform token is
+/// attenuated* token ([`RunTokenCredential`]), never the broad platform token — so the platform token is
 /// removed from the child env, and a per-run token name is the only credential the child ever sees.
 /// (The same scrub is enforced in [`crate::skeleton::ChildEnv`]; re-asserted here at the exec seam.)
 pub const PLATFORM_TOKEN_ENV: &str = "MYELIN_PLATFORM_TOKEN";
@@ -202,7 +202,7 @@ impl SandboxJob {
     ///    image (an un-digested tag is rejected), `pids_max > 0`, `timeout_secs > 0`.
     ///
     /// The `env` is **scrubbed** of the shared [`PLATFORM_TOKEN_ENV`] before being fed to the guest
-    /// (guarantee #2 anti-leak); the per-run token rides as [`RunTokenRef`] in the spec, not the env.
+    /// (guarantee #2 anti-leak); the per-run token rides as [`RunTokenCredential`] in the spec, not the env.
     /// Secrets are passed as in-boundary [`SecretRef`]s (names/handles, resolved inside the boundary
     /// — never the clear material, never forwarded via the runtime). Egress is default-deny by
     /// default; the caller opts in to an allowlist via `egress`.
@@ -216,7 +216,7 @@ impl SandboxJob {
         egress: EgressPolicy,
         limits: ResourceLimits,
         trust_tier: TrustTier,
-        run_token: RunTokenRef,
+        run_token: RunTokenCredential,
         meter_to: MeterTarget,
         idem_token: IdemToken,
     ) -> Result<SandboxJob, RoutingError> {
@@ -319,7 +319,7 @@ pub struct SandboxToolHands<'a, B: SandboxBackend> {
     /// The hardened image the `compute` job runs in (digest-pinned; checked fail-closed).
     image: ImageRef,
     /// The per-run attenuated token (guarantee #2; minted at dispatch, life == run life).
-    run_token: RunTokenRef,
+    run_token: RunTokenCredential,
     /// The reserve this run settles against (guarantee #1; reserved at dispatch).
     meter_to: MeterTarget,
     /// The dispatch idempotency token (stamped on `job.done`).
@@ -353,7 +353,7 @@ impl<'a, B: SandboxBackend> SandboxToolHands<'a, B> {
         backend: &'a B,
         hooks: RunnerHooks,
         image: ImageRef,
-        run_token: RunTokenRef,
+        run_token: RunTokenCredential,
         meter_to: MeterTarget,
         idem_token: IdemToken,
         trust_tier: TrustTier,
@@ -557,6 +557,10 @@ mod tests {
         }
     }
 
+    fn credential(jti: &str) -> RunTokenCredential {
+        RunTokenCredential::new(format!("test-bearer:{jti}"), jti, 300).unwrap()
+    }
+
     fn def(name: &str, kind: EffectKind, side_effecting: bool) -> ToolDef {
         ToolDef {
             name: ToolName(name.into()),
@@ -610,7 +614,7 @@ mod tests {
             EgressPolicy::deny_all(),
             limits(),
             TrustTier::UntrustedFork,
-            RunTokenRef { jti: "j".into() },
+            credential("j"),
             MeterTarget {
                 reserve_id: "r".into(),
             },
@@ -646,7 +650,7 @@ mod tests {
                 EgressPolicy::deny_all(),
                 limits(),
                 TrustTier::Trusted,
-                RunTokenRef { jti: "j".into() },
+                credential("j"),
                 MeterTarget {
                     reserve_id: "r".into(),
                 },
@@ -674,9 +678,7 @@ mod tests {
             EgressPolicy::deny_all(),
             limits(),
             TrustTier::UntrustedFork,
-            RunTokenRef {
-                jti: "agent-jti".into(),
-            },
+            credential("agent-jti"),
             MeterTarget {
                 reserve_id: "agent-res".into(),
             },
@@ -703,7 +705,7 @@ mod tests {
             EgressPolicy::deny_all(),
             limits(),
             TrustTier::UntrustedFork,
-            RunTokenRef { jti: "jti".into() },
+            credential("jti"),
             MeterTarget {
                 reserve_id: "res".into(),
             },
@@ -746,7 +748,7 @@ mod tests {
             EgressPolicy::deny_all(),
             limits(),
             TrustTier::UntrustedFork,
-            RunTokenRef { jti: "j".into() },
+            credential("j"),
             MeterTarget {
                 reserve_id: "r".into(),
             },
@@ -772,7 +774,7 @@ mod tests {
             EgressPolicy::deny_all(),
             l,
             TrustTier::UntrustedFork,
-            RunTokenRef { jti: "j".into() },
+            credential("j"),
             MeterTarget {
                 reserve_id: "r".into(),
             },
@@ -808,16 +810,14 @@ mod tests {
             EgressPolicy::deny_all(),
             limits(),
             TrustTier::UntrustedFork,
-            RunTokenRef {
-                jti: "per-run".into(),
-            },
+            credential("per-run"),
             MeterTarget {
                 reserve_id: "r".into(),
             },
             IdemToken("i".into()),
         )
         .unwrap();
-        // The platform token is GONE; the per-run token rides as the run_token ref, not the env.
+        // The platform token is GONE; the short-lived per-run credential rides on the spec, not the env.
         assert!(job
             .scrubbed_env()
             .iter()
@@ -898,9 +898,7 @@ mod tests {
             backend,
             hooks,
             pinned(),
-            RunTokenRef {
-                jti: "agent-jti".into(),
-            },
+            credential("agent-jti"),
             MeterTarget {
                 reserve_id: "agent-res".into(),
             },

@@ -94,11 +94,13 @@ use myelin_ci_sandbox::escape_corpus::{
     build_corpus_script, parse_console, AttackOutcome, Backend, BackendRun, DrillReport,
     EscapeAttestation,
 };
-use myelin_ci_sandbox::firecracker::{resolved_kernel_path, resolved_rootfs_path, FirecrackerBackend};
+use myelin_ci_sandbox::firecracker::{
+    resolved_kernel_path, resolved_rootfs_path, FirecrackerBackend,
+};
 use myelin_ci_sandbox::gvisor::{build_gvisor_corpus_script, GvisorBackend};
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget,
-    ReserveHandle, ResourceLimits, RunTokenRef, RunnerHooks, SandboxBackend, TrustTier,
+    ReserveHandle, ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend, TrustTier,
     WorkspaceSpec,
 };
 use std::path::Path;
@@ -188,9 +190,7 @@ fn corpus_spec(command: Vec<String>, tag: &str) -> JobSpec {
         },
         WorkspaceSpec::default(),
         TrustTier::Trusted,
-        RunTokenRef {
-            jti: format!("ct003-{tag}"),
-        },
+        RunTokenCredential::new("test-bearer", format!("ct003-{tag}"), 300).unwrap(),
         MeterTarget {
             reserve_id: format!("ct003-{tag}"),
         },
@@ -391,7 +391,11 @@ fn firecracker_production_launch_contains_the_corpus_non_root() {
     // command-runner runs it NON-ROOT (uid 65534) under the mandatory hardening profile.
     let backend = FirecrackerBackend::new();
     let spec = corpus_spec(
-        vec!["/bin/bash".into(), "-c".into(), build_corpus_script(PIDS_MAX)],
+        vec![
+            "/bin/bash".into(),
+            "-c".into(),
+            build_corpus_script(PIDS_MAX),
+        ],
         "fc",
     );
     let launch = backend
@@ -434,7 +438,9 @@ fn firecracker_production_launch_contains_the_corpus_non_root() {
          unbounded fork bomb. The ceiling must keep the guest alive."
     );
 
-    backend.kill(&launch.handle).expect("teardown whole-guest-kill is idempotent");
+    backend
+        .kill(&launch.handle)
+        .expect("teardown whole-guest-kill is idempotent");
 }
 
 #[test]
@@ -461,7 +467,11 @@ fn gvisor_production_launch_contains_the_corpus_non_root() {
     // `stage_bundle`. The production OCI config runs it NON-ROOT (uid 65534), `--network=none`.
     let backend = GvisorBackend::new();
     let spec = corpus_spec(
-        vec!["/bin/sh".into(), "-c".into(), build_gvisor_corpus_script(PIDS_MAX)],
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            build_gvisor_corpus_script(PIDS_MAX),
+        ],
         "gvisor",
     );
     let launch = backend
@@ -510,7 +520,15 @@ fn gvisor_production_launch_contains_the_corpus_non_root() {
     );
     let kernel_version = console
         .lines()
-        .find_map(|l| l.find("kernel=").map(|i| l[i + 7..].split_whitespace().next().unwrap_or("").to_string()))
+        .find_map(|l| {
+            l.find("kernel=").map(|i| {
+                l[i + 7..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
+        })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "4.19.0-gvisor".to_string());
     let date = std::env::var("MYELIN_DRILL_DATE").unwrap_or_else(|_| "2026-06-29".to_string());
@@ -532,11 +550,16 @@ fn gvisor_production_launch_contains_the_corpus_non_root() {
          production-path escape attestation (it refuses over a non-green report)",
     );
     assert_eq!(attestation.total_escapes, 0);
-    println!("[CT-003a gvisor PRODUCTION-PATH] {}", attestation.green_line());
+    println!(
+        "[CT-003a gvisor PRODUCTION-PATH] {}",
+        attestation.green_line()
+    );
     println!(
         "[CT-003a] green production-path escape attestation minted from the REAL non-root launch() \
          (guest_euid=65534) — SI-017 closed on the gVisor production seam."
     );
 
-    backend.kill(&launch.handle).expect("teardown is idempotent");
+    backend
+        .kill(&launch.handle)
+        .expect("teardown is idempotent");
 }

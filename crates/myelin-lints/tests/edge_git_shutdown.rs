@@ -30,8 +30,8 @@ fn edge_shutdown_reaches_active_git_wire_containers() {
         );
     }
     assert!(
-        durable.contains("production_git_core_default_with_shutdown"),
-        "durable Git serving must propagate the shared shutdown flag"
+        durable.contains("production_git_core_with_shutdown_and_issuer"),
+        "durable Git serving must propagate the shared shutdown flag and credential issuer"
     );
     for required in [
         "launch_git_wire_until_cancelled",

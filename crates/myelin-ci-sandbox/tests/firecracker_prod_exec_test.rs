@@ -32,8 +32,9 @@ use myelin_ci_sandbox::firecracker::{
     resolved_kernel_path, resolved_rootfs_path, FirecrackerBackend,
 };
 use myelin_ci_sandbox::{
-    EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget, ReserveHandle, ResourceLimits,
-    RunTokenRef, RunnerHooks, SandboxBackend, TrustTier, WorkspaceSpec, SANDBOX_CAPTURE_BOUND,
+    EgressPolicy, IdemToken, ImageRef, JobKind, JobSpec, MeterTarget, ReserveHandle,
+    ResourceLimits, RunTokenCredential, RunnerHooks, SandboxBackend, TrustTier, WorkspaceSpec,
+    SANDBOX_CAPTURE_BOUND,
 };
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -101,9 +102,7 @@ fn spec_running(command: Vec<String>, timeout_secs: u32) -> JobSpec {
         },
         WorkspaceSpec::default(),
         TrustTier::Trusted,
-        RunTokenRef {
-            jti: "prod-exec-jti".into(),
-        },
+        RunTokenCredential::new("test-bearer", "prod-exec-jti", 300).unwrap(),
         MeterTarget {
             reserve_id: "prod-exec-reserve".into(),
         },
@@ -145,7 +144,10 @@ fn real_microvm_runs_command_and_captures_exit_stdout_stderr() {
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
     println!("=== CT-002a REAL Firecracker prod-exec (exit-7 case) ===");
-    println!("exit_code = {:?}  timed_out = {}", result.exit_code, result.timed_out);
+    println!(
+        "exit_code = {:?}  timed_out = {}",
+        result.exit_code, result.timed_out
+    );
     println!("usage = {:?}", result.usage);
     println!("captured stdout = {stdout:?}");
     println!("captured stderr = {stderr:?}");
@@ -155,7 +157,10 @@ fn real_microvm_runs_command_and_captures_exit_stdout_stderr() {
         Some(7),
         "the REAL guest command exited 7 (captured from the nonce-framed serial-console marker)"
     );
-    assert!(!result.timed_out, "the command completed well within the timeout");
+    assert!(
+        !result.timed_out,
+        "the command completed well within the timeout"
+    );
     assert!(!result.passed(), "a non-zero exit is not a pass");
     assert!(
         stdout.contains("hello-stdout"),
@@ -166,8 +171,12 @@ fn real_microvm_runs_command_and_captures_exit_stdout_stderr() {
         "captured stderr must contain the command's stderr. got: {stderr:?}"
     );
 
-    backend.kill(&launch.handle).expect("teardown whole-guest-kill is idempotent");
-    backend.kill(&launch.handle).expect("kill is idempotent on an already-gone guest");
+    backend
+        .kill(&launch.handle)
+        .expect("teardown whole-guest-kill is idempotent");
+    backend
+        .kill(&launch.handle)
+        .expect("kill is idempotent on an already-gone guest");
 }
 
 /// CT-002c host-side memory-DoS regression (REAL kernel). An untrusted workload emits 2 MiB of stdout
@@ -247,7 +256,9 @@ fn real_microvm_runaway_stdout_is_capped_without_deadlock() {
         "the guest must complete + reboot WELL under the {timeout_secs}s ceiling (no hang); elapsed {elapsed:?}"
     );
 
-    backend.kill(&launch.handle).expect("teardown whole-guest-kill is idempotent");
+    backend
+        .kill(&launch.handle)
+        .expect("teardown whole-guest-kill is idempotent");
 }
 
 #[test]
@@ -273,7 +284,10 @@ fn real_microvm_command_past_timeout_is_whole_guest_killed() {
     );
     println!("usage = {:?}", result.usage);
 
-    assert!(result.timed_out, "the sleep past timeout_secs=2 must time out");
+    assert!(
+        result.timed_out,
+        "the sleep past timeout_secs=2 must time out"
+    );
     assert_eq!(
         result.exit_code, None,
         "a timed-out (killed) guest has no trustworthy exit code — never fabricated as 0"
@@ -308,7 +322,10 @@ fn real_microvm_job_cannot_forge_the_exit_code() {
     let result = &launch.result;
     let stdout = String::from_utf8_lossy(&result.stdout);
     println!("=== CT-002a REAL Firecracker forge-resistance (real kernel) ===");
-    println!("exit_code = {:?} (must be 5, NOT the forged 0)", result.exit_code);
+    println!(
+        "exit_code = {:?} (must be 5, NOT the forged 0)",
+        result.exit_code
+    );
     println!("captured stdout = {stdout:?}");
 
     assert_eq!(
@@ -361,7 +378,10 @@ exit 3
     let result = &launch.result;
     let stdout = String::from_utf8_lossy(&result.stdout);
     println!("=== CT-002a STRUCTURAL forge-resistance (non-root payload, real kernel) ===");
-    println!("exit_code = {:?} (must be 3, NEVER the forged 0)", result.exit_code);
+    println!(
+        "exit_code = {:?} (must be 3, NEVER the forged 0)",
+        result.exit_code
+    );
     println!("captured stdout = {stdout:?}");
 
     // (a) the kernel DENIED the non-root payload's /dev/console write (the structural boundary).
@@ -386,8 +406,14 @@ exit 3
         "the forged exit-0 (even with the REAL nonce) cannot win — the non-root payload could not \
          write the console at all, so the only exit line is init's trusted 3"
     );
-    assert!(!result.timed_out, "the command completed within the timeout");
-    assert!(!result.passed(), "a non-zero exit is not a pass — the forge did NOT flip it to a pass");
+    assert!(
+        !result.timed_out,
+        "the command completed within the timeout"
+    );
+    assert!(
+        !result.passed(),
+        "a non-zero exit is not a pass — the forge did NOT flip it to a pass"
+    );
 
     backend.kill(&launch.handle).expect("teardown");
 }
