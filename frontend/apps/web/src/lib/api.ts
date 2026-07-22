@@ -25,6 +25,7 @@ import {
 } from "./mutation-response";
 import { parseFileLinesInput, parseFileLinesResponse } from "./file-lines";
 import { parseRepoHome, parseReposPage } from "./repo-read-response";
+import { parseCommitDiff, parseCommitsPage } from "./commit-read-response";
 
 export type { IssueMutation, PrMutation } from "./mutation-input";
 
@@ -533,9 +534,13 @@ export const getCommits = query(
   async (input: { repo: string; ref: string; cursor?: string }): Promise<CommitsPage> => {
     "use server";
     const q = input.cursor ? `?cursor=${seg(input.cursor)}` : "";
-    return authed(() =>
-      edgeGet<CommitsPage>(`/v1/git/repos/${seg(input.repo)}/commits/${seg(input.ref)}${q}`),
-    );
+    return authed(async () => {
+      const page = parseCommitsPage(await edgeGet(
+        `/v1/git/repos/${seg(input.repo)}/commits/${seg(input.ref)}${q}`,
+      ));
+      if (!page) throw new RepoRouteError("error");
+      return page;
+    });
   },
   "git-commits",
 );
@@ -544,9 +549,13 @@ export const getCommits = query(
 export const getCommit = query(
   async (input: { repo: string; oid: string }): Promise<CommitDiffVM> => {
     "use server";
-    return authed(() =>
-      edgeGet<CommitDiffVM>(`/v1/git/repos/${seg(input.repo)}/commit/${seg(input.oid)}`),
-    );
+    return authed(async () => {
+      const commit = parseCommitDiff(await edgeGet(
+        `/v1/git/repos/${seg(input.repo)}/commit/${seg(input.oid)}`,
+      ));
+      if (!commit) throw new RepoRouteError("error");
+      return commit;
+    });
   },
   "git-commit",
 );
