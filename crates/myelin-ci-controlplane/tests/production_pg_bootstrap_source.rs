@@ -4,6 +4,7 @@
 fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let source = include_str!("../src/main.rs");
     let library_source = include_str!("../src/lib.rs");
+    let launch_authority_source = include_str!("../src/ci_launch_authority.rs");
     let region_store_source = include_str!("../src/job_queue_region.rs");
 
     assert!(source.contains("MyelinConfig::from_env(Mode::RequireEnv)"));
@@ -62,7 +63,10 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(source.contains("if runner_host_requested {"));
     assert!(source.contains("let runner_host_requested = matches!(&runner_setting"));
     assert!(library_source.contains("LinuxSmallV1LaunchAuthority::new"));
-    assert!(library_source.contains("UnavailableCiJobRuntimeAuthority"));
+    assert!(library_source.contains("UnavailableCiJobBudgetReservation"));
+    assert!(launch_authority_source
+        .contains("ManifestBoundCiJobTokenAuthority::handle_for(request)"));
+    assert!(!launch_authority_source.contains("CiJobTokenAuthorityProvider"));
     assert!(library_source.contains("PgCiRunStarterFactory::new_with_authority"));
     // It routes an AUTHORITATIVE tenant, never a synthetic one — no starter is constructed for a fixed
     // service tenant at the root (the factory mints per discovered ci_run.tenant_id).
