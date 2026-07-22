@@ -381,7 +381,8 @@ impl PgReplayBacking {
 pub struct OidcConfig {
     /// The exact `iss` the token must carry (the configured IdP issuer).
     pub issuer: String,
-    /// The audience this RP is — the token's `aud` MUST contain it.
+    /// The audience this RP is — the token's `aud` MUST name exactly it. Multi-audience tokens are
+    /// refused until an explicit trusted-additional-audience + `azp` policy is configured.
     pub audience: String,
     /// The verified-claim name the TENANT is read from (the trust root; default `tenant`).
     pub tenant_claim: String,
@@ -486,11 +487,16 @@ fn num_claim(claims: &serde_json::Value, key: &str) -> Option<i64> {
     v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
 }
 
-/// Whether the token's `aud` (a string OR an array of strings) contains `want`.
-fn aud_contains(claims: &serde_json::Value, want: &str) -> bool {
+/// Whether the token's `aud` names exactly this RP. OIDC permits an array on the wire, but accepting
+/// arbitrary additional recipients lets a token jointly issued to another client cross a trust
+/// boundary. The conservative default accepts a one-element array for wire compatibility and
+/// refuses every multi-audience token until the deployment has an explicit `azp` policy.
+fn aud_is_exact(claims: &serde_json::Value, want: &str) -> bool {
     match claims.get("aud") {
         Some(serde_json::Value::String(s)) => s == want,
-        Some(serde_json::Value::Array(arr)) => arr.iter().any(|x| x.as_str() == Some(want)),
+        Some(serde_json::Value::Array(arr)) => {
+            arr.len() == 1 && arr.first().and_then(serde_json::Value::as_str) == Some(want)
+        }
         _ => false,
     }
 }
@@ -639,10 +645,11 @@ impl CredentialVerifier for OidcVerifier {
             )));
         }
 
-        // (5b) aud — must contain this RP.
-        if !aud_contains(&claims, &self.config.audience) {
+        // (5b) aud — must name only this RP. A token shared with another client is rejected unless
+        // a future explicit trusted-audience + authorized-party policy opts into that relationship.
+        if !aud_is_exact(&claims, &self.config.audience) {
             return Err(refuse(format!(
-                "audience mismatch: token `aud` does not contain this RP `{}`",
+                "audience mismatch: token `aud` must name exactly this RP `{}`",
                 self.config.audience
             )));
         }
@@ -1251,6 +1258,37 @@ mod tests {
             matches!(&err, AuthzError::FailClosed(m) if m.contains("audience")),
             "a wrong-aud token must be refused, got {err:?}"
         );
+    }
+
+    #[test]
+    fn negative_additional_audience_is_rejected_without_an_explicit_azp_policy() {
+        let key = RsaKey::generate();
+        let jwks = JwkSet::new().with_key("rsa-1", key.jwk());
+        let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
+        let mut cl = claims("jti-extra-aud");
+        cl["aud"] = serde_json::json!(["myelin-rp", "attacker-client"]);
+        cl["azp"] = serde_json::json!("myelin-rp");
+        let sig = key.sign(signing_input(&header, &cl).as_bytes());
+        let error = verifier(jwks)
+            .verify(&cred(jwt(&header, &cl, &sig)))
+            .unwrap_err();
+        assert!(
+            matches!(&error, AuthzError::FailClosed(message) if message.contains("audience")),
+            "an unconfigured additional audience must be refused even when `azp` names Myelin"
+        );
+    }
+
+    #[test]
+    fn positive_single_element_audience_array_is_accepted() {
+        let key = RsaKey::generate();
+        let jwks = JwkSet::new().with_key("rsa-1", key.jwk());
+        let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
+        let mut cl = claims("jti-array-aud");
+        cl["aud"] = serde_json::json!(["myelin-rp"]);
+        let sig = key.sign(signing_input(&header, &cl).as_bytes());
+        verifier(jwks)
+            .verify(&cred(jwt(&header, &cl, &sig)))
+            .expect("a one-element audience array names exactly this RP");
     }
 
     /// (g) WRONG ISS — the token's issuer is not the configured IdP. Reject.
