@@ -112,7 +112,10 @@ fn destructive_round_trip_into_a_clean_target_is_git_fsck_clean() {
         let odb = git.odb().unwrap();
         odb.foreach(|oid| {
             let o = Oid::new(oid.to_string());
-            want_obj_bytes.push((o.clone(), src_repo.read_object(&o).unwrap()));
+            want_obj_bytes.push((
+                o.clone(),
+                src_repo.read_object_bounded(&o, 64 * 1024 * 1024).unwrap(),
+            ));
             true
         })
         .unwrap();
@@ -160,7 +163,9 @@ fn destructive_round_trip_into_a_clean_target_is_git_fsck_clean() {
             oid.as_str()
         );
         assert_eq!(
-            &restored.read_object(oid).expect("read restored object"),
+            &restored
+                .read_object_bounded(oid, 64 * 1024 * 1024)
+                .expect("read restored object"),
             bytes,
             "object {} bytes identical after restore",
             oid.as_str()
