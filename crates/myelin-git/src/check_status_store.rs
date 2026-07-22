@@ -64,20 +64,23 @@ use sqlx::Row;
 /// `tenant_id`); the architecture §6.1 key is `(tenant, repo, commit_oid, context.*)` — `tenant_id`
 /// IS that `tenant`. The table name is parameterised at construction (the integration test isolates
 /// per-process) so the drill never collides with a sibling run; the shape is identical.
-pub fn projection_ddl(table: &str, dedup_table: &str) -> String {
-    format!(
+pub fn projection_ddl(table: &str, dedup_table: &str) -> Result<String, sqlx::Error> {
+    validate_sql_identifier("projection table", table)?;
+    validate_sql_identifier("dedup table", dedup_table)?;
+    Ok(format!(
         "CREATE TABLE IF NOT EXISTS {table} (\
             tenant_id         text   NOT NULL,\
             commit_oid        text   NOT NULL,\
-            context_provider  text   NOT NULL,\
+            context_provider  text   NOT NULL CHECK (context_provider IN ('ci', 'external')),\
             context_name      text   NOT NULL,\
-            state             text   NOT NULL,\
+            state             text   NOT NULL CHECK (state IN ('queued', 'in_progress', 'success',\
+                                      'failure', 'error', 'neutral', 'cancelled')),\
             run_ref           text   NOT NULL,\
-            run_attempt       bigint NOT NULL,\
-            trust_tier        text   NOT NULL,\
+            run_attempt       bigint NOT NULL CHECK (run_attempt BETWEEN 0 AND 4294967295),\
+            trust_tier        text   NOT NULL CHECK (trust_tier IN ('trusted', 'untrusted_fork')),\
             details_ref       text   NOT NULL,\
             summary_key       text   NOT NULL,\
-            summary_args      jsonb  NOT NULL,\
+            summary_args      jsonb  NOT NULL CHECK (jsonb_typeof(summary_args) = 'object'),\
             cost_settled      boolean NOT NULL,\
             PRIMARY KEY (tenant_id, commit_oid, context_provider, context_name));\
          CREATE TABLE IF NOT EXISTS {dedup_table} (\
@@ -85,7 +88,25 @@ pub fn projection_ddl(table: &str, dedup_table: &str) -> String {
             consumer  text NOT NULL,\
             event_id  text NOT NULL,\
             CONSTRAINT {dedup_table}_pk PRIMARY KEY (tenant_id, consumer, event_id))"
-    )
+    ))
+}
+
+/// Accept only ordinary unquoted PostgreSQL identifiers before interpolating a table name into DDL.
+/// Table names are composition-time inputs rather than query parameters, but validating the seam
+/// keeps a future config-wired caller from turning that distinction into SQL injection.
+fn validate_sql_identifier(kind: &str, identifier: &str) -> Result<(), sqlx::Error> {
+    let mut chars = identifier.chars();
+    let starts_safely = chars
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic());
+    let remainder_is_safe =
+        chars.all(|character| character == '_' || character.is_ascii_alphanumeric());
+    if starts_safely && remainder_is_safe && identifier.len() <= 63 {
+        return Ok(());
+    }
+    Err(sqlx::Error::Protocol(format!(
+        "invalid {kind} identifier {identifier:?}: expected 1..=63 ASCII bytes matching [A-Za-z_][A-Za-z0-9_]*"
+    )))
 }
 
 /// The outcome of a store-backed [`apply`](PgCheckStatusProjection::apply) — the loud, observable
@@ -132,7 +153,8 @@ impl PgCheckStatusProjection {
         // We do NOT version-record this DDL (it is a per-table, idempotent `IF NOT EXISTS` projection
         // a consumer re-runs on every startup), so the lock-around-DDL helper is the right tool
         // rather than a recorded `PgMigrator::apply`.
-        myelin_storage::with_migration_lock(&pool, &projection_ddl(table, dedup_table))
+        let ddl = projection_ddl(table, dedup_table)?;
+        myelin_storage::with_migration_lock(&pool, &ddl)
             .await
             .map_err(|e| sqlx::Error::Protocol(format!("check_status migration: {e}")))?;
         Ok(PgCheckStatusProjection {
@@ -256,7 +278,7 @@ impl PgCheckStatusProjection {
         .bind(context_name)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(decode_row))
+        row.map(decode_row).transpose()
     }
 
     /// **THE LIVE MERGE GATE (GIT-P21 / §6.2 — the required-set policy over the STORE-BACKED
@@ -350,16 +372,16 @@ fn state_str(state: CheckState) -> &'static str {
 }
 
 /// The column string → `CheckState`. A row written by [`state_str`] always parses back.
-fn parse_state(s: &str) -> CheckState {
+fn parse_state(s: &str) -> Result<CheckState, sqlx::Error> {
     match s {
-        "queued" => CheckState::Queued,
-        "in_progress" => CheckState::InProgress,
-        "success" => CheckState::Success,
-        "failure" => CheckState::Failure,
-        "error" => CheckState::Error,
-        "neutral" => CheckState::Neutral,
-        "cancelled" => CheckState::Cancelled,
-        other => panic!("check_status row has an unknown state {other:?} (corrupt projection)"),
+        "queued" => Ok(CheckState::Queued),
+        "in_progress" => Ok(CheckState::InProgress),
+        "success" => Ok(CheckState::Success),
+        "failure" => Ok(CheckState::Failure),
+        "error" => Ok(CheckState::Error),
+        "neutral" => Ok(CheckState::Neutral),
+        "cancelled" => Ok(CheckState::Cancelled),
+        other => Err(corrupt_projection(format!("unknown check state {other:?}"))),
     }
 }
 
@@ -372,47 +394,88 @@ fn trust_str(tier: TrustTier) -> &'static str {
 }
 
 /// Column string → `TrustTier`.
-fn parse_trust(s: &str) -> TrustTier {
+fn parse_trust(s: &str) -> Result<TrustTier, sqlx::Error> {
     match s {
-        "trusted" => TrustTier::Trusted,
-        "untrusted_fork" => TrustTier::UntrustedFork,
-        other => {
-            panic!("check_status row has an unknown trust_tier {other:?} (corrupt projection)")
-        }
+        "trusted" => Ok(TrustTier::Trusted),
+        "untrusted_fork" => Ok(TrustTier::UntrustedFork),
+        other => Err(corrupt_projection(format!("unknown trust tier {other:?}"))),
     }
 }
 
 /// Decode a projection table row into the typed [`CheckStatusRow`] the merge gate reads.
-fn decode_row(row: sqlx::postgres::PgRow) -> CheckStatusRow {
+fn decode_row(row: sqlx::postgres::PgRow) -> Result<CheckStatusRow, sqlx::Error> {
     use crate::check_status::{CheckContext, CheckProvider, HumanisedRef};
     use myelin_tenancy::{ArtifactRef, TenantId};
     use std::collections::BTreeMap;
 
-    let provider = match row.get::<String, _>("context_provider").as_str() {
-        "ci" => CheckProvider::Ci,
-        "external" => CheckProvider::External,
-        other => panic!("check_status row has an unknown context_provider {other:?}"),
+    let provider_raw = row.try_get::<String, _>("context_provider")?;
+    let provider = match provider_raw.as_str() {
+        "ci" => Ok(CheckProvider::Ci),
+        "external" => Ok(CheckProvider::External),
+        other => Err(corrupt_projection(format!(
+            "unknown context provider {other:?}"
+        ))),
     };
+    let provider = provider?;
     let summary_args: BTreeMap<String, String> =
-        serde_json::from_value(row.get::<serde_json::Value, _>("summary_args"))
-            .expect("summary_args is a JSON object of String→String");
-    CheckStatusRow {
-        tenant: TenantId(row.get::<String, _>("tenant_id")),
-        commit_oid: GitOid(row.get::<String, _>("commit_oid")),
+        serde_json::from_value(row.try_get::<serde_json::Value, _>("summary_args")?)
+            .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+    let run_attempt = u32::try_from(row.try_get::<i64, _>("run_attempt")?)
+        .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+    Ok(CheckStatusRow {
+        tenant: TenantId(row.try_get::<String, _>("tenant_id")?),
+        commit_oid: GitOid(row.try_get::<String, _>("commit_oid")?),
         context: CheckContext {
             provider,
-            name: row.get::<String, _>("context_name"),
+            name: row.try_get::<String, _>("context_name")?,
         },
-        state: parse_state(&row.get::<String, _>("state")),
-        run: ArtifactRef(row.get::<String, _>("run_ref")),
-        run_attempt: u32::try_from(row.get::<i64, _>("run_attempt"))
-            .expect("run_attempt fits u32 (the fact's counter is u32)"),
-        trust_tier: parse_trust(&row.get::<String, _>("trust_tier")),
-        details_ref: ArtifactRef(row.get::<String, _>("details_ref")),
+        state: parse_state(&row.try_get::<String, _>("state")?)?,
+        run: ArtifactRef(row.try_get::<String, _>("run_ref")?),
+        run_attempt,
+        trust_tier: parse_trust(&row.try_get::<String, _>("trust_tier")?)?,
+        details_ref: ArtifactRef(row.try_get::<String, _>("details_ref")?),
         summary: HumanisedRef {
-            template_key: row.get::<String, _>("summary_key"),
+            template_key: row.try_get::<String, _>("summary_key")?,
             args: summary_args,
         },
-        cost_settled: row.get::<bool, _>("cost_settled"),
+        cost_settled: row.try_get::<bool, _>("cost_settled")?,
+    })
+}
+
+fn corrupt_projection(detail: String) -> sqlx::Error {
+    sqlx::Error::Protocol(format!("corrupt check_status projection: {detail}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_state, parse_trust, projection_ddl};
+
+    #[test]
+    fn projection_identifiers_are_allowlisted_before_ddl_interpolation() {
+        let ddl = projection_ddl("check_status_42", "consumer_dedup_42")
+            .expect("ordinary unquoted identifiers are accepted");
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS check_status_42"));
+
+        for unsafe_name in [
+            "",
+            "9status",
+            "status; DROP TABLE users",
+            "status-name",
+            "état",
+        ] {
+            let error = projection_ddl(unsafe_name, "consumer_dedup")
+                .expect_err("unsafe projection identifier must be refused");
+            assert!(error
+                .to_string()
+                .contains("invalid projection table identifier"));
+        }
+        let overlong = "a".repeat(64);
+        assert!(projection_ddl("check_status", &overlong).is_err());
+    }
+
+    #[test]
+    fn corrupt_closed_set_values_return_errors_instead_of_panicking() {
+        assert!(parse_state("future_state").is_err());
+        assert!(parse_trust("root").is_err());
     }
 }
