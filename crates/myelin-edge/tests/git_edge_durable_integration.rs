@@ -19,6 +19,8 @@ use hyper_util::rt::TokioIo;
 use myelin_edge::{
     register_git_durable, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
 };
+use myelin_git::core::RepoLoc;
+use myelin_git::durable::DurableGitStore;
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
     CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
@@ -799,6 +801,10 @@ async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
         .iter()
         .any(|b| b["name"] == "main" && b["is_default"] == true));
     assert_eq!(rv["tags"].as_array().unwrap().len(), 0);
+    assert_eq!(rv["pinned"].as_array().unwrap().len(), 1);
+    assert_eq!(rv["pinned"][0]["full_name"], "refs/heads/main");
+    assert_eq!(rv["page"]["limit"], 100);
+    assert!(rv["page"]["next_cursor"].is_null());
 
     // tree at root → the three files, each with a full `path` + a resolved latest_commit (bounded walk).
     let (tc, tv) = http(addr, "GET", "/v1/git/repos/br/tree/main", &hdr(&h), vec![]).await;
@@ -931,6 +937,186 @@ async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
         dl_cd.contains("a.txt"),
         "the attachment carries the filename: {dl_cd}"
     );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Stable ref keyset pagination stays bounded above the old 1,000-row browse ceiling. Pins remain
+/// outside filtering/page windows, and typed cursor failures map to the endpoint's scoped statuses.
+#[tokio::test]
+async fn refs_are_stably_paginated_pinned_and_cursor_scoped() {
+    let root = temp_root("refs-pagination");
+    let (gw, cell) = build(&root);
+    let addr = spawn(gw).await;
+    let h = bearer(&mint(&cell, "acme", "jti-refs-pagination"));
+
+    let (create_status, create_body) = http(
+        addr,
+        "POST",
+        "/v1/git/repos",
+        &hdr(&h),
+        br#"{"slug":"ref-pages"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(create_status, 201, "create repo: {create_body}");
+    let (commit_status, commit_body) = http(
+        addr,
+        "POST",
+        "/v1/git/repos/ref-pages/blob/main/README.md",
+        &hdr(&h),
+        br##"{"base_oid":"","contents":"# refs\n","message":"seed refs"}"##.to_vec(),
+    )
+    .await;
+    assert_eq!(commit_status, 200, "seed commit: {commit_body}");
+
+    let store = DurableGitStore::rooted(&root);
+    let repo = store
+        .open_repo(&RepoLoc::new("acme", REGION, "ref-pages"))
+        .expect("open durable repo");
+    let tip = repo
+        .read_ref("refs/heads/main")
+        .expect("read main")
+        .expect("main exists");
+    let mut expected = Vec::new();
+    for index in 0..1_005 {
+        let name = format!("branch-{index:04}");
+        repo.update_ref_cas(
+            &format!("refs/heads/{name}"),
+            None,
+            Some(&tip),
+            "test: seed pagination branch",
+            "psn@acme.noreply",
+        )
+        .expect("create branch");
+        expected.push(("branch", name));
+    }
+    expected.push(("branch", "main".to_string()));
+    for index in 0..3 {
+        let name = format!("v{index}");
+        repo.update_ref_cas(
+            &format!("refs/tags/{name}"),
+            None,
+            Some(&tip),
+            "test: seed pagination tag",
+            "psn@acme.noreply",
+        )
+        .expect("create tag");
+        expected.push(("tag", name));
+    }
+
+    let mut actual = Vec::new();
+    let mut cursor = None;
+    loop {
+        let path = cursor.as_ref().map_or_else(
+            || "/v1/git/repos/ref-pages/refs?limit=100".to_string(),
+            |cursor: &String| format!("/v1/git/repos/ref-pages/refs?limit=100&cursor={cursor}"),
+        );
+        let (status, body) = http(addr, "GET", &path, &hdr(&h), vec![]).await;
+        assert_eq!(status, 200, "refs page: {body}");
+        let branches = body["branches"].as_array().expect("branches");
+        let tags = body["tags"].as_array().expect("tags");
+        let pins = body["pinned"].as_array().expect("pins");
+        assert!(branches.len() + tags.len() <= 100, "bounded page: {body}");
+        assert!(pins.len() <= 2, "bounded pins: {body}");
+        assert_eq!(body["page"]["limit"], 100);
+        actual.extend(
+            branches
+                .iter()
+                .map(|item| ("branch", item["name"].as_str().unwrap().to_string())),
+        );
+        actual.extend(
+            tags.iter()
+                .map(|item| ("tag", item["name"].as_str().unwrap().to_string())),
+        );
+        cursor = body["page"]["next_cursor"].as_str().map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(actual, expected, "no duplicate or skipped refs");
+
+    let (pin_status, pin_body) = http(
+        addr,
+        "GET",
+        "/v1/git/repos/ref-pages/refs?limit=1&q=does-not-match&current=refs/heads/branch-1004",
+        &hdr(&h),
+        vec![],
+    )
+    .await;
+    assert_eq!(pin_status, 200, "filtered pins: {pin_body}");
+    assert!(pin_body["branches"].as_array().unwrap().is_empty());
+    assert!(pin_body["tags"].as_array().unwrap().is_empty());
+    assert_eq!(pin_body["pinned"].as_array().unwrap().len(), 2);
+    assert!(pin_body["pinned"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|pin| pin["full_name"] == "refs/heads/branch-1004"));
+    assert!(pin_body["pinned"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|pin| pin["full_name"] == "refs/heads/main" && pin["is_default"] == true));
+
+    let (_, first_body) = http(
+        addr,
+        "GET",
+        "/v1/git/repos/ref-pages/refs?limit=1",
+        &hdr(&h),
+        vec![],
+    )
+    .await;
+    let first_cursor = first_body["page"]["next_cursor"]
+        .as_str()
+        .expect("first cursor")
+        .to_string();
+    repo.update_ref_cas(
+        "refs/tags/stale-add",
+        None,
+        Some(&tip),
+        "test: stale cursor",
+        "psn@acme.noreply",
+    )
+    .expect("mutate namespace");
+    let (stale_status, stale_body) = http(
+        addr,
+        "GET",
+        &format!("/v1/git/repos/ref-pages/refs?limit=1&cursor={first_cursor}"),
+        &hdr(&h),
+        vec![],
+    )
+    .await;
+    assert_eq!(stale_status, 409, "stale cursor: {stale_body}");
+
+    let (other_status, other_body) = http(
+        addr,
+        "POST",
+        "/v1/git/repos",
+        &hdr(&h),
+        br#"{"slug":"other-ref-pages"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(other_status, 201, "create other repo: {other_body}");
+    let (scope_status, scope_body) = http(
+        addr,
+        "GET",
+        &format!("/v1/git/repos/other-ref-pages/refs?limit=1&cursor={first_cursor}"),
+        &hdr(&h),
+        vec![],
+    )
+    .await;
+    assert_eq!(scope_status, 400, "wrong-scope cursor: {scope_body}");
+    for query in ["cursor=gr1_bad", "limit=01", "q=a&q=b", "unknown=x"] {
+        let (status, body) = http(
+            addr,
+            "GET",
+            &format!("/v1/git/repos/ref-pages/refs?{query}"),
+            &hdr(&h),
+            vec![],
+        )
+        .await;
+        assert_eq!(status, 400, "strict query `{query}`: {body}");
+    }
 
     std::fs::remove_dir_all(&root).ok();
 }
