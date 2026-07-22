@@ -1429,9 +1429,11 @@ impl PgPrStore {
 
     /// Enumerate recovery work for the verified tenant/region only. Startup code then opens the
     /// exact target/source repositories and re-enters `merge_pr_durable`, which verifies actual tips.
-    pub fn list_pending_merges(
+    pub fn list_pending_merges_bounded(
         &self,
         scope: &TenantScope,
+        maximum_records: usize,
+        maximum_bytes: usize,
     ) -> Result<Vec<PendingMerge>, DurableError> {
         if scope.region().0 != self.provider.config().region {
             return Err(DurableError::NotFound("repository partition".into()));
@@ -1439,19 +1441,40 @@ impl PgPrStore {
         let provider = self.provider.clone();
         let tenant = scope.tenant().0.clone();
         let region = scope.region().0.clone();
+        let fetch_limit = i64::try_from(maximum_records.saturating_add(1)).unwrap_or(i64::MAX);
+        let byte_limit = i64::try_from(maximum_bytes).unwrap_or(i64::MAX);
         let rows = self
             .block_on(async move {
                 provider
                     .with_tenant_tx(&tenant.clone(), move |conn| {
                         Box::pin(async move {
                             sqlx::query(
-                                "SELECT repo_slug,number,merge_intent FROM git_pr
-                                  WHERE tenant_id=$1 AND region=$2 AND merge_intent IS NOT NULL
-                                    AND record->>'state' <> 'Merged'
-                                  ORDER BY repo_slug,number",
+                                "WITH pending AS (
+                                   SELECT repo_slug,number,merge_intent,
+                                          pg_column_size(merge_intent)::bigint AS intent_bytes
+                                     FROM git_pr
+                                    WHERE tenant_id=$1 AND region=$2
+                                      AND merge_intent IS NOT NULL
+                                      AND record->>'state' <> 'Merged'
+                                    ORDER BY repo_slug,number
+                                    LIMIT $3
+                                 ), measured AS (
+                                   SELECT repo_slug,number,merge_intent,
+                                          sum(intent_bytes) OVER (
+                                            ORDER BY repo_slug,number
+                                          )::bigint AS aggregate_bytes
+                                     FROM pending
+                                 )
+                                 SELECT repo_slug,number,
+                                        CASE WHEN aggregate_bytes <= $4
+                                             THEN merge_intent ELSE NULL END AS merge_intent,
+                                        aggregate_bytes
+                                   FROM measured ORDER BY repo_slug,number",
                             )
                             .bind(&tenant)
                             .bind(&region)
+                            .bind(fetch_limit)
+                            .bind(byte_limit)
                             .fetch_all(&mut *conn)
                             .await
                             .map_err(|_| {
@@ -1464,6 +1487,11 @@ impl PgPrStore {
                     .await
             })
             .map_err(pg_error)?;
+        if rows.len() > maximum_records {
+            return Err(DurableError::Git(
+                "pending merge recovery limit exceeded: record count".into(),
+            ));
+        }
         rows.into_iter()
             .map(|row| {
                 let repo_slug: String = row
@@ -1472,10 +1500,22 @@ impl PgPrStore {
                 let number: i64 = row
                     .try_get("number")
                     .map_err(|_| DurableError::Io("pending PR merge row malformed".into()))?;
-                let value: serde_json::Value = row
+                let aggregate_bytes: i64 = row
+                    .try_get("aggregate_bytes")
+                    .map_err(|_| DurableError::Io("pending PR merge row malformed".into()))?;
+                if aggregate_bytes > byte_limit {
+                    return Err(DurableError::Git(
+                        "pending merge recovery limit exceeded: serialized bytes".into(),
+                    ));
+                }
+                let value: Option<serde_json::Value> = row
                     .try_get("merge_intent")
                     .map_err(|_| DurableError::Io("pending PR merge row malformed".into()))?;
-                let intent = serde_json::from_value(value)
+                let intent = serde_json::from_value(value.ok_or_else(|| {
+                    DurableError::Git(
+                        "pending merge recovery limit exceeded: serialized bytes".into(),
+                    )
+                })?)
                     .map_err(|_| DurableError::Io("pending PR merge intent malformed".into()))?;
                 Ok(PendingMerge {
                     repo_slug,
@@ -2801,7 +2841,15 @@ mod tests {
                 &actor,
             )
             .is_err());
-        assert!(store.list_bounded(&scope_a, repo, 10, 10 * PR_RECORD_MAX_BYTES).unwrap().is_empty());
+        assert!(store
+            .list_bounded(
+                &scope_a,
+                repo,
+                10,
+                10 * crate::pr_store::PR_RECORD_MAX_BYTES,
+            )
+            .unwrap()
+            .is_empty());
         let abort_events: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM outbox WHERE envelope->>'tenant'=$1 AND envelope->>'type_'=$2",
         )
@@ -3123,8 +3171,20 @@ mod tests {
                     .is_err(),
                 "a durable merge intent freezes every ordinary PR mutation"
             );
+            assert!(
+                store
+                    .list_pending_merges_bounded(&scope_a, 0, 1024 * 1024)
+                    .is_err(),
+                "pending recovery record cap plus one is rejected"
+            );
+            assert!(
+                store
+                    .list_pending_merges_bounded(&scope_a, 100, 0)
+                    .is_err(),
+                "pending recovery byte cap plus one is rejected"
+            );
             assert!(store
-                .list_pending_merges(&scope_a)
+                .list_pending_merges_bounded(&scope_a, 100, 1024 * 1024)
                 .unwrap()
                 .iter()
                 .any(|pending| pending.repo_slug == slug && pending.number == opened.number));
@@ -3244,7 +3304,7 @@ mod tests {
                 assert_eq!(first, retry, "cancelled command replays deterministically");
             }
             assert!(!store
-                .list_pending_merges(&scope_a)
+                .list_pending_merges_bounded(&scope_a, 100, 1024 * 1024)
                 .unwrap()
                 .iter()
                 .any(|pending| pending.repo_slug == slug && pending.number == opened.number));
