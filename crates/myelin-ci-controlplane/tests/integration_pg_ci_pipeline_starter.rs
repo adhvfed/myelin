@@ -7,13 +7,14 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use myelin_ci_controlplane::{
-    ci_artifact_ref, ci_job_id_v2, ci_run_ref, CiExecutionProfileV1, CiExecutionRequestV1,
-    CiJobLaunchGrantV1, CiLaunchAuthorityError, CiLaunchAuthorityMaterializer, CiLaunchAuthorityV1,
-    CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1, CiWorkflowDefinitionPin,
-    PgCiPipelineStarter, PgCiRunStarterFactory, PreparedRunPlanV2, ResolvedJobV2,
-    ResolvedRunPlanV2, StartQueuedOutcome, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
-    CI_JOB_RUN_LEDGER_INDEX, CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL,
-    CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_RUN_DDL,
+    ci_artifact_ref, ci_job_id_v2, ci_region_run_discovery_test_support, ci_run_ref,
+    CiExecutionProfileV1, CiExecutionRequestV1, CiJobLaunchGrantV1, CiLaunchAuthorityError,
+    CiLaunchAuthorityMaterializer, CiLaunchAuthorityV1, CiManifestLaneV1, CiManifestLimitsV1,
+    CiManifestSchedulingV1, CiWorkflowDefinitionPin, PgCiPipelineStarter, PgCiRunStarterFactory,
+    PgCiRunStarterPoller, PreparedRunPlanV2, ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
+    ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL, CI_JOB_RUN_LEDGER_INDEX, CREATE_CHECK_ATTEMPT_DDL,
+    CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
+    CREATE_CI_RUN_DDL,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::MonotonicMinter;
@@ -698,6 +699,48 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
             .register_definition(CI_PIPELINE_WF_TYPE, 1, BODY_HASH)
             .expect("register immutable workflow definition");
     });
+
+    // The region-wide poller routes only the discovered authoritative tenant into the exact-cell
+    // starter. Two pollers may discover the same row, but the starter's exact queued-row lock admits
+    // one authority call and one atomic start; the loser returns Idle.
+    let poller_run = "10000000-0000-0000-0000-0000000000e0";
+    let poller_wf = "20000000-0000-0000-0000-0000000000e0";
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        "tenant_poller",
+        poller_run,
+        poller_wf,
+    )
+    .await;
+    AUTHORITY_CALLS.store(0, Ordering::SeqCst);
+    let poller = PgCiRunStarterPoller::new(
+        ci_region_run_discovery_test_support(admin.clone()),
+        factory(&app, blobs.clone()),
+        CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
+    );
+    let (poll_a, poll_b) = tokio::join!(poller.run_once(), poller.run_once());
+    let poll_outcomes = [poll_a.expect("poller A"), poll_b.expect("poller B")];
+    assert_eq!(
+        poll_outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, StartQueuedOutcome::Started { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        poll_outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, StartQueuedOutcome::Idle))
+            .count(),
+        1
+    );
+    assert_atomic_started(&admin, "tenant_poller", poller_run, true, true).await;
+    assert_eq!(
+        AUTHORITY_CALLS.load(Ordering::SeqCst),
+        1,
+        "racing discovery passes cannot duplicate launch authority"
+    );
 
     // Production composition has no implicit runtime policy. A fresh V2 run is refused before any
     // attempt, manifest, job, workflow, or lifecycle mutation when no authority adapter is wired.

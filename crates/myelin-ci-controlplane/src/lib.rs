@@ -91,6 +91,7 @@ pub use ci_manifest_job_runner::{
 /// [`register_durable_ci_manifest_pipeline`]; production activation remains gated on its real policy
 /// and token-authority adapters, settle bookend, and poller.
 pub mod ci_run_region;
+pub mod ci_run_starter_poller;
 pub mod ci_run_store;
 pub mod ci_scheduler_db;
 /// CT-004a (CI backend reconcile-and-harden — the FOUNDATION chunk): the REAL durable `cost_event`
@@ -525,6 +526,9 @@ pub use ci_run_store::{
     VERIFY_CI_RUN_REPLAY_QUERY,
 };
 pub use ci_run_region::{CiRegionRunDiscovery, DISCOVER_QUEUED_CI_RUN_TENANT_QUERY};
+pub use ci_run_starter_poller::{
+    CiRunStarterBatch, CiRunStarterPollerError, PgCiRunStarterPoller, MAX_CI_RUN_START_BATCH,
+};
 pub use ci_scheduler_db::{
     CiSchedulerDbConfig, CiSchedulerDbError, CiSchedulerDbProvider, CI_SCHEDULER_DATABASE_URL_ENV,
 };
@@ -776,6 +780,14 @@ pub fn ci_region_queue_store_test_support(pool: sqlx::PgPool) -> CiRegionQueueSt
     CiRegionQueueStore::with_pg(pool)
 }
 
+/// Test-only raw-pool seam for starter-poller integration fixtures. Production must construct this
+/// capability only through [`CiSchedulerDbProvider::region_run_discovery`].
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn ci_region_run_discovery_test_support(pool: sqlx::PgPool) -> CiRegionRunDiscovery {
+    CiRegionRunDiscovery::with_pg(pool)
+}
+
 /// **Construct the durable CI `ci_job_spec` store at the composition root (CT-004d.1).** The service
 /// `main` builds this from the MR-022 `SubstrateProvider` pool after the migrations have run, so the
 /// dispatch has a real, production-callable [`CiJobSpecStore`] to co-persist a stage's [`JobSpec`] into
@@ -818,9 +830,9 @@ pub fn ci_run_store_factory(pool: sqlx::PgPool) -> CiRunStore {
 /// query runs), so no queued run is started yet. This composition deliberately carries the starter's
 /// unavailable-authority adapter: even if it were accidentally driven, every fresh V2 launch would
 /// fail before allocating attempts or writing a manifest. The later activation flip must explicitly
-/// replace that adapter, add the region-wide queued-run poller, compose the exact manifest-to-sandbox
-/// runner/token authority and terminal settlement path, and close the remaining worker budget/remint
-/// floors.
+/// replace that adapter, attach [`PgCiRunStarterPoller`] to coordinated lifecycle shutdown with the
+/// deployed workflow-definition pin, compose the exact manifest-to-sandbox runner/token authority
+/// and terminal settlement path, and close the remaining worker budget/remint floors.
 pub fn ci_run_starter_factory(
     pool: sqlx::PgPool,
     region: myelin_tenancy::Region,
