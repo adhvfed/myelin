@@ -14,8 +14,8 @@
 //! The starter co-commits the immutable runtime grants, check attempts, canonical job ledger, workflow,
 //! and lifecycle transition, while an exact retry validates and reuses the frozen manifest without
 //! consulting mutable current policy. A fresh start also co-emits one manifest-bound in-progress
-//! check fact per authored context through the durable outbox. Remaining activation work includes
-//! the region-wide queued-run poller and the myelin-flow M2 durable `RunStore`.
+//! check fact per authored context through the durable outbox. The region-wide poller is composed
+//! separately and remains dormant until the production activation blockers are closed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;

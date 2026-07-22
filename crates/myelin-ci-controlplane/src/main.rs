@@ -258,10 +258,10 @@ async fn main() {
     // driving it would refuse before allocating attempts or writing a manifest. Initial checks and
     // the manifest-native DAG body are now implemented and live-PG proven but deliberately unwired.
     // NAMED FLOORS the activation change must close explicitly: compose a policy-aware authority
-    // adapter, add the region-wide queued-run poller that drives
-    // `starter_factory.starter_for(tenant, pin)` per discovered tenant, bind the exact manifest job
-    // identity to the sandbox/token/reserve stores, settle the durable CI run, and attach Flow's
-    // production budget/remint hooks.
+    // adapter, attach the existing region-wide `PgCiRunStarterPoller` to coordinated shutdown with
+    // the deployed workflow-definition pin, bind the exact manifest job identity to the
+    // sandbox/token/reserve stores, settle the durable CI run, and attach Flow's production
+    // budget/remint hooks.
     if runner_host_requested {
         // ROLLING-UPGRADE FLOOR (CT-004d.2): refuse activation while any non-terminal NULL-stage
         // dispatch is still live — completion refuses such a job without consuming its claim, so the
