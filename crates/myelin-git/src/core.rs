@@ -315,8 +315,16 @@ pub trait ReadBackend {
         maximum_lines: usize,
         maximum_output_bytes: usize,
     ) -> Result<Vec<DiffLine>, GitCoreError>;
-    /// Blame a path at a commit.
-    fn blame(&self, repo: &RepoLoc, path: &str, at: &Oid) -> Result<Vec<BlameHunk>, GitCoreError>;
+    /// Blame a path at a commit with explicit path, blob, and output ceilings.
+    fn blame_bounded(
+        &self,
+        repo: &RepoLoc,
+        path: &str,
+        at: &Oid,
+        maximum_path_bytes: usize,
+        maximum_blob_bytes: usize,
+        maximum_hunks: usize,
+    ) -> Result<Vec<BlameHunk>, GitCoreError>;
 }
 
 // ───────────────────────────── the GitCore trait (the unified seam) ──────────────────────────────
@@ -365,8 +373,16 @@ pub trait GitCore {
         maximum_lines: usize,
         maximum_output_bytes: usize,
     ) -> Result<Vec<DiffLine>, GitCoreError>;
-    /// Blame a path at a commit — in-process.
-    fn blame(&self, repo: &RepoLoc, path: &str, at: &Oid) -> Result<Vec<BlameHunk>, GitCoreError>;
+    /// Blame a path at a commit — in-process, with explicit input and output ceilings.
+    fn blame_bounded(
+        &self,
+        repo: &RepoLoc,
+        path: &str,
+        at: &Oid,
+        maximum_path_bytes: usize,
+        maximum_blob_bytes: usize,
+        maximum_hunks: usize,
+    ) -> Result<Vec<BlameHunk>, GitCoreError>;
 }
 
 // ───────────────────────────── ShellGitCore (the wire backend façade) ───────────────────────────
@@ -522,9 +538,24 @@ impl<E: WireExecutor, R: ReadBackend> GitCore for RoutedGitCore<E, R> {
         )
     }
 
-    fn blame(&self, repo: &RepoLoc, path: &str, at: &Oid) -> Result<Vec<BlameHunk>, GitCoreError> {
+    fn blame_bounded(
+        &self,
+        repo: &RepoLoc,
+        path: &str,
+        at: &Oid,
+        maximum_path_bytes: usize,
+        maximum_blob_bytes: usize,
+        maximum_hunks: usize,
+    ) -> Result<Vec<BlameHunk>, GitCoreError> {
         Self::assert_backend(GitOp::Read(ReadOp::Blame), Backend::Gix)?;
-        self.read.blame(repo, path, at)
+        self.read.blame_bounded(
+            repo,
+            path,
+            at,
+            maximum_path_bytes,
+            maximum_blob_bytes,
+            maximum_hunks,
+        )
     }
 }
 
@@ -721,7 +752,15 @@ mod tests {
         ) -> Result<Vec<DiffLine>, GitCoreError> {
             Ok(Vec::new())
         }
-        fn blame(&self, _r: &RepoLoc, _p: &str, _a: &Oid) -> Result<Vec<BlameHunk>, GitCoreError> {
+        fn blame_bounded(
+            &self,
+            _r: &RepoLoc,
+            _p: &str,
+            _a: &Oid,
+            _maximum_path_bytes: usize,
+            _maximum_blob_bytes: usize,
+            _maximum_hunks: usize,
+        ) -> Result<Vec<BlameHunk>, GitCoreError> {
             Ok(Vec::new())
         }
     }
@@ -763,11 +802,14 @@ mod tests {
                     content: "x".into(),
                 }])
             }
-            fn blame(
+            fn blame_bounded(
                 &self,
                 _r: &RepoLoc,
                 _p: &str,
                 _a: &Oid,
+                _maximum_path_bytes: usize,
+                _maximum_blob_bytes: usize,
+                _maximum_hunks: usize,
             ) -> Result<Vec<BlameHunk>, GitCoreError> {
                 Ok(vec![BlameHunk {
                     final_start_line: 1,
@@ -812,6 +854,11 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(core.blame(&repo, "f", &Oid::new("c")).unwrap().len(), 1);
+        assert_eq!(
+            core.blame_bounded(&repo, "f", &Oid::new("c"), 128, 1024, 100)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

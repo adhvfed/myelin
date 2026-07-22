@@ -264,7 +264,15 @@ impl GitCore for RecCore {
     ) -> Result<Vec<DiffLine>, GitCoreError> {
         unreachable!()
     }
-    fn blame(&self, _r: &RepoLoc, _p: &str, _a: &Oid) -> Result<Vec<BlameHunk>, GitCoreError> {
+    fn blame_bounded(
+        &self,
+        _r: &RepoLoc,
+        _p: &str,
+        _a: &Oid,
+        _maximum_path_bytes: usize,
+        _maximum_blob_bytes: usize,
+        _maximum_hunks: usize,
+    ) -> Result<Vec<BlameHunk>, GitCoreError> {
         unreachable!()
     }
 }

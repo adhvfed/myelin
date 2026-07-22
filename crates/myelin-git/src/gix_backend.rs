@@ -267,13 +267,71 @@ impl<P: RepoPathResolver> ReadBackend for GixCore<P> {
         Ok(lines)
     }
 
-    fn blame(&self, repo: &RepoLoc, path: &str, at: &Oid) -> Result<Vec<BlameHunk>, GitCoreError> {
+    fn blame_bounded(
+        &self,
+        repo: &RepoLoc,
+        path: &str,
+        at: &Oid,
+        maximum_path_bytes: usize,
+        maximum_blob_bytes: usize,
+        maximum_hunks: usize,
+    ) -> Result<Vec<BlameHunk>, GitCoreError> {
+        if path.len() > maximum_path_bytes {
+            return Err(GitCoreError::Read(format!(
+                "blame path limit exceeded: {} bytes exceeds {maximum_path_bytes}",
+                path.len()
+            )));
+        }
+        if path.is_empty()
+            || path.starts_with('/')
+            || path.contains('\\')
+            || path.contains('\0')
+            || path
+                .split('/')
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        {
+            return Err(GitCoreError::Read(
+                "blame path must be a normalized repository-relative path".into(),
+            ));
+        }
         let r = self.open(repo)?;
+        let at = Self::parse_oid(at)?;
+        let commit = r
+            .find_commit(at)
+            .map_err(|e| GitCoreError::Read(format!("find blame commit {at}: {e}")))?;
+        let tree = commit
+            .tree()
+            .map_err(|e| GitCoreError::Read(format!("read blame commit tree {at}: {e}")))?;
+        let entry = tree
+            .get_path(std::path::Path::new(path))
+            .map_err(|e| GitCoreError::Read(format!("resolve blame path {path}: {e}")))?;
+        let odb = r
+            .odb()
+            .map_err(|e| GitCoreError::Read(format!("open object database: {e}")))?;
+        let (size, kind) = odb
+            .read_header(entry.id())
+            .map_err(|e| GitCoreError::Read(format!("read blame blob header {}: {e}", entry.id())))?;
+        if kind != git2::ObjectType::Blob {
+            return Err(GitCoreError::Read(format!(
+                "blame path {path} does not resolve to a blob"
+            )));
+        }
+        if size > maximum_blob_bytes {
+            return Err(GitCoreError::Read(format!(
+                "blame blob limit exceeded: {size} bytes exceeds {maximum_blob_bytes}"
+            )));
+        }
         let mut opts = git2::BlameOptions::new();
-        opts.newest_commit(Self::parse_oid(at)?);
+        opts.newest_commit(at);
         let blame = r
             .blame_file(std::path::Path::new(path), Some(&mut opts))
             .map_err(|e| GitCoreError::Read(format!("blame {path}: {e}")))?;
+        if blame.len() > maximum_hunks {
+            return Err(GitCoreError::Read(format!(
+                "blame hunk limit exceeded: {} hunks exceeds {maximum_hunks}",
+                blame.len()
+            )));
+        }
         let mut hunks = Vec::with_capacity(blame.len());
         for h in blame.iter() {
             hunks.push(BlameHunk {
