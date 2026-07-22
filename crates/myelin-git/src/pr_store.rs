@@ -631,9 +631,18 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
     pub fn get(&self, repo: &RepoLoc, number: u64) -> Result<Option<PrRecord>, DurableError> {
         let path = self.pr_path(repo, number)?;
         match std::fs::read(&path) {
-            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|e| {
-                DurableError::Io(format!("parse {}: {e}", path.display()))
-            })?)),
+            Ok(bytes) => {
+                let record: PrRecord = serde_json::from_slice(&bytes)
+                    .map_err(|e| DurableError::Io(format!("parse {}: {e}", path.display())))?;
+                if record.number != number {
+                    return Err(DurableError::Git(format!(
+                        "PR record identity mismatch: requested #{number} but {} stores #{}",
+                        path.display(),
+                        record.number
+                    )));
+                }
+                Ok(Some(record))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(DurableError::Io(format!("read {}: {e}", path.display()))),
         }
@@ -681,10 +690,27 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
             let entry = entry.map_err(|e| DurableError::Io(format!("dir entry: {e}")))?;
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                let file_number = path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        DurableError::Io(format!(
+                            "invalid PR record filename {}",
+                            path.display()
+                        ))
+                    })?;
                 let bytes = std::fs::read(&path)
                     .map_err(|e| DurableError::Io(format!("read {}: {e}", path.display())))?;
                 let rec = serde_json::from_slice::<PrRecord>(&bytes)
                     .map_err(|e| DurableError::Io(format!("parse {}: {e}", path.display())))?;
+                if rec.number != file_number {
+                    return Err(DurableError::Git(format!(
+                        "PR record identity mismatch: {} names #{file_number} but stores #{}",
+                        path.display(),
+                        rec.number
+                    )));
+                }
                 out.push(rec);
             }
         }
@@ -1051,6 +1077,28 @@ mod tests {
             "no successful concurrent update may be overwritten"
         );
         drop(store);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn record_filename_and_embedded_number_must_match() {
+        let root = temp_root("record-identity");
+        let gitstore = DurableGitStore::rooted(&root);
+        gitstore.create_repo(&loc()).unwrap();
+        let store = DurablePrStore::rooted(&root);
+        let record = open_record(2, "refs/heads/main", &"a".repeat(40), "psn:author@acme");
+        let path = store.pr_path(&loc(), 1).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+        assert!(
+            matches!(store.get(&loc(), 1), Err(DurableError::Git(message)) if message.contains("identity mismatch")),
+            "a point read must not expose the mismatched record"
+        );
+        assert!(
+            matches!(store.list(&loc()), Err(DurableError::Git(message)) if message.contains("identity mismatch")),
+            "a list must not expose the mismatched record"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
