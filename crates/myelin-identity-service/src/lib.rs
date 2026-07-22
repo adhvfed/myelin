@@ -938,7 +938,7 @@ impl StoreBackedCheck {
         &self,
         scope: &myelin_storage::TenantScope,
         now: myelin_events::Timestamp,
-    ) -> pseudonym_erase::ReErasureReceipt {
+    ) -> Result<pseudonym_erase::ReErasureReceipt, PseudonymError> {
         let entries = self.erasure_ledger.entries_in(scope);
         let mut per_subject = Vec::with_capacity(entries.len());
         let mut resurrected = 0usize;
@@ -947,7 +947,7 @@ impl StoreBackedCheck {
             // row whose DEK the restore also brought back.) Probe BEFORE re-shredding.
             let live_before = self
                 .pseudonyms
-                .resolve_subject(scope, &entry.subject)
+                .try_resolve_subject(scope, &entry.subject)?
                 .is_some();
             if live_before {
                 resurrected += 1;
@@ -974,23 +974,31 @@ impl StoreBackedCheck {
             ));
         }
         // After the re-erasure pass, NOTHING the ledger recorded resolves — re-confirm 0 resurrected.
-        let still_resolvable = entries
-            .iter()
-            .filter(|e| self.pseudonyms.resolve_subject(scope, &e.subject).is_some())
-            .count();
-        pseudonym_erase::ReErasureReceipt {
-            tenant: scope.tenant().clone(),
-            region: scope.region().clone(),
-            re_erased: entries.len(),
-            // The post-pass count MUST be 0 (re-erasure re-shredded everything); we report the
-            // pre-pass resurrection count as the honest "what the restore brought back" signal, and
-            // the post-pass count as the proof we re-erased it. The gate reads `resurrected`.
-            resurrected: still_resolvable,
-            pre_pass_resurrected: 0,
-            per_subject,
-            ran_at: now,
+        let mut still_resolvable = 0usize;
+        for entry in &entries {
+            if self
+                .pseudonyms
+                .try_resolve_subject(scope, &entry.subject)?
+                .is_some()
+            {
+                still_resolvable += 1;
+            }
         }
-        .with_pre_pass_resurrected(resurrected)
+        Ok(
+            pseudonym_erase::ReErasureReceipt {
+                tenant: scope.tenant().clone(),
+                region: scope.region().clone(),
+                re_erased: entries.len(),
+                // The post-pass count MUST be 0 (re-erasure re-shredded everything); we report the
+                // pre-pass resurrection count as the honest "what the restore brought back" signal, and
+                // the post-pass count as the proof we re-erased it. The gate reads `resurrected`.
+                resurrected: still_resolvable,
+                pre_pass_resurrected: 0,
+                per_subject,
+                ran_at: now,
+            }
+            .with_pre_pass_resurrected(resurrected),
+        )
     }
 
     /// The shared S8 reverse index this slot's `list_objects` reads (so a caller can wire the live

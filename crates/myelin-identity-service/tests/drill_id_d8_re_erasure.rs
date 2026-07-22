@@ -91,7 +91,9 @@ fn id_d8_restore_resurrects_no_authority_and_emits_a_dated_re_erasure_receipt() 
     );
 
     // (3) POST-RESTORE RE-ERASURE runs — replays the ledger, re-runs the IDENTICAL crypto-shred.
-    let receipt = slot.re_erase_after_restore(&s, at("2026-06-19T11:00:00Z"));
+    let receipt = slot
+        .re_erase_after_restore(&s, at("2026-06-19T11:00:00Z"))
+        .expect("re-erasure verification");
 
     // (4) The quantified thresholds:
     assert_eq!(
@@ -151,7 +153,9 @@ fn id_d8_restore_resurrects_no_authority_and_emits_a_dated_re_erasure_receipt() 
 fn id_d8_empty_ledger_is_trivially_green() {
     let slot = slot();
     let s = scope("acme");
-    let receipt = slot.re_erase_after_restore(&s, at("2026-06-19T11:00:00Z"));
+    let receipt = slot
+        .re_erase_after_restore(&s, at("2026-06-19T11:00:00Z"))
+        .expect("empty re-erasure verification");
     assert_eq!(receipt.re_erased, 0);
     assert_eq!(receipt.resurrected, 0);
     assert!(receipt.is_green());
