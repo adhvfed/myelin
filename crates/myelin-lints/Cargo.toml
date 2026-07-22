@@ -21,5 +21,9 @@ publish = false
 # (see `tests/fixture_matrix.rs`). It depends on nothing — the lint engine is pure string
 # analysis so it is hermetic and deterministic (no DB, no network).
 [dependencies]
+proc-macro2 = { workspace = true, features = ["span-locations"] }
+serde = { workspace = true, features = ["derive"] }
+syn = { workspace = true, features = ["full", "visit"] }
+toml.workspace = true
 
 [dev-dependencies]

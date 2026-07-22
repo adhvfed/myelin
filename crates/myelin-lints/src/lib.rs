@@ -118,7 +118,9 @@
 //! host crate differs, and it differs toward the more coherent home.
 
 pub mod coverage;
+pub mod dependency_direction;
 pub mod engine;
+pub mod erosion;
 pub mod lints;
 pub mod production_graph;
 
