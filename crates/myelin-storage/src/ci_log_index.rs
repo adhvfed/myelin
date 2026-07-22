@@ -286,8 +286,12 @@ pub struct StepSpan {
 
 impl StepSpan {
     /// The inclusive-exclusive byte-range `[offset, offset + len)` this span covers in the step log.
-    pub fn byte_range(&self) -> (u64, u64) {
-        (self.offset, self.offset + self.len)
+    pub fn byte_range(&self) -> Result<(u64, u64), CiLogError> {
+        let end = self
+            .offset
+            .checked_add(self.len)
+            .ok_or(CiLogError::LimitExceeded("step span byte range"))?;
+        Ok((self.offset, end))
     }
 }
 
@@ -336,10 +340,19 @@ impl CiLogIndex {
     /// The total reconstructed log length for `(job, step)` in bytes (the sum of its spans' lengths) —
     /// `0` for an unknown step.
     pub fn step_log_len(&self, job_id: &str, step_no: u32) -> u64 {
+        self.checked_step_log_len(job_id, step_no)
+            .unwrap_or(u64::MAX)
+    }
+
+    fn checked_step_log_len(&self, job_id: &str, step_no: u32) -> Option<u64> {
         self.by_step
             .get(&(job_id.to_string(), step_no))
-            .map(|v| v.iter().fold(0u64, |total, span| total.saturating_add(span.len)))
-            .unwrap_or(0)
+            .map(|spans| {
+                spans
+                    .iter()
+                    .try_fold(0u64, |total, span| total.checked_add(span.len))
+            })
+            .unwrap_or(Some(0))
     }
 
     /// The number of `(job, step)` keys the index holds (the index is live / doing work).
@@ -600,7 +613,9 @@ impl CiLogTier {
         for (seq, clf) in frames {
             // The offset is the running total of this step's prior spans' lengths (the reconstructed
             // step-log offset), computed BEFORE this span is appended.
-            let offset = index.step_log_len(&clf.job_id, clf.step_no);
+            let offset = index
+                .checked_step_log_len(&clf.job_id, clf.step_no)
+                .ok_or(CiLogError::LimitExceeded("step log offset"))?;
             let span = StepSpan {
                 segment: segment.content_hash.clone(),
                 offset,
@@ -1380,7 +1395,38 @@ mod tests {
             frame_seq: 1,
             keying: SegmentKeying::Tenant,
         };
-        assert_eq!(span.byte_range(), (10, 15));
+        assert_eq!(span.byte_range().unwrap(), (10, 15));
+        assert_eq!(
+            StepSpan {
+                offset: u64::MAX,
+                len: 1,
+                ..span.clone()
+            }
+            .byte_range(),
+            Err(CiLogError::LimitExceeded("step span byte range"))
+        );
+        let mut index = CiLogIndex::new();
+        index.append(
+            "job",
+            1,
+            StepSpan {
+                offset: 0,
+                len: u64::MAX,
+                ..span.clone()
+            },
+        );
+        index.append(
+            "job",
+            1,
+            StepSpan {
+                offset: u64::MAX,
+                len: 1,
+                frame_seq: 2,
+                ..span.clone()
+            },
+        );
+        assert_eq!(index.checked_step_log_len("job", 1), None);
+        assert_eq!(index.step_log_len("job", 1), u64::MAX);
         assert!(CiLogError::UnknownStep {
             job_id: "j".into(),
             step_no: 4
