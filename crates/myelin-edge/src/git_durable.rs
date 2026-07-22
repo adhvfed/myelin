@@ -3231,6 +3231,9 @@ fn map_durable_err(e: DurableError) -> EdgeError {
         DurableError::Git(m) if m.starts_with("pull request list limit exceeded:") => {
             EdgeError::PayloadTooLarge("pull request list exceeds the interactive record limit".into())
         }
+        DurableError::Git(m) if m.starts_with("pull request record limit exceeded:") => {
+            EdgeError::PayloadTooLarge("pull request record exceeds the storage limit".into())
+        }
         // A traversal-rejected slug / malformed body (e.g. R3.1 open-PR with no `title`) surfaces as a
         // clean 400 (never a silent wrong path, never a 500 for a client input error).
         DurableError::Git(m)
@@ -5537,6 +5540,10 @@ mod pr_list_tests {
             (
                 "pull request list limit exceeded: private repository detail",
                 "pull request list exceeds the interactive record limit",
+            ),
+            (
+                "pull request record limit exceeded: private repository detail",
+                "pull request record exceeds the storage limit",
             ),
         ] {
             let mapped = map_durable_err(DurableError::Git(private.into()));
