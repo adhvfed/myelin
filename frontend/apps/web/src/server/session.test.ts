@@ -27,6 +27,7 @@ const record = {
   token: "access-one",
   refreshToken: "refresh-one",
   scheme: "agent",
+  credentialExpiresAtMs: Number.MAX_SAFE_INTEGER,
   principalId: "principal-one",
   displayName: "Operator",
   region: "fr-par",

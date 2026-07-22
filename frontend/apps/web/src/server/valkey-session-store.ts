@@ -5,6 +5,7 @@ import Redis from "ioredis";
 import {
   SESSION_ABSOLUTE_TTL_MS,
   SESSION_IDLE_TTL_MS,
+  assertUsableCredentialExpiry,
   type SessionRecord,
   type SessionStore,
 } from "./session-store";
@@ -30,27 +31,33 @@ end
 const ISSUE_SCRIPT = `
 local clock = redis.call("TIME")
 local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local expiresAtMs = math.min(now + tonumber(ARGV[2]), tonumber(ARGV[3]))
+if expiresAtMs <= now then return 0 end
 local session = {
   record = cjson.decode(ARGV[1]),
   createdAtMs = now,
   lastSeenAtMs = now,
-  expiresAtMs = now + tonumber(ARGV[2])
+  expiresAtMs = expiresAtMs
 }
-redis.call("SET", KEYS[1], cjson.encode(session), "PX", ARGV[3])
+local ttl = math.floor(math.min(tonumber(ARGV[4]), expiresAtMs - now))
+redis.call("SET", KEYS[1], cjson.encode(session), "PX", ttl)
 return 1
 `;
 
 const ROTATE_SCRIPT = `
 local clock = redis.call("TIME")
 local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local expiresAtMs = math.min(now + tonumber(ARGV[2]), tonumber(ARGV[3]))
+if expiresAtMs <= now then return 0 end
 local session = {
   record = cjson.decode(ARGV[1]),
   createdAtMs = now,
   lastSeenAtMs = now,
-  expiresAtMs = now + tonumber(ARGV[2])
+  expiresAtMs = expiresAtMs
 }
 local encoded = cjson.encode(session)
-redis.call("SET", KEYS[1], encoded, "PX", ARGV[3])
+local ttl = math.floor(math.min(tonumber(ARGV[4]), expiresAtMs - now))
+redis.call("SET", KEYS[1], encoded, "PX", ttl)
 redis.call("DEL", KEYS[2])
 return 1
 `;
@@ -120,8 +127,10 @@ function validStoredRecord(value: unknown): value is StoredRecord {
 function validRecord(value: unknown): value is SessionRecord {
   if (!value || typeof value !== "object") return false;
   const record = value as Record<string, unknown>;
-  return ["token", "refreshToken", "scheme", "principalId", "displayName", "region", "tenant"].every(
-    (field) => typeof record[field] === "string",
+  return (
+    ["token", "refreshToken", "scheme", "principalId", "displayName", "region", "tenant"].every(
+      (field) => typeof record[field] === "string",
+    ) && Number.isSafeInteger(record.credentialExpiresAtMs)
   );
 }
 
@@ -150,26 +159,32 @@ export class ValkeySessionStore implements SessionStore {
   }
 
   async issue(id: string, record: SessionRecord): Promise<void> {
-    await this.#redis.eval(
+    assertUsableCredentialExpiry(record.credentialExpiresAtMs);
+    const issued = await this.#redis.eval(
       ISSUE_SCRIPT,
       1,
       this.#key(id),
       JSON.stringify(this.#seal(id, record)),
       SESSION_ABSOLUTE_TTL_MS,
-      Math.min(SESSION_IDLE_TTL_MS, SESSION_ABSOLUTE_TTL_MS),
+      record.credentialExpiresAtMs,
+      SESSION_IDLE_TTL_MS,
     );
+    if (issued !== 1) throw new Error("session credential expired during issuance");
   }
 
   async rotate(priorId: string, id: string, record: SessionRecord): Promise<void> {
-    await this.#redis.eval(
+    assertUsableCredentialExpiry(record.credentialExpiresAtMs);
+    const rotated = await this.#redis.eval(
       ROTATE_SCRIPT,
       2,
       this.#key(id),
       this.#key(priorId),
       JSON.stringify(this.#seal(id, record)),
       SESSION_ABSOLUTE_TTL_MS,
-      Math.min(SESSION_IDLE_TTL_MS, SESSION_ABSOLUTE_TTL_MS),
+      record.credentialExpiresAtMs,
+      SESSION_IDLE_TTL_MS,
     );
+    if (rotated !== 1) throw new Error("session credential expired during rotation");
   }
 
   async get(id: string): Promise<SessionRecord | null> {
@@ -240,6 +255,7 @@ export class ValkeySessionStore implements SessionStore {
       token: opened.token,
       refreshToken: opened.refreshToken,
       scheme: opened.scheme,
+      credentialExpiresAtMs: opened.credentialExpiresAtMs,
       principalId: opened.principalId,
       displayName: opened.displayName,
       region: opened.region,

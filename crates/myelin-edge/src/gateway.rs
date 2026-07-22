@@ -1015,6 +1015,7 @@ impl Handler for WhoamiHandler {
                 "tenant": ctx.scope.tenant().0,
                 "region": ctx.scope.region().0,
                 "kind": kind_label(&ctx.principal.kind),
+                "expires_at": ctx.identity.capability().expires_at_unix,
             }),
         ))
     }
@@ -1686,7 +1687,9 @@ mod tests {
             vec![],
         ));
         assert_eq!(whoami.status(), 200);
-        assert_eq!(whoami.json_body().unwrap()["principal_id"], "p:alice");
+        let whoami_body = whoami.json_body().unwrap();
+        assert_eq!(whoami_body["principal_id"], "p:alice");
+        assert_eq!(whoami_body["expires_at"], upstream_expiry);
     }
 
     #[test]
