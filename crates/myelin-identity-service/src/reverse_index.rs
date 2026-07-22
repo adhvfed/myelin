@@ -433,7 +433,13 @@ impl ReverseIndexConsumer {
 
         // The write's zookie (the §8.7 revision_watermark) — references-not-payloads carries it.
         let zookie = match ev.payload.get("zookie").and_then(|z| z.as_str()) {
-            Some(z) => Zookie(z.to_string()),
+            Some(z) if canonical_zookie(z) => Zookie(z.to_string()),
+            Some(_) => {
+                return Err(
+                    "iam.tuple_written event carries a non-canonical zookie (expected `zk-` plus 20 decimal digits)"
+                        .into(),
+                )
+            }
             // A tuple-written event with no zookie is structurally malformed (S3 always stamps one)
             // → a non-retryable poison: never silently project a watermark-less delta.
             None => {
@@ -583,6 +589,18 @@ fn type_of_object_id(object_id: &str) -> String {
         .split_once(':')
         .map(|(ty, _)| ty.to_string())
         .unwrap_or_else(|| object_id.to_string())
+}
+
+/// S3 renders revisions as `zk-<020d>` from a `u64`. S8 compares these strings lexically, so accepting
+/// any other spelling could poison the watermark ordering permanently.
+fn canonical_zookie(value: &str) -> bool {
+    value
+        .strip_prefix("zk-")
+        .is_some_and(|revision| {
+            revision.len() == 20
+                && revision.bytes().all(|byte| byte.is_ascii_digit())
+                && revision.parse::<u64>().is_ok()
+        })
 }
 
 #[cfg(test)]
@@ -905,13 +923,13 @@ mod tests {
     /// A structurally-malformed event (no zookie) returns NonRetryable — the projection is not
     /// mutated and the watermark is not advanced.
     #[test]
-    fn malformed_event_without_zookie_is_non_retryable_poison() {
+    fn malformed_event_zookie_is_non_retryable_poison() {
         use myelin_events::{
             Actor, AggregateKey, CorrelationId, DataRole, EventId, EventType, Visibility,
         };
         let index = ReverseIndex::new();
         let consumer = ReverseIndexConsumer::new(index.clone());
-        let ev = EventEnvelope {
+        let mut ev = EventEnvelope {
             event_id: EventId("e1".into()),
             type_: EventType(IAM_TUPLE_WRITTEN.into()),
             schema_ver: 1,
@@ -940,6 +958,22 @@ mod tests {
         );
         // Nothing was projected and the watermark did not advance.
         assert_eq!(index.watermark(&scope("acme")), Zookie(String::new()));
+
+        ev.event_id = EventId("e2".into());
+        ev.payload = serde_json::json!({
+            "zookie": "zzzz-poisons-lexical-order",
+            "deltas": []
+        });
+        let outcome = consumer.handle(&ev, &mut myelin_events::HandlerTx::none());
+        assert!(
+            matches!(outcome, HandleOutcome::NonRetryable(_)),
+            "a non-canonical zookie is poison rather than a trusted watermark"
+        );
+        assert_eq!(
+            index.watermark(&scope("acme")),
+            Zookie(String::new()),
+            "invalid lexical watermark text cannot pin S8 ahead forever"
+        );
     }
 
     /// **A malformed delta cannot leave a revoked grant behind while claiming S8 is current.** The
