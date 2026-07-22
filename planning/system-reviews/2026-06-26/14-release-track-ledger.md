@@ -856,7 +856,7 @@ posture; run the exact-tenant region poller/worker composition; and close the my
 `RunStore` floor. Production execution remains startup-refused.
 
 **CI `linux-small-v1` launch-policy boundary (2026-07-22, `fd6f3bc4` + `de581870` + `19ee677b` +
-`6d133138`).** The first real
+`6d133138` + `239d64ab`).** The first real
 `CiLaunchAuthorityMaterializer` now converts the customer-authored profile into fixed server-owned,
 default-deny grants: zero egress, environment, or secret handles; 1 vCPU, 256 MiB RAM, 1 GiB disk,
 128 PIDs, and a 600-second timeout; batch scheduling with frozen labels and project fair-share
@@ -885,11 +885,31 @@ bearer nor a JTI. Nine focused tests pin exact batch replay, full-field token bi
 duplicate provider output, pre-call scope rejection, and dormant no-fabrication; the full
 control-plane all-target/all-feature suite, production source guard, warnings-denied clippy, and L2
 gate are green. An independent adversarial verifier reported CONFIRMED-SOUND with no HIGH/MEDIUM
-findings. **Honest remaining activation floor:** implement and crash-prove the concrete Tier-P
-operational reservation source; make the claim-time Identity issuer reload the immutable manifest
-and locked `ci_run`, recompute this handle, and mint/verify the bounded credential; then compose the
-exact-tenant region poller/worker and terminal bookends. No Commercial wallet, billing, or Stripe
-work is admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains startup-refused.
+findings.
+
+The claim-time authority wrapper now locks the exact `job_queue` claim before `ci_run` in one
+tenant-/region-scoped transaction, then reloads the immutable drive manifest and reconstructs the
+complete token-authority request server-side. It refuses unless state, idempotency token, stage,
+trust tier, runner owner, lease epoch, nonce, original claim window, run identity, and manifest
+digest all agree and PostgreSQL still considers the claim live; only then is the raw Identity mint
+seam reachable while both rows remain locked. Initial claim timestamps are now persisted separately
+from heartbeat-extended `lease_expires` via forward-only nullable columns, so old/unmigrated rows
+refuse mint and acknowledgement-loss retries retain one durable generation. The scheduler's
+least-privilege role receives only those two additional column updates, and its live privilege audit
+checks both required and excess grants. Live PostgreSQL proof admits the exact durable claim and
+refuses forged handle/owner/time, reaped/null, and reclaimed generations before the raw minter; the
+full control-plane all-target/all-feature suite and warnings-denied clippy are green. An independent
+adversarial re-audit reported CONFIRMED-SOUND with no HIGH/MEDIUM findings.
+
+**Honest remaining activation floors:** implement and crash-prove the concrete Tier-P operational
+reservation source. The concrete Identity adapter must mint and cryptographically verify the signed
+credential's scheme, purpose, tenant/region/principal/job scope, capabilities, carrier JTI, and
+absolute expiry bounded by the durable claim; its call must have a claim-bounded timeout and exact
+acknowledgement-loss/concurrent-retry behavior. The runner must reauthorize immediately before
+sandbox launch, with a concurrent-reaper and post-mint/pre-commit crash proof. Then compose the
+exact-tenant region poller/worker and terminal reserve/settle bookends. No Commercial wallet,
+billing, or Stripe work is admitted before the Tier-B go decision. `MYELIN_CI_RUNNER=1` remains
+startup-refused.
 
 ## R5–R6
 
