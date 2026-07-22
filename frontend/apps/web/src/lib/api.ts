@@ -830,7 +830,11 @@ export const prMutate = action(async (m: PrMutation): Promise<PrMutationResult> 
       }
       case "merge": {
         try {
-          const r = await edgePost<{ applied: { base_ref: string; new_oid: string } }>(`${base}/merge`, {});
+          const r = await edgePost<{ applied: { base_ref: string; new_oid: string } }>(
+            `${base}/merge`,
+            {},
+            { idempotencyKey: crypto.randomUUID() },
+          );
           return { blocked: false, base_ref: r.applied.base_ref, new_oid: r.applied.new_oid };
         } catch (e) {
           if (e instanceof GatewayError && e.status === 409) {

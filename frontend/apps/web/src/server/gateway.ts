@@ -32,6 +32,11 @@ export interface GatewayRequestOptions {
   timeoutMs?: number;
 }
 
+export interface GatewayMutationOptions extends GatewayRequestOptions {
+  /** Stable operation identity for response-lost retries of durable edge mutations. */
+  idempotencyKey?: string;
+}
+
 export function gatewayRequestSignal(options: GatewayRequestOptions = {}): AbortSignal {
   const timeoutMs = options.timeoutMs ?? DEFAULT_EDGE_REQUEST_TIMEOUT_MS;
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
@@ -50,7 +55,7 @@ export async function edgeGet<T = unknown>(path: string, options?: GatewayReques
 export async function edgePost<T = unknown>(
   path: string,
   body?: unknown,
-  options?: GatewayRequestOptions,
+  options?: GatewayMutationOptions,
 ): Promise<T> {
   return edgeRequest<T>("POST", path, body, options);
 }
@@ -180,7 +185,7 @@ async function edgeRequest<T>(
   method: string,
   path: string,
   body?: unknown,
-  options?: GatewayRequestOptions,
+  options?: GatewayMutationOptions,
 ): Promise<T> {
   const initialSession = await getSessionRecord();
   const scheme = initialSession?.scheme ?? "pat";
@@ -194,6 +199,9 @@ async function edgeRequest<T>(
           authorization: `Bearer ${token}`,
           "x-myelin-token-scheme": scheme,
           ...(body !== undefined ? { "content-type": "application/json" } : {}),
+          ...(options?.idempotencyKey
+            ? { "idempotency-key": options.idempotencyKey }
+            : {}),
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,
         redirect: "error",

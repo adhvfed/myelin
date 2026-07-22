@@ -17,6 +17,7 @@ import {
   edgeGetPublic,
   edgeGetRaw,
   edgeLoginWithOidc,
+  edgePost,
   gatewayRequestSignal,
 } from "./gateway";
 
@@ -167,6 +168,28 @@ describe("gateway response limits", () => {
 });
 
 describe("gateway refresh revocation races", () => {
+  it("preserves a mutation idempotency key across an authentication retry", async () => {
+    const refresh = new Response(JSON.stringify({ access_token: "fresh-token" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(unauthorized())
+      .mockResolvedValueOnce(refresh)
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await edgePost("/v1/git/repos/core/prs/1/merge", {}, {
+      idempotencyKey: "merge-operation-1",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get("idempotency-key"))
+      .toBe("merge-operation-1");
+    expect(new Headers(fetchMock.mock.calls[2]?.[1]?.headers).get("idempotency-key"))
+      .toBe("merge-operation-1");
+  });
+
   it("does not send a refresh request for a non-refreshable SSO session", async () => {
     session.getSessionRecord.mockReturnValue({
       token: "human-session",
