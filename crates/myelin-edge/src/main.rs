@@ -1342,7 +1342,7 @@ mod runtime_config_tests {
 
     #[test]
     fn oidc_jwks_response_is_strict_and_body_opaque() {
-        let document = br#"{"keys":[{"kty":"RSA","kid":"rsa-1","n":"AQAB","e":"AQAB"}]}"#;
+        let document = br#"{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"ed-1","alg":"EdDSA","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}]}"#;
         let keys = parse_oidc_jwks_response(
             hyper::StatusCode::OK,
             Some("Application/JWK-Set+JSON; charset=utf-8"),

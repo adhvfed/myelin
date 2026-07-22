@@ -169,6 +169,30 @@ impl JwkKey {
             JwkKey::Ed25519 { .. } => "EdDSA",
         }
     }
+
+    fn validate_shape(&self) -> Result<(), String> {
+        match self {
+            JwkKey::Rsa { n, e } => {
+                let modulus = rsa::BigUint::from_bytes_be(n);
+                if modulus.bits() < 2048 {
+                    return Err("RSA JWKS modulus must be at least 2048 bits".into());
+                }
+                let exponent = rsa::BigUint::from_bytes_be(e);
+                if exponent < rsa::BigUint::from(3_u8) || e.last().is_none_or(|byte| byte & 1 == 0)
+                {
+                    return Err("RSA JWKS exponent must be an odd integer of at least 3".into());
+                }
+            }
+            JwkKey::EcP256 { x, y } if x.len() != 32 || y.len() != 32 => {
+                return Err("P-256 JWKS coordinates must each be 32 bytes".into());
+            }
+            JwkKey::Ed25519 { x } if x.len() != 32 => {
+                return Err("Ed25519 JWKS public key must be 32 bytes".into());
+            }
+            JwkKey::EcP256 { .. } | JwkKey::Ed25519 { .. } => {}
+        }
+        Ok(())
+    }
 }
 
 /// **The injected JWKS — the IdP's published public keys, keyed by `kid`.** Provided to the verifier
@@ -236,8 +260,7 @@ impl JwksSource {
             }
         }
         let Some(refresh) = &self.refresh else {
-            return cached
-                .ok_or_else(|| refuse(format!("unknown `kid` `{kid}` (not in the JWKS)")));
+            return cached.ok_or_else(|| refuse("unknown `kid` (not in the JWKS)"));
         };
 
         // A stale-but-usable cache never queues behind another network refresh. Unknown keys wait
@@ -263,9 +286,7 @@ impl JwksSource {
             (current, due, cooling_down)
         };
         if !due || cooling_down {
-            return current.ok_or_else(|| {
-                refuse(format!("unknown `kid` `{kid}` (JWKS refresh rate-limited)"))
-            });
+            return current.ok_or_else(|| refuse("unknown `kid` (JWKS refresh rate-limited)"));
         }
         {
             let mut cache = self
@@ -286,9 +307,7 @@ impl JwksSource {
             }
             Ok(_) | Err(_) => {
                 return current.ok_or_else(|| {
-                    refuse(format!(
-                        "unknown `kid` `{kid}` and no usable refreshed JWKS is available"
-                    ))
+                    refuse("unknown `kid` and no usable refreshed JWKS is available")
                 })
             }
         }
@@ -298,7 +317,7 @@ impl JwksSource {
             .keys
             .get(kid)
             .cloned()
-            .ok_or_else(|| refuse(format!("unknown `kid` `{kid}` after JWKS refresh")))
+            .ok_or_else(|| refuse("unknown `kid` after JWKS refresh"))
     }
 }
 
@@ -334,9 +353,10 @@ impl JwkSet {
 
     /// Parse a standard RFC 7517 JWKS JSON document (the shape an IdP's `jwks_uri` returns) into an
     /// injected key set. Supported families: RSA (RS256), EC P-256 (ES256), OKP/Ed25519 (EdDSA). A
-    /// key with no `kid`, or an unsupported `kty`/`crv`, is SKIPPED (a JWKS may legitimately carry
-    /// encryption keys / other curves we do not verify). A supported family with malformed
-    /// parameters is a loud `BadRequest`.
+    /// key with no `kid`, an incompatible `use`/`key_ops`/`alg`, or an unsupported `kty`/`crv`, is
+    /// SKIPPED (a JWKS may legitimately carry encryption keys / other curves we do not verify). A
+    /// weak or malformed supported key and an ambiguous duplicate supported `kid` are loud
+    /// `BadRequest`s.
     pub fn from_jwks_json(doc: &str) -> Result<JwkSet, AuthzError> {
         let v: serde_json::Value = serde_json::from_str(doc)
             .map_err(|e| AuthzError::BadRequest(format!("malformed JWKS JSON: {e}")))?;
@@ -358,41 +378,88 @@ impl JwkSet {
                     .ok_or_else(|| AuthzError::BadRequest(format!("JWKS key missing `{field}`")))?;
                 b64url(s)
             };
-            match kty {
-                "RSA" => {
-                    set = set.with_key(
-                        kid,
-                        JwkKey::Rsa {
-                            n: dec("n")?,
-                            e: dec("e")?,
-                        },
-                    );
-                }
+            let parsed = match kty {
+                "RSA" => Some(JwkKey::Rsa {
+                    n: dec("n")?,
+                    e: dec("e")?,
+                }),
                 "EC" => {
                     let crv = k.get("crv").and_then(|x| x.as_str()).unwrap_or("");
                     if crv != "P-256" {
                         continue; // only ES256 / P-256 is supported here.
                     }
-                    set = set.with_key(
-                        kid,
-                        JwkKey::EcP256 {
-                            x: dec("x")?,
-                            y: dec("y")?,
-                        },
-                    );
+                    Some(JwkKey::EcP256 {
+                        x: dec("x")?,
+                        y: dec("y")?,
+                    })
                 }
                 "OKP" => {
                     let crv = k.get("crv").and_then(|x| x.as_str()).unwrap_or("");
                     if crv != "Ed25519" {
                         continue; // only Ed25519 EdDSA is supported here.
                     }
-                    set = set.with_key(kid, JwkKey::Ed25519 { x: dec("x")? });
+                    Some(JwkKey::Ed25519 { x: dec("x")? })
                 }
-                _ => continue, // unsupported key type — skip (do not fabricate a key).
+                _ => None, // unsupported key type — skip (do not fabricate a key).
+            };
+            let Some(key) = parsed else { continue };
+            if !jwk_allows_verification(k, key.expected_alg())? {
+                continue;
             }
+            key.validate_shape().map_err(AuthzError::BadRequest)?;
+            if set.by_kid.contains_key(&kid) {
+                return Err(AuthzError::BadRequest(
+                    "JWKS contains duplicate supported `kid` values".into(),
+                ));
+            }
+            set = set.with_key(kid, key);
         }
         Ok(set)
     }
+}
+
+fn jwk_allows_verification(
+    value: &serde_json::Value,
+    expected_alg: &str,
+) -> Result<bool, AuthzError> {
+    if let Some(public_use) = value.get("use") {
+        let public_use = public_use
+            .as_str()
+            .ok_or_else(|| AuthzError::BadRequest("JWKS `use` must be a string".into()))?;
+        if public_use != "sig" {
+            return Ok(false);
+        }
+    }
+    if let Some(alg) = value.get("alg") {
+        let alg = alg
+            .as_str()
+            .ok_or_else(|| AuthzError::BadRequest("JWKS `alg` must be a string".into()))?;
+        if alg != expected_alg {
+            return Ok(false);
+        }
+    }
+    if let Some(operations) = value.get("key_ops") {
+        let operations = operations
+            .as_array()
+            .ok_or_else(|| AuthzError::BadRequest("JWKS `key_ops` must be an array".into()))?;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut verifies = false;
+        for operation in operations {
+            let operation = operation.as_str().ok_or_else(|| {
+                AuthzError::BadRequest("JWKS `key_ops` entries must be strings".into())
+            })?;
+            if !seen.insert(operation) {
+                return Err(AuthzError::BadRequest(
+                    "JWKS `key_ops` must not contain duplicates".into(),
+                ));
+            }
+            verifies |= operation == "verify";
+        }
+        if !verifies {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 // ================================================================================================
@@ -643,6 +710,7 @@ fn aud_is_exact(claims: &serde_json::Value, want: &str) -> bool {
 /// key's family. Returns `Ok(())` only on a cryptographically valid signature; any failure is a loud
 /// refusal. NO signature math is hand-rolled — each arm calls the vetted crate's `verify`.
 fn verify_signature(key: &JwkKey, msg: &[u8], sig: &[u8]) -> Result<(), AuthzError> {
+    key.validate_shape().map_err(refuse)?;
     match key {
         JwkKey::Rsa { n, e } => {
             use rsa::pkcs1v15::{Signature, VerifyingKey};
@@ -731,10 +799,10 @@ impl CredentialVerifier for OidcVerifier {
             .get(..2)
             .is_some_and(|p| p.eq_ignore_ascii_case(b"HS"))
         {
-            return Err(refuse(format!(
-                "symmetric alg `{alg}` rejected against an asymmetric JWKS key (the RS256→HS256 \
-                 alg-confusion bypass)"
-            )));
+            return Err(refuse(
+                "symmetric alg rejected against an asymmetric JWKS key (the RS256→HS256 \
+                 alg-confusion bypass)",
+            ));
         }
 
         // (3) KID selection — the key is chosen by the token's `kid` from the cached JWKS. A
@@ -753,7 +821,7 @@ impl CredentialVerifier for OidcVerifier {
         let expected = key.expected_alg();
         if alg != expected {
             return Err(refuse(format!(
-                "alg `{alg}` does not match the key `{kid}` (expected `{expected}` — \
+                "JWT alg does not match the selected JWKS key (expected `{expected}` — \
                  alg-confusion / wrong-alg defence)"
             )));
         }
@@ -773,8 +841,8 @@ impl CredentialVerifier for OidcVerifier {
             let refreshed_expected = key.expected_alg();
             if alg != refreshed_expected {
                 return Err(refuse(format!(
-                    "alg `{alg}` does not match the refreshed key `{kid}` (expected \
-                     `{refreshed_expected}` — alg-confusion / wrong-alg defence)"
+                    "JWT alg does not match the refreshed key (expected `{refreshed_expected}` — \
+                     alg-confusion / wrong-alg defence)"
                 )));
             }
             verify_signature(&key, signing_input.as_bytes(), &sig)?;
@@ -1240,6 +1308,75 @@ mod tests {
             .verify(&cred(jwt(&header, &cl, &sig)))
             .unwrap();
         assert_eq!(a.tenant, TenantId("acme".into()));
+    }
+
+    #[test]
+    fn parsed_jwks_honours_key_intent_and_rejects_ambiguity() {
+        let key = RsaKey::generate();
+        let (n, e) = match key.jwk() {
+            JwkKey::Rsa { n, e } => (b64(&n), b64(&e)),
+            _ => unreachable!(),
+        };
+        let filtered = serde_json::json!({"keys": [
+            {"kty":"RSA", "kid":"enc", "use":"enc", "n":n, "e":e},
+            {"kty":"RSA", "kid":"ops", "key_ops":["encrypt"], "n":n, "e":e},
+            {"kty":"RSA", "kid":"alg", "alg":"PS256", "n":n, "e":e},
+            {"kty":"RSA", "kid":"verify", "use":"sig", "key_ops":["verify"],
+             "alg":"RS256", "n":n, "e":e}
+        ]});
+        let parsed = JwkSet::from_jwks_json(&filtered.to_string()).expect("valid intent metadata");
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed.get("verify").is_some());
+
+        let duplicate = serde_json::json!({"keys": [
+            {"kty":"RSA", "kid":"same", "n":n, "e":e},
+            {"kty":"RSA", "kid":"same", "n":n, "e":e}
+        ]});
+        let error = JwkSet::from_jwks_json(&duplicate.to_string()).unwrap_err();
+        assert!(matches!(error, AuthzError::BadRequest(message) if message.contains("duplicate")));
+    }
+
+    #[test]
+    fn parsed_and_injected_jwks_reject_weak_rsa_keys() {
+        let weak = JwkKey::Rsa {
+            n: vec![0xff; 128],
+            e: vec![0x01, 0x00, 0x01],
+        };
+        let document = serde_json::json!({"keys": [{
+            "kty":"RSA", "kid":"weak", "alg":"RS256",
+            "n":b64(&[0xff; 128]), "e":"AQAB"
+        }]});
+        let error = JwkSet::from_jwks_json(&document.to_string()).unwrap_err();
+        assert!(matches!(error, AuthzError::BadRequest(message) if message.contains("2048")));
+
+        let header = serde_json::json!({"alg": "RS256", "kid": "weak"});
+        let cl = claims("jti-weak-rsa");
+        let error = verifier(JwkSet::new().with_key("weak", weak))
+            .verify(&cred(jwt(&header, &cl, &[0; 256])))
+            .unwrap_err();
+        assert!(matches!(error, AuthzError::FailClosed(message) if message.contains("2048")));
+    }
+
+    #[test]
+    fn malformed_key_operations_fail_loud() {
+        let key = RsaKey::generate();
+        let (n, e) = match key.jwk() {
+            JwkKey::Rsa { n, e } => (b64(&n), b64(&e)),
+            _ => unreachable!(),
+        };
+        for key_ops in [
+            serde_json::json!("verify"),
+            serde_json::json!(["verify", "verify"]),
+            serde_json::json!(["verify", 1]),
+        ] {
+            let document = serde_json::json!({"keys": [{
+                "kty":"RSA", "kid":"rsa", "n":n, "e":e, "key_ops":key_ops
+            }]});
+            assert!(matches!(
+                JwkSet::from_jwks_json(&document.to_string()),
+                Err(AuthzError::BadRequest(_))
+            ));
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════
