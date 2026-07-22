@@ -49,8 +49,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         .find("PgBootstrap::connect(platform_config, DEFAULT_MAX_CONNECTIONS)")
         .expect("database bootstrap must remain wired");
     let service = source
-        .find("run_controlplane(Config::default()")
-        .expect("service lifecycle must remain wired");
+        .find("run_controlplane_until_shutdown(Config::default()")
+        .expect("signal-driven service lifecycle must remain wired");
 
     assert!(!source.contains("runner_hooks"));
     assert!(!source.contains("CiPipelineDriver"));
@@ -69,6 +69,8 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(!source.contains("std::env::var(\"MYELIN_CI_RUNNER\").ok()"));
     assert!(!source.contains("ci_job_queue_store(provider.db_pool().clone())"));
     assert!(source.contains("scheduler_provider.region_queue_store()"));
+    assert!(source.contains("reaper.run_until_shutdown(shutdown_rx)"));
+    assert!(source.contains("shutdown_signal().await"));
     assert!(!library_source.contains("pub fn ci_region_queue_store("));
     assert!(!region_store_source.contains("pub fn with_pg"));
 

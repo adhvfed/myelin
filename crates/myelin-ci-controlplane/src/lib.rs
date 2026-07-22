@@ -710,14 +710,29 @@ pub fn boot_controlplane(
     boot(controlplane_app_spec(config, outbox))
 }
 
-/// **The CI Control Plane service entry — the one `serve(AppSpec)` call (contract 1.1).** The
-/// `ci-controlplane` binary (`src/main.rs`) does nothing but hand [`controlplane_app_spec`] to this.
+/// **The deterministic CI Control Plane lifecycle entry.** This synchronous one-tick wrapper is
+/// retained for shell tests and drills; the production binary uses
+/// [`run_controlplane_until_shutdown`] so it remains live until an OS shutdown signal arrives.
 /// A failed boot / incomplete drain returns non-zero (§3.1) — loud, never a silent success.
 pub fn run_controlplane(
     config: Config,
     outbox: myelin_events::OutboxStore,
 ) -> Result<(), ServeError> {
     serve(controlplane_app_spec(config, outbox))
+}
+
+/// Run the production control plane until the supplied OS-shutdown future resolves, then let the
+/// shared harness stop intake and drain in-flight work. The synchronous [`run_controlplane`] remains
+/// the deterministic one-tick shell-test entry.
+pub async fn run_controlplane_until_shutdown<F>(
+    config: Config,
+    outbox: myelin_events::OutboxStore,
+    shutdown: F,
+) -> Result<(), ServeError>
+where
+    F: std::future::Future<Output = ()>,
+{
+    myelin_substrate::serve_until_shutdown(controlplane_app_spec(config, outbox), shutdown).await
 }
 
 /// **Construct the durable CI `ci_cost_event` projection store at the composition root (CT-004a).**
@@ -936,6 +951,19 @@ mod tests {
             run_controlplane(Config::default(), myelin_events::OutboxStore::new()),
             Ok(()),
             "the CI Control Plane shell boots → … → drains cleanly"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_controlplane_waits_for_shutdown_then_drains() {
+        assert_eq!(
+            run_controlplane_until_shutdown(
+                Config::default(),
+                myelin_events::OutboxStore::new(),
+                async {},
+            )
+            .await,
+            Ok(())
         );
     }
 

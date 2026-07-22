@@ -3,10 +3,11 @@
 //! The "every service `main.rs`" the contract-index row 1.1 names: it composes the DURABLE
 //! composition root (MR-009b W3b.6, the W3b.4 pattern) and hands the CI Control Plane
 //! [`AppSpec`](myelin_ci_controlplane::controlplane_app_spec) to the harness's one call,
-//! [`run_controlplane`](myelin_ci_controlplane::run_controlplane) (a thin wrapper over `serve`).
+//! [`run_controlplane_until_shutdown`](myelin_ci_controlplane::run_controlplane_until_shutdown) (a
+//! thin wrapper over `serve_until_shutdown`).
 //! The harness owns the whole lifecycle (boot → migrate → outbox relay → consumers → three ports
-//! → graceful drain, with liveness ≠ readiness); this `main` composes and hands off — no
-//! hand-rolled lifecycle logic.
+//! → signal-driven graceful drain, with liveness ≠ readiness); this `main` composes durable workers
+//! around that harness-owned lifecycle and joins them during shutdown.
 //!
 //! On boot the CI Control Plane shell runs the complete forward-only data-model migrations (every CI
 //! Control-Plane table — `ci_run` … `cost_event` — `(tenant, region)`-first + RLS-on) and
@@ -33,7 +34,7 @@
 //! CI-P12..CI-P24 surface. This shell runs no job: requesting the incomplete production runner
 //! fails before database bootstrap until its durable billing and run-token authorities are wired.
 
-use myelin_ci_controlplane::run_controlplane;
+use myelin_ci_controlplane::run_controlplane_until_shutdown;
 use myelin_config::{Mode, MyelinConfig};
 use myelin_events::OutboxStore;
 use myelin_storage::{
@@ -231,8 +232,8 @@ async fn main() {
         myelin_tenancy::Region(provider.config().region.clone()),
     );
     // CT-004c.1: construct the REAL durable `job_queue` store + spawn the dead-runner reaper loop onto
-    // the serve runtime (minimal-impact wiring — a bounded background task hung off the existing
-    // lifecycle, NOT a new AppSpec schema field). The `job_queue` table the reaper sweeps is created
+    // the serve runtime (minimal-impact wiring — a bounded background task coordinated with the
+    // signal-driven lifecycle, NOT a new AppSpec schema field). The `job_queue` table it sweeps is created
     // by the full `ci_controlplane_migrations` the `serve(AppSpec)` below applies at boot; the reaper
     // delays its first sweep one interval so that boot-migrate has completed. The reaper is SAFE — it
     // only re-queues expired leases (`leased`→`queued`); it launches NO untrusted code (binding the
@@ -244,7 +245,8 @@ async fn main() {
         provider.config().region.clone(),
         std::time::Duration::from_secs(15),
     );
-    tokio::spawn(reaper.run());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let reaper_task = tokio::spawn(reaper.run_until_shutdown(shutdown_rx));
     // CT-004 — compose the per-tenant `ci_run`-poll STARTER lane behind the SAME `MYELIN_CI_RUNNER`
     // activation seam the runner uses. `ci_run_starter_factory` builds the REAL, production-callable
     // `PgCiRunStarterFactory` from the runtime pool + cell region + blob CAS: it mints an exact-cell
@@ -296,11 +298,56 @@ async fn main() {
     }
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).
-    match run_controlplane(Config::default(), outbox) {
+    let signal_shutdown = shutdown_tx.clone();
+    let service_result = run_controlplane_until_shutdown(Config::default(), outbox, async move {
+        shutdown_signal().await;
+        let _ = signal_shutdown.send(true);
+    })
+    .await;
+    let _ = shutdown_tx.send(true);
+    let reaper_result = tokio::time::timeout(std::time::Duration::from_secs(10), reaper_task).await;
+    if !matches!(reaper_result, Ok(Ok(()))) {
+        eprintln!("ci-controlplane: reaper did not stop cleanly during shutdown");
+        std::process::exit(1);
+    }
+    match service_result {
         Ok(()) => {}
         Err(e) => {
             // A failed boot / incomplete drain returns non-zero (§3.1) — loud, never swallowed.
             eprintln!("ci-controlplane service failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .unwrap_or_else(|error| {
+                    eprintln!("ci-controlplane: failed to install SIGTERM handler: {error}");
+                    std::process::exit(1);
+                });
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result {
+                    eprintln!("ci-controlplane: failed while waiting for SIGINT: {error}");
+                    std::process::exit(1);
+                }
+            }
+            signal = terminate.recv() => {
+                if signal.is_none() {
+                    eprintln!("ci-controlplane: SIGTERM stream closed unexpectedly");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            eprintln!("ci-controlplane: failed while waiting for shutdown signal: {error}");
             std::process::exit(1);
         }
     }
