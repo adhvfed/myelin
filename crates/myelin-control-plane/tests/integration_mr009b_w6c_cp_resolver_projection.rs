@@ -130,8 +130,10 @@ fn pointer(subject: &str, home: &str) -> CrossCellPointer {
 
 /// The resolver FACTORY: durable endpoint → a live handle. Rejects the sentinel `"unresolvable"`
 /// endpoint (the loud `Unresolvable` path); accepts any other non-empty endpoint.
-fn factory(
-) -> Box<dyn Fn(&CellId, &str) -> Result<Arc<dyn CellLocalResolver>, String> + Send + Sync> {
+type ResolverFactory =
+    dyn Fn(&CellId, &str) -> Result<Arc<dyn CellLocalResolver>, String> + Send + Sync;
+
+fn factory() -> Box<ResolverFactory> {
     Box::new(|_cell: &CellId, endpoint: &str| {
         if endpoint == "unresolvable" {
             return Err("transport client refused the endpoint".into());

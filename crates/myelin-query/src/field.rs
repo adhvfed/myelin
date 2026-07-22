@@ -297,7 +297,7 @@ impl Jitter {
 
     /// The zero jitter (`"00"`) — the lowest possible 2-char suffix. Used where a deterministic,
     /// order-floor suffix is wanted (e.g. a canonical un-jittered comparison anchor in tests).
-    pub const ZERO: Jitter = Jitter([b'0', b'0']);
+    pub const ZERO: Jitter = Jitter(*b"00");
 
     /// Draw a random 2-char jitter from a caller-supplied byte source (e.g. mapped from the
     /// platform RNG). `bytes` supplies two arbitrary bytes; each is reduced mod 62 into the
