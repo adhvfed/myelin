@@ -146,6 +146,13 @@ fn read_ref_generation(cfg: &git2::Config, ref_name: &str) -> Result<u64, Durabl
     }
 }
 
+/// Return the next generation only when it can still round-trip through git-config's signed
+/// integer representation. The receive path uses this before committing its outbox witness, and
+/// the disk apply path uses the same bound before mutating the ref.
+pub(crate) fn next_ref_generation(current: u64) -> Option<u64> {
+    current.checked_add(1).filter(|next| i64::try_from(*next).is_ok())
+}
+
 // ───────────────────────────── one on-disk reflog entry ──────────────────────────────────────────
 
 /// One durable reflog entry read back from the on-disk git reflog. The reflog is durable (it is the
@@ -625,16 +632,6 @@ impl DurableGitRepo {
         committer_pseudonym: &str,
     ) -> Result<(), DurableError> {
         let repo = self.open_git()?;
-        // Set the committer identity on this op so the reflog records the pusher PSEUDONYM (GIT-1)
-        // — libgit2 reads `user.name`/`user.email` for the reflog committer.
-        {
-            let mut cfg = repo.config().map_err(|e| git_err("config", e))?;
-            cfg.set_str("user.name", committer_pseudonym)
-                .map_err(|e| git_err("set user.name", e))?;
-            cfg.set_str("user.email", committer_pseudonym)
-                .map_err(|e| git_err("set user.email", e))?;
-        }
-
         let actual = self.read_ref(name)?;
         let expected_norm = expected.cloned();
         if actual != expected_norm {
@@ -643,6 +640,28 @@ impl DurableGitRepo {
                 expected: expected_norm.map(|o| o.0),
                 actual: actual.map(|o| o.0),
             });
+        }
+
+        // Ref generations live in git-config's signed integer domain. Prove there is capacity BEFORE
+        // mutating the ref; discovering exhaustion after the CAS would leave the tip advanced without
+        // its recovery fence. The receive path performs the same check before its outbox commit.
+        if !matches!((expected, new), (None, None)) {
+            let cfg = repo.config().map_err(|e| git_err("config (refgen preflight)", e))?;
+            let current = read_ref_generation(&cfg, name)?;
+            next_ref_generation(current).ok_or_else(|| {
+                DurableError::Git(format!("ref generation exhausted for {name}"))
+            })?;
+        }
+
+        // Set the committer identity only after the CAS and generation preconditions pass, so a
+        // rejected operation does not mutate repository configuration. Libgit2 reads these values
+        // for the reflog committer (GIT-1).
+        {
+            let mut cfg = repo.config().map_err(|e| git_err("config", e))?;
+            cfg.set_str("user.name", committer_pseudonym)
+                .map_err(|e| git_err("set user.name", e))?;
+            cfg.set_str("user.email", committer_pseudonym)
+                .map_err(|e| git_err("set user.email", e))?;
         }
 
         match (expected, new) {
@@ -702,12 +721,10 @@ impl DurableGitRepo {
         let key = refgen_key(name);
         let mut cfg = repo.config().map_err(|e| git_err("config (refgen)", e))?;
         let current = read_ref_generation(&cfg, name)?;
-        let next = current.checked_add(1).ok_or_else(|| {
+        let next = next_ref_generation(current).ok_or_else(|| {
             DurableError::Git(format!("ref generation exhausted for {name}"))
         })?;
-        let next = i64::try_from(next).map_err(|_| {
-            DurableError::Git(format!("ref generation exceeds git-config range for {name}"))
-        })?;
+        let next = i64::try_from(next).expect("next_ref_generation guarantees signed range");
         cfg.set_i64(&key, next)
             .map_err(|e| git_err(&format!("set refgen for {name}"), e))?;
         Ok(())
@@ -2572,6 +2589,38 @@ mod tests {
         assert_eq!(
             repo.ref_generation(ref_name),
             Err(DurableError::Git(format!("negative ref generation stored for {ref_name}")))
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn exhausted_ref_generation_rejects_before_moving_ref() {
+        let root = temp_root("refgen-exhausted");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let commit = seed_commit(&repo, b"capacity\n");
+        let ref_name = "refs/heads/main";
+        let raw = repo.open_git().expect("open raw repo");
+        raw.config()
+            .expect("open config")
+            .set_i64(&refgen_key(ref_name), i64::MAX)
+            .expect("write exhausted fixture");
+
+        let result = repo.update_ref_cas(
+            ref_name,
+            None,
+            Some(&commit),
+            "must not move",
+            "psn@acme.noreply",
+        );
+        assert!(
+            matches!(result, Err(DurableError::Git(message)) if message.contains("generation exhausted")),
+            "generation exhaustion must be loud"
+        );
+        assert_eq!(
+            repo.read_ref(ref_name).unwrap(),
+            None,
+            "the ref must remain unchanged when its recovery fence cannot advance"
         );
         std::fs::remove_dir_all(&root).ok();
     }
