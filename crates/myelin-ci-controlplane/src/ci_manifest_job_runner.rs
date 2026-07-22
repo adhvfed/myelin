@@ -45,6 +45,8 @@ pub struct CiJobTokenRequest {
     pub lease_owner: String,
     pub lease_epoch: i64,
     pub claim_nonce: String,
+    pub claim_started_at_epoch_secs: i64,
+    pub claim_expires_at_epoch_secs: i64,
 }
 
 /// A token authority refusal. The detail must be structural and safe to journal as an activity
@@ -54,6 +56,48 @@ pub struct CiJobTokenIssueError(pub String);
 
 /// Maximum fail-static window accepted from Identity for a claim-bound CI credential.
 pub const MAX_CI_JOB_TOKEN_TTL_SECS: u64 = 300;
+
+impl CiJobTokenRequest {
+    pub fn validate(&self) -> Result<(), CiJobTokenIssueError> {
+        for (name, value) in [
+            ("workflow run", self.wf_run_id.as_str()),
+            ("CI run", self.ci_run_id.as_str()),
+            ("job", self.job_id.as_str()),
+            ("claim nonce", self.claim_nonce.as_str()),
+        ] {
+            sqlx::types::Uuid::parse_str(value).map_err(|_| {
+                CiJobTokenIssueError(format!("{name} identity is not a canonical UUID"))
+            })?;
+        }
+        if self.tenant_id.trim().is_empty()
+            || self.region.trim().is_empty()
+            || self.token_authority_handle.trim().is_empty()
+            || self.idem_token.trim().is_empty()
+            || self.lease_owner.trim().is_empty()
+            || self.lease_epoch <= 0
+            || self.claim_started_at_epoch_secs <= 0
+            || self.claim_expires_at_epoch_secs <= self.claim_started_at_epoch_secs
+        {
+            return Err(CiJobTokenIssueError(
+                "claim-bound token request has invalid scope or lifetime".into(),
+            ));
+        }
+        let claim_lifetime =
+            u64::try_from(self.claim_expires_at_epoch_secs - self.claim_started_at_epoch_secs)
+                .map_err(|_| {
+                    CiJobTokenIssueError("claim lifetime is outside the supported range".into())
+                })?;
+        if claim_lifetime
+            > u64::try_from(crate::runner_bind::CI_RUNNER_LEASE_TTL_SECS)
+                .expect("the runner lease bound is positive")
+        {
+            return Err(CiJobTokenIssueError(
+                "claim lifetime exceeds the production runner lease bound".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 impl std::fmt::Display for CiJobTokenIssueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -311,5 +355,32 @@ mod tests {
             RunTokenCredential::new("bearer", "jti:overlong", MAX_CI_JOB_TOKEN_TTL_SECS + 1)
                 .unwrap();
         assert!(validate_run_token(&overlong, "mint:1").is_err());
+    }
+
+    #[test]
+    fn token_request_binds_one_bounded_durable_claim_generation() {
+        let request = CiJobTokenRequest {
+            tenant_id: "acme".into(),
+            region: "fr-par".into(),
+            wf_run_id: "10000000-0000-0000-0000-000000000001".into(),
+            ci_run_id: "20000000-0000-0000-0000-000000000001".into(),
+            job_id: "30000000-0000-0000-0000-000000000001".into(),
+            token_authority_handle: "authority:job".into(),
+            idem_token: "idem:job".into(),
+            lease_owner: "runner:1".into(),
+            lease_epoch: 1,
+            claim_nonce: "40000000-0000-0000-0000-000000000001".into(),
+            claim_started_at_epoch_secs: 1_000,
+            claim_expires_at_epoch_secs: 1_300,
+        };
+        request.validate().unwrap();
+
+        let mut overlong = request.clone();
+        overlong.claim_expires_at_epoch_secs =
+            overlong.claim_started_at_epoch_secs + crate::runner_bind::CI_RUNNER_LEASE_TTL_SECS + 1;
+        assert!(overlong.validate().is_err());
+        let mut malformed = request;
+        malformed.claim_nonce = "not-a-uuid".into();
+        assert!(malformed.validate().is_err());
     }
 }

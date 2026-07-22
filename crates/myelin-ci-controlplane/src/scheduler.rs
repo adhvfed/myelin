@@ -80,6 +80,8 @@ pub use myelin_ci_sandbox::TrustTier;
 /// `fair_deficit.deficit DESC` is the DRR fairness term (the ADVANCE is CI-P13); `enqueued_at ASC`
 /// breaks the tie oldest-first. The serialize `NOT EXISTS` is the `deploy:%` one-at-a-time hold. On
 /// claim the row is updated to `leased` with the lease owner + expiry, and the claimed row returned.
+/// The same PostgreSQL statement clock is returned beside the expiry so token issuance can bind a
+/// retry-stable absolute lifetime to this exact claim generation without trusting a process clock.
 ///
 /// **`FOR UPDATE OF q` (not a bare `FOR UPDATE`).** The `fair_deficit` join is a READ-ONLY fairness
 /// hint (left-joined; a missing deficit row defaults to 0). Postgres refuses `FOR UPDATE` on the
@@ -117,13 +119,15 @@ WITH eligible AS (
 UPDATE job_queue j
 SET state = 'leased',
     lease_owner = $4,
-    lease_expires = now() + ($5 || ' seconds')::interval,
+    lease_expires = statement_timestamp() + ($5 || ' seconds')::interval,
     lease_epoch = j.lease_epoch + 1,
     claim_nonce = gen_random_uuid()
 FROM eligible e
 WHERE j.tenant_id = e.tenant_id AND j.job_id = e.job_id
 RETURNING j.tenant_id, j.job_id, j.run_id, j.lane, j.concurrency_group, j.fair_key, j.trust_tier,
-          j.lease_epoch, j.claim_nonce::text AS claim_nonce";
+          j.lease_epoch, j.claim_nonce::text AS claim_nonce,
+          EXTRACT(EPOCH FROM statement_timestamp())::bigint AS claim_started_at_epoch_secs,
+          EXTRACT(EPOCH FROM j.lease_expires)::bigint AS claim_expires_at_epoch_secs";
 
 /// **Cancel-superseded (arch 02 §2.3) — a new push to a PR cancels the in-flight run for that group.**
 /// On a new enqueue for a `pr:%` concurrency group, the prior `queued`/`leased` rows for that group
