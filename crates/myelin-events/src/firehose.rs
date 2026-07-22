@@ -92,6 +92,9 @@
 
 use std::collections::HashMap;
 
+/// Maximum resource-id bytes admitted into a typed firehose scope.
+pub const FIREHOSE_MAX_SCOPE_ID_BYTES: usize = 1024;
+
 /// **A firehose scope — the BOUNDED selector that bounds which frames a subscription receives
 /// (§4.3, contract 3.5).** Scope is a bounded selector, **never `*`**: `board:<id>` / `doc:<id>` /
 /// `channel:<id>` / `inbox:<id>` (Notif's own-inbox slice, §7 / C4). The transport REJECTS an
@@ -177,6 +180,11 @@ impl FirehoseScope {
                 why: "an empty scope is unbounded (it names no resource)",
             });
         }
+        if raw.len() > FIREHOSE_MAX_SCOPE_ID_BYTES + 16 {
+            return Err(FirehoseError::ScopeLimitExceeded {
+                maximum: FIREHOSE_MAX_SCOPE_ID_BYTES,
+            });
+        }
         // The headline rule: `*` (or any `*`-containing scope — `*`, `board:*`, `doc:a*`) is an
         // unbounded subscription and is REJECTED. Checked FIRST so `board:*` reads as over-broad,
         // not a "board id of `*`".
@@ -196,6 +204,11 @@ impl FirehoseScope {
             return Err(FirehoseError::OverBroadScope {
                 scope: raw.to_string(),
                 why: "scope resource id must not be empty",
+            });
+        }
+        if id.len() > FIREHOSE_MAX_SCOPE_ID_BYTES {
+            return Err(FirehoseError::ScopeLimitExceeded {
+                maximum: FIREHOSE_MAX_SCOPE_ID_BYTES,
             });
         }
         let kind = match prefix {
@@ -312,6 +325,11 @@ pub enum FirehoseError {
     },
     /// A tail read would exceed its caller's frame-count or aggregate payload-byte ceiling.
     TailLimitExceeded,
+    /// A scope resource id exceeded the allocation-safe selector ceiling.
+    ScopeLimitExceeded {
+        /// Maximum admitted resource-id bytes.
+        maximum: usize,
+    },
 }
 
 impl FirehoseError {
@@ -323,7 +341,10 @@ impl FirehoseError {
 
     /// `true` iff this is the over-broad-scope rejection (the D-10 drill's `scope = *` leg).
     pub fn is_over_broad_scope(&self) -> bool {
-        matches!(self, FirehoseError::OverBroadScope { .. })
+        matches!(
+            self,
+            FirehoseError::OverBroadScope { .. } | FirehoseError::ScopeLimitExceeded { .. }
+        )
     }
 }
 
@@ -341,6 +362,10 @@ impl core::fmt::Display for FirehoseError {
             FirehoseError::TailLimitExceeded => {
                 f.write_str("firehose tail read limit exceeded")
             }
+            FirehoseError::ScopeLimitExceeded { maximum } => write!(
+                f,
+                "firehose rejects scope resource id longer than {maximum} bytes"
+            ),
         }
     }
 }
@@ -1188,6 +1213,33 @@ mod tests {
                 "a bounded scope round-trips its selector string"
             );
         }
+        let exact = format!("board:{}", "x".repeat(FIREHOSE_MAX_SCOPE_ID_BYTES));
+        assert_eq!(
+            FirehoseScope::parse(&exact)
+                .expect("exact scope limit accepted")
+                .id()
+                .len(),
+            FIREHOSE_MAX_SCOPE_ID_BYTES
+        );
+        assert_eq!(
+            FirehoseScope::parse(&format!(
+                "board:{}",
+                "x".repeat(FIREHOSE_MAX_SCOPE_ID_BYTES + 1)
+            )),
+            Err(FirehoseError::ScopeLimitExceeded {
+                maximum: FIREHOSE_MAX_SCOPE_ID_BYTES,
+            })
+        );
+        assert_eq!(
+            FirehoseScope::parse(&format!(
+                "board:*{}",
+                "x".repeat(FIREHOSE_MAX_SCOPE_ID_BYTES + 32)
+            )),
+            Err(FirehoseError::ScopeLimitExceeded {
+                maximum: FIREHOSE_MAX_SCOPE_ID_BYTES,
+            }),
+            "overlong invalid input is rejected without copying it into an error"
+        );
     }
 
     /// **`run:<run_id>` is admitted as a BOUNDED scope (CI §7.1 / contract 3.5 — the CI live-log
