@@ -27,6 +27,7 @@
 //!   arbitrary oid.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -517,6 +518,7 @@ pub fn evaluate_merge(
 /// [`RepoPathResolver`] (tenant/region path-isolated + traversal-safe).
 pub struct DurablePrStore<P: RepoPathResolver = RootedResolver> {
     resolver: P,
+    write_lock: Mutex<()>,
 }
 
 impl DurablePrStore<RootedResolver> {
@@ -524,6 +526,7 @@ impl DurablePrStore<RootedResolver> {
     pub fn rooted(root: impl Into<PathBuf>) -> Self {
         Self {
             resolver: RootedResolver::new(root),
+            write_lock: Mutex::new(()),
         }
     }
 }
@@ -531,7 +534,10 @@ impl DurablePrStore<RootedResolver> {
 impl<P: RepoPathResolver> DurablePrStore<P> {
     /// Build over a resolver (the placement resolver swaps in here behind the same port).
     pub fn new(resolver: P) -> Self {
-        Self { resolver }
+        Self {
+            resolver,
+            write_lock: Mutex::new(()),
+        }
     }
 
     fn meta_dir(&self, repo: &RepoLoc) -> Result<PathBuf, DurableError> {
@@ -583,6 +589,7 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         repo: &RepoLoc,
         config: &BranchProtectionConfig,
     ) -> Result<(), DurableError> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let dir = self.meta_dir(repo)?;
         let bytes = serde_json::to_vec_pretty(config)
             .map_err(|e| DurableError::Io(format!("serialize branch-protection: {e}")))?;
@@ -619,6 +626,11 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
 
     /// Persist (create or overwrite) a PR record durably (atomic temp-file + rename).
     pub fn put(&self, repo: &RepoLoc, rec: &PrRecord) -> Result<(), DurableError> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.put_unlocked(repo, rec)
+    }
+
+    fn put_unlocked(&self, repo: &RepoLoc, rec: &PrRecord) -> Result<(), DurableError> {
         let dir = self.prs_dir(repo)?;
         let bytes = serde_json::to_vec_pretty(rec)
             .map_err(|e| DurableError::Io(format!("serialize PR {}: {e}", rec.number)))?;
@@ -639,13 +651,31 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
 
     /// Open a NEW PR durably — conflict if the number already exists.
     pub fn open_pr(&self, repo: &RepoLoc, rec: &PrRecord) -> Result<(), DurableError> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.get(repo, rec.number)?.is_some() {
             return Err(DurableError::Git(format!(
                 "PR #{} already exists (conflict)",
                 rec.number
             )));
         }
-        self.put(repo, rec)
+        self.put_unlocked(repo, rec)
+    }
+
+    /// Atomically load, mutate, and replace one PR record under the filesystem store's write lock.
+    /// This is the fallback equivalent of the PostgreSQL row lock used by `apply_mutation`.
+    pub fn update<R>(
+        &self,
+        repo: &RepoLoc,
+        number: u64,
+        mutate: impl FnOnce(&mut PrRecord) -> Result<R, DurableError>,
+    ) -> Result<R, DurableError> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut record = self
+            .get(repo, number)?
+            .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
+        let output = mutate(&mut record)?;
+        self.put_unlocked(repo, &record)?;
+        Ok(output)
     }
 
     /// List every PR record under a repo (durable — loaded from disk).
@@ -991,6 +1021,46 @@ mod tests {
         );
         assert!(back.author_is_agent);
         assert_eq!(back.updated_at, Some(1_752_000_000));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn concurrent_record_updates_preserve_every_mutation() {
+        const WRITERS: usize = 32;
+        let root = temp_root("concurrent-updates");
+        let gitstore = DurableGitStore::rooted(&root);
+        gitstore.create_repo(&loc()).unwrap();
+        let store = Arc::new(DurablePrStore::rooted(&root));
+        store
+            .open_pr(
+                &loc(),
+                &open_record(1, "refs/heads/main", &"a".repeat(40), "psn:author@acme"),
+            )
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(WRITERS));
+        let mut handles = Vec::with_capacity(WRITERS);
+        for writer in 0..WRITERS {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.update(&loc(), 1, |record| {
+                    record.endorsed_contexts.push(format!("ci/writer-{writer}"));
+                    Ok(())
+                })
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("writer must not panic").expect("writer must persist");
+        }
+
+        let record = store.get(&loc(), 1).unwrap().unwrap();
+        assert_eq!(
+            record.endorsed_contexts.len(),
+            WRITERS,
+            "no successful concurrent update may be overwritten"
+        );
+        drop(store);
         std::fs::remove_dir_all(&root).ok();
     }
 
