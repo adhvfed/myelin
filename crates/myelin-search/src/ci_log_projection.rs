@@ -416,7 +416,7 @@ mod tests {
         assert!(
             toks.contains("scheduler"),
             "a path segment is searchable: {:?}",
-            &p.text
+            p.text
         );
         assert!(toks.contains("deadlock"));
         assert!(

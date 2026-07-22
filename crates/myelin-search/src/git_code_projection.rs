@@ -467,7 +467,7 @@ mod tests {
         let toks: std::collections::BTreeSet<&str> = p.text.split(' ').collect();
 
         // camel split + whole identifier (exact-identifier hit).
-        assert!(toks.contains("detect"), "camel part: {:?}", &p.text);
+        assert!(toks.contains("detect"), "camel part: {:?}", p.text);
         assert!(toks.contains("deadlock"), "camel part");
         assert!(
             toks.contains("detectdeadlock"),
@@ -608,7 +608,7 @@ mod tests {
         assert!(
             toks.contains("not"),
             "raw code tokenized verbatim (X-2): {:?}",
-            &p.text
+            p.text
         );
         assert!(toks.contains("markdown"));
         assert!(toks.contains("value"));
