@@ -430,6 +430,14 @@ pub const FILE_LINES_MAX_BLOB_BYTES: usize = 512 * 1024;
 pub const BROWSE_MAX_REFS: usize = 1_000;
 /// Maximum direct refs materialized by smart-HTTP and push-adjacent recovery/audit paths.
 pub const WIRE_MAX_REFS: usize = 100_000;
+/// Maximum entries materialized from one durable reflog during audit/export.
+pub const REFLOG_MAX_ENTRIES_PER_REF: usize = 100_000;
+/// Maximum on-disk bytes libgit2 may parse for one durable reflog during audit/export.
+pub const REFLOG_MAX_BYTES_PER_REF: usize = 32 * 1024 * 1024;
+/// Maximum entries materialized across every ref in one durable audit/export view.
+pub const REFLOG_MAX_TOTAL_ENTRIES: usize = 100_000;
+/// Maximum reflog input/output string bytes materialized by one durable audit/export view.
+pub const REFLOG_MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum entries materialized from one tree directory for an interactive browse response.
 pub const BROWSE_MAX_TREE_ENTRIES: usize = 1_000;
 /// Maximum changed files computed for one interactive pull-request diff.
@@ -911,24 +919,80 @@ impl DurableGitRepo {
     /// **NOT** the durable generation (R0.4 / git #1 HIGH): the reflog is destroyed when a ref is
     /// deleted, so this count RESETS on a delete+recreate while the true generation must keep climbing.
     /// Use [`Self::ref_generation`] for the monotonic per-ref generation / recovery fence.
-    pub fn reflog_len(&self, name: &str) -> usize {
-        let Ok(repo) = self.open_git() else { return 0 };
+    pub fn reflog_len(&self, name: &str) -> Result<usize, DurableError> {
+        if !git2::Reference::is_valid_name(name) {
+            return Err(DurableError::Git("invalid reflog ref name".into()));
+        }
+        let _lock = self.lock_ref_exclusive(name)?;
+        let repo = self.open_git()?;
+        let path = repo.path().join("logs").join(name);
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.len() > REFLOG_MAX_BYTES_PER_REF as u64 => {
+                return Err(DurableError::Git(
+                    "audit reflog limit exceeded: on-disk bytes".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(DurableError::Io(format!("stat reflog {name}: {error}"))),
+        }
         match repo.reflog(name) {
-            Ok(log) => log.len(),
-            Err(_) => 0,
+            Ok(log) if log.len() <= REFLOG_MAX_ENTRIES_PER_REF => Ok(log.len()),
+            Ok(_) => Err(DurableError::Git(
+                "audit reflog limit exceeded: entry count".into(),
+            )),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(0),
+            Err(e) => Err(git_err(&format!("reflog {name}"), e)),
         }
     }
 
-    /// Read a ref's durable on-disk reflog, oldest-first (git stores newest-first; we reverse so the
-    /// Nth entry is the Nth update — the `update_seq` ordering the [`crate::receive_pack::RefStore`]
-    /// view expects).
-    pub fn reflog_entries(&self, name: &str) -> Result<Vec<DurableReflogEntry>, DurableError> {
+    /// Read a ref's durable on-disk reflog, oldest-first (git stores newest-first; we reverse it for
+    /// the [`crate::receive_pack::RefStore`] audit view). The file-size header is checked before
+    /// libgit2 parses the reflog, and the durable generation is captured under the same ref lock.
+    pub(crate) fn reflog_entries_bounded(
+        &self,
+        name: &str,
+        maximum_entries: usize,
+        maximum_bytes: usize,
+    ) -> Result<(Vec<DurableReflogEntry>, usize, u64), DurableError> {
+        if !git2::Reference::is_valid_name(name) {
+            return Err(DurableError::Git("invalid reflog ref name".into()));
+        }
+        // The same cross-process lock gates Myelin's ref writers, so the reflog and its durable
+        // generation are one stable snapshot while libgit2 parses the bounded file.
+        let _lock = self.lock_ref_exclusive(name)?;
         let repo = self.open_git()?;
+        let path = repo.path().join("logs").join(name);
+        let on_disk_bytes = match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.len() > maximum_bytes as u64 => {
+                return Err(DurableError::Git(
+                    "audit reflog limit exceeded: on-disk bytes".into(),
+                ));
+            }
+            Ok(metadata) => usize::try_from(metadata.len()).map_err(|_| {
+                DurableError::Git("audit reflog limit exceeded: on-disk bytes".into())
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let cfg = repo.config().map_err(|e| git_err("config (reflog audit)", e))?;
+                return Ok((Vec::new(), 0, read_ref_generation(&cfg, name)?));
+            }
+            Err(error) => {
+                return Err(DurableError::Io(format!("stat {}: {error}", path.display())));
+            }
+        };
         let log = match repo.reflog(name) {
             Ok(log) => log,
-            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(Vec::new()),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                let cfg = repo.config().map_err(|error| git_err("config (reflog audit)", error))?;
+                return Ok((Vec::new(), 0, read_ref_generation(&cfg, name)?));
+            }
             Err(e) => return Err(git_err(&format!("reflog {name}"), e)),
         };
+        if log.len() > maximum_entries {
+            return Err(DurableError::Git(
+                "audit reflog limit exceeded: entry count".into(),
+            ));
+        }
         let mut out = Vec::with_capacity(log.len());
         // git reflog is stored newest-first; iterate in reverse for oldest-first (update order).
         for entry in log.iter().rev() {
@@ -953,7 +1017,17 @@ impl DurableGitRepo {
                 message: message.to_string(),
             });
         }
-        Ok(out)
+        let observed_bytes = std::fs::metadata(&path)
+            .map_err(|error| DurableError::Io(format!("stat {}: {error}", path.display())))?
+            .len();
+        if observed_bytes != on_disk_bytes as u64 || observed_bytes > maximum_bytes as u64 {
+            return Err(DurableError::Git(
+                "audit reflog changed while it was read".into(),
+            ));
+        }
+        let cfg = repo.config().map_err(|e| git_err("config (reflog audit)", e))?;
+        let generation = read_ref_generation(&cfg, name)?;
+        Ok((out, on_disk_bytes, generation))
     }
 
     // ── working-tree reads + the single-file commit build (GT-003 web-edit) ──
@@ -2894,7 +2968,24 @@ mod tests {
         )
         .expect("ff update");
         assert_eq!(repo.read_ref("refs/heads/main").unwrap(), Some(c2));
-        assert_eq!(repo.reflog_len("refs/heads/main"), 2, "two updates logged");
+        assert_eq!(repo.reflog_len("refs/heads/main"), Ok(2), "two updates logged");
+        assert!(matches!(
+            repo.reflog_entries_bounded("refs/heads/main", 1, REFLOG_MAX_BYTES_PER_REF),
+            Err(DurableError::Git(message))
+                if message == "audit reflog limit exceeded: entry count"
+        ));
+        assert_eq!(
+            repo.reflog_entries_bounded("refs/heads/main", 2, REFLOG_MAX_BYTES_PER_REF)
+                .expect("bounded reflog")
+                .0
+                .len(),
+            2
+        );
+        assert!(matches!(
+            repo.reflog_entries_bounded("refs/heads/main", 2, 1),
+            Err(DurableError::Git(message))
+                if message == "audit reflog limit exceeded: on-disk bytes"
+        ));
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2963,7 +3054,7 @@ mod tests {
         // libgit2 restarts the ref's reflog on recreate — that is the OLD (wrong) generation source.
         assert_eq!(
             repo.reflog_len("refs/heads/tmp"),
-            1,
+            Ok(1),
             "the recreated ref's reflog restarts (libgit2 behaviour — why reflog_len was wrong)"
         );
         // The DURABLE generation does NOT reset — it keeps climbing across the delete (the fix).
@@ -3068,7 +3159,14 @@ mod tests {
         std::fs::write(&path, bytes).expect("corrupt reflog identity fixture");
 
         assert!(
-            matches!(repo.reflog_entries("refs/heads/main"), Err(DurableError::Git(_))),
+            matches!(
+                repo.reflog_entries_bounded(
+                    "refs/heads/main",
+                    10,
+                    REFLOG_MAX_BYTES_PER_REF
+                ),
+                Err(DurableError::Git(_))
+            ),
             "invalid audit identity bytes must not become an empty committer"
         );
         std::fs::remove_dir_all(&root).ok();
