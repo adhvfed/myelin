@@ -43,9 +43,12 @@ use myelin_git::check_status::GitOid;
 use myelin_git::core::{Oid as CoreOid, RepoLoc};
 use myelin_git::durable::{
     BlobPathLookup, CommitDetail, CommitMeta, FileLinesLookup, PrDiff, TreePathLookup,
-    COMMIT_LOG_MAX_OFFSET, FILE_LINES_MAX_RANGE, WIRE_MAX_REFS,
+    COMMIT_LOG_MAX_OFFSET, FILE_LINES_MAX_RANGE, REFS_PAGE_DEFAULT_LIMIT, REFS_PAGE_MAX_LIMIT,
+    REFS_PAGE_MAX_QUERY_BYTES, WIRE_MAX_REFS,
 };
-use myelin_git::durable::{DurableError, DurableGitRepo, DurableGitStore};
+use myelin_git::durable::{
+    DurableError, DurableGitRepo, DurableGitStore, RefKind, RefsPageError, RefsPageRequest,
+};
 use myelin_git::events::pseudonymized_event_principal;
 use myelin_git::lifecycle::{
     BranchProtectionRuleset, PrState, PullRequest, ReviewState, ReviewVerdict,
@@ -64,6 +67,7 @@ use myelin_git::receive_pack::{
     evaluate_protected_ref_push, CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate,
     PushOutcome, PushSession, Pusher, QuarantineMigration, QuarantineObject, RefName, RefStore,
 };
+use myelin_git::refs_pagination::WIRE_MAX_REF_NAME_BYTES;
 use myelin_git::web::{
     CommitDiff, CommitRow, DiffFile, DiffLineView, PrDiffFile, PrDiffHunk, PrDiffLine, PrDiffVM,
     RepoHome, WebEditOutcome,
@@ -1052,26 +1056,61 @@ impl DurableGitBackend {
 
     // ── R3.4 repo-browsing completeness: refs · tree-at-path · nested blob · raw/download ──
 
-    /// The RefsVM for the switcher (`GET /repos/{repo}/refs`) — branches + tags + default_branch, all
-    /// permission-checked by the [`RepoObjectGuard`] (`Pull`) at the route. Reads the on-disk refdb.
-    fn refs_json(&self, tenant: &str, region: &str, slug: &str) -> Result<Value, DurableError> {
+    /// The RefsVM for the switcher (`GET /repos/{repo}/refs`) — the legacy branches/tags/default
+    /// fields plus bounded current/default pins and stable pagination. The route's
+    /// [`RepoObjectGuard`] performs `Pull` authorization before its strict query/cursor parser runs.
+    fn refs_json(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        request: RefsPageRequest,
+    ) -> Result<Value, RefsPageError> {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc)?;
-        let view = repo.refs_view()?;
-        let default_branch = view.default_branch.clone();
-        let branches: Vec<Value> = view
-            .branches
-            .iter()
-            .map(|(name, oid)| {
-                json!({ "name": name, "oid": oid.0, "is_default": *name == default_branch })
+        let limit = request.limit;
+        let page = repo.refs_page(request)?;
+        let default_branch = page.summary.default_branch.clone();
+        let mut branches = Vec::new();
+        let mut tags = Vec::new();
+        for item in page.items {
+            match item.kind {
+                RefKind::Branch => {
+                    let is_default = item.name == default_branch;
+                    branches.push(json!({
+                        "name": item.name,
+                        "oid": item.tip.0,
+                        "is_default": is_default,
+                    }));
+                }
+                RefKind::Tag => tags.push(json!({ "name": item.name, "oid": item.tip.0 })),
+            }
+        }
+        let pinned: Vec<Value> = page
+            .pins
+            .into_iter()
+            .map(|item| {
+                let is_default = item.kind == RefKind::Branch && item.name == default_branch;
+                let kind = match item.kind {
+                    RefKind::Branch => "branch",
+                    RefKind::Tag => "tag",
+                };
+                json!({
+                    "kind": kind,
+                    "full_name": item.full_name,
+                    "name": item.name,
+                    "oid": item.tip.0,
+                    "is_default": is_default,
+                })
             })
             .collect();
-        let tags: Vec<Value> = view
-            .tags
-            .iter()
-            .map(|(name, oid)| json!({ "name": name, "oid": oid.0 }))
-            .collect();
-        Ok(json!({ "branches": branches, "tags": tags, "default_branch": default_branch }))
+        Ok(json!({
+            "branches": branches,
+            "tags": tags,
+            "default_branch": default_branch,
+            "pinned": pinned,
+            "page": { "next_cursor": page.next_cursor, "limit": limit },
+        }))
     }
 
     /// The enriched RepoHomeVM (`GET /repos/{repo}`) — default_branch, full README, latest_commit,
@@ -3515,12 +3554,260 @@ impl Handler for DBlobView {
 struct DRefs {
     be: Arc<DurableGitBackend>,
 }
+
+const REFS_MAX_QUERY_BYTES: usize = 16 * 1024;
+const REFS_MAX_CURSOR_BYTES: usize = 8 * 1024;
+
+fn decode_refs_query_component(raw: &str) -> Result<String, EdgeError> {
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return Err(EdgeError::BadRequest(
+                    "git refs query contains malformed percent encoding".into(),
+                ));
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    let form_value = raw.replace('+', " ");
+    let decoded = percent_encoding::percent_decode_str(&form_value)
+        .decode_utf8()
+        .map_err(|_| EdgeError::BadRequest("git refs query is not valid UTF-8".into()))?
+        .into_owned();
+    if decoded.chars().any(char::is_control) {
+        return Err(EdgeError::BadRequest(
+            "git refs query contains a control character".into(),
+        ));
+    }
+    Ok(decoded)
+}
+
+fn parse_refs_query(query: &str) -> Result<RefsPageRequest, EdgeError> {
+    if query.len() > REFS_MAX_QUERY_BYTES {
+        return Err(EdgeError::BadRequest("git refs query is too large".into()));
+    }
+    if query.is_empty() {
+        return Ok(RefsPageRequest::default());
+    }
+
+    let mut limit = None;
+    let mut cursor = None;
+    let mut q = None;
+    let mut current = None;
+    for pair in query.split('&') {
+        let (raw_name, raw_value) = pair.split_once('=').ok_or_else(|| {
+            EdgeError::BadRequest("malformed git refs query parameter (missing `=`)".into())
+        })?;
+        let name = decode_refs_query_component(raw_name)?;
+        let value = decode_refs_query_component(raw_value)?;
+        if name.is_empty() {
+            return Err(EdgeError::BadRequest(
+                "empty git refs query parameter name".into(),
+            ));
+        }
+        let duplicate = |field: &str| {
+            EdgeError::BadRequest(format!("duplicate git refs query parameter `{field}`"))
+        };
+        match name.as_str() {
+            "limit" => {
+                if limit.is_some() {
+                    return Err(duplicate("limit"));
+                }
+                let parsed = value.parse::<usize>().ok().filter(|parsed| {
+                    value == parsed.to_string() && (1..=REFS_PAGE_MAX_LIMIT).contains(parsed)
+                });
+                limit = Some(parsed.ok_or_else(|| {
+                    EdgeError::BadRequest(format!(
+                        "git refs limit must be canonical and within 1..={REFS_PAGE_MAX_LIMIT}"
+                    ))
+                })?);
+            }
+            "cursor" => {
+                if cursor.is_some() {
+                    return Err(duplicate("cursor"));
+                }
+                if value.is_empty() || value.len() > REFS_MAX_CURSOR_BYTES {
+                    return Err(EdgeError::BadRequest(
+                        "git refs cursor is empty or exceeds its byte limit".into(),
+                    ));
+                }
+                cursor = Some(value);
+            }
+            "q" => {
+                if q.is_some() {
+                    return Err(duplicate("q"));
+                }
+                if value.len() > REFS_PAGE_MAX_QUERY_BYTES {
+                    return Err(EdgeError::BadRequest(
+                        "git refs q exceeds its byte limit".into(),
+                    ));
+                }
+                q = Some(value);
+            }
+            "current" => {
+                if current.is_some() {
+                    return Err(duplicate("current"));
+                }
+                if value.len() > WIRE_MAX_REF_NAME_BYTES {
+                    return Err(EdgeError::BadRequest(
+                        "git refs current exceeds its byte limit".into(),
+                    ));
+                }
+                if !value.starts_with("refs/heads/") && !value.starts_with("refs/tags/") {
+                    return Err(EdgeError::BadRequest(
+                        "git refs current must be a fully-qualified branch or tag ref".into(),
+                    ));
+                }
+                current = Some(value);
+            }
+            other => {
+                return Err(EdgeError::BadRequest(format!(
+                    "unknown git refs query parameter `{other}`"
+                )))
+            }
+        }
+    }
+    Ok(RefsPageRequest {
+        limit: limit.unwrap_or(REFS_PAGE_DEFAULT_LIMIT),
+        query: q,
+        current_ref: current,
+        cursor,
+    })
+}
+
+fn map_refs_page_err(error: RefsPageError) -> EdgeError {
+    match error {
+        RefsPageError::Durable(error) => map_durable_err(error),
+        RefsPageError::CursorStale => {
+            EdgeError::Conflict("git refs cursor is stale; restart pagination".into())
+        }
+        RefsPageError::InvalidLimit { .. } => EdgeError::BadRequest(format!(
+            "git refs limit must be canonical and within 1..={REFS_PAGE_MAX_LIMIT}"
+        )),
+        RefsPageError::QueryTooLong { .. } => {
+            EdgeError::BadRequest("git refs q exceeds its byte limit".into())
+        }
+        RefsPageError::InvalidCurrentRef => EdgeError::BadRequest(
+            "git refs current must be a fully-qualified branch or tag ref".into(),
+        ),
+        RefsPageError::MalformedCursor | RefsPageError::CursorScopeMismatch => {
+            EdgeError::BadRequest("git refs cursor is invalid for this request".into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod refs_query_tests {
+    use super::*;
+
+    #[test]
+    fn refs_query_defaults_and_exact_decoding_are_stable() {
+        assert_eq!(parse_refs_query("").unwrap(), RefsPageRequest::default());
+        let parsed = parse_refs_query(
+            "limit=%37&q=Feature%2FOne&current=refs%2Fheads%2Fmain&cursor=gr1_abc",
+        )
+        .expect("strict decoded query");
+        assert_eq!(parsed.limit, 7);
+        assert_eq!(parsed.query.as_deref(), Some("Feature/One"));
+        assert_eq!(parsed.current_ref.as_deref(), Some("refs/heads/main"));
+        assert_eq!(parsed.cursor.as_deref(), Some("gr1_abc"));
+        assert_eq!(parse_refs_query("q=").unwrap().query.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn refs_query_rejects_noncanonical_and_ambiguous_inputs() {
+        for query in [
+            "limit",
+            "=1",
+            "unknown=1",
+            "q=a&q=b",
+            "q=a&%71=b",
+            "limit=",
+            "cursor=",
+            "current=",
+            "limit=01",
+            "limit=+1",
+            "limit=%2B1",
+            "limit=0",
+            "limit=101",
+            "limit=-1",
+            "limit=1.0",
+            "q=%00",
+            "q=%FF",
+            "q=%",
+            "current=main",
+            "current=refs%2Fremotes%2Forigin%2Fmain",
+            "q=a&&limit=1",
+        ] {
+            assert!(
+                matches!(parse_refs_query(query), Err(EdgeError::BadRequest(_))),
+                "query must fail closed: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn refs_query_component_and_total_byte_limits_are_exact() {
+        parse_refs_query(&format!("q={}", "x".repeat(REFS_PAGE_MAX_QUERY_BYTES)))
+            .expect("exact q bound");
+        parse_refs_query(&format!("cursor={}", "x".repeat(REFS_MAX_CURSOR_BYTES)))
+            .expect("exact cursor bound");
+        let current = format!(
+            "refs/heads/{}",
+            "x".repeat(WIRE_MAX_REF_NAME_BYTES - "refs/heads/".len())
+        );
+        parse_refs_query(&format!("current={current}")).expect("exact current bound");
+
+        for query in [
+            format!("q={}", "x".repeat(REFS_PAGE_MAX_QUERY_BYTES + 1)),
+            format!("cursor={}", "x".repeat(REFS_MAX_CURSOR_BYTES + 1)),
+            format!("current={current}x"),
+            "x".repeat(REFS_MAX_QUERY_BYTES + 1),
+        ] {
+            assert!(matches!(
+                parse_refs_query(&query),
+                Err(EdgeError::BadRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn refs_cursor_errors_map_to_scoped_statuses() {
+        for error in [
+            RefsPageError::MalformedCursor,
+            RefsPageError::CursorScopeMismatch,
+            RefsPageError::InvalidCurrentRef,
+            RefsPageError::InvalidLimit { supplied: 0 },
+        ] {
+            assert_eq!(map_refs_page_err(error).status(), 400);
+        }
+        assert_eq!(map_refs_page_err(RefsPageError::CursorStale).status(), 409);
+        assert_eq!(
+            map_refs_page_err(RefsPageError::Durable(DurableError::NotFound(
+                "missing".into()
+            )))
+            .status(),
+            404
+        );
+    }
+}
+
 impl Handler for DRefs {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        // Registration wraps this handler in `RepoObjectGuard(Pull)`, so authorization has already
+        // succeeded before any query or cursor diagnostic becomes observable.
+        let request = parse_refs_query(&ctx.request.query)?;
         let vm = self
             .be
-            .refs_json(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?)
-            .map_err(map_durable_err)?;
+            .refs_json(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?, request)
+            .map_err(map_refs_page_err)?;
         Ok(EdgeResponse::json(200, &vm))
     }
 }

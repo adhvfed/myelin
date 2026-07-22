@@ -259,6 +259,29 @@ impl Harness {
         (status, v)
     }
 
+    fn call_query(
+        &self,
+        subject_key: &str,
+        method: &str,
+        path: &str,
+        query: &str,
+    ) -> (u16, serde_json::Value) {
+        let (scheme, token) = self.token(subject_key, false);
+        let resp = self.gw.handle(EdgeRequest::new(
+            method,
+            path,
+            query,
+            vec![
+                ("authorization".into(), format!("Bearer {token}")),
+                ("x-myelin-token-scheme".into(), scheme),
+            ],
+            vec![],
+        ));
+        let status = resp.status();
+        let body = resp.json_body().unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
     /// Write one raw relation tuple `repo:<slug>#<relation>@<principal_id>` through the ordinary
     /// 4.6 write path (the same store the checker reads).
     fn write_relation(&self, principal_id: &str, relation: &str, slug: &str) {
@@ -346,6 +369,17 @@ fn ungranted_in_tenant_principal_is_denied_on_every_object_route() {
             "the deny body must be indistinguishable from an absent repo ({path}): {v}"
         );
     }
+
+    // Guard ordering is security-sensitive: an ungranted reader sees the uniform 404 before the
+    // refs handler can reveal that its cursor/query is malformed (which would otherwise be a 400).
+    let (status, body) = h.call_query(
+        "subj-mallory",
+        "GET",
+        "/v1/git/repos/alpha/refs",
+        "limit=01&cursor=not-a-cursor",
+    );
+    assert_eq!(status, 404, "Pull deny must precede refs parsing: {body}");
+    assert_eq!(body["error"]["message"], "repository not found");
 
     // WRITE-class → fail-closed 403 (push permission).
     for (path, body) in [
