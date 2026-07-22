@@ -151,7 +151,7 @@ fn ref_written_through_refstore_survives_a_fresh_refstore_over_the_same_root() {
         "the commit object survived the restart in the on-disk odb"
     );
     // The reflog survived too (durable on-disk git reflog).
-    let reflog = refstore2.reflog();
+    let reflog = refstore2.reflog().expect("read durable reflog");
     assert_eq!(reflog.len(), 1, "the reflog entry survived the restart");
     assert_eq!(reflog[0].new_oid, commit);
     assert!(reflog[0].pusher_pseudonym.contains("acme.noreply"));
