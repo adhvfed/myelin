@@ -251,10 +251,11 @@ impl LeaseStore for DurableLeaseAdapter {
 /// **The bounded CI runner loop (CT-004c.2) — the service `main` spawns it (arch 00 §4).** Owns the
 /// durable lease adapter's inputs, a REAL [`GvisorBackend`] (untrusted code runs in a `runsc` guest —
 /// the AG-D4 gate), the firehose stub, the PostgreSQL-only `job.done` reporter,
-/// and the four-guarantee hooks. [`run`](Self::run) constructs the [`RunnerAgent`] on its own thread
-/// and loops `run_one` with backoff. Mirrors [`JobQueueReaper`](crate::JobQueueReaper): a bounded
-/// background driver, no new `AppSpec` field, LOUD on failure and resilient (a launch failure logs and
-/// continues; the §OQ-F dispatch retry re-runs the job).
+/// and the four-guarantee hooks. [`run_until_shutdown`](Self::run_until_shutdown) constructs the
+/// [`RunnerAgent`] on its own thread and loops `run_one` with shutdown-aware backoff. Mirrors
+/// [`JobQueueReaper`](crate::JobQueueReaper): a bounded background driver, no new `AppSpec` field,
+/// LOUD on failure and resilient (a launch failure logs and continues; the §OQ-F dispatch retry
+/// re-runs the job).
 ///
 /// The reporter re-encodes the runner-derived verdict and atomically buffers it in PostgreSQL. A
 /// tenant/region/partition-scoped [`myelin_flow::PgFlowWorker`] wakes and consumes that one durable
@@ -276,7 +277,7 @@ pub struct CiRunnerLoop {
     // CT-004f sub-step 5: the durable log path the live runner seals captured job output through. The
     // pool + S3 config build the `LogPipelineSink` (per-(tenant,run,job) LogPipeline over the real
     // S3 CAS) + `DurableLogPersist` (the log_segment/log_anchor writer + ci.log.available outbox emit)
-    // INSIDE `run()` on the dedicated runner thread (the LogPipeline is non-Send).
+    // INSIDE the run driver on the dedicated runner thread (the LogPipeline is non-Send).
     pool: sqlx::postgres::PgPool,
     s3: myelin_config::S3Config,
 }
@@ -336,13 +337,27 @@ impl CiRunnerLoop {
 
     /// **Spawn the loop on a DEDICATED OS thread (off the tokio runtime).** The runner blocks for the
     /// whole in-line `runsc` job and the adapter bridges its DB calls onto `rt`; running off-runtime
-    /// keeps `block_on` correct and never starves a tokio worker. Returns the join handle (the loop
-    /// runs until the process exits, like the reaper).
+    /// keeps `block_on` correct and never starves a tokio worker. This legacy forever-loop entry is
+    /// retained for deterministic callers; production uses [`Self::spawn_until_shutdown`].
     pub fn spawn(self) -> std::thread::JoinHandle<()> {
         std::thread::Builder::new()
             .name("ci-runner".into())
             .spawn(move || self.run())
             .expect("spawn the ci-runner thread")
+    }
+
+    /// Spawn the production loop on a dedicated thread with an explicit lifecycle signal. A
+    /// shutdown received during a sandbox launch lets that in-flight job finish, then prevents the
+    /// next claim. Idle/error backoff observes shutdown within
+    /// [`RUNNER_SHUTDOWN_POLL_INTERVAL`].
+    pub fn spawn_until_shutdown(
+        self,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::Builder::new()
+            .name("ci-runner".into())
+            .spawn(move || self.run_until_shutdown(shutdown))
+            .expect("spawn the shutdown-aware ci-runner thread")
     }
 
     /// **Run the claim → launch → `job.done` cycle forever (until the process stops).** Constructs the
@@ -351,6 +366,18 @@ impl CiRunnerLoop {
     /// `LaunchFailed`/`ReportFailed` is logged LOUD and sleeps `error_backoff` (the dispatch activity
     /// retries the job, §OQ-F). Never reimplements any sandbox logic.
     pub fn run(self) {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        self.run_until_shutdown(shutdown_rx);
+    }
+
+    /// Run claim → launch → `job.done` cycles until explicit shutdown or sender closure. Shutdown is
+    /// checked before constructing live adapters and before every claim. It never kills a job midway:
+    /// an already-running sandbox remains bounded by its job timeout and drains before this loop
+    /// returns.
+    pub fn run_until_shutdown(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        if runner_shutdown_requested(&mut shutdown) {
+            return;
+        }
         let CiRunnerLoop {
             worker_id,
             labels,
@@ -400,6 +427,9 @@ impl CiRunnerLoop {
              claiming from the durable job_queue + executing in gVisor (AG-D4)"
         );
         loop {
+            if runner_shutdown_requested(&mut shutdown) {
+                return;
+            }
             match agent.run_one(now_secs()) {
                 Ok(o) => {
                     eprintln!(
@@ -407,7 +437,11 @@ impl CiRunnerLoop {
                         o.job_id, o.run_id, o.report.passed, o.signal_outcome
                     );
                 }
-                Err(RunnerError::NoWork) => std::thread::sleep(idle_backoff),
+                Err(RunnerError::NoWork) => {
+                    if runner_sleep_until_shutdown(&mut shutdown, idle_backoff) {
+                        return;
+                    }
+                }
                 Err(RunnerError::LeaseLost { job_id }) => {
                     // Another worker reclaimed the lease (the reaper re-queued it) — a clean retry;
                     // this runner did NOT run the job (the Step-2 double-run guard, fail-closed).
@@ -422,14 +456,50 @@ impl CiRunnerLoop {
                         "ci-runner[{worker_id}]: launch FAILED (fail-closed, no terminal report; \
                          the dispatch retries): {e}"
                     );
-                    std::thread::sleep(error_backoff);
+                    if runner_sleep_until_shutdown(&mut shutdown, error_backoff) {
+                        return;
+                    }
                 }
                 Err(e @ RunnerError::ReportFailed(_)) => {
                     eprintln!("ci-runner[{worker_id}]: terminal report FAILED (surfaced): {e}");
-                    std::thread::sleep(error_backoff);
+                    if runner_sleep_until_shutdown(&mut shutdown, error_backoff) {
+                        return;
+                    }
                 }
             }
         }
+    }
+}
+
+/// Maximum time an idle runner can take to observe shutdown. Active jobs drain under their own
+/// timeout instead of being killed midway.
+pub const RUNNER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+fn runner_shutdown_requested(shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    if *shutdown.borrow_and_update() {
+        return true;
+    }
+    match shutdown.has_changed() {
+        Ok(true) => *shutdown.borrow_and_update(),
+        Ok(false) => false,
+        Err(_) => true,
+    }
+}
+
+fn runner_sleep_until_shutdown(
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    duration: Duration,
+) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if runner_shutdown_requested(shutdown) {
+            return true;
+        }
+        let remaining = duration.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(remaining.min(RUNNER_SHUTDOWN_POLL_INTERVAL));
     }
 }
 
@@ -502,4 +572,27 @@ pub fn durable_spec_resolver(
         validate_run_token(&run_token, &launch.token_authority_handle).map_err(|e| e.0)?;
         Ok(launch.spec.resolve(run_token))
     })
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn pre_signalled_shutdown_interrupts_backoff_without_sleeping() {
+        let (_sender, mut receiver) = tokio::sync::watch::channel(true);
+        let started = std::time::Instant::now();
+        assert!(runner_sleep_until_shutdown(
+            &mut receiver,
+            Duration::from_secs(2)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn sender_closure_is_shutdown() {
+        let (sender, mut receiver) = tokio::sync::watch::channel(false);
+        drop(sender);
+        assert!(runner_shutdown_requested(&mut receiver));
+    }
 }
