@@ -428,6 +428,8 @@ pub const FILE_LINES_MAX_RANGE: usize = 1_000;
 pub const FILE_LINES_MAX_BLOB_BYTES: usize = 512 * 1024;
 /// Maximum refs materialized for an interactive browse response.
 pub const BROWSE_MAX_REFS: usize = 1_000;
+/// Maximum direct refs materialized by smart-HTTP and push-adjacent recovery/audit paths.
+pub const WIRE_MAX_REFS: usize = 100_000;
 /// Maximum entries materialized from one tree directory for an interactive browse response.
 pub const BROWSE_MAX_TREE_ENTRIES: usize = 1_000;
 /// Maximum changed files computed for one interactive pull-request diff.
@@ -1312,7 +1314,7 @@ impl DurableGitRepo {
             return Ok(());
         }
         let branches: Vec<String> = self
-            .list_refs()?
+            .list_refs_bounded(WIRE_MAX_REFS)?
             .into_iter()
             .filter_map(|(n, _)| n.strip_prefix("refs/heads/").map(str::to_string))
             .collect();

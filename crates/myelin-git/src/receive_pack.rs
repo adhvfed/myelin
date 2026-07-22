@@ -901,7 +901,7 @@ impl RefStore {
                 // Assemble the per-ref durable reflogs into the RefStore view, oldest-first per ref,
                 // with the monotonic `update_seq` = the entry's 1-based position in that ref's reflog.
                 let mut out = Vec::new();
-                for (name, _tip) in repo.list_refs()? {
+                for (name, _tip) in repo.list_refs_bounded(crate::durable::WIRE_MAX_REFS)? {
                     for (i, e) in repo.reflog_entries(&name)?.into_iter().enumerate() {
                         out.push(ReflogEntry {
                             ref_name: RefName::new(name.clone()),
