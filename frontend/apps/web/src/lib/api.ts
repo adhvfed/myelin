@@ -10,6 +10,17 @@ import {
   type IssueMutation,
   type PrMutation,
 } from "./mutation-input";
+import {
+  hasAppliedAction,
+  parseAppliedComment,
+  parseAppliedMerge,
+  parseAppliedReview,
+  parseAppliedThread,
+  parseIssue,
+  parseIssueAuthorizationStatus,
+  parseIssueCreateReceipt,
+  parsePrChecks,
+} from "./mutation-response";
 
 export type { IssueMutation, PrMutation } from "./mutation-input";
 
@@ -730,23 +741,32 @@ export const issuesMutate = action(async (mutation: IssueMutation) => {
     if (!parsed) return result({ ok: false, error: "bad-input" });
     if (parsed.op === "create") {
       const target = dogfoodIssueTarget();
-      const receipt = await issueAuthed(() =>
-        edgePost<IssueCreateReceipt>("/v1/issues", { ...target, title: parsed.title }),
-      );
+      const receipt = await issueAuthed(async () => {
+        const response = await edgePost("/v1/issues", { ...target, title: parsed.title });
+        const decoded = parseIssueCreateReceipt(response);
+        if (!decoded) throw new IssueRouteError("error");
+        return decoded;
+      });
       return result({ ok: true, op: "create", receipt });
     }
     if (parsed.op === "activation") {
-      const status = await issueAuthed(() =>
-        edgeGet<IssueAuthorizationStatus>(
+      const status = await issueAuthed(async () => {
+        const response = await edgeGet(
           `/v1/issues/authorization-requests/${seg(parsed.requestEventId)}`,
           { timeoutMs: ISSUE_ACTIVATION_STATUS_TIMEOUT_MS },
-        ),
-      );
+        );
+        const decoded = parseIssueAuthorizationStatus(response);
+        if (!decoded) throw new IssueRouteError("error");
+        return decoded;
+      });
       return result({ ok: true, op: "activation", status });
     }
-    const issue = await issueAuthed(() =>
-      edgePost<IssueVM>(`/v1/issues/${seg(parsed.issueId)}/close`, {}),
-    );
+    const issue = await issueAuthed(async () => {
+      const response = await edgePost(`/v1/issues/${seg(parsed.issueId)}/close`, {});
+      const decoded = parseIssue(response);
+      if (!decoded) throw new IssueRouteError("error");
+      return decoded;
+    });
     return result({ ok: true, op: "close", issue });
   } catch (e) {
     if (e instanceof IssueRouteError) return result({ ok: false, error: e.kind });
@@ -791,43 +811,58 @@ export const prMutate = action(async (m: PrMutation): Promise<PrMutationResult> 
   return authed(async () => {
     switch (parsed.op) {
       case "thread": {
-        const r = await edgePost<{ applied: { thread: PrThreadVM } }>(`${base}/threads`, {
+        const response = await edgePost(`${base}/threads`, {
           body_md: parsed.body_md,
           ...(parsed.anchor ? { anchor: parsed.anchor } : {}),
         });
-        return { thread: r.applied.thread };
+        const thread = parseAppliedThread(response);
+        if (!thread) throw new RepoRouteError("error");
+        return { thread };
       }
       case "comment": {
-        const r = await edgePost<{ applied: { comment: PrCommentVM } }>(`${base}/threads/${seg(parsed.threadId)}/comments`, { body_md: parsed.body_md });
-        return { comment: r.applied.comment };
+        const response = await edgePost(`${base}/threads/${seg(parsed.threadId)}/comments`, { body_md: parsed.body_md });
+        const comment = parseAppliedComment(response, "git.pr.comment.create");
+        if (!comment) throw new RepoRouteError("error");
+        return { comment };
       }
       case "review-start": {
-        const r = await edgePost<{ applied: { review: PrReviewVM } }>(`${base}/reviews/start`, {});
-        return { review: r.applied.review };
+        const response = await edgePost(`${base}/reviews/start`, {});
+        const review = parseAppliedReview(response);
+        if (!review) throw new RepoRouteError("error");
+        return { review };
       }
       case "review-comment": {
-        const r = await edgePost<{ applied: { comment: PrCommentVM } }>(`${base}/reviews/${seg(parsed.reviewId)}/comments`, { body_md: parsed.body_md });
-        return { comment: r.applied.comment };
+        const response = await edgePost(`${base}/reviews/${seg(parsed.reviewId)}/comments`, { body_md: parsed.body_md });
+        const comment = parseAppliedComment(response, "git.pr.review.comment");
+        if (!comment) throw new RepoRouteError("error");
+        return { comment };
       }
       case "review-submit": {
-        await edgePost(`${base}/reviews/${seg(parsed.reviewId)}/submit`, { verdict: parsed.verdict, summary_md: parsed.summary_md });
+        const response = await edgePost(`${base}/reviews/${seg(parsed.reviewId)}/submit`, { verdict: parsed.verdict, summary_md: parsed.summary_md });
+        if (!hasAppliedAction(response, "git.pr.review.submit")) throw new RepoRouteError("error");
         return { ok: true };
       }
       case "review-discard": {
-        await edgePost(`${base}/reviews/${seg(parsed.reviewId)}/discard`, {});
+        const response = await edgePost(`${base}/reviews/${seg(parsed.reviewId)}/discard`, {});
+        if (!hasAppliedAction(response, "git.pr.review.discard")) throw new RepoRouteError("error");
         return { ok: true };
       }
       case "merge": {
         try {
-          const r = await edgePost<{ applied: { base_ref: string; new_oid: string } }>(
+          const response = await edgePost(
             `${base}/merge`,
             {},
             { idempotencyKey: crypto.randomUUID() },
           );
-          return { blocked: false, base_ref: r.applied.base_ref, new_oid: r.applied.new_oid };
+          const merged = parseAppliedMerge(response);
+          if (!merged) throw new RepoRouteError("error");
+          return { blocked: false, ...merged };
         } catch (e) {
           if (e instanceof GatewayError && e.status === 409) {
-            const checks = (e.body as { checks?: PrChecksVM } | undefined)?.checks ?? null;
+            const body = e.body !== null && typeof e.body === "object" && !Array.isArray(e.body)
+              ? e.body as Record<string, unknown>
+              : null;
+            const checks = parsePrChecks(body?.checks);
             return { blocked: true, checks };
           }
           throw e;

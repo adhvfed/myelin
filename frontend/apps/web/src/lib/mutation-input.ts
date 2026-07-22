@@ -24,7 +24,7 @@ export type PrMutation =
 export interface PrAnchor {
   path: string;
   line: number;
-  side?: "old" | "new";
+  side: "old" | "new";
 }
 
 type ReviewVerdict = "approved" | "changes_requested" | "commented";
@@ -99,11 +99,11 @@ function parseAnchor(value: unknown): PrAnchor | null {
   const input = record(value);
   if (!input || !exactKeys(input, ["path", "line", "side"]) ||
       !gitPath(input.path) || !prNumber(input.line) ||
-      (input.side !== undefined && input.side !== "old" && input.side !== "new")) return null;
+      (input.side !== "old" && input.side !== "new")) return null;
   return {
     path: input.path,
     line: input.line,
-    ...(input.side === undefined ? {} : { side: input.side }),
+    side: input.side,
   };
 }
 

@@ -619,8 +619,15 @@ export function devPost(repo, n, tail, body, viewer = "u_dev_operator@acme.norep
   const id = (p) => `${p}-${++threadSeq}`;
   // POST …/threads
   if (tail === "threads") {
-    // A line-anchored comment carries `{ anchor: { path, line, side? } }`; a discussion comment has none.
-    const anchor = body.anchor ? { path: body.anchor.path, line: body.anchor.line ?? null, anchor_state: "live" } : null;
+    // A line-anchored comment is bound to the displayed side and immutable revision pair.
+    const anchor = body.anchor ? {
+      path: body.anchor.path,
+      line: body.anchor.line ?? null,
+      side: body.anchor.side,
+      base_oid: C1,
+      head_oid: C2,
+      anchor_state: "live",
+    } : null;
     const thread = { id: id("t"), anchor, resolved: false, comments: [
       { id: id("c"), author: who, body_md: body.body_md, created_at: 1719450000, edited_at: null, state: "visible", review_id: null, pending: false },
     ] };
