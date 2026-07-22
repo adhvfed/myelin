@@ -86,7 +86,7 @@ serde_json = { workspace = true }
 # fail-loud) are regular deps. Build stays DB-free: connecting happens at RUNTIME, never at build.
 myelin-storage = { path = "../myelin-storage" }
 myelin-config = { path = "../myelin-config" }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 # REAL Postgres raw-sqlx test harness behind the `integration` feature (Stage 1 / infra): pulled
 # ONLY by `--features integration` (tests/integration_notif_schema.rs against the docker dev
 # stack). The default `cargo build --workspace` stays DB-free (the binding-policy floor).

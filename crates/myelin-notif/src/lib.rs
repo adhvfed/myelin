@@ -580,6 +580,19 @@ pub fn run_notif(config: Config, outbox: OutboxStore) -> Result<(), ServeError> 
     serve(notif_app_spec(config, outbox))
 }
 
+/// Keep the production service live until explicit shutdown, then stop intake and drain through the
+/// shared harness. [`run_notif`] remains the deterministic one-tick shell-test entry.
+pub async fn run_notif_until_shutdown<F>(
+    config: Config,
+    outbox: OutboxStore,
+    shutdown: F,
+) -> Result<(), ServeError>
+where
+    F: std::future::Future<Output = ()>,
+{
+    myelin_substrate::serve_until_shutdown(notif_app_spec(config, outbox), shutdown).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,6 +663,14 @@ mod tests {
             handle.metrics_health().readiness().verdict,
             Readiness::Ready,
             "a booted notif instance (migrations applied, deps up) is ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_notif_waits_for_shutdown_then_drains() {
+        assert_eq!(
+            run_notif_until_shutdown(Config::default(), OutboxStore::new(), async {}).await,
+            Ok(())
         );
     }
 

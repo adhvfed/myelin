@@ -2,10 +2,11 @@
 //!
 //! The "every service `main.rs`" the contract-index row 1.1 names: it composes the DURABLE
 //! composition root (MR-009b W3b.4) and hands the Notif [`AppSpec`](myelin_notif::notif_app_spec)
-//! to the harness's one call, [`run_notif`](myelin_notif::run_notif) (a thin wrapper over
-//! `serve`). The harness owns the whole lifecycle (boot → migrate → outbox relay → consumers →
-//! three ports → graceful drain, with liveness ≠ readiness); this `main` composes and hands off —
-//! no hand-rolled lifecycle logic.
+//! to the harness's one call,
+//! [`run_notif_until_shutdown`](myelin_notif::run_notif_until_shutdown) (a thin wrapper over
+//! `serve_until_shutdown`). The harness owns the whole lifecycle (boot → migrate → outbox relay →
+//! consumers → three ports → graceful drain, with liveness ≠ readiness); this `main` composes and
+//! hands off — no hand-rolled lifecycle logic.
 //!
 //! **DURABLE-BY-DEFAULT (MR-009b W3b.4 / SI-007):** the outbox the relay drains is the PG-backed
 //! `outbox` table (`OutboxStore::durable(PgOutboxBacking)`) over the MR-022 `SubstrateProvider`
@@ -22,7 +23,7 @@
 
 use myelin_config::Mode;
 use myelin_events::OutboxStore;
-use myelin_notif::{migrations::migrations as notif_migrations, run_notif};
+use myelin_notif::{migrations::migrations as notif_migrations, run_notif_until_shutdown};
 use myelin_storage::{all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking};
 use myelin_substrate::Config;
 use std::sync::Arc;
@@ -80,11 +81,44 @@ async fn main() {
     )));
     // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
     // shell boots over the validated default today (the durable config is the provider's above).
-    match run_notif(Config::default(), outbox) {
+    match run_notif_until_shutdown(Config::default(), outbox, shutdown_signal()).await {
         Ok(()) => {}
         Err(e) => {
             // A failed boot / incomplete drain returns non-zero (§3.1) — loud, never swallowed.
             eprintln!("notif service failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .unwrap_or_else(|error| {
+                    eprintln!("notif: failed to install SIGTERM handler: {error}");
+                    std::process::exit(1);
+                });
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result {
+                    eprintln!("notif: failed while waiting for SIGINT: {error}");
+                    std::process::exit(1);
+                }
+            }
+            signal = terminate.recv() => {
+                if signal.is_none() {
+                    eprintln!("notif: SIGTERM stream closed unexpectedly");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            eprintln!("notif: failed while waiting for shutdown signal: {error}");
             std::process::exit(1);
         }
     }
