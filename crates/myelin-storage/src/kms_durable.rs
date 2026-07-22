@@ -239,8 +239,10 @@ impl DurableKmsBacking {
             Some(sealed) => {
                 // A root EXISTS → it MUST unseal under the seal key. Fail-closed + LOUD otherwise;
                 // NEVER generate a new root (that would orphan every existing ciphertext).
-                CellRoot::unseal(seal_key, &sealed).ok_or_else(|| KmsDurableError::WrongSealKey {
-                    cell_id: self.cell_id.clone(),
+                CellRoot::unseal(seal_key, &sealed).ok_or_else(|| {
+                    KmsDurableError::WrongSealKey {
+                        cell_id: self.cell_id.clone(),
+                    }
                 })?
             }
             None => {
@@ -254,8 +256,10 @@ impl DurableKmsBacking {
                         "sealed cell root vanished immediately after insert".into(),
                     ))
                 })?;
-                CellRoot::unseal(seal_key, &stored).ok_or_else(|| KmsDurableError::WrongSealKey {
-                    cell_id: self.cell_id.clone(),
+                CellRoot::unseal(seal_key, &stored).ok_or_else(|| {
+                    KmsDurableError::WrongSealKey {
+                        cell_id: self.cell_id.clone(),
+                    }
                 })?
             }
         };
@@ -277,14 +281,15 @@ impl DurableKmsBacking {
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| PgError::Query(e.to_string()))?;
-        Ok(row.map(|r| {
-            let nonce: Vec<u8> = r.get("nonce");
-            let ciphertext: Vec<u8> = r.get("ciphertext");
-            SealedRoot {
-                nonce: nonce_from(&nonce),
+        row.map(|row| {
+            let nonce: Vec<u8> = row.try_get("nonce").map_err(kms_row_decode)?;
+            let ciphertext: Vec<u8> = row.try_get("ciphertext").map_err(kms_row_decode)?;
+            Ok(SealedRoot {
+                nonce: nonce_from(&nonce)?,
                 ciphertext,
-            }
-        }))
+            })
+        })
+        .transpose()
     }
 
     async fn insert_sealed_root_if_absent(&self, sealed: &SealedRoot) -> Result<(), PgError> {
@@ -325,15 +330,15 @@ impl DurableKmsBacking {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| PgError::Query(e.to_string()))?;
-        for r in rows {
-            let tenant: String = r.get("tenant_id");
-            let region: String = r.get("region");
-            let nonce: Vec<u8> = r.get("nonce");
-            let wrapped: Vec<u8> = r.get("wrapped");
-            let epoch: i64 = r.get("epoch");
+        for row in rows {
+            let tenant: String = row.try_get("tenant_id").map_err(kms_row_decode)?;
+            let region: String = row.try_get("region").map_err(kms_row_decode)?;
+            let nonce: Vec<u8> = row.try_get("nonce").map_err(kms_row_decode)?;
+            let wrapped: Vec<u8> = row.try_get("wrapped").map_err(kms_row_decode)?;
+            let epoch: i64 = row.try_get("epoch").map_err(kms_row_decode)?;
             core.install_wrapped_kek(
                 KekId::new(TenantId(tenant), Region(region)),
-                nonce_from(&nonce),
+                nonce_from(&nonce)?,
                 wrapped,
                 epoch as u64,
             );
@@ -383,13 +388,15 @@ impl DurableKmsBacking {
     }
 
     async fn delete_kek_row(&self, id: &KekId) -> Result<(), PgError> {
-        sqlx::query("DELETE FROM kms_wrapped_kek WHERE cell_id = $1 AND tenant_id = $2 AND region = $3")
-            .bind(&self.cell_id)
-            .bind(id.tenant.as_str())
-            .bind(id.region.as_str())
-            .execute(&self.pool)
-            .await
-            .map_err(|e| PgError::Query(e.to_string()))?;
+        sqlx::query(
+            "DELETE FROM kms_wrapped_kek WHERE cell_id = $1 AND tenant_id = $2 AND region = $3",
+        )
+        .bind(&self.cell_id)
+        .bind(id.tenant.as_str())
+        .bind(id.region.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -404,20 +411,20 @@ impl DurableKmsBacking {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| PgError::Query(e.to_string()))?;
-        for r in rows {
-            let tenant: String = r.get("tenant_id");
-            let class_token: String = r.get("class");
+        for row in rows {
+            let tenant: String = row.try_get("tenant_id").map_err(kms_row_decode)?;
+            let class_token: String = row.try_get("class").map_err(kms_row_decode)?;
             let class = KeyClass::parse_token(&class_token).ok_or_else(|| {
-                PgError::Query(format!("corrupt DEK class token in kms_wrapped_dek: {class_token}"))
+                PgError::Query("kms_wrapped_dek row has an invalid key class".to_string())
             })?;
-            let nonce: Vec<u8> = r.get("nonce");
-            let wrapped: Vec<u8> = r.get("wrapped");
-            let kek_epoch: i64 = r.get("kek_epoch");
-            let dek_epoch: i64 = r.get("dek_epoch");
+            let nonce: Vec<u8> = row.try_get("nonce").map_err(kms_row_decode)?;
+            let wrapped: Vec<u8> = row.try_get("wrapped").map_err(kms_row_decode)?;
+            let kek_epoch: i64 = row.try_get("kek_epoch").map_err(kms_row_decode)?;
+            let dek_epoch: i64 = row.try_get("dek_epoch").map_err(kms_row_decode)?;
             core.install_wrapped_dek(
                 DekId::new(TenantId(tenant), class),
                 WrappedDek {
-                    nonce: nonce_from(&nonce),
+                    nonce: nonce_from(&nonce)?,
                     wrapped,
                     kek_epoch: kek_epoch as u64,
                 },
@@ -482,9 +489,12 @@ impl DurableKmsBacking {
             .map_err(|e| PgError::Query(e.to_string()))?;
         self.upsert_kek_row_on(&mut *tx, id, kek).await?;
         for (dek_id, w, dek_epoch) in deks {
-            self.upsert_dek_row_on(&mut *tx, dek_id, w, *dek_epoch).await?;
+            self.upsert_dek_row_on(&mut *tx, dek_id, w, *dek_epoch)
+                .await?;
         }
-        tx.commit().await.map_err(|e| PgError::Query(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| PgError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -502,13 +512,15 @@ impl DurableKmsBacking {
     }
 
     async fn delete_dek_row(&self, id: &DekId) -> Result<(), PgError> {
-        sqlx::query("DELETE FROM kms_wrapped_dek WHERE cell_id = $1 AND tenant_id = $2 AND class = $3")
-            .bind(&self.cell_id)
-            .bind(id.tenant.as_str())
-            .bind(id.class.as_token())
-            .execute(&self.pool)
-            .await
-            .map_err(|e| PgError::Query(e.to_string()))?;
+        sqlx::query(
+            "DELETE FROM kms_wrapped_dek WHERE cell_id = $1 AND tenant_id = $2 AND class = $3",
+        )
+        .bind(&self.cell_id)
+        .bind(id.tenant.as_str())
+        .bind(id.class.as_token())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -561,14 +573,22 @@ impl DurableKmsBacking {
 
     /// `destroy_kek` (crypto-shred L1) + DELETE the durable row — the shred reaches the store, so a
     /// restart can never resurrect the offboarded tenant's KEK.
-    pub async fn destroy_kek(&self, engine: &KmsEngine, id: &KekId) -> Result<bool, KmsDurableError> {
+    pub async fn destroy_kek(
+        &self,
+        engine: &KmsEngine,
+        id: &KekId,
+    ) -> Result<bool, KmsDurableError> {
         let removed = engine.destroy_kek(id);
         self.delete_kek_row(id).await?;
         Ok(removed)
     }
 
     /// `destroy_dek` (crypto-shred L2 / GD-4 individual erasure) + DELETE the durable row.
-    pub async fn destroy_dek(&self, engine: &KmsEngine, id: &DekId) -> Result<bool, KmsDurableError> {
+    pub async fn destroy_dek(
+        &self,
+        engine: &KmsEngine,
+        id: &DekId,
+    ) -> Result<bool, KmsDurableError> {
         let removed = engine.destroy_dek(id);
         self.delete_dek_row(id).await?;
         Ok(removed)
@@ -600,7 +620,8 @@ impl DurableKmsBacking {
         engine: &KmsEngine,
         seal_key: &SealKey,
     ) -> Result<(), KmsDurableError> {
-        self.restore(&engine.backup_snapshot_durable(seal_key)).await
+        self.restore(&engine.backup_snapshot_durable(seal_key))
+            .await
     }
 }
 
@@ -808,9 +829,30 @@ impl DurableKms {
 /// Convert stored bytes into a fixed-size AES-GCM nonce. A wrong length (corruption) yields a nonce
 /// that will not authenticate — a SAFE fail-closed (unseal/unwrap returns the loud failure, never a
 /// wrong-key success).
-fn nonce_from(bytes: &[u8]) -> [u8; NONCE_LEN] {
-    let mut n = [0u8; NONCE_LEN];
-    let len = bytes.len().min(NONCE_LEN);
-    n[..len].copy_from_slice(&bytes[..len]);
-    n
+fn nonce_from(bytes: &[u8]) -> Result<[u8; NONCE_LEN], PgError> {
+    bytes.try_into().map_err(|_| {
+        PgError::Query(format!(
+            "durable KMS row has an invalid nonce length (expected {NONCE_LEN} bytes)"
+        ))
+    })
+}
+
+fn kms_row_decode(error: sqlx::Error) -> PgError {
+    PgError::Query(format!("durable KMS row decode failed: {error}"))
+}
+
+#[cfg(test)]
+mod durable_decode_tests {
+    use super::{nonce_from, NONCE_LEN};
+
+    #[test]
+    fn durable_nonce_requires_the_exact_aead_length() {
+        let exact = vec![7; NONCE_LEN];
+        assert_eq!(nonce_from(&exact).unwrap(), [7; NONCE_LEN]);
+        assert!(nonce_from(&exact[..NONCE_LEN - 1]).is_err());
+
+        let mut overlong = exact;
+        overlong.push(7);
+        assert!(nonce_from(&overlong).is_err());
+    }
 }
