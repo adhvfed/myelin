@@ -2770,6 +2770,12 @@ dependencies = [
 [[package]]
 name = "myelin-lints"
 version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "serde",
+ "syn",
+ "toml",
+]
 
 [[package]]
 name = "myelin-mcp"

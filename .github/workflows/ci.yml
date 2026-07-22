@@ -206,6 +206,8 @@ jobs:
           toolchain: stable
       - name: The twelve architecture lints over the workspace source (loud, non-zero on any violation)
         run: cargo run -p myelin-lints --bin lint-gate
+      - name: L2 production-module erosion budget (3k soft / 5k hard, shrink-only exceptions)
+        run: cargo run -p myelin-lints --bin erosion-gate
       - name: The lint fixture matrix + the CI-gate self-test (red-fixture ⇒ non-zero exit)
         run: cargo test -p myelin-lints
 

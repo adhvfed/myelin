@@ -1,0 +1,14 @@
+# L2 — production Rust module line budget. Counts exclude exact `#[cfg(test)]` items.
+soft_limit = 3000
+hard_limit = 5000
+
+# Existing exceptions are pinned to their exact production-line count. The gate rejects both growth
+# and a stale allowance after shrinkage, so this list can only move downward or lose entries.
+
+[[over_limit]]
+path = "crates/myelin-edge/src/git_durable.rs"
+production_lines = 4283
+
+[[over_limit]]
+path = "crates/myelin-git/src/pg_pr_store.rs"
+production_lines = 3034
