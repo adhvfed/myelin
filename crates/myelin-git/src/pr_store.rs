@@ -26,6 +26,7 @@
 //!   after both admit AND the head is a valid fast-forward target — never a policy bypass, never an
 //!   arbitrary oid.
 
+use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -593,6 +594,28 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         crate::durable::write_file_atomic(dir, file, bytes)
     }
 
+    fn read_bounded_file(
+        path: &std::path::Path,
+        maximum_bytes: usize,
+        limit_error: &'static str,
+    ) -> Result<Option<Vec<u8>>, DurableError> {
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(DurableError::Io(format!("open {}: {error}", path.display())))
+            }
+        };
+        let mut bytes = Vec::new();
+        file.take((maximum_bytes as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| DurableError::Io(format!("read {}: {error}", path.display())))?;
+        if bytes.len() > maximum_bytes {
+            return Err(DurableError::Git(limit_error.into()));
+        }
+        Ok(Some(bytes))
+    }
+
     // ── branch-protection policy (repo-owned) ──
 
     /// Persist (overwrite) the repo-owned branch-protection config. The CALLER must have authorized this
@@ -617,21 +640,15 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         repo: &RepoLoc,
     ) -> Result<Option<BranchProtectionConfig>, DurableError> {
         let path = self.protection_path(repo)?;
-        match std::fs::metadata(&path) {
-            Ok(metadata) => ensure_branch_protection_size(
-                usize::try_from(metadata.len()).unwrap_or(usize::MAX),
-            )?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(DurableError::Io(format!("stat {}: {error}", path.display())))
-            }
-        }
-        match std::fs::read(&path) {
-            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|e| {
+        match Self::read_bounded_file(
+            &path,
+            BRANCH_PROTECTION_MAX_BYTES,
+            "branch protection limit exceeded: serialized bytes",
+        )? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|e| {
                 DurableError::Io(format!("parse {}: {e}", path.display()))
             })?)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(DurableError::Io(format!("read {}: {e}", path.display()))),
+            None => Ok(None),
         }
     }
 
@@ -665,17 +682,12 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
     /// Read a PR record from disk (`None` if absent). A FRESH store over the same root reads it back.
     pub fn get(&self, repo: &RepoLoc, number: u64) -> Result<Option<PrRecord>, DurableError> {
         let path = self.pr_path(repo, number)?;
-        match std::fs::metadata(&path) {
-            Ok(metadata) => ensure_pr_record_size(
-                usize::try_from(metadata.len()).unwrap_or(usize::MAX),
-            )?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(DurableError::Io(format!("stat {}: {error}", path.display())))
-            }
-        }
-        match std::fs::read(&path) {
-            Ok(bytes) => {
+        match Self::read_bounded_file(
+            &path,
+            PR_RECORD_MAX_BYTES,
+            "pull request record limit exceeded: serialized bytes",
+        )? {
+            Some(bytes) => {
                 let record: PrRecord = serde_json::from_slice(&bytes)
                     .map_err(|e| DurableError::Io(format!("parse {}: {e}", path.display())))?;
                 if record.number != number {
@@ -687,8 +699,7 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
                 }
                 Ok(Some(record))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(DurableError::Io(format!("read {}: {e}", path.display()))),
+            None => Ok(None),
         }
     }
 
@@ -756,12 +767,17 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
                             path.display()
                         ))
                     })?;
-                let file_size = entry.metadata().map_err(|error| {
-                    DurableError::Io(format!("stat {}: {error}", path.display()))
-                })?;
-                let file_size = usize::try_from(file_size.len()).unwrap_or(usize::MAX);
-                ensure_pr_record_size(file_size)?;
-                total_bytes = total_bytes.checked_add(file_size).ok_or_else(|| {
+                let mut bytes = Vec::new();
+                std::fs::File::open(&path)
+                    .and_then(|file| {
+                        file.take((PR_RECORD_MAX_BYTES as u64).saturating_add(1))
+                            .read_to_end(&mut bytes)
+                    })
+                    .map_err(|error| {
+                        DurableError::Io(format!("read {}: {error}", path.display()))
+                    })?;
+                ensure_pr_record_size(bytes.len())?;
+                total_bytes = total_bytes.checked_add(bytes.len()).ok_or_else(|| {
                     DurableError::Git(
                         "pull request list limit exceeded: serialized bytes".into(),
                     )
@@ -771,8 +787,6 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
                         "pull request list limit exceeded: serialized bytes".into(),
                     ));
                 }
-                let bytes = std::fs::read(&path)
-                    .map_err(|e| DurableError::Io(format!("read {}: {e}", path.display())))?;
                 let rec = serde_json::from_slice::<PrRecord>(&bytes)
                     .map_err(|e| DurableError::Io(format!("parse {}: {e}", path.display())))?;
                 if rec.number != file_number {
@@ -791,7 +805,7 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
 
     /// **The highest PR number present on disk, from the FILENAMES (`<n>.json`) — never the parsed
     /// content (peer-review finding 2026-07-16 #3).** PR-number allocation MUST NOT derive from
-    /// [`list`](Self::list): list parsing and number allocation are separate concerns, and allocation
+    /// [`Self::list_bounded`]: list parsing and number allocation are separate concerns, and allocation
     /// must remain possible only from the filename-authoritative set. A PR's number is authoritative
     /// in its filename (`pr_path` writes `<n>.json`), so this reads the directory entries and takes the
     /// max of numbers parsed from `.json` stems — a corrupt record still counts and is never re-issued.
