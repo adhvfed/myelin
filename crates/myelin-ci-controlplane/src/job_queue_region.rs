@@ -229,6 +229,8 @@ fn leased_from_row(
     let trust_token_str: String = r.get("trust_tier");
     let lease_epoch: i64 = r.get("lease_epoch");
     let claim_nonce: String = r.get("claim_nonce");
+    let claim_started_at_epoch_secs: i64 = r.get("claim_started_at_epoch_secs");
+    let claim_expires_at_epoch_secs: i64 = r.get("claim_expires_at_epoch_secs");
     let lane = Lane::from_token(&lane_token).ok_or_else(|| {
         JobQueueStoreError::CorruptRow(format!("unknown lane token `{lane_token}`"))
     })?;
@@ -244,5 +246,7 @@ fn leased_from_row(
         lease_owner: lease_owner.to_string(),
         lease_epoch,
         claim_nonce,
+        claim_started_at_epoch_secs,
+        claim_expires_at_epoch_secs,
     })
 }

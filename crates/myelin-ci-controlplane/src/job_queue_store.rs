@@ -188,6 +188,12 @@ pub struct LeasedJob {
     pub lease_epoch: i64,
     /// Fresh unguessable authority minted for this exact claim generation.
     pub claim_nonce: String,
+    /// PostgreSQL statement time that minted this claim, in Unix epoch seconds. Token issuance uses
+    /// this durable claim fact rather than a process clock, so acknowledgement-loss retry is stable.
+    pub claim_started_at_epoch_secs: i64,
+    /// Initial claim expiry in Unix epoch seconds. A token authority may issue only within this
+    /// bounded claim generation; heartbeat may extend execution but never rewrites mint identity.
+    pub claim_expires_at_epoch_secs: i64,
 }
 
 /// **The outcome of the claim CAS joined to durable signal delivery by the completion reporter.**
@@ -615,6 +621,8 @@ mod tests {
             "j.trust_tier",
             "j.lease_epoch",
             "j.claim_nonce",
+            "claim_started_at_epoch_secs",
+            "claim_expires_at_epoch_secs",
         ] {
             assert!(
                 CLAIM_QUERY.contains(col),

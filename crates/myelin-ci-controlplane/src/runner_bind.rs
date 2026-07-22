@@ -567,7 +567,10 @@ pub fn durable_spec_resolver(
             lease_owner: leased.lease_owner.clone(),
             lease_epoch: leased.lease_epoch,
             claim_nonce: leased.claim_nonce.clone(),
+            claim_started_at_epoch_secs: leased.claim_started_at_epoch_secs,
+            claim_expires_at_epoch_secs: leased.claim_expires_at_epoch_secs,
         };
+        request.validate().map_err(|e| e.to_string())?;
         let run_token = bridge(&rt, token_issuer.mint(request)).map_err(|e| e.to_string())?;
         validate_run_token(&run_token, &launch.token_authority_handle).map_err(|e| e.0)?;
         Ok(launch.spec.resolve(run_token))

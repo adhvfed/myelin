@@ -304,6 +304,13 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
         "the in-region interactive job is claimed before the older batch (lane priority) and the \
          out-of-region job is never claimed (residency)"
     );
+    let claim_started_at: i64 = row.get("claim_started_at_epoch_secs");
+    let claim_expires_at: i64 = row.get("claim_expires_at_epoch_secs");
+    assert_eq!(
+        claim_expires_at - claim_started_at,
+        30,
+        "the returned token-mint lifetime is derived from the same PostgreSQL statement clock as the lease"
+    );
 
     // The claimed row is leased with an owner + a future expiry.
     let leased = sqlx::query(&format!(
