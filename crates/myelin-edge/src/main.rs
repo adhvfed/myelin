@@ -28,8 +28,8 @@ use myelin_config::Mode;
 use myelin_edge::{
     bootstrap_principal_and_mint, recover_placed_git_at_boot, register_git_durable,
     register_git_wire, register_issues, serve_edge_until_shutdown_with_probe,
-    spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig,
-    AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer, DurableGitBackend,
+    spawn_issue_authorization_reconciler, AuthPublicConfig, AuthenticatedActionPolicy,
+    BootstrapParams, CheckBackedRepoAuthorizer, DurableGitBackend,
     Gateway, IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, ShutdownOutcome,
     StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
 };
@@ -79,6 +79,23 @@ struct EdgeReadiness {
 struct EdgeReadinessState {
     checked_at: Option<tokio::time::Instant>,
     ready: bool,
+}
+
+fn public_auth_config(
+    dev_login_enabled: bool,
+    token_login_enabled: bool,
+) -> AuthPublicConfig {
+    // Static issuer/audience/JWKS settings make ID-token verification real, but they do not provide
+    // the authorization endpoint, client identity, redirect URI, callback/state store, or human
+    // capability mint needed for an interactive browser login. Advertise SSO only when that complete
+    // flow exists; otherwise the login page must keep the button disabled and present the working
+    // operator-token path.
+    AuthPublicConfig {
+        sso_configured: false,
+        providers: Vec::new(),
+        dev_login_enabled,
+        token_login_enabled,
+    }
 }
 
 impl ReadinessProbe for EdgeReadiness {
@@ -622,23 +639,7 @@ async fn serve(
     let token_login_enabled = std::env::var("MYELIN_TOKEN_LOGIN")
         .map(|v| v == "1")
         .unwrap_or(false);
-    let auth_config = match oidc_settings.as_ref() {
-        Some(_) => AuthPublicConfig {
-            sso_configured: true,
-            providers: vec![AuthProvider {
-                id: "oidc".to_string(),
-                label: "Single sign-on".to_string(),
-            }],
-            dev_login_enabled,
-            token_login_enabled,
-        },
-        None => AuthPublicConfig {
-            sso_configured: false,
-            providers: Vec::new(),
-            dev_login_enabled,
-            token_login_enabled,
-        },
-    };
+    let auth_config = public_auth_config(dev_login_enabled, token_login_enabled);
     let human_login = Arc::new(match oidc_settings {
         Some(oidc) => {
             let jwks = JwkSet::from_jwks_json(&oidc.jwks_json).unwrap_or_else(|e| {
@@ -1120,6 +1121,15 @@ mod runtime_config_tests {
                 .unwrap_err(),
             "MYELIN_PUBLIC_BASE_URL must not contain a query string"
         );
+    }
+
+    #[test]
+    fn verify_only_oidc_does_not_advertise_an_interactive_sso_flow() {
+        let config = public_auth_config(false, true);
+        assert!(!config.sso_configured);
+        assert!(config.providers.is_empty());
+        assert!(!config.dev_login_enabled);
+        assert!(config.token_login_enabled);
     }
 
     #[test]
