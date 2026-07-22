@@ -219,6 +219,13 @@ pub enum GitPackError {
     Blob(BlobError),
     /// A placement / relocation was rejected by the residency pin or an invariant.
     Placement(PlacementError),
+    /// A read was refused because a byte or item ceiling would be exceeded.
+    ReadLimitExceeded {
+        /// The observed size or count.
+        actual: usize,
+        /// The caller's maximum allowance in the same unit.
+        maximum: usize,
+    },
 }
 
 /// **The reason a repo placement / relocation is rejected.**
@@ -248,6 +255,13 @@ impl std::fmt::Display for GitPackError {
             ),
             GitPackError::Blob(e) => write!(f, "git pack tier blob error: {e}"),
             GitPackError::Placement(e) => write!(f, "git pack placement rejected: {e}"),
+            GitPackError::ReadLimitExceeded {
+                actual,
+                maximum,
+            } => write!(
+                f,
+                "git pack tier read refused: observed {actual}, exceeding the limit of {maximum}"
+            ),
         }
     }
 }
@@ -279,6 +293,11 @@ impl From<BlobError> for GitPackError {
         GitPackError::Blob(e)
     }
 }
+
+/// Backstop for direct object reads whose caller does not impose a tighter transport limit.
+pub const GIT_PACK_OBJECT_MAX_STORED_BYTES: usize = 512 * 1024 * 1024;
+/// Backstop for direct opaque pack reads whose caller does not impose a tighter transport limit.
+pub const GIT_PACKFILE_MAX_STORED_BYTES: usize = 1024 * 1024 * 1024;
 
 /// One stored packfile's manifest entry — the opaque packfile blob's content address plus the
 /// SHA-addressed objects it contains (so a reader can resolve an object to its pack). PII-free.
@@ -432,13 +451,24 @@ impl<B: BlobStore> GitPackTier<B> {
         repo: &RepoId,
         address: &ContentHash,
     ) -> Result<Vec<u8>, GitPackError> {
-        self.require_placed(repo)?;
-        let native = self.native_for_sha(repo, address).ok_or_else(|| {
-            GitPackError::Blob(BlobError::NotFound {
-                tenant: self.tenant.clone(),
-                hash: address.clone(),
-            })
-        })?;
+        self.get_object_bounded(repo, address, GIT_PACK_OBJECT_MAX_STORED_BYTES)
+    }
+
+    /// Read a git object only when its stored framing fits `maximum_stored_bytes`. Metadata is
+    /// checked before [`BlobStore::get`], so a rejected object is never materialized in memory.
+    pub fn get_object_bounded(
+        &self,
+        repo: &RepoId,
+        address: &ContentHash,
+        maximum_stored_bytes: usize,
+    ) -> Result<Vec<u8>, GitPackError> {
+        let (native, stored_len) = self.object_native_address_and_stored_len(repo, address)?;
+        if stored_len > maximum_stored_bytes {
+            return Err(GitPackError::ReadLimitExceeded {
+                actual: stored_len,
+                maximum: maximum_stored_bytes,
+            });
+        }
         // Serve the framed bytes through the trait. The BlobStore re-hashes on read on the NATIVE
         // (BLAKE3) address and refuses a corrupt blob FIRST (incrementing `blob_integrity_fail`,
         // 0 silent serve — STOR-D7 on packs). We THEN re-verify under the git SHA so the git-world
@@ -453,6 +483,16 @@ impl<B: BlobStore> GitPackTier<B> {
             }));
         }
         Ok(unframe_git_object(&framed))
+    }
+
+    /// Return an object's stored framed length without materializing it.
+    pub fn object_stored_len(
+        &self,
+        repo: &RepoId,
+        address: &ContentHash,
+    ) -> Result<usize, GitPackError> {
+        self.object_native_address_and_stored_len(repo, address)
+            .map(|(_, stored_len)| stored_len)
     }
 
     /// **Get a git object with replica/backup RECOVERY (STOR-D7 "recover from replica/backup").**
@@ -500,6 +540,13 @@ impl<B: BlobStore> GitPackTier<B> {
         pack_hash: &ContentHash,
     ) -> Result<Vec<u8>, GitPackError> {
         self.require_placed(repo)?;
+        let metadata = self.blobs.head(&self.tenant, pack_hash)?;
+        if metadata.stored_len > GIT_PACKFILE_MAX_STORED_BYTES {
+            return Err(GitPackError::ReadLimitExceeded {
+                actual: metadata.stored_len,
+                maximum: GIT_PACKFILE_MAX_STORED_BYTES,
+            });
+        }
         Ok(self.blobs.get(&self.tenant, pack_hash)?)
     }
 
@@ -536,6 +583,22 @@ impl<B: BlobStore> GitPackTier<B> {
             .expect("sha index mutex")
             .get(&(repo.clone(), sha.clone()))
             .cloned()
+    }
+
+    fn object_native_address_and_stored_len(
+        &self,
+        repo: &RepoId,
+        address: &ContentHash,
+    ) -> Result<(ContentHash, usize), GitPackError> {
+        self.require_placed(repo)?;
+        let native = self.native_for_sha(repo, address).ok_or_else(|| {
+            GitPackError::Blob(BlobError::NotFound {
+                tenant: self.tenant.clone(),
+                hash: address.clone(),
+            })
+        })?;
+        let stored_len = self.blobs.head(&self.tenant, &native)?.stored_len;
+        Ok((native, stored_len))
     }
 
     /// Test/drill-only: the native blob address a git SHA object is stored under, so the STOR-D7
@@ -611,6 +674,29 @@ mod tests {
         assert_eq!(
             got, content,
             "the exact object content round-trips through the trait"
+        );
+    }
+
+    #[test]
+    fn bounded_object_read_checks_metadata_before_materialization() {
+        let (tier, repo) = placed_tier();
+        let content = b"bounded object";
+        let address = tier
+            .put_object(&repo, GitObjectKind::Blob, content)
+            .expect("put");
+        let stored_bytes = frame_git_object(GitObjectKind::Blob, content).len();
+
+        assert_eq!(
+            tier.get_object_bounded(&repo, &address, stored_bytes)
+                .expect("exact limit accepted"),
+            content
+        );
+        assert_eq!(
+            tier.get_object_bounded(&repo, &address, stored_bytes - 1),
+            Err(GitPackError::ReadLimitExceeded {
+                actual: stored_bytes,
+                maximum: stored_bytes - 1,
+            })
         );
     }
 
