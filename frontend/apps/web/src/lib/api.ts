@@ -27,6 +27,7 @@ import { parseFileLinesInput, parseFileLinesResponse } from "./file-lines";
 import { parseBlob, parseRefs, parseRepoHome, parseReposPage, parseTree } from "./repo-read-response";
 import { parseCommitDiff, parseCommitsPage } from "./commit-read-response";
 import { parsePr, parsePrDiff, parsePrListPage } from "./pr-read-response";
+import { parseIssueId, parseIssueListInput } from "./issue-read-input";
 import {
   parseGitBrowseInput,
   parseGitCommitInput,
@@ -785,10 +786,12 @@ export const getIssues = query(
     limit?: number;
   }): Promise<IssuesPage> => {
     "use server";
-    const p = new URLSearchParams({ state: input.state });
-    if (input.key) p.set("key", input.key);
-    if (input.cursor) p.set("cursor", input.cursor);
-    if (input.limit) p.set("limit", String(input.limit));
+    const parsed = parseIssueListInput(input);
+    if (!parsed) throw new IssueRouteError("bad-input");
+    const p = new URLSearchParams({ state: parsed.state });
+    if (parsed.key) p.set("key", parsed.key);
+    if (parsed.cursor) p.set("cursor", parsed.cursor);
+    if (parsed.limit) p.set("limit", String(parsed.limit));
     return issueAuthed(async () => {
       const response = await edgeGet(`/v1/issues?${p.toString()}`);
       const page = parseIssuesPage(response);
@@ -801,8 +804,10 @@ export const getIssues = query(
 
 export const getIssue = query(async (id: string): Promise<IssueVM> => {
   "use server";
+  const parsed = parseIssueId(id);
+  if (!parsed) throw new IssueRouteError("bad-input");
   return issueAuthed(async () => {
-    const response = await edgeGet(`/v1/issues/${seg(id)}`);
+    const response = await edgeGet(`/v1/issues/${seg(parsed)}`);
     const issue = parseIssue(response);
     if (!issue) throw new IssueRouteError("error");
     return issue;
