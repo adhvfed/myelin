@@ -149,27 +149,24 @@ impl GitEffectApi {
                     Ok(v) => v,
                     Err(e) => return e,
                 };
-                // The compiled permission is
-                // `pull_request.review = reviewer ∪ parent_repo->push`. The filesystem PR store
-                // does not yet materialize the PR parent/reviewer tuples, so the sound available
-                // reduction is the parent repo's Push rung. This intentionally over-denies a
-                // reviewer-only grant; it never admits an ungranted reviewer.
-                if let Err(denied) = self.authorize_repo(repo, RepoPermission::Push) {
-                    return denied;
+                // Until PR relation tuples are projected into Identity, the backend materializes
+                // the exact frozen union from the durable requested-reviewer fact plus repo Push.
+                if !self
+                    .backend
+                    .authorize_pr_review(t, r, repo, number, &self.principal)
+                {
+                    return EffectResult::Denied("no review grant for this pull request".into());
                 }
                 let verdict = str_arg(args, "verdict").unwrap_or("comment");
-                match self
-                    .backend
-                    .submit_review_with_operation(
-                        t,
-                        r,
-                        repo,
-                        number,
-                        verdict,
-                        &self.principal,
-                        operation_id,
-                    )
-                {
+                match self.backend.submit_review_with_operation(
+                    t,
+                    r,
+                    repo,
+                    number,
+                    verdict,
+                    &self.principal,
+                    operation_id,
+                ) {
                     Ok(rec) => applied(
                         run,
                         tool,
