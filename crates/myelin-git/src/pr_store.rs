@@ -679,6 +679,16 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
 
     /// List every PR record under a repo (durable — loaded from disk).
     pub fn list(&self, repo: &RepoLoc) -> Result<Vec<PrRecord>, DurableError> {
+        self.list_bounded(repo, usize::MAX)
+    }
+
+    /// List PR records while stopping before more than `maximum_records` JSON documents are read
+    /// and parsed. Interactive callers use this to keep tenant-controlled record cardinality finite.
+    pub fn list_bounded(
+        &self,
+        repo: &RepoLoc,
+        maximum_records: usize,
+    ) -> Result<Vec<PrRecord>, DurableError> {
         let dir = self.prs_dir(repo)?;
         let mut out = Vec::new();
         let rd = match std::fs::read_dir(&dir) {
@@ -690,6 +700,11 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
             let entry = entry.map_err(|e| DurableError::Io(format!("dir entry: {e}")))?;
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                if out.len() >= maximum_records {
+                    return Err(DurableError::Git(
+                        "pull request list limit exceeded: record count".into(),
+                    ));
+                }
                 let file_number = path
                     .file_stem()
                     .and_then(|value| value.to_str())
@@ -1099,6 +1114,35 @@ mod tests {
             matches!(store.list(&loc()), Err(DurableError::Git(message)) if message.contains("identity mismatch")),
             "a list must not expose the mismatched record"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bounded_list_stops_before_reading_surplus_records() {
+        let root = temp_root("bounded-list");
+        let gitstore = DurableGitStore::rooted(&root);
+        gitstore.create_repo(&loc()).unwrap();
+        let store = DurablePrStore::rooted(&root);
+        for number in [1, 2] {
+            store
+                .open_pr(
+                    &loc(),
+                    &open_record(
+                        number,
+                        "refs/heads/main",
+                        &format!("{number:040}"),
+                        "psn:author@acme",
+                    ),
+                )
+                .unwrap();
+        }
+
+        assert!(matches!(
+            store.list_bounded(&loc(), 1),
+            Err(DurableError::Git(message))
+                if message == "pull request list limit exceeded: record count"
+        ));
+        assert_eq!(store.list_bounded(&loc(), 2).unwrap().len(), 2);
         std::fs::remove_dir_all(&root).ok();
     }
 
